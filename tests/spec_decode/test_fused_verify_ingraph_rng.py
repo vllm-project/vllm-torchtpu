@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_SPEC_SYNTHETIC_INGRAPH_RNG: the counter uniforms are U[0, 1) at
+"""spec_synthetic_ingraph_rng: the counter uniforms are U[0, 1) at
 torch.rand's resolution, the fused verify given them decides exactly as with
 the same uniforms passed in, and its accepted counts and bonus / recovered
 tokens follow the synthetic schedule and the target distribution, as they do
@@ -178,3 +178,14 @@ def test_ingraph_draws_follow_schedule_and_target(device):
     chi2 = (((obs[mask] - exp[mask]) ** 2) / exp[mask]).sum().item()
     dof = int(mask.sum()) - 1
     assert chi2 < dof + 6 * (2 * dof) ** 0.5, (chi2, dof)
+
+
+def test_ingraph_rng_enabled():
+    """additional_config gate reproduces the old TPU_SPEC_SYNTHETIC_INGRAPH_RNG
+    env behaviour: off by default, on only for an explicit bool True."""
+    assert not fsv.ingraph_rng_enabled({})
+    assert not fsv.ingraph_rng_enabled(None)
+    assert not fsv.ingraph_rng_enabled({fsv.INGRAPH_RNG_KEY: False})
+    assert fsv.ingraph_rng_enabled({fsv.INGRAPH_RNG_KEY: True})
+    with pytest.raises(ValueError):
+        fsv.ingraph_rng_enabled({fsv.INGRAPH_RNG_KEY: 1})

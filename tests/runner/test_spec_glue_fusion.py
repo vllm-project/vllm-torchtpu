@@ -11,16 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_SPEC_GLUE_FUSION: the substitution glue program must give the eager
+"""spec_glue_fusion: the substitution glue program must give the eager
 sequence's values bit for bit, its outputs never views."""
 
 import pytest
 import torch
 
 from vllm_torchtpu.runner.tpu_runner_async_output import (
+    GLUE_FUSION_KEY,
     INVALID_TOKEN_ID,
     assemble_spec_next_tokens,
     compute_num_rejected,
+    glue_fusion_enabled,
     spec_substitution_glue_impl,
     subtract_num_rejected_tokens,
 )
@@ -131,3 +133,14 @@ def test_subtract_with_padded_rejected_bitwise(device, num_reqs, num_tokens, src
         for a, b in zip(out, ref):
             assert a.dtype == b.dtype
             assert torch.equal(a.cpu(), b.cpu())
+
+
+def test_glue_fusion_enabled():
+    """additional_config gate reproduces the old TPU_SPEC_GLUE_FUSION env
+    behaviour: off by default, on only for an explicit bool True."""
+    assert not glue_fusion_enabled({})
+    assert not glue_fusion_enabled(None)
+    assert not glue_fusion_enabled({GLUE_FUSION_KEY: False})
+    assert glue_fusion_enabled({GLUE_FUSION_KEY: True})
+    with pytest.raises(ValueError):
+        glue_fusion_enabled({GLUE_FUSION_KEY: 1})

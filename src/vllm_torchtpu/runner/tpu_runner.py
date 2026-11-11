@@ -185,6 +185,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
     extract_draft_token_ids,
+    glue_fusion_enabled,
     subtract_num_rejected_tokens,
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
@@ -1209,7 +1210,7 @@ class TPUModelRunner(GPUModelRunner):
         # across a replica's TP ranks (else they diverge -> collective hang).
         self._sampling_generator: torch.Generator | None = None
         # Device counter of the fused verify's in-graph uniforms
-        # (TPU_SPEC_SYNTHETIC_INGRAPH_RNG); seeded like the generator.
+        # (spec_synthetic_ingraph_rng); seeded like the generator.
         self._synthetic_rng_counter: torch.Tensor | None = None
         self._spec_glue_logged: set[str] = set()
         # JAX Mesh for shard_map ops in TPU kernels. Real DP is vLLM
@@ -1482,6 +1483,15 @@ class TPUModelRunner(GPUModelRunner):
             # Non-greedy verify as one program (fused_spec_verify); off by
             # default.
             self._fused_spec_sampler = fused_spec_verify.fused_sampler_enabled(
+                self.vllm_config.additional_config
+            )
+            # Async spec substitution as one compiled program
+            # (spec_substitution_glue) and the fused verify's in-graph
+            # uniforms (spec_verify_sample_fused_rng); both off by default.
+            self._spec_glue_fusion = glue_fusion_enabled(
+                self.vllm_config.additional_config
+            )
+            self._spec_synthetic_ingraph_rng = fused_spec_verify.ingraph_rng_enabled(
                 self.vllm_config.additional_config
             )
             if self.speculative_config.method == "ngram":
@@ -3024,7 +3034,7 @@ class TPUModelRunner(GPUModelRunner):
         # would compile a program per request count); others keep exact rows.
         bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
         if (
-            envs.TPU_SPEC_GLUE_FUSION
+            getattr(self, "_spec_glue_fusion", False)
             and len(next_tokens_per_chunk) == 1
             and state.spec_decode_metadata_list[0] is not None
         ):
@@ -3089,14 +3099,14 @@ class TPUModelRunner(GPUModelRunner):
 
     def _fused_spec_substitution(self, drafts_chunk, nt_chunk, num_reqs, md, bucketed):
         """`_assemble_async_spec_substitution` for a single verify chunk as one
-        compiled program (TPU_SPEC_GLUE_FUSION). The source and the rejected
+        compiled program (spec_glue_fusion). The source and the rejected
         counts come out at the fixed lengths `sample_tokens` pads them to."""
         from vllm_torchtpu.runner.tpu_runner_async_output import (
             spec_substitution_glue,
         )
 
         assert self.speculative_config is not None
-        self._log_spec_glue_once("TPU_SPEC_GLUE_FUSION")
+        self._log_spec_glue_once("spec_glue_fusion")
         rows = nt_chunk.shape[0] if bucketed else num_reqs
         parked_rows = self._async_spec_source_rows()
         src, spec_num_rejected = spec_substitution_glue(
@@ -5059,10 +5069,10 @@ class TPUModelRunner(GPUModelRunner):
             cur_start_idx, cur_end_idx, None
         )
         if (
-            envs.TPU_SPEC_SYNTHETIC_INGRAPH_RNG
+            getattr(self, "_spec_synthetic_ingraph_rng", False)
             and self.rejection_sampler.synthetic_mode
         ):
-            self._log_spec_glue_once("TPU_SPEC_SYNTHETIC_INGRAPH_RNG")
+            self._log_spec_glue_once("spec_synthetic_ingraph_rng")
             out, self._synthetic_rng_counter = (
                 fused_spec_verify.spec_verify_sample_fused_rng(
                     logits,
@@ -6972,7 +6982,7 @@ class TPUModelRunner(GPUModelRunner):
                     zeros(num_tokens), zeros(logits_len), zeros(logits_len)
                 )
                 synchronize_tensors(out)
-            if envs.TPU_SPEC_GLUE_FUSION:
+            if getattr(self, "_spec_glue_fusion", False):
                 from vllm_torchtpu.runner.tpu_runner_async_output import (
                     spec_substitution_glue,
                 )
@@ -7319,7 +7329,7 @@ class TPUModelRunner(GPUModelRunner):
         if blocks := self._topk_candidate_blocks():
             variants.append((True, True, blocks))
         if (
-            envs.TPU_SPEC_SYNTHETIC_INGRAPH_RNG
+            getattr(self, "_spec_synthetic_ingraph_rng", False)
             and self.rejection_sampler.synthetic_mode
         ):
             # A dummy counter: warming must not advance the serving one.
