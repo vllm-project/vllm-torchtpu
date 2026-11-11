@@ -27,6 +27,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
 
 from tests.models.minimax_m3.experimental.packing import (
     CACHE_DTYPES,
@@ -366,6 +367,35 @@ def test_lse_heads_kernel_matches_each_head(monkeypatch, chunk_tokens):
     np.testing.assert_array_equal(
         np.asarray(got_lse), np.asarray(jnp.concatenate([e[1] for e in expected], 1))
     )
+
+
+def test_gather_group_kv_picks_one_rank_per_kv_head():
+    from vllm_torchtpu.models.minimax_m3.experimental.ops.msa import gather_group_kv
+
+    dcp, replicas, num_tokens, d = 8, 2, 5, 4
+
+    # Rank i's k/v/index_q hold 10 * (i // replicas) + {1, 2, 3}.
+    def full(value):
+        return torch.full((num_tokens, 1, d), value)
+
+    per_rank = [
+        torch.cat([full(10.0 * (i // replicas) + c) for c in (1, 2, 3)], dim=1)
+        for i in range(dcp)
+    ]
+
+    class _Group:  # what group.all_gather(dim=1) returns, for every rank
+        def all_gather(self, x, dim):
+            assert dim == 1
+            return torch.cat(per_rank, dim=1)
+
+    k, v, index_q = gather_group_kv(
+        full(0.0), full(0.0), full(0.0), _Group(), dcp, replicas
+    )
+    for tensor, c in ((k, 1), (v, 2), (index_q, 3)):
+        assert tensor.shape == (num_tokens, dcp // replicas, d)
+        assert [float(x) for x in tensor[0, :, 0]] == [
+            10.0 * h + c for h in range(dcp // replicas)
+        ]
 
 
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
