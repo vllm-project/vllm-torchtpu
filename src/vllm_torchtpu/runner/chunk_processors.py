@@ -17,7 +17,7 @@
 plain decode chunks and on draft-less chunks of speculative steps;
 ``TPUModelRunner._sample_spec_verify_chunk`` runs ``SpecChunkProcessor`` hooks
 on verify chunks. Stateful processors, such as penalties, ``bad_words`` or a
-thinking-token budget, implement them; the stateless ``min_tokens`` mask is
+thinking-token budget, can implement them; the stateless ``min_tokens`` mask is
 wrapped in ``StatelessPlainChunkProcessor``.
 """
 
