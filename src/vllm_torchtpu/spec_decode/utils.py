@@ -458,6 +458,75 @@ def maybe_share_lm_head(
         lp._gather_logits = lambda logits: logits
 
 
+class ColumnParallelEhProj(torch.nn.Module):
+    """A replicated bias-free MTP ``eh_proj`` (2H -> H) split by output column.
+
+    Upstream DeepSeek / GLM MTP builds ``eh_proj`` as a plain ``nn.Linear``,
+    so every TP rank holds and reads the whole [H, 2H] weight on each draft
+    pass. This rank keeps rows [r*H/tp, (r+1)*H/tp) of the weight, computes
+    its H/tp output columns, and all-gathers them. Each output element is the
+    same K=2H dot product as in the replicated layer. The input rows must be
+    the same on every TP rank, which holds for the MTP layer: its inputs are
+    the replicated embedding and target hidden state.
+    """
+
+    def __init__(self, weight: torch.Tensor, tp_rank: int, tp_size: int):
+        super().__init__()
+        out_features, in_features = weight.shape
+        assert out_features % tp_size == 0, (out_features, tp_size)
+        n = out_features // tp_size
+        self.in_features = in_features
+        self.out_features = out_features
+        self.tp_size = tp_size
+        self.weight = Parameter(
+            weight.detach()[tp_rank * n : (tp_rank + 1) * n].clone(),
+            requires_grad=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        n = self.out_features // self.tp_size
+        lead = x.shape[:-1]
+        local = F.linear(x, self.weight).reshape(-1, n)
+        rows = local.shape[0]
+        gathered = tensor_model_parallel_all_gather(local, dim=0)
+        return (
+            gathered.view(self.tp_size, rows, n)
+            .permute(1, 0, 2)
+            .reshape(*lead, self.out_features)
+        )
+
+
+def shard_draft_eh_proj(
+    draft_model: torch.nn.Module, tp_rank: int, tp_size: int
+) -> int:
+    """Swap each MTP layer's replicated ``eh_proj`` for `ColumnParallelEhProj`.
+
+    Applies only to a bias-free ``nn.Linear`` whose output width divides by
+    ``tp_size`` (> 1). Returns the number of layers changed (0 = untouched).
+    """
+    if tp_size <= 1:
+        return 0
+    inner = getattr(draft_model, "model", None)
+    layers = getattr(inner, "layers", None)
+    if layers is None:
+        return 0
+    items = layers.values() if isinstance(layers, torch.nn.ModuleDict) else layers
+    changed = 0
+    for layer in items:
+        eh = getattr(layer, "eh_proj", None)
+        if (
+            type(eh) is not torch.nn.Linear
+            or eh.bias is not None
+            or eh.out_features % tp_size != 0
+        ):
+            continue
+        layer.eh_proj = ColumnParallelEhProj(eh.weight, tp_rank, tp_size)
+        changed += 1
+    return changed
+
+
 # Noise-token id resolution order, mirroring upstream
 # vllm/v1/worker/gpu/spec_decode/utils.py.
 _NOISE_TOKEN_KEYS = (
