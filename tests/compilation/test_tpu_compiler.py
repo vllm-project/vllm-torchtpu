@@ -283,6 +283,7 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
             "vllm_torchtpu/models/vllm/muse_spark/attention_compat.py",
             "vllm_torchtpu/models/vllm/muse_spark/det_collectives.py",
+            "vllm_torchtpu/models/vllm/muse_spark/megakernel_fastpath.py",
         } <= hashed
 
     def test_runtime_hash_excluded_kernels_stay_omni_only(self):

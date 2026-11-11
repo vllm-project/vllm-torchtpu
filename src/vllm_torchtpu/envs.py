@@ -211,6 +211,9 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     VLLM_TPU_MUSE_BATCH_INVARIANT: bool = True
     VLLM_TPU_MUSE_MOE_IMPL: str = "fused"
+    VLLM_TPU_MUSE_MEGAKERNEL: bool = False
+    VLLM_TPU_MUSE_ASYNC_PREFETCH: bool = True
+    VLLM_TPU_MUSE_MK_EAGER_KV_WRITEBACK: bool = False
 
 
 def env_with_choices(
@@ -1291,6 +1294,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Muse Spark MoE backend selector: "fused" (default) or "eager".
     "VLLM_TPU_MUSE_MOE_IMPL": env_with_choices(
         "VLLM_TPU_MUSE_MOE_IMPL", "fused", ["fused", "eager"], case_sensitive=False
+    ),
+    # Opt-in TP=8 Muse Spark single-dispatch Pallas decode megakernel.
+    "VLLM_TPU_MUSE_MEGAKERNEL": env_bool("VLLM_TPU_MUSE_MEGAKERNEL", default=False),
+    # Debug escape hatch: 0 disables idempotent next-step async decode prefetch.
+    "VLLM_TPU_MUSE_ASYNC_PREFETCH": env_bool(
+        "VLLM_TPU_MUSE_ASYNC_PREFETCH", default=True
+    ),
+    # Debug escape hatch: mirror megakernel-decoded KV into vLLM paged pools every step.
+    "VLLM_TPU_MUSE_MK_EAGER_KV_WRITEBACK": env_bool(
+        "VLLM_TPU_MUSE_MK_EAGER_KV_WRITEBACK", default=False
     ),
 }
 

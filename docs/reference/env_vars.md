@@ -121,9 +121,12 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 
 ---
 
-## 7. Muse Spark Open Execution
+## 7. Muse Spark Open & Megakernel Execution
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `VLLM_TPU_MUSE_BATCH_INVARIANT` | `True` | Enables batch-invariant Pallas matmul tiling, RMS normalization, and fixed-order TP reductions (`False` uses standard XLA ops). |
 | `VLLM_TPU_MUSE_MOE_IMPL` | `"fused"` | Selects Muse Spark MoE backend (`"fused"` or `"eager"`). |
+| `VLLM_TPU_MUSE_MEGAKERNEL` | `False` | Enables the single-dispatch Pallas decode megakernel backend for Muse Spark on TPU v7x (`TP=8`). |
+| `VLLM_TPU_MUSE_ASYNC_PREFETCH` | `True` | Debug escape hatch: overlaps EngineCore-to-Worker IPC gap with idempotent next-step async decode prefetch (`False` disables). |
+| `VLLM_TPU_MUSE_MK_EAGER_KV_WRITEBACK` | `False` | Debug escape hatch: mirrors megakernel-decoded KV positions back into vLLM's paged KV cache on every step. |

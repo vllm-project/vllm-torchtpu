@@ -77,6 +77,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.custom_ops import muse_moe_tpu
 from vllm_torchtpu.layers.adapter.custom_ops.batch_invariant_ops import (
     det_centered_rms_norm,
@@ -216,6 +217,54 @@ def _reject_unsupported_dspark_config(hf_cfg: Any) -> None:
         )
 
 
+def validate_megakernel_config(vllm_config: VllmConfig) -> None:
+    """Reject setups the VLLM_TPU_MUSE_MEGAKERNEL=1 decode path does not support.
+
+    The megakernel decodes owned requests outside vLLM's forward: a pure
+    megakernel step returns before the DP lockstep collective, the PP stage
+    handoff and the KV connector save, and only the DSpark drafter is fused
+    into it.
+    """
+    parallel_cfg = vllm_config.parallel_config
+    if parallel_cfg.tensor_parallel_size != 8:
+        raise NotImplementedError(
+            "VLLM_TPU_MUSE_MEGAKERNEL=1 requires tensor_parallel_size=8 "
+            f"on TPU, got {parallel_cfg.tensor_parallel_size}."
+        )
+    if parallel_cfg.data_parallel_size > 1:
+        raise NotImplementedError(
+            "VLLM_TPU_MUSE_MEGAKERNEL=1 does not support data_parallel_size > 1 "
+            f"(got {parallel_cfg.data_parallel_size}): megakernel-only steps skip "
+            "the DP lockstep collective."
+        )
+    if parallel_cfg.pipeline_parallel_size > 1:
+        raise NotImplementedError(
+            "VLLM_TPU_MUSE_MEGAKERNEL=1 does not support pipeline_parallel_size "
+            f"> 1 (got {parallel_cfg.pipeline_parallel_size})."
+        )
+    if vllm_config.kv_transfer_config is not None:
+        raise NotImplementedError(
+            "VLLM_TPU_MUSE_MEGAKERNEL=1 does not support KV connectors "
+            "(--kv-transfer-config): megakernel-decoded KV is not saved through "
+            "the connector."
+        )
+    spec_cfg = vllm_config.speculative_config
+    if spec_cfg is not None and spec_cfg.method != "dspark":
+        raise NotImplementedError(
+            "VLLM_TPU_MUSE_MEGAKERNEL=1 supports only the dspark speculative "
+            f"method, got {spec_cfg.method!r}."
+        )
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.tpu_info import get_chip_version
+
+    chip = get_chip_version()
+    if chip != pltpu.ChipVersion.TPU_7X:
+        raise NotImplementedError(
+            f"VLLM_TPU_MUSE_MEGAKERNEL=1 supports only TPU v7x, got {chip.value}."
+        )
+
+
 class TPUMuseSparkConfig(VerifyAndUpdateConfig):
     """MODELS_CONFIG_MAP hook for Muse Spark Open on TPU."""
 
@@ -236,6 +285,16 @@ class TPUMuseSparkConfig(VerifyAndUpdateConfig):
             )
             cache_config.block_size = 128  # type: ignore[assignment]
             cache_config.user_specified_block_size = True
+
+        if envs.VLLM_TPU_MUSE_MEGAKERNEL:
+            validate_megakernel_config(vllm_config)
+            sched_cfg = vllm_config.scheduler_config
+            if sched_cfg.async_scheduling is not False:
+                logger.info_once(
+                    "VLLM_TPU_MUSE_MEGAKERNEL=1: disabling async_scheduling for "
+                    "synchronous decode slot ownership."
+                )
+                sched_cfg.async_scheduling = False
 
         spec_config = vllm_config.speculative_config
         if (

@@ -35,6 +35,7 @@ from vllm.model_executor.models.utils import _flatten_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import merge_multimodal_embeddings_static
 
@@ -96,6 +97,10 @@ class MuseSparkForConditionalGeneration(MuseSparkForCausalLM, SupportsMultiModal
         logger.info(
             "Muse Spark perception: vision=%s audio=%s", enable_vision, enable_audio
         )
+        if envs.VLLM_TPU_MUSE_MEGAKERNEL:
+            from . import megakernel_fastpath as _mk_fp
+
+            _mk_fp.prepare_model_for_megakernel(self, vllm_config)
 
     def get_language_model(self) -> Any:
         return self
@@ -125,6 +130,10 @@ class MuseSparkForConditionalGeneration(MuseSparkForCausalLM, SupportsMultiModal
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         perception_loaded: set[str] = set()
+        use_mk = bool(envs.VLLM_TPU_MUSE_MEGAKERNEL)
+        _mk_fp: Any = None
+        if use_mk:
+            from . import megakernel_fastpath as _mk_fp
 
         def _text_weights():
             for name, tensor in weights:
@@ -136,10 +145,25 @@ class MuseSparkForConditionalGeneration(MuseSparkForCausalLM, SupportsMultiModal
                             for n in self.perception.load_weights([(name, tensor)])
                         )
                     continue
+                if (
+                    use_mk
+                    and _mk_fp is not None
+                    and _mk_fp.should_skip_expert_weight(name)
+                ):
+                    continue
                 yield name, tensor
 
         loaded = super().load_weights(_text_weights())
+        if use_mk and _mk_fp is not None:
+            loaded |= _mk_fp.skipped_expert_param_names(self)
         return loaded | perception_loaded
+
+    def process_weights_after_loading(self) -> None:
+        super().process_weights_after_loading()
+        if envs.VLLM_TPU_MUSE_MEGAKERNEL:
+            from . import megakernel_fastpath as _mk_fp
+
+            _mk_fp.build_for_model(self)
 
 
 __all__ = ["MuseSparkForConditionalGeneration", "muse_spark_enabled_towers"]
