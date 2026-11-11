@@ -13,8 +13,12 @@
 # limitations under the License.
 """The draft load barrier: ranks meet on the gloo world group before the draft
 model load, with vLLM's CPU distributed timeout when it is set, and the CPU
-collective timeout reaches the world group from the same vLLM option."""
+collective timeout reaches the world group from the same vLLM option. Every
+pipeline stage joins it, not only the last one, which hosts the draft."""
 
+import ast
+import inspect
+import textwrap
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -67,3 +71,73 @@ def test_vllm_parallel_config_exposes_the_cpu_timeout(seconds):
     config = ParallelConfig(cpu_distributed_timeout_seconds=seconds)
     expected = None if seconds is None else timedelta(seconds=seconds)
     assert config.cpu_distributed_timeout == expected
+
+
+class _Spec:
+    def __init__(self, method):
+        self.method = method
+
+    def use_eagle(self):
+        return self.method in ("eagle", "eagle3", "mtp")
+
+
+def _barrier_calls_per_stage(method, num_stages=8):
+    """Run the pre-draft-load step on a fake world of pipeline stages, where
+    only the last stage is an async drafter (it alone hosts the draft)."""
+    calls = [0] * num_stages
+    for pp_rank in range(num_stages):
+        spec = None if method is None else _Spec(method)
+        is_last = pp_rank == num_stages - 1
+        stage = SimpleNamespace(
+            speculative_config=spec,
+            _is_async_drafter=bool(
+                is_last
+                and spec is not None
+                and (spec.use_eagle() or spec.method == "dflash")
+            ),
+        )
+
+        def barrier(pp_rank=pp_rank):
+            calls[pp_rank] += 1
+
+        stage._draft_load_barrier = barrier
+        TPUModelRunner._maybe_draft_load_barrier(stage)
+    return calls
+
+
+@pytest.mark.parametrize("method", ["mtp", "eagle3", "dflash"])
+def test_every_pipeline_stage_joins_the_draft_load_barrier(method):
+    # A world-group barrier that only the last stage entered would leave it
+    # waiting for the other stages, which never arrive.
+    assert _barrier_calls_per_stage(method) == [1] * 8
+
+
+@pytest.mark.parametrize("method", [None, "ngram"])
+def test_no_draft_load_barrier_without_a_hidden_state_drafter(method):
+    assert _barrier_calls_per_stage(method) == [0] * 8
+
+
+def test_load_model_reaches_the_barrier_outside_the_drafter_branch():
+    """load_model must reach the barrier on every rank: not inside the
+    `if self._is_async_drafter:` branch, which only the last stage takes."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(TPUModelRunner.load_model)))
+    parents = {
+        child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+    }
+    names = {"_draft_load_barrier", "_maybe_draft_load_barrier"}
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in names
+    ]
+    assert calls, "load_model no longer reaches the draft load barrier"
+    for call in calls:
+        node = call
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, ast.If):
+                assert "_is_async_drafter" not in ast.unparse(node.test), (
+                    "the draft load barrier is gated on this stage hosting a draft"
+                )
