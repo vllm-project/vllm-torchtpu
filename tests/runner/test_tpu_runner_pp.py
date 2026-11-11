@@ -363,6 +363,7 @@ class TestRingStepPosting:
 
         runner = SimpleNamespace(
             execute_model_state=None,
+            _cpu_pinner=SimpleNamespace(maybe_pin=lambda: None),
             _update_states=lambda _so: None,
             scheduler_config=SimpleNamespace(async_scheduling=False),
             _mtp_prefill_only=False,

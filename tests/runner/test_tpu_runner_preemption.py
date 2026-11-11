@@ -31,6 +31,8 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 def test_async_results_do_not_overwrite_recomputed_request(transition, num_drafts):
     runner = object.__new__(TPUModelRunner)
     runner._min_tokens = MinTokensTracker()
+    runner._staged_block_table_reuse = {}
+    runner._cache_prompt_rows = False
     stride = 1 + num_drafts
     invalid = transition != "continue"
     states = {

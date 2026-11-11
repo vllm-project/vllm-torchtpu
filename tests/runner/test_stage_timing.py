@@ -139,3 +139,11 @@ def test_completed_stages_are_drained_in_record_order(events):
         [],
         [("0", "main_forward", 0.001), ("0", "sample", 0.002)],
     )
+
+
+def test_disabled_stage_timing_allocates_no_events(events):
+    timing = stage_timing.RunnerStageTiming(0, enabled=False)
+    with timing.stage("main_forward"), timing.host_stage("output_assembly"):
+        pass
+    assert events.call_count == 0
+    assert timing.take_samples() == ([], [])

@@ -622,13 +622,14 @@ def _patch_vllm_compile_all_ranges() -> None:
             len(to_compile),
             len(to_hand_over),
         )
+        live = max((getattr(b, "_tpu_trace", 0) for b in backends), default=0)
+        shape_variants.check_deferred_handover(to_compile, to_hand_over, live)
         if to_compile:
             compile_ranges(to_compile)
 
         # Only the last trace stays live (shape_variants.retrace replaced the
         # earlier ones), so only its refused buckets are handed over; an
         # earlier trace's would be checked against a graph that never runs.
-        live = max((getattr(b, "_tpu_trace", 0) for b in backends), default=0)
         for backend, range_entry in to_hand_over:
             if getattr(backend, "_tpu_trace", 0) == live:
                 compile_entry(backend, range_entry)

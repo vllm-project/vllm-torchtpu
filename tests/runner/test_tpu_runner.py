@@ -2959,6 +2959,7 @@ class TestInputStagingFence:
             _fenced_h2d_sources=[],
             _free_h2d_sources={},
             _registered_h2d_sources=set(),
+            _reuse_staged_block_tables=False,
             _token_padding_state=None,
             sequence_layout_planner=SimpleNamespace(
                 prepare_dummy=lambda **kw: SimpleNamespace(
@@ -3347,7 +3348,7 @@ def test_upload_unless_unchanged_reuses_only_identical_values(device):
     """Spec steps reuse the previous upload of a small tensor while its values
     repeat. New values, dtype or shape upload again, and slots never share an
     entry."""
-    runner = SimpleNamespace(device=device, _h2d_reuse={})
+    runner = SimpleNamespace(device=device, _h2d_reuse={}, _unfenced_h2d_sources=[])
 
     def upload(slot, host):
         return TPUModelRunner._upload_unless_unchanged(runner, slot, host)

@@ -18,6 +18,7 @@ import importlib.util
 import os
 from importlib import metadata as importlib_metadata
 
+import jax
 import requests
 from jax.experimental.pallas import tpu as pltpu
 
@@ -37,6 +38,7 @@ def get_tpu_metadata(key: str = "") -> str:
         accelerator_type_request = requests.get(
             os.path.join(GCE_TPU_ACCELERATOR_ENDPOINT, key),
             headers=GCE_TPU_HEADERS,
+            timeout=2.0,
         )
         if (
             accelerator_type_request.status_code == 200
@@ -61,6 +63,18 @@ def get_tpu_type() -> str:
     return tpu_type
 
 
+def _parse_chip_version(accelerator_type: str) -> pltpu.ChipVersion | None:
+    # ChipVersion's values are bare chip names ("7x", "v6e"); accelerator types
+    # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
+    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
+    # v5litepod and v7x are the only two that still differ after stripping.
+    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+    try:
+        return pltpu.ChipVersion(name)
+    except ValueError:
+        return None
+
+
 @functools.cache
 def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     """Resolves the TPU chip version without initializing a TPU client.
@@ -71,20 +85,65 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     warning when the accelerator type is unrecognized.
     """
     accelerator_type = accelerator_type or get_tpu_type() or ""
-    # ChipVersion's values are bare chip names ("7x", "v6e"); accelerator types
-    # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
-    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
-    # v5litepod and v7x are the only two that still differ after stripping.
-    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+    chip = _parse_chip_version(accelerator_type)
+    if chip is not None:
+        return chip
+    logger.warning(
+        "Unrecognized TPU accelerator type %r; defaulting to TPU7x static geometry.",
+        accelerator_type,
+    )
+    return pltpu.ChipVersion.TPU_7X
+
+
+_v7x_model_fastpaths: bool = False
+
+
+def set_v7x_model_fastpaths(enabled: bool) -> None:
+    """Enable or disable model-scoped TPU v7x kernel fast paths in this process."""
+    global _v7x_model_fastpaths
+    _v7x_model_fastpaths = bool(enabled)
+
+
+def v7x_model_fastpaths_enabled() -> bool:
+    """Return True when the active model opted into TPU v7x kernel fast paths."""
+    return _v7x_model_fastpaths and is_tpu_v7x()
+
+
+@functools.cache
+def _has_local_vfio_tpu() -> bool:
+    return os.path.isdir("/dev/vfio") and any(
+        entry.isdigit() for entry in os.listdir("/dev/vfio")
+    )
+
+
+def get_host_safe_tpu_info() -> pltpu.TpuInfo | None:
+    """Return static TpuInfo without opening PJRT, or None on CPU-only hosts."""
+    if envs.JAX_PLATFORMS == "cpu" or jax.config.jax_platforms == "cpu":
+        return None
+    tpu_type = envs.TPU_ACCELERATOR_TYPE
+    if tpu_type is None:
+        if not _has_local_vfio_tpu():
+            return None
+        tpu_type = get_tpu_type() or ""
+    chip = _parse_chip_version(tpu_type)
+    if chip is None:
+        return None
     try:
-        return pltpu.ChipVersion(name)
+        return pltpu.get_tpu_info_for_chip(chip, 1)
     except ValueError:
-        logger.warning(
-            "Unrecognized TPU accelerator type %r; defaulting to TPU7x "
-            "static geometry.",
-            accelerator_type,
-        )
-        return pltpu.ChipVersion.TPU_7X
+        return None
+
+
+def is_tpu_v7x() -> bool:
+    """Return True on TPU v7x without initializing PJRT in host processes."""
+    if envs.JAX_PLATFORMS == "cpu" or jax.config.jax_platforms == "cpu":
+        return False
+    tpu_type = envs.TPU_ACCELERATOR_TYPE
+    if tpu_type is None:
+        if not _has_local_vfio_tpu():
+            return False
+        tpu_type = get_tpu_type() or ""
+    return _parse_chip_version(tpu_type) == pltpu.ChipVersion.TPU_7X
 
 
 def get_libtpu_version() -> str | None:

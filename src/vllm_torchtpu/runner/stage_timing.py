@@ -37,20 +37,27 @@ class RunnerStageTiming:
 
     MAX_IN_FLIGHT_DEVICE_TIMINGS = 1024
 
-    def __init__(self, rank: int):
+    def __init__(self, rank: int, *, enabled: bool = True):
         self._rank = str(rank)
+        self._enabled = enabled
         self._cpu_samples: list[tuple[str, str, float]] = []
         # Includes active stages; saturation keeps CPU samples only.
         self._pending: deque[_PendingTiming] = deque()
 
     @contextlib.contextmanager
     def host_stage(self, stage: str) -> Iterator[None]:
+        if not self._enabled:
+            yield
+            return
         cpu_start = time.perf_counter()
         yield
         self._cpu_samples.append((self._rank, stage, time.perf_counter() - cpu_start))
 
     @contextlib.contextmanager
     def stage(self, stage: str) -> Iterator[None]:
+        if not self._enabled:
+            yield
+            return
         if len(self._pending) >= self.MAX_IN_FLIGHT_DEVICE_TIMINGS:
             with self.host_stage(stage):
                 yield

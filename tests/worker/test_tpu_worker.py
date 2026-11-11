@@ -81,6 +81,7 @@ def _build_worker(vllm_config, rank=0):
         worker.compilation_config = vllm_config.compilation_config
         worker.rank = rank
         worker.local_rank = 0
+        worker.distributed_init_method = "tcp://127.0.0.1:29500"
 
         # Now call __init__ (WorkerBase.__init__ is a no-op mock).
         worker.__init__(
@@ -345,6 +346,7 @@ def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
     worker.parallel_config = SimpleNamespace(
         data_parallel_size=1, enable_expert_parallel=expert_parallel
     )
+    worker.model_config = SimpleNamespace(is_hybrid=False)
     worker.vllm_config = SimpleNamespace(kv_transfer_config=None)
     worker.devices = []
     worker.model_runner = MagicMock(is_pooling_model=False)
@@ -590,6 +592,9 @@ def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
 
 
 def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
+    from vllm.config import DeviceConfig, VllmConfig
+
+    vllm_cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
     events = []
     config = object()
     monkeypatch.setattr(
@@ -600,11 +605,47 @@ def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
         lambda: events.append("release"),
     )
     worker = SimpleNamespace(
+        vllm_config=vllm_cfg,
         model_config=config,
         model_runner=SimpleNamespace(load_model=lambda: events.append("load")),
     )
     TPUWorker.load_model(worker)
     assert events == [("model_load", {"model_config": config}), "load", "release"]
+
+
+def test_load_model_binds_current_vllm_config_for_model_load_patches(monkeypatch):
+    from vllm.config import DeviceConfig, VllmConfig, get_current_vllm_config_or_none
+
+    seen_configs = []
+    prior_cfg = get_current_vllm_config_or_none()
+    vllm_cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    model_cfg = object()
+    monkeypatch.setattr(
+        patch_registry,
+        "apply",
+        lambda stage, **kwargs: seen_configs.append(
+            (stage, kwargs, get_current_vllm_config_or_none())
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker._release_free_host_heap",
+        lambda: None,
+    )
+    worker = SimpleNamespace(
+        vllm_config=vllm_cfg,
+        model_config=model_cfg,
+        model_runner=SimpleNamespace(
+            load_model=lambda: seen_configs.append(
+                ("load", {}, get_current_vllm_config_or_none())
+            )
+        ),
+    )
+    TPUWorker.load_model(worker)
+    assert seen_configs == [
+        ("model_load", {"model_config": model_cfg}, vllm_cfg),
+        ("load", {}, prior_cfg),
+    ]
+    assert get_current_vllm_config_or_none() is prior_cfg
 
 
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
@@ -768,6 +809,152 @@ def test_release_free_host_heap_falls_back_to_malloc_trim(monkeypatch):
     monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: FakeProcess())
     tpu_worker._release_free_host_heap()
     assert calls == [0]
+
+
+def test_init_device_single_device_dense_dp_clears_inherited_slice_bootstrap(
+    monkeypatch,
+):
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+    from vllm_torchtpu.worker import tpu_worker as worker_mod
+
+    addresses = ",".join(f"127.0.0.1:{8070 + i}" for i in range(8))
+    monkeypatch.setenv("TORCH_TPU_DP_SIZE", "8")
+    monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29600")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", addresses)
+    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "2x2x1")
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("RANK", "3")
+    monkeypatch.setenv("NNODES", "2")
+    monkeypatch.setenv("NODE_RANK", "1")
+    monkeypatch.setenv("TPU_NUM_HOSTS", "2")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+
+    cfg = _make_vllm_config()
+    pc = cfg.parallel_config
+    pc.world_size = 1
+    pc.tensor_parallel_size = 1
+    pc.pipeline_parallel_size = 1
+    pc.prefill_context_parallel_size = 1
+    pc.decode_context_parallel_size = 1
+    pc.enable_expert_parallel = False
+    pc.data_parallel_size = 8
+    pc.data_parallel_size_local = 8
+    pc.data_parallel_index = 3
+    pc.data_parallel_rank = 3
+    pc.data_parallel_rank_local = 3
+
+    worker = _build_worker(cfg, rank=0)
+    worker.devices = [torch.device("cpu")]
+    worker.is_driver_worker = True
+
+    topology_calls: list[int] = []
+    monkeypatch.setattr(
+        TpuPlatform,
+        "_get_tpu_topology",
+        classmethod(lambda cls, ws: topology_calls.append(ws) or "1x1x1"),
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "set_current_vllm_config",
+        lambda _cfg: patch.dict(os.environ, {}, clear=False),
+    )
+    monkeypatch.setattr(worker_mod, "init_distributed_environment", lambda **_: None)
+    monkeypatch.setattr(
+        worker_mod, "ensure_model_parallel_initialized", lambda **_: None
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    runner_kwargs: list[dict] = []
+    monkeypatch.setattr(
+        worker_mod,
+        "TPUModelRunner",
+        lambda *a, **kw: runner_kwargs.append(kw) or MagicMock(),
+    )
+    monkeypatch.setattr(worker_mod.dist_utils, "get_node_id", lambda: "node0")
+    monkeypatch.setattr(worker_mod.vllm_utils, "report_usage_stats", lambda _cfg: None)
+    with patch("vllm.platforms.current_platform") as mock_platform:
+        mock_platform.get_worker_distributed_backend.return_value = "gloo"
+        worker.init_device()
+
+    for cleared in (
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        "TORCH_TPU_TOPOLOGY",
+        "WORLD_SIZE",
+        "RANK",
+        "NNODES",
+        "NODE_RANK",
+        "TPU_NUM_HOSTS",
+    ):
+        assert cleared not in os.environ
+    assert os.environ["TPU_VISIBLE_CHIPS"] == "3"
+    assert os.environ["TPU_VISIBLE_DEVICES"] == "3"
+    assert topology_calls == []
+    assert runner_kwargs[0]["enable_cpu_pin"] is False
+
+
+def test_init_device_multi_device_dense_dp_narrows_slice_bootstrap(monkeypatch):
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+    from vllm_torchtpu.worker import tpu_worker as worker_mod
+
+    addresses = ",".join(f"127.0.0.1:{8070 + i}" for i in range(8))
+    monkeypatch.setenv("TORCH_TPU_DP_SIZE", "4")
+    monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29600")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", addresses)
+    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "2x2x1")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+
+    cfg = _make_vllm_config()
+    pc = cfg.parallel_config
+    pc.world_size = 2
+    pc.tensor_parallel_size = 2
+    pc.pipeline_parallel_size = 1
+    pc.prefill_context_parallel_size = 1
+    pc.decode_context_parallel_size = 1
+    pc.enable_expert_parallel = False
+    pc.data_parallel_size = 4
+    pc.data_parallel_size_local = 4
+    pc.data_parallel_index = 2
+    pc.data_parallel_rank = 2
+    pc.data_parallel_rank_local = 2
+
+    worker = _build_worker(cfg, rank=1)
+    worker.local_rank = 1
+    worker.devices = [torch.device("cpu")]
+    worker.is_driver_worker = False
+
+    monkeypatch.setattr(
+        TpuPlatform, "_get_tpu_topology", classmethod(lambda cls, ws: f"topo-{ws}")
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "set_current_vllm_config",
+        lambda _cfg: patch.dict(os.environ, {}, clear=False),
+    )
+    monkeypatch.setattr(worker_mod, "init_distributed_environment", lambda **_: None)
+    monkeypatch.setattr(
+        worker_mod, "ensure_model_parallel_initialized", lambda **_: None
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(worker_mod, "TPUModelRunner", lambda *a, **kw: MagicMock())
+    monkeypatch.setattr(worker_mod.dist_utils, "get_node_id", lambda: "node0")
+    monkeypatch.setattr(worker_mod.vllm_utils, "report_usage_stats", lambda _cfg: None)
+    with patch("vllm.platforms.current_platform") as mock_platform:
+        mock_platform.get_worker_distributed_backend.return_value = "gloo"
+        worker.init_device()
+
+    assert (
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"]
+        == "127.0.0.1:8074,127.0.0.1:8075"
+    )
+    assert os.environ["TORCH_TPU_TOPOLOGY"] == "topo-2"
+    assert os.environ["WORLD_SIZE"] == "2"
 
 
 if __name__ == "__mp_main__":

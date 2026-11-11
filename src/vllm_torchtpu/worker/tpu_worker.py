@@ -210,6 +210,7 @@ class TPUWorker(WorkerBase):
         # prepare_tpu_environment() in tpu_platform.py).
         pc = self.parallel_config
         dp_size = utils.get_dp_size(pc)
+        self._orig_dp_size = dp_size
         pcp_size = pc.prefill_context_parallel_size
         binding = get_tpu_worker_binding(
             pc,
@@ -286,50 +287,46 @@ class TPUWorker(WorkerBase):
                 init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
             else:
-                # Dense DP has no cross-rank collective, so each replica
-                # should bootstrap its own isolated torch_tpu slice instead
-                # of sharing check_and_update_config's full DP*TP-wide one
-                # (RANK/WORLD_SIZE above are already replica-local via
-                # binding.as_env()). Narrow the inherited full-slice
-                # TORCH_TPU_SLICEBUILDER_ADDRESSES down to just this
-                # replica's own per_engine_world workers -- narrowing
-                # (rather than each worker picking fresh ports
-                # independently) keeps the address list agreed upon by
-                # every worker in this replica, since it's sliced
-                # deterministically out of the same parent-established list
-                # every sibling worker also inherited.
-                full_sb_addresses = os.environ.get(
-                    "TORCH_TPU_SLICEBUILDER_ADDRESSES", ""
-                )
-                sb_addresses = full_sb_addresses.split(",") if full_sb_addresses else []
-                start = dp_rank * per_engine_world
-                my_sb_addresses = sb_addresses[start : start + per_engine_world]
-                if len(my_sb_addresses) == per_engine_world:
-                    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-                        my_sb_addresses
-                    )
+                if per_engine_world == 1:
+                    for name in (
+                        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+                        "TORCH_TPU_TOPOLOGY",
+                        "WORLD_SIZE",
+                        "RANK",
+                        "NNODES",
+                        "NODE_RANK",
+                        "TPU_NUM_HOSTS",
+                    ):
+                        os.environ.pop(name, None)
                 else:
-                    logger.warning(
-                        "Expected %d slicebuilder addresses for dp_rank=%d "
-                        "at offset %d, found %d in inherited list %r; "
-                        "leaving TORCH_TPU_SLICEBUILDER_ADDRESSES as-is.",
-                        per_engine_world,
-                        dp_rank,
-                        start,
-                        len(my_sb_addresses),
-                        full_sb_addresses,
+                    full_sb_addresses = os.environ.get(
+                        "TORCH_TPU_SLICEBUILDER_ADDRESSES", ""
                     )
-                from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+                    sb_addresses = (
+                        full_sb_addresses.split(",") if full_sb_addresses else []
+                    )
+                    start = dp_rank * per_engine_world
+                    my_sb_addresses = sb_addresses[start : start + per_engine_world]
+                    if len(my_sb_addresses) == per_engine_world:
+                        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+                            my_sb_addresses
+                        )
+                    else:
+                        logger.warning(
+                            "Expected %d slicebuilder addresses for dp_rank=%d "
+                            "at offset %d, found %d in inherited list %r; "
+                            "leaving TORCH_TPU_SLICEBUILDER_ADDRESSES as-is.",
+                            per_engine_world,
+                            dp_rank,
+                            start,
+                            len(my_sb_addresses),
+                            full_sb_addresses,
+                        )
+                    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
-                os.environ["TORCH_TPU_TOPOLOGY"] = TpuPlatform._get_tpu_topology(
-                    per_engine_world
-                )
-                # Request this worker's own physical chip explicitly,
-                # instead of relying on the flattened-rank chip binding EP
-                # uses, so independent replicas don't contend for the same
-                # chips. Both TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES must
-                # be set -- TorchTPU only honors the chip pin under the
-                # RANK/WORLD_SIZE distributed bootstrap when both agree.
+                    os.environ["TORCH_TPU_TOPOLOGY"] = TpuPlatform._get_tpu_topology(
+                        per_engine_world
+                    )
                 os.environ["TPU_VISIBLE_CHIPS"] = str(binding.native_local_rank)
                 os.environ["TPU_VISIBLE_DEVICES"] = str(binding.native_local_rank)
                 os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
@@ -337,6 +334,7 @@ class TPUWorker(WorkerBase):
                 init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
             local_rank_for_init = binding.init_local_rank
+            local_world_for_pin = binding.local_world_size
             dist_world_size = binding.world_size
             logger.info(
                 "TPU DP worker: dp_size=%d dp_rank=%d per_engine_world=%d "
@@ -389,6 +387,7 @@ class TPUWorker(WorkerBase):
                 init_rank = binding.init_rank
                 init_world = binding.init_world_size
                 local_rank_for_init = binding.init_local_rank
+                local_world_for_pin = binding.local_world_size
                 dist_world_size = binding.world_size
                 os.environ.update(binding.as_env())
             else:
@@ -413,6 +412,7 @@ class TPUWorker(WorkerBase):
                     )
                 init_rank = self.rank
                 init_world = pc.world_size
+                local_world_for_pin = tpu_local_world
                 dist_world_size = pc.world_size
                 _configure_tpu_process_env(
                     self.rank, tpu_local_rank_env, pc.world_size, tpu_local_world
@@ -487,6 +487,9 @@ class TPUWorker(WorkerBase):
             self.devices[0],
             profiler_rank=self.profile_rank,
             profiler_world_size=self.profile_world_size,
+            local_rank=self.local_rank,
+            local_world_size=local_world_for_pin,
+            enable_cpu_pin=(self._orig_dp_size == 1),
         )
         logger.info(
             "Init worker | "
@@ -648,23 +651,16 @@ class TPUWorker(WorkerBase):
         return available
 
     def _pooling_kv_cache_cap_bytes(self) -> int | None:
-        """Deterministic KV budget for pure pooling models, or None.
-
-        Pooling requests are prefill-only, so KV only has to hold the in-flight
-        steps plus the earlier chunks of requests still in chunked prefill.
-        The cap is derived from the config alone, so num_gpu_blocks (and thus
-        the backbone compile hash) is identical across restarts and ranks.
-        """
-        runner = getattr(self, "model_runner", None)
+        runner = self.model_runner
         setting = envs.VLLM_TPU_POOLING_KV_CACHE_TOKENS
         if (
             runner is None
-            or not getattr(runner, "is_pooling_model", False)
+            or not runner.is_pooling_model
             or setting == 0
             or self.cache_config.num_gpu_blocks_override is not None
             or self.parallel_config.pipeline_parallel_size > 1
             or self.vllm_config.kv_transfer_config is not None
-            or getattr(self.model_config, "is_hybrid", False)
+            or self.model_config.is_hybrid
         ):
             return None
         sc = self.scheduler_config
@@ -840,7 +836,8 @@ class TPUWorker(WorkerBase):
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         from vllm_torchtpu import patch_registry
 
-        patch_registry.apply("model_load", model_config=self.model_config)
+        with set_current_vllm_config(self.vllm_config):
+            patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
         # The host buffers the weights were staged in are freed, but the
         # allocator keeps their pages. Return them before initialize_from_config,
@@ -849,9 +846,7 @@ class TPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
-        if getattr(self, "speculative_config", None) is not None:
-            # Record the warm-up traces under the serving thread count. Other
-            # models keep upstream's warm-up at the startup count.
+        if self.speculative_config is not None:
             set_torch_threads_for_runtime()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
@@ -867,6 +862,12 @@ class TPUWorker(WorkerBase):
         maybe_attach_gc_debug_callback()
         _release_free_host_heap()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
+
+    def shutdown(self) -> None:
+        runner = self.model_runner
+        if runner is not None:
+            runner._cpu_pinner.close()
+        super().shutdown()
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
         """Kernel-iteration hot-reload: re-import the reloadable kernel

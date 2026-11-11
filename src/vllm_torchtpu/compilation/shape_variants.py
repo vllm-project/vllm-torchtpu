@@ -45,6 +45,8 @@ ShapeEnv, vLLM drops that guard, and nothing here can see it.
 from __future__ import annotations
 
 import contextlib
+import operator
+from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -64,6 +66,14 @@ class ShapeSpecializationError(RuntimeError):
     """A token bucket cannot be served by the graph asked to compile it."""
 
 
+def bucket_gate_edge(min_tokens: int) -> int:
+    """Return cap `c` so `T > c` selects power-of-2 buckets `>= min_tokens`."""
+    m = int(min_tokens)
+    if m <= 1:
+        return 0
+    return m // 2 if m & (m - 1) == 0 else m - 1
+
+
 # ---------------------------------------------------------------------------
 # What a trace assumed about the token count
 # ---------------------------------------------------------------------------
@@ -73,11 +83,21 @@ def _placeholder_value(node: fx.Node) -> Any:
     return node.meta.get("example_value", node.meta.get("val"))
 
 
-def _placeholder_values(graph: fx.GraphModule) -> list[Any]:
-    values = []
-    for node in graph.graph.nodes:
+def _placeholder_nodes(graph: fx.GraphModule) -> list[fx.Node]:
+    inner = getattr(graph, "graph", None)
+    if inner is None:
+        return []
+    nodes: list[fx.Node] = []
+    for node in inner.nodes:
         if node.op != "placeholder":
             break
+        nodes.append(node)
+    return nodes
+
+
+def _placeholder_values(graph: fx.GraphModule) -> list[Any]:
+    values = []
+    for node in _placeholder_nodes(graph):
         value = _placeholder_value(node)
         if value is not None:
             values.append(value)
@@ -149,23 +169,185 @@ def unsupported_reason(shape_env: Any, size: int) -> str | None:
     return None
 
 
+def _meta_entry(value: Any) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, torch.Tensor):
+        return type(value).__name__
+    dims = tuple("?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape)
+    return (str(value.dtype), dims)
+
+
 def _signature(graph: fx.GraphModule) -> tuple:
-    """The submodule input list a handed-over runnable has to match.
+    return tuple(_meta_entry(value) for value in _placeholder_values(graph))
 
-    Symbolic dims compare as "?", so the token dimension matches across traces
-    but a structural difference -- a split graph whose subgraph takes one chunk
-    in one variant and two in another -- does not.
-    """
 
-    def shape(value: Any) -> Any:
-        if not isinstance(value, torch.Tensor):
-            return type(value).__name__
-        dims = tuple(
-            "?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape
+def _handover_inputs(graph: fx.GraphModule) -> tuple[tuple[str, Any], ...]:
+    return tuple(
+        (node.name, _meta_entry(_placeholder_value(node)))
+        for node in _placeholder_nodes(graph)
+    )
+
+
+def _input_permutation(
+    stored: Sequence[tuple[str, Any]], current: Sequence[tuple[str, Any]]
+) -> list[int] | None:
+    if len(stored) != len(current):
+        return None
+    position = {entry: i for i, entry in enumerate(current)}
+    perm: list[int] = []
+    for entry in stored:
+        idx = position.get(entry)
+        if idx is None:
+            return None
+        perm.append(idx)
+    return perm
+
+
+def _scalar_values(graph: fx.GraphModule) -> tuple[Any, ...]:
+    out: list[Any] = []
+    for node in _placeholder_nodes(graph):
+        value = _placeholder_value(node)
+        if isinstance(value, torch.SymInt):
+            out.append(value.node.expr)
+        elif isinstance(value, int):
+            out.append(value)
+        else:
+            out.append(None)
+    return tuple(out)
+
+
+def _concretize(expr: Any, size: int) -> int:
+    if isinstance(expr, int) and not isinstance(expr, bool):
+        return expr
+    sym = sympy.sympify(expr)
+    if len(sym.free_symbols) > 1:
+        raise ShapeSpecializationError(
+            f"scalar placeholder {expr} depends on multiple symbols: {sym.free_symbols}"
         )
-        return (str(value.dtype), dims)
+    val = sym.subs({symbol: size for symbol in sym.free_symbols})
+    if not getattr(val, "is_integer", False):
+        raise ShapeSpecializationError(
+            f"scalar placeholder {expr} at size={size} is non-integer: {val}"
+        )
+    return int(val)
 
-    return tuple(shape(value) for value in _placeholder_values(graph))
+
+def _scalar_adapter(
+    stored: Sequence[tuple[str, Any]],
+    stored_scalars: Sequence[Any],
+    current: Sequence[tuple[str, Any]],
+    current_scalars: Sequence[Any],
+    size: int | None,
+) -> tuple[Callable[[tuple], tuple], list[str]] | None:
+    if size is None:
+        return None
+    stored_t = [i for i, v in enumerate(stored_scalars) if v is None]
+    current_t = [i for i, v in enumerate(current_scalars) if v is None]
+    if len(stored_t) != len(current_t):
+        return None
+    curr_names = [current[j][0] for j in current_t]
+    curr_by_name = (
+        {current[j][0]: j for j in current_t}
+        if len(set(curr_names)) == len(curr_names)
+        else {}
+    )
+    source: list[int] = [-1] * len(stored_t)
+    for k, i in enumerate(stored_t):
+        sname, smeta = stored[i]
+        j = curr_by_name.get(sname)
+        if j is not None:
+            if current[j][1] != smeta:
+                return None
+            source[k] = j
+    matched_j = [j for j in source if j != -1]
+    if len(set(matched_j)) != len(matched_j):
+        return None
+    unmatched_k = [k for k, j in enumerate(source) if j == -1]
+    if unmatched_k:
+        used = set(matched_j)
+        rem_j = [j for j in current_t if j not in used]
+        if any(
+            stored[stored_t[k]][1] != current[j][1]
+            for k, j in zip(unmatched_k, rem_j, strict=True)
+        ):
+            return None
+        if len(unmatched_k) > 1 and len(
+            {stored[stored_t[k]][1] for k in unmatched_k}
+        ) != len(unmatched_k):
+            return None
+        for k, j in zip(unmatched_k, rem_j, strict=True):
+            source[k] = j
+    plan: list[tuple[bool, Any]] = [(False, None)] * len(stored)
+    for i, j in zip(stored_t, source, strict=True):
+        plan[i] = (True, j)
+    filled: list[str] = []
+    for i, value in enumerate(stored_scalars):
+        if value is not None:
+            concrete_val = _concretize(value, size)
+            plan[i] = (False, concrete_val)
+            filled.append(f"{stored[i][0]}={value}->{concrete_val}")
+
+    def adapt(args: tuple) -> tuple:
+        return tuple(args[x] if is_arg else x for is_arg, x in plan)
+
+    return adapt, filled
+
+
+def _signature_delta(stored: Sequence[Any], current: Sequence[Any]) -> str:
+    def render(counts: Counter) -> str:
+        if not counts:
+            return "nothing"
+        by_count = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))
+        return ", ".join(f"{count}x {item}" for item, count in by_count)
+
+    return (
+        f"{len(stored)} inputs vs {len(current)}. "
+        f"Only in earlier trace: {render(Counter(stored) - Counter(current))}. "
+        f"Only in current trace: {render(Counter(current) - Counter(stored))}"
+    )
+
+
+def _non_tensor_inputs(graph: fx.GraphModule) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for node in _placeholder_nodes(graph):
+        value = _placeholder_value(node)
+        if value is not None and not isinstance(value, torch.Tensor):
+            out[node.name] = str(value)
+    return out
+
+
+def _named_delta(
+    stored: Sequence[tuple[str, Any]],
+    current: Sequence[tuple[str, Any]],
+    stored_scalars: dict[str, str],
+    current_scalars: dict[str, str],
+) -> str:
+    def render(entries: list[tuple[str, Any]], scalars: dict[str, str]) -> str:
+        if not entries:
+            return "nothing"
+        shown = [
+            f"{name}={scalars[name]}" if name in scalars else f"{name}:{meta}"
+            for name, meta in entries[:8]
+        ]
+        more = f" (+{len(entries) - 8} more)" if len(entries) > 8 else ""
+        return ", ".join(shown) + more
+
+    only_stored = [e for e in stored if e not in set(current)]
+    only_current = [e for e in current if e not in set(stored)]
+    return (
+        f"by name, only in earlier trace: {render(only_stored, stored_scalars)}; "
+        f"only in current trace: {render(only_current, current_scalars)}"
+    )
+
+
+def _handover_error(key: str, delta: str) -> ShapeSpecializationError:
+    return ShapeSpecializationError(
+        f"{key} was compiled by another trace of this model whose inputs "
+        f"differ beyond reordering or scalar SymInts ({delta}). Both sides of "
+        "a token-count branch must lift the same tensor buffers and subgraph "
+        "boundaries for bucket hand-over; unset TPU_KERNEL_ITER_MODE if set."
+    )
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:
@@ -195,27 +377,75 @@ class BucketExecutables:
 
     def __init__(self) -> None:
         self._runnables: dict[
-            tuple[str | None, str], tuple[Callable[..., Any], tuple]
+            tuple[str | None, str],
+            tuple[Callable[..., Any], tuple, tuple, dict[str, str], tuple],
         ] = {}
         self.refused: set[int] = set()
         self.traces = 0
 
     def get(
-        self, cache_dir: str | None, key: str, graph: fx.GraphModule
+        self,
+        cache_dir: str | None,
+        key: str,
+        graph: fx.GraphModule,
+        size: int | None = None,
     ) -> Callable[..., Any] | None:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature = found
-        if signature != _signature(graph):
-            raise ShapeSpecializationError(
-                f"{key} was compiled by another trace of this model whose "
-                f"inputs differ ({signature} vs {_signature(graph)}). The "
-                "graph is split, so its subgraph boundaries move with the "
-                "specialization and a bucket cannot be handed between traces; "
-                "unset TPU_KERNEL_ITER_MODE to serve this model."
+        runnable, stored, stored_signature, stored_named, stored_scalars = found
+        current = _handover_inputs(graph)
+        if stored == current:
+            return runnable
+        perm = None
+        if sorted(name for name, _ in stored) != sorted(name for name, _ in current):
+            signature = _signature(graph)
+            if signature == stored_signature:
+                return runnable
+            delta = _signature_delta(stored_signature, signature)
+        else:
+            perm = _input_permutation(stored, current)
+            delta = _signature_delta(stored, current)
+        if perm is None:
+            adapter = _scalar_adapter(
+                stored, stored_scalars, current, _scalar_values(graph), size
             )
-        return runnable
+            if adapter is None:
+                raise _handover_error(
+                    key,
+                    delta
+                    + "; "
+                    + _named_delta(
+                        stored, current, stored_named, _non_tensor_inputs(graph)
+                    ),
+                )
+            adapt, filled = adapter
+            logger.info(
+                "[shape-variants] %s handed over across scalar-input difference "
+                "(%d inputs vs %d; bucket %s scalars: %s)",
+                key,
+                len(stored),
+                len(current),
+                size,
+                ", ".join(filled) or "none",
+            )
+
+            def adapted(*args: Any) -> Any:
+                return runnable(*adapt(args))
+
+            return adapted
+        logger.info(
+            "[shape-variants] %s handed over with %d of %d inputs reordered",
+            key,
+            sum(j != i for i, j in enumerate(perm)),
+            len(perm),
+        )
+        to_stored_order = operator.itemgetter(*perm)
+
+        def reordered(*args: Any) -> Any:
+            return runnable(*to_stored_order(args))
+
+        return reordered
 
     def put(
         self,
@@ -224,7 +454,13 @@ class BucketExecutables:
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
     ) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
+        self._runnables[(cache_dir, key)] = (
+            runnable,
+            _handover_inputs(graph),
+            _signature(graph),
+            _non_tensor_inputs(graph),
+            _scalar_values(graph),
+        )
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.
@@ -253,19 +489,15 @@ def warmup() -> Iterator[BucketExecutables]:
         _session = None
 
 
+def in_warmup() -> bool:
+    return _session is not None
+
+
 def runnable_for(
     cache_dir: str | None, key: str, graph: fx.GraphModule, size: int | None = None
 ) -> Callable[..., Any] | None:
-    """What this compile should use instead of compiling, if anything.
-
-    The load path is screened too: the cache key is (subgraph, bucket) with no
-    graph identity, so a graph would otherwise adopt an executable another
-    trace compiled and wrap it in its own aot_autograd wrapper. On TPU that
-    executes as "Donation requested for invalid buffer".
-    Refusing here leaves the bucket to the trace that owns it, which is the
-    only one that can rebuild a wrapper matching the executable.
-    """
-    ready = _session.get(cache_dir, key, graph) if _session else None
+    """Return a handed-over or refusing runnable, or None to compile normally."""
+    ready = _session.get(cache_dir, key, graph, size) if _session else None
     if ready is not None:
         logger.info("[shape-variants] %s handed over by an earlier trace", key)
         return ready
@@ -527,3 +759,38 @@ def _placeholder_runnable(
         return run
 
     return for_size
+
+
+def _entry_cache_key(backend: Any, entry: Any) -> tuple[str | None, str, int] | None:
+    r = entry.compile_range
+    if not r.is_single_size():
+        return None
+    compiler = getattr(
+        getattr(backend.vllm_backend, "compiler_manager", None), "compiler", None
+    )
+    key = (
+        f"artifact_compile_range_{r.start}_{r.end}"
+        f"_subgraph_{backend.piecewise_compile_index}"
+    )
+    return getattr(compiler, "cache_dir", None), key, r.start
+
+
+def check_deferred_handover(
+    to_compile: Sequence[tuple[Any, Any]],
+    to_hand_over: Sequence[tuple[Any, Any]],
+    live_trace: int,
+) -> None:
+    """Validate deferred bucket hand-overs upfront before running XLA compiles."""
+    dry = BucketExecutables()
+    for backend, entry in to_compile:
+        resolved = _entry_cache_key(backend, entry)
+        if resolved is not None:
+            cache_dir, key, _ = resolved
+            dry.put(cache_dir, key, backend.graph, lambda *a: a)
+    for backend, entry in to_hand_over:
+        if getattr(backend, "_tpu_trace", 0) != live_trace:
+            continue
+        resolved = _entry_cache_key(backend, entry)
+        if resolved is not None:
+            cache_dir, key, start = resolved
+            dry.get(cache_dir, key, backend.graph, start)

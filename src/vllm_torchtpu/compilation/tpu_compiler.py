@@ -266,12 +266,20 @@ _NATIVE_TPU_COMPILE_ENV_VARS = (
 _RUNTIME_CACHE_KEY_PATHS = (
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
+    "vllm_torchtpu/compilation/aot_guard_skip.py",
+    "vllm_torchtpu/compilation/foreach_epilogue.py",
+    "vllm_torchtpu/compilation/shape_variants.py",
+    "vllm_torchtpu/runner/utils.py",
     "vllm_torchtpu/kernels",
     "vllm_torchtpu/layers/core",
     "vllm_torchtpu/layers/adapter/attention.py",
     "vllm_torchtpu/layers/adapter/cp_attention.py",
+    "vllm_torchtpu/layers/adapter/cp_mla_attention.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
+    "vllm_torchtpu/layers/adapter/moe_hierarchical.py",
+    "vllm_torchtpu/layers/adapter/moe_routing.py",
+    "vllm_torchtpu/layers/adapter/token_padding.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate
@@ -288,6 +296,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/distributed/pcp.py",
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
+    "vllm_torchtpu/distributed/dcp_comm.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
     # `prefill_checkpoint_enabled` decides whether the GDN op traces with
     # prefill checkpoint operands or with constant None inputs.
@@ -296,6 +305,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
+    "vllm_torchtpu/tpu_info.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
     # Builds the chip-pair wo_a o-fetch Pallas op.
     "vllm_torchtpu/models/vllm/deepseek_v4/attn_intra_chip.py",

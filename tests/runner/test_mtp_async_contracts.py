@@ -87,6 +87,8 @@ def make_runner(device, monkeypatch, k):
     runner._read_offset_scratch = {}
     runner._last_sequence_layout_plan = None
     runner._fast_token_substitution = False
+    runner._staged_block_table_reuse = {}
+    runner._cache_prompt_rows = False
     # Real upstream batch operations and CPU token buffers. The kernels being
     # checked (offset reset / source assembly / substitution / D2H) use TPU.
     runner.input_batch = InputBatch(
@@ -343,6 +345,8 @@ def test_proposed_drafts_reach_next_inputs(device, k, mode):
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=k)
     runner._last_sequence_layout_plan = None
     runner._fast_token_substitution = False
+    runner._staged_block_table_reuse = {}
+    runner._cache_prompt_rows = False
     drafts = torch.tensor(
         [list(range(101, 101 + k)), list(range(201, 201 + k))],
         dtype=torch.int32,

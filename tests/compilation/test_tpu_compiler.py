@@ -276,11 +276,18 @@ class TestTpuCompilerCache:
             if path in excluded_files or path.startswith(excluded_dirs)
         }
         assert {
+            "vllm_torchtpu/compilation/aot_guard_skip.py",
+            "vllm_torchtpu/compilation/shape_variants.py",
+            "vllm_torchtpu/distributed/dcp_comm.py",
             "vllm_torchtpu/gdn_pool_layout.py",
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
+            "vllm_torchtpu/layers/adapter/cp_mla_attention.py",
+            "vllm_torchtpu/layers/adapter/moe_hierarchical.py",
+            "vllm_torchtpu/layers/adapter/moe_routing.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+            "vllm_torchtpu/runner/utils.py",
         } <= hashed
 
     def test_runtime_hash_excluded_kernels_stay_omni_only(self):

@@ -128,6 +128,12 @@ def _make_runner(
     runner._cached_logits_indices = None
     runner._cached_request_distribution = None
     runner._h2d_reuse = {}
+    runner._sampling_h2d_in_flight = {}
+    runner._staged_block_table_reuse = {}
+    runner._reuse_staged_block_tables = False
+    runner._cache_prompt_rows = False
+    runner._steady_sampling_h2d_reuse = False
+    runner._cpu_pinner = SimpleNamespace(maybe_pin=lambda: None, close=lambda: None)
     runner._upload_unless_unchanged = types.MethodType(
         TPUModelRunner._upload_unless_unchanged, runner
     )

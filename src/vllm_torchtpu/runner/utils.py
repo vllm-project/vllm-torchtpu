@@ -474,6 +474,25 @@ def relayout_rope_caches(model: torch.nn.Module):
     logger.info("Row-major relayouted %d rope caches", num_changed)
 
 
+def upcast_norm_weights(model: torch.nn.Module) -> None:
+    """Store learned RMSNorm weights in float32 to skip per-step casts."""
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    num_changed = 0
+    for module in model.modules():
+        weight: torch.Tensor | None = getattr(module, "weight", None)
+        if (
+            isinstance(module, RMSNorm)
+            and module.has_weight
+            and weight is not None
+            and isinstance(weight, torch.nn.Parameter)
+            and weight.dtype != torch.float32
+        ):
+            weight.data = weight.data.to(torch.float32)
+            num_changed += 1
+    logger.info("Stored %d RMSNorm weights in float32", num_changed)
+
+
 def relayout_hash_tables(model: torch.nn.Module):
     """Re-materialize every MOE hash-routing table row-major."""
     seen: set[int] = set()

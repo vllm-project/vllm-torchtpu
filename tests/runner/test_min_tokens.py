@@ -417,6 +417,8 @@ def test_update_states_tracks_new_requests_and_forgets_finished_ones():
     runner._mamba_state_pos, runner._mamba_slot_by_req_id = {}, {}
     runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
     runner._pre_async_results = None
+    runner._staged_block_table_reuse = {}
+    runner._cache_prompt_rows = False
     runner.requests = {}
     runner._install_spec_token_room_guard = lambda: None
     new_req = SimpleNamespace(
@@ -450,6 +452,8 @@ def test_update_states_keeps_preempted_and_resumed_requests():
     runner._mamba_state_pos, runner._mamba_slot_by_req_id = {}, {}
     runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
     runner._pre_async_results = None
+    runner._staged_block_table_reuse = {}
+    runner._cache_prompt_rows = False
     runner.requests = {}
     runner._install_spec_token_room_guard = lambda: None
     for preempted, resumed in (({"p"}, set()), (None, {"p"})):
@@ -606,6 +610,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             )
         },
         _pre_async_results=None,
+        _unfenced_h2d_sources=[],
         _pp_wave=None,
         _dp_step_other_decode=False,
         _min_tokens=min_tokens.MinTokensTracker(),

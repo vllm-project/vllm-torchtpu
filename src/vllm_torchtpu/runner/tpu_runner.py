@@ -91,7 +91,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, tpu_info, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -139,6 +139,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
+    _noop_release,
     attention_block_table_width,
     stage_block_table_uploads,
     stage_h2d_upload,
@@ -165,6 +166,7 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
+from vllm_torchtpu.runner.prompt_rows import cache_prompt_rows
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -413,6 +415,22 @@ def _substitute_placeholder_token(
 logger = init_logger(__name__)
 
 
+@contextmanager
+def _clear_compile_levers(always: bool) -> Iterator[None]:
+    from vllm_torchtpu.compilation import aot_guard_skip, foreach_epilogue
+
+    try:
+        yield
+    except Exception:
+        aot_guard_skip.set_active(False)
+        foreach_epilogue.set_active(False)
+        raise
+    finally:
+        if always:
+            aot_guard_skip.set_active(False)
+            foreach_epilogue.set_active(False)
+
+
 def _pp_step[**P, R](
     method: Callable[Concatenate[Any, P], R],
 ) -> Callable[Concatenate[Any, P], R]:
@@ -537,6 +555,14 @@ SAMPLING_EPS = 1e-5
 
 def _get_sequence_layout_planner_for_runner(runner: Any):
     return runner.sequence_layout_planner
+
+
+def _req_exceeds_most_model_len(runner: Any, req_index: int, num_tokens: int) -> bool:
+    if runner.most_model_len is None:
+        return True
+    computed_arr = getattr(runner.input_batch, "num_computed_tokens_cpu", None)
+    computed = int(computed_arr[req_index]) if computed_arr is not None else 0
+    return computed + num_tokens > runner.most_model_len
 
 
 def _validate_libtpu_version() -> None:
@@ -728,6 +754,9 @@ class TPUModelRunner(GPUModelRunner):
         *,
         profiler_rank: int,
         profiler_world_size: int,
+        local_rank: int = 0,
+        local_world_size: int | None = None,
+        enable_cpu_pin: bool | None = None,
     ):
         # Slice-global rank/world used to label phased-profiler traces; the
         # worker resolves them from the TPU rank binding. Required rather than
@@ -735,6 +764,7 @@ class TPUModelRunner(GPUModelRunner):
         # wrong scope and fails silently. See `_init_phased_profiling`.
         self._profiler_rank = profiler_rank
         self._profiler_world_size = profiler_world_size
+        self.local_rank = int(local_rank)
         pcp_config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
         self._pcp_enabled = pcp_config.enabled
         self._mtp_enabled = pcp_config.speculative_method == "mtp"
@@ -946,12 +976,21 @@ class TPUModelRunner(GPUModelRunner):
         self._fast_token_substitution: bool = bool(
             envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
         )
-        # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
-        # block_table capacity if already created during super().__init__().
-        # This ensures that calculations derived from max_num_blocks_per_req
-        # (such as spec-decode warmup block count `nblk`) strictly respect the
-        # actual BlockTable allocation limits, preventing bounds mismatch errors
-        # (e.g., broadcasting shape (8,) into capacity (5,)).
+        single_dp_no_transfer = (
+            self.parallel_config.data_parallel_size == 1
+            and vllm_config.kv_transfer_config is None
+        )
+        self._reuse_staged_block_tables: bool = single_dp_no_transfer
+        self._staged_block_table_reuse: dict[tuple, tuple] = {}
+        steady_no_apc_no_spec = (
+            not cache_config.enable_prefix_caching
+            and vllm_config.kv_transfer_config is None
+            and vllm_config.speculative_config is None
+        )
+        self._cache_prompt_rows: bool = steady_no_apc_no_spec
+        self._steady_sampling_h2d_reuse: bool = (
+            steady_no_apc_no_spec and single_dp_no_transfer
+        )
         self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
         if (
             hasattr(self, "input_batch")
@@ -1107,6 +1146,12 @@ class TPUModelRunner(GPUModelRunner):
         # Last upload per `_upload_unless_unchanged` slot:
         # (key, device tensor, host source).
         self._h2d_reuse: dict[str, tuple[tuple, torch.Tensor, torch.Tensor]] = {}
+        # Per-chunk in-flight sampling H2D fence + host tensor keepalives, kept
+        # separate from `_input_staging_fence` so `sample_tokens()` never blocks
+        # the next step's `_prepare_inputs` on the previous forward pass.
+        self._sampling_h2d_in_flight: dict[
+            int, tuple[Any, tuple[torch.Tensor, ...]]
+        ] = {}
 
         self.speculative_config = self.vllm_config.speculative_config
         speculative_config = self.speculative_config
@@ -1177,7 +1222,25 @@ class TPUModelRunner(GPUModelRunner):
         self._greedy_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._stage_timing = RunnerStageTiming(
+            profiler_rank,
+            enabled=vllm_config.kv_transfer_config is not None,
+        )
+        from vllm_torchtpu.worker.cpu_pin import WorkerCpuPinner
+
+        self._cpu_pinner = WorkerCpuPinner(
+            enabled=(
+                self.parallel_config.data_parallel_size == 1
+                if enable_cpu_pin is None
+                else enable_cpu_pin
+            ),
+            local_rank=self.local_rank,
+            local_world_size=(
+                self.parallel_config.world_size
+                if local_world_size is None
+                else local_world_size
+            ),
+        )
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -2841,6 +2904,18 @@ class TPUModelRunner(GPUModelRunner):
             else scheduler_output
         )
         result = super()._update_states(base_output)
+        if (
+            scheduler_output.finished_req_ids
+            or scheduler_output.scheduled_new_reqs
+            or scheduler_output.preempted_req_ids
+        ):
+            self._staged_block_table_reuse.clear()
+        if self._cache_prompt_rows and scheduler_output.scheduled_new_reqs:
+            cache_prompt_rows(
+                self.requests,
+                self.input_batch,
+                (new_req.req_id for new_req in scheduler_output.scheduled_new_reqs),
+            )
         self._min_tokens.discard(scheduler_output.finished_req_ids)
         for new_req in scheduler_output.scheduled_new_reqs:
             self._min_tokens.add(new_req.req_id, new_req.sampling_params)
@@ -3299,10 +3374,8 @@ class TPUModelRunner(GPUModelRunner):
             req_id = self.input_batch.req_ids[i]
             assert req_id is not None
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            if (
-                not use_max_model_len
-                and self.most_model_len is not None
-                and num_tokens > self.most_model_len
+            if not use_max_model_len and _req_exceeds_most_model_len(
+                self, i, num_tokens
             ):
                 use_max_model_len = True
             num_scheduled_tokens_per_req.append(num_tokens)
@@ -3822,22 +3895,33 @@ class TPUModelRunner(GPUModelRunner):
                 release_cb()
             self._fenced_h2d_sources.clear()
 
-    def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
-        """`host.to(self.device)`, reusing `slot`'s previous upload when the
-        values have not changed.
-
-        Spec-decode steps miss the decode-only cache in `_prepare_inputs`, yet
-        in steady decode most of their small index tensors repeat step after
-        step. One entry per slot keeps memory bounded however the values vary.
-        The entry also holds `host`, so a temporary array stays alive while its
-        non-blocking upload may still be reading it.
-        """
-        key = (host.dtype, tuple(host.shape), host.numpy().tobytes())
+    def _upload_unless_unchanged(
+        self,
+        slot: str,
+        host: torch.Tensor,
+        device: torch.device | None = None,
+        keepalive: list[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        target = self.device if device is None else device
+        contig = host.contiguous()
+        key = (
+            str(target),
+            host.dtype,
+            tuple(host.shape),
+            contig.reshape(-1).view(torch.uint8).numpy().tobytes(),
+        )
         prev = self._h2d_reuse.get(slot)
         if prev is not None and prev[0] == key:
             return prev[1]
-        dev = host.to(self.device, non_blocking=True)
-        self._h2d_reuse[slot] = (key, dev, host)
+        snap = contig.clone()
+        if keepalive is not None:
+            keepalive.append(snap)
+            if prev is not None:
+                keepalive.append(prev[2])
+        else:
+            self._unfenced_h2d_sources.append((snap, _noop_release))
+        dev = snap.to(target, non_blocking=True)
+        self._h2d_reuse[slot] = (key, dev, snap)
         return dev
 
     def _execute_mm_encoder(
@@ -3938,10 +4022,8 @@ class TPUModelRunner(GPUModelRunner):
                 req_id = self.input_batch.req_ids[i]
                 assert req_id is not None
                 num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                if (
-                    not use_max_model_len
-                    and self.most_model_len is not None
-                    and num_tokens > self.most_model_len
+                if not use_max_model_len and _req_exceeds_most_model_len(
+                    self, i, num_tokens
                 ):
                     use_max_model_len = True
 
@@ -3968,13 +4050,15 @@ class TPUModelRunner(GPUModelRunner):
         ]
         start_index = 0
         while start_index < num_reqs:
-            counts = all_counts[start_index:]
-            if self.most_model_len is None or max(counts) > self.most_model_len:
+            if self.most_model_len is None or any(
+                _req_exceeds_most_model_len(self, j, all_counts[j])
+                for j in range(start_index, num_reqs)
+            ):
                 chunk_reqs = self.num_reqs_max_model_len
             else:
                 assert self.num_reqs_most_model_len is not None
                 chunk_reqs = self.num_reqs_most_model_len
-            counts = counts[:chunk_reqs]
+            counts = all_counts[start_index : start_index + chunk_reqs]
             rows.append(
                 planner.padded_num_tokens(
                     runner=self,
@@ -4156,7 +4240,7 @@ class TPUModelRunner(GPUModelRunner):
             # Before anything reads the step layout, the DP token sync
             # included: the rest of the step runs on the trimmed copy.
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
-        # Update cached state
+        self._cpu_pinner.maybe_pin()
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
@@ -4465,6 +4549,8 @@ class TPUModelRunner(GPUModelRunner):
                     mesh=self.mesh,
                     vllm_config=self.vllm_config,
                     kv_cache_bundle=self._kv_cache_bundle,
+                    query_start_loc_cpu=self.query_start_loc_np[: num_reqs + 1],
+                    seq_lens_cpu=self.seq_lens_np[:num_reqs],
                 ),
                 self._stage_timing.stage("main_forward"),
             ):
@@ -5423,10 +5509,6 @@ class TPUModelRunner(GPUModelRunner):
                 self._update_num_xla_graphs("decoding_step")
                 cur_start_idx = cur_end_idx
 
-        # NOTE: current kv load and save get h2d/d2h copies involved.
-        # Those copies are blocking. Once they become async., kv_save
-        # should be called right after each single forward pass,
-        # instead of the forwards of the entire input batch.
         logprobs = []
         if needs_logprobs and len(combined_logprobs):
             # TODO: concatenate the LogprobsTensors (torch) first, then
@@ -5766,16 +5848,22 @@ class TPUModelRunner(GPUModelRunner):
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
 
-        # Set TPU-specific quantization config before model loading.
-        # This ensures that TPU-compatible quantization methods are used
-        # instead of the default GPU-based ones (e.g., MXFP4 for MoE models).
-        # For unquantized models (quantization=None), we still need to apply
-        # our TPU config to override vLLM's default UnquantizedFusedMoEMethod
-        # which uses torch_xla.
+        from vllm_torchtpu.compilation import aot_guard_skip, foreach_epilogue
+
         logger.info(
             "Setting TPU quantization config for: %s", self.model_config.quantization
         )
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
+
+        host_compile_levers = (
+            tpu_info.v7x_model_fastpaths_enabled()
+            and aot_guard_skip.should_enable(self.vllm_config)
+        )
+        aot_guard_skip.set_active(host_compile_levers)
+        foreach_epilogue.set_active(host_compile_levers)
+        if host_compile_levers:
+            aot_guard_skip.install()
+            foreach_epilogue.install()
 
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
@@ -7276,7 +7364,10 @@ class TPUModelRunner(GPUModelRunner):
             assert isinstance(lora_manager, TPUWorkerLoRAManager)
             with self._precompile_timed("LoRA adapter activation"):
                 lora_manager.precompile_activation()
-        with self.maybe_setup_dummy_loras(self.lora_config):
+        with (
+            self.maybe_setup_dummy_loras(self.lora_config),
+            _clear_compile_levers(True),
+        ):
             with self._precompile_timed("model backbone"):
                 self._precompile_backbone()
 
@@ -8460,7 +8551,7 @@ class TPUModelRunner(GPUModelRunner):
         # The request caps already reflect the finalized block size: vLLM
         # calls get_kv_cache_spec() (which refreshes them) before
         # determine_available_memory() reaches this profile run.
-        with set_current_vllm_config(self.vllm_config):
+        with set_current_vllm_config(self.vllm_config), _clear_compile_levers(False):
             self._initialize_attention_kernels()
             # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
             _get_quantized_matmul_op()
@@ -8791,11 +8882,52 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
         )
 
-        return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+        temps_col = temps_cpu.unsqueeze(1)
+        top_k_col = top_k_cpu.unsqueeze(1)
+        top_p_col = top_p_cpu.unsqueeze(1)
+        prev_flight = self._sampling_h2d_in_flight.pop(cur_start_idx, None)
+        if prev_flight is not None:
+            prev_flight[0].synchronize()
+        if self._steady_sampling_h2d_reuse:
+            keepalive: list[torch.Tensor] = []
+            out = (
+                self._upload_unless_unchanged(
+                    f"sampling_temperature_{cur_start_idx}",
+                    temps_col,
+                    logits.device,
+                    keepalive=keepalive,
+                ),
+                self._upload_unless_unchanged(
+                    f"sampling_top_k_{cur_start_idx}",
+                    top_k_col,
+                    logits.device,
+                    keepalive=keepalive,
+                ),
+                self._upload_unless_unchanged(
+                    f"sampling_top_p_{cur_start_idx}",
+                    top_p_col,
+                    logits.device,
+                    keepalive=keepalive,
+                ),
+            )
+            if keepalive and logits.device.type == "tpu":
+                fence = cast(Any, torch).tpu.Event()
+                fence.record()
+                self._sampling_h2d_in_flight[cur_start_idx] = (fence, tuple(keepalive))
+            return out
+        out = (
+            temps_col.to(logits.device, non_blocking=True),
+            top_k_col.to(logits.device, non_blocking=True),
+            top_p_col.to(logits.device, non_blocking=True),
         )
+        if logits.device.type == "tpu":
+            fence = cast(Any, torch).tpu.Event()
+            fence.record()
+            self._sampling_h2d_in_flight[cur_start_idx] = (
+                fence,
+                (temps_col, top_k_col, top_p_col),
+            )
+        return out
 
     def _topk_candidate_blocks(self) -> int:
         """Returns TPU_SAMPLER_TOPK_CANDIDATES if the vocab allows it, else 0."""
