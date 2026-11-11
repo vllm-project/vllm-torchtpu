@@ -108,6 +108,86 @@ def test_fused_moe_gmm_get_topk_weights_dtype(monkeypatch):
     assert fused_moe_gmm._get_topk_weights_dtype(jnp.float16) == jnp.float32
 
 
+def test_silu_bf16_env_defaults_to_false(monkeypatch):
+    monkeypatch.delenv("TPU_MOE_SILU_BF16", raising=False)
+    getter = envs.environment_variables["TPU_MOE_SILU_BF16"]
+    assert getter() is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "True", "yes", "YES"])
+def test_silu_bf16_env_accepts_truthy(monkeypatch, value):
+    monkeypatch.setenv("TPU_MOE_SILU_BF16", value)
+    getter = envs.environment_variables["TPU_MOE_SILU_BF16"]
+    assert getter() is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "False", "no", "NO"])
+def test_silu_bf16_env_accepts_falsy(monkeypatch, value):
+    monkeypatch.setenv("TPU_MOE_SILU_BF16", value)
+    getter = envs.environment_variables["TPU_MOE_SILU_BF16"]
+    assert getter() is False
+
+
+def test_fused_moe_gmm_get_gmm_fuse_act(monkeypatch):
+    monkeypatch.setattr(fused_moe_gmm.envs, "TPU_MOE_SILU_BF16", False)
+    assert fused_moe_gmm._get_gmm_fuse_act("silu") == "silu"
+    assert fused_moe_gmm._get_gmm_fuse_act("swigluoai") == "swigluoai"
+    assert fused_moe_gmm._get_gmm_fuse_act("gelu") == "gelu"
+
+    monkeypatch.setattr(fused_moe_gmm.envs, "TPU_MOE_SILU_BF16", True)
+    assert fused_moe_gmm._get_gmm_fuse_act("silu") == "silu_bf16"
+    assert fused_moe_gmm._get_gmm_fuse_act("swigluoai") == "swigluoai"
+    assert fused_moe_gmm._get_gmm_fuse_act("gelu") == "gelu"
+
+
+@pytest.mark.parametrize(
+    ("silu_bf16_enabled", "expected_fuse_act"),
+    [(False, "silu"), (True, "silu_bf16")],
+)
+def test_moe_gmm_dispatches_silu_bf16_when_enabled(
+    monkeypatch, silu_bf16_enabled, expected_fuse_act
+):
+    monkeypatch.setattr(fused_moe_gmm.envs, "TPU_MOE_SILU_BF16", silu_bf16_enabled)
+    monkeypatch.setattr(fused_moe_gmm.envs, "TPU_MOE_OWNER_OUTPUT_MODE", "off")
+    recorded_fuse_acts = []
+    gmm_outputs = iter(
+        [
+            jnp.ones((4, 2), dtype=jnp.bfloat16),
+            jnp.ones((4, 2), dtype=jnp.bfloat16),
+        ]
+    )
+
+    def fake_gmm_wrapper(*args, **kwargs):
+        recorded_fuse_acts.append(kwargs.get("fuse_act"))
+        return next(gmm_outputs)
+
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", fake_gmm_wrapper)
+
+    actual = fused_moe_gmm.moe_gmm(
+        x=jnp.ones((4, 2), dtype=jnp.bfloat16),
+        w1=jnp.ones((2, 2, 4), dtype=jnp.bfloat16),
+        w1_scale=None,
+        w1_bias=None,
+        w2=jnp.ones((2, 2, 2), dtype=jnp.bfloat16),
+        w2_scale=None,
+        w2_bias=None,
+        group_sizes=jnp.array([2, 2], dtype=jnp.int32),
+        argsort_revert_indices=jnp.array([0, 1, 2, 3], dtype=jnp.int32),
+        topk_weights_flat=jnp.array([0.5, 0.5, 0.5, 0.5], dtype=jnp.bfloat16),
+        valid_mask_flat=jnp.ones((4,), dtype=jnp.bool_),
+        token_indices_sorted=jnp.array([0, 0, 1, 1], dtype=jnp.int32),
+        activation="silu",
+        num_tokens=2,
+        topk=2,
+        use_ep=False,
+        use_sparse_core=False,
+        onehot_moe_permute_threshold=0,
+    )
+
+    assert actual.shape == (2, 2)
+    assert recorded_fuse_acts == [expected_fuse_act, None]
+
+
 @pytest.mark.parametrize("configured_version", ["v1", "v2", "v3"])
 @pytest.mark.parametrize(
     "use_ep,use_sparse_core,threshold,dtype,hidden,topk,num_tokens,source_rows,sc_lanes,expected_path",
