@@ -71,3 +71,97 @@ def test_scale_page_rows():
     assert msa_fp4.index_scale_row(4) == 8
     # K and V rows only: the index-key scales are folded into the index pages.
     assert [msa_fp4.scale_rows(g) for g in (1, 2, 3, 4, 5, 7)] == [8, 8, 8, 8, 16, 16]
+
+
+def test_write_fp4_stores_rotated_quantized_rows_and_scales():
+    from vllm_torchtpu.models.minimax_m3.experimental.kernels import msa
+
+    rng = np.random.default_rng(4)
+    num_pages, page, d = 5, 128, 128
+    kv_cache = msa_fp4.pack_rows(jnp.zeros((num_pages, page, 2 * d), jnp.uint8))
+    index_cache = msa_fp4.pack_rows(
+        jnp.zeros((num_pages, page, d), jnp.uint8),
+        scales=jnp.full((num_pages, page), jnp.nan, jnp.float32),
+    )
+    scale_cache = jnp.full((num_pages, 8, 128), jnp.nan, jnp.float32)
+    t = 6
+    k = jnp.asarray(rng.standard_normal((t, 1, d)), jnp.float32)
+    v = jnp.asarray(rng.standard_normal((t, 1, d)), jnp.float32)
+    ik = jnp.asarray(rng.standard_normal((t, d)), jnp.float32)
+    pages = jnp.asarray([3, 3, 3, 1, 1, 2**30], jnp.int32)  # last token dropped
+    pos = jnp.asarray([126, 127, 128 + 0, 5, 6, 0], jnp.int32) % 256
+    pages = pages.at[2].set(4)
+    kv_cache, index_cache, scale_cache = msa.write_fp4(
+        kv_cache,
+        index_cache,
+        scale_cache,
+        k,
+        v,
+        ik,
+        pages,
+        pos,
+        max_num_seqs=3,
+        interpret=True,
+    )
+    kv = np.asarray(msa_fp4.unpack_rows(kv_cache))
+    ix = np.asarray(msa_fp4.unpack_rows(index_cache))
+    ix_s = np.asarray(msa_fp4.folded_scales(index_cache))
+    sc = np.asarray(scale_cache)
+    k_nib, k_s = msa_fp4.quantize(msa_fp4.rotate_keys(k[:, 0]))
+    v_nib, v_s = msa_fp4.quantize(msa_fp4.rotate_keys(v[:, 0]))
+    i_nib, i_s = msa_fp4.quantize(msa_fp4.rotate_keys(ik))
+    for i in range(t - 1):
+        p, s = int(pages[i]), int(pos[i]) % page
+        np.testing.assert_array_equal(kv[p, s, :d], k_nib[i])
+        np.testing.assert_array_equal(kv[p, s, d:], v_nib[i])
+        np.testing.assert_array_equal(ix[p, s], i_nib[i])
+        np.testing.assert_allclose(sc[p, :2, s], [k_s[i], v_s[i]], rtol=1e-6)
+        np.testing.assert_allclose(ix_s[p, s], i_s[i], rtol=1e-6)
+    assert np.isnan(sc[0]).all() and np.isnan(ix_s[0]).all()  # untouched page
+    assert np.isnan(ix_s[3, :126]).all()  # untouched slots of a written page
+
+
+def test_write_fp4_multi_head_rows_and_scale_rows():
+    """G = 4 KV heads per rank (DCP wider than a head's replicas): rows
+    [K_0 | V_0 | ... | K_3 | V_3], scale rows 2h / 2h + 1, index scales in
+    the index page."""
+    from vllm_torchtpu.models.minimax_m3.experimental.kernels import msa
+
+    rng = np.random.default_rng(5)
+    g, d, t = 4, 128, 3
+    kv_cache = msa_fp4.pack_rows(jnp.zeros((2, 128, 2 * d * g), jnp.uint8))
+    index_cache = msa_fp4.pack_rows(
+        jnp.zeros((2, 128, d), jnp.uint8), scales=jnp.zeros((2, 128), jnp.float32)
+    )
+    scale_cache = jnp.zeros((2, msa_fp4.scale_rows(g), 128), jnp.float32)
+    k = jnp.asarray(rng.standard_normal((t, g, d)), jnp.float32)
+    v = jnp.asarray(rng.standard_normal((t, g, d)), jnp.float32)
+    ik = jnp.asarray(rng.standard_normal((t, d)), jnp.float32)
+    pages = jnp.asarray([1, 1, 1], jnp.int32)
+    pos = jnp.asarray([10, 11, 12], jnp.int32)
+    kv_cache, index_cache, scale_cache = msa.write_fp4(
+        kv_cache,
+        index_cache,
+        scale_cache,
+        k,
+        v,
+        ik,
+        pages,
+        pos,
+        max_num_seqs=1,
+        interpret=True,
+    )
+    kv = np.asarray(msa_fp4.unpack_rows(kv_cache))
+    sc = np.asarray(scale_cache)
+    for h in range(g):
+        k_nib, k_s = msa_fp4.quantize(msa_fp4.rotate_keys(k[:, h]))
+        v_nib, v_s = msa_fp4.quantize(msa_fp4.rotate_keys(v[:, h]))
+        np.testing.assert_array_equal(kv[1, 10:13, 2 * h * d : (2 * h + 1) * d], k_nib)
+        np.testing.assert_array_equal(
+            kv[1, 10:13, (2 * h + 1) * d : (2 * h + 2) * d], v_nib
+        )
+        np.testing.assert_allclose(sc[1, 2 * h, 10:13], k_s, rtol=1e-6)
+        np.testing.assert_allclose(sc[1, 2 * h + 1, 10:13], v_s, rtol=1e-6)
+    _, i_s = msa_fp4.quantize(msa_fp4.rotate_keys(ik))
+    ix_s = np.asarray(msa_fp4.folded_scales(index_cache))
+    np.testing.assert_allclose(ix_s[1, 10:13], i_s, rtol=1e-6)
