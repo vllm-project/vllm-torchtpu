@@ -94,3 +94,24 @@ def option(additional_config: Any, key: str) -> bool | int:
             f"additional_config.{key} must be a {type(default).__name__}, got {value!r}"
         )
     return value
+
+
+def check_split_disabled(additional_config: Any) -> None:
+    """Refuse the r6 token-half split keys.
+
+    The split step (steps of >= minimax_split_min_tokens tokens) produces wrong
+    tokens on LongBench-v2 and leaks text across requests (real-weight check
+    j-5ec6afaf-fed7-4cd6-a5ef). It stays disabled until that is fixed.
+    """
+    split_on = option(additional_config, "minimax_split_min_tokens") > 0
+    attention_first_set = (
+        isinstance(additional_config, dict)
+        and "minimax_split_attention_first" in additional_config
+    )
+    if split_on or attention_first_set:
+        raise ValueError(
+            "additional_config.minimax_split_min_tokens / "
+            "minimax_split_attention_first: the r6 token-half split is disabled. "
+            "Its split steps leak data across requests and fail LongBench-v2 "
+            "(j-5ec6afaf-fed7-4cd6-a5ef); remove these keys."
+        )

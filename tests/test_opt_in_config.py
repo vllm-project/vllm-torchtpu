@@ -166,3 +166,27 @@ def test_runtime_keys_are_read_where_the_env_var_was(key, path):
     the site that read the env var."""
     text = (SRC / path).read_text()
     assert f'"{key}"' in text and "option(" in text
+
+
+def test_split_guard_passes_with_split_keys_off():
+    from vllm_torchtpu.opt_in_config import check_split_disabled
+
+    check_split_disabled(None)
+    check_split_disabled({})
+    check_split_disabled({"minimax_split_min_tokens": 0, "moe_gmm_tuned_tiles": True})
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"minimax_split_min_tokens": 4096},
+        {"minimax_split_attention_first": True},
+        {"minimax_split_attention_first": False},
+        {"minimax_split_min_tokens": 4096, "minimax_split_attention_first": False},
+    ],
+)
+def test_split_guard_refuses_split_keys(config):
+    from vllm_torchtpu.opt_in_config import check_split_disabled
+
+    with pytest.raises(ValueError, match="leak data across requests"):
+        check_split_disabled(config)

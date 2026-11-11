@@ -45,7 +45,7 @@ from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
 from vllm_torchtpu.models.minimax_m3.split import join_seq_lens, split_query_layout
-from vllm_torchtpu.opt_in_config import option
+from vllm_torchtpu.opt_in_config import check_split_disabled, option
 
 logger = init_logger(__name__)
 
@@ -279,6 +279,7 @@ class MiniMaxM3Model(nn.Module):
         # residual added, before the next norm) are also returned; set by
         # the DSpark drafter before the first trace.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        check_split_disabled(vllm_config.additional_config)
         self.split_min_tokens = option(
             vllm_config.additional_config, "minimax_split_min_tokens"
         )
