@@ -1145,7 +1145,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         core_attn_out = core_attn_out.view(
             num_tokens, local_num_v_heads, self.head_v_dim
         )
-        if gated_norm_quant_op.can_fuse(self.norm, self.out_proj, num_tokens):
+        if gated_norm_quant_op.can_fuse(
+            self.norm, self.out_proj, num_tokens, core_attn_out.dtype
+        ):
             return gated_norm_quant_op.fused_output_projection(
                 core_attn_out, z, self.norm, self.out_proj
             )

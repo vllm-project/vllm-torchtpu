@@ -33,6 +33,7 @@ Per head ``h`` of a token (``norm_before_gate=True``, silu gate)::
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -41,6 +42,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 FP8_DTYPE = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8_DTYPE).max)
+FP8_ROW_TILE_ALIGN = 32
+TPU_LANE_ALIGN = 128
 
 
 def _gated_norm_quant_kernel(
@@ -52,27 +55,46 @@ def _gated_norm_quant_kernel(
     variance = jnp.mean(attn_out * attn_out, axis=-1, keepdims=True)
     normed = attn_out * jax.lax.rsqrt(variance + eps) * weight[None, None, :]
     normed = normed * (gate * jax.nn.sigmoid(gate))
-    # The norm's bf16 output, which the unfused out-projection quantizes.
-    normed = normed.astype(jnp.bfloat16).astype(jnp.float32)
-    abs_max = jnp.max(jnp.abs(normed), axis=(1, 2), keepdims=True)  # [tile, 1, 1]
-    scale = abs_max / FP8_MAX
-    scale = jnp.where(scale == 0, 1.0, scale)
-    quantized_ref[...] = jnp.clip(normed / scale, -FP8_MAX, FP8_MAX).astype(FP8_DTYPE)
-    scale_ref[...] = scale.reshape(scale.shape[0], 1)
+    # Reshape to 2D in float32 before casting to FP8 so single-head TP shards
+    # (`heads == 1`) pack directly into 2D FP8 VREGs without an 8-bit relayout.
+    tile, heads, head_dim = normed.shape
+    normed_2d = (
+        normed.astype(jnp.bfloat16).astype(jnp.float32).reshape(tile, heads * head_dim)
+    )
+    abs_max = jnp.max(jnp.abs(normed_2d), axis=1, keepdims=True)  # [tile, 1]
+    scale = jnp.where(abs_max == 0, 1.0, abs_max / FP8_MAX)
+    quantized_ref[...] = jnp.clip(normed_2d / scale, -FP8_MAX, FP8_MAX).astype(
+        FP8_DTYPE
+    )
+    scale_ref[...] = scale
+
+
+def effective_max_tile(max_tile: int) -> int:
+    """Normalize ``max_tile`` to at least ``FP8_ROW_TILE_ALIGN`` (32)."""
+    if max_tile <= 0:
+        raise ValueError(f"max_tile must be positive, got {max_tile=}")
+    return max(max_tile, FP8_ROW_TILE_ALIGN)
 
 
 def legal_row_tile(rows: int, max_tile: int) -> int:
-    """The largest legal Pallas row block at or below ``max_tile``.
+    """The 2D FP8 Pallas row block for ``rows`` within ``effective_max_tile``.
 
-    A legal block is a multiple of 8 that divides ``rows``, or ``rows`` itself
-    when no such divisor exists (a block equal to the full dimension is always
-    legal). For example 48 rows run in tiles of 16 with ``max_tile=32``, and
-    12 rows run as one tile of 12.
+    On TPU, a 2D ``float8_e4m3fn`` array tiles axis 0 to 32 sublanes, so any
+    multi-step block (``tile < rows``) must be a multiple of 32; ``max_tile``
+    values below 32 are raised to 32. When ``rows <= cap`` a single block of
+    ``rows`` covers the full dimension; otherwise returns the largest multiple
+    of 32 at or below ``cap`` dividing ``rows``, or ``(cap // 32) * 32`` when
+    the last input tile is window-padded to ``tile``.
     """
-    for tile in range(min(max_tile, rows), 7, -1):
-        if rows % tile == 0 and tile % 8 == 0:
+    if rows <= 0:
+        raise ValueError(f"rows must be positive, got {rows=}")
+    cap = effective_max_tile(max_tile)
+    if rows <= cap:
+        return rows
+    for tile in range(cap, FP8_ROW_TILE_ALIGN - 1, -1):
+        if tile % FP8_ROW_TILE_ALIGN == 0 and rows % tile == 0:
             return tile
-    return rows
+    return (cap // FP8_ROW_TILE_ALIGN) * FP8_ROW_TILE_ALIGN
 
 
 def gated_norm_quant(
@@ -84,40 +106,77 @@ def gated_norm_quant(
     max_tile: int = 32,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """Gated RMSNorm plus per-token FP8 quantization.
+    """Gated RMSNorm plus per-token FP8 quantization into 2D activation rows.
+
+    Emitting 2D ``[tokens, heads * head_dim]`` directly gives the FP8 output
+    projection canonical ``T(32, 128)(4, 1)`` activation tiling instead of a 3D
+    ``[tokens, heads, head_dim]`` layout that XLA bitcasts into a 4D transposed
+    contraction.
 
     Args:
         attn_out: GDN output, bf16 ``[tokens, heads, head_dim]``.
         gate: The ``z`` gate, same shape as ``attn_out``.
         weight: Norm weight ``[head_dim]``.
         eps: Norm epsilon.
-        max_tile: Upper bound on the token rows per grid step.
+        max_tile: Upper bound on the token rows per grid step (at least 32 when
+            tiling across multiple steps).
         interpret: Run the Pallas kernel in interpret mode (CPU tests).
 
     Returns:
-        FP8 ``[tokens, heads, head_dim]`` rows and float32 ``[tokens, 1]``
+        FP8 ``[tokens, heads * head_dim]`` rows and float32 ``[tokens, 1]``
         per-token scales.
     """
+    if attn_out.ndim != 3:
+        raise ValueError(
+            f"attn_out must be 3D [tokens, heads, head_dim], got {attn_out.shape=}"
+        )
     tokens, heads, head_dim = attn_out.shape
+    if tokens <= 0 or heads <= 0 or head_dim <= 0:
+        raise ValueError(
+            f"gated_norm_quant dimensions must be positive, got {attn_out.shape=}"
+        )
+    if not interpret and head_dim % TPU_LANE_ALIGN != 0:
+        raise ValueError(
+            f"head_dim must be a multiple of {TPU_LANE_ALIGN} on TPU, got {head_dim=}"
+        )
     if gate.shape != attn_out.shape or weight.shape != (head_dim,):
         raise ValueError(
             f"gated_norm_quant shapes do not match: {attn_out.shape=}, "
             f"{gate.shape=}, {weight.shape=}"
         )
+    if not (math.isfinite(eps) and eps > 0):
+        raise ValueError(f"eps must be finite and positive, got {eps=}")
+
     tile = legal_row_tile(tokens, max_tile)
-    row_spec = pl.BlockSpec((tile, heads, head_dim), lambda i: (i, 0, 0))
-    return pl.pallas_call(
+    pad = (-tokens) % tile
+    padded_tokens = tokens + pad
+    hidden_size = heads * head_dim
+    if pad:
+        in_spec = pl.BlockSpec(
+            (pl.Element(tile, (0, pad)), pl.Element(heads), pl.Element(head_dim)),
+            lambda i: (i * tile, 0, 0),
+        )
+    else:
+        in_spec = pl.BlockSpec((tile, heads, head_dim), lambda i: (i, 0, 0))
+
+    quantized, scale = pl.pallas_call(
         functools.partial(_gated_norm_quant_kernel, eps=float(eps)),
-        grid=(tokens // tile,),
-        in_specs=[row_spec, row_spec, pl.BlockSpec((head_dim,), lambda i: (0,))],
-        out_specs=[row_spec, pl.BlockSpec((tile, 1), lambda i: (i, 0))],
+        grid=(padded_tokens // tile,),
+        in_specs=[in_spec, in_spec, pl.BlockSpec((head_dim,), lambda i: (0,))],
+        out_specs=[
+            pl.BlockSpec((tile, hidden_size), lambda i: (i, 0)),
+            pl.BlockSpec((tile, 1), lambda i: (i, 0)),
+        ],
         out_shape=[
-            jax.ShapeDtypeStruct((tokens, heads, head_dim), FP8_DTYPE),
-            jax.ShapeDtypeStruct((tokens, 1), jnp.float32),
+            jax.ShapeDtypeStruct((padded_tokens, hidden_size), FP8_DTYPE),
+            jax.ShapeDtypeStruct((padded_tokens, 1), jnp.float32),
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
     )(attn_out, gate, weight)
+    if pad:
+        return quantized[:tokens], scale[:tokens]
+    return quantized, scale
 
 
 def fp8_matmul_on_quantized_rows(

@@ -83,7 +83,7 @@ def cpu_op_bridge(monkeypatch):
     monkeypatch.setattr(gated_norm_quant_op.pallas, "jax_op", _cpu_jax_op)
     monkeypatch.setattr(gated_norm_quant_op, "_op_cache", {})
     monkeypatch.setenv("TPU_GDN_FUSED_NORM_QUANT", "1")
-    monkeypatch.setenv("TPU_GATED_NORM_TILE", "16")
+    monkeypatch.setenv("TPU_GATED_NORM_TILE", "32")
 
 
 class _Fp8OutProj(torch.nn.Module):
@@ -159,7 +159,7 @@ def _output_projection(layer, core_attn_out, z):
         )
 
 
-@pytest.mark.parametrize("num_tokens", [4, 16, 48])
+@pytest.mark.parametrize("num_tokens", [4, 32, 48, 64, 80, 96])
 def test_fused_matches_unfused(monkeypatch, num_tokens):
     layer = _load_gdn_layer(monkeypatch)
     core_attn_out, z = _inputs(num_tokens)
@@ -171,6 +171,39 @@ def test_fused_matches_unfused(monkeypatch, num_tokens):
     assert fused.shape == unfused.shape == (num_tokens, HIDDEN)
     assert fused.dtype == unfused.dtype == torch.bfloat16
     torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
+
+
+def test_gated_norm_quant_fake_returns_2d_rows(monkeypatch):
+    registered_fakes = {}
+
+    class _CapturedOp:
+        def __init__(self, name):
+            self._name = name
+
+        def __call__(self, *args):
+            raise AssertionError("fake test should not execute op")
+
+        def register_fake(self, fake_fn):
+            registered_fakes[self._name] = fake_fn
+
+    def _capture_jax_op(name, fn):
+        del fn
+        return _CapturedOp(name)
+
+    monkeypatch.setattr(gated_norm_quant_op.pallas, "jax_op", _capture_jax_op)
+    monkeypatch.setattr(gated_norm_quant_op, "_op_cache", {})
+    # Sub-32 tile values normalize to the 32-sublane 2D FP8 minimum in op naming.
+    monkeypatch.setenv("TPU_GATED_NORM_TILE", "16")
+    gated_norm_quant_op.prebuild_ops(EPS)
+    fake_fn = registered_fakes["pallas::gdn_gated_norm_quant_e1em06_t32"]
+    attn_out = torch.empty((12, HEADS, HEAD_DIM), dtype=torch.bfloat16)
+    gate = torch.empty_like(attn_out)
+    weight = torch.empty((HEAD_DIM,), dtype=torch.bfloat16)
+    q_fake, s_fake = fake_fn(attn_out, gate, weight)
+    assert q_fake.shape == (12, HEADS * HEAD_DIM)
+    assert q_fake.dtype == torch.float8_e4m3fn
+    assert s_fake.shape == (12, 1)
+    assert s_fake.dtype == torch.float32
 
 
 @pytest.mark.parametrize(
@@ -233,6 +266,10 @@ def _set_w8a16_bucket(layer):
     layer.out_proj.quant_method.w8a16_max_rows = 8
 
 
+def _set_unaligned_head_dim(layer):
+    layer.norm.weight = torch.nn.Parameter(torch.ones(64, dtype=torch.bfloat16))
+
+
 @pytest.mark.parametrize(
     "make_unsupported",
     [
@@ -244,6 +281,7 @@ def _set_w8a16_bucket(layer):
         _set_vllm_layout,
         _set_bias,
         _set_w8a16_bucket,
+        _set_unaligned_head_dim,
     ],
 )
 def test_unsupported_layers_keep_unfused_path(make_unsupported):
@@ -251,6 +289,40 @@ def test_unsupported_layers_keep_unfused_path(make_unsupported):
     assert gated_norm_quant_op.can_fuse(layer.norm, layer.out_proj, 8)
     make_unsupported(layer)
     assert not gated_norm_quant_op.can_fuse(layer.norm, layer.out_proj, 8)
+
+
+def test_non_bf16_activation_keeps_unfused_path():
+    layer = _gdn_layer()
+    assert not gated_norm_quant_op.can_fuse(
+        layer.norm, layer.out_proj, 8, torch.float32
+    )
+    assert not gated_norm_quant_op.can_fuse(
+        layer.norm, layer.out_proj, 8, torch.float16
+    )
+
+
+def test_prebuild_ops_validates_eps_and_tile(monkeypatch):
+    with pytest.raises(ValueError, match="eps must be finite and positive"):
+        gated_norm_quant_op.prebuild_ops(0.0)
+    with pytest.raises(ValueError, match="eps must be finite and positive"):
+        gated_norm_quant_op.prebuild_ops(float("nan"))
+    monkeypatch.setenv("TPU_GATED_NORM_TILE", "-8")
+    with pytest.raises(ValueError, match="max_tile must be positive"):
+        gated_norm_quant_op.prebuild_ops(EPS)
+
+
+def test_w8a16_requires_warmup_when_compiling(monkeypatch):
+    layer = _gdn_layer()
+    layer.out_proj.quant_method.w8a16_max_rows = 8
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        gated_norm_quant_op.shape_variants, "aot_cache_tag", lambda: None
+    )
+    assert not gated_norm_quant_op.can_fuse(layer.norm, layer.out_proj, 16)
+    monkeypatch.setattr(
+        gated_norm_quant_op.shape_variants, "aot_cache_tag", lambda: "warmup"
+    )
+    assert gated_norm_quant_op.can_fuse(layer.norm, layer.out_proj, 16)
 
 
 def test_w8a16_applies_only_to_covered_buckets():
@@ -278,11 +350,11 @@ def test_weight_loading_builds_ops_and_forward_only_looks_them_up(monkeypatch):
     # traced forward must not create ops.
     layer = _load_gdn_layer(monkeypatch)
     assert set(gated_norm_quant_op._op_cache) == {
-        "pallas::gdn_gated_norm_quant_e1em06_t16",
+        "pallas::gdn_gated_norm_quant_e1em06_t32",
         "pallas::gdn_fp8_matmul_on_quantized_rows",
     }
     monkeypatch.setattr(gated_norm_quant_op.pallas, "jax_op", _fail_op_creation)
-    for num_tokens in (4, 16, 48):
+    for num_tokens in (4, 32, 48, 64):
         core_attn_out, z = _inputs(num_tokens)
         output = _output_projection(layer, core_attn_out, z)
         assert output.shape == (num_tokens, HIDDEN)

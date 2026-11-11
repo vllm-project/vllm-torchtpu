@@ -22,7 +22,10 @@ cover keep the unfused path.
 """
 
 import functools
+import math
 from collections.abc import Callable
+from threading import Lock
+from typing import cast
 
 import jax
 import torch
@@ -30,6 +33,7 @@ from torch_tpu._internal import pallas
 from vllm.distributed import tensor_model_parallel_all_reduce
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.kernels import gated_norm_quant
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
@@ -40,6 +44,7 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _op_cache: dict[str, Callable] = {}
+_op_cache_lock = Lock()
 
 
 def _op_name_float(value: float) -> str:
@@ -84,7 +89,9 @@ def _build_gated_norm_quant_op(eps: float, max_tile: int) -> Callable:
         del gate, weight
         return (
             torch.empty(
-                attn_out.shape, dtype=torch.float8_e4m3fn, device=attn_out.device
+                (attn_out.shape[0], attn_out.shape[1] * attn_out.shape[2]),
+                dtype=torch.float8_e4m3fn,
+                device=attn_out.device,
             ),
             torch.empty(
                 (attn_out.shape[0], 1), dtype=torch.float32, device=attn_out.device
@@ -117,12 +124,15 @@ def prebuild_ops(eps: float) -> None:
     """
     if not envs.TPU_GDN_FUSED_NORM_QUANT:
         return
-    max_tile = int(envs.TPU_GATED_NORM_TILE)
+    if not (math.isfinite(eps) and eps > 0):
+        raise ValueError(f"eps must be finite and positive, got {eps=}")
+    max_tile = gated_norm_quant.effective_max_tile(int(envs.TPU_GATED_NORM_TILE))
     norm_quant_op_name = _gated_norm_quant_op_name(eps, max_tile)
-    if norm_quant_op_name not in _op_cache:
-        _op_cache[norm_quant_op_name] = _build_gated_norm_quant_op(eps, max_tile)
-    if _FP8_MATMUL_OP_NAME not in _op_cache:
-        _op_cache[_FP8_MATMUL_OP_NAME] = _build_fp8_matmul_op()
+    with _op_cache_lock:
+        if norm_quant_op_name not in _op_cache:
+            _op_cache[norm_quant_op_name] = _build_gated_norm_quant_op(eps, max_tile)
+        if _FP8_MATMUL_OP_NAME not in _op_cache:
+            _op_cache[_FP8_MATMUL_OP_NAME] = _build_fp8_matmul_op()
 
 
 def _prebuilt_op(op_name: str) -> Callable:
@@ -136,20 +146,39 @@ def _prebuilt_op(op_name: str) -> Callable:
 
 
 def _unsupported_reason(
-    norm: torch.nn.Module, out_proj: torch.nn.Module, num_tokens: int
+    norm: torch.nn.Module,
+    out_proj: torch.nn.Module,
+    num_tokens: int,
+    act_dtype: torch.dtype,
 ) -> str | None:
     """Why the fused path cannot reproduce this layer's unfused output."""
+    if act_dtype != torch.bfloat16:
+        return f"activation dtype is {act_dtype}, not bfloat16"
     if not getattr(norm, "norm_before_gate", False):
         return "the gated norm gates before normalizing"
     if getattr(norm, "activation", None) not in ("swish", "silu"):
         return f"the gate activation is {getattr(norm, 'activation', None)}"
-    if getattr(norm, "group_size", None) not in (None, norm.weight.shape[0]):
+    norm_weight = norm.weight
+    if not isinstance(norm_weight, torch.Tensor):
+        return "the norm weight is not a tensor"
+    if norm_weight.shape[0] % gated_norm_quant.TPU_LANE_ALIGN != 0:
+        return (
+            f"head_dim {norm_weight.shape[0]} is not a multiple of "
+            f"{gated_norm_quant.TPU_LANE_ALIGN}"
+        )
+    if getattr(norm, "group_size", None) not in (None, norm_weight.shape[0]):
         return f"the norm groups by {norm.group_size}, not per head"
     weight = out_proj.weight
+    if not isinstance(weight, torch.Tensor):
+        return "out_proj weight is not a tensor"
     weight_scale = getattr(out_proj, "weight_scale", None)
     if weight.dtype != torch.float8_e4m3fn:
         return f"out_proj weight dtype is {weight.dtype}"
-    if weight_scale is None or weight_scale.ndim != 1:
+    if (
+        weight_scale is None
+        or not isinstance(weight_scale, torch.Tensor)
+        or weight_scale.ndim != 1
+    ):
         return "out_proj is not per-channel quantized"
     if getattr(out_proj, KEEP_VLLM_LAYOUT_ATTR, False) or not getattr(
         out_proj, WEIGHT_FLIPPED_ATTR, False
@@ -159,21 +188,30 @@ def _unsupported_reason(
         return "out_proj has a bias"
     if not getattr(out_proj, "input_is_parallel", True):
         return "out_proj input is not parallel"
-    w8a16_max_rows = getattr(out_proj.quant_method, "w8a16_max_rows", 0)
-    if 0 < num_tokens <= w8a16_max_rows:
-        # The unfused path keeps bf16 activations (W8A16) for this bucket.
-        return "TPU_FP8_LINEAR_W8A16_MAX_ROWS covers this token bucket"
+    quant_method = getattr(out_proj, "quant_method", None)
+    w8a16_max_rows = int(getattr(quant_method, "w8a16_max_rows", 0) or 0)
+    if w8a16_max_rows > 0:
+        if torch.compiler.is_compiling() and shape_variants.aot_cache_tag() is None:
+            return "TPU_FP8_LINEAR_W8A16_MAX_ROWS requires per-bucket warmup tracing"
+        if 0 < num_tokens <= w8a16_max_rows:
+            # The unfused path keeps bf16 activations (W8A16) for this bucket.
+            return "TPU_FP8_LINEAR_W8A16_MAX_ROWS covers this token bucket"
     return None
 
 
-def can_fuse(norm: torch.nn.Module, out_proj: torch.nn.Module, num_tokens: int) -> bool:
+def can_fuse(
+    norm: torch.nn.Module,
+    out_proj: torch.nn.Module,
+    num_tokens: int,
+    act_dtype: torch.dtype = torch.bfloat16,
+) -> bool:
     """Whether to run the fused output projection for this layer and bucket.
 
     Decided at trace time from static attributes and shapes.
     """
     if not envs.TPU_GDN_FUSED_NORM_QUANT:
         return False
-    reason = _unsupported_reason(norm, out_proj, num_tokens)
+    reason = _unsupported_reason(norm, out_proj, num_tokens, act_dtype)
     if reason is not None:
         logger.info_once(
             "TPU_GDN_FUSED_NORM_QUANT: unfused GDN output projection because %s.",
@@ -194,20 +232,22 @@ def fused_output_projection(
     ``core_attn_out`` is ``[tokens, heads, head_dim]``. Call only when
     ``can_fuse`` is true, after ``prebuild_ops``.
     """
-    num_tokens = core_attn_out.shape[0]
-    norm_quant_op = _prebuilt_op(
-        _gated_norm_quant_op_name(float(norm.eps), int(envs.TPU_GATED_NORM_TILE))
-    )
+    eps = float(cast(float, norm.eps))
+    max_tile = gated_norm_quant.effective_max_tile(int(envs.TPU_GATED_NORM_TILE))
+    norm_quant_op = _prebuilt_op(_gated_norm_quant_op_name(eps, max_tile))
     quantized_rows, row_scales = norm_quant_op(
         core_attn_out, z.reshape(core_attn_out.shape), norm.weight
     )
     output = _prebuilt_op(_FP8_MATMUL_OP_NAME)(
-        quantized_rows.reshape(num_tokens, -1),
+        quantized_rows,
         row_scales,
         out_proj.weight,
         out_proj.weight_scale,
     )
     # The all-reduce RowParallelLinear.forward would have done.
-    if out_proj.reduce_results and out_proj.tp_size > 1:
+    if (
+        getattr(out_proj, "reduce_results", False)
+        and int(getattr(out_proj, "tp_size", 1)) > 1
+    ):
         output = tensor_model_parallel_all_reduce(output)
     return output
