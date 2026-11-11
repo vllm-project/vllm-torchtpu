@@ -928,6 +928,57 @@ def test_last_layer_with_tail_in_one_call():
     np.testing.assert_array_equal(got[clear], np.asarray(want)[clear])
 
 
+@pytest.mark.parametrize("T", [1, 4])
+def test_draft_step_kernel_attention_moe_and_greedy_tail(T):
+    """MTP draft step as one kernel call (VLLM_TPU_MK_DRAFT): one QSA layer at the served
+    stage-C packing (in-kernel indexer, selection, step K/V) + MoE + final HC mixer +
+    lm_head + per-rank top token. `T = 1` is a draft loop step (one row per request),
+    `T = 4` draft step 0 over the verify rows. Tokens equal the stock greedy pick."""
+    from vllm_torchtpu.megakernel.wholestep.tail import (
+        TOP,
+        greedy_tokens,
+        tail_reference,
+    )
+
+    R, V, Lt = 2, 384, 1
+    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
+    d = wi.random_wholestep_inputs(
+        31, G, ex, Lt, budget=BUDGET, n_pages=PAGES, identical_experts=True,
+        first="qsa", vocab_shard=V,
+    )
+    d = wi.add_indexer_inputs(31, G, ex, d, Lt, max_groups=MAX_GROUPS, ctx=CTX_C)
+    d = wi.add_step_inputs(31, G, ex, d, Lt, ctx=CTX_C)
+    d = wi.add_per_layer(31, G, ex, d, Lt)
+    d = wi.add_carrier(31, d)
+    d["lm_head"] = (d["lm_head"].astype(F32) * 10).astype(BF16)
+    ref, _ = wi.wholestep_reference(G, ex, d, Lt)
+    d.pop("_step_out")
+    want, logits = tail_reference(
+        ref, {n: v[0] for n, v in d["hc"]["tail"].items()}, d["lm_head"],
+        nhc=G.NHC, eps=G.eps,
+    )
+    idx = dict(
+        max_groups=MAX_GROUPS, pages_per_seq=d["mtab"].shape[-1], carrier="bf16",
+        chunk_pages=32, n_layers=1,
+    )
+    spec = wholestep_spec(
+        G, R, L=Lt, qsa=dict(budget=BUDGET), step=True, indexed=idx, first="qsa",
+        tail=dict(vocab_shard=V),
+    )
+    w_mk, states = wi.pack_wholestep(spec, G, ex, d, Lt)
+    mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+        mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states
+    )
+    step, _ = kernel.make_step(mesh, spec, ex)
+    _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras_c(d, mesh, R))
+    got = np.asarray(greedy_tokens(outs[TOP], R, ex.M))[: ex.B]
+    top2 = np.sort(np.asarray(logits), axis=-1)[:, -2:]
+    clear = (top2[:, 1] - top2[:, 0]) > 5e-2
+    assert clear.sum() >= ex.B - 2, top2
+    np.testing.assert_array_equal(got[clear], np.asarray(want)[clear])
+
+
 def test_step_with_per_layer_metadata_matches_reference():
     """Served packing: every QSA layer has its own compressed keys, main page table, raw
     ring and
@@ -1030,10 +1081,12 @@ def test_compaction_exclusive_prefix_matches_reference(S):
         assert not np.array_equal(np.asarray(bad)[0], want_p)
 
 
-def test_last_layer_step_with_per_layer_metadata_matches_reference():
+@pytest.mark.parametrize("T", [4, 1])
+def test_last_layer_step_with_per_layer_metadata_matches_reference(T):
     """Model layer 47 alone (`L = 1`, `first="qsa"`) at the served stage-C packing: the
-    whole-step tail call that folds the last QSA layer (VLLM_TPU_MK_WHOLE_L47)."""
-    R, T, Lt = 2, 4, 1
+    whole-step tail call that folds the last QSA layer (VLLM_TPU_MK_WHOLE_L47). `T = 1`:
+    one query row per request, the MTP draft loop's shape (a draft-step kernel)."""
+    R, Lt = 2, 1
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
     d = wi.random_wholestep_inputs(
         29, G, ex, Lt, budget=BUDGET, n_pages=PAGES, identical_experts=True, first="qsa"
