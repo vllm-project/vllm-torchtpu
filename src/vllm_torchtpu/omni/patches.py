@@ -677,6 +677,18 @@ def _patch_ring_attention() -> None:
             if not can_run_tpu_ring_attention(
                 self, query, key, value, attn_metadata, causal=causal
             ):
+                if int(self._sp_group.ring_world_size) > 1:
+                    # The upstream fallback exchanges K/V with torch.distributed
+                    # P2P sends, which hang on TPU, so fail loudly instead.
+                    raise NotImplementedError(
+                        "Ring attention call does not fit the TPU Pallas ring "
+                        f"kernel (dtype={query.dtype}, causal={causal}, "
+                        "attn_backend_pref="
+                        f"{getattr(self, 'attn_backend_pref', None)}, "
+                        f"metadata={type(attn_metadata).__name__}), and the "
+                        "vLLM-Omni RingParallelAttention fallback (torch.distributed "
+                        "P2P sends) is not supported on TPU."
+                    )
                 logger.warning_once(
                     "Ring attention call does not fit the TPU Pallas ring kernel "
                     "(dtype=%s, causal=%s, attn_backend_pref=%s, metadata=%s); "
@@ -741,13 +753,21 @@ def _patch_ring_attention() -> None:
                     uly_size=int(sp_group.ulysses_world_size),
                     fuse_ulysses=True,
                 )
-            logger.warning_once(
-                "Attention call cannot fuse Ulysses into the TPU Pallas ring "
-                "kernel (strategy=%s, dtype=%s); running vLLM-Omni's Ulysses "
-                "all-to-all around the ring attention runner instead.",
-                getattr(strategy, "name", None),
-                str(query.dtype),
-            )
+            # Pure ring (ulysses_world_size <= 1) has no Ulysses to fuse: the
+            # ring runner below is the intended TPU kernel path, so only warn
+            # when a Ulysses all-to-all really runs outside the kernel.
+            sp_group = getattr(self.ring_runner, "_sp_group", None)
+            if (
+                getattr(strategy, "name", None) == "ulysses"
+                and int(getattr(sp_group, "ulysses_world_size", 1)) > 1
+            ):
+                logger.warning_once(
+                    "Attention call cannot fuse Ulysses into the TPU Pallas ring "
+                    "kernel (strategy=%s, dtype=%s); running vLLM-Omni's Ulysses "
+                    "all-to-all around the ring attention runner instead.",
+                    getattr(strategy, "name", None),
+                    str(query.dtype),
+                )
             return orig_forward_impl(self, query, key, value, attn_metadata)
 
         setattr(_tpu_attention_forward_impl, _RING_ATTENTION_PATCHED, True)
