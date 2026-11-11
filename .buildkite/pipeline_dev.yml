@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Throwaway: measures offloaded blocks per K3-pruned75 prompt for the
-# tier-1 eviction nightly step. Not for merge.
+# Throwaway: validates the nightly k3-pruned75-gpc-tier1-eviction step. Not for merge.
 
 steps:
   - label: ":docker: Build and Push Dev Image"
@@ -27,8 +26,8 @@ steps:
         - exit_status: 1
           limit: 2
 
-  - label: "k3-pruned75 probe: offloaded blocks per prompt"
-    key: k3_offload_blocks_probe
+  - label: "k3-pruned75-gpc-tier1-eviction (node sweep on: expect pass)"
+    key: tier1_evict_sweep_on
     depends_on: build_docker
     timeout_in_minutes: 300
     agents:
@@ -40,7 +39,25 @@ steps:
       SHAPE: "tpu7x-standard-4t/2x2x1"
       TPU_ACCELERATOR_TYPE: "tpu7x"
       ARTIFACTS_DIR: "perf_eval_results"
-      RUN_ROOT: "perf_eval_results/k3_offload_blocks_probe"
+      RUN_ROOT: "perf_eval_results/k3_tier1_evict_sweep_on"
       SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
     commands:
-      - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/diag_k3_offload_blocks.sh
+      - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_k3_pruned75_gpc_tier1_eviction.sh
+
+  - label: "k3-pruned75-gpc-tier1-eviction (node sweep off: expect fail)"
+    key: tier1_evict_sweep_off
+    depends_on: build_docker
+    timeout_in_minutes: 300
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    env:
+      SHAPE: "tpu7x-standard-4t/2x2x1"
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      ARTIFACTS_DIR: "perf_eval_results"
+      RUN_ROOT: "perf_eval_results/k3_tier1_evict_sweep_off"
+      SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
+    commands:
+      - .buildkite/kubernetes/run.sh env NODE_EVICT_SWEEP=false bash ./scripts/vllm/integration/run_k3_pruned75_gpc_tier1_eviction.sh
