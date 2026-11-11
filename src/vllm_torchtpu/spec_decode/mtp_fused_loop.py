@@ -64,10 +64,22 @@ class _MtpFusedLoop(nn.Module):
         """`positions` and `seq_lens` are step 1's. Returns the K-1 draft
         tokens, one [p] int32 tensor per step."""
         tokens = []
+        # VLLM_TPU_MK_DRAFT: each step is one kernel call returning the carry and the
+        # greedy token (attached before the first trace, so a static choice here).
+        inner = getattr(self.mtp, "model", None)
+        mk_step = (
+            getattr(self.mtp, "mk_draft_step", None)
+            if getattr(inner, "mk_draft", None) is not None
+            else None
+        )
         for i in range(self.num_steps):
             if i > 0:
                 positions = positions + 1
                 seq_lens.add_(1)
+            if mk_step is not None:
+                hidden_states, input_ids = mk_step(input_ids, positions, hidden_states, 1)
+                tokens.append(input_ids)
+                continue
             out = type(self.mtp).forward(
                 self.mtp,
                 input_ids,

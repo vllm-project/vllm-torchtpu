@@ -45,6 +45,26 @@ from ..spec import Block, LayerType, ModelSpec, ScratchReq, StateDecl, WeightDec
 
 TOP = "tail_top"
 LM_HEAD = "lm_head"
+# Widest lm_head column block (one 128-row BF16 tile of a block must fit the bank).
+VOCAB_CHUNK = 8192
+
+
+def vocab_chunk_width(ex: ExecSpec) -> int:
+    """lm_head column block width for `ex`'s dense bank (8192 at the 2 MiB bank)."""
+    return max(128, min(VOCAB_CHUNK, ex.tiles.bank // (128 * 2) // 128 * 128))
+
+
+def vocab_chunks(vocab_shard: int, chunk: int = VOCAB_CHUNK) -> list[tuple[str, int, int]]:
+    """`[(weight name, first column, width)]` of the lm_head column blocks: widths are
+    128-multiples, the last one padded past `vocab_shard` (those columns are masked).
+    One block keeps the name `lm_head`; more are `lm_head`, `lm_head1`, ..."""
+    padded = -(-vocab_shard // 128) * 128
+    out, c0 = [], 0
+    while c0 < padded:
+        w = min(chunk, padded - c0)
+        out.append((LM_HEAD if not out else f"{LM_HEAD}{len(out)}", c0, w))
+        c0 += w
+    return out
 
 
 class GreedyHead(Block):
@@ -58,7 +78,14 @@ class GreedyHead(Block):
         self.vocab_shard = vocab_shard
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
-        return [WeightDecl(LM_HEAD, K=g.H, N=self.vocab_shard, dtype=BF16)]
+        return [
+            WeightDecl(name, K=g.H, N=width, dtype=BF16)
+            for name, _, width in vocab_chunks(self.vocab_shard, vocab_chunk_width(ex))
+        ]
+
+    def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
+        # The dense accumulator holds one lm_head column block's logits.
+        return {"acc": max(w for _, _, w in vocab_chunks(self.vocab_shard, vocab_chunk_width(ex)))}
 
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         return [StateDecl(TOP, (ex.M, 128), F32, "w", per_layer=False)]
@@ -74,15 +101,22 @@ class GreedyHead(Block):
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex, scr = ctx.ex, ctx.scr
-        with ctx.stream.segment(lazy=False):
-            logits = ctx.stream.dmatmul(
-                LM_HEAD, scr["xb"], self.vocab_shard
-            )  # [MB, V] f32
-        m = jnp.max(logits, axis=-1, keepdims=True)
-        col = jax.lax.broadcasted_iota(I32, logits.shape, 1)
-        idx = jnp.min(
-            jnp.where(logits == m, col, self.vocab_shard), axis=-1, keepdims=True
-        )
+        m = idx = None
+        for name, c0, width in vocab_chunks(self.vocab_shard, vocab_chunk_width(ex)):
+            with ctx.stream.segment(lazy=False):
+                logits = ctx.stream.dmatmul(name, scr["xb"], width)  # [MB, width] f32
+            col = jax.lax.broadcasted_iota(I32, logits.shape, 1) + c0
+            if c0 + width > self.vocab_shard:  # padded columns never win
+                logits = jnp.where(col < self.vocab_shard, logits, -jnp.inf)
+            m_c = jnp.max(logits, axis=-1, keepdims=True)
+            i_c = jnp.min(
+                jnp.where(logits == m_c, col, self.vocab_shard), axis=-1, keepdims=True
+            )
+            if m is None:
+                m, idx = m_c, i_c
+            else:  # the first maximum: a later block wins only when strictly larger
+                better = m_c > m
+                m, idx = jnp.where(better, m_c, m), jnp.where(better, i_c, idx)
         rank = ctx.me
         gidx = (idx + rank * self.vocab_shard).astype(F32)  # < 2^24: exact in f32
         lane = jax.lax.broadcasted_iota(I32, (ex.MB, 128), 1)

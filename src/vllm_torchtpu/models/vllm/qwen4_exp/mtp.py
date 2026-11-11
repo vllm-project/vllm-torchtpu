@@ -175,6 +175,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         # Set by the Qwen3.8 megakernel driver before the first trace: the
         # layer's o_proj, both HCs and the MoE as one tail-kernel call.
         self.mk_tail: nn.Module | None = None
+        # VLLM_TPU_MK_DRAFT: the whole draft step as one kernel call
+        # (megakernel_runtime.qwen38_draft.MkDraft), attached by the MK driver.
+        self.mk_draft: nn.Module | None = None
 
     def fuse_inputs(self, input_ids, hidden_states, inputs_embeds=None):
         """[T, hc*H] decoder input from the token and the previous hidden."""
@@ -364,6 +367,16 @@ class Qwen4ExpMTP(nn.Module):
                 "_selection_rows", torch.full_like(sink, -1), persistent=False
             )
         return True
+
+    def mk_draft_step(self, input_ids, positions, hidden_states, rows_per_request: int):
+        """VLLM_TPU_MK_DRAFT: `(next hidden carry, greedy tokens int32)` of one draft
+        step: `forward(...)` then `compute_logits(...).argmax(-1)` as one kernel call
+        (the input fusion stays here)."""
+        mk = self.model.mk_draft
+        assert mk is not None
+        hidden = self.model.fuse_inputs(input_ids, hidden_states, None)
+        metadata = get_forward_context().attn_metadata
+        return mk.step(hidden, positions, rows_per_request, metadata)
 
     def compute_logits(self, hidden_states, spec_step_idx: int = 0):
         return self.logits_processor(self.lm_head, hidden_states)
