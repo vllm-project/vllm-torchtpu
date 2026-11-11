@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_STACKED_QSA_WRITES: bool = False
     VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE: bool = False
     VLLM_TPU_MK_HC_FP8: bool = False
+    VLLM_TPU_MK_ALLOW_FALLBACK: bool = False
     VLLM_TPU_MK_SCATTER_DEEP: bool = False
     VLLM_TPU_MK_STACKED_MAMBA_OPERANDS: bool = False
     VLLM_TPU_MK_BUCKET_TUNE: bool = False
@@ -1086,6 +1087,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the mixer and the MoE) stream as FP8 E4M3 with per-output-column scales. The
     # draft (MTP) and the layers outside the whole-step kernel keep BF16 HC.
     "VLLM_TPU_MK_HC_FP8": env_bool("VLLM_TPU_MK_HC_FP8"),
+    # Megakernel failures (setup, self-check, a failed call, MTP tail / MK draft setup)
+    # raise by default; =1 restores the old stock fallback (draft kernels detached).
+    "VLLM_TPU_MK_ALLOW_FALLBACK": env_bool("VLLM_TPU_MK_ALLOW_FALLBACK"),
     # Whole-step GDN checkpoint scatter: 16 staging slots / 12 loads in flight from 64
     # checkpoints (the default deep ring starts at 144). Same pool bytes.
     "VLLM_TPU_MK_SCATTER_DEEP": env_bool("VLLM_TPU_MK_SCATTER_DEEP"),
