@@ -85,7 +85,7 @@ def test_shorthand_table_matches_the_template() -> None:
     assert qwen_plugin.SPEC.name == "qwen35"
     assert qwen_plugin.SPEC.create == ".adapter:create"
     assert qwen_plugin.SPEC.features == frozenset(
-        {"spec_decode", "mrope", "prefix_caching", "kv_offload"}
+        {"spec_decode", "mrope", "prefix_caching", "kv_offload", "kv_transfer_consumer"}
     )
     assert qwen_plugin.SPEC.layout_request is None
     # The adapter enforces these before `create`.

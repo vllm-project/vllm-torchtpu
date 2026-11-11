@@ -41,6 +41,12 @@ FEATURE_MROPE = "mrope"
 FEATURE_PREFIX_CACHING = "prefix_caching"
 FEATURE_KV_OFFLOAD = "kv_offload"
 FEATURE_KV_TRANSFER = "kv_transfer"
+# Consumer-only KV transfer: a transfer connector that only loads KV into this
+# engine before the scheduler runs a request (`kv_role == "kv_consumer"`) and
+# declares no layer-wise load or save, so a program that bypasses the
+# per-layer attention modules skips none of the connector's work. Narrower
+# than `kv_transfer` (any transfer connector, the program honors its hooks).
+FEATURE_KV_TRANSFER_CONSUMER = "kv_transfer_consumer"
 FEATURE_EPLB_DYNAMIC = "eplb_dynamic"
 FEATURE_SLEEP_MODE = "sleep_mode"
 FEATURES: frozenset[str] = frozenset(
@@ -53,6 +59,7 @@ FEATURES: frozenset[str] = frozenset(
         FEATURE_PREFIX_CACHING,
         FEATURE_KV_OFFLOAD,
         FEATURE_KV_TRANSFER,
+        FEATURE_KV_TRANSFER_CONSUMER,
         FEATURE_EPLB_DYNAMIC,
         FEATURE_SLEEP_MODE,
     }

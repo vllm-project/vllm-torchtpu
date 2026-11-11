@@ -770,6 +770,12 @@ def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
 
 class TPUConnector(KVConnectorBase_V1, SupportsHMA):
     force_raiden_connector = False
+    # No layer-wise KV load or save: `wait_for_layer_load` / `save_kv_layer`
+    # are no-ops, loads complete through `get_finished` before the scheduler
+    # runs the request. A megakernel that bypasses the per-layer attention
+    # modules may serve a consumer of this connector (its startup guard reads
+    # this attribute; a connector without it is declined).
+    layerwise_transfer = False
 
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:

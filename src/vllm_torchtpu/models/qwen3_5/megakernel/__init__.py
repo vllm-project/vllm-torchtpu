@@ -32,7 +32,17 @@ SPEC = TpuMonoSpec(
     # "dcp": decode context parallelism, with the DCP size dividing the ranks
     # per KV head (`adapter.dcp_size_decline`); KV pages per `pool.dcp`.
     parallelism=frozenset({"tp", "ep_in_tp", "dcp"}),
-    features=frozenset({"spec_decode", "mrope", "prefix_caching", "kv_offload"}),
+    # "kv_transfer_consumer": a PD decode leg's transfer connector, loading KV
+    # before the scheduler runs a request, with no layer-wise hooks.
+    features=frozenset(
+        {
+            "spec_decode",
+            "mrope",
+            "prefix_caching",
+            "kv_offload",
+            "kv_transfer_consumer",
+        }
+    ),
     requires={"mamba_ssm_cache_dtype": "bfloat16"},
     # The checkpoints this folder serves (the adapter picks it by these).
     architectures=(

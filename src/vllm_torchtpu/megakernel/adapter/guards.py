@@ -21,12 +21,17 @@ from typing import Any
 
 from vllm_torchtpu import _OFFLOADING_CONNECTORS
 from vllm_torchtpu.distributed.kv_transfer.connector_names import (
+    MULTI_CONNECTORS,
+)
+from vllm_torchtpu.distributed.kv_transfer.connector_names import (
     kv_connector_names as _connector_names,
 )
 from vllm_torchtpu.megakernel.adapter.backbone import find_backbone
 from vllm_torchtpu.megakernel.adapter.plugin import RunnerProtocol, RunnerView
 from vllm_torchtpu.megakernel.core.runtime.contract import (
     DOMAIN_TP,
+    FEATURE_KV_TRANSFER,
+    FEATURE_KV_TRANSFER_CONSUMER,
     PARALLELISM_UNSUPPORTED,
     REQUIRES_KEYS,
     REQUIRES_UNMET,
@@ -75,6 +80,80 @@ def kv_connector_names(kv_transfer_config: Any) -> tuple[str, ...]:
         return tuple(names)
     name = kv_transfer_config.kv_connector
     return (name,) if name else ()
+
+
+def connector_class(name: str) -> Any:
+    """The KV connector class registered in vLLM under `name` (vllm-torchtpu
+    registers its connectors there), or `None`: unknown, or no vLLM."""
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+    except ModuleNotFoundError as exc:
+        if not _without_vllm(exc):
+            raise
+        return None
+    try:
+        return KVConnectorFactory.get_connector_class_by_name(name)
+    except Exception:  # unregistered or failing import: unknown, so declined
+        return None
+
+
+def _child_kv_roles(kv_transfer_config: Any) -> dict[str, Any]:
+    """`kv_role` per child connector of a multi-connector (`None` when a child
+    sets none); empty for a single connector."""
+    if kv_transfer_config.kv_connector not in MULTI_CONNECTORS:
+        return {}
+    extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    return {
+        str(c["kv_connector"]): c.get("kv_role") for c in extra.get("connectors", [])
+    }
+
+
+def kv_transfer_decline(
+    kv_transfer_config: Any, features: frozenset[str]
+) -> tuple[str, str] | None:
+    """`(code, detail)` declining the config's KV transfer connectors, or `None`.
+
+    Offloading connectors are `kv_offload`'s. `kv_transfer` serves any
+    transfer connector. `kv_transfer_consumer` serves them only when this
+    engine is a KV consumer (`kv_role == "kv_consumer"`, and no child of a
+    multi-connector says otherwise) and every transfer connector's class
+    declares `layerwise_transfer = False`: such a connector loads KV before
+    the scheduler runs the request and has no per-layer hooks for the
+    megakernel to skip. Producers, `kv_both`, layer-wise connectors and
+    connectors that declare nothing are declined (fail closed).
+    """
+    names = kv_connector_names(kv_transfer_config)
+    transfer = [n for n in names if n not in _OFFLOADING_CONNECTORS]
+    if not transfer or FEATURE_KV_TRANSFER in features:
+        return None
+    code = f"kv_connector_unsupported:{transfer[0]}"
+    if FEATURE_KV_TRANSFER_CONSUMER not in features:
+        return code, f"plugin does not declare KV transfer (connector {transfer[0]})"
+    role = kv_transfer_config.kv_role
+    if role != "kv_consumer":
+        return code, (
+            f"serves a KV transfer connector only on a KV consumer (connector "
+            f"{transfer[0]}, kv_role {role!r})"
+        )
+    child_roles = _child_kv_roles(kv_transfer_config)
+    for name in transfer:
+        child_role = child_roles.get(name)
+        if child_role not in (None, "kv_consumer"):
+            return f"kv_connector_unsupported:{name}", (
+                f"serves a KV transfer connector only as a consumer (connector "
+                f"{name}, kv_role {child_role!r})"
+            )
+        cls = connector_class(name)
+        layerwise = getattr(cls, "layerwise_transfer", None) if cls else None
+        if layerwise is not False:
+            known = "unknown connector" if cls is None else f"{layerwise=}"
+            return f"kv_connector_unsupported:{name}", (
+                "serves only KV transfer connectors that declare no layer-wise "
+                f"load or save (connector {name}: {known})"
+            )
+    return None
 
 
 def _aux_hidden_layers(backbone: Any) -> Any:
@@ -221,9 +300,11 @@ def check_runner_features(
     spec_cfg = v_cfg.speculative_config
     # Offloading and transfer are separate features: a multi-connector may
     # mix an offloading child with a transfer child.
-    kv_names = kv_connector_names(v_cfg.kv_transfer_config)
+    kv_cfg = v_cfg.kv_transfer_config
+    kv_names = kv_connector_names(kv_cfg)
     offload = any(n in _OFFLOADING_CONNECTORS for n in kv_names)
-    other_kv = next((n for n in kv_names if n not in _OFFLOADING_CONNECTORS), None)
+    kv_bad = kv_transfer_decline(kv_cfg, features) if kv_cfg is not None else None
+    kv_code, kv_detail = kv_bad if kv_bad is not None else ("", "")
     rules = [
         (
             spec_cfg is not None
@@ -248,11 +329,7 @@ def check_runner_features(
             "kv_offload_unsupported",
             "plugin does not declare KV offloading",
         ),
-        (
-            other_kv is not None and "kv_transfer" not in features,
-            f"kv_connector_unsupported:{other_kv}",
-            f"plugin does not declare KV transfer (connector {other_kv})",
-        ),
+        (kv_bad is not None, kv_code, kv_detail),
         (
             v_cfg.parallel_config.enable_eplb and "eplb_dynamic" not in features,
             "eplb_dynamic_unsupported",
