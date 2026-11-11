@@ -25,6 +25,7 @@ import dataclasses
 import math
 import os
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -536,17 +537,16 @@ def _make_kv_connector_output(
 
 # Smallest output size
 MIN_NUM_SEQS = 8
+SAMPLING_EPS = 1e-5
 # Most distinct padded temperature / top-k / top-p row sets whose device copies
-# `_build_padded_sampling_params` keeps for reuse.
+# `_build_padded_sampling_params` keeps for reuse; the least recently used set
+# goes first.
 _SAMPLING_PARAM_UPLOAD_CACHE_MAX = 8
 
 
 def _host_bytes(t: torch.Tensor) -> bytes:
     """Raw bytes of a CPU tensor (bfloat16 included), for value-keyed reuse."""
     return t.contiguous().view(torch.uint8).numpy().tobytes()
-
-
-SAMPLING_EPS = 1e-5
 
 
 def _get_sequence_layout_planner_for_runner(runner: Any):
@@ -1194,8 +1194,9 @@ class TPUModelRunner(GPUModelRunner):
         self._greedy_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
-        # host-bytes key -> ((temps, top_k, top_p) device tensors, host sources)
-        self._sampling_param_uploads: dict[tuple, tuple] = {}
+        # host-bytes key -> ((temps, top_k, top_p) device tensors, host
+        # sources), least recently used first
+        self._sampling_param_uploads: OrderedDict[tuple, tuple] = OrderedDict()
         # (host-bytes key, staged device tensor) of the last block-table upload
         self._block_table_upload_reuse: tuple | None = None
         self._stage_timing = RunnerStageTiming(profiler_rank)
@@ -8846,6 +8847,9 @@ class TPUModelRunner(GPUModelRunner):
         )
         cached = self._sampling_param_uploads.get(key)
         if cached is not None:
+            # A hit makes the entry the newest, so rows that recur every step
+            # stay cached while other row sets come and go.
+            self._sampling_param_uploads.move_to_end(key)
             return cached[0]
         uploaded = (
             temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
@@ -8853,7 +8857,7 @@ class TPUModelRunner(GPUModelRunner):
             top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
         )
         if len(self._sampling_param_uploads) >= _SAMPLING_PARAM_UPLOAD_CACHE_MAX:
-            self._sampling_param_uploads.pop(next(iter(self._sampling_param_uploads)))
+            self._sampling_param_uploads.popitem(last=False)
         # The entry keeps the host sources alive: TorchTPU may read them after
         # the non-blocking upload returns (see stage_h2d_upload).
         self._sampling_param_uploads[key] = (

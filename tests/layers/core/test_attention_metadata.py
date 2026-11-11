@@ -54,6 +54,7 @@ class TestAttentionMetadataBuilderPlumbing:
         runner._unfenced_h2d_sources = []
         runner._free_h2d_sources = {}
         runner._registered_h2d_sources = set()
+        runner._block_table_upload_reuse = None
         runner.attn_groups = []
         runner._unified_kv_layout = False
 
@@ -702,28 +703,6 @@ class TestAttentionMetadataBuilderPlumbing:
         assert ctx_preinit.staged_block_tables is None
 
 
-class _CountingUploads:
-    """Counts `Tensor.to(device, non_blocking=True)` calls. Each returns a fresh
-    copy, as a host-to-device transfer does, so a staged table never aliases
-    the host buffer it came from (a CPU `.to("cpu")` would)."""
-
-    def __init__(self, monkeypatch):
-        self.count = 0
-        real_to = torch.Tensor.to
-
-        def to(tensor, *args, **kwargs):
-            if (
-                kwargs.get("non_blocking")
-                and args
-                and isinstance(args[0], (torch.device, str))
-            ):
-                self.count += 1
-                return real_to(tensor, *args, **kwargs).clone()
-            return real_to(tensor, *args, **kwargs)
-
-        monkeypatch.setattr(torch.Tensor, "to", to)
-
-
 def _record_staging_fence(runner):
     """`TPUModelRunner._record_input_staging_fence` without the device event."""
     runner._fenced_h2d_sources.extend(runner._unfenced_h2d_sources)
@@ -860,13 +839,12 @@ class TestBlockTableUploadReuse:
         ids=["unified-mamba", "single-group", "35x128-blocks"],
     )
     def test_reuse_matches_uploading_every_walk(
-        self, monkeypatch, groups, unified, steps, seed
+        self, h2d_uploads, groups, unified, steps, seed
     ):
         """Over a decode trace with block-boundary crossings and finishing
         requests, every walk stages exactly what a fresh upload stages, an
         upload happens exactly when the packed bytes change, and a reused walk
         hands its unused host buffer back to the free list."""
-        uploads = _CountingUploads(monkeypatch)
         num_reqs_padded = 16
         reused = self._runner(groups, unified)
         fresh = self._runner(groups, unified)
@@ -879,11 +857,13 @@ class TestBlockTableUploadReuse:
             trace.write(fresh)
             ctx_reused = trace.ctx(num_reqs_padded)
             ctx_fresh = trace.ctx(num_reqs_padded)
-            reused_uploads += self._walk(reused, ctx_reused, num_reqs_padded, uploads)
+            reused_uploads += self._walk(
+                reused, ctx_reused, num_reqs_padded, h2d_uploads
+            )
             # Dropping the previous upload makes every walk upload, as before
             # this reuse.
             fresh._block_table_upload_reuse = None
-            fresh_uploads += self._walk(fresh, ctx_fresh, num_reqs_padded, uploads)
+            fresh_uploads += self._walk(fresh, ctx_fresh, num_reqs_padded, h2d_uploads)
 
             assert ctx_reused.staged_block_tables.keys() == (
                 ctx_fresh.staged_block_tables.keys()
@@ -924,8 +904,7 @@ class TestBlockTableUploadReuse:
         assert 0 < reused_uploads < steps // 2
         assert len(reused._registered_h2d_sources) <= len(fresh._registered_h2d_sources)
 
-    def test_dummy_walks_always_upload(self, monkeypatch):
-        uploads = _CountingUploads(monkeypatch)
+    def test_dummy_walks_always_upload(self, h2d_uploads):
         runner = self._runner([(False, 4, 16), (True, 4, 16)])
         for _ in range(3):
             ctx = AttentionMetadataBuilderContext(
@@ -937,19 +916,18 @@ class TestBlockTableUploadReuse:
                 request_distribution=torch.zeros(3, dtype=torch.int32),
                 position_ids_override=torch.zeros(8, dtype=torch.int32),
             )
-            assert self._walk(runner, ctx, 8, uploads) == 1
+            assert self._walk(runner, ctx, 8, h2d_uploads) == 1
         assert runner._block_table_upload_reuse is None
 
-    def test_recycled_host_buffer_cannot_corrupt_the_reused_table(self, monkeypatch):
+    def test_recycled_host_buffer_cannot_corrupt_the_reused_table(self, h2d_uploads):
         """Once its fence is waited on, the host buffer of a staged walk goes
         back to the free list and a later walk refills it; a walk that reuses
         the staged table must still read the rows it was staged with."""
-        uploads = _CountingUploads(monkeypatch)
         groups = [(False, 4, 16)]
         runner = self._runner(groups, unified=False)
         trace = _DecodeTrace(groups, num_reqs=3, seed=9)
         trace.write(runner)
-        assert self._walk(runner, trace.ctx(8), 8, uploads) == 1
+        assert self._walk(runner, trace.ctx(8), 8, h2d_uploads) == 1
         staged = runner._block_table_upload_reuse[1]
         expected = staged.clone()
         _wait_staging_fence(runner)
@@ -959,7 +937,7 @@ class TestBlockTableUploadReuse:
         assert torch.equal(staged, expected)
 
         ctx = trace.ctx(8)
-        assert self._walk(runner, ctx, 8, uploads) == 0
+        assert self._walk(runner, ctx, 8, h2d_uploads) == 0
         assert torch.equal(ctx.staged_block_tables[0], expected)
 
 

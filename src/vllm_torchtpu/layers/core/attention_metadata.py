@@ -353,14 +353,9 @@ def stage_h2d_upload(runner: Any, host: torch.Tensor) -> torch.Tensor:
     assert host.is_contiguous()
     recycle = id(host) in runner._registered_h2d_sources
     if recycle:
-        key = (host.numel(), host.dtype)
 
         def release_cb() -> None:
-            free = runner._free_h2d_sources.pop(key, None)
-            if free is None:
-                free = []
-            free.append(host)
-            runner._free_h2d_sources[key] = free
+            _release_unused_h2d_source(runner, host)
     else:
         release_cb = _noop_release
     runner._unfenced_h2d_sources.append((host, release_cb))
@@ -404,9 +399,9 @@ def zeros_h2d_source(
 
 
 def _release_unused_h2d_source(runner: Any, host: torch.Tensor) -> None:
-    """Hand a `zeros_h2d_source` buffer that no transfer read straight back to
-    the free list (`stage_h2d_upload`'s release_cb without the fence wait:
-    nothing is in flight from it)."""
+    """Hand a `zeros_h2d_source` buffer back to the free list once no transfer
+    reads it any more: from `stage_h2d_upload`'s release_cb after the fence
+    wait, or at once when no transfer read it (a reused block-table walk)."""
     if id(host) not in runner._registered_h2d_sources:
         return
     key = (host.numel(), host.dtype)
@@ -430,7 +425,7 @@ def _stage_block_table_upload(
     if ctx.position_ids_override is not None:
         return stage_h2d_upload(runner, flat)
     key = (flat.numel(), flat.dtype, flat.numpy().tobytes())
-    prev = getattr(runner, "_block_table_upload_reuse", None)
+    prev = runner._block_table_upload_reuse
     if prev is not None and prev[0] == key:
         _release_unused_h2d_source(runner, flat)
         return prev[1]

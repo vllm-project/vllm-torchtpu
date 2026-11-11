@@ -17,7 +17,7 @@ import copy
 import inspect
 import random
 import weakref
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -3429,28 +3429,6 @@ def test_upload_unless_unchanged_reuses_only_identical_values(device):
 _SAMPLING_VOCAB = 1024
 
 
-class _CountingUploads:
-    """Counts `Tensor.to(device, non_blocking=True)` calls. Each returns a fresh
-    copy, as a host-to-device transfer does, so a reused upload never aliases
-    host memory (a CPU `.to("cpu")` would)."""
-
-    def __init__(self, monkeypatch):
-        self.count = 0
-        real_to = torch.Tensor.to
-
-        def to(tensor, *args, **kwargs):
-            if (
-                kwargs.get("non_blocking")
-                and args
-                and isinstance(args[0], (torch.device, str))
-            ):
-                self.count += 1
-                return real_to(tensor, *args, **kwargs).clone()
-            return real_to(tensor, *args, **kwargs)
-
-        monkeypatch.setattr(torch.Tensor, "to", to)
-
-
 def _sampling_param_runner(max_num_reqs=64):
     return SimpleNamespace(
         input_batch=SimpleNamespace(
@@ -3462,7 +3440,7 @@ def _sampling_param_runner(max_num_reqs=64):
             top_p_cpu_tensor=torch.ones(max_num_reqs, dtype=torch.float32),
         ),
         vocab_size=_SAMPLING_VOCAB,
-        _sampling_param_uploads={},
+        _sampling_param_uploads=OrderedDict(),
     )
 
 
@@ -3475,7 +3453,7 @@ def _fresh_padded_sampling_params(runner, start, end, logits):
     fresh = SimpleNamespace(
         input_batch=runner.input_batch,
         vocab_size=runner.vocab_size,
-        _sampling_param_uploads={},
+        _sampling_param_uploads=OrderedDict(),
     )
     return _padded_sampling_params(fresh, start, end, logits)
 
@@ -3488,12 +3466,11 @@ def _assert_same_tensors(actual, expected):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_sampling_params_upload_once_per_padded_size_in_rl_decode(monkeypatch, dtype):
+def test_sampling_params_upload_once_per_padded_size_in_rl_decode(h2d_uploads, dtype):
     """RL decode samples every request with the same parameters, so the padded
     temperature / top-k / top-p rows repeat step after step: they are uploaded
     once per padded batch size, and every step gets what a fresh upload
     gives."""
-    uploads = _CountingUploads(monkeypatch)
     runner = _sampling_param_runner()
     rng = random.Random(1)
     num_reqs, seen = 40, set()
@@ -3503,21 +3480,20 @@ def test_sampling_params_upload_once_per_padded_size_in_rl_decode(monkeypatch, d
         padded = 16 if num_reqs <= 16 else 32 if num_reqs <= 32 else 64
         logits = torch.zeros(padded, 8, dtype=dtype)
         expected = _fresh_padded_sampling_params(runner, 0, num_reqs, logits)
-        before = uploads.count
+        before = h2d_uploads.count
         actual = _padded_sampling_params(runner, 0, num_reqs, logits)
         _assert_same_tensors(actual, expected)
-        assert uploads.count - before == (0 if padded in seen else 3), step
+        assert h2d_uploads.count - before == (0 if padded in seen else 3), step
         seen.add(padded)
     assert len(seen) > 1
     assert len(runner._sampling_param_uploads) == len(seen)
 
 
-def test_sampling_param_reuse_with_mixed_and_greedy_rows(monkeypatch):
+def test_sampling_param_reuse_with_mixed_and_greedy_rows(h2d_uploads):
     """Requests with their own temperature (greedy included), top-k and top-p
     join in random slots, and chunks start at different rows: every call
     matches a fresh upload, repeated rows are reused, and the cache stays
     bounded."""
-    uploads = _CountingUploads(monkeypatch)
     runner = _sampling_param_runner()
     batch = runner.input_batch
     rng = random.Random(7)
@@ -3534,11 +3510,11 @@ def test_sampling_param_reuse_with_mixed_and_greedy_rows(monkeypatch):
         dtype = rng.choice([torch.bfloat16, torch.float32])
         logits = torch.zeros(padded, 4, dtype=dtype)
         expected = _fresh_padded_sampling_params(runner, start, end, logits)
-        before = uploads.count
+        before = h2d_uploads.count
         actual = _padded_sampling_params(runner, start, end, logits)
         _assert_same_tensors(actual, expected)
         assert actual[0].dtype == dtype, step
-        if uploads.count == before:
+        if h2d_uploads.count == before:
             reused += 1
         assert (
             len(runner._sampling_param_uploads)
@@ -3547,11 +3523,11 @@ def test_sampling_param_reuse_with_mixed_and_greedy_rows(monkeypatch):
     assert reused > 0
 
 
-def test_sampling_param_reuse_keys_on_values_not_buffers(monkeypatch):
+@pytest.mark.usefixtures("h2d_uploads")
+def test_sampling_param_reuse_keys_on_values_not_buffers():
     """A cached upload does not follow later writes to the persistent batch: a
     changed temperature uploads again. Each entry holds the host rows its
     non-blocking upload reads."""
-    _CountingUploads(monkeypatch)
     runner = _sampling_param_runner()
     logits = torch.zeros(16, 4, dtype=torch.float32)
     first = _padded_sampling_params(runner, 0, 10, logits)
@@ -3567,28 +3543,40 @@ def test_sampling_param_reuse_keys_on_values_not_buffers(monkeypatch):
             assert torch.equal(device_rows, host_rows.unsqueeze(1))
 
 
-def test_sampling_param_cache_evicts_the_oldest_entry(monkeypatch):
-    uploads = _CountingUploads(monkeypatch)
+def test_sampling_param_cache_evicts_the_least_recently_used_entry(h2d_uploads):
+    """A hit makes an entry the newest, so rows that recur every step stay
+    cached while other row sets come and go (first-in-first-out eviction would
+    drop them after `_SAMPLING_PARAM_UPLOAD_CACHE_MAX` new sets). A full cache
+    evicts the entry that went unused the longest."""
     runner = _sampling_param_runner()
     logits = torch.zeros(16, 4)
     cache_max = tpu_runner._SAMPLING_PARAM_UPLOAD_CACHE_MAX
-    temperatures = [0.01 * (i + 1) for i in range(cache_max + 12)]
-    for temperature in temperatures:
+
+    def uploads_for(temperature):
+        """The uploads of one call whose first row has `temperature`."""
         runner.input_batch.temperature_cpu_tensor[0] = temperature
-        _padded_sampling_params(runner, 0, 4, logits)
-    assert uploads.count == 3 * len(temperatures)
+        expected = _fresh_padded_sampling_params(runner, 0, 4, logits)
+        before = h2d_uploads.count
+        actual = _padded_sampling_params(runner, 0, 4, logits)
+        _assert_same_tensors(actual, expected)
+        assert len(runner._sampling_param_uploads) <= cache_max
+        return h2d_uploads.count - before
+
+    # The same rows (temperature 1.0) every step, a new row set in between.
+    new = [0.01 * (i + 1) for i in range(3 * cache_max)]
+    steady = [uploads_for(1.0)]
+    for temperature in new:
+        assert uploads_for(temperature) == 3
+        steady.append(uploads_for(1.0))
+    assert steady == [3] + [0] * len(new)
     assert len(runner._sampling_param_uploads) == cache_max
 
-    # The newest `cache_max` entries stay; the older ones went first.
-    before = uploads.count
-    for temperature in temperatures[-cache_max:]:
-        runner.input_batch.temperature_cpu_tensor[0] = temperature
-        _padded_sampling_params(runner, 0, 4, logits)
-    assert uploads.count == before
-    runner.input_batch.temperature_cpu_tensor[0] = temperatures[-cache_max - 1]
-    _padded_sampling_params(runner, 0, 4, logits)
-    assert uploads.count == before + 3
-    assert len(runner._sampling_param_uploads) == cache_max
+    # Least recently used first, the cache holds the last `cache_max - 1` new
+    # sets, then the steady rows. One more new set evicts the oldest of those
+    # sets, and the next one stays.
+    assert uploads_for(1.5) == 3
+    assert uploads_for(new[-(cache_max - 2)]) == 0
+    assert uploads_for(new[-(cache_max - 1)]) == 3
 
 
 def test_host_bytes_tell_bf16_rows_from_their_float32_values():
