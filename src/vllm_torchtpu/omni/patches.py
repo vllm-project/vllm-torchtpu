@@ -965,8 +965,9 @@ _WAN_VAE_REPLICATED_ENCODE_PATCHED = "_tpu_wan_vae_replicated_encode_patched"
 
 
 def _patch_wan_vae_replicated_encode() -> None:
-    # TODO: Remove once distributed Wan VAE encode avoids rank-0 merge skew
-    # and auto-enabled decode tiling does not force tiled encode on TPU.
+    # TODO: Remove once the distributed Wan VAE encode hang on TPU is understood
+    # and fixed (cause not found yet), and auto-enabled decode tiling does not
+    # force tiled encode on TPU.
     if not envs.VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER:
         return
     try:
