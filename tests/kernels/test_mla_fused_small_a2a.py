@@ -1486,6 +1486,102 @@ def _run_dcp8_backbone_and_mtp_suite(mesh, *, is_cpu_interpret: bool) -> None:
         assert nd_mtp == 0 and ulp_mtp == 0
 
 
+def test_cpu8_flag_off_lowering_independent_of_step16_group(
+    _cpu8_worker_run: bool,
+):
+    """Flag off, the decode kernel must lower exactly as before "step16".
+
+    The step16-only quad group size (DECODE_STEP16_QUAD_GROUP_TOKENS) must not
+    reach any program built without "step16": changing it leaves the StableHLO of
+    every flag-off bucket byte-identical, for the default body levers and
+    without "step8", at small-chunk 16 (the env default, where the 32-token
+    bucket is a regular chunk) and 32. The negative control shows the same
+    change does alter a "step16" program, so the comparison can fail.
+    """
+    if not _cpu8_worker_run:
+        return
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
+
+    num_pages = 8
+
+    def lower_srpa(t_sub: int, levers: tuple[str, ...], small: int) -> str:
+        # The kernel entry point is itself jitted: drop its trace cache so the
+        # patched module constant is read again on every lowering.
+        jax.clear_caches()
+        ql = jax.ShapeDtypeStruct((t_sub, 64, 512), jnp.bfloat16)
+        qp = jax.ShapeDtypeStruct((t_sub, 64, 256), jnp.bfloat16)
+        nc = jax.ShapeDtypeStruct((num_pages, 256, 128), jnp.uint32)
+        rc = jax.ShapeDtypeStruct((num_pages, 64, 128), jnp.uint32)
+        tk = jax.ShapeDtypeStruct((t_sub, 2048), jnp.int32)
+        pt = jax.ShapeDtypeStruct((num_pages,), jnp.int32)
+        cq = jax.ShapeDtypeStruct((2,), jnp.int32)
+        dist = jax.ShapeDtypeStruct((3,), jnp.int32)
+        rt = jax.ShapeDtypeStruct((t_sub, 2, 128), jnp.float32)
+
+        @jax.jit
+        def fn(ql, qp, nc, rc, tk, pt, cq, dist, rt):
+            return sparse_mla.sparse_ragged_paged_attention(
+                ql,
+                nc,
+                rc,
+                tk,
+                pt,
+                cq,
+                dist,
+                q_pe=qp,
+                q_rope_table=rt,
+                lse_in_kernel=True,
+                sm_scale=0.125,
+                k_scale=1.0,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=512,
+                small_chunk_batch_size=4,
+                small_chunk_tokens=small,
+                lse_lane_dense=True,
+                lse_mask_empty=True,
+                fused_window_prep=True,
+                decode_row_widths=(128, 256, 384),
+                decode_body_levers=levers,
+            )
+
+        return fn.lower(ql, qp, nc, rc, tk, pt, cq, dist, rt).as_text()
+
+    default = sparse_mla.DECODE_BODY_DEFAULT
+    assert "step16" not in default
+    no_step8 = tuple(v for v in default if v != "step8")
+    with (
+        mock.patch.dict(os.environ, dict(_CPU8_ENV), clear=False),
+        pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()),
+        mock.patch.object(pltpu, "get_tpu_info", return_value=None),
+        mock.patch.object(
+            native_sc_gather, "dsa_gather_native_sc", _fake_gather_poisoned
+        ),
+    ):
+        os.environ.pop("TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS", None)
+        for levers in (default, no_step8):
+            for small in (16, 32):
+                for t_sub in (4, 8, 16, 32, 64):
+                    ref = lower_srpa(t_sub, levers, small)
+                    with mock.patch.object(
+                        sparse_mla, "DECODE_STEP16_QUAD_GROUP_TOKENS", 4
+                    ):
+                        moved = lower_srpa(t_sub, levers, small)
+                    assert moved == ref, (levers, small, t_sub)
+
+        # Negative control: a "step16" program (32-token bucket at the default
+        # small-chunk 16, 16-token attention steps) does depend on it.
+        step16 = (*default, "step16")
+        ref = lower_srpa(32, step16, 16)
+        with mock.patch.object(sparse_mla, "DECODE_STEP16_QUAD_GROUP_TOKENS", 4):
+            assert lower_srpa(32, step16, 16) != ref
+
+
 def test_cpu8_backbone_t8_t16_and_mtp_t16_numerics(_cpu8_worker_run: bool):
     if not _cpu8_worker_run:
         return

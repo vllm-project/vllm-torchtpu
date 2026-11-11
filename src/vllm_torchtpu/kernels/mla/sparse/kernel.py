@@ -1451,6 +1451,10 @@ DECODE_BODY_LEVERS = (
 )
 DECODE_STEP8_TOKENS = 8
 DECODE_STEP16_TOKENS = 16
+# "quad" under "step16": a 16-token attention step stacks its tokens in groups
+# of this many (the KV staging scratch keeps this size). Without "step16" the
+# group is the whole step, as before "step16" existed.
+DECODE_STEP16_QUAD_GROUP_TOKENS = DECODE_STEP8_TOKENS
 # The measured set (decode probes 02 / 04 / 05): "step8" runs 8 tokens per
 # attention grid step and "quad" stacks them in one softmax; "nofill" and
 # "q128" measured no gain.
@@ -3014,12 +3018,16 @@ def _attention_kernel(
 
         def run_quad(rows, levers):
             """Decode lever "quad": the step's tokens' QK scores stacked in
-            groups of up to DECODE_STEP8_TOKENS into one [g * heads, w] tile
+            groups of `kv_stage_ref.shape[1]` tokens (the whole step, or
+            DECODE_STEP16_QUAD_GROUP_TOKENS under "step16") into one
+            [g * heads, w] tile
             (row max / exp / sum per row), their unpacked KV staged in
             `kv_stage_ref[0]` and read back by the PVs after the softmax."""
             h = num_q_heads
-            for t0 in range(0, batch_size, DECODE_STEP8_TOKENS):
-                bsz = min(DECODE_STEP8_TOKENS, batch_size - t0)
+            assert kv_stage_ref is not None
+            group = kv_stage_ref.shape[1]
+            for t0 in range(0, batch_size, group):
+                bsz = min(group, batch_size - t0)
                 scores = []
                 kv_lens = []
                 w = None
@@ -4606,7 +4614,9 @@ def sparse_attention_chunk(
                 pltpu.VMEM(
                     (
                         1,
-                        min(batch_size, DECODE_STEP8_TOKENS),
+                        min(batch_size, DECODE_STEP16_QUAD_GROUP_TOKENS)
+                        if "step16" in stage_levers
+                        else batch_size,
                         cache_kv_nope.shape[1],
                         pair_head_dim,
                     )
