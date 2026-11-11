@@ -359,7 +359,7 @@ def msa_decode_attention_lse(
     pages_per_step: int = PAGES_PER_STEP,
     widths: tuple[int, ...] = STEP_WIDTHS,
     tiles_per_step: int = TILES_PER_STEP,
-    transposed: bool = True,
+    transposed: bool = False,
     scale_mode: str = "small",
     dense: bool | None = None,
     interpret: bool = False,
