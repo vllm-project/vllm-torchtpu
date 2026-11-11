@@ -21,12 +21,15 @@ linear expert placement) and plain TP MoE (``tp_size == n_ranks``).
 import dataclasses
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 import torch
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental import moe_tp_decode_nvfp4 as kernel
 from vllm_torchtpu.layers.adapter import moe_tp_decode as fp8_decode
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import align_to
 
 logger = init_logger(__name__)
 
@@ -56,7 +59,61 @@ def moe_tp_decode_nvfp4_supported(quant_method: Any) -> bool:
     return getattr(quant_method, _OP_ATTR, None) is not None
 
 
-def _admit(runner: Any, n_ranks: int) -> fp8_decode._Admitted | str:
+def _proposed_routed_sds(
+    layer: Any,
+    *,
+    requant_block: int,
+    clamp_per_matrix: bool = True,
+) -> (
+    tuple[
+        jax.ShapeDtypeStruct,
+        jax.ShapeDtypeStruct,
+        tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct],
+    ]
+    | str
+):
+    """Describe the K-major FP4 weights and 4D scales ``_prepare_moe_weights``
+    will emit for ``layer`` before checkpoint tensors are mutated."""
+    if requant_block <= 0:
+        return f"invalid requant_block {requant_block}"
+    w13_u8, w2_u8 = layer.w13_weight.data, layer.w2_weight.data
+    experts = int(w13_u8.shape[0])
+    hidden = int(w13_u8.shape[-1]) * 2
+    inter = int(w2_u8.shape[-1]) * 2
+    b13 = min(requant_block, hidden) if clamp_per_matrix else requant_block
+    b2 = min(requant_block, inter) if clamp_per_matrix else requant_block
+    if (
+        hidden % b13 == 0
+        and inter % b2 == 0
+        and (not clamp_per_matrix or (b13 % 16 == 0 and b2 % 16 == 0))
+    ):
+        inter_out = inter
+    else:
+        if hidden % requant_block != 0:
+            return (
+                f"hidden ({hidden}) is not divisible by weight block ({requant_block})"
+            )
+        inter_out = align_to(inter, requant_block)
+        b13 = b2 = requant_block
+    return (
+        jax.ShapeDtypeStruct((experts, hidden, 2 * inter_out), jnp.float4_e2m1fn),
+        jax.ShapeDtypeStruct((experts, inter_out, hidden), jnp.float4_e2m1fn),
+        (
+            jax.ShapeDtypeStruct(
+                (experts, hidden // b13, 1, 2 * inter_out), jnp.float32
+            ),
+            jax.ShapeDtypeStruct((experts, inter_out // b2, 1, hidden), jnp.float32),
+        ),
+    )
+
+
+def _admit(
+    runner: Any,
+    n_ranks: int,
+    *,
+    proposed_routed: tuple[Any, Any, tuple[Any, Any]] | None = None,
+    pre_load: bool = False,
+) -> fp8_decode._Admitted | str:
     """Admission check for one ``MoERunner``, or a human-readable refusal."""
     from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
         enable_pipelined_collective_and_compute,
@@ -83,16 +140,51 @@ def _admit(runner: Any, n_ranks: int) -> fp8_decode._Admitted | str:
         get_scales=_get_scales,
         row_buckets=kernel.ROW_BUCKETS,
         can_use_fn=kernel.can_use_moe_tp_decode_nvfp4,
-        no_rows_msg=lambda layer, scales, shared: (
-            f"the kernel admits no token count (w13 {list(layer.w13_weight.shape)} "
-            f"{layer.w13_weight.dtype}, s13 {list(scales[0].shape)}, "
+        no_rows_msg=lambda w13, scales, shared: (
+            f"the kernel admits no token count (w13 {list(w13.shape)} "
+            f"{w13.dtype}, s13 {list(scales[0].shape)}, "
             f"s2 {list(scales[1].shape)}, shared w13 {list(shared[0].shape)})"
         ),
         build_statics=lambda base, _rnr, _hid, _topk, _scales, _shared: _OpStatics(
             **base,
             split_meta=bool(envs.TPU_MOE_TP_DECODE_SPLIT_META),
         ),
+        proposed_routed=proposed_routed,
+        pre_load=pre_load,
     )
+
+
+def precheck_admission(
+    layer: Any,
+    *,
+    requant_block: int,
+    clamp_per_matrix: bool = True,
+) -> str | None:
+    """Return ``None`` if ``layer`` will arm after load-time requantization,
+    else a human-readable refusal reason."""
+    runner = fp8_decode.routed_experts_runner(layer)
+    if runner is None:
+        return "routed experts layer has no MoERunner"
+    qm = layer.quant_method
+    if moe_tp_decode_nvfp4_supported(qm):
+        return None
+    if fp8_decode.moe_tp_decode_supported(qm):
+        return "moe_tp_decode already serves this layer"
+    proposed = _proposed_routed_sds(
+        layer,
+        requant_block=requant_block,
+        clamp_per_matrix=clamp_per_matrix,
+    )
+    if isinstance(proposed, str):
+        return proposed
+    topo = fp8_decode._topology()
+    res = fp8_decode._admit_runner(
+        runner,
+        topo,
+        lambda r, n: _admit(r, n, proposed_routed=proposed, pre_load=True),
+        pre_load=True,
+    )
+    return res if isinstance(res, str) else None
 
 
 def _op_body(
