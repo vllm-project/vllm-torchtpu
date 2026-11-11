@@ -25,6 +25,11 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
 # Util.
 
 
@@ -1386,13 +1391,88 @@ def calculate_tiling(
         if num_k_tiles == 1 and tile_m == 2 * sublane:
             bucket_base = sublane
 
-    return TileSizes(
+    tiles = TileSizes(
         tile_m=tile_m,
         tile_k=tile_k,
         tile_n=tile_n,
         bucket_base=bucket_base,
         buckets=buckets,
     )
+    if envs.TPU_GMM_V2_TUNED_TILES:
+        tiles = tuned_tiles(
+            tiles, dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act
+        )
+    return tiles
+
+
+# From this many rows, a decode gate_up gmm moves an expert's whole gate_up
+# width per grid step (one 2-deep weight stream, out of the fused MLP kernel):
+# at the MoE decode shapes (H 6144, I 3072, 16 local experts) nearly every
+# expert is hit, and halving the grid steps beats the fused kernel's
+# prefetched down block.
+TUNED_FULL_N_MIN_M = 256
+# Grown prefill tiles end at multiples of this many rows: 64-row buckets add
+# two more dequantize-before-matmul bodies to the program and cost 11-27% at
+# 4096-32768 rows, while 128-row tiles of a 64-row group cost no more.
+TUNED_PREFILL_BUCKET_M = 128
+
+
+def tuned_tiles(
+    tiles: TileSizes,
+    dims: Dimensions,
+    lhs_cfgs: InputConfigs,
+    rhs_cfgs: InputConfigs,
+    vmem_limit_bytes: int,
+    fuse_act: str | None,
+) -> TileSizes:
+    """TPU_GMM_V2_TUNED_TILES: retile fp4-rhs, bf16-lhs calls.
+
+    Only the pipeline depth, tile_n and the bucket sizes change. tile_k stays
+    whole and a row's MXU feed (fp8 at <= FP8_RHS_MAX_BUCKET_M rows, else bf16
+    dequantize-before) is unchanged, so every output element is computed the
+    same way.
+    """
+    if fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is None or tiles.tile_k != dims.size_k:
+        return tiles
+    if tiles.tile_m <= FP8_RHS_MAX_BUCKET_M:
+        # Decode fp8 tiles: gate_up only (down's fused-MLP window is 2-deep).
+        if fuse_act is None:
+            return tiles
+        new = dataclasses.replace(tiles, rhs_buffer_count=2)
+        if dims.size_m >= TUNED_FULL_N_MIN_M:
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            full = dataclasses.replace(
+                new, tile_n=align_to(dims.size_n // 2, num_lanes)
+            )
+            block = rhs_weight_block_bytes(full.tile_k, full.tile_n, rhs_cfgs)
+            vmem = (
+                gmm_vmem_estimate(
+                    full.tile_m,
+                    full.tile_n,
+                    full.tile_k,
+                    lhs_cfgs=lhs_cfgs,
+                    rhs_cfgs=rhs_cfgs,
+                    fuse_act=fuse_act,
+                )
+                - 2 * block  # 2 weight blocks in flight, not 3 (gate and up)
+            )
+            if vmem <= vmem_limit_bytes:
+                new = full
+    elif (
+        tiles.buckets is None
+        and tiles.bucket_base < TUNED_PREFILL_BUCKET_M
+        and tiles.tile_m % TUNED_PREFILL_BUCKET_M == 0
+    ):
+        new = dataclasses.replace(tiles, bucket_base=TUNED_PREFILL_BUCKET_M)
+    else:
+        return tiles
+    logger.info_once(
+        "TPU_GMM_V2_TUNED_TILES=1: gmm_v2 retiled (first: size_m %d, %s -> %s)",
+        dims.size_m,
+        tiles,
+        new,
+    )
+    return new
 
 
 def validate_inputs(
