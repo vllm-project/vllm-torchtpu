@@ -221,6 +221,10 @@ def resolve_model_owned_pool_geometry(
     return None
 
 
+def _ignore_evictions(evicted_hashes: list[bytes]) -> None:
+    """Eviction callback left registered after the manager shuts down."""
+
+
 class RaidenLoadStoreSpec(LoadStoreSpec):
     """Offload-side specification describing the ordered keys for a job.
 
@@ -866,9 +870,12 @@ class RaidenOffloadingManager(OffloadingManager):
 
     def shutdown(self) -> None:
         # Unregister first: the callback runs on a Raiden-owned thread and
-        # must not fire into a half-torn-down manager while jobs drain.
+        # must not fire into a half-torn-down manager while jobs drain. The
+        # binding takes a callable only (`set_eviction_callback(self,
+        # callback: object)` rejects None with a TypeError, which aborted the
+        # connector's shutdown before the drain), so swap in a no-op.
         if self._supports_eviction_callback:
-            self._store.set_eviction_callback(None)
+            self._store.set_eviction_callback(_ignore_evictions)
         if self._admissions:
             self.drain_jobs(set(self._admissions.keys()))
 
