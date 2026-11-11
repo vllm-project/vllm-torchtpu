@@ -498,6 +498,61 @@ def _single_sort_permutation(
     return sorted_indices, revert, sorted_indices // topk
 
 
+def packed_sorts_fit(num_routes: int, num_keys: int) -> bool:
+    """Whether `_packed_sorts_permutation` can pack this routing into int32:
+    (key, flat position) in 31 bits, and (position, rank) in 32."""
+    flat_bits = max(1, (num_routes - 1).bit_length())
+    key_bits = max(1, (num_keys - 1).bit_length())
+    return key_bits + flat_bits <= 31 and 2 * flat_bits <= 32
+
+
+def _packed_sorts_permutation(
+    sort_keys: jax.Array, topk: int, num_keys: int, sizes_from_keys: bool = True
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
+    """The routing permutation from two single-operand packed sorts and no scatter
+    (TPU_MOE_EP_PACKED_SORTS on EP path D, TPU_MOE_NONEP_PERMUTE=packed).
+
+    Returns (sorted_indices, revert, token_indices_sorted, group_sizes), the same
+    integer arrays as the three-sort path (argsort, argsort of it, packed token
+    sort) and its one-hot group-size reduce:
+    - (key << flat_bits | position) is unique per route, so one unstable sort
+      orders routes exactly as the stable argsort of the keys;
+    - flat position p belongs to token p // topk, and within one key the
+      positions ascend, so the token ids ascend as in the packed token sort;
+    - sorted_indices is a permutation, so sorting (sorted_indices[r] << flat_bits
+      | r) returns, at index p, the rank r with sorted_indices[r] == p: the
+      inverse, without the TensorCore scatter that loses to two sorts above
+      2,048 routes (_SINGLE_SORT_MAX_ROWS). When 2 * flat_bits == 32 the high
+      part is offset by 2^(flat_bits - 1) to stay in signed int32 order;
+    - the group sizes are the bucket bounds of the sorted keys (keys
+      num_keys - 1 = the sentinel of invalid routes sort last); with
+      sizes_from_keys=False they are None and the caller keeps its one-hot reduce
+      (which, unlike the bounds, does not wait for the sort).
+    The caller checks packed_sorts_fit first.
+    """
+    m = sort_keys.shape[0]
+    flat_bits = max(1, (m - 1).bit_length())
+    mask = (1 << flat_bits) - 1
+    pos = jnp.arange(m, dtype=jnp.int32)
+    packed = jax.lax.sort(
+        jnp.left_shift(sort_keys.astype(jnp.int32), flat_bits) | pos, is_stable=False
+    )
+    sorted_indices = jnp.bitwise_and(packed, mask)
+    sorted_keys = jnp.right_shift(packed, flat_bits)
+    high = sorted_indices
+    if 2 * flat_bits == 32:
+        high = high - (1 << (flat_bits - 1))
+    inverse = jax.lax.sort(jnp.left_shift(high, flat_bits) | pos, is_stable=False)
+    revert = jnp.bitwise_and(inverse, mask)
+    group_sizes = None
+    if sizes_from_keys:
+        bounds = jnp.searchsorted(
+            sorted_keys, jnp.arange(num_keys, dtype=jnp.int32), side="left"
+        ).astype(jnp.int32)
+        group_sizes = bounds[1:] - bounds[:-1]
+    return sorted_indices, revert, sorted_indices // topk, group_sizes
+
+
 def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
@@ -515,8 +570,16 @@ def prepare_routed_gmm_inputs(
     nonep_gather_chunk: int = 16384,
     ep_counting_sort: bool = True,
     ep_gather: str = "sc",
+    ep_packed_sorts: str = "",
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
+
+    ``ep_packed_sorts`` (``TPU_MOE_EP_PACKED_SORTS``: "on" or "onehot") on EP
+    path D, and ``nonep_permute="packed"`` / ``"packed_onehot"`` on the non-EP
+    path above the single-sort cap, build the permutation with
+    `_packed_sorts_permutation` (two packed sorts) where it fits int32, with the
+    group sizes from the sorted keys or ("onehot") from the served one-hot
+    reduce; the same arrays.
 
     ``ep_counting_sort=False`` (``TPU_MOE_EP_ARGSORT_PERMUTE``) builds the EP
     SparseCore path's positions and group sizes with argsort instead of the
@@ -570,9 +633,29 @@ def prepare_routed_gmm_inputs(
         and token_indices_flat.shape[0] <= _SINGLE_SORT_MAX_ROWS
         and (local_num_experts + 1).bit_length() + flat_bits < 31
     )
+    # TPU_MOE_EP_PACKED_SORTS (EP path D) / TPU_MOE_NONEP_PERMUTE=packed: two
+    # packed sorts and the group sizes from the sorted keys; the same arrays.
+    if ep_packed_sorts not in ("", "on", "onehot"):
+        raise ValueError(f"ep_packed_sorts must be '', 'on' or 'onehot', got {ep_packed_sorts!r}")
+    packed_mode = (
+        ep_packed_sorts
+        if ragged_permute and not ep_counting_sort
+        else {"packed": "on", "packed_onehot": "onehot"}.get(nonep_permute, "")
+        if not use_ep and not ragged_permute and not single_sort
+        else ""
+    )
+    packed_perm = (
+        _packed_sorts_permutation(
+            sort_keys, topk, local_num_experts + 1, sizes_from_keys=packed_mode == "on"
+        )
+        if packed_mode and packed_sorts_fit(token_indices_flat.shape[0], local_num_experts + 1)
+        else None
+    )
     sorted_indices = (
         jnp.argsort(sort_keys)
-        if not single_sort and (argsort_revert_indices is None or not packable)
+        if packed_perm is None
+        and not single_sort
+        and (argsort_revert_indices is None or not packable)
         else None
     )
     token_indices_sorted: jax.Array | None = None
@@ -581,7 +664,13 @@ def prepare_routed_gmm_inputs(
     # forward permutation, then either a second argsort (its inverse) and a
     # packed sort (the token ids), or the token ids by division, or the
     # inverse and the group sizes from the counting sort.
-    if not use_ep and not ragged_permute and not single_sort and nonep_permute != "sorts":
+    if (
+        packed_perm is None
+        and not use_ep
+        and not ragged_permute
+        and not single_sort
+        and nonep_permute != "sorts"
+    ):
         if sorted_indices is None:
             sorted_indices = jnp.argsort(sort_keys)
         # jnp.argsort is stable, so this is the packed sort's token order.
@@ -606,7 +695,18 @@ def prepare_routed_gmm_inputs(
                     f"{local_num_experts + 1} rows"
                 )
 
-    if argsort_revert_indices is not None:
+    if packed_perm is not None:
+        logger.info_once("MoE permutation runs as two packed sorts.")
+        sorted_indices, argsort_revert_indices, token_indices_sorted, group_sizes_local = (
+            packed_perm
+        )
+        if group_sizes_local is None:
+            topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+            group_sizes_local = jax.nn.one_hot(
+                topk_indices_for_count, local_num_experts, dtype=jnp.int32
+            ) * valid_mask[:, None].astype(jnp.int32)
+            group_sizes_local = group_sizes_local.sum(axis=0)
+    elif argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
         if single_sort:
@@ -873,6 +973,7 @@ def moe_gmm(
     nonep_chunks: int = 1,
     chunk_src: jax.Array | None = None,
     chunk_copy_mode: str = "vector",
+    combine_presorted: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -880,6 +981,10 @@ def moe_gmm(
     the routed rows are gathered from ``chunk_src`` per expert-range chunk
     (nonep_chunked_mlp), overlapping each chunk's gather with the previous
     chunk's fused GMMs. Needs the fused expert MLP; same output bits.
+    ``combine_presorted`` (``TPU_MOE_COMBINE_PRESORTED``): the SparseCore
+    combine skips its per-block partition sort where the valid routes already
+    form a prefix: statically under ``ep_combine="dense"`` (all routes valid),
+    by a runtime check on the non-EP path. Same output bits.
 
     ``ep_gmm_stack`` (``TPU_MOE_EP_GMM_STACK``): the non-EP GMM knobs (experts
     per visit, gmm2's experts per visit, row bucket, fused expert MLP) apply on
@@ -984,6 +1089,10 @@ def moe_gmm(
         and use_sparse_core
         and argsort_revert_indices.size > onehot_moe_permute_threshold
     )
+    # TPU_MOE_COMBINE_PRESORTED: a runtime prefix check selects the identity or
+    # the partition sort; after ep_all_valid_routes (below) every route is
+    # valid, so the identity holds by construction ("static").
+    pkw = {"presorted": "check"} if combine_presorted else {}
     combine_kw = dict(
         use_sparse_core=use_sparse_core,
         use_ep=use_ep and not ep_dense,
@@ -1029,6 +1138,7 @@ def moe_gmm(
                     topk_weights_flat,
                     valid_mask_flat,
                     reduce_group_size=topk,
+                    **pkw,
                 ).astype(act_dtype)
             )
         return jnp.concatenate(blocks, axis=1)
@@ -1112,6 +1222,8 @@ def moe_gmm(
         gmm2_res, argsort_revert_indices, topk_weights_flat, valid_mask_flat = (
             ep_all_valid_routes(gmm2_res, argsort_revert_indices, topk_weights_flat, valid_mask_flat)
         )
+        if combine_presorted:
+            pkw = {"presorted": "static"}
         logger.info_once("EP MoE combine runs on all-valid routes (dense%s).", ", packed" if packed else "")
     if packed:
         return ragged_gather_reduce_v3(
@@ -1121,6 +1233,7 @@ def moe_gmm(
             valid_mask_flat,
             reduce_group_size=topk,
             x_packed=True,
+            **pkw,
         ).astype(act_dtype)
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
@@ -1133,6 +1246,7 @@ def moe_gmm(
             topk_weights_flat,
             valid_mask_flat,
             reduce_group_size=topk,
+            **pkw,
         ).astype(act_dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
@@ -1229,6 +1343,8 @@ def moe_gmm(
         "ep_gmm_stack",
         "ep_combine",
         "nonep_dispatch_chunks",
+        "ep_packed_sorts",
+        "combine_presorted",
     ),
 )
 def fused_moe_func(
@@ -1267,6 +1383,8 @@ def fused_moe_func(
     ep_gmm_stack: bool = False,
     ep_combine: str = "served",
     nonep_dispatch_chunks: int = 1,
+    ep_packed_sorts: str = "",
+    combine_presorted: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -1408,6 +1526,7 @@ def fused_moe_func(
         nonep_gather_chunk=nonep_gather_chunk,
         ep_counting_sort=ep_counting_sort,
         ep_gather=ep_gather,
+        ep_packed_sorts=ep_packed_sorts,
     )
     if lhs_packed_dtype is None and x is not None:
         x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
@@ -1444,5 +1563,6 @@ def fused_moe_func(
         ep_gmm_stack=ep_gmm_stack,
         ep_combine=ep_combine,
         **({"nonep_chunks": chunks, "chunk_src": chunk_src, "chunk_copy_mode": chunk_copy_mode} if chunks > 1 else {}),
+        combine_presorted=combine_presorted,
     )
     return x[:num_tokens, :hidden_size]

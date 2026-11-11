@@ -110,6 +110,8 @@ if TYPE_CHECKING:
     TPU_MOE_EP_GMM_STACK: bool = False
     TPU_MOE_EP_COMBINE: str = "served"
     TPU_MOE_NONEP_DISPATCH_CHUNKS: str = "1"
+    TPU_MOE_EP_PACKED_SORTS: str = "off"
+    TPU_MOE_COMBINE_PRESORTED: bool = False
     TPU_MOE_NONEP_GATHER_COLS: int = 0
     TPU_MOE_NONEP_GATHER_CHUNK: int = 16384
     TPU_MOE_NONEP_PERMUTE: str = "sorts"
@@ -1922,6 +1924,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_EP_COMBINE": env_with_choices(
         "TPU_MOE_EP_COMBINE", "served", ["served", "dense"], case_sensitive=False
     ),
+    # EP path D (TPU_MOE_EP_ARGSORT_PERMUTE): build the routing permutation from
+    # two packed single-operand sorts (the inverse without a scatter) and the
+    # group sizes from the sorted keys, instead of argsort + inverse argsort +
+    # a packed token sort + a one-hot reduce. Same integer arrays, same output
+    # bits. Falls back where the packing does not fit int32 (> 65,536 routes).
+    # "onehot" keeps the served one-hot group-size reduce (it does not wait for
+    # the sort) and changes only the sorts.
+    "TPU_MOE_EP_PACKED_SORTS": env_with_choices(
+        "TPU_MOE_EP_PACKED_SORTS", "off", ["off", "on", "onehot"], case_sensitive=False
+    ),
+    # SparseCore combine (ragged_gather_reduce_v3): skip the per-block stable
+    # partition sort when every block's valid routes already form a prefix;
+    # statically on the EP all-valid combine (TPU_MOE_EP_COMBINE=dense), by a
+    # runtime check on the non-EP combine. Same metadata, same output bits.
+    "TPU_MOE_COMBINE_PRESORTED": env_bool("TPU_MOE_COMBINE_PRESORTED"),
     # Columns per block for "xla_colchunk". 0 picks the widest block (a
     # multiple of 128 dividing the hidden size) whose source table is at most
     # 3200 x 2560 bf16 bytes, the largest size measured in VMEM; a step whose
@@ -1932,12 +1949,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cap: "sorts" runs three sorts (argsort, its inverse, the packed token
     # ids); "two_sorts" takes the sorted token ids from the argsort by
     # division; "counting" takes the inverse permutation and the group sizes
-    # from the one-hot counting sort (block 1024) and keeps one argsort.
-    # All three give the same permutation.
+    # from the one-hot counting sort (block 1024) and keeps one argsort;
+    # "packed" runs two packed single-operand sorts (the inverse without a
+    # scatter) and takes the group sizes from the sorted keys; "packed_onehot"
+    # keeps the one-hot group sizes. All of them give the same permutation.
     "TPU_MOE_NONEP_PERMUTE": env_with_choices(
         "TPU_MOE_NONEP_PERMUTE",
         "sorts",
-        ["sorts", "two_sorts", "counting"],
+        ["sorts", "two_sorts", "counting", "packed", "packed_onehot"],
         case_sensitive=False,
     ),
     # Blocks of output columns for the non-EP second GMM and its SparseCore

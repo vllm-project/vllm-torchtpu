@@ -200,6 +200,9 @@ def _build_fused_moe_custom_op(
         **({"ep_combine": "dense"} if envs.TPU_MOE_EP_COMBINE.lower() == "dense" else {}),
         **({"nonep_dispatch_chunks": int(envs.TPU_MOE_NONEP_DISPATCH_CHUNKS)}
            if envs.TPU_MOE_NONEP_DISPATCH_CHUNKS != "1" else {}),
+        **({"ep_packed_sorts": envs.TPU_MOE_EP_PACKED_SORTS.lower()}
+           if envs.TPU_MOE_EP_PACKED_SORTS.lower() != "off" else {}),
+        **({"combine_presorted": True} if envs.TPU_MOE_COMBINE_PRESORTED else {}),
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
