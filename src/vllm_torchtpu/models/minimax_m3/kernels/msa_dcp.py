@@ -58,10 +58,8 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 )
 
 _NEG_INF = float("-inf")
-# The narrowest column count `local_candidates` scans (a vreg's lanes), and
-# the fewest tokens for which it picks a width per row block.
+# The narrowest column count `local_candidates` scans (a vreg's lanes).
 _MIN_CANDIDATE_WIDTH = 128
-_MIN_CANDIDATE_TOKENS = 1024
 
 # Up to this many tokens (`msa_attention.SMALL_BATCH_TOKENS` is the non-DCP
 # limit) an 8-token verify group fills an attention tile alone
@@ -337,14 +335,11 @@ def local_candidates(
     p = jnp.pad(pos, (0, pad))[:, None]
     # Static scan widths (`_scan_widths`, one kernel body each); each row
     # block takes the narrowest one holding every block its rows see (a
-    # rank's blocks below n are among its first ceil(n / dcp) columns). A
-    # decode batch scans the full width: its scan is a few us, and picking a
-    # width would cost more.
-    widths = (
-        _scan_widths(num_cols, pretransposed)
-        if num_tokens > _MIN_CANDIDATE_TOKENS
-        else [num_cols]
-    )
+    # rank's blocks below n are among its first ceil(n / dcp) columns). Decode
+    # batches too: their scores span max-model-len, ~3x the columns a decode
+    # request at the served contexts sees (c4 / c48 twins: 1,024 columns,
+    # ~330 / ~520 visible).
+    widths = _scan_widths(num_cols, pretransposed)
     num_blocks = (num_tokens + pad) // block_rows
     if len(widths) == 1:
         row_widths = jnp.full((num_blocks,), num_cols, jnp.int32)
