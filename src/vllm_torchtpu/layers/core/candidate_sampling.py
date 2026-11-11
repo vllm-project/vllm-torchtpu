@@ -338,8 +338,14 @@ def shard_candidates(logits, bounds, kc):
     ``16 kc`` exactly; gathers are one-hot matmuls. Columns at or past the
     shard's vocabulary end are padding and never chosen.
     """
-    rows, width = logits.shape
-    assert width % _LANES == 0 and (kc * _LANES) % _SUB == 0, (width, kc)
+    rows, width0 = logits.shape
+    # TP8 shards of a 248320 vocabulary are 31040 wide (not a multiple of 128):
+    # pad with columns past the shard end (masked to the floor below, never chosen).
+    pad = (-width0) % _LANES
+    if pad:
+        logits = jnp.pad(logits, ((0, 0), (0, pad)))
+    width = width0 + pad
+    assert (kc * _LANES) % _SUB == 0, (width, kc)
     start, end = bounds[0], bounds[1]
     col = lax.broadcasted_iota(jnp.int32, logits.shape, 1)
     floor = jnp.finfo(jnp.bfloat16).min
@@ -377,7 +383,7 @@ def shard_candidates(logits, bounds, kc):
     oh3 = _select_top(_order_key(s2), kc)
     vals = _pick(oh3, s2, floor)
     ids = start + _pick(oh3, pos2, -1)
-    return x, vals, ids, jnp.min(vals, axis=-1), top, start + first
+    return x[:, :width0], vals, ids, jnp.min(vals, axis=-1), top, start + first
 
 
 def verify_local(
