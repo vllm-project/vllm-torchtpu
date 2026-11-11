@@ -46,8 +46,10 @@ COLLECTIVE_ID = 0
 _MESH = pl.DeviceIdType.MESH
 _TILE_ROWS = 16  # bf16 sublane tiling
 _LANES = 128
-# Input, output and the n receive slots live in VMEM: ~3x the view.
-MAX_VIEW_BYTES = 4 << 20
+# Input, output and the n receive slots live in VMEM: ~3x the view (the limit
+# asks 4x + 1 MiB, 33 MiB at 8 MiB, inside a tpu7x TensorCore's 64 MiB). 8 MiB
+# admits the 512-row decode bucket of hidden 6144 (6 MiB).
+MAX_VIEW_BYTES = 8 << 20
 
 
 def view_shape(rows: int, hidden: int, n: int) -> tuple[int, int, int]:

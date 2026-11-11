@@ -147,13 +147,31 @@ def _selftest_inputs(n: int, rows: int, hidden: int) -> np.ndarray:
     return (((d + 1) * 3 + r * 5 + c * 7) % 11 - 5).astype(np.float32)
 
 
+def _selftest_rows(n: int, hidden: int, max_bytes: int) -> tuple[int, ...]:
+    """The self-test's row counts: the fixed small ones, plus the largest
+    multiple of 8 rows whose view fits a cap above 1 MiB (a large view takes
+    another VMEM budget than the small ones)."""
+    if max_bytes <= 1 << 20:
+        return _SELFTEST_ROWS
+    rows = max_bytes // (hidden * 2) // 8 * 8
+    while rows > 0 and kernel.view_bytes(rows, hidden, n) > max_bytes:
+        rows -= 8
+    return _SELFTEST_ROWS + ((rows,) if rows > max(_SELFTEST_ROWS) else ())
+
+
 def _selftest(
-    op, rank: torch.Tensor, mesh_index: int, n: int, hidden: int, device
+    op,
+    rank: torch.Tensor,
+    mesh_index: int,
+    n: int,
+    hidden: int,
+    device,
+    max_bytes: int = 0,
 ) -> list:
     failures = []
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
-        for rows in _SELFTEST_ROWS:
+        for rows in _selftest_rows(n, hidden, max_bytes):
             x = _selftest_inputs(n, rows, hidden)
             mine = torch.from_numpy(x[mesh_index]).to(torch.bfloat16).to(device)
             got = op(mine, rank).to(torch.float32).cpu().numpy()
@@ -191,7 +209,9 @@ def arm(hidden: int, device: torch.device) -> bool:
     n = int(mesh.size)
     op = _make_op(mesh, max_bytes)
     rank = torch.tensor([[mesh_index]], dtype=torch.int32, device=device)
-    failures = _gather(_selftest(op, rank, mesh_index, n, hidden, device))
+    failures = _gather(
+        _selftest(op, rank, mesh_index, n, hidden, device, max_bytes)
+    )
     if any(failures):
         raise RuntimeError(
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
@@ -203,10 +223,13 @@ def arm(hidden: int, device: torch.device) -> bool:
         op_after=_make_op(mesh, max_bytes, ordered=True),
     )
     logger.info(
-        "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views",
+        "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views"
+        " (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES=%d, kernel cap %d)",
         n,
         mesh_index,
         max_bytes,
+        envs.TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES,
+        kernel.MAX_VIEW_BYTES,
     )
     return True
 
