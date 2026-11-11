@@ -24,7 +24,7 @@ from typing import Any, Protocol
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu import envs
@@ -129,6 +129,9 @@ def mk_draft_compile_config(vllm_config: VllmConfig, inner: Any, rows_per_reques
     cfg = copy.copy(vllm_config)
     cc = copy.copy(vllm_config.compilation_config)
     cc.compile_sizes = list(sizes)
+    # No open range either: vLLM appends max_num_batched_tokens to the range
+    # endpoints, and an MK program must never be traced past the kernel's rows.
+    cc.compile_ranges_endpoints = []
     # Built after the stock draft programs compiled: by then the shared inductor config
     # carries the backend's pre-grad pass, which a fresh backend asserts absent
     # (vllm backends.configure_post_pass; exos j-87ff00d1). Give the MK programs their
@@ -161,8 +164,9 @@ def build_mtp_fused_loop(
     cls = support_torch_compile(dynamic_arg_dims=dims)(
         type("MtpFusedLoop", (_MtpFusedLoop,), {})
     )
-    return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps,
-               use_mk=use_mk)
+    with set_current_vllm_config(vllm_config):
+        return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps,
+                   use_mk=use_mk)
 
 
 class _MkDraftStep0(nn.Module):
@@ -214,5 +218,9 @@ def build_mk_draft_step0(
     cls = support_torch_compile(dynamic_arg_dims=dims)(
         type("MkDraftStep0", (_MkDraftStep0,), {})
     )
-    return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp,
-               rows_per_request=rows_per_request)
+    # The compile wrapper builds its backend from the *current* config, not the
+    # vllm_config argument: pin it here so the caller's context cannot widen the
+    # compile sizes (za9j j-d4040629).
+    with set_current_vllm_config(vllm_config):
+        return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp,
+                   rows_per_request=rows_per_request)
