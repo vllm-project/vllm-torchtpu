@@ -19,8 +19,8 @@ about the model's hybrid layout is derived HERE, on the vLLM side, from the
 **live materialization** (the typed KV cache tensors bound into the forward
 context plus their kv-cache-group specs) — never from pinned constants.
 
-Binding resolution follows the storage-pointer rule used by the working ZMQ
-transfer path (``_register_named_region``):
+Binding resolution classifies how logical KV caches alias the raw unified
+storage tensors:
 
 - every logical cache shares storage with a raw unified tensor →
   ``aliased_raw``: pools reference the raw storages with interior offsets;

@@ -38,7 +38,6 @@ from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer import tpu_multi_connector
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
     TPUConnector,
-    TPUConnectorWorker,
     TPURaidenConnector,
     TPURaidenConnectorWorker,
 )
@@ -386,14 +385,6 @@ class TestRaidenTelemetryDrainOwnership:
         # The setter is a no-op without a worker.
         conn.owns_raiden_telemetry_drain = True
         assert conn.owns_raiden_telemetry_drain is False
-
-    def test_zmq_worker_never_owns_raiden_drain(self) -> None:
-        zmq_worker = MagicMock(spec=TPUConnectorWorker)
-        conn = _bare_raiden_connector(zmq_worker)  # type: ignore[arg-type]
-        assert conn.owns_raiden_telemetry_drain is False
-        conn.owns_raiden_telemetry_drain = True
-        assert conn.owns_raiden_telemetry_drain is False
-        assert not hasattr(zmq_worker, "owns_raiden_telemetry_drain")
 
     @pytest.mark.parametrize("offload_first", [False, True])
     def test_multi_connector_keeps_worker_drain_on_raiden_connector(

@@ -116,34 +116,14 @@
       "concise_description": "Object of class `FunctionType` has no attribute `_tpu_same_step_prefix_hit_patch`"
     },
     {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `custom_jax_kernel`"
-    },
-    {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "bad-override-mutable-attribute",
-      "concise_description": "Class member `TPUConnector._connector_metadata` overrides parent class `KVConnectorBase_V1` in an inconsistent manner"
+      "concise_description": "Class member `TPURaidenConnector._connector_metadata` overrides parent class `KVConnectorBase_V1` in an inconsistent manner"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "bad-override",
-      "concise_description": "Class member `TPUConnector.start_load_kv` overrides parent class `KVConnectorBase_V1` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
+      "concise_description": "Class member `TPURaidenConnector.start_load_kv` overrides parent class `KVConnectorBase_V1` in an inconsistent manner"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",

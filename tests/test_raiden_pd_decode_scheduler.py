@@ -50,7 +50,24 @@ from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_torchtpu import envs as tpu_envs
+
 BLOCK_SIZE = 16
+
+
+@pytest.fixture(autouse=True)
+def _raiden_pd_env(monkeypatch):
+    for name in (
+        "TPU_KV_RESHARD_TRANSPORT",
+        "TPU_RAIDEN_KIMIK3_ADMISSION",
+        "TPU_RAIDEN_GLM_ADMISSION",
+        "TPU_RAIDEN_DSV4_ADMISSION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delitem(vars(tpu_envs), name, raising=False)
+    for name in ("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "TPU_RAIDEN_QWEN35_ADMISSION"):
+        monkeypatch.delitem(vars(tpu_envs), name, raising=False)
+        monkeypatch.setenv(name, "1")
 
 
 class _FakeConsumerConnector(KVConnectorBase_V1, SupportsHMA):

@@ -11,12 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Scheduler->worker metadata contract shared by the TPU KV connectors.
+"""Scheduler->worker metadata contract of the Raiden Stage-3 P/D connector.
 
-These dataclasses are the connector-neutral request bookkeeping (what to
-send, what to load) attached to scheduler output. They are used by both the
-zmq/shm transport stack (zmq_shm_base) and the Raiden connector, so they
-live here rather than inside either transport module.
+These dataclasses are the Stage-3 request bookkeeping (what to send, what to
+load) that TPURaidenConnectorScheduler attaches to scheduler output and
+TPURaidenConnectorWorker consumes.
 """
 
 from dataclasses import dataclass, field
@@ -32,12 +31,11 @@ class SendMeta:
     local_block_ids: list[int]
     # Unix timestamp in seconds, compared by workers on different hosts.
     expiration_time: float
-    # Exact transfer extent for controller-planned PCP striping. Legacy send
-    # paths leave this unset.
+    # Exact transfer extent for controller-planned PCP striping.
     num_tokens: int | None = None
     # Uniform-mamba-layout source state slots, one per mamba kv-cache group
     # ordinal (the block holding the final recurrent state); None for FA-only
-    # Stage-3 models and all legacy paths.
+    # Stage-3 models.
     mamba_state_block_ids: list[int] | None = None
     # One block table per transferred kv-cache group, in Stage-3 transfer-plan
     # order. Only DSv4 sets it, because its groups page at different sizes;
@@ -54,19 +52,43 @@ class SendMeta:
 
 @dataclass
 class LoadMeta:
+    """Decode-local declaration for one controller-driven FA transfer.
+
+    Source physical block IDs deliberately do not appear here. They stay in
+    the source controller's D5 registry; the only source-side routing datum
+    crossing the P/D boundary is its controller address.
+    """
+
     uuid: int
-    local_block_ids: list[int] | None
-    remote_block_ids: list[int] | None
-    remote_host: str | list[str]
-    remote_port: int | list[int]
-    remote_side_channel_port: int | None = None
-    # Whether the worker reports this load's completion to the scheduler as
-    # finished_recving. False when this connector doesn't own the request's
-    # load state (the request is not WAITING_FOR_REMOTE_KVS here, e.g. a full
-    # local cache hit or delegation to another MultiConnector child), where a
-    # report would trip the scheduler's assert or prematurely resume the
-    # request.
-    report_completion: bool = True
+    source_req_id: str
+    local_block_ids: list[int]
+    num_tokens: int
+    src_controller_address: str
+    src_job_name: str
+    src_engine_id: str
+    src_data_replica_idx: int
+    src_parallelism: int
+    # Uniform-mamba-layout destination state slots, one per mamba kv-cache
+    # group ordinal: the block holding the recurrent state for the resumed
+    # request (state follows each group's block table; None for FA-only
+    # models).
+    mamba_state_block_ids: list[int] | None = None
+    # One destination block table per transferred kv-cache group, in the
+    # Stage-3 transfer-group plan's order. See SendMeta.group_block_ids.
+    group_block_ids: list[list[int]] | None = None
+    # Prefix-aware load: tokens satisfied by the decode-local prefix cache
+    # and excluded from the transfer. local_block_ids then holds only the
+    # suffix pages; the source store clips its plan at
+    # skip_tokens * token_bytes of the FA global destination byte space.
+    skip_tokens: int = 0
+    # Full local hit: nothing to transfer; the worker only releases the
+    # producer's request-block registration instead of pulling.
+    release_only: bool = False
+    # When True on a release_only entry (e.g. a consumer request aborted while
+    # queued in reqs_to_load before reaching the worker), also record the
+    # request in _done_recving so get_finished() surfaces it and the vLLM
+    # scheduler frees the request's delayed local KV blocks.
+    report_completion: bool = False
     # The scheduler rejected this load after allocation.
     fail_only: bool = False
 

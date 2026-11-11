@@ -38,7 +38,6 @@ from vllm.v1.executor.ray_utils import (
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.executors.kv_block_override import (
     adopt_worker_num_gpu_blocks_override,
 )
@@ -603,13 +602,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
         self.start_worker_monitor()
         self.output_rank = self._get_output_rank()
-
-        # KV connector setup
-        self.has_connector = self.vllm_config.kv_transfer_config is not None
-        if self.has_connector:
-            ip_port = self.collective_rpc("get_node_kv_ip_port")
-            for item in ip_port:
-                set_node_kv_ip_port(item)
 
     def _initialize_ray_cluster(self) -> None:
         """Initialize Ray and select this engine's placement group."""

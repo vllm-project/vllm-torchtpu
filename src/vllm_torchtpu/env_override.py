@@ -77,11 +77,15 @@ os.environ.setdefault("VLLM_USE_MEGA_AOT_ARTIFACT", "0")
 # combination routes every KV-cache D2H/H2D through libtpu's synchronous
 # staged-copy slow path (~0.4 GB/s with per-transfer IOMMU map/unmap).
 # A sized pool restores the pinned fast path; 16 GiB per worker covers the
-# connector's host mirrors with headroom. Must run before torch_tpu is
-# imported; overridable by presetting the variable.
-if (
-    os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden"
-    or os.getenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1"
+# connector's host mirrors with headroom. Raiden P/D always runs with
+# TPU_USE_RAIDEN_KV_CACHE_MANAGER enabled, so key off that flag alone and
+# accept every truthy spelling env_bool accepts. Must run before torch_tpu
+# is imported; overridable by presetting the variable.
+if os.getenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "").strip().lower() in (
+    "true",
+    "1",
+    "yes",
+    "on",
 ):
     os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", str(16 << 30))
 
