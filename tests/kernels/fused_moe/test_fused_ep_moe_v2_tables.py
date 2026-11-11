@@ -468,6 +468,59 @@ def test_slab_scatter_form_follows_the_sparse_core(chip, by_set):
     assert host.slab_scatter_by_set(info) is by_set
 
 
+@pytest.mark.parametrize(
+    "ep,t_local,g_local,topk",
+    GEOMETRIES + [pytest.param(32, 48, 16, 10, id="qwen38_ep32_g16_t48")],
+)
+@pytest.mark.parametrize("routing", ["uniform", "skewed", "padded"])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_sorted_token_gather_is_the_scattered_one(
+    ep, t_local, g_local, topk, routing, seed
+):
+    """The sort build gives the scatter's table, from either plan builder.
+
+    Skewed routing is the case that matters most: most runs are empty or odd,
+    so the padding elements the sort carries are live on some runs and not on
+    others. Padded routing puts expert id e_total on whole rows and on all of
+    one shard, which the sort has to key off-shard as the plans do.
+    """
+    idx, kwargs = _routing_inputs(
+        ep, t_local, g_local, topk, skew=routing == "skewed", seed=seed
+    )
+    e_total = kwargs["e_total"]
+    stride = kwargs["shard_stride"]
+    if routing == "padded":
+        idx = _pad_half_of_each_shard(idx, ep=ep, t_local=t_local, e_total=e_total)
+    assert host.token_gather_sort_fits(ep * t_local, topk, e_total=e_total, ep=ep)
+    whole = host.build_routing_tables(idx, **kwargs)
+    counts = jnp.asarray(_plan_counts(idx, ep=ep, t_local=t_local, e_total=e_total))
+    for me in range(ep):
+        shard = host.build_routing_tables_sharded(
+            idx, jnp.int32(me), all_gather_rows=lambda _row: counts, **kwargs
+        )
+        for plan in (whole, shard):
+            np.testing.assert_array_equal(
+                np.asarray(
+                    host.shard_token_gather_sorted(
+                        idx,
+                        plan,
+                        jnp.int32(me),
+                        e_total=e_total,
+                        ep=ep,
+                        shard_stride=stride,
+                    )
+                ),
+                np.asarray(host.shard_token_gather(plan, me, shard_stride=stride)),
+                err_msg=f"shard {me}",
+            )
+
+
+def test_token_gather_sort_keys_fit_the_served_shapes():
+    """Qwen3.8's EP32 prefill step is far inside the int32 key range."""
+    assert host.token_gather_sort_fits(16384, 10, e_total=512, ep=32)
+    assert not host.token_gather_sort_fits(2**24, 10, e_total=512, ep=32)
+
+
 def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():
     """NaN arrival rows stay isolated to padded rows and zero out via row_routes."""
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
