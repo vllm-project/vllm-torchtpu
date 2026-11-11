@@ -2317,6 +2317,27 @@ class TestMambaSlotReadOffsets:
         for block, expected in ((3, 2), (7, 0), (11, 2), (5, 0)):
             assert int(runner.mamba_slot_read_offsets[block]) == expected
 
+    @pytest.mark.parametrize("num_reqs", range(1, 9))
+    def test_rows_past_the_live_count_are_masked_not_sliced(self, num_reqs):
+        """The live count masks the offsets instead of slicing them (an
+        exact-count slice write compiled one program per count mid-serving,
+        tt_jit_copy__as_strided_inverse). Padding rows of the
+        rejection output can hold tokens; their offsets must still be 0."""
+        runner = self._make_runner(num_blocks=16)
+        rows = 8
+        state_indices = torch.arange(1, rows + 1, dtype=torch.int32)
+        num_valid = torch.tensor([1, 2, 3, 4, 3, 2, 1, 4])
+        cols = torch.arange(4).unsqueeze(0)
+        next_tokens = torch.where(cols < num_valid.unsqueeze(1), 7, INVALID_TOKEN_ID)
+        # The sampler bucket can hold more rows than the state slots.
+        next_tokens = torch.cat([next_tokens, torch.full((4, 4), 7)])
+
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, num_reqs)
+
+        expected = torch.zeros(16, dtype=torch.int32)
+        expected[1 : num_reqs + 1] = (num_valid[:num_reqs] - 1).to(torch.int32)
+        assert torch.equal(runner.mamba_slot_read_offsets, expected)
+
     def test_unified_empty_group_list_is_noop(self):
         runner = self._make_runner(num_blocks=8)
         runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]), 1)
