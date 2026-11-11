@@ -222,6 +222,7 @@ def test_slot_scales_lower_for_tpu(rows, num_values):
         ([1, 1, 1], [5, 130, 255], 2),
         ([8, 8, 8], [124, 40, 250], 8),
         ([300, 2], [70, 126], 1),
+        ([8] * 11, [10 * i + 3 for i in range(11)], 0),  # more runs than in flight
     ],
 )
 def test_write_runs_targets_match_single_writes(q_lens, ctx_lens, pad_tokens):
