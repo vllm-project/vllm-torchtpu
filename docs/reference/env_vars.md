@@ -111,11 +111,10 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_RAIDEN_CONTROLLER_ADDRESS` | `""` | Address (`host:port`) of the Raiden P/D coordinator (`run_raiden_controller.py`). |
 | `TPU_RAIDEN_JOB_NAME` | `""` | Role name (`"prefill"` or `"decode"`) registered with the Raiden controller. |
 | `TPU_RAIDEN_ENGINE_ID` | `"0"` | Engine replica identifier for Raiden KV transfer. |
-| `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of parallel DMA transfer streams in `TpuRaidenConnector`. |
+| `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of source ranks that transfer KV blocks in parallel in `TPURaidenConnector` (source rank transfer parallelism). Distinct from `TPU_RAIDEN_TRANSFER_STREAMS`, which sets the TCP stream count of each push. |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | Selects `"controller"` or `"host"` KV cache resharding when Prefill and Decode topologies differ. |
-| `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Transport protocol (`"zmq"` or `"tcp"`) for host-side KV resharding. |
-| `TPU_KV_TRANSFER_PORT` | `"9100"` | Port used by `TPUConnector` for KV cache transfer. |
-| `TPU_SIDE_CHANNEL_PORT` | `"9600"` | Port used by `TPUConnector` for side-channel handshake metadata. |
+| `TPU_KV_RESHARD_TRANSPORT` | `"raiden"` | Transport selector for KV cache resharding. Defaults to and only accepts `"raiden"` (case-insensitive); kept for launch-config compatibility. Any other value (for example the removed `"zmq"`) is rejected at startup. |
+| `TPU_KV_TRANSFER_PORT` | `"9100"` | Base port for the Raiden connector KV transfer control endpoints. |
 
 ---
 

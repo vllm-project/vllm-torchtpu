@@ -72,7 +72,6 @@
 /tests/distributed/*raiden* @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw
 /tests/distributed/test_*kv*.py @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw
 /tests/distributed/test_tpu_*connector.py @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw
-/tests/distributed/test_zmq_*.py @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw
 
 # Model Layers
 /src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen

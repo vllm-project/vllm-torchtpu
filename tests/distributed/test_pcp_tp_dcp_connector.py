@@ -106,7 +106,7 @@ def test_producer_registers_fa_and_state_with_separate_coordinates(
             )
             meta = tc.TPUConnectorMetadata()
             ids = [3 + i * 2 for i in range(math.ceil(tokens / (384 * pcp)))]
-            meta.reqs_to_send["request"] = SimpleNamespace(
+            meta.reqs_to_send["request"] = tc.SendMeta(
                 uuid=123,
                 local_block_ids=ids,
                 num_tokens=tokens,
@@ -408,7 +408,6 @@ def _pp_pcp_coordinates(stage, pcp_rank):
 def test_pp_pcp_producer_topology_and_unit_identity(monkeypatch, pp, pcp):
     worker = _pp_pcp_worker(monkeypatch, pp=pp, pcp=pcp)
     assert worker._raiden_qwen35_admission_topology() == f"pp{pp}pcp{pcp}_prefill"
-    monkeypatch.setattr(worker, "_raiden_stage3_enabled", lambda: True)
     ranks, ports = [], set()
     for stage in range(pp):
         for p in range(pcp):

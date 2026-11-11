@@ -2,10 +2,7 @@
 
 Prefill/Decode (P/D) disaggregation separates compute-bound **Prefill** (`kv_producer`) and memory-bandwidth-bound **Decode** (`kv_consumer`) onto independent TPU engine pools. This prevents long-prompt prefills from stalling ongoing decode steps (eliminating TPOT spikes) and allows each pool to use the parallelism layout (`TP`, `DP`, `PCP`, `EP`) best suited to its phase.
 
-`vllm-torchtpu` supports two KV cache transfer connectors:
-
-1. **Raiden KV Connector (`TpuRaidenConnector`)**: High-bandwidth PJRT DMA/RDMA engine powered by `tpu-sync-torch` (`tpu_sync`) with a central coordinator (`run_raiden_controller.py`) and support for **heterogeneous P/D resharding** (e.g., Prefill with `PCP=4, TP=2` transferring KV cache into Decode with `DP=8, TP=1`).
-2. **Host TCP/Side-Channel Connector (`TPUConnector`)**: Lightweight single-host or multi-host connector for functional testing and local disaggregation (`examples/disagg/run_disagg_single_host.sh`).
+`vllm-torchtpu` transfers KV cache through the **Raiden KV Connector (`TPURaidenConnector`)**: a high-bandwidth PJRT DMA/RDMA engine powered by `tpu-sync-torch` (`tpu_sync`) with a central coordinator (`run_raiden_controller.py`) and support for **heterogeneous P/D resharding** (e.g., Prefill with `PCP=4, TP=2` transferring KV cache into Decode with `DP=8, TP=1`). `TPUConnector` is a compatibility alias of `TPURaidenConnector` and uses the same Raiden Stage-3 backend; the legacy ZMQ transport has been removed.
 
 ---
 
@@ -20,25 +17,37 @@ A production Raiden P/D deployment consists of four components:
 
 ---
 
-## 2. Single-Host Disaggregated Serving Quickstart
+## 2. Multi-Host Disaggregated Serving with Raiden (`TPURaidenConnector`)
 
-On an 8-device TPU host, you can launch a complete Prefill + Decode + Proxy pipeline using `examples/disagg/run_disagg_single_host.sh`:
+For large models such as `Qwen/Qwen3.5-397B-A17B`, `Qwen/Qwen3.5-35B-A3B-FP8`, `moonshotai/Kimi-K3`, and `deepseek-ai/DeepSeek-V4`, use `TPURaidenConnector` with `TPU_USE_RAIDEN_KV_CACHE_MANAGER=1`.
 
-```bash
-MODEL="Qwen/Qwen3-0.6B" \
-INPUT_LEN=512 \
-OUTPUT_LEN=128 \
-NUM_PROMPTS=200 \
-bash examples/disagg/run_disagg_single_host.sh
-```
+> [!IMPORTANT]
+> `TPURaidenConnector` (and its `TPUConnector` alias) only supports models with a
+> Raiden Stage-3 admission path. Every Prefill and Decode instance must set
+> `TPU_USE_RAIDEN_KV_CACHE_MANAGER=1` and exactly one of the model admission flags:
+>
+> | Model family | Admission flag |
+> | :--- | :--- |
+> | Qwen3.5 | `TPU_RAIDEN_QWEN35_ADMISSION=1` |
+> | Kimi-K3 | `TPU_RAIDEN_KIMIK3_ADMISSION=1` |
+> | GLM | `TPU_RAIDEN_GLM_ADMISSION=1` |
+> | DeepSeek-V4 | `TPU_RAIDEN_DSV4_ADMISSION=1` |
+>
+> `TpuPlatform.check_and_update_config` rejects the configuration before model
+> load if the cache manager is disabled, no admission flag is set, or more than one
+> admission flag is set. Plain attention models without a Stage-3 admission path
+> (for example `Qwen/Qwen3-0.6B`) and 1-chip-per-role Qwen3.5 pairs are not
+> supported. `kv_connector_extra_config["use_raiden_connector"]` has been removed
+> and is rejected at startup.
 
-The script pins separate `/dev/vfio/<N>` devices to the Prefill (`kv_producer`) and Decode (`kv_consumer`) `vllm serve` processes, starts `examples/disagg/toy_proxy_server.py` on port `8000`, and runs `vllm bench serve` against the proxy.
+### Single-Host Disaggregated Serving
 
----
-
-## 3. Multi-Host Disaggregated Serving with Raiden (`TpuRaidenConnector`)
-
-For large models such as `Qwen/Qwen3.5-397B-A17B`, `Qwen/Qwen3.5-35B-A3B-FP8`, `moonshotai/Kimi-K3`, and `deepseek-ai/DeepSeek-V4`, use `TpuRaidenConnector` with `TPU_USE_RAIDEN_KV_CACHE_MANAGER=1`.
+To run Prefill and Decode on a single host, use
+`examples/disagg/launch_qwen35_p4d2_v2_baseline.sh`. It launches a Qwen3.5
+Prefill/Decode pair on one host with `TPU_USE_RAIDEN_KV_CACHE_MANAGER=1` and
+`TPU_RAIDEN_QWEN35_ADMISSION=1`, combining `TPURaidenConnector` with
+`TPURaidenOffloadingConnector` through `TPUMultiConnector`. The multi-host steps
+below show the same configuration split across hosts.
 
 ### Step 1: Start the Raiden Controller
 
@@ -68,8 +77,8 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
   --block-size 256 \
   --attention-backend CUSTOM \
   --kv-transfer-config '{
-    "kv_connector": "TpuRaidenConnector",
-    "kv_connector_module_path": "vllm_torchtpu.distributed.kv_transfer.raiden.raiden_connector",
+    "kv_connector": "TPURaidenConnector",
+    "kv_connector_module_path": "vllm_torchtpu.distributed.kv_transfer.tpu_connector",
     "kv_role": "kv_producer"
   }'
 ```
@@ -92,8 +101,8 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
   --block-size 256 \
   --attention-backend CUSTOM \
   --kv-transfer-config '{
-    "kv_connector": "TpuRaidenConnector",
-    "kv_connector_module_path": "vllm_torchtpu.distributed.kv_transfer.raiden.raiden_connector",
+    "kv_connector": "TPURaidenConnector",
+    "kv_connector_module_path": "vllm_torchtpu.distributed.kv_transfer.tpu_connector",
     "kv_role": "kv_consumer"
   }'
 ```
@@ -112,7 +121,7 @@ python examples/disagg/toy_proxy_server.py \
 
 ---
 
-## 4. Decode Capacity Preemption & Error Contract
+## 3. Decode Capacity Preemption & Error Contract
 
 When a Decode instance (`kv_role="kv_consumer"`) runs with `kv_load_failure_policy="fail"` (the upstream vLLM default), `vllm-torchtpu` aborts `RUNNING` requests that are evicted due to KV cache capacity pressure instead of returning them to `waiting` to recompute prompts locally on the decode pool. Administrative prefix cache resets (`reset_prefix_cache`) continue to requeue requests without aborting them.
 
@@ -150,10 +159,11 @@ Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` 
 
 ---
 
-## 5. Reference Launch Scripts & GKE Manifests
+## 4. Reference Launch Scripts & GKE Manifests
 
 | Script / Manifest | Description |
 | :--- | :--- |
+| `examples/disagg/launch_qwen35_p4d2_v2_baseline.sh` | Single-host Qwen3.5 P/D launcher (Prefill and Decode on one host, `TPURaidenConnector` + offloading via `TPUMultiConnector`). |
 | `examples/disagg/launch_qwen35_disagg_multihost.sh` | Turnkey launcher for Qwen3.5 P/D disaggregation supporting `ROLE=controller\|prefill\|decode\|proxy\|all`. |
 | `examples/disagg/launch_dsv4_disagg_multihost.sh` | Turnkey launcher for DeepSeek-V4 multi-host P/D disaggregation. |
 | `examples/disagg/run_qwen35_raiden_pcp8_dp8_live_pair.sh` | Live pair script demonstrating heterogeneous resharding from Prefill (`PCP=8`) to Decode (`DP=8`). |
@@ -162,7 +172,7 @@ Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` 
 
 ---
 
-## 6. Key Raiden Environment Variables
+## 5. Key Raiden Environment Variables
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
@@ -170,6 +180,6 @@ Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` 
 | `TPU_RAIDEN_CONTROLLER_ADDRESS` | `""` | `host:port` of the Raiden coordinator (`run_raiden_controller.py`). |
 | `TPU_RAIDEN_JOB_NAME` | `""` | Logical role identifier (`prefill` or `decode`) registered with the Raiden controller. |
 | `TPU_RAIDEN_ENGINE_ID` | `"0"` | Unique engine replica ID within the job role. |
-| `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of concurrent DMA transfer streams per worker. |
+| `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of source ranks that transfer KV blocks in parallel (source rank transfer parallelism). Distinct from `TPU_RAIDEN_TRANSFER_STREAMS`, which sets the TCP stream count of each push. |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | KV resharding implementation (`controller` or `host`) when Prefill and Decode shardings differ. |
-| `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Transport protocol for host-side KV resharding (`zmq` or `tcp`). |
+| `TPU_KV_RESHARD_TRANSPORT` | `"raiden"` | Transport selector for KV cache resharding. Defaults to and only accepts `"raiden"` (case-insensitive); kept for launch-config compatibility. Any other value (for example the removed `"zmq"`) is rejected at startup. |

@@ -2004,9 +2004,10 @@ class KVCacheManager:
             # deduplicates strided views by underlying storage, registering only the
             # single canonical bundle.
             kv_connector.register_kv_caches(kv_caches)
-            # TPUConnector reads runner.kv_caches lazily and doesn't need
-            # set_host_xfer_buffer_ops; only call it on connectors that
-            # expose it.
+            # TPURaidenConnector takes the named caches from
+            # register_kv_caches and admits its Raiden pools in
+            # register_runner; it has no set_host_xfer_buffer_ops, so only
+            # call that on connectors that expose it.
             if hasattr(kv_connector, "set_host_xfer_buffer_ops"):
                 kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
             if hasattr(kv_connector, "register_runner"):

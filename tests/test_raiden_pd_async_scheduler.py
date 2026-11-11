@@ -48,6 +48,21 @@ from vllm_torchtpu.distributed import utils as dist_utils
 BLOCK_SIZE = 16
 
 
+@pytest.fixture(autouse=True)
+def _raiden_pd_env(monkeypatch):
+    for name in (
+        "TPU_KV_RESHARD_TRANSPORT",
+        "TPU_RAIDEN_KIMIK3_ADMISSION",
+        "TPU_RAIDEN_GLM_ADMISSION",
+        "TPU_RAIDEN_DSV4_ADMISSION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delitem(vars(tpu_envs), name, raising=False)
+    for name in ("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "TPU_RAIDEN_QWEN35_ADMISSION"):
+        monkeypatch.delitem(vars(tpu_envs), name, raising=False)
+        monkeypatch.setenv(name, "1")
+
+
 @pytest.fixture(scope="module")
 def shared_model_config(tmp_path_factory):
     model_dir = tmp_path_factory.mktemp("opt_init_config")
@@ -93,10 +108,8 @@ def test_default_entrypoint_selects_the_official_scheduler(async_scheduling, exp
 @pytest.mark.parametrize("scheduler_cls", [Scheduler, AsyncScheduler])
 @pytest.mark.parametrize("send_completion", [False, True])
 def test_init_patch_installs_producer_completion_on_real_schedulers(
-    shared_model_config, scheduler_cls, send_completion, monkeypatch
+    shared_model_config, scheduler_cls, send_completion
 ):
-    tpu_envs.__dict__.pop("TPU_KV_RESHARD_TRANSPORT", None)
-    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
     patch_scheduler_init()
 
     vllm_config = VllmConfig(
@@ -174,8 +187,6 @@ def test_init_patch_installs_producer_completion_on_real_schedulers(
 def test_decode_inline_load_with_fail_policy_initializes_without_error(
     shared_model_config, monkeypatch
 ):
-    tpu_envs.__dict__.pop("TPU_KV_RESHARD_TRANSPORT", None)
-    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
     monkeypatch.setattr(dist_utils, "get_raiden_inline_load", lambda: True)
     patch_scheduler_init()
 

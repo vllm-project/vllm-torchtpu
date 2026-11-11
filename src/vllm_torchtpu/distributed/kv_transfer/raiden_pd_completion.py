@@ -19,7 +19,9 @@ from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorWorkerMetadata
 
-from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.kv_transfer.connector_names import (
+    RAIDEN_PD_CONNECTOR_NAMES,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -39,11 +41,9 @@ def send_completion_enabled(vllm_config: "VllmConfig") -> bool:
         return False
 
     kv = vllm_config.kv_transfer_config
-    stage3 = str(envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() == "raiden"
     parallel = vllm_config.parallel_config
     if (
-        not stage3
-        or kv is None
+        kv is None
         or kv.kv_role != "kv_producer"
         or parallel.tensor_parallel_size != 1
         or parallel.data_parallel_size != 1
@@ -59,7 +59,9 @@ def send_completion_enabled(vllm_config: "VllmConfig") -> bool:
         if kv.kv_connector == "TPUMultiConnector"
         else [{"kv_connector": kv.kv_connector}]
     )
-    raiden_count = sum(c["kv_connector"] == "TPURaidenConnector" for c in connectors)
+    raiden_count = sum(
+        c["kv_connector"] in RAIDEN_PD_CONNECTOR_NAMES for c in connectors
+    )
     if raiden_count != 1:
         raise ValueError(
             "raiden_pd_send_completion requires exactly one TPURaidenConnector"
