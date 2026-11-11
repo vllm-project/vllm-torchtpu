@@ -227,16 +227,24 @@ class DSparkProposer(DFlashProposer):
 
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
+        sample_start = 0 if self.sample_from_anchor else 1
 
-        # Draft-vocab logits for every slot; the Markov bias is added in
-        # draft space and ids are remapped to target vocab after argmax.
+        # Draft-vocab logits for every sampled slot; the Markov bias is added
+        # in draft space and ids are remapped to target vocab after argmax.
         # The vocab-parallel path keeps each rank's vocab shard of them.
+        # Slot-major rows ([slot, request]), so each Markov step reads one
+        # contiguous block: the hidden rows are relaid out, not the logits.
+        slot_hidden = (
+            valid_hidden.view(padded_num_reqs, block_size, -1)[:, sample_start:]
+            .transpose(0, 1)
+            .reshape((block_size - sample_start) * padded_num_reqs, -1)
+        )
         vocab_parallel = self._vocab_parallel_markov
         if vocab_parallel:
-            logits = self.draft_model.compute_draft_logits_shard(valid_hidden)
+            logits = self.draft_model.compute_draft_logits_shard(slot_hidden)
         else:
-            logits = self.draft_model.compute_draft_logits(valid_hidden)
-        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
+            logits = self.draft_model.compute_draft_logits(slot_hidden)
+        slot_logits = logits.view(block_size - sample_start, padded_num_reqs, -1)
 
         ids_3d = input_ids[: padded_num_reqs * block_size].view(
             padded_num_reqs, block_size
@@ -244,16 +252,16 @@ class DSparkProposer(DFlashProposer):
         prev = ids_3d[:, 0]
         draft_tokens = []
         markov_embeds = []
-        sample_start = 0 if self.sample_from_anchor else 1
         for i in range(sample_start, block_size):
             markov_embed = self.draft_model.markov_embed(prev)
+            step_logits = slot_logits[i - sample_start]
             if vocab_parallel:
                 draft_ids = self.draft_model.markov_argmax_shard(
-                    logits_3d[:, i], markov_embed
+                    step_logits, markov_embed
                 )
             else:
                 bias = self.draft_model.markov_bias(markov_embed)
-                draft_ids = (logits_3d[:, i] + bias).argmax(dim=-1)
+                draft_ids = (step_logits + bias).argmax(dim=-1)
             step = self.draft_model.map_draft_to_target(draft_ids)
             draft_tokens.append(step)
             markov_embeds.append(markov_embed)
