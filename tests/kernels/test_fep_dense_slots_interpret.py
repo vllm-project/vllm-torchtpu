@@ -24,8 +24,9 @@ Small shapes: hidden 1024 (whole 8-sublane staging tiles), intermediate 128, 16,
 
 The checks need 8 CPU devices, and the host device count (XLA_FLAGS) must be set before
 JAX starts, so the tests run this file as a script in a subprocess, once per session,
-for the cases pytest selected, and each test reports its case. One case per variant
-and the two mutant checks run in regular CI; the rest of the grid is marked nightly.
+for the cases pytest selected, and each test reports its case. Regular CI runs the two
+mutant checks and two reference cases (the fused path, and the unrouted-expert skip on a
+world with cold experts); the rest of the grid is marked nightly.
 """
 
 import json
@@ -299,10 +300,12 @@ WORLDS = [
     (64, 32, "cold", 5),
     (64, 24, True, 0),
 ]
-# Regular CI runs each variant on one world: a skip variant where experts go unrouted,
-# the others on the smallest world. The rest of the grid runs nightly.
+# Regular CI: the two mutant checks (the comparison bites) and two reference cases, the
+# fused path and the unrouted-expert skip where experts go unrouted. Every other case
+# runs nightly.
 REGULAR_WORLD = {
-    v: (64, 24, "cold", 0) if "skip" in v else (16, 24, False, 0) for v in VARIANTS
+    "fused": (16, 24, False, 0),
+    "merged_unpadded_skip": (64, 24, "cold", 0),
 }
 SKIP_PAIRS = [
     ("merged_unpadded", "merged_unpadded_skip"),
@@ -410,7 +413,7 @@ def _report(results, case, may_skip=False):
 def _matches_params():
     for variant in VARIANTS:
         for world in WORLDS:
-            regular = REGULAR_WORLD[variant] == world
+            regular = REGULAR_WORLD.get(variant) == world
             marks = () if regular else (pytest.mark.nightly,)
             yield pytest.param(variant, *world, marks=marks)
 
