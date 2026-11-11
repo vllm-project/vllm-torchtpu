@@ -988,6 +988,9 @@ class TPUModelRunner(GPUModelRunner):
             if self.most_model_len is not None
             else None
         )
+        # Why prompt logprobs cannot be computed, with the fix (None if they
+        # can); set at model load.
+        self._prompt_logprobs_unsupported: str | None = None
         # InputBatch needs to work with sampling tensors greater than padding
         # to avoid dynamic shapes. Also, avoid suboptimal alignment.
         self.max_num_reqs = max(self.max_num_reqs, MIN_NUM_SEQS)
@@ -4664,6 +4667,16 @@ class TPUModelRunner(GPUModelRunner):
         slices of at most the request bucket both precompile for this token
         bucket, so a step with prompt logprobs compiles nothing new.
         """
+        if self._prompt_logprobs_unsupported is not None:
+            # TODO: support them in these configurations. Skipping returns the
+            # request without prompt logprobs, as before they were computed,
+            # where raising here would stop the engine and every request in it.
+            logger.warning_once(
+                "prompt_logprobs (also set by echo=True) are not supported with "
+                "%s; those requests get no prompt logprobs.",
+                self._prompt_logprobs_unsupported,
+            )
+            return None
         end_index = start_index + num_reqs
         spans = prompt_logprobs.plan_chunk(
             cast(list[str], self.input_batch.req_ids[start_index:end_index]),
@@ -4672,32 +4685,9 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output.num_scheduled_tokens,
             self.requests,
             self.num_prompt_logprobs,
-            self.model_config.max_logprobs,
         )
         if not spans:
             return None
-        if self._dp_vocab_logits:
-            unsupported = "TPU_DP_VOCAB_PARALLEL=1; unset it"
-        elif self.speculative_config is not None:
-            unsupported = "speculative decoding; serve without --speculative-config"
-        elif _get_sequence_layout_planner_for_runner(
-            self
-        ).uses_selected_logits_hidden_states:
-            unsupported = (
-                "prefill context parallelism; serve with "
-                "--prefill-context-parallel-size 1"
-            )
-        else:
-            unsupported = None
-        if unsupported is not None:
-            # TODO: a DP-sharded lm_head needs every DP engine to run the same
-            # logits programs; context parallelism selects the logits rows on
-            # each rank; speculative decoding is not covered by tests yet.
-            raise NotImplementedError(
-                "prompt_logprobs (also set by echo=True with logprobs) is not "
-                f"supported with {unsupported}."
-            )
-
         chunk = prompt_logprobs.PromptLogprobsChunk(spans)
         rows, targets = prompt_logprobs.rows_and_targets(spans, self.requests)
         max_slice = _get_padded_num_reqs_with_upper_limit(
@@ -5916,6 +5906,13 @@ class TPUModelRunner(GPUModelRunner):
             self._dp_vocab_logits
             and self.sequence_layout_planner.uses_selected_logits_hidden_states
         ), "TPU_DP_VOCAB_PARALLEL does not support selected logits hidden states"
+        self._prompt_logprobs_unsupported = prompt_logprobs.unsupported_reason(
+            dp_vocab_logits=self._dp_vocab_logits,
+            selected_logits_hidden_states=(
+                self.sequence_layout_planner.uses_selected_logits_hidden_states
+            ),
+            lora=self.lora_config is not None,
+        )
         if self.is_pooling_model:
             self._resolve_static_pooler()
         if self.parallel_config.pipeline_parallel_size > 1:

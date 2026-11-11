@@ -20,6 +20,9 @@ token ``i``, so a prompt has ``P - 1`` rows. Under chunked prefill they are
 filled chunk by chunk into a per-request CPU buffer, which is returned once
 the prompt is computed: the semantics of vLLM's
 ``GPUModelRunner._get_prompt_logprobs_dict``.
+
+The rows are scored with the runner's fixed top-k (``max_logprobs``), so a
+request for more prompt logprobs than that gets ``max_logprobs`` of them.
 """
 
 from __future__ import annotations
@@ -28,9 +31,12 @@ from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -60,6 +66,25 @@ class PromptLogprobsChunk:
     slices: list[tuple[LogprobsTensors, int]] = field(default_factory=list)
 
 
+def unsupported_reason(
+    *, dp_vocab_logits: bool, selected_logits_hidden_states: bool, lora: bool
+) -> str | None:
+    """Why the runner cannot compute prompt logprobs, with the fix; None if it
+    can."""
+    if dp_vocab_logits:
+        # Every DP engine would have to run the same logits programs.
+        return "TPU_DP_VOCAB_PARALLEL=1 (unset it)"
+    if selected_logits_hidden_states:
+        # Each rank selects its own logits rows; the prompt rows are not local.
+        return (
+            "prefill context parallelism (serve with --prefill-context-parallel-size 1)"
+        )
+    if lora:
+        # The LoRA logits mapping has one adapter slot per request, not per row.
+        return "LoRA (serve without --enable-lora)"
+    return None
+
+
 def plan_chunk(
     req_ids: Sequence[str],
     query_start_loc: np.ndarray,
@@ -67,7 +92,6 @@ def plan_chunk(
     num_scheduled_tokens: Mapping[str, int],
     requests: Mapping[str, CachedRequestState],
     num_prompt_logprobs: Mapping[str, int],
-    max_logprobs: int,
 ) -> list[PromptLogprobsSpan]:
     """The prompt-logprob spans of one forward chunk.
 
@@ -76,16 +100,8 @@ def plan_chunk(
     """
     spans = []
     for i, req_id in enumerate(req_ids):
-        num_logprobs = num_prompt_logprobs.get(req_id)
-        if num_logprobs is None:
+        if req_id not in num_prompt_logprobs:
             continue
-        if num_logprobs > max(max_logprobs, 0):
-            raise NotImplementedError(
-                f"prompt_logprobs={num_logprobs} exceeds the TPU runner's fixed "
-                f"top-k of max_logprobs={max_logprobs}; full-vocabulary prompt "
-                "logprobs (-1) are not supported. Request at most max_logprobs, "
-                "or raise --max-logprobs."
-            )
         prompt_token_ids = requests[req_id].prompt_token_ids
         if prompt_token_ids is None:
             # As vLLM: no prompt logprobs for prompt embeddings.
@@ -142,7 +158,17 @@ def emit(
         offset = 0
         for span in chunk.spans:
             request = requests[span.req_id]
+            # The prompt token's logprob, then the top-k.
             width = num_prompt_logprobs[span.req_id] + 1
+            if host is not None and host.logprobs.shape[1] < width:
+                logger.warning_once(
+                    "prompt_logprobs=%d exceeds the TPU runner's top-k of %d "
+                    "(--max-logprobs); returning that many. Set a finite "
+                    "--max-logprobs of at least the requested number.",
+                    width - 1,
+                    host.logprobs.shape[1] - 1,
+                )
+                width = host.logprobs.shape[1]
             buffer = request.in_progress_prompt_logprobs_cpu
             if buffer is None:
                 assert request.prompt_token_ids is not None
@@ -169,8 +195,13 @@ def emit(
 
 def _host_rows(slices: Sequence[tuple[LogprobsTensors, int]]) -> LogprobsTensors:
     """The real rows of a chunk's padded device slices, on the host, in order."""
-    return LogprobsTensors(
-        torch.cat([t.logprob_token_ids.cpu()[:n] for t, n in slices]),
-        torch.cat([t.logprobs.cpu()[:n] for t, n in slices]),
-        torch.cat([t.selected_token_ranks.cpu()[:n] for t, n in slices]),
+    return LogprobsTensors.cat(
+        [
+            LogprobsTensors(
+                t.logprob_token_ids.cpu()[:n],
+                t.logprobs.cpu()[:n],
+                t.selected_token_ranks.cpu()[:n],
+            )
+            for t, n in slices
+        ]
     )

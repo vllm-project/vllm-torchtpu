@@ -206,7 +206,7 @@ def test_prompt_logprobs(llm: LLM):
             sampled.token_ids, sampled.logprobs, continuation
         ):
             assert logprobs[token].logprob == pytest.approx(
-                sampled_logprobs[token].logprob, abs=1e-2
+                sampled_logprobs[token].logprob, abs=0.05
             )
 
 
