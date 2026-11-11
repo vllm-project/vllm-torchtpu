@@ -75,5 +75,10 @@ integration_scripts:
     - integration_k3_pruned75_apc_offload_correctness
 
 # Per-folder rules, each owned by that folder's code owners and the CI owners.
-# Listing a file here is what makes it active.
-component_configs: []
+# Listing a file here is what makes it active. A folder qualifies only if
+# nothing outside it imports it (tests/scripts/test_select_pr_tests.py).
+component_configs:
+  - src/vllm_torchtpu/omni/ci_paths.yaml
+  - src/vllm_torchtpu/megakernel/ci_paths.yaml
+  - src/vllm_torchtpu/experimental/ci_paths.yaml
+  - src/vllm_torchtpu/models/vllm/kimi_k3/ci_paths.yaml

@@ -1,0 +1,45 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Diff-aware CI: the PR TPU steps a change confined to `paths` needs. Owned by
+# this folder's code owners and the CI owners; see .buildkite/ci_paths.yaml.
+#
+# The Kimi-K3 model and its kernels. Only the Kimi-K3 tests and the Kimi-K3
+# integration step run them; other models never load them. The KDA files
+# under kernels/gdn/ and layers/adapter/custom_ops/ are shared with other
+# models, so they are not covered here and run the full build.
+name: kimi_k3
+phase: phase2
+paths:
+  - src/vllm_torchtpu/models/vllm/kimi_k3/
+  - src/vllm_torchtpu/kernels/kimi_k3/
+  - src/vllm_torchtpu/models/kimi_k3/
+  - tests/models/kimi_k3/
+  - tests/models/vllm/test_kimi_k3.py
+  - tests/kernels/test_kimi_attention_residual.py
+  - tests/kernels/test_kimi_collective_topology.py
+  - tests/kernels/test_kimi_decode_kda.py
+  - tests/kernels/test_kimi_kda.py
+  - tests/kernels/test_kimi_mega_kda.py
+modules:
+  - vllm_torchtpu.models.vllm.kimi_k3
+  - vllm_torchtpu.kernels.kimi_k3
+  - vllm_torchtpu.models.kimi_k3
+run_steps:
+  - unit_tests_general_pr
+  - integration_k3_pruned75_apc_offload_correctness
+allowed_importers:
+  # Registers the Kimi-K3 classes by name; vLLM imports them only when a
+  # Kimi-K3 model is loaded.
+  - src/vllm_torchtpu/models/vllm/__init__.py

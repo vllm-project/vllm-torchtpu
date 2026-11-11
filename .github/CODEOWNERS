@@ -223,3 +223,10 @@
 # Entrypoints & E2E Tests
 /tests/entrypoints/ @Lumosis @theminghuang @maxwillzq @Nanfang-Li @QiliangCui
 /tests/e2e/ @Lumosis @theminghuang @maxwillzq @Nanfang-Li @QiliangCui
+
+# Diff-aware CI rules: the folder's owners and the CI owners (/.buildkite/).
+# Keep last so these lines win over the folder rules above.
+/src/vllm_torchtpu/omni/ci_paths.yaml @mbohlool @pi314ever @chandrasekhard2 @yixinshi @QiliangCui @theminghuang @yiw-wang @yunyao-gg
+/src/vllm_torchtpu/megakernel/ci_paths.yaml @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @QiliangCui @theminghuang @yiw-wang @yunyao-gg
+/src/vllm_torchtpu/experimental/ci_paths.yaml @maxwillzq @jrplatin @yunyao-gg @QiliangCui @theminghuang @yiw-wang
+/src/vllm_torchtpu/models/vllm/kimi_k3/ci_paths.yaml @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @QiliangCui @theminghuang @yiw-wang @yunyao-gg

@@ -20,7 +20,9 @@ what a PR runs.
 
 from __future__ import annotations
 
+import ast
 import contextlib
+import fnmatch
 import importlib
 import io
 import pathlib
@@ -456,6 +458,213 @@ class SelectPrTestsTest(unittest.TestCase):
             self.assertIsNone(
                 re.search(r"\b(tpu_test|multichip)\b", text), str(conftest)
             )
+
+
+# -- Component folders: import boundaries, test coverage, ownership ----------
+
+# Where Python that might import a component can live.
+_SCAN_DIRS = (
+    "src",
+    "tests",
+    "tests_omni",
+    "examples",
+    "scripts",
+    "tools",
+    ".buildkite",
+)
+# A string naming a module, as in `importlib.import_module("a.b")` or a vLLM
+# model registry entry "a.b:Class".
+_MODULE_STRING_RE = re.compile(r"[A-Za-z_]\w*(?:\.\w+)+(?::\w+)?")
+# Fallbacks for files this interpreter cannot parse (newer syntax).
+_FALLBACK_IMPORT_RE = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_][\w.]*)", re.M)
+_FALLBACK_STRING_RE = re.compile(r"[\"']([A-Za-z_]\w*(?:\.\w+)+)(?::\w+)?[\"']")
+
+
+def referenced_modules(source: str, rel_path: str) -> set[str]:
+    """Modules a Python file imports, statically or by naming them in a string."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set(_FALLBACK_IMPORT_RE.findall(source)) | set(
+            _FALLBACK_STRING_RE.findall(source)
+        )
+    parts = pathlib.PurePath(rel_path).parts
+    package = ".".join(parts[1:-1]) if parts[0] == "src" else ""
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                pkg = package.split(".") if package else []
+                if not pkg or node.level - 1 > len(pkg):
+                    continue
+                pkg = pkg[: len(pkg) - (node.level - 1)]
+                base = ".".join(pkg + ([node.module] if node.module else []))
+            found.add(base)
+            found.update(f"{base}.{alias.name}" for alias in node.names)
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and _MODULE_STRING_RE.fullmatch(node.value)
+        ):
+            found.add(node.value.split(":", 1)[0])
+    return found
+
+
+def boundary_violations(
+    file_modules: dict[str, set[str]], components: tuple[Any, ...]
+) -> list[str]:
+    """Files outside a component (and its allowed importers) that import it."""
+    out = []
+    for rel, modules in sorted(file_modules.items()):
+        for comp in components:
+            if any(sp.matches(rel, e) for e in comp.paths + comp.allowed_importers):
+                continue
+            for mod in sorted(modules):
+                if any(mod == m or mod.startswith(f"{m}.") for m in comp.modules):
+                    out.append(f"{rel} imports {mod} ({comp.config_path})")
+                    break
+    return out
+
+
+def _codeowners(path: str, rules: list[tuple[str, list[str]]]) -> list[str]:
+    """Owners of `path` under GitHub's last-match-wins CODEOWNERS rules."""
+    owners: list[str] = []
+    for pattern, rule_owners in rules:
+        anchored = pattern.lstrip("/")
+        if pattern == "*" or (
+            fnmatch.fnmatch(path, anchored)
+            if not anchored.endswith("/")
+            else path.startswith(anchored)
+        ):
+            owners = rule_owners
+    return owners
+
+
+class ComponentFoldersTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.config = sp.load_config(_REPO_ROOT)
+
+    def test_no_import_crosses_a_component_boundary(self) -> None:
+        file_modules = {}
+        this_file = pathlib.Path(__file__).resolve()
+        for top in _SCAN_DIRS:
+            for path in (_REPO_ROOT / top).rglob("*.py"):
+                if path.resolve() == this_file:  # names the modules as test data
+                    continue
+                rel = path.relative_to(_REPO_ROOT).as_posix()
+                text = path.read_text(encoding="utf-8", errors="replace")
+                file_modules[rel] = referenced_modules(text, rel)
+        self.assertGreater(len(file_modules), 500)
+        violations = boundary_violations(file_modules, self.config.components)
+        self.assertEqual(
+            violations,
+            [],
+            "These files import an isolated folder from outside it, so a change "
+            "there could break them without their tests running. Move the shared "
+            "code out of the folder, or list the importer under allowed_importers "
+            "(and the steps its tests run under run_steps) in the folder's "
+            "ci_paths.yaml:\n" + "\n".join(violations),
+        )
+
+    def test_boundary_check_catches_imports_of_every_form(self) -> None:
+        comp = sp.Component(
+            name="kimi_k3",
+            config_path="x/ci_paths.yaml",
+            phase="phase2",
+            paths=("src/vllm_torchtpu/models/vllm/kimi_k3/",),
+            run_steps=frozenset(),
+            modules=("vllm_torchtpu.models.vllm.kimi_k3",),
+            allowed_importers=("src/vllm_torchtpu/models/vllm/__init__.py",),
+        )
+        sources = {
+            "src/vllm_torchtpu/runner/a.py": (
+                "from vllm_torchtpu.models.vllm.kimi_k3 import layers\n"
+            ),
+            "src/vllm_torchtpu/runner/b.py": (
+                "import vllm_torchtpu.models.vllm.kimi_k3.moe as moe\n"
+            ),
+            "src/vllm_torchtpu/models/vllm/c.py": "from .kimi_k3 import model\n",
+            "src/vllm_torchtpu/runner/d.py": (
+                'importlib.import_module("vllm_torchtpu.models.vllm.kimi_k3")\n'
+            ),
+            "src/vllm_torchtpu/models/vllm/__init__.py": (
+                '_M = "vllm_torchtpu.models.vllm.kimi_k3:KimiK3Model"\n'
+            ),
+            "src/vllm_torchtpu/models/vllm/kimi_k3/x.py": "from .model import M\n",
+            "src/vllm_torchtpu/runner/e.py": (
+                '"""Docs mention vllm_torchtpu.models.vllm.kimi_k3 in prose."""\n'
+            ),
+        }
+        found = boundary_violations(
+            {rel: referenced_modules(src, rel) for rel, src in sources.items()},
+            (comp,),
+        )
+        self.assertEqual(
+            [line.split(" ")[0] for line in found],
+            [
+                "src/vllm_torchtpu/models/vllm/c.py",
+                "src/vllm_torchtpu/runner/a.py",
+                "src/vllm_torchtpu/runner/b.py",
+                "src/vllm_torchtpu/runner/d.py",
+            ],
+        )
+
+    def test_tests_that_exercise_a_component_run_with_it(self) -> None:
+        # Every TPU unit test under a component's paths or allowed importers
+        # must run in one of its run_steps, so a change there runs them.
+        for comp in self.config.components:
+            for entry in comp.paths + comp.allowed_importers:
+                target = _REPO_ROOT / entry
+                files = (
+                    sorted(target.rglob("*.py")) if entry.endswith("/") else [target]
+                )
+                for path in files:
+                    rel = path.relative_to(_REPO_ROOT).as_posix()
+                    if not rel.startswith("tests/") or not sp._TEST_FILE_RE.match(
+                        path.name
+                    ):
+                        continue
+                    steps = sp._unit_test_steps(rel, _REPO_ROOT)
+                    self.assertLessEqual(steps, comp.run_steps, f"{comp.name}: {rel}")
+
+    def test_component_paths_exist_and_do_not_overlap(self) -> None:
+        claimed: list[tuple[str, str]] = []
+        for comp in self.config.components:
+            for entry in comp.paths + comp.allowed_importers:
+                self.assertTrue((_REPO_ROOT / entry).exists(), f"{comp.name}: {entry}")
+            for entry in comp.paths:
+                self.assertFalse(
+                    any(sp.matches(entry, c) for c in self.config.cpu_only), entry
+                )
+                for other, owner in claimed:
+                    self.assertFalse(
+                        sp.matches(entry, other) or sp.matches(other, entry),
+                        f"{entry} ({comp.name}) overlaps {other} ({owner})",
+                    )
+                claimed.append((entry, comp.name))
+
+    def test_component_configs_need_folder_and_ci_owner_review(self) -> None:
+        rules = []
+        for line in (_REPO_ROOT / ".github/CODEOWNERS").read_text().splitlines():
+            fields = line.split("#", 1)[0].split()
+            if len(fields) >= 2:
+                rules.append((fields[0], fields[1:]))
+        ci_owners = set(_codeowners(sp.CONFIG_PATH, rules))
+        self.assertTrue(ci_owners)
+        for comp in self.config.components:
+            folder = comp.paths[0]
+            folder_owners = set(
+                _codeowners(
+                    f"{folder}__init__.py" if folder.endswith("/") else folder, rules
+                )
+            )
+            owners = set(_codeowners(comp.config_path, rules))
+            self.assertLessEqual(ci_owners, owners, comp.config_path)
+            self.assertLessEqual(folder_owners, owners, comp.config_path)
 
 
 if __name__ == "__main__":
