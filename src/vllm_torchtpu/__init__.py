@@ -1923,6 +1923,53 @@ def _patch_vllm_raiden_pd_completion() -> None:
     patch_scheduler_init()
 
 
+def _patch_vllm_qwen4_raiden_lookahead_hashes() -> None:
+    """Keep single-token lookahead block hashes on Qwen4ExpRaidenConnector.
+
+    Upstream disables ``VllmConfig.num_hash_lookahead_tokens`` whenever
+    ``kv_transfer_config`` is set because external KV stores key remote entries
+    by legacy block hashes. ``Qwen4ExpRaidenConnector`` transfers explicit
+    point-to-point page ranges and never exchanges block hashes over the wire;
+    keeping 1-token lookahead hashes lets decode consumers retain and match
+    imported boundary Mamba checkpoints without dropping the tail block, and
+    prevents draft KV collisions across distinct boundary lookahead tokens.
+    """
+    from vllm.config.vllm import VllmConfig
+
+    if getattr(VllmConfig, "_tpu_qwen4_raiden_lookahead_hashes_patch", False):
+        return
+    original_prop = VllmConfig.__dict__.get("num_hash_lookahead_tokens")
+    if not isinstance(original_prop, property) or original_prop.fget is None:
+        logger.warning(
+            "VllmConfig.num_hash_lookahead_tokens is no longer a property; "
+            "skipping Qwen4Exp Raiden lookahead hash patch."
+        )
+        return
+    original_fget = original_prop.fget
+
+    def num_hash_lookahead_tokens(self: VllmConfig) -> int:
+        value = original_fget(self)
+        if value:
+            return value
+        kv_cfg = self.kv_transfer_config
+        spec_cfg = self.speculative_config
+        if (
+            kv_cfg is None
+            or kv_cfg.kv_connector != "Qwen4ExpRaidenConnector"
+            or spec_cfg is None
+            or not spec_cfg.use_eagle_block_drop()
+            or spec_cfg.disable_lookahead_block_hashes
+            or not self.cache_config.enable_prefix_caching
+        ):
+            return 0
+        lookahead = self.num_prefill_lookahead_tokens
+        return lookahead if lookahead == 1 else 0
+
+    VllmConfig._tpu_upstream_num_hash_lookahead_tokens = original_prop
+    VllmConfig.num_hash_lookahead_tokens = property(num_hash_lookahead_tokens)
+    VllmConfig._tpu_qwen4_raiden_lookahead_hashes_patch = True
+
+
 def _patch_vllm_same_step_prefix_hits() -> None:
     """Keep prefix-cache hits off blocks the current step has not written.
 

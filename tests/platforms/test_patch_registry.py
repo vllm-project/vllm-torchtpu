@@ -235,6 +235,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_hybrid_kv_load_failure_recovery",
         "_patch_vllm_abort_on_preemption",
         "_patch_vllm_raiden_pd_completion",
+        "_patch_vllm_qwen4_raiden_lookahead_hashes",
         "_patch_vllm_same_step_prefix_hits",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
@@ -425,3 +426,53 @@ def test_sequence_parallel_moe_admission(monkeypatch):
         enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
     )
     assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_sp)
+
+
+def test_qwen4_raiden_lookahead_hashes_patch_scopes_to_qwen4_connector(monkeypatch):
+    from vllm.config.vllm import VllmConfig
+
+    from vllm_torchtpu import _patch_vllm_qwen4_raiden_lookahead_hashes
+
+    monkeypatch.setattr(
+        VllmConfig,
+        "num_hash_lookahead_tokens",
+        VllmConfig.num_hash_lookahead_tokens,
+    )
+    monkeypatch.setattr(
+        VllmConfig,
+        "_tpu_qwen4_raiden_lookahead_hashes_patch",
+        getattr(VllmConfig, "_tpu_qwen4_raiden_lookahead_hashes_patch", False),
+        raising=False,
+    )
+    if hasattr(VllmConfig, "_tpu_qwen4_raiden_lookahead_hashes_patch"):
+        delattr(VllmConfig, "_tpu_qwen4_raiden_lookahead_hashes_patch")
+    _patch_vllm_qwen4_raiden_lookahead_hashes()
+
+    def _cfg(
+        connector="Qwen4ExpRaidenConnector", caching=True, lookahead=1, disable=False
+    ):
+        cfg = object.__new__(VllmConfig)
+        cfg.kv_transfer_config = (
+            None if connector is None else SimpleNamespace(kv_connector=connector)
+        )
+        cfg.cache_config = SimpleNamespace(enable_prefix_caching=caching)
+        cfg.speculative_config = (
+            None
+            if lookahead == 0
+            else SimpleNamespace(
+                use_eagle=lambda: True,
+                use_multi_module_mtp=lambda: lookahead > 1,
+                use_eagle_block_drop=lambda: True,
+                disable_lookahead_block_hashes=disable,
+                num_speculative_tokens=lookahead,
+            )
+        )
+        return cfg
+
+    assert _cfg().num_hash_lookahead_tokens == 1
+    assert _cfg(connector="TPURaidenConnector").num_hash_lookahead_tokens == 0
+    assert _cfg(caching=False).num_hash_lookahead_tokens == 0
+    assert _cfg(lookahead=0).num_hash_lookahead_tokens == 0
+    assert _cfg(lookahead=2).num_hash_lookahead_tokens == 0
+    assert _cfg(disable=True).num_hash_lookahead_tokens == 0
+    assert _cfg(connector=None).num_hash_lookahead_tokens == 1

@@ -214,14 +214,17 @@ class _Stage3TransferGroup:
     def committed_state_page(self, block_ids: Sequence[int], num_tokens: int) -> int:
         """Select one committed page, validating the full local state allocation.
 
-        APC publishes the checkpoint for its prefix. Non-APC MTP allocates
-        K+1 slots, but only slot 0 is committed; the consumer owns its scratch.
+        APC publishes the checkpoint at ``index``, ahead of any trailing MTP
+        speculative scratch slots. Non-APC MTP allocates K+1 slots, with slot 0
+        committed; in both modes the consumer owns its own scratch.
         """
         if not self.request_state or num_tokens <= 0:
             raise ValueError("A committed state page requires a positive state extent")
         if self.checkpointed:
             index = (num_tokens - 1) // self.page_tokens
-            if index >= len(block_ids) or self.request_state_pages != 1:
+            if self.request_state_pages < 1 or index + self.request_state_pages > len(
+                block_ids
+            ):
                 raise ValueError("Committed state position is absent from its table")
         else:
             if len(block_ids) != self.request_state_pages:
@@ -1205,6 +1208,13 @@ class TPUConnectorScheduler:
         next_prompt_token_id = request.prompt_token_ids.pop()
         request._all_token_ids.pop()
         request.num_prompt_tokens -= 1
+        if (
+            not getattr(self.vllm_config, "num_hash_lookahead_tokens", 0)
+            and getattr(request, "_block_hasher", None) is not None
+            and getattr(request, "block_hashes", None)
+        ):
+            request.block_hashes.clear()
+            request.update_block_hashes()
         if request.kv_transfer_params is None:
             request.kv_transfer_params = {}
         request.kv_transfer_params["_p_side_truncated"] = True

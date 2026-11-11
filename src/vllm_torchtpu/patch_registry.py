@@ -105,6 +105,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_abort_on_preemption", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_raiden_pd_completion", _ENGINE),
+    Patch("vllm_torchtpu:_patch_vllm_qwen4_raiden_lookahead_hashes", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
