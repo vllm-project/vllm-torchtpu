@@ -255,7 +255,8 @@ def _head_parallel_attend(
         )
         # Buffer page s: logical block s - base[q] of request q.
         page = jnp.arange(buffer_pages, dtype=jnp.int32)
-        q_of = jnp.minimum(jnp.searchsorted(csum, page, side="right"), max_num_seqs - 1)
+        q_of = jnp.searchsorted(csum, page, side="right", method="compare_all")
+        q_of = jnp.minimum(q_of, max_num_seqs - 1)
         j = jnp.clip(page - base[q_of], 0, capacity - 1)
         pages = jnp.where(page < total, block_tables_2d[q_of, j], 0)
         kv, sc = _exchange_pages(
@@ -384,7 +385,9 @@ def attend_and_merge(
         [jnp.zeros((1,), jnp.int32), jnp.cumsum(jnp.where(dcp_req, q_lens, 0))]
     ).astype(jnp.int32)
     p = jnp.arange(rows, dtype=jnp.int32)
-    req = jnp.minimum(jnp.searchsorted(cu_d[1:], p, side="right"), max_num_seqs - 1)
+    # compare_all: the default scan lowers to a loop of small ops.
+    req = jnp.searchsorted(cu_d[1:], p, side="right", method="compare_all")
+    req = jnp.minimum(req, max_num_seqs - 1)
     src_row = jnp.where(p < cu_d[-1], cu_q_lens[req] + p - cu_d[req], 0)
     dcp_out = _dcp_attend(
         q[src_row],
