@@ -13,11 +13,22 @@
 # limitations under the License.
 """XLA-friendly unique-index scatter helpers for TPU sampling adapters."""
 
-from typing import Final
-
 import torch
 
-AMAX_SENTINEL: Final[int] = torch.iinfo(torch.int32).min
+
+def _amax_fill(dtype: torch.dtype) -> float | int:
+    """Fill for non-matching ``amax`` candidates: the lowest value of ``dtype``
+    (-inf for floating dtypes), so no scattered value loses to it.
+
+    It depends only on ``dtype``, so a trace sees a constant.
+    """
+    if dtype.is_floating_point:
+        return float("-inf")
+    if dtype == torch.bool or dtype.is_complex:
+        raise TypeError(
+            f"broadcast_amax_scatter needs a floating or integer dtype, got {dtype}"
+        )
+    return torch.iinfo(dtype).min
 
 
 def broadcast_amax_scatter(
@@ -30,10 +41,14 @@ def broadcast_amax_scatter(
 
     Uses a masked broadcast + ``amax`` reduction rather than
     ``Tensor.scatter(0, ...)``, whose XLA lowering for dynamic colliding
-    indices adds ~7 ms/step on TPU v7x. Active ``indices[valid_mask]`` must be
-    pairwise distinct and within ``[0, base.shape[0])``.
+    indices is slow on TPU. Non-matching candidates take the lowest value of
+    ``base.dtype`` (-inf for floating dtypes), so every scattered value
+    survives the ``amax``. Active ``indices[valid_mask]`` must be pairwise
+    distinct and within ``[0, base.shape[0])``.
     """
-    if indices.shape[0] == 0:
+    num_indices = indices.shape[0]
+    fill = _amax_fill(base.dtype)
+    if num_indices == 0:
         return base
     if base.device.type == "cpu" and not torch.compiler.is_compiling():
         active_idx = indices[valid_mask]
@@ -49,7 +64,7 @@ def broadcast_amax_scatter(
     cand = torch.where(
         match_view,
         values.to(base.dtype).unsqueeze(0),
-        AMAX_SENTINEL,
+        fill,
     ).amax(dim=1)
     any_match = match.any(dim=1).reshape(base.shape[0], *trailing_ones)
     return torch.where(any_match, cand, base)

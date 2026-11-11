@@ -48,7 +48,9 @@ class RequestSlotTable[RowT: Sequence[int]]:
         device: torch.device,
         sentinel_row: Sequence[int] | None = None,
     ) -> None:
-        self._max_num_reqs = max(int(max_num_reqs), 1)
+        self._max_num_reqs = int(max_num_reqs)
+        if self._max_num_reqs <= 0:
+            raise ValueError(f"max_num_reqs must be positive, got {max_num_reqs}")
         self._num_cols = int(num_cols)
         if self._num_cols <= 0:
             raise ValueError(f"num_cols must be positive, got {num_cols}")
@@ -166,7 +168,12 @@ class RequestSlotTable[RowT: Sequence[int]]:
         tracked_req_ids: Container[str],
         compute_cold_row: Callable[[str], RowT],
     ) -> torch.Tensor | None:
-        """Allocate slots and seed dirty/cold rows for ``batch_req_ids``."""
+        """Lease slots and seed dirty/cold rows for the tracked requests in
+        ``batch_req_ids``, after releasing those no longer in it.
+
+        Returns the device table, or None when no tracked request is in the
+        batch.
+        """
         batch_tracked = list(
             dict.fromkeys(
                 req_id
@@ -174,10 +181,12 @@ class RequestSlotTable[RowT: Sequence[int]]:
                 if req_id is not None and req_id in tracked_req_ids
             )
         )
+        # Release first, also when no tracked request is left in the batch,
+        # so a request that returns later is cold-seeded.
+        self.release_unscheduled(set(batch_tracked))
         if not batch_tracked:
             return None
 
-        self.release_unscheduled(set(batch_tracked))
         table = self.ensure_table()
         to_seed: list[tuple[int, RowT]] = []
         for req_id in batch_tracked:
@@ -190,23 +199,25 @@ class RequestSlotTable[RowT: Sequence[int]]:
                 to_seed.append((slot, dirty))
 
         if to_seed:
-            seed_width = self._max_num_reqs
-            sentinel_arr = np.asarray(self._sentinel_row, dtype=np.int32)
-            for start in range(0, len(to_seed), seed_width):
-                chunk = to_seed[start : start + seed_width]
-                slots_np = np.zeros(seed_width, dtype=np.int32)
-                vals_np = np.tile(sentinel_arr, (seed_width, 1))
-                for idx, (slot, row_vals) in enumerate(chunk):
-                    slots_np[idx] = slot
-                    vals_np[idx] = row_vals
-                # Synchronous .to(device): sample_tokens() runs after the
-                # runner's input-staging fence, so async H2D from temporary CPU
-                # buffers would risk reading freed host memory in TorchTPU.
-                table = seed_slot_rows(
-                    table,
-                    torch.from_numpy(slots_np).to(self._device),
-                    torch.from_numpy(vals_np).to(self._device),
-                )
+            # Each row is for a distinct leased slot, so one [max_num_reqs]
+            # scatter seeds them all.
+            assert len(to_seed) <= self._max_num_reqs
+            slots_np = np.zeros(self._max_num_reqs, dtype=np.int32)
+            vals_np = np.tile(
+                np.asarray(self._sentinel_row, dtype=np.int32),
+                (self._max_num_reqs, 1),
+            )
+            for idx, (slot, row_vals) in enumerate(to_seed):
+                slots_np[idx] = slot
+                vals_np[idx] = row_vals
+            # Synchronous .to(device): sample_tokens() runs after the runner's
+            # input-staging fence, so async H2D from temporary CPU buffers
+            # would risk reading freed host memory in TorchTPU.
+            table = seed_slot_rows(
+                table,
+                torch.from_numpy(slots_np).to(self._device),
+                torch.from_numpy(vals_np).to(self._device),
+            )
             self._table = table
         return table
 
@@ -220,7 +231,11 @@ class RequestSlotTable[RowT: Sequence[int]]:
     ) -> torch.Tensor | None:
         """Build ``[padded_num_reqs]`` int32 slot IDs for ``[start_idx, end_idx)``."""
         width = self._max_num_reqs if padded_num_reqs is None else int(padded_num_reqs)
-        upper = min(end_idx, len(batch_req_ids), start_idx + width)
+        upper = min(end_idx, len(batch_req_ids))
+        assert upper - start_idx <= width, (
+            f"Chunk [{start_idx}, {upper}) has {upper - start_idx} rows, more "
+            f"than its {width} slot IDs"
+        )
         slots_np = np.zeros(width, dtype=np.int32)
         seen_slots: set[int] = set()
         any_active = False

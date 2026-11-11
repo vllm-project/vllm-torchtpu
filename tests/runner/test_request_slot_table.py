@@ -16,6 +16,7 @@
 import pytest
 import torch
 
+from vllm_torchtpu.runner import request_slot_table
 from vllm_torchtpu.runner.request_slot_table import RequestSlotTable
 
 CPU = torch.device("cpu")
@@ -29,6 +30,8 @@ def _eager_seed_kernel():
 
 
 def test_constructor_validates_row_shape() -> None:
+    with pytest.raises(ValueError, match="max_num_reqs must be positive, got 0"):
+        RequestSlotTable(max_num_reqs=0, num_cols=1, device=CPU)
     with pytest.raises(ValueError, match="num_cols must be positive"):
         RequestSlotTable(max_num_reqs=2, num_cols=0, device=CPU)
     with pytest.raises(ValueError, match="sentinel_row length 1 != num_cols 2"):
@@ -74,6 +77,54 @@ def test_sync_step_leases_slots_and_seeds_dirty_and_cold_rows() -> None:
     tbl = pool.sync_step(["a", "c"], tracked, cold_row)
     assert tbl is not None and cold_calls == ["b", "c", "a"]
     assert pool.sync_step(["untracked"], tracked, cold_row) is None
+
+
+def test_untracked_only_step_releases_slots() -> None:
+    """A batch without tracked requests still releases the slots of the ones
+    that left, so a returning request is cold-seeded instead of keeping its
+    old row."""
+    pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
+        max_num_reqs=2, num_cols=1, device=CPU
+    )
+    tracked = {"a": (1,)}
+    cold_calls: list[str] = []
+
+    def cold_row(rid: str) -> tuple[int]:
+        cold_calls.append(rid)
+        return tracked[rid]
+
+    assert pool.sync_step(["a"], tracked, cold_row) is not None
+    assert pool.sync_step(["x", None], tracked, cold_row) is None
+    assert not pool.allocated_req_ids()
+    # "a" returns with a state that moved on while it was away.
+    tracked["a"] = (5,)
+    tbl = pool.sync_step(["a"], tracked, cold_row)
+    slot = pool.slot_for("a")
+    assert tbl is not None and slot is not None and cold_calls == ["a", "a"]
+    assert tbl[slot].tolist() == [5]
+
+
+def test_sync_step_seeds_new_rows_in_one_scatter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every seeded row has its own slot, so one scatter seeds a full pool."""
+    seeded: list[int] = []
+    seed = request_slot_table.seed_slot_rows
+
+    def counting_seed(
+        table: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor
+    ) -> torch.Tensor:
+        seeded.append(int((slots > 0).sum()))
+        return seed(table, slots, rows)
+
+    monkeypatch.setattr(request_slot_table, "seed_slot_rows", counting_seed)
+    pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
+        max_num_reqs=3, num_cols=1, device=CPU
+    )
+    tracked = {"a": (1,), "b": (2,), "c": (3,)}
+    tbl = pool.sync_step(["a", "b", "c"], tracked, tracked.__getitem__)
+    assert tbl is not None and seeded == [3]
+    assert sorted(tbl[1:, 0].tolist()) == [1, 2, 3]
 
 
 def test_release_frees_slots_and_dirty_rows() -> None:
@@ -132,6 +183,21 @@ def test_chunk_slot_ids_layout() -> None:
     assert ids is not None and ids.tolist() == [0, 0, sb, 0]
     assert pool.build_chunk_slot_ids(batch, 0, 2, discard_req_ids={"a"}) is None
     assert pool.build_chunk_slot_ids(["x", None], 0, 2) is None
+
+
+def test_chunk_with_more_rows_than_slot_ids_asserts() -> None:
+    pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
+        max_num_reqs=4, num_cols=1, device=CPU
+    )
+    batch = ["a", "b", "c"]
+    tracked = {rid: (0,) for rid in batch}
+    pool.sync_step(batch, tracked, tracked.__getitem__)
+    with pytest.raises(AssertionError, match=r"Chunk \[0, 3\) has 3 rows"):
+        pool.build_chunk_slot_ids(batch, 0, 3, padded_num_reqs=2)
+    # Only rows inside the batch count, so an end_idx past it still fits.
+    ids = pool.build_chunk_slot_ids(batch, 1, 8, padded_num_reqs=2)
+    assert ids is not None
+    assert ids.tolist() == [pool.slot_for("b"), pool.slot_for("c")]
 
 
 def test_slot_id_cache_reuses_uploads_until_the_layout_changes() -> None:
