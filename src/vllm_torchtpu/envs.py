@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DSPARK_SPLIT_FC: bool = False
     TPU_DRAFT_HIDE_NOOP_KV_CONNECTOR: bool = False
     TPU_RAIDEN_HOST_ORDER_DMA: bool = False
+    TPU_GMM_FP8_DECODE_TILES: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -825,6 +826,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # consecutive-run allocation (`contiguous_alloc`) is the connector's
     # extra_config key contiguous_alloc_scan_factor (default 1 = off; r6: 3).
     "TPU_RAIDEN_HOST_ORDER_DMA": env_bool("TPU_RAIDEN_HOST_ORDER_DMA", default=False),
+    # gmm_v2: decode-sized MoE buffers take r6's decode tiles (tile_m 128 in
+    # buckets 16/32/48/128, or fp8-sized tiles up to 512 rows) ahead of the
+    # skinny paths (fp8_feed_wide etc.), and kernel_mlp fuses them. r6.
+    "TPU_GMM_FP8_DECODE_TILES": env_bool("TPU_GMM_FP8_DECODE_TILES", default=False),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

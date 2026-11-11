@@ -172,6 +172,24 @@ FP8_RHS_WIDE_MAX_M = 2048
 _skinny_gmm_path = "fp8_feed"
 
 
+# r6 (opt-in, `set_fp8_decode_tiles`): decode-sized buffers past
+# FP8_RHS_TILE_M rows per tile take tile_m FP8_DECODE_TILE_M in the buckets
+# FP8_DECODE_BUCKETS (fp8 feed up to FP8_RHS_MAX_BUCKET_M rows, one bf16
+# bucket for the rest), or fp8-sized tiles up to FP8_SMALL_DECODE_MAX_M rows,
+# ahead of the skinny paths above; kernel_mlp fuses such tiles. Set with
+# TPU_GMM_FP8_DECODE_TILES before the model's first trace.
+FP8_DECODE_TILE_M = 128
+FP8_DECODE_BUCKETS = (16, 32, 48, FP8_DECODE_TILE_M)
+FP8_DECODE_MAX_M = 2048
+FP8_SMALL_DECODE_MAX_M = 512
+_fp8_decode_tiles = False
+
+
+def set_fp8_decode_tiles(enabled: bool) -> None:
+    global _fp8_decode_tiles
+    _fp8_decode_tiles = bool(enabled)
+
+
 def set_skinny_gmm_path(path: str) -> None:
     global _skinny_gmm_path
     if path not in SKINNY_GMM_PATHS:
@@ -1358,6 +1376,12 @@ def calculate_tiling(
         buckets = tuple(sorted({*small, *(b for b in large if b > max_after)}))
         if buckets[-1] != tile_m:
             buckets = None
+    if _fp8_decode_tiles and buckets is None:
+        decode_tiles = _fp8_decode_tile_sizes(
+            dims, lhs_cfgs, rhs_cfgs, tile_m, tile_k, tile_n, bucket_base, num_k_tiles
+        )
+        if decode_tiles is not None:
+            return decode_tiles
     # A small-size_m tile_m that did not grow makes every group pay for tile_m
     # rows, and rows cost MXU time on the fp8 rhs feed: use fp8-sized tiles in
     # two buckets. Two such tiles cost what one bf16 tile does, and more
@@ -1390,6 +1414,41 @@ def calculate_tiling(
         tile_n=tile_n,
         bucket_base=bucket_base,
         buckets=buckets,
+    )
+
+
+def _fp8_decode_tile_sizes(
+    dims, lhs_cfgs, rhs_cfgs, tile_m, tile_k, tile_n, bucket_base, num_k_tiles
+) -> TileSizes | None:
+    """r6's decode tiles (`set_fp8_decode_tiles`): a decode-sized buffer (the
+    average group, size_m / size_group rows, fits one tile) keeps small
+    groups on the fp8 feed instead of a >= 64-row bf16 bucket. Partial
+    buckets assume a single k tile (run_matmul_step), and 16-row buckets a
+    sublane tiling of at most 16 rows. None where they do not apply."""
+    sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
+    if not (
+        tile_m > bucket_base
+        and tile_m >= FP8_DECODE_TILE_M
+        and dims.size_m <= FP8_DECODE_TILE_M * dims.size_group
+        and dims.size_m <= FP8_DECODE_MAX_M
+        and num_k_tiles == 1
+        and FP8_DECODE_BUCKETS[0] % sublane == 0
+        and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
+    ):
+        return None
+    if dims.size_m <= FP8_SMALL_DECODE_MAX_M:
+        return TileSizes(
+            tile_m=FP8_RHS_TILE_M,
+            tile_k=tile_k,
+            tile_n=tile_n,
+            bucket_base=FP8_RHS_TILE_M // 2,
+        )
+    return TileSizes(
+        tile_m=FP8_DECODE_TILE_M,
+        tile_k=tile_k,
+        tile_n=tile_n,
+        bucket_base=FP8_DECODE_BUCKETS[0],
+        buckets=FP8_DECODE_BUCKETS,
     )
 
 
@@ -1817,6 +1876,19 @@ _HAS_PIPELINE_PREFETCH = "prefetched_count" in {
 } and hasattr(pltpu, "emit_pipeline_with_allocations")
 
 
+def _mlp_tiles(cfgs: GmmConfigs) -> bool:
+    """Decode-sized tiles kernel_mlp fuses: fp8 rhs feed at tile_m, or (with
+    `set_fp8_decode_tiles`, r6) up to FP8_DECODE_TILE_M rows whose smallest
+    bucket takes the fp8 feed."""
+    tiles = cfgs.tiles
+    if _fp8_decode_tiles:
+        return (
+            tiles.tile_m <= FP8_DECODE_TILE_M
+            and cfgs.fp8_rhs_dtype(tiles.bucket_sizes[0]) is not None
+        )
+    return cfgs.fp8_rhs_dtype(tiles.tile_m) is not None
+
+
 def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) -> bool:
     """Whether kernel_mlp can run both gmms on one fill_metadata layout."""
 
@@ -1853,8 +1925,8 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
         and
         # Decode-sized (fp8 rhs feed) tiles only: the fused program holds both
         # gmms' bucket bodies, and large ones would bloat it.
-        cfgs1.fp8_rhs_dtype(cfgs1.tiles.tile_m) is not None
-        and cfgs2.fp8_rhs_dtype(cfgs2.tiles.tile_m) is not None
+        _mlp_tiles(cfgs1)
+        and _mlp_tiles(cfgs2)
         and not cfgs1.zero_init
         and not cfgs2.zero_init
         and cfgs1.tiles.tile_m == cfgs2.tiles.tile_m

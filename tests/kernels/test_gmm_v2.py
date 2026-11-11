@@ -482,6 +482,74 @@ def test_gmm_fp8_feed_wide_keeps_fp8_tiles(size_m, monkeypatch):
     np.testing.assert_array_equal(np.asarray(wide), np.asarray(small))
 
 
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("size_m", [128, 512, 2048])
+def test_gmm_fp8_decode_tiles_match_default(size_m, monkeypatch):
+    """`set_fp8_decode_tiles` (r6, opt-in): decode MoE buffers take the r6
+    decode tiles, whose rows match the default path's (fp8_feed_wide) to
+    the fp8 feed's rounding, bitwise where both feed the bucket fp8."""
+    _require_tpu()
+
+    in_size, out_size, block_size = 6144, 6144, 128
+    sizes = [3, 1, 17, 0, 9, 2, 0, 16, 5, 0, 0, 4, 1, 0, 6, 0]
+    num_rows = sum(sizes)
+    group_sizes = jnp.array(sizes, dtype=jnp.int32)
+    group_offset = jnp.array([0], dtype=jnp.int32)
+    k_lhs, k_rhs = jax.random.split(jax.random.key(0))
+    lhs = jax.random.uniform(k_lhs, (size_m, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        k_rhs, (len(sizes), in_size, out_size), jnp.float32, -1, 1
+    )
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, jnp.float4_e2m1fn, axis=1, block_size=block_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+
+    def tiles(x):
+        return make_gmm_configs(
+            x,
+            rhs_q,
+            rhs_scale,
+            None,
+            group_sizes,
+            group_offset,
+            tile_info=calculate_tiling,
+            vmem_limit_bytes=int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9),
+            out_dtype=None,
+            acc_dtype=None,
+            maybe_quantize_lhs=False,
+            zero_initialize=False,
+            fuse_act="swigluoai",
+        ).tiles
+
+    def run(x):
+        jax.clear_caches()  # gmm_v2 is jitted; its config is read at trace
+        return gmm_v2(
+            x,
+            rhs_q,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            group_offset=group_offset,
+            maybe_quantize_lhs=False,
+            zero_initialize=False,
+            fuse_act="swigluoai",
+        )[:num_rows]
+
+    monkeypatch.setattr(gmm_v2_module, "_skinny_gmm_path", "fp8_feed_wide")
+    want = run(lhs)
+    monkeypatch.setattr(gmm_v2_module, "_fp8_decode_tiles", True)
+    t = tiles(lhs)
+    assert t.tile_m in (FP8_RHS_TILE_M, gmm_v2_module.FP8_DECODE_TILE_M), t
+    got = run(lhs)
+    jax.clear_caches()
+    np.testing.assert_allclose(
+        np.asarray(got.astype(jnp.float32)),
+        np.asarray(want.astype(jnp.float32)),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
 @pytest.mark.tpu_test
 def test_gmm_weight_quantized_block_larger_than_tile_k():
     _require_tpu()

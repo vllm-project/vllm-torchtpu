@@ -5799,6 +5799,11 @@ class TPUModelRunner(GPUModelRunner):
 
             gmm_v2.set_skinny_gmm_path(additional["moe_skinny_gmm"])
             logger.info("MoE skinny gmm path: %s", gmm_v2.skinny_gmm_path())
+        if envs.TPU_GMM_FP8_DECODE_TILES:
+            from vllm_torchtpu.kernels.megablox import gmm_v2
+
+            gmm_v2.set_fp8_decode_tiles(True)
+            logger.info("MoE gmm_v2 fp8 decode tiles on (TPU_GMM_FP8_DECODE_TILES)")
         if isinstance(additional, dict) and "msa_index_int4_fp8" in additional:
             from vllm_torchtpu.models.minimax_m3.kernels import msa_indexer
 
