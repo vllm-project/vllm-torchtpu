@@ -764,9 +764,10 @@ class Qwen4ExpBackbone(nn.Module):
         if (
             not envs.VLLM_TPU_MK_PLE_TRIM
             or emb.tp_size == 1
-            # Served VocabParallelEmbedding may lack these fields (AttributeError
-            # inside the whole-step trace disabled the MK): missing -> separate collectives.
-            or getattr(emb, "reduce_results", None) is not True
+            # The pinned vLLM's VocabParallelEmbedding has no `reduce_results` field
+            # (newer releases do): its forward always all-reduces, so a missing field
+            # means True. A direct read raised inside the whole-step trace (za8d).
+            or getattr(emb, "reduce_results", True) is not True
             or getattr(emb, "parallel_group", None) is not None
             or getattr(emb, "use_fused_embedding", False)
             or emb.weight.dtype != torch.bfloat16
