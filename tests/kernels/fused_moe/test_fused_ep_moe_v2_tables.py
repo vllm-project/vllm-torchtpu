@@ -450,22 +450,22 @@ def test_slab_scatter_set_builds_the_add_tables(
 
 
 @pytest.mark.parametrize(
-    "chip,by_set",
+    "chip,on_tensorcore",
     [
-        ("TPU_7X", False),  # SparseCore 2 x 16: XLA offloads the add
+        ("TPU_7X", False),  # SparseCore 2 x 16: XLA offloads the scatter-add
         ("TPU_8T", False),  # 2 x 16
         ("TPU_V6E", False),  # 2 x 16
         ("TPU_V5P", False),  # 4 x 16: four SparseCores, all full
-        ("TPU_8I", True),  # 1 x 4: the scatter stays on the TensorCore
+        ("TPU_8I", True),  # 1 x 4: the scatters stay on the TensorCore
         ("TPU_V5E", True),  # no SparseCore at all
     ],
 )
-def test_slab_scatter_form_follows_the_sparse_core(chip, by_set):
-    """Only a chip with at most 4 SparseCore subcores builds with the set."""
+def test_slab_tables_follow_the_sparse_core(chip, on_tensorcore):
+    """Only a chip with at most 4 SparseCore subcores builds on the TensorCore."""
     from jax.experimental.pallas import tpu as pltpu
 
     info = pltpu.get_tpu_info_for_chip(getattr(pltpu.ChipVersion, chip), 1)
-    assert host.slab_scatter_by_set(info) is by_set
+    assert host.slab_tables_on_tensorcore(info) is on_tensorcore
 
 
 @pytest.mark.parametrize(

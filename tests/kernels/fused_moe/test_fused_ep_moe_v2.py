@@ -510,7 +510,7 @@ def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
 def test_slab_scatter_set_and_add_are_bit_exact(monkeypatch, sharded_plan, shape):
     """The slab tables' scatter form changes how they are built, not the layer.
 
-    The chip picks the form (host.slab_scatter_by_set); forcing each one here
+    The chip picks the form (host.slab_tables_on_tensorcore); forcing each one here
     runs both on whatever chip this is, so the form this chip does NOT pick
     is checked as well. Both tables are held on their scatter paths, where
     the form applies, rather than the sort and the lookup the layer prefers.
@@ -535,7 +535,9 @@ def test_slab_scatter_set_and_add_are_bit_exact(monkeypatch, sharded_plan, shape
     )
     outs = []
     for by_set in (False, True):
-        monkeypatch.setattr(layer, "slab_scatter_by_set", lambda by_set=by_set: by_set)
+        monkeypatch.setattr(
+            layer, "slab_tables_on_tensorcore", lambda by_set=by_set: by_set
+        )
         outs.append(
             fused_ep_moe_v2(
                 x,
@@ -570,8 +572,10 @@ def test_scale_slab_lookup_and_scatter_are_bit_exact(monkeypatch, sharded_plan, 
     The lookup leaves token 0's scale on the ROWBLK padding rows where the
     scatter leaves zero; the kernel commits neither, so the output is the
     same bits. The scatter form is forced by declaring the scales too large
-    for SMEM.
+    for SMEM; the TensorCore builds are forced on, so the lookup runs on a
+    chip whose SparseCore would otherwise keep the scatter-add.
     """
+    monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
     mesh = _mesh()
     w1, w2, w1_scale, w2_scale = _make_weights(
         mesh,
@@ -622,8 +626,10 @@ def test_scale_slab_lookup_and_scatter_are_bit_exact(monkeypatch, sharded_plan, 
 def test_token_gather_sort_and_scatter_are_bit_exact(monkeypatch, sharded_plan, shape):
     """The token-gather table built by sort gives the layer the scatter's output.
 
-    The scatter form is forced by declaring the sort keys too wide for int32.
+    The scatter form is forced by declaring the sort keys too wide for int32;
+    the TensorCore builds are forced on, as in the lookup test.
     """
+    monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
     mesh = _mesh()
     w1, w2, w1_scale, w2_scale = _make_weights(
         mesh,

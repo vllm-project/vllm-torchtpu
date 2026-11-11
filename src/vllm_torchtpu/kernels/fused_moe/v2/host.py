@@ -1009,30 +1009,35 @@ def local_slab_rows(routing, me, *, shard_stride):
 
 
 # The most SparseCore vector subcores (SparseCores x subcores each) a chip
-# may have and still build the slab tables with a scatter-set rather than a
-# scatter-add. Both forms build the same table (see slab_scatter); which is
-# cheaper depends on where the compiler runs the scatter. With a full
-# SparseCore (v7x and TPU8t: 2 x 16) XLA offloads the scatter-add to it, where
-# it overlaps the activation all-gather, and keeps a scatter-set on the
-# TensorCore at about three times the cost. TPU8i's SparseCore is 1 x 4: XLA
-# offloads neither form, and on the TensorCore the set costs about half the
-# add, which reads each destination back first (1.74x at 16k tokens, 1.76x at
-# 1.5k, measured on TPU8i). A chip without a SparseCore has only the
-# TensorCore, so it takes the set too.
-SLAB_SCATTER_SET_MAX_SC_SUBCORES = 4
+# may have and still build the slab tables on the TensorCore. Where the
+# compiler offloads a scatter-add to a full SparseCore (v7x and TPU8t: 2 x 16;
+# v6e 2 x 16; v5p 4 x 16), both slab tables stay scatter-adds: the SparseCore
+# runs them async, beside the activation all-gather, and they cost the
+# TensorCore almost nothing. Every alternative is TensorCore work there: a
+# scatter-set (about 3x the add's wall), the scale-slab lookup kernel and the
+# token-gather sort (+0.36 ms a layer between them at 16k tokens, measured on
+# v7x, EP8). TPU8i's SparseCore is 1 x 4 and XLA offloads neither scatter form,
+# so both run on the TensorCore one element at a time (0.95 ms each at 16k);
+# there the token-gather table is a sort, the scale slab a lookup through it,
+# and any scatter left (past the sort's or the lookup's limits) a set, which
+# skips the add's read-back. A chip without a SparseCore has only the
+# TensorCore, so it takes the TensorCore builds too.
+TENSORCORE_TABLES_MAX_SC_SUBCORES = 4
 
 
-def slab_scatter_by_set(info=None):
-    """Whether this chip builds the slab tables with a scatter-set.
+def slab_tables_on_tensorcore(info=None):
+    """Whether this chip builds the slab tables on the TensorCore.
 
-    Read off the same device record the VMEM accounting reads, so the layer
-    answers it once per build and hands the answer to both slab scatters.
+    True selects the TensorCore builds (token-gather sort, scale-slab lookup,
+    scatter-set for any scatter left); False keeps both tables scatter-adds
+    for the SparseCore. Read off the same device record the VMEM accounting
+    reads, so the layer answers it once per build.
     """
     if info is None:
         info = pltpu.get_tpu_info()
     sc = info.sparse_core
     return sc is None or sc.num_cores * sc.num_subcores <= (
-        SLAB_SCATTER_SET_MAX_SC_SUBCORES
+        TENSORCORE_TABLES_MAX_SC_SUBCORES
     )
 
 
@@ -1041,7 +1046,7 @@ def slab_scatter(size, rows, values, *, by_set):
 
     Every live row receives at most one routed pair and the destination
     starts at zero, so the add and the set build the same bits, and `by_set`
-    picks whichever the chip builds faster (slab_scatter_by_set). They part
+    picks whichever the chip builds faster (slab_tables_on_tensorcore). They part
     only where pairs collide past the slab's last live row -- the rows
     local_slab_rows sends off-shard pairs to, which nothing reads -- where
     the add sums and the set keeps either pair.
@@ -1058,7 +1063,7 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None, by_set=False):
     `rows` is the destination slab row of each routed pair, which is derived
     here when the caller does not hold it already; passing it in keeps both
     slab scatters on one index. `by_set` is the scatter form, as
-    slab_scatter_by_set answers it for this chip.
+    slab_tables_on_tensorcore answers it for this chip.
 
     The scatter runs against this shard's slab alone rather than against the
     replicated ep-wide slab followed by a slice, which built seven eighths

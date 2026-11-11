@@ -51,7 +51,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     shard_token_gather_sorted,
     shard_transport_tables_in_blocks,
     slab_scatter,
-    slab_scatter_by_set,
+    slab_tables_on_tensorcore,
     token_gather_sort_fits,
     token_gather_window_rows,
     weight_form,
@@ -501,20 +501,27 @@ def fused_ep_moe_v2(
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
     )
-    # The scatter form of both slab tables, read off the same device record
-    # as the kernel's VMEM budget. The mesh in the cache key below already
-    # pins the chip; the form is in the key as well so a caller that forces
-    # it (a test, an A/B) never gets the other form's cached body.
-    slab_by_set = slab_scatter_by_set()
-    # Whether the activation-scale slab is a lookup through the token-gather
-    # table (build_act_scale_slab) rather than a scatter: wherever the rows
-    # are quantized and their per-token scales fit in SMEM. In the cache key
-    # for the same reason as the scatter form.
-    scale_by_lookup = bool(form.quantized_activations and scale_slab_fits(T))
-    # Whether the token-gather table is a sort of the routed pairs
-    # (shard_token_gather_sorted) rather than a scatter: wherever the sort
-    # keys fit in int32. In the cache key for the same reason.
-    gather_by_sort = bool(token_gather_sort_fits(T, topk, e_total=e_total, ep=ep))
+    # How the two slab tables are built, read off the same device record as
+    # the kernel's VMEM budget: on the TensorCore (a chip whose SparseCore
+    # does not take the scatter-add, see TENSORCORE_TABLES_MAX_SC_SUBCORES)
+    # the token-gather table is a sort and the scale slab a lookup, each
+    # where it fits, and any scatter left is a set; otherwise both tables
+    # stay scatter-adds for the SparseCore. The mesh in the cache key below
+    # already pins the chip; the three choices are in the key as well, so a
+    # caller that forces one (a test, an A/B) never gets another's body.
+    tables_on_tensorcore = slab_tables_on_tensorcore()
+    slab_by_set = tables_on_tensorcore
+    # The activation-scale slab by lookup through the token-gather table
+    # (build_act_scale_slab): where the rows are quantized and their
+    # per-token scales fit in SMEM.
+    scale_by_lookup = bool(
+        tables_on_tensorcore and form.quantized_activations and scale_slab_fits(T)
+    )
+    # The token-gather table by sort (shard_token_gather_sorted): where the
+    # sort keys fit in int32.
+    gather_by_sort = bool(
+        tables_on_tensorcore and token_gather_sort_fits(T, topk, e_total=e_total, ep=ep)
+    )
     logger.info_once(
         "fused_ep_moe_v2: token-gather table by %s, scale slab by %s; "
         "slab scatters (where left) by scatter-%s",
@@ -703,7 +710,7 @@ def fused_ep_moe_v2(
         # On a chip with a full SparseCore the two slab scatters and the
         # activation all-gather are offloaded to the SAME SparseCore, where
         # the slabs are built with an add (see
-        # SLAB_SCATTER_SET_MAX_SC_SUBCORES). Ordering the scatters behind the
+        # TENSORCORE_TABLES_MAX_SC_SUBCORES). Ordering the scatters behind the
         # collective enqueues it 129 us earlier and costs them the cover they
         # had; that trade measures +2.80% at 2048 local tokens and negative at
         # every smaller shape, so it is taken only where the routing plan in
