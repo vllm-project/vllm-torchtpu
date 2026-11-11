@@ -52,6 +52,15 @@ def test_other_models_keep_mains_arithmetic_and_code(arch):
     assert gmm_v2.RHS_STREAM is False
 
 
+def test_a_config_without_architectures_keeps_mains_arithmetic_and_code():
+    """A config that does not name its architectures (a stand-in such as the
+    patch registry's tests pass) is not a Qwen3.5 config."""
+    stand_in = SimpleNamespace(hf_config=SimpleNamespace(model_type="llama"))
+    assert hooks.apply_kernel_numerics(stand_in) is None
+    assert util.RECIPROCAL_SCALE is False
+    assert gmm_v2.RHS_STREAM is False
+
+
 def test_waits_for_a_model_config():
     assert hooks.apply_kernel_numerics(None) is False
     assert util.RECIPROCAL_SCALE is False

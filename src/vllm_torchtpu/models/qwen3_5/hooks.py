@@ -213,6 +213,15 @@ def _apply_kv_budget(vllm_config: VllmConfig) -> None:
         cache_config.kv_cache_memory_bytes = safe_kv
 
 
+def _is_qwen3_5_target(model_config) -> bool:
+    """``settings.is_qwen3_5`` for a config that names its architectures. A
+    config without the attribute (the stand-ins callers hand the patch
+    registry) is not a Qwen3.5 target and gets main's behaviour."""
+    if getattr(model_config, "architectures", None) is None:
+        return False
+    return settings.is_qwen3_5(model_config)
+
+
 def apply_kernel_numerics(model_config) -> bool | None:
     """Qwen3.5's kernel numerics and code paths, in every process that loads it.
 
@@ -226,7 +235,7 @@ def apply_kernel_numerics(model_config) -> bool | None:
     """
     if model_config is None:
         return False
-    if settings.is_qwen3_5(model_config):
+    if _is_qwen3_5_target(model_config):
         from vllm_torchtpu.kernels.megablox import gmm_v2
         from vllm_torchtpu.kernels.quantized_matmul import util
 
