@@ -257,4 +257,4 @@ def test_v41_block_size_default(monkeypatch, caplog, impl, user_block, expected,
     with caplog.at_level("WARNING"):
         tpu_platform.TpuPlatform.update_block_size_for_backend(vllm_config)
     assert cache_config.block_size == expected
-    assert ("no block-outer packing" in caplog.text) is warns
+    assert ("packs fewer SWA layers" in caplog.text) is warns
