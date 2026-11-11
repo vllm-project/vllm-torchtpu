@@ -27,6 +27,8 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu import envs
+
 
 class MtpDraftModel(Protocol):
     """What the loop calls on the MTP draft. The draft is an nn.Module, but
@@ -69,7 +71,7 @@ class _MtpFusedLoop(nn.Module):
         inner = getattr(self.mtp, "model", None)
         mk_step = (
             getattr(self.mtp, "mk_draft_step", None)
-            if getattr(inner, "mk_draft", None) is not None
+            if getattr(inner, "mk_draft", None) is not None and envs.VLLM_TPU_MK_DRAFT_LOOP
             else None
         )
         for i in range(self.num_steps):
