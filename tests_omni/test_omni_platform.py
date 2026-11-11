@@ -966,16 +966,26 @@ def _non_ring_reference_bshd(q, k, v, scale):
 
 
 _HOST_DEVICE_COUNT_FLAG = "--xla_force_host_platform_device_count"
+# Tests whose cases share one CPU-only child pytest run.
+_CPU_CHILD_TESTS = (
+    "test_ring_flash_attention_bhsd_matches_non_ring",
+    "test_ring_ulysses_2d_matches_non_ring_reference",
+)
+_cpu_child_run: subprocess.CompletedProcess[str] | None = None
 
 
 def _cpu_devices_or_rerun(request, count):
-    """Returns ``count`` JAX CPU devices, or None once a child run passed.
+    """Returns ``count`` JAX CPU devices, or None once the child run passed.
 
     XLA reads the host device count only when JAX starts, so this process
-    cannot raise it after the fact. With too few CPU devices, the test is
-    rerun in a child process whose XLA_FLAGS set it (and whose JAX uses CPU
-    only); the env of this process is not changed.
+    cannot raise it after the fact. With too few CPU devices, every case of
+    ``_CPU_CHILD_TESTS`` runs once in a single child pytest whose JAX uses 8
+    CPU devices only; each case here then checks that its own copy passed.
+    The child skips conftest.py (``--noconftest``): its autouse fixtures would
+    open the TPU this process already holds. The env of this process is not
+    changed.
     """
+    global _cpu_child_run
     import jax
 
     devices = jax.devices("cpu")
@@ -987,29 +997,37 @@ def _cpu_devices_or_rerun(request, count):
         and _HOST_DEVICE_COUNT_FLAG in xla_flags
     ):
         pytest.skip(f"Requires {count} CPU devices")
-    kept = [t for t in xla_flags.split() if not t.startswith(_HOST_DEVICE_COUNT_FLAG)]
-    env = {
-        **os.environ,
-        "JAX_PLATFORMS": "cpu",
-        "XLA_FLAGS": " ".join([*kept, f"{_HOST_DEVICE_COUNT_FLAG}=8"]),
-    }
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            f"{request.node.path}::{request.node.name}",
-        ],
-        cwd=request.config.rootpath,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert proc.returncode == 0 and "1 passed" in proc.stdout, (
+    if _cpu_child_run is None:
+        kept = [
+            t for t in xla_flags.split() if not t.startswith(_HOST_DEVICE_COUNT_FLAG)
+        ]
+        env = {
+            **os.environ,
+            "JAX_PLATFORMS": "cpu",
+            "XLA_FLAGS": " ".join([*kept, f"{_HOST_DEVICE_COUNT_FLAG}=8"]),
+        }
+        _cpu_child_run = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--noconftest",
+                "-p",
+                "no:cacheprovider",
+                "-q",
+                "-rA",
+                str(request.node.path),
+                "-k",
+                " or ".join(_CPU_CHILD_TESTS),
+            ],
+            cwd=request.config.rootpath,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    proc = _cpu_child_run
+    assert proc.returncode == 0 and f"PASSED {request.node.nodeid}" in proc.stdout, (
         f"{proc.stdout}\n{proc.stderr}"
     )
     return None
@@ -1412,23 +1430,67 @@ def test_ring_attention_patch_and_dispatch(monkeypatch):
     assert out_ring.shape == q.shape
     assert calls == [(1, 2, 2, False, 0.25)]
 
-    # 3. Fallbacks: causal=True, float32, attn_mask, joint_query, or SDPA pref.
-    # Each one logs why it left the TPU ring kernel.
+    # 3. Calls that do not fit the TPU ring kernel (causal=True, float32,
+    # attn_mask, joint_query, or SDPA pref) raise at ring_world_size > 1: the
+    # vLLM-Omni P2P ring fallback is not supported on TPU.
     calls.clear()
     with patch.object(patches.logger, "warning_once") as mock_warn:
-        assert runner.run_attention(q, k, v, causal=True) == "native_ring"
-        assert runner.run_attention(q.float(), k.float(), v.float()) == "native_ring"
+        with pytest.raises(NotImplementedError, match="causal=True"):
+            runner.run_attention(q, k, v, causal=True)
+        with pytest.raises(NotImplementedError, match="dtype=torch.float32"):
+            runner.run_attention(q.float(), k.float(), v.float())
         masked_meta = SimpleNamespace(attn_mask=torch.ones(1, 16, dtype=torch.bool))
-        assert runner.run_attention(q, k, v, attn_metadata=masked_meta) == "native_ring"
+        with pytest.raises(NotImplementedError, match="metadata=SimpleNamespace"):
+            runner.run_attention(q, k, v, attn_metadata=masked_meta)
+        # joint_meta: the fused path logs why it cannot fuse Ulysses, then the
+        # 1-D ring runner raises.
         joint_meta = SimpleNamespace(joint_query=q, extra={})
-        assert layer._forward_impl(q, k, v, attn_metadata=joint_meta) == "native_ring"
+        with pytest.raises(NotImplementedError, match="not supported on TPU"):
+            layer._forward_impl(q, k, v, attn_metadata=joint_meta)
         sdpa_runner = RingParallelAttention(sp_group, attn_backend_pref="TPU_SDPA")
-        assert sdpa_runner.run_attention(q, k, v) == "native_ring"
+        with pytest.raises(NotImplementedError, match="attn_backend_pref="):
+            sdpa_runner.run_attention(q, k, v)
     assert calls == []
     warned = [str(c.args[0]) for c in mock_warn.call_args_list]
-    # joint_meta logs twice: the fused path, then the 1-D ring runner.
-    assert sum("does not fit the TPU Pallas ring kernel" in w for w in warned) == 5
+    assert not any("does not fit the TPU Pallas ring kernel" in w for w in warned)
     assert sum("cannot fuse Ulysses" in w for w in warned) == 1
+
+    # 3b. With ring_world_size == 1 a call that does not fit the kernel still
+    # logs once and runs upstream (no P2P ring exchange happens).
+    single_runner = RingParallelAttention(
+        SimpleNamespace(ring_world_size=1, ulysses_world_size=2),
+        attn_backend_pref="TPU_FLASH_ATTN",
+    )
+    with patch.object(patches.logger, "warning_once") as mock_warn:
+        assert single_runner.run_attention(q, k, v, causal=True) == "native_ring"
+    assert calls == []
+    warned = [str(c.args[0]) for c in mock_warn.call_args_list]
+    assert sum("does not fit the TPU Pallas ring kernel" in w for w in warned) == 1
+
+    # 3c. Pure ring (ulysses_world_size == 1): the ring runner is the TPU kernel
+    # path, so no "cannot fuse Ulysses" warning, whatever the strategy name.
+    pure_runner = RingParallelAttention(
+        SimpleNamespace(ring_world_size=2, ulysses_world_size=1),
+        attn_backend_pref="TPU_FLASH_ATTN",
+    )
+    with patch.object(patches.logger, "warning_once") as mock_warn:
+        for pure_strategy in (strategy, SimpleNamespace(name="ring")):
+            pure_layer = _make_ring_attention_layer(
+                ring_runner=pure_runner,
+                strategy=pure_strategy,
+                softmax_scale=0.125,
+            )
+            monkeypatch.setattr(
+                pure_layer,
+                "_get_active_parallel_strategy",
+                lambda pure_layer=pure_layer: pure_layer.parallel_strategy,
+            )
+            monkeypatch.setattr(pure_layer, "is_paged_kv_active", lambda: False)
+            assert pure_layer._forward_impl(q, k, v).shape == q.shape
+    assert calls == [(1, 2, 1, False, 0.125)] * 2
+    warned = [str(c.args[0]) for c in mock_warn.call_args_list]
+    assert not any("cannot fuse Ulysses" in w for w in warned)
+    calls.clear()
 
     # 4. Non-divisible GQA heads raise ValueError in tpu_ring_flash_attention.
     with pytest.raises(ValueError, match="num_heads"):
