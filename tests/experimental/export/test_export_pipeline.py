@@ -959,37 +959,21 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
         num_layers=2,
         mrope_section=[4, 6, 6],
     ).to(torch.bfloat16)
-    vllm_cfg = SimpleNamespace(
-        model_config=SimpleNamespace(
-            model=str(hf_dir),
-            dtype="bfloat16",
-            max_model_len=128,
-            hf_config=SimpleNamespace(
-                vocab_size=64,
-                hidden_size=32,
-                num_hidden_layers=2,
-                num_attention_heads=2,
-                num_key_value_heads=2,
-                head_dim=16,
-                eos_token_id=[2, 0],
-                architectures=["Qwen2_5_VLForConditionalGeneration"],
-            ),
-        ),
-        cache_config=SimpleNamespace(block_size=8, num_gpu_blocks=16),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=1,
-            data_parallel_size=1,
-            pipeline_parallel_size=1,
-            use_sequence_parallel_moe=False,
-            is_moe_model=False,
-        ),
-        compilation_config=SimpleNamespace(
-            compile_sizes=[8, 16],
-            fast_moe_cold_start=False,
-            static_forward_context={},
-        ),
+    vllm_cfg = _mock_vllm_config(
+        str(hf_dir),
+        max_model_len=128,
+        block_size=8,
+        num_gpu_blocks=16,
+        compile_sizes=[8, 16],
     )
+    vllm_cfg.model_config.hf_config = SimpleNamespace(
+        num_attention_heads=2,
+        eos_token_id=[2, 0],
+        architectures=["Qwen2_5_VLForConditionalGeneration"],
+    )
+    vllm_cfg.parallel_config.use_sequence_parallel_moe = False
+    vllm_cfg.parallel_config.is_moe_model = False
+    vllm_cfg.compilation_config.fast_moe_cold_start = False
 
     out_dir = str(tmp_path / "exported_mrope")
     args = cli.parse_args(
@@ -1030,14 +1014,116 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
     assert not os.path.exists(os.path.join(out_dir, "serving_checkpoint"))
 
 
+def _mock_vllm_config(
+    model: str,
+    *,
+    max_model_len: int = 2048,
+    max_num_seqs: int = 8,
+    block_size: int = 16,
+    num_gpu_blocks: int | None = None,
+    compile_sizes: list[int] | None = None,
+    static_forward_context: dict[str, Any] | None = None,
+    speculative_config: Any = None,
+    **model_config_fields: Any,
+) -> Any:
+    """A `VllmConfig` stand-in with every field the export reads."""
+    hf_config = SimpleNamespace(num_attention_heads=2, eos_token_id=2)
+    model_config = SimpleNamespace(
+        model=model,
+        dtype="bfloat16",
+        max_model_len=max_model_len,
+        hf_config=hf_config,
+        hf_text_config=hf_config,
+        get_vocab_size=lambda: 64,
+        get_hidden_size=lambda: 32,
+        get_total_num_hidden_layers=lambda: 2,
+        get_total_num_kv_heads=lambda: 2,
+        get_head_size=lambda: 16,
+        uses_mrope=False,
+        try_get_generation_config=dict,
+    )
+    vars(model_config).update(model_config_fields)
+    return SimpleNamespace(
+        model_config=model_config,
+        cache_config=SimpleNamespace(
+            block_size=block_size,
+            num_gpu_blocks=num_gpu_blocks,
+            num_gpu_blocks_override=None,
+            kv_cache_memory_bytes=None,
+            gpu_memory_utilization=0.9,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        compilation_config=SimpleNamespace(
+            compile_sizes=compile_sizes,
+            static_forward_context=static_forward_context or {},
+        ),
+        speculative_config=speculative_config,
+    )
+
+
+def test_build_export_config_requires_every_vllm_config_field(
+    tmp_path: Path,
+) -> None:
+    build = universal_adapter.build_export_config_from_vllm
+    cfg = build(_mock_vllm_config(str(tmp_path)))
+    assert (cfg.vocab_size, cfg.hidden_size, cfg.num_layers) == (64, 32, 2)
+    assert (cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim) == (2, 2, 16)
+    assert (cfg.max_num_seqs, cfg.max_model_len, cfg.eos_token_id) == (8, 2048, 2)
+    # A field vLLM renames or drops fails the export instead of taking a default.
+    for section, field in (
+        ("model_config", "max_model_len"),
+        ("model_config", "get_vocab_size"),
+        ("cache_config", "block_size"),
+        ("scheduler_config", "max_num_seqs"),
+        ("parallel_config", "decode_context_parallel_size"),
+        ("compilation_config", "compile_sizes"),
+    ):
+        vllm_config = _mock_vllm_config(str(tmp_path))
+        delattr(getattr(vllm_config, section), field)
+        with pytest.raises(AttributeError, match=field):
+            build(vllm_config)
+
+
+def test_build_export_config_sizes_an_unprofiled_kv_pool(tmp_path: Path) -> None:
+    build = universal_adapter.build_export_config_from_vllm
+    assert build(_mock_vllm_config(str(tmp_path))).num_blocks == 512
+    assert build(_mock_vllm_config(str(tmp_path), num_gpu_blocks=40)).num_blocks == 40
+    vllm_config = _mock_vllm_config(str(tmp_path))
+    vllm_config.cache_config.num_gpu_blocks_override = 24
+    assert build(vllm_config).num_blocks == 24
+
+
+def test_build_export_config_reads_eos_from_the_generation_config(
+    tmp_path: Path,
+) -> None:
+    build = universal_adapter.build_export_config_from_vllm
+    no_eos = SimpleNamespace(num_attention_heads=2, eos_token_id=None)
+    vllm_config = _mock_vllm_config(
+        str(tmp_path),
+        hf_config=no_eos,
+        hf_text_config=no_eos,
+        try_get_generation_config=lambda: {"eos_token_id": [200020, 200021]},
+    )
+    assert build(vllm_config).eos_token_id == 200020
+    vllm_config.model_config.try_get_generation_config = dict
+    with pytest.raises(ValueError, match="declares eos_token_id"):
+        build(vllm_config)
+
+
 def test_build_export_config_raises_block_size_to_fit_smem(tmp_path: Path) -> None:
     def cfg(max_num_seqs: int, max_model_len: int, block_size: int = 16) -> Any:
-        return SimpleNamespace(
-            model_config=SimpleNamespace(
-                model=str(tmp_path), dtype="bfloat16", max_model_len=max_model_len
-            ),
-            cache_config=SimpleNamespace(block_size=block_size),
-            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        return _mock_vllm_config(
+            str(tmp_path),
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+            block_size=block_size,
         )
 
     build = universal_adapter.build_export_config_from_vllm
@@ -1060,30 +1146,23 @@ def test_build_export_config_reads_model_shape_from_vllm_model_config(
 
     class PerLayerHfConfig:
         num_attention_heads = 32
-        hidden_size = 5376
-        vocab_size = 262144
+        eos_token_id = 1
 
         def __getattr__(self, name: str) -> Any:
             if name in ("num_key_value_heads", "head_dim"):
                 raise AmbiguousPerLayerAttributeError(f"{name!r} is per layer")
             raise AttributeError(name)
 
-    model_config = SimpleNamespace(
-        model=str(tmp_path),
-        dtype="bfloat16",
-        max_model_len=2048,
-        hf_config=PerLayerHfConfig(),
-        get_total_num_kv_heads=lambda: 4,
-        get_head_size=lambda: 512,
-        get_total_num_hidden_layers=lambda: 60,
-        get_vocab_size=lambda: 262144,
-        get_hidden_size=lambda: 5376,
-    )
     cfg = universal_adapter.build_export_config_from_vllm(
-        SimpleNamespace(
-            model_config=model_config,
-            cache_config=SimpleNamespace(block_size=16),
-            scheduler_config=SimpleNamespace(max_num_seqs=8),
+        _mock_vllm_config(
+            str(tmp_path),
+            hf_config=PerLayerHfConfig(),
+            hf_text_config=PerLayerHfConfig(),
+            get_total_num_kv_heads=lambda: 4,
+            get_head_size=lambda: 512,
+            get_total_num_hidden_layers=lambda: 60,
+            get_vocab_size=lambda: 262144,
+            get_hidden_size=lambda: 5376,
         )
     )
 
@@ -1109,15 +1188,12 @@ def test_build_export_config_pages_kv_at_the_attention_kernels_block_size(
     attn.attn_backend = RpaBackend
 
     def cfg(block_size: int) -> Any:
-        return SimpleNamespace(
-            model_config=SimpleNamespace(
-                model=str(tmp_path), dtype="bfloat16", max_model_len=2048
-            ),
-            cache_config=SimpleNamespace(block_size=block_size, num_gpu_blocks=100),
-            scheduler_config=SimpleNamespace(max_num_seqs=64),
-            compilation_config=SimpleNamespace(
-                static_forward_context={"layers.3.self_attn.attn": attn}
-            ),
+        return _mock_vllm_config(
+            str(tmp_path),
+            max_num_seqs=64,
+            block_size=block_size,
+            num_gpu_blocks=100,
+            static_forward_context={"layers.3.self_attn.attn": attn},
         )
 
     build = universal_adapter.build_export_config_from_vllm
@@ -1141,12 +1217,10 @@ def test_build_export_config_req_buckets_cover_speculative_verify_rows(
             if num_speculative_tokens is None
             else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
         )
-        return SimpleNamespace(
-            model_config=SimpleNamespace(
-                model=str(tmp_path), dtype="bfloat16", max_model_len=128
-            ),
-            cache_config=SimpleNamespace(block_size=16),
-            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        return _mock_vllm_config(
+            str(tmp_path),
+            max_model_len=128,
+            max_num_seqs=max_num_seqs,
             speculative_config=spec,
         )
 
@@ -1347,12 +1421,9 @@ def test_max_verify_tokens_loads_vllm_with_a_drafterless_speculative_config(
     assert cli.export_speculative_config(spec) == spec
     # The artifact declares none, and its forced verify rows skip the LM head, so
     # the request buckets cover one row per request.
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            model=str(tmp_path), dtype="bfloat16", max_model_len=128
-        ),
-        cache_config=SimpleNamespace(block_size=16),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
+    vllm_config = _mock_vllm_config(
+        str(tmp_path),
+        max_model_len=128,
         speculative_config=SimpleNamespace(num_speculative_tokens=3),
     )
     cfg = universal_adapter.build_export_config_from_vllm(
@@ -1375,7 +1446,9 @@ def test_max_verify_tokens_loads_vllm_with_a_drafterless_speculative_config(
         num_speculative_tokens=2,
     )
     assert cfg.req_buckets == (8, 16, 24)
-    args = SimpleNamespace(speculative_config=mtp, max_verify_tokens=2)
+    args = SimpleNamespace(
+        speculative_config=mtp, tensor_parallel_size=1, max_verify_tokens=2
+    )
     with pytest.raises(ValueError, match="must exceed"):
         cli.run_export_from_args(args, vllm_config=vllm_config)
 
@@ -1572,18 +1645,12 @@ def test_chat_template_is_written_and_declared_like_huggingface_finds_it(
 
 
 def _parallel_vllm_cfg(tmp_path: Path, tp: int, dp: int, pp: int) -> Any:
-    return SimpleNamespace(
-        model_config=SimpleNamespace(
-            model=str(tmp_path), dtype="bfloat16", max_model_len=128
-        ),
-        cache_config=SimpleNamespace(block_size=16),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=tp,
-            data_parallel_size=dp,
-            pipeline_parallel_size=pp,
-        ),
-    )
+    vllm_config = _mock_vllm_config(str(tmp_path), max_model_len=128)
+    parallel_config = vllm_config.parallel_config
+    parallel_config.tensor_parallel_size = tp
+    parallel_config.data_parallel_size = dp
+    parallel_config.pipeline_parallel_size = pp
+    return vllm_config
 
 
 @pytest.mark.parametrize(("dp", "pp"), [(2, 1), (1, 2)])

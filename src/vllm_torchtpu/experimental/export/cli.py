@@ -288,7 +288,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     # `vllm serve MODEL`: the positional model tag names the model, as in vLLM.
     if getattr(args, "model_tag", None):
         args.model = args.model_tag
-    if not getattr(args, "export_worker", False):
+    if not args.export_worker:
         ignored = ignored_frontend_args(parser, args)
         if ignored:
             sys.stderr.write(
@@ -459,10 +459,11 @@ def run_export_from_args(
 ) -> api.TextOnlyLLMExportConfig:
     """Executes the AOT model export given parsed CLI arguments."""
     speculative_config = export_speculative_config(
+        # Defined only by vLLM's serve parser, not `build_arg_parser`'s fallback.
         getattr(args, "speculative_config", None),
-        tensor_parallel_size=int(getattr(args, "tensor_parallel_size", 1) or 1),
+        tensor_parallel_size=args.tensor_parallel_size,
     )
-    max_verify_tokens = int(getattr(args, "max_verify_tokens", 0) or 0)
+    max_verify_tokens = args.max_verify_tokens
     if max_verify_tokens < 0:
         raise ValueError(f"--max-verify-tokens must be >= 0, got {max_verify_tokens}")
     drafted = 0
@@ -490,13 +491,13 @@ def run_export_from_args(
     if vllm_config is not None:
         universal_adapter.check_supported_parallelism(vllm_config.parallel_config)
     # Load before building the export config: loading finalizes the KV block size.
-    export_mode = getattr(args, "export_mode", "model")
+    export_mode = args.export_mode
     if export_mode == "all":
         # Before any JAX use: the Pallas kernels the model loads with use JAX.
         checkpoint.init_jax(
             int(os.environ.get("RANK", 0)),
             int(os.environ.get("WORLD_SIZE", 1)),
-            getattr(args, "jax_coordinator", None),
+            args.jax_coordinator,
         )
     loaded_on_device = model is None
     if loaded_on_device:
@@ -504,23 +505,23 @@ def run_export_from_args(
             vllm_config, load_format="auto" if export_mode == "all" else "dummy"
         )
 
-    token_buckets = _parse_int_list(getattr(args, "token_buckets", None))
-    req_buckets = _parse_int_list(getattr(args, "req_buckets", None))
-    target_tpu = getattr(args, "target_tpu", None)
+    token_buckets = _parse_int_list(args.token_buckets)
+    req_buckets = _parse_int_list(args.req_buckets)
 
     export_cfg = universal_adapter.build_export_config_from_vllm(
         vllm_config,
+        # Defined only by vLLM's serve parser, not `build_arg_parser`'s fallback.
         model_name=artifact_model_name(
-            getattr(args, "model", None), getattr(args, "served_model_name", None)
+            args.model, getattr(args, "served_model_name", None)
         ),
-        hf_checkpoint_dir=getattr(args, "model", None),
-        target_tpu=target_tpu,
+        hf_checkpoint_dir=args.model,
+        target_tpu=args.target_tpu,
         token_buckets=token_buckets,
         req_buckets=req_buckets,
         max_verify_tokens=max_verify_tokens,
         num_speculative_tokens=drafted,
     )
-    num_blocks_override = getattr(args, "num_blocks", None)
+    num_blocks_override = args.num_blocks
     if num_blocks_override is not None:
         export_cfg = dataclasses.replace(
             export_cfg, num_blocks=int(num_blocks_override)
@@ -539,7 +540,7 @@ def run_export_from_args(
             vllm_config=vllm_config,
         )
         cache_cfg = vllm_config.cache_config
-        kv_cache_memory_bytes = getattr(cache_cfg, "kv_cache_memory_bytes", None)
+        kv_cache_memory_bytes = cache_cfg.kv_cache_memory_bytes
         if (
             (loaded_on_device or kv_cache_memory_bytes)
             and num_blocks_override is None
@@ -554,13 +555,13 @@ def run_export_from_args(
         if export_mode == "all"
         else None
     )
-    debug_taps = [p for p in (getattr(args, "debug_taps", "") or "").split(",") if p]
+    debug_taps = [p for p in args.debug_taps.split(",") if p]
     exporter.export(exportable, args.output_dir, debug_taps=debug_taps)
     if weights is not None:
         checkpoint.save_model_checkpoint(
             weights,
             args.output_dir,
-            getattr(args, "checkpoint_data_dir", None)
+            args.checkpoint_data_dir
             or os.path.join(args.output_dir, checkpoint.CHECKPOINT_DATA_DIR),
         )
     return exportable.export_config
@@ -672,7 +673,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.export_worker:
         run_export_from_args(args)
         return 0
-    tp_size = int(getattr(args, "tensor_parallel_size", 1) or 1)
+    tp_size = args.tensor_parallel_size
     _launch_workers(
         argv, tp_size, args.output_dir, save_checkpoint=args.export_mode == "all"
     )

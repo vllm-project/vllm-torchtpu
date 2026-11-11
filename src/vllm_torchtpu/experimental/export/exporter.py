@@ -228,7 +228,7 @@ def _option_value(text: str) -> bool | int | float | str:
 
 def _axis_sizes(cfg: api.TextOnlyLLMExportConfig) -> dict[str, int]:
     """Size of each mesh axis, keyed by `_AXIS_NAMES`."""
-    dp_size = int(getattr(cfg, "data_parallel_size", 1) or 1)
+    dp_size = cfg.data_parallel_size
     return {"data": dp_size, "model": cfg.tensor_parallel_size}
 
 
@@ -442,9 +442,7 @@ def _user_inputs(
     block_tables_name: str = "block_tables",
 ) -> list[tuple[str, tuple[int, ...]]]:
     """Returns `(name, shape)` of the int32 user inputs of `forward_bucket{B}`."""
-    pos_shape = (
-        (3, bucket_size) if getattr(cfg, "uses_mrope", False) else (bucket_size,)
-    )
+    pos_shape = (3, bucket_size) if cfg.uses_mrope else (bucket_size,)
     shapes = (
         (bucket_size,),
         pos_shape,
@@ -1447,8 +1445,8 @@ def export(
         taps = _DebugTaps(forward_taps, draft_taps, output_dir)
 
     tp_size = cfg.tensor_parallel_size
-    dp_size = int(getattr(cfg, "data_parallel_size", 1) or 1)
-    pp_size = int(getattr(cfg, "pipeline_parallel_size", 1) or 1)
+    dp_size = cfg.data_parallel_size
+    pp_size = cfg.pipeline_parallel_size
     all_params = model.abstract_params()
     if cfg.speculative_config:
         # Verify rows are some of a step's tokens.

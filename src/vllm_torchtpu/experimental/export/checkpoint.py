@@ -384,7 +384,7 @@ def run_cpu_load_worker(args: argparse.Namespace) -> None:
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    init_jax(rank, world_size, getattr(args, "jax_coordinator", None))
+    init_jax(rank, world_size, args.jax_coordinator)
 
     vllm_config = universal_adapter.create_export_vllm_config(args)
     # vLLM runs on its CPU platform here, which skips the TPU platform's patches;
