@@ -132,28 +132,24 @@ class GDNConfig:
 
     @property
     def triangular_block_size(self) -> int:
-        """Sub-block size of the chunked KDA intra-chunk solve.
-
-        The diagonal sub-blocks are evaluated on the VPU/XLU with exact
-        pairwise gate differences and the off-diagonal ones as MXU GEMMs,
-        so this trades the two units off against each other: raising it
-        moves work from MXU to XLU. More value heads already means more
-        XLU work, hence the smaller blocks there.
-        """
+        """Diagonal block size B for the chunked triangular solve / inverse."""
         # Within-block forward substitution issues head_groups * B / 2 broadcasts
         # per token. At 1 head group (<= 8 heads), B = 16 is optimal.
-        # - GDN issues O(1 / B) between-block solver matmuls per token, so scale
-        #   B inversely with head_groups (head_groups * B <= 16).
-        # - KDA also tiles Aqk and L into O(1 / B^2) sub-block matmuls per token,
-        #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
+        # - KDA (`chunked_kda_per_seq`) also tiles Aqk and L into O(1 / B^2)
+        #   sub-block matmuls per token, so scale B^2 inversely with head_groups
+        #   (head_groups * B**2 <= 16**2).
+        # - GDN (`solve_triangular_rhs`) updates the whole [B, n] block per
+        #   substitution step, so a block narrower than one 8-sublane tile costs
+        #   the same VALU work as B = 8 while issuing more between-block matmuls
+        #   and padding every solved block to 8 sublanes in VMEM. B = 8 is the
+        #   floor; B = 16 only pays when a single head group leaves VALU idle.
         head_groups = pl.cdiv(self.num_v_heads, 8)
         if self.is_kda:
             for b in (16, 8, 4):
                 if head_groups * b * b <= 256:
                     return b
             return 2
-        # GDN: between-block updates scale as 1 / B.
-        return max(2, min(16, 16 // head_groups))
+        return 16 if head_groups <= 1 else 8
 
     @property
     def use_recurrent(self) -> bool:
