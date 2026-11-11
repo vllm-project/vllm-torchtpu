@@ -983,12 +983,16 @@ class Eagle3Proposer:
         if self._mk_draft_step0 is None:
             from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mk_draft_step0
 
+            # The compile wrapper takes its backend (and so its compile sizes) from the
+            # current config at construction: it must be the MK config, or the step-0
+            # program is built at every stock size up to max_num_batched_tokens
+            # (za9j j-d4040629: draft kernel at 3072 rows, VMEM 678 MiB, warmup hang).
             with (
                 set_model_tag("eagle_head"),
                 set_vllm_model_wrapper_context(
-                    mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+                    mesh=self.runner.mesh, vllm_config=self._mk_step0_cfg
                 ),
-                set_current_vllm_config(self.draft_vllm_config),
+                set_current_vllm_config(self._mk_step0_cfg),
             ):
                 self._mk_draft_step0 = build_mk_draft_step0(
                     vllm_config=self._mk_step0_cfg,
