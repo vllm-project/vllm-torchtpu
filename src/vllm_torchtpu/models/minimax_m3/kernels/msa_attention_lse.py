@@ -30,7 +30,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 
 # Page counts a kernel step may run at besides the full group (`_kernel`).
-_STEP_WIDTHS = (4, 8)
+_STEP_WIDTHS = (4, 8, 16)
 # Tiles per grid step: a step runs the groups of this many tiles in a loop.
 # One step per group paid a per-step cost worth ~2-3% of the call (pool48
 # selections, 1-2 groups a tile; bench j-caec1354).

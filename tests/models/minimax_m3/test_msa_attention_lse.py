@@ -92,6 +92,7 @@ def _check(got, want):
     [
         (37, 35, 16, None, False, 16),  # last tile part padding
         (24, 24, 8, None, False, 16),  # 8-token tiles
+        (24, 24, 8, None, False, 32),  # 8-token tiles, the DCP decode group size
         (150, 140, 16, 64, False, 16),  # several kernel calls (the chunk loop)
         (150, 140, 16, 64, True, 16),  # the prefill (sorted) work list
         (150, 140, 16, 64, True, 5),  # groups per tile padded to a power of two

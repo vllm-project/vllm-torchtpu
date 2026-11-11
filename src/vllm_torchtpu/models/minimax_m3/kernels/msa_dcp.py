@@ -71,6 +71,12 @@ _MIN_CANDIDATE_TOKENS = 1024
 # 108.4 -> 116.7 ms per step, c64 DCP8 b57 147.8 -> 191.1 ms; j-82660a13 vs
 # j-8a29ceb0, j-c0fd0e40 vs j-11d1908c).
 DCP_SMALL_BATCH_TOKENS = 128
+# Pages per kernel step of those 8-token tiles: a tile's 128 query rows keep
+# a 32-page score tile the size of a 16-token tile's 16-page one, and a
+# twin decode tile's union spans ~4 groups of 16 pages (c16 b6: ~1.25 us per
+# group, ~0.75 us of it the step's attend body; AOT: 32 pages ~3,000 bundles
+# vs 2 x ~1,700 for two 16-page steps).
+_SMALL_BATCH_PAGES_PER_STEP = 32
 
 
 def rank_array(rank: int | jax.Array) -> jax.Array:
@@ -836,14 +842,19 @@ def msa_attend_dcp(
     # this rank holds, as `msa.sparse_attention`; [T, G, topk].
     mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
     keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
+    small = num_tokens <= DCP_SMALL_BATCH_TOKENS
     common = dict(
         sm_scale=sm_scale,
         block_q=(
             msa_attention.SMALL_BATCH_BLOCK_Q
-            if num_tokens <= DCP_SMALL_BATCH_TOKENS
+            if small
             else msa_attention.DEFAULT_BLOCK_Q
         ),
-        pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+        pages_per_step=(
+            _SMALL_BATCH_PAGES_PER_STEP
+            if small
+            else msa_attention.DEFAULT_PAGES_PER_STEP
+        ),
         interpret=interpret,
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
