@@ -222,9 +222,12 @@ def test_no_forced_embedding_sharing():
 
 
 class _FakeBackbone:
-    def __call__(self, input_ids, positions):
+    def __call__(self, input_ids, positions, input_embeds=None):
         rows = torch.arange(input_ids.shape[0], dtype=torch.float32)
         return torch.stack([rows, torch.zeros_like(rows)], dim=1)
+
+    def embed_input_ids(self, input_ids):
+        return torch.stack([input_ids.float(), -input_ids.float()], dim=1)
 
 
 class _FakeDraft:
@@ -291,6 +294,17 @@ def test_draft_step_scores_each_slot_from_its_hidden_and_previous_token():
     assert drafts.tolist() == [[1, 2, 3], [4, 5, 6]]
     # Slot 0 follows the anchor, each later slot the token drafted before it.
     assert confidence.tolist() == [[5, 101, 202], [309, 404, 505]]
+
+
+@pytest.mark.parametrize("num_reqs,tail", [(1, 0), (3, 1), (73, 1)])
+def test_block_input_embeds_equal_looking_up_every_row(num_reqs, tail):
+    p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
+    p.draft_model = _FakeDraft()
+    block = 7
+    input_ids = torch.full((num_reqs * block + tail,), p.mask_token_id)
+    input_ids[: num_reqs * block : block] = torch.arange(num_reqs) + 100
+    expected = p.draft_model.model.embed_input_ids(input_ids)
+    assert torch.equal(p._block_input_embeds(input_ids, block), expected)
 
 
 def test_proposal_confidences_are_taken_once():

@@ -175,6 +175,28 @@ class DSparkProposer(DFlashProposer):
         confidences, self._draft_confidences = self._draft_confidences, None
         return confidences
 
+    def _block_input_embeds(
+        self, input_ids: torch.Tensor, block_size: int
+    ) -> torch.Tensor:
+        """``embed_input_ids(input_ids)`` for the draft layout
+        (`_layout_draft_block`): ``[anchor, MASK x (block_size - 1)]`` per
+        request, MASK past the last whole block. Looks up the anchors and one
+        MASK only: a vocab-parallel embedding gathers and all-reduces every
+        row it looks up, here 1 in block_size."""
+        assert self.draft_model is not None
+        num_tokens = input_ids.shape[0]
+        num_reqs = num_tokens // block_size
+        anchors = input_ids[: num_reqs * block_size].view(num_reqs, block_size)[:, 0]
+        mask = torch.full_like(anchors[:1], self.mask_token_id)
+        looked_up = self.draft_model.model.embed_input_ids(torch.cat([anchors, mask]))
+        mask_embed = looked_up[num_reqs:]
+        slot = torch.arange(block_size, device=input_ids.device).view(1, block_size, 1)
+        blocks = torch.where(
+            slot == 0, looked_up[:num_reqs].unsqueeze(1), mask_embed.unsqueeze(0)
+        ).flatten(0, 1)
+        tail = mask_embed.expand(num_tokens - num_reqs * block_size, -1)
+        return torch.cat([blocks, tail])
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
         self,
@@ -200,6 +222,7 @@ class DSparkProposer(DFlashProposer):
         hidden = self.draft_model.model(
             input_ids=input_ids,
             positions=positions,
+            input_embeds=self._block_input_embeds(input_ids, block_size),
         )
 
         padded_num_reqs = hidden.shape[0] // block_size
