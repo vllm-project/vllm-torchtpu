@@ -248,10 +248,14 @@ def test_gdn_nobound_fold_writes_the_split_boundary_state(chunk_pair, monkeypatc
     rest with no block boundary inside. The split runs [512, 768) then
     [768, 985); the fold runs [512, 985) with the checkpoint at offset 256 in
     another block (the first speculative scratch block). Both resume from the
-    hit state seeded into the running block, as serving's seed copy does."""
+    hit state seeded into the running block, as serving's seed copy does.
+    The checkpoint sits at offset 256, so the fold unit must be 256 (as
+    served): with the default unit (the 512 block) the kernel drops every
+    checkpoint of a step padded to at most 512 tokens."""
     from vllm_torchtpu import envs
 
     monkeypatch.setattr(envs, "TPU_GDN_CHUNK_PAIR", chunk_pair)
+    monkeypatch.setattr(envs, "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", 256)
     tokens = 985
     x = _gdn_inputs(tokens, seed=11)
     empty = jnp.zeros((NUM_BLOCKS * SPLIT, KBS) + PAYLOAD + (LANES,), jnp.int8)
