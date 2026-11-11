@@ -120,3 +120,11 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_TRACE_MODE` | `"TRACE_COMPUTE"` | SparseCore trace mode (`"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_DMA"`, etc.). |
 | `TPU_NUM_SPARSE_CORES_TO_TRACE` | `1` | Number of SparseCores to trace when SparseCore tracing is active. |
 | `TPU_KERNEL_ITER_MODE` | `False` | Enables fast Pallas kernel hot-reloading without restarting the vLLM server (`TPU_KERNEL_RELOAD_MODULES`). |
+
+---
+
+## 7. Sampling & Logits
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `TPU_DISTRIBUTED_SAMPLING` | `None` (`True` on TPU v7x) | Serves eligible non-greedy, non-speculative steps (`1 <= top_k <= 100` with any `top_p`, or pure-temperature `no_top_k` and `no_top_p`) without logprobs, structured outputs, or `min_tokens` stops directly from each rank's vocabulary-parallel LM head shard (`runner/distributed_sampling.py`), avoiding the `[batch, vocab]` logit `all-gather` and full-vocabulary uniform RNG draw. Unset (`None`) enables on TPU v7x with an automatic fallback to full-logits sampling on unsupported model or batch configurations; explicit `1` enables on any TPU and raises `NotImplementedError` if unsupported; `0` disables. |

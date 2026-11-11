@@ -162,6 +162,33 @@ def _float32_bsearch(
     return _monotonic_int32_to_float32(result)
 
 
+def _prob_bsearch(
+    batch_shape: Sequence[int],
+    predicate: Callable[[torch.Tensor], torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    """Binary search on non-negative IEEE-754 float32 thresholds in [0.0, 2.0).
+
+    Softmax probabilities lie in [0.0, 1.0], whose IEEE-754 binary32 bit
+    patterns have sign bit 0 (bit 31 = 0) and biased exponent <= 127
+    (bit 30 = 0, since 1.0f == 0x3f800000 < (1 << 30)). Every 30-bit integer
+    in [0, (1 << 30) - 1] reinterpreted as float32 is strictly finite,
+    non-NaN, in [0.0, 2.0), and ordered identically in int32 and float32,
+    avoiding sign-bit handling, XOR total-order conversions, and finiteness
+    checks on every reduction step.
+    """
+    current_bits = torch.zeros(batch_shape, dtype=torch.int32, device=device)
+    zero = torch.zeros_like(current_bits)
+    for i in range(30):
+        bit = 1 << (29 - i)
+        bit_t = torch.full_like(current_bits, bit)
+        midpoint = current_bits | bit
+        current_bits = current_bits | torch.where(
+            predicate(midpoint.view(torch.float32)), zero, bit_t
+        )
+    return current_bits.view(torch.float32)
+
+
 def topk_mask(
     logits: torch.Tensor, k: torch.Tensor, replace_val: float = MASKED_LOGIT_VALUE
 ) -> torch.Tensor:
@@ -209,7 +236,7 @@ def topp_mask(
     probability mass is >= p. Values in this set are left as they are. All other
     values are set with `replace_val`.
 
-    Sharding considerations: this function does 33 reductions over the
+    Sharding considerations: this function does 30 reductions over the
     vocab_size axis of the input array. To avoid excessive latency from these
     reductions, you should ensure that the vocab_size axis is unsharded on input
     to this function. Prefer to shard the batch axes instead.
@@ -240,7 +267,7 @@ def topp_mask(
         )
         return probability_mass < p
 
-    threshold = _float32_bsearch(logits.shape[:-1], predicate, logits.device)
+    threshold = _prob_bsearch(logits.shape[:-1], predicate, logits.device)
     threshold = threshold.unsqueeze(-1)
     return torch.where(probs >= threshold, logits, replace_tensor)
 
@@ -311,3 +338,20 @@ def apply_top_k_top_p_candidates(
         logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
     )
     return torch.where(top_k > 0, masked, logits)
+
+
+def safe_logsumexp(
+    x: torch.Tensor, dim: int = -1, keepdim: bool = False
+) -> torch.Tensor:
+    """Numerically stable logsumexp returning -inf (not NaN) on all -inf slices."""
+    max_val = x.amax(dim=dim, keepdim=True)
+    safe_max = torch.where(max_val > -1e30, max_val, torch.zeros_like(max_val))
+    lse = max_val + torch.log(torch.exp(x - safe_max).sum(dim=dim, keepdim=True))
+    return lse if keepdim else lse.squeeze(dim)
+
+
+def gumbel_noise_from_uniform(u: torch.Tensor) -> torch.Tensor:
+    """Transforms Uniform(0, 1) draws into standard Gumbel(0, 1) variates."""
+    finfo = torch.finfo(u.dtype)
+    u_clamped = torch.clamp(u, min=finfo.tiny, max=1.0 - finfo.eps)
+    return -torch.log(-torch.log(u_clamped))
