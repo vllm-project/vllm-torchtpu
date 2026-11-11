@@ -68,8 +68,11 @@ def _hc_mix_operands(
     """`(hdn [W, n_down], [hup_b [k_up, H]])` of one mixing hyper-connection."""
     W, lr = g.NHC * g.H, g.LOWRANK
     down = hc.input_mix_weight_down.weight.data  # [LR, W]
-    inj = hc.block_inject_weight.weight.data  # [NHC, W]
     up = hc.input_mix_weight_up.weight.data  # [W, LR]
+    if hasattr(hc, "block_inject_weight"):
+        inj = hc.block_inject_weight.weight.data  # [NHC, W]
+    else:  # a final mixer (use_combine=False) has none; the tail ignores these columns
+        inj = down.new_zeros((g.NHC, W))
     assert tuple(down.shape) == (lr, W) and tuple(up.shape) == (W, lr), (
         down.shape,
         up.shape,
