@@ -16,6 +16,7 @@ import dataclasses
 import functools
 import inspect
 import math
+from collections import ChainMap
 from collections.abc import Callable
 from typing import Any, ClassVar, cast
 
@@ -99,6 +100,7 @@ from vllm_torchtpu.layers.core.attention_interface import (
     ragged_paged_attention_batched,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.model_kv_cache_dtypes import MODEL_KV_CACHE_DTYPES
 from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.layers.core.quantization import quantize_kv
 from vllm_torchtpu.layers.core.sequence_layout import (
@@ -141,17 +143,22 @@ _SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS = (
 
 # Note: TPU can fp8 as storage dtype but doesn't support converting from uint8
 # from to fp32 directly. That's why it has a dtype mapping different from GPU
-TPU_STR_DTYPE_TO_TORCH_DTYPE = {
-    "half": torch.half,
-    "bfloat16": torch.bfloat16,
-    "float": torch.float,
-    "fp8": torch.float8_e4m3fn,
-    "fp8_e4m3": torch.float8_e4m3fn,
-    "fp8_e5m2": torch.float8_e5m2,
-    "fp8_ds_mla": torch.uint8,
-    "int8": torch.int8,
-    "uint8": torch.uint8,
-}
+# Names that model directories register (`model_kv_cache_dtypes`) resolve
+# through the second map.
+TPU_STR_DTYPE_TO_TORCH_DTYPE: ChainMap[str, torch.dtype] = ChainMap(
+    {
+        "half": torch.half,
+        "bfloat16": torch.bfloat16,
+        "float": torch.float,
+        "fp8": torch.float8_e4m3fn,
+        "fp8_e4m3": torch.float8_e4m3fn,
+        "fp8_e5m2": torch.float8_e5m2,
+        "fp8_ds_mla": torch.uint8,
+        "int8": torch.int8,
+        "uint8": torch.uint8,
+    },
+    MODEL_KV_CACHE_DTYPES,
+)
 
 
 def _is_fp8_kv_cache_dtype(cache_dtype_str: str) -> bool:
