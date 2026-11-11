@@ -45,7 +45,23 @@ def align_to(x: int, alignment: int) -> int:
     return pl.cdiv(x, alignment) * alignment
 
 
-def get_vmem_estimate_bytes(
+def _window_state_scratch_bytes(
+    tile_b: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    num_lanes: int,
+    is_decode: bool,
+    window_size: int,
+    carry_scratch_bytes: int,
+) -> int:
+    """Returns VMEM scratch bytes reserved by window_tile in decode mode."""
+    if is_decode and window_size > 1 and d_k == num_lanes and d_v == num_lanes:
+        return tile_b * n_v * d_v * d_k * carry_scratch_bytes
+    return 0
+
+
+def get_vmem_declared_bytes(
     tile_b: int,
     chunk_sz: int,
     n_kq: int,
@@ -62,10 +78,8 @@ def get_vmem_estimate_bytes(
     window_size: int = 1,
     attention_mode: config.AttentionMode = config.AttentionMode.GDN,
 ) -> int:
-    """Estimates total on-chip VMEM footprint in bytes for a GDN or KDA tile."""
+    """Declared VMEM footprint in bytes (create_allocs + scratch + weights)."""
     aligned_num_v_heads = align_to(n_v, num_lanes)
-    aligned_d_k = align_to(d_k, num_lanes)
-    aligned_d_v = align_to(d_v, num_lanes)
     dim_size = align_to(2 * n_kq * d_k + n_v * d_v, num_lanes)
     aligned_out_dim = align_to(n_v * d_v, num_lanes)
     is_kda = attention_mode == config.AttentionMode.KDA
@@ -99,7 +113,16 @@ def get_vmem_estimate_bytes(
     # carries for inter-tile chunking; decode mode is batched with no carries.
     if is_decode:
         scratch_conv_bytes = 0
-        scratch_recurrent_bytes = 0
+        scratch_recurrent_bytes = _window_state_scratch_bytes(
+            tile_b=tile_b,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            num_lanes=num_lanes,
+            is_decode=is_decode,
+            window_size=window_size,
+            carry_scratch_bytes=carry_scratch_bytes,
+        )
     else:
         scratch_conv_bytes = (
             tile_b * max(0, kernel_size - 1) * dim_size * carry_scratch_bytes
@@ -112,11 +135,72 @@ def get_vmem_estimate_bytes(
         aligned_num_v_heads + aligned_gate_dim
     ) * carry_scratch_bytes
 
+    return (
+        qkv_bytes
+        + b_bytes
+        + a_bytes
+        + conv_state_buffer_bytes
+        + recurrent_state_buffer_bytes
+        + out_bytes
+        + scratch_conv_bytes
+        + scratch_recurrent_bytes
+        + weights_bytes
+    )
+
+
+def get_vmem_estimate_bytes(
+    tile_b: int,
+    chunk_sz: int,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    act_out_bytes: int,
+    rec_state_bytes: int,
+    num_lanes: int,
+    conv_state_dim_size: int,
+    is_decode: bool = False,
+    carry_scratch_bytes: int = 4,
+    window_size: int = 1,
+    attention_mode: config.AttentionMode = config.AttentionMode.GDN,
+) -> int:
+    """Estimates total on-chip VMEM footprint in bytes for a GDN or KDA tile."""
+    aligned_d_k = align_to(d_k, num_lanes)
+    aligned_d_v = align_to(d_v, num_lanes)
+    is_kda = attention_mode == config.AttentionMode.KDA
+    declared_bytes = get_vmem_declared_bytes(
+        tile_b=tile_b,
+        chunk_sz=chunk_sz,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        act_out_bytes=act_out_bytes,
+        rec_state_bytes=rec_state_bytes,
+        num_lanes=num_lanes,
+        conv_state_dim_size=conv_state_dim_size,
+        is_decode=is_decode,
+        carry_scratch_bytes=carry_scratch_bytes,
+        window_size=window_size,
+        attention_mode=attention_mode,
+    )
+
     # 6. Working memory for intra-chunk recurrence and per-head projections
     # (chunk_sz is the verify window in decode) plus per-slot vector
     # temporaries and the working f32 recurrent state during decode.
     decode_working_recurrent_bytes = (
         tile_b * n_v * d_v * d_k * carry_scratch_bytes if is_decode else 0
+    ) - _window_state_scratch_bytes(
+        tile_b=tile_b,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        num_lanes=num_lanes,
+        is_decode=is_decode,
+        window_size=window_size,
+        carry_scratch_bytes=carry_scratch_bytes,
     )
     kda_decay_elems = 3 * chunk_sz * aligned_d_k if is_kda else 0
     intermediate_bytes = (
@@ -133,19 +217,7 @@ def get_vmem_estimate_bytes(
         * carry_scratch_bytes
     )
 
-    return (
-        qkv_bytes
-        + b_bytes
-        + a_bytes
-        + conv_state_buffer_bytes
-        + recurrent_state_buffer_bytes
-        + out_bytes
-        + scratch_conv_bytes
-        + scratch_recurrent_bytes
-        + weights_bytes
-        + decode_working_recurrent_bytes
-        + intermediate_bytes
-    )
+    return declared_bytes + decode_working_recurrent_bytes + intermediate_bytes
 
 
 def calculate_decode_tile_size(

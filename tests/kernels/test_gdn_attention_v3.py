@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import sys
+from typing import Any
 from unittest import mock
 
 import jax
@@ -40,47 +41,23 @@ def _get_vmem_declared_bytes(
     conv_state_dim_size: int,
     num_lanes: int,
 ) -> int:
-    """Derives declared on-chip VMEM bytes from get_vmem_estimate_bytes."""
-    tile_b = cfg.seq_tile_size
-    chunk_sz = cfg.chunk_size
-    n_v = cfg.num_v_heads
-    d_k = cfg.kq_head_dim
-    d_v = cfg.v_head_dim
-    is_decode = cfg.mode == config.GDNMode.BATCHED
-    aligned_d_k = tiling.align_to(d_k, num_lanes)
-    aligned_d_v = tiling.align_to(d_v, num_lanes)
-    total = tiling.get_vmem_estimate_bytes(
-        tile_b=tile_b,
-        chunk_sz=chunk_sz,
+    """Returns declared on-chip VMEM bytes from tiling.get_vmem_declared_bytes."""
+    return tiling.get_vmem_declared_bytes(
+        tile_b=cfg.seq_tile_size,
+        chunk_sz=cfg.chunk_size,
         n_kq=cfg.num_kq_heads,
-        n_v=n_v,
-        d_k=d_k,
-        d_v=d_v,
+        n_v=cfg.num_v_heads,
+        d_k=cfg.kq_head_dim,
+        d_v=cfg.v_head_dim,
         kernel_size=cfg.kernel_size,
         act_out_bytes=jnp.dtype(cfg.dtypes.act_out).itemsize,
         rec_state_bytes=jnp.dtype(cfg.dtypes.recurrent_state).itemsize,
         num_lanes=num_lanes,
         conv_state_dim_size=conv_state_dim_size,
-        is_decode=is_decode,
+        is_decode=cfg.mode == config.GDNMode.BATCHED,
         window_size=cfg.window_size,
         attention_mode=cfg.attention_mode,
     )
-    decode_working_rec = tile_b * n_v * d_v * d_k * 4 if is_decode else 0
-    kda_decay = 3 * chunk_sz * aligned_d_k if cfg.is_kda else 0
-    intermediate = (
-        tile_b
-        * (
-            n_v
-            * (
-                5 * chunk_sz * chunk_sz
-                + 3 * chunk_sz * (aligned_d_v + aligned_d_k)
-                + kda_decay
-            )
-            + 8 * 8 * num_lanes
-        )
-        * 4
-    )
-    return total - (decode_working_rec + intermediate)
 
 
 def _weight_refs_vmem_bytes(
@@ -629,6 +606,114 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
             ).triangular_block_size,
             4,
         )
+
+    def test_window_tile_scope_and_vmem_invariance(self) -> None:
+        """Checks use_window_tile gating and VMEM estimate invariance."""
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with use_abstract_mesh(mesh):
+            dtypes = config.Dtypes(
+                act_in=jnp.dtype(jnp.float32),
+                act_out=jnp.dtype(jnp.bfloat16),
+                compute=jnp.dtype(jnp.float32),
+                recurrent_state=jnp.dtype(jnp.float32),
+                conv_state=jnp.dtype(jnp.float32),
+            )
+
+            def _make_cfg(**overrides: object) -> config.GDNConfig:
+                """Builds a baseline GDNConfig with overrides."""
+                base_kw: dict[str, Any] = {
+                    "mode": config.GDNMode.BATCHED,
+                    "dtypes": dtypes,
+                    "batch_size": 16,
+                    "dim_size": 5120,
+                    "kernel_size": 4,
+                    "tile_size": 4,
+                    "num_kq_heads": 8,
+                    "num_v_heads": 24,
+                    "kq_head_dim": 128,
+                    "v_head_dim": 128,
+                    "window_size": 4,
+                    "attention_mode": config.AttentionMode.GDN,
+                }
+                base_kw.update(overrides)
+                return config.GDNConfig(**base_kw)
+
+            def _scratch_bytes(cfg: config.GDNConfig) -> int:
+                """Returns _window_state_scratch_bytes for cfg."""
+                return tiling._window_state_scratch_bytes(
+                    tile_b=cfg.seq_tile_size,
+                    n_v=cfg.num_v_heads,
+                    d_k=cfg.kq_head_dim,
+                    d_v=cfg.v_head_dim,
+                    num_lanes=pltpu.get_tpu_info().num_lanes,
+                    is_decode=(cfg.mode == config.GDNMode.BATCHED),
+                    window_size=cfg.window_size,
+                    carry_scratch_bytes=cfg.dtypes.compute.itemsize,
+                )
+
+            for active_overrides in (
+                {},
+                {"attention_mode": config.AttentionMode.KDA},
+            ):
+                cfg_active = _make_cfg(**active_overrides)
+                self.assertTrue(cfg_active.use_window_tile)
+                self.assertIsNotNone(
+                    cfg_active.get_scratch_shape_dict()["window_state_scratch_ref"]
+                )
+                self.assertGreater(_scratch_bytes(cfg_active), 0)
+
+            for overrides in (
+                {"window_size": 1},
+                {"kq_head_dim": 64},
+                {"mode": config.GDNMode.PER_SEQ},
+            ):
+                cfg_off = _make_cfg(**overrides)
+                self.assertFalse(cfg_off.use_window_tile)
+                self.assertIsNone(
+                    cfg_off.get_scratch_shape_dict()["window_state_scratch_ref"]
+                )
+                self.assertEqual(_scratch_bytes(cfg_off), 0)
+
+            d_k, d_v, kernel_size, window = 128, 128, 4, 4
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            for attn_mode, head_pairs in (
+                (config.AttentionMode.GDN, ((2, 8), (8, 24), (8, 32), (16, 64))),
+                (config.AttentionMode.KDA, ((3, 3), (4, 4), (12, 12), (32, 32))),
+            ):
+                for n_kq, n_v in head_pairs:
+                    dim = 2 * n_kq * d_k + n_v * d_v
+                    for state_dtype in (jnp.bfloat16, jnp.float32):
+                        rec_bytes = jnp.dtype(state_dtype).itemsize
+                        for dec_tile in (1, 2, 4, 8):
+                            common: dict[str, Any] = {
+                                "tile_b": dec_tile,
+                                "chunk_sz": window,
+                                "n_kq": n_kq,
+                                "n_v": n_v,
+                                "d_k": d_k,
+                                "d_v": d_v,
+                                "kernel_size": kernel_size,
+                                "act_out_bytes": 2,
+                                "rec_state_bytes": rec_bytes,
+                                "num_lanes": num_lanes,
+                                "conv_state_dim_size": dim,
+                                "is_decode": True,
+                                "window_size": window,
+                                "attention_mode": attn_mode,
+                            }
+                            est_true = tiling.get_vmem_estimate_bytes(**common)
+                            decl_true = tiling.get_vmem_declared_bytes(**common)
+                            with mock.patch.object(
+                                tiling, "_window_state_scratch_bytes", return_value=0
+                            ):
+                                est_false = tiling.get_vmem_estimate_bytes(**common)
+                                decl_false = tiling.get_vmem_declared_bytes(**common)
+                            self.assertEqual(est_true, est_false)
+                            self.assertEqual(
+                                decl_true - decl_false, dec_tile * n_v * d_v * d_k * 4
+                            )
 
 
 class GDNStatePipelineRaceTest(parameterized.TestCase):
@@ -2424,3 +2509,307 @@ class GDNAttentionTest(parameterized.TestCase):
                     np.testing.assert_allclose(
                         rec_out[slot], rec_ref[slot], rtol=3e-2, atol=3e-2
                     )
+
+
+class GDNWindowTileTest(parameterized.TestCase):
+    """Tests per-head window_tile recurrence for speculative verify windows."""
+
+    def setUp(self) -> None:
+        """Skips the test unless running on TPU."""
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Requires TPU backend")
+
+    def _assert_bytes_equal(self, got: object, want: object, what: str) -> None:
+        """Asserts that every array leaf in got and want is byte-identical."""
+        got_leaves = jax.tree.leaves(got)
+        want_leaves = jax.tree.leaves(want)
+        self.assertLen(got_leaves, len(want_leaves), msg=what)
+        for idx, (g_arr, w_arr) in enumerate(zip(got_leaves, want_leaves)):
+            g_bytes = np.asarray(g_arr).view(np.uint8)
+            w_bytes = np.asarray(w_arr).view(np.uint8)
+            np.testing.assert_array_equal(
+                g_bytes, w_bytes, err_msg=f"{what} leaf {idx}"
+            )
+
+    def _run_batched_and_window(
+        self,
+        kwargs: dict[str, Any],
+        states: tuple[jax.Array, jax.Array],
+    ) -> tuple[tuple[Any, jax.Array], tuple[Any, jax.Array]]:
+        """Runs fused_conv1d_gdn with batched recurrence and with window_tile."""
+        jax.clear_caches()
+        with (
+            mock.patch.object(
+                config.GDNConfig,
+                "use_window_tile",
+                new=property(lambda _: False),
+            ),
+            mock.patch.object(
+                wrapper.window_tile, "run", wraps=wrapper.window_tile.run
+            ) as run_spy_base,
+        ):
+            fn_base = jax.jit(
+                wrapper.fused_conv1d_gdn.__wrapped__,
+                donate_argnames=("states",),
+                static_argnames=(
+                    "n_kq",
+                    "n_v",
+                    "d_k",
+                    "d_v",
+                    "kernel_size",
+                    "num_spec_tokens",
+                    "recurrent_dtype",
+                    "conv_dtype",
+                    "attention_mode",
+                    "gate_lower_bound",
+                ),
+            )
+            res_base = fn_base(states=jax.tree.map(jnp.copy, states), **kwargs)
+            jax.block_until_ready(res_base)
+            self.assertEqual(run_spy_base.call_count, 0)
+        jax.clear_caches()
+        with mock.patch.object(
+            wrapper.window_tile, "run", wraps=wrapper.window_tile.run
+        ) as run_spy_win:
+            res_win = wrapper.fused_conv1d_gdn(
+                states=jax.tree.map(jnp.copy, states), **kwargs
+            )
+            jax.block_until_ready(res_win)
+            self.assertGreaterEqual(run_spy_win.call_count, 1)
+        return res_base, res_win
+
+    def _make_verify_inputs(
+        self,
+        seed: int,
+        n_kq: int,
+        n_v: int,
+        window: int,
+        state_dtype: jnp.dtype,
+        attention_mode: config.AttentionMode = config.AttentionMode.GDN,
+        gate_lower_bound: float | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], tuple[jax.Array, jax.Array]]:
+        """Builds two-step ragged verify-window inputs with non-zero states."""
+        d_k, d_v, kernel_size = 128, 128, 4
+        is_kda = attention_mode == config.AttentionMode.KDA
+        gate_dim = n_v * d_k if is_kda else n_v
+        dt_bias_shape = (n_v, d_k) if is_kda else (n_v,)
+        num_spec_tokens = window - 1
+        spec_lengths_1 = [window, 1, max(1, window - 1), max(1, window // 2)]
+        spec_lengths_2 = [max(1, window - 1), window, 1, window]
+        num_seqs = len(spec_lengths_1)
+        num_blocks = 1 + num_seqs * window
+        conv_dim = 2 * n_kq * d_k + n_v * d_v
+
+        state_indices = jnp.array(
+            [1 + i * window for i in range(num_seqs)], dtype=jnp.int32
+        )
+        read_offsets_1 = jnp.array(
+            [(i + 1) % window for i in range(num_seqs)], dtype=jnp.int32
+        )
+        read_offsets_2 = jnp.array(
+            [length - 1 for length in spec_lengths_1], dtype=jnp.int32
+        )
+        seq_lens_1 = jnp.array(
+            [
+                16 + spec_lengths_1[0],
+                12 + spec_lengths_1[1],
+                8 + spec_lengths_1[2],
+                spec_lengths_1[3],
+            ],
+            dtype=jnp.int32,
+        )
+        seq_lens_2 = seq_lens_1 + jnp.array(spec_lengths_2, dtype=jnp.int32)
+        distribution = jnp.array([num_seqs, num_seqs, num_seqs], dtype=jnp.int32)
+
+        rngs = iter(jax.random.split(jax.random.key(seed), 16))
+        conv_state = jax.random.normal(
+            next(rngs), (num_blocks, kernel_size - 1, conv_dim), dtype=jnp.float32
+        )
+        recurrent_state = jax.random.normal(
+            next(rngs), (num_blocks, n_v, d_k, d_v), dtype=state_dtype
+        )
+        conv_weight = jax.random.normal(
+            next(rngs), (conv_dim, 1, kernel_size), dtype=jnp.bfloat16
+        )
+        conv_bias = jax.random.normal(next(rngs), (conv_dim,), dtype=jnp.bfloat16)
+        a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+        dt_bias = jax.random.normal(next(rngs), dt_bias_shape, dtype=jnp.float32)
+
+        def _step_kwargs(
+            lengths: list[int],
+            read_offsets: jax.Array,
+            seq_lens: jax.Array,
+        ) -> dict[str, Any]:
+            """Builds per-step activation and metadata kwargs."""
+            num_tokens = sum(lengths)
+            q_loc = jnp.array(
+                np.concatenate([[0], np.cumsum(lengths)]), dtype=jnp.int32
+            )
+            return {
+                "qkv": jax.random.normal(
+                    next(rngs), (num_tokens, conv_dim), dtype=jnp.bfloat16
+                ),
+                "b": jax.random.normal(
+                    next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16
+                ),
+                "a": jax.random.normal(
+                    next(rngs), (num_tokens, gate_dim), dtype=jnp.bfloat16
+                ),
+                "conv_weight": conv_weight,
+                "conv_bias": conv_bias,
+                "a_log": a_log,
+                "dt_bias": dt_bias,
+                "query_start_loc": q_loc,
+                "state_indices": state_indices,
+                "distribution": distribution,
+                "seq_lens": seq_lens,
+                "read_offsets": read_offsets,
+                "n_kq": n_kq,
+                "n_v": n_v,
+                "d_k": d_k,
+                "d_v": d_v,
+                "kernel_size": kernel_size,
+                "num_spec_tokens": num_spec_tokens,
+                "attention_mode": attention_mode,
+                "gate_lower_bound": gate_lower_bound,
+            }
+
+        kwargs_1 = _step_kwargs(spec_lengths_1, read_offsets_1, seq_lens_1)
+        kwargs_2 = _step_kwargs(spec_lengths_2, read_offsets_2, seq_lens_2)
+        return kwargs_1, kwargs_2, (conv_state, recurrent_state)
+
+    @parameterized.product(
+        heads=((2, 8), (8, 24), (8, 32), (16, 64)),
+        state_dtype=(jnp.bfloat16, jnp.float32),
+        window=(2, 4, 8),
+    )
+    def test_window_tile_is_bitwise_equal_to_batched_recurrence(
+        self,
+        heads: tuple[int, int],
+        state_dtype: jnp.dtype,
+        window: int,
+    ) -> None:
+        """Verifies window_tile is byte-identical to batched recurrence."""
+        n_kq, n_v = heads
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        conv_dim = 2 * n_kq * 128 + n_v * 128
+        vmem_limit = config.GDNConfig.get_vmem_limit_bytes(window)
+        vmem_est = tiling.get_vmem_estimate_bytes(
+            tile_b=1,
+            chunk_sz=window,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=128,
+            d_v=128,
+            kernel_size=4,
+            act_out_bytes=2,
+            rec_state_bytes=jnp.dtype(state_dtype).itemsize,
+            num_lanes=num_lanes,
+            conv_state_dim_size=conv_dim,
+            is_decode=True,
+            window_size=window,
+        )
+        if vmem_est > vmem_limit:
+            self.skipTest(
+                "Baseline batched recurrence exceeds VMEM capacity for"
+                f" heads={heads}, state_dtype={state_dtype}, window={window}"
+            )
+        kwargs_1, kwargs_2, states_0 = self._make_verify_inputs(
+            seed=101 + window + n_v,
+            n_kq=n_kq,
+            n_v=n_v,
+            window=window,
+            state_dtype=state_dtype,
+        )
+        (states_base_1, out_base_1), (states_win_1, out_win_1) = (
+            self._run_batched_and_window(kwargs_1, states_0)
+        )
+        self._assert_bytes_equal(out_win_1, out_base_1, "step1_out")
+        self._assert_bytes_equal(states_win_1, states_base_1, "step1_states")
+
+        (states_base_2, out_base_2), (states_win_2, out_win_2) = (
+            self._run_batched_and_window(kwargs_2, states_base_1)
+        )
+        self._assert_bytes_equal(out_win_2, out_base_2, "step2_out")
+        self._assert_bytes_equal(states_win_2, states_base_2, "step2_states")
+
+    def test_bitwise_compare_detects_one_flipped_byte(self) -> None:
+        """Negative control: flipping a single byte in a state tensor raises."""
+        kwargs_1, _, states_0 = self._make_verify_inputs(
+            seed=501,
+            n_kq=2,
+            n_v=8,
+            window=2,
+            state_dtype=jnp.float32,
+        )
+        states_win, _ = wrapper.fused_conv1d_gdn(
+            states=jax.tree.map(jnp.copy, states_0), **kwargs_1
+        )
+        corrupted_rec = np.array(states_win[1], copy=True)
+        corrupted_bytes = corrupted_rec.view(np.uint8)
+        corrupted_bytes.flat[0] ^= np.uint8(1)
+        with self.assertRaises(AssertionError):
+            self._assert_bytes_equal(
+                (states_win[0], corrupted_rec), states_win, "negative_control"
+            )
+
+    @parameterized.product(
+        heads=((3, 3), (4, 4), (12, 12), (32, 32)),
+        state_dtype=(jnp.bfloat16, jnp.float32),
+        window=(2, 4, 8),
+        gate_lower_bound=(None, -5.0),
+    )
+    def test_kda_window_tile_is_bitwise_equal_to_batched_recurrence(
+        self,
+        heads: tuple[int, int],
+        state_dtype: jnp.dtype,
+        window: int,
+        gate_lower_bound: float | None,
+    ) -> None:
+        """Verifies KDA window_tile is byte-identical to batched recurrence."""
+        n_kq, n_v = heads
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        conv_dim = 2 * n_kq * 128 + n_v * 128
+        vmem_limit = config.GDNConfig.get_vmem_limit_bytes(window)
+        vmem_est = tiling.get_vmem_estimate_bytes(
+            tile_b=1,
+            chunk_sz=window,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=128,
+            d_v=128,
+            kernel_size=4,
+            act_out_bytes=2,
+            rec_state_bytes=jnp.dtype(state_dtype).itemsize,
+            num_lanes=num_lanes,
+            conv_state_dim_size=conv_dim,
+            is_decode=True,
+            window_size=window,
+            attention_mode=config.AttentionMode.KDA,
+        )
+        if vmem_est > vmem_limit:
+            self.skipTest(
+                "Baseline KDA batched recurrence exceeds VMEM capacity for"
+                f" heads={heads}, state_dtype={state_dtype}, window={window}"
+            )
+        kwargs_1, kwargs_2, states_0 = self._make_verify_inputs(
+            seed=211 + window + n_v + (0 if gate_lower_bound is None else 17),
+            n_kq=n_kq,
+            n_v=n_v,
+            window=window,
+            state_dtype=state_dtype,
+            attention_mode=config.AttentionMode.KDA,
+            gate_lower_bound=gate_lower_bound,
+        )
+        (states_base_1, out_base_1), (states_win_1, out_win_1) = (
+            self._run_batched_and_window(kwargs_1, states_0)
+        )
+        self._assert_bytes_equal(out_win_1, out_base_1, "kda_step1_out")
+        self._assert_bytes_equal(states_win_1, states_base_1, "kda_step1_states")
+
+        (states_base_2, out_base_2), (states_win_2, out_win_2) = (
+            self._run_batched_and_window(kwargs_2, states_base_1)
+        )
+        self._assert_bytes_equal(out_win_2, out_base_2, "kda_step2_out")
+        self._assert_bytes_equal(states_win_2, states_base_2, "kda_step2_states")

@@ -99,7 +99,8 @@ def load_and_select_states(
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.GDNConfig,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+    load_recurrent: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Load correct states from HBM or prior tile, and masks invalid states.
 
     Reference metadata to select the appropriate prior states. If `is_first_tile`
@@ -120,13 +121,15 @@ def load_and_select_states(
         carry_recurrent_scratch_ref: Optional inter-tile recurrent state carry of
             shape [seq_tile_size, num_v_heads, kq_head_dim, v_head_dim].
         cfg: GDN configuration object.
+        load_recurrent: Whether to load and select the initial recurrent state.
 
     Returns:
         real_sizes: Valid token count per sequence tile of shape [seq_tile_size].
         prev_conv_state: Selected convolution state of shape [seq_tile_size,
         prev_kernel_size, 1, dim_size] in float32.
         prev_recurrent_state: Selected recurrent state of shape [seq_tile_size,
-        num_v_heads, kq_head_dim, v_head_dim].
+        num_v_heads, kq_head_dim, v_head_dim], or None when `load_recurrent` is
+        False.
     """
 
     real_sizes_list = []
@@ -147,26 +150,29 @@ def load_and_select_states(
             prev_tile_conv = carry_conv_scratch_ref[idx]
             prev_conv_state = jnp.where(is_first_tile, prev_conv_state, prev_tile_conv)
 
-        # Unpack the uint32 words to the state dtype, then upcast because
-        # compute runs in fp32.
-        hbm_recurrent_state = pltpu.bitcast(
-            recurrent_in_slot_ref[idx, 0], cfg.dtypes.recurrent_state
-        ).astype(jnp.float32)
-        prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
+        if load_recurrent:
+            # Unpack the uint32 words to the state dtype, then upcast because
+            # compute runs in fp32.
+            hbm_recurrent_state = pltpu.bitcast(
+                recurrent_in_slot_ref[idx, 0], cfg.dtypes.recurrent_state
+            ).astype(jnp.float32)
+            prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
 
-        if carry_recurrent_scratch_ref is not None:
-            prev_tile_recurrent_scratch = carry_recurrent_scratch_ref[idx]
-            prev_recurrent_state = jnp.where(
-                is_first_tile, prev_recurrent_state, prev_tile_recurrent_scratch
-            )
+            if carry_recurrent_scratch_ref is not None:
+                prev_tile_recurrent_scratch = carry_recurrent_scratch_ref[idx]
+                prev_recurrent_state = jnp.where(
+                    is_first_tile, prev_recurrent_state, prev_tile_recurrent_scratch
+                )
+            prev_recurrent_state_list.append(prev_recurrent_state)
 
         real_sizes_list.append(real_sizes)
         prev_conv_state_list.append(prev_conv_state)
-        prev_recurrent_state_list.append(prev_recurrent_state)
 
     real_sizes = jnp.stack(real_sizes_list, axis=0)
     prev_conv_state = jnp.stack(prev_conv_state_list, axis=0)
-    prev_recurrent_state = jnp.stack(prev_recurrent_state_list, axis=0)
+    prev_recurrent_state = (
+        jnp.stack(prev_recurrent_state_list, axis=0) if load_recurrent else None
+    )
 
     return real_sizes, prev_conv_state, prev_recurrent_state
 
