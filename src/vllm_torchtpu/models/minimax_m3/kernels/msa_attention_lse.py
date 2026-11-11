@@ -39,6 +39,8 @@ TILES_PER_STEP = 4
 # (a page and a scale page each) gain from 2 (bench j-caec1354: c64 shared
 # 2206 -> 2026, forced 2150 -> 2075 us per call), 8/16-bit ones do not.
 _FP4_PREFETCH = 2
+# Page copies a group's start loop issues per iteration (`_kernel`).
+_START_UNROLL = 4
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -131,19 +133,24 @@ def _kernel(
         first = (meta & msa_attention._FIRST_BIT) != 0
         last = (meta & msa_attention._LAST_BIT) != 0
 
-        def page_copies(half, g, page):
+        def page_copies(half, g, page, n=1):
+            """Copies of ``n`` pages from `page` on into slots ``g ..``: every
+            copy of a ring slot signals its one semaphore, so a wait sized to
+            ``n`` pages waits for any ``n`` of them."""
             src = kv_hbm_ref.at[
-                pl.ds(page, 1), :, :, pl.ds(head_ref[0] * row_width, row_width)
+                pl.ds(page, n), :, :, pl.ds(head_ref[0] * row_width, row_width)
             ]
             copies = [
-                pltpu.make_async_copy(src, buf_ref.at[half, g], sem_ref.at[half, g])
+                pltpu.make_async_copy(
+                    src, buf_ref.at[half, pl.ds(g, n), 0], sem_ref.at[half, 0]
+                )
             ]
             if fp4:
                 copies.append(
                     pltpu.make_async_copy(
-                        scale_hbm_ref.at[pl.ds(page, 1)],
-                        scale_buf_ref.at[half, g],
-                        scale_sem_ref.at[half, g],
+                        scale_hbm_ref.at[pl.ds(page, n)],
+                        scale_buf_ref.at[half, pl.ds(g, n), 0],
+                        scale_sem_ref.at[half, 0],
                     )
                 )
             return copies
@@ -151,14 +158,28 @@ def _kernel(
         def start_group(group, half):
             base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
 
-            def start(g, carry):
-                for copy in page_copies(
-                    half, g, page_table_ref[work_page_ref[base + g]]
-                ):
-                    copy.start()
+            def start(g, queue=0):
+                page = page_table_ref[work_page_ref[base + g]]
+                for copy in page_copies(half, g, page):
+                    copy.start(priority=queue)
+
+            # Four page copies per iteration: their address chains (two
+            # dependent SMEM loads each) overlap.
+            count = work_count_ref[group]
+
+            def start4(i, carry):
+                for j in range(_START_UNROLL):  # alternate the two DMA queues
+                    start(_START_UNROLL * i + j, j % 2)
                 return carry
 
-            jax.lax.fori_loop(0, work_count_ref[group], start, 0)
+            jax.lax.fori_loop(0, count // _START_UNROLL, start4, 0)
+            done = count - count % _START_UNROLL
+
+            def start1(g, carry):
+                start(g)
+                return carry
+
+            jax.lax.fori_loop(done, count, start1, 0)
 
         @pl.when(w == 0)
         def _first():
@@ -169,12 +190,12 @@ def _kernel(
         def _next():
             start_group(w + ring - 1, (w + ring - 1) % ring)
 
-        def wait(g, carry):
-            for copy in page_copies(half, g, 0):  # the source only sizes the wait
-                copy.wait()
-            return carry
-
-        jax.lax.fori_loop(0, count, wait, 0)
+        # One wait per set bit of `count` (the source only sizes the wait).
+        n = 1
+        while n <= pages_per_step:
+            for copy in page_copies(half, 0, 0, n):
+                pl.when((count & n) != 0)(copy.wait)
+            n *= 2
 
         kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
 
@@ -475,7 +496,7 @@ def _attention_call(
     scale_scratch = (
         (
             pltpu.VMEM((ring, pages_per_step, 1) + scale_cache.shape[1:], jnp.float32),
-            pltpu.SemaphoreType.DMA((ring, pages_per_step)),
+            pltpu.SemaphoreType.DMA((ring, 1)),
         )
         if fp4
         else ()
@@ -519,7 +540,7 @@ def _attention_call(
                 (ring, pages_per_step, 1, rows_per_page, packing, row_width),
                 kv_cache.dtype,
             ),
-            pltpu.SemaphoreType.DMA((ring, pages_per_step)),
+            pltpu.SemaphoreType.DMA((ring, 1)),
             *scale_scratch,
         ],
     )
