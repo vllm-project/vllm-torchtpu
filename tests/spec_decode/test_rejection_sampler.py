@@ -26,6 +26,7 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
     synthetic_sample_and_assemble,
+    synthetic_sample_rows_and_assemble,
     synthetic_verify_rows,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
@@ -488,6 +489,57 @@ def test_synthetic_one_row_verify_matches_rejection_sampler(device, seed):
     )
     n = len(lengths)
     assert torch.equal(output[:n], expected[:n])
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_synthetic_sample_split_over_ranks_matches_one_rank(monkeypatch, seed):
+    """`synthetic_sample_rows_and_assemble`: each of tp ranks samples its block
+    of the request rows and the all-gathered tokens lay out exactly like
+    `synthetic_sample_and_assemble` on every row (top-p sampling included)."""
+    import vllm.distributed
+
+    gen = torch.Generator().manual_seed(seed)
+    tp, reqs, vocab, k = 4, 8, 64, 3
+    tokens = reqs * k
+    logits = 3 * torch.randn(reqs, vocab, generator=gen)
+    recover_draft = torch.randint(-1, vocab, (reqs,), generator=gen)
+    accepted = torch.randint(0, k + 1, (reqs,), generator=gen)
+    temps = torch.ones(reqs, 1)
+    top_k = torch.zeros(reqs, 1, dtype=torch.int32)
+    top_p = torch.full((reqs, 1), 0.9)
+    recover_u = torch.rand(reqs, vocab, generator=gen)
+    draft = torch.randint(0, vocab, (tokens,), generator=gen, dtype=torch.int32)
+    num_draft = torch.full((reqs,), k, dtype=torch.int32)
+    segment = torch.arange(tokens) // k
+    group = (torch.arange(tokens) % k).to(torch.int32)
+    tables = (draft, num_draft, segment, group, k)
+    expected = synthetic_sample_and_assemble(
+        logits, recover_draft, accepted, temps, top_k, top_p, recover_u, *tables
+    )
+
+    per_rank = reqs // tp
+    blocks = []
+    for rank in range(tp):
+        monkeypatch.setattr(
+            vllm.distributed,
+            "tensor_model_parallel_all_gather",
+            lambda x, dim=0: blocks.append(x) or x.repeat(tp),
+        )
+        synthetic_sample_rows_and_assemble(
+            logits[rank * per_rank : (rank + 1) * per_rank],
+            torch.tensor([rank], dtype=torch.int32),
+            recover_draft, accepted, temps, top_k, top_p, recover_u, *tables,
+        )
+    gathered = torch.cat(blocks)
+    monkeypatch.setattr(
+        vllm.distributed, "tensor_model_parallel_all_gather", lambda x, dim=0: gathered
+    )
+    output = synthetic_sample_rows_and_assemble(
+        logits[:per_rank],
+        torch.tensor([0], dtype=torch.int32),
+        recover_draft, accepted, temps, top_k, top_p, recover_u, *tables,
+    )
+    assert torch.equal(output, expected)
 
 
 @pytest.mark.parametrize("padding_token_id", [-1, 0])

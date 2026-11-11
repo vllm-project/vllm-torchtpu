@@ -128,6 +128,7 @@ if TYPE_CHECKING:
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY: bool = True
     TPU_DRAFT_BUCKET_STEP: int = 32
+    TPU_SPEC_SYNTHETIC_ROW_SPLIT: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -954,6 +955,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 64 (0: the target's token buckets only). A draft is num_reqs * block
     # tokens, which the target's coarse buckets pad by up to ~45 %.
     "TPU_DRAFT_BUCKET_STEP": env_nonnegative_int("TPU_DRAFT_BUCKET_STEP", 32),
+    # Under the synthetic one-row verify, split the requests' rows over the TP
+    # ranks: an all-to-all of the LM head shards instead of an all-gather of
+    # the full logits, each rank samples its block, the tokens are gathered.
+    # Needs the model's compute_logits_shard; same tokens.
+    "TPU_SPEC_SYNTHETIC_ROW_SPLIT": env_bool("TPU_SPEC_SYNTHETIC_ROW_SPLIT", default=True),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
