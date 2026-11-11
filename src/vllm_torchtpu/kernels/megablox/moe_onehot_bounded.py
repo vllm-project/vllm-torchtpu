@@ -96,9 +96,10 @@ def _permute_kernel(valid_ref, revert_t_ref, hidden_hbm_ref, out_hbm_ref, onehot
             onehot_ref[s0 : s0 + _SLOT_BLOCK, :] = onehot.astype(onehot_ref.dtype)
 
         def body(hidden_ref, out_ref):
-            # 0 * NaN == NaN: a non-finite token would reach every slot.
+            # 0 * NaN == NaN: a non-finite token would reach every slot. x * 0
+            # is 0 exactly for finite x (Mosaic's isfinite takes f32 only).
             hidden = hidden_ref[...]
-            hidden = jnp.where(jnp.isfinite(hidden), hidden, jnp.zeros_like(hidden))
+            hidden = jnp.where(hidden * 0 == 0, hidden, jnp.zeros_like(hidden))
             out_ref[...] = jnp.dot(
                 onehot_ref[:cap, :], hidden, preferred_element_type=jnp.float32
             ).astype(out_ref.dtype)
