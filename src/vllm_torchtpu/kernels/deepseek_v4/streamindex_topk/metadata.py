@@ -373,3 +373,85 @@ def compute_metadata(
         cp_size=cp_size,
         interleave_c=interleave_c,
     )
+
+
+def compute_ragged_metadata(
+    seq_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    end_seq_idx: jax.Array | int,
+    bq_sz: int,
+    bkv_sz: int,
+    pages_per_seq: int,
+    page_size: int,
+    max_num_tokens: int,
+    compression_ratio: int = 1,
+) -> MetadataRef:
+    """Build a small unsharded ragged schedule in one device kernel.
+
+    The request ownership mask stays within half a lane tile and the schedule
+    within one int32 vector tile. Larger schedules retain the linear-size
+    scatter/prefix implementation instead of materializing a quadratic mask.
+    """
+    slots = seq_lens.shape[0]
+    hardware = pltpu.get_tpu_info()
+    vector_tile = hardware.num_lanes * hardware.num_sublanes
+    max_bq = pl.cdiv(next_power_of_2(max_num_tokens), bq_sz) + slots
+    max_bkv = pl.cdiv(pages_per_seq * page_size, bkv_sz)
+    if (
+        slots > hardware.num_lanes // 2
+        or max_bkv > hardware.num_sublanes
+        or max_bq * max_bkv > vector_tile
+    ):
+        return compute_metadata(
+            seq_lens,
+            cu_q_lens,
+            0,
+            end_seq_idx,
+            bq_sz,
+            bkv_sz,
+            pages_per_seq,
+            page_size,
+            max_num_tokens,
+            compression_ratio,
+        )
+
+    def kernel(end, seq, cu, count_out, seq_out, q_out, kv_out):
+        ids = jnp.arange(slots, dtype=jnp.int32)
+        lengths, starts = seq[...], cu[...]
+        kv = jnp.maximum(1, pl.cdiv(lengths // compression_ratio, bkv_sz))
+        qb = jnp.maximum(1, pl.cdiv(starts[1:] - starts[:-1], bq_sz))
+        counts = jnp.where(ids < end[0], kv * qb, 0)
+        ends = jnp.sum(
+            jnp.where(ids[:, None] >= ids[None, :], counts[None, :], 0), axis=1
+        )
+        begins = ends - counts
+        steps = jnp.arange(vector_tile, dtype=jnp.int32)
+        owner = jnp.minimum(jnp.sum(steps[:, None] >= ends[None, :], axis=1), slots - 1)
+        selected = owner[:, None] == ids[None, :]
+        offset = steps - jnp.sum(jnp.where(selected, begins[None, :], 0), axis=1)
+        width = jnp.sum(jnp.where(selected, kv[None, :], 0), axis=1)
+        # Enumerate the bounded KV tile count to avoid vector integer division.
+        bq = jnp.zeros((vector_tile,), jnp.int32)
+        for size in range(1, max_bkv + 1):
+            bq = jnp.where(width == size, offset // size, bq)
+        total = jnp.sum(counts)
+        live = steps < total
+        count_out[...] = jnp.full((1,), total, jnp.int32)
+        seq_out[...] = jnp.where(live, owner, 0)
+        q_out[...] = jnp.where(live, bq, 0)
+        kv_out[...] = jnp.where(live, offset - bq * width, 0)
+
+    outputs = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
+            out_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 4,
+            grid=(1,),
+        ),
+        out_shape=[jax.ShapeDtypeStruct((1,), jnp.int32)]
+        + [jax.ShapeDtypeStruct((vector_tile,), jnp.int32)] * 3,
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        name="RaggedScheduleFused",
+    )(jnp.asarray(end_seq_idx, jnp.int32).reshape(1), seq_lens, cu_q_lens)
+    return MetadataRef.create(*outputs)

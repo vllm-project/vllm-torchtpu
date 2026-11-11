@@ -32,7 +32,12 @@ from vllm_torchtpu.kernels.qwen4_exp.resident_topk import QwenSparseCoreTopK
 
 
 @pytest.mark.parametrize("case", ["wide", "chip", "batch", "topk", "carrier"])
-def test_decode_reader_view_preserves_page_ids_and_native_keys(monkeypatch, case):
+@pytest.mark.parametrize(
+    "tokens,pages_per_request", [(16, 41), (16, 80), (32, 41), (32, 80)]
+)
+def test_decode_reader_view_preserves_page_ids_and_native_keys(
+    monkeypatch, case, tokens, pages_per_request
+):
     from jax.experimental.pallas import tpu as pltpu
 
     from vllm_torchtpu.kernels.qwen4_exp import tuned_block_sizes
@@ -43,14 +48,19 @@ def test_decode_reader_view_preserves_page_ids_and_native_keys(monkeypatch, case
         "get_tpu_info",
         lambda: pltpu.get_tpu_info_for_chip(chip, 1),
     )
-    batch = 9 if case == "batch" else 16
+    batch = 9 if case == "batch" else tokens
     k = 16 if case == "topk" else 512
     native = (jnp.arange(4 * 416 * 128) % 113).astype(jnp.bfloat16)
     cache = native.reshape(4, 208, 2, 128)
     if case == "carrier":
         cache = jax.lax.bitcast_convert_type(cache, jnp.uint8)
         cache = cache.transpose(0, 1, 2, 4, 3).reshape(4, 208, 4, 128)
-    pages = jnp.arange(32 * 41, dtype=jnp.int32).reshape(32, 41) % 4
+    pages = (
+        jnp.arange(32 * pages_per_request, dtype=jnp.int32).reshape(
+            32, pages_per_request
+        )
+        % 4
+    )
     requests = jnp.arange(batch, dtype=jnp.int32)[::-1]
     calls = []
 
@@ -90,7 +100,12 @@ def test_decode_reader_view_preserves_page_ids_and_native_keys(monkeypatch, case
 
 
 @pytest.mark.parametrize("case", ["decode", "prefill", "padding", "backend", "chip"])
-def test_sidecar_page_coalescing_preserves_owned_key_addresses(monkeypatch, case):
+@pytest.mark.parametrize(
+    "tokens,pages_per_request", [(16, 41), (16, 80), (32, 41), (32, 80)]
+)
+def test_sidecar_page_coalescing_preserves_owned_key_addresses(
+    monkeypatch, case, tokens, pages_per_request
+):
     """Large pages must preserve physical ownership and exclude sidecar padding."""
     from jax.experimental.pallas import tpu as pltpu
 
@@ -106,9 +121,11 @@ def test_sidecar_page_coalescing_preserves_owned_key_addresses(monkeypatch, case
     pool = (jnp.arange(4 * physical_rows * 128) % 127).astype(jnp.bfloat16)
     pool = pool.reshape(4, physical_rows // 2, 1, 2, 128)
     requests = 8 if case == "prefill" else 16
-    table = jnp.asarray(np.random.default_rng(52).integers(4, size=(requests, 41)))
-    req = jnp.arange(16, dtype=jnp.int32)[::-1] % requests
-    columns = jnp.array([0, 31, 32, 415, 416, 17055])
+    table = jnp.asarray(
+        np.random.default_rng(52).integers(4, size=(requests, pages_per_request))
+    )
+    req = jnp.arange(tokens, dtype=jnp.int32)[::-1] % requests
+    columns = jnp.array([0, 31, 32, 415, 416, pages_per_request * 416 - 1])
     observed = []
 
     def read(q, cache, lengths, pages, request_ids, **kwargs):
@@ -120,9 +137,9 @@ def test_sidecar_page_coalescing_preserves_owned_key_addresses(monkeypatch, case
 
     monkeypatch.setattr(pooled_qsa, "select_index_blocks", read)
     actual = pooled_qsa.select_blocks(
-        jnp.zeros((16, 4, 128), jnp.bfloat16),
+        jnp.zeros((tokens, 4, 128), jnp.bfloat16),
         pool,
-        jnp.full((16,), 67584, jnp.int32),
+        jnp.full((tokens,), 67584, jnp.int32),
         table,
         req,
         jnp.arange(requests + 1, dtype=jnp.int32),
@@ -137,7 +154,7 @@ def test_sidecar_page_coalescing_preserves_owned_key_addresses(monkeypatch, case
         table[req[:, None], columns[None] // 416], columns[None] % 416
     ]
     np.testing.assert_array_equal(actual, expected)
-    assert observed == [416 if case in ("decode", "chip") else 32]
+    assert observed == [416 if case in ("decode", "prefill", "chip") else 32]
 
 
 @dataclass(frozen=True)
@@ -264,12 +281,9 @@ def test_shared_schedule_forwards_backend_and_causal_metadata(
     prefill_rows = sum(
         int(cu[-1]) for lens, cu, kw in seen if kw["num_queries_per_block"] != 1
     )
-    if tokens <= requests:
-        assert decode_rows == sum(counts)
-        assert prefill_rows == 0
-    else:
-        assert decode_rows == sum(int(n) for n in counts if n == 1)
-        assert prefill_rows == sum(int(n) for n in counts if n > 1)
+    # Short multi-token windows may use token-local decode scheduling.
+    # Both schedules must score every real query exactly once.
+    assert decode_rows + prefill_rows == sum(int(n) for n in counts)
 
 
 def test_default_is_qwen_sparsecore_and_jit_backend_identity(monkeypatch):
@@ -743,3 +757,174 @@ def test_resident_policy_is_local_to_qwen(monkeypatch, qwen, return_scores):
     assert calls[0][1]["scheduling_group_id"] == 7
     assert calls[0][1]["return_scores"] is return_scores
     assert backend.overlaps_scoring is True
+
+
+@pytest.mark.parametrize(
+    "tokens,slots", [(16, 16), (32, 16), (64, 16), (128, 32), (256, 64)]
+)
+def test_grouped_index_reuses_request_pages_and_causal_lengths(
+    monkeypatch, tokens, slots
+):
+    """Reuse the original page table, and exclude inactive stale request slots."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.qwen4_exp import tuned_block_sizes
+
+    monkeypatch.setattr(
+        tuned_block_sizes.pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    monkeypatch.setattr(
+        tuned_block_sizes,
+        "_hardware",
+        lambda: tuned_block_sizes.DmaHardware.from_tpu_info(pltpu.get_tpu_info()),
+    )
+    counts = np.zeros(slots, np.int32)
+    counts[:3] = [4, 0, min(tokens - 4, 9)]
+    counts[3] = min(tokens - counts.sum(), 3)  # Stale, beyond active_request_end.
+    starts = jnp.asarray(np.r_[0, counts.cumsum()], jnp.int32)
+    context = jnp.full((slots,), 65536, jnp.int32)
+    req, logical, valid = _token_metadata(tokens, starts, context, jnp.arange(slots))
+    lens = jnp.where(valid, logical + 1, 0)
+    table = jnp.arange(slots * 80, dtype=jnp.int32).reshape(slots, 80) % 4
+    calls = []
+
+    def inspect(q, weights, cache, lengths, pages, cu, distribution, **kwargs):
+        calls.append(True)
+        assert distribution is None
+        assert cache.shape[1:] == (26, 16, 128)
+        np.testing.assert_array_equal(pages, table.reshape(-1))
+        np.testing.assert_array_equal(cu, jnp.minimum(starts, starts[3]))
+        expected = jnp.where(jnp.arange(tokens) < starts[3], lens // 4, 0)
+        np.testing.assert_array_equal(kwargs["row_lengths"], expected)
+        np.testing.assert_array_equal(lengths[3:], 0)
+        return jnp.full((tokens, 512), -1, jnp.int32)
+
+    monkeypatch.setattr(decode_indexer, "streamindex_topk", inspect)
+    with jax.disable_jit():
+        decode_indexer.select_index_blocks(
+            jnp.ones((tokens, 4, 128), jnp.bfloat16),
+            jnp.zeros((4, 208, 2, 128), jnp.bfloat16),
+            lens,
+            table,
+            req,
+            starts=starts,
+            context=context,
+            ratio=4,
+            block_topk=512,
+            request_distribution=jnp.array([1, 2, 3], jnp.int32),
+        )
+    assert calls == [True]
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "tokens,slots", [(16, 16), (32, 16), (64, 16), (128, 32), (256, 64)]
+)
+def test_native_grouped_index_matches_per_query_schedule(tokens, slots):
+    """Ragged windows, idle slots and capacity boundaries preserve ordered top-k."""
+    rng = np.random.default_rng(7301)
+    cache = jnp.asarray(
+        rng.standard_normal((slots * 80, 208, 2, 128), dtype=np.float32), jnp.bfloat16
+    )
+    table = jnp.asarray(rng.permutation(slots * 80).reshape(slots, 80), jnp.int32)
+    q = jnp.asarray(
+        rng.standard_normal((tokens, 4, 128), dtype=np.float32), jnp.bfloat16
+    )
+
+    @jax.jit
+    def grouped(q, cache, lens, req, starts, context, dist):
+        return decode_indexer.select_index_blocks(
+            q,
+            cache,
+            lens,
+            table,
+            req,
+            starts=starts,
+            context=context,
+            request_distribution=dist,
+            ratio=4,
+            block_topk=512,
+        )
+
+    @jax.jit
+    def per_query(q, cache, lens, req):
+        return decode_indexer.select_index_blocks(
+            q,
+            cache,
+            lens,
+            table,
+            req,
+            starts=None,
+            context=None,
+            ratio=4,
+            block_topk=512,
+        )
+
+    for iteration in range(12):
+        counts = np.zeros(slots, np.int32)
+        left = tokens
+        for i in range(slots):
+            counts[i] = min(left, int(rng.choice([0, 1, 2, 3, 4, 8, 16])))
+            left -= counts[i]
+        if iteration == 0:
+            counts[:] = 0
+        if iteration == 1:
+            counts[:] = 0
+            counts[: min(slots, tokens // 4)] = 4
+        starts = jnp.asarray(np.r_[0, counts.cumsum()], jnp.int32)
+        context = jnp.asarray(
+            rng.choice([0, 2047, 65535, 65536, 131080], slots), jnp.int32
+        )
+        req, logical, valid = _token_metadata(
+            tokens, starts, context, jnp.arange(slots)
+        )
+        lens = jnp.where(valid, logical + 1, 0)
+        end = int(np.max(np.where(counts > 0, np.arange(slots) + 1, 0)))
+        result = np.asarray(
+            grouped(
+                q,
+                cache,
+                lens,
+                req,
+                starts,
+                context,
+                jnp.array([0, end, end], jnp.int32),
+            )
+        )
+        np.testing.assert_array_equal(result, per_query(q, cache, lens, req))
+        assert np.all(
+            (result == -1) | ((result >= 0) & (result < np.asarray(lens // 4)[:, None]))
+        )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "slots,pages,tokens", [(16, 80, 16), (64, 80, 256), (128, 80, 512), (16, 200, 32)]
+)
+def test_native_ragged_metadata_matches_general_schedule(slots, pages, tokens):
+    """Fused and fallback schedules preserve all active pipeline steps."""
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
+
+    rng = np.random.default_rng(71)
+    counts = np.zeros(slots, np.int32)
+    counts[: min(slots, tokens // 4)] = 4
+    counts[1::3] = 0
+    starts = jnp.asarray(np.r_[0, counts.cumsum()], jnp.int32)
+    lengths = jnp.asarray(rng.integers(0, 131090, slots), jnp.int32)
+    for end in (0, slots // 2, slots):
+        actual = jax.jit(
+            lambda lens, cu, e: metadata.compute_ragged_metadata(
+                lens, cu, e, 8, 8320, pages, 416, tokens, 4
+            )
+        )(lengths, starts, end)
+        expected = metadata.compute_metadata(
+            lengths, starts, 0, end, 8, 8320, pages, 416, tokens, 4
+        )
+        np.testing.assert_array_equal(actual.num_steps, expected.num_steps)
+        size = int(actual.num_steps[0])
+        for name in ("batch_tile_idx", "bq_idx", "bkv_idx"):
+            np.testing.assert_array_equal(
+                getattr(actual, name)[:size], getattr(expected, name)[:size]
+            )

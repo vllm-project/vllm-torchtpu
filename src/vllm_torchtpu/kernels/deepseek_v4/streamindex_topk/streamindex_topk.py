@@ -1192,6 +1192,7 @@ def streamindex_topk(
     topk_backend: TopKBackend = _DEFAULT_TOPK_BACKEND,
     scheduling_group_namespace: int | None = None,
     prefix_capacity: int | None = None,
+    row_lengths: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1213,12 +1214,15 @@ def streamindex_topk(
       page_indices: flattened page indices look-up table by (seq_id, page_id).
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
         kv_lens, only the first num_seqs+1 values are valid. Together with
-        distribution=None, declares exactly one query per sequence, including
-        zero-length padding rows, and derives the decode-only schedule.
+        distribution=None, omitting cu_q_lens declares one query per sequence;
+        supplying it declares a single ragged pass over the nonempty requests.
       distribution: (i, j, k) represents that sequences[0:i] are decode-only,
         sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
-        k is also the total number of sequences. Must be None iff cu_q_lens is
-        None; this static per-query contract omits empty prefill/mixed passes.
+        k is also the total number of sequences. None derives the schedule from
+        cu_q_lens as described above, omitting empty passes.
+      row_lengths: Optional int32[max_num_tokens] completed causal KV lengths,
+        in global compressed columns, zero for padded query rows. Reuses caller
+        metadata without rebuilding token-to-request ownership.
       k: Number of top-K elements to retrieve.
       compression_ratio: KV cache compression ratio.
       num_kv_pages_per_block: number of kv pages to be processed in one block in
@@ -1289,8 +1293,20 @@ def streamindex_topk(
 
     kv_layout = KVLayout.parse(kv_layout)
     per_query = cu_q_lens is None and distribution is None
-    if (cu_q_lens is None) != (distribution is None):
-        raise ValueError("cu_q_lens and distribution must both be supplied or omitted")
+    ragged_only = cu_q_lens is not None and distribution is None
+    if cu_q_lens is None and distribution is not None:
+        raise ValueError("An explicit distribution requires cu_q_lens")
+    if ragged_only:
+        assert cu_q_lens is not None
+        if uniform_q_len is not None:
+            raise ValueError("A ragged-only schedule requires uniform_q_len=None")
+        count = jnp.diff(cu_q_lens)
+        end = jnp.max(jnp.where(count > 0, jnp.arange(len(count)) + 1, 0))
+        distribution = jnp.array([0, 0, end], jnp.int32)
+    if row_lengths is not None and (
+        row_lengths.shape != (q.shape[0],) or row_lengths.dtype != jnp.int32
+    ):
+        raise ValueError("row_lengths must be int32[max_num_tokens]")
     if per_query:
         if q.shape[0] != seq_lens.shape[0]:
             raise ValueError("Omitted query metadata requires one query per sequence")
@@ -1535,8 +1551,40 @@ def streamindex_topk(
             )
         return scores
 
+    def effective_row_lengths(num_positions):
+        if row_lengths is not None:
+            return jnp.clip(
+                metadata.cp_local_length(row_lengths, cp_rank, cp_size, interleave_c),
+                0,
+                num_positions,
+            )
+        return _effective_row_lengths(
+            seq_lens=seq_lens,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            num_tokens=q.shape[0],
+            num_positions=num_positions,
+            compression_ratio=compression_ratio,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            interleave_c=interleave_c,
+        )
+
     def _pass_specs(decode_batch_end):
         """`run_scores_kernel` kwargs for the passes over the batch."""
+        if ragged_only:
+            return (
+                dict(
+                    num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+                    num_queries_per_block=num_queries_per_blocks[2],
+                    buffer_count=buffer_counts[2],
+                    start_seq_idx=distribution[1],
+                    end_seq_idx=distribution[2],
+                    static_q_len=None,
+                    seq_batch_size=1,
+                    case=MlaCase.MIXED,
+                ),
+            )
         decode_cfg = dict(
             num_kv_pages_per_block=num_kv_pages_per_blocks[0],
             num_queries_per_block=num_queries_per_blocks[0],
@@ -1613,6 +1661,18 @@ def streamindex_topk(
             spec["num_kv_pages_per_block"],
             spec["static_q_len"],
         )
+        if ragged_only and cp_size == 1 and chunk_starts == (None,):
+            return metadata.compute_ragged_metadata(
+                seq_lens,
+                cu_q_lens,
+                distribution[2],
+                bq_sz,
+                bkv_sz,
+                pages_per_seq,
+                page_size,
+                q.shape[0],
+                compression_ratio,
+            )
         return metadata.compute_metadata(
             seq_lens=seq_lens,
             cu_q_lens=cu_q_lens,
@@ -1689,17 +1749,7 @@ def streamindex_topk(
         )
 
         num_positions = max(num_sublanes_total * 128, k)
-        eff_row_lengths = _effective_row_lengths(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            num_tokens=max_num_tokens,
-            num_positions=num_positions,
-            compression_ratio=compression_ratio,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            interleave_c=interleave_c,
-        )
+        eff_row_lengths = effective_row_lengths(num_positions)
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:
             num_chunks, chunk_len = 1, max_num_tokens
@@ -1849,16 +1899,9 @@ def streamindex_topk(
     def _fast_path(_):
         # Every visible position wins, so a row is just its first row-length
         # positions. Shares the scoring path's row lengths so the two agree.
-        row_lengths = _effective_row_lengths(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            num_tokens=q.shape[0],
-            num_positions=k,
-            compression_ratio=compression_ratio,
-        )
+        lengths = effective_row_lengths(k)
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
-        return jnp.where(s_idx < row_lengths[:, None], s_idx, -1)
+        return jnp.where(s_idx < lengths[:, None], s_idx, -1)
 
     # Custom DMA coverage does not certify score-free prefix enumeration.
     if not enable_early_exit or components is not None:

@@ -29,6 +29,7 @@ from vllm_torchtpu.kernels.qwen4_exp.resident_topk import QwenSparseCoreTopK
 from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
     get_decode_index_key_packing,
     get_decode_index_pages,
+    get_grouped_index_config,
 )
 
 
@@ -182,7 +183,8 @@ def select_index_blocks(
 
     ``cache`` is the reader's BF16 or byte-carrier view; ``table`` addresses
     those physical pages. Runner order is decode, verify, then prefill/mixed.
-    Decode and verify rows use per-query causal lengths; the suffix shares KV.
+    Small ragged windows share KV while retaining per-query causal lengths.
+    Other shapes retain the bounded decode and prefill schedules.
     The default SC/QSA prefill composition opts into query-sized score capacity.
     Injected backends stay full unless prefix_capacity explicitly certifies their
     reduced-pitch contract together with this extent-preserving QSA schedule.
@@ -275,6 +277,58 @@ def select_index_blocks(
     if request_distribution is None:
         raise ValueError("Ragged QSA selection requires Runner request_distribution")
     prefix_tokens, active_tokens = _request_bounds(starts, request_distribution, batch)
+    grouped = (
+        get_grouped_index_config(
+            query,
+            cache,
+            pages_per_request=table.shape[1],
+            ratio=ratio,
+            topk=block_topk,
+        )
+        if default_backend
+        else None
+    )
+    if grouped is not None:
+        # Clip the ragged boundary before deriving lengths: inactive request
+        # slots may retain stale history or page IDs from an earlier step.
+        cu = jnp.minimum(starts, active_tokens)
+        counts = jnp.diff(cu)
+        visible = jnp.where(jnp.arange(batch) < active_tokens, lengths // ratio, 0)
+        packing = get_decode_index_key_packing(
+            query,
+            cache,
+            pages_per_query=table.shape[1],
+            ratio=ratio,
+            topk=block_topk,
+        )
+
+        def score_grouped(_):
+            return streamindex_topk(
+                query,
+                jnp.full(query.shape[:2], scale, jnp.float32),
+                cache.reshape(cache.shape[0], page_size // packing, packing, -1),
+                jnp.where(counts > 0, context + counts, 0),
+                table.reshape(-1),
+                cu,
+                None,
+                k=block_topk,
+                compression_ratio=ratio,
+                num_kv_pages_per_block=(grouped.pages,) * 3,
+                num_queries_per_block=(1, grouped.queries, grouped.queries),
+                buffer_count=grouped.buffers,
+                row_lengths=visible,
+                components=qsa_indexing(key_packing=packing),
+                topk_backend=topk_backend,
+                scheduling_group_namespace=scheduling_group_namespace,
+                **resource_options,
+            )
+
+        return jax.lax.cond(
+            jnp.all(visible <= block_topk),
+            lambda _: _enumerate_groups(visible, block_topk),
+            score_grouped,
+            None,
+        )
     if batch <= len(starts) - 1:
         # Per-query scoring remains causal for small verify/prefill batches.
         lengths = jnp.where(jnp.arange(batch) < active_tokens, lengths, 0)

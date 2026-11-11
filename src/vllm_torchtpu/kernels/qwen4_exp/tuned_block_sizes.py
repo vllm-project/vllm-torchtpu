@@ -53,6 +53,46 @@ def get_decode_index_key_packing(
     return hw.bf16_rows if page_size % hw.bf16_rows == 0 else 2
 
 
+@dataclasses.dataclass(frozen=True)
+class GroupedIndexConfig:
+    """Measured tiles for sharing a key read across one request's queries."""
+
+    queries: int
+    pages: int
+    buffers: int
+
+
+# TPU7x BF16: measured at 1/8/16/32/64 requests, with ragged 1--16-query
+# windows and contexts through 128K. Eight queries share each 20-page DMA.
+_GROUPED_INDEX_BLOCKS = {
+    (batch, 4, 128, 416, 80, 4, 512): GroupedIndexConfig(8, 20, 3)
+    for batch in (16, 32, 64, 128, 256)
+}
+
+
+def get_grouped_index_config(
+    query: jax.Array,
+    cache: jax.Array,
+    *,
+    pages_per_request: int,
+    ratio: int,
+    topk: int,
+) -> GroupedIndexConfig | None:
+    """Admit measured grouped schedules on the native BF16 wide reader."""
+    if (
+        get_decode_index_key_packing(
+            query, cache, pages_per_query=pages_per_request, ratio=ratio, topk=topk
+        )
+        == 2
+    ):
+        return None
+    hw = _hardware()
+    if hw is None or hw.chip_version != pltpu.ChipVersion.TPU_7X:
+        return None
+    key = (*query.shape, cache.shape[1] * 2, pages_per_request, ratio, topk)
+    return _GROUPED_INDEX_BLOCKS.get(key)
+
+
 def use_decode_state_fusion(
     raw: _DmaArray,
     pool: _DmaArray,

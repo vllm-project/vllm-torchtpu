@@ -577,10 +577,7 @@ def select_blocks(
     logical_pages = (
         pool.shape[1] if logical_block_size is None else logical_block_size
     ) // 128
-    per_query = (starts is None and context is None) or (
-        starts is not None and context is not None and len(query) <= len(context)
-    )
-    if per_query and topk_backend is None:
+    if topk_backend is None:
         page_group = get_decode_index_page_group(
             query,
             pool,
@@ -592,6 +589,7 @@ def select_blocks(
         )
         # Keep the original pool at the Torch/JAX boundary. This internal view
         # is a bitcast feeding the reader, not an escaping full-cache output.
+        # Ragged prefill restores its subpage view in select_index_blocks.
         rows *= page_group
         physical_pages //= page_group
         logical_pages //= page_group

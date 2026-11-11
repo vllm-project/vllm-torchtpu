@@ -233,7 +233,7 @@ def test_per_query_contract_omits_empty_passes_and_preserves_selection(
     "starts,distribution,tokens,uniform",
     [
         (None, [1, 1, 1], 1, None),
-        ([0, 1], None, 1, None),
+        ([0, 1], None, 1, 2),  # Ragged-only metadata cannot also be uniform.
         (None, None, 2, None),
         (None, None, 1, 2),
     ],
@@ -241,7 +241,7 @@ def test_per_query_contract_omits_empty_passes_and_preserves_selection(
 def test_per_query_contract_rejects_ambiguous_metadata(
     starts, distribution, tokens, uniform
 ):
-    with pytest.raises(ValueError, match="query|cu_q_lens"):
+    with pytest.raises(ValueError, match="query|cu_q_lens|uniform_q_len"):
         module.streamindex_topk.__wrapped__(
             jnp.ones((tokens, 4, 128), jnp.bfloat16),
             jnp.ones((tokens, 4), jnp.float32),
