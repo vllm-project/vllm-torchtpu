@@ -250,12 +250,23 @@ def apply_top_k_top_p(
     top_k: torch.Tensor,
     top_p: torch.Tensor,
     topk_candidates: int = 0,
+    apply_top_k: bool = True,
 ) -> torch.Tensor:
+    """Masks logits to the top-k values, then to the top-p mass.
+
+    Rows with top_k <= 0 skip top-k and rows with top_p >= 1 skip top-p.
+    `apply_top_k=False` drops the top-k bisection (32 reductions over the
+    vocabulary) from the graph; the caller passes it only when every row has
+    top_k <= 0, where the bisection's result is discarded anyway.
+    """
     if topk_candidates > 0:
         return apply_top_k_top_p_candidates(logits, top_k, top_p, topk_candidates)
-    should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
-    topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
-    masked_logits = torch.where(should_apply_topk, topk_masked, logits)
+    if apply_top_k:
+        should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
+        topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
+        masked_logits = torch.where(should_apply_topk, topk_masked, logits)
+    else:
+        masked_logits = logits
 
     should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
     topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
