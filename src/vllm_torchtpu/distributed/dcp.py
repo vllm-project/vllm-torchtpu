@@ -163,3 +163,85 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
     )
     _MESH_CACHE[cache_key] = mesh
     return mesh
+
+
+# Architectures whose attention runs DCP groups wider than a KV head's TP
+# replicas (each rank then stores several KV heads for its share of the
+# blocks). vLLM caps GQA DCP at tensor_parallel_size // num_kv_heads.
+_KV_HEAD_SPANNING_DCP_ARCHITECTURES: set[str] = set()
+_GQA_DCP_LIMIT_PATCHED = False
+
+
+def register_kv_head_spanning_dcp_architectures(*architectures: str) -> None:
+    """Declare that these architectures support DCP up to the TP size.
+
+    Also installs `_patch_vllm_gqa_dcp_limit`. Models register from the
+    general plugin, which every process (API server, engine core, workers)
+    loads before it builds a VllmConfig.
+
+    This patch is not in `patch_registry.PATCHES`: the "import" stage must not
+    import vLLM (`test_plugin_import_sets_environment_before_jax`), and
+    "platform_activation" runs in the API server only after
+    `create_engine_config` has already validated the parallel config.
+    """
+    _KV_HEAD_SPANNING_DCP_ARCHITECTURES.update(architectures)
+    _patch_vllm_gqa_dcp_limit()
+
+
+def _patch_vllm_gqa_dcp_limit() -> None:
+    """Let registered GQA architectures run DCP wider than a KV head's
+    replicas.
+
+    `ModelConfig.verify_with_parallel_config` rejects GQA DCP beyond
+    ``tensor_parallel_size // num_kv_heads``: a stock attention backend keeps
+    one KV head per rank. For a registered architecture, the wider DCP must
+    divide the TP size; vLLM's check then runs with DCP clamped to the cap,
+    so its other checks still apply. The method only reads `parallel_config`,
+    so running it on a shallow copy loses no writes.
+    """
+    global _GQA_DCP_LIMIT_PATCHED
+    if _GQA_DCP_LIMIT_PATCHED:
+        return
+
+    import copy
+
+    from vllm.config.model import ModelConfig
+
+    original = ModelConfig.verify_with_parallel_config
+
+    def verify_with_parallel_config(self, parallel_config):
+        dcp = parallel_config.decode_context_parallel_size
+        if (
+            dcp > 1
+            and not self.use_mla
+            and any(
+                a in _KV_HEAD_SPANNING_DCP_ARCHITECTURES for a in self.architectures
+            )
+        ):
+            tp = parallel_config.tensor_parallel_size
+            num_kv_heads = self.get_total_num_kv_heads()
+            cap = tp // max(1, num_kv_heads)
+            if cap >= 1 and dcp > cap:
+                if tp % dcp != 0:
+                    raise ValueError(
+                        f"`--decode-context-parallel-size` ({dcp}) must divide "
+                        f"`--tensor-parallel-size` ({tp}) for "
+                        f"{self.architectures}."
+                    )
+                logger.info_once(
+                    "GQA DCP %d spans KV heads for %s (TP %d, %d KV heads); "
+                    "vLLM's check runs with DCP %d.",
+                    dcp,
+                    ", ".join(self.architectures),
+                    tp,
+                    num_kv_heads,
+                    cap,
+                )
+                clamped = copy.copy(parallel_config)
+                clamped.decode_context_parallel_size = cap
+                return original(self, clamped)
+        return original(self, parallel_config)
+
+    ModelConfig.verify_with_parallel_config = verify_with_parallel_config
+    _GQA_DCP_LIMIT_PATCHED = True
+    logger.info("Applied TPU patch: GQA DCP up to the TP size for registered models.")
