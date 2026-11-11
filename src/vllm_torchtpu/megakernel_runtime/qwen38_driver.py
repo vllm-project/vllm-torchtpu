@@ -1686,6 +1686,17 @@ class Qwen38SegmentDriver:
                 whole.n_w,
                 self.whole_hold,
             )
+            logger.info(
+                "Qwen3.8 whole-step flags: WHOLE_L45=%d fused=%d QSEL_ASYNC=%d "
+                "BUCKET_TUNE=%d PLE_TRIM=%d DRAFT=%d DRAFT_LOOP=%d",
+                int(bool(envs.VLLM_TPU_MK_WHOLE_L45)),
+                int(bool(getattr(whole, "fused", False))),
+                int(bool(envs.VLLM_TPU_MK_QSEL_ASYNC)),
+                int(bool(envs.VLLM_TPU_MK_BUCKET_TUNE)),
+                int(bool(envs.VLLM_TPU_MK_PLE_TRIM)),
+                int(bool(envs.VLLM_TPU_MK_DRAFT)),
+                int(bool(envs.VLLM_TPU_MK_DRAFT_LOOP)),
+            )
         except Exception:
             logger.exception("Qwen3.8 whole-step: setup failed; segment program only")
             self.whole_program = None
