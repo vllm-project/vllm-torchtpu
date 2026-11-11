@@ -1,76 +1,22 @@
-"""100% diff line and branch coverage for / decode indexer.
+"""Decode indexer coverage: top-k branches and TP query splitting.
 
-Target modules and diff lines:
-1. vllm_torchtpu.models.vllm.deepseek_v41.v2.cache
-   - gather_cache_page_values (lines 523-550):
-     * ValueError on ROW_WORDS % record_words != 0
-     * ValueError on (page_records * record_words) % ROW_WORDS != 0
-     * Valid and negative (-1 sentinel) first_records
-     * Bitwise equivalence against gather_cache_values(split=True)
-2. vllm_torchtpu.models.vllm.deepseek_v41.v2.attention
-   - _index_page_records (lines 389-410):
-     * Non-index owners are rejected
-     * Valid qualifying layout -> per_page
-   - DeepseekV41Attention._select_paged_indices (lines 1351-1490):
-     * split=True (ranks > 1, part = (count + ranks - 1) // ranks, padding = ranks)
-     * split=False (ranks = 1, padding = 0, no slice / no gather)
-     * cached_query_split hit vs miss (stage_attention_cache_scope)
-     * candidate_write=True vs candidate_write=False
-     * sparse_logits=True vs False
-     * page_records passed to paged_indexer
-3. vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels
-   - Constants _INDEX_KEYS_PER_ITER = 65536, _INDEX_MAX_TILE = 8192
-   - paged_index_scores_jax (lines 1318-1360, 1410-1425):
-     * tokens <= 8 -> _INDEX_MAX_TILE (8192) tile budget
-     * tokens = 16 -> 4096 tile budget
-     * tokens >= 128 -> 512 tile floor
-     * width clamping (-(-width // 128) * 128)
-     * requests is not None and tokens <= records.shape[0] (decode take)
-     * requests is not None and tokens > records.shape[0] (prefill row_step)
-     * requests is None
-     * pages=True (native packed page gather branch)
-     * pages=False: page_records is None
-     * pages=False: tile % page_records != 0
-     * Numerical equivalence of pages=True vs pages=False
-   - _visible_top_k (lines 1535-1555):
-     * SparseCore path with rows < 16 (unpadded)
-     * SparseCore path with rows >= 16
-     * Fallback path: unordered=False, lengths=None, width < 2048,
-       width % 16 != 0, k % 16 != 0
-   - paged_indexer_jax, select_indexer_jax, initialize_indexer, paged_indexer
+1. indexer_select._visible_top_k SparseCore and fallback branches.
+2. DeepseekV41Attention._select_paged_indices over the packed FP8 cache:
+   split and unsplit queries, padding rows, candidate publication and
+   stage-cache reuse of the query split.
 """
 
 from functools import partial
 from types import SimpleNamespace
 
-import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 import torch
 
 import vllm_torchtpu.models.vllm.deepseek_v41.v2.attention as v2_attn
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
-    indexer_bf16,
     indexer_fp8,
     indexer_select,
-)
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import (
-    _index_page_records,
-)
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-    ROW_WORDS,
-    IndexCacheRows,
-    gather_cache_page_values,
-    gather_cache_values,
-)
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_bf16 import (
-    _INDEX_KEYS_PER_ITER,
-    _INDEX_MAX_TILE,
-    initialize_indexer,
-    paged_index_scores_jax,
-    paged_indexer,
-    select_indexer_jax,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import (
     PackedFP8IndexCacheRows,
@@ -78,269 +24,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import (
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select import _visible_top_k
 
 
-class TestGatherCachePageValues:
-    """Coverage for v2/cache.py gather_cache_page_values."""
-
-    def test_value_error_row_words_not_divisible_by_record_words(self):
-        """ROW_WORDS % record_words != 0 raises ValueError."""
-        cache = jnp.zeros((16, ROW_WORDS), dtype=jnp.int32)
-        # elements = 10 -> record_words = 5; 128 % 5 != 0
-        with pytest.raises(ValueError, match="Pages must cover whole pool word rows"):
-            gather_cache_page_values(
-                cache,
-                jnp.array([0], dtype=jnp.int32),
-                page_records=4,
-                elements=10,
-            )
-
-    def test_value_error_page_records_not_covering_whole_rows(self):
-        """(page_records * record_words) % ROW_WORDS != 0 raises ValueError."""
-        cache = jnp.zeros((16, ROW_WORDS), dtype=jnp.int32)
-        # elements = 128 -> record_words = 64; 128 % 64 == 0
-        # page_records = 3 -> 3 * 64 = 192 % 128 != 0
-        with pytest.raises(ValueError, match="Pages must cover whole pool word rows"):
-            gather_cache_page_values(
-                cache,
-                jnp.array([0], dtype=jnp.int32),
-                page_records=3,
-                elements=128,
-            )
-
-    def test_positive_and_negative_first_records(self):
-        """Positive records gather contiguous page rows; negative take spread."""
-        rng = np.random.default_rng(42)
-        cache_data = rng.integers(-(2**31), 2**31, (64, ROW_WORDS)).astype(np.int32)
-        cache = jnp.asarray(cache_data & 0x3FFF3FFF)  # finite BF16 words
-        elements = 128  # record_words = 64 -> per_row = 2
-        page_records = 4  # rows = 4 * 64 // 128 = 2 rows per page
-
-        # first_records with valid offsets and negative sentinels (-1, -5)
-        first_records = jnp.asarray([0, 2, -1, 4, -5], dtype=jnp.int32)
-        out = gather_cache_page_values(cache, first_records, page_records, elements)
-        assert out.shape == (5 * page_records, elements)
-        assert out.dtype == jnp.bfloat16
-
-        # Compare valid records against gather_cache_values(split=True)
-        for idx in [0, 1, 3]:
-            first = int(first_records[idx])
-            page_slice = out[idx * page_records : (idx + 1) * page_records]
-            ref_records = jnp.arange(first, first + page_records, dtype=jnp.int32)
-            ref_values = gather_cache_values(cache, ref_records, elements, split=True)
-            np.testing.assert_array_equal(
-                np.asarray(page_slice), np.asarray(ref_values)
-            )
-
-    def test_single_row_page_and_small_cache(self):
-        """Small cache and single-row pages cover spread %= max(1, ...)."""
-        cache = jnp.zeros((1, ROW_WORDS), dtype=jnp.int32)
-        elements = 256  # record_words = 128 -> per_row = 1
-        page_records = 1  # rows = 1
-        first_records = jnp.asarray([-1, 0, -3], dtype=jnp.int32)
-        out = gather_cache_page_values(cache, first_records, page_records, elements)
-        assert out.shape == (3, elements)
-        assert out.dtype == jnp.bfloat16
-
-
-class TestIndexPageRecords:
-    """Coverage for v2/attention.py _index_page_records."""
-
-    def test_non_index_cache_returns_zero(self):
-        """Non-index owners have no index pages."""
-        assert _index_page_records(None) == 0
-        assert _index_page_records(torch.zeros(10, 10)) == 0
-
-    def test_valid_qualifying_layout_returns_per_page(self):
-        """Properly aligned BF16 layout returns per_page."""
-        raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
-        # dim = 128 -> record_bytes = 256 -> per_row = 2
-        # per_page = 16, stride = 32, offset = 16 -> all % 2 == 0
-        layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 16 * 256)
-        cache = IndexCacheRows(raw, layout)
-        assert _index_page_records(cache) == 16
-
-    def test_2bank_lo_rows_alignment(self):
-        """2-bank cache returns per_page if lo_rows*per_row % per_page == 0, else 0."""
-        raw_lo_aligned = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
-        raw_hi = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
-        layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 0)
-        cache_aligned = IndexCacheRows((raw_lo_aligned, raw_hi), layout)
-        assert _index_page_records(cache_aligned) == 16
-
-        raw_lo_unaligned = torch.zeros((5, ROW_WORDS), dtype=torch.int32)
-        cache_unaligned = IndexCacheRows((raw_lo_unaligned, raw_hi), layout)
-        assert _index_page_records(cache_unaligned) == 0
-
-
 class TestAttentionKernelsDecodeIndexer:
     """Coverage for v2/attention_kernels.py / changes."""
-
-    def test_constants_and_tile_budget_spectrum(self):
-        """Test _INDEX_KEYS_PER_ITER = 262144 and _INDEX_MAX_TILE = 16384 budget."""
-        assert _INDEX_KEYS_PER_ITER == 262144
-        assert _INDEX_MAX_TILE == 16384
-
-        # 1. tokens <= 16: budget capped at _INDEX_MAX_TILE (16384)
-        pool = jnp.zeros((16, ROW_WORDS), dtype=jnp.int32)
-        q = jnp.zeros((1, 2, 128), dtype=jnp.bfloat16)
-        records = jnp.full((1, 16384), -1, dtype=jnp.int32)
-        weights = jnp.zeros((1, 2), dtype=jnp.float32)
-        lengths = jnp.array([10], dtype=jnp.int32)
-
-        # tokens = 1 -> budget = min(max(512, min(16384, 262144 // 1)), 16384) = 16384
-        scores = paged_index_scores_jax(q, pool, records, weights, lengths)
-        assert scores.shape == (1, 16384)
-
-        # 2. tokens = 16 -> min(max(512, min(16384, 262144 // 16)), 16384) = 16384
-        q16 = jnp.zeros((16, 2, 128), dtype=jnp.bfloat16)
-        weights16 = jnp.zeros((16, 2), dtype=jnp.float32)
-        lengths16 = jnp.full((16,), 10, dtype=jnp.int32)
-        scores16 = paged_index_scores_jax(q16, pool, records, weights16, lengths16)
-        assert scores16.shape == (16, 16384)
-
-        # 3. tokens = 512 -> budget hits 512 floor
-        q512 = jnp.zeros((512, 2, 128), dtype=jnp.bfloat16)
-        weights512 = jnp.zeros((512, 2), dtype=jnp.float32)
-        lengths512 = jnp.full((512,), 10, dtype=jnp.int32)
-        scores512 = paged_index_scores_jax(q512, pool, records, weights512, lengths512)
-        assert scores512.shape == (512, 16384)
-
-        # 4. Small width clamps budget via -(-width // 128) * 128
-        records_short = jnp.full((1, 256), -1, dtype=jnp.int32)
-        scores_short = paged_index_scores_jax(q, pool, records_short, weights, lengths)
-        assert scores_short.shape == (1, 256)
-
-    def test_paged_index_scores_pages_vs_unpaged_equivalence(self):
-        """paged_index_scores_jax with pages=True vs pages=False match."""
-        from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
-
-        rng = np.random.default_rng(200)
-        heads, dim = 2, 128
-        tokens, width = 4, 1024
-        page_records = 32
-
-        pool = jnp.asarray(
-            rng.integers(-(2**31), 2**31, (256, ROW_WORDS)), dtype=jnp.int32
-        ) & jnp.int32(0x3FFF3FFF)
-        pool_records = pool.shape[0] * index_key_layout.SLOTS
-        pages = rng.integers(
-            0, pool_records // page_records, (tokens, width // page_records)
-        )
-        records = (
-            (pages[..., None] * page_records + np.arange(page_records))
-            .reshape(tokens, width)
-            .astype(np.int32)
-        )
-        records[:, -10:] = -1  # invalid tail
-        records = jnp.asarray(records)
-
-        q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
-        weights = jnp.asarray(rng.standard_normal((tokens, heads)), jnp.float32)
-        lengths = jnp.asarray(rng.integers(50, width, tokens), dtype=jnp.int32)
-
-        # 1. Unpaged (page_records = None)
-        unpaged_scores = paged_index_scores_jax(
-            q, pool, records, weights, lengths, page_records=None
-        )
-        # 2. Paged (page_records = 32)
-        paged_scores = paged_index_scores_jax(
-            q, pool, records, weights, lengths, page_records=page_records
-        )
-        # 3. Non-dividing page_records (e.g. 300, tile % 300 != 0 -> pages = False)
-        nondiv_scores = paged_index_scores_jax(
-            q, pool, records, weights, lengths, page_records=300
-        )
-
-        valid = np.asarray(records >= 0)
-        np.testing.assert_allclose(
-            np.asarray(paged_scores)[valid],
-            np.asarray(unpaged_scores)[valid],
-            rtol=1e-5,
-            atol=1e-5,
-        )
-        np.testing.assert_allclose(
-            np.asarray(nondiv_scores)[valid],
-            np.asarray(unpaged_scores)[valid],
-            rtol=1e-5,
-            atol=1e-5,
-        )
-
-    def test_paged_index_scores_request_branches(self):
-        """Covers requests is not None (decode tokens <= records vs prefill)."""
-        heads, dim = 2, 128
-        pool = jnp.zeros((64, ROW_WORDS), dtype=jnp.int32)
-
-        # Branch 1a: requests is not None, tokens <= records.shape[0],
-        # tokens >= 6 and tokens % 6 == 0 (grouped branch with tokens=6 and tokens=18)
-        q_dec = jnp.zeros((18, heads, dim), dtype=jnp.bfloat16)
-        records_dec = jnp.full((24, 256), -1, dtype=jnp.int32)
-        weights_dec = jnp.zeros((18, heads), dtype=jnp.float32)
-        lengths_dec = jnp.full((18,), 10, dtype=jnp.int32)
-        requests_dec = jnp.zeros((18,), dtype=jnp.int32)
-
-        res_dec_18 = paged_index_scores_jax(
-            q_dec,
-            pool,
-            records_dec,
-            weights_dec,
-            lengths_dec,
-            requests=requests_dec,
-            page_records=16,
-        )
-        assert res_dec_18.shape == (18, 256)
-
-        res_dec = paged_index_scores_jax(
-            q_dec[:6],
-            pool,
-            records_dec,
-            weights_dec[:6],
-            lengths_dec[:6],
-            requests=requests_dec[:6],
-            page_records=16,
-        )
-        assert res_dec.shape == (6, 256)
-
-        # Branch 1b: requests is not None, tokens <= records.shape[0],
-        # tokens not divisible by 6 (tokens = 2 and tokens = 7)
-        res_dec_2 = paged_index_scores_jax(
-            q_dec[:2],
-            pool,
-            records_dec,
-            weights_dec[:2],
-            lengths_dec[:2],
-            requests=requests_dec[:2],
-            page_records=16,
-        )
-        assert res_dec_2.shape == (2, 256)
-
-        res_dec_7 = paged_index_scores_jax(
-            q_dec[:7],
-            pool,
-            records_dec,
-            weights_dec[:7],
-            lengths_dec[:7],
-            requests=requests_dec[:7],
-            page_records=16,
-        )
-        assert res_dec_7.shape == (7, 256)
-
-        # Branch 2: requests is not None and tokens > records.shape[0]
-        # (prefill row_step loop)
-        q_pref = jnp.zeros((4, heads, dim), dtype=jnp.bfloat16)
-        records_pref = jnp.full((2, 256), -1, dtype=jnp.int32)
-        weights_pref = jnp.zeros((4, heads), dtype=jnp.float32)
-        lengths_pref = jnp.array([10, 10, 20, 20], dtype=jnp.int32)
-        requests_pref = jnp.array([0, 0, 1, 1], dtype=jnp.int32)
-
-        res_pref = paged_index_scores_jax(
-            q_pref,
-            pool,
-            records_pref,
-            weights_pref,
-            lengths_pref,
-            requests=requests_pref,
-            page_records=16,
-        )
-        assert res_pref.shape == (4, 256)
 
     def test_visible_top_k_sparsecore_and_fallback_branches(self, monkeypatch):
         """Covers _visible_top_k unpadded rows < 16, rows >= 16, and fallback."""
@@ -406,168 +91,6 @@ class TestAttentionKernelsDecodeIndexer:
         )
         assert out_thresh.shape == (16, 16)
 
-    def test_paged_indexer_and_wrappers_dispatch(self, monkeypatch):
-        """Covers paged_indexer, select_indexer_jax, and initialize_indexer."""
-        # 1. paged_indexer wrapper with batch_max=None and page_records
-        called_args = []
-
-        def mock_op(*args):
-            called_args.append(args)
-            return (
-                torch.zeros(args[0].shape[0], args[8], dtype=torch.int32),
-                args[5],
-            )
-
-        monkeypatch.setattr(indexer_bf16, "_indexer_op", mock_op)
-
-        q = torch.zeros(4, 2, 128)
-        pool = torch.zeros(16, ROW_WORDS, dtype=torch.int32)
-        cache_obj = SimpleNamespace(raw=pool)
-        records = torch.zeros(4, 256, dtype=torch.int32)
-        weights = torch.zeros(4, 256)
-        lengths = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
-        candidates = torch.zeros(4, 8, dtype=torch.int32)
-        requests = torch.arange(4, dtype=torch.int32)
-
-        # Without batch_max (defaults to lengths.max()) and without
-        # page_records (defaults to 0)
-        paged_indexer(
-            q,
-            cache_obj,
-            records,
-            weights,
-            lengths,
-            candidates,
-            requests,
-            topk=16,
-            block_size=16,
-            candidate_write=False,
-            sparse_logits=False,
-        )
-        assert len(called_args) == 1
-        # page_records follows the eight tensor inputs and five selectors.
-        assert called_args[0][13] == 0
-        assert int(called_args[0][7].item()) == 40
-
-        # With explicit batch_max and page_records
-        paged_indexer(
-            q,
-            cache_obj,
-            records,
-            weights,
-            lengths,
-            candidates,
-            requests,
-            topk=16,
-            block_size=16,
-            candidate_write=False,
-            sparse_logits=False,
-            batch_max=torch.tensor(50, dtype=torch.int32),
-            page_records=32,
-        )
-        assert len(called_args) == 2
-        assert called_args[1][13] == 32
-        assert int(called_args[1][7].item()) == 50
-
-        # 2. select_indexer_jax with page_records=0 vs page_records=64
-        q_j = jnp.zeros((2, 2, 128), dtype=jnp.bfloat16)
-        pool_j = jnp.zeros((16, ROW_WORDS), dtype=jnp.int32)
-        records_j = jnp.full((2, 256), -1, dtype=jnp.int32)
-        weights_j = jnp.zeros((2, 2), dtype=jnp.float32)
-        lengths_j = jnp.array([10, 20], dtype=jnp.int32)
-        cand_j = jnp.full((2, 4), -1, dtype=jnp.int32)
-        req_j = jnp.arange(2, dtype=jnp.int32)
-
-        sel0, pub0 = select_indexer_jax(
-            q_j,
-            pool_j,
-            records_j,
-            weights_j,
-            lengths_j,
-            cand_j,
-            req_j,
-            topk=16,
-            block_size=16,
-            batch_max=jnp.array(20, dtype=jnp.int32),
-            candidate_write=False,
-            sparse_logits=False,
-            unordered=False,
-            page_records=0,
-        )
-        assert sel0.shape == (2, 16)
-
-        sel64, pub64 = select_indexer_jax(
-            q_j,
-            pool_j,
-            records_j,
-            weights_j,
-            lengths_j,
-            cand_j,
-            req_j,
-            topk=16,
-            block_size=16,
-            batch_max=jnp.array(20, dtype=jnp.int32),
-            candidate_write=False,
-            sparse_logits=False,
-            unordered=False,
-            page_records=64,
-        )
-        assert sel64.shape == (2, 16)
-
-    @pytest.mark.cpu_test
-    @pytest.mark.parametrize("bank_count", [1, 2])
-    def test_initialize_indexer_and_fake_handler(self, bank_count):
-        """Covers initialize_indexer custom op and fake tensor registration."""
-        from jax.sharding import Mesh
-
-        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-            set_vllm_model_wrapper_context,
-        )
-
-        mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
-        with set_vllm_model_wrapper_context(mesh=mesh):
-            indexer_bf16._indexer_op = None
-            initialize_indexer()
-            assert indexer_bf16._indexer_op is not None
-            # Test early return branch
-            saved_op = indexer_bf16._indexer_op
-            initialize_indexer()
-            assert indexer_bf16._indexer_op is saved_op
-
-        # Verify fake registration by calling op with meta device tensors
-        q = torch.empty((4, 2, 128), dtype=torch.bfloat16, device="meta")
-        pool = torch.empty((16, ROW_WORDS), dtype=torch.int32, device="meta")
-        records = torch.empty((4, 256), dtype=torch.int32, device="meta")
-        weights = torch.empty((4, 256), dtype=torch.float32, device="meta")
-        lengths = torch.empty((4,), dtype=torch.int32, device="meta")
-        candidates = torch.empty((4, 8), dtype=torch.int32, device="meta")
-        requests = torch.empty((4,), dtype=torch.int32, device="meta")
-        batch_max = torch.empty((1,), dtype=torch.int32, device="meta")
-
-        op = (
-            indexer_bf16._indexer_op
-            if bank_count == 1
-            else indexer_bf16._indexer_2bank_op
-        )
-        f_sel, f_pub = op(
-            q,
-            *((pool,) * bank_count),
-            records,
-            weights,
-            lengths,
-            candidates,
-            requests,
-            batch_max,
-            16,
-            16,
-            False,
-            False,
-            False,
-            32,
-        )
-        assert f_sel.shape == (4, 16)
-        assert f_pub.shape == candidates.shape
-
 
 class TestAttentionSelectPagedIndicesDecode:
     """Coverage for v2/attention.py _select_paged_indices / changes."""
@@ -588,6 +111,7 @@ class TestAttentionSelectPagedIndicesDecode:
         attn.candidate_block_buffer = torch.full((128, 8), -1, dtype=torch.int32)
         attn.indexer = SimpleNamespace(
             head_dim=128,
+            softmax_scale=128**-0.5,
             n_head=2,
             indexer_op=v2_attn.SparseMQAIndexer(
                 SimpleNamespace(prefix="source-a"),
@@ -598,7 +122,6 @@ class TestAttentionSelectPagedIndicesDecode:
                 candidate_write=candidate_write,
             ),
         )
-        attn._project_index_q = lambda q, p: q
         attn._project_index_q_unquantized = lambda q, p: torch.zeros(q.shape[0], 2, 128)
 
         monkeypatch.setattr(
@@ -611,16 +134,10 @@ class TestAttentionSelectPagedIndicesDecode:
         )
         return attn
 
-    def _make_selection_call(self, attn, count, *, cache_offset=0, packed=False):
-        cache_type = PackedFP8IndexCacheRows if packed else IndexCacheRows
-        cache = cache_type(
-            torch.zeros((64, 128 if packed else ROW_WORDS), dtype=torch.int32),
-            (
-                (4, 16, 132 if packed else 128),
-                torch.uint8 if packed else torch.bfloat16,
-                32 * 256,
-                cache_offset,
-            ),
+    def _make_selection_call(self, attn, count, *, cache_offset=0):
+        cache = PackedFP8IndexCacheRows(
+            torch.zeros((64, 128), dtype=torch.int32),
+            ((4, 16, 132), torch.uint8, 32 * 256, cache_offset),
         )
         return partial(
             attn._select_paged_indices,
@@ -635,11 +152,10 @@ class TestAttentionSelectPagedIndicesDecode:
         )
 
     @pytest.mark.parametrize("count", [1, 16, 17, 32])
-    @pytest.mark.parametrize("packed", [False, True], ids=["bf16", "fp8"])
     def test_select_paged_indices_split_part_and_padding_calculation(
-        self, count, packed, monkeypatch
+        self, count, monkeypatch
     ):
-        """Split queries keep their owners; FP8 padding has no request owner."""
+        """Split queries keep their owners; padding rows have no request owner."""
         ranks = 8
         attn = self._setup_mock_attn(monkeypatch, ranks=ranks)
 
@@ -658,25 +174,21 @@ class TestAttentionSelectPagedIndicesDecode:
         ):
             captured_args["q_part_shape"] = q_part.shape
             captured_args["lengths_part_shape"] = lengths_part.shape
-            captured_args["page_records"] = kwargs.get("page_records")
             expected_part = max(2, ((count + ranks - 1) // ranks + 1) & ~1)
             live = min(count, expected_part)
             torch.testing.assert_close(
                 requests_part[:live], torch.arange(live, dtype=torch.int32)
             )
-            assert torch.all(requests_part[live:] == (-1 if packed else 0))
+            assert torch.all(requests_part[live:] == -1)
             assert torch.all(lengths_part[live:] == 0)
             return (
                 torch.zeros(expected_part, 4, dtype=torch.int32),
                 candidates_part,
             )
 
-        monkeypatch.setattr(indexer_bf16, "paged_indexer", mock_paged_indexer)
         monkeypatch.setattr(indexer_fp8, "paged_fp8_indexer", mock_paged_indexer)
 
-        select = self._make_selection_call(
-            attn, count, cache_offset=16 * 256, packed=packed
-        )
+        select = self._make_selection_call(attn, count, cache_offset=16 * 256)
 
         with v2_attn.stage_attention_cache_scope():
             selected = select()
@@ -685,8 +197,6 @@ class TestAttentionSelectPagedIndicesDecode:
         expected_part = max(2, ((count + ranks - 1) // ranks + 1) & ~1)
         assert captured_args["q_part_shape"][0] == expected_part
         assert captured_args["lengths_part_shape"][0] == expected_part
-        if not packed:  # The FP8 route takes no page_records.
-            assert captured_args["page_records"] == 16
 
     def test_select_paged_indices_candidate_write_and_published_buffer(
         self, monkeypatch
@@ -715,7 +225,7 @@ class TestAttentionSelectPagedIndicesDecode:
                 pub_part,
             )
 
-        monkeypatch.setattr(indexer_bf16, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_fp8, "paged_fp8_indexer", mock_paged_indexer)
 
         select = self._make_selection_call(attn, count)
 
@@ -759,7 +269,7 @@ class TestAttentionSelectPagedIndicesDecode:
                 candidates_part,
             )
 
-        monkeypatch.setattr(indexer_bf16, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_fp8, "paged_fp8_indexer", mock_paged_indexer)
 
         select = self._make_selection_call(attn, count)
 
@@ -796,7 +306,7 @@ class TestAttentionSelectPagedIndicesDecode:
                 candidates_part,
             )
 
-        monkeypatch.setattr(indexer_bf16, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_fp8, "paged_fp8_indexer", mock_paged_indexer)
 
         select = self._make_selection_call(attn, count)
 
@@ -810,38 +320,3 @@ class TestAttentionSelectPagedIndicesDecode:
             sel2 = select()
             assert sel2.shape == (count, 4)
             assert call_count == 2
-
-            # Selection must leave both banks of the Index-K owner unchanged.
-            raw_lo = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
-            raw_hi = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
-            layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 0)
-            index_cache_2b = IndexCacheRows((raw_lo, raw_hi), layout)
-            monkeypatch.setattr(
-                indexer_bf16,
-                "paged_indexer",
-                lambda q_part, idx_c, *a, **kw: (
-                    torch.zeros(q_part.shape[0], 4, dtype=torch.int32),
-                    a[3],
-                ),
-            )
-            sel3 = select(index_cache=index_cache_2b)
-            assert sel3.shape == (count, 4)
-            assert torch.all(index_cache_2b.raw == 0)
-            assert torch.all(index_cache_2b.raw_hi == 0)
-
-
-@pytest.mark.cpu_test
-def test_candidate_envelope_keeps_token_rows_dynamic():
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.candidates import (
-        cache_capacity,
-    )
-
-    def route(q):
-        capacity = cache_capacity(tuple(q.shape), (2, 98304), 2048, 8, 128)
-        return q + (1 if capacity is not None else 0)
-
-    compiled = torch.compile(route, backend="eager", fullgraph=True)
-    for rows in (12, 13, 2048):
-        q = torch.zeros((rows, 32, 128), dtype=torch.bfloat16)
-        torch._dynamo.mark_dynamic(q, 0, min=2, max=4096)
-        torch.testing.assert_close(compiled(q), q + 1)

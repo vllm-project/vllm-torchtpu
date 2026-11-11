@@ -322,6 +322,7 @@ def _create_mock_attention():
     attn.indexer = SimpleNamespace(
         n_head=64,
         head_dim=128,
+        softmax_scale=128**-0.5,
         weights_proj=lambda x: x[..., :64],
         wq_b=lambda x: x,
         indexer_op=SimpleNamespace(
@@ -516,16 +517,17 @@ def test_run_parallel_input_projections_and_all_indices_fit():
     assert attn._all_indices_fit is False
 
 
-def test_attention_quantize_and_project_index_q():
-    """Test _quantize_indexer and _project_index_q."""
+def test_attention_project_index_q():
+    """Test _project_index_q_unquantized."""
     attn = _create_mock_attention()
     attn.indexer.head_dim = 16
+    attn.indexer.softmax_scale = 16**-0.5
     attn.indexer.n_head = 2
     attn._rotate = lambda q, pos: q
 
     qr = torch.randn(4, 32)
     positions = torch.arange(4)
-    projected = attn._project_index_q(qr, positions)
+    projected = attn._project_index_q_unquantized(qr, positions)
     assert projected.shape == (4, 2, 16)
 
 
@@ -580,12 +582,13 @@ def test_select_paged_indices_split_branches(monkeypatch):
     attn._fp8_kv = True
     attn.indexer = SimpleNamespace(
         head_dim=128,
+        softmax_scale=128**-0.5,
         n_head=2,
         indexer_op=SimpleNamespace(
             candidate_blocks=torch.zeros(4, 4), candidate_write=True
         ),
     )
-    attn._project_index_q = MagicMock(
+    attn._project_index_q_unquantized = MagicMock(
         side_effect=lambda q, pos: torch.zeros(q.shape[0], 2, 128)
     )
     attn.candidate_block_buffer = torch.zeros(32, 16, dtype=torch.int32)
@@ -624,7 +627,7 @@ def test_select_paged_indices_split_branches(monkeypatch):
         swa_slots,
     )
     assert selected.shape == (4, 32)
-    attn._project_index_q.assert_called()
+    attn._project_index_q_unquantized.assert_called()
 
     # 2. TP = 2 (split = True), candidate_write = False
     attn.indexer.indexer_op.candidate_write = False
@@ -646,7 +649,7 @@ def test_select_paged_indices_split_branches(monkeypatch):
     monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 1)
     attn.indexer.indexer_op.candidate_blocks = None
     attn.indexer.indexer_op.candidate_write = False
-    attn._project_index_q = MagicMock(return_value=torch.randn(4, 2, 128))
+    attn._project_index_q_unquantized = MagicMock(return_value=torch.randn(4, 2, 128))
     selected_single = v2_attn.DeepseekV41Attention._select_paged_indices(
         attn,
         qr,

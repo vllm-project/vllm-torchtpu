@@ -740,34 +740,6 @@ class TestCacheJaxHelpers:
         assert val_bf16.shape == (3, 64)
         assert val_bf16.dtype == jnp.bfloat16
 
-    def test_gather_cache_page_values(self):
-        cache = jnp.zeros((64, ROW_WORDS), dtype=jnp.int32)
-
-        # Error on unaligned record_words
-        with pytest.raises(ValueError, match="Pages must cover whole pool word rows"):
-            v2_cache.gather_cache_page_values(
-                cache, jnp.array([0]), page_records=3, elements=100
-            )
-
-        # Valid call
-        first_records = jnp.array([0, 4, -1], dtype=jnp.int32)
-        out = v2_cache.gather_cache_page_values(
-            cache, first_records, page_records=4, elements=64
-        )
-        assert out.shape == (12, 64)
-        assert out.dtype == jnp.bfloat16
-
-        # 2-bank valid call spanning bank 0 and bank 1
-        cache_2b = (cache[:32], cache[32:])
-        out_2b = v2_cache.gather_cache_page_values(
-            cache_2b,
-            jnp.array([0, 200, -1], dtype=jnp.int32),
-            page_records=4,
-            elements=64,
-        )
-        assert out_2b.shape == (12, 64)
-        assert out_2b.dtype == jnp.bfloat16
-
 
 # ==============================================================================
 # 7. Tests for v2/cache.py: Ops Initialization & Cache Mutation

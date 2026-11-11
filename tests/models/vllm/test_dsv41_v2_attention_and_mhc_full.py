@@ -755,46 +755,6 @@ class TestCommonMHCFull:
 class TestAttentionHelperFunctions:
     """Tests for standalone functions and cache addressing in v2/attention.py."""
 
-    def test_select_candidate_blocks(self):
-        # 1. Invalid parameter validations
-        with pytest.raises(ValueError, match="invalid candidate block parameters"):
-            v2_attn.select_candidate_blocks(torch.zeros(2, 10), [10, 10], -1, 4)
-        with pytest.raises(ValueError, match="invalid candidate block parameters"):
-            v2_attn.select_candidate_blocks(torch.zeros(2, 10), [10, 10], 2, 0)
-
-        # 2. width == 0
-        empty = v2_attn.select_candidate_blocks(torch.zeros(2, 0), [0, 0], 2, 4)
-        assert empty.shape == (2, 0)
-
-        # 3. Normal candidate block selection
-        logits = torch.randn(32)
-        lengths = 24
-        keep = v2_attn.select_candidate_blocks(
-            logits, lengths, topk_blocks=3, block_size=4
-        )
-        assert keep.shape == (32,)
-        assert keep.dtype == torch.bool
-
-    def test_select_compressed_indices(self):
-        # 1. topk < 0 -> ValueError
-        with pytest.raises(ValueError, match="topk must be nonnegative"):
-            v2_attn.select_compressed_indices(torch.zeros(2, 10), [10, 10], -1)
-
-        # 2. Without candidates
-        scores = torch.tensor([1.0, 3.0, 2.0, -torch.inf])
-        lengths = 3
-        idx = v2_attn.select_compressed_indices(scores, lengths, topk=2)
-        assert idx.shape == (2,)
-        assert idx[0] == 1
-        assert idx[1] == 2
-
-        # 3. With candidates mask
-        candidates = torch.tensor([True, False, True, True])
-        idx_cand = v2_attn.select_compressed_indices(
-            scores, lengths, topk=2, candidates=candidates
-        )
-        assert idx_cand.shape == (2,)
-
     def test_sparse_attention(self):
         # 1. kv.shape[1] == 0 or indices.shape[-1] == 0 -> returns zeros_like
         q = torch.randn(2, 4, 8, 16)
@@ -937,7 +897,9 @@ class TestAttentionHelperFunctions:
         cfg_other = SimpleNamespace(
             attention_config=SimpleNamespace(resolve_indexer_kv_dtype=lambda x: "fp4")
         )
-        with pytest.raises(ValueError, match="TPU V4.1 indexer requires bf16 or fp8"):
+        with pytest.raises(
+            ValueError, match="TPU V4.1 indexer requires indexer_kv_dtype=fp8"
+        ):
             v2_attn.indexer_uses_fp4(cfg_other)
 
         # 2. AttentionBackend
@@ -972,7 +934,7 @@ class TestAttentionHelperFunctions:
                 return_value=SimpleNamespace(
                     cache_config=SimpleNamespace(),
                     attention_config=SimpleNamespace(
-                        resolve_indexer_kv_dtype=lambda _: "bf16"
+                        resolve_indexer_kv_dtype=lambda _: "fp8"
                     ),
                     model_config=SimpleNamespace(
                         hf_config=SimpleNamespace(index_head_dim=128)
@@ -1167,43 +1129,3 @@ class TestDeepseekV41AttentionMethods:
         ) as mock_assert:
             attn._assert_o_proj_supported()
             mock_assert.assert_called_once_with(attn)
-
-    def test_select_indices_with_candidate_blocks(self):
-        attn = object.__new__(v2_attn.DeepseekV41Attention)
-        torch.nn.Module.__init__(attn)
-        attn._config = {"candidate_topk_blocks": 2, "index_topk": 4}
-        attn.candidate_block_size = 4
-        attn.candidate_block_buffer = torch.full((4, 4), -1, dtype=torch.int32)
-
-        scores = torch.randn(1, 1, 32)
-        lengths = torch.tensor([16])
-        logical = torch.arange(32)[None, :]
-
-        # 1. Candidate write path (candidate_write = True)
-        mock_indexer_op_write = SimpleNamespace(
-            candidate_blocks=True, candidate_write=True
-        )
-        attn.indexer = SimpleNamespace(indexer_op=mock_indexer_op_write)
-
-        idx_write = attn._select_indices(scores, lengths, logical, 1)
-        assert idx_write.shape == (1, 4)
-
-        # 2. Candidate read path (candidate_write = False)
-        mock_indexer_op_read = SimpleNamespace(
-            candidate_blocks=True, candidate_write=False
-        )
-        attn.indexer = SimpleNamespace(indexer_op=mock_indexer_op_read)
-
-        idx_read = attn._select_indices(scores, lengths, logical, 1)
-        assert idx_read.shape == (1, 4)
-
-        # 3. lengths.max() <= index_topk branch
-        lengths_small = torch.tensor([2])
-        idx_small = attn._select_indices(scores, lengths_small, logical, 1)
-        assert idx_small.shape == (1, 4)
-
-        # 4. candidate_blocks is None (exercises 1498->1548 False branch)
-        mock_indexer_op_none = SimpleNamespace(candidate_blocks=None)
-        attn.indexer = SimpleNamespace(indexer_op=mock_indexer_op_none)
-        idx_none = attn._select_indices(scores, lengths, logical, 1)
-        assert idx_none.shape == (1, 4)

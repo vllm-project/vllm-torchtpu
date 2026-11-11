@@ -32,7 +32,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as v2_cache
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     ROW_WORDS,
-    IndexCacheRows,
     PagedCacheRows,
 )
 
@@ -495,10 +494,9 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         assert comp.forward(torch.ones(count, 10), positions) is None
 
     @pytest.mark.cpu_test
-    @pytest.mark.parametrize("packed_fp8", [False, True])
     @pytest.mark.parametrize("short_context", [False, True])
     def test_write_global_kv_addressing_cached_and_uncached(
-        self, monkeypatch, packed_fp8, short_context
+        self, monkeypatch, short_context
     ):
         """Verify _write_global_kv cache hits/misses across ratios."""
         count = 4
@@ -535,21 +533,19 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         attn._config = {"index_topk": 4}
         attn._max_model_len = 8 if short_context else 1000
         attn._rotate = lambda x, p: x
-        attn._quantize_indexer = lambda x: x
         attn.compressor = lambda score, pos: torch.ones(count, 8)
 
         kv_cache_mock = MagicMock(spec=PagedCacheRows)
         kv_cache_mock.shape = (4, 32, 128)
         attn.kv_cache = kv_cache_mock
 
-        idx_cache_mock = MagicMock(
-            spec=v2_attn.PackedFP8IndexCacheRows if packed_fp8 else IndexCacheRows
-        )
+        idx_cache_mock = MagicMock(spec=v2_attn.PackedFP8IndexCacheRows)
         idx_cache_mock.shape = (4, 32, 128)
         idx_cache_mock.row_indices = lambda slots: slots + 100
 
         indexer_mock = SimpleNamespace(
             head_dim=8,
+            softmax_scale=8**-0.5,
             n_head=2,
             wk=lambda lat: lat,
             k_norm=lambda k: k,
@@ -628,10 +624,11 @@ class TestCompressedAttentionAndQuerySplitCaching:
         attn.candidate_block_buffer = None
         attn.indexer = SimpleNamespace(
             head_dim=8,
+            softmax_scale=8**-0.5,
             n_head=2,
             indexer_op=SimpleNamespace(candidate_blocks=None, candidate_write=False),
         )
-        attn._project_index_q = lambda q, p: q
+        attn._project_index_q_unquantized = lambda q, p: q
 
         attn.indexer.indexer_op = MagicMock(
             side_effect=lambda q, *a, **kw: (
@@ -766,6 +763,7 @@ class TestCompressedAttentionAndQuerySplitCaching:
         )
         attn.indexer = SimpleNamespace(
             head_dim=8,
+            softmax_scale=8**-0.5,
             n_head=2,
             wk=lambda x: x,
             k_norm=lambda x: x,
@@ -773,8 +771,8 @@ class TestCompressedAttentionAndQuerySplitCaching:
                 prefix="idx_pfx", compress_ratio=2, kv_cache=idx_cache_mock
             ),
         )
-        attn._project_index_q = lambda q, p: torch.zeros((count, 2, 8))
-        attn._select_indices = lambda scores, lengths, logical, c: torch.zeros(
+        attn._project_index_q_unquantized = lambda q, p: torch.zeros((count, 2, 8))
+        attn._select_paged_indices = lambda *a, **kw: torch.zeros(
             (count, 2), dtype=torch.int32
         )
 
@@ -800,6 +798,7 @@ class TestCompressedAttentionAndQuerySplitCaching:
         attn_tiled_bf16.topk_indices_buffer = torch.full((16, 4), -1, dtype=torch.int32)
         attn_tiled_bf16.indexer = SimpleNamespace(
             head_dim=8,
+            softmax_scale=8**-0.5,
             n_head=2,
             wk=lambda x: x,
             k_norm=lambda x: x,
@@ -807,11 +806,8 @@ class TestCompressedAttentionAndQuerySplitCaching:
                 prefix="idx_pfx", compress_ratio=2, kv_cache=idx_cache_mock
             ),
         )
-        attn_tiled_bf16._project_index_q = lambda q, p: torch.zeros((count, 2, 8))
-        attn_tiled_bf16._select_indices = (
-            lambda scores, lengths, logical, c: torch.zeros(
-                (count, 2), dtype=torch.int32
-            )
+        attn_tiled_bf16._project_index_q_unquantized = lambda q, p: torch.zeros(
+            (count, 2, 8)
         )
         attn_tiled_bf16._select_paged_indices = lambda *a, **kw: torch.zeros(
             (count, 2), dtype=torch.int32

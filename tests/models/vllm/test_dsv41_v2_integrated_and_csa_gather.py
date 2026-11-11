@@ -38,10 +38,9 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
     attention as v2_attn,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_bf16, indexer_select
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_select
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     ROW_WORDS,
-    gather_cache_page_values,
 )
 
 
@@ -413,7 +412,7 @@ class TestIntegratedEvenQuerySplit:
         mock_attn.has_fast_idx_offset = False
         mock_attn.candidate_block_buffer = None
         mock_attn.paged_index_block_buffer = None
-        mock_attn._project_index_q = lambda q, pos: q
+        mock_attn._project_index_q_unquantized = lambda q, pos: q
 
         captured_args = {}
 
@@ -540,139 +539,3 @@ class TestIntegratedAttentionKernelsDecode:
             scores_small, 64, bound=jnp.max(lengths), lengths=None, unordered=False
         )
         assert out_fallback.shape == (3, 64)
-
-    def test_paged_indexer_candidate_context_sparsecore_and_fallback(self, monkeypatch):
-        """Candidate_context covers both SparseCore top-k and fallback paths."""
-        tokens = 2
-        width = 4096
-        topk = 64
-        block_size = 16
-        q = jnp.zeros((tokens, 1, 128), dtype=jnp.bfloat16)
-        pool = jnp.zeros((1000, 128), dtype=jnp.int32)
-        records = jnp.zeros((tokens, width), dtype=jnp.int32)
-        weights = jnp.zeros((tokens, 1), dtype=jnp.float32)
-        lengths = jnp.full((tokens,), 50, dtype=jnp.int32)
-        requests = jnp.arange(tokens, dtype=jnp.int32)
-
-        monkeypatch.setattr(
-            indexer_select,
-            "_sparsecore_top_k",
-            lambda s, k, lengths_arg: jnp.zeros((s.shape[0], k), dtype=jnp.int32),
-        )
-
-        # 1. SparseCore top-k branch in candidate_context
-        # (candidates.shape[1] * block_size >= 2048)
-        candidates_sc = jnp.zeros((tokens, 128), dtype=jnp.int32)  # 128 * 16 = 2048
-        sel_sc, cand_sc = indexer_bf16.paged_indexer_jax(
-            q,
-            pool,
-            records,
-            weights,
-            lengths,
-            candidates_sc,
-            requests,
-            topk=topk,
-            block_size=block_size,
-            candidate_write=False,
-            sparse_logits=True,
-            unordered=True,
-            page_records=16,
-        )
-        assert sel_sc.shape == (tokens, topk)
-        assert cand_sc.shape == (tokens, 128)
-
-        # 2. Fallback lax.top_k branch in candidate_context
-        # (candidates.shape[1] * block_size < 2048)
-        candidates_fb = jnp.zeros((tokens, 8), dtype=jnp.int32)  # 8 * 16 = 128 < 2048
-        sel_fb, cand_fb = indexer_bf16.paged_indexer_jax(
-            q,
-            pool,
-            records,
-            weights,
-            lengths,
-            candidates_fb,
-            requests,
-            topk=topk,
-            block_size=block_size,
-            candidate_write=False,
-            sparse_logits=True,
-            unordered=False,
-            page_records=None,
-        )
-        assert sel_fb.shape == (tokens, topk)
-        assert cand_fb.shape == (tokens, 8)
-
-    def test_select_indexer_jax_and_wrappers_with_page_records(self):
-        """Verifies page_records forwarding in select_indexer_jax."""
-        tokens = 2
-        width = 256
-        topk = 32
-        q = jnp.zeros((tokens, 1, 128), dtype=jnp.bfloat16)
-        pool = jnp.zeros((1000, 128), dtype=jnp.int32)
-        records = jnp.zeros((tokens, width), dtype=jnp.int32)
-        weights = jnp.zeros((tokens, 1), dtype=jnp.float32)
-        lengths = jnp.full((tokens,), 20, dtype=jnp.int32)
-        candidates = jnp.zeros((tokens, 0), dtype=jnp.int32)
-        requests = jnp.arange(tokens, dtype=jnp.int32)
-        batch_max = lengths.max()
-
-        # Case 1: page_records > 0
-        sel1, pub1 = indexer_bf16.select_indexer_jax(
-            q,
-            pool,
-            records,
-            weights,
-            lengths,
-            candidates,
-            requests,
-            batch_max,
-            topk,
-            16,
-            candidate_write=False,
-            sparse_logits=False,
-            unordered=False,
-            page_records=16,
-        )
-        assert sel1.shape == (tokens, topk)
-
-        # Case 2: page_records == 0 (disables page gathers)
-        sel2, pub2 = indexer_bf16.select_indexer_jax(
-            q,
-            pool,
-            records,
-            weights,
-            lengths,
-            candidates,
-            requests,
-            batch_max,
-            topk,
-            16,
-            candidate_write=False,
-            sparse_logits=False,
-            unordered=False,
-            page_records=0,
-        )
-        assert sel2.shape == (tokens, topk)
-
-
-# ==============================================================================
-# 5. v2/cache.py: gather_cache_page_values Coverage
-# ==============================================================================
-
-
-class TestGatherCachePageValuesFull:
-    """Verifies gather_cache_page_values layout guards, page gathers, and sentinels."""
-
-    def test_gather_cache_page_values_layout_and_math(self):
-        cache = jnp.arange(64 * ROW_WORDS, dtype=jnp.int32).reshape(64, ROW_WORDS)
-        page_records = 16
-        elements = 128
-
-        # Valid call
-        first_records = jnp.array([0, 16, -1], dtype=jnp.int32)
-        out = gather_cache_page_values(cache, first_records, page_records, elements)
-        assert out.shape == (3 * page_records, elements)
-
-        # Invalid row words coverage
-        with pytest.raises(ValueError, match="Pages must cover whole pool word rows"):
-            gather_cache_page_values(cache, first_records, page_records=5, elements=128)
