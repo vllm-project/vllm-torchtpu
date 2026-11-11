@@ -1,0 +1,219 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""MSA block selection and sparse attention against a brute-force reference."""
+
+import functools
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from tests.models.minimax_m3.experimental.packing import (
+    CACHE_DTYPES,
+    pack,
+    rounded,
+    unpack,
+)
+from vllm_torchtpu.models.minimax_m3.experimental.kernels import (
+    msa,
+    msa_indexer,
+    msa_select,
+)
+
+BLOCK = 16
+HEAD_DIM = 128
+Q_PER_KV = 4
+TOPK = 4
+BF16 = jnp.bfloat16
+
+
+def _reference(q, k, v, iq, ik, ctx_k, ctx_v, ctx_ik, q_lens, ctx_lens, sm_scale):
+    """Dense numpy MSA over each request's full context + new tokens."""
+    outs = []
+    start = 0
+    for r, (q_len, ctx_len) in enumerate(zip(q_lens, ctx_lens)):
+        keys = np.concatenate([ctx_k[r][:ctx_len], k[start : start + q_len, 0]])
+        vals = np.concatenate([ctx_v[r][:ctx_len], v[start : start + q_len, 0]])
+        ikeys = np.concatenate([ctx_ik[r][:ctx_len], ik[start : start + q_len]])
+        for i in range(q_len):
+            p = ctx_len + i
+            s = ikeys[: p + 1] @ iq[start + i, 0]
+            nvis = p // BLOCK + 1
+            bscore = np.full(nvis, -np.inf)
+            for b in range(nvis):
+                bscore[b] = s[b * BLOCK : (b + 1) * BLOCK].max()
+            bscore[nvis - 1] = np.inf
+            chosen = np.argsort(-bscore)[: min(TOPK, nvis)]
+            mask = np.zeros(p + 1, bool)
+            for b in chosen:
+                mask[b * BLOCK : (b + 1) * BLOCK] = True
+            mask = mask[: p + 1]
+            logits = (q[start + i] @ keys[: p + 1].T) * sm_scale
+            logits = np.where(mask[None], logits, -np.inf)
+            w = np.exp(logits - logits.max(-1, keepdims=True))
+            w /= w.sum(-1, keepdims=True)
+            outs.append(w @ vals[: p + 1])
+        start += q_len
+    return np.stack(outs)
+
+
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
+@pytest.mark.parametrize("small_chunks", [False, True])
+@pytest.mark.parametrize("jit", [False, True])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens",
+    [
+        ([1, 1, 1], [70, 5, 200]),  # decode
+        ([40], [0]),  # first prefill chunk
+        ([1, 37, 3], [129, 60, 17]),  # mixed batch
+    ],
+)
+def test_msa_forward_matches_dense_reference(
+    q_lens, ctx_lens, jit, small_chunks, dtype, monkeypatch
+):
+    # The decode-tile DMA ring copies its pages one by one; at the serving
+    # default of 128 pages per step interpret mode spends minutes per call on
+    # copies of pages past the request (pages_per_seq is 16 here).
+    monkeypatch.setattr(msa_indexer, "DEFAULT_SMALL_PAGES_PER_STEP", 16)
+    if small_chunks:
+        # Several indexer tiles per request and page groups per tile, and
+        # several attention tiles and page groups per step.
+        monkeypatch.setattr(msa_indexer, "DEFAULT_BLOCK_Q", 16)
+        monkeypatch.setattr(msa_indexer, "DEFAULT_LARGE_BLOCK_Q", 8)
+        monkeypatch.setattr(msa_indexer, "DEFAULT_PAGES_PER_STEP", 2)
+        monkeypatch.setattr(msa_indexer, "DEFAULT_SMALL_PAGES_PER_STEP", 2)
+    rng = np.random.default_rng(0)
+    num_seqs = len(q_lens)
+    max_num_seqs = num_seqs + 1
+    pages_per_seq = 16
+    num_pages = max_num_seqs * pages_per_seq + 1
+    num_real = sum(q_lens)
+    num_tokens = num_real + 3
+    num_heads = Q_PER_KV
+    f32 = np.float32
+
+    q = rng.standard_normal((num_tokens, num_heads, HEAD_DIM)).astype(f32)
+    k = rng.standard_normal((num_tokens, 1, HEAD_DIM)).astype(f32)
+    v = rng.standard_normal((num_tokens, 1, HEAD_DIM)).astype(f32)
+    iq = rng.standard_normal((num_tokens, 1, HEAD_DIM)).astype(f32)
+    ik = rng.standard_normal((num_tokens, HEAD_DIM)).astype(f32)
+    ctx_k = rng.standard_normal((num_seqs, 256, HEAD_DIM)).astype(f32)
+    ctx_v = rng.standard_normal((num_seqs, 256, HEAD_DIM)).astype(f32)
+    ctx_ik = rng.standard_normal((num_seqs, 256, HEAD_DIM)).astype(f32)
+    # Queries stay bf16; keys and values are what the caches store.
+    q, iq = (rounded(x, BF16) for x in (q, iq))
+    k, v, ik, ctx_k, ctx_v, ctx_ik = (
+        rounded(x, dtype) for x in (k, v, ik, ctx_k, ctx_v, ctx_ik)
+    )
+
+    # Shuffled physical pages; page 0 stays unused.
+    perm = rng.permutation(np.arange(1, num_pages))
+    block_tables = np.zeros((max_num_seqs, pages_per_seq), np.int32)
+    block_tables[:num_seqs] = perm[: num_seqs * pages_per_seq].reshape(num_seqs, -1)
+
+    kv_rows = np.zeros((num_pages, BLOCK, 2 * HEAD_DIM), f32)
+    index_rows = np.zeros((num_pages, BLOCK, HEAD_DIM), f32)
+    for r in range(num_seqs):
+        for j in range(ctx_lens[r]):
+            page = block_tables[r, j // BLOCK]
+            kv_rows[page, j % BLOCK] = np.concatenate([ctx_k[r, j], ctx_v[r, j]])
+            index_rows[page, j % BLOCK] = ctx_ik[r, j]
+
+    seq_lens = np.zeros(max_num_seqs, np.int32)
+    seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
+    cu_q = np.full(max_num_seqs + 1, num_real, np.int32)
+    cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
+    dist = np.array([num_seqs] * 3, np.int32)
+    sm_scale = HEAD_DIM**-0.5
+
+    forward = functools.partial(
+        msa.msa_forward,
+        sm_scale=sm_scale,
+        topk=TOPK,
+        init_blocks=0,
+        local_blocks=1,
+        interpret=True,
+    )
+    if jit:
+        forward = jax.jit(forward)
+    new_kv, new_idx, out = forward(
+        *(jnp.asarray(x).astype(BF16) for x in (q, k, v, iq, ik)),
+        pack(kv_rows, dtype),
+        pack(index_rows, dtype),
+        *(jnp.asarray(x) for x in (seq_lens, block_tables.reshape(-1), cu_q, dist)),
+    )
+
+    expected = _reference(
+        q, k, v, iq, ik, ctx_k, ctx_v, ctx_ik, q_lens, ctx_lens, sm_scale
+    )
+    out = np.asarray(out.astype(jnp.float32))
+    np.testing.assert_allclose(out[:num_real], expected, atol=3e-2)
+    new_kv, new_idx = unpack(new_kv), unpack(new_idx)
+    np.testing.assert_array_equal(out[num_real:], 0)
+    start = 0
+    for r in range(num_seqs):
+        for i in range(q_lens[r]):
+            p = ctx_lens[r] + i
+            page = block_tables[r, p // BLOCK]
+            slot = p % BLOCK
+            written = {
+                "k": new_kv[page, slot, :HEAD_DIM],
+                "v": new_kv[page, slot, HEAD_DIM:],
+                "index_k": new_idx[page, slot],
+            }
+            expected_rows = {"k": k[start + i, 0], "v": v[start + i, 0]}
+            expected_rows["index_k"] = ik[start + i]
+            for name, row in written.items():
+                np.testing.assert_array_equal(row, expected_rows[name], name)
+        start += q_lens[r]
+    np.testing.assert_array_equal(new_kv[0], 0)
+
+
+def test_select_blocks_forces_local_and_pads():
+    scores = jnp.array([[[5.0, 1.0, 9.0, 2.0, 7.0]]])
+    pos = jnp.array([2 * BLOCK + 3])  # local block 2; blocks 3, 4 not visible
+    picked = msa_select.select_blocks(
+        scores,
+        pos,
+        block_size=BLOCK,
+        topk=4,
+        init_blocks=0,
+        local_blocks=1,
+        block_rows=8,
+        interpret=True,
+    )
+    np.testing.assert_array_equal(np.asarray(picked), [[[2, 0, 1, -1]]])
+    picked = msa_select.select_blocks(
+        scores,
+        pos,
+        block_size=BLOCK,
+        topk=2,
+        init_blocks=0,
+        local_blocks=1,
+        block_rows=8,
+        interpret=True,
+    )
+    np.testing.assert_array_equal(np.asarray(picked), [[[2, 0]]])
+    picked = msa_select.select_blocks(
+        scores,
+        pos,
+        block_size=BLOCK,
+        topk=2,
+        init_blocks=1,
+        local_blocks=1,
+        block_rows=8,
+        interpret=True,
+    )
+    np.testing.assert_array_equal(np.asarray(picked), [[[0, 2]]])
