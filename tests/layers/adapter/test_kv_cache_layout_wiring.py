@@ -452,8 +452,9 @@ def test_no_layout_lookup_on_the_compiled_forward_path():
 
 
 def test_raiden_geometry_resolves_the_layout_under_a_config():
-    """Verify `resolve_attention_geometry` sets the vLLM config context before
-    querying KV cache layout in the EngineCore process."""
+    """Verify `_attention_backend_page`, which `resolve_attention_geometry`
+    and the multi-shape K/V leaf geometry share, sets the vLLM config context
+    before querying KV cache layout in the EngineCore process."""
     import ast
     import inspect
     import textwrap
@@ -461,7 +462,7 @@ def test_raiden_geometry_resolves_the_layout_under_a_config():
     from vllm_torchtpu.offload import raiden_store
 
     tree = ast.parse(
-        textwrap.dedent(inspect.getsource(raiden_store.resolve_attention_geometry))
+        textwrap.dedent(inspect.getsource(raiden_store._attention_backend_page))
     )
     guarded = set()
     for node in ast.walk(tree):
@@ -480,7 +481,76 @@ def test_raiden_geometry_resolves_the_layout_under_a_config():
                     f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
                 )
 
-    assert {"select_common_block_size", "get_kv_cache_shape"} <= guarded
+    assert {
+        "get_attn_backend",
+        "select_common_block_size",
+        "get_kv_cache_shape",
+    } <= guarded
+
+
+def _raiden_attention_page(config, spec, *, use_mla, has_sliding_window):
+    """`_attention_backend_page` in the engine core (no model), with the
+    selector answering `PallasBatchedRPAAttentionBackend`; returns the page
+    shape and the selector's keyword arguments."""
+    from unittest.mock import patch
+
+    from vllm_torchtpu.offload import raiden_store
+
+    with (
+        patch(
+            "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+            "_find_dense_attention_backend",
+            return_value=None,
+        ),
+        patch(
+            "vllm.v1.attention.selector.get_attn_backend", return_value=BATCHED
+        ) as selector,
+    ):
+        _, shape = raiden_store._attention_backend_page(
+            config,
+            spec,
+            selector_head_size=spec.head_size,
+            use_mla=use_mla,
+            has_sliding_window=has_sliding_window,
+            kernel_block_size=spec.block_size,
+        )
+    return shape, selector.call_args.kwargs
+
+
+@pytest.mark.parametrize("helper_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("ambient", ["nhd", "hnd"])
+def test_raiden_attention_page_follows_the_config_handed_in(
+    request, monkeypatch, ambient, helper_layout
+):
+    """The helper shapes the page under the config handed in, whichever
+    layout is current, and passes use_mla / has_sliding_window through to
+    the selector. One fp8 KV head is where the layouts differ (only HND
+    halves the page)."""
+    import types
+
+    spec = FullAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=128, dtype=FP8, sliding_window=64
+    )
+    # A config resolved for `helper_layout`, and the page it gives.
+    with _layout_env(monkeypatch, None if helper_layout == "NHD" else "HND"):
+        config = get_current_vllm_config()
+        expected = BATCHED.get_kv_cache_shape(1, 128, 1, 128, FP8)[1:]
+    request.getfixturevalue(ambient)
+    # Under the ambient layout the page differs exactly when the layouts do.
+    ambient_page = BATCHED.get_kv_cache_shape(1, 128, 1, 128, FP8)[1:]
+    assert (ambient_page == expected) is (ambient == helper_layout.lower())
+
+    # The selector reads the model dtype; this config has no model.
+    monkeypatch.setattr(config, "model_config", types.SimpleNamespace(dtype=BF16))
+    for use_mla, has_sliding_window in ((False, True), (True, False)):
+        shape, kwargs = _raiden_attention_page(
+            config, spec, use_mla=use_mla, has_sliding_window=has_sliding_window
+        )
+        assert shape == tuple(expected)
+        assert (kwargs["use_mla"], kwargs["has_sliding_window"]) == (
+            use_mla,
+            has_sliding_window,
+        )
 
 
 @pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES_CORE)
