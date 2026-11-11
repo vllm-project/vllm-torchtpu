@@ -97,14 +97,16 @@ def test_dp4_tp2_arms_the_op(monkeypatch, fresh):
         dict(dp=8, tp=1),
         dict(dp=2, tp=4),
         dict(dp=4, tp=2, cores=16),
+        dict(dp=1, tp=2, cores=2),
     ],
-    ids=["tp8", "dp8_tp1", "dp2_tp4", "not_the_mesh"],
+    ids=["tp8", "dp8_tp1", "dp2_tp4", "not_the_mesh", "one_engine_tp2"],
 )
 def test_other_layouts_leave_it_unarmed_without_the_groups_collective(
     monkeypatch, fresh, layout
 ):
-    """TP8 (the other IX decode layout), TP other than a chip's pair, or a
-    DP x TP that is not the EP mesh: the default MoE path, and no collective."""
+    """TP8 (the other IX decode layout), TP other than a chip's pair, a DP x TP
+    that is not the EP mesh, or one engine on a chip's pair (nothing to
+    dispatch over DP): the default MoE path, and no collective."""
     check = _layout(monkeypatch, **layout)
     op.prebuild(_config(), TOPK)
     assert op._ARMED is False
