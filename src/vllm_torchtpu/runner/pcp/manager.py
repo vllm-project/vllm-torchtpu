@@ -25,6 +25,7 @@ import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
+from vllm_torchtpu.kernels.mla.kv_cache_utils import WORD_BYTES
 from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import HeadTailPcpShardingPlan
 from vllm_torchtpu.runner.pcp.sharding_plan import (
     PcpShardingPlan,
@@ -33,6 +34,29 @@ from vllm_torchtpu.runner.pcp.sharding_plan import (
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
+
+
+def mla_kv_page_size(kv_cache_config: Any) -> int:
+    """The single block size of the MLA KV cache groups (the sparse-MLA
+    cache's page size), looking inside `UniformTypeKVCacheSpecs`."""
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, UniformTypeKVCacheSpecs
+
+    sizes: set[int] = set()
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        specs = (
+            spec.kv_cache_specs.values()
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else (spec,)
+        )
+        sizes.update(
+            int(s.block_size) for s in specs if isinstance(s, MLAAttentionSpec)
+        )
+    if len(sizes) != 1:
+        raise ValueError(
+            f"PCP manager expects one MLA KV cache block size, got {sorted(sizes)}"
+        )
+    return sizes.pop()
 
 
 def validate_pcp_manager_config(vllm_config: Any) -> None:
@@ -74,6 +98,16 @@ def validate_pcp_manager_config(vllm_config: Any) -> None:
         raise NotImplementedError("PCP x DCP does not support LoRA.")
     if getattr(model_config, "is_multimodal_model", False):
         raise NotImplementedError("PCP x DCP does not support multimodal inputs.")
+    if model_config.runner_type == "pooling":
+        raise NotImplementedError("PCP x DCP does not support pooling models.")
+    if vllm_config.kv_transfer_config is not None:
+        raise NotImplementedError("PCP x DCP does not support KV connectors.")
+    interleave_size = int(parallel_config.cp_kv_cache_interleave_size)
+    if interleave_size % WORD_BYTES:
+        raise ValueError(
+            "PCP x DCP needs --cp-kv-cache-interleave-size to be a multiple of "
+            f"{WORD_BYTES}, got {interleave_size}."
+        )
     max_model_len = int(model_config.max_model_len)
     if max_model_len > envs.TPU_PCP_KV_WORKSPACE_TOKENS:
         raise ValueError(
@@ -136,10 +170,8 @@ class PcpManager:
     def max_local_num_tokens(self) -> int:
         return self.sharding_plan.max_local_num_tokens
 
-    def num_reqs_in_chunk(
-        self, is_prefilling: Any, seq_lens: Any, capacity: int
-    ) -> int:
-        return self.sharding_plan.num_reqs_in_chunk(is_prefilling, seq_lens, capacity)
+    def num_reqs_in_chunk(self, q_lens: Any, seq_lens: Any, capacity: int) -> int:
+        return self.sharding_plan.num_reqs_in_chunk(q_lens, seq_lens, capacity)
 
     def set_page_size(self, page_size: int) -> None:
         self.sharding_plan.set_page_size(page_size)

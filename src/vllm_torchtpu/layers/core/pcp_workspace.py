@@ -38,8 +38,11 @@ def pcp_gather_rows(
 ) -> jax.Array:
     """All-gather local rows over PCP and restore request-major split order.
 
-    This function currently assume DCP = PCP x TP, and only do all gather from
-    PCP group.
+    Assumes DCP = PCP x TP and gathers only within each PCP group: the ranks
+    sharing a TP rank. `groups` relies on DCP axis index `d` being
+    `pcp_rank * tp + tp_rank`, which holds because
+    `pcp_topology_order(preserve_dcp_order=True)` sorts upstream's PCP-major
+    DCP group into ascending rank order.
     """
     num_local = x.shape[0]
     as_bytes = x.dtype.itemsize == 1

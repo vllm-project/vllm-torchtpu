@@ -26,11 +26,9 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
-from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import (
-    HeadTailPcpShardingPlan,
-    mla_kv_page_size,
-)
+from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import HeadTailPcpShardingPlan
 from vllm_torchtpu.runner.pcp.manager import (
+    mla_kv_page_size,
     validate_pcp_manager_config,
     validate_pcp_manager_layers,
 )
@@ -117,6 +115,7 @@ def _pcp_manager_config(max_model_len=8192, pcp_size=2, tp_size=4):
             hf_text_config=SimpleNamespace(index_topk=2048),
             max_model_len=max_model_len,
             is_multimodal_model=False,
+            runner_type="generate",
         ),
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
@@ -131,6 +130,7 @@ def _pcp_manager_config(max_model_len=8192, pcp_size=2, tp_size=4):
         scheduler_config=SimpleNamespace(async_scheduling=True),
         speculative_config=None,
         lora_config=None,
+        kv_transfer_config=None,
     )
 
 
@@ -141,6 +141,21 @@ def test_max_model_len_must_fit_the_kv_workspace(monkeypatch):
     validate_pcp_manager_config(_pcp_manager_config(1 << 20))
     with pytest.raises(ValueError, match="TPU_PCP_KV_WORKSPACE_TOKENS"):
         validate_pcp_manager_config(_pcp_manager_config((1 << 20) + 1))
+
+
+@pytest.mark.parametrize(
+    "section, field, value, match",
+    [
+        ("model_config", "runner_type", "pooling", "pooling"),
+        (None, "kv_transfer_config", object(), "KV connectors"),
+        ("parallel_config", "cp_kv_cache_interleave_size", 1, "interleave"),
+    ],
+)
+def test_pcp_manager_config_rejects(section, field, value, match):
+    config = _pcp_manager_config()
+    setattr(config if section is None else getattr(config, section), field, value)
+    with pytest.raises((NotImplementedError, ValueError), match=match):
+        validate_pcp_manager_config(config)
 
 
 def test_pcp_manager_layers_must_opt_in():

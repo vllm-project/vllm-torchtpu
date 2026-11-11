@@ -44,7 +44,7 @@ import torch
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.collectives import all_to_all
 from vllm_torchtpu.distributed.dcp import get_dcp_group
-from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
+from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs, weight_by_lse
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 
 
@@ -166,7 +166,7 @@ def merge_lse_partials_scatter_heads(
 
     else:
         # dcp = pcp x tp
-        weighted = _weight_by_lse(output, lse, group)
+        weighted, _ = weight_by_lse(output, lse, group)
         if rs_dtype is not None:
             weighted = weighted.to(rs_dtype)
         tp_group = _get_tp_group()
@@ -175,18 +175,6 @@ def merge_lse_partials_scatter_heads(
         pcp_group = get_pcp_group()
         assert pcp_group is not None
         return pcp_group.all_reduce(weighted.contiguous()).to(output.dtype)
-
-
-def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
-    """This rank's `softmax_r(lse) * o_r` term in f32, weighted over `group`
-    (as in `cp_lse_ag_out_rs`)."""
-    lse = lse.to(torch.float32)
-    lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
-    merged_lse = torch.logsumexp(lses, dim=0)
-    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-    weight = torch.exp(lse - merged_lse).unsqueeze(-1)
-    weighted = output.to(torch.float32) * weight
-    return torch.where(weight > 0, weighted, torch.zeros_like(weighted))
 
 
 def merge_lse_partials_all_to_all(

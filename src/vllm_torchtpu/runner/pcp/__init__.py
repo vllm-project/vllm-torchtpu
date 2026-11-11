@@ -13,9 +13,9 @@
 # limitations under the License.
 """PCP manager and sharding plans"""
 
-from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import mla_kv_page_size
 from vllm_torchtpu.runner.pcp.manager import (
     PcpManager,
+    mla_kv_page_size,
     validate_pcp_manager_config,
     validate_pcp_manager_layers,
 )

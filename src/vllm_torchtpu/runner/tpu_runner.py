@@ -568,10 +568,8 @@ def _compute_num_reqs_in_chunk(
         rows = slice(start_index, num_reqs)
         num_computed = runner.input_batch.num_computed_tokens_cpu[rows]
         q_lens = np.asarray(num_scheduled_tokens)
-        # Same rule as the sharding plan's `prepare_real`.
-        is_prefilling = q_lens > 1
         seq_lens = num_computed + q_lens
-        return pcp_manager.num_reqs_in_chunk(is_prefilling, seq_lens, capacity)
+        return pcp_manager.num_reqs_in_chunk(q_lens, seq_lens, capacity)
 
 
 def _validate_libtpu_version() -> None:

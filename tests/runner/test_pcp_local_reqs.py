@@ -126,6 +126,37 @@ def test_decode_window_is_capped_at_max_num_seqs(pcp_size, num_prefills):
     assert dummy.host_metadata["rep_request_distribution"].max() <= MAX_NUM_SEQS
 
 
+@pytest.mark.parametrize("num_prefills", [0, 2])
+def test_logits_rows_cover_a_sampling_bucket_above_the_request_bucket(
+    num_prefills,
+):
+    """The sampling bucket (`padded_num_reqs`, a power of two) can exceed the
+    request bucket (`target_num_reqs`, the SMEM cap); every logits array
+    still has one row per sampling slot."""
+    q_lens = [300] * num_prefills + [1] * 3
+    num_reqs, target, padded = len(q_lens), 2 * num_prefills + 3, MAX_NUM_SEQS
+    assert target < padded
+    num_computed = [0] * num_prefills + [500] * 3
+    plan = _manager(2)
+    plan.prepare_real(
+        runner=_runner(num_computed, [q + 100 for q in q_lens], q_lens, target),
+        scheduler_output=None,
+        start_index=0,
+        num_reqs=num_reqs,
+        num_scheduled_tokens_per_req=q_lens,
+        total_num_scheduled_tokens=sum(q_lens),
+        use_max_model_len=False,
+        target_num_reqs=target,
+        padded_num_reqs=padded,
+    )
+    assert plan.logits_indices_cpu.shape == (padded,)
+    assert plan.logits_local_indices.shape == (padded,)
+    assert plan.logits_owner_mask.shape == (padded,)
+    np.testing.assert_array_equal(
+        plan.logits_indices_cpu[:num_reqs].numpy(), np.cumsum(q_lens) - 1
+    )
+
+
 @pytest.mark.parametrize("pcp_size", [2, 4])
 def test_resumed_request_is_split(pcp_size):
     """A request resumed after preemption recomputes its output tokens, so
@@ -203,16 +234,16 @@ def test_chunk_stops_at_the_kv_workspace(
 ):
     manager = _ws_manager(4096)
     assert manager.num_ws_pages == 8
-    got = manager.num_reqs_in_chunk(
-        np.asarray(is_prefilling), np.asarray(seq_lens), capacity=64
-    )
+    # A prefill schedules several tokens, a decode one.
+    q_lens = np.where(is_prefilling, 64, 1)
+    got = manager.num_reqs_in_chunk(q_lens, np.asarray(seq_lens), capacity=64)
     assert got == expected
 
 
 def test_chunk_keeps_the_request_bucket_limit():
     manager = _ws_manager(1 << 20)
     # 5 prefills are 10 local requests, past a bucket of 9.
-    assert manager.num_reqs_in_chunk([True] * 5, [100] * 5, capacity=9) == 4
+    assert manager.num_reqs_in_chunk([64] * 5, [100] * 5, capacity=9) == 4
 
 
 @pytest.mark.parametrize("workspace_tokens", [4096, 4097, 5000, 8191])

@@ -299,29 +299,6 @@ class PcpWorkspacePlan:
         return cls(num_pages, ws_req, ws_vpage, page_offset, cursor)
 
 
-def mla_kv_page_size(kv_cache_config: Any) -> int:
-    """The single block size of the MLA KV cache groups (the sparse-MLA
-    cache's page size), looking inside `UniformTypeKVCacheSpecs`."""
-    from vllm.v1.kv_cache_interface import MLAAttentionSpec, UniformTypeKVCacheSpecs
-
-    sizes: set[int] = set()
-    for group in kv_cache_config.kv_cache_groups:
-        spec = group.kv_cache_spec
-        specs = (
-            spec.kv_cache_specs.values()
-            if isinstance(spec, UniformTypeKVCacheSpecs)
-            else (spec,)
-        )
-        sizes.update(
-            int(s.block_size) for s in specs if isinstance(s, MLAAttentionSpec)
-        )
-    if len(sizes) != 1:
-        raise ValueError(
-            f"PCP manager expects one MLA KV cache block size, got {sorted(sizes)}"
-        )
-    return sizes.pop()
-
-
 def _block_tables_for_rows(
     device: torch.device,
     block_table_obj: Any,
@@ -431,15 +408,14 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         num_reqs = max(min(target_num_reqs, self._max_num_seqs), 1)
         return cdiv(num_reqs, self.dcp_size) * self.dcp_size
 
-    def num_reqs_in_chunk(
-        self, is_prefilling: Any, seq_lens: Any, capacity: int
-    ) -> int:
+    def num_reqs_in_chunk(self, q_lens: Any, seq_lens: Any, capacity: int) -> int:
         """Also stop before the split prefills' contexts overflow the KV
         workspace, so the runner runs the rest as more forwards."""
-        num_reqs = super().num_reqs_in_chunk(is_prefilling, seq_lens, capacity)
+        num_reqs = super().num_reqs_in_chunk(q_lens, seq_lens, capacity)
+        is_split = self.split_mask(q_lens)
         used_pages = 0
         for i in range(num_reqs):
-            if not is_prefilling[i]:
+            if not is_split[i]:
                 continue
             used_pages += cdiv(int(seq_lens[i]), self.virtual_page_size)
             if used_pages > self.num_ws_pages:
@@ -473,10 +449,7 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         q_lens = [int(n) for n in num_scheduled_tokens_per_req[:num_reqs]]
         rows = slice(start_index, start_index + num_reqs)
         num_computed = runner.input_batch.num_computed_tokens_cpu[rows].astype(np.int64)
-        # Split a request iff it schedules more than one token
-        # TODO(weiyulin): Spec decode verify windows also schedule several
-        # tokens; tell them apart here once PCP x DCP supports spec decode.
-        is_prefilling = [q > 1 for q in q_lens]
+        is_prefilling = self.split_mask(q_lens).tolist()
 
         # Every rank pads its local batch to the same compile bucket.
         rank_counts = pcp_rank_token_counts(q_lens, is_prefilling, self.pcp_size)
@@ -488,9 +461,6 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         local_padded = round_up_to_bucket(
             runner.num_tokens_paddings, max(1, max(rank_counts))
         )
-        dp_target_bucket = getattr(runner, "_dp_target_bucket", None)
-        if dp_target_bucket is not None and dp_target_bucket > local_padded:
-            local_padded = int(dp_target_bucket)
         plan = PcpBatchPlan.from_schedule(
             q_lens, is_prefilling, self.pcp_size, num_local_tokens_padded=local_padded
         )
@@ -527,7 +497,11 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         # Sampling rows: the owner of each request's last token contributes
         # it, the others zeros, summed over PCP. With nothing split every rank
         # holds every row and nothing is summed.
-        global_qsl_padded = np.full(target_num_reqs + 1, num_tokens, dtype=np.int32)
+        # `padded_num_reqs` (the sampling bucket) can exceed `target_num_reqs`
+        # (the SMEM cap), e.g. 85 requests pad to 128.
+        global_qsl_padded = np.full(
+            max(target_num_reqs, padded_num_reqs) + 1, num_tokens, dtype=np.int32
+        )
         global_qsl_padded[: num_reqs + 1] = global_qsl
         logits_indices = global_qsl_padded[1 : padded_num_reqs + 1] - 1
         logits_all_local = not split_reqs

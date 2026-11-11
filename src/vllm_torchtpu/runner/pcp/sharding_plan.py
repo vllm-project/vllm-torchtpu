@@ -137,21 +137,28 @@ class PcpShardingPlan(ABC):
         split_block_tables: torch.Tensor | None = None,
     ) -> PcpMetadata | None: ...
 
-    def num_reqs_in_chunk(
-        self, is_prefilling: Any, seq_lens: Any, capacity: int
-    ) -> int:
-        """Requests that fit `capacity` local requests, given whether each is
-        prefilling (a prefill can become `local_reqs_per_req` of them) and its
-        context length after this step (`seq_lens`)."""
+    def split_mask(self, q_lens: Any) -> np.ndarray:
+        """Which requests are split over the PCP ranks: those scheduling more
+        than one token. The rest (decodes) are replicated on every rank."""
+        # TODO(weiyulin): Spec decode verify windows also schedule several
+        # tokens; tell them apart here once PCP x DCP supports spec decode.
+        return np.asarray(q_lens) > 1
+
+    def num_reqs_in_chunk(self, q_lens: Any, seq_lens: Any, capacity: int) -> int:
+        """Requests that fit `capacity` local requests, given each one's
+        scheduled tokens (`q_lens`; a split request can become
+        `local_reqs_per_req` of them) and its context length after this step
+        (`seq_lens`)."""
         del seq_lens
         # TODO(weiyulin): Remove once the head and tail chunks share one
         # page table row.
         num_local = 0
-        for i, prefilling in enumerate(is_prefilling):
-            num_local += self.local_reqs_per_req if prefilling else 1
+        is_split = self.split_mask(q_lens)
+        for i, split in enumerate(is_split):
+            num_local += self.local_reqs_per_req if split else 1
             if num_local > capacity:
                 return max(i, 1)
-        return len(is_prefilling)
+        return len(is_split)
 
     def request_distribution_counts(
         self, chunk_num_decode: int, num_reqs: int
