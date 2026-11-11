@@ -5981,6 +5981,20 @@ class TPUModelRunner(GPUModelRunner):
 
         return async_output
 
+    def _maybe_draft_load_barrier(self) -> None:
+        """With eagle/MTP or dflash speculative decoding, align every rank of
+        the world group before the draft model load.
+
+        The barrier runs on the world group, so every rank must join it, not
+        only the ones that load a draft. Under a pipeline only the last stage
+        hosts the drafter (`_is_async_drafter`); gating the barrier on it would
+        leave that stage waiting for stages that never arrive while they block
+        in their next collective.
+        """
+        spec = self.speculative_config
+        if spec is not None and (spec.use_eagle() or spec.method == "dflash"):
+            self._draft_load_barrier()
+
     def _draft_load_barrier(self) -> None:
         """Aligns every rank of the world group before the draft model load."""
         world = get_world_group()
@@ -6088,10 +6102,12 @@ class TPUModelRunner(GPUModelRunner):
                 self.model, self._dp_lockstep_enabled()
             )
 
+        # Every pipeline stage joins the barrier, the stages that host no draft
+        # included (see _maybe_draft_load_barrier).
+        self._maybe_draft_load_barrier()
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
-            self._draft_load_barrier()
             self._async_drafter.load_model(self.model)
             # The draft reuses the target's Pallas ops (cached by op name),
             # which were traced against the target's relayouted tables. Its
