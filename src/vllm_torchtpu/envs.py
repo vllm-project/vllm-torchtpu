@@ -350,6 +350,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
     VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
     VLLM_TPU_STAGED_WALK_STACKED: bool = False
+    VLLM_TPU_MD_STRUCT_LOG: bool = False
     VLLM_TPU_WARMED_SUBSTITUTE_SOURCE: bool = False
     VLLM_TPU_PROPOSE_DEVICE_CONSTANTS: bool = False
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
@@ -2114,6 +2115,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # each group's metadata reads its row in-graph
     # (StackedMambaAttentionMetadata). Same values.
     "VLLM_TPU_STAGED_WALK_STACKED": env_bool("VLLM_TPU_STAGED_WALK_STACKED"),
+    # Diagnostics only: log, once per distinct shape of decision, which
+    # mamba-index path each attention-metadata build and staged walk took
+    # (stacked / staged / compact / gather) and where it was called from.
+    # Kept out of the compile-cache key.
+    "VLLM_TPU_MD_STRUCT_LOG": env_bool("VLLM_TPU_MD_STRUCT_LOG"),
     # Async substitution: pad next_tokens to a precompiled source length.
     "VLLM_TPU_WARMED_SUBSTITUTE_SOURCE": env_bool(
         "VLLM_TPU_WARMED_SUBSTITUTE_SOURCE", default=False

@@ -218,6 +218,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     # compiled model or custom-kernel lowering.
     "CDK_OUTPUT_DIR",
     "DP_SCHED_ENABLED",
+    "VLLM_TPU_MD_STRUCT_LOG",
     "VLLM_TPU_MK_OPERAND_DUMP",
     "VLLM_TPU_MK_STEP_MIX_INTERVAL_S",
     "VLLM_TPU_PY_SAMPLER_DELAY_S",

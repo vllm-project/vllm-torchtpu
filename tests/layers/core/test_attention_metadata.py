@@ -578,6 +578,110 @@ class TestAttentionMetadataBuilderPlumbing:
             torch.cat(c_plain.unified_mamba_state_indices),
         )
 
+    @pytest.mark.parametrize("stacked", [False, True])
+    def test_dummy_and_real_builds_trace_the_same_inputs(self, stacked):
+        """A program traced on a dummy run's metadata is replayed on real
+        metadata (guard-free AOT), so both must expose the same mamba-index
+        structure: same metadata class per group, same non-None fields, and
+        the same number of dynamo graph inputs for a forward that reads the
+        ids through mamba_state_of / mamba_ckpt_of. Flag on and off."""
+        from vllm_torchtpu.layers.core.attention_metadata import (
+            StackedMambaAttentionMetadata,
+            mamba_ckpt_of,
+            mamba_state_of,
+        )
+
+        window = 3
+        num_reqs = 4
+        fields = (
+            "mamba_state_indices",
+            "mamba_ckpt_indices",
+            "mamba_state_stack",
+            "mamba_ckpt_stack",
+        )
+
+        def build(dummy):
+            env = {
+                "VLLM_TPU_STAGED_WALK_CLASS_GATHER": "1",
+                "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "0",
+                "VLLM_TPU_MD_STRUCT_LOG": "1",
+            }
+            if stacked:
+                env["VLLM_TPU_STAGED_WALK_STACKED"] = "1"
+            with patch.dict(os.environ, env):
+                runner = self._make_runner_mock(num_groups=4, max_num_blocks_per_req=6)
+                runner._unified_kv_layout = True
+                runner._block_table_stage_cpu = None
+                runner._staged_walk_stacked_logged = False
+                attn = self._make_builder(runner, kv_cache_group_id=0)
+                mambas = [
+                    self._make_mamba_builder(runner, kv_cache_group_id=gid)
+                    for gid in (1, 2, 3)
+                ]
+                groups = self._make_attn_groups(runner, [attn] + mambas)
+                for i, (group,) in enumerate(groups):
+                    group.layer_names = [f"layer.{i}"]
+                ctx = AttentionMetadataBuilderContext(
+                    num_reqs=num_reqs,
+                    start_index=0,
+                    use_max_model_len=True,
+                    seq_lens=torch.tensor([1, 17, 33, 49], dtype=torch.int32),
+                    query_start_loc=torch.arange(5, dtype=torch.int32),
+                    request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+                    position_ids_override=(
+                        torch.zeros(num_reqs, dtype=torch.int32) if dummy else None
+                    ),
+                    mamba_slot_read_offsets=torch.zeros(8, dtype=torch.int32),
+                    mamba_ckpt_window=window,
+                    mamba_request_distribution=torch.tensor([4, 4, 4]),
+                    unified_mamba_state_indices=[],
+                )
+                runner._attn_metadata_builder_ctx = ctx
+                stage_block_table_uploads(runner, ctx, num_reqs)
+                return [
+                    b.build(
+                        common_prefix_len=0,
+                        common_attn_metadata=self._make_cm(num_reqs),
+                    )
+                    for b in mambas
+                ]
+
+        def structure(metas):
+            return [
+                (type(m).__name__,)
+                + tuple(getattr(m, f, None) is not None for f in fields)
+                for m in metas
+            ]
+
+        def num_graph_inputs(metas):
+            counts = []
+
+            def backend(gm, example_inputs):
+                counts.append(
+                    sum(1 for n in gm.graph.nodes if n.op == "placeholder")
+                )
+                return gm
+
+            def forward(x, mds):
+                for md in mds:
+                    x = x + mamba_state_of(md).sum() + mamba_ckpt_of(md).sum()
+                return x
+
+            torch._dynamo.reset()
+            torch.compile(forward, backend=backend, fullgraph=True)(
+                torch.zeros(()), metas
+            )
+            torch._dynamo.reset()
+            return counts[0]
+
+        dummy, real = build(True), build(False)
+        assert structure(dummy) == structure(real)
+        assert all(
+            isinstance(m, StackedMambaAttentionMetadata) == stacked
+            for m in dummy + real
+        )
+        assert num_graph_inputs(dummy) == num_graph_inputs(real)
+
     def test_stacked_read_offset_update_matches_per_group(self):
         """`_update_read_offsets_impl` on the [G, width] stack writes the
         same slot buffer as on the per-group list."""

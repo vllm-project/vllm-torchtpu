@@ -132,6 +132,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
     MambaStackRef,
+    _md_struct_log,
     attention_block_table_width,
     stage_block_table_uploads,
     stacked_mamba_metadata,
@@ -2139,6 +2140,12 @@ class TPUModelRunner(GPUModelRunner):
                 else:
                     state = None
                 ref = None
+                _md_struct_log(
+                    "fast",
+                    stack=bool(unified and isinstance(products[gid], MambaStackRef)),
+                    compact=compact is not None,
+                    unified=bool(unified),
+                )
                 if unified and isinstance(products[gid], MambaStackRef):
                     # VLLM_TPU_STAGED_WALK_STACKED: a row of the walk's stack.
                     ref, state, ckpt = products[gid], None, None

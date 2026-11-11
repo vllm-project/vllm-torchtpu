@@ -138,6 +138,33 @@ class AttentionMetadata:
 logger = init_logger(__name__)
 
 
+_MD_STRUCT_SEEN: set = set()
+
+
+def _md_struct_log(tag: str, **fields: Any) -> None:
+    """VLLM_TPU_MD_STRUCT_LOG: log each distinct metadata-path decision once,
+    with the runner frames that led to it."""
+    if not envs.VLLM_TPU_MD_STRUCT_LOG:
+        return
+    key = (tag, tuple(sorted(fields.items())))
+    if key in _MD_STRUCT_SEEN:
+        return
+    _MD_STRUCT_SEEN.add(key)
+    import traceback
+
+    frames = [
+        f.name
+        for f in traceback.extract_stack()[:-2]
+        if "vllm_torchtpu" in f.filename
+    ][-6:]
+    logger.info(
+        "MD_STRUCT %s %s via %s",
+        tag,
+        " ".join(f"{k}={v}" for k, v in sorted(fields.items())),
+        ">".join(frames),
+    )
+
+
 @dataclass
 class StackedMambaAttentionMetadata(AttentionMetadata):
     """A mamba group's metadata whose state / checkpoint ids are one row of a
@@ -730,6 +757,24 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_request_distribution = None
             mamba_prefill_ckpt = None
 
+        if self.is_mamba_group:
+            _md_struct_log(
+                "build",
+                branch=(
+                    "stack"
+                    if mamba_stack_ref is not None
+                    else "compact"
+                    if ctx.mamba_state_indices is not None
+                    else "staged"
+                    if ctx.staged_mamba_products is not None
+                    else "gather"
+                    if runner._unified_kv_layout
+                    else "none"
+                ),
+                ckpt=mamba_ckpt_indices is not None,
+                dummy=ctx.position_ids_override is not None,
+                unified=bool(runner._unified_kv_layout),
+            )
         md_cls: Any = AttentionMetadata
         if mamba_stack_ref is not None:
             md_cls = functools.partial(stacked_mamba_metadata, mamba_stack_ref)
@@ -810,6 +855,7 @@ def stage_block_table_uploads(
     if not runner.attn_groups:
         # Pre-initialization dummy runs build metadata before the KV cache
         # groups exist; each build() synthesizes its own table there.
+        _md_struct_log("stage_no_groups")
         return
 
     # Walk in the same order the builds will, deduping shared group ids. The
@@ -1048,6 +1094,7 @@ def _issue_walk_products(
                 mamba_entry_indices.append(i)
 
     if len(entries) == 1 and not mamba_geom:
+        _md_struct_log("walk_single_group", dummy=ctx.position_ids_override is not None)
         # Exactly one group with no mamba derivation: the flat upload is
         # already the complete table view; avoid launching an unnecessary
         # device clone program.
@@ -1104,6 +1151,15 @@ def _issue_walk_products(
                 # Dummy runs warm the tables-free variant serving reuses.
                 walk(*args, False, envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER, stacked)
     n_mamba = len(mamba_geom)
+    _md_struct_log(
+        "walk",
+        stacked=stacked,
+        n_mamba=n_mamba,
+        reused=reused_key is not None,
+        dummy=ctx.position_ids_override is not None,
+        compact=ctx.mamba_state_indices is not None,
+        unified=bool(runner._unified_kv_layout),
+    )
     if stacked:
         # Same class grouping (and order) as `_staged_walk_products`.
         classes: dict[tuple[int, int], list[int]] = {}
