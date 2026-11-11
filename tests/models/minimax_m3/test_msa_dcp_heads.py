@@ -184,8 +184,9 @@ def test_attend_and_merge_matches_dcp_reference(
         )
 
 
-@pytest.mark.parametrize("live", [0, 5, 11, 12])
-def test_exchange_head_pages(live):
+@pytest.mark.parametrize("live,lanes", [(0, 1), (5, 1), (11, 1), (12, 1), (5, 0)])
+def test_exchange_head_pages(live, lanes):
+    """`lanes = 0`: the served (lane, dcp) mesh, with a lane axis of size 1."""
     if len(jax.devices()) < DCP:
         pytest.skip(
             "needs 8 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)"
@@ -194,7 +195,8 @@ def test_exchange_head_pages(live):
     num_pages, buffer, width = 20, 12, 256
     caches = rng.integers(0, 256, (DCP, num_pages, 2, 4, HEADS * width), np.uint8)
     pages = rng.integers(0, num_pages, (DCP, buffer)).astype(np.int32)
-    mesh = Mesh(np.asarray(jax.devices()[:DCP]), ("dcp",))
+    devices = np.asarray(jax.devices()[:DCP])
+    mesh = Mesh(devices, ("dcp",)) if lanes else Mesh(devices[None], ("lane", "dcp"))
     body = functools.partial(
         msa_dcp_heads.exchange_head_pages,
         axis="dcp",

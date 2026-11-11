@@ -119,6 +119,8 @@ def _per_token(seq_id: jax.Array, table: jax.Array) -> jax.Array:
 
 # Pages whose head copies to every rank an exchange keeps in flight.
 _EXCHANGE_PAGES_IN_FLIGHT = 8
+# The exchange's barrier semaphore.
+_EXCHANGE_COLLECTIVE_ID = 0
 
 
 def live_part(live: jax.Array, replica, replicas: int, part: int) -> jax.Array:
@@ -157,6 +159,10 @@ def exchange_head_pages(
     _, rows, packing, _ = kv_cache.shape
     num_pages = pages.shape[0]
     part = num_pages // replicas
+    # Slots past the live pages stay unset: harmless while no key reaches
+    # them and while any byte pattern of the 4-bit cache dequantizes finite.
+    if kv_cache.dtype != jnp.uint8:
+        raise ValueError(f"4-bit (uint8) caches only, got {kv_cache.dtype}")
 
     def remote(src, dst, send_sem, recv_sem, device):
         return pltpu.make_async_remote_copy(
@@ -253,7 +259,7 @@ def exchange_head_pages(
         out_shape=jax.ShapeDtypeStruct(
             (replicas, dcp, part, rows, packing, head_width), kv_cache.dtype
         ),
-        compiler_params=pltpu.CompilerParams(collective_id=0),
+        compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
         interpret=pltpu.InterpretParams() if interpret else False,
         name="minimax_m3_msa_dcp_exchange_head_pages",
     )(pages, live, rank, kv_cache)
