@@ -254,6 +254,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     # with the venv prefix or mount path. get_libtpu_cache_key() already
     # identifies the loaded build without its path.
     "TPU_LIBRARY_PATH",
+    # vLLM-Omni DiT compile only: diffusion workers compile outside
+    # TpuCompilerAdaptor and key their executables separately through
+    # torch.compiler.config.cache_key_tag (configure_diffusion_compile_cache).
+    "VLLM_TPU_OMNI_COMPILE",
+    "VLLM_TPU_OMNI_COMPILE_SPMD_SAFE",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -308,10 +313,13 @@ _RUNTIME_CACHE_KEY_PATHS = (
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
-# workers never compile through TpuCompilerAdaptor (OmniTpuPlatform does not
-# support torch inductor and vLLM-Omni skips torch.compile), and nothing
-# outside these paths imports their kernels, so they cannot change a cached
-# executable; hashing them would only invalidate LLM compile caches.
+# workers never compile through TpuCompilerAdaptor: by default they run
+# eagerly, and with VLLM_TPU_OMNI_COMPILE they torch.compile the DiT with
+# backend="tpu" directly and key those executables through
+# OmniTpuPlatform.configure_diffusion_compile_cache, which hashes these
+# sources itself. Nothing outside these paths imports their kernels, so they
+# cannot change an LLM executable; hashing them would only invalidate LLM
+# compile caches.
 _RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
     "vllm_torchtpu/kernels/diffusion_attention",
     "vllm_torchtpu/omni/attention.py",
@@ -398,22 +406,36 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
     return factors
 
 
-def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
-    """Hash TPU-specific factors used by both AOT and piecewise caches."""
+def tpu_compiler_cache_factors() -> dict[str, Any]:
+    """Compiler builds and native compiler flags behind every TPU executable.
+
+    The torch_tpu, jax and jaxlib versions, the loaded libtpu build, and the
+    native env flags read when torch_tpu compiles a graph. Shared by
+    ``compute_tpu_compilation_hash`` and the vLLM-Omni DiT compile cache key
+    (``OmniTpuPlatform.configure_diffusion_compile_cache``).
+    """
     # Deferred: tpu_info imports Pallas, which this module otherwise avoids.
     from vllm_torchtpu.tpu_info import get_libtpu_cache_key
 
-    cache_config = vllm_config.cache_config
-    scheduler_config = vllm_config.scheduler_config
-    spec = vllm_config.speculative_config
-    factors = {
-        "torch": torch.__version__,
+    return {
         "torch_tpu": importlib_metadata.version("torch-tpu"),
         "jax": importlib_metadata.version("jax"),
         "jaxlib": importlib_metadata.version("jaxlib"),
         "libtpu": get_libtpu_cache_key(),
-        "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
+    }
+
+
+def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
+    """Hash TPU-specific factors used by both AOT and piecewise caches."""
+    cache_config = vllm_config.cache_config
+    scheduler_config = vllm_config.scheduler_config
+    spec = vllm_config.speculative_config
+    # json.dumps(sort_keys=True) below makes the key order irrelevant.
+    factors = {
+        "torch": torch.__version__,
+        **tpu_compiler_cache_factors(),
+        "env": _tpu_compile_env_factors(),
         "parallel": {
             "effective_data_parallel_size": utils.get_dp_size(
                 vllm_config.parallel_config

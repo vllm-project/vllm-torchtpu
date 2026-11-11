@@ -315,6 +315,41 @@ def test_tiny_wan_block_does_not_recompile_across_steps(tiny_wan_block):
                 compiled(*_inputs())
 
 
+def test_rope_tables_are_not_cached_while_tracing(monkeypatch):
+    # With regional compile no eager forward runs first, so the RoPE helper
+    # tables are first built inside the traced graph. They must not be
+    # stored then (a traced tensor in a module-level cache); the eager call
+    # afterwards fills the cache as before.
+    monkeypatch.setattr(omni_rope, "_PAIR_SWAP_MATRICES", {})
+    monkeypatch.setattr(omni_rope, "_FIRST_HALF_LANES", {})
+    torch._dynamo.reset()
+    head_dim, heads, seq = 16, 2, 8
+    x = torch.randn(1, seq, heads, head_dim, dtype=torch.bfloat16)
+    cos = torch.randn(1, seq, 1, head_dim // 2, dtype=torch.bfloat16)
+    sin = torch.randn(1, seq, 1, head_dim // 2, dtype=torch.bfloat16)
+    xs = torch.randn(1, seq, heads * head_dim, dtype=torch.bfloat16)
+    cos_s = torch.randn(1, 1, seq, heads * head_dim, dtype=torch.bfloat16)
+    sin_s = torch.randn(1, 1, seq, heads * head_dim, dtype=torch.bfloat16)
+    try:
+        pair = torch.compile(
+            omni_rope.apply_rotary_pair_swap, backend="eager", fullgraph=True
+        )(x, cos, sin)
+        split = torch.compile(
+            omni_rope.apply_split_rotary_half_swap, backend="eager", fullgraph=True
+        )(xs, cos_s, sin_s, head_dim)
+        assert omni_rope._PAIR_SWAP_MATRICES == {}
+        assert omni_rope._FIRST_HALF_LANES == {}
+    finally:
+        torch._dynamo.reset()
+
+    torch.testing.assert_close(pair, omni_rope.apply_rotary_pair_swap(x, cos, sin))
+    torch.testing.assert_close(
+        split, omni_rope.apply_split_rotary_half_swap(xs, cos_s, sin_s, head_dim)
+    )
+    assert len(omni_rope._PAIR_SWAP_MATRICES) == 1
+    assert len(omni_rope._FIRST_HALF_LANES) == 1
+
+
 def test_op_accessors_are_not_functools_caches():
     # Dynamo ignores functools.cache wrappers and re-traces the op builder
     # (pallas.jax_op) or tensor factory inside the compiled forward.

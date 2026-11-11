@@ -20,19 +20,18 @@ from torch_tpu._internal.utils import hardware
 from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.env_override import set_libtpu_flag_default
 from vllm_torchtpu.omni.patches import (
     _patch_dit_compile,
     apply_omni_tpu_patches,
     dit_compile_gate_open,
+    omni_compile_mode,
     set_compile_cache_tag,
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 logger = init_logger(__name__)
 
-_COMPILER_DISTS = ("torch_tpu", "libtpu", "jax", "jaxlib")
 _RANK_ASSIGNMENT_TAG = "tpu-rank-assignment-v1:"
 _PALLAS_SOURCES_TAG = "tpu-pallas-sources-v1:"
 _COMPILER_FLAGS_TAG = "tpu-compiler-v2:"
@@ -96,26 +95,18 @@ def _rank_assignment_tag(world_size: int) -> str:
 
 def _compiler_flags_tag() -> str:
     import hashlib
-    from importlib import metadata
+    import json
 
-    def version(dist: str) -> str:
-        try:
-            return metadata.version(dist)
-        except metadata.PackageNotFoundError:
-            return ""
+    from vllm_torchtpu.compilation.tpu_compiler import tpu_compiler_cache_factors
 
-    # Flags read when torch_tpu compiles a graph; persisted executables built
-    # under other values are stale.
-    fields = [
-        os.environ.get("LIBTPU_INIT_ARGS", ""),
-        os.environ.get("XLA_FLAGS", ""),
-        os.environ.get("TORCH_TPU_INTERNAL_XLA_OPTIONS", ""),
-        # Where torch_tpu splits graphs at collectives.
-        os.environ.get("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", ""),
-    ]
-    fields += [version(dist) for dist in _COMPILER_DISTS]
-    fields += [hardware.get_tpu_device_name(), os.environ.get("TORCH_TPU_TOPOLOGY", "")]
-    digest = hashlib.sha256("\0".join(fields).encode()).hexdigest()[:16]
+    # The compiler builds and the native flags read when torch_tpu compiles a
+    # graph (the same factors the LLM compile hash uses), plus the chip and
+    # topology; persisted executables built under other values are stale.
+    factors = tpu_compiler_cache_factors()
+    factors["tpu_device_name"] = hardware.get_tpu_device_name()
+    factors["torch_tpu_topology"] = os.environ.get("TORCH_TPU_TOPOLOGY", "")
+    payload = json.dumps(factors, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
     return _COMPILER_FLAGS_TAG + digest
 
 
@@ -168,7 +159,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:
-        # vLLM-Omni's DiT compile gate. Open only with VLLM_TORCHTPU_OMNI_COMPILE
+        # vLLM-Omni's DiT compile gate. Open only with VLLM_TPU_OMNI_COMPILE
         # set and only for DiffusionModelRunner's generic DiT compile, which
         # patches route to the torch_tpu "tpu" backend (see
         # patches.dit_compile_gate_open for the other callers kept off).
@@ -216,7 +207,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
         torch.accelerator.synchronize()
-        if (envs.VLLM_TORCHTPU_OMNI_COMPILE or "0").lower() != "0":
+        if omni_compile_mode() != "0":
             # The diffusion worker calls set_device before load_model.
             _patch_dit_compile()
             cls.configure_diffusion_compile_cache(world_size)
@@ -229,13 +220,13 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         neither the device assignment behind collectives, the opaque Pallas
         kernel sources, nor the XLA/libtpu flags: a stale hit can hang (a
         multi-rank launch loading single-rank executables) or ignore new
-        flags. Only with VLLM_TORCHTPU_OMNI_COMPILE set; idempotent. When
+        flags. Only with VLLM_TPU_OMNI_COMPILE set; idempotent. When
         called from ``set_device`` before distributed init, the rank tag
         encodes ``world_size`` and ``RANK`` (if set), which still separates
         single-rank from multi-rank executables; a later call replaces each
         entry with its updated value.
         """
-        if (envs.VLLM_TORCHTPU_OMNI_COMPILE or "0").lower() == "0":
+        if omni_compile_mode() == "0":
             return
         if world_size is None:
             world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")

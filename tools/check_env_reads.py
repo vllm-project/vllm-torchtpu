@@ -69,19 +69,11 @@ EXEMPT_PATHS = {
 #                           value, and it is a CPython knob, not one of ours.
 #   omni/platform.py        os.environ["MASTER_PORT"] (exported per worker by
 #                           vLLM-Omni's DiffusionWorker) must raise when unset.
-#   omni/platform.py        compile-cache key hashes runtime/compiler flags:
-#                           - LIBTPU_INIT_ARGS: libtpu compiler flags set by
-#                             env_override.py or the operator before PjRt init.
-#                           - XLA_FLAGS: XLA compiler flags consumed by PJRT.
-#                           - TORCH_TPU_INTERNAL_XLA_OPTIONS: internal XLA
-#                             options written by env_override.py for torch_tpu.
-#                           - TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS:
-#                             torch_tpu collective graph-split flag written by
-#                             env_override.py.
-#                           - TPU_CHIPS_PER_PROCESS_BOUNDS: per-process TPU mesh
-#                             shape set by tpu_platform.py or the TPU runtime.
-#                           - TPU_PROCESS_BOUNDS: multi-host TPU process grid
-#                             set by tpu_platform.py or the TPU runtime.
+#   omni/platform.py        hashes TPU_PROCESS_BOUNDS and
+#                           TPU_CHIPS_PER_PROCESS_BOUNDS, the process grid the
+#                           TPU runtime sets up like TPU_VISIBLE_CHIPS, into
+#                           the DiT compile-cache rank tag; unset means the
+#                           runtime default, not a knob default.
 #   model_loader_patches.py RUNAI_STREAMER_PROCESS_GROUP_SIZE is exported by
 #                           the Run:AI streamer's first host-rank discovery in
 #                           the process; unset means that has not run yet.
@@ -107,22 +99,11 @@ BOOTSTRAP_VARS = {
     "TORCH_TPU_SLICEBUILDER_ADDRESSES",
     "TORCH_TPU_TOPOLOGY",
     "TORCH_TPU_XPROF_SESSION_ID",
+    "TPU_CHIPS_PER_PROCESS_BOUNDS",
     "TPU_NUM_HOSTS",
+    "TPU_PROCESS_BOUNDS",
     "TPU_VISIBLE_CHIPS",
     "WORLD_SIZE",
-}
-
-# Bootstrap / compiler-fingerprint variables scoped to the specific file that
-# reads them, rather than allowed repo-wide.
-SCOPED_BOOTSTRAP_VARS: dict[pathlib.Path, set[str]] = {
-    PACKAGE / "omni" / "platform.py": {
-        "LIBTPU_INIT_ARGS",
-        "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-        "TORCH_TPU_INTERNAL_XLA_OPTIONS",
-        "TPU_CHIPS_PER_PROCESS_BOUNDS",
-        "TPU_PROCESS_BOUNDS",
-        "XLA_FLAGS",
-    },
 }
 
 
@@ -189,10 +170,9 @@ def find_reads() -> list[str]:
         aliases = _os_aliases(tree)
         if not aliases:
             continue
-        scoped_vars = SCOPED_BOOTSTRAP_VARS.get(path, set())
         for node in ast.walk(tree):
             name = _read_name(node, aliases)
-            if name is None or name in BOOTSTRAP_VARS or name in scoped_vars:
+            if name is None or name in BOOTSTRAP_VARS:
                 continue
             rel = path.relative_to(REPO_ROOT).as_posix()
             found.add(f"{rel}:{name}")

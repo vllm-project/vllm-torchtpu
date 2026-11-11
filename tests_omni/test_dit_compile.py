@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Opt-in DiT torch.compile (VLLM_TORCHTPU_OMNI_COMPILE) and its cache key."""
+"""Opt-in DiT torch.compile (VLLM_TPU_OMNI_COMPILE) and its cache key."""
 
 import os
 import re
@@ -162,7 +162,7 @@ def test_compile_mode_parsing(monkeypatch):
         monkeypatch.setenv(patches.OMNI_COMPILE_ENV, mode)
         assert patches.omni_compile_mode() == mode.lower()
     monkeypatch.setenv(patches.OMNI_COMPILE_ENV, "inductor")
-    with pytest.raises(ValueError, match="VLLM_TORCHTPU_OMNI_COMPILE"):
+    with pytest.raises(ValueError, match="VLLM_TPU_OMNI_COMPILE"):
         patches.omni_compile_mode()
 
 
@@ -496,6 +496,57 @@ def test_real_omni_pipeline_setup_compile_gate(monkeypatch):
         patches._dit_compile_runner.reset(token)
 
 
+def test_allow_listed_dit_classes_match_pinned_vllm_omni():
+    # _SPMD_SAFE_DIT_CLASSES and _EXTRA_REPEATED_BLOCKS match by class name;
+    # pin those names against the real vLLM-Omni classes so an upstream
+    # rename or _repeated_blocks change fails here instead of silently
+    # turning SPMD-safe regions or the extra blocks off.
+    from vllm_omni.diffusion.models.flux.flux_transformer import (
+        FluxSingleTransformerBlock,
+        FluxTransformer2DModel,
+        FluxTransformerBlock,
+    )
+    from vllm_omni.diffusion.models.flux2.flux2_transformer import (
+        Flux2Transformer2DModel,
+    )
+    from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+        QwenImageTransformer2DModel,
+    )
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+        WanTransformer3DModel,
+    )
+
+    real = {
+        cls.__name__: cls
+        for cls in (
+            Flux2Transformer2DModel,
+            FluxTransformer2DModel,
+            QwenImageTransformer2DModel,
+            WanTransformer3DModel,
+        )
+    }
+    assert set(real) == patches._SPMD_SAFE_DIT_CLASSES
+    for name, cls in real.items():
+        module = sys.modules[cls.__module__]
+        blocks = list(getattr(cls, "_repeated_blocks", None) or ())
+        assert blocks, name
+        for block in blocks:
+            assert isinstance(getattr(module, block, None), type), (name, block)
+
+    assert set(patches._EXTRA_REPEATED_BLOCKS) <= set(real)
+    for name, extras in patches._EXTRA_REPEATED_BLOCKS.items():
+        module = sys.modules[real[name].__module__]
+        for block in extras:
+            assert isinstance(getattr(module, block, None), type), (name, block)
+            # Still missing upstream; drop it from _EXTRA_REPEATED_BLOCKS once
+            # vLLM-Omni lists it.
+            assert block not in real[name]._repeated_blocks, (name, block)
+    assert FluxTransformer2DModel._repeated_blocks == [FluxTransformerBlock.__name__]
+    assert patches._EXTRA_REPEATED_BLOCKS["FluxTransformer2DModel"] == (
+        FluxSingleTransformerBlock.__name__,
+    )
+
+
 @pytest.mark.parametrize(
     "model_cls",
     [
@@ -587,20 +638,21 @@ def test_cache_key_tracks_every_flag(monkeypatch):
 
 
 def test_cache_key_tracks_versions_chip_and_topology(monkeypatch):
+    from vllm_torchtpu import tpu_info
+
     flags_tag = _tags(monkeypatch)[-1]
     real_version = metadata.version
-    for dist in ("torch_tpu", "libtpu", "jax", "jaxlib"):
+    # The same compiler factors as the LLM compile hash
+    # (tpu_compiler.tpu_compiler_cache_factors).
+    for dist in ("torch-tpu", "jax", "jaxlib"):
 
         def bumped(name, dist=dist):
-            if name == dist:
-                return "999.0"
-            try:
-                return real_version(name)
-            except metadata.PackageNotFoundError:
-                return ""
+            return "999.0" if name == dist else real_version(name)
 
         with patch("importlib.metadata.version", side_effect=bumped):
             assert _tags(monkeypatch)[-1] != flags_tag, dist
+    with patch.object(tpu_info, "get_libtpu_cache_key", return_value="libtpu-other"):
+        assert _tags(monkeypatch)[-1] != flags_tag
     with patch.object(
         omni_platform.hardware, "get_tpu_device_name", return_value="TPU v0"
     ):
@@ -665,32 +717,3 @@ def test_sdpa_fallback_warning_skipped_while_compiling(monkeypatch):
     assert warned == []
     assert impl._needs_sdpa_fallback(q, q, None) is True
     assert len(warned) == 1
-
-
-def test_check_env_reads_scopes_compile_cache_vars_to_omni_platform():
-    import importlib.util
-    import pathlib
-
-    tool_path = (
-        pathlib.Path(omni_platform.__file__).resolve().parents[3]
-        / "tools"
-        / "check_env_reads.py"
-    )
-    spec = importlib.util.spec_from_file_location("check_env_reads", tool_path)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    scoped_only = {
-        "LIBTPU_INIT_ARGS",
-        "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-        "TORCH_TPU_INTERNAL_XLA_OPTIONS",
-        "TPU_CHIPS_PER_PROCESS_BOUNDS",
-        "TPU_PROCESS_BOUNDS",
-        "XLA_FLAGS",
-    }
-    assert scoped_only.isdisjoint(mod.BOOTSTRAP_VARS)
-    assert {
-        mod.PACKAGE / "omni" / "platform.py": scoped_only,
-    } == mod.SCOPED_BOOTSTRAP_VARS
-    assert mod.find_reads() == mod.load_baseline()

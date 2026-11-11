@@ -37,14 +37,15 @@ logger = init_logger(__name__)
 
 # Opt-in DiT torch.compile with the torch_tpu "tpu" dynamo backend:
 # "0" (default, eager), "regional" (each repeated block) or "full" (whole DiT).
-OMNI_COMPILE_ENV = "VLLM_TORCHTPU_OMNI_COMPILE"
-OMNI_COMPILE_MODES = ("0", "regional", "full")
+OMNI_COMPILE_ENV = "VLLM_TPU_OMNI_COMPILE"
 # Opt-in: run each regionally compiled block as one torch_tpu SPMD-safe region,
 # so its sequence-parallel collectives stay inside the compiled program.
-OMNI_COMPILE_SPMD_SAFE_ENV = "VLLM_TORCHTPU_OMNI_COMPILE_SPMD_SAFE"
+OMNI_COMPILE_SPMD_SAFE_ENV = "VLLM_TPU_OMNI_COMPILE_SPMD_SAFE"
 SPMD_SAFE_CACHE_TAG = "spmd-safe-regions-v1"
 # DiTs whose repeated blocks issue the same TPU ops and collectives, in the
 # same order and with the same shapes, on every TP or sequence-parallel rank.
+# Matched by class name; tests_omni/test_dit_compile.py pins these names (and
+# the _EXTRA_REPEATED_BLOCKS below) against the real vLLM-Omni classes.
 _SPMD_SAFE_DIT_CLASSES = frozenset(
     {
         "Flux2Transformer2DModel",
@@ -60,12 +61,12 @@ _EXTRA_REPEATED_BLOCKS: dict[str, tuple[str, ...]] = {
 
 
 def omni_compile_mode() -> str:
-    """The VLLM_TORCHTPU_OMNI_COMPILE mode: "0", "regional" or "full"."""
-    return (envs.VLLM_TORCHTPU_OMNI_COMPILE or "0").lower()
+    """The VLLM_TPU_OMNI_COMPILE mode: "0", "regional" or "full"."""
+    return (envs.VLLM_TPU_OMNI_COMPILE or "0").lower()
 
 
 def omni_compile_spmd_safe() -> bool:
-    return envs.VLLM_TORCHTPU_OMNI_COMPILE_SPMD_SAFE
+    return envs.VLLM_TPU_OMNI_COMPILE_SPMD_SAFE
 
 
 def set_compile_cache_tag(tag: str, prefix: str | None = None) -> None:
@@ -99,7 +100,7 @@ def dit_compile_gate_open() -> bool:
     cannot run. The gate is therefore open only while a DiffusionModelRunner
     loads a pipeline that takes the generic _compile_transformer path (which
     _patch_dit_compile routes to the "tpu" backend), and only with
-    VLLM_TORCHTPU_OMNI_COMPILE set.
+    VLLM_TPU_OMNI_COMPILE set.
     """
     runner = _dit_compile_runner.get()
     pipeline = getattr(runner, "pipeline", None) if runner is not None else None
@@ -121,7 +122,7 @@ def dit_compile_gate_open() -> bool:
 
 def _patch_dit_compile() -> None:
     # -------------------------------------------------------------------------
-    # Opt-in (VLLM_TORCHTPU_OMNI_COMPILE=regional|full, Omni enforce_eager=False).
+    # Opt-in (VLLM_TPU_OMNI_COMPILE=regional|full, Omni enforce_eager=False).
     #
     # DiffusionModelRunner._compile_transformer builds its torch.compile kwargs
     # locally with no backend (Inductor) and dynamic=od_config.
