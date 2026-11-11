@@ -983,6 +983,107 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             distribution=jnp.array([num_seqs] * 3, dtype=jnp.int32),
         )
 
+    def test_zero_step_and_single_slot_decode_preserve_cache_and_parity(self):
+        """Verify actual_steps == 0 (empty distribution) and actual_steps == 1."""
+        rng = np.random.default_rng(7)
+        dtype = jnp.bfloat16
+        head_dim = 128
+        num_kv_heads, num_q_heads = 2, 4
+        page_size, total_pages = 128, 8
+        sm_scale = head_dim**-0.5
+        decode_blocks = configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8)
+        prefill_blocks = configs.BlockSizes(
+            bq_sz=512, bq_c_sz=16, bkv_sz=256, batch_size=2
+        )
+
+        cache_shape = wrapper.get_kv_cache_shape(
+            total_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        )
+        init_cache = jnp.asarray(
+            rng.standard_normal(cache_shape).astype(np.float32) * 0.25, dtype
+        )
+        init_cache_np = np.asarray(init_cache, np.float32)
+        q_pad = jnp.asarray(rng.standard_normal((8, num_q_heads, head_dim)), dtype)
+        k_pad = jnp.asarray(rng.standard_normal((8, num_kv_heads, head_dim)), dtype)
+        v_pad = jnp.asarray(rng.standard_normal((8, num_kv_heads, head_dim)), dtype)
+
+        _, cache_after_empty = wrapper.ragged_paged_attention(
+            q_pad,
+            k_pad,
+            v_pad,
+            init_cache,
+            jnp.zeros((8,), jnp.int32),
+            jnp.arange(total_pages, dtype=jnp.int32),
+            jnp.zeros((9,), jnp.int32),
+            jnp.array([0, 0, 0], jnp.int32),
+            sm_scale=sm_scale,
+            decode_block_sizes=decode_blocks,
+            prefill_block_sizes=prefill_blocks,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        )
+        np.testing.assert_array_equal(
+            init_cache_np, np.asarray(cache_after_empty, np.float32)
+        )
+
+        kv_len = 64
+        hist_k = jnp.asarray(
+            rng.standard_normal((kv_len, num_kv_heads, head_dim)) * 0.5, dtype
+        )
+        hist_v = jnp.asarray(
+            rng.standard_normal((kv_len, num_kv_heads, head_dim)) * 0.5, dtype
+        )
+        q1 = jnp.asarray(rng.standard_normal((1, num_q_heads, head_dim)) * 0.5, dtype)
+        _, seeded_cache = wrapper.ragged_paged_attention(
+            jnp.zeros((kv_len, num_q_heads, head_dim), dtype),
+            hist_k,
+            hist_v,
+            jnp.zeros(cache_shape, dtype),
+            jnp.array([kv_len], jnp.int32),
+            jnp.arange(total_pages, dtype=jnp.int32),
+            jnp.array([0, kv_len], jnp.int32),
+            jnp.array([0, 0, 1], jnp.int32),
+            sm_scale=sm_scale,
+            decode_block_sizes=decode_blocks,
+            prefill_block_sizes=prefill_blocks,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        )
+        ref1, _ = ref_ragged_paged_attention(
+            q1,
+            hist_k[-1:],
+            hist_v[-1:],
+            seeded_cache,
+            jnp.array([kv_len], jnp.int32),
+            jnp.arange(total_pages, dtype=jnp.int32),
+            jnp.array([0, 1], jnp.int32),
+            jnp.array([1, 1, 1], jnp.int32),
+            sm_scale=sm_scale,
+        )
+        out1, _ = wrapper.ragged_paged_attention(
+            q1,
+            hist_k[-1:],
+            hist_v[-1:],
+            seeded_cache,
+            jnp.array([kv_len], jnp.int32),
+            jnp.arange(total_pages, dtype=jnp.int32),
+            jnp.array([0, 1], jnp.int32),
+            jnp.array([1, 1, 1], jnp.int32),
+            sm_scale=sm_scale,
+            decode_block_sizes=decode_blocks,
+            prefill_block_sizes=prefill_blocks,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        )
+        np.testing.assert_allclose(
+            np.asarray(out1, np.float32),
+            np.asarray(ref1, np.float32),
+            atol=2e-2,
+            rtol=1e-2,
+        )
+
 
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())

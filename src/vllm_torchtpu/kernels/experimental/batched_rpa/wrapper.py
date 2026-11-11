@@ -223,6 +223,12 @@ def _is_sfs(tpu_info) -> bool:
     )
 
 
+# Sliding-window sizes where capping decode bkv_sz at W // 2 was measured on
+# TPU v7x (Gemma 4, W=1024); other window sizes are unverified and keep the
+# VMEM-driven decode tile.
+_SWA_DECODE_BKV_CAP_WINDOWS = frozenset({1024})
+
+
 def calculate_block_sizes(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
@@ -380,9 +386,16 @@ def calculate_block_sizes(
 
         # To maximize MXU, we want bkv_sz to be at least MXU size.
         bkv_default = mxu_column_size
-        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            # SEQ-ALONG-LANE does not support intra-page DMA offset.
-            # TODO(kyuyeunk): Reduce granularity to lane size.
+        if (
+            serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            or serve_cfgs.page_size > bkv_default
+        ):
+            # SEQ-ALONG-LANE does not support intra-page DMA offset. For both
+            # layouts the schedule maps KV block k_idx to tokens
+            # [k_idx * bkv_sz, ...) but to pages starting at k_idx * bkv_p, so
+            # bkv_sz must be a multiple of page_size. Starting from a
+            # page-aligned default (and stepping by it below) keeps every
+            # candidate bkv_sz aligned when page_size > mxu_column_size.
             bkv_default = utils.align_to(bkv_default, serve_cfgs.page_size)
         bkv_sz = bkv_stride = bkv_default
         if fixed_bq_sz is None:
@@ -431,6 +444,21 @@ def calculate_block_sizes(
             if fixed_bq_sz is None:
                 bq_sz -= bq_stride
 
+        # Decode tiles are built with a fixed bq_sz (decode_query_size);
+        # prefill/mixed tiles (fixed_bq_sz is None) stay uncapped. At W=1024 on
+        # TPU v7x, capping decode bkv_sz at W // 2 avoids wasted masked MXU rows
+        # and VMEM slot initialization; other window sizes remain unverified.
+        if (
+            fixed_bq_sz is not None
+            and model_cfgs.sliding_window in _SWA_DECODE_BKV_CAP_WINDOWS
+            and tpu_info.generation == 7
+        ):
+            swa_bkv_cap = utils.align_to(
+                max(bkv_default, model_cfgs.sliding_window // 2),
+                bkv_stride,
+            )
+            bkv_sz = min(bkv_sz, swa_bkv_cap)
+
         # Indicates OOM was triggered from the starting bkv size.
         if bkv_sz == 0:
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
@@ -438,8 +466,6 @@ def calculate_block_sizes(
         # Step 3: Given current tile size, calculate compute tile size.
 
         # Threshold value based on hardware generation and precision.
-        tpu_info = pltpu.get_tpu_info()
-
         is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
 
         match tpu_info.generation:

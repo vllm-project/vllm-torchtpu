@@ -179,7 +179,9 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         num_lanes = pltpu.get_tpu_info().num_lanes
         for b in range(self.cfgs.batch_size):
             for i in range(self.cfgs.bkv_p_cache):
-                hbm_p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
+                hbm_p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache_page(
+                    block_idx, b, i
+                )
                 sz = jnp.where(is_no_op, 0, sz)
                 dst_off = pl.multiple_of(dst_off, num_lanes)
                 sz = pl.multiple_of(sz, num_lanes)
@@ -327,21 +329,23 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         kv_cache_hbm, new_kv_hbm, schedule_ref = self.src_ref
         assert self.sem_recvs is not None
         assert self.window_ref is not None
+        assert self.cfgs.kv_token_align == 1
         sem = self.sem_recvs.at[slot]
         vmem_dst = cast(
             jax.Ref, self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
         )
-        # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
-        #     packing, page_size)
-        # kv_cache_hbm_flat: (num_pages * num_kv_heads * 2, kv_head_dim // packing,
-        #     packing, page_size)
+        # kv_cache_hbm: (num_pages, page_size, num_kv_heads * 2 // packing,
+        #     packing, kv_head_dim)
+        # kv_cache_hbm_flat: (num_pages * page_size, num_kv_heads * 2 // packing,
+        #     packing, kv_head_dim), indexed by token offsets in dma_kv_cache.
         kv_cache_hbm_flat = kv_cache_hbm.reshape(-1, *kv_cache_hbm.shape[2:])
 
         for b in range(self.cfgs.batch_size):
             for i in range(self.cfgs.bkv_p_cache):
-                p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
+                src_off, dst_off, sz = schedule_ref.get_dma_kv_cache_tokens(
+                    block_idx, b, i
+                )
                 sz = jnp.where(is_no_op, 0, sz)
-                src_off = p_idx * self.cfgs.serve.page_size
                 pltpu.make_async_copy(
                     kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
                     vmem_dst.at[b, pl.ds(dst_off, sz)],
