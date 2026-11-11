@@ -4,7 +4,8 @@ Run on a TPU host from the repo root:
     python scripts/dsv41_bench/bench_main_records.py
 Compares `prepare_main_records` with the old whole-page formula (page_stride=None)
 against the new block-stride formula at the measured decode buckets, checks
-both match `PagedCacheRows.row_indices`, and reports median device time.
+both match `PagedCacheRows.row_indices`, and reports per-call time from a
+1000-iteration on-device loop (min and max of 3 repeats).
 """
 
 import pathlib
@@ -32,7 +33,8 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2 import cache as c2  # noqa: E402
 PAGE = 128  # ratio-2 main page at --block-size 256
 # Block stride 512 KiB (old, whole pages) vs 448 KiB (new), in 512-byte records.
 OLD_STRIDE, NEW_STRIDE, OFFSET = 1024, 896, 256
-ITERS = 200
+LOOP = 1000
+REPEATS = 3
 
 
 def inputs(tokens, requests, pps, seed=0):
@@ -45,14 +47,28 @@ def inputs(tokens, requests, pps, seed=0):
 
 
 def timed(fn, *args):
-    out = fn(*args)
-    jax.block_until_ready(out)
+    """Per-call device time: ``LOOP`` calls in one jit amortize host dispatch.
+
+    Each iteration's inputs pass through a barrier with the previous output,
+    so XLA can neither hoist the loop-invariant call nor drop it.
+    """
+
+    def body(_, carry):
+        *xs, acc = jax.lax.optimization_barrier(carry)
+        records, counts = fn(*xs)
+        return (*xs, acc + records[0, 0] + counts[0])
+
+    loop = jax.jit(
+        lambda *xs: jax.lax.fori_loop(0, LOOP, body, (*xs, jnp.int32(0)))[-1]
+    )
+    out = jax.jit(fn)(*args)
+    jax.block_until_ready(loop(*args))
     samples = []
-    for _ in range(ITERS):
+    for _ in range(REPEATS):
         begin = time.perf_counter()
-        jax.block_until_ready(fn(*args))
-        samples.append(time.perf_counter() - begin)
-    return out, float(np.median(samples)) * 1e6
+        jax.block_until_ready(loop(*args))
+        samples.append((time.perf_counter() - begin) / LOOP)
+    return out, min(samples) * 1e6, max(samples) * 1e6
 
 
 def main():
@@ -68,16 +84,17 @@ def main():
             args = tuple(jnp.asarray(x) for x in (selected, table, starts))
             # Old: pages() pre-scaled the table to whole pages.
             old_table = jnp.asarray(table * (OLD_STRIDE // PAGE) + OFFSET // PAGE)
-            old = jax.jit(
-                lambda s, t, b: c2.prepare_main_records(s, t, b, page_size=PAGE)
-            )
-            new = jax.jit(
-                lambda s, t, b: c2.prepare_main_records(
+
+            def old(s, t, b):
+                return c2.prepare_main_records(s, t, b, page_size=PAGE)
+
+            def new(s, t, b):
+                return c2.prepare_main_records(
                     s, t, b, page_size=PAGE, page_stride=NEW_STRIDE, row_offset=OFFSET
                 )
-            )
-            (old_rec, _), old_us = timed(old, args[0], old_table, args[2])
-            (new_rec, _), new_us = timed(new, *args)
+
+            (old_rec, _), old_us, old_max = timed(old, args[0], old_table, args[2])
+            (new_rec, _), new_us, new_max = timed(new, *args)
             req = np.searchsorted(starts[1:], np.arange(tokens), side="right")
             logical = np.maximum(selected, 0)
             block = table[req[:, None], logical // PAGE]
@@ -87,7 +104,8 @@ def main():
                 np.testing.assert_array_equal(np.asarray(got), expect)
             print(
                 f"T={tokens:4d} R={requests:3d} pps={pps:4d}  "
-                f"old {old_us:8.1f} us  new {new_us:8.1f} us  "
+                f"old {old_us:7.2f} us (max {old_max:7.2f})  "
+                f"new {new_us:7.2f} us (max {new_max:7.2f})  "
                 f"ratio {new_us / old_us:5.3f}"
             )
 
