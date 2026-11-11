@@ -376,6 +376,11 @@ class Eagle3Proposer:
         # mtp_fused_loop.py), and whether it has run once. Built in
         # load_model; None means the per-step loop.
         self._mtp_fused_loop: torch.nn.Module | None = None
+        # VLLM_TPU_MK_DRAFT_LOOP: the MK variant of the fused loop, compiled only at the
+        # draft kernel's rows and picked per step in Python (never a traced branch).
+        self._mtp_fused_loop_mk: torch.nn.Module | None = None
+        self._mtp_fused_loop_mk_sizes: frozenset[int] = frozenset()
+        self._mtp_fused_loop_mk_warm = False
         # VLLM_TPU_MK_DRAFT: draft step 0 as one MK call (built on first use).
         self._mk_draft_step0: torch.nn.Module | None = None
         self._mk_draft_step0_warm = False
@@ -839,6 +844,9 @@ class Eagle3Proposer:
         self._draft_md_cache.pop(id(chunk), None)
 
         num_tokens = input_ids.shape[0]
+        loop, warm_attr = self._mtp_fused_loop, "_mtp_fused_loop_warm"
+        if self._mk_fused_loop_for(num_tokens) is not None:
+            loop, warm_attr = self._mtp_fused_loop_mk, "_mtp_fused_loop_mk_warm"
         with (
             set_model_tag("eagle_head"),
             set_forward_context(
@@ -851,16 +859,50 @@ class Eagle3Proposer:
                 mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
             ),
         ):
-            if not self._mtp_fused_loop_warm:
+            if not getattr(self, warm_attr):
                 # The first call traces and compiles; like the loop-step
                 # program's, its outputs can carry symbolic sizes, so run it
                 # again compiled. The repeat rewrites the same KV entries;
                 # seq_lens is put back first because the program advanced it.
                 seq_lens_step1 = seq_lens.clone()
-                self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+                loop(input_ids, positions, hidden_states, seq_lens)
                 seq_lens.copy_(seq_lens_step1)
-                self._mtp_fused_loop_warm = True
-            return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+                setattr(self, warm_attr, True)
+            return loop(input_ids, positions, hidden_states, seq_lens)
+
+    def _mk_fused_loop_for(self, num_tokens: int) -> torch.nn.Module | None:
+        """The MK fused loop when this step's token count is one of its compile sizes
+        (built on first use, after the driver attached the MK draft); else None."""
+        inner = getattr(self.draft_model, "model", None)
+        if not envs.VLLM_TPU_MK_DRAFT_LOOP or getattr(inner, "mk_draft", None) is None:
+            return None
+        if self._mtp_fused_loop_mk is None and not self._mtp_fused_loop_mk_sizes:
+            from vllm_torchtpu.spec_decode.mtp_fused_loop import (
+                build_mtp_fused_loop,
+                mk_draft_compile_config,
+            )
+
+            cfg, sizes = mk_draft_compile_config(self.draft_vllm_config, inner, 1)
+            self._mtp_fused_loop_mk_sizes = frozenset(sizes) or frozenset({-1})
+            if sizes:
+                K = self.speculative_config.num_speculative_tokens
+                with (
+                    set_model_tag("eagle_head"),
+                    set_vllm_model_wrapper_context(mesh=self.runner.mesh, vllm_config=cfg),
+                    set_current_vllm_config(cfg),
+                ):
+                    self._mtp_fused_loop_mk = build_mtp_fused_loop(
+                        vllm_config=cfg,
+                        prefix=f"mk_mtp_fused_loop_k{K}",
+                        mtp=self.draft_model,
+                        num_steps=K - 1,
+                        dynamic_arg_dims=getattr(self.draft_model, "_dynamic_arg_dims", {}),
+                        use_mk=True,
+                    )
+                logger.info("MK draft loop: fused loop program at token sizes %s", sizes)
+        if num_tokens not in self._mtp_fused_loop_mk_sizes:
+            return None
+        return self._mtp_fused_loop_mk
 
     def _mk_draft_count(self, key: str) -> None:
         """VLLM_TPU_MK_DRAFT: per-path step-0 count, logged with the MK step mix."""
@@ -871,7 +913,9 @@ class Eagle3Proposer:
         if count is not None:
             count(key, 1)
 
-    def _mk_draft_step0_ready(self, chunk: DraftChunkInputs, num_chunks: int) -> bool:
+    def _mk_draft_step0_ready(
+        self, chunk: DraftChunkInputs, num_chunks: int, num_tokens: int = 0
+    ) -> bool:
         """VLLM_TPU_MK_DRAFT step 0: the MK draft is attached and this step's target
         forward ran the whole-step megakernel (a uniform verify step: 4 rows per
         request), one chunk, draft rows, default sequence layout."""
@@ -881,6 +925,14 @@ class Eagle3Proposer:
         if getattr(inner, "mk_draft", None) is None:
             return False
         if not getattr(self.runner, "_mk_whole_step", False):
+            return False
+        # The step-0 MK program is compiled only at the draft kernel's rows.
+        if not hasattr(self, "_mk_step0_sizes"):
+            from vllm_torchtpu.spec_decode.mtp_fused_loop import mk_draft_compile_config
+
+            self._mk_step0_cfg, sizes = mk_draft_compile_config(self.draft_vllm_config, inner, 4)
+            self._mk_step0_sizes = frozenset(sizes)
+        if num_tokens not in self._mk_step0_sizes:
             return False
         # Host-side guard on top of the driver's flag: every request 4 rows.
         qsl = np.asarray(chunk.query_start_loc_np)[: chunk.num_reqs + 1]
@@ -913,7 +965,7 @@ class Eagle3Proposer:
                 set_current_vllm_config(self.draft_vllm_config),
             ):
                 self._mk_draft_step0 = build_mk_draft_step0(
-                    vllm_config=self.draft_vllm_config,
+                    vllm_config=self._mk_step0_cfg,
                     prefix="mk_draft_step0",
                     mtp=self.draft_model,
                     rows_per_request=4,
@@ -1682,7 +1734,7 @@ class Eagle3Proposer:
             rejected_np_per_chunk.append(
                 None if isinstance(num_rejected, torch.Tensor) else num_rejected
             )
-            mk0 = self._mk_draft_step0_ready(chunk, len(chunks))
+            mk0 = self._mk_draft_step0_ready(chunk, len(chunks), int(input_ids.shape[0]))
             self._mk_draft_count("mk_draft_step0" if mk0 else "stock_step0")
             if mk0:
                 # VLLM_TPU_MK_DRAFT: step 0 + carry + token 0 as one kernel call.

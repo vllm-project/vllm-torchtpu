@@ -47,12 +47,14 @@ class _MtpFusedLoop(nn.Module):
         prefix: str = "",
         mtp: MtpDraftModel,
         num_steps: int,
+        use_mk: bool = False,
     ) -> None:
         super().__init__()
         # Own compile-cache folder, as in MtpLoopStepModel.
         self.prefix = prefix
         self.mtp = mtp
         self.num_steps = num_steps
+        self.use_mk = use_mk
 
     def forward(
         self,
@@ -68,17 +70,12 @@ class _MtpFusedLoop(nn.Module):
         tokens = []
         # VLLM_TPU_MK_DRAFT: each step is one kernel call returning the carry and the
         # greedy token (attached before the first trace, so a static choice here).
-        inner = getattr(self.mtp, "model", None)
-        mk_step = (
-            getattr(self.mtp, "mk_draft_step", None)
-            if getattr(inner, "mk_draft", None) is not None and envs.VLLM_TPU_MK_DRAFT_LOOP
-            else None
-        )
-        if mk_step is not None and not mk_draft_rows_ok(inner, int(input_ids.shape[0]), 1):
-            # Compile ranges past the draft kernel's rows (prefill-sized token budgets,
-            # up to 8192) trace the stock steps: the kernel is never built at those
-            # sizes (VMEM), and served whole-step steps never reach them.
-            mk_step = None
+        # The MK choice is a construction-time attribute, never a branch on the token
+        # count: vLLM traces one graph for every compile range, so a shape branch would
+        # freeze at the first traced bucket (za9g ShapeSpecializationError). The MK
+        # variant is a separate program compiled only at the kernel's rows
+        # (`mk_draft_compile_config`); the caller picks it per step in Python.
+        mk_step = getattr(self.mtp, "mk_draft_step", None) if self.use_mk else None
         for i in range(self.num_steps):
             if i > 0:
                 positions = positions + 1
@@ -120,6 +117,22 @@ def mk_draft_rows_ok(inner: Any, rows: int, rows_per_request: int) -> bool:
     return 0 < rows <= cap
 
 
+def mk_draft_compile_config(vllm_config: VllmConfig, inner: Any, rows_per_request: int):
+    """`(config, sizes)`: the draft config with compile sizes cut to the draft
+    kernel's rows (`MkDraft.max_rows`), so the MK draft programs are never built at a
+    prefill-sized range (VMEM: 1872 MiB at 8192 rows, za9e j-c6b8b17f). Empty sizes:
+    no MK program."""
+    import copy
+
+    cap = getattr(getattr(inner, "mk_draft", None), "max_rows", {}).get(rows_per_request, 0)
+    sizes = [s for s in (vllm_config.compilation_config.compile_sizes or []) if 0 < s <= cap]
+    cfg = copy.copy(vllm_config)
+    cc = copy.copy(vllm_config.compilation_config)
+    cc.compile_sizes = list(sizes)
+    object.__setattr__(cfg, "compilation_config", cc)
+    return cfg, sizes
+
+
 def build_mtp_fused_loop(
     *,
     vllm_config: VllmConfig,
@@ -127,6 +140,7 @@ def build_mtp_fused_loop(
     mtp: MtpDraftModel,
     num_steps: int,
     dynamic_arg_dims: dict,
+    use_mk: bool = False,
 ) -> nn.Module:
     """Compile `_MtpFusedLoop` with the draft's own dynamic dims (Qwen3.5's
     MTP marks positions -1, DeepSeek's 0), so both programs specialise the
@@ -139,7 +153,8 @@ def build_mtp_fused_loop(
     cls = support_torch_compile(dynamic_arg_dims=dims)(
         type("MtpFusedLoop", (_MtpFusedLoop,), {})
     )
-    return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps)
+    return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps,
+               use_mk=use_mk)
 
 
 class _MkDraftStep0(nn.Module):
@@ -166,23 +181,9 @@ class _MkDraftStep0(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if mk_draft_rows_ok(
-            getattr(self.mtp, "model", None), int(input_ids.shape[0]), self.rows_per_request
-        ):
-            carry, tokens = self.mtp.mk_draft_step(  # type: ignore[attr-defined]
-                input_ids, positions, hidden_states, self.rows_per_request
-            )
-        else:
-            # Compile sizes past the kernel's rows (never served: step 0 runs on the MK
-            # only after a whole-step target forward): the stock draft step.
-            out = type(self.mtp).forward(
-                self.mtp, input_ids, positions, hidden_states, intermediate_tensors,
-                inputs_embeds, spec_step_idx=0,
-            )
-            if isinstance(out, (list, tuple)) and len(out) == 1:
-                out = out[0]
-            last, carry = out if isinstance(out, (list, tuple)) else (out, out)
-            tokens = self.mtp.compute_logits(last).argmax(dim=-1).to(torch.int32)
+        carry, tokens = self.mtp.mk_draft_step(  # type: ignore[attr-defined]
+            input_ids, positions, hidden_states, self.rows_per_request
+        )
         rows = draft_rows.clamp_min(0)
         return (
             torch.index_select(carry, 0, rows),

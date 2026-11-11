@@ -11,20 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""VLLM_TPU_MK_DRAFT: compile ranges past the draft kernel's rows trace the stock draft.
+"""VLLM_TPU_MK_DRAFT: the MK draft programs are compiled only at the kernel's rows.
 
-za9e c4 j-c6b8b17f: the fused draft loop's warmup compiled every range up to 8192 rows,
-built the MK draft kernel at 8192 rows (1872 MiB VMEM scratch) and the server died.
+za9e c4 j-c6b8b17f: the fused loop chose the MK step for every compile range and built
+the draft kernel at 8192 rows (1872 MiB VMEM). za9g: a token-count branch inside the
+traced loop froze the graph at the first bucket (ShapeSpecializationError at 8192).
+The MK choice is now a construction-time attribute of a separate program whose
+compile sizes stop at the kernel's rows; the caller picks it per step in Python.
 """
 
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
-import pytest
 import torch
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.spec_decode import mtp_fused_loop as fl
 
 
@@ -36,10 +38,22 @@ def test_rows_gate():
     inner = _inner({4: 32, 1: 16})
     assert fl.mk_draft_rows_ok(inner, 16, 1) and fl.mk_draft_rows_ok(inner, 32, 4)
     assert not fl.mk_draft_rows_ok(inner, 8192, 1)
-    assert not fl.mk_draft_rows_ok(inner, 8192, 4)
     assert not fl.mk_draft_rows_ok(inner, 17, 1)
     assert not fl.mk_draft_rows_ok(SimpleNamespace(mk_draft=None), 4, 1)
-    assert not fl.mk_draft_rows_ok(_inner({}), 4, 1)  # not set by the driver: never MK
+    assert not fl.mk_draft_rows_ok(_inner({}), 4, 1)
+
+
+def test_mk_compile_config_drops_prefill_sized_buckets():
+    cc = SimpleNamespace(compile_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 1024, 8192])
+    cfg = SimpleNamespace(compilation_config=cc)
+    inner = _inner({4: 32, 1: 16})
+    loop_cfg, loop_sizes = fl.mk_draft_compile_config(cfg, inner, 1)
+    step0_cfg, step0_sizes = fl.mk_draft_compile_config(cfg, inner, 4)
+    assert loop_sizes == [1, 2, 4, 8, 16] and loop_cfg.compilation_config.compile_sizes == loop_sizes
+    assert step0_sizes == [1, 2, 4, 8, 16, 32]
+    assert cc.compile_sizes[-1] == 8192  # the stock draft config is untouched
+    _, none = fl.mk_draft_compile_config(cfg, _inner({}), 1)
+    assert none == []
 
 
 class _StubMtp(torch.nn.Module):
@@ -50,25 +64,48 @@ class _StubMtp(torch.nn.Module):
 
     def mk_draft_step(self, input_ids, positions, hidden, rows_per_request):
         self.mk_calls += 1
-        assert input_ids.shape[0] <= 16, "the MK draft must not be traced at this size"
-        return hidden, input_ids
+        return hidden + 1, input_ids
 
     def forward(self, input_ids, positions, hidden, intermediate_tensors, inputs_embeds,
                 spec_step_idx=0):
-        return hidden
+        return hidden * 2
 
     def compute_logits(self, hidden):
-        return torch.zeros(hidden.shape[0], 8)
+        return hidden
 
 
-@pytest.mark.parametrize("rows,mk", [(8192, False), (16, True)])
-def test_fused_loop_uses_mk_only_within_rows(monkeypatch, rows, mk):
-    monkeypatch.setattr(envs, "VLLM_TPU_MK_DRAFT_LOOP", True)
-    mtp = _StubMtp()
+def _loop(use_mk):
     loop = fl._MtpFusedLoop.__new__(fl._MtpFusedLoop)
     torch.nn.Module.__init__(loop)
-    loop.mtp, loop.num_steps, loop.prefix = mtp, 2, ""
-    ids = torch.zeros(rows, dtype=torch.int32)
-    tokens = loop.forward(ids, torch.zeros(rows), torch.zeros(rows, 4), torch.zeros(rows))
-    assert len(tokens) == 2
-    assert (mtp.mk_calls > 0) == mk
+    loop.mtp, loop.num_steps, loop.prefix, loop.use_mk = _StubMtp(), 2, "", use_mk
+    return loop
+
+
+def _args(rows):
+    return (torch.zeros(rows, dtype=torch.int32), torch.zeros(rows),
+            torch.zeros(rows, 4), torch.zeros(rows))
+
+
+def test_mk_choice_is_static():
+    stock, mk = _loop(False), _loop(True)
+    stock.forward(*_args(16))
+    mk.forward(*_args(16))
+    assert stock.mtp.mk_calls == 0 and mk.mtp.mk_calls == 2
+
+
+def test_stock_loop_has_no_token_count_guard():
+    """One dynamo trace serves 16 and 8192 rows: the loop must not branch on the token
+    count (a shape guard would freeze every compile range at the first bucket)."""
+    from torch._dynamo.testing import CompileCounter
+
+    torch._dynamo.reset()
+    loop = _loop(False)
+    counter = CompileCounter()
+    fn = torch.compile(lambda *a: loop.forward(*a), backend=counter, dynamic=True)
+    a16, a8192 = _args(16), _args(8192)
+    for t in (*a16, *a8192):
+        torch._dynamo.mark_dynamic(t, 0)
+    fn(*copy.deepcopy(a16))
+    fn(*copy.deepcopy(a8192))
+    assert counter.frame_count == 1, counter.frame_count
+    assert loop.mtp.mk_calls == 0
