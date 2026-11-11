@@ -25,6 +25,11 @@ _ARCHITECTURES = (
     "MiniMaxM3SparseForConditionalGeneration",
 )
 _MODEL = "vllm_torchtpu.models.minimax_m3.experimental.model:MiniMaxM3SparseForCausalLM"
+# The checkpoint's dspark/ draft; keep in sync with dspark.ARCHITECTURE.
+_DSPARK_ARCHITECTURE = "DSparkMiniMaxDraftModel"
+_DSPARK_MODEL = (
+    "vllm_torchtpu.models.minimax_m3.experimental.dspark:MiniMaxM3DSparkForCausalLM"
+)
 
 
 def register() -> None:
@@ -51,14 +56,18 @@ def register() -> None:
     for arch in _ARCHITECTURES:
         ModelRegistry.register_model(arch, _MODEL)
         MODELS_CONFIG_MAP[arch] = TPUMiniMaxM3Config
+    ModelRegistry.register_model(_DSPARK_ARCHITECTURE, _DSPARK_MODEL)
     register_tpu_quant_config(QUANT_METHOD, MiniMaxM3QuantConfig)
     # The [K | V] and index caches differ in row width, so KV offload
     # registers them array by array.
     register_multi_shapes_kv_architectures(*_ARCHITECTURES)
     # DCP up to the TP size: a wide group stores several KV heads per rank.
     register_kv_head_spanning_dcp_architectures(*_ARCHITECTURES)
-    # 4-bit MSA caches (`kernels.msa_fp4`); the model's other attention
-    # caches store fp8 under this name.
+    # 4-bit MSA caches (`kernels.msa_fp4`); the other attention caches of the
+    # model (the DSpark draft's) store fp8 under this name.
     register_model_kv_cache_dtype(
-        "int4_per_token_head", torch.float8_e4m3fn, *_ARCHITECTURES
+        "int4_per_token_head",
+        torch.float8_e4m3fn,
+        *_ARCHITECTURES,
+        _DSPARK_ARCHITECTURE,
     )

@@ -92,6 +92,12 @@ class TPUMiniMaxM3Config(VerifyAndUpdateConfig):
             )
         if parallel_config.decode_context_parallel_size > 1:
             _verify_dcp(vllm_config, block_size)
+        if vllm_config.speculative_config is not None:
+            from vllm_torchtpu.models.minimax_m3.experimental.dspark import (
+                configure_dspark_draft,
+            )
+
+            configure_dspark_draft(vllm_config.speculative_config)
         if parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "MiniMax M3 on TPU requires pipeline_parallel_size=1."
