@@ -33,7 +33,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -53,6 +57,7 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import cp_draft_attention
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
@@ -318,6 +323,56 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
         self.post_attention_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
 
 
+def _flipped_weight(linear: nn.Module, dtype: torch.dtype) -> torch.Tensor | None:
+    """The ``[n_in, n_out]`` weight of a bias-free linear whose apply is a
+    plain ``matmul(x, weight)`` (unquantized, or MXFP8 dequantized to
+    ``dtype`` at load, both flipped after loading), else None."""
+    from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+
+    if getattr(linear, "bias", None) is not None:
+        return None
+    if not getattr(linear, WEIGHT_FLIPPED_ATTR, False):
+        return None
+    # A quantized weight keeps a separate scale (e.g. the fp8 method).
+    if hasattr(linear, "weight_scale") or linear.weight.dtype != dtype:
+        return None
+    return linear.weight
+
+
+def _column_parallel(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """``linear(x)`` for a TP-replicated linear: with
+    TPU_MINIMAX_M3_DSPARK_SPLIT_FC (r6), each rank computes 1/tp of the output
+    columns, reading 1/tp of the weight, then the ranks all-gather."""
+    if not envs.TPU_MINIMAX_M3_DSPARK_SPLIT_FC:
+        return linear(x)
+    weight = _flipped_weight(linear, x.dtype)
+    tp = get_tensor_model_parallel_world_size()
+    if weight is None or tp == 1 or weight.shape[1] % tp:
+        return linear(x)
+    cols = weight.shape[1] // tp
+    start = get_tensor_model_parallel_rank() * cols
+    part = torch.matmul(x, weight[:, start : start + cols])
+    return tensor_model_parallel_all_gather(part, dim=-1)
+
+
+def _context_kv(attn: nn.Module, context: torch.Tensor):
+    """A draft layer's K and V of the context tokens. Only the qkv_proj's K/V
+    columns when its weight is a plain matrix: the Q columns would be
+    discarded (1024 of this rank's 1280 for MiniMax-M3's draft at TP8).
+    Only with TPU_MINIMAX_M3_DSPARK_SPLIT_FC (r6); else the whole qkv_proj."""
+    weight = (
+        _flipped_weight(attn.qkv_proj, context.dtype)
+        if envs.TPU_MINIMAX_M3_DSPARK_SPLIT_FC
+        else None
+    )
+    if weight is None:
+        qkv, _ = attn.qkv_proj(context)
+        kv = qkv[:, attn.q_size :]
+    else:
+        kv = torch.matmul(context, weight[:, attn.q_size :])
+    return kv.split([attn.kv_size, attn.kv_size], dim=-1)
+
+
 class MiniMaxM3DSparkModel(Qwen3DSparkModel):
     decoder_layer_cls = MiniMaxM3DSparkDecoderLayer
 
@@ -360,12 +415,11 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         if self.rank_rows_context_kv is not None:
             return store_context_kv_rank_rows(self, aux, positions, metadata)
         target_hidden_states = aux[0] if len(aux) == 1 else torch.cat(aux, dim=-1)
-        context = self.hidden_norm(self.fc(target_hidden_states))
+        context = self.hidden_norm(_column_parallel(self.fc, target_hidden_states))
         num_tokens = context.shape[0]
         for layer, layer_metadata in zip(self.layers, metadata, strict=True):
             attn = layer.self_attn
-            qkv, _ = attn.qkv_proj(context)
-            k, v = qkv[:, attn.q_size :].split([attn.kv_size, attn.kv_size], dim=-1)
+            k, v = _context_kv(attn, context)
             k = _per_head_norm(k, attn.k_norm, attn.head_dim)
             k, _ = attn.rotary_emb(positions, k, None)
             impl = attn.attn.impl

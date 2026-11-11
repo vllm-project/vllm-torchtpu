@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_INDEXER_DMA_RING3: bool = False
     TPU_MINIMAX_M3_INDEXER_FP8_TRANSPOSED: bool = False
     TPU_MINIMAX_M3_MSA_LSE_R6: bool = False
+    TPU_MINIMAX_M3_DSPARK_SPLIT_FC: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -803,6 +804,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefetch ring, transposed scores for 8/16-bit full tiles; no 12-page
     # width, no 4-bit page cache). Not bit-identical on 8/16-bit caches.
     "TPU_MINIMAX_M3_MSA_LSE_R6": env_bool("TPU_MINIMAX_M3_MSA_LSE_R6", default=False),
+    # MiniMax M3 DSpark drafter context K/V: fc's replicated weight split by
+    # columns over the TP ranks (+ all-gather), and only the K/V columns of
+    # each draft qkv_proj, when the weights are plain flipped matrices. r6.
+    "TPU_MINIMAX_M3_DSPARK_SPLIT_FC": env_bool(
+        "TPU_MINIMAX_M3_DSPARK_SPLIT_FC", default=False
+    ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
