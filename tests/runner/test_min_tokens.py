@@ -839,6 +839,7 @@ def _spec_step_runner(num_output, logits_list, md_list, req_ids):
     )
     runner.speculative_config = spec_config
     runner.rejection_sampler = RejectionSampler(spec_config, torch.device("cpu"))
+    runner._fused_spec_sampler = False
     for name in (
         "_sample_spec_verify_chunk",
         "spec_bonus_and_target_logits",
