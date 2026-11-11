@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
+    TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -960,6 +961,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # effect for models whose ops implement that pass (DeepSeek-V4); 0 keeps
     # every verify window on the mixed pass.
     "TPU_SPEC_STATIC_VERIFY": env_bool("TPU_SPEC_STATIC_VERIFY", default=True),
+    # Under synthetic rejection sampling, decide acceptance before the LM head
+    # and compute logits and sample on one row per request (its first
+    # rejected slot or its bonus slot) instead of every verify row. r6
+    # (default on there); default off here.
+    "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY": env_bool(
+        "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY", default=False
+    ),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
