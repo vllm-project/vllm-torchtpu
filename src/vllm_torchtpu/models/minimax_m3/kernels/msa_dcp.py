@@ -578,6 +578,7 @@ def _class_candidates(
         scale_cache=scale_cache,
         scale_row=scale_row,
         interpret=interpret,
+        fp8_q=msa_indexer.fp8_queries_enabled(),
     )
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     max_num_seqs = q_lens.shape[0]
