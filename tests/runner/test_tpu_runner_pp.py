@@ -33,6 +33,8 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 def _runner(**attrs):
     runner = MagicMock(spec=TPUModelRunner)
     runner._stage_timing = MagicMock()
+    runner._forward_timing = MagicMock()
+    runner._forward_timing.take_forward_samples.return_value = []
     runner.device = torch.device("cpu")
     runner.model_config = MagicMock()
     runner.model_config.dtype = torch.bfloat16

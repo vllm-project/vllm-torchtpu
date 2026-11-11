@@ -6346,14 +6346,14 @@ class TestTPUConnectorStats(unittest.TestCase):
         stats = TpuKVConnectorStats()
 
         reduced = stats.reduce()
-        assert sum(reduced["Num failed transfers"]) == 0
+        assert reduced["Num failed transfers"] == 0
         assert stats.is_empty() is True
 
         for i in range(10):
             stats.record_failed_transfer()
         reduced = stats.reduce()
 
-        assert sum(reduced["Num failed transfers"]) == 10
+        assert reduced["Num failed transfers"] == 10
         assert stats.is_empty() is False
 
     def test_prometheus_histogram_d2h_transfer_time(self):

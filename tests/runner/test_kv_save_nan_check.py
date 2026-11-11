@@ -287,6 +287,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         mesh=None,
         _kv_cache_bundle=None,
         _stage_timing=MagicMock(),
+        _forward_timing=MagicMock(),
         is_pooling_model=False,
         sequence_layout_planner=SimpleNamespace(
             maybe_select_logits_hidden_states=lambda hs, _plan, _idx: hs[:1]
@@ -307,6 +308,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     )
     runner._stage_timing.stage.return_value = contextlib.nullcontext()
     runner._stage_timing.take_samples.return_value = ([], [])
+    runner._forward_timing.take_forward_samples.return_value = []
 
     def prepare_inputs(_so, start_index, _num_decode, _num_windowed):
         valid = valid_tokens_per_chunk[start_index]

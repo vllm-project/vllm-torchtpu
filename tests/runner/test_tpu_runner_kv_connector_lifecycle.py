@@ -126,8 +126,10 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         _assemble_async_prefill_bootstrap=lambda *_args: async_source,
         _update_placeholder=lambda *_args: {"r0": 0},
         _stage_timing=MagicMock(),
+        _forward_timing=MagicMock(),
     )
     runner._stage_timing.take_samples.return_value = ([], [])
+    runner._forward_timing.take_forward_samples.return_value = []
     runner._async_drafter = runner.drafter
     for name in (
         "maybe_wait_for_kv_save",

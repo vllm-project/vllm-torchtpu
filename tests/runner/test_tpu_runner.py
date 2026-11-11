@@ -1008,7 +1008,8 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
     connector.get_block_ids_with_load_errors_group_index.return_value = 2
     connector.build_connector_worker_meta.return_value = {"jobs": []}
     connector.get_kv_connector_stats.return_value = stats
-    runner = SimpleNamespace(_stage_timing=MagicMock())
+    runner = SimpleNamespace(_stage_timing=MagicMock(), _forward_timing=MagicMock())
+    runner._forward_timing.take_forward_samples.return_value = []
     runner._stage_timing.take_samples.return_value = (cpu_samples, device_samples)
     scheduler_output = SimpleNamespace(finished_req_ids={"finished"})
 
@@ -1040,6 +1041,7 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
         assert stats == original_stats
     assert unrelated_stats.data == original_unrelated_data
     runner._stage_timing.take_samples.assert_called_once_with()
+    runner._forward_timing.take_forward_samples.assert_called_once_with()
     connector.get_transfer_results.assert_called_once_with({"finished"})
     connector.get_finished.assert_not_called()
     connector.get_block_ids_with_load_errors.assert_called_once_with()
@@ -3782,8 +3784,10 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _update_mamba_slot_read_offsets=lambda *_args: None,
             _update_num_xla_graphs=lambda *_args: None,
             _stage_timing=MagicMock(),
+            _forward_timing=MagicMock(),
         )
         runner._stage_timing.take_samples.return_value = ([], [])
+        runner._forward_timing.take_forward_samples.return_value = []
         for name in (
             "maybe_wait_for_kv_save",
             "get_finished_kv_transfers",

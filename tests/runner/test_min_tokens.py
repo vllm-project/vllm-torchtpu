@@ -623,8 +623,10 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
         _update_num_xla_graphs=lambda *_args: None,
         _modify_prev_results=lambda: None,
         _stage_timing=MagicMock(),
+        _forward_timing=MagicMock(),
     )
     runner._stage_timing.take_samples.return_value = ([], [])
+    runner._forward_timing.take_forward_samples.return_value = []
     if num_output is not None:
         runner._min_tokens.add(req_id, SamplingParams(min_tokens=4, stop_token_ids=[3]))
         runner.requests[req_id] = SimpleNamespace(
