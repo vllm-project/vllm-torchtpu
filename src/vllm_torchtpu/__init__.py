@@ -1635,44 +1635,6 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     )
 
 
-def _patch_vllm_merge_dsv41_swa_groups() -> None:
-    """Give identical DeepSeek-V4.1 SWA layers one KV cache group.
-
-    Upstream grouping assumes every group draws from one shared page pool and
-    so leaves each SWA layer in its own group. The scheduler then walks every
-    SWA manager for every request on every step, although the private pools
-    make those managers issue the same ids. See `swa_cache.merge_swa_groups`.
-    """
-    import functools
-    import sys
-
-    from vllm.v1.core import kv_cache_utils
-
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
-        merge_swa_groups,
-    )
-
-    patched = kv_cache_utils.get_kv_cache_configs
-    if not getattr(patched, "_tpu_merge_swa_groups_patch", False):
-        original = patched
-
-        @functools.wraps(original)
-        def patched(vllm_config, kv_cache_specs, available_memory):
-            configs = original(vllm_config, kv_cache_specs, available_memory)
-            return [merge_swa_groups(config) for config in configs]
-
-        # pyrefly: ignore[missing-attribute]
-        patched._tpu_merge_swa_groups_patch = True
-        kv_cache_utils.get_kv_cache_configs = patched
-        logger.info("Applied TPU patch: one KV cache group per DeepSeek-V4.1 SWA spec.")
-    # EngineCore imports the function directly and may be imported after the
-    # first application, so rebind it on every refresh.
-    core = sys.modules.get("vllm.v1.engine.core")
-    if core is not None and hasattr(core, "get_kv_cache_configs"):
-        # pyrefly: ignore[missing-attribute]
-        core.get_kv_cache_configs = patched
-
-
 def _patch_vllm_vocab_parallel_embedding() -> None:
     """Register shard index bounds as module buffers in VocabParallelEmbedding.
 
