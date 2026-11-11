@@ -1097,8 +1097,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qwen38_wholestep_call). Layout-only entries keep the bytes; see its comments.
     "VLLM_TPU_MK_BUCKET_TUNE": env_bool("VLLM_TPU_MK_BUCKET_TUNE"),
     # Whole-step megakernel: MTP draft step 0 (draft layer, final mixer, lm_head,
-    # greedy pick, carry) as one kernel call (megakernel_runtime.qwen38_draft). BF16
-    # draft weights (shipped precision). Needs the whole-step MK and the fused loop.
+    # greedy pick, carry) as one kernel call (megakernel_runtime.qwen38_draft). Draft
+    # weights at checkpoint precision (FP8 routed experts, BF16 elsewhere; no HC FP8).
+    # Needs the whole-step MK and the fused loop.
     "VLLM_TPU_MK_DRAFT": env_bool("VLLM_TPU_MK_DRAFT"),
     # With VLLM_TPU_MK_DRAFT: the fused loop's steps 1..K-1 through the MK draft call
     # too (else only draft step 0). Off: at T=1 the call is slower than stock

@@ -1995,7 +1995,7 @@ class Qwen38SegmentDriver:
             return False
 
     def _attach_mk_draft(self, runner: Any) -> None:
-        """VLLM_TPU_MK_DRAFT: the MTP draft's loop steps (and, from the drafter, step 0)
+        """VLLM_TPU_MK_DRAFT: the MTP draft's step 0 (and loop steps, VLLM_TPU_MK_DRAFT_LOOP)
         as one whole-step kernel call each (`qwen38_draft.MkDraft`): draft layer, final
         mixer, lm_head and greedy pick. Needs the whole-step program (its pool and
         geometry) and the fused draft loop; on failure the draft stays stock."""
@@ -2027,7 +2027,9 @@ class Qwen38SegmentDriver:
         draft.model.mk_draft = mk
         logger.info(
             "Qwen3.8 MK draft attached: draft layer + mixer + lm_head + greedy pick per "
-            "step (BF16 draft weights, %d operands)", mk.n_w,
+            "step (draft weights at checkpoint precision: FP8 routed experts with their "
+            "scales, BF16 attention / HC / shared expert / router / lm_head; %d operands)",
+            mk.n_w,
         )
 
     def _attach_mtp_tail(self, runner: Any) -> None:
