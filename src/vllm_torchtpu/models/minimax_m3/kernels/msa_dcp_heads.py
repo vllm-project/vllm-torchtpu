@@ -138,7 +138,9 @@ def _exchange_pages(kv_cache, scale_cache, pages, *, dcp, replicas, head_width, 
     send = jnp.moveaxis(kv, 4, 0).reshape(dcp, part, rows, packing, head_width)
     sc = scale_cache[pages][:, : 2 * heads]  # K/V rows of every head
     sc = sc.reshape(replicas, part, heads, 2, sc.shape[-1])
-    send_sc = jnp.moveaxis(sc, 2, 0).reshape(dcp, part, 2, sc.shape[-1])
+    # [dcp, part * 2, lanes]: a [.., 2, lanes] block pads its (8, 128) tiles
+    # four times over.
+    send_sc = jnp.moveaxis(sc, 2, 0).reshape(dcp, part * 2, sc.shape[-1])
     recv = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)
     recv_sc = jax.lax.all_to_all(send_sc, axis, 0, 0, tiled=True)
     if replicas > 1:
