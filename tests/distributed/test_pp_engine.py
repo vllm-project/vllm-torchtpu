@@ -34,8 +34,8 @@ def fresh_steps_in_flight(monkeypatch):
     monkeypatch.setattr(
         VllmConfig, "max_concurrent_batches", VllmConfig.max_concurrent_batches
     )
-    monkeypatch.setattr(VllmConfig, "_tpu_pp_extra_steps", None, raising=False)
-    monkeypatch.delattr(VllmConfig, "_tpu_pp_extra_steps")
+    monkeypatch.setattr(VllmConfig, "_tpu_pp_steps_patch", False, raising=False)
+    monkeypatch.delattr(VllmConfig, "_tpu_pp_steps_patch")
 
 
 @pytest.fixture
@@ -160,12 +160,13 @@ def test_the_steps_in_flight_are_raised_once(monkeypatch, queue):
     _bare_executor_cls(monkeypatch)
     pp_engine.patch_executor_for_pp_buffered(_config(8))
     raised = VllmConfig.max_concurrent_batches
-    # a later call keeps the one patch and the first call's extra steps
+    # a later call keeps the one patch; each config counts its own stages
     pp_engine.patch_executor_for_pp_buffered(_config(8))
     pp_engine.patch_executor_for_pp_buffered(_config(4))
     assert VllmConfig.max_concurrent_batches is raised
-    assert VllmConfig._tpu_pp_extra_steps == 4
-    assert raised.fget(_engine_config(8, async_scheduling=False)) == 12
+    assert raised.fget(_engine_config(8, async_scheduling=False)) == 8 + 4
+    assert raised.fget(_engine_config(4, async_scheduling=False)) == 4 + 2
+    assert raised.fget(_engine_config(2, async_scheduling=False)) == 2 + 1
 
 
 def _bare_executor_cls(monkeypatch):

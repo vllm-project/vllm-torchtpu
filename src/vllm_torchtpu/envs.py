@@ -115,7 +115,9 @@ if TYPE_CHECKING:
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_LINEAR: bool = False
-    TPU_PP_DYNAMIC_CHUNKS: bool = True
+    TPU_PP_LONE_PROMPT_CHUNKS: bool = True
+    TPU_PP_EQUAL_COST_CHUNKS: bool = True
+    TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_HANDOFF_DEPTH: int = 2
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
@@ -912,9 +914,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Add linear token buckets above a quarter of the token budget, for
     # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings).
     "TPU_TOKEN_BUCKET_LINEAR": env_bool("TPU_TOKEN_BUCKET_LINEAR"),
-    # Pipeline parallelism: spread a lone prompt's prefill over the stages
-    # in smaller chunks (core/pp_chunks.py). 0 keeps token budgets.
-    "TPU_PP_DYNAMIC_CHUNKS": env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),
+    # Pipeline parallelism: while the pending prefill work cannot fill every
+    # stage with a full step, spread it over the stages in smaller steps
+    # (core/pp_chunks.py).
+    "TPU_PP_LONE_PROMPT_CHUNKS": env_bool("TPU_PP_LONE_PROMPT_CHUNKS", default=True),
+    # Pipeline parallelism: size prefill chunks by a per-step time budget
+    # fit to forwards each stage times at startup, instead of a token budget
+    # (core/pp_chunks.py).
+    "TPU_PP_EQUAL_COST_CHUNKS": env_bool("TPU_PP_EQUAL_COST_CHUNKS", default=True),
+    # With TPU_PP_EQUAL_COST_CHUNKS: fraction above the time of a full
+    # prefix-free step that a step may take before its chunks are shortened.
+    "TPU_PP_CHUNK_SLACK": lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
     # Pipeline parallelism: the forwards a stage may queue for sending to the
     # next stage before end_forward waits for room (distributed/pp_buffered.py).
     "TPU_PP_HANDOFF_DEPTH": env_int("TPU_PP_HANDOFF_DEPTH", 2),

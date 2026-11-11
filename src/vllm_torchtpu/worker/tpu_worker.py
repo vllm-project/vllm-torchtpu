@@ -684,6 +684,9 @@ class TPUWorker(WorkerBase):
     def sample_tokens(self, grammar_output):
         return self.model_runner.sample_tokens(grammar_output)
 
+    def profile_pipeline_chunks(self) -> dict:
+        return self.model_runner.profile_pipeline_chunks()
+
     def pipeline_chunk_limits(self) -> dict:
         return self.model_runner.pipeline_chunk_limits()
 

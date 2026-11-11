@@ -286,3 +286,23 @@ def test_a_model_with_a_top_k_table_hands_on_two_tensors_per_forward(monkeypatch
         validate_pipeline_parallel_config(_config(pp=4, index_topk=2048))
     monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "2")
     validate_pipeline_parallel_config(_config(pp=4, index_topk=2048))
+
+
+@pytest.mark.parametrize(
+    "name,remedy",
+    [
+        ("TPU_PP_HANDOFF", "Unset it"),
+        ("TPU_PP_RING_DEPTH", "set TPU_PP_HANDOFF_DEPTH instead"),
+        ("TPU_PP_LAZY_PUSH", "Unset it"),
+        (
+            "TPU_PP_DYNAMIC_CHUNKS",
+            "set TPU_PP_LONE_PROMPT_CHUNKS and TPU_PP_EQUAL_COST_CHUNKS instead",
+        ),
+    ],
+)
+def test_a_removed_pipeline_env_var_that_is_still_set_fails(monkeypatch, name, remedy):
+    monkeypatch.setenv(name, "1")
+    with pytest.raises(ValueError, match=f"{name} has been removed; {remedy}"):
+        validate_pipeline_parallel_config(_config(pp=2))
+    # Without a pipeline it changes nothing.
+    validate_pipeline_parallel_config(_config(pp=1))

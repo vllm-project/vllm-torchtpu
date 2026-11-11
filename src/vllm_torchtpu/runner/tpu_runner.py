@@ -6620,6 +6620,44 @@ class TPUModelRunner(GPUModelRunner):
         assert granularity is not None
         return {"granularity": int(granularity) * pcp, "schedule": schedule}
 
+    def profile_pipeline_chunks(self) -> dict[str, Any]:
+        """Time this stage's forward at the points the pipeline chunk
+        scheduler fits its step cost model from. Returns the chunk limits
+        (`pipeline_chunk_limits`) and (tokens, prefix, ms) samples."""
+        from vllm_torchtpu.core.pp_chunks import profile_points
+
+        limits = self.pipeline_chunk_limits()
+        pcp = self.parallel_config.prefill_context_parallel_size
+        step = self.scheduler_config.max_num_batched_tokens
+        buckets = [b for b in self.num_tokens_paddings if b * pcp <= step]
+        points = profile_points(
+            buckets, self.max_num_tokens, self.max_model_len, limits["schedule"]
+        )
+        samples = []
+        started = time.perf_counter()
+        for tokens, prefix in points:
+            # Each point is timed twice; the faster run is kept.
+            timings = []
+            for _ in range(2):
+                elapsed_ms = self._dummy_run(
+                    tokens,
+                    self.num_reqs_max_model_len,
+                    self.max_num_blocks_per_req,
+                    use_max_model_len=True,
+                    profile_prefix=prefix,
+                )
+                assert elapsed_ms is not None
+                timings.append(elapsed_ms)
+            ms = min(timings)
+            samples.append((int(tokens) * pcp, int(prefix), float(ms)))
+        logger.info(
+            "Pipeline step profile (%d points, %.1f s): %s",
+            len(samples),
+            time.perf_counter() - started,
+            ", ".join(f"{t}+{p}: {ms:.1f} ms" for t, p, ms in samples),
+        )
+        return {**limits, "samples": samples}
+
     def _spec_verify_bucket_reachable(self, num_tokens: int, num_reqs: int) -> bool:
         """Whether a spec-decode verify step can land in this bucket pair.
 

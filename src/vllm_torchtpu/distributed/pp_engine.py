@@ -108,9 +108,8 @@ def widen_message_rings(vllm_config: Any) -> None:
         return
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages > 1:
-        extra = buffered_extra_steps(stages)
-        _widen_rpc_ring(stages, extra)
-        _raise_steps_in_flight(extra)
+        _widen_rpc_ring(stages, buffered_extra_steps(stages))
+        _raise_steps_in_flight()
 
 
 def _install_take_draft_token_ids(executor_cls: Any) -> None:
@@ -136,31 +135,29 @@ def _install_take_draft_token_ids(executor_cls: Any) -> None:
     executor_cls._tpu_pp_take_draft_patch = True
 
 
-def _raise_steps_in_flight(extra: int) -> None:
-    """Have ``VllmConfig.max_concurrent_batches`` count ``extra`` more steps
-    for a pipeline, so the engine keeps that many steps in flight beyond
-    its stages.
+def _raise_steps_in_flight() -> None:
+    """Have ``VllmConfig.max_concurrent_batches`` count
+    ``buffered_extra_steps`` more steps for a pipeline, so the engine keeps
+    that many steps in flight beyond its stages.
 
     The engine core reads the property when it is built, so this runs from
     the same places as the executor patch, before it. Pipelines of one
     stage, and engines with async scheduling, which size the queue for
-    their own overlap, keep vLLM's count. Installed once per process: the
-    first call's ``extra`` stands for every engine the process builds.
+    their own overlap, keep vLLM's count. Installed once per process; each
+    config counts the extra steps for its own stage count.
     """
     from vllm.config import VllmConfig
 
-    if getattr(VllmConfig, "_tpu_pp_extra_steps", None) is not None:
+    if getattr(VllmConfig, "_tpu_pp_steps_patch", False):
         return
     original = cast(property, VllmConfig.max_concurrent_batches)
     original_fget = cast(Callable[[Any], int], original.fget)
 
     def max_concurrent_batches(self: Any) -> int:
         steps = original_fget(self)
-        if (
-            self.parallel_config.pipeline_parallel_size > 1
-            and not self.scheduler_config.async_scheduling
-        ):
-            return steps + extra
+        stages = self.parallel_config.pipeline_parallel_size
+        if stages > 1 and not self.scheduler_config.async_scheduling:
+            return steps + buffered_extra_steps(stages)
         return steps
 
     # vLLM declares the property through its getter; pyrefly types the class
@@ -169,7 +166,7 @@ def _raise_steps_in_flight(extra: int) -> None:
     VllmConfig.max_concurrent_batches = property(
         max_concurrent_batches, doc=original.__doc__
     )
-    VllmConfig._tpu_pp_extra_steps = extra
+    VllmConfig._tpu_pp_steps_patch = True
 
 
 def patch_executor_for_pp_buffered(vllm_config: Any) -> None:
@@ -187,7 +184,7 @@ def patch_executor_for_pp_buffered(vllm_config: Any) -> None:
         return
     extra = buffered_extra_steps(stages)
     _widen_rpc_ring(stages, extra)
-    _raise_steps_in_flight(extra)
+    _raise_steps_in_flight()
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
     if getattr(MultiprocExecutor, "_tpu_pp_buffered_patch", False):

@@ -18,7 +18,7 @@
 | **Tensor Parallelism (TP)** | `--tensor-parallel-size N` | Shard attention heads and dense MLP projections within a high-bandwidth ICI domain. | All-reduce / Reduce-scatter across `TP` ranks per layer. |
 | **Data Parallelism (DP)** | `--data-parallel-size N` | Replicate attention layers across independent engines while sharing a global Expert Parallel MoE mesh (`TP * DP` experts). | Zero attention collective overhead when `TP=1`; All-to-All across `TP * DP` for MoE layers when `--enable-expert-parallel` is enabled. |
 | **Expert Parallelism (EP)** | `--enable-expert-parallel` | Shard Mixture-of-Experts (MoE) routed experts across the `TP * DP` device mesh instead of slicing each expert's weights. | Uses Pallas SparseCore / GMM ragged dispatch and combine collectives across the EP mesh (`src/vllm_torchtpu/distributed/ep_mesh.py`). |
-| **Pipeline Parallelism (PP)** | `--pipeline-parallel-size N` | Partition transformer layers sequentially across stages (`PP` stages). | Point-to-point activation transfers with dynamic microbatch chunking (`TPU_PP_DYNAMIC_CHUNKS=1`). |
+| **Pipeline Parallelism (PP)** | `--pipeline-parallel-size N` | Partition transformer layers sequentially across stages (`PP` stages). | Point-to-point activation transfers with dynamic microbatch chunking (`TPU_PP_LONE_PROMPT_CHUNKS`, `TPU_PP_EQUAL_COST_CHUNKS`). |
 | **Prefill Context Parallelism (PCP)** | `--prefill-context-parallel-size N` | Split long prefill sequences across `PCP` ranks to parallelize prefill compute and reduce time-to-first-token (TTFT). | Topology-aware ring/mesh assignment (`TPU_PCP_TOPOLOGY_AWARE_MESH=1`) minimizing ICI hop count between consecutive PCP ranks. |
 | **Decode Context Parallelism (DCP)** | `--decode-context-parallel-size N` | Shard the KV cache along the sequence dimension across `DCP` ranks for long-context decode. | Online LSE (log-sum-exp) attention merge across `DCP` ranks (`TPU_DCP_LSE_MERGE_A2A`). |
 
@@ -96,7 +96,7 @@ vllm serve meta-llama/Llama-3.1-70B-Instruct \
   --max-model-len 8192
 ```
 
-By default, `TPU_PP_DYNAMIC_CHUNKS=1` cuts prefill into smaller chunks while the pending prefill work cannot fill every stage, so a lone prompt runs on all stages at once instead of one full step at a time.
+Two chunking policies, both on by default, keep pipeline bubbles small; each has its own switch. `TPU_PP_LONE_PROMPT_CHUNKS` spreads prefill work that cannot fill every stage (for example, a lone prompt) over the stages in smaller steps. `TPU_PP_EQUAL_COST_CHUNKS` sizes prefill chunks so every step takes about the same time, from step costs each stage times at startup. Shortened steps pad to extra token buckets compiled at startup.
 
 The stages hand activations on point to point: each forward's output goes to the next stage as soon as it is done, which keeps the stages busy when prompts of different lengths are in flight. The engine keeps half as many steps again in flight as the pipeline has stages (twelve for eight stages), so stage 0 has a forward queued while the engine core schedules the next step. The hand-off needs libtpu 0.0.50 or later with torch_tpu 0.2.0 or later; the start-up self-test fails fast otherwise. `TPU_PP_HANDOFF_DEPTH` (default `2`) caps the forwards a stage queues for sending: each device holds up to that many outgoing buffers and up to 7 landing buffers for receives posted ahead of their forwards, each `--max-num-batched-tokens` x hidden size in the model dtype, and that memory is reserved before the KV cache is sized.
 

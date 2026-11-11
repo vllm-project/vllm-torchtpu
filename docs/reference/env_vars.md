@@ -33,7 +33,9 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `VLLM_TPU_SRPT_ATTN_WORK_CAP` | `0` | In `SrptPrefillScheduler`, cap on a step's attention work (`sum(n * (c + n / 2))` over scheduled chunks with `n` new tokens after `c` computed ones); while this rank decodes, or another DP rank decodes under EP lockstep (`DP > 1` with expert parallel), prefill chunks are shrunk to stay under it (`0` disables). |
 | `VLLM_TPU_SRPT_ATTN_TILE_TOKENS` | `32` | In `SrptPrefillScheduler`, a chunk shrunk by `VLLM_TPU_SRPT_ATTN_WORK_CAP` ends on a multiple of this many tokens, rounded down (the attention kernel's query tile). |
 | `VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP` | `False` | Sets `SpeculativeConfig.disable_eagle_block_drop`. With EAGLE or MTP, keeps the trailing prefix-cache block vLLM otherwise drops from each hit and skips the matching one-block Mamba split back-off. This also turns off vLLM's lookahead block hashes, which otherwise keep the block themselves, so hashes stop covering the token after each block. Changes speculative acceptance, not target KV. |
-| `TPU_PP_DYNAMIC_CHUNKS` | `True` | Spreads a lone prompt's prefill over the pipeline stages in smaller chunks (`--pipeline-parallel-size`). |
+| `TPU_PP_LONE_PROMPT_CHUNKS` | `True` | In Pipeline Parallelism (`--pipeline-parallel-size`), while the pending prefill work cannot fill every stage with a full step (for example, a lone prompt), spreads it over the stages in smaller steps. |
+| `TPU_PP_EQUAL_COST_CHUNKS` | `True` | In Pipeline Parallelism, sizes prefill chunks so every step takes about the same time, using step costs each stage times at startup, instead of filling the token budget. |
+| `TPU_PP_CHUNK_SLACK` | `0.1` | With `TPU_PP_EQUAL_COST_CHUNKS`, the fraction above the time of a full prefix-free step that a step may take before its chunks are shortened. |
 | `TPU_PP_HANDOFF_DEPTH` | `2` | The forwards a pipeline stage may queue for sending to the next stage before it waits for room; each device holds up to this many outgoing buffers and up to 7 landing buffers for receives posted ahead of their forwards, each `--max-num-batched-tokens` x hidden size in the model dtype, and that memory is reserved before the KV cache is sized. |
 | `TPU_PCP_TOPOLOGY_AWARE_MESH` | `True` | Orders Prefill Context Parallel (`PCP`) ranks along adjacent ICI torus neighbors to minimize ring hop count. |
 | `TPU_DCP_MLA_TOPK_CAP` | `0` | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
@@ -41,6 +43,13 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
+
+Removed pipeline variables. Startup with pipeline parallelism fails while any of them is set:
+
+- `TPU_PP_HANDOFF`: the buffered point-to-point hand-off is the only one; unset it.
+- `TPU_PP_RING_DEPTH`: renamed to `TPU_PP_HANDOFF_DEPTH`.
+- `TPU_PP_LAZY_PUSH`: timed the pushes of the removed lockstep hand-off; unset it.
+- `TPU_PP_DYNAMIC_CHUNKS`: split into `TPU_PP_LONE_PROMPT_CHUNKS` and `TPU_PP_EQUAL_COST_CHUNKS`.
 
 ---
 
