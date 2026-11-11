@@ -96,3 +96,60 @@ def test_kernel_merge_lowers_for_tpu(num_heads, num_tokens):
     with use_abstract_mesh(tpu7x):
         lowered = jax.jit(merge).trace(arg).lower(lowering_platforms=("tpu",))
     assert "tpu_custom_call" in lowered.as_text()
+
+
+def _partials_reference(parts, lse, hadamard=None):
+    """`ops.msa.merge_head_partials`' weights (torch.logsumexp over ranks;
+    zero weights drop NaN partials), summed in f32 and rounded once."""
+    peak = lse.max(axis=0)
+    peak = np.where(np.isinf(peak), 0.0, peak)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        total = peak + np.log(np.exp(lse - peak).sum(axis=0))
+        w = np.exp(lse - total).transpose(0, 2, 1)[..., None]  # [dcp, Hl, T, 1]
+        terms = np.where(w > 0, parts.astype(np.float32) * w, 0.0)
+    merged = np.asarray(jnp.asarray(terms.sum(axis=0)).astype(jnp.bfloat16))
+    if hadamard is not None:
+        d = parts.shape[-1]
+        merged = np.asarray(
+            (
+                jnp.dot(
+                    jnp.asarray(merged), hadamard, preferred_element_type=jnp.float32
+                )
+                * (1.0 / d)
+            ).astype(jnp.bfloat16)
+        )
+    return merged.astype(np.float32).transpose(1, 0, 2).reshape(parts.shape[2], -1)
+
+
+@pytest.mark.parametrize("rotated", [False, True])
+@pytest.mark.parametrize("num_tokens,block_tokens", [(8, 256), (300, 128)])
+def test_merge_partials_matches_reference(num_tokens, block_tokens, rotated):
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+
+    dcp, num_heads, head_dim = 2, 8, 128
+    rng = np.random.default_rng(num_tokens)
+    parts = rng.normal(size=(dcp, num_heads, num_tokens, head_dim)).astype(np.float32)
+    lse = rng.normal(0, 4, size=(dcp, num_tokens, num_heads)).astype(np.float32)
+    # A rank with nothing selected: lse -inf and a NaN partial; some tokens
+    # attended by no rank at all.
+    gone = rng.random((dcp, num_tokens, num_heads)) < 0.2
+    lse[gone] = -np.inf
+    parts[gone.transpose(0, 2, 1)] = np.nan
+    parts = np.asarray(jnp.asarray(parts).astype(jnp.bfloat16))
+    hadamard = (
+        jnp.asarray(msa_fp4.hadamard(head_dim), jnp.bfloat16) if rotated else None
+    )
+    got = msa_dcp.merge_partials(
+        jnp.asarray(parts, jnp.bfloat16),
+        jnp.asarray(lse),
+        hadamard,
+        block_tokens=block_tokens,
+        interpret=True,
+    )
+    assert got.shape == (num_tokens, num_heads * head_dim)
+    want = _partials_reference(parts, lse, hadamard)
+    got = np.asarray(got, np.float32)
+    assert np.isfinite(got).all()
+    # Within a bf16 rounding of the reference (exp / log differ by an ulp,
+    # which the rotation spreads over a head).
+    np.testing.assert_allclose(got, want, rtol=2**-7, atol=1e-4)

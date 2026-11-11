@@ -900,3 +900,75 @@ def msa_attend_dcp(
         q, kv_cache, keys, *args, head_major=True, **common
     )
 
+
+_PARTIALS_BLOCK_TOKENS = 256
+
+
+def _merge_partials_kernel(lse_ref, parts_ref, *rest, rotated):
+    """One token block of `merge_partials`: ``lse_ref [dcp, Bt, Hl]``,
+    ``parts_ref [dcp, Hl, Bt, D]``, (``hadamard [D, D]``), ``o_ref [Bt,
+    Hl * D]``."""
+    o_ref = rest[-1]
+    dcp, num_heads, _, head_dim = parts_ref.shape
+    lse = lse_ref[...]
+    # torch.logsumexp over the ranks; a token no rank attended (every lse
+    # -inf) gets NaN weights, which the where below turns into zeros.
+    peak = jnp.max(lse, axis=0)
+    peak = jnp.where(jnp.isinf(peak), 0.0, peak)
+    total = peak + jnp.log(jnp.sum(jnp.exp(lse - peak[None]), axis=0))
+    weight = jnp.exp(lse - total[None])
+    weight = jnp.where(weight > 0, weight, 0.0)  # NaN (no rank attended) -> 0
+    for h in range(num_heads):
+        merged = None
+        for r in range(dcp):
+            w = jnp.broadcast_to(weight[r, :, h : h + 1], parts_ref.shape[2:])
+            # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+            term = jnp.where(w > 0, parts_ref[r, h].astype(jnp.float32) * w, 0.0)
+            merged = term if merged is None else merged + term
+        merged = merged.astype(o_ref.dtype)
+        if rotated:
+            merged = jnp.dot(merged, rest[0][...], preferred_element_type=jnp.float32)
+            merged = (merged * (1.0 / head_dim)).astype(o_ref.dtype)
+        o_ref[:, h * head_dim : (h + 1) * head_dim] = merged
+
+
+@functools.partial(jax.jit, static_argnames=("block_tokens", "interpret"))
+def merge_partials(
+    parts: jax.Array,
+    lse: jax.Array,
+    hadamard: jax.Array | None = None,
+    *,
+    block_tokens: int = _PARTIALS_BLOCK_TOKENS,
+    interpret: bool = False,
+) -> jax.Array:
+    """The log-sum-exp merge of every DCP rank's partial attention output of
+    this rank's heads, token-major: ``parts [dcp, Hl, T, D]`` (rank ``r``'s
+    head-major partial), ``lse [dcp, T, Hl]`` f32 -> ``[T, Hl * D]``.
+
+    Weights and sum in f32, rounded once; a 4-bit cache's partials (in the
+    rotated basis) are unrotated by its bf16 `hadamard` (``x @ H / D``, as
+    `ops.msa._rotate_heads`). One pass that writes the layout the output
+    projection reads: the reduce-scatter merge weighted the whole ``[dcp *
+    Hl, T, D]`` partial and XLA relaid it out for the token-major output
+    (~43 + 24 us per layer at 8K tokens, c4 twin j-db4e365d)."""
+    dcp, num_heads, num_tokens, head_dim = parts.shape
+    block_t = num_tokens if num_tokens <= block_tokens else block_tokens
+    rotated = hadamard is not None
+    return pl.pallas_call(
+        functools.partial(_merge_partials_kernel, rotated=rotated),
+        grid=(pl.cdiv(num_tokens, block_t),),
+        in_specs=[
+            pl.BlockSpec((dcp, block_t, num_heads), lambda i: (0, i, 0)),
+            pl.BlockSpec((dcp, num_heads, block_t, head_dim), lambda i: (0, 0, i, 0)),
+            *(
+                [pl.BlockSpec((head_dim, head_dim), lambda i: (0, 0))]
+                if rotated
+                else []
+            ),
+        ],
+        out_specs=pl.BlockSpec((block_t, num_heads * head_dim), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, num_heads * head_dim), parts.dtype),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_merge_partials",
+    )(lse.astype(jnp.float32), parts, *([hadamard] if rotated else []))

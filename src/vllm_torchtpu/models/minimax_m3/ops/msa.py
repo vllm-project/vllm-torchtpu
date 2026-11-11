@@ -431,6 +431,57 @@ def merge_head_partials(
     return merged.transpose(0, 1)
 
 
+@functools.cache
+def _get_merge_partials_op(rotated: bool) -> Callable[..., torch.Tensor]:
+    """`msa_dcp.merge_partials` as a torch op (with a 4-bit cache's
+    `hadamard` when `rotated`)."""
+
+    def _merge_jax(parts: jax.Array, lse: jax.Array) -> jax.Array:
+        return msa_dcp.merge_partials(parts, lse)
+
+    def _merge_rotated_jax(
+        parts: jax.Array, lse: jax.Array, hadamard: jax.Array
+    ) -> jax.Array:
+        return msa_dcp.merge_partials(parts, lse, hadamard)
+
+    op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_merge_partials_r{int(rotated)}",
+        _merge_rotated_jax if rotated else _merge_jax,
+    )
+
+    def _fake(parts, lse, *args):
+        _, num_heads, num_tokens, head_dim = parts.shape
+        return parts.new_empty((num_tokens, num_heads * head_dim))
+
+    op.register_fake(_fake)
+    return op
+
+
+def exchange_merge_partials(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any,
+    merge: Callable[..., torch.Tensor],
+    hadamard: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """`merge_head_partials` by an all-to-all: rank ``d`` receives every
+    rank's head block ``d`` of the head-major partial ``out [H, T, D]`` and
+    its LSEs (``lse [H, T]``), and one kernel, `merge`
+    (`_get_merge_partials_op`, built ahead of the traced forward), weights,
+    sums and (with `hadamard`) unrotates them into ``[T, H / dcp, D]``,
+    token-major as the output projection reads it."""
+    num_heads, num_tokens, head_dim = out.shape
+    dcp = int(group.world_size)
+    local = num_heads // dcp
+    parts = _all_to_all(out.reshape(dcp, -1), group)
+    lses = _all_to_all(
+        lse.to(torch.float32).view(dcp, local, num_tokens).transpose(1, 2), group
+    )
+    args = (parts.view(dcp, local, num_tokens, head_dim), lses)
+    merged = merge(*args, hadamard) if hadamard is not None else merge(*args)
+    return merged.view(num_tokens, local, head_dim)
+
+
 def gather_group_heads(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -627,6 +678,7 @@ def get_msa_dcp_op(
     attend_op.register_fake(
         _q_head_major_attend_fake if kv_heads == 1 else _head_major_attend_fake
     )
+    merge_op = _get_merge_partials_op(rotated=False)
 
     def op(
         q: torch.Tensor,
@@ -673,6 +725,8 @@ def get_msa_dcp_op(
             metadata.query_start_loc,
             dcp_rank,
         )
+        if kv_heads == 1:
+            return exchange_merge_partials(out, lse, group, merge_op)
         return merge_head_partials(out, lse, group)
 
     return op
@@ -785,6 +839,7 @@ def _get_msa_dcp_fp4_op(
 
     score_op.register_fake(_score_fake)
     attend_op.register_fake(_q_head_major_attend_fake)
+    merge_op = _get_merge_partials_op(rotated=True)
     heads_op = (
         _get_msa_dcp_heads_op(
             sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix
@@ -855,7 +910,7 @@ def _get_msa_dcp_fp4_op(
             metadata.query_start_loc,
             dcp_rank,
         )
-        return merge_head_partials(out, lse, group, hadamard)
+        return exchange_merge_partials(out, lse, group, merge_op, hadamard)
 
     return op
 
