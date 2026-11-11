@@ -165,7 +165,7 @@ class TestTpuKVConnectorStatsDynamicMetrics:
 
     def test_is_empty_with_standard_metrics(self):
         stats = TpuKVConnectorStats()
-        stats.record_d2h_transfer(15.0)
+        stats.record_prefill_queue_length(15)
         assert stats.is_empty() is False
 
     def test_is_empty_with_dynamic_telemetry_metrics(self):
@@ -191,11 +191,11 @@ class TestTpuKVConnectorStatsDynamicMetrics:
     def test_clone_and_reset_dynamic_metrics(self):
         stats = TpuKVConnectorStats()
         stats.data["tpu_raiden_sent_bytes_total"] = [1, 2]
-        stats.record_d2h_transfer(10.0)
+        stats.record_prefill_queue_length(10)
 
         cloned = stats.clone_and_reset()
         assert cloned.data["tpu_raiden_sent_bytes_total"] == [1, 2]
-        assert cloned.data["d2h_transfer_time"] == [10.0]
+        assert cloned.data["prefill_queue_length"] == [10]
 
         assert stats.is_empty() is True
         assert "tpu_raiden_sent_bytes_total" not in stats.data
@@ -301,11 +301,6 @@ class TestTpuKVConnectorPromMetricsDynamicMetrics:
         metrics = self._setup_prom_metrics(descriptors)
 
         data = {
-            "d2h_transfer_time": [],
-            "h2d_transfer_time": [],
-            "kv_pull_time": [],
-            "mb_transferred": [],
-            "num_failed_transfers": [],
             "prefill_queue_length": [],
             "decode_queue_length": [],
             "tpu_raiden_transfer_duration_ms": [0.5, 5.0, 50.0],
@@ -356,15 +351,7 @@ class TestTpuKVConnectorPromMetricsDynamicMetrics:
 
         assert metrics.dynamic_metrics == {}
         # Observe should still succeed without crashing
-        metrics.observe(
-            {
-                "d2h_transfer_time": [],
-                "h2d_transfer_time": [],
-                "kv_pull_time": [],
-                "mb_transferred": [],
-                "num_failed_transfers": [],
-            }
-        )
+        metrics.observe({"prefill_queue_length": [], "decode_queue_length": []})
 
 
 class TestTPURaidenConnectorWorkerTelemetry:
