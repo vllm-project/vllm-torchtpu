@@ -412,6 +412,19 @@ def attend_and_merge(
         **common,
     )
     hp_out = msa_fp4.unrotate_output(hp_out.transpose(1, 0, 2))
-    # The decode rows go back to their places (the others are dropped).
-    dest = jnp.where(p < cu_d[-1], src_row, num_tokens)
-    return hp_out.at[dest].set(dcp_out, mode="drop")
+    num_decode = cu_d[-1]
+
+    def decode_prefix(out):
+        # The runner orders decodes ahead of prefills: the decode rows are
+        # then the step's first rows, one in-place update of `rows` rows.
+        head = jnp.where((p < num_decode)[:, None, None], dcp_out, out[:rows])
+        return jax.lax.dynamic_update_slice_in_dim(out, head, 0, 0)
+
+    def scatter(out):
+        # The decode rows go back to their places (the others are dropped):
+        # a scatter of `rows` rows.
+        dest = jnp.where(p < num_decode, src_row, num_tokens)
+        return out.at[dest].set(dcp_out, mode="drop")
+
+    prefix = jnp.all((p >= num_decode) | (src_row == p))
+    return jax.lax.cond(prefix, decode_prefix, scatter, hp_out)
