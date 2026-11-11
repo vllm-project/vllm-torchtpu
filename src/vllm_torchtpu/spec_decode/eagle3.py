@@ -376,6 +376,9 @@ class Eagle3Proposer:
         # mtp_fused_loop.py), and whether it has run once. Built in
         # load_model; None means the per-step loop.
         self._mtp_fused_loop: torch.nn.Module | None = None
+        # VLLM_TPU_MK_DRAFT: draft step 0 as one MK call (built on first use).
+        self._mk_draft_step0: torch.nn.Module | None = None
+        self._mk_draft_step0_warm = False
         self._mtp_fused_loop_warm = False
         # Draft step 0 evaluated at each request's last token only
         # (VLLM_TPU_MTP_DRAFT_ROWS). Resolved in load_model.
@@ -858,6 +861,89 @@ class Eagle3Proposer:
                 seq_lens.copy_(seq_lens_step1)
                 self._mtp_fused_loop_warm = True
             return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+
+    def _mk_draft_step0_ready(self, chunk: DraftChunkInputs, num_chunks: int) -> bool:
+        """VLLM_TPU_MK_DRAFT step 0: the MK draft is attached and this step's target
+        forward ran the whole-step megakernel (a uniform verify step: 4 rows per
+        request), one chunk, draft rows, default sequence layout."""
+        if not envs.VLLM_TPU_MK_DRAFT or num_chunks != 1 or not self._draft_rows:
+            return False
+        inner = getattr(self.draft_model, "model", None)
+        if getattr(inner, "mk_draft", None) is None:
+            return False
+        if not getattr(self.runner, "_mk_whole_step", False):
+            return False
+        # Host-side guard on top of the driver's flag: every request 4 rows.
+        qsl = np.asarray(chunk.query_start_loc_np)[: chunk.num_reqs + 1]
+        if chunk.num_reqs < 1 or not np.all(np.diff(qsl) == 4):
+            return False
+        return (
+            getattr(chunk.sequence_layout_plan, "descriptor", None)
+            == DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+        )
+
+    def _run_mk_draft_step0(
+        self,
+        chunk: DraftChunkInputs,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        num_rejected_np: np.ndarray | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`(hidden carry, token 0, positions carry)` of draft step 0 from one MK call
+        (`mtp_fused_loop.build_mk_draft_step0`), trimmed to the chunk's p rows."""
+        if self._mk_draft_step0 is None:
+            from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mk_draft_step0
+
+            with (
+                set_model_tag("eagle_head"),
+                set_vllm_model_wrapper_context(
+                    mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+                ),
+                set_current_vllm_config(self.draft_vllm_config),
+            ):
+                self._mk_draft_step0 = build_mk_draft_step0(
+                    vllm_config=self.draft_vllm_config,
+                    prefix="mk_draft_step0",
+                    mtp=self.draft_model,
+                    rows_per_request=4,
+                    dynamic_arg_dims=getattr(self.draft_model, "_dynamic_arg_dims", {}),
+                )
+            self._mk_draft_step0_warm = False
+        attn_metadata = self._build_draft_attn_metadata(
+            chunk=chunk,
+            step_idx=0,
+            seq_lens_delta=0,
+            num_rejected_np=num_rejected_np,
+            num_tokens_padded=input_ids.shape[0],
+        )
+        rows = last_token_indices.shape[0]
+        draft_rows = self._padded_draft_rows(last_token_indices, self._draft_rows_len(chunk))
+        num_tokens = input_ids.shape[0]
+        with (
+            set_model_tag("eagle_head"),
+            set_forward_context(
+                attn_metadata,
+                self.draft_vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=self.runner._dp_num_tokens_across_dp(num_tokens),
+            ),
+            set_vllm_model_wrapper_context(
+                mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+            ),
+            self._draft_moe_ctx(),
+        ):
+            if not self._mk_draft_step0_warm:
+                # Trace + compile, then run compiled (as the fused loop's first call);
+                # the repeat rewrites the same draft K/V rows.
+                self._mk_draft_step0(input_ids, positions, target_hidden_states, draft_rows)
+                self._mk_draft_step0_warm = True
+            carry, token, pos = self._mk_draft_step0(
+                input_ids, positions, target_hidden_states, draft_rows
+            )
+        # draft_rows is the chunk's request capacity, >= p: plain row slices.
+        return self._fit_draft_rows_output(carry, rows), token[:rows], pos[..., :rows]
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
@@ -1587,6 +1673,17 @@ class Eagle3Proposer:
             rejected_np_per_chunk.append(
                 None if isinstance(num_rejected, torch.Tensor) else num_rejected
             )
+            if self._mk_draft_step0_ready(chunk, len(chunks)):
+                # VLLM_TPU_MK_DRAFT: step 0 + carry + token 0 as one kernel call.
+                hidden_carry, fused_token0, positions_carry = self._run_mk_draft_step0(
+                    chunk, input_ids, positions, target_hidden_states, last_token_indices,
+                    rejected_np_per_chunk[ci],
+                )
+                host_phases.mark("dp_carries")
+                hidden_carry_per_chunk.append(hidden_carry)
+                positions_carry_per_chunk.append(positions_carry)
+                draft_tokens_per_chunk.append([fused_token0])
+                continue
             last_hidden, hidden = self._forward_draft(
                 chunk=chunk,
                 input_ids=input_ids,

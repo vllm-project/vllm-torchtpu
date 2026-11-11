@@ -123,3 +123,56 @@ def build_mtp_fused_loop(
         type("MtpFusedLoop", (_MtpFusedLoop,), {})
     )
     return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps)
+
+
+class _MkDraftStep0(nn.Module):
+    """VLLM_TPU_MK_DRAFT: draft step 0 as one kernel call over the verify rows (4 per
+    request) plus the per-request carry: `(hidden carry [p], token 0 [p] int32,
+    positions carry [p])` at the last accepted row of each request (`rows`). Replaces
+    the draft forward, `_draft_rows_carry_and_token`'s position gather and its
+    lm-head + argmax. Only for uniform verify steps (the whole-step's), where every
+    request has the same 4 rows."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", mtp: MtpDraftModel,
+                 rows_per_request: int) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.mtp = mtp
+        self.rows_per_request = rows_per_request
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        draft_rows: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        carry, tokens = self.mtp.mk_draft_step(  # type: ignore[attr-defined]
+            input_ids, positions, hidden_states, self.rows_per_request
+        )
+        rows = draft_rows.clamp_min(0)
+        return (
+            torch.index_select(carry, 0, rows),
+            torch.index_select(tokens, 0, rows),
+            torch.index_select(positions, positions.ndim - 1, rows),
+        )
+
+
+def build_mk_draft_step0(
+    *,
+    vllm_config: VllmConfig,
+    prefix: str,
+    mtp: MtpDraftModel,
+    rows_per_request: int,
+    dynamic_arg_dims: dict,
+) -> nn.Module:
+    """Compile `_MkDraftStep0` with the draft's own dynamic dims (as the fused loop)."""
+    step_args = inspect.signature(_MkDraftStep0.forward).parameters
+    dims = {k: v for k, v in dict(dynamic_arg_dims).items() if k in step_args}
+    cls = support_torch_compile(dynamic_arg_dims=dims)(
+        type("MkDraftStep0", (_MkDraftStep0,), {})
+    )
+    return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp,
+               rows_per_request=rows_per_request)
