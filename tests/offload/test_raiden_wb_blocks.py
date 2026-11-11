@@ -263,3 +263,52 @@ def test_late_store_job_skips_the_fence():
     mgr.submit_store_job.assert_called_once_with(7, [keys[1]], [6])
     assert 7 not in s._fence_pending
     mgr.drain_jobs.assert_called_once_with({7})
+
+
+def test_late_store_under_staging_is_cancelled_not_packed():
+    """Staged packs run after the forward: a late store must be cancelled by
+    the flush instead of packing reallocated blocks."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        OffloadingConnectorMetadata,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+    from vllm.v1.kv_offload.base import GPULoadStoreSpec
+
+    from vllm_torchtpu.offload.raiden_staging import StagedTransferScheduler
+    from vllm_torchtpu.offload.raiden_store import RaidenLoadStoreSpec
+
+    s, pool = _late_scheduler(window_blocks=1)
+    keys, _ = _held(s, "r", [5, 6])
+    _step(s)
+    s._fresh_block_ids.update({6})
+    mgr = MagicMock()
+    mgr.poll_finished_jobs.return_value = []
+    s._raiden_manager = mgr
+    s.manager = mgr
+    s._staged = StagedTransferScheduler(mgr, 8, 1)
+    job = SimpleNamespace(
+        req_id="r",
+        src_spec=GPULoadStoreSpec([6], group_sizes=[1], block_indices=[1]),
+        dst_spec=RaidenLoadStoreSpec([keys[1]]),
+    )
+    meta = OffloadingConnectorMetadata(
+        load_jobs={}, store_jobs={7: job}, jobs_to_flush={7}
+    )
+    out = SimpleNamespace(
+        finished_req_ids=set(), num_scheduled_tokens={}, scheduled_new_reqs=[]
+    )
+    with patch(
+        "vllm_torchtpu.offload.raiden_connector._allocated_block_ids",
+        return_value={6},
+    ), patch(
+        "vllm_torchtpu.offload.raiden_connector.dataclasses.replace",
+        side_effect=lambda o, **kw: SimpleNamespace(**{**vars(o), **kw}),
+    ), patch.object(
+        OffloadingConnectorScheduler, "build_connector_meta", lambda self, o: meta
+    ):
+        res = s.build_connector_meta(out)
+    assert res.staging_packs == {}
+    mgr.submit_store_job.assert_not_called()
+    mgr.on_store_job_cancelled.assert_called_once_with([keys[1]])
