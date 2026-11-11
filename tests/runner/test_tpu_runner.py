@@ -4094,3 +4094,33 @@ class TestLogitsAtDpVocabRows:
             TPUModelRunner._logits_at_dp_vocab_rows(
                 runner, torch.zeros(9, 2), torch.arange(9)
             )
+
+
+def test_precompile_runs_under_the_serving_global_state(monkeypatch):
+    """Dynamo guards each graph on grad mode and the torch thread count;
+    a serving run retraced compute_selected_logits and the substitution at
+    every serving bucket because their precompile ran with grad on and
+    before the worker dropped to its serving thread count."""
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    before = torch.get_num_threads()
+    torch.set_num_threads(4)
+    try:
+        runner = SimpleNamespace(
+            check_recompilation=False, _update_num_xla_graphs=lambda name: None
+        )
+        assert torch.is_grad_enabled()
+        with TPUModelRunner._precompile_timed(runner, "x"):
+            assert not torch.is_grad_enabled()
+            assert torch.get_num_threads() == 1
+        assert torch.is_grad_enabled()
+        assert torch.get_num_threads() == 4
+    finally:
+        torch.set_num_threads(before)
+
+
+def test_sample_tokens_runs_without_grad():
+    """The sampling graphs are precompiled without grad; dynamo guards on
+    grad mode, so serving must sample without it too (a serving run retraced
+    the rejection sampler at every bucket)."""
+    src = inspect.getsource(TPUModelRunner.sample_tokens)
+    assert "@torch.no_grad()" in src.split("def sample_tokens")[0]
