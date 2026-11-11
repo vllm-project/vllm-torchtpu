@@ -57,10 +57,16 @@ def _build(model_config=None, model=None) -> TPUARModelRunner:
     with patch.object(TPUModelRunner, "__init__", _fake_init):
         runner = TPUARModelRunner(SimpleNamespace(model_config=model_config), "tpu")
     if model is not None:
-        with patch.object(
-            TPUModelRunner, "load_model", lambda self: setattr(self, "model", model)
+        with (
+            patch(
+                "vllm_torchtpu.omni.worker.tpu_ar_model_runner.maybe_patch_qwen3_omni_thinker"
+            ) as mock_patch,
+            patch.object(
+                TPUModelRunner, "load_model", lambda self: setattr(self, "model", model)
+            ),
         ):
             runner.load_model()
+            mock_patch.assert_called_once_with(runner.model_config)
     return runner
 
 
