@@ -47,7 +47,7 @@ from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
 from vllm_torchtpu.megakernel.wholestep.qsa_full import KV_NEW
 from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
-from vllm_torchtpu.megakernel.wholestep.tail import TOP, greedy_tokens
+from vllm_torchtpu.megakernel.wholestep.tail import TOP
 from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
 
 from .qwen38_wholestep_cache import QSALayerCache, wholestep_qsa_writes
@@ -91,6 +91,22 @@ def draft_spec(g: Any, R: int, *, budget: int, max_groups: int, vocab_shard: int
         tail=dict(vocab_shard=vocab_shard),
         hc_fp8=False,
     )
+
+
+def make_draft_greedy(mesh: Any) -> Any:
+    """`tokens [M] int32` (replicated) from the tail's per-rank `(max, index)` pairs
+    `[R*M, 128]` (tp-sharded): `greedy_tokens` inside the mesh, so each rank
+    all-gathers the pairs and takes the first maximal rank (ties to the lower rank).
+    Outside shard_map the rank split of the pairs lowers to a partition id, which the
+    served SPMD compile refuses (exos j-760b499c: "partitionId instruction is not
+    supported for SPMD partitioning")."""
+
+    def per_rank(top):
+        t = jax.lax.all_gather(top, "tp")  # [R, M, 128]
+        best = jnp.argmax(t[:, :, 0], axis=0)
+        return jnp.take_along_axis(t[:, :, 1], best[None], axis=0)[0].astype(jnp.int32)
+
+    return jax.shard_map(per_rank, mesh=mesh, in_specs=P("tp"), out_specs=P(), check_vma=False)
 
 
 def build_draft_call(
@@ -188,6 +204,8 @@ def build_draft_call(
         out_specs=tp, check_vma=False,
     )
 
+    greedy = make_draft_greedy(mesh)
+
     def call(*args):
         hidden = args[0]
         w = [
@@ -205,7 +223,7 @@ def build_draft_call(
         res, kv, kr, ir, top = outs[:5]
         pool = writes(pool, kv, kr, ir, ring, main, comp, positions, starts, context, trig,
                       k_norm, ik_norm, *rank)
-        tokens = greedy_tokens(top, R, M)[:B]
+        tokens = greedy(top)[:B]
         return unpad(res), tokens, pool
 
     in_specs = (
