@@ -34,6 +34,8 @@ PAIRED_KV_TILES = (256, 512, 1024)
 # VLLM_TPU_QSA_PREFILL_VPU features (see envs.py) and the set "1" selects.
 VPU_FEATURES = ("mask", "qk16", "pv16", "qkfirst")
 VPU_DEFAULT = ("mask", "qk16", "pv16")
+# Comma-free spellings (recipes pass server env as a comma-separated list).
+VPU_PRESETS = {"1": VPU_DEFAULT, "2": VPU_DEFAULT + ("qkfirst",)}
 
 
 def vpu_features():
@@ -41,9 +43,10 @@ def vpu_features():
     raw = envs.VLLM_TPU_QSA_PREFILL_VPU
     if raw in ("", "0"):
         return ()
-    names = VPU_DEFAULT if raw == "1" else tuple(
-        name.strip() for name in raw.split(",") if name.strip()
-    )
+    if raw in VPU_PRESETS:
+        names = VPU_PRESETS[raw]
+    else:
+        names = tuple(name.strip() for name in raw.split(",") if name.strip())
     unknown = sorted(set(names) - set(VPU_FEATURES))
     if unknown:
         raise ValueError(f"Unknown VLLM_TPU_QSA_PREFILL_VPU features: {unknown}")
