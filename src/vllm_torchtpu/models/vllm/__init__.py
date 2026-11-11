@@ -25,6 +25,10 @@ _DSV4_DSPARK_MODEL = (
 _QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
 _QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
 _QWEN4_EXP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalLM"
+_MUSE_SPARK_MODEL = (
+    "vllm_torchtpu.models.vllm.muse_spark:MuseSparkForConditionalGeneration"
+)
+_MUSE_SPARK_CAUSAL_MODEL = "vllm_torchtpu.models.vllm.muse_spark:MuseSparkForCausalLM"
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -64,3 +68,14 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
+
+    from vllm_torchtpu.models.vllm.muse_spark.configuration import (
+        register_muse_spark_configs,
+    )
+    from vllm_torchtpu.models.vllm.muse_spark.text_model import TPUMuseSparkConfig
+
+    register_muse_spark_configs()
+    ModelRegistry.register_model("MuseSparkForConditionalGeneration", _MUSE_SPARK_MODEL)
+    ModelRegistry.register_model("MuseSparkForCausalLM", _MUSE_SPARK_CAUSAL_MODEL)
+    MODELS_CONFIG_MAP["MuseSparkForConditionalGeneration"] = TPUMuseSparkConfig
+    MODELS_CONFIG_MAP["MuseSparkForCausalLM"] = TPUMuseSparkConfig
