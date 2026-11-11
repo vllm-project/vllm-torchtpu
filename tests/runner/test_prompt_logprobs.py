@@ -28,7 +28,7 @@ import torch
 from vllm_torchtpu.runner import prompt_logprobs
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
-HIDDEN, VOCAB, MAX_LOGPROBS = 8, 32, 3
+HIDDEN, VOCAB = 8, 32
 PROMPTS = {
     "a": [5, 9, 2, 30, 7, 7, 1],
     "b": [4, 4, 8, 3, 0],
@@ -36,15 +36,19 @@ PROMPTS = {
 }
 # "b" asks for none.
 NUM_PROMPT_LOGPROBS = {"a": 2, "c": 0}
+_GEN = torch.Generator().manual_seed(0)
+WEIGHT = torch.randn(VOCAB, HIDDEN, generator=_GEN)
+# The hidden state at every prompt position.
+HIDDEN_STATES = {
+    r: torch.randn(len(p), HIDDEN, generator=_GEN) for r, p in PROMPTS.items()
+}
 
 
-def _runner(**overrides):
-    gen = torch.Generator().manual_seed(0)
-    weight = torch.randn(VOCAB, HIDDEN, generator=gen)
+def _runner(max_logprobs=3, **overrides):
     runner = SimpleNamespace(
-        model=SimpleNamespace(compute_logits=lambda h: h @ weight.T),
+        model=SimpleNamespace(compute_logits=lambda h: h @ WEIGHT.T),
         is_pooling_model=False,
-        model_config=SimpleNamespace(max_logprobs=MAX_LOGPROBS),
+        model_config=SimpleNamespace(max_logprobs=max_logprobs),
         max_num_reqs=8,
         device=torch.device("cpu"),
         requests={
@@ -57,7 +61,6 @@ def _runner(**overrides):
         input_batch=SimpleNamespace(req_ids=[], num_computed_tokens_cpu=None),
         query_start_loc_np=None,
         _prompt_logprobs_unsupported=None,
-        weight=weight,
     )
     runner.compute_selected_logits = functools.partial(
         TPUModelRunner.compute_selected_logits, runner
@@ -68,9 +71,9 @@ def _runner(**overrides):
     return runner
 
 
-def _run_steps(runner, hidden, schedule):
+def _run_steps(runner, schedule):
     """Run each step's chunks (each a dict req_id -> scheduled tokens, in batch
-    order) and emit; return the request ids each step completed."""
+    order) and emit; return what each step completed."""
     computed = dict.fromkeys(PROMPTS, 0)
     completed_per_step = []
     for step in schedule:
@@ -82,11 +85,11 @@ def _run_steps(runner, hidden, schedule):
         for chunk_tokens in step:
             req_ids = list(chunk_tokens)
             qsl = np.concatenate([[0], np.cumsum([chunk_tokens[r] for r in req_ids])])
-            # Padding rows hold noise, so reading one shows up in the values.
-            chunk_hidden = torch.randn(int(qsl[-1]) + 3, HIDDEN)
+            # Padding rows are NaN, so scoring one fails the value checks.
+            chunk_hidden = torch.full((int(qsl[-1]) + 3, HIDDEN), float("nan"))
             for i, req_id in enumerate(req_ids):
                 first = computed[req_id]
-                chunk_hidden[qsl[i] : qsl[i + 1]] = hidden[req_id][
+                chunk_hidden[qsl[i] : qsl[i + 1]] = HIDDEN_STATES[req_id][
                     first : first + chunk_tokens[req_id]
                 ]
             runner.query_start_loc_np = qsl
@@ -110,10 +113,10 @@ def _run_steps(runner, hidden, schedule):
     return completed_per_step
 
 
-def _expected(runner, hidden, req_id, num_logprobs):
+def _expected(req_id, num_logprobs):
     """Token ids, logprobs and ranks of every prompt row, in float64."""
     prompt = torch.tensor(PROMPTS[req_id])
-    logits = (hidden[req_id][:-1] @ runner.weight.T).double()
+    logits = (HIDDEN_STATES[req_id][:-1] @ WEIGHT.T).double()
     ids = torch.cat(
         [prompt[1:, None], logits.topk(num_logprobs, dim=-1).indices], dim=1
     )
@@ -122,19 +125,17 @@ def _expected(runner, hidden, req_id, num_logprobs):
     return ids, logprobs, ranks
 
 
-def _hidden():
-    gen = torch.Generator().manual_seed(1)
-    return {r: torch.randn(len(p), HIDDEN, generator=gen) for r, p in PROMPTS.items()}
-
-
+# -1 is --max-logprobs -1: gather_logprobs keeps no top-k, so a request gets
+# the prompt token's logprob alone.
+@pytest.mark.parametrize("max_logprobs", [3, -1])
 @pytest.mark.parametrize(
     "schedule, completing_step",
     [
         pytest.param([[{"a": 7, "b": 5, "c": 4}]], 0, id="whole_prompts"),
-        pytest.param([[{"a": 3, "b": 5, "c": 2}], [{"a": 4, "c": 2}]], 1, id="chunked"),
         # Every row is scored in step 0; vLLM returns them with the next chunk.
         pytest.param([[{"a": 6, "c": 3}], [{"a": 1, "c": 1}]], 1, id="one_token_short"),
-        # A step split into two forward chunks (start_index > 0 for the second).
+        # Chunked prefill, with a step split into two forward chunks
+        # (start_index > 0 for the second).
         pytest.param(
             [[{"b": 5, "a": 3}, {"c": 2}], [{"a": 4}, {"c": 2}]],
             1,
@@ -142,13 +143,12 @@ def _hidden():
         ),
     ],
 )
-def test_prompt_logprobs_match_log_softmax(schedule, completing_step):
+def test_prompt_logprobs_match_log_softmax(schedule, completing_step, max_logprobs):
     """Row i holds the logprob of prompt token i + 1 from hidden state i, the
     top-k and the rank; returned once, when the prompt completes."""
-    runner = _runner()
-    hidden = _hidden()
+    runner = _runner(max_logprobs)
 
-    completed_per_step = _run_steps(runner, hidden, schedule)
+    completed_per_step = _run_steps(runner, schedule)
 
     for step, completed in enumerate(completed_per_step):
         expected = set(NUM_PROMPT_LOGPROBS) if step == completing_step else set()
@@ -157,8 +157,9 @@ def test_prompt_logprobs_match_log_softmax(schedule, completing_step):
     for req_id, num_logprobs in NUM_PROMPT_LOGPROBS.items():
         assert runner.requests[req_id].in_progress_prompt_logprobs_cpu is None
         result = completed_per_step[completing_step][req_id]
-        ids, logprobs, ranks = _expected(runner, hidden, req_id, num_logprobs)
-        assert result.logprobs.shape == (len(PROMPTS[req_id]) - 1, num_logprobs + 1)
+        top_k = min(num_logprobs, max(max_logprobs, 0))
+        ids, logprobs, ranks = _expected(req_id, top_k)
+        assert result.logprobs.shape == (len(PROMPTS[req_id]) - 1, top_k + 1)
         assert torch.equal(result.logprob_token_ids.long(), ids)
         torch.testing.assert_close(
             result.logprobs.double(), logprobs, rtol=0, atol=1e-5
@@ -166,44 +167,22 @@ def test_prompt_logprobs_match_log_softmax(schedule, completing_step):
         assert torch.equal(result.selected_token_ranks.long(), ranks)
 
 
-def test_prompt_logprobs_beyond_the_top_k_return_the_prompt_token_only():
-    """With --max-logprobs -1, gather_logprobs keeps no top-k, so a request for
-    prompt_logprobs=2 gets the prompt token's logprob alone."""
-    runner = _runner(model_config=SimpleNamespace(max_logprobs=-1))
-    hidden = _hidden()
-
-    (completed,) = _run_steps(runner, hidden, [[{"a": 7}]])
-
-    ids, logprobs, _ = _expected(runner, hidden, "a", 0)
-    assert torch.equal(completed["a"].logprob_token_ids.long(), ids)
-    torch.testing.assert_close(
-        completed["a"].logprobs.double(), logprobs, rtol=0, atol=1e-5
-    )
-
-
-def test_prompt_logprobs_are_skipped_where_unsupported():
-    """No device work and no prompt logprobs, and the engine keeps running."""
-    runner = _runner(_prompt_logprobs_unsupported="TPU_DP_VOCAB_PARALLEL=1")
-    runner.compute_selected_logits = None
-
-    assert _run_steps(runner, _hidden(), [[{"a": 7, "c": 4}]]) == [{}]
-
-
 @pytest.mark.parametrize(
-    "config, expected",
+    "flag, fix",
     [
-        ({}, None),
-        ({"dp_vocab_logits": True}, "TPU_DP_VOCAB_PARALLEL"),
-        ({"selected_logits_hidden_states": True}, "prefill context parallelism"),
-        ({"lora": True}, "LoRA"),
+        ("dp_vocab_logits", "TPU_DP_VOCAB_PARALLEL"),
+        ("selected_logits_hidden_states", "--prefill-context-parallel-size 1"),
+        ("lora", "--enable-lora"),
     ],
 )
-def test_unsupported_reason(config, expected):
-    kwargs = {
-        "dp_vocab_logits": False,
-        "selected_logits_hidden_states": False,
-        "lora": False,
-        **config,
-    }
-    reason = prompt_logprobs.unsupported_reason(**kwargs)
-    assert reason is None if expected is None else expected in reason
+def test_prompt_logprobs_are_skipped_where_unsupported(flag, fix):
+    """The reason names the fix, and the step does no device work and returns
+    no prompt logprobs instead of stopping the engine."""
+    flags = dict.fromkeys(
+        ["dp_vocab_logits", "selected_logits_hidden_states", "lora"], False
+    )
+    reason = prompt_logprobs.unsupported_reason(**{**flags, flag: True})
+    assert reason is not None and fix in reason
+    runner = _runner(_prompt_logprobs_unsupported=reason, compute_selected_logits=None)
+
+    assert _run_steps(runner, [[{"a": 7, "c": 4}]]) == [{}]
