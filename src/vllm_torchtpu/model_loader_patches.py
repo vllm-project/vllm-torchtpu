@@ -69,8 +69,15 @@ logger = init_logger(__name__)
 # Suffixes of per-expert tensors that are safe to skip for non-local
 # experts. Anything else (dense, shared experts, gate, norms) is fetched by
 # every rank. ``.scale`` is DeepSeek-V4's per-expert block scale
-# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts.
-_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
+# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts;
+# ``.weight_scale_inv`` is FP8 block scale (e.g. Qwen3.8-Flash-Next-FP8).
+_EXPERT_WEIGHT_SUFFIXES = (
+    ".weight",
+    ".weight_packed",
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".scale",
+)
 
 
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
@@ -91,8 +98,9 @@ def _should_skip_weight_tpu(
 
     Same contract as upstream (``local_expert_ids=None`` means no
     filtering), but the suffix allowlist also covers the compressed-tensors
-    MXFP4 ``.weight_packed`` and ``.weight_scale`` names, so non-local
-    experts are skipped before their bytes are read.
+    MXFP4 ``.weight_packed`` and ``.weight_scale`` names and FP8 block-scale
+    ``.weight_scale_inv`` names, so non-local experts are skipped before
+    their bytes are read.
     """
     if local_expert_ids is None:
         return False

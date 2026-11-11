@@ -13,6 +13,7 @@
 # limitations under the License.
 """Checkpoint-native text backbone with explicit TPU state/input ownership."""
 
+import itertools
 from collections.abc import Iterable, Sequence
 from functools import partial
 from pathlib import Path
@@ -92,6 +93,48 @@ def moe_weights_mapper():
             "shared_expert.up_proj": ("shared_expert.gate_up_proj", 1),
         }
     )
+
+
+_SHARED_LOCAL_MAPPER = WeightsMapper(
+    orig_to_new_stacked={
+        "shared_expert_local.gate_proj": ("shared_expert_local.gate_up_proj", 0),
+        "shared_expert_local.up_proj": ("shared_expert_local.gate_up_proj", 1),
+    }
+)
+
+
+def load_layer_mlp_weights(
+    loader: AutoWeightsLoader,
+    mlp: nn.Module,
+    items: Iterable[tuple[str, torch.Tensor]],
+    moe_mapper: WeightsMapper,
+    layer_idx: int,
+) -> set[str]:
+    """Load a contiguous batch of checkpoint tensors into one layer's MLP."""
+    has_shared_local = hasattr(mlp, "shared_expert_local")
+    local_shared: list[tuple[str, torch.Tensor]] = []
+
+    def _stream() -> Iterable[tuple[str, torch.Tensor]]:
+        for relative, weight in items:
+            if has_shared_local and relative.startswith("shared_expert."):
+                local_shared.append(
+                    ("shared_expert_local." + relative.split(".", 1)[1], weight)
+                )
+            yield relative, weight
+
+    prefix = f"model.layers.{layer_idx}.mlp."
+    loaded = {
+        prefix + target
+        for target in loader.load_weights(_stream(), mapper=moe_mapper)
+    }
+    if local_shared:
+        loaded.update(
+            prefix + target
+            for target in loader.load_weights(
+                iter(local_shared), mapper=_SHARED_LOCAL_MAPPER
+            )
+        )
+    return loaded
 
 
 def verify_shared_expert_replica(mlp, tp, label):
@@ -1460,22 +1503,23 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.pd_loaded_weight_identity = None
         self.pd_loaded_ple_identity = None
         identity = LoadedWeightIdentity() if self._pd_weight_identity_enabled else None
-        if identity is not None:
-            weights = identity.observe(weights)
         parameters = dict(self.named_parameters())
         loaded, source = set(), set()
         moe_mapper = moe_weights_mapper()
-        local_mapper = WeightsMapper(
-            orig_to_new_stacked={
-                "shared_expert_local.gate_proj": (
-                    "shared_expert_local.gate_up_proj",
-                    0,
-                ),
-                "shared_expert_local.up_proj": ("shared_expert_local.gate_up_proj", 1),
-            }
-        )
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.model.layers)
         moe_loaders = [AutoWeightsLoader(layer.mlp) for layer in layers]
+        local_expert_ids: set[int] | None = None
+        if layers:
+            routed_experts = layers[0].mlp.experts.routed_experts
+            if routed_experts.use_ep:
+                local_expert_ids = {
+                    expert_id
+                    for expert_id in range(routed_experts.global_num_experts)
+                    if routed_experts._map_global_expert_id_to_local_expert_id(
+                        expert_id
+                    )
+                    >= 0
+                }
         # Exactly the Qwen3.5 checkpoint projection mapping. HC remains
         # separate checkpoint-native parameters (no NVIDIA packed-HC mapper).
         gdn_map = {
@@ -1484,55 +1528,80 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             "in_proj_b.weight": ("in_proj_ba.weight", 0),
             "in_proj_a.weight": ("in_proj_ba.weight", 1),
         }
-        for original, weight in weights:
-            if original.startswith(("model.visual.", "mtp.")):
+
+        def _classified_weights():
+            for original, weight in weights:
+                if original.startswith(("model.visual.", "mtp.")):
+                    continue
+                mapped = self.hf_to_vllm_mapper._map_name(original)
+                name = original if mapped is None else mapped
+                if name in source:
+                    raise ValueError(f"Duplicate checkpoint tensor {original}")
+                if name.startswith("model.layers."):
+                    _, _, idx, family, relative = name.split(".", 4)
+                    if family == "mlp":
+                        if local_expert_ids is not None and relative.startswith(
+                            "experts."
+                        ):
+                            expert_str = relative.split(".", 2)[1]
+                            if (
+                                expert_str.isdigit()
+                                and int(expert_str) not in local_expert_ids
+                            ):
+                                source.add(name)
+                                continue
+                        if identity is not None:
+                            identity.observe_tensor(original, weight)
+                        source.add(name)
+                        yield ("mlp", int(idx)), (original, name, relative, weight)
+                        continue
+                if identity is not None:
+                    identity.observe_tensor(original, weight)
+                source.add(name)
+                yield None, (original, name, "", weight)
+
+        for group_key, group in itertools.groupby(
+            _classified_weights(), key=lambda item: item[0]
+        ):
+            if group_key is not None:
+                _, layer_idx = group_key
+                loaded.update(
+                    load_layer_mlp_weights(
+                        moe_loaders[layer_idx],
+                        layers[layer_idx].mlp,
+                        ((relative, weight) for _, (_, _, relative, weight) in group),
+                        moe_mapper,
+                        layer_idx,
+                    )
+                )
                 continue
-            name = next(iter(self.hf_to_vllm_mapper.apply([(original, weight)])))[0]
-            if name in source:
-                raise ValueError(f"Duplicate checkpoint tensor {original}")
-            source.add(name)
-            if name.startswith("model.layers."):
-                _, _, idx, family, relative = name.split(".", 4)
-                layer = layers[int(idx)]
-                if family == "mlp":
-                    targets = moe_loaders[int(idx)].load_weights(
-                        iter([(relative, weight)]), mapper=moe_mapper
-                    )
-                    loaded.update(
-                        f"model.layers.{idx}.mlp.{target}" for target in targets
-                    )
-                    if relative.startswith("shared_expert.") and hasattr(
-                        layer.mlp, "shared_expert_local"
-                    ):
-                        # The same tensor, unsliced, into the replicated copy.
-                        local = "shared_expert_local." + relative.split(".", 1)[1]
-                        targets = moe_loaders[int(idx)].load_weights(
-                            iter([(local, weight)]), mapper=local_mapper
+
+            for _, (original, name, _, weight) in group:
+                if name.startswith("model.layers."):
+                    _, _, idx, family, relative = name.split(".", 4)
+                    layer = layers[int(idx)]
+                    if family == "ple":
+                        assert layer.ple is not None
+                        layer.ple.load_checkpoint([(relative, weight)])
+                        continue
+                    if family == "self_attn":
+                        layer.self_attn.load_weights([(relative, weight)])
+                        continue
+                    if family == "linear_attn" and relative in gdn_map:
+                        mapped, shard = gdn_map[relative]
+                        target = f"model.layers.{idx}.linear_attn.{mapped}"
+                        param = parameters[target]
+                        cast(BasevLLMParameter, param).weight_loader(
+                            param, weight, shard
                         )
-                        loaded.update(
-                            f"model.layers.{idx}.mlp.{target}" for target in targets
-                        )
-                    continue
-                if family == "ple":
-                    assert layer.ple is not None
-                    layer.ple.load_checkpoint([(relative, weight)])
-                    continue
-                if family == "self_attn":
-                    layer.self_attn.load_weights([(relative, weight)])
-                    continue
-                if family == "linear_attn" and relative in gdn_map:
-                    mapped, shard = gdn_map[relative]
-                    target = f"model.layers.{idx}.linear_attn.{mapped}"
-                    param = parameters[target]
-                    cast(BasevLLMParameter, param).weight_loader(param, weight, shard)
-                    loaded.add(target)
-                    continue
-            if name not in parameters:
-                raise ValueError(f"Unknown Qwen4Exp checkpoint tensor {original}")
-            param = parameters[name]
-            loader = getattr(param, "weight_loader", default_weight_loader)
-            loader(param, weight)
-            loaded.add(name)
+                        loaded.add(target)
+                        continue
+                if name not in parameters:
+                    raise ValueError(f"Unknown Qwen4Exp checkpoint tensor {original}")
+                param = parameters[name]
+                loader = getattr(param, "weight_loader", default_weight_loader)
+                loader(param, weight)
+                loaded.add(name)
         for i, layer in enumerate(layers):
             verify_moe_checkpoint(
                 layer.mlp, f"model.layers.{i}.mlp.", source, moe_mapper, f"layer{i}"
