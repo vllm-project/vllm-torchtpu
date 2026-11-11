@@ -665,7 +665,7 @@ def _can_use_ici_ring_kernel(
     fuse_ulysses: bool,
 ) -> bool:
     """Whether a ring attention call fits the ICI-DMA Pallas ring kernel."""
-    if not envs.VLLM_TORCHTPU_OMNI_RING_KERNEL or ring_size < 2:
+    if not envs.VLLM_TPU_OMNI_RING_KERNEL or ring_size < 2:
         return False
     if query.device.type != "tpu":
         return False
@@ -761,7 +761,7 @@ def tpu_ring_flash_attention(
             uly_size,
             fuse,
             float(scale),
-            bool(envs.VLLM_TORCHTPU_OMNI_RING_FIXED_M),
+            bool(envs.VLLM_TPU_OMNI_RING_FIXED_M),
         )
         return ring_op(q, k, v).reshape(*query.shape[:3], value.shape[-1])
 

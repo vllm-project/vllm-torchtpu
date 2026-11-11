@@ -21,17 +21,9 @@ import functools
 import os
 import subprocess
 import sys
-from types import SimpleNamespace
-from unittest.mock import patch
-
-if "--xla_force_host_platform_device_count=" not in os.environ.get("XLA_FLAGS", ""):
-    os.environ["XLA_FLAGS"] = (
-        f"{os.environ.get('XLA_FLAGS', '')} --xla_force_host_platform_device_count=8"
-    ).strip()
 
 import numpy as np
 import pytest
-import torch
 
 from vllm_torchtpu.kernels.diffusion_attention import ring_kernel
 
@@ -244,172 +236,19 @@ def test_ring4_interpret_multiblock_matches_fp32_reference() -> None:
         assert rel_l2 < 7e-3
 
 
-def test_omni_ring_dispatch_and_env_knobs(monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip("vllm_omni")
-    from vllm_torchtpu.omni import attention as omni_attn
-
-    class _FakeTpuTensor(torch.Tensor):
-        @property
-        def device(self):  # type: ignore[override]
-            return SimpleNamespace(type="tpu")
-
-    calls: list[tuple[str, tuple[object, ...]]] = []
-    # Cases 1-6 run as TPU v7; case 7 covers the other side of the gate.
-    monkeypatch.setattr(omni_attn, "_ici_ring_kernel_hw_ok", None)
-    monkeypatch.setattr(
-        omni_attn.hardware, "get_tpu_version", lambda: omni_attn.hardware.TpuVersion.V7
-    )
-    assert omni_attn._ici_ring_kernel_hw_supported() is True
-
-    monkeypatch.setattr(
-        omni_attn,
-        "_pallas_ring_attention_op",
-        lambda outer, ring, uly, fuse, scale, fm: (
-            lambda q, k, v: (
-                calls.append(
-                    ("ici_ring", (outer, ring, uly, fuse, round(scale, 6), fm))
-                )
-                or (q + 1)
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        omni_attn,
-        "_short_2d_ring_attention_op",
-        lambda outer, ring, scale: (
-            lambda q, k, v: (
-                calls.append(("short_2d", (outer, ring, round(scale, 6)))) or (q + 2)
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        omni_attn,
-        "_ring_ulysses_attention_op",
-        lambda outer, ring, uly, fuse: (
-            lambda q, k, v, scale: (
-                calls.append(("fallback_ppermute", (outer, ring, uly, fuse))) or (q + 3)
-            )
-        ),
-    )
-
-    # 1. Long shard (q_seq=4290 > 4096) at c2r4 uses ICI ring op (fixed_m=True).
-    q_long = torch.zeros((1, 4290, 4, 128), dtype=torch.bfloat16).as_subclass(
-        _FakeTpuTensor
-    )
-    k_long = torch.zeros((1, 4290, 2, 128), dtype=torch.bfloat16).as_subclass(
-        _FakeTpuTensor
-    )
-    out = omni_attn.tpu_ring_flash_attention(
-        q_long, k_long, k_long, 0.125, ring_size=4, uly_size=1, outer_size=2
-    )
-    assert tuple(out.shape) == (1, 4290, 4, 128)
-    assert torch.all(out == 1)
-    assert calls == [("ici_ring", (2, 4, 1, False, 0.125, True))]
-
-    # 2. VLLM_TORCHTPU_OMNI_RING_FIXED_M=0 switches use_fixed_m to False.
-    calls.clear()
-    with patch.dict(os.environ, {"VLLM_TORCHTPU_OMNI_RING_FIXED_M": "0"}):
-        out_fm0 = omni_attn.tpu_ring_flash_attention(
-            q_long, k_long, k_long, 0.125, ring_size=4, uly_size=1, outer_size=2
-        )
-    assert torch.all(out_fm0 == 1)
-    assert calls == [("ici_ring", (2, 4, 1, False, 0.125, False))]
-
-    # 3. Short shard (q_seq=1950 <= 4096, ring=4, uly=1) uses short 2D ring op.
-    calls.clear()
-    q_short = torch.zeros((1, 1950, 4, 128), dtype=torch.bfloat16).as_subclass(
-        _FakeTpuTensor
-    )
-    out_short = omni_attn.tpu_ring_flash_attention(
-        q_short, q_short, q_short, 0.125, ring_size=4, uly_size=1, outer_size=2
-    )
-    assert torch.all(out_short == 2)
-    assert calls == [("short_2d", (2, 4, 0.125))]
-
-    # 4. Odd head count on short shard stays on _pallas_ring_attention_op.
-    calls.clear()
-    q_odd = torch.zeros((1, 1950, 3, 128), dtype=torch.bfloat16).as_subclass(
-        _FakeTpuTensor
-    )
-    k_odd = torch.zeros((1, 1950, 1, 128), dtype=torch.bfloat16).as_subclass(
-        _FakeTpuTensor
-    )
-    out_odd = omni_attn.tpu_ring_flash_attention(
-        q_odd, k_odd, k_odd, 0.125, ring_size=4, uly_size=1, outer_size=2
-    )
-    assert torch.all(out_odd == 1)
-    assert calls == [("ici_ring", (2, 4, 1, False, 0.125, True))]
-
-    # 5. VLLM_TORCHTPU_OMNI_RING_KERNEL=0 opts out to fallback ppermute ring.
-    calls.clear()
-    with patch.dict(os.environ, {"VLLM_TORCHTPU_OMNI_RING_KERNEL": "0"}):
-        out_fb = omni_attn.tpu_ring_flash_attention(
-            q_long, k_long, k_long, 0.125, ring_size=4, uly_size=1, outer_size=2
-        )
-        out_short_fb = omni_attn.tpu_ring_flash_attention(
-            q_short, q_short, q_short, 0.125, ring_size=4, uly_size=1, outer_size=2
-        )
-    assert torch.all(out_fb == 3)
-    assert torch.all(out_short_fb == 3)
-    assert calls == [
-        ("fallback_ppermute", (2, 4, 1, False)),
-        ("fallback_ppermute", (2, 4, 1, False)),
-    ]
-
-    # 6. Very short shard (< 256 rows) falls back cleanly.
-    calls.clear()
-    q_tiny = torch.zeros((1, 128, 4, 128), dtype=torch.bfloat16).as_subclass(
-        _FakeTpuTensor
-    )
-    out_tiny = omni_attn.tpu_ring_flash_attention(
-        q_tiny, q_tiny, q_tiny, 0.125, ring_size=4, uly_size=1, outer_size=2
-    )
-    assert torch.all(out_tiny == 3)
-    assert calls == [("fallback_ppermute", (2, 4, 1, False))]
-
-    # 7. Other TPU generations (and hosts without a known TPU) use the ppermute
-    # ring path; the generation is probed once and cached.
-    calls.clear()
-    probes: list[str] = []
-
-    def _v6e():
-        probes.append("v6e")
-        return omni_attn.hardware.TpuVersion.V6E
-
-    monkeypatch.setattr(omni_attn, "_ici_ring_kernel_hw_ok", None)
-    monkeypatch.setattr(omni_attn.hardware, "get_tpu_version", _v6e)
-    out_v6e = omni_attn.tpu_ring_flash_attention(
-        q_long, k_long, k_long, 0.125, ring_size=4, uly_size=1, outer_size=2
-    )
-    out_v6e_short = omni_attn.tpu_ring_flash_attention(
-        q_short, q_short, q_short, 0.125, ring_size=4, uly_size=1, outer_size=2
-    )
-    assert torch.all(out_v6e == 3)
-    assert torch.all(out_v6e_short == 3)
-    assert calls == [("fallback_ppermute", (2, 4, 1, False))] * 2
-    assert probes == ["v6e"]
-
-    monkeypatch.setattr(omni_attn, "_ici_ring_kernel_hw_ok", None)
-    monkeypatch.setattr(
-        omni_attn.hardware,
-        "get_tpu_version",
-        lambda: omni_attn.hardware.TpuVersion.UNKNOWN,
-    )
-    assert omni_attn._ici_ring_kernel_hw_supported() is False
-
-
 @pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "ring_size,shard_len,block_kv",
     [
         (2, 390, None),
-        (4, 390, None),
-        (4, 4290, None),
+        # Ring 4 needs 4 TPU devices: the multichip lane runs these rows.
+        pytest.param(4, 390, None, marks=pytest.mark.multichip),
+        pytest.param(4, 4290, None, marks=pytest.mark.multichip),
         # block_kv=1024 splits each hop into 5 KV blocks with a ragged tail, so
         # the multi-block DMA pipeline (_reload_own, credit semaphores) runs.
-        (4, 4290, 1024),
+        pytest.param(4, 4290, 1024, marks=pytest.mark.multichip),
         # Tuned Wan 2.2 shard: several KV blocks per hop, ragged tail.
-        (4, 18900, None),
+        pytest.param(4, 18900, None, marks=pytest.mark.multichip),
     ],
 )
 def test_sharded_ring_on_device_matches_fp32_reference(
