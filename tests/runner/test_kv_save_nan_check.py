@@ -332,6 +332,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     for name in (
         "_any_decode",
         "_readmit_trimmed_drafts",
+        "_sample_plain_chunk",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
         "_build_kv_connector_output",

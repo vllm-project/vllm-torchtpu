@@ -3786,6 +3786,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         )
         runner._stage_timing.take_samples.return_value = ([], [])
         for name in (
+            "_sample_plain_chunk",
             "maybe_wait_for_kv_save",
             "get_finished_kv_transfers",
             "_build_kv_connector_output",
