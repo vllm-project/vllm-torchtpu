@@ -396,3 +396,139 @@ def test_replicated_token_shard_dcp2_matches_plain_dcp(rows, context):
     print("QSA_DCP2_RESULT " + json.dumps(result), flush=True)
     for r, c in checks.items():
         assert all(c[k] for k in ("pool", "selected", "out", "lse")), (r, c)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic: where the RP + DCP-2 selection differs from the plain DCP op.
+# Every StreamIndex call of the step is recorded twice: the served top-k ids
+# and a top-(k + 16) with scores, so a flipped group's score in both paths and
+# the scores at the cut can be read back.
+
+
+def _bf16_ulp(x):
+    x = np.abs(np.asarray(x, np.float64))
+    return np.where(x > 0, 2.0 ** (np.floor(np.log2(np.maximum(x, 1e-30))) - 7), 0.0)
+
+
+def _record_indexer(monkeypatch, calls):
+    from jax.experimental import io_callback
+
+    original = pooled_qsa.streamindex_topk
+
+    def store(main, ids, scores):
+        calls.append((np.asarray(main), np.asarray(ids), np.asarray(scores)))
+
+    def wrapped(*args, **kwargs):
+        main = original(*args, **kwargs)
+        if kwargs.get("return_scores"):
+            return main
+        k = kwargs["k"]
+        ids, scores = original(
+            *args, **{**kwargs, "k": k + 16, "return_scores": True, "enable_early_exit": False}
+        )
+        if scores.dtype == jnp.int32:
+            scores = jax.lax.bitcast_convert_type(scores, jnp.float32)
+        io_callback(store, None, main, ids, scores.astype(jnp.float32), ordered=True)
+        return main
+
+    monkeypatch.setattr(pooled_qsa, "streamindex_topk", wrapped)
+
+
+def _rows_of(calls):
+    main = np.concatenate([c[0] for c in calls])
+    ids = np.concatenate([c[1] for c in calls])
+    scores = np.concatenate([c[2] for c in calls])
+    return main, ids, scores
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("served_mql", [False, True], ids=["mql_prefill", "mql_served4"])
+def test_dcp2_3072_108k_selection_dump(monkeypatch, served_mql):
+    import os
+
+    rows, context = 3072, 108_000
+    pair_qgate, shared, meta, pools, prefill = _dcp_step(rows, context)
+    mql = 4 if served_mql else prefill
+    _dcp_fns.cache_clear()
+    full_calls, shard_calls = [], []
+    _record_indexer(monkeypatch, full_calls)
+    plain, select, attend = _dcp_fns(mql)
+    starts, ctx, _, table, _ = meta
+    report = dict(rows=rows, context=context, max_query_len=mql, ranks={})
+    for r in range(2):
+        rank = jnp.asarray([r], jnp.int32)
+        args = _dcp_args(pair_qgate, shared, meta, pools[r])
+        full_calls.clear()
+        p_pool, p_out, p_lse, p_sel = jax.block_until_ready(plain(*args, rank))
+        jax.effects_barrier()
+        full = _rows_of(full_calls)
+        per_shard = []
+        for s in range(TP):
+            full_calls.clear()
+            per_shard.append(jax.block_until_ready(
+                select(*args, jnp.asarray([s], jnp.int32), rank)))
+            jax.effects_barrier()
+            shard_calls.append(_rows_of(full_calls))
+        shard = tuple(np.concatenate([c[i] for c in shard_calls[-TP:]]) for i in range(3))
+        s_pool, q, gate, lengths, req, st, _ = per_shard[0]
+        gathered = jnp.concatenate([x[-1] for x in per_shard])[:rows]
+        _, a_out, a_lse, a_sel = attend(q, gate, lengths, req, st, table, ctx, s_pool,
+                                        gathered, rank)
+        p_sel, a_sel = np.asarray(p_sel), np.asarray(a_sel)
+        sel_diff = {}
+        for row in range(rows):
+            a, b = set(p_sel[row][p_sel[row] >= 0]), set(a_sel[row][a_sel[row] >= 0])
+            if a != b:
+                sel_diff[row] = len(a ^ b)
+        # Group level: the served top-k of each path, scores from the k+16 dumps.
+        f_main, f_ids, f_sc = full
+        s_main, s_ids, s_sc = shard
+        assert len(f_main) == rows and len(s_main) == rows, (f_main.shape, s_main.shape)
+        k = f_main.shape[1]
+        flips, max_delta, max_delta_ulp, worst = [], 0.0, 0.0, None
+        for row in range(rows):
+            fd = {int(g): float(v) for g, v in zip(f_ids[row], f_sc[row]) if g >= 0}
+            sd = {int(g): float(v) for g, v in zip(s_ids[row], s_sc[row]) if g >= 0}
+            for g in fd.keys() & sd.keys():
+                d = abs(fd[g] - sd[g])
+                if d > max_delta:
+                    max_delta, worst = d, (row, g, fd[g], sd[g])
+                u = float(_bf16_ulp(fd[g]))
+                if u and d / u > max_delta_ulp:
+                    max_delta_ulp = d / u
+            fm = set(int(g) for g in f_main[row] if g >= 0)
+            sm = set(int(g) for g in s_main[row] if g >= 0)
+            if fm != sm:
+                fs, ss = sorted(fd.values(), reverse=True), sorted(sd.values(), reverse=True)
+                cut = lambda v: [v[k - 1] if len(v) >= k else None,
+                                 v[k] if len(v) > k else None]
+                flips.append(dict(
+                    row=row,
+                    only_full=[(g, fd.get(g), sd.get(g)) for g in sorted(fm - sm)],
+                    only_shard=[(g, fd.get(g), sd.get(g)) for g in sorted(sm - fm)],
+                    full_cut_k_k1=cut(fs), shard_cut_k_k1=cut(ss),
+                ))
+        report["ranks"][r] = dict(
+            selected_rows_differing=len(sel_diff),
+            selected_entries_differing=int(sum(sel_diff.values())),
+            selected_diff_rows=sorted(sel_diff)[:64],
+            group_rows_flipped=len(flips),
+            max_abs_score_delta=max_delta,
+            max_delta_in_bf16_ulps=max_delta_ulp,
+            worst=worst,
+            out_equal=bool(np.array_equal(np.asarray(p_out), np.asarray(a_out))),
+            flips=flips[:40],
+            indexer_calls=dict(full=len(full_calls), shard_chunks=len(shard_calls[-1][0])),
+        )
+    text = json.dumps(report, default=float)
+    out_dir = os.environ.get("CDK_OUTPUT_DIR")
+    if out_dir:
+        with open(os.path.join(out_dir, f"dcp2_dump_mql{mql}.json"), "w") as f:
+            f.write(text)
+    summary = {r: {k2: v for k2, v in d.items() if k2 != "flips"}
+               for r, d in report["ranks"].items()}
+    print("QSA_DCP2_DUMP " + json.dumps(dict(max_query_len=mql, ranks=summary),
+                                        default=float), flush=True)
+    for r, d in report["ranks"].items():
+        for f in d["flips"][:5]:
+            print("QSA_DCP2_FLIP", mql, r, json.dumps(f, default=float), flush=True)
