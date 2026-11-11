@@ -987,6 +987,56 @@ def test_draft_step_kernel_attention_moe_and_greedy_tail(T):
     np.testing.assert_array_equal(got[clear], np.asarray(want)[clear])
 
 
+@pytest.mark.parametrize("T", [1, 4])
+def test_draft_step_skip_idle_requests_bit_identical(T):
+    """`skip_idle` (the MK draft's request loops stop after the last live request) at the
+    served request loop / sharded selection / union attention: live rows' residual and
+    greedy tokens are byte-identical to the full loop over every request slot (a T = 1
+    tile holds 16 request slots, 2 live here)."""
+    from vllm_torchtpu.megakernel.wholestep.tail import TOP, greedy_tokens
+
+    R, V, Lt = 2, 384, 1
+    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
+    d = wi.random_wholestep_inputs(
+        37, G, ex, Lt, budget=BUDGET, n_pages=PAGES, identical_experts=True,
+        first="qsa", vocab_shard=V,
+    )
+    # Live requests first (contexts > 0), the rest of the tile's request slots idle.
+    nreq, live = ex.M // T, ex.B // T
+    ctx = [CTX_C[q % len(CTX_C)] or 37 for q in range(live)] + [0] * (nreq - live)
+    d = wi.add_indexer_inputs(37, G, ex, d, Lt, max_groups=MAX_GROUPS, ctx=ctx)
+    d = wi.add_step_inputs(37, G, ex, d, Lt, ctx=ctx)
+    d = wi.add_per_layer(37, G, ex, d, Lt)
+    d = wi.add_carrier(37, d)
+    d["hbm_tables"] = True
+    wi.wholestep_reference(G, ex, d, Lt)
+    d.pop("_step_out")
+    mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
+    got = []
+    for skip in (False, True):
+        idx = dict(
+            max_groups=MAX_GROUPS, pages_per_seq=d["mtab"].shape[-1], carrier="bf16",
+            chunk_pages=8, n_layers=1, hbm_tables=True, per_request_scores=True,
+            bounded_chunks=True, shard_index=True, union_attn=True, loop_requests=True,
+            skip_idle=skip,
+        )
+        spec = wholestep_spec(
+            G, R, L=Lt, qsa=dict(budget=BUDGET), step=True, indexed=idx, first="qsa",
+            tail=dict(vocab_shard=V),
+        )
+        w_mk, states = wi.pack_wholestep(spec, G, ex, d, Lt)
+        pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+            mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states
+        )
+        step, _ = kernel.make_step(mesh, spec, ex)
+        _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras_c(d, mesh, R))
+        res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, : ex.B], np.float32)
+        tok = np.asarray(greedy_tokens(outs[TOP], R, ex.M))[: ex.B]
+        got.append((res, tok))
+    np.testing.assert_array_equal(got[0][0], got[1][0])
+    np.testing.assert_array_equal(got[0][1], got[1][1])
+
+
 def test_step_with_per_layer_metadata_matches_reference():
     """Served packing: every QSA layer has its own compressed keys, main page table, raw
     ring and

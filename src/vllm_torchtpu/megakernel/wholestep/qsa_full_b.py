@@ -87,6 +87,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         dcp: int = 1,
         compressed_dcp: bool = False,
         async_dma: bool = False,
+        skip_idle: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -169,6 +170,12 @@ class QSAFullIndexedBlock(QSAFullBlock):
         # Selection-path DMAs to distinct destinations issued together and waited once
         # (row ids into SMEM, the new group's loads/stores) instead of start-wait pairs.
         self.async_dma = bool(async_dma)
+        # `skip_idle` (needs `loop_requests`; the MK draft at one row per request): the
+        # per-request loops stop after the last live request (context > 0), so the 16
+        # request slots of a T = 1 tile do no work when idle. Their outputs are left
+        # unwritten: the cache writer and the caller read only live requests.
+        self.skip_idle = bool(skip_idle)
+        assert not skip_idle or loop_requests, "skip_idle bounds the request loops"
         assert not shard_index or per_request_scores, (
             "the sharded indexer selects per request"
         )
