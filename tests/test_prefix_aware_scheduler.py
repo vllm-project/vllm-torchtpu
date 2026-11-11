@@ -348,3 +348,46 @@ def test_prompt_ids_ndarray_early_patch_wraps_preprocess(monkeypatch):
     assert out == (request, 0)
     np.testing.assert_array_equal(request._prompt_ids_np, np.asarray(ids, np.int32))
     assert request.prompt_token_ids is ids
+
+
+def test_prompt_ids_ndarray_early_real_preprocess(monkeypatch):
+    """The wrapped real EngineCore.preprocess_add_request builds a real
+    Request whose cached ndarray add_request then reuses."""
+    import numpy as np
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine import EngineCoreRequest
+    from vllm.v1.engine.core import EngineCore
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.core import prefix_aware_scheduler as paw
+
+    monkeypatch.setattr(
+        EngineCore, "preprocess_add_request", EngineCore.preprocess_add_request
+    )
+    monkeypatch.setattr(envs, "VLLM_TPU_PROMPT_IDS_NDARRAY", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY", True, raising=False)
+    paw.patch_prompt_ids_ndarray_early()
+    ids = list(range(1000, 1000 + 4096))
+    core_req = EngineCoreRequest(
+        request_id="r0",
+        prompt_token_ids=ids,
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=4, temperature=0.0),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    fake_core = SimpleNamespace(
+        mm_receiver_cache=None, request_block_hasher=None, structured_output_manager=None
+    )
+    request, wave = EngineCore.preprocess_add_request(fake_core, core_req)
+    assert wave == 0
+    converted = request._prompt_ids_np
+    np.testing.assert_array_equal(converted, np.asarray(ids, np.int32))
+    s = _make_scheduler([], {})
+    s._prompt_np = True
+    with patch.object(AsyncScheduler, "add_request", return_value=None):
+        s.add_request(request)
+    assert request._prompt_ids_np is converted
