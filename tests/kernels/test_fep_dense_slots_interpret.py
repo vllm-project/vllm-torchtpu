@@ -19,11 +19,21 @@ of the same math: v3's select, fused EP v3's per-row FFN (ffn.expert_ffn_fp8 /
 result_rows with
 bf16 result rows) and its k-ordered weighted sum.
 
-Needs 8 CPU devices, i.e. XLA_FLAGS=--xla_force_host_platform_device_count=8 before JAX
-starts
-(skipped otherwise). Small shapes: hidden 1024 (whole 8-sublane staging tiles),
-intermediate 128, 16 or 32 experts, top-k 4.
+Small shapes: hidden 1024 (whole 8-sublane staging tiles), intermediate 128, 16, 32 or
+64 experts, top-k 4.
+
+The checks need 8 CPU devices, and the host device count (XLA_FLAGS) must be set before
+JAX starts, so the tests run this file as a script in a subprocess, once per session,
+for the cases pytest selected, and each test reports its case. One case per variant
+and the two mutant checks run in regular CI; the rest of the grid is marked nightly.
 """
+
+import json
+import os
+import subprocess
+import sys
+import time
+import traceback
 
 import jax
 import jax.numpy as jnp
@@ -61,15 +71,7 @@ VARIANTS = {
 }
 
 
-@pytest.fixture(autouse=True)
 def _cpu_budget(monkeypatch):
-    # The device check runs here, not at import: the suite refuses a JAX backend started
-    # during collection.
-    if len(jax.devices()) < D or jax.devices()[0].platform != "cpu":
-        pytest.skip(
-            f"needs {D} CPU devices "
-            f"(XLA_FLAGS=--xla_force_host_platform_device_count={D})"
-        )
     # No TPU to ask for its VMEM size: the programs plan for a 64 MiB core.
     monkeypatch.setattr(DS, "VMEM_LIMIT", 64 << 20)
     monkeypatch.setattr(DEV, "vmem_limit", lambda *a, **k: 64 << 20)
@@ -200,19 +202,7 @@ def _close(got, want):
     return bool(np.isfinite(got).all() and off.mean() < 1e-3)
 
 
-@pytest.mark.parametrize("variant", list(VARIANTS))
-@pytest.mark.parametrize(
-    "e,real,hot,short",
-    [
-        (16, 24, False, 0),
-        (16, 24, True, 0),
-        (32, 32, False, 5),
-        (64, 24, "cold", 0),
-        (64, 32, "cold", 5),
-        (64, 24, True, 0),
-    ],
-)
-def test_matches_reference(variant, e, real, hot, short):
+def _check_matches_reference(variant, e, real, hot, short):
     if (
         e == 64
         and "skip" not in variant
@@ -250,17 +240,7 @@ def _run_kernel_only(variant, e, real, hot, short):
     return np.asarray(got.astype(jnp.float32))
 
 
-@pytest.mark.parametrize(
-    "base,variant",
-    [
-        ("merged_unpadded", "merged_unpadded_skip"),
-        ("merged_unpadded", "merged_unpadded_w4"),
-        ("merged_unpadded", "merged_unpadded_skip_w2"),
-        ("fused", "fused_skip"),
-    ],
-)
-@pytest.mark.parametrize("hot,short", [("cold", 0), ("cold", 5), (True, 0), (False, 0)])
-def test_skip_bit_identical(base, variant, hot, short):
+def _check_skip_bit_identical(base, variant, hot, short):
     """The skip and the slot count change only which weight DMAs run and when: the same
     program on the same CPU gives every value equal."""
     a = _run_kernel_only(base, 64, 24, hot, short)
@@ -268,7 +248,7 @@ def test_skip_bit_identical(base, variant, hot, short):
     assert np.array_equal(a, b), int((a != b).sum())
 
 
-def test_skip_slot_mutant_is_caught(monkeypatch):
+def _check_skip_slot_mutant_is_caught(monkeypatch):
     """Computing with the old expert-indexed weight slot on the compacted list reads
     another
     expert's (or a not yet landed) weights: the output must move."""
@@ -281,7 +261,7 @@ def test_skip_slot_mutant_is_caught(monkeypatch):
     assert not np.array_equal(a, b)
 
 
-def test_mutants_are_caught(monkeypatch):
+def _check_mutants_are_caught(monkeypatch):
     """Each mutant breaks the output: the destination reads the neighbouring pair's row
     (pos),
     each expert gathers its rows one token off (onehot), the merged program's arrival
@@ -309,3 +289,162 @@ def test_mutants_are_caught(monkeypatch):
         monkeypatch.setattr(DS, "TABLE_HOOK", None)
         monkeypatch.setattr(DS, "MERGED_POS_SHIFT", 0)
         DS.build_kernel.cache_clear()
+
+
+WORLDS = [
+    (16, 24, False, 0),
+    (16, 24, True, 0),
+    (32, 32, False, 5),
+    (64, 24, "cold", 0),
+    (64, 32, "cold", 5),
+    (64, 24, True, 0),
+]
+# Regular CI runs each variant on one world: a skip variant where experts go unrouted,
+# the others on the smallest world. The rest of the grid runs nightly.
+REGULAR_WORLD = {
+    v: (64, 24, "cold", 0) if "skip" in v else (16, 24, False, 0) for v in VARIANTS
+}
+SKIP_PAIRS = [
+    ("merged_unpadded", "merged_unpadded_skip"),
+    ("merged_unpadded", "merged_unpadded_w4"),
+    ("merged_unpadded", "merged_unpadded_skip_w2"),
+    ("fused", "fused_skip"),
+]
+SKIP_WORLDS = [("cold", 0), ("cold", 5), (True, 0), (False, 0)]
+
+
+def _case_id(name, *params):
+    return name + "[" + "-".join(map(str, params)) + "]"
+
+
+def _cases():
+    """Every case of the grid: id -> the check it runs with a MonkeyPatch."""
+    cases = {}
+    for variant in VARIANTS:
+        for world in WORLDS:
+            cases[_case_id("matches_reference", variant, *world)] = (
+                lambda mp, v=variant, w=world: _check_matches_reference(v, *w)
+            )
+    for base, variant in SKIP_PAIRS:
+        for hot, short in SKIP_WORLDS:
+            cases[_case_id("skip_bit_identical", base, variant, hot, short)] = (
+                lambda mp, b=base, v=variant, h=hot, s=short: _check_skip_bit_identical(
+                    b, v, h, s
+                )
+            )
+    cases["skip_slot_mutant_is_caught"] = _check_skip_slot_mutant_is_caught
+    cases["mutants_are_caught"] = _check_mutants_are_caught
+    return cases
+
+
+def _worker(case_ids):
+    devices = jax.devices()
+    # Fail, not skip, without the 8 devices: the tests set them up themselves.
+    assert len(devices) >= D and devices[0].platform == "cpu", devices
+    cases = _cases()
+    results = {}
+    for case in case_ids:
+        start = time.monotonic()
+        with pytest.MonkeyPatch.context() as mp:
+            _cpu_budget(mp)
+            try:
+                cases[case](mp)
+                outcome, message = "passed", ""
+            except pytest.skip.Exception as e:
+                outcome, message = "skipped", str(e)
+            except Exception:
+                outcome, message = "failed", traceback.format_exc()[-3000:]
+        results[case] = dict(
+            outcome=outcome, message=message, seconds=time.monotonic() - start
+        )
+    print("RESULT " + json.dumps(results))
+
+
+_TESTS = {
+    "test_matches_reference": "matches_reference",
+    "test_skip_bit_identical": "skip_bit_identical",
+}
+
+
+def _item_case(item):
+    name = item.originalname
+    if name in _TESTS:
+        return _case_id(_TESTS[name], *item.callspec.params.values())
+    return name[len("test_") :]
+
+
+@pytest.fixture(scope="module")
+def on_8_devices(request):
+    """Runs the cases pytest selected from this file in one subprocess with 8 CPU
+    devices, and returns each case's outcome."""
+    case_ids = [
+        _item_case(item)
+        for item in request.session.items
+        if getattr(item, "module", None) is request.module
+    ]
+    flags = os.environ.get("XLA_FLAGS", "")
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count={D}",
+    )
+    proc = subprocess.run(
+        [sys.executable, __file__, json.dumps(case_ids)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300 + 300 * len(case_ids),
+    )
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
+    return json.loads(lines[-1][len("RESULT ") :])
+
+
+def _report(results, case, may_skip=False):
+    got = results[case]
+    if got["outcome"] == "skipped" and may_skip:
+        pytest.skip(got["message"])
+    assert got["outcome"] == "passed", got["message"]
+
+
+def _matches_params():
+    for variant in VARIANTS:
+        for world in WORLDS:
+            regular = REGULAR_WORLD[variant] == world
+            marks = () if regular else (pytest.mark.nightly,)
+            yield pytest.param(variant, *world, marks=marks)
+
+
+@pytest.mark.parametrize("variant,e,real,hot,short", list(_matches_params()))
+def test_matches_reference(on_8_devices, variant, e, real, hot, short):
+    # The 64-expert worlds run only the skip variants and their bases (the check skips
+    # the rest itself).
+    may_skip = (
+        e == 64
+        and "skip" not in variant
+        and variant not in ("merged_unpadded", "fused")
+    )
+    _report(
+        on_8_devices,
+        _case_id("matches_reference", variant, e, real, hot, short),
+        may_skip,
+    )
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("base,variant", SKIP_PAIRS)
+@pytest.mark.parametrize("hot,short", SKIP_WORLDS)
+def test_skip_bit_identical(on_8_devices, base, variant, hot, short):
+    _report(on_8_devices, _case_id("skip_bit_identical", base, variant, hot, short))
+
+
+def test_skip_slot_mutant_is_caught(on_8_devices):
+    _report(on_8_devices, "skip_slot_mutant_is_caught")
+
+
+def test_mutants_are_caught(on_8_devices):
+    _report(on_8_devices, "mutants_are_caught")
+
+
+if __name__ == "__main__":
+    _worker(json.loads(sys.argv[1]))
