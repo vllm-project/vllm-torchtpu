@@ -916,43 +916,33 @@ class TestTpuPlatform:
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
+    @pytest.mark.parametrize(
+        ("initial_cls", "expected_cls"),
+        [
+            ("auto", "vllm_torchtpu.worker.tpu_worker.TPUWorker"),
+            # A caller's choice (--worker-cls, or the stage worker vllm-omni
+            # resolves before this hook runs) is kept.
+            ("pkg.custom_worker.CustomWorker", "pkg.custom_worker.CustomWorker"),
+        ],
+    )
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    def test_check_and_update_config_resolves_auto_worker_cls(
-        self, mock_prepare_env, mock_apply_patches, vllm_config
+    def test_check_and_update_config_resolves_only_auto_worker_cls(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        initial_cls,
+        expected_cls,
     ):
         vllm_config.cache_config.block_size = 16
-        vllm_config.parallel_config.worker_cls = "auto"
+        vllm_config.parallel_config.worker_cls = initial_cls
 
         TpuPlatform.check_and_update_config(vllm_config)
 
-        assert (
-            vllm_config.parallel_config.worker_cls
-            == "vllm_torchtpu.worker.tpu_worker.TPUWorker"
-        )
-
-    @patch("vllm_torchtpu.patch_registry.apply")
-    @patch(
-        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
-    )
-    def test_check_and_update_config_keeps_explicit_worker_cls(
-        self, mock_prepare_env, mock_apply_patches, vllm_config
-    ):
-        # vllm-omni resolves each stage's worker (e.g. the Omni AR worker)
-        # before this hook runs; the hook must not clobber that choice.
-        vllm_config.cache_config.block_size = 16
-        vllm_config.parallel_config.worker_cls = (
-            "vllm_torchtpu.omni.worker.tpu_ar_worker.TPUARWorker"
-        )
-
-        TpuPlatform.check_and_update_config(vllm_config)
-
-        assert (
-            vllm_config.parallel_config.worker_cls
-            == "vllm_torchtpu.omni.worker.tpu_ar_worker.TPUARWorker"
-        )
+        assert vllm_config.parallel_config.worker_cls == expected_cls
 
     @pytest.mark.parametrize(
         ("initial_cls", "expected_cls"),

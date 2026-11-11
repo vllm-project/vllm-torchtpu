@@ -31,9 +31,6 @@ pytestmark = pytest.mark.omni
 
 
 def test_tpu_ar_worker_wiring():
-    # The platform hook vLLM-Omni resolves for AR stages lands on a worker of
-    # the same shape as upstream GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase)
-    # that swaps in the AR runner.
     assert resolve_obj_by_qualname(OmniTpuPlatform.get_omni_ar_worker_cls()) is (
         TPUARWorker
     )
@@ -51,20 +48,12 @@ def test_tpu_ar_worker_wiring():
     ],
 )
 def test_worker_base_refuses_unimplemented_orchestrator_hooks(method, args):
-    # The orchestrator-facing hooks of OmniGPUWorkerBase exist on TPU but
-    # raise, so a feature that relies on them fails visibly.
     worker = OmniTPUWorkerBase.__new__(OmniTPUWorkerBase)
     with pytest.raises(NotImplementedError, match="TPU"):
         getattr(worker, method)(*args)
 
 
 def test_tpu_worker_builds_runner_from_model_runner_cls():
-    """init_device() needs a TPU, so check the construction site in the AST.
-
-    The worker must build its runner through the overridable class attribute
-    and must not name TPUModelRunner directly. Parsing the source survives
-    reformatting, which a text match would not.
-    """
     tree = ast.parse(textwrap.dedent(inspect.getsource(TPUWorker.init_device)))
     called = [node.func for node in ast.walk(tree) if isinstance(node, ast.Call)]
     assert any(

@@ -205,6 +205,47 @@ def omni_runner(
     yield _omni_runner_manager.get_or_create(request.param)
 
 
+@pytest.fixture(scope="module")
+def omni_ctx() -> Generator[None, None, None]:
+    """Single-rank parallel groups plus a default forward context.
+
+    For component tests that build vLLM / vLLM-Omni layers in-process:
+    ``initialize_model_parallel`` creates the diffusion groups and vLLM's own
+    TP/PP/DP/EP groups, so both diffusion transformers and autoregressive
+    encoders (parallel linear layers) can be constructed, and
+    ``set_forward_context`` installs the current ``VllmConfig`` that vLLM
+    CustomOps (Conv3dLayer, QKVParallelLinear) need at construction time.
+    A module that needs a different forward context overrides this fixture
+    under the same name.
+    """
+    from vllm.config import VllmConfig
+    from vllm.utils.network_utils import get_open_port
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        destroy_distributed_env,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm_omni.diffusion.forward_context import set_forward_context
+
+    owns_dist_env = not torch.distributed.is_initialized()
+    if owns_dist_env:
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
+            backend="gloo",
+        )
+        initialize_model_parallel(tensor_parallel_size=1, pipeline_parallel_size=1)
+    with set_forward_context(
+        vllm_config=VllmConfig(), omni_diffusion_config=OmniDiffusionConfig()
+    ):
+        yield
+    if owns_dist_env:
+        destroy_distributed_env()
+
+
 @pytest.fixture(autouse=True)
 def _omni_model_patches(request: pytest.FixtureRequest) -> None:
     """Install the TPU model patches that the diffusion worker runs with.

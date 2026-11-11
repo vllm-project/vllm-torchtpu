@@ -11,11 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU patches for the Qwen3-Omni Thinker: audio encoder chunk-length math.
+"""TPU patch for the Qwen3-Omni Thinker: audio encoder chunk-length math.
 
-``Qwen3OmniMoeAudioEncoder.forward`` (in both upstream vLLM and vLLM-Omni's
-thinker subclass) splits the mel features into windows of
-``n_window * 2 = 100`` frames with
+vLLM-Omni's ``Qwen3OmniMoeAudioEncoder.forward`` splits the mel features into
+windows of ``n_window * 2 = 100`` frames with
 
     chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
 
@@ -35,32 +34,31 @@ inherit its device, so the whole chunking computation moves to exact
 IEEE-754 arithmetic. ``_get_cnn_output_lengths`` is wrapped so the CNN mask
 lengths computed from the CPU chunk lengths come back on the encoder's
 device, where ``forward`` compares them with an ``arange`` on the feature
-device. At the pinned vLLM (0.33.0) and vLLM-Omni (0.32.0rc1) versions,
-``Qwen3OmniMoeAudioEncoder.forward`` is the only caller of
-``Qwen3OmniMoeAudioEncoder._get_cnn_output_lengths`` (processors and
-token-counting paths call the separate module-level
-``_get_feat_extract_output_lengths`` helper), so nothing else observes the
-device change.
+device. At the pinned vLLM-Omni (0.32.0rc1), ``forward`` is the only caller
+of ``_get_cnn_output_lengths`` (processors and token-counting paths call the
+module-level ``_get_feat_extract_output_lengths`` helper), so nothing else
+observes the device change.
 
 Installed through ``patch_registry.PATCHES`` at ``platform_activation`` and
 ``model_load`` for ``Qwen3OmniMoeForConditionalGeneration`` only. The thinker
-stage runs in a ``TPUWorker`` (``TPUARWorker``), which runs both the
-``platform_activation`` and the ``model_load`` patch-registry stages; the
-callback returns ``False`` for every other architecture so the registry
-retries it once a model config is known.
+stage runs in ``TPUARWorker``, a ``TPUWorker``, which runs both registry
+stages; the callback returns ``False`` for every other architecture so the
+registry retries it once a model config is known.
 
-TODO: remove once vLLM and vLLM-Omni compute ``chunk_num`` with integer
-ceil-division, ``(feature_lens + window - 1) // window``, in
-https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_moe_thinker.py
-or once TPU float division is exact for these lengths. The canary
-``test_tpu_float_ceil_still_inexact_for_window_multiples`` in
-``tests_omni/test_qwen3_omni_audio_encoder_tpu.py`` fails when the second
-condition holds.
+TODO: delete this module, its registry entry and its tests when vLLM-Omni is
+bumped to 0.33.0rc1 or later (#2910 / vllm-omni#9010). From that release
+``prepare_encoder_metadata`` computes the window count on the host with
+integer arithmetic, ``forward`` takes ``aftercnn_lens=None`` and feeds
+``_get_cnn_output_lengths`` a NumPy array, so this patch is both unnecessary
+and incompatible there. The strict ``xfail`` test
+``test_upstream_forward_miscounts_exact_window_multiples`` in
+``tests_omni/models/qwen3_omni/test_qwen3_omni_components.py`` reproduces the
+failure the patch works around and turns into an XPASS failure once it is
+gone upstream or once TPU float division becomes exact for these lengths.
 """
 
 from __future__ import annotations
 
-import importlib.util
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -79,15 +77,12 @@ _QWEN3_OMNI_ARCH = "Qwen3OmniMoeForConditionalGeneration"
 _AUDIO_CHUNK_LENGTHS_PATCHED = "_tpu_audio_chunk_lengths_patched"
 
 
-def _patch_audio_encoder_cls(encoder_cls: type[Any]) -> bool:
-    """Wrap ``forward`` and ``_get_cnn_output_lengths`` on an audio encoder class."""
+def _wrap_chunk_length_math(encoder_cls: type[Any]) -> bool:
+    """Wrap ``forward`` and ``_get_cnn_output_lengths``; ``False`` if already done."""
     orig_forward = encoder_cls.forward
     if getattr(orig_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False):
         return False
-    orig_get_cnn_output_lengths = (
-        getattr(encoder_cls, "_tpu_orig_get_cnn_output_lengths", None)
-        or encoder_cls._get_cnn_output_lengths
-    )
+    orig_get_cnn_output_lengths = encoder_cls._get_cnn_output_lengths
 
     def _forward_with_cpu_chunk_lengths(
         self: Any,
@@ -109,57 +104,51 @@ def _patch_audio_encoder_cls(encoder_cls: type[Any]) -> bool:
         ``forward`` feeds it the CPU ``chunk_lengths`` and builds the CNN
         padding mask by comparing the result with an ``arange`` that lives
         on the feature device, so the lengths have to come back there.
-        Verified at the pinned vLLM (0.33.0) and vLLM-Omni (0.32.0rc1)
-        versions: ``Qwen3OmniMoeAudioEncoder.forward`` is the sole caller of
-        this method across both codebases (processor and token-counting code
-        calls the module-level ``_get_feat_extract_output_lengths`` function).
         """
         return orig_get_cnn_output_lengths(self, input_lengths).to(
             self.conv2d1.weight.device
         )
 
     setattr(_forward_with_cpu_chunk_lengths, _AUDIO_CHUNK_LENGTHS_PATCHED, True)
-    encoder_cls._tpu_orig_get_cnn_output_lengths = orig_get_cnn_output_lengths
     encoder_cls.forward = _forward_with_cpu_chunk_lengths
     encoder_cls._get_cnn_output_lengths = _get_cnn_output_lengths_on_device
     return True
 
 
-def maybe_patch_qwen3_omni_thinker(model_config: ModelConfig | None = None) -> bool:
+def maybe_patch_qwen3_omni_thinker(
+    model_config: ModelConfig | None = None,
+) -> bool | None:
     """Route the audio encoder's chunk-length math through CPU on TPU.
 
     Applies to ``Qwen3OmniMoeForConditionalGeneration`` only, matched
-    literally in ``ModelConfig.architectures`` (for a vLLM-Omni stage that is
-    the pipeline's ``model_arch``, which is this name for every Qwen3-Omni
-    stage; upstream vLLM also registers this architecture directly for
-    Thinker-only serving). Returns ``False`` without importing model modules
-    for anything else, including the ``None`` that ``platform_activation``
-    passes before a model is configured, so the registry does not record the
-    patch as applied and retries at ``model_load``.
+    literally in ``ModelConfig.architectures`` (the pipeline ``model_arch``
+    vLLM-Omni gives every Qwen3-Omni stage). Returns ``False`` without
+    importing model modules for anything else, including the ``None`` that
+    ``platform_activation`` passes before a model is configured, so the
+    registry does not record the patch as applied and retries at
+    ``model_load``. Returns ``None`` once the encoder is patched, as the
+    other model patches do; the registry then records it and does not call
+    it again.
 
-    Patches upstream vLLM's ``Qwen3OmniMoeAudioEncoder`` unconditionally and,
-    when ``vllm_omni`` is installed, also patches vLLM-Omni's subclass so
-    plain-vLLM Thinker-only startup without the ``omni`` extra neither fails
-    with ``ImportError`` nor leaves vLLM's encoder unpatched.
+    Patches vLLM-Omni's ``Qwen3OmniMoeAudioEncoder`` only, the class the
+    vLLM-Omni thinker stage instantiates. Plain vLLM (0.33.0) also registers
+    ``Qwen3OmniMoeForConditionalGeneration`` against its own
+    ``vllm.model_executor.models.qwen3_omni_moe_thinker.Qwen3OmniMoeAudioEncoder``:
+    serving it on TPU through plain vLLM (without ``--omni``) fails at startup
+    with ``ModuleNotFoundError: No module named 'vllm_omni'`` if the ``omni``
+    extra is not installed, or fails at runtime in ``split_with_sizes`` on
+    100-frame-multiple audio clips if ``vllm-omni`` is installed (because
+    plain vLLM instantiates its own unpatched encoder class).
     """
     if model_config is None or _QWEN3_OMNI_ARCH not in model_config.architectures:
         return False
 
-    from vllm.model_executor.models.qwen3_omni_moe_thinker import (
-        Qwen3OmniMoeAudioEncoder as VllmQwen3OmniMoeAudioEncoder,
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+        Qwen3OmniMoeAudioEncoder,
     )
 
-    patched = _patch_audio_encoder_cls(VllmQwen3OmniMoeAudioEncoder)
-
-    if importlib.util.find_spec("vllm_omni") is not None:
-        from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
-            Qwen3OmniMoeAudioEncoder as OmniQwen3OmniMoeAudioEncoder,
-        )
-
-        patched = _patch_audio_encoder_cls(OmniQwen3OmniMoeAudioEncoder) or patched
-
-    if patched:
+    if _wrap_chunk_length_math(Qwen3OmniMoeAudioEncoder):
         logger.info(
             "Applied TPU patch: Qwen3-Omni audio encoder CPU chunk length math."
         )
-    return True
+    return None

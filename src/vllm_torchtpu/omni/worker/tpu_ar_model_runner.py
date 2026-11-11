@@ -13,8 +13,11 @@
 # limitations under the License.
 """TPU model runner for autoregressive vLLM-Omni stages."""
 
-from typing import Any
+from typing import Any, Protocol, cast
 
+import torch
+from vllm.sequence import IntermediateTensors
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -22,39 +25,41 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
 
 from vllm_torchtpu.omni.worker.tpu_model_runner import OmniTPUModelRunner
 
+# Model capability flags that ``GPUARModelRunner`` reads (through
+# ``_model_omni_flag``) to drive the per-step preprocess / postprocess hooks.
+# vLLM-Omni models set them in ``__init__``: the Qwen3-Omni thinker sets both
+# to False, the talker sets both to True.
+_PER_STEP_HOOK_FLAGS = ("has_preprocess", "has_postprocess")
+
+
+class _OmniStageModel(Protocol):
+    """The part of a vLLM-Omni stage model ``forward_model`` relies on."""
+
+    def make_omni_output(self, model_outputs: Any, **kwargs: Any) -> OmniOutput: ...
+
 
 class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
     """TPU runner for autoregressive stages; counterpart of ``GPUARModelRunner``.
 
-    Serves the Thinker stage of a single-stage pipeline. The other pieces
-    ``GPUARModelRunner`` adds are checked for at construction and refused with
-    ``NotImplementedError`` until they exist on TPU, so an unsupported stage
-    config fails at startup with a clear message:
+    Serves stages that vLLM's own execute-and-sample loop covers, which is
+    what the Qwen3-Omni thinker-only pipeline needs. What ``GPUARModelRunner``
+    adds on top of that loop is refused with ``NotImplementedError`` rather
+    than approximated, each where it can first be seen:
 
-    - inter-stage connectors (``init_omni_connectors`` with the KV transfer
-      manager), which every stage of a multi-stage pipeline needs to send or
-      receive payloads;
-    - the talker path: ``talker_mtp`` multi-token prediction and the
-      preprocess/postprocess hooks around each step.
+    - at construction, a stage config that needs inter-stage connectors
+      (``needs_omni_connector``): every stage of a multi-stage pipeline sends
+      or receives payloads through them, and they are not wired on TPU;
+    - at ``load_model``, a model that declares the per-step
+      ``preprocess`` / ``postprocess`` hooks (``has_preprocess`` /
+      ``has_postprocess``): the talker path, which runs multi-token
+      prediction around every step.
 
     ``OmniConnectorModelRunnerMixin`` sits on this leaf, as upstream, so the
     connector methods have their home when the multi-stage work lands.
     """
 
-    SUPPORTED_STAGES = frozenset({"thinker"})
-
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        if (
-            self.model_stage is not None
-            and self.model_stage not in self.SUPPORTED_STAGES
-        ):
-            raise NotImplementedError(
-                f"Stage {self.stage_id} ({self.model_stage!r}) is not supported on "
-                "TPU: TPUARModelRunner serves the thinker stage only. The talker "
-                "needs talker_mtp and the preprocess/postprocess hooks, which are "
-                "not implemented on TPU yet."
-            )
         if needs_omni_connector(self.model_config):
             raise NotImplementedError(
                 f"Stage {self.stage_id} ({self.model_stage!r}) needs inter-stage Omni "
@@ -62,3 +67,61 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
                 "pipeline (qwen3_omni_moe_thinker_only) or another single-stage "
                 "deployment."
             )
+
+    def load_model(self) -> None:
+        """Load the stage model, then refuse one whose hooks nobody would call."""
+        super().load_model()
+        model = self.get_model()
+        declared = [
+            flag for flag in _PER_STEP_HOOK_FLAGS if bool(getattr(model, flag, False))
+        ]
+        if declared:
+            raise NotImplementedError(
+                f"Stage {self.stage_id} ({self.model_stage!r}): "
+                f"{type(model).__name__} declares {', '.join(declared)}, so it "
+                "relies on the per-step preprocess/postprocess hooks (the talker's "
+                "multi-token prediction), which TPUARModelRunner does not run yet."
+            )
+
+    def forward_model(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> tuple[torch.Tensor | IntermediateTensors, None]:
+        """Run the stage model and return ``(hidden_states, aux_hidden_states)``.
+
+        vLLM-Omni's runner (``OmniGPUModelRunner._model_forward``) normalises
+        whatever a stage model returns through ``model.make_omni_output`` into
+        an ``OmniOutput``: the text hidden states to sample from plus the
+        multimodal sidecar the next stage consumes. ``TPUModelRunner.forward_model``
+        instead unwraps by shape, for vLLM's ``(hidden_states,
+        aux_hidden_states)`` draft-model convention, which an ``OmniOutput``
+        (a four-field NamedTuple) or a staged thinker's ``(hidden_states,
+        captured_layers)`` would match by accident. This override applies the
+        Omni contract: pipeline-parallel ``IntermediateTensors`` pass through,
+        everything else goes through ``make_omni_output`` and only
+        ``text_hidden_states`` continues. The sidecar is dropped: it is the
+        payload for a next stage, and ``__init__`` refuses configs that have
+        one. Aux hidden states are always ``None``; no Omni stage registers
+        draft-model aux layers.
+        """
+        kwargs: dict[str, Any] = {}
+        if intermediate_tensors is not None:
+            kwargs["intermediate_tensors"] = intermediate_tensors
+        out = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+            **kwargs,
+        )
+        if isinstance(out, IntermediateTensors):
+            return out, None
+        # @support_torch_compile may hand a single tensor back as a 1-element
+        # list or tuple; the same unwrap as TPUModelRunner.forward_model.
+        if isinstance(out, (list, tuple)) and len(out) == 1:
+            out = out[0]
+        if not isinstance(out, OmniOutput):
+            out = cast(_OmniStageModel, self.model).make_omni_output(out)
+        return out.text_hidden_states, None
