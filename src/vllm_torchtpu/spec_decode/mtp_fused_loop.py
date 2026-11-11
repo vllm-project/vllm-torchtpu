@@ -129,6 +129,14 @@ def mk_draft_compile_config(vllm_config: VllmConfig, inner: Any, rows_per_reques
     cfg = copy.copy(vllm_config)
     cc = copy.copy(vllm_config.compilation_config)
     cc.compile_sizes = list(sizes)
+    # Built after the stock draft programs compiled: by then the shared inductor config
+    # carries the backend's pre-grad pass, which a fresh backend asserts absent
+    # (vllm backends.configure_post_pass; exos j-87ff00d1). Give the MK programs their
+    # own copy without it.
+    cc.inductor_compile_config = {
+        k: v for k, v in dict(cc.inductor_compile_config or {}).items()
+        if k != "pre_grad_custom_pass"
+    }
     object.__setattr__(cfg, "compilation_config", cc)
     return cfg, sizes
 
