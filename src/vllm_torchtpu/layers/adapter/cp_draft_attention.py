@@ -605,7 +605,9 @@ def attend_pages(
             def load_word(w):
                 if w not in loaded:
                     loaded[w] = (
-                        kv_u32[pl.ds(w, keys, stride=words)] if words > 1 else kv_u32[...]
+                        kv_u32[pl.ds(w, keys, stride=words)]
+                        if words > 1
+                        else kv_u32[...]
                     )
                 return loaded[w]
 
@@ -616,7 +618,9 @@ def attend_pages(
                 v = unpack(load_word(v_word), v_slot)[:, :head_dim].astype(jnp.float32)
                 v = jnp.where(cached, v, 0.0)
                 # [Q, X, D] -> [Q * X, D]: row q * X + x is token q, head g * X + x.
-                qv = q_buf[slot, :, g * group : (g + 1) * group, :].reshape(rows, head_dim)
+                qv = q_buf[slot, :, g * group : (g + 1) * group, :].reshape(
+                    rows, head_dim
+                )
                 s = jax.lax.dot_general(
                     qv.astype(mxu_dtype),
                     k,
@@ -635,7 +639,9 @@ def attend_pages(
                     q_block, group, head_dim
                 ).astype(o_buf.dtype)
                 lse = jnp.where(denom > 0, m_safe + jnp.log(safe), _NEG_INF)
-                lse_ref[0, g] = jnp.sum(jnp.where(diag, lse, 0.0), axis=0, keepdims=True)
+                lse_ref[0, g] = jnp.sum(
+                    jnp.where(diag, lse, 0.0), axis=0, keepdims=True
+                )
 
         pl.when(cache_ref[r] > 0)(attend)
 

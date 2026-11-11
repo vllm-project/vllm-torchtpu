@@ -951,9 +951,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY": env_bool(
         "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY", default=True
     ),
-    # Extra DFlash/DSpark draft-forward buckets every this many tokens above
-    # 64 (0: the target's token buckets only). A draft is num_reqs * block
-    # tokens, which the target's coarse buckets pad by up to ~45 %.
+    # Extra DFlash/DSpark draft-forward buckets above 64 tokens, this many
+    # apart (`DFlashProposer._fine_draft_buckets`; 0: the target's token
+    # buckets only). A draft is num_reqs * block tokens, which the target's
+    # coarse buckets pad by up to ~45 %.
     "TPU_DRAFT_BUCKET_STEP": env_nonnegative_int("TPU_DRAFT_BUCKET_STEP", 32),
     # Under the synthetic one-row verify, split the requests' rows over the TP
     # ranks: an all-to-all of the LM head shards instead of an all-gather of

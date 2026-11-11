@@ -657,10 +657,13 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
     return next(iter(found.values()))
 
 
-# Fewest request rows per rank for which the synthetic verify splits them:
-# the sampler's top-p bisection is launch-bound below that (the same 31
-# passes for 1, 2 or 8 rows), so a split only adds its two collectives
-# (c4 twin, 8 requests: +24 us).
+# Fewest request rows per rank for which the synthetic verify splits them.
+# The split saves 1 - 1/tp of the sampler's passes over [rows, vocab] and
+# costs an all-to-all plus a token all-gather (~10 us each). Each of the
+# top-p bisection's 31 passes is launch-bound up to ~16 rows (tpu7x, TP8
+# MiniMax-M3 twins: 1.7 us per pass at 8 and 16 rows, 2.0 us on a single
+# row), so splitting 8 or 16 rows lost (+24 / +19 us) and 48 or 64 won
+# (-450 / -630 us); 4 rows per rank sits between.
 _SYNTHETIC_ROW_SPLIT_MIN_ROWS = 4
 
 
@@ -671,7 +674,6 @@ _SYNTHETIC_ROW_SPLIT_MIN_ROWS = 4
 #      gather_logprobs) so _dummy_run and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
-
 class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     drafter: NgramProposer | DFlashProposer | Eagle3Proposer | None

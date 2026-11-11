@@ -417,13 +417,25 @@ class DFlashProposer:
         max_draft_tokens = self._max_chunk_reqs() * self.block_size
         while paddings[-1] < max_draft_tokens:
             paddings.append(min(paddings[-1] * 2, max_draft_tokens))
-        step = envs.TPU_DRAFT_BUCKET_STEP
-        if step:
+        if envs.TPU_DRAFT_BUCKET_STEP:
             # Every row of a padded draft costs: its matmuls, TP all-reduces,
             # LM head and window attention all scale with the bucket.
-            fine = range(_FINE_DRAFT_BUCKETS_FROM + step, max_draft_tokens + step, step)
-            paddings = sorted(set(paddings).union(fine))
+            paddings = sorted(set(paddings).union(self._fine_draft_buckets()))
         return paddings
+
+    def _fine_draft_buckets(self) -> list[int]:
+        """Draft-only buckets from `_FINE_DRAFT_BUCKETS_FROM` up to a full
+        chunk: TPU_DRAFT_BUCKET_STEP apart, and an eighth of the bucket's
+        power of two apart above 8 x the step, so a bucket pads at most
+        ~12.5 % and their count grows with log2 of the chunk."""
+        step = envs.TPU_DRAFT_BUCKET_STEP
+        max_draft_tokens = -(-self._max_chunk_reqs() * self.block_size // 8) * 8
+        buckets = []
+        bucket = _FINE_DRAFT_BUCKETS_FROM
+        while bucket < max_draft_tokens:
+            bucket += max(step, (1 << (bucket.bit_length() - 1)) // 8)
+            buckets.append(min(bucket, max_draft_tokens))
+        return buckets
 
     def _get_padded_len(self, target_len: int) -> int:
         paddings = self._draft_token_paddings()
