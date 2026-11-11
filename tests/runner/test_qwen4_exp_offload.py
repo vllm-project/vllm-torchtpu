@@ -679,3 +679,22 @@ def test_host_hit_restores_every_group_at_the_mamba_boundary(monkeypatch, packed
     third = _request("r3", first.prompt_token_ids + _tokens(300, 2))
     sched.on_new_request(third)
     assert sched.get_num_new_matched_tokens(third, 0) == (0, False)
+
+
+def test_main_kv_dcp_pool_rows_are_whole_carrier_pages(monkeypatch):
+    """Under VLLM_TPU_QSA_MAIN_KV_DCP=2 the main-KV spec holds 2B tokens in a
+    B-row page (tokens_per_state=2); a Raiden row is still one B-row page."""
+    monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", "2")
+    _, layout, native, _ = qwen_pool(monkeypatch, packed=True)
+    dcp_specs = [
+        g.kv_cache_spec
+        for g in native.kv_cache_groups
+        if getattr(g.kv_cache_spec, "tokens_per_state", 1) == 2
+    ]
+    assert dcp_specs and dcp_specs[0].block_size == 2 * layout.block_size
+    assert offload_pool_geometry(None, native) == (
+        layout.block_size,
+        (layout.block_size, 1, 4, 256),
+        torch.float8_e4m3fn,
+        layout.block_size,
+    )
