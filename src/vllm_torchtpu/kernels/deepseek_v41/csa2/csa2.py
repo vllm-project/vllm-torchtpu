@@ -489,20 +489,30 @@ def _csa2_kernel(
                 )
 
         def main_unpack(indices):
-            # Split each 64-row read into 16-row conversions shared by QK and PV.
+            # Split each 64-row read into 32-row FP8 tiles shared by QK and PV.
             unpack_rows = 64
             for i in indices:
                 for row in range(0, 512, unpack_rows):
                     rows = pl.ds(row, unpack_rows)
                     words = cast(jax.Ref, main_cache_ref)[i, rows, :]
-                    for subrow in range(0, unpack_rows, 16):
-                        subwords = words[pl.ds(subrow, 16)]
+                    for subrow in range(0, unpack_rows, 32):
+                        subwords = words[pl.ds(subrow, 32)]
+                        # Byte g of each word is column group g. Truncate to the
+                        # 16-bit halves once; a 32-bit shift of a packed half
+                        # moves byte 1 of each element into its low byte.
+                        halves = (
+                            subwords.astype(jnp.uint16),
+                            lax.shift_right_logical(subwords, 16).astype(jnp.uint16),
+                        )
                         for group in range(4):
-                            shifted = lax.shift_right_logical(subwords, 8 * group)
-                            bits = shifted.astype(jnp.uint8)
-                            fp8 = lax.bitcast_convert_type(bits, jnp.float8_e4m3fn)
-                            values = fp8.astype(jnp.bfloat16)
-                            subrows = pl.ds(row + subrow, 16)
+                            half = halves[group // 2]
+                            if group % 2:
+                                pairs = pltpu.bitcast(half, jnp.uint32)
+                                pairs = lax.shift_right_logical(pairs, jnp.uint32(8))
+                                half = pltpu.bitcast(pairs, jnp.uint16)
+                            bits = half.astype(jnp.uint8)
+                            values = lax.bitcast_convert_type(bits, jnp.float8_e4m3fn)
+                            subrows = pl.ds(row + subrow, 32)
                             main_kv_ref[i, subrows, pl.ds(group * 128, 128)] = values
 
         def main_qk_compute(indices):
@@ -955,7 +965,7 @@ def csa2(
                     (4, num_pages * len(banks), 1, page_size, 512), jnp.bfloat16
                 ),
                 pltpu.VMEM((2, bq, heads, 512), jnp.bfloat16),
-                pltpu.VMEM((bq, 512, 512), jnp.bfloat16) if has_main else None,
+                pltpu.VMEM((bq, 512, 512), jnp.float8_e4m3fn) if has_main else None,
                 pltpu.VMEM((2, 256, 512), jnp.bfloat16),
                 pltpu.VMEM((bq, heads, 256), jnp.float32),
                 pltpu.VMEM((bq, heads, 512), jnp.bfloat16) if has_main else None,
