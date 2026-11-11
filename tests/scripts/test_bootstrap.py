@@ -665,7 +665,9 @@ class TestBootstrapUnits(unittest.TestCase):
             [c[3] for c in calls if c[:3] == ("fetch", "origin", "main")],
             ["--depth=20", "--depth=200", "--depth=1000"],
         )
-        self.assertIn(("diff", "--name-only", "origin/main...headsha"), calls)
+        self.assertIn(
+            ("diff", "--name-only", "--no-renames", "origin/main...headsha"), calls
+        )
 
         # No merge-base at any depth: run the full build instead of diffing
         # only the (docs-only) head commit.
@@ -1289,6 +1291,19 @@ class TestBootstrapUnits(unittest.TestCase):
                 ("JOB_PRIORITY", "6"),
                 ("WORKLOAD_PRIORITY", "pre-merge"),
                 ("VLLM_COMMIT_HASH", self.pinned),
+                (
+                    "diff-aware",
+                    json.dumps(
+                        {
+                            "files": 1,
+                            "full_build_file": "src/vllm_torchtpu/envs.py",
+                            "mode": "shadow",
+                            "rules": ["full build"],
+                            "skipped": [],
+                            "would_skip": [],
+                        }
+                    ),
+                ),
                 ("upload-stages:upload_stage_0:cpu", "1"),
                 ("upload-stages:upload_stage_0:build", "1"),
             ],
@@ -1634,7 +1649,7 @@ class TestBootstrapUnits(unittest.TestCase):
             [
                 ("fetch", "origin", "base111", "--depth=20", "--quiet"),
                 ("fetch", "origin", "deadbeef", "--depth=20", "--quiet"),
-                ("diff", "--name-only", "base111...deadbeef"),
+                ("diff", "--name-only", "--no-renames", "base111...deadbeef"),
             ],
         )
         self.assertIn(("JOB_PRIORITY", "11"), mq_main.meta)
@@ -1686,7 +1701,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     "--quiet",
                 ),
                 ("fetch", "origin", "deadbeef", "--depth=20", "--quiet"),
-                ("diff", "--name-only", "origin/main...deadbeef"),
+                ("diff", "--name-only", "--no-renames", "origin/main...deadbeef"),
             ],
         )
         self.assertTrue(mq_pre.annotations[0][2].startswith("CI suite: pr+cpu-only: "))
@@ -1817,6 +1832,141 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertEqual(step["key"], "pre_commit")
         self.assertEqual(step["agents"], {"queue": "cpu"})
         self.assertNotIn("depends_on", step)
+
+    def test_orchestration_diff_aware_selection(self) -> None:
+        bp = self.bp
+        script = "scripts/vllm/integration/run_qwen35_apc_correctness.sh"
+        pr_env = {
+            "BUILDKITE_PULL_REQUEST": "42",
+            "BUILDKITE_BUILD_AUTHOR_EMAIL": "alice@example.com",
+        }
+
+        def skipped_keys(rec: _RunRecorder) -> dict[str, set[str]]:
+            out: dict[str, set[str]] = {}
+            for lane, rendered, _ in rec.uploads:
+                if lane not in ("tests", "integration"):
+                    continue
+                keys = {
+                    s["key"]
+                    for g in json.loads(rendered)["steps"]
+                    if isinstance(g, dict)
+                    for s in g.get("steps", [g])
+                    if isinstance(s, dict) and s.get("skip")
+                }
+                if keys:
+                    out[lane] = keys
+            return out
+
+        # Shadow (the default): records and annotates, skips nothing.
+        shadow = self._run_bootstrap(pr_env, files=[script])
+        record = json.loads(dict(shadow.meta)["diff-aware"])
+        self.assertEqual(record["mode"], "shadow")
+        self.assertEqual(record["skipped"], [])
+        self.assertNotIn("integration_qwen35_apc_correctness", record["would_skip"])
+        self.assertIn("unit_tests_general_pr", record["would_skip"])
+        self.assertIn(
+            ("info", "diff-aware"), [(a[0], a[1]) for a in shadow.annotations]
+        )
+        self.assertEqual(shadow.uploads[2][2]["OMNI_IMAGE_SKIP"], "")
+        uploader = json.loads(shadow.uploads[0][1])["steps"][1]
+        self.assertNotIn("CI_DIFF_AWARE_SKIP", uploader["env"])
+        self.assertEqual(skipped_keys(self._run_next_stage(shadow)), {})
+
+        # phase1: the other selectable steps are skipped in the stage-2
+        # uploads, the Omni image is not built, and the script's step runs.
+        phase1 = self._run_bootstrap(
+            {**pr_env, "CI_DIFF_AWARE_MODE": "phase1"}, files=[script]
+        )
+        self.assertTrue(phase1.uploads[2][2]["OMNI_IMAGE_SKIP"])
+        self.assertLessEqual(len(phase1.uploads[2][2]["OMNI_IMAGE_SKIP"]), 70)
+        stage1 = self._run_next_stage(phase1)
+        skipped = skipped_keys(stage1)
+        self.assertIn("unit_tests_general_pr", skipped["tests"])
+        self.assertIn("unit_tests_omni_pr", skipped["tests"])
+        self.assertNotIn("integration_qwen35_apc_correctness", skipped["integration"])
+        self.assertIn(
+            "integration_k3_pruned75_apc_offload_correctness", skipped["integration"]
+        )
+        # Concurrency capping still applies to the steps that run.
+        self.assertIn("tpu-pr/alice@example.com", stage1.uploads[2][1])
+
+        # A shared source file needs the full build, whatever the mode.
+        full = self._run_bootstrap(
+            {**pr_env, "CI_DIFF_AWARE_MODE": "phase2"},
+            files=[script, "src/vllm_torchtpu/envs.py"],
+        )
+        self.assertEqual(skipped_keys(self._run_next_stage(full)), {})
+        self.assertNotIn("diff-aware", [a[1] for a in full.annotations])
+
+        # Off, and builds outside the plain PR suite, never select.
+        off = self._run_bootstrap(
+            {**pr_env, "CI_DIFF_AWARE_MODE": "off"}, files=[script]
+        )
+        self.assertNotIn("diff-aware", dict(off.meta))
+        nightly_suite = self._run_bootstrap(
+            {
+                **pr_env,
+                "BUILDKITE_PULL_REQUEST_LABELS": "run-full-ci",
+                "CI_DIFF_AWARE_MODE": "phase2",
+            },
+            files=[script],
+        )
+        self.assertNotIn("diff-aware", dict(nightly_suite.meta))
+        post_merge = self._run_bootstrap(
+            {
+                "BUILDKITE_BRANCH": "main",
+                "BUILDKITE_SOURCE": "webhook",
+                "CI_DIFF_AWARE_MODE": "phase2",
+            },
+            files=[script],
+        )
+        self.assertNotIn("diff-aware", dict(post_merge.meta))
+
+        # A selector failure is annotated and runs every step.
+        with mock.patch.object(
+            bp.select_pr_tests, "load_config", side_effect=OSError("boom")
+        ):
+            broken = self._run_bootstrap(
+                {**pr_env, "CI_DIFF_AWARE_MODE": "phase2"}, files=[script]
+            )
+        self.assertIn(
+            ("warning", "diff-aware"), [(a[0], a[1]) for a in broken.annotations]
+        )
+        self.assertNotIn("diff-aware", dict(broken.meta))
+        self.assertEqual(skipped_keys(self._run_next_stage(broken)), {})
+
+        # An upload whose --dry-run fails goes up unchanged.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "p.yml").write_text(
+                "steps:\n  - key: unit_tests_general_pr\n    command: x\n",
+                encoding="utf-8",
+            )
+            calls: list[tuple[tuple[str, ...], str | None]] = []
+
+            def agent(
+                *args: str, input_text: str | None = None, **_: Any
+            ) -> subprocess.CompletedProcess[str]:
+                calls.append((args, input_text))
+                return subprocess.CompletedProcess(
+                    args, 1 if "--dry-run" in args else 0
+                )
+
+            with (
+                mock.patch.object(bp, "_agent", side_effect=agent),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()) as err,
+            ):
+                bp.upload_with_priority(
+                    "p.yml",
+                    repo_root=root,
+                    job_priority=6,
+                    nightly=False,
+                    pr_tpu_concurrency_group=None,
+                    env={"CI_DIFF_AWARE_SKIP": '{"unit_tests_general_pr": "r"}'},
+                )
+            self.assertIn("could not apply diff-aware skips", err.getvalue())
+            self.assertNotIn("skip:", calls[-1][1] or "")
 
     def test_scope_equivalence_across_channels(self) -> None:
         """All channels for a given scope choose the same Suite and upload the same
