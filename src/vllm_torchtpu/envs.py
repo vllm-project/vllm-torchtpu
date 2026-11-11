@@ -185,6 +185,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
@@ -1055,6 +1056,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (reshape, copy and pad) is gone. The group's lanes are the same bits; lanes >= group are left unwritten (no reader
     # uses them).
     "VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN": env_bool("VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN"),
+    # GATHERED_LEAN (with IN_PLACE; ignored without it): the in-place gathered walk takes no union words and no page
+    # rows, which it never reads (no per-chunk union-word slices / padding / staging, no per-word pool bases). Bitwise.
+    "VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN"),
     # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free kernel on chunked gathered tiles.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""),
     "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4),

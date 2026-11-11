@@ -853,6 +853,118 @@ def test_in_place_dispatch(kernels, monkeypatch):
     assert calls[0].get("in_place") is True, calls
 
 
+# --- the lean in-place gathered walk (gathered_lean; VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN) ----------------------
+
+
+def _kernel_spy(monkeypatch):
+    calls = []
+    original = ud.union_walk_kernel
+
+    def spy(query, bits, ubits, usize, vlengths, pool, page_table_row, **kw):
+        calls.append(dict(bits=bits is None, ubits=ubits is None, rows=page_table_row is None,
+                          lean=kw.get("lean_gathered", False), offset=kw.get("group_offset", 0)))
+        return original(query, bits, ubits, usize, vlengths, pool, page_table_row, **kw)
+
+    monkeypatch.setattr(ud, "union_walk_kernel", spy)
+    return calls
+
+
+@pytest.mark.parametrize("layout,chunks,growth", [(SPARE, 4, 1.0), (WORST, 3, 1.0), (A64, 8, 1.5)])
+def test_gathered_lean_is_the_in_place_walk(kernels, monkeypatch, layout, chunks, growth):
+    """gathered_lean=True with in_place: every chunk's walk gets no union words and no page row (which the gathered walk
+    never reads) and is bit for bit the in-place gathered walk on packed unaligned steps; the lean walk is what ran."""
+    rows, cached = layout
+    tokens = 2048 if sum(-(-n // 256) * 256 for n in rows) > 1024 else 1024
+    step = _packed_step(191 + chunks + len(rows), rows, cached, tokens=tokens)
+    opts = dict(group=64, listed="reference", gathered="reference", gather_chunks=chunks, gather_growth=growth,
+                in_place=True)
+    want = _walk(step, **opts)
+    calls = _kernel_spy(monkeypatch)
+    jax.clear_caches()
+    got = _walk(step, gathered_lean=True, **opts)
+    np.testing.assert_array_equal(_bits(got), _bits(want))
+    assert calls and all(c["lean"] and c["bits"] and c["ubits"] and c["rows"] for c in calls), calls
+    assert any(c["offset"] > 0 for c in calls) == (chunks > 1), calls
+
+
+def test_gathered_lean_compact_and_fallback(kernels, monkeypatch):
+    """gathered_lean with the compact pool and lazy share (FR10b's set): bit for bit the in-place walk; an over-cap
+    step is still the served call bit for bit."""
+    rows, cached = A64
+    step = _packed_step(197, rows, cached)
+    opts = dict(group=64, listed="reference", gathered="reference", gather_chunks=3, share_bits=True, lazy_share=True,
+                compact_reqs=4, in_place=True)
+    want = _walk(step, **opts)
+    calls = _kernel_spy(monkeypatch)
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(_walk(step, gathered_lean=True, **opts)), _bits(want))
+    # every in-place gathered walk is lean; the compact overflow's listed walk (bits given) is not a gathered walk
+    assert any(c["lean"] for c in calls) and all(c["lean"] for c in calls if c["bits"]), calls
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(_walk(step, union_cap=32, gathered_lean=True, **opts)), _bits(_served(step)))
+
+
+def test_gathered_lean_dispatch(kernels, monkeypatch):
+    """VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN=1 reaches union_walk_prefill as gathered_lean=True (unset: absent); with
+    IN_PLACE it reaches the walk as lean_gathered=True; without IN_PLACE it is ignored (no lean walk, the same output)."""
+    rows, cached = A64
+    step = _packed_step(199, rows, cached, tokens=1024)
+    for name, value in (("VLLM_TPU_QSA_PREFILL_UNION_WALK", "64"), ("VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", "0"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_LISTED", "reference"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", "reference")):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN", raising=False)
+    monkeypatch.delenv("VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE", raising=False)
+    calls = _spy(monkeypatch)
+    want = _dispatch(step)
+    assert "gathered_lean" not in calls[0], calls
+    kcalls = _kernel_spy(monkeypatch)
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN", "1")
+    calls.clear()
+    jax.clear_caches()
+    got = _dispatch(step)
+    assert calls[0].get("gathered_lean") is True and "in_place" not in calls[0], calls
+    assert kcalls and not any(c["lean"] for c in kcalls), kcalls     # ignored without in_place
+    np.testing.assert_array_equal(_bits(got), _bits(want))
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE", "1")
+    calls.clear()
+    kcalls.clear()
+    jax.clear_caches()
+    got = _dispatch(step)
+    assert calls[0].get("gathered_lean") is True and calls[0].get("in_place") is True, calls
+    assert kcalls and all(c["lean"] and c["ubits"] and c["rows"] for c in kcalls), kcalls
+    np.testing.assert_array_equal(_bits(got), _bits(want))
+
+
+def test_gathered_lean_args_are_checked(kernels):
+    """lean_gathered needs the in-place gathered walk; _gathered_chunks' lean form needs in_place; the flag is part of
+    the compile key."""
+    rows, cached = A64
+    q, gate, blocks, lengths, table, pool, starts = _packed_step(211, rows, cached, tokens=1024)
+    usize = jnp.zeros((4,), jnp.int32)
+    fake = (jnp.zeros((4 * 8 * 4, 1, 4, 256), pool.dtype), jnp.zeros((4 * 8, 128), jnp.int32))
+    with pytest.raises(ValueError, match="lean_gathered"):
+        ud.union_walk_kernel(q, None, None, usize, lengths, pool, None, group=64, union_cap=CAP, kv_tile=1024,
+                             fast_walk=True, line_matmul=True, lean_gathered=True)
+    with pytest.raises(ValueError, match="lean_gathered"):
+        ud.union_walk_kernel(q, jnp.zeros((4, 8, 128), jnp.int32), None, usize, lengths, pool, None, group=64,
+                             union_cap=CAP, kv_tile=1024, fast_walk=True, line_matmul=True, gathered=fake,
+                             lean_gathered=True)
+    with pytest.raises(ValueError, match="in_place"):
+        ud._gathered_chunks(q, None, jnp.zeros((4, 8), jnp.uint32), usize, lengths, pool, table[:4], None, None,
+                            gathered="reference", chunks=1, group=64, union_cap=CAP, kv_tile=1024, ratio=RATIO,
+                            k_scale=1.0, v_scale=1.0, lean=True, qk16=False, lean_gathered=True)
+    import ast
+    import pathlib
+
+    import vllm_torchtpu
+
+    src = (pathlib.Path(vllm_torchtpu.__file__).parent / "compilation" / "tpu_compiler.py").read_text()
+    ignored = next(ast.literal_eval(n.value) for n in ast.parse(src).body if isinstance(n, ast.Assign)
+                   and any(getattr(t, "id", "") == "_TPU_COMPILE_ENV_IGNORED" for t in n.targets))
+    assert "VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE" not in ignored and "VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN" not in ignored
+
+
 def test_in_place_args_are_checked(kernels):
     """group_offset / bits=None need the gathered walk, and the offset must stay inside the plan's rows."""
     rows, cached = A64
