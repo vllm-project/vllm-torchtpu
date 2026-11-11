@@ -24,7 +24,7 @@ the DCP ownership, the workspace pages or the top-k remap shows up as a
 wrong row. Steps run back to back, so later steps read earlier steps' KV
 as a cached prefix.
 
-The indexer half runs `mla_attention_op.pcp_prefill_topk` (write the split
+The indexer half runs `pcp_workspace.pcp_prefill_topk` (write the split
 rows' K, gather the K workspace, top-k each local query over it) against
 `sum_h w_h * relu(q_h . k)` in numpy, accepting any top-k that differs from
 the exact one only by near-ties at the cut (the kernel's top-k is
@@ -54,8 +54,8 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
 )
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
-from vllm_torchtpu.layers.adapter.pcp_kv_gather import pcp_chunk_pages
 from vllm_torchtpu.layers.core import attention_interface
+from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import HeadTailPcpShardingPlan
 
 pytestmark = [pytest.mark.tpu_test, pytest.mark.multichip]
@@ -518,12 +518,11 @@ def _plain_topk(record, seq_len, q, weights):
 @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
 def test_pcp_indexer_topk_matches_numpy(monkeypatch, scenario, pcp):
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+    from vllm_torchtpu.layers.core import pcp_workspace
 
     mesh = _mesh()
     monkeypatch.setattr(envs, "TPU_PCP_KV_CHUNK_TOKENS", CHUNK_TOKENS)
-    monkeypatch.setattr(
-        mla_attention_op, "PCP_INDEXER_BUCKET_TOKENS", IDX_BUCKET_TOKENS
-    )
+    monkeypatch.setattr(pcp_workspace, "PCP_INDEXER_BUCKET_TOKENS", IDX_BUCKET_TOKENS)
     rng = np.random.default_rng(zlib.crc32(f"indexer-{scenario}-{pcp}".encode()))
     steps = SCENARIOS[scenario]
     final_len = _final_lens(steps)
@@ -531,12 +530,14 @@ def test_pcp_indexer_topk_matches_numpy(monkeypatch, scenario, pcp):
 
     topk_fn = jax.jit(
         functools.partial(
-            mla_attention_op.pcp_prefill_topk,
+            pcp_workspace.pcp_prefill_topk,
             mesh=mesh,
             topk=IDX_TOPK,
             dcp_size=DCP,
             pcp_size=pcp,
             interleave_size=INTERLEAVE,
+            num_queries_per_block=mla_attention_op.STREAMIDX_QUERIES_PER_BLOCK,
+            enable_early_exit=mla_attention_op.STREAMIDX_ENABLE_EARLY_EXIT,
             max_model_len=MAX_MODEL_LEN,
             chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
         )

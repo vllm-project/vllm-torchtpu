@@ -121,13 +121,14 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
 
 ### PCP with PCP manager
 
-Set `USE_TPU_PCP_MANAGER=1` to combine `PCP` and `DCP` on sparse MLA models. Each prefill in a step is split over the `PCP` ranks: rank `r` holds chunks `r` and `2P-1-r` of the prompt to balances causal attention. For attention, every rank gathers those prefills' KV from the `DCP`-sharded cache into a workspace. Decode requests are replicated on every `PCP` rank and run the regular `DCP` decode path.
+Set `USE_TPU_PCP_MANAGER=1` to combine `PCP` and `DCP` on sparse MLA models. Each prefill in a step is split over the `PCP` ranks: rank `r` holds chunks `r` and `2P-1-r` of the prompt to balance causal attention. For attention, every rank gathers those prefills' KV from the `DCP`-sharded cache into a workspace. Decode requests are replicated on every `PCP` rank and run the regular `DCP` decode path.
 
 ```bash
 USE_TPU_PCP_MANAGER=1 vllm serve zai-org/GLM-5.2-FP8 \
   --tensor-parallel-size 2 \
   --prefill-context-parallel-size 4 \
   --decode-context-parallel-size 8 \
+  --cp-kv-cache-interleave-size 4 \
   --enable-expert-parallel
 ```
 
@@ -135,6 +136,7 @@ Requirements:
 
 - A sparse MLA model.
 - `--decode-context-parallel-size` equal to `--prefill-context-parallel-size` x `--tensor-parallel-size`.
+- `--cp-kv-cache-interleave-size` a multiple of `4` (vLLM defaults to `1`).
 - No speculative decoding, LoRA, pipeline parallelism, data parallelism, or multimodal inputs.
 - MoE models also need `--enable-expert-parallel`.
 

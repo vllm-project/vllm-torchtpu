@@ -90,10 +90,7 @@ from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
 )
-from vllm_torchtpu.layers.adapter.pcp_kv_gather import (
-    is_pcp_kv_gather_metadata,
-    pcp_chunk_pages,
-)
+from vllm_torchtpu.layers.adapter.pcp_kv_gather import is_pcp_kv_gather_metadata
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
     attention_bundled,
@@ -102,6 +99,7 @@ from vllm_torchtpu.layers.core.attention_interface import (
     ragged_paged_attention_batched,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.layers.core.quantization import quantize_kv
 from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,

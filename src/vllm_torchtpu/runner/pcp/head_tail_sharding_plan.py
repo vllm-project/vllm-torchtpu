@@ -34,8 +34,8 @@ import torch
 from vllm.utils.math_utils import cdiv
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter.pcp_kv_gather import pcp_chunk_pages
 from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
+from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.pcp.sharding_plan import (
     PcpShardingPlan,

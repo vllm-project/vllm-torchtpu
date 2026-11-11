@@ -25,7 +25,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter.pcp_kv_gather import pcp_chunk_pages
+from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import (
     HeadTailPcpShardingPlan,
     mla_kv_page_size,

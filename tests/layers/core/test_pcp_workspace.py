@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Position-ordered indexer K workspace (`kernels/mla/pcp_workspace.py`)."""
+"""Position-ordered indexer K workspace (`layers/core/pcp_workspace.py`)."""
 
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.mla import pcp_workspace as ws
+from vllm_torchtpu.layers.core import pcp_workspace as ws
 
 
 def _rank_major_workspace(dcp, num_ws_pages, rows, packing, interleave):

@@ -1325,7 +1325,7 @@ def sparse_mla_pcp_write_split(
 
     Returns the updated `(kv_cache_nope, kv_cache_rope)`.
     """
-    from vllm_torchtpu.kernels.mla import pcp_workspace as ws
+    from vllm_torchtpu.layers.core import pcp_workspace as ws
 
     sharded = P(dcp_axis_name)
     replicated = P()
@@ -1419,7 +1419,7 @@ def sparse_mla_attention_pcp_prefill(
 
     Returns `[local_tokens, local_heads, lkv_dim]`; zeros when nothing is split.
     """
-    from vllm_torchtpu.kernels.mla import pcp_workspace as ws
+    from vllm_torchtpu.layers.core import pcp_workspace as ws
 
     if nope_spec.layout is not rope_spec.layout:
         raise ValueError(
