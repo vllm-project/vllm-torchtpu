@@ -17,6 +17,11 @@
 #   `streamindex_topk` per rank (`cp_size`, `cp_rank`);
 # - drops the helpers only DeepSeek V4 callers use (`indexer_kv_layout`,
 #   `convert_cache_to_seq_along_lane`, `prepare_outputs`, the `cp_*` aliases);
+# - each chunk's top-k runs through a static `topk_backend` (`topk_backend.py`);
+#   `topk_backend=None` takes `default_topk_backend()`, which picks the
+#   selector from the chip (SparseCore where usable, else BisectTopK), and
+#   cross-chunk scheduling groups are reserved only for a selector that
+#   overlaps scoring;
 # - imports the sibling copies in this directory and the logger directly;
 #   drops one measurement note and one redundant early return.
 """StreamIndex top-k for the QSA (query-sparse attention) indexer."""
@@ -35,12 +40,15 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.qwen4_exp.kernels.sparsecore_topk import (
     BITS_NEG_INF,
-    sparsecore_topk,
 )
 from vllm_torchtpu.models.vllm.qwen4_exp.kernels.streamindex_topk import (
     bref_override,
     config,
     metadata,
+)
+from vllm_torchtpu.models.vllm.qwen4_exp.kernels.streamindex_topk.topk_backend import (
+    TopKBackend,
+    default_topk_backend,
 )
 
 logger = init_logger(__name__)
@@ -926,6 +934,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "uniform_q_len",
+        "topk_backend",
     ),
 )
 def streamindex_topk(
@@ -955,6 +964,7 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     uniform_q_len: int | None = None,
+    topk_backend: TopKBackend | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1020,6 +1030,11 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      topk_backend: static selector run on each chunk's score buffer. None
+        (default) takes `default_topk_backend()`: the SparseCore selector where
+        the chip has a usable SparseCore, the exact TensorCore `BisectTopK`
+        elsewhere. Only a selector that `overlaps_scoring` gets the cross-chunk
+        scheduling groups.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1029,6 +1044,8 @@ def streamindex_topk(
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv`, keeping HBM transactions fused.
 
+    if topk_backend is None:
+        topk_backend = default_topk_backend()
     kv_layout = KVLayout.parse(kv_layout)
 
     if cp_size < 1:
@@ -1408,8 +1425,9 @@ def streamindex_topk(
 
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
+        # Only a selector on another engine overlaps the next chunk's scoring.
         group_base = 0
-        if num_chunks > 1:
+        if num_chunks > 1 and topk_backend.overlaps_scoring:
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
         chunk_starts = (
@@ -1427,8 +1445,8 @@ def streamindex_topk(
             # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
             # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
             # Chunk 0's scoring and the last top-k have no partner.
-            tc_group = None if m == 0 else group_base + m - 1
-            sc_group = None if m == num_chunks - 1 else group_base + m
+            tc_group = None if m == 0 or not group_base else group_base + m - 1
+            sc_group = None if m == num_chunks - 1 or not group_base else group_base + m
 
             start = m * chunk_len
             scores = _scores_for_chunk(
@@ -1447,25 +1465,18 @@ def streamindex_topk(
                     constant_values=BITS_NEG_INF,
                 )
 
-            if return_scores:
-                chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
-                    scores,
-                    k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
-                    write_empty_rows=True,
-                    scheduling_group_id=sc_group,
-                    return_scores=True,
-                )
+            selected = topk_backend.select(
+                scores,
+                k,
+                row_lengths=eff_row_lengths[start : start + chunk_len],
+                scheduling_group_id=sc_group,
+                return_scores=return_scores,
+            )
+            if isinstance(selected, tuple):
+                chunk_topk_idxs, chunk_topk_scores = selected
                 topk_scores_list.append(chunk_topk_scores)
             else:
-                chunk_topk_idxs = sparsecore_topk(
-                    scores,
-                    k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
-                    write_empty_rows=True,
-                    scheduling_group_id=sc_group,
-                    return_scores=False,
-                )
+                chunk_topk_idxs = selected
             topk_idxs.append(chunk_topk_idxs)
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
