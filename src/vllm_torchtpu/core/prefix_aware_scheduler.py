@@ -58,6 +58,49 @@ def _prompt_ids_ndarray() -> bool:
     return envs.VLLM_TPU_PROMPT_IDS_NDARRAY
 
 
+def _prompt_ids_ndarray_early() -> bool:
+    from vllm_torchtpu import envs
+
+    return envs.VLLM_TPU_PROMPT_IDS_NDARRAY and envs.VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY
+
+
+def prompt_ids_to_ndarray(request) -> None:
+    """Cache ``request.prompt_token_ids`` as an int32 ndarray on the request
+    (``_prompt_ids_np``), once; a non-list prompt is left alone."""
+    if getattr(request, "_prompt_ids_np", None) is None and isinstance(
+        request.prompt_token_ids, list
+    ):
+        request._prompt_ids_np = np.asarray(request.prompt_token_ids, np.int32)
+
+
+def patch_prompt_ids_ndarray_early() -> None:
+    """VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY: convert the prompt in the engine
+    core's input thread (``EngineCore.preprocess_add_request``), so
+    ``PrefixAwareScheduler.add_request`` on the busy loop finds it done."""
+    if not _prompt_ids_ndarray_early():
+        return
+    from vllm.v1.engine.core import EngineCore
+
+    if getattr(EngineCore.preprocess_add_request, "_tpu_prompt_np_early", False):
+        return
+    original = EngineCore.preprocess_add_request
+
+    def preprocess_add_request(self, request):
+        out = original(self, request)
+        try:
+            prompt_ids_to_ndarray(out[0])
+        except Exception:  # never fail a request over an optimization
+            logger.exception("PROMPT_IDS_NDARRAY_EARLY: conversion failed")
+        return out
+
+    preprocess_add_request._tpu_prompt_np_early = True
+    EngineCore.preprocess_add_request = preprocess_add_request
+    logger.info(
+        "PROMPT_IDS_NDARRAY_EARLY ACTIVE: prompt ids -> int32 ndarray in the "
+        "engine core input thread"
+    )
+
+
 def _paw_skip_full() -> bool:
     from vllm_torchtpu import envs
 
@@ -209,9 +252,10 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     def add_request(self, request: Request) -> None:
         t0 = time.perf_counter_ns() if self._hp_every else 0
-        if self._prompt_np and isinstance(request.prompt_token_ids, list):
-            # Once per request, at arrival (usually off the admit step).
-            request._prompt_ids_np = np.asarray(request.prompt_token_ids, np.int32)
+        if self._prompt_np:
+            # Once per request, at arrival; already done in the input thread
+            # under VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY.
+            prompt_ids_to_ndarray(request)
         super().add_request(request)
         if self._hp_every:
             self._hp_note("add_request", (time.perf_counter_ns() - t0) / 1e3)
