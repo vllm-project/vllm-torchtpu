@@ -22,6 +22,8 @@ The house rule: a value that does not parse raises, because a misspelled flag
 is a launch-script bug and defaulting hides it.
 """
 
+import types
+
 import pytest
 
 from vllm_torchtpu.envs import (
@@ -221,24 +223,13 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
 @pytest.mark.parametrize(
     "name,expected",
     [
+        ("TPU_KV_RESHARD_TRANSPORT", "raiden"),
         ("TPU_KV_TRANSFER_PORT", "9100"),
-        ("TPU_SIDE_CHANNEL_PORT", "9600"),
-        ("TPU_NODE_ID", 0),
-        ("TPU_KV_TRANSFER_CHANNEL_NUMBER", 0),
         ("TPU_P2P_WAIT_PULL_TIMEOUT", 120),
         ("TPU_RAIDEN_STAGE3_STATUS_PROBE_S", 1.0),
         ("TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", True),
         ("TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S", 30.0),
         ("TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0),
-        ("TPU_KV_STAGE_WAIT_TIMEOUT_SECS", 30.0),
-        ("TPU_KV_SHM_POOL_GB", 128.0),
-        ("TPU_KV_TRANSFER_NAMESPACE", ""),
-        ("TPU_IPC_SOCKET_DIR", "/tmp"),
-        ("TPU_KV_WARMUP_ENABLED", True),
-        ("TPU_KV_LATENCY_LOG_INTERVAL", 30.0),
-        ("TPU_KV_PIN_SHM", False),
-        ("TPU_USE_RAIDEN_CONNECTOR", False),
-        ("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0),
         ("TPU_RAIDEN_POOL_STAGING_LEASES", 8),
         ("TPU_RAIDEN_INLINE_LOAD", False),
         ("KDA_MANUAL_STATE_DMA", None),
@@ -254,7 +245,6 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
         ("RAIDEN_SHM_KEY", ""),
         ("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", 30.0),
         ("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
-        ("VLLM_TORCHTPU_IPC_KEY", ""),
         ("TPU_SHARDED_LOAD_SYNC_EVERY", 512),
         ("VLLM_TPU_DEBUG_PCP_LAYOUT", False),
         ("TPU_LOCAL_RANK_OFFSET", 0),
@@ -270,6 +260,95 @@ def test_migrated_knob_defaults(monkeypatch, name, expected):
 
     monkeypatch.delenv(name, raising=False)
     assert envs.environment_variables[name]() == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, "raiden"),
+        ("raiden", "raiden"),
+        ("RAIDEN", "RAIDEN"),
+    ],
+)
+def test_tpu_kv_reshard_transport_accepts_only_raiden(monkeypatch, raw, expected):
+    """Unset defaults to 'raiden' and 'raiden' is accepted case-insensitively;
+    the variable is kept only for launch-config compatibility."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.delitem(vars(envs), "TPU_KV_RESHARD_TRANSPORT", raising=False)
+    if raw is None:
+        monkeypatch.delenv("TPU_KV_RESHARD_TRANSPORT", raising=False)
+    else:
+        monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", raw)
+    actual = envs.TPU_KV_RESHARD_TRANSPORT
+    assert actual == expected
+
+
+@pytest.mark.parametrize("raw", ["zmq", "custom", "radien", ""])
+def test_tpu_kv_reshard_transport_rejects_non_raiden(monkeypatch, raw):
+    """The removed 'zmq' transport, custom names, typos, and an explicit empty
+    string fail on first read instead of being passed through."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.delitem(vars(envs), "TPU_KV_RESHARD_TRANSPORT", raising=False)
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", raw)
+    with pytest.raises(ValueError, match=r"Valid options: \['raiden'\]"):
+        _ = envs.TPU_KV_RESHARD_TRANSPORT
+
+
+def _premapped_buffer_block():
+    """Compile only env_override.py's TPU_PREMAPPED_BUFFER_SIZE block.
+
+    Reloading the whole module would re-run libtpu flag setup, the GCE
+    metadata probe and the import-time patch registry, so the block is
+    executed on its own against a fake ``os``.
+    """
+    import ast
+    import inspect
+
+    from vllm_torchtpu import env_override
+
+    tree = ast.parse(inspect.getsource(env_override))
+    blocks = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.If) and "TPU_PREMAPPED_BUFFER_SIZE" in ast.unparse(node)
+    ]
+    assert len(blocks) == 1
+    module = ast.Module(body=blocks, type_ignores=[])
+    return compile(module, env_override.__file__, "exec")
+
+
+def _run_premapped_buffer_block(env):
+    fake_os = types.SimpleNamespace(environ=env, getenv=env.get)
+    exec(_premapped_buffer_block(), {"os": fake_os})  # noqa: S102
+    return env
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on", " On "])
+def test_env_override_premaps_host_buffer_for_raiden_cache_manager(raw):
+    """Every env_bool truthy spelling of TPU_USE_RAIDEN_KV_CACHE_MANAGER sizes
+    libtpu's premapped host buffer pool to 16 GiB."""
+    env = _run_premapped_buffer_block({"TPU_USE_RAIDEN_KV_CACHE_MANAGER": raw})
+    assert env["TPU_PREMAPPED_BUFFER_SIZE"] == str(16 << 30)
+
+
+@pytest.mark.parametrize("raw", [None, "0", "false", ""])
+def test_env_override_skips_premapped_buffer_without_raiden_cache_manager(raw):
+    """TPU_KV_RESHARD_TRANSPORT=raiden alone (its default) no longer enables the
+    premapped pool, so single-host engines keep torch_tpu's default."""
+    env = {"TPU_KV_RESHARD_TRANSPORT": "raiden"}
+    if raw is not None:
+        env["TPU_USE_RAIDEN_KV_CACHE_MANAGER"] = raw
+    env = _run_premapped_buffer_block(env)
+    assert "TPU_PREMAPPED_BUFFER_SIZE" not in env
+
+
+def test_env_override_keeps_a_preset_premapped_buffer_size():
+    env = _run_premapped_buffer_block(
+        {"TPU_USE_RAIDEN_KV_CACHE_MANAGER": "1", "TPU_PREMAPPED_BUFFER_SIZE": "123"}
+    )
+    assert env["TPU_PREMAPPED_BUFFER_SIZE"] == "123"
 
 
 def test_spec_warmup_off_spellings(monkeypatch):

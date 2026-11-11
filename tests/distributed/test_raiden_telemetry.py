@@ -382,7 +382,6 @@ class TestTPURaidenConnectorWorkerTelemetry:
         worker.host_ip = "127.0.0.1"
         worker.kv_transfer_port = 9100
         worker.is_producer = is_producer
-        worker._raiden_stage3_enabled = MagicMock(return_value=True)
         worker._stage3_registered_sends = {1: MagicMock(), 2: MagicMock()}
         worker._stage3_submitted_loads = {
             1: MagicMock(),

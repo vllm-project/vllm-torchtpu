@@ -93,6 +93,9 @@ from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer.connector_names import (
+    RAIDEN_PD_CONNECTOR_NAMES,
+)
 from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
     KVSaveNanCheck,
     begin_kv_save_nan_check,
@@ -1161,7 +1164,7 @@ class TPUModelRunner(GPUModelRunner):
         # The producer populates draft context KV without generating proposals.
         self._is_dspark_pd_producer = bool(
             transfer_config is not None
-            and transfer_config.kv_connector == "TPURaidenConnector"
+            and transfer_config.kv_connector in RAIDEN_PD_CONNECTOR_NAMES
             and transfer_config.is_kv_producer
             and speculative_config is not None
             and speculative_config.method == "dspark"
@@ -4281,8 +4284,8 @@ class TPUModelRunner(GPUModelRunner):
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
             # Even for a zero-token step and if DP lockstep is enabled, we must
-            # still execute the KV coordination logic so the background ZMQ/SHM
-            # threads can start KV transfer in disaggregated serving. This is
+            # still execute the KV coordination logic so the Raiden KV connector
+            # can submit and poll KV transfers in disaggregated serving. This is
             # safe to do for a zero-token step since no collectives are
             # triggered.
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)

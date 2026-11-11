@@ -19,7 +19,8 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 import importlib.util
 import os
 import time
-from typing import TYPE_CHECKING, Protocol, Union, cast
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Protocol, Union, cast
 
 import portpicker
 import torch
@@ -33,6 +34,12 @@ from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
+from vllm_torchtpu.distributed.kv_transfer.connector_names import (
+    RAIDEN_PD_ADMISSION_REQUIRED_MESSAGE,
+    RAIDEN_PD_CONNECTOR_NAMES,
+    USE_RAIDEN_CONNECTOR_REMOVED_MESSAGE,
+    kv_connector_names,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
@@ -440,8 +447,14 @@ def _register_tpu_kv_connectors() -> None:
 
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
+    # Every Raiden P/D name (TPUConnector is an alias) loads the one class.
+    for name in RAIDEN_PD_CONNECTOR_NAMES:
+        KVConnectorFactory.register_connector(
+            name,
+            "vllm_torchtpu.distributed.kv_transfer.tpu_connector",
+            "TPURaidenConnector",
+        )
     for name, module_path in (
-        ("TPURaidenConnector", "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
         (
             "TPUMultiConnector",
             "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
@@ -449,6 +462,44 @@ def _register_tpu_kv_connectors() -> None:
         ("TPURaidenOffloadingConnector", "vllm_torchtpu.offload.raiden_connector"),
     ):
         KVConnectorFactory.register_connector(name, module_path, name)
+
+
+def validate_raiden_pd_connector_config(kv_transfer_config: Any) -> None:
+    """Rejects a Raiden P/D connector config that cannot start.
+
+    vLLM builds the KV connector (and calls register_runner) only after the
+    executor has loaded the model weights, so a leftover ZMQ-era setting would
+    otherwise fail minutes into startup. Runs from check_and_update_config,
+    before any weight is loaded.
+    """
+    extra = kv_transfer_config.kv_connector_extra_config
+    extras = [extra] if isinstance(extra, Mapping) else []
+    if isinstance(extra, Mapping):
+        for child in extra.get("connectors", []):
+            if (
+                isinstance(child, Mapping)
+                and child.get("kv_connector") in RAIDEN_PD_CONNECTOR_NAMES
+                and isinstance(child.get("kv_connector_extra_config"), Mapping)
+            ):
+                extras.append(child["kv_connector_extra_config"])
+    if any("use_raiden_connector" in e for e in extras):
+        raise ValueError(USE_RAIDEN_CONNECTOR_REMOVED_MESSAGE)
+    # env_with_choices raises on anything but "raiden" (e.g. a stale "zmq").
+    _ = envs.TPU_KV_RESHARD_TRANSPORT
+    selected = [
+        name
+        for name in (
+            "TPU_RAIDEN_QWEN35_ADMISSION",
+            "TPU_RAIDEN_KIMIK3_ADMISSION",
+            "TPU_RAIDEN_GLM_ADMISSION",
+            "TPU_RAIDEN_DSV4_ADMISSION",
+        )
+        if getattr(envs, name)
+    ]
+    if len(selected) > 1:
+        raise RuntimeError(f"{' and '.join(selected)} are mutually exclusive")
+    if not envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER or not selected:
+        raise ValueError(RAIDEN_PD_ADMISSION_REQUIRED_MESSAGE)
 
 
 class TpuPlatform(Platform):
@@ -1281,6 +1332,13 @@ class TpuPlatform(Platform):
                 f"{_TPU_SUPPORTED_KV_CONNECTORS}, but got "
                 f"'{kv_transfer_config.kv_connector}'."
             )
+            if any(
+                name in RAIDEN_PD_CONNECTOR_NAMES
+                for name in kv_connector_names(
+                    kv_transfer_config, ("TPUMultiConnector",)
+                )
+            ):
+                validate_raiden_pd_connector_config(kv_transfer_config)
             is_hybrid_offloading = (
                 kv_transfer_config.kv_connector == "TPURaidenOffloadingConnector"
                 and is_hybrid
