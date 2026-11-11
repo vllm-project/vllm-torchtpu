@@ -183,6 +183,7 @@ def _candidates_kernel_t(
     dcp,
     widths,
     pretransposed=False,
+    fine_widths=False,
 ):
     """`_candidates_kernel` with the row block transposed in VMEM: columns
     on sublanes, rows on lanes (``pos_ref [1, rows]``, outputs ``[topk,
@@ -209,6 +210,9 @@ def _candidates_kernel_t(
         s = jnp.where(
             visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
         )
+        if fine_widths:
+            _pick_looped(s, cols, width, score_out_ref, block_out_ref, topk, dcp, rank)
+            return
         picked_scores, picked_blocks = [], []
         for _ in range(topk):
             best_score = jnp.max(s, axis=0, keepdims=True)
@@ -225,6 +229,73 @@ def _candidates_kernel_t(
 
     for width in widths:
         pl.when(width_now == width)(functools.partial(select, width))
+
+
+def _pick_looped(s, cols, width, score_out_ref, block_out_ref, topk, dcp, rank):
+    """`_candidates_kernel_t`'s picks for `FINE_SCAN_WIDTHS` (r6): each pick
+    stores its row as it goes, ties resolve on f32 column ids (exact below
+    2**24: one f32 min instead of an int32 compare and select), and blocks
+    wider than `_UNROLLED_WIDTH` loop over the picks instead of unrolling
+    them. Same picks as the unrolled loop."""
+    col_ids = cols.astype(jnp.float32)
+
+    def pick(k, s):
+        best_score = jnp.max(s, axis=0, keepdims=True)
+        best = jnp.min(
+            jnp.where(s == best_score, col_ids, float(width)),
+            axis=0,
+            keepdims=True,
+        )
+        score_out_ref[pl.ds(k, 1), :] = best_score
+        block_out_ref[pl.ds(k, 1), :] = jnp.where(
+            best_score > _NEG_INF, best.astype(jnp.int32) * dcp + rank, -1
+        )
+        return jnp.where(col_ids == best, _NEG_INF, s)
+
+    if width <= _UNROLLED_WIDTH:
+        for k in range(topk):
+            s = pick(k, s)
+    else:
+        jax.lax.fori_loop(0, topk, pick, s, unroll=_PICK_UNROLL)
+
+
+# r6 (opt-in, `FINE_SCAN_WIDTHS`): scan widths step by this many
+# pretransposed columns up to `_FINE_WIDTH_LIMIT`, then by 128.
+_FINE_WIDTH_STEP = 32
+_FINE_WIDTH_LIMIT = 256
+# Up to this width a block's picks unroll; past it they loop two at a time:
+# unrolled bodies of every wider width would multiply the kernel's code, and
+# the loop costs ~15% more per column there (AOT bundles: 384 columns 4,468
+# looped, 1,024 columns 12,541 looped vs 10,876 unrolled).
+_UNROLLED_WIDTH = 512
+_PICK_UNROLL = 2
+# Past this width the scan widths step by half of it (bounding the
+# kernel's bodies: 20 at 4,096 columns).
+_COARSE_WIDTH_FROM = 1024
+# Set from TPU_MINIMAX_M3_DCP_FINE_SCAN_WIDTHS by the attention layer.
+FINE_SCAN_WIDTHS = False
+
+
+def _scan_widths(num_cols: int, pretransposed: bool) -> list[int]:
+    """`local_candidates`' scan widths up to `num_cols` with
+    `FINE_SCAN_WIDTHS`. A pick costs per scanned column, so widths step
+    finely: by `_FINE_WIDTH_STEP` columns (sublanes of the pretransposed
+    scores) up to `_FINE_WIDTH_LIMIT`, then by a vreg's 128 lanes (powers of
+    two cost ~25% more scan on average: c64's 146-column blocks scanned
+    256)."""
+    step = _FINE_WIDTH_STEP if pretransposed else _MIN_CANDIDATE_WIDTH
+    widths = list(range(step, min(num_cols, _FINE_WIDTH_LIMIT) + 1, step))
+    # Then steps of 128 up to _COARSE_WIDTH_FROM, and of half of that
+    # past it: one kernel body per width.
+    for lo, hi, step in (
+        (_MIN_CANDIDATE_WIDTH, _COARSE_WIDTH_FROM, _MIN_CANDIDATE_WIDTH),
+        (_COARSE_WIDTH_FROM, num_cols, _COARSE_WIDTH_FROM // 2),
+    ):
+        first = (widths[-1] if widths else 0) + step
+        widths += range(max(first, lo), min(hi, num_cols) + 1, step)
+    if not widths or widths[-1] != num_cols:
+        widths.append(num_cols)
+    return widths
 
 
 # Row blocks of a multiple of this many rows (a vreg's lanes) pick
@@ -301,9 +372,15 @@ def local_candidates(
     # one holding every block its rows see (a rank's blocks below n are among
     # its first ceil(n / dcp) columns). A decode batch scans the full width:
     # its scan is a few us, and picking a width would cost more.
-    widths = [num_cols]
-    while widths[0] > _MIN_CANDIDATE_WIDTH and num_tokens > _MIN_CANDIDATE_TOKENS:
-        widths.insert(0, max(_MIN_CANDIDATE_WIDTH, 1 << (widths[0] - 1).bit_length() - 1))
+    fine_widths = FINE_SCAN_WIDTHS
+    if fine_widths and num_tokens > _MIN_CANDIDATE_TOKENS:
+        widths = _scan_widths(num_cols, pretransposed)
+    else:
+        widths = [num_cols]
+        while widths[0] > _MIN_CANDIDATE_WIDTH and num_tokens > _MIN_CANDIDATE_TOKENS:
+            widths.insert(
+                0, max(_MIN_CANDIDATE_WIDTH, 1 << (widths[0] - 1).bit_length() - 1)
+            )
     num_blocks = (num_tokens + pad) // block_rows
     if len(widths) == 1:
         row_widths = jnp.full((num_blocks,), num_cols, jnp.int32)
@@ -334,7 +411,9 @@ def local_candidates(
             picked_scores, picked_blocks = picked_scores.T, picked_blocks.T
         return picked_scores[:num_tokens], picked_blocks[:num_tokens]
     if transposed:
-        kernel = functools.partial(_candidates_kernel_t, pretransposed=pretransposed)
+        kernel = functools.partial(
+            _candidates_kernel_t, pretransposed=pretransposed, fine_widths=fine_widths
+        )
         pos_spec = pl.BlockSpec((1, block_rows), lambda i: (0, i))
         p = p.T
         out_spec = pl.BlockSpec((topk, block_rows), lambda i: (0, i))

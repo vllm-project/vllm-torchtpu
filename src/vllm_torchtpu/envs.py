@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST: bool = True
     TPU_MINIMAX_M3_DCP_HEADS_ATTEND: bool = False
     TPU_MINIMAX_M3_MSA_UNSTABLE_SORT: bool = False
+    TPU_MINIMAX_M3_DCP_FINE_SCAN_WIDTHS: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -768,6 +769,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unstable sorts (no iota tie-breaker; bit-identical unions). r6.
     "TPU_MINIMAX_M3_MSA_UNSTABLE_SORT": env_bool(
         "TPU_MINIMAX_M3_MSA_UNSTABLE_SORT", default=False
+    ),
+    # MiniMax M3 DCP prefill candidates: scan widths in steps of 32/128
+    # columns instead of powers of two, picks stored per pick and looped past
+    # 512 columns (same picks). r6.
+    "TPU_MINIMAX_M3_DCP_FINE_SCAN_WIDTHS": env_bool(
+        "TPU_MINIMAX_M3_DCP_FINE_SCAN_WIDTHS", default=False
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
