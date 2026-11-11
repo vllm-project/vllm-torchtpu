@@ -41,6 +41,41 @@ from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_cache import QSALayerCach
 from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_call import wholestep_tiles
 
 
+def device_report(trace_dir: str, tag: str) -> None:
+    """Device time per call (TPU:0 XLA modules >= 50 us) and the top ops inside them."""
+    import collections
+    import glob
+    import re
+
+    paths = sorted(glob.glob(f"{trace_dir}/**/*.xplane.pb", recursive=True))
+    if not paths:
+        print(f"{tag} profile: no xplane", flush=True)
+        return
+    prof = jax.profiler.ProfileData.from_file(paths[-1])
+    for plane in prof.planes:
+        if plane.name != "/device:TPU:0":
+            continue
+        mods, ops = [], []
+        for line in plane.lines:
+            if line.name == "XLA Modules":
+                mods = [(e.start_ns, e.duration_ns, e.name) for e in line.events]
+            elif line.name == "XLA Ops":
+                ops = [(e.start_ns, e.duration_ns, e.name) for e in line.events]
+        big = [m for m in mods if m[1] >= 50_000]
+        if not big:
+            print(f"{tag} profile: no module >= 50 us ({len(mods)} modules)", flush=True)
+            return
+        print(f"{tag} device per call median {np.median([m[1] for m in big]) / 1e3:.1f} us "
+              f"({len(big)} calls; module {big[0][2][:60]})", flush=True)
+        tot = collections.Counter()
+        for st, du, _ in big:
+            for o in ops:
+                if st <= o[0] < st + du:
+                    tot[re.sub(r"\.\d+$", "", o[2].split(" = ")[0])[:48]] += o[1]
+        for k, v in tot.most_common(14):
+            print(f"{tag}   {v / len(big) / 1e3:7.1f} us  {k}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--reqs", default="1,2,4", help="requests per call (rows = reqs * T, "
@@ -54,6 +89,7 @@ def main():
     ap.add_argument("--wstd", type=float, default=0.02)
     ap.add_argument("--served-flags", action="store_true",
                     help="shard / union / loop indexer modes (the served whole-step's)")
+    ap.add_argument("--profile", default="", help="trace dir: device time per call + top ops")
     ap.add_argument("--trace-only", action="store_true")
     ap.add_argument("--interpret", action="store_true")
     a = ap.parse_args()
@@ -171,6 +207,14 @@ def main():
                 res, tok, pool = f(*args)
                 jax.block_until_ready((res, tok, pool))
                 ts.append(time.perf_counter() - t0)
+            if a.profile:
+                d = f"{a.profile}/t{T}_r{nreq}"
+                with jax.profiler.trace(d):
+                    for _ in range(5):
+                        args[pi] = pool
+                        res, tok, pool = f(*args)
+                    jax.block_until_ready((res, tok, pool))
+                device_report(d, f"T={T} reqs={nreq} B={B}")
             ts = np.sort(np.asarray(ts) * 1e3)
             print(f"T={T} reqs={nreq} B={B} draft-step call median {np.median(ts):.3f} ms "
                   f"p10 {ts[len(ts) // 10]:.3f}", flush=True)
