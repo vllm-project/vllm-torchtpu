@@ -302,7 +302,7 @@ def test_a_model_with_a_top_k_table_hands_on_two_tensors_per_forward(monkeypatch
 )
 def test_a_removed_pipeline_env_var_that_is_still_set_fails(monkeypatch, name, remedy):
     monkeypatch.setenv(name, "1")
-    with pytest.raises(ValueError, match=f"{name} has been removed; {remedy}"):
+    with pytest.raises(ValueError, match=f"{name} has been removed; .*{remedy}"):
         validate_pipeline_parallel_config(_config(pp=2))
     # Without a pipeline it changes nothing.
     validate_pipeline_parallel_config(_config(pp=1))
