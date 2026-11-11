@@ -220,8 +220,12 @@ def maybe_install_qk_norm_rope_patch(model_config: ModelConfig | None) -> bool |
     until a Qwen3.5 model config is available, so other models, including
     Qwen3-Next, which shares ``Qwen3NextAttention``, never install it. The
     patch is class-wide, so the MTP draft's attention, built after the
-    target's config is seen, takes the fused path too.
+    target's config is seen, takes the fused path too. A config without
+    architectures (the stand-ins callers hand the patch registry) is not a
+    Qwen3.5 config.
     """
+    if getattr(model_config, "architectures", None) is None:
+        return False
     if not qwen3_5_settings.is_qwen3_5(model_config):
         return False
     install_qk_norm_rope_patch()
