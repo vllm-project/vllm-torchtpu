@@ -302,6 +302,7 @@ def test_dispatch_needs_the_sub_flags(kernels, monkeypatch):
     jax.eval_shape(offset_layer)
     assert calls == []
     monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_UNION_OFFSET", "1")
+    jax.clear_caches()  # eval_shape caches the trace of the same callable
     jax.eval_shape(offset_layer)
     assert len(calls) == 1 and calls[0]["kv_head_offset"] == 1 and calls[0]["dcp"] is None
 
@@ -318,5 +319,6 @@ def test_dispatch_needs_the_sub_flags(kernels, monkeypatch):
     jax.eval_shape(dcp_layer)
     assert calls == []
     monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_UNION_DCP", "1")
+    jax.clear_caches()
     jax.eval_shape(dcp_layer)
     assert len(calls) == 1 and calls[0]["return_lse"] and calls[0]["dcp"][1] == 2

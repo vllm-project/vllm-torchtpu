@@ -2182,12 +2182,13 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                     v_scale=v_scale, lean=lean, fast_walk=True, qk16=qk16, run_tables=tables, listed_lines=lines,
                     line_matmul=True,
                 )
-            return union_walk_kernel(
+            result = union_walk_kernel(
                 aligned_query, bits, ubits, usize, vlengths, cache, page_rows, group=group,
                 union_cap=union_cap, kv_tile=kv_tile, ratio=ratio, k_scale=k_scale,
                 v_scale=v_scale, lean=lean, fast_walk=True, walk_runs=walk_runs, qk16=qk16, listed=ids,
                 kv_head_offset=kv_head_offset, return_lse=return_lse,
             )
+            return tuple(result) if return_lse else result
 
         def listing(rows_of_groups):
             if listed == "reference":
@@ -2276,7 +2277,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
     raw, fits = lax.switch(route, branches)
     live = global_lengths > 0
     if return_lse:
-        out, lse = lax.cond(fits, lambda: raw, lambda: tuple(served()[:2]))
+        out, lse = lax.cond(fits, lambda: tuple(raw), lambda: tuple(served()[:2]))
         return jnp.where(live[:, None, None], out, 0), jnp.where(live[:, None], lse, -jnp.inf), cache
 
     def walked():

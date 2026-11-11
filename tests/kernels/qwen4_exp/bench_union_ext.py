@@ -172,7 +172,6 @@ def reference_rows(inputs, host, sample, *, world, rank, offset):
     blocks, lengths, table_row = host
     q = np.asarray(query[sample].astype(jnp.float32), np.float64)
     heads = q.shape[1]
-    cache_np = np.asarray(cache.astype(jnp.float32), np.float64)
     out = np.zeros((len(sample), heads, DIM))
     lse = np.full((len(sample), heads), -np.inf)
     for i, row in enumerate(sample):
@@ -188,8 +187,8 @@ def reference_rows(inputs, host, sample, *, world, rank, offset):
             continue
         phys = table_row[tokens // (PAGE * world)]
         off = tokens % PAGE
-        keys = cache_np[phys, off, 0, 2 * offset]
-        values = cache_np[phys, off, 0, 2 * offset + 1]
+        kv = np.asarray(cache[jnp.asarray(phys), jnp.asarray(off), 0].astype(jnp.float32), np.float64)
+        keys, values = kv[:, 2 * offset], kv[:, 2 * offset + 1]
         for h in range(heads):
             s = keys @ q[i, h] / np.sqrt(DIM)
             p = np.exp(s - s.max())
@@ -211,7 +210,8 @@ def union_stats(inputs, world, rank):
         blocks, lengths, group=128, union_cap=12288, groups_cap=table.shape[1] * PAGE // RATIO, ratio=RATIO
     )
     usize = np.asarray(usize)
-    return float(usize.mean()), int(usize.max())
+    tiles = int(np.sum(-(-usize * RATIO // 1024)))
+    return float(usize.mean()), int(usize.max()), tiles
 
 
 def device_time(fn, args, iters):
@@ -297,9 +297,9 @@ def main():
             print(f"BENCH shape={shape_name} SKIP {type(exc).__name__}: {exc}", flush=True)
             continue
         lengths = host[1]
-        mean_u, max_u = union_stats(inputs, world, 0)
+        mean_u, max_u, walk_tiles = union_stats(inputs, world, 0)
         print(f"SHAPE {shape_name} rows={rows} ctx={int(lengths.min())}-{int(lengths.max())} world={world} "
-              f"union128_mean={mean_u:.0f} union128_max={max_u} fits={max_u <= 12288}", flush=True)
+              f"union128_mean={mean_u:.0f} union128_max={max_u} fits={max_u <= 12288} walk_tiles1024={walk_tiles}", flush=True)
         rng = np.random.default_rng(1)
         sample = np.sort(rng.choice(rows, size=min(args.sample, rows), replace=False))
         refs = {}
