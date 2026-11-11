@@ -355,6 +355,119 @@ def test_padded_tokens_are_dropped_from_routing_tables(
             assert int(np.asarray(whole_visit[1]).item()) == 0
 
 
+def _plan_counts(idx, *, ep, t_local, e_total):
+    """The [ep, e_total] count table the sharded plan exchanges."""
+    flat = np.asarray(idx)
+    return np.stack(
+        [
+            np.bincount(
+                flat[d * t_local : (d + 1) * t_local][
+                    flat[d * t_local : (d + 1) * t_local] < e_total
+                ],
+                minlength=e_total,
+            )
+            for d in range(ep)
+        ]
+    ).astype(np.int32)
+
+
+def _pad_half_of_each_shard(idx, *, ep, t_local, e_total):
+    """Padding rows as the layer marks them: every selection set to e_total.
+
+    The second half of each shard's rows, and all of shard 1's.
+    """
+    idx = np.asarray(idx).copy()
+    for d in range(ep):
+        start = d * t_local if d == 1 else d * t_local + t_local // 2
+        idx[start : (d + 1) * t_local, :] = e_total
+    return jnp.asarray(idx)
+
+
+@pytest.mark.parametrize("ep,t_local,g_local,topk", GEOMETRIES)
+@pytest.mark.parametrize("routing", ["uniform", "skewed", "padded"])
+@pytest.mark.parametrize("sharded", [False, True], ids=["replicated", "sharded"])
+def test_slab_scatter_set_builds_the_add_tables(
+    ep, t_local, g_local, topk, routing, sharded
+):
+    """Both slab tables come out of a scatter-set as they do of an add.
+
+    That is what lets the chip's SparseCore pick the form. Every live row takes
+    at most one pair and the slab starts at zero; the only rows the two forms
+    can disagree on are dropped or past the slab's last row, where the kernel
+    never reads. Padding rows (expert id e_total) go off-shard in both plans,
+    so they stay out of the live rows too.
+    """
+    idx, kwargs = _routing_inputs(
+        ep, t_local, g_local, topk, skew=routing == "skewed", seed=3
+    )
+    e_total = kwargs["e_total"]
+    stride = kwargs["shard_stride"]
+    if routing == "padded":
+        idx = _pad_half_of_each_shard(idx, ep=ep, t_local=t_local, e_total=e_total)
+    whole = host.build_routing_tables(idx, **kwargs)
+    counts = _plan_counts(idx, ep=ep, t_local=t_local, e_total=e_total)
+    # Row-scale bit patterns as the routing exchange carries them: one
+    # positive f32 per token, repeated over its selections.
+    rng = np.random.default_rng(4)
+    tokens = ep * t_local
+    scale_bits = jnp.asarray(
+        np.repeat((rng.random(tokens, dtype=np.float32) + 0.5).view(np.int32), topk)
+    )
+    scale_size = host.act_scale_slab_rows(stride) * host.HIDDEN_LANE_BLOCK
+
+    for me in range(ep):
+        plan = (
+            host.build_routing_tables_sharded(
+                idx,
+                jnp.int32(me),
+                all_gather_rows=lambda _row: jnp.asarray(counts),
+                **kwargs,
+            )
+            if sharded
+            else whole
+        )
+        rows = host.local_slab_rows(plan, me, shard_stride=stride)
+        gather_add, gather_set = (
+            host.shard_token_gather(
+                plan, me, shard_stride=stride, rows=rows, by_set=by_set
+            )
+            for by_set in (False, True)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(gather_set),
+            np.asarray(gather_add),
+            err_msg=f"token-gather table, shard {me}",
+        )
+        scale_add, scale_set = (
+            host.slab_scatter(scale_size, rows, scale_bits, by_set=by_set)
+            for by_set in (False, True)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(scale_set)[:stride],
+            np.asarray(scale_add)[:stride],
+            err_msg=f"activation-scale slab, shard {me}",
+        )
+
+
+@pytest.mark.parametrize(
+    "chip,by_set",
+    [
+        ("TPU_7X", False),  # SparseCore 2 x 16: XLA offloads the add
+        ("TPU_8T", False),  # 2 x 16
+        ("TPU_V6E", False),  # 2 x 16
+        ("TPU_V5P", False),  # 4 x 16: four SparseCores, all full
+        ("TPU_8I", True),  # 1 x 4: the scatter stays on the TensorCore
+        ("TPU_V5E", True),  # no SparseCore at all
+    ],
+)
+def test_slab_scatter_form_follows_the_sparse_core(chip, by_set):
+    """Only a chip with at most 4 SparseCore subcores builds with the set."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    info = pltpu.get_tpu_info_for_chip(getattr(pltpu.ChipVersion, chip), 1)
+    assert host.slab_scatter_by_set(info) is by_set
+
+
 def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():
     """NaN arrival rows stay isolated to padded rows and zero out via row_routes."""
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
