@@ -243,6 +243,37 @@ def _metadata(
     )
 
 
+def _metadata_tables(
+    tables: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    minimum: jax.Array,
+    page_size: int,
+    page_stride: int,
+    non_causal: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``_metadata`` for [G,R,W] block tables at row offset 0, in one program.
+
+    Only the page lookups depend on the table; vmap keeps the request,
+    window and bound computation unbatched, so it runs once for all tables.
+    """
+    metadata, bounds, records = jax.vmap(
+        lambda table: _metadata(
+            table, starts, positions, minimum, page_size, page_stride, 0, non_causal
+        )
+    )(tables)
+    return metadata, bounds[0], records
+
+
+def _fake_metadata_tables(tables, starts, positions, minimum, page_size, *_):
+    columns = (positions.shape[0] + 128 + page_size - 1) // page_size + 1
+    return (
+        tables.new_empty((tables.shape[0], tables.shape[1], 2 + columns)),
+        tables.new_empty((tables.shape[1], 2)),
+        positions.new_empty((tables.shape[0], positions.shape[0])),
+    )
+
+
 def _fake_metadata(table, starts, positions, minimum, page_size, *_):
     columns = (positions.shape[0] + 128 + page_size - 1) // page_size + 1
     return (
@@ -356,6 +387,12 @@ def initialize_csa2_ops() -> None:
     definitions = (
         ("metadata", _metadata, (P(),) * 4 + (None,) * 4, _fake_metadata),
         (
+            "metadata_tables",
+            _metadata_tables,
+            (P(),) * 4 + (None,) * 3,
+            _fake_metadata_tables,
+        ),
+        (
             "prepare_publish_swa",
             _prepare_publish_swa,
             (P(),) * 6 + (None,) * 2,
@@ -426,6 +463,7 @@ def initialize_csa2_ops() -> None:
         "prepare_publish_swa": 4,
         "prepare_publish_swa_banked": 5,
         "metadata": 3,
+        "metadata_tables": 3,
         "publish_main": 2,
         "publish_main_banked": 4,
         "publish_swa_banked": 2,
@@ -637,6 +675,27 @@ def prepare_swa(
         cache.shape[1],
         cache.page_stride,
         cache.row_offset,
+        non_causal,
+    )
+
+
+def prepare_swa_tables(
+    tables: torch.Tensor,
+    starts: torch.Tensor,
+    positions: torch.Tensor,
+    minimum: torch.Tensor,
+    cache: "PagedCacheRows",
+    non_causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``prepare_swa`` for [G,R,W] tables at row offset 0: [G,...] metadata
+    and records, with the table-independent bounds shared."""
+    return _ops["metadata_tables"](
+        tables.int(),
+        starts.int(),
+        positions.int(),
+        minimum.int(),
+        cache.shape[1],
+        cache.page_stride,
         non_causal,
     )
 

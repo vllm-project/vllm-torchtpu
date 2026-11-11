@@ -373,3 +373,64 @@ def test_shift_swa_metadata_matches_direct_offsets(seed):
         assert torch.equal(metadata, want[0])
         assert torch.equal(base[1], want[1])
         assert torch.equal(records, want[2])
+
+
+@pytest.mark.parametrize("seed", range(6))
+@pytest.mark.parametrize("non_causal", [False, True])
+def test_metadata_tables_matches_per_table_metadata(seed, non_causal):
+    """One batched program equals one prepare_swa_metadata call per SWA group."""
+    from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import prepare_swa_metadata
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import csa2_adapter
+
+    page, width, groups = 64, 40, 7
+    rng = np.random.default_rng(seed)
+    requests = int(rng.integers(1, 9))
+    stride = page * 8
+    tables = np.stack(
+        [
+            rng.permutation(np.arange(1, 1 + requests * width)).reshape(requests, width)
+            for _ in range(groups)
+        ]
+    ).astype(np.int32)
+    queries = rng.integers(0, 7, requests)
+    queries[0] = max(queries[0], 1)
+    starts = np.concatenate(([0], np.cumsum(queries))).astype(np.int32)
+    positions = np.zeros(int(starts[-1]) + int(rng.integers(0, 5)), np.int32)
+    for r in range(requests):
+        first = int(rng.integers(0, width * page - 16))
+        positions[starts[r] : starts[r + 1]] = first + np.arange(queries[r])
+    minimum = rng.integers(0, 64, requests).astype(np.int32)
+    args = tuple(jnp.asarray(x) for x in (starts, positions, minimum))
+
+    metadata, bounds, records = csa2_adapter._metadata_tables(
+        jnp.asarray(tables), *args, page, stride, non_causal
+    )
+    for g in range(groups):
+        want = prepare_swa_metadata(
+            jnp.asarray(tables[g]),
+            *args,
+            page_size=page,
+            page_stride=stride,
+            row_offset=0,
+            non_causal=non_causal,
+        )
+        np.testing.assert_array_equal(np.asarray(metadata[g]), np.asarray(want[0]))
+        np.testing.assert_array_equal(np.asarray(bounds), np.asarray(want[1]))
+        np.testing.assert_array_equal(np.asarray(records[g]), np.asarray(want[2]))
+
+
+def test_swa_group_tables_dedupes_by_object_and_shape():
+    a, b = torch.zeros(12, dtype=torch.int32), torch.ones(12, dtype=torch.int32)
+    other = torch.zeros(20, dtype=torch.int32)
+    metadata = {
+        "l0.swa_cache": SimpleNamespace(block_tables=a),
+        "l0.self_attn": SimpleNamespace(block_tables=b),  # not SWA
+        "l1.swa_cache": SimpleNamespace(block_tables=b),
+        "l2.swa_cache": SimpleNamespace(block_tables=a),
+        # Equal values, distinct object: a separate table.
+        "l3.swa_cache": SimpleNamespace(block_tables=torch.zeros(12)),
+        "d0.swa_cache": SimpleNamespace(block_tables=other),  # another shape
+    }
+    tables = v2_attn._swa_group_tables(metadata, (3, 4))
+    assert len(tables) == 3
+    assert tables[0] is a and tables[1] is b
