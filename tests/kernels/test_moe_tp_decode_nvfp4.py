@@ -1961,6 +1961,13 @@ def _load_runtime_modules(monkeypatch):
         def shape(self):
             return self._arr.shape
 
+        @property
+        def ndim(self) -> int:
+            return self._arr.ndim
+
+        def dim(self) -> int:
+            return self._arr.ndim
+
         def to(self, dtype):
             np_dt = np.float32 if dtype == "float32" else self._arr.dtype
             return _FakeTensor(self._arr.astype(np_dt), dtype=str(dtype))
@@ -2088,15 +2095,24 @@ def _load_runtime_modules(monkeypatch):
     )
     vllm_runner_pkg.moe_runner.MoERunner = _MoERunnerBase
     _put_mod("vllm", __path__=[])
-    _put_mod(
-        "vllm.logger",
-        init_logger=lambda _name: SimpleNamespace(
+
+    def _make_fake_logger(_name):
+        seen_warn: set[tuple] = set()
+
+        def _warn_once(msg, *args, **_k):
+            key = (msg, *args)
+            if key not in seen_warn:
+                seen_warn.add(key)
+
+        return SimpleNamespace(
             info=lambda *_a, **_k: None,
             info_once=lambda *_a, **_k: None,
             warning=lambda *_a, **_k: None,
+            warning_once=_warn_once,
             debug=lambda *_a, **_k: None,
-        ),
-    )
+        )
+
+    _put_mod("vllm.logger", init_logger=_make_fake_logger)
     _put_mod("vllm.model_executor", __path__=[])
     _put_mod("vllm.model_executor.layers", __path__=[])
     _put_mod(
@@ -2291,6 +2307,8 @@ def _load_runtime_modules(monkeypatch):
     )
     _put_mod(
         "vllm_torchtpu.layers.adapter.linear_common",
+        KEEP_VLLM_LAYOUT_ATTR="_keep_vllm_layout",
+        WEIGHT_FLIPPED_ATTR="_tpu_weight_flipped",
         quantized_matmul_fp4=lambda *_a, **_k: None,
     )
     _put_mod(
@@ -2305,6 +2323,16 @@ def _load_runtime_modules(monkeypatch):
     )
     _put_mod(
         "vllm_torchtpu.layers.adapter.quantization.fp8",
+        VllmFp8LinearMethodTPU=type("VllmFp8LinearMethodTPU", (), {}),
+        VllmFp8MoEMethodTPU=type(
+            "VllmFp8MoEMethodTPU", (), {"_use_adaptive_fused_moe": False}
+        ),
+        _get_linear_quant_config=lambda _cfg=None: (
+            "float8_e4m3fn",
+            fake_torch.float8_e4m3fn,
+            None,
+            False,
+        ),
         build_excluded_moe_online_fp8_method=lambda *_a, **_k: None,
         resolve_online_fp8=lambda _c, _l, _p, m: m,
     )
@@ -2551,11 +2579,81 @@ def test_nvfp4_prepare_moe_weights_flag_off_vs_on(monkeypatch):
     assert tuple(layer_off_b16.w2_weight.shape) == (2, 256, 3072)
     assert tuple(layer_off_b16.w2_weight_scale.shape) == (2, 16, 1, 6144)
 
-    # 2. Flag ON + op is None at TP8 (H=6144, I_rank=256): clamps per matrix
-    #    (b13=512, b2=256), takes requant_load_kmajor_fp4, and stays unpadded.
+    # 2. Flag ON + op is None + admittable runner at TP8 (H=6144, I_rank=256):
+    #    clamps per matrix (b13=512, b2=256), takes requant_load_kmajor_fp4,
+    #    and stays unpadded.
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+    fake_topo = SimpleNamespace(
+        mesh=SimpleNamespace(size=N_RANKS, axis_names=("ep",)),
+        mesh_index=0,
+    )
+    shared_6144 = (
+        t.zeros(6144, 512, dtype=t.float8_e4m3fn),
+        t.ones(512, dtype=t.float32),
+        t.zeros(256, 6144, dtype=t.float8_e4m3fn),
+        t.ones(6144, dtype=t.float32),
+    )
+    monkeypatch.setattr(
+        rt.adapter.fp8_decode, "_topology", lambda: fake_topo, raising=False
+    )
+    monkeypatch.setattr(
+        rt.adapter.fp8_decode,
+        "_shared_slice",
+        lambda _r, **_k: shared_6144,
+        raising=False,
+    )
+    live_runners: list[Any] = []
+
+    def _bind_runner(
+        layer,
+        method,
+        *,
+        use_grouped_topk: bool = False,
+        num_expert_group: int = 1,
+        topk_group: int = 1,
+    ):
+        VllmMoERunner = rt.moe_runner.VllmMoERunner
+        par = layer.moe_config.moe_parallel_config
+        par.dp_size = 1
+        par.pcp_size = 1
+        par.enable_eplb = False
+        layer.moe_config.is_sequence_parallel = False
+        layer.moe_config.skip_final_all_reduce = False
+        layer.moe_config.experts_per_token = min(8, layer.global_num_experts)
+        layer.quant_method = method
+        layer.e_score_correction_bias = t.zeros(
+            layer.global_num_experts, dtype=t.float32
+        )
+        layer.use_grouped_topk = use_grouped_topk
+        layer.num_expert_group = num_expert_group
+        layer.topk_group = topk_group
+        layer.scoring_func = "sigmoid"
+        layer.renormalize = True
+        layer.custom_routing_function = None
+        layer.routed_scaling_factor = 1.0
+
+        r: Any = VllmMoERunner.__new__(VllmMoERunner)
+        t.nn.Module.__init__(r)
+        r.layer_name = "model.layers.0.mlp"
+        r.routed_experts = layer
+        _set_runner_quant_method(r, method)
+        r.moe_config = layer.moe_config
+        r.gate = object()
+        r.shared_expert_gate = None
+        r.routed_input_transform = None
+        r.routed_output_transform = None
+        r.router = object()
+        r.routed_scaling_factor = 2.5
+        _set_runner_shared_experts(r, "shared_mlp")
+        rt.adapter.fp8_decode.bind_routed_experts_runner(r)
+        live_runners.append(r)
+        return r
+
     monkeypatch.setenv("MOE_REQUANTIZE_BLOCK_SIZE", "512")
     monkeypatch.setenv("USE_MOE_TP_DECODE_NVFP4_KERNEL", "1")
     layer_on_tp8, method_on_tp8 = _make_nvfp4_moe_layer(rt, e=2, h=6144, inter=256)
+    _bind_runner(layer_on_tp8, method_on_tp8)
     _, mode_tp8 = nvfp4._prepare_moe_weights(
         layer_on_tp8,
         layer_on_tp8.w13_weight_scale.data,
@@ -2574,12 +2672,13 @@ def test_nvfp4_prepare_moe_weights_flag_off_vs_on(monkeypatch):
     assert tuple(layer_on_tp8.w2_weight_scale.shape) == (2, 1, 1, 6144)
     assert layer_on_tp8._experts_start is None
 
-    # 3. Flag ON + op is None at EP2xTP4 (H=6144, I_rank=512, use_ep=True,
-    #    ep_size=2, tp_size=4): b13=512, b2=512, unpadded shapes + _experts_start.
+    # 3. Flag ON + op is None + admittable runner at EP2xTP4 (H=6144, I_rank=512,
+    #    use_ep=True, ep_size=2, tp_size=4): b13=512, b2=512, unpadded shapes.
     jax_calls.clear()
     layer_ep2, method_ep2 = _make_nvfp4_moe_layer(
         rt, e=2, h=6144, inter=512, use_ep=True, ep_size=2, ep_rank=1, tp_size=4
     )
+    _bind_runner(layer_ep2, method_ep2)
     _, mode_ep2 = nvfp4._prepare_moe_weights(
         layer_ep2,
         layer_ep2.w13_weight_scale.data,
@@ -2599,19 +2698,48 @@ def test_nvfp4_prepare_moe_weights_flag_off_vs_on(monkeypatch):
     assert _scalar(layer_ep2._experts_start) == 2
 
     # 4. Flag ON when MOE_REQUANTIZE_BLOCK_SIZE is unset: defaults block to 512
-    #    so both TP8 (512/256) and EP2xTP4 (512/512) still prepare unpadded
-    #    block-quantized weights ready for arming.
+    #    for admitted layers so both TP8 (512/256) and EP2xTP4 (512/512) still
+    #    prepare unpadded block-quantized weights ready for arming.
     jax_calls.clear()
     monkeypatch.delenv("MOE_REQUANTIZE_BLOCK_SIZE", raising=False)
     layer_auto_tp8, method_auto_tp8 = _make_nvfp4_moe_layer(rt, e=2, h=6144, inter=256)
+    _bind_runner(layer_auto_tp8, method_auto_tp8)
     method_auto_tp8.process_weights_after_loading(layer_auto_tp8)
     assert jax_calls == [((2, 512, 3072), 512), ((2, 6144, 128), 256)]
     jax_calls.clear()
     layer_auto_ep2, method_auto_ep2 = _make_nvfp4_moe_layer(
         rt, e=2, h=6144, inter=512, use_ep=True, ep_size=2, ep_rank=0, tp_size=4
     )
+    _bind_runner(layer_auto_ep2, method_auto_ep2)
     method_auto_ep2.process_weights_after_loading(layer_auto_ep2)
     assert jax_calls == [((2, 1024, 3072), 512), ((2, 6144, 256), 512)]
+
+    # 4b. Flag ON when MOE_REQUANTIZE_BLOCK_SIZE is unset, but admission refuses
+    #     (TPU_MOE_SKIP_PADDED_TOKENS=0 or grouped top-k): keeps block-16 GMM
+    #     scales without invoking JAX or Torch requantization.
+    jax_calls.clear()
+    torch_calls.clear()
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
+    layer_ref_pad, method_ref_pad = _make_nvfp4_moe_layer(rt, e=2, h=6144, inter=256)
+    _bind_runner(layer_ref_pad, method_ref_pad)
+    method_ref_pad.process_weights_after_loading(layer_ref_pad)
+    assert jax_calls == [] and torch_calls == []
+    assert tuple(layer_ref_pad.w13_weight_scale.shape) == (2, 384, 1, 512)
+    assert tuple(layer_ref_pad.w2_weight_scale.shape) == (2, 16, 1, 6144)
+
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+    layer_ref_grp, method_ref_grp = _make_nvfp4_moe_layer(rt, e=4, h=6144, inter=256)
+    _bind_runner(
+        layer_ref_grp,
+        method_ref_grp,
+        use_grouped_topk=True,
+        num_expert_group=2,
+        topk_group=1,
+    )
+    method_ref_grp.process_weights_after_loading(layer_ref_grp)
+    assert jax_calls == [] and torch_calls == []
+    assert tuple(layer_ref_grp.w13_weight_scale.shape) == (4, 384, 1, 512)
+    assert tuple(layer_ref_grp.w2_weight_scale.shape) == (4, 16, 1, 6144)
 
     # 5. Flag ON + admitted fused-EP W4A8 op (op is not None): does NOT clamp
     #    per matrix so fused-EP retains its uniform rhs_qb=512 layout.
@@ -3961,3 +4089,570 @@ def test_selftest_covers_only_untested_buckets(monkeypatch):
     nvfp4_runner2 = h.make_runner("model.layers.1.mlp", "nvfp4")
     h.arm_in_runner_order(h.Model(nvfp4_runner2))
     assert len(tested) == 1
+
+
+def test_c1_pre_load_admission_preserves_block16_and_bit_exact_fallback(monkeypatch):
+    """C1 regression: refused layers keep checkpoint block-16 scales, log one
+    WARNING, return arm()==0, and match flag-off apply_monolithic bit-for-bit."""
+    import logging
+
+    pm = _load_precedence_modules(monkeypatch)
+    gmm = _ensure_layers_core_pkg(monkeypatch)
+    t = pm.torch
+    nvfp4 = pm.nvfp4
+    adapter = pm.adapter
+    fp8_decode = pm.fp8_decode
+    has_real_torch = _has_real_module("torch") and _has_real_module("vllm")
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    monkeypatch.setenv("USE_MOE_FUSED_EP_KERNEL", "0")
+    monkeypatch.setenv("MOE_FUSED_EP_ENABLE_W4A8", "0")
+    monkeypatch.setenv("TPU_MOE_COLLECTION_CHUNK_SIZE", "0")
+    monkeypatch.setenv("TPU_MOE_TP_DECODE_HBM_OPERANDS", "0")
+    monkeypatch.delenv("MOE_REQUANTIZE_BLOCK_SIZE", raising=False)
+    monkeypatch.delenv("MOE_FUSED_EP_KERNEL_IMPL", raising=False)
+
+    fake_mesh = SimpleNamespace(size=N_RANKS, axis_names=("d",), shape={"d": N_RANKS})
+    topo = SimpleNamespace(mesh=fake_mesh, mesh_index=0)
+    monkeypatch.setattr(fp8_decode, "_topology", lambda: topo)
+    monkeypatch.setattr(fp8_decode, "_check_ranks_agree", lambda _d: None)
+    monkeypatch.setattr(fp8_decode, "_selftest", lambda *_a: [])
+    monkeypatch.setattr(fp8_decode, "_gather", lambda d: [d])
+    monkeypatch.setattr(fp8_decode, "_SELFTESTED_BUCKETS", set())
+    adapter._OPS.clear()
+    monkeypatch.setattr(adapter, "_get_op", lambda _m, _st: "nvfp4_tp_decode_op")
+    monkeypatch.setattr(nvfp4, "prebuild_fused_moe_kernel", lambda **_k: None)
+
+    if has_real_torch:
+        grouped_router = importlib.import_module(
+            "vllm.model_executor.layers.fused_moe.router.grouped_topk_router"
+        )
+        if hasattr(grouped_router.grouped_topk, "__wrapped__"):
+            monkeypatch.setattr(
+                grouped_router, "grouped_topk", grouped_router.grouped_topk.__wrapped__
+            )
+
+    def _to_jnp_u8(x_t) -> jax.Array:
+        if has_real_torch:
+            return jnp.asarray(x_t.detach().cpu().contiguous().view(t.uint8).numpy())
+        return jnp.asarray(x_t._arr, dtype=jnp.uint8)
+
+    def _to_jnp_f32(x_t) -> jax.Array:
+        if has_real_torch:
+            return jnp.asarray(x_t.detach().cpu().float().numpy(), dtype=jnp.float32)
+        return jnp.asarray(x_t._arr, dtype=jnp.float32)
+
+    def _to_jnp_bf16(x_t) -> jax.Array:
+        if has_real_torch:
+            u16 = x_t.detach().cpu().contiguous().view(t.uint16).numpy()
+            return jax.lax.bitcast_convert_type(jnp.asarray(u16), jnp.bfloat16)
+        return jnp.asarray(x_t._arr).astype(jnp.bfloat16)
+
+    def _from_jnp_fp4(arr_fp4: jax.Array):
+        packed = jax.lax.bitcast_convert_type(
+            arr_fp4.reshape(*arr_fp4.shape[:-1], arr_fp4.shape[-1] // 2, 2),
+            jnp.uint8,
+        )
+        u8 = np.asarray(packed, dtype=np.uint8).copy()
+        if has_real_torch:
+            return t.from_numpy(u8).view(t.float4_e2m1fn_x2)
+        return t.Tensor(u8, dtype=t.float4_e2m1fn_x2)
+
+    def _from_jnp_f32(arr_f32: jax.Array):
+        arr = np.asarray(arr_f32, dtype=np.float32).copy()
+        return t.from_numpy(arr) if has_real_torch else t.Tensor(arr, dtype=t.float32)
+
+    def _from_jnp_bf16(arr_bf16: jax.Array):
+        u16 = np.asarray(
+            jax.lax.bitcast_convert_type(arr_bf16.astype(jnp.bfloat16), jnp.uint16),
+            dtype=np.uint16,
+        ).copy()
+        if has_real_torch:
+            return t.from_numpy(u16).view(t.bfloat16)
+        return t.Tensor(np.asarray(arr_bf16, dtype=np.float32), dtype=t.bfloat16)
+
+    def _bits_equal(a, b) -> bool:
+        if a.dtype != b.dtype or tuple(a.shape) != tuple(b.shape):
+            return False
+        if has_real_torch:
+            return bool(
+                t.equal(
+                    a.detach().contiguous().view(t.uint8),
+                    b.detach().contiguous().view(t.uint8),
+                )
+            )
+        return np.array_equal(a._arr, b._arr)
+
+    def _real_load_kmajor_fp4(w_u8):
+        return _from_jnp_fp4(gmm.unpack_fp4_to_e2m1(_to_jnp_u8(w_u8)))
+
+    def _real_requant_load_kmajor_fp4(w_u8, scale_f, block):
+        w_q, s_q = gmm.requant_unpack_kmajor(
+            _to_jnp_u8(w_u8), _to_jnp_f32(scale_f), int(block)
+        )
+        return _from_jnp_fp4(w_q), _from_jnp_f32(s_q)
+
+    def _cpu_w4a16_gmm(
+        *,
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        **_kw,
+    ):
+        x_j = _to_jnp_bf16(hidden_states).astype(jnp.float32)  # [M, H]
+        w1_fp4 = jax.lax.bitcast_convert_type(
+            _to_jnp_u8(w1), jnp.float4_e2m1fn
+        ).reshape(w1.shape[0], w1.shape[1], w1.shape[2] * 2)
+        w2_fp4 = jax.lax.bitcast_convert_type(
+            _to_jnp_u8(w2), jnp.float4_e2m1fn
+        ).reshape(w2.shape[0], w2.shape[1], w2.shape[2] * 2)
+        s1_j = _to_jnp_f32(w1_scale)[:, :, 0, :]  # [E, B1, 2I]
+        s2_j = _to_jnp_f32(w2_scale)[:, :, 0, :]  # [E, B2, H]
+        tw_j = _to_jnp_bf16(topk_weights).astype(jnp.float32)  # [M, K]
+        ti_j = (
+            jnp.asarray(topk_ids.detach().cpu().numpy(), dtype=jnp.int32)
+            if has_real_torch
+            else jnp.asarray(topk_ids._arr, dtype=jnp.int32)
+        )
+        b1 = s1_j.shape[1]
+        b2 = s2_j.shape[1]
+        w1_deq = (
+            w1_fp4.astype(jnp.float32).reshape(
+                w1_fp4.shape[0], b1, w1_fp4.shape[1] // b1, w1_fp4.shape[2]
+            )
+            * s1_j[:, :, None, :]
+        ).reshape(w1_fp4.shape)
+        w2_deq = (
+            w2_fp4.astype(jnp.float32).reshape(
+                w2_fp4.shape[0], b2, w2_fp4.shape[1] // b2, w2_fp4.shape[2]
+            )
+            * s2_j[:, :, None, :]
+        ).reshape(w2_fp4.shape)
+        two_i = w1_deq.shape[2]
+        inter = two_i // 2
+        out = jnp.zeros_like(x_j)
+        for slot in range(ti_j.shape[1]):
+            e_ids = ti_j[:, slot]
+            w1_sel = w1_deq[e_ids]  # [M, H, 2I]
+            proj13 = jnp.einsum("mh,mhn->mn", x_j, w1_sel)
+            gate, up = proj13[:, :inter], proj13[:, inter:]
+            act = jax.nn.silu(gate) * up
+            w2_sel = w2_deq[e_ids]  # [M, I, H]
+            down = jnp.einsum("mi,mih->mh", act, w2_sel)
+            out = out + down * tw_j[:, slot : slot + 1]
+        return _from_jnp_bf16(out.astype(jnp.bfloat16))
+
+    monkeypatch.setattr(nvfp4, "load_kmajor_fp4", _real_load_kmajor_fp4)
+    monkeypatch.setattr(nvfp4, "requant_load_kmajor_fp4", _real_requant_load_kmajor_fp4)
+    monkeypatch.setattr(nvfp4, "fused_moe_gmm", _cpu_w4a16_gmm)
+
+    if not has_real_torch:
+
+        def _fallback_route(layer, _x, router_logits):
+            logits = jnp.asarray(router_logits._arr, dtype=jnp.float32)
+            scores = jax.nn.sigmoid(logits)
+            biased = scores + jnp.asarray(
+                layer.e_score_correction_bias._arr, dtype=jnp.float32
+            )
+            k = int(layer.moe_config.experts_per_token)
+            if layer.use_grouped_topk and layer.num_expert_group > 1:
+                g = int(layer.num_expert_group)
+                kg = int(layer.topk_group)
+                g_scores = jnp.sum(
+                    jax.lax.top_k(biased.reshape(biased.shape[0], g, -1), 2)[0],
+                    axis=-1,
+                )
+                _, g_idx = jax.lax.top_k(g_scores, kg)
+                g_mask = jnp.any(
+                    jax.nn.one_hot(g_idx, g, dtype=jnp.bool_), axis=1
+                )  # [M, G]
+                s_mask = jnp.repeat(g_mask, biased.shape[1] // g, axis=1)
+                masked = jnp.where(s_mask, biased, -jnp.inf)
+                _, idx = jax.lax.top_k(masked, k)
+            else:
+                _, idx = jax.lax.top_k(biased, k)
+            w = jnp.take_along_axis(scores, idx, axis=-1)
+            w = w / jnp.sum(w, axis=-1, keepdims=True)
+            return (
+                t.Tensor(np.asarray(w, dtype=np.float32), dtype=t.bfloat16),
+                t.Tensor(np.asarray(idx, dtype=np.int32), dtype=t.int32),
+            )
+
+        monkeypatch.setattr(nvfp4.moe_routing, "route", _fallback_route)
+
+    e_local, h, inter, fs, topk, m_tok = 16, 2048, 256, 128, 4, 8
+    rng = np.random.default_rng(12345)
+    raw_w13 = rng.integers(0, 256, (e_local, 2 * inter, h // 2), dtype=np.uint8)
+    raw_w2 = rng.integers(0, 256, (e_local, h, inter // 2), dtype=np.uint8)
+    # Non-uniform block-16 scales so block-512 requantization changes weights/scales.
+    raw_s13_f32 = rng.uniform(0.05, 1.75, (e_local, 2 * inter, h // 16)).astype(
+        np.float32
+    )
+    raw_s2_f32 = rng.uniform(0.05, 1.75, (e_local, h, inter // 16)).astype(np.float32)
+    raw_g13 = rng.uniform(0.5, 1.5, (e_local, 2)).astype(np.float32)
+    raw_g2 = rng.uniform(0.5, 1.5, (e_local,)).astype(np.float32)
+    raw_bias = rng.uniform(-0.15, 0.15, (e_local,)).astype(np.float32)
+    raw_x = rng.standard_normal((m_tok, h)).astype(np.float32) * 0.5
+    raw_logits = rng.standard_normal((m_tok, e_local)).astype(np.float32)
+
+    x_in = _from_jnp_bf16(jnp.asarray(raw_x, dtype=jnp.bfloat16))
+    logits_in = _from_jnp_f32(jnp.asarray(raw_logits, dtype=jnp.float32))
+
+    linear_mod = importlib.import_module("vllm_torchtpu.layers.adapter.linear_common")
+    flipped_attr = linear_mod.WEIGHT_FLIPPED_ATTR
+
+    class _Runner(pm.moe_runner.VllmMoERunner):
+        @property
+        def shared_experts(self):
+            return self._shared_experts
+
+    class _Model(t.nn.Module):
+        def __init__(self, *runners):
+            super().__init__()
+            self._runners = list(runners)
+
+        def modules(self):
+            return [self, *self._runners]
+
+    def _make_shared_mlp(*, unflipped_online_fp8: bool = False):
+        if unflipped_online_fp8 and has_real_torch:
+            online_mod = importlib.import_module(
+                "vllm_torchtpu.layers.adapter.quantization.online_fp8"
+            )
+            policy = online_mod.OnlineFp8Policy(
+                targets=["*"], exclude=[], weight_scheme="per_channel"
+            )
+
+            class _OnlineLin(t.nn.Module):
+                def __init__(self, k_in: int, n_out: int, *, reduce_results=None):
+                    super().__init__()
+                    cfg = pm.fp8_mod.VllmFp8Config(
+                        is_checkpoint_fp8_serialized=False,
+                        activation_scheme="dynamic",
+                        weight_block_size=None,
+                    )
+                    qm = pm.fp8_mod.VllmFp8LinearMethodTPU(cfg, prefix="shared")
+                    qm.online_fp8 = True
+                    qm.online_fp8_policy = policy
+                    self.quant_method = qm
+                    self._tpu_online_fp8_processed = False
+                    self.weight = t.nn.Parameter(
+                        t.randn(n_out, k_in, dtype=t.bfloat16) * 0.05,
+                        requires_grad=False,
+                    )
+                    self.bias = None
+                    if reduce_results is not None:
+                        self.reduce_results = reduce_results
+
+            return SimpleNamespace(
+                gate_up_proj=_OnlineLin(h, 2 * fs),
+                down_proj=_OnlineLin(fs, h, reduce_results=False),
+            )
+
+        lin_qm = pm.fp8_mod.VllmFp8LinearMethodTPU.__new__(
+            pm.fp8_mod.VllmFp8LinearMethodTPU
+        )
+        if unflipped_online_fp8:
+            lin_qm.quant_config = SimpleNamespace(is_checkpoint_fp8_serialized=False)
+            lin_qm.online_fp8 = True
+            lin_qm.online_fp8_policy = SimpleNamespace(weight_scheme="per_channel")
+            return SimpleNamespace(
+                gate_up_proj=SimpleNamespace(
+                    weight=t.zeros(2 * fs, h, dtype=t.bfloat16),
+                    bias=None,
+                    quant_method=lin_qm,
+                ),
+                down_proj=SimpleNamespace(
+                    weight=t.zeros(h, fs, dtype=t.bfloat16),
+                    bias=None,
+                    reduce_results=False,
+                    quant_method=lin_qm,
+                ),
+            )
+        return SimpleNamespace(
+            gate_up_proj=SimpleNamespace(
+                weight=t.zeros(h, 2 * fs, dtype=t.float8_e4m3fn),
+                weight_scale=t.ones(2 * fs, dtype=t.float32),
+                bias=None,
+                quant_method=lin_qm,
+                **{flipped_attr: True},
+            ),
+            down_proj=SimpleNamespace(
+                weight=t.zeros(fs, h, dtype=t.float8_e4m3fn),
+                weight_scale=t.ones(h, dtype=t.float32),
+                bias=None,
+                reduce_results=False,
+                quant_method=lin_qm,
+                **{flipped_attr: True},
+            ),
+        )
+
+    def _build_fresh_runner(
+        name: str,
+        *,
+        use_grouped_topk: bool = False,
+        unflipped_online_fp8: bool = False,
+    ):
+        par = SimpleNamespace(
+            use_ep=False,
+            ep_size=1,
+            ep_rank=0,
+            tp_size=N_RANKS,
+            dp_size=1,
+            pcp_size=1,
+            enable_eplb=False,
+        )
+        cfg = SimpleNamespace(
+            experts_per_token=topk,
+            is_sequence_parallel=False,
+            skip_final_all_reduce=False,
+            ep_size=1,
+            ep_rank=0,
+            tp_size=N_RANKS,
+            hidden_dim=h,
+            moe_parallel_config=par,
+        )
+        layer = _new_routed_experts(pm, nvfp4.RoutedExperts)
+        layer.activation = "silu"
+        layer.expert_placement_strategy = "linear"
+        layer.global_num_experts = e_local
+        layer.moe_config = cfg
+        layer.use_grouped_topk = use_grouped_topk
+        layer.num_expert_group = 4 if use_grouped_topk else 1
+        layer.topk_group = 2 if use_grouped_topk else 1
+        layer.scoring_func = "sigmoid"
+        layer.renormalize = True
+        layer.custom_routing_function = None
+        layer.routed_scaling_factor = 1.0
+        layer.e_score_correction_bias = _from_jnp_f32(jnp.asarray(raw_bias))
+
+        if has_real_torch:
+            w13_t = t.from_numpy(raw_w13.copy())
+            w2_t = t.from_numpy(raw_w2.copy())
+            s13_t = t.from_numpy(raw_s13_f32.copy()).to(t.float8_e4m3fn)
+            s2_t = t.from_numpy(raw_s2_f32.copy()).to(t.float8_e4m3fn)
+            g13_t = t.from_numpy(raw_g13.copy())
+            g2_t = t.from_numpy(raw_g2.copy())
+        else:
+            w13_t = t.Tensor(raw_w13.copy(), dtype=t.uint8)
+            w2_t = t.Tensor(raw_w2.copy(), dtype=t.uint8)
+            s13_f8 = np.asarray(
+                jnp.asarray(raw_s13_f32).astype(jnp.float8_e4m3fn).astype(jnp.float32)
+            )
+            s2_f8 = np.asarray(
+                jnp.asarray(raw_s2_f32).astype(jnp.float8_e4m3fn).astype(jnp.float32)
+            )
+            s13_t = t.Tensor(s13_f8, dtype=t.float8_e4m3fn)
+            s2_t = t.Tensor(s2_f8, dtype=t.float8_e4m3fn)
+            g13_t = t.Tensor(raw_g13.copy(), dtype=t.float32)
+            g2_t = t.Tensor(raw_g2.copy(), dtype=t.float32)
+
+        layer.w13_weight = t.nn.Parameter(w13_t, requires_grad=False)
+        layer.w2_weight = t.nn.Parameter(w2_t, requires_grad=False)
+        layer.w13_weight_scale = t.nn.Parameter(s13_t, requires_grad=False)
+        layer.w2_weight_scale = t.nn.Parameter(s2_t, requires_grad=False)
+        layer.w13_weight_scale_2 = t.nn.Parameter(g13_t, requires_grad=False)
+        layer.w2_weight_scale_2 = t.nn.Parameter(g2_t, requires_grad=False)
+
+        qm = nvfp4.VllmNvfp4MoEMethod(
+            SimpleNamespace(group_size=16),
+            SimpleNamespace(has_bias=False, is_act_and_mul=True),
+        )
+        layer.quant_method = qm
+
+        r: Any = _Runner.__new__(_Runner)
+        t.nn.Module.__init__(r)
+        r.layer_name = name
+        r.routed_experts = layer
+        _set_runner_quant_method(r, qm)
+        r.moe_config = cfg
+        r.gate = object()
+        r.shared_expert_gate = None
+        r.routed_input_transform = None
+        r.routed_output_transform = None
+        r.router = object()
+        r.routed_scaling_factor = ROUTED_SCALE
+        r._shared_experts = SimpleNamespace(
+            _layer=_make_shared_mlp(unflipped_online_fp8=unflipped_online_fp8)
+        )
+        fp8_decode.bind_routed_experts_runner(r)
+        return r
+
+    def _run_load_capturing_warnings(*runners):
+        warnings_logged: list[str] = []
+        if has_real_torch:
+            vllm_logger_mod = importlib.import_module("vllm.logger")
+            vllm_logger_mod._print_warning_once.cache_clear()
+
+            class _ListHandler(logging.Handler):
+                def emit(self, record: logging.LogRecord) -> None:
+                    if record.levelno >= logging.WARNING:
+                        warnings_logged.append(record.getMessage())
+
+            root_vllm = logging.getLogger("vllm")
+            handler = _ListHandler(level=logging.WARNING)
+            root_vllm.addHandler(handler)
+            try:
+                for r in runners:
+                    r.routed_experts.quant_method.process_weights_after_loading(
+                        r.routed_experts
+                    )
+            finally:
+                root_vllm.removeHandler(handler)
+        else:
+            seen_keys: set[tuple] = set()
+
+            def _capture_warn_once(msg, *args, **_k):
+                key = (msg, *args)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    warnings_logged.append(msg % args if args else str(msg))
+
+            orig = nvfp4.logger.warning_once
+            nvfp4.logger.warning_once = _capture_warn_once
+            try:
+                for r in runners:
+                    r.routed_experts.quant_method.process_weights_after_loading(
+                        r.routed_experts
+                    )
+            finally:
+                nvfp4.logger.warning_once = orig
+        return warnings_logged
+
+    def _sync_pad_state():
+        pad_state = (
+            SimpleNamespace(local_padding_mask=t.zeros(64, dtype=t.uint8))
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS
+            else None
+        )
+        monkeypatch.setattr(fp8_decode.token_padding, "_padding_state", pad_state)
+
+    # 0. Flag-OFF baselines (ungrouped & grouped): checkpoint block-16 scales
+    #    and exact reference apply_monolithic outputs.
+    monkeypatch.setenv("USE_MOE_TP_DECODE_NVFP4_KERNEL", "0")
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
+    ref_ungrp = _build_fresh_runner("model.layers.0.mlp", use_grouped_topk=False)
+    assert _run_load_capturing_warnings(ref_ungrp) == []
+    out_off_ungrp = ref_ungrp.routed_experts.quant_method.apply_monolithic(
+        ref_ungrp.routed_experts, x_in, logits_in
+    )
+
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+    ref_grp = _build_fresh_runner("model.layers.0.mlp", use_grouped_topk=True)
+    assert _run_load_capturing_warnings(ref_grp) == []
+    out_off_grp = ref_grp.routed_experts.quant_method.apply_monolithic(
+        ref_grp.routed_experts, x_in, logits_in
+    )
+
+    # 1. Refusal: USE_MOE_TP_DECODE_NVFP4_KERNEL=1 + TPU_MOE_SKIP_PADDED_TOKENS=0.
+    #    Across 2 layers: block-16 scales survive, ONE warning is logged with
+    #    the refusal reason, arm() == 0, and fallback output is bit-identical.
+    monkeypatch.setenv("USE_MOE_TP_DECODE_NVFP4_KERNEL", "1")
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
+    _sync_pad_state()
+    r_pad0 = _build_fresh_runner("model.layers.0.mlp", use_grouped_topk=False)
+    r_pad1 = _build_fresh_runner("model.layers.1.mlp", use_grouped_topk=False)
+    warn_pad = _run_load_capturing_warnings(r_pad0, r_pad1)
+    assert len(warn_pad) == 1
+    assert "TPU_MOE_SKIP_PADDED_TOKENS" in warn_pad[0]
+    for r in (r_pad0, r_pad1):
+        lyr = r.routed_experts
+        assert tuple(lyr.w13_weight_scale.shape) == (e_local, h // 16, 1, 2 * inter)
+        assert tuple(lyr.w2_weight_scale.shape) == (e_local, inter // 16, 1, h)
+        assert _bits_equal(lyr.w13_weight, ref_ungrp.routed_experts.w13_weight)
+        assert _bits_equal(lyr.w2_weight, ref_ungrp.routed_experts.w2_weight)
+        assert _bits_equal(
+            lyr.w13_weight_scale, ref_ungrp.routed_experts.w13_weight_scale
+        )
+        assert _bits_equal(
+            lyr.w2_weight_scale, ref_ungrp.routed_experts.w2_weight_scale
+        )
+    assert adapter.arm(_Model(r_pad0, r_pad1)) == 0
+    assert not adapter.moe_tp_decode_nvfp4_supported(r_pad0._quant_method)
+    out_pad = r_pad0.routed_experts.quant_method.apply_monolithic(
+        r_pad0.routed_experts, x_in, logits_in
+    )
+    assert _bits_equal(out_pad, out_off_ungrp)
+
+    # 2. Refusal: USE_MOE_TP_DECODE_NVFP4_KERNEL=1 + TPU_MOE_SKIP_PADDED_TOKENS=1
+    #    + use_grouped_topk=True. Block-16 scales survive, ONE warning is logged
+    #    with the routing refusal reason, arm() == 0, and fallback is bit-exact.
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+    _sync_pad_state()
+    r_grp0 = _build_fresh_runner("model.layers.0.mlp", use_grouped_topk=True)
+    r_grp1 = _build_fresh_runner("model.layers.1.mlp", use_grouped_topk=True)
+    warn_grp = _run_load_capturing_warnings(r_grp0, r_grp1)
+    assert len(warn_grp) == 1
+    assert "routing is not sigmoid + renormalized ungrouped top-k" in warn_grp[0]
+    for r in (r_grp0, r_grp1):
+        lyr = r.routed_experts
+        assert tuple(lyr.w13_weight_scale.shape) == (e_local, h // 16, 1, 2 * inter)
+        assert tuple(lyr.w2_weight_scale.shape) == (e_local, inter // 16, 1, h)
+        assert _bits_equal(
+            lyr.w13_weight_scale, ref_grp.routed_experts.w13_weight_scale
+        )
+        assert _bits_equal(lyr.w2_weight_scale, ref_grp.routed_experts.w2_weight_scale)
+    assert adapter.arm(_Model(r_grp0, r_grp1)) == 0
+    assert not adapter.moe_tp_decode_nvfp4_supported(r_grp0._quant_method)
+    out_grp = r_grp0.routed_experts.quant_method.apply_monolithic(
+        r_grp0.routed_experts, x_in, logits_in
+    )
+    assert _bits_equal(out_grp, out_off_grp)
+
+    # 3. Positive control: admittable layer (both pre-flipped FP8 shared expert
+    #    and unflipped online_fp8 BF16 shared expert processed AFTER routed
+    #    experts, matching MoERunner's submodule order). Commits block-512
+    #    scales, logs no refusal warning, and arms (arm() == 1).
+    r_pos = _build_fresh_runner("model.layers.0.mlp", use_grouped_topk=False)
+    assert _run_load_capturing_warnings(r_pos) == []
+    assert tuple(r_pos.routed_experts.w13_weight_scale.shape) == (
+        e_local,
+        h // 512,
+        1,
+        2 * inter,
+    )
+    assert tuple(r_pos.routed_experts.w2_weight_scale.shape) == (
+        e_local,
+        inter // 256,
+        1,
+        h,
+    )
+    # Sanity check: block-512 requantized weights genuinely alter GMM output
+    # prior to arming, proving the bit-exactness assertions above are sensitive.
+    out_b512_gmm = r_pos.routed_experts.quant_method.apply_monolithic(
+        r_pos.routed_experts, x_in, logits_in
+    )
+    assert not _bits_equal(out_b512_gmm, out_off_ungrp)
+    assert adapter.arm(_Model(r_pos)) == 1
+    assert adapter.moe_tp_decode_nvfp4_supported(r_pos._quant_method) is True
+
+    # Also verify unflipped online_fp8 shared expert processed after routed_experts.
+    r_online = _build_fresh_runner(
+        "model.layers.1.mlp", use_grouped_topk=False, unflipped_online_fp8=True
+    )
+    assert _run_load_capturing_warnings(r_online) == []
+    assert tuple(r_online.routed_experts.w13_weight_scale.shape) == (
+        e_local,
+        h // 512,
+        1,
+        2 * inter,
+    )
+    s_mlp = r_online._shared_experts._layer
+    if has_real_torch:
+        s_mlp.gate_up_proj.quant_method.process_weights_after_loading(
+            s_mlp.gate_up_proj
+        )
+        s_mlp.down_proj.quant_method.process_weights_after_loading(s_mlp.down_proj)
+    else:
+        s_mlp.gate_up_proj.weight = t.zeros(h, 2 * fs, dtype=t.float8_e4m3fn)
+        s_mlp.gate_up_proj.weight_scale = t.ones(2 * fs, dtype=t.float32)
+        setattr(s_mlp.gate_up_proj, flipped_attr, True)
+        s_mlp.down_proj.weight = t.zeros(fs, h, dtype=t.float8_e4m3fn)
+        s_mlp.down_proj.weight_scale = t.ones(h, dtype=t.float32)
+        setattr(s_mlp.down_proj, flipped_attr, True)
+    assert adapter.arm(_Model(r_online)) == 1
+    assert adapter.moe_tp_decode_nvfp4_supported(r_online._quant_method) is True
