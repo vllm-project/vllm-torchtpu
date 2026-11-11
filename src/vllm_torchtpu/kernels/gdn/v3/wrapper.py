@@ -29,6 +29,7 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     metadata,
     tiling,
     vmem_ldst,
+    window_tile,
 )
 from vllm_torchtpu.logger import init_logger
 
@@ -51,6 +52,7 @@ def inner_kernel(
     weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
+    window_state_scratch_ref: jax.Ref | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -77,6 +79,8 @@ def inner_kernel(
             convolution carry.
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
+        window_state_scratch_ref: Optional VMEM scratch reference for per-head
+            verify-window recurrent state carry.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
@@ -85,6 +89,8 @@ def inner_kernel(
 
     if p_id is None:
         p_id = pl.program_id(0)
+
+    use_window = window_state_scratch_ref is not None and cfg.use_window_tile
 
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -95,6 +101,7 @@ def inner_kernel(
         carry_conv_scratch_ref=carry_conv_scratch_ref,
         carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
         cfg=cfg,
+        load_recurrent=not use_window,
     )
 
     # Step 1: Conv1D.
@@ -141,6 +148,28 @@ def inner_kernel(
         padding_size = cfg.aligned_num_v_heads - cfg.num_v_heads
         a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
         dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
+
+    if use_window:
+        qkv_slot_ref[...] = qkv_out_compact.astype(qkv_slot_ref.dtype)
+        window_tile.run(
+            qkv_slot_ref,
+            b_slot_ref,
+            a_slot_ref,
+            recurrent_in_slot_ref,
+            out_slot_ref,
+            recurrent_out_slot_ref,
+            metadata_ref,
+            a_log,
+            dt_bias,
+            window_state_scratch_ref,
+            cfg=cfg,
+            p_id=p_id,
+        )
+        return
+
+    if prev_recurrent is None:
+        msg = "prev_recurrent must be loaded when window_tile is off."
+        raise ValueError(msg)
 
     # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
@@ -223,6 +252,7 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    window_state_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -266,6 +296,7 @@ def outer_kernel(
         weights_ref,
         carry_conv_scratch_ref,
         carry_recurrent_scratch_ref,
+        window_state_scratch_ref,
     )
     state_allocs = (conv_in_alloc, recurrent_in_alloc)
     out_allocs = (out_alloc, conv_out_alloc, recurrent_out_alloc)

@@ -170,6 +170,17 @@ class GDNConfig:
         return self.chunk_size == 1 or self.window_size > 1
 
     @property
+    def use_window_tile(self) -> bool:
+        """Whether BATCHED verify windows run per-head window_tile recurrence."""
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return (
+            self.mode == GDNMode.BATCHED
+            and self.window_size > 1
+            and self.kq_head_dim == num_lanes
+            and self.v_head_dim == num_lanes
+        )
+
+    @property
     def v_dim_size(self) -> int:
         return self.num_v_heads * self.v_head_dim
 
@@ -258,7 +269,12 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
+        window_state_scratch = (
+            pltpu.VMEM(recurrent_shape, jnp.float32) if self.use_window_tile else None
+        )
+
         return dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
+            window_state_scratch_ref=window_state_scratch,
         )
