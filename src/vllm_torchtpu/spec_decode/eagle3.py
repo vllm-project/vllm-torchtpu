@@ -862,6 +862,15 @@ class Eagle3Proposer:
                 self._mtp_fused_loop_warm = True
             return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
 
+    def _mk_draft_count(self, key: str) -> None:
+        """VLLM_TPU_MK_DRAFT: per-path step-0 count, logged with the MK step mix."""
+        if not envs.VLLM_TPU_MK_DRAFT:
+            return
+        count = getattr(getattr(getattr(self.draft_model, "model", None), "mk_draft", None),
+                        "count", None)
+        if count is not None:
+            count(key, 1)
+
     def _mk_draft_step0_ready(self, chunk: DraftChunkInputs, num_chunks: int) -> bool:
         """VLLM_TPU_MK_DRAFT step 0: the MK draft is attached and this step's target
         forward ran the whole-step megakernel (a uniform verify step: 4 rows per
@@ -1635,7 +1644,9 @@ class Eagle3Proposer:
             rejected_np_per_chunk.append(
                 None if isinstance(num_rejected, torch.Tensor) else num_rejected
             )
-            if self._mk_draft_step0_ready(chunk, len(chunks)):
+            mk0 = self._mk_draft_step0_ready(chunk, len(chunks))
+            self._mk_draft_count("mk_draft_step0" if mk0 else "stock_step0")
+            if mk0:
                 # VLLM_TPU_MK_DRAFT: step 0 + carry + token 0 as one kernel call.
                 hidden_carry, fused_token0, positions_carry = self._run_mk_draft_step0(
                     chunk, input_ids, positions, target_hidden_states, last_token_indices,
