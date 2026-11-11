@@ -64,13 +64,15 @@ _MIN_CANDIDATE_WIDTH = 128
 _MIN_CANDIDATE_TOKENS = 1024
 
 # Up to this many tokens (`msa_attention.SMALL_BATCH_TOKENS` is the non-DCP
-# limit) an 8-token verify group fills an attention tile alone
-# (no padding rows, half the page union of a 16-token tile). Larger decode
-# batches keep 16-token tiles: at 48-64 tiles of 8 the per-tile work list and
-# kernel steps cost more than the smaller unions save (c48 b39 decode twin
-# 108.4 -> 116.7 ms per step, c64 DCP8 b57 147.8 -> 191.1 ms; j-82660a13 vs
-# j-8a29ceb0, j-c0fd0e40 vs j-11d1908c).
-DCP_SMALL_BATCH_TOKENS = 128
+# limit; every decode bucket) an 8-token verify group fills an attention tile
+# alone: a 16-token tile holds two requests' disjoint page unions, so its
+# groups score twice the rows over the same pages (AOT, 4-bit 16-page step:
+# ~1,450 bundles at 8 tokens vs ~2,240 at 16). With the twins' selections
+# dispersed as served (int4 index-scale fill), c48 b37 decode attention was
+# 223 us per layer in 16-token tiles (j-52ca6e4b). Before that fill, the
+# twins' tiles were nearly empty and 8-token ones lost on per-tile cost
+# (c48 b39 108.4 -> 116.7 ms per step, j-82660a13 vs j-8a29ceb0).
+DCP_SMALL_BATCH_TOKENS = 1024
 # Pages per kernel step of those 8-token tiles: a tile's 128 query rows keep
 # a 32-page score tile the size of a 16-token tile's 16-page one, and a
 # twin decode tile's union spans ~4 groups of 16 pages (c16 b6: ~1.25 us per
