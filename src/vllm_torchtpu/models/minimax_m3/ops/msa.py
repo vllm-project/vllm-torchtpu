@@ -430,6 +430,7 @@ def gather_group_heads(
     group: Any,
     dcp: int,
     kv_head_replicas: int,
+    dcp_rank: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The DCP group's query heads ``[T, dcp * q_heads, D]``
     (`gather_query_heads`) and its KV heads' ``k``/``v``/``index_q``
@@ -440,7 +441,7 @@ def gather_group_heads(
     rank's 11 heads at DCP 8) can run while the scoring op computes instead
     of before it, and needs no strided split of a combined gather."""
     return gather_query_heads(q, group), *gather_group_kv(
-        k, v, index_q, group, dcp, kv_head_replicas
+        k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
     )
 
 
@@ -451,13 +452,29 @@ def gather_group_kv(
     group: Any,
     dcp: int,
     kv_head_replicas: int,
+    dcp_rank: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The ``k``/``v``/``index_q [T, dcp // kv_head_replicas, D]`` of the DCP
-    group's KV heads (rank ``i`` holds KV head ``i // kv_head_replicas``, so
-    every ``kv_head_replicas``-th rank supplies the next head)."""
+    group's KV heads. Rank ``i = h * kv_head_replicas + j`` holds KV head
+    ``h``, as its other replicas do, so it sends only part ``j`` of the
+    tokens: a replica-split all-gather moves ``1 / kv_head_replicas`` of the
+    bytes of gathering every rank's rows and keeping one replica's (c64
+    decode twin j-c4bfc418: 17.3 us per layer for ``bf16[4096, 3, 128]``)."""
     num_tokens, _, head_dim = k.shape
-    per_rank = group.all_gather(torch.cat([k, v, index_q], dim=1).contiguous(), dim=1)
-    per_head = per_rank.view(num_tokens, dcp, 3, head_dim)[:, ::kv_head_replicas]
+    rows = torch.cat([k, v, index_q], dim=1)  # [T, 3, D]
+    reps = kv_head_replicas
+    if num_tokens % reps:
+        per_rank = group.all_gather(rows.contiguous(), dim=1)
+        per_head = per_rank.view(num_tokens, dcp, 3, head_dim)[:, ::reps]
+        return tuple(per_head[:, :, i].contiguous() for i in range(3))
+    part = num_tokens // reps
+    mine = torch.index_select(rows.view(reps, part, 3, head_dim), 0, dcp_rank % reps)
+    parts = group.all_gather(mine.contiguous(), dim=0)  # [dcp, part, 3, D]
+    per_head = (
+        parts.view(dcp // reps, reps, part, 3, head_dim)
+        .permute(1, 2, 0, 3, 4)
+        .reshape(num_tokens, dcp // reps, 3, head_dim)
+    )
     return tuple(per_head[:, :, i].contiguous() for i in range(3))
 
 
@@ -617,7 +634,7 @@ def get_msa_dcp_op(
             q_all = gather_query_heads(q, group)
         else:
             q_all, k, v, index_q = gather_group_heads(
-                q, k, v, index_q, group, dcp, kv_head_replicas
+                q, k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
             )
         new_kv_cache, new_index_cache, candidates = score_op(
             k,
@@ -780,7 +797,9 @@ def _get_msa_dcp_fp4_op(
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
         if kv_heads > 1:
-            k, v, index_q = gather_group_kv(k, v, index_q, group, dcp, kv_head_replicas)
+            k, v, index_q = gather_group_kv(
+                k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
+            )
         new_kv_cache, new_index_cache, new_scale_cache, candidates, q = score_op(
             k,
             v,
