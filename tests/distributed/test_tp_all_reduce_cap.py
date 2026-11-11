@@ -22,7 +22,7 @@ HIDDEN, N = 6144, 8
 TPU7X_VMEM = 64 << 20
 
 
-@pytest.mark.parametrize("rows", [8, 16, 24, 40, 48, 128, 256, 512])
+@pytest.mark.parametrize("rows", [8, 16, 24, 40, 48, 64, 96, 128, 256])
 def test_decode_buckets_fit_the_cap(rows):
     padded, m, w = kernel.view_shape(rows, HIDDEN, N)
     assert padded == rows  # multiples of 8 rows need no padding at hidden 6144
@@ -34,13 +34,21 @@ def test_cap_vmem_request_fits():
     assert 4 * kernel.MAX_VIEW_BYTES + (1 << 20) < TPU7X_VMEM
 
 
+def test_cap_value_for_128_rows():
+    # TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES=1572864 admits the 128-row bucket
+    # of hidden 6144 and nothing larger.
+    assert kernel.view_bytes(128, HIDDEN, N) == 1572864
+    assert kernel.view_bytes(136, HIDDEN, N) > 1572864
+
+
 def test_selftest_rows():
     par = pytest.importorskip("vllm_torchtpu.distributed.pallas_all_reduce")
     assert par._selftest_rows(N, HIDDEN, 524288) == par._SELFTEST_ROWS
     assert par._selftest_rows(N, HIDDEN, 0) == par._SELFTEST_ROWS
     rows = par._selftest_rows(N, HIDDEN, kernel.MAX_VIEW_BYTES)
+    assert par._selftest_rows(N, HIDDEN, 1572864) == par._SELFTEST_ROWS + (128,)
     assert rows[:-1] == par._SELFTEST_ROWS
     big = rows[-1]
-    assert big % 8 == 0 and big >= 512
+    assert big % 8 == 0 and big >= 256
     assert kernel.view_bytes(big, HIDDEN, N) <= kernel.MAX_VIEW_BYTES
     assert kernel.view_bytes(big + 8, HIDDEN, N) > kernel.MAX_VIEW_BYTES
