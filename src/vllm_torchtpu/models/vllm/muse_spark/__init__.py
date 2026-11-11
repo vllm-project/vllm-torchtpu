@@ -13,10 +13,12 @@
 # limitations under the License.
 """Muse Spark Open models for the TorchTPU vLLM plugin."""
 
+from .dspark import MuseSparkDSparkModel
 from .model import MuseSparkForConditionalGeneration
 from .text_model import MuseSparkForCausalLM, MuseSparkTextModel
 
 __all__ = [
+    "MuseSparkDSparkModel",
     "MuseSparkForCausalLM",
     "MuseSparkForConditionalGeneration",
     "MuseSparkTextModel",
