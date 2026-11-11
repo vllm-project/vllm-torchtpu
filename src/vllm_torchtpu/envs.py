@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_LSE_R6: bool = False
     TPU_MINIMAX_M3_DSPARK_SPLIT_FC: bool = False
     TPU_DRAFT_HIDE_NOOP_KV_CONNECTOR: bool = False
+    TPU_RAIDEN_HOST_ORDER_DMA: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -818,6 +819,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DRAFT_HIDE_NOOP_KV_CONNECTOR": env_bool(
         "TPU_DRAFT_HIDE_NOOP_KV_CONNECTOR", default=False
     ),
+    # Raiden KV offload: local loads in host-block order (and the load's fresh
+    # device blocks permuted to match), stores in device-block order, so
+    # consecutive runs move as one copy per KV array. r6. The block pool's
+    # consecutive-run allocation (`contiguous_alloc`) is the connector's
+    # extra_config key contiguous_alloc_scan_factor (default 1 = off; r6: 3).
+    "TPU_RAIDEN_HOST_ORDER_DMA": env_bool("TPU_RAIDEN_HOST_ORDER_DMA", default=False),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

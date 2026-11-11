@@ -367,9 +367,17 @@ class RaidenLoadStoreSpec(LoadStoreSpec):
     allowing vLLM to recompute the blocks.
     """
 
-    def __init__(self, keys: list[OffloadKey], pinned: bool = True):
+    def __init__(
+        self,
+        keys: list[OffloadKey],
+        pinned: bool = True,
+        host_block_ids: list[int] | None = None,
+    ):
         self.keys = keys
         self.pinned = pinned
+        # Loads only: the host block of each sub-hash of `keys` (expanded, in
+        # order), -1 for one not in the local host pool; None if unknown.
+        self.host_block_ids = host_block_ids
 
     def __repr__(self) -> str:
         return (
@@ -436,6 +444,28 @@ class FinishedJob:
     success: bool
     req_id: str | None = None
     failed_device_block_ids: list[int] = field(default_factory=list)
+
+
+def _host_order_dma() -> bool:
+    """TPU_RAIDEN_HOST_ORDER_DMA (r6, default off): order local loads by host
+    block and stores by device block, so runs consecutive on both sides move
+    as one copy (`_dma_order`)."""
+    return envs.TPU_RAIDEN_HOST_ORDER_DMA
+
+
+def _dma_order(
+    sub_hashes: list[bytes], device_ids: list[int], host_ids: list[int]
+) -> tuple[list[bytes], list[int]]:
+    """Order a local load's (sub-hash, device block) pairs by host block.
+
+    Raiden moves a run of pairs consecutive on both host and device as one
+    copy per KV array, and every other pair as a copy of its own; each copy
+    holds the core's in-order DMA/launch queue, so a scattered 100k-token load
+    parks every kernel behind it ~30x longer than a contiguous one. The pairs
+    are independent, so their order in one call is free.
+    """
+    order = sorted(range(len(sub_hashes)), key=host_ids.__getitem__)
+    return [sub_hashes[i] for i in order], [device_ids[i] for i in order]
 
 
 @dataclass
@@ -901,6 +931,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # left the host pool after `lookup` — it is read from storage.
         remote_slices: dict[bytes, object] = {}
         local_hashes: list[bytes] = []
+        host_block_of: dict[bytes, int] = {}
         idx = 0
         while idx < len(sub_hashes):
             matched = self._store.lookup(sub_hashes[idx:])
@@ -913,6 +944,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 len(matched),
             )
             local_hashes.extend(sub_hash for sub_hash, _ in matched[:local_run])
+            host_block_of.update(
+                (sub_hash, block.host_block_id)
+                for sub_hash, block in matched[:local_run]
+            )
             idx += local_run
             if idx == len(sub_hashes):
                 break
@@ -953,7 +988,12 @@ class RaidenOffloadingManager(OffloadingManager):
                 return RaidenLoadStoreSpec(keys, pinned=False)
             idx = resolved_to
         self._pending_remote_slices.update(remote_slices)
-        return RaidenLoadStoreSpec(keys)
+        if not _host_order_dma():
+            return RaidenLoadStoreSpec(keys)
+        return RaidenLoadStoreSpec(
+            keys,
+            host_block_ids=[host_block_of.get(sub_hash, -1) for sub_hash in sub_hashes],
+        )
 
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
         # The Raiden directory is the sole authority on what is stored: probe
@@ -1097,6 +1137,13 @@ class RaidenOffloadingManager(OffloadingManager):
         account for fails the job closed (rollback + recompute).
         """
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        # Device-block order: the store hands out host blocks in insert order,
+        # so a run of consecutive device blocks lands on consecutive host
+        # blocks and moves as one copy (see `_dma_order`).
+        if keys and _host_order_dma():
+            device_block_ids, keys = map(
+                list, zip(*sorted(zip(device_block_ids, keys), key=lambda p: p[0]))
+            )
         # A live load (a peer or storage-tier read) owns these sub-hashes in
         # `_hash_to_admission`; admitting them would steal its completions.
         held_keys = {
@@ -1208,8 +1255,12 @@ class RaidenOffloadingManager(OffloadingManager):
         device_block_ids: list[int],
         req_id: str,
         pinned: bool = True,
+        host_block_ids: Sequence[int] | None = None,
     ) -> None:
-        """Launch a load job; entries were pinned in prepare_load."""
+        """Launch a load job; entries were pinned in prepare_load.
+
+        `host_block_ids` (from the spec `prepare_load` returned) orders the
+        local transfer for `_dma_order`."""
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
         if not pinned:
             # prepare_load lost the pin race; nothing is held, so fail the
@@ -1239,11 +1290,13 @@ class RaidenOffloadingManager(OffloadingManager):
         storage_batch = _ReadBatch()
         local_hashes: list[bytes] = []
         dst_device_ids_for_local: list[int] = []
-        for sub_hash, dev_id in zip(sub_hashes, device_ids):
+        local_host_ids: list[int] = []
+        for i, (sub_hash, dev_id) in enumerate(zip(sub_hashes, device_ids)):
             block: Any = self._pending_remote_slices.pop(sub_hash, None)
             if block is None:
                 local_hashes.append(sub_hash)
                 dst_device_ids_for_local.append(dev_id)
+                local_host_ids.append(host_block_ids[i] if host_block_ids else -1)
             elif block.status == self._block_status.REMOTE:
                 peer_batches[block.raiden_id].add(sub_hash, block, dev_id)
             else:  # SHARED_STORAGE
@@ -1301,6 +1354,10 @@ class RaidenOffloadingManager(OffloadingManager):
             # matching a polled failure.
             self._finalize(admission)
 
+        if host_block_ids and local_hashes:
+            local_hashes, dst_device_ids_for_local = _dma_order(
+                local_hashes, dst_device_ids_for_local, local_host_ids
+            )
         if local_hashes and not self._store.load(
             local_hashes, dst_device_ids_for_local
         ):

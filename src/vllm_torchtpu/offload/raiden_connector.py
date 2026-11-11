@@ -56,6 +56,7 @@ from collections.abc import Iterable, Mapping, Set
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -81,6 +82,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import (
@@ -105,6 +107,7 @@ from vllm_torchtpu.offload.raiden_staging import (
     padded_row_bytes,
     staging_hbm_reserve_bytes,
 )
+from vllm_torchtpu.offload import contiguous_alloc
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
     RaidenLoadStoreSpec,
@@ -292,6 +295,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     _block_pool = None
     _wb_hits: Set[int] = frozenset()
     _staged: StagedTransferScheduler | None = None
+    _contiguous_alloc_scan_factor = 1
 
     def __init__(
         self,
@@ -303,8 +307,13 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
-        self._write_back = WriteBackPolicy.from_extra_config(
-            getattr(spec, "extra_config", None) or {}
+        extra_config = getattr(spec, "extra_config", None) or {}
+        self._write_back = WriteBackPolicy.from_extra_config(extra_config)
+        # How deep into the oldest free blocks an allocation of n blocks may
+        # look for consecutive ids (`contiguous_alloc`); <= 1 turns it off.
+        # r6; default 1 (off) here: set the key to 3 for r6's behaviour.
+        self._contiguous_alloc_scan_factor = int(
+            extra_config.get("contiguous_alloc_scan_factor", 1)
         )
         # Write-back state: finished requests whose chunks are not stored yet
         # (their finish is deferred), the blocks each one would store, and
@@ -347,8 +356,21 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
     def attach_block_pool(self, block_pool) -> None:
         """`EvictionAwareConnector`: the scheduler's block pool, whose free
-        queue tells write-back which finished requests near eviction."""
+        queue tells write-back which finished requests near eviction. Its
+        fresh blocks come out as consecutive runs (`contiguous_alloc`)."""
         self._block_pool = block_pool
+        # No deeper than the write-back window looks for requests to flush, so
+        # a held request's blocks are reused no earlier than write-back can see
+        # them coming (one it has not flushed yet is dropped, as before).
+        contiguous_alloc.install(
+            block_pool,
+            scan_factor=self._contiguous_alloc_scan_factor,
+            max_scan=(
+                self._write_back.window_blocks
+                if self._write_back
+                else WriteBackPolicy.window_blocks
+            ),
+        )
 
     def _wb_unregister(self, req_id: str) -> None:
         for bid in self._wb_blocks.pop(req_id, ()):
@@ -593,6 +615,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 device_block_ids,
                 job.req_id,
                 pinned=src_spec.pinned,
+                host_block_ids=src_spec.host_block_ids,
             )
 
         # Handle jobs_to_flush (source blocks are about to be recycled):
@@ -683,6 +706,62 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             failed_load_req_ids=out.failed_load_req_ids,
             staging_packs=out.packs,
             staging_unpacks=out.unpacks,
+        )
+
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ) -> None:
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        if num_external_tokens:
+            self._align_load_blocks_to_host_order(request, blocks)
+
+    def _align_load_blocks_to_host_order(
+        self, request: Request, blocks: KVCacheBlocks
+    ) -> None:
+        """Give the load's fresh blocks to its keys in host-block order.
+
+        A load moves fastest into device blocks that ascend with the host
+        blocks it reads (`raiden_store._dma_order`). The blocks the scheduler
+        just allocated for the load hold nothing yet, so which key lands in
+        which of them is free: sort them, and hand the lowest one to the key
+        with the lowest host block. The request's block list is permuted in
+        place, so its block table and later prefix caching follow: `blocks`
+        must wrap the KV cache manager's own lists, as the scheduler's
+        `get_blocks()` does on the async-load path this connector takes.
+        """
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None or len(req_status.transfer_jobs) != 1:
+            return
+        job = self._current_batch_load_jobs.get(next(iter(req_status.transfer_jobs)))
+        if job is None or len(self.config.kv_group_configs) != 1:
+            return
+        src_spec, dst_spec = job.src_spec, job.dst_spec
+        assert isinstance(src_spec, RaidenLoadStoreSpec)
+        num_blocks = len(dst_spec.block_ids)
+        host_ids = src_spec.host_block_ids
+        if not src_spec.pinned or not host_ids or num_blocks < 2:
+            return
+        if len(src_spec.keys) != num_blocks or len(host_ids) % num_blocks:
+            return
+        if min(host_ids) < 0:
+            return  # some bytes come from a peer or the storage tier
+        # Every key expands to the same number of sub-hashes, which travel
+        # together: order keys by their first one. Any assignment of the fresh
+        # blocks is correct; the order only decides how well the copy coalesces.
+        key_host_ids = host_ids[:: len(host_ids) // num_blocks]
+        start = dst_spec.block_indices[0]
+        group_blocks = blocks.blocks[self.config.kv_group_configs[0].group_idx]
+        fresh = group_blocks[start : start + num_blocks]
+        if [b.block_id for b in fresh] != dst_spec.block_ids.tolist() or any(
+            b.block_hash is not None or b.ref_cnt != 1 for b in fresh
+        ):
+            return
+        by_host = sorted(range(num_blocks), key=key_host_ids.__getitem__)
+        block_at = dict(zip(by_host, sorted(fresh, key=lambda b: b.block_id)))
+        aligned = [block_at[pos] for pos in range(num_blocks)]
+        group_blocks[start : start + num_blocks] = aligned
+        dst_spec.block_ids = np.array(
+            [b.block_id for b in aligned], dtype=dst_spec.block_ids.dtype
         )
 
     def peek_external_prefix_tokens(
