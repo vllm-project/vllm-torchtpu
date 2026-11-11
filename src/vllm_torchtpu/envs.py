@@ -133,6 +133,7 @@ if TYPE_CHECKING:
     TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY: bool = True
     TPU_DRAFT_BUCKET_STEP: int = 32
     TPU_SPEC_SYNTHETIC_ROW_SPLIT: bool = True
+    TPU_SPEC_GLUE_FUSION: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -993,6 +994,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPEC_SYNTHETIC_ROW_SPLIT": env_bool(
         "TPU_SPEC_SYNTHETIC_ROW_SPLIT", default=True
     ),
+    # Run the async spec-decode glue between the draft and the next forward
+    # (substitution source, rejected count, the next step's seq_lens and
+    # positions correction) as two compiled programs instead of about eight
+    # eager ones. Integer ops only; same values.
+    "TPU_SPEC_GLUE_FUSION": env_bool("TPU_SPEC_GLUE_FUSION", default=False),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
