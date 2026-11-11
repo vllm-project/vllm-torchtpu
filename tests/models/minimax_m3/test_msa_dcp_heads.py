@@ -182,3 +182,48 @@ def test_attend_and_merge_matches_dcp_reference(
         np.testing.assert_allclose(
             got[r][:num_real], np.asarray(want[r])[:num_real], rtol=2e-2, atol=2e-2
         )
+
+
+@pytest.mark.parametrize("live", [0, 5, 11, 12])
+def test_exchange_head_pages(live):
+    if len(jax.devices()) < DCP:
+        pytest.skip(
+            "needs 8 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)"
+        )
+    rng = np.random.default_rng(live)
+    num_pages, buffer, width = 20, 12, 256
+    caches = rng.integers(0, 256, (DCP, num_pages, 2, 4, HEADS * width), np.uint8)
+    pages = rng.integers(0, num_pages, (DCP, buffer)).astype(np.int32)
+    mesh = Mesh(np.asarray(jax.devices()[:DCP]), ("dcp",))
+    body = functools.partial(
+        msa_dcp_heads.exchange_head_pages,
+        axis="dcp",
+        dcp=DCP,
+        replicas=REPLICAS,
+        head_width=width,
+        interpret=True,
+    )
+    f = jax.shard_map(
+        lambda c, p, n, r: body(c, p[0], n, r)[None],
+        mesh=mesh,
+        in_specs=(P("dcp"), P("dcp"), P(), P("dcp")),
+        out_specs=P("dcp"),
+        check_vma=False,
+    )
+    got = np.asarray(
+        f(
+            jnp.asarray(caches.reshape(DCP * num_pages, 2, 4, -1)),
+            jnp.asarray(pages),
+            jnp.full((1,), live, jnp.int32),
+            jnp.arange(DCP, dtype=jnp.int32),
+        )
+    )
+    part = buffer // REPLICAS
+    for rank in range(DCP):
+        head = rank // REPLICAS
+        for j in range(REPLICAS):
+            n = int(msa_dcp_heads.live_part(live, j, REPLICAS, part))
+            for src in range(DCP):
+                want = caches[src, pages[src, j * part : j * part + n]]
+                want = want[..., head * width : (head + 1) * width]
+                np.testing.assert_array_equal(got[rank, j, src, :n], want)
