@@ -17,8 +17,9 @@ Tests for the TPU unquantized dense-linear method.
 `VllmUnquantizedLinearMethod` stores the weight in the canonical (k, n)
 layout `[n_in, n_out]` so the runtime matmul is `(m, k) @ (k, n)` instead of
 vLLM's `(m, k) @ (n, k).T`. This is the default path for every unquantized
-(bf16/fp16) model, so these tests pin both the layout and the requirement
-that results stay bit-identical to `F.linear`.
+(bf16/fp16) model, so these tests pin both the layout and the numerics: no
+bias matches `F.linear` exactly, and a bias is added to the float32
+accumulator before a single rounding.
 """
 
 import pytest
@@ -30,6 +31,26 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 )
 
 SHAPES = [(7, 64, 32), (128, 256, 512), (1, 128, 64)]
+
+
+def _single_rounding_ref(x, w_nmajor, bias):
+    """`x @ w.T + bias` in float32, rounded once to the activation dtype."""
+    return F.linear(x.float(), w_nmajor.float(), bias.float()).to(x.dtype)
+
+
+def _assert_rounded_once(out, ref):
+    """`out` matches the single-rounding reference up to summation order.
+
+    Rounding the product to bf16 before adding the bias changes about a
+    quarter of the outputs; a different float32 summation order changes
+    only the rare ones that sit on a rounding boundary, by at most one ulp.
+    """
+    assert out.dtype == ref.dtype and out.shape == ref.shape
+    mismatch = out != ref
+    assert mismatch.float().mean().item() < 0.01
+    ulp = torch.finfo(ref.dtype).eps * ref.float().abs()
+    diff = (out.float() - ref.float()).abs()
+    assert bool((diff[mismatch] <= ulp[mismatch]).all())
 
 
 def _make_layer(w_nmajor: torch.Tensor) -> torch.nn.Module:
@@ -76,7 +97,7 @@ class TestUnquantizedLinearLayout:
 
 
 class TestUnquantizedLinearNumerics:
-    """apply() must stay bit-identical to vLLM's stock F.linear path."""
+    """apply() numerics for the bias-free and bias paths."""
 
     @pytest.mark.parametrize("m,k,n", SHAPES)
     def test_matches_f_linear_without_bias(self, m, k, n, device):
@@ -89,11 +110,11 @@ class TestUnquantizedLinearNumerics:
 
     @pytest.mark.parametrize("m,k,n", SHAPES)
     def test_matches_f_linear_with_bias(self, m, k, n, device):
-        """Bias must be fused into the accumulator.
+        """Bias must be added to the float32 accumulator.
 
-        `matmul(x, w) + bias` rounds the product to the activation dtype
-        before adding, which diverges from F.linear's single rounding. The
-        difference is sub-ulp, so only an exact comparison catches it.
+        On torch_tpu, `F.linear`, `addmm` and `matmul(x, w) + bias` all round
+        the product to the activation dtype before adding the bias, so the
+        reference is the float32 result rounded once.
         """
         x = torch.randn(m, k, dtype=torch.bfloat16, device=device)
         w = torch.randn(n, k, dtype=torch.bfloat16, device=device)
@@ -101,7 +122,9 @@ class TestUnquantizedLinearNumerics:
         layer = _make_layer(w)
         method = VllmUnquantizedLinearMethod()
         method.process_weights_after_loading(layer)
-        assert torch.equal(F.linear(x, w, bias), method.apply(layer, x, bias))
+        _assert_rounded_once(
+            method.apply(layer, x, bias), _single_rounding_ref(x, w, bias)
+        )
 
     def test_matches_f_linear_for_3d_input(self, device):
         """Leading dims are flattened for the matmul and restored after."""
@@ -114,4 +137,4 @@ class TestUnquantizedLinearNumerics:
         method.process_weights_after_loading(layer)
         out = method.apply(layer, x, bias)
         assert tuple(out.shape) == (b, m, n)
-        assert torch.equal(F.linear(x, w, bias), out)
+        _assert_rounded_once(out, _single_rounding_ref(x, w, bias))

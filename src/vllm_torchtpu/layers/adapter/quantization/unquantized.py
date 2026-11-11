@@ -133,14 +133,22 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         weight = layer.weight
         if bias is None:
             return torch.matmul(x, weight)
-        # Fuse the bias via addmm rather than `matmul(...) + bias`: the latter
-        # rounds the product to the activation dtype before adding, which
-        # diverges from F.linear's single rounding and would silently change
-        # outputs for every bf16 model. addmm accumulates then rounds once,
-        # keeping this bit-identical to vLLM's stock path.
         orig_out_shape = (*x.shape[:-1], weight.shape[-1])
         x_2d = x.reshape(-1, x.shape[-1])
-        return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
+        if x.dtype not in (torch.bfloat16, torch.float16):
+            return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
+        # Add the bias to the float32 accumulator and round once. torch_tpu
+        # lowers F.linear, addmm and `matmul(...) + bias` alike to a dot with
+        # an activation-dtype result followed by an add, which rounds twice
+        # (~1.4x the bf16 output error).
+        if x.device.type == "tpu":
+            out = torch.mm(x_2d, weight, out_dtype=torch.float32)
+        else:
+            # aten::mm.dtype has no CPU kernel. bf16/fp16 products are exact
+            # in float32, so upcasting keeps the same single rounding.
+            out = torch.mm(x_2d.float(), weight.float())
+        out = (out + bias.float()).to(x.dtype)
+        return out.reshape(orig_out_shape)
 
 
 @register_quantization_config(get_tpu_quant_method(UNQUANTIZED))
