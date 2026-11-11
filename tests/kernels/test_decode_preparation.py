@@ -249,6 +249,12 @@ def test_swa_word_pool_pack_matches_native(tokens, case):
     fused = prep.swa_word_pool_pack(
         records, values, capacity=capacity, padded=padded, interpret=True
     )
+    # Fused rows are segment-major (row j * padded + p); native rows are
+    # pair-major (row 4 * p + j). The publisher writes each row independently.
+    fused = tuple(
+        np.asarray(x).reshape(4, padded, -1).swapaxes(0, 1).reshape(4 * padded, -1)
+        for x in fused
+    )
     ids, words, masks = paged_swa._pack_native(records, values, capacity, 64)
     pad = 4 * padded - ids.size
     native = (
@@ -257,6 +263,6 @@ def test_swa_word_pool_pack_matches_native(tokens, case):
         jnp.pad(masks, ((0, pad), (0, 0))),
     )
     keep = np.asarray(native[0]) >= 0
-    np.testing.assert_array_equal(np.asarray(fused[0]), np.asarray(native[0]))
+    np.testing.assert_array_equal(fused[0].reshape(-1), np.asarray(native[0]))
     for got, want in zip(fused[1:], native[1:]):
-        np.testing.assert_array_equal(np.asarray(got)[keep], np.asarray(want)[keep])
+        np.testing.assert_array_equal(got[keep], np.asarray(want)[keep])
