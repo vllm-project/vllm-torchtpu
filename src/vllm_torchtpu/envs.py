@@ -209,6 +209,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_OMNI_RING_KERNEL: bool = True
+    VLLM_TPU_OMNI_RING_FIXED_M: bool = True
 
 
 def env_with_choices(
@@ -1282,6 +1284,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
+    # Enable the Pallas ICI-DMA diffusion ring attention kernel in vllm-omni;
+    # 0 falls back to the ppermute residual ring attention path.
+    "VLLM_TPU_OMNI_RING_KERNEL": env_bool("VLLM_TPU_OMNI_RING_KERNEL", default=True),
+    # Enable hybrid per-head fixed-m softmax in the Pallas ICI-DMA diffusion
+    # ring attention kernel; 0 uses online softmax on every head.
+    "VLLM_TPU_OMNI_RING_FIXED_M": env_bool("VLLM_TPU_OMNI_RING_FIXED_M", default=True),
 }
 
 

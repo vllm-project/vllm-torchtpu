@@ -88,6 +88,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `VLLM_TPU_OMNI_RING_KERNEL` | `True` | Enables the Pallas ICI-DMA diffusion ring attention kernel for `vllm-omni` (`0` falls back to the `ppermute` residual ring path). |
+| `VLLM_TPU_OMNI_RING_FIXED_M` | `True` | Enables hybrid per-head fixed-m softmax in the Pallas ICI-DMA diffusion ring attention kernel (`0` runs online softmax on every head). |
 
 ---
 
