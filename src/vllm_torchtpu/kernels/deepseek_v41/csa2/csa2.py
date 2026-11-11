@@ -169,6 +169,7 @@ def _csa2_kernel(
         swa_scores,
         main_p,
         swa_p,
+        inverses,
         input_sems,
         swa_sems,
         output_sems,
@@ -372,6 +373,9 @@ def _csa2_kernel(
                 ],
                 axis=1,
             )
+            if has_main:
+                # PV accumulated unnormalized weights.
+                output = output * inverses[bank, i]
             tail = output[:, 384:]
             partner = jnp.take_along_axis(
                 tail,
@@ -563,9 +567,9 @@ def _csa2_kernel(
                 denominator = sink_exponential + jnp.sum(
                     exponentials, axis=1, keepdims=True
                 )
-                exponentials = exponentials / denominator
-                # The denominator uses unscaled weights; fold KV scales into
-                # main PV weights and round once to BF16.
+                # Normalize after PV: no weight stays live until the sum ends.
+                inverses[bank, i] = 1.0 / denominator
+                # Fold KV scales into main PV weights and round once to BF16.
                 kv_scales = cast(jax.Ref, main_scale_ref)[i]
                 main_p_ref[i] = (exponentials[:, :512] * kv_scales).astype(jnp.bfloat16)
                 swa_p_ref[i] = exponentials[:, 512:].astype(jnp.bfloat16)
@@ -970,6 +974,7 @@ def csa2(
                 pltpu.VMEM((bq, heads, 256), jnp.float32),
                 pltpu.VMEM((bq, heads, 512), jnp.bfloat16) if has_main else None,
                 pltpu.VMEM((bq, heads, 256), jnp.bfloat16),
+                pltpu.VMEM((2, bq, heads, 1), jnp.float32),
                 pltpu.SemaphoreType.DMA((4, 2 if resident_metadata else 4)),
                 pltpu.SemaphoreType.DMA((4, num_pages * len(banks))),
                 pltpu.SemaphoreType.DMA((2,)),
