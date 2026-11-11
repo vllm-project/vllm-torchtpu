@@ -170,6 +170,7 @@ def _csa2_kernel(
         main_p,
         swa_p,
         inverses,
+        pv_raw,
         input_sems,
         swa_sems,
         output_sems,
@@ -365,14 +366,17 @@ def _csa2_kernel(
         )
         start = _tile_field(tiles_ref, tile, 1)
         row_offset = start - jnp.minimum(start, tokens - bq)
+        # Drain every PV result to VMEM before any of its vector work.
         for i in range(bq):
-            output = jnp.concatenate(
+            pv_raw[i] = jnp.concatenate(
                 [
                     pltpu.matmul_pop(accumulators[mxu][bq + i])[:heads]
                     for mxu in range(2)
                 ],
                 axis=1,
             )
+        for i in range(bq):
+            output = pv_raw[i]
             if has_main:
                 # PV accumulated unnormalized weights.
                 output = output * inverses[bank, i]
@@ -640,11 +644,11 @@ def _csa2_kernel(
             if not first_tile:
                 output_copy(tile - 1, 1 - bank).start()
             return
+        if not first_tile:
+            finish(tile - 1, 1 - bank)
         swa_qk_compute(0, bq)
         prepare_next()
         main_unpack(indices)
-        if not first_tile:
-            finish(tile - 1, 1 - bank)
         swa_qk_pop(0, bq)
         main_qk_compute(indices)
         for r, i in enumerate(indices):
@@ -975,6 +979,7 @@ def csa2(
                 pltpu.VMEM((bq, heads, 512), jnp.bfloat16) if has_main else None,
                 pltpu.VMEM((bq, heads, 256), jnp.bfloat16),
                 pltpu.VMEM((2, bq, heads, 1), jnp.float32),
+                pltpu.VMEM((bq, heads, 512), jnp.float32),
                 pltpu.SemaphoreType.DMA((4, 2 if resident_metadata else 4)),
                 pltpu.SemaphoreType.DMA((4, num_pages * len(banks))),
                 pltpu.SemaphoreType.DMA((2,)),
