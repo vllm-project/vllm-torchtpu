@@ -22,6 +22,7 @@ apply_omni_model_specific_patches() at attention backend selection
 patch_registry.py.
 """
 
+import importlib
 from functools import cache as run_once
 from typing import Any
 
@@ -409,6 +410,10 @@ def _wrap_fresh_timestep(cls: type) -> None:
 
 
 _HOST_SCHEDULE_PATCHED = "_tpu_host_schedule_patched"
+_WAN_HOST_SCHEDULE_PIPELINE_MODULES = (
+    "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2",
+    "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v",
+)
 
 
 def _patch_wan_host_resident_schedule() -> None:
@@ -433,19 +438,14 @@ def _patch_wan_host_resident_schedule() -> None:
     from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
         FlowUniPCMultistepScheduler,
     )
-    from vllm_omni.diffusion.models.wan2_2 import (
-        pipeline_wan2_2,
-        pipeline_wan2_2_s2v,
-    )
 
-    if getattr(
-        pipeline_wan2_2.FlowUniPCMultistepScheduler,
-        _HOST_SCHEDULE_PATCHED,
-        False,
-    ) and getattr(
-        pipeline_wan2_2_s2v.FlowUniPCMultistepScheduler,
-        _HOST_SCHEDULE_PATCHED,
-        False,
+    modules: list[Any] = [
+        importlib.import_module(module_name)
+        for module_name in _WAN_HOST_SCHEDULE_PIPELINE_MODULES
+    ]
+    if all(
+        getattr(module.FlowUniPCMultistepScheduler, _HOST_SCHEDULE_PATCHED, False)
+        for module in modules
     ):
         return
 
@@ -457,7 +457,7 @@ def _patch_wan_host_resident_schedule() -> None:
             *args: Any,
             **kwargs: Any,
         ) -> None:
-            return super().set_timesteps(num_inference_steps, "cpu", *args, **kwargs)
+            super().set_timesteps(num_inference_steps, "cpu", *args, **kwargs)
 
     setattr(
         _WanHostFlowUniPCMultistepScheduler,
@@ -469,10 +469,8 @@ def _patch_wan_host_resident_schedule() -> None:
         _HOST_SCHEDULE_PATCHED,
         True,
     )
-    pipeline_wan2_2.FlowUniPCMultistepScheduler = _WanHostFlowUniPCMultistepScheduler
-    pipeline_wan2_2_s2v.FlowUniPCMultistepScheduler = (
-        _WanHostFlowUniPCMultistepScheduler
-    )
+    for module in modules:
+        module.FlowUniPCMultistepScheduler = _WanHostFlowUniPCMultistepScheduler
     logger.info(
         "Applied TPU patch: host-resident FlowUniPC denoising schedule for Wan."
     )
