@@ -547,18 +547,18 @@ def _csa2_kernel(
 
         def softmax(indices, qk_values):
             for r, i in enumerate(indices):
-                main_logits = qk_values[r]
                 # Scale each key column after QK, using FP32 KV scales.
                 kv_scales = cast(jax.Ref, main_scale_ref)[i]
-                main_logits = main_logits * (kv_scales * (scale * log2_e))
-
-                sink = sink_ref[...] * log2_e
+                factor = kv_scales * (scale * log2_e)
                 main_count = main_lengths_ref[
                     jnp.minimum(t0 + i, main_lengths_ref.shape[0] - 1)
                 ]
-                main_logits = main_logits + jnp.where(
-                    jnp.arange(512)[None, :] < main_count, 0.0, -jnp.inf
+                main_logits = jnp.where(
+                    jnp.arange(512)[None, :] < main_count,
+                    qk_values[r] * factor,
+                    -jnp.inf,
                 )
+                sink = sink_ref[...] * log2_e
                 swa_logits = swa_score_ref[i]
                 logits = jnp.concatenate((main_logits, swa_logits), axis=1)
                 maximum = jnp.maximum(sink, jnp.max(logits, axis=1, keepdims=True))
