@@ -763,6 +763,35 @@ class RaidenOffloadingManager(OffloadingManager):
         # or whose recall found no host room. The save puts it back in host
         # DRAM and rewrites the files, which also repairs a copy that could
         # not be read.
+        if self.__dict__.get("_victim_mode", False):
+            # QWEN4_EXP_HOST_TIER_POLICY=victim: nothing is stored on compute.
+            # The caller's bookkeeping advances as for an all-resident batch;
+            # blocks reach the host only through prepare_victim_store, when
+            # HBM evicts them (offload/victim.py).
+            return PrepareStoreOutput(
+                keys_to_store=[], store_spec=RaidenLoadStoreSpec([]), evicted_keys=[]
+            )
+        keys_to_store = self._keys_needing_store(keys)
+        if len(keys_to_store) > self._capacity_keys:
+            return None
+        # Atomic admission happens at job-submit time via insert; in-flight
+        # tracking here only stops duplicate admission of the same key from a
+        # concurrent request.
+        self._inflight_store_keys.update(keys_to_store)
+        return PrepareStoreOutput(
+            keys_to_store=keys_to_store,
+            store_spec=RaidenLoadStoreSpec(keys_to_store),
+            evicted_keys=[],
+        )
+
+    def set_victim_mode(self, on: bool) -> None:
+        """Victim policy: prepare_store stores nothing; see prepare_victim_store."""
+        self.__dict__["_victim_mode"] = bool(on)
+
+    def _keys_needing_store(self, keys) -> list[OffloadKey]:
+        """Keys not in flight and not wholly resident (host or a peer). The
+        probe pins then releases, so a resident key moves to the LRU's MRU
+        end, which is the victim policy's order for a key evicted again."""
         keys_to_store: list[OffloadKey] = []
         resident_statuses = (
             self._block_status.HOST,
@@ -779,17 +808,14 @@ class RaidenOffloadingManager(OffloadingManager):
             ):
                 continue
             keys_to_store.append(key)
-        if len(keys_to_store) > self._capacity_keys:
-            return None
-        # Atomic admission happens at job-submit time via insert; in-flight
-        # tracking here only stops duplicate admission of the same key from a
-        # concurrent request.
+        return keys_to_store
+
+    def prepare_victim_store(self, keys) -> list[OffloadKey]:
+        """Admission for blocks HBM is evicting (victim policy): the keys to
+        store now, marked in flight. At most the tier's capacity per call."""
+        keys_to_store = self._keys_needing_store(keys)[: self._capacity_keys]
         self._inflight_store_keys.update(keys_to_store)
-        return PrepareStoreOutput(
-            keys_to_store=keys_to_store,
-            store_spec=RaidenLoadStoreSpec(keys_to_store),
-            evicted_keys=[],
-        )
+        return keys_to_store
 
     def _sub_hash_to_offload_key(
         self, sub_hash: bytes
