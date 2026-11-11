@@ -289,6 +289,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MAMBA_TAIL_FOLD_UNIT: int = 0
     VLLM_TPU_MAMBA_TAIL_FOLD_DCP: bool = False
     VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY: bool = False
+    VLLM_TPU_MAMBA_LRU_BUDGET: int = 0
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -1928,6 +1929,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY": env_bool(
         "VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY", default=False
     ),
+    # Scheduler: cached Mamba state blocks (prefix checkpoints) get their own
+    # LRU of this many blocks, so attention allocations do not evict them and
+    # their eviction does not evict KV; KV that only an evicted checkpoint
+    # needed is released, and vice versa (core/mamba_state_lru.py). 0 = off.
+    # Host-only.
+    "VLLM_TPU_MAMBA_LRU_BUDGET": env_int("VLLM_TPU_MAMBA_LRU_BUDGET", 0),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),
