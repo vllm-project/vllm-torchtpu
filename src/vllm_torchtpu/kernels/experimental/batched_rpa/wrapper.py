@@ -13,6 +13,7 @@
 # limitations under the License.
 """Wrapper for RPA kernel to match expected interface."""
 
+import math
 from typing import cast
 
 import jax
@@ -228,6 +229,7 @@ def calculate_block_sizes(
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
     decode_query_size: int = 1,
+    prefill_max_bkv_sz: int | None = None,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
     """Calculate optimal block size for decode and prefill."""
 
@@ -269,7 +271,13 @@ def calculate_block_sizes(
     else:
         aligned_kv_head_dim_val = utils.align_to(model_cfgs.head_dim, num_lanes)
 
-    def calculate_vmem_usage(batch_size: int, bq_sz: int, bkv_sz: int) -> int:
+    def calculate_vmem_usage(
+        batch_size: int,
+        bq_sz: int,
+        bkv_sz: int,
+        *,
+        full_scratches_bq_c: int | None = None,
+    ) -> int:
         """Given tile size, calculate VMEM usage of the kernel."""
 
         # Step 1: Calculate buffer sizes.
@@ -306,19 +314,47 @@ def calculate_block_sizes(
             buffer_bytes += lse_bytes
 
         # Step 2: Calculate worst case memory usage during computation.
-
-        # Calculate the size of loaded bq and bkv size.
-        loaded_bq_size = bq_sz * model_cfgs.num_q_heads * aligned_head_dim
-        loaded_bkv_size = bkv_sz * model_cfgs.num_kv_heads * aligned_head_dim
-
-        # Calculate peak memory requirement of otuput - which is attention weight.
-        qk_size = bq_sz * bkv_sz * model_cfgs.num_q_heads
-
-        # Convert to bytes.
-        loaded_bq_bytes = loaded_bq_size * q_bytes
         compute_kv_bytes = kv_bytes
-        loaded_bkv_bytes = loaded_bkv_size * compute_kv_bytes
-        qk_bytes = qk_size * out_bytes
+        if full_scratches_bq_c is not None:
+            loaded_bq_size = bq_sz * aligned_num_q_heads * aligned_head_dim
+            loaded_bkv_size = (
+                2 * bkv_sz * model_cfgs.num_kv_heads * aligned_kv_head_dim_val
+            )
+            loaded_bq_bytes = loaded_bq_size * q_bytes
+            loaded_bkv_bytes = loaded_bkv_size * compute_kv_bytes
+            # Inside `for bq_start in range(0, bq_sz, bq_c_sz)`, live attention
+            # score/probability tiles are `qk` (fp32) plus `p` and `prev_p`
+            # (out_dtype), each of shape `(bq_c_sz * aligned_num_q_heads, bkv_sz)`,
+            # alongside per-batch `acc_next`, `l_next` (and `m_next` if return_lse).
+            qk_bytes = (
+                full_scratches_bq_c * bkv_sz * aligned_num_q_heads * (4 + 2 * out_bytes)
+            )
+            lm_per_batch = (
+                model_cfgs.num_kv_heads
+                * bq_sz
+                * aligned_num_q_heads_per_kv_head
+                * num_lanes
+            )
+            acc_per_batch = (
+                model_cfgs.num_kv_heads
+                * bq_sz
+                * aligned_num_q_heads_per_kv_head
+                * aligned_head_dim
+            )
+            num_lm_lists = 2 if serve_cfgs.return_lse else 1
+            chunk_accum_bytes = (
+                acc_per_batch + num_lm_lists * lm_per_batch
+            ) * out_bytes
+        else:
+            # Calculate the size of loaded bq and bkv size.
+            loaded_bq_size = bq_sz * model_cfgs.num_q_heads * aligned_head_dim
+            loaded_bkv_size = bkv_sz * model_cfgs.num_kv_heads * aligned_head_dim
+            loaded_bq_bytes = loaded_bq_size * q_bytes
+            loaded_bkv_bytes = loaded_bkv_size * compute_kv_bytes
+            # Calculate peak memory requirement of output - which is attention weight.
+            qk_size = bq_sz * bkv_sz * model_cfgs.num_q_heads
+            qk_bytes = qk_size * out_bytes
+            chunk_accum_bytes = 0
 
         # Calculate VMEM contribution of active unpacked scale arrays during
         # compute. Note: since flash_attention consumes quantized k/v directly
@@ -335,7 +371,11 @@ def calculate_block_sizes(
 
         # Sum up all compute memory usage.
         compute_bytes = (
-            loaded_bq_bytes + loaded_bkv_bytes + qk_bytes + loaded_scale_bytes
+            loaded_bq_bytes
+            + loaded_bkv_bytes
+            + qk_bytes
+            + loaded_scale_bytes
+            + chunk_accum_bytes
         )
 
         # Step 3: Sum up all memory usage.
@@ -345,12 +385,26 @@ def calculate_block_sizes(
         total_bytes *= batch_size
 
         # Online-softmax scratch (m, l, and the output accumulator)
-        lm_array_size = (
-            model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
-        )
-        acc_array_size = (
-            model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
-        )
+        if full_scratches_bq_c is not None:
+            lm_array_size = (
+                model_cfgs.num_kv_heads
+                * bq_sz
+                * aligned_num_q_heads_per_kv_head
+                * num_lanes
+            )
+            acc_array_size = (
+                model_cfgs.num_kv_heads
+                * bq_sz
+                * aligned_num_q_heads_per_kv_head
+                * aligned_head_dim
+            )
+        else:
+            lm_array_size = (
+                model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
+            )
+            acc_array_size = (
+                model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
+            )
         # m and l scratches share the same shape.
         scratch_bytes = (2 * lm_array_size + acc_array_size) * out_bytes
         total_bytes += scratch_bytes
@@ -370,7 +424,9 @@ def calculate_block_sizes(
         return batch_size * num_muls
 
     def find_best_block_sizes(
-        max_batch_size: int, fixed_bq_sz: int | None = None
+        max_batch_size: int,
+        fixed_bq_sz: int | None = None,
+        max_bkv_sz: int | None = None,
     ) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
 
@@ -378,12 +434,10 @@ def calculate_block_sizes(
         # costs. Therefore, we conservatively only use 80% of the VMEM budget.
         capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
 
-        # To maximize MXU, we want bkv_sz to be at least MXU size.
-        bkv_default = mxu_column_size
-        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            # SEQ-ALONG-LANE does not support intra-page DMA offset.
-            # TODO(kyuyeunk): Reduce granularity to lane size.
-            bkv_default = utils.align_to(bkv_default, serve_cfgs.page_size)
+        # Both SEQ_ALONG_LANE and HEAD_ALONG_SUBLANE index cached KV pages by
+        # whole-page offsets (`kv_p_start = k_idx * cdiv(bkv_sz, page_size)`), so
+        # `bkv_sz` and `bkv_stride` must be exact multiples of `page_size`.
+        bkv_default = math.lcm(mxu_column_size, serve_cfgs.page_size)
         bkv_sz = bkv_stride = bkv_default
         if fixed_bq_sz is None:
             bq_sz = bq_stride = bkv_sz
@@ -412,10 +466,10 @@ def calculate_block_sizes(
 
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
+        coupled_bkv_cap = min(max_seq_len, 4096)
         while (
             calculate_vmem_usage(batch_size, bq_sz, bkv_sz) < capped_vmem_limit_bytes
-            and bkv_sz <= max_seq_len
-            and bkv_sz <= 4096  # TEMP PATCH
+            and bkv_sz <= coupled_bkv_cap
         ):
             # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
             # size. When using causal masking, if bq size is larger than bkv size,
@@ -435,11 +489,8 @@ def calculate_block_sizes(
         if bkv_sz == 0:
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
-        # Step 3: Given current tile size, calculate compute tile size.
-
         # Threshold value based on hardware generation and precision.
         tpu_info = pltpu.get_tpu_info()
-
         is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
 
         match tpu_info.generation:
@@ -453,18 +504,78 @@ def calculate_block_sizes(
         if is_8bit:
             flops_ratio = tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
             threshold *= flops_ratio
-        num_bq_c = 1
-        last_valid_bq_c_sz = bq_c_sz = bq_sz
-        bq_c_rem = 0
 
-        while (
-            calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
-            or bq_c_rem != 0
-        ) and num_bq_c < bq_sz:
-            if bq_c_rem == 0:
-                last_valid_bq_c_sz = bq_c_sz
-            num_bq_c += 1
-            bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
+        def _compute_bq_c_sz_legacy(cand_bkv_sz: int) -> int:
+            num_bq_c = 1
+            last_valid = curr_bq_c = bq_sz
+            rem = 0
+            while (
+                calculate_compute_buffer_time(batch_size, curr_bq_c, cand_bkv_sz)
+                > threshold
+                or rem != 0
+            ) and num_bq_c < bq_sz:
+                if rem == 0:
+                    last_valid = curr_bq_c
+                num_bq_c += 1
+                curr_bq_c, rem = divmod(bq_sz, num_bq_c)
+            return last_valid
+
+        def _compute_bq_c_sz(cand_bkv_sz: int, *, enforce_mxu_rows: bool) -> int:
+            min_bq_c = 1
+            if (
+                enforce_mxu_rows
+                and bq_sz * aligned_num_q_heads_per_kv_head >= mxu_column_size
+            ):
+                min_bq_c = pl.cdiv(mxu_column_size, aligned_num_q_heads_per_kv_head)
+            num_bq_c = 1
+            last_valid = curr_bq_c = bq_sz
+            rem = 0
+            while (
+                calculate_compute_buffer_time(batch_size, curr_bq_c, cand_bkv_sz)
+                > threshold
+                or rem != 0
+            ) and num_bq_c < bq_sz:
+                if rem == 0 and curr_bq_c >= min_bq_c:
+                    last_valid = curr_bq_c
+                next_bq_c, next_rem = divmod(bq_sz, num_bq_c + 1)
+                if next_bq_c < min_bq_c:
+                    break
+                num_bq_c += 1
+                curr_bq_c, rem = next_bq_c, next_rem
+            if rem == 0 and curr_bq_c >= min_bq_c:
+                last_valid = curr_bq_c
+            return last_valid
+
+        # Step 2b: When `max_bkv_sz` is explicitly requested and high GQA ratios
+        # bound `bq_sz` before `bkv_sz`, continue growing `bkv_sz` within the
+        # remaining VMEM budget (accounting for full online-softmax scratches and
+        # per-batch chunk accumulators). Coupled `(bq_sz, bkv_sz)` growth in Step 2
+        # is never shrunk when `bkv_sz` already reached or exceeded `max_bkv_sz`.
+        decoupled_bkv_grew = False
+        if max_bkv_sz is not None and max_bkv_sz > 0 and fixed_bq_sz is None:
+            decoupled_cap = min(coupled_bkv_cap, max_bkv_sz)
+            while bkv_sz + bkv_stride <= decoupled_cap:
+                cand_bkv = bkv_sz + bkv_stride
+                cand_bq_c = _compute_bq_c_sz(cand_bkv, enforce_mxu_rows=True)
+                if (
+                    calculate_vmem_usage(
+                        batch_size,
+                        bq_sz,
+                        cand_bkv,
+                        full_scratches_bq_c=cand_bq_c,
+                    )
+                    >= capped_vmem_limit_bytes
+                ):
+                    break
+                bkv_sz = cand_bkv
+                decoupled_bkv_grew = True
+
+        # Step 3: Given current tile size, calculate compute tile size. Preserve
+        # exact baseline `bq_c_sz` whenever Step 2b did not grow `bkv_sz`.
+        if decoupled_bkv_grew:
+            last_valid_bq_c_sz = _compute_bq_c_sz(bkv_sz, enforce_mxu_rows=True)
+        else:
+            last_valid_bq_c_sz = _compute_bq_c_sz_legacy(bkv_sz)
 
         return configs.BlockSizes(
             bq_sz=bq_sz,
@@ -478,7 +589,9 @@ def calculate_block_sizes(
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
-    prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
+    prefill_block_sizes = find_best_block_sizes(
+        prefill_batch_size, max_bkv_sz=prefill_max_bkv_sz
+    )
 
     return decode_block_sizes, prefill_block_sizes
 
@@ -497,6 +610,7 @@ def calculate_block_sizes(
         "chunk_prefill_size",
         "decode_block_sizes",
         "prefill_block_sizes",
+        "prefill_max_bkv_sz",
         "vmem_limit_bytes",
         "debug_mode",
         "out_dtype",
@@ -539,6 +653,7 @@ def ragged_paged_attention(
     chunk_prefill_size: int | None = None,
     decode_block_sizes: configs.BlockSizes | None = None,
     prefill_block_sizes: configs.BlockSizes | None = None,
+    prefill_max_bkv_sz: int | None = None,
     vmem_limit_bytes: int | None = None,
     debug_mode: bool = False,
     out_dtype: jnp.dtype | None = None,
@@ -589,6 +704,8 @@ def ragged_paged_attention(
         chunk_prefill_size: Not used.
         decode_block_sizes: Kernel block size to use during decode.
         prefill_block_sizes: Kernel block size to use during prefill.
+        prefill_max_bkv_sz: Optional upper bound on KV block size for prefill/mixed
+            tile selection, allowing bkv_sz to grow past bq_sz within VMEM.
         vmem_limit_bytes: VMEM size limit of the kernel. Defaults to maximum VMEM
             size of the hardware.
         debug_mode: Not used.
@@ -718,6 +835,7 @@ def ragged_paged_attention(
         serve_cfgs,
         vmem_limit_bytes,
         decode_query_size=decode_query_size,
+        prefill_max_bkv_sz=prefill_max_bkv_sz,
     )
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None

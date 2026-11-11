@@ -89,6 +89,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_SPARSE_MLA_NOPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA non-positional (`nope`) KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
+| `TPU_RPA_PREFILL_MAX_BKV` | `0` | Upper bound on the KV block size (tokens) for the batched Ragged Paged Attention mixed/prefill kernel, allowing `bkv_sz` to grow past `bq_sz` within the VMEM budget when high GQA ratios bound `bq_sz` first (`0` keeps `bkv_sz == bq_sz`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
 
 ---

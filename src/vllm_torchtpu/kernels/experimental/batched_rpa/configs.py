@@ -662,10 +662,9 @@ class RpaConfigs:
                     "Context Parallel does not support sliding window right now"
                 )
 
-        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            bkv_sz = self.block.bkv_sz
-            page_size = self.serve.page_size
-            if bkv_sz % page_size != 0:
-                raise NotImplementedError(
-                    f"SEQ_ALONG_LANE expects {bkv_sz=} to be aligned to {page_size=}."
-                )
+        bkv_sz = self.block.bkv_sz
+        page_size = self.serve.page_size
+        if bkv_sz % page_size != 0:
+            raise NotImplementedError(
+                f"Batched RPA expects {bkv_sz=} to be aligned to {page_size=}."
+            )

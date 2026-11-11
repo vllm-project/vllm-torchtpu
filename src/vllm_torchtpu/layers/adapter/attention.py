@@ -554,9 +554,15 @@ def _pallas_rpa_kernel_batched(
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
     block_major: bool = False,
+    prefill_max_bkv_sz: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
+    batched_kwargs: dict[str, Any] = {}
+    if decode_query_size > 1:
+        batched_kwargs["decode_query_size"] = decode_query_size
+    if prefill_max_bkv_sz > 0:
+        batched_kwargs["prefill_max_bkv_sz"] = prefill_max_bkv_sz
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -574,10 +580,8 @@ def _pallas_rpa_kernel_batched(
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
         rpa_func=(
-            functools.partial(
-                ragged_paged_attention_batched, decode_query_size=decode_query_size
-            )
-            if decode_query_size > 1
+            functools.partial(ragged_paged_attention_batched, **batched_kwargs)
+            if batched_kwargs
             else ragged_paged_attention_batched
         ),
         sm_scale=sm_scale,
@@ -851,6 +855,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
     )
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
+    prefill_max_bkv_sz: int = 0
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -984,6 +989,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if use_pcp_streaming
             else batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
         )
+        prefill_max_bkv_sz = 0 if use_pcp_streaming else self.prefill_max_bkv_sz
         config_key = (
             self._kernel_op_prefix,
             self.sliding_window,
@@ -996,6 +1002,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            prefill_max_bkv_sz,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1038,6 +1045,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            prefill_max_bkv_sz,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1078,6 +1086,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 )
             if "decode_query_size" in entry_params:
                 entry_kwargs["decode_query_size"] = self.decode_query_size
+            if "prefill_max_bkv_sz" in entry_params and prefill_max_bkv_sz > 0:
+                entry_kwargs["prefill_max_bkv_sz"] = prefill_max_bkv_sz
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
@@ -1210,6 +1220,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_rank=self.dcp_rank,
             kv_layout=self.kv_layout,
             decode_query_size=self.decode_query_size,
+            prefill_max_bkv_sz=self.prefill_max_bkv_sz,
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
@@ -1390,6 +1401,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if pcp_configured:
             self._validate_pcp_streaming_support(skip_kv_update)
             self.decode_query_size = 1
+            self.prefill_max_bkv_sz = 0
             self._pcp_streaming = True
             self.rpa_kernel = self._build_rpa_kernel(
                 q_scale,
@@ -1432,6 +1444,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     cp_rank=self.dcp_rank,
                     kv_layout=self.kv_layout,
                     decode_query_size=self.decode_query_size,
+                    prefill_max_bkv_sz=self.prefill_max_bkv_sz,
                 )
             return
 
@@ -1704,8 +1717,11 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         spec = vllm_config.speculative_config if vllm_config else None
         # Run K + 1 verify tokens in the DECODE stage.
         # head_dim 64 is rerouted to the hd64 kernel.
-        if spec is not None and self.head_size != 64:
-            self.decode_query_size = spec.num_speculative_tokens + 1
+        if self.head_size != 64:
+            if spec is not None:
+                self.decode_query_size = spec.num_speculative_tokens + 1
+            if envs.TPU_RPA_PREFILL_MAX_BKV > 0:
+                self.prefill_max_bkv_sz = int(envs.TPU_RPA_PREFILL_MAX_BKV)
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

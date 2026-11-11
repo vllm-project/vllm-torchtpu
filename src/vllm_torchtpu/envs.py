@@ -138,6 +138,7 @@ if TYPE_CHECKING:
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
+    TPU_RPA_PREFILL_MAX_BKV: int = 0
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -1031,6 +1032,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPARSE_MLA_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_SPARSE_MLA_CHUNK_TOKENS"
     ),
+    # Upper bound on the KV block size (tokens) for the batched Ragged Paged
+    # Attention mixed/prefill kernel, allowing bkv_sz to grow past bq_sz within
+    # the VMEM budget when high GQA ratios bound bq_sz first. 0 keeps bkv_sz == bq_sz.
+    "TPU_RPA_PREFILL_MAX_BKV": env_nonnegative_int("TPU_RPA_PREFILL_MAX_BKV", 0),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(

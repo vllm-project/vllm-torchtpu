@@ -53,7 +53,10 @@ def _stitch_decode_lane(
 
     lane_idx = lax.broadcasted_iota(jnp.int32, (outer_dim, num_lanes), 1)
 
-    if cfgs.block.bq_sz == 1:
+    max_new_tokens = (
+        cfgs.block.bq_sz if cfgs.mode == configs.RpaCase.DECODE else cfgs.block.bkv_sz
+    )
+    if max_new_tokens == 1:
         # A single token needs neither a second destination column nor the
         # wrap-around source column: its source column is unambiguous.
         dst_vreg = strided_vmem_ref[pl.ds(dst_chunk_idx, outer_dim, lanes_per_col)]
@@ -77,7 +80,7 @@ def _stitch_decode_lane(
             strided_vmem_ref[pl.ds(col, outer_dim, lanes_per_col)], shift, axis=1
         )
 
-    n_cols = pl.cdiv(num_lanes - 1 + cfgs.block.bq_sz, num_lanes)
+    n_cols = pl.cdiv(num_lanes - 1 + max_new_tokens, num_lanes)
     rolled = [rolled_src(j) for j in range(n_cols + 1)]
 
     cols = []
@@ -127,6 +130,13 @@ def _stitch_prefill_lane(
     return merged_cache_u32
 
 
+def _use_decode_lane_stitch(cfgs: configs.RpaConfigs) -> bool:
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    if cfgs.mode == configs.RpaCase.DECODE:
+        return cfgs.block.bq_sz <= num_lanes
+    return cfgs.block.bkv_sz <= num_lanes
+
+
 def store_new_kv_lane(
     vmem_ref: jax.Ref,
     b_idx: int,
@@ -138,7 +148,7 @@ def store_new_kv_lane(
     v_len = cfgs.kv_vmem_lanes
     vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
 
-    if cfgs.block.bq_sz <= pltpu.get_tpu_info().num_lanes:
+    if _use_decode_lane_stitch(cfgs):
         cols, outer_dim, lanes_per_col, merged = stitch_result
         num_lanes = pltpu.get_tpu_info().num_lanes
         strided_vmem_ref = vmem_u32_ref.reshape(-1, num_lanes)
@@ -184,7 +194,7 @@ def stitch_new_kv_lane(
 
     # Up to num_lanes new kv tokens span at most two 128-lane registers, so they
     # can be rolled in place instead of rolling the entire bkv_sz.
-    if cfgs.block.bq_sz <= pltpu.get_tpu_info().num_lanes:
+    if _use_decode_lane_stitch(cfgs):
         return _stitch_decode_lane(
             vmem_u32_ref,
             bkv_sz_cache,
