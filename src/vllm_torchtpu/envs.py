@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY: bool = False
+    TPU_SPEC_WARMUP_SWEEP_TOKEN_BUCKETS: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -967,6 +968,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (default on there); default off here.
     "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY": env_bool(
         "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY", default=False
+    ),
+    # Spec-decode warm-up: run the greedy mixed nr=R step at every token bucket
+    # below the full budget too, so the (token bucket, logits rows) programs
+    # serving's partial prefill chunks reach are compiled before serving. r6
+    # (always on there); default off here (longer warm-up).
+    "TPU_SPEC_WARMUP_SWEEP_TOKEN_BUCKETS": env_bool(
+        "TPU_SPEC_WARMUP_SWEEP_TOKEN_BUCKETS", default=False
     ),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.

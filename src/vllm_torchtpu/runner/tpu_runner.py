@@ -8070,6 +8070,7 @@ class TPUModelRunner(GPUModelRunner):
                         greedy=True,
                         short=True,
                         mixed=True,
+                        sweep_token_buckets=envs.TPU_SPEC_WARMUP_SWEEP_TOKEN_BUCKETS,
                     )
                     self._warmup_spec_batch(
                         int(R), P_small, greedy=False, short=True, mixed=True
@@ -8155,12 +8156,19 @@ class TPUModelRunner(GPUModelRunner):
         *,
         short: bool = False,
         mixed: bool = False,
+        sweep_token_buckets: bool = False,
     ) -> None:
         """Warm an nr=R decode batch: prefill R synthetic requests then decode
         them together so the multi-request fused programs are compiled.
 
         greedy=False routes the non-greedy (do_sampling=True) verify+sample
-        fusion, which is a distinct set of programs from the greedy path."""
+        fusion, which is a distinct set of programs from the greedy path.
+
+        With `mixed` and `sweep_token_buckets`, a mixed step runs at every
+        token bucket, not only the full budget: the selected-logits, draft-input
+        builder, draft-token extraction and rejected-count programs are keyed
+        on (token bucket, logits rows), and serving's partial prefill chunks
+        reach every bucket."""
         from vllm.sampling_params import SamplingParams
         from vllm.v1.core.sched.output import (
             CachedRequestData,
@@ -8175,7 +8183,25 @@ class TPUModelRunner(GPUModelRunner):
         max_seqs = int(self.scheduler_config.max_num_seqs)
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
-        max_pos = min(self.max_model_len, P + n_decode * (1 + K))
+        verify_tokens = R * (1 + K)
+        # One prefill chunk filling each token bucket below the full budget
+        # (the full-budget step follows as before).
+        bucket_prefills = (
+            [
+                int(T) - verify_tokens
+                for T in self.num_tokens_paddings
+                if verify_tokens < int(T) < int(self.max_num_tokens)
+                and int(T) - verify_tokens <= self.max_model_len - (1 + K) - 1
+            ]
+            if mixed and sweep_token_buckets and max_seqs >= R + 1
+            else []
+        )
+        # Every mixed step advances the R verify windows by one token (without
+        # the sweep: v3's bound, unchanged).
+        max_pos = min(
+            self.max_model_len,
+            P + (n_decode + len(bucket_prefills) + (2 if bucket_prefills else 0)) * (1 + K),
+        )
         # Per-group block counts in the group's own block-table units (see
         # _warmup_one_spec_request); the per-request stride uses the widest
         # group so every group's ranges stay disjoint across requests.
@@ -8274,17 +8300,20 @@ class TPUModelRunner(GPUModelRunner):
                     for g in self.kv_cache_config.kv_cache_groups
                 ]
                 mix_nblk = max(mix_nblks)
-                variants = [[P_mix]]
+                variants = [[p] for p in bucket_prefills if p >= P] + [[P_mix]]
                 if max_seqs >= R + 2 and P_mix >= 2 * P:
                     variants.append([P_mix // 2, P_mix - P_mix // 2])
                 prev_ids: list[str] = []
                 base_lo = 1 + R * nblk
                 for vi, plist in enumerate(variants):
-                    if top <= base_lo + (vi + 1) * len(plist) * mix_nblk + 1:
+                    # A variant's requests finish in the next variant's step,
+                    # so variants alternate between two disjoint block ranges.
+                    slot = (vi % 2) * 2
+                    if top <= base_lo + (slot + len(plist)) * mix_nblk + 1:
                         break
                     extras = []
                     for k_, Pk in enumerate(plist):
-                        lo = base_lo + (vi * 2 + k_) * mix_nblk
+                        lo = base_lo + (slot + k_) * mix_nblk
                         extras.append(
                             NewRequestData(
                                 req_id=f"{mix_rid}{vi}_{k_}",
