@@ -4913,7 +4913,7 @@ class TPUModelRunner(GPUModelRunner):
         each row's greedy token instead (no request is below min_tokens then).
         """
         assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
-        if md.synthetic_verify is not None:
+        if getattr(md, "synthetic_verify", None) is not None:
             return self._sample_synthetic_verify(
                 logits, md, cur_start_idx, cur_end_idx, sampling_generator
             )

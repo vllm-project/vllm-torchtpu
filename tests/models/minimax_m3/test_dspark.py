@@ -238,7 +238,7 @@ def test_target_returns_residual_stream_aux_states() -> None:
             super().__init__()
             self.scale = scale
 
-        def forward(self, positions, hidden_states, residual):
+        def forward(self, positions, hidden_states, residual, metadata=None):
             residual = hidden_states if residual is None else hidden_states + residual
             return residual * self.scale, residual
 
@@ -254,6 +254,7 @@ def test_target_returns_residual_stream_aux_states() -> None:
         norm=norm,
         embed_input_ids=lambda ids: ids.float().unsqueeze(-1).repeat(1, 2),
         aux_hidden_state_layers=(),
+        split_min_tokens=0,
     )
     target = SimpleNamespace(model=model)
     MiniMaxM3SparseForCausalLM.set_aux_hidden_state_layers(
