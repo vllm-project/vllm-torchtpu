@@ -16,6 +16,14 @@ spec, with its manager block as the kernel block, laid out by
 ``_pool_attention_geometry`` and ``Qwen4ExpPooledCache.kernel_block_sizes``).
 Raiden registers the pool with that same typed shape, so one Raiden row is
 one manager page and every transfer is a whole-page DMA.
+
+Under the gcd group-size rule (the TPU default) a group holds several layers
+and a worker backs one pool region per layer slot it owns: one raw tensor of
+``num_blocks`` pages each (two on a served PP8 TP1 stage). Block ``b`` of a
+group is then row ``b`` of each region, so the connector registers every
+region and a key moves that row of each; the bytes of every layer of the
+group still round-trip whole. A pipeline stage registers its own regions,
+and a key covers the block on every stage.
 """
 
 import math
@@ -66,11 +74,15 @@ def offload_pool_geometry(vllm_config, kv_cache_config):
         raise ValueError(
             "Qwen4Exp host offload needs every cache descriptor in one backing pool"
         )
-    if tensors and tensors[0].size != kv_cache_config.num_blocks * page_bytes:
-        # More than one pool region would put a group's block on several
-        # rows; the unified pool keeps every group on a single region.
+    if tensors and tensors[0].size % (kv_cache_config.num_blocks * page_bytes):
+        # The backing allocation is a whole number of regions of
+        # num_blocks pages each (kv_cache_materializer.layer_to_pool_index).
+        # Under the gcd group-size rule a block ID's layers sit in several
+        # regions (one per layer slot this worker backs: 2 on a served PP8
+        # stage); the connector registers every region and a key moves the
+        # block's row of each, so a group's block still round-trips whole.
         raise ValueError(
-            "Qwen4Exp host offload needs a single pool region of "
+            "Qwen4Exp host offload needs whole pool regions of "
             f"{kv_cache_config.num_blocks} x {page_bytes} bytes, got "
             f"{tensors[0].size} bytes"
         )
@@ -90,3 +102,16 @@ def offload_pool_geometry(vllm_config, kv_cache_config):
             f"hold {page_bytes}"
         )
     return spec.block_size, per_block_shape, spec.dtype, spec.block_size
+
+
+def pool_regions(kv_cache_config) -> int:
+    """Raw pool regions behind one worker's unified pool (one per layer slot).
+
+    The materializer allocates ``backing bytes / (num_blocks * page)`` raw
+    tensors (``allocate_raw_kv_cache_tensors``); the offload connector must
+    register exactly that many distinct storages, or a key would move only
+    part of a block's layers.
+    """
+    page = max(g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups)
+    tensors = kv_cache_config.kv_cache_tensors
+    return tensors[0].size // (kv_cache_config.num_blocks * page) if tensors else 0
