@@ -611,6 +611,12 @@ def _prefill_attention(
     query_block, kv_tile, query_tile = get_sparse_prefill_tiles(
         query, cache, kv_heads=kv_heads, ratio=ratio, with_query_tile=True
     )
+    tuned = None
+    if dcp is None and (query.shape[1], kv_heads, cache.shape[1] % 128) == (3, 1, 0):
+        tuned = shape_tuned.shard_prefill_tiles(len(query))
+    if tuned is not None:
+        # VLLM_TPU_SHAPE_TUNED: measured TP8 Q3/KV1 tiles for short chunks.
+        query_block, kv_tile, query_tile = tuned
     if dcp is not None:
         # One KV tile per owned page: the kernel walks this rank's pages only. The owned walk
         # streams half the pages per query block, so a wider query block amortises them:

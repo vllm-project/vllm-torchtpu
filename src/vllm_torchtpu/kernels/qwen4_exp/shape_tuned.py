@@ -64,3 +64,21 @@ INDEXER_PREFILL_TILES: tuple = ()
 
 def indexer_prefill_tiles(rows: int):
     return _lookup(INDEXER_PREFILL_TILES, rows)
+
+
+# QSA prefill attention, no-DCP block-sparse path at the TP8 rank geometry
+# (Q3/KV1, 128-aligned pages): chunk tokens -> (query_block, kv_tile,
+# query_tile). Short chunks (c1-c8 align/tail pieces) do not fill the served
+# 512/1024/256 tiles (halved to 256 below 512 tokens). Bit-identical outputs.
+# tests/shapetune qsapfnd j-b40a036b, 64K context, us per layer call:
+#   128 tokens: 312.5 -> 218.6 (Q128/KV1024/QT128)
+#   256 tokens: 298.3 -> 276.3 (Q256/KV1024/QT128)
+#   512 tokens: served tiles best.
+SHARD_PREFILL_TILES = (
+    (128, (128, 1024, 128)),
+    (256, (256, 1024, 128)),
+)
+
+
+def shard_prefill_tiles(tokens: int):
+    return _lookup(SHARD_PREFILL_TILES, tokens)
