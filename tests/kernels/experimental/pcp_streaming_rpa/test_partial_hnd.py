@@ -95,8 +95,6 @@ def _worker(result_dir):
                 sm_scale=1.0,
                 skip_kv_update=False,
                 cp_kv_cache_interleave_size=128,
-                q_block_size=128,
-                q_compute_size=64,
                 kv_layout=layout,
             )
             ops[layout] = pcp_streaming_jax_op(
@@ -308,8 +306,6 @@ def _extended_cases(out, rank, partition, mesh, rows):
                 sm_scale=hd**-0.5 if nonzero_qk else 1.0,
                 skip_kv_update=False,
                 cp_kv_cache_interleave_size=interleave,
-                q_block_size=interleave,
-                q_compute_size=64,
                 kv_layout=layout,
             )
             op = pcp_streaming_jax_op(

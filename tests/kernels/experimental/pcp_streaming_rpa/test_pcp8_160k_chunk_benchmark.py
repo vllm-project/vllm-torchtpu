@@ -28,7 +28,7 @@ latest startup log:
 * 32,768 max batched tokens and 64 request metadata slots;
 * manager block size 4,352, split into 256-token CUSTOM kernel pages;
 * 256-token PCP KV-cache interleave; and
-* the production PCP kernel defaults: q_block_size=q_compute_size=512.
+* the unified PCP Splash tiling: block_q=128, block_kv=1024, block_kv_compute=256.
 
 The manager block size is recorded in the result but is not directly visible
 to RPA: vLLM expands manager blocks into 256-token kernel pages before building
@@ -85,8 +85,6 @@ PACKED_KV_GROUPS = math.ceil(2 * NUM_KV_HEADS / KV_PACKING)
 MANAGER_BLOCK_SIZE = 4352
 KERNEL_PAGE_SIZE = 256
 PCP_INTERLEAVE_SIZE = 256
-Q_BLOCK_SIZE = 512
-Q_COMPUTE_SIZE = 512
 
 MAX_LOCAL_PAGES_PER_SEQ = MAX_MODEL_LEN // (WORLD_SIZE * KERNEL_PAGE_SIZE)
 ACTIVE_LOCAL_PAGES = TOTAL_KV_TOKENS // (WORLD_SIZE * KERNEL_PAGE_SIZE)
@@ -417,8 +415,6 @@ def _run_worker(result_dir: Path) -> None:
             soft_cap=None,
             skip_kv_update=False,
             cp_kv_cache_interleave_size=PCP_INTERLEAVE_SIZE,
-            q_block_size=Q_BLOCK_SIZE,
-            q_compute_size=Q_COMPUTE_SIZE,
             kv_layout=kv_layout,
         )
         attention = pcp_streaming_jax_op(
@@ -620,8 +616,6 @@ def test_pcp8_qwen35_397b_history128k_chunk32k_layout_benchmark(tmp_path, capsys
         "manager_block_size": MANAGER_BLOCK_SIZE,
         "kernel_page_size": KERNEL_PAGE_SIZE,
         "pcp_interleave_size": PCP_INTERLEAVE_SIZE,
-        "q_block_size": Q_BLOCK_SIZE,
-        "q_compute_size": Q_COMPUTE_SIZE,
         "history_tokens_global": HISTORY_TOKENS,
         "chunk_tokens_global": CHUNK_TOKENS,
         "history_tokens_per_rank": LOCAL_HISTORY_TOKENS,

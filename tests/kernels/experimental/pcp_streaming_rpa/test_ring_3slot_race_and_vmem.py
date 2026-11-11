@@ -410,7 +410,6 @@ def test_3slot_ring_matches_fp64_at_qwen35_pcp8(
         k_scale=scale,
         v_scale=scale,
         cp_kv_cache_interleave_size=QWEN35_INTERLEAVE_SIZE,
-        q_block_size=q_block_size,
         kv_layout=kv_layout,
     )
     out = np.asarray(jax.device_get(output), dtype=np.float64)[inverse_order]
