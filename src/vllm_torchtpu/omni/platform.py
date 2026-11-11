@@ -154,14 +154,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
                     world_size - 1,
                 )
             cls._set_shared_slicebuilder_addresses(world_size)
-            if cls._diffusion_ring_degree <= 1:
-                cls._offload_dense_all_to_all()
-            else:
-                logger.info(
-                    "Skipping SparseCore dense all-to-all offload default "
-                    "because ring_degree=%d > 1.",
-                    cls._diffusion_ring_degree,
-                )
+            cls._offload_dense_all_to_all()
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
@@ -173,16 +166,13 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
         Ulysses sequence parallelism moves q, k, v and the attention output
         through dense all-to-alls in every transformer block. By default XLA
-        runs them on the TensorCore, which waits for them. Callers skip this
-        default when ``ring_degree > 1``, where SparseCore dense all-to-all
-        offload slows down Pallas ring attention steps.
+        runs them on the TensorCore, which waits for them.
         """
         # TODO: Remove once libtpu enables the SparseCore dense all-to-all offload by
-        # default without regressing Pallas ring attention collectives. This sets
-        # os.environ after torch_tpu is imported, but it still takes effect because
-        # libtpu reads LIBTPU_INIT_ARGS when the PjRt client is created on the first
-        # device allocation, the same pre-PjRt window that
-        # _set_shared_slicebuilder_addresses relies on.
+        # default. This sets os.environ after torch_tpu is imported, but it still
+        # takes effect because libtpu reads LIBTPU_INIT_ARGS when the PjRt client
+        # is created on the first device allocation, the same pre-PjRt window
+        # that _set_shared_slicebuilder_addresses relies on.
         set_libtpu_flag_default(
             "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all", "true"
         )

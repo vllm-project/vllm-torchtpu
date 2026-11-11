@@ -677,6 +677,16 @@ def _patch_ring_attention() -> None:
             if not can_run_tpu_ring_attention(
                 self, query, key, value, attn_metadata, causal=causal
             ):
+                logger.warning_once(
+                    "Ring attention call does not fit the TPU Pallas ring kernel "
+                    "(dtype=%s, causal=%s, attn_backend_pref=%s, metadata=%s); "
+                    "falling back to vLLM-Omni RingParallelAttention, which "
+                    "exchanges K/V with torch.distributed P2P sends.",
+                    str(query.dtype),
+                    causal,
+                    getattr(self, "attn_backend_pref", None),
+                    type(attn_metadata).__name__,
+                )
                 return orig_run(
                     self,
                     query,
@@ -731,6 +741,13 @@ def _patch_ring_attention() -> None:
                     uly_size=int(sp_group.ulysses_world_size),
                     fuse_ulysses=True,
                 )
+            logger.warning_once(
+                "Attention call cannot fuse Ulysses into the TPU Pallas ring "
+                "kernel (strategy=%s, dtype=%s); running vLLM-Omni's Ulysses "
+                "all-to-all around the ring attention runner instead.",
+                getattr(strategy, "name", None),
+                str(query.dtype),
+            )
             return orig_forward_impl(self, query, key, value, attn_metadata)
 
         setattr(_tpu_attention_forward_impl, _RING_ATTENTION_PATCHED, True)
@@ -744,23 +761,9 @@ _DEVICE_IDS_BY_RANK_OVERRIDE: list[int] | None = None
 _ACTIVE_INIT_MP_DEVICE_ORDER: bool | None = None
 
 
-def _query_local_tpu_device_id() -> int | None:
-    try:
-        if not hasattr(torch, "tpu"):
-            return None
-        fn = getattr(
-            torch.tpu,
-            "get_local_device_attributes",
-            getattr(torch.tpu, "_get_local_device_attributes", None),
-        )
-        if fn is None:
-            return None
-        attrs = fn()
-        if isinstance(attrs, dict) and "id" in attrs:
-            return int(attrs["id"])
-    except Exception:
-        return None
-    return None
+def _query_local_tpu_device_id() -> int:
+    """PJRT device ID of this rank's TPU."""
+    return int(torch.tpu.get_local_device_attributes()["id"])
 
 
 def _resolve_device_ids_by_rank(world_size: int) -> tuple[list[int], list[int]] | None:
@@ -779,8 +782,15 @@ def _resolve_device_ids_by_rank(world_size: int) -> tuple[list[int], list[int]] 
     if world_size <= 1 or not torch.distributed.is_initialized():
         return None
 
-    local_dev_id = _query_local_tpu_device_id()
-    local_val: int | None = None if local_dev_id is None else int(local_dev_id)
+    # Every rank must reach all_gather_object, or the ranks whose query worked
+    # wait on it forever, so a local failure is gathered as None and raised
+    # below on every rank.
+    local_val: int | None = None
+    local_exc: Exception | None = None
+    try:
+        local_val = _query_local_tpu_device_id()
+    except Exception as exc:
+        local_exc = exc
 
     from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 
@@ -789,22 +799,22 @@ def _resolve_device_ids_by_rank(world_size: int) -> tuple[list[int], list[int]] 
         gathered, local_val, group=get_world_group().cpu_group
     )
     if any(x is None for x in gathered):
-        logger.warning(
-            "TPU device-ID query failed on one or more ranks (gathered=%s); "
-            "falling back to default rank ordering.",
-            gathered,
-        )
-        return None
+        raise RuntimeError(
+            "torch.tpu.get_local_device_attributes() failed on one or more "
+            f"ranks (gathered device IDs by rank: {gathered}). Ring attention "
+            "(ring_degree > 1) lays out the parallel groups by TPU device ID "
+            "and cannot run with rank-ordered groups."
+        ) from local_exc
     dev_ids = [int(x) for x in gathered if x is not None]
     try:
         ranks_by_dev = ranks_ordered_by_device_id(dev_ids)
     except ValueError as exc:
-        logger.warning(
-            "Invalid TPU device-ID mapping across ranks (%s); "
-            "falling back to default rank ordering.",
-            exc,
-        )
-        return None
+        raise RuntimeError(
+            f"TPU device IDs gathered by rank ({dev_ids}) are not a "
+            "permutation of 0..world_size-1. Ring attention (ring_degree > 1) "
+            "lays out the parallel groups by TPU device ID and cannot run "
+            "with rank-ordered groups."
+        ) from exc
     _CACHED_DEVICE_ID_ORDER = (world_size, dev_ids, ranks_by_dev)
     logger.info(
         "Resolved TPU device-ID rank ordering: dev_ids=%s, ranks_by_dev=%s",
