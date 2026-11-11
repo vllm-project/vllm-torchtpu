@@ -462,7 +462,7 @@ def _head_parallel_attend(
         attend = functools.partial(
             msa_attention_lse.msa_sparse_attention_lse,
             sm_scale=sm_scale,
-            block_q=msa_attention.DEFAULT_BLOCK_Q,
+            block_q=msa_attention.PREFILL_BLOCK_Q,
             pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
             head=0,
             scale_cache=sc,

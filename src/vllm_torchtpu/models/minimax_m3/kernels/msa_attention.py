@@ -46,6 +46,12 @@ DEFAULT_BLOCK_Q = 16
 # (32 req x 8 tokens): 416 -> 350 us per call (j-cae78264 vs j-2c36aed7);
 # prefill chunks keep 16 (8 is 7% slower there, j-3eb5e8aa).
 SMALL_BATCH_TOKENS = 1024
+# Prefill / mixed-step tiles of the LSE kernel (`msa_attention_lse`, DCP and
+# head-parallel calls): a page's fixed per-visit cost (DMA, unpacking) spreads
+# over twice the rows, and neighbouring tokens share most of their pages.
+# Served c4 xprof, every 8192-token call of one capture timed at 8/16/32-token
+# tiles on the same selections (j-4396c8a5): 11.8 / 7.7 / 5.5 ms in total.
+PREFILL_BLOCK_Q = 32
 SMALL_BATCH_BLOCK_Q = 8
 DEFAULT_PAGES_PER_STEP = 16
 DEFAULT_KERNEL = "v2"

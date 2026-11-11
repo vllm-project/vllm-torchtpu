@@ -96,6 +96,7 @@ def _check(got, want):
         (150, 140, 16, 64, False, 16),  # several kernel calls (the chunk loop)
         (150, 140, 16, 64, True, 16),  # the prefill (sorted) work list
         (150, 140, 16, 64, True, 5),  # groups per tile padded to a power of two
+        (150, 140, 32, 64, True, 16),  # prefill (32-token) tiles
     ],
 )
 def test_lse_matches_dense_reference(
