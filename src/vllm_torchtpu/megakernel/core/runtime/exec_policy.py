@@ -242,17 +242,24 @@ def align_cache_exec(
     num_pages: int,
     page_size: int,
     max_pages_per_seq: int,
+    dcp: int = 1,
 ) -> ExecSpec:
-    """Align `base_exec.ctx` to `kv_blk` and bind paged KV cache geometry."""
+    """Align `base_exec.ctx` to `kv_blk` and bind paged KV cache geometry.
+
+    `dcp` is the decode context parallel size: the page table is then the
+    rank-local one, and `ctx` the rank-local context it addresses.
+    """
     ex0 = profile.exec_for(base_exec, B=base_exec.B, T=1, g=geom)
     kv_blk = ex0.resolved_tiles.module(GQAModule.name, GQATunables).kv_blk
     aligned_ctx = ((max_pages_per_seq * page_size) // kv_blk) * kv_blk
+    dcp_kw = {"dcp": int(dcp)} if dcp != 1 else {}
     return with_cache(
         dataclasses.replace(base_exec, ctx=max(base_exec.ctx, aligned_ctx)),
         num_pages=num_pages,
         page_size=page_size,
         max_pages_per_seq=max_pages_per_seq,
         paged_kv=True,
+        **dcp_kw,
     )
 
 

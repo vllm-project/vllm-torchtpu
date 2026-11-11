@@ -30,6 +30,7 @@ from typing import Any
 import jax.numpy as jnp
 
 from ..errors import EligibilityResult
+from ..pool.dcp import DCP_OWNER_PAGE_MOD, DCP_OWNER_REPLICATED
 from ..pool.layout import PoolLayout
 
 LAYOUT_FACTS_SCHEMA = "megakernel-pool-slot-facts-v1"
@@ -61,6 +62,13 @@ class PoolLayoutFacts:
 
     Byte offsets are relative to the first page of the slot. A slot is one
     framework cache block (`slot_tokens` tokens = whole pool pages).
+
+    The `dcp_*` fields say which KV pages this rank holds under decode
+    context parallelism: `dcp_size` ranks share a KV head, this rank is
+    `dcp_rank` among them, each holds runs of `dcp_interleave` tokens, and
+    `dcp_page_owner` names the rule (`pool.dcp`). Without DCP they are
+    `(1, 0, 0, "replicated")` and stay out of the payload, so the fingerprint
+    of a DCP 1 slot is the same as before they existed.
     """
 
     page_dtype: str
@@ -81,10 +89,17 @@ class PoolLayoutFacts:
     d_v: int
     conv_taps: int
     conv_dim: int
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    dcp_interleave: int = 0
+    dcp_page_owner: str = DCP_OWNER_REPLICATED
 
     def payload(self) -> dict[str, Any]:
         d = dataclasses.asdict(self)
         d["page_shape"] = list(self.page_shape)
+        if self.dcp_size == 1:
+            for k in _DCP_FIELDS:
+                del d[k]
         return {"schema": LAYOUT_FACTS_SCHEMA, **d}
 
     def fingerprint(self) -> str:
@@ -93,8 +108,39 @@ class PoolLayoutFacts:
         return hashlib.sha256(enc.encode("ascii")).hexdigest()
 
 
-def facts_from_pool_layout(layout: PoolLayout, R: int) -> PoolLayoutFacts:
-    """The slot facts the megakernel's pool I/O assumes on each of `R` ranks."""
+_DCP_FIELDS = ("dcp_size", "dcp_rank", "dcp_interleave", "dcp_page_owner")
+
+
+def dcp_facts(
+    dcp_size: int, dcp_rank: int, interleave: int, page_size: int
+) -> dict[str, Any]:
+    """The `dcp_*` fields of a rank whose DCP group of `dcp_size` holds runs of
+    `interleave` tokens per rank, on pool pages of `page_size` tokens.
+
+    Global page `p` on DCP rank `p % dcp_size` at column `p // dcp_size` (the
+    megakernel's rule) holds exactly when the run is one page; any other
+    interleave gets its own name, so it never compares equal to that rule.
+    """
+    if dcp_size == 1:
+        return {}
+    owner = (
+        DCP_OWNER_PAGE_MOD
+        if interleave == page_size
+        else f"interleave_{interleave}_tokens_mod_dcp"
+    )
+    return dict(
+        dcp_size=int(dcp_size),
+        dcp_rank=int(dcp_rank),
+        dcp_interleave=int(interleave),
+        dcp_page_owner=owner,
+    )
+
+
+def facts_from_pool_layout(
+    layout: PoolLayout, R: int, *, dcp: int = 1, dcp_rank: int = 0
+) -> PoolLayoutFacts:
+    """The slot facts the megakernel's pool I/O assumes on each of `R` ranks
+    (under DCP `dcp`, on the rank of DCP rank `dcp_rank`: one page per run)."""
     rec_isz = jnp.dtype(layout.rec_dtype).itemsize
     conv_isz = jnp.dtype(layout.conv_dtype).itemsize
     qkv = layout.qkv_per_rank(R)
@@ -117,6 +163,7 @@ def facts_from_pool_layout(layout: PoolLayout, R: int) -> PoolLayoutFacts:
         d_v=int(layout.VD),
         conv_taps=int(layout.conv_taps),
         conv_dim=qkv,
+        **dcp_facts(dcp, dcp_rank, layout.page_size, layout.page_size),
     )
 
 
@@ -154,6 +201,7 @@ __all__ = [
     "LAYOUT_FACTS_SCHEMA",
     "PoolLayoutFacts",
     "compare_layout_facts",
+    "dcp_facts",
     "dtype_name",
     "facts_from_pool_layout",
 ]

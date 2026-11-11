@@ -39,7 +39,7 @@ from vllm_torchtpu.megakernel.core.runtime import contract
 
 def test_fake_runner_implements_every_runner_view_property() -> None:
     props = [n for n, v in vars(RunnerView).items() if isinstance(v, property)]
-    assert len(props) == 17
+    assert len(props) == 20
     model = object()
     runner = testing.fake_runner(
         model=model,

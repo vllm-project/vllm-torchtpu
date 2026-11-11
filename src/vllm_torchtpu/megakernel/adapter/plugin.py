@@ -175,11 +175,18 @@ class RunnerView:
     `initialize_kv_cache`), so `create` can't read them, and `bind` can.
     """
 
-    __slots__ = ("_runner", "_tp_rank")
+    __slots__ = ("_runner", "_tp_rank", "_dcp_rank")
 
-    def __init__(self, runner: Any, *, tp_rank: int | None = None) -> None:
+    def __init__(
+        self,
+        runner: Any,
+        *,
+        tp_rank: int | None = None,
+        dcp_rank: int | None = None,
+    ) -> None:
         self._runner = runner
         self._tp_rank = tp_rank
+        self._dcp_rank = dcp_rank
 
     @property
     def vllm_config(self) -> Any:
@@ -216,6 +223,44 @@ class RunnerView:
         from vllm.distributed import get_tensor_model_parallel_rank
 
         return get_tensor_model_parallel_rank()
+
+    @property
+    def dcp_size(self) -> int:
+        """`parallel_config.decode_context_parallel_size` (1 without DCP): the
+        ranks of one DCP group, which share a KV head and each hold one shard
+        of its KV pages."""
+        dcp = self._runner.parallel_config.decode_context_parallel_size
+        if not isinstance(dcp, int) or isinstance(dcp, bool) or dcp <= 0:
+            raise RuntimeError(
+                "RunnerView.dcp_size: runner.parallel_config."
+                f"decode_context_parallel_size is {dcp!r}; expected a positive int"
+            )
+        return dcp
+
+    @property
+    def dcp_rank(self) -> int:
+        """This rank's index in its DCP group (vLLM's DCP group; 0 without
+        DCP). Raises if DCP is on but vLLM has no DCP group."""
+        if self.dcp_size == 1:
+            return 0
+        if self._dcp_rank is not None:
+            return self._dcp_rank
+        from vllm_torchtpu.distributed.dcp import get_dcp_group
+
+        group = get_dcp_group()
+        if group is None:
+            raise RuntimeError(
+                "RunnerView.dcp_rank: decode_context_parallel_size > 1 but vLLM "
+                "has no DCP group"
+            )
+        return int(group.rank_in_group)
+
+    @property
+    def dcp_interleave(self) -> int:
+        """`parallel_config.cp_kv_cache_interleave_size`: the tokens of each run
+        that one DCP rank holds before the next rank's (the KV page ownership
+        unit). Only meaningful with DCP."""
+        return int(self._runner.parallel_config.cp_kv_cache_interleave_size)
 
     @property
     def speculative_tokens(self) -> int:

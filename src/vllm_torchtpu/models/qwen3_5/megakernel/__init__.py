@@ -29,7 +29,9 @@ SPEC = TpuMonoSpec(
     create=".adapter:create",
     chips=("TPU7x",),
     tp_sizes=(8,),
-    parallelism=frozenset({"tp", "ep_in_tp"}),
+    # "dcp": decode context parallelism, with the DCP size dividing the ranks
+    # per KV head (`adapter.dcp_size_decline`); KV pages per `pool.dcp`.
+    parallelism=frozenset({"tp", "ep_in_tp", "dcp"}),
     features=frozenset({"spec_decode", "mrope", "prefix_caching", "kv_offload"}),
     requires={"mamba_ssm_cache_dtype": "bfloat16"},
     # The checkpoints this folder serves (the adapter picks it by these).
@@ -68,5 +70,6 @@ SPEC = TpuMonoSpec(
         "layer_count_mismatch",
         "unaligned_cache_layout",
         "empty_buckets",
+        "dcp_geometry_unsupported",
     ),
 )

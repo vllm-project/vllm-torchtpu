@@ -27,6 +27,7 @@ from typing import Any
 from vllm_torchtpu.megakernel.core.runtime.layout_facts import (
     CONV_ORDER_TAPS_QKV,
     PoolLayoutFacts,
+    dcp_facts,
     dtype_name,
 )
 
@@ -67,11 +68,17 @@ def framework_pool_layout_facts(
     linear_attn: Any,
     block_size: int,
     conv_qk_pair: bool,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    dcp_interleave: int = 1,
 ) -> PoolLayoutFacts:
     """Describe one rank's slot the way the framework lays it out.
 
     `pool` is the per-rank raw pool `(num_pages, *page_shape)`; `linear_attn`
-    is one of the GDN layers that alias it.
+    is one of the GDN layers that alias it. Under decode context parallelism
+    `dcp_size` / `dcp_rank` are the runner's DCP group size and this rank's
+    index in it (vLLM's DCP group), and `dcp_interleave` its
+    `cp_kv_cache_interleave_size`.
     """
     from vllm_torchtpu import gdn_pool_layout as gpl
 
@@ -114,6 +121,7 @@ def framework_pool_layout_facts(
         d_v=d_v,
         conv_taps=kernel_size - 1,
         conv_dim=conv_dim,
+        **dcp_facts(dcp_size, dcp_rank, dcp_interleave, page_size),
     )
 
 

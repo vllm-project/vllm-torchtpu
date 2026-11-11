@@ -167,6 +167,26 @@ def _extract_step_sc(
     return s, (c if c is not None else s)
 
 
+def dcp_size_decline(dcp: int, tp_size: int, num_kv_heads: int) -> Decline | None:
+    """Decline a DCP size the kernel can't shard, else `None`.
+
+    vLLM builds DCP groups as contiguous runs of `dcp` ranks inside TP and
+    gives TP rank `r` the KV head `r // (tp_size / num_kv_heads)`, so the
+    kernel's `tp_size / num_kv_heads` ranks per KV head split into shards of
+    `dcp` ranks only when `dcp` divides them (TP8 with two KV heads: dcp 1, 2
+    or 4). The kernel's DCP rank is then `tp_rank % dcp`.
+    """
+    per_head = tp_size // num_kv_heads if num_kv_heads > 0 else 0
+    if dcp == 1 or (per_head > 0 and per_head % dcp == 0):
+        return None
+    return Decline(
+        "dcp_geometry_unsupported",
+        f"Megakernel: decode_context_parallel_size={dcp} must divide the "
+        f"{per_head} ranks per KV head (tp_size={tp_size}, "
+        f"num_key_value_heads={num_kv_heads}); skipping.",
+    )
+
+
 def validate_hf_config(
     hf_cfg: Any, model_def: type[ModelDef] = Qwen35
 ) -> mk_rt.EligibilityResult:
@@ -197,6 +217,10 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decl
         return Decline("backbone_not_found", f"Megakernel: {exc}; skipping.")
     d_geom = mdef.derive_geometry()
     exp_l, tot_e = d_geom.L, d_geom.E
+    dcp = view.dcp_size
+    dec = dcp_size_decline(dcp, view.tp_size, d_geom.NKV)
+    if dec is not None:
+        return dec
     prof = mk_rt.resolve_driver_profile(cfg["profile"], model_name=mdef.name)
     el = mk_rt.check_startup_eligibility(
         num_layers=len(backbone.layers),
@@ -237,6 +261,7 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decl
         fused_pool_io_min_b_hi=owned["fused_pool_io_min_b_hi"],
         pool_gather=owned["pool_gather"],
         compile_hlo_check=cfg["compile_hlo_check"],
+        dcp_size=dcp,
     )
 
 
@@ -245,7 +270,13 @@ class Qwen35Program:
 
     Passing `mesh` loads immediately (direct use and tests); `create` leaves
     it to `load(mesh)`, after the adapter's first agreement.
+
+    `dcp_size` is the decode context parallel size: each of the `dcp_size`
+    ranks sharing a KV head holds one shard of its pages (`pool.dcp`).
     """
+
+    # Decode context parallel size (`create` passes the runner's); 1: no DCP.
+    dcp_size: int = 1
 
     def __init__(
         self,
@@ -269,6 +300,7 @@ class Qwen35Program:
         fused_pool_io_min_b_hi: int | None = None,
         pool_gather: bool | str | None = None,
         compile_hlo_check: bool | None = None,
+        dcp_size: int = 1,
     ) -> None:
         register()
         _need(mode in ("ep", "tp"), f"invalid mode={mode!r}; expected 'ep' or 'tp'")
@@ -276,6 +308,7 @@ class Qwen35Program:
         self.model, self.backbone = model, find_backbone(model)
         self.embed_tokens = self.backbone.embed_tokens
         self.tp_rank, self.mode = tp_rank, mode
+        self.dcp_size = int(dcp_size)
         self._spec_arg, self._geom_arg = spec, geom
         self._base_exec_arg, self._weights_arg = base_exec, weights
         self._reshard_ep_to_tp, self._expert_placement = (
@@ -512,10 +545,27 @@ class Qwen35Program:
             page_size=self.page_size,
             max_pages_per_seq=self.max_pages_per_seq,
         )
+        if self.dcp_size > 1:
+            c_kw["dcp"] = self.dcp_size
+            logger.info(
+                "%s megakernel binds under decode context parallelism: dcp=%d, "
+                "dcp_rank=%d (KV pages p %% %d == dcp_rank at column p // %d)",
+                self._display_name,
+                self.dcp_size,
+                self._dcp_rank,
+                self.dcp_size,
+                self.dcp_size,
+            )
         self.base_exec = mk_rt.align_cache_exec(
             self.base_exec, self.profile, self.geom, **c_kw
         )
         return self.pool_layout_facts
+
+    @property
+    def _dcp_rank(self) -> int:
+        """The DCP rank the kernel assumes: `tp_rank % dcp_size` (0 without
+        DCP); the layout facts check it against the runner's DCP group."""
+        return self.tp_rank % self.dcp_size if self.dcp_size > 1 else 0
 
     def _framework_slot_facts(
         self, view: RunnerView, linear_attn: Any, pool: torch.Tensor
@@ -523,11 +573,19 @@ class Qwen35Program:
         block = view.cache_block_size
         if block is None:
             raise ValueError("runner has no cache_config.block_size")
+        dcp_kw: dict[str, int] = {}
+        if view.dcp_size > 1:
+            dcp_kw = dict(
+                dcp_size=view.dcp_size,
+                dcp_rank=view.dcp_rank,
+                dcp_interleave=view.dcp_interleave,
+            )
         return framework_pool_layout_facts(
             pool=pool,
             linear_attn=linear_attn,
             block_size=block,
             conv_qk_pair=conv_qk_pair_layout_enabled(),
+            **dcp_kw,
         )
 
     def _adopt_framework_conv_dtype(self, conv_dtype: str) -> None:
@@ -587,8 +645,13 @@ class Qwen35Program:
                 mk_rt.EligibilityResult(False, "pool_layout_unknown", msg)
             ) from exc
         self._adopt_framework_conv_dtype(fw_facts.conv_dtype)
+        dcp_kw = (
+            dict(dcp=self.dcp_size, dcp_rank=self._dcp_rank)
+            if self.dcp_size > 1
+            else {}
+        )
         mk_facts = mk_rt.facts_from_pool_layout(
-            self.spec.cache_backend.layout, self.base_exec.R
+            self.spec.cache_backend.layout, self.base_exec.R, **dcp_kw
         )
         res = mk_rt.compare_layout_facts(mk_facts, fw_facts)
         if not res.eligible:
@@ -959,7 +1022,13 @@ class Qwen35Program:
                 p[sent.gdn_p0 : sent.gdn_p0 + rpp].view(torch.uint8).cpu().numpy()
                 for p in self.raw_pools
             ]
-            s_kw = dict(tokens_per_seq=T, bucket_t=b, variant_key=sent.variant_key)
+            s_kw: dict[str, Any] = dict(
+                tokens_per_seq=T, bucket_t=b, variant_key=sent.variant_key
+            )
+            if self.dcp_size > 1:
+                # The sentinel token (position 0, page 0) is written by the DCP
+                # rank holding page 0 only; the other shards hold no copy of it.
+                s_kw["kv_owner"] = self._dcp_rank == 0
             mk_rt.verify_sentinel_step(
                 out_b[:b].detach().float().cpu().numpy(),
                 sent_kv,

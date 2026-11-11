@@ -91,7 +91,7 @@ def test_shorthand_table_matches_the_template() -> None:
     # The adapter enforces these before `create`.
     assert qwen_plugin.SPEC.chips == ("TPU7x",)
     assert qwen_plugin.SPEC.tp_sizes == (8,)
-    assert qwen_plugin.SPEC.parallelism == frozenset({"tp", "ep_in_tp"})
+    assert qwen_plugin.SPEC.parallelism == frozenset({"tp", "ep_in_tp", "dcp"})
     assert qwen_plugin.SPEC.requires == {"mamba_ssm_cache_dtype": "bfloat16"}
     assert qwen_plugin.SPEC.numerics == "approx"
 
@@ -394,6 +394,8 @@ _QWEN_DECLINES = frozenset(
         # (no TP size: the adapter checks `SPEC.tp_sizes`)
         "layer_count_mismatch",
         "unaligned_cache_layout",
+        # create: a DCP size that doesn't divide the ranks per KV head
+        "dcp_geometry_unsupported",
         # create: `check_post_mesh_eligibility` (no mesh_size, no device_kind:
         # the adapter checks `SPEC.chips`)
         "empty_buckets",

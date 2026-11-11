@@ -50,6 +50,8 @@ def fake_runner(
     kv_transfer_config: Any = None,
     enable_eplb: bool = False,
     enable_expert_parallel: bool = False,
+    decode_context_parallel_size: int = 1,
+    cp_kv_cache_interleave_size: int = 1,
     kv_cache_dtype: str = "auto",
     mamba_ssm_cache_dtype: Any = "auto",
     mamba_cache_mode: str = "none",
@@ -90,7 +92,8 @@ def fake_runner(
         tensor_parallel_size=int(tp_size),
         data_parallel_size=1,
         prefill_context_parallel_size=1,
-        decode_context_parallel_size=1,
+        decode_context_parallel_size=int(decode_context_parallel_size),
+        cp_kv_cache_interleave_size=int(cp_kv_cache_interleave_size),
         enable_eplb=bool(enable_eplb),
         enable_expert_parallel=bool(enable_expert_parallel),
     )
