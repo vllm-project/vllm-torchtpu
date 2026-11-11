@@ -122,7 +122,9 @@ def csa2_pipeline(
         elif end < q.shape[0]:
             # Otherwise the scheduler can gather chunk 1 before chunk 0 and
             # wait for both before starting the first attention invocation.
-            current, next_ids = jax.lax.optimization_barrier((current, next_ids))
+            # Gating on q too keeps gather 1 beside attention 0: issued any
+            # earlier, it competes with the Q projection for HBM bandwidth.
+            current, next_ids, q = jax.lax.optimization_barrier((current, next_ids, q))
         following = (
             gather_csa2_kv_sc(words, scales, next_ids, deep=deep_gather)
             if end < q.shape[0]
