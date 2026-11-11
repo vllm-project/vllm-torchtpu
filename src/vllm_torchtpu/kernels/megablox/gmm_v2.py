@@ -1432,7 +1432,11 @@ def tuned_tiles(
     dequantize-before) is unchanged, so every output element is computed the
     same way.
     """
-    if fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is None or tiles.tile_k != dims.size_k:
+    if (
+        _skinny_gmm_path != "fp8_feed_wide"  # the tiles were measured on it
+        or fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is None
+        or tiles.tile_k != dims.size_k
+    ):
         return tiles
     if tiles.tile_m <= FP8_RHS_MAX_BUCKET_M:
         # Decode fp8 tiles: gate_up only (down's fused-MLP window is 2-deep).
