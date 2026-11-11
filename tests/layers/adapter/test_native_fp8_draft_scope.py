@@ -16,11 +16,16 @@
 A target attention layer's batched RPA call carries the layer's modes
 (`native_fp8`, `native_fp8_prefill`, `decode_exp2`); a speculative draft's
 layer carries none (the full-precision path the draft ships with). With
-every mode off nothing changes: the draft binds nothing new and shares the
-target's op as before.
+every mode off nothing changes: the all-off modes (the entry's default) are
+bound, and the draft shares the target's op as before.
+
+Every kernel entry the builders hand to torch_tpu's jax_op must pass
+torch_tpu's own signature check: a parameter that is not a jax.Array or POD
+type (AttentionModes, KVLayout, the mesh) has to be bound.
 """
 
 import functools
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -185,7 +190,7 @@ def test_builder_gives_a_draft_its_own_full_precision_op(
     assert len(rpa) == 2, [n for n, _ in rpa]
     (_, t_fn), (_, d_fn) = rpa
     assert t_fn.keywords["attention_modes"] == PVS
-    assert "attention_modes" not in d_fn.keywords
+    assert d_fn.keywords["attention_modes"] == native_fp8_scope.OFF
     # End to end through the bound entries. The builder binds q/k/v scales as
     # keywords: 9 positional arguments.
     assert _rpa_call_kwargs(monkeypatch, t_fn, 9) == PVS_KWARGS
@@ -204,7 +209,101 @@ def test_builder_unchanged_with_the_modes_off(
     assert t_op is d_op
     rpa = [(n, fn) for n, fn in registered if n.startswith("pallas::rpa_kernel")]
     assert len(rpa) == 1
-    assert "attention_modes" not in rpa[0][1].keywords
+    assert rpa[0][1].keywords["attention_modes"] == native_fp8_scope.OFF
+
+
+# --- torch_tpu's own signature check on the built kernel entries -------------
+
+
+def _torch_tpu_check(fn, follow_bound=True):
+    """The check torch_tpu runs on `fn` before it registers an op: jax_op's
+    (bound names from functools.partial), or with follow_bound=False the PCP
+    streaming adapter's (no bound names)."""
+    from torch_tpu._internal.pallas import pallas as torch_tpu_pallas
+
+    if follow_bound:
+        torch_tpu_pallas._verify_signature(
+            inspect.signature(inspect.unwrap(fn), eval_str=True),
+            bound_names=torch_tpu_pallas._get_bound_names(fn),
+        )
+    else:
+        torch_tpu_pallas._verify_signature(inspect.signature(fn, follow_wrapped=False))
+
+
+def _impl(cls, modes, draft, entry):
+    impl = cls(
+        num_heads=2,
+        head_size=128,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="bfloat16",
+    )
+    impl.attention_modes = modes
+    impl.native_fp8_draft = draft
+    if entry is not None:
+        # As the runner does for a tp=1 speculative draft.
+        impl._kernel_entry = entry
+        impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+    return impl
+
+
+_OFF = native_fp8_scope.OFF
+
+
+@pytest.mark.parametrize(
+    "cls, modes, draft, entry",
+    [
+        (PallasBatchedRPAAttentionBackendImpl, _OFF, False, None),
+        (PallasBatchedRPAAttentionBackendImpl, PVS, True, None),
+        (PallasBatchedRPAAttentionBackendImpl, PVS, False, None),
+        (PallasAttentionBackendImpl, _OFF, False, None),
+        (PallasAttentionBackendImpl, _OFF, False, attention._pallas_rpa_kernel_local),
+    ],
+    ids=["batched-modes-off", "batched-draft", "batched-modes-on", "default", "local"],
+)
+def test_built_entries_pass_torch_tpu_signature_check(
+    registered, cpu_vllm_config_context, cls, modes, draft, entry
+):
+    """The op every layer builds at load_model: with every mode off (a draft,
+    or a run without trade-offs) the batched entry once left AttentionModes
+    unbound, and torch_tpu refused it."""
+    impl = _impl(cls, modes, draft, entry)
+    with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
+        impl._build_rpa_kernel(None, None, None)
+    ((_, fn),) = registered
+    _torch_tpu_check(fn)
+
+
+def test_bundled_entry_passes_torch_tpu_signature_check(
+    registered, cpu_vllm_config_context
+):
+    impl = _impl(PallasAttentionBackendImpl, _OFF, False, None)
+    with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
+        impl._build_bundled_kernel(None, None, None)
+    ((_, fn),) = registered
+    _torch_tpu_check(fn)
+
+
+@pytest.mark.parametrize("modes", [_OFF, PVS], ids=["modes-off", "modes-on"])
+def test_pcp_streaming_entry_passes_torch_tpu_signature_check(
+    monkeypatch, registered, cpu_vllm_config_context, modes
+):
+    seen = []
+
+    def fake_pcp_jax_op(name, fn, **_kwargs):
+        seen.append(fn)
+        return _FakeOp()
+
+    monkeypatch.setattr(attention, "pcp_streaming_jax_op", fake_pcp_jax_op)
+    impl = _impl(PallasBatchedRPAAttentionBackendImpl, modes, False, None)
+    with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
+        impl._build_rpa_kernel(
+            None, None, None, use_pcp_streaming=True, cp_kv_cache_interleave_size=1
+        )
+    (fn,) = seen
+    _torch_tpu_check(fn, follow_bound=False)
 
 
 def test_dcp_kernels_take_the_modes(monkeypatch):

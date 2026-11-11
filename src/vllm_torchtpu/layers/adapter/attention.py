@@ -1104,8 +1104,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if "decode_lanes" in entry_params:
                 entry_kwargs["decode_lanes"] = self.decode_lanes
             # Entries without the argument run kernels that have no
-            # reduced-precision modes.
-            if modes.any() and "attention_modes" in entry_params:
+            # reduced-precision modes. Bind it whenever the entry takes it,
+            # even with every mode off (the entry's default, so nothing
+            # changes): torch_tpu's jax_op accepts a parameter that is not a
+            # jax.Array or POD type, like AttentionModes, only when bound.
+            if "attention_modes" in entry_params:
                 entry_kwargs["attention_modes"] = modes
             if block_major:
                 if "block_major" not in entry_params:
