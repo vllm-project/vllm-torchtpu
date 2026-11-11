@@ -25,7 +25,8 @@ def test_compressor_admission_fullgraph(monkeypatch, caplog, capacity, mode, reg
     monkeypatch.setattr(prep, "_mode_used", False)
     monkeypatch.setattr(prep, "_reported", set())
     torch._dynamo.reset()
-    owner = SimpleNamespace(window_size=128)
+    # A layer before `bind_compressor_layout` checks against the default layout.
+    owner = SimpleNamespace(window_size=128, _compressor_layout_fields=None)
 
     class Cache:
         def __init__(self, shape, stride, offset=0):
