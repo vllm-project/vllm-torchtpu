@@ -75,9 +75,9 @@ _GROUP_MASK = (1 << _TILE_SHIFT) - 1
 
 logger = init_logger(__name__)
 
-# TPU_MINIMAX_M3_INDEXER_V2=1: kernel v3 scores with fp8 queries as well as
-# fp8 keys, so the MXU runs fp8 x fp8 (twice the bf16 rate) instead of
-# widening the keys to bf16. Each query row is scaled so its largest |q| is
+# TPU_MINIMAX_M3_INDEXER_V2=1: kernel v3 scores fp8 pages on its token-major
+# (prefill) tiles with fp8 queries as well as fp8 keys, so the MXU runs
+# fp8 x fp8 instead of widening the keys to bf16. Each query row is scaled so its largest |q| is
 # _FP8_Q_MAX before the cast, and its maxima are scaled back: a positive
 # per-row scale keeps the order of the row's page scores, and the scaled-back
 # scores stay comparable across rows and heads (`merge_head_candidates`).
@@ -799,8 +799,13 @@ def _class_scores(
             functools.partial(
                 _kernel_v3,
                 transposed=token_major,
-                # fp8 x fp8 only for fp8 / 4-bit pages (keys exact in fp8).
-                fp8_q=fp8_q and index_cache.dtype in (jnp.float8_e4m3fn, jnp.uint8),
+                # fp8 pages on token-major (large, prefill) tiles only: there
+                # fp8 x fp8 measured -12% (2K chunk) to -20% (8K) per call; the
+                # transposed decode tiles and 4-bit pages were no faster or
+                # slower (arm8 bench, exos j-0ee19a2a).
+                fp8_q=fp8_q
+                and index_cache.dtype == jnp.float8_e4m3fn
+                and not _scores_transposed(block_q, rows_per_page, index_cache.dtype),
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
