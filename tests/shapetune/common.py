@@ -134,7 +134,7 @@ def digest(*arrays):
     for a in jax.tree_util.tree_leaves(arrays):
         a = np.asarray(jax.device_get(a))
         h.update(str(a.dtype).encode())
-        h.update(a.view(np.uint8).tobytes() if a.dtype.itemsize else b"")
+        h.update(np.ascontiguousarray(a).tobytes())
     return h.hexdigest()[:16]
 
 
