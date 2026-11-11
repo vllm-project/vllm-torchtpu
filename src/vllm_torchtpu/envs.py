@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: int = 1
     TPU_MLA_FUSED_SMALL_A2A_MERGE: bool = True
     TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: int = 4
+    TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS: str = ""
     TPU_SMALL_COLL_HBM_OPERAND: bool = True
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
@@ -681,6 +682,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # same merged [T, L, V]. Static per bucket in the JAX op.
     "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS": env_int(
         "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS", 4
+    ),
+    # Opt-in extension of fused MLA small all-to-all + in-kernel DCP merge (and
+    # the MTP drafter's small-all-to-all DCP merge cap) to 8- and 16-token
+    # decode buckets on 4-chip DCP8 ("1" = "4=kv@16,8=kv@24,16=kv@32", or an
+    # explicit T=<pins>@<MiB> bucket list; "" / "0" / "off" = off, leaving all
+    # existing caps, grids and bucket configs unchanged).
+    "TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS": lambda: os.getenv(
+        "TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS", ""
     ),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.

@@ -748,7 +748,7 @@ def merge_send_layout(
     rows = num_tokens * local
     # Padded with the real count, so the last entry is that count.
     real = query_start_loc[-1:].to(torch.int32)
-    if send_small_a2a_applies(num_tokens):
+    if send_small_a2a_applies(num_tokens, num_q_heads=world * local):
         # One Pallas round of remote DMAs + the unpack, one JAX op; partial
         # rows past the real ones zeroed as the ragged exchange leaves them.
         # The merge below is the incumbent's, on the same bits.
@@ -1042,55 +1042,72 @@ _SEND_GROUP_OPS: dict = {}
 _SEND_SMALL_OPS: dict = {}
 
 
-def send_small_a2a_applies(num_tokens: int) -> bool:
+def send_small_a2a_applies(num_tokens: int, num_q_heads: int | None = None) -> bool:
     """Whether `merge_send_layout` exchanges this bucket with the Pallas
     small all-to-all (`TPU_DCP_MLA_SEND_SMALL_A2A`): `T <= cap` on the static
     bucket size, and only where the indexer's small all-gather already lifts
     the lane operand on every bucket (so no bucket lifts a buffer another
     does not)."""
+    from vllm_torchtpu.layers.core.attention_interface import (
+        resolve_fused_small_a2a_config,
+    )
+
+    group = get_dcp_group()
+    dcp_size = None if group is None else int(group.world_size)
     return bool(
         envs.TPU_DCP_MLA_SEND_SMALL_A2A
         and envs.TPU_DCP_INDEXER_SMALL_AG
         and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
         and envs.TPU_DCP_RANK_OPERAND
-        and num_tokens <= envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
+        and num_tokens
+        <= resolve_fused_small_a2a_config(
+            num_q_heads=num_q_heads, dcp_size=dcp_size
+        ).send_max_tokens
     )
 
 
-def fused_small_a2a_applies(num_tokens: int) -> bool:
+def fused_small_a2a_applies(num_tokens: int, num_q_heads: int | None = None) -> bool:
     """Whether the decode MLA kernel runs this bucket's small all-to-all
     itself (`TPU_MLA_FUSED_SMALL_A2A`): a bucket `send_small_a2a_applies`
     takes whose attention grid is one step -- the decode body lever "step8"
-    on the capped fused-prep row-widths body. The only token-count gate is
-    `send_small_a2a_applies`' `T <= cap` (a power of 2): the rest is static --
-    the cap itself at most DECODE_STEP8_TOKENS (a power-of-2 bucket at or
-    below it is its own step) and within the small-chunk path. Fixed at trace
-    time on the static bucket size. The cap is the one that applies at this
-    DCP size (`dcp_mla_topk_cap`: the auto default caps only at DCP >= 8)."""
+    (or "step16" when enabled) on the capped fused-prep row-widths body. The
+    only token-count gate is `send_small_a2a_applies`' `T <= cap` (a power of
+    2): the rest is static -- the cap itself at most the step token bound (a
+    power-of-2 bucket at or below it is its own step) and within the
+    small-chunk path. Fixed at trace time on the static bucket size. The cap
+    is the one that applies at this DCP size (`dcp_mla_topk_cap`: the auto
+    default caps only at DCP >= 8)."""
     from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
-    from vllm_torchtpu.layers.core.attention_interface import dcp_mla_topk_cap
+    from vllm_torchtpu.layers.core.attention_interface import (
+        dcp_mla_topk_cap,
+        resolve_fused_small_a2a_config,
+    )
 
-    if not (envs.TPU_MLA_FUSED_SMALL_A2A and send_small_a2a_applies(num_tokens)):
+    if not (
+        envs.TPU_MLA_FUSED_SMALL_A2A
+        and send_small_a2a_applies(num_tokens, num_q_heads=num_q_heads)
+    ):
         return False
     group = get_dcp_group()
-    dcp_size = 1 if group is None else int(group.world_size)
-    value = envs.TPU_MLA_DECODE_BODY_LEVERS
-    levers = (
-        sparse_kernel.DECODE_BODY_DEFAULT
-        if value == "1"
-        else tuple(
-            v.strip() for v in (value or "").split(",") if v.strip() and v != "0"
-        )
+    dcp_size = None if group is None else int(group.world_size)
+    if not dcp_mla_topk_cap(1 if dcp_size is None else dcp_size):
+        return False
+    cfg = resolve_fused_small_a2a_config(
+        num_q_heads=num_q_heads,
+        dcp_size=dcp_size,
+    )
+    levers = cfg.decode_levers
+    step_cap = (
+        sparse_kernel.DECODE_STEP16_TOKENS
+        if "step16" in levers
+        else sparse_kernel.DECODE_STEP8_TOKENS
     )
     return bool(
-        "step8" in levers
-        and dcp_mla_topk_cap(dcp_size)
+        ("step8" in levers or "step16" in levers)
         and envs.TPU_DCP_MLA_FUSED_PREP
         and envs.TPU_MLA_DECODE_ROW_WIDTHS
-        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
-        <= sparse_kernel.DECODE_STEP8_TOKENS
-        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
-        <= envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
+        and cfg.send_max_tokens <= step_cap
+        and cfg.send_max_tokens <= envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
     )
 
 
@@ -1538,8 +1555,11 @@ def prebuild_sized_merge(world: int) -> None:
     # as data on every bucket (the small all-to-all addresses peers by them);
     # buckets above the small cap ignore them.
     from vllm_torchtpu.distributed.dcp import dcp_lane_operand, dcp_rank_operand
+    from vllm_torchtpu.layers.core.attention_interface import (
+        resolve_fused_small_a2a_config,
+    )
 
-    small_cap = int(envs.TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS)
+    small_cap = resolve_fused_small_a2a_config(dcp_size=world).mtp_merge_max_tokens
     lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
     assert len(lane_axes) <= 1, mesh.axis_names
     lane_axis = lane_axes[0] if lane_axes else None

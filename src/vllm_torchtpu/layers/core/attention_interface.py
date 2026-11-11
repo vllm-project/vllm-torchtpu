@@ -1,7 +1,7 @@
 import functools
 import math
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -1130,32 +1130,180 @@ def kv_write_in_gather_supported(
     )
 
 
-def fused_small_a2a_bucket_config(num_tokens: int) -> tuple[bool | tuple, int]:
+FUSED_SMALL_A2A_4CHIP_DEFAULT_BUCKETS = "4=kv@16,8=kv@24,16=kv@32"
+IN_KERNEL_MERGE_MAX_SEND_ROWS = 128
+
+
+class FusedSmallA2AConfig(NamedTuple):
+    bucket_spec: str
+    send_max_tokens: int
+    merge_max_tokens: int
+    mtp_merge_max_tokens: int
+    decode_levers: tuple[str, ...]
+
+
+def _parse_bucket_pin_and_mib(
+    entry_pins: str,
+    entry_mib: str,
+    knob: str,
+    default_vmem_mib: int | None = None,
+) -> tuple[bool | tuple, int]:
+    pins = entry_pins.strip()
+    if pins == "all":
+        pin: bool | tuple = True
+    elif pins in ("none", ""):
+        pin = False
+    else:
+        pin = tuple(sorted(p.strip() for p in pins.split("+")))
+        bad = set(pin) - set(sparse_mla_kernel.SEND_EXCHANGE_PIN_ROLES)
+        if bad:
+            raise ValueError(f"{knob}: unknown roles {bad}")
+    vmem_mib = (
+        int(entry_mib)
+        if entry_mib.strip()
+        else (
+            int(envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB)
+            if default_vmem_mib is None
+            else default_vmem_mib
+        )
+    )
+    if vmem_mib < 1:
+        raise ValueError(f"{knob}: invalid VMEM MiB {entry_mib!r}")
+    return pin, vmem_mib
+
+
+def resolve_fused_small_a2a_config(
+    num_q_heads: int | None = None,
+    dcp_size: int | None = None,
+    *,
+    fused_bucket: bool = True,
+) -> FusedSmallA2AConfig:
+    """Resolve effective fused small-all-to-all caps, bucket spec and decode levers.
+
+    When `TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS` is unset / `"0"` / `"off"`,
+    returns the existing defaults unchanged. When set (`"1"` expands to
+    `FUSED_SMALL_A2A_4CHIP_DEFAULT_BUCKETS`, or an explicit `T=<pins>@<MiB>`
+    list), raises the effective caps to `max(buckets)` and, whenever both
+    `num_q_heads` and `dcp_size` are known, validates every bucket's
+    `tl = T * (num_q_heads // dcp_size) <= 128`.
+    """
+    bucket_spec = (envs.TPU_MLA_FUSED_SMALL_A2A_BUCKETS or "").strip()
+    levers = _decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS or "")
+    send_max = int(envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS)
+    merge_max = int(envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS)
+    mtp_merge_max = int(envs.TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS)
+    raw = (envs.TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS or "").strip()
+    if raw.lower() in ("", "0", "off", "false"):
+        return FusedSmallA2AConfig(
+            bucket_spec=bucket_spec,
+            send_max_tokens=send_max,
+            merge_max_tokens=merge_max,
+            mtp_merge_max_tokens=mtp_merge_max,
+            decode_levers=levers,
+        )
+
+    if dcp_size is not None and dcp_size < 1:
+        raise ValueError(
+            f"TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS: dcp_size ({dcp_size}) must be >= 1"
+        )
+    send_per: int | None = None
+    if num_q_heads is not None:
+        if num_q_heads < 1:
+            raise ValueError(
+                "TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS: num_q_heads "
+                f"({num_q_heads}) must be >= 1"
+            )
+        if dcp_size is not None:
+            if num_q_heads % dcp_size != 0:
+                raise ValueError(
+                    "TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS: num_q_heads "
+                    f"({num_q_heads}) must be divisible by dcp_size ({dcp_size})"
+                )
+            send_per = num_q_heads // dcp_size
+
+    default_vmem_mib = int(envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB)
+    spec = FUSED_SMALL_A2A_4CHIP_DEFAULT_BUCKETS if raw == "1" else raw
+    buckets: list[int] = []
+    for raw_entry in spec.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        tok_s, eq, rest = entry.partition("=")
+        if not eq:
+            raise ValueError(
+                f"TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS: invalid spec {raw!r}"
+            )
+        try:
+            tokens = int(tok_s)
+        except ValueError as exc:
+            raise ValueError(
+                f"TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS: invalid spec {raw!r}"
+            ) from exc
+        if tokens < 1:
+            raise ValueError(
+                f"TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS: invalid spec {raw!r}"
+            )
+        pins, _, mib = rest.partition("@")
+        _parse_bucket_pin_and_mib(
+            pins,
+            mib,
+            "TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS",
+            default_vmem_mib=default_vmem_mib,
+        )
+        if send_per is not None:
+            tl = tokens * send_per
+            if tl > IN_KERNEL_MERGE_MAX_SEND_ROWS:
+                raise ValueError(
+                    f"TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS: bucket T={tokens} "
+                    f"requires tl={tl} send rows (> {IN_KERNEL_MERGE_MAX_SEND_ROWS}) "
+                    f"at num_q_heads={num_q_heads}, dcp_size={dcp_size}"
+                )
+        if tokens > sparse_mla_kernel.DECODE_STEP16_TOKENS:
+            raise ValueError(
+                f"TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS: bucket T={tokens} "
+                f"exceeds step16 bound ({sparse_mla_kernel.DECODE_STEP16_TOKENS})"
+            )
+        buckets.append(tokens)
+    if not buckets:
+        raise ValueError(f"TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS: invalid spec {raw!r}")
+
+    opt_max = max(buckets)
+    if (
+        bool(fused_bucket)
+        and opt_max > sparse_mla_kernel.DECODE_STEP8_TOKENS
+        and "step8" in levers
+        and "step16" not in levers
+    ):
+        levers = (*levers, "step16")
+    return FusedSmallA2AConfig(
+        bucket_spec=spec,
+        send_max_tokens=max(send_max, opt_max),
+        merge_max_tokens=max(merge_max, opt_max),
+        mtp_merge_max_tokens=max(mtp_merge_max, opt_max),
+        decode_levers=levers,
+    )
+
+
+def fused_small_a2a_bucket_config(
+    num_tokens: int,
+    *,
+    num_q_heads: int | None = None,
+    dcp_size: int | None = None,
+) -> tuple[bool | tuple, int]:
     """TPU_MLA_FUSED_SMALL_A2A: (operands pinned to HBM, scoped VMEM MiB) of the
     fused call at a decode bucket of `num_tokens` (static: the JAX op's shape).
-    TPU_MLA_FUSED_SMALL_A2A_BUCKETS, when set, gives it per bucket as
+    TPU_MLA_FUSED_SMALL_A2A_BUCKETS (or TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS
+    when set) gives it per bucket as
     `T=<pins>@<MiB>` entries (`<pins>`: all | none | roles of
     `sparse_mla_kernel.SEND_EXCHANGE_PIN_ROLES` joined by `+`); a bucket it does
     not list, or an empty knob, takes PIN_MIN_TOKENS / PIN_VMEM_MIB / VMEM_MIB."""
-    spec = (envs.TPU_MLA_FUSED_SMALL_A2A_BUCKETS or "").strip()
+    spec = resolve_fused_small_a2a_config(num_q_heads, dcp_size).bucket_spec
     for entry in filter(None, (e.strip() for e in spec.split(","))):
         tokens, _, rest = entry.partition("=")
         pins, _, mib = rest.partition("@")
         if int(tokens) != num_tokens:
             continue
-        pins = pins.strip()
-        if pins == "all":
-            pin: bool | tuple = True
-        elif pins in ("none", ""):
-            pin = False
-        else:
-            pin = tuple(sorted(p.strip() for p in pins.split("+")))
-            bad = set(pin) - set(sparse_mla_kernel.SEND_EXCHANGE_PIN_ROLES)
-            if bad:
-                raise ValueError(
-                    f"TPU_MLA_FUSED_SMALL_A2A_BUCKETS: unknown roles {bad}"
-                )
-        return pin, int(mib) if mib.strip() else envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB
+        return _parse_bucket_pin_and_mib(pins, mib, "TPU_MLA_FUSED_SMALL_A2A_BUCKETS")
     pin = num_tokens >= envs.TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS
     vmem_mib = (
         envs.TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB
@@ -1388,10 +1536,12 @@ def sparse_mla_attention_dcp(
             )
         # TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: buckets above it keep the
         # kernel's exchange but merge in the op (jnp), same result schema.
-        merge_here = bool(
-            fused_merge
-            and topk_idx.shape[0] <= envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS
+        a2a_cfg = resolve_fused_small_a2a_config(
+            ql_nope.shape[1],
+            dcp_size,
+            fused_bucket=bool(fused_exchange and fuse_here),
         )
+        merge_here = bool(fused_merge and topk_idx.shape[0] <= a2a_cfg.merge_max_tokens)
         if dcp_rank_ids is not None:
             dcp_rank = extra_[int(q_rope)][0]
         else:
@@ -1484,7 +1634,11 @@ def sparse_mla_attention_dcp(
                     split_kwargs["send_world"] = dcp_size
                 if fused_exchange and fuse_here:
                     # Static per bucket (the JAX op's shape, not a torch gate).
-                    pin, vmem_mib = fused_small_a2a_bucket_config(num_tokens)
+                    pin, vmem_mib = fused_small_a2a_bucket_config(
+                        num_tokens,
+                        num_q_heads=ql_nope.shape[1],
+                        dcp_size=dcp_size,
+                    )
                     split_kwargs["send_exchange"] = (
                         dcp_axis_name,
                         lane_axis,
@@ -1589,7 +1743,7 @@ def sparse_mla_attention_dcp(
                 if topk_cap
                 else ()
             ),
-            decode_body_levers=_decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS),
+            decode_body_levers=a2a_cfg.decode_levers,
             out_pieces=out_pieces,
             out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
             **chunk_kwargs,
