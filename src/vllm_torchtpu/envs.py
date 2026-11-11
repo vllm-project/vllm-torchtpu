@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     TPU_MINIMAX_M3_SPLIT_MIN_TOKENS: int = 0
     TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST: bool = True
+    TPU_MINIMAX_M3_DCP_HEADS_ATTEND: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -752,6 +753,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster at c16/c48, slower at c4 (batch-1 mixed steps).
     "TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST": env_bool(
         "TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST", default=True
+    ),
+    # MiniMax M3, 4-bit DCP caches over several KV heads per rank group: steps
+    # of >= 2048 tokens attend their prefill requests head-parallel (each
+    # rank fetches its KV head's pages and attends its own query heads, no
+    # query gather or partial merge; `msa_dcp_heads`). r6; default off.
+    "TPU_MINIMAX_M3_DCP_HEADS_ATTEND": env_bool(
+        "TPU_MINIMAX_M3_DCP_HEADS_ATTEND", default=False
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
