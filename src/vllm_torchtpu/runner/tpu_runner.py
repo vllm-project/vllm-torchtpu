@@ -1502,6 +1502,18 @@ class TPUModelRunner(GPUModelRunner):
             self._spec_synthetic_ingraph_rng = fused_spec_verify.ingraph_rng_enabled(
                 self.vllm_config.additional_config
             )
+            if (
+                self._spec_glue_fusion
+                or self._spec_synthetic_ingraph_rng
+                or self._synthetic_one_row_verify
+            ):
+                logger.info(
+                    "Spec decode opt-ins: spec_glue_fusion=%s "
+                    "spec_synthetic_ingraph_rng=%s spec_synthetic_one_row_verify=%s",
+                    self._spec_glue_fusion,
+                    self._spec_synthetic_ingraph_rng,
+                    self._synthetic_one_row_verify,
+                )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "dflash":
