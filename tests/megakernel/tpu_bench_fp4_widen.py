@@ -96,7 +96,8 @@ def _ffn_tail(h, xdt):
     return mid.astype(xdt)
 
 
-def make_kernel(variant: str, rows: int, D: int, rep: int, xdt, qb13=128, qb2=64, G=1, nbuf=2):
+def make_kernel(variant: str, rows: int, D: int, rep: int, xdt, qb13=128, qb2=64, G=1, nbuf=2,
+                resident=False):
     nb13, nb2 = H // qb13, I // qb2
 
     def body(x_ref, w13_g, s13_g, w2_g, s2_g, o_ref):
@@ -161,6 +162,8 @@ def make_kernel(variant: str, rows: int, D: int, rep: int, xdt, qb13=128, qb2=64
 
     def wspec(shape):
         kw = {"pipeline_mode": pl.Buffered(nbuf)} if nbuf != 2 else {}
+        if resident:  # compute only: the same G experts every step, fetched once
+            return pl.BlockSpec((G,) + shape[1:], lambda r, d: (0,) * len(shape), **kw)
         return pl.BlockSpec((G,) + shape[1:], lambda r, d: (d,) + (0,) * (len(shape) - 1), **kw)
 
     call = pl.pallas_call(
@@ -235,6 +238,8 @@ def main():
     ap.add_argument("--interpret", action="store_true")
     ap.add_argument("--group", type=int, nargs="+", default=[1], help="experts per grid step")
     ap.add_argument("--nbuf", type=int, nargs="+", default=[2], help="weight pipeline buffers")
+    ap.add_argument("--resident", action="store_true",
+                    help="compute-only timing: weights fetched once (no per-step DMA)")
     a = ap.parse_args()
     if a.interpret:
         original = pl.pallas_call
@@ -253,7 +258,8 @@ def main():
                 for v in a.variants:
                     key = f"r{rows}_g{G}_b{nbuf}_x{xname}_{v}"
                     try:
-                        call = make_kernel(v, max(rows, 8), D, a.rep, xdt, G=G, nbuf=nbuf)[0]
+                        call = make_kernel(v, max(rows, 8), D, a.rep, xdt, G=G, nbuf=nbuf,
+                                           resident=a.resident)[0]
                         args = inputs(v, max(rows, 8), D, xdt, rng)
                         f = jax.jit(call)
                         jax.block_until_ready(f(*args))
