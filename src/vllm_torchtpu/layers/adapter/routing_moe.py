@@ -58,6 +58,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
     get_ep_group,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
+from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -107,15 +108,25 @@ def unsupported_reason(layer) -> str | None:
 
 
 def _route(
-    gating: jax.Array, topk: int, renormalize: bool, scoring_fn: str
+    gating: jax.Array,
+    topk: int,
+    renormalize: bool,
+    scoring_fn: str,
+    topk_impl: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """moe_router.select_experts for the scoring functions admitted above."""
+    if topk_impl is None:
+        topk_impl = envs.TPU_MOE_ROUTER_TOPK
     gating = gating.astype(jnp.float32)
     if scoring_fn == "softmax":
         scores = jax.nn.softmax(gating, axis=-1)
     else:
         scores = jax.nn.sigmoid(gating)
-    weights, ids = lax.top_k(scores, topk)
+    on_tpu = jax.default_backend() == "tpu"
+    if topk_impl == "rowmax" and (not on_tpu or scores.shape[1] % 128 == 0):
+        weights, ids = router_select(scores, topk, interpret=not on_tpu)
+    else:
+        weights, ids = lax.top_k(scores, topk)
     if renormalize:
         weights = weights / jnp.sum(weights, axis=-1, keepdims=True)
     return weights, ids.astype(jnp.int32)
@@ -144,6 +155,7 @@ def _build_op(
     replica_groups: tuple[tuple[int, ...], ...],
     remote_scatter: bool,
 ):
+    topk_impl = envs.TPU_MOE_ROUTER_TOPK
     key = (
         topk,
         renormalize,
@@ -152,6 +164,7 @@ def _build_op(
         mesh_expert_order,
         replica_groups,
         remote_scatter,
+        topk_impl,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -195,7 +208,7 @@ def _build_op(
         def split_and_route(x_l, gating_l, rank_l):
             me = rank_l[0, 0]
             weights, ids = _route(
-                layout.split(gating_l, me), topk, renormalize, scoring_fn
+                layout.split(gating_l, me), topk, renormalize, scoring_fn, topk_impl
             )
             if relabel is not None:
                 ids = relabel[ids]
@@ -261,6 +274,7 @@ def _tp_moe_fn(
     scoring_fn: str,
     activation: str,
     kernel,
+    topk_impl: str | None = None,
 ):
     """The TP op's body: `kernel` is tokamax's `modular.routing_moe`.
 
@@ -271,6 +285,8 @@ def _tp_moe_fn(
     Every rank already holds exactly its own slice, so the conversion is an
     identity shard_map that only relabels the sharding, without moving data.
     """
+    if topk_impl is None:
+        topk_impl = envs.TPU_MOE_ROUTER_TOPK
     axis = mesh.axis_names[0]
     rows = PartitionSpec(axis)
     replicated = PartitionSpec()
@@ -285,7 +301,7 @@ def _tp_moe_fn(
         )(a)
 
     def route(x_l, gating_l):
-        weights, ids = _route(gating_l, topk, renormalize, scoring_fn)
+        weights, ids = _route(gating_l, topk, renormalize, scoring_fn, topk_impl)
         return x_l, weights, ids
 
     def moe(
@@ -353,7 +369,8 @@ def _build_tp_op(
     scoring_fn: str,
     activation: str,
 ):
-    key = ("tp", topk, renormalize, scoring_fn, activation)
+    topk_impl = envs.TPU_MOE_ROUTER_TOPK
+    key = ("tp", topk, renormalize, scoring_fn, activation, topk_impl)
     cached = _OPS.get(key)
     if cached is not None:
         return cached
@@ -365,7 +382,13 @@ def _build_tp_op(
     op = jax_op(
         name,
         _tp_moe_fn(
-            mesh, topk, renormalize, scoring_fn, activation, tk_modular.routing_moe
+            mesh,
+            topk,
+            renormalize,
+            scoring_fn,
+            activation,
+            tk_modular.routing_moe,
+            topk_impl,
         ),
         mesh=mesh,
         input_partition_specs=(spec,) * 7,

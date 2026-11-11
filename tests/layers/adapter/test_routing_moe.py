@@ -301,11 +301,13 @@ def test_relabel_table():
     assert sorted(table) == list(range(12))
 
 
+@pytest.mark.parametrize("topk_impl", ["rowmax", "sort"])
 @pytest.mark.parametrize("scoring_fn", ["softmax", "sigmoid"])
 @pytest.mark.parametrize("renormalize", [True, False])
-def test_route_matches_select_experts(scoring_fn, renormalize):
+def test_route_matches_select_experts(topk_impl, scoring_fn, renormalize):
     gating = jax.random.normal(jax.random.key(0), (5, 16), jnp.bfloat16)
-    weights, ids = bridge._route(gating, 4, renormalize, scoring_fn)
+    with patch.object(envs, "TPU_MOE_ROUTER_TOPK", topk_impl):
+        weights, ids = bridge._route(gating, 4, renormalize, scoring_fn)
     g = np.asarray(gating, np.float32)
     scores = (
         np.exp(g) / np.exp(g).sum(-1, keepdims=True)
@@ -319,6 +321,26 @@ def test_route_matches_select_experts(scoring_fn, renormalize):
     np.testing.assert_array_equal(np.sort(ids, -1), np.sort(want_ids, -1))
     np.testing.assert_allclose(np.sort(weights, -1), np.sort(want, -1), rtol=1e-5)
     assert ids.dtype == jnp.int32
+
+
+def test_route_dispatches_to_router_topk_on_rowmax():
+    gating = jax.random.normal(jax.random.key(7), (16, 512), jnp.bfloat16)
+    with (
+        patch.object(envs, "TPU_MOE_ROUTER_TOPK", "rowmax"),
+        patch.object(bridge, "router_select", wraps=bridge.router_select) as sel_spy,
+    ):
+        w_rowmax, i_rowmax = bridge._route(gating, 10, True, "softmax")
+        assert sel_spy.call_count == 1
+    with (
+        patch.object(envs, "TPU_MOE_ROUTER_TOPK", "sort"),
+        patch.object(bridge, "router_select", wraps=bridge.router_select) as sel_spy,
+    ):
+        w_sort, i_sort = bridge._route(gating, 10, True, "softmax")
+        assert sel_spy.call_count == 0
+    np.testing.assert_array_equal(np.asarray(i_rowmax), np.asarray(i_sort))
+    np.testing.assert_allclose(
+        np.asarray(w_rowmax), np.asarray(w_sort), rtol=1e-6, atol=1e-6
+    )
 
 
 class TestOutputIsReduced:
