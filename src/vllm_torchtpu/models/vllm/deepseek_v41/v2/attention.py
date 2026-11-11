@@ -1273,6 +1273,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             # Block-outer groups give each SWA layer its own row offset within
             # the block; the metadata is otherwise identical, so the key omits
             # the offset and _shift_swa_metadata moves the cached result.
+            # Upstream deals SWA layers to groups round-robin, so consecutive
+            # layers use different block tables: keep one entry per table, or
+            # each layer evicts the previous group's entry and always misses.
             meta_key = (
                 "csa2_swa",
                 rows_per_page,
@@ -1280,8 +1283,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 non_causal,
                 self._ced_decoder,
             )
-            cached = stage_cache.get(meta_key) if stage_cache is not None else None
-            if cached is None or cached[0] is not swa.block_tables:
+            entries = (
+                stage_cache.setdefault(meta_key, []) if stage_cache is not None else []
+            )
+            cached = next((e for e in entries if e[0] is swa.block_tables), None)
+            if cached is None:
                 if (
                     self._fused_preprocess
                     and swa_cache.swa_words
@@ -1313,14 +1319,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             non_causal,
                         )
                     )
-                if stage_cache is not None:
-                    stage_cache[meta_key] = (
+                entries.append(
+                    (
                         swa.block_tables,
                         swa_cache.row_offset,
                         csa2_metadata,
                         csa2_bounds,
                         csa2_write_records,
                     )
+                )
             else:
                 _, offset, csa2_metadata, csa2_bounds, csa2_write_records = cached
                 csa2_metadata, csa2_write_records = _shift_swa_metadata(
