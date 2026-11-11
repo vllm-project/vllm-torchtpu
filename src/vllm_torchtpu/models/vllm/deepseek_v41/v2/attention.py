@@ -184,6 +184,26 @@ def _shift_swa_metadata(metadata, records, shift, page_size):
     return metadata, records
 
 
+def _swa_group_tables(metadata, shape):
+    """Distinct SWA block tables of this forward, in first-use order.
+
+    Block-outer packing deals SWA layers to several groups, each with its own
+    table; layers of one group share the table object. Tables of another
+    shape (another request layout) are left to their own preparation.
+    """
+    tables = []
+    for name, value in metadata.items():
+        table = getattr(value, "block_tables", None)
+        if (
+            name.endswith(".swa_cache")
+            and table is not None
+            and table.numel() == shape[0] * shape[1]
+            and not any(table is seen for seen in tables)
+        ):
+            tables.append(table)
+    return tables
+
+
 def _replayed(metadata, positions, starts, window):
     """Tokens a prefix hit replays: their prefix-cached KV must stay as is."""
     requests = _token_requests(metadata, positions).clamp(max=starts.shape[0] - 1)
@@ -1287,6 +1307,24 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 stage_cache.setdefault(meta_key, []) if stage_cache is not None else []
             )
             cached = next((e for e in entries if e[0] is swa.block_tables), None)
+            if cached is None and stage_cache is not None and not entries:
+                # First CSA2 layer of the stage: one program prepares every SWA
+                # group's table, so later layers of other groups also hit.
+                tables = _swa_group_tables(metadata, swa_table.shape)
+                if len(tables) > 1 and any(t is swa.block_tables for t in tables):
+                    batched, bounds, records = csa2_adapter.prepare_swa_tables(
+                        torch.stack([t.reshape(swa_table.shape) for t in tables]),
+                        swa.query_start_loc,
+                        positions,
+                        minimum,
+                        swa_cache,
+                        non_causal,
+                    )
+                    entries.extend(
+                        (table, 0, batched[g], bounds, records[g])
+                        for g, table in enumerate(tables)
+                    )
+                    cached = next(e for e in entries if e[0] is swa.block_tables)
             if cached is None:
                 if (
                     self._fused_preprocess
