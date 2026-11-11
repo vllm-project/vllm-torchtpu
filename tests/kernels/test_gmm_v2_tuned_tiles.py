@@ -109,7 +109,8 @@ def test_prefill_buckets_128(tpu7x, monkeypatch, size_m):
         assert t.bucket_sizes == (128, 256)
 
 
-def test_bf16_after_path_untouched(tpu7x, monkeypatch):
-    G.set_skinny_gmm_path("bf16_after")
-    for size_m in (128, 8192):
+@pytest.mark.parametrize("path", ["bf16_after", "fp8_feed"])
+def test_other_skinny_paths_untouched(tpu7x, monkeypatch, path):
+    G.set_skinny_gmm_path(path)
+    for size_m in (128, 1024, 8192):
         assert _tiles(size_m, True, monkeypatch) == _tiles(size_m, False, monkeypatch)
