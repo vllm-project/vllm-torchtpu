@@ -153,8 +153,6 @@ spec:
           value: "decode"
         - name: TPU_RAIDEN_ENGINE_ID
           value: "decode-engine"
-        - name: TPU_KV_TRANSFER_NAMESPACE
-          value: "decode"
         - name: TPU_GDN_CONV_STATE_TILE_PAD
           value: "1"
         - name: XLA_PYTHON_CLIENT_PREALLOCATE
@@ -185,12 +183,8 @@ spec:
           value: "64"
         - name: TPU_P2P_WAIT_PULL_TIMEOUT
           value: "600"
-        - name: TPU_KV_SHM_POOL_GB
-          value: "8"
         - name: TPU_KV_TRANSFER_PORT
           value: "9100"
-        - name: TPU_SIDE_CHANNEL_PORT
-          value: "9600"
         ports:
         - containerPort: 8000
         resources:
