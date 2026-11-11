@@ -657,6 +657,13 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
     return next(iter(found.values()))
 
 
+# Fewest request rows per rank for which the synthetic verify splits them:
+# the sampler's top-p bisection is launch-bound below that (the same 31
+# passes for 1, 2 or 8 rows), so a split only adds its two collectives
+# (c4 twin, 8 requests: +24 us).
+_SYNTHETIC_ROW_SPLIT_MIN_ROWS = 4
+
+
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
@@ -664,6 +671,7 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 #      gather_logprobs) so _dummy_run and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
+
 class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     drafter: NgramProposer | DFlashProposer | Eagle3Proposer | None
@@ -4824,9 +4832,11 @@ class TPUModelRunner(GPUModelRunner):
         over the TP ranks (`_synthetic_verify_logits`)."""
         from vllm.distributed import get_tensor_model_parallel_world_size
 
+        tp = get_tensor_model_parallel_world_size()
         return (
             self._synthetic_row_rank is not None
-            and padded_num_reqs % get_tensor_model_parallel_world_size() == 0
+            and padded_num_reqs % tp == 0
+            and padded_num_reqs // tp >= _SYNTHETIC_ROW_SPLIT_MIN_ROWS
         )
 
     def _sample_synthetic_verify(
