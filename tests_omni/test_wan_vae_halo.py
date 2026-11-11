@@ -98,12 +98,12 @@ def test_patch_idempotent_and_kill_switch_on_real_omni(wan_vae_modules, monkeypa
         wan_spatial_shard, "_tpu_orig_all_gather_along_dim", raising=False
     )
 
-    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "0")
+    monkeypatch.setenv("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", "0")
     patches._patch_wan_vae_halo_allgather()
     assert wan_spatial_shard._halo_exchange_p2p is orig_fn
     assert not hasattr(wan_spatial_shard, "_tpu_orig_halo_exchange_p2p")
 
-    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    monkeypatch.setenv("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", "1")
     patches._patch_wan_vae_halo_allgather()
     patched_fn = wan_spatial_shard._halo_exchange_p2p
     assert patched_fn is not orig_fn
@@ -163,7 +163,7 @@ def test_patch_warns_and_skips_on_upstream_drift(wan_vae_modules, monkeypatch, d
         )
     else:
         monkeypatch.delattr(wan_spatial_shard, "_halo_exchange_p2p")
-    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    monkeypatch.setenv("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", "1")
     before = getattr(wan_spatial_shard, "_halo_exchange_p2p", None)
     warnings = _record_warnings(monkeypatch)
 
@@ -408,7 +408,7 @@ def _check_wan21_720p_on_8_ranks(
     )
 
     # Fresh spawned process: enable the gate; the patches are idempotent.
-    os.environ["VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER"] = "1"
+    os.environ["VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES"] = "1"
     patches._patch_wan_vae_halo_allgather()
     patches._patch_distributed_vae_host_metadata_collectives()
 
@@ -569,7 +569,7 @@ def test_all_gather_along_dim_and_tile_gather_sync_on_tpu_device(
         "_tpu_orig_compute_global_padding_shape",
         raising=False,
     )
-    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    monkeypatch.setenv("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", "1")
     patches._patch_wan_vae_halo_allgather()
     patches._patch_distributed_vae_host_metadata_collectives()
 
@@ -597,7 +597,10 @@ def test_all_gather_along_dim_and_tile_gather_sync_on_tpu_device(
     )
     assert out_non_dst.numel() == 0
     assert len(sync_calls) == 1
-    assert sync_calls[0] == (None, False)
+    # Only the gathered chunks are synced, not the whole deferred graph.
+    synced, wait = sync_calls[0]
+    assert isinstance(synced, list) and len(synced) == 2
+    assert wait is False
 
     # dst=None (attention gather) does not force a chunk boundary sync.
     sync_calls.clear()
@@ -636,7 +639,7 @@ def test_sync_final_result_broadcasts_shape_on_host_group(wan_vae_modules, monke
     monkeypatch.delattr(
         executor_cls, "_tpu_orig_compute_global_padding_shape", raising=False
     )
-    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    monkeypatch.setenv("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", "1")
     patches._patch_distributed_vae_host_metadata_collectives()
     assert hasattr(executor_cls, "_tpu_orig_sync_final_result")
 
@@ -705,7 +708,7 @@ def test_host_metadata_patch_skips_without_sync_errors(wan_vae_modules, monkeypa
     monkeypatch.setattr(
         distributed_vae_executor, "DistributedVaeExecutor", executor_cls
     )
-    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    monkeypatch.setenv("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", "1")
     warnings = _record_warnings(monkeypatch)
 
     patches._patch_distributed_vae_host_metadata_collectives()
@@ -753,7 +756,7 @@ def test_host_metadata_patch_falls_back_without_error_group(
         "DistributedVaeExecutor",
         _ExecutorWithoutErrorGroup,
     )
-    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    monkeypatch.setenv("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", "1")
     warnings = _record_warnings(monkeypatch)
 
     patches._patch_distributed_vae_host_metadata_collectives()
@@ -783,14 +786,14 @@ def test_wan_vae_replicated_encode_skips_distributed_executor(
     monkeypatch.delattr(cls, "_tpu_orig_encode", raising=False)
     monkeypatch.delattr(cls, "_tpu_orig_tiled_encode", raising=False)
 
-    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "0")
+    monkeypatch.setenv("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", "0")
     patches._patch_wan_vae_replicated_encode()
     assert cls._encode is orig_encode
     assert cls.tiled_encode is orig_tiled_encode
     assert not hasattr(cls, "_tpu_orig_encode")
     assert not hasattr(cls, "_tpu_orig_tiled_encode")
 
-    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    monkeypatch.setenv("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", "1")
     patches._patch_wan_vae_replicated_encode()
     patched_encode = cls._encode
     patched_tiled = cls.tiled_encode
@@ -859,7 +862,7 @@ def test_wan_vae_replicated_encode_restores_tiling_and_respects_single_rank(
     monkeypatch.delattr(cls, "_tpu_orig_encode", raising=False)
     monkeypatch.delattr(cls, "_tpu_orig_tiled_encode", raising=False)
 
-    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    monkeypatch.setenv("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", "1")
     patches._patch_wan_vae_replicated_encode()
 
     torch.manual_seed(1)

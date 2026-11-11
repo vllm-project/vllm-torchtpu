@@ -1045,14 +1045,14 @@ def test_wan_vae_halo_allgather_patch(monkeypatch):
         wan_spatial_shard, "_tpu_orig_all_gather_along_dim", raising=False
     )
 
-    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "0")
+    monkeypatch.setenv("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", "0")
     _patch_wan_vae_halo_allgather()
     assert wan_spatial_shard._halo_exchange_p2p is orig_fn
     assert not hasattr(wan_spatial_shard, "_tpu_orig_halo_exchange_p2p")
 
-    monkeypatch.delenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", raising=False)
-    apply_omni_model_specific_patches.cache_clear()
-    apply_omni_model_specific_patches()
+    monkeypatch.delenv("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", raising=False)
+    # Only the patch under test; monkeypatch restores both module attributes.
+    _patch_wan_vae_halo_allgather()
     assert wan_spatial_shard._tpu_orig_halo_exchange_p2p is orig_fn
     patched = wan_spatial_shard._halo_exchange_p2p
     assert patched is not orig_fn

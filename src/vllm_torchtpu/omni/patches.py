@@ -722,7 +722,7 @@ _HALO_EXCHANGE_P2P_PARAMS = (
 
 def _patch_wan_vae_halo_allgather() -> None:
     # TODO: Remove once wan_spatial_shard uses collective halo exchange on TPU.
-    if not envs.VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER:
+    if not envs.VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES:
         return
 
     try:
@@ -814,7 +814,7 @@ def _patch_wan_vae_halo_allgather() -> None:
             wan_spatial_shard.dist.all_gather(gathered, x.contiguous(), group=group)
             # Materialize each chunk before non-dst ranks drop gathered tensors.
             if dst is not None and x.device.type == "tpu":
-                synchronize_tensors(wait=False)
+                synchronize_tensors(gathered, wait=False)
             if dst is not None and rank != dst:
                 return x.new_zeros(0)
             return torch.cat(gathered, dim=dim)
@@ -830,7 +830,7 @@ def _patch_distributed_vae_host_metadata_collectives() -> None:
     # TODO: Remove once ProcessGroupTpu lowers ReduceOp.MAX and integer metadata.
     # Uses DistributedVaeExecutor._sync_errors and the host _error_group of
     # vLLM-Omni 0.32.0rc1; without them the upstream methods are kept.
-    if not envs.VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER:
+    if not envs.VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES:
         return
 
     from vllm_omni.diffusion.distributed.autoencoders import (
@@ -966,7 +966,7 @@ def _patch_wan_vae_replicated_encode() -> None:
     # TODO: Remove once the distributed Wan VAE encode hang on TPU is understood
     # and fixed (cause not found yet), and auto-enabled decode tiling does not
     # force tiled encode on TPU.
-    if not envs.VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER:
+    if not envs.VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES:
         return
     try:
         from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
