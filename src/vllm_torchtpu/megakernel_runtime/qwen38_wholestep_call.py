@@ -114,6 +114,10 @@ BUCKET_TUNE: dict[int, dict[str, Any]] = {
     4: {"rel_fetch": True},
     8: {"rel_fetch": True},
     16: {"rel_fetch": True},
+    # exos j-fd684c46 (bitwise): b24 6.46 -> 6.27, b32 7.32 -> 7.19 ms. lazy=false and the
+    # nbe/nbd trades (14/8, 10/12, 8/8) are within noise or worse on top of rel_fetch.
+    24: {"rel_fetch": True},
+    32: {"rel_fetch": True},
 }
 
 
