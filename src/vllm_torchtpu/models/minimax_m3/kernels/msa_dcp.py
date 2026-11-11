@@ -31,7 +31,8 @@ lives on rank ``b % dcp``, whole, and every block-level step stays local:
 2. `msa_attend_dcp`: each rank merges the candidates into that selection,
    attends every query head of the KV head over the selected blocks it
    holds and returns the partial output with its log-sum-exp; the caller
-   merges the ranks' partials (`ops.msa.merge_head_partials`).
+   merges the ranks' partials (`ops.msa.exchange_merge_partials`, or
+   `ops.msa.merge_head_partials` over several KV heads).
 
 A DCP group wider than a KV head's TP replicas (e.g. DCP 8 at TP 8 with 4
 KV heads) spans ``G = dcp / replicas`` KV heads: every rank then stores all
@@ -837,7 +838,8 @@ def msa_attend_dcp(
     rank's candidates. Returns
     the partial head-major, as the kernel writes it, ``(out [G * Hg, T, D],
     lse [G * Hg, T] f32)``: the LSE merge reduce-scatters heads along the
-    leading axis (`ops.msa.merge_head_partials`).
+    leading axis (`ops.msa.merge_head_partials`), or the merge's all-to-all
+    sends each rank its block (`ops.msa.exchange_merge_partials`).
     """
     num_tokens = q.shape[1 if q_head_major else 0]
     rank = rank_array(rank)[0]
@@ -952,7 +954,7 @@ def merge_partials(
     Hl, T, D]`` partial and XLA relaid it out for the token-major output
     (~43 + 24 us per layer at 8K tokens, c4 twin j-db4e365d)."""
     dcp, num_heads, num_tokens, head_dim = parts.shape
-    block_t = num_tokens if num_tokens <= block_tokens else block_tokens
+    block_t = max(1, min(num_tokens, block_tokens))
     rotated = hadamard is not None
     return pl.pallas_call(
         functools.partial(_merge_partials_kernel, rotated=rotated),

@@ -13,10 +13,13 @@
 # limitations under the License.
 """`qk_norm_rope` against `attention.norm_rope_heads`' numerics in jnp."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from vllm_torchtpu.models.minimax_m3.kernels import qk_norm_rope
 
@@ -76,3 +79,26 @@ def test_matches_reference(num_tokens, nq, nkv, block_tokens, q_head_major):
         np.testing.assert_array_equal(
             np.asarray(g, np.float32), np.asarray(w, np.float32)
         )
+
+
+@pytest.mark.parametrize("q_head_major", [False, True])
+@pytest.mark.parametrize("num_tokens", [8, 300, 8192])
+def test_lowers_for_tpu(num_tokens, q_head_major):
+    nq, nkv = 8, 1
+    args = (
+        jax.ShapeDtypeStruct((num_tokens, (nq + 3 * nkv + 1) * D), jnp.bfloat16),
+        jax.ShapeDtypeStruct((num_tokens, ROT), jnp.bfloat16),
+        jax.ShapeDtypeStruct((nq + 2 * nkv + 1, D), jnp.float32),
+    )
+    fn = functools.partial(
+        qk_norm_rope.qk_norm_rope,
+        num_heads=nq,
+        num_kv_heads=nkv,
+        head_dim=D,
+        eps=EPS,
+        q_head_major=q_head_major,
+    )
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = jax.jit(fn).trace(*args).lower(lowering_platforms=("tpu",))
+    assert "tpu_custom_call" in lowered.as_text()

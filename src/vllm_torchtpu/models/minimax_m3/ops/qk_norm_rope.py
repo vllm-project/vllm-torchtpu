@@ -46,7 +46,7 @@ def get_qk_norm_rope_op(
 
     op = pallas.jax_op(
         f"pallas::minimax_m3_qk_norm_rope_q{num_heads}_kv{num_kv_heads}_d{head_dim}"
-        f"_e{eps:.3g}_hm{int(q_head_major)}".replace(".", "p").replace("-", "m"),
+        f"_e{eps!r}_hm{int(q_head_major)}".replace(".", "p").replace("-", "m"),
         _norm_rope_jax,
     )
 

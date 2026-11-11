@@ -150,7 +150,7 @@ def qk_norm_rope(
     rotary_dim = cos_sin.shape[1]
     # Whole-array blocks for small batches (any row count); else multiples
     # of the 16-row bf16 tile, the last block partial.
-    block_t = num_tokens if num_tokens <= block_tokens else block_tokens
+    block_t = max(1, min(num_tokens, block_tokens))
     rows = lambda i: (i, 0)  # noqa: E731
     kv_shape = jax.ShapeDtypeStruct((num_tokens, nkv * d), qkv.dtype)
     if q_head_major:

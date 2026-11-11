@@ -410,9 +410,11 @@ def merge_head_partials(
     this rank's heads along the leading axis, and only that ``1 / DCP``
     share is transposed back to ``[T, H / DCP, D]`` (and, with a 4-bit
     cache's `hadamard`, unrotated: the rotation is linear, so the merged sum
-    unrotates as its terms would, up to bf16 rounding order). The MSA merge
-    always reduce-scatters: `TPU_DCP_LSE_MERGE_A2A` (the MLA merge's
-    all-to-all for small steps) does not apply here."""
+    unrotates as its terms would, up to bf16 rounding order). It merges DCP
+    groups over several KV heads, always by reduce-scatter
+    (`TPU_DCP_LSE_MERGE_A2A`, the MLA merge's all-to-all for small steps,
+    does not apply); over one KV head `exchange_merge_partials` merges, in
+    f32 (`TPU_DCP_RS_OUT_PRECISION` does not apply there)."""
     # The LSEs cross the all-gather token-major ([T, H], as the MLA merge
     # sends them): gathered head-major they took 2x as long (c48 / c64
     # twins, j-fe812c28, j-c5c4bdfc).

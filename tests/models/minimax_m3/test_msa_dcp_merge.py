@@ -153,3 +153,22 @@ def test_merge_partials_matches_reference(num_tokens, block_tokens, rotated):
     # Within a bf16 rounding of the reference (exp / log differ by an ulp,
     # which the rotation spreads over a head).
     np.testing.assert_allclose(got, want, rtol=2**-7, atol=1e-4)
+
+
+@pytest.mark.parametrize("rotated", [False, True])
+@pytest.mark.parametrize("num_tokens", [8, 8192])
+def test_merge_partials_lowers_for_tpu(num_tokens, rotated):
+    args = [
+        jax.ShapeDtypeStruct((2, 8, num_tokens, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((2, num_tokens, 8), jnp.float32),
+    ]
+    if rotated:
+        args.append(jax.ShapeDtypeStruct((128, 128), jnp.bfloat16))
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = (
+            jax.jit(msa_dcp.merge_partials)
+            .trace(*args)
+            .lower(lowering_platforms=("tpu",))
+        )
+    assert "tpu_custom_call" in lowered.as_text()
