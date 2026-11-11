@@ -1012,6 +1012,7 @@ def _cpu_devices_or_rerun(request, count):
                 "-m",
                 "pytest",
                 "--noconftest",
+                "--color=no",
                 "-p",
                 "no:cacheprovider",
                 "-q",

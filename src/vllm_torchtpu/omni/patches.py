@@ -679,7 +679,7 @@ def _patch_ring_attention() -> None:
             ):
                 if int(self._sp_group.ring_world_size) > 1:
                     # The upstream fallback exchanges K/V with torch.distributed
-                    # P2P sends, which hang on TPU, so fail loudly instead.
+                    # P2P sends, which are not supported on TPU, so fail loudly.
                     raise NotImplementedError(
                         "Ring attention call does not fit the TPU Pallas ring "
                         f"kernel (dtype={query.dtype}, causal={causal}, "
@@ -692,8 +692,8 @@ def _patch_ring_attention() -> None:
                 logger.warning_once(
                     "Ring attention call does not fit the TPU Pallas ring kernel "
                     "(dtype=%s, causal=%s, attn_backend_pref=%s, metadata=%s); "
-                    "falling back to vLLM-Omni RingParallelAttention, which "
-                    "exchanges K/V with torch.distributed P2P sends.",
+                    "falling back to vLLM-Omni RingParallelAttention "
+                    "(ring_world_size is 1, so no K/V exchange).",
                     str(query.dtype),
                     causal,
                     getattr(self, "attn_backend_pref", None),
