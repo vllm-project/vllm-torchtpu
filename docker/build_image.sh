@@ -153,6 +153,23 @@ DOCKER_ARGS=(
   --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
 )
 
+# Token for the transient torch-tpu registry, which serves the torch_tpu dev
+# wheel. Taken from ACCESS_TOKEN, the VM metadata server, or gcloud.
+if [ -z "${ACCESS_TOKEN:-}" ]; then
+  ACCESS_TOKEN="$(curl -sf -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
+    | sed -nE 's/.*"access_token"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' || true)"
+fi
+if [ -z "${ACCESS_TOKEN:-}" ] && command -v gcloud >/dev/null 2>&1; then
+  ACCESS_TOKEN="$(gcloud auth print-access-token 2>/dev/null || true)"
+fi
+if [ -n "${ACCESS_TOKEN:-}" ]; then
+  export ACCESS_TOKEN
+  DOCKER_ARGS+=(--secret "id=gcloud_token,env=ACCESS_TOKEN")
+else
+  echo "===> No registry token; resolving from PyPI only"
+fi
+
 # Run docker build
 DOCKER_BUILDKIT=1 docker build "${DOCKER_ARGS[@]}" "${REPO_ROOT}"
 

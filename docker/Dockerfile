@@ -37,10 +37,12 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
 FROM python:3.12-slim-bookworm AS base
 
 # curl for health checks, git so uv can clone the vllm source dependency, the
-# toolchain for packages that build from source, and libgoogle-perftools4 for
-# the tcmalloc allocator enabled below. build-essential already pulls in gcc,
-# g++, make and libc6-dev.
-RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 && rm -rf /var/lib/apt/lists/*
+# toolchain for packages that build from source, libgoogle-perftools4 for the
+# tcmalloc allocator enabled below, and libibverbs1, which the tpu-sync-torch
+# extension links (for its Peregrine transport) and so needs at import even
+# when nothing uses RDMA. build-essential already pulls in gcc, g++, make and
+# libc6-dev.
+RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 libibverbs1 && rm -rf /var/lib/apt/lists/*
 
 # tcmalloc for every derived image. Set after the install above, so that
 # intermediate steps do not fail preloading a library that is not there yet.
@@ -70,9 +72,17 @@ ENV CC=gcc
 ENV VLLM_TARGET_DEVICE=empty
 ENV UV_TORCH_BACKEND=cpu
 
+# torch_tpu dev wheels are only in the transient torch-tpu registry. With a
+# gcloud_token secret, uv also resolves from it.
+ARG REGISTRY_URL="https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple"
+
 # Install all dependencies from pyproject.toml.
 # vLLM comes from the `vllm` dependency group (see pyproject.toml).
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=secret,id=gcloud_token \
+    if [ -s /run/secrets/gcloud_token ]; then \
+      export UV_EXTRA_INDEX_URL="https://oauth2accesstoken:$(cat /run/secrets/gcloud_token)@${REGISTRY_URL#https://} https://pypi.org/simple"; \
+    fi; \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm
@@ -119,12 +129,18 @@ RUN git config --global --add safe.directory /workspace/vllm-torchtpu && \
 # It installs testing and benchmarking tools in editable mode.
 FROM ci AS dev
 
+ARG REGISTRY_URL="https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple"
+
 # Pre-install test and benchmarking dependencies before copying full source tree
 # so that changes to folders like src/ or tests/ do not invalidate the
 # dependency installation layer cache.
 # --group vllm keeps vLLM (already installed in base) in this resolution, so
 # the test/benchmarking deps cannot move shared packages outside vLLM's pins.
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=secret,id=gcloud_token \
+    if [ -s /run/secrets/gcloud_token ]; then \
+      export UV_EXTRA_INDEX_URL="https://oauth2accesstoken:$(cat /run/secrets/gcloud_token)@${REGISTRY_URL#https://} https://pypi.org/simple"; \
+    fi; \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm \
