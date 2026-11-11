@@ -47,6 +47,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     update_sparse_mla_kv_cache,
     update_sparse_mla_kv_cache_dcp,
 )
+from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
@@ -91,6 +92,28 @@ def sparse_mla_chunk_kwargs() -> dict[str, int]:
             f"sparse MLA attention kernel batch size ({batch})."
         )
     return {"gather_and_attention_chunk_size": chunk}
+
+
+def _pack_lane_dense(values: jax.Array, token_bytes: int) -> jax.Array:
+    """`kv_cache_utils.pack_tokens` as u32[num_tokens, 128] rows.
+
+    Word `w` holds byte `w` of each of the token's `WORD_BYTES` bands, as in
+    `pack_tokens`, and words past the token are zero. The words are built from
+    lane slices of the bytes, so XLA emits one lane-dense fusion instead of the
+    relayout that `pack_tokens`' [T, 4, band] reshape costs at decode sizes.
+    """
+    u8 = jax.lax.bitcast_convert_type(values, jnp.uint8)
+    band = token_bytes // kv_cache_utils.WORD_BYTES
+    words = None
+    for b in range(kv_cache_utils.WORD_BYTES):
+        if b * band >= u8.shape[-1]:
+            break
+        part = u8[:, b * band : (b + 1) * band].astype(jnp.uint32) << (8 * b)
+        words = part if words is None else words | part
+    assert words is not None
+    if words.shape[-1] < 128:
+        words = jnp.pad(words, ((0, 0), (0, 128 - words.shape[-1])))
+    return words
 
 
 def _resolve_sparse_mla_split_q(ql_nope: jax.Array, q_pe: jax.Array) -> bool:
@@ -1209,21 +1232,6 @@ def sparse_mla_attention_dcp(
         request_distribution_,
     ):
         dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
-        kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
-            kv_cache_nope,
-            kv_cache_rope,
-            kv_c_normed,
-            k_pe,
-            seq_lens_,
-            block_tables_,
-            query_start_loc_,
-            dcp_rank,
-            nope_spec=nope_spec,
-            rope_spec=rope_spec,
-            dcp_size=dcp_size,
-            interleave_size=interleave_size,
-        )
-
         # Decode buckets with TPU_DCP_MLA_MASK_IN_KERNEL: the kernel takes the
         # true kv_len (0 = this rank owns none of the token's top-k) and writes
         # that token's lse as -inf itself, so none of the glue below runs.
@@ -1264,10 +1272,45 @@ def sparse_mla_attention_dcp(
             if topk_cap
             else sparse_mla_chunk_kwargs()
         )
+        # TPU_MLA_KV_WRITE_IN_GATHER, fused-prep decode buckets: the SparseCore
+        # gather that feeds the kernel writes this step's tokens into both
+        # caches first, so only their rows and packed bytes are built here.
+        kv_write = None
+        if envs.TPU_MLA_KV_WRITE_IN_GATHER and fused_prep and topk_cap:
+            kv_write = native_sc_gather.pack_write_rows(
+                kv_cache_utils.get_dcp_dst_rows(
+                    kv_c_normed.shape[0],
+                    seq_lens_,
+                    block_tables_,
+                    query_start_loc_,
+                    dcp_rank,
+                    nope_spec=nope_spec,
+                    dcp_size=dcp_size,
+                    interleave_size=interleave_size,
+                ),
+                _pack_lane_dense(kv_c_normed, nope_spec.token_bytes),
+                _pack_lane_dense(k_pe, rope_spec.token_bytes),
+            )
+        else:
+            kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
+                kv_cache_nope,
+                kv_cache_rope,
+                kv_c_normed,
+                k_pe,
+                seq_lens_,
+                block_tables_,
+                query_start_loc_,
+                dcp_rank,
+                nope_spec=nope_spec,
+                rope_spec=rope_spec,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+            )
+
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
-        output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
+        attn = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
             kv_cache_rope,
@@ -1285,9 +1328,13 @@ def sparse_mla_attention_dcp(
             topk_cap=topk_cap,
             lse_mask_empty=mask_in_kernel,
             fused_window_prep=fused_prep,
+            kv_write=kv_write,
             **chunk_kwargs,
             **split_kwargs,
         )
+        output, lse = attn[:2]
+        if kv_write is not None:
+            kv_cache_nope, kv_cache_rope = attn[2:]
         if not mask_in_kernel:
             lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).

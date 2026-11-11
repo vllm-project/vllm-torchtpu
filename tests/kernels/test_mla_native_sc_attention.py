@@ -898,6 +898,91 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 live_vec, [live_b] * 16 + [-(-live_b // 32)] * 16
             )
 
+    def test_kv_write_in_gather_matches_writing_first(self):
+        """`kv_write` on the fused-prep decode path (TPU_MLA_KV_WRITE_IN_GATHER):
+        output, lse and both caches equal writing the step's rows into the
+        caches first and then attending. Each written row is one a token
+        attends, so a write the gather does not see changes the output."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        from vllm_torchtpu.kernels.mla import kv_cache_utils
+        from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
+        from vllm_torchtpu.layers.core import attention_interface
+
+        query_tokens, seq_q = 16, (4, 4, 4, 1)
+        rng = np.random.default_rng(20261111)
+        problem, topk_glued, owns, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        topk_raw = jnp.where(owns[:, None], topk_glued, -1)
+        nope, rope = problem["sparsecore_nope"], problem["sparsecore_rope"]
+        rope_bytes = 4 * rope.size // (nope.size // 128)
+        # Slot 0 of every token with a live entry, each physical row once;
+        # the other tokens are rows this rank does not own.
+        dst = np.full(query_tokens, kv_cache_utils.SKIP_ROW, np.int64)
+        for t in np.flatnonzero(counts > 0):
+            row = int(problem["physical_topk"][t, 0])
+            if row not in dst:
+                dst[t] = row
+        owned = dst >= 0
+        self.assertTrue(owned.any() and (~owned).any())
+        kv_c = jnp.asarray(rng.integers(0, 0x7E, (query_tokens, NOPE_DIM), np.uint8))
+        k_pe = jnp.asarray(rng.integers(0, 0x7E, (query_tokens, ROPE_DIM), np.uint8))
+        want_nope = (
+            nope.reshape(-1, 128)
+            .at[dst[owned]]
+            .set(kv_cache_utils.pack_tokens(kv_c, NOPE_DIM)[owned])
+            .reshape(nope.shape)
+        )
+        want_rope = (
+            rope.reshape(-1, rope_bytes // 4)
+            .at[dst[owned]]
+            .set(kv_cache_utils.pack_tokens(k_pe, rope_bytes)[owned])
+            .reshape(rope.shape)
+        )
+        kv_write = native_sc_gather.pack_write_rows(
+            jnp.asarray(dst, jnp.int32),
+            attention_interface._pack_lane_dense(kv_c, NOPE_DIM),
+            attention_interface._pack_lane_dense(k_pe, rope_bytes),
+        )
+        common = dict(
+            sm_scale=0.125,
+            k_scale=0.75,
+            return_lse=True,
+            cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+            gather_and_attention_chunk_size=256,
+            topk_cap=512,
+            small_chunk_batch_size=4,
+            small_chunk_tokens=32,
+            q_pe=problem["q"][..., NOPE_DIM:],
+            lse_lane_dense=True,
+            lse_mask_empty=True,
+            fused_window_prep=True,
+        )
+        args = (topk_raw, page_table, cu_q_lens, distribution)
+        q_nope = problem["q"][..., :NOPE_DIM]
+        got = jax.block_until_ready(
+            sparse_mla.sparse_ragged_paged_attention(
+                q_nope, nope, rope, *args, kv_write=kv_write, **common
+            )
+        )
+        want = jax.block_until_ready(
+            sparse_mla.sparse_ragged_paged_attention(
+                q_nope, want_nope, want_rope, *args, **common
+            )
+        )
+        real = int(sum(seq_q))
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(got[0], jnp.uint16))[:real],
+            np.asarray(jax.lax.bitcast_convert_type(want[0], jnp.uint16))[:real],
+        )
+        np.testing.assert_array_equal(
+            np.asarray(got[1])[:real].view(np.uint32),
+            np.asarray(want[1])[:real].view(np.uint32),
+        )
+        np.testing.assert_array_equal(np.asarray(got[2]), np.asarray(want_nope))
+        np.testing.assert_array_equal(np.asarray(got[3]), np.asarray(want_rope))
+
     def test_topk_cap_validation(self):
         q = jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16)
         nope = jnp.zeros((16, 256, 128), jnp.uint32)
