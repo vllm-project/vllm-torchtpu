@@ -28,4 +28,9 @@ class MegakernelLayoutError(ValueError):
     """
 
 
-__all__ = ["MegakernelConfigError", "MegakernelLayoutError"]
+class MegakernelSetupError(RuntimeError):
+    """A requested megakernel part failed to set up, compile or run (fatal unless
+    VLLM_TPU_MK_ALLOW_FALLBACK=1)."""
+
+
+__all__ = ["MegakernelConfigError", "MegakernelLayoutError", "MegakernelSetupError"]

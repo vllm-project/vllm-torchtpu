@@ -37,6 +37,7 @@ from torch import nn
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import mamba_ckpt_of, mamba_state_of
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel.errors import MegakernelSetupError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen38
 
@@ -53,10 +54,6 @@ from .qwen38_segment_call import GDN_META, T_VERIFY, build_segment_call, segment
 from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
 
 logger = init_logger(__name__)
-
-
-class MegakernelSetupError(RuntimeError):
-    """A requested megakernel part failed to set up or to run (fatal by default)."""
 
 
 def _mk_fail(msg: str, exc: BaseException | None = None) -> None:

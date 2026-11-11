@@ -18,6 +18,7 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError, MegakernelSetupError
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     fixed_moe_collection_chunks,
 )
@@ -219,6 +220,29 @@ if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
+
+
+def _mk_program(fn, what: str):
+    """`fn` with its failures (compile or run) raised as `MegakernelSetupError`:
+    an MK draft program that fails must stop the server, not be swallowed by the
+    spec-decode warmup and served as dead (exos j-5ac1be1f: partitionId compile
+    error in qwen38_mk_draft_t1, warmup "continuing", every request failed).
+    VLLM_TPU_MK_ALLOW_FALLBACK=1 keeps the original exception."""
+    if envs.VLLM_TPU_MK_ALLOW_FALLBACK:
+        return fn
+
+    def call(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except (MegakernelSetupError, MegakernelConfigError):
+            raise
+        except Exception as exc:
+            raise MegakernelSetupError(
+                f"Qwen3.8 MK draft: {what} failed ({type(exc).__name__}: {exc}) "
+                "(set VLLM_TPU_MK_ALLOW_FALLBACK=1 to fall back to the stock path)"
+            ) from exc
+
+    return call
 
 
 def _collect_topk_indices_buffers(mtp_model) -> list[torch.Tensor]:
@@ -859,6 +883,8 @@ class Eagle3Proposer:
                 mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
             ),
         ):
+            if loop is not self._mtp_fused_loop:
+                loop = _mk_program(loop, "fused draft loop")
             if not getattr(self, warm_attr):
                 # The first call traces and compiles; like the loop-step
                 # program's, its outputs can carry symbolic sizes, so run it
@@ -1738,7 +1764,9 @@ class Eagle3Proposer:
             self._mk_draft_count("mk_draft_step0" if mk0 else "stock_step0")
             if mk0:
                 # VLLM_TPU_MK_DRAFT: step 0 + carry + token 0 as one kernel call.
-                hidden_carry, fused_token0, positions_carry = self._run_mk_draft_step0(
+                hidden_carry, fused_token0, positions_carry = _mk_program(
+                    self._run_mk_draft_step0, "step-0 program"
+                )(
                     chunk, input_ids, positions, target_hidden_states, last_token_indices,
                     rejected_np_per_chunk[ci],
                 )
