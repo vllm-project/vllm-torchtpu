@@ -116,3 +116,26 @@ def test_gate_entry_is_well_formed(path):
     assert entry["suite"]["mtp_acceptance_length"] == "real"
     override = entry["legs"]["decode"]["serve_args_override"]["--speculative-config"]
     assert "synthetic" not in override
+
+
+@pytest.mark.parametrize("path", GATES, ids=lambda p: p.stem)
+def test_gate_arms_turn_the_base_points_trade_offs_off_and_on(path):
+    """Arm sections are deep-merged over each leg's, so a setting the base
+    point turns on stays on unless the arm sets it false: tradeoffs_off must
+    set every such qwen3_5 key false, and tradeoffs_on must keep it true."""
+    entry = _load(path)
+    base = _load(next(p for p in POINTS if _load(p)["point"] == entry["base_point"]))
+    on_in_base = sorted(
+        {
+            key
+            for leg in base["legs"].values()
+            for key, value in leg["additional_config"].get(settings.SECTION, {}).items()
+            if value is True
+        }
+    )
+    arms = entry["arms"]
+    off = arms["tradeoffs_off"]["additional_config"].get(settings.SECTION, {})
+    on = arms["tradeoffs_on"]["additional_config"].get(settings.SECTION, {})
+    for key in on_in_base:
+        assert off.get(key) is False, f"tradeoffs_off leaves {key} on"
+        assert on.get(key) is True, f"tradeoffs_on does not keep {key} on"

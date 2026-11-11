@@ -58,8 +58,11 @@ GDN state pool differs from the record tree's (vllm-torchtpu #1620):
 `legs` derive from the point named in `base_point`, with one replica each and
 the listed `serve_args_override`. `arms` differ in `additional_config` and
 in the serve arguments `arm_serve_args_override` lists for each arm, applied
-over the legs': the changes that add the FP8 trade-off settings add them to
-`tradeoffs_on`, and the bf16 GDN SSM state (`--mamba-ssm-cache-dtype
-bfloat16`, which every point leg passes) is on in `tradeoffs_on` only.
+over the legs'. An arm's `additional_config` sections are deep-merged over
+each leg's, key by key, so an arm turns a setting off by setting it to false:
+the changes that add the trade-off settings set them true in `tradeoffs_on`
+and false in `tradeoffs_off`, and the bf16 GDN SSM state
+(`--mamba-ssm-cache-dtype bfloat16`, which every point leg passes) is on in
+`tradeoffs_on` only.
 `references` are earlier gates at the same layout (GSM8K strict-match, 1,319
 samples, thinking on).

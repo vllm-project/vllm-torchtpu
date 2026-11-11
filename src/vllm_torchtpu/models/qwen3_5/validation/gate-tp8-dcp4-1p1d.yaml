@@ -32,9 +32,10 @@ legs:
       "--speculative-config": "{\"method\":\"mtp\",\"num_speculative_tokens\":3}"
 decode_megakernel: "off"
 arms:
-  # The changes that add the trade-off settings add them to tradeoffs_on.
+  # Arm sections are deep-merged over each leg's (README.md), so tradeoffs_off
+  # sets every trade-off the base point turns on back to false.
   tradeoffs_off:
-    additional_config: {}
+    additional_config: {qwen3_5: {exp2_softmax: false, native_fp8_attention: false}}
   tradeoffs_on:
     additional_config:
       qwen3_5:
