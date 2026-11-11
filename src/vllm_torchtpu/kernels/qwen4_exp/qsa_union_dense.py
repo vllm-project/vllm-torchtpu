@@ -596,6 +596,19 @@ _DEBRUIJN = np.asarray([0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8
                         31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9], np.int32)
 
 
+def _qk_ahead():
+    """VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD, read when the walk kernel is traced."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.logger import init_logger
+
+    if not envs.VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD:
+        return False
+    init_logger(__name__).info_once(
+        "QSA union walk QK lookahead on (VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD=1)"
+    )
+    return True
+
+
 def _walk_kernel(
     tiles_ref,
     usize_ref,
@@ -688,6 +701,7 @@ def _walk_kernel(
     # physw_hbm_ref (per-group page rows, ``_walk_kernel_per_group``): each
     #   group's per-word pool bases sit in HBM and are staged into the SMEM
     #   ``physw_ref`` at block start, as the union words are.
+    qk_ahead = _qk_ahead()
     block = pl.program_id(0)
     count = tiles_ref[block]
     usize = usize_ref[block]
@@ -1059,6 +1073,9 @@ def _walk_kernel(
         return pairs
 
     def compute_tile(tile, kv_ref, line_ref):
+        finish_tile(*qk_tile(tile, kv_ref, line_ref))
+
+    def qk_tile(tile, kv_ref, line_ref):
         logical = tile * kv_tile
         mask_scope = sc("mask")
         mask_scope.__enter__()
@@ -1094,16 +1111,21 @@ def _walk_kernel(
             row_visible = jnp.broadcast_to(
                 visible[None, :, :], (q_heads_per_kv, query_block, kv_tile)
             ).reshape(rows, kv_tile)
-        for head, (key, value) in enumerate(key_values):
+        scores = []
+        for head, (key, _) in enumerate(key_values):
+            query = q[head].reshape(rows, head_dim)
+            with sc("qk"):
+                scores.append(lax.dot(
+                    query, key, dimension_numbers=(([1], [1]), ([], [])),
+                    preferred_element_type=jnp.float32,
+                ))
+        return key_values, row_visible, scores
+
+    def finish_tile(key_values, row_visible, scores):
+        for head, ((_, value), score) in enumerate(zip(key_values, scores)):
             m = max_ref[0, head, :]
             mass = mass_ref[0, head, :]
             acc = accumulator_ref[0, head, :, :]
-            query = q[head].reshape(rows, head_dim)
-            with sc("qk"):
-                score = lax.dot(
-                    query, key, dimension_numbers=(([1], [1]), ([], [])),
-                    preferred_element_type=jnp.float32,
-                )
             with sc("softmax"):
                 score = jnp.where(row_visible, score, -jnp.inf)
                 next_m = jnp.maximum(m, jnp.max(score, axis=1))
@@ -1130,6 +1152,26 @@ def _walk_kernel(
     def pair_step(pair, _):
         tile = pair * 2
         wait_tile(kv0_ref, sem0_ref, line0_ref)
+        if qk_ahead:
+            # VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD: the odd tile's QK is issued
+            # before the even tile's softmax and PV, so it does not queue
+            # behind them. Same products, same accumulation order.
+            even = qk_tile(tile, kv0_ref, line0_ref)
+            wait_tile(kv1_ref, sem1_ref, line1_ref)
+            odd = qk_tile(tile + 1, kv1_ref, line1_ref)
+            finish_tile(*even)
+
+            @pl.when(tile + 2 < count)
+            def prefetch_next_even_ahead():
+                start_tile(kv0_ref, line0_ref, sem0_ref)
+
+            finish_tile(*odd)
+
+            @pl.when(tile + 3 < count)
+            def prefetch_next_odd_ahead():
+                start_tile(kv1_ref, line1_ref, sem1_ref)
+
+            return None
         compute_tile(tile, kv0_ref, line0_ref)
 
         @pl.when(tile + 2 < count)
