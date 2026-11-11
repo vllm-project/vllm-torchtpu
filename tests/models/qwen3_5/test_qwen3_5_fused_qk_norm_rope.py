@@ -237,6 +237,8 @@ def restore_attention(monkeypatch):
     "architectures, installs",
     [
         (None, False),
+        # A stand-in without architectures, as the patch registry's tests pass.
+        ("no-architectures", False),
         (["Qwen3NextForCausalLM"], False),
         (["Qwen3_5MoeForConditionalGeneration"], True),
     ],
@@ -246,9 +248,14 @@ def test_the_rule_installs_the_patch_for_qwen3_5_only(
 ):
     original_init = Qwen3NextAttention.__init__
     original_project = Qwen3NextAttention._project_qkv_gate
-    model_config = (
-        None if architectures is None else SimpleNamespace(architectures=architectures)
-    )
+    if architectures == "no-architectures":
+        model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="llama"))
+    else:
+        model_config = (
+            None
+            if architectures is None
+            else SimpleNamespace(architectures=architectures)
+        )
     result = fused.maybe_install_qk_norm_rope_patch(model_config)
     # False keeps the patch eligible for the next lifecycle stage.
     assert result is (None if installs else False)
