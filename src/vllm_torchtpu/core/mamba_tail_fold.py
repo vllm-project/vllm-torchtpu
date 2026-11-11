@@ -106,17 +106,18 @@ def fold_blocked_by_context_parallel(cfg, main_kv_dcp: int) -> str | None:
     By default any context parallelism turns it off: vLLM DCP / PCP, or the
     Qwen4Exp main-KV DCP (``VLLM_TPU_QSA_MAIN_KV_DCP``). Leaving the
     checkpoint off the specs keeps the scheduler, the manager and the worker
-    off together. ``VLLM_TPU_MAMBA_TAIL_FOLD_DCP=1`` allows main-KV DCP: it
-    shards only the target QSA main KV (2B-token entries); the Mamba specs
-    keep block B, their tables and states are not sharded, and the
-    scheduler geometry (hash B, partial hits on the 2B scheduler block) is
-    the one the scheduler guard accepts. vLLM DCP / PCP stay off. Logged
-    once per reason and process.
+    off together. ``VLLM_TPU_MAMBA_TAIL_FOLD_DCP`` is ignored: with it the
+    fold ran under main-KV DCP-2 and za6 GSM8K fell to 0.26 (c32) and
+    0.008 (c48) with no prefix hits, while the same fold without DCP
+    scored 0.974-0.977; the cause is not yet found. Logged once per reason
+    and process.
     """
     p = getattr(cfg, "parallel_config", None)
     reason = None
-    if main_kv_dcp > 1 and not envs.VLLM_TPU_MAMBA_TAIL_FOLD_DCP:
+    if main_kv_dcp > 1:
         reason = f"VLLM_TPU_QSA_MAIN_KV_DCP={main_kv_dcp}"
+        if envs.VLLM_TPU_MAMBA_TAIL_FOLD_DCP:
+            reason += " (VLLM_TPU_MAMBA_TAIL_FOLD_DCP=1 is ignored: wrong outputs)"
     elif int(getattr(p, "decode_context_parallel_size", 1) or 1) > 1:
         reason = f"decode_context_parallel_size={p.decode_context_parallel_size}"
     elif int(getattr(p, "prefill_context_parallel_size", 1) or 1) > 1:
