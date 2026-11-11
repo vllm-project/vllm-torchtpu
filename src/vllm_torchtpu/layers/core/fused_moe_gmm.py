@@ -28,6 +28,11 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     gmm_v2,
     gmm_v2_mlp,
 )
+from vllm_torchtpu.kernels.megablox.moe_onehot_bounded import (
+    bounded_onehot_combine,
+    bounded_onehot_permute,
+    can_use_bounded_onehot,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -76,6 +81,8 @@ ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VE
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
+# Fixed at import: one-hot permute/combine over the valid prefix only.
+_BOUNDED_ONEHOT = envs.TPU_MOE_BOUNDED_ONEHOT
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Fixed at import: let the counting sort replace the comparison sorts on the
@@ -327,6 +334,14 @@ def _counting_sort_positions(
     return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
 
 
+def _use_bounded_onehot(num_tokens: int, num_slots: int, rows: jax.Array) -> bool:
+    return (
+        _BOUNDED_ONEHOT
+        and rows.dtype == jnp.bfloat16
+        and can_use_bounded_onehot(num_tokens, num_slots, rows.shape[1])
+    )
+
+
 def _single_sort_permutation(
     sort_keys: jax.Array, topk: int, flat_bits: int
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -463,7 +478,15 @@ def prepare_routed_gmm_inputs(
             # sort, build the `[M, T]` permutation directly from it so
             # `fused_moe_gmm` does not depend on `token_indices_sorted` (letting
             # XLA DCE its scatter unless owner-output combine uses it).
-            if bucket_counts is not None:
+            if bucket_counts is not None and _use_bounded_onehot(
+                num_tokens_local, argsort_revert_indices.size, hidden_states_local
+            ):
+                x = bounded_onehot_permute(
+                    hidden_states_local,
+                    argsort_revert_indices,
+                    group_sizes_local.sum(dtype=jnp.int32)[None],
+                )
+            elif bucket_counts is not None:
                 onehot = (
                     jax.nn.one_hot(
                         argsort_revert_indices.reshape(num_tokens_local, topk),
@@ -473,13 +496,14 @@ def prepare_routed_gmm_inputs(
                     .sum(axis=1)
                     .T
                 )
+                x = onehot @ hidden_states_local
             else:
                 onehot = jax.nn.one_hot(
                     token_indices_sorted,
                     num_tokens_local,
                     dtype=hidden_states_local.dtype,
                 )
-            x = onehot @ hidden_states_local
+                x = onehot @ hidden_states_local
         else:
             # Match uLLM/reference EP routing: materialize the valid local
             # expert prefix through SparseCore ragged_gather. Invalid
@@ -664,6 +688,17 @@ def moe_gmm(
                     topk_weights_sorted,
                     valid_count,
                     num_tokens=num_tokens,
+                ).astype(x.dtype)
+            # The dense combine one-hot takes the weights' dtype; the kernel
+            # multiplies in the routed rows' dtype.
+            if topk_weights.dtype == gmm2_res.dtype and _use_bounded_onehot(
+                num_tokens, argsort_revert_indices.size, gmm2_res
+            ):
+                return bounded_onehot_combine(
+                    gmm2_res,
+                    argsort_revert_indices,
+                    jnp.where(valid_mask, topk_weights, 0),
+                    valid_count,
                 ).astype(x.dtype)
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them

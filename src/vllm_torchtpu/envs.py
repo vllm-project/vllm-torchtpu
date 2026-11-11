@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
+    TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -724,6 +725,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counting sort either way. A stand-down knob in case a libtpu release
     # miscompiles the rank contraction again.
     "TPU_MOE_COUNTING_SORT": env_bool("TPU_MOE_COUNTING_SORT", True),
+    # Run the EP one-hot MoE permute and combine as Pallas kernels that visit
+    # only the 128-slot blocks of the valid local prefix (about 1/EP of the
+    # routed slots) instead of dense one-hot matmuls over every slot, where
+    # the shapes allow (kernels/megablox/moe_onehot_bounded.py). A stand-down
+    # knob; the owner-output combine (TPU_MOE_OWNER_OUTPUT_MODE) takes
+    # precedence over this combine.
+    "TPU_MOE_BOUNDED_ONEHOT": env_bool("TPU_MOE_BOUNDED_ONEHOT", True),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
