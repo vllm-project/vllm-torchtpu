@@ -122,8 +122,13 @@ def pack_wholestep_operands(
     spec: ModelSpec,
     ex: ExecSpec,
     layer_ids: list[int],
+    tail: tuple[Any, Any, int] | None = None,
 ) -> list[torch.Tensor]:
-    """This rank's whole-step operands, flattened in `plan.w_names` order."""
+    """This rank's whole-step operands, flattened in `plan.w_names` order.
+
+    `tail` = `(final HC mixer, lm_head, vocab shard)` for a spec with the greedy tail
+    (`wholestep_spec(tail=...)`, the MTP draft step): its mixer and `lm_head` weights.
+    """
     p = planner.plan(spec, ex)
     L = spec.config.L
     assert len(layer_ids) == L, (len(layer_ids), L)
@@ -217,6 +222,20 @@ def pack_wholestep_operands(
         row("sh_gate", j, layer.mlp.shared_expert_gate.weight.data)
         row("sh13_s", j, torch.ones(2 * (gi.IS // ex.R), device=dev))
         row("sh2_s", j, torch.ones(g.H, device=dev))
+
+    if tail is not None:  # final HC mixer (last layer's slot) + lm_head [H, V shard]
+        hc, lm, V = tail
+        hdn, ups = _hc_mix_operands(hc, g)
+        w["tail_hdn"] = hdn[None]
+        for b in range(g.NHC):
+            w[f"tail_hup{b}"] = ups[b][None]
+        from vllm_torchtpu.megakernel.wholestep.tail import vocab_chunk_width, vocab_chunks
+
+        lm_kn = kn(lm, g.H, V)
+        for name, c0, width in vocab_chunks(V, vocab_chunk_width(ex)):  # 128-wide column blocks, last one padded
+            blk = lm_kn[:, c0 : c0 + width]
+            w[name] = F.pad(blk, (0, width - blk.shape[1]))[None]
+        row("tail_hcn", L - 1, hc.hc_norm.weight.data)
 
     if "moe_hdn_s" in p.smalls_layout:  # VLLM_TPU_MK_HC_FP8 (spec hc_fp8)
         _hc_fp8(w, row, "qsa_full", g.NHC, att)

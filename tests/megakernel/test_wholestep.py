@@ -830,10 +830,12 @@ def test_qsa_first_layout_matches_reference():
     _assert_within_budget(res, np.asarray(ref, np.float32))
 
 
-def test_tail_greedy_tokens_match_reference():
+@pytest.mark.parametrize("V", [384, 8256])
+def test_tail_greedy_tokens_match_reference(V):
     """Final HC mixer + lm_head + per-rank top token + argmax over ranks = the stock
     greedy
-    verify (argmax of the full logits, ties to the lower index)."""
+    verify (argmax of the full logits, ties to the lower index). `V = 8256`: two lm_head
+    column blocks (`tail.vocab_chunks`), the second one padded past the vocab shard."""
     from vllm_torchtpu.megakernel.models.qwen38_inputs import (
         _hc_params,
         hc_weight_arrays,
@@ -845,11 +847,12 @@ def test_tail_greedy_tokens_match_reference():
         tail_spec,
     )
 
-    R, T, V = 2, 4, 384
+    R, T = 2, 4
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
     k = jax.random.split(jax.random.PRNGKey(5), 3)
     hc = _hc_params(k[0], G, 1)
-    lm = (jax.random.normal(k[1], (R, G.H, V), F32) * 0.05).astype(BF16)
+    # Wider vocab, closer top-2 logits: spread them so the pick is decided.
+    lm = (jax.random.normal(k[1], (R, G.H, V), F32) * (0.05 if V < 1024 else 0.5)).astype(BF16)
     x = jax.random.normal(k[2], (ex.B, G.NHC * G.H), F32).astype(BF16)
     want, logits = tail_reference(
         x, {n: v[0] for n, v in hc.items()}, lm, nhc=G.NHC, eps=G.eps
@@ -857,7 +860,12 @@ def test_tail_greedy_tokens_match_reference():
     spec = tail_spec(G, R, vocab_shard=V)
     from vllm_torchtpu.megakernel.models.qwen38_pack import pack_weights
 
-    w = {"lm_head": lm[:, None], **hc_weight_arrays("tail", hc, G, R, mix=True)}
+    from vllm_torchtpu.megakernel.wholestep.tail import vocab_chunk_width, vocab_chunks
+
+    w = {**hc_weight_arrays("tail", hc, G, R, mix=True)}
+    for name, c0, width in vocab_chunks(V, vocab_chunk_width(ex)):
+        blk = lm[:, :, c0 : c0 + width]
+        w[name] = jnp.pad(blk, ((0, 0), (0, 0), (0, width - blk.shape[-1])))[:, None]
     sm = {"tail_hcn": jnp.broadcast_to(hc["norm"][None], (R, 1, hc["norm"].shape[-1]))}
     w_mk = pack_weights(spec, ex, w, sm)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
