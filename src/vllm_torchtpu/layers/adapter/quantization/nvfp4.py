@@ -422,9 +422,31 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             )
         else:
             op, requant_block = _prebuild_w4a8(layer, activation_str, configured_block)
-        tp_decode_nvfp4 = envs.USE_MOE_TP_DECODE_NVFP4_KERNEL and op is None
-        if tp_decode_nvfp4 and requant_block is None:
-            requant_block = _TP_DECODE_NVFP4_Q_BLOCK
+        tp_decode_nvfp4 = False
+        if envs.USE_MOE_TP_DECODE_NVFP4_KERNEL and op is None:
+            from vllm_torchtpu.layers.adapter.moe_tp_decode_nvfp4 import (
+                precheck_admission,
+            )
+
+            candidate_block = (
+                _TP_DECODE_NVFP4_Q_BLOCK
+                if requant_block is None
+                else int(requant_block)
+            )
+            refusal = precheck_admission(
+                layer,
+                requant_block=candidate_block,
+                clamp_per_matrix=True,
+            )
+            if refusal is None:
+                tp_decode_nvfp4 = True
+                requant_block = candidate_block
+            else:
+                logger.warning_once(
+                    "moe_tp_decode_nvfp4: retaining GMM NVFP4 MoE weight recipe "
+                    "(refused before load-time requantization: %s)",
+                    refusal,
+                )
         weights, mode = _prepare_moe_weights(
             layer,
             w13_scale_f,

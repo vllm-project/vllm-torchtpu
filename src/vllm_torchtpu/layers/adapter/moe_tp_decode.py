@@ -43,6 +43,7 @@ scales) where the layer's experts fit whole.
 import dataclasses
 import faulthandler
 import hashlib
+import weakref
 from collections.abc import Callable
 from typing import Any
 
@@ -142,11 +143,29 @@ class _OpStatics:
 
 @dataclasses.dataclass(frozen=True)
 class _Admitted:
-    shared: tuple[torch.Tensor, ...]  # sw13, ss13, sw2, ss2
+    shared: tuple[Any, ...]  # sw13, ss13, sw2, ss2
     rows: tuple[int, ...]  # the token counts the kernel admits
     hidden: int
     statics: _OpStatics
     experts_start: int  # first global expert of this rank's block (0 under TP)
+
+
+_RUNNER_REF_ATTR = "_tpu_moe_runner_ref"
+
+
+def bind_routed_experts_runner(runner: Any) -> None:
+    """Link ``runner.routed_experts`` back to ``runner`` via a weakref so
+    load-time weight hooks can run the same runner-level admission check as
+    ``arm()`` without creating an ``nn.Module`` cycle."""
+    routed = getattr(runner, "routed_experts", None)
+    if routed is not None:
+        setattr(routed, _RUNNER_REF_ATTR, weakref.ref(runner))
+
+
+def routed_experts_runner(layer: Any) -> Any | None:
+    """Return the ``MoERunner`` owning ``layer``, or ``None`` if unbound."""
+    ref = getattr(layer, _RUNNER_REF_ATTR, None)
+    return None if ref is None else ref()
 
 
 def moe_tp_decode_supported(quant_method: Any) -> bool:
@@ -154,7 +173,9 @@ def moe_tp_decode_supported(quant_method: Any) -> bool:
     return getattr(quant_method, _OP_ATTR, None) is not None
 
 
-def _sds(t: torch.Tensor) -> jax.ShapeDtypeStruct:
+def _sds(t: torch.Tensor | jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
+    if isinstance(t, jax.ShapeDtypeStruct):
+        return t
     shape = tuple(t.shape)
     if t.dtype == torch.float4_e2m1fn_x2 and shape:
         shape = (*shape[:-1], shape[-1] * 2)
@@ -164,7 +185,10 @@ def _sds(t: torch.Tensor) -> jax.ShapeDtypeStruct:
 def _topology() -> _Topology | str:
     """The op's 1-D mesh over the TP group and this rank's index in it, or a
     refusal reason. Collective: build_ep_mesh gathers device ids."""
-    tp = parallel_state.get_tp_group()
+    try:
+        tp = parallel_state.get_tp_group()
+    except (AssertionError, AttributeError, RuntimeError):
+        return "the TP group is not initialized"
     ep = get_ep_group()
     if ep is None:
         return "no EP group (the TP group has one device)"
@@ -172,7 +196,10 @@ def _topology() -> _Topology | str:
     ep_ranks = tuple(int(r) for r in ep.ranks)
     if tp_ranks != ep_ranks:
         return f"TP ranks {tp_ranks} != EP ranks {ep_ranks} (needs dp 1, pcp 1)"
-    world = torch.distributed.get_world_size()
+    try:
+        world = torch.distributed.get_world_size()
+    except (AssertionError, AttributeError, RuntimeError, ValueError):
+        return "torch.distributed is not initialized"
     if len(tp_ranks) != world:
         return f"the TP group has {len(tp_ranks)} of {world} ranks"
     mesh = build_ep_mesh()
@@ -181,7 +208,50 @@ def _topology() -> _Topology | str:
     return _Topology(mesh=mesh, mesh_index=mesh_index)
 
 
-def _shared_slice(runner) -> tuple[torch.Tensor, ...] | str:
+def _unflipped_fp8_linear_sds(
+    lin: Any,
+) -> tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct] | str:
+    """Predict post-load ``(weight, weight_scale)`` shapes/dtypes for a
+    shared-expert ``VllmFp8LinearMethodTPU`` whose ``process_weights_after_loading``
+    has not run yet (``MoERunner`` registers ``routed_experts`` before
+    ``_shared_experts``)."""
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import _get_linear_quant_config
+
+    qm = lin.quant_method
+    quant_cfg = getattr(qm, "quant_config", None)
+    online_fp8 = bool(getattr(qm, "online_fp8", False))
+    linear_quant_cfg = getattr(qm, "_linear_quant_config", None)
+    if quant_cfg is None and not online_fp8 and linear_quant_cfg is None:
+        return "a shared-expert weight is not K-major"
+    if getattr(lin, "weight", None) is None or lin.weight.dim() != 2:
+        return "a shared-expert weight is not K-major"
+    n_out, k_in = (int(d) for d in lin.weight.shape)
+    is_fp8_ckpt = bool(getattr(quant_cfg, "is_checkpoint_fp8_serialized", False))
+    if not is_fp8_ckpt and online_fp8:
+        policy = getattr(qm, "online_fp8_policy", None)
+        if lin.weight.dtype != torch.bfloat16 or policy is None:
+            return "the shared expert is not FP8 with per-channel scales"
+        if policy.weight_scheme == "per_block":
+            return "the shared expert is not FP8 with per-channel scales"
+        scale_shape = (1,) if policy.weight_scheme == "per_tensor" else (n_out,)
+    else:
+        if linear_quant_cfg is None:
+            linear_quant_cfg = _get_linear_quant_config(
+                getattr(qm, "linear_config", None)
+            )
+        _name, requant_dtype, requant_block_size, blockwise_kernel = linear_quant_cfg
+        if requant_block_size is not None and k_in < requant_block_size:
+            blockwise_kernel = False
+        if requant_dtype != torch.float8_e4m3fn or blockwise_kernel:
+            return "the shared expert is not FP8 with per-channel scales"
+        scale_shape = (n_out,)
+    return (
+        jax.ShapeDtypeStruct((k_in, n_out), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct(scale_shape, jnp.float32),
+    )
+
+
+def _shared_slice(runner: Any, *, pre_load: bool = False) -> tuple[Any, ...] | str:
     """This rank's shared-expert tensors (w13 [D, 2Fs], s13 [2Fs], w2 [Fs, D],
     s2 [D]), or a refusal reason."""
     from vllm_torchtpu.layers.adapter.linear_common import (
@@ -197,24 +267,27 @@ def _shared_slice(runner) -> tuple[torch.Tensor, ...] | str:
     down = getattr(mlp, "down_proj", None)
     if gate_up is None or down is None:
         return "the shared expert has no gate_up_proj / down_proj"
+    out: list[Any] = []
     for lin in (gate_up, down):
         if not isinstance(lin.quant_method, VllmFp8LinearMethodTPU):
             return "a shared-expert linear is not VllmFp8LinearMethodTPU"
         flipped = getattr(lin, WEIGHT_FLIPPED_ATTR, False)
-        if not flipped or getattr(lin, KEEP_VLLM_LAYOUT_ATTR, False):
+        if getattr(lin, KEEP_VLLM_LAYOUT_ATTR, False) or (not flipped and not pre_load):
             return "a shared-expert weight is not K-major"
         if lin.bias is not None:
             return "a shared-expert linear has a bias"
-        if lin.weight.dtype != torch.float8_e4m3fn or lin.weight_scale.dim() != 1:
-            return "the shared expert is not FP8 with per-channel scales"
+        if flipped:
+            if lin.weight.dtype != torch.float8_e4m3fn or lin.weight_scale.dim() != 1:
+                return "the shared expert is not FP8 with per-channel scales"
+            out.extend((lin.weight.data, lin.weight_scale.data))
+        else:
+            predicted = _unflipped_fp8_linear_sds(lin)
+            if isinstance(predicted, str):
+                return predicted
+            out.extend(predicted)
     if down.reduce_results:
         return "the shared expert reduces its own output"
-    return (
-        gate_up.weight.data,
-        gate_up.weight_scale.data,
-        down.weight.data,
-        down.weight_scale.data,
-    )
+    return tuple(out)
 
 
 def _admit_common(
@@ -223,23 +296,23 @@ def _admit_common(
     *,
     quant_cls: type,
     pre_check: Callable[[], str | None],
-    get_scales: Callable[[Any], tuple[torch.Tensor, torch.Tensor] | str],
+    get_scales: Callable[[Any], tuple[Any, Any] | str],
     row_buckets: tuple[int, ...],
     can_use_fn: Callable[..., bool],
-    no_rows_msg: Callable[
-        [Any, tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, ...]], str
-    ],
+    no_rows_msg: Callable[[Any, tuple[Any, Any], tuple[Any, ...]], str],
     build_statics: Callable[
         [
             dict[str, Any],
             Any,
             int,
             int,
-            tuple[torch.Tensor, torch.Tensor],
-            tuple[torch.Tensor, ...],
+            tuple[Any, Any],
+            tuple[Any, ...],
         ],
         _OpStatics | str,
     ],
+    proposed_routed: tuple[Any, Any, tuple[Any, Any]] | None = None,
+    pre_load: bool = False,
 ) -> _Admitted | str:
     """Shared admission checks across TP decode MoE adapters."""
     from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
@@ -271,9 +344,14 @@ def _admit_common(
             )
         if getattr(layer, "expert_placement_strategy", "linear") != "linear":
             return "EP placement is not linear"
-        if layer.w13_weight.shape[0] * par.ep_size != layer.global_num_experts:
+        local_experts = (
+            proposed_routed[0].shape[0]
+            if proposed_routed is not None
+            else layer.w13_weight.shape[0]
+        )
+        if local_experts * par.ep_size != layer.global_num_experts:
             return (
-                f"{layer.w13_weight.shape[0]} local experts x ep {par.ep_size} != "
+                f"{local_experts} local experts x ep {par.ep_size} != "
                 f"{layer.global_num_experts} experts"
             )
         experts_start = moe_routing.get_experts_start(layer)
@@ -322,19 +400,23 @@ def _admit_common(
         return f"layer routed_scaling_factor {layer.routed_scaling_factor} != 1"
     if not kernel.exact_in_bf16(runner.routed_scaling_factor):
         return f"routed_scaling_factor {runner.routed_scaling_factor} is not bf16"
-    shared = _shared_slice(runner)
+    shared = _shared_slice(runner, pre_load=True) if pre_load else _shared_slice(runner)
     if isinstance(shared, str):
         return shared
-    scales = get_scales(layer)
-    if isinstance(scales, str):
-        return scales
-    hidden = layer.w13_weight.shape[1]
+    if proposed_routed is not None:
+        w13, w2, scales = proposed_routed
+    else:
+        w13, w2 = layer.w13_weight, layer.w2_weight
+        scales = get_scales(layer)
+        if isinstance(scales, str):
+            return scales
+    hidden = int(_sds(w13).shape[1])
     experts = layer.global_num_experts
     topk = int(cfg.experts_per_token)
     weights = (
         layer.e_score_correction_bias,
-        layer.w13_weight,
-        layer.w2_weight,
+        w13,
+        w2,
         *scales,
         *shared,
     )
@@ -350,7 +432,7 @@ def _admit_common(
         )
     )
     if not rows:
-        return no_rows_msg(layer, scales, shared)
+        return no_rows_msg(w13, scales, shared)
     base_statics = dict(
         topk=topk,
         routed_scale=float(runner.routed_scaling_factor),
@@ -403,9 +485,9 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         ),
         row_buckets=kernel.ROW_BUCKETS,
         can_use_fn=kernel.can_use_moe_tp_decode,
-        no_rows_msg=lambda layer, _scales, shared: (
-            f"the kernel admits no token count (w13 {list(layer.w13_weight.shape)} "
-            f"{layer.w13_weight.dtype}, shared w13 {list(shared[0].shape)})"
+        no_rows_msg=lambda w13, _scales, shared: (
+            f"the kernel admits no token count (w13 {list(w13.shape)} "
+            f"{w13.dtype}, shared w13 {list(shared[0].shape)})"
         ),
         build_statics=lambda base, rnr, hidden, _topk, _scales, _shared: _OpStatics(
             **base,
@@ -921,6 +1003,23 @@ def should_arm() -> bool:
     return envs.TPU_MOE_SKIP_PADDED_TOKENS or envs.is_set("USE_MOE_TP_DECODE_KERNEL")
 
 
+def _admit_runner(
+    runner: Any,
+    topo: _Topology | str,
+    admit_fn: Callable[[Any, int], _Admitted | str],
+    *,
+    pre_load: bool = False,
+) -> _Admitted | str:
+    """Run topology, padding-mask, and layer admission gates for ``runner``."""
+    if isinstance(topo, str):
+        return topo
+    if not envs.TPU_MOE_SKIP_PADDED_TOKENS or (
+        not pre_load and token_padding._padding_state is None
+    ):
+        return "needs TPU_MOE_SKIP_PADDED_TOKENS=1 (n_valid comes from its mask)"
+    return admit_fn(runner, int(topo.mesh.size))
+
+
 def _arm_layers(
     model: torch.nn.Module,
     draft_model: torch.nn.Module | None,
@@ -954,14 +1053,7 @@ def _arm_layers(
     for runner in target + drafter:
         if is_already_armed(runner._quant_method):
             continue
-        if isinstance(topo, str):
-            res: _Admitted | str = topo
-        elif (
-            not envs.TPU_MOE_SKIP_PADDED_TOKENS or token_padding._padding_state is None
-        ):
-            res = "needs TPU_MOE_SKIP_PADDED_TOKENS=1 (n_valid comes from its mask)"
-        else:
-            res = admit_fn(runner, int(topo.mesh.size))
+        res = _admit_runner(runner, topo, admit_fn)
         if isinstance(res, str):
             refused[res] = refused.get(res, 0) + 1
         else:

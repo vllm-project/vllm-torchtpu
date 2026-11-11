@@ -23,7 +23,10 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
+from vllm_torchtpu.layers.adapter.moe_tp_decode import (
+    bind_routed_experts_runner,
+    moe_tp_decode_supported,
+)
 from vllm_torchtpu.layers.adapter.moe_tp_decode_nvfp4 import (
     moe_tp_decode_nvfp4_supported,
 )
@@ -49,6 +52,7 @@ class VllmMoERunner(MoERunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        bind_routed_experts_runner(self)
         self._take_over_moe_quant_config_init()
 
     def _take_over_moe_quant_config_init(self) -> None:
