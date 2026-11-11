@@ -107,7 +107,14 @@ def indexed_options() -> dict:
 
 # VLLM_TPU_MK_BUCKET_TUNE: knob overrides per row bucket (core `Tiles` fields or
 # `<block>.<field>` tunables), measured with tpu_bench_wholestep_call (~/q38f/d1/BUCKETS.md).
-BUCKET_TUNE: dict[int, dict[str, Any]] = {}
+# rel_fetch (trace-time-decoded dense refills; exact): j-01f264b1, bitwise at b4/b8/b16,
+# 3.84 -> 3.67 / 4.11 -> 3.95 / 5.33 -> 5.14 ms per call. No VMEM headroom for deeper rings
+# even at b4 (nbd 14 / nbe 16: 66 MiB of 62).
+BUCKET_TUNE: dict[int, dict[str, Any]] = {
+    4: {"rel_fetch": True},
+    8: {"rel_fetch": True},
+    16: {"rel_fetch": True},
+}
 
 
 def _tile_value(v: Any) -> Any:
