@@ -579,7 +579,10 @@ class TestEvictionEvents(unittest.TestCase):
     def test_eviction_callback_registered_and_unregistered(self):
         self.assertEqual(self.store.eviction_callback, self.manager._on_eviction)
         self.manager.shutdown()
-        self.assertIsNone(self.store.eviction_callback)
+        # The real binding rejects None (set_eviction_callback(self, callback:
+        # object)); shutdown detaches the manager by registering a no-op.
+        self.assertTrue(callable(self.store.eviction_callback))
+        self.assertNotEqual(self.store.eviction_callback, self.manager._on_eviction)
 
     def test_sub_hash_to_offload_key(self):
         key = OffloadKey(_key(1) + (0).to_bytes(4, "big"))
