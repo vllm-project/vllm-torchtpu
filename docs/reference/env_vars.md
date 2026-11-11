@@ -118,3 +118,11 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_TRACE_MODE` | `"TRACE_COMPUTE"` | SparseCore trace mode (`"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_DMA"`, etc.). |
 | `TPU_NUM_SPARSE_CORES_TO_TRACE` | `1` | Number of SparseCores to trace when SparseCore tracing is active. |
 | `TPU_KERNEL_ITER_MODE` | `False` | Enables fast Pallas kernel hot-reloading without restarting the vLLM server (`TPU_KERNEL_RELOAD_MODULES`). |
+
+---
+
+## 7. vLLM-Omni Diffusion
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `VLLM_TPU_OMNI_LTX2_PER_SAMPLE_TIMESTEP` | `False` | Opt-in. LTX-2 requests without a conditioning mask pass one timestep per sample (`(B,)`) to the transformer instead of one per token, so each block builds its AdaLN tables once per sample. Off by default: the bf16 TPU output differs from the per-token path, and no on-device bf16 A/B yet shows the difference is rounding only. Does not affect the LLM compile cache. |

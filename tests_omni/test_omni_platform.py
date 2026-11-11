@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
 )
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.omni import patches, register_omni_tpu_platform
 from vllm_torchtpu.omni import rope as omni_rope
 from vllm_torchtpu.omni.attention import (
@@ -962,6 +963,20 @@ def _ltx2_denoise_ctx(conditioning_mask, batch=2, video_tokens=7, audio_tokens=3
     )
 
 
+def _install_ltx2_per_sample_timestep(monkeypatch, *, enabled):
+    # Runs only this patch, on the real upstream LTXRuntime, with the knob
+    # set as given. monkeypatch restores the upstream method afterwards.
+    monkeypatch.setattr(
+        ltx2_runtime.LTXRuntime,
+        "_denoise_timestep_kwargs",
+        _UPSTREAM_DENOISE_TIMESTEP_KWARGS,
+    )
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_OMNI_LTX2_PER_SAMPLE_TIMESTEP", enabled, raising=False
+    )
+    patches._patch_ltx2_per_sample_timestep()
+
+
 class _LTX2SdpaAttention(torch.nn.Module):
     """Plain SDPA in place of _LTX2ParallelAttention (no SP, no backend)."""
 
@@ -999,14 +1014,7 @@ def test_ltx2_per_sample_timestep_matches_per_token_fp32(monkeypatch):
     monkeypatch.setattr(ltx2_transformer, "_LTX2ParallelAttention", _LTX2SdpaAttention)
 
     runtime_cls = ltx2_runtime.LTXRuntime
-    monkeypatch.setattr(
-        runtime_cls, "_denoise_timestep_kwargs", _UPSTREAM_DENOISE_TIMESTEP_KWARGS
-    )
-    monkeypatch.setattr(
-        runtime_cls, "_tpu_orig_denoise_timestep_kwargs", None, raising=False
-    )
-    monkeypatch.delattr(runtime_cls, "_tpu_orig_denoise_timestep_kwargs")
-    patches._patch_ltx2_per_sample_timestep()
+    _install_ltx2_per_sample_timestep(monkeypatch, enabled=True)
 
     torch.manual_seed(0)
     heads, video_head_dim, audio_head_dim, caption = 2, 24, 12, 16
@@ -1060,22 +1068,26 @@ def test_ltx2_per_sample_timestep_matches_per_token_fp32(monkeypatch):
         torch.testing.assert_close(got_out, want_out, rtol=1e-5, atol=1e-5)
 
 
-def test_ltx2_per_sample_timestep_patch(monkeypatch):
+def test_ltx2_per_sample_timestep_patch_off_by_default(monkeypatch):
+    _install_ltx2_per_sample_timestep(monkeypatch, enabled=False)
     runtime_cls = ltx2_runtime.LTXRuntime
-    monkeypatch.setattr(
-        runtime_cls, "_denoise_timestep_kwargs", _UPSTREAM_DENOISE_TIMESTEP_KWARGS
-    )
-    monkeypatch.setattr(
-        runtime_cls, "_tpu_orig_denoise_timestep_kwargs", None, raising=False
-    )
-    monkeypatch.delattr(runtime_cls, "_tpu_orig_denoise_timestep_kwargs")
+    assert runtime_cls._denoise_timestep_kwargs is _UPSTREAM_DENOISE_TIMESTEP_KWARGS
 
-    apply_omni_model_specific_patches.cache_clear()
-    apply_omni_model_specific_patches()
-    assert (
-        runtime_cls._tpu_orig_denoise_timestep_kwargs
-        is _UPSTREAM_DENOISE_TIMESTEP_KWARGS
+    runtime = runtime_cls.__new__(runtime_cls)
+    runtime.guidance_executor = ltx2_runtime.LTXGuidanceExecutor()
+    ts = torch.tensor([500.0, 250.0])
+    counts = {"video_token_count": 7, "audio_token_count": 3}
+    kwargs = runtime._denoise_timestep_kwargs(
+        ts, None, _ltx2_denoise_ctx(None), **counts
     )
+    assert kwargs["timestep"].shape == (2, 7)
+    assert kwargs["audio_timestep"].shape == (2, 3)
+
+
+def test_ltx2_per_sample_timestep_patch(monkeypatch):
+    _install_ltx2_per_sample_timestep(monkeypatch, enabled=True)
+    runtime_cls = ltx2_runtime.LTXRuntime
+    assert runtime_cls._denoise_timestep_kwargs is not _UPSTREAM_DENOISE_TIMESTEP_KWARGS
 
     runtime = runtime_cls.__new__(runtime_cls)
     runtime.guidance_executor = ltx2_runtime.LTXGuidanceExecutor()
@@ -1087,6 +1099,7 @@ def test_ltx2_per_sample_timestep_patch(monkeypatch):
     assert kwargs["timestep"].shape == (2,)
     assert kwargs["audio_timestep"].shape == (2,)
     torch.testing.assert_close(kwargs["timestep"], ts)
+    torch.testing.assert_close(kwargs["audio_timestep"], ts)
     torch.testing.assert_close(kwargs["sigma"], ts)
 
     conditioned = _ltx2_denoise_ctx(torch.ones(2, 7))
@@ -1319,3 +1332,43 @@ def test_ltx2_v2a_patch_dispatch_and_fallbacks(monkeypatch):
     layer._forward_impl(q, k, v, None)
     assert len(called_local) == 1 and len(fallback_calls) == 3
     assert decline_log.info.call_count == 1
+
+
+def test_ltx2_sp_plan_leaves_per_sample_timestep_unsplit(monkeypatch):
+    # The real LTX-2 SP plan run through the real SequenceParallelSplitHook
+    # on 2 Ulysses ranks (this process plays rank 1): a per-token (B, S)
+    # timestep is split with the video tokens, a per-sample (B,) timestep
+    # passes through unchanged, and audio_timestep is not in the plan.
+    from vllm_omni.diffusion.distributed import sp_sharding
+    from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
+    from vllm_omni.diffusion.hooks.sequence_parallel import (
+        ModuleForwardMetadata,
+        SequenceParallelSplitHook,
+    )
+
+    monkeypatch.setattr(sp_sharding, "get_sequence_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(sp_sharding, "get_sequence_parallel_rank", lambda: 1)
+
+    model_cls = ltx2_transformer.LTX2VideoTransformer3DModel
+    plan = model_cls._build_sp_plan("split")[""]
+    assert isinstance(plan["timestep"], SequenceParallelInput)
+    assert "audio_timestep" not in plan
+    hook = SequenceParallelSplitHook(
+        plan, SimpleNamespace(ulysses_degree=2, sequence_parallel_size=2)
+    )
+    hook.module_forward_metadata = ModuleForwardMetadata(_cls=model_cls)
+
+    batch, video_tokens, audio_tokens = 2, 8, 3
+    ts = torch.tensor([500.0, 250.0])
+    per_token = torch.arange(batch * video_tokens, dtype=torch.float32).reshape(
+        batch, video_tokens
+    )
+    audio = ts.reshape(-1, 1).expand(-1, audio_tokens)
+
+    _, split = hook.pre_forward(None, timestep=per_token, audio_timestep=audio)
+    torch.testing.assert_close(split["timestep"], per_token[:, video_tokens // 2 :])
+    assert split["audio_timestep"] is audio
+
+    _, kept = hook.pre_forward(None, timestep=ts, audio_timestep=ts)
+    assert kept["timestep"] is ts
+    assert kept["audio_timestep"] is ts

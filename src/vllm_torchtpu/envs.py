@@ -209,6 +209,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_OMNI_LTX2_PER_SAMPLE_TIMESTEP: bool = False
 
 
 def env_with_choices(
@@ -1281,6 +1282,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # vLLM-Omni LTX-2: pass one timestep per sample, not one per token, when a
+    # request has no conditioning mask (omni/patches.py). Off by default: the
+    # bf16 TPU output differs from the per-token path, and no on-device bf16
+    # A/B yet shows the difference is rounding only.
+    "VLLM_TPU_OMNI_LTX2_PER_SAMPLE_TIMESTEP": env_bool(
+        "VLLM_TPU_OMNI_LTX2_PER_SAMPLE_TIMESTEP", default=False
     ),
 }
 
