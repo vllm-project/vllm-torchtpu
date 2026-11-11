@@ -5807,6 +5807,7 @@ class TPUModelRunner(GPUModelRunner):
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
         with (
+            megakernel_adapter.observe_model_loader(self.vllm_config, model_loader),
             set_vllm_model_wrapper_context(
                 mesh=self.mesh, vllm_config=self.vllm_config
             ),

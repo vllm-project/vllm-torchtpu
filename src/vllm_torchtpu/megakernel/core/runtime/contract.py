@@ -291,6 +291,7 @@ class TpuMonoSpec:
     numerics: str = "exact"
     collective_domain: str = DOMAIN_TP
     layout_request: str | Callable[..., Any] | None = None
+    load_tensor: str | Callable[..., object] | None = None
     decline_codes: tuple[str, ...] = ()
     source_root: str | None = None
     api_version: int = API_VERSION

@@ -149,6 +149,8 @@ def check_plugin_spec(
         resolve_callable(spec.create, module, what="create")
         if isinstance(spec.layout_request, str):
             resolve_callable(spec.layout_request, module, what="layout_request")
+        if isinstance(spec.load_tensor, str):
+            resolve_callable(spec.load_tensor, module, what="load_tensor")
     return spec
 
 
