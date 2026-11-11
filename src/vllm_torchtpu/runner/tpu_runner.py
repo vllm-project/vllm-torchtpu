@@ -83,6 +83,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
 from vllm_torchtpu import envs, stall_watchdog, utils
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError, MegakernelSetupError
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.core.mamba_tail_fold import (
@@ -9317,6 +9318,14 @@ class TPUModelRunner(GPUModelRunner):
                 d = self.take_draft_token_ids()
                 if d and d.draft_token_ids:
                     cur = d.draft_token_ids[0]
+        except (MegakernelSetupError, MegakernelConfigError):
+            # A requested MK program failed (compile or run): fatal unless
+            # VLLM_TPU_MK_ALLOW_FALLBACK=1. "Continuing" served a dead draft
+            # (exos j-5ac1be1f: all requests failed after the warmup swallowed it).
+            if not envs.VLLM_TPU_MK_ALLOW_FALLBACK:
+                raise
+            logger.exception("spec-decode warmup P=%d: MK failed; continuing", P)
+            return False
         except Exception:
             if quiet:
                 # First attempt: a SymInt from the draft forward's cold compile
