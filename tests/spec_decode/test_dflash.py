@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 from types import SimpleNamespace
 from unittest import mock
 
@@ -40,7 +39,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
-from vllm_torchtpu import _patch_dflash_drafting_slot_budget
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
 from vllm_torchtpu.platforms.tpu_platform import _get_token_paddings
@@ -51,12 +49,18 @@ from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
 
 
-def _make_proposer(draft_tp: int | None = 1, target_tp: int = 1) -> DFlashProposer:
+def _make_proposer(
+    draft_tp: int | None = 1,
+    target_tp: int = 1,
+    target_layer_ids: list[int] | None = None,
+) -> DFlashProposer:
     hf_config_mock = mock.MagicMock()
     hf_config_mock.to_dict.return_value = {
         "dflash_config": {
             "mask_token_id": 0,
-            "target_layer_ids": [1, 2],
+            "target_layer_ids": [1, 2]
+            if target_layer_ids is None
+            else target_layer_ids,
         }
     }
 
@@ -240,11 +244,48 @@ def test_precompile_warms_draft_only_buckets():
     assert draft_sizes == [16, 32, 64, 128]
 
 
+@pytest.mark.parametrize(
+    ("num_tokens_paddings", "num_reqs_max_model_len", "buckets"),
+    [
+        # The sub-block bucket drops out; a full chunk rounds up to 512.
+        ([1, 8, 16, 512], 8, [8, 16, 512]),
+        # The draft-only bucket past the largest target bucket stays.
+        ([16, 32, 64], 16, [16, 32, 64, 128]),
+    ],
+)
+def test_draft_forward_buckets_are_the_ones_precompile_warms(
+    num_tokens_paddings, num_reqs_max_model_len, buckets
+):
+    proposer = _make_precompile_proposer(num_tokens_paddings, num_reqs_max_model_len)
+
+    assert proposer.draft_forward_buckets() == buckets
+    proposer.precompile()
+    _, draft_sizes = _precompiled_sizes(proposer)
+    assert draft_sizes == buckets
+
+
+def test_profile_draft_ms_keeps_the_faster_run(monkeypatch):
+    proposer = _make_precompile_proposer([16, 32, 64], num_reqs_max_model_len=4)
+    draft_forward = mock.MagicMock()
+    proposer._dummy_draft_forward = draft_forward
+    # A 10 ms run that compiles, then a 4 ms one.
+    clock = iter([0.0, 0.010, 1.0, 1.004])
+    monkeypatch.setattr(
+        dflash_module, "time", SimpleNamespace(perf_counter=lambda: next(clock))
+    )
+
+    assert proposer.profile_draft_ms(32) == pytest.approx(4.0)
+    calls = draft_forward.call_args_list
+    assert [(c.args, c.kwargs) for c in calls] == [
+        ((32,), {"use_max_model_len": True, "sync": True})
+    ] * 2
+
+
 # Matches _make_precompile_proposer (K=7, block_size 8).
 NUM_SPEC_TOKENS = 7
 
 
-def _spec_config(method: str, parallel_drafting: bool = True) -> SpeculativeConfig:
+def _spec_config(method: str) -> SpeculativeConfig:
     """A real SpeculativeConfig for ``method`` without loading a drafter."""
     spec = SpeculativeConfig(
         model="ngram",
@@ -253,22 +294,8 @@ def _spec_config(method: str, parallel_drafting: bool = True) -> SpeculativeConf
         prompt_lookup_min=1,
     )
     spec.method = method
-    spec.parallel_drafting = parallel_drafting
+    spec.parallel_drafting = True
     return spec
-
-
-@pytest.fixture
-def install_slot_patch(monkeypatch):
-    # Platform activation in earlier tests may have installed the patch
-    # already, so unwrap to upstream's getter. Teardown restores the property
-    # the test found.
-    prop = SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"]
-    monkeypatch.setattr(
-        SpeculativeConfig,
-        "max_num_new_slots_for_drafting",
-        property(inspect.unwrap(prop.fget)),
-    )
-    return _patch_dflash_drafting_slot_budget
 
 
 def _build_scheduler(max_num_batched_tokens: int, method: str) -> Scheduler:
@@ -331,53 +358,22 @@ def _add_request(scheduler: Scheduler, request_id: str, num_prompt_tokens: int):
 
 
 @pytest.mark.parametrize(
-    ("method", "parallel_drafting", "upstream_slots", "tpu_slots"),
-    [
-        ("dflash", True, NUM_SPEC_TOKENS, 0),
-        ("dspark", True, NUM_SPEC_TOKENS - 1, 0),
-        # Methods without a TPU block drafter keep upstream's charge.
-        ("eagle3", True, NUM_SPEC_TOKENS - 1, NUM_SPEC_TOKENS - 1),
-        ("draft_model", True, NUM_SPEC_TOKENS, NUM_SPEC_TOKENS),
-        ("draft_model", False, 1, 1),
-        ("ngram", False, 0, 0),
-    ],
-)
-def test_only_tpu_block_drafters_stop_charging_slots(
-    install_slot_patch, method, parallel_drafting, upstream_slots, tpu_slots
-):
-    spec = _spec_config(method, parallel_drafting)
-    assert spec.max_num_new_slots_for_drafting == upstream_slots
-    install_slot_patch()
-    assert spec.max_num_new_slots_for_drafting == tpu_slots
-
-
-def test_slot_patch_installs_once(install_slot_patch):
-    install_slot_patch()
-    installed = SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"]
-    install_slot_patch()
-    assert SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"] is installed
-
-
-@pytest.mark.parametrize(
     ("method", "expected_prefill"),
     [
-        # TPU block drafter: its K - 1 drafting slots go to prefill.
+        # TPU block drafter: vLLM charges it no drafting slots.
         ("dspark", 40),
         # PARD has no TPU block drafter and keeps its K-slot charge.
         ("draft_model", 40 - NUM_SPEC_TOKENS),
     ],
 )
-def test_tpu_block_drafter_slots_go_to_prefill(
-    install_slot_patch, method, expected_prefill
-):
-    install_slot_patch()
+def test_tpu_block_drafter_slots_go_to_prefill(method, expected_prefill):
     scheduler = _build_scheduler(max_num_batched_tokens=40, method=method)
     _add_request(scheduler, "prefill", 96)
 
     assert scheduler.schedule().num_scheduled_tokens == {"prefill": expected_prefill}
 
 
-def test_uncharged_draft_stays_in_precompiled_buckets(install_slot_patch):
+def test_uncharged_draft_stays_in_precompiled_buckets():
     """Without the charge a step's draft outgrows the token budget.
 
     Each scheduled request drafts a full block however few tokens it was
@@ -385,7 +381,6 @@ def test_uncharged_draft_stays_in_precompiled_buckets(install_slot_patch):
     tokens than max_num_batched_tokens. DFlash must still pad that draft to a
     bucket precompile warmed.
     """
-    install_slot_patch()
     budget = 40
     scheduler = _build_scheduler(max_num_batched_tokens=budget, method="dflash")
     for i in range(6):
@@ -574,6 +569,12 @@ def _make_chunk(
         else None
     )
 
+    if aux_hidden_states is None:
+        num_tokens = max(1, int(position_ids.shape[-1]))
+        aux_hidden_states = [
+            torch.zeros((num_tokens, 32), dtype=torch.float32, device=device)
+        ]
+
     return DraftChunkInputs(
         input_ids=None,
         position_ids=position_ids,
@@ -646,8 +647,13 @@ def test_prepare_dflash_inputs(device):
     )
 
 
-@pytest.mark.tpu_test
-def test_update_draft_kv_cache_from_target_unit(device):
+def test_missing_target_layer_ids():
+    with pytest.raises(ValueError, match="target layer ids"):
+        _make_proposer(target_layer_ids=[])
+
+
+def test_update_draft_kv_cache_from_target_unit():
+    device = torch.device("cpu")
     proposer = _make_proposer(draft_tp=1)
     proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock(
         return_value=(None, [])
@@ -684,12 +690,33 @@ def test_update_draft_kv_cache_from_target_unit(device):
         device=device,
         query_start_loc_np=np.array([0, 3]),
         position_ids=torch.zeros(3),
-        aux_hidden_states=torch.zeros((3, 32), dtype=torch.float32, device=device),
+        aux_hidden_states=[torch.zeros((3, 32), dtype=torch.float32, device=device)],
     )
 
     proposer._update_draft_kv_cache_from_target(chunk)
 
     proposer._tpu_precompute_and_update_kv_cache.assert_called_once()
+
+    # Empty aux_hidden_states is an invalid DFlash runtime state: fail fast
+    # with RuntimeError (rather than IndexError or silently skipping the write
+    # / dropping an EP-DP collective).
+    proposer._tpu_precompute_and_update_kv_cache.reset_mock()
+    empty = _make_chunk(
+        num_reqs=1,
+        start_index=0,
+        device=device,
+        query_start_loc_np=np.array([0, 3]),
+        position_ids=torch.zeros(3),
+        aux_hidden_states=[],
+    )
+    with pytest.raises(RuntimeError, match="aux_hidden_states"):
+        proposer._update_draft_kv_cache_from_target(empty)
+    proposer._tpu_precompute_and_update_kv_cache.assert_not_called()
+
+    # Multi-chunk steps validate every chunk before chunk 0 executes a KV update.
+    with pytest.raises(RuntimeError, match="aux_hidden_states"):
+        proposer._update_context_kv([chunk, empty])
+    proposer._tpu_precompute_and_update_kv_cache.assert_not_called()
 
 
 @pytest.mark.tpu_test
@@ -795,6 +822,7 @@ def test_propose_marks_padding_for_draft_rows():
         SimpleNamespace(
             num_reqs=2,
             start_index=0,
+            aux_hidden_states=[torch.zeros((2, 32))],
             # The live count reaches the builders as a device scalar.
             attn_ctx=SimpleNamespace(
                 request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32)

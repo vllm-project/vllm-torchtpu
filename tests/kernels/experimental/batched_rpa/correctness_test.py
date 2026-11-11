@@ -948,6 +948,41 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             soft_cap=soft_cap,
         )
 
+    @parameterized.product(
+        kv_layout=[
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+            configs.KVLayout.SEQ_ALONG_LANE,
+        ],
+    )
+    def test_ragged_paged_attention_1m_context(self, kv_layout):
+        kv_len = 1024 * 1024
+        num_seqs = 2
+        seq_lens = [(1, kv_len)] * num_seqs
+        num_heads = (8, 2)
+        head_dim = 256
+        page_size = 256
+        dtype = jnp.bfloat16
+        num_pages = cdiv(kv_len, page_size) * num_seqs + 8
+        bq_sz = 1
+        bq_csz = 1
+        bkv_sz = 2048
+
+        self._test_ragged_paged_attention(
+            seq_lens,
+            num_heads,
+            head_dim,
+            page_size,
+            dtype,
+            dtype,
+            num_pages,
+            bq_sz=bq_sz,
+            bkv_sz=bkv_sz,
+            bq_csz=bq_csz,
+            max_num_seq=192,
+            kv_layout=kv_layout,
+            distribution=jnp.array([num_seqs] * 3, dtype=jnp.int32),
+        )
+
 
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())

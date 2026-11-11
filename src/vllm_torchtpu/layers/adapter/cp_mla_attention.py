@@ -38,6 +38,7 @@ from typing import Any
 import torch
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.collectives import all_to_all
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 
@@ -137,17 +138,6 @@ def merge_lse_partials_scatter_heads(
     return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
 
 
-def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
-    """Block `d` of `x`'s leading axis goes to rank `d`; block `r` of the
-    result came from rank `r`."""
-    from torch.distributed import _functional_collectives as funcol
-
-    out = funcol.all_to_all_single(x.contiguous(), None, None, group.device_group)
-    if isinstance(out, funcol.AsyncCollectiveTensor):
-        return funcol.wait_tensor(out)
-    return out
-
-
 def merge_lse_partials_all_to_all(
     output: torch.Tensor, lse: torch.Tensor, group: Any
 ) -> torch.Tensor:
@@ -162,8 +152,8 @@ def merge_lse_partials_all_to_all(
     # Destination-major: [world, T, local, V] and [world, T, local].
     o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
-    o_recv = _all_to_all(o_send, group)
-    l_recv = _all_to_all(l_send, group)
+    o_recv = all_to_all(o_send, group)
+    l_recv = all_to_all(l_send, group)
     return _merge_received(o_recv, l_recv).to(output.dtype)
 
 
