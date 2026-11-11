@@ -85,6 +85,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_UNSTABLE_SORT: bool = False
     TPU_MINIMAX_M3_DCP_FINE_SCAN_WIDTHS: bool = False
     TPU_MINIMAX_M3_MSA_ONEHOT_LOOKUP: bool = False
+    TPU_MINIMAX_M3_INDEXER_DMA_RING3: bool = False
+    TPU_MINIMAX_M3_INDEXER_FP8_TRANSPOSED: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -782,6 +784,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gather, which XLA lowers to a compare chain. r6.
     "TPU_MINIMAX_M3_MSA_ONEHOT_LOOKUP": env_bool(
         "TPU_MINIMAX_M3_MSA_ONEHOT_LOOKUP", default=False
+    ),
+    # MiniMax M3 indexer kernel v3: a 3-group DMA ring (2 groups ahead),
+    # alternate pages on the second DMA queue, one wait per set bit of the
+    # group's page count. Same scores. r6.
+    "TPU_MINIMAX_M3_INDEXER_DMA_RING3": env_bool(
+        "TPU_MINIMAX_M3_INDEXER_DMA_RING3", default=False
+    ),
+    # MiniMax M3 indexer kernel v3: fp8 index caches score small tiles
+    # (<= 64 rows) transposed with fp8 MXU keys, as the folded 4-bit caches
+    # do. r6. Check bitwise against the default before relying on it.
+    "TPU_MINIMAX_M3_INDEXER_FP8_TRANSPOSED": env_bool(
+        "TPU_MINIMAX_M3_INDEXER_FP8_TRANSPOSED", default=False
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and

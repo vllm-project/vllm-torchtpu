@@ -222,6 +222,30 @@ _DMA_ISSUE_CHUNKS = 2
 # token-major with the slot scales folded into the keys (maxima across
 # sublanes, as the other caches).
 _FOLDED_TRANSPOSED_MAX_ROWS = 64
+# r6 (opt-in): fp8 index caches also score transposed (`_fp8_chunk_maxima_t`)
+# for tiles of up to `_FOLDED_TRANSPOSED_MAX_ROWS` rows, their keys fed to
+# the MXU as fp8 as stored (no fp8 -> bf16 unpack; AOT, 128 pages at 8
+# rows: 2,171 -> 819 bundles). Set from TPU_MINIMAX_M3_INDEXER_FP8_TRANSPOSED
+# by the attention layer.
+FP8_TRANSPOSED = False
+# r6 (opt-in): `_kernel_v3`'s DMA ring holds 3 page groups (issuing 2 steps
+# ahead; with one group ahead each step waited out its pages' DMA latency,
+# ~1.3 us per step at 64 or 128 pages), alternate pages go to the second DMA
+# queue, and a group's pages are waited for with one wait per set bit of its
+# page count. Set from TPU_MINIMAX_M3_INDEXER_DMA_RING3 by the attention
+# layer.
+DMA_RING3 = False
+_RING3_SLOTS = 3
+
+
+def _fp8_transposed(block_q: int, dtype) -> bool:
+    """Whether `_kernel_v3` scores fp8-cache tiles of `block_q` rows with
+    `_fp8_chunk_maxima_t` (`FP8_TRANSPOSED`)."""
+    return (
+        FP8_TRANSPOSED
+        and dtype == jnp.float8_e4m3fn
+        and block_q <= _FOLDED_TRANSPOSED_MAX_ROWS
+    )
 # Transposed folded 4-bit scoring feeds the MXU the int4 keys as fp8 rather
 # than bf16: int4 values are exact in e4m3 and bf16 x fp8 is native on tpu7x,
 # so the scores are unchanged, and the cheaper unpack makes the c64 decode
@@ -316,6 +340,34 @@ def _folded_chunk_maxima_t(q_pair, buf, first, chunk, live, issue) -> jax.Array:
     return jnp.concatenate([m[:block_q], m[block_q:]], axis=1)
 
 
+def _fp8_chunk_maxima_t(q_pair, buf, first, chunk, live, issue, dtype) -> jax.Array:
+    """`_folded_chunk_maxima_t` for fp8 pages (`FP8_TRANSPOSED`, r6): the keys
+    enter the MXU as fp8 as stored; a page past the request's end is zeroed
+    (stale VMEM may hold NaN, which would reach the paired page's scores
+    through the zero half of the paired query). Only the right page of a
+    pair can be past the end while its partner is not."""
+    half = chunk // 2
+    block_q = q_pair.shape[0] // 2
+    keys = []
+    for j in range(half):
+        issue(j)
+        pair = []
+        for side, p in enumerate((first + j, first + half + j)):
+            w = buf[p]
+            k = pltpu.bitcast(jnp.where(p < live, w, 0) if side == 1 else w, dtype)
+            pair.append(k)
+        keys.append(jnp.concatenate(pair, axis=1))
+    page_size = keys[0].shape[0]
+    s = jax.lax.dot_general(
+        q_pair,
+        jnp.concatenate(keys, axis=0),
+        (((1,), (1,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )  # [2 Bq, half * S]
+    m = jnp.max(s.reshape(2 * block_q, half, page_size), axis=2)  # [2 Bq, half]
+    return jnp.concatenate([m[:block_q], m[block_q:]], axis=1)
+
+
 def _v3_chunk(pages_per_step: int, block_q: int, page_size: int) -> int:
     """Pages per dot of `_kernel_v3`: the f32 ``[chunk / 2 * S, 2 Bq]``
     product within twice `_MAX_SCORE_ELEMS`."""
@@ -355,7 +407,11 @@ def _kernel_v3(
     A folded 4-bit page (`msa_fp4.scales_in_page`) is ``S / 8`` word rows of
     int4 keys and one row of f32 slot scales (`_folded_chunk_maxima_t`).
     """
-    _, pages_per_step, rows, head_dim = buf.shape
+    slots, pages_per_step, rows, head_dim = buf.shape
+    # Groups issued ahead of the running one: 1 (v3's double buffer), or 2
+    # with `DMA_RING3` (the ring's size decides; see `_class_scores`).
+    ring3 = slots > 2
+    ahead = slots - 1
     block_q = q_ref.shape[0]
     folded = msa_fp4.scales_in_page(rows, cache_ref.dtype)
     page_size = _page_tokens(rows, cache_ref.dtype)
@@ -387,15 +443,39 @@ def _kernel_v3(
 
     def start(base, live, pages, slot):
         for g in pages:
-            pl.when(g < live)(copy(base, g, slot).start)
+            if ring3:
+                # Alternate pages on the second DMA queue (priority 1).
+                pl.when(g < live)(
+                    functools.partial(copy(base, g, slot).start, priority=g % 2)
+                )
+            else:
+                pl.when(g < live)(copy(base, g, slot).start)
+
+    def ahead_group(k):
+        """(first entry, live pages) of work item `k`; none past the grid."""
+        k_base, k_live = group(jnp.minimum(k, num_steps - 1))
+        return k_base, jnp.where(k < num_steps, k_live, 0)
+
+    def wait_pages(live, slot):
+        """`DMA_RING3`: wait for the slot's `live` page copies with one wait
+        per set bit of `live` (the slot's semaphore counts their bytes; a
+        wait per page cost two serial bundles each)."""
+        live = jnp.minimum(live, pages_per_step)
+        n = 1
+        while n <= pages_per_step:
+            fake = pltpu.make_async_copy(
+                words.at[pl.ds(0, n)], buf.at[slot, pl.ds(0, n)], sems.at[slot]
+            )
+            pl.when((live & n) != 0)(fake.wait)
+            n *= 2
 
     @pl.when(step == 0)
     def _():
-        start(*group(step), range(pages_per_step), 0)
+        for k in range(ahead):
+            start(*ahead_group(k), range(pages_per_step), k)
 
     base, live = group(step)
-    next_base, next_live = group(jnp.minimum(step + 1, num_steps - 1))
-    next_live = jnp.where(step + 1 < num_steps, next_live, 0)
+    next_base, next_live = ahead_group(step + ahead)
     q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
     num_chunks = pages_per_step // chunk
     # The next group's descriptors, spread over the first chunks' page pairs:
@@ -414,8 +494,18 @@ def _kernel_v3(
                     next_base,
                     next_live,
                     share[j * per_pair : (j + 1) * per_pair],
-                    1 - slot,
+                    (slot + ahead) % slots,
                 )
+
+        if _fp8_transposed(block_q, cache_ref.dtype):
+            m = _fp8_chunk_maxima_t(
+                q_pair, buf.at[slot], first, chunk, live, issue, cache_ref.dtype
+            )  # [Bq, chunk]
+            if transposed:
+                o_ref[:, pl.ds(first, chunk)] = m
+            else:
+                o_ref[pl.ds(first, chunk), :] = m.T
+            return
 
         if folded and block_q <= _FOLDED_TRANSPOSED_MAX_ROWS:
             m = _folded_chunk_maxima_t(
@@ -466,8 +556,11 @@ def _kernel_v3(
         """Score the group's first `scored` chunks; the rest are past the
         request's last page (their scores are never read) and only issue
         their share of the next group's descriptors."""
-        for g in range(pages_per_step):
-            pl.when(g < live)(copy(base, g, slot).wait)
+        if ring3:
+            wait_pages(live, slot)
+        else:
+            for g in range(pages_per_step):
+                pl.when(g < live)(copy(base, g, slot).wait)
         for c in range(num_chunks):
             pages = range(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
@@ -475,16 +568,16 @@ def _kernel_v3(
             if c < scored:
                 score_chunk(slot, c * chunk, pages)
             else:
-                start(next_base, next_live, pages, 1 - slot)
+                start(next_base, next_live, pages, (slot + ahead) % slots)
 
     # One straight-line body per slot and count of scored chunks, so that a
     # chunk's matmuls overlap the previous chunk's maxima.
     counts = sorted({num_chunks} | {2**k for k in range(1, 8) if 2**k < num_chunks})
     live_chunks = jnp.minimum(-(-live // chunk), num_chunks)
-    for slot in (0, 1):
+    for slot in range(slots):
         for i, n in enumerate(counts):
             lo = counts[i - 1] if i else 0
-            pl.when((step % 2 == slot) & (live_chunks > lo) & (live_chunks <= n))(
+            pl.when((step % slots == slot) & (live_chunks > lo) & (live_chunks <= n))(
                 functools.partial(body, slot, n)
             )
 
@@ -702,6 +795,7 @@ def _class_scores(
                 f"pages_per_step must be an even divisor or a multiple of it, "
                 f"got {pages_per_step}"
             )
+        ring_slots = _RING3_SLOTS if DMA_RING3 else 2
         scores_t = pl.pallas_call(
             functools.partial(_kernel_v3, transposed=token_major),
             grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -711,9 +805,10 @@ def _class_scores(
                 out_specs=out_specs,
                 scratch_shapes=[
                     pltpu.VMEM(
-                        (2, pages_per_step, rows_per_page, head_dim), jnp.uint32
+                        (ring_slots, pages_per_step, rows_per_page, head_dim),
+                        jnp.uint32,
                     ),
-                    pltpu.SemaphoreType.DMA((2,)),
+                    pltpu.SemaphoreType.DMA((ring_slots,)),
                 ],
             ),
             out_shape=out_shape,
@@ -844,6 +939,8 @@ def class_plan(
     # the same as one of 8 (paired scores are 2 x tile lanes). A request of up
     # to block_q rows takes several tiles; none holds more than the batch.
     folded = msa_fp4.is_fp4(index_cache) and scale_row is None
+    # With `FP8_TRANSPOSED`, fp8 tiles take the transposed tile size too.
+    folded = folded or (scale_row is None and _fp8_transposed(1, index_cache.dtype))
     tile = (
         min(
             block_q,

@@ -43,3 +43,5 @@ def apply() -> None:
     _set("TPU_MINIMAX_M3_MSA_UNSTABLE_SORT", msa_attention, "UNSTABLE_UNION_SORT")
     _set("TPU_MINIMAX_M3_DCP_FINE_SCAN_WIDTHS", msa_dcp, "FINE_SCAN_WIDTHS")
     _set("TPU_MINIMAX_M3_MSA_ONEHOT_LOOKUP", msa_indexer, "ONEHOT_LOOKUP")
+    _set("TPU_MINIMAX_M3_INDEXER_DMA_RING3", msa_indexer, "DMA_RING3")
+    _set("TPU_MINIMAX_M3_INDEXER_FP8_TRANSPOSED", msa_indexer, "FP8_TRANSPOSED")
