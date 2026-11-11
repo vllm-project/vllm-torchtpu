@@ -14,11 +14,11 @@
 """MiniMax Sparse Attention layer on TPU."""
 
 import functools
+from collections.abc import Callable
 
 import torch
 from torch import nn
 from transformers import PreTrainedConfig
-from vllm import ir
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -45,6 +45,7 @@ from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_op,
     get_msa_sharded_op,
 )
+from vllm_torchtpu.models.minimax_m3.ops.qk_norm_rope import get_qk_norm_rope_op
 
 
 class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
@@ -211,47 +212,35 @@ def norm_rope_heads(
     head_dim: int,
     norms: tuple[GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm],
     rotary_emb: nn.Module,
+    op: Callable[..., tuple[torch.Tensor, ...]],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split ``[q | k | v | index_q | index_k]`` and norm + rotate all but v.
+    """Split ``[q | k | v | index_q | index_k]`` and norm + rotate all but v
+    in one kernel, `op` (`ops.qk_norm_rope.get_qk_norm_rope_op` for these
+    head counts; it also fixes q's layout).
 
     The four Gemma RMSNorms differ only in their weights and RoPE acts on each
-    head alone, so one norm over the stacked q, k, index_q and index_k heads
-    with a per-head ``1 + w`` table, then one rotation, gives the same values
-    as four norms and two rotations in fewer, larger ops.
-
-    Returns ``(q, k, v, index_q, index_k)`` with shapes ``[T, num_heads * D]``,
-    ``[T, num_kv_heads * D]`` (x3) and ``[T, D]``.
+    head alone, so the kernel norms every head with its row of a per-head
+    ``1 + w`` table, then rotates it, with the numerics of the TPU
+    ``rms_norm`` provider and the FP32 rotary embedding.
     """
-    num_tokens = qkv.shape[0]
-    heads = qkv.view(num_tokens, -1, head_dim)
-    nq, nkv = num_heads, num_kv_heads
-    v = heads[:, nq + nkv : nq + 2 * nkv]
-    x = torch.cat([heads[:, : nq + nkv], heads[:, nq + 2 * nkv :]], dim=1)
+    if not rotary_emb.is_neox_style or rotary_emb.head_size != head_dim:
+        raise NotImplementedError("MiniMax M3 rotates NeoX-style within each head.")
     q_norm, k_norm, index_q_norm, index_k_norm = norms
     weight = (
         torch.cat(
             [
-                q_norm.weight.expand(nq, head_dim),
-                k_norm.weight.expand(nkv, head_dim),
-                index_q_norm.weight.expand(nkv, head_dim),
+                q_norm.weight.expand(num_heads, head_dim),
+                k_norm.weight.expand(num_kv_heads, head_dim),
+                index_q_norm.weight.expand(num_kv_heads, head_dim),
                 index_k_norm.weight.expand(1, head_dim),
             ]
         ).float()
         + 1.0
     )
-    eps = q_norm.variance_epsilon
-    assert all(n.variance_epsilon == eps for n in norms)
-    x = ir.ops.rms_norm(x, weight, eps)
-    x, _ = rotary_emb(positions, x.reshape(num_tokens, -1), None)
-    x = x.view(num_tokens, -1, head_dim)
-    q, k, index_q, index_k = x.split([nq, nkv, nkv, 1], dim=1)
-    return (
-        q.reshape(num_tokens, -1),
-        k.reshape(num_tokens, -1),
-        v.reshape(num_tokens, -1),
-        index_q.reshape(num_tokens, -1),
-        index_k.reshape(num_tokens, -1),
-    )
+    assert all(n.variance_epsilon == q_norm.variance_epsilon for n in norms)
+    cos_sin = rotary_emb._match_cos_sin_cache_dtype(qkv)
+    cos_sin = cos_sin.index_select(0, positions.flatten())
+    return op(qkv, cos_sin, weight)
 
 
 class MiniMaxM3SparseAttention(nn.Module):
@@ -402,6 +391,15 @@ class MiniMaxM3SparseAttention(nn.Module):
             )
         else:
             self.msa_op = get_msa_op(*msa_config, fp4=self.fp4)
+        # A DCP group over one KV head reads q head-major (`get_msa_dcp_op`).
+        self.q_head_major = self.dcp_size > 1 and self.dcp_kv_heads == 1
+        self.norm_rope_op = get_qk_norm_rope_op(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            eps,
+            self.q_head_major,
+        )
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
@@ -415,14 +413,18 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.head_dim,
             (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm),
             self.rotary_emb,
+            self.norm_rope_op,
         )
-
         num_tokens = hidden_states.shape[0]
+        if not self.q_head_major:
+            q = q.view(num_tokens, self.num_heads, self.head_dim)
         metadata = get_forward_context().attn_metadata
         kv_cache = self.kv_cache.kv_cache
         if not isinstance(metadata, dict) or kv_cache.numel() == 0:
             # Memory profiling runs before the caches are bound.
-            attn_output = q
+            attn_output = (q.transpose(0, 1) if self.q_head_major else q).reshape(
+                num_tokens, self.q_size
+            )
         else:
             layer_metadata = metadata[self.kv_cache.prefix]
             assert isinstance(layer_metadata, AttentionMetadata)
@@ -436,7 +438,7 @@ class MiniMaxM3SparseAttention(nn.Module):
                 if self.dcp_size > 1:
                     extra["hadamard"] = self.hadamard
             attn_output = self.msa_op(
-                q.view(num_tokens, self.num_heads, self.head_dim),
+                q,
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),
                 v.view(num_tokens, self.num_kv_heads, self.head_dim),
                 index_q,

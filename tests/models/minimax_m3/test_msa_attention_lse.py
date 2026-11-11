@@ -140,17 +140,27 @@ def test_lse_matches_dense_reference(
     _check(got, want)
 
 
-def _head_major_call(fn, q, *args, head_major, **kwargs):
-    """`fn`'s token-major results, or its head-major ones transposed back."""
+# (head-major results, head-major q)
+LAYOUTS = [(False, False), (True, False), (True, True)]
+
+
+def _head_major_call(fn, q, *args, head_major, q_head_major=False, **kwargs):
+    """`fn`'s token-major results, or its head-major ones transposed back;
+    with `q_head_major`, `fn` takes q head-major."""
+    if q_head_major:
+        q = q.transpose(1, 0, 2)
+        kwargs["q_head_major"] = True
     if not head_major:
         return fn(q, *args, **kwargs)
     out, lse = fn(q, *args, head_major=True, **kwargs)
     return out.transpose(1, 0, 2), lse.T
 
 
-@pytest.mark.parametrize("head_major", [False, True])
+@pytest.mark.parametrize("head_major,q_head_major", LAYOUTS)
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
-def test_lse_heads_matches_dense_reference(dtype, head_major, monkeypatch):
+def test_lse_heads_matches_dense_reference(
+    dtype, head_major, q_head_major, monkeypatch
+):
     """Every KV head of multi-head cache rows, over several kernel calls."""
     monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", 32)
     num_kv_heads, num_tokens = 2, 70
@@ -169,6 +179,7 @@ def test_lse_heads_matches_dense_reference(dtype, head_major, monkeypatch):
         sm_scale=SCALE,
         interpret=True,
         head_major=head_major,
+        q_head_major=q_head_major,
     )
     q32 = np.asarray(q.astype(jnp.float32))
     outs, lses = [], []
@@ -259,9 +270,11 @@ def _fp4_cache(rng, num_kv_heads):
     return kv, scales, rows
 
 
-@pytest.mark.parametrize("head_major", [False, True])
+@pytest.mark.parametrize("head_major,q_head_major", LAYOUTS)
 @pytest.mark.parametrize("num_kv_heads", [1, 2])
-def test_fp4_lse_matches_dense_reference(num_kv_heads, head_major, monkeypatch):
+def test_fp4_lse_matches_dense_reference(
+    num_kv_heads, head_major, q_head_major, monkeypatch
+):
     """4-bit pages and their scale pages, copied by the kernel beside each
     page: single-head calls (static scale rows) and every head at once
     (rows of the cache-row head). Scale pages nobody selects hold NaN."""
@@ -281,7 +294,7 @@ def test_fp4_lse_matches_dense_reference(num_kv_heads, head_major, monkeypatch):
     scales[table[10:]] = np.nan
     common = dict(sm_scale=SCALE, scale_cache=jnp.asarray(scales), interpret=True)
     args = (jnp.asarray(local_key), jnp.asarray(local_limit), jnp.asarray(table))
-    common["head_major"] = head_major
+    common.update(head_major=head_major, q_head_major=q_head_major)
     if num_kv_heads == 1:
         got = _head_major_call(
             msa_sparse_attention_lse, q, kv, jnp.asarray(keys[:, 0]), *args, **common

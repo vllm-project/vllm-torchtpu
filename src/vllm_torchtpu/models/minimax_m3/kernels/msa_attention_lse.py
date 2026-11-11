@@ -639,6 +639,7 @@ def _chunked_call(
     scale_cache=None,
     scale_rows=None,
     head_major=False,
+    q_head_major=False,
 ):
     """`_attention_call` per KV head and chunk of at most
     `MAX_TOKENS_PER_CALL` tokens (the work list lives in SMEM).
@@ -654,13 +655,16 @@ def _chunked_call(
     the c4 prefill twin, j-3c651507, and ~43 us more per head at DCP 8).
     The calls after the first run as one `fori_loop`, so the kernel is
     emitted twice per call site (the first call creates the output) rather
-    than once per head and chunk."""
-    num_tokens, num_q_heads, _ = q.shape
+    than once per head and chunk. With `q_head_major`, q comes ``[G * Hg, T,
+    D]``, as the kernel reads it."""
+    if not q_head_major:
+        q = q.transpose(1, 0, 2)
+    num_q_heads, num_tokens, _ = q.shape
     num_heads = selected.shape[1]
     if num_tokens == 0:
         if head_major:
-            return q.transpose(1, 0, 2), jnp.zeros((num_q_heads, 0), jnp.float32)
-        return q, jnp.zeros(q.shape[:2], jnp.float32)
+            return q, jnp.zeros((num_q_heads, 0), jnp.float32)
+        return q.transpose(1, 0, 2), jnp.zeros((0, num_q_heads), jnp.float32)
     call = functools.partial(
         _attention_call,
         q_per_head=num_q_heads // num_heads,
@@ -675,7 +679,7 @@ def _chunked_call(
     step = min(num_tokens, max(block_q, limit - limit % block_q))
     num_chunks = -(-num_tokens // step)
     pad = num_chunks * step - num_tokens
-    q = jnp.pad(q, ((0, pad), (0, 0), (0, 0))).transpose(1, 0, 2)
+    q = jnp.pad(q, ((0, 0), (0, pad), (0, 0)))
     selected = jnp.pad(
         selected, ((0, pad), (0, 0), (0, 0)), constant_values=-1
     ).transpose(1, 0, 2)
@@ -723,10 +727,12 @@ def _chunked_call(
     return out.transpose(1, 0, 2)[:num_tokens], lse[:num_tokens]
 
 
-def _pad_tokens(q, selected, local_page, local_limit, block_q):
-    pad = -q.shape[0] % block_q
+def _pad_tokens(q, selected, local_page, local_limit, block_q, q_head_major=False):
+    pad = -selected.shape[0] % block_q
     if pad:
-        q = jnp.pad(q, ((0, pad),) + ((0, 0),) * (q.ndim - 1))
+        widths = [(0, 0)] * q.ndim
+        widths[1 if q_head_major else 0] = (0, pad)
+        q = jnp.pad(q, widths)
         selected = jnp.pad(
             selected, ((0, pad),) + ((0, 0),) * (selected.ndim - 1), constant_values=-1
         )
@@ -758,6 +764,7 @@ def _check_rows(kv_cache, head_dim, head=None):
         "v_scale_row",
         "interpret",
         "head_major",
+        "q_head_major",
     ),
 )
 def msa_sparse_attention_lse(
@@ -777,6 +784,7 @@ def msa_sparse_attention_lse(
     v_scale_row: int = 1,
     interpret: bool = False,
     head_major: bool = False,
+    q_head_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
     by `page_table`) returning ``(out [T, H, D], lse [T, H] f32)``.
@@ -787,13 +795,13 @@ def msa_sparse_attention_lse(
     `head` picks the one these queries attend (a 2D-wide block of each page).
     A 4-bit cache takes its `scale_cache` (`msa_attention.msa_sparse_attention`).
     With `head_major`, the results come back head-major: ``out [H, T, D]``,
-    ``lse [H, T]``.
+    ``lse [H, T]``; with `q_head_major`, q comes head-major, ``[H, T, D]``.
     """
-    num_tokens, _, head_dim = q.shape
+    num_tokens, head_dim = selected.shape[0], q.shape[2]
     msa_attention.check_cache(kv_cache, scale_cache)
     _check_rows(kv_cache, head_dim, head)
     q, selected, local_page, local_limit = _pad_tokens(
-        q, selected, local_page, local_limit, block_q
+        q, selected, local_page, local_limit, block_q, q_head_major
     )
     out, lse = _chunked_call(
         q,
@@ -810,6 +818,7 @@ def msa_sparse_attention_lse(
         scale_cache=scale_cache,
         scale_rows=None if scale_cache is None else (k_scale_row, v_scale_row),
         head_major=head_major,
+        q_head_major=q_head_major,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
@@ -824,6 +833,7 @@ def msa_sparse_attention_lse(
         "pages_per_step",
         "interpret",
         "head_major",
+        "q_head_major",
     ),
 )
 def msa_sparse_attention_lse_heads(
@@ -840,6 +850,7 @@ def msa_sparse_attention_lse_heads(
     scale_cache: jax.Array | None = None,
     interpret: bool = False,
     head_major: bool = False,
+    q_head_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_sparse_attention_lse` for every KV head of the cache rows at once.
 
@@ -850,10 +861,11 @@ def msa_sparse_attention_lse_heads(
     [T, G * Hg, D], lse [T, G * Hg] f32)``.
 
     With a 4-bit cache, `scale_cache` ``[pages, R, S]`` holds head ``h``'s K / V
-    scales in rows ``2h`` / ``2h + 1``. `head_major` as `msa_sparse_attention_lse`.
+    scales in rows ``2h`` / ``2h + 1``. `head_major` and `q_head_major` as
+    `msa_sparse_attention_lse`.
     """
-    num_tokens, num_q_heads, head_dim = q.shape
-    num_heads = selected.shape[1]
+    num_tokens, num_heads = selected.shape[:2]
+    num_q_heads, head_dim = q.shape[0 if q_head_major else 1], q.shape[2]
     msa_attention.check_cache(kv_cache, scale_cache)
     if scale_cache is not None and scale_cache.shape[1] < 2 * num_heads:
         raise ValueError(
@@ -865,7 +877,7 @@ def msa_sparse_attention_lse_heads(
             f"rows {kv_cache.shape}."
         )
     q, selected, local_page, local_limit = _pad_tokens(
-        q, selected, local_page, local_limit, block_q
+        q, selected, local_page, local_limit, block_q, q_head_major
     )
     out, lse = _chunked_call(
         q,
@@ -882,6 +894,7 @@ def msa_sparse_attention_lse_heads(
         scale_cache=scale_cache,
         scale_rows=None if scale_cache is None else "head",
         head_major=head_major,
+        q_head_major=q_head_major,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]

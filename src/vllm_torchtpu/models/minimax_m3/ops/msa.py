@@ -372,6 +372,11 @@ def _head_major_attend_fake(q, *args):
     )
 
 
+def _q_head_major_attend_fake(q, *args):
+    """`_head_major_attend_fake` for head-major ``q [H, T, D]``."""
+    return torch.empty_like(q), q.new_empty(q.shape[:2], dtype=torch.float32)
+
+
 def _rotate_heads(x: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
     """``x @ H / n`` over the head dim, for the bf16 Sylvester ``hadamard``:
     `msa_fp4.rotate_queries` (and, ``H`` being symmetric,
@@ -380,14 +385,18 @@ def _rotate_heads(x: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
     return torch.matmul(x, hadamard) * (1.0 / x.shape[-1])
 
 
-def gather_query_heads(q: torch.Tensor, group: Any) -> torch.Tensor:
-    """The DCP group's query heads ``[T, dcp * q_heads, D]``, gathered as
+def gather_query_heads(
+    q: torch.Tensor, group: Any, head_major: bool = False
+) -> torch.Tensor:
+    """The DCP group's query heads ``[T, dcp * q_heads, D]`` (``[dcp *
+    q_heads, T, D]`` from `head_major` ``q [q_heads, T, D]``), gathered as
     they leave the rope: any op on `q` before the gather (a head-major
     transpose, a 4-bit rotation of this rank's heads) made XLA re-lay out
     the qkv / rope fusions that produce it (+0.25-0.3 ms per layer at 8K
     tokens, c48 / c64 twins j-4371707e, j-65bccede, j-c5c4bdfc); the
-    attention op rotates the gathered queries itself."""
-    return group.all_gather(q.contiguous(), dim=1)
+    attention op rotates the gathered queries itself. The rope kernel
+    (`ops.qk_norm_rope`) emits head-major q in a fixed layout."""
+    return group.all_gather(q.contiguous(), dim=0 if head_major else 1)
 
 
 def merge_head_partials(
@@ -586,6 +595,7 @@ def get_msa_dcp_op(
             topk=topk,
             rank=dcp_rank,
             dcp=dcp,
+            q_head_major=kv_heads == 1,
         )
 
     # No rank in the name: the op (and the program it lowers to) is the same
@@ -614,7 +624,9 @@ def get_msa_dcp_op(
         )
 
     score_op.register_fake(_score_fake)
-    attend_op.register_fake(_head_major_attend_fake)
+    attend_op.register_fake(
+        _q_head_major_attend_fake if kv_heads == 1 else _head_major_attend_fake
+    )
 
     def op(
         q: torch.Tensor,
@@ -631,7 +643,7 @@ def get_msa_dcp_op(
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
         if kv_heads == 1:
-            q_all = gather_query_heads(q, group)
+            q_all = gather_query_heads(q, group, head_major=True)
         else:
             q_all, k, v, index_q = gather_group_heads(
                 q, k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
@@ -739,6 +751,7 @@ def _get_msa_dcp_fp4_op(
             rank=dcp_rank,
             dcp=dcp,
             scale_cache=scale_cache,
+            q_head_major=True,
         )
 
     suffix = (
@@ -771,7 +784,7 @@ def _get_msa_dcp_fp4_op(
         )
 
     score_op.register_fake(_score_fake)
-    attend_op.register_fake(_head_major_attend_fake)
+    attend_op.register_fake(_q_head_major_attend_fake)
     heads_op = (
         _get_msa_dcp_heads_op(
             sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix
@@ -830,7 +843,7 @@ def _get_msa_dcp_fp4_op(
                 metadata.query_start_loc,
                 metadata.request_distribution,
             )
-        q_all = gather_query_heads(q, group)
+        q_all = gather_query_heads(q, group, head_major=True)
         candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
         out, lse = attend_op(
             q_all,

@@ -820,6 +820,7 @@ def msa_attend_dcp(
     rank: int | jax.Array,
     dcp: int,
     scale_cache: jax.Array | None = None,
+    q_head_major: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Second half of the DCP forward: attend over the selected blocks this
@@ -831,13 +832,14 @@ def msa_attend_dcp(
     their own merged heads, a 1 / DCP share of the group's each).
 
     ``q [T, G * Hg, D]`` holds every query head of the group's ``G`` KV heads
-    (KV head ``h`` owns query heads ``[h * Hg, (h + 1) * Hg)``);
-    ``candidates [dcp, T, G * 2 * topk]`` every rank's candidates. Returns
+    (KV head ``h`` owns query heads ``[h * Hg, (h + 1) * Hg)``), or ``[G * Hg,
+    T, D]`` with `q_head_major`; ``candidates [dcp, T, G * 2 * topk]`` every
+    rank's candidates. Returns
     the partial head-major, as the kernel writes it, ``(out [G * Hg, T, D],
     lse [G * Hg, T] f32)``: the LSE merge reduce-scatters heads along the
     leading axis (`ops.msa.merge_head_partials`).
     """
-    num_tokens = q.shape[0]
+    num_tokens = q.shape[1 if q_head_major else 0]
     rank = rank_array(rank)[0]
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
@@ -869,6 +871,7 @@ def msa_attend_dcp(
             if small
             else msa_attention.DEFAULT_PAGES_PER_STEP
         ),
+        q_head_major=q_head_major,
         interpret=interpret,
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
@@ -896,3 +899,4 @@ def msa_attend_dcp(
     return msa_attention_lse.msa_sparse_attention_lse_heads(
         q, kv_cache, keys, *args, head_major=True, **common
     )
+
