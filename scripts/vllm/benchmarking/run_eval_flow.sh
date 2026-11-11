@@ -28,6 +28,9 @@ SKIP_DB_UPLOAD_FLAG=0
 SKIP_PERF_CHECK=0
 SKIP_BENCHMARK=0
 BASELINE_CONFIG=""
+BASE_URL_CLI=""
+EVAL_SUITES_CLI=""
+PERF_SUITES_CLI=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -38,6 +41,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --results-dir)
             RESULTS_DIR="$2"
+            shift 2
+            ;;
+        --base-url)
+            BASE_URL_CLI="$2"
+            shift 2
+            ;;
+        --eval-suites)
+            EVAL_SUITES_CLI="$2"
+            shift 2
+            ;;
+        --perf-suites)
+            PERF_SUITES_CLI="$2"
             shift 2
             ;;
         --run-lm-eval)
@@ -87,7 +102,7 @@ while [[ $# -gt 0 ]]; do
 
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT] [--skip-db-upload] [--skip-perf-check] [--skip-benchmark] [--baseline-config CONFIG_NAME]"
+            echo "Usage: $0 --config CONFIG_NAME [--base-url URL] [--eval-suites LIST] [--perf-suites LIST] [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT] [--skip-db-upload] [--skip-perf-check] [--skip-benchmark] [--baseline-config CONFIG_NAME]"
             # shellcheck disable=SC2016
             echo '  --results-dir defaults to $ARTIFACTS_DIR/$CONFIG_NAME when ARTIFACTS_DIR is set, else /tmp/perf_eval_$CONFIG_NAME'
             exit 1
@@ -95,8 +110,26 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ -z "$HOST" ]; then
-    HOST="localhost"
+if [ -n "$BASE_URL_CLI" ]; then
+    read -r BASE_URL HOST PORT < <(python3 -c '
+import sys
+from urllib.parse import urlparse
+raw = sys.argv[1].strip()
+if "://" not in raw:
+    raw = "http://" + raw
+u = urlparse(raw)
+if not u.hostname:
+    sys.exit(f"Invalid --base-url: {sys.argv[1]}")
+port = u.port or (443 if u.scheme == "https" else 8000)
+base = f"{u.scheme}://{u.hostname}:{port}"
+print(base, u.hostname, port)
+' "$BASE_URL_CLI")
+    START_SERVER=0
+else
+    if [ -z "$HOST" ]; then
+        HOST="localhost"
+    fi
+    BASE_URL="http://$HOST:$PORT"
 fi
 
 if [ -z "$CONFIG_NAME" ]; then
@@ -328,10 +361,184 @@ print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + '
     fi
 }
 
+run_json_schema_eval() {
+    local task="json_schema"
+    local baseline="scripts/vllm/benchmarking/baselines/eval/${BASELINE_CONFIG}.${task}.baseline.json"
+    local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
+    local results_json="${RESULTS_DIR}/results_${task}.json"
+    local task_cfg="${JSON_SCHEMA_TASK_CONFIG:-$SCRIPT_DIR/task_configs/json_schema_default.yaml}"
+
+    echo "Running JSON Schema evaluation ($task_cfg)..."
+    local model_arg=()
+    if [ -n "${MODEL:-}" ]; then
+        model_arg=(--model "$MODEL")
+    fi
+    if ! python3 "$SCRIPT_DIR/eval_json_schema.py" \
+        --base-url "$BASE_URL" \
+        "${model_arg[@]}" \
+        --task-config "$task_cfg" \
+        --output-json "$results_json"; then
+        echo "::error::JSON Schema evaluation client failed."
+        fail=1
+        return
+    fi
+
+    if [ -f "$baseline" ]; then
+        echo "=== Checking Eval Regression for $task ==="
+        python3 scripts/vllm/benchmarking/check_regression.py \
+          --mode eval \
+          --tolerance "$EVAL_TOLERANCE" \
+          --results-dir "$RESULTS_DIR" \
+          --baseline "$baseline" 2>&1 | tee "$eval_log" || eval_regression_failed "$task"
+    else
+        echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
+    fi
+}
+
+run_agentx_perf() {
+    local conc_list="${AGENTX_CONC_LIST:-}"
+    local model_prefix="${AGENTX_MODEL_PREFIX:-}"
+    local precision="${AGENTX_PRECISION:-}"
+    if [ -z "$conc_list" ] || [ -z "$model_prefix" ] || [ -z "$precision" ]; then
+        echo "::error::agentx suite requires AGENTX_CONC_LIST, AGENTX_MODEL_PREFIX, and AGENTX_PRECISION in $CONFIG_NAME.sh or env."
+        fail=1
+        return
+    fi
+    local chips="${AGENTX_CHIPS:-$(( CONFIG_TP * CONFIG_DP ))}"
+    local agentx_args=(
+        --server-url "$BASE_URL"
+        --conc-list "${conc_list// /,}"
+        --chips "$chips"
+        --model-prefix "$model_prefix"
+        --precision "$precision"
+        --results-dir "$RESULTS_DIR/agentx"
+    )
+    if [ -n "${AGENTX_REFERENCE_ROW:-}" ]; then
+        agentx_args+=(--reference-row "$AGENTX_REFERENCE_ROW")
+    fi
+    if [ -n "${AGENTX_SPEC_METHOD:-}" ]; then
+        agentx_args+=(--spec-method "$AGENTX_SPEC_METHOD")
+    fi
+    if [ -n "${AGENTX_DURATION:-}" ]; then
+        agentx_args+=(--duration "$AGENTX_DURATION")
+    fi
+    echo "Running InferenceX AgentX suite against $BASE_URL..."
+    bash "$SCRIPT_DIR/../benchmark/inferencex/agentx_client.sh" "${agentx_args[@]}" || {
+        echo "::error::AgentX benchmark suite failed."
+        fail=1
+    }
+}
+
+CONFIG_FILE="$SCRIPT_DIR/configs/${CONFIG_NAME}.sh"
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: Config file not found: $CONFIG_FILE"
+    exit 1
+fi
+
+# Read config-declared suite defaults in an isolated subshell before launching.
+eval "$(
+    SCRIPT_DIR="$SCRIPT_DIR" bash -c '
+        LM_EVAL_TASKS="mmlu_llama mmlu_pro"
+        EVAL_SUITES="${EVAL_SUITES:-}"
+        PERF_SUITES="${PERF_SUITES:-}"
+        JSON_SCHEMA_TASK_CONFIG="${JSON_SCHEMA_TASK_CONFIG:-}"
+        AGENTX_CONC_LIST="${AGENTX_CONC_LIST:-}"
+        AGENTX_MODEL_PREFIX="${AGENTX_MODEL_PREFIX:-}"
+        AGENTX_PRECISION="${AGENTX_PRECISION:-}"
+        AGENTX_CHIPS="${AGENTX_CHIPS:-}"
+        AGENTX_REFERENCE_ROW="${AGENTX_REFERENCE_ROW:-}"
+        AGENTX_SPEC_METHOD="${AGENTX_SPEC_METHOD:-}"
+        AGENTX_DURATION="${AGENTX_DURATION:-}"
+        source "$1"
+        for var in LM_EVAL_TASKS EVAL_SUITES PERF_SUITES JSON_SCHEMA_TASK_CONFIG \
+            AGENTX_CONC_LIST AGENTX_MODEL_PREFIX AGENTX_PRECISION AGENTX_CHIPS \
+            AGENTX_REFERENCE_ROW AGENTX_SPEC_METHOD AGENTX_DURATION; do
+            printf "%s=%q\n" "$var" "${!var}"
+        done
+    ' _ "$CONFIG_FILE"
+)"
+
+# Resolve selected performance suites.
+RUN_BENCH_SERVE=0
+RUN_AGENTX=0
+effective_perf_suites="$PERF_SUITES_CLI"
+if [ -z "$effective_perf_suites" ] && [ -n "${PERF_SUITES:-}" ]; then
+    effective_perf_suites="$PERF_SUITES"
+fi
+if [ -n "$effective_perf_suites" ]; then
+    IFS=',' read -r -a _perf_items <<< "$effective_perf_suites"
+    for raw_item in "${_perf_items[@]}"; do
+        item="${raw_item// /}"
+        case "$item" in
+            ""|none) ;;
+            all) RUN_BENCH_SERVE=1; RUN_AGENTX=1 ;;
+            bench_serve) RUN_BENCH_SERVE=1 ;;
+            agentx) RUN_AGENTX=1 ;;
+            *)
+                echo "ERROR: Unknown --perf-suites item '$item' (expected bench_serve, agentx, all, or none)"
+                exit 1
+                ;;
+        esac
+    done
+else
+    if [ "$SKIP_BENCHMARK" = "0" ]; then
+        RUN_BENCH_SERVE=1
+    fi
+fi
+
+if [ "$RUN_BENCH_SERVE" = "0" ]; then
+    SKIP_PERF_CHECK=1
+fi
+
+# Resolve selected accuracy suites.
+SELECTED_EVAL_SUITES=()
+effective_eval_suites="$EVAL_SUITES_CLI"
+if [ -z "$effective_eval_suites" ] && [ -n "${EVAL_SUITES:-}" ] && [ "$RUN_LM_EVAL" = "0" ] && [ "$RUN_CODE_EVAL" = "0" ] && [ "$RUN_MM_EVAL" = "0" ]; then
+    effective_eval_suites="$EVAL_SUITES"
+fi
+if [ -n "$effective_eval_suites" ]; then
+    IFS=',' read -r -a _eval_items <<< "$effective_eval_suites"
+    for raw_item in "${_eval_items[@]}"; do
+        item="${raw_item// /}"
+        case "$item" in
+            ""|none) ;;
+            all)
+                SELECTED_EVAL_SUITES+=(
+                    mmlu_pro gsm8k gpqa_diamond aime2026
+                    humaneval_plus_tpu mbpp_plus_tpu mmmu_pro json_schema
+                )
+                ;;
+            mmlu_llama|mmlu_pro|gsm8k|gpqa_diamond|aime2026|humaneval_plus_tpu|mbpp_plus_tpu|mmmu_pro|json_schema|bfcl|ruler)
+                SELECTED_EVAL_SUITES+=("$item")
+                ;;
+            *)
+                echo "ERROR: Unknown --eval-suites item '$item'"
+                exit 1
+                ;;
+        esac
+    done
+else
+    if [ "$RUN_LM_EVAL" = "1" ]; then
+        # shellcheck disable=SC2206  # space-separated task list, split on purpose
+        SELECTED_EVAL_SUITES+=($LM_EVAL_TASKS)
+    fi
+    if [ "$RUN_CODE_EVAL" = "1" ]; then
+        SELECTED_EVAL_SUITES+=(humaneval_plus_tpu mbpp_plus_tpu)
+    fi
+    if [ "$RUN_MM_EVAL" = "1" ]; then
+        SELECTED_EVAL_SUITES+=(mmmu_pro)
+    fi
+fi
+
+NEEDS_LIVE_SERVER=0
+if [ "$RUN_BENCH_SERVE" = "1" ] || [ "$RUN_AGENTX" = "1" ] || [ "${#SELECTED_EVAL_SUITES[@]}" -gt 0 ]; then
+    NEEDS_LIVE_SERVER=1
+fi
+
 # ========================================================
 # 1. Initial Cleanup
 # ========================================================
-if [ "$START_SERVER" = "1" ]; then
+if [ "$START_SERVER" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
     echo "=== Initial Cleanup ==="
     bash "$SCRIPT_DIR/cleanup_server.sh"
 fi
@@ -350,15 +557,21 @@ else
   BENCH_ARGS+=(--host "$HOST")
 fi
 BENCH_ARGS+=(--port "$PORT")
-# A dry run still writes the config.json the evals below read.
-if [ "$SKIP_BENCHMARK" = "1" ]; then
-  BENCH_ARGS+=(--dry-run)
+if [ "$RUN_BENCH_SERVE" = "0" ]; then
+  if [ "$START_SERVER" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
+    BENCH_ARGS+=(--skip-bench-cells)
+  else
+    # A dry run still writes the config.json the evals below read.
+    BENCH_ARGS+=(--dry-run)
+  fi
 fi
 
 ./scripts/vllm/benchmarking/run_benchmarks.sh "${BENCH_ARGS[@]}"
 
 # Read model name from config
 MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")
+CONFIG_TP=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("tensor_parallelism", 1))' "$RESULTS_DIR/config.json")
+CONFIG_DP=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("data_parallelism", 1))' "$RESULTS_DIR/config.json")
 MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
 LM_EVAL_TASKS=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("lm_eval_tasks") or "mmlu_llama mmlu_pro")' "$RESULTS_DIR/config.json")
 EXTRA_LM_EVAL_MODEL_ARGS=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("extra_lm_eval_model_args", ""))' "$RESULTS_DIR/config.json")
@@ -369,7 +582,7 @@ PERF_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])
 fail=0
 
 # ========================================================
-# 3. Check Perf Regression
+# 3. Check Perf Regression & Run AgentX
 # ========================================================
 if [ "$SKIP_PERF_CHECK" = "0" ] && [ -f "$PERF_BASELINE" ]; then
     echo "=== Checking Perf Regression ==="
@@ -380,35 +593,35 @@ if [ "$SKIP_PERF_CHECK" = "0" ] && [ -f "$PERF_BASELINE" ]; then
       --baseline "$PERF_BASELINE" 2>&1 | tee "$PERF_LOG" || { echo "::error::Perf regression check failed! See logs above for details."; fail=1; }
 fi
 
-# ========================================================
-# 4. Run lm_eval
-# ========================================================
-if [ "$RUN_LM_EVAL" = "1" ]; then
-    # shellcheck disable=SC2086  # space-separated task list, split on purpose
-    for task in $LM_EVAL_TASKS; do
-        run_lm_eval "$task"
-    done
+if [ "$RUN_AGENTX" = "1" ]; then
+    run_agentx_perf
 fi
 
 # ========================================================
-# 5. Run code-generation evals (EvalPlus datasets via lm-eval)
+# 4. Run Selected Accuracy Suites
 # ========================================================
-if [ "$RUN_CODE_EVAL" = "1" ]; then
-    run_lm_eval "humaneval_plus_tpu"
-    run_lm_eval "mbpp_plus_tpu"
-fi
-
-# ========================================================
-# 6. Run multimodal evals (evalscope, live API endpoint)
-# ========================================================
-if [ "$RUN_MM_EVAL" = "1" ]; then
-    if ! command -v evalscope &>/dev/null; then
-        echo "::error::--run-mm-eval requires the 'evalscope' CLI (pip install evalscope)."
-        fail=1
-    else
-        run_mm_eval "mmmu_pro"
-    fi
-fi
+for suite in "${SELECTED_EVAL_SUITES[@]}"; do
+    case "$suite" in
+        mmlu_llama|mmlu_pro|gsm8k|gpqa_diamond|aime2026|humaneval_plus_tpu|mbpp_plus_tpu)
+            run_lm_eval "$suite"
+            ;;
+        mmmu_pro)
+            if ! command -v evalscope &>/dev/null; then
+                echo "::error::mmmu_pro requires the 'evalscope' CLI (pip install evalscope)."
+                fail=1
+            else
+                run_mm_eval "mmmu_pro"
+            fi
+            ;;
+        json_schema)
+            run_json_schema_eval
+            ;;
+        bfcl|ruler)
+            echo "::error::Accuracy suite '$suite' runner is not wired in yet."
+            fail=1
+            ;;
+    esac
+done
 
 # ========================================================
 # 7. Upload results to BigQuery (and Spanner, if asked)

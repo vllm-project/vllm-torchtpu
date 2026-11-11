@@ -67,6 +67,7 @@ DRY_RUN=0
 RESULTS_DIR_OVERRIDE="${RESULTS_DIR:-}"
 KEEP_ALIVE=0
 SERVE_ONLY=0
+SKIP_BENCH_CELLS=0
 HOST=""
 PORT="${PORT:-8000}"
 START_SERVER=1
@@ -94,6 +95,10 @@ while [[ $# -gt 0 ]]; do
             SERVE_ONLY=1
             shift
             ;;
+        --skip-bench-cells)
+            SKIP_BENCH_CELLS=1
+            shift
+            ;;
         --host)
             HOST="$2"
             START_SERVER=0
@@ -109,7 +114,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--config CONFIG_NAME] [--mode MODE] [--results-dir DIR] [--dry-run] [--keep-alive] [--serve-only] [--host HOST] [--port PORT]"
+            echo "Usage: $0 [--config CONFIG_NAME] [--mode MODE] [--results-dir DIR] [--dry-run] [--keep-alive] [--serve-only] [--skip-bench-cells] [--host HOST] [--port PORT]"
             exit 1
             ;;
     esac
@@ -940,6 +945,11 @@ if [ "$START_SERVER" = "1" ]; then
 fi
 
 exit_code=0
+
+if [ "$SKIP_BENCH_CELLS" = "1" ]; then
+    echo "Skipping vllm bench serve cells (--skip-bench-cells)."
+    ISL_OSL_CONFIGS=""
+fi
 
 for isl_osl_config in $ISL_OSL_CONFIGS; do
     IFS=':' read -r input_len output_len <<< "$isl_osl_config"
