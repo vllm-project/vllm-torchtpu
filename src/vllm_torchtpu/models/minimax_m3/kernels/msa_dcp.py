@@ -339,10 +339,12 @@ def local_candidates(
     if pretransposed:
         block_rows = -(-block_rows // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
     pad = -num_tokens % block_rows
-    if pretransposed:
-        s = jnp.pad(scores, ((0, 0), (0, pad)))
-    else:
-        s = jnp.pad(scores[:, 0], ((0, pad), (0, 0)))
+    s = scores if pretransposed else scores[:, 0]
+    if num_tokens < block_rows:
+        s = jnp.pad(s, ((0, 0), (0, pad)) if pretransposed else ((0, pad), (0, 0)))
+    # Else the last row block reads past the scores: its padding rows pick
+    # from garbage and are dropped (a pad copied every score, ~17 us per
+    # layer for the c48 mixed step's small tiles, j-c22c589e).
     p = jnp.pad(pos, (0, pad))[:, None]
     # Static scan widths (`_scan_widths`, one kernel body each); each row
     # block takes the narrowest one holding every block its rows see (a
