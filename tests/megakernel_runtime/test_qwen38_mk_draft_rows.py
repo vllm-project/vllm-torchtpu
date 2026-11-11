@@ -44,7 +44,10 @@ def test_rows_gate():
 
 
 def test_mk_compile_config_drops_prefill_sized_buckets():
-    cc = SimpleNamespace(compile_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 1024, 8192])
+    cc = SimpleNamespace(
+        compile_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 1024, 8192],
+        inductor_compile_config={"pre_grad_custom_pass": object(), "keep": 1},
+    )
     cfg = SimpleNamespace(compilation_config=cc)
     inner = _inner({4: 32, 1: 16})
     loop_cfg, loop_sizes = fl.mk_draft_compile_config(cfg, inner, 1)
@@ -52,6 +55,10 @@ def test_mk_compile_config_drops_prefill_sized_buckets():
     assert loop_sizes == [1, 2, 4, 8, 16] and loop_cfg.compilation_config.compile_sizes == loop_sizes
     assert step0_sizes == [1, 2, 4, 8, 16, 32]
     assert cc.compile_sizes[-1] == 8192  # the stock draft config is untouched
+    # A fresh backend asserts the pre-grad pass absent: the MK copy drops it, the stock
+    # config keeps it.
+    assert loop_cfg.compilation_config.inductor_compile_config == {"keep": 1}
+    assert "pre_grad_custom_pass" in cc.inductor_compile_config
     _, none = fl.mk_draft_compile_config(cfg, _inner({}), 1)
     assert none == []
 
