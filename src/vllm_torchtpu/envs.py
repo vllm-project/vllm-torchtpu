@@ -365,6 +365,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BLOCK_TABLE_PACK_DELTA: bool = False
     VLLM_TPU_TOKEN_PADDING_REUSE: bool = False
     VLLM_TPU_PREFLAT_FWD_ARGS: bool = False
+    VLLM_TPU_MK_TRYFWD_LEAN: bool = False
     VLLM_TPU_FAST_METADATA_BUILD: bool = False
     VLLM_TPU_STEADY_DECODE_METADATA: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
@@ -2220,6 +2221,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # megakernel call's contexts are resolved once (token_padding.py,
     # qwen38_driver.py). Same values, same graph inputs.
     "VLLM_TPU_PREFLAT_FWD_ARGS": env_bool("VLLM_TPU_PREFLAT_FWD_ARGS"),
+    # Qwen3.8 megakernel try_forward host bookkeeping per step: the real-traffic
+    # gate is read only when a shadow check can use it, the whole-step context
+    # check runs once per step instead of twice, and the step-mix total is a
+    # running count. Same decisions, counters, logs and outputs
+    # (qwen38_driver.py).
+    "VLLM_TPU_MK_TRYFWD_LEAN": env_bool("VLLM_TPU_MK_TRYFWD_LEAN"),
     # Staged metadata walk: build every group's AttentionMetadata inline instead
     # of one builder call per group (tpu_runner._build_attention_metadata_staged).
     "VLLM_TPU_FAST_METADATA_BUILD": env_bool("VLLM_TPU_FAST_METADATA_BUILD"),
