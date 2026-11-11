@@ -25,6 +25,24 @@ from vllm.v1.outputs import (
 
 INVALID_TOKEN_ID = -1
 
+GLUE_FUSION_KEY = "spec_glue_fusion"
+
+
+def glue_fusion_enabled(additional_config: Any) -> bool:
+    """`additional_config["spec_glue_fusion"]`; off by default.
+
+    Gates building the async spec-decode substitution source and rejected
+    count of a single-chunk verify step as one compiled program
+    (`spec_substitution_glue`) instead of the eager op sequence. Integer ops,
+    same values either way.
+    """
+    if not isinstance(additional_config, dict):
+        return False
+    enabled = additional_config.get(GLUE_FUSION_KEY, False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"additional_config.{GLUE_FUSION_KEY} must be a bool")
+    return enabled
+
 
 @dataclass
 class SpecLogprobsChunk:

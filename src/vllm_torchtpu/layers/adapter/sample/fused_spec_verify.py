@@ -49,6 +49,27 @@ def fused_sampler_enabled(additional_config: Any) -> bool:
     return enabled
 
 
+INGRAPH_RNG_KEY = "spec_synthetic_ingraph_rng"
+
+
+def ingraph_rng_enabled(additional_config: Any) -> bool:
+    """`additional_config["spec_synthetic_ingraph_rng"]`; off by default.
+
+    Under synthetic rejection with the fused verify sampler, draws
+    `spec_verify_sample_fused_rng`'s three uniform tensors inside the
+    compiled verify program from a device counter (keyed counter-based hash,
+    24-bit uniforms like torch.rand) instead of three eager torch.rand calls.
+    Same distribution, different random stream. Real acceptance keeps the
+    sampling generator's draws either way.
+    """
+    if not isinstance(additional_config, dict):
+        return False
+    enabled = additional_config.get(INGRAPH_RNG_KEY, False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"additional_config.{INGRAPH_RNG_KEY} must be a bool")
+    return enabled
+
+
 def sample_rows(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
