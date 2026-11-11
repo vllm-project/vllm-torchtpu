@@ -208,6 +208,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_PREFILL_SPACING_FRAC: float = 0.5
+    VLLM_TPU_PREFILL_SPACING_MIN_TOKENS: int = 8192
 
 
 def env_with_choices(
@@ -1270,6 +1272,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # PrefillSpacingScheduler: decode-only time owed after a step that runs a
+    # chunk of a long prompt, as a fraction of that step's time (0 disables
+    # spacing; prefill chunks are still ordered shortest first).
+    "VLLM_TPU_PREFILL_SPACING_FRAC": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_SPACING_FRAC", 0.5
+    ),
+    # PrefillSpacingScheduler: a prompt is long, and its chunks are spaced,
+    # while at least this many of its prompt tokens are left to compute.
+    "VLLM_TPU_PREFILL_SPACING_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_PREFILL_SPACING_MIN_TOKENS", 8192
     ),
 }
 
