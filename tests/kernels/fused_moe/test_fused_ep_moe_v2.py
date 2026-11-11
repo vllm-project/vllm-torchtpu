@@ -465,6 +465,107 @@ def test_hash_routing_serves_the_ids_it_was_given():
     assert _relative_l2(selected, want) > ROTATED_CONTROL_FACTOR * error
 
 
+# Rows each shard's local experts receive, in visit order, and the token
+# count that gives a shard their sum. Every expert issues its successor's
+# first rows from its own last tile, from an index window started when its
+# last group became current. The first order is one tile, two, one, one:
+# it crosses one-tile -> multi-tile both ways and ends on a one-tile expert.
+# The second is one, one, two, three: a multi-tile -> multi-tile pair, an
+# expert of three tiles, and a multi-tile expert with no successor.
+MIXED_EXPERT_ROWS = (24, 136, 24, 72)
+MIXED_TOKENS = 512
+MIXED_CASES = [
+    (MIXED_EXPERT_ROWS, MIXED_TOKENS),
+    ((56, 24, 136, 296), 1024),
+]
+
+
+def _make_ids_with_expert_rows(mesh, seed, *, rows_per_local, tokens, topk, e_total):
+    """Hash ids that give local expert j of every shard rows_per_local[j] rows.
+
+    Each expert's slots are a contiguous run of the flat list, dealt out a
+    token at a time, so a run shorter than `tokens` never repeats an id
+    within a token.
+    """
+    g_local = len(rows_per_local)
+    counts = np.tile(rows_per_local, e_total // g_local)
+    assert counts.sum() == tokens * topk and counts.max() <= tokens
+    flat = np.repeat(np.arange(e_total, dtype=np.int32), counts)
+    ids = flat.reshape(topk, tokens).T
+    ids = ids[np.random.default_rng(seed).permutation(tokens)]
+    np.testing.assert_array_equal(np.bincount(ids.ravel(), minlength=e_total), counts)
+    assert all(len(set(row)) == topk for row in ids)
+    return jax.device_put(ids, NamedSharding(mesh, P(AXIS)))
+
+
+@pytest.mark.parametrize("rows_per_local,tokens", MIXED_CASES)
+def test_mixed_one_tile_and_multi_tile_experts_track_the_reference(
+    rows_per_local, tokens
+):
+    """One-tile and multi-tile experts next to each other match the reference.
+
+    Random routing gives every expert about the same rows, so the ids are
+    picked by hand to get these mixes.
+    """
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        33,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh, 34, tokens=tokens, hidden=SMALL["hidden"], e_total=SMALL["e_total"]
+    )
+    hash_ids = _make_ids_with_expert_rows(
+        mesh,
+        35,
+        rows_per_local=rows_per_local,
+        tokens=tokens,
+        topk=SMALL["topk"],
+        e_total=SMALL["e_total"],
+    )
+    out = fused_ep_moe_v2(
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        hash_topk_ids=hash_ids,
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+    )
+
+    def reference(roll):
+        def r(a):
+            return jnp.roll(a, roll, axis=0)
+
+        return _dense_reference(
+            mesh,
+            x,
+            r(w1),
+            r(w2),
+            r(w1_scale),
+            r(w2_scale),
+            gating,
+            topk=SMALL["topk"],
+            hash_ids=hash_ids,
+        )
+
+    want = reference(0)
+    error = _relative_l2(out, want)
+    assert error < FP8_RELATIVE_BOUND, f"relative L2 {error:.4f} past the band"
+    worst = _worst_token_relative_l2(out, want)
+    assert worst < FP8_TOKEN_BOUND, f"worst token {worst:.4f} past the band"
+    assert _relative_l2(out, reference(1)) > ROTATED_CONTROL_FACTOR * error
+
+
 def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
     """Plan decomposition changes only how the kernel operands are built."""
     mesh = _mesh()
