@@ -31,7 +31,7 @@ pytestmark = pytest.mark.omni
 THINKER = SimpleNamespace(architectures=["Qwen3OmniMoeForConditionalGeneration"])
 
 
-def test_non_omni_config_is_not_consumed() -> None:
+def test_non_omni_config_is_not_patched() -> None:
     before = Qwen3OmniMoeAudioEncoder.forward
     assert maybe_patch_qwen3_omni_thinker(None) is False
     for arch in ("LlamaForCausalLM", "Qwen3OmniMoeThinkerForConditionalGeneration"):
@@ -49,7 +49,7 @@ def test_patch_moves_chunk_lengths_to_cpu_and_cnn_lengths_back(
     monkeypatch.setattr(cls, "forward", lambda self, x, lens, after: lens)
     monkeypatch.setattr(cls, "_get_cnn_output_lengths", lambda self, x: x)
 
-    assert maybe_patch_qwen3_omni_thinker(THINKER) is None
+    assert maybe_patch_qwen3_omni_thinker(THINKER) is True
     patched = cls.forward
     assert getattr(patched, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
 
@@ -70,5 +70,5 @@ def test_patch_moves_chunk_lengths_to_cpu_and_cnn_lengths_back(
     assert cnn_out.device.type == "meta"
 
     # Idempotent on repeated calls.
-    assert maybe_patch_qwen3_omni_thinker(THINKER) is None
+    assert maybe_patch_qwen3_omni_thinker(THINKER) is False
     assert cls.forward is patched

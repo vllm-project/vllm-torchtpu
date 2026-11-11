@@ -11,20 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU runtime patches for vLLM-Omni diffusion models.
+"""TPU runtime patches for vLLM-Omni models.
 
 vLLM-Omni diffusion workers run in separate worker processes spawned by
 vLLM-Omni's DiffusionEngine rather than through TPUWorker's worker_init /
-model_load lifecycle stages, so OmniTpuPlatform applies the Omni patches
+model_load lifecycle stages, so OmniTpuPlatform applies the diffusion patches
 itself: apply_omni_tpu_patches() when the platform is constructed, and
 apply_omni_model_specific_patches() at attention backend selection
-(get_diffusion_attn_backend_cls). Tracked in #1862 for unification with
-patch_registry.py.
+(get_diffusion_attn_backend_cls).
 
-Patches for stages that do run through TPUWorker, the autoregressive stages
-served by TPUARWorker, live in one submodule per model of this package and
-are installed through patch_registry.PATCHES like every other model patch;
-see qwen3omni_thinker.py.
+Patches for autoregressive stages served by TPUARWorker live in one submodule
+per model of this package and are applied from TPUARModelRunner.load_model()
+until Omni patches are unified with patch_registry.py (tracked in #1862); see
+qwen3omni_thinker.py.
 """
 
 from functools import cache as run_once

@@ -148,7 +148,7 @@ def encoders(
     own = {n: cls.__dict__.get(n) for n in ("forward", "_get_cnn_output_lengths")}
     try:
         config = SimpleNamespace(architectures=["Qwen3OmniMoeForConditionalGeneration"])
-        assert maybe_patch_qwen3_omni_thinker(config) is None
+        assert maybe_patch_qwen3_omni_thinker(config) is True
         assert getattr(cls.forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
 
         torch.manual_seed(0)
