@@ -176,9 +176,9 @@ is the default profile's; the bound line names the served profile's.
 | | Supported | Not supported (the megakernel stays off, named reason) |
 |---|---|---|
 | Chip | TPU v7x (`TPU7x`) | other chips (`unsupported_tpu_chip`) |
-| Parallelism | TP=8, EP inside TP | other TP sizes (`unsupported_tp_size`); DP, PP, DCP / PCP, EP wider than TP (`parallelism_unsupported:<kind>`) |
+| Parallelism | TP=8, EP inside TP; DCP 2 or 4 with a 128-token interleave (see `PD_SUPPORT.md`; not yet validated on TPU) | other TP sizes (`unsupported_tp_size`); DP, PP, PCP, EP wider than TP (`parallelism_unsupported:<kind>`); a DCP size that doesn't divide the ranks per KV head (`dcp_geometry_unsupported`) |
 | Steps | decode `T=1` (buckets 8, 16, 32), MTP verify `T=4` (up to 64 rows) | prefill and mixed steps (the stock model serves them) |
-| Features | MTP speculative decoding, M-RoPE, prefix caching, KV offloading | LoRA, multimodal inputs, KV transfer connectors, dynamic EPLB, sleep mode, EAGLE-3 hidden-state capture |
+| Features | MTP speculative decoding, M-RoPE, prefix caching, KV offloading; on a PD decode leg, a KV transfer connector as a consumer when it has no layer-wise hooks (`TPURaidenConnector`; see `PD_SUPPORT.md`) | LoRA, multimodal inputs, other KV transfer connectors and roles (`kv_connector_unsupported:<name>`), dynamic EPLB, sleep mode, EAGLE-3 hidden-state capture |
 | Server settings | `--mamba-ssm-cache-dtype bfloat16` | anything else (`requires_unmet:mamba_ssm_cache_dtype`) |
 | Checkpoint | Qwen3.5-397B-A17B (FP8), its 60-layer hybrid GQA / GDN + MoE geometry | dense Qwen3.5 checkpoints, other geometries (`non_moe_checkpoint`, `geometry_mismatch`) |
 
