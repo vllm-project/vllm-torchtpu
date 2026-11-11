@@ -74,12 +74,17 @@ _MIN_CANDIDATE_TOKENS = 1024
 # twins' tiles were nearly empty and 8-token ones lost on per-tile cost
 # (c48 b39 108.4 -> 116.7 ms per step, j-82660a13 vs j-8a29ceb0).
 DCP_SMALL_BATCH_TOKENS = 1024
-# Pages per kernel step of those 8-token tiles: a tile's 128 query rows keep
-# a 32-page score tile the size of a 16-token tile's 16-page one, and a
-# twin decode tile's union spans ~4 groups of 16 pages (c16 b6: ~1.25 us per
-# group, ~0.75 us of it the step's attend body; AOT: 32 pages ~3,000 bundles
-# vs 2 x ~1,700 for two 16-page steps).
+# Pages per kernel step of those 8-token tiles in batches of more than
+# `_WIDE_GROUP_MIN_TOKENS` tokens: a tile's 128 query rows keep a 32-page
+# score tile the size of a 16-token tile's 16-page one (AOT: 32 pages ~3,000
+# bundles vs 2 x ~1,700 for two 16-page steps). Batches of up to 128 tokens
+# (c4 / c16 decode) keep 16-page groups: there the 32-page ones saved at most
+# 1.4 us per layer (c16 b6, j-5eda23f9 vs j-c93c225d), and their other
+# accumulation order re-rolled the twin's dummy-weight expert routing into a
+# reproducibly worse MoE balance at c4 b1 p90-100 (+0.58 ms per step, every
+# core's MSA ops flat, j-eb9a7c1a vs j-fbcd168a).
 _SMALL_BATCH_PAGES_PER_STEP = 32
+_WIDE_GROUP_MIN_TOKENS = 129
 
 
 def rank_array(rank: int | jax.Array) -> jax.Array:
@@ -873,7 +878,7 @@ def msa_attend_dcp(
         ),
         pages_per_step=(
             _SMALL_BATCH_PAGES_PER_STEP
-            if small
+            if small and num_tokens >= _WIDE_GROUP_MIN_TOKENS
             else msa_attention.DEFAULT_PAGES_PER_STEP
         ),
         q_head_major=q_head_major,
