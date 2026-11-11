@@ -927,8 +927,11 @@ def _merge_partials_kernel(lse_ref, parts_ref, *rest, rotated):
         merged = None
         for r in range(dcp):
             w = jnp.broadcast_to(weight[r, :, h : h + 1], parts_ref.shape[2:])
-            # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-            term = jnp.where(w > 0, parts_ref[r, h].astype(jnp.float32) * w, 0.0)
+            # A plain product: a rank that attended nothing for a token has
+            # a zero partial (`msa_sparse_attention_lse`), never NaN, so no
+            # select guards it (a compare and a select per element, ~20% of
+            # the kernel's bundles).
+            term = parts_ref[r, h].astype(jnp.float32) * w
             merged = term if merged is None else merged + term
         merged = merged.astype(o_ref.dtype)
         if rotated:
@@ -950,8 +953,10 @@ def merge_partials(
     this rank's heads, token-major: ``parts [dcp, Hl, T, D]`` (rank ``r``'s
     head-major partial), ``lse [dcp, T, Hl]`` f32 -> ``[T, Hl * D]``.
 
-    Weights and sum in f32, rounded once; a 4-bit cache's partials (in the
-    rotated basis) are unrotated by its bf16 `hadamard` (``x @ H / D``, as
+    Weights and sum in f32, rounded once; a rank's partial of a token it
+    attended nothing for must be zero (as `msa_sparse_attention_lse` writes
+    it), not NaN. A 4-bit cache's partials (in the rotated basis) are
+    unrotated by its bf16 `hadamard` (``x @ H / D``, as
     `ops.msa._rotate_heads`). One pass that writes the layout the output
     projection reads: the reduce-scatter merge weighted the whole ``[dcp *
     Hl, T, D]`` partial and XLA relaid it out for the token-major output

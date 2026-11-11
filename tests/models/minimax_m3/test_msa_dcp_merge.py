@@ -99,8 +99,8 @@ def test_kernel_merge_lowers_for_tpu(num_heads, num_tokens):
 
 
 def _partials_reference(parts, lse, hadamard=None):
-    """`ops.msa.merge_head_partials`' weights (torch.logsumexp over ranks;
-    zero weights drop NaN partials), summed in f32 and rounded once."""
+    """`ops.msa.merge_head_partials`' weights (torch.logsumexp over ranks),
+    summed in f32 and rounded once."""
     peak = lse.max(axis=0)
     peak = np.where(np.isinf(peak), 0.0, peak)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -130,11 +130,11 @@ def test_merge_partials_matches_reference(num_tokens, block_tokens, rotated):
     rng = np.random.default_rng(num_tokens)
     parts = rng.normal(size=(dcp, num_heads, num_tokens, head_dim)).astype(np.float32)
     lse = rng.normal(0, 4, size=(dcp, num_tokens, num_heads)).astype(np.float32)
-    # A rank with nothing selected: lse -inf and a NaN partial; some tokens
-    # attended by no rank at all.
+    # A rank with nothing selected: lse -inf and a zero partial (as the
+    # attention kernel writes it); some tokens attended by no rank at all.
     gone = rng.random((dcp, num_tokens, num_heads)) < 0.2
     lse[gone] = -np.inf
-    parts[gone.transpose(0, 2, 1)] = np.nan
+    parts[gone.transpose(0, 2, 1)] = 0.0
     parts = np.asarray(jnp.asarray(parts).astype(jnp.bfloat16))
     hadamard = (
         jnp.asarray(msa_fp4.hadamard(head_dim), jnp.bfloat16) if rotated else None
