@@ -27,7 +27,11 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa_attention,
+    msa_attention_lse_r6,
+    msa_fp4,
+)
 
 # Page counts a kernel step may run at besides the full group (`_kernel`).
 # A 12-page width saves 4 pages of score columns for the ~9-12-page tile
@@ -35,6 +39,11 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 # selections, bitwise equal, j-7ea3ab27).
 _STEP_WIDTHS = (4, 8, 12)
 _LOG2_E = math.log2(math.e)
+# Opt-in: run r6's kernel (`msa_attention_lse_r6`: several tiles per grid
+# step, a deeper 4-bit page prefetch ring, transposed scores for 8/16-bit
+# pages) instead of this one (12-page step width, per-call 4-bit page
+# cache). Set from TPU_MINIMAX_M3_MSA_LSE_R6 by the attention layer.
+R6_KERNEL = False
 _LN_2 = math.log(2.0)
 # Slots of the per-call page cache of 4-bit caches (`_kernel`): 256 x 20 KB
 # of VMEM. A call with more distinct pages streams them per group instead.
@@ -717,6 +726,24 @@ def msa_sparse_attention_lse(
     With `head_major`, the results come back head-major: ``out [H, T, D]``,
     ``lse [H, T]``.
     """
+    if R6_KERNEL:
+        return msa_attention_lse_r6.msa_sparse_attention_lse(
+            q,
+            kv_cache,
+            selected,
+            local_page,
+            local_limit,
+            page_table,
+            sm_scale=sm_scale,
+            block_q=block_q,
+            pages_per_step=pages_per_step,
+            head=head,
+            scale_cache=scale_cache,
+            k_scale_row=k_scale_row,
+            v_scale_row=v_scale_row,
+            interpret=interpret,
+            head_major=head_major,
+        )
     num_tokens, _, head_dim = q.shape
     msa_attention.check_cache(kv_cache, scale_cache)
     _check_rows(kv_cache, head_dim, head)
@@ -780,6 +807,21 @@ def msa_sparse_attention_lse_heads(
     With a 4-bit cache, `scale_cache` ``[pages, R, S]`` holds head ``h``'s K / V
     scales in rows ``2h`` / ``2h + 1``. `head_major` as `msa_sparse_attention_lse`.
     """
+    if R6_KERNEL:
+        return msa_attention_lse_r6.msa_sparse_attention_lse_heads(
+            q,
+            kv_cache,
+            selected,
+            local_page,
+            local_limit,
+            page_table,
+            sm_scale=sm_scale,
+            block_q=block_q,
+            pages_per_step=pages_per_step,
+            scale_cache=scale_cache,
+            interpret=interpret,
+            head_major=head_major,
+        )
     num_tokens, num_q_heads, head_dim = q.shape
     num_heads = selected.shape[1]
     msa_attention.check_cache(kv_cache, scale_cache)

@@ -182,3 +182,45 @@ def test_indexer_fp8_transposed_close(monkeypatch):
     for rows, n in live:
         np.testing.assert_allclose(got[rows, :n], want[rows, :n], rtol=1e-5, atol=1e-4)
 
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
+@pytest.mark.parametrize("block_q", [8, 16])
+def test_lse_r6_kernel_matches_default(monkeypatch, dtype, block_q):
+    """`msa_attention_lse.R6_KERNEL` dispatches to r6's kernel, which attends
+    the same selection: equal outputs (bit for bit on decode-sized tiles,
+    which keep the row-major scores; to bf16 rounding on full tiles, whose
+    8/16-bit scores run transposed)."""
+    from tests.models.minimax_m3.packing import pack, rounded
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse
+
+    rng = np.random.default_rng(17)
+    num_tokens, pages, topk, heads, hd, q_per_head = 64, 10, 4, 2, 128, 2
+    q = jnp.asarray(rng.standard_normal((num_tokens, heads * q_per_head, hd)))
+    q = q.astype(jnp.bfloat16)
+    rows = pack(
+        rounded(rng.standard_normal((pages, PAGE, heads * 2 * hd)), dtype), dtype
+    )
+    selected = np.full((num_tokens, heads, topk), -1, np.int32)
+    for t in range(num_tokens):
+        for h in range(heads):
+            chosen = rng.choice(pages, rng.integers(0, topk + 1), replace=False)
+            selected[t, h, : len(chosen)] = chosen
+    args = (
+        q,
+        rows,
+        jnp.asarray(selected),
+        jnp.asarray(selected[:, 0, 0]),
+        jnp.asarray(rng.integers(1, PAGE + 1, num_tokens), jnp.int32),
+        jnp.arange(pages, dtype=jnp.int32),
+    )
+    kw = dict(sm_scale=hd**-0.5, block_q=block_q, pages_per_step=4, interpret=True)
+    want = msa_attention_lse.msa_sparse_attention_lse_heads(*args, **kw)
+    monkeypatch.setattr(msa_attention_lse, "R6_KERNEL", True)
+    jax.clear_caches()
+    got = msa_attention_lse.msa_sparse_attention_lse_heads(*args, **kw)
+    np.testing.assert_allclose(
+        np.asarray(got[0].astype(jnp.float32)),
+        np.asarray(want[0].astype(jnp.float32)),
+        atol=2e-2,
+    )
+    np.testing.assert_allclose(np.asarray(got[1]), np.asarray(want[1]), atol=1e-3)

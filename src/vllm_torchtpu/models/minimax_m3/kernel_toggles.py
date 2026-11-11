@@ -22,6 +22,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_attention,
+    msa_attention_lse,
     msa_dcp,
     msa_indexer,
 )
@@ -45,3 +46,4 @@ def apply() -> None:
     _set("TPU_MINIMAX_M3_MSA_ONEHOT_LOOKUP", msa_indexer, "ONEHOT_LOOKUP")
     _set("TPU_MINIMAX_M3_INDEXER_DMA_RING3", msa_indexer, "DMA_RING3")
     _set("TPU_MINIMAX_M3_INDEXER_FP8_TRANSPOSED", msa_indexer, "FP8_TRANSPOSED")
+    _set("TPU_MINIMAX_M3_MSA_LSE_R6", msa_attention_lse, "R6_KERNEL")
