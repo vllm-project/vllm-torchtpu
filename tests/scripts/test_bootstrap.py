@@ -1350,7 +1350,9 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertNotIn("for TPU v6e", pr_stage1.stdout)
         # Every TPU upload is in the author's group.
         for tag, content, _ in pr_stage1.uploads[1:]:
-            self.assertIn("tpu-pr/alice@example.com", content, tag)
+            self.assertIn(
+                '"concurrency_group": "tpu-pr/alice@example.com"', content, tag
+            )
 
         # Automatic retry after agent loss skips what meta-data records as
         # uploaded: lanes, and each generation of a per-generation lane, so a
@@ -1454,7 +1456,10 @@ class TestBootstrapUnits(unittest.TestCase):
             ["verify", *_PERF, *_INTEGRATION, *_TESTS],
         )
         self.assertEqual(json.loads(oncall_stage1.uploads[0][1])["priority"], 12)
-        self.assertIn("tpu-pr/oncall@example.com", oncall_stage1.uploads[-1][1])
+        self.assertIn(
+            '"concurrency_group": "tpu-pr/oncall@example.com"',
+            oncall_stage1.uploads[-1][1],
+        )
         for _, content, _ in (*oncall_full.uploads[1:], *oncall_stage1.uploads):
             self.assertNotIn('build.env("NIGHTLY")', content)
 
@@ -1621,7 +1626,10 @@ class TestBootstrapUnits(unittest.TestCase):
             [u[0] for u in ci_run_stage1.uploads],
             ["verify", *_PERF, *_INTEGRATION, *_TESTS],
         )
-        self.assertIn("tpu-pr/alice@example.com", ci_run_stage1.uploads[-1][1])
+        self.assertIn(
+            '"concurrency_group": "tpu-pr/alice@example.com"',
+            ci_run_stage1.uploads[-1][1],
+        )
 
         # CI_PRECHECK=1 runs pr+cpu-only even on [skip ci] / docs-only.
         pre = self._run_bootstrap(
@@ -2244,6 +2252,85 @@ class TestBootstrapUnits(unittest.TestCase):
                 refused = self._run_bootstrap(env, raises=bp.BootstrapError)
                 self.assertEqual(refused.annotations[-1][:2], ("error", "tpu-version"))
                 self.assertEqual(refused.uploads, [])
+
+    def test_pr_concurrency_group_per_generation(self) -> None:
+        bp = self.bp
+        group = "tpu-pr/alice@example.com"
+        # The base generation, or none, keeps the group; each other generation
+        # gets its own; no group stays none.
+        self.assertIs(bp.BASE_TPU_GENERATION, bp.TPU_V7X)
+        self.assertEqual(bp.pr_concurrency_group(group, bp.TPU_V7X), group)
+        self.assertEqual(bp.pr_concurrency_group(group, None), group)
+        self.assertEqual(bp.pr_concurrency_group(group, bp.TPU_V6E), f"{group}/v6e")
+        for gen in (bp.TPU_V7X, bp.TPU_V6E, None):
+            self.assertIsNone(bp.pr_concurrency_group(None, gen))
+        generations = list(dict.fromkeys(bp.TPU_GENERATIONS.values()))
+        self.assertEqual(
+            len({bp.pr_concurrency_group(group, g) for g in generations}),
+            len(generations),
+        )
+        for gen in generations:
+            self.assertEqual(gen.pr_tpu_jobs_per_author, bp.PR_TPU_JOBS_PER_AUTHOR)
+
+        def concurrency(content: str) -> set[tuple[str, int]]:
+            found: set[tuple[str, int]] = set()
+
+            def walk(steps: Any) -> None:
+                for step in steps or []:
+                    if not isinstance(step, dict):
+                        continue
+                    if isinstance(step.get("steps"), list):
+                        walk(step["steps"])
+                    elif "concurrency_group" in step:
+                        found.add((step["concurrency_group"], step["concurrency"]))
+
+            walk((yaml.safe_load(content) or {}).get("steps"))
+            return found
+
+        def stage1(env: dict[str, str]) -> dict[str, set[tuple[str, int]]]:
+            rec = _RunRecorder(bp)
+            with (
+                mock.patch.object(bp, "_agent", side_effect=rec.agent),
+                mock.patch.object(
+                    bp, "upload_with_priority", side_effect=rec.upload_with_priority
+                ),
+                contextlib.redirect_stdout(rec.stdout_buf),
+            ):
+                bp.upload_stages(
+                    (("tests", "integration", "verify"),),
+                    {
+                        **env,
+                        "TPU_VERSION": "all",
+                        "BUILDKITE_STEP_KEY": "upload_stage_1",
+                    },
+                    repo_root=_REPO_ROOT,
+                )
+            return {tag: concurrency(content) for tag, content, _ in rec.uploads}
+
+        # Each generation's TPU steps go in its own group, both capped at 40.
+        v7x = {(group, 40)}
+        v6e = {(f"{group}/v6e", 40)}
+        expected = {
+            "verify": set(),
+            "integration:v6e": v6e,
+            "integration:v7x": v7x,
+            "tests:v6e": v6e,
+            "tests:v7x": v7x,
+        }
+        self.assertEqual(stage1({"PR_TPU_CONCURRENCY_GROUP": group}), expected)
+        # A generation's own cap applies to its group alone.
+        with mock.patch.dict(
+            bp.TPU_GENERATIONS,
+            {"v6e": replace(bp.TPU_V6E, pr_tpu_jobs_per_author=8)},
+        ):
+            capped = stage1({"PR_TPU_CONCURRENCY_GROUP": group})
+        self.assertEqual(capped["tests:v6e"], {(f"{group}/v6e", 8)})
+        self.assertEqual(capped["tests:v7x"], v7x)
+        # No group (e.g. the merge queue): nothing is capped.
+        self.assertEqual(
+            stage1({}),
+            {tag: set() for tag in expected},
+        )
 
     def test_verify_upload_runs_every_generation(self) -> None:
         # upload_models_and_features.sh sends up each generation's group, as on

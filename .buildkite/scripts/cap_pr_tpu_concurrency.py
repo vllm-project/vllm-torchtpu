@@ -17,7 +17,8 @@
 Reads a pipeline as JSON (`buildkite-agent pipeline upload --dry-run --format
 json`) on stdin and writes it back with every TPU step on the kube queue in
 the given group, so all of one author's PR builds share one limit on TPU jobs
-in flight:
+in flight. bootstrap.py passes each TPU generation its own group and limit
+(see pr_concurrency_group), so that limit applies per generation:
 
     cap_pr_tpu_concurrency.py <group> <limit> < pipeline.json
 

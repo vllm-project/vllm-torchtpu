@@ -44,9 +44,10 @@ _REPO_ROOT = _SCRIPT_DIR.parents[1]
 _CREDENTIAL_HELPER = pathlib.Path("/etc/buildkite-agent/git-credential-github-app")
 _GITHUB_API_URL = "https://api.github.com"
 
-# Max TPU jobs one author's PR builds may have in flight on kube (~2 PRs at ~19
-# jobs); extra jobs wait in Buildkite as `limited` and take no Kueue slot, while
-# nightly, post-merge, and release builds run uncapped.
+# Max TPU jobs one author's PR builds may have in flight on kube per TPU
+# generation (~2 PRs at ~19 jobs), each generation in its own concurrency group
+# (see pr_concurrency_group); extra jobs wait in Buildkite as `limited` and take
+# no Kueue slot, while nightly, post-merge, and release builds run uncapped.
 PR_TPU_JOBS_PER_AUTHOR = 40
 
 _CI_MERGE_BOT_LOGIN = "github-actions[bot]"
@@ -382,6 +383,9 @@ class TpuGeneration:
     # True while no perf baselines have been measured on the generation: its
     # perf steps report their numbers without gating on another chip's.
     skip_perf_check: bool
+    # Max PR TPU jobs one author may have in flight on this generation; lower
+    # it for a small fleet.
+    pr_tpu_jobs_per_author: int = PR_TPU_JOBS_PER_AUTHOR
 
     def upload_env(self) -> dict[str, str]:
         return {
@@ -431,6 +435,26 @@ DEFAULT_TPU_GENERATIONS: tuple[TpuGeneration, ...] = (TPU_V7X,)
 # non-default generation alone. The generation brings its shapes, so the build
 # names no KUBE_SHAPE_* of its own.
 TPU_VERSION_ALL = "all"
+# The fleet of the files uploaded once (pipeline_coverage.yml,
+# pipeline_dynamic.yml, and pipeline_dev.yml name tpu7x shapes): its PR jobs
+# keep the author's group as is, so they share one cap with those files' jobs.
+BASE_TPU_GENERATION = TPU_V7X
+TPU_GENERATIONS: Mapping[str, TpuGeneration] = {
+    gen.name: gen for gens in TPU_GENERATION_FILES.values() for gen in gens
+}
+
+
+def pr_concurrency_group(group: str | None, gen: TpuGeneration | None) -> str | None:
+    """Return the concurrency group of `gen`'s PR TPU steps.
+
+    BASE_TPU_GENERATION (or no generation) keeps `group`; any other generation
+    gets `<group>/<name>`, so each generation has its own per-author cap. A
+    suffix, not a prefix: PR_TPU_CONCURRENCY_GROUP may be any string a manual
+    build sets. No group (e.g. the merge queue) stays none.
+    """
+    if not group or gen is None or gen is BASE_TPU_GENERATION:
+        return group
+    return f"{group}/{gen.name}"
 
 
 def choose_suite(ctx: BuildContext) -> Suite:
@@ -1097,12 +1121,16 @@ def upload_stages(
             ):
                 print(f"Skipping {upload} (already uploaded for {stage_key})")
                 continue
+            gen = TPU_GENERATIONS.get(generation)
             upload_with_priority(
                 lane_file,
                 repo_root=repo_root,
                 job_priority=job_priority,
                 nightly=nightly,
-                pr_tpu_concurrency_group=concurrency_group,
+                pr_tpu_concurrency_group=pr_concurrency_group(concurrency_group, gen),
+                pr_tpu_jobs_per_author=(
+                    gen.pr_tpu_jobs_per_author if gen else PR_TPU_JOBS_PER_AUTHOR
+                ),
                 env={**child_env, **extra_env},
                 tpu_generation=generation,
             )
