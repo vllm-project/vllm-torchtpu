@@ -54,8 +54,11 @@ def compute_batched_seq_metadata(
     position is written back to `state_indices[s] + t`.
     """
 
-    max_seqs = seq_lens.size
-    all_seqs = jnp.arange(max_seqs)
+    # Every lane in the last sequence tile reads program metadata, including
+    # inactive lanes. Keep those reads in bounds and map them to safe index 0;
+    # zero length and false first/last predicates suppress all of their DMAs.
+    padded_seqs = pl.cdiv(seq_lens.size, cfg.seq_tile_size) * cfg.seq_tile_size
+    all_seqs = jnp.arange(padded_seqs)
 
     # NOTE: Only supports use case where query_lens[i] <= cfg.window_size where
     # i < end_seq. This must be guaranteed by the function caller.
@@ -70,7 +73,7 @@ def compute_batched_seq_metadata(
         num_tiles=pl.cdiv(end_seq, cfg.tile_size),
         p_id_to_s_idx=all_valid_seqs,
         p_id_to_r_base=query_start_loc[all_valid_seqs],
-        p_id_to_r_size=jnp.where(is_valid_seqs, query_lens, 0),
+        p_id_to_r_size=jnp.where(is_valid_seqs, query_lens[all_valid_seqs], 0),
         p_id_is_first_tile=is_valid_seqs,
         p_id_is_last_tile=is_valid_seqs,
         s_idx_has_initial_state=has_initial_state,
