@@ -163,6 +163,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
+from vllm_torchtpu.runner import steady_decode_metadata as steady_md
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
     StaticPoolerSpec,
@@ -1437,6 +1438,9 @@ class TPUModelRunner(GPUModelRunner):
         # ragged paged attention (in-window query rows never attend).
         self._combined_request_distribution_cpu = torch.zeros(6, dtype=torch.int32)
         self._decode_device_cache_key: tuple | None = None
+        # VLLM_TPU_STEADY_DECODE_METADATA: the previous chunk's reusable
+        # batch-shape products (runner/steady_decode_metadata.py).
+        self._steady_decode_cache = steady_md.SteadyDecodeMetadataCache()
         # Snapshot of the in-flight uploads from the host staging tensors
         # (input_ids_cpu, positions_cpu, seq_lens_cpu, ...); the next chunk
         # waits on it before rewriting them.
@@ -2075,7 +2079,8 @@ class TPUModelRunner(GPUModelRunner):
             stage_block_table_uploads(self, ctx, effective_num_reqs_padded)
 
         if (
-            envs.VLLM_TPU_FAST_METADATA_BUILD
+            # A steady-decode step builds the same objects inline as well.
+            (envs.VLLM_TPU_FAST_METADATA_BUILD or ctx.steady_hit)
             and ctx.staged_block_tables is not None
             and ctx.position_ids_override is None
         ):
@@ -2316,7 +2321,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._mamba_slot_by_req_id[req_id] = slot
             slots.append(slot)
         memo = None
-        if envs.VLLM_TPU_MAMBA_INDICES_REUSE:
+        if envs.VLLM_TPU_MAMBA_INDICES_REUSE or envs.VLLM_TPU_STEADY_DECODE_METADATA:
             # Steady decode (and every draft forward of a step) rebuilds the
             # same slot list: reuse that upload while the values repeat.
             memo = self.__dict__.setdefault("_mamba_indices_memo", {})
@@ -3778,6 +3783,74 @@ class TPUModelRunner(GPUModelRunner):
             num_draft_per_req,
         )
 
+    def _steady_decode_lookup(
+        self,
+        scheduler_output: "SchedulerOutput",
+        start_index: int,
+        num_reqs: int,
+        num_scheduled_tokens_per_req: np.ndarray,
+        use_max_model_len: bool,
+        rpa_num_decode_reqs: int,
+        num_windowed_reqs: int,
+    ) -> tuple["steady_md.SteadyDecodeEntry | None", tuple | None, np.ndarray | None]:
+        """VLLM_TPU_STEADY_DECODE_METADATA: (cached entry on a hit, this
+        chunk's key, its per-request draft counts). The key is None for
+        chunks the incremental path never handles (multi-chunk, prefill
+        pieces, request churn, PCP / mrope / LoRA); those always rebuild."""
+        cache = self._steady_decode_cache
+        key = None
+        num_draft = None
+        if (
+            not self.uses_mrope
+            and self.lora_config is None
+            and not self._pcp_enabled
+            and steady_md.scheduler_output_is_quiet(scheduler_output)
+        ):
+            req_ids = tuple(
+                self.input_batch.req_ids[start_index : start_index + num_reqs]
+            )
+            if self.speculative_config:
+                spec = scheduler_output.scheduled_spec_decode_tokens
+                num_draft = np.array(
+                    [len(spec.get(r, ())) for r in req_ids], dtype=np.int32
+                )
+            key = steady_md.steady_decode_key(
+                req_ids,
+                num_scheduled_tokens_per_req,
+                num_draft,
+                start_index=start_index,
+                batch_num_reqs=self.input_batch.num_reqs,
+                use_max_model_len=use_max_model_len,
+                target_num_reqs=(
+                    self.num_reqs_max_model_len
+                    if use_max_model_len
+                    else self.num_reqs_most_model_len
+                ),
+                padded_num_reqs=_get_padded_num_reqs_with_upper_limit(
+                    num_reqs, self.max_num_reqs
+                ),
+                rpa_num_decode_reqs=rpa_num_decode_reqs,
+                num_windowed_reqs=num_windowed_reqs,
+            )
+        entry = cache.lookup(key)
+        if host_phases.enabled() and (cache.hits + cache.misses) % 2000 == 0:
+            logger.info(
+                "STEADY_DECODE_METADATA: %d hits / %d misses, walk skips %d / %d",
+                cache.hits,
+                cache.misses,
+                cache.walk_skips,
+                cache.walks,
+            )
+        return entry, key, num_draft
+
+    def _steady_walk_margin(self) -> int:
+        """Exclusive bound on how far below the host's optimistic seq_lens
+        the async spec path's on-device rejected-token subtract can move a
+        request (it removes at most the previous step's drafts)."""
+        if not self.speculative_config:
+            return 0
+        return int(self.speculative_config.num_speculative_tokens) + 1
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3841,6 +3914,20 @@ class TPUModelRunner(GPUModelRunner):
 
         num_reqs = len(num_scheduled_tokens_per_req)
 
+        # VLLM_TPU_STEADY_DECODE_METADATA: None on every step it does not
+        # recognize as a repeat of the previous one (full rebuild).
+        steady = steady_key = steady_num_draft = None
+        if envs.VLLM_TPU_STEADY_DECODE_METADATA:
+            steady, steady_key, steady_num_draft = self._steady_decode_lookup(
+                scheduler_output,
+                start_index,
+                num_reqs,
+                num_scheduled_tokens_per_req,
+                use_max_model_len,
+                rpa_num_decode_reqs,
+                num_windowed_reqs,
+            )
+
         sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
         sequence_layout_planner.reserve_host_token_capacity(
             self, int(total_num_scheduled_tokens)
@@ -3874,17 +3961,21 @@ class TPUModelRunner(GPUModelRunner):
             )
         else:
             # General path: mixed prefill + decode.
-            # Get request indices.
-            req_indices = np.repeat(
-                self.arange_np[start_index : start_index + num_reqs],
-                num_scheduled_tokens_per_req,
-            )
+            if steady is not None and steady.req_indices is not None:
+                # Same per-request token counts as the previous step.
+                req_indices, arange = steady.req_indices, steady.arange
+            else:
+                # Get request indices.
+                req_indices = np.repeat(
+                    self.arange_np[start_index : start_index + num_reqs],
+                    num_scheduled_tokens_per_req,
+                )
 
-            # Get batched arange.
-            # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-            arange = np.concatenate(
-                [self.arange_np[:n] for n in num_scheduled_tokens_per_req]
-            )
+                # Get batched arange.
+                # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+                arange = np.concatenate(
+                    [self.arange_np[:n] for n in num_scheduled_tokens_per_req]
+                )
 
             # Get positions.
             positions_np = self.positions_np[:total_num_scheduled_tokens]
@@ -3907,13 +3998,28 @@ class TPUModelRunner(GPUModelRunner):
             )
 
         # Prepare the attention metadata.
-        self.query_start_loc_np[0] = 0
-        np.cumsum(
-            num_scheduled_tokens_per_req, out=self.query_start_loc_np[1 : num_reqs + 1]
-        )
-        # Keep padded entries equal to the last valid location so padded
-        # requests have zero length instead of a negative q_len.
-        self.query_start_loc_np[num_reqs + 1 :] = self.query_start_loc_np[num_reqs]
+        if steady is None:
+            self.query_start_loc_np[0] = 0
+            np.cumsum(
+                num_scheduled_tokens_per_req,
+                out=self.query_start_loc_np[1 : num_reqs + 1],
+            )
+            # Keep padded entries equal to the last valid location so padded
+            # requests have zero length instead of a negative q_len.
+            self.query_start_loc_np[num_reqs + 1 :] = self.query_start_loc_np[num_reqs]
+        # else: only this method writes the buffer, and the previous call (the
+        # cached step, same token counts) left exactly these values in it.
+        steady_hit = steady is not None
+        if steady is None and steady_key is not None:
+            # Seed the next step's cache with this step's count-only arrays.
+            steady = self._steady_decode_cache.seed(
+                steady_key,
+                req_indices=(
+                    req_indices if max_num_scheduled_tokens_all_reqs > 1 else None
+                ),
+                arange=arange if max_num_scheduled_tokens_all_reqs > 1 else None,
+                num_draft=steady_num_draft,
+            )
 
         fill_step_seq_lens(
             self.seq_lens_np,
@@ -4024,17 +4130,43 @@ class TPUModelRunner(GPUModelRunner):
                 subtract_num_rejected_tokens,
             )
 
-            seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
-            pos_idx_np = np.full(padded_total_num_scheduled_tokens, -1, dtype=np.int32)
-            acc = 0
-            for i in range(num_reqs):
-                req_id = self.input_batch.req_ids[start_index + i]
-                n_sched = int(num_scheduled_tokens_per_req[i])
-                pos = self._pre_async_results.req_id_to_index_copy.get(req_id)
-                if pos is not None:
-                    seq_idx_np[i] = pos
-                    pos_idx_np[acc : acc + n_sched] = pos
-                acc += n_sched
+            subtract_idx = None
+            subtract_key = None
+            if steady is not None:
+                # The indices depend only on the token counts (in the key) and
+                # on where these requests sat in the previous step's results.
+                index_of = self._pre_async_results.req_id_to_index_copy
+                subtract_key = (
+                    padded_total_num_scheduled_tokens,
+                    tuple(index_of.get(r) for r in steady.key[0]),
+                )
+                if steady_hit and steady.subtract_key == subtract_key:
+                    subtract_idx = steady.subtract_idx
+            if subtract_idx is None:
+                seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
+                pos_idx_np = np.full(
+                    padded_total_num_scheduled_tokens, -1, dtype=np.int32
+                )
+                acc = 0
+                for i in range(num_reqs):
+                    req_id = self.input_batch.req_ids[start_index + i]
+                    n_sched = int(num_scheduled_tokens_per_req[i])
+                    pos = self._pre_async_results.req_id_to_index_copy.get(req_id)
+                    if pos is not None:
+                        seq_idx_np[i] = pos
+                        pos_idx_np[acc : acc + n_sched] = pos
+                    acc += n_sched
+                subtract_idx = (
+                    self._upload_unless_unchanged(
+                        "rejected_seq_idx", torch.from_numpy(seq_idx_np)
+                    ),
+                    self._upload_unless_unchanged(
+                        "rejected_pos_idx", torch.from_numpy(pos_idx_np)
+                    ),
+                )
+                if steady is not None:
+                    steady.subtract_key = subtract_key
+                    steady.subtract_idx = subtract_idx
             # The compiled program only for shapes warmup compiled (steady
             # decode); prefill/mixed steps keep the eager ops rather than
             # compiling mid-serve.
@@ -4053,12 +4185,7 @@ class TPUModelRunner(GPUModelRunner):
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
-                self._upload_unless_unchanged(
-                    "rejected_seq_idx", torch.from_numpy(seq_idx_np)
-                ),
-                self._upload_unless_unchanged(
-                    "rejected_pos_idx", torch.from_numpy(pos_idx_np)
-                ),
+                *subtract_idx,
             )
 
         # For decode-only case, cache constant device tensors to skip H2D.
@@ -4075,15 +4202,23 @@ class TPUModelRunner(GPUModelRunner):
         # Speculative decoding metadata.
         spec_decode_metadata = None
         if self.speculative_config:
-            num_draft_tokens = np.array(
-                [
-                    len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
-                    for req_id in self.input_batch.req_ids[
-                        start_index : start_index + num_reqs
-                    ]
-                ],
-                dtype=np.int32,
-            )
+            if steady_num_draft is not None:
+                # Built (identically) for the steady-decode key.
+                num_draft_tokens = steady_num_draft
+            else:
+                num_draft_tokens = np.array(
+                    [
+                        len(
+                            scheduler_output.scheduled_spec_decode_tokens.get(
+                                req_id, ()
+                            )
+                        )
+                        for req_id in self.input_batch.req_ids[
+                            start_index : start_index + num_reqs
+                        ]
+                    ],
+                    dtype=np.int32,
+                )
             if num_draft_tokens.any():
                 spec_decode_metadata = (
                     self.spec_decode_manager.get_spec_decode_metadata(
@@ -4124,12 +4259,34 @@ class TPUModelRunner(GPUModelRunner):
             # Compute and copy to device (first call or shape changed). Spec
             # steps miss the decode cache above but usually repeat the same
             # query_start_loc, so reuse the last upload while it matches.
-            if use_max_model_len:
-                qsl_host = self.query_start_loc_cpu[: self.num_reqs_max_model_len + 1]
+            steady_layout = (
+                (layout_plan.descriptor.cache_key, padded_total_num_scheduled_tokens)
+                if steady is not None
+                else None
+            )
+            if (
+                steady_hit
+                and steady.query_start_loc is not None
+                and steady.layout_key == steady_layout
+            ):
+                # Same counts and buffer contents as the cached upload.
+                query_start_loc = steady.query_start_loc
             else:
-                assert self.num_reqs_most_model_len is not None
-                qsl_host = self.query_start_loc_cpu[: self.num_reqs_most_model_len + 1]
-            query_start_loc = self._upload_unless_unchanged("query_start_loc", qsl_host)
+                if use_max_model_len:
+                    qsl_host = self.query_start_loc_cpu[
+                        : self.num_reqs_max_model_len + 1
+                    ]
+                else:
+                    assert self.num_reqs_most_model_len is not None
+                    qsl_host = self.query_start_loc_cpu[
+                        : self.num_reqs_most_model_len + 1
+                    ]
+                query_start_loc = self._upload_unless_unchanged(
+                    "query_start_loc", qsl_host
+                )
+                if steady is not None:
+                    steady.layout_key = steady_layout
+                    steady.query_start_loc = query_start_loc
 
             if spec_decode_metadata is not None:
                 logits_indices = spec_decode_metadata.final_logits_indices
@@ -4236,6 +4393,17 @@ class TPUModelRunner(GPUModelRunner):
                 else None
             ),
             sequence_layout_descriptor=layout_plan.descriptor,
+            steady_walk_bounds=(
+                steady_md.walk_seq_bounds(
+                    self.seq_lens_np,
+                    num_reqs,
+                    target_num_reqs,
+                    self._steady_walk_margin(),
+                )
+                if steady is not None
+                else None
+            ),
+            steady_hit=steady_hit,
         )
         slot_mappings = self.empty_slot_mappings
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
@@ -4653,6 +4821,7 @@ class TPUModelRunner(GPUModelRunner):
                 "_build_mamba_state_indices",
                 "_mamba_prefill_ckpt",
                 "_build_attention_metadata_staged",
+                "_steady_decode_lookup",
                 "_prepare_async_token_substitution_indices",
                 "_collect_mamba_state_seed_copies",
                 "_flush_mamba_state_seed_copies",
@@ -9402,6 +9571,7 @@ class TPUModelRunner(GPUModelRunner):
             self.num_blocks_per_most_len_req = pages
         self._attention_capacity.clear()
         self._decode_device_cache_key = None
+        self._steady_decode_cache.invalidate()
 
     def may_reinitialize_input_batch(
         self,
