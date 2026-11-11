@@ -530,7 +530,9 @@ _ASSEMBLY_PROGRAMS = (
 )
 
 
-def _assembly_warmup_calls(monkeypatch, *, async_scheduling=True, most=None):
+def _assembly_warmup_calls(
+    monkeypatch, *, async_scheduling=True, most=None, async_drafter=True
+):
     """Run _precompile_async_spec_assembly on a stub runner and record the
     shapes each assembly program was warmed with."""
     calls: dict[str, list[tuple]] = {name: [] for name in _ASSEMBLY_PROGRAMS}
@@ -550,7 +552,7 @@ def _assembly_warmup_calls(monkeypatch, *, async_scheduling=True, most=None):
         monkeypatch.setattr(async_output, name, recorder(name))
     monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
     runner = SimpleNamespace(
-        _is_async_drafter=True,
+        _is_async_drafter=async_drafter,
         speculative_config=SimpleNamespace(num_speculative_tokens=3),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         max_num_reqs=8,
@@ -593,4 +595,9 @@ def test_async_spec_assembly_warmup_covers_every_bucket(monkeypatch):
 
 def test_async_spec_assembly_warmup_needs_async_scheduling(monkeypatch):
     calls = _assembly_warmup_calls(monkeypatch, async_scheduling=False)
+    assert all(not c for c in calls.values())
+
+
+def test_async_spec_assembly_warmup_needs_an_async_drafter(monkeypatch):
+    calls = _assembly_warmup_calls(monkeypatch, async_drafter=False)
     assert all(not c for c in calls.values())
