@@ -250,6 +250,8 @@ class TileSizes:
     # Ascending row counts a tile's matmul is compiled for, ending at tile_m;
     # empty means the multiples of bucket_base.
     buckets: tuple[int, ...] = ()
+    # Weight blocks the rhs pipeline keeps in flight.
+    rhs_buffer_count: int = 3
 
     @property
     def bucket_sizes(self) -> tuple[int, ...]:
@@ -424,7 +426,7 @@ def generate_block_specs(
     rhs_weight_spec = pl.BlockSpec(
         (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
         index_map.rhs_weight_index_map,
-        pipeline_mode=pl.Buffered(buffer_count=3),
+        pipeline_mode=pl.Buffered(buffer_count=cfgs.tiles.rhs_buffer_count),
     )
     rhs_scale_block_spec = rhs_bias_block_spec = None
     if cfgs.rhs_cfgs.has_bias:
