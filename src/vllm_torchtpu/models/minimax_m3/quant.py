@@ -16,8 +16,12 @@
 The checkpoint's `quant_method: mxfp8` config also carries the routed experts'
 compressed-tensors NVFP4 scheme (`moe_quant_algo`). MXFP8 linears are
 dequantized to bf16 at load: an e4m3 value times a power-of-two scale is exact
-in bf16, so this keeps the checkpoint's numerics. The experts reuse the TPU
-NVFP4 MoE path after renaming the compressed-tensors tensors to ModelOpt's.
+in bf16, so this keeps the checkpoint's numerics. With
+TPU_MINIMAX_M3_MXFP8_W8A16=1 the target model's MXFP8 linears instead keep the
+e4m3 weights and their block-32 scales, and the matmul dequantizes each weight
+tile in VMEM (W8A16, bf16 activations): the same exact bf16 weight values, at
+half the HBM bytes. The experts reuse the TPU NVFP4 MoE path after renaming the
+compressed-tensors tensors to ModelOpt's.
 """
 
 from typing import Any
@@ -34,6 +38,12 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+    quantized_matmul,
+)
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
     VllmNvfp4Config,
     VllmNvfp4MoEMethod,
@@ -43,7 +53,10 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedLinearMethod,
 )
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
+
+logger = init_logger(__name__)
 
 QUANT_METHOD = "mxfp8"
 MXFP8_BLOCK = 32
@@ -140,6 +153,79 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         return VllmUnquantizedLinearMethod().apply(layer, x, bias)
 
 
+def mxfp8_to_w8a16(
+    weight: torch.Tensor, scale_e8m0: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[n, k]`` e4m3 + ``[n, k // 32]`` e8m0 -> the K-major ``[k, n]`` e4m3
+    weight and the ``[1, k // 32, 1, n]`` fp32 block scale ``gmm_v2`` reads.
+
+    The scale is the power of two ``2 ** (e - 127)``, exact in fp32 and in the
+    bf16 the kernel dequantizes to, so ``w[k, n] * scale[k // 32, n]`` is
+    bit-identical to `dequantize_mxfp8`'s weight.
+    """
+    out_dim, in_dim = weight.shape
+    w_kn = weight.view(torch.uint8).t().contiguous().view(torch.float8_e4m3fn)
+    scale = torch.exp2(scale_e8m0.to(torch.float32) - _E8M0_BIAS)
+    scale = scale.t().contiguous().view(1, in_dim // MXFP8_BLOCK, 1, out_dim)
+    return w_kn, scale
+
+
+@register_weight_loader_v2_supported_method
+class MiniMaxM3Mxfp8W8A16LinearMethod(MiniMaxM3Mxfp8LinearMethod):
+    """Keeps the MXFP8 weight as e4m3 and dequantizes it inside the matmul.
+
+    `quantized_matmul` sends the rank-4 block scale to `gmm_v2`. Its block (32)
+    is below the MXU width, so the kernel dequantizes each weight tile to bf16
+    in VMEM and runs a bf16 x bf16 matmul with f32 accumulation: the products
+    are the bf16 path's, and the weight read from HBM is 1 + 1/8 B instead of
+    2 B per element.
+    """
+
+    _logged = False
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            # A consumer reads this weight raw in vLLM's layout: stay bf16.
+            super().process_weights_after_loading(layer)
+            return
+        if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            return  # already converted; reload paths re-enter this hook
+        weight, scale = mxfp8_to_w8a16(layer.weight.data, layer.weight_scale.data)
+        replace_parameter(
+            layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
+        )
+        replace_parameter(
+            layer, "weight_scale", torch.nn.Parameter(scale, requires_grad=False)
+        )
+        setattr(layer, WEIGHT_FLIPPED_ATTR, True)
+        if layer.weight.device.type == "tpu":
+            synchronize_tensors([layer.weight, layer.weight_scale])
+        if not MiniMaxM3Mxfp8W8A16LinearMethod._logged:
+            MiniMaxM3Mxfp8W8A16LinearMethod._logged = True
+            logger.info(
+                "TPU_MINIMAX_M3_MXFP8_W8A16=1: MXFP8 dense linears keep e4m3 "
+                "weights with block-32 scales (W8A16, dequantized in the "
+                "matmul); first layer weight %s scale %s",
+                list(weight.shape),
+                list(scale.shape),
+            )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not getattr(layer, WEIGHT_FLIPPED_ATTR, False) or getattr(
+            layer, KEEP_VLLM_LAYOUT_ATTR, False
+        ):
+            return super().apply(layer, x, bias)
+        out = quantized_matmul(x, layer.weight, layer.weight_scale)
+        if bias is not None:
+            out = out + bias
+        return out
+
+
 class MiniMaxM3Nvfp4MoEMethod(VllmNvfp4MoEMethod):
     """Compressed-tensors NVFP4 experts on the TPU NVFP4 MoE path.
 
@@ -200,12 +286,20 @@ class MiniMaxM3QuantConfig(VllmNvfp4Config):
             new + name.removeprefix(old) if name.startswith(old) else name
             for name in config.get("ignored_layers") or []
         ]
-        return cls(
+        quant_config = cls(
             quant_method="NVFP4",
             is_checkpoint_nvfp4_serialized=True,
             exclude_modules=exclude_modules,
             group_size=_NVFP4_GROUP,
         )
+        # The DSpark draft's config names its own modules under the draft
+        # prefix. Its qkv_proj is read raw (`dspark._flipped_weight`) for the
+        # context K/V columns, so the draft keeps the bf16 path.
+        is_draft = any(
+            name.startswith(old) for name in config.get("ignored_layers") or []
+        )
+        quant_config.mxfp8_w8a16 = envs.TPU_MINIMAX_M3_MXFP8_W8A16 and not is_draft
+        return quant_config
 
     def _get_checkpoint_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -214,6 +308,8 @@ class MiniMaxM3QuantConfig(VllmNvfp4Config):
         if isinstance(layer, LinearBase):
             if excluded:
                 return VllmUnquantizedLinearMethod()
+            if getattr(self, "mxfp8_w8a16", False):
+                return MiniMaxM3Mxfp8W8A16LinearMethod()
             return MiniMaxM3Mxfp8LinearMethod()
         if isinstance(layer, RoutedExperts):
             if excluded:

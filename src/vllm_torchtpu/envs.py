@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
+    TPU_MINIMAX_M3_MXFP8_W8A16: bool = False
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -578,6 +579,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
     ),
+    # MiniMax M3: keep the target model's MXFP8 dense linears as e4m3 weights
+    # with their block-32 e8m0 scales and dequantize inside the matmul (bf16
+    # activations), instead of dequantizing them to bf16 at load. Halves the
+    # weight bytes read per step. Off by default (models/minimax_m3/quant.py).
+    "TPU_MINIMAX_M3_MXFP8_W8A16": env_bool("TPU_MINIMAX_M3_MXFP8_W8A16"),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
