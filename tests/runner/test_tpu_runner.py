@@ -3647,6 +3647,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         all_greedy=False,
         topk_candidates=0,
         apply_topk_topp=True,
+        apply_top_k=True,
     ):
         seen_u_dtypes.append(u.dtype)
         return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
@@ -3659,8 +3660,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     )
 
     # 1. _precompile_sample_from_logits: two graphs without speculative
-    # decoding, plus the no-top-k/top-p graph with it.
-    for speculative_config, num_graphs in ((None, 2), (SimpleNamespace(), 3)):
+    # decoding, plus the no-top-k/top-p and top-p-only graphs with it.
+    for speculative_config, num_graphs in ((None, 2), (SimpleNamespace(), 4)):
         precompile_runner = SimpleNamespace(
             num_reqs_paddings=[2],
             _hidden_states_dtype=torch.bfloat16,
@@ -3690,6 +3691,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         _build_padded_sampling_params=lambda start, end, logits: sampling_params,
         _sampler_topk_candidates=lambda start, end, grammar: 0,
         _sampler_applies_topk_topp=lambda: True,
+        _sampler_applies_top_k=lambda: True,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
@@ -3777,6 +3779,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _build_padded_sampling_params=lambda start, end, logits: sampling_params,
             _sampler_topk_candidates=lambda start, end, grammar: 0,
             _sampler_applies_topk_topp=lambda: True,
+            _sampler_applies_top_k=lambda: True,
             sample_from_logits_func=fake_sample_from_logits,
             _update_mamba_slot_read_offsets=lambda *_args: None,
             _update_num_xla_graphs=lambda *_args: None,
