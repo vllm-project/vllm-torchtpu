@@ -580,10 +580,13 @@ def test_metadata_has_one_serving_config_with_what_the_runtime_reads(tmp_path) -
         "tensor_parallel_size",
         "pipeline_parallel_size",
         "data_parallel_size",
+        "attention_decode_query_size",
         "tokenizer_config",
         "checkpoint_config",
     }
     assert (serving["vocab_size"], serving["num_blocks"]) == (32, 16)
+    # A model without Pallas attention layers decodes one token per request.
+    assert serving["attention_decode_query_size"] == 1
     # The checkpoint format every export writes (Zarr v2 arrays in an OCDBT database).
     assert serving["checkpoint_config"] == {"format": "zarr2_ocdbt"}
 
@@ -624,6 +627,83 @@ def test_metadata_declares_the_speculative_config_it_was_exported_with(
         exporter.export(_TinyTorchExportableLLM(cfg), out_dir)
     meta = json.loads(Path(out_dir, "metadata.json").read_text())
     assert meta["serving_config"]["speculative_config"] == speculative
+
+
+class _TinyVerifyingExportableLLM(_TinyTorchExportableLLM):
+    """The tiny model whose attention decodes 4-token verify windows."""
+
+    def attention_decode_query_size(self) -> int:
+        return 4
+
+
+def test_metadata_records_the_attention_decode_width(tmp_path) -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny-torch",
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=8,
+        num_blocks=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        token_buckets=(8,),
+        req_buckets=(8, 32),
+        emit_byte_tokenizer=True,
+    )
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_torch_callable_to_mlir,
+    ):
+        exporter.export(_TinyVerifyingExportableLLM(cfg), out_dir)
+    meta = json.loads(Path(out_dir, "metadata.json").read_text())
+    assert meta["serving_config"]["attention_decode_query_size"] == 4
+
+
+def _pallas_attention_layer(decode_query_size: int) -> Any:
+    from vllm.model_executor.layers.attention import Attention
+
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+
+    impl = object.__new__(PallasAttentionBackendImpl)
+    impl.decode_query_size = decode_query_size
+    layer = object.__new__(Attention)
+    layer.impl = impl
+    return layer
+
+
+@pytest.mark.parametrize(
+    ("widths", "want"),
+    [
+        # Target and sharded draft layers decoding K + 1 = 4 tokens.
+        ((4, 4), 4),
+        # A tp=1 draft layer on the 1-wide local kernel.
+        ((4, 4, 1), 1),
+        # No Pallas attention layers.
+        ((), 1),
+    ],
+)
+def test_attention_decode_width_is_the_narrowest_pallas_decode_stage(
+    widths: tuple[int, ...], want: int
+) -> None:
+    layers = {
+        f"layers.{i}.self_attn.attn": _pallas_attention_layer(w)
+        for i, w in enumerate(widths)
+    }
+    # A layer of another backend does not narrow the decode stage.
+    other = _pallas_attention_layer(1)
+    other.impl = SimpleNamespace(decode_query_size=1)
+    layers["layers.9.self_attn.attn"] = other
+    cfg = api.TextOnlyLLMExportConfig(model_name="tiny", num_layers=1)
+    adapter = _adapter_without_model(cfg)
+    adapter._vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=layers)
+    )
+    assert adapter.attention_decode_query_size() == want
 
 
 def _export_metadata(tmp_path: Path) -> dict[str, Any]:
