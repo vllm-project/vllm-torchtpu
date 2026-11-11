@@ -109,9 +109,19 @@ def _log_partition_once(batch, budget):
 def _owned_first(blocks, owned):
     """Each row's owned entries at the front in their input order (a stable
     partition), the other columns ``int32 max``. Equal to sorting
-    ``where(owned, blocks, max)`` when the owned entries are ascending."""
+    ``where(owned, blocks, max)`` when the owned non-negative entries are
+    ascending: owned ``-1`` padding (an empty selection slot inside the counted
+    columns; ``-1 // page_groups`` is odd) sorts first there, so it goes first
+    here too."""
     batch, budget = blocks.shape
-    dest = jnp.where(owned, jnp.cumsum(owned.astype(jnp.int32), axis=1) - 1, budget)
+    neg = owned & (blocks < 0)
+    pos = owned & (blocks >= 0)
+    n_neg = jnp.sum(neg, axis=1, keepdims=True, dtype=jnp.int32)
+    dest = jnp.where(
+        neg,
+        jnp.cumsum(neg.astype(jnp.int32), axis=1) - 1,
+        jnp.where(pos, n_neg + jnp.cumsum(pos.astype(jnp.int32), axis=1) - 1, budget),
+    )
     rows = jnp.broadcast_to(jnp.arange(batch, dtype=jnp.int32)[:, None], dest.shape)
     big = jnp.iinfo(jnp.int32).max
     return (
