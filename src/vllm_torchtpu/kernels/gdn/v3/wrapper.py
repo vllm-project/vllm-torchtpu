@@ -31,6 +31,7 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     metadata,
     tiling,
     vmem_ldst,
+    window_tile,
 )
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.logger import init_logger
@@ -96,6 +97,7 @@ def inner_kernel(
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     raw_scratch_ref: dict[str, jax.Ref] | None = None,
+    window_scratch_refs: tuple[jax.Ref, ...] | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -122,6 +124,8 @@ def inner_kernel(
             convolution carry.
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
+        window_scratch_refs: window_tile's VMEM scratches (head states,
+            conv inputs, conv weights) when `cfg.per_head_windows`.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
@@ -130,6 +134,52 @@ def inner_kernel(
 
     if p_id is None:
         p_id = pl.program_id(0)
+
+    if cfg.per_head_windows:
+        # Verify-window tile, one position and one value head at a time
+        # (VLLM_TPU_GDN_V3_WINDOW_VERIFY). Raw inputs are staged to the
+        # FP32 tiles inner_kernel would read.
+        assert window_scratch_refs is not None
+        if cfg.raw_qkv:
+            assert raw_scratch_ref is not None
+            raw_scratch_ref["qkv_act"][...] = _load_raw_rows(
+                qkv_slot_ref,
+                raw_scratch_ref["qkv_stage"],
+                metadata_ref,
+                p_id,
+                cfg,
+                cfg.raw_qkv_align,
+            )
+            qkv_slot_ref = raw_scratch_ref["qkv_act"]
+        if cfg.raw_ba:
+            assert raw_scratch_ref is not None
+            for name, raw_ref in (("b", b_slot_ref), ("a", a_slot_ref)):
+                raw_scratch_ref[f"{name}_act"][...] = _load_raw_rows(
+                    raw_ref,
+                    raw_scratch_ref[f"{name}_stage"],
+                    metadata_ref,
+                    p_id,
+                    cfg,
+                    cfg.raw_ba_align,
+                )
+            b_slot_ref = raw_scratch_ref["b_act"]
+            a_slot_ref = raw_scratch_ref["a_act"]
+        window_tile.run(
+            qkv_slot_ref,
+            b_slot_ref,
+            a_slot_ref,
+            conv_state_in_slot_ref,
+            recurrent_in_slot_ref,
+            out_slot_ref,
+            conv_state_out_slot_ref,
+            recurrent_out_slot_ref,
+            metadata_ref,
+            weights_ref,
+            *window_scratch_refs,
+            cfg=cfg,
+            p_id=p_id,
+        )
+        return
 
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -333,6 +383,7 @@ def outer_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     raw_scratch_ref: dict[str, jax.Array] | None = None,
     zero_out_scratch_ref: tuple[jax.Array, jax.Array] | None = None,
+    window_scratch_refs: tuple[jax.Array, ...] | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -414,7 +465,8 @@ def outer_kernel(
                 carry_conv_scratch_ref,
                 carry_recurrent_scratch_ref,
                 raw_scratch_ref,
-            ),
+            )
+            + (() if window_scratch_refs is None else (window_scratch_refs,)),
             allocations=allocations,
         )
 
@@ -450,6 +502,44 @@ def outer_kernel(
     @pl.loop(0, num_copies)
     def _(i):
         zero_copy(i).wait()
+
+
+def _both_segments_kernel(
+    metadata_refs: tuple[memory_ref.MetadataRef, memory_ref.MetadataRef],
+    qkv_ref: jax.Array,
+    b_ref: jax.Array,
+    a_ref: jax.Array,
+    source_ref: jax.Array,
+    in_act_ref: jax.Array | None,
+    weights_ref: memory_ref.WeightRefs,
+    out_ref: jax.Array,
+    source_out_ref: jax.Array,
+    *,
+    cfgs: tuple[config.GDNConfig, config.GDNConfig],
+):
+    """outer_kernel of the pooled BATCHED segment, then of the PER_SEQ one,
+    on the same activations, output and state source
+    (VLLM_TPU_GDN_V3_SINGLE_LAUNCH)."""
+    for metadata_ref, cfg in zip(metadata_refs, cfgs, strict=True):
+
+        def segment(metadata_ref=metadata_ref, cfg=cfg, **scratch_refs):
+            outer_kernel(
+                metadata_ref,
+                qkv_ref,
+                b_ref,
+                a_ref,
+                source_ref,
+                None,
+                in_act_ref,
+                weights_ref,
+                out_ref,
+                source_out_ref,
+                None,
+                **scratch_refs,
+                cfg=cfg,
+            )
+
+        pl.run_scoped(segment, **cfg.get_scratch_shape_dict())
 
 
 def kernel_metadata(
@@ -881,12 +971,12 @@ def fused_conv1d_gdn(
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
-    def call_kernel(
+    def make_cfg_and_metadata(
         in_conv_state: jax.Array,
         in_recurrent_state: jax.Array | None,
         in_act: jax.Array | None,
         mode: config.GDNMode,
-    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    ) -> tuple[config.GDNConfig, memory_ref.MetadataRef]:
         # With a state source, it rides the conv-state slot and the dense
         # recurrent-state input is absent.
         chunk_pair = False
@@ -955,6 +1045,23 @@ def fused_conv1d_gdn(
             raw_ba_align=raw_row_align(b) if use_raw_ba else 0,
             zero_out_from=zero_out_from,
         )
+        if (
+            envs.VLLM_TPU_GDN_V3_WINDOW_VERIFY
+            and pooled
+            and mode == config.GDNMode.BATCHED
+            and window_size > 1
+            and not is_kda
+        ):
+            window_cfg = dataclasses.replace(cfg, window_verify=True)
+            if window_tile.supported(
+                window_cfg, in_conv_state.shape, in_conv_state.dtype
+            ):
+                cfg = window_cfg
+            else:
+                logger.info_once(
+                    "GDN window verify: pool layout not supported by "
+                    "window_tile; verify keeps inner_kernel"
+                )
 
         # Step 6: Metadata preprocessing. Runs once per layer: each layer's
         # op is its own program, so XLA does not share it across layers
@@ -990,7 +1097,17 @@ def fused_conv1d_gdn(
                 zero_out_query_start_loc=query_start_loc,
                 zero_out_distribution=distribution,
             )
+        return cfg, metadata_obj
 
+    def call_kernel(
+        in_conv_state: jax.Array,
+        in_recurrent_state: jax.Array | None,
+        in_act: jax.Array | None,
+        mode: config.GDNMode,
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        cfg, metadata_obj = make_cfg_and_metadata(
+            in_conv_state, in_recurrent_state, in_act, mode
+        )
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
         # Step 7: Handle case where write needs to be done in existing out.
@@ -1010,7 +1127,7 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
 
-        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(cfg.window_size)
 
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
@@ -1047,6 +1164,61 @@ def fused_conv1d_gdn(
 
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
+
+    if (
+        pooled
+        and envs.VLLM_TPU_GDN_V3_SINGLE_LAUNCH
+        and not (prefill_only or batched_only)
+    ):
+        # Both segments in one kernel (VLLM_TPU_GDN_V3_SINGLE_LAUNCH), each
+        # with the configuration, metadata and scratch it has as its own
+        # call; the BATCHED segment owns the in-kernel zero-fill.
+        source = cast(jax.Array, state_source)
+        batched_cfg, batched_meta = make_cfg_and_metadata(
+            source, None, None, config.GDNMode.BATCHED
+        )
+        in_act = None
+        if zero_initialize_out and not batched_cfg.kernel_zero_out:
+            in_act = jnp.zeros_like(batched_cfg.get_out_shape())
+        # The PER_SEQ segment writes into the BATCHED segment's output, as
+        # its own call does through the aliased `in_act`.
+        per_seq_cfg, per_seq_meta = make_cfg_and_metadata(
+            source,
+            None,
+            batched_cfg.get_out_shape(),
+            config.GDNMode.PER_SEQ,
+        )
+        cfgs = (batched_cfg, per_seq_cfg)
+        metas = (batched_meta, per_seq_meta)
+        num_meta = len(batched_meta) + len(per_seq_meta)
+        aliases = {num_meta + 3: 1}
+        if in_act is not None:
+            aliases[num_meta + 4] = 0
+        out_act, out_source = pl.pallas_call(
+            functools.partial(_both_segments_kernel, cfgs=cfgs),
+            out_shape=(batched_cfg.get_out_shape(), source),
+            in_specs=(
+                jax.tree.map(lambda _: smem_spec, metas),
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                None if in_act is None else hbm_spec,
+                weights_spec,
+            ),
+            out_specs=(hbm_spec, hbm_spec),
+            input_output_aliases=aliases,
+            compiler_params=pltpu.CompilerParams(
+                disable_bounds_checks=True,
+                vmem_limit_bytes=max(
+                    config.GDNConfig.get_vmem_limit_bytes(c.window_size) for c in cfgs
+                ),
+            ),
+            name=f"{batched_cfg.get_kernel_name()}_and_per_seq",
+            metadata=batched_cfg.get_metadata(),
+        )(metas, qkv, b, a, source, in_act, weights)
+        out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+        return out_source, out_act
 
     if pooled:
         out_act, out_source = None, state_source
