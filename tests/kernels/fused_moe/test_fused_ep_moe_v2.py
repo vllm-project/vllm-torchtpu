@@ -621,13 +621,14 @@ def test_slab_scatter_set_and_add_are_bit_exact(
 
     The chip picks the form (host.slab_tables_on_tensorcore); forcing each one
     here runs both on whatever chip this is, so the form this chip does NOT
-    pick is checked as well. The scale slab is held on its scatter path, where
-    the form applies, rather than the lookup the layer prefers. The two forced
-    builds must lower to different programs, so the agreement is not vacuous:
-    were the form ever dropped from the layer's shard_map cache key, the second
-    build would reuse the first one's body and fail here.
+    pick is checked as well. Both tables are held on their scatter paths, where
+    the form applies, rather than the sort and the lookup the layer prefers.
+    The two forced builds must lower to different programs, so the agreement is
+    not vacuous: were the form ever dropped from the layer's shard_map cache
+    key, the second build would reuse the first one's body and fail here.
     """
     monkeypatch.setattr(layer, "scale_slab_fits", lambda _n: False)
+    monkeypatch.setattr(layer, "token_gather_sort_fits", lambda *_a, **_k: False)
     mesh = _mesh()
     if shared_weights is not None:
         w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
@@ -756,6 +757,62 @@ def test_scale_slab_lookup_and_scatter_are_bit_exact(
         outs[fits] = np.asarray(run(*args))
     assert has_lookup == {True: True, False: False}, has_lookup
     np.testing.assert_array_equal(outs[True], outs[False])
+
+
+@pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(dict(SMALL), id="small"),
+        pytest.param(dict(PROD, tokens=PROD_TOKENS[0]), id="prod_t2048"),
+        pytest.param(dict(PROD, tokens=PROD_TOKENS[1]), id="prod_t16384"),
+    ],
+)
+def test_token_gather_sort_and_scatter_are_bit_exact(monkeypatch, sharded_plan, shape):
+    """The token-gather table built by sort gives the layer the scatter's output.
+
+    The scatter form is forced by declaring the sort keys too wide for int32;
+    the TensorCore builds are forced on, as in the lookup test.
+    """
+    monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        60,
+        hidden=shape["hidden"],
+        inter=shape["inter"],
+        e_total=shape["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        61,
+        tokens=shape["tokens"],
+        hidden=shape["hidden"],
+        e_total=shape["e_total"],
+    )
+    outs = []
+    for fits in (True, False):
+        monkeypatch.setattr(
+            layer, "token_gather_sort_fits", lambda *_a, fits=fits, **_k: fits
+        )
+        outs.append(
+            fused_ep_moe_v2(
+                x,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                gating,
+                topk=shape["topk"],
+                renormalize=True,
+                mesh=mesh,
+                capacity=CAPACITY,
+                weight_format=WeightFormat.FP8,
+                sharded_plan=sharded_plan,
+            )
+        )
+    np.testing.assert_array_equal(np.asarray(outs[0]), np.asarray(outs[1]))
 
 
 @pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
