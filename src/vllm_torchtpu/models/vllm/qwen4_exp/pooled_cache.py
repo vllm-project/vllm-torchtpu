@@ -2,7 +2,7 @@
 """Qwen4Exp binding over the native planner and existing unified pool allocator."""
 
 import gc
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import torch
 from vllm.v1.core.kv_cache_utils import (
@@ -17,7 +17,12 @@ from vllm_torchtpu.kv_cache_materializer import (
     LayerKVCache,
     materialize_kv_cache_tensors,
 )
-from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
+from vllm_torchtpu import envs
+from vllm_torchtpu.layers.core.attention_metadata import (
+    AttentionMetadataBuilder,
+    MambaStackRef,
+    stacked_mamba_metadata,
+)
 from vllm_torchtpu.utils import compute_hbm_budget, synchronize_tensors
 
 from .cache import TEMP_HEADROOM, logger
@@ -381,6 +386,11 @@ class Qwen4ExpPooledCache:
             mamba_distribution = combined[3:6]
         # VLLM_TPU_MAMBA_TAIL_FOLD: serving hands every state group one shared
         # checkpoint tensor; trace the same input (all zero: no checkpoint).
+        stacked = bool(
+            envs.VLLM_TPU_STAGED_WALK_STACKED
+            and envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER
+        )
+        stack_classes: dict[tuple[int, int], list] = {}
         prefill_ckpt = None
         if any(
             isinstance(g.kv_cache_spec, MambaSpec)
@@ -447,6 +457,36 @@ class Qwen4ExpPooledCache:
                 )
             if state and prefill_ckpt is not None:
                 item = replace(item, mamba_prefill_ckpt=prefill_ckpt)
+            if state and stacked:
+                stack_classes.setdefault((columns, spec.block_size), []).append(
+                    (item, group.layer_names)
+                )
+                continue
             result.update({name: item for name in group.layer_names})
+        # VLLM_TPU_STAGED_WALK_STACKED: serving hands each block-geometry
+        # class's state groups one [G, n] state and one [G, n, W] checkpoint
+        # stack, read by row in-graph. The compiled forward keeps no guards,
+        # so the dummy must trace those stacks too, not one tensor per group
+        # (a per-group trace expects 2 inputs per state group that the
+        # stacked metadata no longer has).
+        for members in stack_classes.values():
+            state_stack = torch.stack(
+                [item.mamba_state_indices for item, _ in members]
+            )
+            ckpt_stack = (
+                torch.stack([item.mamba_ckpt_indices for item, _ in members])
+                if members[0][0].mamba_ckpt_indices is not None
+                else None
+            )
+            for row, (item, names) in enumerate(members):
+                stacked_item = stacked_mamba_metadata(
+                    MambaStackRef(state_stack, ckpt_stack, row),
+                    **{
+                        f.name: getattr(item, f.name)
+                        for f in fields(item)
+                        if f.init
+                    },
+                )
+                result.update({name: stacked_item for name in names})
         assert next_page <= self.pages, "dummy owner pages exceed the planned pool"
         return result

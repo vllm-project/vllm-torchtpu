@@ -929,3 +929,118 @@ def test_main_kv_dcp_allocation_and_prefix_hits_align_to_scheduler_blocks(
     _, hit, *_ = manager.get_computed_blocks(second)
     assert hit > 0 and hit % scheduler_block == 0, (hit, scheduler_block)
     assert hit <= len(prompt) - 1
+
+
+@pytest.mark.parametrize("stacked", [False, True])
+def test_pool_warmup_traces_the_stacked_walk_inputs(monkeypatch, stacked):
+    """VLLM_TPU_STAGED_WALK_STACKED: the adapter's warmup metadata (the
+    backbone precompile goes through it, not the runner's builders) must
+    trace the stacks serving hands the forward. A per-group warmup trace
+    expected 2 inputs per state group that the stacked serving metadata does
+    not carry ("Execution supplied 1317 arguments but compiled program
+    expected 1391", 37 state groups). Flag off: unchanged per-group tensors.
+    Either way the dynamo graph-input count of a forward reading the ids via
+    mamba_state_of / mamba_ckpt_of must equal serving's stacked/per-group one."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from vllm_torchtpu.layers.core.attention_metadata import (
+        AttentionMetadata,
+        StackedMambaAttentionMetadata,
+        mamba_ckpt_of,
+        mamba_state_of,
+    )
+    from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
+
+    monkeypatch.delenv("VLLM_TPU_MAMBA_TAIL_FOLD", raising=False)
+    monkeypatch.setenv("VLLM_TPU_STAGED_WALK_CLASS_GATHER", "1")
+    if stacked:
+        monkeypatch.setenv("VLLM_TPU_STAGED_WALK_STACKED", "1")
+    else:
+        monkeypatch.delenv("VLLM_TPU_STAGED_WALK_STACKED", raising=False)
+    num_spec = 3
+    cfg = pool_config()
+    layout, _ = pooled_cache_specs(cfg)
+    cfg.cache_config.block_size = cfg.cache_config.mamba_block_size = layout.block_size
+    cfg.speculative_config = NS(num_speculative_tokens=num_spec)
+    runner = NS(vllm_config=cfg, max_model_len=9216, device=torch.device("cpu"))
+    cache = Qwen4ExpPooledCache(runner, model=None)
+    cache.groups = [
+        replace(
+            g, kv_cache_spec=replace(g.kv_cache_spec, num_speculative_blocks=num_spec)
+        )
+        if isinstance(g.kv_cache_spec, MambaSpec)
+        else g
+        for g in cache.groups
+    ]
+    rows, window = 8, num_spec + 1
+    metadata = AttentionMetadata(
+        input_positions=torch.arange(rows, dtype=torch.int32),
+        query_start_loc=torch.arange(rows + 1, dtype=torch.int32),
+        seq_lens=torch.full((rows,), 600, dtype=torch.int32),
+        request_distribution=torch.tensor([rows] * 3, dtype=torch.int32),
+    )
+    cache.pages = cache.dummy_pages([600] * rows, active_rows=rows)
+    warmup = cache.dummy_metadata(metadata, active_rows=rows)
+    state_groups = [
+        g for g in cache.groups if isinstance(g.kv_cache_spec, MambaSpec)
+    ]
+    assert len(state_groups) > 1
+    items = [warmup[g.layer_names[0]] for g in state_groups]
+    for k, item in enumerate(items):
+        assert isinstance(item, StackedMambaAttentionMetadata) == stacked
+        st, ck = mamba_state_of(item), mamba_ckpt_of(item)
+        assert st.shape == (rows,) and ck.shape == (rows, window)
+        if stacked:
+            assert item.mamba_state_indices is None
+            assert item.mamba_ckpt_indices is None
+            assert item.mamba_state_stack is items[0].mamba_state_stack
+            assert item.mamba_stack_row == k
+            assert item.mamba_slot_read_offsets is not None
+            table = item.block_tables.reshape(rows, -1)
+            assert torch.equal(st, table[:, 0]) and torch.equal(ck, table[:, :window])
+
+    # What serving hands the same groups: one [G, n] / [G, n, W] stack with
+    # the flag, one tensor pair per group without.
+    G = len(items)
+    if stacked:
+        from vllm_torchtpu.layers.core.attention_metadata import (
+            MambaStackRef,
+            stacked_mamba_metadata,
+        )
+
+        s_stack = torch.zeros((G, rows), dtype=torch.int32)
+        c_stack = torch.zeros((G, rows, window), dtype=torch.int32)
+        served = [
+            stacked_mamba_metadata(
+                MambaStackRef(s_stack, c_stack, k), input_positions=None
+            )
+            for k in range(G)
+        ]
+    else:
+        served = [
+            AttentionMetadata(
+                input_positions=None,
+                mamba_state_indices=torch.zeros(rows, dtype=torch.int32),
+                mamba_ckpt_indices=torch.zeros((rows, window), dtype=torch.int32),
+            )
+            for _ in range(G)
+        ]
+
+    def num_graph_inputs(mds):
+        counts = []
+
+        def backend(gm, example_inputs):
+            counts.append(sum(1 for n in gm.graph.nodes if n.op == "placeholder"))
+            return gm
+
+        def forward(x, mds):
+            for md in mds:
+                x = x + mamba_state_of(md).sum() + mamba_ckpt_of(md).sum()
+            return x
+
+        torch._dynamo.reset()
+        torch.compile(forward, backend=backend, fullgraph=True)(torch.zeros(()), mds)
+        torch._dynamo.reset()
+        return counts[0]
+
+    assert num_graph_inputs(items) == num_graph_inputs(served)
