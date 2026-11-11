@@ -43,13 +43,17 @@ class _Sampler:
 
     def __init__(self):
         self.calls: list[tuple[int, int]] = []
-        self.variants: list[tuple[int, bool]] = []
+        self.variants: list[tuple[int, bool, bool]] = []
 
     def __call__(self, *, draft_token_ids, num_draft_tokens, **kwargs):
         self.calls.append((draft_token_ids.shape[0], num_draft_tokens.shape[0]))
         if kwargs.get("do_sampling"):
             self.variants.append(
-                (kwargs.get("topk_candidates", 0), kwargs.get("apply_topk_topp", True))
+                (
+                    kwargs.get("topk_candidates", 0),
+                    kwargs.get("apply_topk_topp", True),
+                    kwargs.get("apply_top_k", True),
+                )
             )
         return draft_token_ids
 
@@ -92,9 +96,9 @@ def _sweep(monkeypatch, flag, rank=3):
     runner, calls = _runner()
     TPUModelRunner._precompile_rejection_sampler(runner)  # type: ignore[arg-type]
     # Each warmup shape runs the greedy verify path and the non-greedy one with
-    # and without top-k/top-p.
-    assert calls[::3] == calls[1::3] == calls[2::3]
-    return calls[::3]
+    # and without top-k/top-p and with top-p only.
+    assert calls[::4] == calls[1::4] == calls[2::4] == calls[3::4]
+    return calls[::4]
 
 
 # The reachable (padded_logits_length, padded_num_reqs) pairs for these
@@ -136,15 +140,16 @@ def test_flag_starts_each_local_rank_at_its_share_of_the_sweep(monkeypatch, rank
 def test_non_greedy_warmups_are_the_random_sampler_variants(monkeypatch, blocks):
     """Each shape warms the non-greedy verify path once per
     random_sampler_variants entry, the list _precompile_sample_from_logits
-    warms too, so a new variant reaches both precompiles."""
+    warms too, so a new variant reaches both precompiles, plus the top-p-only
+    graph (_sampler_applies_top_k)."""
     monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda out: None)
     monkeypatch.delenv(FLAG, raising=False)
     runner, _ = _runner()
     runner._topk_candidate_blocks = lambda: blocks
     TPUModelRunner._precompile_rejection_sampler(runner)  # type: ignore[arg-type]
-    assert runner.rejection_sampler.variants == (
-        random_sampler_variants(blocks) * len(PAIRS)
-    )
+    per_shape = [(*v, True) for v in random_sampler_variants(blocks)]
+    per_shape.append((0, True, False))
+    assert runner.rejection_sampler.variants == per_shape * len(PAIRS)
 
 
 def _recording(fn, graphs, also=None):
@@ -254,12 +259,12 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
         # Drop the recording backend's entries so later tests compile afresh.
         torch._dynamo.reset()
 
-    # Each shape compiles the random path with and without top-k/top-p, plus
-    # the top-k candidate variant when that path is on.
+    # Each shape compiles the random path with and without top-k/top-p and
+    # with top-p only, plus the top-k candidate variant when that path is on.
     shapes = len(sampler_graphs["_greedy_rejection_sample_with_segment"])
     assert shapes > 0
     assert len(sampler_graphs["_random_rejection_sample_with_segment"]) == shapes * (
-        3 if optional_paths else 2
+        4 if optional_paths else 3
     )
     # The optional paths ran only when enabled.
     assert bool(token_graphs) == optional_paths
