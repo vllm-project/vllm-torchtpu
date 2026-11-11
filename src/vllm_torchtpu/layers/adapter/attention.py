@@ -1173,9 +1173,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
         dcp_rank: int,
         kv_head_replicas: int,
         max_query_len: int,
+        uniform_blocks: bool = False,
     ) -> None:
         """Keep this (drafter, sliding-window) layer's KV DCP-sharded like the
         target's (`cp_draft_attention`) instead of whole on every rank.
+        ``uniform_blocks``: every forward holds ``max_query_len`` query rows
+        per request (`cp_draft_attention.attend_cached`).
 
         The rank is a buffer of `layer`, so every rank traces one program.
         """
@@ -1205,6 +1208,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 causal=self.use_causal_mask,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                uniform_blocks=uniform_blocks,
             ),
         )
 

@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.layers.adapter.cp_draft_attention import (
+    attend_block,
     attend_cached,
     attend_cached_reference,
 )
@@ -73,3 +74,42 @@ def test_attend_cached_matches_reference(dcp, kv_heads, dtype, scale):
         np.testing.assert_allclose(
             np.asarray(got_lse), np.asarray(want_lse), rtol=1e-5, atol=1e-5
         )
+
+
+@pytest.mark.parametrize("dcp, kv_heads", [(2, 1), (8, 4)])
+def test_uniform_blocks_match_the_general_layout(dcp, kv_heads):
+    """A draft forward's rows (`uniform_blocks`: 7 per request, padding rows
+    after them): the reshaped paths equal the general ones, a request without
+    cached tokens (the draft's padding requests) included."""
+    rng = np.random.default_rng(1)
+    block, num_reqs, num_tokens = 7, 4, 32
+    words = -(-2 * kv_heads // 4)
+    cache = jnp.asarray(
+        rng.standard_normal((64, 128, words, 4, 128)), jnp.float32
+    ).astype(jnp.float8_e4m3fn)
+    seq_lens = jnp.asarray([3000, 7, 700, 135], jnp.int32)
+    cu_q_lens = jnp.arange(num_reqs + 1, dtype=jnp.int32) * block
+    tables = jnp.asarray(rng.integers(1, 64, (num_reqs, 32)), jnp.int32)
+    q = jnp.asarray(rng.standard_normal((num_tokens, 16, 128)), jnp.bfloat16)
+    key = jnp.asarray(rng.standard_normal((num_tokens, kv_heads, 128)), jnp.bfloat16)
+    value = jnp.asarray(rng.standard_normal((num_tokens, kv_heads, 128)), jnp.bfloat16)
+    for rank in range(dcp):
+        outs = [
+            attend_cached(
+                q, cache, seq_lens, tables, cu_q_lens, kv_heads=kv_heads,
+                max_query_len=block, sliding_window=512, sm_scale=0.088, dcp=dcp,
+                rank=jnp.int32(rank), interpret=True, uniform_blocks=uniform,
+            )
+            for uniform in (False, True)
+        ]
+        for got, want in zip(outs[1], outs[0]):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    blocks = [
+        attend_block(
+            q, key, value, seq_lens, cu_q_lens, max_query_len=block,
+            sm_scale=0.088, causal=False, uniform_blocks=uniform,
+        )
+        for uniform in (False, True)
+    ]
+    for got, want in zip(blocks[1], blocks[0]):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))

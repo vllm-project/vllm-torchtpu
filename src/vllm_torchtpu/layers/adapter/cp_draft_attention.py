@@ -351,13 +351,16 @@ def attend_cached(
     k_scale: float | None = None,
     v_scale: float | None = None,
     interpret: bool = False,
+    uniform_blocks: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Partial attention of ``q [T, H, D]`` (every query head of the group,
     head ``i`` reading KV head ``i * G // H``) over the cached tokens of the
     window held by this rank. Returns ``(out [T, H, D], lse [T, H] f32)``;
     ``lse`` is -inf where the rank holds none of a token's window.
 
-    A request's query tokens are at most `max_query_len` (the draft block).
+    A request's query tokens are at most `max_query_len` (the draft block);
+    with ``uniform_blocks`` every request has exactly that many, request
+    ``r`` at rows ``r * max_query_len`` on (`_uniform_rows`).
     """
     num_tokens = q.shape[0]
     q_lens, cache_lens, blocks, pages = _window_pages(
@@ -387,11 +390,28 @@ def attend_cached(
         interpret=interpret,
     )
     # Back to token order.
-    seq, _, valid = _token_layout(seq_lens, cu_q_lens, num_tokens)
-    col = jnp.clip(jnp.arange(num_tokens) - cu_q_lens[seq], 0, max_query_len - 1)
+    if uniform_blocks:
+        valid = _uniform_rows(seq_lens.shape[0], max_query_len, num_tokens)
+        lse_t = _pad_rows(lse.reshape(-1, lse.shape[-1]), num_tokens, _NEG_INF)
+    else:
+        seq, _, valid = _token_layout(seq_lens, cu_q_lens, num_tokens)
+        col = jnp.clip(jnp.arange(num_tokens) - cu_q_lens[seq], 0, max_query_len - 1)
+        lse_t = jnp.where(valid[:, None], lse[seq, col], _NEG_INF)
     out_t = jnp.where(valid[:, None, None], out, 0.0)
-    lse_t = jnp.where(valid[:, None], lse[seq, col], _NEG_INF)
     return out_t.astype(q.dtype), lse_t
+
+
+def _uniform_rows(num_reqs: int, block: int, num_tokens: int) -> jax.Array:
+    """Which of ``num_tokens`` rows belong to a request when ``num_reqs``
+    requests of exactly ``block`` tokens lead them (the rest is padding)."""
+    assert num_reqs * block <= num_tokens, (num_reqs, block, num_tokens)
+    return jnp.arange(num_tokens) < num_reqs * block
+
+
+def _pad_rows(x: jax.Array, num_rows: int, value: float) -> jax.Array:
+    """``x`` with rows of ``value`` appended up to ``num_rows``."""
+    pad = [(0, num_rows - x.shape[0])] + [(0, 0)] * (x.ndim - 1)
+    return jnp.pad(x, pad, constant_values=value)
 
 
 def attend_pages(
@@ -468,8 +488,9 @@ def attend_pages(
         def copies(req, dst):
             """(condition or None for always, copy) pairs fetching a request's
             pages and query rows."""
-            # A padding request (no query tokens) fetches and computes nothing.
-            live = qlen_ref[req] > 0
+            # A request with no cached tokens (a draft's padding rows) has
+            # nothing to fetch or attend.
+            live = cache_ref[req] > 0
             pages = [
                 (
                     live,
@@ -616,7 +637,12 @@ def attend_pages(
                 lse = jnp.where(denom > 0, m_safe + jnp.log(safe), _NEG_INF)
                 lse_ref[0, g] = jnp.sum(jnp.where(diag, lse, 0.0), axis=0, keepdims=True)
 
-        pl.when(qlen_ref[r] > 0)(attend)
+        pl.when(cache_ref[r] > 0)(attend)
+
+        @pl.when(cache_ref[r] == 0)
+        def _():
+            o_buf[slot] = jnp.zeros(o_buf.shape[1:], o_buf.dtype)
+            lse_ref[...] = jnp.full(lse_ref.shape, _NEG_INF, lse_ref.dtype)
 
         # The rows go out while the next requests compute; a slot's copies are
         # waited for before it is refilled, the last two at the end.
@@ -760,21 +786,35 @@ def attend_block(
     max_query_len: int,
     sm_scale: float,
     causal: bool = True,
+    uniform_blocks: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Attention of each request's query tokens (``q [T, H, D]``) over its
     own new K/V (``[T, G, D]``), causal or over the whole block. The block is
-    shorter than the window. Returns ``(out, lse)``."""
+    shorter than the window. Returns ``(out, lse)``. ``uniform_blocks`` as in
+    `attend_cached`: the requests' blocks are reshapes of the leading rows."""
     num_tokens, num_heads, head_dim = q.shape
     kv_heads = key.shape[1]
     max_seqs = seq_lens.shape[0]
-    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     slot = jnp.arange(max_query_len)
-    tok = jnp.minimum(cu_q_lens[:-1, None] + slot[None, :], num_tokens - 1)
-    tok_valid = slot[None, :] < q_lens[:, None]
     group = num_heads // kv_heads
-    qr = q[tok].astype(jnp.float32).reshape(max_seqs, max_query_len, kv_heads, group, head_dim)
-    k = key[tok].astype(jnp.float32)  # [R, Q, G, D]
-    v = value[tok].astype(jnp.float32)
+    if uniform_blocks:
+        valid = _uniform_rows(max_seqs, max_query_len, num_tokens)
+        lead = max_seqs * max_query_len
+        blocks = (max_seqs, max_query_len)
+        q_blocks = q[:lead].reshape(*blocks, num_heads, head_dim)
+        k_blocks = key[:lead].reshape(*blocks, kv_heads, head_dim)
+        v_blocks = value[:lead].reshape(*blocks, kv_heads, head_dim)
+        tok_valid = jnp.ones(blocks, dtype=bool)
+    else:
+        q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+        tok = jnp.minimum(cu_q_lens[:-1, None] + slot[None, :], num_tokens - 1)
+        tok_valid = slot[None, :] < q_lens[:, None]
+        q_blocks, k_blocks, v_blocks = q[tok], key[tok], value[tok]
+    qr = q_blocks.astype(jnp.float32).reshape(
+        max_seqs, max_query_len, kv_heads, group, head_dim
+    )
+    k = k_blocks.astype(jnp.float32)  # [R, Q, G, D]
+    v = v_blocks.astype(jnp.float32)
     s = jnp.einsum("rqgxd,rkgd->rqgxk", qr, k) * sm_scale
     visible = tok_valid[:, None, :] & tok_valid[:, :, None]
     if causal:
@@ -788,6 +828,11 @@ def attend_block(
     lse = jnp.where(l > 0, m_safe + jnp.log(jnp.where(l > 0, l, 1.0)), _NEG_INF)
     out = out.reshape(max_seqs, max_query_len, num_heads, head_dim)
     lse = lse.reshape(max_seqs, max_query_len, num_heads)
+    if uniform_blocks:
+        out_t = _pad_rows(out.reshape(-1, num_heads, head_dim), num_tokens, 0.0)
+        lse_t = _pad_rows(lse.reshape(-1, num_heads), num_tokens, _NEG_INF)
+        out_t = jnp.where(valid[:, None, None], out_t, 0.0)
+        return out_t.astype(q.dtype), lse_t
     seq, _, valid = _token_layout(seq_lens, cu_q_lens, num_tokens)
     col = jnp.clip(jnp.arange(num_tokens) - cu_q_lens[seq], 0, max_query_len - 1)
     out_t = jnp.where(valid[:, None, None], out[seq, col], 0.0)
@@ -829,14 +874,24 @@ def build_ops(
     causal: bool,
     k_scale: float | None,
     v_scale: float | None,
+    uniform_blocks: bool = False,
 ) -> dict[str, Any]:
-    """The write, cached-attention and block ops of one draft layer."""
+    """The write, cached-attention and block ops of one draft layer.
+    ``uniform_blocks``: every forward's query rows are ``max_query_len``
+    tokens per request (`attend_cached`)."""
     return dict(
         write=_write_op(dcp, k_scale, v_scale),
         attend=_attend_op(
-            kv_heads, max_query_len, sliding_window, sm_scale, dcp, k_scale, v_scale
+            kv_heads,
+            max_query_len,
+            sliding_window,
+            sm_scale,
+            dcp,
+            k_scale,
+            v_scale,
+            uniform_blocks,
         ),
-        block=_block_op(max_query_len, sm_scale, causal),
+        block=_block_op(max_query_len, sm_scale, causal, uniform_blocks),
     )
 
 
@@ -881,6 +936,7 @@ def _attend_op(
     dcp: int,
     k_scale: float | None,
     v_scale: float | None,
+    uniform_blocks: bool,
 ):
     from torch_tpu._internal import pallas
 
@@ -906,11 +962,12 @@ def _attend_op(
             rank=dcp_rank[0],
             k_scale=k_scale,
             v_scale=v_scale,
+            uniform_blocks=uniform_blocks,
         )
 
     name = (
         f"pallas::dcp_draft_attend_g{kv_heads}_q{max_query_len}_w{sliding_window}"
-        f"_s{sm_scale:.8f}_d{dcp}_k{k_scale}_v{v_scale}"
+        f"_s{sm_scale:.8f}_d{dcp}_k{k_scale}_v{v_scale}_u{int(uniform_blocks)}"
     ).replace(".", "p")
     op = pallas.jax_op(name, _attend)
     op.register_fake(
@@ -923,7 +980,9 @@ def _attend_op(
 
 
 @functools.cache
-def _block_op(max_query_len: int, sm_scale: float, causal: bool):
+def _block_op(
+    max_query_len: int, sm_scale: float, causal: bool, uniform_blocks: bool
+):
     from torch_tpu._internal import pallas
 
     def _block(
@@ -938,12 +997,14 @@ def _block_op(max_query_len: int, sm_scale: float, causal: bool):
         out, lse = attend_block(
             q, key, value, seq_lens, query_start_loc,
             max_query_len=max_query_len, sm_scale=sm_scale, causal=causal,
+            uniform_blocks=uniform_blocks,
         )
         return merge(ctx_out.astype(out.dtype), ctx_lse, out, lse)[0]
 
-    name = f"pallas::dcp_draft_block_q{max_query_len}_s{sm_scale:.8f}_c{int(causal)}".replace(
-        ".", "p"
-    )
+    name = (
+        f"pallas::dcp_draft_block_q{max_query_len}_s{sm_scale:.8f}_c{int(causal)}"
+        f"_u{int(uniform_blocks)}"
+    ).replace(".", "p")
     op = pallas.jax_op(name, _block)
     op.register_fake(lambda q, *args: torch.empty_like(q))
     return op

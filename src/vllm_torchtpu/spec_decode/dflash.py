@@ -323,6 +323,8 @@ class DFlashProposer:
                             dcp_rank=get_dcp_group().rank_in_group,
                             kv_head_replicas=self._draft_kv_head_replicas(),
                             max_query_len=self.block_size,
+                            # `_get_static_attn_tensors`: block_size rows each.
+                            uniform_blocks=True,
                         )
                     attn_impl.initialize_kernel(attn_obj)
 
