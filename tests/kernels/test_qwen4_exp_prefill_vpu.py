@@ -42,6 +42,8 @@ def test_feature_parsing(monkeypatch):
         ("", ()),
         ("0", ()),
         ("1", ("mask", "qk16", "pv16")),
+        ("2", ("mask", "qk16", "pv16", "qkfirst")),
+        ("qkfirst", ("mask", "qkfirst")),
         ("mask", ("mask",)),
         ("qk16", ("mask", "qk16")),
         ("pv16", ("mask", "pv16")),
