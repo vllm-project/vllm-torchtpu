@@ -669,8 +669,14 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
 
 
 class GDNChunkedComputeTest(parameterized.TestCase):
-    def test_chunked_gdn_per_seq_shared_kq_heads_matches_recurrent_ref(self):
-        n_kq, n_v, chunk, d = 2, 16, 16, 128
+    @parameterized.named_parameters(
+        dict(testcase_name="qwen3_8_paired", n_kq=2, n_v=16),
+        dict(testcase_name="odd_v_per_kq_unpaired", n_kq=2, n_v=6),
+    )
+    def test_chunked_gdn_per_seq_shared_kq_heads_matches_recurrent_ref(
+        self, n_kq: int, n_v: int
+    ):
+        chunk, d = 16, 128
         k0, k1, k2, k3, k4, k5 = jax.random.split(jax.random.key(41), 6)
         q = compute_gdn.l2_norm(jax.random.normal(k0, (n_kq, chunk, d))) * (d**-0.5)
         k = compute_gdn.l2_norm(jax.random.normal(k1, (n_kq, chunk, d)))
@@ -709,6 +715,17 @@ class GDNChunkedComputeTest(parameterized.TestCase):
 
         np.testing.assert_allclose(out, ref_out.swapaxes(0, 1), rtol=1e-5, atol=1e-5)
         np.testing.assert_allclose(state, ref_state[0], rtol=1e-5, atol=1e-5)
+
+    def test_pack_unpack_v_head_pairs_roundtrip(self):
+        """Packing and unpacking Qwen 3.8 V-head pairs along lanes is exact."""
+        n_kq, n_v, d_k, d_v = 8, 64, 128, 128
+        v_per_kq = n_v // n_kq
+        x = jax.random.normal(jax.random.key(53), (n_v, d_k, d_v))
+        packed = compute_gdn._pack_v_head_pairs(x, v_per_kq)
+        self.assertEqual(packed.shape, (n_v // 2, d_k, 2 * d_v))
+        unpacked = compute_gdn._unpack_v_head_pairs(packed, v_per_kq)
+        self.assertEqual(unpacked.shape, x.shape)
+        self.assertEqual(float(jnp.max(jnp.abs(unpacked - x))), 0.0)
 
 
 @pytest.mark.tpu_test
