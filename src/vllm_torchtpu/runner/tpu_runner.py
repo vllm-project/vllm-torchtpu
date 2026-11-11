@@ -6834,8 +6834,7 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 # (all_greedy, topk_candidates, apply_topk_topp): the random
                 # path has a no-top-k/top-p graph next to the full one
-                # (_sampler_applies_topk_topp), with or without speculative
-                # decoding.
+                # (_sampler_applies_topk_topp).
                 variants = [(False, 0, True), (False, 0, False), (True, 0, True)]
                 if blocks := self._topk_candidate_blocks():
                     variants.append((False, blocks, True))
@@ -8837,15 +8836,9 @@ class TPUModelRunner(GPUModelRunner):
     def _sampler_applies_topk_topp(self) -> bool:
         """False when no running request sets top-k or top-p.
 
-        `apply_top_k_top_p` runs two 31-step bisections over the whole
-        vocabulary per row (7.5 ms for 512 verify rows on Flash) and is the
-        identity for top_k == 0 and top_p == 1.0, the vLLM defaults; vLLM's
-        GPU sampler skips it in the same case, keyed on the same
-        `InputBatch.no_top_k` / `no_top_p`. The samplers skip it on a
-        separate compiled graph that the precompiles warm next to the full
-        one, with or without speculative decoding. Skipping is exact: on
-        all-False predicates the full path's `torch.where` returns the
-        unmasked logits bit for bit.
+        Skipping `apply_top_k_top_p` is then bit-exact: every row reaches the
+        sampler with top_k == 0 and top_p == 1.0, where its `torch.where`
+        calls return the unmasked logits unchanged.
         """
         return not (self.input_batch.no_top_k and self.input_batch.no_top_p)
 
@@ -9036,7 +9029,7 @@ class TPUModelRunner(GPUModelRunner):
                 scaled_logits, top_k, top_p, topk_candidates
             )
         else:
-            # No request sets top-k/top-p: skip the two 31-step vocabulary
+            # No request sets top-k/top-p: skip the two 32-step vocabulary
             # bisections (separate graph, warmed in the precompile).
             masked_logits = scaled_logits
         u_clamped = torch.clamp(
