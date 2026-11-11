@@ -72,7 +72,7 @@ def device_report(trace_dir: str, tag: str) -> None:
             for o in ops:
                 if st <= o[0] < st + du:
                     tot[re.sub(r"\.\d+$", "", o[2].split(" = ")[0])[:48]] += o[1]
-        for k, v in tot.most_common(14):
+        for k, v in tot.most_common(40):
             print(f"{tag}   {v / len(big) / 1e3:7.1f} us  {k}", flush=True)
 
 

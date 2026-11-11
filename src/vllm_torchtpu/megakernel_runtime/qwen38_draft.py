@@ -28,6 +28,7 @@ the HC mix weights stay BF16 (`hc_fp8=False`), the experts as checkpointed.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import jax
@@ -38,7 +39,7 @@ from torch import nn
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel import kernel
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
+from vllm_torchtpu.megakernel.exec_spec import DebugOptions, ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
 from vllm_torchtpu.megakernel.wholestep.qsa_full import KV_NEW
 from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW
@@ -110,6 +111,8 @@ def build_draft_call(
         R=R, B=B, T=T, ctx=128,
         tiles=wholestep_tiles(B, max_groups) if tiles is None else tiles,
         interpret=interpret,
+        # VLLM_TPU_MK_SCOPES=N: per-phase named scopes in the kernel (profiling only).
+        debug=DebugOptions(scopes=int(os.environ.get("VLLM_TPU_MK_SCOPES", "0") or 0)),
     )
     spec = draft_spec(g, R, budget=budget, max_groups=max_groups, vocab_shard=vocab_shard)
     fn, k_specs, _, n_w = make_flat_segment_step(
