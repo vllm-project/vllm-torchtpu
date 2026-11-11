@@ -908,15 +908,26 @@ def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
     last._async_drafter.run_dp_dummy_draft.assert_called_once_with(3)
 
 
-def test_one_mtp_prefill_warmup_builds_prefill_without_decode():
+@pytest.mark.parametrize("unified", [False, True])
+def test_one_mtp_prefill_warmup_builds_prefill_without_decode(unified):
     executed = []
     runner = SimpleNamespace(
         max_model_len=64,
+        vllm_config=SimpleNamespace(),
+        is_unified_pool_used=lambda: unified,
         kv_cache_config=SimpleNamespace(
             num_blocks=100,
             kv_cache_groups=[
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=8)),
+                SimpleNamespace(
+                    kv_cache_spec=SimpleNamespace(
+                        max_num_blocks_per_req=lambda cfg, n: (n + 15) // 16
+                    )
+                ),
+                SimpleNamespace(
+                    kv_cache_spec=SimpleNamespace(
+                        max_num_blocks_per_req=lambda cfg, n: (n + 7) // 8
+                    )
+                ),
             ],
         ),
         execute_model=MagicMock(side_effect=lambda so: executed.append(so)),
@@ -935,7 +946,9 @@ def test_one_mtp_prefill_warmup_builds_prefill_without_decode():
     request = scheduler_output.scheduled_new_reqs[0]
     assert request.req_id == "__mtp_prefill_warmup__"
     assert len(request.prompt_token_ids) == 31
-    assert request.block_ids == ([98, 99], [96, 97, 98, 99])
+    assert request.block_ids == (
+        ([98, 99], [94, 95, 96, 97]) if unified else ([98, 99], [96, 97, 98, 99])
+    )
     assert scheduler_output.scheduled_cached_reqs.req_ids == []
     runner.sample_tokens.assert_called_once_with(None)
     runner.take_draft_token_ids.assert_called_once_with()
@@ -4182,3 +4195,64 @@ class TestLogitsAtDpVocabRows:
             TPUModelRunner._logits_at_dp_vocab_rows(
                 runner, torch.zeros(9, 2), torch.arange(9)
             )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("k", [1, 2, 3, 4])
+def test_unified_mamba_offsets_preserve_every_request_on_device(device, k):
+    """Each owner must resume each row at its own accepted prefix."""
+    groups, requests, padded = 37, 5, 8
+    runner = SimpleNamespace(
+        mamba_slot_read_offsets=torch.zeros(512, dtype=torch.int32, device=device)
+    )
+    blocks = torch.arange(1, groups * requests + 1).reshape(groups, requests)
+    indices = [
+        torch.nn.functional.pad(row, (0, padded - requests)).to(device)
+        for row in blocks
+    ]
+    for shift in range(k + 1):
+        accepted = (torch.arange(requests) + shift) % (k + 1)
+        tokens = torch.where(
+            torch.arange(k + 1)[None, :] <= accepted[:, None], 42, INVALID_TOKEN_ID
+        ).to(device)
+        TPUModelRunner._update_mamba_slot_read_offsets(
+            runner, indices, tokens, requests
+        )
+        actual = runner.mamba_slot_read_offsets.cpu()
+        torch.testing.assert_close(
+            actual[blocks], accepted.expand(groups, -1).to(torch.int32)
+        )
+        assert actual[0] == 0
+        assert not actual[groups * requests + 1 :].any()
+
+
+@pytest.mark.parametrize(
+    "role, expected",
+    [("kv_producer", True), ("kv_consumer", False), ("kv_both", False)],
+)
+def test_cp1_mtp_producer_only_fills_draft_prefix(role, expected):
+    parallel = SimpleNamespace(pipeline_parallel_size=1)
+    transfer = SimpleNamespace(kv_role=role)
+    assert TPUModelRunner._prefill_only_mtp(parallel, False, True, transfer) is expected
+    assert not TPUModelRunner._prefill_only_mtp(parallel, False, False, transfer)
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 4, 16])
+def test_prefill_only_mtp_request_classification(monkeypatch, count):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.runner import tpu_runner
+
+    runner = object.__new__(TPUModelRunner)
+    runner.input_batch = SimpleNamespace(num_reqs=1, req_ids=["prefill"])
+    runner._mtp_prefill_only = True
+    monkeypatch.setattr(
+        tpu_runner.mla_dispatch, "maybe_order_prefills_by_kv_len", lambda *args: None
+    )
+    scheduled = SimpleNamespace(
+        num_scheduled_tokens={"prefill": count},
+        scheduled_spec_decode_tokens={},
+    )
+    expected = (1, 1) if count == 1 else (0, 0)
+    assert runner._reorder_batch_for_rpa(scheduled) == expected
+    assert runner._num_static_verify_reqs == 0

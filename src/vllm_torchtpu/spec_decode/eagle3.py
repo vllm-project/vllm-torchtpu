@@ -1265,7 +1265,11 @@ class Eagle3Proposer:
         if num_reqs == 0:
             return []
 
-        K = self.speculative_config.num_speculative_tokens
+        K = (
+            1
+            if self.runner._mtp_prefill_only
+            else self.speculative_config.num_speculative_tokens
+        )
 
         chunks = self.draft_chunks
         if not chunks:
@@ -2383,7 +2387,11 @@ class Eagle3Proposer:
         collectives, so there is nothing for an idle rank to pair with and the
         forwards would be pure wasted device time.
         """
-        K = self.speculative_config.num_speculative_tokens
+        K = (
+            1
+            if self.runner._mtp_prefill_only
+            else self.speculative_config.num_speculative_tokens
+        )
         if not self._dp_lockstep_sharded() or num_chunks * K == 0:
             return
         self._draft_md_cache.clear()

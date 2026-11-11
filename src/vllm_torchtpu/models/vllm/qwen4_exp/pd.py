@@ -42,6 +42,7 @@ class TransferGroup:
     block_size: int
     extent: TransferExtent
     checkpointed: bool = False
+    request_state_pages: int = 1
 
     def page_count(self, committed_tokens: int) -> int:
         if committed_tokens < 0:
@@ -88,8 +89,28 @@ def build_transfer_groups(
         }
         if len(checkpointed) != 1:
             raise ValueError("A transfer group needs one state checkpoint convention")
+        state_page_counts = {
+            1 + spec.num_speculative_blocks if isinstance(spec, MambaSpec) else 1
+            for spec in specs
+        }
+        if len(state_page_counts) != 1:
+            raise ValueError("A request-state group needs one checkpoint page count")
+        if any(
+            isinstance(spec, MambaSpec)
+            and spec.num_speculative_blocks
+            and spec.mamba_cache_mode != "none"
+            for spec in specs
+        ):
+            raise NotImplementedError("Qwen MTP PD request state requires APC off")
         result.append(
-            TransferGroup(index, names, sizes.pop(), extents.pop(), checkpointed.pop())
+            TransferGroup(
+                index,
+                names,
+                sizes.pop(),
+                extents.pop(),
+                checkpointed=checkpointed.pop(),
+                request_state_pages=state_page_counts.pop(),
+            )
         )
     if not result:
         raise ValueError("Qwen PD requires a nonempty cache-group plan")

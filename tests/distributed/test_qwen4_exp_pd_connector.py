@@ -58,8 +58,15 @@ def stage3(monkeypatch):
         monkeypatch.setenv(name, value)
 
 
-def connector(config, *, state_first=False):
+def connector(config, *, state_first=False, k=0):
     groups = cache_groups()
+    for index in (3, 4):
+        groups[index] = replace(
+            groups[index],
+            kv_cache_spec=replace(
+                groups[index].kv_cache_spec, num_speculative_blocks=k
+            ),
+        )
     if state_first:
         groups = groups[2:] + groups[:2]
     caches = KVCacheConfig(num_blocks=64, kv_cache_tensors=[], kv_cache_groups=groups)
@@ -114,7 +121,8 @@ def test_execution_switches_do_not_replace_required_transfer_contract(option):
             connector(cfg)
         return
     elif option == "mtp":
-        cfg.speculative_config = object()
+        cfg.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=3)
+        cfg.kv_transfer_config.kv_role = "kv_producer"
     else:
         name = {
             "pcp": "prefill_context_parallel_size",
@@ -581,6 +589,9 @@ def _registered_qwen_pool(
     feature=None,
     gather_fault=None,
     text_overrides=None,
+    k=0,
+    draft_scales=(0.5, 0.25),
+    draft_head_size_delta=0,
 ):
     import torch
 
@@ -612,12 +623,19 @@ def _registered_qwen_pool(
         setattr(worker.vllm_config.parallel_config, feature, 2)
     text_overrides = text_overrides or {}
     config, materialized = live_pool(
-        tp=tp, ssm=ssm_dtype, num_blocks=blocks, **text_overrides
+        tp=tp, ssm=ssm_dtype, num_blocks=blocks, k=k, **text_overrides
     )
     from tests.runner.test_qwen4_exp_pool import pool_config
     from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
 
     cache_config = pool_config(tp=tp, ssm=ssm_dtype)
+    if k:
+        cache_config.speculative_config = SimpleNamespace(
+            method="mtp", num_speculative_tokens=k
+        )
+        cache_config.cache_config.enable_prefix_caching = False
+        cache_config.cache_config.mamba_cache_mode = "none"
+        worker.vllm_config.speculative_config = cache_config.speculative_config
     for key, value in text_overrides.items():
         setattr(cache_config.model_config.hf_text_config, key, value)
     cache = Qwen4ExpPooledCache.__new__(Qwen4ExpPooledCache)
@@ -654,6 +672,27 @@ def _registered_qwen_pool(
             ]
         ),
     )
+    if k:
+        cache.draft_model = SimpleNamespace(
+            model=SimpleNamespace(
+                layers=[
+                    SimpleNamespace(
+                        layer_type="indexed_attention",
+                        self_attn=SimpleNamespace(
+                            _k_scale_float=draft_scales[0],
+                            _v_scale_float=draft_scales[1],
+                            _k_scale_cpu=torch.tensor(draft_scales[0]),
+                            _v_scale_cpu=torch.tensor(draft_scales[1]),
+                        ),
+                    )
+                ]
+            )
+        )
+        for name, spec in cache.specs.items():
+            if name.startswith("mtp.") and name.endswith(".self_attn"):
+                cache.specs[name] = replace(
+                    spec, head_size=spec.head_size + draft_head_size_delta
+                )
     worker.vllm_config.additional_config = dict(
         qwen4_exp=dict(
             ple_host_backend="torch" if producer else "native_dma",
@@ -1129,3 +1168,270 @@ def test_non_grouped_replay_does_not_read_released_metadata(monkeypatch):
     )
     worker._submit_stage3_loads(meta, cast("KVCacheManager", _FakeRaidenEngine()))
     worker._dispatch_stage3_load_submit.assert_not_called()
+
+
+def mtp_connector(*, producer=True, k=3):
+    cfg = _make_vllm_config(is_producer=producer)
+    cfg.kv_transfer_config.kv_role = "kv_producer" if producer else "kv_consumer"
+    cfg.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=k)
+    return connector(cfg, k=k)
+
+
+def mtp_request(req_id="qwen", tail=33):
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.request import Request
+
+    return Request(req_id, [11, 22, tail], SamplingParams(max_tokens=1), None)
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_mtp_seed_precedes_send_and_publishes_only_committed_pages(k):
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    obj = mtp_connector(k=k)
+    request = mtp_request()
+    obj.on_new_request(request)
+    assert request.prompt_token_ids == [11, 22]
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {request.request_id: 2}
+    meta = obj.build_connector_meta(output)
+    assert not meta.reqs_to_send
+    assert meta.draft_prompt_seeds == {request.request_id: 33}
+    tables = ([1], [2], [3], list(range(4, 5 + k)), list(range(10, 11 + k)))
+    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    request.num_computed_tokens = 2
+    delay, params = obj.request_finished_all_groups(request, tables)
+    assert delay and params["num_tokens"] == 2
+    assert len(params["qwen_mtp_prompt_digest"]) == 64
+    meta = obj.build_connector_meta(output)
+    assert meta.draft_prompt_seeds == {}
+    assert meta.reqs_to_send[request.request_id].group_block_ids == [
+        [1],
+        [2],
+        [3],
+        [4],
+        [10],
+    ]
+
+
+@pytest.mark.parametrize("fault", [None, "tail", "prefix", "missing"])
+def test_mtp_consumer_binds_the_complete_prompt_before_transfer_admission(fault):
+    source = mtp_connector()
+    prompt = mtp_request("source")
+    source.on_new_request(prompt)
+    prompt.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    prompt.num_computed_tokens = 2
+    _, params = source.request_finished_all_groups(
+        prompt, ([1], [2], [3], [4, 5, 6, 7], [10, 11, 12, 13])
+    )
+    dest = mtp_connector(producer=False)
+    request = mtp_request("dest", tail=34 if fault == "tail" else 33)
+    if fault == "prefix":
+        request.prompt_token_ids[0] = 12
+    if fault == "missing":
+        params.pop("qwen_mtp_prompt_digest")
+    request.kv_transfer_params = params
+    dest.on_new_request(request)
+    matched, asynchronous = dest.get_num_new_matched_tokens(request, 0)
+    scheduler = dest.connector_scheduler
+    if fault:
+        assert (matched, asynchronous) == (0, False)
+        assert scheduler._stage3_active_source_req_ids == {}
+        release = scheduler.reqs_to_load[request.request_id]
+        assert release.release_only and not release.report_completion
+        assert release.group_block_ids is None
+        from vllm.v1.core.sched.output import SchedulerOutput
+
+        released = dest.build_connector_meta(SchedulerOutput.make_empty())
+        assert released.reqs_to_load == {request.request_id: release}
+        assert not dest.build_connector_meta(SchedulerOutput.make_empty()).reqs_to_load
+        assert not dest._draft_prompt_seeds
+    else:
+        assert (matched, asynchronous) == (2, True)
+        assert scheduler._stage3_active_source_req_ids == {"source": "dest"}
+
+
+def test_mtp_seed_clears_on_abort_and_request_id_reuse():
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    obj = mtp_connector()
+    request = mtp_request()
+    obj.on_new_request(request)
+    output = SchedulerOutput.make_empty()
+    output.finished_req_ids = {request.request_id}
+    assert obj.build_connector_meta(output).draft_prompt_seeds == {}
+    obj.on_new_request(mtp_request(tail=77))
+    # Abort/resubmit can appear in the same scheduler output.
+    output.scheduled_new_reqs = [SimpleNamespace(req_id=request.request_id)]
+    output.num_scheduled_tokens = {request.request_id: 1}
+    assert obj.build_connector_meta(output).draft_prompt_seeds == {
+        request.request_id: 77
+    }
+
+
+@pytest.mark.parametrize("role,method", [("kv_both", "mtp"), ("kv_producer", "eagle3")])
+def test_mtp_connector_rejects_unimplemented_roles_and_drafters(role, method):
+    cfg = _make_vllm_config()
+    cfg.kv_transfer_config.kv_role = role
+    cfg.speculative_config = SimpleNamespace(method=method, num_speculative_tokens=3)
+    with pytest.raises(NotImplementedError, match="explicit producer or consumer"):
+        connector(cfg, k=3)
+
+
+@pytest.mark.parametrize(
+    "change", [None, "ring_capacity", "draft_scale", "draft_encoding"]
+)
+def test_actual_mtp_cache_contract_binds_wire_scales_and_encoding(monkeypatch, change):
+    ratio = 2 if change == "ring_capacity" else 4
+    producer = _registered_qwen_pool(
+        monkeypatch, k=1, text_overrides=dict(indexer_compress_ratio=ratio)
+    )
+    consumer = _registered_qwen_pool(
+        monkeypatch,
+        producer=False,
+        k=3,
+        text_overrides=dict(indexer_compress_ratio=ratio),
+        draft_scales=(0.75, 0.25) if change == "draft_scale" else (0.5, 0.25),
+        draft_head_size_delta=128 if change == "draft_encoding" else 0,
+    )
+    assert (
+        producer.worker._raiden_layout_fingerprint
+        == consumer.worker._raiden_layout_fingerprint
+    ) is (change is None)
+    semantics = producer.worker._qwen_semantics
+    assert semantics["ranks"][0]["draft"] == {
+        "kv_scales": [(0, 0.5, 0.25)],
+    }
+
+
+@pytest.mark.parametrize("option", ["pcp", "dcp", "pp", "apc"])
+def test_mtp_pd_rejects_unimplemented_state_lifecycles(option):
+    cfg = _make_vllm_config()
+    cfg.kv_transfer_config.kv_role = "kv_producer"
+    cfg.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=3)
+    if option == "apc":
+        cfg.cache_config.enable_prefix_caching = True
+    else:
+        field = {
+            "pcp": "prefill_context_parallel_size",
+            "dcp": "decode_context_parallel_size",
+            "pp": "pipeline_parallel_size",
+        }[option]
+        setattr(cfg.parallel_config, field, 2)
+    with pytest.raises(
+        NotImplementedError, match="MTP PD requires CP1/PP1 and APC off"
+    ):
+        connector(cfg, k=3)
+
+
+@pytest.mark.parametrize("k", [0, 1, 3])
+def test_state_spans_keep_only_committed_checkpoint(k):
+    from tests.runner.test_qwen4_exp_pd_manifest import live_pool
+    from vllm_torchtpu.distributed.kv_transfer.connector_metadata import SendMeta
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd import (
+        TransferExtent,
+        build_transfer_groups,
+    )
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_connector import (
+        Qwen4ExpRaidenWorker,
+        QwenPagePlan,
+    )
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_manifest import build_transfer_manifest
+
+    config, materialized = live_pool(k=k, num_blocks=256)
+    plan = QwenPagePlan(
+        build_transfer_groups(config.kv_cache_groups),
+        build_transfer_manifest(config, materialized),
+    )
+    worker = object.__new__(Qwen4ExpRaidenWorker)
+    worker.tp_rank, worker.tp_size = 0, 1
+    worker._qwen_page_plan = plan
+    cursor, tables = 1, []
+    for group in plan.groups:
+        count = group.page_count(129)
+        tables.append(list(range(cursor, cursor + count)))
+        cursor += count
+    send = SendMeta(
+        uuid=1,
+        expiration_time=9999999999,
+        num_tokens=129,
+        local_block_ids=tables[0],
+        group_block_ids=tables,
+    )
+    _, spans = worker._stage3_grouped_spans(send, 129)
+    for (pool, index), registration in zip(plan.pool_groups(), spans):
+        token_pages = plan.groups[index].extent is TransferExtent.TOKEN_PAGES
+        assert registration.dst_space_version == int(token_pages)
+        assert [
+            (s.dst_block_index, s.dst_offset_bytes) for s in registration.spans
+        ] == [
+            (0, ordinal * pool.block_stride_bytes) if token_pages else (0, 0)
+            for ordinal in range(len(tables[index]))
+        ]
+
+
+@pytest.mark.parametrize("producer_k,consumer_k", [(1, 3), (3, 1), (3, 3)])
+def test_actual_mtp_depths_share_wire_contract_and_keep_local_allocation(
+    monkeypatch, producer_k, consumer_k
+):
+    producer = _registered_qwen_pool(monkeypatch, k=producer_k, blocks=5)
+    consumer = _registered_qwen_pool(
+        monkeypatch, producer=False, k=consumer_k, blocks=7
+    )
+    assert (
+        producer.worker._raiden_layout_fingerprint
+        == consumer.worker._raiden_layout_fingerprint
+    )
+    assert (
+        producer.worker._raiden_layout_fingerprint_payload
+        == consumer.worker._raiden_layout_fingerprint_payload
+    )
+    for peer, k, capacity in [(producer, producer_k, 5), (consumer, consumer_k, 7)]:
+        cache = peer.runner.model_adapter.cache
+        assert cache.native_config.num_blocks == capacity
+        state_specs = [s for s in cache.specs.values() if isinstance(s, MambaSpec)]
+        assert state_specs and all(s.num_speculative_blocks == k for s in state_specs)
+        rings = {n: s for n, s in cache.specs.items() if n.endswith(".raw_ring")}
+        assert any(n.startswith("mtp.") for n in rings)
+        assert all(s.block_size == 8 for s in rings.values())
+        groups = Qwen4ExpRaidenConnector._build_stage3_transfer_groups(
+            cache.native_config
+        )
+        for group in groups:
+            if not group.request_state:
+                continue
+            ids = list(range(1, group.request_state_pages + 1))
+            assert group.page_count(129) == 1
+            assert group.committed_state_page(ids, 129) == 1
+            for invalid in [ids[:-1], ids + [group.request_state_pages + 1]]:
+                with pytest.raises(ValueError, match="exactly"):
+                    group.committed_state_page(invalid, 129)
+
+
+@pytest.mark.parametrize("producer_k,consumer_k", [(1, 3), (3, 1), (3, 3)])
+def test_mtp_depth_mismatch_publishes_one_state_page(producer_k, consumer_k):
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    producer = mtp_connector(k=producer_k)
+    prompt = mtp_request("source")
+    producer.on_new_request(prompt)
+    prompt.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    prompt.num_computed_tokens = 2
+    source_tables = [
+        [1],
+        [2],
+        [3],
+        list(range(4, 5 + producer_k)),
+        list(range(10, 11 + producer_k)),
+    ]
+    delay, params = producer.request_finished_all_groups(prompt, source_tables)
+    assert delay
+    send = producer.build_connector_meta(SchedulerOutput.make_empty()).reqs_to_send[
+        "source"
+    ]
+    assert send.group_block_ids == [[1], [2], [3], [4], [10]]
+    consumer = mtp_connector(producer=False, k=consumer_k)
+    request = mtp_request("dest")
+    request.kv_transfer_params = params
+    consumer.on_new_request(request)
+    assert consumer.get_num_new_matched_tokens(request, 0) == (2, True)

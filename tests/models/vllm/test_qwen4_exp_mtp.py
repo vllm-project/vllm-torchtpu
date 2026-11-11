@@ -474,3 +474,26 @@ def test_mtp_mapper_filters_target_and_preserves_weight_payload(prefix):
     assert len(mapped) == 1
     assert mapped[0][0] == "model.fc_hidden.weight"
     assert mapped[0][1] is weight
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+def test_mtp_admission_with_model_owned_pd(monkeypatch, k, role):
+    for name in ("QWEN35", "KIMIK3", "GLM", "DSV4"):
+        monkeypatch.setenv(f"TPU_RAIDEN_{name}_ADMISSION", "0")
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    cfg = config(tp=1, dp=8)
+    cfg.speculative_config = NS(
+        method="mtp", num_speculative_tokens=k, draft_tensor_parallel_size=1
+    )
+    cfg.kv_transfer_config = NS(
+        kv_connector="Qwen4ExpRaidenConnector",
+        kv_connector_module_path=None,
+        kv_role=role,
+    )
+    cfg.cache_config.cache_dtype = "fp8_e4m3"
+    cfg.cache_config.mamba_ssm_cache_dtype = "bfloat16"
+    validate_config(cfg)
+    cfg.kv_transfer_config.kv_role = "kv_both"
+    with pytest.raises(ValueError, match="producer or consumer role"):
+        validate_config(cfg)

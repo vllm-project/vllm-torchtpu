@@ -78,3 +78,5 @@ class TPUConnectorMetadata(KVConnectorMetadata):
     # Producer request id -> transfer uuid whose ahead-of-finish request-block
     # registration every pipeline stage retires.
     reqs_to_release: dict[ReqId, int] = field(default_factory=dict)
+    # Model-owned boundary seeds, available before finish-time sends exist.
+    draft_prompt_seeds: dict[ReqId, int] = field(default_factory=dict)

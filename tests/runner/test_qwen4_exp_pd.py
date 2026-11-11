@@ -155,11 +155,13 @@ def test_state_capacity_flags_accept_only_an_explicit_committed_snapshot(fields)
         kv_cache_spec=replace(groups[3].kv_cache_spec, **fields),
     )
     plan = build_transfer_groups(groups)
-    tables = [[1], [2], [3], [4], [5]]
+    count = 1 + fields.get("num_speculative_blocks", 0)
+    assert plan[3].request_state_pages == count
+    tables = [[1], [2], [3], [4], [10]]
     assert handoff_block_ids(
         plan, tables, committed_tokens=127, computed_tokens=127
     ) == tuple(tuple(t) for t in tables)
-    for state_ids in ([], [4, 9]):
+    for state_ids in ([], list(range(4, 5 + count))):
         with pytest.raises(ValueError, match="needs 1 pages"):
             handoff_block_ids(
                 plan,
@@ -229,3 +231,22 @@ def test_plan_covers_the_native_qwen_scheduler_groups(tp):
                 group.page_count(8191)
                 == (8191 + spec.block_size - 1) // spec.block_size
             )
+
+
+@pytest.mark.parametrize("k", [0, 1, 3])
+def test_mtp_wire_uses_one_state_page_without_changing_allocation(k):
+    groups = cache_groups()
+    for i in (3, 4):
+        groups[i] = replace(
+            groups[i],
+            kv_cache_spec=replace(groups[i].kv_cache_spec, num_speculative_blocks=k),
+        )
+    plan = build_transfer_groups(groups)
+    assert [g.request_state_pages for g in plan] == [1, 1, 1, k + 1, k + 1]
+    assert [g.page_count(129) for g in plan] == [2, 2, 1, 1, 1]
+    tables = [[1, 2], [3, 4], [5], [6], [10]]
+    handoff_block_ids(plan, tables, committed_tokens=129, computed_tokens=129)
+    if k:
+        tables[3] = list(range(6, 7 + k))
+        with pytest.raises(ValueError, match="needs 1 pages"):
+            handoff_block_ids(plan, tables, committed_tokens=129, computed_tokens=129)

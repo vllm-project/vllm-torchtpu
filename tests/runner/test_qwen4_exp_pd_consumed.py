@@ -87,6 +87,7 @@ def model_builder(monkeypatch):
         settings = SimpleNamespace(
             model_config=SimpleNamespace(hf_text_config=text, max_model_len=32),
             kv_transfer_config=object(),
+            speculative_config=None,
             additional_config={},
             device_config=SimpleNamespace(device="cpu"),
             cache_config=SimpleNamespace(cache_dtype="fp8"),
@@ -147,7 +148,9 @@ def test_actual_model_normalized_layers_bind_loaded_scale_identity(
     worker.vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     worker.vllm_config.cache_config.mamba_ssm_cache_dtype = "bfloat16"
     runner = SimpleNamespace(
-        model_adapter=SimpleNamespace(cache=SimpleNamespace(model=model, specs={}))
+        model_adapter=SimpleNamespace(
+            cache=SimpleNamespace(model=model, specs={}, draft_model=None)
+        )
     )
     monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
     monkeypatch.setattr(
@@ -215,3 +218,56 @@ def test_pd_uses_the_same_public_weight_loaders(model_builder, pd_enabled):
         torch.testing.assert_close(value, before[name], rtol=0, atol=0)
     for name, value in weights:
         torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
+def test_real_mtp_attention_registry_admits_prefill_only(model_builder, monkeypatch):
+    from vllm.config import get_current_vllm_config, get_layers_from_vllm_config
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec
+
+    from tests.runner.test_qwen4_exp_pool import pool_config
+    from vllm_torchtpu.models.vllm.qwen4_exp import mtp
+    from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    target = model_builder(["indexed_attention"])
+    config = pool_config()
+    config.model_config.hf_text_config = target.config
+    config.model_config.max_model_len = 32
+    config.model_config.head_dtype = None
+    config.cache_config.enable_prefix_caching = False
+    config.cache_config.mamba_cache_mode = "none"
+    config.compilation_config = get_current_vllm_config().compilation_config
+    config.device_config = DeviceConfig(device="cpu")
+    config.quant_config = None
+    config.speculative_config = SimpleNamespace(
+        num_speculative_tokens=3,
+        method="mtp",
+        use_eagle=lambda: True,
+        use_eagle_block_drop=lambda: False,
+    )
+    monkeypatch.setattr(mtp, "GatedResidual", lambda *args, **kwargs: nn.Identity())
+    before = set(get_layers_from_vllm_config(config, AttentionLayerBase))
+    from vllm.model_executor.layers import linear
+
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 1)
+    draft = mtp.Qwen4ExpMultiTokenPredictor(config, prefix="mtp")
+    registered = get_layers_from_vllm_config(config, AttentionLayerBase)
+    names = set(registered) - before
+    assert names == {draft.attention_prefix}
+    assert isinstance(
+        registered[draft.attention_prefix].get_kv_cache_spec(config), FullAttentionSpec
+    )
+    assert isinstance(
+        registered[draft.attention_prefix].get_auxiliary_cache_specs()["raw_ring"],
+        CircularBufferSpec,
+    )
+    runner = SimpleNamespace(vllm_config=config, cache_config=config.cache_config)
+    cache = Qwen4ExpPooledCache(runner, target)
+    specs = cache.get_specs()
+    proposer = object.__new__(Eagle3Proposer)
+    proposer.runner = SimpleNamespace(get_kv_cache_spec=cache.get_specs)
+    proposer._validate_prefill_only_draft_model(names)
+    assert isinstance(specs[draft.attention_prefix], FullAttentionSpec)
+    assert isinstance(specs[draft.attention_prefix + ".raw_ring"], CircularBufferSpec)

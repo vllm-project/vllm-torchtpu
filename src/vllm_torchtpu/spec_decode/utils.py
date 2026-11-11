@@ -27,6 +27,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.utils import PPMissingLayer
 
+from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
+    TPUConnectorMetadata,
+)
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
     SequenceLayoutPlan,
@@ -159,18 +162,26 @@ def handoff_seed_tokens(
     A Stage-3 producer drops the last prompt token for the decode peer to
     compute and samples a throwaway token in its place. The draft layer's KV
     row at the prompt boundary has to be built from the real continuation,
-    which the send published in this step carries as
-    ``SendMeta.next_prompt_token_id``. Requests without such a send keep the
-    sampled seed.
+    supplied by model-owned ``draft_prompt_seeds`` before the final forward.
+    Register-ahead connectors may instead publish it in
+    ``SendMeta.next_prompt_token_id``. Requests without either keep the sampled
+    seed; a nonfinal prefill chunk later substitutes its real next prompt token.
     """
-    reqs_to_send = getattr(metadata, "reqs_to_send", None)
-    if not reqs_to_send:
+    reqs_to_send = getattr(metadata, "reqs_to_send", None) or {}
+    prompt_seeds = (
+        metadata.draft_prompt_seeds
+        if isinstance(metadata, TPUConnectorMetadata)
+        else {}
+    )
+    if not reqs_to_send and not prompt_seeds:
         return device_seed
     indices: list[int] = []
     tokens: list[int] = []
     for index, req_id in enumerate(req_ids):
         send = reqs_to_send.get(req_id)
-        token = None if send is None else getattr(send, "next_prompt_token_id", None)
+        token = prompt_seeds.get(req_id)
+        if token is None and send is not None:
+            token = getattr(send, "next_prompt_token_id", None)
         if token is not None:
             indices.append(index)
             tokens.append(int(token))

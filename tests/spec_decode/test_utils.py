@@ -201,3 +201,16 @@ def test_fit_rows_returns_slices_or_pads_the_leading_dim():
     out = utils.fit_rows(t, 6, value=-1)
     assert out.dtype == torch.int32 and out.shape == (6, 2)
     assert torch.equal(out[:4], t) and out[4:].eq(-1).all()
+
+
+def test_handoff_seed_is_available_before_finish_time_send():
+    from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
+        TPUConnectorMetadata,
+    )
+
+    metadata = TPUConnectorMetadata(draft_prompt_seeds={"b": 77})
+    assert metadata.reqs_to_send == {}
+    seed = torch.tensor([11, 22, 33], dtype=torch.int32)
+    out = utils.handoff_seed_tokens(seed, ["a", "b", "c"], metadata)
+    assert out.tolist() == [11, 77, 33]
+    assert seed.tolist() == [11, 22, 33]

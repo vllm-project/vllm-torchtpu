@@ -1337,6 +1337,7 @@ def test_run_dp_dummy_draft_loop_bucket_below_num_reqs_max_model_len(monkeypatch
     proposer.runner = SimpleNamespace(
         _dp_target_bucket=64,
         _dp_step_max_reqs=5,
+        _mtp_prefill_only=False,
         num_reqs_max_model_len=64,
         max_num_reqs=64,
         num_tokens_paddings=[16, 32, 64],
@@ -3236,3 +3237,74 @@ def test_draft_greedy_tokens_use_regular_logits(dp_vocab):
     got = inspect.unwrap(Eagle3Proposer._draft_propose_token)(proposer, hidden)
     assert torch.equal(got, logits.argmax(-1).to(torch.int32))
     proposer.draft_model.compute_logits.assert_called_once_with(hidden)
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("num_chunks", [1, 3])
+def test_mtp_pd_producer_busy_and_idle_only_execute_step_zero(
+    monkeypatch, k, num_chunks
+):
+    full = _lockstep_draft_trace(
+        monkeypatch, "mtp", k, num_chunks, num_chunks, prefill_only=True
+    )
+    forwards = [event for event in full if event[0] == "forward"]
+    assert forwards == [("forward", 0, 64)] * num_chunks
+    assert sum(event[0] == "lm_head" for event in full) == num_chunks
+    for num_real in range(num_chunks):
+        assert (
+            _lockstep_draft_trace(
+                monkeypatch, "mtp", k, num_chunks, num_real, prefill_only=True
+            )
+            == full
+        )
+
+
+@pytest.mark.parametrize("final_chunk", [False, True])
+def test_mtp_pd_chunk_seed_uses_real_next_prompt_token(final_chunk):
+    import inspect
+    from types import MethodType
+
+    from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
+        TPUConnectorMetadata,
+    )
+    from vllm_torchtpu.spec_decode.utils import handoff_seed_tokens
+
+    prompt = [11, 22, 33, 44, 55]
+    start = 2 if final_chunk else 0
+    proposer = _make_proposer(method="mtp")
+    proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=True,
+        input_batch=SimpleNamespace(req_ids=["request"]),
+        requests={
+            "request": SimpleNamespace(
+                num_computed_tokens=start, get_token_id=prompt.__getitem__
+            )
+        },
+        device=torch.device("cpu"),
+        num_tokens_paddings=[16, 32],
+        _dp_lockstep_enabled=lambda: False,
+    )
+    # Exercise the production seed/scatter function without compiling CPU tensors
+    # through the TPU backend. Device compilation is covered separately.
+    proposer._draft_seed_input_ids = MethodType(
+        inspect.unwrap(Eagle3Proposer._draft_seed_input_ids), proposer
+    )
+    chunk = _make_chunk(
+        input_ids=torch.tensor(prompt[start : start + 2] + [0] * 14, dtype=torch.int32),
+        position_ids=torch.arange(16, dtype=torch.int32) + start,
+        query_start_loc_np=np.array([0, 2], dtype=np.int32),
+        start_index=0,
+        num_reqs=1,
+        device=torch.device("cpu"),
+    )
+    meta = TPUConnectorMetadata(draft_prompt_seeds={"request": prompt[-1]})
+    seed = handoff_seed_tokens(torch.tensor([999]), ["request"], meta)
+    ids, _, _, _ = proposer._prepare_draft_inputs(
+        chunk,
+        [],
+        [] if final_chunk else [0],
+        None,
+        SimpleNamespace(num_scheduled_tokens={"request": 2}),
+        device_seed=seed,
+    )
+    assert ids[:2].tolist() == prompt[start + 1 : start + 3]

@@ -17,9 +17,11 @@ Native admission binds cache encoding, loaded KV scales and measured page layout
 This connector does not borrow another model's native pool admission.
 """
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
@@ -43,6 +45,7 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
 )
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
     SendMeta,
+    TPUConnectorMetadata,
     TPURaidenConnector,
     TPURaidenConnectorWorker,
     _prefix_aware_load_enabled,
@@ -57,6 +60,16 @@ from vllm_torchtpu.gdn_pool_layout import (
 
 from .pd import TransferExtent, TransferGroup, build_transfer_groups, handoff_block_ids
 from .pd_manifest import build_transfer_manifest, measure_transfer_layout
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.request import Request
+
+
+def _prompt_digest(token_ids: list[int]) -> str:
+    return hashlib.sha256(
+        json.dumps(token_ids, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 class Qwen4ExpRaidenConnector(TPURaidenConnector):
@@ -77,10 +90,30 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
             )
         ):
             raise ValueError("Qwen PD cannot use another model's pool admission")
+        spec = vllm_config.speculative_config
+        self._mtp = spec is not None
+        transfer = vllm_config.kv_transfer_config
+        assert transfer is not None
+        if spec is not None and (
+            spec.method != "mtp"
+            or transfer.kv_role not in ("kv_producer", "kv_consumer")
+        ):
+            raise NotImplementedError(
+                "Qwen PD supports MTP with an explicit producer or consumer"
+            )
+        parallel = vllm_config.parallel_config
+        if self._mtp and (
+            parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or vllm_config.cache_config.enable_prefix_caching
+        ):
+            raise NotImplementedError("Qwen MTP PD requires CP1/PP1 and APC off")
+        self._draft_prompt_seeds: dict[str, int] = {}
         super().__init__(vllm_config, role, kv_cache_config)
         if (
             vllm_config.cache_config.enable_prefix_caching
-            and vllm_config.kv_transfer_config.is_kv_consumer
+            and transfer.is_kv_consumer
             and not _prefix_aware_load_enabled()
         ):
             raise ValueError("Qwen APC+PD requires enabled Stage-3 prefix-aware loads")
@@ -95,6 +128,70 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         ):
             raise ValueError("Qwen whole-page PD needs token-page-aligned APC hits")
 
+    def on_new_request(self, request: "Request") -> None:
+        self._draft_prompt_seeds.pop(request.request_id, None)
+        scheduler = self.connector_scheduler
+        assert scheduler is not None
+        if self._mtp:
+            assert request.prompt_token_ids is not None
+            params = request.kv_transfer_params
+            if scheduler.is_producer:
+                if params is None:
+                    params = request.kv_transfer_params = {}
+                if not params.get("_p_side_truncated"):
+                    params["qwen_mtp_prompt_digest"] = _prompt_digest(
+                        request.prompt_token_ids
+                    )
+            elif params and params.get("uuid") is not None:
+                if params.get("qwen_mtp_prompt_digest") != _prompt_digest(
+                    request.prompt_token_ids
+                ):
+                    scheduler._reject_kv_transfer_params(
+                        request,
+                        params,
+                        "Qwen MTP requires the same complete prompt, "
+                        "including its tail token",
+                    )
+        super().on_new_request(request)
+        if self._mtp and scheduler.is_producer:
+            token = (request.kv_transfer_params or {}).get(
+                "_p_side_next_prompt_token_id"
+            )
+            if token is not None:
+                self._draft_prompt_seeds[request.request_id] = token
+
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> TPUConnectorMetadata:
+        new_ids = {request.req_id for request in scheduler_output.scheduled_new_reqs}
+        for req_id in scheduler_output.finished_req_ids - new_ids:
+            self._draft_prompt_seeds.pop(req_id, None)
+        meta = super().build_connector_meta(scheduler_output)
+        meta.draft_prompt_seeds = {
+            req_id: self._draft_prompt_seeds[req_id]
+            for req_id in scheduler_output.num_scheduled_tokens
+            if req_id in self._draft_prompt_seeds
+        }
+        return meta
+
+    def request_finished_all_groups(
+        self, request: "Request", block_ids: tuple[list[int], ...]
+    ) -> tuple[bool, dict[str, Any] | None]:
+        self._draft_prompt_seeds.pop(request.request_id, None)
+        delay, params = super().request_finished_all_groups(request, block_ids)
+        if self._mtp and delay:
+            assert params is not None and request.kv_transfer_params is not None
+            params["qwen_mtp_prompt_digest"] = request.kv_transfer_params[
+                "qwen_mtp_prompt_digest"
+            ]
+        return delay, params
+
+    def request_finished(
+        self, request: "Request", block_ids: list[int]
+    ) -> tuple[bool, dict[str, Any] | None]:
+        self._draft_prompt_seeds.pop(request.request_id, None)
+        return super().request_finished(request, block_ids)
+
     @staticmethod
     def _build_stage3_transfer_groups(
         config: KVCacheConfig,
@@ -105,6 +202,7 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
                 page_tokens=group.block_size,
                 request_state=group.extent is TransferExtent.REQUEST_STATE,
                 checkpointed=group.checkpointed,
+                request_state_pages=group.request_state_pages,
             )
             for group in build_transfer_groups(config.kv_cache_groups)
         )
@@ -200,24 +298,8 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             raise RuntimeError("Qwen PD native admission must finish before transfer")
         return self._raiden_transfer_engine
 
-    def _collect_pd_semantics(self, runner) -> dict[str, Any]:
-        cache = runner.model_adapter.cache
-        model = cache.model
-        cache_specs: dict[str, dict[str, Any]] = {}
-        for name, spec in cache.specs.items():
-            if isinstance(spec, MambaSpec):
-                cache_specs[name] = dict(
-                    shapes=spec.shapes, dtypes=[str(dtype) for dtype in spec.dtypes]
-                )
-            elif isinstance(spec, AttentionSpec):
-                cache_specs[name] = dict(
-                    block_size=spec.block_size,
-                    num_kv_heads=spec.num_kv_heads,
-                    head_size=spec.head_size,
-                    dtype=str(spec.dtype),
-                )
-            else:
-                raise ValueError("Qwen PD has an unsupported logical cache encoding")
+    @staticmethod
+    def _loaded_qsa_scales(model):
         scales = []
         for index, layer in enumerate(model.model.layers):
             if layer.layer_type == "indexed_attention":
@@ -236,10 +318,31 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 scales.append((index, k, v))
         if not scales:
             raise ValueError("Qwen PD requires loaded indexed-attention KV scales")
+        return scales
+
+    def _collect_pd_semantics(self, runner) -> dict[str, Any]:
+        cache = runner.model_adapter.cache
+        model = cache.model
+        cache_specs: dict[str, dict[str, Any]] = {}
+        for name, spec in cache.specs.items():
+            if isinstance(spec, MambaSpec):
+                cache_specs[name] = dict(
+                    shapes=spec.shapes, dtypes=[str(dtype) for dtype in spec.dtypes]
+                )
+            elif isinstance(spec, AttentionSpec):
+                cache_specs[name] = dict(
+                    block_size=spec.block_size,
+                    num_kv_heads=spec.num_kv_heads,
+                    head_size=spec.head_size,
+                    dtype=str(spec.dtype),
+                )
+            else:
+                raise ValueError("Qwen PD has an unsupported logical cache encoding")
+        scales = self._loaded_qsa_scales(model)
         group = get_tp_group()
         if group.world_size != self.tp_size or group.rank_in_group != self.tp_rank:
             raise ValueError("Qwen PD cache shards differ from the local TP group")
-        record = dict(
+        record: dict[str, Any] = dict(
             rank=group.rank_in_group,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -250,6 +353,8 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 gdn_granule_bytes=GRANULE_BYTES,
             ),
         )
+        if cache.draft_model is not None:
+            record["draft"] = dict(kv_scales=self._loaded_qsa_scales(cache.draft_model))
         records: list[Any] = [None] * group.world_size
         torch.distributed.all_gather_object(records, record, group=group.cpu_group)
         if (

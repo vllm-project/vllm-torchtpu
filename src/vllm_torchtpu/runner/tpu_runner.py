@@ -43,6 +43,7 @@ from jax.sharding import Mesh
 from packaging import version
 from vllm.config import (
     CUDAGraphMode,
+    KVTransferConfig,
     ParallelConfig,
     VllmConfig,
     get_layers_from_vllm_config,
@@ -692,16 +693,23 @@ class TPUModelRunner(GPUModelRunner):
 
     @staticmethod
     def _prefill_only_mtp(
-        parallel_config: ParallelConfig, pcp_enabled: bool, mtp_enabled: bool
+        parallel_config: ParallelConfig,
+        pcp_enabled: bool,
+        mtp_enabled: bool,
+        transfer_config: KVTransferConfig | None = None,
     ) -> bool:
         """Whether MTP runs over prefill chunks only, never verifying.
 
-        A context-parallel or pipeline-parallel producer drafts to fill the
-        draft layer's KV for a decode peer, so the decode/verify programs
+        A PD, context-parallel or pipeline-parallel producer drafts to fill
+        the draft layer's KV for a decode peer, so the decode/verify programs
         are never compiled or warmed (`_warmup_mtp_prefill`).
         """
         return mtp_enabled and (
-            pcp_enabled or parallel_config.pipeline_parallel_size > 1
+            pcp_enabled
+            or parallel_config.pipeline_parallel_size > 1
+            or (
+                transfer_config is not None and transfer_config.kv_role == "kv_producer"
+            )
         )
 
     @property
@@ -755,7 +763,10 @@ class TPUModelRunner(GPUModelRunner):
         # instead of sampling; stages after the first take them as input.
         self._pp_is_first, self._pp_is_last = pp_rank_flags(vllm_config.parallel_config)
         self._mtp_prefill_only = self._prefill_only_mtp(
-            vllm_config.parallel_config, self._pcp_enabled, self._mtp_enabled
+            vllm_config.parallel_config,
+            self._pcp_enabled,
+            self._mtp_enabled,
+            vllm_config.kv_transfer_config,
         )
         sequence_layout_planner = create_sequence_layout_planner(vllm_config)
         if sequence_layout_planner.requires_backend_preinit:
@@ -5614,8 +5625,8 @@ class TPUModelRunner(GPUModelRunner):
                     if self._mtp_prefill_only:
                         # The producer's sample at the prompt boundary is
                         # thrown away; the draft row there takes the token the
-                        # consumer computes, carried by this step's published
-                        # send.
+                        # consumer computes, supplied before this forward by
+                        # connector metadata (or a register-ahead send).
                         flat_seed = handoff_seed_tokens(
                             flat_seed, req_ids, scheduler_output.kv_connector_metadata
                         )
@@ -5703,7 +5714,11 @@ class TPUModelRunner(GPUModelRunner):
                 ) = self._assemble_async_spec_substitution(
                     eagle3_drafts, next_tokens_per_chunk, state
                 )
-            elif self._is_async_drafter and next_tokens_tpu_chunks:
+            elif (
+                self._is_async_drafter
+                and not self._mtp_prefill_only
+                and next_tokens_tpu_chunks
+            ):
                 # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
                 # branch parked a stride-1 source (sampled token only). Rebuild
                 # it as a stride-(1+K) [bonus, draft_1..K] source carrying real
@@ -7558,19 +7573,21 @@ class TPUModelRunner(GPUModelRunner):
         assert self.kv_cache_config is not None
         top = int(self.kv_cache_config.num_blocks)
         block_ids_per_group = []
-        max_nblk = 0
+        cursor = top
+        unified = self.is_unified_pool_used()
         for group in self.kv_cache_config.kv_cache_groups:
-            group_block_size = int(group.kv_cache_spec.block_size)
-            group_num_blocks = min(
-                cdiv(max_pos, group_block_size),
-                cdiv(self.max_model_len, group_block_size),
+            group_num_blocks = group.kv_cache_spec.max_num_blocks_per_req(
+                self.vllm_config, max_pos
             )
-            block_ids_per_group.append(list(range(top - group_num_blocks, top)))
-            max_nblk = max(max_nblk, group_num_blocks)
-        if top <= max_nblk + 1:
+            # Native unified pools share physical block IDs across groups.
+            # Each state group also owns all K+1 checkpoint pages.
+            start = cursor - group_num_blocks if unified else top - group_num_blocks
+            block_ids_per_group.append(list(range(start, start + group_num_blocks)))
+            cursor = start if unified else min(cursor, start)
+        if cursor <= 1:
             raise RuntimeError(
                 "MTP prefill warmup has not enough KV blocks for its "
-                f"synthetic request: num_blocks={top}, required>{max_nblk + 1}"
+                f"synthetic request: num_blocks={top}, required>{top - cursor + 1}"
             )
 
         attempt_succeeded = True

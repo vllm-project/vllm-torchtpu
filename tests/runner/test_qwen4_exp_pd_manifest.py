@@ -14,6 +14,7 @@
 """Live carrier binding; CPU bytes do not prove the TPU physical layout."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -29,8 +30,18 @@ from vllm_torchtpu.models.vllm.qwen4_exp.pool_allocation import materialize_pool
 from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
 
 
-def live_pool(tp=1, device="cpu", num_blocks=64, ssm="bfloat16", **text_overrides):
+def live_pool(tp=1, device="cpu", num_blocks=64, ssm="bfloat16", k=0, **text_overrides):
     cfg = pool_config(tp=tp, ssm=ssm)
+    cfg.speculative_config = (
+        SimpleNamespace(
+            num_speculative_tokens=k,
+            method="mtp",
+            use_eagle=lambda: True,
+            use_eagle_block_drop=lambda: False,
+        )
+        if k
+        else None
+    )
     # These are normalized text-only pool/transfer fixtures.
     cfg.model_config.hf_text_config.rope_parameters.pop("mrope_section", None)
     cfg.model_config.hf_text_config.rope_parameters.pop("mrope_interleaved", None)
@@ -234,3 +245,24 @@ def test_actual_dual_carriers_follow_owner_tables_and_preserve_other_bytes(extra
     tables[ring_gid] = tables[main_gid][:1]
     with pytest.raises(ValueError, match="overlap"):
         plan.request_pages(tables, tokens)
+
+
+@pytest.mark.parametrize("k", [0, 1, 3])
+def test_mtp_manifest_enumerates_draft_owners_and_checkpoint_geometry(k):
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd import build_transfer_groups
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_connector import QwenPagePlan
+
+    config, live = live_pool(k=k, num_blocks=256)
+    manifest = build_transfer_manifest(config, live)
+    owners = [p.layer_name for p in manifest.pools]
+    draft = "mtp.layers.48.self_attn"
+    assert (draft in owners) is bool(k)
+    if k:
+        assert {draft, draft + ".compressed_k", draft + ".raw_ring"} <= set(owners)
+    groups = build_transfer_groups(config.kv_cache_groups)
+    cursor, tables = 1, []
+    for group in groups:
+        count = group.page_count(129)
+        tables.append(list(range(cursor, cursor + count)))
+        cursor += count
+    QwenPagePlan(groups, manifest).request_pages(tables, num_tokens=129)

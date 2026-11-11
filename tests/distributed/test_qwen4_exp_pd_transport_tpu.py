@@ -86,9 +86,14 @@ def _run_role(role: str, exchange: Path) -> None:
         batch_transfer_d2h_sync([raw], [host])
         return host.numpy()
 
-    ssm_dtype = _receive(exchange / "test-config.json")["ssm_dtype"]
-    capacity = 128 if role == "prefill" else 160
-    config, materialized = live_pool(device="tpu", num_blocks=capacity, ssm=ssm_dtype)
+    settings = _receive(exchange / "test-config.json")
+    ssm_dtype = settings["ssm_dtype"]
+    k = settings["producer_k" if role == "prefill" else "consumer_k"]
+    source_capacity = 256 if settings["producer_k"] else 128
+    capacity = source_capacity if role == "prefill" else source_capacity * 5 // 4
+    config, materialized = live_pool(
+        device="tpu", num_blocks=capacity, ssm=ssm_dtype, k=k
+    )
     manifest = build_transfer_manifest(config, materialized)
     source_bytes, before = [], []
     for raw in manifest.storages:
@@ -162,7 +167,7 @@ def _run_role(role: str, exchange: Path) -> None:
         count = group.page_count(num_tokens)
         pages = list(range(cursor, cursor + count))
         source_tables.append(pages)
-        dest_tables.append([128 - page for page in pages])
+        dest_tables.append([source_capacity - page for page in pages])
         cursor += count
     assert cursor <= config.num_blocks
     load = _Stage3LoadMeta(
@@ -206,7 +211,7 @@ def _run_role(role: str, exchange: Path) -> None:
             address=address,
             fingerprint=fingerprint,
             source_sha256=[
-                hashlib.sha256(x[: 128 * (x.size // capacity)]).hexdigest()
+                hashlib.sha256(x[: source_capacity * (x.size // capacity)]).hexdigest()
                 for x in source_bytes
             ],
             layout=layout,
@@ -224,7 +229,7 @@ def _run_role(role: str, exchange: Path) -> None:
     assert peer["fingerprint"] == fingerprint
     assert peer["page_tokens"] == page_tokens
     assert peer["source_sha256"] == [
-        hashlib.sha256(x[: 128 * (x.size // capacity)]).hexdigest()
+        hashlib.sha256(x[: source_capacity * (x.size // capacity)]).hexdigest()
         for x in source_bytes
     ]
     assert (
@@ -283,6 +288,7 @@ def _run_role(role: str, exchange: Path) -> None:
             owners=len(tags),
             pages=cursor - 1,
             ssm_dtype=ssm_dtype,
+            k=k,
             transferred_bytes=moved,
             compared_bytes=sum(x.size for x in after),
             capacity=capacity,
@@ -295,10 +301,16 @@ def _run_role(role: str, exchange: Path) -> None:
 
 
 @pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
-def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
+@pytest.mark.parametrize("producer_k,consumer_k", [(0, 0), (3, 3), (1, 3)])
+def test_qwen_all_owner_pages_over_native_reshard(
+    tmp_path, ssm_dtype, producer_k, consumer_k
+):
     from tests.distributed.tpu_test_utils import prepare_tpu_environment
 
-    _publish(tmp_path / "test-config.json", dict(ssm_dtype=ssm_dtype))
+    _publish(
+        tmp_path / "test-config.json",
+        dict(ssm_dtype=ssm_dtype, producer_k=producer_k, consumer_k=consumer_k),
+    )
     roles = ("prefill", "decode")
     with patch.dict(os.environ):
         for key in (
@@ -337,7 +349,10 @@ def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
                 time.sleep(0.1)
             assert child.wait() == 0
             records = [_receive(tmp_path / f"{role}-done.json") for role in roles]
-            assert all(record["ssm_dtype"] == ssm_dtype for record in records)
+            assert all(
+                record["ssm_dtype"] == ssm_dtype and record["k"] == k
+                for record, k in zip(records, (producer_k, consumer_k))
+            )
             print("QWEN_NATIVE_PAGE_TRANSFER " + json.dumps(records))
         finally:
             if child.poll() is None:

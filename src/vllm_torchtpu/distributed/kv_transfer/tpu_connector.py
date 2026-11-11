@@ -209,18 +209,28 @@ class _Stage3TransferGroup:
     window_tokens: int | None = None
     request_state: bool = False
     checkpointed: bool = False
+    request_state_pages: int = 1
 
     def committed_state_page(self, block_ids: Sequence[int], num_tokens: int) -> int:
-        """Select the state at the published position, excluding history/scratch."""
+        """Select one committed page, validating the full local state allocation.
+
+        APC publishes the checkpoint for its prefix. Non-APC MTP allocates
+        K+1 slots, but only slot 0 is committed; the consumer owns its scratch.
+        """
         if not self.request_state or num_tokens <= 0:
             raise ValueError("A committed state page requires a positive state extent")
         if self.checkpointed:
             index = (num_tokens - 1) // self.page_tokens
-            if index >= len(block_ids):
+            if index >= len(block_ids) or self.request_state_pages != 1:
                 raise ValueError("Committed state position is absent from its table")
         else:
-            if len(block_ids) != 1:
-                raise ValueError("Request state requires exactly one committed page")
+            if len(block_ids) != self.request_state_pages:
+                count = (
+                    "one committed page"
+                    if self.request_state_pages == 1
+                    else f"{self.request_state_pages} state pages"
+                )
+                raise ValueError(f"Request state requires exactly {count}")
             index = 0
         page = block_ids[index]
         if type(page) is not int or page <= 0:

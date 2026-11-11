@@ -304,8 +304,13 @@ def test_pd_requires_model_owned_fp8_and_geometric_parallelism(
         else:
             validate_config(cfg)
 
-    cfg.speculative_config = SimpleNamespace()
-    with pytest.raises(ValueError, match="MTP"):
+    cfg.speculative_config = SimpleNamespace(
+        method="mtp", num_speculative_tokens=2, draft_tensor_parallel_size=1
+    )
+    if tp != 1:
+        with pytest.raises(ValueError, match="draft_tensor_parallel_size"):
+            validate_config(cfg)
+    else:
         validate_config(cfg)
     cfg.speculative_config = None
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "0")
@@ -348,8 +353,10 @@ def test_real_config_hook_accepts_pd_with_aligned_apc_and_independent_expert_rou
     assert cfg.cache_config.enable_prefix_caching
     assert cfg.cache_config.mamba_cache_mode == "align"
     assert cfg.parallel_config.enable_expert_parallel is expert_parallel
-    cfg.speculative_config = object()
-    with pytest.raises(ValueError, match="no MTP"):
+    cfg.speculative_config = SimpleNamespace(
+        method="mtp", num_speculative_tokens=3, draft_tensor_parallel_size=1
+    )
+    with pytest.raises(ValueError, match="MTP PD requires CP1/PP1 and APC off"):
         validate_config(cfg)
 
 

@@ -232,8 +232,6 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
 
 
 def validate_config(cfg):
-    if cfg.kv_transfer_config is not None and cfg.speculative_config is not None:
-        raise ValueError("Qwen4Exp PD requires no MTP")
     m, p, c, s = (
         cfg.model_config,
         cfg.parallel_config,
@@ -440,6 +438,13 @@ def validate_config(cfg):
             raise ValueError("Qwen4Exp MTP requires a finite positive draft RoPE theta")
     transfer = cfg.kv_transfer_config
     if transfer is not None:
+        if cfg.speculative_config is not None and (
+            c.enable_prefix_caching
+            or p.prefill_context_parallel_size != 1
+            or p.decode_context_parallel_size != 1
+            or p.pipeline_parallel_size != 1
+        ):
+            raise ValueError("Qwen4Exp MTP PD requires CP1/PP1 and APC off")
         connector_module = "vllm_torchtpu.models.vllm.qwen4_exp.pd_connector"
         if (
             transfer.kv_connector != "Qwen4ExpRaidenConnector"
