@@ -581,3 +581,15 @@ def test_dcp_forward_lowers_once_for_every_rank():
         for fn, args in ((score, score_args), (attend, attend_args)):
             lowered = jax.jit(fn).trace(*args).lower(lowering_platforms=("tpu",))
             assert "tpu_custom_call" in lowered.as_text()
+
+
+def test_dcp_op_name_has_no_rank():
+    """The torch op's name (its compile-cache identity) is rank-free."""
+    import inspect
+
+    from vllm_torchtpu.models.minimax_m3.experimental.ops import msa as msa_ops
+
+    params = inspect.signature(msa_ops.get_msa_dcp_op).parameters
+    assert "rank" not in params
+    src = inspect.getsource(msa_ops.get_msa_dcp_op)
+    assert "_r{rank}" not in src and "dcp_rank" in src
