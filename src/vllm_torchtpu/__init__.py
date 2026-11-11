@@ -1527,8 +1527,19 @@ def _patch_vllm_qsa_dcp_fine_prefix_hits() -> None:
             or init_args["dcp_world_size"] != 1
             or init_args["pcp_world_size"] != 1
             or self.scheduler_block_size == hash_block_size
-            # Connectors consume block hashes at block granularity.
-            or (vllm_config is not None and vllm_config.kv_transfer_config is not None)
+            # Connectors consume block hashes at block granularity, unless
+            # VLLM_TPU_QSA_DCP_FINE_PREFIX_CONNECTOR opts in for a CPU
+            # offloading connector: it keys each chunk by its last hash, and
+            # _patch_vllm_offload_fine_prefix_alignment skips the host lookup
+            # after a hit that ends inside a chunk (no CoW/load race).
+            or (
+                vllm_config is not None
+                and vllm_config.kv_transfer_config is not None
+                and not (
+                    envs.VLLM_TPU_QSA_DCP_FINE_PREFIX_CONNECTOR
+                    and _is_offloading_connector(vllm_config.kv_transfer_config)
+                )
+            )
             or not any(
                 isinstance(g.kv_cache_spec, MambaSpec)
                 and g.kv_cache_spec.mamba_cache_mode == "align"
@@ -1538,7 +1549,8 @@ def _patch_vllm_qsa_dcp_fine_prefix_hits() -> None:
         ):
             logger.warning(
                 "VLLM_TPU_QSA_DCP_FINE_PREFIX is set but not applied (needs "
-                "VLLM_TPU_QSA_MAIN_KV_DCP > 1, prefix caching, no KV connector, "
+                "VLLM_TPU_QSA_MAIN_KV_DCP > 1, prefix caching, no KV connector "
+                "unless VLLM_TPU_QSA_DCP_FINE_PREFIX_CONNECTOR=1, "
                 "and a Mamba align group at the hash block); hits stay "
                 "%d-token aligned.",
                 self.scheduler_block_size,
