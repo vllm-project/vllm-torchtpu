@@ -1543,7 +1543,17 @@ def _patch_vllm_block_pool_lifo_free() -> None:
     def free_blocks(self, ordered_blocks) -> None:
         blocks_with_hash = []
         blocks_without_hash = []
+        # A deferred free (KV connector) pops a request's blocks from every
+        # group at once, so the list can hold blocks of another pool, e.g. the
+        # DeepSeek-V4.1 private SWA pool. Return those to their own pool as
+        # upstream BlockPool.free_blocks does; queueing them here would hand
+        # the same block ids out twice.
+        other_pools: dict = {}
         for block in ordered_blocks:
+            pool = getattr(block, "pool", None)
+            if pool is not None and pool is not self:
+                other_pools.setdefault(pool, []).append(block)
+                continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None:
@@ -1552,6 +1562,8 @@ def _patch_vllm_block_pool_lifo_free() -> None:
                     blocks_with_hash.append(block)
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
+        for pool, blocks in other_pools.items():
+            pool.free_blocks(blocks)
 
     BlockPool.free_blocks = free_blocks
     BlockPool._tpu_lifo_free_patch = True
