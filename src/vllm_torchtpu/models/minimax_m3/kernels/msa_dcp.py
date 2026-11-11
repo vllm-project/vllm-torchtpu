@@ -976,3 +976,64 @@ def merge_partials(
         interpret=interpret,
         name="minimax_m3_msa_dcp_merge_partials",
     )(lse.astype(jnp.float32), parts, *([hadamard] if rotated else []))
+
+
+def attend_and_merge(
+    rank: jax.Array,
+    q: jax.Array,
+    kv_cache: jax.Array,
+    candidates: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    scale_cache: jax.Array | None = None,
+    hadamard: jax.Array | None = None,
+    *,
+    axis: str,
+    dcp: int,
+    sm_scale: float,
+    topk: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """The attention half of the DCP forward over one KV head, inside a
+    ``shard_map`` over `axis` (the DCP group): this rank's head-major query
+    heads ``q [Hl, T, D]`` (rotated for a 4-bit cache, then pass its
+    `scale_cache` and `hadamard`) and packed ``candidates [T, 2 * topk]`` ->
+    its heads' merged output ``[T, Hl * D]``.
+
+    The query heads and candidates are all-gathered, `msa_attend_dcp` runs
+    over the group's heads, and each rank's head block of the partial and
+    its LSEs go to their owner by all-to-all for `merge_partials`. As XLA
+    collectives in one program they move the head-major buffers as laid out;
+    torch's all-gather / all-to-all of them cost 157 us / ~890 us per layer
+    at 8K tokens (c4 twin, j-c60806bf)."""
+    num_heads, num_tokens, head_dim = q.shape
+    q_all = jax.lax.all_gather(q, axis, axis=0, tiled=True)
+    cand_all = jax.lax.all_gather(candidates, axis, axis=0)
+    out, lse = msa_attend_dcp(
+        q_all,
+        kv_cache,
+        cand_all,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        sm_scale=sm_scale,
+        topk=topk,
+        rank=rank,
+        dcp=dcp,
+        scale_cache=scale_cache,
+        q_head_major=True,
+        interpret=interpret,
+    )
+    # Block r of each result came from rank r: its partial of this rank's heads.
+    parts = jax.lax.all_to_all(
+        out.reshape(dcp, num_heads, num_tokens, head_dim), axis, 0, 0, tiled=True
+    )
+    lses = jax.lax.all_to_all(
+        lse.reshape(dcp, num_heads, num_tokens).transpose(0, 2, 1),
+        axis,
+        0,
+        0,
+        tiled=True,
+    )
+    return merge_partials(parts, lses, hadamard, interpret=interpret)
