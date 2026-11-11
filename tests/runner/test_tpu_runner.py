@@ -3649,12 +3649,14 @@ def _recording_sampler(record):
 _VOCAB_SIZE = 248320
 
 
-def _precompile_runner(record, speculative_config=None, candidate_blocks=0):
+def _precompile_runner(
+    record, speculative_config=None, candidate_blocks=0, num_reqs_paddings=(2,)
+):
     """A runner stand-in for `_precompile_sample_from_logits` that samples
     through `_recording_sampler(record)`. `candidate_blocks` stands for
     TPU_SAMPLER_TOPK_CANDIDATES, gated on `_VOCAB_SIZE`."""
     return SimpleNamespace(
-        num_reqs_paddings=[2],
+        num_reqs_paddings=list(num_reqs_paddings),
         _hidden_states_dtype=torch.bfloat16,
         device=torch.device("cpu"),
         _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
@@ -3693,19 +3695,23 @@ def test_every_runtime_sampler_variant_is_precompiled(
 ):
     """Every (all_greedy, topk_candidates, apply_topk_topp) graph that
     sampling picks at runtime, random or all-greedy, is one the precompile
-    warms, so serving compiles no sampler graph after warmup. The random path
-    picks from random_sampler_variants, which both precompiles warm."""
+    warms in every num_reqs bucket, so serving compiles no sampler graph after
+    warmup. The random path picks from random_sampler_variants, which both
+    precompiles warm."""
     num_blocks = topk_candidate_blocks(candidate_blocks, _VOCAB_SIZE)
+    num_reqs_paddings = (2, 4)
+    # (num_reqs, (all_greedy, topk_candidates, apply_topk_topp))
     warmed = set()
     TPUModelRunner._precompile_sample_from_logits(
         _precompile_runner(
-            lambda _u, variant: warmed.add(variant),
+            lambda u, variant: warmed.add((u.shape[0], variant)),
             speculative_config,
             candidate_blocks,
+            num_reqs_paddings,
         )
     )
     variants = {(False, *variant) for variant in random_sampler_variants(num_blocks)}
-    assert variants <= warmed
+    assert {(n, v) for n in num_reqs_paddings for v in variants} <= warmed
 
     # vLLM's InputBatch stores vocab_size as the top_k of a request that does
     # not set it.
@@ -3744,7 +3750,8 @@ def test_every_runtime_sampler_variant_is_precompiled(
         ),
         torch.zeros((2, 16), dtype=torch.bfloat16),
     )
-    assert len(greedy) == 1 and greedy[0] in warmed, greedy
+    assert len(greedy) == 1, greedy
+    assert {(n, greedy[0]) for n in num_reqs_paddings} <= warmed, greedy
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
