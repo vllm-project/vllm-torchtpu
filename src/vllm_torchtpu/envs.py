@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_SCATTER_DEEP: bool = False
     VLLM_TPU_MK_STACKED_MAMBA_OPERANDS: bool = False
     VLLM_TPU_MK_BUCKET_TUNE: bool = False
+    VLLM_TPU_MK_DRAFT: bool = False
     VLLM_TPU_MK_QSEL_ASYNC: bool = False
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_MK_WHOLE_L45: bool = False
@@ -1086,6 +1087,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whole-step megakernel: per-row-bucket tile / tunable overrides (BUCKET_TUNE in
     # qwen38_wholestep_call). Layout-only entries keep the bytes; see its comments.
     "VLLM_TPU_MK_BUCKET_TUNE": env_bool("VLLM_TPU_MK_BUCKET_TUNE"),
+    # Whole-step megakernel: the MTP draft step (draft layer, final mixer, lm_head,
+    # greedy pick) as one kernel call per step (megakernel_runtime.qwen38_draft). BF16
+    # draft weights (shipped precision). Needs the whole-step MK and the fused loop.
+    "VLLM_TPU_MK_DRAFT": env_bool("VLLM_TPU_MK_DRAFT"),
     # Whole-step QSA selection: the per-row id copies into SMEM and the new group's
     # loads / stores are issued together and waited once instead of in start-wait
     # pairs (distinct destinations; same bytes).

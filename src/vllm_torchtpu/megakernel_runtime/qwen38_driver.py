@@ -1041,7 +1041,9 @@ class Qwen38SegmentDriver:
             )
         if self.whole:
             self._attach_whole(runner)
-        if self.mtp:
+        if envs.VLLM_TPU_MK_DRAFT:
+            self._attach_mk_draft(runner)
+        elif self.mtp:
             self._attach_mtp_tail(runner)
         if self.check_left > 0:
             shadow_seg = Qwen38Segments(
@@ -1963,6 +1965,41 @@ class Qwen38SegmentDriver:
             return int(ctx.max()) + T_VERIFY <= self.whole_cap
         except Exception:
             return False
+
+    def _attach_mk_draft(self, runner: Any) -> None:
+        """VLLM_TPU_MK_DRAFT: the MTP draft's loop steps (and, from the drafter, step 0)
+        as one whole-step kernel call each (`qwen38_draft.MkDraft`): draft layer, final
+        mixer, lm_head and greedy pick. Needs the whole-step program (its pool and
+        geometry) and the fused draft loop; on failure the draft stays stock."""
+        from vllm_torchtpu.models.vllm.qwen4_exp.mtp import Qwen4ExpMTP
+
+        from .qwen38_draft import MkDraft
+
+        whole = getattr(self, "whole_module", None)
+        if whole is None or self.whole_program is None:
+            logger.warning("Qwen3.8 MK draft: needs the whole-step program")
+            return
+        if not envs.VLLM_TPU_FUSED_DRAFT_LOOP:
+            logger.warning("Qwen3.8 MK draft: needs the fused draft loop")
+            return
+        draft = getattr(getattr(runner, "drafter", None), "draft_model", None)
+        if not isinstance(draft, Qwen4ExpMTP):
+            logger.warning("Qwen3.8 MK draft: no Qwen4ExpMTP draft model (%s)", type(draft))
+            return
+        try:
+            mk = MkDraft(
+                draft, self.g, self.mesh, self.segments.layout, whole.pool,
+                budget=whole.budget, max_groups=whole.max_groups,
+                norm_eps=whole.norm_eps, rotary_dim=whole.rotary_dim,
+            )
+        except Exception:
+            logger.exception("Qwen3.8 MK draft: setup failed; draft stays stock")
+            return
+        draft.model.mk_draft = mk
+        logger.info(
+            "Qwen3.8 MK draft attached: draft layer + mixer + lm_head + greedy pick per "
+            "step (BF16 draft weights, %d operands)", mk.n_w,
+        )
 
     def _attach_mtp_tail(self, runner: Any) -> None:
         """Route the MTP draft layer's post-attention half to the tail kernel.
