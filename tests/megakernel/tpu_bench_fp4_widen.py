@@ -96,14 +96,19 @@ def _ffn_tail(h, xdt):
     return mid.astype(xdt)
 
 
-def make_kernel(variant: str, rows: int, D: int, rep: int, xdt, qb13=128, qb2=64):
+def make_kernel(variant: str, rows: int, D: int, rep: int, xdt, qb13=128, qb2=64, G=1, nbuf=2):
     nb13, nb2 = H // qb13, I // qb2
 
-    def body(x_ref, w13_ref, s13_ref, w2_ref, s2_ref, o_ref):
+    def body(x_ref, w13_g, s13_g, w2_g, s2_g, o_ref):
         @pl.when((pl.program_id(0) == 0) & (pl.program_id(1) == 0))
         def _():
             o_ref[...] = jnp.zeros(o_ref.shape, jnp.float32)
 
+        for g in range(G):
+            one(x_ref, w13_g.at[pl.ds(g, 1)], s13_g.at[pl.ds(g, 1)], w2_g.at[pl.ds(g, 1)],
+                s2_g.at[pl.ds(g, 1)], o_ref)
+
+    def one(x_ref, w13_ref, s13_ref, w2_ref, s2_ref, o_ref):
         x = x_ref[...]
         if variant == "fp8":
             h = _mm(x, w13_ref[0]) * s13_ref[0]
@@ -155,11 +160,12 @@ def make_kernel(variant: str, rows: int, D: int, rep: int, xdt, qb13=128, qb2=64
             s13s, s2s = (D, nb13, N13), (D, nb2, H)
 
     def wspec(shape):
-        return pl.BlockSpec((1,) + shape[1:], lambda r, d: (d,) + (0,) * (len(shape) - 1))
+        kw = {"pipeline_mode": pl.Buffered(nbuf)} if nbuf != 2 else {}
+        return pl.BlockSpec((G,) + shape[1:], lambda r, d: (d,) + (0,) * (len(shape) - 1), **kw)
 
     call = pl.pallas_call(
         body,
-        grid=(rep, D),
+        grid=(rep, D // G),
         in_specs=[
             pl.BlockSpec((rows, H), lambda r, d: (0, 0)),
             wspec(w13s),
@@ -227,6 +233,8 @@ def main():
     ap.add_argument("--rep", type=int, default=16)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--interpret", action="store_true")
+    ap.add_argument("--group", type=int, nargs="+", default=[1], help="experts per grid step")
+    ap.add_argument("--nbuf", type=int, nargs="+", default=[2], help="weight pipeline buffers")
     a = ap.parse_args()
     if a.interpret:
         original = pl.pallas_call
@@ -236,32 +244,37 @@ def main():
     rng = np.random.default_rng(0)
     res = {}
     for rows in a.rows:
-        D = experts_for(rows)
-        for xname in a.x:
-            xdt = jnp.bfloat16 if xname == "bf16" else FP8
-            base = None
-            for v in a.variants:
-                key = f"r{rows}_x{xname}_{v}"
-                try:
-                    call = make_kernel(v, max(rows, 8), D, a.rep, xdt)[0]
-                    args = inputs(v, max(rows, 8), D, xdt, rng)
-                    f = jax.jit(call)
-                    jax.block_until_ready(f(*args))
-                    ts = []
-                    for _ in range(a.iters):
-                        t0 = time.perf_counter()
+        for G in a.group:
+          for nbuf in a.nbuf:
+            D = -(-experts_for(rows) // G) * G
+            for xname in a.x:
+                xdt = jnp.bfloat16 if xname == "bf16" else FP8
+                base = None
+                for v in a.variants:
+                    key = f"r{rows}_g{G}_b{nbuf}_x{xname}_{v}"
+                    try:
+                        call = make_kernel(v, max(rows, 8), D, a.rep, xdt, G=G, nbuf=nbuf)[0]
+                        args = inputs(v, max(rows, 8), D, xdt, rng)
+                        f = jax.jit(call)
                         jax.block_until_ready(f(*args))
-                        ts.append(time.perf_counter() - t0)
-                    layer_us = float(np.median(ts)) / a.rep * 1e6
-                    if v == "fp8":
-                        base = layer_us
-                    r = {"rows": rows, "D": D, "x": xname, "variant": v,
-                         "layer_us": round(layer_us, 2), "per_expert_us": round(layer_us / D, 3),
-                         "ratio_vs_fp8": round(layer_us / base, 3) if base else None}
-                except Exception as e:  # noqa: BLE001
-                    r = {"rows": rows, "x": xname, "variant": v, "error": f"{type(e).__name__}: {e}"[:300]}
-                res[key] = r
-                print("RESULT", json.dumps(r), flush=True)
+                        ts = []
+                        for _ in range(a.iters):
+                            t0 = time.perf_counter()
+                            jax.block_until_ready(f(*args))
+                            ts.append(time.perf_counter() - t0)
+                        layer_us = float(np.median(ts)) / a.rep * 1e6
+                        if v == "fp8":
+                            base = layer_us
+                        floor = (4.92e6 if v == "fp8" else 2.61e6) * D / 3.37e12 * 1e6
+                        r = {"rows": rows, "G": G, "nbuf": nbuf, "D": D, "x": xname, "variant": v,
+                             "layer_us": round(layer_us, 2), "per_expert_us": round(layer_us / D, 3),
+                             "hbm_floor_frac": round(floor / layer_us, 3),
+                             "ratio_vs_fp8": round(layer_us / base, 3) if base else None}
+                    except Exception as e:  # noqa: BLE001
+                        r = {"rows": rows, "G": G, "nbuf": nbuf, "x": xname, "variant": v,
+                             "error": f"{type(e).__name__}: {e}"[:300]}
+                    res[key] = r
+                    print("RESULT", json.dumps(r), flush=True)
     print("SUMMARY", json.dumps(res), flush=True)
 
 
