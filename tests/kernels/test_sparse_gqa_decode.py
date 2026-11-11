@@ -556,7 +556,10 @@ def test_launch_bound_tracks_selected_tiles_and_hardware(monkeypatch):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
-def test_dynamic_prefix_keeps_read_only_cache_without_pool_copy(fp8, tmp_path):
+@pytest.mark.parametrize("chunk_queries", [4, 9])
+def test_dynamic_prefix_keeps_read_only_cache_without_pool_copy(
+    fp8, chunk_queries, tmp_path
+):
     """A read-only Pallas operand must not be donated inside a while body."""
     import re
 
@@ -567,8 +570,8 @@ def test_dynamic_prefix_keeps_read_only_cache_without_pool_copy(fp8, tmp_path):
     cache_before = np.asarray(args[5]).copy()
     options = dict(kv_heads=1, ratio=4, k_scale=0.375, v_scale=2.5)
     # Four-query chunks exercise zero, partial, and multiple loop iterations.
-    launch = plan_decode(*(arg[:4] for arg in args[:5]), args[5], **options)
-    assert launch is not None and launch.chunk_queries == 4
+    launch = plan_decode(*(arg[:chunk_queries] for arg in args[:5]), args[5], **options)
+    assert launch is not None and launch.chunk_queries == chunk_queries
     initial = jnp.full_like(args[0], 0.125)
 
     def prefix(*values):
@@ -585,7 +588,11 @@ def test_dynamic_prefix_keeps_read_only_cache_without_pool_copy(fp8, tmp_path):
     executable = jax.jit(prefix).lower(*args, jnp.int32(1), initial).compile()
     hlo = executable.as_text()
     (tmp_path / "prefix.hlo").write_text(hlo)
-    assert "while(" in hlo and "fused_qsa_decode" in hlo
+    assert "fused_qsa_decode" in hlo
+    if chunk_queries < len(args[0]):
+        assert "while(" in hlo
+    else:
+        assert "conditional(" in hlo
     # This test retains the caller input, so JAX may copy the returned cache
     # at ENTRY. No nested computation may copy the read-only pool.
     cache_type = "f8e4m3fn" if fp8 else "bf16"
@@ -611,6 +618,8 @@ def test_dynamic_prefix_keeps_read_only_cache_without_pool_copy(fp8, tmp_path):
             np.linalg.norm(actual - expected) / max(np.linalg.norm(expected), 1e-12)
             < 0.01
         )
+        if chunk_queries == len(args[0]):
+            np.testing.assert_array_equal(actual, expected)
         np.testing.assert_array_equal(actual[count:], expected[count:])
         np.testing.assert_array_equal(
             np.asarray(returned).view(np.uint8), cache_before.view(np.uint8)

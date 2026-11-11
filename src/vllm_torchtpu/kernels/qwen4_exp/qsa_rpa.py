@@ -357,17 +357,28 @@ def qsa_attention(
             **options,
         )
     suffix = (positions >= prefix_tokens) & (positions < active_tokens)
+
     # Neither request segment owns or updates the written cache.
     prefill_options: dict[str, Any] = dict(options, sc_min_context=sc_min_context)
-    prefill, _ = _prefill_attention(
-        planning_query(query, query_prepared),
-        gate,
-        blocks,
-        jnp.where(suffix, lengths, 0),
-        table,
-        cache,
-        jnp.clip(starts, prefix_tokens, active_tokens),
-        **prefill_options,
+
+    def prefill_attention(_: None) -> jax.Array:
+        output, _ = _prefill_attention(
+            planning_query(query, query_prepared),
+            gate,
+            blocks,
+            jnp.where(suffix, lengths, 0),
+            table,
+            cache,
+            jnp.clip(starts, prefix_tokens, active_tokens),
+            **prefill_options,
+        )
+        return output
+
+    prefill = jax.lax.cond(
+        prefix_tokens < active_tokens,
+        prefill_attention,
+        lambda _: jnp.zeros(query.shape, jnp.bfloat16),
+        None,
     )
 
     def decode(_: None) -> jax.Array:

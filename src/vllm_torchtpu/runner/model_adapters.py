@@ -37,6 +37,11 @@ class ModelInputSnapshot:
 
 
 class ModelAdapter(Protocol):
+    @property
+    def decode_query_size(self) -> int:
+        """Maximum verify width supported by every target and draft attention."""
+        ...
+
     def bind_model(
         self, model: torch.nn.Module, draft_model: torch.nn.Module | None = None
     ) -> None: ...

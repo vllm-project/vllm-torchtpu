@@ -67,6 +67,13 @@ class Qwen4ExpAdapter:
     def block_size(self) -> int:
         return self.runner.cache_config.block_size
 
+    @property
+    def decode_query_size(self) -> int:
+        # Both target and MTP QSA use per-query causal lengths. Verify windows
+        # can share the decode prefix instead of running sparse prefill.
+        spec = self.runner.speculative_config
+        return 1 + (spec.num_speculative_tokens if spec is not None else 0)
+
     def bind_model(self, model, draft_model=None):
         from .pooled_cache import Qwen4ExpPooledCache
 

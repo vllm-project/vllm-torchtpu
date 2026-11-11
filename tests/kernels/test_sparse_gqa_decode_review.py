@@ -391,7 +391,8 @@ def test_vector_gather_rejects_unbounded_footprint(monkeypatch, info, oversized)
 
 @pytest.mark.parametrize("active", [0, 1, 7, 13])
 @pytest.mark.parametrize("fill", [0, 19])
-def test_runtime_prefix_skips_empty_chunks_and_preserves_rows(active, fill):
+@pytest.mark.parametrize("batch_size", [4, 13, 16])
+def test_runtime_prefix_skips_empty_chunks_and_preserves_rows(active, fill, batch_size):
     from vllm_torchtpu.kernels.sparse_gqa_decode.batching import attend_in_chunks
 
     query = jnp.arange(13 * 128, dtype=jnp.float32).reshape(13, 1, 128)
@@ -399,8 +400,10 @@ def test_runtime_prefix_skips_empty_chunks_and_preserves_rows(active, fill):
     ids = jnp.arange(13, dtype=jnp.int32)[:, None]
     cache = jnp.arange(256, dtype=jnp.float32).reshape(2, 128)
     visited = []
+    calls = []
 
     def attend(q, gate, blocks, lens, table, owner):
+        calls.append(len(q))
         visited.extend(np.asarray(blocks)[np.asarray(lens) > 0, 0].tolist())
         return jnp.where((lens > 0)[:, None, None], q + table[:, :1, None], 0), owner
 
@@ -413,7 +416,7 @@ def test_runtime_prefix_skips_empty_chunks_and_preserves_rows(active, fill):
             lengths,
             ids,
             cache,
-            batch_size=4,
+            batch_size=batch_size,
             active_tokens=jnp.array(active, jnp.int32),
             initial_output=jnp.full_like(query, fill),
         )
@@ -421,4 +424,5 @@ def test_runtime_prefix_skips_empty_chunks_and_preserves_rows(active, fill):
     expected[:active] = np.asarray(query[:active]) + np.arange(active)[:, None, None]
     np.testing.assert_array_equal(output, expected)
     assert visited == list(range(active))
+    assert len(calls) == math.ceil(active / min(batch_size, len(query)))
     assert owner is cache

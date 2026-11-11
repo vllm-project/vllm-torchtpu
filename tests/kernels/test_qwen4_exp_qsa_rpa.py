@@ -13,6 +13,7 @@
 # limitations under the License.
 """Native-layout QSA must preserve request state across prefill and decode."""
 
+import re
 from functools import partial
 
 import jax
@@ -155,6 +156,116 @@ def test_head_packing_preserves_values(fp8, heads):
     )
     if fp8 and heads == 1:
         np.testing.assert_array_equal(np.asarray(decoded[:, 2:], np.float32), 0)
+
+
+def test_prepared_verify_query_keeps_read_only_decode_path(monkeypatch):
+    from vllm_torchtpu.kernels.sparse_gqa_decode import decode
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    query = jnp.ones((16, 24, 256), jnp.float32)
+    gate = jnp.zeros(query.shape, jnp.bfloat16)
+    blocks = jnp.zeros((16, 17), jnp.int32)
+    lengths = jnp.array([64, 65, 66] + [0] * 13, jnp.int32)
+    table = jnp.zeros((16, 2), jnp.int32)
+    cache = jnp.zeros((2, 128, 1, 4, 256), jnp.float8_e4m3fn)
+    starts = jnp.array([0] + [3] * 16, jnp.int32)
+    prepared_cu = jnp.minimum(jnp.arange(17, dtype=jnp.int32), 3)
+
+    def execute(query, gate, blocks, lengths, table, cache, **kwargs):
+        assert kwargs["launch"] is not None
+        assert kwargs["prepared_cu"] is prepared_cu
+        assert query.dtype == jnp.float32
+        return jnp.where((lengths > 0)[:, None, None], query, 0), cache
+
+    def reject_legacy(*args, **kwargs):
+        raise AssertionError("prepared verify query fell back to cache-aliasing RPA")
+
+    monkeypatch.setattr(decode, "execute_decode", execute)
+    monkeypatch.setattr(qsa_rpa, "_rpa_attention_in_chunks", reject_legacy)
+    output, returned_cache = qsa_rpa.qsa_attention(
+        query,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        starts,
+        request_distribution=jnp.ones(3, jnp.int32),
+        kv_heads=2,
+        ratio=4,
+        query_prepared=True,
+        prepared_cu=prepared_cu,
+    )
+    assert returned_cache is cache
+    np.testing.assert_array_equal(output[:3], query[:3])
+    np.testing.assert_array_equal(output[3:], 0)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "tokens,requests,width",
+    [(16, 1, 3), (16, 1, 4), (16, 1, 5), (32, 8, 3), (32, 8, 4), (64, 8, 5)],
+)
+def test_verify_attention_is_read_only_and_matches_causal_queries(
+    tokens, requests, width, tmp_path
+):
+    rng = np.random.default_rng(419)
+
+    def rand(shape):
+        return jnp.asarray(rng.normal(0, 0.2, shape), jnp.bfloat16)
+
+    query, gate = rand((tokens, 24, 256)), rand((tokens, 24, 256))
+    active = requests * width
+    lengths = jnp.where(
+        jnp.arange(tokens) < active, 64 + jnp.arange(tokens) % width, 0
+    ).astype(jnp.int32)
+    blocks = jnp.broadcast_to(jnp.arange(16, dtype=jnp.int32), (tokens, 16))
+    table = jnp.zeros((tokens, 1), jnp.int32)
+    cache = qsa_rpa.pack_rows(rand((256, 2, 256)), rand((256, 2, 256)), fp8=True)
+    cache = cache.reshape(2, 128, 1, 4, 256)
+    cache = jnp.pad(cache, ((0, 254), (0, 0), (0, 0), (0, 0), (0, 0)))
+    starts = jnp.minimum(jnp.arange(17, dtype=jnp.int32), requests) * width
+    distribution = jnp.full((3,), requests, jnp.int32)
+    prepared = tokens == 16
+    reader_query = query.astype(jnp.float32) if prepared else query
+    cu = jnp.minimum(jnp.arange(tokens + 1, dtype=jnp.int32), active)
+
+    def attend(q, g, b, lens, pages, kv, starts, distribution):
+        return qsa_rpa.qsa_attention(
+            q,
+            g,
+            b,
+            lens,
+            pages,
+            kv,
+            starts,
+            request_distribution=distribution,
+            kv_heads=2,
+            ratio=4,
+            query_prepared=prepared,
+            prepared_cu=cu if prepared else None,
+        )[0]
+
+    args = (reader_query, gate, blocks, lengths, table, cache, starts, distribution)
+    compiled = jax.jit(attend).lower(*args).compile()
+    hlo = compiled.as_text()
+    (tmp_path / "verify.hlo.txt").write_text(hlo)
+    actual = compiled(*args)
+    expected, _ = jax.jit(
+        lambda q, g, b, lens, pages, kv: qsa_rpa.rpa_attention(
+            q, g, b, lens, pages, kv, kv_heads=2, ratio=4
+        )
+    )(query, gate, blocks, lengths, table, cache)
+    np.testing.assert_allclose(actual, expected, atol=0.002, rtol=0.01)
+    np.testing.assert_array_equal(actual[active:], 0)
+    # A read-only attention consumer must not copy its entire KV input.
+    cache_copies = []
+    for line in hlo.splitlines():
+        match = re.search(r"= f8e4m3fn\[([0-9,]+)\].*\bcopy(?:-start)?\(", line)
+        if match and np.prod([int(n) for n in match[1].split(",")]) == cache.size:
+            cache_copies.append(line)
+    assert not cache_copies, cache_copies
 
 
 @pytest.mark.tpu_test

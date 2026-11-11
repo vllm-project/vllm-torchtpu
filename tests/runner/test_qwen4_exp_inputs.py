@@ -51,6 +51,16 @@ def test_qwen_adapter_constructor_does_not_access_device(monkeypatch, architectu
     assert adapter.cache is None and adapter.ngram_context is None
 
 
+@pytest.mark.parametrize("k", [0, 2, 3, 4])
+def test_qsa_advertises_target_and_draft_verify_width(monkeypatch, k):
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+    runner = NS(
+        model_config=NS(hf_text_config=q4exp_text_config()),
+        speculative_config=NS(num_speculative_tokens=k) if k else None,
+    )
+    assert Qwen4ExpAdapter(runner).decode_query_size == k + 1
+
+
 @pytest.mark.parametrize("offload", [False, True])
 @pytest.mark.parametrize("qsa_index", [0, 3])
 def test_reordered_history_slots_and_group_tables_are_independent(

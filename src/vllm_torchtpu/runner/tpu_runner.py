@@ -6078,6 +6078,8 @@ class TPUModelRunner(GPUModelRunner):
         layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         initialized_count = 0
         decode_query_sizes = []
+        if self.model_adapter is not None:
+            decode_query_sizes.append(self.model_adapter.decode_query_size)
         layer_widths = []
         with set_vllm_model_wrapper_context(
             mesh=self.mesh, vllm_config=self.vllm_config

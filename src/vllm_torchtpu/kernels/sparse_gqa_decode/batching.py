@@ -119,6 +119,24 @@ def attend_in_chunks(
         raise ValueError("An initial output requires a runtime attention prefix")
     if active_tokens is not None:
         batch = min(batch_size, len(q))
+        output = jnp.zeros_like(q) if initial_output is None else initial_output
+        if len(q) <= batch_size:
+            # A single launch needs neither dynamic row gathers nor scatter.
+            # Keep the empty-prefix branch free of cache reads and kernel work.
+            live = jnp.arange(len(q), dtype=jnp.int32) < active_tokens
+
+            def attend_prefix():
+                result, _ = attend(
+                    q,
+                    gate,
+                    jnp.where(live[:, None], blocks, -1),
+                    jnp.where(live, lengths, 0),
+                    table,
+                    cache,
+                )
+                return jnp.where(live[:, None, None], result, output)
+
+            return jax.lax.cond(active_tokens > 0, attend_prefix, lambda: output), cache
 
         def step(index, output):
             positions = index * batch + jnp.arange(batch, dtype=jnp.int32)
@@ -137,7 +155,6 @@ def attend_in_chunks(
 
         # Segment attention is read-only. Only token output belongs in the
         # loop state; the pooled writer retains the cache owner.
-        output = jnp.zeros_like(q) if initial_output is None else initial_output
         output = jax.lax.fori_loop(
             0, (active_tokens + batch - 1) // batch, step, output
         )
