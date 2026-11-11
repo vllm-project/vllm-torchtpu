@@ -1823,10 +1823,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stops at most unit - 1 tokens short of the prior prompt instead of up
     # to 511. Also sets --prefix-match-unit to the unit when it is unset.
     "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT": env_int("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", 0),
-    # With VLLM_TPU_MAMBA_TAIL_FOLD: also fold under the Qwen4Exp main-KV DCP
-    # (VLLM_TPU_QSA_MAIN_KV_DCP > 1), which shards only the target QSA main KV;
-    # the Mamba specs, tables and states are not sharded. Off: the fold turns
-    # itself off under any context parallelism. vLLM DCP / PCP stay off.
+    # Ignored (hard-off): the fold under the Qwen4Exp main-KV DCP gave wrong
+    # outputs (za6 GSM8K c32 0.26, c48 0.008). The fold turns itself off under
+    # any context parallelism.
     "VLLM_TPU_MAMBA_TAIL_FOLD_DCP": env_bool(
         "VLLM_TPU_MAMBA_TAIL_FOLD_DCP", default=False
     ),
