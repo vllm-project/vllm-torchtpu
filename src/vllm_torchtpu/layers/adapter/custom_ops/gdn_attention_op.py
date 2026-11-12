@@ -52,6 +52,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
+from vllm_torchtpu.layers.adapter import gated_norm_quant_op
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
@@ -583,6 +584,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         del act_dtype
         w = self.conv1d.weight
         self.conv1d.weight.data = fresh_buffer(w)
+        gated_norm_quant_op.prebuild_ops(float(self.norm.eps))
 
     def get_state_shape(
         self,
@@ -1143,6 +1145,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         core_attn_out = core_attn_out.view(
             num_tokens, local_num_v_heads, self.head_v_dim
         )
+        if gated_norm_quant_op.can_fuse(
+            self.norm, self.out_proj, num_tokens, core_attn_out.dtype
+        ):
+            return gated_norm_quant_op.fused_output_projection(
+                core_attn_out, z, self.norm, self.out_proj
+            )
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
