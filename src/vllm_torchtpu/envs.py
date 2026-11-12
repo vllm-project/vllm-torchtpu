@@ -210,6 +210,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
+    TPU_MOE_ONEHOT_CAP_MIN_ROWS: int = 0
+    TPU_MOE_ONEHOT_CAP_FRACTION: float = 0.25
 
 
 def env_with_choices(
@@ -1285,6 +1287,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of two (`models.minimax_m3.dcp_pack`). 0 keeps two gathers.
     "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS", 0
+    ),
+    # One-hot EP MoE permute steps of at least this many routes (tokens x
+    # top-k, up to ONEHOT_MOE_PERMUTE_THRESHOLD) build and combine only the
+    # first ceil8(routes x TPU_MOE_ONEHOT_CAP_FRACTION) permuted rows when the
+    # step's local routes fit there, else the full permute. 0 disables.
+    "TPU_MOE_ONEHOT_CAP_MIN_ROWS": env_nonnegative_int(
+        "TPU_MOE_ONEHOT_CAP_MIN_ROWS", 0
+    ),
+    "TPU_MOE_ONEHOT_CAP_FRACTION": env_nonnegative_float(
+        "TPU_MOE_ONEHOT_CAP_FRACTION", 0.25
     ),
 }
 

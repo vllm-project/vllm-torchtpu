@@ -354,8 +354,13 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
+    row_cap: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
+
+    ``row_cap`` (one-hot EP permute only): build only the first ``row_cap``
+    rows of the permuted input; the caller guarantees every valid (local)
+    route sorts below it (`fused_moe_func`'s capped one-hot path).
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
     valid-mask path computed below is a no-op (jnp.where on an all-True
@@ -464,10 +469,11 @@ def prepare_routed_gmm_inputs(
             # `fused_moe_gmm` does not depend on `token_indices_sorted` (letting
             # XLA DCE its scatter unless owner-output combine uses it).
             if bucket_counts is not None:
+                # Positions at or past `row_cap` one-hot to zero rows.
                 onehot = (
                     jax.nn.one_hot(
                         argsort_revert_indices.reshape(num_tokens_local, topk),
-                        argsort_revert_indices.size,
+                        row_cap or argsort_revert_indices.size,
                         dtype=hidden_states_local.dtype,
                     )
                     .sum(axis=1)
@@ -475,7 +481,7 @@ def prepare_routed_gmm_inputs(
                 )
             else:
                 onehot = jax.nn.one_hot(
-                    token_indices_sorted,
+                    token_indices_sorted[:row_cap],
                     num_tokens_local,
                     dtype=hidden_states_local.dtype,
                 )
@@ -524,8 +530,12 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    row_cap: int | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
+
+    ``row_cap``: `x` holds only the first ``row_cap`` permuted rows
+    (`prepare_routed_gmm_inputs`), and the one-hot combine contracts only them.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
@@ -674,7 +684,9 @@ def moe_gmm(
             gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(
-                revert_indices, argsort_revert_indices.size, dtype=gmm2_res.dtype
+                revert_indices,
+                row_cap or argsort_revert_indices.size,
+                dtype=gmm2_res.dtype,
             )
             combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
                 axis=1
@@ -804,44 +816,94 @@ def fused_moe_func(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
 
-    (
-        x,
-        group_sizes,
-        argsort_revert_indices,
-        topk_weights_flat,
-        valid_mask,
-        token_indices_sorted,
-    ) = prepare_routed_gmm_inputs(
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        local_num_experts=w1.shape[0],
-        topk=topk,
-        use_ep=use_ep,
-        use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-        skip_padded_tokens=skip_padded_tokens,
+    def routed(row_cap: int | None) -> jax.Array:
+        (
+            x,
+            group_sizes,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask,
+            token_indices_sorted,
+        ) = prepare_routed_gmm_inputs(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            local_num_experts=w1.shape[0],
+            topk=topk,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+            skip_padded_tokens=skip_padded_tokens,
+            row_cap=row_cap,
+        )
+        x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+        x = moe_gmm(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            w2,
+            w2_scale,
+            w2_bias,
+            group_sizes,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask,
+            token_indices_sorted,
+            activation=activation,
+            num_tokens=num_tokens,
+            topk=topk,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+            rhs_quant_dtype=rhs_quant_dtype,
+            row_cap=row_cap,
+        )
+        return x[:num_tokens, :hidden_size]
+
+    row_cap = _onehot_row_cap(
+        num_tokens * topk, use_ep, use_sparse_core, onehot_moe_permute_threshold
     )
-    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
-    x = moe_gmm(
-        x,
-        w1,
-        w1_scale,
-        w1_bias,
-        w2,
-        w2_scale,
-        w2_bias,
-        group_sizes,
-        argsort_revert_indices,
-        topk_weights_flat,
-        valid_mask,
-        token_indices_sorted,
-        activation=activation,
-        num_tokens=num_tokens,
-        topk=topk,
-        use_ep=use_ep,
-        use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-        rhs_quant_dtype=rhs_quant_dtype,
+    if row_cap is None:
+        return routed(None)
+    # Under EP only the routes to this rank's experts are computed, about
+    # 1 / EP of them, yet the one-hot permute and combine are matmuls over
+    # every route. Steps whose local routes fit `row_cap` run them over the
+    # first `row_cap` permuted rows only (the valid routes sort first); a
+    # step with more local routes takes the full path.
+    valid = topk_ids >= 0
+    if skip_padded_tokens:
+        valid = valid & (topk_weights != 0)
+    num_valid = jnp.sum(valid, dtype=jnp.int32)
+    return jax.lax.cond(
+        num_valid <= row_cap, lambda: routed(row_cap), lambda: routed(None)
     )
-    return x[:num_tokens, :hidden_size]
+
+
+def _onehot_row_cap(
+    num_routes: int, use_ep: bool, use_sparse_core: bool, threshold: int
+) -> int | None:
+    """Rows of the capped one-hot EP permute for a step of `num_routes`
+    routes (``TPU_MOE_ONEHOT_CAP_MIN_ROWS`` / ``TPU_MOE_ONEHOT_CAP_FRACTION``),
+    or None for the full one."""
+    min_rows = envs.TPU_MOE_ONEHOT_CAP_MIN_ROWS
+    if not (
+        min_rows
+        and use_ep
+        and use_sparse_core
+        and min_rows <= num_routes <= threshold
+        and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() != "on"
+    ):
+        return None
+    cap = -(-int(num_routes * envs.TPU_MOE_ONEHOT_CAP_FRACTION) // 8) * 8
+    if not 0 < cap < num_routes:
+        return None
+    logger.info_once(
+        "TPU_MOE_ONEHOT_CAP_MIN_ROWS=%d: one-hot EP permute over %d of %d rows "
+        "when the step's local routes fit (fraction %s).",
+        min_rows,
+        cap,
+        num_routes,
+        envs.TPU_MOE_ONEHOT_CAP_FRACTION,
+    )
+    return cap
