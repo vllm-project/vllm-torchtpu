@@ -416,7 +416,8 @@ python3 transfer_stats.py ...                                                   
 
 ### 5.6 AgentX（2026-11-12，hl-2lxt / hl-6g41，合并后代码）
 
-`results/agentx-c*-{base,affinity,sweep-balanced,sweep-swafix}-1112-*`。P 生产配置，D `MAX_NUM_SEQS=64` + `[16,48,96,192,384,2048]`（c256 两轮 3600s 时 D 为 32 / `[16,48,96,192,2048]`、P 关 async）。
+`results/agentx-c*-{base,affinity,sweep-balanced,sweep-swafix,p1fix,dtune-A,dtune-A2}-1112-*`。P 生产配置，D `MAX_NUM_SEQS=64` + `[16,48,96,192,384,2048]`（c256 两轮 3600s 时 D 为 32 / `[16,48,96,192,2048]`、P 关 async）；
+标 **P 修复** 的行带 CSA2 deep gather 修复（6.1 第 11 条），标 **D 桶** 的行 D 编译桶为 `[16,48,96,144,192,288,384,2048]`（6.1 第 12 条）。
 
 | 运行 | 时长 | req/s | 输出 tok/s | TTFT P50 / P90 | ITL P50 | P 命中率 |
 |---|---|---|---|---|---|---|
@@ -425,11 +426,16 @@ python3 transfer_stats.py ...                                                   
 | c256 负载感知亲和 | 900s | 5.04 | 4,282 | 2.29 / 6.5 s | 16.4 ms | 86.8% |
 | c512 负载感知亲和 | 900s | **5.51** | **4,360** | 5.7 / 36 s | 39.8 ms | 75.3% |
 | c768 负载感知亲和 | 900s | 4.50 | 3,854 | 44 / 115 s | 41.0 ms | — |
+| c256 + P 修复 | 900s | 5.22 | 4,414 | 1.23 / 3.1 s | 16.8 ms | 87.5% |
+| c512 + P 修复 | 900s | 6.65 | 5,538 | 2.76 / 18.2 s | 34.0 ms | 78.2% |
+| c512 + P 修复 + D 桶 | 900s | **8.58** | **7,947** | 3.82 / 19.2 s | 17.1 ms | 82.0% |
+| c512 + P 修复 + 更细 D 桶（加 240/336） | 900s | 8.33 | 7,772 | 4.76 / 20.0 s | 16.7 ms | 81.7% |
 | 参考（客户提供，c256） | 3600s | 5.22 | 5,218 | 0.22 / 0.48 s | 4.83 ms | 理论 97% |
 
 - 峰值在 c512 附近；c768 时 P 8 个 rank 全忙、平均排队 261，D 只跑 146 个请求、KV 28%：这个负载下 **P 是瓶颈**（每个会话第一轮整段 prefill，单 rank 算）。
 - ITL 随 D 并发上升（69 → 175 个请求：16 → 40 ms），DSpark 接受长度约 3.0（greedy bench 约 4.9）。
 - c512 起曾反复崩溃：P 的 SWA 私有池耗尽（见第 7 节），已修。
+- P 修复后 TTFT 减半（c256 P50 2.29→1.23s、P99 23.6→7.4s）；D 加 144/288 桶后 c512 的 ITL 34→17 ms、吞吐 +43%。再细（240/336）没有额外收益。现在 c512 下 TTFT 又由 P 决定（P50 3.8s）。
 
 ---
 
@@ -453,6 +459,14 @@ python3 transfer_stats.py ...                                                   
     - manifest / layout 校验支持 SWA 私有池整页传输、FP8 Index-K 整页传输，块数按 KV cache group 校验（c96b3269e）；
     - LIFO 释放补丁按 `block.pool` 分流（dc4f44ee0）：KV connector 的延迟释放会把 SWA 私有池的块一起交给共享池，
       原补丁把它们塞进共享池的空闲队列，下一个请求就拿到重复的块 id（`dst_device_block_ids ... must not contain duplicates`）。上游 epic/dsv41 也有这个问题，只在 PD 下触发。
+11. **CSA2 deep gather 的清零行按 lane 分开**（159e4efe4，2026-11-12）：`_gather_sc_banked_deep` 对无效 id（-1）从共享零表 DMA 第 0 行来清零，
+    所有 subcore 的所有 lane 读同一个地址。无效 id 占多数时（DP lockstep 下空闲 rank 的 dummy 前向、短 selection）这些读串行化：
+    空闲 rank 的 gather 0.84 ms/次，忙 rank 只要 0.057 ms；MoE 集合通信又让忙 rank 等空闲 rank，结果 P 上单请求 prefill 比 8 并发还慢约 2.4 倍。
+    改成每个 subcore lane 读自己的零行。32k token prefill（P DP8）：1 请求 3.32→1.34–1.54s，8 请求 1.25–2.06→1.18–1.72s；
+    和 `TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER=0` 一样快，PD logprob 检查不变。AgentX c512 吞吐 +21%、TTFT P50 减半（5.6）。
+12. **D 编译桶加 144 / 288**（DSpark K=5，每请求 6 行；`MAX_NUM_SEQS=64` 时最多 384 行）：`[16,48,96,192,384,2048]` → `[16,48,96,144,192,288,384,2048]`。
+    原来 96→192→384 之间最多补齐 2 倍，AgentX c512 的 ITL 34→17 ms、输出吞吐 5,538→7,947 tok/s。D 编译缓存多约 10 GB（42 GB）。
+13. **proxy 复用 P 的 prompt token ids**（159e4efe4）：chat 请求让 P 返回 `prompt_token_ids`，放进 `kv_transfer_params` 交给 D，D 不再渲染模板、重新分词（`PROXY_REUSE_PROMPT_IDS=0` 关）。100k token 命中缓存的 chat TTFT 873→678–774ms，输出一致。
 
 ### 6.2 D 这一跳的控制路径优化（2026-10-29，已部署）
 
@@ -481,6 +495,8 @@ python3 transfer_stats.py ...                                                   
 ### 6.3 试过但没用 / 不可行
 
 - async scheduling 用在 P 上：TTFT 无改善。
+- **DSpark 的 K 不能改**：`num_speculative_tokens` 必须等于 checkpoint 的 block size 5（`block/Markov-head machinery is trained for exactly that block length`），K=3/4 启动即报错。
+- dummy 前向不放 token（让空闲 rank 的 selection 全为 -1）：没用，热点在 deep gather 的共享零行（6.1 第 11 条）。
 - chunk 4096 / 8192：XLA SparseCore RET_CHECK，编译失败。
 - prefix 哈希换 xxhash：82 万 token 只省 35ms。
 - 8 个 API server：对 4P 没有额外帮助；P 的起步等待 60ms 也没有帮助。
