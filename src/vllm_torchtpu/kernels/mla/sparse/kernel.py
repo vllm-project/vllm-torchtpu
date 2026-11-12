@@ -24,7 +24,13 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.mla import kv_cache_utils
-from vllm_torchtpu.kernels.mla.sparse import dsa_gather, native_sc_gather
+from vllm_torchtpu.kernels.mla.sparse import (
+    dsa_gather,
+    native_sc_gather,
+)
+from vllm_torchtpu.kernels.mla.sparse import (
+    turboquant as sparse_tq,
+)
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 TENSORCORE_CACHE_LAYOUT = "tensorcore"
@@ -33,6 +39,17 @@ DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
 DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
 # The native SparseCore gather's unit, which `topk_cap` must be a multiple of.
 GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
+NOPE_WORDS_DEFAULT = kv_cache_utils.TILE_LANE_BYTES
+
+
+def _nope_words_and_packing(
+    *, turboquant: bool, sparsecore_layout: bool
+) -> tuple[int, int]:
+    """`(nope_words, nope_tokens_per_row)` for a SparseCore/TensorCore NoPE row."""
+    if turboquant and not sparsecore_layout:
+        raise NotImplementedError("TurboQuant sparse MLA needs the sparsecore layout")
+    words = sparse_tq.TQ_NOPE_WORDS if turboquant else NOPE_WORDS_DEFAULT
+    return words, NOPE_WORDS_DEFAULT // words
 
 
 def cdiv(a, b):
@@ -431,7 +448,14 @@ def _attention_kernel(
     capped_windows: int | None = None,
     split_q: bool = False,
     lse_lane_dense: bool = False,
+    turboquant: bool = False,
 ):
+    rope_scale = k_scale
+    _, nope_tokens_per_row = _nope_words_and_packing(
+        turboquant=turboquant, sparsecore_layout=sparsecore_layout
+    )
+    if turboquant:
+        k_scale = 1.0
     # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
     # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
     # its own VMEM double buffer (last scratch ref). The two are joined and
@@ -498,7 +522,7 @@ def _attention_kernel(
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
     bkv_sz = (
-        cache_kv_nope_hbm_ref.shape[1]
+        cache_kv_nope_hbm_ref.shape[1] * nope_tokens_per_row
         if sparsecore_layout
         else cache_kv_nope_hbm_ref.shape[1] // kv_cache_utils.WORD_BYTES
     )
@@ -736,6 +760,15 @@ def _attention_kernel(
         )
 
     def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
+        if turboquant:
+            return sparse_tq.unpack_tq_bkv(
+                bkv_nope_ref,
+                bkv_rope_ref,
+                get_kv_len,
+                bkv_sz=bkv_sz,
+                rope_scale=rope_scale,
+                head_dim=head_dim,
+            )
         bkv_nope = bkv_nope_ref[...]
         if sparsecore_layout:
             # Native SC returns one uint32[128] row per token. Bitcasting
@@ -928,39 +961,61 @@ def _attention_kernel(
             if return_lse:
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
-        for batch_idx in range(batch_size):
-            kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-            bkv = load_bkv(bi_sem_idx, batch_idx)
-            bq = load_bq(bi_sem_idx, batch_idx)
+        if turboquant:
+            sparse_tq.run_tq_batch(
+                batch_size=batch_size,
+                batch_start_seq_idx=batch_start_seq_idx,
+                bi_sem_idx=bi_sem_idx,
+                bo_sem_idx=bo_sem_idx,
+                split_q=split_q,
+                kv_lens_ref=kv_lens_ref,
+                bq_x2_ref=bq_x2_ref,
+                bq_pe_x2_ref=bq_pe_x2_ref,
+                load_bq=load_bq,
+                bkv_nope_x2_ref=bkv_nope_x2_ref,
+                bkv_rope_x2_ref=bkv_rope_x2_ref,
+                bo_x2_ref=bo_x2_ref,
+                write_blse=write_blse,
+                bkv_sz=bkv_sz,
+                rope_scale=rope_scale,
+                sm_scale=sm_scale,
+                q_dtype=q_dtype,
+                o_dim=o_dim,
+            )
+        else:
+            for batch_idx in range(batch_size):
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                bkv = load_bkv(bi_sem_idx, batch_idx)
+                bq = load_bq(bi_sem_idx, batch_idx)
 
-            if prev_out is not None:
-                # Artificial dependency to force MXU/VPU interleaving by limiting
-                # LLO's QK runahead
-                # We use jnp.where to prevent XLA from optimizing the dependency away.
-                # prev_out won't be inf in practice.
-                bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
+                if prev_out is not None:
+                    # Artificial dependency to force MXU/VPU interleaving by limiting
+                    # LLO's QK runahead
+                    # We use jnp.where to prevent XLA from optimizing the dependency
+                    # away. prev_out won't be inf in practice.
+                    bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
 
-            p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
+                p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
 
-            if prev_p is not None:
-                assert prev_bkv is not None
-                assert prev_l_sum is not None
-                out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+                if prev_p is not None:
+                    assert prev_bkv is not None
+                    assert prev_l_sum is not None
+                    out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
 
-                # Store output from acc to bo.
-                bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out[:, :o_dim]
-                write_blse(batch_idx - 1, prev_m, prev_l_sum)
-                prev_out = out
+                    # Store output from acc to bo.
+                    bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out[:, :o_dim]
+                    write_blse(batch_idx - 1, prev_m, prev_l_sum)
+                    prev_out = out
 
-            prev_p = p
-            prev_bkv = bkv
-            prev_l_sum = l_sum
-            prev_m = m
+                prev_p = p
+                prev_bkv = bkv
+                prev_l_sum = l_sum
+                prev_m = m
 
-        # end of pipelining loop
-        out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
-        bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
-        write_blse(batch_size - 1, prev_m, prev_l_sum)
+            # end of pipelining loop
+            out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+            bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
+            write_blse(batch_size - 1, prev_m, prev_l_sum)
         if capped_windows is not None:
             fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
@@ -1061,6 +1116,7 @@ def prepare_outputs(
         "live_gather_all_chunks",
         "topk_cap",
         "lse_lane_dense",
+        "turboquant",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1095,6 +1151,7 @@ def sparse_ragged_paged_attention(
     topk_cap: int | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    turboquant: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1170,6 +1227,9 @@ def sparse_ragged_paged_attention(
             f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
         )
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
+    _, nope_tokens_per_row = _nope_words_and_packing(
+        turboquant=turboquant, sparsecore_layout=sparsecore_layout
+    )
     if sparsecore_layout:
         if (
             cache_kv_nope.dtype != jnp.uint32
@@ -1177,7 +1237,7 @@ def sparse_ragged_paged_attention(
             or cache_kv_nope.shape[-1] != 128
         ):
             raise ValueError(
-                "sparsecore NOPE cache must be uint32[pages,page_size,128]"
+                "sparsecore NOPE cache must be uint32[pages,nope_rows,128]"
             )
         if (
             cache_kv_rope.dtype != jnp.uint32
@@ -1188,11 +1248,16 @@ def sparse_ragged_paged_attention(
                 "sparsecore ROPE cache must be uint32[pages,rope_rows,128]"
             )
         rope_rows = cache_kv_rope.shape[1]
-        if rope_rows <= 0 or cache_kv_nope.shape[1] % rope_rows != 0:
+        logical_page_size = cache_kv_nope.shape[1] * nope_tokens_per_row
+        if rope_rows <= 0 or logical_page_size % rope_rows != 0:
             raise ValueError(
                 "NOPE and ROPE caches must have matching page counts and page geometry"
             )
-        rope_tokens_per_row = cache_kv_nope.shape[1] // rope_rows
+        rope_tokens_per_row = logical_page_size // rope_rows
+        if turboquant and rope_tokens_per_row != 4:
+            raise ValueError(
+                "TurboQuant sparse MLA requires 4 tokens per ROPE row (128 B/token)"
+            )
         rope_words = (
             128 // rope_tokens_per_row if 128 % rope_tokens_per_row == 0 else -1
         )
@@ -1223,14 +1288,18 @@ def sparse_ragged_paged_attention(
             raise ValueError(
                 "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
             )
-    if cache_kv_nope.size != rope_tokens_per_row * cache_kv_rope.size:
+    if (
+        cache_kv_nope.size * nope_tokens_per_row
+        != rope_tokens_per_row * cache_kv_rope.size
+    ):
         raise ValueError(
-            f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
-            f"{rope_tokens_per_row} * ROPE cache size ({cache_kv_rope.size})"
+            f"NOPE cache size ({cache_kv_nope.size}) * {nope_tokens_per_row} "
+            f"must equal {rope_tokens_per_row} * ROPE cache size ({cache_kv_rope.size})"
         )
     if (
         cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
-        or cache_kv_nope.shape[1] != rope_tokens_per_row * cache_kv_rope.shape[1]
+        or cache_kv_nope.shape[1] * nope_tokens_per_row
+        != rope_tokens_per_row * cache_kv_rope.shape[1]
     ):
         raise ValueError(
             "NOPE and ROPE caches must have matching page counts and page geometry"
@@ -1251,7 +1320,7 @@ def sparse_ragged_paged_attention(
     else:
         q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
 
-    page_size = cache_kv_nope.shape[1]
+    page_size = cache_kv_nope.shape[1] * nope_tokens_per_row
 
     _, num_q_heads, _ = q.shape
 
@@ -1379,6 +1448,7 @@ def sparse_ragged_paged_attention(
             ),
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
+            turboquant=turboquant,
         )
         if return_lse:
             q, lse = result
@@ -1480,6 +1550,7 @@ def sparse_attention_chunk(
     window_indices: jax.Array | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    turboquant: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1525,6 +1596,9 @@ def sparse_attention_chunk(
         head_dim = align_to(head_dim + q_pe.shape[-1], 128)
     chunk_size = end_pos - start_pos
     capped_windows = None if topk_cap is None else topk // topk_cap
+    nope_words, nope_tokens_per_row = _nope_words_and_packing(
+        turboquant=turboquant, sparsecore_layout=sparsecore_layout
+    )
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
@@ -1630,6 +1704,7 @@ def sparse_attention_chunk(
             capped_windows=capped_windows,
             split_q=split_q,
             lse_lane_dense=lse_lane_dense,
+            turboquant=turboquant,
         )
 
         scope_name = (
@@ -1638,6 +1713,8 @@ def sparse_attention_chunk(
         )
         if capped_windows is not None:
             scope_name += f"-capw_{capped_windows}"
+        if turboquant:
+            scope_name += "-tq"
         num_prefetch = len(scalar_prefetches)
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
@@ -1751,10 +1828,11 @@ def sparse_attention_chunk(
                 serve_pipelined=sparsecore_gather_pipelined,
                 num_live_indices=num_live_capped,
                 live_multiple=kernel_batch_size * topk_cap,
+                nope_words=nope_words,
             )
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
-            capped_windows * chunk_size, topk_cap, 128
+            capped_windows * chunk_size, topk_cap // nope_tokens_per_row, 128
         )
         gathered_rope_buffer = gathered_rope_buffer.reshape(
             capped_windows * chunk_size, topk_cap // native_sc_gather.ROPE_PACKING, 128
@@ -1782,10 +1860,13 @@ def sparse_attention_chunk(
                 atoms_per_batch=gather_atoms,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
+                nope_words=nope_words,
                 **live_kwargs,
             )
         )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
+        gathered_nope_buffer = gathered_nope_buffer.reshape(
+            chunk_size, topk // nope_tokens_per_row, 128
+        )
         gathered_rope_buffer = gathered_rope_buffer.reshape(
             chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
         )
