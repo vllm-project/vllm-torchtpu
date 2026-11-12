@@ -8,7 +8,7 @@ from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_gated_residual_op
 
 
 @pytest.mark.parametrize(
-    "branches,hidden,tile", [(0, 128, 128), (4, 129, 128), (4, 128, 64)]
+    "branches,hidden,tile", [(0, 128, 128), (4, 129, 128), (4, 128, 0)]
 )
 def test_invalid_geometry(branches, hidden, tile):
     with pytest.raises(ValueError):

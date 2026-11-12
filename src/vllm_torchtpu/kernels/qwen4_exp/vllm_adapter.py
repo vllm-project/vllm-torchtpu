@@ -6,6 +6,7 @@ import hashlib
 
 import jax
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu import envs
@@ -13,14 +14,35 @@ from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode import hc_decode_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _combine_full_mix, _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
+from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
 from vllm_torchtpu.kernels.qwen4_exp.hc_up import _up_epilogue
 
 
+def current_hc_hardware() -> HcHardware | None:
+    """Read layout only after worker TPU initialization; never claim a device."""
+    # torch_tpu registers this public module dynamically.
+    # pyrefly: ignore[missing-attribute]
+    if (
+        not getattr(torch, "tpu", None)
+        or not torch.tpu.is_initialized()
+        or not pltpu.is_tpu_device()
+    ):
+        return None
+    return HcHardware.from_tpu_info(pltpu.get_tpu_info())
+
+
+def _hardware_tag(hardware: HcHardware | None) -> str:
+    return hashlib.sha1(repr(hardware).encode()).hexdigest()[:12]
+
+
 @functools.cache
-def build_gated_residual_op(branches: int, hidden: int, token_tile: int):
+def build_gated_residual_op(
+    branches: int, hidden: int, token_tile: int, hardware: HcHardware | None = None
+):
     op = pallas.jax_op(
-        f"qwen4_exp::gated_residual_b{branches}_h{hidden}_m{token_tile}_v1",
-        gated_residual_fn(branches, hidden, token_tile),
+        f"qwen4_exp::gated_residual_b{branches}_h{hidden}_m{token_tile}"
+        f"_l{_hardware_tag(hardware)}_v2",
+        gated_residual_fn(branches, hidden, token_tile, hardware),
     )
 
     @op.register_fake
@@ -50,6 +72,7 @@ def build_full_mix_op(
     hidden: int,
     eps: float,
     token_tile: int,
+    hardware: HcHardware | None = None,
     up_t: bool = False,
     inject: bool = False,
 ):
@@ -67,6 +90,7 @@ def build_full_mix_op(
         eps=eps,
         token_tile=token_tile,
         up_t=up_t,
+        hardware=hardware,
         norm_impl=norm_impl,
     )
     _up = _up_operand(up_t)
@@ -91,8 +115,9 @@ def build_full_mix_op(
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"_l{_hardware_tag(hardware)}"
         f"{'_upt' if up_t else ''}{'_inj' if inject else ''}"
-        f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
+        f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v2",
         core,
     )
 
@@ -114,7 +139,8 @@ def build_combine_full_mix_op(
     hidden: int,
     eps: float,
     token_tile: int,
-    up_t: bool,
+    hardware: HcHardware | None = None,
+    up_t: bool = False,
     inject: bool = False,
 ):
     """``(mixed, norm, combined)``: the gated residual merge, then the full mix
@@ -128,6 +154,7 @@ def build_combine_full_mix_op(
         eps=eps,
         token_tile=token_tile,
         up_t=up_t,
+        hardware=hardware,
         norm_impl=norm_impl,
     )
     _up = _up_operand(up_t)
@@ -162,8 +189,9 @@ def build_combine_full_mix_op(
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_combine_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"_l{_hardware_tag(hardware)}"
         f"{'_upt' if up_t else ''}{'_inj' if inject else ''}"
-        f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
+        f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v2",
         core,
     )
 

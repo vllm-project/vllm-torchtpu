@@ -189,8 +189,8 @@ def test_full_mix_inject():
 
 
 def _full_mix_norm_variants_match(device):
-    """rows64 / bf16ep / bf16ep64 are bit-identical to vpu; gram* stay within
-    one bf16 ulp of it (only the variance's f32 summation order changes)."""
+    """rows64 is bit-identical to FP32-internal vpu; bf16ep* (BF16 epilogue)
+    and gram* (MXU Gram variance) stay within BF16 tolerance."""
     put = functools.partial(jax.device_put, device=device)
     x, weight, down, up = (put(jnp.asarray(a, jnp.bfloat16)) for a in inputs(512))
     rng = np.random.default_rng(11)
@@ -201,19 +201,42 @@ def _full_mix_norm_variants_match(device):
     combined_expected = _combine_full_mix(
         x, block, gates, weight, down, up, **static, up_t=False
     )
-    for impl in ("rows64", "bf16ep", "bf16ep64"):
-        _bitwise(_full_mix(x, weight, down, up, **static, norm_impl=impl), expected)
-        _bitwise(
-            _combine_full_mix(
-                x, block, gates, weight, down, up, **static, up_t=False, norm_impl=impl
-            ),
-            combined_expected,
-        )
-    for impl in ("gram", "gram64"):
+    _bitwise(_full_mix(x, weight, down, up, **static, norm_impl="rows64"), expected)
+    _bitwise(
+        _combine_full_mix(
+            x, block, gates, weight, down, up, **static, up_t=False, norm_impl="rows64"
+        ),
+        combined_expected,
+    )
+    for impl in ("bf16ep", "bf16ep64", "gram", "gram64"):
         mixed, norm = _full_mix(x, weight, down, up, **static, norm_impl=impl)
         np.testing.assert_allclose(
-            np.asarray(norm, np.float32), np.asarray(expected[1], np.float32),
-            rtol=1e-2, atol=1e-2,
+            np.asarray(norm, np.float32),
+            np.asarray(expected[1], np.float32),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        np.testing.assert_allclose(
+            np.asarray(mixed, np.float32),
+            np.asarray(expected[0], np.float32),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        c_mixed, c_norm, c_comb = _combine_full_mix(
+            x, block, gates, weight, down, up, **static, up_t=False, norm_impl=impl
+        )
+        _bitwise((c_comb,), (combined_expected[2],))
+        np.testing.assert_allclose(
+            np.asarray(c_norm, np.float32),
+            np.asarray(combined_expected[1], np.float32),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        np.testing.assert_allclose(
+            np.asarray(c_mixed, np.float32),
+            np.asarray(combined_expected[0], np.float32),
+            rtol=1e-2,
+            atol=1e-2,
         )
     with pytest.raises(ValueError, match="norm_impl"):
         _full_mix(x, weight, down, up, **static, norm_impl="nope")
