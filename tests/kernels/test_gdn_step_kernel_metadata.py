@@ -187,6 +187,31 @@ def test_packed_step_metadata_matches_per_layer(kind, fake_tpu):
         assert int(per_layer[0][1].num_tiles) > 0
 
 
+def test_metadata_only_call_never_donates_the_pool(monkeypatch):
+    """The step op does not own the pool: outside any outer jit, the
+    donating kernel wrapper must not consume it (seen on TPU as 'Buffer has
+    been deleted or donated' on the next layer's op)."""
+    info = types.SimpleNamespace(
+        num_lanes=128, num_sublanes=8, vmem_capacity_bytes=64 * 1024**2
+    )
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda *a, **k: info)
+    for name in ("TPU_GDN_RAW_QKV", "TPU_GDN_RAW_BA", "VLLM_TPU_GDN_V3_SINGLE_LAUNCH"):
+        monkeypatch.setattr(envs, name, True)
+    seen = []
+    real = wrapper.fused_conv1d_gdn
+
+    def spy(*args, state_source=None, **kw):
+        seen.append(state_source)
+        return real(*args, state_source=state_source, **kw)
+
+    monkeypatch.setattr(gdn_attention.gdn_v3_wrapper, "fused_conv1d_gdn", spy)
+    tokens, md = _case("mix4")
+    packed = _run(tokens, md, metadata_only=True)
+    assert packed.ndim == 1
+    (source,) = seen
+    assert source.shape[0] == 1  # a copy, not the caller's pool
+
+
 def test_tile_slots_cover_every_tile():
     cfg = types.SimpleNamespace(batch_size=8192, chunk_size=256)
     for lens in ([8192], [1] * 23 + [8169], [255, 257] * 12):
