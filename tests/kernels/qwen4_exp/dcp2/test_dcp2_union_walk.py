@@ -22,7 +22,29 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
+
+try:
+    import pytest
+except ImportError:  # `python3 file.py` on an image without pytest (exos: no pip network)
+    import contextlib
+    import types
+
+    def _identity(*args, **kwargs):
+        return lambda fn: fn
+
+    @contextlib.contextmanager
+    def _raises(exc):
+        try:
+            yield
+        except exc:
+            return
+        raise AssertionError(f"did not raise {exc}")
+
+    pytest = types.ModuleType("pytest")
+    pytest.mark = types.SimpleNamespace(skipif=_identity, parametrize=_identity)
+    pytest.raises = _raises
+    pytest.fixture = lambda *a, **k: (a[0] if a and callable(a[0]) else _identity())
+    sys.modules["pytest"] = pytest  # for test_dcp2_prefill's import in check_union_case
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
