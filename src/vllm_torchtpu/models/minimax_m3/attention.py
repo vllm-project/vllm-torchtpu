@@ -410,9 +410,14 @@ class MiniMaxM3SparseAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         attn_metadata: dict | None = None,
+        caches: list[torch.Tensor] | None = None,
+        writes: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``attn_metadata`` (per KV-cache prefix) replaces the forward
-        context's, for a call on part of the step's tokens."""
+        context's, for a call on part of the step's tokens. With `writes`
+        the layer's caches are not written: their new values are appended
+        (in `cache_tensors` order) for the caller to pass to the next call
+        as `caches` and to `write_caches` once (see `ops.msa._store`)."""
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
@@ -426,7 +431,8 @@ class MiniMaxM3SparseAttention(nn.Module):
 
         num_tokens = hidden_states.shape[0]
         metadata = attn_metadata or get_forward_context().attn_metadata
-        kv_cache = self.kv_cache.kv_cache
+        cache_in = caches or self.cache_tensors()
+        kv_cache = cache_in[0]
         if not isinstance(metadata, dict) or kv_cache.numel() == 0:
             # Memory profiling runs before the caches are bound.
             attn_output = q
@@ -438,8 +444,10 @@ class MiniMaxM3SparseAttention(nn.Module):
                 # Every rank scores all index heads on its share of the keys.
                 index_q = get_tp_group().all_gather(index_q.contiguous(), dim=1)
             extra = {"dcp_rank": self.dcp_rank} if self.dcp_size > 1 else {}
+            if writes is not None:
+                extra["writes"] = writes
             if self.scale_cache is not None:
-                extra["scale_cache"] = self.scale_cache.kv_cache
+                extra["scale_cache"] = cache_in[2]
                 if self.dcp_size > 1:
                     extra["hadamard"] = self.hadamard
             attn_output = self.msa_op(
@@ -449,9 +457,23 @@ class MiniMaxM3SparseAttention(nn.Module):
                 index_q,
                 index_k,
                 kv_cache,
-                self.index_cache.kv_cache,
+                cache_in[1],
                 layer_metadata,
                 **extra,
             ).reshape(num_tokens, self.q_size)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def cache_tensors(self) -> list[torch.Tensor]:
+        """The caches the attention op writes: K/V, index keys and, with
+        4-bit caches, their scales."""
+        caches = [self.kv_cache.kv_cache, self.index_cache.kv_cache]
+        if self.scale_cache is not None:
+            caches.append(self.scale_cache.kv_cache)
+        return caches
+
+    def write_caches(self, new: list[torch.Tensor]) -> None:
+        """Write the values a `writes` call returned (nothing when the op
+        did not run, as in memory profiling)."""
+        for cache, value in zip(self.cache_tensors(), new):
+            cache.copy_(value)

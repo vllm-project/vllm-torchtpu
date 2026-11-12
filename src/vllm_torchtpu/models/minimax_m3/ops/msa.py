@@ -41,6 +41,20 @@ _SCALE_CACHE_ARG = 7
 _DCP_SCALE_CACHE_ARG = 6
 
 
+def _store(cache: torch.Tensor, new: torch.Tensor, writes: list | None):
+    """Write `new` into `cache` and return what later reads see. With
+    `writes` (a token-half split step, `MiniMaxM3DecoderLayer.forward_split`)
+    the cache is not written: `new` is appended for the caller, which feeds
+    it to the next call on the same layer and writes the layer's caches once.
+    Two in-place writes of one cache in one compiled step lose the second
+    (the second half's K/V, TPU state check j-a2d405cc)."""
+    if writes is None:
+        cache.copy_(new)
+        return cache
+    writes.append(new)
+    return new
+
+
 @functools.cache
 def get_msa_op(
     sm_scale: float, topk: int, init_blocks: int, local_blocks: int, fp4: bool = False
@@ -112,6 +126,8 @@ def get_msa_op(
         kv_cache: torch.Tensor,
         index_cache: torch.Tensor,
         metadata: AttentionMetadata,
+        *,
+        writes: list | None = None,
     ) -> torch.Tensor:
         new_kv_cache, new_index_cache, out = jax_op(
             q,
@@ -126,8 +142,8 @@ def get_msa_op(
             metadata.query_start_loc,
             metadata.request_distribution,
         )
-        kv_cache.copy_(new_kv_cache)
-        index_cache.copy_(new_index_cache)
+        kv_cache = _store(kv_cache, new_kv_cache, writes)
+        index_cache = _store(index_cache, new_index_cache, writes)
         return out
 
     return op
@@ -200,6 +216,7 @@ def _get_msa_fp4_op(
         metadata: AttentionMetadata,
         *,
         scale_cache: torch.Tensor,
+        writes: list | None = None,
     ) -> torch.Tensor:
         new_kv_cache, new_index_cache, new_scale_cache, out = jax_op(
             q,
@@ -215,9 +232,9 @@ def _get_msa_fp4_op(
             metadata.query_start_loc,
             metadata.request_distribution,
         )
-        kv_cache.copy_(new_kv_cache)
-        index_cache.copy_(new_index_cache)
-        scale_cache.copy_(new_scale_cache)
+        kv_cache = _store(kv_cache, new_kv_cache, writes)
+        index_cache = _store(index_cache, new_index_cache, writes)
+        scale_cache = _store(scale_cache, new_scale_cache, writes)
         return out
 
     return op
@@ -333,6 +350,8 @@ def get_msa_sharded_op(
         kv_cache: torch.Tensor,
         index_cache: torch.Tensor,
         metadata: AttentionMetadata,
+        *,
+        writes: list | None = None,
     ) -> torch.Tensor:
         new_kv_cache, new_index_cache, partial = score_op(
             k,
@@ -346,8 +365,8 @@ def get_msa_sharded_op(
             metadata.query_start_loc,
             metadata.request_distribution,
         )
-        kv_cache.copy_(new_kv_cache)
-        index_cache.copy_(new_index_cache)
+        kv_cache = _store(kv_cache, new_kv_cache, writes)
+        index_cache = _store(index_cache, new_index_cache, writes)
         # Row r of the result came from rank r: its partial for this head.
         scores = _all_to_all(partial, get_tp_group()).amax(dim=0)
         return attend_op(
@@ -610,6 +629,7 @@ def get_msa_dcp_op(
         metadata: AttentionMetadata,
         *,
         dcp_rank: torch.Tensor,
+        writes: list | None = None,
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
@@ -632,8 +652,8 @@ def get_msa_dcp_op(
             metadata.request_distribution,
             dcp_rank,
         )
-        kv_cache.copy_(new_kv_cache)
-        index_cache.copy_(new_index_cache)
+        kv_cache = _store(kv_cache, new_kv_cache, writes)
+        index_cache = _store(index_cache, new_index_cache, writes)
         candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
         out, lse = attend_op(
             q_all,
@@ -776,6 +796,7 @@ def _get_msa_dcp_fp4_op(
         dcp_rank: torch.Tensor,
         scale_cache: torch.Tensor,
         hadamard: torch.Tensor,
+        writes: list | None = None,
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
@@ -796,9 +817,9 @@ def _get_msa_dcp_fp4_op(
             dcp_rank,
             q.contiguous(),
         )
-        kv_cache.copy_(new_kv_cache)
-        index_cache.copy_(new_index_cache)
-        scale_cache.copy_(new_scale_cache)
+        kv_cache = _store(kv_cache, new_kv_cache, writes)
+        index_cache = _store(index_cache, new_index_cache, writes)
+        scale_cache = _store(scale_cache, new_scale_cache, writes)
         if heads_op is not None:
             return heads_op(
                 dcp_rank,

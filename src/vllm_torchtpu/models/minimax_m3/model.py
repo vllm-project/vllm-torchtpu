@@ -170,6 +170,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         from combining a pair into one that both halves would wait for.
         """
         attn, res = [], []
+        # The halves' cache writes are threaded from the first call into the
+        # second and written once (see MiniMaxM3SparseAttention.forward).
+        caches = None
         for i, h in enumerate(hidden_states):
             if attn and envs.TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST:
                 # The second half waits for the first half's attention, which
@@ -180,8 +183,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 n, r = self.input_layernorm(h), h
             else:
                 n, r = self.input_layernorm(h, residual[i])
-            attn.append(self.self_attn(halves[i].positions, n, halves[i].metadata))
+            writes: list[torch.Tensor] = []
+            attn.append(
+                self.self_attn(
+                    halves[i].positions, n, halves[i].metadata, caches, writes
+                )
+            )
+            caches = writes
             res.append(r)
+        self.self_attn.write_caches(caches)
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         post = []
         for i, a in enumerate(attn):
@@ -281,6 +291,12 @@ class MiniMaxM3Model(nn.Module):
             raise ValueError(
                 f"TPU_MINIMAX_M3_SPLIT_MIN_TOKENS must be 0 or at least "
                 f"{2 * _AFTER_ROWS}, got {self.split_min_tokens}."
+            )
+        if self.split_min_tokens:
+            logger.info_once(
+                "TPU_MINIMAX_M3_SPLIT_MIN_TOKENS=%d: token-half split on, cache "
+                "writes threaded through the halves",
+                self.split_min_tokens,
             )
         if self.split_min_tokens and envs.TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES <= 0:
             logger.warning(
