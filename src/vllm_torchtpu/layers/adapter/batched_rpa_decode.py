@@ -25,7 +25,9 @@ is not bit-exact against 8 lanes (max abs 4.3e-4, bf16 rounding scale).
 
 Only that measured shape is in the table, and only for long-context
 deployments (``max_model_len`` of at least the measured ~98K tokens); every
-other layer keeps the wrapper's default.
+other layer keeps the wrapper's default. The attention backend looks the table
+up only for layers that take the tuned tiles (its ``tuned_tiles``), so the
+lanes of other models do not change.
 """
 
 from typing import Any

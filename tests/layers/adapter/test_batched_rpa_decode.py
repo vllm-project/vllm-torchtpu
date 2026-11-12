@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Decode lanes of the batched RPA kernel: the shape table and how the batched
-RPA entry hands them to the kernel."""
+"""Decode lanes and tuned tiles of the batched RPA kernel: the lanes table, the
+layers that look it up, and how the batched RPA and DCP entries hand both to the
+kernel."""
 
 import functools
 from types import SimpleNamespace
@@ -20,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_torchtpu.layers.adapter import attention, batched_rpa_decode
+from vllm_torchtpu.layers.adapter import attention, batched_rpa_decode, cp_attention
 
 pytestmark = pytest.mark.cpu_test
 
@@ -55,7 +56,9 @@ def test_decode_lanes_table(num_kv_heads, head_dim, dtype, max_model_len, lanes)
     )
 
 
-def _entry_rpa_func(monkeypatch, *, rows, decode_query_size, decode_lanes):
+def _entry_rpa_func(
+    monkeypatch, *, rows, decode_query_size, decode_lanes, tuned_tiles=False
+):
     seen = {}
 
     def impl(*args, rpa_func, **kwargs):
@@ -72,6 +75,7 @@ def _entry_rpa_func(monkeypatch, *, rows, decode_query_size, decode_lanes):
         kv_layout=None,
         decode_query_size=decode_query_size,
         decode_lanes=decode_lanes,
+        tuned_tiles=tuned_tiles,
     )
     return seen["rpa_func"]
 
@@ -95,3 +99,76 @@ def test_no_lanes_keeps_the_kernel_default(monkeypatch):
         monkeypatch, rows=64, decode_query_size=4, decode_lanes=None
     )
     assert rpa_func.keywords == {"decode_query_size": 4}
+
+
+def test_tuned_tiles_reach_the_kernel(monkeypatch):
+    rpa_func = _entry_rpa_func(
+        monkeypatch, rows=64, decode_query_size=4, decode_lanes=4, tuned_tiles=True
+    )
+    assert rpa_func.keywords == {
+        "decode_batch_size": 4,
+        "decode_query_size": 4,
+        "tuned_tiles": True,
+    }
+
+
+def _lanes_after_init(monkeypatch, *, tuned_tiles, max_model_len=262144):
+    """decode_lanes of a batched RPA layer with one fp8 KV head of 256 per
+    device, as its __init__ sets it; tuned_tiles stands in for a model rule."""
+
+    def base_init(self, *args, **kwargs):
+        self.head_size = 256
+        self.num_kv_heads = 1
+        self.kv_cache_quantized_dtype = FP8
+
+    monkeypatch.setattr(attention.PallasAttentionBackendImpl, "__init__", base_init)
+    monkeypatch.setattr(
+        attention.PallasAttentionBackendImpl, "tuned_tiles", tuned_tiles
+    )
+    config = SimpleNamespace(
+        speculative_config=None,
+        model_config=SimpleNamespace(architectures=[], max_model_len=max_model_len),
+        additional_config={},
+    )
+    monkeypatch.setattr(attention, "get_current_vllm_config_or_none", lambda: config)
+    return attention.PallasBatchedRPAAttentionBackendImpl().decode_lanes
+
+
+def test_only_layers_with_tuned_tiles_look_up_the_lanes(monkeypatch):
+    # The lanes table's own shape: another model keeps the kernel default.
+    assert _lanes_after_init(monkeypatch, tuned_tiles=False) is None
+    assert _lanes_after_init(monkeypatch, tuned_tiles=True) == 4
+
+
+def test_dcp_kernels_take_the_tuned_tiles(monkeypatch):
+    monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
+    monkeypatch.setattr(cp_attention, "_build_dcp_kernel_op", lambda name, fn: fn)
+    kw = dict(
+        sliding_window=None,
+        sm_scale=1.0,
+        logits_soft_cap=None,
+        q_scale=None,
+        k_scale=None,
+        v_scale=None,
+        cp_group_size=4,
+        cp_rank=0,
+        decode_query_size=4,
+    )
+    default = cp_attention.build_dcp_kernels(**kw)
+    tuned = cp_attention.build_dcp_kernels(tuned_tiles=True, **kw)
+    for off, on in zip(default, tuned, strict=True):
+        assert off is not on
+        assert off.keywords["tuned_tiles"] is False
+        assert on.keywords["tuned_tiles"] is True
+
+    seen = {}
+
+    def fake_wrapper(**kwargs):
+        seen.update(kwargs)
+        return None, None, None
+
+    monkeypatch.setattr(
+        cp_attention._batched_rpa_wrapper, "ragged_paged_attention", fake_wrapper
+    )
+    tuned[0](*([None] * 11))
+    assert seen["tuned_tiles"] is True

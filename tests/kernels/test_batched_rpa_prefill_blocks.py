@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tuned batched RPA prefill tiles: the table entry, the heuristic elsewhere, and
-the refusal of tiles known to be wrong."""
+"""Tuned batched RPA prefill tiles: the table entry, the heuristic elsewhere and
+without the tuned tiles, and the refusal of tiles known to be wrong."""
 
 from unittest.mock import MagicMock, patch
 
@@ -35,7 +35,9 @@ def _tpu_info():
     return m
 
 
-def _blocks(total_q_tokens=4352, num_q_heads=32, dtype_kv=jnp.float8_e4m3fn):
+def _blocks(
+    total_q_tokens=4352, num_q_heads=32, dtype_kv=jnp.float8_e4m3fn, tuned_tiles=True
+):
     # The PP=8 stage geometry: 32 q heads, 2 KV heads, head_dim 256, fp8 KV, page 128.
     model = configs.ModelConfigs(
         num_q_heads=num_q_heads, num_kv_heads=2, head_dim=256, mask_value=-1e30
@@ -52,7 +54,11 @@ def _blocks(total_q_tokens=4352, num_q_heads=32, dtype_kv=jnp.float8_e4m3fn):
     )
     with patch("jax.experimental.pallas.tpu.get_tpu_info", return_value=_tpu_info()):
         return wrapper.calculate_block_sizes(
-            model, serve, 64 * 1024 * 1024, decode_query_size=4
+            model,
+            serve,
+            64 * 1024 * 1024,
+            decode_query_size=4,
+            tuned_tiles=tuned_tiles,
         )
 
 
@@ -72,6 +78,13 @@ def test_tuned_shape_takes_the_table_tiles():
 @pytest.mark.parametrize("kwargs", [{"num_q_heads": 16}, {"dtype_kv": jnp.bfloat16}])
 def test_other_shapes_keep_the_heuristic(kwargs):
     assert _blocks(**kwargs) == _heuristic(**kwargs)
+
+
+def test_the_table_needs_the_tuned_tiles():
+    # A model that does not ask for the tuned tiles gets the default heuristic's
+    # tiles at the table's layer shape too.
+    _, pre = _blocks(tuned_tiles=False)
+    assert pre == configs.BlockSizes(bq_sz=256, bq_c_sz=64, bkv_sz=256, batch_size=1)
 
 
 def test_table_tiles_clamp_bq_to_tokens():

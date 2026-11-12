@@ -249,7 +249,9 @@ def calculate_block_sizes(
       cap of 85% of VMEM with an fp8 KV cache and 75% otherwise;
     - an fp8 KV cache (without LSE) takes the fp8 compute threshold, and the
       fp8/bf16 throughput ratio is rounded rather than floored;
-    - prefill bq is clamped to the token count aligned to the MXU width.
+    - prefill bq is clamped to the token count aligned to the MXU width;
+    - prefill/mixed tiles come from `_TUNED_PREFILL_TILES` for the layer
+      shapes it lists.
     Off (the default), the tiles are the ones these rules replace, so other
     models keep their tiles.
     """
@@ -543,12 +545,11 @@ def calculate_block_sizes(
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
-    prefill_block_sizes = tuned_prefill_block_sizes(
-        find_best_block_sizes(prefill_batch_size),
-        model_cfgs,
-        serve_cfgs,
-        mxu_column_size,
-    )
+    prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
+    if tuned_tiles:
+        prefill_block_sizes = tuned_prefill_block_sizes(
+            prefill_block_sizes, model_cfgs, serve_cfgs, mxu_column_size
+        )
 
     return decode_block_sizes, prefill_block_sizes
 
@@ -577,7 +578,8 @@ def tuned_prefill_block_sizes(
     mxu_column_size: int,
 ) -> configs.BlockSizes:
     """The prefill tiles from `_TUNED_PREFILL_TILES` for this layer shape, or
-    `default` (the heuristic's) for any other shape.
+    `default` (the heuristic's) for any other shape. Applied with
+    ``tuned_tiles`` only.
 
     bq is clamped to the aligned token count as the heuristic does, and bq_c
     to a divisor of bq.

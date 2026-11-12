@@ -557,6 +557,7 @@ def _pallas_rpa_kernel_batched(
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
     decode_lanes: int | None = None,
+    tuned_tiles: bool = False,
     attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF,
     block_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
@@ -566,6 +567,8 @@ def _pallas_rpa_kernel_batched(
     kernel_kwargs.update(native_fp8_scope.kernel_kwargs(attention_modes))
     if decode_query_size > 1:
         kernel_kwargs["decode_query_size"] = decode_query_size
+    if tuned_tiles:
+        kernel_kwargs["tuned_tiles"] = True
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -863,6 +866,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
     decode_lanes: int | None = None
+    # The tuned batched RPA tiles and decode lanes (wrapper.calculate_block_sizes,
+    # batched_rpa_decode); off unless a model rule turns them on.
+    tuned_tiles: bool = False
     # Reduced-precision modes of this layer's batched RPA kernels; off unless
     # the model turns them on (native_fp8_scope).
     attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF
@@ -1015,6 +1021,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             self.decode_lanes,
+            self.tuned_tiles,
             modes,
             block_major,
         )
@@ -1059,6 +1066,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             self.decode_lanes,
+            self.tuned_tiles,
             modes,
             block_major,
         )
@@ -1103,6 +1111,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 entry_kwargs["decode_query_size"] = self.decode_query_size
             if "decode_lanes" in entry_params:
                 entry_kwargs["decode_lanes"] = self.decode_lanes
+            if "tuned_tiles" in entry_params:
+                entry_kwargs["tuned_tiles"] = self.tuned_tiles
             # Entries without the argument run kernels that have no
             # reduced-precision modes. Bind it whenever the entry takes it,
             # even with every mode off (the entry's default, so nothing
@@ -1467,6 +1477,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     attention_modes=native_fp8_scope.effective(
                         self.attention_modes, self.native_fp8_draft
                     ),
+                    tuned_tiles=self.tuned_tiles,
                 )
             return
 
@@ -1742,7 +1753,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         if spec is not None and self.head_size != 64:
             self.decode_query_size = spec.num_speculative_tokens + 1
         model_config = vllm_config.model_config if vllm_config is not None else None
-        if model_config is not None and self.head_size != 64:
+        if self.tuned_tiles and model_config is not None and self.head_size != 64:
             self.decode_lanes = batched_rpa_decode.decode_lanes(
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_size,

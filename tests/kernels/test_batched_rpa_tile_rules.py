@@ -278,7 +278,8 @@ _QWEN3_5 = [
         pytest.param(
             _qwen3_5("tp1-prefill", tokens=t),
             (2, 2, 1792, 8),
-            (256, 128, 256, 1),
+            # The tuned prefill table's entry.
+            (256, 16, 1024, 1),
             id=f"tp1-prefill-{t}tok",
         )
         for t in (256, 2048, 8192)
