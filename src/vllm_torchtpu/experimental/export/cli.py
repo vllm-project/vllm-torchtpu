@@ -239,6 +239,8 @@ _EXPORT_DESTS = frozenset(
         "token_buckets",
         "req_buckets",
         "num_blocks",
+        "max_verify_tokens",
+        "debug_taps",
         "export_mode",
         "export_worker",
         "jax_coordinator",
