@@ -114,7 +114,15 @@ def main():
                     help="VLLM_TPU_MK_WHOLE_L47: + the last QSA layer as a one-layer kernel")
     ap.add_argument("--ledger", action="store_true",
                     help="print each kernel's planned VMEM scratch (name, shape, dtype, MiB, phase)")
+    ap.add_argument("--watchdog", type=int, default=0,
+                    help="dump every thread's Python stack after this many seconds (and every "
+                         "such interval after), to tell a compile hang from a device hang")
     a = ap.parse_args()
+    if a.watchdog:
+        import faulthandler
+        import sys
+
+        faulthandler.dump_traceback_later(a.watchdog, repeat=True, file=sys.stderr)
     _apply_removals(a.remove)
     if a.ledger:
         _install_ledger()
@@ -343,9 +351,15 @@ def main():
             print(f"B={B} STACKED_META bitwise={same}", flush=True)
             pool = p0
             args[1 + len(ws)] = pool
+        # Compile ahead of the first call so a hang is placed: compile vs device run.
+        t0 = time.time()
+        print(f"B={B} STAGE compile start", flush=True)
+        f = f.lower(*args).compile()
+        print(f"B={B} STAGE compiled {time.time() - t0:.1f} s", flush=True)
         t0 = time.time()
         res, pool = f(*args)
         jax.block_until_ready(res)
+        print(f"B={B} STAGE first run {time.time() - t0:.1f} s", flush=True)
         if a.hash:
             import hashlib
 
