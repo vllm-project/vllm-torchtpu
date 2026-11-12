@@ -95,9 +95,9 @@ def _eos_token_id(model_cfg: Any) -> int:
     Falls back to generation_config.json, the only place some checkpoints (e.g.
     MiniMax-M3.1) declare it.
     """
-    eos = model_cfg.hf_config.eos_token_id
+    eos = getattr(model_cfg.hf_config, "eos_token_id", None)
     if eos is None:
-        eos = model_cfg.hf_text_config.eos_token_id
+        eos = getattr(model_cfg.hf_text_config, "eos_token_id", None)
     if eos is None:
         eos = model_cfg.try_get_generation_config().get("eos_token_id")
     if isinstance(eos, (list, tuple)):

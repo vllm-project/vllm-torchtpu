@@ -1145,17 +1145,21 @@ def test_build_export_config_reads_eos_from_the_generation_config(
     tmp_path: Path,
 ) -> None:
     build = universal_adapter.build_export_config_from_vllm
-    no_eos = SimpleNamespace(num_attention_heads=2, eos_token_id=None)
-    vllm_config = _mock_vllm_config(
-        str(tmp_path),
-        hf_config=no_eos,
-        hf_text_config=no_eos,
-        try_get_generation_config=lambda: {"eos_token_id": [200020, 200021]},
-    )
-    assert build(vllm_config).eos_token_id == 200020
-    vllm_config.model_config.try_get_generation_config = dict
-    with pytest.raises(ValueError, match="declares eos_token_id"):
-        build(vllm_config)
+    for no_eos in (
+        SimpleNamespace(num_attention_heads=2, eos_token_id=None),
+        # PretrainedConfig subclasses such as Qwen3_5MoeConfig omit the attribute.
+        SimpleNamespace(num_attention_heads=2),
+    ):
+        vllm_config = _mock_vllm_config(
+            str(tmp_path),
+            hf_config=no_eos,
+            hf_text_config=no_eos,
+            try_get_generation_config=lambda: {"eos_token_id": [200020, 200021]},
+        )
+        assert build(vllm_config).eos_token_id == 200020
+        vllm_config.model_config.try_get_generation_config = dict
+        with pytest.raises(ValueError, match="declares eos_token_id"):
+            build(vllm_config)
 
 
 def test_build_export_config_raises_block_size_to_fit_smem(tmp_path: Path) -> None:
