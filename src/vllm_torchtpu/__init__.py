@@ -218,9 +218,9 @@ def _patch_vllm_megakernel_prefix_hits() -> None:
 
 
 def _patch_vllm_prefill_sjf_queue() -> None:
-    """A KV producer's or megakernel aggregate engine's waiting queue admits
-    the request with the fewest uncached prompt tokens first, with aging
-    (``vllm_torchtpu.core.sjf_queue``). Other engines are unchanged."""
+    """A megakernel prefill (KV producer) or aggregate engine's waiting queue
+    admits the request with the fewest uncached prompt tokens first, with
+    aging (``vllm_torchtpu.core.sjf_queue``). Other engines are unchanged."""
     from functools import wraps
 
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -235,10 +235,7 @@ def _patch_vllm_prefill_sjf_queue() -> None:
         from vllm_torchtpu.core import sjf_queue
         from vllm_torchtpu.megakernel import backend
 
-        transfer = getattr(self.vllm_config, "kv_transfer_config", None)
-        producer = getattr(transfer, "kv_role", None) == "kv_producer"
-        aggregate = backend.role(self.vllm_config) == "aggregate"
-        if not (producer or aggregate):
+        if backend.role(self.vllm_config) not in ("prefill", "aggregate"):
             return
         if self.waiting:
             raise RuntimeError("prefill SJF queue: the waiting queue is not empty")
@@ -326,9 +323,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
             if is_agg and req_id is not None and start < pf_target:
                 from vllm_torchtpu.megakernel.kimi_k3.prefill import prefill_windows
 
-                raw_engine_budget = (
-                    min(orig_max_sched, MAX_STEP_TOKENS) if is_agg else orig_max_sched
-                )
+                raw_engine_budget = min(orig_max_sched, MAX_STEP_TOKENS)
                 model_cfg = getattr(self.vllm_config, "model_config", None)
                 max_model_len = (
                     getattr(model_cfg, "max_model_len", raw_engine_budget)

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shortest-uncached-prompt-first waiting queue for a Kimi-K3 prefill engine.
 
-A KV producer's or aggregate megakernel engine's scheduler admits waiting
-requests in order of their uncached prompt tokens (estimated from the local
+A megakernel prefill (KV producer) or aggregate engine's scheduler admits
+waiting requests in order of their uncached prompt tokens (estimated from the local
 prefix cache when the request is queued), minus an aging credit of
 ``AGING`` tokens per second waited, so long prompts are not starved.
 Running requests keep their chunks; the scheduling policy stays FCFS, so
