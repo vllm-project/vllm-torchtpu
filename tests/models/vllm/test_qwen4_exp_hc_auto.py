@@ -694,6 +694,53 @@ def test_tpu_8i_admits_m256_full_mix_and_m128_residual(boundaries, monkeypatch):
     assert combine_selected(module, block, x, inj)
 
 
+def test_transpose_up_weight_rebuilds_full_and_combine_full_ops(
+    boundaries, monkeypatch
+):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
+
+    tpu_8i = HcHardware("8i", 192 << 20, 128, 16, 8, 256)
+    monkeypatch.setattr(vllm_adapter, "current_hc_hardware", lambda: tpu_8i)
+    monkeypatch.setattr(envs, "VLLM_TPU_HC_PREFILL_COMBINE_MIX", True)
+    monkeypatch.setattr(envs, "VLLM_TPU_HC_PREFILL_UP_T", True)
+    monkeypatch.setattr(envs, "VLLM_TPU_HC_PREFILL_INJECT", True)
+
+    full_calls = []
+    combine_calls = []
+    monkeypatch.setattr(
+        vllm_adapter,
+        "build_full_mix_op",
+        lambda *a, **kw: full_calls.append((a, kw)) or object(),
+    )
+    monkeypatch.setattr(
+        vllm_adapter,
+        "build_combine_full_mix_op",
+        lambda *a, **kw: combine_calls.append((a, kw)) or object(),
+    )
+
+    module = meta_module()
+    assert tuple(module._prefill_full_ops) == (256, 128)
+    assert tuple(module._prefill_combine_full_ops) == (256, 128)
+    assert all(kw["up_transposed"] is False for _, kw in full_calls)
+    assert all(kw["up_transposed"] is False for _, kw in combine_calls)
+
+    full_calls.clear()
+    combine_calls.clear()
+    module.transpose_up_weight()
+    assert module._up_transposed
+    assert tuple(module._prefill_full_ops) == (256, 128)
+    assert tuple(module._prefill_combine_full_ops) == (256, 128)
+    assert all(
+        kw == {"up_t": True, "inject": True, "up_transposed": True}
+        for _, kw in full_calls
+    )
+    assert all(
+        kw == {"up_t": True, "inject": True, "up_transposed": True}
+        for _, kw in combine_calls
+    )
+
+
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("tokens", [16, 32, 128, 256, 512, 1024, 4096])
 def test_tpu_8i_e2e_fused_decode_and_prefill_hc_match_torchtpu(tokens, monkeypatch):
@@ -756,6 +803,10 @@ def test_tpu_8i_e2e_fused_decode_and_prefill_hc_match_torchtpu(tokens, monkeypat
 
     ref_a, ref_m = make_pair(False)
     fus_a, fus_m = make_pair(True)
+    fus_a.transpose_up_weight()
+    fus_m.transpose_up_weight()
+    assert fus_a._up_transposed and fus_m._up_transposed
+    assert tuple(fus_a.input_mix_weight_up.weight.shape) == (320, 10240)
     assert tuple(fus_a._prefill_full_ops) == (256, 128)
     assert fus_a._prefill_combine_op is not None
     assert fus_a._decode_mix_op is not None
@@ -840,6 +891,8 @@ def test_tpu_8i_shape_variants_partitions_16_to_8192_without_128_constant_fold(
             self.mlp_proj = torch.nn.Linear(
                 2560, 2560, bias=False, dtype=torch.bfloat16
             )
+            self.attn_hc.transpose_up_weight()
+            self.mlp_hc.transpose_up_weight()
 
         def forward(self, input_ids, positions, *, valid_tokens):
             h = self.embed(input_ids).repeat(1, 4)

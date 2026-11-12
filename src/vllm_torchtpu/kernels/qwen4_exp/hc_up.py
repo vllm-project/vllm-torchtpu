@@ -9,14 +9,23 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def _up_kernel(mid_ref, norm_ref, weight_ref, mixed_ref, *, hidden, branches):
+def _up_kernel(
+    mid_ref,
+    norm_ref,
+    weight_ref,
+    mixed_ref,
+    *,
+    hidden,
+    branches,
+    up_transposed: bool = False,
+):
     mid = mid_ref[...]
     norm = norm_ref[...].astype(jnp.float32)
-    # Checkpoint-native weight is [branches * hidden, lowrank].
+    up_dims = (((1,), (0,)), ((), ())) if up_transposed else (((1,), (1,)), ((), ()))
     logits = jax.lax.dot_general(
         mid,
         weight_ref[...],
-        dimension_numbers=(((1,), (1,)), ((), ())),
+        dimension_numbers=up_dims,
         preferred_element_type=jnp.float32,
     )
     # F.linear(BF16, BF16) rounds to BF16 before the FP32 sigmoid.
@@ -29,31 +38,42 @@ def _up_kernel(mid_ref, norm_ref, weight_ref, mixed_ref, *, hidden, branches):
     mixed_ref[...] = (mixed / branches).astype(jnp.bfloat16)
 
 
-@functools.partial(jax.jit, static_argnames=("branches", "hidden", "token_tile"))
-def _up_epilogue(mid, norm, weight, *, branches, hidden, token_tile):
+@functools.partial(
+    jax.jit,
+    static_argnames=("branches", "hidden", "token_tile", "up_transposed"),
+)
+def _up_epilogue(
+    mid, norm, weight, *, branches, hidden, token_tile, up_transposed=False
+):
     tokens, lowrank = mid.shape
     width = branches * hidden
+    expected_up_shape = (lowrank, width) if up_transposed else (width, lowrank)
     if (
         tokens % token_tile
         or norm.shape != (tokens, width)
-        or weight.shape != (width, lowrank)
+        or weight.shape != expected_up_shape
         or mid.dtype != jnp.bfloat16
         or norm.dtype != jnp.bfloat16
         or weight.dtype != jnp.bfloat16
     ):
         raise ValueError("HC up epilogue requires BF16 and whole token tiles")
     return pl.pallas_call(
-        functools.partial(_up_kernel, hidden=hidden, branches=branches),
+        functools.partial(
+            _up_kernel,
+            hidden=hidden,
+            branches=branches,
+            up_transposed=up_transposed,
+        ),
         grid=(tokens // token_tile,),
         in_specs=[
             pl.BlockSpec((token_tile, lowrank), lambda tile: (tile, 0)),
             pl.BlockSpec((token_tile, width), lambda tile: (tile, 0)),
-            pl.BlockSpec((width, lowrank), lambda tile: (0, 0)),
+            pl.BlockSpec(expected_up_shape, lambda tile: (0, 0)),
         ],
         out_specs=pl.BlockSpec((token_tile, hidden), lambda tile: (tile, 0)),
         out_shape=jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",), vmem_limit_bytes=60 << 20
         ),
-        name=f"qwen4exp_hc_up_epilogue_m{token_tile}",
+        name=(f"qwen4exp_hc_up_epilogue_m{token_tile}{'_ut' if up_transposed else ''}"),
     )(mid, norm, weight)

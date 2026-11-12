@@ -446,6 +446,7 @@ def _pallas_mix(
         ),
         name=(
             f"qwen4exp_hc_{'combine_' if combine else ''}branchstore32_m{token_tile}"
+            f"{'_ut' if up_t else ''}"
             f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}"
         ),
     )(*inputs)
@@ -460,6 +461,7 @@ def _pallas_mix(
         "token_tile",
         "up_t",
         "hardware",
+        "up_transposed",
         "norm_impl",
     ),
 )
@@ -476,9 +478,10 @@ def _full_mix(
     token_tile,
     up_t=False,
     hardware=None,
+    up_transposed=False,
     norm_impl="vpu",
 ):
-    """``up_t``: ``up`` is given as its [low rank, width] transpose. ``inject``: the
+    """``up_t``/``up_transposed``: ``up`` is [low rank, width]. ``inject``: the
     second output is the gate projection (see ``_pallas_mix``)."""
     return _pallas_mix(
         x,
@@ -491,7 +494,7 @@ def _full_mix(
         hidden=hidden,
         eps=eps,
         token_tile=token_tile,
-        up_t=up_t,
+        up_t=up_t or up_transposed,
         hardware=hardware,
         norm_impl=norm_impl,
     )
@@ -506,6 +509,7 @@ def _full_mix(
         "token_tile",
         "up_t",
         "hardware",
+        "up_transposed",
         "norm_impl",
     ),
 )
@@ -522,8 +526,9 @@ def _combine_full_mix(
     hidden,
     eps,
     token_tile,
-    up_t,
+    up_t=False,
     hardware=None,
+    up_transposed=False,
     norm_impl="vpu",
 ):
     """``_full_mix(gated_residual(residual, block, gates), ...)`` in one kernel.
@@ -542,7 +547,7 @@ def _combine_full_mix(
         hidden=hidden,
         eps=eps,
         token_tile=token_tile,
-        up_t=up_t,
+        up_t=up_t or up_transposed,
         hardware=hardware,
         norm_impl=norm_impl,
     )
