@@ -40,9 +40,10 @@ FROM python:3.12-slim-bookworm AS base
 # toolchain for packages that build from source, libgoogle-perftools4 for the
 # tcmalloc allocator enabled below, and libibverbs1, which the tpu-sync-torch
 # extension links (for its Peregrine transport) and so needs at import even
-# when nothing uses RDMA. build-essential already pulls in gcc, g++, make and
+# when nothing uses RDMA, and numactl, which vLLM's --numa-bind launches the
+# workers under. build-essential already pulls in gcc, g++, make and
 # libc6-dev.
-RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 libibverbs1 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 libibverbs1 numactl && rm -rf /var/lib/apt/lists/*
 
 # tcmalloc for every derived image. Set after the install above, so that
 # intermediate steps do not fail preloading a library that is not there yet.
