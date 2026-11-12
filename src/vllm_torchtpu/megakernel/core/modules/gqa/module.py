@@ -55,7 +55,14 @@ from .merge import split_merge
 from .new_token import att_new
 from .params import GQAParams, GQATunables, derive_params, gqa_scratch
 from .reference import gqa_reference
-from .staging import att_q, kv_new, q_exchange_start, q_gather_finish
+from .staging import (
+    GDefer,
+    att_q,
+    gate_mm,
+    kv_new,
+    q_exchange_start,
+    q_gather_finish,
+)
 
 
 class GQAModule(Module):
@@ -255,8 +262,21 @@ class GQAModule(Module):
             for b in range(ex.B):
                 pf = jnp.where(rows_ == b, pos_ref[b].astype(F32), pf)
             ang_ = pf * inv_
-            scr["rope"][0, :, :half_] = round_bf16(jnp.cos(ang_))
-            scr["rope"][1, :, :half_] = round_bf16(jnp.sin(ang_))
+            cos_t = round_bf16(jnp.cos(ang_))
+            sin_t = round_bf16(jnp.sin(ang_))
+            if ap.QSW:
+                # lanes [half, ROT) repeat lanes [0, half), the rest are zero
+                def dup_(v):
+                    parts = [v, v]
+                    if ap.ROT < 128:
+                        parts.append(jnp.zeros((ex.MR, 128 - ap.ROT), F32))
+                    return jnp.concatenate(parts, axis=-1)
+
+                scr["rope"][0] = dup_(cos_t)
+                scr["rope"][1] = dup_(sin_t)
+            else:
+                scr["rope"][0, :, :half_] = cos_t
+                scr["rope"][1, :, :half_] = sin_t
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ap: GQAParams = ctx.module_params(self.name)
@@ -265,12 +285,15 @@ class GQAModule(Module):
         nh, HD, H, SPLIT, LAZY_ATT = ap.nh, ap.HD, ap.H, ap.SPLIT, ap.LAZY_ATT
         kv = make_kv_ring(cx)
         with stream.segment(lazy=LAZY_ATT):
-            ybuf, kn, half, koff, rcs = att_q(cx, slot)
+            gd = GDefer(cx, slot) if ap.GDEF and "dense" not in cx.skip else None
+            ybuf, kn, half, koff, rcs = att_q(cx, slot, gd)
             qx = q_exchange_start(cx)
             if cache_exec(ex).FUSED:
                 with sc("att_kvrd"):
                     fused_io().gqa_fused_kvrd_issue(ctx, a)
-            kv_out = kv_new(cx, ybuf, kn, half, koff, rcs)
+            kv_out = kv_new(cx, ybuf, kn, half, koff, rcs, gd)
+            if gd is not None:
+                gate_mm(cx, gd)
             if SPLIT or ex.VER:
                 q_gather_finish(cx, qx)
             att_core(cx, kv)

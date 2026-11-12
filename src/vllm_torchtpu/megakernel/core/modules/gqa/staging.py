@@ -38,19 +38,78 @@ def rope(ap: GQAParams, x_in: Any, cos_in: Any, sin_in: Any) -> Any:
     )
 
 
-def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
-    """QKV projection, then normed / roped Q into the Q staging buffers."""
+class GDefer:
+    """`GQAParams.GDEF` state of one layer: att_in's taken tiles, their
+    release, and the per-column scale."""
+
+    def __init__(self, cx: GQAEmit, slot: Any) -> None:
+        ap, stream = cx.ap, cx.stream
+        n_ai = stream.sp.nt["att_in"]
+        g0, self.give = stream.claim("att_in")
+        kinds = [("att_in", g0 + u) for u in range(n_ai)]
+        if ap.WGROUP:
+            self.ws = stream.dtake_group(kinds)
+        else:
+            self.ws = [stream.dtake(k, g) for k, g in kinds]
+        self.n_ai = n_ai
+        self.t_k = stream.sp.tk["att_in"]
+        self.slot = slot
+        self.cx = cx
+
+    def scale(self) -> Any:
+        """att_in's per-column scale (re-read by each phase), None if unscaled."""
+        ap = self.cx.ap
+        return self.cx.ctx.sm(self.slot, "in_s", ap.NAI) if ap.in_scaled else None
+
+    def cols(self, c0: int, cw: int, in_s: Any) -> Any:
+        """att_in columns `c0 .. c0 + cw`, bf16-rounded, in the dense matmul's
+        summation order (groups of `GA` tiles summed in registers)."""
+        stream, xb, t_k, GA = self.cx.stream, self.cx.scr["xb"], self.t_k, self.cx.ap.GA
+        p = None
+        for u0 in range(0, self.n_ai, GA):
+            st = stream.mm(
+                xb[:, u0 * t_k : (u0 + 1) * t_k], self.ws[u0][:, c0 : c0 + cw]
+            )
+            for u in range(u0 + 1, u0 + GA):
+                st = st + stream.mm(
+                    xb[:, u * t_k : (u + 1) * t_k], self.ws[u][:, c0 : c0 + cw]
+                )
+            p = st if p is None else p + st
+        if in_s is not None:
+            p = p * in_s[:, c0 : c0 + cw]
+        return round_bf16(p)
+
+
+def att_q(
+    cx: GQAEmit, slot: Any, gd: GDefer | None = None
+) -> tuple[Any, Any, int, int, Any]:
+    """QKV projection, then normed / roped Q into the Q staging buffers.
+
+    With `gd` (`GQAParams.GDEF`) only the q columns (and the K / V columns
+    unless `KVDEF`) are computed here; `kv_new` and `gate_mm` do the rest.
+    """
     ctx, ex, ap, scr, pos_ref, sc = cx.ctx, cx.ex, cx.ap, cx.scr, cx.pos_ref, cx.sc
     stream, gi = cx.stream, cx.gi
     B, NS, VER = ex.B, ex.NS, ex.VER
     nh, HD, NAI, ROT, SPLIT, PACK = ap.nh, ap.HD, ap.NAI, ap.ROT, ap.SPLIT, ap.PACK
     QV, GQ, NHH, SR, QG = ap.QV, ap.GQ, ap.NHH, ap.SR, ap.QG
     with sc("att_in"):
-        y = stream.dmatmul("att_in", scr["xb"], NAI)
         ybuf = scr["ybuf"]
-        ybuf[:, :NAI] = (
-            round_bf16(y * ctx.sm(slot, "in_s", NAI)) if ap.in_scaled else round_bf16(y)
-        )
+        if gd is not None:
+            in_s = gd.scale()
+            for h in range(nh):
+                c0 = h * 2 * HD
+                ybuf[:, c0 : c0 + HD] = gd.cols(c0, HD, in_s)
+            if not ap.KVDEF:
+                ko = nh * 2 * HD
+                ybuf[:, ko : ko + 2 * HD] = gd.cols(ko, 2 * HD, in_s)
+        else:
+            y = stream.dmatmul("att_in", scr["xb"], NAI)
+            ybuf[:, :NAI] = (
+                round_bf16(y * ctx.sm(slot, "in_s", NAI))
+                if ap.in_scaled
+                else round_bf16(y)
+            )
     qn = ctx.sm(slot, "qn")
     kn = ctx.sm(slot, "kn")
     half = ROT // 2
@@ -64,17 +123,23 @@ def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
         if QV:
             cos = scr["rope"][0, :B, :half]
             sin = scr["rope"][1, :B, :half]
+            if ap.QSW:
+                qsw = _qswap_setup(ap, scr, qn, B, half)
             for h in range(nh):
                 q0_ = h * 2 * HD
-                qh = gqa_rms(ap, ybuf[:B, q0_ : q0_ + HD], qn)
-                qh = round_bf16(rope(ap, qh, cos, sin) * HD**-0.5)
+                if ap.QSW:
+                    qparts = _qswap_head(ap, qsw, ybuf[:B, q0_ : q0_ + HD])
+                else:
+                    qh = gqa_rms(ap, ybuf[:B, q0_ : q0_ + HD], qn)
+                    qh = round_bf16(rope(ap, qh, cos, sin) * HD**-0.5)
+                    qparts = [qh[:, j * 128 : (j + 1) * 128] for j in range(NHH)]
                 for j in range(NHH):
                     scr["qg"][
                         0 if GQ else gi,
                         jnp.int32(j),
                         pl.ds(h, B, stride=SR),
                         :,
-                    ] = qh[:, j * 128 : (j + 1) * 128]
+                    ] = qparts[j]
             if GQ:
                 for sq in range(NS):
                     r0 = sq * QG
@@ -105,6 +170,47 @@ def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
     return ybuf, kn, half, koff, rcs
 
 
+def _qswap_setup(ap: GQAParams, scr: Any, qn: Any, B: int, half: int) -> dict:
+    """Lane masks and tables of the `QSW` Q path (per step, shared by heads)."""
+    lane = lax.broadcasted_iota(I32, (B, 128), 1)
+    partner = jnp.where(lane < half, lane + half, lane - half)
+    from_a = pltpu.roll(lane, half, 1) == partner
+
+    def swap(v):
+        """Each lane's RoPE partner: lane i <-> i + half for i < half."""
+        return jnp.where(from_a, pltpu.roll(v, half, 1), pltpu.roll(v, 128 - half, 1))
+
+    sin_f = scr["rope"][1, :B, :]  # lanes [half, ROT) repeat lanes [0, half)
+    w1 = (1.0 + qn) if ap.zero_centered_norm else qn
+    return {
+        "swap": swap,
+        "in_rot": lane < ap.ROT,
+        "cos_f": scr["rope"][0, :B, :],
+        "nsin_f": jnp.where(lane < half, -sin_f, sin_f),
+        "w1": w1,
+        "w1s": swap(jnp.broadcast_to(w1[:, :128], (B, 128))),
+    }
+
+
+def _qswap_head(ap: GQAParams, q: dict, x: Any) -> list[Any]:
+    """One head's normed, roped and scaled Q as `NHH` 128-lane parts.
+
+    Element for element the per-row form's math (`gqa_rms`, `rope`, the
+    scale): x2 * -sin added equals x2 * sin subtracted, and the partner lane's
+    normed value is recomputed from the swapped input with the same rounding.
+    """
+    HD = ap.HD
+    r = lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + ap.eps)
+    n = round_bf16(x * r * q["w1"])
+    ns = round_bf16(q["swap"](x[:, :128]) * r * q["w1s"])
+    n0 = n[:, :128]
+    ro = round_bf16(round_bf16(n0 * q["cos_f"]) + round_bf16(ns * q["nsin_f"]))
+    parts = [round_bf16(jnp.where(q["in_rot"], ro, n0) * HD**-0.5)]
+    for j in range(1, ap.NHH):
+        parts.append(round_bf16(n[:, j * 128 : (j + 1) * 128] * HD**-0.5))
+    return parts
+
+
 def q_exchange_start(cx: GQAEmit) -> list[Any]:
     """Start the Q all-gather within the KV-head group (`SPLIT`)."""
     ap, scr, sc, comm, gi = cx.ap, cx.scr, cx.sc, cx.comm, cx.gi
@@ -126,21 +232,34 @@ def q_exchange_start(cx: GQAEmit) -> list[Any]:
 
 
 def kv_new(
-    cx: GQAEmit, ybuf: Any, kn: Any, half: int, koff: int, rcs: Any
+    cx: GQAEmit,
+    ybuf: Any,
+    kn: Any,
+    half: int,
+    koff: int,
+    rcs: Any,
+    gd: GDefer | None = None,
 ) -> tuple[Any, ...]:
-    """Output gate, this step's normed / roped K and V; start their writeback."""
+    """Output gate, this step's normed / roped K and V; start their writeback.
+
+    With `gd` the gate columns come later (`gate_mm`) and, with `KVDEF`, the
+    K / V columns of att_in are summed here, inside the Q exchange.
+    """
     ex, ap, scr, O, sc, a = cx.ex, cx.ap, cx.scr, cx.O, cx.sc, cx.a  # noqa: E741
     B = ex.B
     nh, HD, QV = ap.nh, ap.HD, ap.QV
     with sc("att_kvnew"):
         if QV:
+            if gd is not None and ap.KVDEF:
+                ybuf[:, koff : koff + 2 * HD] = gd.cols(koff, 2 * HD, gd.scale())
             cos = scr["rope"][0, :B, :half]
             sin = scr["rope"][1, :B, :half]
-            for h in range(nh):
-                q0_ = h * 2 * HD
-                scr["gate"][:B, h * HD : (h + 1) * HD] = ybuf[
-                    :B, q0_ + HD : q0_ + 2 * HD
-                ]
+            if gd is None:
+                for h in range(nh):
+                    q0_ = h * 2 * HD
+                    scr["gate"][:B, h * HD : (h + 1) * HD] = ybuf[
+                        :B, q0_ + HD : q0_ + 2 * HD
+                    ]
             k = gqa_rms(ap, ybuf[:B, koff : koff + HD], kn)
             v = ybuf[:B, koff + HD : koff + 2 * HD]
             k = rope(ap, k, cos, sin)
@@ -183,6 +302,20 @@ def kv_new(
         else:
             kv_out = ()
     return kv_out
+
+
+def gate_mm(cx: GQAEmit, gd: GDefer) -> None:
+    """`GDEF`: att_in's gate columns, inside the Q exchange; then (non-lazy
+    segment) release the att_in tiles held since `att_q`."""
+    ex, ap, scr, sc = cx.ex, cx.ap, cx.scr, cx.sc
+    B, nh, HD = ex.B, ap.nh, ap.HD
+    with sc("att_gate_mm"):
+        in_s = gd.scale()
+        for h in range(nh):
+            c0 = h * 2 * HD + HD
+            scr["gate"][:B, h * HD : (h + 1) * HD] = gd.cols(c0, HD, in_s)[:B]
+        for u in range(gd.n_ai):
+            gd.give(u)
 
 
 def q_gather_finish(cx: GQAEmit, qx: list[Any]) -> None:

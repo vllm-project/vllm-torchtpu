@@ -332,6 +332,10 @@ def _plan_effect(field: str, g: Any, ex: mk.ExecSpec) -> Any:
         "moe.sh2_pre_route": bp["moe"].sh2_pre_route,
         "moe.sh_at": bp["moe"].sh_at,
         "moe.flush_pre_drain": bp["moe"].flush_pre_drain,
+        "gqa.qswap": bp["gqa"].QSW,
+        "gqa.gdefer": bp["gqa"].GDEF,
+        "gqa.kvdefer": bp["gqa"].KVDEF,
+        "gqa.wgroup": bp["gqa"].WGROUP,
     }.get(field)
 
 

@@ -95,6 +95,20 @@ class GQAParams:
     # Decode context parallel size (`CacheExec.dcp`): the G ranks of a
     # KV-head group hold DCP page shards, each shard on G // DCP ranks.
     DCP: int = 1
+    # `GQATunables.qswap` resolved: head-batched Q norm + RoPE with each lane's
+    # RoPE partner from lane rolls over a lane-duplicated cos / sin table (QV,
+    # ROT <= 128, HD % 128 == 0, bf16-rounded RoPE intermediates).
+    QSW: bool = False
+    # `GQATunables.gdefer` resolved (QV, unrolled or paired att_in, one ring
+    # slot per att_in tile): att_in's tiles are taken at once; the q columns
+    # are summed first, the gate columns after the Q exchange starts.
+    # `KVDEF`: the K / V columns move after it too. `WGROUP`: the att_in
+    # tiles wait as one group (`TwoRing.dtake_group`). `GA`: tiles per
+    # register-summed group of the deferred matmuls (the dense matmul's).
+    GDEF: bool = False
+    KVDEF: bool = False
+    WGROUP: bool = False
+    GA: int = 0
 
     def qrow(self, b: int) -> tuple[int, int]:
         return b // self.PB, (b % self.PB) * self.nh
@@ -139,10 +153,10 @@ class GQATunables:
         "gq_pack": "approx",  # packed G*nh query tiles
         "rope_fp32": "approx",  # float32 vs bfloat16-rounded RoPE intermediates
         # `approx` until a bit-identity flip (`EXACT_FLIPS`) shows otherwise.
-        "gdefer": "approx",
-        "kvdefer": "approx",
-        "qswap": "approx",
-        "wgroup": "approx",
+        "gdefer": "exact",  # same tile sums, gate columns later
+        "kvdefer": "exact",  # same tile sums, K / V columns later
+        "qswap": "exact",  # element for element the per-row RoPE
+        "wgroup": "exact",  # same tiles, grouped waits
     }
 
 
@@ -335,6 +349,24 @@ def derive_params(
     QVR = ex.B * nh + 8 if GQ else NBP * 8
     nt_att = plan.nt["att_in"] + plan.nt["att_out"]
     LAZY_ATT = tiles.lazy and nt_att <= tiles.nbd
+    n_ai = plan.nt["att_in"]
+    if n_ai <= min(tiles.dmm_unroll, tiles.nbd):
+        GA = n_ai
+    elif tiles.dense_acc_pair and n_ai % 2 == 0 and nai > 512:
+        GA = 2
+    else:
+        GA = 0
+    # Holding all n_ai tiles at once needs a ring slot per tile: with
+    # nbd < n_ai the wait for tile g0 + nbd would block on a slot whose
+    # refill is issued only after its use.
+    GDEF = bool(
+        tt.gdefer
+        and QV
+        and GA >= 2
+        and n_ai <= tiles.nbd
+        and g.HD % 128 == 0
+        and nai == nh * 2 * g.HD + 2 * g.HD
+    )
     return GQAParams(
         H=g.H,
         nh=nh,
@@ -375,6 +407,13 @@ def derive_params(
         in_scaled=bool(in_scaled),
         out_scaled=bool(out_scaled),
         DCP=DCP,
+        QSW=bool(
+            tt.qswap and QV and g.ROT <= 128 and g.HD % 128 == 0 and not tt.rope_fp32
+        ),
+        GDEF=GDEF,
+        KVDEF=bool(GDEF and tt.kvdefer),
+        WGROUP=bool(GDEF and tt.wgroup),
+        GA=GA if GDEF else 0,
     )
 
 

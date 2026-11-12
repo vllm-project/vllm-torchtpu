@@ -82,7 +82,7 @@ def synth_full_scale_spec(*, moe_tp: bool = False, R: int = 8) -> ModelSpec:
 # Extras of the candidate4 schedule options' flips (Qwen3.5 tiny geometry, R=2):
 # EP with 4 redundant copies per rank and vectorized routing; PIPE_EP with one
 # expert per ring (I=512, ebank 128 KiB: TE = 3 = nbe); the fully unrolled
-# dense matmul.
+# dense matmul; att_in as 2 tiles (bank 256 KiB).
 _EP_COPIES = {
     "geom_kw": {"moe_tp": False, "e_slots": 68},
     "moe.route_vec": True,
@@ -95,6 +95,7 @@ _PIPE_EP1 = {
     "nbe": 3,
 }
 _UNROLL = {"dense_acc_pair": True, "dmm_unroll": 8}
+_GDEF = {"gqa.gqa_qv": True, "bank": 256 << 10, **_UNROLL}
 
 EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ("nbd", "nbd", 8, (2, 4), {}),
@@ -145,6 +146,10 @@ EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ),
     ("sh_at", "moe.sh_at", 2, (2, 4), {**_UNROLL, "moe.sh_pre": True}),
     ("flush_pre_drain", "moe.flush_pre_drain", True, (2, 4), _PIPE_EP1),
+    ("qswap", "gqa.qswap", True, (2, 4), {"gqa.gqa_qv": True}),
+    ("gdefer", "gqa.gdefer", True, (2, 4), _GDEF),
+    ("kvdefer", "gqa.kvdefer", True, (2, 4), {**_GDEF, "gqa.gdefer": True}),
+    ("wgroup", "gqa.wgroup", True, (2, 4), {**_GDEF, "gqa.gdefer": True}),
 ]
 
 __all__ = [
