@@ -451,6 +451,12 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         )
         return self._fused_markov is not None
 
+    @property
+    def fused_markov_max_rows(self) -> int:
+        from vllm_torchtpu.kernels.collectives.markov_argmax import MAX_ROWS
+
+        return MAX_ROWS
+
     def markov_draft_fused(
         self, logits_3d: torch.Tensor, prev: torch.Tensor
     ) -> torch.Tensor:
