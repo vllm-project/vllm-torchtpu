@@ -359,6 +359,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR: bool = False
     VLLM_TPU_QSA_DCP_GATE_IN_COMBINE: bool = False
     VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED: bool = False
+    VLLM_TPU_QSA_PREFILL_ALIGN_GATHER: bool = False
     VLLM_TPU_QSA_DCP_SPLIT_LSE: bool = False
     VLLM_TPU_QSA_DCP_PACK_LISTS: bool = False
     VLLM_TPU_QSA_DCP_META_PARTITION: bool = False
@@ -2303,6 +2304,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # layouts; the aligned layout's kernel rows are already 0 / -inf there
     # (bit-identical, drops an f32 [T, heads, D] select per call).
     "VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED": env_bool("VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED"),
+    # QSA prefill block alignment (block_sparse_gqa_attention.run_with_padding):
+    # build the aligned query / blocks / lengths / page_table with a row gather
+    # plus a fill select instead of a .at[slots].set scatter (c32 1024-row
+    # step: scatter_fusion bf16[1024,6,256] x12 = 1.26 ms). Bit-identical.
+    "VLLM_TPU_QSA_PREFILL_ALIGN_GATHER": env_bool("VLLM_TPU_QSA_PREFILL_ALIGN_GATHER"),
     # Main-KV DCP attention: route the partial output and its lse as two arrays
     # instead of one [.., D + 1] channel (a padded f32 concat plus the slices
     # that undo it at every 8K prefill step); same values.
