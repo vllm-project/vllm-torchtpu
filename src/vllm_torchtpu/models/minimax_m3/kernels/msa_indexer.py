@@ -47,10 +47,20 @@ from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
 
 DEFAULT_BLOCK_Q = 128
 DEFAULT_LARGE_BLOCK_Q = 512
-DEFAULT_PAGES_PER_STEP = 32
+# TPU_MINIMAX_M3_INDEXER_LARGE_PAGES_PER_STEP: pages per grid step of the
+# large (prefill) class, a multiple of 32 (default 32). Wider steps amortize
+# the per-step cost over more pages; the scores are bit-identical (each page
+# maximum is one dot, whatever the grid).
+LARGE_PAGES_PER_STEP_ENV = "TPU_MINIMAX_M3_INDEXER_LARGE_PAGES_PER_STEP"
+DEFAULT_PAGES_PER_STEP = int(os.environ.get(LARGE_PAGES_PER_STEP_ENV, "32"))
+if DEFAULT_PAGES_PER_STEP <= 0 or DEFAULT_PAGES_PER_STEP % 32:
+    raise ValueError(
+        f"{LARGE_PAGES_PER_STEP_ENV} must be a positive multiple of 32, got "
+        f"{DEFAULT_PAGES_PER_STEP}"
+    )
 # The block_q class (decode, MTP verify) runs the v3 DMA ring; 128 pages per
 # step keep more bytes in flight (j-dba77583: 32 req x 8 tokens at 128K,
-# 1.95 -> 1.66 ms). The large prefill class keeps 32.
+# 1.95 -> 1.66 ms). The large prefill class keeps DEFAULT_PAGES_PER_STEP.
 DEFAULT_SMALL_PAGES_PER_STEP = 128
 DEFAULT_KERNEL = "v3"
 # Rows per token-major query tile of the block_q class (see `block_scores`).
@@ -89,6 +99,14 @@ _FP8_Q_MAX = 256.0
 def fp8_queries_enabled() -> bool:
     return os.environ.get(INDEXER_V2_ENV, "0") == "1"
 
+
+if DEFAULT_PAGES_PER_STEP != 32:
+    logger.info(
+        "%s=%d: MSA indexer prefill tiles score %d pages per grid step.",
+        LARGE_PAGES_PER_STEP_ENV,
+        DEFAULT_PAGES_PER_STEP,
+        DEFAULT_PAGES_PER_STEP,
+    )
 
 if fp8_queries_enabled():
     logger.info(
