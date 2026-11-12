@@ -6012,7 +6012,6 @@ class TPUModelRunner(GPUModelRunner):
             model = load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
-        validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
         if self.lora_config is not None:
             self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
@@ -6085,6 +6084,14 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
+
+        validate_online_fp8(
+            self.model,
+            self.vllm_config.quant_config,
+            draft_model=self._async_drafter.draft_model
+            if self._is_async_drafter
+            else None,
+        )
 
         # After the drafter: every placed MoE layer, the drafter's too, must
         # have had its router renumbered with its experts.
