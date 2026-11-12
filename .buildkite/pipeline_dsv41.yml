@@ -276,7 +276,7 @@ steps:
         commands:
           - .buildkite/kubernetes/run_multihost.sh --manifest dsv41-dp16-decode.yaml
 
-      - label: "DeepSeek-V4.1-Flash: DP8 C8 cached 96K + 16K extend"
+      - label: "DeepSeek-V4.1-Flash: DP8 C8 cached 96K + 16K extend (continuous EPLB)"
         key: "dsv41_flash_dp8_c8_cached_extend"
         <<: *tpu_step
         depends_on: "dsv41_stage_model"
@@ -299,6 +299,8 @@ steps:
         commands:
           # dsv41_publish_check.sh updates the GitHub check from inside the
           # pod, after the benchmark and before the pod uploads its artifacts.
+          # prefill_only keeps sampling fresh windows; decode CI keeps its
+          # separate decode_only chaining and convergence freeze policy.
           - >-
             .buildkite/kubernetes/run.sh
             bash .buildkite/scripts/dsv41_publish_check.sh

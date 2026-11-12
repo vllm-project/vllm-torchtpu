@@ -707,6 +707,40 @@ def test_direct_staged_next_breaks_single_copy_cycle_and_chains_decode():
     assert c._converged is True
 
 
+@pytest.mark.parametrize(
+    ("mode", "phase", "keeps_sampling"),
+    [
+        (rl.EplbMode.PREFILL_ONLY, "prefill", True),
+        (rl.EplbMode.DECODE_ONLY, "decode", False),
+    ],
+)
+def test_no_gain_keeps_prefill_sampling_but_freezes_decode(mode, phase, keeps_sampling):
+    tap = _Tap()
+    c = _controller(0, tap, _Mover(), [], mode=mode, min_gain=1.0)
+    for step in range(1, 65):
+        c.on_step(step, c.fields(), phase=phase)
+        c.after_dispatch()
+        tap.advance()
+    assert c.stats["skipped"] > 0
+    assert (c.stats["triggers"] > 1) == keeps_sampling
+    assert c._converged != keeps_sampling
+
+
+def test_prefill_install_waits_for_a_fresh_load_window():
+    tap = _Tap()
+    c = _controller(0, tap, _Mover(), [], mode=rl.EplbMode.PREFILL_ONLY, min_gain=0.005)
+    for step in range(1, 65):
+        c.on_step(step, c.fields(), phase="prefill")
+        c.after_dispatch()
+        tap.advance()
+        if c.generation:
+            break
+    assert c.generation == 1
+    assert c.state == rl.IDLE
+    assert c.stats["triggers"] == 1
+    assert c.history == []
+
+
 def test_window_deltas_wrap_cleanly_across_int32_overflow():
     """The on-device load accumulator is int32; when a hot slot wraps past
     2^31 - 1 into negative int32 values, the window delta must still be the

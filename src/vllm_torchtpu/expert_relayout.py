@@ -915,8 +915,10 @@ class Controller:
         self._need_read_issue: bool = False
         self._last_step: int = 0
         self.decode_first_window: int = max(DECODE_FIRST_WINDOW, 8)
-        self._chain_layouts: bool = True
-        self._freeze_converged: bool = True
+        # Prefill windows can change with context length; sample fresh counts
+        # after each install or rejected plan instead of freezing that mix.
+        self._chain_layouts: bool = self._sample_phase != "prefill"
+        self._freeze_converged: bool = self._sample_phase != "prefill"
         self._logical_windows: dict[tuple[str, int], np.ndarray] | None = None
         self._converged: bool = False
 

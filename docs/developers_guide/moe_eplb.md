@@ -35,16 +35,17 @@ export TPU_MOE_EPLB_MODE=decode_only
 
 Decode-only ignores prefill warmup traffic. Prefill-only ignores decode
 traffic, including first-token generation. Dirty/padded steps reset the
-sampling window. Prefill uses an initial eight-clean-step window; decode
-retains its configured window and existing first-window behavior. Both
-policies reuse a captured logical load across budgeted migrations until no
-layer clears the gain gate, then freeze. Outstanding migrations are safely
-drained; phase filtering does not cancel a transfer in flight.
+sampling window. Prefill samples fresh eight-clean-step windows after each
+installed or rejected plan and keeps sampling when no layer clears the gain
+gate. Decode retains its configured window and existing first-window
+behavior: it reuses a captured logical load across budgeted migrations until
+no layer clears the gain gate, then freezes. Outstanding migrations are
+safely drained; phase filtering does not cancel a transfer in flight.
 
 The policy is fixed for the process lifetime. It does not provide two
-independent layouts in one mixed-role instance, and frozen layouts do not
-automatically relearn a changed workload. Do not share persisted physical
-slot tables between different EP topologies.
+independent layouts in one mixed-role instance, and frozen decode layouts do
+not automatically relearn a changed workload. Do not share persisted
+physical slot tables between different EP topologies.
 
 The DP8 prefill CI selects `prefill_only`; the DP16 decode launcher explicitly
 selects and checks `decode_only`, overriding any inherited prefill policy.
