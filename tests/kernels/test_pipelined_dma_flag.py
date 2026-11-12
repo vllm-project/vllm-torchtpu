@@ -130,7 +130,11 @@ def test_kv_cache_update_builds_block_specs_and_traces():
     slices = jnp.zeros((3, 4), dtype=jnp.int32)
     num_slices = jnp.array([2], dtype=jnp.int32)
 
-    for pipelined_dma in (False, True):
+    # Trace the unjitted body so every eval_shape reaches pallas_call: a hit in
+    # the jit trace cache skips the Python body and the spy. Each setting runs
+    # twice to keep the test independent of what was traced before it.
+    unwrapped_update = inspect.unwrap(ragged_kv_cache_update.kv_cache_update)
+    for pipelined_dma in (False, True, False, True):
         with patch.object(
             ragged_kv_cache_update.pl,
             "pallas_call",
@@ -138,7 +142,7 @@ def test_kv_cache_update_builds_block_specs_and_traces():
         ) as spy_pallas_call:
             out_shape = jax.eval_shape(
                 functools.partial(
-                    ragged_kv_cache_update.kv_cache_update,
+                    unwrapped_update,
                     num_slices_per_block=4,
                     pipelined_dma=pipelined_dma,
                 ),
