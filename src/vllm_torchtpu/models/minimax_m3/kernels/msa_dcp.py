@@ -345,12 +345,15 @@ def local_candidates(
         block_rows = -(-block_rows // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
     pad = -num_tokens % block_rows
     s = scores if pretransposed else scores[:, 0]
-    if num_tokens < block_rows:
+    if pad and (live_rows is None or num_tokens < block_rows):
         s = jnp.pad(s, ((0, 0), (0, pad)) if pretransposed else ((0, pad), (0, 0)))
-    # Else the last row block reads past the scores: its padding rows pick
-    # from garbage and are dropped, as the kernels reduce within a row only
-    # (a pad copied every score, ~17 us per layer for the c48 mixed step's
-    # small tiles, j-c22c589e).
+    # Without `live_rows` every row block runs, so a last block past the
+    # scores always reads past them: in the c48 decode twin (384 tokens, DCP 2,
+    # 4-bit) that halted every chip at warmup (j-433e936a). A class's grid
+    # stops at its live rows, so its scores keep no padded copy (~17 us per
+    # layer for the c48 mixed step's small tiles, j-c22c589e); its last block
+    # reads past them only when the live rows reach it. Padding rows pick from
+    # garbage and are dropped, as the kernels reduce within a row only.
     p = jnp.pad(pos, (0, pad))[:, None]
     # Static scan widths (`_scan_widths`, one kernel body each); each row
     # block takes the narrowest one holding every block its rows see (a

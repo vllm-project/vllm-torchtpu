@@ -13,6 +13,7 @@
 # limitations under the License.
 """DCP local top-k candidates (interpret mode) against a numpy reference."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -94,3 +95,43 @@ def test_candidates_match_reference(
     want_s, want_b = _reference(scores, pos, rank, dcp, init_blocks, local_blocks)
     np.testing.assert_array_equal(np.asarray(got_b), want_b)
     np.testing.assert_array_equal(np.asarray(got_s), want_s)
+
+
+@pytest.mark.parametrize("num_tokens", [256, 384, 300])
+def test_row_blocks_stay_inside_the_scores(num_tokens):
+    """Without `live_rows` every row block runs: the scores the kernel reads
+    must hold whole row blocks (a block past them halted the c48 decode twin
+    at 384 tokens, j-433e936a)."""
+    scores = jnp.zeros((num_tokens, 1, 1024), jnp.float32)
+    pos = jnp.zeros((num_tokens,), jnp.int32)
+    jaxpr = jax.make_jaxpr(
+        lambda s, p: local_candidates(
+            s,
+            p,
+            block_size=BLOCK,
+            topk=TOPK,
+            init_blocks=0,
+            local_blocks=1,
+            rank=1,
+            dcp=2,
+            interpret=True,
+        )
+    )(scores, pos)
+    (call,) = _pallas_calls(jaxpr.jaxpr)
+    rows = call.invars[2].aval.shape[0]
+    block_rows = call.params["grid_mapping"].block_mappings[2].block_aval.shape[0]
+    assert rows % block_rows == 0, (rows, block_rows)
+    assert call.params["grid_mapping"].grid[0] * block_rows == rows
+
+
+def _pallas_calls(jaxpr):
+    """The pallas_call equations of `jaxpr`, inside nested jaxprs too."""
+    calls = []
+    for e in jaxpr.eqns:
+        if e.primitive.name == "pallas_call":
+            calls.append(e)
+        for p in e.params.values():
+            inner = getattr(p, "jaxpr", None)
+            if inner is not None and e.primitive.name != "pallas_call":
+                calls += _pallas_calls(getattr(inner, "jaxpr", inner))
+    return calls
