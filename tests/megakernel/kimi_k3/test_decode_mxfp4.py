@@ -48,6 +48,41 @@ def test_scale_block_partials_do_not_depend_on_the_step():
         )
 
 
+def _block_tree(products):
+    """The scale-block reduction's order on device, in float32: per row the
+    8-block groups left to right, then blocks i + (i + 4), then the sums two
+    apart, then the last pair."""
+    rows, blocks, width = products.shape
+    totals = np.empty((rows, width), np.float32)
+    for row in range(rows):
+        sums = products[row, 0:8]
+        for group in range(8, blocks, 8):
+            sums = sums + products[row, group : group + 8]
+        fours = [sums[i] + sums[i + 4] for i in range(4)]
+        totals[row] = (fours[0] + fours[2]) + (fours[1] + fours[3])
+    return totals
+
+
+@pytest.mark.parametrize("rows", [4, 8, 16])
+@pytest.mark.parametrize("blocks", [8, 16, 24])
+def test_scaled_block_sum_keeps_the_block_order(rows, blocks):
+    """The rows' shared trees add exactly the reduction's pairs: with partials
+    spread over many binary orders, any other order changes bits."""
+    rng = np.random.default_rng(rows * blocks)
+    spread = np.exp2(rng.integers(-24, 24, (rows, blocks, 256)))
+    partial = (rng.standard_normal((rows, blocks, 256)) * spread).astype(np.float32)
+    scale = np.exp2(rng.integers(-8, 8, (blocks, 256))).astype(np.float32)
+    got = np.asarray(jax.jit(dm._scaled_block_sum)(partial, scale))
+    want = _block_tree(partial * scale[None])
+    np.testing.assert_array_equal(got.view(np.uint32), want.view(np.uint32))
+    # These partials detect a different order: a sequential sum differs.
+    products = partial * scale[None]
+    sequential = products[:, 0]
+    for block in range(1, blocks):
+        sequential = sequential + products[:, block]
+    assert not np.array_equal(sequential, want)
+
+
 def _paired(monkeypatch, step, source, packed, scales, second=None, active=None):
     monkeypatch.setattr(dm, "MXFP4_PAIR_STEP", step)
     rows = source.shape[0] * (2 if second is not None else 1)

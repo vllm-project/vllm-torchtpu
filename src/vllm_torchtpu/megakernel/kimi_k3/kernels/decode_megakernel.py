@@ -581,6 +581,61 @@ def _scale_block_partials(activation, values, step):
     return partials[0] if len(partials) == 1 else jnp.concatenate(partials, axis=1)
 
 
+def _scaled_block_sum(partial, scale):
+    """``jnp.sum(partial * scale[None], axis=1)`` of [R, B, N] scale-block
+    partials (B a multiple of 8), adding in the order Mosaic lowers that sum to
+    (read from the compiled kernel): per row its 8-block groups left to right,
+    then a tree over the 8 sublanes (blocks i and i + 4, then the sums two
+    apart, then the last pair). A compiler that lowers the sum differently
+    would change the plain-sum paths' rounding, not this function's.
+
+    With 4 rows or a multiple of 8, the rows' trees share their rotations and
+    additions: each level packs the rows into the sublanes it leaves unused,
+    instead of reducing every row's 8 sublanes on their own.
+    """
+    rows, blocks, width = partial.shape
+    if blocks % 8 or not (rows == 4 or rows % 8 == 0):
+        return jnp.sum(partial * scale[None], axis=1)
+    products = partial * scale[None]
+    sums = [
+        functools.reduce(
+            jnp.add, [products[row, group : group + 8] for group in range(0, blocks, 8)]
+        )
+        for row in range(rows)
+    ]
+    sublane = jax.lax.broadcasted_iota(jnp.int32, (8, width), 0)
+
+    def roll(value, shift):  # sublane j takes sublane j - shift
+        return tpu.roll(value, shift % 8, 0)
+
+    def fours(first, second):
+        # [first's 4 sums i + (i + 4) | second's]
+        return jnp.where(sublane < 4, first, second) + roll(
+            jnp.where(sublane < 4, second, first), 4
+        )
+
+    def twos(first, second):
+        # first's sums two apart at sublanes 0, 1, 4, 5; second's at 2, 3, 6, 7
+        return jnp.where(
+            sublane % 4 < 2, first + roll(first, -2), second + roll(second, 2)
+        )
+
+    if rows == 4:
+        pairs = twos(fours(sums[0], sums[1]), fours(sums[2], sums[3]))
+        # Rows 0, 2, 1, 3 end at sublanes 0, 2, 4, 6.
+        totals = pairs + roll(pairs, -1)
+        return jnp.where((sublane == 1) | (sublane == 3), roll(totals, -3), totals)[:4]
+    totals = []
+    for first in range(0, rows, 8):
+        row = sums[first : first + 8]
+        even = twos(fours(row[0], row[4]), fours(row[2], row[6]))
+        odd = twos(fours(row[1], row[5]), fours(row[3], row[7]))
+        totals.append(
+            jnp.where(sublane % 2 == 0, even + roll(even, -1), odd + roll(odd, 1))
+        )
+    return jnp.concatenate(totals, axis=0) if len(totals) > 1 else totals[0]
+
+
 def _quantized_expert_dot(
     source,
     packed,
@@ -680,7 +735,7 @@ def _quantized_expert_dot(
             # the unsplit tile; reducing each subtile separately changes that
             # association and can perturb routing over many decode steps.
             partial = _scale_block_partials(activation, values, dot_tile)
-            accumulator[...] += jnp.sum(partial * scale[None], axis=1)
+            accumulator[...] += _scaled_block_sum(partial, scale)
             return
         scale_block_mask = (
             jnp.arange(size // 32)[:, None]
@@ -726,7 +781,7 @@ def _quantized_expert_dot(
                 (((2,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )
-            accumulator[...] += jnp.sum(partial * scale[None], axis=1)
+            accumulator[...] += _scaled_block_sum(partial, scale)
 
     if static_tiles:
         for start in range(0, contraction_size, MXFP4_STATIC_TILE):
@@ -875,8 +930,8 @@ def _paired_expert_gate_up(
                     values[:, half * columns:(half + 1) * columns],
                     MXFP4_PAIR_STEP,
                 )
-                result = jnp.sum(
-                    partial * scale[None, :, half * columns:(half + 1) * columns], axis=1
+                result = _scaled_block_sum(
+                    partial, scale[:, half * columns:(half + 1) * columns]
                 )
                 accumulator[
                     half * rows:(half + 1) * rows,
@@ -887,13 +942,13 @@ def _paired_expert_gate_up(
             partial = _scale_block_partials(
                 activation[:active_capacity], values, MXFP4_PAIR_STEP
             )
-            result = jnp.sum(partial * scale[None], axis=1)
+            result = _scaled_block_sum(partial, scale)
             accumulator[...] += jnp.pad(
                 result, ((0, source.shape[0] - active_capacity), (0, 0))
             )
         else:
             partial = _scale_block_partials(activation, values, MXFP4_PAIR_STEP)
-            accumulator[...] += jnp.sum(partial * scale[None], axis=1)
+            accumulator[...] += _scaled_block_sum(partial, scale)
 
     # Narrow scaled partials (MXFP4_PAIR_TILE) shorten register live ranges.
     tile_size = MXFP4_PAIR_TILE
@@ -917,7 +972,7 @@ def _paired_order_expert_gate_up(source, packed, scales, accumulator, contractio
         scale = jax.lax.bitcast_convert_type(exponents << 23, jnp.float32)
         activation = source[:, pl.ds(start, size)].astype(jnp.bfloat16)
         partial = _scale_block_partials(activation, values, MXFP4_PAIR_STEP)
-        accumulator[...] += jnp.sum(partial * scale[None], axis=1)
+        accumulator[...] += _scaled_block_sum(partial, scale)
 
 
 def _dot_scoped(function, name_of):
