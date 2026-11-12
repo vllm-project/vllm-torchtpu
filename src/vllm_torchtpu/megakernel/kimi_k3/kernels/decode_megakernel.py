@@ -424,6 +424,85 @@ def _route_owned_rows(
     )
 
 
+def _next_route(selected_experts, local_route_counts, processed, *, group_pending_routes):
+    """The routed-expert stream's next choice among the routes not yet
+    ``processed``: ``(expert, active_rows, slot_mask, consumed, has_expert)``.
+
+    Grouped routes take the lowest pending expert with all its routes.
+    Otherwise rows advance through their own route order and the lowest current
+    expert runs for the rows whose current route it is; ``slot_mask`` then marks
+    every row's current slot.
+    """
+    route_slots = jnp.arange(selected_experts.shape[1])[None, :]
+    pending = (route_slots < local_route_counts[:, None]) & ~processed
+    if group_pending_routes:
+        minimum_expert = jnp.min(
+            jnp.where(
+                pending,
+                selected_experts.astype(jnp.float32),
+                jnp.inf,
+            )
+        )
+        has_expert = jnp.any(pending)
+        expert = jnp.where(has_expert, minimum_expert, 0).astype(jnp.int32)
+        selected_slot_mask = pending & (selected_experts == expert)
+        active_rows = jnp.any(selected_slot_mask, axis=1)
+        return (
+            expert,
+            active_rows,
+            selected_slot_mask,
+            selected_slot_mask,
+            has_expert,
+        )
+    rows_with_routes = jnp.any(pending, axis=1)
+    current_slots = jnp.sum(processed.astype(jnp.int32), axis=1)
+    current_slot_mask = route_slots == current_slots[:, None]
+    current_experts = jnp.sum(
+        jnp.where(current_slot_mask, selected_experts, 0), axis=1
+    )
+    minimum_expert = jnp.min(
+        jnp.where(
+            rows_with_routes,
+            current_experts.astype(jnp.float32),
+            jnp.inf,
+        )
+    )
+    has_expert = jnp.any(rows_with_routes)
+    expert = jnp.where(has_expert, minimum_expert, 0).astype(jnp.int32)
+    active_rows = rows_with_routes & (current_experts == expert)
+    consumed = active_rows[:, None] & current_slot_mask
+    return expert, active_rows, current_slot_mask, consumed, has_expert
+
+
+def _next_route_pair(selected_experts, local_route_counts, processed, *, group_pending_routes):
+    """The next two choices of _next_route, the second after the first is consumed.
+
+    With EP16 halves every row holds both halves of a physical route back to
+    back (_expert_half_routes), so the choices consume them in step: the first
+    is always a first half 2e and the second is 2e + 1 for the same rows, which
+    needs no second selection.
+    """
+    first = _next_route(
+        selected_experts, local_route_counts, processed,
+        group_pending_routes=group_pending_routes,
+    )
+    expert, rows, slot_mask, consumed, has_expert = first
+    if EXPERT_HALVES == 1:
+        return first, _next_route(
+            selected_experts, local_route_counts, processed | consumed,
+            group_pending_routes=group_pending_routes,
+        )
+    route_slots = jnp.arange(selected_experts.shape[1])[None, :]
+    pending = (route_slots < local_route_counts[:, None]) & ~processed
+    other_half = pending & rows[:, None] & (selected_experts == expert + 1)
+    second_slot_mask = (
+        other_half if group_pending_routes
+        else other_half | (~rows[:, None] & slot_mask)
+    )
+    second_expert = jnp.where(has_expert, expert + 1, 0)
+    return first, (second_expert, rows, second_slot_mask, other_half, has_expert)
+
+
 def _start_initial_expert_weight_copies(
     selected_experts,
     local_route_counts,
@@ -438,52 +517,20 @@ def _start_initial_expert_weight_copies(
     This uses the same cross-row ordering as the expert stream, so it works for
     both shared and divergent routes without specializing on batch size.
     """
-    selected_expert_count = selected_experts.shape[1]
-    route_slots = jnp.arange(selected_expert_count)[None, :]
     processed = jnp.zeros(selected_experts.shape, jnp.bool_)
+    choices = []
+    while len(choices) < slot_count:
+        pair = _next_route_pair(
+            selected_experts, local_route_counts, processed,
+            group_pending_routes=group_pending_routes,
+        )
+        choices += pair
+        processed |= pair[0][3] | pair[1][3]
 
-    def next_expert(completed):
-        pending = (route_slots < local_route_counts[:, None]) & ~completed
-        if group_pending_routes:
-            minimum_expert = jnp.min(
-                jnp.where(
-                    pending,
-                    selected_experts.astype(jnp.float32),
-                    jnp.inf,
-                )
-            )
-            has_expert = jnp.any(pending)
-            expert = jnp.where(has_expert, minimum_expert, 0).astype(jnp.int32)
-            consumed = pending & (selected_experts == expert)
-        else:
-            rows_with_routes = jnp.any(pending, axis=1)
-            current_slots = jnp.sum(completed.astype(jnp.int32), axis=1)
-            current_slot_mask = route_slots == current_slots[:, None]
-            current_experts = jnp.sum(
-                jnp.where(current_slot_mask, selected_experts, 0), axis=1
-            )
-            minimum_expert = jnp.min(
-                jnp.where(
-                    rows_with_routes,
-                    current_experts.astype(jnp.float32),
-                    jnp.inf,
-                )
-            )
-            has_expert = jnp.any(rows_with_routes)
-            expert = jnp.where(has_expert, minimum_expert, 0).astype(jnp.int32)
-            consumed = (
-                rows_with_routes & (current_experts == expert)
-            )[:, None] & current_slot_mask
-        return expert, consumed, has_expert
-
-    for slot in range(slot_count):
-        expert, consumed, has_expert = next_expert(processed)
-
+    for slot, (expert, _, _, _, has_expert) in enumerate(choices[:slot_count]):
         @pl.when(has_expert & (slot >= already_started))
         def start_copy(expert=expert, slot=slot):
             _start_async_copies(copy_expert(expert, slot))
-
-        processed |= consumed
 
 
 def _expert_half_routes(selected_experts, selected_probabilities, local_route_counts):
@@ -964,47 +1011,11 @@ def _run_routed_expert_stream(
     )
     expert_output[...] = jnp.zeros(expert_output.shape, jnp.float32)
 
-    def next_expert(processed):
-        pending = (
-            route_slots < local_route_counts[:, None]
-        ) & ~processed
-        if group_pending_routes:
-            minimum_expert = jnp.min(
-                jnp.where(
-                    pending,
-                    selected_experts.astype(jnp.float32),
-                    jnp.inf,
-                )
-            )
-            has_expert = jnp.any(pending)
-            expert = jnp.where(has_expert, minimum_expert, 0).astype(jnp.int32)
-            selected_slot_mask = pending & (selected_experts == expert)
-            active_rows = jnp.any(selected_slot_mask, axis=1)
-            return (
-                expert,
-                active_rows,
-                selected_slot_mask,
-                selected_slot_mask,
-                has_expert,
-            )
-        rows_with_routes = jnp.any(pending, axis=1)
-        current_slots = jnp.sum(processed.astype(jnp.int32), axis=1)
-        current_slot_mask = route_slots == current_slots[:, None]
-        current_experts = jnp.sum(
-            jnp.where(current_slot_mask, selected_experts, 0), axis=1
+    def next_pair(processed):
+        return _next_route_pair(
+            selected_experts, local_route_counts, processed,
+            group_pending_routes=group_pending_routes,
         )
-        minimum_expert = jnp.min(
-            jnp.where(
-                rows_with_routes,
-                current_experts.astype(jnp.float32),
-                jnp.inf,
-            )
-        )
-        has_expert = jnp.any(rows_with_routes)
-        expert = jnp.where(has_expert, minimum_expert, 0).astype(jnp.int32)
-        active_rows = rows_with_routes & (current_experts == expert)
-        consumed = active_rows[:, None] & current_slot_mask
-        return expert, active_rows, current_slot_mask, consumed, has_expert
 
     def finish_expert(active_rows, current_slot_mask, copies, column, slot, output_weights=None):
         gate_up = gate_up_accumulator[
@@ -1549,10 +1560,19 @@ def _run_routed_expert_stream(
         expert_lanes = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
 
         def plan_lowest(remaining):
-            # Expert ids are < 128, exact in FP32 (as next_expert's minimum);
+            # Expert ids are < 128, exact in FP32 (as _next_route's minimum);
             # 128: the plan is exhausted.
             lowest = jnp.min(jnp.where(remaining, expert_lanes.astype(jnp.float32), 128.0)).astype(jnp.int32)
             return lowest, remaining & (expert_lanes != lowest)
+
+        def plan_lowest_pair(remaining):
+            first, remaining = plan_lowest(remaining)
+            if EXPERT_HALVES == 1:
+                second, remaining = plan_lowest(remaining)
+                return first, second, remaining
+            # ``used`` holds both halves of each physical expert (_next_route_pair).
+            second = jnp.where(first < 128, first + 1, 128)
+            return first, second, remaining & (expert_lanes != second)
 
         def plan_choice(lowest):
             has_expert = lowest < 128
@@ -1567,12 +1587,11 @@ def _run_routed_expert_stream(
         if plan_routes:
             # The carry holds only the next two expert ids and the plan; their
             # route masks are rebuilt when they run (no [B, 16] carries).
-            initial_first, initial_remaining = plan_lowest(used)
-            initial_second, initial_remaining = plan_lowest(initial_remaining)
+            initial_first, initial_second, initial_remaining = plan_lowest_pair(used)
         elif carry_routes:
-            initial_processed = jnp.zeros(selected_experts.shape, jnp.bool_)
-            initial_first = next_expert(initial_processed)
-            initial_second = next_expert(initial_processed | initial_first[3])
+            initial_first, initial_second = next_pair(
+                jnp.zeros(selected_experts.shape, jnp.bool_)
+            )
 
         def run_next_expert_pair(iteration, carry=None):
           if progress is not None:
@@ -1580,32 +1599,37 @@ def _run_routed_expert_stream(
           with _phase("e_iteration"):
             select_scope = _phase_start("e_select")
             processed = None if plan_routes else processed_routes_vmem[:, :selected_expert_count] != 0
+            if plan_routes:
+                first_choice, second_choice = plan_choice(carry[0]), plan_choice(carry[1])
+            elif carry_routes:
+                first_choice, second_choice = unpack(carry[0]), unpack(carry[1])
+            else:
+                first_choice, second_choice = next_pair(processed)
             (
                 first_expert,
                 first_rows,
                 first_slot_mask,
                 first_consumed,
                 has_first,
-            ) = plan_choice(carry[0]) if plan_routes else unpack(carry[0]) if carry_routes else next_expert(processed)
+            ) = first_choice
             (
                 second_expert,
                 second_rows,
                 second_slot_mask,
                 second_consumed,
                 has_second,
-            ) = plan_choice(carry[1]) if plan_routes else unpack(carry[1]) if carry_routes else next_expert(processed | first_consumed)
+            ) = second_choice
             third_lowest: Any = None
             fourth_lowest: Any = None
             remaining: Any = None
             if plan_routes:
-                third_lowest, remaining = plan_lowest(carry[2] != 0)
-                fourth_lowest, remaining = plan_lowest(remaining)
+                third_lowest, fourth_lowest, remaining = plan_lowest_pair(carry[2] != 0)
                 third_choice = (jnp.where(third_lowest < 128, third_lowest, 0), None, None, None, third_lowest < 128)
                 fourth_choice = (jnp.where(fourth_lowest < 128, fourth_lowest, 0), None, None, None, fourth_lowest < 128)
             else:
-                processed_after_pair = processed | first_consumed | second_consumed
-                third_choice = next_expert(processed_after_pair)
-                fourth_choice = next_expert(processed_after_pair | third_choice[3])
+                third_choice, fourth_choice = next_pair(
+                    processed | first_consumed | second_consumed
+                )
             (
                 third_expert,
                 third_rows,

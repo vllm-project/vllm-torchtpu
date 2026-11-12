@@ -227,6 +227,45 @@ def test_routes_expand_to_both_halves():
     assert local.shape == (2, 8)
 
 
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16])
+def test_half_pair_is_the_next_two_choices(monkeypatch, grouped, batch):
+    """EP16 halves: _next_route_pair's second choice (the first's other half,
+    same rows) is the choice _next_route makes once the first is consumed,
+    over whole visiting orders with shared, divergent and conflicting rows."""
+    rng = np.random.default_rng(batch)
+    options = {"group_pending_routes": grouped}
+    # Only _next_route_pair reads EXPERT_HALVES.
+    monkeypatch.setattr(dm, "EXPERT_HALVES", 2)
+    for _ in range(40):
+        # A small pool makes rows share experts and order them differently.
+        pool = rng.permutation(56)[: rng.integers(4, 12)]
+        counts = np.minimum(rng.integers(0, 6, batch), len(pool))
+        experts = np.zeros((batch, 16), np.int32)
+        for row, count in enumerate(counts):
+            experts[row, :count] = rng.permutation(pool)[:count]
+        local, _, local_counts = dm._expert_half_routes(
+            jnp.asarray(experts),
+            jnp.zeros((batch, 16), jnp.float32),
+            jnp.asarray(counts, jnp.int32),
+        )
+        processed = jnp.zeros(local.shape, jnp.bool_)
+        while True:
+            first = dm._next_route(local, local_counts, processed, **options)
+            after = processed | first[3]
+            second = dm._next_route(local, local_counts, after, **options)
+            pair = dm._next_route_pair(local, local_counts, processed, **options)
+            for got, want in zip(pair, (first, second), strict=True):
+                for got_value, want_value in zip(got, want, strict=True):
+                    np.testing.assert_array_equal(got_value, want_value)
+            if not first[4]:
+                break
+            assert first[0] % 2 == 0
+            processed = processed | first[3] | second[3]
+        pending = jnp.arange(32)[None] < local_counts[:, None]
+        assert not jnp.any(pending & ~processed)
+
+
 def test_config_checks_decode_expert_parallel():
     assert KernelConfig().decode_expert_parallel == 8
     with pytest.raises(ValueError, match="decode_expert_parallel"):
