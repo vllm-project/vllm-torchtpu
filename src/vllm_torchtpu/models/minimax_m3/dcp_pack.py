@@ -45,8 +45,9 @@ def _rows(x: torch.Tensor, lanes: int) -> torch.Tensor:
     words = x.contiguous().view(torch.int16)
     n, m = words.shape
     rows = -(-m // lanes)
-    if rows * lanes != m:
-        words = torch.nn.functional.pad(words, (0, rows * lanes - m))
+    # Always pad (possibly by 0): a Python branch on the token count here
+    # splits the backbone's bucket groups and forces a re-trace.
+    words = torch.nn.functional.pad(words, (0, rows * lanes - m))
     return words.view(n, rows, lanes)
 
 
