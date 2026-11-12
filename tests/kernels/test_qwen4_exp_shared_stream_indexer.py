@@ -639,9 +639,80 @@ def test_prefill_pool_page_table_keeps_the_selection(
 
     def run():
         return np.asarray(
-            pooled_qsa.select_blocks(**args, ratio=RATIO, block_topk=BLOCK_TOPK, slot=slot)
+            pooled_qsa.select_blocks(
+                **args, ratio=RATIO, block_topk=BLOCK_TOPK, slot=slot
+            )
         )
 
     expected = run()
     monkeypatch.setattr(pooled_qsa, "PREFILL_PAGE_TABLE_SMEM_BYTES", 0)
     np.testing.assert_array_equal(run(), expected)
+
+
+def test_decode_only_skips_mixed_and_tail_launches(monkeypatch):
+    """decode_only=True emits a single batched decode kernel when max_reqs % 8 == 0."""
+    info = _tpu7x_info()
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    shape = jax.ShapeDtypeStruct
+    args = (
+        shape((16, 4, 128), jnp.bfloat16),
+        shape((16, 4), jnp.float32),
+        shape((4, 32, 4, 256), jnp.uint8),
+        shape((16,), jnp.int32),
+        shape((64,), jnp.int32),
+        shape((17,), jnp.int32),
+        shape((3,), jnp.int32),
+    )
+    fn = jax.jit(
+        functools.partial(
+            streamindex.streamindex_topk,
+            k=128,
+            compression_ratio=2,
+            num_kv_pages_per_block=(8, 8, 8),
+            num_queries_per_block=(1, 128, 128),
+            decode_req_batch_size=8,
+            components=pooled_qsa.qsa_indexing(),
+            decode_only=True,
+            hoist_step_metadata=True,
+        )
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("x",),
+        abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        text = fn.trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+    assert "StreamIdxTC-d-bq_1-bkvp_8" in text
+    assert "StreamIdxTC-m" not in text
+
+
+def test_auto_shared_verify_engages_for_multi_token_verify(monkeypatch):
+    """When query_block is unset and max_query_len > 1, shared verify auto-enables."""
+    info = _tpu7x_info()
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    monkeypatch.delenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", raising=False)
+    shape = jax.ShapeDtypeStruct
+    args = (
+        shape((32, 4, 128), jnp.bfloat16),
+        shape((64, 512, 1, 2, 256), jnp.bfloat16),
+        shape((32,), jnp.int32),
+        shape((32, 16), jnp.int32),
+        shape((32,), jnp.int32),
+        shape((33,), jnp.int32),
+        shape((32,), jnp.int32),
+    )
+    select_fn = jax.jit(
+        functools.partial(
+            pooled_qsa.select_blocks, ratio=RATIO, block_topk=512, max_query_len=4
+        )
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("x",),
+        abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        text = select_fn.trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+    assert "StreamIdxTC-m-bq_4-bkvp_32" in text
+    assert "StreamIdxTC-d" not in text
