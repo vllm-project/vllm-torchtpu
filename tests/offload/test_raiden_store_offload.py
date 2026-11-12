@@ -4550,3 +4550,48 @@ class TestLoadPacing(unittest.TestCase):
         self.assertFalse(job.success)
         self.assertEqual(job.failed_device_block_ids, [10])
         self.assertEqual(self.store.pinned_hashes(), {})
+
+
+class TestStorePacing(unittest.TestCase):
+    """max_inflight_store_sub_blocks runs a store job as insert+save pieces."""
+
+    def setUp(self):
+        self.store = FakeKVCacheStore()
+        self.manager = make_manager(self.store, max_inflight_store_sub_blocks=8)
+        self.keys = [_key(0), _key(1), _key(2)]
+        self.assertEqual(self.manager.prepare_store(self.keys, _ctx()).keys_to_store, self.keys)
+
+    def test_pieces_launch_in_turn_and_finish_the_job_once(self):
+        self.manager.submit_store_job(7, self.keys, [5, 6, 9])
+        (insert,) = self.store.calls_named("insert")
+        self.assertEqual(insert.args[0], sub_hashes(_key(0)) + sub_hashes(_key(1)))
+        self.assertTrue(self.manager.is_job_launched(7))
+        self.store.complete_save(self.store.calls_named("save")[-1].args[0])
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        save = self.store.calls_named("save")[-1]
+        self.assertEqual(save.args[0], sub_hashes(_key(2)))
+        self.store.complete_save(save.args[0])
+        (job,) = self.manager.poll_finished_jobs()
+        self.assertEqual((job.job_id, job.success), (7, True))
+        self.assertFalse(self.manager.has_pending_work())
+        self.assertEqual(self.store.pinned_hashes(), {})
+        for key in self.keys:
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+
+    def test_drain_drops_unlaunched_pieces(self):
+        self.manager.submit_store_job(7, self.keys, [5, 6, 9])
+        self.store.complete_save(self.store.calls_named("save")[-1].args[0])
+        (job,) = self.manager.drain_jobs({7})
+        self.assertEqual((job.job_id, job.success), (7, False))
+        self.assertEqual(len(self.store.calls_named("save")), 1)
+        self.assertFalse(self.manager.has_pending_work())
+        self.assertEqual(self.manager._inflight_store_keys, set())
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_a_rejected_piece_fails_the_job(self):
+        self.manager.submit_store_job(7, self.keys, [5, 6, 9])
+        self.store.fail_insert = True
+        self.store.complete_save(self.store.calls_named("save")[-1].args[0])
+        (job,) = self.manager.poll_finished_jobs()
+        self.assertEqual((job.job_id, job.success), (7, False))
+        self.assertFalse(self.manager.has_pending_work())
