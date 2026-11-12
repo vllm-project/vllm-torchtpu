@@ -55,8 +55,17 @@ def _load_msa():
     ]
     assert len(body) == len(want), [getattr(n, "name", n) for n in body]
     mod = types.ModuleType("msa_subset")
+
+    class _Envs:
+        def __getattr__(self, name):
+            return os.environ.get(name, "0") == "1"
+
     mod.__dict__.update(
-        os=os, torch=torch, Any=typing.Any, init_logger=logging.getLogger
+        os=os,
+        torch=torch,
+        Any=typing.Any,
+        init_logger=logging.getLogger,
+        envs=_Envs(),
     )
     exec(
         compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), mod.__dict__

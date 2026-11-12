@@ -14,7 +14,6 @@
 """Torch entry point for the JAX MSA forward."""
 
 import functools
-import os
 from collections.abc import Callable
 from typing import Any
 
@@ -447,15 +446,16 @@ def gather_group_heads(
     )
 
 
-# TPU_MINIMAX_M3_DCP_KV_GATHER_SHARE=1: the ``kv_head_replicas`` ranks of a
-# KV head hold the same new k/v/index_q, so each sends only its share of the
-# tokens and the group's gather carries every head once instead of
+# TPU_MINIMAX_M3_DCP_KV_GATHER_SHARE=1 (an envs.py variable, so it keys the
+# compile caches): the ``kv_head_replicas`` ranks of a KV head hold the same
+# new k/v/index_q up to rounding, so each sends only its share of the tokens
+# and the group's gather carries every head once instead of
 # ``kv_head_replicas`` times (half the bytes at c64, DCP 8 over 4 KV heads).
 KV_GATHER_SHARE_ENV = "TPU_MINIMAX_M3_DCP_KV_GATHER_SHARE"
 
 
 def kv_gather_share_enabled() -> bool:
-    return os.environ.get(KV_GATHER_SHARE_ENV, "0") == "1"
+    return bool(envs.TPU_MINIMAX_M3_DCP_KV_GATHER_SHARE)
 
 
 if kv_gather_share_enabled():
@@ -480,8 +480,8 @@ def gather_group_kv(
 
     With `KV_GATHER_SHARE_ENV` and this rank's ``dcp_rank`` (``int32[1]``),
     rank ``h * r + j`` sends rows ``[j * T / r, (j + 1) * T / r)`` of its KV
-    head (``r = kv_head_replicas``): the replicas compute the same values, so
-    the result is the same, from ``1 / r`` of the bytes."""
+    head (``r = kv_head_replicas``): ``1 / r`` of the bytes; the replicas
+    compute the same values up to rounding (not bit for bit)."""
     num_tokens, _, head_dim = k.shape
     kv_heads = dcp // kv_head_replicas
     if (
