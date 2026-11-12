@@ -46,6 +46,8 @@ def _case(kind):
         lens, ctx, ndec = [4096, 2048, 1536, 512], [60000, 20000, 0, 3000], 0
     elif kind == "mixdec":
         lens, ctx, ndec = [4] * 20 + [8112], [30000 + i for i in range(20)] + [75776], 20
+    elif kind == "small":  # <= 256 rows: the single-launch program
+        lens, ctx, ndec = [4] * 10 + [100], [50 + i for i in range(10)] + [900], 10
     elif kind == "ragged":
         lens, ctx, ndec = [3, 1, 4, 300, 129, 7, 1000], [9, 0, 5, 0, 77, 1, 0], 3
     else:
@@ -167,12 +169,23 @@ def _assert_kernel_view_equal(got, want):
         np.testing.assert_array_equal(g, w, err_msg=jax.tree_util.keystr(path))
 
 
-@pytest.mark.parametrize("kind", ["pf1", "mix4", "mixdec", "ragged"])
+def _segment_metas(calls):
+    """(BATCHED, PER_SEQ) metadata, from one single-launch call (a pair) or
+    from the two-call path (prefill programs over 256 rows)."""
+    if len(calls) == 1:
+        assert isinstance(calls[0], tuple)
+        return list(calls[0])
+    assert len(calls) == 2
+    return list(calls)
+
+
+@pytest.mark.parametrize("kind", ["pf1", "mix4", "mixdec", "ragged", "small"])
 def test_packed_step_metadata_matches_per_layer(kind, fake_tpu):
     tokens, md = _case(kind)
     _run(tokens, md)
-    per_layer = list(fake_tpu)
-    assert len(per_layer) == 1  # single launch: (BATCHED, PER_SEQ) metas
+    launches = len(fake_tpu)
+    assert launches == (1 if tokens <= 256 else 2)
+    per_layer = [_segment_metas(list(fake_tpu))]
     fake_tpu.clear()
     exact = _run(tokens, md, metadata_only=True)
     assert exact.dtype == jnp.int32 and exact.ndim == 1
@@ -186,7 +199,8 @@ def test_packed_step_metadata_matches_per_layer(kind, fake_tpu):
     np.testing.assert_array_equal(np.asarray(packed[: exact.size]), np.asarray(exact))
     assert not np.asarray(packed[exact.size :]).any()
     _run(tokens, md, packed_metadata=packed)
-    (stepped,) = fake_tpu
+    assert len(fake_tpu) == launches
+    stepped = _segment_metas(list(fake_tpu))
     for got, want in zip(stepped, per_layer[0], strict=True):
         _assert_kernel_view_equal(got, want)
     if kind != "mixdec":
