@@ -33,6 +33,9 @@ class KernelConfig:
     mla_decode_ktile: int = 1024
     # Routed experts and weight layout (the pre-shard format).
     expert_gate_up: str = "mxfp4"  # "mxfp4" or "fp8" (reblocked)
+    # Decode routed experts: 8 (EP8/TP4, the pre-shard layout) or 16 (EP16/TP2,
+    # the prefill's families; each expert runs as two TP4-width halves).
+    decode_expert_parallel: int = 8
     mxfp4_block: int = 2048
     mxfp4_pair_tile: int = 512
     mxfp4_static_tile: int = 0
@@ -78,10 +81,11 @@ class KernelConfig:
         default_factory=lambda: envs.K3_PREFILL_ROUTE_COUNTS
     )
     prefill_route_counts_every: int = 200
-    # Prefill EP16 expert placement (empty: the pre-shard's): an npz whose
-    # ``order`` [92, 896] is the logical expert at each physical slot (chip c:
-    # slots 56c..56c+55); the router columns and expert weights are loaded in
-    # that order. A bare name loads from kimi_k3/data.
+    # EP16 expert placement of the prefill and of an EP16 decode (empty: the
+    # pre-shard's): an npz whose ``order`` [92, 896] is the logical expert at
+    # each physical slot (chip c: slots 56c..56c+55); the router columns and
+    # expert weights are loaded in that order (rank_loader.prefill_expert_plan).
+    # A bare name loads from kimi_k3/data.
     prefill_expert_plan: str = dataclasses.field(
         default_factory=lambda: envs.K3_PREFILL_EXPERT_PLAN
     )
@@ -133,6 +137,11 @@ class KernelConfig:
             raise ValueError("kd_hot_plan and kd_replica_plan are exclusive")
         if not set(self.fp8_wires) <= {"t0", "t10"}:
             raise ValueError("fp8_wires holds t0 and/or t10")
+        if self.decode_expert_parallel not in (8, 16):
+            raise ValueError("decode_expert_parallel is 8 or 16")
+        hot_plans = self.kd_hot_plan or self.kd_replica_plan
+        if self.decode_expert_parallel == 16 and hot_plans:
+            raise ValueError("hot-expert plans need decode_expert_parallel 8")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
         if self.mla_decode_ktile not in (1024, 2048):

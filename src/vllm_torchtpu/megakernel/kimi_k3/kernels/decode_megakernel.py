@@ -81,6 +81,52 @@ HOT_LOCAL_EXPERTS = 112  # EP8 local experts; copy slot j is local id 112 + j (f
 REPLICAS = bool(_config().kd_replica_plan)
 REPLICA_LANE = 3584  # replica table in latent_norm's zero padding lanes (see rank_loader._replica_table)
 SCATTER_BATCHES = (8, 12, 16, 20, 24, 28, 32, 64, 96, 128)
+# KernelConfig.decode_expert_parallel=16: the expert families hold 56 EP16/TP2 experts
+# ([56, K/8, 4W] gate/up as gate halves then up halves, [56, 2W/8, N] down). Expert e's
+# half h runs as local expert 2e + h with the EP8 slot shapes (TP4 width W).
+EXPERT_HALVES = 2 if _config().decode_expert_parallel == 16 else 1
+
+
+def _local_half(index, half=0):
+    """The local index of half ``half`` of physical index ``index`` (an expert,
+    a route slot or a route count): ``EXPERT_HALVES * index + half``."""
+    return index if EXPERT_HALVES == 1 else EXPERT_HALVES * index + half
+
+
+def expert_slot_shape(name, shape, halves=None):
+    """One expert slot's shape for family ``name`` of per-layer shape ``shape`` [E, ...]."""
+    rows, columns = shape[1:]
+    if (EXPERT_HALVES if halves is None else halves) == 1:
+        return (rows, columns)
+    if name in ("expert_gu", "expert_gus"):
+        return (rows, columns // 2)
+    return (rows // 2, columns)
+
+
+def expert_half_windows(name, slot_shape, half):
+    """Where local expert half ``half`` of a physical EP16 expert sits in family
+    ``name``: ``(axis, source start, size, slot start)`` windows along axis 1
+    (columns: gate then up) or 0 (rows) of the expert's [rows, columns] entry."""
+    rows, columns = slot_shape
+    if name in ("expert_gu", "expert_gus"):
+        width = columns // 2
+        return [(1, part * 2 * width + half * width, width, part * width) for part in range(2)]
+    return [(0, half * rows, rows, 0)]
+
+
+class _CopyPair:
+    """Two DMAs started and waited together."""
+
+    def __init__(self, first, second):
+        self.first, self.second = first, second
+
+    def start(self):
+        self.first.start()
+        self.second.start()
+
+    def wait(self):
+        self.first.wait()
+        self.second.wait()
 
 
 def _bf16_rows_view(ref, rows, width):
@@ -564,6 +610,23 @@ def _start_initial_expert_weight_copies(
             _start_async_copies(copy_expert(expert, slot))
 
         processed |= consumed
+
+
+def _expert_half_routes(selected_experts, selected_probabilities, local_route_counts):
+    """EP16 halves: each local route [B, k] to physical expert e becomes routes to local
+    experts 2e and 2e + 1 (same probability), in route order: [B, 2k]."""
+    batch_size, count = selected_experts.shape
+    lanes = jax.lax.broadcasted_iota(jnp.int32, (batch_size, 2 * count), 1)
+    experts = jnp.zeros((batch_size, 2 * count), jnp.int32)
+    probabilities = jnp.zeros((batch_size, 2 * count), jnp.float32)
+    for route in range(count):
+        expert = selected_experts[:, route : route + 1]
+        experts = jnp.where(lanes == 2 * route, 2 * expert, experts)
+        experts = jnp.where(lanes == 2 * route + 1, 2 * expert + 1, experts)
+        probabilities = jnp.where(
+            lanes // 2 == route, selected_probabilities[:, route : route + 1], probabilities
+        )
+    return experts, probabilities, 2 * local_route_counts
 
 
 def _hot_home_routes(latent_norm, selected_experts, local_route_counts, slot_count):
@@ -2406,6 +2469,8 @@ class MixtureOfExpertsWeights:
         gate_up: bool = True,
         down: bool = True,
     ) -> SimpleNamespace:
+        if EXPERT_HALVES == 2:
+            return self._make_expert_half_copies(expert, slot, gate_up=gate_up, down=down)
         return SimpleNamespace(
             gate_up=(
                 tpu.make_async_copy(
@@ -2443,6 +2508,37 @@ class MixtureOfExpertsWeights:
                 if down
                 else None
             ),
+        )
+
+    def _make_expert_half_copies(self, expert, slot, *, gate_up, down):
+        """EP16 local expert ``expert`` = half ``expert % 2`` of physical expert
+        ``expert // 2``: its gate and up column halves, its down row half."""
+        physical, half = expert // 2, expert % 2
+
+        def copy(name, source, destination, semaphore):
+            copies = []
+            for axis, start, size, offset in expert_half_windows(name, destination.shape[1:], half):
+                if axis == 1:
+                    window = (source.at[physical, :, pl.ds(start, size)],
+                              destination.at[slot, :, pl.ds(offset, size)])
+                else:
+                    window = (source.at[physical, pl.ds(start, size)], destination.at[slot])
+                copies.append(tpu.make_async_copy(*window, semaphore))
+            return copies[0] if len(copies) == 1 else _CopyPair(*copies)
+
+        def family(name, source, destination, semaphore, wanted):
+            return copy(name, source, destination, semaphore) if wanted else None
+
+        semaphores = self.expert_copy_semaphores
+        return SimpleNamespace(
+            gate_up=family("expert_gu", self.expert_gate_up_projection,
+                           self.expert_gate_up_projection_vmem, semaphores.at[slot, 0], gate_up),
+            gate_up_scales=family("expert_gus", self.expert_gate_up_scales,
+                                  self.expert_gate_up_scales_vmem, semaphores.at[slot, 1], gate_up),
+            down=family("expert_down", self.expert_down_projection,
+                        self.expert_down_projection_vmem, semaphores.at[slot, 2], down),
+            down_scales=family("expert_ds", self.expert_down_scales,
+                               self.expert_down_scales_vmem, semaphores.at[slot, 3], down),
         )
 
 
@@ -2542,26 +2638,45 @@ def moe(
     expert_count = weights.routing_projection.shape[1]
     latent_size = weights.latent_normalization.shape[-1]
     expert_output_size = weights.expert_down_projection.shape[-1]
-    local_expert_count = weights.expert_gate_up_projection.shape[0]
+    # Per-slot (local expert) shapes; EP16 halves: see EXPERT_HALVES.
+    gate_up_slot, gate_up_scale_slot, down_slot, down_scale_slot = (
+        expert_slot_shape(name, ref.shape)
+        for name, ref in (
+            ("expert_gu", weights.expert_gate_up_projection),
+            ("expert_gus", weights.expert_gate_up_scales),
+            ("expert_down", weights.expert_down_projection),
+            ("expert_ds", weights.expert_down_scales),
+        )
+    )
+    # Routing owns physical experts; the expert loop runs local experts (halves).
+    routed_expert_count = weights.expert_gate_up_projection.shape[0]
+    local_expert_count = EXPERT_HALVES * routed_expert_count
+    if EXPERT_HALVES == 2 and (
+        routed_expert_count * 16 != expert_count
+        or weights.expert_gate_up_projection.dtype != jnp.uint32
+        or weights.expert_down_projection.dtype != jnp.uint32
+    ):
+        raise ValueError("EP16 decode experts are 56 MXFP4 experts per rank")
     # Replicas: entries 112.. of the local expert families are replica slots.
     replica_slots = local_expert_count - expert_count // 8 if REPLICAS else 0
     if replica_slots:
-        local_expert_count = expert_count // 8
+        local_expert_count = routed_expert_count = expert_count // 8
         if not 0 < replica_slots <= 16:
             raise ValueError("replica slots must be 1..16 (local ids < 128)")
     expert_tensor_parallel = 32 * local_expert_count // expert_count
+    routed_tensor_parallel = 32 * routed_expert_count // expert_count
     down_is_reblocked_fp8 = (
         weights.expert_down_projection.dtype == jnp.float8_e4m3fn
     )
     expert_width = (
-        weights.expert_down_projection.shape[1]
+        down_slot[0]
         if down_is_reblocked_fp8
-        else weights.expert_down_projection.shape[1] * 8
+        else down_slot[0] * 8
     )
     expert_input_size = (
-        weights.expert_gate_up_projection.shape[1] * 8
+        gate_up_slot[0] * 8
         if weights.expert_gate_up_projection.dtype == jnp.uint32
-        else weights.expert_gate_up_projection.shape[1]
+        else gate_up_slot[0]
     )
     shared_width = weights.shared_down_projection.shape[0]
     expert_prefetch_slot_count = 4
@@ -2583,6 +2698,7 @@ def moe(
         or not token_scatter_output
         or token_scatter_owners != 4
         or expert_tensor_parallel != 4
+        or EXPERT_HALVES != 1
     ):
         raise ValueError("MoE token pipeline needs B32/B64, EP8/TP4 and pair-owned routed reduce-scatter")
     if weights.expert_gate_up_projection.dtype not in (
@@ -2621,9 +2737,9 @@ def moe(
 
     if weights.expert_gate_up_projection.dtype == jnp.uint32:
         if (
-            weights.expert_gate_up_projection.shape[1:]
+            gate_up_slot
             != (expert_input_size // 8, 2 * expert_width)
-            or weights.expert_gate_up_scales.shape[1:]
+            or gate_up_scale_slot
             != (expert_input_size // 32, 2 * expert_width)
             or weights.expert_gate_up_scales.dtype != jnp.uint8
         ):
@@ -2638,7 +2754,7 @@ def moe(
         raise ValueError("FP8 gate/up weights have inconsistent shapes")
 
     if down_is_reblocked_fp8:
-        if weights.expert_down_projection.shape[1] != expert_width:
+        if down_slot[0] != expert_width:
             raise ValueError("Reblocked FP8 down weights have the wrong width")
         if weights.expert_down_scales.dtype != jnp.bfloat16:
             raise ValueError("Reblocked FP8 down scales must be BF16")
@@ -2648,7 +2764,8 @@ def moe(
         ):
             raise ValueError("FP8 down scales must partition the contraction")
     elif (
-        weights.expert_down_projection.shape[1] * 8 != expert_width
+        down_slot[0] * 8 != expert_width
+        or down_scale_slot[0] * 32 != expert_width
         or weights.expert_down_scales.dtype != jnp.uint8
     ):
         raise ValueError("MXFP4 down weights or scales have inconsistent shapes")
@@ -2713,22 +2830,10 @@ def moe(
     if weights.routing_projection_vmem.shape != (1, hidden_size, 512):
         raise ValueError("MoE routing projection workspace has the wrong shape")
     expert_workspace_shapes = (
-        (
-            weights.expert_gate_up_projection_vmem.shape,
-            (expert_prefetch_slot_count, *weights.expert_gate_up_projection.shape[1:]),
-        ),
-        (
-            weights.expert_gate_up_scales_vmem.shape,
-            (expert_prefetch_slot_count, *weights.expert_gate_up_scales.shape[1:]),
-        ),
-        (
-            weights.expert_down_projection_vmem.shape,
-            (expert_prefetch_slot_count, *weights.expert_down_projection.shape[1:]),
-        ),
-        (
-            weights.expert_down_scales_vmem.shape,
-            (expert_prefetch_slot_count, *weights.expert_down_scales.shape[1:]),
-        ),
+        (weights.expert_gate_up_projection_vmem.shape, (expert_prefetch_slot_count, *gate_up_slot)),
+        (weights.expert_gate_up_scales_vmem.shape, (expert_prefetch_slot_count, *gate_up_scale_slot)),
+        (weights.expert_down_projection_vmem.shape, (expert_prefetch_slot_count, *down_slot)),
+        (weights.expert_down_scales_vmem.shape, (expert_prefetch_slot_count, *down_scale_slot)),
     )
     if any(actual != expected for actual, expected in expert_workspace_shapes):
         raise ValueError("MoE expert weight workspace has an invalid shape")
@@ -2885,24 +2990,26 @@ def moe(
             shared_route_prefix *= jnp.all(winners == winners[0]).astype(
                 jnp.int32
             )
+            # A physical route takes EXPERT_HALVES consecutive slots.
             should_prefetch = (
                 shared_route_prefix
                 * owned_locally.astype(jnp.int32)[0]
                 * (
-                    route_counts[0] < expert_prefetch_slot_count
+                    route_counts[0] < expert_prefetch_slot_count // EXPERT_HALVES
                 ).astype(jnp.int32)
             )
 
             @pl.when(should_prefetch != 0)
             def start_expert_copy():
-                _start_async_copies(
-                    copy_expert(
-                        winners[0] % local_expert_count,
-                        route_counts[0],
+                for half in range(EXPERT_HALVES):
+                    _start_async_copies(
+                        copy_expert(
+                            _local_half(winners[0] % routed_expert_count, half),
+                            _local_half(route_counts[0], half),
+                        )
                     )
-                )
 
-            prefetched_expert_count += should_prefetch
+            prefetched_expert_count += _local_half(should_prefetch)
 
         def overlap_router_score_exchange():
             # Latent projection reads hidden states, not router scores. Its
@@ -2961,8 +3068,8 @@ def moe(
                 send_semaphores,
                 receive_semaphores,
                 selected_expert_count=selected_expert_count,
-                local_expert_count=local_expert_count,
-                expert_tensor_parallel=expert_tensor_parallel,
+                local_expert_count=routed_expert_count,
+                expert_tensor_parallel=routed_tensor_parallel,
                 on_local_selection=prefetch_shared_route_prefix,
                 after_selection=overlap_routing_with_latent_gather,
                 after_scores=after_routing_scores,
@@ -2977,8 +3084,8 @@ def moe(
                 send_semaphores.at[0],
                 receive_semaphores.at[0],
                 selected_expert_count=selected_expert_count,
-                local_expert_count=local_expert_count,
-                expert_tensor_parallel=expert_tensor_parallel,
+                local_expert_count=routed_expert_count,
+                expert_tensor_parallel=routed_tensor_parallel,
                 on_local_selection=prefetch_shared_route_prefix,
                 after_selection=overlap_routing_with_latent_gather,
                 after_scores=after_routing_scores,
@@ -2996,13 +3103,18 @@ def moe(
             selected_experts = _hot_home_routes(
                 weights.latent_normalization, selected_experts, local_route_counts, hot_info[3]
             )
+        if EXPERT_HALVES == 2:
+            selected_experts, selected_probabilities, local_route_counts = _expert_half_routes(
+                selected_experts, selected_probabilities, local_route_counts
+            )
+        route_columns = selected_experts.shape[1]
         selected_experts_vmem[...] = jnp.pad(
             selected_experts,
-            ((0, 0), (0, 128 - selected_expert_count)),
+            ((0, 0), (0, 128 - route_columns)),
         )
         selected_probabilities_vmem[...] = jnp.pad(
             selected_probabilities,
-            ((0, 0), (0, 128 - selected_expert_count)),
+            ((0, 0), (0, 128 - route_columns)),
         )
         local_route_counts_vmem[...] = jnp.broadcast_to(
             local_route_counts[:, None], local_route_counts_vmem.shape
@@ -3518,8 +3630,8 @@ def moe(
         with _phase("p4_experts"):
             _run_routed_expert_stream(
             latent_vmem,
-            selected_experts_vmem[:, :selected_expert_count],
-            selected_probabilities_vmem[:, :selected_expert_count],
+            selected_experts_vmem[:, :EXPERT_HALVES * selected_expert_count],
+            selected_probabilities_vmem[:, :EXPERT_HALVES * selected_expert_count],
             local_route_counts_vmem[:, 0],
             probability_totals_vmem[:, 0],
             expert_gate_up_vmem,
@@ -3554,8 +3666,8 @@ def moe(
         with _phase("p4_experts"):
             _run_routed_expert_stream(
             latent_vmem,
-            selected_experts_vmem[:, :selected_expert_count],
-            selected_probabilities_vmem[:, :selected_expert_count],
+            selected_experts_vmem[:, :EXPERT_HALVES * selected_expert_count],
+            selected_probabilities_vmem[:, :EXPERT_HALVES * selected_expert_count],
             local_route_counts_vmem[:, 0],
             probability_totals_vmem[:, 0],
             expert_gate_up_vmem,
@@ -7038,6 +7150,13 @@ def stack(
         name: jax.ShapeDtypeStruct(value.shape[1:], value.dtype)
         for name, value in weights.items()
     }
+    if EXPERT_HALVES == 2:
+        # Slots and scratch are sized per local expert (one half).
+        for name in ("expert_gu", "expert_gus", "expert_down", "expert_ds"):
+            family = local_weights[name]
+            local_weights[name] = jax.ShapeDtypeStruct(
+                (EXPERT_HALVES * family.shape[0], *expert_slot_shape(name, family.shape)), family.dtype
+            )
 
     def pooled_shape(name):
         """Pool footprint of a layer weight: a ring stream's slot region
