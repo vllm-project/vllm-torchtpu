@@ -47,7 +47,10 @@ from vllm_torchtpu.layers.adapter.attention import (
     TPU_HEAD_SIZE_ALIGNMENT,
     PallasAttentionBackend,
 )
-from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_compact_pooled_qsa_op
+from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+    build_compact_pooled_qsa_op,
+    build_compact_pooled_qsa_projected_op,
+)
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedLinearMethod,
 )
@@ -339,6 +342,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.cache_owners: tuple[torch.Tensor, ...] = ()
         self.register_buffer("output_weight_tiles", None, persistent=False)
         self.register_buffer("k_norm_multiplier", None, persistent=False)
+        self.register_buffer("norm_weights_packed", None, persistent=False)
         self._loaded: set[str] = set()
         self.rope_axes = rope_axis_assignment(
             config.rope_parameters,
@@ -359,6 +363,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             ring_capacity=self.ring_capacity,
         )
         self._projected_op = None
+        self._fused_projected_op = None
 
     def get_attn_backend(self):
         return Qwen4ExpPooledQSABackend
@@ -461,12 +466,43 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self._loaded.update(loaded)
         return loaded
 
+    def _build_norm_weights_packed(self) -> torch.Tensor:
+        assert self.k_norm_multiplier is not None
+        return torch.cat(
+            [
+                self.k_norm_multiplier,
+                self.indexer.q_layernorm.weight.detach().float(),
+                self.indexer.k_layernorm.weight.detach().float(),
+            ],
+            dim=0,
+        )
+
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
         if self.k_norm_multiplier is not None:
             # Rebuild after dtype/device conversion; never retain a rounded BF16 scale.
             self.k_norm_multiplier = 1.0 + self.k_norm.weight.detach().float()
+            if self.norm_weights_packed is not None:
+                self.norm_weights_packed = self._build_norm_weights_packed()
         return result
+
+    def _supports_fused_qsa_decode(self) -> bool:
+        rotary_dim = int(self.head_dim * self.config.partial_rotary_factor)
+        return (
+            self._supports_projected_output()
+            and self.fp8_kv
+            and self.num_heads == 24
+            and self.num_kv_heads == 2
+            and self.head_dim == 256
+            and self.index_n_heads == 4
+            and self.index_head_dim == 128
+            and self.compress_ratio == 4
+            and self.ring_capacity in (4, 8)
+            and self.token_topk == 2048
+            and rotary_dim == 64
+            and self.topk_backend is None
+            and self.output_weight_tiles is not None
+        )
 
     def finalize_weights(self, *, block_size: int | None = None):
         expected = set(dict(self.named_parameters())) - {"input_proj.weight"}
@@ -475,6 +511,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         if missing:
             raise ValueError(f"Missing QSA checkpoint tensors: {sorted(missing)}")
         self.k_norm_multiplier = 1.0 + self.k_norm.weight.detach().float()
+        self.norm_weights_packed = self._build_norm_weights_packed()
         # Shard checkpoint columns before preparing the existing K-major BF16
         # linear path. Its idempotent hook also handles the loader's later pass.
         self.o_proj.quant_method = VllmUnquantizedLinearMethod()
@@ -492,6 +529,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         if tile is None:
             self.output_weight_tiles = None
             self._projected_op = None
+            self._fused_projected_op = None
         if tile is not None and self.output_weight_tiles is None:
             self.output_weight_tiles = (
                 torch.nn.functional.pad(weight.detach(), (0, -weight.shape[1] % tile))
@@ -506,6 +544,18 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     topk_backend=self.topk_backend,
                     topk_backend_key=self.topk_backend_key,
                     project_output=True,
+                    rope_axes=self.rope_axes,
+                    cache_tags=self.cache_tags,
+                ),
+                compress_ratio=self.compress_ratio,
+                token_topk=self.token_topk,
+                norm_eps=float(self.q_norm.variance_epsilon),
+                rotary_dim=int(self.head_dim * self.config.partial_rotary_factor),
+                ring_capacity=self.ring_capacity,
+            )
+        if self._supports_fused_qsa_decode() and self._fused_projected_op is None:
+            self._fused_projected_op = partial(
+                build_compact_pooled_qsa_projected_op(
                     rope_axes=self.rope_axes,
                     cache_tags=self.cache_tags,
                 ),
@@ -612,6 +662,68 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         hc_token_tile=0,
         hc_min_tokens=1024,
     ):
+        if (
+            residual is not None
+            and hc_gate is not None
+            and residual.ndim == 2
+            and hc_gate.ndim == 2
+            and self._fused_projected_op is not None
+            and self.norm_weights_packed is not None
+            and self.k_norm_multiplier is not None
+            and self.can_prefetch_output(hidden)
+            and self.q_proj.weight.shape
+            in (
+                (self.hidden_size, self.input_sizes[0]),
+                (self.input_sizes[0], self.hidden_size),
+            )
+            and self.cache_owners[0].dtype == torch.float8_e4m3fn
+            and self.cache_owners[1].dtype == torch.bfloat16
+        ):
+            per_layer = cast(
+                dict[str, AttentionMetadata], get_forward_context().attn_metadata
+            )
+            ring_ids = per_layer[self.prefix].qsa_ring_slots
+            if ring_ids is None and (self.prefix + ".raw_ring") in per_layer:
+                ring_ids = cast(
+                    torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables
+                )
+            assert isinstance(ring_ids, torch.Tensor), (
+                "QSA execution requires per_layer[prefix].qsa_ring_slots"
+            )
+            block_tables = cast(torch.Tensor, per_layer[self.prefix].block_tables)
+            request_distribution = cast(
+                torch.Tensor, per_layer[self.prefix].request_distribution
+            )
+            kv_iqk = self.input_proj(hidden)
+            return self._fused_projected_op(
+                hidden,
+                kv_iqk,
+                self.q_proj.weight,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.indexer.q_layernorm.weight,
+                self.indexer.k_layernorm.weight,
+                self.norm_weights_packed,
+                self.k_norm_multiplier,
+                positions,
+                self.rope_cache,
+                *self.cache_owners,
+                metadata.query_start_loc,
+                metadata.context_lens,
+                ring_ids,
+                block_tables,
+                block_tables,
+                request_distribution,
+                cast(torch.Tensor, self.output_weight_tiles),
+                residual,
+                hc_gate,
+                self.o_proj.weight,
+                k_scale=cast(float, self._k_scale_float) if self.fp8_kv else 1.0,
+                v_scale=cast(float, self._v_scale_float) if self.fp8_kv else 1.0,
+                hc_token_tile=hc_token_tile,
+                hc_min_tokens=hc_min_tokens,
+                decode_cu=metadata.decode_cu,
+            )
         return self.forward_with_indices(
             hidden, positions, metadata, residual, hc_gate, hc_token_tile, hc_min_tokens
         )[0]

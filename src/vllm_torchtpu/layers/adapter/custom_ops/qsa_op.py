@@ -24,6 +24,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import TopK
 from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     compact_pooled_qsa_step,
 )
+from vllm_torchtpu.kernels.qwen4_exp.qsa_decode_fused_ops import (
+    compact_pooled_qsa_projected_unified_step,
+)
 
 _backend_keys: dict[str, TopKBackend] = {}
 
@@ -236,5 +239,179 @@ def _build_compact_pooled_qsa_op(
         index_pool.copy_(index_updated)
         ring_pool.copy_(ring_updated)
         return output, blocks
+
+    return run
+
+
+def build_compact_pooled_qsa_projected_op(
+    *,
+    rope_axes: tuple[int, ...] | None = None,
+    cache_tags: bool | None = None,
+):
+    """Build unified QSA projected custom op with a stable Torch ABI."""
+    sc_min_context = envs.environment_variables["VLLM_TPU_QSA_SC_MIN_CONTEXT"]()
+    return _build_compact_pooled_qsa_projected_op(
+        sc_min_context,
+        rope_axes,
+        cache_tags,
+    )
+
+
+@functools.cache
+def _build_compact_pooled_qsa_projected_op(
+    sc_min_context: int | None,
+    rope_axes: tuple[int, ...] | None,
+    cache_tags: bool | None,
+):
+    kind = "compact_pooled_qsa_projected_unified"
+    if sc_min_context is not None:
+        suffix = hashlib.sha256(str(sc_min_context).encode("utf-8")).hexdigest()
+        kind += f"_sc_min_context_{suffix}"
+    if rope_axes is not None:
+        kind += "_mrope_" + hashlib.sha256(repr(rope_axes).encode()).hexdigest()
+    if cache_tags is False:
+        kind += "_notags"
+    core = functools.partial(
+        compact_pooled_qsa_projected_unified_step,
+        sc_min_context=sc_min_context,
+        rope_axes=rope_axes,
+        cache_tags=cache_tags,
+    )
+    op = pallas.jax_op(
+        f"qwen4_exp::{kind}",
+        core,
+        donate_argnums=(11, 12, 13),  # pool, index_pool, ring_pool
+    )
+
+    @op.register_fake
+    def fake(
+        hidden,
+        kv_iqk,
+        w_q,
+        nq,
+        nk,
+        niq,
+        nik,
+        norm_weights_packed,
+        k_norm_multiplier,
+        positions,
+        trig,
+        pool,
+        index_pool,
+        ring_pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        request_distribution,
+        output_weight,
+        residual,
+        hc_gate,
+        original_output_weight,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale=1.0,
+        v_scale=1.0,
+        hc_token_tile=0,
+        hc_min_tokens=1024,
+        decode_cu=None,
+        scheduling_group_namespace=0,
+        ring_capacity=None,
+    ):
+        return (
+            torch.empty_like(pool),
+            torch.empty_like(index_pool),
+            torch.empty_like(ring_pool),
+            torch.empty_like(residual),
+        )
+
+    def run(
+        hidden: torch.Tensor,
+        kv_iqk: torch.Tensor,
+        w_q: torch.Tensor,
+        nq: torch.Tensor,
+        nk: torch.Tensor,
+        niq: torch.Tensor,
+        nik: torch.Tensor,
+        norm_weights_packed: torch.Tensor,
+        k_norm_multiplier: torch.Tensor,
+        positions: torch.Tensor,
+        trig: torch.Tensor,
+        pool: torch.Tensor,
+        index_pool: torch.Tensor,
+        ring_pool: torch.Tensor,
+        starts: torch.Tensor,
+        context: torch.Tensor,
+        ring_ids: torch.Tensor,
+        main_table: torch.Tensor,
+        compressed_table: torch.Tensor,
+        request_distribution: torch.Tensor,
+        output_weight: torch.Tensor,
+        residual: torch.Tensor,
+        hc_gate: torch.Tensor,
+        original_output_weight: torch.Tensor,
+        compress_ratio: int,
+        token_topk: int,
+        norm_eps: float,
+        rotary_dim: int,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+        hc_token_tile: int = 0,
+        hc_min_tokens: int = 1024,
+        decode_cu: torch.Tensor | None = None,
+        scheduling_group_namespace: int = 0,
+        ring_capacity: int | None = None,
+    ):
+        positions = positions.to(torch.int32)
+        starts = starts.to(torch.int32)
+        context = context.to(torch.int32)
+        ring_ids = ring_ids.to(torch.int32)
+        main_table = main_table.to(torch.int32)
+        compressed_table = compressed_table.to(torch.int32)
+        request_distribution = request_distribution.to(torch.int32)
+        updated, index_updated, ring_updated, output = op(
+            hidden,
+            kv_iqk,
+            w_q,
+            nq,
+            nk,
+            niq,
+            nik,
+            norm_weights_packed,
+            k_norm_multiplier,
+            positions,
+            trig,
+            pool,
+            index_pool,
+            ring_pool,
+            starts,
+            context,
+            ring_ids,
+            main_table,
+            compressed_table,
+            request_distribution,
+            output_weight,
+            residual,
+            hc_gate,
+            original_output_weight,
+            compress_ratio,
+            token_topk,
+            norm_eps,
+            rotary_dim,
+            k_scale,
+            v_scale,
+            hc_token_tile,
+            hc_min_tokens,
+            decode_cu,
+            scheduling_group_namespace,
+            ring_capacity,
+        )
+        pool.copy_(updated)
+        index_pool.copy_(index_updated)
+        ring_pool.copy_(ring_updated)
+        return output
 
     return run
