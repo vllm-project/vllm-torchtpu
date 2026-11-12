@@ -87,6 +87,25 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
         return pltpu.ChipVersion.TPU_7X
 
 
+def is_non_megacore_dual_core_device_kind(device_kind: str) -> bool:
+    """Whether a PJRT `device_kind` string (such as `'TPU7'`, `'TPU7x'`, or
+    `'TPU8i'`) names a generation >= 7 TPU with two independent TensorCores per
+    physical chip."""
+    normalized = device_kind.strip().lower().removeprefix("tpu").strip()
+    for candidate in (normalized, normalized.removeprefix("v")):
+        try:
+            chip_version = pltpu.ChipVersion(candidate)
+        except ValueError:
+            continue
+        chip_info = pltpu.get_tpu_info_for_chip(chip_version, 1)
+        return (
+            chip_version.num_physical_tensor_cores_per_chip == 2
+            and not chip_version.supports_megacore
+            and chip_info.generation >= 7
+        )
+    return False
+
+
 def get_libtpu_version() -> str | None:
     """Version of the pip ``libtpu`` package, or None if it is not installed.
 
