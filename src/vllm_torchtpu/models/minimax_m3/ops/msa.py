@@ -49,29 +49,34 @@ def _packed_merge(num_tokens: int) -> bool:
     """Whether a DCP step of `num_tokens` merges with one packed all-to-all
     (``TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS``). Compared while tracing:
     the backbone is re-traced per token-bucket group."""
-    limit = envs.TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS
-    if limit:
-        logger.info_once(
-            "TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS=%d: MSA DCP partials merge "
-            "with one packed all-to-all on steps of at most %d tokens.",
-            limit,
-            limit,
-        )
-    return 0 < num_tokens <= limit
+    return 0 < num_tokens <= envs.TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS
 
 
 def _packed_gather(num_tokens: int) -> bool:
     """Whether a DCP step of `num_tokens` gathers its query heads and
     candidates in one all-gather (``TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS``)."""
-    limit = envs.TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS
-    if limit:
+    return 0 < num_tokens <= envs.TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS
+
+
+def _log_packed_collectives() -> None:
+    """Once per process, from the op builders (outside the traced forward:
+    a logging call under Dynamo breaks the graph)."""
+    merge = envs.TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS
+    gather = envs.TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS
+    if merge:
+        logger.info_once(
+            "TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS=%d: MSA DCP partials merge "
+            "with one packed all-to-all on steps of at most %d tokens.",
+            merge,
+            merge,
+        )
+    if gather:
         logger.info_once(
             "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS=%d: MSA DCP query heads "
             "and candidates share one all-gather on steps of at most %d tokens.",
-            limit,
-            limit,
+            gather,
+            gather,
         )
-    return 0 < num_tokens <= limit
 
 
 @functools.cache
@@ -549,6 +554,7 @@ def get_msa_dcp_op(
             "must divide one another."
         )
     kv_heads = max(1, dcp // kv_head_replicas)
+    _log_packed_collectives()
     if fp4:
         return _get_msa_dcp_fp4_op(
             sm_scale,
