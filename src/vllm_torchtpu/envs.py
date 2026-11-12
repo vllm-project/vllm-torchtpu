@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_PREFILL_VPU: str = ""
     VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX: str = ""
+    VLLM_TPU_QSA_PREFILL_LANE_SUM: str = ""
     VLLM_TPU_QSA_PREFILL_PAGE_COPIES: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_WALK: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT: int = 32768
@@ -1009,6 +1010,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX": env_str(
         "VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX", ""
     ),
+    # qwen4_exp QSA sparse prefill under DCP (block_sparse_gqa_prefill with
+    # dcp, FP32-score path; not with VPU / BF16_MXU / LAZY_SOFTMAX): keep the
+    # per-row max and rescale, but accumulate each row's probability mass as
+    # 128-lane partial sums reduced across lanes once per query block instead
+    # of a cross-lane row sum per KV tile (f32 reassociation only). "" / "0" =
+    # off; "1" = on; "1,bf16mass" also sums the BF16-rounded probabilities the
+    # PV dot uses (normalizer consistent with the numerator).
+    "VLLM_TPU_QSA_PREFILL_LANE_SUM": env_str("VLLM_TPU_QSA_PREFILL_LANE_SUM", ""),
     # qwen4_exp QSA sparse prefill: fetch each KV tile with one DMA per
     # page-sized run instead of one per 128-row selection segment, when KV
     # tiles and pages nest (TP8: 1024-row tiles over 512-row pages; DCP: one

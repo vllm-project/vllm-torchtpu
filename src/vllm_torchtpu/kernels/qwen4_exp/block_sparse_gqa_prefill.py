@@ -70,6 +70,18 @@ def lazy_softmax_features():
     return ("on",) + tuple(name for name in LAZY_SOFTMAX_TOKENS if name in names)
 
 
+def lane_sum_features():
+    """VLLM_TPU_QSA_PREFILL_LANE_SUM as a feature tuple; () when off."""
+    raw = envs.VLLM_TPU_QSA_PREFILL_LANE_SUM
+    if raw in ("", "0"):
+        return ()
+    names = {name.strip() for name in raw.split(",") if name.strip()} - {"1"}
+    unknown = sorted(names - {"bf16mass"})
+    if unknown:
+        raise ValueError(f"Unknown VLLM_TPU_QSA_PREFILL_LANE_SUM tokens: {unknown}")
+    return ("on",) + (("bf16mass",) if "bf16mass" in names else ())
+
+
 def default_query_tile(query_block):
     """Query subtile used when the tile table does not choose one."""
     return min(query_block, 256)
@@ -401,6 +413,7 @@ def _kernel(
     vpu: tuple = (),
     page_copies: bool = False,
     lazy: tuple = (),
+    lane_sum: tuple = (),
 ):
     # DCP: a fourth scalar operand holds this rank; its KV tiles are its owned
     # page-sized blocks only (local tile t is global block t * dcp_world + rank).
@@ -419,6 +432,10 @@ def _kernel(
     # KV head), lane-replicated; lane-partial masses; per-query "has a
     # visible key" bits for the underflow guard.
     stab_ref, partial_ref, has_key_ref = refs[7:10] if lazy else (None,) * 3
+    # VLLM_TPU_QSA_PREFILL_LANE_SUM: per-row masses kept as 128-lane partial
+    # sums (rows, 128), reduced across lanes once per query block.
+    lane_ref = refs[7] if lane_sum else None
+    bf16_mass = "bf16mass" in lane_sum
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
     # FP32 input window while preserving the existing FP32 QK accumulation.
@@ -524,6 +541,8 @@ def _kernel(
         mass_ref[...] = jnp.zeros(mass_ref.shape, jnp.float32)
         accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
 
+    if lane_sum:
+        lane_ref[...] = jnp.zeros(lane_ref.shape, jnp.float32)
     if lazy:
         stab_ref[...] = jnp.full(stab_ref.shape, -jnp.inf, jnp.float32)
         partial_ref[...] = jnp.zeros(partial_ref.shape, jnp.float32)
@@ -654,6 +673,8 @@ def _kernel(
             if bf16_mxu:
                 key = key.astype(jnp.bfloat16)
                 value = value.astype(jnp.bfloat16)
+            elif bf16_mass:
+                value = value.astype(jnp.bfloat16)  # FP8 values: exact
             key_values.append((key, value))
         for query_tile_index in range(num_query_tiles):
             start = query_tile_index * query_tile
@@ -661,7 +682,8 @@ def _kernel(
             for head, (key, value) in enumerate(key_values):
                 if not lazy_pass:
                     m = max_ref[query_tile_index, head, :]
-                    mass = mass_ref[query_tile_index, head, :]
+                    if not lane_sum:
+                        mass = mass_ref[query_tile_index, head, :]
                     acc = accumulator_ref[query_tile_index, head, :, :]
                 rows = query_tile * q_heads_per_kv
                 if bf16_mxu:
@@ -713,6 +735,19 @@ def _kernel(
                         dimension_numbers=(([1], [0]), ([], [])),
                         preferred_element_type=jnp.float32,
                     )
+                elif lane_sum:
+                    # The PV dot rounds probabilities to BF16 (one MXU pass);
+                    # bf16mass sums those same rounded values.
+                    mass_terms = prob
+                    if bf16_mass:
+                        prob = prob.astype(jnp.bfloat16)
+                        mass_terms = prob.astype(jnp.float32)
+                    weighted = lax.dot(
+                        prob,
+                        value,
+                        dimension_numbers=(([1], [0]), ([], [])),
+                        preferred_element_type=jnp.float32,
+                    )
                 else:
                     weighted = lax.dot(
                         prob,
@@ -721,6 +756,18 @@ def _kernel(
                         preferred_element_type=jnp.float32,
                     )
                 max_ref[query_tile_index, head, :] = next_m
+                if lane_sum:
+                    alpha_column = alpha[:, None]
+                    lanes = mass_terms[:, :128]
+                    for offset in range(128, kv_tile, 128):
+                        lanes = lanes + mass_terms[:, offset : offset + 128]
+                    lane_ref[query_tile_index, head] = (
+                        lane_ref[query_tile_index, head] * alpha_column + lanes
+                    )
+                    accumulator_ref[query_tile_index, head, :, :] = (
+                        acc * alpha_column + weighted
+                    )
+                    continue
                 mass_ref[query_tile_index, head, :] = mass * alpha + jnp.sum(
                     prob, axis=1
                 )
@@ -939,6 +986,8 @@ def _kernel(
             lse_ref[...] = jnp.concatenate(lse_tiles, axis=0)
 
     def row_state(query_tile_index, head, field):
+        if lane_sum and field == "mass":
+            return jnp.sum(lane_ref[query_tile_index, head], axis=1)
         ref = max_ref if field == "max" else mass_ref
         return ref[query_tile_index, head, :]
 
@@ -1488,6 +1537,18 @@ def _block_sparse_gqa_prefill(
     lazy = lazy_softmax_features() if dcp and not vpu and not bf16_mxu else ()
     if lazy and kv_tile % 128:
         lazy = ()
+    lane_sum = (
+        lane_sum_features()
+        if dcp and not vpu and not bf16_mxu and not lazy and kv_tile % 128 == 0
+        else ()
+    )
+    if lane_sum:
+        logger.info_once(
+            "QSA sparse DCP prefill lane-partial masses on: %s "
+            "(VLLM_TPU_QSA_PREFILL_LANE_SUM=%s)",
+            ",".join(lane_sum),
+            envs.VLLM_TPU_QSA_PREFILL_LANE_SUM,
+        )
     if lazy:
         logger.info_once(
             "QSA sparse DCP prefill lazy softmax on: %s "
@@ -1524,6 +1585,7 @@ def _block_sparse_gqa_prefill(
             **({"vpu": vpu} if vpu else {}),
             **({"page_copies": True} if page_copies else {}),
             **({"lazy": lazy} if lazy else {}),
+            **({"lane_sum": lane_sum} if lane_sum else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3 + int(dcp) + int(bool(vpu)),
@@ -1561,6 +1623,11 @@ def _block_sparse_gqa_prefill(
                     pltpu.VMEM((query_block, 128), jnp.int32),
                 ]
                 if lazy
+                else []
+            )
+            + (
+                [pltpu.VMEM((*state_shape, 128), jnp.float32)]
+                if lane_sum
                 else []
             ),
         ),
