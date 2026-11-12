@@ -2080,6 +2080,7 @@ SMALL_AG_MAX_TOKENS = 8
         "overlap_pin_max_tokens",
         "flat_merge",
         "small_all_gather",
+        "lane_split",
         "decode_pack",
         "shared_meta",
     ),
@@ -2121,6 +2122,7 @@ def streamindex_topk_dcp(
     small_all_gather: bool | None = None,
     decode_pack: bool = False,
     shared_meta: bool = False,
+    lane_split: bool = False,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -2203,6 +2205,10 @@ def streamindex_topk_dcp(
       skip_empty_decode_chunked: forwarded to `streamindex_topk`; see there.
       decode_pack: forwarded to `streamindex_topk`; see there. Same result.
       shared_meta: forwarded to `streamindex_topk`; see there. Same result.
+      lane_split: each lane (the mesh axis beside `dcp_axis_name`, whose ranks
+        hold replicas of the same shards) scores only its share of the tokens;
+        an all-gather over the lanes restores the token axis. Needs
+        `dcp_lane_ids` and the hist or all-to-all merge. Same result.
       global_scheduling_group_id: XLA scheduling group of the cross-rank
         SparseCore merge (stage 2), which the layer's independent TensorCore
         work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
@@ -2306,6 +2312,18 @@ def streamindex_topk_dcp(
             f"small_all_gather takes at most one axis beside {dcp_axis_name!r},"
             f" got mesh axes {mesh.axis_names}"
         )
+    num_lanes = math.prod(mesh.shape[a] for a in lane_axes)
+    lane_split = bool(lane_split) and num_lanes > 1
+    if lane_split:
+        if len(lane_axes) != 1 or dcp_lane_ids is None:
+            raise ValueError("lane_split needs one lane axis and dcp_lane_ids.")
+        if not (hist_merge or a2a_merge) or small_all_gather:
+            raise ValueError("lane_split needs the hist or all-to-all merge.")
+        if q.shape[0] % (num_lanes * dcp_size) != 0:
+            raise ValueError(
+                f"padded_num_tokens={q.shape[0]} must be divisible by"
+                f" lanes * dcp_size={num_lanes * dcp_size}."
+            )
     # Pin only where each stage is one SparseCore call: an unchunked local
     # top-k (as `streamindex_topk` decides it) and the all-gather merge.
     pin = (
@@ -2317,6 +2335,9 @@ def streamindex_topk_dcp(
             or q.shape[0] == chunk_tokens
         )
     )
+
+    if lane_split and pin:
+        raise ValueError("lane_split cannot pin the overlap work to the local top-k.")
 
     def _local(
         q,
@@ -2354,6 +2375,15 @@ def streamindex_topk_dcp(
             # exported call (which then takes one operand fewer than the op
             # hands it). Adds zero.
             dcp_rank = dcp_rank + jnp.int32(0) * lane_ids[0][0]
+        if lane_split:
+            # This lane's share of the tokens; the KV shard is the same on every lane.
+            size = q.shape[0] // num_lanes
+            start = lane[0] * size
+            q = lax.dynamic_slice_in_dim(q, start, size, 0)
+            indexer_weights = lax.dynamic_slice_in_dim(indexer_weights, start, size, 0)
+            seq_lens, cu_q_lens = metadata.lane_slice_q_metadata(
+                seq_lens, cu_q_lens, start, size
+            )
         local_page_indices = jnp.mod(page_indices, jnp.int32(cache_kv.shape[0]))
 
         local = streamindex_topk(
@@ -2411,6 +2441,8 @@ def streamindex_topk_dcp(
                 scores, ov = lax.optimization_barrier((scores, ov))
 
         def _ret(topk, merge_pinned=False):
+            if lane_split:
+                topk = lax.all_gather(topk, lane_axis, axis=0, tiled=True)
             if overlap_fn is None:
                 return topk
             if merge_overlap_fn is None:
