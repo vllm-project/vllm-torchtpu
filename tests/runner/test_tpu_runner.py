@@ -2829,6 +2829,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         _fenced_h2d_sources=[],
         _free_h2d_sources={},
         _registered_h2d_sources=set(),
+        _block_table_upload_reuse=None,
         _token_padding_state=None,
         sequence_layout_planner=SimpleNamespace(
             prepare_dummy=lambda **kw: SimpleNamespace(
@@ -3069,6 +3070,8 @@ class TestInputStagingFence:
             assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
         assert len(_FakeTpuEvent.instances) == 3
         assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
+        # Dummy walks always upload and leave no block table for reuse.
+        assert runner._block_table_upload_reuse is None
 
         # With through_handoff=True, the fence must be recorded before
         # _pp_wave.start_forward so the next wait never blocks on the receive.
