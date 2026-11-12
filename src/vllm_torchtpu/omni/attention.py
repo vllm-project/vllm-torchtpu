@@ -17,17 +17,27 @@
 bf16 attention through a Pallas flash kernel tuned for diffusion
 sequence lengths. Masked, causal, or non-bf16 calls fall back with a
 one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA).
+
+``tpu_ring_flash_attention`` runs vLLM-Omni's ring attention
+(``ring_degree > 1``) through the same kernel, rotating K/V between ranks
+inside one Pallas op.
 """
 
+import functools
+import math
 from functools import cache as run_once
-from typing import Any
+from typing import Any, cast
 
 import jax
 import torch
+from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 
-from vllm_torchtpu.kernels.diffusion_attention.kernel import flash_attention_bshd
+from vllm_torchtpu.kernels.diffusion_attention.kernel import (
+    flash_attention_bshd,
+    ring_flash_attention_bshd,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -134,3 +144,185 @@ class TpuFlashAttentionBackend(SDPABackend):
     @staticmethod
     def get_impl_cls() -> type[TpuFlashAttentionImpl]:
         return TpuFlashAttentionImpl
+
+
+_NON_RING_FLASH_PREFS = frozenset(
+    {
+        "sdpa",
+        "torch",
+        "torch_sdpa",
+        "tpu_sdpa",
+        "cudnn_attn",
+        "flashinfer_attn",
+        "trtllm_attn",
+        "sage_attn",
+        "sage_attn_3",
+        "flash_attn_hub",
+        "flash_attn_3_hub",
+    }
+)
+
+
+@functools.cache
+def _ring_attention_op(outer_size: int, ring_size: int, uly_size: int):
+    """Builds the torch custom op wrapping the Pallas ring attention kernel.
+
+    vLLM-Omni lays out sequence-parallel ranks as (cfg, ring, ulysses), so
+    ring partners are ``uly_size`` ranks apart. Ulysses has already moved
+    heads before ``run_attention``; each ``uly`` shard runs its own ring over
+    its slice of heads.
+    """
+    mesh = cast(Any, torch).tpu.pallas.get_pallas_mesh(
+        axis_names=("batch", "ring", "uly"),
+        mesh_shape=(outer_size, ring_size, uly_size),
+    )
+    spec = PartitionSpec("batch", "ring", "uly", None, None, None, None)
+
+    def _body(q: jax.Array, k: jax.Array, v: jax.Array, scale: float) -> jax.Array:
+        out = ring_flash_attention_bshd(
+            q[0, 0, 0],
+            k[0, 0, 0],
+            v[0, 0, 0],
+            ring_axis="ring",
+            scale=scale,
+        )
+        return out[None, None, None]
+
+    def _fn(q: jax.Array, k: jax.Array, v: jax.Array, scale: float) -> jax.Array:
+        return jax.shard_map(
+            functools.partial(_body, scale=scale),
+            mesh=mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(q, k, v)
+
+    op_name = f"pallas::diffusion_ring_attn_{outer_size}_{ring_size}_{uly_size}"
+    # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        op_name,
+        _fn,
+        mesh=mesh,
+        input_partition_specs=(spec, spec, spec, None),
+        output_partition_specs=(spec,),
+    )
+    op.register_fake(lambda q, k, v, scale: q.new_empty((*q.shape[:6], v.shape[-1])))
+    return op
+
+
+def tpu_ring_flash_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float | None,
+    *,
+    ring_size: int,
+    uly_size: int = 1,
+    outer_size: int | None = None,
+) -> torch.Tensor:
+    """Runs Pallas ring flash attention on TPU over (B, S, H, D) inputs."""
+    if query.shape[2] % key.shape[2] != 0:
+        raise ValueError(
+            f"num_heads ({query.shape[2]}) must be a multiple of "
+            f"num_kv_heads ({key.shape[2]})"
+        )
+    if scale is None:
+        scale = 1.0 / math.sqrt(query.shape[-1])
+    if outer_size is None:
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else ring_size * uly_size
+        )
+        outer_size = max(1, world_size // (ring_size * uly_size))
+    op = _ring_attention_op(outer_size, ring_size, uly_size)
+    q = query.contiguous().unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    k = key.contiguous().unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    v = value.contiguous().unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    out = op(q, k, v, float(scale))
+    return out.reshape(*query.shape[:3], value.shape[-1])
+
+
+def can_run_tpu_ring_attention(
+    ring_runner: Any,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: Any | None,
+    *,
+    causal: bool = False,
+) -> bool:
+    """Whether a RingParallelAttention call fits the TPU Pallas ring kernel."""
+    pref = getattr(ring_runner, "attn_backend_pref", None)
+    if pref is not None and str(pref).lower() in _NON_RING_FLASH_PREFS:
+        return False
+    if (
+        causal
+        or query.dtype != torch.bfloat16
+        or key.dtype != torch.bfloat16
+        or value.dtype != torch.bfloat16
+        or query.ndim != 4
+        or key.ndim != 4
+        or value.ndim != 4
+    ):
+        return False
+    if (
+        key.shape[2] <= 0
+        or query.shape[2] % key.shape[2] != 0
+        or key.shape[2] != value.shape[2]
+        or query.shape[-1] != key.shape[-1]
+        or value.shape[-1] % 8 != 0
+    ):
+        return False
+    if attn_metadata is not None:
+        if (
+            getattr(attn_metadata, "attn_mask", None) is not None
+            or getattr(attn_metadata, "joint_query", None) is not None
+            or getattr(attn_metadata, "joint_key", None) is not None
+            or getattr(attn_metadata, "joint_value", None) is not None
+        ):
+            return False
+        extra = getattr(attn_metadata, "extra", None) or {}
+        if (
+            extra.get("valid_kv_length") is not None
+            or extra.get("gate_compress") is not None
+            or extra.get("kv_cache_dtype") not in (None, "float")
+        ):
+            return False
+    sp_group = getattr(ring_runner, "_sp_group", None)
+    return int(getattr(sp_group, "ring_world_size", 0)) >= 1
+
+
+_checked_ring_layouts: set[tuple[int, int, int]] = set()
+
+
+def check_ring_rank_layout(sp_group: Any, ring_size: int, uly_size: int) -> None:
+    """Raises unless the ring group matches the op's (cfg, ring, uly) mesh.
+
+    The mesh is row-major, so it pairs the right ranks only when vLLM-Omni's
+    tensor and pipeline parallel sizes are 1 (it orders tp innermost).
+    """
+    dist = torch.distributed
+    ring_group = getattr(sp_group, "ring_group", None)
+    if not dist.is_initialized() or not isinstance(ring_group, dist.ProcessGroup):
+        return
+    key = (id(ring_group), ring_size, uly_size)
+    if key in _checked_ring_layouts:
+        return
+    block = ring_size * uly_size
+    ranks = dist.get_process_group_ranks(ring_group)
+    base = ranks[0] if ranks else 0
+    expected = [base + r * uly_size for r in range(ring_size)]
+    if (
+        dist.get_world_size() % block != 0
+        or ranks != expected
+        or base // block != expected[-1] // block
+    ):
+        raise NotImplementedError(
+            f"TPU ring attention expects ring group ranks {expected} "
+            f"(cfg x ring x ulysses layout), got {ranks} in world size "
+            f"{dist.get_world_size()}; tensor/pipeline parallel > 1 is not "
+            "supported with TPU ring attention."
+        )
+    _checked_ring_layouts.add(key)

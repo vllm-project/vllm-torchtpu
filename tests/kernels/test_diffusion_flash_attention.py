@@ -26,6 +26,8 @@ from vllm_torchtpu.kernels.diffusion_attention.kernel import (
     LOG2_E,
     fixed_m_operands,
     flash_attention_bshd,
+    partial_to_lse,
+    residual_flash_attention_bhsd,
 )
 
 pytestmark = pytest.mark.tpu_test
@@ -86,6 +88,34 @@ def test_matches_reference(batch, q_len, kv_len, heads, kv_heads, head_dim, fixe
     )(q, k, v)
     assert out.dtype == jnp.bfloat16
     _check(out, _reference(q, k, v, scale))
+
+
+@pytest.mark.parametrize(
+    "seq_len,heads,kv_heads",
+    [
+        # GQA; autotuned blocks leave a partial last Q and KV block.
+        (4133, 4, 2),
+        # A ring shard with measured v7x block sizes.
+        (18900, 2, 1),
+    ],
+)
+def test_residual_mode_matches_reference(seq_len, heads, kv_heads):
+    """emit_residuals partials normalize to the reference output and LSE."""
+    q, k, v = _inputs(1, seq_len, seq_len, heads, kv_heads, 128, seed=3)
+    scale = 1.0 / math.sqrt(128)
+
+    def _run(q, k, v):
+        q, k, v = (jnp.swapaxes(x, 1, 2) for x in (q, k, v))
+        return partial_to_lse(*residual_flash_attention_bhsd(q, k, v, scale=scale))
+
+    o_norm, lse = jax.jit(_run)(q, k, v)
+    assert o_norm.dtype == lse.dtype == jnp.float32
+    _check(jnp.swapaxes(o_norm, 1, 2), _reference(q, k, v, scale))
+
+    k_rep = jnp.repeat(k, heads // kv_heads, axis=2).astype(jnp.float32)
+    s = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k_rep) * scale
+    ref_lse = jax.nn.logsumexp(s, axis=-1, keepdims=True) * LOG2_E
+    np.testing.assert_allclose(np.asarray(lse), np.asarray(ref_lse), atol=1e-2)
 
 
 def test_outlier_heads_fall_back_to_online():

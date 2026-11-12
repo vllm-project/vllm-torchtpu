@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +23,7 @@ import torch
 from diffusers.pipelines.ltx2.vocoder import UpSample1d
 from vllm_omni.diffusion import ipc
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
@@ -945,3 +949,669 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
 def test_supports_talker_mtp_graph_capture_disabled():
     assert OmniTpuPlatform.supports_talker_mtp_graph_capture() is False
     assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False
+
+
+def _non_ring_reference_bshd(q, k, v, scale):
+    """Single-device f32 softmax attention over (B, S, H, D) inputs."""
+    import jax
+    import jax.numpy as jnp
+
+    heads_per_kv = q.shape[2] // k.shape[2]
+    k_rep = jnp.repeat(k, heads_per_kv, axis=2).astype(jnp.float32)
+    v_rep = jnp.repeat(v, heads_per_kv, axis=2).astype(jnp.float32)
+    scores = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k_rep) * scale
+    probs = jax.nn.softmax(scores, axis=-1)
+    return jnp.einsum("bhqk,bkhd->bqhd", probs, v_rep).astype(q.dtype)
+
+
+def _residual_reference_bhsd(query, key, value, *, scale=None):
+    """Reference (o_unnorm, m, l) attention residuals in log2 space.
+
+    Same contract as ``residual_flash_attention_bhsd``, in plain JAX so it
+    runs on CPU.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.diffusion_attention.kernel import LOG2_E
+
+    head_dim = query.shape[-1]
+    scale_factor = 1.0 / math.sqrt(head_dim) if scale is None else scale
+    q = query.astype(jnp.float32)
+    k = key.astype(jnp.float32)
+    v = value.astype(jnp.float32)
+    q_heads_per_kv = q.shape[1] // k.shape[1]
+    if q_heads_per_kv > 1:
+        k = jnp.repeat(k, q_heads_per_kv, axis=1)
+        v = jnp.repeat(v, q_heads_per_kv, axis=1)
+    highest = jax.lax.Precision.HIGHEST
+    scores = jnp.einsum("bhsd,bhkd->bhsk", q, k, precision=highest)
+    scores = scores * (scale_factor * LOG2_E)
+    m = jnp.max(scores, axis=-1, keepdims=True)
+    p_unnorm = jnp.exp2(scores - m)
+    l_sum = jnp.sum(p_unnorm, axis=-1, keepdims=True)
+    o_un = jnp.einsum("bhsk,bhkd->bhsd", p_unnorm, v, precision=highest)
+    return o_un, m, l_sum
+
+
+_HOST_DEVICE_COUNT_FLAG = "--xla_force_host_platform_device_count"
+# Tests whose cases share one CPU-only child pytest run.
+_CPU_CHILD_TESTS = (
+    "test_ring_flash_attention_bhsd_matches_non_ring",
+    "test_ring_attention_op_2d_matches_non_ring_reference",
+)
+_cpu_child_run: subprocess.CompletedProcess[str] | None = None
+
+
+def _cpu_devices_or_rerun(request, count):
+    """Returns ``count`` JAX CPU devices, or None once the child run passed.
+
+    XLA reads the host device count only when JAX starts, so this process
+    cannot raise it after the fact. With too few CPU devices, every case of
+    ``_CPU_CHILD_TESTS`` runs once in a single child pytest whose JAX uses 8
+    CPU devices only; each case here then checks that its own copy passed.
+    The child skips conftest.py (``--noconftest``): its autouse fixtures would
+    open the TPU this process already holds. The env of this process is not
+    changed.
+    """
+    global _cpu_child_run
+    import jax
+
+    devices = jax.devices("cpu")
+    if len(devices) >= count:
+        return devices[:count]
+    xla_flags = os.environ.get("XLA_FLAGS", "")
+    if (
+        os.environ.get("JAX_PLATFORMS") == "cpu"
+        and _HOST_DEVICE_COUNT_FLAG in xla_flags
+    ):
+        pytest.skip(f"Requires {count} CPU devices")
+    if _cpu_child_run is None:
+        kept = [
+            t for t in xla_flags.split() if not t.startswith(_HOST_DEVICE_COUNT_FLAG)
+        ]
+        env = {
+            **os.environ,
+            "JAX_PLATFORMS": "cpu",
+            "XLA_FLAGS": " ".join([*kept, f"{_HOST_DEVICE_COUNT_FLAG}=8"]),
+        }
+        _cpu_child_run = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--noconftest",
+                "--color=no",
+                "-p",
+                "no:cacheprovider",
+                "-q",
+                "-rA",
+                str(request.node.path),
+                "-k",
+                " or ".join(_CPU_CHILD_TESTS),
+            ],
+            cwd=request.config.rootpath,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    proc = _cpu_child_run
+    assert proc.returncode == 0 and f"PASSED {request.node.nodeid}" in proc.stdout, (
+        f"{proc.stdout}\n{proc.stderr}"
+    )
+    return None
+
+
+def test_ring_lse_helpers_match_single_pass():
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.kernels.diffusion_attention.kernel import (
+        RING_LSE_INIT,
+        merge_partials,
+        partial_to_lse,
+    )
+
+    key = jax.random.PRNGKey(0)
+    kq, kk, kv = jax.random.split(key, 3)
+    b, h_q, h_kv, s_q, s_kv, d = 2, 4, 2, 32, 64, 16
+    scale = 1.0 / math.sqrt(d)
+    q = jax.random.normal(kq, (b, h_q, s_q, d), jnp.bfloat16)
+    k = jax.random.normal(kk, (b, h_kv, s_kv, d), jnp.bfloat16)
+    v = jax.random.normal(kv, (b, h_kv, s_kv, d), jnp.bfloat16)
+
+    o_full_un, m_full, l_full = _residual_reference_bhsd(q, k, v, scale=scale)
+    o_full, lse_full = partial_to_lse(o_full_un, m_full, l_full)
+
+    # Merge 4 KV chunks and compare against single-pass attention.
+    o_acc = jnp.zeros_like(o_full)
+    lse_acc = jnp.full_like(lse_full, RING_LSE_INIT)
+    for k_chunk, v_chunk in zip(jnp.split(k, 4, axis=2), jnp.split(v, 4, axis=2)):
+        o_un, m_c, l_c = _residual_reference_bhsd(q, k_chunk, v_chunk, scale=scale)
+        o_c, lse_c = partial_to_lse(o_un, m_c, l_c)
+        o_acc, lse_acc = merge_partials(o_acc, lse_acc, o_c, lse_c)
+
+    np.testing.assert_allclose(
+        np.asarray(o_acc), np.asarray(o_full), rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.asarray(lse_acc), np.asarray(lse_full), rtol=1e-5, atol=1e-5
+    )
+
+    # Merging with an empty partial (l == 0) leaves the accumulator unchanged.
+    o_empty, lse_empty = partial_to_lse(
+        jnp.zeros_like(o_full), jnp.zeros_like(m_full), jnp.zeros_like(l_full)
+    )
+    o_after, lse_after = merge_partials(o_full, lse_full, o_empty, lse_empty)
+    np.testing.assert_allclose(
+        np.asarray(o_after), np.asarray(o_full), rtol=1e-6, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        np.asarray(lse_after), np.asarray(lse_full), rtol=1e-6, atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("ring_size,h_q,h_kv", [(1, 4, 4), (2, 4, 4), (4, 4, 2)])
+def test_ring_flash_attention_bhsd_matches_non_ring(request, ring_size, h_q, h_kv):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh, PartitionSpec
+
+    from vllm_torchtpu.kernels.diffusion_attention.kernel import (
+        ring_flash_attention_bhsd,
+    )
+
+    cpu_devices = _cpu_devices_or_rerun(request, ring_size)
+    if cpu_devices is None:
+        return
+    mesh = Mesh(np.array(cpu_devices), ("ring",))
+    b, s_per_rank, d = 2, 16, 16
+    s_total = s_per_rank * ring_size
+    scale = 1.0 / math.sqrt(d)
+
+    kq, kk, kv = jax.random.split(jax.random.PRNGKey(10 + ring_size), 3)
+    q_full = jax.random.normal(kq, (b, s_total, h_q, d), jnp.bfloat16)
+    k_full = jax.random.normal(kk, (b, s_total, h_kv, d), jnp.bfloat16)
+    v_full = jax.random.normal(kv, (b, s_total, h_kv, d), jnp.bfloat16)
+    want = _non_ring_reference_bshd(q_full, k_full, v_full, scale)
+
+    q_sharded = q_full.reshape(b, ring_size, s_per_rank, h_q, d).transpose(
+        1, 0, 3, 2, 4
+    )
+    k_sharded = k_full.reshape(b, ring_size, s_per_rank, h_kv, d).transpose(
+        1, 0, 3, 2, 4
+    )
+    v_sharded = v_full.reshape(b, ring_size, s_per_rank, h_kv, d).transpose(
+        1, 0, 3, 2, 4
+    )
+    spec = PartitionSpec("ring", None, None, None, None)
+
+    def _run(q_s, k_s, v_s):
+        out = ring_flash_attention_bhsd(
+            q_s[0],
+            k_s[0],
+            v_s[0],
+            ring_axis="ring",
+            scale=scale,
+            residual_fn=_residual_reference_bhsd,
+        )
+        return out[None]
+
+    got_sharded = jax.jit(
+        jax.shard_map(
+            _run,
+            mesh=mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )
+    )(q_sharded, k_sharded, v_sharded)
+    got = got_sharded.transpose(1, 0, 3, 2, 4).reshape(b, s_total, h_q, d)
+    np.testing.assert_allclose(
+        np.asarray(got, np.float32),
+        np.asarray(want, np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+class _EagerJaxOp:
+    """Stands in for ``pallas.jax_op``: calls the JAX function directly."""
+
+    def __init__(self, name, fn, **kwargs):
+        self.name = name
+        self.fn = fn
+
+    def register_fake(self, fake):
+        pass
+
+    def __call__(self, *args):
+        return self.fn(*args)
+
+
+@pytest.mark.parametrize(
+    "cfg_size,ring_size,uly_size,h_q,h_kv",
+    [
+        (2, 2, 2, 4, 4),
+        (2, 2, 2, 4, 2),
+        (2, 4, 1, 4, 2),
+        (1, 2, 2, 4, 4),
+        (2, 2, 1, 4, 2),
+    ],
+)
+def test_ring_attention_op_2d_matches_non_ring_reference(
+    request, cfg_size, ring_size, uly_size, h_q, h_kv
+):
+    """_ring_attention_op on a (cfg, ring, uly) mesh vs full attention.
+
+    vLLM-Omni runs the Ulysses all-to-all before run_attention, so the rank
+    at (c, r, u) holds ring chunk r of CFG branch c for head slice u. Each
+    (branch, head slice) must match full attention over the whole sequence.
+    """
+    import functools
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh
+
+    from vllm_torchtpu.kernels.diffusion_attention.kernel import (
+        ring_flash_attention_bshd,
+    )
+    from vllm_torchtpu.omni import attention as omni_attention
+
+    cpu_devices = _cpu_devices_or_rerun(request, cfg_size * ring_size * uly_size)
+    if cpu_devices is None:
+        return
+    mesh = Mesh(
+        np.array(cpu_devices).reshape(cfg_size, ring_size, uly_size),
+        ("batch", "ring", "uly"),
+    )
+    b, s_per_ring, d = 1, 12, 16
+    s_total = s_per_ring * ring_size
+    scale = 1.0 / math.sqrt(d)
+    hq_slice, hkv_slice = h_q // uly_size, h_kv // uly_size
+
+    kq, kk, kv = jax.random.split(jax.random.PRNGKey(42), 3)
+    q_full = jax.random.normal(kq, (cfg_size, b, s_total, h_q, d), jnp.bfloat16)
+    k_full = jax.random.normal(kk, (cfg_size, b, s_total, h_kv, d), jnp.bfloat16)
+    v_full = jax.random.normal(kv, (cfg_size, b, s_total, h_kv, d), jnp.bfloat16)
+
+    def _heads(x, u, n):
+        return x[:, :, u * n : (u + 1) * n]
+
+    want = jnp.stack(
+        [
+            jnp.concatenate(
+                [
+                    _non_ring_reference_bshd(
+                        _heads(q_full[c], u, hq_slice),
+                        _heads(k_full[c], u, hkv_slice),
+                        _heads(v_full[c], u, hkv_slice),
+                        scale,
+                    )
+                    for u in range(uly_size)
+                ],
+                axis=2,
+            )
+            for c in range(cfg_size)
+        ]
+    )
+
+    def _shard(x):
+        # (cfg, B, S, H, D) -> (cfg, ring, uly, B, S / ring, H / uly, D)
+        return x.reshape(
+            cfg_size, b, ring_size, s_per_ring, uly_size, x.shape[3] // uly_size, d
+        ).transpose(0, 2, 4, 1, 3, 5, 6)
+
+    omni_attention._ring_attention_op.cache_clear()
+    try:
+        with (
+            patch("torch.tpu.pallas.get_pallas_mesh", return_value=mesh) as get_mesh,
+            patch.object(omni_attention.pallas, "jax_op", _EagerJaxOp),
+            patch.object(
+                omni_attention,
+                "ring_flash_attention_bshd",
+                functools.partial(
+                    ring_flash_attention_bshd, residual_fn=_residual_reference_bhsd
+                ),
+            ),
+        ):
+            op = omni_attention._ring_attention_op(cfg_size, ring_size, uly_size)
+            got = jax.jit(lambda q, k, v: op(q, k, v, scale))(
+                _shard(q_full), _shard(k_full), _shard(v_full)
+            )
+    finally:
+        omni_attention._ring_attention_op.cache_clear()
+    get_mesh.assert_called_once_with(
+        axis_names=("batch", "ring", "uly"),
+        mesh_shape=(cfg_size, ring_size, uly_size),
+    )
+    assert op.name == f"pallas::diffusion_ring_attn_{cfg_size}_{ring_size}_{uly_size}"
+    np.testing.assert_allclose(
+        np.asarray(got, np.float32),
+        np.asarray(_shard(want), np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+def test_tpu_ring_attention_stablehlo_export():
+    import jax
+    import jax.export
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh
+    from torch_tpu._internal.pallas import pallas as pallas_impl
+    from torch_tpu._internal.pallas.pallas import _PallasDevice
+
+    from vllm_torchtpu.omni import attention as omni_attention
+
+    devs = [_PallasDevice(id=i, process_index=i, device_kind="TPU7x") for i in range(8)]
+    mesh = Mesh(np.array(devs).reshape(2, 2, 2), ("batch", "ring", "uly"))
+    scale = 1.0 / math.sqrt(128)
+
+    orig_jax_op = omni_attention.pallas.jax_op
+    built = {}
+
+    def _jax_op(name, fn, **kwargs):
+        built[name] = fn
+        return orig_jax_op(name, fn, **kwargs)
+
+    orig_tp = pallas_impl.torch_placeholder
+    registered_names: list[str] = []
+    omni_attention._ring_attention_op.cache_clear()
+    with (
+        patch("torch.tpu.pallas.get_pallas_mesh", return_value=mesh),
+        patch.object(omni_attention.pallas, "jax_op", side_effect=_jax_op),
+        patch.object(pallas_impl, "_validate_pallas_mesh_world_size"),
+        patch.object(
+            pallas_impl.tpu_torch_pallas, "lookup_custom_kernel", return_value=False
+        ),
+        patch.object(
+            pallas_impl.tpu_torch_pallas,
+            "register_custom_kernel",
+            side_effect=lambda name, *args, **kw: registered_names.append(name),
+        ),
+        patch.object(
+            pallas_impl.tpu_torch_pallas,
+            "call_custom_kernel",
+            side_effect=lambda name, fp, inputs, output_shapes, **kw: output_shapes,
+        ),
+        patch.object(
+            pallas_impl,
+            "torch_placeholder",
+            side_effect=lambda aval, mesh=None, partition_spec=None, device="cpu": (
+                orig_tp(aval, mesh=mesh, partition_spec=partition_spec, device="cpu")
+            ),
+        ),
+    ):
+        op = omni_attention._ring_attention_op(2, 2, 2)
+        q = torch.empty((1, 1, 1, 1, 1024, 4, 128), dtype=torch.bfloat16)
+        out = op(q, q, q, scale)
+        assert out.shape == q.shape
+    omni_attention._ring_attention_op.cache_clear()
+    assert registered_names == ["pallas::diffusion_ring_attn_2_2_2"]
+    assert list(built) == registered_names
+
+    # Export the JAX function the op wraps.
+    fn = built["pallas::diffusion_ring_attn_2_2_2"]
+    shape = jax.ShapeDtypeStruct((2, 2, 2, 1, 1024, 4, 128), jnp.bfloat16)
+    exported = jax.export.export(
+        jax.jit(lambda q, k, v: fn(q, k, v, scale)),
+        platforms=["tpu"],
+        disabled_checks=[jax.export.DisabledSafetyCheck.custom_call("ALL")],
+    )(shape, shape, shape)
+    mlir = str(exported.mlir_module())
+    assert "stablehlo.collective_permute" in mlir
+    assert "stablehlo.all_to_all" not in mlir
+    assert "stablehlo.all_gather" not in mlir
+    assert "tpu_custom_call" in mlir
+
+
+def test_ring_attention_patch_and_dispatch(monkeypatch):
+    from vllm_torchtpu.omni.attention import tpu_ring_flash_attention
+    from vllm_torchtpu.omni.patches import _patch_ring_attention
+
+    def _orig_run(
+        self, query, key, value, attn_metadata=None, softmax_scale=None, causal=False
+    ):
+        return "native_ring"
+
+    monkeypatch.setattr(RingParallelAttention, "run_attention", _orig_run)
+    _patch_ring_attention()
+    calls = []
+
+    def _fake_op(outer_size, ring_size, uly_size):
+        def _run(q, k, v, scale):
+            calls.append((outer_size, ring_size, uly_size, scale))
+            return q.clone()
+
+        return _run
+
+    monkeypatch.setattr("vllm_torchtpu.omni.attention._ring_attention_op", _fake_op)
+
+    sp_group = SimpleNamespace(ring_world_size=2, ulysses_world_size=2)
+    runner = RingParallelAttention(sp_group, attn_backend_pref="TPU_FLASH_ATTN")
+    q = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+    k = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+    v = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+
+    # 1. run_attention runs the Pallas ring op over the (cfg, ring, uly) mesh.
+    out = runner.run_attention(q, k, v, softmax_scale=0.25)
+    assert out.shape == q.shape
+    assert calls == [(1, 2, 2, 0.25)]
+
+    # 2. Calls the kernel cannot run (causal, float32, attn_mask, joint
+    # tensors, SDPA preference) raise when ring_world_size > 1.
+    calls.clear()
+    masked_meta = SimpleNamespace(attn_mask=torch.ones(1, 16, dtype=torch.bool))
+    joint_meta = SimpleNamespace(joint_query=q, extra={})
+    sdpa_runner = RingParallelAttention(sp_group, attn_backend_pref="TPU_SDPA")
+    unsupported = [
+        lambda r: r.run_attention(q, k, v, causal=True),
+        lambda r: r.run_attention(q.float(), k.float(), v.float()),
+        lambda r: r.run_attention(q, k, v, attn_metadata=masked_meta),
+        lambda r: r.run_attention(q, k, v, attn_metadata=joint_meta),
+    ]
+    for call in unsupported:
+        with pytest.raises(NotImplementedError, match="not supported on TPU"):
+            call(runner)
+    with pytest.raises(NotImplementedError, match="attn_backend_pref=TPU_SDPA"):
+        sdpa_runner.run_attention(q, k, v)
+    assert calls == []
+
+    # 3. With ring_world_size == 1 they warn once and run vLLM-Omni's ring.
+    single_group = SimpleNamespace(ring_world_size=1, ulysses_world_size=2)
+    single_runner = RingParallelAttention(
+        single_group, attn_backend_pref="TPU_FLASH_ATTN"
+    )
+    for call in unsupported:
+        with patch("vllm_torchtpu.omni.patches.logger.warning_once") as warn:
+            assert call(single_runner) == "native_ring"
+        warn.assert_called_once()
+        assert "ring_world_size is 1" in warn.call_args.args[0]
+    assert calls == []
+
+    # 4. Non-divisible GQA heads raise ValueError in tpu_ring_flash_attention.
+    with pytest.raises(ValueError, match="num_heads"):
+        tpu_ring_flash_attention(
+            q, torch.randn(1, 16, 3, 16, dtype=torch.bfloat16), v, 0.25, ring_size=2
+        )
+
+    # 5. Re-applying _patch_ring_attention is idempotent.
+    run_fn = RingParallelAttention.run_attention
+    _patch_ring_attention()
+    assert RingParallelAttention.run_attention is run_fn
+
+
+def test_ring_rank_layout_check(monkeypatch):
+    from vllm_torchtpu.omni import attention as omni_attention
+
+    class _FakeGroup:
+        def __init__(self, ranks):
+            self.ranks = ranks
+
+    world = {"size": 8}
+    monkeypatch.setattr(torch.distributed, "ProcessGroup", _FakeGroup)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: world["size"])
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda g: g.ranks)
+    monkeypatch.setattr(omni_attention, "_checked_ring_layouts", set())
+    groups = []
+
+    def _check(ranks):
+        groups.append(SimpleNamespace(ring_group=_FakeGroup(ranks)))
+        omni_attention.check_ring_rank_layout(groups[-1], ring_size=2, uly_size=2)
+
+    # cfg 2 x ring 2 x ulysses 2: ring partners are uly_size ranks apart.
+    for ranks in ([0, 2], [1, 3], [4, 6], [5, 7]):
+        _check(ranks)
+    # tp=2 sits innermost, so ring partners are 4 apart or cross a block.
+    for ranks in ([0, 4], [2, 4]):
+        with pytest.raises(NotImplementedError, match="tensor/pipeline parallel"):
+            _check(ranks)
+    world["size"] = 6
+    with pytest.raises(NotImplementedError, match="cfg x ring x ulysses"):
+        _check([0, 2])
+
+
+@pytest.fixture
+def _restore_diffusion_ring_degree_state():
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    orig_ring_degree = OmniTpuPlatform._diffusion_ring_degree
+    orig_init_device = DiffusionWorker.init_device
+    try:
+        yield DiffusionWorker, orig_init_device
+    finally:
+        OmniTpuPlatform._diffusion_ring_degree = orig_ring_degree
+        DiffusionWorker.init_device = orig_init_device
+
+
+def _call_set_device_multi_rank(monkeypatch, world_size: int = 4) -> None:
+    monkeypatch.setenv("WORLD_SIZE", str(world_size))
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.delenv("TPU_VISIBLE_CHIPS", raising=False)
+    monkeypatch.setattr(OmniTpuPlatform, "_worker_world_size", 1)
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda ws: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    with patch("torch.empty"), patch("torch.device"):
+        OmniTpuPlatform.set_device(None)
+
+
+def test_set_device_offload_dense_all_to_all_ring_degree_one(
+    monkeypatch, _restore_diffusion_ring_degree_state
+):
+    flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
+    OmniTpuPlatform._diffusion_ring_degree = 1
+
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
+    _call_set_device_multi_rank(monkeypatch)
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"--xla_foo=1 {flag}=true"
+
+    monkeypatch.delenv("LIBTPU_INIT_ARGS", raising=False)
+    _call_set_device_multi_rank(monkeypatch)
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"{flag}=true"
+
+
+def test_set_device_skips_offload_dense_all_to_all_for_ring_degree_two(
+    monkeypatch, _restore_diffusion_ring_degree_state
+):
+    flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
+    OmniTpuPlatform._diffusion_ring_degree = 2
+
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
+    with patch("vllm_torchtpu.omni.platform.logger.info") as mock_info:
+        _call_set_device_multi_rank(monkeypatch)
+    assert os.environ["LIBTPU_INIT_ARGS"] == "--xla_foo=1"
+    assert flag not in os.environ["LIBTPU_INIT_ARGS"]
+    assert any(
+        "ring_degree=%d" in str(call.args[0]) and call.args[1] == 2
+        for call in mock_info.call_args_list
+        if len(call.args) >= 2
+    )
+
+    monkeypatch.delenv("LIBTPU_INIT_ARGS", raising=False)
+    _call_set_device_multi_rank(monkeypatch)
+    assert "LIBTPU_INIT_ARGS" not in os.environ
+
+
+@pytest.mark.parametrize("explicit_val", ["true", "false"])
+def test_set_device_preserves_explicit_offload_flag_for_ring_degree_two(
+    monkeypatch, _restore_diffusion_ring_degree_state, explicit_val
+):
+    flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
+    OmniTpuPlatform._diffusion_ring_degree = 2
+
+    expected = f"--xla_foo=1 {flag}={explicit_val}"
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", expected)
+    _call_set_device_multi_rank(monkeypatch)
+    assert os.environ["LIBTPU_INIT_ARGS"] == expected
+
+
+def test_get_diffusion_worker_cls_wraps_init_device_idempotently(
+    monkeypatch, _restore_diffusion_ring_degree_state
+):
+    from vllm_omni.platforms.interface import OmniPlatform
+
+    flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
+    diffusion_worker_cls, _ = _restore_diffusion_ring_degree_state
+    observed_in_orig: list[int] = []
+
+    def _fake_orig_init_device(self):
+        observed_in_orig.append(OmniTpuPlatform._diffusion_ring_degree)
+        _call_set_device_multi_rank(monkeypatch)
+
+    diffusion_worker_cls.init_device = _fake_orig_init_device
+
+    parent_ret = OmniPlatform.get_diffusion_worker_cls()
+    ret1 = OmniTpuPlatform.get_diffusion_worker_cls()
+    wrapped_first = diffusion_worker_cls.init_device
+    ret2 = OmniTpuPlatform.get_diffusion_worker_cls()
+    wrapped_second = diffusion_worker_cls.init_device
+
+    assert ret1 == parent_ret
+    assert ret2 == parent_ret
+    assert wrapped_first is not _fake_orig_init_device
+    assert wrapped_second is wrapped_first
+
+    # Records ring_degree=2 before calling original init_device once.
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
+    fake_worker_ring2 = SimpleNamespace(
+        od_config=SimpleNamespace(parallel_config=SimpleNamespace(ring_degree=2))
+    )
+    diffusion_worker_cls.init_device(fake_worker_ring2)
+    assert OmniTpuPlatform._diffusion_ring_degree == 2
+    assert observed_in_orig == [2]
+    assert os.environ["LIBTPU_INIT_ARGS"] == "--xla_foo=1"
+
+    # Defensive fallbacks: None, 0, "0", missing configs -> 1.
+    for fake_worker in (
+        SimpleNamespace(
+            od_config=SimpleNamespace(parallel_config=SimpleNamespace(ring_degree=None))
+        ),
+        SimpleNamespace(
+            od_config=SimpleNamespace(parallel_config=SimpleNamespace(ring_degree=0))
+        ),
+        SimpleNamespace(
+            od_config=SimpleNamespace(parallel_config=SimpleNamespace(ring_degree="0"))
+        ),
+        SimpleNamespace(od_config=SimpleNamespace(parallel_config=None)),
+        SimpleNamespace(od_config=None),
+        SimpleNamespace(),
+    ):
+        OmniTpuPlatform._diffusion_ring_degree = 4
+        monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
+        diffusion_worker_cls.init_device(fake_worker)
+        assert OmniTpuPlatform._diffusion_ring_degree == 1
+        assert os.environ["LIBTPU_INIT_ARGS"] == f"--xla_foo=1 {flag}=true"
+
+    assert len(observed_in_orig) == 7
