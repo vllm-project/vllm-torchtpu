@@ -86,6 +86,30 @@ def uses_dcp_attention(
     return num_tokens < max(head_parallel_min_tokens, 2 * max_num_seqs * decode_rows)
 
 
+def decode_row_plan(
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    max_num_seqs: int,
+    decode_rows: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``(dcp_req, hp_req, cu_d, src_row)`` of a head-parallel step: the
+    decode-sized requests, the prefill ones, the decode requests' compacted
+    ``cu_q_lens`` and the step row of each of the static
+    ``max_num_seqs * decode_rows`` compacted rows."""
+    seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    live = (seq_idx < distribution[2]) & (q_lens > 0)
+    dcp_req = live & (q_lens <= decode_rows)
+    hp_req = live & (q_lens > decode_rows)
+    cu_d = jnp.concatenate(
+        [jnp.zeros((1,), jnp.int32), jnp.cumsum(jnp.where(dcp_req, q_lens, 0))]
+    ).astype(jnp.int32)
+    p = jnp.arange(max_num_seqs * decode_rows, dtype=jnp.int32)
+    req = jnp.minimum(jnp.searchsorted(cu_d[1:], p, side="right"), max_num_seqs - 1)
+    src_row = jnp.where(p < cu_d[-1], cu_q_lens[req] + p - cu_d[req], 0)
+    return dcp_req, hp_req, cu_d, src_row
+
+
 def merge_partials(
     out: jax.Array, lse: jax.Array, axis: str, *, rs_out_precision: bool
 ) -> jax.Array:
@@ -384,13 +408,16 @@ def attend_and_merge(
     head_parallel_min_tokens: int = HEAD_PARALLEL_MIN_TOKENS,
     interpret: bool = False,
     q_gathered: bool = False,
+    q_dec: jax.Array | None = None,
 ) -> jax.Array:
     """This rank's (``rank``, ``int32[1]``) attention output ``[T, Hl, D]``
     (unrotated) for its rotated query heads ``q [T, Hl, D]`` and its packed
     ``candidates [T, G * 2 * topk]`` (`msa_dcp.msa_write_and_candidates_dcp`);
     4-bit caches. `q_gathered`: ``q`` is the group's unrotated query heads
     ``[T, dcp * Hl, D]`` (`EARLY_Q_GATHER_ENV`); only for steps that
-    `uses_dcp_attention`.
+    `uses_dcp_attention`. `q_dec`: on a head-parallel step, the group's
+    unrotated query heads of the compacted decode rows ``[max_num_seqs *
+    decode_rows, dcp * Hl, D]`` (`decode_row_plan`), gathered by the caller.
     Runs inside a ``shard_map`` over `axis` (the DCP group)."""
     num_tokens = q.shape[0]
     # The rank is an input: torch_tpu's SPMD partitioner refuses the
@@ -421,21 +448,13 @@ def attend_and_merge(
             q_gathered=q_gathered,
             **common,
         )
-    seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
-    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    live = (seq_idx < distribution[2]) & (q_lens > 0)
-    dcp_req = live & (q_lens <= decode_rows)
-    hp_req = live & (q_lens > decode_rows)
-
     # The decode requests' rows, compacted: their own cu_q_lens.
-    cu_d = jnp.concatenate(
-        [jnp.zeros((1,), jnp.int32), jnp.cumsum(jnp.where(dcp_req, q_lens, 0))]
-    ).astype(jnp.int32)
+    _, hp_req, cu_d, src_row = decode_row_plan(
+        cu_q_lens, distribution, max_num_seqs, decode_rows
+    )
     p = jnp.arange(rows, dtype=jnp.int32)
-    req = jnp.minimum(jnp.searchsorted(cu_d[1:], p, side="right"), max_num_seqs - 1)
-    src_row = jnp.where(p < cu_d[-1], cu_q_lens[req] + p - cu_d[req], 0)
     dcp_out = _dcp_attend(
-        q[src_row],
+        q[src_row] if q_dec is None else q_dec,
         kv_cache,
         scale_cache,
         candidates[src_row],
@@ -443,6 +462,7 @@ def attend_and_merge(
         block_tables,
         cu_d,
         rs_out_precision=rs_out_precision,
+        q_gathered=q_dec is not None,
         **common,
     )
     tokens = msa.token_positions(num_tokens, seq_lens, cu_q_lens)

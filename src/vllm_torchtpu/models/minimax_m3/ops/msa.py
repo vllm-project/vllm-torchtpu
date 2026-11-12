@@ -724,9 +724,60 @@ def _get_msa_dcp_fp4_op(
             scale_cache=scale_cache,
         )
 
+    def _attend_rot_jax(
+        q: jax.Array,
+        kv_cache: jax.Array,
+        scale_cache: jax.Array,
+        candidates: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        dcp_rank: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        # `q`: the group's unrotated heads (early gather); per-row rotation.
+        return _attend_jax(
+            msa_fp4.rotate_queries(q),
+            kv_cache,
+            scale_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            dcp_rank,
+        )
+
+    def _decode_rows_q_jax(
+        q: jax.Array, query_start_loc: jax.Array, request_distribution: jax.Array
+    ) -> jax.Array:
+        src_row = msa_dcp_heads.decode_row_plan(
+            query_start_loc,
+            request_distribution,
+            query_start_loc.shape[0] - 1,
+            decode_rows,
+        )[3]
+        return q[src_row]
+
     suffix = (
         f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g{kv_heads}"
     ).replace(".", "p")
+    early = msa_dcp_heads.early_q_gather_enabled()
+    attend_rot_op = None
+    if early and kv_heads == 1:
+        attend_rot_op = pallas.jax_op(
+            f"pallas::minimax_m3_msa_dcp_fp4_attend_rot_{suffix}", _attend_rot_jax
+        )
+        attend_rot_op.register_fake(_head_major_attend_fake)
+    decode_rows_q_op = None
+    if early and kv_heads > 1:
+        decode_rows_q_op = pallas.jax_op(
+            f"pallas::minimax_m3_msa_dcp_decode_rows_q_r{decode_rows}",
+            _decode_rows_q_jax,
+        )
+        decode_rows_q_op.register_fake(
+            lambda q, qsl, dist: q.new_empty(
+                ((qsl.shape[0] - 1) * decode_rows, q.shape[1], q.shape[2])
+            )
+        )
     score_op = pallas.jax_op(
         f"pallas::minimax_m3_msa_dcp_fp4_score_{suffix}",
         _score_jax,
@@ -762,13 +813,14 @@ def _get_msa_dcp_fp4_op(
         if kv_heads > 1
         else None
     )
-    early_q_op = (
-        _get_msa_dcp_heads_op(
+    early_q_op = early_dec_op = None
+    if kv_heads > 1 and early:
+        early_q_op = _get_msa_dcp_heads_op(
             sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix, q_gathered=True
         )
-        if kv_heads > 1 and msa_dcp_heads.early_q_gather_enabled()
-        else None
-    )
+        early_dec_op = _get_msa_dcp_heads_op(
+            sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix, q_dec=True
+        )
 
     def op(
         q: torch.Tensor,
@@ -786,12 +838,24 @@ def _get_msa_dcp_fp4_op(
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
-        q_all = None
-        if early_q_op is not None and msa_dcp_heads.uses_dcp_attention(
-            q.shape[0], metadata.seq_lens.shape[0], decode_rows
-        ):
-            # Ahead of the scoring op, which it does not feed: the gather can
-            # overlap the indexer (`msa_dcp_heads.EARLY_Q_GATHER_ENV`).
+        # Gathers ahead of the scoring op, which they do not feed, so they
+        # can overlap the indexer (`msa_dcp_heads.EARLY_Q_GATHER_ENV`).
+        q_all = q_dec = None
+        if early_q_op is not None:
+            if msa_dcp_heads.uses_dcp_attention(
+                q.shape[0], metadata.seq_lens.shape[0], decode_rows
+            ):
+                q_all = gather_query_heads(q, group)
+            else:  # head-parallel step: only its decode rows take the gather
+                q_dec = gather_query_heads(
+                    decode_rows_q_op(
+                        q.contiguous(),
+                        metadata.query_start_loc,
+                        metadata.request_distribution,
+                    ),
+                    group,
+                )
+        elif attend_rot_op is not None:
             q_all = gather_query_heads(q, group)
         if kv_heads > 1:
             k, v, index_q = gather_group_kv(k, v, index_q, group, dcp, kv_head_replicas)
@@ -813,7 +877,20 @@ def _get_msa_dcp_fp4_op(
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
         scale_cache.copy_(new_scale_cache)
-        if q_all is not None:
+        if q_dec is not None:
+            return early_dec_op(
+                dcp_rank,
+                q,
+                kv_cache,
+                scale_cache,
+                candidates,
+                metadata.seq_lens,
+                metadata.block_tables,
+                metadata.query_start_loc,
+                metadata.request_distribution,
+                q_dec,
+            )
+        if q_all is not None and early_q_op is not None:
             return early_q_op(
                 dcp_rank,
                 q_all,
@@ -837,9 +914,13 @@ def _get_msa_dcp_fp4_op(
                 metadata.query_start_loc,
                 metadata.request_distribution,
             )
-        q_all = gather_query_heads(q, group)
         candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
-        out, lse = attend_op(
+        if q_all is None:
+            q_all = gather_query_heads(q, group)
+            attend = attend_op
+        else:
+            attend = attend_rot_op
+        out, lse = attend(
             q_all,
             kv_cache,
             scale_cache,
@@ -862,22 +943,31 @@ def _get_msa_dcp_heads_op(
     decode_rows: int,
     suffix: str,
     q_gathered: bool = False,
+    q_dec: bool = False,
 ) -> Callable[..., torch.Tensor]:
     """The attention half of the 4-bit DCP op over several KV heads, as one
     SPMD op over the DCP mesh (`msa_dcp_heads.attend_and_merge`): its
     collectives run inside the program, so a long step can pick its paths
     and their sizes from the step's requests. `q_gathered`: the op takes the
-    group's unrotated query heads, gathered by the caller."""
+    group's unrotated query heads, gathered by the caller. `q_dec`: the op
+    takes one more input, the gathered unrotated heads of a head-parallel
+    step's compacted decode rows."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
 
     mesh = get_or_create_dcp_mesh()
     sharded, replicated = PartitionSpec(DCP_AXIS_NAME), PartitionSpec()
-    specs = (sharded,) * 5 + (replicated,) * 4
+    specs = (sharded,) * 5 + (replicated,) * 4 + ((sharded,) if q_dec else ())
+    fn = msa_dcp_heads.attend_and_merge
+    if q_dec:
+
+        def fn(*args, **kwargs):
+            return msa_dcp_heads.attend_and_merge(*args[:9], q_dec=args[9], **kwargs)
+
     body = jax.shard_map(
         functools.partial(
-            msa_dcp_heads.attend_and_merge,
+            fn,
             axis=DCP_AXIS_NAME,
             dcp=dcp,
             kv_head_replicas=kv_head_replicas,
@@ -920,11 +1010,40 @@ def _get_msa_dcp_heads_op(
             *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
         )
 
+    def _attend_dec_jax(
+        dcp_rank: jax.Array,
+        q: jax.Array,
+        kv_cache: jax.Array,
+        scale_cache: jax.Array,
+        candidates: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        q_dec: jax.Array,
+    ) -> jax.Array:
+        args = (
+            dcp_rank,
+            q,
+            kv_cache,
+            scale_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            q_dec,
+        )
+        return body(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         f"pallas::minimax_m3_msa_dcp_heads_attend_{suffix}_r{decode_rows}"
-        + ("_qg" if q_gathered else ""),
-        _attend_jax,
+        + ("_qg" if q_gathered else "")
+        + ("_qd" if q_dec else ""),
+        _attend_dec_jax if q_dec else _attend_jax,
         mesh=mesh,
         input_partition_specs=specs,
         # A sequence, one spec per output (a bare spec reads as its axes).
