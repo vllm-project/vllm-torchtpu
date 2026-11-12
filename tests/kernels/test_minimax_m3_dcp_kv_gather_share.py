@@ -17,6 +17,7 @@ same k/v/index_q, for every rank of the DCP group."""
 
 import ast
 import importlib
+import logging
 import os
 import pathlib
 import types
@@ -37,19 +38,24 @@ def _load_msa():
         "src/vllm_torchtpu/models/minimax_m3/ops/msa.py"
     )
     tree = ast.parse(path.read_text())
-    want = {"KV_GATHER_SHARE_ENV", "kv_gather_share_enabled", "gather_group_kv"}
+    want = {"KV_GATHER_SHARE_ENV", "_KV_GATHER_SHARE_TRACED", "kv_gather_share_enabled", "gather_group_kv"}
     body = [
         node
         for node in tree.body
         if (isinstance(node, ast.FunctionDef) and node.name in want)
         or (
-            isinstance(node, ast.Assign)
-            and any(getattr(t, "id", None) in want for t in node.targets)
+            isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                getattr(t, "id", None) in want
+                for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            )
         )
     ]
     assert len(body) == len(want), [getattr(n, "name", n) for n in body]
     mod = types.ModuleType("msa_subset")
-    mod.__dict__.update(os=os, torch=torch, Any=typing.Any)
+    mod.__dict__.update(
+        os=os, torch=torch, Any=typing.Any, init_logger=logging.getLogger
+    )
     exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), mod.__dict__)
     return mod
 
