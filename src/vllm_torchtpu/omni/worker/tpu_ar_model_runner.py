@@ -72,7 +72,7 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
                 "pipeline (qwen3_omni_moe_thinker_only) or another single-stage "
                 "deployment."
             )
-        if getattr(self, "speculative_config", None) is not None:
+        if self.speculative_config is not None:
             raise NotImplementedError(
                 f"Stage {self.stage_id} ({self.model_stage!r}): speculative decoding "
                 "(speculative_config) is not supported by TPUARModelRunner yet."
