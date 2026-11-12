@@ -13,6 +13,11 @@
 # limitations under the License.
 
 import torch
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+
+# Captured at import: the autouse _omni_model_patches fixture in conftest.py
+# installs the patch before each test runs.
+_UPSTREAM_FORWARD = WanCausalConv3d.forward
 
 
 def _assert_close(out: torch.Tensor, ref: torch.Tensor) -> None:
@@ -21,9 +26,10 @@ def _assert_close(out: torch.Tensor, ref: torch.Tensor) -> None:
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5 * scale)
 
 
-def test_vae_conv_out_padding():
-    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
-
+def test_vae_conv_out_padding(monkeypatch):
+    # Start from upstream's forward; monkeypatch puts the fixture's patched
+    # forward back afterwards.
+    monkeypatch.setattr(WanCausalConv3d, "forward", _UPSTREAM_FORWARD)
     orig_forward = WanCausalConv3d.forward
 
     conv = WanCausalConv3d(in_channels=96, out_channels=3, kernel_size=3, padding=1)
@@ -33,6 +39,10 @@ def test_vae_conv_out_padding():
     _patch_wan_vae_conv_out_lane_padding()
 
     assert WanCausalConv3d.forward is not orig_forward
+    # Installing again keeps the wrapper instead of wrapping it a second time.
+    patched = WanCausalConv3d.forward
+    _patch_wan_vae_conv_out_lane_padding()
+    assert WanCausalConv3d.forward is patched
 
     x_even = torch.randn(1, 96, 2, 8, 8)
     x_odd = torch.randn(1, 96, 3, 8, 8)

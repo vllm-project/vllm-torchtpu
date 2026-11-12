@@ -648,11 +648,16 @@ def _patch_ltx2_split_rope() -> None:
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
 
 
+_CONV_OUT_LANE_PADDING_PATCHED = "_tpu_conv_out_lane_padding_patched"
+
+
 def _patch_wan_vae_conv_out_lane_padding() -> None:
     # TODO: Remove once TPU conv3d lowers 3-channel outputs at full lane bandwidth.
     from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
 
     orig_forward = WanCausalConv3d.forward
+    if getattr(orig_forward, _CONV_OUT_LANE_PADDING_PATCHED, False):
+        return
     padded_channels = 128
 
     def _padded_forward(
@@ -693,6 +698,7 @@ def _patch_wan_vae_conv_out_lane_padding() -> None:
         )
         return out[:, :3]
 
+    setattr(_padded_forward, _CONV_OUT_LANE_PADDING_PATCHED, True)
     WanCausalConv3d.forward = _padded_forward
     logger.info(
         "Applied TPU patch: lane-dense output padding for the Wan VAE conv_out."
