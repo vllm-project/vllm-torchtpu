@@ -1886,6 +1886,35 @@ def _decode_tiles(cfgs: GmmConfigs) -> bool:
     )
 
 
+_MLP_VMEM_FRACTION_ENV = "TPU_GMM_V2_MLP_VMEM_FRACTION"
+
+
+@functools.cache
+def _mlp_vmem_fraction() -> float:
+    """VMEM limit of gmm_v2_mlp as a fraction of capacity (default 0.9).
+
+    At decode with ``TPU_GMM_V2_DECODE_W13=3072:2:2`` (one grid step per
+    expert, 2-deep) the fused kernel_mlp needs ~62.1 MB, just over 0.9 x 64 MiB,
+    so the MLP runs as two calls and the down call exposes its first weight
+    block. 0.95 lets it fuse; tiles and results are unchanged."""
+    raw = os.environ.get(_MLP_VMEM_FRACTION_ENV, "").strip()
+    if not raw:
+        return 0.9
+    frac = float(raw)
+    if not 0.5 <= frac <= 0.98:
+        raise ValueError(f"{_MLP_VMEM_FRACTION_ENV}={raw!r}: expected 0.5..0.98")
+    try:
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(
+            "%s=%s: gmm_v2_mlp VMEM limit %.2f x capacity (fusability test and kernel_mlp).",
+            _MLP_VMEM_FRACTION_ENV, raw, frac,
+        )
+    except ImportError:  # kernel-only use without vllm
+        pass
+    return frac
+
+
 def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) -> bool:
     """Whether kernel_mlp can run both gmms on one fill_metadata layout."""
 
@@ -1993,6 +2022,11 @@ def gmm_v2_mlp(
     elif jnp.isscalar(group_offset):
         group_offset = group_offset[None]
     vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    # Tiles are chosen at 0.9 x capacity either way; only the fusability test
+    # and kernel_mlp's own limit see TPU_GMM_V2_MLP_VMEM_FRACTION.
+    mlp_vmem_limit_bytes = int(
+        pltpu.get_tpu_info().vmem_capacity_bytes * _mlp_vmem_fraction()
+    )
 
     common = dict(
         tile_info=calculate_tiling,
@@ -2025,7 +2059,7 @@ def gmm_v2_mlp(
         out_dtype=preferred_element_type,
         **common,
     )
-    if not _mlp_fusable(cfgs1, cfgs2, vmem_limit_bytes):
+    if not _mlp_fusable(cfgs1, cfgs2, mlp_vmem_limit_bytes):
         return two_calls()[:size_m]
 
     def weights_ref(rhs, rhs_scale):
@@ -2063,7 +2097,7 @@ def gmm_v2_mlp(
             ],
         ),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=vmem_limit_bytes,
+            vmem_limit_bytes=mlp_vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
         name=f"mlp-{get_scope_name(cfgs1)}-{get_scope_name(cfgs2)}",

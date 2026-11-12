@@ -146,3 +146,17 @@ def test_vmem_estimate_counts_rhs_buffers():
         32, 3072, H, lhs_cfgs=lhs, rhs_cfgs=rhs, fuse_act="swigluoai", rhs_buffer_count=2
     )
     assert e3 - e2 == 2 * G.rhs_weight_block_bytes(H, 3072, rhs)
+
+
+def test_mlp_vmem_fraction_env(monkeypatch):
+    G._mlp_vmem_fraction.cache_clear()
+    monkeypatch.delenv(G._MLP_VMEM_FRACTION_ENV, raising=False)
+    assert G._mlp_vmem_fraction() == 0.9
+    G._mlp_vmem_fraction.cache_clear()
+    monkeypatch.setenv(G._MLP_VMEM_FRACTION_ENV, "0.95")
+    assert G._mlp_vmem_fraction() == 0.95
+    G._mlp_vmem_fraction.cache_clear()
+    monkeypatch.setenv(G._MLP_VMEM_FRACTION_ENV, "1.5")
+    with pytest.raises(ValueError):
+        G._mlp_vmem_fraction()
+    G._mlp_vmem_fraction.cache_clear()
