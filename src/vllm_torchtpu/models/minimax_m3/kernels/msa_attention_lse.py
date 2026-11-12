@@ -675,6 +675,37 @@ def _bitonic_sort_rows(x):
     return x
 
 
+def _dense_union_row(x):
+    """`msa_attention._dense_unions` of one tile ``x [1, n]`` (`_NO_PAGE`
+    for none) on the VPU: [n, n] compares of the keys on lanes against the
+    same keys on sublanes (one transpose). Few tiles: its latency is a few
+    dozen vreg ops, below the bitonic network's ~50 dependent stages."""
+    n = x.shape[1]
+    no_page = msa_attention._NO_PAGE
+    i32 = jnp.int32
+    sub = jax.lax.broadcasted_iota(i32, (n, n), 0)
+    lane = jax.lax.broadcasted_iota(i32, (n, n), 1)
+    xc = jnp.transpose(jnp.broadcast_to(x, (8, n)))[:, 0:1]  # [n, 1]
+    eq = (xc == x).astype(i32)  # [i, j]
+    seen_row = jnp.max(jnp.where(sub < lane, eq, 0), axis=0, keepdims=True)
+    seen_col = jnp.max(jnp.where(sub > lane, eq, 0), axis=1, keepdims=True)
+    first_row = jnp.where((x != no_page) & (seen_row == 0), 1, 0)
+    first_col = (xc != no_page) & (seen_col == 0)
+    # Distinct pages below x_i: x_i's slot in the ascending union.
+    place_col = jnp.sum(jnp.where(x < xc, first_row, 0), axis=1, keepdims=True)
+    return jnp.min(
+        jnp.where(first_col & (place_col == lane), xc, no_page),
+        axis=0,
+        keepdims=True,
+    )
+
+
+# Calls of at most this many tiles build unions by `_dense_union_row`, more
+# by `_bitonic_sort_rows` (bench j-2ab6fa8c / j-10aec1e9: dense -2..-4 us at
+# 1-6 8-token tiles, +3..+5 at 12-16; bitonic ~ XLA at 6-24 tiles).
+_DENSE_UNION_MAX_TILES = 6
+
+
 def _work_list_kernel(
     rows_ref, o_ref, *, block_q, pages_per_step, tiles_per_step, offsets
 ):
@@ -695,16 +726,27 @@ def _work_list_kernel(
     union_len = groups_per_tile * pages_per_step
     i32 = jnp.int32
     tiles_p = _round_up(num_tiles, 8)
-    x = rows_ref[...]
-    if tiles_p > num_tiles:
-        x = jnp.concatenate([x, jnp.full((tiles_p - num_tiles, n), -1, i32)], axis=0)
-    x = _bitonic_sort_rows(jnp.where(x < 0, no_page, x))
-    lane = jax.lax.broadcasted_iota(i32, x.shape, 1)
-    dup = (lane > 0) & (x == pltpu.roll(x, 1, axis=1))
-    union = _bitonic_sort_rows(jnp.where(dup, no_page, x))
+    o_ref[...] = jnp.full(o_ref.shape, -1, i32)
+    if num_tiles <= _DENSE_UNION_MAX_TILES:
+        row_sub = jax.lax.broadcasted_iota(i32, (tiles_p, n), 0)
+        union = jnp.full((tiles_p, n), no_page, i32)
+        for t in range(num_tiles):
+            x = rows_ref[t : t + 1, :]
+            union = jnp.where(
+                row_sub == t, _dense_union_row(jnp.where(x < 0, no_page, x)), union
+            )
+    else:
+        x = rows_ref[...]
+        if tiles_p > num_tiles:
+            x = jnp.concatenate(
+                [x, jnp.full((tiles_p - num_tiles, n), -1, i32)], axis=0
+            )
+        x = _bitonic_sort_rows(jnp.where(x < 0, no_page, x))
+        lane = jax.lax.broadcasted_iota(i32, x.shape, 1)
+        dup = (lane > 0) & (x == pltpu.roll(x, 1, axis=1))
+        union = _bitonic_sort_rows(jnp.where(dup, no_page, x))
     pages_col = jnp.sum((union != no_page).astype(i32), axis=1, keepdims=True)
     union = jnp.where(union == no_page, -1, union)
-    o_ref[...] = jnp.full(o_ref.shape, -1, i32)
     for t in range(num_tiles):
         start = offsets[0] + t * union_len
         o_ref[:, start : start + n] = union[t : t + 1, :]
@@ -893,7 +935,7 @@ def _chunked_call(
     keys = selected.reshape(num_heads * num_chunks, step, selected.shape[2])
     if (
         decode
-        and num_tiles <= _WORK_KERNEL_MAX_TILES
+        and num_tiles <= _DENSE_UNION_MAX_TILES
         and _env_flag(WORK_LIST_KERNEL_ENV)
     ):
         _proof(WORK_LIST_KERNEL_ENV, "MSA decode work list by one Pallas kernel")
