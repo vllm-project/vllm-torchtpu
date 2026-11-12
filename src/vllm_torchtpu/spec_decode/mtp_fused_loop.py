@@ -28,6 +28,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.spec_decode.shard_argmax import greedy_draft_token
 
 
 class MtpDraftModel(Protocol):
@@ -100,9 +101,7 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
-            input_ids = (
-                self.mtp.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
-            )
+            input_ids = greedy_draft_token(self.mtp, last_hidden)
             tokens.append(input_ids)
         return tuple(tokens)
 

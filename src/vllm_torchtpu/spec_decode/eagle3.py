@@ -18,6 +18,7 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.spec_decode.shard_argmax import greedy_draft_token
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError, MegakernelSetupError
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     fixed_moe_collection_chunks,
@@ -1486,9 +1487,7 @@ class Eagle3Proposer:
             # No draft->target mapping table. Upstream compute_logits then asserts
             # the head is already target-vocab-width, so plain argmax yields
             # target ids.
-            return (
-                self.draft_model.compute_logits(hidden).argmax(dim=-1).to(torch.int32)
-            )
+            return greedy_draft_token(self.draft_model, hidden)
         draft_id = self.draft_model.logits_processor(
             self.draft_model.lm_head, hidden
         ).argmax(dim=-1)
