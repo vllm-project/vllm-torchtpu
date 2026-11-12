@@ -136,6 +136,7 @@ def _reference(inp, reqs):
         v_scale=1.0,
         kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         native_fp8_prefill=native_fp8_prefill,
+        tuned_tiles=True,
     )
     t = sum(n for _, n in reqs)
     out = np.asarray(out[:t].astype(jnp.float32))
