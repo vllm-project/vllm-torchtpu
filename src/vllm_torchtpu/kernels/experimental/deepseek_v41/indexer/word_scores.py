@@ -56,7 +56,12 @@ def _vmem_limit_bytes() -> int:
     return int(pltpu.get_tpu_info().vmem_capacity_bytes) // VMEM_LIMIT_DIVISOR
 
 
-def _max_vmem_tokens(heads: int, padded_rows: int) -> int:
+def max_vmem_tokens(heads: int, padded_rows: int) -> int:
+    """Return max query tokens fitting TPU7x scoped VMEM for ``padded_rows``.
+
+    Accounts for ``(8, 128)`` sublane/lane tiling of ``q`` and ``weights`` plus
+    fixed double-buffered pipeline scratch.
+    """
     vmem_limit = _vmem_limit_bytes()
     # Avoid scalar WEIGHT_BYTES_PER_HEAD (4 B) or unpadded heads: VMEM tiles
     # 3D q and f32[T, H, 1] weights to (8, 128), costing 512 B/head for weights.
@@ -303,7 +308,7 @@ def _score_word_rows_jit(
         )
         return scores[:, : SLOTS * rows]
 
-    max_tokens_per_chunk = _max_vmem_tokens(heads, padded_rows)
+    max_tokens_per_chunk = max_vmem_tokens(heads, padded_rows)
 
     def _scan_tokens(
         scan_q: jax.Array,
