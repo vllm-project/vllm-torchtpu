@@ -392,6 +392,16 @@ def run_prefill(args, records: harness.Records) -> None:
     rng = np.random.default_rng(0)
     corpus = np.load(args.token_file).astype(np.int32) if args.token_file else None
     largest = prefiller.program.windows[-1]
+
+    def wait(step):
+        """Wait for a step's work: its sampled tokens, or the pools its window
+        writes when it samples none (the aggregate's prefill computes no
+        logits)."""
+        bridge.materialize(step.tokens)
+        if not step.tokens.numel():
+            for tensor in pools.tensors:
+                bridge.materialize(tensor)
+
     for length, count, prefix in cases:
         tag = f"p{length}x{count}" + (f"c{prefix}" if prefix else "")
         pieces = [
@@ -433,8 +443,7 @@ def run_prefill(args, records: harness.Records) -> None:
                             num_prompt_tokens=prefix,
                             block_tables=tables[r],
                         )
-                        step = prefiller.step(mk.StepInput([chained]))
-                        bridge.materialize(step.tokens)
+                        wait(prefiller.step(mk.StepInput([chained])))
             rows = [
                 mk.RequestInput(
                     req_id=f"{tag}-{repeat}-{r}",
@@ -450,7 +459,7 @@ def run_prefill(args, records: harness.Records) -> None:
             with _trace(args.trace, tag, repeat == args.repeats):
                 started = time.perf_counter()
                 stepped = prefiller.step(mk.StepInput(rows))
-                bridge.materialize(stepped.tokens)
+                wait(stepped)
                 elapsed = 1e3 * (time.perf_counter() - started)
             if args.route_counts and harness.rank() == 0:
                 harness.log(
