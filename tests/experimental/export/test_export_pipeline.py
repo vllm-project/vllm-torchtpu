@@ -787,6 +787,10 @@ def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
             "1024",
             "--block-size",
             "32",
+            "--max-verify-tokens",
+            "8",
+            "--debug-taps",
+            "model.layers.0",
             "--port",
             "8001",
             "--default-chat-template-kwargs",
@@ -797,7 +801,11 @@ def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
         ]
     )
     assert args.model == "Qwen/Qwen3-0.6B"
-    assert (args.max_model_len, args.block_size) == (1024, 32)
+    assert (args.max_model_len, args.block_size, args.max_verify_tokens) == (
+        1024,
+        32,
+        8,
+    )
     ignored = capsys.readouterr().err
     for flag in [
         "--port",
@@ -806,8 +814,41 @@ def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
         "--tool-call-parser",
     ]:
         assert flag in ignored, ignored
-    for flag in ["--max-model-len", "--block-size", "--output-dir"]:
+    for flag in [
+        "--max-model-len",
+        "--block-size",
+        "--output-dir",
+        "--max-verify-tokens",
+        "--debug-taps",
+    ]:
         assert flag not in ignored, ignored
+
+
+def test_export_options_are_never_reported_as_ignored_frontend_args() -> None:
+    parser = cli.build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--model",
+            "Qwen/Qwen3-0.6B",
+            "--output-dir",
+            "/tmp/out",
+            "--target-tpu",
+            "7x",
+            "--token-buckets",
+            "16,32",
+            "--req-buckets",
+            "8,16",
+            "--num-blocks",
+            "64",
+            "--max-verify-tokens",
+            "8",
+            "--debug-taps",
+            "model.layers.0",
+            "--export-mode",
+            "model",
+        ]
+    )
+    assert cli.ignored_frontend_args(parser, args) == []
 
 
 def test_artifact_model_name_records_the_model_id_not_its_location(
