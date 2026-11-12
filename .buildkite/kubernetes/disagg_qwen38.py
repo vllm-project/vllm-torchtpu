@@ -30,6 +30,7 @@ def role_profile(
     instance: str = "qwen38-pd",
     *,
     apc: bool = False,
+    mtp: bool = False,
 ) -> dict:
     if role not in ("prefill", "decode") or dp not in (4, 8):
         raise ValueError("Expected prefill/decode and DP4 or DP8 on eight ranks")
@@ -84,20 +85,27 @@ def role_profile(
         "VLLM_ENGINE_READY_TIMEOUT_S": "6800",
         "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
     }
+    mtp_tokens = (1 if prefill else 3) if mtp else 0
     if prefill:
         env["MOE_FUSED_EP_KERNEL_IMPL"] = "v2"
     if apc:
         env["VLLM_SERVER_DEV_MODE"] = "1"
         env["TPU_RAIDEN_POOL_STAGING_LEASES"] = "1"
+    if mtp:
+        env["TPU_DP_VOCAB_PARALLEL"] = "1"
     qwen = dict(
         ple_host_backend=backend,
         engram_config=dict(
             cpu_offload=True, dp_shared_memory=prefill, embedding_across_dp=not prefill
         ),
     )
+    if mtp:
+        compile_sizes = [16, 8192] if prefill else [16, 32, 64, 8192]
+    else:
+        compile_sizes = [8192] if prefill else [8, 8192]
     compilation = dict(
         backend="vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor",
-        compile_sizes=[8192] if prefill else [8, 8192],
+        compile_sizes=compile_sizes,
     )
     transfer = dict(
         kv_connector="Qwen4ExpRaidenConnector",
@@ -148,6 +156,13 @@ def role_profile(
         "--kv-transfer-config",
         json.dumps(transfer),
     ]
+    if mtp:
+        args.extend(
+            [
+                "--speculative-config",
+                json.dumps(dict(method="mtp", num_speculative_tokens=mtp_tokens)),
+            ]
+        )
     return dict(
         role=role,
         dp=dp,
@@ -160,6 +175,7 @@ def role_profile(
         max_request_tokens=33792,
         client_concurrency=dp * 8,
         prefix_caching=apc,
+        speculative_tokens=mtp_tokens,
     )
 
 
@@ -188,15 +204,16 @@ def main() -> None:
             )
         return
     mode = os.environ.get("DISAGG_TEST_MODE", "performance")
-    if mode not in ("performance", "apc"):
-        parser.error("DISAGG_TEST_MODE must be performance or apc")
+    if mode not in ("performance", "apc", "mtp-apc"):
+        parser.error("DISAGG_TEST_MODE must be performance, apc or mtp-apc")
     profile = role_profile(
         args.role,
         int(os.environ.get("DISAGG_DP_SIZE", "8")),
         os.environ.get("DISAGG_MODEL", MODEL),
         os.environ["POD_IP"],
         os.environ.get("WORKLOAD_NAME", "qwen38-pd"),
-        apc=mode == "apc",
+        apc=mode in ("apc", "mtp-apc"),
+        mtp=mode == "mtp-apc",
     )
     if args.print_only:
         print(json.dumps(profile, indent=2))

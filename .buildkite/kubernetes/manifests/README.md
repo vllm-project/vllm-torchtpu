@@ -62,7 +62,8 @@ can be supplied for host tests. No model copy is part of the scripts.
 
 Both roles request block128 FP8 pages, FP32 convolution state and BF16 recurrent
 state, CP1/PP1 and async/chunked scheduling. Native pool planning resolves the
-actual manager-page and state-slot geometry. MTP is unsupported. The model-owned
+actual manager-page and state-slot geometry, including optional MTP draft cache
+groups and speculative recurrent scratch slots. The model-owned
 `Qwen4ExpRaidenConnector` transfers native cache groups with parallelism equal
 to TP, independently of DP or expert routing. Its physical layout checks remain
 mandatory; the Qwen3.5 admission and block8192 recipe do not apply.
@@ -77,18 +78,22 @@ independently. Local PLE
 shards, backend/shared-memory choices and checkpoint paths may differ; incompatible
 cache encodings, scales or storage bindings are rejected. Matching transfer
 fingerprints do not establish model/checkpoint equivalence or numerical accuracy.
-The model still requires CP1/PP1 and no speculative decoding. This whole-page
-mapper requires the actual local TP rank set and one explicitly mapped committed
-snapshot for each recurrent owner. In aligned mode the snapshot is selected at
-the published token position, excluding historical and spare slots.
+The model requires CP1/PP1; native MTP (`method="mtp"`) is supported on both
+symmetric and asymmetric (`P k=1 -> D k=3`) roles under `mamba_cache_mode="none"`
+or `"align"`. This whole-page mapper requires the actual local TP rank set and
+one explicitly mapped committed snapshot for each recurrent owner. In aligned
+mode the snapshot is selected at the published token position, excluding
+historical checkpoints and trailing speculative scratch slots.
 The Qwen adapter currently declares whole-page copies to matching transfer-unit
 ordinals. Cross-TP splitting/combining of packed QSA/GDN pages needs a fragment
 mapping that this adapter does not supply. Shared Raiden's support for explicit
 resharding spans does not infer that model-specific mapping automatically.
 
-`DISAGG_TEST_MODE=apc` selects the correctness lane. Both roles enable APC with
-aligned Mamba state and Stage-3 prefix-aware loads; the performance lane keeps
-APC disabled. The correctness client uses the existing development RPC to read
+`DISAGG_TEST_MODE=apc` selects the APC correctness lane, and
+`DISAGG_TEST_MODE=mtp-apc` selects the asymmetric MTP (`P k=1 -> D k=3`) + APC
+correctness lane with `TPU_DP_VOCAB_PARALLEL=1` and 1-token lookahead block
+hashing. Both correctness modes enable APC with aligned Mamba state and Stage-3
+prefix-aware loads; the performance lane keeps APC and MTP disabled. The correctness client uses the existing development RPC to read
 the default DP engine's initialized TP-worker plans. Per-engine counters check
 actual routing and hits on every DP rank. Qualification also requires native
 supervisor receipts for loaded source and cache plans on all workers.

@@ -283,3 +283,19 @@ steps:
           - *kube_plugin
         commands:
           - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.8-flash-1p1d.yaml
+
+      - label: "Test: Nightly Qwen3.8-Flash MTP + APC with PD DP8"
+        depends_on: "build_docker"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 1440
+        agents:
+          queue: "kube"
+        env:
+          CREATED_BY: "${BUILDKITE_SOURCE:-buildkite}"
+          BQ_UPLOAD: "0"
+          DISAGG_DP_SIZE: "8"
+          DISAGG_TEST_MODE: "mtp-apc"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.8-flash-1p1d.yaml

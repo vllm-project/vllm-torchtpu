@@ -36,13 +36,13 @@ esac
 test_mode="${DISAGG_TEST_MODE:-performance}"
 case "$test_mode" in
   performance) ;;
-  apc)
+  apc|mtp-apc)
     if [ "$profile" != qwen3.8-flash ]; then
       echo "Use the existing integration recipe for other APC model profiles" >&2
       exit 2
     fi
     ;;
-  *) echo "DISAGG_TEST_MODE must be performance or apc" >&2; exit 2 ;;
+  *) echo "DISAGG_TEST_MODE must be performance, apc or mtp-apc" >&2; exit 2 ;;
 esac
 # The image ships libtpu, which makes vLLM's platform
 # detection pick TPU on this CPU-only pod and fail.
@@ -122,13 +122,17 @@ if [ "$profile" = qwen3.8-flash ]; then
   model="${DISAGG_MODEL:-Qwen/Qwen3.8-Flash-Next-FP8}"
 fi
 
-if [ "$test_mode" = apc ]; then
+if [ "$test_mode" = apc ] || [ "$test_mode" = mtp-apc ]; then
   apc_rc=0
+  apc_args=()
+  if [ "$test_mode" = mtp-apc ]; then
+    apc_args+=(--mtp)
+  fi
   python3 "$HERE/../../examples/disagg/check_pd_apc.py" \
     --prefill "http://$prefill_host:8000" --decode "http://$decode_host:8000" \
     --proxy http://localhost:10000 --model "$model" --dp "${DISAGG_DP_SIZE:-8}" \
-    --output-dir "$results_dir/apc" || apc_rc=$?
-  (cd "$results_dir" && buildkite-agent artifact upload 'apc/**/*.json') \
+    --output-dir "$results_dir/$test_mode" "${apc_args[@]}" || apc_rc=$?
+  (cd "$results_dir" && buildkite-agent artifact upload "$test_mode/**/*.json") \
     || { [ "$apc_rc" -ne 0 ] || apc_rc=1; }
   exit "$apc_rc"
 fi

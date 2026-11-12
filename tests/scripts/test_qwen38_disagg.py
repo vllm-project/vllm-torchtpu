@@ -412,6 +412,27 @@ def test_unknown_profile_is_rejected_before_any_child(tmp_path):
     assert not (tmp_path / "vllm.jsonl").exists()
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["disagg_engine.sh", "prefill"],
+        ["disagg_benchmark.sh"],
+    ],
+)
+def test_unknown_test_mode_is_rejected_before_any_child(tmp_path, cmd):
+    env = stubs(tmp_path)
+    env["DISAGG_TEST_MODE"] = "invalid-mode"
+    result = subprocess.run(
+        ["bash", str(KUBE / cmd[0]), *cmd[1:]],
+        env=env,
+        capture_output=True,
+        timeout=15,
+    )
+    assert result.returncode == 2
+    assert not (tmp_path / "vllm.jsonl").exists()
+    assert not (tmp_path / "proxy.pid").exists()
+
+
 def test_partial_request_failure_keeps_all_completed_and_failed_receipts(
     tmp_path, monkeypatch
 ):

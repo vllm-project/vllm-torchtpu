@@ -27,6 +27,7 @@ from prometheus_client.parser import text_string_to_metric_families
 
 # Match run_qwen35_p8d8_disagg_correctness.sh's PD divergence criterion.
 OUTPUT_TOKENS = 1
+MTP_OUTPUT_TOKENS = 32
 LOGPROB_ATOL = 0.2
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
@@ -65,6 +66,10 @@ def counters(text: str) -> dict:
                 "vllm:prefix_cache_queries_total",
                 "vllm:prefix_cache_hits_total",
                 "vllm:external_prefix_cache_hits_total",
+                "vllm:generation_tokens_total",
+                "vllm:spec_decode_num_drafts_total",
+                "vllm:spec_decode_num_draft_tokens_total",
+                "vllm:spec_decode_num_accepted_tokens_total",
             ):
                 key = (sample.name, int(sample.labels["engine"]))
                 if key in result:
@@ -75,7 +80,7 @@ def counters(text: str) -> dict:
     return result
 
 
-def cache_contract(rows: list, dp: int) -> tuple[int, int]:
+def cache_contract(rows: list, dp: int, *, mtp: bool = False) -> tuple[int, int]:
     # The installed dev RPC calls the default DP engine's TP workers.
     flat = rows
     if not flat or {row["dp_size"] for row in flat} != {dp}:
@@ -95,6 +100,15 @@ def cache_contract(rows: list, dp: int) -> tuple[int, int]:
         not row["prefix_caching"] or row["mamba_cache_mode"] != "align" for row in flat
     ):
         raise ValueError("APC and aligned state must be active in actual workers")
+    if mtp and any(
+        not any(
+            group["prefix_cacheable"]
+            and any(name.startswith("mtp.") for name in group.get("layer_names", ()))
+            for group in row["groups"]
+        )
+        for row in flat
+    ):
+        raise ValueError("MTP draft cache group is missing from worker cache plan")
     sizes = [
         group["block_tokens"]
         for row in flat
@@ -116,20 +130,24 @@ def run(
     output: Path,
     *,
     call=http,
+    mtp: bool = False,
 ) -> dict:
     output.mkdir(parents=True, exist_ok=True)
+    criteria = dict(
+        greedy_tokens=OUTPUT_TOKENS,
+        logprob_atol=LOGPROB_ATOL,
+        known_answers="exact normalized answer, interleaved repeats",
+    )
+    if mtp:
+        criteria["mtp_output_tokens"] = MTP_OUTPUT_TOKENS
     summary = dict(
         passed=False,
         completed=0,
         failed=0,
-        expected=dp * 22,
+        expected=dp * (27 if mtp else 22),
         cases=[],
         errors=[],
-        criteria=dict(
-            greedy_tokens=OUTPUT_TOKENS,
-            logprob_atol=LOGPROB_ATOL,
-            known_answers="exact normalized answer, interleaved repeats",
-        ),
+        criteria=criteria,
         geometry_scope=(
             "default DP engine TP workers; all-rank plans require "
             "native supervisor receipts"
@@ -156,7 +174,7 @@ def run(
         raw = [call(url + "/metrics") for url in (prefill, decode)]
         return raw, [counters(text) for text in raw]
 
-    def settled_deltas(rank, before, receipt):
+    def settled_deltas(rank, before, receipt, *, min_decode_tokens=0):
         # Every request, including known answers, settles before the next
         # rank's baseline. HTTP completion precedes periodic metrics logging.
         deadline = time.monotonic() + 30
@@ -174,13 +192,23 @@ def run(
                 value != 0
                 for delta in deltas
                 for (metric, engine), value in delta.items()
-                if engine != rank and metric == "vllm:prefix_cache_queries_total"
+                if engine != rank
+                and metric
+                in (
+                    "vllm:prefix_cache_queries_total",
+                    "vllm:spec_decode_num_drafts_total",
+                )
             ):
                 raise ValueError("Actual engine routing differs from requested rank")
-            if all(
+            queries_ready = all(
                 delta.get(("vllm:prefix_cache_queries_total", rank), 0) > 0
                 for delta in deltas
-            ):
+            )
+            decode_ready = min_decode_tokens <= 0 or (
+                deltas[1].get(("vllm:generation_tokens_total", rank), 0)
+                >= min_decode_tokens
+            )
+            if queries_ready and decode_ready:
                 return deltas
             if time.monotonic() >= deadline:
                 raise ValueError(
@@ -188,14 +216,24 @@ def run(
                 )
             time.sleep(0.1)
 
-    def measured(rank, name, prompt, warmth, external, expected=None):
+    def measured(
+        rank,
+        name,
+        prompt,
+        warmth,
+        external,
+        expected=None,
+        *,
+        max_tokens=OUTPUT_TOKENS,
+        check_spec=False,
+    ):
         receipt = dict(rank=rank, case=name, prompt=prompt, expected=expected)
         try:
             raw_before, before = snapshot()
             body = dict(
                 model=model,
                 prompt=prompt,
-                max_tokens=OUTPUT_TOKENS,
+                max_tokens=max_tokens,
                 temperature=0,
                 seed=42,
                 ignore_eos=True,
@@ -211,31 +249,36 @@ def run(
             choice, usage = response["choices"][0], response["usage"]
             tokens = choice["token_ids"]
             if (
-                len(tokens) != OUTPUT_TOKENS
+                len(tokens) != max_tokens
                 or any(type(t) is not int or t < 0 for t in tokens)
                 or choice["finish_reason"] != "length"
                 or usage["prompt_tokens"] != len(prompt)
-                or usage["completion_tokens"] != OUTPUT_TOKENS
-                or usage["total_tokens"] != len(prompt) + OUTPUT_TOKENS
+                or usage["completion_tokens"] != max_tokens
+                or usage["total_tokens"] != len(prompt) + max_tokens
             ):
                 raise ValueError("Completion token or request accounting failed")
             logprobs = choice["logprobs"]["token_logprobs"]
-            if len(logprobs) != OUTPUT_TOKENS or any(
+            if len(logprobs) != max_tokens or any(
                 not isinstance(value, (int, float)) or not math.isfinite(value)
                 for value in logprobs
             ):
                 raise ValueError("Missing finite generated-token logprobs")
             result = dict(token_ids=tokens, logprobs=logprobs)
             if expected is not None:
-                if tokens != expected["token_ids"]:
+                if tokens[0] != expected["token_ids"][0]:
                     raise ValueError("Cold/warm first token IDs differ")
-                difference = max(
-                    abs(a - b) for a, b in zip(logprobs, expected["logprobs"])
-                )
+                difference = abs(logprobs[0] - expected["logprobs"][0])
                 receipt["max_logprob_absdiff"] = difference
+                if max_tokens > 1:
+                    receipt["exact_sequence_match"] = tokens == expected["token_ids"]
                 if difference > LOGPROB_ATOL:
                     raise ValueError("Cold/warm first-token logprob differs")
-            deltas = settled_deltas(rank, before, receipt)
+            deltas = settled_deltas(
+                rank,
+                before,
+                receipt,
+                min_decode_tokens=max_tokens if check_spec else 0,
+            )
             receipt["counter_deltas"] = [
                 {
                     f"{metric}/engine{engine}": value
@@ -264,6 +307,27 @@ def run(
                 raise ValueError(
                     "Remote consumption differs from full-hit/suffix contract"
                 )
+            if check_spec:
+                drafts = deltas[1].get(("vllm:spec_decode_num_drafts_total", rank), 0)
+                draft_tokens = deltas[1].get(
+                    ("vllm:spec_decode_num_draft_tokens_total", rank), 0
+                )
+                accepted = deltas[1].get(
+                    ("vllm:spec_decode_num_accepted_tokens_total", rank), 0
+                )
+                receipt["spec_decode"] = dict(
+                    drafts=drafts,
+                    draft_tokens=draft_tokens,
+                    accepted_tokens=accepted,
+                )
+                if (
+                    drafts <= 0
+                    or draft_tokens <= drafts
+                    or not 0 < accepted <= draft_tokens
+                ):
+                    raise ValueError(
+                        "Speculative decoding draft/accept counters failed"
+                    )
             summary["completed"] += 1
             summary["cases"].append(dict(rank=rank, case=name, passed=True))
             return result
@@ -281,11 +345,10 @@ def run(
             for url in (prefill, decode)
         ]
         save("cache-plans", dict(prefill=plans[0], decode=plans[1]))
-        contracts = [cache_contract(plan["results"], dp) for plan in plans]
+        contracts = [cache_contract(plan["results"], dp, mtp=mtp) for plan in plans]
         alignment = math.lcm(*(contract[0] for contract in contracts))
-        if 3 * alignment + 1 + OUTPUT_TOKENS > min(
-            contract[1] for contract in contracts
-        ):
+        max_output = MTP_OUTPUT_TOKENS if mtp else OUTPUT_TOKENS
+        if 3 * alignment + 1 + max_output > min(contract[1] for contract in contracts):
             raise ValueError(
                 "Configured context cannot cover shared-prefix and suffix test pages"
             )
@@ -421,6 +484,61 @@ def run(
                 summary["cases"].append(
                     dict(rank=rank, case="known-" + name, passed=True)
                 )
+            if mtp:
+                alt_token = next(
+                    (tok for tok in seeds[1] if tok != prompts["A"][2 * alignment]),
+                    prompts["A"][2 * alignment] + 1,
+                )
+                divergent = (
+                    prompts["A"][: 2 * alignment]
+                    + [alt_token]
+                    + (seeds[1] * math.ceil(alignment / len(seeds[1])))[:alignment]
+                )
+                reset(prefill)
+                reset(decode)
+                cold_divergent = measured(
+                    rank, "mtp-cold-divergent", divergent, (False, False), 3 * alignment
+                )
+                reset(prefill)
+                reset(decode)
+                mtp_cold_a = measured(
+                    rank,
+                    "mtp-spec-cold-A",
+                    prompts["A"],
+                    (False, False),
+                    2 * alignment,
+                    max_tokens=MTP_OUTPUT_TOKENS,
+                    check_spec=True,
+                )
+                measured(
+                    rank,
+                    "mtp-spec-both-warm-A",
+                    prompts["A"],
+                    (True, True),
+                    0,
+                    mtp_cold_a,
+                    max_tokens=MTP_OUTPUT_TOKENS,
+                    check_spec=True,
+                )
+                measured(
+                    rank,
+                    "mtp-spec-partial-branch",
+                    prompts["branch"],
+                    (True, True),
+                    alignment,
+                    max_tokens=MTP_OUTPUT_TOKENS,
+                    check_spec=True,
+                )
+                measured(
+                    rank,
+                    "mtp-boundary-divergent",
+                    divergent,
+                    (True, False),
+                    3 * alignment,
+                    cold_divergent,
+                )
+                reset(prefill)
+                reset(decode)
         if summary["completed"] != summary["expected"]:
             raise ValueError("Incomplete correctness matrix")
         summary["passed"] = True
@@ -442,10 +560,19 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--dp", type=int, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--mtp", action="store_true")
     args = parser.parse_args()
     if args.dp <= 0:
         parser.error("--dp must be positive")
-    run(args.prefill, args.decode, args.proxy, args.model, args.dp, args.output_dir)
+    run(
+        args.prefill,
+        args.decode,
+        args.proxy,
+        args.model,
+        args.dp,
+        args.output_dir,
+        mtp=args.mtp,
+    )
 
 
 if __name__ == "__main__":
