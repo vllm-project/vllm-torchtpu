@@ -226,9 +226,10 @@ def apply_kernel_numerics(model_config) -> bool | None:
     """Qwen3.5's kernel numerics and code paths, in every process that loads it.
 
     The Qwen3.5 PD stack was tuned and evaluated with the quantize helpers'
-    reciprocal scale (kernels/quantized_matmul/util.RECIPROCAL_SCALE) and the
+    reciprocal scale (kernels/quantized_matmul/util.RECIPROCAL_SCALE), the
     grouped matmul's hand-streamed whole-expert slabs
-    (kernels/megablox/gmm_v2.RHS_STREAM), both off by default; turn them on
+    (kernels/megablox/gmm_v2.RHS_STREAM), and its tuned FP8 MoE tiling and
+    rhs-scale hoist (gmm_v2.TUNED_FP8_MOE), all off by default; turn them on
     before the model's kernels are traced. Other models keep main's arithmetic
     and code. Returns False while no model config is available, so the patch
     registry tries again at model load.
@@ -241,6 +242,7 @@ def apply_kernel_numerics(model_config) -> bool | None:
 
         util.set_reciprocal_scale(True)
         gmm_v2.set_rhs_stream(True)
+        gmm_v2.set_tuned_fp8_moe(True)
     return None
 
 
