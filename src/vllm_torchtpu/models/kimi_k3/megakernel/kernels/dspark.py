@@ -59,7 +59,7 @@ from jax.experimental.pallas import tpu
 
 from vllm_torchtpu.models.kimi_k3.megakernel.common import collectives32
 
-from .decode_megakernel import _attention_scores, _dot
+from .decode_megakernel import attention_scores, dot
 
 
 @dataclasses.dataclass(frozen=True)
@@ -449,12 +449,12 @@ def _grouped_sumsq(x32, ones_bf16):
     squares = x32 * x32
     high = _bf16(squares)
     low = _bf16(squares - _f32(high))
-    return _dot(high, ones_bf16) + _dot(low, ones_bf16)
+    return dot(high, ones_bf16) + dot(low, ones_bf16)
 
 
 def _rope(x_bf16, rotation_bf16, cos32, sin32):
     """Reference ``x * cos + rotate_half(x) * sin`` in BF16 arithmetic; cos/sin are BF16-valued."""
-    rotated = _bf16(_dot(x_bf16, rotation_bf16))
+    rotated = _bf16(dot(x_bf16, rotation_bf16))
     first = _bf16(_f32(x_bf16) * cos32)
     second = _bf16(_f32(rotated) * sin32)
     return _bf16(_f32(first) + _f32(second))
@@ -600,7 +600,7 @@ def _make_body(c: DraftConfig, block: int, eps: float, requests: int = 1):
                     item = copy(refill.at[:, pl.ds(k * CHUNK, width)], weight_ref, refill_sem)
                     item.start()
                     item.wait()
-                partial = _dot(lhs_bf16, current[:, pl.ds((k * CHUNK) % width, CHUNK)])  # [T, 896] FP32
+                partial = dot(lhs_bf16, current[:, pl.ds((k * CHUNK) % width, CHUNK)])  # [T, 896] FP32
                 stage[slot, k] = pack(_bf16(partial))
                 if k == 0:
                     own = copy(stage.at[slot, 0], local_recv.at[slot, lane], SEM_OWN)
@@ -847,7 +847,7 @@ def _make_body(c: DraftConfig, block: int, eps: float, requests: int = 1):
                         row_start = 0 if stream_aux else j * rows
                         total = None
                         for layer_index, lo, hi, offset in spans[h]:
-                            part = _dot(
+                            part = dot(
                                 aux_ref[layer_index, row_start:row_start + rows, lo:hi],
                                 fc_view[pl.ds(offset, hi - lo), :],
                             )
@@ -899,7 +899,7 @@ def _make_body(c: DraftConfig, block: int, eps: float, requests: int = 1):
 
         def kv_rows(features_bf16, layer, cos32, sin32):
             """Packed [T, 128] K (normed, RoPE) | V rows for all requests' feature rows."""
-            kv = _bf16(_dot(features_bf16, kv_buf[...]))  # reference linear: BF16 output
+            kv = _bf16(dot(features_bf16, kv_buf[...]))  # reference linear: BF16 output
             sumsq = _grouped_sumsq(_f32(kv), small["kv_ones"][...])  # K lanes only
             lane_index = jax.lax.broadcasted_iota(jnp.int32, kv.shape, 1)
             normed = _f32(kv) * jax.lax.rsqrt(sumsq * (1.0 / c.head_dim) + eps)
@@ -933,7 +933,7 @@ def _make_body(c: DraftConfig, block: int, eps: float, requests: int = 1):
             for item in w1_drain(0):
                 item.wait()
             w2t_copy.wait()
-            slot0_bias[0] = _dot(w1_rows_for(anchor_token, 0), w2t_buf[...])  # [R, 5120] FP32
+            slot0_bias[0] = dot(w1_rows_for(anchor_token, 0), w2t_buf[...])  # [R, 5120] FP32
 
         # Layer 0's context rows; later layers' are computed inside the
         # previous layer's down-projection reduction. Each ring visit applies
@@ -951,7 +951,7 @@ def _make_body(c: DraftConfig, block: int, eps: float, requests: int = 1):
                 pending["kv"].start()
 
             pending["q"].wait()
-            q = _bf16(_dot(h, q_buf[...]))  # [T, 192]
+            q = _bf16(dot(h, q_buf[...]))  # [T, 192]
             if layer + 1 < layers:
                 pending["q"] = layer_copy("q", layer + 1)
                 pending["q"].start()
@@ -974,9 +974,9 @@ def _make_body(c: DraftConfig, block: int, eps: float, requests: int = 1):
                 q_rows = q[j * rows:(j + 1) * rows]
                 attended_j = jnp.zeros((rows, q_width), jnp.float32)
                 for head in range(3):
-                    q_head = _bf16(_dot(q_rows, small["head_select"][head]))  # [8, 128], zeros on V lanes
-                    s_ctx = _attention_scores(q_head, ring_tile) * scale  # [8, window]
-                    s_blk = _attention_scores(q_head, block_tile[j]) * scale  # [8, 16]
+                    q_head = _bf16(dot(q_rows, small["head_select"][head]))  # [8, 128], zeros on V lanes
+                    s_ctx = attention_scores(q_head, ring_tile) * scale  # [8, window]
+                    s_blk = attention_scores(q_head, block_tile[j]) * scale  # [8, 16]
                     s_ctx = jnp.where(context_allowed[j], s_ctx, NEG)
                     s_blk = jnp.where(block_allowed, s_blk, NEG)
                     maximum = jnp.maximum(jnp.max(s_ctx, axis=1, keepdims=True), jnp.max(s_blk, axis=1, keepdims=True))
@@ -984,8 +984,8 @@ def _make_body(c: DraftConfig, block: int, eps: float, requests: int = 1):
                     p_blk = jnp.exp(s_blk - maximum)
                     denominator = jnp.sum(p_ctx, axis=1, keepdims=True) + jnp.sum(p_blk, axis=1, keepdims=True)
                     inverse = 1.0 / denominator
-                    out = _dot(_bf16(p_ctx * inverse), ring_tile) + _dot(_bf16(p_blk * inverse), block_tile[j])
-                    attended_j = attended_j + _dot(_bf16(out), small["head_place"][head])  # V lanes -> head lanes
+                    out = dot(_bf16(p_ctx * inverse), ring_tile) + dot(_bf16(p_blk * inverse), block_tile[j])
+                    attended_j = attended_j + dot(_bf16(out), small["head_place"][head])  # V lanes -> head lanes
                 attended_rows.append(attended_j)
                 item = copy(ring_vmem.at[b], cache_out.at[j, layer], SEM_RING + 2 + b)
                 item.start()
@@ -1006,9 +1006,9 @@ def _make_body(c: DraftConfig, block: int, eps: float, requests: int = 1):
 
             h2 = _rms_norm(x, small["ln2"][layer], eps)
             pending["gate"].wait()
-            gate = _bf16(_dot(h2, gate_buf[...]))  # [T, 512], zero beyond 448
+            gate = _bf16(dot(h2, gate_buf[...]))  # [T, 512], zero beyond 448
             pending["up"].wait()
-            up = _bf16(_dot(h2, up_buf[...]))
+            up = _bf16(dot(h2, up_buf[...]))
             if layer + 1 < layers:
                 pending["gate"] = layer_copy("gate", layer + 1)
                 pending["gate"].start()
@@ -1045,7 +1045,7 @@ def _make_body(c: DraftConfig, block: int, eps: float, requests: int = 1):
         vocab_lane = jax.lax.broadcasted_iota(jnp.int32, (1, vocab), 1)
         for chunk in range(LM_CHUNKS):
             chunk_copies[chunk % 3].wait()
-            logits = _f32(_bf16(_dot(hidden_rows, chunk_buffers[chunk % 3][...])))  # BF16-rounded like the reference
+            logits = _f32(_bf16(dot(hidden_rows, chunk_buffers[chunk % 3][...])))  # BF16-rounded like the reference
             if chunk + 3 < LM_CHUNKS:
                 chunk_copies[chunk % 3] = chunk_copy(chunk + 3)
                 chunk_copies[chunk % 3].start()
@@ -1062,7 +1062,7 @@ def _make_body(c: DraftConfig, block: int, eps: float, requests: int = 1):
             else:
                 for item in w1_drain(slot % 2):
                     item.wait()
-                bias = _dot(w1_rows_for(previous, slot % 2), w2t_buf[...])  # [R, 5120] FP32
+                bias = dot(w1_rows_for(previous, slot % 2), w2t_buf[...])  # [R, 5120] FP32
             scores = jnp.concatenate(
                 [logits_vmem[j, slot: slot + 1, :] for j in range(R)], axis=0
             ) + bias  # [R, 5120]
