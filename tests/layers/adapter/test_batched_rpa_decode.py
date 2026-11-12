@@ -114,7 +114,8 @@ def test_tuned_tiles_reach_the_kernel(monkeypatch):
 
 def _lanes_after_init(monkeypatch, *, tuned_tiles, max_model_len=262144):
     """decode_lanes of a batched RPA layer with one fp8 KV head of 256 per
-    device, as its __init__ sets it; tuned_tiles stands in for a model rule."""
+    device, as its __init__ sets it; tuned_tiles stands in for the Qwen3.5
+    rule."""
 
     def base_init(self, *args, **kwargs):
         self.head_size = 256
@@ -122,9 +123,7 @@ def _lanes_after_init(monkeypatch, *, tuned_tiles, max_model_len=262144):
         self.kv_cache_quantized_dtype = FP8
 
     monkeypatch.setattr(attention.PallasAttentionBackendImpl, "__init__", base_init)
-    monkeypatch.setattr(
-        attention.PallasAttentionBackendImpl, "tuned_tiles", tuned_tiles
-    )
+    monkeypatch.setattr(attention, "qwen3_5_tuned_tiles", lambda _: tuned_tiles)
     config = SimpleNamespace(
         speculative_config=None,
         model_config=SimpleNamespace(architectures=[], max_model_len=max_model_len),
