@@ -240,6 +240,35 @@ def set_rhs_stream(enabled: bool) -> None:
     RHS_STREAM = bool(enabled)
 
 
+# The quantized-lhs tiling and rhs-scale placement tuned for Qwen3.5's FP8 MoE
+# (calculate_tiling, hoist_rhs_scale). Off by default, so every model keeps
+# main's tiles and main's order of scaling and accumulating; a model rule turns
+# it on before its kernels are traced (set_tuned_fp8_moe). The hoist changes
+# the bf16 accumulator's rounding, so it is not a free choice for other models.
+TUNED_FP8_MOE: bool = False
+
+
+def set_tuned_fp8_moe(enabled: bool) -> None:
+    """Take the tuned FP8 MoE tiling and rhs-scale hoist (True) or main's."""
+    global TUNED_FP8_MOE
+    TUNED_FP8_MOE = bool(enabled)
+
+
+def hoist_rhs_scale(cfgs: "GmmConfigs") -> bool:
+    """Whether the quantized path applies the rhs scale once per k tile.
+
+    With one rhs quant block per k tile the scale is the same for every lhs
+    quant block in the tile, so it can multiply the tile's sum instead of each
+    block's product. In a bf16 accumulator the two orders round differently,
+    so this holds only while TUNED_FP8_MOE is set.
+    """
+    return (
+        TUNED_FP8_MOE
+        and cfgs.rhs_cfgs.should_dequantize_after_matmul
+        and cfgs.rhs_cfgs.quant_block_size >= cfgs.tiles.tile_k
+    )
+
+
 def use_rhs_stream(cfgs: "GmmConfigs") -> bool:
     """Whether rhs slabs are streamed by hand instead of by emit_pipeline.
 
@@ -582,10 +611,7 @@ def inner_kernel(
             # result of [tile_m, mxu_size] becomes available at the end of every k
             # inner loop which can be used to pipeline subsequent VPU or VST ops with
             # MXU ops for the next [tile_m, mxu_size].
-            hoist_rhs_scale = (
-                cfgs.rhs_cfgs.should_dequantize_after_matmul
-                and rhs_qbs >= cfgs.tiles.tile_k
-            )
+            hoist = hoist_rhs_scale(cfgs)
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
@@ -625,10 +651,7 @@ def inner_kernel(
                     block_acc *= block_scale.astype(acc_ref.dtype)
 
                     # Apply rhs subchannel scale per quant block.
-                    if (
-                        cfgs.rhs_cfgs.should_dequantize_after_matmul
-                        and not hoist_rhs_scale
-                    ):
+                    if cfgs.rhs_cfgs.should_dequantize_after_matmul and not hoist:
                         b_id = start_k // rhs_qbs
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m
@@ -636,7 +659,7 @@ def inner_kernel(
                         block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
                     acc_n += block_acc
-                if hoist_rhs_scale:
+                if hoist:
                     rhs_scale_replicated = tiled_rhs_ref.get_scale(
                         replicate_size=bucket_m
                     )[0, :, start_n : start_n + col_size]
@@ -1173,7 +1196,10 @@ def calculate_tiling(
     rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
     tile_m = bf16_bf16_tile_m // rhs_mod
     max_num_buckets = 4
-    if lhs_cfgs.should_quantize:
+    tuned = TUNED_FP8_MOE and lhs_cfgs.should_quantize
+    if lhs_cfgs.should_quantize and not tuned:
+        tile_m *= 2
+    elif tuned:
         effective_groups = (
             min(dims.size_group, 64) if dims.size_group >= 64 else dims.size_group
         )
@@ -1264,7 +1290,7 @@ def calculate_tiling(
 
         return lhs_vmem + rhs_vmem + acc_vmem + out_vmem
 
-    if lhs_cfgs.should_quantize and dims.size_group >= 16:
+    if tuned and dims.size_group >= 16:
         table_entry = None
         if fuse_act is not None and (dims.size_k, dims.size_n) == (4096, 2048):
             table_entry = _FP8_MOE_GMM1_TILES.get(dims.size_m)
