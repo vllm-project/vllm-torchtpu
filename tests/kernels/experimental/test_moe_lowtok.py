@@ -150,6 +150,7 @@ def _assert_close(got, want, rel_l2=1e-2):
     assert err < rel_l2, err
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("tokens", [1, 4, 8, 13, 32, 64, 128, 256])
 @pytest.mark.parametrize("shape", [(8, 512, 256, 4), (64, 4096, 1024, 10)])
 def test_ids_entry_matches_reference(tokens, shape):
@@ -160,6 +161,7 @@ def test_ids_entry_matches_reference(tokens, shape):
     _assert_close(got, _reference(*ops), 2.5e-2 if tokens < 4 else 1e-2)
 
 
+@pytest.mark.tpu_test
 def test_no_local_expert_is_zero():
     _needs("tpu")
     x, ids, weights, *w = _ids_operands(3, 4, 8, 512, 256, 4)
@@ -167,6 +169,7 @@ def test_no_local_expert_is_zero():
     assert np.all(np.asarray(got, np.float32) == 0)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("tokens", [1, 4, 8, 13, 32])
 @pytest.mark.parametrize("shape", [(8, 512, 256, 4, 16), (64, 4096, 1024, 10, 128)])
 def test_scores_entry_matches_router_then_ids_entry(tokens, shape):
@@ -180,6 +183,7 @@ def test_scores_entry_matches_router_then_ids_entry(tokens, shape):
     _assert_close(got, _scores_want(x, scores, weights, topk, start, experts))
 
 
+@pytest.mark.tpu_test
 def test_scores_entry_zero_score_rows_select_nothing():
     """A padded row's scores are zeroed; it adds no hit and outputs zero."""
     _needs("tpu")
@@ -345,6 +349,7 @@ def _rel_l2(got, want):
     return np.linalg.norm(got - want) / np.linalg.norm(want)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("m", [16, 128])
 def test_fused_moe_func_selects_kernel_and_matches_oracle(monkeypatch, m):
     _needs("tpu")
@@ -378,6 +383,7 @@ def test_fused_moe_func_selects_kernel_and_matches_oracle(monkeypatch, m):
     assert err < gmm_err + 0.005, (err, gmm_err)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("tokens", [4, 16])
 @pytest.mark.parametrize("extra_slots", [4, 8])
 def test_scores_copies_entry_matches_reference_across_ranks(tokens, extra_slots):
