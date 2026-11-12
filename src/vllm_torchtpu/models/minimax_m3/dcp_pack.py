@@ -73,6 +73,7 @@ def merge_received_partials(
     lse_parts: torch.Tensor,
     out_dtype: torch.dtype,
     round_operands: bool,
+    fence=None,
 ) -> torch.Tensor:
     """``[R, H, T, D]`` partials and ``[R, H, T]`` f32 LSEs of the same heads
     from every rank ``r`` -> the merged ``[H, T, D]`` in `out_dtype`.
@@ -80,7 +81,8 @@ def merge_received_partials(
     Per source the weight and the weighted partial are computed as
     `ops.msa.merge_head_partials` computes them on that source; with
     `round_operands` (``TPU_DCP_RS_OUT_PRECISION``) each weighted partial is
-    rounded to `out_dtype` before the sum, as the reduce-scatter operand is.
+    rounded to `out_dtype` before the sum, as the reduce-scatter operand is;
+    `fence` (an XLA optimization barrier) keeps that rounding.
     """
     total = torch.logsumexp(lse_parts, dim=0)
     weight = torch.exp(lse_parts - total.unsqueeze(0)).unsqueeze(-1)
@@ -89,6 +91,10 @@ def merge_received_partials(
     weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
     if round_operands:
         weighted = weighted.to(out_dtype)
+        # The reduce-scatter receives these rounded values; XLA's excess
+        # precision would otherwise drop the rounding inside one fusion.
+        if fence is not None:
+            weighted = fence(weighted)
     return weighted.sum(dim=0).to(out_dtype)
 
 
@@ -129,6 +135,7 @@ def merge_head_partials_all_to_all(
     group,
     all_to_all,
     round_operands: bool,
+    fence=None,
 ) -> torch.Tensor:
     """`ops.msa.merge_head_partials` before its unrotation and transpose:
     head-major partials ``out [H, T, D]``, ``lse [H, T]`` -> this rank's
@@ -140,4 +147,6 @@ def merge_head_partials_all_to_all(
     out_parts, lse_parts = unpack_partials(
         recv, dcp, num_tokens, head_dim, out.dtype
     )
-    return merge_received_partials(out_parts, lse_parts, out.dtype, round_operands)
+    return merge_received_partials(
+        out_parts, lse_parts, out.dtype, round_operands, fence
+    )
