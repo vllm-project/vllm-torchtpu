@@ -29,6 +29,9 @@ class _PackedRows:
 def indexed_gate_up(latent, indices, rhs, sizes, scales, layer):
     """Packed [T,2,K/2] source; bounded token indices and per-expert route counts.
 
+    ``rhs``/``scales`` hold each expert's gate and up columns lane-interleaved
+    (alternating 128-column chunks), the routed experts' resident layout.
+
     Runs the GMM weight/scale/output pipeline and inner arithmetic
     (``prefill_megakernel.inner_kernel``) on rows gathered by sorted token
     index. All index reads and row DMAs are bounded by aligned valid metadata
@@ -74,11 +77,17 @@ def indexed_gate_up(latent, indices, rhs, sizes, scales, layer):
         )
         ng = k.fill_metadata(counts, offset, metadata, cfgs=cfg)
         (_, ws), ys = k.generate_block_specs(metadata, cfg)
-        weights = k.FusedWeightsRef(
-            gate=weights,
-            up=jax.tree.map(lambda r: r.at[..., cfg.out_size_n :], weights),
+        # Lane-interleaved gate/up: output tile n reads weight columns
+        # [2 n tn, 2 (n + 1) tn), the gate and up chunks of its columns.
+        ws = k.WeightsRef(
+            weight=dataclasses.replace(
+                ws.weight, block_shape=(*ws.weight.block_shape[:-1], 2 * tn)
+            ),
+            scale=dataclasses.replace(
+                ws.scale, block_shape=(*ws.scale.block_shape[:-1], 2 * tn)
+            ),
+            bias=None,
         )
-        ws = k.FusedWeightsRef(gate=ws, up=ws)
 
         def bounds(g):
             start = metadata.gm_id_to_m_offset[g] // sub * sub

@@ -28,9 +28,18 @@ from jax.sharding import PartitionSpec as P
 
 from .. import prefill_megakernel as k
 
-_COMPACT_8K_CAPACITY = 65536
 _RMW_BATCH = 2
 _RMW_DUMMY_SLOTS = 16
+_LOCAL_EXPERTS = 56  # EP16/TP2: a chip's two ranks share 56 experts
+_MIDDLE = 1536  # each rank's half of an expert's intermediate width
+# Local routes a launch keeps in SMEM (expert-major token ids and weights):
+# every route below 8K tokens; above that, more take the uncapped fallback.
+_COMPACT_ROUTES = 65536
+
+
+def _route_capacity(tokens):
+    """The compact SMEM route capacity of one ``tokens`` launch."""
+    return min(tokens * 16, _COMPACT_ROUTES)
 
 
 def _sort_route_steps(keys, probabilities, token_ids=None, *, size, bits=0):
@@ -646,10 +655,12 @@ def _prologue(
 ):
     """Router, latent projection and shared experts, with incremental collectives.
 
-    The caller retains shared/metadata outputs across this scope. All temporary
-    projection and communication buffers die before routed-expert scratch is
-    allocated. The initial HBM input load targets our half of the peer buffer;
-    both the router and shared expert use this same copy.
+    ``shared`` is an HBM buffer of the rank's rows: the shared-expert output
+    goes there (the epilogue reads it back), so it holds no VMEM during the
+    routed experts. The caller retains the metadata outputs across this scope.
+    All temporary projection and communication buffers die before routed-expert
+    scratch is allocated. The initial HBM input load targets our half of the
+    peer buffer; both the router and shared expert use this same copy.
     """
     if hidden is None:
         assert pair_buf is not None
@@ -880,14 +891,25 @@ def _prologue(
                 s["down_sems"][panel % 2],
             )
 
+        def shared_store(panel):
+            bank = panel % 2
+            return pltpu.make_async_copy(
+                s["shared_stage"][bank],
+                shared.at[:, pl.ds(panel * 256, 256)],
+                s["shared_sems"][bank],
+            )
+
         def finish_reduction(pending):
             transfer, bank, panel = pending
             own = s["partial"][bank][pl.ds(parity * rows, rows), :]
             transfer.wait_send()
             transfer.wait_recv()
-            shared[:, pl.ds(panel * 256, 256)] = (own + s["peer_y"][bank][...]).astype(
+            if panel >= 2:
+                shared_store(panel - 2).wait()
+            s["shared_stage"][bank][...] = (own + s["peer_y"][bank][...]).astype(
                 jnp.bfloat16
             )
+            shared_store(panel).start()
 
         down_copy(0).start()
         pending = None
@@ -920,6 +942,8 @@ def _prologue(
                 if rows == 256 or row == rows:
                     latent_progress()
         finish_reduction(pending)
+        for panel in (26, 27):
+            shared_store(panel).wait()
         if rows == 256:
             for _ in metadata_steps:
                 latent_progress()
@@ -965,6 +989,8 @@ def _prologue(
         peer_y=tuple(vmem((rows, 256), jnp.float32) for _ in range(2)),
         reduce_send=(dma, dma),
         reduce_recv=(dma, dma),
+        shared_stage=tuple(vmem((rows, 256), jnp.bfloat16) for _ in range(2)),
+        shared_sems=(dma, dma),
     )
     pl.run_scoped(body, scratch)
 
@@ -995,15 +1021,14 @@ def _routed_experts(
     assert gu_width % 2 == 0
     mid_width = gu_width // 2
     assert rhs.shape[-2] * 8 == mid_width
-    unroll = 8 if tokens < 8192 else (16 if mid_width == 768 else 32)
+    unroll = 8 if tokens < 8192 else 32
     gu_unroll = 4 if tokens < 8192 else 8
     first_down_unroll = 2 if tokens < 8192 else 8
-    first_tail_unroll = 8 if tokens < 8192 else (16 if mid_width == 768 else 8)
-    metadata_row_capacity = 0 if tokens < 8192 else _COMPACT_8K_CAPACITY
+    first_tail_unroll = 8
     ring_dtype = jnp.bfloat16
-    x = jax.ShapeDtypeStruct((tokens * 16, mid_width), latent.dtype)
-    rows, width = (metadata_row_capacity or x.shape[0], rhs.shape[-1])
-    assert rows <= x.shape[0]
+    x = jax.ShapeDtypeStruct((_route_capacity(tokens), mid_width), latent.dtype)
+    rows, width = x.shape[0], rhs.shape[-1]
+    assert middle.shape == x.shape
     tm, tn, localrows = (tile, columns, tokens // 32)
     packed_half = 512 if tokens == 8192 else tn // 2
     assert width % tn == 0
@@ -1081,19 +1106,17 @@ def _routed_experts(
         rx,
         state,
         ring_meta,
-        moved_smem,
     ):
         w = dataclasses.replace(
             w, weight=w.weight.at[layer[0]], scale=w.scale.at[layer[0]]
         )
         w = dataclasses.replace(w, weight=w.weight.bitcast(jnp.float4_e2m1fn))
+        # Gate/up columns are lane-interleaved in memory (gate and up 128-column
+        # chunks alternate), so one contiguous tile feeds the fused SiTU.
         gu = dataclasses.replace(
             gu,
             weight=gu.weight.at[layer[0]].bitcast(jnp.float4_e2m1fn),
             scale=gu.scale.at[layer[0]],
-        )
-        gu = k.FusedWeightsRef(
-            gate=gu, up=jax.tree.map(lambda r: r.at[..., mid_width:], gu)
         )
         # Six directed rings: [target, source, 32 local-contribution row bases].
         # One initialization per layer call, reused across all four columns.
@@ -1231,15 +1254,9 @@ def _routed_experts(
 
         gu_panels = pl.cdiv(gu_width, pltpu.get_tpu_info().mxu_column_size)
         moved_rows = gu_panels * gu_unroll
-        ep8_8k = tokens == 8192 and mid_width == 768
-        gu_u_by_bucket = (4, 8, 12, 16) if ep8_8k else (gu_unroll,) * 4
-        first_down_u_by_bucket = (
-            (4, 8, 16, 20) if ep8_8k else (first_down_unroll,) * 4
-        )
-        rem_down_u_by_bucket = (8, 16, 28, 36) if ep8_8k else (unroll,) * 4
 
-        def gu_work(g, panel, bucket_index=0):
-            gu_u = gu_u_by_bucket[bucket_index]
+        def gu_work(g, panel):
+            gu_u = gu_unroll
             previous_g = jnp.maximum(g - 1, 0)
             start = metadata.gm_id_to_m_offset[previous_g]
             end = metadata.gm_id_to_m_offset[previous_g + 1]
@@ -1256,30 +1273,38 @@ def _routed_experts(
                     guard=(g > 0),
                     dummy_base=panel * gu_u + row,
                 )
-            if ep8_8k and panel == gu_panels - 1:
-                moved_smem[0] = gu_panels * gu_u
 
-        def inner(x, w, metadata, *, first=False, subtotal_vmem=None):
-            g, n = (pl.program_id(1), 0 if first else pl.program_id(0) + 1)
+        def inner(x, w, metadata, *, first=False, subtotal_vmem=None, tile=None, poll=True):
+            """One expert tile of a down column: the pipeline's grid step, or
+            ``tile`` of a paired step. ``poll`` (a static or traced bool) runs
+            the reduce ring's progress before the tile."""
+            g = pl.program_id(1) if tile is None else tile
+            n = 0 if first else pl.program_id(0) + 1
             if not first:
 
                 @pl.when(g == 0)
                 def clear():
                     sums[...] = jnp.zeros(sums.shape, jnp.float32)
 
-            if not first:
-                advance(jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem, poll_round=g)
+                def ring_poll():
+                    advance(
+                        jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem,
+                        poll_round=g if tile is None else g // 2,
+                    )
+
+                if poll is True:
+                    ring_poll()
+                elif poll is not False:
+                    pl.when(poll)(ring_poll)
             current = packed.at[g % 2]
             previous = packed.at[(g + 1) % 2]
             previous_g = jnp.maximum(g - 1, 0)
             panel_count = pl.cdiv(tn, pltpu.get_tpu_info().mxu_column_size)
             down_unroll = first_down_unroll if first else unroll
-            gu_moved = moved_smem[0] if (first and ep8_8k) else (moved_rows if first else 0)
+            gu_moved = moved_rows if first else 0
 
-            def overlap_work(panel, bucket_index=0):
-                down_u = (
-                    first_down_u_by_bucket if first else rem_down_u_by_bucket
-                )[bucket_index]
+            def overlap_work(panel):
+                down_u = down_unroll
                 start = metadata.gm_id_to_m_offset[previous_g]
                 end = metadata.gm_id_to_m_offset[previous_g + 1]
                 begin = start // sub * sub
@@ -1295,8 +1320,6 @@ def _routed_experts(
                         guard=(g > 0),
                         dummy_base=panel * down_u + row,
                     )
-                if ep8_8k and panel == panel_count - 1:
-                    moved_smem[0] = gu_moved + panel_count * down_u
 
             if not first:
 
@@ -1313,6 +1336,7 @@ def _routed_experts(
                     metadata,
                     cfgs=cfg,
                     overlap_work=overlap_work,
+                    group=g,
                 )
 
             @pl.when(g > 0)
@@ -1320,9 +1344,7 @@ def _routed_experts(
                 consume(
                     previous_g,
                     previous,
-                    moved_smem[0]
-                    if ep8_8k
-                    else ((moved_rows if first else 0) + panel_count * down_unroll),
+                    gu_moved + panel_count * down_unroll,
                     loop_unroll=first_tail_unroll if first else unroll,
                 )
 
@@ -1339,7 +1361,7 @@ def _routed_experts(
                         advance(jnp.int32(32), n, subtotal_vmem, drain=True)
 
         (_, gu_ws), gu_ys = k.generate_block_specs(metadata, gu_cfg)
-        gu_ws = k.FusedWeightsRef(gate=gu_ws, up=gu_ws)
+        gu_ws = _interleaved_gate_up_specs(gu_ws, gu_width)
 
         @functools.partial(
             pl.run_scoped,
@@ -1439,7 +1461,7 @@ def _routed_experts(
                         metadata,
                         row_weights.at[bank],
                         cfgs=gu_cfg,
-                        overlap_work=lambda panel, b_idx=0: gu_work(g, panel, b_idx),
+                        overlap_work=lambda panel: gu_work(g, panel),
                     )
 
                 inner(gy, dw, metadata, first=True)
@@ -1451,55 +1473,7 @@ def _routed_experts(
             )
             refs = (gu, w, middle.reshape(-1, sub, mid_width))
             scratches = (metadata, gu_partial, acts, act_sems, row_weights)
-            if tokens == 8192 and mid_width != 768:
-                # The EP16 8K schedule fills VMEM; retain its compact buffers.
-                pltpu.emit_pipeline(joint, **specs)(*refs, scratches=scratches)
-                return
-
-            # Skew the physical GU weight/scale row stride to reduce concurrent
-            # VMEM load conflicts. Logical tiles and arithmetic stay unchanged.
-            pipeline, allocate = pltpu.emit_pipeline_with_allocations(joint, **specs)
-            allocations = allocate(*refs)
-            logical_gu = allocations[0]
-
-            def is_buffer(value):
-                return hasattr(value, "window_ref")
-
-            def pad(buffer):
-                window = buffer.window_ref
-                if window is None:
-                    return buffer
-                return dataclasses.replace(
-                    buffer,
-                    window_ref=pltpu.VMEM(
-                        (*window.shape[:-1], window.shape[-1] + 256), window.dtype
-                    ),
-                )
-
-            padded_gu = jax.tree.map(pad, logical_gu, is_leaf=is_buffer)
-
-            def run_pipeline(buffers):
-                def trim(buffer, original):
-                    if buffer.window_ref is None:
-                        return buffer
-                    return dataclasses.replace(
-                        buffer,
-                        window_ref=buffer.window_ref.at[
-                            ..., pl.ds(0, original.window_ref.shape[-1])
-                        ],
-                    )
-
-                selected = (
-                    jax.tree.map(trim, buffers[0], logical_gu, is_leaf=is_buffer),
-                    *buffers[1:],
-                )
-                pipeline(
-                    *refs,
-                    allocations=selected,
-                    scratches=scratches,
-                )
-
-            pl.run_scoped(run_pipeline, (padded_gu, *allocations[1:]))
+            pltpu.emit_pipeline(joint, **specs)(*refs, scratches=scratches)
 
         @functools.partial(
             pl.run_scoped, subtotal_vmem=pltpu.VMEM((tokens, tn), x.dtype)
@@ -1518,15 +1492,47 @@ def _routed_experts(
                 shifted, ws, is_leaf=lambda v: isinstance(v, pl.BlockSpec)
             )
 
-            def remaining(x, w, metadata):
-                inner(x, w, metadata, subtotal_vmem=subtotal_vmem)
+            # Two expert tiles per pipeline step (tiles 2h and 2h + 1; an odd
+            # count's last step fetches its last tile twice and skips the copy),
+            # with one reduce-ring poll per step: half the steps' fixed cost.
+            # Two buffers per input: each step's pair plus the next pair in flight.
+            def paired(spec, second):
+                index_map = spec.index_map
 
+                def mapped(n, h, k):
+                    return index_map(n, jnp.minimum(2 * h + second, ng - 1), k)
+
+                return dataclasses.replace(
+                    spec, index_map=mapped, pipeline_mode=pl.Buffered(buffer_count=2)
+                )
+
+            def pair(specs, second):
+                return jax.tree.map(
+                    lambda spec: paired(spec, second),
+                    specs,
+                    is_leaf=lambda v: isinstance(v, pl.BlockSpec),
+                )
+
+            def remaining(xa, xb, wa, wb, metadata):
+                h = pl.program_id(1)
+                inner(xa, wa, metadata, subtotal_vmem=subtotal_vmem, tile=2 * h)
+
+                @pl.when(2 * h + 1 < ng)
+                def second():
+                    inner(
+                        xb, wb, metadata, subtotal_vmem=subtotal_vmem,
+                        tile=2 * h + 1, poll=False,
+                    )
+
+            rows = middle.reshape(-1, sub, mid_width)
             pltpu.emit_pipeline(
                 remaining,
-                grid=(width // tn - 1, ng, 1),
-                in_specs=(xs, shifted_ws),
+                grid=(width // tn - 1, (ng + 1) // 2, 1),
+                in_specs=(
+                    pair(xs, 0), pair(xs, 1), pair(shifted_ws, 0), pair(shifted_ws, 1)
+                ),
                 out_specs=(),
-            )(middle.reshape(-1, sub, mid_width), w, scratches=(metadata,))
+            )(rows, rows, w, w, scratches=(metadata,))
 
     def run(**scratch):
         kernel(
@@ -1560,7 +1566,6 @@ def _routed_experts(
         rx=pltpu.VMEM((2, localrows, tn), ring_dtype),
         state=pltpu.SMEM((1 + 2 * streams,), jnp.int32),
         ring_meta=pltpu.SMEM((6 * 34,), jnp.int32),
-        moved_smem=pltpu.SMEM((1,), jnp.int32),
     )
 
 
@@ -1578,111 +1583,131 @@ class _PackedRows:
         return self.ref[rows].reshape(-1, 2 * self.ref.shape[-1])
 
 
-def _column_rhs(rhs, first, size):
-    """Slice references before dequantization to bound panel temporaries."""
-
-    def slice_ref(ref, first, size):
-        assert ref.scale is not None
-        return dataclasses.replace(
-            ref,
-            weight=ref.weight.at[:, pl.ds(first, size)],
-            scale=ref.scale.at[..., pl.ds(first, size)],
-        )
-
-    if isinstance(rhs, k.FusedWeightsRef):
-        # Gate/up columns alternate in lane-sized chunks. A complete pair
-        # maps to half as many columns in each underlying reference.
-        pair = 2 * pltpu.get_tpu_info().num_lanes
-        assert first % pair == 0 and size % pair == 0
-        return k.FusedWeightsRef(
-            slice_ref(rhs.gate, first // 2, size // 2),
-            slice_ref(rhs.up, first // 2, size // 2),
-        )
-    return slice_ref(rhs, first, size)
+def _interleaved_gate_up_specs(specs, width):
+    """Block specs of a lane-interleaved gate/up weight: the GMM tiles the
+    activated output (``tile_n`` columns), each tile reads ``2 * tile_n``
+    contiguous weight columns."""
+    return k.WeightsRef(
+        weight=dataclasses.replace(
+            specs.weight, block_shape=(*specs.weight.block_shape[:-1], width)
+        ),
+        scale=dataclasses.replace(
+            specs.scale, block_shape=(*specs.scale.block_shape[:-1], width)
+        ),
+        bias=None,
+    )
 
 
-def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
-    """Dequantize MXFP4 weights, panel-locally for the 8K row tile.
+_DOWN_K_STEP = 768  # rows of the 256-row down tile's weights dequantized at once
+
+
+def _dequantized(rhs, cfgs, rows, cols):
+    """BF16 weights of ``rhs`` rows ``rows`` and columns ``cols`` (slices)."""
+    block = cfgs.rhs_cfgs.quant_block_size
+    part = dataclasses.replace(
+        rhs,
+        weight=rhs.weight.at[rows, cols],
+        scale=rhs.scale.at[pl.ds(rows.start // block, rows.size // block), cols],
+    )
+    weights = part.get_weight().astype(cfgs.lhs_cfgs.dtype)
+    scales = part.get_scale(replicate_size=block).astype(cfgs.lhs_cfgs.dtype)
+    shape = weights.shape
+    return (weights.reshape(shape[0] // block, block, shape[1]) * scales).reshape(shape)
+
+
+def _product_panels(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
+    """Yield ``(panel, FP32 product)`` per MXU column panel of one expert tile.
 
     Both routed projections cover their complete reduction dimension in one
-    tile. The callback consumes rows of the previous expert tile between MXU
-    panels; it must not read this product's result.
+    tile. The 128-row tile dequantizes its whole weight tile once. The 256-row
+    gate/up tile dequantizes per panel; the 256-row down tile reduces its
+    1536 rows in 768-row steps, each dequantized whole, and accumulates in
+    FP32. The callback consumes rows of the previous expert tile between the
+    last step's MXU panels; it must not read this product's result.
     """
     assert cfgs.dims.size_k == cfgs.tiles.tile_k
     assert not cfgs.rhs_cfgs.has_bias
     columns = pltpu.get_tpu_info().mxu_column_size
-    activations = lhs.reshape(-1, cfgs.tiles.tile_k)[:bucket_rows]
-    width = (
-        2 * rhs.gate.weight.shape[-1]
-        if isinstance(rhs, k.FusedWeightsRef)
-        else rhs.weight.shape[-1]
-    )
-    block = cfgs.rhs_cfgs.quant_block_size
-    # Smaller windows (128-row tile) and the compact EP8 8K down tile ([768, 896])
-    # convert the whole weight tile once; larger 256-row tiles convert per panel.
-    panel_local = cfgs.tiles.tile_m == 256 and (
-        cfgs.tiles.tile_k > 768 or width > 896
-    )
-    weights = None
-    if not panel_local:
-        weights = rhs.get_weight()
-        scales = rhs.get_scale(replicate_size=block).astype(cfgs.lhs_cfgs.dtype)
-        weights = weights.astype(cfgs.lhs_cfgs.dtype).reshape(
-            cfgs.num_quant_blocks_per_tile_k, block, width
-        )
-        weights = (weights * scales).reshape(cfgs.tiles.tile_k, width)
-    panels = []
-    for first in range(0, width, columns):
-        panel_width = min(columns, width - first)
-        if panel_local:
-            panel_rhs = _column_rhs(rhs, first, panel_width)
-            panel_weights = panel_rhs.get_weight().astype(cfgs.lhs_cfgs.dtype).reshape(
-                cfgs.num_quant_blocks_per_tile_k, block, panel_width
-            )
-            scales = panel_rhs.get_scale(replicate_size=block).astype(cfgs.lhs_cfgs.dtype)
-            panel_weights = (panel_weights * scales).reshape(
-                cfgs.tiles.tile_k, panel_width
+    size_k = cfgs.tiles.tile_k
+    activations = lhs.reshape(-1, size_k)[:bucket_rows]
+    width = rhs.weight.shape[-1]
+    panels = [(first, min(columns, width - first)) for first in range(0, width, columns)]
+    if cfgs.tiles.tile_m == 256 and cfgs.fuse_act is None:
+        k_step = min(size_k, _DOWN_K_STEP)
+        accumulators = [None] * len(panels)
+        for k0 in range(0, size_k, k_step):
+            rows = pl.ds(k0, k_step)
+            weights = _dequantized(rhs, cfgs, rows, pl.ds(0, width))
+            last_step = k0 + k_step == size_k
+            for index, (first, panel_width) in enumerate(panels):
+                product = jnp.matmul(
+                    activations[:, k0:k0 + k_step],
+                    weights[:, first:first + panel_width],
+                    preferred_element_type=jnp.float32,
+                ).astype(cfgs.acc_dtype)
+                if last_step:
+                    overlap_work(index)
+                total = accumulators[index]
+                accumulators[index] = product if total is None else total + product
+        for index, accumulator in enumerate(accumulators):
+            yield index, accumulator
+        return
+    whole = None
+    if cfgs.tiles.tile_m != 256:
+        whole = _dequantized(rhs, cfgs, pl.ds(0, size_k), pl.ds(0, width))
+    for index, (first, panel_width) in enumerate(panels):
+        if whole is None:
+            panel_weights = _dequantized(
+                rhs, cfgs, pl.ds(0, size_k), pl.ds(first, panel_width)
             )
         else:
-            assert weights is not None
-            panel_weights = weights[:, first:first + panel_width]
-        accumulator = jnp.zeros((bucket_rows, panel_width), cfgs.acc_dtype)
+            panel_weights = whole[:, first:first + panel_width]
         product = jnp.matmul(
             activations, panel_weights, preferred_element_type=jnp.float32
         ).astype(cfgs.acc_dtype)
-        overlap_work(first // columns)
-        accumulator += product
-        panels.append(accumulator)
-    return jnp.concatenate(panels, axis=1)
+        overlap_work(index)
+        yield index, product
+
+
+def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
+    """The complete product of ``_product_panels``."""
+    panels = _product_panels(
+        lhs, rhs, cfgs=cfgs, bucket_rows=bucket_rows, overlap_work=overlap_work
+    )
+    return jnp.concatenate([product for _, product in panels], axis=1)
 
 
 def _gu_inner(lhs, rhs, output, partial, metadata, row_weights, *, cfgs, overlap_work):
     """GU/SiTU with the production row buckets and adjacent-expert carry.
 
-    Each row is scaled by its route weight (``row_weights``, lane-broadcast),
-    so the down projection's rows combine unweighted. Expert boundaries need
-    not align with the 16-row BF16 sublane. Mask outside the active expert,
-    then preserve the preceding expert's partial first row.
+    Each 256-column weight panel holds a gate and an up 128-column chunk
+    (lane-interleaved layout), so its product is activated, scaled by the
+    rows' route weights (``row_weights``, lane-broadcast; the down projection's
+    rows then combine unweighted) and stored as 128 intermediate columns at
+    once. Expert boundaries need not align with the 16-row BF16 sublane. Mask
+    outside the active expert, then preserve the preceding expert's partial
+    first row.
     """
     group = pl.program_id(1)
     start = metadata.gm_id_to_m_offset[group]
     end = metadata.gm_id_to_m_offset[group + 1]
     aligned = start - start % cfgs.dims.size_lhs_sublane
     first, last = start - aligned, end - aligned
+    lanes = pltpu.get_tpu_info().num_lanes
 
     def product(bucket_index):
         rows = cfgs.tiles.bucket_base * (bucket_index + 1)
-        value = _expert_product(
-            lhs,
-            rhs,
-            cfgs=cfgs,
-            bucket_rows=rows,
-            overlap_work=lambda panel: overlap_work(panel, bucket_index),
-        )
-        value = k.apply_act_fn(value, cfgs.fuse_act) * row_weights[:rows, :1]
-        row = lax.broadcasted_iota(jnp.int32, value.shape, 0)
-        value = jnp.where((first <= row) & (row < last), value, 0)
-        output.reshape(-1, cfgs.tiles.tile_n)[:rows] = value.astype(output.dtype)
+        row = lax.broadcasted_iota(jnp.int32, (rows, lanes), 0)
+        live = (first <= row) & (row < last)
+        weights = row_weights[:rows, :1]
+        rows_out = output.reshape(-1, cfgs.tiles.tile_n)
+        for panel, value in _product_panels(
+            lhs, rhs, cfgs=cfgs, bucket_rows=rows, overlap_work=overlap_work
+        ):
+            value = k.apply_act_fn(value, cfgs.fuse_act) * weights
+            rows_out[:rows, pl.ds(panel * lanes, lanes)] = jnp.where(
+                live, value, 0
+            ).astype(output.dtype)
         zeros = jnp.zeros_like(partial)
         output[0] += jnp.where(group == 0, zeros, partial[...])
         last_row = last // cfgs.dims.size_lhs_sublane
@@ -1690,9 +1715,8 @@ def _gu_inner(lhs, rhs, output, partial, metadata, row_weights, *, cfgs, overlap
             last % cfgs.dims.size_lhs_sublane == 0, zeros, output[last_row]
         )
 
-    # At EP16 (tile_n=1536, 12 GU panels), share the 128-row product to bound
-    # instruction size; at EP8 (tile_n=768, 6 GU panels), keep the 64-row bucket.
-    first_bucket = 1 if (cfgs.tiles.tile_m == 256 and cfgs.tiles.tile_n > 768) else 0
+    # The 256-row tile shares the 128-row product to bound instruction size.
+    first_bucket = 1 if cfgs.tiles.tile_m == 256 else 0
     branches = [
         functools.partial(product, bucket_index=i)
         for i in range(first_bucket, cfgs.tiles.tile_m // cfgs.tiles.bucket_base)
@@ -1705,14 +1729,13 @@ def _gu_inner(lhs, rhs, output, partial, metadata, row_weights, *, cfgs, overlap
     )
 
 
-def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work):
+def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work, group):
     """Down projection stored as packed rows for token-wise VALU combine.
 
     Each valid expert row is consumed individually, so this output needs no
     adjacent-expert carry. Rows arrive weighted (see ``_gu_inner``).
     """
     assert cfgs.fuse_act is None
-    group = pl.program_id(1)
     start = metadata.gm_id_to_m_offset[group]
     end = metadata.gm_id_to_m_offset[group + 1]
     aligned = start - start % cfgs.dims.size_lhs_sublane
@@ -1722,11 +1745,7 @@ def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work):
     def product(bucket_index):
         rows = cfgs.tiles.bucket_base * (bucket_index + 1)
         value = _expert_product(
-            lhs,
-            rhs,
-            cfgs=cfgs,
-            bucket_rows=rows,
-            overlap_work=lambda panel: overlap_work(panel, bucket_index),
+            lhs, rhs, cfgs=cfgs, bucket_rows=rows, overlap_work=overlap_work
         )
         if cfgs.tiles.tile_n == 896:
             # Keep the half boundary on a complete 128-lane block.
@@ -2003,10 +2022,12 @@ def _ready_reduce(
                     sweep(group)
 
 
-def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
+def _epilogue(control, reduced, norm_weight, up_weight, prefix, output):
     """Normalize routed output and project up with three weight/prefix banks.
 
-    Reduced FP32 rows remain in VMEM. Preserve the BF16 boundaries after
+    ``output`` holds the shared-expert rows on entry (see ``_prologue``); each
+    panel reads them back before it overwrites them with the layer output.
+    Reduced rows remain in VMEM. Preserve the BF16 boundaries after
     normalization, after latent-up, and after adding the shared expert.
     """
     rows, width = reduced.shape
@@ -2035,6 +2056,13 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
                 s["prefix_sems"][panel % 3],
             )
 
+        def shared_copy(panel):
+            return pltpu.make_async_copy(
+                output.at[:, pl.ds(panel * 512, 512)],
+                s["shared"][panel % 3],
+                s["shared_sems"][panel % 3],
+            )
+
         def output_copy(panel):
             return pltpu.make_async_copy(
                 s["tiles"][panel % 3],
@@ -2046,6 +2074,7 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
         for panel in (0, 1):
             weight_copy(panel).start()
             prefix_copy(panel).start()
+            shared_copy(panel).start()
         routed = reduced[...].astype(jnp.float32)
         mean = jnp.sum(routed * routed, axis=1, keepdims=True) / width
         inverse = jax.lax.rsqrt(mean + 1e-5)
@@ -2056,17 +2085,19 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
             bank = panel % 3
             weight_copy(panel).wait()
             prefix_copy(panel).wait()
+            shared_copy(panel).wait()
             if panel + 2 < 14:
                 if panel >= 1:
                     output_copy(panel - 1).wait()
                 weight_copy(panel + 2).start()
                 prefix_copy(panel + 2).start()
+                shared_copy(panel + 2).start()
             product = jnp.matmul(
                 s["normalized"][...],
                 s["weights"][bank][...],
                 preferred_element_type=jnp.float32,
             ).astype(jnp.bfloat16)
-            value = product + shared[:, pl.ds(panel * 512, 512)]
+            value = product + s["shared"][bank][...]
             value = jnp.where(valid, value, 0)
             s["tiles"][bank][...] = s["tiles"][bank][...] + value
             output_copy(panel).start()
@@ -2081,8 +2112,10 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
             normalized=vmem((rows, width), jnp.bfloat16),
             weights=tuple(vmem((width, 512), jnp.bfloat16) for _ in range(3)),
             tiles=tuple(vmem((rows, 512), jnp.bfloat16) for _ in range(3)),
+            shared=tuple(vmem((rows, 512), jnp.bfloat16) for _ in range(3)),
             weight_sems=(dma, dma, dma),
             prefix_sems=(dma, dma, dma),
+            shared_sems=(dma, dma, dma),
             output_sems=(dma, dma, dma),
         ),
     )
@@ -2125,7 +2158,6 @@ def _layer_kernel(
     fallback_ids=None,
     fallback_probs=None,
     fallback_counts=None,
-    fallback_shared=None,
     maximum=None,
     route_counts=None,
     mixture_refs=None,
@@ -2133,13 +2165,15 @@ def _layer_kernel(
     """One launch owns all compute, metadata and communication on the fast path.
 
     Large projection scratch has a shorter lifetime than expert scratch. Only
-    shared output and the scalar routing metadata survive that boundary. At 8K
-    all ranks take the same overflow branch; no routes are dropped to fit SMEM.
+    the scalar routing metadata survives that boundary in VMEM/SMEM; the
+    shared-expert rows wait in ``output``. At 8K all ranks take the same
+    overflow branch, which reads them from there; no routes are dropped to fit
+    SMEM.
     """
     rows, hidden_size = prefix.shape if hidden is None else hidden.shape
     tokens = rows * 32
     local_experts = expert_gu.shape[1]
-    capacity = tokens * 16 if tokens < 8192 else _COMPACT_8K_CAPACITY
+    capacity = _route_capacity(tokens)
     shape = (tokens // 8, 128)
     vmem, smem, dma = pltpu.VMEM, pltpu.SMEM, pltpu.SemaphoreType.DMA
 
@@ -2235,7 +2269,7 @@ def _layer_kernel(
                 latent_down,
                 shared_gu,
                 shared_down,
-                s["shared"],
+                output,
                 latent,
                 ids_v,
                 probs_v,
@@ -2261,7 +2295,6 @@ def _layer_kernel(
                         (ids_v, fallback_ids),
                         (probs_v, fallback_probs),
                         (s["counts_v"], fallback_counts),
-                        (s["shared"], fallback_shared),
                     ):
                         copy = pltpu.make_async_copy(source, dest, s["export_sem"])
                         copy.start()
@@ -2311,9 +2344,7 @@ def _layer_kernel(
                 tokens=tokens,
                 probabilities_ready=probabilities_ready,
             )
-            _epilogue(
-                control, s["reduced"], s["shared"], norm, latent_up, prefix, output
-            )
+            _epilogue(control, s["reduced"], norm, latent_up, prefix, output)
 
         if maximum is None:
             fast()
@@ -2326,7 +2357,6 @@ def _layer_kernel(
     pl.run_scoped(
         body,
         dict(
-            shared=vmem((rows, 7168), jnp.bfloat16),
             reduced=vmem((rows, 3584), jnp.bfloat16),
             probs_v=vmem(shape, jnp.float32) if tokens < 8192 else None,
             counts_v=vmem((local_experts,), jnp.int32),
@@ -2365,7 +2395,7 @@ def make_indexed_mixture_moe_sp_ring(mesh, *, seq_len=8192):
 
 
 def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
-    """Build the fused EP8/EP16 prefill MoE for a supported serving window.
+    """Build the fused EP16/TP2 prefill MoE for a supported serving window.
 
     Inputs follow the prefill layer interface: rank-sharded normalized hidden
     states (or residual blocks + mixture/norm weights when ``with_mixture`` is
@@ -2383,13 +2413,9 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
         )
     if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
         raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
-    ep = k._config().prefill_expert_parallel
-    if ep not in (8, 16):
-        raise ValueError("Fused prefill MoE requires prefill_expert_parallel in (8, 16)")
     from .layer import routed_experts_prepared
 
-    local_experts = 896 // ep
-    mid_width = 3072 // (32 // ep)
+    local_experts = _LOCAL_EXPERTS
     rows = seq_len // 32
     tables = k.ring_tables(list(mesh.devices.flat), tuple(range(32)))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
@@ -2398,21 +2424,20 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
     workspace_shapes = [
         ((rows, 7168), bf16),
         ((seq_len, 2, 1792), bf16),
-        ((seq_len * 16, mid_width), bf16),
+        ((_route_capacity(seq_len), _MIDDLE), bf16),
     ]
     output_specs = [hbm] * 3
-    can_overflow = seq_len == 8192 and ep > 8
+    can_overflow = seq_len * 16 > _route_capacity(seq_len)
     if can_overflow:
-        # Only 8K at EP16 can overflow compact SMEM routing capacity (65536).
-        # At <=4K or EP8 every route fits, so omit the unused overflow outputs.
+        # Below 8K every route fits the compact capacity, so omit the
+        # overflow outputs there.
         workspace_shapes += [
             (shape, jnp.int32),
             (shape, jnp.float32),
             ((local_experts,), jnp.int32),
-            ((rows, 7168), bf16),
             ((1,), jnp.int32),
         ]
-        output_specs += [hbm] * 4 + [pl.BlockSpec()]
+        output_specs += [hbm] * 3 + [pl.BlockSpec()]
     counting = k._config().prefill_route_counts
     if counting:
         workspace_shapes += [((local_experts,), jnp.int32)]
@@ -2420,9 +2445,6 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
 
     def body(*refs):
         refs = list(refs)
-        for idx in (8, 9, 10, 11):
-            if refs[idx].shape[1] != local_experts:
-                refs[idx] = refs[idx].at[:, pl.ds(0, local_experts)]
         mix_refs = None
         if with_mixture:
             blocks_ref = refs[2]
@@ -2519,18 +2541,16 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
             routes = routes[None]
         if not can_overflow:
             return (outputs[0][None], routes) if counting else outputs[0][None]
-        final, latent, _, ids, probs, counts, shared, maximum = outputs
+        # Without the compact path's epilogue, the output holds the shared rows.
+        final, latent, _, ids, probs, counts, maximum = outputs
+        shared = final
 
         def overflow():
-            extra_slots = w["expert_gu"].shape[1] - local_experts
-            counts_for_prep = (
-                jnp.pad(counts, (0, extra_slots)) if extra_slots > 0 else counts
-            )
             reduced = routed_experts_prepared(
                 latent,
                 ids.reshape(-1),
                 probs.reshape(-1),
-                counts_for_prep,
+                counts,
                 w["expert_gu"],
                 w["expert_gus"],
                 w["expert_down"],
@@ -2552,7 +2572,7 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
             )
 
         result = jax.lax.cond(
-            maximum[0] <= _COMPACT_8K_CAPACITY, lambda: final, overflow
+            maximum[0] <= _route_capacity(seq_len), lambda: final, overflow
         )[None]
         return (result, routes) if counting else result
 
@@ -2572,16 +2592,12 @@ def _make_moe_compound(
     """
     if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
         raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
-    ep = k._config().prefill_expert_parallel
-    if ep not in (8, 16):
-        raise ValueError("Fused prefill MoE requires prefill_expert_parallel in (8, 16)")
     if sum(part_tokens) != seq_len:
         raise ValueError(f"Compound MoE parts {part_tokens} do not sum to {seq_len}")
     from .layer import routed_experts_prepared
 
     window_rows = seq_len // 32
-    local_experts = 896 // ep
-    mid_width = 3072 // (32 // ep)
+    local_experts = _LOCAL_EXPERTS
     tables = k.ring_tables(list(mesh.devices.flat), tuple(range(32)))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     bf16 = jnp.bfloat16
@@ -2596,7 +2612,7 @@ def _make_moe_compound(
         row_offsets.append(acc_tok // 32)
         acc_tok += p_tok
     part_rows = tuple(p_tok // 32 for p_tok in part_tokens)
-    can_overflow_parts = tuple(p_tok == 8192 and ep > 8 for p_tok in part_tokens)
+    can_overflow_parts = tuple(t * 16 > _route_capacity(t) for t in part_tokens)
 
     def make_kernel(part_idx: int):
         p_tok = part_tokens[part_idx]
@@ -2608,7 +2624,7 @@ def _make_moe_compound(
         workspace_shapes = [
             ((window_rows, 7168), bf16),
             ((p_tok, 2, 1792), bf16),
-            ((p_tok * 16, mid_width), bf16),
+            ((_route_capacity(p_tok), _MIDDLE), bf16),
         ]
         output_specs = [hbm] * 3
         if can_overflow_part:
@@ -2616,10 +2632,9 @@ def _make_moe_compound(
                 (p_shape, jnp.int32),
                 (p_shape, jnp.float32),
                 ((local_experts,), jnp.int32),
-                ((p_rows, 7168), bf16),
                 ((1,), jnp.int32),
             ]
-            output_specs += [hbm] * 4 + [pl.BlockSpec()]
+            output_specs += [hbm] * 3 + [pl.BlockSpec()]
         if counting:
             workspace_shapes += [((local_experts,), jnp.int32)]
             output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
@@ -2634,9 +2649,6 @@ def _make_moe_compound(
             if aliased:
                 del refs[2 + inputs]  # previous launch's output, aliased below
             own = pl.ds(r_off, p_rows)
-            for idx in (8, 9, 10, 11):  # expert_gu, expert_gus, expert_down, expert_ds
-                if refs[idx].shape[1] != local_experts:
-                    refs[idx] = refs[idx].at[:, pl.ds(0, local_experts)]
             mix_refs = None
             if with_mixture:
                 blocks_ref = refs[2].at[:, own]
@@ -2751,16 +2763,14 @@ def _make_moe_compound(
 
         def overflow(idx: int):
             r_off, p_rows = row_offsets[idx], part_rows[idx]
-            _, latent, _, ids, probs, counts, shared, maximum = parts_out[idx]
-            extra_slots = w["expert_gu"].shape[1] - local_experts
-            counts_for_prep = (
-                jnp.pad(counts, (0, extra_slots)) if extra_slots > 0 else counts
-            )
+            # The part's rows of the output hold its shared rows (no epilogue).
+            _, latent, _, ids, probs, counts, maximum = parts_out[idx]
+            shared = final[r_off : r_off + p_rows]
             reduced = routed_experts_prepared(
                 latent,
                 ids.reshape(-1),
                 probs.reshape(-1),
-                counts_for_prep,
+                counts,
                 w["expert_gu"],
                 w["expert_gus"],
                 w["expert_down"],
@@ -2782,7 +2792,7 @@ def _make_moe_compound(
             )
 
         fits = [
-            (parts_out[i][7][0] <= _COMPACT_8K_CAPACITY)
+            (parts_out[i][6][0] <= _route_capacity(part_tokens[i]))
             if can_overflow_parts[i]
             else jnp.bool_(True)
             for i in range(len(part_tokens))
