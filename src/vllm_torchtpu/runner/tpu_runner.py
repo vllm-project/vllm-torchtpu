@@ -407,6 +407,52 @@ def _spec_logprob_row_tokens(
     return out[:num_rows, None]
 
 
+FIXED_SHAPE_SAMPLING_COPIES_KEY = "sampling_metadata_fixed_shape_copies"
+
+
+def fixed_shape_sampling_copies_enabled(additional_config: Any) -> bool:
+    """`additional_config["sampling_metadata_fixed_shape_copies"]`; off by
+    default. See `install_fixed_shape_sampling_copies`."""
+    if not isinstance(additional_config, dict):
+        return False
+    enabled = additional_config.get(FIXED_SHAPE_SAMPLING_COPIES_KEY, False)
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            f"additional_config.{FIXED_SHAPE_SAMPLING_COPIES_KEY} must be a bool"
+        )
+    return enabled
+
+
+def _fixed_shape_copy_slice(
+    from_tensor: torch.Tensor, to_tensor: torch.Tensor, length: int
+) -> torch.Tensor:
+    """vLLM's `copy_slice` for a device target: copy the whole staging
+    tensor, not its first `length` rows, and return the same `[:length]`
+    view. The rows past `length` are never read, so every read value is
+    the one `copy_slice` writes."""
+    if to_tensor.device.type == "cpu" or from_tensor.shape != to_tensor.shape:
+        from vllm.v1.utils import copy_slice
+
+        return copy_slice(from_tensor, to_tensor, length)
+    to_tensor.copy_(from_tensor, non_blocking=True)
+    return to_tensor[:length]
+
+
+def install_fixed_shape_sampling_copies() -> None:
+    """Route upstream InputBatch's sampling-metadata uploads
+    (`_make_sampling_metadata`: temperature, top_p, top_k, penalties)
+    through `_fixed_shape_copy_slice`.
+
+    Upstream writes `device[:num_reqs].copy_(cpu[:num_reqs])`, an in-place
+    write into a view whose length is the live request count. On TPU each
+    new count compiles an eager `copy_ + as_strided_inverse` program, so a
+    served run compiled one per request count after warmup (c48: 48, c64:
+    64), each mid-serving. A full-length copy is one program."""
+    from vllm.v1.worker import gpu_input_batch
+
+    gpu_input_batch.copy_slice = _fixed_shape_copy_slice
+
+
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _fit_verify_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
     """`t` with its leading (verify row) dim zero-padded or cut to ``rows``."""
@@ -921,6 +967,13 @@ class TPUModelRunner(GPUModelRunner):
             GPUInputBatch.get_pooling_metadata = get_pooling_metadata
             self.input_batch.get_pooling_metadata = lambda: get_pooling_metadata(
                 self.input_batch
+            )
+
+        if fixed_shape_sampling_copies_enabled(vllm_config.additional_config):
+            install_fixed_shape_sampling_copies()
+            logger.info(
+                "%s=True: sampling metadata uploads at full length",
+                FIXED_SHAPE_SAMPLING_COPIES_KEY,
             )
 
         # Parent already set: vllm_config, *_config, device, dtype,
