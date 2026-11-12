@@ -208,6 +208,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
 
 
 def env_with_choices(
@@ -1270,6 +1272,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # MiniMax M3 DCP steps of at most this many tokens merge the attention
+    # partials with one packed all-to-all instead of an LSE all-gather plus an
+    # output reduce-scatter (`models.minimax_m3.dcp_pack`). 0 keeps the
+    # reduce-scatter. Exact on a DCP 2 pair.
+    "TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 DCP steps of at most this many tokens gather the query heads
+    # and the top-k candidates in one all-gather, after the scoring op,
+    # instead of two (`models.minimax_m3.dcp_pack`). 0 keeps two gathers.
+    "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS", 0
     ),
 }
 
