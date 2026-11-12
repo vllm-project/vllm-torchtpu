@@ -630,6 +630,62 @@ def bench(chunk=8192, context=75776, budget=512, models=MODELS, ranks=(0,)):
     return results
 
 
+# Out-of-sample shapes for the cost model (not in SERVED_SWEEP): (name, [(prefix, chunk), ...], model).
+OOS_CASES = [
+    ("8k@88K corr10", [(90112 - 8192, 8192)], "corr10"), ("8k@88K tight2", [(90112 - 8192, 8192)], "tight2"),
+    ("8k@33K corr10", [(33000 - 8192, 8192)], "corr10"), ("8k@33K tight2", [(33000 - 8192, 8192)], "tight2"),
+    ("6k@60K corr10", [(60000 - 6144, 6144)], "corr10"), ("6k@60K tight2", [(60000 - 6144, 6144)], "tight2"),
+    ("6k@60K hot0.15", [(60000 - 6144, 6144)], "hot0.15"),
+    ("4x2k@32-88K corr10", [(32768 - 2048, 2048), (57344 - 2048, 2048), (75776 - 2048, 2048), (90112 - 2048, 2048)],
+     "corr10"),
+    ("4x2k@32-88K tight2", [(32768 - 2048, 2048), (57344 - 2048, 2048), (75776 - 2048, 2048), (90112 - 2048, 2048)],
+     "tight2"),
+    ("2x4k@40K,90K tight2", [(40000 - 4096, 4096), (90112 - 4096, 4096)], "tight2"),
+    ("2x4k@40K,90K pages0.15", [(40000 - 4096, 4096), (90112 - 4096, 4096)], "pages0.15"),
+    ("3x(3000,2000,1192)@50-80K tight2", [(50000 - 3000, 3000), (65000 - 2000, 2000), (80000 - 1192, 1192)],
+     "tight2"),
+]
+
+
+def bench_oos(cases=OOS_CASES, budget=512, rank=0):
+    """The served precheck (default cost constants) on shapes the fit did not see: picked vs faster per case."""
+    good = 0
+    for name, chunks, model in cases:
+        rng = np.random.default_rng(len(name))
+        case = union_case(rng, chunks, budget=budget, pad_to=128)  # NaN padding rows past the requests
+        parts, at = [], 0
+        for _, count in chunks:
+            parts.append(model_blocks(rng, case.lengths[at:at + count], budget, model))
+            at += count
+        parts.append(np.full((len(case.lengths) - at, budget), -1, np.int32))
+        case.blocks = np.concatenate(parts)
+        args = (case.q, case.gate, jnp.asarray(case.blocks), jnp.asarray(case.lengths),
+                jnp.asarray(case.dcp_rows), case.rank_pools[rank], jnp.asarray(case.starts))
+        row, outs = {}, {}
+        for arm in ("block_sparse", "walk_forced", "served"):
+            for k, v in {**UNION_ENV, **SERVED_C32_ENV}.items():
+                os.environ[k] = v
+            os.environ["VLLM_TPU_QSA_PREFILL_UNION_DCP"] = "1"
+            for k in ("VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK",
+                      "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST"):
+                os.environ.pop(k, None)  # served = the envs.py defaults
+            for k, v in ARMS[arm].items() if arm != "served" else ():
+                os.environ[k] = v
+            fn = jax.jit(lambda *a: qsa_rpa._prefill_attention(
+                *a, dcp=(rank_operand(rank), D), return_lse=True, **case.opts)[:2])
+            row[arm] = round(_time(lambda: fn(*args)), 3)
+            outs[arm] = np.asarray(fn(*args)[0])
+        picked_walk = bool((outs["served"] != outs["block_sparse"]).any())
+        walk_faster = row["walk_forced"] < row["block_sparse"]
+        good += picked_walk == walk_faster
+        row.update(picked_walk=picked_walk, walk_faster=walk_faster, correct=picked_walk == walk_faster,
+                   served_vs_best=round(min(row["block_sparse"], row["walk_forced"]) / row["served"], 3),
+                   union_frac=union_fraction(case.blocks, case.lengths, case.dcp_rows.shape[1], rank),
+                   precheck_terms=precheck_terms(case.blocks, case.lengths, rank))
+        print("OOS", name, row, flush=True)
+    print(f"OOS correct picks {good}/{len(cases)}", flush=True)
+
+
 if __name__ == "__main__":
     # python3 test_dcp2_union_walk.py [--bench]  (DCP2_HARNESS_DEVICE=tpu for the TPU tests)
     class _Env:
@@ -640,7 +696,7 @@ if __name__ == "__main__":
     test_local_selection_matches_owned_tokens()
     print("PASS local selection", flush=True)
     failures = 0
-    if ON_TPU and "--bench-only" not in sys.argv:
+    if ON_TPU and "--bench-only" not in sys.argv and "--oos" not in sys.argv:
         for name in sorted(CASES):
             for slot in (0, 1):
                 try:
@@ -662,7 +718,9 @@ if __name__ == "__main__":
             except Exception as e:  # noqa: BLE001
                 failures += 1
                 print("FAIL fallback", which, repr(e)[:4000], flush=True)
-    if ON_TPU:
+    if ON_TPU and "--oos" in sys.argv:
+        bench_oos()
+    if ON_TPU and "--oos" not in sys.argv:
         if "--bench" in sys.argv or "--bench-only" in sys.argv:
             bench()
             print("BENCH shape 4096-row chunk, 40K context", flush=True)
