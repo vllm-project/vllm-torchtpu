@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prefill EP16 expert placement (K3_PREFILL_EXPERT_PLAN): the planned loader
+"""EP16 expert placement (KernelConfig.prefill_expert_plan): the planned loader
 reproduces the pre-shard's regroup under the identity plan and places each
-planned expert's rows under a random plan; the shipped serving plan is valid."""
+planned expert's rows under a random plan; the shipped plan is valid."""
 
 import json
 import os
@@ -9,6 +9,7 @@ import os
 import numpy as np
 import pytest
 
+from vllm_torchtpu.megakernel.kimi_k3.config import KernelConfig
 from vllm_torchtpu.megakernel.kimi_k3.kernels import rank_loader as rl
 
 pytestmark = pytest.mark.cpu_test
@@ -110,9 +111,16 @@ def test_random_plan_places_each_expert(preshard, rank, name):
             np.testing.assert_array_equal(got[layer, slot], want)
 
 
-def test_shipped_serving_plan_is_valid():
-    for name in ("plan_prefill_serve.npz", "plan_ep8_real_hotfirst.npz"):
-        path = os.path.join(os.path.dirname(rl.__file__), "..", "data", name)
-        order = np.load(path)["order"]
-        assert order.shape == (92, 896)
-        assert all(sorted(row) == list(range(896)) for row in order.tolist())
+def test_shipped_plan_is_valid():
+    path = os.path.join(
+        os.path.dirname(rl.__file__), "..", "data", "plan_ep8_real_hotfirst.npz"
+    )
+    order = np.load(path)["order"]
+    assert order.shape == (92, 896)
+    assert all(sorted(row) == list(range(896)) for row in order.tolist())
+
+
+@pytest.mark.parametrize("ep", [8, 32])
+def test_plan_places_only_ep16_experts(ep):
+    with pytest.raises(ValueError, match="EP16"):
+        KernelConfig(prefill_expert_parallel=ep, prefill_expert_plan="plan.npz")

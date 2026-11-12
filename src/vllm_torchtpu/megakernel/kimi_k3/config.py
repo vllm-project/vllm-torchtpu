@@ -86,9 +86,7 @@ class KernelConfig:
     # each physical slot (chip c: slots 56c..56c+55); the router columns and
     # expert weights are loaded in that order (rank_loader.prefill_expert_plan).
     # A bare name loads from kimi_k3/data.
-    prefill_expert_plan: str = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_EXPERT_PLAN
-    )
+    prefill_expert_plan: str = ""
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
@@ -115,6 +113,8 @@ class KernelConfig:
             raise ValueError("decode_expert_parallel is 8 or 16")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
+        if self.prefill_expert_plan and self.prefill_expert_parallel != 16:
+            raise ValueError("prefill_expert_plan places EP16 experts")
         if self.mla_decode_ktile not in (1024, 2048):
             raise ValueError("mla_decode_ktile supports 1024 or experimental 2048")
         if self.mla_decode_ktile == 2048 and (

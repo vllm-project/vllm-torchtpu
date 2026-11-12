@@ -343,22 +343,10 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
     """
     rank_dir = RankDir(presharded, rank, layers)
     ep16 = _config().decode_expert_parallel == 16
-    expert_order = (
-        prefill_expert_plan(layers)
-        if ep16 or _config().prefill_expert_parallel == 8
-        else None
-    )
+    expert_order = prefill_expert_plan(layers) if ep16 else None
     jobs: list[tuple[str, int, object]]
     if ep16:
         jobs = _host_joined(_ep16_expert_jobs(presharded, rank_dir, rank, layers, expert_order))
-    elif expert_order is not None:
-        jobs = [
-            job
-            for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
-            for job in _planned_expert_jobs_ep8(
-                presharded, rank_dir, name, rank, expert_order, layers, split=split_experts
-            )
-        ]
     else:
         jobs = list(_expert_jobs(rank_dir, split_experts))
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
@@ -418,10 +406,9 @@ def prefill_expert_plan(layers: int):
     """The expert placement (``KernelConfig.prefill_expert_plan``) of every
     program holding EP16 experts -- the prefill and the aggregate's decode --
     or None: ``order [layers - 1, 896]``, ``order[l, p]`` the logical expert
-    at physical slot ``p`` of MoE layer ``l``. EP16 chip ``c`` holds slots
-    ``56 c .. 56 c + 55`` (an EP8 prefill's group ``g``: ``112 g .. 112 g +
-    111``); the expert weights and router columns are loaded in slot order.
-    A bare name loads from kimi_k3/data."""
+    at physical slot ``p`` of MoE layer ``l``; chip ``c`` holds slots
+    ``56 c .. 56 c + 55``. The expert weights and router columns are loaded
+    in slot order. A bare name loads from kimi_k3/data."""
     path = _config().prefill_expert_plan
     if not path:
         return None
@@ -485,61 +472,6 @@ def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers):
         yield f"{name}@{index}/{count}", (hi - lo) * nbytes, reader
 
 
-def _planned_expert_jobs_ep8(
-    presharded, rank_dir, name, rank, order, layers, *, split: bool
-):
-    """EP8/TP4 expert parts permuted by ``order [layers - 1, 896]``:
-    EP8 group ``rank // 4`` holds ``order[l, 112 g : 112 g + 112]``
-    (quarter ``rank % 4``)."""
-    spec = rank_dir.spec(name)
-    shape = tuple(spec["shape"])  # [layers, 112, ...] per quarter
-    dtype = _dtype(spec["dtype"])
-    ep_group, quarter = rank // 4, rank % 4
-    dirs = [RankDir(presharded, 4 * g + quarter, layers) for g in range(8)]
-
-    count = len(spec["files"])
-    expert_bytes = int(np.prod(shape[2:])) * dtype.itemsize
-    nbytes = 112 * expert_bytes
-    parts = []
-    for index, (filename, (lo, hi)) in enumerate(
-        zip(spec["files"], spec["layer_ranges"])
-    ):
-        part_bytes = (hi - lo) * nbytes
-
-        def reader(filename=filename, lo=lo, hi=hi):
-            out = np.empty((hi - lo, 112, *shape[2:]), dtype)
-            jobs = []
-            for layer in range(lo, hi):
-                experts = order[layer, 112 * ep_group : 112 * ep_group + 112]
-                for slot, expert in enumerate(experts):
-                    sg, idx = int(expert) // 112, int(expert) % 112
-                    offset = ((layer - lo) * 112 + idx) * expert_bytes
-                    jobs.append(
-                        (dirs[sg].path / filename, offset, out[layer - lo, slot])
-                    )
-            with ThreadPoolExecutor(32) as pool:
-                list(
-                    pool.map(
-                        lambda job: read_into(
-                            job[0], job[1], job[2], streams=1, drop_cache=True
-                        ),
-                        jobs,
-                    )
-                )
-            return out
-
-        parts.append((f"{name}@{index}/{count}", part_bytes, reader))
-
-    if split:
-        yield from parts
-    else:
-        yield (
-            name,
-            _family_bytes(spec),
-            lambda parts=parts: np.concatenate([fn() for _, _, fn in parts], axis=0),
-        )
-
-
 def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 93,
                       split_experts: bool = False,
                       skip: frozenset = frozenset()) -> Iterator[tuple[str, str, np.ndarray]]:
@@ -586,17 +518,7 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
         jobs += [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
                  for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, rank % 4, 4)]
     else:
-        plan = prefill_expert_plan(layers) if ep == 8 else None
-        if plan is not None:
-            jobs += [
-                job
-                for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
-                for job in _planned_expert_jobs_ep8(
-                    presharded, rank_dir, name, rank, plan, layers, split=split_experts
-                )
-            ]
-        else:
-            jobs += list(_expert_jobs(rank_dir, split_experts))
+        jobs += list(_expert_jobs(rank_dir, split_experts))
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for name, source in (("latent_down", "latent_down"), ("latent_up", "latent_up"),
                          ("shared_gu", f"shared_gu_{parity}"), ("shared_down", f"shared_down_{parity}")):
@@ -628,7 +550,7 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
             if name == "m_o":
                 family = _sequence_parallel_output(family, peer_dir, "m_o", rank)
             yield "mla", name, family
-        plan = prefill_expert_plan(layers) if ep in (8, 16) else None
+        plan = prefill_expert_plan(layers)
         for name in PREFILL_MOE_DENSE:
             if name in skip:
                 continue

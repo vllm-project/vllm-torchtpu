@@ -140,9 +140,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     CDK_OUTPUT_DIR: str = "/tmp"
-    K3_AGGREGATE_EP16: bool = False
     K3_MAX_PREFILL_STEP_TOKENS: int = 8192
-    K3_PREFILL_EXPERT_PLAN: str = ""
     K3_PREFILL_PREFIX_FP8: bool = False
     K3_PREFILL_ROUTE_COUNTS: bool = False
     K3_PREFILL_ROUTE_COUNTS_DIR: str = ""
@@ -866,9 +864,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Kimi K3 megakernel and prefill scheduler knobs.
     "CDK_OUTPUT_DIR": env_str("CDK_OUTPUT_DIR", "/tmp"),
-    "K3_AGGREGATE_EP16": env_bool("K3_AGGREGATE_EP16", default=False),
     "K3_MAX_PREFILL_STEP_TOKENS": env_int("K3_MAX_PREFILL_STEP_TOKENS", 8192),
-    "K3_PREFILL_EXPERT_PLAN": env_str("K3_PREFILL_EXPERT_PLAN", ""),
     "K3_PREFILL_PREFIX_FP8": env_bool("K3_PREFILL_PREFIX_FP8", default=False),
     "K3_PREFILL_ROUTE_COUNTS": env_bool("K3_PREFILL_ROUTE_COUNTS", default=False),
     "K3_PREFILL_ROUTE_COUNTS_DIR": env_str("K3_PREFILL_ROUTE_COUNTS_DIR", ""),
