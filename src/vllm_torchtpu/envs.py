@@ -344,6 +344,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FREEZE_PYSPY_S: float = 120.0
     VLLM_TPU_REASONING_COUNT_SKIP_TOOLS: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_OWNED: bool = False
+    VLLM_TPU_QSA_PREFILL_LEAN_WRAPPER: bool = False
     VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR: bool = False
     VLLM_TPU_QSA_DCP_GATE_IN_COMBINE: bool = False
     VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED: bool = False
@@ -2181,6 +2182,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # words only, instead of a global bitset then an owned-word gather
     # (bit-identical).
     "VLLM_TPU_QSA_PREFILL_BITSET_OWNED": env_bool("VLLM_TPU_QSA_PREFILL_BITSET_OWNED"),
+    # Main-KV DCP sparse prefill: lean metadata around the kernel. The bitset
+    # kernel emits this rank's words (as VLLM_TPU_QSA_PREFILL_BITSET_OWNED)
+    # and visits only the selection chunks that can hold each word group (as
+    # VLLM_TPU_QSA_PREFILL_BITSET_RANGED; tight on the ascending DCP
+    # selection). Bit-identical.
+    "VLLM_TPU_QSA_PREFILL_LEAN_WRAPPER": env_bool("VLLM_TPU_QSA_PREFILL_LEAN_WRAPPER"),
     # Compressed main-KV DCP ops: all-gather the pair's q/gate rank-major
     # (dim 0) and join the heads inside the step, instead of a dim -1 gather
     # whose head join runs as a standalone copy (bit-identical).
