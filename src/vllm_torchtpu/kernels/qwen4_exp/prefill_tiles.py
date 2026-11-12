@@ -22,7 +22,7 @@ PAIRED_PAGE_VMEM_MIB = {128: 61, 256: 62}
 # dedicated attention caches use 128. Both require segment-wise addressing.
 SPARSE_PREFILL_TILES = {
     (
-        pltpu.ChipVersion.TPU_7X,
+        chip,
         8192,
         24,
         2,
@@ -32,6 +32,7 @@ SPARSE_PREFILL_TILES = {
         "bfloat16",
         "float8_e4m3fn",
     ): (256, 256)
+    for chip in (pltpu.ChipVersion.TPU_7X, pltpu.ChipVersion.TPU_8I)
     for page_size in (128, 1664)
 }
 
@@ -50,7 +51,7 @@ SPARSE_PREFILL_TILES = {
 # block stays at 512.
 SHARD_PREFILL_TILES = {
     (
-        pltpu.ChipVersion.TPU_7X,
+        chip,
         query_heads,
         1,
         256,
@@ -59,6 +60,7 @@ SHARD_PREFILL_TILES = {
         "bfloat16",
         "float8_e4m3fn",
     ): tiles
+    for chip in (pltpu.ChipVersion.TPU_7X, pltpu.ChipVersion.TPU_8I)
     for query_heads, tiles in (
         (3, (512, 1024, 256)),
         (6, (512, 1024, 128)),

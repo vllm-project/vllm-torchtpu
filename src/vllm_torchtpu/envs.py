@@ -119,7 +119,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFIX_SLICE: bool = False
     VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
-    VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
+    VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = True
     VLLM_TPU_QSA_DCP_FINE_PREFIX: bool = False
     VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL: bool = False
     VLLM_TPU_QSA_DCP_FINE_PREFIX_CONNECTOR: bool = False
@@ -915,7 +915,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # queries and keys, probabilities split into two BF16 terms) instead of
     # FP32 operands, which Mosaic multiplies at full FP32 precision.
     "VLLM_TPU_QSA_PREFILL_BF16_MXU": env_bool(
-        "VLLM_TPU_QSA_PREFILL_BF16_MXU", default=False
+        "VLLM_TPU_QSA_PREFILL_BF16_MXU", default=True
     ),
     # Under VLLM_TPU_QSA_MAIN_KV_DCP > 1: prefix-cache hits at the hash unit
     # (B) instead of the D*B scheduler block, with copy-on-write of a partially

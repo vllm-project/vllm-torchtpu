@@ -943,6 +943,8 @@ def calculate_tiling(
     tile_m = bf16_bf16_tile_m // rhs_mod
     if lhs_cfgs.should_quantize:
         tile_m *= 2
+    if dims.size_group >= 32 and dims.size_m <= 512:
+        tile_m = min(tile_m, max(dims.size_lhs_sublane, 16))
     tile_m = min(tile_m, dims.size_m)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go

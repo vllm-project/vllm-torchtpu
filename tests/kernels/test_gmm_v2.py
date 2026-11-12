@@ -462,3 +462,56 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+def test_calculate_tiling_caps_low_token_high_group_tile_m(monkeypatch):
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+        Dimensions,
+        InputConfigs,
+        calculate_tiling,
+    )
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_8I, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+
+    lhs_cfg = InputConfigs(
+        quant_dtype=None, quant_block_size=128, dtype=jnp.dtype(jnp.bfloat16)
+    )
+    rhs_cfg = InputConfigs(
+        quant_dtype=None,
+        quant_block_size=128,
+        dtype=jnp.dtype(jnp.float8_e4m3fn),
+        has_scale=True,
+    )
+    vmem_bytes = info.vmem_capacity_bytes
+
+    low_tok = calculate_tiling(
+        dims=Dimensions(
+            size_m=256,
+            size_k=2048,
+            size_n=512,
+            size_group=64,
+            size_lhs_group=16,
+            size_lhs_sublane=8,
+        ),
+        lhs_cfgs=lhs_cfg,
+        rhs_cfgs=rhs_cfg,
+        vmem_limit_bytes=vmem_bytes,
+    )
+    high_tok = calculate_tiling(
+        dims=Dimensions(
+            size_m=1024,
+            size_k=2048,
+            size_n=512,
+            size_group=64,
+            size_lhs_group=16,
+            size_lhs_sublane=8,
+        ),
+        lhs_cfgs=lhs_cfg,
+        rhs_cfgs=rhs_cfg,
+        vmem_limit_bytes=vmem_bytes,
+    )
+    assert (low_tok.bucket_base, low_tok.tile_m) == (16, 64)
+    assert (high_tok.bucket_base, high_tok.tile_m) == (64, 256)
