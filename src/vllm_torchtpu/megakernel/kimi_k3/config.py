@@ -106,42 +106,13 @@ class KernelConfig:
     dcp_skip: tuple[str, ...] = ()
     debug_skip: tuple[str, ...] = ()
     phase_scopes: bool = False
-    # Hot-expert fp8 copies (off when empty): an npz whose ``experts``
-    # [92, 8, S] holds the global expert id in copy slot j of EP group g
-    # per MoE layer (-1: empty). A bare name loads from kimi_k3/data.
-    kd_hot_plan: str = dataclasses.field(default_factory=lambda: envs.K3_HOT_PLAN)
-    # A hot expert's routes use its fp8 copy from this many rows.
-    hot_min_rows: int = 9
-    # Hot-expert MXFP4 replicas on other EP groups (off when empty; exclusive
-    # with kd_hot_plan): an npz with ``experts`` [92, 8, S] (global expert id
-    # replicated in copy slot j of EP group g, -1: empty) and ``order``
-    # [92, 8 S] (the dispatch order of the slots). Per step, each replicated
-    # expert's routes stay home, split by row parity, or move to the replica,
-    # whichever gives the lowest modeled slowest-group expert time. A bare
-    # name loads from kimi_k3/data.
-    kd_replica_plan: str = dataclasses.field(
-        default_factory=lambda: envs.K3_REPLICA_PLAN
-    )
-    # FP8 wires for attention DP's hidden-row gathers (off when empty): "t0"
-    # the attention input, "t10" the MoE input. Rows travel as e4m3 with one
-    # FP32 scale each; every rank uses the dequantized rows.
-    fp8_wires: tuple[str, ...] = dataclasses.field(
-        default_factory=lambda: tuple(filter(None, envs.K3_FP8_WIRES.split(",")))
-    )
     pool_report: bool = False
     vmem_report: bool = False
     vmem_pad_kb: int = 0
 
     def __post_init__(self) -> None:
-        if self.kd_hot_plan and self.kd_replica_plan:
-            raise ValueError("kd_hot_plan and kd_replica_plan are exclusive")
-        if not set(self.fp8_wires) <= {"t0", "t10"}:
-            raise ValueError("fp8_wires holds t0 and/or t10")
         if self.decode_expert_parallel not in (8, 16):
             raise ValueError("decode_expert_parallel is 8 or 16")
-        hot_plans = self.kd_hot_plan or self.kd_replica_plan
-        if self.decode_expert_parallel == 16 and hot_plans:
-            raise ValueError("hot-expert plans need decode_expert_parallel 8")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
         if self.mla_decode_ktile not in (1024, 2048):
