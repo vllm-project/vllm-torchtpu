@@ -616,6 +616,14 @@ def _prefill_attention(
 ):
     """With ``return_lse`` returns ``(out, lse, cache)`` (see
     ``block_sparse_gqa_attention``)."""
+    if dcp is not None and envs.VLLM_TPU_QSA_PREFILL_UNION_PROBE:
+        # Debug-only, log-only (union_probe): owned-union sizes of this step's tiles.
+        from vllm_torchtpu.kernels.qwen4_exp import union_probe
+
+        union_probe.record(
+            blocks, lengths, starts, table.shape[1], rank=dcp[0], world=int(dcp[1]),
+            page_size=cache.shape[1], ratio=ratio, steps=envs.VLLM_TPU_QSA_PREFILL_UNION_PROBE,
+        )
     union_group = envs.VLLM_TPU_QSA_PREFILL_UNION_WALK
     if union_group and (128 % union_group or union_group < 8):
         raise ValueError(
