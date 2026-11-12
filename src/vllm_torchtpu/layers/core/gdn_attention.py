@@ -915,6 +915,11 @@ def run_jax_gdn_attention_pooled_local(
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
     )
+    if metadata_only:
+        # The metadata reads only the pool's geometry (already in `plan`).
+        # Hand the donating kernel wrapper a one-block copy so the caller's
+        # pool is never donated by a call that does not write it.
+        recurrent_state = jax.lax.slice_in_dim(recurrent_state, 0, 1)
     result = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
         b,
