@@ -632,10 +632,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         before = torch_tpu_release.get_num_compilations() if reload else 0
         # TpuBackend sets `aot_config.cache_info`, so torch saves the entry to
         # `AOTAutogradCache` inside this call: an extra `SerializeExecutable()`
-        # and an `aotautograd/` file nothing reads, and `entry.pre_save()` swaps
-        # `compiled_fw.result` for a copy that `release_entry_executables` would
-        # then clear instead of the executable `compiled_fn` runs. Reload skips
-        # that save; the default path keeps it.
+        # and an `aotautograd/` file nothing reads, and for a non-split
+        # executable `entry.pre_save()` swaps `compiled_fw.result` for a copy
+        # that `release_entry_executables` would then clear instead of the
+        # executable `compiled_fn` runs. Reload skips that save; the default
+        # path keeps it.
         skip_save = (
             _skip_aot_autograd_cache_save() if reload else contextlib.nullcontext()
         )

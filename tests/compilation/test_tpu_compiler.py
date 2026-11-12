@@ -1527,7 +1527,7 @@ class TestReloadCompiledExecutable:
         assert torch.equal(fn(torch.tensor([3, 4])), torch.tensor([15, 20]))
         assert artifact.read_bytes() != b"corrupt"
 
-    def test_release_entry_executables_clears_every_leaf_once(self, reload_state):
+    def test_release_entry_executables_clears_every_leaf_once(self):
         """Shared and cyclic splits are visited once; `NoOpCompiledArtifact`
         and empty results are skipped."""
         from vllm_torchtpu.compilation.torch_tpu_release import (
@@ -1555,9 +1555,7 @@ class TestReloadCompiledExecutable:
         assert shared.released
         assert bw.released
 
-    def test_release_entry_executables_rejects_unsupported_types_unreleased(
-        self, reload_state
-    ):
+    def test_release_entry_executables_rejects_unsupported_types_unreleased(self):
         """An unsupported artifact anywhere in the entry raises `TypeError`
         before any leaf, earlier in the tree or in the forward, is cleared."""
         from vllm_torchtpu.compilation.torch_tpu_release import (
@@ -1590,16 +1588,35 @@ def _compile_and_reload_on_tpu(root: str) -> None:
     # Neither persistent torch_tpu cache may serve the graph: the cold compile
     # has to be a new CompileAndLoad for the reload to run.
     os.environ["TORCH_TPU_TIER2_COMPILATION_CACHE"] = "disabled"
-    os.environ["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = "disabled"
     os.environ.pop("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", None)
-    os.environ.pop("TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT", None)
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(root, "inductor")
     os.environ["VLLM_TPU_RELOAD_COMPILED_EXECUTABLE"] = "1"
-    import torch_tpu  # noqa: F401
     from vllm.config.utils import Range
 
-    from vllm_torchtpu.compilation import shape_variants, torch_tpu_release
+    from vllm_torchtpu.compilation import (
+        shape_variants,
+        torch_tpu_release,
+        tpu_compiler,
+    )
     from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+    real_backend = tpu_compiler._tpu_backend
+
+    def tracked_backend(graph, example_inputs):
+        compiled_fn = real_backend(graph, example_inputs)
+        freevars = dict(
+            zip(
+                compiled_fn.__code__.co_freevars,
+                (c.cell_contents for c in compiled_fn.__closure__ or ()),
+            )
+        )
+        assert (
+            compiled_fn.serialize().compiled_fw.result
+            is freevars["compiled_artifacts"][0]
+        )
+        return compiled_fn
+
+    tpu_compiler._tpu_backend = tracked_backend
 
     released = []
     release = torch_tpu_release.release_entry_executables
@@ -1636,7 +1653,9 @@ def _compile_and_reload_on_tpu(root: str) -> None:
         if isinstance(result, _SplitCompiledExecutable)
         else [result]
     )
-    assert leaves and all(leaf._executable is None for leaf in leaves)
+    assert leaves and all(
+        leaf._executable is None and leaf._fast_runner is None for leaf in leaves
+    )
     assert not os.path.exists(os.path.join(root, "inductor", "aotautograd"))
 
     # A warm start replays the saved artifact without compiling again.
@@ -1645,17 +1664,19 @@ def _compile_and_reload_on_tpu(root: str) -> None:
     before = torch.tpu._get_cache_stats().num_compilations
     warm = TpuCompilerAdaptor()
     warm.initialize_cache(cache_dir=cache_dir)
-    out = warm.load(handle, graph, example_inputs, 0, Range(start=8, end=8))(x)
-    out = out[0] if isinstance(out, (tuple, list)) else out
+    (out,) = warm.load(handle, graph, example_inputs, 0, Range(start=8, end=8))(x)
     assert torch.equal(out.cpu(), expected)
     assert torch.tpu._get_cache_stats().num_compilations == before
 
 
 @pytest.mark.tpu_test
+@pytest.mark.spawns_tpu_workers
 def test_reload_compiled_executable_on_tpu(tmp_path):
     """Real TpuBackend: a cold compile under VLLM_TPU_RELOAD_COMPILED_EXECUTABLE
     releases and reloads its executable, writes no AOTAutogradCache entry, and
     the saved artifact warm-loads. Spawned, so PJRT never binds pytest itself."""
     from tests.distributed.tpu_test_utils import run_in_isolated_process
 
-    run_in_isolated_process(partial(_compile_and_reload_on_tpu, str(tmp_path)))
+    run_in_isolated_process(
+        partial(_compile_and_reload_on_tpu, str(tmp_path)), timeout=180
+    )
