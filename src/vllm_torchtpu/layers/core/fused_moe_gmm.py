@@ -32,6 +32,10 @@ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
 )
+from vllm_torchtpu.kernels.megablox.moe_tc_combine import (
+    tc_slab_combine,
+    tc_slab_combine_ok,
+)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
 )
@@ -72,6 +76,25 @@ def _select_ragged_gather_reduce(version: str):
 # RAGGED_GATHER_REDUCE_VERSION=v3 to select the destination-major kernel for EP.
 # The non-EP combine in moe_gmm selects that kernel directly.
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
+_V3_PAYLOAD_SORT = (
+    envs.TPU_MOE_V3_PAYLOAD_SORT and envs.RAGGED_GATHER_REDUCE_VERSION == "v3"
+)
+if _V3_PAYLOAD_SORT:
+    ragged_gather_reduce = functools.partial(
+        ragged_gather_reduce_v3, payload_sort=True
+    )
+# Fixed at import: EP steps of at least this many tokens combine the expert
+# outputs on the TensorCore (0 = never). See moe_tc_combine.
+_TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
+_FLAT_ROUTING_MIN_TOKENS = envs.TPU_MOE_FLAT_ROUTING_MIN_TOKENS
+if _TC_COMBINE_MIN_TOKENS or _V3_PAYLOAD_SORT or _FLAT_ROUTING_MIN_TOKENS:
+    logger.info(
+        "MoE row movement: TPU_MOE_TC_COMBINE_MIN_TOKENS=%d "
+        "TPU_MOE_V3_PAYLOAD_SORT=%d TPU_MOE_FLAT_ROUTING_MIN_TOKENS=%d",
+        _TC_COMBINE_MIN_TOKENS,
+        int(_V3_PAYLOAD_SORT),
+        _FLAT_ROUTING_MIN_TOKENS,
+    )
 
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
@@ -680,13 +703,38 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
-        return ragged_gather_reduce(
-            gmm2_res,
-            argsort_revert_indices,
-            topk_weights_flat,
-            valid_mask_flat,
-            reduce_group_size=topk,
-        ).astype(x.dtype)
+        def sc_combine():
+            return ragged_gather_reduce(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                reduce_group_size=topk,
+            ).astype(x.dtype)
+
+        if (
+            _TC_COMBINE_MIN_TOKENS
+            and num_tokens >= _TC_COMBINE_MIN_TOKENS
+            and gmm2_res.dtype == jnp.bfloat16
+            and tc_slab_combine_ok(num_tokens, gmm2_res.shape[-1])
+        ):
+            logger.info_once(
+                "TPU_MOE_TC_COMBINE_MIN_TOKENS=%d: TensorCore MoE combine "
+                "(tc_slab_combine) armed",
+                _TC_COMBINE_MIN_TOKENS,
+            )
+            out, overflow = tc_slab_combine(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                topk=topk,
+            )
+            # A token block whose routes need more slabs or extra routes than
+            # the kernel stages (far above the EP mean) takes the SparseCore
+            # combine.
+            return jax.lax.cond(overflow, sc_combine, lambda: out.astype(x.dtype))
+        return sc_combine()
 
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape((num_tokens, topk, gmm2_res.shape[-1]))
@@ -803,6 +851,25 @@ def fused_moe_func(
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
+
+    if (
+        _FLAT_ROUTING_MIN_TOKENS
+        and num_tokens >= _FLAT_ROUTING_MIN_TOKENS
+        and use_ep
+        and num_tokens * topk > onehot_moe_permute_threshold
+    ):
+        # [T, top_k] is lane-padded 32x in HBM; read it once into flat arrays
+        # so every later view (flat, counting-sort blocks, v3 blocks) is a
+        # cheap reshape of dense data instead of another padded relayout.
+        logger.info_once(
+            "TPU_MOE_FLAT_ROUTING_MIN_TOKENS=%d: flat MoE routing armed",
+            _FLAT_ROUTING_MIN_TOKENS,
+        )
+        ids_flat, weights_flat = jax.lax.optimization_barrier(
+            (topk_ids.reshape(-1), topk_weights.reshape(-1))
+        )
+        topk_ids = ids_flat.reshape(num_tokens, topk)
+        topk_weights = weights_flat.reshape(num_tokens, topk)
 
     (
         x,
