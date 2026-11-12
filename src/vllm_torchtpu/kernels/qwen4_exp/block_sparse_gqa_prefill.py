@@ -55,7 +55,7 @@ def vpu_features():
     return tuple(name for name in VPU_FEATURES if name in names)
 
 
-LAZY_SOFTMAX_TOKENS = ("nobranch", "noguard")
+LAZY_SOFTMAX_TOKENS = ("nobranch", "noguard", "nostabmax")
 
 
 def lazy_softmax_features():
@@ -541,7 +541,16 @@ def _kernel(
         kept as 128-lane partial sums and reduced once in the epilogue.
         """
         del tile_visible
-        tile_max = jnp.max(score, axis=(0, 1), keepdims=True)
+        # Whole-tile max without per-row lane reductions: fold rows (across
+        # vregs) and 128-lane segments elementwise down to one vreg first.
+        rows = score.shape[0]
+        folded = jnp.max(score.reshape(rows // 8, 8, kv_tile), axis=0)
+        lanes = folded[:, :128]
+        for offset in range(128, kv_tile, 128):
+            lanes = jnp.maximum(lanes, folded[:, offset : offset + 128])
+        tile_max = jnp.max(lanes, axis=(0, 1), keepdims=True)
+        if "nostabmax" in lazy:  # test-only: price the tile max (wrong output)
+            tile_max = jnp.full((1, 1), -jnp.inf, jnp.float32)
         old = stab_ref[query_tile_index, head][:, :1]
         grow = tile_max > old + LAZY_SOFTMAX_SLACK
         if "nobranch" in lazy:
