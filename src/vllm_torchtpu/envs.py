@@ -127,6 +127,8 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY: bool = True
+    TPU_SPEC_GLUE_FUSION: bool = False
+    TPU_SPEC_SYNTHETIC_INGRAPH_RNG: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -946,6 +948,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rejected slot or its bonus slot) instead of every verify row.
     "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY": env_bool(
         "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY", default=True
+    ),
+    # Run the async spec-decode glue between the draft and the next forward
+    # (substitution source, rejected count, the next step's seq_lens and
+    # positions correction) as two compiled programs instead of about eight
+    # eager ones. Integer ops only; same values.
+    "TPU_SPEC_GLUE_FUSION": env_bool("TPU_SPEC_GLUE_FUSION", default=False),
+    # Under the synthetic one-row verify, draw the accept and recovery
+    # uniforms inside the two compiled sampler programs from a device counter
+    # (keyed counter-based hash, 24-bit uniforms like torch.rand) instead of
+    # two eager torch.rand calls on the sampling generator. Same distribution,
+    # different random stream.
+    "TPU_SPEC_SYNTHETIC_INGRAPH_RNG": env_bool(
+        "TPU_SPEC_SYNTHETIC_INGRAPH_RNG", default=False
     ),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
