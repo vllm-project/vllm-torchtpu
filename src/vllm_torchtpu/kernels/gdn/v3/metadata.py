@@ -88,6 +88,19 @@ def roll_per_seq_inputs(
     return query_start_loc, seq_lens, state_indices, read_offsets, ckpt_indices
 
 
+def per_seq_tile_slots(cfg: config.GDNConfig, max_seqs: int, tile_sized: bool) -> int:
+    """Length of the PER_SEQ per-tile metadata arrays.
+
+    A sequence of `q` tokens takes `cdiv(q, chunk)` tiles, so a call takes at
+    most `cdiv(batch, chunk) + max_seqs` of them. Two spare slots keep the
+    pipeline's one-tile lookahead past the last tile on entries that the
+    token-sized arrays hold there too (the `jnp.repeat` fill).
+    """
+    if not tile_sized:
+        return cfg.batch_size
+    return min(cfg.batch_size, pl.cdiv(cfg.batch_size, cfg.chunk_size) + max_seqs + 2)
+
+
 def compute_per_seq_metadata(
     cfg: config.GDNConfig,
     seq_lens: jax.Array,
@@ -99,6 +112,7 @@ def compute_per_seq_metadata(
     ckpt_indices: jax.Array | None = None,
     prerolled: bool = False,
     prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
+    tile_sized: bool = False,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing single sequence per tile.
 
@@ -121,7 +135,7 @@ def compute_per_seq_metadata(
     from the carry. Offset or block 0 means none.
     """
     max_seqs = seq_lens.size
-    max_tokens = cfg.batch_size
+    max_tokens = per_seq_tile_slots(cfg, max_seqs, tile_sized)
     all_seqs = jnp.arange(max_seqs)
     all_tokens = jnp.arange(max_tokens)
 

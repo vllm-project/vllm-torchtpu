@@ -880,8 +880,14 @@ def run_jax_gdn_attention_pooled_local(
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
     prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+    packed_metadata: jnp.ndarray | None = None,
+    metadata_only: bool = False,
+) -> tuple[jnp.ndarray, jnp.ndarray] | jnp.ndarray:
     """GDN attention over the unified block pool.
+
+    ``packed_metadata`` / ``metadata_only``: see ``fused_conv1d_gdn``
+    (VLLM_TPU_GDN_STEP_KERNEL_METADATA); with ``metadata_only`` the result is
+    the packed kernel metadata alone.
 
     ``recurrent_state`` is the attention-shaped pool holding the SSM region
     in ``recurrent_state_dtype`` at token offset 0 and the configured Conv
@@ -909,7 +915,7 @@ def run_jax_gdn_attention_pooled_local(
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
     )
-    recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
+    result = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
         b,
         a,
@@ -941,7 +947,12 @@ def run_jax_gdn_attention_pooled_local(
         prefill_ckpt_alignment=(
             fold_unit(pool_block_tokens) if prefill_ckpt is not None else 0
         ),
+        packed_metadata=packed_metadata,
+        metadata_only=metadata_only,
     )
+    if metadata_only:
+        return result
+    recurrent_state, output = result
     return recurrent_state, output
 
 
@@ -1007,7 +1018,9 @@ def run_jax_gdn_attention_pooled(
     conv_weight_kmajor: bool = False,
     step_metadata: tuple[jnp.ndarray, ...] | None = None,
     prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+    packed_metadata: jnp.ndarray | None = None,
+    metadata_only: bool = False,
+) -> tuple[jnp.ndarray, jnp.ndarray] | jnp.ndarray:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
     Args:
@@ -1118,7 +1131,24 @@ def run_jax_gdn_attention_pooled(
         conv_state_dtype=conv_state_dtype,
         conv_weight_kmajor=conv_weight_kmajor,
     )
+    if packed_metadata is not None or metadata_only:
+        # VLLM_TPU_GDN_STEP_KERNEL_METADATA: one replicated packed vector,
+        # the same on every rank (it is built from replicated step inputs).
+        assert prefill_ckpt is None and step_metadata is None
+        p_run_jax_gdn_attention_pooled_local = functools.partial(
+            p_run_jax_gdn_attention_pooled_local, metadata_only=metadata_only
+        )
+        if metadata_only:
+            out_specs = P(None)
     local_fn = p_run_jax_gdn_attention_pooled_local
+    if packed_metadata is not None:
+        in_specs = in_specs + (P(None),)
+        inner_fn = local_fn
+
+        def local_fn(*args):
+            *rest, packed = args
+            return inner_fn(*rest, packed_metadata=packed)
+
     if prefill_ckpt is not None:
         # Two more replicated per-sequence inputs, appended after whichever
         # optional inputs precede them.
@@ -1159,6 +1189,8 @@ def run_jax_gdn_attention_pooled(
         extra_args = extra_args + (ckpt_indices,)
     if prefill_ckpt is not None:
         extra_args = extra_args + tuple(prefill_ckpt)
+    if packed_metadata is not None:
+        extra_args = extra_args + (packed_metadata,)
     outputs = mapped_fn(
         j_mixed_qkv,
         j_b,

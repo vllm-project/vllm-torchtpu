@@ -398,6 +398,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SPEC_BOUNDARY_STATE_COPY: bool = False
     VLLM_TPU_GDN_V3_WINDOW_VERIFY: bool = False
     VLLM_TPU_GDN_V3_SINGLE_LAUNCH: bool = False
+    VLLM_TPU_GDN_STEP_KERNEL_METADATA: bool = False
     VLLM_TPU_CANDIDATE_SAMPLING: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -2454,6 +2455,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel instead of two, so a decode/verify-only step launches no empty
     # PER_SEQ kernel (PR #2821 d8340b973). Same outputs and pool bytes.
     "VLLM_TPU_GDN_V3_SINGLE_LAUNCH": env_bool("VLLM_TPU_GDN_V3_SINGLE_LAUNCH"),
+    # Pooled GDN v3: build the kernel's scalar-prefetch metadata (both
+    # segments' MetadataRef) once per step and share it across every GDN layer
+    # of the step, instead of once per layer inside each layer's op; and size
+    # the PER_SEQ tile arrays by tiles (cdiv(tokens, chunk) + seqs) rather than
+    # by tokens. Same integers in every slot the kernel reads, so
+    # bit-identical. Plain unified pool only (not block-major, not SP
+    # micro-batch halves, not internal prefill checkpoints).
+    "VLLM_TPU_GDN_STEP_KERNEL_METADATA": env_bool(
+        "VLLM_TPU_GDN_STEP_KERNEL_METADATA"
+    ),
     # Non-greedy MTP verify steps whose requests all keep top_k <= 48 (or are
     # greedy) keep each rank's LM-head vocab shard instead of all-gathering
     # the logits: one program takes each shard's 64 largest logits per row,

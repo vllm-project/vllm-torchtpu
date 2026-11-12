@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from typing import cast
 
 import jax
@@ -553,8 +554,12 @@ def kernel_metadata(
     ckpt_indices: jax.Array | None,
     per_seq_inputs: tuple[jax.Array, ...] | None = None,
     prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
+    tile_sized: bool = False,
 ) -> memory_ref.MetadataRef:
-    """The scalar-prefetch metadata of one `fused_conv1d_gdn` kernel call."""
+    """The scalar-prefetch metadata of one `fused_conv1d_gdn` kernel call.
+
+    `tile_sized`: PER_SEQ per-tile arrays sized by tiles, not tokens
+    (`metadata.per_seq_tile_slots`)."""
     if cfg.mode != config.GDNMode.PER_SEQ:
         return metadata.compute_batched_seq_metadata(
             cfg=cfg,
@@ -578,6 +583,7 @@ def kernel_metadata(
             ckpt_indices=ps_ckpt,
             prerolled=True,
             prefill_ckpt=prefill_ckpt,
+            tile_sized=tile_sized,
         )
     return metadata.compute_per_seq_metadata(
         cfg=cfg,
@@ -589,7 +595,41 @@ def kernel_metadata(
         end_seq=distribution[-1],
         ckpt_indices=ckpt_indices,
         prefill_ckpt=prefill_ckpt,
+        tile_sized=tile_sized,
     )
+
+
+def pack_kernel_metadata(metas: tuple[memory_ref.MetadataRef, ...]) -> jax.Array:
+    """Every leaf of `metas`, flattened in order, as one int32 vector.
+
+    All MetadataRef leaves are int32 or bool scalars / arrays, so the round
+    trip through `unpack_kernel_metadata` is exact.
+    """
+    leaves = jax.tree.leaves(metas)
+    for leaf in leaves:
+        dtype = jnp.result_type(leaf)
+        if not (jnp.issubdtype(dtype, jnp.integer) or dtype == jnp.bool_):
+            raise TypeError(f"GDN kernel metadata leaf of dtype {dtype}")
+    return jnp.concatenate([jnp.ravel(x).astype(jnp.int32) for x in leaves])
+
+
+def unpack_kernel_metadata(
+    packed: jax.Array, abstract: tuple[memory_ref.MetadataRef, ...]
+) -> tuple[memory_ref.MetadataRef, ...]:
+    """Inverse of `pack_kernel_metadata` for metadata shaped like `abstract`
+    (`jax.eval_shape` of the same builders)."""
+    leaves, treedef = jax.tree.flatten(abstract)
+    sizes = [math.prod(leaf.shape) for leaf in leaves]
+    if packed.shape != (sum(sizes),):
+        raise ValueError(
+            f"packed GDN kernel metadata {packed.shape} != ({sum(sizes)},)"
+        )
+    out, offset = [], 0
+    for leaf, size in zip(leaves, sizes, strict=True):
+        part = packed[offset : offset + size].reshape(leaf.shape)
+        out.append(part.astype(leaf.dtype))
+        offset += size
+    return jax.tree.unflatten(treedef, out)
 
 
 @jax.jit(
@@ -612,6 +652,7 @@ def kernel_metadata(
         "attention_mode",
         "gate_lower_bound",
         "prefill_ckpt_alignment",
+        "metadata_only",
     ),
 )
 def fused_conv1d_gdn(
@@ -652,7 +693,13 @@ def fused_conv1d_gdn(
     per_seq_inputs: tuple[jax.Array, ...] | None = None,
     prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
     prefill_ckpt_alignment: int = 0,
-) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
+    packed_metadata: jax.Array | None = None,
+    metadata_only: bool = False,
+) -> (
+    tuple[tuple[jax.Array, jax.Array], jax.Array]
+    | tuple[jax.Array, jax.Array]
+    | jax.Array
+):
     """Perform conv1d and gdn in a single fused kernel.
 
     Args:
@@ -736,6 +783,13 @@ def fused_conv1d_gdn(
             `metadata.compute_per_seq_metadata`.
         prefill_ckpt_alignment: Every nonzero checkpoint offset is a multiple
             of this; the PER_SEQ tile must divide it.
+        packed_metadata: Optional int32 vector from a `metadata_only` call
+            with the same shapes and step inputs (VLLM_TPU_GDN_STEP_KERNEL_METADATA):
+            both segments' kernel metadata, built once per step and shared by
+            every layer, replacing the per-call metadata computation. Pooled
+            calls running both segments only.
+        metadata_only: Return the call's packed kernel metadata (see
+            `pack_kernel_metadata`) instead of running the kernel.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -743,6 +797,11 @@ def fused_conv1d_gdn(
             source (aliased in place) instead of the state pair.
         out: Fused output tensor.
     """
+    step_metadata = packed_metadata is not None or metadata_only
+    if step_metadata and (prefill_ckpt is not None or per_seq_inputs is not None):
+        raise ValueError(
+            "packed GDN kernel metadata excludes prefill_ckpt and per_seq_inputs"
+        )
     # Conv1D consumes FP32 while outputs retain the projection activation dtype.
     prepared_qkv = isinstance(qkv, Conv1DInput)
     if isinstance(qkv, Conv1DInput):
@@ -1089,6 +1148,7 @@ def fused_conv1d_gdn(
             ckpt_indices=ckpt_indices,
             per_seq_inputs=per_seq_inputs,
             prefill_ckpt=ckpt,
+            tile_sized=step_metadata,
         )
 
         if cfg.kernel_zero_out:
@@ -1104,10 +1164,13 @@ def fused_conv1d_gdn(
         in_recurrent_state: jax.Array | None,
         in_act: jax.Array | None,
         mode: config.GDNMode,
+        metadata_override: memory_ref.MetadataRef | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
         cfg, metadata_obj = make_cfg_and_metadata(
             in_conv_state, in_recurrent_state, in_act, mode
         )
+        if metadata_override is not None:
+            metadata_obj = metadata_override
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
         # Step 7: Handle case where write needs to be done in existing out.
@@ -1165,6 +1228,32 @@ def fused_conv1d_gdn(
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
 
+    # VLLM_TPU_GDN_STEP_KERNEL_METADATA: both segments' metadata as one packed
+    # int32 vector, built by a `metadata_only` call once per step.
+    segment_metas = None
+    if step_metadata:
+        if not pooled or prefill_only or batched_only:
+            raise ValueError(
+                "packed GDN kernel metadata covers pooled calls running both "
+                "segments only"
+            )
+        source = cast(jax.Array, state_source)
+
+        def build(mode: config.GDNMode, in_act):
+            return make_cfg_and_metadata(source, None, in_act, mode)[1]
+
+        batched_build = functools.partial(build, config.GDNMode.BATCHED, None)
+        batched_out = make_cfg_and_metadata(
+            source, None, None, config.GDNMode.BATCHED
+        )[0].get_out_shape()
+        per_seq_build = functools.partial(build, config.GDNMode.PER_SEQ, batched_out)
+        if metadata_only:
+            return pack_kernel_metadata((batched_build(), per_seq_build()))
+        segment_metas = unpack_kernel_metadata(
+            cast(jax.Array, packed_metadata),
+            (jax.eval_shape(batched_build), jax.eval_shape(per_seq_build)),
+        )
+
     if (
         pooled
         and envs.VLLM_TPU_GDN_V3_SINGLE_LAUNCH
@@ -1177,6 +1266,8 @@ def fused_conv1d_gdn(
         batched_cfg, batched_meta = make_cfg_and_metadata(
             source, None, None, config.GDNMode.BATCHED
         )
+        if segment_metas is not None:
+            batched_meta = segment_metas[0]
         in_act = None
         if zero_initialize_out and not batched_cfg.kernel_zero_out:
             in_act = jnp.zeros_like(batched_cfg.get_out_shape())
@@ -1188,6 +1279,8 @@ def fused_conv1d_gdn(
             batched_cfg.get_out_shape(),
             config.GDNMode.PER_SEQ,
         )
+        if segment_metas is not None:
+            per_seq_meta = segment_metas[1]
         cfgs = (batched_cfg, per_seq_cfg)
         metas = (batched_meta, per_seq_meta)
         num_meta = len(batched_meta) + len(per_seq_meta)
@@ -1224,11 +1317,19 @@ def fused_conv1d_gdn(
         out_act, out_source = None, state_source
         if not prefill_only:
             out_act, out_source, _ = call_kernel(
-                state_source, None, None, config.GDNMode.BATCHED
+                state_source,
+                None,
+                None,
+                config.GDNMode.BATCHED,
+                None if segment_metas is None else segment_metas[0],
             )
         if not batched_only:
             out_act, out_source, _ = call_kernel(
-                out_source, None, out_act, config.GDNMode.PER_SEQ
+                out_source,
+                None,
+                out_act,
+                config.GDNMode.PER_SEQ,
+                None if segment_metas is None else segment_metas[1],
             )
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
