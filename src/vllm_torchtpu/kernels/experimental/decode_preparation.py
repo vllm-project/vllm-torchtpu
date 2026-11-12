@@ -260,35 +260,45 @@ def pack_matrix(records, values, *, base, capacity, padded):
     masks = jnp.where(even, jnp.int32(65535), jnp.int32(0)) | jnp.where(
         odd, jnp.int32(-65536), jnp.int32(0)
     )
+    # Row-major [1, padded]: a [padded, 1] column spends a whole lane tile per
+    # id, and flattening it outside the region is a relayout.
+    pairs = jnp.pad(
+        jnp.where(boundary, pairs, -1), ((0, padded - n), (0, 0)), constant_values=-1
+    ).T
+    masks = jnp.broadcast_to(jnp.pad(masks, ((0, padded - n), (0, 0))), (padded, 128))
+    words = jnp.pad(words, ((0, padded - n), (0, 0)))
+    # Emit the publisher's 128-word rows segment-major: row j * padded + p is
+    # 128-word segment j of pair p. Each segment is a lane-aligned slice, so
+    # the rows leave the region in the layout the SparseCore writer reads; a
+    # pair-major [padded, 512] -> [4 * padded, 128] reshape outside it is a
+    # relayout copy per layer. The writer handles rows independently, and
+    # reads row r's mask at r % padded, so each pair's mask is written once.
     return (
-        jnp.pad(
-            jnp.where(boundary, pairs, -1),
-            ((0, padded - n), (0, 0)),
-            constant_values=-1,
+        jnp.concatenate(
+            [jnp.where(pairs >= 0, pairs * 4 + j, -1) for j in range(4)], axis=1
         ),
-        jnp.broadcast_to(jnp.pad(masks, ((0, padded - n), (0, 0))), (padded, 512)),
-        jnp.pad(words, ((0, padded - n), (0, 0))),
+        masks,
+        jnp.concatenate([words[:, 128 * j : 128 * (j + 1)] for j in range(4)], axis=0),
     )
 
 
 def swa_word_pool_pack(records, values, *, capacity, padded, interpret=False):
     """Sort and pair SWA records for the word-pool publisher in one TC region.
 
-    Returns 128-word physical row ids (four per token pair, -1 when skipped),
-    the packed words and their BF16-half masks, padded to ``4 * padded`` rows.
+    Returns 128-word physical row ids (four per token pair, -1 when skipped)
+    and the packed words, padded to ``4 * padded`` rows, plus one BF16-half
+    mask row per pair (``padded`` rows; row r's mask is ``masks[r % padded]``).
+    Rows are segment-major (see `pack_matrix`), not ordered by row id.
     """
 
     def body(records, values):
         return pack_matrix(records, values, base=0, capacity=capacity, padded=padded)
 
     inputs = (records[None, :], values)
-    pairs, masks, words = fuse_function(
+    physical, masks, words = fuse_function(
         body, inputs, name="decode_swa_sort_pack", interpret=interpret
     )(*inputs)
-    physical = jnp.where(
-        pairs >= 0, pairs * 4 + jnp.arange(4, dtype=jnp.int32)[None, :], -1
-    )
-    return physical.reshape(-1), words.reshape(-1, 128), masks.reshape(-1, 128)
+    return physical.reshape(-1), words, masks
 
 
 def main_records_call(xs, *, page_size):
