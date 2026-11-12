@@ -762,6 +762,13 @@ def _get_msa_dcp_fp4_op(
         if kv_heads > 1
         else None
     )
+    early_q_op = (
+        _get_msa_dcp_heads_op(
+            sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix, q_gathered=True
+        )
+        if kv_heads > 1 and msa_dcp_heads.early_q_gather_enabled()
+        else None
+    )
 
     def op(
         q: torch.Tensor,
@@ -779,6 +786,13 @@ def _get_msa_dcp_fp4_op(
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
+        q_all = None
+        if early_q_op is not None and msa_dcp_heads.uses_dcp_attention(
+            q.shape[0], metadata.seq_lens.shape[0], decode_rows
+        ):
+            # Ahead of the scoring op, which it does not feed: the gather can
+            # overlap the indexer (`msa_dcp_heads.EARLY_Q_GATHER_ENV`).
+            q_all = gather_query_heads(q, group)
         if kv_heads > 1:
             k, v, index_q = gather_group_kv(k, v, index_q, group, dcp, kv_head_replicas)
         new_kv_cache, new_index_cache, new_scale_cache, candidates, q = score_op(
@@ -799,6 +813,18 @@ def _get_msa_dcp_fp4_op(
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
         scale_cache.copy_(new_scale_cache)
+        if q_all is not None:
+            return early_q_op(
+                dcp_rank,
+                q_all,
+                kv_cache,
+                scale_cache,
+                candidates,
+                metadata.seq_lens,
+                metadata.block_tables,
+                metadata.query_start_loc,
+                metadata.request_distribution,
+            )
         if heads_op is not None:
             return heads_op(
                 dcp_rank,
@@ -835,11 +861,13 @@ def _get_msa_dcp_heads_op(
     kv_head_replicas: int,
     decode_rows: int,
     suffix: str,
+    q_gathered: bool = False,
 ) -> Callable[..., torch.Tensor]:
     """The attention half of the 4-bit DCP op over several KV heads, as one
     SPMD op over the DCP mesh (`msa_dcp_heads.attend_and_merge`): its
     collectives run inside the program, so a long step can pick its paths
-    and their sizes from the step's requests."""
+    and their sizes from the step's requests. `q_gathered`: the op takes the
+    group's unrotated query heads, gathered by the caller."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
@@ -857,6 +885,7 @@ def _get_msa_dcp_heads_op(
             topk=topk,
             decode_rows=decode_rows,
             rs_out_precision=envs.TPU_DCP_RS_OUT_PRECISION,
+            q_gathered=q_gathered,
         ),
         mesh=mesh,
         in_specs=specs,
@@ -893,14 +922,22 @@ def _get_msa_dcp_heads_op(
 
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        f"pallas::minimax_m3_msa_dcp_heads_attend_{suffix}_r{decode_rows}",
+        f"pallas::minimax_m3_msa_dcp_heads_attend_{suffix}_r{decode_rows}"
+        + ("_qg" if q_gathered else ""),
         _attend_jax,
         mesh=mesh,
         input_partition_specs=specs,
         # A sequence, one spec per output (a bare spec reads as its axes).
         output_partition_specs=(sharded,),
     )
-    op.register_fake(lambda dcp_rank, q, *args: torch.empty_like(q))
+    if q_gathered:
+        op.register_fake(
+            lambda dcp_rank, q, *args: q.new_empty(
+                (q.shape[0], q.shape[1] // dcp, q.shape[2])
+            )
+        )
+    else:
+        op.register_fake(lambda dcp_rank, q, *args: torch.empty_like(q))
     return op
 
 
