@@ -119,12 +119,16 @@ def _template(side):
     return template
 
 
-def _build(monkeypatch, stages, columns=1, side=False, depth=2, transport=None):
+def _build(monkeypatch, stages, columns=1, side=False, depth=None, transport=None):
     """One PPRing per device of ``stages`` stages of ``columns`` devices,
     sharing one fake transport; keyed by (stage, column)."""
     from vllm.distributed import parallel_state
 
-    from vllm_torchtpu.distributed import pcp
+    from vllm_torchtpu.distributed import pcp, pp_prepare_ahead
+
+    monkeypatch.setattr(pp_prepare_ahead, "install_worker", lambda: None)
+    if depth is None:
+        depth = 1 if side else 2
 
     transport = transport or _Transport(stride=columns)
     monkeypatch.setattr(torch.distributed, "isend", transport.isend)
@@ -323,8 +327,10 @@ def _until(predicate, seconds=5.0):
 
 
 @pytest.mark.parametrize("depth", [1, 2])
-def test_a_stage_that_runs_ahead_holds_at_most_depth_forwards(monkeypatch, depth):
-    transport, rings = _build(monkeypatch, stages=2, side=True, depth=depth)
+def test_a_stage_that_runs_ahead_holds_one_prepared_output_beyond_depth(
+    monkeypatch, depth
+):
+    transport, rings = _build(monkeypatch, stages=2, depth=depth)
     first, second = rings[0, 0], rings[1, 0]
     warmups = [threading.Thread(target=r.warmup, daemon=True) for r in (first, second)]
     for t in warmups:
@@ -342,11 +348,11 @@ def test_a_stage_that_runs_ahead_holds_at_most_depth_forwards(monkeypatch, depth
     ahead = threading.Thread(target=run_first, daemon=True)
     ahead.start()
     # The second stage has posted nothing: the first sends nothing and stops
-    # once ``depth`` forwards wait in its queue.
-    assert _until(lambda: len(queued) == depth)
+    # once ``depth + 1`` forwards wait in its queue.
+    assert _until(lambda: len(queued) == depth + 1)
     ahead.join(0.3)
-    assert ahead.is_alive() and len(queued) == depth
-    assert first.sent == 0 and len(first._sends) == depth
+    assert ahead.is_alive() and len(queued) == depth + 1
+    assert first.sent == 0 and len(first._sends) == depth + 1
 
     results = []
 
@@ -365,9 +371,7 @@ def test_a_stage_that_runs_ahead_holds_at_most_depth_forwards(monkeypatch, depth
     assert first.sent == len(rows)
     for g, h, extra in results:
         assert torch.equal(h, torch.full((rows[g], HIDDEN), g + 1.5))
-        assert torch.equal(
-            extra, torch.full((rows[g], SIDE_WIDTH), g, dtype=torch.int32)
-        )
+        assert extra is None
 
 
 def test_the_self_test_catches_data_from_the_wrong_sender(monkeypatch):
@@ -707,18 +711,14 @@ def test_the_hbm_reserve_covers_every_buffer_the_ring_holds():
 @pytest.mark.parametrize(
     ("stages", "depth", "carried", "posted"),
     [
-        # the last of two stages holds only the step it runs
-        (2, 50, 1, 1),
-        (2, 50, 2, 2),
-        # no more than the six steps the engine keeps in flight: four stages
-        # and two more
-        (4, 50, 1, 6),
-        # a stage that sends: the step it begins and ``depth`` unsent forwards
-        (8, 2, 1, 3),
-        (8, 2, 2, 6),
-        (8, 6, 1, 7),
-        (8, 7, 1, 8),
-        (4, 3, 2, 8),
+        (1, 2, 1, 0),
+        (2, 1, 2, 6),
+        (2, 5, 1, 7),
+        (4, 4, 1, 6),
+        (8, 2, 1, 4),
+        (8, 2, 2, 8),
+        (8, 5, 1, 7),
+        (8, 6, 1, 8),
     ],
 )
 def test_receives_a_device_can_have_posted(stages, depth, carried, posted):
@@ -728,8 +728,9 @@ def test_receives_a_device_can_have_posted(stages, depth, carried, posted):
 def test_a_ring_deeper_than_the_receive_flags_is_refused(monkeypatch):
     with pytest.raises(ValueError, match="at most 8 receives can be outstanding"):
         _build(monkeypatch, stages=4, side=True, depth=3)
-    _build(monkeypatch, stages=4, side=True, depth=2)
-    _build(monkeypatch, stages=2, side=True, depth=10)
+    _build(monkeypatch, stages=4, side=True, depth=1)
+    with pytest.raises(ValueError, match="at most 8 receives"):
+        _build(monkeypatch, stages=2, side=True, depth=2)
 
 
 def test_rows_beyond_the_hand_off_are_refused(monkeypatch):

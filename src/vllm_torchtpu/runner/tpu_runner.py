@@ -1190,6 +1190,9 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
+        from vllm_torchtpu.runner.pp_prefill_output import create
+
+        self._pp_prefill_output = create(self)
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -5522,6 +5525,9 @@ class TPUModelRunner(GPUModelRunner):
         # keeps proposing from the host-materialized output in the sync block
         # below.
         is_async = bool(self.scheduler_config.async_scheduling)
+        defer_prefill = (
+            self._pp_prefill_output is not None and self._pp_prefill_output.active
+        )
         eagle3_drafts = None
         if (
             self._is_async_drafter
@@ -5535,7 +5541,7 @@ class TPUModelRunner(GPUModelRunner):
                         discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
                         num_rejected_tokens_np=None,
                         scheduler_output=scheduler_output,
-                        return_device=is_async,
+                        return_device=is_async or defer_prefill,
                         next_tokens_per_chunk=next_tokens_per_chunk,
                     )
             else:
@@ -5572,7 +5578,7 @@ class TPUModelRunner(GPUModelRunner):
                         discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
                         num_rejected_tokens_np=None,
                         scheduler_output=scheduler_output,
-                        return_device=is_async,
+                        return_device=is_async or defer_prefill,
                         device_seed=device_seed,
                     )
         if self._adaptive_verification is not None:
@@ -5746,6 +5752,10 @@ class TPUModelRunner(GPUModelRunner):
                 copy_state=copy_state,
                 discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
             )
+
+        if defer_prefill:
+            assert self._pp_prefill_output is not None
+            return self._pp_prefill_output.wrap(async_output, eagle3_drafts, req_ids)
 
         if not self.scheduler_config.async_scheduling:
             final_output = async_output.get_output()

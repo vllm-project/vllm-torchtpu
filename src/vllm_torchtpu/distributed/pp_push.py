@@ -238,7 +238,9 @@ def ring_extra_steps(stages: int) -> int:
     Half the stage count reached the floor on an eight-stage prefill
     engine; one extra step recovered half of the gain.
     """
-    return max(1, stages // 2)
+    from vllm_torchtpu import envs
+
+    return envs.TPU_PP_RING_EXTRA_STEPS or max(1, stages // 2)
 
 
 def rpc_ring_chunks(stages: int, extra: int = 0) -> int:
