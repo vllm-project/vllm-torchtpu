@@ -76,7 +76,7 @@ def _engine_config(**overrides):
         kv_cache_dtype="fp8",
         max_num_seqs=4,
         max_model_len=1 << 20,
-        max_num_batched_tokens=8256,
+        max_num_batched_tokens=16448,
         num_speculative_tokens=7,
         num_speculative_tokens_per_batch_size=((1, 1, 7), (2, 4, 3)),
     )
@@ -90,9 +90,9 @@ def test_aggregate_capabilities_and_role_configs():
     assert caps.roles == frozenset({"prefill", "decode"})
     assert caps.speculation == "dspark" and caps.num_speculative_tokens == 7
     assert caps.page_aligned_chunks and caps.block_copies
-    assert caps.max_step_tokens == 8256
+    assert caps.max_step_tokens == 16448
     prefill = role_config(config, "prefill")
-    assert prefill.role == "prefill" and prefill.max_num_batched_tokens == 8192
+    assert prefill.role == "prefill" and prefill.max_num_batched_tokens == 16384
     assert prefill.num_speculative_tokens == 0
     k3.check(prefill)
     decode = role_config(config, "decode")
@@ -297,7 +297,7 @@ def test_aggregate_aligns_prefiller_pool_order_to_decoder_mesh_rank(
         seen["decoder_tp_rank"] = tp_rank
         return types.SimpleNamespace(rank=8)
 
-    def fake_prefiller(cfg, presharded, draft, *, tp_rank):
+    def fake_prefiller(cfg, presharded, draft, *, tp_rank, compute_logits):
         seen["prefiller_tp_rank"] = tp_rank
         return types.SimpleNamespace(rank=8)
 
