@@ -103,11 +103,10 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_raiden_pd_completion", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
-    # API-server request routing (DPLBAsyncMPClient, API-server process only);
-    # no-op unless VLLM_TPU_DP_PLACEMENT.
-    Patch(
-        "vllm_torchtpu.core.dp_placement:install_if_enabled", ("platform_activation",)
-    ),
+    # API-server request routing (DPLBAsyncMPClient); no-op unless
+    # VLLM_TPU_DP_PLACEMENT. _ACTIVE like every platform-activation patch
+    # (tests/platforms/test_patch_registry.py); a no-op in TPU workers.
+    Patch("vllm_torchtpu.core.dp_placement:install_if_enabled", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
