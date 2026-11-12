@@ -11,23 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TensorCore MoE dispatch and combine for large EP batches.
+"""TensorCore MoE combine for large EP batches.
 
-Under expert parallelism only about 1/8 of the routes of a token are local,
-so the SparseCore kernels (`ragged_gather_v2`, `ragged_gather_reduce_v3`) move
-little data per launch yet leave the TensorCore waiting for them. These two
-kernels do the same row movement on the TensorCore with one row DMA per local
-route:
-
-* `tc_row_gather` -- dispatch: `out[i] = x[rows[i]]` for `i < count`.
-* `tc_combine` -- combine: `out[t] = sum_k w[t, k] * y[pos[t, k]]` over the
-  valid routes of token `t`, accumulated in f32 in `k` order starting from
-  +0.0 and rounded to bf16 once, which is the arithmetic of
-  `ragged_gather_reduce_v3`.
-
-BF16 rows are packed two to a 32-bit word in HBM, so both kernels move the
-32-bit pair row that holds a route's row and pick the half on the VPU (the
-same scheme the SparseCore kernels use).
+Under expert parallelism only about 1/8 of a token's routes are local, so the
+SparseCore gather-reduce (`ragged_gather_reduce_v3`) moves little data yet the
+TensorCore waits for it (~280 us per MoE layer at 8192 tokens). `tc_slab_combine`
+computes the same result on the TensorCore:
+`out[t] = sum_k w[t, k] * y[pos[t, k]]` over the valid routes of token `t`,
+products and sum in f32 in top-k order starting from +0.0, one bf16 rounding.
 """
 
 import functools
@@ -38,229 +29,243 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-_HALF_MASK = -65536  # 0xFFFF0000 as int32
-
-
-def _as_pairs(ref):
-    """bf16 [R, H] HBM ref -> u32 [R // 2, H] pair-row view (u32 input as is)."""
-    if ref.dtype == jnp.uint32:
-        return ref
-    return ref.bitcast(jnp.uint32)
-
-
-def _row_dma(src_pairs, row, dst, dst_row, sem):
-    return pltpu.make_async_copy(
-        src_pairs.at[pl.ds(jnp.right_shift(row, 1), 1)],
-        dst.at[pl.ds(dst_row, 1)],
-        sem,
-    )
-
-
-def _half_to_f32(words, odd):
-    """u32 pair-row words -> f32 value of the even (low) or odd (high) row."""
-    bits = jnp.where(
-        odd,
-        jnp.bitwise_and(words, jnp.uint32(0xFFFF0000)),
-        jnp.left_shift(words, jnp.uint32(16)),
-    )
-    return lax.bitcast_convert_type(bits, jnp.float32)
-
-
 # --------------------------------------------------------------------------
-# combine
+# combine from aligned slabs (MXU selection)
 # --------------------------------------------------------------------------
+#
+# A token block's routed rows lie in at most 16 contiguous runs of the
+# expert-sorted GMM output (one per local expert; the counting sort keeps
+# tokens ascending inside an expert). The kernel DMAs the aligned 16-row slabs
+# that hold them (contiguous 16 x H bf16 = whole HBM tiles, unlike single-row
+# copies) and selects each token's rows with a 0/1 bf16 matmul: one nonzero
+# term per output element, so the f32 result is the row value exactly. The
+# weights, the top-k-order f32 sum from +0.0 and the bf16 rounding then follow
+# `ragged_gather_reduce_v3`.
+
+_SLAB = 16
+_GROUP = 8  # slabs per selection matmul (128 rows)
 
 
-def _combine_kernel(
+def _slab_kernel(
     # scalar prefetch
-    cnt0_ref,  # [nb] int32: slot-0 DMAs per block
-    nex_ref,  # [nb] int32: extra routes per block
+    slabs_ref,  # [nb * scap] int32 sorted unique slab ids of each block
+    nsl_ref,  # [nb] int32 slabs per block
+    nex_ref,  # [nb] int32 extra routes per block
+    count_ref,  # [1] int32 valid GMM rows
     # inputs
-    pos0_cur_ref,  # SMEM [tb] int32 (current block), -1 = no local route
-    pos0_nxt_ref,  # SMEM [tb] int32 (next block)
-    exp_cur_ref,  # SMEM [xcap] int32 extra-route rows (current block)
-    exp_nxt_ref,  # SMEM [xcap] int32 (next block)
     ext_ref,  # SMEM [xcap] int32 extra-route token (block-local)
     exw_ref,  # SMEM [xcap] f32 extra-route weight
-    p0v_ref,  # VMEM [tb, 1] int32 slot-0 row (-1 = none)
-    w0v_ref,  # VMEM [tb, 1] f32 slot-0 weight
-    y_hbm,  # [M, H] bf16 (or [M/2, H] u32 pairs) in HBM
+    srow0_ref,  # VMEM [tb, 1] int32 staged row of the first local route (-1)
+    w0_ref,  # VMEM [tb, 1] f32
+    srowx_ref,  # VMEM [xcap, 1] int32 staged row of each extra route
+    y_hbm,  # [M, H] bf16 HBM
     # output
     out_ref,  # VMEM [tb, H] bf16
     # scratch
-    stage0,  # VMEM [2, tb, H] u32
-    stagex,  # VMEM [2, xcap, H] u32
+    stage,  # VMEM [2, scap * 16, H] bf16
     acc_ref,  # VMEM [tb, H] f32
+    gx_ref,  # VMEM [xcap, H] f32
     sems,  # DMA (2,)
 ):
     b = pl.program_id(0)
     nb = pl.num_programs(0)
-    tb = stage0.shape[1]
-    y32 = _as_pairs(y_hbm)
+    scap = stage.shape[1] // _SLAB
+    xcap = gx_ref.shape[0]
+    hidden = stage.shape[2]
+    rows_g = _GROUP * _SLAB
 
-    def issue(pos0_ref, exp_ref, blk, slot):
-        def one0(i, c):
-            p = pos0_ref[i]
+    def slab_copy(blk, j, slot):
+        sid = slabs_ref[blk * scap + j]
+        return pltpu.make_async_copy(
+            y_hbm.at[pl.ds(pl.multiple_of(sid * _SLAB, _SLAB), _SLAB)],
+            stage.at[slot, pl.ds(pl.multiple_of(j * _SLAB, _SLAB), _SLAB)],
+            sems.at[slot],
+        )
 
-            @pl.when(p >= 0)
-            def _():
-                _row_dma(y32, p, stage0.at[slot], i, sems.at[slot]).start()
-
+    def issue(blk, slot):
+        def one(j, c):
+            slab_copy(blk, j, slot).start()
             return c
 
-        lax.fori_loop(0, tb, one0, 0)
-
-        def onex(j, c):
-            _row_dma(y32, exp_ref[j], stagex.at[slot], j, sems.at[slot]).start()
-            return c
-
-        lax.fori_loop(0, nex_ref[blk], onex, 0)
+        lax.fori_loop(0, nsl_ref[blk], one, 0)
 
     @pl.when(b == 0)
     def _():
-        issue(pos0_cur_ref, exp_cur_ref, b, 0)
+        issue(b, 0)
 
     slot = b % 2
+    nsl = nsl_ref[b]
 
-    def wait_one(i, c):
-        pltpu.make_async_copy(
-            y32.at[pl.ds(0, 1)], stage0.at[slot, pl.ds(0, 1)], sems.at[slot]
-        ).wait()
+    def wait_one(j, c):
+        slab_copy(b, 0, slot).wait()
         return c
 
-    lax.fori_loop(0, cnt0_ref[b] + nex_ref[b], wait_one, 0)
+    lax.fori_loop(0, nsl, wait_one, 0)
 
     @pl.when(b + 1 < nb)
     def _():
-        issue(pos0_nxt_ref, exp_nxt_ref, b + 1, 1 - slot)
+        issue(b + 1, 1 - slot)
 
-    p0 = p0v_ref[...]
-    val = _half_to_f32(stage0[slot], jnp.bitwise_and(p0, 1) == 1) * w0v_ref[...]
-    # +0.0 start: a -0.0 product lands as +0.0, as `0 + x` does in v3.
-    acc_ref[...] = jnp.where((p0 >= 0) & (val != 0), val, 0.0)
+    ng = (nsl + _GROUP - 1) // _GROUP
+    zero_slab = jnp.zeros((_SLAB, hidden), stage.dtype)
+
+    # Slabs past nsl inside the last group hold stale (or never written)
+    # rows; the selection multiplies them by 0, so they must be finite.
+    def clear(j, c):
+        stage[slot, pl.ds(pl.multiple_of(j * _SLAB, _SLAB), _SLAB), :] = zero_slab
+        return c
+
+    lax.fori_loop(nsl, ng * _GROUP, clear, 0)
+
+    # Rows at or past `count` were never written by the GMM: only the slab
+    # holding row count - 1 can contain such rows.
+    count = count_ref[0]
+
+    @pl.when(nsl > 0)
+    def _():
+        j = nsl - 1
+        sid = slabs_ref[b * scap + j]
+        rows = sid * _SLAB + lax.broadcasted_iota(jnp.int32, (_SLAB, 1), 0)
+        sl = pl.ds(pl.multiple_of(j * _SLAB, _SLAB), _SLAB)
+        stage[slot, sl, :] = jnp.where(rows < count, stage[slot, sl, :], 0)
+
+    srow0 = srow0_ref[...]
+    srowx = srowx_ref[...]
+    acc_ref[...] = jnp.zeros_like(acc_ref)
+    gx_ref[...] = jnp.zeros_like(gx_ref)
+    lanes = lax.broadcasted_iota(jnp.int32, (1, rows_g), 1)
+
+    def group(g, c):
+        base = g * rows_g
+        s = stage[slot, pl.ds(pl.multiple_of(base, rows_g), rows_g), :]
+        p0 = (srow0 == lanes + base).astype(s.dtype)
+        acc_ref[...] += jnp.dot(p0, s, preferred_element_type=jnp.float32)
+        px = (srowx == lanes + base).astype(s.dtype)
+        gx_ref[...] += jnp.dot(px, s, preferred_element_type=jnp.float32)
+        return c
+
+    lax.fori_loop(0, ng, group, 0)
+
+    val = acc_ref[...] * w0_ref[...]
+    # +0.0 start: a -0.0 (or a selected +-0.0) lands as +0.0, as in v3.
+    acc_ref[...] = jnp.where((srow0 >= 0) & (val != 0), val, 0.0)
 
     def addx(j, c):
-        p = exp_cur_ref[j]
         t = ext_ref[j]
-        row = stagex[slot, pl.ds(j, 1), :]
-        v = _half_to_f32(row, jnp.bitwise_and(p, 1) == 1) * exw_ref[j]
+        v = gx_ref[pl.ds(j, 1), :] * exw_ref[j]
         acc_ref[pl.ds(t, 1), :] = acc_ref[pl.ds(t, 1), :] + v
         return c
 
     lax.fori_loop(0, nex_ref[b], addx, 0)
+    del xcap
     out_ref[...] = acc_ref[...].astype(out_ref.dtype)
 
 
-def combine_metadata(indices, weights, valid, *, topk: int, tb: int, xcap: int):
-    """Route metadata for `tc_combine` (all TensorCore XLA ops, no gathers).
-
-    Returns (pos0 [T], w0 [T] f32, cnt0 [nb], ex_pos [nb*xcap], ex_t [nb*xcap],
-    ex_w [nb*xcap] f32, nex [nb], overflow scalar bool).
-    """
+def slab_metadata(indices, weights, valid, *, topk: int, tb: int, scap: int, xcap: int):
+    """Route metadata for `tc_slab_combine` (TensorCore XLA ops, no gathers)."""
     t = indices.size // topk
     nb = t // tb
-    pos = indices.reshape(t, topk).astype(jnp.int32)
+    big = jnp.int32(1 << 30)
+    pos = indices.reshape(nb, tb * topk).astype(jnp.int32)
+    v = valid.reshape(nb, tb * topk)
+    sid = jnp.where(v, jnp.right_shift(pos, 4), big)
+    s1 = jnp.sort(sid, axis=1)
+    first = jnp.concatenate(
+        [jnp.ones((nb, 1), bool), s1[:, 1:] != s1[:, :-1]], axis=1
+    ) & (s1 != big)
+    uniq = jnp.sort(jnp.where(first, s1, big), axis=1)[:, :scap]
+    nsl = jnp.sum(first, axis=1, dtype=jnp.int32)
+    # Staged row of every route: slab rank inside the block, then row in slab.
+    rank = jnp.sum(uniq[:, None, :] < sid[:, :, None], axis=2, dtype=jnp.int32)
+    srow = jnp.where(v, rank * _SLAB + jnp.bitwise_and(pos, _SLAB - 1), -1)
+    srow = srow.reshape(t, topk)
     w = weights.reshape(t, topk).astype(jnp.float32)
-    v = valid.reshape(t, topk)
-    # First valid route of each token (select chain, no gather).
-    pos0 = jnp.full((t,), -1, jnp.int32)
+    vv = valid.reshape(t, topk)
+    srow0 = jnp.full((t,), -1, jnp.int32)
     w0 = jnp.zeros((t,), jnp.float32)
     for k in reversed(range(topk)):
-        pos0 = jnp.where(v[:, k], pos[:, k], pos0)
-        w0 = jnp.where(v[:, k], w[:, k], w0)
-    rank = jnp.cumsum(v.astype(jnp.int32), axis=1)
-    extra = v & (rank >= 2)
-    # Compact the extra routes of each block in (token, k) order: a stable sort
-    # on "not extra" carries the payloads with it.
+        srow0 = jnp.where(vv[:, k], srow[:, k], srow0)
+        w0 = jnp.where(vv[:, k], w[:, k], w0)
+    extra = vv & (jnp.cumsum(vv.astype(jnp.int32), axis=1) >= 2)
     key = jnp.logical_not(extra).reshape(nb, tb * topk).astype(jnp.int32)
     tloc = jnp.broadcast_to(
-        jnp.arange(tb, dtype=jnp.int32)[:, None], (tb, topk)
-    ).reshape(1, tb * topk)
-    tloc = jnp.broadcast_to(tloc, (nb, tb * topk))
-    _, ex_pos, ex_t, ex_w = lax.sort(
-        (key, pos.reshape(nb, tb * topk), tloc, w.reshape(nb, tb * topk)),
+        jnp.broadcast_to(jnp.arange(tb, dtype=jnp.int32)[:, None], (tb, topk)).reshape(
+            1, tb * topk
+        ),
+        (nb, tb * topk),
+    )
+    _, ex_srow, ex_t, ex_w = lax.sort(
+        (key, srow.reshape(nb, tb * topk), tloc, w.reshape(nb, tb * topk)),
         dimension=1,
         is_stable=True,
         num_keys=1,
     )
     nex = jnp.sum(extra.reshape(nb, tb * topk), axis=1, dtype=jnp.int32)
-    cnt0 = jnp.sum((pos0 >= 0).reshape(nb, tb), axis=1, dtype=jnp.int32)
-    overflow = jnp.any(nex > xcap)
-    return (
-        pos0,
-        w0,
-        cnt0,
-        ex_pos[:, :xcap].reshape(-1),
-        ex_t[:, :xcap].reshape(-1),
-        ex_w[:, :xcap].reshape(-1),
-        jnp.minimum(nex, xcap),
-        overflow,
+    overflow = jnp.any(nsl > scap) | jnp.any(nex > xcap)
+    count = jnp.sum(valid, dtype=jnp.int32).reshape(1)
+    # Unused extra slots select nothing (-1).
+    ex_srow = jnp.where(
+        jnp.arange(xcap)[None, :] < nex[:, None], ex_srow[:, :xcap], -1
+    )
+    return dict(
+        slabs=uniq.reshape(-1),
+        nsl=jnp.minimum(nsl, scap),
+        nex=jnp.minimum(nex, xcap),
+        count=count,
+        ex_t=ex_t[:, :xcap].reshape(-1),
+        ex_w=ex_w[:, :xcap].reshape(-1),
+        ex_srow=ex_srow.reshape(-1),
+        srow0=srow0,
+        w0=w0,
+        overflow=overflow,
     )
 
 
-def tc_combine_ok(num_tokens: int, hidden: int, rows: int, tb: int = 128) -> bool:
-    return num_tokens % tb == 0 and hidden % 128 == 0 and rows % 2 == 0
+def tc_slab_combine_ok(num_tokens: int, hidden: int, tb: int = 256) -> bool:
+    return num_tokens % tb == 0 and hidden % 128 == 0
 
 
 @functools.partial(
-    jax.jit, static_argnames=("topk", "tb", "xcap", "interpret", "vmem_mb")
+    jax.jit, static_argnames=("topk", "tb", "scap", "xcap", "interpret", "vmem_mb")
 )
-def tc_combine(
+def tc_slab_combine(
     y,
     indices,
     weights,
     valid,
     *,
     topk: int,
-    tb: int = 128,
-    xcap: int = 64,
+    tb: int = 256,
+    scap: int = 64,
+    xcap: int = 128,
     interpret: bool = False,
-    vmem_mb: int = 48,
+    vmem_mb: int = 60,
 ):
-    """out[t] = bf16(sum over valid k, in k order, of f32(w[t,k]) * y[idx[t,k]]).
-
-    Returns (out [T, H] bf16, overflow bool). On overflow (a block with more
-    than `xcap` extra routes) the result is incomplete and the caller must use
-    another combine.
-    """
+    """Same result as `tc_combine` / v3; returns (out [T, H] bf16, overflow)."""
     hidden = y.shape[-1]
     t = indices.size // topk
     nb = t // tb
-    pos0, w0, cnt0, ex_pos, ex_t, ex_w, nex, overflow = combine_metadata(
-        indices, weights, valid, topk=topk, tb=tb, xcap=xcap
-    )
+    md = slab_metadata(indices, weights, valid, topk=topk, tb=tb, scap=scap, xcap=xcap)
     smem = pltpu.MemorySpace.SMEM if hasattr(pltpu, "MemorySpace") else pltpu.SMEM
-    last = nb - 1
-
-    def cur(b, *_):
-        return (b,)
-
-    def nxt(b, *_):
-        return (jnp.minimum(b + 1, last),)
-
-    in_specs = [
-        pl.BlockSpec((tb,), cur, memory_space=smem),
-        pl.BlockSpec((tb,), nxt, memory_space=smem),
-        pl.BlockSpec((xcap,), cur, memory_space=smem),
-        pl.BlockSpec((xcap,), nxt, memory_space=smem),
-        pl.BlockSpec((xcap,), cur, memory_space=smem),
-        pl.BlockSpec((xcap,), cur, memory_space=smem),
-        pl.BlockSpec((tb, 1), lambda b, *_: (b, 0)),
-        pl.BlockSpec((tb, 1), lambda b, *_: (b, 0)),
-        pl.BlockSpec(memory_space=pl.ANY),
-    ]
     out = pl.pallas_call(
-        _combine_kernel,
+        _slab_kernel,
         out_shape=jax.ShapeDtypeStruct((t, hidden), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=4,
             grid=(nb,),
-            in_specs=in_specs,
+            in_specs=[
+                pl.BlockSpec((xcap,), lambda b, *_: (b,), memory_space=smem),
+                pl.BlockSpec((xcap,), lambda b, *_: (b,), memory_space=smem),
+                pl.BlockSpec((tb, 1), lambda b, *_: (b, 0)),
+                pl.BlockSpec((tb, 1), lambda b, *_: (b, 0)),
+                pl.BlockSpec((xcap, 1), lambda b, *_: (b, 0)),
+                pl.BlockSpec(memory_space=pl.ANY),
+            ],
             out_specs=pl.BlockSpec((tb, hidden), lambda b, *_: (b, 0)),
             scratch_shapes=[
-                pltpu.VMEM((2, tb, hidden), jnp.uint32),
-                pltpu.VMEM((2, xcap, hidden), jnp.uint32),
+                pltpu.VMEM((2, scap * _SLAB, hidden), jnp.bfloat16),
                 pltpu.VMEM((tb, hidden), jnp.float32),
+                pltpu.VMEM((xcap, hidden), jnp.float32),
                 pltpu.SemaphoreType.DMA((2,)),
             ],
         ),
@@ -269,185 +274,17 @@ def tc_combine(
             vmem_limit_bytes=vmem_mb * 1024 * 1024,
         ),
         interpret=pltpu.InterpretParams() if interpret else False,
-        name="moe_tc_combine",
+        name="moe_tc_slab_combine",
     )(
-        cnt0,
-        nex,
-        pos0,
-        pos0,
-        ex_pos,
-        ex_pos,
-        ex_t,
-        ex_w,
-        pos0[:, None],
-        w0[:, None],
+        md["slabs"],
+        md["nsl"],
+        md["nex"],
+        md["count"],
+        md["ex_t"],
+        md["ex_w"],
+        md["srow0"][:, None],
+        md["w0"][:, None],
+        md["ex_srow"][:, None],
         y,
     )
-    return out, overflow
-
-
-# --------------------------------------------------------------------------
-# dispatch (row gather)
-# --------------------------------------------------------------------------
-
-
-def _gather_kernel(
-    count_ref,  # SMEM [1] int32 (scalar prefetch)
-    tok_hbm,  # [M] int32 HBM: source row of each output row
-    tokv_hbm,  # [M // 2, 2] int32 HBM (same data, for parity vectors)
-    x_hbm,  # [T, H] bf16 (or [T/2, H] u32) HBM
-    out_hbm,  # [M, H] bf16 HBM (output, written for rows < count rounded up)
-    tok_smem,  # SMEM [2, tbd] int32
-    tokv,  # VMEM [2, tbd // 2, 2] int32
-    stage,  # VMEM [2, tbd, H] u32: even rows first, then odd rows
-    obuf,  # VMEM [2, tbd // 2, H] u32
-    sems,  # DMA (6,): rows x2, tok x2, out x2
-):
-    tbd = stage.shape[1]
-    half = tbd // 2
-    x32 = _as_pairs(x_hbm)
-    o32 = _as_pairs(out_hbm)
-    count = count_ref[0]
-    nblk = (count + tbd - 1) // tbd
-
-    def tok_copy(blk, slot):
-        return (
-            pltpu.make_async_copy(
-                tok_hbm.at[pl.ds(blk * tbd, tbd)], tok_smem.at[slot], sems.at[2 + slot]
-            ),
-            pltpu.make_async_copy(
-                tokv_hbm.at[pl.ds(blk * half, half)], tokv.at[slot], sems.at[2 + slot]
-            ),
-        )
-
-    def issue_rows(blk, slot):
-        n = jnp.minimum(count - blk * tbd, tbd)
-
-        def one(i, c):
-            dst = jnp.right_shift(i, 1) + jnp.bitwise_and(i, 1) * half
-            _row_dma(x32, tok_smem[slot, i], stage.at[slot], dst, sems.at[slot]).start()
-            return c
-
-        lax.fori_loop(0, n, one, 0)
-
-    def wait_rows(blk, slot):
-        n = jnp.minimum(count - blk * tbd, tbd)
-
-        def one(i, c):
-            pltpu.make_async_copy(
-                x32.at[pl.ds(0, 1)], stage.at[slot, pl.ds(0, 1)], sems.at[slot]
-            ).wait()
-            return c
-
-        lax.fori_loop(0, n, one, 0)
-
-    def out_copy(blk, slot):
-        return pltpu.make_async_copy(
-            obuf.at[slot], o32.at[pl.ds(blk * half, half)], sems.at[4 + slot]
-        )
-
-    @pl.when(nblk > 0)
-    def _():
-        for c in tok_copy(0, 0):
-            c.start()
-        for c in tok_copy(0, 0):
-            c.wait()
-        issue_rows(0, 0)
-
-        @pl.when(nblk > 1)
-        def _():
-            for c in tok_copy(1, 1):
-                c.start()
-
-    def body(blk, c):
-        slot = blk % 2
-        nslot = 1 - slot
-
-        @pl.when(blk + 1 < nblk)
-        def _():
-            for cp in tok_copy(blk + 1, nslot):
-                cp.wait()
-            issue_rows(blk + 1, nslot)
-
-        wait_rows(blk, slot)
-
-        @pl.when(blk >= 2)
-        def _():
-            out_copy(blk - 2, slot).wait()
-
-        tv = tokv[slot]
-        pa = jnp.bitwise_and(tv[:, 0:1], 1) == 1
-        pb = jnp.bitwise_and(tv[:, 1:2], 1) == 1
-        a = stage[slot, pl.ds(0, half), :]
-        bb = stage[slot, pl.ds(half, half), :]
-        lo = jnp.where(
-            pa, jnp.right_shift(a, jnp.uint32(16)), jnp.bitwise_and(a, jnp.uint32(0xFFFF))
-        )
-        hi = jnp.where(
-            pb,
-            jnp.bitwise_and(bb, jnp.uint32(0xFFFF0000)),
-            jnp.left_shift(bb, jnp.uint32(16)),
-        )
-        obuf[slot] = jnp.bitwise_or(lo, hi)
-        out_copy(blk, slot).start()
-
-        # The token chunk two blocks ahead reuses this slot's SMEM buffer,
-        # whose row DMAs were all issued above.
-        @pl.when(blk + 2 < nblk)
-        def _():
-            for cp in tok_copy(blk + 2, slot):
-                cp.start()
-
-        return c
-
-    lax.fori_loop(0, nblk, body, 0)
-
-    @pl.when(nblk >= 2)
-    def _():
-        out_copy(nblk - 2, nblk % 2).wait()
-
-    @pl.when(nblk >= 1)
-    def _():
-        out_copy(nblk - 1, (nblk - 1) % 2).wait()
-
-
-@functools.partial(jax.jit, static_argnames=("tbd", "interpret", "vmem_mb"))
-def tc_row_gather(
-    x, rows, count, *, tbd: int = 256, interpret: bool = False, vmem_mb: int = 48
-):
-    """out[i] = x[rows[i]] for i < count; rows past count are unspecified.
-
-    x: [T, H] bf16 (T even); rows: [M] int32 (M % tbd == 0); count: [1] int32.
-    """
-    m = rows.shape[0]
-    hidden = x.shape[-1]
-    assert m % tbd == 0 and tbd % 16 == 0
-    rows = rows.astype(jnp.int32)
-    out_dtype = x.dtype
-    out_rows = m if out_dtype == jnp.bfloat16 else m // 2
-    return pl.pallas_call(
-        _gather_kernel,
-        out_shape=jax.ShapeDtypeStruct((out_rows, hidden), out_dtype),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            grid=(1,),
-            in_specs=[
-                pl.BlockSpec(memory_space=pl.ANY),
-                pl.BlockSpec(memory_space=pl.ANY),
-                pl.BlockSpec(memory_space=pl.ANY),
-            ],
-            out_specs=pl.BlockSpec(memory_space=pl.ANY),
-            scratch_shapes=[
-                pltpu.SMEM((2, tbd), jnp.int32),
-                pltpu.VMEM((2, tbd // 2, 2), jnp.int32),
-                pltpu.VMEM((2, tbd, hidden), jnp.uint32),
-                pltpu.VMEM((2, tbd // 2, hidden), jnp.uint32),
-                pltpu.SemaphoreType.DMA((6,)),
-            ],
-        ),
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=vmem_mb * 1024 * 1024,
-        ),
-        interpret=pltpu.InterpretParams() if interpret else False,
-        name="moe_tc_row_gather",
-    )(count.reshape(1).astype(jnp.int32), rows, rows.reshape(m // 2, 2), x)
+    return out, md["overflow"]

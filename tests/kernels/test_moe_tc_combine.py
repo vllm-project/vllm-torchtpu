@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TensorCore MoE dispatch / combine (interpret mode, u32 pair-row inputs)."""
+"""TensorCore MoE slab combine vs the v3 combine arithmetic (interpret mode)."""
 
 import jax
 import jax.numpy as jnp
@@ -21,20 +21,7 @@ import pytest
 from vllm_torchtpu.kernels.megablox import moe_tc_combine as K
 
 TOPK = 4
-E = 32
-
-
-def _pairs(a):
-    u = np.asarray(a).view(np.uint16).astype(np.uint32)
-    return jnp.asarray(u[0::2] | (u[1::2] << 16))
-
-
-def _unpairs(p):
-    p = np.asarray(p)
-    out = np.empty((p.shape[0] * 2, p.shape[1]), np.uint16)
-    out[0::2] = (p & 0xFFFF).astype(np.uint16)
-    out[1::2] = (p >> 16).astype(np.uint16)
-    return out
+E = 128
 
 
 def _routes(t, local, seed):
@@ -67,24 +54,32 @@ def _v3_reference(y, pos, w, valid):
 
 
 @pytest.mark.parametrize(
-    "local,seed,xcap,expect_overflow",
-    [(8, 0, 32, False), (32, 2, 256, False), (16, 3, 4, True)],
+    "t,local,seed,scap,xcap,expect_overflow",
+    [
+        (512, 16, 0, 64, 128, False),
+        (1024, 16, 1, 64, 128, False),
+        (768, 8, 5, 64, 128, False),
+        (512, 32, 4, 128, 1024, False),
+        (512, 32, 3, 8, 128, True),  # more slabs than staged
+        (512, 32, 6, 64, 4, True),  # more extra routes than staged
+    ],
 )
-def test_combine_bitwise(local, seed, xcap, expect_overflow):
-    t, h = 256, 256
+def test_slab_combine_bitwise(t, local, seed, scap, xcap, expect_overflow):
+    h = 256
     _, valid, _, pos, w, rng = _routes(t, local, seed)
     count = int(valid.sum())
     y = (rng.standard_normal((t * TOPK, h)) * 3).astype(np.float32)
-    y[count:] = np.nan  # rows past the computed prefix are never read
+    y[count:] = np.nan  # rows past the computed prefix are never written
     y[0, :7] = -0.0
     yb = jnp.asarray(y).astype(jnp.bfloat16)
-    out, overflow = K.tc_combine(
-        _pairs(yb),
+    out, overflow = K.tc_slab_combine(
+        yb,
         jnp.asarray(pos),
         w.reshape(-1),
         jnp.asarray(valid.reshape(-1)),
         topk=TOPK,
-        tb=64,
+        tb=256,
+        scap=scap,
         xcap=xcap,
         interpret=True,
     )
@@ -92,35 +87,3 @@ def test_combine_bitwise(local, seed, xcap, expect_overflow):
     if not expect_overflow:
         ref = _v3_reference(yb, pos, w, valid)
         np.testing.assert_array_equal(np.asarray(out).view(np.uint16), ref)
-
-
-@pytest.mark.parametrize("count_override", [None, 0, 64, 65])
-def test_row_gather_bitwise(count_override):
-    t, h = 256, 256
-    _, valid, order, _, _, rng = _routes(t, 8, 4)
-    count = int(valid.sum()) if count_override is None else count_override
-    x = jnp.asarray(rng.standard_normal((t, h)).astype(np.float32)).astype(jnp.bfloat16)
-    rows = (order // TOPK).astype(np.int32)
-    g = K.tc_row_gather(
-        _pairs(x), jnp.asarray(rows), jnp.asarray([count], jnp.int32), tbd=64, interpret=True
-    )
-    got = _unpairs(g)[:count]
-    want = np.asarray(x).view(np.uint16)[rows[:count]]
-    np.testing.assert_array_equal(got, want)
-
-
-def test_combine_metadata_first_route_and_extras():
-    valid = np.array([[0, 1, 1, 0], [0, 0, 0, 0], [1, 1, 1, 1], [1, 0, 0, 1]], bool)
-    valid = np.tile(valid, (32, 1))  # 128 tokens, one block of 128
-    pos = np.arange(valid.size, dtype=np.int32)
-    w = jnp.ones(valid.size, jnp.bfloat16)
-    pos0, _, cnt0, ex_pos, ex_t, _, nex, overflow = K.combine_metadata(
-        jnp.asarray(pos), w, jnp.asarray(valid.reshape(-1)), topk=TOPK, tb=128, xcap=256
-    )
-    pos0 = np.asarray(pos0)
-    assert pos0[0] == 1 and pos0[1] == -1 and pos0[2] == 8 and pos0[3] == 12
-    assert int(cnt0[0]) == 96
-    # extras in (token, k) order: token 0 -> k2; token 2 -> k1,k2,k3; token 3 -> k3
-    assert int(nex[0]) == 32 * 5 and not bool(overflow)
-    assert list(np.asarray(ex_pos)[:5]) == [2, 9, 10, 11, 15]
-    assert list(np.asarray(ex_t)[:5]) == [0, 2, 2, 2, 3]
