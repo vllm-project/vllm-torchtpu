@@ -14,10 +14,12 @@
 """MiniMax M3 checkpoint quantization: MXFP8 linears, NVFP4 routed experts.
 
 The checkpoint's `quant_method: mxfp8` config also carries the routed experts'
-compressed-tensors NVFP4 scheme (`moe_quant_algo`). MXFP8 linears are
-dequantized to bf16 at load: an e4m3 value times a power-of-two scale is exact
-in bf16, so this keeps the checkpoint's numerics. The experts reuse the TPU
-NVFP4 MoE path after renaming the compressed-tensors tensors to ModelOpt's.
+compressed-tensors NVFP4 scheme (`moe_quant_algo`). The target model's MXFP8
+linears stay e4m3 with one power-of-two scale per output channel
+(`requantize_mxfp8_per_channel`), which halves the weight bytes every decode
+step streams; the DSpark draft's linears are dequantized to bf16, which its
+column-parallel matmuls read raw. The experts reuse the TPU NVFP4 MoE path
+after renaming the compressed-tensors tensors to ModelOpt's.
 """
 
 from typing import Any
@@ -34,6 +36,10 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
     VllmNvfp4Config,
     VllmNvfp4MoEMethod,
@@ -43,7 +49,10 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedLinearMethod,
 )
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
+
+logger = init_logger(__name__)
 
 QUANT_METHOD = "mxfp8"
 MXFP8_BLOCK = 32
@@ -73,9 +82,38 @@ def dequantize_mxfp8(weight: torch.Tensor, scale_e8m0: torch.Tensor) -> torch.Te
     return (w * scale.unsqueeze(-1)).view(out_dim, in_dim).to(torch.bfloat16)
 
 
+def requantize_mxfp8_per_channel(
+    weight: torch.Tensor, scale_e8m0: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """MXFP8 ``weight[n, k]`` (e4m3, e8m0 scale per ``[1, 32]`` block) as e4m3
+    ``[k, n]`` times a power-of-two scale per output channel, plus how many
+    elements changed value.
+
+    Each block is shifted by a power of two onto its channel's largest block
+    scale, so an element is exact unless the shift takes it below e4m3's
+    normal range; a matmul against it, rounded once and scaled by a power of
+    two, then equals the bf16 dequantized matmul."""
+    out_dim, in_dim = weight.shape
+    exp = scale_e8m0.to(torch.int32)
+    top = exp.amax(dim=1, keepdim=True)
+    shift = torch.exp2((exp - top).to(torch.float32))
+    w = weight.to(torch.float32).view(out_dim, in_dim // MXFP8_BLOCK, MXFP8_BLOCK)
+    w = (w * shift.unsqueeze(-1)).view(out_dim, in_dim)
+    w8 = w.to(torch.float8_e4m3fn)
+    changed = int((w8.to(torch.float32) != w).sum().item())
+    channel_scale = torch.exp2(top.squeeze(1).to(torch.float32) - _E8M0_BIAS)
+    return w8.transpose(0, 1).contiguous(), channel_scale, changed
+
+
 @register_weight_loader_v2_supported_method
 class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
-    """Loads e4m3 weights with ``[1, 32]`` e8m0 scales, runs in bf16."""
+    """Loads e4m3 weights with ``[1, 32]`` e8m0 scales. With ``keep_fp8`` a
+    bias-free linear runs on e4m3 weights with a per-channel power-of-two
+    scale (``requantize_mxfp8_per_channel``); otherwise on bf16."""
+
+    def __init__(self, keep_fp8: bool = False) -> None:
+        super().__init__()
+        self.keep_fp8 = keep_fp8
 
     def create_weights(
         self,
@@ -123,13 +161,44 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
             ),
         )
 
+    def _runs_fp8(self, layer: torch.nn.Module) -> bool:
+        return (
+            self.keep_fp8
+            and getattr(layer, "bias", None) is None
+            and not getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        weight = dequantize_mxfp8(layer.weight.data, layer.weight_scale.data)
-        del layer.weight_scale
+        if not self._runs_fp8(layer):
+            weight = dequantize_mxfp8(layer.weight.data, layer.weight_scale.data)
+            del layer.weight_scale
+            replace_parameter(
+                layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
+            )
+            VllmUnquantizedLinearMethod().process_weights_after_loading(layer)
+            return
+        weight, scale, changed = requantize_mxfp8_per_channel(
+            layer.weight.data, layer.weight_scale.data
+        )
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
         )
-        VllmUnquantizedLinearMethod().process_weights_after_loading(layer)
+        replace_parameter(
+            layer,
+            "weight_scale",
+            torch.nn.Parameter(scale.to(torch.bfloat16), requires_grad=False),
+        )
+        setattr(layer, WEIGHT_FLIPPED_ATTR, True)
+        if weight.device.type == "tpu":
+            synchronize_tensors([layer.weight, layer.weight_scale])
+        logger.info_once(
+            "MXFP8 linears run on e4m3 weights with per-channel power-of-two "
+            "scales (first: %s, %d of %d elements below e4m3's normal range "
+            "after the block shift).",
+            str(tuple(weight.shape)),
+            changed,
+            weight.numel(),
+        )
 
     def apply(
         self,
@@ -137,7 +206,10 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return VllmUnquantizedLinearMethod().apply(layer, x, bias)
+        if not hasattr(layer, "weight_scale"):
+            return VllmUnquantizedLinearMethod().apply(layer, x, bias)
+        # The scale is a power of two, so this rounds once, like x @ bf16(W).
+        return torch.matmul(x, layer.weight.to(x.dtype)) * layer.weight_scale
 
 
 class MiniMaxM3Nvfp4MoEMethod(VllmNvfp4MoEMethod):
@@ -196,16 +268,20 @@ class MiniMaxM3QuantConfig(VllmNvfp4Config):
                 f"MiniMax M3 TPU quantization supports {expected}, got {got}."
             )
         old, new = _DSPARK_PREFIX
+        ignored = config.get("ignored_layers") or []
         exclude_modules = [
             new + name.removeprefix(old) if name.startswith(old) else name
-            for name in config.get("ignored_layers") or []
+            for name in ignored
         ]
-        return cls(
+        quant_config = cls(
             quant_method="NVFP4",
             is_checkpoint_nvfp4_serialized=True,
             exclude_modules=exclude_modules,
             group_size=_NVFP4_GROUP,
         )
+        # The draft checkpoint names its modules under the dspark prefix.
+        quant_config.fp8_linears = not any(name.startswith(old) for name in ignored)
+        return quant_config
 
     def _get_checkpoint_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -214,7 +290,7 @@ class MiniMaxM3QuantConfig(VllmNvfp4Config):
         if isinstance(layer, LinearBase):
             if excluded:
                 return VllmUnquantizedLinearMethod()
-            return MiniMaxM3Mxfp8LinearMethod()
+            return MiniMaxM3Mxfp8LinearMethod(getattr(self, "fp8_linears", False))
         if isinstance(layer, RoutedExperts):
             if excluded:
                 return VllmUnquantizedFusedMoEMethod(self.get_moe_config(layer))
