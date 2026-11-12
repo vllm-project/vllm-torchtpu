@@ -220,6 +220,9 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    TPU_FUSED_ADD_RMSNORM: bool = False
+    TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
+    TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
 
 
 def env_with_choices(
@@ -1343,6 +1346,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # Run (fused add +) RMSNorm on >= MIN_TOKENS rows of a residual stream at least
+    # MIN_HIDDEN wide as one Pallas pass instead of XLA's reduce and apply passes.
+    # Same residual; the normalized output is within 2 bf16 ulp.
+    "TPU_FUSED_ADD_RMSNORM": env_bool("TPU_FUSED_ADD_RMSNORM"),
+    "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS": env_int(
+        "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS", 512
+    ),
+    "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN": env_int(
+        "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN", 4096
     ),
 }
 

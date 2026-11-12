@@ -303,6 +303,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/gdn_pool_layout.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
+    "vllm_torchtpu/layers/adapter/rmsnorm.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",

@@ -308,6 +308,12 @@ class Eagle3Proposer:
             get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys()
         )
         self._load_draft_model(target_model)
+        if envs.TPU_FUSED_ADD_RMSNORM:
+            # The draft model is traced once for every token bucket, so its
+            # norms cannot branch on the token count: keep them upstream.
+            from vllm_torchtpu.layers.adapter import rmsnorm as _tpu_rmsnorm
+
+            _tpu_rmsnorm.keep_upstream_path(self.draft_model)
         all_attn_layers = get_layers_from_vllm_config(
             self.vllm_config, AttentionLayerBase
         )
