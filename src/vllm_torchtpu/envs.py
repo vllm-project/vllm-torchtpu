@@ -333,6 +333,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PLE_HOST_OVERLAP: bool = False
     VLLM_TPU_PLE_HOST_OVERLAP_CHECK: int = 0
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
+    VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL: bool = False
     VLLM_TPU_DEFER_PREV_RESULTS_WAIT: bool = False
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
     VLLM_TPU_CPU_PIN: str = "off"
@@ -2406,6 +2407,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # _async_draft_seed). Partial-prefill overrides keep the eager path.
     "VLLM_TPU_FUSED_ASYNC_DRAFT_SEED": env_bool(
         "VLLM_TPU_FUSED_ASYNC_DRAFT_SEED", default=True
+    ),
+    # With VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: keep the fused seed program on
+    # steps with a partial (chunked) prefill too. Each partial-prefill
+    # request's known next prompt token enters the program as a [width]
+    # override vector (-1 = no override) instead of sending the whole step to
+    # the eager path. The program always takes the vector while this is on,
+    # so the warmed keys stay the same set. Bit-identical to the eager path.
+    "VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL": env_bool(
+        "VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL", default=False
     ),
     # Spec decode on hybrid models: scatter the post-verify mamba read
     # offsets of all groups in one compiled program instead of ~10 eager ones
