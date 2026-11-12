@@ -324,6 +324,7 @@ def _plan_effect(field: str, g: Any, ex: mk.ExecSpec) -> Any:
         "gqa.gqa_qv": bp["gqa"].QV,
         "rel_fetch": sp.rel_fetch,
         "moe.moe_group_rows": bp["moe"].group_rel,
+        "moe.ep_fast_refill": bp["moe"].ep_fast,
     }.get(field)
 
 

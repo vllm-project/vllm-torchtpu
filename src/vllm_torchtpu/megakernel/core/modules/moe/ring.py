@@ -184,6 +184,48 @@ def _arm_issue(m: MoEEmit, r13, r2, w, bank, t, td, gate):
         stream.ecopy("e2", r2.at[w, td - T13], bank).start()
 
 
+def slot_of(m: MoEEmit, i):
+    """Source slot of hit-list entry `i` as `_unit_meta` derives it (EP: the
+    expert row within this rank's weights); `i` is clamped to the list, so
+    callers gate on `i < n_hit`."""
+    me, mp, scr = m.me, m.mp, m.scr
+    lst = scr["wlist"] if mp.ECOPY else scr["elist"]
+    ic = jnp.minimum(i, lst.shape[0] - 1)
+    if mp.ECOPY:
+        return scr["wlist"][ic]
+    e = scr["elist"][ic]
+    return e if mp.moe_tp else e - me * mp.ER
+
+
+def refill_static(m: MoEEmit, l_idx, items, gate):
+    """Issue ring refills `[(w, t, bank, gate_i)]` (tile `t` of source slot `w`
+    into a trace-time bank) in one per-layer `bswitch`, all skipped unless
+    `gate` holds (`gate_i` None: no further condition)."""
+    W, mp, stream = m.W, m.mp, m.stream
+    T13 = mp.T13
+
+    def arm(r13, r2):
+        for w, t, bank, g in items:
+
+            def go(w=w, t=t, bank=bank):
+                if t < T13:
+                    stream.ecopy("e13", r13.at[w, t], bank).start()
+                else:
+                    stream.ecopy("e2", r2.at[w, t - T13], bank).start()
+
+            if g is None:
+                go()
+            else:
+                pl.when(g)(go)
+
+    @pl.when(gate)
+    def _():
+        bswitch(
+            l_idx,
+            [lambda a=a, b=b: arm(a, b) for a, b in zip(W["e13"], W["e2"])],
+        )
+
+
 def egive_group(m: MoEEmit, items, l_idx):
     """Release a batch of expert units together under a single per-layer `bswitch`."""
     W, mp, scr = m.W, m.mp, m.scr

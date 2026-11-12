@@ -79,6 +79,15 @@ def synth_full_scale_spec(*, moe_tp: bool = False, R: int = 8) -> ModelSpec:
     return synth_hybrid_spec(E=512, TOPK=10, I=1024, IS=1024, moe_tp=moe_tp, R=R, **kw)
 
 
+# Extras of the candidate4 schedule options' flips (Qwen3.5 tiny geometry, R=2):
+# PIPE_EP with one expert per ring (I=512, ebank 128 KiB: TE = 3 = nbe).
+_PIPE_EP1 = {
+    "geom_kw": {"moe_tp": False, "I": 512},
+    "moe.pipe_ep": True,
+    "ebank": 128 << 10,
+    "nbe": 3,
+}
+
 EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ("nbd", "nbd", 8, (2, 4), {}),
     ("nkv", "gqa.nkv", 4, (2, 4), {}),
@@ -102,6 +111,7 @@ EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ("pair_kv-wide", "gqa.pair_kv", True, (4, 24), {}),
     ("kv_ering-wide", "gqa.kv_ering", True, (4, 24), {}),
     ("gqa_qv-wide", "gqa.gqa_qv", True, (4, 24), {}),
+    ("ep_fast_refill", "moe.ep_fast_refill", True, (2, 4), _PIPE_EP1),
 ]
 
 __all__ = [

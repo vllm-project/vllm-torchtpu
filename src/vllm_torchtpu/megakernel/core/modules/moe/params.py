@@ -66,6 +66,9 @@ class MoEParams:
     zero_centered_norm: bool
     sh13_scaled: bool = True
     sh2_scaled: bool = True
+    # `MoETunables.ep_fast_refill` resolved: PIPE_EP with one whole expert per
+    # ring (NBE == TE) and unstacked expert weights.
+    ep_fast: bool = False
 
 
 @dataclass(frozen=True)
@@ -125,7 +128,7 @@ class MoETunables:
         "sh2_pre_route": "approx",
         "flush_in_ar1": "approx",
         "sh_at": "approx",
-        "ep_fast_refill": "approx",
+        "ep_fast_refill": "exact",  # same DMAs, static banks
         "cp_interleave": "approx",  # copy-slot scan order (Po2C is greedy)
         "route_early": "approx",
         "flush_pre_drain": "approx",
@@ -269,4 +272,5 @@ def derive_moe_params(
         zero_centered_norm=bool(getattr(g, "zero_centered_norm", True)),
         sh13_scaled=bool(sh13_scaled),
         sh2_scaled=bool(sh2_scaled),
+        ep_fast=bool(tt.ep_fast_refill and pipe_ep and nbe == te and not ex.stack_e),
     )

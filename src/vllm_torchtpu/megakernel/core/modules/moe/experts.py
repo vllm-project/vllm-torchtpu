@@ -22,7 +22,15 @@ from jax.experimental import pallas as pl
 
 from ...ops import BF16, F32, round_bf16
 from .context import MoEEmit
-from .ring import egive, egive_group, es_wait, etake
+from .ring import (
+    _es_start,
+    egive,
+    egive_group,
+    es_wait,
+    etake,
+    refill_static,
+    slot_of,
+)
 
 
 def gate_up(m: MoEEmit, i, w13):
@@ -235,12 +243,25 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
         )
         xb2[:, :IR] = mid0.astype(BF16)
 
+        # ep_fast: with one expert per ring (NBE == TE) unit u = i * TE + t sits
+        # in the static bank t, so iteration i refills expert i + 1's w2 tiles
+        # and expert i + 2's w13 tiles into known banks: two slot lookups and
+        # bounds checks per expert and one layer dispatch per macro-step instead
+        # of a per-tile unit decode. Same DMAs into the same banks, issued after
+        # the macro-step's three tile matmuls.
+        FAST = mp.ep_fast
+
         def body_ep(i, _):
             e = scr["elist"][i]
             s_cur = i % NSS
             s_nxt = (i + 1) % NSS
             base_w2 = i * TE + T13
             base_nxt13 = (i + 1) * TE
+            if FAST:
+                w_n1 = slot_of(m, i + 1)
+                w_n2 = slot_of(m, i + 2)
+                g_n1 = i + 1 < n_hit
+                g_n2 = i + 2 < n_hit
 
             if not DIRECT0:
                 acc[:, :H] = jnp.zeros((MB, H), F32)
@@ -265,7 +286,9 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 else:
                     acc[:, :H] += mm2
                     acc13[:, :BN] += mm13_0
-                if mp.group_rel:
+                if FAST:
+                    pass
+                elif mp.group_rel:
                     egive_group(m, [(u2, T13 + s_step), (u13_0, t0)], l_idx)
                 else:
                     egive(m, u2, l_idx, T13 + s_step)
@@ -274,7 +297,23 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 w13_1 = etake(m, "e13", u13_1)
                 k13_1 = t1 * TK13
                 acc13[:, :BN] += stream.mm(xb[:, k13_1 : k13_1 + TK13], w13_1[...])
-                egive(m, u13_1, l_idx, t1)
+                if FAST:
+                    refill_static(
+                        m,
+                        l_idx,
+                        [
+                            (w_n1, T13 + s_step, T13 + s_step, None),
+                            (w_n2, t0, t0, g_n2),
+                            (w_n2, t1, t1, g_n2),
+                        ],
+                        g_n1,
+                    )
+                    if t0 == 0:
+                        pl.when(g_n2)(
+                            lambda w_n2=w_n2: _es_start(m, i + 2, w_n2, l_idx)
+                        )
+                else:
+                    egive(m, u13_1, l_idx, t1)
 
             wcol = jnp.sum(
                 jnp.where(lane_e8 == e, scr["wn"][...], 0.0),
