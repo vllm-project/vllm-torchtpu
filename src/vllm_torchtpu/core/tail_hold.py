@@ -24,8 +24,13 @@ K steps, but only while
 
 - no other prefill can run in this step (no other running request has
   prefill left, and no waiting request can be admitted), and
-- a waiting request is queued for a seat (a partner prefill is coming), and
-- some other running request still runs in the step (the step is not empty).
+- some other running request still runs in the step (the step is never
+  empty, and a request that runs alone is never held).
+
+With ``VLLM_TPU_TAIL_HOLD_REQUIRE_WAITING=1`` it also requires a waiting
+request queued for a seat (a partner prefill known to be coming). By
+default a tail may wait on an empty queue: a new request can arrive within
+K steps, and K bounds the wait either way.
 
 The tail is released as soon as it can share a step with another prefill, or
 when any held tail has waited K steps (then every held tail runs in that
@@ -84,8 +89,9 @@ class TailHold:
     """Per-scheduler hold state. ``plan`` runs once per ``schedule()``, before
     the upstream schedule; ``held_now`` is the set of request ids to skip."""
 
-    def __init__(self, steps: int) -> None:
+    def __init__(self, steps: int, require_waiting: bool = False) -> None:
         self.steps = int(steps)
+        self.require_waiting = bool(require_waiting)
         self.waited: dict[str, int] = {}
         self.held_now: frozenset[str] = frozenset()
         # Counters (tail-steps held; tails released with a partner prefill,
@@ -106,9 +112,11 @@ class TailHold:
             self._logged_on = True
             logger.info(
                 "VLLM_TPU_TAIL_HOLD_STEPS=%d: a Mamba-aligned prefill tail waits "
-                "up to %d steps for another prefill to share its step.",
+                "up to %d steps for another prefill to share its step "
+                "(require a waiting request: %s).",
                 self.steps,
                 self.steps,
+                self.require_waiting,
             )
         align, max_tail = tail_geometry(scheduler)
         running = scheduler.running
@@ -125,12 +133,12 @@ class TailHold:
         )
         num_waiting = scheduler.get_request_counts()[1]
         partner_now = other_prefill or (num_waiting > 0 and seat_free)
-        partner_pending = num_waiting > 0
+        partner_pending = num_waiting > 0 or not self.require_waiting
         step_not_empty = len(running) > len(tails)
 
         if partner_now or not partner_pending or not step_not_empty:
-            # Runs now, as upstream: with a partner, or alone because no
-            # partner can come (never starve a tail on an idle queue).
+            # Runs now, as upstream: with a partner; alone when it is the
+            # only work in the step; or (REQUIRE_WAITING) on an empty queue.
             if partner_now:
                 self.n_merged += sum(1 for rid in tail_ids if self.waited.get(rid))
             self._maybe_log()

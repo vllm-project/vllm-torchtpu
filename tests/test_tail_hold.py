@@ -216,21 +216,49 @@ def test_k2_tail_runs_alone_after_two_steps(model_config, monkeypatch):
     assert scheduler._tail_hold.n_hold_steps == 2
 
 
-def test_no_hold_when_nothing_waits(model_config, monkeypatch):
+def test_empty_queue_holds_while_others_decode(model_config, monkeypatch):
+    """Default rule: nothing waits, but `d` still decodes, so `a`'s tail may
+    wait K steps for a prefill that may arrive; then it runs alone."""
     scheduler, hasher = _scheduler(model_config, monkeypatch, steps=2)
+    _start(scheduler, hasher, waiting=False)
+    s2, s3, s4 = _steps(scheduler, 3)
+    assert "a" not in s2 and "a" not in s3 and "d" in s2 and "d" in s3
+    assert s4["a"] == PROMPT_A - B_LAST
+    assert scheduler._tail_hold.n_hold_steps == 2
+    assert scheduler._tail_hold.n_expired == 1
+
+
+def test_empty_queue_hold_released_by_an_arrival(model_config, monkeypatch):
+    scheduler, hasher = _scheduler(model_config, monkeypatch, steps=2, max_num_seqs=3)
+    _start(scheduler, hasher, waiting=False)
+    (s2,) = _steps(scheduler, 1)
+    assert "a" not in s2
+    # A new request arrives and gets the free seat: the tail rides along.
+    scheduler.add_request(_request("n", 200, hasher, 5))
+    (s3,) = _steps(scheduler, 1)
+    assert s3["a"] == PROMPT_A - B_LAST and s3["n"] > 0
+    assert scheduler._tail_hold.n_merged == 1
+
+
+def test_require_waiting_no_hold_on_empty_queue(model_config, monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_TAIL_HOLD_REQUIRE_WAITING", "1")
+    scheduler, hasher = _scheduler(model_config, monkeypatch, steps=2)
+    assert scheduler._tail_hold.require_waiting
     _start(scheduler, hasher, waiting=False)
     (s2,) = _steps(scheduler, 1)
     assert s2["a"] == PROMPT_A - B_LAST
     assert scheduler._tail_hold.n_hold_steps == 0
 
 
-def test_no_hold_when_the_step_would_be_empty(model_config, monkeypatch):
+@pytest.mark.parametrize("waiting", [True, False])
+def test_no_hold_when_the_step_would_be_empty(model_config, monkeypatch, waiting):
     scheduler, hasher = _scheduler(model_config, monkeypatch, steps=2, max_num_seqs=1)
     a = _request("a", PROMPT_A, hasher, 2)
     scheduler.add_request(a)
     assert scheduler.schedule().num_scheduled_tokens == {"a": B_LAST}
-    scheduler.add_request(_request("w", 200, hasher, 3))
-    # `w` waits for the only seat, but `a` is all that runs: no hold.
+    if waiting:
+        scheduler.add_request(_request("w", 200, hasher, 3))
+    # `a` is all that runs (`w`, if any, waits for the only seat): no hold.
     assert scheduler.schedule().num_scheduled_tokens == {"a": PROMPT_A - B_LAST}
 
 
