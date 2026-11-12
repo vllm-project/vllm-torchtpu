@@ -64,6 +64,29 @@ HEAD_PARALLEL_MIN_TOKENS = 2048
 EARLY_Q_GATHER_ENV = "TPU_MINIMAX_M3_DCP_EARLY_Q_GATHER"
 
 
+# TPU_MINIMAX_M3_DCP_HP_BUFFER_STEP=<pages>: the first head-parallel round
+# exchanges a page buffer sized to the round's pages, rounded up to a
+# multiple of this many pages (a static size per branch of a switch),
+# instead of one max-length request's buffer (256 pages per rank at c64,
+# DCP 8, max_model_len 256K). The rounds attend the same pages, so the
+# output is the same. 0 / unset = off.
+HP_BUFFER_STEP_ENV = "TPU_MINIMAX_M3_DCP_HP_BUFFER_STEP"
+
+
+def hp_buffer_step() -> int:
+    return int(os.environ.get(HP_BUFFER_STEP_ENV, "0") or 0)
+
+
+if hp_buffer_step():
+    init_logger(__name__).info(
+        "%s=%d: first head-parallel round exchanges a page buffer sized in steps "
+        "of %d pages.",
+        HP_BUFFER_STEP_ENV,
+        hp_buffer_step(),
+        hp_buffer_step(),
+    )
+
+
 def early_q_gather_enabled() -> bool:
     return os.environ.get(EARLY_Q_GATHER_ENV, "0") == "1"
 
@@ -274,8 +297,6 @@ def _head_parallel_attend(
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
     capacity = block_tables_2d.shape[1]  # logical blocks per round
     replicas = kv_head_replicas
-    part = -(-capacity // replicas)  # each replica's share of the buffer
-    buffer_pages = part * replicas
 
     selected = _own_selection(
         candidates,
@@ -290,19 +311,23 @@ def _head_parallel_attend(
     seq_blocks = -(-seq_lens // (block_size * dcp))
     blocks = jnp.where(hp_req, seq_blocks, 0)
     seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
-    page_table = jnp.arange(dcp * buffer_pages, dtype=jnp.int32)
     # Rows per kernel call (the caller pads tokens to a block_q multiple).
     window = min(num_tokens, msa_attention.MAX_TOKENS_PER_CALL)
     sel_block = jnp.maximum(selected, 0)
     own_block = pos // block_size
     limit = pos % block_size + 1
 
-    def slot(base, block):
-        # Logical block l = base + block // dcp of rank block % dcp.
-        logical = base + block // dcp
-        return ((logical // part) * dcp + block % dcp) * part + logical % part
+    def attend_round(first, acc, merge, cap=capacity):
+        # `cap`: logical blocks the round's buffer holds (static).
+        part = -(-cap // replicas)  # each replica's share of the buffer
+        buffer_pages = part * replicas
+        page_table = jnp.arange(dcp * buffer_pages, dtype=jnp.int32)
 
-    def attend_round(first, acc, merge):
+        def slot(base, block):
+            # Logical block l = base + block // dcp of rank block % dcp.
+            logical = base + block // dcp
+            return ((logical // part) * dcp + block % dcp) * part + logical % part
+
         csum = jnp.cumsum(jnp.where(seq_idx >= first, blocks, 0))
         # A request never exceeds the buffer (the block table's width); always
         # admitting `first` keeps the rounds moving if that ever broke.
@@ -372,7 +397,24 @@ def _head_parallel_attend(
         return nxt, acc
 
     first = jnp.min(jnp.where(hp_req, seq_idx, max_num_seqs))
-    first, acc = attend_round(first, None, merge=False)
+    step = hp_buffer_step()
+    sizes = list(range(step, capacity, step)) + [capacity] if step > 0 else []
+    if len(sizes) > 1:
+        # The first round's blocks, as attend_round admits them.
+        csum0 = jnp.cumsum(jnp.where(seq_idx >= first, blocks, 0))
+        admit0 = (
+            hp_req & (seq_idx >= first) & ((csum0 <= capacity) | (seq_idx == first))
+        )
+        total0 = jnp.max(jnp.where(admit0, csum0, 0))
+        index = jnp.sum(total0 > jnp.asarray(sizes[:-1], jnp.int32)).astype(jnp.int32)
+        first, acc = jax.lax.switch(
+            index,
+            [functools.partial(attend_round, merge=False, cap=c) for c in sizes],
+            first,
+            None,
+        )
+    else:
+        first, acc = attend_round(first, None, merge=False)
 
     # Further rounds sit under a cond: a while loop that reads the cache
     # makes XLA copy the whole cache ahead of it (0.45 ms per layer at c64).
