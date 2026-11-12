@@ -505,6 +505,15 @@ def outer_kernel(
         zero_copy(i).wait()
 
 
+# VLLM_TPU_GDN_V3_SINGLE_LAUNCH covers decode / verify programs only. In a
+# prefill program (thousands of rows) the single-launch kernel next to a
+# SparseCore-offloaded all-gather halts the step (c32, offload on: TC halt in
+# the following adaptive_fused_moe, SC3 tile halt), while the two-call path
+# runs clean. Decode steps never carry an all-gather above the 8 MiB offload
+# threshold, and they are where the single launch saves its ~0.24 ms.
+_SINGLE_LAUNCH_MAX_ROWS = 256
+
+
 def _both_segments_kernel(
     metadata_refs: tuple[memory_ref.MetadataRef, memory_ref.MetadataRef],
     qkv_ref: jax.Array,
@@ -1258,6 +1267,7 @@ def fused_conv1d_gdn(
         pooled
         and envs.VLLM_TPU_GDN_V3_SINGLE_LAUNCH
         and not (prefill_only or batched_only)
+        and batch_size <= _SINGLE_LAUNCH_MAX_ROWS
     ):
         # Both segments in one kernel (VLLM_TPU_GDN_V3_SINGLE_LAUNCH), each
         # with the configuration, metadata and scratch it has as its own
