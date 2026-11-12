@@ -170,6 +170,8 @@ from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
+    coarse_pad_enabled,
+    verify_logits_paddings,
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner.tpu_pooling import (
@@ -403,6 +405,32 @@ def _spec_logprob_row_tokens(
     out = torch.zeros(num_rows + 1, dtype=torch.int64, device=next_tokens.device)
     out = out.scatter(0, rows.flatten(), tokens.flatten())
     return out[:num_rows, None]
+
+
+def _verify_rows_uniform(
+    md: SpecDecodeMetadata,
+    shape: tuple[int, ...],
+    device: torch.device,
+    generator: torch.Generator | None,
+) -> torch.Tensor:
+    """`torch.rand(shape)` for a tensor over a verify chunk's padded rows
+    (``shape[0]`` = padded_logits_length).
+
+    Under spec_verify_coarse_pad the draw is taken at the token-bucket row
+    count (`md.rng_rows`) and zero-padded (or cut) to ``shape[0]``: the
+    generator advances exactly as without the key, and every real row gets
+    the same uniforms. The rows past the real ones are padding the verify
+    programs never read into a real request's result."""
+    rows = getattr(md, "rng_rows", None)
+    if rows is None or rows == shape[0]:
+        return torch.rand(shape, dtype=torch.float32, device=device, generator=generator)
+    u = torch.rand(
+        (rows, *shape[1:]), dtype=torch.float32, device=device, generator=generator
+    )
+    if rows > shape[0]:
+        return u[: shape[0]]
+    pad = [0, 0] * (len(shape) - 1) + [0, shape[0] - rows]
+    return torch.nn.functional.pad(u, pad)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -1493,6 +1521,10 @@ class TPUModelRunner(GPUModelRunner):
             self._synthetic_one_row_verify = option(
                 self.vllm_config.additional_config, "spec_synthetic_one_row_verify"
             )
+            # Verify rows padded to a coarse ladder, not the token buckets.
+            self._spec_verify_coarse_pad = coarse_pad_enabled(
+                self.vllm_config.additional_config
+            )
             # Async spec substitution as one compiled program
             # (spec_substitution_glue) and the fused verify's in-graph
             # uniforms (spec_verify_sample_fused_rng); both off by default.
@@ -1506,13 +1538,16 @@ class TPUModelRunner(GPUModelRunner):
                 self._spec_glue_fusion
                 or self._spec_synthetic_ingraph_rng
                 or self._synthetic_one_row_verify
+                or self._spec_verify_coarse_pad
             ):
                 logger.info(
                     "Spec decode opt-ins: spec_glue_fusion=%s "
-                    "spec_synthetic_ingraph_rng=%s spec_synthetic_one_row_verify=%s",
+                    "spec_synthetic_ingraph_rng=%s spec_synthetic_one_row_verify=%s "
+                    "spec_verify_coarse_pad=%s",
                     self._spec_glue_fusion,
                     self._spec_synthetic_ingraph_rng,
                     self._synthetic_one_row_verify,
+                    self._spec_verify_coarse_pad,
                 )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
@@ -4916,11 +4951,11 @@ class TPUModelRunner(GPUModelRunner):
         assert md.draft_token_ids is not None
         assert self.rejection_sampler is not None
         assert self.rejection_sampler.synthetic_conditional_rates is not None
-        accept_u = torch.rand(
-            md.draft_token_ids.shape,
-            dtype=torch.float32,
-            device=md.draft_token_ids.device,
-            generator=self._get_sampling_generator(),
+        accept_u = _verify_rows_uniform(
+            md,
+            tuple(md.draft_token_ids.shape),
+            md.draft_token_ids.device,
+            self._get_sampling_generator(),
         )
         accepted_count, rows, recover_draft = synthetic_verify_rows(
             md.draft_token_ids,
@@ -5014,11 +5049,11 @@ class TPUModelRunner(GPUModelRunner):
                 group_indices=md.group_indices,
                 max_draft_tokens=self.speculative_config.num_speculative_tokens,
                 accept_u=(
-                    torch.rand(
-                        md.draft_token_ids.shape,
-                        dtype=torch.float32,
-                        device=logits.device,
-                        generator=sampling_generator,
+                    _verify_rows_uniform(
+                        md,
+                        tuple(md.draft_token_ids.shape),
+                        logits.device,
+                        sampling_generator,
                     )
                     if self.rejection_sampler.synthetic_mode
                     else None
@@ -5109,11 +5144,11 @@ class TPUModelRunner(GPUModelRunner):
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
         if self.rejection_sampler.synthetic_mode or not all_greedy:
-            accept_u = torch.rand(
-                md.draft_token_ids.shape,
-                dtype=torch.float32,
-                device=target_logits.device,
-                generator=sampling_generator,
+            accept_u = _verify_rows_uniform(
+                md,
+                tuple(md.draft_token_ids.shape),
+                target_logits.device,
+                sampling_generator,
             )
         if all_greedy:
             return self.rejection_sampler(
@@ -5130,9 +5165,14 @@ class TPUModelRunner(GPUModelRunner):
         assert req_temperatures is not None
         assert req_top_k is not None
         assert req_top_p is not None
-        recover_u = torch.rand_like(
-            target_logits, dtype=torch.float32, generator=sampling_generator
-        )
+        if getattr(md, "rng_rows", None) is None:
+            recover_u = torch.rand_like(
+                target_logits, dtype=torch.float32, generator=sampling_generator
+            )
+        else:
+            recover_u = _verify_rows_uniform(
+                md, tuple(target_logits.shape), target_logits.device, sampling_generator
+            )
         return self.rejection_sampler(
             draft_token_ids=md.draft_token_ids,
             num_draft_tokens=md.draft_lengths,
@@ -5212,8 +5252,16 @@ class TPUModelRunner(GPUModelRunner):
             generator=sampling_generator,
         )
         bonus_u = draw((num_reqs, vocab))
-        accept_u = draw(md.draft_token_ids.shape)
-        recover_u = draw((num_tokens, vocab))
+        if getattr(md, "rng_rows", None) is None:
+            accept_u = draw(md.draft_token_ids.shape)
+            recover_u = draw((num_tokens, vocab))
+        else:
+            accept_u = _verify_rows_uniform(
+                md, tuple(md.draft_token_ids.shape), logits.device, sampling_generator
+            )
+            recover_u = _verify_rows_uniform(
+                md, (num_tokens, vocab), logits.device, sampling_generator
+            )
         return fused_spec_verify.spec_verify_sample_fused(
             logits,
             md.bonus_logits_indices,
@@ -6801,7 +6849,7 @@ class TPUModelRunner(GPUModelRunner):
         """
         assert self.speculative_config is not None
         k = self.speculative_config.num_speculative_tokens
-        tokens_paddings = sorted(self.num_tokens_paddings)
+        tokens_paddings = sorted(verify_logits_paddings(self))
         idx = bisect.bisect_left(tokens_paddings, num_tokens)
         prev_num_tokens = tokens_paddings[idx - 1] if idx > 0 else 0
         idx = bisect.bisect_left(self.num_reqs_paddings, num_reqs)
@@ -6840,8 +6888,13 @@ class TPUModelRunner(GPUModelRunner):
                     lengths.append(num_reqs)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
-                # A verify step selects one row per verified token.
-                lengths += [n for n in spec_lens if n <= num_tokens]
+                # A verify step selects one row per verified token: n real
+                # rows, n <= num_tokens, padded to a verify row count.
+                if spec_lens:
+                    most = _get_padded_token_len(
+                        spec_lens, min(num_tokens, spec_lens[-1])
+                    )
+                    lengths += [n for n in spec_lens if n <= most]
                 for num_rows in sorted(set(lengths)):
                     indices = torch.zeros(num_rows, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
@@ -6856,7 +6909,7 @@ class TPUModelRunner(GPUModelRunner):
         if self.speculative_config is None:
             return []
         K = self.speculative_config.num_speculative_tokens
-        pads = list(self.num_tokens_paddings)
+        pads = verify_logits_paddings(self)
         most = _get_padded_token_len(pads, min(self.max_num_reqs * (1 + K), pads[-1]))
         return [n for n in pads if n <= most]
 
@@ -6942,7 +6995,7 @@ class TPUModelRunner(GPUModelRunner):
         max_target_rows = (
             self.structured_decoding_manager.target_grammar_bitmask_cpu.shape[0]
         )
-        return [n for n in self.num_tokens_paddings if n <= max_target_rows]
+        return [n for n in verify_logits_paddings(self) if n <= max_target_rows]
 
     def _precompile_min_tokens_mask(self) -> None:
         with self._precompile_timed("min_tokens_mask"):
@@ -7065,13 +7118,16 @@ class TPUModelRunner(GPUModelRunner):
         pads = list(self.num_tokens_paddings)
         capacities = self._chunk_request_capacities()
         max_logits = min(max(capacities) * (1 + K), pads[-1])
-        max_logits_len = _get_padded_token_len(pads, max_logits)
+        # A step's logits rows (at most its tokens and a full chunk of
+        # windows) pad to a verify row count, which can exceed the step's
+        # token bucket under spec_verify_coarse_pad.
+        verify_pads = verify_logits_paddings(self)
         subtract = [(t, c) for t in pads for c in capacities]
         extract = [
             (t, length)
             for t in pads
-            for length in pads
-            if length <= min(t, max_logits_len)
+            for length in verify_pads
+            if length <= _get_padded_token_len(verify_pads, min(t, max_logits))
         ]
         return subtract, extract
 
@@ -7148,12 +7204,13 @@ class TPUModelRunner(GPUModelRunner):
         """
         assert self.speculative_config is not None
         k = self.speculative_config.num_speculative_tokens
+        verify_pads = verify_logits_paddings(self)
         max_logits_len = _get_padded_token_len(
-            self.num_tokens_paddings,
-            min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
+            verify_pads,
+            min(self.max_num_reqs * (k + 1), verify_pads[-1]),
         )
         with self._precompile_timed("spec_logprobs"):
-            for num_tokens in self.num_tokens_paddings:
+            for num_tokens in verify_pads:
                 if num_tokens > max_logits_len:
                     break
                 final_logits_indices = torch.zeros(
@@ -7247,14 +7304,15 @@ class TPUModelRunner(GPUModelRunner):
         # Use min here because num_reqs*(K+1) can exceed max_num_batched_tokens
         # (which is the largest bucket), and logits rows never exceed the largest
         # bucket.
+        verify_pads = verify_logits_paddings(self)
         max_logits_len = _get_padded_token_len(
-            self.num_tokens_paddings,
-            min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
+            verify_pads,
+            min(self.max_num_reqs * (k + 1), verify_pads[-1]),
         )
         # The (padded_logits_length, padded_num_reqs) shapes, in the order
         # the runtime buckets follow.
         pairs = []
-        for num_tokens in self.num_tokens_paddings:
+        for num_tokens in verify_pads:
             if num_tokens > max_logits_len:
                 break
             for num_reqs in self.num_reqs_paddings:
