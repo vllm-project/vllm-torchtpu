@@ -2568,7 +2568,6 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
                 selected,
                 axis_name="k3_sp",
                 eps=1e-5,
-                shared_reduced=True,
             )
 
         result = jax.lax.cond(
@@ -2788,7 +2787,6 @@ def _make_moe_compound(
                 selected,
                 axis_name="k3_sp",
                 eps=1e-5,
-                shared_reduced=True,
             )
 
         fits = [

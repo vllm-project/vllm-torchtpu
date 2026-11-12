@@ -9,7 +9,6 @@ import os
 import numpy as np
 import pytest
 
-from vllm_torchtpu.megakernel.kimi_k3.config import KernelConfig
 from vllm_torchtpu.megakernel.kimi_k3.kernels import rank_loader as rl
 
 pytestmark = pytest.mark.cpu_test
@@ -117,9 +116,3 @@ def test_shipped_plan_is_valid():
     order = np.load(path)["order"]
     assert order.shape == (92, 896)
     assert all(sorted(row) == list(range(896)) for row in order.tolist())
-
-
-@pytest.mark.parametrize("ep", [8, 32])
-def test_plan_places_only_ep16_experts(ep):
-    with pytest.raises(ValueError, match="EP16"):
-        KernelConfig(prefill_expert_parallel=ep, prefill_expert_plan="plan.npz")

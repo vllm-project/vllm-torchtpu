@@ -308,7 +308,7 @@ def test_prefill_ep16_loader_matches_the_ep16_decode(monkeypatch, preshard, rank
     monkeypatch.setattr(rl, "_config", lambda: KernelConfig(prefill_expert_plan=plan))
     parts: dict[str, list] = {}
     for _, name, value in rl.iter_prefill_rank(
-        root, root / "prefill-sp-cache", rank, layers=LAYERS, split_experts=True
+        root, root / "prefill-sp-cache", rank, layers=LAYERS
     ):
         parts.setdefault(name.partition("@")[0], []).append(value)
     for name in (*SHAPES, "router", "router_bias"):

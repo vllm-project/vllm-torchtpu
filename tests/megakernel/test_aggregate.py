@@ -220,18 +220,10 @@ def test_prefill_loader_skips_shared_families(monkeypatch, preshard):
     monkeypatch.setattr(
         rank_loader, "_config", lambda: KernelConfig(decode_expert_parallel=16)
     )
-    full = {
-        name
-        for _, name, _ in rank_loader.iter_prefill_rank(
-            root, cache, 0, split_experts=True
-        )
-    }
+    full = {name for _, name, _ in rank_loader.iter_prefill_rank(root, cache, 0)}
     skip = frozenset(rank_loader.PREFILL_SHARED)
     left = [
-        (g, n)
-        for g, n, _ in rank_loader.iter_prefill_rank(
-            root, cache, 0, split_experts=True, skip=skip
-        )
+        (g, n) for g, n, _ in rank_loader.iter_prefill_rank(root, cache, 0, skip=skip)
     ]
     assert sorted(n for _, n in left) == sorted(
         ["k_o", "m_o", "latent_down", "latent_up", "shared_gu", "shared_down"]
@@ -242,20 +234,10 @@ def test_prefill_loader_skips_shared_families(monkeypatch, preshard):
     }
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        KernelConfig(),  # an EP8 decode
-        KernelConfig(prefill_expert_parallel=8),
-        KernelConfig(prefill_expert_parallel=8, decode_expert_parallel=16),
-    ],
-)
-def test_prefill_loader_shares_experts_only_with_an_ep16_decode(
-    monkeypatch, preshard, config
-):
+def test_prefill_loader_shares_experts_only_with_an_ep16_decode(monkeypatch, preshard):
     root, cache = preshard
     experts = frozenset(rank_loader.EXPERT_FAMILIES)
-    monkeypatch.setattr(rank_loader, "_config", lambda: config)
+    monkeypatch.setattr(rank_loader, "_config", lambda: KernelConfig())
     with pytest.raises(ValueError, match="EP16 decode"):
         list(rank_loader.iter_prefill_rank(root, cache, 0, skip=experts))
 
@@ -327,17 +309,10 @@ def test_aggregate_aligns_prefiller_pool_order_to_decoder_mesh_rank(
     assert seen == {"decoder_tp_rank": 0, "prefiller_tp_rank": 8}
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        KernelConfig(),  # an EP8 decode
-        KernelConfig(prefill_expert_parallel=8, decode_expert_parallel=16),
-    ],
-)
-def test_aggregate_needs_one_shared_ep16_expert_copy(monkeypatch, tmp_path, config):
+def test_aggregate_needs_one_shared_ep16_expert_copy(monkeypatch, tmp_path):
     from vllm_torchtpu.megakernel.kimi_k3 import aggregate as agg_mod
 
-    monkeypatch.setattr(agg_mod, "active", lambda: config)
+    monkeypatch.setattr(agg_mod, "active", lambda: KernelConfig())
     with pytest.raises(NotImplementedError, match="EP16/TP2"):
         KimiAggregate(_engine_config(), tmp_path, tp_rank=0)
 

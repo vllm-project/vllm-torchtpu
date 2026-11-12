@@ -5847,141 +5847,9 @@ def routed_experts(
     )
 
 
-def _moe_latent_all_gather(latent, tables):
-    """Gather BF16 SP latents in mesh-rank order using the TP32 ring.
-
-    The gather's owners are mesh ranks, independent of the routed-output
-    ring's token ownership permutation.
-    """
-    rows, width = latent.shape
-    regions = _regions(rows, width)
-    streams, buffers = len(regions), 2
-    return pl.pallas_call(
-        functools.partial(_all_gather_kernel, regions=regions, buffers=buffers),
-        out_shape=jax.ShapeDtypeStruct((32 * rows, width), latent.dtype),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            grid=(1, 32),
-            in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),),
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-            scratch_shapes=(
-                pltpu.SemaphoreType.DMA((streams,)),
-                pltpu.SemaphoreType.DMA((streams,)),
-                pltpu.SemaphoreType.DMA((buffers + 1, streams)),
-                pltpu.SemaphoreType.REGULAR((streams,)),
-                pltpu.SemaphoreType.DMA((streams,)),
-                pltpu.VMEM((buffers + 1, rows, width), latent.dtype),
-            ),
-        ),
-        compiler_params=pltpu.CompilerParams(
-            collective_id=41,
-            vmem_limit_bytes=3 * rows * width * 2 + 8 * 1024**2,
-        ),
-        name="kimi_prefill_moe_latent_ag",
-    )(jnp.asarray(tables, jnp.int32), latent)
-
-
-def moe_local_routed(hidden_local, length, weights, *, axis_name, gather_tables):
-    """This rank's routed-expert partial for every token of the window, and
-    its FP32 half of the TP2 shared expert over its chip's rows (reduced
-    across the chip pair in the tail).
-
-    Routing is sequence-parallel (each rank routes its own ``T/32`` rows);
-    the latent, ids and probabilities are then gathered so that each EP
-    shard runs its experts over all tokens (``routed_experts``). The caller's
-    reduce-scatter ring sums the partials. ``latent_down`` is [7168,4096] on
-    every rank; 112 local experts (EP8/TP4), 56 (EP16/TP2) or 28 (EP32).
-    """
-    rank = jax.lax.axis_index(axis_name)
-    local_tokens, hidden_width = hidden_local.shape
-    if hidden_width != 7168:
-        raise ValueError("K3 sequence-parallel MoE expects [T/32,7168]")
-    if weights["latent_down"].shape[-2:] != (7168, 4096):
-        raise ValueError("latent projection weights must use replicated SP layout")
-    local_experts = weights["expert_gu"].shape[-3]
-    if local_experts not in (28, 56, 112):
-        raise ValueError("K3 SP MoE requires EP32, EP16/TP2 or EP8/TP4 expert weights")
-    expert_tp = 32 * local_experts // 896
-    tokens = local_tokens * 32
-
-    logits = jax.lax.dot_general(
-        hidden_local, weights["router"], (((1,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32,
-    )
-    raw = jax.nn.sigmoid(logits)
-    _, local_ids = jax.lax.top_k(raw + weights["router_bias"], 16)
-    local_probs = jnp.take_along_axis(raw, local_ids, axis=1)
-    local_probs /= jnp.maximum(local_probs.sum(axis=1, keepdims=True), 1e-30)
-    valid_rows = sp_token_index(
-        rank, jnp.arange(local_tokens), window_stripe(local_tokens)) < length.reshape(())
-    local_probs = jnp.where(valid_rows[:, None], local_probs, 0)
-
-    if weights["latent_down"].ndim == 3:  # the resident family: select the layer in the kernel
-        latent_local = gmm_v2(
-            hidden_local, weights["latent_down"][:, None], jnp.full((1,), local_tokens, jnp.int32),
-            rhs_layer=weights["expert_layer"], maybe_quantize_lhs=False, zero_initialize=False)
-    else:
-        latent_local = hidden_local @ weights["latent_down"]
-    latent_all = _moe_latent_all_gather(latent_local[:, :3584], gather_tables)
-    # One all-gather for ids and probability bits.
-    routes = jnp.concatenate(
-        (local_ids.astype(jnp.int32), jax.lax.bitcast_convert_type(local_probs, jnp.int32)), axis=1)
-    routes = jax.lax.all_gather(routes, axis_name).reshape(tokens, 32)
-    ids_all = routes[:, :16]
-    probs_all = jax.lax.bitcast_convert_type(routes[:, 16:], jnp.float32)
-    routed = routed_experts(
-        latent_all, ids_all, probs_all,
-        weights["expert_gu"], weights["expert_gus"],
-        weights["expert_down"], weights["expert_ds"],
-        first_expert=(rank // expert_tp) * local_experts,
-        expert_layer=weights.get("expert_layer"),
-    )
-    shared = _moe_sp_shared_partial(_moe_sp_shared_rows(hidden_local, axis_name), weights)
-    return routed, shared
-
-
-SHARED_PAIRS = tuple((2 * i, 2 * i + 1) for i in range(16))  # the chip-local TP2 groups
-
-
-def _moe_sp_shared_rows(hidden_local, axis_name):
-    """Both cores' token rows of this chip, for the TP2 shared expert."""
-    local_tokens = hidden_local.shape[0]
-    return jax.lax.all_gather(hidden_local, axis_name, axis_index_groups=SHARED_PAIRS).reshape(
-        2 * local_tokens, 7168)
-
-
-def _moe_sp_shared_partial(chip_rows, weights):
-    """This core's half of the shared expert over the chip's rows: FP32
-    partials for _moe_sp_shared_reduce. Pure matmuls (no collectives), so
-    it can overlap SparseCore work."""
-    # One-group GMMs: the shared expert's M (the chip's rows) is small, and
-    # the GMM keeps each weight tile on the MXU for all of it, with the
-    # activation fused on the FP32 accumulator.
-    rows = jnp.full((1,), chip_rows.shape[0], jnp.int32)
-    # Resident layer families ([L, ...]): the kernel selects the layer (a
-    # sliced operand would be copied).
-    family = weights["shared_gu"].ndim == 3
-    layer = dict(rhs_layer=weights["expert_layer"]) if family else {}
-
-    def one_group(w):
-        return w[:, None] if family else w[None]
-
-    shared_mid = gmm_v2(chip_rows, one_group(weights["shared_gu"]), rows, maybe_quantize_lhs=False,
-                        zero_initialize=False, fuse_act="situ:4:25", **layer)
-    return gmm_v2(shared_mid, one_group(weights["shared_down"]), rows, maybe_quantize_lhs=False,
-                  zero_initialize=False, preferred_element_type=jnp.float32, **layer)
-
-
-def _moe_sp_shared_reduce(partial, axis_name):
-    return jax.lax.psum_scatter(
-        partial, axis_name, scatter_dimension=0, tiled=True, axis_index_groups=SHARED_PAIRS,
-    ).astype(jnp.bfloat16)
-
-
-def _moe_sp_tail(routed, shared, prefix_local, length, weights, *,
-                 axis_name, eps, shared_reduced=False):
+def _moe_sp_tail(routed, shared, prefix_local, length, weights, *, axis_name, eps):
     """Finish the routed branch from local reduced MoE rows and add the
-    shared expert's rows."""
+    shared expert's (reduced) rows."""
     rank = jax.lax.axis_index(axis_name)
     local_tokens = prefix_local.shape[0]
     valid_rows = sp_token_index(
@@ -5990,105 +5858,9 @@ def _moe_sp_tail(routed, shared, prefix_local, length, weights, *,
     routed *= jax.lax.rsqrt(jnp.mean(routed*routed, axis=1, keepdims=True)+eps)
     routed = (routed * weights["latent_norm"][:, :3584]).astype(jnp.bfloat16)
     up = routed @ weights["latent_up"]
-    if not shared_reduced:
-        shared = _moe_sp_shared_reduce(shared, axis_name)
     output = (up + shared).astype(jnp.bfloat16)
     output = jnp.where(valid_rows[:, None], output, 0)
     return (prefix_local + output).astype(jnp.bfloat16)
-
-
-def make_moe_fused_sp_repacked(mesh, *, seq_len, eps=1e-5, collective_id=42,
-                               token_ranks=None):
-    """Build the TP32 MoE layer for repacked projection weights: the local
-    routed partials, their reduce-scatter ring, then the latent-up and
-    shared-expert tail on each rank's rows."""
-    if tuple(mesh.axis_names) != ("k3_sp",):
-        raise ValueError("MoE Pallas ring reduction needs k3_sp")
-    check_window(seq_len, "MoE Pallas ring reduction")
-    axis_name = mesh.axis_names[0]
-    if token_ranks is None:
-        token_ranks = tuple(range(32))
-    tables = ring_tables(list(mesh.devices.flat), token_ranks)
-    gather_tables = ring_tables(list(mesh.devices.flat), tuple(range(32)))
-    local_tokens = seq_len // 32
-
-    def local_partial(hidden, prefix, weights, length):
-        local_weights = jax.tree.map(lambda value: value[0], weights)
-        routed, shared = moe_local_routed(
-            hidden[0], length, local_weights, axis_name=axis_name,
-            gather_tables=gather_tables,
-        )
-        return routed[None], shared[None]
-
-    partial_op = jax.jit(jax.shard_map(
-        local_partial, mesh=mesh,
-        in_specs=(P(axis_name), P(axis_name), P(axis_name), P()),
-        out_specs=(P(axis_name), P(axis_name)), check_vma=False,
-    ))
-
-    def local_tail(reduced, shared, prefix, weights, length):
-        local_weights = jax.tree.map(lambda value: value[0], weights)
-        return _moe_sp_tail(
-            reduced[0], shared[0], prefix[0], length, local_weights,
-            axis_name=axis_name, eps=eps,
-        )[None]
-
-    tail_op = jax.jit(jax.shard_map(
-        local_tail, mesh=mesh,
-        in_specs=(P(axis_name), P(axis_name), P(axis_name),
-                  P(axis_name), P()),
-        out_specs=P(axis_name), check_vma=False,
-    ))
-
-    def run_ring(hidden, prefix, weights, length):
-        partials, shared = partial_op(hidden, prefix, weights, length)
-        reduced = ring_reduce_scatter_fp32(
-            partials, mesh, tables,
-            collective_id=collective_id, dtype=jnp.float32,
-        )
-        reduced = reduced.reshape(32, local_tokens, 3584)
-        return tail_op(reduced, shared, prefix, weights, length)
-
-    return jax.jit(run_ring)
-
-
-def repack_moe_projection_weights_for_rank(weights_by_rank, rank):
-    """Convert the TP32 checkpoint projection shards to SP layout for one rank.
-
-    The input is a host mapping of 32-rank NumPy arrays. Expert and router
-    weights stay on their checkpoint shards; only the four dense projection
-    families are returned here. A checkpoint loader can construct the same
-    four arrays directly without materializing all 32 output copies.
-    """
-    if rank not in range(32):
-        raise ValueError("rank must be 0..31")
-    down = np.asarray(weights_by_rank["latent_down"])
-    up = np.asarray(weights_by_rank["latent_up"])
-    shared_gu = np.asarray(weights_by_rank["shared_gu"])
-    shared_down = np.asarray(weights_by_rank["shared_down"])
-    if any(value.shape[0] != 32 for value in (down, up, shared_gu, shared_down)):
-        raise ValueError("projection weight inputs must have a leading TP32 axis")
-    if shared_gu.shape[-1] % 2:
-        raise ValueError("shared gate/up columns must split evenly")
-    half = shared_gu.shape[-1] // 2
-    parity = rank % 2
-    gate = np.concatenate([shared_gu[i, :, :half] for i in range(parity, 32, 2)], axis=1)
-    value = np.concatenate([shared_gu[i, :, half:] for i in range(parity, 32, 2)], axis=1)
-    return {
-        "latent_down": np.ascontiguousarray(np.concatenate(list(down), axis=1)),
-        "latent_up": np.ascontiguousarray(np.concatenate([up[i] for i in range(7)], axis=1)),
-        "shared_gu": np.ascontiguousarray(np.concatenate((gate, value), axis=1)),
-        "shared_down": np.ascontiguousarray(np.concatenate(
-            [shared_down[i] for i in range(parity, 32, 2)], axis=0
-        )),
-    }
-
-
-# ============================================================================
-# MLA weight families
-# ============================================================================
-#
-# Each family holds every MLA layer's copy; a runtime slot picks the layer.
 
 
 MLA_FAMILIES = (
@@ -6140,82 +5912,20 @@ MOE_FAMILIES = (
 
 
 def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
-    """Select a MoE layer, keeping packed expert families resident for tile DMA."""
-    from ..config import active
+    """The fused EP16/TP2 MoE layer (``prefill_moe.fused``), keeping packed
+    expert families resident for tile DMA."""
+    from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
 
-    cfg = active()
-    if (
-        cfg.prefill_fused_moe
-        and cfg.prefill_expert_parallel in (8, 16)
-        and seq_len in (512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384)
-    ):
-        from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
-        return make_packed_moe(mesh, seq_len=seq_len)
-    return _make_indexed_moe_sp_ring_reference(mesh, seq_len=seq_len)
+    return make_packed_moe(mesh, seq_len=seq_len)
 
 
 def make_indexed_mixture_moe_sp_ring(mesh, *, seq_len=8192):
-    """Select a fused residual-mixture + RMSNorm + MoE layer when available."""
-    from ..config import active
-
-    cfg = active()
-    if (
-        cfg.prefill_fused_moe
-        and cfg.prefill_expert_parallel in (8, 16)
-        and seq_len in (512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384)
-    ):
-        from .prefill_moe.fused import (
-            make_indexed_mixture_moe_sp_ring as make_packed_mix_moe,
-        )
-
-        return make_packed_mix_moe(mesh, seq_len=seq_len)
-    mixture = make_mixture_norm_sp(mesh, seq_len=seq_len)
-    moe = make_indexed_moe_sp_ring(mesh, seq_len=seq_len)
-    return jax.jit(
-        lambda prefix, blocks, mlp_res, ffn_norm, mix_active, families, length, slot: moe(
-            mixture(prefix, blocks, mlp_res, ffn_norm, mix_active),
-            prefix,
-            families,
-            length,
-            slot,
-        )
+    """The fused residual mixture + RMSNorm + MoE layer (``prefill_moe.fused``)."""
+    from .prefill_moe.fused import (
+        make_indexed_mixture_moe_sp_ring as make_packed_mix_moe,
     )
 
-
-def _make_indexed_moe_sp_ring_reference(mesh, *, seq_len=8192):
-    """SparseCore gather/combine path, for shapes the fused MoE does not cover
-    or with ``prefill_fused_moe`` off."""
-    from ..config import active
-
-    base = make_moe_fused_sp_repacked(mesh, seq_len=seq_len)
-    local_experts = 896 // active().prefill_expert_parallel
-
-    def run(hidden, prefix, families, length, slot):
-        selected = {
-            name: (
-                families[name][:, :, :local_experts]
-                if name in ("expert_gu", "expert_down", "expert_gus", "expert_ds")
-                and families[name].shape[2] != local_experts
-                else families[name]
-                if name in ("expert_gu", "expert_down", "expert_gus", "expert_ds", "latent_down",
-                            "shared_gu", "shared_down")
-                else jax.lax.dynamic_index_in_dim(
-                    families[name], slot[0], axis=1, keepdims=False,
-                )
-            )
-            for name in MOE_FAMILIES
-        }
-        selected["expert_layer"] = jnp.broadcast_to(slot[None], (mesh.size, 1))
-        return base(hidden, prefix, selected, length)
-
-    return jax.jit(run)
-
-
-# ============================================================================
-# Norm + all-gather + KDA
-# ============================================================================
-#
-# Mixture, RMSNorm and window all-gather in one Pallas call, optionally with KDA.
+    return make_packed_mix_moe(mesh, seq_len=seq_len)
 
 
 def _norm_gather_body(

@@ -171,9 +171,8 @@ class RankDir:
     def regrouped_expert_parts(self, name, quarter_dirs, part, parts):
         """An expert family regrouped from EP8/TP4 shards, per file like
         ``expert_parts``: experts ``part`` of ``parts`` equal slices of the EP8
-        group's 112, over the TP4 quarters in ``quarter_dirs`` (all four:
-        whole experts, EP32; two: half the intermediate, EP16/TP2), joined by
-        :func:`_join_quarters`."""
+        group's 112, over the TP4 quarters in ``quarter_dirs`` (two: half the
+        intermediate, EP16/TP2), joined by :func:`_join_quarters`."""
         spec = self.families[name]
         shape = tuple(spec["shape"])  # [layers, 112, ...] per quarter
         dtype = _dtype(spec["dtype"])
@@ -494,15 +493,15 @@ def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers):
 
 
 def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 93,
-                      split_experts: bool = False,
                       skip: frozenset = frozenset()) -> Iterator[tuple[str, str, np.ndarray]]:
     """The prefill stack's weights for ``rank``.
 
     Yields ``(group, name, array)`` with ``group`` in io/common/kda/mla/moe
-    (per-rank arrays, without the rank axis); expert families first
-    (``split_experts``: per file, as in :func:`iter_decode_rank`). Families in
-    ``skip`` (a subset of :data:`PREFILL_SHARED`; the experts all four, from an
-    EP16 decode) are not read: the caller already holds them.
+    (per-rank arrays, without the rank axis); first the EP16/TP2 expert
+    families (:func:`_ep16_expert_jobs`), per file as in
+    :func:`iter_decode_rank`. Families in ``skip`` (a subset of
+    :data:`PREFILL_SHARED`; the experts all four, from an EP16 decode) are not
+    read: the caller already holds them.
     """
     if not skip <= set(PREFILL_SHARED):
         raise ValueError(f"prefill families {sorted(skip - set(PREFILL_SHARED))} cannot be shared")
@@ -524,22 +523,12 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
         return (int(np.prod(spec["shape"])) * _dtype(spec["dtype"]).itemsize,
                 lambda: projection(name))
 
-    ep = _config().prefill_expert_parallel
-    if skip & set(EXPERT_FAMILIES) and (
-        ep != 16 or _config().decode_expert_parallel != 16 or not set(EXPERT_FAMILIES) <= skip
-    ):
-        raise ValueError("only all four EP16 prefill expert families, from an EP16 decode, are the decode's tensors")
+    shared_experts = skip & set(EXPERT_FAMILIES)
+    if shared_experts and (_config().decode_expert_parallel != 16 or shared_experts != set(EXPERT_FAMILIES)):
+        raise ValueError("only all four expert families, from an EP16 decode, are the decode's tensors")
     jobs: list[tuple] = []
-    if skip & set(EXPERT_FAMILIES):
-        pass  # the EP16 decode's experts
-    elif ep == 16:
+    if not shared_experts:
         jobs += _ep16_expert_jobs(presharded, rank_dir, rank, layers, prefill_expert_plan(layers))
-    elif ep == 32:  # 28 whole experts, regrouped from the EP8 group's quarters (same host)
-        quarter_dirs = [RankDir(presharded, 4 * (rank // 4) + q, layers) for q in range(4)]
-        jobs += [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
-                 for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, rank % 4, 4)]
-    else:
-        jobs += list(_expert_jobs(rank_dir, split_experts))
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for name, source in (("latent_down", "latent_down"), ("latent_up", "latent_up"),
                          ("shared_gu", f"shared_gu_{parity}"), ("shared_down", f"shared_down_{parity}")):

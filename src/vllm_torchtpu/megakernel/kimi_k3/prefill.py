@@ -82,6 +82,7 @@ AXIS = "k3_sp"
 WINDOWS = (512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384)
 PAGE_TOKENS = 256
 SLOTS = 16  # sequences per window, at most (and at most one per page)
+LOCAL_EXPERTS = 56  # EP16/TP2: a chip's two ranks hold 56 of the 896 experts
 SERIAL_SLOTS = 2  # a serial prefill's window: one request and the next one's tail
 GROUP_PAIRS = 11  # regular 8-layer groups: layers 4..91
 COPY_PAIRS = 8  # copy-on-write block copies per PoolWriter.copy_blocks call
@@ -314,18 +315,14 @@ class PrefillProgram:
         """Stream this rank's weights; families in ``shared`` (the decode's
         device tensors, ``rank_loader.PREFILL_SHARED``) are used as they are."""
         cache = presharded / "prefill-sp-cache"
-        from .config import active
 
         shared = dict(shared or {})
         iterator = self._rank_loader.iter_prefill_rank(
-            presharded, cache, self.rank, split_experts=True, skip=frozenset(shared)
+            presharded, cache, self.rank, skip=frozenset(shared)
         )
         self._expert_banks = []
-        if (
-            active().prefill_fused_moe
-            and active().prefill_expert_parallel in (8, 16)
-            and not (set(_EXPERT_FAMILIES) & set(shared))
-        ):
+        # The aggregate's shared decode experts are one 92-layer family each.
+        if not (set(_EXPERT_FAMILIES) & set(shared)):
             self._expert_banks = [{} for _ in _EXPERT_BANK_SIZES]
             iterator = _bank_expert_weights(iterator)
 
@@ -473,7 +470,7 @@ class PrefillProgram:
         )
         state_sharding = jax.sharding.NamedSharding(mesh, sharded)
         counting = bool(active().prefill_route_counts)
-        local_experts = 896 // active().prefill_expert_parallel
+        local_experts = LOCAL_EXPERTS
         nroute = 1 if counting else 0
 
         def zeros(shape, dtype):
@@ -707,17 +704,11 @@ class PrefillProgram:
 
     def _export_key(self, op: str, window: int) -> str:
         """The static configuration a window op's trace bakes in (export cache)."""
-        cfg = active()
-        fused_moe = (
-            cfg.prefill_fused_moe
-            and cfg.prefill_expert_parallel in (8, 16)
-            and window in WINDOWS
-        )
         return repr(
             (
                 "prefill-mla-hm",
                 "moe-bank8" if self._expert_banks else "moe-global",
-                "moe-mix-fused-v2" if fused_moe else "moe-ref",
+                "moe-ep16-fused",
                 "draft" if self.has_draft else "no-draft",
                 "logits" if self.compute_logits else "no-logits",
                 op,
@@ -1877,10 +1868,9 @@ class KimiPrefiller:
         total = getattr(self, "_route_total", None)
         self._route_total = routes if total is None else total + routes
         self._route_windows = getattr(self, "_route_windows", 0) + 1
-        ep_tp = 32 // active().prefill_expert_parallel
-        local_experts = 896 // active().prefill_expert_parallel
+        local_experts = LOCAL_EXPERTS
         every = active().prefill_route_counts_every
-        if self._route_windows % every or self.rank % ep_tp:
+        if self._route_windows % every or self.rank % 2:
             return
         directory = active().prefill_route_counts_dir or os.path.join(
             envs.CDK_OUTPUT_DIR, "prefill_route_counts"
@@ -1968,7 +1958,7 @@ class KimiPrefiller:
                 (1, KDA_LAYERS, count, 3, 3, 3, 128), dtype=torch.bfloat16
             )
             latents = torch.empty((1, MLA_LAYERS, window, 576), dtype=torch.bfloat16)
-            local_experts = 896 // active().prefill_expert_parallel
+            local_experts = LOCAL_EXPERTS
             routes = (
                 (torch.empty((1, NUM_LAYERS - 1, local_experts), dtype=torch.int32),)
                 if active().prefill_route_counts

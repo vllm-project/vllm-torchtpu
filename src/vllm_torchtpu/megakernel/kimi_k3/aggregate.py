@@ -113,10 +113,10 @@ class KimiAggregate:
         from vllm_torchtpu.megakernel.kimi_k3.program import build_decoder
 
         kernel = active()
-        if kernel.prefill_expert_parallel != 16 or kernel.decode_expert_parallel != 16:
+        if kernel.decode_expert_parallel != 16:
             raise NotImplementedError(
                 "the K3 aggregate engine shares one EP16/TP2 expert copy: it needs "
-                "prefill_expert_parallel and decode_expert_parallel 16"
+                "decode_expert_parallel 16"
             )
         if config.attention_dp != 1:
             raise NotImplementedError(
