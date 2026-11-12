@@ -159,6 +159,7 @@ def test_replicated_token_shard_eligibility(
     from vllm_torchtpu import envs
     from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
 
+    monkeypatch.delenv("LIBTPU_INIT_ARGS", raising=False)
     monkeypatch.setattr(
         envs, "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD", True, raising=False
     )
@@ -171,3 +172,45 @@ def test_replicated_token_shard_eligibility(
         envs, "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD", False, raising=False
     )
     assert sp.replicated_token_shard_eligible(tokens, 8, max_num_seqs) is False
+
+
+_SC_AG = "--xla_tpu_enable_sparse_core_collective_offload_all_gather"
+
+
+@pytest.mark.parametrize(
+    "libtpu_args,expected",
+    [
+        ("", True),
+        (f"{_SC_AG}=false", True),
+        (f"{_SC_AG}=true", False),
+        # The last setting wins, as in libtpu (the recipe appends overrides).
+        (f"{_SC_AG}=true {_SC_AG}=false", True),
+        (f"{_SC_AG}=false {_SC_AG}=true", False),
+        # The c32 recipe's offload flags around it.
+        (
+            "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=8388608 "
+            f"{_SC_AG}=true "
+            "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true",
+            False,
+        ),
+    ],
+)
+def test_replicated_token_shard_off_under_sparse_core_all_gather_offload(
+    monkeypatch, libtpu_args, expected
+):
+    """The selection all-gather of Qwen4ExpBackboneRP halts a SparseCore with
+    the all-gather offload on (c32): the router and the QSA layers both drop
+    the graph there."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
+    from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
+
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", libtpu_args)
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD", True, raising=False
+    )
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_COMPRESSED_DCP", False, raising=False)
+    assert sp.replicated_token_shard_enabled() is expected
+    assert sp.replicated_token_shard_eligible(512, 8, 24) is expected
+    assert Qwen4ExpQSA._replicated_token_shard_mode(8, True, "model.layers.3") is expected
+    assert Qwen4ExpQSA._replicated_token_shard_mode(8, True, "mtp.layers.0") is False

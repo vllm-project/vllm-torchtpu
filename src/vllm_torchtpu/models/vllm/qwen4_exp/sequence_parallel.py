@@ -124,6 +124,34 @@ def sequence_parallel_eligible(
     )
 
 
+def replicated_token_shard_enabled() -> bool:
+    """VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD, unless it cannot run here.
+
+    Off under VLLM_TPU_QSA_COMPRESSED_DCP (VLLM_TPU_QSA_DECODE_TOKEN_SHARD
+    shards that indexer over the DCP pairs) and while LIBTPU_INIT_ARGS turns on
+    the SparseCore all-gather offload (the c32 recipe): there the graph's
+    selection all-gather halts a SparseCore ("Node 3 halted unexpectedly ...
+    all_gather_into_tensor") in the first served replicated prefill bucket of
+    the spec-decode warmup, and the run dies.
+    """
+    if not envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD:
+        return False
+    if envs.VLLM_TPU_QSA_COMPRESSED_DCP:
+        return False
+    from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
+        sparse_core_all_gather_offload,
+    )
+
+    if sparse_core_all_gather_offload():
+        logger.warning_once(
+            "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD is ignored while the "
+            "SparseCore all-gather offload is on (its selection all-gather halts "
+            "a SparseCore)."
+        )
+        return False
+    return True
+
+
 def replicated_token_shard_eligible(
     num_tokens: int, tp_size: int, max_num_seqs: int
 ) -> bool:
@@ -135,11 +163,7 @@ def replicated_token_shard_eligible(
     request slots), as the token-sharded op asserts. The router applies it
     after ``sequence_parallel_eligible``.
     """
-    if not (
-        envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD
-        and tp_size > 1
-        and not envs.VLLM_TPU_QSA_COMPRESSED_DCP
-    ):
+    if not (tp_size > 1 and replicated_token_shard_enabled()):
         return False
     return (
         num_tokens >= int(envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS)
