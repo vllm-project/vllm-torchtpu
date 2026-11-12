@@ -55,6 +55,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
+from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
@@ -105,12 +106,6 @@ def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
         f"Unsupported mamba_ssm_cache_dtype for TPU GDN: "
         f"{dtype}; expected float32 or bfloat16"
     )
-
-
-def _torch_to_jax_dtype(dtype: torch.dtype) -> jnp.dtype:
-    """The JAX dtype of a torch tensor's elements (fake-shape inference)."""
-    name = str(dtype).removeprefix("torch.")
-    return jnp.dtype("bool" if name == "bool" else name)
 
 
 def gdn_attention_core_tpu(
@@ -215,6 +210,7 @@ def gdn_attention_pooled_core_tpu(
     prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
     packed_metadata: jax.Array | None = None,
     metadata_only: bool = False,
+    packed_size: int = 0,
 ) -> tuple[jax.Array, jax.Array] | jax.Array:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -246,6 +242,7 @@ def gdn_attention_pooled_core_tpu(
         prefill_ckpt=prefill_ckpt,
         packed_metadata=packed_metadata,
         metadata_only=metadata_only,
+        packed_size=packed_size,
     )
 
 
@@ -912,6 +909,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # checkpoint selection (see TPUModelRunner.mamba_slot_read_offsets).
         num_spec_tokens = self.num_spec
         conv_weight_kmajor = envs.VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR
+        # VLLM_TPU_GDN_STEP_KERNEL_METADATA: the step op's output length, from
+        # the scheduler's static limits only (the token dim is dynamic in the
+        # traced forward; no shape of it may reach a Python int).
+        packed_size = 0
+        if kernel_metadata is not None:
+            scheduler = getattr(vllm_config, "scheduler_config", None)
+            max_tokens = getattr(scheduler, "max_num_batched_tokens", None) or 16384
+            max_seqs = getattr(scheduler, "max_num_seqs", None) or 256
+            packed_size = gdn_v3_wrapper.packed_kernel_metadata_size(
+                max_tokens, max_seqs, num_spec_tokens
+            )
 
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
@@ -977,6 +985,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 prefill_ckpt=prefill_ckpt,
                 packed_metadata=packed_metadata,
                 metadata_only=metadata_only,
+                packed_size=packed_size if metadata_only else 0,
             )
             if not block_major or metadata_only:
                 return result
@@ -1171,16 +1180,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 metadata_only=True,
             )
 
-        def _fake_step_kmeta(*args):
-            # The packed length is a static function of the operand shapes.
-            structs = [
-                None
-                if x is None
-                else jax.ShapeDtypeStruct(tuple(x.shape), _torch_to_jax_dtype(x.dtype))
-                for x in args
-            ]
-            out = jax.eval_shape(step_kmeta_fn, *structs)
-            return torch.empty(out.shape, dtype=torch.int32, device=args[0].device)
+        def _fake_step_kmeta(mixed_qkv, *args):
+            # Static length: reading the (dynamic) token dim here would
+            # specialize the traced forward on it.
+            return torch.empty(
+                (packed_size,), dtype=torch.int32, device=mixed_qkv.device
+            )
 
         def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)

@@ -622,6 +622,23 @@ def pack_kernel_metadata(metas: tuple[memory_ref.MetadataRef, ...]) -> jax.Array
     return jnp.concatenate([jnp.ravel(x).astype(jnp.int32) for x in leaves])
 
 
+def packed_kernel_metadata_size(
+    max_tokens: int, max_seqs: int, num_spec_tokens: int
+) -> int:
+    """Static upper bound on `pack_kernel_metadata`'s length for calls of at
+    most `max_tokens` rows and `max_seqs` sequence slots.
+
+    Depends on no traced shape, so the op returning it keeps a static output
+    shape under a dynamic token dim. Per segment: `num_tiles`, up to six
+    per-tile arrays (at most one entry per token, or per slot), the
+    per-sequence arrays incl. the checkpoint ids, and the zero-fill
+    `query_start_loc` / `distribution`.
+    """
+    per_tile = max(max_tokens, max_seqs) + 2
+    per_seq = max_seqs * (num_spec_tokens + 4) + (max_seqs + 1) + 3
+    return 2 * (1 + 6 * per_tile + per_seq)
+
+
 def unpack_kernel_metadata(
     packed: jax.Array, abstract: tuple[memory_ref.MetadataRef, ...]
 ) -> tuple[memory_ref.MetadataRef, ...]:
@@ -629,9 +646,10 @@ def unpack_kernel_metadata(
     (`jax.eval_shape` of the same builders)."""
     leaves, treedef = jax.tree.flatten(abstract)
     sizes = [math.prod(leaf.shape) for leaf in leaves]
-    if packed.shape != (sum(sizes),):
+    # A static-size vector (packed_size) carries zero padding past the end.
+    if packed.ndim != 1 or packed.shape[0] < sum(sizes):
         raise ValueError(
-            f"packed GDN kernel metadata {packed.shape} != ({sum(sizes)},)"
+            f"packed GDN kernel metadata {packed.shape} < ({sum(sizes)},)"
         )
     out, offset = [], 0
     for leaf, size in zip(leaves, sizes, strict=True):
@@ -662,6 +680,7 @@ def unpack_kernel_metadata(
         "gate_lower_bound",
         "prefill_ckpt_alignment",
         "metadata_only",
+        "packed_size",
     ),
 )
 def fused_conv1d_gdn(
@@ -704,6 +723,7 @@ def fused_conv1d_gdn(
     prefill_ckpt_alignment: int = 0,
     packed_metadata: jax.Array | None = None,
     metadata_only: bool = False,
+    packed_size: int = 0,
 ) -> (
     tuple[tuple[jax.Array, jax.Array], jax.Array]
     | tuple[jax.Array, jax.Array]
@@ -799,6 +819,9 @@ def fused_conv1d_gdn(
             calls running both segments only.
         metadata_only: Return the call's packed kernel metadata (see
             `pack_kernel_metadata`) instead of running the kernel.
+        packed_size: With `metadata_only`, zero-pad the packed vector to this
+            static length (`packed_kernel_metadata_size`), so its shape does
+            not depend on the token count of the call; 0 keeps it exact.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -1257,7 +1280,15 @@ def fused_conv1d_gdn(
         )[0].get_out_shape()
         per_seq_build = functools.partial(build, config.GDNMode.PER_SEQ, batched_out)
         if metadata_only:
-            return pack_kernel_metadata((batched_build(), per_seq_build()))
+            packed = pack_kernel_metadata((batched_build(), per_seq_build()))
+            if packed_size:
+                if packed.size > packed_size:
+                    raise ValueError(
+                        f"GDN kernel metadata needs {packed.size} entries, "
+                        f"more than the static bound {packed_size}"
+                    )
+                packed = jnp.pad(packed, (0, packed_size - packed.size))
+            return packed
         segment_metas = unpack_kernel_metadata(
             cast(jax.Array, packed_metadata),
             (jax.eval_shape(batched_build), jax.eval_shape(per_seq_build)),
