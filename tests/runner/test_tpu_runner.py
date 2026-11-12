@@ -129,6 +129,55 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
     assert len(block_ids) <= spec.max_num_blocks_per_req(config, 40960)
 
 
+def test_spec_warmup_request_gives_groups_disjoint_blocks():
+    """In a unified pool (Qwen4Exp pooled cache) a block id is one pool page
+    for every kv-cache group; the warmup request's main KV (DCP2: 2 x 512
+    tokens per entry), compressed/state groups (512) and ring (1 block) must
+    not share pages, as serving's block pool never does."""
+    main = FullAttentionSpec(
+        block_size=1024, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    other = FullAttentionSpec(
+        block_size=512, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+    )
+    captured = []
+    runner = SimpleNamespace(
+        max_model_len=262144,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=122418,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=spec) for spec in (main, other, main)
+            ],
+        ),
+        vllm_config=config,
+        execute_model=lambda so: captured.append(so),
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+    )
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 4096, idx=0)
+
+    groups = captured[0].scheduled_new_reqs[0].block_ids
+    # 4096 + 5 verify steps of 4 tokens reach position 4120.
+    assert [len(ids) for ids in groups] == [5, 9, 5]
+    flat = [i for ids in groups for i in ids]
+    assert len(set(flat)) == len(flat) and min(flat) == 1
+    assert max(flat) < runner.kv_cache_config.num_blocks
+    # Later decode steps reuse the request's blocks; none adds new ones.
+    assert all(not s.scheduled_new_reqs for s in captured[1:])
+
+
+def test_spec_warmup_block_ids_lay_groups_back_to_back():
+    assert tpu_runner._spec_warmup_block_ids([2, 3, 1], 7) == (
+        [7, 8], [9, 10, 11], [12]
+    )
+
+
 def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     spec = FullAttentionSpec(
         block_size=384, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
@@ -624,7 +673,8 @@ def test_one_mtp_prefill_warmup_builds_prefill_without_decode():
     request = scheduler_output.scheduled_new_reqs[0]
     assert request.req_id == "__mtp_prefill_warmup__"
     assert len(request.prompt_token_ids) == 31
-    assert request.block_ids == ([98, 99], [96, 97, 98, 99])
+    # One unified pool page per id: the groups' ranges must not overlap.
+    assert request.block_ids == ([94, 95], [96, 97, 98, 99])
     assert scheduler_output.scheduled_cached_reqs.req_ids == []
     runner.sample_tokens.assert_called_once_with(None)
     runner.take_draft_token_ids.assert_called_once_with()
