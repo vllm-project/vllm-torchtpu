@@ -140,15 +140,8 @@ _IM_END_TOKEN_ID = 151645
 _ASSISTANT_ROLE_TOKEN_ID = 77091
 
 
-def _find_server_hop_reply_end(prompt_token_ids: Sequence[int]) -> int | None:
-    """Return the token index right after the last completed assistant message on a server hop.
-
-    Searches for the last `<|im_start|>assistant` (`151644, 77091`) that has a
-    closing `<|im_end|>` (`151645`) so turns with multiple trailing tool/user
-    messages after the assistant reply still split `routing_loss` vs `new_input`
-    at the assistant reply boundary. Falls back to the second-to-last `<|im_end|>`
-    when ChatML role start tokens are absent.
-    """
+def _find_last_assistant_reply_end(prompt_token_ids: Sequence[int]) -> int | None:
+    """Return the token index right after the last completed ChatML assistant message."""
     total = len(prompt_token_ids)
     last_asst_end: int | None = None
     idx = 0
@@ -166,6 +159,19 @@ def _find_server_hop_reply_end(prompt_token_ids: Sequence[int]) -> int | None:
                 idx = end_idx + 1
                 continue
         idx += 1
+    return last_asst_end
+
+
+def _find_server_hop_reply_end(prompt_token_ids: Sequence[int]) -> int | None:
+    """Return the token index right after the last completed assistant message on a server hop.
+
+    Searches for the last `<|im_start|>assistant` (`151644, 77091`) that has a
+    closing `<|im_end|>` (`151645`) so turns with multiple trailing tool/user
+    messages after the assistant reply still split `routing_loss` vs `new_input`
+    at the assistant reply boundary. Falls back to the second-to-last `<|im_end|>`
+    when ChatML role start tokens are absent.
+    """
+    last_asst_end = _find_last_assistant_reply_end(prompt_token_ids)
     if last_asst_end is not None:
         return last_asst_end
 
@@ -203,6 +209,8 @@ def _find_reply_end_idx(
     fallback_end: int,
     prior_im_ends: int = 0,
     matched_prefix_end: int = 0,
+    *,
+    edited_same_session: bool = False,
 ) -> int:
     """Return the token index just after the prior assistant reply's `<|im_end|>`.
 
@@ -215,6 +223,10 @@ def _find_reply_end_idx(
     """
     total = len(prompt_token_ids)
     start = min(max(0, search_start), total)
+    if edited_same_session:
+        asst_end = _find_last_assistant_reply_end(prompt_token_ids)
+        if asst_end is not None and asst_end > start:
+            return asst_end
     if matched_prefix_end > 0 and start >= matched_prefix_end:
         seen_im_ends = prior_im_ends + prompt_token_ids[
             matched_prefix_end:start
@@ -317,7 +329,21 @@ class SessionTurnTracker:
             return TokenBreakdown()
 
         t1, t2, used_parent = self._lookup_prior(session_id, parent_session_id)
-        if t1 is not None:
+        prior_turn_id = (
+            t1.turn_id
+            if t1 is not None
+            else (t2.turn_id if t2 is not None else None)
+        )
+        is_revisit_hop = (
+            not used_parent
+            and session_id is not None
+            and turn_id is not None
+            and prior_turn_id is not None
+            and turn_id > prior_turn_id + 1
+        )
+        if is_revisit_hop:
+            self._verified_match_len.pop(session_id, None)
+        elif t1 is not None:
             return self._classify_from_tier1(
                 prompt_token_ids,
                 hit,
@@ -325,20 +351,21 @@ class SessionTurnTracker:
                 used_parent or parent_session_id,
                 session_id=session_id if not used_parent else None,
             )
-        if t2 is not None:
+        elif t2 is not None:
             return self._classify_from_tier2(
                 prompt_token_ids, hit, t2, used_parent or parent_session_id
             )
 
-        # No prior state on this replica for session_id or parent_session_id.
+        # No prior state on this replica (or revisit hop after intermediate turns elsewhere).
         if session_id and turn_id is not None and turn_id > 1:
             last_reply_end = _find_server_hop_reply_end(prompt_token_ids)
             if last_reply_end is not None and 0 < last_reply_end <= total:
                 rloss = max(0, last_reply_end - hit)
+                new_in = max(0, total - max(hit, last_reply_end))
                 return TokenBreakdown(
                     cache_hit=hit,
                     routing_loss=rloss,
-                    new_input=total - hit - rloss,
+                    new_input=new_in,
                     parent_session_id=parent_session_id,
                 )
             return TokenBreakdown(
@@ -415,25 +442,19 @@ class SessionTurnTracker:
             if diverge_idx >= prior.reply_start_idx > 0
             else 0
         )
-        if diverge_idx >= reply_boundary or 0 < prior.reply_start_idx < total:
-            search_start = max(
+        reply_end = max(
+            block_base,
+            _find_reply_end_idx(
+                prompt_token_ids,
                 diverge_idx,
-                prior.reply_start_idx
-                if 0 < prior.reply_start_idx < total
-                else diverge_idx,
-            )
-            reply_end = max(
-                block_base,
-                _find_reply_end_idx(
-                    prompt_token_ids,
-                    search_start,
-                    expected_prefix,
-                    prior_im_ends,
-                    matched_prefix_end=matched_prefix_end,
+                expected_prefix,
+                prior_im_ends,
+                matched_prefix_end=matched_prefix_end,
+                edited_same_session=(
+                    diverge_idx < reply_boundary and not parent_session_id
                 ),
-            )
-        else:
-            reply_end = expected_prefix
+            ),
+        )
 
         if diverge_idx >= reply_boundary:
             return TokenBreakdown(
@@ -485,6 +506,17 @@ class SessionTurnTracker:
             )
             if hash(cur_tail) != prior.tail_hash:
                 diverge_idx = max(hit, max_blk * self.block_size)
+        elif (
+            diverge_idx is None
+            and total < prior.seq_len
+            and max_blk * self.block_size < total
+            and (
+                0 < prior.reply_start_idx < total
+                or _IM_END_TOKEN_ID
+                in prompt_token_ids[max_blk * self.block_size : total]
+            )
+        ):
+            diverge_idx = max(hit, max_blk * self.block_size)
 
         if diverge_idx is None:
             return TokenBreakdown(
@@ -500,21 +532,18 @@ class SessionTurnTracker:
             if 0 < prior.reply_start_idx < prior.seq_len
             else prior.seq_len
         )
-        if diverge_idx >= reply_boundary or 0 < prior.reply_start_idx < total:
-            search_start = max(
+        reply_end = max(
+            block_base,
+            _find_reply_end_idx(
+                prompt_token_ids,
                 diverge_idx,
-                prior.reply_start_idx
-                if 0 < prior.reply_start_idx < total
-                else diverge_idx,
-            )
-            reply_end = max(
-                block_base,
-                _find_reply_end_idx(
-                    prompt_token_ids, search_start, expected_prefix, prior.prior_im_ends
+                expected_prefix,
+                prior.prior_im_ends,
+                edited_same_session=(
+                    diverge_idx < reply_boundary and not parent_session_id
                 ),
-            )
-        else:
-            reply_end = expected_prefix
+            ),
+        )
 
         if diverge_idx >= reply_boundary:
             return TokenBreakdown(

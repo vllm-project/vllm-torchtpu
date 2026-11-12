@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
 """Flag-gated vLLM lifecycle hooks for CUJ-2 agentic serving telemetry."""
 
+import contextlib
 import contextvars
 import json
 import logging
@@ -190,6 +191,7 @@ class AgenticTelemetryService:
         self._req_eviction_metrics: dict[
             str, tuple[float | None, int | None]
         ] = {}
+        self._req_eviction_ts: dict[str, float | None] = {}
         self._eviction_sync_dirty: bool = False
         self._eviction_writer_initialized: bool = False
         self._eviction_sync_inode: int | None = None
@@ -222,11 +224,15 @@ class AgenticTelemetryService:
             is_prompt_round=is_prompt_round,
         )
         if sync_ipc and envs.VLLM_TPU_AGENTIC_TELEMETRY:
+            sync_path = self._padding_sync_path()
+            tmp_path = f"{sync_path}.tmp.{os.getpid()}"
             try:
-                with open(self._padding_sync_path(), "w", encoding="utf-8") as f:
+                with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(self.padding_tracker.as_dict(), f)
+                os.replace(tmp_path, sync_path)
             except OSError:
-                pass
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
 
     def sync_padding_state(self) -> dict[str, int]:
         """Sync TPU round padding counters from EngineCore shared memory."""
@@ -460,11 +466,15 @@ class AgenticTelemetryService:
             self.category_totals[cat] += count
         if req_id:
             self._req_breakdowns[req_id] = breakdown
+            self._req_eviction_ts[req_id] = (
+                self.eviction_tracker.session_evicted_ts(session_id)
+            )
             evict_age, evict_wall = self._compute_eviction_snapshot(
                 req_state,
                 breakdown,
                 session_id=session_id,
                 eval_now=prefill_now,
+                ext_cached=ext_cached,
             )
             self._req_eviction_metrics[req_id] = (evict_age, evict_wall)
         return breakdown
@@ -476,9 +486,11 @@ class AgenticTelemetryService:
         *,
         session_id: str | None,
         eval_now: float | None,
+        ext_cached: int = 0,
     ) -> tuple[float | None, int | None]:
         eviction_age_ms: float | None = None
-        if breakdown.affinity_honored_eviction > 0:
+        session_evicted_wall: int | None = None
+        if breakdown.affinity_honored_eviction > 0 or ext_cached > 0:
             prompt_token_ids = getattr(req_state, "prompt_token_ids", None) or ()
             block_size = self.session_tracker.block_size
             num_prompt_blocks = len(prompt_token_ids) // block_size
@@ -493,13 +505,16 @@ class AgenticTelemetryService:
                 all_hashes = compute_rolling_block_hashes(
                     prompt_token_ids, block_size
                 )
-            start_blk = breakdown.cache_hit // block_size
+            hbm_hit = max(0, breakdown.cache_hit - max(0, int(ext_cached)))
+            start_blk = hbm_hit // block_size
             missed_hashes = all_hashes[start_blk:]
             eviction_age_ms = self.eviction_tracker.time_since_eviction_ms(
                 missed_hashes, now=eval_now, session_id=session_id
             )
+            session_evicted_wall = self.eviction_tracker.session_evicted_at_ms(
+                session_id
+            )
 
-        session_evicted_wall = self.eviction_tracker.session_evicted_at_ms(session_id)
         return eviction_age_ms, session_evicted_wall
 
     def on_request_finished(
@@ -563,6 +578,9 @@ class AgenticTelemetryService:
         breakdown = self.on_request_finished(req_state, engine_core_output)
         if snap_evict is None and req_id:
             snap_evict = self._req_eviction_metrics.pop(req_id, None)
+        prefill_evict_ts = (
+            self._req_eviction_ts.pop(req_id, None) if req_id else None
+        )
         prefill_ts = self._req_prefill_ts.pop(req_id, None) if req_id else None
         eval_now = now if now is not None else prefill_ts
 
@@ -583,13 +601,34 @@ class AgenticTelemetryService:
             eviction_age_ms, session_evicted_wall = snap_evict
         else:
             self._maybe_sync_eviction_state()
+            if prefill_evict_ts is None:
+                prefill_evict_ts = self.eviction_tracker.session_evicted_ts(
+                    session_id
+                )
             eviction_age_ms, session_evicted_wall = (
                 self._compute_eviction_snapshot(
                     req_state,
                     breakdown,
                     session_id=session_id,
                     eval_now=eval_now,
+                    ext_cached=ext_computed,
                 )
+            )
+
+        had_eviction = (
+            breakdown.affinity_honored_eviction > 0 or ext_computed > 0
+        )
+        if (
+            session_id
+            and prefill_evict_ts is not None
+            and (
+                had_eviction
+                or breakdown.cache_hit > 0
+                or (turn_id is not None and turn_id > 1)
+            )
+        ):
+            self.eviction_tracker.clear_session_eviction(
+                session_id, up_to_ts=prefill_evict_ts
             )
 
         hw_attrs = extract_hardware_span_attributes(
@@ -995,6 +1034,21 @@ def _register_padding_collector_on_registry(
         pass
 
 
+def _is_padding_sync_writer(runner: Any) -> bool:
+    """Return True only for per-replica worker rank 0 to avoid `/dev/shm` races."""
+    if getattr(runner, "is_driver_worker", None) is False:
+        return False
+    pc = getattr(runner, "parallel_config", None)
+    if pc is not None:
+        world = int(getattr(pc, "world_size", 1) or 1)
+        rank = int(getattr(pc, "rank", 0) or 0)
+        return (rank % max(1, world)) == 0
+    rank_attr = getattr(runner, "rank", None)
+    if rank_attr is not None:
+        return int(rank_attr) == 0
+    return True
+
+
 def patch_tpu_padding_metrics(
     runner_cls: Any = None,
     service: AgenticTelemetryService | None = None,
@@ -1055,6 +1109,7 @@ def patch_tpu_padding_metrics(
                         real_tokens,
                         padded_tokens,
                         is_prompt_round=(real_tokens > chunk_num_reqs),
+                        sync_ipc=_is_padding_sync_writer(self),
                     )
                 except Exception:
                     pass

@@ -62,6 +62,32 @@ def install_into_tree(pkg_root: Path | None = None) -> None:
             encoding="utf-8",
         )
 
+    compiler_path = pkg_root / "compilation" / "tpu_compiler.py"
+    if not compiler_path.exists():
+        raise RuntimeError(f"Missing target file: {compiler_path}")
+    compiler_text = compiler_path.read_text(encoding="utf-8")
+    if (
+        '"VLLM_TPU_AGENTIC_TELEMETRY"' not in compiler_text
+        or '"VLLM_TPU_AGENTIC_SPAN_LOG"' not in compiler_text
+    ):
+        anchor = "_TPU_COMPILE_ENV_IGNORED = {\n"
+        if anchor not in compiler_text:
+            raise RuntimeError(
+                f"Failed to locate _TPU_COMPILE_ENV_IGNORED anchor in {compiler_path}"
+            )
+        missing_lines = "".join(
+            f'    "{env_name}",\n'
+            for env_name in (
+                "VLLM_TPU_AGENTIC_TELEMETRY",
+                "VLLM_TPU_AGENTIC_SPAN_LOG",
+            )
+            if f'"{env_name}"' not in compiler_text
+        )
+        compiler_path.write_text(
+            compiler_text.replace(anchor, anchor + missing_lines, 1),
+            encoding="utf-8",
+        )
+
 
 if __name__ == "__main__":
     install_into_tree()
