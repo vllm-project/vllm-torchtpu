@@ -44,6 +44,8 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu.core.tail_hold import TailHold
+
 logger = init_logger("vllm." + __name__)
 
 
@@ -111,6 +113,12 @@ def patch_prompt_ids_ndarray_early() -> None:
     )
 
 
+def _tail_hold_steps() -> int:
+    from vllm_torchtpu import envs
+
+    return envs.VLLM_TPU_TAIL_HOLD_STEPS
+
+
 def _paw_skip_full() -> bool:
     from vllm_torchtpu import envs
 
@@ -157,6 +165,9 @@ class PrefixAwareScheduler(AsyncScheduler):
     _hp_promote_ns = 0
     _prompt_np = False
     _paw_skip_full = False
+    # VLLM_TPU_TAIL_HOLD_STEPS (core/tail_hold.py); None: off.
+    _tail_hold: TailHold | None = None
+    _tail_hold_now: frozenset[str] = frozenset()
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -171,6 +182,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._hp_promote_ns = 0
         self._prompt_np = _prompt_ids_ndarray()
         self._paw_skip_full = _paw_skip_full()
+        steps = _tail_hold_steps()
+        self._tail_hold = TailHold(steps) if steps > 0 else None
+        self._tail_hold_now = frozenset()
 
         logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
 
@@ -220,10 +234,31 @@ class PrefixAwareScheduler(AsyncScheduler):
             )
             if queue is not None:
                 self._promote_warmest(queue)
-            out = super().schedule(throttle_prefills)
+            out = self._schedule_with_tail_hold(throttle_prefills)
         if self._prompt_np and out.scheduled_new_reqs:
             ship_prompt_ids_as_ndarray(out, self.requests)
         return out
+
+    def _schedule_with_tail_hold(self, throttle_prefills: bool):
+        hold = self._tail_hold
+        if hold is None:
+            return super().schedule(throttle_prefills)
+        self._tail_hold_now = hold.plan(
+            self, seat_free=not throttle_prefills and not self._no_seat_free()
+        )
+        try:
+            return super().schedule(throttle_prefills)
+        finally:
+            self._tail_hold_now = frozenset()
+
+    def _mamba_block_aligned_split(self, request, num_new_tokens, *args, **kwargs):
+        # VLLM_TPU_TAIL_HOLD_STEPS: 0 new tokens skips a held tail this step
+        # (the running loop's "cannot be scheduled" path).
+        if self._tail_hold_now and request.request_id in self._tail_hold_now:
+            return 0
+        return super()._mamba_block_aligned_split(
+            request, num_new_tokens, *args, **kwargs
+        )
 
     # ---- VLLM_TPU_HOST_PHASES instrumentation (off by default) ----
     def _hp_note(self, name: str, us: float) -> None:
@@ -237,7 +272,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
         if queue is not None:
             self._promote_warmest(queue)
-        out = super().schedule(throttle_prefills)
+        out = self._schedule_with_tail_hold(throttle_prefills)
         sched_us = (time.perf_counter_ns() - t0) / 1e3
         promote_us = self._hp_promote_ns / 1e3
         kind = "admit" if out.scheduled_new_reqs else "other"
