@@ -709,6 +709,13 @@ def _patch_ltx2_host_sigma_schedule() -> None:
         setattr(_device_timesteps_run, _LTX2_HOST_SIGMA_PATCHED, True)
         executor_cls.run = staticmethod(_device_timesteps_run)
 
+    # The replacement below copies the guidance_parallel_ready /
+    # get_guidance_parallel_world_size() > 1 gate and the .contiguous() step
+    # of vllm_omni.diffusion.models.ltx2.ltx2_runtime.LTXRuntime.
+    # _synchronize_guidance_parallel_step_output (vllm-omni 0.32.0rc1) and
+    # drops its synchronize. Re-check it when bumping vllm-omni; remove it
+    # once upstream skips that synchronize on platforms whose collectives
+    # run in program order.
     orig_sync = runtime_cls._synchronize_guidance_parallel_step_output
     if not getattr(orig_sync, _LTX2_HOST_SIGMA_PATCHED, False):
 
