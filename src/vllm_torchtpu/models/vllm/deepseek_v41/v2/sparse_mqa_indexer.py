@@ -1,36 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sparse MQA indexer routing and stage-local candidate key reuse."""
+"""Sparse MQA indexer over the packed FP8 Index-K cache."""
 
-import functools
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.candidates import (
-    cache_capacity,
-)
-
-from . import indexer_bf16, indexer_fp8
-from .cache import IndexCacheRows
-from .candidate_cache import prepare_candidate_cache, select_candidate_cache
+from . import indexer_fp8
 from .indexer_cache import PackedFP8IndexCacheRows
 
 if TYPE_CHECKING:
     from vllm.models.deepseek_v41.attention import DeepseekV4IndexerCache
-
-
-def quantize_query(
-    q: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin: torch.Tensor,
-    weights: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate Q, quantize each head and fold its scale into FP32 weights."""
-    operation = indexer_fp8._query_op
-    assert operation is not None
-    return operation(q, positions, cos_sin, weights)
 
 
 class SparseMQAIndexer(torch.nn.Module):
@@ -58,88 +38,19 @@ class SparseMQAIndexer(torch.nn.Module):
         self,
         q: torch.Tensor,
         weights: torch.Tensor,
-        cache: IndexCacheRows | PackedFP8IndexCacheRows,
+        cache: PackedFP8IndexCacheRows,
         records: torch.Tensor,
         lengths: torch.Tensor,
         requests: torch.Tensor,
         *,
         candidates: torch.Tensor,
         batch_max: torch.Tensor,
-        page_records: int,
         unordered: bool,
         score_width: int,
         stage_cache: dict[Any, Any] | None,
         query_start_loc: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        sparse_logits = self.candidate_blocks is not None and not self.candidate_write
-        reuse = sparse_logits and stage_cache is not None
-        packed_fp8 = isinstance(cache, PackedFP8IndexCacheRows)
-        capacity = (
-            cache_capacity(
-                tuple(q.shape),
-                tuple(records.shape),
-                candidates.shape[1],
-                self.candidate_block_size,
-                page_records,
-            )
-            if not packed_fp8 and reuse and unordered and q.dtype == torch.bfloat16
-            else None
-        )
-        if capacity is None:
-            select: Callable[..., tuple[torch.Tensor, torch.Tensor]] = (
-                functools.partial(
-                    indexer_fp8.paged_fp8_indexer,
-                    score_width=score_width,
-                    stage_cache=stage_cache,
-                    source_prefix=self.k_cache.prefix,
-                    candidate_source=self.candidate_source_layer,
-                    query_start_loc=query_start_loc,
-                )
-                if packed_fp8
-                else functools.partial(
-                    indexer_bf16.paged_indexer, page_records=page_records
-                )
-            )
-            return select(
-                q,
-                cache,
-                records,
-                weights,
-                lengths,
-                candidates,
-                requests,
-                topk=self.topk_tokens,
-                block_size=max(1, self.candidate_block_size),
-                candidate_write=self.candidate_write,
-                sparse_logits=sparse_logits,
-                unordered=unordered,
-                batch_max=batch_max,
-            )
-
-        assert stage_cache is not None
-        assert isinstance(cache, IndexCacheRows)
-        cache_key = (
-            "candidate_index_keys",
-            self.k_cache.prefix,
-            stage_cache.get(("candidate_index_version", self.k_cache.prefix), 0),
-            self.candidate_source_layer,
-            stage_cache.get(("candidate_publication", self.candidate_source_layer), 0),
-            capacity,
-        )
-        prepared = stage_cache.get(cache_key)
-        if prepared is None:
-            prepared = prepare_candidate_cache(
-                cache,
-                records,
-                candidates,
-                requests,
-                lengths,
-                block_size=self.candidate_block_size,
-                capacity=capacity,
-            )
-            stage_cache[cache_key] = prepared
-
-        selected = select_candidate_cache(
+        return indexer_fp8.paged_fp8_indexer(
             q,
             cache,
             records,
@@ -147,11 +58,16 @@ class SparseMQAIndexer(torch.nn.Module):
             lengths,
             candidates,
             requests,
-            batch_max,
-            prepared,
-            block_size=self.candidate_block_size,
-            page_records=page_records,
-            request_tile=None,
             topk=self.topk_tokens,
+            block_size=max(1, self.candidate_block_size),
+            candidate_write=self.candidate_write,
+            sparse_logits=self.candidate_blocks is not None
+            and not self.candidate_write,
+            unordered=unordered,
+            batch_max=batch_max,
+            score_width=score_width,
+            stage_cache=stage_cache,
+            source_prefix=self.k_cache.prefix,
+            candidate_source=self.candidate_source_layer,
+            query_start_loc=query_start_loc,
         )
-        return selected, candidates

@@ -50,7 +50,6 @@ from .attention import (
 from .attention_kernels import initialize_paged_attention
 from .cache import initialize_cache_ops
 from .engram import Engram, NgramHashState
-from .indexer_bf16 import initialize_indexer
 from .model import DeepseekV41DecoderLayer
 from .ops import compact_rope_caches, device_hooks
 
@@ -144,7 +143,6 @@ class DSparkDeepseekV41Model(nn.Module):
         self._boundary_collapse = initialize_collapse()
 
         initialize_paged_attention()
-        initialize_indexer()
 
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_config

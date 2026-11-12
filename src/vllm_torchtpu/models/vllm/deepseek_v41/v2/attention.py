@@ -29,30 +29,28 @@ from vllm_torchtpu.layers.adapter.linear_common import (
 from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.utils import synchronize_tensors
 
-from . import csa2_adapter, preprocess_ops
+from . import csa2_adapter, indexer_fp8, preprocess_ops
 from .attention_kernels import (
     gathered_kv_cache_scope,
     paged_attention,
 )
 from .cache import (
-    BLOCK_STRIDE_ALIGNMENT,
     SWA_PAGE_TOKENS,
-    IndexCacheRows,
     NativeCacheView,
     PagedCacheRows,
+    block_stride_alignment,
     write_cache,
 )
 from .ced import prefix_replay_enabled
-from .indexer_cache import IndexerCache, PackedFP8IndexCacheRows, indexer_uses_fp8
+from .indexer_cache import IndexerCache, PackedFP8IndexCacheRows, indexer_uses_fp4
 from .ops import (
     device_hooks,
     quantize_fp8_activation,
     rms_norm,
     rotary,
-    round_fp8_activation,
 )
 from .projection_rope import initialize_projection_rope
-from .sparse_mqa_indexer import SparseMQAIndexer, quantize_query
+from .sparse_mqa_indexer import SparseMQAIndexer
 
 logger = init_logger(__name__)
 
@@ -70,49 +68,6 @@ def stage_attention_cache_scope():
             yield
     finally:
         _active_stage_attn_cache = prev
-
-
-def select_candidate_blocks(logits, lengths, topk_blocks, block_size):
-    if block_size < 1 or topk_blocks < 0:
-        raise ValueError("invalid candidate block parameters")
-    width = logits.shape[-1]
-    if width == 0:
-        return torch.zeros_like(logits, dtype=torch.bool)
-    lengths = torch.as_tensor(lengths, device=logits.device)
-    visible = torch.arange(width, device=logits.device) < lengths
-    scores = F.pad(
-        logits.masked_fill(~visible, -torch.inf),
-        (0, -width % block_size),
-        value=-torch.inf,
-    )
-    scores = scores.unflatten(-1, (-1, block_size)).amax(-1)
-    last = (lengths - 1) // block_size
-    scores = scores.masked_fill(
-        torch.arange(scores.shape[-1], device=scores.device) == last, torch.inf
-    )
-    selected = scores.topk(min(topk_blocks, scores.shape[-1]), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-        -1, selected.indices, selected.values > -torch.inf
-    )
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
-
-
-def select_compressed_indices(scores, lengths, topk, *, candidates=None):
-    """Return logical compressed positions; unavailable picks are always -1.
-
-    Do not carry a source layer's SWA concatenation offset into reuse layers.
-    Equal scores retain PyTorch topk's unspecified tie ordering.
-    """
-    if topk < 0:
-        raise ValueError("topk must be nonnegative")
-    valid = torch.arange(scores.shape[-1], device=scores.device) < torch.as_tensor(
-        lengths, device=scores.device
-    )
-    if candidates is not None:
-        valid = valid & candidates
-    masked = scores.masked_fill(~valid, -torch.inf)
-    indices = masked.topk(min(topk, scores.shape[-1]), dim=-1).indices.sort(-1).values
-    return indices.masked_fill(masked.gather(-1, indices) == -torch.inf, -1).int()
 
 
 def sparse_attention(q, kv, sink, indices, scale):
@@ -283,7 +238,9 @@ class CompressorStateCache(NativeCacheView, compressor_upstream.CompressorStateC
     def get_kv_cache_spec(self, vllm_config):
         return dataclasses.replace(
             super().get_kv_cache_spec(vllm_config),
-            block_stride_alignment=BLOCK_STRIDE_ALIGNMENT,
+            block_stride_alignment=block_stride_alignment(
+                vllm_config.cache_config.block_size
+            ),
         )
 
 
@@ -437,10 +394,61 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
         return latent
 
 
-def indexer_uses_fp4(vllm_config):
-    """Resolve the upstream format without imposing a CUDA capability check."""
-    indexer_uses_fp8(vllm_config)
-    return False
+def _sparse_mqa_indexer(
+    k_cache,
+    quant_block_size,
+    scale_fmt,
+    topk_tokens,
+    *args,
+    candidate_blocks=None,
+    candidate_block_size=0,
+    candidate_write=False,
+    **kwargs,
+):
+    """Build the TPU scorer from upstream's ``SparseAttnIndexer`` arguments.
+
+    The model writes Index-K before scoring and lengths come from the TPU
+    metadata, so the remaining arguments do not apply.
+    """
+    del quant_block_size, scale_fmt, args, kwargs
+    config = get_current_vllm_config().model_config.hf_config
+    return SparseMQAIndexer(
+        k_cache,
+        topk_tokens,
+        candidate_blocks,
+        candidate_block_size,
+        candidate_source_layer=(
+            getattr(config, "candidate_source_layer_id", -1)
+            if candidate_blocks is not None
+            else None
+        ),
+        candidate_write=candidate_write,
+    )
+
+
+class DeepseekV41Indexer(upstream.DeepseekV4Indexer):
+    """Upstream indexer modules and weights with the TPU scoring layer."""
+
+    attn_cls = staticmethod(_sparse_mqa_indexer)
+
+    def forward_q(self, qr, qr_scale, indexer_weights, positions, rotary_emb):
+        """Upstream's query build: wq_b, then fused RoPE and per-head FP8 quant.
+
+        ``rotary_emb`` may be the cos/sin table itself, so callers can pass the
+        compact serving table (`compact_rope_caches`). The head scale is folded
+        into the FP32 weights, hence no separate query scale.
+        """
+        assert qr_scale is None
+        table = (
+            rotary_emb
+            if isinstance(rotary_emb, torch.Tensor)
+            else rotary_emb.cos_sin_cache
+        )
+        q = _value(self.wq_b(qr)).reshape(-1, self.n_head, self.head_dim)
+        operation = indexer_fp8._query_op
+        assert operation is not None
+        q, weights = operation(q, positions, table, indexer_weights)
+        return q, None, weights
 
 
 class AttentionBackend(compressor_upstream.CompressorBackend):
@@ -466,13 +474,14 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         kwargs["bounded_replay"] = prefix_replay_enabled(get_current_vllm_config())
         # FP8 applies to the compressed main KV only; SWA rows stay BF16.
         kwargs["dtype"] = torch.bfloat16
-        kwargs["backend_cls"] = AttentionBackend
         super().__init__(*args, **kwargs)
 
     def get_kv_cache_spec(self, vllm_config):
         return dataclasses.replace(
             super().get_kv_cache_spec(vllm_config),
-            block_stride_alignment=BLOCK_STRIDE_ALIGNMENT,
+            block_stride_alignment=block_stride_alignment(
+                vllm_config.cache_config.block_size
+            ),
         )
 
 
@@ -525,18 +534,6 @@ def _bound_geometry(module) -> tuple[int, int, int] | None:
     return shape[1], stride_bytes // record_bytes, offset_bytes // record_bytes
 
 
-def _index_page_records(index_cache):
-    """Records per page, or zero when the physical layout breaks page alignment."""
-    if not isinstance(index_cache, IndexCacheRows):
-        return 0
-    per_page = index_cache.shape[1]
-    if index_cache.row_offset % per_page or index_cache.page_stride % per_page:
-        return 0
-    if index_cache.raw_hi is not None and index_cache.bank_records % per_page:
-        return 0
-    return per_page
-
-
 def _query_split(count, ranks):
     """``(part, padding)``: rows per TP rank and the static pad that covers them.
 
@@ -547,34 +544,6 @@ def _query_split(count, ranks):
     ``padding = 2 * ranks`` rows always cover it.
     """
     return (count + 2 * ranks - 1) // (2 * ranks) * 2, 2 * ranks
-
-
-def _request_row_slots(cache, block_table, width):
-    """Slots of logical rows ``0..width-1`` for every request: ``[requests, width]``.
-
-    Every token of a request scans the same capacity-wide rows, so address
-    them once per request instead of once per token.
-    """
-    rows_per_page = cache.shape[1]
-    # Logical row r lives in table column r // rows_per_page, so repeating each
-    # column rows_per_page times lines blocks up with rows 0..width-1 without
-    # a full-width gather (16-40x slower on TPU, see _row_slots).
-    blocks = (
-        block_table[:, :, None]
-        .expand(-1, -1, rows_per_page)
-        .reshape(block_table.shape[0], -1)
-        .long()
-    )
-    offsets = (
-        torch.arange(width, device=block_table.device).clamp(max=blocks.shape[1] - 1)
-        % rows_per_page
-    )
-    if width > blocks.shape[1]:
-        # Match _row_slots' clamp to the table's last row.
-        blocks = torch.cat(
-            (blocks, blocks[:, -1:].expand(-1, width - blocks.shape[1])), dim=1
-        )
-    return blocks[:, :width] * rows_per_page + offsets
 
 
 def _read_rows(cache, block_table, requests, logical):
@@ -668,30 +637,23 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             persistent=False,
         )
         self._config = vllm_config.model_config.hf_config.to_dict()
-        if self.indexer is not None:
-            indexer = cast(Any, self.indexer)
-            op = indexer.indexer_op
-            indexer.indexer_op = SparseMQAIndexer(
-                indexer.k_cache,
-                self._config["index_topk"],
-                op.candidate_blocks,
-                self.candidate_block_size,
-                candidate_source_layer=(
-                    self.candidate_source_layer
-                    if op.candidate_blocks is not None
-                    else None
-                ),
-                candidate_write=getattr(op, "candidate_write", False),
-            )
         self._max_model_len = vllm_config.model_config.max_model_len
         object.__setattr__(self, "mla_attn", self)
         self._prepare_and_attn_fn = self._prepare_tpu
+
+    def _indexer_cls(self, k_cache):
+        return DeepseekV41Indexer
 
     def get_kv_cache_spec(self, vllm_config):
         spec = super().get_kv_cache_spec(vllm_config)
         if spec is None:
             return spec
-        spec = dataclasses.replace(spec, block_stride_alignment=BLOCK_STRIDE_ALIGNMENT)
+        spec = dataclasses.replace(
+            spec,
+            block_stride_alignment=block_stride_alignment(
+                vllm_config.cache_config.block_size
+            ),
+        )
         if not self._fp8_kv:
             return spec
         return dataclasses.replace(spec, dtype=torch.uint8, page_size_padded=None)
@@ -792,15 +754,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             self._max_model_len // self.compress_ratio <= self._config["index_topk"]
         )
 
-    def _quantize_indexer(self, values):
-        # Values are kept dequantized in BF16 storage, not silently changed to
-        # another quantizer. Power-of-two FP8 scales remain with Q/K, so weights
-        # must NOT fold the Q scale a second time.
-        return round_fp8_activation(values, self.indexer.head_dim)
-
-    def _project_index_q(self, qr, positions):
-        return self._quantize_indexer(self._project_index_q_unquantized(qr, positions))
-
     def _project_index_q_unquantized(self, qr, positions):
         index_q = _value(self.indexer.wq_b(qr)).reshape(
             -1, self.indexer.n_head, self.indexer.head_dim
@@ -892,8 +845,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         indexer = self.indexer
         keys = indexer.k_norm(_value(indexer.wk(latent)))
         keys = self._rotate(keys, positions)
-        if not isinstance(cache, PackedFP8IndexCacheRows):
-            keys = self._quantize_indexer(keys)
         _insert(cache, slots, keys, valid)
         stage_cache = _active_stage_attn_cache
         if stage_cache is not None:
@@ -1658,7 +1609,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if self.indexer is not None and not self._all_indices_fit:
             weights = (
                 index_weights.float()
-                * self.indexer.head_dim**-0.5
+                * self.indexer.softmax_scale
                 * self.indexer.n_head**-0.5
             )
         count = positions.shape[0]
@@ -1702,84 +1653,17 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         weights = cast(torch.Tensor, weights)
                         keys_meta = metadata[indexer.k_cache.prefix]
                         index_cache = indexer.k_cache.kv_cache
-                        index_records = None
-                        if isinstance(index_cache, PackedFP8IndexCacheRows):
-                            index_records = _block_table(keys_meta)
-                        elif tiled:
-                            # Rows are row_indices of _row_slots(..., logical),
-                            # computed per request: [requests, capacity]. The
-                            # indexer shares each request's key tiles.
-                            has_fast_idx_offset = isinstance(
-                                getattr(index_cache, "row_offset", None), int
-                            )
-                            idx_req_key = (
-                                "index_req_slots",
-                                indexer.k_cache.prefix,
-                                index_cache.shape[1] if has_fast_idx_offset else None,
-                                (
-                                    index_cache.page_stride
-                                    if has_fast_idx_offset
-                                    else None
-                                ),
-                                capacity,
-                            )
-                            cached_idx_req = (
-                                stage_cache.get(idx_req_key)
-                                if stage_cache is not None
-                                else None
-                            )
-                            if cached_idx_req is None:
-                                req_slots = _request_row_slots(
-                                    index_cache, _block_table(keys_meta), capacity
-                                )
-                                cached_idx_req = (
-                                    req_slots
-                                    // index_cache.shape[1]
-                                    * index_cache.page_stride
-                                    + req_slots % index_cache.shape[1]
-                                    if has_fast_idx_offset
-                                    else req_slots
-                                )
-                                if stage_cache is not None:
-                                    stage_cache[idx_req_key] = cached_idx_req
-                            index_records = (
-                                index_cache.row_offset + cached_idx_req
-                                if has_fast_idx_offset
-                                else index_cache.row_indices(cached_idx_req)
-                            )
-                        if tiled or isinstance(index_cache, PackedFP8IndexCacheRows):
-                            assert index_records is not None
-                            selected = self._select_paged_indices(
-                                qr,
-                                positions,
-                                index_cache,
-                                index_records,
-                                requests,
-                                weights,
-                                lengths,
-                                swa_valid,
-                                query_start_loc=keys_meta.query_start_loc,
-                            )
-                        else:
-                            index_q = self._project_index_q(qr, positions)
-                            logical_compressed = torch.arange(
-                                capacity, device=positions.device
-                            )[None, :].expand(count, -1)
-                            keys = _read_rows(
-                                index_cache,
-                                _block_table(keys_meta),
-                                requests,
-                                logical_compressed,
-                            )
-                            scores = (
-                                torch.einsum(
-                                    "thd,tcd->thc", index_q.float(), keys.float()
-                                ).relu()
-                                * weights[:, :, None]
-                            ).sum(1)[None]
-                            selected = self._select_indices(
-                                scores, lengths, logical_compressed, count
-                            )
+                        selected = self._select_paged_indices(
+                            qr,
+                            positions,
+                            index_cache,
+                            _block_table(keys_meta),
+                            requests,
+                            weights,
+                            lengths,
+                            swa_valid,
+                            query_start_loc=keys_meta.query_start_loc,
+                        )
                     if stage_cache is None or not tiled:
                         # Keep the persistent buffer's physical shape across compile
                         # buckets when not sharing stage-scoped main_records directly.
@@ -1942,7 +1826,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         """
         indexer = self.indexer
         count = qr.shape[0]
-        packed_fp8 = isinstance(index_cache, PackedFP8IndexCacheRows)
         has_candidates = indexer.indexer_op.candidate_blocks is not None
         candidate_write = has_candidates and getattr(
             indexer.indexer_op, "candidate_write", False
@@ -1993,7 +1876,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         (positions, 0),
                         (active_lengths, 0),
                         # FP8 candidate grouping must exclude padding requests.
-                        (requests, -1 if packed_fp8 else 0),
+                        (requests, -1),
                     )
                 )
             else:
@@ -2024,7 +1907,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 requests_part,
             ) = cached_query_split
         offsets_part = None
-        if packed_fp8 and query_start_loc is not None:
+        if query_start_loc is not None:
             # This rank's rows [rank * part, rank * part + part) of each request.
             offsets_part = query_start_loc.int()
             if split:
@@ -2040,21 +1923,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         else:
             qr_part, weights_part, candidates_part = qr, weights, candidates
 
-        if packed_fp8 and qr_part.device.type != "cpu":
-            projected = _value(indexer.wq_b(qr_part)).reshape(
-                -1, indexer.n_head, indexer.head_dim
+        if qr_part.device.type != "cpu":
+            q_part, _, weights_part = indexer.forward_q(
+                qr_part, None, weights_part, positions_part, self._tpu_rope_cache
             )
-            q_part, weights_part = quantize_query(
-                projected, positions_part, self._tpu_rope_cache, weights_part
-            )
-        elif packed_fp8:
+        else:
             q_part, q_scale = quantize_fp8_activation(
                 self._project_index_q_unquantized(qr_part, positions_part),
                 indexer.head_dim,
             )
             weights_part = weights_part.float() * q_scale.squeeze(-1)
-        else:
-            q_part = self._project_index_q(qr_part, positions_part)
 
         selected, published = indexer.indexer_op(
             q_part,
@@ -2065,7 +1943,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             requests_part,
             candidates=candidates_part,
             batch_max=batch_max,
-            page_records=_index_page_records(index_cache),
             unordered=self._fp8_kv,
             score_width=max(1, self._max_model_len // self.compress_ratio),
             stage_cache=stage_cache if not split else None,
@@ -2087,68 +1964,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
             )
         return selected
-
-    def _select_indices(self, scores, lengths, logical_compressed, count):
-        indexer = self.indexer
-        candidates = None
-        # If every block fits, publication and filtering are identities. The
-        # Flash config has 2048 candidate slots but only 512 blocks at 4K.
-        capacity = logical_compressed.shape[-1]
-        if (
-            indexer.indexer_op.candidate_blocks is not None
-            and self.candidate_block_buffer.shape[-1] * self.candidate_block_size
-            < capacity
-        ):
-            if getattr(indexer.indexer_op, "candidate_write", False):
-                published = select_candidate_blocks(
-                    scores,
-                    lengths,
-                    self._config["candidate_topk_blocks"],
-                    self.candidate_block_size,
-                )
-                blocks = published[..., :: self.candidate_block_size]
-                ids = (
-                    torch.arange(blocks.shape[-1], device=blocks.device)
-                    .expand_as(blocks)
-                    .masked_fill(~blocks, -1)
-                )
-                selected = ids.topk(
-                    min(ids.shape[-1], self.candidate_block_buffer.shape[-1]), dim=-1
-                ).values
-                self.candidate_block_buffer.copy_(
-                    torch.nn.functional.pad(
-                        selected[0].int(),
-                        (
-                            0,
-                            self.candidate_block_buffer.shape[-1] - selected.shape[-1],
-                            0,
-                            self.candidate_block_buffer.shape[0] - count,
-                        ),
-                        value=-1,
-                    )
-                )
-            else:
-                ids = self.candidate_block_buffer[:count]
-                # Membership is a 2-D block table, not [tokens, context, topk].
-                # The extra column absorbs all invalid/padded candidate ids.
-                num_blocks = (
-                    capacity + self.candidate_block_size - 1
-                ) // self.candidate_block_size
-                valid_ids = (ids >= 0) & (ids < num_blocks)
-                block_mask = torch.zeros(
-                    (count, num_blocks + 1), dtype=torch.bool, device=ids.device
-                )
-                block_mask.scatter_(
-                    1, ids.masked_fill(~valid_ids, num_blocks).long(), True
-                )
-                candidates = block_mask.gather(
-                    1, logical_compressed // self.candidate_block_size
-                )[None]
-        if candidates is not None:
-            candidates = candidates | (lengths.max() <= self._config["index_topk"])
-        return select_compressed_indices(
-            scores, lengths, self._config["index_topk"], candidates=candidates
-        )[0]
 
     def forward_mqa(self, q, kv, positions, output):
         raise RuntimeError("TPU sparse attention is dispatched by _prepare_tpu")

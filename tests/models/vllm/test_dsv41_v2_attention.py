@@ -15,9 +15,9 @@ import pytest
 import torch
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-    IndexCacheRows,
-    PagedCacheRows,
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import (
+    PackedFP8IndexCacheRows,
 )
 
 
@@ -299,7 +299,7 @@ def test_prepare_tpu_untiled_fp8_kv_raises_not_implemented(monkeypatch):
 
 
 def test_prepare_tpu_indexer_not_all_indices_fit_both_branches(monkeypatch):
-    """Test _prepare_tpu indexer when _all_indices_fit is False (tiled & untiled)."""
+    """_prepare_tpu routes both tiled and untiled windows to the paged indexer."""
     attn = object.__new__(v2_attn.DeepseekV41Attention)
     torch.nn.Module.__init__(attn)
 
@@ -327,8 +327,9 @@ def test_prepare_tpu_indexer_not_all_indices_fit_both_branches(monkeypatch):
         wq_b=lambda qr: qr,
         n_head=2,
         head_dim=16,
+        softmax_scale=16**-0.5,
         k_cache=SimpleNamespace(
-            prefix="idx_k", kv_cache=MagicMock(spec=IndexCacheRows)
+            prefix="idx_k", kv_cache=MagicMock(spec=PackedFP8IndexCacheRows)
         ),
     )
     indexer_mock.k_cache.kv_cache.row_indices = lambda slots: slots.int()
@@ -353,7 +354,10 @@ def test_prepare_tpu_indexer_not_all_indices_fit_both_branches(monkeypatch):
     metadata = {
         "swa_kv": SimpleNamespace(block_table=torch.zeros((2, 4), dtype=torch.int32)),
         "comp_kv": SimpleNamespace(block_table=torch.zeros((2, 4), dtype=torch.int32)),
-        "idx_k": SimpleNamespace(block_table=torch.zeros((2, 4), dtype=torch.int32)),
+        "idx_k": SimpleNamespace(
+            block_table=torch.zeros((2, 4), dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        ),
     }
 
     forward_ctx = SimpleNamespace(attn_metadata=metadata, additional_kwargs={})
@@ -367,24 +371,16 @@ def test_prepare_tpu_indexer_not_all_indices_fit_both_branches(monkeypatch):
     )
     monkeypatch.setattr(
         v2_attn,
-        "_request_row_slots",
-        lambda cache, table, cap: torch.zeros((2, cap), dtype=torch.int64),
-    )
-    monkeypatch.setattr(
-        v2_attn,
         "_row_slots",
         lambda cache, table, reqs, log: torch.zeros_like(log, dtype=torch.int64),
     )
     monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
     attn.wq_b = lambda qr: qr
     attn._rotate = lambda x, pos: x
-    attn._quantize_indexer = lambda x: x
 
     select_paged_called = []
 
-    def fake_select_paged(
-        qr, pos, cache, records, reqs, weights, lengths, slots, pending
-    ):
+    def fake_select_paged(*args, **kwargs):
         select_paged_called.append(True)
         return torch.zeros((count, 2), dtype=torch.int32)
 
@@ -423,13 +419,6 @@ def test_prepare_tpu_indexer_not_all_indices_fit_both_branches(monkeypatch):
             (count, log.shape[1], indexer_mock.head_dim)
         ),
     )
-    select_indices_called = []
-
-    def fake_select_indices(scores, lengths, logical, cnt):
-        select_indices_called.append(True)
-        return torch.zeros((cnt, 2), dtype=torch.int32)
-
-    monkeypatch.setattr(attn, "_select_indices", fake_select_indices)
     monkeypatch.setattr(
         v2_attn,
         "sparse_attention",
@@ -441,7 +430,7 @@ def test_prepare_tpu_indexer_not_all_indices_fit_both_branches(monkeypatch):
     v2_attn.DeepseekV41Attention._prepare_tpu(
         attn, None, qr, kv, None, None, idx_weights, positions, output
     )
-    assert len(select_indices_called) == 1
+    assert len(select_paged_called) == 2
 
 
 def test_write_encoder_global_kv_empty_metadata(monkeypatch):

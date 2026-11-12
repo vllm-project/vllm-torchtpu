@@ -1638,10 +1638,11 @@ def _patch_vllm_same_step_prefix_hits() -> None:
 def _order_pages_by_size(groups: list) -> list:
     """Place each group's pages largest first inside a block-outer block.
 
-    Upstream packs a group's pages in registration order. Every page size of a
-    V4.1 group is a power of two and the block stride is a multiple of the
-    largest one, so largest-first puts every page on a multiple of its own size:
-    CSA2's whole-page SWA and main-record addressing then holds in every block.
+    Upstream packs a group's pages in registration order. Main KV and SWA pages
+    are powers of two and the block stride is a multiple of the largest one, so
+    largest-first puts each on a multiple of its own size, as CSA2's whole-page
+    addressing needs. Indexer pages (132-byte records in 4 KiB units) are
+    smaller than every main page, so they come last.
     """
     import dataclasses
 
@@ -1664,6 +1665,46 @@ def _order_pages_by_size(groups: list) -> list:
             )
         ordered_groups.append(group)
     return ordered_groups
+
+
+def _patch_vllm_packed_state_group_anchor() -> None:
+    """Size packed state groups by the stride-aligned block.
+
+    Backport of vllm-project/vllm#67171. Upstream caps sliding-window and other
+    state groups at the block size before `block_stride_alignment` rounds it
+    up, so part of every DeepSeek-V4.1 v2 SWA block stays empty and the SWA
+    layers take extra groups. Rewrites `_get_packed_kv_cache_groups` in place;
+    a no-op once the source no longer has the needle.
+    """
+    import inspect
+    import textwrap
+
+    from vllm.v1.core import kv_cache_utils
+
+    original = getattr(kv_cache_utils, "_get_packed_kv_cache_groups", None)
+    if original is None or getattr(original, "_tpu_state_group_anchor_patch", False):
+        return
+    source = textwrap.dedent(inspect.getsource(original))
+    needle = "\n    groups = []\n    for spec, page_size_layers, balanced in bucketed:"
+    fix = """
+    anchor_bytes = round_up(
+        anchor_bytes,
+        math.lcm(*(s.block_stride_alignment or 1 for s in kv_cache_spec.values())),
+    )"""
+    if source.count(needle) != 1 or "anchor_bytes = round_up(" in source:
+        return
+    namespace: dict = {}
+    exec(
+        compile(source.replace(needle, fix + needle), kv_cache_utils.__file__, "exec"),
+        kv_cache_utils.__dict__,
+        namespace,
+    )
+    patched = namespace["_get_packed_kv_cache_groups"]
+    patched._tpu_state_group_anchor_patch = True
+    kv_cache_utils._get_packed_kv_cache_groups = patched
+    logger.info(
+        "Applied TPU patch: packed state groups sized by the stride-aligned block."
+    )
 
 
 def _patch_vllm_dsv41_page_order() -> None:
