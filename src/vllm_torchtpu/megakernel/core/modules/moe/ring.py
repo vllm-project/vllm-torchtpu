@@ -30,14 +30,25 @@ from ...ops import bswitch
 from .context import MoEEmit
 
 
-def fetch_e(m: MoEEmit, u, l_idx, t=None):
-    """Issue routed expert unit `u` into dynamic bank `u % NBE`."""
+def _slot(m: MoEEmit, i, fixed: bool = False):
+    """`prim_now` source slot of hit-list entry `i`: `elist[i] - me * ER` for
+    the fixed hits (`i < st[5]`, or always when `fixed`), else `wlist[i]`."""
+    me, mp, scr = m.me, m.mp, m.scr
+    w_fix = scr["elist"][i] - me * mp.ER
+    return w_fix if fixed else jnp.where(i < scr["st"][5], w_fix, scr["wlist"][i])
+
+
+def fetch_e(m: MoEEmit, u, l_idx, t=None, fixed: bool = False):
+    """Issue routed expert unit `u` into dynamic bank `u % NBE` (`fixed`: `u`
+    belongs to a fixed hit, `prim_now` only)."""
     W, me, mp, scr, stream = m.W, m.me, m.mp, m.scr, m.stream
     ECOPY, ER, NBE, NSS, T13, TE = mp.ECOPY, mp.ER, mp.NBE, mp.NSS, mp.T13, mp.TE
     if t is None and isinstance(u, int):
         t = u % TE
     i = u // TE if t is None else (u - t) // TE
-    if ECOPY:
+    if ECOPY and mp.prim_now:
+        w = _slot(m, i, fixed)
+    elif ECOPY:
         w = scr["wlist"][i]
     else:
         e = scr["elist"][i]
@@ -133,7 +144,9 @@ def _unit_meta(m: MoEEmit, u, t):
     lst = scr["wlist"] if ECOPY else scr["elist"]
     n_l = lst.shape[0]
     ic = i if isinstance(i, int) else jnp.minimum(i, n_l - 1)
-    if ECOPY:
+    if ECOPY and mp.prim_now:
+        w = _slot(m, ic)
+    elif ECOPY:
         w = lst[ic]
     else:
         e = lst[ic]
@@ -191,6 +204,8 @@ def slot_of(m: MoEEmit, i):
     me, mp, scr = m.me, m.mp, m.scr
     lst = scr["wlist"] if mp.ECOPY else scr["elist"]
     ic = jnp.minimum(i, lst.shape[0] - 1)
+    if mp.ECOPY and mp.prim_now:
+        return _slot(m, ic)
     if mp.ECOPY:
         return scr["wlist"][ic]
     e = scr["elist"][ic]
@@ -276,6 +291,21 @@ def fetch_loop(m: MoEEmit, nf, l_idx):
         l_idx,
         [lambda a=a, b=b: arm(a, b) for a, b in zip(W["e13"], W["e2"])],
     )
+
+
+def fetch_range(m: MoEEmit, k0, k1, l_idx, fixed: bool = False):
+    """Issue expert units `k0 .. k1 - 1` (`k1 <= NBE`) into the ring (`fixed`:
+    all of them belong to fixed hits, `prim_now` only)."""
+    mp = m.mp
+    if mp.stack_e:
+        for k in range(mp.NBE):
+
+            @pl.when(jnp.logical_and(k >= k0, k < k1))
+            def _(k=k):
+                fetch_e(m, k, l_idx, fixed=fixed)
+
+    else:
+        lax.fori_loop(k0, k1, lambda k, _: (fetch_e(m, k, l_idx, fixed=fixed), 0)[1], 0)
 
 
 def es_wait(m: MoEEmit, i):

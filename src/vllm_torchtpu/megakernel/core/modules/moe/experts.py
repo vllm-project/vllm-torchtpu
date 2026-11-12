@@ -205,19 +205,38 @@ def experts_piped(m: MoEEmit, l_idx, n_hit):
         egive(m, u2, l_idx, T13)
 
 
-def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
+def experts_piped_ep(m: MoEEmit, l_idx, n_hit, pre_drain=None):
+    """EP multi-tile software pipeline (`T13 == 2 * T2`).
+
+    `pre_drain()`, when given (`MoETunables.flush_pre_drain`), runs once,
+    between the steady-state loop and the last expert's down projection (with
+    no expert in the layer: after the empty pipeline).
+    """
+    if pre_drain is None:
+        pl.when(n_hit > 0)(lambda: _piped_ep_body(m, l_idx, n_hit, None))
+    else:
+        # one trace site for pre_drain: the pipeline up to the last expert's
+        # down projection, pre_drain(), then that down projection
+        pl.when(n_hit > 0)(lambda: _piped_ep_body(m, l_idx, n_hit, "head"))
+        pre_drain()
+        pl.when(n_hit > 0)(lambda: _piped_ep_body(m, l_idx, n_hit, "tail"))
+
+
+def _piped_ep_body(m: MoEEmit, l_idx, n_hit, part_sel):
+    """`experts_piped_ep`'s pipeline; `part_sel` "head" (prologue + loop),
+    "tail" (last expert's down projection) or None (all of it)."""
     ex, lane_e8, mp, scr, stream, tk = m.ex, m.lane_e8, m.mp, m.scr, m.stream, m.tk
     MB, MR = ex.MB, ex.MR
     H, IR, NSS, T13, T2, TE = mp.H, mp.IR, mp.NSS, mp.T13, mp.T2, mp.TE
 
-    @pl.when(n_hit > 0)
-    def _():
-        acc, acc13 = scr["acc"], scr["acc13"]
-        xb, xb2, part = scr["xb"], scr["xb2"], scr["part"]
-        BN = 2 * IR
-        TK13, TK2 = tk["e13"], tk["e2"]
-        DIRECT0 = mp.r2_direct_store
+    acc, acc13 = scr["acc"], scr["acc13"]
+    xb, xb2, part = scr["xb"], scr["xb2"], scr["part"]
+    BN = 2 * IR
+    TK13, TK2 = tk["e13"], tk["e2"]
+    DIRECT0 = mp.r2_direct_store
+    has_es = "es" in m.W
 
+    if part_sel in (None, "head"):
         if not DIRECT0:
             acc13[...] = jnp.zeros((MB, BN), F32)
         for t in range(T13):
@@ -236,7 +255,6 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
             else:
                 egive(m, t, l_idx, t)
         es_wait(m, 0)
-        has_es = "es" in m.W
         h0 = acc13[:, :BN] * scr["es"][0, :, :BN] if has_es else acc13[:, :BN]
         mid0 = round_bf16(
             round_bf16(jax.nn.silu(round_bf16(h0[:, :IR]))) * round_bf16(h0[:, IR:])
@@ -340,6 +358,7 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
 
         lax.fori_loop(0, n_hit - 1, body_ep, 0)
 
+    if part_sel in (None, "tail"):
         i_last = n_hit - 1
         e_last = scr["elist"][i_last]
         s_last = i_last % NSS

@@ -68,7 +68,8 @@ _BASE_MOE = {"pipe_ep": True, "route_vec": True, "ecopy_opt": 1}
 
 
 # Core tile fields every case starts from: the fully unrolled dense matmul
-# (as the candidate4 schedule runs it).
+# (as the candidate4 schedule runs it), which the register-summed shared
+# expert of `sh_pre` reproduces.
 _BASE_TILES = {"dense_acc_pair": True, "dmm_unroll": 8}
 
 
@@ -137,14 +138,29 @@ def test_base_case_engages_the_gates():
 
 
 # (id, option, value, resolved MoEParams field, other options set in both arms)
+_SHRINK = {"cp_interleave": True, "route_shrink": True}
 _EXACT = [
     ("ep_fast_refill", "ep_fast_refill", True, "ep_fast", {}),
+    ("route_early", "route_early", True, "route_early", {}),
+    (
+        "route_early-prim_now",
+        "route_early",
+        True,
+        "route_early",
+        {**_SHRINK, "prim_now": True},
+    ),
+    ("route_shrink", "route_shrink", True, "route_shrink", {"cp_interleave": True}),
+    ("prim_now", "prim_now", True, "prim_now", _SHRINK),
+    ("sh_pre", "sh_pre", True, "sh_pre", {}),
+    ("sh_pre-hoist", "sh_pre", True, "sh_hoist", {"tiles": {"dwait_hoist": True}}),
+    ("sh2_pre_route", "sh2_pre_route", True, "sh2_pre_route", {"sh_pre": True}),
+    ("flush_pre_drain", "flush_pre_drain", True, "flush_pre_drain", {}),
 ]
 
 
 # Decode (T=1) rechecks of the options that touch every bucket's routing or
 # expert refills; the rest run at the verify shape only (interpret-mode cost).
-_DECODE_TOO = {"ep_fast_refill"}
+_DECODE_TOO = {"ep_fast_refill", "route_early", "sh_pre"}
 
 
 @pytest.mark.parametrize(
@@ -162,6 +178,40 @@ def test_exact_option_is_bit_identical(
     before, after = _moe_params(T, B, base), _moe_params(T, B, on)
     assert getattr(after, field) != getattr(before, field)
     _assert_same(_run(T, B, on), _run(T, B, base))
+
+
+def test_cp_interleave_changes_the_copy_scan_within_tolerance():
+    """cp_interleave reorders the copy slots Po2C scans (approx): the step stays
+    close to the rank-major order's, and the resolved flag reaches the plan."""
+    assert _moe_params(4, 8, {"cp_interleave": True}).cp_interleave
+    a = _run(4, 8, {})[0].view(np.uint16).view(jnp.bfloat16).astype(np.float32)
+    b = (
+        _run(4, 8, {"cp_interleave": True})[0]
+        .view(np.uint16)
+        .view(jnp.bfloat16)
+        .astype(np.float32)
+    )
+    np.testing.assert_allclose(b, a, atol=3e-2, rtol=3e-2)
+
+
+def test_route_shrink_requires_cp_interleave():
+    with pytest.raises(mk.MegakernelConfigError, match="cp_interleave"):
+        _moe_params(4, 8, {"route_shrink": True})
+
+
+def test_sh_pre_and_flush_gates():
+    """sh_pre needs a lazy MoE segment; sh2_pre_route needs sh_pre;
+    flush_pre_drain needs PIPE_EP and a lazy segment."""
+    assert not _moe_params(4, 8, {"sh_pre": True, "tiles": {"lazy": False}}).sh_pre
+    assert not _moe_params(4, 8, {"sh2_pre_route": True}).sh2_pre_route
+    fpd = {"flush_pre_drain": True}
+    assert not _moe_params(4, 8, {**fpd, "pipe_ep": False}).flush_pre_drain
+    assert not _moe_params(4, 8, {**fpd, "tiles": {"lazy": False}}).flush_pre_drain
+
+
+def test_prim_now_needs_route_shrink():
+    assert not _moe_params(4, 8, {"prim_now": True}).prim_now
+    assert _moe_params(4, 8, {**_SHRINK, "prim_now": True}).prim_now
 
 
 def test_ep_fast_refill_gate():

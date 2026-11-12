@@ -80,13 +80,21 @@ def synth_full_scale_spec(*, moe_tp: bool = False, R: int = 8) -> ModelSpec:
 
 
 # Extras of the candidate4 schedule options' flips (Qwen3.5 tiny geometry, R=2):
-# PIPE_EP with one expert per ring (I=512, ebank 128 KiB: TE = 3 = nbe).
+# EP with 4 redundant copies per rank and vectorized routing; PIPE_EP with one
+# expert per ring (I=512, ebank 128 KiB: TE = 3 = nbe); the fully unrolled
+# dense matmul.
+_EP_COPIES = {
+    "geom_kw": {"moe_tp": False, "e_slots": 68},
+    "moe.route_vec": True,
+    "moe.ecopy_opt": 1,
+}
 _PIPE_EP1 = {
     "geom_kw": {"moe_tp": False, "I": 512},
     "moe.pipe_ep": True,
     "ebank": 128 << 10,
     "nbe": 3,
 }
+_UNROLL = {"dense_acc_pair": True, "dmm_unroll": 8}
 
 EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ("nbd", "nbd", 8, (2, 4), {}),
@@ -112,6 +120,30 @@ EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ("kv_ering-wide", "gqa.kv_ering", True, (4, 24), {}),
     ("gqa_qv-wide", "gqa.gqa_qv", True, (4, 24), {}),
     ("ep_fast_refill", "moe.ep_fast_refill", True, (2, 4), _PIPE_EP1),
+    ("route_early", "moe.route_early", True, (2, 4), _EP_COPIES),
+    (
+        "route_shrink",
+        "moe.route_shrink",
+        True,
+        (2, 4),
+        {**_EP_COPIES, "moe.cp_interleave": True},
+    ),
+    (
+        "prim_now",
+        "moe.prim_now",
+        True,
+        (2, 4),
+        {**_EP_COPIES, "moe.cp_interleave": True, "moe.route_shrink": True},
+    ),
+    ("sh_pre", "moe.sh_pre", True, (2, 4), _UNROLL),
+    (
+        "sh2_pre_route",
+        "moe.sh2_pre_route",
+        True,
+        (2, 4),
+        {**_UNROLL, "moe.sh_pre": True},
+    ),
+    ("flush_pre_drain", "moe.flush_pre_drain", True, (2, 4), _PIPE_EP1),
 ]
 
 __all__ = [

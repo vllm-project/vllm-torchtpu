@@ -85,10 +85,28 @@ def topk_rows_on_lanes(
     return ids, sel
 
 
+def route_weights(m: MoEEmit, sel: Any, p8: Any) -> None:
+    """Renormalized routing weights of the selected experts into `wn`."""
+    wsel = jnp.where(sel, p8, 0.0)
+    m.scr["wn"][...] = jnp.where(
+        m.row8 < m.ex.B, wsel / jnp.sum(wsel, axis=-1, keepdims=True), 0.0
+    )
+
+
 def route_topk(
-    m: MoEEmit, choice: Any, p8: Any, VEC: bool, slot_ec: Any, NCP: int, MROW: int
-) -> None:
-    """Pick each row's top-k experts; write `hitv` (ids or VEC meta) and `wn`."""
+    m: MoEEmit,
+    choice: Any,
+    p8: Any,
+    VEC: bool,
+    slot_ec: Any,
+    NCP: int,
+    MROW: int,
+    *,
+    write_wn: bool = True,
+) -> Any:
+    """Pick each row's top-k experts; write `hitv` (ids or VEC meta) and, unless
+    `write_wn` is False (the caller writes it later), `wn`. Returns the
+    selection mask."""
     ctx, ex, mp, stream, scr = m.ctx, m.ex, m.mp, m.stream, m.scr
     EM, FLT_MIN, lane128, lane_e8, row8 = m.EM, m.FLT_MIN, m.lane128, m.lane_e8, m.row8
     B, MR, R = ex.B, ex.MR, ex.R
@@ -149,9 +167,17 @@ def route_topk(
         lane_b = lax.broadcasted_iota(I32, (128, E), 1)
         rr = row_b - NCP
         in_rank = jnp.logical_and(lane_b >= rr * ER, lane_b < (rr + 1) * ER)
+        # copy slot row j: rank-major (rank j // EXTRA, extra slot j % EXTRA,
+        # code j + 1) or with cp_interleave rank-minor (rank j % R, extra slot
+        # j // R); `ecopy` holds 1 + rank * EXTRA + slot.
+        cp_code = (
+            (row_b % R) * mp.EXTRA + lax.div(row_b, R) + 1
+            if mp.cp_interleave
+            else row_b + 1
+        )
         bm = jnp.where(
             row_b < NCP,
-            jnp.where(cpi == row_b + 1, 1.0, 0.0),
+            jnp.where(cpi == cp_code, 1.0, 0.0),
             jnp.where(
                 rr < R,
                 jnp.where(in_rank, 1.0, 0.0),
@@ -165,7 +191,9 @@ def route_topk(
         scr["hitv"][MROW : MROW + 1, :] = meta.astype(I32)
     else:
         scr["hitv"][...] = ids
-    wsel = jnp.where(sel, p8, 0.0)
-    scr["wn"][...] = jnp.where(
-        row8 < B, wsel / jnp.sum(wsel, axis=-1, keepdims=True), 0.0
-    )
+    if write_wn:
+        wsel = jnp.where(sel, p8, 0.0)
+        scr["wn"][...] = jnp.where(
+            row8 < B, wsel / jnp.sum(wsel, axis=-1, keepdims=True), 0.0
+        )
+    return sel

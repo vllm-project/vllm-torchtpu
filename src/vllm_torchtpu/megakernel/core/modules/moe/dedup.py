@@ -23,10 +23,22 @@ from jax import lax
 
 from ...ops import I32
 from .context import MoEEmit
+from .params import CP_SH
 
 
-def dedup_vec(m: MoEEmit, NCP: int, MROW: int, nb_picks: int) -> tuple[Any, Any, Any]:
-    """Read the vectorized route tables back into `elist`/`wlist`/`cplist`."""
+def dedup_vec(
+    m: MoEEmit,
+    NCP: int,
+    MROW: int,
+    nb_picks: int,
+    *,
+    early_fill: Any = None,
+) -> tuple[Any, Any, Any]:
+    """Read the vectorized route tables back into `elist`/`wlist`/`cplist`.
+
+    `early_fill(n_hit)`, when given, runs right after the fixed-hit scan, while
+    the hit list's first `n_hit` entries are final (`MoETunables.route_early`).
+    """
     scr, sc, me = m.scr, m.sc, m.me
     R, ER = m.ex.R, m.mp.ER
     with sc("route_dedup", 3):
@@ -35,24 +47,66 @@ def dedup_vec(m: MoEEmit, NCP: int, MROW: int, nb_picks: int) -> tuple[Any, Any,
         n_tot = scr["hits"][MROW, NCP + R]
         base = me * ER
 
+        prim_now = m.mp.prim_now
+
         def prim(s, n):
             e = base + s
             f = scr["hits"][lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)]
             idx = jnp.minimum(n, nb_picks - 1)
             scr["elist"][idx] = e
-            scr["wlist"][idx] = s
+            if not prim_now:  # prim_now: slot = e - me * ER (`ring._slot`)
+                scr["wlist"][idx] = s
             return n + f
 
         n_hit = lax.fori_loop(0, ER, prim, jnp.int32(0), unroll=True)
+        if prim_now:
+            scr["st"][5] = n_hit
+        if early_fill is not None:
+            early_fill(n_hit)
 
-        def cpl(j, n):
-            v1 = scr["hits"][MROW, j]
-            idx = jnp.minimum(n, nb_picks - 1)
-            scr["cplist"][idx] = v1 - 1
-            return n + jnp.where(v1 > 0, 1, 0).astype(I32)
+        if m.mp.route_shrink:
+            # Each entry packs its copy-slot row j above the expert id, so Po2C
+            # decodes both holders with shifts / masks (`cp_decode`). Rows are
+            # read in groups of 16 before their stores; a missed row's store is
+            # overwritten (n_cp advances only on a hit).
+            n_cp = jnp.int32(0)
+            for c0 in range(0, NCP, 16):
+                vs = [scr["hits"][MROW, j] for j in range(c0, min(c0 + 16, NCP))]
+                for k, v1 in enumerate(vs):
+                    scr["cplist"][n_cp] = v1 + (((c0 + k) << CP_SH) - 1)
+                    n_cp = n_cp + lax.shift_right_logical(-v1, 31)
+        else:
 
-        n_cp = lax.fori_loop(0, NCP, cpl, jnp.int32(0), unroll=True)
+            def cpl(j, n):
+                v1 = scr["hits"][MROW, j]
+                idx = jnp.minimum(n, nb_picks - 1)
+                scr["cplist"][idx] = v1 - 1
+                return n + jnp.where(v1 > 0, 1, 0).astype(I32)
+
+            n_cp = lax.fori_loop(0, NCP, cpl, jnp.int32(0), unroll=True)
     return n_tot, n_hit, n_cp
+
+
+def cp_decode(m: MoEEmit, w: Any) -> tuple[Any, Any, Any, Any, Any]:
+    """`route_shrink` copy-list entry -> `(e, r0, s0, r1, s1)`: the primary
+    rank / slot and the copy's rank / slot (copy-slot row j is rank j % R,
+    slot ER + j // R, the `cp_interleave` order)."""
+    R, ER = m.ex.R, m.mp.ER
+    e = lax.bitwise_and(w, (1 << CP_SH) - 1)
+    j = lax.shift_right_logical(w, CP_SH)
+    if ER & (ER - 1) == 0:
+        r0 = lax.shift_right_logical(e, ER.bit_length() - 1)
+        s0 = lax.bitwise_and(e, ER - 1)
+    else:
+        r0 = lax.div(e, ER)
+        s0 = e - r0 * ER
+    if R & (R - 1) == 0:
+        r1 = lax.bitwise_and(j, R - 1)
+        s1 = ER + lax.shift_right_logical(j, R.bit_length() - 1)
+    else:
+        r1 = lax.rem(j, R)
+        s1 = ER + lax.div(j, R)
+    return e, r0, s0, r1, s1
 
 
 def dedup_ecopy(
@@ -191,11 +245,16 @@ def po2c(m: MoEEmit, slot_ec: Any, n_tot: Any, n_hit: Any, n_cp: Any) -> Any:
         # `rload` vector, so on a 1-expert gap it flips only when `cur` is
         # strictly above AND `alt` is strictly below the mean (avoiding a no-op
         # load swap `(k, k-1) -> (k-1, k)`).
+        shrink = m.mp.route_shrink
+
         def po2c_pass1(j, _):
-            e = scr["cplist"][j]
-            r0 = lax.div(e, ER)
-            c0 = scr["ecopy"][slot_ec, 0, e].astype(I32) - 1
-            r1 = lax.div(c0, EXTRA)
+            if shrink:
+                e, r0, _s0, r1, _s1 = cp_decode(m, scr["cplist"][j])
+            else:
+                e = scr["cplist"][j]
+                r0 = lax.div(e, ER)
+                c0 = scr["ecopy"][slot_ec, 0, e].astype(I32) - 1
+                r1 = lax.div(c0, EXTRA)
             l0 = scr["rload"][r0]
             l1 = scr["rload"][r1]
             use_c = jnp.logical_or(
@@ -211,12 +270,15 @@ def po2c(m: MoEEmit, slot_ec: Any, n_tot: Any, n_hit: Any, n_cp: Any) -> Any:
             return 0
 
         def po2c_pass2(j, n):
-            e = scr["cplist"][j]
-            r0 = lax.div(e, ER)
-            s0 = e - r0 * ER
-            c0 = scr["ecopy"][slot_ec, 0, e].astype(I32) - 1
-            r1 = lax.div(c0, EXTRA)
-            s1 = ER + (c0 - r1 * EXTRA)
+            if shrink:
+                e, r0, s0, r1, s1 = cp_decode(m, scr["cplist"][j])
+            else:
+                e = scr["cplist"][j]
+                r0 = lax.div(e, ER)
+                s0 = e - r0 * ER
+                c0 = scr["ecopy"][slot_ec, 0, e].astype(I32) - 1
+                r1 = lax.div(c0, EXTRA)
+                s1 = ER + (c0 - r1 * EXTRA)
             use_c = scr["cpchoice"][j] != 0
             cur = jnp.where(use_c, r1, r0)
             alt = jnp.where(use_c, r0, r1)

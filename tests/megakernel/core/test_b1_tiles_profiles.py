@@ -325,6 +325,12 @@ def _plan_effect(field: str, g: Any, ex: mk.ExecSpec) -> Any:
         "rel_fetch": sp.rel_fetch,
         "moe.moe_group_rows": bp["moe"].group_rel,
         "moe.ep_fast_refill": bp["moe"].ep_fast,
+        "moe.route_early": bp["moe"].route_early,
+        "moe.route_shrink": bp["moe"].route_shrink,
+        "moe.prim_now": bp["moe"].prim_now,
+        "moe.sh_pre": bp["moe"].sh_pre,
+        "moe.sh2_pre_route": bp["moe"].sh2_pre_route,
+        "moe.flush_pre_drain": bp["moe"].flush_pre_drain,
     }.get(field)
 
 

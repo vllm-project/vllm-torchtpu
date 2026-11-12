@@ -25,6 +25,10 @@ from ...ops import col_chunk, round_up
 
 logger = logging.getLogger(__name__)
 
+# `route_shrink`: bit position of the copy-slot index packed above the expert id
+# in a copy-list entry.
+CP_SH = 16
+
 
 @dataclass(frozen=True)
 class MoEParams:
@@ -69,6 +73,27 @@ class MoEParams:
     # `MoETunables.ep_fast_refill` resolved: PIPE_EP with one whole expert per
     # ring (NBE == TE) and unstacked expert weights.
     ep_fast: bool = False
+    # `MoETunables.route_early`: routing weights under the hit-list copy, and
+    # (vectorized routing) the first expert fills right after the fixed-hit scan.
+    route_early: bool = False
+    # `MoETunables.cp_interleave` / `route_shrink` resolved (vectorized routing
+    # with redundant copies; `route_shrink` also needs E < 2**CP_SH).
+    cp_interleave: bool = False
+    route_shrink: bool = False
+    # `MoETunables.prim_now` resolved (with `route_shrink`, ER dividing 128): the
+    # fixed-hit scan stores no `wlist` entries; slot = expert - me * ER for hit
+    # list entries below `st[5]` (the fixed-hit count).
+    prim_now: bool = False
+    # `MoETunables.sh_pre` resolved (lazy MoE segment, shared expert of at most
+    # 4 dense tiles, each kind within `dmm_unroll`): the shared expert's tiles
+    # are taken with the router's and its matmuls run from registers, the
+    # gate|up before routing. `sh_hoist`: the router + shared tiles wait as one
+    # hoisted group (`Tiles.dwait_hoist`, router fully unrolled).
+    sh_pre: bool = False
+    sh_hoist: bool = False
+    sh2_pre_route: bool = False
+    # `MoETunables.flush_pre_drain` resolved (lazy MoE segment, PIPE_EP).
+    flush_pre_drain: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,16 +147,16 @@ class MoETunables:
         "topk_lanes": "approx",  # Batcher odd-even lane top-k
         "moe_unroll": "approx",  # unrolled expert tiles (not exact on TPU, bisect)
         # `approx` until a bit-identity flip (`EXACT_FLIPS`) shows otherwise.
-        "route_shrink": "approx",
-        "prim_now": "approx",
-        "sh_pre": "approx",
-        "sh2_pre_route": "approx",
+        "route_shrink": "exact",  # same Po2C decisions (packed decode)
+        "prim_now": "exact",  # derived instead of stored slots
+        "sh_pre": "exact",  # same tile sums, moved before routing
+        "sh2_pre_route": "exact",  # same ops, moved
         "flush_in_ar1": "approx",
         "sh_at": "approx",
         "ep_fast_refill": "exact",  # same DMAs, static banks
         "cp_interleave": "approx",  # copy-slot scan order (Po2C is greedy)
-        "route_early": "approx",
-        "flush_pre_drain": "approx",
+        "route_early": "exact",  # same ops and DMAs, earlier
+        "flush_pre_drain": "exact",  # same refill, earlier
     }
 
 
@@ -226,6 +251,20 @@ def derive_moe_params(
         and ex.R * extra + ex.R + 1 <= 128  # NCP + R + 1 <= 128 VREG lanes
         and nb_picks >= er  # elist/wlist capacity covers ER local slots
     )
+    # sh_pre sums the shared expert's tiles in registers, which is the dense
+    # matmul's own order only on its fully unrolled path (nt <= dmm_unroll).
+    dmu = min(tiles.dmm_unroll, tiles.nbd)
+    sh_pre = bool(
+        tt.sh_pre
+        and lazy_moe
+        and plan.nt["sh13"] + plan.nt["sh2"] <= 4
+        and max(plan.nt["sh13"], plan.nt["sh2"]) <= dmu
+    )
+    if tt.route_shrink and not tt.cp_interleave:
+        raise MegakernelConfigError(
+            "MoETunables.route_shrink decodes the copy slot as rank j % R, slot "
+            "j // R, so it requires cp_interleave"
+        )
     if tt.route_vec and not route_vec:
         logger.debug(
             "MoETunables.route_vec=True disabled for E=%d, R=%d, B=%d, MR=%d, "
@@ -273,4 +312,18 @@ def derive_moe_params(
         sh13_scaled=bool(sh13_scaled),
         sh2_scaled=bool(sh2_scaled),
         ep_fast=bool(tt.ep_fast_refill and pipe_ep and nbe == te and not ex.stack_e),
+        route_early=bool(tt.route_early),
+        cp_interleave=bool(tt.cp_interleave and route_vec),
+        route_shrink=bool(tt.route_shrink and route_vec and g.E < (1 << CP_SH)),
+        prim_now=bool(
+            tt.prim_now
+            and tt.route_shrink
+            and route_vec
+            and g.E < (1 << CP_SH)
+            and 128 % er == 0
+        ),
+        sh_pre=sh_pre,
+        sh_hoist=bool(sh_pre and tiles.dwait_hoist and plan.nt["router"] <= dmu),
+        sh2_pre_route=bool(sh_pre and tt.sh2_pre_route),
+        flush_pre_drain=bool(tt.flush_pre_drain and lazy_moe and pipe_ep),
     )

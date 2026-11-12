@@ -55,6 +55,68 @@ from .reference import moe_reference
 from .routing import route
 
 
+def _router_sh_pre(m: MoEEmit, mp: MoEParams) -> tuple[Any, tuple[list, list]]:
+    """`sh_pre`: the router matmul, and the shared expert's tiles taken now.
+
+    With `sh_hoist` the router, sh13 and sh2 tiles wait as one hoisted group
+    before the router matmul (which uses the group's views); otherwise the
+    shared tiles are waited right after it. Returns the router logits and
+    the `(sh13, sh2)` tile views.
+    """
+    stream, scr, nt = m.stream, m.scr, m.sp.nt
+    n_r, n_13, n_2 = nt["router"], nt["sh13"], nt["sh2"]
+    if mp.sh_hoist:
+        g_r = stream.cursor
+        wg = stream.dtake_group(
+            [("router", g_r + t) for t in range(n_r)]
+            + [("sh13", g_r + n_r + t) for t in range(n_13)]
+            + [("sh2", g_r + n_r + n_13 + t) for t in range(n_2)]
+        )
+        logits = stream.dmatmul("router", scr["xb"], mp.E, ws_pre=wg[:n_r])
+        stream.claim("sh13")
+        stream.claim("sh2")
+        return logits[0 : m.ex.MR], (wg[n_r : n_r + n_13], wg[n_r + n_13 :])
+    logits = stream.dmatmul("router", scr["xb"], mp.E)
+    g13, _ = stream.claim("sh13")
+    w13s = [stream.dtake("sh13", g13 + t) for t in range(n_13)]
+    g2, _ = stream.claim("sh2")
+    w2s = [stream.dtake("sh2", g2 + t) for t in range(n_2)]
+    return logits[0 : m.ex.MR], (w13s, w2s)
+
+
+def _shared_up(m: MoEEmit, ctx: Any, slot: Any, w13s: list) -> None:
+    """`sh_pre` shared expert gate|up from taken tiles (tile sums in order, as
+    the unrolled dense matmul) into `xb2`."""
+    mp, scr, stream, tk = m.mp, m.scr, m.stream, m.tk
+    ISR = mp.ISR
+    with m.sc("moe_shared"):
+        t13 = tk["sh13"]
+        g13 = None
+        for t, w in enumerate(w13s):
+            p_ = stream.mm(scr["xb"][:, t * t13 : (t + 1) * t13], w[...])
+            g13 = p_ if g13 is None else g13 + p_
+        if mp.sh13_scaled:
+            g13 = g13 * ctx.sm(slot, "sh13_s")
+        mid = round_bf16(
+            round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR]))) * round_bf16(g13[:, ISR:])
+        )
+        scr["xb2"][:, :ISR] = mid.astype(BF16)
+
+
+def _shared_down(m: MoEEmit, ctx: Any, slot: Any, w2s: list) -> None:
+    """`sh_pre` shared expert down projection from taken tiles into `part`."""
+    mp, scr, stream, tk = m.mp, m.scr, m.stream, m.tk
+    with m.sc("moe_shared"):
+        t2 = tk["sh2"]
+        ysh = None
+        for t, w in enumerate(w2s):
+            p_ = stream.mm(scr["xb2"][:, t * t2 : (t + 1) * t2], w[...])
+            ysh = p_ if ysh is None else ysh + p_
+        if mp.sh2_scaled:
+            ysh = ysh * ctx.sm(slot, "sh2_s")
+        scr["part"][...] = ysh * scr["sg"][:, 0:1]
+
+
 class MoEModule(Module):
     """Sparse + shared MoE module with dynamic `epool` streaming and `PIPE`."""
 
@@ -261,7 +323,8 @@ class MoEModule(Module):
             "elist": pltpu.SMEM((nb_picks,), I32),
             "seen": pltpu.SMEM((8, 128), I32),
             "misc_sem": pltpu.SemaphoreType.DMA(()),
-            "st": pltpu.SMEM((1,), I32),
+            # [0]: this layer's expert-unit count; prim_now: [5] fixed hits
+            "st": pltpu.SMEM((6,) if mp.prim_now else (1,), I32),
         }
         if "es" in plan.hbm_weights:
             scr["es"] = pltpu.VMEM((mp.NSS, 1, 2 * mp.IR + mp.H), F32)
@@ -343,39 +406,61 @@ class MoEModule(Module):
         MR, MB = ex.MR, ex.MB
         H, E, ISR = mp.H, mp.E, mp.ISR
         PIPE, PIPE_EP, LAZY_MOE = mp.PIPE, mp.PIPE_EP, mp.LAZY_MOE
-        with stream.expert_stream(), stream.segment(lazy=LAZY_MOE):
-            with sc("moe_router"):
-                assert ctx.norm_x is not None, (
-                    "MoEModule requires input_norm='post_norm' to populate ctx.norm_x"
-                )
-                x = ctx.norm_x
-                logits = stream.dmatmul("router", scr["xb"], E)[0:MR]
-                glog = jnp.sum(x * ctx.sm(slot, "sh_gate"), axis=-1, keepdims=True)
-                scr["sg"][...] = jnp.broadcast_to(jax.nn.sigmoid(glog), (MB, 128))
-                mx = jnp.max(logits, axis=-1, keepdims=True)
-                pexp = jnp.exp(logits - mx)
-            with sc("moe_route"):
-                n_hit = route(m, l, pexp)
-            with sc("moe_shared"):
-                g13 = stream.dmatmul("sh13", scr["xb"], 2 * ISR)
-                if mp.sh13_scaled:
-                    g13 = g13 * ctx.sm(slot, "sh13_s")
-                mid = round_bf16(
-                    round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR])))
-                    * round_bf16(g13[:, ISR:])
-                )
-                scr["xb2"][:, :ISR] = mid.astype(BF16)
-                ysh = stream.dmatmul("sh2", scr["xb2"], H)
-                if mp.sh2_scaled:
-                    ysh = ysh * ctx.sm(slot, "sh2_s")
-                scr["part"][...] = ysh * scr["sg"][:, 0:1]
-            with sc("moe_experts"):
-                if PIPE:
-                    experts_piped(m, l, n_hit)
-                elif PIPE_EP:
-                    experts_piped_ep(m, l, n_hit)
-                else:
-                    lax.fori_loop(0, n_hit, functools.partial(expert, m, l), 0)
+        SH_PRE = mp.sh_pre and "dense" not in m.skip
+        FPD = mp.flush_pre_drain
+        with stream.expert_stream():
+            with stream.segment(lazy=LAZY_MOE, defer_flush=FPD):
+                with sc("moe_router"):
+                    assert ctx.norm_x is not None, (
+                        "MoEModule requires input_norm='post_norm' to populate "
+                        "ctx.norm_x"
+                    )
+                    x = ctx.norm_x
+                    if SH_PRE:
+                        logits, sh_w = _router_sh_pre(m, mp)
+                    else:
+                        logits = stream.dmatmul("router", scr["xb"], E)[0:MR]
+                    glog = jnp.sum(x * ctx.sm(slot, "sh_gate"), axis=-1, keepdims=True)
+                    scr["sg"][...] = jnp.broadcast_to(jax.nn.sigmoid(glog), (MB, 128))
+                    mx = jnp.max(logits, axis=-1, keepdims=True)
+                    pexp = jnp.exp(logits - mx)
+                if SH_PRE:
+                    _shared_up(m, ctx, slot, sh_w[0])
+                    if mp.sh2_pre_route:
+                        _shared_down(m, ctx, slot, sh_w[1])
+                with sc("moe_route"):
+                    n_hit = route(m, l, pexp)
+                if SH_PRE and not mp.sh2_pre_route:
+                    _shared_down(m, ctx, slot, sh_w[1])
+                elif not SH_PRE:
+                    with sc("moe_shared"):
+                        g13 = stream.dmatmul("sh13", scr["xb"], 2 * ISR)
+                        if mp.sh13_scaled:
+                            g13 = g13 * ctx.sm(slot, "sh13_s")
+                        mid = round_bf16(
+                            round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR])))
+                            * round_bf16(g13[:, ISR:])
+                        )
+                        scr["xb2"][:, :ISR] = mid.astype(BF16)
+                        ysh = stream.dmatmul("sh2", scr["xb2"], H)
+                        if mp.sh2_scaled:
+                            ysh = ysh * ctx.sm(slot, "sh2_s")
+                        scr["part"][...] = ysh * scr["sg"][:, 0:1]
+                if not FPD:
+                    with sc("moe_experts"):
+                        if PIPE:
+                            experts_piped(m, l, n_hit)
+                        elif PIPE_EP:
+                            experts_piped_ep(m, l, n_hit)
+                        else:
+                            lax.fori_loop(0, n_hit, functools.partial(expert, m, l), 0)
+            if FPD:
+                # flush_pre_drain (PIPE_EP only): the lazy segment's dense
+                # refill just before the last expert's down projection
+                with sc("moe_experts"):
+                    experts_piped_ep(
+                        m, l, n_hit, pre_drain=stream.take_deferred_flush()
+                    )
         return scr["part"][...]
 
     def hf_params(self, prefix: str | None = None, g: Any = None) -> list[HFParamDecl]:

@@ -24,8 +24,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from .context import MoEEmit
 from .dedup import dedup_ecopy, dedup_local, dedup_vec
-from .ring import fetch_e, fetch_loop
-from .topk import route_topk
+from .ring import fetch_e, fetch_loop, fetch_range
+from .topk import route_topk, route_weights
 
 
 def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
@@ -65,11 +65,16 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     slot_ec = l_idx % 2
     NCP = R * EXTRA
     MROW = E // 128
+    # route_early: the routing weights inside the hit-list copy's round trip,
+    # and (VEC) the first expert fills right after the fixed-hit scan.
+    early = mp.route_early
     with sc("route_topk", 3):
-        route_topk(m, choice, p8, VEC, slot_ec, NCP, MROW)
+        sel = route_topk(m, choice, p8, VEC, slot_ec, NCP, MROW, write_wn=not early)
     with sc("route_dma", 3):
         cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
         cp.start()
+        if early:
+            route_weights(m, sel, p8)
         cp.wait()
     # `MoEModule.prologue` / `init_buffers` zeroes `scr["seen"]` before layer 0
     # of every step, so `stamp = l_idx + 1` (`1..L`) is unique per layer.
@@ -77,8 +82,18 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     n_tot: Any = jnp.int32(0)
     n_hit: Any = jnp.int32(0)
     n_cp: Any = jnp.int32(0)
+    early_fill = early and VEC and "experts" not in skip
+    fill0: list[Any] = []
+
+    def first_fill(n_prim: Any) -> None:
+        fill0.append(jnp.minimum(NBE, n_prim * TE))
+        with sc("route_fetch0", 3):
+            fetch_range(m, jnp.int32(0), fill0[0], l_idx, fixed=mp.prim_now)
+
     if VEC:
-        n_tot, n_hit, n_cp = dedup_vec(m, NCP, MROW, nb_picks)
+        n_tot, n_hit, n_cp = dedup_vec(
+            m, NCP, MROW, nb_picks, early_fill=first_fill if early_fill else None
+        )
     if ECOPY:
         n_hit = dedup_ecopy(m, VEC, slot_ec, stamp, n_tot, n_hit, n_cp)
     else:
@@ -87,7 +102,9 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
         n_hit = jnp.int32(0)
     scr["st"][0] = n_hit * TE
     with sc("route_fetch", 3):
-        if mp.stack_e:
+        if early_fill:
+            fetch_range(m, fill0[0], jnp.minimum(NBE, n_hit * TE), l_idx)
+        elif mp.stack_e:
             for k in range(NBE):
 
                 @pl.when(k < n_hit * TE)
