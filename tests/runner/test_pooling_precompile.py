@@ -767,12 +767,17 @@ def test_runner_sampling_precompile_bypassed_for_pooling(monkeypatch, is_pooling
         "_precompile_compute_selected_logits",
         "_precompile_compute_logits_from_hidden_states",
         "_precompile_compute_top_tokens",
+        "_precompile_distributed_sampling",
         "_precompile_structured_decoding",
         "_precompile_min_tokens_mask",
         "_precompile_sample_from_logits",
         "_precompile_gather_logprobs",
     )
-    runner = SimpleNamespace(is_pooling_model=is_pooling, _pp_is_last=True)
+    runner = SimpleNamespace(
+        is_pooling_model=is_pooling,
+        _pp_is_last=True,
+        _dist_sampling_head_owner=None,
+    )
     for name in names:
         setattr(runner, name, MagicMock())
     runner_mod.TPUModelRunner._precompile_sampling_subgraphs(runner)

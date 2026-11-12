@@ -590,6 +590,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             mamba_boundary_plans=None,
             pooler_output_list=[],
             top_tokens=False,
+            dist_sampling=False,
             kv_save_nan_check=None,
         ),
         input_batch=SimpleNamespace(

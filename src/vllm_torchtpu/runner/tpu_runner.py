@@ -37,6 +37,7 @@ import torch_tpu  # noqa: F401
 import vllm.envs as vllm_envs
 
 # TODO: Remove this after jax dependency is removed
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 from packaging import version
 from vllm.config import (
@@ -159,7 +160,11 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import greedy_top_tokens, spec_boundary_state
+from vllm_torchtpu.runner import (
+    distributed_sampling,
+    greedy_top_tokens,
+    spec_boundary_state,
+)
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
@@ -206,7 +211,11 @@ from vllm_torchtpu.spec_decode.utils import (
     normalize_draft_config,
 )
 from vllm_torchtpu.structured_decoding import StructuredDecodingManager
-from vllm_torchtpu.tpu_info import get_libtpu_version, get_tpu_library_path
+from vllm_torchtpu.tpu_info import (
+    get_chip_version,
+    get_libtpu_version,
+    get_tpu_library_path,
+)
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import (
@@ -216,6 +225,9 @@ from vllm_torchtpu.tracing.utils import (
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
     from vllm.model_executor.models.interfaces import SupportsPP
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
@@ -247,6 +259,9 @@ class ExecuteModelState:
     # logits_list holds the greedy tokens ([rows, 1]), not logits
     # (TPU_GREEDY_TOP_TOKENS).
     top_tokens: bool = False
+    # logits_list holds selected hidden states ([rows, H]) for
+    # vocabulary-parallel non-greedy sampling (TPU_DISTRIBUTED_SAMPLING).
+    dist_sampling: bool = False
     kv_save_nan_check: KVSaveNanCheck | None = None
 
 
@@ -1170,6 +1185,8 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
+        # Set at load when TPU_DISTRIBUTED_SAMPLING is on.
+        self._dist_sampling_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
@@ -4278,6 +4295,9 @@ class TPUModelRunner(GPUModelRunner):
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
         top_tokens = self._greedy_top_tokens_this_step()
+        dist_sampling = not top_tokens and self._distributed_sampling_this_step(
+            scheduler_output, target_num_chunks
+        )
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
@@ -4533,6 +4553,10 @@ class TPUModelRunner(GPUModelRunner):
                         logits = self.compute_selected_top_tokens(
                             hidden_states, logits_indices
                         )
+                    elif dist_sampling:
+                        logits = self.select_sample_hidden_states(
+                            hidden_states, logits_indices
+                        )
                     else:
                         logits = self._logits_at_dp_vocab_rows(
                             hidden_states, logits_indices
@@ -4541,6 +4565,8 @@ class TPUModelRunner(GPUModelRunner):
                     logits = self.compute_top_tokens_from_hidden_states(
                         sample_hidden_states
                     )
+                elif dist_sampling:
+                    logits = sample_hidden_states
                 else:
                     logits = self.compute_logits_from_hidden_states(
                         sample_hidden_states
@@ -4610,6 +4636,7 @@ class TPUModelRunner(GPUModelRunner):
             mamba_state_indices_list=mamba_state_indices_list,
             mamba_boundary_plans=mamba_boundary_plans,
             top_tokens=top_tokens,
+            dist_sampling=dist_sampling,
             kv_save_nan_check=nan_check,
         )
 
@@ -5350,6 +5377,14 @@ class TPUModelRunner(GPUModelRunner):
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
+                chunk_dist_sampling = (
+                    state.dist_sampling
+                    and grammar_output is None
+                    and not min_toks
+                    and not needs_logprobs
+                )
+                if state.dist_sampling and not chunk_dist_sampling:
+                    logits = self.compute_logits_from_hidden_states(logits)
                 if grammar_output is not None:
                     logits = self.structured_decoding_manager.mask_logits(
                         logits, grammar_output, cur_start_idx, cur_end_idx
@@ -5369,6 +5404,15 @@ class TPUModelRunner(GPUModelRunner):
                 with self._stage_timing.stage("sample"):
                     if state.top_tokens:
                         selected_token_ids = logits
+                    elif chunk_dist_sampling:
+                        selected_token_ids = self._sample_distributed_or_fallback(
+                            logits,
+                            cur_start_idx,
+                            cur_end_idx,
+                            all_greedy,
+                            grammar_output,
+                            sampling_generator,
+                        )
                     elif all_greedy:
                         selected_token_ids = self._greedy_sample(logits)
                     else:
@@ -5834,6 +5878,7 @@ class TPUModelRunner(GPUModelRunner):
             self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
                 self.model, self._dp_lockstep_enabled()
             )
+        self._resolve_distributed_sampling_owner()
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -6822,6 +6867,79 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(out)
                 logger.info("  -- num_rows: %d", num_rows)
 
+    def _precompile_distributed_sampling(self) -> None:
+        if self._dist_sampling_head_owner is None:
+            return
+        hsize = self.model_config.get_hidden_size()
+        warm_gen = (
+            torch.Generator(device=self.device)
+            if isinstance(self.device, torch.device) and self.device.type == "tpu"
+            else None
+        )
+        if not _get_sequence_layout_planner_for_runner(
+            self
+        ).uses_selected_logits_hidden_states:
+            with self._precompile_timed("select_sample_hidden_states"):
+                for num_tokens in self.num_tokens_paddings:
+                    dummy_tok_h = torch.zeros(
+                        (num_tokens, hsize),
+                        dtype=self._hidden_states_dtype,
+                        device=self.device,
+                    )
+                    for num_reqs in self.num_reqs_paddings:
+                        indices = torch.zeros(
+                            num_reqs, dtype=torch.int32, device=self.device
+                        )
+                        out = self.select_sample_hidden_states(dummy_tok_h, indices)
+                        synchronize_tensors(out)
+                        if num_reqs >= min(num_tokens, self.max_num_reqs):
+                            break
+        tp_size, v_local = self._dist_sampling_tp_and_shard_vocab()
+        w_tktp = distributed_sampling.topk_topp_rng_width(tp_size, v_local)
+        w_temp = distributed_sampling.pure_temp_rng_width(v_local, tp_size)
+        # Iterate unrotated: distributed sampling graphs contain TP all-gathers,
+        # so every TP rank must warm buckets in identical order.
+        with self._precompile_timed("distributed_sampling"):
+            for num_reqs in self.num_reqs_paddings:
+                dummy_h = torch.zeros(
+                    (num_reqs, hsize),
+                    dtype=self._hidden_states_dtype,
+                    device=self.device,
+                )
+                dummy_temps = torch.ones(
+                    (num_reqs, 1),
+                    dtype=self._hidden_states_dtype,
+                    device=self.device,
+                )
+                dummy_top_k = torch.full(
+                    (num_reqs, 1), 64, dtype=torch.int32, device=self.device
+                )
+                dummy_top_p = torch.full(
+                    (num_reqs, 1),
+                    0.95,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                u_tktp = torch.rand(
+                    (num_reqs, w_tktp),
+                    dtype=torch.float32,
+                    device=self.device,
+                    generator=warm_gen,
+                )
+                out = self.sample_distributed_topk_topp(
+                    dummy_h, dummy_temps, dummy_top_k, dummy_top_p, u_tktp
+                )
+                synchronize_tensors(out)
+                u_temp = torch.rand(
+                    (num_reqs, w_temp),
+                    dtype=torch.float32,
+                    device=self.device,
+                    generator=warm_gen,
+                )
+                out = self.sample_distributed_pure_temp(dummy_h, dummy_temps, u_temp)
+                synchronize_tensors(out)
+                logger.info("  -- num_seqs: %d", num_reqs)
+
     def _precompile_sample_from_logits(self) -> None:
         with self._precompile_timed("sample_from_logits"):
             for num_reqs in _rotate_precompile_sweep(
@@ -7175,11 +7293,15 @@ class TPUModelRunner(GPUModelRunner):
             # Only the last stage holds the lm_head and samples.
             return
         self._precompile_compute_selected_logits()
-        if _get_sequence_layout_planner_for_runner(
-            self
-        ).uses_selected_logits_hidden_states:
+        if (
+            _get_sequence_layout_planner_for_runner(
+                self
+            ).uses_selected_logits_hidden_states
+            or self._dist_sampling_head_owner is not None
+        ):
             self._precompile_compute_logits_from_hidden_states()
         self._precompile_compute_top_tokens()
+        self._precompile_distributed_sampling()
         self._precompile_structured_decoding()
         self._precompile_min_tokens_mask()
         self._precompile_sample_from_logits()
@@ -8930,6 +9052,175 @@ class TPUModelRunner(GPUModelRunner):
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
+
+    def _distributed_sampling_enabled(self) -> bool:
+        setting = envs.TPU_DISTRIBUTED_SAMPLING
+        if setting is not None:
+            return setting
+        return get_chip_version() == pltpu.ChipVersion.TPU_7X
+
+    def _resolve_distributed_sampling_owner(self) -> None:
+        if not (
+            self._distributed_sampling_enabled()
+            and self._pp_is_last
+            and not self.is_pooling_model
+        ):
+            return
+        try:
+            self._dist_sampling_head_owner = distributed_sampling.resolve_head_owner(
+                self.model, self._dp_lockstep_enabled()
+            )
+        except NotImplementedError as exc:
+            if envs.TPU_DISTRIBUTED_SAMPLING is True:
+                raise
+            logger.info(
+                "TPU_DISTRIBUTED_SAMPLING unavailable for this model "
+                "configuration (%s); falling back to full-logits sampling.",
+                exc,
+            )
+
+    def _distributed_sampling_this_step(
+        self, scheduler_output: "SchedulerOutput", target_num_chunks: int = 1
+    ) -> bool:
+        if scheduler_output.scheduled_spec_decode_tokens and any(
+            scheduler_output.scheduled_spec_decode_tokens.values()
+        ):
+            return False
+        if not (
+            self._dist_sampling_head_owner is not None
+            and distributed_sampling.step_eligible(self.input_batch, self.requests)
+            and not self._min_tokens.any_in(self.input_batch.req_id_to_index)
+        ):
+            return False
+        if target_num_chunks <= 1:
+            return (
+                distributed_sampling.select_chunk_mode(
+                    self.input_batch, 0, self.input_batch.num_reqs, self.vocab_size
+                )
+                is not None
+            )
+        return distributed_sampling.step_has_eligible_request(
+            self.input_batch, self.vocab_size
+        )
+
+    def _dist_sampling_tp_and_shard_vocab(self) -> tuple[int, int]:
+        assert self._dist_sampling_head_owner is not None
+        head = cast("VocabParallelEmbedding", self._dist_sampling_head_owner.lm_head)
+        weight = cast(torch.Tensor, head.weight)
+        return int(head.tp_size), int(weight.shape[0])
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def select_sample_hidden_states(
+        self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.index_select(hidden_states, 0, indices_do_sample)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def sample_distributed_topk_topp(
+        self,
+        hidden_states: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        u: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._dist_sampling_head_owner is None:
+            raise RuntimeError("distributed sampling requires a resolved head owner")
+        return distributed_sampling.distributed_topk_topp_sample(
+            self._dist_sampling_head_owner,
+            hidden_states,
+            temperatures,
+            top_k,
+            top_p,
+            u,
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def sample_distributed_pure_temp(
+        self,
+        hidden_states: torch.Tensor,
+        temperatures: torch.Tensor,
+        u: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._dist_sampling_head_owner is None:
+            raise RuntimeError("distributed sampling requires a resolved head owner")
+        return distributed_sampling.distributed_pure_temp_sample(
+            self._dist_sampling_head_owner, hidden_states, temperatures, u
+        )
+
+    def _sample_distributed_or_fallback(
+        self,
+        sample_hidden_states: torch.Tensor,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        all_greedy: bool,
+        grammar_output: object | None,
+        sampling_generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        chunk_mode = distributed_sampling.select_chunk_mode(
+            self.input_batch, cur_start_idx, cur_end_idx, self.vocab_size
+        )
+        if chunk_mode is distributed_sampling.DistributedSamplingMode.TOPK_TOPP:
+            distributed_sampling.log_step_path(chunk_mode, self.input_batch.req_ids)
+            temperatures_tpu, top_k_tpu, top_p_tpu = self._build_padded_sampling_params(
+                cur_start_idx, cur_end_idx, sample_hidden_states
+            )
+            tp_size, v_local = self._dist_sampling_tp_and_shard_vocab()
+            u = torch.rand(
+                (
+                    sample_hidden_states.shape[0],
+                    distributed_sampling.topk_topp_rng_width(tp_size, v_local),
+                ),
+                dtype=torch.float32,
+                device=sample_hidden_states.device,
+                generator=sampling_generator,
+            )
+            return self.sample_distributed_topk_topp(
+                sample_hidden_states,
+                temperatures_tpu,
+                top_k_tpu,
+                top_p_tpu,
+                u,
+            )
+        if chunk_mode is distributed_sampling.DistributedSamplingMode.PURE_TEMP:
+            distributed_sampling.log_step_path(chunk_mode, self.input_batch.req_ids)
+            temperatures_tpu, _, _ = self._build_padded_sampling_params(
+                cur_start_idx, cur_end_idx, sample_hidden_states
+            )
+            tp_size, v_local = self._dist_sampling_tp_and_shard_vocab()
+            u = torch.rand(
+                (
+                    sample_hidden_states.shape[0],
+                    distributed_sampling.pure_temp_rng_width(v_local, tp_size),
+                ),
+                dtype=torch.float32,
+                device=sample_hidden_states.device,
+                generator=sampling_generator,
+            )
+            return self.sample_distributed_pure_temp(
+                sample_hidden_states, temperatures_tpu, u
+            )
+        full_logits = self.compute_logits_from_hidden_states(sample_hidden_states)
+        if all_greedy:
+            return self._greedy_sample(full_logits)
+        temperatures_tpu, top_k_tpu, top_p_tpu = self._build_padded_sampling_params(
+            cur_start_idx, cur_end_idx, full_logits
+        )
+        u = torch.rand_like(
+            full_logits, dtype=torch.float32, generator=sampling_generator
+        )
+        return self.sample_from_logits_func(
+            full_logits,
+            temperatures_tpu,
+            u,
+            top_k_tpu,
+            top_p_tpu,
+            all_greedy=all_greedy,
+            topk_candidates=self._sampler_topk_candidates(
+                cur_start_idx, cur_end_idx, grammar_output
+            ),
+            apply_topk_topp=self._sampler_applies_topk_topp(),
+        )
 
     def _greedy_top_tokens_this_step(self) -> bool:
         # A request below min_tokens needs the full logits to mask its stops.
