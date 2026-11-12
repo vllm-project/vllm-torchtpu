@@ -89,13 +89,21 @@ if _V3_PAYLOAD_SORT:
 _TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
 _TC_DISPATCH_MIN_TOKENS = envs.TPU_MOE_TC_DISPATCH_MIN_TOKENS
 _TC_DISPATCH_BLOCK = 256
-if _TC_COMBINE_MIN_TOKENS or _TC_DISPATCH_MIN_TOKENS or _V3_PAYLOAD_SORT:
+_FLAT_ROUTING_MIN_TOKENS = envs.TPU_MOE_FLAT_ROUTING_MIN_TOKENS
+if (
+    _TC_COMBINE_MIN_TOKENS
+    or _TC_DISPATCH_MIN_TOKENS
+    or _V3_PAYLOAD_SORT
+    or _FLAT_ROUTING_MIN_TOKENS
+):
     logger.info(
         "MoE row movement: TPU_MOE_TC_COMBINE_MIN_TOKENS=%d "
-        "TPU_MOE_TC_DISPATCH_MIN_TOKENS=%d TPU_MOE_V3_PAYLOAD_SORT=%d",
+        "TPU_MOE_TC_DISPATCH_MIN_TOKENS=%d TPU_MOE_V3_PAYLOAD_SORT=%d "
+        "TPU_MOE_FLAT_ROUTING_MIN_TOKENS=%d",
         _TC_COMBINE_MIN_TOKENS,
         _TC_DISPATCH_MIN_TOKENS,
         int(_V3_PAYLOAD_SORT),
+        _FLAT_ROUTING_MIN_TOKENS,
     )
 
 _ONEHOT_AUTO_CAP = 512
@@ -871,6 +879,25 @@ def fused_moe_func(
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
+
+    if (
+        _FLAT_ROUTING_MIN_TOKENS
+        and num_tokens >= _FLAT_ROUTING_MIN_TOKENS
+        and use_ep
+        and num_tokens * topk > onehot_moe_permute_threshold
+    ):
+        # [T, top_k] is lane-padded 32x in HBM; read it once into flat arrays
+        # so every later view (flat, counting-sort blocks, v3 blocks) is a
+        # cheap reshape of dense data instead of another padded relayout.
+        logger.info_once(
+            "TPU_MOE_FLAT_ROUTING_MIN_TOKENS=%d: flat MoE routing armed",
+            _FLAT_ROUTING_MIN_TOKENS,
+        )
+        ids_flat, weights_flat = jax.lax.optimization_barrier(
+            (topk_ids.reshape(-1), topk_weights.reshape(-1))
+        )
+        topk_ids = ids_flat.reshape(num_tokens, topk)
+        topk_weights = weights_flat.reshape(num_tokens, topk)
 
     (
         x,
