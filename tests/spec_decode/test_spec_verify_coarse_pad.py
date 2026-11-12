@@ -18,6 +18,7 @@ programs."""
 
 import contextlib
 import functools
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -46,6 +47,9 @@ from vllm_torchtpu.runner.tpu_runner import (
 )
 
 K = 7
+# VPAD_TEST_DEVICE=tpu runs the exactness cases through the compiled TPU
+# programs instead of eager CPU.
+DEVICE = os.environ.get("VPAD_TEST_DEVICE", "cpu")
 # The served deployments' (max_num_batched_tokens, max_num_seqs,
 # TPU_TOKEN_BUCKET_EXTRA) of the MiniMax-M3.1 v3 stack.
 CONFIGS = {
@@ -132,6 +136,7 @@ class _Step:
         )
         g = torch.Generator().manual_seed(seed)
         self.table = (torch.randn((total, vocab), generator=g) * 3).to(torch.bfloat16)
+        self.table_dev = self.table.to(DEVICE)
         argmax = self.table.float().argmax(-1)
         # Drafts that often match the target's argmax, so real acceptance
         # accepts some.
@@ -147,7 +152,7 @@ class _Step:
             runner = _shape_runner(conc, coarse)
             runner.input_ids_cpu = ids
             runner.arange_np = np.arange(total + 8, dtype=np.int64)
-            runner.device = "cpu"
+            runner.device = DEVICE
             self.mds[coarse] = SpeculativeDecodingManager(
                 runner
             ).get_spec_decode_metadata(drafts, cu, self.padded_num_reqs)
@@ -170,10 +175,10 @@ def _verify_runner(step, synthetic, fused, ingraph, vocab):
         _synthetic_rng_counter=None,
         _spec_glue_logged=set(),
         model_config=SimpleNamespace(seed=0),
-        device="cpu",
+        device=DEVICE,
         vocab_size=vocab,
         input_batch=step.input_batch,
-        rejection_sampler=RejectionSampler(_spec_config(synthetic)),
+        rejection_sampler=RejectionSampler(_spec_config(synthetic), DEVICE),
         speculative_config=SimpleNamespace(num_speculative_tokens=K),
         sample_from_logits_func=_reference_sample_from_logits,
         _sampler_topk_candidates=lambda *a: 0,
@@ -215,15 +220,20 @@ def _run(step, coarse, path, vocab, seed):
     md = step.mds[coarse]
     md.synthetic_verify = None
     runner = _verify_runner(step, synthetic, fused, ingraph, vocab)
-    gen = torch.Generator().manual_seed(seed + 1000)
+    gen = torch.Generator(device=DEVICE).manual_seed(seed + 1000)
     runner._get_sampling_generator = lambda: gen
-    with torch.compiler.set_stance("force_eager"):
+    stance = (
+        torch.compiler.set_stance("force_eager")
+        if DEVICE == "cpu"
+        else contextlib.nullcontext()
+    )
+    with stance:
         if one_row:
             rows = runner._plan_synthetic_verify(md)
-            logits = step.table[rows]
+            logits = step.table_dev[rows]
         else:
             # compute_selected_logits: the verify rows of the logits.
-            logits = step.table[md.final_logits_indices]
+            logits = step.table_dev[md.final_logits_indices]
         out = TPUModelRunner._sample_spec_verify_chunk(
             runner,
             logits,
@@ -236,7 +246,9 @@ def _run(step, coarse, path, vocab, seed):
             sampling_generator=gen,
         )
     counter = runner._synthetic_rng_counter
-    return out, gen.get_state(), None if counter is None else int(counter)
+    # The generator's position: its next draw.
+    after = torch.rand(16, generator=gen, device=DEVICE)
+    return out.cpu(), after.cpu(), None if counter is None else int(counter)
 
 
 def _cases(conc):
@@ -265,7 +277,7 @@ def _cases(conc):
 def test_coarse_pad_is_exact(conc):
     vocab = 512
     padded_further = 0
-    cases = _cases(conc)
+    cases = _cases(conc)[:: int(os.environ.get("VPAD_CASE_STRIDE", "1"))]
     for i, (num_rows, num_reqs) in enumerate(cases):
         step = _Step(conc, num_rows, num_reqs, seed=i, vocab=vocab)
         off, on = step.mds[False], step.mds[True]
@@ -280,7 +292,11 @@ def test_coarse_pad_is_exact(conc):
         # Padded verify rows belong to no real request.
         assert bool((on.segment_ids[num_rows:] == num_reqs).all())
         for path in PATHS:
-            if path.endswith("_sampled") and num_reqs == step.padded_num_reqs:
+            if (
+                DEVICE == "cpu"
+                and path.endswith("_sampled")
+                and num_reqs == step.padded_num_reqs
+            ):
                 # The unfused sampled verify gathers per-row temperatures with
                 # the padding sentinel num_reqs, one past the table when no
                 # request is padded: XLA clamps it on TPU, eager CPU raises
