@@ -6,7 +6,7 @@ vllm @ git+https://github.com/vllm-project/vllm.git@v0.31.1rc0
 torch==2.13.0
 torchvision==0.28.0
 torch-tpu==0.2.0
-tpu-sync-torch==0.0.1.dev20261012084241
+tpu-sync-torch==0.0.1.dev20261031081414
 transformers>=5.16.1,<5.19
 numba==0.65.0
 jax==0.11.2
