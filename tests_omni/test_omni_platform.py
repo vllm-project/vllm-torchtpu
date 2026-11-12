@@ -1387,3 +1387,152 @@ def test_tpu_two_stage_concurrent_subprocess_chip_isolation(monkeypatch):
         "1",
         [4.0, 4.0, 4.0, 4.0],
     )
+
+
+_TP_STAGE_MODEL = "Qwen/Qwen3-0.6B"
+
+
+def _busy_tpu_chips(num_chips: int) -> set[int]:
+    """Return the TPU chips that some process currently holds."""
+    free = _find_free_tpu_chips(num_chips, needed=num_chips)
+    return set(range(num_chips)) - {int(c) for c in free}
+
+
+def _tpu_tp_stage_worker(tp_size: int, result_queue, done) -> None:
+    import os
+
+    from vllm import LLM, SamplingParams
+    from vllm.distributed import cleanup_dist_env_and_memory
+
+    llm = LLM(
+        model=_TP_STAGE_MODEL,
+        tensor_parallel_size=tp_size,
+        max_num_batched_tokens=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        gpu_memory_utilization=0.6,
+    )
+    try:
+        outputs = llm.generate(
+            ["The capital of France is"],
+            sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
+        )
+        result_queue.put(
+            (
+                "tp",
+                os.environ.get("TPU_VISIBLE_CHIPS"),
+                os.environ.get("DEBUG_TPU_LOCAL_RANK_OFFSET"),
+                len(outputs[0].outputs[0].token_ids),
+            )
+        )
+        # Keep the chips held until the parent has checked which ones are busy.
+        done.wait(timeout=600)
+    finally:
+        del llm
+        cleanup_dist_env_and_memory()
+
+
+def _tpu_single_stage_holding_worker(result_queue, done) -> None:
+    import os
+
+    import torch
+    import torch_tpu  # noqa: F401
+
+    x = torch.full((4,), 1.0, device=torch.device("tpu"))
+    result_queue.put(
+        ("single", os.environ.get("TPU_VISIBLE_CHIPS"), (x * 2.0).cpu().tolist())
+    )
+    # Keep the chip held until the parent has checked which ones are busy.
+    done.wait(timeout=600)
+
+
+@pytest.mark.multichip
+@pytest.mark.spawns_tpu_workers
+@pytest.mark.tpu_test
+def test_tpu_multi_chip_stage_at_offset_next_to_single_chip_stage(monkeypatch):
+    """A TP=4 stage on chips 4-7 and a 1-chip stage on chip 0 run side by side.
+
+    The TP stage is a real vLLM engine, so TPUWorker applies
+    DEBUG_TPU_LOCAL_RANK_OFFSET. torch_tpu has no 2-chip topology on v6e, so
+    TP=4 is the smallest multi-chip stage that works on every 8-chip host.
+    """
+    import multiprocessing as mp
+    import threading
+
+    from vllm_omni.engine import stage_engine_startup
+
+    tp_size = 4
+    tp_chips = list(range(tp_size, 2 * tp_size))
+    single_chip = 0
+    num_chips = OmniTpuPlatform.device_count()
+    if num_chips < 2 * tp_size:
+        # Same rule as tests/entrypoints/llm/test_generate_tp.py: a smaller
+        # slice cannot hold both stages, so there is nothing to check here.
+        pytest.skip(f"Needs an 8-chip host for both stages, found {num_chips} chips")
+
+    busy_before = _busy_tpu_chips(num_chips)
+    wanted = {single_chip, *tp_chips}
+    if busy_before & wanted:
+        pytest.fail(f"TPU chips {sorted(busy_before & wanted)} are already held")
+
+    platform = OmniTpuPlatform()
+    monkeypatch.setattr(stage_engine_startup, "current_omni_platform", platform)
+    monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
+    for key in (
+        "TPU_VISIBLE_CHIPS",
+        "TPU_VISIBLE_DEVICES",
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+        "TPU_RUNTIME_METRICS_PORTS",
+        "MASTER_PORT",
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        "TORCH_TPU_TOPOLOGY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    done = ctx.Event()
+    lock = threading.Lock()
+    procs = []
+    try:
+        with stage_engine_startup.scoped_spawn_device_env(
+            ",".join(str(c) for c in tp_chips), lock, stage_id=0, replica_id=0
+        ):
+            procs.append(
+                ctx.Process(
+                    target=_tpu_tp_stage_worker, args=(tp_size, result_queue, done)
+                )
+            )
+            procs[-1].start()
+        with stage_engine_startup.scoped_spawn_device_env(
+            str(single_chip), lock, stage_id=1, replica_id=0
+        ):
+            procs.append(
+                ctx.Process(
+                    target=_tpu_single_stage_holding_worker, args=(result_queue, done)
+                )
+            )
+            procs[-1].start()
+
+        # The parent env is back to how it was before the spawns.
+        assert "TPU_VISIBLE_CHIPS" not in os.environ
+        assert "DEBUG_TPU_LOCAL_RANK_OFFSET" not in os.environ
+        assert "MASTER_PORT" not in os.environ
+        assert OmniTpuPlatform._saved_spawn_env is None
+
+        results = {}
+        while len(results) < 2:
+            result = result_queue.get(timeout=1500)
+            results[result[0]] = result[1:]
+        assert results["tp"] == ("4,5,6,7", "4", 4)
+        assert results["single"] == ("0", [2.0, 2.0, 2.0, 2.0])
+
+        # Both stages are alive: they hold exactly chips 0 and 4-7.
+        assert _busy_tpu_chips(num_chips) - busy_before == wanted
+    finally:
+        done.set()
+        for proc in procs:
+            proc.join(timeout=300)
+            if proc.is_alive():
+                proc.kill()
+    assert [proc.exitcode for proc in procs] == [0, 0]
