@@ -118,6 +118,12 @@ DEFAULTS: dict[str, bool | int | str] = {
     "moe_tc_combine_min_tokens": 0,
     "moe_v3_payload_sort": False,
     "moe_flat_routing_min_tokens": 0,
+    # MiniMax kernels (MSA attention / select / candidates, gmm_v2, DSpark
+    # draft attention): compile each pallas_call once per shape at smaller
+    # VMEM limits and keep the first that compiles (`kernels.tight_vmem`);
+    # only the limit changes. Candidates "<MiB>,..." ("" = "32,40,48,52").
+    "tight_vmem": False,
+    "tight_vmem_candidates_mib": "",
 }
 
 

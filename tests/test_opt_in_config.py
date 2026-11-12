@@ -61,6 +61,8 @@ REPLACED_ENV = {
     "moe_tc_combine_min_tokens": "TPU_MOE_TC_COMBINE_MIN_TOKENS",
     "moe_v3_payload_sort": "TPU_MOE_V3_PAYLOAD_SORT",
     "moe_flat_routing_min_tokens": "TPU_MOE_FLAT_ROUTING_MIN_TOKENS",
+    "tight_vmem": "TPU_TIGHT_VMEM",
+    "tight_vmem_candidates_mib": "TPU_TIGHT_VMEM_CANDIDATES_MIB",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -76,6 +78,7 @@ SAMPLE = {
     "minimax_msa_prefill_pages_per_step": 8,
     "moe_tc_combine_min_tokens": 4096,
     "moe_flat_routing_min_tokens": 1024,
+    "tight_vmem_candidates_mib": "32,40,48",
 }
 # Dropped with no key: hid the offload connector from draft forwards, which
 # v3's skip_draft_kv unbinding already covers in every served config.
@@ -277,3 +280,19 @@ def test_split_guard_refuses_split_keys(config):
     with pytest.raises(ValueError, match="leak data across requests"):
         check_split_disabled(config)
 
+
+def test_tight_vmem_keys():
+    from vllm_torchtpu.kernels import tight_vmem
+
+    assert tight_vmem.ENABLED is False
+    try:
+        tight_vmem.set_options(True, "48,32")
+        assert tight_vmem.ENABLED is True
+        assert tight_vmem._CANDIDATES == (32 << 20, 48 << 20)
+        with pytest.raises(ValueError, match="tight_vmem_candidates_mib"):
+            tight_vmem.set_options(True, "0")
+    finally:
+        tight_vmem.set_options(False)
+    assert tight_vmem._CANDIDATES == tuple(
+        v << 20 for v in tight_vmem.DEFAULT_CANDIDATES_MIB
+    )

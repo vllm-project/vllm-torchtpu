@@ -54,6 +54,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import tight_vmem
+
 _NEG_INF = float("-inf")
 
 
@@ -742,7 +744,7 @@ def attend_cached_flash(
         v_scale=v_scale,
         dcp=dcp,
     )
-    out, lse = pl.pallas_call(
+    out, lse = tight_vmem.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,

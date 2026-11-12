@@ -5990,6 +5990,16 @@ class TPUModelRunner(GPUModelRunner):
 
             # Logs the resolved values (the payload sort needs the v3 combine).
             fused_moe_gmm.set_row_movement(*moe_row_movement)
+        if option(additional, "tight_vmem"):
+            from vllm_torchtpu.kernels import tight_vmem
+
+            tight_vmem.set_options(True, option(additional, "tight_vmem_candidates_mib"))
+            logger.info(
+                "tight_vmem on: smallest compiling vmem_limit from %s MiB "
+                "(additional_config tight_vmem_candidates_mib=%r)",
+                [c >> 20 for c in tight_vmem._CANDIDATES],
+                option(additional, "tight_vmem_candidates_mib"),
+            )
         if isinstance(additional, dict) and "moe_gmm_tuned_tiles" in additional:
             from vllm_torchtpu.kernels.megablox import gmm_v2
 

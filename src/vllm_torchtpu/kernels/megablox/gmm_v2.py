@@ -25,6 +25,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import tight_vmem
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -2095,7 +2096,7 @@ def gmm_v2(
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
-    return pl.pallas_call(
+    return tight_vmem.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -2302,7 +2303,7 @@ def gmm_v2_mlp(
     num_lanes = pltpu.get_tpu_info().num_lanes
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     cost1, cost2 = get_cost_estimate(cfgs1), get_cost_estimate(cfgs2)
-    out, _ = pl.pallas_call(
+    out, _ = tight_vmem.pallas_call(
         functools.partial(kernel_mlp, cfgs1=cfgs1, cfgs2=cfgs2),
         out_shape=(
             jax.ShapeDtypeStruct(

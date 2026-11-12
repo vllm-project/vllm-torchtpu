@@ -25,6 +25,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import tight_vmem
+
 DEFAULT_BLOCK_ROWS = 256
 _NEG_INF = float("-inf")
 _FORCED_LOCAL_SCORE = 1e29
@@ -95,7 +97,7 @@ def select_blocks(
     pad = -num_tokens % block_rows
     s = jnp.pad(scores[:, 0], ((0, pad), (0, 0)))
     p = jnp.pad(pos, (0, pad))[:, None]
-    picked = pl.pallas_call(
+    picked = tight_vmem.pallas_call(
         functools.partial(
             _kernel,
             block_size=block_size,
