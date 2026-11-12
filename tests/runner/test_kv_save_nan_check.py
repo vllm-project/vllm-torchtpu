@@ -202,9 +202,8 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
             pass
 
     connector = OptInConnector()
-    wave = MagicMock()
-    wave.step.return_value = contextlib.nullcontext()
-    wave.start_forward.return_value = IntermediateTensors(
+    handoff = MagicMock()
+    handoff.start_forward.return_value = IntermediateTensors(
         {"hidden_states": torch.zeros(2, 2), "residual": torch.zeros(2, 2)}
     )
 
@@ -233,7 +232,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     valid_tokens_per_chunk = [2, 1]
 
     runner = SimpleNamespace(
-        _pp_wave=None if pp_is_last else wave,
+        _pp_handoff=None if pp_is_last else handoff,
         _dp_step_other_decode=False,
         _pp_is_first=True,
         _pp_is_last=pp_is_last,

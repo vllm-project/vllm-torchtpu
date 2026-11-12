@@ -483,10 +483,8 @@ def test_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
 @pytest.mark.parametrize("succeeds", [True, False])
 def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
     # Every stage runs the synthetic prefill through the hand-off in step,
-    # so a stage never retries on its own, and settles the burst after its
-    # forward so the launches that carry the prefill on are issued.
+    # so a stage never retries on its own.
     attempts = MagicMock(return_value=succeeds)
-    wave = MagicMock()
     runner = SimpleNamespace(
         enforce_eager=False,
         speculative_config=object(),
@@ -494,7 +492,6 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
             pipeline_parallel_size=4, prefill_context_parallel_size=1
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
-        _pp_wave=wave,
         input_batch=SimpleNamespace(num_reqs=0),
         num_tokens_paddings=[4096],
         max_model_len=262144,
@@ -518,14 +515,12 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
         TPUModelRunner._warmup_mtp_prefill(runner)
 
     assert attempts.call_args_list == [((4096,), {})]
-    assert wave.settle.call_count == 1
 
 
 def test_mtp_prefill_warmup_fills_every_bucket():
     # Buckets are per rank: a PCP8 prompt of 8 x 512 tokens pads to 512 per
     # rank. Prompts above one scheduler step collapse onto its size.
     attempts = MagicMock(return_value=True)
-    wave = MagicMock()
     runner = SimpleNamespace(
         enforce_eager=False,
         speculative_config=object(),
@@ -533,7 +528,6 @@ def test_mtp_prefill_warmup_fills_every_bucket():
             pipeline_parallel_size=4, prefill_context_parallel_size=8
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32768),
-        _pp_wave=wave,
         input_batch=SimpleNamespace(num_reqs=0),
         num_tokens_paddings=[512, 1024, 1536, 2048, 4096, 8192],
         max_model_len=262144,
@@ -553,7 +547,6 @@ def test_mtp_prefill_warmup_fills_every_bucket():
         ((16384,), {}),
         ((32768,), {}),
     ]
-    assert wave.settle.call_count == 5
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -2820,7 +2813,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         uses_mrope=False,
         supports_mm_inputs=False,
         _pp_is_first=True,
-        _pp_wave=None,
+        _pp_handoff=None,
         _pp_topk_buffer=None,
         _kv_cache_bundle=None,
         lora_config=None,
@@ -3082,7 +3075,7 @@ class TestInputStagingFence:
         assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
 
         # With through_handoff=True, the fence must be recorded before
-        # _pp_wave.start_forward so the next wait never blocks on the receive.
+        # _pp_handoff.start_forward so the next wait never blocks on the receive.
         handoff_checked = []
 
         def start_forward(n):
@@ -3091,8 +3084,7 @@ class TestInputStagingFence:
             handoff_checked.append(n)
             return None
 
-        runner._pp_wave = SimpleNamespace(
-            step=contextlib.nullcontext,
+        runner._pp_handoff = SimpleNamespace(
             start_forward=start_forward,
             end_forward=lambda *a: None,
         )
@@ -3734,7 +3726,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             has_structured_output_requests=False,
         )
         runner = SimpleNamespace(
-            _pp_wave=None,
+            _pp_handoff=None,
             _dp_step_other_decode=False,
             execute_model_state=SimpleNamespace(
                 scheduler_output=scheduler_output,
