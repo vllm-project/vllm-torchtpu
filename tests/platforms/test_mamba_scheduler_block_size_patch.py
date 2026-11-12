@@ -122,8 +122,6 @@ def test_serial_prefill_two_slot_tail_packing_and_skip_guard(monkeypatch):
     monkeypatch.setattr(
         vllm_torchtpu, "_model_needs_page_aligned_chunks", lambda vllm_config: True
     )
-    monkeypatch.setattr(vllm_torchtpu.envs, "K3_SERIAL_PREFILL", True)
-    monkeypatch.setattr(vllm_torchtpu.envs, "K3_MAX_PREFILL_STEP_TOKENS", 16384)
     _patch_vllm_mamba_split_scheduler_block_size()
 
     scheduler, _ = _scheduler(page=512, block=16384, budget=16448)
@@ -133,6 +131,9 @@ def test_serial_prefill_two_slot_tail_packing_and_skip_guard(monkeypatch):
     scheduler.scheduler_config = SimpleNamespace(
         long_prefill_token_threshold=0, max_num_seqs=64
     )
+    # Serial prefill is the aggregate engine's.
+    scheduler._tpu_is_aggregate = True
+    scheduler._tpu_decoding_ids = set()
     scheduler._tpu_unfinished_prefill_ids = {"r0"}
     scheduler._tpu_step_prefill_info = {}
     scheduler._tpu_effective_start = {"r0": 65536}
@@ -179,7 +180,6 @@ def test_serial_prefill_aggregate_target_and_step_cap(monkeypatch):
     monkeypatch.setattr(
         vllm_torchtpu, "_model_needs_page_aligned_chunks", lambda vllm_config: True
     )
-    monkeypatch.setattr(vllm_torchtpu.envs, "K3_SERIAL_PREFILL", True)
     _patch_vllm_mamba_split_scheduler_block_size()
 
     scheduler, _ = _scheduler(page=512, block=16384, budget=16448)
@@ -192,9 +192,8 @@ def test_serial_prefill_aggregate_target_and_step_cap(monkeypatch):
     scheduler._tpu_is_aggregate = True
     scheduler._tpu_decoding_ids = set()
 
-    # 1) Default K3_MAX_PREFILL_STEP_TOKENS=8192 caps each request at 8192 while
-    #    allowing two 8192 chunks to pack into largest_window=16384.
-    monkeypatch.setattr(vllm_torchtpu.envs, "K3_MAX_PREFILL_STEP_TOKENS", 8192)
+    # 1) A request's step is capped at the largest prefill window (16384): the
+    #    first long prompt fills the window, the second waits for the next step.
     scheduler._tpu_unfinished_prefill_ids = set()
     scheduler._tpu_step_prefill_info = {}
     scheduler._tpu_effective_start = {}
@@ -221,16 +220,15 @@ def test_serial_prefill_aggregate_target_and_step_cap(monkeypatch):
     rb.request_id = "rb"
     assert (
         Scheduler._mamba_block_aligned_split(scheduler, ra, num_new_tokens=16448)
-        == 8192
+        == 16384
     )
     assert (
         Scheduler._mamba_block_aligned_split(scheduler, rb, num_new_tokens=16448)
-        == 8192
+        == 0
     )
 
-    # 2) K3_MAX_PREFILL_STEP_TOKENS=0 derives largest_window=16384 from prefill_windows
-    #    rather than raw max_num_scheduled_tokens=16448.
-    monkeypatch.setattr(vllm_torchtpu.envs, "K3_MAX_PREFILL_STEP_TOKENS", 0)
+    # 2) largest_window=16384 comes from prefill_windows rather than the raw
+    #    max_num_scheduled_tokens=16448.
     scheduler._tpu_step_prefill_info = {}
     scheduler._tpu_effective_start = {"rc": 65536}
     scheduler._tpu_unfinished_prefill_ids = {"rc"}

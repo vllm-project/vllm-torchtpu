@@ -136,6 +136,7 @@ class KimiAggregate:
             draft_checkpoint,
             tp_rank=self.decoder.rank,
             compute_logits=False,
+            serial=True,
         )
         self.rank = self.decoder.rank
         self._loaded = False

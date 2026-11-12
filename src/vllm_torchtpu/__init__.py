@@ -218,8 +218,8 @@ def _patch_vllm_megakernel_prefix_hits() -> None:
 
 
 def _patch_vllm_prefill_sjf_queue() -> None:
-    """``K3_PREFILL_SJF=1``: a KV producer's or aggregate engine's waiting queue
-    admits the request with the fewest uncached prompt tokens first, with aging
+    """A KV producer's or megakernel aggregate engine's waiting queue admits
+    the request with the fewest uncached prompt tokens first, with aging
     (``vllm_torchtpu.core.sjf_queue``). Other engines are unchanged."""
     from functools import wraps
 
@@ -238,17 +238,17 @@ def _patch_vllm_prefill_sjf_queue() -> None:
         transfer = getattr(self.vllm_config, "kv_transfer_config", None)
         producer = getattr(transfer, "kv_role", None) == "kv_producer"
         aggregate = backend.role(self.vllm_config) == "aggregate"
-        if not (sjf_queue.enabled() and (producer or aggregate)):
+        if not (producer or aggregate):
             return
         if self.waiting:
-            raise RuntimeError("K3_PREFILL_SJF: the waiting queue is not empty at init")
+            raise RuntimeError("prefill SJF queue: the waiting queue is not empty")
         self.waiting = sjf_queue.SJFRequestQueue(
-            sjf_queue.uncached_estimator(self), sjf_queue.aging()
+            sjf_queue.uncached_estimator(self), sjf_queue.AGING
         )
         logger.info(
             "Prefill waiting queue: shortest uncached prompt first, "
             "aging %.0f tokens/s",
-            sjf_queue.aging(),
+            sjf_queue.AGING,
         )
 
     init.__dict__["_tpu_prefill_sjf_patch"] = True
@@ -297,7 +297,6 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         page = physical_cache_config.block_size
         req_id = getattr(request, "request_id", None)
         orig_max_sched = self.max_num_scheduled_tokens
-        max_step = envs.K3_MAX_PREFILL_STEP_TOKENS
         is_agg = False
         pf_target = prefill_end
         largest_window = orig_max_sched
@@ -320,9 +319,12 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
                 request, is_aggregate=is_agg, decoding_ids=decoding_ids
             )
         if needs_pages and start < prefill_end:
-            if envs.K3_SERIAL_PREFILL and req_id is not None and start < pf_target:
+            from vllm_torchtpu.megakernel.kimi_k3.program import MAX_STEP_TOKENS
+
+            # The aggregate engine prefills serially: at most two requests a
+            # step (the second one's tail packed into the first one's window).
+            if is_agg and req_id is not None and start < pf_target:
                 from vllm_torchtpu.megakernel.kimi_k3.prefill import prefill_windows
-                from vllm_torchtpu.megakernel.kimi_k3.program import MAX_STEP_TOKENS
 
                 raw_engine_budget = (
                     min(orig_max_sched, MAX_STEP_TOKENS) if is_agg else orig_max_sched
@@ -334,9 +336,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
                 )
                 largest_window = prefill_windows(raw_engine_budget, max_model_len)[-1]
                 prefix_cap = max(largest_window, -(-max_model_len // 4096) * 4096)
-                step_cap = (
-                    min(orig_max_sched, max_step) if max_step > 0 else orig_max_sched
-                )
+                step_cap = min(orig_max_sched, MAX_STEP_TOKENS)
                 step_info = getattr(self, "_tpu_step_prefill_info", None)
                 if step_info is None:
                     step_info = self._tpu_step_prefill_info = {}
@@ -380,8 +380,8 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
                 if max_for_req <= 0:
                     return 0
                 num_new_tokens = min(num_new_tokens, max_for_req)
-            elif max_step > 0 and not (envs.K3_SERIAL_PREFILL and req_id is not None):
-                max_for_req = min(orig_max_sched, max_step)
+            elif not (is_agg and req_id is not None):
+                max_for_req = min(orig_max_sched, MAX_STEP_TOKENS)
                 num_new_tokens = min(num_new_tokens, max_for_req)
         args = (
             request,
@@ -437,7 +437,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         if (
             num_new_tokens > 0
             and start < pf_target
-            and envs.K3_SERIAL_PREFILL
+            and is_agg
             and req_id is not None
             and step_info is not None
         ):

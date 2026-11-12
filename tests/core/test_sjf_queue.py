@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K3_PREFILL_SJF waiting queue: shortest uncached prompt first, aging so old
+"""Prefill SJF waiting queue: shortest uncached prompt first, aging so old
 long prompts overtake new short ones, front requeues, peek/pop agreement."""
 
 import pytest

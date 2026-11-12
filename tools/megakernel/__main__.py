@@ -161,7 +161,13 @@ def main(argv: list[str]) -> int:
         coverage = LineCoverage(args.coverage)
         coverage.start()  # before the kernels import: their module-level lines count
     k3.configure_cache(args.kv_cache_dtype)
-    config = kernel_config(args.set)  # before any kernel module is imported
+    overrides = list(args.set)
+    if getattr(args, "route_counts", ""):
+        overrides += [
+            "prefill_route_counts=1",
+            f"prefill_route_counts_dir={os.path.abspath(args.route_counts)}",
+        ]
+    config = kernel_config(overrides)  # before any kernel module is imported
     harness.log(
         f"kernel config {config.key()}"
         + (f" ({', '.join(args.set)})" if args.set else " (defaults)")

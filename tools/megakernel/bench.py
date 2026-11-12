@@ -99,8 +99,9 @@ def add_arguments(parser, profile: bool = False) -> None:
     prefill.add_argument(
         "--route-counts",
         default="",
-        help="directory: with prefill_route_counts, the prefill saves its MoE "
-        "route count snapshots here (rank 0 logs each step's window numbers)",
+        help="directory: the prefill counts its MoE routes and saves snapshots "
+        "here every prefill_route_counts_every windows (rank 0 logs each step's "
+        "window numbers)",
     )
     prefill.add_argument(
         "--token-file",
@@ -305,7 +306,6 @@ def run_prefill(args, records: harness.Records) -> None:
 
     if args.route_counts:
         os.makedirs(args.route_counts, exist_ok=True)
-        os.environ["K3_PREFILL_ROUTE_COUNTS_DIR"] = args.route_counts
     cases = []
     for part in filter(None, args.prompts.split(",")):
         prompt, _, prefix = part.partition("@")

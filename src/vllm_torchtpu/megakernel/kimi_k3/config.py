@@ -13,7 +13,6 @@ import hashlib
 import json
 from typing import Any
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel.config import set_active_kernel_config
 
 
@@ -71,16 +70,15 @@ class KernelConfig:
     mla_flash_prefix_tiles: bool = True
     # Cached-prefix attention in FP8 (E4M3FN keys/values from the expansion, FP8
     # queries, probabilities x16 in E4M3FN, FP32 statistics); the window's own
-    # keys stay BF16. K3_PREFILL_PREFIX_FP8=1 turns it on.
-    prefill_prefix_fp8: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_PREFIX_FP8
-    )
+    # keys stay BF16.
+    prefill_prefix_fp8: bool = True
     # Prefill MoE route counts (diagnostic): each fused MoE call also returns its
-    # chip's 56 local expert counts; the prefiller saves cumulative snapshots.
-    prefill_route_counts: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_ROUTE_COUNTS
-    )
+    # chip's 56 local expert counts; the prefiller saves cumulative snapshots
+    # every prefill_route_counts_every windows under prefill_route_counts_dir
+    # (default: $CDK_OUTPUT_DIR/prefill_route_counts).
+    prefill_route_counts: bool = False
     prefill_route_counts_every: int = 200
+    prefill_route_counts_dir: str = ""
     # EP16 expert placement of the prefill and of an EP16 decode (empty: the
     # pre-shard's): an npz whose ``order`` [92, 896] is the logical expert at
     # each physical slot (chip c: slots 56c..56c+55); the router columns and

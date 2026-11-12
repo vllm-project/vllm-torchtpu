@@ -82,7 +82,7 @@ AXIS = "k3_sp"
 WINDOWS = (512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384)
 PAGE_TOKENS = 256
 SLOTS = 16  # sequences per window, at most (and at most one per page)
-SERIAL_SLOTS = 2  # tail-packing slots under K3_SERIAL_PREFILL
+SERIAL_SLOTS = 2  # a serial prefill's window: one request and the next one's tail
 GROUP_PAIRS = 11  # regular 8-layer groups: layers 4..91
 COPY_PAIRS = 8  # copy-on-write block copies per PoolWriter.copy_blocks call
 
@@ -1351,7 +1351,11 @@ class KimiPrefiller:
         *,
         tp_rank: int,
         compute_logits: bool = True,
+        serial: bool = False,
     ) -> None:
+        """``serial``: windows hold at most SERIAL_SLOTS sequences (the
+        aggregate engine's scheduler prefills one request at a time, packing the
+        next one's start into the tail of its last window)."""
         self.config = config
         self.page_tokens = config.block_size
         self.presharded = Path(presharded)
@@ -1364,7 +1368,7 @@ class KimiPrefiller:
         # rounding slack per sequence, in multiples of 1024.
         capacity = max(windows[-1], -(-config.max_model_len // 4096) * 4096)
         self.slots = min(
-            config.max_num_seqs, SERIAL_SLOTS if envs.K3_SERIAL_PREFILL else SLOTS
+            config.max_num_seqs, SERIAL_SLOTS if serial else SLOTS
         )
         self.cp_capacity = (
             -(-(capacity // DCP_SIZE + self.slots * self.page_tokens) // 1024) * 1024
@@ -1861,11 +1865,11 @@ class KimiPrefiller:
         return logits
 
     def _count_routes(self) -> None:
-        """K3_PREFILL_ROUTE_COUNTS: accumulate the window's MoE route counts
+        """``prefill_route_counts``: accumulate the window's MoE route counts
         ([1, 92, 56] per rank: its chip's local experts per MoE layer) and
         have each chip's even rank save a cumulative snapshot every
         ``prefill_route_counts_every`` windows under
-        ``$K3_PREFILL_ROUTE_COUNTS_DIR`` (default ``$CDK_OUTPUT_DIR/
+        ``prefill_route_counts_dir`` (default ``$CDK_OUTPUT_DIR/
         prefill_route_counts``)."""
         routes = getattr(self.program, "last_routes", None)
         if routes is None:
@@ -1878,7 +1882,7 @@ class KimiPrefiller:
         every = active().prefill_route_counts_every
         if self._route_windows % every or self.rank % ep_tp:
             return
-        directory = envs.K3_PREFILL_ROUTE_COUNTS_DIR or os.path.join(
+        directory = active().prefill_route_counts_dir or os.path.join(
             envs.CDK_OUTPUT_DIR, "prefill_route_counts"
         )
         os.makedirs(directory, exist_ok=True)
