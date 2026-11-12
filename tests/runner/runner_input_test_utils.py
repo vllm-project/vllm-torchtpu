@@ -121,6 +121,7 @@ def _make_runner(
     runner._fenced_h2d_sources = []
     runner._free_h2d_sources = {}
     runner._registered_h2d_sources = set()
+    runner._staged_block_tables_reuse = None
     runner._wait_input_staging_fence = types.MethodType(
         TPUModelRunner._wait_input_staging_fence, runner
     )

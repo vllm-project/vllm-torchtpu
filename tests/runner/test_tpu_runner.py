@@ -2848,6 +2848,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         _fenced_h2d_sources=[],
         _free_h2d_sources={},
         _registered_h2d_sources=set(),
+        _staged_block_tables_reuse=None,
         _token_padding_state=None,
         pcp_manager=None,
         sequence_layout_planner=SimpleNamespace(
@@ -3079,13 +3080,14 @@ class TestInputStagingFence:
 
         runner = _dummy_run_stand_in(monkeypatch, forward_model)
 
-        for dp_lockstep in (False, True, False):
+        for i, dp_lockstep in enumerate((False, True, False)):
             TPUModelRunner._dummy_run(
                 runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=dp_lockstep
             )
-            # Only this run's staged table is still held, by its own fence.
+            # The first run's staged table is held by its own fence; the same
+            # zero table reuses that upload, so later runs hold nothing.
             assert runner._unfenced_h2d_sources == []
-            assert len(runner._fenced_h2d_sources) == 1
+            assert len(runner._fenced_h2d_sources) == (1 if i == 0 else 0)
             assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
         assert len(_FakeTpuEvent.instances) == 3
         assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])

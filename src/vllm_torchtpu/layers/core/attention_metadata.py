@@ -722,27 +722,45 @@ def stage_block_table_uploads(
     if not entries:
         return
 
-    total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
-    # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
-    # drains, so a later chunk or draft walk must not refill a shared scratch
-    # (see `stage_h2d_upload`).
-    flat = zeros_h2d_source(runner, total)
-
-    # The PCP manager's layers read block tables inside pcp_metadata.
-    if ctx.position_ids_override is None and runner.pcp_manager is None:
+    # Dummy runs keep the zeroed table (same layout, null blocks); the PCP
+    # manager's layers read block tables inside pcp_metadata.
+    dummy = ctx.position_ids_override is not None or runner.pcp_manager is not None
+    live_rows = [
+        None
+        if dummy
+        else block_table_obj.get_cpu_tensor()[
+            ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+        ]
+        for _, block_table_obj, target_num_blocks in entries
+    ]
+    # The live rows fix the staged table (padded rows stay zero). In steady
+    # decode they repeat until a request takes a new block, so reuse the last
+    # upload instead of zero-filling and copying the whole padded table (512 KB
+    # per step for one request at 256 rows x 512 blocks).
+    reuse_key = (
+        num_reqs_padded,
+        dummy,
+        tuple(
+            (gid, target_num_blocks, None if rows is None else rows.numpy().tobytes())
+            for (gid, _, target_num_blocks), rows in zip(entries, live_rows)
+        ),
+    )
+    prev = runner._staged_block_tables_reuse
+    if prev is not None and prev[0] == reuse_key:
+        staged_dev = prev[1]
+    else:
+        total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
+        # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
+        # drains, so a later chunk or draft walk must not refill a shared
+        # scratch (see `stage_h2d_upload`).
+        flat = zeros_h2d_source(runner, total)
         offset = 0
-        for _, block_table_obj, target_num_blocks in entries:
-            rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(
-                num_reqs_padded, target_num_blocks
-            )
-            source = block_table_obj.get_cpu_tensor()
-            rows[: ctx.num_reqs] = source[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
-            ]
+        for (_, _, target_num_blocks), rows in zip(entries, live_rows):
+            if rows is not None:
+                flat[offset : offset + rows.numel()].view_as(rows).copy_(rows)
             offset += num_reqs_padded * target_num_blocks
-    # Dummy runs keep the zeroed buffer: same staged layout, null blocks.
-
-    staged_dev = stage_h2d_upload(runner, flat)
+        staged_dev = stage_h2d_upload(runner, flat)
+        runner._staged_block_tables_reuse = (reuse_key, staged_dev)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices

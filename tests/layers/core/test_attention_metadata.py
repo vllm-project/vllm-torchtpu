@@ -53,6 +53,7 @@ class TestAttentionMetadataBuilderPlumbing:
         runner._unfenced_h2d_sources = []
         runner._free_h2d_sources = {}
         runner._registered_h2d_sources = set()
+        runner._staged_block_tables_reuse = None
         runner.attn_groups = []
         runner._unified_kv_layout = False
         runner.pcp_manager = None
@@ -508,6 +509,33 @@ class TestAttentionMetadataBuilderPlumbing:
         assert set(ctx.staged_block_tables) == {0}
         assert ctx.staged_mamba_products is None
         assert ctx.staged_block_tables[0].numel() == 4 * 4
+
+    def test_unchanged_live_rows_reuse_the_staged_upload(self):
+        """Steady decode repeats the block table until a request takes a new
+        block; only a change in the live rows may upload again."""
+        runner = self._make_runner_mock(num_groups=1)
+        self._make_attn_groups(runner, [self._make_builder(runner, 0)])
+
+        def walk():
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=2,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones((4,), dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            )
+            stage_block_table_uploads(runner, ctx, 4)
+            return ctx.staged_block_tables[0]
+
+        first = walk()
+        torch.testing.assert_close(walk(), first, rtol=0, atol=0)
+        assert len(runner._unfenced_h2d_sources) == 1
+        source = runner.input_batch.block_table[0].get_cpu_tensor.return_value
+        source[1, 3] = 99
+        changed = walk()
+        assert len(runner._unfenced_h2d_sources) == 2
+        assert changed.view(4, 4)[1, 3] == 99
 
     @pytest.mark.parametrize("num_groups", [1, 3])
     def test_each_staged_walk_owns_its_host_buffer(self, num_groups):
