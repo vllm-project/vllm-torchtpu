@@ -83,6 +83,8 @@ if TYPE_CHECKING:
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
     TPU_MOE_V3_PAYLOAD_SORT: bool = False
     TPU_MOE_FLAT_ROUTING_MIN_TOKENS: int = 0
+    TPU_MOE_ROUTE_TRACE: int = 0
+    TPU_MOE_ROUTE_TRACE_EVERY: int = 8192
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
@@ -774,6 +776,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of being relaid out for every consumer shape. Same values. 0 = off.
     "TPU_MOE_FLAT_ROUTING_MIN_TOKENS": env_nonnegative_int(
         "TPU_MOE_FLAT_ROUTING_MIN_TOKENS", 0
+    ),
+    # Diagnostics (layers/adapter/moe_route_trace.py): keep the per-expert
+    # routed-row counts of the last N forward steps of every MoE layer in a
+    # device ring buffer and log them from TP rank 0 every
+    # TPU_MOE_ROUTE_TRACE_EVERY model-runner steps. Adds an index_copy per MoE
+    # layer to the graph, so it is compile-hashed here. 0 = off.
+    "TPU_MOE_ROUTE_TRACE": env_nonnegative_int("TPU_MOE_ROUTE_TRACE", 0),
+    "TPU_MOE_ROUTE_TRACE_EVERY": env_nonnegative_int(
+        "TPU_MOE_ROUTE_TRACE_EVERY", 8192
     ),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;

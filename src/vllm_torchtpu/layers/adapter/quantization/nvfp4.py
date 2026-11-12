@@ -74,7 +74,7 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter import moe_route_trace, moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -487,6 +487,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        moe_route_trace.register(layer)
         if not self._use_adaptive_fused_moe:
             prebuild_fused_moe_kernel(
                 topk=layer.moe_config.experts_per_token,
@@ -559,6 +560,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # passes `layer` uniformly, which fixes that -- flagging separately as
         # it's a behavior change, not just a refactor.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if moe_route_trace.ENABLED:
+            moe_route_trace.record(layer, topk_ids)
         kwargs = {
             "hidden_states": x,
             "w1": layer.w13_weight,
