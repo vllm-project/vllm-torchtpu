@@ -672,6 +672,78 @@ def test_token_gather_sort_and_scatter_are_bit_exact(monkeypatch, sharded_plan, 
     np.testing.assert_array_equal(np.asarray(outs[0]), np.asarray(outs[1]))
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(dict(SMALL), id="small"),
+        pytest.param(dict(PROD, tokens=PROD_TOKENS[0]), id="prod_t2048"),
+        pytest.param(dict(PROD, tokens=PROD_TOKENS[1]), id="prod_t16384"),
+    ],
+)
+def test_slab_run_copy_and_sort_lookup_are_bit_exact(monkeypatch, shape):
+    """Both slab tables by run copy give the layer the sort + lookup's output.
+
+    The run copy changes the routing payload (expert-sorted token numbers and
+    a scale per pair) and builds both tables from it; the tables differ from
+    the lookup's only on the ROWBLK padding rows, which the kernel never
+    commits. The TensorCore builds are forced on and the token threshold is
+    moved so each shape runs both forms; the lowered programs are checked to
+    really differ, so the agreement is not vacuous.
+    """
+    monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        70,
+        hidden=shape["hidden"],
+        inter=shape["inter"],
+        e_total=shape["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        71,
+        tokens=shape["tokens"],
+        hidden=shape["hidden"],
+        e_total=shape["e_total"],
+    )
+
+    def make_run():
+        # A fresh function per build: jax.jit caches the trace by function, and
+        # the threshold is read while tracing, so reusing one `run` would lower
+        # the first build's program again.
+        def run(*args):
+            return fused_ep_moe_v2(
+                *args,
+                topk=shape["topk"],
+                renormalize=True,
+                mesh=mesh,
+                capacity=CAPACITY,
+                weight_format=WeightFormat.FP8,
+                sharded_plan=True,
+            )
+
+        return run
+
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    outs, has_copy = {}, {}
+    for on in (False, True):
+        monkeypatch.setattr(
+            layer, "SLAB_RUN_COPY_MIN_TOKENS", 0 if on else shape["tokens"] + 1
+        )
+        layer._LAYER_SM_CACHE.clear()
+        jax.clear_caches()
+        run = make_run()
+        has_copy[on] = (
+            "fused_ep_moe_v2_slab_runs" in jax.jit(run).lower(*args).as_text()
+        )
+        outs[on] = np.asarray(run(*args))
+    layer._LAYER_SM_CACHE.clear()
+    jax.clear_caches()
+    assert has_copy == {False: False, True: True}, has_copy
+    np.testing.assert_array_equal(outs[True], outs[False])
+
+
 @pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
 def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
     wire_dtype,

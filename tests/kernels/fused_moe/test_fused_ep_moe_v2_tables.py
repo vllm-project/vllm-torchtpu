@@ -515,6 +515,99 @@ def test_sorted_token_gather_is_the_scattered_one(
             )
 
 
+def _sender_payloads(idx, scale_bits, *, ep, t_local, topk, block, e_total):
+    """Every shard's expert-sorted payload as the run-copy exchange gathers it.
+
+    Returns the token numbers and the scale bits, [ep, pair_w] each with every
+    source padded to the lane-block-aligned section width, and that width.
+    """
+    pair_w = host.align_up(t_local * topk, host.HIDDEN_LANE_BLOCK)
+    tokens, scales = [], []
+    for s in range(ep):
+        rows = slice(s * t_local, (s + 1) * t_local)
+        t_s, c_s = host.sender_sorted_pairs(
+            jnp.asarray(idx)[rows].reshape(-1, block),
+            jnp.int32(s),
+            t_local=t_local,
+            topk=topk,
+            scale_bits=jnp.asarray(scale_bits)[rows],
+        )
+        tokens.append(np.pad(np.asarray(t_s), (0, pair_w - t_s.size)))
+        scales.append(np.pad(np.asarray(c_s), (0, pair_w - c_s.size)))
+    return np.stack(tokens), np.stack(scales), pair_w
+
+
+@pytest.mark.parametrize(
+    "ep,t_local,g_local,topk",
+    GEOMETRIES + [pytest.param(32, 48, 16, 10, id="qwen38_ep32_g16_t48")],
+)
+@pytest.mark.parametrize("routing", ["uniform", "skewed", "padded"])
+def test_slab_runs_copy_out_the_scattered_tables(ep, t_local, g_local, topk, routing):
+    """Copying runs of the expert-sorted payloads rebuilds both slab tables.
+
+    The host half of the run-copy form: sender_sorted_pairs on every source,
+    then slab_run_copy_runs' offsets for each shard, copied here in numpy (the
+    kernel that does it on the chip is checked against this in its own test).
+    The result must be the scatter's token-gather table, padding and clip
+    included, and the scatter's scale slab over the whole slab: zero on the
+    ROWBLK padding of every run, as the scatter leaves it.
+    """
+    idx, kwargs = _routing_inputs(
+        ep, t_local, g_local, topk, skew=routing == "skewed", seed=7
+    )
+    e_total = kwargs["e_total"]
+    stride = kwargs["shard_stride"]
+    if routing == "padded":
+        idx = _pad_half_of_each_shard(idx, ep=ep, t_local=t_local, e_total=e_total)
+    T = ep * t_local
+    rng = np.random.default_rng(8)
+    scale_bits = (rng.random(T, dtype=np.float32) + 0.5).view(np.int32)
+    tokens, scales, pair_w = _sender_payloads(
+        idx,
+        scale_bits,
+        ep=ep,
+        t_local=t_local,
+        topk=topk,
+        block=kwargs["block"],
+        e_total=e_total,
+    )
+    counts = jnp.asarray(_plan_counts(idx, ep=ep, t_local=t_local, e_total=e_total))
+    view_rows = host.act_scale_slab_rows(stride) * host.HIDDEN_LANE_BLOCK
+    lo, hi = host.gather_clamp_bounds(T)
+    for me in range(ep):
+        plan = host.build_routing_tables_sharded(
+            idx, jnp.int32(me), all_gather_rows=lambda _row: counts, **kwargs
+        )
+        rows = host.local_slab_rows(plan, me, shard_stride=stride)
+        src, dst, length = (
+            np.asarray(a)
+            for a in host.slab_run_copy_runs(
+                plan, jnp.int32(me), e_total=e_total, ep=ep, src_stride=pair_w
+            )
+        )
+        assert length.size == g_local * ep
+        got_tokens = np.zeros(view_rows, np.int32)
+        got_scales = np.zeros(view_rows, np.int32)
+        for a, b, n in zip(src, dst, length):
+            got_tokens[b : b + n] = tokens.reshape(-1)[a : a + n]
+            got_scales[b : b + n] = scales.reshape(-1)[a : a + n]
+        np.testing.assert_array_equal(
+            np.clip(got_tokens[:stride], lo, hi),
+            np.asarray(
+                host.shard_token_gather(plan, me, shard_stride=stride, rows=rows)
+            ),
+            err_msg=f"token-gather table, shard {me}",
+        )
+        scattered = host.slab_scatter(
+            view_rows, rows, jnp.asarray(np.repeat(scale_bits, topk)), by_set=False
+        )
+        np.testing.assert_array_equal(
+            got_scales[:stride],
+            np.asarray(scattered)[:stride],
+            err_msg=f"activation-scale slab, shard {me}",
+        )
+
+
 def test_token_gather_sort_keys_fit_the_served_shapes():
     """Qwen3.8's EP32 prefill step is far inside the int32 key range."""
     assert host.token_gather_sort_fits(16384, 10, e_total=512, ep=32)

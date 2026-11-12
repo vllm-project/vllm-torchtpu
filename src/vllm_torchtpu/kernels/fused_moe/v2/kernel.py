@@ -2547,3 +2547,150 @@ def build_act_scale_slab(**kwargs):
                 fn = _build_act_scale_slab(**kwargs)
                 _SCALE_SLAB_CACHE[key] = fn
     return fn
+
+
+# --------------------------------------------------------------------------- #
+# Both slab tables by one run copy. Where every shard sends its routed pairs
+# already sorted by expert (host.sender_sorted_pairs), each (local expert,
+# source) run of the slab is a contiguous stretch of that source's gathered
+# pairs, so the token-gather table and the activation-scale slab are the same
+# copy of runs out of two gathered streams -- token numbers and scale bits --
+# instead of a sort over every routed pair and a lookup per row.
+# --------------------------------------------------------------------------- #
+
+# Gathered tokens per step at or above which the layer builds the tables by
+# run copy. Measured on TPU8i 4x4x1 (top-10 of 512, 32 shards) against the
+# sort + lookup: -102 us per layer at 16384 tokens, -14 us at 8192, +33 us at
+# 4096 and below, where the sort over fewer pairs is cheaper than visiting
+# all 512 runs.
+SLAB_RUN_COPY_MIN_TOKENS = 8192
+
+
+def _build_slab_run_copy(*, n_streams, src_rows, out_rows, n_runs):
+    """Copy `n_runs` runs of int32 out of `n_streams` flat streams at once.
+
+    Operands: per run its source offset, destination offset and length
+    (scalar prefetch, [n_runs] each), then the streams as [n_streams,
+    src_rows, 128] lane rows. The result is [n_streams, out_rows, 128], zero
+    wherever no run lands -- the run padding and everything past the last
+    run, exactly what the scatter forms leave. Runs must not overlap at the
+    destination; the layer's are disjoint by construction.
+
+    Everything stays in VMEM. A run is copied 128 elements at a time: the
+    chunk's elements sit in at most two source lane rows, which one select
+    merges into a single row holding them rotated by the source lane; one
+    lane rotation then moves them to the destination lane, and a masked
+    store writes the one or two destination rows the chunk covers.
+    """
+    lanes = HIDDEN_LANE_BLOCK
+    shift = host.pow2_shift(lanes, "the lane count")
+    if src_rows % host.U32_SUBLANE_TILE or out_rows % host.U32_SUBLANE_TILE:
+        raise ValueError(
+            f"the source ({src_rows}) and destination ({out_rows}) row counts "
+            f"must be whole {host.U32_SUBLANE_TILE}-row tiles"
+        )
+
+    def kernel(src_off_sm, dst_off_sm, count_sm, src_ref, out_ref):
+        sub = host.U32_SUBLANE_TILE
+        zero = jnp.zeros((sub, lanes), jnp.int32)
+
+        def clear(i, carry):
+            row = pl.multiple_of(i * sub, sub)
+            for s in range(n_streams):
+                out_ref[s, pl.ds(row, sub), :] = zero
+            return carry
+
+        lax.fori_loop(0, out_rows // sub, clear, jnp.int32(0))
+        lane = lax.broadcasted_iota(jnp.int32, (1, lanes), 1)
+
+        def copy_run(r, carry):
+            length = count_sm[r]
+            src0 = src_off_sm[r]
+            dst0 = dst_off_sm[r]
+
+            def copy_chunk(c, carry):
+                done = c * lanes
+                n = jnp.minimum(length - done, lanes)
+                src = src0 + done
+                dst = dst0 + done
+                src_row = jnp.right_shift(src, shift)
+                src_lane = src & (lanes - 1)
+                dst_row = jnp.right_shift(dst, shift)
+                dst_lane = dst & (lanes - 1)
+                # The chunk's tail wraps into the next source row only where
+                # src_lane > 0, and then only lanes below src_lane are read
+                # from it; clamping keeps the last row's read in bounds.
+                next_row = jnp.minimum(src_row + 1, src_rows - 1)
+                from_next = lane < src_lane
+                rotate = (dst_lane - src_lane) & (lanes - 1)
+                spill = dst_lane + n - lanes
+                in_first = (lane >= dst_lane) & (lane < dst_lane + n)
+                in_second = lane < spill
+                for s in range(n_streams):
+                    merged = jnp.where(
+                        from_next,
+                        src_ref[s, pl.ds(next_row, 1), :],
+                        src_ref[s, pl.ds(src_row, 1), :],
+                    )
+                    moved = pltpu.roll(merged, rotate, 1)
+                    out_ref[s, pl.ds(dst_row, 1), :] = jnp.where(
+                        in_first, moved, out_ref[s, pl.ds(dst_row, 1), :]
+                    )
+
+                    @pl.when(spill > 0)
+                    def _(s=s, moved=moved):
+                        out_ref[s, pl.ds(dst_row + 1, 1), :] = jnp.where(
+                            in_second, moved, out_ref[s, pl.ds(dst_row + 1, 1), :]
+                        )
+
+                return carry
+
+            lax.fori_loop(
+                0, jnp.right_shift(length + lanes - 1, shift), copy_chunk, carry
+            )
+            return carry
+
+        lax.fori_loop(0, n_runs, copy_run, jnp.int32(0))
+
+    vmem = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
+    call = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            in_specs=[vmem],
+            out_specs=vmem,
+            grid=(),
+        ),
+        out_shape=jax.ShapeDtypeStruct((n_streams, out_rows, lanes), jnp.int32),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=host.vmem_limit(), disable_bounds_checks=True
+        ),
+        name=f"fused_ep_moe_v2_slab_runs_r{n_runs}_s{src_rows}_o{out_rows}",
+    )
+
+    def fn(src_off, dst_off, count, streams):
+        return call(
+            src_off.astype(jnp.int32),
+            dst_off.astype(jnp.int32),
+            count.astype(jnp.int32),
+            streams.astype(jnp.int32),
+        )
+
+    return fn
+
+
+_SLAB_RUN_COPY_CACHE = {}
+_SLAB_RUN_COPY_CACHE_LOCK = threading.Lock()
+
+
+def build_slab_run_copy(**kwargs):
+    """Memoizing front door; see build_fused_ep_moe_kernel for why."""
+    key = tuple(sorted((k, str(v)) for k, v in kwargs.items()))
+    fn = _SLAB_RUN_COPY_CACHE.get(key)
+    if fn is None:
+        with _SLAB_RUN_COPY_CACHE_LOCK:
+            fn = _SLAB_RUN_COPY_CACHE.get(key)
+            if fn is None:
+                fn = _build_slab_run_copy(**kwargs)
+                _SLAB_RUN_COPY_CACHE[key] = fn
+    return fn
