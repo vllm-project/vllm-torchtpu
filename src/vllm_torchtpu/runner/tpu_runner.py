@@ -4882,6 +4882,11 @@ class TPUModelRunner(GPUModelRunner):
             )
         if host_phases.enabled():
             self._host_phases_begin_step(scheduler_output)
+        if envs.VLLM_TPU_QSA_PREFILL_UNION_PROBE:
+            # Debug, log-only: the previous step's QSA DCP union stats (outside the compiled step).
+            from vllm_torchtpu.models.vllm.qwen4_exp import union_probe
+
+            union_probe.poll(scheduler_output.total_num_scheduled_tokens)
         # Update cached state
         self._update_states(scheduler_output)
         host_phases.mark("update_states")

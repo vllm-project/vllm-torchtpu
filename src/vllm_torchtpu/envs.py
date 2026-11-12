@@ -149,6 +149,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA: float = 0.2
     VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK: int = 8
     VLLM_TPU_QSA_PREFILL_UNION_PROBE: int = 0
+    VLLM_TPU_QSA_PREFILL_UNION_PROBE_LAYERS: str = ""
     VLLM_TPU_QSA_PREFILL_PREFIX_PAGES: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK: int = 1024
@@ -1078,12 +1079,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": env_nonnegative_int(
         "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK", 8
     ),
-    # PROBE=<N> (debug-only, log-only; 0 = off): under main-KV DCP, for the
-    # first N prefill steps with >= 4096 live rows, log per 128- and 256-row
-    # query tile the owned union of selected groups, the owned visible groups
-    # and the rows' selected counts (kernels/qwen4_exp/union_probe.py; one
-    # unordered host callback per QSA layer call, no outputs changed).
+    # PROBE=<N> (debug-only, log-only; 0 = off): under main-KV DCP, log every
+    # N-th step with >= 4096 scheduled tokens: per 128/256-row tile the owned
+    # union of selected groups, owned visible groups and rows' selected counts
+    # (models/vllm/qwen4_exp/union_probe.py). Torch side only: the probed
+    # layers copy the DCP op's `selected` into a buffer; the runner reads it
+    # outside the compiled step. PROBE_LAYERS: decoder layer indices (default
+    # the first and the middle QSA layer).
     "VLLM_TPU_QSA_PREFILL_UNION_PROBE": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_UNION_PROBE", 0),
+    "VLLM_TPU_QSA_PREFILL_UNION_PROBE_LAYERS": env_str("VLLM_TPU_QSA_PREFILL_UNION_PROBE_LAYERS", ""),
     # qwen4_exp QSA (unsharded indexer path): when every row's completed groups
     # fit the top-k budget, take all visible groups and skip the StreamIndex
     # scoring call (the sharded path already does). Same selected set; the
