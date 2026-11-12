@@ -103,15 +103,28 @@ def test_prefill_tiles_bad_spec(monkeypatch):
         _tiles(4096, True)
 
 
-def test_decode_w13_applies_to_gate_up_only(monkeypatch):
-    monkeypatch.setenv(G._DECODE_W13_ENV, "3072:2")
-    for size_m in (32, 512, 2048):
+def test_decode_w13_small_and_large_decode(monkeypatch):
+    monkeypatch.setenv(G._DECODE_W13_ENV, "3072:2:2")
+    for size_m in (32, 512):
         t = _tiles(size_m, True)
         d = G._calculate_tiling(*_args(size_m, True))
         assert (t.tile_n, t.rhs_buffer_count) == (3072, 2)
         assert (t.tile_m, t.bucket_sizes) == (d.tile_m, d.bucket_sizes)
+        t2 = _tiles(size_m, False)
+        assert t2 == G.dataclasses.replace(
+            G._calculate_tiling(*_args(size_m, False)), rhs_buffer_count=2)
+    for size_m in (1536, 2048):
+        t = _tiles(size_m, True)
+        assert t == G.dataclasses.replace(
+            G._calculate_tiling(*_args(size_m, True)), rhs_buffer_count=2)
         assert _tiles(size_m, False) == G._calculate_tiling(*_args(size_m, False))
     assert _tiles(4096, True) == G._calculate_tiling(*_args(4096, True))
+
+
+def test_decode_w13_default_down_depth(monkeypatch):
+    monkeypatch.setenv(G._DECODE_W13_ENV, "3072:2")
+    assert _tiles(512, False) == G._calculate_tiling(*_args(512, False))
+    assert _tiles(512, True).tile_n == 3072
 
 
 def test_decode_w13_over_vmem_falls_back(monkeypatch):
