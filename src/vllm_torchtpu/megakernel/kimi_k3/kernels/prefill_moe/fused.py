@@ -680,8 +680,8 @@ def _prologue(
     every pass's routes and start after the last pass's Top16.
     """
     hidden_size = router.shape[-2]
-    halves = 2 if rows == 512 else 1
-    part = rows // halves
+    passes = 2 if rows == 512 else 1
+    part = rows // passes
     big = part == 256  # the 8K streaming schedule (8K and each pass of 16K)
     rank = jax.lax.axis_index("k3_sp")
     parity, peer = rank % 2, rank ^ 1
@@ -737,7 +737,7 @@ def _prologue(
                 )
 
         def metadata_progress():
-            for _ in range((2 if rows <= 128 else 5) * halves):
+            for _ in range((2 if rows <= 128 else 5) * passes):
                 next(metadata_steps, None)
 
         rings = []  # big: each pass's 256-row latent ring, progressed together
@@ -793,8 +793,8 @@ def _prologue(
                 s["down_sems"][panel % 2],
             )
 
-        for h in range(halves):
-            last = h == halves - 1
+        for h in range(passes):
+            last = h == passes - 1
             if h:
                 if sources[h] is not None:
                     input_copy(h).start()
@@ -998,7 +998,7 @@ def _prologue(
             for _ in metadata_steps:
                 pass
 
-    ring_count = halves if big else 1
+    ring_count = passes if big else 1
     scratch = dict(
         router=vmem((hidden_size, 896), jnp.bfloat16) if not big else None,
         router_gu=vmem((hidden_size, 1024), jnp.bfloat16) if big else None,
@@ -1017,7 +1017,7 @@ def _prologue(
         route_send=dma((5,)),
         route_recv=dma((5,)),
         keys=vmem((rows * 4, 128), jnp.int32),
-        latent_payload=vmem((halves, part, 2, 1792), jnp.bfloat16)
+        latent_payload=vmem((passes, part, 2, 1792), jnp.bfloat16)
         if big
         else vmem((rows, 2, 1792), jnp.bfloat16),
         latent_recv=vmem((2, rows, 2, 1792), jnp.bfloat16) if not big else None,
@@ -2251,12 +2251,12 @@ def _layer_kernel(
     shape = (tokens // 8, 128)
     compact = tokens * 16 > capacity  # the compact routes are a prefix of the sort
     part = rows // (2 if rows == 512 else 1)  # the prologue's pass rows
-    halves = rows // part
+    passes = rows // part
     vmem, smem, dma = pltpu.VMEM, pltpu.SMEM, pltpu.SemaphoreType.DMA
     mixture = None
     sources = tuple(
         None if hidden is None else hidden.at[pl.ds(h * part, part)]
-        for h in range(halves)
+        for h in range(passes)
     )
     if mixture_refs is not None:
         blocks_ref, mlp_res_ref, ffn_norm_ref = mixture_refs
@@ -2265,7 +2265,7 @@ def _layer_kernel(
         # rows of ``output`` (free until their shared experts), which the
         # prologue then loads, so no mixture scratch lives inside the prologue.
         sources = (None,) + tuple(
-            output.at[pl.ds(h * part, part)] for h in range(1, halves)
+            output.at[pl.ds(h * part, part)] for h in range(1, passes)
         )
 
         def mixture(h, *, own=None, hbm=None):
@@ -2358,7 +2358,7 @@ def _layer_kernel(
             if mixture is not None:
                 parity = jax.lax.axis_index("k3_sp") % 2
                 mixture(0, own=pair.at[pl.ds(parity * part, part), :])
-                for h in range(1, halves):
+                for h in range(1, passes):
                     mixture(h, hbm=sources[h])
             _prologue(
                 tables,
