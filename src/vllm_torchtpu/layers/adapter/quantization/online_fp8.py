@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.config import VllmConfig
+from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -202,7 +203,7 @@ def validate_online_fp8(
             if layer_id in seen_ids:
                 continue
             seen_ids.add(layer_id)
-            if isinstance(layer, MoERunner):
+            if isinstance(layer, (MoERunner, BaseLayerWithLoRA)):
                 continue
             if isinstance(layer, RoutedExperts):
                 prefix = layer.layer_name
