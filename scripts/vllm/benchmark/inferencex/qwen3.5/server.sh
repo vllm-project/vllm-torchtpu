@@ -104,7 +104,7 @@ case "$SHARDING" in
     # step's state loads and stores through the pool's packed 16-bit view.
     ;;
   TP8_EP)
-    # Tensor-parallel attention across all 8 cores + expert-parallel MoE.
+    # Tensor-parallel attention across all 8 chips + expert-parallel MoE.
     DP_SIZE=1
     SHARDING_ARGS=(
       --tensor-parallel-size=8
@@ -203,7 +203,7 @@ export TPU_ACCELERATOR_TYPE=tpu7x
 export USE_MOE_SPARSE_CORE=1
 export ONEHOT_MOE_PERMUTE_THRESHOLD="${ONEHOT_MOE_PERMUTE_THRESHOLD:-32768}"
 
-# Select the SparseCore gather-reduce implementation.
+# Default to v3 which is a bit faster than v2.
 export RAGGED_GATHER_REDUCE_VERSION="${RAGGED_GATHER_REDUCE_VERSION:-v3}"
 
 # Add extra padding
@@ -247,24 +247,6 @@ args=(
 )
 # Pass --load-format when streaming from GCS.
 [ -n "${LOAD_FORMAT:-}" ] && args+=(--load-format="$LOAD_FORMAT")
-
-if [ "${DRY_RUN:-0}" = "1" ]; then
-  for key in SHARDING CONC MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
-      MOE_FUSED_EP_KERNEL_IMPL TPU_MOE_SEQUENCE_PARALLEL MOE_KERNEL_THRESHOLD TPU_MOE_LOWTOK_MAX_TOKENS TPU_MOE_LOWTOK_FROM_SCORES \
-      TPU_MOE_LOWTOK_SCORES_STRICT TPU_EXPERT_PLACEMENT \
-      TPU_NORM_WEIGHT_HOIST TPU_SP_MIN_ROWS TPU_MOE_FUSED_EP_STEP_MIN_TOKENS \
-      TPU_RPA_DECODE_BATCH TPU_RPA_DECODE_VMEM_MIB TPU_SP_FP8_GATHER \
-      TPU_GDN_FUSED_NORM_QUANT TPU_FUSED_QK_NORM_ROPE TPU_SHARDED_LM_HEAD \
-      GLOBAL_MAX_NUM_BATCHED_TOKENS VLLM_TPU_DP_RELEASE_THRESHOLD \
-      GDN_STATE_DTYPE TPU_SMALL_ALL_REDUCE_MAX_ROWS TPU_SMALL_ALL_REDUCE_FORM \
-      TPU_GREEDY_TOP_TOKENS TPU_GDN_TABLES_IN_KERNEL \
-      TPU_GDN_DECODE_TILE TPU_GATED_NORM_TILE \
-      TPU_TOKEN_BUCKET_EXTRA TPU_TOKEN_BUCKET_STEP LIBTPU_INIT_ARGS; do
-    printf '%s=%s\n' "$key" "${!key-}"
-  done
-  printf 'vllm serve'; printf ' %q' "${args[@]}"; printf '\n'
-  exit 0
-fi
 
 set -x
 vllm serve "${args[@]}"

@@ -30,7 +30,8 @@ if [ -z "${INFERENCEX_REPO:-}" ]; then
   fi
 fi
 
-# Default concurrency and context lengths for Qwen3.5 quality evaluation.
+# InferenceX defaults for the Qwen3.5 B300 SGLang quality-eval row.
+# The selected eval rows are CONC=32 and CONC=256; default to the max row.
 ISL="${ISL:-8192}"
 OSL="${OSL:-1024}"
 CONC="${CONC:-256}"
@@ -42,11 +43,8 @@ RESULT_DIR="${RESULT_DIR:-/tmp/qwen3.5-inferencex-eval}"
 EVAL_LIMIT="${EVAL_LIMIT:-${LIMIT:-}}"
 EVAL_CONCURRENT_REQUESTS="${EVAL_CONCURRENT_REQUESTS:-$CONC}"
 
-# Look up a relative YAML path as supplied, then under infx/evals.
 if [[ "$TASK" == *.yaml && "$TASK" != /* && -f "${INFERENCEX_REPO}/$TASK" ]]; then
   EVAL_TASKS_DIR="${INFERENCEX_REPO}/$TASK"
-elif [[ "$TASK" == *.yaml && "$TASK" != /* && -f "${INFERENCEX_REPO}/infx/evals/$(basename "$TASK")" ]]; then
-  EVAL_TASKS_DIR="${INFERENCEX_REPO}/infx/evals/$(basename "$TASK")"
 else
   EVAL_TASKS_DIR="$TASK"
 fi
@@ -58,13 +56,6 @@ export EVAL_CONCURRENT_REQUESTS EVAL_LIMIT
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 
 # shellcheck source=/dev/null
-# InferenceX's library reads these at load (its own runs set them from the
-# container) and reads optional variables unguarded, so it is sourced and run
-# without -u, as its own scripts do.
-export INFERENCEX_REPO_ROOT="${INFERENCEX_REPO_ROOT:-$INFERENCEX_REPO}"
-export INFMAX_CONTAINER_WORKSPACE="${INFMAX_CONTAINER_WORKSPACE:-$INFERENCEX_REPO}"
-set +u
-# shellcheck disable=SC1091
 source "${INFERENCEX_REPO}/benchmarks/benchmark_lib.sh"
 
 run_lm_eval --port "$PORT"
