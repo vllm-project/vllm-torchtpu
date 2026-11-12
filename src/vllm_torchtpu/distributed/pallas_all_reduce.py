@@ -33,7 +33,6 @@ import faulthandler
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import torch
 from jax import lax
@@ -59,7 +58,6 @@ class _Armed:
     ranks: tuple[int, ...]
     op: Any
     rank: torch.Tensor  # this rank's mesh index, int32 [1, 1]
-    op_after: Any  # op(x, rank, after): starts once `after` exists
 
 
 _ARMED: _Armed | None = None
@@ -75,52 +73,35 @@ def _body(n: int, max_bytes: int, axis: str):
     return body
 
 
-def _body_after(n: int, max_bytes: int, axis: str):
-    body = _body(n, max_bytes, axis)
-
-    def body_after(x, rank, after):
-        # A data dependency on `after` (an earlier collective's output) that
-        # adds exactly zero: XLA's all-reduce combiner merges collectives that
-        # are ordered only by an optimization barrier, not by data.
-        zero = jnp.nan_to_num(after[0, 0], nan=0.0, posinf=0.0, neginf=0.0) * 0
-        return body(x.at[0, 0].add(zero.astype(x.dtype)), rank)
-
-    return body_after
-
-
-def _make_op(mesh, max_bytes: int, ordered: bool = False):
+def _make_op(mesh, max_bytes: int):
     axis = mesh.axis_names[0]
-    specs = (P(axis),) * (3 if ordered else 2)
-    make_body = _body_after if ordered else _body
+    specs = (P(axis), P(axis))
     sharded = jax.shard_map(
-        make_body(int(mesh.size), max_bytes, axis),
+        _body(int(mesh.size), max_bytes, axis),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
         check_vma=False,
     )
 
-    def put(args):
-        return (jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
-
     # torch_tpu reads the operand types from these annotations.
     def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
-        return sharded(*put((x, rank)))
-
-    def fn_after(x: jax.Array, rank: jax.Array, after: jax.Array) -> jax.Array:
-        return sharded(*put((x, rank, after)))
+        args = (x, rank)
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
 
     # PartitionSpecs, as other jax_op call sites pass them (torch_tpu's
     # annotation is narrower).
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        "pallas::tp_all_reduce_after" if ordered else "pallas::tp_all_reduce",
-        fn_after if ordered else fn,
+        "pallas::tp_all_reduce",
+        fn,
         mesh=mesh,
         input_partition_specs=specs,
         output_partition_specs=P(axis),
     )
-    op.register_fake(lambda x, *_args: torch.empty_like(x))
+    op.register_fake(lambda x, rank: torch.empty_like(x))
     return op
 
 
@@ -196,12 +177,7 @@ def arm(hidden: int, device: torch.device) -> bool:
         raise RuntimeError(
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
         )
-    _ARMED = _Armed(
-        ranks=tuple(int(r) for r in tp.ranks),
-        op=op,
-        rank=rank,
-        op_after=_make_op(mesh, max_bytes, ordered=True),
-    )
+    _ARMED = _Armed(ranks=tuple(int(r) for r in tp.ranks), op=op, rank=rank)
     logger.info(
         "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views",
         n,
@@ -211,15 +187,9 @@ def arm(hidden: int, device: torch.device) -> bool:
     return True
 
 
-def all_reduce(
-    ranks, x: torch.Tensor, after: torch.Tensor | None = None
-) -> torch.Tensor | None:
+def all_reduce(ranks, x: torch.Tensor) -> torch.Tensor | None:
     """The armed op's all-reduce of x over the group of `ranks`, or None when
-    this group or tensor is not armed (the caller takes its usual path).
-
-    With `after` (a 2-D bf16 tensor, typically an earlier all-reduce's output)
-    the all-reduce starts only once `after` exists, and XLA cannot combine it
-    with the collective that produced `after`."""
+    this group or tensor is not armed (the caller takes its usual path)."""
     armed = _ARMED
     if armed is None or tuple(ranks) != armed.ranks:
         return None
@@ -228,6 +198,4 @@ def all_reduce(
     # Every size goes to the op, which decides on the static size inside: a
     # branch here would give the model's Dynamo traces different graphs (and
     # inputs) per bucket, which shape_variants refuses to hand buckets between.
-    if after is None:
-        return armed.op(x, armed.rank)
-    return armed.op_after(x, armed.rank, after)
+    return armed.op(x, armed.rank)

@@ -88,7 +88,6 @@ class MiniMaxM3MoE(nn.Module):
         config: PreTrainedConfig,
         quant_config: QuantizationConfig | None,
         prefix: str,
-        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         num_experts = config.num_local_experts
@@ -126,7 +125,6 @@ class MiniMaxM3MoE(nn.Module):
             swiglu_beta=beta,
             routed_scaling_factor=config.routed_scaling_factor,
             router_logits_dtype=torch.float32,
-            reduce_results=reduce_results,
             shared_experts=self.shared_experts,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",

@@ -268,7 +268,6 @@ class MiniMaxM3SparseAttention(nn.Module):
         quant_config: QuantizationConfig | None,
         cache_config: CacheConfig | None,
         prefix: str,
-        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
@@ -301,7 +300,6 @@ class MiniMaxM3SparseAttention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
         eps = config.rms_norm_eps
@@ -406,13 +404,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.msa_op = get_msa_op(*msa_config, fp4=self.fp4)
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        attn_metadata: dict | None = None,
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        """``attn_metadata`` (per KV-cache prefix) replaces the forward
-        context's, for a call on part of the step's tokens."""
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
@@ -425,7 +418,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
 
         num_tokens = hidden_states.shape[0]
-        metadata = attn_metadata or get_forward_context().attn_metadata
+        metadata = get_forward_context().attn_metadata
         kv_cache = self.kv_cache.kv_cache
         if not isinstance(metadata, dict) or kv_cache.numel() == 0:
             # Memory profiling runs before the caches are bound.
