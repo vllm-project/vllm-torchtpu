@@ -43,6 +43,12 @@ PREFILL_STEP_WIDTHS = (
     if os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_WIDTH12", "0") == "1"
     else _STEP_WIDTHS
 )
+# TPU_MINIMAX_M3_MSA_PREFILL_WIDTHS=<w,w,...> (e.g. "2,4,6,8,12") sets the
+# prefill step widths outright (below 16, ascending); unset keeps the above.
+if os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_WIDTHS"):
+    PREFILL_STEP_WIDTHS = tuple(
+        sorted(int(w) for w in os.environ["TPU_MINIMAX_M3_MSA_PREFILL_WIDTHS"].split(","))
+    )
 # With TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE=<slots> (0 = off), prefill-sized
 # calls on 4-bit caches copy each distinct page of a call once into a VMEM
 # cache of that many slots (~20 KB each) instead of once per tile holding it
@@ -51,7 +57,13 @@ PREFILL_STEP_WIDTHS = (
 PREFILL_PAGE_CACHE_SLOTS = int(
     os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE", "0") or 0
 )
-PAGE_CACHE_TILE_PAGES = 32
+# Tile unions past this many pages make a call stream (only this many entries of
+# each union are sorted). At DCP 2 a 16-token tile's union is ~20 pages and ~5%
+# of tiles pass 32, so nearly every 2,048-token call has one:
+# TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_TILE_PAGES=64 keeps those calls cached.
+PAGE_CACHE_TILE_PAGES = int(
+    os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_TILE_PAGES", "32") or 32
+)
 # With TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_BF16=1 (and a page cache), the
 # cached 4-bit pages are unpacked to bf16 once, after the cache fill, into a
 # second VMEM cache (64 KB a slot), so a group reads bf16 rows instead of
@@ -63,6 +75,11 @@ PREFILL_PAGE_CACHE_BF16 = (
 # run each group's scores, softmax and p @ v in `n` independent parts of the
 # tile's query heads, so one part's softmax can be scheduled beside the next
 # part's QK matmul. Rows are independent: the results are bitwise the same.
+# With TPU_MINIMAX_M3_MSA_PREFILL_BLOCK_Q=8 (default 16), prefill-sized calls
+# tile 8 tokens instead of 16: half the rows a group, each over a smaller page
+# union. Not bitwise: a row's scores then sit in other columns of the step, so
+# sums over them may round in another order.
+PREFILL_BLOCK_Q = int(os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_BLOCK_Q", "0") or 0)
 PREFILL_ROW_SPLIT = int(os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_ROW_SPLIT", "1") or 1)
 if PREFILL_PAGE_CACHE_SLOTS:
     logger.info(
@@ -71,10 +88,23 @@ if PREFILL_PAGE_CACHE_SLOTS:
         PREFILL_PAGE_CACHE_SLOTS,
         PREFILL_PAGE_CACHE_SLOTS,
     )
+if PAGE_CACHE_TILE_PAGES != 32:
+    logger.info(
+        "TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_TILE_PAGES=%d: MSA prefill page cache "
+        "sorts %d entries of each tile union.",
+        PAGE_CACHE_TILE_PAGES,
+        PAGE_CACHE_TILE_PAGES,
+    )
 if PREFILL_PAGE_CACHE_BF16:
     logger.info(
         "TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_BF16=1: MSA prefill attention page "
         "cache unpacked to bf16 once per call."
+    )
+if PREFILL_BLOCK_Q:
+    logger.info(
+        "TPU_MINIMAX_M3_MSA_PREFILL_BLOCK_Q=%d: MSA prefill attention tiles of %d tokens.",
+        PREFILL_BLOCK_Q,
+        PREFILL_BLOCK_Q,
     )
 if PREFILL_ROW_SPLIT != 1:
     logger.info(
@@ -83,7 +113,12 @@ if PREFILL_ROW_SPLIT != 1:
         PREFILL_ROW_SPLIT,
         PREFILL_ROW_SPLIT,
     )
-if PREFILL_STEP_WIDTHS != _STEP_WIDTHS:
+if os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_WIDTHS"):
+    logger.info(
+        "TPU_MINIMAX_M3_MSA_PREFILL_WIDTHS: MSA prefill attention step widths %s.",
+        PREFILL_STEP_WIDTHS,
+    )
+elif PREFILL_STEP_WIDTHS != _STEP_WIDTHS:
     logger.info(
         "TPU_MINIMAX_M3_MSA_PREFILL_WIDTH12=1: MSA prefill attention step widths %s.",
         PREFILL_STEP_WIDTHS,
