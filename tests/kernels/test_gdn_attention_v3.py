@@ -433,7 +433,8 @@ class GDNAttentionTest(parameterized.TestCase):
 
         # Compare results
         # the kernel returns its own [tokens, heads, head_dim]; the reference builds flat rows
-        np.testing.assert_allclose(output_chunked.reshape(output_chunked.shape[0], -1),
+        np.testing.assert_allclose(output_chunked.reshape(
+            output_chunked.shape[0], -1),
                                    output_ref,
                                    rtol=2e-2,
                                    atol=2e-2)
@@ -604,7 +605,10 @@ class GDNAttentionTest(parameterized.TestCase):
             )
             ref_output = ref_output.at[spec_token_end:].set(prefill_output)
 
-        np.testing.assert_allclose(output.reshape(output.shape[0], -1), ref_output, rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(output.reshape(output.shape[0], -1),
+                                   ref_output,
+                                   rtol=2e-2,
+                                   atol=2e-2)
 
         # Verify every written checkpoint slot; untouched slots must keep
         # their original contents.

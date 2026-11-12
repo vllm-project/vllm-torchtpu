@@ -396,8 +396,7 @@ def test_served_buckets_track_a_dense_reference(production_weights,
                           batch_bound=FP8_RELATIVE_BOUND,
                           token_bound=FP8_TOKEN_BOUND)
     print(
-        f"fp8 {local_tokens}x{EP}: rel_l2 {error:.4f} worst token {worst:.4f}"
-    )
+        f"fp8 {local_tokens}x{EP}: rel_l2 {error:.4f} worst token {worst:.4f}")
 
 
 def test_served_bucket_with_a_partially_padded_rank(production_weights):

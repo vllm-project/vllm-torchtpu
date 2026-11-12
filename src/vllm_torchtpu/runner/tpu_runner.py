@@ -5187,18 +5187,21 @@ class TPUModelRunner(GPUModelRunner):
                     indices = torch.zeros(num_reqs,
                                           dtype=torch.int32,
                                           device=self.device)
-                    out = self.compute_selected_top_tokens(dummy_hidden, indices)
+                    out = self.compute_selected_top_tokens(
+                        dummy_hidden, indices)
                     synchronize_tensors(out)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
         if (_get_sequence_layout_planner_for_runner(
                 self).uses_selected_logits_hidden_states):
-            with self._precompile_timed("compute_top_tokens_from_hidden_states"):
+            with self._precompile_timed(
+                    "compute_top_tokens_from_hidden_states"):
                 for num_reqs in self.num_reqs_paddings:
                     dummy_hidden = torch.zeros((num_reqs, hsize),
                                                device=self.device,
                                                dtype=self._hidden_states_dtype)
-                    out = self.compute_top_tokens_from_hidden_states(dummy_hidden)
+                    out = self.compute_top_tokens_from_hidden_states(
+                        dummy_hidden)
                     synchronize_tensors(out)
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
@@ -7088,18 +7091,17 @@ class TPUModelRunner(GPUModelRunner):
         """Whether this step's sampled tokens come from the vocabulary-parallel
         argmax: every request greedy, no logprobs asked, no speculation, a
         generative model, the head's owner resolved (TPU_GREEDY_TOP_TOKENS)."""
-        return (getattr(self, "_greedy_head_owner", None) is not None
-                and not self.is_pooling_model
-                and self.speculative_config is None
-                and self.input_batch.all_greedy
-                and self.input_batch.max_num_logprobs is None
-                # Grammar masks need the full logits. Inspect request state:
-                # the scheduler's structured-output flag is async-only.
-                and not any(
-                    self.requests[req_id].sampling_params.structured_outputs
-                    is not None
-                    for req_id in self.input_batch.req_ids
-                    if req_id is not None))
+        return (
+            getattr(self, "_greedy_head_owner", None) is not None
+            and not self.is_pooling_model and self.speculative_config is None
+            and self.input_batch.all_greedy
+            and self.input_batch.max_num_logprobs is None
+            # Grammar masks need the full logits. Inspect request state:
+            # the scheduler's structured-output flag is async-only.
+            and not any(
+                self.requests[req_id].sampling_params.structured_outputs
+                is not None
+                for req_id in self.input_batch.req_ids if req_id is not None))
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_top_tokens(

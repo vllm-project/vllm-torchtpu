@@ -77,7 +77,8 @@ def _tpu_chip_numa_node(chip_index: int) -> tuple[str | None, int | None]:
     if chip_index >= len(devices):
         return None, None
     try:
-        with open(f"/sys/bus/pci/devices/{devices[chip_index]}/numa_node") as f:
+        with open(
+                f"/sys/bus/pci/devices/{devices[chip_index]}/numa_node") as f:
             node = int(f.read().strip())
     except OSError:
         return devices[chip_index], None

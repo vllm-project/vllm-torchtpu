@@ -167,13 +167,13 @@ def prebuild() -> bool:
                                  device=torch.device("tpu"))
     _RS_OP = _build_reduce_scatter(mesh)
     from vllm.distributed.parallel_state import get_ep_group
-    _DP_COMBINE = (int(get_dp_group().world_size) == n
-                   and tuple(get_dp_group().ranks) == tuple(get_ep_group().ranks))
+    _DP_COMBINE = (int(get_dp_group().world_size) == n and tuple(
+        get_dp_group().ranks) == tuple(get_ep_group().ranks))
     logger.info(
         "small all-reduce armed (cap %d rows, %d cores, mesh index %d, "
         "tensor-parallel group is the mesh: %s): form %s", cap, n,
-        int(_RANK[0]), _TP_IS_MESH, form or
-        "by block size (one-shot up to %d bytes per core, two-shot above)" %
+        int(_RANK[0]), _TP_IS_MESH, form
+        or "by block size (one-shot up to %d bytes per core, two-shot above)" %
         sar.ONE_SHOT_MAX_BYTES)
     logger.info(
         "data-parallel combine reduce-scatter %s (this rank %d, "
@@ -220,8 +220,7 @@ def dp_combine(x: torch.Tensor):
     # The cap counts output rows per rank. The gathered input has
     # _CORES times as many rows, all held in the kernel's VMEM scratch.
     if (_RS_OP is None or not _DP_COMBINE or x.dim() != 2
-            or x.dtype != torch.bfloat16
-            or x.shape[1] % (_CORES * sar.LANES)
+            or x.dtype != torch.bfloat16 or x.shape[1] % (_CORES * sar.LANES)
             or x.shape[0] > _CORES * envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS):
         return None
     return _RS_OP(x, _RANK, _MY_RANK, _CORE_OF_RANK)

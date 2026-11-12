@@ -223,9 +223,10 @@ def update_cache(
         if sliding_window and T > sliding_window:
             assert B == 1
             start_index = jax.lax.max(0, prefill_seq_len - sliding_window)
-            operand = jax.lax.dynamic_slice_in_dim(
-                operand, start_index, sliding_window,
-                axis=2)
+            operand = jax.lax.dynamic_slice_in_dim(operand,
+                                                   start_index,
+                                                   sliding_window,
+                                                   axis=2)
             T = sliding_window
 
         I = B * T // S

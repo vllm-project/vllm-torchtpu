@@ -54,8 +54,8 @@ MESH = pl.DeviceIdType.MESH
 
 def form_for(rows, hidden, itemsize):
     """The form for a block of rows x hidden elements of itemsize bytes."""
-    return ("oneshot"
-            if rows * hidden * itemsize <= ONE_SHOT_MAX_BYTES else "twoshot")
+    return ("oneshot" if rows * hidden *
+            itemsize <= ONE_SHOT_MAX_BYTES else "twoshot")
 
 
 def reference(blocks):
@@ -115,8 +115,8 @@ def _split(refs, rank_operand, axis):
 def _oneshot(x, rows, hidden, n, axis, rank, dict_ids, collective_id):
 
     def kernel(*refs):
-        me, (x_ref, o_ref, arrivals, send_sem, recv_sem) = _split(
-            refs, rank is not None, axis)
+        me, (x_ref, o_ref, arrivals, send_sem,
+             recv_sem) = _split(refs, rank is not None, axis)
         _barrier(n, axis, dict_ids)
         for j in range(n):  # my block into slot `me` of every other core
 
@@ -155,8 +155,8 @@ def _twoshot(x, rows, hidden, n, axis, rank, dict_ids, collective_id):
 
             @pl.when(jnp.int32(j) != me)
             def _(j=j):
-                _push(mine.at[j], slices.at[me], send_sem, recv_sem, j,
-                      axis, dict_ids)
+                _push(mine.at[j], slices.at[me], send_sem, recv_sem, j, axis,
+                      dict_ids)
 
         slices[pl.ds(me, 1)] = mine[pl.ds(me, 1)]
         _wait_bytes_of(slices.at[pl.ds(0, n - 1)], recv_sem)
@@ -190,8 +190,8 @@ def _twoshot(x, rows, hidden, n, axis, rank, dict_ids, collective_id):
 
 
 def _call(kernel, x, rows, hidden, rank, scratch, collective_id, name):
-    rank_specs = ([pl.BlockSpec(memory_space=pltpu.SMEM)]
-                  if rank is not None else [])
+    rank_specs = ([pl.BlockSpec(
+        memory_space=pltpu.SMEM)] if rank is not None else [])
     args = (() if rank is None else (rank.astype(jnp.int32), )) + (x, )
     return pl.pallas_call(
         kernel,

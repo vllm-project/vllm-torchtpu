@@ -43,4 +43,6 @@ def test_no_cpu_on_the_socket_leaves_the_inherited_set():
 
 
 def test_parse_cpulist():
-    assert tpu_worker._parse_cpulist("0-3,8,10-11\n") == [0, 1, 2, 3, 8, 10, 11]
+    assert tpu_worker._parse_cpulist("0-3,8,10-11\n") == [
+        0, 1, 2, 3, 8, 10, 11
+    ]

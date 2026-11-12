@@ -32,29 +32,39 @@ def capture(fn, x):
 def buffers(gm):
     """The combine op's buffers among the placeholders, named as the compile flow lists them."""
     from vllm_torchtpu.compilation import shape_variants
-    return {name for name, _ in shape_variants._handover_inputs(gm) if "small_all_reduce_op" in name}
+    return {
+        name
+        for name, _ in shape_variants._handover_inputs(gm)
+        if "small_all_reduce_op" in name
+    }
 
 
 def live_buffers(gm):
     """The same after dead-code elimination, keeping the buffers something still reads: the piecewise split gives a
     subgraph the inputs its nodes use, so a buffer read only by a dead expression is not among the executable's."""
     gm.graph.eliminate_dead_code()
-    return {n.name for n in gm.graph.nodes if n.op == "placeholder" and "small_all_reduce_op" in n.name and n.users}
+    return {
+        n.name
+        for n in gm.graph.nodes if n.op == "placeholder"
+        and "small_all_reduce_op" in n.name and n.users
+    }
 
 
 @pytest.fixture
 def armed(monkeypatch):
     if jax.default_backend() != "tpu" or len(jax.devices()) < 8:
         pytest.skip("8 TPU cores are needed for the mesh")
+    import vllm.distributed.parallel_state as ps
     from jax.sharding import Mesh
 
-    import vllm.distributed.parallel_state as ps
     from vllm_torchtpu.layers.vllm import small_all_reduce_op as op
-    rs = op._build_reduce_scatter(Mesh(np.array(jax.devices()[:8]), ("d",)))
+    rs = op._build_reduce_scatter(Mesh(np.array(jax.devices()[:8]), ("d", )))
     monkeypatch.setattr(op, "_RS_OP", rs)
     monkeypatch.setattr(op, "_RANK", torch.tensor([3], dtype=torch.int32))
     monkeypatch.setattr(op, "_MY_RANK", torch.tensor([6], dtype=torch.int32))
-    monkeypatch.setattr(op, "_CORE_OF_RANK", torch.tensor([0, 1, 4, 5, 6, 7, 2, 3], dtype=torch.int32))
+    monkeypatch.setattr(
+        op, "_CORE_OF_RANK",
+        torch.tensor([0, 1, 4, 5, 6, 7, 2, 3], dtype=torch.int32))
     monkeypatch.setattr(op, "_CORES", 8)
     monkeypatch.setattr(op, "_DP_COMBINE", True)
     group = SimpleNamespace(ranks=list(range(8)), world_size=8)
@@ -68,11 +78,13 @@ def test_both_sides_of_the_fork_lift_the_same_buffers(armed):
     x = torch.zeros(64, 4096, dtype=torch.bfloat16)
     # called through the module attribute, as the communicator and the fused route call them
     below = capture(lambda x: op.dp_combine(x), x)
-    above = capture(lambda x: op.retain_dp_combine_inputs(x.sum(0, keepdim=True)), x)
+    above = capture(
+        lambda x: op.retain_dp_combine_inputs(x.sum(0, keepdim=True)), x)
     fallback = capture(lambda x: op.retain_dp_combine_inputs(x[:8]), x)
     assert len(buffers(below)) == 3, buffers(below)
     assert buffers(above) == buffers(below) == buffers(fallback)
-    assert live_buffers(above) == live_buffers(below) == live_buffers(fallback) == buffers(below)
+    assert live_buffers(above) == live_buffers(below) == live_buffers(
+        fallback) == buffers(below)
 
 
 def test_a_dead_read_does_not_reach_the_executable(armed):
@@ -82,7 +94,8 @@ def test_a_dead_read_does_not_reach_the_executable(armed):
     x = torch.zeros(64, 4096, dtype=torch.bfloat16)
 
     def dead(x):
-        _positions = torch.arange(x.shape[0]) + op.zero_from_rank()  # computed, never used
+        _positions = torch.arange(
+            x.shape[0]) + op.zero_from_rank()  # computed, never used
         return x.sum(0, keepdim=True)
 
     gm = capture(dead, x)
@@ -104,4 +117,6 @@ def test_the_tensor_parallel_line_lifts_no_combine_buffers(armed, monkeypatch):
     monkeypatch.setattr(op, "_DP_COMBINE", False)
     x = torch.zeros(64, 4096, dtype=torch.bfloat16)
     assert op.dp_combine(x) is None
-    assert buffers(capture(lambda x: op.retain_dp_combine_inputs(x.sum(0, keepdim=True)), x)) == set()
+    assert buffers(
+        capture(lambda x: op.retain_dp_combine_inputs(x.sum(0, keepdim=True)),
+                x)) == set()

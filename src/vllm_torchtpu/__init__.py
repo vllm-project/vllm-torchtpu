@@ -758,7 +758,8 @@ def _patch_qwen3_next_sequence_parallel_by_rows() -> None:
         # differing set of lifted inputs (the residual slice below uses it
         # only in the first layer of the sequence-parallel trace). A zero
         # rides on the positions, which the compiler folds.
-        positions = positions + (self._tpu_sp_rank * 0)[0] + _sar.zero_from_rank()
+        positions = positions + (self._tpu_sp_rank *
+                                 0)[0] + _sar.zero_from_rank()
 
         prequant = None
         if residual is None:
@@ -1643,8 +1644,7 @@ def _patch_vllm_block_pool_lifo_free() -> None:
 
     BlockPool.free_blocks = free_blocks
     BlockPool._tpu_lifo_free_patch = True
-    logger.info(
-        "Applied LIFO free-block patch to BlockPool")
+    logger.info("Applied LIFO free-block patch to BlockPool")
 
 
 def _patch_vllm_vocab_parallel_embedding() -> None:

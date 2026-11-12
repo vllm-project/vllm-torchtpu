@@ -1,25 +1,29 @@
 """The configuration checker must reject failed launcher dry runs."""
 import os
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
 BASH = os.environ.get("BASH_EXECUTABLE") or shutil.which("bash")
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash is required")
-CHECKER = Path(os.environ.get(
-    "CHECK_POINTS_SCRIPT",
-    str(Path(__file__).resolve().parents[2]
-        / "scripts/vllm/benchmark/inferencex/qwen3.5/check_points.sh")))
+CHECKER = Path(
+    os.environ.get(
+        "CHECK_POINTS_SCRIPT",
+        str(
+            Path(__file__).resolve().parents[2] /
+            "scripts/vllm/benchmark/inferencex/qwen3.5/check_points.sh")))
 
 
 def run_check(tmp_path, sweep, server, *points):
     for name, text in (("check_points.sh", CHECKER.read_text()),
                        ("sweep.sh", sweep), ("server.sh", server)):
         (tmp_path / name).write_text(text, encoding="utf-8", newline="\n")
-    return subprocess.run([BASH, "check_points.sh", *(points or ("32",))],
-                          cwd=tmp_path, capture_output=True, text=True,
+    return subprocess.run([BASH, "check_points.sh", *(points or ("32", ))],
+                          cwd=tmp_path,
+                          capture_output=True,
+                          text=True,
                           timeout=20)
 
 

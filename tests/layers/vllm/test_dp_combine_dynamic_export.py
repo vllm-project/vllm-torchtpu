@@ -13,8 +13,9 @@ def test_dynamic_batch_dimension_survives_the_op():
     if jax.default_backend() != "tpu" or len(jax.devices()) < 8:
         pytest.skip("8 TPU cores are needed for the mesh")
     from jax.sharding import Mesh
+
     from vllm_torchtpu.layers.vllm import small_all_reduce_op as op
-    rs = op._build_reduce_scatter(Mesh(np.array(jax.devices()[:8]), ("d",)))
+    rs = op._build_reduce_scatter(Mesh(np.array(jax.devices()[:8]), ("d", )))
     rank = torch.tensor([3], dtype=torch.int32)
     my_rank = torch.tensor([6], dtype=torch.int32)
     table = torch.tensor([0, 1, 4, 5, 6, 7, 2, 3], dtype=torch.int32)

@@ -409,7 +409,8 @@ def _make_ep_inputs(num_local_experts, seed=0):
 @pytest.mark.parametrize(
     "num_local_experts,experts_start",
     [
-        (16, 0),  # rank 0: experts_start == 0 must behave like local expert IDs
+        (16,
+         0),  # rank 0: experts_start == 0 must behave like local expert IDs
         (16, 32),  # rank 2 of 8-way EP (Qwen3-30B shape: 128 / 8 = 16 local)
         (20,
          60),  # rank 3 of 8-way EP (Qwen3-480B-FP8 shape: 160 / 8 = 20 local)

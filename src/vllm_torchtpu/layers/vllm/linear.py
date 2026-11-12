@@ -14,7 +14,7 @@
 
 import torch
 from torch.nn import Parameter
-from vllm.distributed import (split_tensor_along_last_dim)
+from vllm.distributed import split_tensor_along_last_dim
 from vllm.model_executor.layers.linear import RowParallelLinear
 
 
