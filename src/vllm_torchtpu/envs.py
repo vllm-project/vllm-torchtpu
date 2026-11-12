@@ -134,6 +134,7 @@ if TYPE_CHECKING:
     TPU_SPEC_GATHER_IN_BOUNDS: bool = False
     TPU_SPEC_SYNTHETIC_INGRAPH_RNG: bool = False
     TPU_SPEC_SYNTHETIC_HEAD_FUSION: bool = False
+    TPU_SPEC_SUBST_EXTRACT_FUSION: bool = False
     TPU_DSPARK_MARKOV_KERNEL: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -1001,6 +1002,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in the same order; the step's logits stay inside the program.
     "TPU_SPEC_SYNTHETIC_HEAD_FUSION": env_bool(
         "TPU_SPEC_SYNTHETIC_HEAD_FUSION", default=False
+    ),
+    # Async spec, steady decode: when the next step's input_ids are the first
+    # rows of the parked substitution source (fast token substitution's
+    # identity case), build them and re-source the verify's draft ids in one
+    # compiled program instead of an eager slice plus an eager gather.
+    "TPU_SPEC_SUBST_EXTRACT_FUSION": env_bool(
+        "TPU_SPEC_SUBST_EXTRACT_FUSION", default=False
     ),
     # Run the DSpark greedy Markov chain over the vocab-parallel draft logits
     # as one Pallas call (kernels/collectives/markov_argmax.py) instead of K

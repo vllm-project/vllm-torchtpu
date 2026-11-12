@@ -2516,6 +2516,32 @@ class TPUModelRunner(GPUModelRunner):
         else:
             return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
 
+    def _identity_substitution_source(
+        self,
+        input_ids: torch.Tensor,
+        token_in_tpu_cur_input_indices: np.ndarray,
+        token_in_tpu_pre_next_tokens_indices: np.ndarray,
+    ) -> torch.Tensor | None:
+        """The parked source when `_apply_async_token_substitution` would take
+        its first fast path (every input row substituted, in order, from the
+        source's first rows), else None."""
+        n = len(input_ids)
+        if (
+            not getattr(self, "_fast_token_substitution", False)
+            or self._pre_async_results is None
+            or self._pre_async_results.next_tokens_tpu is None
+            or len(token_in_tpu_cur_input_indices) != n
+        ):
+            return None
+        arange = np.arange(n, dtype=np.int32)
+        if not (
+            np.array_equal(token_in_tpu_cur_input_indices, arange)
+            and np.array_equal(token_in_tpu_pre_next_tokens_indices, arange)
+        ):
+            return None
+        src = self._pre_async_results.next_tokens_tpu
+        return src if src.numel() >= n else None
+
     def _apply_async_token_substitution(
         self,
         input_ids: torch.Tensor,
@@ -4199,14 +4225,41 @@ class TPUModelRunner(GPUModelRunner):
             # offset; clear it before this chunk's forward gathers it.
             self._reset_read_offsets_for_new_requests(start_index, num_reqs)
 
-            input_ids = self._apply_async_token_substitution(
-                self.input_ids, cur_input_indices, pre_next_tokens_indices
-            )
+            fused_src = None
+            if (
+                envs.TPU_SPEC_SUBST_EXTRACT_FUSION
+                and self.scheduler_config.async_scheduling
+                and spec_decode_metadata is not None
+                and len(cur_input_indices) > 0
+            ):
+                fused_src = self._identity_substitution_source(
+                    self.input_ids, cur_input_indices, pre_next_tokens_indices
+                )
+            if fused_src is not None:
+                from vllm_torchtpu.runner.tpu_runner_async_output import (
+                    substitute_and_extract_drafts,
+                )
+
+                assert spec_decode_metadata is not None
+                self._log_spec_glue_once("TPU_SPEC_SUBST_EXTRACT_FUSION")
+                input_ids, spec_decode_metadata.draft_token_ids = (
+                    substitute_and_extract_drafts(
+                        fused_src,
+                        self.input_ids,
+                        spec_decode_metadata.final_logits_indices,
+                        spec_decode_metadata.target_logits_indices,
+                    )
+                )
+            else:
+                input_ids = self._apply_async_token_substitution(
+                    self.input_ids, cur_input_indices, pre_next_tokens_indices
+                )
             # Async spec: the drafts the target verifies live in the substituted
             # input_ids (host input_ids_cpu holds placeholders), so re-source the
             # rejection sampler's draft_token_ids from the device.
             if (
-                self.scheduler_config.async_scheduling
+                fused_src is None
+                and self.scheduler_config.async_scheduling
                 and spec_decode_metadata is not None
                 and len(cur_input_indices) > 0
             ):
@@ -7370,6 +7423,21 @@ class TPUModelRunner(GPUModelRunner):
                     out = spec_substitution_glue(
                         next_tokens, drafts, num_draft, rows, None, src_len, rejected_len
                     )
+                    synchronize_tensors(out)
+            if envs.TPU_SPEC_SUBST_EXTRACT_FUSION:
+                from vllm_torchtpu.runner.tpu_runner_async_output import (
+                    substitute_and_extract_drafts,
+                )
+
+                src = torch.zeros(src_len, dtype=torch.int32).to(self.device)
+                for num_tokens in self.num_tokens_paddings:
+                    if num_tokens > src_len:
+                        break
+                    ids = torch.zeros(num_tokens, dtype=self.input_ids_cpu.dtype).to(
+                        self.device
+                    )
+                    idx = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
+                    out = substitute_and_extract_drafts(src, ids, idx, idx)
                     synchronize_tensors(out)
             num_rejected = torch.zeros(rejected_len, dtype=torch.int32).to(self.device)
             for num_tokens in self.num_tokens_paddings:

@@ -358,6 +358,25 @@ def extract_draft_token_ids(
     return input_ids[logits_indices[target_logits_indices + 1]]
 
 
+def _substitute_and_extract_drafts(
+    next_tokens: torch.Tensor,
+    input_ids: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The identity case of the async token substitution (``input_ids`` are
+    the first rows of the parked source) followed by
+    `extract_draft_token_ids` on the result. ``input_ids`` gives only the
+    length and dtype."""
+    ids = next_tokens.flatten()[: input_ids.shape[0]].to(input_ids.dtype)
+    return ids, extract_draft_token_ids(ids, logits_indices, target_logits_indices)
+
+
+substitute_and_extract_drafts = torch.compile(
+    backend="tpu", fullgraph=True, dynamic=False
+)(_substitute_and_extract_drafts)
+
+
 def compute_num_rejected(
     next_tokens: torch.Tensor, num_draft: torch.Tensor
 ) -> torch.Tensor:
