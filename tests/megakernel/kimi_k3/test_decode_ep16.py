@@ -421,3 +421,64 @@ def test_interleaved_gate_up_is_bit_identical(rows, paired_order):
     )
     assert np.count_nonzero(old) > old.size // 2
     np.testing.assert_array_equal(np.asarray(new).view(np.uint32), old.view(np.uint32))
+
+
+def test_half_copies_take_each_halfs_window():
+    """EP16 local expert 2e + h (interpret mode): one DMA per family brings
+    TP4 quarter h of the gate/up columns and row half h of down."""
+    experts, rows, width = 4, 8, 512
+    rng = np.random.default_rng(5)
+    families = (
+        rng.integers(0, 2**31, (experts, rows, 2 * width)).astype(np.uint32),
+        rng.integers(0, 255, (experts, 2, 2 * width)).astype(np.uint8),
+        rng.integers(0, 2**31, (experts, 2 * 16, 128)).astype(np.uint32),
+        rng.integers(0, 255, (experts, 2 * 32, 128)).astype(np.uint8),
+    )
+    slots = [(4, f.shape[1], width) for f in families[:2]] + [
+        (4, f.shape[1] // 2, 128) for f in families[2:]
+    ]
+
+    def kernel(*refs):
+        sources, outputs, vmem, semaphores = refs[:4], refs[4:8], refs[8:12], refs[12]
+        # Only the routed expert families and their slots are used.
+        weights = dm.MixtureOfExpertsWeights(
+            *([None] * 11),
+            *(ref for pair in zip(sources, vmem) for ref in pair),
+            semaphores,
+        )
+        for local in range(2 * experts):
+            copies = vars(
+                weights._make_expert_half_copies(
+                    local, local % 4, gate_up=True, down=True
+                )
+            )
+            for copy in copies.values():
+                copy.start()
+            for copy in copies.values():
+                copy.wait()
+            for output, slot in zip(outputs, vmem):
+                output[local] = slot[local % 4]
+
+    outputs = pl.pallas_call(
+        kernel,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
+        out_shape=[
+            jax.ShapeDtypeStruct((2 * experts, *shape[1:]), f.dtype)
+            for shape, f in zip(slots, families)
+        ],
+        scratch_shapes=[
+            *(pltpu.VMEM(shape, f.dtype) for shape, f in zip(slots, families)),
+            pltpu.SemaphoreType.DMA((4, 4)),
+        ],
+        interpret=True,
+    )(*families)
+    for local in range(2 * experts):
+        expert, half = local // 2, local % 2
+        for name, family, output, shape in zip(SHAPES, families, outputs, slots):
+            axis, start = dm.expert_half_window(name, shape[1:], half)
+            want = (
+                family[expert][:, start : start + shape[2]]
+                if axis == 1
+                else family[expert][start : start + shape[1]]
+            )
+            np.testing.assert_array_equal(np.asarray(output[local]), want)
