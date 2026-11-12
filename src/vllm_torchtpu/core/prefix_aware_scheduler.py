@@ -119,6 +119,12 @@ def _tail_hold_steps() -> int:
     return envs.VLLM_TPU_TAIL_HOLD_STEPS
 
 
+def _tail_hold_require_waiting() -> bool:
+    from vllm_torchtpu import envs
+
+    return envs.VLLM_TPU_TAIL_HOLD_REQUIRE_WAITING
+
+
 def _paw_skip_full() -> bool:
     from vllm_torchtpu import envs
 
@@ -183,7 +189,11 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._prompt_np = _prompt_ids_ndarray()
         self._paw_skip_full = _paw_skip_full()
         steps = _tail_hold_steps()
-        self._tail_hold = TailHold(steps) if steps > 0 else None
+        self._tail_hold = (
+            TailHold(steps, require_waiting=_tail_hold_require_waiting())
+            if steps > 0
+            else None
+        )
         self._tail_hold_now = frozenset()
 
         logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
