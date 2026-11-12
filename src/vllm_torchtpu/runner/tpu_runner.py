@@ -5980,6 +5980,16 @@ class TPUModelRunner(GPUModelRunner):
                 gmm_prefill_tiles,
                 gmm_decode_w13,
             )
+        moe_row_movement = (
+            option(additional, "moe_tc_combine_min_tokens"),
+            option(additional, "moe_v3_payload_sort"),
+            option(additional, "moe_flat_routing_min_tokens"),
+        )
+        if any(moe_row_movement):
+            from vllm_torchtpu.layers.core import fused_moe_gmm
+
+            # Logs the resolved values (the payload sort needs the v3 combine).
+            fused_moe_gmm.set_row_movement(*moe_row_movement)
         if isinstance(additional, dict) and "moe_gmm_tuned_tiles" in additional:
             from vllm_torchtpu.kernels.megablox import gmm_v2
 

@@ -58,6 +58,9 @@ REPLACED_ENV = {
     "minimax_msa_prefill_pages_per_step": "TPU_MINIMAX_M3_MSA_PREFILL_PAGES_PER_STEP",
     "minimax_msa_decode_work_list_kernel": "TPU_MINIMAX_M3_MSA_DECODE_WORK_LIST_KERNEL",
     "minimax_msa_decode_one_call": "TPU_MINIMAX_M3_MSA_DECODE_ONE_CALL",
+    "moe_tc_combine_min_tokens": "TPU_MOE_TC_COMBINE_MIN_TOKENS",
+    "moe_v3_payload_sort": "TPU_MOE_V3_PAYLOAD_SORT",
+    "moe_flat_routing_min_tokens": "TPU_MOE_FLAT_ROUTING_MIN_TOKENS",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -71,6 +74,8 @@ SAMPLE = {
     "minimax_msa_prefill_row_split": 2,
     "minimax_msa_prefill_block_q": 8,
     "minimax_msa_prefill_pages_per_step": 8,
+    "moe_tc_combine_min_tokens": 4096,
+    "moe_flat_routing_min_tokens": 1024,
 }
 # Dropped with no key: hid the offload connector from draft forwards, which
 # v3's skip_draft_kv unbinding already covers in every served config.

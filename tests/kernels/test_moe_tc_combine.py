@@ -87,3 +87,23 @@ def test_slab_combine_bitwise(t, local, seed, scap, xcap, expect_overflow):
     if not expect_overflow:
         ref = _v3_reference(yb, pos, w, valid)
         np.testing.assert_array_equal(np.asarray(out).view(np.uint16), ref)
+
+
+def test_row_movement_keys_default_off(monkeypatch):
+    fm = pytest.importorskip("vllm_torchtpu.layers.core.fused_moe_gmm")
+    assert (fm._TC_COMBINE_MIN_TOKENS, fm._V3_PAYLOAD_SORT) == (0, False)
+    assert fm._FLAT_ROUTING_MIN_TOKENS == 0
+    assert fm._ep_combine() is fm.ragged_gather_reduce
+    try:
+        monkeypatch.setattr(fm.envs, "RAGGED_GATHER_REDUCE_VERSION", "v3")
+        fm.set_row_movement(4096, True, 1024)
+        assert (fm._TC_COMBINE_MIN_TOKENS, fm._FLAT_ROUTING_MIN_TOKENS) == (4096, 1024)
+        assert fm._ep_combine().keywords == {"payload_sort": True}
+        monkeypatch.setattr(fm.envs, "RAGGED_GATHER_REDUCE_VERSION", "v2")
+        fm.set_row_movement(0, True, 0)  # the payload sort needs the v3 combine
+        assert fm._V3_PAYLOAD_SORT is False
+        with pytest.raises(ValueError):
+            fm.set_row_movement(-1, False, 0)
+    finally:
+        fm.set_row_movement()
+    assert fm._ep_combine() is fm.ragged_gather_reduce

@@ -80,9 +80,6 @@ if TYPE_CHECKING:
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
-    TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
-    TPU_MOE_V3_PAYLOAD_SORT: bool = False
-    TPU_MOE_FLAT_ROUTING_MIN_TOKENS: int = 0
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
@@ -749,25 +746,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "v3" selects the destination-major prototype.
     "RAGGED_GATHER_REDUCE_VERSION": env_with_choices(
         "RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2", "v3"]
-    ),
-    # EP MoE steps of at least this many tokens combine the expert outputs on
-    # the TensorCore (kernels/megablox/moe_tc_combine.tc_slab_combine: aligned
-    # 16-row slab DMAs plus a 0/1 selection matmul, then the f32 top-k-order sum
-    # of the SparseCore v3 combine) instead of the SparseCore gather-reduce.
-    # 0 (default) keeps the SparseCore combine. Needs tokens divisible by 256.
-    "TPU_MOE_TC_COMBINE_MIN_TOKENS": env_nonnegative_int(
-        "TPU_MOE_TC_COMBINE_MIN_TOKENS", 0
-    ),
-    # Build the v3 combine's per-block route metadata with one multi-operand
-    # TensorCore sort instead of an argsort plus four gathers (which XLA
-    # offloads to the SparseCore ahead of the dispatch). Same values.
-    "TPU_MOE_V3_PAYLOAD_SORT": env_bool("TPU_MOE_V3_PAYLOAD_SORT"),
-    # EP MoE steps of at least this many tokens flatten the [tokens, top_k]
-    # routing ids and weights once (behind an optimization barrier) before the
-    # routing prep, so the [T, 4] arrays (32x lane-padded in HBM) are read once
-    # instead of being relaid out for every consumer shape. Same values. 0 = off.
-    "TPU_MOE_FLAT_ROUTING_MIN_TOKENS": env_nonnegative_int(
-        "TPU_MOE_FLAT_ROUTING_MIN_TOKENS", 0
     ),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;

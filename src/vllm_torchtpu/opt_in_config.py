@@ -110,6 +110,14 @@ DEFAULTS: dict[str, bool | int | str] = {
     # KV head in one kernel call. Bitwise.
     "minimax_msa_decode_work_list_kernel": False,
     "minimax_msa_decode_one_call": False,
+    # EP MoE steps of at least this many tokens: combine on the TensorCore
+    # (`moe_tc_combine.tc_slab_combine`, bitwise, 0 = off); flat routing
+    # arrays read once (same values, 0 = off). And the v3 combine's route
+    # metadata by one multi-operand sort (same values;
+    # `fused_moe_gmm.set_row_movement`).
+    "moe_tc_combine_min_tokens": 0,
+    "moe_v3_payload_sort": False,
+    "moe_flat_routing_min_tokens": 0,
 }
 
 

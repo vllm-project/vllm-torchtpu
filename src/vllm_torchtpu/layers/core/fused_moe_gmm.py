@@ -76,25 +76,60 @@ def _select_ragged_gather_reduce(version: str):
 # RAGGED_GATHER_REDUCE_VERSION=v3 to select the destination-major kernel for EP.
 # The non-EP combine in moe_gmm selects that kernel directly.
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
-_V3_PAYLOAD_SORT = (
-    envs.TPU_MOE_V3_PAYLOAD_SORT and envs.RAGGED_GATHER_REDUCE_VERSION == "v3"
-)
-if _V3_PAYLOAD_SORT:
-    ragged_gather_reduce = functools.partial(
-        ragged_gather_reduce_v3, payload_sort=True
+# Opt-in MoE row movement for large EP steps, set from --additional-config
+# before the model's first trace (`set_row_movement`; all off by default):
+#   moe_tc_combine_min_tokens: EP steps of at least this many tokens combine
+#     the expert outputs on the TensorCore (moe_tc_combine.tc_slab_combine:
+#     aligned 16-row slab DMAs plus a 0/1 selection matmul, then the f32
+#     top-k-order sum of the SparseCore v3 combine) instead of the SparseCore
+#     gather-reduce. Needs tokens divisible by 256. 0 = never.
+#   moe_v3_payload_sort: the v3 combine (RAGGED_GATHER_REDUCE_VERSION=v3)
+#     builds its per-block route metadata with one multi-operand TensorCore
+#     sort instead of an argsort plus four gathers. Same values.
+#   moe_flat_routing_min_tokens: EP steps of at least this many tokens flatten
+#     the [tokens, top_k] routing ids and weights once (behind an optimization
+#     barrier) before the routing prep, so the lane-padded [T, top_k] arrays
+#     are read once instead of being relaid out for every consumer shape.
+#     Same values. 0 = off.
+_TC_COMBINE_MIN_TOKENS = 0
+_V3_PAYLOAD_SORT = False
+_FLAT_ROUTING_MIN_TOKENS = 0
+
+
+def set_row_movement(
+    tc_combine_min_tokens: int = 0,
+    v3_payload_sort: bool = False,
+    flat_routing_min_tokens: int = 0,
+) -> None:
+    """Keys moe_tc_combine_min_tokens / moe_v3_payload_sort /
+    moe_flat_routing_min_tokens."""
+    global _TC_COMBINE_MIN_TOKENS, _V3_PAYLOAD_SORT, _FLAT_ROUTING_MIN_TOKENS
+    if tc_combine_min_tokens < 0 or flat_routing_min_tokens < 0:
+        raise ValueError(
+            "moe_tc_combine_min_tokens / moe_flat_routing_min_tokens must be >= 0"
+        )
+    _TC_COMBINE_MIN_TOKENS = int(tc_combine_min_tokens)
+    _V3_PAYLOAD_SORT = (
+        bool(v3_payload_sort) and envs.RAGGED_GATHER_REDUCE_VERSION == "v3"
     )
-# Fixed at import: EP steps of at least this many tokens combine the expert
-# outputs on the TensorCore (0 = never). See moe_tc_combine.
-_TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
-_FLAT_ROUTING_MIN_TOKENS = envs.TPU_MOE_FLAT_ROUTING_MIN_TOKENS
-if _TC_COMBINE_MIN_TOKENS or _V3_PAYLOAD_SORT or _FLAT_ROUTING_MIN_TOKENS:
-    logger.info(
-        "MoE row movement: TPU_MOE_TC_COMBINE_MIN_TOKENS=%d "
-        "TPU_MOE_V3_PAYLOAD_SORT=%d TPU_MOE_FLAT_ROUTING_MIN_TOKENS=%d",
-        _TC_COMBINE_MIN_TOKENS,
-        int(_V3_PAYLOAD_SORT),
-        _FLAT_ROUTING_MIN_TOKENS,
-    )
+    _FLAT_ROUTING_MIN_TOKENS = int(flat_routing_min_tokens)
+    if _TC_COMBINE_MIN_TOKENS or _V3_PAYLOAD_SORT or _FLAT_ROUTING_MIN_TOKENS:
+        logger.info(
+            "MoE row movement: moe_tc_combine_min_tokens=%d "
+            "moe_v3_payload_sort=%s moe_flat_routing_min_tokens=%d",
+            _TC_COMBINE_MIN_TOKENS,
+            _V3_PAYLOAD_SORT,
+            _FLAT_ROUTING_MIN_TOKENS,
+        )
+
+
+def _ep_combine():
+    """The EP combine `ragged_gather_reduce`, with the v3 payload sort under
+    moe_v3_payload_sort."""
+    if _V3_PAYLOAD_SORT:
+        return functools.partial(ragged_gather_reduce_v3, payload_sort=True)
+    return ragged_gather_reduce
+
 
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
@@ -704,7 +739,7 @@ def moe_gmm(
             )
             return (combine @ gmm2_res).astype(x.dtype)
         def sc_combine():
-            return ragged_gather_reduce(
+            return _ep_combine()(
                 gmm2_res,
                 argsort_revert_indices,
                 topk_weights_flat,
@@ -719,7 +754,7 @@ def moe_gmm(
             and tc_slab_combine_ok(num_tokens, gmm2_res.shape[-1])
         ):
             logger.info_once(
-                "TPU_MOE_TC_COMBINE_MIN_TOKENS=%d: TensorCore MoE combine "
+                "moe_tc_combine_min_tokens=%d: TensorCore MoE combine "
                 "(tc_slab_combine) armed",
                 _TC_COMBINE_MIN_TOKENS,
             )
@@ -862,7 +897,7 @@ def fused_moe_func(
         # so every later view (flat, counting-sort blocks, v3 blocks) is a
         # cheap reshape of dense data instead of another padded relayout.
         logger.info_once(
-            "TPU_MOE_FLAT_ROUTING_MIN_TOKENS=%d: flat MoE routing armed",
+            "moe_flat_routing_min_tokens=%d: flat MoE routing armed",
             _FLAT_ROUTING_MIN_TOKENS,
         )
         ids_flat, weights_flat = jax.lax.optimization_barrier(
