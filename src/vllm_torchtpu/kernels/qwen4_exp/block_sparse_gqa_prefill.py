@@ -6,6 +6,8 @@ import math
 
 import jax
 import jax.numpy as jnp
+
+from vllm_torchtpu.kernels import sorted_search
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -1763,7 +1765,7 @@ def block_sparse_gqa_attention(
     )
 
     def run_with_padding(max_tokens):
-        req = jnp.searchsorted(starts[1:], jnp.arange(len(query)), side="right")
+        req = sorted_search.searchsorted(starts[1:], jnp.arange(len(query)), side="right")
         req = jnp.minimum(req, len(real) - 1)
         positions = jnp.arange(len(query)) - starts[req]
         valid = jnp.arange(len(query)) < starts[-1]
