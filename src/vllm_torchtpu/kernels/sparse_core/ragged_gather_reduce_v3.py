@@ -329,15 +329,20 @@ def _main_kernel(
     )
 
 
-@functools.partial(jax.jit, static_argnames=("reduce_group_size",))
+@functools.partial(jax.jit, static_argnames=("reduce_group_size", "payload_sort"))
 def ragged_gather_reduce(
     x: jax.Array,
     indices: jax.Array,
     topk_weights: jax.Array,
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
+    payload_sort: bool = False,
 ) -> jax.Array:
-    """Destination-major prototype for MoE output combine."""
+    """Destination-major prototype for MoE output combine.
+
+    ``payload_sort`` builds the route metadata with one multi-operand sort
+    instead of an argsort and four gathers; the result is identical.
+    """
     sc_info = get_sparse_core_info()
     if (
         sc_info is None
@@ -401,12 +406,31 @@ def ragged_gather_reduce(
 
     # A stable boolean partition keeps routes for each destination adjacent
     # while placing the exact valid prefix first in every destination block.
-    route_order = jnp.argsort(~valid_blocks, axis=1, stable=True)
-    compact_valid = jnp.take_along_axis(valid_blocks, route_order, axis=1)
-    route_indices = jnp.take_along_axis(indices_blocks, route_order, axis=1)
-    route_destinations = jnp.take_along_axis(destination_blocks, route_order, axis=1)
     weights_blocks = weights_2d.reshape(num_blocks, metadata_block_size)
-    route_weights = jnp.take_along_axis(weights_blocks, route_order, axis=1)
+    if payload_sort:
+        # One stable multi-operand sort carries the payloads with the key, so
+        # no gathers (XLA offloads those to the SparseCore, where they queue
+        # ahead of the MoE dispatch). Same permutation, same values.
+        invalid_key, route_indices, route_destinations, route_weights = jax.lax.sort(
+            (
+                jnp.logical_not(valid_blocks).astype(jnp.int32),
+                indices_blocks.astype(jnp.int32),
+                destination_blocks,
+                weights_blocks,
+            ),
+            dimension=1,
+            is_stable=True,
+            num_keys=1,
+        )
+        compact_valid = invalid_key == 0
+    else:
+        route_order = jnp.argsort(~valid_blocks, axis=1, stable=True)
+        compact_valid = jnp.take_along_axis(valid_blocks, route_order, axis=1)
+        route_indices = jnp.take_along_axis(indices_blocks, route_order, axis=1)
+        route_destinations = jnp.take_along_axis(
+            destination_blocks, route_order, axis=1
+        )
+        route_weights = jnp.take_along_axis(weights_blocks, route_order, axis=1)
     route_indices = jnp.where(compact_valid, route_indices, 0).astype(jnp.int32)
     route_destinations = jnp.where(compact_valid, route_destinations, 0).astype(
         jnp.int32
