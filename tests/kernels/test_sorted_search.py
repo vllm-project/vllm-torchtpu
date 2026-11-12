@@ -59,3 +59,45 @@ def test_patched_modules_import():
     import vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk  # noqa: F401
     import vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill  # noqa: F401
     import vllm_torchtpu.kernels.qwen4_exp.qsa_union_dense  # noqa: F401
+
+
+def _check(b, x, side):
+    b = jnp.asarray(b, jnp.int32)
+    x = jnp.asarray(x, jnp.int32)
+    want = jnp.searchsorted(b, x, side=side)
+    got = sorted_search.searchsorted(b, x, side=side)
+    assert got.shape == want.shape and got.dtype == want.dtype
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+I32 = np.iinfo(np.int32)
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_edge_cases_bitwise(monkeypatch, side):
+    monkeypatch.setenv("VLLM_TPU_SORTED_SEARCH_MASK", "1")
+    edge_x = [I32.min, -1, 0, 1, 2, 3, 7, 8, 9, 100, I32.max]
+    _check([], edge_x, side)  # empty boundaries: every query -> 0
+    _check([0, 3, 9], [], side)  # no queries
+    _check([], [], side)
+    _check([5], edge_x + [5, 4, 6], side)  # single boundary
+    _check([4, 4, 4, 4], edge_x + [4, 3, 5], side)  # all equal
+    _check([0, 0, 0, 8, 8, 9, 9], edge_x, side)  # duplicate runs (empty requests)
+    _check([I32.min, 0, I32.max], edge_x, side)  # int32 extremes as boundaries
+    # Query exactly on every boundary and one either side of it.
+    b = np.array([0, 2, 2, 5, 11, 11, 11, 20], np.int32)
+    _check(b, np.concatenate([b - 1, b, b + 1]), side)
+    # 2-D queries keep their shape.
+    _check(b, np.arange(-2, 22, dtype=np.int32).reshape(4, 6), side)
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_random_sorted_bitwise(monkeypatch, side):
+    monkeypatch.setenv("VLLM_TPU_SORTED_SEARCH_MASK", "1")
+    rng = np.random.default_rng(1234)
+    for _ in range(200):
+        n = int(rng.integers(0, 70))
+        lo, hi = sorted(int(v) for v in rng.integers(-1000, 1000, size=2))
+        b = np.sort(rng.integers(lo, hi + 1, size=n)).astype(np.int32)
+        x = rng.integers(lo - 5, hi + 6, size=int(rng.integers(0, 300))).astype(np.int32)
+        _check(b, x, side)
