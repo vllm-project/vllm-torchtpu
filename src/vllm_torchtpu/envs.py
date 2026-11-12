@@ -303,6 +303,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MAMBA_TAIL_FOLD_UNIT: int = 0
     VLLM_TPU_MAMBA_TAIL_FOLD_DCP: bool = False
     VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY: bool = False
+    VLLM_TPU_TAIL_HOLD_STEPS: int = 0
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -2040,6 +2041,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stops at most unit - 1 tokens short of the prior prompt instead of up
     # to 511. Also sets --prefix-match-unit to the unit when it is unset.
     "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT": env_int("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", 0),
+    # PrefixAwareScheduler: hold a running request's short prefill remainder
+    # (the Mamba-aligned tail) for up to this many steps while no other
+    # prefill can run in the step but a waiting request is queued for a
+    # seat, so the tail shares a step with that prefill instead of paying a
+    # prefill step of its own (core/tail_hold.py). 0 = off. Engine core.
+    "VLLM_TPU_TAIL_HOLD_STEPS": env_int("VLLM_TPU_TAIL_HOLD_STEPS", 0),
     # Ignored (hard-off): the fold under the Qwen4Exp main-KV DCP gave wrong
     # outputs (za6 GSM8K c32 0.26, c48 0.008). The fold turns itself off under
     # any context parallelism.
