@@ -1203,8 +1203,8 @@ def gmm_vmem_estimate(
 #   TPU_GMM_V2_PREFILL_TILES="<tile_m>:<bucket>,...,<tile_m>": calls above
 #     FP8_DECODE_MAX_M rows (prefill / mixed steps). Buckets of at most
 #     FP8_RHS_MAX_BUCKET_M rows take the fp8 rhs feed (as decode tiles do);
-#     larger ones dequantize before the matmul. "256:128,256" keeps every
-#     bucket on the default numerics.
+#     larger ones dequantize before the matmul. "256:128,256" (or
+#     "256:128/256") keeps every bucket on the default numerics.
 #   TPU_GMM_V2_DECODE_W13="<tile_n>:<rhs buffers>": the gate_up (fused
 #     activation) call of decode-sized buffers (<= FP8_DECODE_MAX_M rows).
 _PREFILL_TILES_ENV = "TPU_GMM_V2_PREFILL_TILES"
@@ -1217,7 +1217,10 @@ def _tile_env() -> tuple[tuple[int, tuple[int, ...]] | None, tuple[int, int] | N
     raw = os.environ.get(_PREFILL_TILES_ENV, "").strip()
     if raw:
         tm, _, bks = raw.partition(":")
-        buckets = tuple(sorted({int(b) for b in bks.split(",") if b.strip()}))
+        # "," or "/" between buckets ("/" fits comma-separated env lists).
+        buckets = tuple(
+            sorted({int(b) for b in bks.replace("/", ",").split(",") if b.strip()})
+        )
         if not buckets or buckets[-1] != int(tm):
             raise ValueError(f"{_PREFILL_TILES_ENV}={raw!r}: buckets must end at tile_m")
         prefill = (int(tm), buckets)

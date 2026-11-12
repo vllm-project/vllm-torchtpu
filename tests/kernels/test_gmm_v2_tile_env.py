@@ -86,7 +86,7 @@ def _args(size_m, gate_up):
 
 @pytest.mark.parametrize("gate_up", [True, False])
 def test_prefill_tiles_apply_above_decode_max(monkeypatch, gate_up):
-    monkeypatch.setenv(G._PREFILL_TILES_ENV, "256:128,256")
+    monkeypatch.setenv(G._PREFILL_TILES_ENV, "256:128/256")
     for size_m in (4096, 32768):
         t = _tiles(size_m, gate_up)
         assert (t.tile_m, t.bucket_base, t.bucket_sizes) == (256, 128, (128, 256))
