@@ -662,10 +662,8 @@ class RpaConfigs:
                     "Context Parallel does not support sliding window right now"
                 )
 
-        # The cached-KV DMA schedule addresses whole pages: block k is fetched
-        # from pages k * bkv_p onwards with no intra-page offset, in both
-        # layouts. A bkv_sz that is not a page multiple silently reads the wrong
-        # tokens from the second block onwards, so reject it up front.
+        # The cached-KV schedule fetches block k from pages k * bkv_p with no
+        # intra-page offset; an unaligned bkv_sz silently reads the wrong tokens.
         bkv_sz = self.block.bkv_sz
         page_size = self.serve.page_size
         if bkv_sz % page_size != 0:

@@ -380,12 +380,8 @@ def calculate_block_sizes(
 
         # To maximize MXU, we want bkv_sz to be at least MXU size.
         bkv_default = mxu_column_size
-        # bkv_sz must be a whole number of pages in every layout: the schedule
-        # fetches the cached KV of block k from pages k * bkv_p onwards with no
-        # intra-page offset (`BaseMetadataComputer.k_loop`). With a bkv_sz that
-        # is not a page multiple (e.g. 768 with 512-token pages) every block after
-        # the first reads the wrong tokens. Growing bkv_sz in steps of the aligned
-        # default keeps every candidate aligned.
+        # The cached-KV schedule fetches block k from pages k * bkv_p with no
+        # intra-page offset, so bkv_sz must be a page multiple in every layout.
         # TODO(kyuyeunk): Reduce granularity to lane size for SEQ_ALONG_LANE.
         bkv_default = utils.align_to(bkv_default, serve_cfgs.page_size)
         bkv_sz = bkv_stride = bkv_default

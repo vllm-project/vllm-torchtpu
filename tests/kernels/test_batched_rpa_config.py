@@ -86,11 +86,8 @@ def test_calculate_block_sizes_generation(
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
 
 
-# The cached-KV DMA schedule fetches block k from pages k * bkv_p onwards with no
-# intra-page offset, so bkv_sz has to be a whole number of pages in every layout.
-# These are the four configs from issue #2435 on a 256-wide MXU with 512-token
-# pages, where the default decode bkv_sz used to land on an odd multiple of 256
-# for two of them.
+# bkv_sz must be a page multiple in every layout (see RpaConfigs.validate_inputs).
+# These are the four configs from the #2435 report on a 256-wide MXU.
 @pytest.mark.parametrize(
     "kv_layout",
     [configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE],
