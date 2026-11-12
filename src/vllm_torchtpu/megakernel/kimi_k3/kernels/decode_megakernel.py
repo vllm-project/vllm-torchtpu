@@ -21,6 +21,7 @@ from vllm_torchtpu.megakernel.common.vmem_pool import VmemPool
 from vllm_torchtpu.megakernel.kimi_k3 import kernels as kimi
 from vllm_torchtpu.megakernel.kimi_k3.config import active as _config
 from vllm_torchtpu.megakernel.kimi_k3.kernels import mla_dcp
+from vllm_torchtpu.megakernel.kimi_k3.kernels.rank_loader import GATE_UP_CHUNK
 from vllm_torchtpu.megakernel.kimi_k3.layout import CONV_HEAD_ROWS
 
 _COMMUNICATION_SCRATCH_SPEC_COUNT = 10
@@ -74,8 +75,8 @@ def _scoped(name):
 MAX_BATCH = 128
 SCATTER_BATCHES = (8, 12, 16, 20, 24, 28, 32, 64, 96, 128)
 # KernelConfig.decode_expert_parallel=16: the expert families hold 56 EP16/TP2 experts
-# ([56, K/8, 4W] gate/up as gate halves then up halves, [56, 2W/8, N] down). Expert e's
-# half h runs as local expert 2e + h with the EP8 slot shapes (TP4 width W).
+# ([56, K/8, 4W] gate/up as two TP4 quarters side by side, [56, 2W/8, N] down). Expert
+# e's half h runs as local expert 2e + h with the EP8 slot shapes (TP4 width W).
 EXPERT_HALVES = 2 if _config().decode_expert_parallel == 16 else 1
 
 
@@ -95,30 +96,23 @@ def expert_slot_shape(name, shape, halves=None):
     return (rows // 2, columns)
 
 
-def expert_half_windows(name, slot_shape, half):
+def expert_half_window(name, slot_shape, half):
     """Where local expert half ``half`` of a physical EP16 expert sits in family
-    ``name``: ``(axis, source start, size, slot start)`` windows along axis 1
-    (columns: gate then up) or 0 (rows) of the expert's [rows, columns] entry."""
-    rows, columns = slot_shape
-    if name in ("expert_gu", "expert_gus"):
-        width = columns // 2
-        return [(1, part * 2 * width + half * width, width, part * width) for part in range(2)]
-    return [(0, half * rows, rows, 0)]
+    ``name``: ``(axis, start)`` of its slot-shaped window along axis 1 (gate/up
+    columns: one TP4 quarter) or 0 (down rows) of the expert's entry."""
+    axis = 1 if name in ("expert_gu", "expert_gus") else 0
+    return axis, half * slot_shape[axis]
 
 
-class _CopyPair:
-    """Two DMAs started and waited together."""
-
-    def __init__(self, first, second):
-        self.first, self.second = first, second
-
-    def start(self):
-        self.first.start()
-        self.second.start()
-
-    def wait(self):
-        self.first.wait()
-        self.second.wait()
+def _routed_gated_activation(gate_up):
+    """``_gated_activation`` of routed gate/up products [rows, 2 W], whose
+    columns alternate rank_loader.GATE_UP_CHUNK gate and up columns
+    (rank_loader.interleave_gate_up): [rows, W] in column order."""
+    starts = range(0, gate_up.shape[-1], 2 * GATE_UP_CHUNK)
+    return _gated_activation(
+        jnp.concatenate([gate_up[:, s : s + GATE_UP_CHUNK] for s in starts], axis=-1),
+        jnp.concatenate([gate_up[:, s + GATE_UP_CHUNK : s + 2 * GATE_UP_CHUNK] for s in starts], axis=-1),
+    )
 
 
 def _bf16_rows_view(ref, rows, width):
@@ -1022,9 +1016,7 @@ def _run_routed_expert_stream(
             :, (pl.ds(pl.multiple_of(column, 128), 2 * expert_width)
                 if share_full_finish else slice(column, column + 2 * expert_width))
         ].astype(jnp.bfloat16).astype(jnp.float32)
-        middle = _gated_activation(
-            gate_up[:, :expert_width], gate_up[:, expert_width:]
-        )
+        middle = _routed_gated_activation(gate_up)
         gate_up_accumulator[:, :expert_width] = middle.astype(jnp.float32)
         copies.down.wait()
         copies.down_scales.wait()
@@ -1069,9 +1061,7 @@ def _run_routed_expert_stream(
             compact_row : compact_row + 1,
             column : column + 2 * expert_width,
         ].astype(jnp.bfloat16).astype(jnp.float32)
-        middle = _gated_activation(
-            gate_up[:, :expert_width], gate_up[:, expert_width:]
-        )
+        middle = _routed_gated_activation(gate_up)
         gate_up_accumulator[
             compact_row : compact_row + 1, :expert_width
         ] = middle.astype(jnp.float32)
@@ -1331,9 +1321,7 @@ def _run_routed_expert_stream(
             rows, (pl.ds(pl.multiple_of(column, 128), 2 * expert_width)
                    if share_compact_finish else slice(column, column + 2 * expert_width))
         ].astype(jnp.bfloat16).astype(jnp.float32)
-        middle = _gated_activation(
-            gate_up[:, :expert_width], gate_up[:, expert_width:]
-        )
+        middle = _routed_gated_activation(gate_up)
         gate_up_accumulator[rows, :expert_width] = middle.astype(jnp.float32)
         if wait_down:
             copies.down.wait()
@@ -1460,9 +1448,7 @@ def _run_routed_expert_stream(
             gate_up = gate_up_accumulator[
                 :, column : column + 2 * expert_width
             ].astype(jnp.bfloat16).astype(jnp.float32)
-            middle = _gated_activation(
-                gate_up[:, :expert_width], gate_up[:, expert_width:]
-            )
+            middle = _routed_gated_activation(gate_up)
             gate_up_accumulator[:, :expert_width] = middle.astype(
                 jnp.float32
             )
@@ -2251,19 +2237,15 @@ class MixtureOfExpertsWeights:
 
     def _make_expert_half_copies(self, expert, slot, *, gate_up, down):
         """EP16 local expert ``expert`` = half ``expert % 2`` of physical expert
-        ``expert // 2``: its gate and up column halves, its down row half."""
+        ``expert // 2``: one TP4 quarter's gate/up columns, its down rows."""
         physical, half = expert // 2, expert % 2
 
         def copy(name, source, destination, semaphore):
-            copies = []
-            for axis, start, size, offset in expert_half_windows(name, destination.shape[1:], half):
-                if axis == 1:
-                    window = (source.at[physical, :, pl.ds(start, size)],
-                              destination.at[slot, :, pl.ds(offset, size)])
-                else:
-                    window = (source.at[physical, pl.ds(start, size)], destination.at[slot])
-                copies.append(tpu.make_async_copy(*window, semaphore))
-            return copies[0] if len(copies) == 1 else _CopyPair(*copies)
+            size = destination.shape[1:]
+            axis, start = expert_half_window(name, size, half)
+            window = (source.at[physical, :, pl.ds(start, size[1])] if axis == 1
+                      else source.at[physical, pl.ds(start, size[0])])
+            return tpu.make_async_copy(window, destination.at[slot], semaphore)
 
         def family(name, source, destination, semaphore, wanted):
             return copy(name, source, destination, semaphore) if wanted else None

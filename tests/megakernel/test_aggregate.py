@@ -176,12 +176,13 @@ def _write_preshard(root, rank):
         offset += value.nbytes
     (path / "dense.bin").write_bytes(b"".join(blob))
     for name in rank_loader.EXPERT_FAMILIES:
-        value = np.full((2, 3, 4), rank, np.uint8)
+        # [layers, experts, rows, columns]; gate/up rows are 128-column halves.
+        value = np.full((2, 3, 2, 256), rank, np.uint8)
         (path / f"{name}.bin").write_bytes(value.tobytes())
         families[name] = {
             "files": [f"{name}.bin"],
             "layer_ranges": [[0, 2]],
-            "shape": [2, 3, 4],
+            "shape": list(value.shape),
             "dtype": "uint8",
         }
     (path / "index.json").write_text(

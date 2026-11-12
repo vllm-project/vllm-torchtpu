@@ -2,28 +2,48 @@
 """EP16/TP2 decode experts (KernelConfig.decode_expert_parallel=16): the decode
 loader holds the prefill's EP16 families (placed by prefill_expert_plan, router
 columns to match, each family joined on the host), each local expert half is an
-EP8 TP4 quarter of the pre-shard, and routes expand to both halves."""
+EP8 TP4 quarter of the pre-shard, and routes expand to both halves. Every
+reader lane-interleaves each quarter's gate/up columns, which the decode's
+activation reads back in order."""
 
 import json
+import types
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.megakernel.kimi_k3.config import KernelConfig
 from vllm_torchtpu.megakernel.kimi_k3.kernels import decode_megakernel as dm
+from vllm_torchtpu.megakernel.kimi_k3.kernels import prefill_megakernel as pm
 from vllm_torchtpu.megakernel.kimi_k3.kernels import rank_loader as rl
 
 pytestmark = pytest.mark.cpu_test
 
 LAYERS = 3  # two MoE layers
-SHAPES = {
-    "expert_gu": (2, 112, 4, 8),
-    "expert_gus": (2, 112, 1, 8),
+SHAPES = {  # gate/up: 2 x 256 columns, two interleave chunks per half
+    "expert_gu": (2, 112, 2, 512),
+    "expert_gus": (2, 112, 1, 512),
     "expert_down": (2, 112, 6, 4),
     "expert_ds": (2, 112, 2, 4),
 }
 RANGES = [(0, 1), (1, 2)]
+
+
+def _interleaved(quarter):
+    """A [gate | up] quarter as alternating 128-column gate and up chunks."""
+    width = quarter.shape[-1] // 2
+    return np.concatenate(
+        [
+            part[..., k : k + 128]
+            for k in range(0, width, 128)
+            for part in (quarter[..., :width], quarter[..., width:])
+        ],
+        -1,
+    )
 
 
 def _write_dense(directory, rank):
@@ -107,17 +127,14 @@ def preshard(tmp_path_factory):
 
 def _ep16_entry(data, rank, name, layer, expert):
     """Logical expert ``expert``'s EP16 entry on ``rank``: its TP4 quarters
-    2 (rank % 2) and 2 (rank % 2) + 1 (gate quarters then up quarters along
-    the columns; down and its scales along the rows)."""
+    2 (rank % 2) and 2 (rank % 2) + 1, interleaved side by side along the
+    columns (gate/up), along the rows (down and its scales)."""
     quarters = [
         data[(4 * (expert // 112) + q, name, layer)][0, expert % 112]
         for q in (2 * (rank % 2), 2 * (rank % 2) + 1)
     ]
-    if name in ("expert_gu", "expert_gus"):
-        half = quarters[0].shape[-1] // 2
-        return np.concatenate(
-            [q[..., :half] for q in quarters] + [q[..., half:] for q in quarters], -1
-        )
+    if name in rl.GATE_UP_FAMILIES:
+        return np.concatenate([_interleaved(q) for q in quarters], -1)
     return np.concatenate(quarters, 0)
 
 
@@ -176,19 +193,18 @@ def test_each_half_is_an_ep8_quarter(preshard, rank, name):
     for layer in range(LAYERS - 1):
         for expert in (0, 17, 55):
             for half in range(2):
-                got = np.zeros(slot, np.float32)
-                for axis, start, size, offset in dm.expert_half_windows(
-                    name, slot, half
-                ):
-                    if axis == 1:
-                        got[:, offset : offset + size] = family[layer, expert][
-                            :, start : start + size
-                        ]
-                    else:
-                        got[:] = family[layer, expert][start : start + size]
+                axis, start = dm.expert_half_window(name, slot, half)
+                entry = family[layer, expert]
+                got = (
+                    entry[:, start : start + slot[1]]
+                    if axis == 1
+                    else entry[start : start + slot[0]]
+                )
                 global_expert = 56 * (rank // 2) + expert
                 source = 4 * (global_expert // 112) + 2 * (rank % 2) + half
                 want = data[(source, name, layer)][0, global_expert % 112]
+                if name in rl.GATE_UP_FAMILIES:
+                    want = _interleaved(want)
                 np.testing.assert_array_equal(got, want)
 
 
@@ -314,3 +330,94 @@ def test_plan_must_be_layer_permutations(monkeypatch, preshard, tmp_path):
                 decode_expert_parallel=16,
                 prefill_expert_plan=str(tmp_path / bad),
             )
+
+
+def test_interleave_is_the_kernels_interleave_lane(monkeypatch):
+    monkeypatch.setattr(
+        pltpu, "get_tpu_info", lambda: types.SimpleNamespace(num_lanes=128)
+    )
+    rng = np.random.default_rng(3)
+    gate, up = rng.standard_normal((2, 2, 3, 768)).astype(np.float32)
+    joined = np.ascontiguousarray(np.concatenate([gate, up], -1))
+    got = rl.interleave_gate_up(joined)
+    assert got is joined
+    np.testing.assert_array_equal(
+        got, np.asarray(pm.interleave_lane(jnp.asarray(gate), jnp.asarray(up)))
+    )
+    with pytest.raises(ValueError, match="interleaved"):
+        rl.interleave_gate_up(np.zeros((2, 384), np.float32))
+
+
+def test_routed_activation_reads_interleaved_products_in_order():
+    rng = np.random.default_rng(4)
+    gate, up = (8 * rng.standard_normal((2, 5, 768))).astype(np.float32)
+    joined = np.ascontiguousarray(np.concatenate([gate, up], -1))
+    got = dm._routed_gated_activation(jnp.asarray(rl.interleave_gate_up(joined)))
+    want = dm._gated_activation(jnp.asarray(gate), jnp.asarray(up))
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_ep8_readers_interleave_gate_up(preshard, split):
+    root, data, _ = preshard
+    jobs = rl._expert_jobs(rl.RankDir(root, 5, LAYERS), split)
+    parts: dict[str, list] = {}
+    for key, _, read in jobs:
+        parts.setdefault(key.partition("@")[0], []).append(read())
+    for name in SHAPES:
+        want = np.concatenate([data[(5, name, i)] for i in range(len(RANGES))])
+        if name in rl.GATE_UP_FAMILIES:
+            want = _interleaved(want)
+        np.testing.assert_array_equal(np.concatenate(parts[name]), want)
+
+
+@pytest.mark.parametrize("rows", [1, 16])
+@pytest.mark.parametrize("paired_order", [False, True])
+def test_interleaved_gate_up_is_bit_identical(rows, paired_order):
+    """MXFP4 gate/up product and activation in the decode's arithmetic
+    (interpret mode): pre-shard layout with the in-order split, interleaved
+    layout with _routed_gated_activation."""
+    contraction, width = 512, 768
+    rng = np.random.default_rng(rows)
+    packed = rng.integers(0, 2**32, (contraction // 8, 2 * width), dtype=np.uint64)
+    packed = packed.astype(np.uint32)
+    scales = rng.integers(110, 124, (contraction // 32, 2 * width), dtype=np.uint8)
+    source = rng.standard_normal((rows, contraction)).astype(np.float32)
+
+    def run(packed, scales, interleaved):
+        def kernel(source_ref, packed_ref, scales_ref, out_ref, accumulator):
+            if paired_order:
+                dm._paired_order_expert_gate_up(
+                    source_ref, packed_ref, scales_ref, accumulator, contraction, 512
+                )
+            else:
+                dm._quantized_expert_dot(
+                    source_ref,
+                    packed_ref,
+                    scales_ref,
+                    accumulator,
+                    contraction,
+                    2 * width,
+                    dot_tile=512,
+                )
+            gate_up = accumulator[...].astype(jnp.bfloat16).astype(jnp.float32)
+            middle = (
+                dm._routed_gated_activation(gate_up)
+                if interleaved
+                else dm._gated_activation(gate_up[:, :width], gate_up[:, width:])
+            )
+            out_ref[...] = middle.astype(jnp.float32)
+
+        return pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((rows, width), jnp.float32),
+            scratch_shapes=[pltpu.VMEM((rows, 2 * width), jnp.float32)],
+            interpret=True,
+        )(source, packed, scales)
+
+    old = np.asarray(run(packed, scales, False))
+    new = run(
+        rl.interleave_gate_up(packed.copy()), rl.interleave_gate_up(scales.copy()), True
+    )
+    assert np.count_nonzero(old) > old.size // 2
+    np.testing.assert_array_equal(np.asarray(new).view(np.uint32), old.view(np.uint32))

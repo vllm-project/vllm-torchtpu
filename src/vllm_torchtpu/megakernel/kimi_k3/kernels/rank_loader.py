@@ -15,6 +15,11 @@ The iterators yield ``(group, name, array)`` host arrays for one rank, in
 the per-rank layout the kernels consume (no leading rank axis). They are
 independent of JAX so a vLLM worker can upload them through torch, and
 :func:`to_device` builds the kernels' rank-leading global arrays from them.
+
+The one departure from the pre-shard's layout is the routed gate/up columns
+(:data:`GATE_UP_FAMILIES`): every reader returns each TP4 quarter's
+``[gate | up]`` as alternating chunks of :data:`GATE_UP_CHUNK` gate and up
+columns (:func:`interleave_gate_up`).
 """
 
 from __future__ import annotations
@@ -33,6 +38,8 @@ from vllm_torchtpu.megakernel.kimi_k3.config import active as _config
 
 CHUNK = 64 << 20
 EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
+GATE_UP_FAMILIES = ("expert_gu", "expert_gus")
+GATE_UP_CHUNK = 128  # columns per gate or up chunk of an interleaved quarter
 PREFILL_COMMON = ("attn_res", "attn_norm", "mlp_res", "ffn_norm", "dense_gu", "dense_down")
 PREFILL_IO = ("embedding", "lm_head", "output_res", "final_norm")
 PREFILL_KDA = ("k_gate", "k_fb", "k_projection", "k_conv", "k_a_log", "k_dt", "k_norm", "k_o")
@@ -157,15 +164,16 @@ class RankDir:
         count = len(spec["files"])
         for index, (filename, (lo, hi)) in enumerate(zip(spec["files"], spec["layer_ranges"])):
             def reader(filename=filename, lo=lo, hi=hi):
-                return read_into(self.path / filename, 0, np.empty((hi - lo, *shape[1:]), dtype))
+                value = read_into(self.path / filename, 0, np.empty((hi - lo, *shape[1:]), dtype))
+                return interleave_gate_up(value) if name in GATE_UP_FAMILIES else value
             yield f"{name}@{index}/{count}", (hi - lo) * per_layer, reader
 
     def regrouped_expert_parts(self, name, quarter_dirs, part, parts):
         """An expert family regrouped from EP8/TP4 shards, per file like
         ``expert_parts``: experts ``part`` of ``parts`` equal slices of the EP8
         group's 112, over the TP4 quarters in ``quarter_dirs`` (all four:
-        whole experts, EP32; two: half the intermediate, EP16/TP2) -- gate
-        quarters then up quarters along N, down and its scales along K."""
+        whole experts, EP32; two: half the intermediate, EP16/TP2), joined by
+        :func:`_join_quarters`."""
         spec = self.families[name]
         shape = tuple(spec["shape"])  # [layers, 112, ...] per quarter
         dtype = _dtype(spec["dtype"])
@@ -178,11 +186,7 @@ class RankDir:
                 for rank_dir in quarter_dirs:
                     array = np.memmap(rank_dir.path / filename, dtype, "r", shape=(hi - lo, *shape[1:]))
                     quarters.append(np.array(array[:, part * experts:(part + 1) * experts]))
-                if name in ("expert_gu", "expert_gus"):
-                    half = shape[-1] // 2
-                    return np.concatenate([q[..., :half] for q in quarters]
-                                          + [q[..., half:] for q in quarters], axis=-1)
-                return np.concatenate(quarters, axis=2)
+                return _join_quarters(name, quarters)
             yield f"{name}@{index}/{count}", (hi - lo) * nbytes, reader
 
     def read_expert_family(self, name) -> np.ndarray:
@@ -194,7 +198,33 @@ class RankDir:
         with ThreadPoolExecutor(len(spec["files"])) as pool:
             list(pool.map(lambda item: read_into(self.path / item[0], 0, out[item[1][0]:item[1][1]]),
                           zip(spec["files"], spec["layer_ranges"])))
-        return out
+        return interleave_gate_up(out) if name in GATE_UP_FAMILIES else out
+
+
+def interleave_gate_up(family: np.ndarray) -> np.ndarray:
+    """A routed gate/up family ``[..., 2 W]`` (one TP4 quarter per row, gate
+    then up), rearranged in place into alternating chunks of
+    :data:`GATE_UP_CHUNK` gate and up columns: column ``2 c k + j`` is gate
+    column ``c k + j`` and column ``2 c k + c + j`` up column ``c k + j``
+    (``c = GATE_UP_CHUNK``; ``prefill_megakernel.interleave_lane(gate, up)``).
+    One leading index at a time, so the temporary is one layer at most."""
+    width = family.shape[-1] // 2
+    if 2 * width != family.shape[-1] or width % GATE_UP_CHUNK or not family.flags.c_contiguous:
+        raise ValueError(f"gate/up rows of {family.shape[-1]} columns cannot be interleaved in place")
+    chunks = width // GATE_UP_CHUNK
+    for block in family if family.ndim > 2 else family[None]:
+        block[...] = block.reshape(*block.shape[:-1], 2, chunks, GATE_UP_CHUNK).swapaxes(-3, -2).reshape(block.shape)
+    return family
+
+
+def _join_quarters(name: str, quarters: list[np.ndarray]) -> np.ndarray:
+    """One expert family's TP4 quarters ``[..., rows, columns]`` joined into the
+    entries of whole or half experts: gate/up families side by side, each
+    quarter interleaved (:func:`interleave_gate_up`); down families and their
+    scales along the rows (the contraction)."""
+    if name in GATE_UP_FAMILIES:
+        return np.concatenate([interleave_gate_up(q) for q in quarters], axis=-1)
+    return np.concatenate(quarters, axis=-2)
 
 
 def split_kda_projection(families: dict) -> dict:
@@ -459,16 +489,7 @@ def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers):
                         jobs.append((source(group, q).path / filename, offset, raw[q][layer - lo, slot]))
             with ThreadPoolExecutor(32) as pool:
                 list(pool.map(lambda job: read_into(job[0], job[1], job[2], streams=1), jobs))
-            layers_out = []
-            for layer in range(lo, hi):
-                parts = [raw[q][layer - lo] for q in quarters]
-                if name in ("expert_gu", "expert_gus"):
-                    half = shape[-1] // 2
-                    layers_out.append(np.concatenate([q[..., :half] for q in parts]
-                                                     + [q[..., half:] for q in parts], axis=-1))
-                else:
-                    layers_out.append(np.concatenate(parts, axis=1))
-            return np.stack(layers_out)
+            return _join_quarters(name, [raw[q] for q in quarters])
         yield f"{name}@{index}/{count}", (hi - lo) * nbytes, reader
 
 

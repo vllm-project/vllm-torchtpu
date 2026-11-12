@@ -15,9 +15,9 @@ from vllm_torchtpu.megakernel.kimi_k3.kernels import rank_loader as rl
 pytestmark = pytest.mark.cpu_test
 
 LAYERS = 3  # two MoE layers
-SHAPES = {
-    "expert_gu": (2, 112, 4, 8),
-    "expert_gus": (2, 112, 1, 8),
+SHAPES = {  # gate/up: 2 x 256 columns, two interleave chunks per quarter
+    "expert_gu": (2, 112, 2, 512),
+    "expert_gus": (2, 112, 1, 512),
     "expert_down": (2, 112, 6, 4),
     "expert_ds": (2, 112, 1, 4),
 }
@@ -101,10 +101,9 @@ def test_random_plan_places_each_expert(preshard, rank, name):
                 data[(4 * (expert // 112) + q, name, layer)][0, expert % 112]
                 for q in quarters
             ]
-            if name in ("expert_gu", "expert_gus"):
-                half = parts[0].shape[-1] // 2
+            if name in rl.GATE_UP_FAMILIES:
                 want = np.concatenate(
-                    [p[..., :half] for p in parts] + [p[..., half:] for p in parts], -1
+                    [rl.interleave_gate_up(p.copy()) for p in parts], -1
                 )
             else:
                 want = np.concatenate(parts, 0)
