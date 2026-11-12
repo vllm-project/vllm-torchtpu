@@ -20,6 +20,9 @@ case, and each case records its first sampled tokens per repeat (with a
 checksum of every pool on rank 0), so two trees or two window sizes compare on
 the same text; ``--chain-prefix`` first computes a case's cached prefix in
 ``--chain-step`` token steps of its own, so the timed step reads real KV.
+``--aggregate`` times the aggregate engine's prefill instead of the prefill
+role's: the decode program holds the EP16 experts and the prefill steps on
+them, in serial two-sequence windows (with ``--set decode_expert_parallel=16``).
 
 ``--trace DIR`` (both): rank 0 saves an xprof trace of each case's last repeat.
 """
@@ -102,6 +105,12 @@ def add_arguments(parser, profile: bool = False) -> None:
         help="directory: the prefill counts its MoE routes and saves snapshots "
         "here every prefill_route_counts_every windows (rank 0 logs each step's "
         "window numbers)",
+    )
+    prefill.add_argument(
+        "--aggregate",
+        action="store_true",
+        help="time the aggregate engine's prefill (its decode program's experts, "
+        "serial windows); needs --set decode_expert_parallel=16",
     )
     prefill.add_argument(
         "--token-file",
@@ -323,11 +332,16 @@ def run_prefill(args, records: harness.Records) -> None:
             )
         cases.append((length, count, prefix))
     max_seqs = max(count for _, count, _ in cases)
+    if args.aggregate and max_seqs > k3_prefill.SERIAL_SLOTS:
+        harness.fail(
+            f"--aggregate: the aggregate prefills at most {k3_prefill.SERIAL_SLOTS} "
+            "sequences a window"
+        )
     totals = [length + prefix for length, _, prefix in cases]
     max_model_len = -(-max(totals) // k3.LOGICAL) * k3.LOGICAL
-    prefiller = k3_program.build(
+    program = k3_program.build(
         k3.engine_config(
-            "prefill",
+            "aggregate" if args.aggregate else "prefill",
             max_num_seqs=max_seqs,
             max_model_len=max_model_len,
             max_num_batched_tokens=k3_program.MAX_STEP_TOKENS,
@@ -335,7 +349,8 @@ def run_prefill(args, records: harness.Records) -> None:
         args.presharded,
         tp_rank=torch.distributed.get_rank(),
     )
-    prefiller.load_weights()
+    program.load_weights()
+    prefiller = program.prefiller if args.aggregate else program
     # Per request slot: real MLA pages for the longest case that uses it (the
     # window reads and writes them), but a KDA state block only at the
     # columns a step touches -- a hit's and the final one; the rest of the
