@@ -97,7 +97,8 @@ def _ring_outputs(
     With `fills`, every all-reduce gets a `fill` that appends its slot (at
     trace time) and zeroes a spare buffer. With `arp`, slot 1 is the ARPIPE
     deferred all-reduce: primed, its other half added before every slot-0
-    all-reduce (as a layer's input projection would) and after the last step. With `ar0`, slot 0 is the AR0S
+    all-reduce (as a layer's input projection would) and after the last
+    step. With `ar0`, slot 0 is the AR0S
     all-reduce: its payload is packed and sent from `ar0_spec`'s column-group
     hooks (fed the partial's columns, as an output projection would) and
     finished by `ar0_finish`.
