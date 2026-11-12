@@ -85,6 +85,7 @@ def _make_runner(
         pipeline_parallel_size=1,
     )
     runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(uses_contiguous_pcp_layout=False),
         parallel_config=runner.parallel_config,
         scheduler_config=runner.scheduler_config,
         speculative_config=None,
@@ -172,6 +173,13 @@ def _make_runner(
         TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner)
     )
     runner._replay_starts = {}
+    runner._pre_async_results = None
+    runner._compute_lookback_token_ids_np = (
+        TPUModelRunner._compute_lookback_token_ids_np.__get__(runner)
+    )
+    runner._prepare_host_sequence_lookback_inputs = (
+        TPUModelRunner._prepare_host_sequence_lookback_inputs.__get__(runner)
+    )
     runner._prefix_replay_tokens = types.MethodType(
         TPUModelRunner._prefix_replay_tokens, runner
     )
@@ -227,6 +235,11 @@ def _make_runner(
         req_id_to_index={f"req{i}": i for i in range(num_reqs)},
         num_computed_tokens_cpu=np.asarray(num_computed_tokens, dtype=np.int32),
         num_prompt_tokens=np.asarray(prompt_tokens, dtype=np.int32),
+        num_tokens_no_spec=np.maximum(
+            np.asarray(prompt_tokens, dtype=np.int32),
+            np.asarray(num_computed_tokens, dtype=np.int32)
+            + np.asarray(scheduled_tokens, dtype=np.int32),
+        ),
         token_ids_cpu=token_ids_cpu.numpy(),
         token_ids_cpu_tensor=token_ids_cpu,
         block_table=[_BlockTable(block_tables)],

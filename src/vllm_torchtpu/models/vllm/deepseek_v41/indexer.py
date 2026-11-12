@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
 import torch.nn as nn
@@ -42,6 +42,9 @@ from .metadata import (
     not_replayed,
     rotate_rope,
 )
+
+if TYPE_CHECKING:
+    from .pcp import PcpStep
 
 INDEX_HEAD_DIM: int = 128
 _SENTINEL_BLOCK_ID: int = 0x7FFFFFFF
@@ -371,21 +374,10 @@ class DeepseekV41Indexer(upstream.DeepseekV4Indexer):
         query: Tensor,
         weights: Tensor,
         positions: Tensor | None = None,
+        *,
+        pcp_step: PcpStep | None = None,
     ) -> Tensor:
-        """Score paged index keys via ``dsv41_paged_indexer_topk`` and write top-K.
-
-        Args:
-            query: ``bfloat16[num_tokens, n_head, head_dim]`` split-lane queries (Used).
-            weights: ``float32[num_tokens, n_head, 1]`` scaled head weights (Used).
-            positions: Optional ``int32[num_tokens]`` positions; falls back to
-                ``_last_positions`` recorded in :meth:`forward`.
-
-        Returns:
-            ``int32[num_tokens, topk_tokens]`` selected key indices (Created).
-
-        Raises:
-            ValueError: If ``positions`` is ``None`` and :meth:`forward` has not run.
-        """
+        """Score paged index keys via ``dsv41_paged_indexer_topk`` and write top-K."""
         resolved_pos = self._last_positions if positions is None else positions
         if resolved_pos is None:
             raise ValueError(
@@ -393,7 +385,7 @@ class DeepseekV41Indexer(upstream.DeepseekV4Indexer):
             )
         num_tokens = query.shape[0]
         k_cache = active_cache(self.k_cache)
-        meta = layer_meta(self.k_cache.prefix)
+        meta = layer_meta(self.k_cache.prefix, pcp_step=pcp_step)
         if meta is None or not k_cache.numel():
             topk = query.new_full((num_tokens, self.topk_tokens), -1, dtype=torch.int32)
         else:

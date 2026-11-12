@@ -23,7 +23,9 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
     build_pcp_logits_indices,
     build_pcp_rank_major_token_order,
 )
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.pcp_sequence_layout import (
+    PCP_CONTIGUOUS_SEQUENCE_LAYOUT_DESCRIPTOR,
     PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
     PcpSequenceLayoutEligibility,
     PcpSequenceLayoutMode,
@@ -97,6 +99,7 @@ def _evaluate(
 @pytest.mark.parametrize("kv_role", [None, "kv_producer", "kv_consumer", "kv_both"])
 def test_prefill_layout_is_independent_of_kv_role(kv_role):
     vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(uses_contiguous_pcp_layout=False),
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=4,
             cp_kv_cache_interleave_size=16,
@@ -802,3 +805,80 @@ def test_pcp_planner_preinit_and_dummy_share_the_v1_layout_contract():
     assert after_cache.requires_hidden_state_gather is True
 
     assert before_cache == after_cache
+
+
+def test_non_v41_mla_model_keeps_interleaved_pcp_layout():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=True, uses_contiguous_pcp_layout=False),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=4,
+            cp_kv_cache_interleave_size=16,
+            decode_context_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        speculative_config=None,
+    )
+
+    planner = PcpSequenceLayoutPlanner.from_vllm_config(vllm_config)
+
+    assert planner.eligibility.contiguous_split is False
+    assert planner.descriptor == PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR
+    assert planner.retains_request_replay_starts is False
+    assert planner.cap_local_token_paddings([16, 64, 256], max_batched_tokens=128) == [
+        16,
+        64,
+        256,
+    ]
+    decision = _evaluate(
+        eligibility=planner.eligibility,
+        computed=[0],
+        prompt=[64],
+        scheduled=[64],
+    )
+    assert decision.interleave_size == 16
+
+
+def test_contiguous_pcp_layout_uses_v2_descriptor_and_caps_buckets():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=True, uses_contiguous_pcp_layout=True),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=8,
+            cp_kv_cache_interleave_size=1,
+            decode_context_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        speculative_config=None,
+    )
+
+    planner = PcpSequenceLayoutPlanner.from_vllm_config(vllm_config)
+
+    assert planner.eligibility.contiguous_split is True
+    assert planner.descriptor == PCP_CONTIGUOUS_SEQUENCE_LAYOUT_DESCRIPTOR
+    assert planner.retains_request_replay_starts is True
+    assert planner.cap_local_token_paddings(
+        [8192, 16, 2048, 1024, 512], max_batched_tokens=8192
+    ) == [16, 512, 1024]
+    assert planner.cap_local_token_paddings(
+        [8192, 16, 2048, 512], max_batched_tokens=8192
+    ) == [16, 512, 2048]
+
+    dummy = planner.prepare_dummy(num_tokens=64, num_reqs=4, kv_cache_initialized=True)
+    assert dummy.is_dummy is True
+    assert dummy.descriptor == PCP_CONTIGUOUS_SEQUENCE_LAYOUT_DESCRIPTOR
+    assert dummy.interleave_size == 64
+
+    v2_meta = AttentionMetadata(
+        input_positions=torch.zeros(8, dtype=torch.int32),
+        sequence_layout_kind=PCP_CONTIGUOUS_SEQUENCE_LAYOUT_DESCRIPTOR.kind.value,
+        sequence_layout_protocol=PCP_CONTIGUOUS_SEQUENCE_LAYOUT_DESCRIPTOR.protocol,
+        sequence_layout_version=PCP_CONTIGUOUS_SEQUENCE_LAYOUT_DESCRIPTOR.version,
+    )
+    assert sequence_layout.is_pcp_streaming_attention_metadata(v2_meta) is False
+    assert (
+        sequence_layout.is_pcp_partial_sequence_layout_descriptor(
+            PCP_CONTIGUOUS_SEQUENCE_LAYOUT_DESCRIPTOR
+        )
+        is True
+    )

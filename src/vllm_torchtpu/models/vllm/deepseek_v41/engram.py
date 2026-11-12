@@ -25,7 +25,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from vllm.config import get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_engram_dp_group,
     get_engram_dp_size,
@@ -103,6 +103,61 @@ def _gather_engram_rows(rows: torch.Tensor, dim: int) -> torch.Tensor:
     if pad:
         return gathered[..., :width].contiguous()
     return gathered
+
+
+def engram_token_slot(default_tokens: int) -> int:
+    """Return the padded per-rank token slot across the Engram DP group."""
+    if not upstream.is_forward_context_available():
+        return default_tokens
+    forward_ctx = upstream.get_forward_context()
+    if forward_ctx.dp_metadata is None:
+        return default_tokens
+    saved = forward_ctx.additional_kwargs.get("tpu_num_tokens_across_dp_cpu")
+    if saved is None or len(saved) == 0:
+        raise RuntimeError(
+            "Missing tpu_num_tokens_across_dp_cpu in "
+            "forward_context.additional_kwargs when dp_metadata is active."
+        )
+    return max(int(val) for val in saved)
+
+
+def gather_engram_hashes(
+    hash_ids: Tensor,
+    *,
+    dp_shared_memory: bool = False,
+) -> Tensor:
+    """All-gather Engram ``hash_ids`` across the Engram DP group.
+
+    Uses ``dp_group.cpu_group`` on CPU tensors to avoid device collectives or
+    D2H syncs when staging host-offloaded Engram tables.
+    """
+    if dp_shared_memory:
+        return hash_ids
+    dp_group = get_engram_dp_group()
+    if dp_group is None or dp_group.world_size <= 1:
+        if (
+            upstream.is_forward_context_available()
+            and upstream.get_forward_context().dp_metadata is not None
+        ):
+            return upstream.gather_engram_hashes(hash_ids, dp_shared_memory=False)
+        return hash_ids
+    slot = engram_token_slot(hash_ids.shape[0])
+    if hash_ids.shape[0] > slot:
+        raise ValueError(
+            f"Engram hash_ids rows ({hash_ids.shape[0]}) exceed coordinated "
+            f"slot ({slot})."
+        )
+    if hash_ids.shape[0] == slot:
+        padded = hash_ids.contiguous()
+    else:
+        padded = hash_ids.new_full((slot, *hash_ids.shape[1:]), upstream.DEAD_ID)
+        if hash_ids.shape[0] > 0:
+            padded[: hash_ids.shape[0]] = hash_ids
+    if padded.device.type == "cpu":
+        chunks = [torch.empty_like(padded) for _ in range(dp_group.world_size)]
+        dist.all_gather(chunks, padded, group=dp_group.cpu_group)
+        return torch.cat(chunks, dim=0)
+    return dp_group.all_gather(padded, dim=0)
 
 
 def _dp_gather_engram_rows(staged: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -238,6 +293,29 @@ class NgramHashState(upstream.NgramHashState):
     """
 
     _cached_cpu_tables: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        layout: upstream.EngramLayout,
+        swa_cache_module: nn.Module,
+    ) -> None:
+        target_device = torch.get_default_device()
+        with torch.device("cpu"):
+            super().__init__(vllm_config, layout, swa_cache_module)
+            flat_primes = self.primes.flatten(1)
+            offsets_cpu = torch.cumsum(flat_primes, dim=1) - flat_primes
+        self._cached_cpu_tables = (
+            self.token_map,
+            self.multipliers,
+            self.primes,
+            offsets_cpu,
+        )
+        self.offsets = offsets_cpu.to(target_device)
+        if target_device.type != "cpu":
+            self.token_map = self.token_map.to(target_device)
+            self.multipliers = self.multipliers.to(target_device)
+            self.primes = self.primes.to(target_device)
 
     def ensure_cache(self) -> bool:
         """Synchronize ``block_size`` with ``swa_cache_module`` and allocate slots.
@@ -674,7 +752,7 @@ class Engram(upstream.Engram):
         self._staged_raw = init.to(self.staged_rows.device)
 
     def _staged_pair(self, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(flat_root_i32, view_2d)`` device staging buffers for a bucket."""
+        """Return ``(flat_root_i32, dynamic_view)`` device staging buffers."""
         assert self._staged_raw is not None
         pair = self._staged_by_tokens.get(num_tokens)
         if pair is None:
@@ -687,9 +765,16 @@ class Engram(upstream.Engram):
                 init = torch.zeros(num_tokens * words_per_token, dtype=torch.int32)
                 init[raw_words:].fill_(-1)
                 staged = init.to(self._staged_raw.device)
-            view = staged.view(num_tokens, words_per_token)
-            if num_tokens >= 2:
-                torch._dynamo.mark_dynamic(view, 0)
+            dp_size = self.embed_tokens.dp_size
+            if dp_size > 1 and num_tokens % dp_size == 0:
+                slot = num_tokens // dp_size
+                view = staged.view(dp_size, slot, words_per_token)
+                if slot >= 2:
+                    torch._dynamo.mark_dynamic(view, 1)
+            else:
+                view = staged.view(num_tokens, words_per_token)
+                if num_tokens >= 2:
+                    torch._dynamo.mark_dynamic(view, 0)
             pair = (staged, view)
             self._staged_by_tokens[num_tokens] = pair
         return pair
@@ -767,7 +852,7 @@ class Engram(upstream.Engram):
         dp_size = self.embed_tokens.dp_size
         if self._staged_raw is None:
             if dp_size > 1:
-                slot = upstream.engram_gathered_num_tokens()
+                slot = engram_token_slot(num_tokens)
                 return _dp_gather_engram_rows(
                     self.staged_rows[: slot * dp_size], num_tokens
                 )
@@ -780,12 +865,10 @@ class Engram(upstream.Engram):
         active = self._active_raw
         if active is None:
             fallback_tokens = (
-                num_tokens
-                if dp_size == 1
-                else upstream.engram_gathered_num_tokens() * dp_size
+                num_tokens if dp_size == 1 else engram_token_slot(num_tokens) * dp_size
             )
             _, active = self._staged_pair(fallback_tokens)
-        staged_tokens = active.shape[0]
+        staged_tokens = active.numel() // self._words_per_tok
         by_word = active.view(raw_words_per_tok + scale_words_per_tok, staged_tokens)
         raw = _unpack_bytes(
             by_word[:raw_words_per_tok].reshape(-1),

@@ -635,7 +635,6 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 # without stalling the host thread; per-slot TPU events guard multi-chunk prefills
 # (`> 4` chunks/step) and unsynchronized `dp_lockstep` wraparound.
 _LOOKBACK_RING_DEPTH: int = 4
-_LOOKBACK_PAD_TOKEN_ID: int = -1
 
 
 # Recompilation-avoidance contract:
@@ -966,7 +965,21 @@ class TPUModelRunner(GPUModelRunner):
         # are ints here; the config field's own type also admits str and None.
         compile_sizes = vllm_config.compilation_config.compile_sizes
         assert compile_sizes, "TPUPlatform sets compile_sizes"
-        self.num_tokens_paddings: list[int] = [int(size) for size in compile_sizes]
+        raw_paddings = [int(size) for size in compile_sizes]
+        max_batched_tokens = int(self.scheduler_config.max_num_batched_tokens)
+        capped_paddings = self.sequence_layout_planner.cap_local_token_paddings(
+            raw_paddings, max_batched_tokens
+        )
+        if capped_paddings and raw_paddings and capped_paddings[-1] < max(raw_paddings):
+            logger.info(
+                "Capped local token buckets for partial layout at %d (was %d).",
+                capped_paddings[-1],
+                max(raw_paddings),
+            )
+            vllm_config.compilation_config.compile_sizes = cast(
+                list[int | str], list(capped_paddings)
+            )
+        self.num_tokens_paddings: list[int] = capped_paddings
         # Override parent's max_num_tokens with the last (largest) padding
         # bucket so all CPU staging buffers cover it.
         self.max_num_tokens = self.num_tokens_paddings[-1]
@@ -1024,15 +1037,16 @@ class TPUModelRunner(GPUModelRunner):
             self.mrope_positions = self._make_buffer(
                 3, self.max_num_tokens + 1, dtype=torch.int32
             )
+        req_buf_len = max(self.max_num_tokens, self.max_num_reqs)
         self.query_start_loc_cpu = torch.zeros(
-            self.max_num_tokens + 1,
+            req_buf_len + 1,
             dtype=torch.int32,
             device="cpu",
             pin_memory=PIN_MEMORY,
         )
         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
         self.seq_lens_cpu = torch.zeros(
-            self.max_num_tokens, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+            req_buf_len, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
         )
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         if self.supports_mm_inputs:
@@ -1042,7 +1056,7 @@ class TPUModelRunner(GPUModelRunner):
                 device="cpu",
                 pin_memory=PIN_MEMORY,
             )
-        self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
+        self.arange_np = np.arange(req_buf_len, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
@@ -2739,6 +2753,44 @@ class TPUModelRunner(GPUModelRunner):
                 if computed > 0:
                     replay_starts[req_id] = computed
 
+    def _compute_lookback_token_ids_np(
+        self,
+        num_reqs: int,
+        start_index: int,
+        depth: int,
+        *,
+        include_generated: bool = False,
+    ) -> np.ndarray:
+        """Gather per-request preceding token IDs ``int32[num_reqs, depth]`` on CPU."""
+        end_idx = start_index + num_reqs
+        starts = self.input_batch.num_computed_tokens_cpu[start_index:end_idx, None]
+        lookback_positions = starts - np.arange(1, depth + 1)
+        if include_generated:
+            # Host-only n-gram hashing has no device token cache, so committed
+            # generated tokens must remain readable up to num_tokens_no_spec.
+            limits = self.input_batch.num_tokens_no_spec[start_index:end_idx, None]
+        else:
+            limits = self.input_batch.num_prompt_tokens[start_index:end_idx, None]
+            replay_starts = self._replay_starts
+            if replay_starts:
+                chunk_req_ids = self.input_batch.req_ids[start_index:end_idx]
+                limits = limits.copy()
+                for row, req_id in enumerate(chunk_req_ids):
+                    batch_row = start_index + row
+                    if replay_starts.get(req_id) == int(starts[row, 0]):
+                        limits[row, 0] = int(
+                            self.input_batch.num_tokens_no_spec[batch_row]
+                        )
+        valid_mask = (lookback_positions >= 0) & (lookback_positions < limits)
+        batch_rows = np.arange(start_index, end_idx)[:, None]
+        max_col = max(int(self.input_batch.token_ids_cpu.shape[1]) - 1, 0)
+        gathered_token_ids = self.input_batch.token_ids_cpu[
+            batch_rows, np.clip(lookback_positions, 0, max_col)
+        ]
+        return np.where(
+            valid_mask, gathered_token_ids, utils.LOOKBACK_PAD_TOKEN_ID
+        ).astype(np.int32)
+
     def _prepare_lookback_token_ids(
         self, num_reqs: int, start_index: int = 0
     ) -> torch.Tensor:
@@ -2750,7 +2802,7 @@ class TPUModelRunner(GPUModelRunner):
 
         Returns:
             Device `int32[max_num_reqs, depth]` lookback token ID tensor padded
-            with `_LOOKBACK_PAD_TOKEN_ID` (`-1`) outside valid history bounds.
+            with `utils.LOOKBACK_PAD_TOKEN_ID` (`-1`) outside valid history bounds.
         """
         ring = self._lookback_staging_ring
         fences: list[Any] | None = None
@@ -2771,30 +2823,11 @@ class TPUModelRunner(GPUModelRunner):
         else:
             staging_buf = self.lookback_token_ids
         assert staging_buf is not None
-        staging_buf.np.fill(_LOOKBACK_PAD_TOKEN_ID)
+        staging_buf.np.fill(utils.LOOKBACK_PAD_TOKEN_ID)
         if num_reqs > 0:
-            depth = staging_buf.np.shape[1]
-            end_idx = start_index + num_reqs
-            starts = self.input_batch.num_computed_tokens_cpu[start_index:end_idx, None]
-            lookback_positions = starts - np.arange(1, depth + 1)
-            limits = self.input_batch.num_prompt_tokens[start_index:end_idx, None]
-            replay_starts = self._replay_starts
-            if replay_starts:
-                chunk_req_ids = self.input_batch.req_ids[start_index:end_idx]
-                limits = limits.copy()
-                for row, req_id in enumerate(chunk_req_ids):
-                    batch_row = start_index + row
-                    if replay_starts.get(req_id) == int(starts[row, 0]):
-                        limits[row, 0] = int(
-                            self.input_batch.num_tokens_no_spec[batch_row]
-                        )
-            valid_mask = (lookback_positions >= 0) & (lookback_positions < limits)
-            batch_rows = np.arange(start_index, end_idx)[:, None]
-            gathered_token_ids = self.input_batch.token_ids_cpu[
-                batch_rows, np.clip(lookback_positions, 0, None)
-            ]
-            staging_buf.np[:num_reqs] = np.where(
-                valid_mask, gathered_token_ids, _LOOKBACK_PAD_TOKEN_ID
+            depth = int(staging_buf.np.shape[1])
+            staging_buf.np[:num_reqs] = self._compute_lookback_token_ids_np(
+                num_reqs, start_index, depth, include_generated=False
             )
         lookback_device_tensor = staging_buf.copy_to_gpu()
         if fences is not None and self.device.type == "tpu":
@@ -2803,6 +2836,84 @@ class TPUModelRunner(GPUModelRunner):
             fence.record()
             fences[slot_idx] = fence
         return lookback_device_tensor
+
+    def _prepare_host_sequence_lookback_inputs(
+        self, num_reqs: int, start_index: int = 0
+    ) -> utils.HostSequenceLookbackInputs | None:
+        """Snapshot request-major CPU tokens, positions, and lookback for PCP."""
+        depth = max(
+            0, int(cast(utils.TokenLookbackModel, self.model).token_lookback_depth)
+        )
+        plan = self._last_sequence_layout_plan
+        if num_reqs <= 0 or (plan is not None and plan.is_dummy):
+            return utils.HostSequenceLookbackInputs(
+                tokens=torch.empty(0, dtype=torch.int32),
+                positions=torch.empty(0, dtype=torch.int32),
+                query_start_loc=torch.zeros(1, dtype=torch.int32),
+                lookback_token_ids=torch.empty((0, depth), dtype=torch.int32),
+                local_start=0,
+                num_local=0,
+            )
+        if plan is None:
+            return None
+
+        qsl_np = self.query_start_loc_np[: num_reqs + 1]
+        total = int(qsl_np[num_reqs])
+        qsl = torch.from_numpy(qsl_np.astype(np.int32, copy=True))
+        if plan.kind is SequenceLayoutKind.ALL:
+            tokens = self.input_ids_cpu[:total].to(torch.int32).clone()
+            positions = self.positions_cpu[:total].to(torch.int32).clone()
+            local_start = 0
+            num_local = total
+        else:
+            packed_idx = plan.request_major_to_packed_token_indices
+            if packed_idx is None or packed_idx.size != total:
+                return None
+            idx_t = torch.from_numpy(packed_idx).long()
+            tokens = self.input_ids_cpu.index_select(0, idx_t).to(torch.int32)
+            positions = self.positions_cpu.index_select(0, idx_t).to(torch.int32)
+            pcp_size = max(1, int(self.parallel_config.prefill_context_parallel_size))
+            pcp_rank = int(get_pcp_group().rank_in_group) if pcp_size > 1 else 0
+            span = plan.interleave_size if total > 0 else 0
+            local_start = min(pcp_rank * span, total)
+            num_local = min(local_start + span, total) - local_start
+
+        lb_np = (
+            self._compute_lookback_token_ids_np(
+                num_reqs, start_index, depth, include_generated=True
+            )
+            if depth > 0
+            else np.empty((num_reqs, 0), dtype=np.int32)
+        )
+        pre_async = self._pre_async_results
+        if pre_async is not None and pre_async.request_seq_lens:
+            discard = set(pre_async.discard_sampled_tokens_req_indices)
+            req_map = {
+                req_id: pre_req_idx
+                for pre_req_idx, _, _, req_id in pre_async.request_seq_lens
+                if pre_req_idx not in discard
+            }
+            chunk_req_ids = self.input_batch.req_ids[
+                start_index : start_index + num_reqs
+            ]
+            if any(req_id in req_map for req_id in chunk_req_ids):
+                pre_next_cpu = pre_async.wait_for_copy()
+                if pre_next_cpu is not None:
+                    for row, req_id in enumerate(chunk_req_ids):
+                        pre_idx = req_map.get(req_id)
+                        if pre_idx is not None:
+                            q_s, q_e = int(qsl_np[row]), int(qsl_np[row + 1])
+                            if q_e > q_s:
+                                tokens[q_e - 1] = int(pre_next_cpu[pre_idx, 0].item())
+
+        return utils.HostSequenceLookbackInputs(
+            tokens=tokens,
+            positions=positions,
+            query_start_loc=qsl,
+            lookback_token_ids=torch.from_numpy(lb_np),
+            local_start=local_start,
+            num_local=num_local,
+        )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
         invalidated_req_ids = (
@@ -3654,7 +3765,10 @@ class TPUModelRunner(GPUModelRunner):
             ),
             replay_starts_cpu=(
                 self._build_replay_starts_cpu(start_index, num_reqs, target_num_reqs)
-                if layout_plan.kind is SequenceLayoutKind.ALL
+                if (
+                    layout_plan.kind is SequenceLayoutKind.ALL
+                    or self.sequence_layout_planner.retains_request_replay_starts
+                )
                 else None
             ),
             mamba_state_indices=mamba_state_indices,
@@ -4081,8 +4195,16 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output
         )
+        pcp_world = (
+            max(1, int(self.parallel_config.prefill_context_parallel_size))
+            if self.sequence_layout_planner.retains_request_replay_starts
+            else 1
+        )
+        local_sched_tokens = cdiv(
+            scheduler_output.total_num_scheduled_tokens, pcp_world
+        )
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
-            scheduler_output.total_num_scheduled_tokens,
+            local_sched_tokens,
             local_num_chunks,
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
@@ -4110,8 +4232,9 @@ class TPUModelRunner(GPUModelRunner):
         batch_composition_stats = None
         if self.phase_based_profiler:
             self.batch_counter += 1
-            padded_total_tokens = _get_padded_token_len(
-                self.num_tokens_paddings, scheduler_output.total_num_scheduled_tokens
+            padded_total_tokens = (
+                _get_padded_token_len(self.num_tokens_paddings, local_sched_tokens)
+                * pcp_world
             )
             batch_composition_stats = runner_utils.get_batch_composition_stats(
                 batch_id=self.batch_counter,
@@ -6029,6 +6152,7 @@ class TPUModelRunner(GPUModelRunner):
             num_reqs=num_reqs,
             kv_cache_initialized=kv_cache_initialized,
         )
+        self._last_sequence_layout_plan = dummy_layout_plan
 
         self._lookback_chunk_span = (0, num_reqs)
         if self.kv_cache_config is not None:
@@ -8210,10 +8334,8 @@ class TPUModelRunner(GPUModelRunner):
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
-        if (
-            isinstance(self.model, utils.TokenLookbackModel)
-            and self.lookback_token_ids is not None
-        ):
+        model = self.model
+        if isinstance(model, utils.TokenLookbackModel):
             # Request-sized history retains its fixed shape across token buckets.
             span = self._lookback_chunk_span
             start_idx = 0 if span is None else span[0]
@@ -8222,9 +8344,16 @@ class TPUModelRunner(GPUModelRunner):
                 if span is None
                 else min(span[1], max(0, self.input_batch.num_reqs - start_idx))
             )
-            kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
-                chunk_reqs, start_index=start_idx
-            )
+            if model.uses_host_sequence_lookback():
+                kwargs["host_lookback_inputs"] = (
+                    self._prepare_host_sequence_lookback_inputs(
+                        chunk_reqs, start_index=start_idx
+                    )
+                )
+            elif self.lookback_token_ids is not None:
+                kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
+                    chunk_reqs, start_index=start_idx
+                )
         out = self.model(
             input_ids=input_ids,
             positions=positions,

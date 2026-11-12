@@ -339,6 +339,10 @@ class PagedCacheRows:
             values = torch.stack((even_lanes, odd_lanes), dim=-1).flatten(-2)
         return values.reshape(*records.shape, *self.shape[2:])
 
+    def clear_last_read(self) -> None:
+        """Clear any pending gather dependency token recorded during compilation."""
+        self._last_read = None
+
     def _write_words(
         self,
         low_bank: Tensor,

@@ -26,30 +26,39 @@ from torch import Tensor
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_pcp_group
 from vllm.forward_context import DPMetadata, ForwardContext, override_forward_context
 from vllm.model_executor.kernels.mhc.torch import mhc_pre_delayed_torch
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.models.deepseek_v41.nvidia import model as upstream
 from vllm.sequence import IntermediateTensors
+from vllm.utils.math_utils import cdiv
 
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (
     get_mhc_post_op,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.pcp_sequence_layout import PcpSequenceLayoutPlanner
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import (
+    LOOKBACK_PAD_TOKEN_ID,
+    HostSequenceLookbackInputs,
     RpaSmemPageTableModel,
     TokenLookbackModel,
     synchronize_tensors,
 )
 
 from . import ced as ced_mod
+from . import engram as engram_mod
+from . import pcp
 from .attention import DeepseekV41Attention
 from .engram import Engram, NgramHashState
 from .metadata import active_cache, block_table, cache_slots
 from .moe import DeepseekV41MoE
+
+logger = init_logger(__name__)
 
 _ENC_DYNAMIC_DIMS: dict[str, int] = dict.fromkeys(
     ("input_ids", "positions", "inputs_embeds", "engram_hashes", "engram_mask"), 0
@@ -61,7 +70,6 @@ _FAST_HC_STREAM_COUNT: int = 4
 _MHC_POST_ALPHA: float = 2.0
 _MHC_MIX_EXTRA_ROWS: int = 2
 _MHC_SCALE_DIM: int = 3
-_LOOKBACK_PAD_TOKEN_ID: int = -1
 StageOutput = (
     Tensor
     | tuple[Tensor, list[Tensor]]
@@ -104,6 +112,12 @@ def _ced_config(vllm_config: VllmConfig) -> tuple[bool, int]:
         hf_config.kv_source_layer_ids, default=hf_config.num_hidden_layers // 2
     )
     enabled = not prefix_blocks_replay and 0 < cut_layer < hf_config.num_hidden_layers
+    if enabled and vllm_config.parallel_config.prefill_context_parallel_size > 1:
+        logger.warning_once(
+            "Disabling two-stage CED execution for DeepSeek-V4.1 when "
+            "prefill_context_parallel_size > 1."
+        )
+        return False, cut_layer
     return enabled, cut_layer
 
 
@@ -377,25 +391,9 @@ class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
         engram_hashes: Tensor | None = None,
         engram_mask: Tensor | None = None,
         capture_previous_aux: bool = False,
+        pcp_step: pcp.PcpStep | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor | None]:
-        """Execute optional delayed mHC post + Engram, attention, and MoE sublayers.
-
-        Args:
-            hidden_states: Input hidden states or preceding sublayer output.
-            positions: Token positions ``int32[num_tokens]``.
-            input_ids: Optional token IDs for MoE routing debug/telemetry.
-            pre_mix: Delayed pre-mix weights entering the attention sublayer.
-            post_mix: Delayed post-mix weights from the preceding FFN sublayer.
-            res_mix: Delayed residual transition matrix from the preceding FFN.
-            residual: Multi-stream residual from the preceding layer.
-            engram_hashes: Optional per-token n-gram hash table ``int64[N, L, K]``.
-            engram_mask: Optional boolean mask excluding image sentinel tokens.
-            capture_previous_aux: Whether to capture the stream-averaged residual
-                after applying the preceding layer's delayed ``mhc_post``.
-
-        Returns:
-            Tuple ``(ffn_out, res_state, post_mix, res_mix, ffn_pre, previous_aux)``.
-        """
+        """Execute optional delayed mHC post + Engram, attention, and MoE sublayers."""
         previous_aux: Tensor | None = None
         if residual is None:
             if hidden_states.dim() == 2:
@@ -426,7 +424,11 @@ class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
         post_mix, res_mix, attn_in, attn_pre = self._mhc_pre(
             res_state, attn_fn, False, attn_pre_in, prev_x
         )
-        attn_out = self.attn(positions, attn_in, None)
+        attn_out = (
+            self.attn(positions, attn_in, None)
+            if pcp_step is None
+            else self.attn(positions, attn_in, None, pcp_step=pcp_step)
+        )
         res_state = mhc_post(attn_out, res_state, post_mix, res_mix)
         post_mix, res_mix, ffn_in, ffn_pre = self._mhc_pre(
             res_state, self.hc_ffn_fn, True, attn_pre
@@ -575,8 +577,26 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         self.rms_norm_eps: float = hf_config.rms_norm_eps
         self.use_native_mega_moe = False
         self.use_sequence_parallel = False
+        self._pcp_size: int = parallel_config.prefill_context_parallel_size
+        pcp_rank_val = get_pcp_group().rank_in_group if self._pcp_size > 1 else 0
+        self.register_buffer(
+            "_pcp_rank",
+            torch.tensor(pcp_rank_val, dtype=torch.int32),
+            persistent=False,
+        )
 
-        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        raw_compile_sizes = vllm_config.compilation_config.compile_sizes or []
+        int_compile_sizes = tuple(
+            int(size) for size in raw_compile_sizes if isinstance(size, int)
+        )
+        max_batched = vllm_config.scheduler_config.max_num_batched_tokens
+        if self._pcp_size > 1:
+            capped_sizes = PcpSequenceLayoutPlanner.from_vllm_config(
+                vllm_config
+            ).cap_local_token_paddings(int_compile_sizes, max_batched)
+            max_tokens = max(cdiv(max_batched, self._pcp_size), *capped_sizes)
+        else:
+            max_tokens = max(max_batched, *int_compile_sizes)
         topk_buffer = torch.empty(max_tokens, hf_config.index_topk, dtype=torch.int32)
         self.topk_indices_buffer = topk_buffer
         cand_blocks: int = hf_config.candidate_topk_blocks
@@ -642,10 +662,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         self._ced_prefix_replay = self._ced_enabled and ced_mod.prefix_replay_enabled(
             vllm_config
         )
-        raw_compile_sizes = vllm_config.compilation_config.compile_sizes or []
-        self._ced_compile_sizes = tuple(
-            int(size) for size in raw_compile_sizes if isinstance(size, int)
-        )
+        self._ced_compile_sizes = int_compile_sizes
         self._ced_dp_sync = parallel_config.data_parallel_size > 1
 
         if self._ced_enabled:
@@ -669,12 +686,63 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 self, f"{prefix}.full_stage", "full"
             )
 
+    def _pcp_step(self, positions: Tensor) -> pcp.PcpStep | None:
+        """Build per-step local-query PCP mappings when ``_pcp_size > 1``."""
+        if self._pcp_size <= 1 or not upstream.is_forward_context_available():
+            return None
+        forward_ctx = upstream.get_forward_context()
+        attn_meta = forward_ctx.attn_metadata
+        if not isinstance(attn_meta, dict) or not attn_meta:
+            return None
+        window_starts = forward_ctx.additional_kwargs.get("deepseek_v41_window_starts")
+        return pcp.PcpStep.build(
+            attn_meta,
+            positions,
+            cast(Tensor, self._pcp_rank),
+            self._pcp_size,
+            window_starts=window_starts if isinstance(window_starts, Tensor) else None,
+        )
+
+    def _device_engram_hashes(
+        self,
+        input_ids: Tensor,
+        positions: Tensor,
+        swa_meta: AttentionMetadata,
+        lookback_token_ids: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        """Compute device-side Engram hashes for ``CP=1``."""
+        assert self.engram_hash is not None
+        num_reqs = cast(Tensor, swa_meta.seq_lens).shape[0]
+        lookback = (
+            input_ids.new_full(
+                (num_reqs, self.engram_hash.lookback_depth), LOOKBACK_PAD_TOKEN_ID
+            )
+            if lookback_token_ids is None
+            else lookback_token_ids
+        )
+        dead_mask = upstream.image_sentinel_mask(input_ids)
+        lookback_dead = upstream.image_sentinel_mask(lookback)
+        swa_cache = active_cache(self.engram_hash.swa_cache_module)
+        slots = cache_slots(swa_cache, swa_meta, positions)
+        hashes = self.engram_hash(
+            input_ids,
+            positions,
+            cast(Tensor, swa_meta.query_start_loc),
+            dead_mask,
+            lookback,
+            lookback_dead,
+            slots,
+            block_table(swa_meta),
+        )
+        return hashes, ~dead_mask
+
     def _prepare_engram(
         self,
         input_ids: Tensor | None,
         positions: Tensor,
         lookback_token_ids: Tensor | None,
         stage: str,
+        host_lookback_inputs: HostSequenceLookbackInputs | None = None,
     ) -> tuple[Tensor | None, Tensor | None]:
         """Compute n-gram hashes and stage host-offloaded Engram rows before layers.
 
@@ -683,6 +751,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             positions: Token positions ``int32[num_tokens]``.
             lookback_token_ids: Optional ``(M-1)`` lookback token IDs.
             stage: Execution stage name (``"full"`` or ``"encoder"``).
+            host_lookback_inputs: Optional request-major CPU sequence inputs for PCP.
 
         Returns:
             Tuple ``(engram_hashes, engram_mask)``.
@@ -694,65 +763,119 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if upstream.is_forward_context_available()
             else None
         )
+
+        local_tokens = input_ids.shape[0]
         attn_meta = forward_ctx.attn_metadata if forward_ctx is not None else None
-        if isinstance(attn_meta, dict) and self.engram_hash.ensure_cache():
+        if host_lookback_inputs is not None:
+            assert not torch.compiler.is_compiling(), (
+                "Host Engram hashing must run eagerly outside torch.compile."
+            )
+            num_layers, ngram_size = self.engram_hash.multipliers.shape
+            num_cols = (ngram_size - 1) * self.engram_hash.primes.shape[-1]
+            raw_hashes = torch.full(
+                (local_tokens, num_layers, num_cols),
+                engram_mod.upstream.DEAD_ID,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            raw_mask = torch.zeros(local_tokens, dtype=torch.bool, device="cpu")
+            count = host_lookback_inputs.num_local
+            if count > local_tokens:
+                raise ValueError(
+                    f"Host local token count ({count}) exceeds device bucket "
+                    f"({local_tokens})."
+                )
+            if host_lookback_inputs.tokens.numel() > 0 and count > 0:
+                dead_cpu = upstream.image_sentinel_mask(host_lookback_inputs.tokens)
+                lb_dead_cpu = upstream.image_sentinel_mask(
+                    host_lookback_inputs.lookback_token_ids
+                )
+                all_hashes = self.engram_hash.hash_on_host(
+                    host_lookback_inputs.tokens,
+                    host_lookback_inputs.positions,
+                    host_lookback_inputs.query_start_loc,
+                    dead_cpu,
+                    host_lookback_inputs.lookback_token_ids,
+                    lb_dead_cpu,
+                )
+                start = host_lookback_inputs.local_start
+                end = start + count
+                if start < 0 or end > all_hashes.shape[0]:
+                    raise ValueError(
+                        f"Host local slice [{start}:{end}] out of bounds for "
+                        f"{all_hashes.shape[0]} request-major tokens."
+                    )
+                raw_hashes[:count] = all_hashes[start:end]
+                raw_mask[:count] = ~dead_cpu[start:end]
+        elif isinstance(attn_meta, dict) and self.engram_hash.ensure_cache():
+            if self._pcp_size > 1:
+                raise ValueError(
+                    "host_lookback_inputs is required when "
+                    "prefill_context_parallel_size > 1."
+                )
             assert self.engram_swa_prefix is not None
             swa_meta = cast(AttentionMetadata, attn_meta[self.engram_swa_prefix])
-            num_reqs = cast(Tensor, swa_meta.seq_lens).shape[0]
-            lookback_depth = self.engram_hash.lookback_depth
-            lookback = (
-                input_ids.new_full((num_reqs, lookback_depth), _LOOKBACK_PAD_TOKEN_ID)
-                if lookback_token_ids is None
-                else lookback_token_ids
+            raw_hashes, raw_mask = self._device_engram_hashes(
+                input_ids, positions, swa_meta, lookback_token_ids
             )
-            dead_mask = upstream.image_sentinel_mask(input_ids)
-            lookback_dead = upstream.image_sentinel_mask(lookback)
-            swa_cache = active_cache(self.engram_hash.swa_cache_module)
-            slots = cache_slots(swa_cache, swa_meta, positions)
-            hashes = self.engram_hash(
-                input_ids,
-                positions,
-                cast(Tensor, swa_meta.query_start_loc),
-                dead_mask,
-                lookback,
-                lookback_dead,
-                slots,
-                block_table(swa_meta),
-            )
-            mask = ~dead_mask
         else:
-            hashes, mask = self.engram_hash.dummy_hashes(input_ids)
+            raw_hashes, raw_mask = self.engram_hash.dummy_hashes(input_ids)
 
-        should_gather = self.engram_dp_shared_memory or (
-            forward_ctx is not None and forward_ctx.dp_metadata is not None
-        )
-        gathered_hashes = (
-            upstream.gather_engram_hashes(
-                hashes, dp_shared_memory=self.engram_dp_shared_memory
-            )
-            if should_gather
-            else hashes
-        )
         stage_end = self._ced_boundary if stage == "encoder" else self.end_layer
         stage_layers = cast(
             Sequence[DeepseekV41DecoderLayer],
             list(islice(self.layers, self.start_layer, stage_end)),
         )
         engrams = [layer.engram for layer in stage_layers if layer.engram is not None]
+        if self._pcp_size > 1:
+            gathered_hashes = engram_mod.gather_engram_hashes(
+                raw_hashes, dp_shared_memory=self.engram_dp_shared_memory
+            )
+        elif self.engram_dp_shared_memory or (
+            forward_ctx is not None and forward_ctx.dp_metadata is not None
+        ):
+            gathered_hashes = upstream.gather_engram_hashes(
+                raw_hashes, dp_shared_memory=self.engram_dp_shared_memory
+            )
+        else:
+            gathered_hashes = raw_hashes
+        target_dev = input_ids.device
+        sync_tensors: list[Tensor] = []
+
+        def _to_target(tensor: Tensor) -> Tensor:
+            if tensor.device == target_dev:
+                return tensor
+            moved = tensor.to(target_dev, non_blocking=True)
+            sync_tensors.append(moved)
+            return moved
+
         any_offloaded = any(engram_layer.is_staged() for engram_layer in engrams)
-        host_or_dev_hashes = (
+        any_hbm = any(not engram_layer.is_staged() for engram_layer in engrams)
+        cpu_gathered = (
             gathered_hashes.cpu()
             if gathered_hashes.device.type == "tpu" and any_offloaded
             else gathered_hashes
         )
-        staged_tensors: list[Tensor] = []
+        hbm_from_host = host_lookback_inputs is not None and any_hbm
+        dev_gathered = _to_target(gathered_hashes) if hbm_from_host else gathered_hashes
         for engram_layer in engrams:
+            source_hashes = cpu_gathered if engram_layer.is_staged() else dev_gathered
             engram_layer.prepare_embeddings(
-                host_or_dev_hashes[:, engram_layer.layer_hash_index]
+                source_hashes[:, engram_layer.layer_hash_index]
             )
-            staged_tensors.extend(engram_layer.staged_device_tensors())
-        if staged_tensors and input_ids.device.type == "tpu":
-            synchronize_tensors(staged_tensors, wait=True)
+            sync_tensors.extend(engram_layer.staged_device_tensors())
+            if (
+                hbm_from_host
+                and not engram_layer.is_staged()
+                and engram_layer.staged_rows.numel() > 0
+            ):
+                sync_tensors.append(engram_layer.staged_rows)
+        hashes = (
+            _to_target(raw_hashes) if host_lookback_inputs is not None else raw_hashes
+        )
+        mask = _to_target(raw_mask) if host_lookback_inputs is not None else raw_mask
+        if sync_tensors and target_dev.type == "tpu":
+            synchronize_tensors(sync_tensors, wait=True)
         return hashes, mask
 
     # pyrefly: ignore[bad-override]
@@ -763,6 +886,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: Tensor | None = None,
         lookback_token_ids: Tensor | None = None,
+        host_lookback_inputs: HostSequenceLookbackInputs | None = None,
     ) -> Tensor | tuple[Tensor, list[Tensor]]:
         """Execute full backbone or 2-stage CED encoder + narrowed decoder replay.
 
@@ -772,6 +896,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             intermediate_tensors: Unused pipeline-parallel tensors.
             inputs_embeds: Optional pre-computed input embeddings.
             lookback_token_ids: Optional ``(M-1)`` lookback token IDs.
+            host_lookback_inputs: Optional request-major CPU sequence inputs for PCP.
 
         Returns:
             Final hidden states ``[num_tokens, hidden_size]``, or a tuple
@@ -783,7 +908,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             embeds is None
             and input_ids is not None
             and device.type == "tpu"
-            and self.parallel_config.data_parallel_size > 1
+            and (self.parallel_config.data_parallel_size > 1 or self._pcp_size > 1)
         ):
             embeds = self.embed_input_ids(input_ids)
             synchronize_tensors((embeds,), wait=False)
@@ -808,7 +933,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
         if not self._ced_enabled:
             engram_hashes, engram_mask = self._prepare_engram(
-                input_ids, positions, lookback_token_ids, "full"
+                input_ids,
+                positions,
+                lookback_token_ids,
+                "full",
+                host_lookback_inputs,
             )
             if forward_ctx is None:
                 full_out = self.full_stage(
@@ -836,7 +965,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
         assert forward_ctx is not None
         engram_hashes, engram_mask = self._prepare_engram(
-            input_ids, positions, lookback_token_ids, "encoder"
+            input_ids,
+            positions,
+            lookback_token_ids,
+            "encoder",
+            host_lookback_inputs,
         )
         num_tokens = positions.shape[0]
         plan = (
@@ -1013,6 +1146,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if stage == "decoder" and start_layer in self.aux_hidden_state_layers:
             aux_by_layer[start_layer] = _mean_hc_streams(hidden)
 
+        pcp_step = self._pcp_step(positions)
         for layer_idx, raw_layer in enumerate(
             islice(self.layers, start_layer, end_layer), start=start_layer
         ):
@@ -1031,6 +1165,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 engram_hashes,
                 engram_mask,
                 capture_aux,
+                pcp_step,
             )
             if prev_aux is not None:
                 aux_by_layer[layer_idx] = prev_aux
@@ -1124,7 +1259,9 @@ class DeepseekV41ForCausalLM(
         num_routed: int = self.config.n_routed_experts
         parallel_config = self.model.parallel_config
         ep_world = (
-            parallel_config.data_parallel_size * parallel_config.tensor_parallel_size
+            parallel_config.data_parallel_size
+            * parallel_config.prefill_context_parallel_size
+            * parallel_config.tensor_parallel_size
         )
         ep_divisor = ep_world if parallel_config.enable_expert_parallel else 1
 
@@ -1167,6 +1304,11 @@ class DeepseekV41ForCausalLM(
             layers = self._dspark_target_layer_ids
         super().set_aux_hidden_state_layers(layers)
 
+    def uses_host_sequence_lookback(self) -> bool:
+        """Use host-side sequence lookback only when PCP is active."""
+        backbone = cast(DeepseekV41Model, self.model)
+        return backbone._pcp_size > 1 and backbone.engram_hash is not None
+
     def forward(
         self,
         input_ids: Tensor,
@@ -1174,6 +1316,7 @@ class DeepseekV41ForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: Tensor | None = None,
         lookback_token_ids: Tensor | None = None,
+        host_lookback_inputs: HostSequenceLookbackInputs | None = None,
     ) -> Tensor | IntermediateTensors:
         """Ensure Engram cache binding and run ``DeepseekV41Model`` forward.
 
@@ -1183,16 +1326,21 @@ class DeepseekV41ForCausalLM(
             intermediate_tensors: Unused pipeline-parallel tensors.
             inputs_embeds: Optional pre-computed input embeddings.
             lookback_token_ids: Optional ``(M-1)`` lookback token IDs.
+            host_lookback_inputs: Optional request-major CPU sequence inputs for PCP.
 
         Returns:
             Model forward output tensor or intermediate tensors.
         """
         if self.model.engram_hash is not None:
             self.model.engram_hash.ensure_cache()
-        return super().forward(
-            input_ids,
-            positions,
-            intermediate_tensors,
-            inputs_embeds,
-            lookback_token_ids=lookback_token_ids,
+        return cast(
+            Tensor | IntermediateTensors,
+            self.model(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                lookback_token_ids=lookback_token_ids,
+                host_lookback_inputs=host_lookback_inputs,
+            ),
         )

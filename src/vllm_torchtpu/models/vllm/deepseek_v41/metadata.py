@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
@@ -26,6 +26,9 @@ from vllm import forward_context
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .cache import NativeCacheView, PagedCacheRows
+
+if TYPE_CHECKING:
+    from .pcp import PcpStep
 
 
 def rotate_rope(
@@ -64,19 +67,28 @@ def active_cache(layer: NativeCacheView | nn.Module) -> PagedCacheRows | Tensor:
     return layer.kv_cache
 
 
-def layer_meta(prefix: str) -> AttentionMetadata | None:
+def layer_meta(
+    prefix: str, *, pcp_step: PcpStep | None = None
+) -> AttentionMetadata | None:
     """Look up per-layer ``AttentionMetadata`` from the active vLLM forward context.
 
     Args:
         prefix: Layer or cache module prefix key in ``attn_metadata`` dict.
+        pcp_step: Optional active PCP step; when given, narrows ``meta`` to
+            this rank's compacted local request slice.
 
     Returns:
         Matching ``AttentionMetadata`` instance, or ``None`` if absent.
     """
     attn_metadata = forward_context.get_forward_context().attn_metadata
-    if isinstance(attn_metadata, dict):
-        return cast(AttentionMetadata | None, attn_metadata.get(prefix))
-    return cast(AttentionMetadata | None, attn_metadata)
+    meta = (
+        cast(AttentionMetadata | None, attn_metadata.get(prefix))
+        if isinstance(attn_metadata, dict)
+        else cast(AttentionMetadata | None, attn_metadata)
+    )
+    if meta is not None and pcp_step is not None:
+        return pcp_step.local(meta)
+    return meta
 
 
 def block_table(meta: AttentionMetadata) -> Tensor:
@@ -189,6 +201,7 @@ def replay_starts(
     device: torch.device,
     *,
     ced_decoder: bool = False,
+    pcp_step: PcpStep | None = None,
 ) -> Tensor | None:
     """Resolve effective per-sequence replay/window lower bounds ``int32[num_seqs]``.
 
@@ -196,11 +209,20 @@ def replay_starts(
         num_seqs: Number of scheduled sequences in the batch.
         device: Target device for the returned tensor.
         ced_decoder: Whether to resolve the lower bound for the CED decoder stage.
+        pcp_step: Optional active PCP step; when given, returns this rank's
+            compacted local window lower bounds.
 
     Returns:
         Per-sequence lower bounds ``int32[num_seqs]``, or ``None`` if no replay
         or window lower bounds are active.
     """
+    if pcp_step is not None:
+        starts = pcp_step.local_window_starts
+        if starts is not None and starts.numel() > 0:
+            seq_indices = torch.arange(num_seqs, device=device).clamp_max(
+                starts.shape[0] - 1
+            )
+            return starts.int()[seq_indices]
     window_starts = _context_starts("deepseek_v41_window_starts", num_seqs, device)
     decoder_starts = _context_starts("deepseek_v41_replay_starts", num_seqs, device)
     if ced_decoder:

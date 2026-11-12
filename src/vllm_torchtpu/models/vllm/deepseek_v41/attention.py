@@ -36,6 +36,7 @@ from vllm_torchtpu.layers.adapter.custom_ops import deepseek_v41 as ops
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.vllm.deepseek_v4 import attention as v4_attn
 
+from . import pcp
 from .cache import ROPE_WORDS, ROW_WORDS, NativeCacheView, PagedCacheRows, write_cache
 from .compressor import (
     AttentionBackend,
@@ -513,28 +514,22 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         """
         return rotate_rope(inputs, positions, self.rotary_emb, self.kv_rope_op)
 
-    def _swa_state(self) -> tuple[PagedCacheRows | Tensor, AttentionMetadata | None]:
-        """Return the active SWA cache view and its forward-context metadata.
-
-        Returns:
-            Tuple ``(swa_cache, swa_meta)``.
-        """
+    def _swa_state(
+        self, *, pcp_step: pcp.PcpStep | None = None
+    ) -> tuple[PagedCacheRows | Tensor, AttentionMetadata | None]:
+        """Return the active SWA cache view and its forward-context metadata."""
         swa_layer = self.swa_cache_layer
-        return active_cache(swa_layer), layer_meta(swa_layer.prefix)
+        return active_cache(swa_layer), layer_meta(swa_layer.prefix, pcp_step=pcp_step)
 
     def _write_swa_kv(
         self,
         kv_rotated: Tensor,
         positions: Tensor,
         after_read: bool = False,
+        *,
+        retain_all_step_tokens: bool = False,
     ) -> None:
-        """Scatter trailing window tokens into ``swa_cache_layer`` in place.
-
-        Args:
-            kv_rotated: RoPE-rotated SWA KV latents ``[num_tokens, head_dim]``.
-            positions: Token positions ``int32[num_tokens]``.
-            after_read: Whether to order the write after prior SWA cache reads.
-        """
+        """Scatter trailing window tokens into ``swa_cache_layer`` in place."""
         swa_cache, swa_meta = self._swa_state()
         if (
             swa_meta is None
@@ -549,29 +544,19 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         table_capacity = block_table(swa_meta).shape[1] * swa_cache.shape[1]
         window_cap = min(self.window_size + self.dspark_block_size, table_capacity)
+        cap = table_capacity if retain_all_step_tokens else window_cap
         token_rows = torch.arange(positions.shape[0], device=positions.device)
-        keep_mask = (slots >= 0) & (token_rows >= query_ends[req_indices] - window_cap)
+        keep_mask = (slots >= 0) & (token_rows >= query_ends[req_indices] - cap)
         write_cache(swa_cache, slots, kv_rotated, keep_mask, after_read=after_read)
 
-    def _gather_seq_swa(self, live_kv: Tensor | None = None) -> Tensor | None:
-        """Gather per-sequence ``[num_seqs, eff_window, head_dim]`` SWA history.
-
-        Under ``non_causal_multi_token_decode``, splices ``live_kv`` draft block
-        tokens directly after committed prefix tokens without mutating the SWA
-        cache (preserving target KV pools across speculative steps and idle DP
-        dummy forwards). Masks ``null_block=0`` and positions ``< replay_starts``
-        with ``torch.where`` / ``masked_fill`` before ``bfloat16`` reads so
-        unzeroed recycled bit patterns never produce ``NaN``.
-
-        Args:
-            live_kv: Optional live KV latents ``[num_tokens, head_dim]`` for
-                non-causal draft splicing.
-
-        Returns:
-            Per-sequence SWA window tensor ``bfloat16[num_seqs, eff_window, head_dim]``,
-            or ``None`` if the SWA cache is empty or unscheduled.
-        """
-        swa_cache, swa_meta = self._swa_state()
+    def _gather_seq_swa(
+        self,
+        live_kv: Tensor | None = None,
+        *,
+        pcp_step: pcp.PcpStep | None = None,
+    ) -> Tensor | None:
+        """Gather per-sequence ``[num_seqs, eff_window, head_dim]`` SWA history."""
+        swa_cache, swa_meta = self._swa_state(pcp_step=pcp_step)
         non_causal = self.non_causal_multi_token_decode
         block_tokens = max(0, self.dspark_block_size) if non_causal else 0
         eff_window = self.window_size + block_tokens
@@ -605,7 +590,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         kv_positions = window_base[:, None] + window_offsets
         lower_bounds = replay_starts(
-            seq_lens.shape[0], seq_lens.device, ced_decoder=self.ced_decoder
+            seq_lens.shape[0],
+            seq_lens.device,
+            ced_decoder=self.ced_decoder,
+            pcp_step=pcp_step,
         )
         min_pos = (
             lower_bounds.to(torch.int64).clamp_min(0).unsqueeze(1)
@@ -689,20 +677,84 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             kv_score = sp_all_gather(kv_score)[: positions.shape[0]]
         self._compress_kv(kv_score, positions, produce_indexer_k=True)
 
-    def forward_kv(self, positions: Tensor, hidden_states: Tensor) -> None:
-        """Write SWA KV, compressed KV, and indexer K without running attention.
-
-        Args:
-            positions: Token positions ``int32[num_tokens]``.
-            hidden_states: Token hidden states ``[num_tokens, hidden_size]``.
-        """
-        qr_kv, kv_score, _ = self._run_parallel_input_projections(hidden_states)
-        _, _, kv_latent = self._split_qkv_and_norm(qr_kv)
-        self._write_swa_kv(self.rotate(kv_latent, positions), positions)
+    def _write_and_compress_kv(
+        self,
+        kv_rotated: Tensor,
+        kv_score: Tensor | None,
+        positions: Tensor,
+        *,
+        retain_all_step_tokens: bool = False,
+    ) -> None:
+        """Write SWA KV and optionally compress KV + indexer K at ``positions``."""
+        self._write_swa_kv(
+            kv_rotated, positions, retain_all_step_tokens=retain_all_step_tokens
+        )
         if self.compressor is not None and kv_score is not None:
             self._compress_kv(kv_score, positions, produce_indexer_k=True)
 
-    # pyrefly: ignore[bad-override-param-name]
+    def forward_kv(self, positions: Tensor, hidden_states: Tensor) -> None:
+        """Write SWA KV, compressed KV, and indexer K without running attention."""
+        qr_kv, kv_score, _ = self._run_parallel_input_projections(hidden_states)
+        _, _, kv_latent = self._split_qkv_and_norm(qr_kv)
+        self._write_and_compress_kv(
+            self.rotate(kv_latent, positions), kv_score, positions
+        )
+
+    def _pcp_publish_kv(
+        self,
+        pcp_step: pcp.PcpStep,
+        kv_rotated: Tensor,
+        kv_score: Tensor | None,
+    ) -> None:
+        """All-gather local KV projections and publish replicated step caches."""
+        global_kv = pcp_step.gather(kv_rotated)
+        global_score = (
+            pcp_step.gather(kv_score)
+            if self.compressor is not None and kv_score is not None
+            else None
+        )
+        self._write_and_compress_kv(
+            global_kv,
+            global_score,
+            pcp_step.positions,
+            retain_all_step_tokens=True,
+        )
+
+    # pyrefly: ignore[bad-override]
+    def forward(
+        self,
+        positions: Tensor,
+        hidden_states: Tensor,
+        llama_4_scaling: Tensor | None = None,
+        *,
+        pcp_step: pcp.PcpStep | None = None,
+    ) -> Tensor:
+        """Run input projections, sparse/SWA attention, and output projection."""
+        if pcp_step is None:
+            return super().forward(positions, hidden_states, llama_4_scaling)
+        attn_out = cast(
+            Tensor, self._alloc_attn_out(hidden_states.shape[0], hidden_states)
+        )
+        qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
+            hidden_states
+        )
+        qr_proj, qr_scale, kv_latent = self._split_qkv_and_norm(qr_kv)
+        self._prepare_and_attn(
+            hidden_states,
+            qr_proj,
+            kv_latent,
+            qr_scale,
+            kv_score,
+            indexer_weights,
+            positions,
+            attn_out,
+            pcp_step=pcp_step,
+        )
+        return v4_attn.VllmDeepseekV4MLAAttention._o_proj(
+            cast(v4_attn.VllmDeepseekV4MLAAttention, self), attn_out, positions
+        )
+
+    # pyrefly: ignore[bad-override]
     def _prepare_and_attn(
         self,
         hidden_states: Tensor,
@@ -713,20 +765,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         indexer_weights: Tensor | None,
         positions: Tensor,
         attn_output: Tensor,
+        *,
+        pcp_step: pcp.PcpStep | None = None,
     ) -> None:
-        """Project Q, update caches (ordered after SWA prefix read), and run MQA.
-
-        Args:
-            hidden_states: Token hidden states ``[num_tokens, hidden_size]``.
-            qr_proj: Normalized query LoRA latents ``[num_tokens, q_lora_rank]``.
-            kv_latent: Normalized SWA KV latents ``[num_tokens, head_dim]``.
-            qr_scale: Optional query LoRA quantization scale.
-            kv_score: Optional compressor ``[kv, gate]`` projection.
-            indexer_weights: Optional indexer head importance weights.
-            positions: Token positions ``int32[num_tokens]``.
-            attn_output: Output buffer ``[num_tokens, n_local_heads, head_dim]``
-                populated in place.
-        """
+        """Project Q, update caches (ordered after SWA prefix read), and run MQA."""
         q_heads = self._wq_b_proj(qr_proj, qr_scale).view(
             -1, self.n_local_heads, self.head_dim
         )
@@ -734,13 +776,18 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         kv_rotated = self.rotate(kv_latent, positions)
 
         if self.non_causal_multi_token_decode:
-            pre_write_swa: Tensor | None = None
+            cached_swa: Tensor | None = None
             compressed_latent: Tensor | None = None
+        elif pcp_step is not None:
+            self._pcp_publish_kv(pcp_step, kv_rotated, kv_score)
+            cached_swa = self._gather_seq_swa(pcp_step=pcp_step)
+            swa_cache, _ = self._swa_state(pcp_step=pcp_step)
+            if isinstance(swa_cache, PagedCacheRows):
+                swa_cache.clear_last_read()
+            compressed_latent = None
         else:
-            pre_write_swa = self._gather_seq_swa()
-            self._write_swa_kv(
-                kv_rotated, positions, after_read=pre_write_swa is not None
-            )
+            cached_swa = self._gather_seq_swa()
+            self._write_swa_kv(kv_rotated, positions, after_read=cached_swa is not None)
             should_compress = (
                 self.compressor is not None
                 and not self.ced_global_from_encoder
@@ -761,10 +808,28 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 self.indexer_rotary_emb,
                 qr_scale,
             )
-            quant_q = idx_q if idx_q_scale is None else (idx_q, idx_q_scale)
-            self.indexer.indexer_op(hidden_states, quant_q, positions, idx_weights)
+            if pcp_step is not None:
+                assert idx_q is not None and idx_weights is not None
+                self.indexer.select_topk(
+                    idx_q, idx_weights, positions, pcp_step=pcp_step
+                )
+            else:
+                quant_q = idx_q if idx_q_scale is None else (idx_q, idx_q_scale)
+                self.indexer.indexer_op(
+                    hidden_states,
+                    cast(Tensor | tuple[Tensor, Tensor | None], quant_q),
+                    positions,
+                    cast(Tensor, idx_weights),
+                )
 
-        self.forward_mqa(q_rotated, kv_rotated, positions, attn_output, pre_write_swa)
+        self.forward_mqa(
+            q_rotated,
+            kv_rotated,
+            positions,
+            attn_output,
+            cached_swa,
+            pcp_step=pcp_step,
+        )
 
     def forward_mqa(
         self,
@@ -772,22 +837,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         kv: Tensor,
         positions: Tensor,
         output: Tensor,
-        pre_write_swa: Tensor | None = None,
+        cached_swa: Tensor | None = None,
+        *,
+        pcp_step: pcp.PcpStep | None = None,
     ) -> None:
-        """Gather sparse FP8 + SWA KV and write fused attention into ``output``.
-
-        Args:
-            q: RoPE-rotated query heads ``[num_tokens, n_local_heads, head_dim]``.
-            kv: RoPE-rotated SWA KV latents ``[num_tokens, head_dim]``.
-            positions: Token positions ``int32[num_tokens]``.
-            output: Attention output buffer ``[num_tokens, n_local_heads, head_dim]``
-                written in place.
-            pre_write_swa: Optional SWA window gathered before the current step's
-                SWA cache write.
-        """
+        """Gather sparse FP8 + SWA KV and write fused attention into ``output``."""
         num_tokens = q.shape[0]
         device = q.device
-        swa_cache, swa_meta = self._swa_state()
+        swa_cache, swa_meta = self._swa_state(pcp_step=pcp_step)
         if (
             swa_meta is None
             or not swa_cache.numel()
@@ -798,9 +855,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
 
         seq_lens = cast(Tensor, swa_meta.seq_lens).int()
         cu_q_lens = cast(Tensor, swa_meta.query_start_loc).int()
-        seq_swa = self._gather_seq_swa(kv) if pre_write_swa is None else pre_write_swa
+        seq_swa = (
+            self._gather_seq_swa(kv, pcp_step=pcp_step)
+            if cached_swa is None
+            else cached_swa
+        )
         lower_bounds = replay_starts(
-            seq_lens.shape[0], device, ced_decoder=self.ced_decoder
+            seq_lens.shape[0],
+            device,
+            ced_decoder=self.ced_decoder,
+            pcp_step=pcp_step,
         )
 
         if self.non_causal_multi_token_decode:
@@ -833,7 +897,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else None
         )
         comp_cache = active_cache(comp_layer) if comp_layer is not None else None
-        comp_meta = layer_meta(comp_prefix) if comp_prefix is not None else None
+        comp_meta = (
+            layer_meta(comp_prefix, pcp_step=pcp_step)
+            if comp_prefix is not None
+            else None
+        )
         has_compressed = (
             self.compress_ratio > 0
             and comp_cache is not None

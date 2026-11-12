@@ -15,6 +15,7 @@ import importlib
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
@@ -401,6 +402,21 @@ class RpaSmemPageTableModel:
     uses_rpa_smem_page_table: bool = True
 
 
+LOOKBACK_PAD_TOKEN_ID: int = -1
+
+
+@dataclass(frozen=True)
+class HostSequenceLookbackInputs:
+    """Host-side request-major inputs for sequence-parallel n-gram lookback."""
+
+    tokens: torch.Tensor
+    positions: torch.Tensor
+    query_start_loc: torch.Tensor
+    lookback_token_ids: torch.Tensor
+    local_start: int
+    num_local: int
+
+
 class TokenLookbackModel:
     """Mixin for models with request-level host token lookback.
 
@@ -411,6 +427,10 @@ class TokenLookbackModel:
     """
 
     token_lookback_depth: int = 0
+
+    def uses_host_sequence_lookback(self) -> bool:
+        """Whether `TPUModelRunner` passes `host_lookback_inputs` on forward."""
+        return False
 
 
 def tpu_bind_kv_cache(

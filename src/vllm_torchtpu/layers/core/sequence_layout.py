@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import bisect
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, cast
@@ -30,13 +31,15 @@ class SequenceLayoutKind(str, Enum):
 
 DEFAULT_SEQUENCE_LAYOUT_PROTOCOL = "default"
 PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL = "pcp_streaming"
+PCP_STREAMING_SEQUENCE_LAYOUT_VERSION = 1
+PCP_CONTIGUOUS_SEQUENCE_LAYOUT_VERSION = 2
 
 
 @dataclass(frozen=True)
 class SequenceLayoutDescriptor:
     kind: SequenceLayoutKind = SequenceLayoutKind.ALL
     protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
-    version: int = 1
+    version: int = PCP_STREAMING_SEQUENCE_LAYOUT_VERSION
 
     @property
     def cache_key(self) -> tuple[str, str, int]:
@@ -52,7 +55,21 @@ def is_pcp_streaming_sequence_layout_descriptor(
     return descriptor.cache_key == (
         SequenceLayoutKind.PARTIAL.value,
         PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
-        1,
+        PCP_STREAMING_SEQUENCE_LAYOUT_VERSION,
+    )
+
+
+def is_pcp_partial_sequence_layout_descriptor(
+    descriptor: SequenceLayoutDescriptor,
+) -> bool:
+    return (
+        descriptor.kind is SequenceLayoutKind.PARTIAL
+        and descriptor.protocol == PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL
+        and int(descriptor.version)
+        in (
+            PCP_STREAMING_SEQUENCE_LAYOUT_VERSION,
+            PCP_CONTIGUOUS_SEQUENCE_LAYOUT_VERSION,
+        )
     )
 
 
@@ -68,6 +85,8 @@ class SequenceLayoutPlan:
     logits_local_indices_cpu: torch.Tensor | None = None
     logits_owner_mask_cpu: torch.Tensor | None = None
     requires_hidden_state_gather: bool = False
+    is_dummy: bool = False
+    interleave_size: int = 1
     # Optional packed-global to request-major token order. Padding rows use
     # -1. Real PCP plans carry both mapping directions.
     _packed_to_request_major_token_indices: np.ndarray | None = None
@@ -79,6 +98,10 @@ class SequenceLayoutPlan:
     @property
     def kind(self) -> SequenceLayoutKind:
         return self.descriptor.kind
+
+    @property
+    def request_major_to_packed_token_indices(self) -> np.ndarray | None:
+        return self._request_major_to_packed_token_indices
 
     def local_index_for_request_major_token(
         self, request_major_index: int
@@ -170,7 +193,7 @@ class SequenceLayoutPlan:
         descriptor = self.descriptor
         if descriptor == DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR:
             return local_tensor
-        if is_pcp_streaming_sequence_layout_descriptor(descriptor):
+        if is_pcp_partial_sequence_layout_descriptor(descriptor):
             local_tensor = torch.where(
                 owner_mask.unsqueeze(-1), local_tensor, torch.zeros_like(local_tensor)
             )
@@ -236,9 +259,16 @@ class SequenceLayoutPlanner(Protocol):
     @property
     def uses_selected_logits_hidden_states(self) -> bool: ...
 
+    @property
+    def retains_request_replay_starts(self) -> bool: ...
+
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int
     ) -> None: ...
+
+    def cap_local_token_paddings(
+        self, paddings: Sequence[int], max_batched_tokens: int
+    ) -> list[int]: ...
 
     def prepare_real(
         self,
@@ -300,10 +330,20 @@ class AllSequenceLayoutPlanner:
     def uses_selected_logits_hidden_states(self) -> bool:
         return False
 
+    @property
+    def retains_request_replay_starts(self) -> bool:
+        return False
+
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int
     ) -> None:
         del runner, required_num_tokens
+
+    def cap_local_token_paddings(
+        self, paddings: Sequence[int], max_batched_tokens: int
+    ) -> list[int]:
+        del max_batched_tokens
+        return [int(p) for p in paddings]
 
     def prepare_real(
         self,
@@ -360,6 +400,7 @@ class AllSequenceLayoutPlanner:
             global_padded_num_tokens=num_tokens,
             local_num_tokens=num_tokens,
             local_padded_num_tokens=num_tokens,
+            is_dummy=True,
         )
 
     def finalize_hidden_states(
@@ -393,11 +434,13 @@ def is_pcp_streaming_sequence_layout(
     *,
     kind: str | SequenceLayoutKind,
     protocol: str,
+    version: int = PCP_STREAMING_SEQUENCE_LAYOUT_VERSION,
 ) -> bool:
     kind_value = kind.value if isinstance(kind, SequenceLayoutKind) else str(kind)
     return (
         kind_value == SequenceLayoutKind.PARTIAL.value
         and protocol == PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL
+        and int(version) == PCP_STREAMING_SEQUENCE_LAYOUT_VERSION
     )
 
 
@@ -408,5 +451,10 @@ def is_pcp_streaming_attention_metadata(attn_metadata: Any) -> bool:
         ),
         protocol=getattr(
             attn_metadata, "sequence_layout_protocol", DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
+        ),
+        version=getattr(
+            attn_metadata,
+            "sequence_layout_version",
+            PCP_STREAMING_SEQUENCE_LAYOUT_VERSION,
         ),
     )

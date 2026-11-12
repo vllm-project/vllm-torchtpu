@@ -787,3 +787,81 @@ def test_prepare_inputs_pcp_ignores_unmapped_async_spec_results(
         torch.testing.assert_close(
             runner.position_ids[:16].cpu(), torch.arange(16, 32, dtype=torch.int32)
         )
+
+
+def test_pcp_runner_contiguous_vs_interleaved_accounting_and_host_lookback(
+    monkeypatch,
+):
+    import vllm_torchtpu.runner.tpu_runner as runner_mod
+    from vllm_torchtpu.layers.core.pcp_sequence_layout import PcpSequenceLayoutPlanner
+    from vllm_torchtpu.utils import TokenLookbackModel
+
+    interleaved = PcpSequenceLayoutPlanner.from_vllm_config(
+        SimpleNamespace(
+            model_config=SimpleNamespace(uses_contiguous_pcp_layout=False),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=4,
+                cp_kv_cache_interleave_size=16,
+                decode_context_parallel_size=1,
+                pipeline_parallel_size=1,
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+        )
+    )
+    assert interleaved.retains_request_replay_starts is False
+    assert interleaved.cap_local_token_paddings(
+        [256, 16, 64], max_batched_tokens=128
+    ) == [16, 64, 256]
+
+    runner = _make_runner(
+        num_computed_tokens=[2],
+        prompt_tokens=[6],
+        scheduled_tokens=[4],
+        token_paddings=[4, 8],
+        pcp_size=2,
+    )
+    runner.vllm_config.model_config.uses_contiguous_pcp_layout = True
+    runner.sequence_layout_planner = PcpSequenceLayoutPlanner.from_vllm_config(
+        runner.vllm_config
+    )
+    assert runner.sequence_layout_planner.retains_request_replay_starts is True
+
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 1)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+    monkeypatch.setattr(
+        runner_mod,
+        "get_pcp_group",
+        lambda: SimpleNamespace(rank_in_group=1, world_size=2),
+    )
+    runner.input_batch.token_ids_cpu[0, :6] = [10, 11, 12, 13, 14, 15]
+    TPUModelRunner._prepare_inputs(runner, _scheduler_output([4]), 0, 0)
+
+    captured_kwargs: dict[str, object] = {}
+
+    class _LookbackStub(TokenLookbackModel):
+        token_lookback_depth = 2
+
+        def __init__(self, use_host: bool):
+            self._use_host = use_host
+
+        def uses_host_sequence_lookback(self) -> bool:
+            return self._use_host
+
+        def __call__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return torch.zeros((2, 4))
+
+    runner._lookback_chunk_span = (0, 1)
+    runner.lookback_token_ids = None
+    runner.model = _LookbackStub(use_host=False)
+    TPUModelRunner.forward_model(runner, runner.input_ids, runner.position_ids)
+    assert "host_lookback_inputs" not in captured_kwargs
+
+    captured_kwargs.clear()
+    runner.model = _LookbackStub(use_host=True)
+    TPUModelRunner.forward_model(runner, runner.input_ids, runner.position_ids)
+    host_in = captured_kwargs["host_lookback_inputs"]
+    assert host_in is not None
+    assert host_in.tokens.tolist() == [12, 13, 14, 15]
+    assert host_in.lookback_token_ids.tolist() == [[11, 10]]
+    assert (host_in.local_start, host_in.num_local) == (2, 2)

@@ -299,6 +299,151 @@ def _patch_moe_explicit_pcp_collectives() -> None:
     )
 
 
+def _patch_vllm_engram_dp_group_pcp() -> None:
+    """Extend node-local DeepSeek-V4.1 Engram DP groups across PCP ranks at TP=1
+    so all PCP workers on a host share one ``/dev/shm`` L1 Engram table.
+    """
+    import torch
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.config.engram import EngramConfig
+    from vllm.distributed import parallel_state
+
+    from vllm_torchtpu.models.vllm import install_pcp_model_capabilities
+
+    install_pcp_model_capabilities()
+    if parallel_state.__dict__.get("_tpu_engram_dp_pcp_patch", False):
+        return
+
+    original_verify_model = EngramConfig.verify_model_config
+    original_resolve = EngramConfig.resolve_dp_shared_memory
+    original_verify = EngramConfig.verify_parallel_config
+    original_shard_size = parallel_state._engram_dp_shard_size
+    original_init = parallel_state.initialize_model_parallel
+
+    def _shares_pcp_host_table(cfg: EngramConfig, parallel_config) -> bool:
+        return (
+            bool(cfg.__dict__.get("_tpu_shares_engram_pcp", False))
+            and parallel_config.prefill_context_parallel_size > 1
+            and parallel_config.data_parallel_size == 1
+            and parallel_config.tensor_parallel_size == 1
+            and not parallel_config.enable_elastic_ep
+        )
+
+    def verify_model_config(self: EngramConfig, model_config) -> None:
+        original_verify_model(self, model_config)
+        object.__setattr__(
+            self,
+            "_tpu_shares_engram_pcp",
+            bool(
+                model_config is not None
+                and model_config.shares_engram_host_table_across_pcp
+            ),
+        )
+
+    def resolve_dp_shared_memory(self: EngramConfig, parallel_config) -> None:
+        if self.dp_shared_memory is None and _shares_pcp_host_table(
+            self, parallel_config
+        ):
+            self.dp_shared_memory = self.cpu_offload and not self.use_thp
+            return
+        original_resolve(self, parallel_config)
+
+    def verify_parallel_config(self: EngramConfig, parallel_config) -> None:
+        if self.dp_shared_memory and _shares_pcp_host_table(self, parallel_config):
+            return
+        original_verify(self, parallel_config)
+
+    def _engram_dp_shard_size(
+        world_size: int,
+        data_parallel_size: int,
+        replica_size: int,
+    ) -> int:
+        vllm_config = get_current_vllm_config_or_none()
+        if (
+            vllm_config is not None
+            and vllm_config.engram_config is not None
+            and _shares_pcp_host_table(
+                vllm_config.engram_config, vllm_config.parallel_config
+            )
+        ):
+            pcp = vllm_config.parallel_config.prefill_context_parallel_size
+            if data_parallel_size == 1 and replica_size % pcp == 0:
+                return original_shard_size(world_size, pcp, replica_size // pcp)
+        return original_shard_size(world_size, data_parallel_size, replica_size)
+
+    def initialize_model_parallel(
+        tensor_model_parallel_size: int = 1,
+        pipeline_model_parallel_size: int = 1,
+        prefill_context_model_parallel_size: int = 1,
+        decode_context_model_parallel_size: int | None = 1,
+        backend: str | None = None,
+    ) -> None:
+        original_init(
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+            prefill_context_model_parallel_size=prefill_context_model_parallel_size,
+            decode_context_model_parallel_size=decode_context_model_parallel_size,
+            backend=backend,
+        )
+        if (
+            prefill_context_model_parallel_size <= 1
+            or tensor_model_parallel_size != 1
+            or parallel_state._ENGRAM_DP is not None
+        ):
+            return
+        vllm_config = get_current_vllm_config_or_none()
+        if (
+            vllm_config is None
+            or vllm_config.engram_config is None
+            or not _shares_pcp_host_table(
+                vllm_config.engram_config, vllm_config.parallel_config
+            )
+        ):
+            return
+        world_group = parallel_state.get_world_group()
+        world_size = world_group.world_size
+        replica_size = (
+            pipeline_model_parallel_size * prefill_context_model_parallel_size
+        )
+        engram_dp_size = _engram_dp_shard_size(world_size, 1, replica_size)
+        if engram_dp_size <= 1:
+            return
+        group_ranks = (
+            torch.arange(world_size)
+            .reshape(
+                -1,
+                pipeline_model_parallel_size,
+                prefill_context_model_parallel_size,
+            )
+            .transpose(1, 2)
+            .reshape(-1, engram_dp_size)
+            .tolist()
+        )
+        resolved_backend = backend or torch.distributed.get_backend(
+            world_group.device_group
+        )
+        parallel_state._ENGRAM_DP = parallel_state.init_model_parallel_group(
+            group_ranks,
+            world_group.local_rank,
+            resolved_backend,
+            group_name="edp",
+        )
+        logger.info_once(
+            "Engram node-local PCP group size: %d (PCP=%d, TP=%d)",
+            engram_dp_size,
+            prefill_context_model_parallel_size,
+            tensor_model_parallel_size,
+        )
+
+    EngramConfig.verify_model_config = verify_model_config
+    EngramConfig.resolve_dp_shared_memory = resolve_dp_shared_memory
+    EngramConfig.verify_parallel_config = verify_parallel_config
+    parallel_state._engram_dp_shard_size = _engram_dp_shard_size
+    parallel_state.initialize_model_parallel = initialize_model_parallel
+    parallel_state.__dict__["_tpu_engram_dp_pcp_patch"] = True
+    logger.info("Applied TPU patch: extend Engram DP group across PCP ranks at TP=1.")
+
+
 def _patch_expert_map_host_lookup() -> None:
     """Build the expert map on the host and serve host readers from a copy.
 

@@ -225,6 +225,7 @@ def test_manifest_preserves_lifecycle_dependencies():
     }
     assert stages["import"] == ["_patch_jax_pallas_fori_lowering"]
     assert stages["engine_core"] == [
+        "_patch_vllm_engram_dp_group_pcp",
         "_patch_vllm_hybrid_pcp_block_sizes",
         "_patch_vllm_dcp_fine_prefix_hits",
         "_patch_vllm_mamba_split_scheduler_block_size",
