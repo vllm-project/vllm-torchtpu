@@ -33,6 +33,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import tight_vmem
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 
 _UINT_BY_BITS = {16: jnp.uint16, 8: jnp.uint8}
@@ -370,7 +371,7 @@ def write_runs(
     vmem_bytes += 2 * sum(_DEPTH * c[0].size * c.dtype.itemsize for c in caches)
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
     first_cache = 5 + len(inputs)
-    return pl.pallas_call(
+    return tight_vmem.pallas_call(
         functools.partial(
             _kernel,
             specs=tuple(specs),

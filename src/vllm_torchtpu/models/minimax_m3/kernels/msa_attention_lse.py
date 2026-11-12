@@ -29,6 +29,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import tight_vmem
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 
@@ -863,7 +864,7 @@ def _attention_call(
         ],
     )
     num_inputs = 4 + 5 + len(scale_inputs)
-    return pl.pallas_call(
+    return tight_vmem.pallas_call(
         functools.partial(
             kernel,
             sm_scale=sm_scale,

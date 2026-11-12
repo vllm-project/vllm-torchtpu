@@ -47,6 +47,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import tight_vmem
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_attention,
@@ -365,7 +366,7 @@ def local_candidates(
         pos_spec = pl.BlockSpec((block_rows, 1), lambda i: (i, 0))
         out_spec = pl.BlockSpec((block_rows, topk), lambda i: (i, 0))
         out_dims = (num_tokens + pad, topk)
-    picked_scores, picked_blocks = pl.pallas_call(
+    picked_scores, picked_blocks = tight_vmem.pallas_call(
         functools.partial(
             kernel,
             block_size=block_size,
