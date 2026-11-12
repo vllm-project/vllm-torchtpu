@@ -950,17 +950,20 @@ def synthetic_sample_rows_and_assemble(
     from vllm.distributed import tensor_model_parallel_all_gather
 
     per_rank = logit_rows.shape[0]
-    rows = (
-        rank.to(torch.int64) * per_rank
-        + torch.arange(per_rank, dtype=torch.int64, device=logit_rows.device)
-    ).view(-1)
+
+    def rows(x: torch.Tensor) -> torch.Tensor:
+        # One block index, so a slice of the block rather than a row gather
+        # (which read all of `recover_u [rows, vocab]`, ~27 us at 64 rows).
+        blocks = x.reshape(-1, per_rank, *x.shape[1:])
+        return blocks.index_select(0, rank.view(-1)).view(per_rank, *x.shape[1:])
+
     sampled_rows = _recover_tokens(
         logit_rows,
-        recover_draft[rows],
-        temperatures[rows],
-        top_k[rows],
-        top_p[rows],
-        recover_u[rows],
+        rows(recover_draft),
+        rows(temperatures),
+        rows(top_k),
+        rows(top_p),
+        rows(recover_u),
         topk_candidates,
         apply_topk_topp,
         None,
