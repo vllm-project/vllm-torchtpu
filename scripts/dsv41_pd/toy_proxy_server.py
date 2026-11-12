@@ -536,6 +536,11 @@ async def send_request_to_prefill(
     # Must overwrite these for prefill workers.
     req_data["stream"] = False
     req_data["max_tokens"] = 1
+    if _REUSE_PROMPT_IDS and "messages" in req_data:
+        # Have P return the ids it rendered, so the decode hop reuses them
+        # (kv_transfer_params["prompt_token_ids"]) instead of templating and
+        # tokenizing the conversation again on the TTFT path.
+        req_data["return_token_ids"] = True
     if "max_completion_tokens" in req_data:
         req_data["max_completion_tokens"] = 1
     if "stream_options" in req_data:
@@ -684,6 +689,12 @@ def _align_join() -> _AlignGroup:
 # both hops. Prefix caches are per DP rank, and a multi-turn conversation only
 # appends to its messages, so every turn of one conversation lands on the rank
 # that already holds its prefix (agentic replay: P hit rate 26% -> see notes).
+# PROXY_REUSE_PROMPT_IDS=1 (default): for chat requests, the decode hop reuses
+# the prompt token ids the prefill hop rendered (vLLM decode-side token reuse
+# via kv_transfer_params["prompt_token_ids"]) instead of re-rendering; one
+# ~130k-token conversation costs ~0.35 s to template and tokenize per hop.
+_REUSE_PROMPT_IDS = os.environ.get("PROXY_REUSE_PROMPT_IDS", "1") != "0"
+
 _SESSION_AFFINITY_DP = int(os.environ.get("PROXY_SESSION_AFFINITY_DP", "0"))
 
 
@@ -904,6 +915,9 @@ async def _handle_completions(api: str, request: Request):
         )
 
         if kv_transfer_params:
+            prompt_ids = response_json.get("prompt_token_ids")
+            if _REUSE_PROMPT_IDS and "messages" in req_data and prompt_ids:
+                kv_transfer_params = {**kv_transfer_params, "prompt_token_ids": prompt_ids}
             req_data["kv_transfer_params"] = kv_transfer_params
 
         # Get the next decode client in round-robin fashion
