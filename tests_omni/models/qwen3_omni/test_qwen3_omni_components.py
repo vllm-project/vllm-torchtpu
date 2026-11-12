@@ -171,13 +171,19 @@ def encoders(
 
 @pytest.mark.xfail(
     strict=True,
-    raises=RuntimeError,
+    raises=AssertionError,
     reason="vLLM-Omni 0.32.0rc1 takes ceil(feature_lens / 100) on the device, "
     "which TPU rounds up to 9 windows for 800 frames; the split then fails",
 )
 def test_upstream_forward_miscounts_exact_window_multiples(encoders) -> None:
     tpu, _, upstream_forward = encoders
-    out = _encode(tpu, 800, forward=upstream_forward)
+    try:
+        out = _encode(tpu, 800, forward=upstream_forward)
+    except RuntimeError as exc:
+        assert "split_with_sizes expects split_sizes to sum exactly to 800" not in str(
+            exc
+        ), str(exc)
+        raise
     assert out.shape[0] == int(_get_feat_extract_output_lengths(800))
 
 
