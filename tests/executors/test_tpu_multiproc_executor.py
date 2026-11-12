@@ -245,8 +245,8 @@ def test_adopts_the_count_workers_set_after_the_profile_run(kind):
     executor must copy it after determine_available_memory."""
     executor, parent = _executor_and_parent(kind, None, [5310, 5312])
 
-    with patch.object(parent, "determine_available_memory", return_value=[1 << 30]):
-        assert executor.determine_available_memory() == [1 << 30]
+    with patch.object(parent, "determine_available_memory", return_value=[1 << 30] * 2):
+        assert executor.determine_available_memory() == [1 << 30] * 2
 
     executor.collective_rpc.assert_called_once_with("get_num_gpu_blocks_override")
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 5310
@@ -258,8 +258,79 @@ def test_engine_override_is_kept_after_the_profile_run(kind):
     in get_kv_cache_specs) is not queried again."""
     executor, parent = _executor_and_parent(kind, 1234, [5310, 5312])
 
-    with patch.object(parent, "determine_available_memory", return_value=[1 << 30]):
+    with patch.object(parent, "determine_available_memory", return_value=[1 << 30] * 2):
         executor.determine_available_memory()
 
     executor.collective_rpc.assert_not_called()
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 1234
+
+
+_GIB = 1 << 30
+_OBSERVED = [49883] * 7 + [49420]
+
+
+@pytest.mark.parametrize("kind", ["multiproc", "ray_v2"])
+@pytest.mark.parametrize(
+    "parallel_precompile, peer_replay", [("0", "0"), ("1", "1"), ("0", "1")]
+)
+def test_a_compile_residue_within_the_byte_tolerance_is_adopted(
+    kind, parallel_precompile, peer_replay, monkeypatch
+):
+    """The rank that compiled the profile bucket measured 0.68 GiB less than
+    its 7 peers: 463 fewer blocks, past the 0.5% block tolerance (247), but
+    a budget spread inside 1 GiB. Every executor pins its count, whatever
+    the precompile flags, since the state of the caches decides which ranks
+    compile."""
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", parallel_precompile)
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", peer_replay)
+    executor, parent = _executor_and_parent(kind, None, _OBSERVED)
+    budgets = [60 * _GIB] * 7 + [60 * _GIB - int(0.68 * _GIB)]
+
+    with patch.object(parent, "determine_available_memory", return_value=budgets):
+        assert executor.determine_available_memory() == budgets
+
+    executor.collective_rpc.assert_called_once_with("get_num_gpu_blocks_override")
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 49420
+
+
+@pytest.mark.parametrize("kind", ["multiproc", "ray_v2"])
+def test_a_budget_spread_past_the_byte_tolerance_fails(kind, monkeypatch):
+    """A worker 2 GiB short, e.g. sharing its chip with a leftover process,
+    still fails start-up. Without peer replay the error does not suggest
+    turning it off."""
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "0")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "0")
+    executor, parent = _executor_and_parent(kind, None, _OBSERVED)
+    budgets = [60 * _GIB] * 7 + [58 * _GIB]
+
+    with (
+        patch.object(parent, "determine_available_memory", return_value=budgets),
+        pytest.raises(ValueError, match="workers disagree") as exc,
+    ):
+        executor.determine_available_memory()
+
+    assert "TPU_PRECOMPILE_PEER_REPLAY" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "parallel_precompile, peer_replay, hint",
+    [("1", "1", True), ("0", "1", False), ("1", "0", False)],
+)
+def test_peer_replay_hint_needs_both_precompile_flags(
+    parallel_precompile, peer_replay, hint, monkeypatch
+):
+    """Only TPU_PARALLEL_PRECOMPILE installs the owner/waiter split that peer
+    replay relies on, so the TPU_PRECOMPILE_PEER_REPLAY=0 workaround is named
+    only with both flags on."""
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", parallel_precompile)
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", peer_replay)
+    executor, parent = _executor_and_parent("multiproc", None, _OBSERVED)
+    budgets = [60 * _GIB] * 7 + [58 * _GIB]
+
+    with (
+        patch.object(parent, "determine_available_memory", return_value=budgets),
+        pytest.raises(ValueError, match="workers disagree") as exc,
+    ):
+        executor.determine_available_memory()
+
+    assert ("TPU_PRECOMPILE_PEER_REPLAY=0" in str(exc.value)) is hint

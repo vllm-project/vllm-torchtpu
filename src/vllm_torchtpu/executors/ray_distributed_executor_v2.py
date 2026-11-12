@@ -745,7 +745,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
     def determine_available_memory(self) -> list[int]:
         available = super().determine_available_memory()
-        adopt_worker_num_gpu_blocks_override(self)
+        adopt_worker_num_gpu_blocks_override(self, available)
         return available
 
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
