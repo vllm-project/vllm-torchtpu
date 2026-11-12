@@ -190,6 +190,8 @@ if TYPE_CHECKING:
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
     TPU_SMALL_ALL_REDUCE: bool = False
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
+    TPU_FUSED_OPROJ_AR: bool = False
+    TPU_FUSED_OPROJ_AR_WAVES: bool = True
     SPEC_WARMUP: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
@@ -1294,6 +1296,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
         "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
     ),
+    # With TPU_SMALL_ALL_REDUCE and TPU_FP8_LINEAR_PALLAS: attention's o_proj at
+    # decode (at most 16 rows) runs its FP8 matmul and its TP all-reduce as one
+    # Pallas kernel, so the all-reduce barrier hides under the weight stream.
+    # Bitwise the two-call path.
+    "TPU_FUSED_OPROJ_AR": env_bool("TPU_FUSED_OPROJ_AR"),
+    # With TPU_FUSED_OPROJ_AR: push each reduce-scatter chunk once the weight tile
+    # holding its last column is done. 0 pushes every chunk after the last tile.
+    "TPU_FUSED_OPROJ_AR_WAVES": env_bool("TPU_FUSED_OPROJ_AR_WAVES", True),
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),

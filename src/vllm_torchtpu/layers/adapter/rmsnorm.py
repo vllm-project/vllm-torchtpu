@@ -33,7 +33,11 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import fused_add_rmsnorm as kernel
-from vllm_torchtpu.layers.adapter.linear_common import PREQUANT_ATTR, PrequantSlot
+from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_WEIGHT,
+    PREQUANT_ATTR,
+    PrequantSlot,
+)
 
 _ops: dict[tuple[float, bool], object] = {}
 _ops_lock = Lock()
@@ -135,6 +139,10 @@ def _pair(norm, linear, emit_y: bool) -> bool:
     if not isinstance(norm, TpuRMSNorm) or not norm._pallas_ok:
         return False
     if not _per_channel_fp8_linear(linear):
+        return False
+    if getattr(linear, FP8_PALLAS_WEIGHT, None) is not None:
+        # Its unpaired path lifts the padded kernel copy, the paired one would
+        # not: the two sides of the rows branch must lift the same buffers.
         return False
     if linear.quant_method.w8a16_max_rows >= norm._min_rows:
         # Buckets the norm's Pallas path takes would run the linear as W8A16

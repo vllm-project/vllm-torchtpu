@@ -60,6 +60,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
+from vllm_torchtpu.layers.adapter import small_all_reduce_op
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
@@ -1370,6 +1371,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             attn_out *= self.g_proj(hidden_states)[0].sigmoid()
         if prefill_group is not None:
             return prefill_group.project_reduce_scatter(attn_out, self.o_proj)
+        if envs.TPU_FUSED_OPROJ_AR:
+            return small_all_reduce_op.row_parallel_or(attn_out, self.o_proj)
         return self.o_proj(attn_out)[0]
 
 
