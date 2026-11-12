@@ -1,7 +1,22 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from unittest.mock import MagicMock, patch
 
-from vllm_torchtpu.tracing.annotation import (TraceAnnotation,
-                                              is_trace_annotation_enabled)
+from vllm_torchtpu.tracing.annotation import (
+    TraceAnnotation,
+    is_trace_annotation_enabled,
+)
 
 
 @patch("torch.autograd._profiler_enabled", return_value=False)
@@ -36,14 +51,11 @@ def test_trace_annotation_enabled_with_kwargs(mock_profiler_enabled):
         mock_context = MagicMock()
         mock_rf.return_value = mock_context
 
-        with TraceAnnotation("ModelForward",
-                             num_reqs=2,
-                             request_id1="cmpl-xyz"):
+        with TraceAnnotation("ModelForward", num_reqs=2, request_id1="cmpl-xyz"):
             pass
 
         # Verify the context properly appends the delimiter hash tags
-        mock_rf.assert_called_once_with(
-            "ModelForward#num_reqs=2,request_id1=cmpl-xyz#")
+        mock_rf.assert_called_once_with("ModelForward#num_reqs=2,request_id1=cmpl-xyz#")
 
 
 @patch("torch.autograd._profiler_enabled", return_value=True)
@@ -57,7 +69,7 @@ def test_trace_annotation_with_batch_composition(mock_profiler_enabled):
             "num_prefill_tokens": 1024,
             "num_decode_tokens": 128,
             "phase": "PREFILL_HEAVY",
-            "batch_id": 42
+            "batch_id": 42,
         }
         with TraceAnnotation("ModelForward", num_reqs=8, **trace_kwargs):
             pass

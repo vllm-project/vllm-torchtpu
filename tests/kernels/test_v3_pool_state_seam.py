@@ -1,106 +1,70 @@
-"""GDN V3 pooled state seam: plan math, byte compatibility, equivalence.
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""GDN V3 pooled state seam: byte compatibility and equivalence.
 
-`TestV3StateSourcePlan` and the source-hygiene test are pure Python/CPU.
-The remaining classes execute Pallas kernels and run on TPU (same gating
-as test_pool_adapters.py).
+The source-hygiene test is pure Python/CPU. The remaining classes execute
+Pallas kernels and run on TPU (same gating as test_pool_adapters.py).
 """
+
+import functools
 import pathlib
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from kernels.gdn.v3.gdn_pool_state_utils import (
+    GRANULE,
+    WORDS_PER_GRANULE,
+    on_cpu,
+    pack_bf16_rows,
+    put_words,
+    read_states,
+    state_words,
+    unpack_bf16_rows,
+    words_to_pool,
+    write_states,
+)
 
-from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
 
 # 35B-like slice: manager block = 3 kernel blocks; ssm = 2 whole kernel
-# blocks (one contiguous 512 KB DMA per slot); conv = 16 token rows at
-# the start of the third kernel block.
+# blocks (one contiguous 512 KB DMA per slot); the fp32 conv state starts
+# the third kernel block.
 N_KQ, N_V, D_K, D_V = 2, 8, 128, 128
 KERNEL_SIZE = 4
 DIM = N_KQ * D_K * 2 + N_V * D_V  # 1536
 SPLIT, KBS, LANES = 3, 256, 256
 PAYLOAD = (1, 2)
 TOK_BYTES = 2 * LANES * 2  # bf16 pool
-SSM_NTOK = N_V * D_K * D_V * 4 // TOK_BYTES  # 512
-CONV_TOK0 = SSM_NTOK
-CONV_NTOK = 16
-CONV_ROWS = (KERNEL_SIZE - 1) * DIM // LANES  # 18
-CONV_SLOT_ROWS = CONV_NTOK * TOK_BYTES // (2 * LANES)  # 32
 NUM_MGR = 5  # null block + 4 slots
-POOL_SHAPE = (NUM_MGR * SPLIT, KBS) + PAYLOAD + (LANES, )
 
-
-def _plan(pool=None, **overrides):
-    if pool is None:
-        pool = jax.ShapeDtypeStruct(POOL_SHAPE, jnp.bfloat16)
-    kwargs = dict(split=SPLIT,
-                  ssm_ntok=SSM_NTOK,
-                  conv_tok0=CONV_TOK0,
-                  conv_ntok=CONV_NTOK,
-                  conv_dim=DIM,
-                  n_v=N_V,
-                  d_k=D_K,
-                  d_v=D_V,
-                  kernel_size=KERNEL_SIZE)
-    kwargs.update(overrides)
-    return pool_adapters.v3_state_source(pool, **kwargs)
-
-
-class TestV3StateSourcePlan:
-    """Plan-construction math only; runs on CPU."""
-
-    def test_ssm_region_one_contiguous_whole_block_window(self):
-        r = _plan().recurrent
-        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 2, 0, KBS)
-        assert r.view_dtype == jnp.dtype(jnp.float32)
-        assert r.lane_split == LANES // D_V
-        assert r.rows_used == N_V * D_K
-
-    def test_conv_region_rows_of_last_kernel_block(self):
-        plan = _plan()
-        c = plan.conv
-        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (2, 1, 0, CONV_NTOK)
-        assert c.view_dtype == jnp.dtype(jnp.bfloat16)
-        assert c.lane_split == 1
-        assert c.rows_used == CONV_ROWS
-        assert plan.stride == SPLIT
-        assert plan.whole_block_dma is False
-
-    def test_plan_is_static_hashable_and_stable(self):
-        assert _plan() == _plan()
-        assert hash(_plan()) == hash(_plan())
-
-    def test_subblock_regions_when_pool_is_manager_grained(self):
-        pool = jax.ShapeDtypeStruct(
-            (NUM_MGR, SPLIT * KBS) + PAYLOAD + (LANES, ), jnp.bfloat16)
-        plan = _plan(pool, split=1)
-        r = plan.recurrent
-        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 1, 0, SSM_NTOK)
-        c = plan.conv
-        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (0, 1, CONV_TOK0,
-                                                       CONV_NTOK)
-        assert plan.stride == 1
-
-    def test_one_byte_pool_keeps_regions_and_view_dtypes(self):
-        pool = jax.ShapeDtypeStruct((NUM_MGR * SPLIT, KBS, 1, 4, LANES),
-                                    jnp.int8)
-        plan = _plan(pool)
-        assert plan.recurrent.nblocks == 2
-        assert plan.recurrent.view_dtype == jnp.dtype(jnp.float32)
-        assert plan.conv.view_dtype == jnp.dtype(jnp.bfloat16)
-
-    def test_conv_region_straddling_kernel_blocks_rejected(self):
-        with pytest.raises(NotImplementedError):
-            _plan(conv_tok0=KBS - 8)
+# Granule extent of the conv region. The kernel is not told it -- it rederives
+# the conv region's start from the pool's own geometry -- so this exists for
+# the tests to place and read bytes with. The region is a plain byte range, so
+# its extent follows from the state dtype alone.
+CONV_GRANULES = (KERNEL_SIZE - 1) * DIM * 4 // GRANULE  # 36
+# Pool tokens the conv region covers, from the start of its kernel block.
+CONV_END_TOK = CONV_GRANULES * GRANULE // TOK_BYTES  # 18
 
 
 def test_v3_kernel_package_stays_pool_agnostic():
-    """The dense path must be byte-for-byte untouched by the seam: the V3
-    kernel package sees only the generic state-source plan, never the
-    pool (pool knowledge lives in pool_adapters / the pooled caller)."""
+    """The V3 kernel package addresses state by granule offset only and
+    never imports the pool adapters (pool knowledge lives in the pooled
+    caller)."""
     import vllm_torchtpu.kernels.gdn.v3 as v3_pkg
+
     for path in pathlib.Path(list(v3_pkg.__path__)[0]).glob("*.py"):
         assert "pool_adapters" not in path.read_text(), path
 
@@ -114,48 +78,21 @@ def test_v3_kernel_package_stays_pool_agnostic():
 
 def _garbage_pool(seed, num_mgr: int = NUM_MGR):
     rng = np.random.default_rng(seed)
-    shape = (num_mgr * SPLIT, KBS) + PAYLOAD + (LANES, )
+    shape = (num_mgr * SPLIT, KBS) + PAYLOAD + (LANES,)
     return jnp.asarray(rng.standard_normal(shape), dtype=jnp.bfloat16)
 
 
-def _write_states(pool, ssm, conv, idx):
-    """Adapter-convention write of both regions (the byte layout the seam
-    must reproduce exactly)."""
-    n = idx.shape[0]
-    pool = pool_adapters.scatter_region(pool,
-                                        ssm.astype(jnp.float32).reshape(
-                                            n, N_V * D_K, D_V),
-                                        idx,
-                                        tok0=0,
-                                        ntok=SSM_NTOK,
-                                        split=SPLIT)
-    rows = conv.astype(jnp.bfloat16).reshape(n, CONV_ROWS, LANES)
-    rows = jnp.pad(rows, ((0, 0), (0, CONV_SLOT_ROWS - CONV_ROWS), (0, 0)))
-    return pool_adapters.scatter_region(pool,
-                                        rows,
-                                        idx,
-                                        tok0=CONV_TOK0,
-                                        ntok=CONV_NTOK,
-                                        split=SPLIT)
+_STATE_SHAPES = dict(recurrent_shape=(N_V, D_K, D_V), conv_shape=(KERNEL_SIZE - 1, DIM))
 
 
-def _read_states(pool, idx):
-    n = idx.shape[0]
-    ssm = pool_adapters.gather_region(pool,
-                                      idx,
-                                      tok0=0,
-                                      ntok=SSM_NTOK,
-                                      split=SPLIT,
-                                      out_dtype=jnp.float32,
-                                      out_lanes=D_V).reshape(n, N_V, D_K, D_V)
-    conv = pool_adapters.gather_region(pool,
-                                       idx,
-                                       tok0=CONV_TOK0,
-                                       ntok=CONV_NTOK,
-                                       split=SPLIT,
-                                       out_dtype=jnp.bfloat16)
-    conv = conv[:, :CONV_ROWS, :].reshape(n, KERNEL_SIZE - 1, DIM)
-    return ssm, conv
+def _write_states(pool, ssm, conv, idx, split=SPLIT, ssm_dtype=jnp.float32):
+    return write_states(pool, ssm, conv, idx, split=split, recurrent_dtype=ssm_dtype)
+
+
+def _read_states(pool, idx, split=SPLIT, ssm_dtype=jnp.float32):
+    return read_states(
+        pool, idx, split=split, recurrent_dtype=ssm_dtype, **_STATE_SHAPES
+    )
 
 
 def _rand_inputs(seed, num_tokens):
@@ -165,9 +102,9 @@ def _rand_inputs(seed, num_tokens):
         b=jax.random.normal(next(rngs), (num_tokens, N_V)),
         a=jax.random.normal(next(rngs), (num_tokens, N_V)),
         conv_weight=jax.random.normal(next(rngs), (DIM, 1, KERNEL_SIZE)),
-        conv_bias=jax.random.normal(next(rngs), (DIM, )),
-        a_log=jax.random.normal(next(rngs), (N_V, )),
-        dt_bias=jax.random.normal(next(rngs), (N_V, )),
+        conv_bias=jax.random.normal(next(rngs), (DIM,)),
+        a_log=jax.random.normal(next(rngs), (N_V,)),
+        dt_bias=jax.random.normal(next(rngs), (N_V,)),
         n_kq=N_KQ,
         n_v=N_V,
         d_k=D_K,
@@ -180,24 +117,34 @@ def _run_roundtrip(pool, idx, kwargs):
     """The pre-seam pooled V3 path."""
     ssm, conv = _read_states(pool, idx)
     identity = jnp.arange(idx.shape[0], dtype=jnp.int32)
-    (new_conv, new_ssm), out = wrapper.fused_conv1d_gdn(conv_state=conv,
-                                                        recurrent_state=ssm,
-                                                        state_indices=identity,
-                                                        **kwargs)
+    (new_conv, new_ssm), out = wrapper.fused_conv1d_gdn(
+        states=(conv, ssm), state_indices=identity, **kwargs
+    )
     return _write_states(pool, new_ssm, new_conv, idx), out
 
 
-def _run_seam(pool, idx, kwargs):
-    return wrapper.fused_conv1d_gdn(conv_state=None,
-                                    recurrent_state=None,
-                                    state_indices=idx,
-                                    state_source=pool,
-                                    state_plan=_plan(pool),
-                                    **kwargs)
+def _merge(pool, split=SPLIT):
+    """Kernel blocks -> manager blocks, as the pooled caller does."""
+    return pool.reshape(pool.shape[0] // split, split * pool.shape[1], *pool.shape[2:])
 
 
+def _split(pool, shape):
+    return pool.reshape(shape)
+
+
+def _run_seam(pool, idx, kwargs, split=SPLIT):
+    out_pool, out = wrapper.fused_conv1d_gdn(
+        states=_merge(pool, split),
+        state_indices=idx,
+        conv_dtype=jnp.float32,
+        recurrent_dtype=jnp.float32,
+        **kwargs,
+    )
+    return _split(out_pool, pool.shape), out
+
+
+@pytest.mark.tpu_test
 class TestSeamMatchesRoundTrip:
-
     def _compare(self, pool, idx, kwargs):
         pool_rt, out_rt = _run_roundtrip(jnp.copy(pool), idx, kwargs)
         pool_seam, out_seam = _run_seam(jnp.copy(pool), idx, kwargs)
@@ -206,42 +153,45 @@ class TestSeamMatchesRoundTrip:
         # f32 accumulations reassociate: outputs and states agree to a
         # couple of bf16 ulps (operand precision), not bitwise.
         tol = dict(rtol=1e-2, atol=1e-2)
-        np.testing.assert_allclose(np.asarray(out_seam), np.asarray(out_rt),
-                                   **tol)
+        np.testing.assert_allclose(np.asarray(out_seam), np.asarray(out_rt), **tol)
         ssm_rt, conv_rt = _read_states(pool_rt, idx)
         ssm_seam, conv_seam = _read_states(pool_seam, idx)
-        np.testing.assert_allclose(np.asarray(ssm_seam), np.asarray(ssm_rt),
-                                   **tol)
-        np.testing.assert_allclose(np.asarray(conv_seam, dtype=np.float32),
-                                   np.asarray(conv_rt, dtype=np.float32),
-                                   rtol=2e-2,
-                                   atol=2e-2)
+        np.testing.assert_allclose(np.asarray(ssm_seam), np.asarray(ssm_rt), **tol)
+        np.testing.assert_allclose(
+            np.asarray(conv_seam, dtype=np.float32),
+            np.asarray(conv_rt, dtype=np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
         # Blocks neither path addresses must stay byte-identical; the
         # addressed windows are covered by the logical compares above and
-        # the write-layout tests (seam bytes == scatter_region bytes for
+        # the write-layout tests (seam bytes == granule-offset bytes for
         # identical values).
         touched = set()
         for mgr in np.asarray(idx):
             touched.update(range(int(mgr) * SPLIT, int(mgr) * SPLIT + SPLIT))
         for kb in range(pool_seam.shape[0]):
             if kb not in touched:
-                assert jnp.array_equal(pool_seam[kb].view(jnp.int16),
-                                       pool_rt[kb].view(jnp.int16)), kb
+                assert jnp.array_equal(
+                    pool_seam[kb].view(jnp.int16), pool_rt[kb].view(jnp.int16)
+                ), kb
 
     def test_decode_continuation(self):
         n = 4
         idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
         keys = iter(jax.random.split(jax.random.key(10), 2))
         pool = _write_states(
-            _garbage_pool(0), jax.random.normal(next(keys),
-                                                (n, N_V, D_K, D_V)),
-            jax.random.normal(next(keys),
-                              (n, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16),
-            idx)
+            _garbage_pool(0),
+            jax.random.normal(next(keys), (n, N_V, D_K, D_V)),
+            jax.random.normal(next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(
+                jnp.bfloat16
+            ),
+            idx,
+        )
         kwargs = _rand_inputs(1, n) | dict(
             query_start_loc=jnp.arange(n + 1),
             distribution=jnp.array([n, n, n], dtype=jnp.int32),
-            seq_lens=jnp.full((n, ), 9, dtype=jnp.int32),
+            seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
         )
         self._compare(pool, idx, kwargs)
 
@@ -264,49 +214,51 @@ class TestSeamMatchesRoundTrip:
         # block across slots would let one sequence's write clobber
         # another's, which is a property of the addressing, not the kernel.
         ckpt_blocks = jnp.asarray(
-            np.array([[1, 3, 5, 7], [8, 6, 4, 2]], dtype=np.int32))
+            np.array([[1, 3, 5, 7], [8, 6, 4, 2]], dtype=np.int32)
+        )
         num_mgr = 9
         keys = iter(jax.random.split(jax.random.key(77), 2 * window))
         states = []
         pool = _garbage_pool(11, num_mgr)
         for t in range(window):
             ssm_t = jax.random.normal(next(keys), (n, N_V, D_K, D_V))
-            conv_t = jax.random.normal(
-                next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16)
+            conv_t = jax.random.normal(next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(
+                jnp.bfloat16
+            )
             states.append((ssm_t, conv_t))
             pool = _write_states(pool, ssm_t, conv_t, ckpt_blocks[:, t])
 
         kwargs = _rand_inputs(12, n) | dict(
             query_start_loc=jnp.arange(n + 1),
             distribution=jnp.array([n, n, n], dtype=jnp.int32),
-            seq_lens=jnp.full((n, ), 9, dtype=jnp.int32),
+            seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
         )
 
         def _run(src, read_ckpt):
-            return wrapper.fused_conv1d_gdn(conv_state=None,
-                                            recurrent_state=None,
-                                            state_indices=jnp.zeros(
-                                                (n, ), dtype=jnp.int32),
-                                            state_source=jnp.copy(src),
-                                            state_plan=_plan(src),
-                                            read_offsets=jnp.full(
-                                                (n, ),
-                                                read_ckpt,
-                                                dtype=jnp.int32),
-                                            ckpt_indices=ckpt_blocks,
-                                            num_spec_tokens=num_spec,
-                                            **kwargs)[1]
+            return wrapper.fused_conv1d_gdn(
+                states=_merge(jnp.copy(src)),
+                state_indices=jnp.zeros((n,), dtype=jnp.int32),
+                conv_dtype=jnp.float32,
+                recurrent_dtype=jnp.float32,
+                read_offsets=jnp.full((n,), read_ckpt, dtype=jnp.int32),
+                ckpt_indices=ckpt_blocks,
+                num_spec_tokens=num_spec,
+                **kwargs,
+            )[1]
 
         for r in range(window):
             ssm_r, conv_r = states[r]
             # Same states, but the one the offset names now sits at column 0.
-            at_col0 = _write_states(_garbage_pool(11, num_mgr), ssm_r, conv_r,
-                                    ckpt_blocks[:, 0])
-            np.testing.assert_allclose(np.asarray(_run(pool, r)),
-                                       np.asarray(_run(at_col0, 0)),
-                                       rtol=1e-6,
-                                       atol=1e-6,
-                                       err_msg=f"checkpoint {r}")
+            at_col0 = _write_states(
+                _garbage_pool(11, num_mgr), ssm_r, conv_r, ckpt_blocks[:, 0]
+            )
+            np.testing.assert_allclose(
+                np.asarray(_run(pool, r)),
+                np.asarray(_run(at_col0, 0)),
+                rtol=1e-6,
+                atol=1e-6,
+                err_msg=f"checkpoint {r}",
+            )
 
     def test_per_ckpt_writes_only_touch_named_blocks(self):
         """Checkpoint `t` is written to `ckpt_indices[:, t]`; nothing else
@@ -319,26 +271,23 @@ class TestSeamMatchesRoundTrip:
         kwargs = _rand_inputs(14, n * window) | dict(
             query_start_loc=jnp.arange(0, n * window + 1, window),
             distribution=jnp.array([n, n, n], dtype=jnp.int32),
-            seq_lens=jnp.full((n, ), 9, dtype=jnp.int32),
+            seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
         )
         before = np.asarray(pool.view(jnp.int16))
         out_pool, _ = wrapper.fused_conv1d_gdn(
-            conv_state=None,
-            recurrent_state=None,
-            state_indices=jnp.zeros((n, ), dtype=jnp.int32),
-            state_source=jnp.copy(pool),
-            state_plan=_plan(pool),
-            read_offsets=jnp.zeros((n, ), dtype=jnp.int32),
+            states=_merge(jnp.copy(pool)),
+            state_indices=jnp.zeros((n,), dtype=jnp.int32),
+            conv_dtype=jnp.float32,
+            recurrent_dtype=jnp.float32,
+            read_offsets=jnp.zeros((n,), dtype=jnp.int32),
             ckpt_indices=jnp.asarray(ckpt_blocks),
             num_spec_tokens=num_spec,
-            **kwargs)
+            **kwargs,
+        )
+        out_pool = _split(out_pool, pool.shape)
 
         named = set(int(m) for m in ckpt_blocks.reshape(-1))
-        touched_kb = {
-            kb
-            for m in named
-            for kb in range(m * SPLIT, m * SPLIT + SPLIT)
-        }
+        touched_kb = {kb for m in named for kb in range(m * SPLIT, m * SPLIT + SPLIT)}
         after = np.asarray(out_pool.view(jnp.int16))
         changed = {
             kb
@@ -361,11 +310,13 @@ class TestSeamMatchesRoundTrip:
         idx = jnp.array([1, 3], dtype=jnp.int32)
         keys = iter(jax.random.split(jax.random.key(11), 2))
         pool = _write_states(
-            _garbage_pool(4), jax.random.normal(next(keys),
-                                                (2, N_V, D_K, D_V)),
-            jax.random.normal(next(keys),
-                              (2, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16),
-            idx)
+            _garbage_pool(4),
+            jax.random.normal(next(keys), (2, N_V, D_K, D_V)),
+            jax.random.normal(next(keys), (2, KERNEL_SIZE - 1, DIM)).astype(
+                jnp.bfloat16
+            ),
+            idx,
+        )
         kwargs = _rand_inputs(5, 112) | dict(
             query_start_loc=jnp.array([0, 64, 112]),
             distribution=jnp.array([0, 2, 2], dtype=jnp.int32),
@@ -378,11 +329,13 @@ class TestSeamMatchesRoundTrip:
         keys = iter(jax.random.split(jax.random.key(12), 2))
         decode_idx = idx[:2]
         pool = _write_states(
-            _garbage_pool(6), jax.random.normal(next(keys),
-                                                (2, N_V, D_K, D_V)),
-            jax.random.normal(next(keys),
-                              (2, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16),
-            decode_idx)
+            _garbage_pool(6),
+            jax.random.normal(next(keys), (2, N_V, D_K, D_V)),
+            jax.random.normal(next(keys), (2, KERNEL_SIZE - 1, DIM)).astype(
+                jnp.bfloat16
+            ),
+            decode_idx,
+        )
         kwargs = _rand_inputs(7, 130) | dict(
             query_start_loc=jnp.array([0, 1, 2, 66, 130]),
             distribution=jnp.array([2, 4, 4], dtype=jnp.int32),
@@ -391,19 +344,21 @@ class TestSeamMatchesRoundTrip:
         self._compare(pool, idx, kwargs)
 
 
+@pytest.mark.tpu_test
 class TestSeamSkipsInvalidSlots:
-
     def test_padded_slots_and_null_block_untouched(self):
         # 2 active decodes on manager blocks 2 and 4; rows 2..3 padded to
         # the null block. Only the active windows' state regions may move.
         idx = jnp.array([2, 4, 0, 0], dtype=jnp.int32)
         keys = iter(jax.random.split(jax.random.key(13), 2))
         pool = _write_states(
-            _garbage_pool(8), jax.random.normal(next(keys),
-                                                (2, N_V, D_K, D_V)),
-            jax.random.normal(next(keys),
-                              (2, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16),
-            idx[:2])
+            _garbage_pool(8),
+            jax.random.normal(next(keys), (2, N_V, D_K, D_V)),
+            jax.random.normal(next(keys), (2, KERNEL_SIZE - 1, DIM)).astype(
+                jnp.bfloat16
+            ),
+            idx[:2],
+        )
         before = jnp.copy(pool)
         kwargs = _rand_inputs(9, 2) | dict(
             query_start_loc=jnp.array([0, 1, 2, 2, 2]),
@@ -420,34 +375,17 @@ class TestSeamSkipsInvalidSlots:
             assert jnp.array_equal(b16(after[kb]), b16(before[kb])), kb
         for mgr in (2, 4):
             # ssm blocks written...
-            assert not jnp.array_equal(b16(after[mgr * SPLIT]),
-                                       b16(before[mgr * SPLIT])), mgr
+            assert not jnp.array_equal(
+                b16(after[mgr * SPLIT]), b16(before[mgr * SPLIT])
+            ), mgr
             # ...and the conv block's rows outside the conv region kept.
             conv_kb = mgr * SPLIT + 2
-            assert jnp.array_equal(b16(after[conv_kb, CONV_NTOK:]),
-                                   b16(before[conv_kb, CONV_NTOK:])), mgr
+            assert jnp.array_equal(
+                b16(after[conv_kb, CONV_END_TOK:]), b16(before[conv_kb, CONV_END_TOK:])
+            ), mgr
 
 
-def _write_states_split(pool, ssm, conv, idx, split):
-    """`_write_states` on an arbitrary-split pool (checkpoint 0's layout)."""
-    n = idx.shape[0]
-    pool = pool_adapters.scatter_region(pool,
-                                        ssm.astype(jnp.float32).reshape(
-                                            n, N_V * D_K, D_V),
-                                        idx,
-                                        tok0=0,
-                                        ntok=SSM_NTOK,
-                                        split=split)
-    rows = conv.astype(jnp.bfloat16).reshape(n, CONV_ROWS, LANES)
-    rows = jnp.pad(rows, ((0, 0), (0, CONV_SLOT_ROWS - CONV_ROWS), (0, 0)))
-    return pool_adapters.scatter_region(pool,
-                                        rows,
-                                        idx,
-                                        tok0=CONV_TOK0,
-                                        ntok=CONV_NTOK,
-                                        split=split)
-
-
+@pytest.mark.tpu_test
 class TestPooledSpecWindows:
     """Speculative verify windows on the pooled path.
 
@@ -457,6 +395,8 @@ class TestPooledSpecWindows:
     on compact slot groups, fed byte-equal initial states: matching outputs
     across multi-step schedules prove the pooled DMA wrote each window
     position's checkpoint to the block the next step's read offset names.
+    Runs with fp32 and bf16 SSM state; bf16 SSM with verify windows is the
+    MTP serving configuration.
     """
 
     NUM_SPEC = 1
@@ -464,9 +404,11 @@ class TestPooledSpecWindows:
     N = 3
 
     def _pool(self, split):
-        shape = ((NUM_MGR * self.WINDOW * split, KBS) + PAYLOAD +
-                 (LANES, ) if split > 1 else
-                 (NUM_MGR * self.WINDOW, 1280) + PAYLOAD + (LANES, ))
+        shape = (
+            (NUM_MGR * self.WINDOW * split, KBS) + PAYLOAD + (LANES,)
+            if split > 1
+            else (NUM_MGR * self.WINDOW, 1280) + PAYLOAD + (LANES,)
+        )
         rng = np.random.default_rng(20)
         return jnp.asarray(rng.standard_normal(shape), dtype=jnp.bfloat16)
 
@@ -476,32 +418,40 @@ class TestPooledSpecWindows:
         n = self.N
         return [
             # Verify windows (2, 1, 2 tokens), resuming from checkpoint 0.
-            dict(num_tokens=5,
-                 query_start_loc=jnp.array([0, 2, 3, 5]),
-                 distribution=jnp.array([n, n, n], dtype=jnp.int32),
-                 seq_lens=jnp.array([10, 7, 9], dtype=jnp.int32),
-                 read_offsets=jnp.zeros((n, ), dtype=jnp.int32)),
+            dict(
+                num_tokens=5,
+                query_start_loc=jnp.array([0, 2, 3, 5]),
+                distribution=jnp.array([n, n, n], dtype=jnp.int32),
+                seq_lens=jnp.array([10, 7, 9], dtype=jnp.int32),
+                read_offsets=jnp.zeros((n,), dtype=jnp.int32),
+            ),
             # Mixed acceptance: seqs 0/2 roll back to checkpoint 1, seq 1
             # to checkpoint 0.
-            dict(num_tokens=5,
-                 query_start_loc=jnp.array([0, 2, 4, 5]),
-                 distribution=jnp.array([n, n, n], dtype=jnp.int32),
-                 seq_lens=jnp.array([12, 9, 10], dtype=jnp.int32),
-                 read_offsets=jnp.array([1, 0, 1], dtype=jnp.int32)),
+            dict(
+                num_tokens=5,
+                query_start_loc=jnp.array([0, 2, 4, 5]),
+                distribution=jnp.array([n, n, n], dtype=jnp.int32),
+                seq_lens=jnp.array([12, 9, 10], dtype=jnp.int32),
+                read_offsets=jnp.array([1, 0, 1], dtype=jnp.int32),
+            ),
             # PER_SEQ resume with a non-zero read offset: seq 0 stays a
             # 1-token window, seq 1 becomes a 5-token prefill continuation
             # resuming from checkpoint 1 (the prefix-cache-resume shape);
             # seq 2 idles.
-            dict(num_tokens=6,
-                 query_start_loc=jnp.array([0, 1, 6, 6]),
-                 distribution=jnp.array([1, 1, n], dtype=jnp.int32),
-                 seq_lens=jnp.array([14, 14, 0], dtype=jnp.int32),
-                 read_offsets=jnp.array([0, 1, 0], dtype=jnp.int32)),
+            dict(
+                num_tokens=6,
+                query_start_loc=jnp.array([0, 1, 6, 6]),
+                distribution=jnp.array([1, 1, n], dtype=jnp.int32),
+                seq_lens=jnp.array([14, 14, 0], dtype=jnp.int32),
+                read_offsets=jnp.array([0, 1, 0], dtype=jnp.int32),
+            ),
         ]
 
-    @pytest.mark.parametrize("split", [6, 1],
-                             ids=["kernel_grained", "manager"])
-    def test_pooled_spec_matches_dense(self, split):
+    @pytest.mark.parametrize(
+        "ssm_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32_ssm", "bf16_ssm"]
+    )
+    @pytest.mark.parametrize("split", [6, 1], ids=["kernel_grained", "manager"])
+    def test_pooled_spec_matches_dense(self, split, ssm_dtype):
         n, window = self.N, self.WINDOW
         pool = self._pool(split)
         # Checkpoint 0 is the request's state block; the rest are ordinary
@@ -511,27 +461,26 @@ class TestPooledSpecWindows:
         ckpt_indices = jnp.array([[4, 7], [1, 9], [3, 5]], dtype=jnp.int32)
 
         keys = iter(jax.random.split(jax.random.key(21), 2))
-        ssm0 = jax.random.normal(next(keys), (n, N_V, D_K, D_V))
-        conv0 = jax.random.normal(
-            next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16)
-        pool = _write_states_split(pool, ssm0, conv0, pool_idx, split)
-        plan = _plan(pool, split=split)
+        ssm0 = jax.random.normal(next(keys), (n, N_V, D_K, D_V)).astype(ssm_dtype)
+        conv0 = jax.random.normal(next(keys), (n, KERNEL_SIZE - 1, DIM))
+        pool = _write_states(
+            pool, ssm0, conv0, pool_idx, split=split, ssm_dtype=ssm_dtype
+        )
 
         # Dense reference: compact slot groups of `window` consecutive
         # slots, byte-equal initial states at each group's base. Garbage in
         # the other slots must never be read.
         rng = np.random.default_rng(22)
         num_slots = 1 + n * window
-        dense_base = jnp.array([1 + i * window for i in range(n)],
-                               dtype=jnp.int32)
-        dense_conv = jnp.asarray(rng.standard_normal(
-            (num_slots, KERNEL_SIZE - 1, DIM)),
-                                 dtype=jnp.bfloat16)
-        dense_rec = jnp.asarray(rng.standard_normal(
-            (num_slots, N_V, D_K, D_V)),
-                                dtype=jnp.float32)
+        dense_base = jnp.array([1 + i * window for i in range(n)], dtype=jnp.int32)
+        dense_conv = jnp.asarray(
+            rng.standard_normal((num_slots, KERNEL_SIZE - 1, DIM)), dtype=jnp.float32
+        )
+        dense_rec = jnp.asarray(
+            rng.standard_normal((num_slots, N_V, D_K, D_V)), dtype=ssm_dtype
+        )
         dense_conv = dense_conv.at[dense_base].set(conv0)
-        dense_rec = dense_rec.at[dense_base].set(ssm0.astype(jnp.float32))
+        dense_rec = dense_rec.at[dense_base].set(ssm0)
 
         for step_num, step in enumerate(self._steps()):
             kwargs = _rand_inputs(30 + step_num, step["num_tokens"]) | dict(
@@ -542,62 +491,528 @@ class TestPooledSpecWindows:
                 read_offsets=step["read_offsets"],
             )
             (dense_conv, dense_rec), out_dense = wrapper.fused_conv1d_gdn(
-                conv_state=dense_conv,
-                recurrent_state=dense_rec,
-                state_indices=dense_base,
-                **kwargs)
+                states=(dense_conv, dense_rec), state_indices=dense_base, **kwargs
+            )
+            pool_shape = pool.shape
             pool, out_pooled = wrapper.fused_conv1d_gdn(
-                conv_state=None,
-                recurrent_state=None,
+                states=_merge(pool, split),
                 state_indices=pool_idx,
                 ckpt_indices=ckpt_indices,
-                state_source=pool,
-                state_plan=plan,
-                **kwargs)
-            np.testing.assert_allclose(np.asarray(out_pooled),
-                                       np.asarray(out_dense),
-                                       rtol=2e-2,
-                                       atol=2e-2,
-                                       err_msg=f"step {step_num}")
+                conv_dtype=jnp.float32,
+                recurrent_dtype=ssm_dtype,
+                **kwargs,
+            )
+            pool = _split(pool, pool_shape)
+            np.testing.assert_allclose(
+                np.asarray(out_pooled),
+                np.asarray(out_dense),
+                rtol=2e-2,
+                atol=2e-2,
+                err_msg=f"step {step_num}",
+            )
 
 
+_write_states_bf16 = functools.partial(_write_states, ssm_dtype=jnp.bfloat16)
+_read_states_bf16 = functools.partial(_read_states, ssm_dtype=jnp.bfloat16)
+
+
+def _bits(x):
+    return np.asarray(jax.lax.bitcast_convert_type(x, jnp.int16))
+
+
+@pytest.mark.tpu_test
+class TestPooledBf16Recurrent:
+    """bf16 recurrent state with an fp32 conv state.
+
+    The kernel upcasts the recurrent state once on load and rounds it once on
+    store. Against the fp32 kernel fed the same bf16-representable values, the
+    recurrent state is bit-exact; against the tuple path it stays within 32
+    bf16 ULPs, and conv state and output stay within standard float tolerance.
+    """
+
+    def _states(self, seed, n):
+        keys = iter(jax.random.split(jax.random.key(seed), 2))
+        ssm = jax.random.normal(next(keys), (n, N_V, D_K, D_V)).astype(jnp.bfloat16)
+        conv = jax.random.normal(next(keys), (n, KERNEL_SIZE - 1, DIM))
+        return ssm, conv
+
+    def _tuple(self, ssm, conv, kwargs):
+        ident = jnp.arange(ssm.shape[0], dtype=jnp.int32)
+        (new_conv, new_ssm), out = wrapper.fused_conv1d_gdn(
+            states=(conv, ssm), state_indices=ident, **kwargs
+        )
+        return new_ssm, new_conv, out
+
+    def _pooled(self, ssm, conv, idx, kwargs, write=_write_states_bf16):
+        pool = write(_garbage_pool(0), ssm, conv, idx)
+        out_pool, out = wrapper.fused_conv1d_gdn(
+            states=_merge(pool),
+            state_indices=idx,
+            conv_dtype=jnp.float32,
+            recurrent_dtype=jnp.bfloat16,
+            **kwargs,
+        )
+        new_ssm, new_conv = _read_states_bf16(_split(out_pool, pool.shape), idx)
+        return new_ssm, new_conv, out
+
+    def _assert_same(self, got, want, ssm_ulps=0):
+        # Recurrent state: bf16 bit patterns may differ by at most `ssm_ulps`
+        # units in the last place; 0 means bit-exact.
+        diff = np.abs(_bits(got[0]).astype(np.int32) - _bits(want[0]).astype(np.int32))
+        assert int(diff.max()) <= ssm_ulps
+        np.testing.assert_allclose(
+            np.asarray(got[1]), np.asarray(want[1]), rtol=2e-2, atol=2e-2
+        )
+        np.testing.assert_allclose(
+            np.asarray(got[2]), np.asarray(want[2]), rtol=2e-2, atol=2e-2
+        )
+
+    def _mixed_kwargs(self, seed):
+        # Two decodes (BATCHED) plus two 64-token continuations (PER_SEQ).
+        return _rand_inputs(seed, 130) | dict(
+            query_start_loc=jnp.array([0, 1, 2, 66, 130]),
+            distribution=jnp.array([2, 4, 4], dtype=jnp.int32),
+            seq_lens=jnp.array([7, 9, 96, 80], dtype=jnp.int32),
+        )
+
+    def test_pooled_bf16_recurrent_matches_tuple_path(self):
+        idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+        ssm, conv = self._states(40, 4)
+        kwargs = self._mixed_kwargs(41)
+        # The pooled and tuple paths compile to different programs, so their
+        # fp32 results can differ in the last bits and round to adjacent bf16
+        # values. Conv state and output stay within standard tolerance.
+        self._assert_same(
+            self._pooled(ssm, conv, idx, kwargs),
+            self._tuple(ssm, conv, kwargs),
+            ssm_ulps=32,
+        )
+
+    def test_bf16_recurrent_matches_fp32_on_bf16_values(self):
+        ssm, conv = self._states(42, 4)
+        kwargs = self._mixed_kwargs(43)
+        # The kernel donates `states`, so each call gets its own buffers.
+        ssm32, conv32 = ssm.astype(jnp.float32), conv.copy()
+        got = self._tuple(ssm, conv, kwargs)
+        new_ssm, new_conv, out = self._tuple(ssm32, conv32, kwargs)
+        self._assert_same(got, (new_ssm.astype(jnp.bfloat16), new_conv, out))
+
+    def test_multi_tile_prefill_with_bf16_recurrent_keeps_fp32_carry(self):
+        # 200 tokens span 4 PER_SEQ tiles of 64: the carry between tiles must
+        # stay fp32, so only the final state is rounded.
+        ssm, conv = self._states(44, 1)
+        kwargs = _rand_inputs(45, 200) | dict(
+            query_start_loc=jnp.array([0, 200]),
+            distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+            seq_lens=jnp.array([230], dtype=jnp.int32),
+        )
+        ssm32, conv32 = ssm.astype(jnp.float32), conv.copy()
+        got = self._tuple(ssm, conv, kwargs)
+        new_ssm, new_conv, out = self._tuple(ssm32, conv32, kwargs)
+        self._assert_same(got, (new_ssm.astype(jnp.bfloat16), new_conv, out))
+
+    def test_spec_windows_with_bf16_recurrent_match_fp32_on_bf16_values(self):
+        # Reuses the pooled spec schedule on the tuple path. Rounding the
+        # fp32 arm between steps mirrors the bf16 store/load round trip.
+        spec = TestPooledSpecWindows
+        n, window = spec.N, spec.WINDOW
+        base = jnp.array([1 + i * window for i in range(n)], dtype=jnp.int32)
+        rng = np.random.default_rng(46)
+        num_slots = 1 + n * window
+        conv = jnp.asarray(
+            rng.standard_normal((num_slots, KERNEL_SIZE - 1, DIM)), jnp.float32
+        )
+        rec = jnp.asarray(rng.standard_normal((num_slots, N_V, D_K, D_V)), jnp.bfloat16)
+        conv16, rec16 = conv, rec
+        conv32, rec32 = conv.copy(), rec.astype(jnp.float32)
+        for step_num, step in enumerate(spec._steps(spec)):
+            kwargs = _rand_inputs(47 + step_num, step["num_tokens"]) | dict(
+                query_start_loc=step["query_start_loc"],
+                distribution=step["distribution"],
+                seq_lens=step["seq_lens"],
+                num_spec_tokens=spec.NUM_SPEC,
+                read_offsets=step["read_offsets"],
+            )
+            (conv16, rec16), out16 = wrapper.fused_conv1d_gdn(
+                states=(conv16, rec16), state_indices=base, **kwargs
+            )
+            (conv32, rec32), out32 = wrapper.fused_conv1d_gdn(
+                states=(conv32, rec32), state_indices=base, **kwargs
+            )
+            rec32 = rec32.astype(jnp.bfloat16)
+            self._assert_same((rec16, conv16, out16), (rec32, conv32, out32))
+            rec32 = rec32.astype(jnp.float32)
+
+    def test_conv_first_pool_layout_is_detected(self):
+        """Negative control: regions written in the other order must not match."""
+
+        def write_conv_first(pool, ssm, conv, idx, split=SPLIT):
+            def build(pool, ssm, conv, idx):
+                words = state_words(pool, split)
+                words = put_words(words, idx, 0, jnp.asarray(conv, jnp.float32))
+                body = pack_bf16_rows(ssm).reshape(idx.shape[0], -1)
+                start = CONV_GRANULES * WORDS_PER_GRANULE
+                words = words.at[idx, start : start + body.shape[1]].set(body)
+                return words_to_pool(words, pool)
+
+            return on_cpu(build, pool, ssm, conv, idx)
+
+        idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+        ssm, conv = self._states(48, 4)
+        kwargs = _rand_inputs(49, 4) | dict(
+            query_start_loc=jnp.arange(5),
+            distribution=jnp.array([4, 4, 4], dtype=jnp.int32),
+            seq_lens=jnp.full((4,), 9, dtype=jnp.int32),
+        )
+        got = self._pooled(ssm, conv, idx, kwargs, write=write_conv_first)
+        want = self._tuple(ssm, conv, kwargs)
+        assert not np.array_equal(np.asarray(got[2]), np.asarray(want[2]))
+
+    def test_bf16_conv_state_is_rejected(self):
+        ssm, conv = self._states(50, 1)
+        kwargs = _rand_inputs(51, 1) | dict(
+            query_start_loc=jnp.arange(2),
+            distribution=jnp.array([1, 1, 1], dtype=jnp.int32),
+            seq_lens=jnp.array([3], dtype=jnp.int32),
+        )
+        with pytest.raises(NotImplementedError, match="fp32 conv state"):
+            self._tuple(ssm, conv.astype(jnp.bfloat16), kwargs)
+
+
+def _mgr_bytes(pool, mgr):
+    """Raw bytes of manager block `mgr` (all of its kernel blocks)."""
+    return np.asarray(pool[mgr * SPLIT : (mgr + 1) * SPLIT].view(jnp.int16))
+
+
+def _rows(inputs, start, end):
+    """`inputs` restricted to batch rows [start, end)."""
+    return inputs | {k: inputs[k][start:end] for k in ("qkv", "b", "a")}
+
+
+@pytest.mark.tpu_test
+class TestPooledPrefillCheckpoint:
+    """Internal prefill checkpoints match a standalone prefix prefill."""
+
+    NUM_MGR = 12
+
+    @staticmethod
+    def _run(
+        pool,
+        inputs,
+        qsl,
+        seq_lens,
+        state_indices,
+        distribution,
+        ckpt=None,
+        ssm_dtype=jnp.float32,
+        **kernel_kwargs,
+    ):
+        extra = dict(kernel_kwargs)
+        if ckpt is not None:
+            extra |= dict(
+                prefill_ckpt_offsets=jnp.asarray(ckpt[0], dtype=jnp.int32),
+                prefill_ckpt_indices=jnp.asarray(ckpt[1], dtype=jnp.int32),
+            )
+        out_pool, out = wrapper.fused_conv1d_gdn(
+            states=_merge(jnp.copy(pool)),
+            conv_dtype=jnp.float32,
+            recurrent_dtype=ssm_dtype,
+            query_start_loc=jnp.asarray(qsl, dtype=jnp.int32),
+            seq_lens=jnp.asarray(seq_lens, dtype=jnp.int32),
+            state_indices=jnp.asarray(state_indices, dtype=jnp.int32),
+            distribution=jnp.asarray(distribution, dtype=jnp.int32),
+            **inputs,
+            **extra,
+        )
+        return _split(out_pool, pool.shape), out
+
+    def _fresh_prefix(self, pool, inputs, start, num_tokens, block, **kernel_kwargs):
+        """A fresh prefill of rows [start, start + num_tokens) into `block`."""
+        return self._run(
+            pool,
+            _rows(inputs, start, start + num_tokens),
+            qsl=[0, num_tokens],
+            seq_lens=[num_tokens],
+            state_indices=[block],
+            distribution=[0, 1, 1],
+            **kernel_kwargs,
+        )
+
+    @pytest.mark.parametrize(
+        "ssm_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32_ssm", "bf16_ssm"]
+    )
+    def test_checkpoint_matches_two_call_split(self, ssm_dtype):
+        length, offset, state_block, ckpt_block = 192, 128, 2, 5
+        pool = _garbage_pool(50, self.NUM_MGR)
+        inputs = _rand_inputs(51, length)
+        one_shot = dict(
+            qsl=[0, length],
+            seq_lens=[length],
+            state_indices=[state_block],
+            distribution=[0, 1, 1],
+            ssm_dtype=ssm_dtype,
+        )
+
+        pool_ckpt, out_ckpt = self._run(
+            pool, inputs, **one_shot, ckpt=([offset], [ckpt_block])
+        )
+        pool_plain, out_plain = self._run(pool, inputs, **one_shot)
+        pool_split, _ = self._fresh_prefix(
+            pool, inputs, 0, offset, ckpt_block, ssm_dtype=ssm_dtype
+        )
+
+        ckpt_idx = jnp.array([ckpt_block], dtype=jnp.int32)
+        ssm_ckpt, conv_ckpt = _read_states(pool_ckpt, ckpt_idx, ssm_dtype=ssm_dtype)
+        ssm_split, conv_split = _read_states(pool_split, ckpt_idx, ssm_dtype=ssm_dtype)
+        np.testing.assert_array_equal(np.asarray(conv_ckpt), np.asarray(conv_split))
+        np.testing.assert_array_equal(
+            np.asarray(ssm_ckpt, dtype=np.float32),
+            np.asarray(ssm_split, dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            _mgr_bytes(pool_ckpt, ckpt_block), _mgr_bytes(pool_split, ckpt_block)
+        )
+
+        # The export leaves the computation alone: outputs and every other
+        # block match the run without a checkpoint.
+        np.testing.assert_array_equal(np.asarray(out_ckpt), np.asarray(out_plain))
+        for mgr in range(self.NUM_MGR):
+            if mgr != ckpt_block:
+                np.testing.assert_array_equal(
+                    _mgr_bytes(pool_ckpt, mgr),
+                    _mgr_bytes(pool_plain, mgr),
+                    f"block {mgr}",
+                )
+
+    def test_dense_states_checkpoint_matches_two_call_split(self):
+        """Dense (conv, ssm) states take the same export as the pool."""
+        length, offset, state_slot, ckpt_slot, num_slots = 192, 100, 1, 3, 4
+        inputs = _rand_inputs(59, length)
+        keys = iter(jax.random.split(jax.random.key(60), 2))
+        states = (
+            jax.random.normal(next(keys), (num_slots, KERNEL_SIZE - 1, DIM)),
+            jax.random.normal(next(keys), (num_slots, N_V, D_K, D_V)),
+        )
+
+        def run(rows, slot, ckpt=None):
+            extra = {}
+            if ckpt is not None:
+                extra = dict(
+                    prefill_ckpt_offsets=jnp.asarray([ckpt[0]], dtype=jnp.int32),
+                    prefill_ckpt_indices=jnp.asarray([ckpt[1]], dtype=jnp.int32),
+                )
+            return wrapper.fused_conv1d_gdn(
+                states=jax.tree.map(jnp.copy, states),
+                query_start_loc=jnp.asarray([0, rows], dtype=jnp.int32),
+                seq_lens=jnp.asarray([rows], dtype=jnp.int32),
+                state_indices=jnp.asarray([slot], dtype=jnp.int32),
+                distribution=jnp.asarray([0, 1, 1], dtype=jnp.int32),
+                **_rows(inputs, 0, rows),
+                **extra,
+            )
+
+        (conv_ckpt, ssm_ckpt), _ = run(length, state_slot, (offset, ckpt_slot))
+        (conv_split, ssm_split), _ = run(offset, ckpt_slot)
+
+        np.testing.assert_array_equal(
+            np.asarray(conv_ckpt[ckpt_slot]), np.asarray(conv_split[ckpt_slot])
+        )
+        np.testing.assert_array_equal(
+            np.asarray(ssm_ckpt[ckpt_slot]), np.asarray(ssm_split[ckpt_slot])
+        )
+        for slot in (0, 2):
+            np.testing.assert_array_equal(
+                np.asarray(ssm_ckpt[slot]), np.asarray(states[1][slot])
+            )
+
+    @pytest.mark.parametrize(
+        "mixed_tile_size, length, offset",
+        [
+            # The largest dynamic tile: the checkpoint row is mid-tile on
+            # the 128-row grid of the request. Each offset is above the tile
+            # size, so the reference prefill runs the same tile size.
+            (128, 320, 192),
+            (128, 384, 320),
+            # Offsets off the grid of the default and of a smaller tile.
+            (64, 192, 100),
+            (32, 160, 40),
+        ],
+    )
+    def test_checkpoint_off_the_tile_grid_matches_two_call_split(
+        self, mixed_tile_size, length, offset
+    ):
+        """Off-grid checkpoint offsets split the tile schedule at the checkpoint
+        row, matching a standalone prefix prefill byte for byte while keeping
+        full-sequence outputs within numerical tolerance."""
+        state_block, ckpt_block = 2, 5
+        pool = _garbage_pool(57, self.NUM_MGR)
+        inputs = _rand_inputs(58, length)
+        one_shot = dict(
+            qsl=[0, length],
+            seq_lens=[length],
+            state_indices=[state_block],
+            distribution=[0, 1, 1],
+            mixed_tile_size=mixed_tile_size,
+        )
+
+        pool_ckpt, out_ckpt = self._run(
+            pool, inputs, **one_shot, ckpt=([offset], [ckpt_block])
+        )
+        pool_plain, out_plain = self._run(pool, inputs, **one_shot)
+        pool_split, _ = self._fresh_prefix(
+            pool, inputs, 0, offset, ckpt_block, mixed_tile_size=mixed_tile_size
+        )
+
+        np.testing.assert_array_equal(
+            _mgr_bytes(pool_ckpt, ckpt_block), _mgr_bytes(pool_split, ckpt_block)
+        )
+        # The checkpoint is not the final state, so the comparison above
+        # cannot pass by reading the wrong block.
+        ckpt_ssm, _ = _read_states(pool_ckpt, jnp.array([ckpt_block]))
+        final_ssm, final_conv = _read_states(pool_ckpt, jnp.array([state_block]))
+        assert not np.allclose(np.asarray(ckpt_ssm), np.asarray(final_ssm), atol=1e-2)
+
+        tol = dict(rtol=1e-2, atol=1e-2)
+        np.testing.assert_allclose(np.asarray(out_ckpt), np.asarray(out_plain), **tol)
+        plain_ssm, plain_conv = _read_states(pool_plain, jnp.array([state_block]))
+        np.testing.assert_allclose(np.asarray(final_ssm), np.asarray(plain_ssm), **tol)
+        np.testing.assert_allclose(
+            np.asarray(final_conv), np.asarray(plain_conv), rtol=2e-2, atol=2e-2
+        )
+        for mgr in range(self.NUM_MGR):
+            if mgr not in (state_block, ckpt_block):
+                np.testing.assert_array_equal(
+                    _mgr_bytes(pool_ckpt, mgr),
+                    _mgr_bytes(pool_plain, mgr),
+                    f"block {mgr}",
+                )
+
+    def test_resume_from_checkpoint_continues_the_sequence(self):
+        """A prefix-cache hit on the checkpoint resumes like a real split."""
+        length, offset, state_block, ckpt_block, split_block = 256, 192, 3, 7, 9
+        pool = _garbage_pool(52, self.NUM_MGR)
+        inputs = _rand_inputs(53, length)
+        tail = dict(
+            qsl=[0, length - offset],
+            seq_lens=[length],
+            distribution=[0, 1, 1],
+        )
+
+        pool_ckpt, _ = self._run(
+            pool,
+            inputs,
+            qsl=[0, length],
+            seq_lens=[length],
+            state_indices=[state_block],
+            distribution=[0, 1, 1],
+            ckpt=([offset], [ckpt_block]),
+        )
+        _, out_resumed = self._run(
+            pool_ckpt,
+            _rows(inputs, offset, length),
+            state_indices=[ckpt_block],
+            **tail,
+        )
+
+        pool_split, _ = self._fresh_prefix(pool, inputs, 0, offset, split_block)
+        _, out_split = self._run(
+            pool_split,
+            _rows(inputs, offset, length),
+            state_indices=[split_block],
+            **tail,
+        )
+        np.testing.assert_array_equal(np.asarray(out_resumed), np.asarray(out_split))
+
+    def test_mixed_batch_writes_only_requested_blocks(self):
+        """Verifies checkpoint export in a mixed batch where a continuation's
+        pipelined state copy-in overlaps the previous row's final-state copy-out."""
+        query_lens = [1, 1, 192, 128, 256, 64, 0]
+        seq_lens = [9, 9, 192, 200, 256, 300, 0]
+        state_indices = [1, 2, 3, 4, 5, 10, 0]
+        # Row 3 names a block with offset 0 and the padded row 6 carries a
+        # stale request: neither may write.
+        offsets = [0, 0, 64, 0, 192, 0, 64]
+        indices = [-1, -1, 6, 7, 8, -1, 9]
+        distribution = [2, 6, 6]
+        qsl = np.concatenate([[0], np.cumsum(query_lens)]).tolist()
+
+        resumed = jnp.array([1, 2, 4, 10], dtype=jnp.int32)
+        keys = iter(jax.random.split(jax.random.key(54), 2))
+        pool = _write_states(
+            _garbage_pool(55, self.NUM_MGR),
+            jax.random.normal(next(keys), (4, N_V, D_K, D_V)),
+            jax.random.normal(next(keys), (4, KERNEL_SIZE - 1, DIM)),
+            resumed,
+        )
+        inputs = _rand_inputs(56, qsl[-1])
+        batch = dict(
+            qsl=qsl,
+            seq_lens=seq_lens,
+            state_indices=state_indices,
+            distribution=distribution,
+        )
+
+        pool_ckpt, out_ckpt = self._run(pool, inputs, **batch, ckpt=(offsets, indices))
+        pool_plain, out_plain = self._run(pool, inputs, **batch)
+
+        np.testing.assert_array_equal(np.asarray(out_ckpt), np.asarray(out_plain))
+        for mgr in range(self.NUM_MGR):
+            if mgr not in (6, 8):
+                np.testing.assert_array_equal(
+                    _mgr_bytes(pool_ckpt, mgr),
+                    _mgr_bytes(pool_plain, mgr),
+                    f"block {mgr}",
+                )
+        for mgr in (0, 7, 9, 11):
+            np.testing.assert_array_equal(
+                _mgr_bytes(pool_ckpt, mgr), _mgr_bytes(pool, mgr), f"block {mgr}"
+            )
+
+        for row, ckpt_block in ((2, 6), (4, 8)):
+            pool_split, _ = self._fresh_prefix(
+                pool, inputs, qsl[row], offsets[row], ckpt_block
+            )
+            np.testing.assert_array_equal(
+                _mgr_bytes(pool_ckpt, ckpt_block),
+                _mgr_bytes(pool_split, ckpt_block),
+                f"row {row}",
+            )
+
+
+@pytest.mark.tpu_test
 class TestPooledCallerV3:
-
-    def test_bf16_ssm_round_trips_through_fp8_pool(self):
-        gdn_attention = pytest.importorskip(
-            "vllm_torchtpu.layers.common.gdn_attention")
+    def test_fp32_ssm_round_trips_through_fp8_pool(self):
+        """The pool's own element type is irrelevant: the DMA moves bytes."""
+        gdn_attention = pytest.importorskip("vllm_torchtpu.layers.core.gdn_attention")
         n = 4
         pool_idx = jnp.arange(1, n + 1, dtype=jnp.int32)
         dense_idx = jnp.arange(n, dtype=jnp.int32)
-        recurrent_bf16 = jax.random.normal(
-            jax.random.key(41), (n, N_V, D_K, D_V)).astype(jnp.bfloat16)
+        recurrent = jax.random.normal(jax.random.key(41), (n, N_V, D_K, D_V))
         conv = jnp.zeros((n, KERNEL_SIZE - 1, DIM), dtype=jnp.float32)
-        pool = jnp.zeros((NUM_MGR * SPLIT, KBS, 1, 4, LANES),
-                         dtype=jnp.float8_e4m3fn)
-        ssm_ntok = N_V * D_K * D_V * 2 // (4 * LANES)
-        pool = pool_adapters.scatter_region(pool,
-                                            recurrent_bf16.reshape(
-                                                n, -1, LANES),
-                                            pool_idx,
-                                            tok0=0,
-                                            ntok=ssm_ntok,
-                                            split=SPLIT)
+        pool = jnp.zeros((NUM_MGR * SPLIT, KBS, 1, 4, LANES), dtype=jnp.float8_e4m3fn)
+        nwords = recurrent.size // n
+
+        def _seed(pool, recurrent, pool_idx):
+            body = recurrent.reshape(n, -1).view(jnp.uint32)
+            words = state_words(pool, SPLIT).at[pool_idx, 0:nwords].set(body)
+            return words_to_pool(words, pool)
+
+        pool = on_cpu(_seed, pool, recurrent, pool_idx)
         kwargs = _rand_inputs(42, n) | dict(
             query_start_loc=jnp.arange(n + 1),
             distribution=jnp.array([n, n, n], dtype=jnp.int32),
-            seq_lens=jnp.full((n, ), 9, dtype=jnp.int32),
+            seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
         )
 
+        conv_init, recurrent_init = conv.copy(), recurrent.copy()
         (_, dense_ssm), dense_out = wrapper.fused_conv1d_gdn(
-            conv_state=conv,
-            recurrent_state=recurrent_bf16.astype(jnp.float32),
-            state_indices=dense_idx,
-            **kwargs)
-        new_pool, pooled_out = gdn_attention.run_jax_gdn_attention_pooled_local(
+            states=(conv, recurrent), state_indices=dense_idx, **kwargs
+        )
+        pooled = functools.partial(
+            gdn_attention.run_jax_gdn_attention_pooled_local,
             mixed_qkv=kwargs["qkv"],
             b=kwargs["b"],
             a=kwargs["a"],
-            recurrent_state=pool,
             conv_weight=kwargs["conv_weight"],
             conv_bias=kwargs["conv_bias"],
             A_log=kwargs["a_log"],
@@ -612,42 +1027,76 @@ class TestPooledCallerV3:
             d_v=D_V,
             kernel_size=KERNEL_SIZE,
             pool_block_tokens=SPLIT * KBS,
-            recurrent_state_dtype=jnp.bfloat16,
         )
-        pooled_ssm = pool_adapters.gather_region(new_pool,
-                                                 pool_idx,
-                                                 tok0=0,
-                                                 ntok=ssm_ntok,
-                                                 split=SPLIT,
-                                                 out_dtype=jnp.bfloat16,
-                                                 out_lanes=LANES).reshape(
-                                                     n, N_V, D_K, D_V)
+        new_pool, pooled_out = pooled(recurrent_state=pool)
 
-        np.testing.assert_allclose(np.asarray(pooled_out),
-                                   np.asarray(dense_out),
-                                   rtol=5e-2,
-                                   atol=5e-2)
-        np.testing.assert_allclose(np.asarray(pooled_ssm, dtype=np.float32),
-                                   np.asarray(dense_ssm, dtype=np.float32),
-                                   rtol=5e-2,
-                                   atol=5e-2)
+        def _read(new_pool, pool_idx):
+            return (
+                state_words(new_pool, SPLIT)[pool_idx, 0:nwords]
+                .view(jnp.float32)
+                .reshape(n, N_V, D_K, D_V)
+            )
+
+        pooled_ssm = on_cpu(_read, new_pool, pool_idx)
+
+        np.testing.assert_allclose(
+            np.asarray(pooled_out), np.asarray(dense_out), rtol=5e-2, atol=5e-2
+        )
+        np.testing.assert_allclose(
+            np.asarray(pooled_ssm), np.asarray(dense_ssm), rtol=5e-2, atol=5e-2
+        )
+
+        # A bf16 SSM cache takes the same caller path, two rows per word.
+        recurrent16 = recurrent_init.astype(jnp.bfloat16)
+
+        def _seed16(pool, recurrent16, pool_idx):
+            body = pack_bf16_rows(recurrent16).reshape(n, -1)
+            words = state_words(pool, SPLIT).at[pool_idx, 0 : body.shape[1]].set(body)
+            return words_to_pool(words, pool)
+
+        def _read16(new_pool, pool_idx):
+            words = state_words(new_pool, SPLIT)[pool_idx, 0 : nwords // 2]
+            return unpack_bf16_rows(words.reshape(n, N_V, D_K // 2, D_V))
+
+        pool16 = on_cpu(_seed16, jnp.zeros_like(pool), recurrent16, pool_idx)
+        (_, dense_ssm16), dense_out16 = wrapper.fused_conv1d_gdn(
+            states=(conv_init, recurrent16), state_indices=dense_idx, **kwargs
+        )
+        new_pool16, pooled_out16 = pooled(
+            recurrent_state=pool16, recurrent_state_dtype=jnp.bfloat16
+        )
+        pooled_ssm16 = on_cpu(_read16, new_pool16, pool_idx)
+
+        np.testing.assert_allclose(
+            np.asarray(pooled_out16, np.float32),
+            np.asarray(dense_out16, np.float32),
+            rtol=5e-2,
+            atol=5e-2,
+        )
+        np.testing.assert_allclose(
+            np.asarray(pooled_ssm16, np.float32),
+            np.asarray(dense_ssm16, np.float32),
+            rtol=5e-2,
+            atol=5e-2,
+        )
 
     def test_caller_matches_roundtrip(self):
-        gdn_attention = pytest.importorskip(
-            "vllm_torchtpu.layers.common.gdn_attention")
+        gdn_attention = pytest.importorskip("vllm_torchtpu.layers.core.gdn_attention")
         n = 4
         idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
         keys = iter(jax.random.split(jax.random.key(14), 2))
         pool = _write_states(
-            _garbage_pool(15), jax.random.normal(next(keys),
-                                                 (n, N_V, D_K, D_V)),
-            jax.random.normal(next(keys),
-                              (n, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16),
-            idx)
+            _garbage_pool(15),
+            jax.random.normal(next(keys), (n, N_V, D_K, D_V)),
+            jax.random.normal(next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(
+                jnp.bfloat16
+            ),
+            idx,
+        )
         kwargs = _rand_inputs(16, n) | dict(
             query_start_loc=jnp.arange(n + 1),
             distribution=jnp.array([n, n, n], dtype=jnp.int32),
-            seq_lens=jnp.full((n, ), 9, dtype=jnp.int32),
+            seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
         )
         pool_rt, out_rt = _run_roundtrip(jnp.copy(pool), idx, kwargs)
 
@@ -672,43 +1121,57 @@ class TestPooledCallerV3:
             pool_block_tokens=SPLIT * KBS,
         )
 
-        np.testing.assert_allclose(np.asarray(out),
-                                   np.asarray(out_rt),
-                                   rtol=1e-5,
-                                   atol=1e-5)
-        assert jnp.array_equal(new_pool.view(jnp.int16),
-                               pool_rt.view(jnp.int16))
+        np.testing.assert_allclose(
+            np.asarray(out), np.asarray(out_rt), rtol=1e-5, atol=1e-5
+        )
+        assert jnp.array_equal(new_pool.view(jnp.int16), pool_rt.view(jnp.int16))
 
-    @pytest.mark.parametrize("page_size", [128, 256])
+    @pytest.mark.parametrize("page_size", [128, 256, 512])
+    @pytest.mark.parametrize(
+        ("num_kv_heads", "kv_packing", "head_dim", "pool_dtype"),
+        [
+            (1, 4, 256, jnp.float8_e4m3fn),
+            (1, 2, 256, jnp.bfloat16),
+            (2, 2, 256, jnp.bfloat16),
+            (4, 4, 256, jnp.float8_e4m3fn),
+        ],
+    )
     def test_caller_matches_dense_with_native_seq_along_lane_pool(
-            self, monkeypatch, page_size):
-        monkeypatch.setenv("USE_BATCHED_RPA_LONGCTX", "1")
+        self, monkeypatch, page_size, num_kv_heads, kv_packing, head_dim, pool_dtype
+    ):
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
-        gdn_attention = pytest.importorskip(
-            "vllm_torchtpu.layers.common.gdn_attention")
+        gdn_attention = pytest.importorskip("vllm_torchtpu.layers.core.gdn_attention")
         n = 4
         pool_idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
         dense_idx = jnp.arange(n, dtype=jnp.int32)
 
-        # split must provide at least 1056 tokens per manager block (SSM=1024 + Conv=32)
+        # A 1536-token manager block holds the state for every geometry here:
+        # the smallest token row (one fp8 KV head pair, 512 B) needs
+        # SSM=1024 + Conv=64 tokens.
         split = 1536 // page_size
-        num_kv_heads_x2, packed_d, pack = 2, 64, 4  # head_dim = 64 * 4 = 256
         pool = jnp.zeros(
-            (NUM_MGR * split, num_kv_heads_x2, packed_d, pack, page_size),
-            dtype=jnp.float8_e4m3fn)
+            (
+                NUM_MGR * split,
+                num_kv_heads * 2,
+                head_dim // kv_packing,
+                kv_packing,
+                page_size,
+            ),
+            dtype=pool_dtype,
+        )
         conv = jnp.zeros((n, KERNEL_SIZE - 1, DIM), dtype=jnp.float32)
         recurrent_f32 = jnp.zeros((n, N_V, D_K, D_V), dtype=jnp.float32)
 
         kwargs = _rand_inputs(17, n) | dict(
             query_start_loc=jnp.arange(n + 1),
             distribution=jnp.array([n, n, n], dtype=jnp.int32),
-            seq_lens=jnp.full((n, ), 9, dtype=jnp.int32),
+            seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
         )
         (dense_conv, dense_ssm), dense_out = wrapper.fused_conv1d_gdn(
-            conv_state=conv,
-            recurrent_state=recurrent_f32,
+            states=(conv, recurrent_f32),
             state_indices=dense_idx,
-            **kwargs)
+            **kwargs,
+        )
 
         new_pool, pooled_out = gdn_attention.run_jax_gdn_attention_pooled_local(
             mixed_qkv=kwargs["qkv"],
@@ -732,23 +1195,22 @@ class TestPooledCallerV3:
             recurrent_state_dtype=jnp.float32,
         )
         assert new_pool.shape == pool.shape
-        np.testing.assert_allclose(np.asarray(pooled_out),
-                                   np.asarray(dense_out),
-                                   rtol=1e-5,
-                                   atol=1e-5)
+        np.testing.assert_allclose(
+            np.asarray(pooled_out), np.asarray(dense_out), rtol=1e-5, atol=1e-5
+        )
 
         # state update by feeding next token into both dense
         kwargs2 = kwargs | dict(
             qkv=jax.random.normal(jax.random.key(18), (n, DIM)),
             b=jax.random.normal(jax.random.key(19), (n, N_V)),
             a=jax.random.normal(jax.random.key(20), (n, N_V)),
-            seq_lens=jnp.full((n, ), 10, dtype=jnp.int32),
+            seq_lens=jnp.full((n,), 10, dtype=jnp.int32),
         )
-        (_,
-         _), dense_out2 = wrapper.fused_conv1d_gdn(conv_state=dense_conv,
-                                                   recurrent_state=dense_ssm,
-                                                   state_indices=dense_idx,
-                                                   **kwargs2)
+        (_, _), dense_out2 = wrapper.fused_conv1d_gdn(
+            states=(dense_conv, dense_ssm),
+            state_indices=dense_idx,
+            **kwargs2,
+        )
 
         new_pool2, pooled_out2 = gdn_attention.run_jax_gdn_attention_pooled_local(
             mixed_qkv=kwargs2["qkv"],
@@ -772,7 +1234,6 @@ class TestPooledCallerV3:
             recurrent_state_dtype=jnp.float32,
         )
         assert new_pool2.shape == pool.shape
-        np.testing.assert_allclose(np.asarray(pooled_out2),
-                                   np.asarray(dense_out2),
-                                   rtol=1e-3,
-                                   atol=1e-3)
+        np.testing.assert_allclose(
+            np.asarray(pooled_out2), np.asarray(dense_out2), rtol=1e-3, atol=1e-3
+        )

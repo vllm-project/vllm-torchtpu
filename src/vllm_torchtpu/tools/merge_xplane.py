@@ -92,8 +92,7 @@ class Capture:
     @property
     def label(self) -> str:
         """Human-readable tag used in merged plane and line names."""
-        return f"rank {self.rank}" if self.rank is not None else (
-            f"file {self.slot}")
+        return f"rank {self.rank}" if self.rank is not None else (f"file {self.slot}")
 
 
 @dataclass(frozen=True)
@@ -176,8 +175,10 @@ def _phase_dir(session_dir: str) -> str | None:
     """
     profile_dir = os.path.dirname(session_dir)
     plugins_dir = os.path.dirname(profile_dir)
-    if (os.path.basename(profile_dir) == "profile"
-            and os.path.basename(plugins_dir) == "plugins"):
+    if (
+        os.path.basename(profile_dir) == "profile"
+        and os.path.basename(plugins_dir) == "plugins"
+    ):
         return os.path.dirname(plugins_dir)
     return None
 
@@ -200,8 +201,7 @@ def _make_session(directory: str, paths: list[str]) -> Session:
     # `rank10_` before `rank2_`, which would mislabel every rank above 9.
     ranked = sorted(
         ((path, _rank_of(path)) for path in paths),
-        key=lambda pair:
-        (pair[1] is None, pair[1] or 0, os.path.basename(pair[0])),
+        key=lambda pair: (pair[1] is None, pair[1] or 0, os.path.basename(pair[0])),
     )
 
     # A file with no rank prefix (a single-worker capture) still needs a slot
@@ -225,10 +225,9 @@ def _make_session(directory: str, paths: list[str]) -> Session:
     # separator would otherwise shift every component by one.
     directory = os.path.normpath(os.path.abspath(directory))
     label, timestamp = _session_identity(directory)
-    return Session(label=label,
-                   timestamp=timestamp,
-                   directory=directory,
-                   captures=tuple(captures))
+    return Session(
+        label=label, timestamp=timestamp, directory=directory, captures=tuple(captures)
+    )
 
 
 def _is_within(path: str, ancestor: str) -> bool:
@@ -237,8 +236,7 @@ def _is_within(path: str, ancestor: str) -> bool:
     return path == ancestor or path.startswith(ancestor + os.sep)
 
 
-def discover_sessions(paths: list[str], *,
-                      skip: tuple[str, ...] = ()) -> list[Session]:
+def discover_sessions(paths: list[str], *, skip: tuple[str, ...] = ()) -> list[Session]:
     """Group the trace files under `paths` into capture sessions.
 
     One session per directory holding `.xplane.pb` files. That keeps a phased
@@ -265,7 +263,8 @@ def discover_sessions(paths: list[str], *,
                 if any(_is_within(root, s) for s in skip):
                     continue
                 found = [
-                    os.path.join(root, f) for f in filenames
+                    os.path.join(root, f)
+                    for f in filenames
                     if f.endswith(_TRACE_SUFFIX)
                 ]
                 if found:
@@ -278,18 +277,20 @@ def discover_sessions(paths: list[str], *,
         for directory, found in sorted(by_directory.items())
     ]
     if explicit:
-        sessions.insert(0, _make_session(os.path.dirname(explicit[0]),
-                                         explicit))
+        sessions.insert(0, _make_session(os.path.dirname(explicit[0]), explicit))
 
     def normalized(path: str) -> str:
         return os.path.normpath(os.path.abspath(path))
 
     phase_dirs = {
         normalized(session.default_output_dir)
-        for session in sessions if _phase_dir(session.directory)
+        for session in sessions
+        if _phase_dir(session.directory)
     }
     return [
-        session for session in sessions if _phase_dir(session.directory)
+        session
+        for session in sessions
+        if _phase_dir(session.directory)
         or normalized(session.directory) not in phase_dirs
     ]
 
@@ -316,8 +317,7 @@ def _tag_host_cpu_plane(plane, capture: Capture) -> None:
         plane.name = f"{_HOST_CPU_PLANE} [{slot}]"
 
     stat_id = next(
-        (key for key, meta in plane.stat_metadata.items()
-         if meta.name == "process_id"),
+        (key for key, meta in plane.stat_metadata.items() if meta.name == "process_id"),
         None,
     )
     if stat_id is None:
@@ -347,9 +347,12 @@ def _tag_host_cpu_plane(plane, capture: Capture) -> None:
             line.name = f"{thread} [{capture.label}]"
 
 
-def _rewrite_plane_name(plane, capture: Capture,
-                        local_to_global: dict[tuple[str, int], int],
-                        next_id_per_prefix: dict[str, int]) -> None:
+def _rewrite_plane_name(
+    plane,
+    capture: Capture,
+    local_to_global: dict[tuple[str, int], int],
+    next_id_per_prefix: dict[str, int],
+) -> None:
     """Rename one plane so it stays distinct once ranks are combined.
 
     Device planes are renumbered from a single global counter per prefix, which
@@ -358,8 +361,11 @@ def _rewrite_plane_name(plane, capture: Capture,
     """
     match = _PREFIX_ID_RE.match(plane.name)
     if match:
-        prefix, local_id, trailing = match.group(1), int(
-            match.group(2)), match.group(3) or ""
+        prefix, local_id, trailing = (
+            match.group(1),
+            int(match.group(2)),
+            match.group(3) or "",
+        )
         key = (prefix, local_id)
         if key not in local_to_global:
             local_to_global[key] = next_id_per_prefix.get(prefix, 0)
@@ -428,36 +434,37 @@ def merge_session(session: Session, output_path: str) -> MergeResult:
                             continue
                         seen_metadata = True
                     else:
-                        _rewrite_plane_name(plane, capture, local_to_global,
-                                            next_id_per_prefix)
+                        _rewrite_plane_name(
+                            plane, capture, local_to_global, next_id_per_prefix
+                        )
                     plane.id = plane_id
                     plane_id += 1
                     plane_count += 1
                     out.write(
-                        _delimited(_XSPACE_PLANES_FIELD,
-                                   plane.SerializeToString()))
+                        _delimited(_XSPACE_PLANES_FIELD, plane.SerializeToString())
+                    )
 
                 for error in space.errors:
                     out.write(_delimited(_XSPACE_ERRORS_FIELD, error.encode()))
                 for warning in space.warnings:
-                    out.write(
-                        _delimited(_XSPACE_WARNINGS_FIELD, warning.encode()))
+                    out.write(_delimited(_XSPACE_WARNINGS_FIELD, warning.encode()))
                 del space
 
             for hostname in hostnames:
-                out.write(
-                    _delimited(_XSPACE_HOSTNAMES_FIELD, hostname.encode()))
+                out.write(_delimited(_XSPACE_HOSTNAMES_FIELD, hostname.encode()))
 
         os.replace(temporary_path, output_path)
     finally:
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
 
-    return MergeResult(path=output_path,
-                       size=os.path.getsize(output_path),
-                       planes=plane_count,
-                       planes_read=planes_read,
-                       deduplicated=deduplicated)
+    return MergeResult(
+        path=output_path,
+        size=os.path.getsize(output_path),
+        planes=plane_count,
+        planes_read=planes_read,
+        deduplicated=deduplicated,
+    )
 
 
 def _is_inside_session_dir(directory: str) -> bool:
@@ -525,8 +532,11 @@ def main(argv: list[str] | None = None) -> int:
     # An explicit destination is resolved before scanning so the scan can
     # exclude it. Without one, each session writes to its own phase directory,
     # which discovery drops on sight rather than skipping by path.
-    explicit_dir = (os.path.dirname(os.path.abspath(args.output))
-                    if args.output else args.output_dir)
+    explicit_dir = (
+        os.path.dirname(os.path.abspath(args.output))
+        if args.output
+        else args.output_dir
+    )
 
     if explicit_dir and _is_inside_session_dir(explicit_dir):
         print(
@@ -534,25 +544,28 @@ def main(argv: list[str] | None = None) -> int:
             "merged file as an extra host alongside the per-rank files, "
             "double-counting every rank. Choose a directory outside "
             "plugins/profile/.",
-            file=sys.stderr)
+            file=sys.stderr,
+        )
         return 2
 
     if args.output:
-        skip: tuple[str, ...] = (os.path.abspath(args.output), )
+        skip: tuple[str, ...] = (os.path.abspath(args.output),)
     elif explicit_dir:
-        skip = (explicit_dir, )
+        skip = (explicit_dir,)
     else:
         # Captures that are not laid out as `<phase>/plugins/profile/<ts>/`
         # have no phase directory and fall back to `<input>/merged`.
         skip = tuple(
-            os.path.join(path, "merged") for path in args.inputs
-            if os.path.isdir(path))
+            os.path.join(path, "merged") for path in args.inputs if os.path.isdir(path)
+        )
 
     sessions = discover_sessions(args.inputs, skip=skip)
 
     if not sessions:
-        print(f"No {_TRACE_SUFFIX} files found in: {' '.join(args.inputs)}",
-              file=sys.stderr)
+        print(
+            f"No {_TRACE_SUFFIX} files found in: {' '.join(args.inputs)}",
+            file=sys.stderr,
+        )
         return 2
 
     if args.output and len(sessions) > 1:
@@ -560,7 +573,8 @@ def main(argv: list[str] | None = None) -> int:
             f"--output takes a single file but {len(sessions)} capture "
             "sessions were found. Use --output-dir, or name one session "
             "directory.",
-            file=sys.stderr)
+            file=sys.stderr,
+        )
         return 2
 
     noun = "session" if len(sessions) == 1 else "sessions"
@@ -568,10 +582,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run:
         # Without this, the plane totals below invite the reading that four
         # input files somehow became seventeen of something.
-        print("A plane is one timeline inside a capture: one per TPU chip, one"
-              " per host,")
-        print("plus a shared metadata block. Merging combines planes, not"
-              " whole files.")
+        print(
+            "A plane is one timeline inside a capture: one per TPU chip, one per host,"
+        )
+        print("plus a shared metadata block. Merging combines planes, not whole files.")
 
     total_in = total_out = 0
     written: list[str] = []
@@ -581,20 +595,24 @@ def main(argv: list[str] | None = None) -> int:
         total_in += source_bytes
         count = len(session.captures)
         ranks = [c.rank for c in session.captures if c.rank is not None]
-        rank_note = (f" (ranks {min(ranks)}-{max(ranks)})"
-                     if len(ranks) > 1 else "")
+        rank_note = f" (ranks {min(ranks)}-{max(ranks)})" if len(ranks) > 1 else ""
 
         print(f"\n  {session.label}  {session.timestamp}")
-        print(f"    input   {count} {'capture' if count == 1 else 'captures'}"
-              f"{rank_note}, {_format_size(source_bytes)}")
+        print(
+            f"    input   {count} {'capture' if count == 1 else 'captures'}"
+            f"{rank_note}, {_format_size(source_bytes)}"
+        )
 
         if session.missing_ranks:
             gaps = ", ".join(str(r) for r in session.missing_ranks)
-            print(f"    WARNING: no trace for rank(s) {gaps}. The merged file "
-                  "will describe only part of the slice.")
+            print(
+                f"    WARNING: no trace for rank(s) {gaps}. The merged file "
+                "will describe only part of the slice."
+            )
 
         destination = args.output or os.path.join(
-            explicit_dir or session.default_output_dir, session.output_name)
+            explicit_dir or session.default_output_dir, session.output_name
+        )
         written.append(destination)
 
         if args.dry_run:
@@ -603,10 +621,14 @@ def main(argv: list[str] | None = None) -> int:
 
         result = merge_session(session, destination)
         total_out += result.size
-        dropped = (f" ({result.deduplicated} duplicate {_METADATA_PLANE} "
-                   "dropped)") if result.deduplicated else ""
-        print(f"    planes  {result.planes_read} read -> {result.planes} "
-              f"written{dropped}")
+        dropped = (
+            (f" ({result.deduplicated} duplicate {_METADATA_PLANE} dropped)")
+            if result.deduplicated
+            else ""
+        )
+        print(
+            f"    planes  {result.planes_read} read -> {result.planes} written{dropped}"
+        )
         print(f"    output  {_format_size(result.size)}")
         print(f"    -> {result.path}")
 
@@ -614,8 +636,9 @@ def main(argv: list[str] | None = None) -> int:
     # scroll away, and that is the one thing every caller came for.
     print("\nSummary")
     if args.dry_run:
-        print(f"  {len(sessions)} {noun} to merge, "
-              f"{_format_size(total_in)} of captures")
+        print(
+            f"  {len(sessions)} {noun} to merge, {_format_size(total_in)} of captures"
+        )
     else:
         # Usually a large reduction, from collapsing the duplicated
         # `/host:metadata` planes. Captures small enough that the per-rank
@@ -624,10 +647,15 @@ def main(argv: list[str] | None = None) -> int:
         change = ""
         if total_in and total_out != total_in:
             percent = 100 * abs(total_out - total_in) // total_in
-            change = (f", {percent}% smaller"
-                      if total_out < total_in else f", {percent}% larger")
-        print(f"  {len(sessions)} {noun} merged, {_format_size(total_in)} -> "
-              f"{_format_size(total_out)}{change}")
+            change = (
+                f", {percent}% smaller"
+                if total_out < total_in
+                else f", {percent}% larger"
+            )
+        print(
+            f"  {len(sessions)} {noun} merged, {_format_size(total_in)} -> "
+            f"{_format_size(total_out)}{change}"
+        )
     for path in written:
         print(f"  {path}")
     return 0

@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 End-to-end tests for vLLM LLM generation API on TPU.
 
@@ -22,6 +35,9 @@ import weakref
 import pytest
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.exceptions import VLLMValidationError
+
+pytestmark = pytest.mark.tpu_test
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
@@ -45,9 +61,12 @@ GREEDY_SAMPLING_PARAMS = SamplingParams(temperature=0.0, max_tokens=4)
 def llm():
     # pytest caches the fixture so we use weakref.proxy to
     # enable garbage collection
+    # Every call sends at most 4 prompts, so 8 sequences is the only request
+    # bucket a step uses; the default compiles them up to 64.
     llm = LLM(
         model=MODEL_NAME,
         max_num_batched_tokens=64,
+        max_num_seqs=8,
         max_model_len=64,
         tensor_parallel_size=1,
         # TODO: Reduce GPU memory utilization after KV cache optimization.
@@ -78,7 +97,10 @@ def test_multiple_sampling_params(llm: LLM):
     assert len(PROMPTS) == len(outputs)
 
     # Exception raised, if the size of params does not match the size of prompts
-    with pytest.raises(ValueError):
+    with pytest.raises(
+        VLLMValidationError,
+        match=r"lengths of prompts .* and params .* must be the same",
+    ):
         outputs = llm.generate(PROMPTS, sampling_params=sampling_params[:3])
 
     # Single SamplingParams should be applied to every prompt
@@ -99,38 +121,46 @@ def test_non_greedy_sampling(llm: LLM):
 
 def test_multiple_priority(llm: LLM):
     # Generate works when priority is None
-    outputs = llm.generate(PROMPTS,
-                           sampling_params=GREEDY_SAMPLING_PARAMS,
-                           priority=None)
+    outputs = llm.generate(
+        PROMPTS, sampling_params=GREEDY_SAMPLING_PARAMS, priority=None
+    )
     assert len(PROMPTS) == len(outputs)
 
     # Generate works when length of priority is same as the len(PROMPTS)
-    outputs = llm.generate(PROMPTS,
-                           sampling_params=GREEDY_SAMPLING_PARAMS,
-                           priority=[0] * len(PROMPTS))
+    outputs = llm.generate(
+        PROMPTS, sampling_params=GREEDY_SAMPLING_PARAMS, priority=[0] * len(PROMPTS)
+    )
     assert len(PROMPTS) == len(outputs)
 
     # Exception raised, if the length of priority does not match the length of prompts
-    with pytest.raises(ValueError):
-        outputs = llm.generate(PROMPTS,
-                               sampling_params=GREEDY_SAMPLING_PARAMS,
-                               priority=[0] * (len(PROMPTS) - 1))
+    with pytest.raises(
+        VLLMValidationError,
+        match=r"lengths of prompts .* and priority .* must be the same",
+    ):
+        outputs = llm.generate(
+            PROMPTS,
+            sampling_params=GREEDY_SAMPLING_PARAMS,
+            priority=[0] * (len(PROMPTS) - 1),
+        )
 
     # Exception raised, if the priority list is empty
-    with pytest.raises(ValueError):
-        outputs = llm.generate(PROMPTS,
-                               sampling_params=GREEDY_SAMPLING_PARAMS,
-                               priority=[])
+    with pytest.raises(
+        VLLMValidationError,
+        match=r"lengths of prompts .* and priority .* must be the same",
+    ):
+        outputs = llm.generate(
+            PROMPTS, sampling_params=GREEDY_SAMPLING_PARAMS, priority=[]
+        )
 
 
 def test_max_model_len(llm: LLM):
     max_model_len = llm.model_config.max_model_len
-    sampling_params = SamplingParams(temperature=0.0,
-                                     max_tokens=max_model_len + 10)
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=max_model_len + 10)
     outputs = llm.generate(PROMPTS, sampling_params)
     for output in outputs:
         num_total_tokens = len(output.prompt_token_ids) + len(
-            output.outputs[0].token_ids)
+            output.outputs[0].token_ids
+        )
         # Total tokens must not exceed max_model_len.
         # It can be less if generation finishes due to other reasons (e.g., EOS)
         # before reaching the absolute model length limit.
@@ -149,3 +179,10 @@ def test_logprobs(llm: LLM):
 def test_log_stats(llm: LLM):
     outputs = llm.generate(PROMPTS, sampling_params=GREEDY_SAMPLING_PARAMS)
     assert all(output.metrics is not None for output in outputs)
+
+
+def test_reset_encoder_cache(llm: LLM):
+    baseline = llm.generate(PROMPTS[:1], sampling_params=GREEDY_SAMPLING_PARAMS)
+    llm.llm_engine.reset_encoder_cache()
+    outputs = llm.generate(PROMPTS[:1], sampling_params=GREEDY_SAMPLING_PARAMS)
+    assert outputs[0].outputs[0].token_ids == baseline[0].outputs[0].token_ids

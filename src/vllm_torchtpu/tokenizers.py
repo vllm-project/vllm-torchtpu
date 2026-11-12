@@ -22,6 +22,7 @@ a request that prefills one asks the model to generate past end-of-sentence.
 The encoder reads a per-message ``wo_eos`` flag and has a template for that
 case. This module registers a tokenizer that sets the flag.
 """
+
 import copy
 
 from vllm.tokenizers.protocol import TokenizerLike
@@ -36,7 +37,6 @@ def _tpu_deepseek_v4_tokenizer(tokenizer):
     base_cls = tokenizer.__class__
 
     class _TpuDeepseekV4Tokenizer(base_cls):
-
         def apply_chat_template(self, messages, tools=None, **kwargs):
             """Set ``wo_eos`` on a trailing assistant turn when
             ``continue_final_message`` is set, so the encoder omits
@@ -45,14 +45,13 @@ def _tpu_deepseek_v4_tokenizer(tokenizer):
                 # The parent renders the conversation from kwargs when it is
                 # there, so the marked copy goes back the same way.
                 conversation = list(kwargs.get("conversation", messages))
-                if conversation and conversation[-1].get(
-                        "role") == "assistant":
+                if conversation and conversation[-1].get("role") == "assistant":
                     conversation[-1] = {**conversation[-1], "wo_eos": True}
                 kwargs["conversation"] = conversation
             return super().apply_chat_template(messages, tools, **kwargs)
 
         def __reduce__(self):
-            return _tpu_deepseek_v4_tokenizer, (tokenizer, )
+            return _tpu_deepseek_v4_tokenizer, (tokenizer,)
 
     tpu_tokenizer = copy.copy(tokenizer)
     tpu_tokenizer.__class__ = _TpuDeepseekV4Tokenizer
@@ -67,7 +66,8 @@ class TpuDeepseekV4Tokenizer(TokenizerLike):
         from vllm.tokenizers.deepseek_v4 import DeepseekV4Tokenizer
 
         return _tpu_deepseek_v4_tokenizer(
-            DeepseekV4Tokenizer.from_pretrained(*args, **kwargs))
+            DeepseekV4Tokenizer.from_pretrained(*args, **kwargs)
+        )
 
 
 def register_tokenizers() -> None:
@@ -78,5 +78,4 @@ def register_tokenizers() -> None:
 
     from vllm.tokenizers.registry import TokenizerRegistry
 
-    TokenizerRegistry.register("deepseek_v4", __name__,
-                               "TpuDeepseekV4Tokenizer")
+    TokenizerRegistry.register("deepseek_v4", __name__, "TpuDeepseekV4Tokenizer")

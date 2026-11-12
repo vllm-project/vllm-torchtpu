@@ -1,21 +1,43 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
 from dataclasses import replace
+from typing import Any
 
 import torch
-from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec, MambaSpec,
-                                        MLAAttentionSpec)
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+)
 
-from vllm_torchtpu.layers.vllm.attention import (PallasAttentionBackend,
-                                                 PallasMLAttentionBackend)
+from vllm_torchtpu.gdn_pool_layout import pooled_gdn_state_dtypes
+from vllm_torchtpu.layers.adapter.attention import (
+    PallasAttentionBackend,
+    PallasMLAttentionBackend,
+    VllmTPUDeepseekV32IndexerBackend,
+)
 
 
 def normalize_kv_cache_specs_for_tpu(
     kv_cache_specs: dict[str, KVCacheSpec],
-    kv_cache_dtype: str | torch.dtype,
+    kv_cache_dtype: torch.dtype,
     *,
     enable_unified_kv_layout: bool = False,
     exempt_layers: set[str] | None = None,
-    attention_backend: type[PallasAttentionBackend],
+    attention_backend: type[PallasAttentionBackend] | None,
 ) -> dict[str, KVCacheSpec]:
     """Normalize KV cache specs to the TPU's real page geometry.
 
@@ -38,27 +60,69 @@ def normalize_kv_cache_specs_for_tpu(
             attention_backend=attention_backend,
         )
     if enable_unified_kv_layout:
-        non_exempt_specs = {
-            k: v
-            for k, v in normalized.items() if k not in exempt
-        }
+        non_exempt_specs = {k: v for k, v in normalized.items() if k not in exempt}
         if _has_hybrid_attention_and_mamba(non_exempt_specs):
+            # The pool stores the mamba state regions in its fixed physical
+            # dtypes (bf16 conv -- see gdn_pool_layout), not the layer's
+            # declared dense-cache dtypes. A layer that declares an fp32 conv
+            # state (KDA does, for the fused kernel's sake) would otherwise
+            # size its page past the attention-shaped page the pool is born
+            # with; worse, a padded page below the declared-dtype page trips
+            # MambaSpec.page_size_bytes' own invariant. Retype the spec to
+            # the physical layout before any page math.
+            non_exempt_specs = {
+                name: _pooled_physical_mamba_spec(spec)
+                for name, spec in non_exempt_specs.items()
+            }
+            normalized.update(non_exempt_specs)
             page_size = max(
-                _required_page_size_bytes(spec)
-                for spec in non_exempt_specs.values())
+                _required_page_size_bytes(spec) for spec in non_exempt_specs.values()
+            )
             normalized = {
-                layer_name: (spec if layer_name in exempt else _pad_page_size(
-                    spec, page_size))
+                layer_name: (
+                    spec if layer_name in exempt else _pad_page_size(spec, page_size)
+                )
                 for layer_name, spec in normalized.items()
             }
     return normalized
 
 
+def _as_torch_dtype(dtype: object) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    return getattr(torch, str(dtype).removeprefix("torch."))
+
+
+def _pooled_physical_mamba_spec(spec: KVCacheSpec) -> KVCacheSpec:
+    """Retype a two-state (conv, ssm) mamba spec to the dtypes the unified
+    pool physically stores; anything else passes through."""
+    if not isinstance(spec, MambaSpec):
+        return spec
+    if len(spec.shapes) != 2 or len(spec.dtypes) != 2:
+        return spec
+    conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(spec.dtypes)
+    dtypes = (_as_torch_dtype(conv_dtype), _as_torch_dtype(ssm_dtype))
+    if tuple(spec.dtypes) == dtypes:
+        return spec
+    return replace(spec, dtypes=dtypes)
+
+
+def _is_deepseek_v32_indexer_spec(spec: KVCacheSpec) -> bool:
+    """True for packed uint8 DSA indexer K-cache (`DeepseekV32IndexerCache`)."""
+    return (
+        isinstance(spec, MLAAttentionSpec)
+        and not spec.dtype.is_floating_point
+        and spec.tokens_per_state == 1
+        and spec.cache_dtype_str != "fp8_ds_mla"
+        and getattr(spec, "model_version", None) != "deepseek_v4"
+    )
+
+
 def _normalize_one_spec(
     spec: KVCacheSpec,
-    kv_cache_dtype: str | torch.dtype,
+    kv_cache_dtype: torch.dtype,
     *,
-    attention_backend: type[PallasAttentionBackend],
+    attention_backend: type[PallasAttentionBackend] | None,
 ) -> KVCacheSpec:
     if not isinstance(spec, AttentionSpec):
         return spec
@@ -72,48 +136,47 @@ def _normalize_one_spec(
         # normalize to the TPU fp8 dtype below.
         kv_cache_dtype = spec.dtype
 
-    if isinstance(spec, MLAAttentionSpec):
-        page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
-            spec.block_size,
-            spec.num_kv_heads,
-            spec.head_size,
-            kv_cache_dtype,
-        )
+    if _is_deepseek_v32_indexer_spec(spec):
+        backend: type[Any] = VllmTPUDeepseekV32IndexerBackend
+    elif isinstance(spec, MLAAttentionSpec):
+        backend = PallasMLAttentionBackend
     else:
-        page_size = attention_backend.get_kv_cache_page_size_bytes(
-            spec.block_size,
-            spec.num_kv_heads,
-            spec.head_size,
-            kv_cache_dtype,
-        )
-    target_spec = replace(spec, dtype=kv_cache_dtype)
+        assert attention_backend is not None
+        backend = attention_backend
+    page_size = backend.get_kv_cache_page_size_bytes(
+        spec.block_size,
+        spec.num_kv_heads,
+        spec.head_size,
+        kv_cache_dtype,
+    )
+    target_spec = backend.customize_spec(replace(spec, dtype=kv_cache_dtype))
     padded_page_size = spec.page_size_padded or 0
-    page_size = max(page_size, target_spec.real_page_size_bytes,
-                    padded_page_size)
-    if spec.page_size_padded == page_size and spec.dtype == kv_cache_dtype:
-        return spec
+    page_size = max(page_size, target_spec.real_page_size_bytes, padded_page_size)
+    if target_spec.page_size_padded == page_size:
+        return target_spec
     return replace(target_spec, page_size_padded=page_size)
 
 
 def _has_hybrid_attention_and_mamba(
-    kv_cache_specs: dict[str, KVCacheSpec], ) -> bool:
+    kv_cache_specs: dict[str, KVCacheSpec],
+) -> bool:
     has_attention = any(
-        isinstance(spec, AttentionSpec) for spec in kv_cache_specs.values())
-    has_mamba = any(
-        isinstance(spec, MambaSpec) for spec in kv_cache_specs.values())
+        isinstance(spec, AttentionSpec) for spec in kv_cache_specs.values()
+    )
+    has_mamba = any(isinstance(spec, MambaSpec) for spec in kv_cache_specs.values())
     return has_attention and has_mamba
 
 
 def _mamba_unpadded_page_size_bytes(spec: MambaSpec) -> int:
     return sum(
         math.prod(shape) * dtype.itemsize
-        for shape, dtype in zip(spec.shapes, spec.dtypes))
+        for shape, dtype in zip(spec.shapes, spec.dtypes)
+    )
 
 
 def _required_page_size_bytes(spec: KVCacheSpec) -> int:
     if isinstance(spec, MambaSpec):
-        return max(_mamba_unpadded_page_size_bytes(spec), spec.page_size_padded
-                   or 0)
+        return max(_mamba_unpadded_page_size_bytes(spec), spec.page_size_padded or 0)
     return spec.page_size_bytes
 
 

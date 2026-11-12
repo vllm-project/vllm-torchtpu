@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 #
 # Launch a single Docker container running a given `vllm serve` command for
 # the `mp` multihost distributed-executor backend.
@@ -10,8 +24,7 @@
 # cross-host rendezvous directly between those processes. This script is
 # the shared "run this command in a TPU-privileged container" primitive
 # used by both the head (foreground `vllm serve`) and each worker
-# (foreground `vllm serve --headless ...`) in
-# .buildkite/scripts/run_multihost.sh (--backend mp).
+# (foreground `vllm serve --headless ...`).
 #
 # Usage:
 #   run_cluster_mp.sh <docker_image> <path_to_huggingface_cache> \
@@ -45,7 +58,7 @@ trap cleanup EXIT
 # --network host: allows the head/worker vllm serve processes to reach each
 # other directly via host networking (data-parallel-address/rpc-port).
 # --shm-size=128G: shared memory; the torch_tpu compile cache lives in
-# /dev/shm/torch_tpu_cache (see run_multihost.sh for the DP>=4 rationale).
+# /dev/shm/torch_tpu_cache.
 # -v HF_HOME: mounts the HuggingFace cache (tokenizer/config only here;
 # weights stream from GCS via runai_streamer).
 docker run \

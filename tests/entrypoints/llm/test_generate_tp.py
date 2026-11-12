@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 End-to-end tests for vLLM LLM generation API with tensor parallelism on TPU.
 
@@ -27,19 +40,27 @@ def _get_local_tpu_chip_count() -> int:
         pytest.skip(f"Unable to detect local TPU chip count: {e}")
 
 
-@pytest.mark.parametrize("async_scheduling", [
-    pytest.param(False, marks=pytest.mark.nightly, id="sync"),
-    pytest.param(True, id="async"),
-])
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [
+        pytest.param(False, marks=pytest.mark.nightly, id="sync"),
+        pytest.param(True, id="async"),
+    ],
+)
 def test_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
     tp_size = _get_local_tpu_chip_count()
     if tp_size < 8:
-        pytest.skip(f"TP test expects an 8-chip agent, found {tp_size} chips; "
-                    "running here would silently reduce TP coverage")
+        pytest.skip(
+            f"TP test expects an 8-chip agent, found {tp_size} chips; "
+            "running here would silently reduce TP coverage"
+        )
 
+    # One ~6-token prompt and 4 output tokens: every step fits the 16-token
+    # bucket and the 8-request one, so those are the only shapes compiled.
     llm = LLM(
         model=MODEL_NAME,
-        max_num_batched_tokens=64,
+        max_num_batched_tokens=16,
+        max_num_seqs=8,
         max_model_len=64,
         tensor_parallel_size=tp_size,
         async_scheduling=async_scheduling,

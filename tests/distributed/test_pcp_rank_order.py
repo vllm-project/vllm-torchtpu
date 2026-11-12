@@ -66,7 +66,9 @@ def test_propagates_the_error_when_the_mesh_call_fails(monkeypatch):
     def _boom(_shape):
         raise RuntimeError("topology_aware_mesh exploded")
 
-    monkeypatch.setattr(torch.tpu, "topology_aware_mesh", _boom, raising=False)
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(topology_aware_mesh=_boom), raising=False
+    )
     with pytest.raises(RuntimeError, match="exploded"):
         order_mod.resolve_pcp_topology_order(_config())
 
@@ -76,10 +78,12 @@ def test_raises_when_the_mesh_is_not_a_permutation(monkeypatch):
     import torch
 
     mesh = numpy.array([0, 1, 2, 3, 4, 5, 6, 6]).reshape(1, 8, 1)
-    monkeypatch.setattr(torch.tpu,
-                        "topology_aware_mesh",
-                        lambda _shape: mesh,
-                        raising=False)
+    monkeypatch.setattr(
+        torch,
+        "tpu",
+        SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
+        raising=False,
+    )
     with pytest.raises(RuntimeError, match="not a permutation"):
         order_mod.resolve_pcp_topology_order(_config())
 
@@ -91,10 +95,12 @@ def test_returns_both_axes_from_one_mesh(monkeypatch):
     import torch
 
     mesh = numpy.array([[[0, 1], [6, 7], [4, 5], [2, 3]]])
-    monkeypatch.setattr(torch.tpu,
-                        "topology_aware_mesh",
-                        lambda _shape: mesh,
-                        raising=False)
+    monkeypatch.setattr(
+        torch,
+        "tpu",
+        SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
+        raising=False,
+    )
     got = order_mod.resolve_pcp_topology_order(_config(pcp=4, tp=2))
 
     assert got == {
@@ -117,10 +123,12 @@ def test_matches_the_order_measured_on_hardware(monkeypatch):
     import torch
 
     mesh = numpy.array([0, 1, 6, 7, 4, 5, 2, 3]).reshape(1, 8, 1)
-    monkeypatch.setattr(torch.tpu,
-                        "topology_aware_mesh",
-                        lambda _shape: mesh,
-                        raising=False)
+    monkeypatch.setattr(
+        torch,
+        "tpu",
+        SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
+        raising=False,
+    )
     got = order_mod.resolve_pcp_topology_order(_config(pcp=8, tp=1))
 
     assert got["pcp"] == [[0, 1, 6, 7, 4, 5, 2, 3]]
@@ -144,9 +152,11 @@ def test_context_manager_only_touches_axes_it_was_given():
     try:
         with order_mod.pcp_topology_order({"pcp": [[0, 1, 2, 3, 6, 7, 4, 5]]}):
             parallel_state.init_model_parallel_group(
-                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="pcp")
+                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="pcp"
+            )
             parallel_state.init_model_parallel_group(
-                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="tp")
+                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="tp"
+            )
     finally:
         parallel_state.init_model_parallel_group = original
 
@@ -193,9 +203,14 @@ def test_new_group_preserves_rank_order_only_for_replaced_axes():
     try:
         with order_mod.pcp_topology_order(orders):
             patched = parallel_state.init_model_parallel_group
-            for axis, built in (("tp", singletons), ("dcp", singletons),
-                                ("pcp", [list(range(8))]), ("pp", singletons),
-                                ("dp", singletons), ("ep", [list(range(8))])):
+            for axis, built in (
+                ("tp", singletons),
+                ("dcp", singletons),
+                ("pcp", [list(range(8))]),
+                ("pp", singletons),
+                ("dp", singletons),
+                ("ep", [list(range(8))]),
+            ):
                 calls.clear()
                 patched(built, 0, "gloo", group_name=axis)
                 seen[axis] = sorted({c for c in calls}, key=str)
@@ -228,9 +243,11 @@ def test_raises_when_new_group_cannot_preserve_order():
     original_new_group = torch.distributed.new_group
     torch.distributed.new_group = lambda ranks=None, backend=None: None
     try:
-        with pytest.raises(RuntimeError, match="no sort_ranks parameter"):
-            with order_mod.pcp_topology_order({"pcp": [[0, 1]]}):
-                pass
+        with (
+            pytest.raises(RuntimeError, match="no sort_ranks parameter"),
+            order_mod.pcp_topology_order({"pcp": [[0, 1]]}),
+        ):
+            pass
     finally:
         torch.distributed.new_group = original_new_group
 
@@ -264,11 +281,11 @@ def test_context_manager_changes_no_group_without_orders():
     try:
         with order_mod.pcp_topology_order(None):
             parallel_state.init_model_parallel_group(
-                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="pcp")
-            parallel_state.init_model_parallel_group([[0, 1], [2, 3]],
-                                                     0,
-                                                     "gloo",
-                                                     group_name="tp")
+                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="pcp"
+            )
+            parallel_state.init_model_parallel_group(
+                [[0, 1], [2, 3]], 0, "gloo", group_name="tp"
+            )
         # Restored even though nothing was replaced.
         assert parallel_state.init_model_parallel_group is _record
     finally:
@@ -297,19 +314,98 @@ def test_context_manager_replaces_both_axes():
     try:
         with order_mod.pcp_topology_order(orders):
             parallel_state.init_model_parallel_group(
-                [[0, 2, 4, 6], [1, 3, 5, 7]], 0, "gloo", group_name="pcp")
+                [[0, 2, 4, 6], [1, 3, 5, 7]], 0, "gloo", group_name="pcp"
+            )
             parallel_state.init_model_parallel_group(
-                [[0, 1], [2, 3], [4, 5], [6, 7]], 0, "gloo", group_name="tp")
-            parallel_state.init_model_parallel_group([[0]],
-                                                     0,
-                                                     "gloo",
-                                                     group_name="dp")
+                [[0, 1], [2, 3], [4, 5], [6, 7]], 0, "gloo", group_name="tp"
+            )
+            parallel_state.init_model_parallel_group([[0]], 0, "gloo", group_name="dp")
     finally:
         parallel_state.init_model_parallel_group = original
 
     assert seen["pcp"] == orders["pcp"]
     assert seen["tp"] == orders["tp"]
     assert seen["dp"] == [[0]]
+
+
+def test_preserve_dcp_order_sorts_unsorted_and_disables_sort_ranks():
+    """preserve_dcp_order=True sorts unsorted dcp ranks and passes sort_ranks=False
+    to new_group, while leaving already-sorted or non-dcp axes with default
+    sort_ranks=True.
+    """
+    import torch
+    from vllm.distributed import parallel_state
+
+    original_new_group = torch.distributed.new_group
+    original_init = parallel_state.init_model_parallel_group
+
+    calls = []
+    seen_ranks = {}
+
+    def _record_new_group(ranks=None, sort_ranks=True, **kwargs):
+        calls.append(sort_ranks)
+        return None
+
+    def _fake_init(group_ranks, local_rank, backend, *args, **kwargs):
+        axis = kwargs.get("group_name")
+        seen_ranks[axis] = [list(g) for g in group_ranks]
+        for ranks in group_ranks:
+            torch.distributed.new_group(ranks)
+
+    torch.distributed.new_group = _record_new_group
+    parallel_state.init_model_parallel_group = _fake_init
+    try:
+        with order_mod.pcp_topology_order(None, preserve_dcp_order=True):
+            patched = parallel_state.init_model_parallel_group
+
+            # 1. Unsorted DCP group: sorted, and sort_ranks=False passed to new_group
+            calls.clear()
+            patched([[0, 8, 1, 9]], 0, "gloo", group_name="dcp")
+            assert seen_ranks["dcp"] == [[0, 1, 8, 9]]
+            assert calls == [False]
+
+            # 2. Already-sorted DCP group: untouched, and default sort_ranks=True
+            calls.clear()
+            patched([[0, 1, 8, 9]], 0, "gloo", group_name="dcp")
+            assert seen_ranks["dcp"] == [[0, 1, 8, 9]]
+            assert calls == [True]
+
+            # 3. Non-DCP axis: untouched, and default sort_ranks=True
+            calls.clear()
+            patched([[0, 2], [1, 3]], 0, "gloo", group_name="tp")
+            assert seen_ranks["tp"] == [[0, 2], [1, 3]]
+            assert calls == [True, True]
+
+            calls.clear()
+            patched([[0]], 0, "gloo", group_name="dp")
+            assert seen_ranks["dp"] == [[0]]
+            assert calls == [True]
+    finally:
+        torch.distributed.new_group = original_new_group
+        parallel_state.init_model_parallel_group = original_init
+
+
+def test_preserve_dcp_order_false_leaves_unsorted_dcp_untouched():
+    """preserve_dcp_order=False leaves unsorted dcp group ranks untouched."""
+    from vllm.distributed import parallel_state
+
+    seen = {}
+    before = parallel_state.init_model_parallel_group
+
+    def _record(group_ranks, local_rank, backend, **kwargs):
+        seen[kwargs.get("group_name")] = [list(g) for g in group_ranks]
+        return None
+
+    parallel_state.init_model_parallel_group = _record
+    try:
+        with order_mod.pcp_topology_order(None, preserve_dcp_order=False):
+            parallel_state.init_model_parallel_group(
+                [[0, 8, 1, 9]], 0, "gloo", group_name="dcp"
+            )
+    finally:
+        parallel_state.init_model_parallel_group = before
+
+    assert seen["dcp"] == [[0, 8, 1, 9]]
 
 
 # --- verify_pcp_topology_order ---------------------------------------------
@@ -322,10 +418,12 @@ def _patch_groups(monkeypatch, *, rank, pcp=None, tp=None):
 
     monkeypatch.setattr(dist, "get_rank", lambda: rank)
     for name, ranks in (("get_pcp_group", pcp), ("get_tp_group", tp)):
-        monkeypatch.setattr(parallel_state,
-                            name,
-                            lambda ranks=ranks: SimpleNamespace(ranks=ranks),
-                            raising=False)
+        monkeypatch.setattr(
+            parallel_state,
+            name,
+            lambda ranks=ranks: SimpleNamespace(ranks=ranks),
+            raising=False,
+        )
 
 
 def test_verify_does_nothing_when_no_order_was_applied(monkeypatch):
@@ -346,14 +444,15 @@ def test_verify_does_nothing_when_no_order_was_applied(monkeypatch):
 def test_verify_accepts_the_order_it_asked_for(monkeypatch):
     _patch_groups(monkeypatch, rank=6, pcp=[0, 1, 6, 7, 4, 5, 2, 3], tp=[6])
 
-    order_mod.verify_pcp_topology_order({
-        "pcp": [[0, 1, 6, 7, 4, 5, 2, 3]],
-        "tp": [[r] for r in range(8)],
-    })
+    order_mod.verify_pcp_topology_order(
+        {
+            "pcp": [[0, 1, 6, 7, 4, 5, 2, 3]],
+            "tp": [[r] for r in range(8)],
+        }
+    )
 
 
-def test_verify_raises_when_the_members_match_but_the_order_does_not(
-        monkeypatch):
+def test_verify_raises_when_the_members_match_but_the_order_does_not(monkeypatch):
     """The failure this function exists for.
 
     A ring is its order, so a group holding the right ranks in the wrong
@@ -363,8 +462,7 @@ def test_verify_raises_when_the_members_match_but_the_order_does_not(
     _patch_groups(monkeypatch, rank=6, pcp=[0, 1, 2, 3, 4, 5, 6, 7])
 
     with pytest.raises(RuntimeError, match="did not adopt the requested"):
-        order_mod.verify_pcp_topology_order(
-            {"pcp": [[0, 1, 6, 7, 4, 5, 2, 3]]})
+        order_mod.verify_pcp_topology_order({"pcp": [[0, 1, 6, 7, 4, 5, 2, 3]]})
 
 
 def test_verify_raises_when_the_rank_is_in_no_resolved_group(monkeypatch):
@@ -373,8 +471,7 @@ def test_verify_raises_when_the_rank_is_in_no_resolved_group(monkeypatch):
     _patch_groups(monkeypatch, rank=9, pcp=[0, 1, 6, 7, 4, 5, 2, 3])
 
     with pytest.raises(RuntimeError, match="does not appear in the pcp"):
-        order_mod.verify_pcp_topology_order(
-            {"pcp": [[0, 1, 6, 7, 4, 5, 2, 3]]})
+        order_mod.verify_pcp_topology_order({"pcp": [[0, 1, 6, 7, 4, 5, 2, 3]]})
 
 
 def test_verify_raises_for_an_axis_it_cannot_read_back(monkeypatch):
@@ -384,3 +481,20 @@ def test_verify_raises_for_an_axis_it_cannot_read_back(monkeypatch):
 
     with pytest.raises(RuntimeError, match="No group accessor"):
         order_mod.verify_pcp_topology_order({"ep": [[0, 1]]})
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "prefill_context_parallel_size",
+        "nnodes",
+        "data_parallel_size",
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+    ],
+)
+def test_missing_parallel_field_cannot_select_a_default_topology(field):
+    config = _config()
+    delattr(config.parallel_config, field)
+    with pytest.raises(AttributeError, match=field):
+        order_mod.resolve_pcp_topology_order(config)

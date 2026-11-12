@@ -1,0 +1,500 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for the Deepseek V4 SparseCore top-k kernel.
+
+`sparsecore_topk` has two execution paths and, before this file, neither had a
+test. `_pick_partition` returns P=1 for most shapes and the call takes the
+single-stage fast path; only when `b < 32` or `n > 32K` does it split each row
+into P slices, run a local top-k per slice, and merge the `P * k_p` candidates
+in a second pass. Every GLM-5.2 configuration exercised in practice to date has
+run at `--max-model-len=9216` (`n=10240`), where the batch sizes that matter
+resolve to P=1 -- so the **two-stage path had never executed at all** until it
+was checked deliberately.
+
+It matters because the path is live, not dead code: `streamindex_topk` calls
+this from `_common_path`, and `enable_early_exit` defaults to `False`, so there
+is no `lax.cond` and no env flag standing between production and this kernel.
+Raising the context is all it takes. At `--max-model-len=132096` the call
+resolves to P=8 with 16640-word slices and 16384 candidates.
+
+Two properties of the kernel shape these tests, and both rule out the obvious
+assertion:
+
+* **Compare selected SCORES as a multiset, never the indices.** The kernel
+  returns indices *unsorted* and its own docstring concedes that equal boundary
+  scores "may be broken differently". Real score rows carry hundreds of exact
+  ties, so asserting on the index set asserts something the kernel never
+  promised, and would fail on a correct implementation.
+* **Use no relative tolerance.** This is exact selection, not approximation, so
+  the bar is `max |score diff| == 0.0`. A relative tolerance would also be
+  meaningless against rows whose maximum is exactly 0.0.
+
+`test_comparison_detects_a_wrong_index` is the reason to believe the rest of the
+file. A test whose assertion cannot fail reads as evidence while providing none,
+so the comparison helper is run a second time against deliberately corrupted
+output and is required to reject it.
+"""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from vllm_torchtpu.kernels.deepseek_v4 import sparsecore_topk as sc_module
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
+    LANES,
+    MAX_SLICE_WORDS,
+    _align_to,
+    _pick_partition,
+    sparsecore_topk,
+)
+
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+
+# `n` for a given `--max-model-len`, mirroring `streamindex_topk.py:602-605`:
+# `align_to(pages_per_seq, bkv_p) * page_size // 128 * 128` with page_size=1024
+# and bkv_p=2 on the GLM path.
+N_SHORT = 10240  # --max-model-len 9216
+N_128K = 133120  # --max-model-len 132096
+N_1M = 1048576  # --max-model-len 1048576, the GLM-5.2 DCP=16 shape
+
+SEED = 20260904
+
+
+def _topk_n(max_model_len: int, page_size: int = 1024, bkv_p: int = 2) -> int:
+    pages_per_seq = -(-max_model_len // page_size)
+    return _align_to(pages_per_seq, bkv_p) * page_size // 128 * 128
+
+
+def _reference_scores(
+    scores: np.ndarray, k: int, row_lengths: np.ndarray
+) -> np.ndarray:
+    """Exact top-k scores per row, descending, `-inf` suffix-padded.
+
+    Positions at or beyond `row_lengths`, and `-inf` scores, are never
+    eligible.
+    """
+    out = np.full((scores.shape[0], k), -np.inf, np.float32)
+    for i in range(scores.shape[0]):
+        row = scores[i, : int(row_lengths[i])]
+        eligible = row[row > -np.inf]
+        vals = np.sort(eligible)[::-1][:k]
+        out[i, : vals.size] = vals
+    return out
+
+
+def _mismatch(
+    scores: np.ndarray, idx: np.ndarray, k: int, row_lengths: np.ndarray
+) -> str | None:
+    """`None` if `idx` is a valid exact top-k, else why it is not.
+
+    Returns a reason rather than asserting so that
+    `test_comparison_detects_a_wrong_index` can require this to reject bad
+    output. An assertion buried in here could not be tested for its ability to
+    fire.
+    """
+    b, n = scores.shape
+    ref = _reference_scores(scores, k, row_lengths)
+    got = np.full((b, k), -np.inf, np.float32)
+
+    for i in range(b):
+        sel = idx[i]
+        live = sel[sel >= 0]
+        # `-1` padding must be a suffix, not interleaved.
+        n_live = live.size
+        if not (np.all(idx[i, n_live:] < 0) and np.all(idx[i, :n_live] >= 0)):
+            return f"row {i}: -1 padding is not a suffix"
+        if n_live and live.max() >= n:
+            return f"row {i}: index {live.max()} out of range for n={n}"
+        if np.unique(live).size != n_live:
+            return f"row {i}: duplicate indices"
+        if n_live and live.max() >= 0:
+            beyond = live[live >= int(row_lengths[i])]
+            if beyond.size:
+                return (
+                    f"row {i}: index {beyond[0]} at or beyond "
+                    f"row_length {int(row_lengths[i])}"
+                )
+        vals = np.sort(scores[i, live])[::-1] if n_live else np.zeros(0)
+        got[i, : vals.size] = vals
+
+    n_ref = np.isfinite(ref).sum(axis=1)
+    n_got = np.isfinite(got).sum(axis=1)
+    if not (n_ref == n_got).all():
+        bad = int(np.flatnonzero(n_ref != n_got)[0])
+        return f"row {bad}: returned {n_got[bad]} valid entries, expected {n_ref[bad]}"
+
+    finite = np.isfinite(ref) & np.isfinite(got)
+    if finite.any():
+        # Exact: this is a selection, so a correct kernel returns the same
+        # score values bit for bit. No relative tolerance.
+        diff = np.abs(ref[finite] - got[finite]).max()
+        if diff != 0.0:
+            return f"max score difference {diff!r}, expected exactly 0.0"
+    return None
+
+
+def _scores(kind: str, b: int, n: int, rng: np.random.Generator) -> np.ndarray:
+    """Score rows, each probing a different way selection can go wrong."""
+    if kind == "strict_desc":
+        # Tie-free and monotone: the answer is known in closed form, so a
+        # kernel that mishandles ordering has nowhere to hide.
+        # This is also the only `kind` whose winners are negative, so it is
+        # what covers `monotone_key` -- the involution is the identity on
+        # non-negative floats, and `random`/`heavy_ties` are centred at or
+        # above zero. Measured: dropping the involution at stage 2's emit site
+        # fails this `kind` on all five two-stage shapes (and nothing on the
+        # single-stage one, which has no emit site). The only other test that
+        # catches it is `test_topk_concentrated_in_the_last_partition`, via its
+        # negative `-1e30` padding fill.
+        return np.repeat(-np.arange(n, dtype=np.float32)[None, :], b, axis=0)
+    if kind == "random":
+        return rng.standard_normal((b, n), dtype=np.float32)
+    if kind == "heavy_ties":
+        # 17 distinct values across the whole row, so the k-th and (k+1)-th
+        # scores are equal in every row and every partition boundary lands in a
+        # tie. This is the case that makes an index-based assertion wrong.
+        # int8 first: `rng.integers` defaults to int64, which is 1 GiB at the
+        # 128K shape.
+        return rng.integers(0, 17, size=(b, n), dtype=np.int8).astype(np.float32)
+    if kind == "all_neg_inf":
+        return np.full((b, n), -np.inf, np.float32)
+    raise ValueError(kind)
+
+
+def _run(scores: np.ndarray, k: int, row_lengths: np.ndarray) -> np.ndarray:
+    return np.asarray(
+        jax.block_until_ready(
+            sparsecore_topk(jnp.asarray(scores), k, jnp.asarray(row_lengths))
+        )
+    )
+
+
+# Shapes covering the single-stage path and both two-stage partition factors
+# production can reach. The expected `P` is asserted separately, not assumed --
+# see
+# `test_partition_factor_is_what_these_tests_assume`. `P` at the 128K shape is
+# 8 rather than 4 because `MAX_SLICE_WORDS` is the *single-buffer* budget and
+# the resident slice is now double-buffered by `emit_pipeline`, so `p_min`
+# doubled.
+SHAPES = [
+    pytest.param(64, N_SHORT, 2048, 1, id="p1-b64-n10240"),
+    pytest.param(16, N_SHORT, 2048, 2, id="p2-b16-n10240"),
+    pytest.param(16, N_128K, 2048, 8, id="p8-b16-n133120"),
+    pytest.param(64, N_128K, 2048, 8, id="p8-b64-n133120"),
+    pytest.param(16, N_128K, 512, 8, id="p8-b16-n133120-k512"),
+    # The other end of the production bucket ladder. `_dp_coordinated_step`
+    # all-reduce-MAXes the token count across the 16 DP ranks, so a step in
+    # which any one rank prefills drags every rank to the top bucket -- 1024 at
+    # `--max-num-batched-tokens=1024`. It is as much a production shape as 16
+    # is, and it is the one that needs 64x as many stage-1 waves as `b=16`.
+    pytest.param(1024, N_128K, 2048, 8, id="p8-b1024-n133120"),
+]
+
+
+def test_shape_derivation_matches_max_model_len():
+    """The 128K shape is derived, not hardcoded, so a page-size change shows."""
+    assert _topk_n(9216) == N_SHORT
+    assert _topk_n(132096) == N_128K
+    assert _topk_n(1048576, page_size=256) == N_1M
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("b,k", [(16, 2048), (64, 2048), (128, 2048)])
+def test_exact_topk_at_1m_with_single_buffered_slices(b, k):
+    """1M rows must stay on one SparseCore by single-buffering 64K slices.
+
+    At 1M context the double-buffered budget needs `p=32`, but a cooperative
+    group shares its histogram in one SparseCore's VMEM_SHARED, so it holds at
+    most 16 subcores. Past that the group spans two SparseCores and the core
+    halts at runtime (E0200 RuntimeUnexpectedCoreHalt), poisoning every later
+    test in the process. `_pick_partition` instead returns `p=16` with slices
+    twice `MAX_SLICE_WORDS`, which only fit in tile memory single-buffered;
+    double-buffered they fail to compile with E3000. `b=16` is a single wave,
+    the others pipeline several.
+    """
+    p = _pick_partition(b, N_1M, k)
+    assert p == 16 and N_1M // p > MAX_SLICE_WORDS, (
+        f"{b=} {k=} no longer reaches the single-buffered path (p={p})"
+    )
+    rng = np.random.default_rng(SEED)
+    scores = _scores("random", b, N_1M, rng)
+    row_lengths = np.full(b, N_1M, np.int32)
+    assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
+
+
+@pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
+def test_partition_factor_is_what_these_tests_assume(b, n, k, expected_p):
+    """Pin `P` so a change to `_pick_partition` cannot silently retarget these.
+
+    Without this, tuning `MAX_SLICE_WORDS` or the doubling loop could collapse
+    every case below to the single-stage path, and the suite would keep passing
+    while testing nothing about the two-stage merge.
+    """
+    assert _pick_partition(b, n, k) == expected_p
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
+@pytest.mark.parametrize("kind", ["strict_desc", "random", "heavy_ties"])
+def test_exact_topk_full_rows(b, n, k, expected_p, kind):
+    rng = np.random.default_rng(SEED)
+    scores = _scores(kind, b, n, rng)
+    row_lengths = np.full(b, n, np.int32)
+    assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
+def test_exact_topk_ragged_rows_straddle_partition_boundaries(b, n, k, expected_p):
+    """Ragged lengths are the chunked-prefill case and the two-stage risk.
+
+    `_effective_row_lengths` gives every row in a chunk a different amount of
+    visible context, so partitions are routinely partly or wholly empty. Edges
+    exactly at `n_p` are where a stage-1 slice contributes nothing and stage 2
+    must cope with all-padding candidate blocks.
+    """
+    n_p = n // expected_p
+    rng = np.random.default_rng(SEED)
+    scores = _scores("random", b, n, rng)
+    edges = sorted(
+        {
+            min(max(e, 0), n)
+            for e in (
+                0,
+                1,
+                LANES,
+                k,
+                n_p - 1,
+                n_p,
+                n_p + 1,
+                2 * n_p,
+                2 * n_p + 17,
+                3 * n_p,
+                n - 1,
+                n,
+            )
+        }
+    )
+    row_lengths = np.array([edges[i % len(edges)] for i in range(b)], np.int32)
+    assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
+def test_all_neg_inf_rows_return_no_selection(b, n, k, expected_p):
+    """`-inf` is never eligible, so every output slot must be `-1`."""
+    rng = np.random.default_rng(SEED)
+    scores = _scores("all_neg_inf", b, n, rng)
+    row_lengths = np.full(b, n, np.int32)
+    idx = _run(scores, k, row_lengths)
+    assert (idx == -1).all(), f"expected all -1, got {np.unique(idx)[:8]}"
+    assert _mismatch(scores, idx, k, row_lengths) is None
+
+
+@pytest.mark.tpu_test
+def test_topk_concentrated_in_the_last_partition():
+    """The two-stage path's own failure mode.
+
+    All the mass sits in the final slice, so all but one of the stage-1
+    candidate blocks are pure padding and stage 2 has to discard them without
+    letting a padded entry outrank a real one.
+    """
+    b, n, k, p = 16, N_128K, 2048, 8
+    assert _pick_partition(b, n, k) == p
+    rng = np.random.default_rng(SEED)
+    scores = np.full((b, n), -1e30, np.float32)
+    scores[:, -(k + 64) :] = rng.standard_normal((b, k + 64)).astype(np.float32)
+    row_lengths = np.full(b, n, np.int32)
+    assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "corruption", ["worst_index", "drop_one", "duplicate", "negative"]
+)
+def test_comparison_detects_a_wrong_index(corruption):
+    """The meta-test: prove `_mismatch` can reject bad output.
+
+    Every other assertion in this file is `_mismatch(...) is None`, which is
+    worth exactly as much as this test. Four independent corruptions, each of
+    which a correct kernel would never produce.
+
+    `worst_index` swaps in the row's *minimum* eligible column rather than
+    shifting an index by one. Under `heavy_ties` an adjacent column very often
+    carries an identical score, so a one-off shift leaves the score multiset
+    unchanged -- the comparison would rightly accept it, and the control would
+    look broken when it was the perturbation that was too weak.
+    """
+    b, n, k = 16, N_128K, 2048
+    rng = np.random.default_rng(SEED)
+    scores = _scores("random", b, n, rng)
+    row_lengths = np.full(b, n, np.int32)
+    idx = _run(scores, k, row_lengths)
+    assert _mismatch(scores, idx, k, row_lengths) is None, "baseline must pass"
+
+    bad = idx.copy()
+    if corruption == "worst_index":
+        bad[0, 0] = int(np.argmin(scores[0, : int(row_lengths[0])]))
+    elif corruption == "drop_one":
+        bad[0, 0] = -1  # breaks the suffix-padding invariant and the count
+    elif corruption == "duplicate":
+        bad[0, 0] = int(bad[0, 1])
+    elif corruption == "negative":
+        bad[0, 0] = n + 5  # out of range
+
+    assert _mismatch(scores, bad, k, row_lengths) is not None, (
+        f"corruption {corruption!r} was NOT detected -- the comparison used by "
+        f"every other test in this file cannot fail, so those tests prove "
+        f"nothing"
+    )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "b,n,k",
+    [
+        (32, 2048, 256),  # single_stage
+        (4, 8192, 256),  # two_stage
+    ],
+)
+def test_return_scores(b: int, n: int, k: int):
+    """Verifies that return_scores=True returns matching scores for winners and
+    -inf for pad.
+    """
+    np.random.seed(800 + b + n + k)
+    scores = np.random.randn(b, n).astype(np.float32)
+    row_lengths = np.random.randint(k, n + 1, size=(b,), dtype=np.int32)
+
+    actual_idxs, actual_scores_bits = sparsecore_topk(
+        jnp.array(scores),
+        k,
+        row_lengths=jnp.array(row_lengths),
+        return_scores=True,
+    )
+    assert _mismatch(scores, actual_idxs, k, row_lengths) is None
+
+    actual_scores = np.asarray(
+        jax.lax.bitcast_convert_type(actual_scores_bits, jnp.float32)
+    )
+    for r in range(b):
+        for i in range(k):
+            idx = int(actual_idxs[r, i])
+            score_val = actual_scores[r, i]
+            if idx >= 0:
+                np.testing.assert_allclose(score_val, scores[r, idx], rtol=1e-5)
+            else:
+                assert score_val == -np.inf
+
+
+# --------------------------------------------------------------------------- #
+# Scheduling groups.
+# --------------------------------------------------------------------------- #
+# `scheduling_group_id` puts the SparseCore call in an XLA scheduling group, so a
+# caller pipelining several chunks can overlap it with a different chunk's
+# TensorCore work. Every partition factor is now one cooperative call, so there
+# is no second stage and no stage-2 id.
+#
+# The id is a scheduling hint, so there are exactly two ways it can be wrong:
+# the annotation is lost (or appears when not asked for), or it perturbs the
+# selection. One test each. Which call gets the id is decided before any kernel
+# is built, so that half runs on CPU and only the other two need a TPU.
+
+# `b=64, n=N_SHORT` is P=1; `b=16, n=N_128K` is one cooperative call at P=8.
+SINGLE_STAGE = (64, N_SHORT, 2048)
+COOPERATIVE = (16, N_128K, 2048)
+
+
+def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
+    """The `scheduling_group_id` each `_sc_topk_direct` call receives, in order.
+
+    Calls `sparsecore_topk.__wrapped__` rather than the jitted wrapper so the
+    stub is guaranteed to be the function that runs: a cached trace from an
+    earlier test would otherwise re-run the real kernel and record nothing.
+    """
+    seen: list[int | None] = []
+
+    def _stub(scores, k_, row_lengths, *, scheduling_group_id=None, **_):
+        seen.append(scheduling_group_id)
+        out = jnp.zeros((scores.shape[0], k_), jnp.int32)
+        return out, out
+
+    monkeypatch.setattr(sc_module, "_sc_topk_direct", _stub)
+    sc_module.sparsecore_topk.__wrapped__(jnp.zeros((b, n), jnp.float32), k, **kwargs)
+    return seen
+
+
+@pytest.mark.parametrize(
+    "shape,expected_p,kwargs,expected",
+    [
+        (SINGLE_STAGE, 1, dict(scheduling_group_id=3), [3]),
+        (SINGLE_STAGE, 1, {}, [None]),
+        (COOPERATIVE, 8, dict(scheduling_group_id=3), [3]),
+        (COOPERATIVE, 8, {}, [None]),
+    ],
+    ids=["p1", "p1_none", "p8", "p8_none"],
+)
+def test_each_stage_gets_the_group_id_it_was_given(
+    monkeypatch, shape, expected_p, kwargs, expected
+):
+    b, n, k = shape
+    assert _pick_partition(b, n, k) == expected_p
+    assert _stage_group_ids(monkeypatch, b, n, k, **kwargs) == expected
+
+
+@pytest.mark.tpu_test
+def test_scheduling_group_ids_reach_the_lowered_hlo():
+    """The stub test above proves the plumbing; this proves the plumbing does
+    something. The id has to survive as a frontend attribute, or the call is
+    annotated only in the source."""
+    b, n, k = COOPERATIVE
+    assert _pick_partition(b, n, k) == 8
+    scores = jnp.zeros((b, n), jnp.float32)
+    row_lengths = jnp.full((b,), n, jnp.int32)
+
+    def _text(**kwargs):
+        return sparsecore_topk.lower(scores, k, row_lengths, **kwargs).as_text()
+
+    assert '_scheduling_group_id = "3"' in _text(scheduling_group_id=3)
+    # Nothing is annotated unless it was asked for.
+    assert "_scheduling_group_id" not in _text()
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("kind", ["random", "heavy_ties"])
+def test_scheduling_group_ids_do_not_change_the_selection(kind):
+    """A scheduling hint that changed the answer would be a correctness bug."""
+    b, n, k = COOPERATIVE
+    rng = np.random.default_rng(SEED)
+    scores = _scores(kind, b, n, rng)
+    row_lengths = np.full(b, n, np.int32)
+
+    plain = _run(scores, k, row_lengths)
+    grouped = np.asarray(
+        jax.block_until_ready(
+            sparsecore_topk(
+                jnp.asarray(scores),
+                k,
+                jnp.asarray(row_lengths),
+                scheduling_group_id=3,
+            )
+        )
+    )
+
+    assert _mismatch(scores, grouped, k, row_lengths) is None
+    # Indices may legitimately differ on ties, the selected scores may not.
+    np.testing.assert_array_equal(
+        np.sort(np.take_along_axis(scores, np.maximum(plain, 0), axis=1), axis=1),
+        np.sort(np.take_along_axis(scores, np.maximum(grouped, 0), axis=1), axis=1),
+    )

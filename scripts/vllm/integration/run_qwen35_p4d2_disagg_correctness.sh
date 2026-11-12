@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +39,8 @@ PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-768}"
 DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-2304}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
+VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-0}"
+TPU_RAIDEN_PREFIX_AWARE_LOAD="${TPU_RAIDEN_PREFIX_AWARE_LOAD:-1}"
 # P4D4 uses a smaller per-worker premapped pool than the plugin-wide Raiden
 # default to reduce libtpu startup reservation time for this bounded case.
 TPU_PREMAPPED_BUFFER_SIZE="${TPU_PREMAPPED_BUFFER_SIZE:-8589934592}"
@@ -42,7 +57,9 @@ default_prefill_speculative_config='{"method":"mtp","num_speculative_tokens":1}'
 default_decode_speculative_config='{"method":"mtp","num_speculative_tokens":3}'
 PREFILL_SPECULATIVE_CONFIG="${PREFILL_SPECULATIVE_CONFIG-${default_prefill_speculative_config}}"
 DECODE_SPECULATIVE_CONFIG="${DECODE_SPECULATIVE_CONFIG-${default_decode_speculative_config}}"
-MIN_MTP_ACCEPTANCE_RATE="${MIN_MTP_ACCEPTANCE_RATE:-0.45}"
+# Candidate regression floor for this fixed PCP4/DP4 workload; configurable
+# for other models/geometries. Validate each cold start independently.
+MIN_MTP_ACCEPTANCE_RATE="${MIN_MTP_ACCEPTANCE_RATE:-0.50}"
 
 cleanup() {
   local pid_file pid
@@ -83,6 +100,10 @@ fi
 
 mkdir -p "${RUN_ROOT}" "${RUN_DIR}/logs"
 
+# Dynamically extract the exact vLLM version installed in the container
+EXPECTED_VLLM_VERSION="${EXPECTED_VLLM_VERSION:-$(python3 -c 'import importlib.metadata as m; print(m.version("vllm"))')}"
+export EXPECTED_VLLM_VERSION
+
 export MODEL_PATH
 export SERVED_MODEL_NAME
 export RUN_ROOT
@@ -105,6 +126,8 @@ export PREFILL_BLOCK_SIZE
 export DECODE_BLOCK_SIZE
 export ENABLE_PREFIX_CACHING
 export MAMBA_CACHE_MODE
+export VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+export TPU_RAIDEN_PREFIX_AWARE_LOAD
 export TPU_PREMAPPED_BUFFER_SIZE
 export TPU_PARALLEL_PRECOMPILE
 export NUM_GPU_BLOCKS_OVERRIDE
@@ -138,6 +161,22 @@ cd "${repo_root}"
 bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh \
   2>&1 | tee "${RUN_DIR}/logs/launch.log"
 
+if ! grep -Fqx \
+    "VLLM_PREFIX_CACHE_RETENTION_INTERVAL=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}" \
+    "${RUN_DIR}/launch_params.txt"; then
+  echo "Expected VLLM_PREFIX_CACHE_RETENTION_INTERVAL=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL} in launch_params.txt" >&2
+  exit 1
+fi
+echo "PREFIX_CACHE_RETENTION_INTERVAL_OK ${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}"
+
+if ! grep -Fqx \
+    "TPU_RAIDEN_PREFIX_AWARE_LOAD=${TPU_RAIDEN_PREFIX_AWARE_LOAD}" \
+    "${RUN_DIR}/launch_params.txt"; then
+  echo "Expected TPU_RAIDEN_PREFIX_AWARE_LOAD=${TPU_RAIDEN_PREFIX_AWARE_LOAD} in launch_params.txt" >&2
+  exit 1
+fi
+echo "RAIDEN_PREFIX_AWARE_LOAD_OK ${TPU_RAIDEN_PREFIX_AWARE_LOAD}"
+
 expected_prefill_scheduler_block_size=$((PREFILL_BLOCK_SIZE * PREFILL_PCP))
 expected_decode_scheduler_block_size="${DECODE_BLOCK_SIZE}"
 prefill_resolution="scheduler_block_size=${expected_prefill_scheduler_block_size} hash_block_size=${expected_prefill_scheduler_block_size}"
@@ -162,11 +201,32 @@ if ((P4D2_PREFIX_HIT_PROBE_COUNT < 2)); then
   echo "P4D2_PREFIX_HIT_PROBE_COUNT must be at least 2" >&2
   exit 2
 fi
+# The runner starts fresh servers; fixed prompt namespaces make acceptance
+# comparable across independent cold starts without reusing a live cache.
+prefix_hit_probe_namespace="pcp4-dp4-retention-v1"
+if [[ "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}" == "0" ]]; then
+  # Zero retention starts with no periodic Mamba checkpoints. Prime the full
+  # attention cache once so the next request discovers the shared-prefix
+  # junction and materializes the adaptive Mamba checkpoint. Keep this setup
+  # request outside the measured interval: the existing assertion then still
+  # requires every repeat after the adaptive request to hit one scheduler block.
+  python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
+    --host "${P4D2_BIND_HOST}" \
+    --port "${PROXY_PORT}" \
+    --model "${SERVED_MODEL_NAME}" \
+    --namespace "${prefix_hit_probe_namespace}" \
+    --prefix-hit-probe-only \
+    --long-repeat-lines "${P4D2_PREFIX_HIT_PROBE_LINES}" \
+    --long-repeat-count 1 \
+    2>&1 | tee "${RUN_DIR}/logs/prefix_cache_retention_warmup.log"
+  echo "PREFIX_CACHE_RETENTION_WARMUP_OK 1"
+fi
 prefill_prefix_cache_hits_before="$(read_prefill_prefix_cache_hits)"
 python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
   --host "${P4D2_BIND_HOST}" \
   --port "${PROXY_PORT}" \
   --model "${SERVED_MODEL_NAME}" \
+  --namespace "${prefix_hit_probe_namespace}" \
   --prefix-hit-probe-only \
   --long-repeat-lines "${P4D2_PREFIX_HIT_PROBE_LINES}" \
   --long-repeat-count "${P4D2_PREFIX_HIT_PROBE_COUNT}" \
@@ -178,9 +238,12 @@ prefill_prefix_cache_hits_delta=$((
 expected_prefill_prefix_cache_hits_delta=$((
   expected_prefill_scheduler_block_size * (P4D2_PREFIX_HIT_PROBE_COUNT - 1)
 ))
+expected_warm_prefill_prefix_cache_hits_delta=$((
+  expected_prefill_scheduler_block_size * P4D2_PREFIX_HIT_PROBE_COUNT
+))
 echo "PREFILL_PREFIX_CACHE_HITS_DELTA ${prefill_prefix_cache_hits_delta}"
-if ((prefill_prefix_cache_hits_delta != expected_prefill_prefix_cache_hits_delta)); then
-  echo "Expected Prefill local prefix-cache hit delta ${expected_prefill_prefix_cache_hits_delta}, got ${prefill_prefix_cache_hits_delta}" >&2
+if ((prefill_prefix_cache_hits_delta != expected_prefill_prefix_cache_hits_delta && prefill_prefix_cache_hits_delta != expected_warm_prefill_prefix_cache_hits_delta)); then
+  echo "Expected Prefill local prefix-cache hit delta ${expected_prefill_prefix_cache_hits_delta} or ${expected_warm_prefill_prefix_cache_hits_delta}, got ${prefill_prefix_cache_hits_delta}" >&2
   exit 1
 fi
 echo "PREFILL_PREFIX_CACHE_HIT_OK 1"
@@ -189,6 +252,7 @@ python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
   --host "${P4D2_BIND_HOST}" \
   --port "${PROXY_PORT}" \
   --model "${SERVED_MODEL_NAME}" \
+  --namespace pcp4-dp4-correctness-v1 \
   2>&1 | tee "${RUN_DIR}/logs/correctness.log"
 
 if [[ "${RUN_PREFIX_CACHE_E2E_DIVERGENCE}" == "1" ]]; then
@@ -197,6 +261,7 @@ if [[ "${RUN_PREFIX_CACHE_E2E_DIVERGENCE}" == "1" ]]; then
     --port "${PROXY_PORT}" \
     --model "${SERVED_MODEL_NAME}" \
     --max-tokens 1 \
+    --run-id pcp4-dp4-v1 \
     --no-logprobs \
     2>&1 | tee "${RUN_DIR}/logs/prefix_cache_e2e_divergence.log"
 else
@@ -233,8 +298,8 @@ else
     -v d="${decode_draft_tokens}" 'BEGIN { printf "%.4f", a / d }')"
   echo "MTP_DECODE_ACCEPTANCE_RATE ${decode_acceptance_rate}"
 
-  if awk -v r="${decode_acceptance_rate}" -v m="${MIN_MTP_ACCEPTANCE_RATE}" \
-      'BEGIN { exit !(r < m) }'; then
+  if awk -v a="${decode_accepted_tokens}" -v d="${decode_draft_tokens}" \
+      -v m="${MIN_MTP_ACCEPTANCE_RATE}" 'BEGIN { exit !(a / d < m) }'; then
     echo "Expected MTP acceptance rate >= ${MIN_MTP_ACCEPTANCE_RATE} on the" \
       "decode engine, got ${decode_acceptance_rate}" >&2
     exit 1

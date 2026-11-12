@@ -20,12 +20,10 @@ into a local cache dir and rewrites ``model_config.model`` /
 (``ModelConfig.maybe_pull_model_tokenizer_for_runai``). That runs once,
 on the head host; ``__post_init__`` is not re-run when the config is
 shipped to workers. On a multi-host slice the remote ranks therefore
-arrive in one of two states, neither of which has the files locally:
-
-* Ray V2 executor: the head's config as-is — ``model`` is a local dir
-  that exists only on the head host, ``model_weights`` is the URI.
-* Ray V1 executor (``ray_distributed_executor.py``): the URI restored
-  into ``model`` and ``model_weights`` cleared, i.e. the pre-pull state.
+receive the head's config as-is: ``model`` is a local dir that exists
+only on the head host, and ``model_weights`` is the URI. A config that
+still holds the URI in ``model`` (the pre-pull state) has no local files
+either.
 
 Why only some models notice: most architectures never read that path
 again on a worker, so stock-config models served from GCS (the GLM
@@ -45,9 +43,7 @@ serializes the ranks sharing a host: one pulls, the rest wait and skip.
 Why here and not upstream: the gap is in vLLM's multi-host worker
 handoff, but it is reached only through this plugin's executors on a
 pinned vLLM, and this repo already patches the object-storage load path
-(``model_loader_patches.py``). The V1 executor restores the URI for
-remote nodes on the assumption that each worker re-pulls; this module is
-what makes that assumption hold. It is a no-op unless the model comes
+(``model_loader_patches.py``). It is a no-op unless the model comes
 from object storage (``is_runai_obj_uri`` on ``model_weights``/``model``),
 so models served from local disk or the HF hub are untouched. The
 observable trace on an affected rank is one ``[runai-repull] pulling aux
@@ -66,8 +62,7 @@ ranks do not re-pull.
 
 import os
 
-from vllm.model_executor.model_loader.weight_utils import (atomic_writer,
-                                                           get_lock)
+from vllm.model_executor.model_loader.weight_utils import atomic_writer, get_lock
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 
 from vllm_torchtpu.logger import init_logger
@@ -89,8 +84,9 @@ def _is_complete(local_dir: str) -> bool:
     # Populated by the API server's own pull (no worker-side sentinel) —
     # complete by construction: __post_init__ returned before the engine
     # spawned any worker.
-    return (os.path.exists(os.path.join(local_dir, "config.json"))
-            and not os.path.exists(os.path.join(local_dir, PULLING_SENTINEL)))
+    return os.path.exists(
+        os.path.join(local_dir, "config.json")
+    ) and not os.path.exists(os.path.join(local_dir, PULLING_SENTINEL))
 
 
 def ensure_runai_aux_files(model_config) -> None:
@@ -104,11 +100,11 @@ def ensure_runai_aux_files(model_config) -> None:
     # isinstance guards: both fields are str on a real ModelConfig; tests
     # drive TPUWorker with MagicMock configs, which must stay a no-op.
     if isinstance(model_weights, str) and is_runai_obj_uri(model_weights):
-        # Ray V2: rewritten on the head; the local dir may be missing here.
+        # Rewritten on the head; the local dir may be missing here.
         uri = model_weights
         rewritten = True
     elif isinstance(model, str) and is_runai_obj_uri(model):
-        # Ray V1: pre-pull state, nobody has pulled on this host yet.
+        # Pre-pull state, nobody has pulled on this host yet.
         uri = model
         rewritten = False
     else:
@@ -126,14 +122,17 @@ def ensure_runai_aux_files(model_config) -> None:
             return
         logger.info(
             "[runai-repull] pulling aux files for %s on this host "
-            "(model_config.model=%s)", uri, model_config.model)
+            "(model_config.model=%s)",
+            uri,
+            model_config.model,
+        )
         # Upstream treats a set model_weights as "already pulled".
         model_config.model_weights = None
         if rewritten:
             os.makedirs(model_config.model, exist_ok=True)
             _touch(os.path.join(model_config.model, PULLING_SENTINEL), uri)
         model_config.maybe_pull_model_tokenizer_for_runai(uri, tokenizer)
-        # Without the V2 rewrite the dir is only known after the pull.
+        # Without the head's rewrite the dir is only known after the pull.
         if not rewritten:
             _touch(os.path.join(model_config.model, PULLING_SENTINEL), uri)
         _touch(os.path.join(model_config.model, COMPLETE_SENTINEL), uri)
@@ -146,12 +145,18 @@ def _report_tokenizer_gap(model_config) -> None:
     does not retain that URI — so it cannot be mirrored here. Say so
     instead of letting the worker die on an opaque repo-id error."""
     tokenizer = model_config.tokenizer
-    if (tokenizer and tokenizer != model_config.model
-            and not is_runai_obj_uri(tokenizer) and os.path.isabs(tokenizer)
-            and not os.path.isdir(tokenizer)):
+    if (
+        tokenizer
+        and tokenizer != model_config.model
+        and not is_runai_obj_uri(tokenizer)
+        and os.path.isabs(tokenizer)
+        and not os.path.isdir(tokenizer)
+    ):
         logger.error(
             "[runai-repull] tokenizer dir %s is missing on this host and its "
             "object-storage URI is not retained on ModelConfig, so it cannot "
             "be re-pulled; any worker-side tokenizer use will fail. Pass the "
             "model URI as --tokenizer (shared dir) or stage the tokenizer on "
-            "every host.", tokenizer)
+            "every host.",
+            tokenizer,
+        )

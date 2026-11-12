@@ -25,6 +25,7 @@ against 87 / 0 for the ref-level reshape, on a 256 KiB pool block).
 The pool gather/scatter kernels and the GDN V3 state seam share these
 helpers so the bytes they exchange are identical.
 """
+
 import jax
 import jax.numpy as jnp
 

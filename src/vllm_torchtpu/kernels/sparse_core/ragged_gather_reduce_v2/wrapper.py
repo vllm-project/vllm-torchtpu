@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import functools
 
 import jax
@@ -7,7 +20,10 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import (
-    config, kernel, memory_ref)
+    config,
+    kernel,
+    memory_ref,
+)
 
 
 def _fallback_implementation(
@@ -31,29 +47,29 @@ def _preprocess_scalar_data(
 ) -> tuple[memory_ref.IndexRef, jax.Array]:
     """Sorts valid source rows to the front of each row partition.
 
-  Args:
-    indices: Indices for gather.
-    valid_rows_mask: Mask indicating valid rows.
-    cfg: Ragged gather reduce config.
+    Args:
+      indices: Indices for gather.
+      valid_rows_mask: Mask indicating valid rows.
+      cfg: Ragged gather reduce config.
 
-  Returns:
-    sorted_by_validity: original row index of each slot after the stable
-      sort, flattened across partitions and padded to ``row_chunk_size``.
-    num_src_rows_per_row_partition: valid row count per partition, padded to
-      ``num_simd_lanes`` so the kernel can load it as a single vector.
-    mask: per output group, whether the group has any valid source row.
-  """
+    Returns:
+      sorted_by_validity: original row index of each slot after the stable
+        sort, flattened across partitions and padded to ``row_chunk_size``.
+      num_src_rows_per_row_partition: valid row count per partition, padded to
+        ``num_simd_lanes`` so the kernel can load it as a single vector.
+      mask: per output group, whether the group has any valid source row.
+    """
     num_simd_lanes = cfg.sc_info.num_lanes
     valid_rows_mask_2d = valid_rows_mask.reshape(cfg.num_row_partitions, -1)
 
     # Stable sort of a boolean key is a stable partition: valid rows keep their
     # relative order and move ahead of the invalid ones.
-    sorted_by_validity = jnp.argsort(~valid_rows_mask_2d,
-                                     descending=False,
-                                     stable=True,
-                                     axis=-1)
-    sorted_by_validity += (jnp.arange(cfg.num_row_partitions)[:, None] *
-                           cfg.row_partition_size)
+    sorted_by_validity = jnp.argsort(
+        ~valid_rows_mask_2d, descending=False, stable=True, axis=-1
+    )
+    sorted_by_validity += (
+        jnp.arange(cfg.num_row_partitions)[:, None] * cfg.row_partition_size
+    )
 
     padding = cfg.row_partition_size_padded - cfg.row_partition_size
     sorted_by_validity = jnp.pad(sorted_by_validity, ((0, 0), (0, padding)))
@@ -115,7 +131,7 @@ def main_kernel(
     )
 
 
-@jax.jit(static_argnames=("reduce_group_size", ))
+@jax.jit(static_argnames=("reduce_group_size",))
 def ragged_gather_reduce_v2(
     x: jax.Array,
     indices: jax.Array,
@@ -125,16 +141,16 @@ def ragged_gather_reduce_v2(
 ) -> jax.Array:
     """Gathers ``x`` by ``indices``, weights and masks, then reduces by group.
 
-  Args:
-    x: 2-D input features, ``(num_rows, hidden_size)``.
-    indices: 1-D gather indices, ``(input_size,)``.
-    topk_weights: 1-D per-row weights, ``(input_size,)``.
-    valid_rows_mask: 1-D bool mask of valid gathered rows, ``(input_size,)``.
-    reduce_group_size: number of consecutive rows summed into one output row.
+    Args:
+      x: 2-D input features, ``(num_rows, hidden_size)``.
+      indices: 1-D gather indices, ``(input_size,)``.
+      topk_weights: 1-D per-row weights, ``(input_size,)``.
+      valid_rows_mask: 1-D bool mask of valid gathered rows, ``(input_size,)``.
+      reduce_group_size: number of consecutive rows summed into one output row.
 
-  Returns:
-    Reduced output, ``(input_size // reduce_group_size, hidden_size)``.
-  """
+    Returns:
+      Reduced output, ``(input_size // reduce_group_size, hidden_size)``.
+    """
     # Step 1: Create config object.
     cfg = config.Config(
         input_size=indices.size,
@@ -149,8 +165,9 @@ def ragged_gather_reduce_v2(
 
     # Step 2: Fallback to compiler version if needed.
     if cfg.should_fallback:
-        return _fallback_implementation(x, indices, topk_weights,
-                                        valid_rows_mask, reduce_group_size)
+        return _fallback_implementation(
+            x, indices, topk_weights, valid_rows_mask, reduce_group_size
+        )
 
     # Step 3: Pre-process inputs (weights, padding, sort by validity).
     # Simplify topk gather by using fp32 and ensure data is always word aligned.
@@ -189,13 +206,13 @@ def ragged_gather_reduce_v2(
             disable_bounds_checks=True,
             needs_layout_passes=False,
         ),
-        scratch_types=(memory_ref.ScratchRef.create_scratch_types(cfg), ),
+        scratch_types=(memory_ref.ScratchRef.create_scratch_types(cfg),),
         mesh=vector_mesh,
         name="sc_ragged_gather_reduce_v2",
     )(scalar, x, topk_weights_f32)
 
     # Step 5: Post-process the output (drop padding, zero empty groups, cast).
-    out = out[:cfg.output_size, :cfg.hidden_size]
+    out = out[: cfg.output_size, : cfg.hidden_size]
     # TODO(kyuyeunk): Use zero initialization instead of masking.
-    out = jnp.where(mask[:cfg.output_size, None], out, jnp.zeros_like(out))
+    out = jnp.where(mask[: cfg.output_size, None], out, jnp.zeros_like(out))
     return out.astype(x.dtype)

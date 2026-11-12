@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Callable
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -81,7 +82,10 @@ def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     rem = fn - fn_hi
     fn_mid = jax.lax.reduce_precision(rem, 8, 7)
     fn_lo = jax.lax.reduce_precision(rem - fn_mid, 8, 7)
-    return tuple(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo))
+    return cast(
+        tuple[jax.Array, jax.Array, jax.Array],
+        tuple(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo)),
+    )
 
 
 def mhc_pre_gates(
@@ -109,19 +113,21 @@ def mhc_pre_gates(
     pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
     pre_mix = jax.nn.sigmoid(pre_logits) + hc_pre_eps
 
-    post_logits = (mixes[:, hc_mult:2 * hc_mult] * hc_scale[1] +
-                   hc_base[hc_mult:2 * hc_mult])
+    post_logits = (
+        mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
+    )
     post_mix = jax.nn.sigmoid(post_logits) * hc_post_mult_value
 
-    comb_logits = (
-        mixes[:, 2 * hc_mult:].reshape(num_tokens, hc_mult, hc_mult) *
-        hc_scale[2] + hc_base[2 * hc_mult:].reshape(1, hc_mult, hc_mult))
+    comb_logits = mixes[:, 2 * hc_mult :].reshape(
+        num_tokens, hc_mult, hc_mult
+    ) * hc_scale[2] + hc_base[2 * hc_mult :].reshape(1, hc_mult, hc_mult)
     comb_mix = jax.nn.softmax(comb_logits, axis=-1) + hc_sinkhorn_eps
-    comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-2, keepdims=True) +
-                           hc_sinkhorn_eps)
+    comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps)
     for _ in range(sinkhorn_repeat - 1):
-        comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-1, keepdims=True) +
-                               hc_sinkhorn_eps)
-        comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-2, keepdims=True) +
-                               hc_sinkhorn_eps)
+        comb_mix = comb_mix / (
+            jnp.sum(comb_mix, axis=-1, keepdims=True) + hc_sinkhorn_eps
+        )
+        comb_mix = comb_mix / (
+            jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps
+        )
     return pre_mix, post_mix, comb_mix

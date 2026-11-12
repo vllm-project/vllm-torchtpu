@@ -51,8 +51,10 @@ def _cpu_tpu7_registry():
 def test_qwen35_target_shape_traces_on_cpu():
     with _cpu_tpu7_registry():
         output = jax.eval_shape(
-            lambda routes, tokens, weights, count: moe_onehot_unpermute.
-            blockwise_onehot_unpermute(
+            lambda routes,
+            tokens,
+            weights,
+            count: moe_onehot_unpermute.blockwise_onehot_unpermute(
                 routes,
                 tokens,
                 weights,
@@ -60,9 +62,9 @@ def test_qwen35_target_shape_traces_on_cpu():
                 num_tokens=256,
             ),
             _shape((2560, 4096), jnp.bfloat16),
-            _shape((2560, ), jnp.int32),
-            _shape((2560, ), jnp.bfloat16),
-            _shape((1, ), jnp.int32),
+            _shape((2560,), jnp.int32),
+            _shape((2560,), jnp.bfloat16),
+            _shape((1,), jnp.int32),
         )
 
     assert output.shape == (256, 4096)
@@ -77,8 +79,7 @@ def test_qwen35_target_shape_fits_explicit_vmem_budget():
             hidden_size=4096,
             num_tokens=256,
         )
-        estimated = (explicit +
-                     moe_onehot_unpermute._VMEM_WORKSPACE_MARGIN_BYTES)
+        estimated = explicit + moe_onehot_unpermute._VMEM_WORKSPACE_MARGIN_BYTES
 
     assert explicit == 8409088
     assert estimated == 12603392
@@ -87,15 +88,15 @@ def test_qwen35_target_shape_fits_explicit_vmem_budget():
 
 def test_supported_shape_is_not_restricted_to_tpu7():
     with patch.object(
-            moe_onehot_unpermute.pltpu,
-            "get_tpu_info",
-            return_value=_tpu6e_info(),
+        moe_onehot_unpermute.pltpu,
+        "get_tpu_info",
+        return_value=_tpu6e_info(),
     ):
         assert moe_onehot_unpermute.can_use_blockwise_onehot_unpermute(
             _shape((2560, 4096), jnp.bfloat16),
-            _shape((2560, ), jnp.int32),
-            _shape((2560, ), jnp.bfloat16),
-            _shape((1, ), jnp.int32),
+            _shape((2560,), jnp.int32),
+            _shape((2560,), jnp.bfloat16),
+            _shape((1,), jnp.int32),
             num_tokens=256,
         )
 
@@ -105,37 +106,37 @@ def test_supported_shape_is_not_restricted_to_tpu7():
     [
         (
             _shape((2560, 4096), jnp.float32),
-            _shape((2560, ), jnp.int32),
-            _shape((2560, ), jnp.bfloat16),
-            _shape((1, ), jnp.int32),
+            _shape((2560,), jnp.int32),
+            _shape((2560,), jnp.bfloat16),
+            _shape((1,), jnp.int32),
             256,
         ),
         (
             _shape((2560, 4096), jnp.bfloat16),
-            _shape((2560, ), jnp.int32),
-            _shape((2560, ), jnp.float32),
-            _shape((1, ), jnp.int32),
+            _shape((2560,), jnp.int32),
+            _shape((2560,), jnp.float32),
+            _shape((1,), jnp.int32),
             256,
         ),
         (
             _shape((2433, 4096), jnp.bfloat16),
-            _shape((2433, ), jnp.int32),
-            _shape((2433, ), jnp.bfloat16),
-            _shape((1, ), jnp.int32),
+            _shape((2433,), jnp.int32),
+            _shape((2433,), jnp.bfloat16),
+            _shape((1,), jnp.int32),
             256,
         ),
         (
             _shape((2560, 4100), jnp.bfloat16),
-            _shape((2560, ), jnp.int32),
-            _shape((2560, ), jnp.bfloat16),
-            _shape((1, ), jnp.int32),
+            _shape((2560,), jnp.int32),
+            _shape((2560,), jnp.bfloat16),
+            _shape((1,), jnp.int32),
             256,
         ),
         (
             _shape((2560, 4096), jnp.bfloat16),
-            _shape((2560, ), jnp.int32),
-            _shape((2560, ), jnp.bfloat16),
-            _shape((1, ), jnp.int32),
+            _shape((2560,), jnp.int32),
+            _shape((2560,), jnp.bfloat16),
+            _shape((1,), jnp.int32),
             127,
         ),
     ],
@@ -169,8 +170,8 @@ def test_aligned_shapes_are_not_restricted_to_qwen35_config(
     with _cpu_tpu7_registry():
         assert moe_onehot_unpermute.can_use_blockwise_onehot_unpermute(
             _shape((route_capacity, hidden_size), jnp.bfloat16),
-            _shape((route_capacity, ), jnp.int32),
-            _shape((route_capacity, ), jnp.bfloat16),
-            _shape((1, ), jnp.int32),
+            _shape((route_capacity,), jnp.int32),
+            _shape((route_capacity,), jnp.bfloat16),
+            _shape((1,), jnp.int32),
             num_tokens=num_tokens,
         )

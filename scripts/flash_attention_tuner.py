@@ -28,19 +28,29 @@ from statistics import median
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.kernels.flash_attention.kernel import (BlockSizes,
-                                                          SegmentIds,
-                                                          flash_attention)
+from vllm_torchtpu.kernels.flash_attention.kernel import (
+    BlockSizes,
+    SegmentIds,
+    flash_attention,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
 VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 TUNING_GRIDS = (
-    ("kimi-k3", 12, 128, (256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768,
-                          65_536, 67_328)),
-    ("qwen2.5-vl", 16, 80, (256, 512, 1_024, 2_048, 4_096, 8_192, 16_384,
-                            32_768, 65_536)),
+    (
+        "kimi-k3",
+        12,
+        128,
+        (256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 67_328),
+    ),
+    (
+        "qwen2.5-vl",
+        16,
+        80,
+        (256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536),
+    ),
 )
 
 _Q_BLOCKS = (128, 256, 512, 1_024, 2_048, 4_096, 8_192)
@@ -82,11 +92,11 @@ class _TuningInputs:
 def _make_inputs(spec: FlashAttentionTuningSpec) -> _TuningInputs:
     if spec.has_attention_bias:
         raise NotImplementedError(
-            "Flash-attention tuning does not support attention bias")
+            "Flash-attention tuning does not support attention bias"
+        )
 
     q_shape = (spec.batch_size, spec.num_heads, spec.q_seq_len, spec.head_dim)
-    kv_shape = (spec.batch_size, spec.num_heads, spec.kv_seq_len,
-                spec.head_dim)
+    kv_shape = (spec.batch_size, spec.num_heads, spec.kv_seq_len, spec.head_dim)
     q = jnp.ones(q_shape, dtype=jnp.dtype(spec.q_dtype))
     if q_shape == kv_shape and spec.q_dtype == spec.kv_dtype:
         k = q
@@ -99,20 +109,21 @@ def _make_inputs(spec: FlashAttentionTuningSpec) -> _TuningInputs:
 
     segment_ids = None
     if spec.has_segment_ids:
-        q_segment = jnp.zeros((spec.batch_size, spec.q_seq_len),
-                              dtype=jnp.int32)
+        q_segment = jnp.zeros((spec.batch_size, spec.q_seq_len), dtype=jnp.int32)
         if spec.q_seq_len == spec.kv_seq_len:
             kv_segment = q_segment
         else:
-            kv_segment = jnp.zeros((spec.batch_size, spec.kv_seq_len),
-                                   dtype=jnp.int32)
+            kv_segment = jnp.zeros((spec.batch_size, spec.kv_seq_len), dtype=jnp.int32)
         segment_ids = SegmentIds(q=q_segment, kv=kv_segment)
     return _TuningInputs(q=q, k=k, v=v, segment_ids=segment_ids)
 
 
-def _benchmark_candidate(spec: FlashAttentionTuningSpec, inputs: _TuningInputs,
-                         block_sizes: BlockSizes,
-                         benchmark_iterations: int) -> tuple[float, float]:
+def _benchmark_candidate(
+    spec: FlashAttentionTuningSpec,
+    inputs: _TuningInputs,
+    block_sizes: BlockSizes,
+    benchmark_iterations: int,
+) -> tuple[float, float]:
     start = time.perf_counter()
     out = flash_attention(
         inputs.q,
@@ -159,8 +170,7 @@ def tune_flash_attention(
     if benchmark_iterations < 1:
         raise ValueError("benchmark_iterations must be at least 1")
     if not spec.candidates:
-        logger.warning("No flash-attention candidates configured for %s",
-                       spec.name)
+        logger.warning("No flash-attention candidates configured for %s", spec.name)
         return None
 
     started = time.perf_counter()
@@ -171,34 +181,51 @@ def tune_flash_attention(
         for block_sizes in spec.candidates:
             try:
                 latency_ns, compile_seconds = _benchmark_candidate(
-                    spec, inputs, block_sizes, benchmark_iterations)
+                    spec, inputs, block_sizes, benchmark_iterations
+                )
             except Exception as exc:
                 error = str(exc).lower()
-                failure = ("VMEM/OOM" if "vmem" in error
-                           or "out of memory" in error else "error")
+                failure = (
+                    "VMEM/OOM"
+                    if "vmem" in error or "out of memory" in error
+                    else "error"
+                )
                 detail = str(exc).partition("\n")[0]
                 logger.warning(
                     "Flash-attention autotune %s skipped %s after %s: %s",
-                    spec.name, block_sizes, failure, detail)
+                    spec.name,
+                    block_sizes,
+                    failure,
+                    detail,
+                )
                 continue
 
             logger.info(
                 "Flash-attention autotune %s candidate=%s "
-                "compile_and_warmup_s=%.3f median_ms=%.3f", spec.name,
-                block_sizes, compile_seconds, latency_ns / 1e6)
+                "compile_and_warmup_s=%.3f median_ms=%.3f",
+                spec.name,
+                block_sizes,
+                compile_seconds,
+                latency_ns / 1e6,
+            )
             if fastest is None or latency_ns < fastest[0]:
                 fastest = (latency_ns, block_sizes)
 
         if fastest is None:
             logger.warning(
                 "Flash-attention autotune %s found no usable candidate; "
-                "keeping the default block-size heuristic", spec.name)
+                "keeping the default block-size heuristic",
+                spec.name,
+            )
             return None
 
         _, winner = fastest
-        logger.info("Flash-attention autotune %s selected %s in %.3fs",
-                    spec.name, winner,
-                    time.perf_counter() - started)
+        logger.info(
+            "Flash-attention autotune %s selected %s in %.3fs",
+            spec.name,
+            winner,
+            time.perf_counter() - started,
+        )
         return winner
     finally:
         # Candidate executables are only useful for measurement. Callers build
@@ -222,14 +249,14 @@ def _candidate_block_sizes(seq_len: int) -> tuple[BlockSizes, ...]:
             for block_k in _K_BLOCKS:
                 if block_k > block_k_major or block_k_major % block_k:
                     continue
-                candidates.append(
-                    BlockSizes(block_q, block_k_major, block_k, 1))
+                candidates.append(BlockSizes(block_q, block_k_major, block_k, 1))
     return tuple(candidates)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Tune the requested Kimi-K3 and Qwen2.5-VL grids.")
+        description="Tune the requested Kimi-K3 and Qwen2.5-VL grids."
+    )
     parser.add_argument(
         "--model",
         action="append",
@@ -256,11 +283,9 @@ def main() -> None:
     if not devices or devices[0].platform != "tpu":
         parser.error("run this script on a TPU node")
     if devices[0].device_kind != "TPU7x":
-        parser.error(f"this search targets TPU7x, found "
-                     f"{devices[0].device_kind}")
+        parser.error(f"this search targets TPU7x, found {devices[0].device_kind}")
     if args.device_index < 0 or args.device_index >= len(devices):
-        parser.error(
-            f"--device-index must be between 0 and {len(devices) - 1}")
+        parser.error(f"--device-index must be between 0 and {len(devices) - 1}")
 
     selected_models = set(args.model or (grid[0] for grid in TUNING_GRIDS))
     results = []
@@ -291,8 +316,7 @@ def main() -> None:
                     benchmark_iterations=args.iterations,
                 )
                 if winner is None:
-                    raise SystemExit(
-                        f"No candidate compiled for {model} at {seq_len}")
+                    raise SystemExit(f"No candidate compiled for {model} at {seq_len}")
                 results.append((model, num_heads, head_dim, seq_len, winner))
 
     print("\nPaste into tuned_params_mapping:")
@@ -301,11 +325,15 @@ def main() -> None:
         if model != previous_model:
             print(f"    # {model}.")
             previous_model = model
-        print(f"    _vision_tuning_key(num_heads={num_heads}, "
-              f"seq_len={seq_len:_}, head_dim={head_dim}):")
-        print(f"    TunableParams({winner.block_q:_}, "
-              f"{winner.block_k_major:_}, {winner.block_k:_}, "
-              f"{winner.block_b}),")
+        print(
+            f"    _vision_tuning_key(num_heads={num_heads}, "
+            f"seq_len={seq_len:_}, head_dim={head_dim}):"
+        )
+        print(
+            f"    TunableParams({winner.block_q:_}, "
+            f"{winner.block_k_major:_}, {winner.block_k:_}, "
+            f"{winner.block_b}),"
+        )
 
 
 if __name__ == "__main__":

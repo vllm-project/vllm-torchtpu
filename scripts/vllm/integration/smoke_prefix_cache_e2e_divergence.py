@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import argparse
 import json
 import math
@@ -25,12 +38,16 @@ def env_float(name: str, default: float) -> float:
         raise SystemExit(f"{name} must be a float: {raw}") from exc
 
 
-def post_json(url: str, payload: dict,
-              timeout: int) -> tuple[int, dict, float]:
+# Sent with every request. main() adds vLLM's X-data-parallel-rank from
+# --data-parallel-rank.
+EXTRA_HEADERS: dict = {}
+
+
+def post_json(url: str, payload: dict, timeout: int) -> tuple[int, dict, float]:
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **EXTRA_HEADERS},
         method="POST",
     )
     start = time.time()
@@ -50,10 +67,15 @@ def post_json(url: str, payload: dict,
         return response.status, json.loads(body), elapsed
 
 
+# What turns reasoning off differs by chat template: Qwen3.5 reads
+# enable_thinking, Kimi-K3 reads thinking. main() replaces this from
+# --chat-template-kwargs.
+CHAT_TEMPLATE_KWARGS: dict = {"enable_thinking": False}
+
+
 def cached_tokens_from_usage(usage: dict) -> int:
     details = usage.get("prompt_tokens_details")
-    if isinstance(details, dict) and isinstance(details.get("cached_tokens"),
-                                                int):
+    if isinstance(details, dict) and isinstance(details.get("cached_tokens"), int):
         return details["cached_tokens"]
     return 0
 
@@ -73,33 +95,43 @@ def generated_logprobs(choice: dict) -> list[dict]:
         token = item.get("token")
         logprob = item.get("logprob")
         if isinstance(token, str) and isinstance(logprob, (int, float)):
-            items.append({
-                "token": token,
-                "logprob": float(logprob),
-            })
+            items.append(
+                {
+                    "token": token,
+                    "logprob": float(logprob),
+                }
+            )
     return items
 
 
-def chat(url: str, model: str, prompt: str, max_tokens: int, timeout: int,
-         request_logprobs: bool) -> dict:
+def chat(
+    url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    timeout: int,
+    request_logprobs: bool,
+) -> dict:
     payload = {
         "model": model,
-        "messages": [{
-            "role": "user",
-            "content": prompt,
-        }],
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "return_token_ids": True,
-        "chat_template_kwargs": {
-            "enable_thinking": False,
-        },
+        "chat_template_kwargs": CHAT_TEMPLATE_KWARGS,
     }
     if request_logprobs:
-        payload.update({
-            "logprobs": True,
-            "top_logprobs": 20,
-        })
+        payload.update(
+            {
+                "logprobs": True,
+                "top_logprobs": 20,
+            }
+        )
     status, parsed, elapsed = post_json(url, payload, timeout)
     result = {
         "status": status,
@@ -111,15 +143,17 @@ def chat(url: str, model: str, prompt: str, max_tokens: int, timeout: int,
 
     choice = parsed["choices"][0]
     usage = parsed.get("usage", {})
-    result.update({
-        "finish": choice.get("finish_reason"),
-        "text": choice.get("message", {}).get("content", ""),
-        "prompt_tokens": usage.get("prompt_tokens"),
-        "completion_tokens": usage.get("completion_tokens"),
-        "cached_tokens": cached_tokens_from_usage(usage),
-        "token_ids": choice.get("token_ids") or [],
-        "logprobs": generated_logprobs(choice),
-    })
+    result.update(
+        {
+            "finish": choice.get("finish_reason"),
+            "text": choice.get("message", {}).get("content", ""),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "cached_tokens": cached_tokens_from_usage(usage),
+            "token_ids": choice.get("token_ids") or [],
+            "logprobs": generated_logprobs(choice),
+        }
+    )
     return result
 
 
@@ -131,10 +165,11 @@ def build_last_key_prompt(salt: str, line_count: int) -> str:
     for index in range(line_count):
         value = (index * 7919 + 1234) % 10000
         distractor = (index * 17 + len(salt)) % 10000
-        lines.append(f"code line {index:03d}: value={value:04d}; "
-                     f"distractor={distractor:04d}; salt={salt}.")
-    lines.append(
-        "What is the value on the final code line? Output only the digits.")
+        lines.append(
+            f"code line {index:03d}: value={value:04d}; "
+            f"distractor={distractor:04d}; salt={salt}."
+        )
+    lines.append("What is the value on the final code line? Output only the digits.")
     return "\n".join(lines)
 
 
@@ -171,16 +206,13 @@ def output_diff(cold: dict, warm: dict, logprob_atol: float) -> dict:
         if left["token"] != right["token"]:
             if first_div_index is None:
                 first_div_index = index
-                if (math.isfinite(left["logprob"])
-                        and math.isfinite(right["logprob"])):
+                if math.isfinite(left["logprob"]) and math.isfinite(right["logprob"]):
                     first_div_absdiff = abs(left["logprob"] - right["logprob"])
             continue
         if math.isfinite(left["logprob"]) and math.isfinite(right["logprob"]):
             logprob_diffs.append(abs(left["logprob"] - right["logprob"]))
-    if (len(cold_logprob_tokens) != len(warm_logprob_tokens)
-            and first_div_index is None):
-        first_div_index = min(len(cold_logprob_tokens),
-                              len(warm_logprob_tokens))
+    if len(cold_logprob_tokens) != len(warm_logprob_tokens) and first_div_index is None:
+        first_div_index = min(len(cold_logprob_tokens), len(warm_logprob_tokens))
     max_logprob_absdiff = max(logprob_diffs) if logprob_diffs else float("inf")
     return {
         "text_equal": cold.get("text") == warm.get("text"),
@@ -196,47 +228,73 @@ def output_diff(cold: dict, warm: dict, logprob_atol: float) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=(
-        "Output-level E2E repro for prefix-cache warm-hit drift. The test "
-        "treats cold prefill and warm prefix-cache hit as externally equivalent "
-        "paths and compares API text/token/logprob output."))
+    parser = argparse.ArgumentParser(
+        description=(
+            "Output-level E2E repro for prefix-cache warm-hit drift. The test "
+            "treats cold prefill and warm prefix-cache hit as externally equivalent "
+            "paths and compares API text/token/logprob output."
+        )
+    )
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--port", default=os.environ.get("PROXY_PORT", "8000"))
-    parser.add_argument("--model",
-                        default=os.environ.get("SERVED_MODEL_NAME",
-                                               "Qwen3.5-35B-A3B-FP8"))
-    parser.add_argument("--timeout",
-                        type=int,
-                        default=env_int("PREFIX_E2E_DIVERGENCE_TIMEOUT", 600))
-    parser.add_argument("--attempts",
-                        type=int,
-                        default=env_int("PREFIX_E2E_DIVERGENCE_ATTEMPTS", 8))
-    parser.add_argument("--line-count",
-                        type=int,
-                        default=env_int("PREFIX_E2E_DIVERGENCE_LINES", 72))
-    parser.add_argument("--max-tokens",
-                        type=int,
-                        default=env_int("PREFIX_E2E_DIVERGENCE_MAX_TOKENS",
-                                        32))
+    parser.add_argument(
+        "--model", default=os.environ.get("SERVED_MODEL_NAME", "Qwen3.5-35B-A3B-FP8")
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=env_int("PREFIX_E2E_DIVERGENCE_TIMEOUT", 600)
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=json.loads,
+        help="JSON object sent as chat_template_kwargs with every request, "
+        'in place of {"enable_thinking": false}.',
+    )
+    parser.add_argument(
+        "--attempts", type=int, default=env_int("PREFIX_E2E_DIVERGENCE_ATTEMPTS", 8)
+    )
+    parser.add_argument(
+        "--line-count", type=int, default=env_int("PREFIX_E2E_DIVERGENCE_LINES", 72)
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=env_int("PREFIX_E2E_DIVERGENCE_MAX_TOKENS", 32),
+    )
     parser.add_argument(
         "--no-logprobs",
         action="store_true",
-        help=("Compare text and returned token IDs without requesting "
-              "logprobs. Use this when the serving configuration does not "
-              "support logprobs, such as TPU speculative decoding."),
+        help=(
+            "Compare text and returned token IDs without requesting "
+            "logprobs. Use this when the serving configuration does not "
+            "support logprobs, such as TPU speculative decoding."
+        ),
     )
     # 1e-3 is loose enough to absorb the FP8/TPU numerical noise cold prefill
     # and warm cascade-attention produce on identical prompts (typically
     # 1e-5..1e-4), and still ~2 orders of magnitude tighter than the drift the
     # bug this smoke targets produces (>>0.1; see the PR that added the fix).
-    parser.add_argument("--logprob-atol",
-                        type=float,
-                        default=env_float("PREFIX_E2E_DIVERGENCE_LOGPROB_ATOL",
-                                          1e-3))
-    parser.add_argument("--salt-prefix",
-                        default=os.environ.get(
-                            "PREFIX_E2E_DIVERGENCE_SALT_PREFIX",
-                            "prefix-e2e-divergence"))
+    parser.add_argument(
+        "--logprob-atol",
+        type=float,
+        default=env_float("PREFIX_E2E_DIVERGENCE_LOGPROB_ATOL", 1e-3),
+    )
+    parser.add_argument(
+        "--salt-prefix",
+        default=os.environ.get(
+            "PREFIX_E2E_DIVERGENCE_SALT_PREFIX", "prefix-e2e-divergence"
+        ),
+    )
+    parser.add_argument(
+        "--run-id",
+        help="Fixed prompt run ID for fresh-server regression tests; defaults to time.",
+    )
+    parser.add_argument(
+        "--data-parallel-rank",
+        type=int,
+        help="Hold every request to this DP rank of the engine, with vLLM's "
+        "X-data-parallel-rank header; through a P/D proxy, of both engines. "
+        "Replicas differ slightly in greedy output, and this compares tokens.",
+    )
     return parser.parse_args()
 
 
@@ -249,8 +307,13 @@ def main() -> int:
     if args.max_tokens < 1:
         raise SystemExit("--max-tokens must be positive")
 
+    if args.chat_template_kwargs is not None:
+        CHAT_TEMPLATE_KWARGS.clear()
+        CHAT_TEMPLATE_KWARGS.update(args.chat_template_kwargs)
+    if args.data_parallel_rank is not None:
+        EXTRA_HEADERS["X-data-parallel-rank"] = str(args.data_parallel_rank)
     url = f"http://{args.host}:{args.port}/v1/chat/completions"
-    run_id = int(time.time() * 1000)
+    run_id = args.run_id if args.run_id is not None else str(int(time.time() * 1000))
     hit_attempts = 0
 
     print("=== PREFIX CACHE E2E DIVERGENCE REPRO ===", flush=True)
@@ -263,20 +326,21 @@ def main() -> int:
         salt = f"{args.salt_prefix}-{run_id}-{attempt:02d}"
         prompt = build_last_key_prompt(salt, args.line_count)
 
-        print(f"\n=== ATTEMPT {attempt + 1}/{args.attempts} salt={salt} ===",
-              flush=True)
-        cold = chat(url, args.model, prompt, args.max_tokens, args.timeout,
-                    not args.no_logprobs)
-        print(json.dumps(summarize("cold", cold), ensure_ascii=False),
-              flush=True)
+        print(
+            f"\n=== ATTEMPT {attempt + 1}/{args.attempts} salt={salt} ===", flush=True
+        )
+        cold = chat(
+            url, args.model, prompt, args.max_tokens, args.timeout, not args.no_logprobs
+        )
+        print(json.dumps(summarize("cold", cold), ensure_ascii=False), flush=True)
         if cold.get("status") != 200:
             print("PREFIX_E2E_DIVERGENCE_COLD_FAILED")
             return 1
 
-        warm = chat(url, args.model, prompt, args.max_tokens, args.timeout,
-                    not args.no_logprobs)
-        print(json.dumps(summarize("warm", warm), ensure_ascii=False),
-              flush=True)
+        warm = chat(
+            url, args.model, prompt, args.max_tokens, args.timeout, not args.no_logprobs
+        )
+        print(json.dumps(summarize("warm", warm), ensure_ascii=False), flush=True)
         if warm.get("status") != 200:
             print("PREFIX_E2E_DIVERGENCE_WARM_FAILED")
             return 1
@@ -293,21 +357,26 @@ def main() -> int:
             "warm_cached_tokens": cached_tokens,
             **diff,
         }
-        print("PREFIX_E2E_DIVERGENCE_EVIDENCE " +
-              json.dumps(evidence, ensure_ascii=False, sort_keys=True),
-              flush=True)
+        print(
+            "PREFIX_E2E_DIVERGENCE_EVIDENCE "
+            + json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+            flush=True,
+        )
 
         if cached_tokens <= 0:
             print("PREFIX_E2E_DIVERGENCE_LOCAL_HIT_MISSING")
             continue
 
-        output_mismatch = (not diff["text_equal"]
-                           or not diff["token_ids_equal"]
-                           or not diff["has_token_ids"])
-        logprob_mismatch = (not args.no_logprobs
-                            and (not diff["has_logprobs"]
-                                 or not diff["logprob_tokens_equal"]
-                                 or not diff["logprob_equal"]))
+        output_mismatch = (
+            not diff["text_equal"]
+            or not diff["token_ids_equal"]
+            or not diff["has_token_ids"]
+        )
+        logprob_mismatch = not args.no_logprobs and (
+            not diff["has_logprobs"]
+            or not diff["logprob_tokens_equal"]
+            or not diff["logprob_equal"]
+        )
         if output_mismatch or logprob_mismatch:
             print("PREFIX_E2E_DIVERGENCE_BUG_CONFIRMED 1")
             return 1

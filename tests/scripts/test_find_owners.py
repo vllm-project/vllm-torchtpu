@@ -22,8 +22,7 @@ import importlib.util
 import pathlib
 import tempfile
 
-_SCRIPT = (pathlib.Path(__file__).resolve().parents[2] / "scripts" /
-           "find_owners.py")
+_SCRIPT = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "find_owners.py"
 _spec = importlib.util.spec_from_file_location("find_owners", _SCRIPT)
 find_owners = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(find_owners)
@@ -115,15 +114,16 @@ def test_pattern_without_owners_un_owns_the_path():
     # GitHub lets a later ownerless rule strip ownership granted earlier.
     rules = find_owners.parse_codeowners("/docs/ @alice\n/docs/generated/\n")
     groups, unowned = find_owners.group_by_rule(
-        ["docs/index.md", "docs/generated/api.md"], rules)
+        ["docs/index.md", "docs/generated/api.md"], rules
+    )
     assert list(groups) == ["/docs/"]
     assert groups["/docs/"]["files"] == ["docs/index.md"]
     assert unowned == ["docs/generated/api.md"]
 
 
 def test_codeowners_override_is_read_instead_of_the_checkout():
-    # The approval gate uses this to enforce the base branch's ownership while
-    # running the PR's copy of the resolver.
+    # --codeowners: check a PR against another copy of CODEOWNERS, such as
+    # the base branch's, while running this checkout's resolver.
     with tempfile.TemporaryDirectory() as d:
         override = pathlib.Path(d) / "CODEOWNERS"
         override.write_text("/docs/ @alice\n")
@@ -148,29 +148,27 @@ def test_last_matching_rule_wins():
 # --------------------------------------------------------------------------
 def _groups(mapping):
     return {
-        pattern: {
-            "owners": owners,
-            "files": ["f"]
-        }
+        pattern: {"owners": owners, "files": ["f"]}
         for pattern, owners in mapping.items()
     }
 
 
 def test_files_are_grouped_under_their_effective_rule():
     rules = find_owners.parse_codeowners("* @alice\n/docs/ @bob\n")
-    groups, unowned = find_owners.group_by_rule(["docs/a.md", "main.py"],
-                                                rules)
+    groups, unowned = find_owners.group_by_rule(["docs/a.md", "main.py"], rules)
     assert groups["/docs/"]["files"] == ["docs/a.md"]
     assert groups["*"]["files"] == ["main.py"]
     assert unowned == []
 
 
 def test_cover_prefers_the_owner_spanning_the_most_areas():
-    groups = _groups({
-        "/a/": ["@alice", "@carol"],
-        "/b/": ["@bob", "@carol"],
-        "/c/": ["@carol"],
-    })
+    groups = _groups(
+        {
+            "/a/": ["@alice", "@carol"],
+            "/b/": ["@bob", "@carol"],
+            "/c/": ["@carol"],
+        }
+    )
     assert find_owners.minimal_cover(groups) == ["@carol"]
 
 

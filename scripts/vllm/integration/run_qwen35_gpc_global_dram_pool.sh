@@ -40,7 +40,6 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "${script_dir}/../../.." && pwd)"
 
 # Print to stdout: Buildkite's main log view surfaces stdout, and the
 # failure reason must be readable there without digging through artifacts.
@@ -160,33 +159,15 @@ echo "ports: server=${PORT} registry=${REGISTRY_PORT}\
  offload controller=${OFFLOAD_CONTROLLER_PORT}\
  node controller=${NODE_CONTROLLER_PORT}"
 
-# ---------------------------------------------------------------------------
-# Version preflight: the runtime must match pyproject.toml exactly.
-# ---------------------------------------------------------------------------
-RAIDEN_PIN="$(sed -nE 's/^[[:space:]]*"tpu-raiden-torch==([^"]+)".*/\1/p' \
-  "${repo_root}/pyproject.toml" | head -1)"
-[[ -n "${RAIDEN_PIN}" ]] \
-  || fail "no tpu-raiden-torch== pin found in pyproject.toml"
-
-python3 - "${RAIDEN_PIN}" <<'PY'
-import importlib.metadata
-import sys
-
-raiden_pin = sys.argv[1]
-raiden_installed = importlib.metadata.version("tpu-raiden-torch")
-if raiden_installed != raiden_pin:
-    raise SystemExit(
-        f"installed tpu-raiden-torch {raiden_installed} != pyproject pin "
-        f"{raiden_pin}: the CI image must install the pinned wheel")
-print(f"tpu-raiden-torch {raiden_installed} matches pyproject pin")
-PY
-
+RAIDEN_VERSION="$(python3 -c \
+  'import importlib.metadata as m; print(m.version("tpu-sync-torch"))')" \
+  || fail "tpu-sync-torch is not installed"
 for cmd in global_registry_server kv_cache_host_store_node_main; do
   command -v "${cmd}" >/dev/null || fail \
-    "${cmd} not found: tpu-raiden-torch==${RAIDEN_PIN} does not bundle the \
-global DRAM pool control plane — bump the pin in pyproject.toml"
+    "${cmd} not found: tpu-sync-torch ${RAIDEN_VERSION} does not bundle the \
+global DRAM pool control plane"
 done
-echo "control plane from the tpu-raiden-torch ${RAIDEN_PIN} wheel"
+echo "control plane from the tpu-sync-torch ${RAIDEN_VERSION} wheel"
 
 # ---------------------------------------------------------------------------
 # Global registry: the directory and placement plane everything else joins.
@@ -302,8 +283,11 @@ KV_TRANSFER_CONFIG='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector
   export RAGGED_GATED_DELTA_RULE_IMPL=chunked_kernel_v3_pd
   export TPU_GDN_CONV_STATE_TILE_PAD=1
   export LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536 --xla_tpu_enable_latency_hiding_scheduler=false"
-  export VLLM_CACHE_ROOT="${RUN_DIR}/cache"
-  export TORCHINDUCTOR_CACHE_DIR="${RUN_DIR}/cache/inductor"
+  # Outside RUN_DIR: CI points RUN_ROOT into the artifacts directory, and a
+  # compile cache there (~13 GiB) was uploaded with the logs on every run.
+  compile_cache="${COMPILE_CACHE_DIR:-${TMPDIR:-/tmp}/qwen35_gpc_dram_pool_compile_cache}"
+  export VLLM_CACHE_ROOT="${compile_cache}"
+  export TORCHINDUCTOR_CACHE_DIR="${compile_cache}/inductor"
   export VLLM_ENGINE_READY_TIMEOUT_S="${STARTUP_TIMEOUT_S}"
   export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
   export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1

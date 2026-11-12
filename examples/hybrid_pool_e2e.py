@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """End-to-end smoke for the unified int8 KV pool on a hybrid GDN model.
 
 Boots Qwen3.5-35B-A3B on TP4 at the config that used to OOM on the strided
@@ -7,11 +20,11 @@ recurrent state is read/written through the in-kernel int8<->f32 bitcast, so
 there is no strided f32 view to byte-assemble. Success = ENGINE_UP (no OOM) +
 GEN_OK with sane tokens.
 """
+
 import os
 import sys
 
-# The default GDN impl (chunked_jax_pd) is where the int8-pool gather/scatter
-# is wired. No KV-cache env gates: the pool is the default now.
+# SparseCore MoE is on by default and is not what this smoke tests.
 os.environ.setdefault("USE_MOE_SPARSE_CORE", "0")
 
 
@@ -19,8 +32,7 @@ def main() -> int:
     from vllm import LLM, SamplingParams
 
     tp = int(os.environ.get("E2E_TP", "4"))
-    print(f"=== hybrid-pool e2e: tp={tp}, unified int8 pool (default) ===",
-          flush=True)
+    print(f"=== hybrid-pool e2e: tp={tp}, unified int8 pool (default) ===", flush=True)
     kwargs = dict(
         model=os.environ.get("E2E_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8"),
         tensor_parallel_size=tp,
@@ -32,18 +44,14 @@ def main() -> int:
         # the unified pool is rejected (make_attention_cache_view guard).
         kv_cache_dtype=os.environ.get("E2E_KVDTYPE", "auto"),
         block_size=256,
-        gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL",
-                                                    "0.8")),
+        gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL", "0.8")),
         enable_prefix_caching=True,
         enable_expert_parallel=os.environ.get("E2E_EP", "1") == "1",
         # Qwen3.5 declares a vision modality; run it text-only so vLLM keeps
         # chunked MM input enabled (see TpuPlatform.check_and_update_config).
         language_model_only=True,
         async_scheduling=False,
-        limit_mm_per_prompt={
-            "image": 0,
-            "video": 0
-        },
+        limit_mm_per_prompt={"image": 0, "video": 0},
     )
     # 0 (default) => let vLLM auto-size the KV cache to fit; the override is
     # flaky under multiproc TP.
@@ -52,10 +60,10 @@ def main() -> int:
         kwargs["num_gpu_blocks_override"] = nb
     llm = LLM(**kwargs)
     print("ENGINE_UP", flush=True)
-    out = llm.generate(["The bridge at dawn. " * 16],
-                       SamplingParams(temperature=0.0,
-                                      max_tokens=8,
-                                      ignore_eos=True))
+    out = llm.generate(
+        ["The bridge at dawn. " * 16],
+        SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True),
+    )
     toks = list(out[0].outputs[0].token_ids[:6])
     print(f"GEN_OK first_tokens={toks}", flush=True)
     return 0

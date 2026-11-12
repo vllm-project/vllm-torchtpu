@@ -18,8 +18,7 @@ import uuid
 import pytest
 import torch
 
-from vllm_torchtpu.distributed.kv_transfer.host_kv_shm import (HostKVShmPool,
-                                                               PoolSpec)
+from vllm_torchtpu.distributed.kv_transfer.host_kv_shm import HostKVShmPool, PoolSpec
 
 
 def _pool_spec() -> PoolSpec:
@@ -41,24 +40,22 @@ def test_unpack_rank_layers_copies_used_bytes_and_preserves_padding():
         num_blocks = 2
         used = pool._used_per_layer(num_blocks)
         payloads = [
-            memoryview(bytes([layer + 1]) * used)
-            for layer in range(spec.num_layers)
+            memoryview(bytes([layer + 1]) * used) for layer in range(spec.num_layers)
         ]
 
-        pool.unpack_rank_layers(slot_idx=0,
-                                rank=1,
-                                num_blocks=num_blocks,
-                                layer_buffers=payloads)
+        pool.unpack_rank_layers(
+            slot_idx=0, rank=1, num_blocks=num_blocks, layer_buffers=payloads
+        )
 
         rank_start = spec.per_rank_bytes
         for layer in range(spec.num_layers):
             layer_off = rank_start + layer * spec.per_layer_bytes
-            assert bytes(pool._shm.buf[layer_off:layer_off +
-                                       used]) == (bytes([layer + 1]) * used)
+            assert bytes(pool._shm.buf[layer_off : layer_off + used]) == (
+                bytes([layer + 1]) * used
+            )
             assert bytes(
-                pool._shm.buf[layer_off + used:layer_off +
-                              spec.per_layer_bytes]) == (
-                                  b"\xee" * (spec.per_layer_bytes - used))
+                pool._shm.buf[layer_off + used : layer_off + spec.per_layer_bytes]
+            ) == (b"\xee" * (spec.per_layer_bytes - used))
     finally:
         pool.close()
 
@@ -68,9 +65,8 @@ def test_unpack_rank_layers_rejects_wrong_layer_size():
     pool = HostKVShmPool.create(spec, f"test_host_kv_{uuid.uuid4().hex}")
     try:
         with pytest.raises(RuntimeError, match="layer 0 size"):
-            pool.unpack_rank_layers(slot_idx=0,
-                                    rank=0,
-                                    num_blocks=2,
-                                    layer_buffers=[b"x"] * spec.num_layers)
+            pool.unpack_rank_layers(
+                slot_idx=0, rank=0, num_blocks=2, layer_buffers=[b"x"] * spec.num_layers
+            )
     finally:
         pool.close()

@@ -1,14 +1,60 @@
-from typing import Any, Dict
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from typing import Any, cast
 
 import torch
 from vllm.config import VllmConfig
-from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
-from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+from vllm.model_executor.models.interfaces import (
+    SupportsEncoderCudaGraph,
+    supports_encoder_cudagraph,
+)
+from vllm.v1.worker.encoder_cudagraph import (
+    CaptureAxisKeys,
+    EncoderCudaGraphManager,
+)
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.mm_video_chunking import (
+    embed_multimodal_chunked,
+    get_video_chunk_patch_size,
+)
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
+
+def _pack_encoder_items(
+    tokens: list[int], budgets: list[int], max_items: int
+) -> list[tuple[list[int], int]]:
+    batches: list[tuple[list[int], int]] = []
+    indices: list[int] = []
+    total = 0
+    for index in sorted(range(len(tokens)), key=tokens.__getitem__):
+        count = tokens[index]
+        if not 0 < count <= budgets[-1]:
+            raise ValueError(
+                f"Coordinated encoding requires each image to fit "
+                f"an encoder graph bucket; got {count} tokens, maximum {budgets[-1]}"
+            )
+        if indices and (len(indices) == max_items or total + count > budgets[-1]):
+            batches.append((indices, next(b for b in budgets if b >= total)))
+            indices, total = [], 0
+        indices.append(index)
+        total += count
+    if indices:
+        batches.append((indices, next(b for b in budgets if b >= total)))
+    return batches
 
 
 class MMEncoderManager(EncoderCudaGraphManager):
@@ -54,27 +100,42 @@ class MMEncoderManager(EncoderCudaGraphManager):
         super().__init__(
             vllm_config=vllm_config,
             device=device,
-            dtype=vllm_config.model_config.dtype,
-            model=vllm_model,
+            dtype=cast(torch.dtype, vllm_config.model_config.dtype),
+            # maybe_create_mm_encoder_manager checks supports_encoder_cudagraph.
+            model=cast(SupportsEncoderCudaGraph, vllm_model),
         )
+        if self._capture_axes:
+            raise ValueError("TPU encoder budget templates do not support capture axes")
+
+        encoder_use_dp = getattr(vllm_model, "use_data_parallel", None)
+        if isinstance(encoder_use_dp, bool):
+            tp_size = vllm_config.parallel_config.tensor_parallel_size
+            self.use_dp = encoder_use_dp and tp_size > 1
+        elif encoder_use_dp is not None:
+            logger.warning("Ignoring non-boolean use_data_parallel=%r", encoder_use_dp)
 
         # Create dummy input templates for every budget size and path directly
         # from self.path_token_budgets prepared by EncoderCudaGraphManager.
-        self.budget_templates: Dict[str, Dict[int, Dict[
-            str, torch.Tensor]]] = {
-                path: {
-                    budget:
-                    self.model.prepare_encoder_cudagraph_capture_inputs(
-                        budget,
-                        self.max_batch_size,
-                        self.max_frames_per_batch,
-                        self.device,
-                        self.dtype,
-                        path=path).values
-                    for budget in budgets if budget > 0
-                }
-                for path, budgets in self.path_token_budgets.items()
+        self.budget_templates: dict[str, dict[int, dict[str, torch.Tensor]]] = {
+            path: {
+                budget: self.model.prepare_encoder_cudagraph_capture_inputs(
+                    budget,
+                    self.max_batch_size,
+                    self.max_frames_per_batch,
+                    self.device,
+                    self.dtype,
+                    path=path,
+                ).values
+                for budget in budgets
+                if budget > 0
             }
+            for path, budgets in self.path_token_budgets.items()
+        }
+        # CUDA graph metadata owns CUDA replay buffers. Track XLA warmup
+        # separately rather than storing template dicts in that upstream map.
+        self.compiled_budgets: dict[str, set[int]] = {
+            path: set() for path in self.path_token_budgets
+        }
 
         # We compile the forward pass function using the TPU backend.
         # This acts as our XLA cache. We compile it once, and it will generate
@@ -83,21 +144,24 @@ class MMEncoderManager(EncoderCudaGraphManager):
             self.model.encoder_cudagraph_forward,
             backend="tpu",
             fullgraph=True,
-            dynamic=False)
+            dynamic=False,
+        )
 
         logger.info(
-            f"[mm_encoder_manager] Initialized XLA path_budgets={self.path_token_budgets} "
-            f"max_batch_size={self.max_batch_size}")
+            "[mm_encoder_manager] Initialized XLA path_budgets=%s max_batch_size=%s",
+            self.path_token_budgets,
+            self.max_batch_size,
+        )
 
     def _pad_to_template(
         self,
-        replay_values: Dict[str, torch.Tensor],
+        replay_values: dict[str, torch.Tensor | None],
         budget: int,
         path: str = "default",
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         """Zero-pads dynamic multimodal inputs up to the static budget template."""
         template = self.budget_templates[path][budget]
-        padded: Dict[str, torch.Tensor] = {}
+        padded: dict[str, torch.Tensor] = {}
 
         for key, tmpl in template.items():
             src = replay_values.get(key)
@@ -117,49 +181,65 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 continue
 
             padding_logic = self.config.padding_logics.get(
-                key, self._copy_padded_buffer)
+                key, self._copy_padded_buffer
+            )
             padding_logic(tmpl, src)
             padded[key] = tmpl
 
         return padded
 
     @torch.no_grad()
-    def _capture_budget_graph(self,
-                              token_budget: int,
-                              path: str = "default") -> None:
+    def _capture_budget_graph(
+        self,
+        token_budget: int,
+        path: str = "default",
+        axis_keys: CaptureAxisKeys = (),
+    ) -> None:
         """Primes the XLA cache for a specific budget bucket."""
+        if axis_keys:
+            raise ValueError("TPU encoder budget templates do not support capture axes")
         template = self.budget_templates[path][token_budget]
 
-        # Pass a copy of template so models calling values.pop() don't mutate the stored template.
+        # Pass a copy of template so models calling values.pop() don't mutate
+        # the stored template.
         try:
             out = self._compiled_budget_forward(dict(template), path=path)
             synchronize_tensors(out, wait=True)
-            self._get_graph_set(path)[token_budget] = template
+            self.compiled_budgets[path].add(token_budget)
         except Exception as e:
             logger.warning(
                 "[mm_encoder_manager] Failed to precompile vision encoder "
-                "for budget=%d, path='%s': %s", token_budget, path, e)
+                "for budget=%d, path='%s': %s",
+                token_budget,
+                path,
+                e,
+            )
 
     @torch.no_grad()
     def _run_budget_graph(
         self,
-        mm_kwargs: Dict[str, Any],
+        mm_kwargs: dict[str, Any],
         token_budget: int,
         path: str = "default",
+        axis_keys: CaptureAxisKeys = (),
+        *,
+        allow_eager_fallback: bool = True,
     ) -> torch.Tensor | None:
         """Pads actual inputs and runs the compiled XLA graph."""
+        if axis_keys:
+            raise ValueError("TPU encoder budget templates do not support capture axes")
         num_items = len(self._get_item_specs(mm_kwargs))
-        if (path not in self.budget_templates
-                or token_budget not in self.budget_templates[path]):
+        if (
+            path not in self.budget_templates
+            or token_budget not in self.budget_templates[path]
+        ):
             self.graph_misses += num_items
             return None
 
         # Prepare dynamic inputs
         replay = self.model.prepare_encoder_cudagraph_replay_buffers(
-            mm_kwargs,
-            self.max_batch_size,
-            self.max_frames_per_batch,
-            path=path)
+            mm_kwargs, self.max_batch_size, self.max_frames_per_batch, path=path
+        )
 
         # Pad dynamic inputs to strictly match the static budget shape
         padded = self._pad_to_template(replay.values, token_budget, path=path)
@@ -170,13 +250,182 @@ class MMEncoderManager(EncoderCudaGraphManager):
             self.graph_hits += num_items
             return out_tensor
         except Exception as e:
+            if not allow_eager_fallback:
+                raise
             logger.warning(
                 "[mm_encoder_manager] Compiled vision encoder forward failed "
                 "for budget=%d, path='%s': %s. Falling back to "
-                "encoder_eager_forward.", token_budget, path, e)
+                "encoder_eager_forward.",
+                token_budget,
+                path,
+                e,
+            )
             self.graph_misses += num_items
             with torch.inference_mode():
                 return self.model.encoder_eager_forward(mm_kwargs, path=path)
+
+    def _execute_local(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list[torch.Tensor]:
+        """Execute locally, temporally chunking videos that exceed max budget."""
+        item_specs = self._get_item_specs(mm_kwargs)
+        total_tokens = sum(spec.output_tokens for spec in item_specs)
+        max_budget = max(self.token_budgets, default=0)
+        # When total batch tokens exceed the largest compiled bucket
+        # (max_budget), embed_multimodal_chunked temporally splits oversized
+        # videos so each call to upstream _execute_local fits in a compiled
+        # bucket, avoiding unbucketed eager fallback, XLA recompilation, and
+        # VMEM OOM on long videos.
+        if total_tokens > max_budget > 0:
+            total_patches = sum(spec.input_size for spec in item_specs)
+            max_patches = get_video_chunk_patch_size(
+                self.vllm_config.model_config,
+                default_max_patches=max_budget * total_patches // total_tokens,
+            )
+            if max_patches > 0:
+                return list(
+                    embed_multimodal_chunked(
+                        lambda **kw: super(MMEncoderManager, self)._execute_local(kw),
+                        mm_kwargs,
+                        max_patches,
+                    )
+                )
+        return super()._execute_local(mm_kwargs)
+
+    @torch.no_grad()
+    def execute_dp_coordinated(
+        self, mm_kwargs: dict[str, Any] | None, input_error: str | None = None
+    ) -> list[torch.Tensor]:
+        """Run encoding in lockstep across attention-DP engines sharing EP."""
+        from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+
+        if tuple(self.path_token_budgets) != ("default",):
+            raise ValueError(
+                "Coordinated encoding requires a single default encoder path"
+            )
+        all_tokens: list[int] = []
+        assignment: list[int] = []
+        images_per_rank: list[int] = []
+        tokens: list[int] = []
+        batches: list[tuple[list[int], int]] = []
+        try:
+            if input_error is None and mm_kwargs is not None:
+                if self.use_dp:
+                    all_tokens = self._get_per_item_out_tokens(mm_kwargs)
+                    mm_kwargs, assignment, images_per_rank, _ = self._dp_shard(
+                        mm_kwargs, all_tokens
+                    )
+                specs = self._get_item_specs(mm_kwargs)
+                tokens = [spec.output_tokens for spec in specs]
+                batches = _pack_encoder_items(
+                    [spec.get_path_output_tokens("default") for spec in specs],
+                    self.path_token_budgets["default"],
+                    self.max_batch_size,
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            input_error = str(exc)
+        group = get_ep_group() if self.use_dp else get_dp_group()
+        plans: list[Any] = [None] * group.world_size
+        torch.distributed.all_gather_object(
+            plans,
+            (input_error, [budget for _, budget in batches], sum(tokens)),
+            group=group.cpu_group,
+        )
+        errors = [error for error, _, _ in plans if error is not None]
+        if errors:
+            raise ValueError(f"Invalid coordinated encoder inputs: {errors}")
+        outputs: dict[int, torch.Tensor] = {}
+        for step in range(max(len(plan) for _, plan, _ in plans)):
+            budget = max(plan[step] if step < len(plan) else 0 for _, plan, _ in plans)
+            if step < len(batches):
+                assert mm_kwargs is not None
+                indices, _ = batches[step]
+                kwargs, axis_keys = self._select_items(mm_kwargs, indices)
+                output = self._run_budget_graph(
+                    kwargs, budget, axis_keys=axis_keys, allow_eager_fallback=False
+                )
+                assert output is not None
+                self.model.postprocess_encoder_output(
+                    {"default": output},
+                    indices,
+                    tokens,
+                    outputs,
+                    clone=True,
+                    batch_mm_kwargs=kwargs,
+                )
+            else:
+                output = self._compiled_budget_forward(
+                    dict(self.budget_templates["default"][budget]), path="default"
+                )
+            synchronize_tensors(output, wait=True)
+        local_outputs = [outputs[index] for index in range(len(tokens))]
+        if self.use_dp:
+            return self._gather_dp_outputs(
+                local_outputs,
+                all_tokens,
+                assignment,
+                images_per_rank,
+                max(count for _, _, count in plans),
+            )
+        return local_outputs
+
+    def _dp_gather(
+        self,
+        local_outputs: list[torch.Tensor],
+        per_item_out_tokens: list[int],
+        image_rank_assignment: list[int],
+        images_per_rank: list[int],
+        max_output_tokens_per_rank: int,
+    ) -> list[torch.Tensor]:
+        """Gather encoder DP outputs at the same point on every TP rank.
+
+        Each rank encodes a different share of the images, and upstream's
+        gather leaves its input and output deferred, so ranks can execute the
+        all-gather at different points among their collectives.
+        ``_gather_dp_outputs`` materializes the input before the all-gather
+        and the output right after it.
+        """
+        return self._gather_dp_outputs(
+            local_outputs,
+            per_item_out_tokens,
+            image_rank_assignment,
+            images_per_rank,
+            max_output_tokens_per_rank,
+        )
+
+    def _gather_dp_outputs(
+        self,
+        local_outputs: list[torch.Tensor],
+        tokens: list[int],
+        assignment: list[int],
+        images_per_rank: list[int],
+        max_tokens: int,
+    ) -> list[torch.Tensor]:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        padded = torch.zeros(
+            (max_tokens, self.config.out_hidden_size),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        offset = 0
+        for output in local_outputs:
+            padded[offset : offset + len(output)].copy_(output)
+            offset += len(output)
+        synchronize_tensors(padded, wait=True)
+        gathered = get_tp_group().all_gather(padded, dim=0)
+        # Empty engines must materialize the collective before discarding its output.
+        synchronize_tensors(gathered, wait=True)
+        outputs: dict[int, torch.Tensor] = {}
+        start = 0
+        for rank, count in enumerate(images_per_rank):
+            offset = rank * max_tokens
+            for index in assignment[start : start + count]:
+                outputs[index] = gathered[offset : offset + tokens[index]]
+                offset += tokens[index]
+            start += count
+        return [outputs[index] for index in range(len(tokens))]
 
     def precompile_vision_encoder(self) -> None:
         """Prime the XLA compilation cache for all configured token budgets."""
@@ -207,5 +456,8 @@ def maybe_create_mm_encoder_manager(
     if not vllm_config.compilation_config.cudagraph_mm_encoder:
         return None
     if not supports_encoder_cudagraph(vllm_model):
+        return None
+    if vllm_model.get_encoder_cudagraph_config().capture_axes:
+        logger.info("Using eager encoding for a model with encoder capture axes.")
         return None
     return MMEncoderManager(vllm_config, device, vllm_model)

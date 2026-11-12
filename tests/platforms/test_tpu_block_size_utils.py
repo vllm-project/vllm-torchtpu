@@ -1,17 +1,31 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 
-from vllm_torchtpu.platforms.tpu_block_size_utils import \
-    update_tpu_block_size_and_slot_config
+from vllm_torchtpu.platforms.tpu_block_size_utils import (
+    _hybrid_mamba_state_layout,
+    update_tpu_block_size_and_slot_config,
+)
 
 
 class FakeBatchedRPAAttentionBackend:
-
     @staticmethod
     def get_name():
         return "CUSTOM"
@@ -30,7 +44,6 @@ class FakeBatchedRPAAttentionBackend:
 
 
 class FakePlainAttentionBackend(FakeBatchedRPAAttentionBackend):
-
     @staticmethod
     def get_name():
         return "PALLAS"
@@ -41,14 +54,12 @@ class FakePlainAttentionBackend(FakeBatchedRPAAttentionBackend):
 
 
 class FakeLargeMinimumBackend(FakeBatchedRPAAttentionBackend):
-
     @staticmethod
     def get_min_page_size(_vllm_config):
         return 1536
 
 
 class FakeNonLinearPageBackend(FakeBatchedRPAAttentionBackend):
-
     @staticmethod
     def get_kv_cache_page_size_bytes(block_size, *_args, **_kwargs):
         tail_bytes = 16 if block_size > 1 else 0
@@ -56,14 +67,12 @@ class FakeNonLinearPageBackend(FakeBatchedRPAAttentionBackend):
 
 
 class FakeMisalignedSlotBackend(FakePlainAttentionBackend):
-
     @staticmethod
     def get_kv_cache_page_size_bytes(block_size, *_args, **_kwargs):
         return block_size * 1025
 
 
 class FakeQwenMambaModel:
-
     @staticmethod
     def get_mamba_state_shape_from_config(vllm_config):
         tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -74,11 +83,36 @@ class FakeQwenMambaModel:
         return (torch.bfloat16, torch.float32)
 
 
-class FakeCompactMambaModel:
+class FakeConfiguredGdnModel:
+    @staticmethod
+    def get_mamba_state_shape_from_config(vllm_config):
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        local_kq_heads = hf_config.linear_num_key_heads // tp_size
+        local_v_heads = hf_config.linear_num_value_heads // tp_size
+        conv_dim = (
+            2 * local_kq_heads * hf_config.linear_key_head_dim
+            + local_v_heads * hf_config.linear_value_head_dim
+        )
+        return (
+            (hf_config.linear_conv_kernel_dim - 1, conv_dim),
+            (
+                local_v_heads,
+                hf_config.linear_value_head_dim,
+                hf_config.linear_key_head_dim,
+            ),
+        )
 
     @staticmethod
+    def get_mamba_state_dtype_from_config(_):
+        return (torch.bfloat16, torch.float32)
+
+
+class FakeCompactMambaModel:
+    @staticmethod
     def get_mamba_state_shape_from_config(_):
-        # 1 physical conv row followed by 256 physical SSM rows.
+        # 2 physical conv rows (fp32 in the pool) followed by 256 physical SSM
+        # rows.
         return ((1, 512), (2, 128, 256))
 
     @staticmethod
@@ -87,14 +121,12 @@ class FakeCompactMambaModel:
 
 
 class FakeBf16StateMambaModel(FakeQwenMambaModel):
-
     @staticmethod
     def get_mamba_state_dtype_from_config(_):
         return (torch.bfloat16, torch.bfloat16)
 
 
 class FakeNonShardingMambaModel(FakeQwenMambaModel):
-
     @staticmethod
     def get_mamba_state_shape_from_config(_):
         return ((3, 4096), (16, 128, 128))
@@ -106,7 +138,7 @@ class FakeKimiLinearModel:
 
     @staticmethod
     def get_mamba_state_shape_from_config(vllm_config):
-        local_heads = (32 // vllm_config.parallel_config.tensor_parallel_size)
+        local_heads = 32 // vllm_config.parallel_config.tensor_parallel_size
         return ((3, 3, local_heads, 128), (local_heads, 128, 128))
 
     @staticmethod
@@ -115,10 +147,10 @@ class FakeKimiLinearModel:
 
 
 class FakeKimiMLABackend(FakePlainAttentionBackend):
-    """MLA page geometry: packing=2 x 640 padded bf16 lanes = 2560 B/token.
-
-    The real PallasMLAttentionBackend inherits MultipleOf(1) kernel block
-    sizes, so the derivation's alignment step is a no-op ([] matches)."""
+    """MLA page geometry: the pool packs the token axis (bf16 packing 2), so
+    a pool row is a 2560 B packed pair; a 1-token page already takes a whole
+    row. The real PallasMLAttentionBackend inherits MultipleOf(1) kernel
+    block sizes, so the derivation's alignment step is a no-op ([] matches)."""
 
     @staticmethod
     def get_name():
@@ -131,7 +163,7 @@ class FakeKimiMLABackend(FakePlainAttentionBackend):
 
     @staticmethod
     def get_kv_cache_page_size_bytes(block_size, *_args, **_kwargs):
-        return block_size * 2560
+        return ((block_size + 1) // 2) * 2560
 
 
 @pytest.fixture
@@ -140,6 +172,13 @@ def vllm_config():
     vllm_config.model_config = MagicMock(spec=ModelConfig)
     vllm_config.model_config.dtype = torch.bfloat16
     vllm_config.model_config.is_hybrid = False
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        linear_num_key_heads=8,
+        linear_num_value_heads=16,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
     vllm_config.model_config.get_num_kv_heads.return_value = 1
     vllm_config.model_config.get_head_size.return_value = 256
     vllm_config.cache_config = MagicMock(spec=CacheConfig)
@@ -156,15 +195,23 @@ def vllm_config():
     return vllm_config
 
 
-def _configure_hybrid(vllm_config,
-                      *,
-                      block_size=256,
-                      user_specified=False,
-                      tp_size=1,
-                      kv_transfer_config=None):
+def _configure_hybrid(
+    vllm_config,
+    *,
+    block_size=256,
+    user_specified=False,
+    tp_size=1,
+    kv_transfer_config=None,
+):
     vllm_config.model_config.is_hybrid = True
-    vllm_config.model_config.architecture = (
-        "Qwen3_5MoeForConditionalGeneration")
+    vllm_config.model_config.architecture = "Qwen3_5MoeForCausalLM"
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        linear_num_key_heads=8,
+        linear_num_value_heads=16,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
     vllm_config.cache_config.block_size = block_size
     vllm_config.cache_config.user_specified_block_size = user_specified
     vllm_config.cache_config.mamba_block_size = block_size
@@ -174,19 +221,22 @@ def _configure_hybrid(vllm_config,
     vllm_config.parallel_config.tensor_parallel_size = tp_size
 
 
-def _update(vllm_config,
-            backend_cls=FakeBatchedRPAAttentionBackend,
-            model_cls=FakeQwenMambaModel):
-    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
-               return_value=(model_cls, None)):
+def _update(
+    vllm_config,
+    backend_cls=FakeBatchedRPAAttentionBackend,
+    model_cls=FakeQwenMambaModel,
+):
+    with patch(
+        "vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+        return_value=(model_cls, None),
+    ):
         update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
 
 def test_custom_backend_does_not_lower_non_hybrid_block_size(vllm_config):
     vllm_config.cache_config.block_size = 2112
 
-    update_tpu_block_size_and_slot_config(vllm_config,
-                                          FakeBatchedRPAAttentionBackend)
+    update_tpu_block_size_and_slot_config(vllm_config, FakeBatchedRPAAttentionBackend)
 
     assert vllm_config.cache_config.block_size == 2112
 
@@ -195,8 +245,7 @@ def test_cache_slot_requires_16_byte_alignment(vllm_config):
     vllm_config.cache_config.block_size = 17
 
     with pytest.raises(AssertionError):
-        update_tpu_block_size_and_slot_config(vllm_config,
-                                              FakeMisalignedSlotBackend)
+        update_tpu_block_size_and_slot_config(vllm_config, FakeMisalignedSlotBackend)
 
 
 def test_hybrid_fit_uses_physical_gdn_extent(vllm_config):
@@ -223,8 +272,9 @@ def test_hybrid_fit_uses_configured_bf16_ssm_dtype(vllm_config):
 
 def test_kimi_linear_padded_ssm_fit(vllm_config):
     """Kimi-Linear TP8: the f32 KDA state (2^18 B) does not divide the MLA
-    token row (2^9 * 5 B), so the derivation pads the SSM region up to whole
-    token rows instead of rejecting the geometry."""
+    pool row (2^9 * 5 B), so the derivation pads the SSM region up to whole
+    rows; the pool's token-axis packing (2 tokens/row) then doubles the
+    manager block the fit floor implies."""
     vllm_config.model_config.is_hybrid = True
     vllm_config.model_config.architecture = "KimiLinearForCausalLM"
     vllm_config.model_config.get_head_size.return_value = 576
@@ -233,16 +283,15 @@ def test_kimi_linear_padded_ssm_fit(vllm_config):
     vllm_config.cache_config.mamba_cache_mode = "align"
     vllm_config.parallel_config.tensor_parallel_size = 8
 
-    _update(vllm_config,
-            backend_cls=FakeKimiMLABackend,
-            model_cls=FakeKimiLinearModel)
+    _update(vllm_config, backend_cls=FakeKimiMLABackend, model_cls=FakeKimiLinearModel)
 
-    # SSM: ceil(262144 / 2560) = 103 rows (1536 B of padding in the last
-    # row); conv: pow2(ceil(9216 / 2560)) = 4 rows; the fit floor 107 beats
-    # the backend minimum of 64 and the input block size of 16.
-    assert vllm_config.cache_config.block_size == 107
-    assert vllm_config.cache_config.mamba_block_size == 107
-    assert vllm_config.cache_config.mamba_page_size_padded == 107 * 2560
+    # State regions: ceil(262144 / 2560) = 103 pool rows (1536 B of padding
+    # in the last row) + fp32 conv pow2(ceil(18432 / 2560)) = 8 -> 111 packed
+    # rows = 222 tokens at packing 2. The fit floor 222 beats the backend
+    # minimum of 64 and the input block size of 16.
+    assert vllm_config.cache_config.block_size == 222
+    assert vllm_config.cache_config.mamba_block_size == 222
+    assert vllm_config.cache_config.mamba_page_size_padded == 111 * 2560
 
 
 def test_tp_sharding_changes_the_physical_gdn_fit(vllm_config):
@@ -257,13 +306,17 @@ def test_tp_sharding_changes_the_physical_gdn_fit(vllm_config):
 
 def test_fit_has_no_fixed_16_token_alignment(vllm_config):
     _configure_hybrid(vllm_config)
+    # This artificial state shape tests pool alignment, not Qwen's heads.
+    vllm_config.model_config.architecture = "CompactHybridForCausalLM"
 
-    _update(vllm_config,
-            backend_cls=FakePlainAttentionBackend,
-            model_cls=FakeCompactMambaModel)
+    _update(
+        vllm_config,
+        backend_cls=FakePlainAttentionBackend,
+        model_cls=FakeCompactMambaModel,
+    )
 
-    assert vllm_config.cache_config.block_size == 257
-    assert vllm_config.cache_config.mamba_page_size_padded == 257 * 1024
+    assert vllm_config.cache_config.block_size == 258
+    assert vllm_config.cache_config.mamba_page_size_padded == 258 * 1024
 
 
 def test_user_block_size_below_fit_is_promoted(vllm_config):
@@ -305,6 +358,66 @@ def test_pcp_uses_effective_tp_mamba_state(vllm_config):
     assert vllm_config.cache_config.mamba_page_size_padded == 512 * 1024
 
 
+@pytest.mark.parametrize(
+    "architecture", ["KimiLinearForCausalLM", "KimiK3ForConditionalGeneration"]
+)
+def test_pcp_kimi_pool_keeps_model_state_geometry(vllm_config, architecture):
+    _configure_hybrid(vllm_config, tp_size=2)
+    vllm_config.model_config.architecture = architecture
+    # Kimi has separate Q/K/V axes and no Qwen linear_num_* config fields.
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        linear_attn_config=dict(num_heads=32, head_dim=128, short_conv_kernel_size=4)
+    )
+    vllm_config.parallel_config.prefill_context_parallel_size = 4
+
+    class KimiModel:
+        @staticmethod
+        def get_mamba_state_shape_from_config(config):
+            kda = config.model_config.hf_text_config.linear_attn_config
+            heads = kda["num_heads"] // config.parallel_config.tensor_parallel_size
+            return (
+                (kda["short_conv_kernel_size"] - 1, 3, heads, kda["head_dim"]),
+                (heads, kda["head_dim"], kda["head_dim"]),
+            )
+
+        @staticmethod
+        def get_mamba_state_dtype_from_config(config):
+            return torch.bfloat16, torch.float32
+
+    with patch(
+        "vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+        return_value=(KimiModel, None),
+    ):
+        layout = _hybrid_mamba_state_layout(vllm_config, 1024)
+    assert layout.ssm_bytes == 4 * 128 * 128 * 4
+    assert layout.conv_bytes == 3 * 3 * 4 * 128 * 4
+    assert vllm_config.parallel_config.tensor_parallel_size == 2
+
+
+def test_pcp_gdn_pool_sizes_replicated_kq_state(vllm_config):
+    _configure_hybrid(vllm_config)
+    vllm_config.parallel_config.prefill_context_parallel_size = 8
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        linear_num_key_heads=4,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
+
+    _update(
+        vllm_config,
+        backend_cls=FakePlainAttentionBackend,
+        model_cls=FakeConfiguredGdnModel,
+    )
+
+    # Local SSM: 4*128*128*4 = 256 KiB (256 rows). Local Conv:
+    # 3*(1Q+1K+4V)*128*4 = 9216 B, rounded to 16 physical rows.
+    assert vllm_config.cache_config.block_size == 272
+    assert vllm_config.cache_config.mamba_block_size == 272
+    assert vllm_config.cache_config.mamba_page_size_padded == 272 * 1024
+
+
 def test_backend_minimum_is_part_of_the_block_floor(vllm_config):
     _configure_hybrid(vllm_config)
 
@@ -322,7 +435,8 @@ def test_unified_slot_rejects_non_compact_fa_pages(vllm_config):
 
 
 def test_spec_ckpt_blocks_keep_block_size_independent_of_num_spec(
-        vllm_config, monkeypatch):
+    vllm_config, monkeypatch
+):
     """One block per checkpoint means the fit floor stops scaling with K.
 
     This is what the unified pool does for every speculative config: the
@@ -335,8 +449,7 @@ def test_spec_ckpt_blocks_keep_block_size_independent_of_num_spec(
     sizes = {}
     for num_spec in (1, 3, 7):
         vllm_config.model_config.is_hybrid = True
-        vllm_config.model_config.architecture = (
-            "Qwen3_5MoeForConditionalGeneration")
+        vllm_config.model_config.architecture = "Qwen3_5MoeForConditionalGeneration"
         vllm_config.cache_config.block_size = 2112
         vllm_config.cache_config.mamba_block_size = 2112
         vllm_config.cache_config.mamba_cache_mode = "align"
@@ -345,10 +458,12 @@ def test_spec_ckpt_blocks_keep_block_size_independent_of_num_spec(
         vllm_config.speculative_config.num_speculative_tokens = num_spec
 
         with patch(
-                "vllm.model_executor.models.ModelRegistry.resolve_model_cls",
-                return_value=(FakeQwenMambaModel, None)):
+            "vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+            return_value=(FakeQwenMambaModel, None),
+        ):
             update_tpu_block_size_and_slot_config(
-                vllm_config, FakeBatchedRPAAttentionBackend)
+                vllm_config, FakeBatchedRPAAttentionBackend
+            )
         sizes[num_spec] = vllm_config.cache_config.block_size
 
     assert len(set(sizes.values())) == 1, sizes
@@ -376,9 +491,13 @@ def test_hybrid_gdn_pcp_rejects_non_sharding_shape_calculator(vllm_config):
     vllm_config.cache_config.mamba_cache_mode = "align"
     vllm_config.parallel_config.prefill_context_parallel_size = 4
 
-    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
-               return_value=(FakeNonShardingMambaModel, None)), pytest.raises(
-                   ValueError,
-                   match="PCP-local Mamba state size must be exactly"):
-        update_tpu_block_size_and_slot_config(vllm_config,
-                                              FakeBatchedRPAAttentionBackend)
+    with (
+        patch(
+            "vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+            return_value=(FakeNonShardingMambaModel, None),
+        ),
+        pytest.raises(ValueError, match="PCP-local Mamba state size must be exactly"),
+    ):
+        update_tpu_block_size_and_slot_config(
+            vllm_config, FakeBatchedRPAAttentionBackend
+        )

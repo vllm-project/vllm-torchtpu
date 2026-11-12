@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """TPU platform plugin for vllm-omni."""
 
 import os
@@ -8,6 +20,7 @@ from torch_tpu._internal.utils import hardware
 from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
+from vllm_torchtpu.env_override import set_libtpu_flag_default
 from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
@@ -23,11 +36,14 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     _omni_enum = OmniPlatformEnum.OOT
 
+    # Diffusion worker world size recorded by set_device (see dist_backend).
+    _worker_world_size: int = 1
+
     @property
     def dist_backend(self) -> str:
-        world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
         return TpuPlatform.get_worker_distributed_backend(
-            world_size=world_size)
+            world_size=self._worker_world_size
+        )
 
     def __init__(self) -> None:
         super().__init__()
@@ -40,14 +56,35 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         head_size: int,
         allow_trtllm_default: bool = False,
     ) -> str:
+        from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
+
+        apply_omni_model_specific_patches()
+        if selected_backend is not None and selected_backend.upper() in (
+            "SDPA",
+            "TPU_SDPA",
+            "TORCH_SDPA",
+        ):
+            backend = "vllm_torchtpu.omni.attention.TpuSDPABackend"
+        else:
+            backend = "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
         logger.info_once(
-            "Using TpuSDPABackend for diffusion attention (requested: %s).",
-            selected_backend)
-        return "vllm_torchtpu.omni.attention.TpuSDPABackend"
+            "Using %s for diffusion attention (requested: %s).",
+            backend,
+            selected_backend,
+        )
+        return backend
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:
         return False
+
+    @classmethod
+    def supports_diffusion_dense_flash_attention(cls) -> bool:
+        return False
+
+    @classmethod
+    def get_profiler_cls(cls) -> str:
+        return "vllm_torchtpu.omni.profiler.TpuOmniTorchProfilerWrapper"
 
     @classmethod
     def supports_float64(cls) -> bool:
@@ -58,12 +95,72 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return False
 
     @classmethod
-    def set_device(cls, device: torch.device) -> None:
+    def supports_talker_mtp_graph_capture(cls) -> bool:
+        return False
+
+    @classmethod
+    def set_device(cls, device: torch.device | int) -> None:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+        if world_size > 1:
+            cls._worker_world_size = world_size
+            chips = os.environ.get("TPU_VISIBLE_CHIPS")
+            if chips and [int(c) for c in chips.split(",")] != list(range(world_size)):
+                logger.warning(
+                    "Diffusion stage is pinned to TPU_VISIBLE_CHIPS=%s, but its "
+                    "%d ranks bind chips 0-%d by local rank. Multi-rank diffusion "
+                    "stages on other chips (e.g. in multi-stage pipelines) are "
+                    "not supported on TPU yet.",
+                    chips,
+                    world_size,
+                    world_size - 1,
+                )
+            cls._set_shared_slicebuilder_addresses(world_size)
+            cls._offload_dense_all_to_all()
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
+
+    @staticmethod
+    def _offload_dense_all_to_all() -> None:
+        """Run dense all-to-alls on SparseCore in multi-rank diffusion workers.
+
+        Ulysses sequence parallelism moves q, k, v and the attention output
+        through dense all-to-alls in every transformer block. By default XLA
+        runs them on the TensorCore, which waits for them.
+        """
+        # TODO: Remove once libtpu enables the SparseCore dense all-to-all offload by
+        # default. This sets os.environ after torch_tpu is imported, but it still
+        # takes effect because libtpu reads LIBTPU_INIT_ARGS when the PjRt client
+        # is created on the first device allocation, the same pre-PjRt window
+        # that _set_shared_slicebuilder_addresses relies on.
+        set_libtpu_flag_default(
+            "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all", "true"
+        )
+
+    @staticmethod
+    def _set_shared_slicebuilder_addresses(world_size: int) -> None:
+        """Give every diffusion worker the same PjRt slicebuilder addresses.
+
+        Root cause: vLLM-Omni spawns diffusion workers with no platform hook
+        in the parent, so each worker reaches ``_prepare_singlehost_tpu_env``
+        without TORCH_TPU_SLICEBUILDER_ADDRESSES and picks its own random
+        ports. torch_tpu needs one identical list on every rank, otherwise
+        the slice bootstrap never completes. The workers already share
+        MASTER_PORT (DiffusionWorker exports od_config.master_port), so the
+        list is derived from it.
+
+        An inherited list is replaced even when its size matches: in
+        multi-stage pipelines it is an LLM stage's list (built in the
+        orchestrator process), and sharing it hangs that stage's workers.
+        """
+        # TODO: Remove once vLLM-Omni calls a platform hook in the parent before
+        # spawning diffusion workers, so every rank inherits one address list, or
+        # torch_tpu allows more than one addressable device per process.
+        base_port = int(os.environ["MASTER_PORT"])
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+            f"localhost:{base_port + 1 + i}" for i in range(world_size)
+        )
 
     @classmethod
     def get_torch_device(cls, _local_rank: int | None = None) -> torch.device:
@@ -78,8 +175,8 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return None
 
     @classmethod
-    def synchronize(cls) -> None:
-        torch.tpu.synchronize()
+    def synchronize(cls, device: torch.device | int | None = None) -> None:
+        torch.accelerator.synchronize(device)
 
     @classmethod
     def empty_cache(cls) -> None:
@@ -91,7 +188,8 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         if hbm is not None:
             return hbm
         raise ValueError(
-            f"Could not determine HBM memory for attached TPU device: {hardware.get_tpu_device_name()}"
+            "Could not determine HBM memory for attached TPU device: "
+            f"{hardware.get_tpu_device_name()}"
         )
 
     @classmethod
@@ -115,8 +213,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return torch.accelerator.max_memory_allocated(device)
 
     @classmethod
-    def reset_peak_memory_stats(cls,
-                                device: torch.device | None = None) -> None:
+    def reset_peak_memory_stats(cls, device: torch.device | None = None) -> None:
         torch.accelerator.reset_peak_memory_stats(device)
 
     @classmethod

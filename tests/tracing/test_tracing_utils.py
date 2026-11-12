@@ -1,8 +1,23 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from unittest.mock import patch
 
-from vllm_torchtpu.tracing.utils import (extract_kv_lens_for_tracing,
-                                         extract_request_ids_for_tracing,
-                                         trim_request_id_suffix)
+from vllm_torchtpu.tracing.utils import (
+    extract_kv_lens_for_tracing,
+    extract_request_ids_for_tracing,
+    trim_request_id_suffix,
+)
 
 
 def test_trim_request_id_suffix():
@@ -13,8 +28,10 @@ def test_trim_request_id_suffix():
     assert trim_request_id_suffix("cmpl-1234") == "cmpl-1234"
 
     # Case C: Non-"cmpl" prefixed IDs are bypassed.
-    assert trim_request_id_suffix(
-        "custom-req-id-1-2-3-4-5-6-7") == "custom-req-id-1-2-3-4-5-6-7"
+    assert (
+        trim_request_id_suffix("custom-req-id-1-2-3-4-5-6-7")
+        == "custom-req-id-1-2-3-4-5-6-7"
+    )
 
 
 def test_extract_request_ids_for_tracing():
@@ -32,14 +49,12 @@ def test_extract_request_ids_for_tracing():
 
     # Case C: Mock the internal components to fail and verify it swallows error
     class BadItem:
-
         def __str__(self):
             raise ValueError("Intentional crash")
 
     with patch("vllm_torchtpu.tracing.utils.logger.warning") as mock_warning:
         res_3 = extract_request_ids_for_tracing(["cmpl-1", BadItem()], 0, 2)
-        assert res_3 == {
-        }  # the list comprehension exception catches in outer try
+        assert res_3 == {}  # the list comprehension exception catches in outer try
         mock_warning.assert_called_once()
 
 
@@ -47,9 +62,7 @@ def test_extract_kv_lens_for_tracing():
     num_computed_tokens = [100, 200, 300, 400]
 
     # Case A: Test pagination by passing start_index and num_reqs
-    res = extract_kv_lens_for_tracing(num_computed_tokens,
-                                      start_index=1,
-                                      num_reqs=2)
+    res = extract_kv_lens_for_tracing(num_computed_tokens, start_index=1, num_reqs=2)
     assert res == {
         "kv_len1": 200,
         "kv_len2": 300,
@@ -71,7 +84,5 @@ def test_extract_kv_lens_for_tracing():
     }
 
     # Case C: Empty slice yields no kwargs and no summary stats
-    res_3 = extract_kv_lens_for_tracing(num_computed_tokens,
-                                        start_index=4,
-                                        num_reqs=2)
+    res_3 = extract_kv_lens_for_tracing(num_computed_tokens, start_index=4, num_reqs=2)
     assert res_3 == {}

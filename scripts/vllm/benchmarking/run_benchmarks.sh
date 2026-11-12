@@ -1,10 +1,26 @@
 #!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Self-contained benchmark runner for vllm-torchtpu.
 # Starts a vLLM server, runs benchmark_serving.py for each ISL/OSL x concurrency
 # combo, saves results locally.
 #
 # Usage:
-#   ./scripts/vllm/benchmarking/run_benchmarks.sh [--config CONFIG_NAME] [--dry-run] [--keep-alive]
+#   ./scripts/vllm/benchmarking/run_benchmarks.sh [--config CONFIG_NAME] [--dry-run] [--keep-alive] [--serve-only]
+#
+#   --serve-only  start the config's server and wait on it, running no benchmark
 #
 # Examples:
 #   ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-0.6b-smoke
@@ -23,14 +39,20 @@
 #                         <results>/profile. Implied when EXTRA_SERVE_ARGS sets
 #                         --profiler-config.torch_profiler_dir, which then also
 #                         chooses the trace directory; CAPTURE_PROFILE=0 opts
-#                         back out. Bench gets --profile so /start_profile
-#                         and /stop_profile fire
-#                         around the main run; warmup runs aren't profiled.
-#                         --profile costs roughly +11% TTFT and −4% throughput,
-#                         so don't compare profile-on numbers to a non-profile
-#                         baseline. Prefer a single ISL/OSL case for clean
+#                         back out. --profile costs roughly +11% TTFT and −4%
+#                         throughput, so it runs once more per cell after the
+#                         measured run instead of profiling it; the gate and
+#                         uploader skip that <cell>.profile.json.
+#                         Prefer a single ISL/OSL case for clean
 #                         attribution. Recorded as capture_profile + profile_dir
 #                         in config.json.
+#   PROFILE_NUM_PROMPTS   prompts for that run (default: the cell's concurrency).
+#
+# Structured decoding:
+#   BENCHMARK_EXTRA_BODY  JSON merged into every request body via
+#                         --extra-body, e.g. a `structured_outputs` grammar.
+#                         Passed as one quoted argument; EXTRA_BENCH_ARGS is
+#                         word-split and globbed, which mangles JSON.
 
 set -euo pipefail
 
@@ -44,6 +66,7 @@ CONFIG_NAME="qwen3-coder-480b-fp8-tp8-ep"
 DRY_RUN=0
 RESULTS_DIR_OVERRIDE="${RESULTS_DIR:-}"
 KEEP_ALIVE=0
+SERVE_ONLY=0
 HOST=""
 PORT="${PORT:-8000}"
 START_SERVER=1
@@ -67,9 +90,17 @@ while [[ $# -gt 0 ]]; do
             KEEP_ALIVE=1
             shift
             ;;
+        --serve-only)
+            SERVE_ONLY=1
+            shift
+            ;;
         --host)
             HOST="$2"
             START_SERVER=0
+            shift 2
+            ;;
+        --mode)
+            BENCHMARK_MODE_CLI="$2"
             shift 2
             ;;
         --port)
@@ -78,7 +109,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--config CONFIG_NAME] [--results-dir DIR] [--dry-run] [--keep-alive] [--host HOST] [--port PORT]"
+            echo "Usage: $0 [--config CONFIG_NAME] [--mode MODE] [--results-dir DIR] [--dry-run] [--keep-alive] [--serve-only] [--host HOST] [--port PORT]"
             exit 1
             ;;
     esac
@@ -103,8 +134,8 @@ fi
 MODEL=""
 # Optional gs:// (or s3://) checkpoint URI. When set, the server streams
 # weights from object storage via --load-format runai_streamer and serves
-# under the MODEL name (for hosts without an attached disk, e.g.
-# tpu_v7x_16_queue). Clients keep using MODEL. Env-overridable so CI can
+# under the MODEL name (for hosts without the checkpoint on local disk).
+# Clients keep using MODEL. Env-overridable so CI can
 # resolve the snapshot path at runtime.
 MODEL_URI="${MODEL_URI:-}"
 TENSOR_PARALLELISM=1
@@ -113,6 +144,12 @@ ENABLE_EP=false
 QUANTIZATION=""
 ISL_OSL_CONFIGS="512:512"
 CONCURRENCY_OPTIONS="1"
+# Benchmark prompts: "random" (default) sizes them from ISL_OSL_CONFIGS; any
+# other vllm bench serve --dataset-name (e.g. sharegpt with DATASET_PATH)
+# takes prompts from the dataset. For sharegpt the OSL still sets the output
+# length; ISL is then only the cell label.
+DATASET_NAME="${DATASET_NAME:-random}"
+DATASET_PATH="${DATASET_PATH:-}"
 RANDOM_RANGE_RATIO=""
 NUM_PROMPTS=""
 # How RANDOM_RANGE_RATIO is interpreted:
@@ -133,6 +170,9 @@ BENCHMARK_TEMPERATURE="${BENCHMARK_TEMPERATURE:-}"
 # passthrough that configs extend with "${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS }".
 # E.g. --trust-remote-code for models whose repo ships a custom tokenizer.
 EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
+# JSON for --extra-body, kept apart from EXTRA_BENCH_ARGS so it reaches the
+# client as one argument (see header). Empty => flag not passed.
+BENCHMARK_EXTRA_BODY="${BENCHMARK_EXTRA_BODY:-}"
 # Server async scheduling (--async-scheduling / --no-async-scheduling).
 # Resolution order: env > config > harness default (true). Left empty here
 # so a config can tell "unset" from "forced by the operator".
@@ -150,8 +190,29 @@ EVAL_TOLERANCE=""
 # check_regression.py still apply). Raise per config for noisier layouts.
 PERF_TOLERANCE="0.05"
 
+BENCHMARK_MODE="${BENCHMARK_MODE:-serving}"
+SPEC_METHOD="${SPEC_METHOD:-}"
+SPEC_DRAFT_MODEL="${SPEC_DRAFT_MODEL:-}"
+SPEC_DRAFT_TP="${SPEC_DRAFT_TP:-}"
+SPEC_K_LIST="${SPEC_K_LIST:-0 1 2 3 4 5}"
+SPEC_BS_LIST="${SPEC_BS_LIST:-1 4 8}"
+SPEC_BENCH_DATASET="${SPEC_BENCH_DATASET:-}"
+SPEC_BENCH_CATEGORY="${SPEC_BENCH_CATEGORY:-summarization}"
+SPEC_NUM_PROMPTS="${SPEC_NUM_PROMPTS:-100}"
+SPEC_WARMUP_PROMPTS="${SPEC_WARMUP_PROMPTS:-20}"
+SPEC_REPS="${SPEC_REPS:-2}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
+
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
+
+if [ -n "${BENCHMARK_MODE_CLI:-}" ]; then
+    BENCHMARK_MODE="$BENCHMARK_MODE_CLI"
+fi
+if [ "$BENCHMARK_MODE" != "serving" ] && [ "$BENCHMARK_MODE" != "spec_bench" ]; then
+    echo "ERROR: BENCHMARK_MODE must be 'serving' or 'spec_bench', got '$BENCHMARK_MODE'"
+    exit 1
+fi
 
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
 if [ "$ASYNC_SCHEDULING" != "true" ] && [ "$ASYNC_SCHEDULING" != "false" ]; then
@@ -159,22 +220,74 @@ if [ "$ASYNC_SCHEDULING" != "true" ] && [ "$ASYNC_SCHEDULING" != "false" ]; then
     exit 1
 fi
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+# Fail on bad JSON here rather than after server startup and compile, at the
+# first `vllm bench serve`. The compact form goes into config.json so a
+# constrained run's metadata differs from an unconstrained one.
+if [ -n "$BENCHMARK_EXTRA_BODY" ]; then
+    benchmark_extra_body_json=$(python3 -c 'import json, sys; print(json.dumps(json.loads(sys.argv[1])))' "$BENCHMARK_EXTRA_BODY") ||
+        {
+            echo "ERROR: BENCHMARK_EXTRA_BODY is not valid JSON" >&2
+            exit 1
+        }
+else
+    benchmark_extra_body_json=null
+fi
 
 if [ -z "$MODEL" ]; then
     echo "ERROR: Config must set MODEL"
     exit 1
 fi
-if [ -z "$RANDOM_RANGE_RATIO" ]; then
-    echo "ERROR: Config must set RANDOM_RANGE_RATIO"
-    exit 1
-fi
-if [ -z "$EVAL_TOLERANCE" ]; then
-    echo "ERROR: Config must set EVAL_TOLERANCE"
-    exit 1
-fi
-if [ "$RANGE_RATIO_STYLE" != "symmetric" ] && [ "$RANGE_RATIO_STYLE" != "min" ]; then
-    echo "ERROR: RANGE_RATIO_STYLE must be 'symmetric' or 'min'"
-    exit 1
+
+if [ "$BENCHMARK_MODE" != "spec_bench" ]; then
+    if [ -z "$RANDOM_RANGE_RATIO" ]; then
+        echo "ERROR: Config must set RANDOM_RANGE_RATIO"
+        exit 1
+    fi
+    if [ -z "$EVAL_TOLERANCE" ]; then
+        echo "ERROR: Config must set EVAL_TOLERANCE"
+        exit 1
+    fi
+    if [ "$RANGE_RATIO_STYLE" != "symmetric" ] && [ "$RANGE_RATIO_STYLE" != "min" ]; then
+        echo "ERROR: RANGE_RATIO_STYLE must be 'symmetric' or 'min'"
+        exit 1
+    fi
+else
+    if [ "$START_SERVER" != "1" ]; then
+        echo "ERROR: --host is not supported in spec_bench mode because each (BS, K) cell restarts vllm serve."
+        exit 1
+    fi
+    if [ -z "${SPEC_K_LIST// /}" ]; then
+        echo "ERROR: SPEC_K_LIST must be a non-empty space-separated list of non-negative integers"
+        exit 1
+    fi
+    for k in $SPEC_K_LIST; do
+        if ! [[ "$k" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: SPEC_K_LIST entries must be non-negative integers, got '$k'"
+            exit 1
+        fi
+    done
+    if [ -z "${SPEC_BS_LIST// /}" ]; then
+        echo "ERROR: SPEC_BS_LIST must be a non-empty space-separated list of positive integers"
+        exit 1
+    fi
+    for bs in $SPEC_BS_LIST; do
+        if ! [[ "$bs" =~ ^[1-9][0-9]*$ ]]; then
+            echo "ERROR: SPEC_BS_LIST entries must be positive integers, got '$bs'"
+            exit 1
+        fi
+    done
+    if ! [[ "$SPEC_REPS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SPEC_REPS must be a positive integer, got '$SPEC_REPS'"
+        exit 1
+    fi
+    if ! [[ "$SPEC_NUM_PROMPTS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SPEC_NUM_PROMPTS must be a positive integer, got '$SPEC_NUM_PROMPTS'"
+        exit 1
+    fi
+    if ! [[ "$SPEC_WARMUP_PROMPTS" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: SPEC_WARMUP_PROMPTS must be a non-negative integer, got '$SPEC_WARMUP_PROMPTS'"
+        exit 1
+    fi
 fi
 if ! [[ "$BENCHMARK_WARMUP_RUNS" =~ ^[0-9]+$ ]]; then
     echo "ERROR: BENCHMARK_WARMUP_RUNS must be a non-negative integer"
@@ -183,9 +296,12 @@ fi
 
 PORT="${PORT:-8000}"
 
-# Verify vllm bench serve is available
-if ! python3 -m vllm.entrypoints.cli.main bench serve --help &>/dev/null; then
-    echo "ERROR: 'vllm bench serve' not available. Is vLLM installed?"
+# Verify vLLM is installed. find_spec locates the package without importing it:
+# the `vllm bench serve --help` this replaces imported all of vLLM, 6-50s per
+# config with the chips idle, and a missing subcommand still fails the first
+# benchmark call with its own error.
+if ! python3 -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("vllm") is None)'; then
+    echo "ERROR: vLLM is not installed."
     exit 1
 fi
 echo "Using benchmark tool: vllm bench serve"
@@ -230,6 +346,7 @@ start_vllm_server() {
     local max_model_len=$1
     local max_num_batched_tokens=$2
     local max_num_seqs=$3
+    local extra_server_flags="${4:-}"
     local gpu_mem_util="${GPU_MEMORY_UTILIZATION:-0.95}"
 
     # Build extra args
@@ -245,6 +362,15 @@ start_vllm_server() {
     # block_size=16 and benchmarks regress ~12% (see PR #191 / 9467829).
     local attn_backend="${ATTENTION_BACKEND:-CUSTOM}"
     extra_args="$extra_args --attention-backend $attn_backend"
+    # One API frontend, not one per DP rank: vLLM's default for DP starts a
+    # frontend per rank, and they race resolving the model into the loader
+    # cache - a losing frontend dies without binding (DSv4-Flash, and GLM-5.2
+    # in dev build 164). Topology rather than model, so it lives here rather
+    # than in each config. Ahead of EXTRA_SERVE_ARGS so a config can still
+    # override it.
+    if [ "${DATA_PARALLELISM:-1}" -gt 1 ]; then
+        extra_args="$extra_args --api-server-count=1"
+    fi
     if [ -n "${EXTRA_SERVE_ARGS:-}" ]; then
         extra_args="$extra_args $EXTRA_SERVE_ARGS"
     fi
@@ -272,6 +398,11 @@ start_vllm_server() {
     if [ -n "$MODEL_URI" ]; then
         serve_target="$MODEL_URI"
         extra_args="$extra_args --load-format runai_streamer --served-model-name $MODEL"
+    elif [ "$BENCHMARK_MODE" = "spec_bench" ] && [ -n "${SERVED_MODEL_NAME:-}" ]; then
+        extra_args="$extra_args --served-model-name $SERVED_MODEL_NAME"
+    fi
+    if [ -n "$extra_server_flags" ]; then
+        extra_args="$extra_args $extra_server_flags"
     fi
     local server_cmd="vllm serve ${serve_target} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT $async_scheduling_flag $prefix_caching_flag --gpu-memory-utilization=$gpu_mem_util --kv-cache-dtype=$kv_cache_dtype $extra_args"
 
@@ -373,7 +504,7 @@ run_benchmark_once() {
     local concurrency=$3
     local result_file=$4
     local bench_log=$5
-    local is_warmup=${6:-0}
+    local mode=${6:-measured}  # measured | warmup | profile
 
     # min-style ratios sample in [r*len, len]; vllm bench serve only supports
     # the symmetric [(1-h)*mid, (1+h)*mid], so pass mid = len*(1+r)/2 and
@@ -388,8 +519,11 @@ run_benchmark_once() {
     fi
 
     local profile_arg=""
-    if [ "${CAPTURE_PROFILE:-0}" = "1" ] && [ "$is_warmup" != "1" ]; then
+    local num_prompts="${NUM_PROMPTS:-320}"
+    if [ "$mode" = "profile" ]; then
         profile_arg="--profile"
+        # One full wave, so decode reaches the measured run's batch width.
+        num_prompts="${PROFILE_NUM_PROMPTS:-$concurrency}"
     fi
 
     # Force greedy (or any fixed temperature) when BENCHMARK_TEMPERATURE is set.
@@ -403,13 +537,34 @@ run_benchmark_once() {
     # TOKENIZER overrides; else with MODEL_URI tokenize from the dir the
     # server pulled from object storage (see "Bench-client tokenizer").
     local tokenizer_arg=()
-    local pulled_tokenizer=""
-    if [ -n "${TOKENIZER:-}" ]; then
-        tokenizer_arg=(--tokenizer "$TOKENIZER")
+    set_tokenizer_arg
+
+    local extra_body_arg=()
+    if [ -n "$BENCHMARK_EXTRA_BODY" ]; then
+        extra_body_arg=(--extra-body "$BENCHMARK_EXTRA_BODY")
+    fi
+
+    local dataset_args=()
+    if [ "${DATASET_NAME:-random}" = "random" ]; then
+        dataset_args=(
+            --dataset-name random
+            --random-input-len "$bench_input_len"
+            --random-output-len "$bench_output_len"
+            --random-range-ratio "$bench_range_ratio"
+        )
     else
-        pulled_tokenizer=$(bench_tokenizer_dir)
-        if [ -n "$pulled_tokenizer" ]; then
-            tokenizer_arg=(--tokenizer "$pulled_tokenizer")
+        # Prompts come from the dataset, so ISL is only the cell label.
+        # vllm bench serve takes each ShareGPT request's output length from
+        # its reference answer unless --sharegpt-output-len is given; pass
+        # the config's OSL so the cell decodes the length it is named for.
+        dataset_args=(
+            --dataset-name "$DATASET_NAME"
+        )
+        if [ -n "${DATASET_PATH:-}" ]; then
+            dataset_args+=(--dataset-path "$DATASET_PATH")
+        fi
+        if [ "$DATASET_NAME" = "sharegpt" ]; then
+            dataset_args+=(--sharegpt-output-len "$bench_output_len")
         fi
     fi
 
@@ -421,11 +576,8 @@ run_benchmark_once() {
         --trust-remote-code \
         --host "$HOST" \
         --port "$PORT" \
-        --dataset-name random \
-        --random-input-len "$bench_input_len" \
-        --random-output-len "$bench_output_len" \
-        --random-range-ratio "$bench_range_ratio" \
-        --num-prompts "${NUM_PROMPTS:-320}" \
+        "${dataset_args[@]}" \
+        --num-prompts "$num_prompts" \
         --max-concurrency "$concurrency" \
         --request-rate inf \
         --percentile-metrics ttft,tpot,itl,e2el \
@@ -434,12 +586,165 @@ run_benchmark_once() {
         --result-filename "$result_file" \
         $profile_arg \
         ${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS} \
+        "${extra_body_arg[@]}" \
         "${temperature_arg[@]}" \
         --seed 42 2>&1 | tee -a "$bench_log"
     local bench_exit=${PIPESTATUS[0]}
     set -e
 
     return "$bench_exit"
+}
+
+run_spec_bench_client() {
+    local bs=$1
+    local k=$2
+    local num_prompts=$3
+    local result_file=$4
+    local bench_log=$5
+
+    local tokenizer_arg=()
+    set_tokenizer_arg
+
+    local served_model_arg=()
+    if [ -n "${SERVED_MODEL_NAME:-}" ]; then
+        served_model_arg=(--served-model-name "$SERVED_MODEL_NAME")
+    fi
+
+    set +e
+    vllm bench serve \
+        --backend vllm \
+        --endpoint /v1/completions \
+        --model "$MODEL" \
+        "${served_model_arg[@]}" \
+        "${tokenizer_arg[@]}" \
+        --trust-remote-code \
+        --host "$HOST" \
+        --port "$PORT" \
+        --dataset-name spec_bench \
+        --dataset-path "$SPEC_BENCH_DATASET" \
+        --spec-bench-category "$SPEC_BENCH_CATEGORY" \
+        --num-prompts "$num_prompts" \
+        --max-concurrency "$bs" \
+        --temperature "${BENCHMARK_TEMPERATURE:-0}" \
+        --seed 0 \
+        --request-rate inf \
+        --percentile-metrics ttft,tpot,itl,e2el \
+        --metric-percentiles 50,95,99 \
+        --save-result \
+        --result-filename "$result_file" \
+        ${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS} 2>&1 | tee -a "$bench_log"
+    local client_exit=${PIPESTATUS[0]}
+    set -e
+
+    return "$client_exit"
+}
+
+run_spec_benchmarks() {
+    # Resolve Spec-Bench dataset
+    if [ "$DRY_RUN" = "1" ]; then
+        SPEC_BENCH_DATASET="${SPEC_BENCH_DATASET:-/workspace/datasets/spec_bench_question.jsonl}"
+    elif [ -z "$SPEC_BENCH_DATASET" ] || [ ! -s "$SPEC_BENCH_DATASET" ]; then
+        local default_dataset_path="/tmp/spec_bench_question.jsonl"
+        local dataset_url="https://raw.githubusercontent.com/hemingkx/Spec-Bench/main/data/spec_bench/question.jsonl"
+        if [ ! -s "$default_dataset_path" ]; then
+            echo "Downloading spec_bench_question.jsonl to $default_dataset_path..."
+            local tmp_download="${default_dataset_path}.partial"
+            if command -v curl &>/dev/null; then
+                curl -fsSL --connect-timeout 5 "$dataset_url" -o "$tmp_download" || rm -f "$tmp_download"
+            elif command -v wget &>/dev/null; then
+                wget -q --timeout=5 -O "$tmp_download" "$dataset_url" || rm -f "$tmp_download"
+            fi
+            if [ -s "$tmp_download" ]; then
+                mv "$tmp_download" "$default_dataset_path"
+            fi
+        fi
+        if [ ! -s "$default_dataset_path" ]; then
+            echo "ERROR: Spec-Bench dataset not found and download from $dataset_url failed."
+            echo "Set SPEC_BENCH_DATASET to a local copy of question.jsonl."
+            exit 1
+        fi
+        SPEC_BENCH_DATASET="$default_dataset_path"
+    fi
+    echo "Using Spec-Bench dataset: $SPEC_BENCH_DATASET (category: $SPEC_BENCH_CATEGORY)"
+
+    # Every K > 0 needs a drafting method; fail before starting any server.
+    if [ -z "$SPEC_METHOD" ]; then
+        for k in $SPEC_K_LIST; do
+            if [ "$k" -gt 0 ]; then
+                echo "ERROR: SPEC_K_LIST contains K=$k but SPEC_METHOD is empty."
+                echo "Set SPEC_METHOD (e.g. ngram, eagle3, mtp) or use SPEC_K_LIST=0."
+                exit 1
+            fi
+        done
+    fi
+
+    local exit_code=0
+    for bs in $SPEC_BS_LIST; do
+        mkdir -p "$RESULTS_DIR/bs${bs}"
+        for k in $SPEC_K_LIST; do
+            echo ""
+            echo "================================================"
+            echo "Spec-Bench Cell: BS=$bs, K=$k"
+            echo "================================================"
+
+            local spec_config_arg=""
+            if [ "$k" -gt 0 ]; then
+                if [ -n "$SPEC_DRAFT_MODEL" ]; then
+                    local draft_tp=${SPEC_DRAFT_TP:-$TENSOR_PARALLELISM}
+                    spec_config_arg="--speculative-config {\"method\":\"$SPEC_METHOD\",\"model\":\"$SPEC_DRAFT_MODEL\",\"num_speculative_tokens\":$k,\"draft_tensor_parallel_size\":$draft_tp}"
+                else
+                    spec_config_arg="--speculative-config {\"method\":\"$SPEC_METHOD\",\"num_speculative_tokens\":$k}"
+                fi
+            fi
+
+            if [ "$START_SERVER" = "1" ]; then
+                stop_vllm_server
+                trap stop_vllm_server EXIT INT TERM
+                start_vllm_server "$max_model_len" "$max_batched_tokens" "$bs" "$spec_config_arg"
+            fi
+
+            if [ "$DRY_RUN" = "1" ]; then
+                echo "[DRY RUN] Skipping client execution"
+                continue
+            fi
+
+            if [ "$SPEC_WARMUP_PROMPTS" -gt 0 ]; then
+                echo "  Running warmup pass ($SPEC_WARMUP_PROMPTS prompts)..."
+                local warmup_log="$RESULTS_DIR/bs${bs}/k${k}_warmup.log"
+                run_spec_bench_client "$bs" "$k" "$SPEC_WARMUP_PROMPTS" "/tmp/warmup.json" "$warmup_log" || true
+            fi
+
+            for ((rep = 1; rep <= SPEC_REPS; rep++)); do
+                local result_file="$RESULTS_DIR/bs${bs}/k${k}_rep${rep}.json"
+                local bench_log="$RESULTS_DIR/bs${bs}/k${k}_rep${rep}.log"
+                echo "  Running measured pass (rep $rep/$SPEC_REPS)..."
+                if run_spec_bench_client "$bs" "$k" "$SPEC_NUM_PROMPTS" "$result_file" "$bench_log"; then
+                    echo "  Rep $rep OK -> $result_file"
+                else
+                    echo "  Rep $rep FAILED"
+                    exit_code=1
+                fi
+                if ! check_server_alive; then
+                    exit_code=1
+                    break 2
+                fi
+            done
+        done
+    done
+
+    if [ "$START_SERVER" = "1" ]; then
+        stop_vllm_server
+    fi
+
+    if [ "$DRY_RUN" != "1" ]; then
+        echo ""
+        echo "================================================"
+        echo "Generating Spec-Bench Summary"
+        echo "================================================"
+        python3 "$SCRIPT_DIR/summarize_spec_bench.py" --results-dir "$RESULTS_DIR"
+    fi
+
+    return "$exit_code"
 }
 
 # =============================================================================
@@ -466,6 +771,19 @@ bench_tokenizer_dir() {
     fi
 }
 
+set_tokenizer_arg() {
+    tokenizer_arg=()
+    local pulled_tokenizer=""
+    if [ -n "${TOKENIZER:-}" ]; then
+        tokenizer_arg=(--tokenizer "$TOKENIZER")
+    else
+        pulled_tokenizer=$(bench_tokenizer_dir)
+        if [ -n "$pulled_tokenizer" ]; then
+            tokenizer_arg=(--tokenizer "$pulled_tokenizer")
+        fi
+    fi
+}
+
 # =============================================================================
 # Compute server parameters from config
 # =============================================================================
@@ -482,8 +800,8 @@ if [ -n "$PROFILE_DIR" ]; then
 else
     profile_dir_json=null
 fi
-# Null outside Buildkite, where nothing performs the copy.
-if [ -n "${PROFILE_GCS_BASE:-}" ] && [ -n "${BUILDKITE_BUILD_NUMBER:-}" ]; then
+# Null when not profiling, and outside Buildkite where nothing performs the copy.
+if [ "${CAPTURE_PROFILE:-0}" = "1" ] && [ -n "${PROFILE_GCS_BASE:-}" ] && [ -n "${BUILDKITE_BUILD_NUMBER:-}" ]; then
     if [ "$(printf '%s' "$ISL_OSL_CONFIGS" | wc -w)" -ne 1 ]; then
         echo "ERROR: PROFILE_GCS_BASE needs exactly one ISL/OSL cell; got" \
              "'$ISL_OSL_CONFIGS'. One profile directory serves every cell." >&2
@@ -506,6 +824,37 @@ if [ -n "$MODEL_URI" ]; then
 else
     model_uri_json=null
 fi
+random_range_ratio_json=${RANDOM_RANGE_RATIO:-null}
+eval_tolerance_json=${EVAL_TOLERANCE:-null}
+spec_bench_config_json=""
+if [ "$BENCHMARK_MODE" = "spec_bench" ]; then
+    spec_bench_config_json=$(python3 -c '
+import json, sys
+_, method, draft_model, draft_tp, k_list, bs_list, dataset, category, num_prompts, warmup_prompts, reps = sys.argv
+fields = {
+    "benchmark_mode": "spec_bench",
+    "spec_method": method or None,
+    "spec_draft_model": draft_model or None,
+    "spec_draft_tp": int(draft_tp) if draft_tp else None,
+    "spec_k_list": k_list,
+    "spec_bs_list": bs_list,
+    "spec_bench_dataset": dataset or None,
+    "spec_bench_category": category,
+    "spec_num_prompts": int(num_prompts),
+    "spec_warmup_prompts": int(warmup_prompts),
+    "spec_reps": int(reps),
+}
+body = json.dumps(fields, indent=4)
+print("," + body[1:-2])
+' "$SPEC_METHOD" "$SPEC_DRAFT_MODEL" "$SPEC_DRAFT_TP" "$SPEC_K_LIST" "$SPEC_BS_LIST" "$SPEC_BENCH_DATASET" "$SPEC_BENCH_CATEGORY" "$SPEC_NUM_PROMPTS" "$SPEC_WARMUP_PROMPTS" "$SPEC_REPS")
+fi
+# lm-eval only reaches its key=value parser for a --gen_kwargs string with no
+# "{" in it; anything brace-shaped must be real JSON with double quotes. Those
+# quotes would close the string literal below, so encode rather than interpolate.
+lm_eval_gen_kwargs_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$LM_EVAL_GEN_KWARGS")
+
+# Eval generation arguments can contain nested JSON.
+lm_eval_gen_kwargs_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$LM_EVAL_GEN_KWARGS")
 
 # Save config metadata
 cat > "$RESULTS_DIR/config.json" << EOF
@@ -517,12 +866,14 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "enable_ep": $ENABLE_EP,
     "quantization": "${QUANTIZATION:-none}",
     "isl_osl_configs": "$ISL_OSL_CONFIGS",
+    "dataset_name": "$DATASET_NAME",
     "concurrency_options": "$CONCURRENCY_OPTIONS",
     "num_prompts": ${NUM_PROMPTS:-320},
-    "random_range_ratio": $RANDOM_RANGE_RATIO,
+    "random_range_ratio": $random_range_ratio_json,
     "range_ratio_style": "$RANGE_RATIO_STYLE",
     "benchmark_warmup_runs": $BENCHMARK_WARMUP_RUNS,
     "benchmark_temperature": $benchmark_temperature_json,
+    "benchmark_extra_body": $benchmark_extra_body_json,
     "max_model_len": $max_model_len,
     "max_num_batched_tokens": $max_batched_tokens,
     "max_num_seqs": $max_num_seqs,
@@ -535,9 +886,9 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS,
     "lm_eval_tasks": "$LM_EVAL_TASKS",
     "extra_lm_eval_model_args": "$EXTRA_LM_EVAL_MODEL_ARGS",
-    "lm_eval_gen_kwargs": "$LM_EVAL_GEN_KWARGS",
+    "lm_eval_gen_kwargs": $lm_eval_gen_kwargs_json,
     "perf_tolerance": $PERF_TOLERANCE,
-    "eval_tolerance": $EVAL_TOLERANCE
+    "eval_tolerance": $eval_tolerance_json$spec_bench_config_json
 }
 EOF
 
@@ -571,9 +922,21 @@ echo "================================================"
 # (vLLM's default is 600s). Matches the golden cmds' setting.
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 
+if [ "$BENCHMARK_MODE" = "spec_bench" ]; then
+    run_spec_benchmarks
+    exit "$?"
+fi
+
 if [ "$START_SERVER" = "1" ]; then
     trap stop_vllm_server EXIT INT TERM
     start_vllm_server "$max_model_len" "$max_batched_tokens" "$max_num_seqs"
+    # For a caller that drives the server itself, e.g. one engine of a
+    # disaggregated pair, which must not be sent the config's benchmark.
+    if [ "$SERVE_ONLY" = "1" ] && [ "$DRY_RUN" = "0" ]; then
+        echo "Serving until the server exits (--serve-only)"
+        wait "$SERVER_PID"
+        exit $?
+    fi
 fi
 
 exit_code=0
@@ -610,7 +973,7 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
             warmup_file="${RESULTS_DIR}/${base_name}.warmup${warmup_idx}.json"
             warmup_log="${RESULTS_DIR}/${base_name}.warmup${warmup_idx}.log"
             echo "    Warmup run $warmup_idx/$BENCHMARK_WARMUP_RUNS"
-            if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$warmup_file" "$warmup_log" 1; then
+            if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$warmup_file" "$warmup_log" warmup; then
                 warmup_exit=0
             else
                 warmup_exit=$?
@@ -646,6 +1009,21 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
             if ! check_server_alive; then
                 exit_code=1
                 break 2
+            fi
+            if [ "${CAPTURE_PROFILE:-0}" = "1" ]; then
+                profile_file="${RESULTS_DIR}/${base_name}.profile.json"
+                profile_log="${RESULTS_DIR}/${base_name}.profile.log"
+                echo "    Profile run"
+                # A failed profile run doesn't fail the measured run; a dead server does.
+                if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$profile_file" "$profile_log" profile; then
+                    echo "    Profile OK -> $profile_file"
+                else
+                    echo "    PROFILE RUN FAILED (exit $?)"
+                fi
+                if ! check_server_alive; then
+                    exit_code=1
+                    break 2
+                fi
             fi
         else
             echo "    FAILED (exit $bench_exit)"

@@ -25,7 +25,7 @@ cd vllm-torchtpu/
 # Replace the IPs with your own IP addresses
 ./scripts/multihost/deploy_cluster.sh \
   -s ./scripts/multihost/run_cluster.sh \
-  -d "<link_to_your_docker_image>" \
+  -d "vllm/vllm-torchtpu:latest" \
   -t "<HF_TOKEN>" \
   -H "<IP_0>" \
   -i "<INTERNAL_IP_0>" \
@@ -33,6 +33,7 @@ cd vllm-torchtpu/
 ```
 
 ### Parameter Descriptions
+- `-d`: Docker image URI (e.g., `vllm/vllm-torchtpu:latest` or `vllm/vllm-torchtpu:nightly` from [Docker Hub](https://hub.docker.com/r/vllm/vllm-torchtpu/tags))
 - `-H`: External IP of host0
 - `-i`: Internal IP of host0
 - `-W`: External IPs of worker hosts (`host1,host2,...`)

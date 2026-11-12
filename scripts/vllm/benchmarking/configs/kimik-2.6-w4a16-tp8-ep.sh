@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Nightly benchmark config for Kimi-K2.6 (TP=8, EP, MoE W4A16)
 
@@ -63,3 +77,15 @@ RANDOM_RANGE_RATIO="0.8"
 BENCHMARK_TEMPERATURE="0"
 PERF_TOLERANCE="0.05"
 EVAL_TOLERANCE="0.03"
+
+# Accuracy Evaluation Parameters
+# mmlu_pro only: mmlu_llama's few-shot turns arrive via continue_final_message,
+# and this chat template renders a prefilled assistant turn through its <think>
+# branch, so the shots come back malformed.
+LM_EVAL_TASKS="mmlu_pro"
+MMLU_PRO_DISABLE_MULTITURN_ARGS=true
+EXTRA_LM_EVAL_MODEL_ARGS="num_concurrent=32,timeout=7200"
+# K2.6 gates reasoning on `thinking`, not the `enable_thinking` the harness
+# passes by default (chat_template.jinja L85/L107) -- with the default the
+# template opens an unclosed <think> and the answer never fits max_gen_toks.
+LM_EVAL_GEN_KWARGS='{"chat_template_kwargs": {"thinking": false}}'

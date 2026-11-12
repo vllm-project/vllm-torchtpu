@@ -1,10 +1,22 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Implements profiling for vLLM on TPU VMs using the PyTorch/XLA profiler.
 # NOTE: you will need the xprof (or tensorboard-plugin-profile) python package
 # to visualize the results.
-# Please see docs/profiling.md for more details, including how to view the
-# resulting traces and how to profile a running server instead.
+# Please see docs/developers_guide/profiling/ for more details, including how
+# to view the resulting traces and how to profile a running server instead.
 # Usage example for prefilling 1 request of 1024 tokens:
 # python3 examples/tpu_profiling.py --input-len 1024 --output-len 1   --batch-size 1
 # Usage example for decoding 256 requests of 1 token each:
@@ -50,18 +62,16 @@ def main(args: argparse.Namespace):
         max_tokens=args.output_len,
     )
     print(sampling_params)
-    dummy_prompt_token_ids = np.random.randint(10000,
-                                               size=(args.batch_size,
-                                                     args.input_len))
-    dummy_prompts: list[PromptType] = [{
-        "prompt_token_ids": batch
-    } for batch in dummy_prompt_token_ids.tolist()]
+    dummy_prompt_token_ids = np.random.randint(
+        10000, size=(args.batch_size, args.input_len)
+    )
+    dummy_prompts: list[PromptType] = [
+        {"prompt_token_ids": batch} for batch in dummy_prompt_token_ids.tolist()
+    ]
 
     def run_to_completion():
         start_time = time.perf_counter()
-        llm.generate(dummy_prompts,
-                     sampling_params=sampling_params,
-                     use_tqdm=False)
+        llm.generate(dummy_prompts, sampling_params=sampling_params, use_tqdm=False)
         end_time = time.perf_counter()
         latency = end_time - start_time
         return latency
@@ -89,7 +99,8 @@ def main(args: argparse.Namespace):
 def parse_args():
     parser = FlexibleArgumentParser(
         description="Benchmark the latency of processing a single batch of "
-        "requests till completion.")
+        "requests till completion."
+    )
     parser.add_argument("--input-len", type=int, default=32)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -109,8 +120,10 @@ def parse_args():
         "--profile-result-dir",
         type=str,
         default="profiles",
-        help=("path to save the profiler output. Can be visualized "
-              "with XProf or Tensorboard"),
+        help=(
+            "path to save the profiler output. Can be visualized "
+            "with XProf or Tensorboard"
+        ),
     )
 
     parser = EngineArgs.add_cli_args(parser)

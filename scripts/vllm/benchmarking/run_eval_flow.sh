@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Full evaluation flow script: supports manual and CI execution
 set -euo pipefail
 
@@ -11,6 +25,9 @@ RUN_CODE_EVAL=0
 RUN_MM_EVAL=0
 START_SERVER=1
 SKIP_DB_UPLOAD_FLAG=0
+SKIP_PERF_CHECK=0
+SKIP_BENCHMARK=0
+BASELINE_CONFIG=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -48,10 +65,31 @@ while [[ $# -gt 0 ]]; do
             SKIP_DB_UPLOAD_FLAG=1
             shift
             ;;
+        # Reports the benchmark without gating it on the config's baseline,
+        # for a run whose serving setup the baseline does not describe.
+        --skip-perf-check)
+            SKIP_PERF_CHECK=1
+            shift
+            ;;
+        # Runs the evals alone, for a server whose benchmark numbers would
+        # describe nothing a reader tracks.
+        --skip-benchmark)
+            SKIP_BENCHMARK=1
+            SKIP_PERF_CHECK=1
+            shift
+            ;;
+        # Gates against another config's baselines, for a config that serves
+        # that one's model another way and must answer the same.
+        --baseline-config)
+            BASELINE_CONFIG="$2"
+            shift 2
+            ;;
 
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT]"
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT] [--skip-db-upload] [--skip-perf-check] [--skip-benchmark] [--baseline-config CONFIG_NAME]"
+            # shellcheck disable=SC2016
+            echo '  --results-dir defaults to $ARTIFACTS_DIR/$CONFIG_NAME when ARTIFACTS_DIR is set, else /tmp/perf_eval_$CONFIG_NAME'
             exit 1
             ;;
     esac
@@ -65,6 +103,23 @@ if [ -z "$CONFIG_NAME" ]; then
     echo "ERROR: --config is required"
     exit 1
 fi
+
+# An eval regression warns instead of failing the step. Perf regressions still
+# fail either way. For a config whose eval baseline is new and whose
+# run-to-run spread is not yet known -- it keeps the perf gate hard while the
+# accuracy number earns confidence, instead of soft_fail'ing the whole step.
+EVAL_SOFT_FAIL="${EVAL_SOFT_FAIL:-0}"
+
+# Called when check_regression.py --mode eval exits non-zero.
+eval_regression_failed() {
+    local task="$1"
+    if [ "$EVAL_SOFT_FAIL" = "1" ]; then
+        echo "::warning::Eval regression for $task (EVAL_SOFT_FAIL=1, not failing the step). See logs above."
+    else
+        echo "::error::Eval regression check failed for $task! See logs above for details."
+        fail=1
+    fi
+}
 
 # If running in Buildkite CI, only upload to Spanner/BigQuery if on main branch and not a PR.
 if [ -n "${BUILDKITE_BRANCH:-}" ] && { [ "$BUILDKITE_BRANCH" != "main" ] || [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; }; then
@@ -80,17 +135,24 @@ if [ "$START_SERVER" = "1" ]; then
 fi
 
 if [ -z "$RESULTS_DIR" ]; then
-    RESULTS_DIR="/tmp/perf_eval_$CONFIG_NAME"
+    # Under ARTIFACTS_DIR when the caller set one, so results are picked up as
+    # artifacts without every step restating the path it already declared.
+    if [ -n "${ARTIFACTS_DIR:-}" ]; then
+        RESULTS_DIR="$ARTIFACTS_DIR/$CONFIG_NAME"
+    else
+        RESULTS_DIR="/tmp/perf_eval_$CONFIG_NAME"
+    fi
 fi
 mkdir -p "$RESULTS_DIR"
 
-PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$CONFIG_NAME.baseline.json"
+BASELINE_CONFIG="${BASELINE_CONFIG:-$CONFIG_NAME}"
+PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$BASELINE_CONFIG.baseline.json"
 
 PERF_LOG="$RESULTS_DIR/regression_check.md"
 
 run_lm_eval() {
     local task="$1"
-    local baseline="scripts/vllm/benchmarking/baselines/eval/${CONFIG_NAME}.${task}.baseline.json"
+    local baseline="scripts/vllm/benchmarking/baselines/eval/${BASELINE_CONFIG}.${task}.baseline.json"
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
 
     # --model_args is one comma-separated string, not a repeatable flag, so
@@ -145,9 +207,57 @@ run_lm_eval() {
             ;;
     esac
 
-    echo "Running lm_eval for task: $task..."
+    # lm-eval builds every request (contexts, few-shot examples) before sending
+    # the first, ~40s per task with the server idle, and each config rebuilt the
+    # same ones. They follow from the arguments below, the lm-eval version and
+    # our task definitions, not from the model: local-chat-completions leaves
+    # the chat template to the server and fingerprints requests with an empty
+    # tokenizer name. So they are cached per combination in the shared cache,
+    # $HF_HOME/hub (a gcsfuse bucket on kube), for every config and later run. lm-eval's own cache key leaves
+    # out --limit, --gen_kwargs and the task YAML contents, so the directory
+    # name carries all of it.
+    local request_spec=() skip_next=0 arg
+    for arg in "${lm_eval_args[@]}"; do
+        if [ "$skip_next" = 1 ]; then
+            skip_next=0
+            continue
+        fi
+        case "$arg" in
+            --output_path|--model_args) skip_next=1; continue ;;
+        esac
+        request_spec+=("$arg")
+    done
+    request_spec+=("extra_model_args=$EXTRA_LM_EVAL_MODEL_ARGS")
+    # A tokenizer setting makes requests depend on the model after all.
+    if [[ "$EXTRA_LM_EVAL_MODEL_ARGS" == *tokeniz* ]]; then
+        request_spec+=("model=$MODEL")
+    fi
+    # Best effort: if any input can't be read, the task runs uncached.
+    local request_key="" request_cache=""
+    request_key=$({
+        python3 -c 'import importlib.metadata as m; print(m.version("lm_eval"))'
+        printf '%s\n' "${request_spec[@]}"
+        (cd "$SCRIPT_DIR/lm_eval_tasks" && find . -type f -print0 | sort -z | xargs -0 sha256sum)
+    } | sha256sum | cut -c1-16) || request_key=""
+    if [ -n "$request_key" ]; then
+        request_cache="${LM_EVAL_REQUEST_CACHE_ROOT:-${HF_HOME:-$HOME/.cache/huggingface}/hub/lm_eval_requests}/$request_key"
+        if mkdir -p "$request_cache"; then
+            lm_eval_args+=(--cache_requests true)
+        else
+            request_cache=""
+        fi
+    fi
+
+    echo "Running lm_eval for task: $task (request cache: ${request_cache:-off})..."
     echo "[cmd] lm_eval ${lm_eval_args[*]}"
-    lm_eval "${lm_eval_args[@]}"
+    # lm-eval's progress bar redraws with carriage returns and ends its line
+    # only when the run does. Container runtimes log by line, so an eval with
+    # nothing else writing to the console shows no output at all until it
+    # finishes - Kimi-K2.6's took 22 silent minutes on kube and read as a hang.
+    # Turning each redraw into its own line makes every TQDM_MININTERVAL tick
+    # visible; stdbuf stops tr holding them in a block buffer. pipefail keeps
+    # lm_eval's exit status.
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 LM_HARNESS_CACHE_PATH="$request_cache" lm_eval "${lm_eval_args[@]}" 2>&1 | stdbuf -oL tr '\r' '\n'
 
     if [ -f "$baseline" ]; then
         echo "=== Checking Eval Regression for $task ==="
@@ -155,7 +265,7 @@ run_lm_eval() {
           --mode eval \
           --tolerance "$EVAL_TOLERANCE" \
           --results-dir "$RESULTS_DIR" \
-          --baseline "$baseline" 2>&1 | tee "$eval_log" || { echo "::error::Eval regression check failed for $task! See logs above for details."; fail=1; }
+          --baseline "$baseline" 2>&1 | tee "$eval_log" || eval_regression_failed "$task"
     else
         echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
     fi
@@ -168,7 +278,7 @@ run_lm_eval() {
 # MM_EVAL_LIMIT=10 means <=300 total samples, not 10.
 run_mm_eval() {
     local task="$1"
-    local baseline="scripts/vllm/benchmarking/baselines/eval/${CONFIG_NAME}.${task}.baseline.json"
+    local baseline="scripts/vllm/benchmarking/baselines/eval/${BASELINE_CONFIG}.${task}.baseline.json"
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
     local mm_workdir="${RESULTS_DIR}/${task}_evalscope"
     local mm_limit="${MM_EVAL_LIMIT:-4}"
@@ -176,7 +286,7 @@ run_mm_eval() {
 
     echo "Running evalscope for task: $task (limit=$mm_limit/subset, eval-batch-size=$mm_batch_size)..."
     rm -rf "$mm_workdir"
-    evalscope eval \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 evalscope eval \
         --model "$MODEL" \
         --eval-type openai_api \
         --api-url "http://$HOST:$PORT/v1/chat/completions" \
@@ -212,7 +322,7 @@ print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + '
           --mode eval \
           --tolerance "$EVAL_TOLERANCE" \
           --results-dir "$RESULTS_DIR" \
-          --baseline "$baseline" 2>&1 | tee "$eval_log" || { echo "::error::Eval regression check failed for $task! See logs above for details."; fail=1; }
+          --baseline "$baseline" 2>&1 | tee "$eval_log" || eval_regression_failed "$task"
     else
         echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
     fi
@@ -240,6 +350,10 @@ else
   BENCH_ARGS+=(--host "$HOST")
 fi
 BENCH_ARGS+=(--port "$PORT")
+# A dry run still writes the config.json the evals below read.
+if [ "$SKIP_BENCHMARK" = "1" ]; then
+  BENCH_ARGS+=(--dry-run)
+fi
 
 ./scripts/vllm/benchmarking/run_benchmarks.sh "${BENCH_ARGS[@]}"
 
@@ -257,7 +371,7 @@ fail=0
 # ========================================================
 # 3. Check Perf Regression
 # ========================================================
-if [ -f "$PERF_BASELINE" ]; then
+if [ "$SKIP_PERF_CHECK" = "0" ] && [ -f "$PERF_BASELINE" ]; then
     echo "=== Checking Perf Regression ==="
     python3 scripts/vllm/benchmarking/check_regression.py \
       --mode perf \
@@ -297,15 +411,38 @@ if [ "$RUN_MM_EVAL" = "1" ]; then
 fi
 
 # ========================================================
-# 7. Upload results to Spanner and BigQuery (dual write during migration)
+# 7. Upload results to BigQuery (and Spanner, if asked)
 # ========================================================
-echo "=== Uploading results to Spanner and BigQuery ==="
+echo "=== Uploading results ==="
 UPLOAD_ARGS=("--results-dir" "$RESULTS_DIR")
 if [ "${SKIP_DB_UPLOAD:-0}" = "1" ] || [ "${SKIP_DB_UPLOAD:-}" = "true" ] || [ "$SKIP_DB_UPLOAD_FLAG" = "1" ]; then
     UPLOAD_ARGS+=("--skip-db-upload")
 fi
+# Spanner is opt-in: its rows duplicate the BigQuery ones, keyed by the same
+# RecordId. SKIP_SPANNER_UPLOAD=0 writes it as well; the guard above still
+# skips both.
+if [ "${SKIP_SPANNER_UPLOAD:-1}" != "0" ] && [ "${SKIP_SPANNER_UPLOAD:-}" != "false" ]; then
+    UPLOAD_ARGS+=("--skip-spanner")
+fi
 
 
 python3 scripts/vllm/benchmarking/upload_results.py "${UPLOAD_ARGS[@]}" || echo "Warning: results upload failed"
+
+# Opt-in per step, and under the same guard as the database upload, so a PR's
+# numbers never reach the dashboard. SHAPE's topology is the slice's chips.
+if [ "${UPLOAD_TO_VLLM_CI:-0}" = "1" ] && [ "$SKIP_BENCHMARK" = "0" ] && [[ " ${UPLOAD_ARGS[*]} " != *" --skip-db-upload "* ]]; then
+    echo "=== Publishing to the ci.vllm.ai Performance tab ==="
+    topology="${SHAPE:-}"
+    topology="${topology#*/}"
+    if [[ ! "$topology" =~ ^[0-9]+(x[0-9]+)*$ ]] || [ -z "${TPU_ACCELERATOR_TYPE:-}" ] || [ -z "${WORKLOAD_IMAGE:-}" ]; then
+        echo "Warning: UPLOAD_TO_VLLM_CI needs SHAPE=<machine-type>/<topology>, TPU_ACCELERATOR_TYPE and WORKLOAD_IMAGE; not publishing"
+    else
+        python3 scripts/vllm/benchmarking/publish_perf_dashboard.py "$RESULTS_DIR" \
+            --device "$TPU_ACCELERATOR_TYPE" \
+            --chips "$(( ${topology//x/*} ))" \
+            --image "$WORKLOAD_IMAGE" ||
+            echo "Warning: ci.vllm.ai publish failed"
+    fi
+fi
 
 exit "$fail"

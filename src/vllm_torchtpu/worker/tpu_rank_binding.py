@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Rank -> TPU device binding for vLLM workers.
 
 ``LOCAL_RANK`` selects which physical chip a worker opens: torch_tpu copies it
@@ -34,8 +46,8 @@ ordering is visible rather than silent; if one ever appears, the fix belongs in
 the PCP group's rank order, not here.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 from vllm_torchtpu.logger import init_logger
 
@@ -101,7 +113,8 @@ def _get_spawned_pcp_local_rank(
     if not 0 <= local_rank < local_world:
         raise ValueError(
             f"LOCAL_RANK={local_rank_env} is out of range for PCP local "
-            f"world {local_world} with offset {local_rank_offset}.")
+            f"world {local_world} with offset {local_rank_offset}."
+        )
     return local_rank
 
 
@@ -141,16 +154,16 @@ def _slice_binding_from_env(
     if not present:
         return None
     if len(present) != len(_SLICE_BINDING_ENV_VARS):
-        missing = [
-            name for name in _SLICE_BINDING_ENV_VARS if not env.get(name)
-        ]
+        missing = [name for name in _SLICE_BINDING_ENV_VARS if not env.get(name)]
         raise ValueError(
             "Executor-assigned TPU slice binding is incomplete: missing "
-            f"{missing}. Set all of {list(_SLICE_BINDING_ENV_VARS)} or none.")
+            f"{missing}. Set all of {list(_SLICE_BINDING_ENV_VARS)} or none."
+        )
     if pcp_size > 1:
         raise NotImplementedError(
             "Prefill context parallelism is not supported together with "
-            "multihost data parallelism.")
+            "multihost data parallelism."
+        )
 
     world_size = parallel_config.world_size
     slice_rank = int(env[SLICE_RANK_ENV])
@@ -163,18 +176,23 @@ def _slice_binding_from_env(
         raise ValueError(
             f"{SLICE_WORLD_SIZE_ENV}={slice_world} does not match "
             f"world_size ({world_size}) x data_parallel_size ({dp_size}) "
-            f"= {expected_world}.")
+            f"= {expected_world}."
+        )
     if not 0 <= slice_rank < slice_world:
-        raise ValueError(f"{SLICE_RANK_ENV}={slice_rank} is out of range for "
-                         f"slice world size {slice_world}.")
+        raise ValueError(
+            f"{SLICE_RANK_ENV}={slice_rank} is out of range for "
+            f"slice world size {slice_world}."
+        )
     if not 0 < slice_local_world <= slice_world:
         raise ValueError(
             f"{SLICE_LOCAL_WORLD_SIZE_ENV}={slice_local_world} is out of "
-            f"range for slice world size {slice_world}.")
+            f"range for slice world size {slice_world}."
+        )
     if not 0 <= slice_local_rank < slice_local_world:
         raise ValueError(
             f"{SLICE_LOCAL_RANK_ENV}={slice_local_rank} is out of range for "
-            f"slice local world size {slice_local_world}.")
+            f"slice local world size {slice_local_world}."
+        )
 
     return TpuWorkerBinding(
         rank=slice_rank,
@@ -201,8 +219,9 @@ def get_tpu_worker_binding(
 ) -> TpuWorkerBinding:
     world_size = parallel_config.world_size
     pcp_size = parallel_config.prefill_context_parallel_size
-    dp_size = (_get_int_env(env, "TORCH_TPU_DP_SIZE", 0)
-               or parallel_config.data_parallel_size)
+    dp_size = (
+        _get_int_env(env, "TORCH_TPU_DP_SIZE", 0) or parallel_config.data_parallel_size
+    )
     local_rank_offset = _get_int_env(env, "TPU_LOCAL_RANK_OFFSET", 0)
 
     rank = int(rank)
@@ -211,7 +230,8 @@ def get_tpu_worker_binding(
         dp_rank = parallel_config.data_parallel_index
         assert dp_rank is not None, (
             "ParallelConfig.data_parallel_index must be resolved when "
-            "data_parallel_size > 1")
+            "data_parallel_size > 1"
+        )
 
         executor_binding = _slice_binding_from_env(
             env,
@@ -248,7 +268,7 @@ def get_tpu_worker_binding(
         native_local_rank = dp_rank_local * world_size + local_rank
         global_rank = dp_rank * world_size + rank
         global_world = world_size * dp_size
-        if pcp_size > 1 and use_spawned_pcp_local_rank:
+        if pcp_size > 1 and use_spawned_pcp_local_rank and bool(env.get("LOCAL_RANK")):
             tpu_local_rank = _get_spawned_pcp_local_rank(
                 env=env,
                 local_rank_offset=local_rank_offset,
@@ -272,7 +292,7 @@ def get_tpu_worker_binding(
 
     dp_rank = parallel_config.data_parallel_index or 0
     native_local_rank = dp_rank * world_size + local_rank
-    if pcp_size > 1 and use_spawned_pcp_local_rank:
+    if pcp_size > 1 and use_spawned_pcp_local_rank and bool(env.get("LOCAL_RANK")):
         tpu_local_rank = _get_spawned_pcp_local_rank(
             env=env,
             local_rank_offset=local_rank_offset,
@@ -283,12 +303,15 @@ def get_tpu_worker_binding(
         # dp offset because it is the physical chip ordinal, and two dense
         # DP replicas must not resolve to the same chip.
         tpu_local_rank = local_rank
-    # LOCAL_WORLD_SIZE must be the per-host chip count, not the global TP*PP
-    # world size: on a single host they're equal, but across --nnodes hosts
-    # each host only has world_size // nnodes chips, and PjRt bootstrap fails
-    # ("PjRtClient is not initialized") if told to expect more local devices
-    # than physically exist on this host.
-    local_chip_count = parallel_config.local_world_size
+    # Ray sets per-host LOCAL_WORLD_SIZE without setting LOCAL_RANK; multiproc
+    # parent/child reuse env after as_env() has already added local_rank_offset
+    # into LOCAL_WORLD_SIZE (alongside LOCAL_RANK), so only read it when
+    # LOCAL_RANK is absent.
+    local_chip_count = (
+        parallel_config.local_world_size
+        if env.get("LOCAL_RANK")
+        else _get_int_env(env, "LOCAL_WORLD_SIZE", parallel_config.local_world_size)
+    )
     return TpuWorkerBinding(
         rank=rank,
         local_rank=local_rank_offset + tpu_local_rank,

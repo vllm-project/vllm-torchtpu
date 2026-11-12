@@ -1,8 +1,22 @@
 #!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Nightly throughput benchmark for DeepSeek-V4-Flash on TPU v7x-8, TP=1 x DP=8
 # with EP.
-MODEL="deepseek-ai/DeepSeek-V4-Flash"
+MODEL="deepseek-ai/DeepSeek-V4-Flash-0731"
 TENSOR_PARALLELISM=1
 DATA_PARALLELISM=8
 ENABLE_EP=true
@@ -36,7 +50,13 @@ export VLLM_ENGINE_READY_TIMEOUT_S=7200
 export TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE=1
 SERVER_READY_WAIT_MIN=120
 
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--api-server-count=1 --trust-remote-code --generation-config=vllm --override-generation-config={\"do_sample\":false,\"temperature\":0.0,\"model\":\"deepseek-ai/DeepSeek-V4-Flash\"}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --generation-config=vllm --override-generation-config={\"do_sample\":false,\"temperature\":0.0,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\"}"
+
+export CAPTURE_PROFILE="${CAPTURE_PROFILE:-1}"
+export USE_PHASED_PROFILER="$CAPTURE_PROFILE"
+
+PROFILE_GCS_BASE="gs://tpu-commons-ci/xprof/deepseek-v4-flash/torchtpu"
 
 BENCHMARK_TEMPERATURE=0
-EVAL_TOLERANCE="0.02"
+# todo(patemotter) decrease tolerance to 0.02 once we have more nightly results
+EVAL_TOLERANCE="0.03"

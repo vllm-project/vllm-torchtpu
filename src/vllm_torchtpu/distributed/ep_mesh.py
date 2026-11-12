@@ -31,9 +31,19 @@ that silently addresses the wrong device.
 
 from typing import Any
 
-from vllm_torchtpu.distributed.pcp import (_collect_rank_to_device_id,
-                                           _get_current_global_rank,
-                                           _get_tpu_global_device_id)
+import torch
+from vllm.distributed import parallel_state
+
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.dcp import get_dcp_world_size
+from vllm_torchtpu.distributed.mesh_utils import (
+    _collect_rank_to_device_id,
+    _get_current_global_rank,
+    _get_tpu_global_device_id,
+    get_pipeline_stage,
+    get_stage_mesh,
+)
+from vllm_torchtpu.distributed.pcp import get_pcp_world_size
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -46,6 +56,64 @@ logger = init_logger(__name__)
 EP_AXIS_NAME = "d"
 
 _MESH_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
+_TOKEN_GROUP_CACHE: dict[tuple, tuple[tuple[int, ...], ...]] = {}
+_SORTED_GATHER_CACHE: dict[tuple, tuple[Any, tuple[int, ...]]] = {}
+
+
+def ep_token_replica_groups(
+    *, is_sequence_parallel: bool = False
+) -> tuple[tuple[int, ...], ...]:
+    """Native token replica groups expressed in the EP mesh's coordinates.
+
+    TP inputs are replicated unless MoE sequence parallelism partitions them.
+    Gather the actual group memberships rather than deriving them from rank
+    arithmetic: vLLM ranks and mesh positions may differ (see `_ep_mesh_order`).
+    Called during weight loading, never inside the compiled forward.
+    """
+    group = get_ep_group()
+    if group is None:
+        raise RuntimeError("Token replica groups require an initialized EP group")
+    rank = _get_current_global_rank()
+    ranks = tuple(int(r) for r in group.ranks)
+    replicas = (
+        (rank,)
+        if is_sequence_parallel
+        else tuple(int(r) for r in parallel_state.get_tp_group().ranks)
+    )
+    device_ids = ep_device_ids()
+    assert device_ids is not None
+    key = (ranks, device_ids, replicas)
+    cached = _TOKEN_GROUP_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    gathered: list[Any] = [None] * len(ranks)
+    torch.distributed.all_gather_object(
+        gathered, (rank, replicas), group=group.cpu_group
+    )
+    if any(item is None for item in gathered):
+        raise RuntimeError("EP token replica gather returned an empty entry")
+    reported = {int(r): tuple(int(p) for p in members) for r, members in gathered}
+    if set(reported) != set(ranks):
+        raise RuntimeError("EP token replica gather does not cover the EP ranks")
+    for r, members in reported.items():
+        if (
+            r not in members
+            or len(set(members)) != len(members)
+            or any(reported.get(peer) != members for peer in members)
+        ):
+            raise RuntimeError(f"Inconsistent token replica group: {r}: {members}")
+    if len({len(members) for members in reported.values()}) != 1:
+        raise RuntimeError("EP token replica groups must have equal sizes")
+    mesh_index = {ranks[e]: i for i, e in enumerate(_ep_mesh_order(device_ids))}
+    groups = tuple(
+        sorted(
+            {tuple(mesh_index[r] for r in members) for members in reported.values()},
+            key=min,
+        )
+    )
+    _TOKEN_GROUP_CACHE[key] = groups
+    return groups
 
 
 def get_ep_group() -> Any | None:
@@ -72,101 +140,195 @@ def ep_device_ids() -> tuple[int, ...] | None:
     if group is None:
         return None
     ranks = tuple(int(r) for r in group.ranks)
-    rank_to_device_id = _collect_rank_to_device_id(group,
-                                                   _get_current_global_rank(),
-                                                   _get_tpu_global_device_id())
+    rank_to_device_id = _collect_rank_to_device_id(
+        group, _get_current_global_rank(), _get_tpu_global_device_id()
+    )
     missing = [r for r in ranks if r not in rank_to_device_id]
     if missing:
         raise RuntimeError(
             "Could not map all EP ranks to TPU global device ids: "
-            f"missing={missing}, ranks={ranks}, gathered={rank_to_device_id}")
+            f"missing={missing}, ranks={ranks}, gathered={rank_to_device_id}"
+        )
     return tuple(rank_to_device_id[r] for r in ranks)
 
 
+def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
+    """EP rank at each index of the mesh `build_ep_mesh` builds.
+
+    `device_ids` is `ep_device_ids()`, in EP-rank order. This is the one place
+    the mesh order is decided: `build_ep_mesh`, `ep_rank_order`,
+    `ep_mesh_index` and `ep_token_replica_groups` all take it from here.
+
+    Since google-pytorch/torch_tpu#3522 the mesh's device order is the kernel's
+    DeviceAssignment, so any order addresses the right peers. Ascending device
+    id is preferred because XLA's SparseCore-offloaded all-gathers inside the
+    fused MoE are much slower over the rank-ordered one: on a tpu7x 2x2x2
+    DSv4-Pro run the fp8 activation all-gather (identical HLO and bytes) went
+    from 178 to 321 us and end-to-end throughput dropped 4.5%.
+
+    With PCP or DCP on, the mesh stays in rank order. torch_tpu requires every
+    Pallas kernel in one compiled module to share a single DeviceAssignment,
+    and both CP meshes are rank-ordered: the PCP mesh
+    (`pcp.get_or_create_pcp_mesh`) because the PCP kernels index token shards
+    and state by PCP rank, the DCP mesh (`dcp.get_or_create_dcp_mesh`, used by
+    the MLA attention op) because it is built by walking the group's ranks. An
+    EP mesh in device-id order beside either fails to compile with "Disjoint or
+    conflicting device assignments" -- for DCP whenever a DCP group is not a
+    contiguous tile of the sorted EP mesh, e.g. TP4/DCP4 on tpu7x, whose DCP
+    groups are devices [0, 1, 4, 5] and [6, 7, 2, 3].
+
+    With MOE_FUSED_EP_SORTED_GATHER the mesh stays in rank order too, and the
+    activation all-gather gets the device-id order on its own instead; see
+    `ep_sorted_gather_group`.
+    """
+    if len(set(device_ids)) != len(device_ids):
+        raise RuntimeError(
+            f"Two EP ranks report the same TPU global device id: {device_ids}"
+        )
+    ep_ranks = range(len(device_ids))
+    if (
+        get_pcp_world_size() > 1
+        or get_dcp_world_size() > 1
+        or envs.MOE_FUSED_EP_SORTED_GATHER
+    ):
+        return tuple(ep_ranks)
+    return tuple(sorted(ep_ranks, key=device_ids.__getitem__))
+
+
 def ep_rank_order() -> tuple[int, ...] | None:
-    """EP rank at each mesh index, for a mesh in ascending device-id order.
+    """EP rank at each mesh index, or None when EP is off.
 
-    A Mosaic kernel that addresses a peer with `DeviceIdType.MESH` resolves the
-    mesh coordinate positionally against the device list, not through the
-    device array the mesh was built with: an eight-process run whose mesh is in
-    EP-rank order (device ids `[0, 1, 4, 5, 6, 7, 2, 3]` on a tpu7x-8) sends
-    every routed row to the wrong peer and deadlocks on the first call, and so
-    does any other permuted order. Ascending device-id order is the one that
-    works, and it is also what a single-process mesh gets from `jax.devices()`,
-    which is why the kernel's own device tests never saw this.
+    With the mesh in ascending device-id order (PCP and DCP off; see
+    `_ep_mesh_order`)
+    mesh index i is not EP rank i on a host whose PCI enumeration differs from
+    its device ids -- every tpu7x host, where local ranks 0..7 land on devices
+    `[0, 1, 4, 5, 6, 7, 2, 3]` -- so the shard at mesh index i owns the experts
+    of EP rank `ep_rank_order()[i]`. The caller has to say so -- see
+    `fused_moe_ep._mesh_expert_order` -- because the kernel reads a token's
+    expert id as `mesh_index * experts_per_shard + j`. With PCP or DCP on it is
+    the identity.
+    """
+    device_ids = ep_device_ids()
+    if device_ids is None:
+        return None
+    return _ep_mesh_order(device_ids)
 
-    Ordering by device id means mesh index i is no longer EP rank i, so the
-    shard sitting at mesh index i owns the experts of EP rank
-    `ep_rank_order()[i]` rather than of rank i. The caller has to say so -- see
-    `fused_moe_ep._mesh_expert_order` -- because the kernel reads a
-    token's expert id as `mesh_index * experts_per_shard + j`.
 
-    Returns None when EP is off.
+def ep_mesh_index() -> int | None:
+    """This rank's index into the mesh `build_ep_mesh` builds, or None."""
+    group = get_ep_group()
+    device_ids = ep_device_ids()
+    if group is None or device_ids is None:
+        return None
+    ranks = tuple(int(r) for r in group.ranks)
+    return _ep_mesh_order(device_ids).index(ranks.index(_get_current_global_rank()))
+
+
+def ep_sorted_gather_group() -> tuple[Any, tuple[int, ...]] | None:
+    """A process group over the EP ranks in ascending device-id order.
+
+    Returns (group, positions), where positions[i] is the group rank of EP
+    rank i, or None when EP is off. An all-gather over this group is the
+    SparseCore gather the device-id ordered EP mesh got its N-dimensional
+    algorithm from, while the Pallas kernels around it keep a rank-ordered
+    DeviceAssignment: torch_tpu lets a torch collective's group order differ
+    from the kernels' and rewrites its replica groups into the module's
+    partitions, but requires every JAX op in a module to share one order.
+    The gather's blocks come out in group order, which
+    `fused_ep_moe_v2(gather_positions=...)` reads.
+
+    `torch.distributed.new_group` is collective over the whole world, so this
+    must be called by every rank in the same order, at weight load.
     """
     group = get_ep_group()
     device_ids = ep_device_ids()
     if group is None or device_ids is None:
         return None
     ranks = tuple(int(r) for r in group.ranks)
-    by_device = dict(zip(device_ids, ranks))
-    if len(by_device) != len(ranks):
-        raise RuntimeError(
-            "Two EP ranks report the same TPU global device id: "
-            f"ranks={ranks}, device_ids={device_ids}")
-    ep_rank_of_group_rank = {r: i for i, r in enumerate(ranks)}
-    return tuple(ep_rank_of_group_rank[by_device[d]]
-                 for d in sorted(device_ids))
-
-
-def ep_mesh_index() -> int | None:
-    """This rank's index into the mesh `build_ep_mesh` builds, or None."""
-    device_ids = ep_device_ids()
-    if device_ids is None:
-        return None
-    return sorted(device_ids).index(_get_tpu_global_device_id())
+    key = (ranks, device_ids)
+    cached = _SORTED_GATHER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    order = tuple(sorted(range(len(ranks)), key=device_ids.__getitem__))
+    # sort_ranks=False, or new_group sorts the list back into global-rank
+    # order and the gather comes out in rank order again.
+    pg = torch.distributed.new_group([ranks[e] for e in order], sort_ranks=False)
+    positions = tuple(order.index(e) for e in range(len(ranks)))
+    logger.info(
+        "Built EP sorted-gather group | device_ids=%s | ep_rank_order=%s",
+        [device_ids[e] for e in order],
+        order,
+    )
+    _SORTED_GATHER_CACHE[key] = (pg, positions)
+    return pg, positions
 
 
 def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     """A one-axis JAX mesh over the EP group, or None when EP is off.
 
-    Devices go in ascending id order rather than EP-rank order, which is what
-    the kernels' peer addressing requires; `ep_rank_order` has the detail and
-    the consequence for the caller.
+    The devices are Torchtpu's ``get_pallas_mesh`` ones, put in the order
+    `_ep_mesh_order` picks: ascending device id, or rank order when PCP or DCP
+    is on.
+    `ep_rank_order` has the permutation this introduces and the consequence
+    for the caller.
 
-    Cached per (axis, device ids): the ids come from a collective, so this must
-    not be called for the first time inside a traced region.
+    Cached per (axis, device ids in mesh order): the ids come from a
+    collective, so this must not be called for the first time inside a traced
+    region.
     """
     unordered = ep_device_ids()
     if unordered is None:
         return None
-    device_ids = tuple(sorted(unordered))
+    order = _ep_mesh_order(unordered)
+    device_ids = tuple(unordered[e] for e in order)
 
     cache_key = (axis_name, device_ids)
     cached = _MESH_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    import jax
+    # No jax.devices() lookup: get_pallas_mesh builds abstract devices from the
+    # process group, so this worker no longer needs JAX to expose every peer.
+    import torch.distributed as dist
+
+    world_size = int(dist.get_world_size())
+    _, stages = get_pipeline_stage()
+    if len(device_ids) * stages != world_size:
+        raise NotImplementedError(
+            f"The EP group spans {len(device_ids)} devices inside a "
+            f"torch.distributed world of {world_size}. get_pallas_mesh builds "
+            "a mesh over the whole world, so EP alongside another parallelism "
+            "axis needs a mesh_shape factorisation that has not been worked "
+            "out."
+        )
+
     import numpy as np
     from jax.sharding import Mesh
+    from torch_tpu._internal.pallas import get_pallas_mesh
 
-    visible = {
-        int(getattr(device, "id", idx)): device
-        for idx, device in enumerate(jax.devices())
-    }
-    missing = [d for d in device_ids if d not in visible]
-    if missing:
+    if stages > 1:
+        # The EP group is one pipeline stage.
+        ranked = get_stage_mesh(
+            (axis_name,), (len(device_ids),), get_ep_group(), unordered
+        )
+    else:
+        ranked = get_pallas_mesh(axis_names=(axis_name,))
+    by_id = {int(d.id): d for d in ranked.devices.flat}
+    if sorted(by_id) != sorted(device_ids):
+        # The ids become the DeviceAssignment, and ep_rank_order/ep_mesh_index
+        # index into them assuming they are the ids gathered above.
         raise RuntimeError(
-            "Cannot build the EP mesh: JAX does not expose every EP device in "
-            f"this worker. missing={missing}, ep_device_ids={device_ids}, "
-            f"jax_visible_ids={sorted(visible)}. A multi-device op needs the "
-            "whole slice visible in each process; check the chip binding "
-            "(TPU_VISIBLE_CHIPS/TPU_VISIBLE_DEVICES) the worker was started "
-            "with.")
-
-    mesh = Mesh(np.asarray([visible[d] for d in device_ids]),
-                axis_names=(axis_name, ))
-    logger.info("Built EP mesh | axis=%s | size=%d | device_ids=%s", axis_name,
-                len(device_ids), list(device_ids))
+            "get_pallas_mesh device ids do not match the EP group's: "
+            f"pallas={[int(d.id) for d in ranked.devices.flat]}, "
+            f"ep_device_ids={unordered}"
+        )
+    mesh = Mesh(np.asarray([by_id[d] for d in device_ids]), axis_names=(axis_name,))
+    logger.info(
+        "Built EP mesh | axis=%s | size=%d | device_ids=%s | ep_rank_order=%s",
+        axis_name,
+        len(device_ids),
+        list(device_ids),
+        order,
+    )
     _MESH_CACHE[cache_key] = mesh
     return mesh

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import importlib.util
 import json
@@ -6,8 +18,12 @@ from pathlib import Path
 
 
 def _load_toy_proxy_server():
-    path = (Path(__file__).resolve().parents[2] / "examples" / "disagg" /
-            "toy_proxy_server.py")
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "examples"
+        / "disagg"
+        / "toy_proxy_server.py"
+    )
     spec = importlib.util.spec_from_file_location("toy_proxy_server", path)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
@@ -19,7 +35,8 @@ def _load_toy_proxy_server():
 _toy_proxy_server = _load_toy_proxy_server()
 _AsciiSafeStreamEncoder = _toy_proxy_server._AsciiSafeStreamEncoder
 _replace_prompt_with_rendered_token_ids = (
-    _toy_proxy_server._replace_prompt_with_rendered_token_ids)
+    _toy_proxy_server._replace_prompt_with_rendered_token_ids
+)
 
 
 def test_ascii_safe_stream_encoder_handles_split_utf8() -> None:
@@ -83,9 +100,7 @@ def test_replace_prompt_with_rendered_token_ids_rejects_bad_response() -> None:
     }
 
     try:
-        _replace_prompt_with_rendered_token_ids(request, [{
-            "token_ids": ["1"]
-        }])
+        _replace_prompt_with_rendered_token_ids(request, [{"token_ids": ["1"]}])
     except ValueError as exc:
         assert "token_ids" in str(exc)
     else:

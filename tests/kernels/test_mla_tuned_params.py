@@ -5,6 +5,12 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from dataclasses import replace
 from unittest.mock import MagicMock
@@ -12,8 +18,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from vllm_torchtpu.kernels.mla.v2 import tuned_params
-from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
-                                                       get_tuned_params)
+from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
 
 
 def _k3_mixed_key() -> TuningKey:
@@ -83,7 +88,8 @@ def test_k3_tp32_fp8_8k_page256_mixed_tuned_params() -> None:
 
 
 def test_k3_mixed_tuned_params_require_matching_geometry(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(tuned_params, "logger", MagicMock())
     mismatched_key = replace(_k3_mixed_key(), page_size_per_kv_packing=64)
 

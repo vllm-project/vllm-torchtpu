@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import time
 
@@ -50,15 +61,17 @@ def main(args: dict):
 
     prompt = "What is 1+1? \n"
     lora_request = LoRARequest(
-        "lora_adapter_3", 3,
-        "Username6568/Qwen2.5-3B-Instruct-1_plus_1_equals_3_adapter")
+        "lora_adapter_3",
+        3,
+        "Username6568/Qwen2.5-3B-Instruct-1_plus_1_equals_3_adapter",
+    )
 
     if llm.llm_engine.vllm_config.profiler_config.torch_profiler_dir is not None:
         llm.start_profile()
     start = time.perf_counter()
-    outputs = llm.generate(prompt,
-                           sampling_params=sampling_params,
-                           lora_request=lora_request)
+    outputs = llm.generate(
+        prompt, sampling_params=sampling_params, lora_request=lora_request
+    )
     if llm.llm_engine.vllm_config.profiler_config.torch_profiler_dir is not None:
         llm.stop_profile()
 
@@ -70,7 +83,7 @@ def main(args: dict):
         print(f"Prompt: {prompt!r}\nGenerated text: {generated_text!r}")
         print("-" * 50)
     end = time.perf_counter()
-    print(f'total time: {end - start} [secs].')
+    print(f"total time: {end - start} [secs].")
 
 
 if __name__ == "__main__":

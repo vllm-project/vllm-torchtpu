@@ -15,18 +15,36 @@
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+
 
 def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
     """Block fp8 quantization with UE8M0 (power-of-two) block scales."""
     fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
     *lead, dim = x.shape
     blocked = x.reshape(*lead, dim // block_size, block_size)
-    amax = jnp.clip(jnp.max(jnp.abs(blocked), axis=-1, keepdims=True), 1e-4,
-                    None)
+    amax = jnp.clip(jnp.max(jnp.abs(blocked), axis=-1, keepdims=True), 1e-4, None)
     scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
     q = (blocked * (1.0 / scale)).astype(jnp.float8_e4m3fn).reshape(x.shape)
     scale = jnp.squeeze(scale, -1).astype(jnp.float8_e8m0fnu)
     return q, scale
+
+
+def quantize_fp8_lane_periodic(x: jax.Array, period: int, nope_dim: int):
+    """Block fp8 quantization with one UE8M0 scale per lane of `period`.
+
+    Group j is ``{d < nope_dim : d % period == j}``; see
+    ``compute.quantize_fp8_lane_periodic``.
+    """
+    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    dim = x.shape[-1]
+    kept = jnp.where(jnp.arange(dim) < nope_dim, jnp.abs(x), 0.0)
+    amax = jnp.clip(
+        jnp.max(kept.reshape(*x.shape[:-1], dim // period, period), axis=-2), 1e-4, None
+    )
+    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
+    q = (x / jnp.tile(scale, dim // period)).astype(jnp.float8_e4m3fn)
+    return q, scale.astype(jnp.float8_e8m0fnu)
 
 
 def interleaved_rope(
@@ -39,8 +57,10 @@ def interleaved_rope(
     if head_dim % 2 != 0:
         raise ValueError(f"head_dim must be even; got {head_dim}")
     if rope_head_dim % 2 != 0 or rope_head_dim > head_dim:
-        raise ValueError("rope_head_dim must be even and <= head_dim; got "
-                         f"rope_head_dim={rope_head_dim}, head_dim={head_dim}")
+        raise ValueError(
+            "rope_head_dim must be even and <= head_dim; got "
+            f"rope_head_dim={rope_head_dim}, head_dim={head_dim}"
+        )
 
     half_rope = rope_head_dim // 2  # 32
     num_pairs = head_dim // 2  # 256
@@ -54,10 +74,12 @@ def interleaved_rope(
     sin = cos_sin[..., half_rope:rope_head_dim]  # [tokens, 32]
 
     pad_shape = (*cos.shape[:-1], nope_pairs)
-    cos_full = jnp.concatenate([jnp.ones(pad_shape, x.dtype), cos],
-                               axis=-1)  # [tokens, 256]
-    sin_full = jnp.concatenate([jnp.zeros(pad_shape, x.dtype), sin],
-                               axis=-1)  # [tokens, 256]
+    cos_full = jnp.concatenate(
+        [jnp.ones(pad_shape, x.dtype), cos], axis=-1
+    )  # [tokens, 256]
+    sin_full = jnp.concatenate(
+        [jnp.zeros(pad_shape, x.dtype), sin], axis=-1
+    )  # [tokens, 256]
 
     new_even = even * cos_full - odd * sin_full  # [tokens, 256]
     new_odd = odd * cos_full + even * sin_full  # [tokens, 256]
@@ -89,8 +111,7 @@ def gather_state_windows(
 
     safe_pos = jnp.maximum(pos, 0)
     req = token_to_req_indices[:, None]
-    block_numbers = block_table[req * block_table_stride +
-                                safe_pos // block_size]
+    block_numbers = block_table[req * block_table_stride + safe_pos // block_size]
     block_offsets = safe_pos % block_size
 
     head_offset = (w_idx >= compress_ratio).astype(jnp.int32) * head_dim
@@ -120,16 +141,18 @@ def compress_norm_rope(
     masked_score = jnp.where(valid_mask[..., None], score_window, neg_inf)
     weights = jax.nn.softmax(masked_score, axis=1)
 
-    compressed_kv = jnp.sum(weights * kv_window,
-                            axis=1)  # [num_tokens, head_dim]
+    compressed_kv = jnp.sum(weights * kv_window, axis=1)  # [num_tokens, head_dim]
 
     # variance: [N, 1]
     variance = jnp.mean(jnp.square(compressed_kv), axis=-1, keepdims=True)
 
     # rms_weight: [1, D]
     # normed: [N, D]
-    normed = (compressed_kv * jax.lax.rsqrt(variance + rms_eps) *
-              rms_weight[None, :].astype(compressed_kv.dtype))
+    normed = (
+        compressed_kv
+        * jax.lax.rsqrt(variance + rms_eps)
+        * rms_weight[None, :].astype(compressed_kv.dtype)
+    )
 
     # cos_sin: [N, R]
     cos_sin = cos_sin_cache[compressed_pos]
@@ -153,7 +176,7 @@ def _boundary_dest(
 
 def ref_compress_norm_rope_store(
     cache: jax.Array,  # [num_pages, page_size, slots_per_part_hbm, 128] uint8
-    rope_cache: jax.Array,  # [num_pages, rope_page_size, 4, 128] uint8
+    rope_cache: jax.Array,  # [num_pages, page_size // 4, 4, 128] uint8
     positions: jax.Array,  # [num_tokens] int
     slot_mapping: jax.Array,  # [num_tokens] int (state-cache slots)
     block_table: jax.Array,  # [num_reqs * stride] int (state pages)
@@ -177,8 +200,15 @@ def ref_compress_norm_rope_store(
     """Golden JAX reference for Kernel 2 (compress + store).
 
     ``state_cache`` is the array holding the f32 states; ``None`` means it
-    shares ``cache``'s buffer (CSA / indexer).
+    shares ``cache``'s buffer (CSA / indexer). CSA's arrays may also be the
+    int32 ``[num_pages, rows, 128]`` declarations of `csa_cache_layout`; the
+    outputs keep each input's dtype.
     """
+    cache_is_words = csa_cache_layout.is_word_array(cache.dtype)
+    if cache_is_words:
+        cache = csa_cache_layout.words_to_slabs(cache)
+    if state_cache is not None and csa_cache_layout.is_word_array(state_cache.dtype):
+        state_cache = csa_cache_layout.words_to_slabs(state_cache)
     coff = 1 + int(overlap)
     state_width = coff * head_dim
     state_dim = 2 * state_width
@@ -187,25 +217,18 @@ def ref_compress_norm_rope_store(
         has_rope_cache = is_quantized and has_rope
 
     # Internally reshape packed layouts to unpacked shapes for easy processing
-    is_indexer_mode = (cache.shape[-1] == 256
-                       and cache.shape[-2] == 4) or (cache.shape[-1] == 128
-                                                     and cache.shape[-2] == 8)
+    is_indexer_mode = (cache.shape[-1] == 256 and cache.shape[-2] == 4) or (
+        cache.shape[-1] == 128 and cache.shape[-2] == 8
+    )
     if is_indexer_mode:
         pack_factor = cache.shape[-2]
         last_dim = cache.shape[-1]
         unpacked_page_size = cache.shape[1] * pack_factor
-        cache_for_unpack = cache.reshape(cache.shape[0], unpacked_page_size, 1,
-                                         last_dim)
+        cache_for_unpack = cache.reshape(
+            cache.shape[0], unpacked_page_size, 1, last_dim
+        )
     else:
         cache_for_unpack = cache
-
-    rope_page_size = rope_cache.shape[
-        1] * 4 if has_rope_cache else rope_cache.shape[1]
-    if has_rope_cache:
-        rope_cache_for_unpack = rope_cache.reshape(rope_cache.shape[0],
-                                                   rope_page_size, 1, 128)
-    else:
-        rope_cache_for_unpack = rope_cache
 
     # 1. Geometry setup
     if is_indexer_mode:
@@ -220,10 +243,9 @@ def ref_compress_norm_rope_store(
 
     state_source = cache if state_cache is None else state_cache
 
-    rope_num_pages, rope_page_size_unpacked, rope_d1, rope_d2 = rope_cache_for_unpack.shape
-    assert rope_num_pages == num_pages
-    assert rope_page_size_unpacked == rope_page_size
-    assert rope_d1 == 1 and rope_d2 == 128
+    if has_rope_cache:
+        assert rope_cache.shape[0] == num_pages
+        assert rope_cache.shape[-1] == 128
 
     # 2. Unpack state cache inline.
     # The state is read from the *physical* cache, whatever the trailing dims are:
@@ -241,14 +263,14 @@ def ref_compress_norm_rope_store(
     tokens_per_page = phys_page_size // state_rows
     assert state_block_size <= tokens_per_page, (
         f"state_block_size {state_block_size} exceeds the {tokens_per_page} "
-        f"token states a {phys_page_size}-row page holds")
-    state_bytes_t = state_source.reshape(phys_pages, tokens_per_page,
-                                         state_rows, hbm_pack,
-                                         last_dim).transpose(0, 1, 2, 4, 3)
-    state_view = jax.lax.bitcast_convert_type(state_bytes_t,
-                                              jnp.float32).reshape(
-                                                  phys_pages, tokens_per_page,
-                                                  state_dim)
+        f"token states a {phys_page_size}-row page holds"
+    )
+    state_bytes_t = state_source.reshape(
+        phys_pages, tokens_per_page, state_rows, hbm_pack, last_dim
+    ).transpose(0, 1, 2, 4, 3)
+    state_view = jax.lax.bitcast_convert_type(state_bytes_t, jnp.float32).reshape(
+        phys_pages, tokens_per_page, state_dim
+    )
 
     # 3. Gather state windows
     kv_window, score_window, valid_mask = gather_state_windows(
@@ -281,7 +303,12 @@ def ref_compress_norm_rope_store(
     nope_store_dim = head_dim - rope_head_dim if has_rope_cache else head_dim
     if is_quantized:
         # Quantized (CSA / Indexer)
-        q_full, scale_full = quantize_fp8_ue8m0(compressed, quant_block)
+        if is_indexer_mode:
+            q_full, scale_full = quantize_fp8_ue8m0(compressed, quant_block)
+        else:
+            q_full, scale_full = quantize_fp8_lane_periodic(
+                compressed, quant_block, nope_store_dim
+            )
         q_bytes = jax.lax.bitcast_convert_type(q_full, jnp.uint8)
         scale_bytes = jax.lax.bitcast_convert_type(scale_full, jnp.uint8)
 
@@ -289,8 +316,11 @@ def ref_compress_norm_rope_store(
         scale_bytes_flat = scale_bytes.reshape(scale_bytes.shape[0], -1)
 
         q_nope = q_bytes_flat[..., :nope_store_dim]
-        nope_blocks = (nope_store_dim + quant_block - 1) // quant_block
-        scale_nope = scale_bytes_flat[..., :nope_blocks]
+        if is_indexer_mode:
+            nope_blocks = (nope_store_dim + quant_block - 1) // quant_block
+            scale_nope = scale_bytes_flat[..., :nope_blocks]
+        else:
+            scale_nope = scale_bytes_flat
 
         nope_record = jnp.concatenate([q_nope, scale_nope], axis=-1)
     else:
@@ -298,11 +328,14 @@ def ref_compress_norm_rope_store(
         compressed_bf16 = compressed.astype(jnp.bfloat16)
         slots_per_part = head_dim // 128
         compressed_bf16_tiled = compressed_bf16.reshape(
-            compressed_bf16.shape[0], slots_per_part, 128)
+            compressed_bf16.shape[0], slots_per_part, 128
+        )
         compressed_bytes = jax.lax.bitcast_convert_type(
-            compressed_bf16_tiled, jnp.uint8)
+            compressed_bf16_tiled, jnp.uint8
+        )
         compressed_bytes_split = compressed_bytes.reshape(
-            compressed_bytes.shape[0], slots_per_part, 128, 2)
+            compressed_bytes.shape[0], slots_per_part, 128, 2
+        )
         compressed_bytes_t = compressed_bytes_split.transpose(0, 1, 3, 2)
         nope_record = compressed_bytes_t.reshape(compressed_bytes.shape[0], -1)
 
@@ -323,12 +356,14 @@ def ref_compress_norm_rope_store(
     if nope_pad < 0:
         raise ValueError(
             f"packed NOPE record {nope_record.shape[-1]}B exceeds cache width"
-            f" {nope_width}B")
+            f" {nope_width}B"
+        )
     nope_record = jnp.pad(nope_record, ((0, 0), (0, nope_pad)))
 
     # Split nope_record for multi-slot write if slots_per_part_out > 1
-    nope_record_split = nope_record.reshape(nope_record.shape[0],
-                                            slots_per_part_out, slot_bytes)
+    nope_record_split = nope_record.reshape(
+        nope_record.shape[0], slots_per_part_out, slot_bytes
+    )
 
     # 6. Scatter NOPE into cache
     logical_slots_factor = 1
@@ -337,12 +372,14 @@ def ref_compress_norm_rope_store(
     nope_num_slots_logical = num_pages * page_size_logical
     nope_num_slots_physical = num_pages * page_size_physical
 
-    dest_logical = _boundary_dest(positions, slot_mapping, kv_slot_mapping,
-                                  compress_ratio, nope_num_slots_logical)
+    dest_logical = _boundary_dest(
+        positions, slot_mapping, kv_slot_mapping, compress_ratio, nope_num_slots_logical
+    )
     dest_nope_physical = dest_logical // logical_slots_factor
 
-    flat_nope = cache_for_unpack.reshape(nope_num_slots_physical,
-                                         slot_size_bytes := slot_bytes)
+    flat_nope = cache_for_unpack.reshape(
+        nope_num_slots_physical, slot_size_bytes := slot_bytes
+    )
     flat_nope_padded = jnp.concatenate(
         [
             flat_nope,
@@ -357,50 +394,38 @@ def ref_compress_norm_rope_store(
             dest_nope_physical + o,
             nope_num_slots_physical + o,
         )
-        flat_nope_padded = flat_nope_padded.at[dest_o].set(
-            nope_record_split[:, o])
+        flat_nope_padded = flat_nope_padded.at[dest_o].set(nope_record_split[:, o])
 
     new_cache_unpacked = flat_nope_padded[:-slots_per_part_out].reshape(
-        cache_for_unpack.shape)
+        cache_for_unpack.shape
+    )
     new_cache = new_cache_unpacked.reshape(cache.shape)
+    if cache_is_words:
+        new_cache = csa_cache_layout.slabs_to_words(new_cache)
 
-    # 7. Scatter ROPE into rope_cache (only if has_rope_cache)
-    if has_rope_cache:
-        rope = compressed[..., nope_dim:]
-        rope_bf16 = rope.astype(jnp.bfloat16)
-        rope_hi = ((jax.lax.bitcast_convert_type(rope_bf16, jnp.uint16) >> 8)
-                   & 0xFF).astype(jnp.uint8)
-        rope_lo = (jax.lax.bitcast_convert_type(rope_bf16, jnp.uint16)
-                   & 0xFF).astype(jnp.uint8)
-        rope_bytes_flat = jnp.concatenate([rope_hi, rope_lo], axis=-1)
-
-        rope_width_padded = 128
-        rope_pad = rope_width_padded - rope_bytes_flat.shape[-1]
-        if rope_pad < 0:
-            raise ValueError(
-                f"packed ROPE record {rope_bytes_flat.shape[-1]}B exceeds cache width"
-                f" {rope_width_padded}B")
-        rope_record = jnp.pad(rope_bytes_flat, ((0, 0), (0, rope_pad)))
-
-        rope_logical_slots_factor = 1
-        rope_num_slots = rope_num_pages * rope_page_size
-
-        dest_logical_rope = _boundary_dest(positions, slot_mapping,
-                                           kv_slot_mapping, compress_ratio,
-                                           rope_num_slots)
-
-        flat_rope = rope_cache_for_unpack.reshape(rope_num_slots, rope_d1, 128)
-        flat_rope_padded = jnp.concatenate(
-            [flat_rope,
-             jnp.zeros((1, rope_d1, 128), dtype=jnp.uint8)], axis=0)
-        rope_record_dup = jnp.broadcast_to(
-            rope_record[:, None, :], (rope_record.shape[0], rope_d1, 128))
-        flat_rope_padded = flat_rope_padded.at[
-            dest_logical_rope *
-            rope_logical_slots_factor, :, :].set(rope_record_dup)
-        new_rope_cache_unpacked = flat_rope_padded[:-1].reshape(
-            rope_cache_for_unpack.shape)
-        new_rope_cache = new_rope_cache_unpacked.reshape(rope_cache.shape)
-        return new_cache, new_rope_cache
-    else:
+    # 7. Scatter ROPE into rope_cache (only if has_rope_cache): each token's 32
+    # words into its quarter of a 4-token row (see `csa_cache_layout`).
+    if not has_rope_cache:
         return new_cache, rope_cache
+    rope_is_words = csa_cache_layout.is_word_array(rope_cache.dtype)
+    rope_rows = (
+        rope_cache if rope_is_words else csa_cache_layout.slabs_to_words(rope_cache)
+    )
+    rope = compressed[..., nope_dim:].astype(jnp.bfloat16)
+    if rope.shape[-1] != csa_cache_layout.ROPE_DIM:
+        raise ValueError(
+            f"CSA RoPE is {csa_cache_layout.ROPE_DIM} bf16 per token, got "
+            f"{rope.shape[-1]}"
+        )
+    words = csa_cache_layout.rope_words(rope)
+    flat_rope = rope_rows.reshape(-1, csa_cache_layout.ROPE_WORDS)
+    rope_num_slots = flat_rope.shape[0]
+    dest_rope = _boundary_dest(
+        positions, slot_mapping, kv_slot_mapping, compress_ratio, rope_num_slots
+    )
+    flat_rope = jnp.concatenate([flat_rope, jnp.zeros_like(flat_rope[:1])], axis=0)
+    flat_rope = flat_rope.at[dest_rope].set(words)
+    new_rope_rows = flat_rope[:-1].reshape(rope_rows.shape)
+    if rope_is_words:
+        return new_cache, new_rope_rows
+    return new_cache, csa_cache_layout.words_to_slabs(new_rope_rows)
