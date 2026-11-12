@@ -97,6 +97,12 @@ def test_prefill_tiles_apply_above_decode_max(monkeypatch, gate_up):
     assert _tiles(2048, gate_up) == G._calculate_tiling(*_args(2048, gate_up))
 
 
+def test_prefill_tiles_max_size_m(monkeypatch):
+    monkeypatch.setenv(G._PREFILL_TILES_ENV, "256:128/256@12288")
+    assert _tiles(12288, True).bucket_sizes == (128, 256)
+    assert _tiles(16384, True) == G._calculate_tiling(*_args(16384, True))
+
+
 def test_prefill_tiles_bad_spec(monkeypatch):
     monkeypatch.setenv(G._PREFILL_TILES_ENV, "256:128")
     with pytest.raises(ValueError):

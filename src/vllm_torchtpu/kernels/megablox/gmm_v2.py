@@ -1204,7 +1204,8 @@ def gmm_vmem_estimate(
 #     FP8_DECODE_MAX_M rows (prefill / mixed steps). Buckets of at most
 #     FP8_RHS_MAX_BUCKET_M rows take the fp8 rhs feed (as decode tiles do);
 #     larger ones dequantize before the matmul. "256:128,256" (or
-#     "256:128/256") keeps every bucket on the default numerics.
+#     "256:128/256") keeps every bucket on the default numerics. An optional
+#     "@<max size_m>" suffix limits it to calls of at most that many rows.
 #   TPU_GMM_V2_DECODE_W13="<tile_n>:<gate_up buffers>[:<down buffers>]":
 #     decode-sized buffers. Up to FP8_SMALL_DECODE_MAX_M rows the gate_up
 #     (fused activation) call takes tile_n and its rhs pipeline depth and the
@@ -1217,19 +1218,20 @@ _DECODE_W13_ENV = "TPU_GMM_V2_DECODE_W13"
 
 @functools.cache
 def _tile_env() -> (
-    tuple[tuple[int, tuple[int, ...]] | None, tuple[int, int, int] | None]
+    tuple[tuple[int, tuple[int, ...], int | None] | None, tuple[int, int, int] | None]
 ):
     prefill = decode_w13 = None
     raw = os.environ.get(_PREFILL_TILES_ENV, "").strip()
     if raw:
-        tm, _, bks = raw.partition(":")
+        spec, _, max_m = raw.partition("@")
+        tm, _, bks = spec.partition(":")
         # "," or "/" between buckets ("/" fits comma-separated env lists).
         buckets = tuple(
             sorted({int(b) for b in bks.replace("/", ",").split(",") if b.strip()})
         )
         if not buckets or buckets[-1] != int(tm):
             raise ValueError(f"{_PREFILL_TILES_ENV}={raw!r}: buckets must end at tile_m")
-        prefill = (int(tm), buckets)
+        prefill = (int(tm), buckets, int(max_m) if max_m else None)
     raw = os.environ.get(_DECODE_W13_ENV, "").strip()
     if raw:
         parts = [int(x) for x in raw.split(":")]
@@ -1274,9 +1276,11 @@ def _apply_tile_env(
         return tiles
     new, name = None, None
     if prefill is not None and dims.size_m > FP8_DECODE_MAX_M:
-        tile_m, buckets = prefill
+        tile_m, buckets, max_m = prefill
         sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
-        if all(b % sublane == 0 for b in buckets):
+        if all(b % sublane == 0 for b in buckets) and (
+            max_m is None or dims.size_m <= max_m
+        ):
             new = dataclasses.replace(
                 tiles, tile_m=tile_m, bucket_base=buckets[0], buckets=buckets
             )
