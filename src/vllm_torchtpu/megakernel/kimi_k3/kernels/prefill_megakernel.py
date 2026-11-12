@@ -3900,8 +3900,7 @@ def kda_prefill_tiled_body(
     if packed:
         # An unused slot: its outputs are its inputs. The copies start with
         # the first tiles and are waited for after the last: one blocking
-        # round trip per slot would hold up the tiles (~0.15 ms a layer at
-        # 16 slots).
+        # round trip per slot would hold up the tiles.
         def unused_copies(s):
             pairs = [(rec_state_in_ref.at[s], rec_state_out_ref.at[s]),
                      (conv_hist_in_ref.at[s], conv_hist_out_ref.at[s])]
