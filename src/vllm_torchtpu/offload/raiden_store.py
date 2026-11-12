@@ -1195,7 +1195,9 @@ class RaidenOffloadingManager(OffloadingManager):
                 )
                 job.live.add(piece_id)
                 self._submit_store_batch(piece_id, keys, device_block_ids)
-        self._fold_store_pieces()
+                # A piece can finish inside the submit (insert rejected,
+                # nothing new to save): give its room back at once.
+                self._fold_store_pieces()
 
     def _fold_store_pieces(self) -> None:
         """Replace finished pieces by their job's finish, once its last piece
@@ -1213,7 +1215,9 @@ class RaidenOffloadingManager(OffloadingManager):
             if not job.live and not job.queued:
                 del self._store_jobs[job_id]
                 kept.append(
-                    FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=not job.failed)
+                    FinishedJob(
+                        job_id=job_id, op=AdmissionOp.STORE, success=not job.failed
+                    )
                 )
         self._finished = kept
 
@@ -1667,6 +1671,8 @@ class RaidenOffloadingManager(OffloadingManager):
             results.append((done, failed))
         if has_loads:
             done, failed, _pending = self._store.poll_load_status()
+            self._inflight_loads.difference_update(done)
+            self._inflight_loads.difference_update(failed)
             results.append((done, failed))
         if has_remote:
             done, failed, _pending = self._store.poll_remote_read_status()
@@ -1675,8 +1681,6 @@ class RaidenOffloadingManager(OffloadingManager):
         # same poll (some done, some failed) must finalize exactly once.
         newly_terminal: dict[int, Admission] = {}
         for done, failed in results:
-            self._inflight_loads.difference_update(done)
-            self._inflight_loads.difference_update(failed)
             for sub_hash in failed:
                 admission = self._hash_to_admission.get(sub_hash)
                 if admission is None:
@@ -1701,8 +1705,6 @@ class RaidenOffloadingManager(OffloadingManager):
             if self._maybe_retry_save(admission):
                 continue
             self._finalize(admission)
-        self._launch_queued_loads()
-        self._launch_queued_stores()
 
     def _launch_queued_loads(self) -> None:
         """Launch queued local loads while fewer than `_max_inflight_loads`
@@ -1726,21 +1728,30 @@ class RaidenOffloadingManager(OffloadingManager):
             if self._store.load(hashes, device_ids):
                 self._inflight_loads.update(hashes)
                 continue
-            admission = head.admission
             unlaunched = hashes + head.hashes
             logger.error(
                 "TPURaidenOffloadingConnector: load job %d: load() launch failed "
                 "for %d sub-blocks",
-                admission.job_id,
+                head.admission.job_id,
                 len(unlaunched),
             )
             if head.hashes:
                 self._queued_loads.popleft()
-            admission.failed = True
-            admission.failed_sub_hashes.extend(unlaunched)
-            admission.pending.difference_update(unlaunched)
-            if not admission.pending:
-                self._finalize(admission)
+            self._fail_unlaunched_load(head.admission, unlaunched)
+
+    def _fail_unlaunched_load(self, admission: Admission, hashes: list[bytes]) -> None:
+        admission.failed = True
+        admission.failed_sub_hashes.extend(hashes)
+        admission.pending.difference_update(hashes)
+        if not admission.pending:
+            self._finalize(admission)
+
+    def _cancel_queued_loads(self, job_ids: set[int]) -> None:
+        """Fail the unlaunched pieces of the loads among `job_ids`: their
+        destination blocks are being reclaimed."""
+        for item in [q for q in self._queued_loads if q.admission.job_id in job_ids]:
+            self._queued_loads.remove(item)
+            self._fail_unlaunched_load(item.admission, item.hashes)
 
     def _maybe_retry_save(self, admission: Admission) -> bool:
         """Re-issue the failed subset of a store job's save, at most
@@ -1788,7 +1799,8 @@ class RaidenOffloadingManager(OffloadingManager):
     def poll_finished_jobs(self) -> list[FinishedJob]:
         """Poll raiden completion and return newly terminal jobs."""
         self._poll_once()
-        self._fold_store_pieces()
+        self._launch_queued_loads()
+        self._launch_queued_stores()
         finished = self._finished
         self._finished = []
         return finished
@@ -1808,6 +1820,7 @@ class RaidenOffloadingManager(OffloadingManager):
         """
         # Suppress retries for draining jobs: source blocks are being reclaimed,
         # so subsequent reads would transfer invalid/overwritten data.
+        self._cancel_queued_loads(set(job_ids))
         waits = set(job_ids) | self._cancel_queued_store_pieces(set(job_ids))
         for job_id in waits:
             admission = self._admissions.get(job_id)
@@ -1817,7 +1830,8 @@ class RaidenOffloadingManager(OffloadingManager):
         drained: list[FinishedJob] = []
         while True:
             self._poll_once()
-            self._fold_store_pieces()
+            self._launch_queued_loads()
+            self._launch_queued_stores()
             drained.extend(f for f in self._finished if f.job_id in job_ids)
             self._finished = [f for f in self._finished if f.job_id not in job_ids]
             live = [
@@ -1830,6 +1844,7 @@ class RaidenOffloadingManager(OffloadingManager):
             if time.perf_counter() >= deadline:
                 for job_id in live:
                     self._admissions[job_id].poisoned = True
+                self._cancel_queued_loads(set(live))
                 logger.error(
                     "TPURaidenOffloadingConnector: drain timed out after %.1fs; "
                     "poisoned jobs %s (%d keys): their transfers are still in flight "

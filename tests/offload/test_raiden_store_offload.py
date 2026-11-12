@@ -4497,11 +4497,6 @@ class TestDenseDpIndex(unittest.TestCase):
         self.assertEqual(job_name, "vllm-offload-engine-dp2")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-
 class TestLoadPacing(unittest.TestCase):
     """max_inflight_load_sub_blocks bounds the local load sub-blocks in flight."""
 
@@ -4559,7 +4554,8 @@ class TestStorePacing(unittest.TestCase):
         self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store, max_inflight_store_sub_blocks=8)
         self.keys = [_key(0), _key(1), _key(2)]
-        self.assertEqual(self.manager.prepare_store(self.keys, _ctx()).keys_to_store, self.keys)
+        out = self.manager.prepare_store(self.keys, _ctx())
+        self.assertEqual(out.keys_to_store, self.keys)
 
     def test_pieces_launch_in_turn_and_finish_the_job_once(self):
         self.manager.submit_store_job(7, self.keys, [5, 6, 9])
@@ -4588,6 +4584,17 @@ class TestStorePacing(unittest.TestCase):
         self.assertEqual(self.manager._inflight_store_keys, set())
         self.assertEqual(self.store.pinned_hashes(), {})
 
+    def test_a_piece_rejected_at_submit_does_not_hold_up_the_rest(self):
+        # Every insert is refused: each piece finishes inside its submit, and
+        # the job still ends without waiting for an unrelated poll.
+        self.store.fail_insert = True
+        self.manager.submit_store_job(7, self.keys, [5, 6, 9])
+        self.assertEqual(len(self.store.calls_named("insert")), 2)
+        (job,) = self.manager.poll_finished_jobs()
+        self.assertEqual((job.job_id, job.success), (7, False))
+        self.assertFalse(self.manager.has_pending_work())
+        self.assertEqual(self.manager._inflight_store_keys, set())
+
     def test_a_rejected_piece_fails_the_job(self):
         self.manager.submit_store_job(7, self.keys, [5, 6, 9])
         self.store.fail_insert = True
@@ -4595,3 +4602,7 @@ class TestStorePacing(unittest.TestCase):
         (job,) = self.manager.poll_finished_jobs()
         self.assertEqual((job.job_id, job.success), (7, False))
         self.assertFalse(self.manager.has_pending_work())
+
+
+if __name__ == "__main__":
+    unittest.main()
