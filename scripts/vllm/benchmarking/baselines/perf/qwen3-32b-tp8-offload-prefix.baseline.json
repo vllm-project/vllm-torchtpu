@@ -1,0 +1,9 @@
+{
+  "isl8448_osl256_c32": {
+    "completed": 1000,
+    "median_tpot_ms": 24.58,
+    "num_prompts": 1000,
+    "output_token_throughput": 1140.54,
+    "total_token_throughput": 38778.34
+  }
+}

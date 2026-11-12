@@ -81,6 +81,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
             num_reqs_list=[1],
             spec_decode_metadata_list=[object() if verify else None],
             mamba_state_indices_list=None,
+            mamba_boundary_plans=None,
             pooler_output_list=[],
             top_tokens=False,
             kv_save_nan_check=None,
@@ -128,7 +129,11 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     )
     runner._stage_timing.take_samples.return_value = ([], [])
     runner._async_drafter = runner.drafter
-    for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+    for name in (
+        "maybe_wait_for_kv_save",
+        "get_finished_kv_transfers",
+        "_build_kv_connector_output",
+    ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner
 

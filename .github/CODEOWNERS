@@ -171,9 +171,21 @@
 /src/vllm_torchtpu/models/kimi_k3/ @yiw-wang @QiliangCui @qizzzh
 /tests/models/kimi_k3/ @yiw-wang @QiliangCui @qizzzh
 
-# Megakernel (Framework-Free JAX/Pallas)
+# Models: Qwen3.8 Flash
+/src/vllm_torchtpu/models/qwen38_flash/ @DRZDONG @caojx-google
+/tests/models/qwen38_flash/ @DRZDONG @caojx-google
+
+# Megakernel (root package and shared test setup)
 /src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
 /tests/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
+
+# Megakernel core (framework-free JAX/Pallas)
+/src/vllm_torchtpu/megakernel/core/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
+/tests/megakernel/core/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
+
+# Megakernel adapter (PyTorch/vLLM bridge)
+/src/vllm_torchtpu/megakernel/adapter/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li
+/tests/megakernel/adapter/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li
 
 # Speculative Decoding
 /src/vllm_torchtpu/spec_decode/ @Lumosis @junyanxu @gxd3 @jyj0w0 @maxwillzq
@@ -184,11 +196,11 @@
 /tests/structured_decoding/ @maxwillzq @silkyarora
 
 # Multi-LoRA
-/src/vllm_torchtpu/lora/ @vanbasten23 @haotianxue-google
-/tests/lora/ @vanbasten23 @haotianxue-google
+/src/vllm_torchtpu/lora/ @aman2930 @haotianxue-google
+/tests/lora/ @aman2930 @haotianxue-google
 
 # Omni & Diffusion Support
-/src/vllm_torchtpu/omni/ @mbohlool @pi314ever @chandrasekhard2
+/src/vllm_torchtpu/omni/ @mbohlool @pi314ever @chandrasekhard2 @yixinshi
 /tests_omni/ @mbohlool @pi314ever @chandrasekhard2
 
 # Experimental Model Export
