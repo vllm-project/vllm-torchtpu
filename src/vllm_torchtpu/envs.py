@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY: str = "vmem"
     VLLM_TPU_QSA_PREFILL_UNION_DCP: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_PROBE: int = 0
     VLLM_TPU_QSA_PREFILL_PREFIX_PAGES: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK: int = 1024
@@ -1061,6 +1062,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block-sparse kernel. Not bitwise against it (union-order online
     # softmax, equal precision).
     "VLLM_TPU_QSA_PREFILL_UNION_DCP": env_bool("VLLM_TPU_QSA_PREFILL_UNION_DCP"),
+    # PROBE=<N> (debug-only, log-only; 0 = off): under main-KV DCP, for the
+    # first N prefill steps with >= 4096 live rows, log per 128- and 256-row
+    # query tile the owned union of selected groups, the owned visible groups
+    # and the rows' selected counts (kernels/qwen4_exp/union_probe.py; one
+    # unordered host callback per QSA layer call, no outputs changed).
+    "VLLM_TPU_QSA_PREFILL_UNION_PROBE": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_UNION_PROBE", 0),
     # qwen4_exp QSA (unsharded indexer path): when every row's completed groups
     # fit the top-k budget, take all visible groups and skip the StreamIndex
     # scoring call (the sharded path already does). Same selected set; the
