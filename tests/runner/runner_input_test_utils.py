@@ -59,6 +59,7 @@ def _make_runner(
     runner.num_reqs_most_model_len = None
     runner.num_tokens_paddings = list(token_paddings)
     runner.max_num_reqs = max_num_reqs
+    runner.max_num_local_reqs = max_num_reqs
     runner.max_num_tokens = max_num_tokens
     runner.max_model_len = max_model_len
     runner.block_size = block_size

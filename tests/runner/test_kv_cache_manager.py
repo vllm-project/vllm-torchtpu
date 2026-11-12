@@ -2574,6 +2574,7 @@ def test_dsv4_request_caps_match_runner_refresh():
             max_model_len=1048576,
             most_model_len=65536,
             max_num_reqs=64,
+            max_num_local_reqs=64,
             max_num_tokens=1024,
             block_size=1024,
             max_num_blocks_per_req=1024,
