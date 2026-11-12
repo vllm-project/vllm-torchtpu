@@ -106,8 +106,13 @@ def _patch_tpu_info():
         return
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     pltpu.get_tpu_info = lambda: info
-    tpu_info.registry[jax.devices()[0].device_kind] = lambda: tpu_info._get_tpu_info_impl(
-        tpu_info.ChipVersion.TPU_7X, 1)
+    # Only public symbols plus the registry when it exists: the private
+    # _get_tpu_info_impl is gone in newer JAX (the served image's).
+    registry = getattr(tpu_info, "registry", None)
+    if registry is not None:
+        registry[jax.devices()[0].device_kind] = lambda: info
+    if hasattr(tpu_info, "get_tpu_info"):
+        tpu_info.get_tpu_info = lambda: info
 
 
 def export_dcp_prefill():
