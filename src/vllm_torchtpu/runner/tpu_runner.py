@@ -415,6 +415,32 @@ def _substitute_placeholder_token(
 logger = init_logger(__name__)
 
 
+@functools.cache
+def _spec_row_gather_op():
+    """`spec_gather_bonus_and_target_logits` as one JAX op: ``logits[idx]``
+    gathers with in-bounds indices (the padded rows use index 0). torch's
+    index_select lowers to an out-of-bounds-filling gather that rebuilds the
+    [rows, vocab] output in vocab chunks (pad + maximum): 30 -> 6 us at 8
+    rows, 54 -> 9 us at 48 (exos microbench, same values)."""
+    from torch_tpu._internal import pallas
+
+    def _gather(
+        logits: jax.Array, bonus_idx: jax.Array, target_idx: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        return logits[bonus_idx], logits[target_idx]
+
+    op = pallas.jax_op("pallas::spec_row_gather_in_bounds", _gather)
+
+    def _fake(logits, bonus_idx, target_idx):
+        return (
+            logits.new_empty((bonus_idx.shape[0], logits.shape[1])),
+            logits.new_empty((target_idx.shape[0], logits.shape[1])),
+        )
+
+    op.register_fake(_fake)
+    return op
+
+
 def _pp_step[**P, R](
     method: Callable[Concatenate[Any, P], R],
 ) -> Callable[Concatenate[Any, P], R]:
@@ -5759,6 +5785,12 @@ class TPUModelRunner(GPUModelRunner):
         return async_output
 
     def load_model(self) -> None:
+        if envs.TPU_SPEC_GATHER_IN_BOUNDS:
+            _spec_row_gather_op()  # built eagerly: Dynamo cannot build a jax_op
+            logger.info(
+                "TPU_SPEC_GATHER_IN_BOUNDS=1: non-greedy verify gathers its "
+                "bonus/target logits rows with one in-bounds JAX gather op."
+            )
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
@@ -8946,6 +8978,12 @@ class TPUModelRunner(GPUModelRunner):
         # logits[indices] gathers are eager ops torch-tpu's DEFER_AND_FUSE fuses
         # with the live per-step dispatch into per-context programs (cold
         # recompiles).index_select is value-identical to logits[indices].
+        if envs.TPU_SPEC_GATHER_IN_BOUNDS:
+            # One JAX op, in-bounds row gathers (TPU_SPEC_GATHER_IN_BOUNDS):
+            # same rows, no out-of-bounds fill pass.
+            return _spec_row_gather_op()(
+                logits, bonus_logits_indices, target_logits_indices
+            )
         bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_logits, target_logits
