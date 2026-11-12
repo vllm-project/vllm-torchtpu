@@ -453,12 +453,15 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     def _replicated_token_shard_mode(tp_size, pooled, prefix):
         """Whether to build the token-sharded indexer ops for the replicated
         prefill graph (``Qwen4ExpBackboneRP``); the MTP draft never takes it."""
+        from vllm_torchtpu.models.vllm.qwen4_exp.sequence_parallel import (
+            replicated_token_shard_enabled,
+        )
+
         active = bool(
-            envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD
-            and tp_size > 1
+            tp_size > 1
             and pooled
-            and not envs.VLLM_TPU_QSA_COMPRESSED_DCP
             and "mtp" not in prefix
+            and replicated_token_shard_enabled()
         )
         if envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD:
             logger.info_once(
