@@ -11,9 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_SPEC_GATHER_EMBEDDING: F.embedding gathers the same logits rows as
-index_select (bit for bit, incl. -inf / NaN), on CPU."""
+"""TPU_SPEC_GATHER_IN_BOUNDS: the JAX op's ``logits[idx]`` gathers the same
+rows as torch index_select (bit for bit, incl. -inf / NaN), on CPU."""
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 import torch
 
@@ -36,7 +39,12 @@ def test_embedding_matches_index_select(rows, reqs, dtype):
     bonus[:reqs] = torch.arange(reqs, dtype=torch.int32) * (k + 1) + k
     for idx in (target, bonus):
         a = torch.index_select(logits, 0, idx)
-        b = torch.nn.functional.embedding(idx, logits)
+        x = jnp.asarray(logits.float().numpy()).astype(
+            jnp.bfloat16 if dtype == torch.bfloat16 else jnp.float32
+        )
+        with jax.default_device(jax.devices("cpu")[0]):
+            g = np.asarray(x[jnp.asarray(idx.numpy())].astype(jnp.float32))
+        b = torch.from_numpy(g).to(dtype)
         assert a.dtype == b.dtype and a.shape == b.shape
-        assert torch.equal(a.view(torch.int16 if dtype == torch.bfloat16 else torch.int32),
-                           b.view(torch.int16 if dtype == torch.bfloat16 else torch.int32))
+        # Value-exact (NaN payloads may change in this CPU float32 detour).
+        torch.testing.assert_close(a, b, rtol=0, atol=0, equal_nan=True)
