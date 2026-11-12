@@ -138,6 +138,8 @@ def test_prefill_fp8_kv(native_fp8_prefill, reqs):
         v_scale=1.0,
         kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         native_fp8_prefill=native_fp8_prefill,
+        # The tiles of the Qwen3.5 shapes these modes are tuned for.
+        tuned_tiles=True,
     )
     t = sum(n for _, n in reqs)
     out = np.asarray(out[:t].astype(jnp.float32))

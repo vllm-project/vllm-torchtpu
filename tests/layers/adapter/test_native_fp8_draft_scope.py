@@ -212,6 +212,21 @@ def test_builder_unchanged_with_the_modes_off(
     assert rpa[0][1].keywords["attention_modes"] == native_fp8_scope.OFF
 
 
+def test_builder_binds_the_tuned_tiles(
+    monkeypatch, registered, cpu_vllm_config_context
+):
+    default, tuned = _batched_impl(), _batched_impl()
+    tuned.tuned_tiles = True
+    with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
+        d_op = default._build_rpa_kernel(None, None, None)
+        t_op = tuned._build_rpa_kernel(None, None, None)
+    assert d_op is not t_op
+    rpa = [fn for n, fn in registered if n.startswith("pallas::rpa_kernel")]
+    assert [fn.keywords["tuned_tiles"] for fn in rpa] == [False, True]
+    assert _rpa_call_kwargs(monkeypatch, rpa[0], 9) == {}
+    assert _rpa_call_kwargs(monkeypatch, rpa[1], 9) == {"tuned_tiles": True}
+
+
 # --- torch_tpu's own signature check on the built kernel entries -------------
 
 
