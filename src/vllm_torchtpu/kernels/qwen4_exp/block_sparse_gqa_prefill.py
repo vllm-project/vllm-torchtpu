@@ -1687,6 +1687,46 @@ def _block_sparse_gqa_prefill(
     return output[:, :, :original_head_dim]
 
 
+def _aligned_sources(starts, offsets, real, rows, max_tokens):
+    """Inverse of the block-aligned row placement, for a gather.
+
+    Token ``i`` of request ``r`` (``starts[r] <= i < starts[r + 1]``) goes to
+    aligned row ``offsets[r] + i - starts[r]``; rows at or past ``max_tokens``
+    are dropped. Returns ``(source int32[max_tokens], filled bool[max_tokens])``:
+    aligned row ``d`` holds token ``source[d]`` where ``filled[d]``, else the
+    fill value. Same placement as the ``.at[slots].set(mode="drop")`` scatter
+    (``starts[0] == 0``, sorted ``starts``), so the aligned tensors are
+    bit-identical.
+
+    The request of each aligned row is a compare-and-sum over the padded
+    request ends (exact for int32, no while loop); above
+    ``sorted_search.MAX_MASK_ELEMENTS`` an int32 row-index scatter inverts the
+    map instead (one s32 per row, not the [rows, heads, dim] payload).
+    """
+    dest = jnp.arange(max_tokens, dtype=jnp.int32)
+    requests = real.shape[0]
+    if max_tokens * requests <= sorted_search.MAX_MASK_ELEMENTS:
+        req = jnp.sum(offsets[1:][None, :] <= dest[:, None], axis=1, dtype=jnp.int32)
+        req = jnp.minimum(req, requests - 1)
+        position = dest - offsets[req]
+        source = starts[req] + position
+        filled = (
+            (dest < offsets[-1])
+            & (position < real[req])
+            & (source < starts[-1])
+            & (source < rows)
+        )
+        return jnp.clip(source, 0, rows - 1).astype(jnp.int32), filled
+    token = jnp.arange(rows, dtype=jnp.int32)
+    tok_req = sorted_search.searchsorted(starts[1:], token, side="right")
+    tok_req = jnp.minimum(tok_req, requests - 1)
+    slots = jnp.where(
+        token < starts[-1], offsets[tok_req] + token - starts[tok_req], max_tokens
+    )
+    inverse = jnp.full((max_tokens,), -1, jnp.int32).at[slots].set(token, mode="drop")
+    return jnp.maximum(inverse, 0), inverse >= 0
+
+
 def block_sparse_gqa_attention(
     query,
     gate,
@@ -1771,9 +1811,18 @@ def block_sparse_gqa_attention(
         valid = jnp.arange(len(query)) < starts[-1]
         slots = jnp.where(valid, offsets[req] + positions, max_tokens)
 
-        def align(array, fill):
-            shape = (max_tokens, *array.shape[1:])
-            return jnp.full(shape, fill, array.dtype).at[slots].set(array, mode="drop")
+        if envs.VLLM_TPU_QSA_PREFILL_ALIGN_GATHER:
+            source, filled = _aligned_sources(starts, offsets, real, len(query), max_tokens)
+
+            def align(array, fill):
+                rows = jnp.take(array, source, axis=0)
+                keep = filled.reshape(-1, *([1] * (array.ndim - 1)))
+                return jnp.where(keep, rows, jnp.asarray(fill, array.dtype))
+        else:
+
+            def align(array, fill):
+                shape = (max_tokens, *array.shape[1:])
+                return jnp.full(shape, fill, array.dtype).at[slots].set(array, mode="drop")
 
         output = block_sparse_gqa_prefill(
             align(query, 0),
