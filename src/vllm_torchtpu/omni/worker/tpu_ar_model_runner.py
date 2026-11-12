@@ -32,7 +32,7 @@ from vllm_torchtpu.omni.worker.tpu_model_runner import OmniTPUModelRunner
 # ``_model_omni_flag``) to drive the per-step preprocess / postprocess hooks.
 # vLLM-Omni models set them in ``__init__``: the Qwen3-Omni thinker sets both
 # to False, the talker sets both to True.
-_PER_STEP_HOOK_FLAGS = ("has_preprocess", "has_postprocess")
+_UNSUPPORTED_HOOK_FLAGS = ("has_preprocess", "has_postprocess")
 
 
 class _OmniStageModel(Protocol):
@@ -52,6 +52,8 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
     - at construction, a stage config that needs inter-stage connectors
       (``needs_omni_connector``): every stage of a multi-stage pipeline sends
       or receives payloads through them, and they are not wired on TPU;
+    - at construction, speculative decoding (``speculative_config``): draft-model
+      auxiliary hidden states are not verified or wired on ``TPUARModelRunner``;
     - at ``load_model``, a model that declares the per-step
       ``preprocess`` / ``postprocess`` hooks (``has_preprocess`` /
       ``has_postprocess``): the talker path, which runs multi-token
@@ -70,21 +72,29 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
                 "pipeline (qwen3_omni_moe_thinker_only) or another single-stage "
                 "deployment."
             )
+        if getattr(self, "speculative_config", None) is not None:
+            raise NotImplementedError(
+                f"Stage {self.stage_id} ({self.model_stage!r}): speculative decoding "
+                "(speculative_config) is not supported by TPUARModelRunner yet."
+            )
 
     def load_model(self) -> None:
         """Load the stage model, then refuse one whose hooks nobody would call."""
         maybe_patch_qwen3_omni_thinker(self.model_config)
         super().load_model()
         model = self.get_model()
-        declared = [
-            flag for flag in _PER_STEP_HOOK_FLAGS if bool(getattr(model, flag, False))
+        has_unsupported_flags = [
+            flag
+            for flag in _UNSUPPORTED_HOOK_FLAGS
+            if bool(getattr(model, flag, False))
         ]
-        if declared:
+        if len(has_unsupported_flags) > 0:
             raise NotImplementedError(
                 f"Stage {self.stage_id} ({self.model_stage!r}): "
-                f"{type(model).__name__} declares {', '.join(declared)}, so it "
-                "relies on the per-step preprocess/postprocess hooks (the talker's "
-                "multi-token prediction), which TPUARModelRunner does not run yet."
+                f"{type(model).__name__} declares {', '.join(has_unsupported_flags)}, "
+                "so it relies on the per-step preprocess/postprocess hooks (the "
+                "talker's multi-token prediction), which TPUARModelRunner does not "
+                "run yet."
             )
 
     def forward_model(

@@ -46,16 +46,23 @@ def _stage_config(**fields) -> OmniModelConfig:
     return config
 
 
-def _build(model_config=None, model=None) -> TPUARModelRunner:
+def _build(model_config=None, model=None, speculative_config=None) -> TPUARModelRunner:
     if model_config is None:
         model_config = _stage_config()
 
     def _fake_init(self, vllm_config, *args, **kwargs):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
+        self.speculative_config = vllm_config.speculative_config
 
     with patch.object(TPUModelRunner, "__init__", _fake_init):
-        runner = TPUARModelRunner(SimpleNamespace(model_config=model_config), "tpu")
+        runner = TPUARModelRunner(
+            SimpleNamespace(
+                model_config=model_config,
+                speculative_config=speculative_config,
+            ),
+            "tpu",
+        )
     if model is not None:
         with (
             patch(
@@ -103,6 +110,9 @@ def test_tpu_ar_model_runner_init_and_inheritance():
         _build(
             _stage_config(custom_process_next_stage_input_func="pkg.mod.thinker2talker")
         )
+
+    with pytest.raises(NotImplementedError, match="speculative_config"):
+        _build(speculative_config=SimpleNamespace(method="eagle3"))
 
 
 def test_load_model_checks_per_step_hook_capabilities():
