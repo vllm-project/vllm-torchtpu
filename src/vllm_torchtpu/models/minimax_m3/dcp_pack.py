@@ -24,9 +24,10 @@ the four:
 * `merge_head_partials_all_to_all`: one all-to-all sends every rank the partial
   outputs and LSEs of the heads it keeps; the rank then merges them itself.
 
-Both pack their operands as int32 bit patterns, so the collectives move bits
-and never see a float (a TPU collective may flush f32 subnormals, which the
-bf16 pairs and the candidate ids are as f32).
+Both move int16 bit patterns, so the collectives never see a float (a TPU
+collective may flush f32 subnormals, which candidate ids are as f32). The bf16
+operand keeps its layout; the small f32 operands ride as extra sublane rows
+(`_rows`), since splitting a bf16 tensor into int32 pairs costs a relayout.
 
 The merge reproduces `ops.msa.merge_head_partials` bit for bit on a DCP 2
 pair: the receiving rank computes the same per-source weights from the same
@@ -37,9 +38,23 @@ and the sum of two terms does not depend on their order.
 import torch
 
 
-def _bits(x: torch.Tensor) -> torch.Tensor:
-    """``x`` (bf16 or f32, last dim even for bf16) as int32 words."""
-    return x.contiguous().view(torch.int32)
+def _rows(x: torch.Tensor, lanes: int) -> torch.Tensor:
+    """``x [N, M]`` (any 4-byte dtype) as int16 rows ``[N, ceil(2M / lanes), lanes]``,
+    zero padded: small operands ride as extra sublane rows of a bf16 payload,
+    so the payload never changes its lane layout."""
+    words = x.contiguous().view(torch.int16)
+    n, m = words.shape
+    rows = -(-m // lanes)
+    if rows * lanes != m:
+        words = torch.nn.functional.pad(words, (0, rows * lanes - m))
+    return words.view(n, rows, lanes)
+
+
+def _unrows(x: torch.Tensor, count: int, dtype: torch.dtype) -> torch.Tensor:
+    """Inverse of `_rows` for ``[..., rows, lanes]``: the first ``count``
+    values of `dtype` (4-byte)."""
+    flat = x.reshape(*x.shape[:-2], x.shape[-2] * x.shape[-1])
+    return flat[..., : 2 * count].contiguous().view(dtype)
 
 
 def gather_queries_and_candidates(
@@ -50,21 +65,19 @@ def gather_queries_and_candidates(
     the same values as ``group.all_gather(q, dim=1)`` and
     ``group.all_gather(candidates.unsqueeze(0), dim=0)``."""
     num_tokens, num_heads, head_dim = q.shape
-    q_words = num_heads * head_dim // 2
+    cols = candidates.shape[1]
     payload = torch.cat(
-        [_bits(q).reshape(num_tokens, q_words), _bits(candidates)], dim=1
+        [q.contiguous().view(torch.int16), _rows(candidates, head_dim)], dim=1
     )
-    gathered = group.all_gather(payload.unsqueeze(0), dim=0)  # [dcp, T, W]
+    gathered = group.all_gather(payload.unsqueeze(0), dim=0)  # [dcp, T, Hq + r, D]
     dcp = gathered.shape[0]
     q_all = (
-        gathered[:, :, :q_words]
-        .contiguous()
-        .view(q.dtype)
-        .view(dcp, num_tokens, num_heads, head_dim)
+        gathered[:, :, :num_heads]
         .transpose(0, 1)
         .reshape(num_tokens, dcp * num_heads, head_dim)
+        .view(q.dtype)
     )
-    cand_all = gathered[:, :, q_words:].contiguous().view(candidates.dtype)
+    cand_all = _unrows(gathered[:, :, num_heads:], cols, candidates.dtype)
     return q_all, cand_all
 
 
@@ -99,14 +112,11 @@ def merge_received_partials(
 
 
 def pack_partials(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
-    """``out [H, T, D]`` (bf16) and ``lse [H, T]`` as int32 rows
-    ``[H, T * D / 2 + T]``: head ``h``'s row carries its partial, then its LSEs."""
-    num_heads, num_tokens, head_dim = out.shape
+    """``out [H, T, D]`` (bf16) and ``lse [H, T]`` as int16 ``[H, T + r, D]``:
+    head ``h``'s partial rows, then its f32 LSEs as ``r`` extra rows."""
+    head_dim = out.shape[2]
     return torch.cat(
-        [
-            _bits(out).reshape(num_heads, num_tokens * head_dim // 2),
-            _bits(lse.to(torch.float32)),
-        ],
+        [out.contiguous().view(torch.int16), _rows(lse.to(torch.float32), head_dim)],
         dim=1,
     )
 
@@ -114,18 +124,11 @@ def pack_partials(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
 def unpack_partials(
     recv: torch.Tensor, dcp: int, num_tokens: int, head_dim: int, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """`pack_partials` rows of ``dcp`` sources, ``[dcp * h, W]`` -> ``(out
-    [dcp, h, T, D], lse [dcp, h, T])``."""
-    words = num_tokens * head_dim // 2
-    rows = recv.view(dcp, -1, recv.shape[-1])
-    local = rows.shape[1]
-    out = (
-        rows[:, :, :words]
-        .contiguous()
-        .view(dtype)
-        .view(dcp, local, num_tokens, head_dim)
-    )
-    lse = rows[:, :, words:].contiguous().view(torch.float32)
+    """`pack_partials` payloads of ``dcp`` sources, ``[dcp * h, T + r, D]`` ->
+    ``(out [dcp, h, T, D], lse [dcp, h, T])``."""
+    rows = recv.view(dcp, -1, recv.shape[-2], head_dim)
+    out = rows[:, :, :num_tokens].view(dtype)
+    lse = _unrows(rows[:, :, num_tokens:], num_tokens, torch.float32)
     return out, lse
 
 

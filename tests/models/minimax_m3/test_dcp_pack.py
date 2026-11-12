@@ -127,8 +127,7 @@ def test_gather_queries_and_candidates(tokens):
         c[-1, 1] = 1e-40  # a subnormal travels as bits
         cands.append(c)
     bank = [
-        torch.cat([q.view(torch.int32).reshape(tokens, -1), c.view(torch.int32)], 1)
-        .unsqueeze(0)
+        torch.cat([q.view(torch.int16), dcp_pack._rows(c, dim)], 1).unsqueeze(0)
         for q, c in zip(qs, cands)
     ]
     want_q = torch.cat(qs, dim=1)
