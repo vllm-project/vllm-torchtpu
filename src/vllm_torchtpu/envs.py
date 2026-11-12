@@ -214,6 +214,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     VLLM_TPU_PREFILL_SPACING_FRAC: float = 0.5
     VLLM_TPU_PREFILL_SPACING_MIN_TOKENS: int = 8192
+    VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
+    VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
 
 
 def env_with_choices(
@@ -1310,6 +1312,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # while at least this many of its prompt tokens are left to compute.
     "VLLM_TPU_PREFILL_SPACING_MIN_TOKENS": env_nonnegative_int(
         "VLLM_TPU_PREFILL_SPACING_MIN_TOKENS", 8192
+    ),
+    # PrefillSpacingScheduler: TPOT target in ms. Prefill is deferred while a
+    # long-chunk step would push a decoding request that can still meet it past
+    # it (TPOT projected from max_tokens: only acts when clients set max_tokens
+    # with ignore_eos; 0 disables).
+    "VLLM_TPU_PREFILL_TPOT_TARGET_MS": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_TARGET_MS", 0.0
+    ),
+    # PrefillSpacingScheduler: longest run of steps, in seconds, that the TPOT
+    # target alone may defer prefill for; the next step then runs prefill.
+    "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S", 10.0
     ),
 }
 

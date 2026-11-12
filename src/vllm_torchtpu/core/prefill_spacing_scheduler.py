@@ -34,7 +34,17 @@ warmest-first admission, each step this scheduler:
   requests decode (KV loads still start). Step times are moving averages of
   the time between consecutive ``update_from_output`` calls per kind of step,
   timed only while the next step is already queued (async scheduling), so no
-  chunk is spaced until a long-chunk step has been timed.
+  chunk is spaced until a long-chunk step has been timed;
+* with ``VLLM_TPU_PREFILL_TPOT_TARGET_MS`` set, also defers prefill while a
+  long-chunk step would push a decoding request that can still meet that TPOT
+  past it. A request's TPOT is projected from the time since it first decoded
+  and its tokens left to ``max_tokens`` at the measured tokens per step and
+  decode-step time, so the rule only acts when clients set ``max_tokens`` and
+  ``ignore_eos`` (as AgentX does). Any pending prefill, short prompts too, is
+  priced as a long-chunk step: the next step may admit a long one. Unlike the
+  fixed debt, prefill then runs as soon as every such request can afford the
+  step. At most ``VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S`` of steps in a row are
+  deferred this way.
 
 Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.prefill_spacing_scheduler.PrefillSpacingScheduler``.
@@ -62,6 +72,8 @@ _MAX_STEP_RATIO = 4.0
 # Steps scheduled but not yet reported; bounds the kind map if outputs drop.
 _MAX_PENDING_STEPS = 64
 _LOG_EVERY = 10000
+# Weight of the newest step in the tokens-per-decode-step moving average.
+_TOKENS_PER_STEP_EMA = 0.05
 
 _LONG, _PREFILL, _DECODE = "long", "prefill", "decode"
 
@@ -74,6 +86,15 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self.spacing_frac = envs.VLLM_TPU_PREFILL_SPACING_FRAC
         self.long_prompt_tokens = envs.VLLM_TPU_PREFILL_SPACING_MIN_TOKENS
         self.max_starved_steps = envs.VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS
+        self.tpot_target_s = envs.VLLM_TPU_PREFILL_TPOT_TARGET_MS / 1e3
+        self.max_hold_s = envs.VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S
+        # Decoding request id -> when it was first scheduled to decode, and
+        # its output tokens at the previous step (TPOT projection).
+        self._decode_t0: dict[str, float] = {}
+        self._seen_out: dict[str, int] = {}
+        self._tokens_per_step = 1.0
+        # Start of the current run of steps deferred by the TPOT target.
+        self._held_since: float | None = None
         # Decode-only seconds owed to the decoding requests.
         self._debt_s = 0.0
         self._step_s: dict[str, float] = {}
@@ -94,10 +115,11 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self._long_steps = 0
         logger.info(
             "PrefillSpacingScheduler active (spacing_frac=%.2f, "
-            "long_prompt_tokens=%d, max_starved_steps=%d)",
+            "long_prompt_tokens=%d, max_starved_steps=%d, tpot_target_ms=%.1f)",
             self.spacing_frac,
             self.long_prompt_tokens,
             self.max_starved_steps,
+            self.tpot_target_s * 1e3,
         )
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
@@ -138,10 +160,13 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         )
         if queue is not None:
             self._promote_warmest(queue)
-        decoding = any(not r.is_prefill_chunk for r in self.running)
+        decoders = [r for r in self.running if not r.is_prefill_chunk]
+        decoding = bool(decoders)
         if not decoding:
             self._debt_s = 0.0
         spacing = self.spacing_frac > 0 and decoding and self._debt_s > 0
+        if self.tpot_target_s > 0:
+            spacing = self._hold_for_tpot(decoders, queue) or spacing
         defer = throttle_prefills or spacing
         prefilling = [r for r in self.running if r.is_prefill_chunk]
         self._reserve = {} if defer else self._plan_reserve(prefilling)
@@ -161,6 +186,66 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             self._update_starved(prefilling, output)
         self._account(output, decoding, spacing)
         return output
+
+    def _hold_for_tpot(
+        self, decoders: list[Request], queue: RequestQueue | None
+    ) -> bool:
+        """Whether a long-chunk step now would push a decoding request that
+        can still meet the TPOT target past it, while prefill is pending."""
+        now = time.monotonic()
+        self._track_decoders(decoders, now)
+        pending = bool(queue) or any(r.is_prefill_chunk for r in self.running)
+        hold = pending and self._short_of_slack(decoders, now)
+        if not hold:
+            self._held_since = None
+        elif self._held_since is None:
+            self._held_since = now
+        elif now - self._held_since > self.max_hold_s:
+            # Bounds one run of holds; the next step may start another.
+            self._held_since = None
+            hold = False
+        return hold
+
+    def _track_decoders(self, decoders: list[Request], now: float) -> None:
+        tokens = rows = 0
+        for r in decoders:
+            seen = self._seen_out.get(r.request_id)
+            if seen is None:
+                self._decode_t0[r.request_id] = now
+            else:
+                tokens += r.num_output_tokens - seen
+                rows += 1
+            self._seen_out[r.request_id] = r.num_output_tokens
+        if rows:
+            self._tokens_per_step += _TOKENS_PER_STEP_EMA * (
+                tokens / rows - self._tokens_per_step
+            )
+        if len(self._seen_out) > 2 * len(self.running) + _MAX_PENDING_STEPS:
+            live = {r.request_id for r in self.running}
+            for req_id in [k for k in self._seen_out if k not in live]:
+                del self._seen_out[req_id]
+                self._decode_t0.pop(req_id, None)
+
+    def _short_of_slack(self, decoders: list[Request], now: float) -> bool:
+        decode_s = self._step_s.get(_DECODE)
+        long_s = self._step_s.get(_LONG)
+        if decode_s is None or long_s is None:
+            return False
+        extra_s = long_s - decode_s
+        for r in decoders:
+            t0 = self._decode_t0.get(r.request_id)
+            if t0 is None or r.max_tokens <= 1:
+                continue
+            steps_left = max(r.max_tokens - r.num_output_tokens, 0) / max(
+                self._tokens_per_step, 1.0
+            )
+            projected_s = now - t0 + steps_left * decode_s
+            slack_s = self.tpot_target_s * (r.max_tokens - 1) - projected_s
+            # A request already past the target is not protected: holding
+            # prefill for it cannot bring it back under.
+            if 0 < slack_s < extra_s:
+                return True
+        return False
 
     def _plan_reserve(self, prefilling: list[Request]) -> dict[str, int]:
         """Order RUNNING and size each prefill chunk's reserve for the

@@ -161,3 +161,47 @@ def test_step_time_is_timed_only_back_to_back(model_config, monkeypatch):
     scheduler._pending_kinds[id(d)] = "decode"
     scheduler.update_from_output(d, None)  # t=50: after idle, not timed
     assert scheduler._step_s["decode"] == pytest.approx(0.42)
+
+
+def _tpot_scheduler(model_config, monkeypatch, target_ms, long_s=0.1):
+    """A scheduler deferring by the TPOT target only, on a settable clock."""
+    clock = SimpleNamespace(t=100.0)
+    monkeypatch.setattr(pss.time, "monotonic", lambda: clock.t)
+    scheduler, hasher = _scheduler(model_config, max_num_batched_tokens=64)
+    scheduler.spacing_frac = 0.0
+    scheduler.long_prompt_tokens = 128
+    scheduler._step_s = {"long": long_s, "decode": 0.04}
+    _decoding_and_long(scheduler, hasher)
+    scheduler.tpot_target_s = target_ms / 1e3
+    return scheduler, clock
+
+
+# "dec" has 256 tokens left at >= 1 token per 0.04 s step: 10.24 s projected,
+# against target x 255 tokens allowed.
+@pytest.mark.parametrize(
+    ("target_ms", "held"),
+    [
+        (40.3, True),  # 0.037 s of slack: a 0.06 s longer step does not fit
+        (50.0, False),  # 2.5 s of slack: the chunk runs
+        (30.0, False),  # already past the target: not protected
+    ],
+)
+def test_tpot_target_defers_prefill_only_for_a_decoder_short_of_slack(
+    model_config, monkeypatch, target_ms, held
+):
+    scheduler, _ = _tpot_scheduler(model_config, monkeypatch, target_ms)
+    scheduled = set(scheduler.schedule().num_scheduled_tokens)
+    assert scheduled == ({"dec"} if held else {"dec", "long"})
+
+
+def test_tpot_target_defers_prefill_at_most_max_hold(model_config, monkeypatch):
+    # 3 s of slack, a 4.96 s longer long-chunk step: held until max_hold_s.
+    scheduler, clock = _tpot_scheduler(
+        model_config, monkeypatch, target_ms=(10.24 + 3.0) / 255 * 1e3, long_s=5.0
+    )
+    scheduler.max_hold_s = 1.0
+    for t in (100.0, 100.5):
+        clock.t = t
+        assert set(scheduler.schedule().num_scheduled_tokens) == {"dec"}
+    clock.t = 101.2
+    assert "long" in scheduler.schedule().num_scheduled_tokens
