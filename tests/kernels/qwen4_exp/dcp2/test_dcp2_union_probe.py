@@ -134,7 +134,6 @@ def export_dcp_prefill():
 def test_dcp_prefill_exports_with_probe_on(monkeypatch):
     import jax
     import jax.numpy as jnp
-    import pytest
 
     for k, v in {"VLLM_TPU_QSA_PREFILL_UNION_PROBE": "4", "VLLM_TPU_QSA_PREFILL_UNION_WALK": "128",
                  "VLLM_TPU_QSA_PREFILL_UNION_DCP": "1"}.items():
@@ -147,8 +146,12 @@ def test_dcp_prefill_exports_with_probe_on(monkeypatch):
         jax.debug.callback(lambda v: None, x)
         return x + 1
 
-    with pytest.raises(NotImplementedError, match="host_callbacks"):
+    try:
         jax.export.export(jax.jit(g), platforms=[jax.default_backend()])(jax.ShapeDtypeStruct((4,), jnp.float32))
+    except NotImplementedError as e:
+        assert "host_callbacks" in str(e), e
+    else:
+        raise AssertionError("a host callback exported: the positive control is broken")
 
 
 def tpu_compiled_stash():
@@ -199,22 +202,6 @@ if __name__ == "__main__":
         def setattr(self, obj, name, value):
             setattr(obj, name, value)
 
-    try:
-        import pytest  # noqa: F401
-    except ImportError:
-        import contextlib
-        import re
-
-        @contextlib.contextmanager
-        def _raises(exc, match=None):
-            try:
-                yield
-            except exc as e:
-                assert match is None or re.search(match, str(e)), e
-                return
-            raise AssertionError(f"did not raise {exc}")
-
-        sys.modules["pytest"] = types.SimpleNamespace(raises=_raises)
     rc = 0
     for name, fn in (("tile_stats", test_tile_stats_match_owned_group_space),
                      ("export", lambda: test_dcp_prefill_exports_with_probe_on(_MP())),
