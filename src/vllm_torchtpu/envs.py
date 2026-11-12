@@ -79,6 +79,8 @@ if TYPE_CHECKING:
     TPU_MOE_COUNTING_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
+    TPU_MINIMAX_M3_SPLIT_MIN_TOKENS: int = 0
+    TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST: bool = True
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -741,6 +743,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # buckets up to 40 rows of 6144, where the two still differ.
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
+    ),
+    # MiniMax M3: steps of at least this many tokens run every layer on the
+    # step's two token halves, so one half's residual all-reduces overlap the
+    # other half's attention and FFN. 0 (default) = off.
+    "TPU_MINIMAX_M3_SPLIT_MIN_TOKENS": env_int("TPU_MINIMAX_M3_SPLIT_MIN_TOKENS", 0),
+    # With the split on, the second half's layer input waits for the first
+    # half's attention (so it overlaps the previous all-reduce). Measured
+    # faster at c16/c48, slower at c4 (batch-1 mixed steps).
+    "TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST": env_bool(
+        "TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST", default=True
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
