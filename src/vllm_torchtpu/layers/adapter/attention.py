@@ -534,6 +534,19 @@ def _pallas_rpa_kernel_default_bundled(
     return new_bundle, outputs
 
 
+def qwen3_5_tuned_tiles(vllm_config: VllmConfig | None) -> bool:
+    """Whether the engine's batched RPA layers take the tuned tiles and decode
+    lanes (``tuned_tiles``): for a Qwen3.5 target, whose PD deployments were
+    tuned and validated with them. Every other model keeps the default tiles.
+    The rule keys on the engine's target model, so a Qwen3.5 MTP draft, which
+    runs under a copy of the target's config, takes them too."""
+    if vllm_config is None:
+        return False
+    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+
+    return qwen3_5_settings.is_qwen3_5(vllm_config.model_config)
+
+
 def _pallas_rpa_kernel_batched(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -1842,6 +1855,9 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         if spec is not None and self.head_size != 64:
             self.decode_query_size = spec.num_speculative_tokens + 1
         model_config = vllm_config.model_config if vllm_config is not None else None
+        # The Qwen3.5 PD deployments ran with the tuned tiles and with the skip
+        # of an empty MIXED call; both key on the same rule.
+        self.tuned_tiles = self.skip_empty_mixed = qwen3_5_tuned_tiles(vllm_config)
         if self.tuned_tiles and model_config is not None and self.head_size != 64:
             self.decode_lanes = batched_rpa_decode.decode_lanes(
                 chip_version=get_chip_version(),
