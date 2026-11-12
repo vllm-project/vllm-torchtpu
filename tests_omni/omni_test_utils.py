@@ -15,6 +15,47 @@
 
 import numpy as np
 import torch
+from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.attention.mm_encoder_attention import (
+    MMEncoderAttention,
+)
+from vllm.model_executor.layers.conv import Conv3dLayer
+from vllm.model_executor.layers.linear import LinearBase
+
+
+def init_test_weights(module: torch.nn.Module, seed: int) -> None:
+    """Seed vLLM parallel linear and Conv3d layers allocated with ``torch.empty``."""
+    generator = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for submodule in module.modules():
+            if isinstance(submodule, (LinearBase, Conv3dLayer)):
+                for param in submodule.parameters(recurse=False):
+                    if param.dim() > 1:
+                        param.copy_(
+                            torch.randn(param.shape, generator=generator) * 0.02
+                        )
+                    else:
+                        param.zero_()
+
+
+def use_native_ops_on_cpu(module: torch.nn.Module) -> None:
+    """Bind CPU-compatible reference methods on vLLM CustomOp instances."""
+
+    def _attention(query, key, value, cu_seqlens=None, max_seqlen=None, **_):
+        q, k, v = (t.transpose(1, 2).double() for t in (query, key, value))
+        bounds = cu_seqlens.tolist() if cu_seqlens is not None else [0, q.shape[2]]
+        scale = q.shape[-1] ** -0.5
+        out = torch.empty_like(q)
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            scores = q[:, :, start:end] @ k[:, :, start:end].transpose(-1, -2) * scale
+            out[:, :, start:end] = scores.softmax(dim=-1) @ v[:, :, start:end]
+        return out.transpose(1, 2).to(query.dtype)
+
+    for submodule in module.modules():
+        if isinstance(submodule, MMEncoderAttention):
+            submodule._forward_method = _attention
+        elif isinstance(submodule, CustomOp):
+            submodule._forward_method = submodule.forward_native
 
 
 def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
