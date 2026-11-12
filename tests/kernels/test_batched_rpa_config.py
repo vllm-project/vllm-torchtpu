@@ -87,7 +87,6 @@ def test_calculate_block_sizes_generation(
 
 
 # bkv_sz must be a page multiple in every layout (see RpaConfigs.validate_inputs).
-# These are the four configs from the #2435 report on a 256-wide MXU.
 @pytest.mark.parametrize(
     "kv_layout",
     [configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE],

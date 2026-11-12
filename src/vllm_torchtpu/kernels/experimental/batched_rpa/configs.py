@@ -662,8 +662,6 @@ class RpaConfigs:
                     "Context Parallel does not support sliding window right now"
                 )
 
-        # The cached-KV schedule fetches block k from pages k * bkv_p with no
-        # intra-page offset; an unaligned bkv_sz silently reads the wrong tokens.
         bkv_sz = self.block.bkv_sz
         page_size = self.serve.page_size
         if bkv_sz % page_size != 0:
