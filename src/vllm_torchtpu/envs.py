@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     TPU_GDN_RAW_QKV: bool = False
     TPU_GDN_RAW_BA: bool = False
     TPU_GDN_KERNEL_ZERO_OUT: bool = False
+    VLLM_TPU_GDN_PREFILL_RAW_QKV: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_TOPK_STATS: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
@@ -702,6 +703,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # writes (bucket padding) instead of XLA zero-initializing the whole
     # output buffer first. Bit-identical.
     "TPU_GDN_KERNEL_ZERO_OUT": env_bool("TPU_GDN_KERNEL_ZERO_OUT", default=False),
+    # Qwen4-exp GDN with TPU_GDN_RAW_QKV: also hand prefill / mixed buckets
+    # the projection's BF16 qkv as is, instead of the FP32 Conv1DInput copy
+    # (gdn_compact_qkv_input), which otherwise turns the raw path off for
+    # every bucket larger than the request capacity. Same values, so
+    # bit-identical.
+    "VLLM_TPU_GDN_PREFILL_RAW_QKV": env_bool("VLLM_TPU_GDN_PREFILL_RAW_QKV"),
     # Qwen4-exp QSA decode/verify indexer: score all query tokens of a
     # request (e.g. the K+1 MTP verify tokens) in one query block of this many
     # tokens, sharing one stream over the request's compressed keys instead of

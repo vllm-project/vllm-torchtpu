@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import jax
+import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.kernels.qwen4_exp.gdn_input import (
     compact_qkv_input,
@@ -39,6 +41,14 @@ def prepare_gdn_input(
     """
     tokens, width = qkv.shape
     local_width = width // get_mesh_shape_product(mesh, _MODEL_AXIS)
+    if (
+        envs.VLLM_TPU_GDN_PREFILL_RAW_QKV
+        and envs.TPU_GDN_RAW_QKV
+        and qkv.dtype == jnp.bfloat16
+        and tokens % 16 == 0
+    ):
+        # The kernel reads the BF16 rows directly (fused_conv1d_gdn raw path).
+        return qkv
     if tokens <= request_capacity or not supports_compact_qkv(
         (tokens, local_width), qkv.dtype
     ):
