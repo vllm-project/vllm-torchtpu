@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GQA schedule options of the Qwen3.5 candidate4 schedule (CPU interpret).
+"""GQA / GDN schedule options of the Qwen3.5 candidate4 schedule (CPU interpret).
 
 Each option is moved alone on a tiny paged Qwen3.5 step, through the split
 pool I/O and the 1-launch fused pool I/O. An exact option keeps hidden states
@@ -53,7 +53,8 @@ def _mesh() -> Mesh:
 
 
 def _geom() -> qwen35.Qwen35Geometry:
-    # KH=4, VH=8 at R=2: kh=2, vh=4. NKV=1: both ranks share the KV head
+    # KH=4, VH=8 at R=2: kh=2, vh=4, so QKV=1024 and Z=512 are multiples of
+    # 512 (the z-chunk deferral's gate). NKV=1: both ranks share the KV head
     # (G=2), so the sequence-split attention and the Q exchange run, as at
     # the real geometry, and head-batched Q staging also engages at T=1.
     return qwen35.Qwen35Geometry(
@@ -155,9 +156,18 @@ _EXACT = [
         True,
     ),
 ]
+# Same arithmetic in another code shape on the fused GDN path: hidden states,
+# KV and conv pages bitwise; recurrent-state pages within the CPU-interpret
+# bound of `test_m3_cache_eplb` (T > 1: up to T - 1 bf16 ULP on t >= 1
+# checkpoints, from XLA CPU's per-shape fusion; T = 1 bitwise).
+_REC_ULP = [
+    ("lcv", "gdn", "lcv", True, "LCV", {}, True),
+    ("zdefer", "gdn", "zdefer", True, "ZDEF", {"lcv": True}, True),
+]
+
 # Decode (T=1) rechecks for one option per path; the rest run at the verify
 # shape only (interpret-mode cost).
-_DECODE_TOO = {"qswap-split", "gdefer-split"}
+_DECODE_TOO = {"qswap-split", "lcv", "gdefer-split"}
 
 
 def _cases(rows: list) -> list:
@@ -191,9 +201,59 @@ def test_exact_option_is_bit_identical(
     _assert_same(_run(T, B, on, fused), _run(T, B, off, fused))
 
 
+@pytest.mark.parametrize("module,opt,value,field,base,fused,T,B", _cases(_REC_ULP))
+def test_fused_gdn_option_up_to_cpu_rec_ulp(
+    module: str,
+    opt: str,
+    value: Any,
+    field: str,
+    base: dict,
+    fused: bool,
+    T: int,
+    B: int,
+):
+    from tests.megakernel.core.test_m3_cache_eplb import (
+        _pool_page_kinds,
+        _rec_pool_max_ulp,
+    )
+
+    off, on = _arms(module, opt, value, base)
+    assert getattr(_params(T, B, on, fused, module), field)
+    assert not getattr(_params(T, B, off, fused, module), field)
+    a, b = _run(T, B, on, fused), _run(T, B, off, fused)
+    np.testing.assert_array_equal(a[0], b[0])  # hidden states
+    if T == 1:
+        _assert_same(a, b)
+        return
+    g, ex = _geom(), _exec(T, B, off)
+    pt, ckpt, _, _ = mk.default_pool_layout(g, ex)
+    kinds = _pool_page_kinds(pt, ckpt, g_per_att=g.att_every - 1)
+    n_pages = mk.cache_exec(ex).num_pages
+    worst = max(_rec_pool_max_ulp(x, y, n_pages, kinds) for x, y in zip(a[1:], b[1:]))
+    print(f"{opt} T={T} B={B}: rec-state max {worst} bf16 ULP")
+    assert worst <= max(1, T - 1), worst
+
+
+@pytest.mark.parametrize("T,B", [(4, 8), (1, 4)])
+def test_mxu_dr_within_tolerance(T: int, B: int):
+    """MXU_DR reassociates the delta rule's dot products (approx): close to the
+    LCV recurrence, and it must change the arithmetic somewhere."""
+    lcv = {"gdn": {"lcv": True}}
+    mxu = {"gdn": {"lcv": True, "mxu_dr": True}}
+    assert _params(T, B, mxu, True, "gdn").MXU_DR
+    a, b = _run(T, B, lcv, True), _run(T, B, mxu, True)
+    np.testing.assert_allclose(_hidden_f32(b), _hidden_f32(a), atol=3e-2, rtol=3e-2)
+
+
+def test_lcv_and_mxu_dr_gates():
+    """LCV needs fused pool I/O; MXU_DR needs LCV."""
+    assert not _params(4, 8, {"gdn": {"lcv": True}}, False, "gdn").LCV
+    assert not _params(4, 8, {"gdn": {"mxu_dr": True}}, True, "gdn").MXU_DR
+
+
 def test_deferral_gates():
     """gdefer needs a ring slot per att_in tile and an unrolled or paired
-    att_in; kvdefer / wgroup need gdefer."""
+    att_in; kvdefer / wgroup need gdefer; zdefer needs LCV."""
     assert _params(4, 8, {"gqa": {"gdefer": True}}, False, "gqa").GA == 2
     shallow = {"gqa": {"gdefer": True}, "tiles": {"dmm_unroll": 0, "nbd": 1}}
     with pytest.raises(mk.MegakernelConfigError):
@@ -205,6 +265,7 @@ def test_deferral_gates():
     assert not _params(4, 8, no_pair, False, "gqa").GDEF
     assert not _params(4, 8, {"gqa": {"kvdefer": True}}, False, "gqa").KVDEF
     assert not _params(4, 8, {"gqa": {"wgroup": True}}, False, "gqa").WGROUP
+    assert not _params(4, 8, {"gdn": {"zdefer": True}}, True, "gdn").ZDEF
 
 
 def test_qswap_needs_head_batched_q():

@@ -96,6 +96,21 @@ class GDNParams:
     # Pool layout of the model's pool backend (set only for pool I/O: GPR or
     # fused); the slot geometry above and `page_base` come from it.
     pool_layout: Any = None
+    # `GDNTunables.lcv` resolved (fused pool I/O, KD == VD == 128, bf16 conv
+    # pages): each sequence's conv window is assembled in VMEM `gdn_cq` rows
+    # (the 3 cached taps, then the T new inputs; one 128-lane row per head
+    # chunk), so the conv reads and the new conv checkpoints are row slices.
+    LCV: bool = False
+    LCV_NH: int = 0  # rows of the 3 cached taps (3 * qkv_128)
+    LCV_NH16: int = 0  # LCV_NH rounded up to 16 (bf16 conv page rows read / written)
+    LCV_ROWS: int = 0  # gdn_cq rows
+    # `GDNTunables.mxu_dr` resolved (with LCV): the delta-rule prediction and
+    # output dot products on the MXU from a 3-term bf16 split of k and q.
+    MXU_DR: bool = False
+    # `GDNTunables.zdefer` resolved (with LCV, unrolled lin_in): lin_in's tiles
+    # are taken at once, the z-gate column chunks (512 lanes) are summed in
+    # shares inside the recurrence, and the z gate is applied after it.
+    ZDEF: bool = False
 
 
 @dataclass(frozen=True)
@@ -121,9 +136,9 @@ class GDNTunables:
         "conv_stage": "approx",  # fused-path conv staging
         "gdn_head_major": "approx",  # head-major state update (reassociates)
         # `approx` until a bit-identity flip (`EXACT_FLIPS`) shows otherwise.
-        "lcv": "approx",
+        "lcv": "approx",  # rec-state ULP on CPU interpret (see test_mixer_cand4)
         "mxu_dr": "approx",
-        "zdefer": "approx",
+        "zdefer": "approx",  # rides on lcv
     }
 
 
@@ -282,6 +297,18 @@ def derive_params(
     NGO = min(ex.NS, 2) if cache_exec(ex).FUSED else 0
     K_ckpt = cache_exec(ex).ckpt_k if cache_exec(ex).ckpt_k > 0 else T
     ckpt_t_off = K_ckpt - T if K_ckpt > T else 0
+    lcv_nh = 3 * qkv_128
+    lcv_nh16 = round_up(lcv_nh, 16)
+    lcv = bool(
+        tt.lcv
+        and cache_exec(ex).FUSED
+        and ngdn > 0
+        and lay.KD == 128
+        and lay.VD == 128
+        and 2 * lay.kh * lay.KD + lay.vh * lay.VD == lay.QKV
+        and not conv_is_f32
+        and lcv_nh16 <= conv8_rows
+    )
 
     return GDNParams(
         kh=lay.kh,
@@ -331,6 +358,19 @@ def derive_params(
         in_scaled=bool(in_scaled),
         out_scaled=bool(out_scaled),
         pool_layout=pool_layout,
+        LCV=lcv,
+        LCV_NH=lcv_nh if lcv else 0,
+        LCV_NH16=lcv_nh16 if lcv else 0,
+        LCV_ROWS=round_up(max((T + 3) * qkv_128, lcv_nh16), 8) if lcv else 0,
+        MXU_DR=bool(lcv and tt.mxu_dr),
+        ZDEF=bool(
+            lcv
+            and tt.zdefer
+            and plan.nt["lin_in"] <= min(tiles.dmm_unroll, tiles.nbd)
+            and lay.QKV % 512 == 0
+            and lay.Z % 512 == 0
+            and lay.QKV + lay.Z < lay.NLI
+        ),
     )
 
 
