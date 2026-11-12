@@ -346,7 +346,7 @@ def test_flag_routes_dcp_prefill_to_union_walk(monkeypatch, slot):
     # The served defaults (alpha 0.2, sampled precheck) trace too.
     _set_env(monkeypatch.setenv, True, {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.6",
                                         "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "8",
-                                        "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": "0.75,2.2e-5,1.0,8e-3"})
+                                        "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": "0.15,2.31e-5,0.17,7.2e-3"})
     served = _jaxpr(True, slot)
     assert "qsa_union_walk_g128_kv1024_lean_fast_pg_lse" in served and served != on
     # Variants the DCP walk does not support keep the block-sparse kernel.
@@ -362,6 +362,34 @@ def test_flag_leaves_replicated_route_unchanged(monkeypatch):
     on = _jaxpr(None)
     assert on == off
     assert "qsa_union_walk_g128_kv1024_lean_fast_pg" in on and "fast_pg_lse" not in on
+
+
+# j-9a871b0e (served shape: top-k 512 groups, c32 env, rank 0): (rows, sampled union groups, owned pages
+# touched, forced walk ms, block-sparse ms) per selection model; one sampled 1024-row block per step.
+SERVED_SWEEP = {
+    "8k_corr10": (8192, 27359, 71, 6.508, 5.699), "8k_tight2": (8192, 7081, 71, 2.797, 5.715),
+    "8k_random": (8192, 70718, 71, 14.386, 5.693), "8k_hot0.05": (8192, 3906, 71, 2.013, 5.700),
+    "8k_hot0.1": (8192, 7577, 71, 2.711, 5.705), "8k_hot0.2": (8192, 14780, 71, 4.165, 5.701),
+    "8k_pages0.1": (8192, 7296, 8, 2.704, 2.065), "8k_pages0.2": (8192, 14464, 15, 4.153, 2.561),
+    "8k_pages0.36": (8192, 24703, 25, 5.857, 3.079), "4k_corr10": (4096, 23432, 40, 2.834, 1.631),
+    "4k_tight2": (4096, 6990, 40, 1.335, 1.643), "4k_random": (4096, 39753, 40, 4.102, 1.644),
+    "4k_hot0.1": (4096, 4109, 40, 0.925, 1.645), "4k_pages0.2": (4096, 5248, 7, 1.117, 0.706),
+}
+
+
+def test_default_cost_model_picks_the_faster_kernel():
+    """The default VLLM_TPU_QSA_PREFILL_UNION_DCP_COST on the measured served-shape sweep (in-sample)."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import _union_dcp_cost
+
+    assert envs.VLLM_TPU_QSA_PREFILL_UNION_DCP_COST == "0.15,2.31e-5,0.17,7.2e-3"
+    walk_fixed, per_group, sparse_fixed, per_page = _union_dcp_cost()
+    for name, (rows, union, pages, walk_ms, sparse_ms) in SERVED_SWEEP.items():
+        take_walk = walk_fixed + per_group * union < sparse_fixed + per_page * pages
+        assert take_walk == (walk_ms < sparse_ms), (name, take_walk, walk_ms, sparse_ms)
+        blocks = rows // 1024  # the model's per-block times, summed, within 25% of the measurement
+        assert abs(blocks * (walk_fixed + per_group * union) / walk_ms - 1) < 0.25, name
+        assert abs(blocks * (sparse_fixed + per_page * pages) / sparse_ms - 1) < 0.25 or rows == 4096, name
 
 
 # ----------------------------------------------------------------------------
@@ -440,7 +468,7 @@ ARMS = {
                     "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": "off"},
     # The served defaults: precheck 8 with the cost model, alpha 0.6 backstop.
     "served": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.6", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "8",
-               "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": "0.75,2.2e-5,1.0,8e-3"},
+               "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": "0.15,2.31e-5,0.17,7.2e-3"},
     "alpha0.2_pc8": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.2", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "8",
                      "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": "off"},
 }

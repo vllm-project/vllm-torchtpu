@@ -147,7 +147,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY: str = "vmem"
     VLLM_TPU_QSA_PREFILL_UNION_DCP: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA: float = 0.6
-    VLLM_TPU_QSA_PREFILL_UNION_DCP_COST: str = "0.75,2.2e-5,1.0,8e-3"
+    VLLM_TPU_QSA_PREFILL_UNION_DCP_COST: str = "0.15,2.31e-5,0.17,7.2e-3"
     VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK: int = 8
     VLLM_TPU_QSA_PREFILL_UNION_PROBE: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_PROBE_LAYERS: str = ""
@@ -1072,16 +1072,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # there): fall back to block-sparse when any 128-row group's owned union
     # exceeds this fraction of its owned visible groups (0 = off). A backstop:
     # the walk's win depends on the block-sparse kernel's page coverage too,
-    # which DCP_COST models (j-7a3ce29d: union 20% spread over every page 1.44x,
-    # 36% page-local 0.95x).
+    # which DCP_COST models (j-9a871b0e, 8K chunk / 75K context: a 20% union
+    # spread over every page walks 1.37x faster, a 10% page-local one 0.76x).
     "VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": env_float("VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA", 0.6),
     # DCP_COST (with DCP_PRECHECK; "" / "off" = alpha only): ms per 1024-row
     # block "walk_fixed,walk_per_group,sparse_fixed,sparse_per_page"; the
     # precheck's sample takes the walk only when its modelled walk time is
     # below the block-sparse time for the owned pages its union touches.
-    # Default fitted on j-7a3ce29d (8K chunk, 74K context, top-k 2048).
+    # Default fitted on j-9a871b0e at the served shape (top-k 2048 tokens =
+    # 512 groups, served c32 env, 6 gathered heads; 8K chunk / 75K context and
+    # 4K / 40K, nine selection models): it picks the faster kernel in all 14
+    # cases (walk 1.2-2.8x on sparse unions, block-sparse on corr10, dense
+    # and page-local unions; the precheck costs ~0.1 ms per 8K step).
     "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": env_str(
-        "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST", "0.75,2.2e-5,1.0,8e-3"
+        "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST", "0.15,2.31e-5,0.17,7.2e-3"
     ),
     # DCP_PRECHECK=<stride> (with DCP and DCP_ALPHA; 0 = off): check alpha on
     # every stride-th 128-row tile before the full plan, so a dense step goes
