@@ -66,6 +66,8 @@ def _slab_kernel(
     acc_ref,  # VMEM [tb, H] f32
     gx_ref,  # VMEM [xcap, H] f32
     sems,  # DMA (2,)
+    *,
+    col_chunk: int,
 ):
     b = pl.program_id(0)
     nb = pl.num_programs(0)
@@ -135,13 +137,19 @@ def _slab_kernel(
     gx_ref[...] = jnp.zeros_like(gx_ref)
     lanes = lax.broadcasted_iota(jnp.int32, (1, rows_g), 1)
 
+    cc = min(col_chunk or hidden, hidden)
+    assert hidden % cc == 0
+
     def group(g, c):
         base = g * rows_g
-        s = stage[slot, pl.ds(pl.multiple_of(base, rows_g), rows_g), :]
-        p0 = (srow0 == lanes + base).astype(s.dtype)
-        acc_ref[...] += jnp.dot(p0, s, preferred_element_type=jnp.float32)
-        px = (srowx == lanes + base).astype(s.dtype)
-        gx_ref[...] += jnp.dot(px, s, preferred_element_type=jnp.float32)
+        rows = pl.ds(pl.multiple_of(base, rows_g), rows_g)
+        p0 = (srow0 == lanes + base).astype(stage.dtype)
+        px = (srowx == lanes + base).astype(stage.dtype)
+        for c0 in range(0, hidden, cc):
+            cols = pl.ds(c0, cc)
+            s = stage[slot, rows, cols]
+            acc_ref[:, cols] += jnp.dot(p0, s, preferred_element_type=jnp.float32)
+            gx_ref[:, cols] += jnp.dot(px, s, preferred_element_type=jnp.float32)
         return c
 
     lax.fori_loop(0, ng, group, 0)
@@ -226,7 +234,8 @@ def tc_slab_combine_ok(num_tokens: int, hidden: int, tb: int = 256) -> bool:
 
 
 @functools.partial(
-    jax.jit, static_argnames=("topk", "tb", "scap", "xcap", "interpret", "vmem_mb")
+    jax.jit,
+    static_argnames=("topk", "tb", "scap", "xcap", "col_chunk", "interpret", "vmem_mb"),
 )
 def tc_slab_combine(
     y,
@@ -238,6 +247,7 @@ def tc_slab_combine(
     tb: int = 256,
     scap: int = 64,
     xcap: int = 128,
+    col_chunk: int = 1024,
     interpret: bool = False,
     vmem_mb: int = 60,
 ):
@@ -248,7 +258,7 @@ def tc_slab_combine(
     md = slab_metadata(indices, weights, valid, topk=topk, tb=tb, scap=scap, xcap=xcap)
     smem = pltpu.MemorySpace.SMEM if hasattr(pltpu, "MemorySpace") else pltpu.SMEM
     out = pl.pallas_call(
-        _slab_kernel,
+        functools.partial(_slab_kernel, col_chunk=col_chunk),
         out_shape=jax.ShapeDtypeStruct((t, hidden), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4,
