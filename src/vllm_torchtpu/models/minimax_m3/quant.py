@@ -45,6 +45,11 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 )
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.minimax_m3.kernels.mxfp8_w8a16 import (
+    mxfp8_w8a16_linear,
+    mxfp8_w8a16_op,
+    supports_shape,
+)
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -175,10 +180,6 @@ class MiniMaxM3Mxfp8W8A16LinearMethod(MiniMaxM3Mxfp8LinearMethod):
         self.max_rows = max_rows
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from vllm_torchtpu.models.minimax_m3.kernels.mxfp8_w8a16 import (
-            supports_shape,
-        )
-
         if hasattr(layer, "weight_w8"):
             return  # reload paths re-enter this hook
         n, k = layer.weight.shape
@@ -188,6 +189,9 @@ class MiniMaxM3Mxfp8W8A16LinearMethod(MiniMaxM3Mxfp8LinearMethod):
         super().process_weights_after_loading(layer)
         if w8 is None:
             return
+        # Build the torch op outside the compiled forward (its cache lock
+        # cannot be traced).
+        mxfp8_w8a16_op()
         layer.register_parameter(
             "weight_w8", torch.nn.Parameter(w8.to(layer.weight.device), requires_grad=False)
         )
@@ -217,10 +221,6 @@ class MiniMaxM3Mxfp8W8A16LinearMethod(MiniMaxM3Mxfp8LinearMethod):
         rows = x.numel() // x.shape[-1]
         if bias is not None or not hasattr(layer, "weight_w8") or rows > self.max_rows:
             return super().apply(layer, x, bias)
-        from vllm_torchtpu.models.minimax_m3.kernels.mxfp8_w8a16 import (
-            mxfp8_w8a16_linear,
-        )
-
         return mxfp8_w8a16_linear(x, layer.weight_w8, layer.weight_w8_scale)
 
 

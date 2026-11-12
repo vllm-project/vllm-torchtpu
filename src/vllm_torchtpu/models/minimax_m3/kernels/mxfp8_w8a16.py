@@ -95,7 +95,8 @@ _op: Callable | None = None
 _op_lock = Lock()
 
 
-def _get_op() -> Callable:
+def mxfp8_w8a16_op() -> Callable:
+    """The cached torch op; call once eagerly before tracing a forward."""
     global _op
     if _op is not None:
         return _op
@@ -119,4 +120,4 @@ def mxfp8_w8a16_linear(
 ) -> torch.Tensor:
     """Torch entry: ``x [..., k] @ w8a16(w [k, n], scale [k // 32, n])``."""
     out_shape = (*x.shape[:-1], w.shape[1])
-    return _get_op()(x.reshape(-1, x.shape[-1]), w, scale).reshape(out_shape)
+    return mxfp8_w8a16_op()(x.reshape(-1, x.shape[-1]), w, scale).reshape(out_shape)
