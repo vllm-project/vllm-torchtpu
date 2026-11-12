@@ -5759,6 +5759,11 @@ class TPUModelRunner(GPUModelRunner):
         return async_output
 
     def load_model(self) -> None:
+        if envs.TPU_SPEC_GATHER_EMBEDDING:
+            logger.info(
+                "TPU_SPEC_GATHER_EMBEDDING=1: non-greedy verify gathers its "
+                "bonus/target logits rows with F.embedding."
+            )
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
@@ -8946,6 +8951,13 @@ class TPUModelRunner(GPUModelRunner):
         # logits[indices] gathers are eager ops torch-tpu's DEFER_AND_FUSE fuses
         # with the live per-step dispatch into per-context programs (cold
         # recompiles).index_select is value-identical to logits[indices].
+        if envs.TPU_SPEC_GATHER_EMBEDDING:
+            # In-bounds row gather (TPU_SPEC_GATHER_EMBEDDING): same rows.
+            bonus_logits = torch.nn.functional.embedding(bonus_logits_indices, logits)
+            target_logits = torch.nn.functional.embedding(
+                target_logits_indices, logits
+            )
+            return bonus_logits, target_logits
         bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_logits, target_logits

@@ -131,6 +131,7 @@ if TYPE_CHECKING:
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY: bool = True
     TPU_SPEC_GLUE_FUSION: bool = False
+    TPU_SPEC_GATHER_EMBEDDING: bool = False
     TPU_SPEC_SYNTHETIC_INGRAPH_RNG: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -978,6 +979,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # positions correction) as two compiled programs instead of about eight
     # eager ones. Integer ops only; same values.
     "TPU_SPEC_GLUE_FUSION": env_bool("TPU_SPEC_GLUE_FUSION", default=False),
+    # Gather the non-greedy verify's bonus and target logits rows with
+    # F.embedding (an in-bounds row gather) instead of index_select, which
+    # lowers to an out-of-bounds-filling gather that reassembles the
+    # [T, vocab] rows in vocab chunks (pad + maximum): 54 -> 9 us at T=48.
+    # Same values: the indices are always in bounds (padding rows use 0).
+    "TPU_SPEC_GATHER_EMBEDDING": env_bool("TPU_SPEC_GATHER_EMBEDDING", default=False),
     # Under the synthetic one-row verify, draw the accept and recovery
     # uniforms inside the two compiled sampler programs from a device counter
     # (keyed counter-based hash, 24-bit uniforms like torch.rand) instead of
