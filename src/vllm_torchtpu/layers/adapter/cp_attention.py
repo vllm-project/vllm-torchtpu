@@ -302,6 +302,8 @@ def forward_with_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF,
+    tuned_tiles: bool = False,
 ) -> torch.Tensor:
     """Two-pass DCP attention forward.
     1. CACHE_ONLY: query is all-gathered by heads to attend every rank's KV
@@ -310,6 +312,9 @@ def forward_with_dcp(
         full local K/V for this step), so this rank's own heads attend
             directly; no gather/combine needed.
 
+    `attention_modes` and `tuned_tiles` must be the layer's, as given to
+    `build_dcp_kernels` when its kernels were prebuilt: the lookup below then
+    finds those ops instead of building new ones while torch.compile traces.
     """
     dcp_group = get_dcp_group()
     if dcp_group is None:
@@ -330,6 +335,8 @@ def forward_with_dcp(
         cp_rank=dcp_rank,
         kv_layout=kv_layout,
         decode_query_size=decode_query_size,
+        attention_modes=attention_modes,
+        tuned_tiles=tuned_tiles,
     )
 
     query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)

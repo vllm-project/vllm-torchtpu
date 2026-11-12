@@ -1252,6 +1252,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_rank=self.dcp_rank,
             kv_layout=self.kv_layout,
             decode_query_size=self.decode_query_size,
+            attention_modes=native_fp8_scope.effective(
+                self.attention_modes, self.native_fp8_draft
+            ),
+            tuned_tiles=self.tuned_tiles,
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
