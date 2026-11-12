@@ -206,8 +206,11 @@ def test_compiled_outside_the_warmup_keeps_vllm_collectives():
 
 
 def test_prebuild_records_this_rank_and_the_mesh_core_of_every_rank(monkeypatch):
+    import numpy as np
+
     monkeypatch.setenv("TPU_SMALL_ALL_REDUCE_MAX_ROWS", str(CAP))
     monkeypatch.setenv("TPU_SMALL_ALL_REDUCE_FORM", "TwoShot")
+    monkeypatch.setenv("TPU_SMALL_REDUCE_SCATTER_HIERARCHICAL", "1")
     for name in (
         "_ALL_REDUCE_OP",
         "_REDUCE_SCATTER_OP",
@@ -216,7 +219,10 @@ def test_prebuild_records_this_rank_and_the_mesh_core_of_every_rank(monkeypatch)
         "_CORE_OF_RANK",
     ):
         monkeypatch.setattr(op, name, None)
-    mesh = SimpleNamespace(shape={op.EP_AXIS_NAME: N})
+    dual_core_devs = np.asarray(
+        [SimpleNamespace(id=i, device_kind="TPU7x") for i in range(N)], dtype=object
+    )
+    mesh = SimpleNamespace(shape={op.EP_AXIS_NAME: N}, devices=dual_core_devs)
     built = {}
     monkeypatch.setattr(op, "build_ep_mesh", lambda: mesh)
     monkeypatch.setattr(
@@ -227,10 +233,15 @@ def test_prebuild_records_this_rank_and_the_mesh_core_of_every_rank(monkeypatch)
     monkeypatch.setattr(
         op, "_build_all_reduce", lambda m, form: built.setdefault("form", form)
     )
-    monkeypatch.setattr(op, "_build_reduce_scatter", lambda m: "reduce_scatter")
+    monkeypatch.setattr(
+        op,
+        "_build_reduce_scatter",
+        lambda m, *, hierarchical=False: built.setdefault("hierarchical", hierarchical),
+    )
 
     assert op.prebuild(torch.device("cpu"))
     assert built["form"] == "twoshot"
+    assert built["hierarchical"] is True
     assert op._MESH_INDEX.tolist() == [2]
     assert op._RANK_IN_MESH.tolist() == [6]
     # rank r is served by mesh core core_of_rank[r]
@@ -269,3 +280,109 @@ def test_builders_pass_sharded_output_partition_spec_to_jax_op(monkeypatch):
     assert recorded[1][0] == op.REDUCE_SCATTER_OP_NAME
     assert recorded[1][1]["input_partition_specs"] == (expected,) * 4
     assert recorded[1][1]["output_partition_specs"] == expected
+
+
+def test_build_reduce_scatter_gates_hierarchical_on_dual_core_mesh(monkeypatch):
+    """_build_reduce_scatter enables the two-stage kernel only when both the
+    knob is set and the mesh pairs dual-core chip mates."""
+    import numpy as np
+
+    seen_hierarchical = []
+
+    def fake_shard_map(body_fn, **kwargs):
+        def runner(x, mi, mr, cr):
+            return body_fn(x, mi, mr, cr)
+
+        return runner
+
+    monkeypatch.setattr(op.jax, "shard_map", fake_shard_map)
+    monkeypatch.setattr(
+        op.sgs,
+        "small_reduce_scatter",
+        lambda block, **kw: seen_hierarchical.append(kw["hierarchical"]) or block,
+    )
+
+    captured_fns = []
+    monkeypatch.setattr(
+        op.pallas,
+        "jax_op",
+        lambda name, fn, **kw: captured_fns.append(fn)
+        or SimpleNamespace(register_fake=lambda f: f),
+    )
+
+    dual_core_devs = np.asarray(
+        [SimpleNamespace(id=i, device_kind="TPU7x") for i in range(N)], dtype=object
+    )
+    single_core_devs = np.asarray(
+        [SimpleNamespace(id=i, device_kind="TPU v6e") for i in range(N)], dtype=object
+    )
+
+    op._build_reduce_scatter(
+        SimpleNamespace(shape={op.EP_AXIS_NAME: N}, devices=dual_core_devs),
+        hierarchical=True,
+    )
+    op._build_reduce_scatter(
+        SimpleNamespace(shape={op.EP_AXIS_NAME: N}, devices=dual_core_devs),
+        hierarchical=False,
+    )
+    op._build_reduce_scatter(
+        SimpleNamespace(shape={op.EP_AXIS_NAME: N}, devices=single_core_devs),
+        hierarchical=True,
+    )
+    for fn in captured_fns:
+        fn("x", "mi", "mr", "cr")
+
+    assert seen_hierarchical == [True, False, False]
+
+
+def test_prebuild_warns_and_disables_hierarchical_on_ineligible_mesh(
+    monkeypatch, caplog
+):
+    """prebuild warns once and passes hierarchical=False when the env knob is
+    enabled on a single-core-per-chip mesh."""
+    import logging
+
+    import numpy as np
+
+    monkeypatch.setenv("TPU_SMALL_ALL_REDUCE_MAX_ROWS", str(CAP))
+    monkeypatch.setenv("TPU_SMALL_REDUCE_SCATTER_HIERARCHICAL", "1")
+    monkeypatch.setattr(op, "_ALL_REDUCE_OP", None)
+    monkeypatch.setattr(op, "_REDUCE_SCATTER_OP", None)
+    v6e_devs = np.asarray(
+        [SimpleNamespace(id=i, device_kind="TPU v6e") for i in range(N)],
+        dtype=object,
+    )
+    monkeypatch.setattr(
+        op,
+        "build_ep_mesh",
+        lambda: SimpleNamespace(shape={op.EP_AXIS_NAME: N}, devices=v6e_devs),
+    )
+    monkeypatch.setattr(
+        op,
+        "get_ep_group",
+        lambda: SimpleNamespace(ranks=list(MESH_RANKS), rank_in_group=0),
+    )
+    monkeypatch.setattr(op, "ep_rank_order", lambda: RANK_OF_CORE)
+    monkeypatch.setattr(op, "ep_mesh_index", lambda: 0)
+
+    seen_hierarchical = []
+    monkeypatch.setattr(op, "_build_all_reduce", lambda mesh, form: _kernel_all_reduce)
+    monkeypatch.setattr(
+        op,
+        "_build_reduce_scatter",
+        lambda mesh, hierarchical=False: seen_hierarchical.append(hierarchical)
+        or _kernel_reduce_scatter,
+    )
+
+    with caplog.at_level(logging.INFO):
+        assert op.prebuild(torch.device("cpu"))
+
+    assert seen_hierarchical == [False]
+    assert any(
+        "falling back to one-stage reduce-scatter" in rec.getMessage()
+        for rec in caplog.records
+    )
+    assert any(
+        "hierarchical_reduce_scatter=False" in rec.getMessage()
+        for rec in caplog.records
+    )

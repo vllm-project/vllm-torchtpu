@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
     TPU_SMALL_ALL_REDUCE_FORM: str | None = None
+    TPU_SMALL_REDUCE_SCATTER_HIERARCHICAL: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
@@ -740,6 +741,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # then all-gather). Unset picks one-shot up to 32 KiB per core.
     "TPU_SMALL_ALL_REDUCE_FORM": env_with_choices(
         "TPU_SMALL_ALL_REDUCE_FORM", None, ["oneshot", "twoshot"], case_sensitive=False
+    ),
+    # Run the small MoE combine reduce-scatter in two stages on meshes that
+    # pair dual-core TPU chips across a power-of-two chip count (>= 2): first
+    # exchange and reduce partner blocks between the two cores of each physical
+    # chip, then push one reduced block per remote chip over ICI. Falls back to
+    # the one-stage kernel on ineligible meshes or when two-stage buffers
+    # exceed the scoped VMEM budget.
+    "TPU_SMALL_REDUCE_SCATTER_HIERARCHICAL": env_bool(
+        "TPU_SMALL_REDUCE_SCATTER_HIERARCHICAL", default=False
     ),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
