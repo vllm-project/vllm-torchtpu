@@ -56,7 +56,11 @@ from test_dcp2_prefill import (  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not ON_TPU, reason="DCP2_HARNESS_DEVICE=tpu only")
 
-FLAG = "VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX"
+# The same gate serves VLLM_TPU_QSA_PREFILL_LANE_SUM: DCP2_FLAG / DCP2_FLAG_ON
+# select the flag under test (the guard test is lazy-softmax only).
+LAZY_FLAG = "VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX"
+FLAG = os.environ.get("DCP2_FLAG", LAZY_FLAG)
+FLAG_ON = os.environ.get("DCP2_FLAG_ON", "1")
 SERVED_ENV = {"VLLM_TPU_QSA_PREFILL_LEAN": "1", "VLLM_TPU_QSA_DCP_SPLIT_LSE": "1"}
 
 PREFILL = {
@@ -66,6 +70,7 @@ PREFILL = {
     # Fresh request: rank 1 owns nothing for rows 1..511.
     "ragged_mix": [(5000, 1000), (0, 700), (9003, 347), (2047, 1)],
 }
+SLOT1 = {"c8192_p1234_slot1": [(1234, 8192)]}  # paired main-KV layer slot 1
 
 
 def with_flag(value, fn):
@@ -129,7 +134,7 @@ def error_stats(out, ref):
 
 def check_lazy_case(case):
     today = with_flag("", lambda: kernel_partials(case))
-    lazy = with_flag("1", lambda: kernel_partials(case))
+    lazy = with_flag(FLAG_ON, lambda: kernel_partials(case))
     ref = reference_partials(case)
     report = {}
     for r in range(D):
@@ -145,13 +150,20 @@ def check_lazy_case(case):
                 f"rank {r} {k}: lazy {e_lazy[k]:.3g} > 2 x today {e_today[k]:.3g}")
         report[f"rank{r}"] = dict(today=e_today, lazy=e_lazy,
                                   bitwise_vs_today=float(np.mean(lazy[r][0] == today[r][0])))
-    report["gate"] = with_flag("1", lambda: check_production_prefill(case))
+    report["gate"] = with_flag(FLAG_ON, lambda: check_production_prefill(case))
     return report
 
 
 @pytest.mark.parametrize("name", sorted(PREFILL))
 def test_lazy_softmax_prefill(name):
     case = prefill_case(np.random.default_rng(len(name)), PREFILL[name], budget=512)
+    print(name, check_lazy_case(case))
+
+
+@pytest.mark.parametrize("name", sorted(SLOT1))
+def test_lazy_softmax_prefill_slot1(name):
+    case = prefill_case(np.random.default_rng(len(name) + 1), SLOT1[name], budget=512,
+                        kv_head_offset=1)
     print(name, check_lazy_case(case))
 
 
@@ -171,7 +183,7 @@ def guard_case():
 def test_lazy_softmax_guard_fires():
     case = guard_case()
     today = with_flag("", lambda: kernel_partials(case))
-    lazy = with_flag("1", lambda: kernel_partials(case))
+    lazy = with_flag(FLAG_ON, lambda: kernel_partials(case))
     for r in range(D):
         for a, b, what in ((lazy[r][0], today[r][0], "out"), (lazy[r][1], today[r][1], "lse")):
             assert np.array_equal(a, b, equal_nan=True), (
@@ -197,8 +209,10 @@ if __name__ == "__main__":
     for k, v in SERVED_ENV.items():
         os.environ.setdefault(k, v)
     tests = [(f"prefill[{n}]", lambda n=n: test_lazy_softmax_prefill(n)) for n in sorted(PREFILL)]
-    tests += [("nan_padding", test_lazy_softmax_nan_padding),
-              ("guard_fires", test_lazy_softmax_guard_fires)]
+    tests += [(f"slot1[{n}]", lambda n=n: test_lazy_softmax_prefill_slot1(n)) for n in SLOT1]
+    tests += [("nan_padding", test_lazy_softmax_nan_padding)]
+    if FLAG == LAZY_FLAG:
+        tests += [("guard_fires", test_lazy_softmax_guard_fires)]
     only = sys.argv[1:]
     failures = 0
     for name, fn in tests:
