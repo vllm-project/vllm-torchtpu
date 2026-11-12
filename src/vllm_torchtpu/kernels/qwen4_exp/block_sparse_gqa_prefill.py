@@ -52,6 +52,21 @@ def vpu_features():
     return tuple(name for name in VPU_FEATURES if name in names)
 
 
+LAZY_SOFTMAX_TOKENS = ("nobranch", "noguard")
+
+
+def lazy_softmax_features():
+    """VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX as a feature tuple; () when off."""
+    raw = envs.VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX
+    if raw in ("", "0"):
+        return ()
+    names = {name.strip() for name in raw.split(",") if name.strip()} - {"1"}
+    unknown = sorted(names - set(LAZY_SOFTMAX_TOKENS))
+    if unknown:
+        raise ValueError(f"Unknown VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX tokens: {unknown}")
+    return ("on",) + tuple(name for name in LAZY_SOFTMAX_TOKENS if name in names)
+
+
 def default_query_tile(query_block):
     """Query subtile used when the tile table does not choose one."""
     return min(query_block, 256)
@@ -366,6 +381,7 @@ def _kernel(
     dcp_world: int = 1,
     vpu: tuple = (),
     page_copies: bool = False,
+    lazy: tuple = (),
 ):
     # DCP: a fourth scalar operand holds this rank; its KV tiles are its owned
     # page-sized blocks only (local tile t is global block t * dcp_world + rank).
@@ -378,9 +394,12 @@ def _kernel(
     query_ref, bitset_ref, lengths_ref, cache_ref, output_ref = refs[:5]
     refs = refs[5:]
     lse_ref = refs[0] if return_lse else None
-    kv0_ref, kv1_ref, sem0_ref, sem1_ref, max_ref, mass_ref, accumulator_ref = refs[
-        1 if return_lse else 0 :
-    ]
+    refs = refs[1 if return_lse else 0 :]
+    kv0_ref, kv1_ref, sem0_ref, sem1_ref, max_ref, mass_ref, accumulator_ref = refs[:7]
+    # VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX: one stabilizer per (query subtile,
+    # KV head), lane-replicated; lane-partial masses; per-query "has a
+    # visible key" bits for the underflow guard.
+    stab_ref, partial_ref, has_key_ref = refs[7:10] if lazy else (None,) * 3
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
     # FP32 input window while preserving the existing FP32 QK accumulation.
@@ -479,12 +498,79 @@ def _kernel(
 
     # Larger query blocks reuse one resident KV tile across query subtiles.
     num_query_tiles = query_block // query_tile
-    # Preserve -inf initialization and all-masked-row guards exactly.
-    max_ref[...] = jnp.full(max_ref.shape, -jnp.inf, jnp.float32)
-    mass_ref[...] = jnp.zeros(mass_ref.shape, jnp.float32)
-    accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
 
-    def compute_tile(tile, kv_ref):
+    def init_state():
+        # Preserve -inf initialization and all-masked-row guards exactly.
+        max_ref[...] = jnp.full(max_ref.shape, -jnp.inf, jnp.float32)
+        mass_ref[...] = jnp.zeros(mass_ref.shape, jnp.float32)
+        accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
+
+    if lazy:
+        stab_ref[...] = jnp.full(stab_ref.shape, -jnp.inf, jnp.float32)
+        partial_ref[...] = jnp.zeros(partial_ref.shape, jnp.float32)
+        has_key_ref[...] = jnp.zeros(has_key_ref.shape, jnp.int32)
+        accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
+    else:
+        init_state()
+
+    def lazy_update(query_tile_index, head, score, value, tile_visible):
+        """Online softmax step with a block-scalar stabilizer.
+
+        ``stab`` only grows, by whole-tile maxima, and only when a tile
+        exceeds it by more than LAZY_SOFTMAX_SLACK, so probabilities stay
+        below e^slack and the accumulator is rescaled rarely. Masses are
+        kept as 128-lane partial sums and reduced once in the epilogue.
+        """
+        del tile_visible
+        tile_max = jnp.max(score, axis=(0, 1), keepdims=True)
+        old = stab_ref[query_tile_index, head][:, :1]
+        grow = tile_max > old + LAZY_SOFTMAX_SLACK
+        if "nobranch" in lazy:
+            new = jnp.where(grow, tile_max, old)
+            alpha = jnp.where(grow, jnp.exp(old - tile_max), 1.0)
+            accumulator_ref[query_tile_index, head] = (
+                accumulator_ref[query_tile_index, head] * alpha
+            )
+            partial_ref[query_tile_index, head] = (
+                partial_ref[query_tile_index, head] * alpha
+            )
+            stab_ref[query_tile_index, head] = jnp.broadcast_to(new, (1, 128))
+        else:
+
+            @pl.when(jnp.max(grow.astype(jnp.int32)) > 0)
+            def rescale():
+                # exp(-inf) = 0 clears nothing but zeros on the first raise.
+                alpha = jnp.exp(old - tile_max)
+                accumulator_ref[query_tile_index, head] = (
+                    accumulator_ref[query_tile_index, head] * alpha
+                )
+                partial_ref[query_tile_index, head] = (
+                    partial_ref[query_tile_index, head] * alpha
+                )
+                stab_ref[query_tile_index, head] = jnp.broadcast_to(
+                    tile_max, (1, 128)
+                )
+
+            new = stab_ref[query_tile_index, head][:, :1]
+        finite = jnp.where(jnp.isneginf(new), 0.0, new)
+        prob = jnp.exp(score - finite)
+        weighted = lax.dot(
+            prob,
+            value,
+            dimension_numbers=(([1], [0]), ([], [])),
+            preferred_element_type=jnp.float32,
+        )
+        accumulator_ref[query_tile_index, head] = (
+            accumulator_ref[query_tile_index, head] + weighted
+        )
+        lane_sum = prob[:, :128]
+        for offset in range(128, kv_tile, 128):
+            lane_sum = lane_sum + prob[:, offset : offset + 128]
+        partial_ref[query_tile_index, head] = (
+            partial_ref[query_tile_index, head] + lane_sum
+        )
+
+    def compute_tile(tile, kv_ref, lazy_pass=False):
         logical = tile * kv_tile
         if dcp_world > 1:
             # Global token position of this owned block (masks, causality).
@@ -514,6 +600,11 @@ def _kernel(
                 pieces.append(((word[:, None] >> group_in_tile[None, :]) & 1) != 0)
         visible = pieces[0] if parts == 1 else jnp.concatenate(pieces, axis=0)
         visible &= logical + row[None, :] <= positions[:, None]
+        if lazy_pass and "noguard" not in lazy:
+            seen = visible[:, :128]
+            for offset in range(128, kv_tile, 128):
+                seen = seen | visible[:, offset : offset + 128]
+            has_key_ref[...] = has_key_ref[...] | seen.astype(jnp.int32)
         written = logical + lax.broadcasted_iota(
             jnp.int32, (kv_tile, head_dim), 0
         ) < jnp.max(lengths_ref[:, 0])
@@ -540,9 +631,10 @@ def _kernel(
             start = query_tile_index * query_tile
             tile_visible = visible[start : start + query_tile]
             for head, (key, value) in enumerate(key_values):
-                m = max_ref[query_tile_index, head, :]
-                mass = mass_ref[query_tile_index, head, :]
-                acc = accumulator_ref[query_tile_index, head, :, :]
+                if not lazy_pass:
+                    m = max_ref[query_tile_index, head, :]
+                    mass = mass_ref[query_tile_index, head, :]
+                    acc = accumulator_ref[query_tile_index, head, :, :]
                 rows = query_tile * q_heads_per_kv
                 if bf16_mxu:
                     assert q16 is not None
@@ -568,6 +660,9 @@ def _kernel(
                     score * score_scale if bf16_mxu else score,
                     -jnp.inf,
                 )
+                if lazy_pass:
+                    lazy_update(query_tile_index, head, score, value, tile_visible)
+                    continue
                 next_m = jnp.maximum(m, jnp.max(score, axis=1))
                 finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
                 prob = jnp.exp(score - finite_m[:, None])
@@ -720,70 +815,136 @@ def _kernel(
             def boundary():
                 compute_tile_vpu(tile, kv_ref, True)
 
-    @pl.when(count > 0)
-    def prefetch_first():
-        start_tile(active_tile(0), kv0_ref, sem0_ref)
+    def run_tiles(tile_fn):
+        @pl.when(count > 0)
+        def prefetch_first():
+            start_tile(active_tile(0), kv0_ref, sem0_ref)
 
-    @pl.when(count > 1)
-    def prefetch_second():
-        start_tile(active_tile(1), kv1_ref, sem1_ref)
+        @pl.when(count > 1)
+        def prefetch_second():
+            start_tile(active_tile(1), kv1_ref, sem1_ref)
 
-    def pair_step(pair, _):
-        slot = pair * 2
-        tile = active_tile(slot)
-        wait_tile(tile, kv0_ref, sem0_ref)
-        compute_tile(tile, kv0_ref)
+        def pair_step(pair, _):
+            slot = pair * 2
+            tile = active_tile(slot)
+            wait_tile(tile, kv0_ref, sem0_ref)
+            tile_fn(tile, kv0_ref)
 
-        @pl.when(slot + 2 < count)
-        def prefetch_next_even():
-            start_tile(active_tile(slot + 2), kv0_ref, sem0_ref)
+            @pl.when(slot + 2 < count)
+            def prefetch_next_even():
+                start_tile(active_tile(slot + 2), kv0_ref, sem0_ref)
 
-        tile = active_tile(slot + 1)
-        wait_tile(tile, kv1_ref, sem1_ref)
-        compute_tile(tile, kv1_ref)
+            tile = active_tile(slot + 1)
+            wait_tile(tile, kv1_ref, sem1_ref)
+            tile_fn(tile, kv1_ref)
 
-        @pl.when(slot + 3 < count)
-        def prefetch_next_odd():
-            start_tile(active_tile(slot + 3), kv1_ref, sem1_ref)
+            @pl.when(slot + 3 < count)
+            def prefetch_next_odd():
+                start_tile(active_tile(slot + 3), kv1_ref, sem1_ref)
 
-        return None
+            return None
 
-    lax.fori_loop(0, count // 2, pair_step, None)
+        lax.fori_loop(0, count // 2, pair_step, None)
 
-    @pl.when(count % 2 != 0)
-    def consume_odd():
-        tile = active_tile(count - 1)
-        wait_tile(tile, kv0_ref, sem0_ref)
-        compute_tile(tile, kv0_ref)
+        @pl.when(count % 2 != 0)
+        def consume_odd():
+            tile = active_tile(count - 1)
+            wait_tile(tile, kv0_ref, sem0_ref)
+            tile_fn(tile, kv0_ref)
 
-    output_tiles = []
-    for query_tile_index in range(num_query_tiles):
-        heads = []
-        for head in range(kv_heads):
-            mass = mass_ref[query_tile_index, head, :]
-            acc = accumulator_ref[query_tile_index, head, :, :]
-            heads.append(
-                # The value scale is applied once here, not per KV tile.
-                (acc * (v_scale / jnp.where(mass == 0, 1, mass))[:, None])
-                .reshape(q_heads_per_kv, query_tile, head_dim)
-                .transpose(1, 0, 2)
-            )
-        output_tiles.append(jnp.concatenate(heads, axis=1))
-    output_ref[...] = jnp.concatenate(output_tiles, axis=0).astype(output_ref.dtype)
-    if return_lse:
-        # Natural-log sum of the scaled scores; -inf for a row with no key.
-        lse_tiles = []
+    def finalize(state):
+        """Write output (and lse) from ``state(q_tile, head, field)``."""
+        output_tiles = []
         for query_tile_index in range(num_query_tiles):
             heads = []
             for head in range(kv_heads):
-                m = max_ref[query_tile_index, head, :]
-                mass = mass_ref[query_tile_index, head, :]
-                lse = jnp.where(
-                    mass > 0, m + jnp.log(jnp.where(mass > 0, mass, 1)), -jnp.inf
+                mass = state(query_tile_index, head, "mass")
+                acc = accumulator_ref[query_tile_index, head, :, :]
+                heads.append(
+                    # The value scale is applied once here, not per KV tile.
+                    (acc * (v_scale / jnp.where(mass == 0, 1, mass))[:, None])
+                    .reshape(q_heads_per_kv, query_tile, head_dim)
+                    .transpose(1, 0, 2)
                 )
-                heads.append(lse.reshape(q_heads_per_kv, query_tile).T)
-            lse_tiles.append(jnp.concatenate(heads, axis=1))
-        lse_ref[...] = jnp.concatenate(lse_tiles, axis=0)
+            output_tiles.append(jnp.concatenate(heads, axis=1))
+        output_ref[...] = jnp.concatenate(output_tiles, axis=0).astype(
+            output_ref.dtype
+        )
+        if return_lse:
+            # Natural-log sum of the scaled scores; -inf for a row with no key.
+            lse_tiles = []
+            for query_tile_index in range(num_query_tiles):
+                heads = []
+                for head in range(kv_heads):
+                    m = state(query_tile_index, head, "max")
+                    mass = state(query_tile_index, head, "mass")
+                    lse = jnp.where(
+                        mass > 0, m + jnp.log(jnp.where(mass > 0, mass, 1)), -jnp.inf
+                    )
+                    heads.append(lse.reshape(q_heads_per_kv, query_tile).T)
+                lse_tiles.append(jnp.concatenate(heads, axis=1))
+            lse_ref[...] = jnp.concatenate(lse_tiles, axis=0)
+
+    def row_state(query_tile_index, head, field):
+        ref = max_ref if field == "max" else mass_ref
+        return ref[query_tile_index, head, :]
+
+    if not lazy:
+        run_tiles(compute_tile)
+        finalize(row_state)
+        return
+
+    run_tiles(functools.partial(compute_tile, lazy_pass=True))
+
+    def lazy_state(query_tile_index, head, field):
+        if field == "mass":
+            return jnp.sum(partial_ref[query_tile_index, head], axis=1)
+        stab = jnp.max(stab_ref[query_tile_index, head])
+        return jnp.full((query_tile * q_heads_per_kv,), stab, jnp.float32)
+
+    # Underflow guard: a row with a visible key whose largest lane partial is
+    # under e^-40 (so its mass is under 128 e^-40) may have lost
+    # probabilities to underflow below the shared stabilizer; recompute the
+    # whole block with the per-row softmax. Conservative (never misses).
+    if "noguard" in lazy:
+        fallback = jnp.int32(0)
+    else:
+        fallback = jnp.int32(0)
+        for query_tile_index in range(num_query_tiles):
+            start = query_tile_index * query_tile
+            has_key = (
+                jnp.max(has_key_ref[start : start + query_tile], axis=1, keepdims=True)
+                > 0
+            )
+            for head in range(kv_heads):
+                lanes = partial_ref[query_tile_index, head].reshape(
+                    q_heads_per_kv, query_tile, 128
+                )
+                for q_head in range(q_heads_per_kv):
+                    largest = jnp.max(lanes[q_head], axis=1, keepdims=True)
+                    low = has_key & (largest < LAZY_SOFTMAX_UNDERFLOW)
+                    fallback = jnp.maximum(
+                        fallback, jnp.max(low.astype(jnp.int32))
+                    )
+
+    @pl.when(fallback == 0)
+    def lazy_epilogue():
+        finalize(lazy_state)
+
+    @pl.when(fallback != 0)
+    def exact_fallback():
+        init_state()
+        run_tiles(compute_tile)
+        finalize(row_state)
+
+
+# VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX: a tile raises the stabilizer only when
+# its maximum exceeds it by more than this (probabilities stay <= e^8), and a
+# row whose largest lane-partial mass is under e^-40 triggers the fallback
+# (then every dropped probability is under e^-36 of the row's largest: at
+# most 37888 owned keys x e^-36.8 ~ 4e-12 of its mass).
+LAZY_SOFTMAX_SLACK = 8.0
+LAZY_SOFTMAX_UNDERFLOW = math.exp(-40.0)
 
 
 # Soft cap on one step's selection bitset, for the resident prefix tier.
@@ -1252,6 +1413,16 @@ def _block_sparse_gqa_prefill(
         kv_heads,
         query_tile * (query_heads // kv_heads),
     )
+    lazy = lazy_softmax_features() if dcp and not vpu and not bf16_mxu else ()
+    if lazy and kv_tile % 128:
+        lazy = ()
+    if lazy:
+        logger.info_once(
+            "QSA sparse DCP prefill lazy softmax on: %s "
+            "(VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX=%s)",
+            ",".join(lazy),
+            envs.VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX,
+        )
     out_spec = pl.BlockSpec(
         (query_block, query_heads, head_dim),
         lambda b, *_: (b, 0, 0),
@@ -1280,6 +1451,7 @@ def _block_sparse_gqa_prefill(
             **({"dcp_world": dcp_world} if dcp else {}),
             **({"vpu": vpu} if vpu else {}),
             **({"page_copies": True} if page_copies else {}),
+            **({"lazy": lazy} if lazy else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3 + int(dcp) + int(bool(vpu)),
@@ -1309,7 +1481,16 @@ def _block_sparse_gqa_prefill(
                 pltpu.VMEM(state_shape, jnp.float32),
                 pltpu.VMEM(state_shape, jnp.float32),
                 pltpu.VMEM((*state_shape, head_dim), jnp.float32),
-            ],
+            ]
+            + (
+                [
+                    pltpu.VMEM((*state_shape[:2], 1, 128), jnp.float32),
+                    pltpu.VMEM((*state_shape, 128), jnp.float32),
+                    pltpu.VMEM((query_block, 128), jnp.int32),
+                ]
+                if lazy
+                else []
+            ),
         ),
         # B128 retains two B64 FP32 online-softmax states so one resident KV
         # tile can serve twice as many queries.  The compiled production
