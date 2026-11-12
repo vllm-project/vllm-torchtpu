@@ -786,9 +786,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
     # Shard the input embedding and lm_head over every DP x TP rank (the EP
     # group) instead of the TP group. Needs DP with EP (lockstep DP engines);
-    # ignored with PP, context parallelism, speculative decoding, LoRA, pooling
-    # or multimodal models, or TPU_GREEDY_TOP_TOKENS. See
-    # layers/adapter/dp_vocab_parallel.py.
+    # ignored with PP, context parallelism, speculative decoding, LoRA, or
+    # pooling or multimodal models. See layers/adapter/dp_vocab_parallel.py.
     "TPU_DP_VOCAB_PARALLEL": env_bool("TPU_DP_VOCAB_PARALLEL"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),

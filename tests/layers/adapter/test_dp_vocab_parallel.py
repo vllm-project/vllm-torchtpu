@@ -219,6 +219,115 @@ def test_lm_head_projects_each_engines_rows_once_per_tp_index():
     assert projected == [dp * rows] * (dp * tp)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("rows", [3, 8])
+@pytest.mark.parametrize("dp, tp", [(4, 2), (2, 1), (1, 4), (8, 1)])
+def test_lm_head_top_tokens_match_unsharded_argmax(dp, tp, rows, dtype):
+    """TpuLogitsProcessor.get_top_tokens exchanges only [ep_size, rows, 2]
+    pairs and reproduces torch.argmax over the full-vocab logits across
+    dtype, scale, soft_cap, embedding_bias, and padded vocabulary tails."""
+    torch.manual_seed(dp * 10 + tp + rows)
+    table = torch.randn(VOCAB, HIDDEN, dtype=dtype)
+    bias = torch.randn(VOCAB, dtype=dtype) * 0.1
+    ranks = _layout(dp, tp)
+    heads = []
+    for r in ranks:
+        with (
+            patch.dict(os.environ, {"TPU_DP_VOCAB_PARALLEL": "1"}),
+            patch.object(dp_vocab_parallel, "group_for_new_layer", return_value=r.ep),
+        ):
+            head = ParallelLMHead(VOCAB, HIDDEN, params_dtype=dtype)
+        head.weight_loader(head.weight, table)
+        # Fill padded tail rows (indices >= VOCAB) on the last shard with large
+        # values that would win argmax if _mask_outside_vocab were missing.
+        pad = head.shard_indices.num_org_vocab_padding
+        if pad > 0:
+            head.weight.data[-pad:].fill_(1e3)
+        heads.append(head)
+
+    processor = dp_vocab_parallel.TpuLogitsProcessor(VOCAB, scale=0.75, soft_cap=5.0)
+    hidden = [torch.randn(rows, HIDDEN, dtype=dtype) for _ in range(dp)]
+    bias_shards = []
+    for head in heads:
+        start = head.shard_indices.org_vocab_start_index
+        width = head.weight.shape[0]
+        shard_b = torch.zeros(width, dtype=dtype)
+        valid = max(0, min(width, VOCAB - start))
+        if valid > 0:
+            shard_b[:valid] = bias[start : start + valid]
+        bias_shards.append(shard_b)
+
+    sent_shapes: list[tuple[int, ...]] = []
+    orig_rank0_a2a = ranks[0].ep.all_to_all
+
+    def recording_all_to_all(x):
+        sent_shapes.append(tuple(x.shape))
+        return orig_rank0_a2a(x)
+
+    ranks[0].ep.all_to_all = recording_all_to_all
+    top = _run_ranks(
+        ranks,
+        lambda r: processor.get_top_tokens(
+            heads[ranks.index(r)],
+            hidden[r.dp_rank],
+            bias_shards[ranks.index(r)],
+        ),
+    )
+
+    assert sent_shapes == [(dp * tp, rows, 2)]
+    full = _run_ranks(
+        ranks,
+        lambda r: processor(
+            heads[ranks.index(r)],
+            hidden[r.dp_rank],
+            bias_shards[ranks.index(r)],
+        ),
+    )
+    for got, logits in zip(top, full, strict=True):
+        assert got.dtype == torch.int64 and got.shape == (rows,)
+        assert torch.equal(got, logits.argmax(dim=-1))
+
+
+def test_lm_head_top_tokens_ties_resolve_to_lowest_token_id():
+    """Exact ties both within one EP shard and across distinct EP shards break
+    to the lowest global token ID, matching torch.argmax."""
+    dp, tp = 4, 2
+    table = torch.zeros(VOCAB, HIDDEN)
+    # Row 0 ties ids 35 (shard 1) and 195 (shard 6); row 1 ties ids 66 and 67
+    # inside shard 2; row 2 ties all 250 tokens at 0.0.
+    table[[35, 195], 0] = 2.0
+    table[[66, 67], 1] = 2.0
+    ranks = _layout(dp, tp)
+    heads = _build(ParallelLMHead, ranks, table)
+    processor = dp_vocab_parallel.TpuLogitsProcessor(VOCAB)
+    h = torch.zeros(3, HIDDEN)
+    h[0, 0] = 1.0
+    h[1, 1] = 1.0
+    h[2, 2] = 1.0
+    hidden = [h.clone() for _ in range(dp)]
+
+    out = _run_ranks(
+        ranks,
+        lambda r: processor.get_top_tokens(heads[ranks.index(r)], hidden[r.dp_rank]),
+    )
+    for got in out:
+        assert got.tolist() == [35, 66, 0]
+
+
+def test_tp_only_lm_head_top_tokens_keeps_the_stock_path():
+    head = ParallelLMHead(VOCAB, HIDDEN, params_dtype=torch.float32, disable_tp=True)
+    table = torch.randn(VOCAB, HIDDEN)
+    head.weight.data[:VOCAB].copy_(table)
+    head.weight.data[VOCAB:].fill_(1e4)
+    hidden = torch.randn(4, HIDDEN)
+    got = dp_vocab_parallel.TpuLogitsProcessor(VOCAB).get_top_tokens(head, hidden)
+    assert torch.equal(got, (hidden @ table.T).argmax(dim=-1))
+    bad_proc = dp_vocab_parallel.TpuLogitsProcessor(VOCAB, scale=-1.0)
+    (dp_head,) = _build(ParallelLMHead, _layout(4, 2)[:1], table)
+    with pytest.raises(ValueError, match="non-positive"):
+        bad_proc.get_top_tokens(dp_head, hidden)
+
+
 class _OwnLogitsProcessor(LogitsProcessor):
     """A model's LogitsProcessor subclass, which vLLM's out-of-tree
     replacement of LogitsProcessor does not reach."""
@@ -414,7 +523,7 @@ def _group_for(
         pytest.param({"config": _config(runner="pooling")}, None, id="pooling_model"),
         pytest.param({"config": _config(mm=True)}, None, id="multimodal_model"),
         pytest.param(
-            {"env": [("TPU_GREEDY_TOP_TOKENS", "1")]}, None, id="greedy_top_tokens"
+            {"env": [("TPU_GREEDY_TOP_TOKENS", "1")]}, "ep", id="greedy_top_tokens"
         ),
         # 250 rows pad to 256 (padding_size 64): 8 ranks split it, 6 do not.
         pytest.param({"dp_size": 3}, None, id="vocab_does_not_split_over_dp_x_tp"),

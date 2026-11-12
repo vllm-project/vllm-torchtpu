@@ -676,6 +676,8 @@ class TPUModelRunner(GPUModelRunner):
     # Defaults for a runner built without __init__.
     _pp_wave: PPWave | PPRing | None = None
     _dp_step_other_decode: bool = False
+    _greedy_head_owner: torch.nn.Module | None = None
+    _dp_step_top_tokens: bool = False
     _adaptive_verification: AdaptiveVerificationManager | None = None
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
@@ -1187,6 +1189,7 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
+        self._dp_step_top_tokens: bool = False
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
@@ -4003,13 +4006,21 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         local_any_decode: bool = False,
+        local_top_tokens: bool | None = None,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._dp_step_other_decode = False
+        self._dp_step_top_tokens = False
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
 
+        if local_top_tokens is None:
+            local_top_tokens = (
+                self._greedy_top_tokens_this_step()
+                if local_num_tokens > 0
+                else (self._greedy_head_owner is not None)
+            )
         dp_group = get_dp_group()
         dp_rank, dp_size = dp_group.rank_in_group, dp_group.world_size
         # Token/chunk metadata is synchronized on vLLM's CPU DP group. The
@@ -4026,6 +4037,7 @@ class TPUModelRunner(GPUModelRunner):
                 # tell under a MAX reduction whether another one decodes.
                 int(local_any_decode) * (dp_rank + 1),
                 int(local_any_decode) * (dp_size - dp_rank),
+                int(not local_top_tokens),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -4043,6 +4055,9 @@ class TPUModelRunner(GPUModelRunner):
         highest, lowest = int(t[4].item()) - 1, dp_size - int(t[5].item())
         self._dp_step_other_decode = highest >= 0 and (
             highest != lowest or highest != dp_rank
+        )
+        self._dp_step_top_tokens = self._greedy_head_owner is not None and not bool(
+            t[6].item()
         )
         return bucket, int(t[1].item())
 
@@ -4295,7 +4310,12 @@ class TPUModelRunner(GPUModelRunner):
         mamba_boundary_plans: list[spec_boundary_state.SpecBoundaryPlan | None] = []
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
-        top_tokens = self._greedy_top_tokens_this_step()
+        top_tokens = (
+            self._dp_step_top_tokens
+            if self._dp_target_bucket is not None
+            and hasattr(self, "_dp_step_top_tokens")
+            else self._greedy_top_tokens_this_step()
+        )
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
@@ -4548,7 +4568,7 @@ class TPUModelRunner(GPUModelRunner):
                         layout_plan,
                     )
                     if top_tokens:
-                        logits = self.compute_selected_top_tokens(
+                        logits = self._top_tokens_at_dp_vocab_rows(
                             hidden_states, logits_indices
                         )
                     else:
@@ -6394,14 +6414,25 @@ class TPUModelRunner(GPUModelRunner):
                 assert self._pp_wave is not None
                 self._pp_wave.end_forward(None, num_tokens)
             if dp_lockstep:
-                # Idle DP engines must issue the same TP logits collective as
-                # busy engines before the next DP synchronization.
-                _idx = torch.zeros(
-                    self._dp_vocab_logits_rows() if self._dp_vocab_logits else num_reqs,
-                    dtype=torch.int32,
-                    device=out.device,
-                )
-                _ = self.compute_selected_logits(out, _idx)
+                # Idle DP engines must issue the same cross-DP LM-head
+                # collective as busy engines before the next DP synchronization.
+                if getattr(self, "_dp_step_top_tokens", False):
+                    if self._dp_vocab_logits:
+                        _idx = torch.zeros(
+                            self._dp_vocab_logits_rows(),
+                            dtype=torch.int32,
+                            device=out.device,
+                        )
+                        _ = self.compute_selected_top_tokens(out, _idx)
+                else:
+                    _idx = torch.zeros(
+                        self._dp_vocab_logits_rows()
+                        if self._dp_vocab_logits
+                        else num_reqs,
+                        dtype=torch.int32,
+                        device=out.device,
+                    )
+                    _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -8934,19 +8965,22 @@ class TPUModelRunner(GPUModelRunner):
             self._dp_step_max_reqs, self.max_num_reqs
         )
 
-    def _logits_at_dp_vocab_rows(
-        self, hidden_states: torch.Tensor, indices: torch.Tensor
+    def _call_at_dp_vocab_rows(
+        self,
+        fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        hidden_states: torch.Tensor,
+        indices: torch.Tensor,
     ) -> torch.Tensor:
-        """`compute_selected_logits` with `indices` padded to the step's
-        TPU_DP_VOCAB_PARALLEL row count, and the logits sliced back after.
+        """Call ``fn(hidden_states, indices)`` padded to the step's
+        ``TPU_DP_VOCAB_PARALLEL`` row count, slicing the result back after.
 
         An lm_head sharded over DP runs collectives across DP engines, and
         TorchTPU pairs those by program: every rank must enter the compiled
-        logits program with the same shapes. The pad and the slice run as
-        rank-local programs of their own, outside it.
+        program with the same shapes. The pad and the slice run as rank-local
+        programs of their own, outside it.
         """
         if not self._dp_vocab_logits:
-            return self.compute_selected_logits(hidden_states, indices)
+            return fn(hidden_states, indices)
         rows = self._dp_vocab_logits_rows()
         num_rows = indices.shape[0]
         if num_rows > rows:
@@ -8955,9 +8989,23 @@ class TPUModelRunner(GPUModelRunner):
                 f"{rows}"
             )
         if num_rows == rows:
-            return self.compute_selected_logits(hidden_states, indices)
+            return fn(hidden_states, indices)
         padded = torch.nn.functional.pad(indices, (0, rows - num_rows))
-        return self.compute_selected_logits(hidden_states, padded)[:num_rows]
+        return fn(hidden_states, padded)[:num_rows]
+
+    def _logits_at_dp_vocab_rows(
+        self, hidden_states: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        return TPUModelRunner._call_at_dp_vocab_rows(
+            self, self.compute_selected_logits, hidden_states, indices
+        )
+
+    def _top_tokens_at_dp_vocab_rows(
+        self, hidden_states: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        return TPUModelRunner._call_at_dp_vocab_rows(
+            self, self.compute_selected_top_tokens, hidden_states, indices
+        )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(

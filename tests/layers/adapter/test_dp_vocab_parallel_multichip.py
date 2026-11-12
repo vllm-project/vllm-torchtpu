@@ -154,13 +154,17 @@ def _check(rank: int) -> dict:
     def run_logits(h):
         return processor(head, h)
 
+    def run_top_tokens(h):
+        return processor.get_top_tokens(head, h)
+
     want_embed = table[ids[dp_rank]].float()
     want_logits = hidden[dp_rank].float() @ table.float().T
-    for how, (fe, fl) in {
-        "eager": (run_embed, run_logits),
+    for how, (fe, fl, ft) in {
+        "eager": (run_embed, run_logits, run_top_tokens),
         "compiled": (
             torch.compile(run_embed, backend="tpu", fullgraph=True, dynamic=False),
             torch.compile(run_logits, backend="tpu", fullgraph=True, dynamic=False),
+            torch.compile(run_top_tokens, backend="tpu", fullgraph=True, dynamic=False),
         ),
     }.items():
         try:
@@ -170,11 +174,16 @@ def _check(rank: int) -> dict:
                 "max_abs_err": float((got - want_embed).abs().max()),
             }
             got = fl(hidden[dp_rank].to("tpu")).cpu().float()
+            got_top = ft(hidden[dp_rank].to("tpu")).cpu()
             out[f"logits/{how}"] = {
                 "shape": list(got.shape),
                 "max_abs_err": float((got - want_logits).abs().max()),
                 "ref_max_abs": float(want_logits.abs().max()),
                 "argmax_match": bool((got.argmax(-1) == want_logits.argmax(-1)).all()),
+            }
+            out[f"top_tokens/{how}"] = {
+                "shape": list(got_top.shape),
+                "matches_full_logits": bool((got_top == got.argmax(-1)).all()),
             }
         except Exception as exc:  # noqa: BLE001 - reported to the parent
             traceback.print_exc()
@@ -274,6 +283,11 @@ def test_dp_vocab_parallel_on_real_collectives(tmp_path):
                 r["rank"],
                 how,
                 logits,
+            )
+            assert check[f"top_tokens/{how}"]["matches_full_logits"], (
+                r["rank"],
+                how,
+                check[f"top_tokens/{how}"],
             )
 
 

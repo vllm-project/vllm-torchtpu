@@ -113,8 +113,6 @@ def _ineligible_reason(vllm_config: "VllmConfig") -> str | None:
         # TODO: multimodal models embed outside the compiled forward, around
         # rank-local merges; enable once a multimodal DP + EP test covers it.
         return "multimodal models are not covered yet"
-    if envs.TPU_GREEDY_TOP_TOKENS:
-        return "TPU_GREEDY_TOP_TOKENS reads TP-sharded logits"
     return None
 
 
@@ -232,6 +230,67 @@ def get_logits(
     return logits[:, : processor.org_vocab_size]
 
 
+def get_top_tokens(
+    processor: "LogitsProcessor",
+    hidden_states: torch.Tensor,
+    lm_head: "VocabParallelEmbedding",
+    embedding_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Greedy top token ids ``[rows]`` (int64) from an lm_head sharded over every
+    DP x TP rank without exchanging full-vocab logits. Every rank passes the same
+    number of rows."""
+    if processor.scale <= 0.0 and processor.scale != 1.0:
+        raise ValueError(
+            "The local argmax reduction optimization is not supported for "
+            "non-positive logit scaling factors."
+        )
+    group = lm_head.parallel_group
+    assert group is not None
+    dp, tp = _groups()
+    rows = hidden_states.shape[0]
+    gathered = (
+        dp.all_gather(hidden_states, dim=0) if dp.world_size > 1 else hidden_states
+    )
+    local = processor._apply_head(lm_head, gathered, embedding_bias)
+    if processor.soft_cap is not None:
+        local = local / processor.soft_cap
+        local = torch.tanh(local)
+        local = local * processor.soft_cap
+    if processor.scale != 1.0:
+        local = local * processor.scale
+
+    shard_width = local.shape[-1]
+    vocab_start = getattr(
+        lm_head,
+        "org_vocab_start_index",
+        lm_head.shard_indices.org_vocab_start_index,
+    )
+    vocab_end = getattr(
+        lm_head,
+        "org_vocab_end_index",
+        lm_head.shard_indices.org_vocab_end_index,
+    )
+    global_vocab_ids = (
+        torch.arange(shard_width, device=local.device, dtype=torch.int64) + vocab_start
+    )
+    valid_vocab_mask = (global_vocab_ids < vocab_end) & (
+        global_vocab_ids < processor.org_vocab_size
+    )
+    local = local.masked_fill(~valid_vocab_mask, -float("inf"))
+
+    local_max_vals, local_max_indices = local.max(dim=-1)
+    global_indices = (local_max_indices + vocab_start).to(torch.int32)
+    local_pair = torch.stack(
+        [local_max_vals.float().view(torch.int32), global_indices], dim=-1
+    )
+    send = local_pair.view(dp.world_size, 1, rows, 2).expand(-1, tp.world_size, -1, -1)
+    received = all_to_all(send.reshape(group.world_size, rows, 2), group)
+    vals = received[:, :, 0].view(torch.float32)
+    ids = received[:, :, 1]
+    max_rank_idx = vals.argmax(dim=0, keepdim=True)
+    return ids.gather(dim=0, index=max_rank_idx).squeeze(0).to(torch.int64)
+
+
 class TpuLogitsProcessor(LogitsProcessor):
     """LogitsProcessor whose lm_head may be sharded over every DP x TP rank.
 
@@ -256,6 +315,16 @@ class TpuLogitsProcessor(LogitsProcessor):
                 "TP-local logits to return (skip_gather)."
             )
         return get_logits(self, hidden_states, lm_head, embedding_bias)
+
+    def get_top_tokens(
+        self,
+        lm_head: "VocabParallelEmbedding",
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not getattr(lm_head, DP_VOCAB_ATTR, False):
+            return super().get_top_tokens(lm_head, hidden_states, embedding_bias)
+        return get_top_tokens(self, hidden_states, lm_head, embedding_bias)
 
 
 def register_logits_processor() -> None:

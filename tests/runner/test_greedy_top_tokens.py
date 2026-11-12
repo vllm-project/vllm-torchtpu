@@ -243,13 +243,25 @@ def test_resolve_head_owner_finds_the_nested_language_model():
     assert greedy_top_tokens.resolve_head_owner(model, dp_lockstep=False) is owner
 
 
-def test_resolve_head_owner_refuses_unsupported_models():
+def test_resolve_head_owner_refuses_unsupported_models(monkeypatch):
     with pytest.raises(NotImplementedError, match="no module with an lm_head"):
         greedy_top_tokens.resolve_head_owner(torch.nn.Linear(2, 2), False)
-    with pytest.raises(NotImplementedError, match="expert-parallel data"):
+    monkeypatch.delenv("TPU_DP_VOCAB_PARALLEL", raising=False)
+    with pytest.raises(NotImplementedError, match="requires TPU_DP_VOCAB_PARALLEL"):
         greedy_top_tokens.resolve_head_owner(
             _Owner(_shards(torch.zeros(8, 2), 2)[0]), dp_lockstep=True
         )
+    monkeypatch.setenv("TPU_DP_VOCAB_PARALLEL", "1")
+    with pytest.raises(NotImplementedError, match="fell back to tensor parallelism"):
+        greedy_top_tokens.resolve_head_owner(
+            _Owner(_shards(torch.zeros(8, 2), 2)[0]), dp_lockstep=True
+        )
+    dp_vocab_owner = _Owner(_shards(torch.zeros(8, 2), 2)[0])
+    setattr(dp_vocab_owner.lm_head, greedy_top_tokens.DP_VOCAB_ATTR, True)
+    assert (
+        greedy_top_tokens.resolve_head_owner(dp_vocab_owner, dp_lockstep=True)
+        is dp_vocab_owner
+    )
 
     class TpuLogitsModel(_Owner):
         def compute_logits(self, hidden_states):

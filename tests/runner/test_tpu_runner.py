@@ -4028,7 +4028,12 @@ class TestLogitsAtDpVocabRows:
             runner.seen.append(indices)
             return hidden[indices] * 10
 
+        def compute_selected_top_tokens(hidden, indices):
+            runner.seen.append(indices)
+            return hidden[indices] * 100
+
         runner.compute_selected_logits = compute_selected_logits
+        runner.compute_selected_top_tokens = compute_selected_top_tokens
         return runner
 
     def test_off_passes_straight_through(self):
@@ -4093,3 +4098,94 @@ class TestLogitsAtDpVocabRows:
             TPUModelRunner._logits_at_dp_vocab_rows(
                 runner, torch.zeros(9, 2), torch.arange(9)
             )
+        with pytest.raises(ValueError, match="exceeds"):
+            TPUModelRunner._top_tokens_at_dp_vocab_rows(
+                runner, torch.zeros(9, 2), torch.arange(9)
+            )
+
+    @pytest.mark.parametrize("step_max_reqs, rows", [(3, 8), (9, 16)])
+    def test_top_tokens_pads_indices_and_slices_the_rows_back(
+        self, step_max_reqs, rows
+    ):
+        runner = self._runner(True, step_max_reqs=step_max_reqs)
+        top_seen = []
+        runner.compute_selected_top_tokens = (
+            lambda h, idx: top_seen.append(idx) or h[idx] * 100
+        )
+        hidden = torch.arange(16).reshape(16, 1)
+        indices = torch.tensor([2, 5, 11], dtype=torch.int32)
+        got = TPUModelRunner._top_tokens_at_dp_vocab_rows(runner, hidden, indices)
+        assert top_seen[0].tolist() == [2, 5, 11] + [0] * (rows - 3)
+        assert got.flatten().tolist() == [200, 500, 1100]
+
+    @pytest.mark.parametrize("step_top_tokens", [False, True])
+    @pytest.mark.parametrize("dp_vocab, rows", [(True, 16), (False, 4)])
+    def test_idle_dummy_chunk_pairs_top_tokens_or_logits_in_lockstep(
+        self, monkeypatch, step_top_tokens, dp_vocab, rows
+    ):
+        """An idle DP engine's dummy chunk must enter compute_selected_top_tokens
+        when _dp_step_top_tokens and _dp_vocab_logits are True, skip the head
+        when _dp_vocab_logits is False on a greedy step (no cross-DP collective),
+        and enter compute_selected_logits when _dp_step_top_tokens is False."""
+        seen_logits = []
+        seen_top = []
+        runner = _dummy_run_stand_in(
+            monkeypatch, lambda **kw: (torch.zeros((16, 8)), None)
+        )
+        runner.compute_selected_logits = lambda out, idx: seen_logits.append(
+            idx.shape[0]
+        )
+        runner.compute_selected_top_tokens = lambda out, idx: seen_top.append(
+            idx.shape[0]
+        )
+        runner._dp_vocab_logits = dp_vocab
+        runner._dp_vocab_logits_rows = lambda: 16
+        runner._dp_step_top_tokens = step_top_tokens
+        TPUModelRunner._dummy_run(
+            runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=True
+        )
+        if step_top_tokens:
+            expected_top = [rows] if dp_vocab else []
+            assert seen_top == expected_top and seen_logits == []
+        else:
+            assert seen_logits == [rows] and seen_top == []
+
+    @pytest.mark.parametrize(
+        "peer_veto, owner_on, local_vote, expected",
+        [
+            (0, True, True, True),
+            (0, True, None, True),  # idle rank defaults to True when owner exists
+            (1, True, True, False),  # non-greedy peer vetoes step-wide top_tokens
+            (0, True, False, False),  # local rank vetoes step-wide top_tokens
+            (0, False, None, False),  # no greedy head owner -> always False
+        ],
+    )
+    def test_dp_coordinated_step_synchronizes_top_tokens_across_engines(
+        self, monkeypatch, peer_veto, owner_on, local_vote, expected
+    ):
+        from vllm.distributed import parallel_state
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            del op, group
+            tensor[0] = max(int(tensor[0].item()), 8)
+            tensor[1] = max(int(tensor[1].item()), 1)
+            tensor[2] = max(int(tensor[2].item()), 4)
+            tensor[6] = max(int(tensor[6].item()), peer_veto)
+
+        dp_group = SimpleNamespace(rank_in_group=0, world_size=2, cpu_group="cpu")
+        monkeypatch.setattr(parallel_state, "get_dp_group", lambda: dp_group)
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+        runner = SimpleNamespace(
+            _dp_lockstep_enabled=lambda: True,
+            num_tokens_paddings=[8, 16],
+            _greedy_head_owner=object() if owner_on else None,
+            _dp_step_other_decode=False,
+            _dp_step_top_tokens=False,
+            _dp_step_max_reqs=0,
+            _dp_step_has_encoder_inputs=False,
+        )
+        bucket, chunks = TPUModelRunner._dp_coordinated_step(
+            runner, 0, 0, local_top_tokens=local_vote
+        )
+        assert (bucket, chunks) == (8, 1)
+        assert runner._dp_step_top_tokens is expected
