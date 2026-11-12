@@ -1953,7 +1953,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                        lean, walk_runs=0, union_alpha=0.0, share_bits=False, qk16=False, listed=None,
                        run_tables=False, max_run=8, lazy_share=False, gathered=None, gather_chunks=4,
                        gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem", sc_bitset=False,
-                       dcp=None, return_lse=False, kv_head_offset=0):
+                       dcp=None, return_lse=False, kv_head_offset=0, precheck_stride=0):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
 
     ``dcp=(rank int32[1], world)`` with ``return_lse`` (VLLM_TPU_QSA_PREFILL_UNION_DCP,
@@ -1966,6 +1966,13 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
     context, cap, alpha) take that DCP block-sparse call. Bit-scan walk only:
     no listed / run_tables / gathered / compact_reqs / share_bits.
     ``kv_head_offset`` (DCP only): a paired main KV page's second layer.
+    ``precheck_stride`` (DCP only, with ``union_alpha``; 0 = off): before the
+    plan, build the union of every ``precheck_stride``-th 128-row tile of the
+    step's rows as they arrive (``union_bits_plan`` on those rows only) and
+    send the whole step to the DCP block-sparse call, without the full plan,
+    when any sampled tile's owned union exceeds ``union_alpha`` times its
+    owned visible groups (or ``union_cap``). Tiles the sample misses are still
+    caught by the full plan's alpha check.
 
     Same contract as ``block_sparse_gqa_attention`` without ``return_lse``.
     ``table`` holds one page row per query row and ``starts`` the request
@@ -2287,6 +2294,19 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
         route = jnp.where(jnp.all(real % align == 0), 0, route + 1)
     branches.append(skip)
     route = jnp.where(jnp.max(lengths) >= min_context, route, len(branches) - 1)
+    if dcp is not None and precheck_stride and union_alpha and tokens % 128 == 0:
+        sample = np.arange(0, tokens // 128, int(precheck_stride))
+        sampled_blocks = walk_blocks.reshape(tokens // 128, 128, -1)[sample].reshape(-1, blocks.shape[1])
+        sampled_lengths = walk_lengths.reshape(tokens // 128, 128)[sample].reshape(-1)
+        _, _, sampled_usize, _ = union_bits_plan(
+            sampled_blocks, sampled_lengths, group=128, union_cap=union_cap, groups_cap=groups_cap,
+            ratio=ratio, bitset="sparsecore" if sc_bitset else "tensorcore",
+        )
+        sampled_visible = jnp.max(((sampled_lengths + ratio - 1) // ratio).reshape(-1, 128), axis=1)
+        sparse = jnp.all(
+            sampled_usize.astype(jnp.float32) <= union_alpha * sampled_visible.astype(jnp.float32)
+        ) & (jnp.max(sampled_usize) <= union_cap)
+        route = jnp.where(sparse, route, len(branches) - 1)
     raw, fits = lax.switch(route, branches)
     if dcp is not None:
         def served_dcp():
