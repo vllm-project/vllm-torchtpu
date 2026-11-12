@@ -33,9 +33,8 @@ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     can_use_blockwise_onehot_unpermute,
 )
 from vllm_torchtpu.kernels.megablox.moe_tc_combine import (
-    tc_combine,
-    tc_combine_ok,
-    tc_row_gather,
+    tc_slab_combine,
+    tc_slab_combine_ok,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
@@ -84,24 +83,15 @@ if _V3_PAYLOAD_SORT:
     ragged_gather_reduce = functools.partial(
         ragged_gather_reduce_v3, payload_sort=True
     )
-# Fixed at import: EP steps of at least this many tokens move MoE rows on the
-# TensorCore (0 = never). See moe_tc_combine.
+# Fixed at import: EP steps of at least this many tokens combine the expert
+# outputs on the TensorCore (0 = never). See moe_tc_combine.
 _TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
-_TC_DISPATCH_MIN_TOKENS = envs.TPU_MOE_TC_DISPATCH_MIN_TOKENS
-_TC_DISPATCH_BLOCK = 256
 _FLAT_ROUTING_MIN_TOKENS = envs.TPU_MOE_FLAT_ROUTING_MIN_TOKENS
-if (
-    _TC_COMBINE_MIN_TOKENS
-    or _TC_DISPATCH_MIN_TOKENS
-    or _V3_PAYLOAD_SORT
-    or _FLAT_ROUTING_MIN_TOKENS
-):
+if _TC_COMBINE_MIN_TOKENS or _V3_PAYLOAD_SORT or _FLAT_ROUTING_MIN_TOKENS:
     logger.info(
         "MoE row movement: TPU_MOE_TC_COMBINE_MIN_TOKENS=%d "
-        "TPU_MOE_TC_DISPATCH_MIN_TOKENS=%d TPU_MOE_V3_PAYLOAD_SORT=%d "
-        "TPU_MOE_FLAT_ROUTING_MIN_TOKENS=%d",
+        "TPU_MOE_V3_PAYLOAD_SORT=%d TPU_MOE_FLAT_ROUTING_MIN_TOKENS=%d",
         _TC_COMBINE_MIN_TOKENS,
-        _TC_DISPATCH_MIN_TOKENS,
         int(_V3_PAYLOAD_SORT),
         _FLAT_ROUTING_MIN_TOKENS,
     )
@@ -518,31 +508,12 @@ def prepare_routed_gmm_inputs(
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
             valid_count = group_sizes_local.sum(dtype=jnp.int32)
-            if (
-                _TC_DISPATCH_MIN_TOKENS
-                and num_tokens_local >= _TC_DISPATCH_MIN_TOKENS
-                and token_indices_sorted.shape[0] % _TC_DISPATCH_BLOCK == 0
-                and num_tokens_local % 2 == 0
-                and hidden_states_local.dtype == jnp.bfloat16
-            ):
-                logger.info_once(
-                    "TPU_MOE_TC_DISPATCH_MIN_TOKENS=%d: TensorCore MoE dispatch "
-                    "(tc_row_gather) armed",
-                    _TC_DISPATCH_MIN_TOKENS,
-                )
-                x = tc_row_gather(
-                    hidden_states_local,
-                    token_indices_sorted,
-                    valid_count[None],
-                    tbd=_TC_DISPATCH_BLOCK,
-                )
-            else:
-                x = ragged_gather_v2(
-                    hidden_states_local,
-                    token_indices_sorted,
-                    jnp.array([0], dtype=jnp.int32),
-                    valid_count[None],
-                )
+            x = ragged_gather_v2(
+                hidden_states_local,
+                token_indices_sorted,
+                jnp.array([0], dtype=jnp.int32),
+                valid_count[None],
+            )
     else:
         x = hidden_states_local[token_indices_sorted]
     return (
@@ -745,22 +716,23 @@ def moe_gmm(
             _TC_COMBINE_MIN_TOKENS
             and num_tokens >= _TC_COMBINE_MIN_TOKENS
             and gmm2_res.dtype == jnp.bfloat16
-            and tc_combine_ok(num_tokens, gmm2_res.shape[-1], gmm2_res.shape[0])
+            and tc_slab_combine_ok(num_tokens, gmm2_res.shape[-1])
         ):
             logger.info_once(
                 "TPU_MOE_TC_COMBINE_MIN_TOKENS=%d: TensorCore MoE combine "
-                "(tc_combine) armed",
+                "(tc_slab_combine) armed",
                 _TC_COMBINE_MIN_TOKENS,
             )
-            out, overflow = tc_combine(
+            out, overflow = tc_slab_combine(
                 gmm2_res,
                 argsort_revert_indices,
                 topk_weights_flat,
                 valid_mask_flat,
                 topk=topk,
             )
-            # A block with more extra local routes than the kernel stages
-            # (far above the EP mean) takes the SparseCore combine.
+            # A token block whose routes need more slabs or extra routes than
+            # the kernel stages (far above the EP mean) takes the SparseCore
+            # combine.
             return jax.lax.cond(overflow, sc_combine, lambda: out.astype(x.dtype))
         return sc_combine()
 
