@@ -37,8 +37,8 @@ def routed_experts_prepared(
     # tile in VMEM): an FP32 [E, blocks, 1, N] copy pads 8x in HBM.
     gu_scale = expert_gate_up_scales.astype(jnp.uint8)
     down_scale = expert_down_scales.astype(jnp.uint8)
-    # gmm_v2 splits [gate, up] and interleaves lanes for the fused SiTU
-    # activation (expert_activation).
+    # The gate/up weights arrive lane-interleaved (the loader's layout), the
+    # order the fused SiTU activation consumes.
     middle = indexed_gate_up(
         latent, sorted_tokens, expert_gate_up, counts, gu_scale, expert_layer
     )
