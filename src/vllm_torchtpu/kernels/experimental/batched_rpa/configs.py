@@ -662,10 +662,14 @@ class RpaConfigs:
                     "Context Parallel does not support sliding window right now"
                 )
 
-        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            bkv_sz = self.block.bkv_sz
-            page_size = self.serve.page_size
-            if bkv_sz % page_size != 0:
-                raise NotImplementedError(
-                    f"SEQ_ALONG_LANE expects {bkv_sz=} to be aligned to {page_size=}."
-                )
+        # The cached-KV DMA schedule addresses whole pages: block k is fetched
+        # from pages k * bkv_p onwards with no intra-page offset, in both
+        # layouts. A bkv_sz that is not a page multiple silently reads the wrong
+        # tokens from the second block onwards, so reject it up front.
+        bkv_sz = self.block.bkv_sz
+        page_size = self.serve.page_size
+        if bkv_sz % page_size != 0:
+            raise ValueError(
+                f"Expected {bkv_sz=} to be a multiple of {page_size=} for"
+                f" kv_layout={self.serve.kv_layout}."
+            )

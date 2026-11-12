@@ -82,3 +82,56 @@ def test_calculate_block_sizes_generation(
         )
         assert decode_blocks.bq_sz >= decode_blocks.bq_c_sz >= expected_bq_c_min
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
+
+
+# The cached-KV DMA schedule fetches block k from pages k * bkv_p onwards with no
+# intra-page offset, so bkv_sz has to be a whole number of pages in every layout.
+# These are the four configs from issue #2435 on a 256-wide MXU with 512-token
+# pages, where the default decode bkv_sz used to land on an odd multiple of 256
+# for two of them.
+@pytest.mark.parametrize(
+    "kv_layout",
+    [configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE],
+)
+@pytest.mark.parametrize(
+    "kv_dtype,num_kv_heads",
+    [
+        (jnp.bfloat16, 1),
+        (jnp.bfloat16, 2),
+        (jnp.float8_e4m3fn, 1),
+        (jnp.float8_e4m3fn, 2),
+    ],
+)
+@pytest.mark.parametrize("page_size", [16, 128, 512])
+def test_calculate_block_sizes_bkv_is_page_multiple(
+    kv_layout, kv_dtype, num_kv_heads, page_size
+):
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=6 * num_kv_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=8,
+        page_size=page_size,
+        total_q_tokens=512,
+        num_page_indices=8 * 17,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=kv_dtype,
+        dtype_out=jnp.bfloat16,
+        kv_layout=kv_layout,
+    )
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        decode_blocks, prefill_blocks = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, 64 * 1024 * 1024
+        )
+    for blocks in (decode_blocks, prefill_blocks):
+        assert blocks.bkv_sz >= page_size
+        assert blocks.bkv_sz % page_size == 0, (
+            f"{kv_layout=} {kv_dtype=} {num_kv_heads=} {page_size=}:"
+            f" bkv_sz={blocks.bkv_sz} is not a page multiple"
+        )
