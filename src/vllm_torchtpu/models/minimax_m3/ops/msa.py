@@ -14,6 +14,7 @@
 """Torch entry point for the JAX MSA forward."""
 
 import functools
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -23,6 +24,7 @@ from torch_tpu._internal import pallas
 from vllm.distributed import get_tp_group
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
@@ -430,6 +432,7 @@ def gather_group_heads(
     group: Any,
     dcp: int,
     kv_head_replicas: int,
+    dcp_rank: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The DCP group's query heads ``[T, dcp * q_heads, D]``
     (`gather_query_heads`) and its KV heads' ``k``/``v``/``index_q``
@@ -440,7 +443,25 @@ def gather_group_heads(
     rank's 11 heads at DCP 8) can run while the scoring op computes instead
     of before it, and needs no strided split of a combined gather."""
     return gather_query_heads(q, group), *gather_group_kv(
-        k, v, index_q, group, dcp, kv_head_replicas
+        k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
+    )
+
+
+# TPU_MINIMAX_M3_DCP_KV_GATHER_SHARE=1: the ``kv_head_replicas`` ranks of a
+# KV head hold the same new k/v/index_q, so each sends only its share of the
+# tokens and the group's gather carries every head once instead of
+# ``kv_head_replicas`` times (half the bytes at c64, DCP 8 over 4 KV heads).
+KV_GATHER_SHARE_ENV = "TPU_MINIMAX_M3_DCP_KV_GATHER_SHARE"
+
+
+def kv_gather_share_enabled() -> bool:
+    return os.environ.get(KV_GATHER_SHARE_ENV, "0") == "1"
+
+
+if kv_gather_share_enabled():
+    init_logger(__name__).info(
+        "%s=1: MSA DCP k/v/index_q gather sends one token share per KV-head replica.",
+        KV_GATHER_SHARE_ENV,
     )
 
 
@@ -451,11 +472,37 @@ def gather_group_kv(
     group: Any,
     dcp: int,
     kv_head_replicas: int,
+    dcp_rank: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The ``k``/``v``/``index_q [T, dcp // kv_head_replicas, D]`` of the DCP
     group's KV heads (rank ``i`` holds KV head ``i // kv_head_replicas``, so
-    every ``kv_head_replicas``-th rank supplies the next head)."""
+    every ``kv_head_replicas``-th rank supplies the next head).
+
+    With `KV_GATHER_SHARE_ENV` and this rank's ``dcp_rank`` (``int32[1]``),
+    rank ``h * r + j`` sends rows ``[j * T / r, (j + 1) * T / r)`` of its KV
+    head (``r = kv_head_replicas``): the replicas compute the same values, so
+    the result is the same, from ``1 / r`` of the bytes."""
     num_tokens, _, head_dim = k.shape
+    kv_heads = dcp // kv_head_replicas
+    if (
+        kv_head_replicas > 1
+        and dcp_rank is not None
+        and num_tokens % kv_head_replicas == 0
+        and kv_gather_share_enabled()
+    ):
+        share = num_tokens // kv_head_replicas
+        mine = torch.cat([k, v, index_q], dim=1).view(
+            kv_head_replicas, share, 3, head_dim
+        )
+        # The rank is a tensor, so every rank traces the same program.
+        j = torch.remainder(dcp_rank.reshape(1).to(torch.int64), kv_head_replicas)
+        mine = torch.index_select(mine, 0, j).reshape(share, 3, head_dim)
+        gathered = group.all_gather(mine.contiguous(), dim=0)
+        # Row block h * r + j is head h's token share j: [heads, T, 3, D].
+        per_head = gathered.view(kv_heads, num_tokens, 3, head_dim)
+        return tuple(
+            per_head[:, :, i].transpose(0, 1).contiguous() for i in range(3)
+        )
     per_rank = group.all_gather(torch.cat([k, v, index_q], dim=1).contiguous(), dim=1)
     per_head = per_rank.view(num_tokens, dcp, 3, head_dim)[:, ::kv_head_replicas]
     return tuple(per_head[:, :, i].contiguous() for i in range(3))
@@ -617,7 +664,7 @@ def get_msa_dcp_op(
             q_all = gather_query_heads(q, group)
         else:
             q_all, k, v, index_q = gather_group_heads(
-                q, k, v, index_q, group, dcp, kv_head_replicas
+                q, k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
             )
         new_kv_cache, new_index_cache, candidates = score_op(
             k,
@@ -858,7 +905,9 @@ def _get_msa_dcp_fp4_op(
         elif attend_rot_op is not None:
             q_all = gather_query_heads(q, group)
         if kv_heads > 1:
-            k, v, index_q = gather_group_kv(k, v, index_q, group, dcp, kv_head_replicas)
+            k, v, index_q = gather_group_kv(
+                k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
+            )
         new_kv_cache, new_index_cache, new_scale_cache, candidates, q = score_op(
             k,
             v,
