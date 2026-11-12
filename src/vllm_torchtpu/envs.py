@@ -195,6 +195,7 @@ if TYPE_CHECKING:
     EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK: bool = False
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
+    VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB: int = 128
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -1225,6 +1226,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # How many times an offload save whose transfer failed is retried.
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES": env_int("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
+    # MiB of one worker's KV that offload loads may have in flight at once
+    # (0: no bound); the step's input uploads queue behind them.
+    "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB": env_int(
+        "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB", 128
+    ),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(

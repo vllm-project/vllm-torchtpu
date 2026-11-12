@@ -4499,3 +4499,54 @@ class TestDenseDpIndex(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestLoadPacing(unittest.TestCase):
+    """max_inflight_load_sub_blocks bounds the local load sub-blocks in flight."""
+
+    def setUp(self):
+        self.store = FakeKVCacheStore()
+        self.manager = make_manager(self.store, max_inflight_load_sub_blocks=3)
+        for n in range(2):
+            seed_host_entries(self.store, _key(n))
+
+    def test_load_launches_over_polls_within_the_bound(self):
+        self.manager.prepare_load([_key(0), _key(1)], _ctx("r1"))
+        self.manager.submit_load_job(3, [_key(0), _key(1)], [10, 11], "r1")
+        finished = []
+        for _ in range(4):
+            launched = self.store.calls_named("load")
+            self.assertLessEqual(len(launched[-1].args[0]), 3)
+            self.store.complete_load(launched[-1].args[0])
+            finished = self.manager.poll_finished_jobs()
+            if finished:
+                break
+        launched = self.store.calls_named("load")
+        self.assertEqual(
+            [h for c in launched for h in c.args[0]],
+            sub_hashes(_key(0)) + sub_hashes(_key(1)),
+        )
+        self.assertEqual(
+            [d for c in launched for d in c.args[1]], [40, 41, 42, 43, 44, 45, 46, 47]
+        )
+        (job,) = finished
+        self.assertTrue(job.success)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_saves_are_not_paced(self):
+        self.manager.prepare_store([_key(5), _key(6)], _ctx())
+        self.manager.submit_store_job(7, [_key(5), _key(6)], [5, 6])
+        (save,) = self.store.calls_named("save")
+        self.assertEqual(save.args[0], sub_hashes(_key(5)) + sub_hashes(_key(6)))
+
+    def test_failed_later_launch_fails_the_job_after_the_first_lands(self):
+        self.manager.prepare_load([_key(0)], _ctx("r1"))
+        self.manager.submit_load_job(3, [_key(0)], [10], "r1")
+        (first,) = self.store.calls_named("load")
+        self.store.fail_load = True
+        self.store.complete_load(first.args[0])
+        (job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(job.success)
+        self.assertEqual(job.failed_device_block_ids, [10])
+        self.assertEqual(self.store.pinned_hashes(), {})

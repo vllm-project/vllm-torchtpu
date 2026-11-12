@@ -83,7 +83,7 @@ import os
 import socket
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -442,6 +442,15 @@ class FinishedJob:
     failed_device_block_ids: list[int] = field(default_factory=list)
 
 
+@dataclass
+class _QueuedLoad:
+    """The not yet launched part of an admitted local load."""
+
+    admission: Admission
+    hashes: list[bytes]
+    device_ids: list[int]
+
+
 def _dma_order(
     sub_hashes: list[bytes], device_ids: list[int], host_ids: list[int]
 ) -> tuple[list[bytes], list[int]]:
@@ -502,6 +511,9 @@ class RaidenOffloadingManager(OffloadingManager):
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
         dp_rank: int = 0,
+        # Most local load sub-blocks in flight at once (0: no bound); see
+        # `_launch_queued_loads`.
+        max_inflight_load_sub_blocks: int = 0,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -654,6 +666,12 @@ class RaidenOffloadingManager(OffloadingManager):
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
+
+        # Load pacing: launched-but-unresolved local load sub-hashes, and the
+        # local loads still waiting for room.
+        self._max_inflight_loads = max_inflight_load_sub_blocks
+        self._inflight_loads: set[bytes] = set()
+        self._queued_loads: deque[_QueuedLoad] = deque()
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -1345,6 +1363,25 @@ class RaidenOffloadingManager(OffloadingManager):
             local_hashes, dst_device_ids_for_local = _dma_order(
                 local_hashes, dst_device_ids_for_local, local_host_ids
             )
+        if not remote_batches and self._max_inflight_loads > 0:
+            # Local only: paced (`_launch_queued_loads`).
+            admission = Admission(
+                job_id=job_id,
+                op=AdmissionOp.LOAD,
+                keys=keys,
+                sub_hashes=sub_hashes,
+                pending=set(sub_hashes),
+                req_id=req_id,
+                dst_device_block_ids=list(device_block_ids),
+            )
+            self._admissions[job_id] = admission
+            for sub_hash in sub_hashes:
+                self._hash_to_admission[sub_hash] = admission
+            self._queued_loads.append(
+                _QueuedLoad(admission, local_hashes, dst_device_ids_for_local)
+            )
+            self._launch_queued_loads()
+            return
         if local_hashes and not self._store.load(
             local_hashes, dst_device_ids_for_local
         ):
@@ -1530,6 +1567,8 @@ class RaidenOffloadingManager(OffloadingManager):
         # same poll (some done, some failed) must finalize exactly once.
         newly_terminal: dict[int, Admission] = {}
         for done, failed in results:
+            self._inflight_loads.difference_update(done)
+            self._inflight_loads.difference_update(failed)
             for sub_hash in failed:
                 admission = self._hash_to_admission.get(sub_hash)
                 if admission is None:
@@ -1554,6 +1593,45 @@ class RaidenOffloadingManager(OffloadingManager):
             if self._maybe_retry_save(admission):
                 continue
             self._finalize(admission)
+        self._launch_queued_loads()
+
+    def _launch_queued_loads(self) -> None:
+        """Launch queued local loads while fewer than `_max_inflight_loads`
+        sub-blocks are in flight, splitting a load at the bound.
+
+        A host->HBM copy shares the device's host-transfer path with the
+        step's own input uploads, which wait behind everything issued before
+        them, so one large load stalls every running request for its whole
+        duration. Bounding what is in flight bounds that wait; a load larger
+        than the bound lands over several scheduler steps.
+        """
+        while self._queued_loads:
+            room = self._max_inflight_loads - len(self._inflight_loads)
+            if room <= 0:
+                return
+            head = self._queued_loads[0]
+            hashes, device_ids = head.hashes[:room], head.device_ids[:room]
+            head.hashes, head.device_ids = head.hashes[room:], head.device_ids[room:]
+            if not head.hashes:
+                self._queued_loads.popleft()
+            if self._store.load(hashes, device_ids):
+                self._inflight_loads.update(hashes)
+                continue
+            admission = head.admission
+            unlaunched = hashes + head.hashes
+            logger.error(
+                "TPURaidenOffloadingConnector: load job %d: load() launch failed "
+                "for %d sub-blocks",
+                admission.job_id,
+                len(unlaunched),
+            )
+            if head.hashes:
+                self._queued_loads.popleft()
+            admission.failed = True
+            admission.failed_sub_hashes.extend(unlaunched)
+            admission.pending.difference_update(unlaunched)
+            if not admission.pending:
+                self._finalize(admission)
 
     def _maybe_retry_save(self, admission: Admission) -> bool:
         """Re-issue the failed subset of a store job's save, at most
@@ -2802,6 +2880,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 )
             bytes_per_block_all_ranks -= draft_bytes
         assert bytes_per_block_all_ranks > 0
+        # What one worker moves per sub-block of a load.
+        self._sub_block_bytes = bytes_per_block_all_ranks // (
+            self.world_size * self.device_block_size_factor
+        )
         self.offload_logical_blocks_capacity = int(
             int(cpu_bytes_to_use) // bytes_per_block_all_ranks
         )
@@ -2965,8 +3047,17 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
                 dp_rank=self.dp_rank,
+                max_inflight_load_sub_blocks=self._max_inflight_load_sub_blocks(),
             )
         return self._manager
+
+    def _max_inflight_load_sub_blocks(self) -> int:
+        """`VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB` of one worker's KV, in
+        sub-blocks."""
+        mib = envs.VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB
+        if mib <= 0:
+            return 0
+        return max(1, (mib << 20) // max(self._sub_block_bytes, 1))
 
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
         if self._worker is None:
