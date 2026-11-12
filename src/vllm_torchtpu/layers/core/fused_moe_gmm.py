@@ -756,9 +756,10 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "dispatch_token",
     ),
 )
-def fused_moe_func(
+def _fused_moe_func(
     hidden_states: jax.Array,
     w1: jax.Array,
     w2: jax.Array,
@@ -931,6 +932,48 @@ def fused_moe_func(
     return out
 
 
+def fused_moe_func(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array | None = None,
+    topk: int = 1,
+    activation: str = "silu",
+    use_ep: bool = False,
+    use_sparse_core: bool = True,
+    onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
+) -> jax.Array:
+    """`_fused_moe_func` without the dispatch token (every parameter here is
+    either bound or an operand of the torch_tpu custom op)."""
+    return _fused_moe_func(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+        experts_start,
+        topk=topk,
+        activation=activation,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+
+
 def fused_moe_func_with_dispatch_token(
     hidden_states: jax.Array,
     w1: jax.Array,
@@ -952,7 +995,7 @@ def fused_moe_func_with_dispatch_token(
 ) -> tuple[jax.Array, jax.Array]:
     """`fused_moe_func` and its dispatch token (torch_tpu reads the output
     count from this annotation)."""
-    return fused_moe_func(
+    return _fused_moe_func(
         hidden_states,
         w1,
         w2,
