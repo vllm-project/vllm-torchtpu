@@ -55,6 +55,7 @@ def _kernel(
     eps: float,
     prologue: bool,
     inject: bool,
+    up_transposed: bool = False,
 ):
     refs_list: list = list(refs)
     prev_ref = block_ref = prev_inj_ref = x_ref = None
@@ -77,16 +78,23 @@ def _kernel(
     first = pl.program_id(0) == 0
     w_copy = pltpu.make_async_copy(w_hbm, w_vm, sems.at[0])
     down_copy = pltpu.make_async_copy(down_hbm, down_vm, sems.at[1])
-    up_copies = [
-        pltpu.make_async_copy(
-            up_hbm.at[pl.ds(b * hidden, hidden)],
-            up_vm.at[pl.ds(b * hidden, hidden)],
-            sems.at[2 + b],
-        )
-        for b in range(branches)
-    ]
+    if up_transposed:
+        up_copy = pltpu.make_async_copy(up_hbm, up_vm, sems.at[2])
+        up_copies = None
+        inj_sem_idx = 3
+    else:
+        up_copy = None
+        up_copies = [
+            pltpu.make_async_copy(
+                up_hbm.at[pl.ds(b * hidden, hidden)],
+                up_vm.at[pl.ds(b * hidden, hidden)],
+                sems.at[2 + b],
+            )
+            for b in range(branches)
+        ]
+        inj_sem_idx = 2 + branches
     inj_copy = (
-        pltpu.make_async_copy(injw_hbm, injw_vm, sems.at[2 + branches])
+        pltpu.make_async_copy(injw_hbm, injw_vm, sems.at[inj_sem_idx])
         if inject
         else None
     )
@@ -98,8 +106,13 @@ def _kernel(
         if inj_copy is not None:
             inj_copy.start()
         down_copy.start()
-        for copy in up_copies:
-            copy.start()
+        if up_transposed:
+            assert up_copy is not None
+            up_copy.start()
+        else:
+            assert up_copies is not None
+            for copy in up_copies:
+                copy.start()
 
     def wait_first(copy):
         @pl.when(first)
@@ -113,6 +126,7 @@ def _kernel(
         return jnp.sum(jnp.where(lanes == column, values, 0.0), axis=1, keepdims=True)
 
     nt = (((1,), (1,)), ((), ()))
+    nn_dim = (((1,), (0,)), ((), ()))
     wait_first(w_copy)
     if inj_copy is not None:
         wait_first(inj_copy)
@@ -198,24 +212,44 @@ def _kernel(
 
     gate = (down_acc.astype(jnp.bfloat16) / branches).astype(jnp.bfloat16)
     gate = jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16)
-    mixed: jax.Array | None = None
-    for b in range(branches):
-        start = b * hidden
-        wait_first(up_copies[b])
+    if up_transposed:
+        assert up_copy is not None
+        wait_first(up_copy)
         logits = (
             jax.lax.dot_general(
                 gate,
-                up_vm[pl.ds(start, hidden), :],
-                dimension_numbers=nt,
+                up_vm[...],
+                dimension_numbers=nn_dim,
                 preferred_element_type=jnp.float32,
             )
             .astype(jnp.bfloat16)
             .astype(jnp.float32)
         )
-        weighted = jax.nn.sigmoid(logits) * norm_vm[:, pl.ds(start, hidden)].astype(
-            jnp.float32
-        )
-        mixed = weighted if mixed is None else mixed + weighted
+        weighted = jax.nn.sigmoid(logits) * norm_vm[...].astype(jnp.float32)
+        mixed = weighted[:, :hidden]
+        for b in range(1, branches):
+            start = b * hidden
+            mixed = mixed + weighted[:, start : start + hidden]
+    else:
+        assert up_copies is not None
+        mixed = None
+        for b in range(branches):
+            start = b * hidden
+            wait_first(up_copies[b])
+            logits = (
+                jax.lax.dot_general(
+                    gate,
+                    up_vm[pl.ds(start, hidden), :],
+                    dimension_numbers=nt,
+                    preferred_element_type=jnp.float32,
+                )
+                .astype(jnp.bfloat16)
+                .astype(jnp.float32)
+            )
+            weighted = jax.nn.sigmoid(logits) * norm_vm[:, pl.ds(start, hidden)].astype(
+                jnp.float32
+            )
+            mixed = weighted if mixed is None else mixed + weighted
     assert mixed is not None
     mixed_ref[...] = (mixed / branches).astype(jnp.bfloat16)
 
@@ -233,6 +267,7 @@ def hc_decode_mix(
     block=None,
     prev_injection=None,
     interpret=False,
+    up_transposed: bool = False,
 ):
     """Fused HC mix for at most ``MAX_TOKENS`` rows.
 
@@ -253,10 +288,14 @@ def hc_decode_mix(
         hidden=hidden,
         eps=eps,
         interpret=interpret,
+        up_transposed=up_transposed,
     )
 
 
-@functools.partial(jax.jit, static_argnames=("branches", "hidden", "eps", "interpret"))
+@functools.partial(
+    jax.jit,
+    static_argnames=("branches", "hidden", "eps", "interpret", "up_transposed"),
+)
 def _hc_decode_mix(
     x,
     weight,
@@ -270,19 +309,21 @@ def _hc_decode_mix(
     hidden,
     eps,
     interpret,
+    up_transposed=False,
 ):
     tokens, width = x.shape
     lowrank = down.shape[0]
     prologue = block is not None
     inject = inject_weight is not None
     tile = decode_token_tile(tokens)
+    expected_up_shape = (lowrank, width) if up_transposed else (width, lowrank)
     if (
         tile is None
         or width != branches * hidden
         or hidden % 128
         or weight.shape != (width,)
         or down.shape != (lowrank, width)
-        or up.shape != (width, lowrank)
+        or up.shape != expected_up_shape
         or (inject and inject_weight.shape != (branches, width))
         or (prologue and block.shape != (tokens, hidden))
         or (prologue and prev_injection.shape != (tokens, branches))
@@ -315,16 +356,22 @@ def _hc_decode_mix(
     scratch = [
         pltpu.VMEM((width,), jnp.bfloat16),
         pltpu.VMEM((lowrank, width), jnp.bfloat16),
-        pltpu.VMEM((width, lowrank), jnp.bfloat16),
+        pltpu.VMEM(expected_up_shape, jnp.bfloat16),
     ]
     if inject:
         scratch.append(pltpu.VMEM((branches, width), jnp.bfloat16))
+    num_sems = 4 if up_transposed else (3 + branches)
     scratch += [
         pltpu.VMEM((tile, width), jnp.bfloat16),
-        pltpu.SemaphoreType.DMA((3 + branches,)),
+        pltpu.SemaphoreType.DMA((num_sems,)),
     ]
     args = [x, block, prev_injection] if prologue else [x]
     args += [weight, down, up] + ([inject_weight] if inject else [])
+    out_bytes = tokens * hidden * 2
+    if inject:
+        out_bytes += tokens * branches * 4
+    if prologue:
+        out_bytes += tokens * width * 2
     outs = pl.pallas_call(
         functools.partial(
             _kernel,
@@ -333,6 +380,7 @@ def _hc_decode_mix(
             eps=eps,
             prologue=prologue,
             inject=inject,
+            up_transposed=up_transposed,
         ),
         grid=(tokens // tile,),
         in_specs=in_specs,
@@ -344,8 +392,21 @@ def _hc_decode_mix(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=56 << 20,
         ),
+        cost_estimate=pl.CostEstimate(
+            flops=4 * tokens * width * lowrank
+            + tokens * (7 * width + branches + 2 * lowrank)
+            + (2 * tokens * width * branches if inject else 0)
+            + (2 * tokens * width if prologue else 0),
+            transcendentals=tokens
+            * (branches + lowrank + width + (branches if inject else 0)),
+            bytes_accessed=sum(a.size * a.dtype.itemsize for a in args if a is not None)
+            + out_bytes,
+        ),
         interpret=interpret,
-        name=f"qwen4exp_hc_decode{'_combine' if prologue else ''}",
+        name=(
+            f"qwen4exp_hc_decode{'_combine' if prologue else ''}"
+            f"{'_ut' if up_transposed else ''}"
+        ),
     )(*args)
     mixed = outs[0]
     injection = outs[1] if inject else None

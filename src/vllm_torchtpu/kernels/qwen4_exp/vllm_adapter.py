@@ -6,6 +6,7 @@ import hashlib
 
 import jax
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu import envs
@@ -13,14 +14,35 @@ from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode import hc_decode_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _combine_full_mix, _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
+from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
 from vllm_torchtpu.kernels.qwen4_exp.hc_up import _up_epilogue
 
 
+def current_hc_hardware() -> HcHardware | None:
+    """Read layout only after worker TPU initialization; never claim a device."""
+    # torch_tpu registers this public module dynamically.
+    # pyrefly: ignore[missing-attribute]
+    if (
+        not getattr(torch, "tpu", None)
+        or not torch.tpu.is_initialized()
+        or not pltpu.is_tpu_device()
+    ):
+        return None
+    return HcHardware.from_tpu_info(pltpu.get_tpu_info())
+
+
+def _hardware_tag(hardware: HcHardware | None) -> str:
+    return hashlib.sha1(repr(hardware).encode()).hexdigest()[:12]
+
+
 @functools.cache
-def build_gated_residual_op(branches: int, hidden: int, token_tile: int):
+def build_gated_residual_op(
+    branches: int, hidden: int, token_tile: int, hardware: HcHardware | None = None
+):
     op = pallas.jax_op(
-        f"qwen4_exp::gated_residual_b{branches}_h{hidden}_m{token_tile}_v1",
-        gated_residual_fn(branches, hidden, token_tile),
+        f"qwen4_exp::gated_residual_b{branches}_h{hidden}_m{token_tile}"
+        f"_l{_hardware_tag(hardware)}_v2",
+        gated_residual_fn(branches, hidden, token_tile, hardware),
     )
 
     @op.register_fake
@@ -50,26 +72,29 @@ def build_full_mix_op(
     hidden: int,
     eps: float,
     token_tile: int,
+    hardware: HcHardware | None = None,
     up_t: bool = False,
     inject: bool = False,
+    up_transposed: bool = False,
 ):
     """``up_t``: the kernel reads the up projection as its [low rank, width]
-    transpose, taken inside the op (a bitcast of the checkpoint's column-major
-    weight); the op's operands stay the checkpoint tensors either way.
+    transpose, taken inside the op unless ``up_transposed`` is already set;
     ``inject``: it also takes the combine's gate weight and returns the BF16 gate
     projection [tokens, branches] in place of the normalized input."""
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
 
     norm_impl = _hc_prefill_norm()
+    kernel_up_t = up_t or up_transposed
     static = dict(
         branches=branches,
         hidden=hidden,
         eps=eps,
         token_tile=token_tile,
-        up_t=up_t,
+        up_t=kernel_up_t,
+        hardware=hardware,
         norm_impl=norm_impl,
     )
-    _up = _up_operand(up_t)
+    _up = _up_operand(up_t and not up_transposed)
     # torch.library.infer_schema takes explicit tensor parameters only.
     if inject:
 
@@ -91,8 +116,9 @@ def build_full_mix_op(
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"_l{_hardware_tag(hardware)}_ut{int(up_transposed)}"
         f"{'_upt' if up_t else ''}{'_inj' if inject else ''}"
-        f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
+        f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v2",
         core,
     )
 
@@ -114,23 +140,27 @@ def build_combine_full_mix_op(
     hidden: int,
     eps: float,
     token_tile: int,
-    up_t: bool,
+    hardware: HcHardware | None = None,
+    up_t: bool = False,
     inject: bool = False,
+    up_transposed: bool = False,
 ):
     """``(mixed, norm, combined)``: the gated residual merge, then the full mix
     (``inject``: the gate projection in place of ``norm``, as ``build_full_mix_op``)."""
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
 
     norm_impl = _hc_prefill_norm()
+    kernel_up_t = up_t or up_transposed
     static = dict(
         branches=branches,
         hidden=hidden,
         eps=eps,
         token_tile=token_tile,
-        up_t=up_t,
+        up_t=kernel_up_t,
+        hardware=hardware,
         norm_impl=norm_impl,
     )
-    _up = _up_operand(up_t)
+    _up = _up_operand(up_t and not up_transposed)
     if inject:
 
         def core(
@@ -162,8 +192,9 @@ def build_combine_full_mix_op(
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_combine_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"_l{_hardware_tag(hardware)}_ut{int(up_transposed)}"
         f"{'_upt' if up_t else ''}{'_inj' if inject else ''}"
-        f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
+        f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v2",
         core,
     )
 
@@ -209,16 +240,26 @@ def build_norm_op(branches: int, hidden: int, eps: float, token_tile: int):
 
 
 @functools.cache
-def build_up_epilogue_op(branches: int, hidden: int, token_tile: int):
+def build_up_epilogue_op(
+    branches: int, hidden: int, token_tile: int, up_transposed: bool = False
+):
     """Register a local JAX op; callers gate it to whole prefill tiles."""
 
     def core(mid: jax.Array, norm: jax.Array, weight: jax.Array) -> jax.Array:
         return _up_epilogue(
-            mid, norm, weight, branches=branches, hidden=hidden, token_tile=token_tile
+            mid,
+            norm,
+            weight,
+            branches=branches,
+            hidden=hidden,
+            token_tile=token_tile,
+            up_transposed=up_transposed,
         )
 
     op = pallas.jax_op(
-        f"qwen4_exp::hc_up_epilogue_c{branches}_h{hidden}_m{token_tile}_v1", core
+        f"qwen4_exp::hc_up_epilogue_c{branches}_h{hidden}_m{token_tile}"
+        f"_ut{int(up_transposed)}_v1",
+        core,
     )
 
     @op.register_fake
@@ -229,14 +270,22 @@ def build_up_epilogue_op(branches: int, hidden: int, token_tile: int):
 
 
 @functools.cache
-def build_decode_mix_op(branches: int, hidden: int, eps: float, inject: bool):
+def build_decode_mix_op(
+    branches: int,
+    hidden: int,
+    eps: float,
+    inject: bool,
+    up_transposed: bool = False,
+):
     """Register the fused decode HC mix; callers gate it on decode_token_tile.
 
     Returns ``(mixed, injection)`` with ``inject`` (the combine's f32 gate,
     from the same normalized input), else ``mixed`` only.
     """
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
-    static = dict(branches=branches, hidden=hidden, eps=eps)
+    static = dict(
+        branches=branches, hidden=hidden, eps=eps, up_transposed=up_transposed
+    )
     if inject:
 
         def core(
@@ -257,7 +306,7 @@ def build_decode_mix_op(branches: int, hidden: int, eps: float, inject: bool):
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_decode_c{branches}_h{hidden}_e{eps_tag}"
-        f"{'_inj' if inject else ''}_v1",
+        f"{'_inj' if inject else ''}_ut{int(up_transposed)}_v1",
         core,
     )
 
@@ -281,7 +330,9 @@ def build_decode_mix_op(branches: int, hidden: int, eps: float, inject: bool):
 
 
 @functools.cache
-def build_decode_combine_mix_op(branches: int, hidden: int, eps: float):
+def build_decode_combine_mix_op(
+    branches: int, hidden: int, eps: float, up_transposed: bool = False
+):
     """The previous HC's combine fused ahead of this HC's decode mix.
 
     Returns ``(mixed, injection, combined)``; ``combined`` is the hyper input
@@ -309,10 +360,13 @@ def build_decode_combine_mix_op(branches: int, hidden: int, eps: float):
             eps=eps,
             block=block,
             prev_injection=prev_injection,
+            up_transposed=up_transposed,
         )
 
     op = pallas.jax_op(
-        f"qwen4_exp::hc_decode_combine_c{branches}_h{hidden}_e{eps_tag}_v1", core
+        f"qwen4_exp::hc_decode_combine_c{branches}_h{hidden}_e{eps_tag}"
+        f"_ut{int(up_transposed)}_v1",
+        core,
     )
 
     @op.register_fake

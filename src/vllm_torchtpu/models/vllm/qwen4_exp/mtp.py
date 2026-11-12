@@ -157,23 +157,24 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             for i, prefix in enumerate(prefixes)
         )
         tiles = cfg.additional_config.get("qwen4_exp", {})
+        hc_full_tile = tiles.get("hc_prefill_full_tile", 0)
         self.hyper_connection_mixer = GatedResidual(
             hc_config(t),
             use_combine=False,
             prefill_up_tile=int(tiles.get("hc_prefill_up_tile", 0)),
             prefill_norm_tile=int(tiles.get("hc_prefill_norm_tile", 0)),
-            prefill_full_tile=int(tiles.get("hc_prefill_full_tile", 0)),
+            prefill_full_tile=hc_full_tile if isinstance(hc_full_tile, int) else 0,
         )
         # The draft is traced once for every token bucket (see
         # draft_additional_config): its attention must not choose its
         # structure by the token count either, and its HCs keep the unfused
-        # decode mix (TPU_QWEN4_HC_DECODE_FUSED picks the fused path by the
-        # token count while tracing).
+        # decode/prefill mix (auto prefill and decode fusion pick by token count).
         for layer in self.layers:
             cast(Any, layer.self_attn).single_graph = True
         for module in self.modules():
             if isinstance(module, GatedResidual):
                 module.disable_decode_fused()
+                module.disable_prefill_fused()
         # Set by the Qwen3.8 megakernel driver before the first trace: the
         # layer's o_proj, both HCs and the MoE as one tail-kernel call.
         self.mk_tail: nn.Module | None = None
@@ -470,4 +471,7 @@ class Qwen4ExpMTP(nn.Module):
         }
         if missing:
             raise ValueError(f"Incomplete Qwen4Exp MTP checkpoint: {sorted(missing)}")
+        for module in self.modules():
+            if isinstance(module, GatedResidual) and module.use_mix:
+                module.transpose_up_weight()
         return set(parameters)
