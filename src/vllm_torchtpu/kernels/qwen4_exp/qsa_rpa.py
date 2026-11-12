@@ -698,6 +698,7 @@ def _prefill_attention(
                     "return_lse": True,
                     "kv_head_offset": kv_head_offset,
                     "precheck_stride": envs.VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK,
+                    "precheck_cost": _union_dcp_cost(),
                 }
                 if union_dcp
                 else {}
@@ -719,6 +720,16 @@ def _prefill_attention(
         dcp=dcp,
         return_lse=return_lse,
     )
+
+
+def _union_dcp_cost():
+    raw = envs.VLLM_TPU_QSA_PREFILL_UNION_DCP_COST.strip()
+    if not raw or raw.lower() in ("0", "off", "none"):
+        return None
+    cost = tuple(float(x) for x in raw.split(","))
+    if len(cost) != 4:
+        raise ValueError("VLLM_TPU_QSA_PREFILL_UNION_DCP_COST: walk_fixed,walk_per_group,sparse_fixed,sparse_per_page")
+    return cost
 
 
 def block_sparse_prefill(

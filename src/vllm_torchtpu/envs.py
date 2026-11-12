@@ -144,7 +144,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY: str = "vmem"
     VLLM_TPU_QSA_PREFILL_UNION_DCP: bool = False
-    VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA: float = 0.2
+    VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA: float = 0.6
+    VLLM_TPU_QSA_PREFILL_UNION_DCP_COST: str = "0.75,2.2e-5,1.0,8e-3"
     VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK: int = 8
     VLLM_TPU_QSA_PREFILL_UNION_PROBE: int = 0
     VLLM_TPU_QSA_PREFILL_PREFIX_PAGES: bool = False
@@ -1066,10 +1067,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_UNION_DCP": env_bool("VLLM_TPU_QSA_PREFILL_UNION_DCP"),
     # DCP_ALPHA (with DCP): the union walk's alpha under DCP (replaces ALPHA
     # there): fall back to block-sparse when any 128-row group's owned union
-    # exceeds this fraction of its owned visible groups (0 = off). The walk
-    # wins only on sparse unions (74K context, 8K chunk: 9.5% union 0.70x,
-    # 36% union 1.78x the block-sparse time).
-    "VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": env_float("VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA", 0.2),
+    # exceeds this fraction of its owned visible groups (0 = off). A backstop:
+    # the walk's win depends on the block-sparse kernel's page coverage too,
+    # which DCP_COST models (j-7a3ce29d: union 20% spread over every page 1.44x,
+    # 36% page-local 0.95x).
+    "VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": env_float("VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA", 0.6),
+    # DCP_COST (with DCP_PRECHECK; "" / "off" = alpha only): ms per 1024-row
+    # block "walk_fixed,walk_per_group,sparse_fixed,sparse_per_page"; the
+    # precheck's sample takes the walk only when its modelled walk time is
+    # below the block-sparse time for the owned pages its union touches.
+    # Default fitted on j-7a3ce29d (8K chunk, 74K context, top-k 2048).
+    "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": env_str(
+        "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST", "0.75,2.2e-5,1.0,8e-3"
+    ),
     # DCP_PRECHECK=<stride> (with DCP and DCP_ALPHA; 0 = off): check alpha on
     # every stride-th 128-row tile before the full plan, so a dense step goes
     # to block-sparse without paying the plan.

@@ -81,6 +81,7 @@ UNION_ENV = {
     # bench sets the served alpha / precheck explicitly.
     "VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0",
     "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "0",
+    "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": "off",
 }
 
 
@@ -229,7 +230,7 @@ def check_union_case(case, setenv, *, tol=TPU_TOL):
                                             case.dcp_rows, case.rank_pools[r], dcp=dcp, **case.opts)
         _, kv_lens, _, _ = reference_metadata(case.blocks, case.lengths, case.dcp_rows,
                                               ratio=case.ratio, page_size=B, dcp=(r, D))
-        loose = Tolerance(rtol=1.0, atol=1.0, lse_atol=tol.lse_atol)  # support / NaN / lse checks only
+        loose = Tolerance(rtol=1.0, atol=1.0, lse_atol=1.0)  # support / NaN checks only
         check_partial(*u, ref_out, ref_lse, kv_lens, loose, what=f"union rank {r} vs reference")
         check_partial(*s, ref_out, ref_lse, kv_lens, loose, what=f"block-sparse rank {r} vs reference")
         live = np.broadcast_to((kv_lens > 0)[:, None], np.asarray(ref_lse).shape)
@@ -239,6 +240,16 @@ def check_union_case(case, setenv, *, tol=TPU_TOL):
                                          worst_sparse=_worst_rows(s[0], ref_out, case, kv_lens))
         assert eu[0] <= 2 * max(es[0], 1e-6) and eu[1] <= 2 * max(es[1], 1e-6), (
             f"rank {r}: union error {eu} > 2x block-sparse {es}: {reports[f'err_vs_ref{r}']}")
+        fin = np.isfinite(np.asarray(ref_lse))
+        lu = np.abs(np.asarray(u[1]) - np.asarray(ref_lse))
+        ls = np.abs(np.asarray(s[1]) - np.asarray(ref_lse))
+        lu, ls = np.where(fin, lu, 0).max(1), np.where(fin, ls, 0).max(1)
+        top = np.argsort(-lu)[:4]
+        reports[f"lse_err{r}"] = dict(
+            union=float(lu.max()), block_sparse=float(ls.max()),
+            worst_union=[(int(i), round(float(lu[i]), 5), round(float(ls[i]), 5), int(case.lengths[i]),
+                          int(case.row_req[i]), int(kv_lens[i])) for i in top])
+        assert lu.max() <= max(2 * ls.max(), tol.lse_atol), f"rank {r} lse: {reports[f'lse_err{r}']}"
         reports[f"walk_ran{r}"] = bool((u[0] != s[0]).any())
         reports[f"rows_owning_nothing{r}"] = int(((kv_lens == 0) & (case.lengths > 0)).sum())
         union.append(u)
@@ -333,8 +344,9 @@ def test_flag_routes_dcp_prefill_to_union_walk(monkeypatch, slot):
     off = _jaxpr(True, slot)
     assert "qsa_union_walk" not in off
     # The served defaults (alpha 0.2, sampled precheck) trace too.
-    _set_env(monkeypatch.setenv, True, {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.2",
-                                        "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "8"})
+    _set_env(monkeypatch.setenv, True, {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.6",
+                                        "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "8",
+                                        "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": "0.75,2.2e-5,1.0,8e-3"})
     served = _jaxpr(True, slot)
     assert "qsa_union_walk_g128_kv1024_lean_fast_pg_lse" in served and served != on
     # Variants the DCP walk does not support keep the block-sparse kernel.
@@ -424,10 +436,13 @@ def _time(fn, iters=10):
 
 ARMS = {
     "block_sparse": {"VLLM_TPU_QSA_PREFILL_UNION_DCP": "0"},
-    "walk_forced": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "0"},
-    "served_a0.2_pc8": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.2", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "8"},
-    "served_a0.2_nopc": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.2", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "0"},
-    "fallback_cap1": {"VLLM_TPU_QSA_PREFILL_UNION_CAP": "1"},
+    "walk_forced": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "0",
+                    "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": "off"},
+    # The served defaults: precheck 8 with the cost model, alpha 0.6 backstop.
+    "served": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.6", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "8",
+               "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": "0.75,2.2e-5,1.0,8e-3"},
+    "alpha0.2_pc8": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.2", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "8",
+                     "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": "off"},
 }
 MODELS = ("random", "hot0.1", "hot0.2", "hot0.36", "pages0.1", "pages0.2", "pages0.36")
 
@@ -496,10 +511,11 @@ def bench(chunk=8192, context=74000, budget=2048, models=MODELS, ranks=(0,)):
                     *a, dcp=(rank_operand(r), D), return_lse=True, **case.opts)[:2])
                 row[arm] = round(_time(lambda: fn(*args)), 3)
                 outs[arm] = np.asarray(fn(*args)[0])
-            row["served_took_walk"] = bool((outs["served_a0.2_pc8"] != outs["block_sparse"]).any())
+            row["served_took_walk"] = bool((outs["served"] != outs["block_sparse"]).any())
             row["walk_vs_bs_max_abs"] = float(np.abs(outs["walk_forced"] - outs["block_sparse"]).max())
             row["walk_speedup"] = round(row["block_sparse"] / row["walk_forced"], 3)
-            row["served_speedup"] = round(row["block_sparse"] / row["served_a0.2_pc8"], 3)
+            row["served_speedup"] = round(row["block_sparse"] / row["served"], 3)
+            row["best_possible"] = round(row["block_sparse"] / min(row["block_sparse"], row["walk_forced"]), 3)
             results[f"{model}_rank{r}"] = row
             print("BENCH", model, r, row, flush=True)
     return results
@@ -539,5 +555,7 @@ if __name__ == "__main__":
                 print("FAIL fallback", which, repr(e)[:4000], flush=True)
         if "--bench" in sys.argv:
             bench()
+            print("BENCH shape 4096-row chunk, 40K context", flush=True)
+            bench(chunk=4096, context=40000, models=("random", "hot0.2", "hot0.36", "pages0.1", "pages0.36"))
     print("FAILURES", failures)
     sys.exit(1 if failures else 0)

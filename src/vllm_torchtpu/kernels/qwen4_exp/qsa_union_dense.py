@@ -1953,7 +1953,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                        lean, walk_runs=0, union_alpha=0.0, share_bits=False, qk16=False, listed=None,
                        run_tables=False, max_run=8, lazy_share=False, gathered=None, gather_chunks=4,
                        gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem", sc_bitset=False,
-                       dcp=None, return_lse=False, kv_head_offset=0, precheck_stride=0):
+                       dcp=None, return_lse=False, kv_head_offset=0, precheck_stride=0, precheck_cost=None):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
 
     ``dcp=(rank int32[1], world)`` with ``return_lse`` (VLLM_TPU_QSA_PREFILL_UNION_DCP,
@@ -1972,7 +1972,13 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
     send the whole step to the DCP block-sparse call, without the full plan,
     when any sampled tile's owned union exceeds ``union_alpha`` times its
     owned visible groups (or ``union_cap``). Tiles the sample misses are still
-    caught by the full plan's alpha check.
+    caught by the full plan's alpha check. The sample is every
+    ``precheck_stride``-th 1024-row block (one block at 8K rows for 8).
+    ``precheck_cost`` (with ``precheck_stride``): ``(walk_fixed, walk_per_group,
+    sparse_fixed, sparse_per_page)`` in ms per 1024-row block: the sampled
+    blocks take the walk only when ``walk_fixed + walk_per_group * union
+    groups`` is below ``sparse_fixed + sparse_per_page * owned pages the
+    block's union touches`` (the block-sparse kernel's tiles).
 
     Same contract as ``block_sparse_gqa_attention`` without ``return_lse``.
     ``table`` holds one page row per query row and ``starts`` the request
@@ -2294,18 +2300,42 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
         route = jnp.where(jnp.all(real % align == 0), 0, route + 1)
     branches.append(skip)
     route = jnp.where(jnp.max(lengths) >= min_context, route, len(branches) - 1)
-    if dcp is not None and precheck_stride and union_alpha and tokens % 128 == 0:
-        sample = np.arange(0, tokens // 128, int(precheck_stride))
-        sampled_blocks = walk_blocks.reshape(tokens // 128, 128, -1)[sample].reshape(-1, blocks.shape[1])
-        sampled_lengths = walk_lengths.reshape(tokens // 128, 128)[sample].reshape(-1)
-        _, _, sampled_usize, _ = union_bits_plan(
+    if dcp is not None and precheck_stride and (union_alpha or precheck_cost) and tokens % 128 == 0:
+        # Sampled pre-plan check: every precheck_stride-th 1024-row block of the step (as it arrives).
+        sample_rows = min(1024, tokens)
+        nblocks = tokens // sample_rows
+        sample = np.arange(min(int(precheck_stride) // 2, nblocks - 1), nblocks, int(precheck_stride))
+        sampled_blocks = walk_blocks[: nblocks * sample_rows].reshape(nblocks, sample_rows, -1)[sample]
+        sampled_blocks = sampled_blocks.reshape(-1, blocks.shape[1])
+        sampled_lengths = walk_lengths[: nblocks * sample_rows].reshape(nblocks, sample_rows)[sample].reshape(-1)
+        _, sampled_ubits, sampled_usize, _ = union_bits_plan(
             sampled_blocks, sampled_lengths, group=128, union_cap=union_cap, groups_cap=groups_cap,
             ratio=ratio, bitset="sparsecore" if sc_bitset else "tensorcore",
         )
         sampled_visible = jnp.max(((sampled_lengths + ratio - 1) // ratio).reshape(-1, 128), axis=1)
-        sparse = jnp.all(
-            sampled_usize.astype(jnp.float32) <= union_alpha * sampled_visible.astype(jnp.float32)
-        ) & (jnp.max(sampled_usize) <= union_cap)
+        sparse = jnp.max(sampled_usize) <= union_cap
+        if union_alpha:
+            sparse &= jnp.all(
+                sampled_usize.astype(jnp.float32) <= union_alpha * sampled_visible.astype(jnp.float32)
+            )
+        if precheck_cost:
+            # Modelled per 1024-row block (8K chunk, 74K context, TPU7x): walk = fixed + per union group;
+            # block-sparse = fixed + per (1024-row block, owned page) it touches.
+            walk_fixed, walk_per_group, sparse_fixed, sparse_per_page = precheck_cost
+            tiles_per_block = sample_rows // 128
+            words = sampled_ubits.shape[1]
+            words_per_page = page_size // (ratio * 32)
+            per_block = lax.bitcast_convert_type(sampled_ubits, jnp.uint32).reshape(
+                len(sample), tiles_per_block, words)
+            pages_or = lax.reduce(per_block, np.uint32(0), lax.bitwise_or, (1,))
+            pages_or = jnp.pad(pages_or, ((0, 0), (0, (-words) % words_per_page)))
+            pages_touched = jnp.sum(
+                jnp.any(pages_or.reshape(len(sample), -1, words_per_page) != 0, axis=2), dtype=jnp.int32)
+            union_groups = jnp.sum(sampled_usize, dtype=jnp.int32)
+            scale = sample_rows / 1024 * len(sample)
+            walk_cost = walk_fixed * scale + walk_per_group * union_groups.astype(jnp.float32)
+            sparse_cost = sparse_fixed * scale + sparse_per_page * pages_touched.astype(jnp.float32)
+            sparse &= walk_cost < sparse_cost
         route = jnp.where(sparse, route, len(branches) - 1)
     raw, fits = lax.switch(route, branches)
     if dcp is not None:
