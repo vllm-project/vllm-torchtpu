@@ -143,3 +143,43 @@ def test_dispatch_and_combine_with_sequence_parallel(
             assert invocation.kwargs == {"dim": 0}
         assert ep_group.all_gather.call_count == count
         ep_group.reduce_scatter.assert_not_called()
+
+
+@pytest.mark.parametrize("is_sequence_parallel", [False, True])
+def test_combine_routes_through_the_small_reduce_scatter(
+    monkeypatch, communicator, is_sequence_parallel
+):
+    small = pytest.importorskip("vllm_torchtpu.layers.adapter.small_all_reduce_op")
+    group = Mock(world_size=8, ranks=list(range(8)))
+    monkeypatch.setattr(comm, "get_ep_group", lambda: group)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    calls = []
+
+    def reduce_scatter(x, group_ranks, fallback):
+        calls.append(group_ranks)
+        return fallback(x)
+
+    monkeypatch.setattr(small, "reduce_scatter", reduce_scatter)
+    x = torch.ones(8, 2)
+    result = communicator.combine(x, is_sequence_parallel=is_sequence_parallel)
+    assert calls == [group.ranks]
+    group.reduce_scatter.assert_called_once_with(x, dim=0)
+    assert result is group.reduce_scatter.return_value
+
+
+def test_all_reduce_routes_through_the_small_all_reduce(monkeypatch, communicator):
+    small = pytest.importorskip("vllm_torchtpu.layers.adapter.small_all_reduce_op")
+    communicator.ranks = [0, 1, 2, 3]
+    base = Mock(side_effect=lambda x: x * 4)
+    monkeypatch.setattr(comm.DeviceCommunicatorBase, "all_reduce", base, raising=False)
+    calls = []
+
+    def all_reduce(x, group_ranks, fallback):
+        calls.append(group_ranks)
+        return fallback(x)
+
+    monkeypatch.setattr(small, "all_reduce", all_reduce)
+    x = torch.ones(2, 2)
+    torch.testing.assert_close(communicator.all_reduce(x), x * 4)
+    assert calls == [[0, 1, 2, 3]]
+    base.assert_called_once_with(x)
