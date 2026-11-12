@@ -59,10 +59,8 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 )
 
 _NEG_INF = float("-inf")
-# The narrowest column count `local_candidates` scans (a vreg's lanes), and
-# the fewest tokens for which row-major blocks pick a width per row block.
+# The narrowest column count `local_candidates` scans (a vreg's lanes).
 _MIN_CANDIDATE_WIDTH = 128
-_MIN_CANDIDATE_TOKENS = 1024
 
 # Up to this many tokens (`msa_attention.SMALL_BATCH_TOKENS` is the non-DCP
 # limit; every decode bucket) an 8-token verify group fills an attention tile
@@ -355,17 +353,10 @@ def local_candidates(
     # Static scan widths (`_scan_widths`, one kernel body each); each row
     # block takes the narrowest one holding every block its rows see (a
     # rank's blocks below n are among its first ceil(n / dcp) columns). Decode
-    # batches of transposed blocks too: their scores span max-model-len,
-    # ~2x the columns a request at the served contexts sees (c48 twin: 1,024
-    # columns, ~390 visible). Row-major (small) blocks scan the full width:
-    # their unrolled bodies per width made the c16 b6 call slower (3.55 ->
-    # 4.13 us, twins j-93d4e683 / j-26f6865b).
-    transposed = block_rows % _TRANSPOSED_ROWS == 0
-    widths = (
-        _scan_widths(num_cols, pretransposed)
-        if transposed or num_tokens > _MIN_CANDIDATE_TOKENS
-        else [num_cols]
-    )
+    # batches too: their scores span max-model-len, ~3x the columns a decode
+    # request at the served contexts sees (c4 / c48 twins: 1,024 columns,
+    # ~330 / ~520 visible).
+    widths = _scan_widths(num_cols, pretransposed)
     num_blocks = (num_tokens + pad) // block_rows
     if len(widths) == 1:
         row_widths = jnp.full((num_blocks,), num_cols, jnp.int32)
@@ -379,6 +370,7 @@ def local_candidates(
         # block the grid keeps for an empty class) only moves its blocks.
         first_row = jnp.arange(num_blocks, dtype=jnp.int32) * block_rows
         row_widths = jnp.where(first_row < live_rows, row_widths, 0)
+    transposed = block_rows % _TRANSPOSED_ROWS == 0
     if transposed:
         kernel = functools.partial(_candidates_kernel_t, pretransposed=pretransposed)
         pos_spec = pl.BlockSpec((1, block_rows), lambda i: (0, i))
