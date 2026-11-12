@@ -627,26 +627,22 @@ def _class_candidates(
             col_pos,
             live_rows=scored.num_tiles * block_q,
         )
-        picks.append((s, b))
+        picks.append(pack_candidates(s, b))
         # Each head's and token's column in this class (`_class_scores`).
         start = msa_indexer.lookup(scored.tile_start, seq_of_token)[None]
         off = rows - start
         col = (
             msa_indexer.lookup(scored.first_tile, seq_of_token)[None] + off // block_q
         ) * block_q
-        cols.append(jnp.clip(col + off % block_q, 0, s.shape[0] - 1).reshape(-1))
+        cols.append(jnp.clip(col + off % block_q, 0, picks[-1].shape[0] - 1))
     # A head's and token's picks: its large-class column if its request is
-    # large, else its small-class one. Each class's picks are gathered
-    # before they are packed: packing the classes' picks and gathering from
-    # their concatenation copied every row of both ([15296, 32] f32, ~4 us
-    # per layer in the c64 decode twin, j-0db341fb).
-    is_large = msa_indexer.lookup(plan.is_large, seq_of_token)[None]
-    is_large = jnp.broadcast_to(is_large, (num_heads, num_tokens)).reshape(-1, 1)
-    (s_small, b_small), (s_large, b_large) = picks
-    packed = pack_candidates(
-        jnp.where(is_large, s_large[cols[1]], s_small[cols[0]]),
-        jnp.where(is_large, b_large[cols[1]], b_small[cols[0]]),
-    )  # [G * T, 2 * topk]
+    # large, else its small-class one.
+    col = jnp.where(
+        msa_indexer.lookup(plan.is_large, seq_of_token)[None],
+        picks[0].shape[0] + cols[1],
+        cols[0],
+    )
+    packed = jnp.concatenate(picks, axis=0)[col.reshape(-1)]  # [G * T, 2 * topk]
     return (
         packed.reshape(num_heads, num_tokens, -1)
         .transpose(1, 0, 2)
