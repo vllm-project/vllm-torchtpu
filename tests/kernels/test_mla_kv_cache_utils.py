@@ -35,6 +35,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     update_sparse_mla_kv_cache_jax,
 )
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
+from vllm_torchtpu.kernels.mla.sparse import native_sc_cache_layout, native_sc_gather
 
 LKV_DIM = 512
 ROPE_DIM = 64
@@ -85,7 +86,7 @@ def token_bytes(cache: jax.Array, spec: SparseMLAKVCacheSpec) -> np.ndarray:
     """
     rows = np.asarray(cache).reshape(spec.num_pages, spec.page_size, -1)
     if spec.layout is KVCacheLayout.SPARSECORE:
-        # nope [P, S, 128] u32 and rope [P, S // 4, 128] u32.
+        # nope [P, S, 128] u32 and rope [P, S // tokens_per_row, 128] u32.
         rows = unpack4(rows)
     # TENSORCORE nope [P, S, 4, 128] and rope [P, S // 4, 4, 128] are already
     # byte images -- the reshape above is the whole decode.
@@ -265,16 +266,16 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
         for token in range(num_tokens):
             np.testing.assert_array_equal(sc_words[3, token], expected[token])
 
-        # ...and the two layouts hold the same bytes, differing only in how
-        # the 32-bit packing is expressed.
-        np.testing.assert_array_equal(
-            token_bytes(
-                caches[KVCacheLayout.SPARSECORE], specs[KVCacheLayout.SPARSECORE]
-            ),
-            token_bytes(
-                caches[KVCacheLayout.TENSORCORE], specs[KVCacheLayout.TENSORCORE]
-            ),
+        # ...and the two layouts hold the same logical bytes, differing only in
+        # how the 32-bit packing is expressed (and TC's 128B zero-padded tail).
+        sc_bytes = token_bytes(
+            caches[KVCacheLayout.SPARSECORE], specs[KVCacheLayout.SPARSECORE]
         )
+        tc_bytes = token_bytes(
+            caches[KVCacheLayout.TENSORCORE], specs[KVCacheLayout.TENSORCORE]
+        )
+        np.testing.assert_array_equal(sc_bytes, tc_bytes[..., : sc_bytes.shape[-1]])
+        self.assertEqual(int(np.count_nonzero(tc_bytes[..., sc_bytes.shape[-1] :])), 0)
 
 
 class PackingTest(parameterized.TestCase):
@@ -465,9 +466,26 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
             interleave_size=16,
             layout=KVCacheLayout.SPARSECORE,
         ),
+        dict(
+            testcase_name="d8_i4_sc",
+            dcp_size=8,
+            interleave_size=4,
+            layout=KVCacheLayout.SPARSECORE,
+        ),
+        dict(
+            testcase_name="d4_i8_sc_128b_rope",
+            dcp_size=4,
+            interleave_size=8,
+            layout=KVCacheLayout.SPARSECORE,
+            rope_dim=128,
+        ),
     )
     def test_rows_land_where_the_interleave_says(
-        self, dcp_size, interleave_size, layout=KVCacheLayout.TENSORCORE
+        self,
+        dcp_size,
+        interleave_size,
+        layout=KVCacheLayout.TENSORCORE,
+        rope_dim=ROPE_DIM,
     ):
         """Each row reaches exactly one rank, at the reference (page, slot).
 
@@ -480,7 +498,12 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
             KVCacheType.NOPE, layout, TOTAL_PAGES, PAGE_SIZE, LKV_DIM, KV_PACKING
         )
         rope_spec = SparseMLAKVCacheSpec.create(
-            KVCacheType.ROPE, layout, TOTAL_PAGES, PAGE_SIZE, ROPE_DIM, KV_PACKING
+            KVCacheType.ROPE,
+            layout,
+            TOTAL_PAGES,
+            PAGE_SIZE,
+            rope_dim,
+            KV_PACKING,
         )
         inputs = self._inputs(dcp_size, interleave_size)
         shards = self._run_group(
@@ -612,3 +635,222 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
                 dcp_size=2,
                 interleave_size=4,
             )
+
+
+def _emulate_native_rope_gather(
+    cache: jax.Array, spec: SparseMLAKVCacheSpec, flat_indices: np.ndarray
+) -> np.ndarray:
+    """CPU model of `dsa_gather_native_sc`'s ROPE output.
+
+    The kernel reads each selected token's `token_bytes // WORD_BYTES` words,
+    runs `transpose_quad` on every four consecutive selections, stores band
+    `b` at lanes `[b * words, (b + 1) * words)` and zeroes the lanes past
+    them. Everything but the indirect DMA, which is exact row addressing.
+    """
+    words = spec.token_bytes // WORD_BYTES
+    rows = np.asarray(cache).reshape(-1, words)[flat_indices]
+    quads = rows.reshape(-1, native_sc_gather.ROPE_PACKING, words)
+    bands = native_sc_gather.transpose_quad(
+        [jnp.asarray(quads[:, t]) for t in range(native_sc_gather.ROPE_PACKING)]
+    )
+    out = np.zeros((quads.shape[0], 128), np.uint32)
+    for band, data in enumerate(bands):
+        out[:, band * words : (band + 1) * words] = np.asarray(data)
+    return out
+
+
+class SparseCoreRopePackingTest(parameterized.TestCase):
+    """Generic SparseCore RoPE packing: 64B/token (8 tokens/row) by default."""
+
+    PACKED = SparseMLAKVCacheSpec.create(
+        KVCacheType.ROPE,
+        KVCacheLayout.SPARSECORE,
+        TOTAL_PAGES,
+        PAGE_SIZE,
+        ROPE_DIM,
+        KV_PACKING,
+    )
+    PADDED = SparseMLAKVCacheSpec.create(
+        KVCacheType.ROPE,
+        KVCacheLayout.SPARSECORE,
+        TOTAL_PAGES,
+        PAGE_SIZE,
+        128,
+        KV_PACKING,
+    )
+    NOPE = SparseMLAKVCacheSpec.create(
+        KVCacheType.NOPE,
+        KVCacheLayout.SPARSECORE,
+        TOTAL_PAGES,
+        PAGE_SIZE,
+        LKV_DIM,
+        KV_PACKING,
+    )
+
+    def test_default_sparsecore_spec_halves_the_rope_cache(self):
+        self.assertEqual(self.PACKED.token_bytes, ROPE_DIM)
+        self.assertEqual(self.PACKED.tokens_per_row, 8)
+        self.assertEqual(self.PACKED.shape, (TOTAL_PAGES, PAGE_SIZE // 8, 128))
+        self.assertEqual(self.PADDED.token_bytes, 128)
+        self.assertEqual(self.PADDED.tokens_per_row, 4)
+        self.assertEqual(self.PADDED.shape, (TOTAL_PAGES, PAGE_SIZE // 4, 128))
+        packed, padded = _empty(self.PACKED), _empty(self.PADDED)
+        self.assertEqual(packed.nbytes, TOTAL_PAGES * PAGE_SIZE * ROPE_DIM)
+        self.assertEqual(2 * packed.nbytes, padded.nbytes)
+        # The latent: 512 + 128 = 640 B/token padded, 512 + 64 = 576 packed.
+        nope = _empty(self.NOPE).nbytes
+        self.assertEqual(
+            (nope + packed.nbytes) // (TOTAL_PAGES * PAGE_SIZE), LKV_DIM + ROPE_DIM
+        )
+        self.assertEqual(
+            (nope + padded.nbytes) // (TOTAL_PAGES * PAGE_SIZE), LKV_DIM + 128
+        )
+
+    def test_generic_alignment_and_xla_tile_fallback(self):
+        """Narrower RoPE dims align up to 64B and zero-pad their tail; pages
+        whose 8-token row count would be XLA-tile-padded fall back to 128B."""
+        spec_32 = SparseMLAKVCacheSpec.create(
+            KVCacheType.ROPE,
+            KVCacheLayout.SPARSECORE,
+            TOTAL_PAGES,
+            PAGE_SIZE,
+            32,
+            KV_PACKING,
+        )
+        self.assertEqual((spec_32.token_bytes, spec_32.tokens_per_row), (64, 8))
+        raw = np.full((4, 32), 0x5A, np.uint8)
+        k_pe = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
+        kv_c = jnp.zeros((4, LKV_DIM), jnp.float8_e4m3fn)
+        _, rope_32 = update_sparse_mla_kv_cache_jax(
+            _empty(self.NOPE),
+            _empty(spec_32),
+            kv_c,
+            k_pe,
+            jnp.asarray([4], jnp.int32),
+            jnp.asarray([1], jnp.int32),
+            jnp.asarray([0, 4], jnp.int32),
+            nope_spec=self.NOPE,
+            rope_spec=spec_32,
+        )
+        decoded = token_bytes(rope_32, spec_32)[1, :4]
+        np.testing.assert_array_equal(decoded[:, :32], raw)
+        self.assertEqual(int(np.count_nonzero(decoded[:, 32:])), 0)
+
+        for fallback_page in (4, 96):
+            spec_fb = SparseMLAKVCacheSpec.create(
+                KVCacheType.ROPE,
+                KVCacheLayout.SPARSECORE,
+                TOTAL_PAGES,
+                fallback_page,
+                ROPE_DIM,
+                KV_PACKING,
+            )
+            self.assertEqual(
+                (spec_fb.token_bytes, spec_fb.tokens_per_row),
+                (128, 4),
+            )
+            self.assertEqual(spec_fb.shape, (TOTAL_PAGES, fallback_page // 4, 128))
+
+    def test_invalid_sparsecore_rope_shapes_rejected(self):
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            SparseMLAKVCacheSpec.create(
+                KVCacheType.ROPE,
+                KVCacheLayout.SPARSECORE,
+                TOTAL_PAGES,
+                PAGE_SIZE,
+                192,
+                KV_PACKING,
+            )
+        with self.assertRaisesRegex(ValueError, "page_size"):
+            SparseMLAKVCacheSpec.create(
+                KVCacheType.ROPE,
+                KVCacheLayout.SPARSECORE,
+                TOTAL_PAGES,
+                2,
+                ROPE_DIM,
+                kv_packing=1,
+            )
+
+    def test_packed_writer_matches_the_host_layout(self):
+        """The jnp writer lays tokens out exactly as `pack_rope_packed`, the
+        byte contract the native gather is tested against on TPU."""
+        num_tokens = PAGE_SIZE * 2
+        rng = np.random.default_rng(3)
+        raw = rng.integers(0, 256, (num_tokens, ROPE_DIM), np.uint8)
+        k_pe = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
+        kv_c = jnp.zeros((num_tokens, LKV_DIM), jnp.float8_e4m3fn)
+        block_tables = np.array([6, 2, 0, 0], np.int32)
+        _, rope = update_sparse_mla_kv_cache_jax(
+            _empty(self.NOPE),
+            _empty(self.PACKED),
+            kv_c,
+            k_pe,
+            jnp.asarray([num_tokens], jnp.int32),
+            jnp.asarray(block_tables),
+            jnp.asarray([0, num_tokens], jnp.int32),
+            nope_spec=self.NOPE,
+            rope_spec=self.PACKED,
+        )
+        expected = native_sc_cache_layout.pack_rope_packed(
+            raw.reshape(2, PAGE_SIZE, ROPE_DIM)
+        )
+        rope = np.asarray(rope)
+        np.testing.assert_array_equal(rope[6], expected[0])
+        np.testing.assert_array_equal(rope[2], expected[1])
+        self.assertEqual(int(np.count_nonzero(np.delete(rope, [2, 6], axis=0))), 0)
+
+    def test_packed_and_padded_round_trip_through_the_gather(self):
+        """Write then gather: the packed cache yields the same rows the padded
+        one does, which are the selected tokens' rope with a zero tail."""
+        rng = np.random.default_rng(7)
+        q_lens = [5, 3, 1, 23]
+        seq_lens = np.array([37, 3, 90, 64], np.int32)
+        num_tokens = sum(q_lens)
+        query_start_loc = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+        block_tables = rng.permutation(TOTAL_PAGES).astype(np.int32)
+        raw = rng.integers(0, 256, (num_tokens, ROPE_DIM), np.uint8)
+        k_pe = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
+        kv_c = jnp.zeros((num_tokens, LKV_DIM), jnp.float8_e4m3fn)
+        caches = {}
+        for name, spec in (("packed", self.PACKED), ("padded", self.PADDED)):
+            _, caches[name] = update_sparse_mla_kv_cache_jax(
+                _empty(self.NOPE),
+                _empty(spec),
+                kv_c,
+                k_pe,
+                jnp.asarray(seq_lens),
+                jnp.asarray(block_tables),
+                jnp.asarray(query_start_loc),
+                nope_spec=self.NOPE,
+                rope_spec=spec,
+            )
+        rows = get_dst_rows(
+            num_tokens,
+            jnp.asarray(seq_lens),
+            jnp.asarray(block_tables),
+            jnp.asarray(query_start_loc),
+            PAGE_SIZE,
+        )
+        rows = np.asarray(rows)
+        # Every written token, repeated and shuffled, plus never-written rows.
+        picks = rng.integers(0, num_tokens, 4 * 64)
+        selected = rows[picks].copy()
+        selected[::7] = rng.integers(0, TOTAL_PAGES * PAGE_SIZE, selected[::7].size)
+        expected_u8 = np.zeros((selected.size, 128), np.uint8)
+        written = dict(zip(rows.tolist(), raw))
+        for i, row in enumerate(selected.tolist()):
+            if row in written:
+                expected_u8[i, :ROPE_DIM] = written[row]
+
+        got = {
+            name: _emulate_native_rope_gather(caches[name], spec, selected)
+            for name, spec in (("packed", self.PACKED), ("padded", self.PADDED))
+        }
+        np.testing.assert_array_equal(got["packed"], got["padded"])
+        np.testing.assert_array_equal(
+            got["padded"],
+            native_sc_cache_layout.pack_selected_rope_for_tc(expected_u8),
+        )
+        # The attention body bitcasts each row to four tokens' uint8 rows.
+        tokens_u8 = unpack4(got["packed"]).reshape(-1, 128)
+        np.testing.assert_array_equal(tokens_u8, expected_u8)

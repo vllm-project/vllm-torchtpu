@@ -210,6 +210,41 @@ def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
     return min_page_size
 
 
+def kv_page_head_padding(
+    pool_page: tuple[int, ...],
+    native_page: tuple[int, ...],
+    pool_head_dim: int,
+    head_size: int,
+) -> int:
+    """How far to pad q/k/v so they match the head width of the KV page.
+
+    A layer writing its own native page needs no padding: the RPA kernels align
+    head_dim themselves, and the head_dim=64 page packs K and V along its last
+    axis, so that axis is twice the head width. Only a page defined by another
+    spec, such as a draft layer sharing the target's unified pool, needs q/k/v
+    padded out to the page width.
+
+    `native_page` comes from `PallasAttentionBackend.get_kv_cache_shape`, the
+    head-along-sublane layout. A SEQ_ALONG_LANE pool (`VLLM_KV_CACHE_LAYOUT=HND`)
+    never matches it, so those layers keep the width rule they had before.
+
+    Args:
+        pool_page: Trailing `(heads, packing, head_dim)` axes of the allocated
+            KV pool, after the block and page-size axes.
+        native_page: The same trailing axes that
+            `PallasAttentionBackend.get_kv_cache_shape` would allocate for this
+            layer on its own pool.
+        pool_head_dim: Effective head width of `pool_page`.
+        head_size: Unpadded head size of this attention layer.
+
+    Returns:
+        Elements of zero-padding to append along the head dimension of q/k/v.
+    """
+    if pool_page == native_page or pool_head_dim <= head_size:
+        return 0
+    return pool_head_dim - head_size
+
+
 def _reshape_packed_kv_cache(kv_cache: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     if kv_cache.shape[-2:] == shape[-2:]:
         return kv_cache.reshape(shape)
@@ -1474,6 +1509,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
         else:
             q_len, q_compute_dim = query.shape
 
+        if key is None:
+            # KV-shared layers get no K/V from vLLM. The kernel runs with
+            # skip_kv_update and reads all K/V from the target layer's cache,
+            # so zeros only fill the operand slots.
+            assert value is None and self.kv_sharing_target_layer_name is not None
+            key = query.new_zeros(q_len, self.num_kv_heads * self.head_size)
+            value = key
+
         if key.dim() == 3:
             k_len = key.shape[0]
             k_compute_dim = key.shape[1] * key.shape[2]
@@ -1509,8 +1552,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pool_head_dim = kv_cache.shape[-3] * kv_cache.shape[-2]
         else:
             pool_head_dim = kv_cache.shape[-1]
-        if pool_head_dim > self.head_size:
-            pad_size = pool_head_dim - self.head_size
+        # A layer writing its own native page is never padded, even when the
+        # page is wider than head_size (the head_dim=64 page packs K and V along
+        # its last axis). Only a page defined by another spec is padded.
+        native_page = PallasAttentionBackend.get_kv_cache_shape(
+            1, 1, self.num_kv_heads, self.head_size, kv_cache.dtype
+        )[2:]
+        pad_size = kv_page_head_padding(
+            tuple(kv_cache.shape[-3:]), native_page, pool_head_dim, self.head_size
+        )
+        if pad_size:
             query = torch.nn.functional.pad(query, (0, pad_size))
             key = torch.nn.functional.pad(key, (0, pad_size))
             value = torch.nn.functional.pad(value, (0, pad_size))
@@ -1784,6 +1835,18 @@ class PallasMLAttentionBackend(AttentionBackend):
                 kv_packing,
             ),
         )
+
+    @staticmethod
+    def get_sparse_kv_cache_page_size_bytes(
+        block_size: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        """Bytes per block of one sparse-MLA layer's (nope, rope) caches."""
+        specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            1, block_size, head_size, cache_dtype_str
+        )
+        return sum(math.prod(spec.shape) * spec.torch_dtype.itemsize for spec in specs)
 
     @staticmethod
     def get_kv_cache_page_size_bytes(
@@ -2593,6 +2656,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         slot_mapping: torch.Tensor,
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
+        skip_scale: bool = False,
     ) -> None:
         """Structural no-op. KV cache updates occur in-place during
         ragged paged attention kernel run."""

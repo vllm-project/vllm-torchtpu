@@ -34,6 +34,7 @@ _harness = importlib.import_module("test_pcp_runner_integration")
 
 
 def _profile_run(monkeypatch, runner, num_tokens, prefix, first_stage=True):
+    _harness._fake_tpu_events(monkeypatch)
     seen = {}
 
     def capture_forward_context(attn_metadata, *_args, **_kwargs):

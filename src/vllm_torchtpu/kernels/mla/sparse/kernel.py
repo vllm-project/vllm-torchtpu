@@ -1010,6 +1010,18 @@ def _chunk_kernel_batch_size(
     return small_chunk, _largest_divisor(chunk_size, batch_cap)
 
 
+def supports_split_q(q_nope: jax.Array, q_pe: jax.Array) -> bool:
+    """Whether `(q_nope, q_pe)` satisfies the `q_pe=` split-Q kernel envelope."""
+    return (
+        q_nope.ndim == 3
+        and q_pe.ndim == 3
+        and q_pe.shape[:2] == q_nope.shape[:2]
+        and q_pe.dtype == q_nope.dtype
+        and q_nope.shape[-1] % 128 == 0
+        and q_nope.shape[1] % get_dtype_packing(q_nope.dtype) == 0
+    )
+
+
 def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):
@@ -1069,7 +1081,7 @@ def sparse_ragged_paged_attention(
     # SparseCore: u32[pages, page_size, 128].
     cache_kv_nope: jax.Array,
     # TensorCore: u8[pages, page_size/4, 4, 128].
-    # SparseCore: u32[pages, page_size/4, 128].
+    # SparseCore: u32[pages, page_size/tokens_per_row, 128].
     cache_kv_rope: jax.Array,
     topk_indices: jax.Array,  # i32[max_num_tokens, csa_topk]
     page_indices: jax.Array | None,  # i32[max_num_seqs * pages_per_seq]
@@ -1185,9 +1197,28 @@ def sparse_ragged_paged_attention(
             or cache_kv_rope.shape[-1] != 128
         ):
             raise ValueError(
-                "sparsecore ROPE cache must be uint32[pages,page_size/4,128]"
+                "sparsecore ROPE cache must be uint32[pages,rope_rows,128]"
+            )
+        rope_rows = cache_kv_rope.shape[1]
+        if rope_rows <= 0 or cache_kv_nope.shape[1] % rope_rows != 0:
+            raise ValueError(
+                "NOPE and ROPE caches must have matching page counts and page geometry"
+            )
+        rope_tokens_per_row = cache_kv_nope.shape[1] // rope_rows
+        rope_words = (
+            128 // rope_tokens_per_row if 128 % rope_tokens_per_row == 0 else -1
+        )
+        if (
+            rope_words <= 0
+            or rope_words % native_sc_gather.NUM_LANES != 0
+            or native_sc_gather.ROPE_PACKING * rope_words > 128
+        ):
+            raise ValueError(
+                f"sparsecore ROPE cache packs {rope_tokens_per_row} tokens per "
+                "128-word row, which is incompatible with SparseCore gather"
             )
     else:
+        rope_tokens_per_row = 4
         if (
             cache_kv_nope.dtype != jnp.uint8
             or cache_kv_nope.ndim != 4
@@ -1204,14 +1235,14 @@ def sparse_ragged_paged_attention(
             raise ValueError(
                 "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
             )
-    if cache_kv_nope.size != 4 * cache_kv_rope.size:
+    if cache_kv_nope.size != rope_tokens_per_row * cache_kv_rope.size:
         raise ValueError(
             f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
-            f"4 * ROPE cache size ({cache_kv_rope.size})"
+            f"{rope_tokens_per_row} * ROPE cache size ({cache_kv_rope.size})"
         )
     if (
         cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
-        or cache_kv_nope.shape[1] != 4 * cache_kv_rope.shape[1]
+        or cache_kv_nope.shape[1] != rope_tokens_per_row * cache_kv_rope.shape[1]
     ):
         raise ValueError(
             "NOPE and ROPE caches must have matching page counts and page geometry"
@@ -1220,12 +1251,12 @@ def sparse_ragged_paged_attention(
     _, actual_num_q_heads, actual_head_dim = q.shape
 
     if q_pe is not None:
-        if q_pe.shape[:2] != q.shape[:2] or q_pe.dtype != q.dtype:
+        if q_pe.ndim != 3 or q_pe.shape[:2] != q.shape[:2] or q_pe.dtype != q.dtype:
             raise ValueError(
-                f"q_pe {q_pe.shape}/{q_pe.dtype} must match q_nope "
+                f"q_pe {q_pe.shape}/{q_pe.dtype} must be 3D and match q_nope "
                 f"{q.shape}/{q.dtype} in tokens, heads and dtype"
             )
-        if actual_head_dim % 128 or actual_num_q_heads % get_dtype_packing(q.dtype):
+        if not supports_split_q(q, q_pe):
             raise ValueError(
                 f"split q needs a 128-multiple nope dim and packed heads, got {q.shape}"
             )
@@ -1433,7 +1464,7 @@ def sparse_attention_chunk(
     # SparseCore: u32[pages, page_size, 128].
     cache_kv_nope: jax.Array,
     # TensorCore: u8[pages, page_size/4, 4, 128].
-    # SparseCore: u32[pages, page_size/4, 128].
+    # SparseCore: u32[pages, page_size / tokens_per_row, 128].
     cache_kv_rope: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_tokens]
     physical_indices: jax.Array | None,  # i32[max_num_tokens, csa_topk]

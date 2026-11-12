@@ -43,7 +43,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from math import gcd
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 from vllm.model_executor.layers.attention import Attention
@@ -783,14 +783,22 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
 
-    def __init__(self, quant_config: Fp8Config, moe_config):
+    def __init__(
+        self,
+        quant_config: Fp8Config,
+        moe_config,
+        weight_scale_name: Literal["weight_scale", "weight_scale_inv"] | None = None,
+    ):
         FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
-        self.weight_scale_name = (
-            "weight_scale_inv" if self.block_quant else "weight_scale"
-        )
+        # Native fp8 checkpoints name block scales `weight_scale_inv`.
+        if weight_scale_name is None:
+            weight_scale_name = (
+                "weight_scale_inv" if self.block_quant else "weight_scale"
+            )
+        self.weight_scale_name = weight_scale_name
         # Native allocation/loading reads these states in vLLM 0.29.
         # maybe_roundup_sizes refines them when a TP shard is smaller than a
         # checkpoint block.

@@ -16,7 +16,9 @@
 vLLM 0.27.0's ``should_skip_weight`` only matches names ending in
 ``.weight``, so a compressed-tensors MXFP4 checkpoint (``.weight_packed`` /
 ``.weight_scale``) reads every expert's bytes on every rank. The TPU patch
-widens the suffix allowlist. No TPU, no network.
+widens the suffix allowlist, and skips tensors the loading model marks
+unused (``is_unused_checkpoint_weight``) before they are read. No TPU, no
+network.
 """
 
 import torch
@@ -101,6 +103,11 @@ def _restore_iterators(monkeypatch):
         default_loader,
         "safetensors_weights_iterator",
         default_loader.safetensors_weights_iterator,
+    )
+    monkeypatch.setattr(
+        default_loader.DefaultModelLoader,
+        "_get_weights_iterator",
+        default_loader.DefaultModelLoader._get_weights_iterator,
     )
 
 
@@ -349,3 +356,140 @@ def test_prefetch_strategy_under_filter_switches_to_lazy(tmp_path, monkeypatch):
     list(iterator([shard], False, "prefetch", local_expert_ids=None))
     assert strategies == ["lazy", "prefetch"]
     assert len(prefetches) == 1
+
+
+# ---------------------------------------------------------------------------
+# Unused checkpoint weight filtering (MTP shards + co-located tensors + EP)
+# ---------------------------------------------------------------------------
+
+
+def _write_indexed_mtp_checkpoint(tmp_path):
+    import json
+
+    from safetensors.torch import save_file
+
+    shards = {
+        "main.safetensors": {
+            "model.layers.0.self_attn.q_proj.weight": torch.ones(2, 2),
+        },
+        "vocab.safetensors": {
+            "model.embed_tokens.weight": torch.full((4, 2), 2.0),
+        },
+        "head.safetensors": {
+            "lm_head.weight": torch.full((4, 2), 3.0),
+        },
+        "mtp_remote_expert.safetensors": {
+            "mtp.layers.0.mlp.experts.7.w1.weight_packed": torch.ones(
+                8, dtype=torch.uint8
+            ),
+            "mtp.layers.0.mlp.experts.7.w1.weight_scale": torch.ones(
+                1, dtype=torch.uint8
+            ),
+        },
+        "mtp_local_and_main.safetensors": {
+            "model.layers.1.self_attn.o_proj.weight": torch.full((2, 2), 9.0),
+            "mtp.fc.weight": torch.full((2, 4), 4.0),
+            "mtp.layers.0.mlp.experts.0.w1.weight_packed": torch.full(
+                (8,), 5, dtype=torch.uint8
+            ),
+            "mtp.layers.0.mlp.experts.7.w2.weight_packed": torch.full(
+                (8,), 6, dtype=torch.uint8
+            ),
+        },
+    }
+    weight_map = {}
+    for filename, tensors in shards.items():
+        save_file(tensors, str(tmp_path / filename))
+        weight_map.update(dict.fromkeys(tensors, filename))
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
+
+
+def test_default_loader_skips_unused_shards_and_colocated_tensors(
+    tmp_path, monkeypatch
+):
+    import os
+    from types import SimpleNamespace
+
+    import pytest
+    from vllm.config.load import LoadConfig
+    from vllm.model_executor.model_loader import (
+        default_loader,
+        ep_weight_filter,
+        weight_utils,
+    )
+    from vllm.model_executor.models.qwen3_next_mtp import Qwen3NextMTP
+
+    _write_indexed_mtp_checkpoint(tmp_path)
+
+    monkeypatch.setattr(
+        weight_utils, "should_skip_weight", weight_utils.should_skip_weight
+    )
+    monkeypatch.setattr(
+        ep_weight_filter, "should_skip_weight", ep_weight_filter.should_skip_weight
+    )
+    monkeypatch.setattr(weight_utils, "_tpu_ep_filter_patch", False, raising=False)
+    _restore_iterators(monkeypatch)
+    patch_default_loader_ep_weight_filter()
+
+    read_files = set()
+    read_tensors = []
+    real_safe_open = weight_utils.safe_open
+
+    class _TrackingSafeOpen:
+        def __init__(self, filename, *args, **kwargs):
+            self._name = os.path.basename(filename)
+            self._inner = real_safe_open(filename, *args, **kwargs)
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def keys(self):
+            return self._inner.keys()
+
+        def get_tensor(self, name):
+            read_files.add(self._name)
+            read_tensors.append(name)
+            return self._inner.get_tensor(name)
+
+    monkeypatch.setattr(weight_utils, "safe_open", _TrackingSafeOpen)
+
+    loader = object.__new__(default_loader.DefaultModelLoader)
+    loader.load_config = LoadConfig(load_format="safetensors")
+    loader.local_expert_ids = {0}
+    loader._encoder_only_lm_prefixes = None
+
+    # Emulate _load_mtp_draft_sharing_head wrapping is_unused_checkpoint_weight
+    # when embed_tokens and lm_head are borrowed from the target model.
+    base_is_unused = Qwen3NextMTP.is_unused_checkpoint_weight
+    shared_keys = ("embed_tokens", "lm_head")
+    dummy_model = SimpleNamespace(
+        is_unused_checkpoint_weight=lambda name: (
+            base_is_unused(dummy_model, name) or any(key in name for key in shared_keys)
+        )
+    )
+    model_config = SimpleNamespace(
+        model=str(tmp_path),
+        revision=None,
+        quantization=None,
+    )
+
+    yielded = dict(loader.get_all_weights(model_config, dummy_model))
+
+    # Main, borrowed-head and remote-expert-only shards are never read.
+    assert read_files == {"mtp_local_and_main.safetensors"}
+    # Co-located main-model and remote expert tensors are skipped before get_tensor.
+    assert set(read_tensors) == {
+        "mtp.fc.weight",
+        "mtp.layers.0.mlp.experts.0.w1.weight_packed",
+    }
+    assert set(yielded) == set(read_tensors)
+
+    # A missing shard still fails, even one the draft does not read.
+    (tmp_path / "main.safetensors").unlink()
+    with pytest.raises(FileNotFoundError, match="main.safetensors"):
+        list(loader.get_all_weights(model_config, dummy_model))

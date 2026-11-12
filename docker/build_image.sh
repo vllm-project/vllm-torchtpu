@@ -24,6 +24,7 @@ Options:
   -t, --image-tag TAG      Tag for the built image (default: vllm-torchtpu-local)
   -s, --vllm-source DIR    Local vLLM source tree to install in editable mode
       --target TARGET      Dockerfile stage to build: prod, dev, ci, or omni (default: prod)
+      --vllm-rs            Compile vLLM's Rust frontend (vllm-rs) into the image; takes minutes
   -h, --help               Show this help and exit
 
 Examples:
@@ -43,6 +44,7 @@ IMAGE_TAG="vllm-torchtpu-local"
 VLLM_SOURCE=""
 VLLM_COMMIT_HASH=""
 TARGET="prod"
+BUILD_VLLM_RS="false"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -62,6 +64,10 @@ while [[ $# -gt 0 ]]; do
     --target)
       TARGET="$2"
       shift 2
+      ;;
+    --vllm-rs)
+      BUILD_VLLM_RS="true"
+      shift
       ;;
     -h|--help)
       usage
@@ -144,6 +150,7 @@ else
 fi
 
 echo "Build Target: $TARGET"
+echo "Compile vllm-rs: $BUILD_VLLM_RS"
 DOCKER_ARGS=(
   --progress=plain \
   -f "${SCRIPT_DIR}/Dockerfile" \
@@ -151,6 +158,7 @@ DOCKER_ARGS=(
   --target "${TARGET}" \
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
   --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
+  --build-arg BUILD_VLLM_RS="${BUILD_VLLM_RS}" \
 )
 
 # Run docker build
