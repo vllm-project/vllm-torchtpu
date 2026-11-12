@@ -80,6 +80,9 @@ if TYPE_CHECKING:
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
+    TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
+    TPU_MOE_TC_DISPATCH_MIN_TOKENS: int = 0
+    TPU_MOE_V3_PAYLOAD_SORT: bool = False
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
@@ -748,6 +751,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "RAGGED_GATHER_REDUCE_VERSION": env_with_choices(
         "RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2", "v3"]
     ),
+    # EP MoE steps of at least this many tokens combine the expert outputs on
+    # the TensorCore (kernels/megablox/moe_tc_combine.tc_combine: one pair-row
+    # DMA per local route, f32 sum in top-k order, the arithmetic of the
+    # SparseCore v3 combine) instead of the SparseCore gather-reduce. 0 (default)
+    # keeps the SparseCore combine. Needs a token count divisible by 128.
+    "TPU_MOE_TC_COMBINE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_TC_COMBINE_MIN_TOKENS", 0
+    ),
+    # EP MoE steps of at least this many tokens gather the routed rows on the
+    # TensorCore (tc_row_gather) instead of SparseCore ragged_gather_v2. 0
+    # (default) keeps the SparseCore gather.
+    "TPU_MOE_TC_DISPATCH_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_TC_DISPATCH_MIN_TOKENS", 0
+    ),
+    # Build the v3 combine's per-block route metadata with one multi-operand
+    # TensorCore sort instead of an argsort plus four gathers (which XLA
+    # offloads to the SparseCore ahead of the dispatch). Same values.
+    "TPU_MOE_V3_PAYLOAD_SORT": env_bool("TPU_MOE_V3_PAYLOAD_SORT"),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.

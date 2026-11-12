@@ -32,6 +32,11 @@ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
 )
+from vllm_torchtpu.kernels.megablox.moe_tc_combine import (
+    tc_combine,
+    tc_combine_ok,
+    tc_row_gather,
+)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
 )
@@ -72,6 +77,26 @@ def _select_ragged_gather_reduce(version: str):
 # RAGGED_GATHER_REDUCE_VERSION=v3 to select the destination-major kernel for EP.
 # The non-EP combine in moe_gmm selects that kernel directly.
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
+_V3_PAYLOAD_SORT = (
+    envs.TPU_MOE_V3_PAYLOAD_SORT and envs.RAGGED_GATHER_REDUCE_VERSION == "v3"
+)
+if _V3_PAYLOAD_SORT:
+    ragged_gather_reduce = functools.partial(
+        ragged_gather_reduce_v3, payload_sort=True
+    )
+# Fixed at import: EP steps of at least this many tokens move MoE rows on the
+# TensorCore (0 = never). See moe_tc_combine.
+_TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
+_TC_DISPATCH_MIN_TOKENS = envs.TPU_MOE_TC_DISPATCH_MIN_TOKENS
+_TC_DISPATCH_BLOCK = 256
+if _TC_COMBINE_MIN_TOKENS or _TC_DISPATCH_MIN_TOKENS or _V3_PAYLOAD_SORT:
+    logger.info(
+        "MoE row movement: TPU_MOE_TC_COMBINE_MIN_TOKENS=%d "
+        "TPU_MOE_TC_DISPATCH_MIN_TOKENS=%d TPU_MOE_V3_PAYLOAD_SORT=%d",
+        _TC_COMBINE_MIN_TOKENS,
+        _TC_DISPATCH_MIN_TOKENS,
+        int(_V3_PAYLOAD_SORT),
+    )
 
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
@@ -485,12 +510,31 @@ def prepare_routed_gmm_inputs(
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
             valid_count = group_sizes_local.sum(dtype=jnp.int32)
-            x = ragged_gather_v2(
-                hidden_states_local,
-                token_indices_sorted,
-                jnp.array([0], dtype=jnp.int32),
-                valid_count[None],
-            )
+            if (
+                _TC_DISPATCH_MIN_TOKENS
+                and num_tokens_local >= _TC_DISPATCH_MIN_TOKENS
+                and token_indices_sorted.shape[0] % _TC_DISPATCH_BLOCK == 0
+                and num_tokens_local % 2 == 0
+                and hidden_states_local.dtype == jnp.bfloat16
+            ):
+                logger.info_once(
+                    "TPU_MOE_TC_DISPATCH_MIN_TOKENS=%d: TensorCore MoE dispatch "
+                    "(tc_row_gather) armed",
+                    _TC_DISPATCH_MIN_TOKENS,
+                )
+                x = tc_row_gather(
+                    hidden_states_local,
+                    token_indices_sorted,
+                    valid_count[None],
+                    tbd=_TC_DISPATCH_BLOCK,
+                )
+            else:
+                x = ragged_gather_v2(
+                    hidden_states_local,
+                    token_indices_sorted,
+                    jnp.array([0], dtype=jnp.int32),
+                    valid_count[None],
+                )
     else:
         x = hidden_states_local[token_indices_sorted]
     return (
@@ -680,13 +724,37 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
-        return ragged_gather_reduce(
-            gmm2_res,
-            argsort_revert_indices,
-            topk_weights_flat,
-            valid_mask_flat,
-            reduce_group_size=topk,
-        ).astype(x.dtype)
+        def sc_combine():
+            return ragged_gather_reduce(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                reduce_group_size=topk,
+            ).astype(x.dtype)
+
+        if (
+            _TC_COMBINE_MIN_TOKENS
+            and num_tokens >= _TC_COMBINE_MIN_TOKENS
+            and gmm2_res.dtype == jnp.bfloat16
+            and tc_combine_ok(num_tokens, gmm2_res.shape[-1], gmm2_res.shape[0])
+        ):
+            logger.info_once(
+                "TPU_MOE_TC_COMBINE_MIN_TOKENS=%d: TensorCore MoE combine "
+                "(tc_combine) armed",
+                _TC_COMBINE_MIN_TOKENS,
+            )
+            out, overflow = tc_combine(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                topk=topk,
+            )
+            # A block with more extra local routes than the kernel stages
+            # (far above the EP mean) takes the SparseCore combine.
+            return jax.lax.cond(overflow, sc_combine, lambda: out.astype(x.dtype))
+        return sc_combine()
 
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape((num_tokens, topk, gmm2_res.shape[-1]))
