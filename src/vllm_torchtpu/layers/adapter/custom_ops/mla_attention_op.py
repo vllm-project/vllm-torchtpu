@@ -736,6 +736,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         hist_merge = envs.TPU_DCP_INDEXER_HIST_MERGE
         a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
         a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
+        lane_split_env = envs.TPU_DCP_INDEXER_LANE_SPLIT
+        lane_split_min_tokens = envs.TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS
         small_bucket = (
             envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
             envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
@@ -768,7 +770,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
             and rank_operand
         )
-        lane_tensor = dcp_lane_operand() if small_ag else None
+        # TPU_DCP_INDEXER_LANE_SPLIT slices each lane's tokens by the same operand.
+        pass_lane = small_ag or bool(lane_split_env and rank_operand)
+        lane_tensor = dcp_lane_operand() if pass_lane else None
         k_write_compact = envs.TPU_INDEXER_K_WRITE_COMPACT
         qb_overlap_fn = _fp8_linear_pallas_jax
         if qb_overlap:
@@ -830,6 +834,23 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 )
             # The histogram merge, if on, replaces the all-to-all one.
             large = _dcp_indexer_a2a_for_bucket(q.shape[0], True, a2a_min_tokens)
+            num_lanes = mesh.size // dcp_size
+            lane_split = (
+                lane_split_env
+                and lane_ids_arg is not None
+                and num_lanes > 1
+                and large
+                and (hist_merge or a2a_merge)
+                and q.shape[0] > fp8_skinny.MAX_M
+                and q.shape[0] >= lane_split_min_tokens
+                and q.shape[0] % (num_lanes * dcp_size) == 0
+            )
+            if lane_split:
+                logger.info_once(
+                    "DCP indexer lane split: %d-token bucket over %d lanes",
+                    q.shape[0],
+                    num_lanes,
+                )
             out = streamindex_topk_dcp(
                 q,
                 weights,
@@ -857,6 +878,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 small_all_gather=small_ag,
                 decode_pack=decode_pack,
                 shared_meta=shared_meta,
+                lane_split=lane_split,
                 **overlap,
             )
             if qb_overlap:
@@ -1029,7 +1051,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             (True, True, False): _streamidx_topk_dcp_qb_rank_jax,
             (False, True, True): _streamidx_topk_dcp_rank_lane_jax,
             (True, True, True): _streamidx_topk_dcp_qb_rank_lane_jax,
-        }[(bool(qb_overlap), bool(rank_operand), small_ag)]
+        }[(bool(qb_overlap), bool(rank_operand), pass_lane)]
 
         replicated = jax.sharding.PartitionSpec()
         sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
@@ -1056,7 +1078,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 replicated,  # distribution
                 *((replicated,) * 3 if qb_overlap else ()),  # x, w_q, w_s
                 *((sharded,) if rank_operand else ()),  # rank ids
-                *((sharded,) if small_ag else ()),  # lane ids
+                *((sharded,) if pass_lane else ()),  # lane ids
             ),
             output_partition_specs=(
                 sharded,  # new cache_kv

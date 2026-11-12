@@ -175,6 +175,8 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = True
     TPU_DCP_INDEXER_HIST_MERGE: bool = True
+    TPU_DCP_INDEXER_LANE_SPLIT: bool = False
+    TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS: int = 512
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = 4
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
@@ -1475,6 +1477,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep the all-gather merge: there the exchange rounds' latency outweighs
     # the merge they save.
     "TPU_DCP_INDEXER_HIST_MERGE": env_bool("TPU_DCP_INDEXER_HIST_MERGE", default=True),
+    # Split each large bucket's query tokens over the DCP lanes (tp // dcp > 1),
+    # which hold replicas of one KV shard; a lane all-gather restores them.
+    "TPU_DCP_INDEXER_LANE_SPLIT": env_bool("TPU_DCP_INDEXER_LANE_SPLIT", default=False),
+    # Smallest padded token bucket that takes TPU_DCP_INDEXER_LANE_SPLIT.
+    "TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS", 512
+    ),
     # Smallest padded token bucket that takes the all-to-all merge when
     # TPU_DCP_INDEXER_A2A_MERGE is on. The bucket is static, so each compiled
     # variant picks one merge with no runtime cost.

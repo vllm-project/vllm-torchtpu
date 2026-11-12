@@ -959,3 +959,67 @@ def test_lane_operand_is_kept_on_every_bucket(q_len):
 
     exp = jax.export.export(jax.jit(fn))(*args, ids, lanes)
     assert len(exp.module_kept_var_idx) == len(args) + 2
+
+
+# ===================================================================== #
+# TPU_DCP_INDEXER_LANE_SPLIT: each lane scores half the tokens.
+# ===================================================================== #
+
+# (q_lens, kv lengths): one request cut by the lane boundary; two requests,
+# the second cut; the boundary on a request edge; short requests then a long one.
+_LANE_SPLIT_LAYOUTS = {
+    "one": ([Q_LEN], [KV_LEN]),
+    "cut": ([100, Q_LEN - 100], [KV_LEN, KV_LEN - 1000]),
+    "edge": ([Q_LEN // 2, Q_LEN // 2], [KV_LEN - 7, KV_LEN]),
+    "mixed": ([4, 4, 4, Q_LEN - 12], [KV_LEN - 5, 9000, KV_LEN, KV_LEN - 300]),
+}
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("merge", ["a2a", "hist"])
+@pytest.mark.parametrize("layout", sorted(_LANE_SPLIT_LAYOUTS))
+def test_lane_split_matches_the_unsplit_result_on_a_lane_mesh(merge, layout):
+    """(2 lanes, DCP4): each lane scores its half of the tokens and the lane
+    all-gather must give back the unsplit answer exactly, including a request
+    the lane boundary cuts."""
+    _need_devices(8)
+    _require_sparsecore()
+    dcp = 4
+    _, args, kwargs = _dcp_case(dcp, 61)
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()[:8]).reshape(2, dcp), ("lane", DCP_AXIS_NAME)
+    )
+    shards = jax.device_put(
+        np.asarray(args[2]), jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))
+    )
+    q_lens, seq_lens = _LANE_SPLIT_LAYOUTS[layout]
+    n = len(q_lens)
+    vpages = args[4].shape[0]
+    lane_args = (
+        args[0],
+        args[1],
+        shards,
+        jnp.array(seq_lens, jnp.int32),
+        jnp.tile(args[4], n),
+        jnp.array(np.concatenate([[0], np.cumsum(q_lens)]), jnp.int32),
+        jnp.array([0, 0, n], jnp.int32),
+    )
+    assert vpages * n == lane_args[4].shape[0]
+    lane_kwargs = dict(
+        kwargs, mesh=mesh, a2a_merge=merge == "a2a", hist_merge=merge == "hist"
+    )
+
+    def run(lane_ids, lane_split):
+        ids = _per_device_ids(mesh, [[lane] for lane in lane_ids for _ in range(dcp)])
+        return np.asarray(
+            streamindex_topk_dcp(
+                *lane_args, **lane_kwargs, dcp_lane_ids=ids, lane_split=lane_split
+            )
+        )
+
+    want = run((0, 1), False)
+    np.testing.assert_array_equal(run((0, 1), True), want)
+    assert (want >= 0).any()
+    # Positive control: swapped lane ids score each other's halves, which the
+    # all-gather then puts back in the wrong order.
+    assert (run((1, 0), True) != want).any()
