@@ -19,6 +19,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
     SparseCoreTopK,
+    default_topk_backend,
 )
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import decode_query_chunk_size
 from vllm_torchtpu.kernels.qwen4_exp.fused_kv_write import (
@@ -1345,6 +1346,8 @@ def _select_blocks(
             decode_req_batch_size=8 if batch >= 8 else 4,
             enable_early_exit=True,
             components=qsa_indexing(),
+            decode_only=True,
+            hoist_step_metadata=True,
         )
 
     if len(query) > len(context) * max_query_len:
@@ -1369,6 +1372,25 @@ def _select_blocks(
             prefill_bkv, prefill_bq, chunk = tuned
             if chunk and len(query) % chunk == 0:
                 chunk_tokens = None if chunk == len(query) else chunk
+        use_sc_bounded = (
+            envs.VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY
+            and shard is None
+            and dcp is None
+        )
+        prefill_backend = (
+            SparseCoreTopK(bounded_copy=True)
+            if use_sc_bounded
+            else default_topk_backend()
+        )
+        fuses_prefill = getattr(prefill_backend, "fuses_in_streamindex", False) and (
+            len(query) >= getattr(prefill_backend, "min_tokens", 1)
+        )
+        if (
+            fuses_prefill
+            and envs.VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK == 0
+            and tuned is None
+        ):
+            chunk_tokens = None
         # The scalar-prefetched kernel-page table holds every request slot's
         # whole row (slots x max_model_len / 128 pages). Past the SMEM budget
         # (e.g. 96 slots at 262144 tokens: 768 KiB) hand StreamIndex the
@@ -1416,7 +1438,14 @@ def _select_blocks(
         pages_per_query = -(-pages_per_query // shard[1])
     chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
     query_block = envs.VLLM_TPU_QSA_DECODE_QUERY_BLOCK
-    tuned = shape_tuned.indexer_decode_tiles(len(query)) if query_block else None
+    auto_shared_verify = query_block == 0 and max_query_len > 1
+    if auto_shared_verify:
+        query_block = min(8, 1 << (max_query_len - 1).bit_length())
+    tuned = (
+        shape_tuned.indexer_decode_tiles(len(query))
+        if (query_block and not auto_shared_verify)
+        else None
+    )
     if query_block:
         kv_block = envs.VLLM_TPU_QSA_DECODE_KV_BLOCK
         if tuned is not None:
@@ -1440,7 +1469,8 @@ def _select_blocks(
                     f"{name} must be a positive multiple of 128 "
                     f"and of {rows} compressed keys per page, got {block}"
                 )
-        mixed_only = envs.VLLM_TPU_QSA_INDEXER_MIXED_ONLY
+        mixed_only = envs.VLLM_TPU_QSA_INDEXER_MIXED_ONLY or auto_shared_verify
+        hoist_meta = envs.VLLM_TPU_QSA_INDEXER_HOIST_META or auto_shared_verify
         if shard is not None or dcp is not None:
             # Room for the local table padded to the widest KV block.
             pages_per_query += max(256, kv_block, decode_kv_block) // rows
@@ -1497,7 +1527,7 @@ def _select_blocks(
                     coalesce_entries=envs.VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA,
                 ),
                 decode_passes=not mixed_only,
-                hoist_step_metadata=envs.VLLM_TPU_QSA_INDEXER_HOIST_META,
+                hoist_step_metadata=hoist_meta,
                 tile_aligned_scores=envs.VLLM_TPU_QSA_INDEXER_TILE_ALIGNED_SCORES,
                 # VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: the score rows are
                 # sized for max_model_len; select from each row's live prefix

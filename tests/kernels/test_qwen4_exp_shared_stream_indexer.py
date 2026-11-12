@@ -639,9 +639,220 @@ def test_prefill_pool_page_table_keeps_the_selection(
 
     def run():
         return np.asarray(
-            pooled_qsa.select_blocks(**args, ratio=RATIO, block_topk=BLOCK_TOPK, slot=slot)
+            pooled_qsa.select_blocks(
+                **args, ratio=RATIO, block_topk=BLOCK_TOPK, slot=slot
+            )
         )
 
     expected = run()
     monkeypatch.setattr(pooled_qsa, "PREFILL_PAGE_TABLE_SMEM_BYTES", 0)
     np.testing.assert_array_equal(run(), expected)
+
+
+def test_decode_only_skips_mixed_and_tail_launches(monkeypatch):
+    """decode_only=True emits a single batched decode kernel when max_reqs % 8 == 0."""
+    info = _tpu7x_info()
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    shape = jax.ShapeDtypeStruct
+    args = (
+        shape((16, 4, 128), jnp.bfloat16),
+        shape((16, 4), jnp.float32),
+        shape((4, 32, 4, 256), jnp.uint8),
+        shape((16,), jnp.int32),
+        shape((64,), jnp.int32),
+        shape((17,), jnp.int32),
+        shape((3,), jnp.int32),
+    )
+    fn = jax.jit(
+        functools.partial(
+            streamindex.streamindex_topk,
+            k=128,
+            compression_ratio=2,
+            num_kv_pages_per_block=(8, 8, 8),
+            num_queries_per_block=(1, 128, 128),
+            decode_req_batch_size=8,
+            components=pooled_qsa.qsa_indexing(),
+            decode_only=True,
+            hoist_step_metadata=True,
+        )
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("x",),
+        abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        text = fn.trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+    assert "StreamIdxTC-d-bq_1-bkvp_8" in text
+    assert "StreamIdxTC-m" not in text
+
+
+def test_auto_shared_verify_engages_for_multi_token_verify(monkeypatch):
+    """When query_block is unset and max_query_len > 1, shared verify auto-enables."""
+    info = _tpu7x_info()
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    monkeypatch.delenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", raising=False)
+    shape = jax.ShapeDtypeStruct
+    args = (
+        shape((32, 4, 128), jnp.bfloat16),
+        shape((64, 512, 1, 2, 256), jnp.bfloat16),
+        shape((32,), jnp.int32),
+        shape((32, 16), jnp.int32),
+        shape((32,), jnp.int32),
+        shape((33,), jnp.int32),
+        shape((32,), jnp.int32),
+    )
+    select_fn = jax.jit(
+        functools.partial(
+            pooled_qsa.select_blocks, ratio=RATIO, block_topk=512, max_query_len=4
+        )
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("x",),
+        abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        text = select_fn.trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+    assert "StreamIdxTC-m-bq_4-bkvp_32" in text
+    assert "StreamIdxTC-d" not in text
+
+
+@pytest.mark.parametrize("return_scores", [False, True])
+def test_pallas_fused_topk_matches_reference_in_interpret_prefill_and_verify(
+    monkeypatch, interpret, return_scores
+):
+    """PallasFusedTopK matches ReferenceTopK bit-for-bit on prefill and verify."""
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+        PallasFusedTopK,
+    )
+
+    prefill_args = inputs(11, [36, 0, 28], [1500, 0, 17], 64, "integer")
+    monkeypatch.setattr(
+        pooled_qsa,
+        "default_topk_backend",
+        lambda: PallasFusedTopK(min_tokens=64),
+    )
+
+    def _run_with_backend(backend, step_args):
+        captured = {}
+
+        def _wrap(*a, **kw):
+            kw = dict(
+                kw,
+                enable_early_exit=False,
+                return_scores=return_scores,
+                topk_backend=backend,
+            )
+            res = streamindex.streamindex_topk(*a, **kw)
+            if return_scores:
+                captured["ids"], captured["scores"] = res
+                return res[0]
+            captured["ids"] = res
+            return res
+
+        monkeypatch.setattr(pooled_qsa, "streamindex_topk", _wrap)
+        out = select(step_args)
+        return out, captured
+
+    ref_out, ref_cap = _run_with_backend(ReferenceTopK(), prefill_args)
+    fzd_out, fzd_cap = _run_with_backend(PallasFusedTopK(min_tokens=64), prefill_args)
+    for r in range(ref_out.shape[0]):
+        n_v = int(np.sum(ref_out[r] >= 0))
+        assert int(np.sum(fzd_out[r] >= 0)) == n_v
+        if n_v > 0:
+            order = np.argsort(ref_out[r, :n_v])
+            np.testing.assert_array_equal(fzd_out[r, :n_v], ref_out[r, :n_v][order])
+            if return_scores:
+                np.testing.assert_array_equal(
+                    np.asarray(fzd_cap["scores"])[r, :n_v],
+                    np.asarray(ref_cap["scores"])[r, :n_v][order],
+                )
+        np.testing.assert_array_equal(fzd_out[r, n_v:], -1)
+
+    q_lens, context, tokens = CASES["ragged_1_to_4"]
+    verify_args = inputs(13, q_lens, context, tokens, "integer")
+    monkeypatch.setattr(pooled_qsa, "decode_query_chunk_size", lambda pages: 1 << 20)
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", "4")
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_KV_BLOCK", "256")
+    ref_v, ref_vcap = _run_with_backend(ReferenceTopK(), verify_args)
+    fzd_v, fzd_vcap = _run_with_backend(PallasFusedTopK(min_tokens=1), verify_args)
+    for r in range(ref_v.shape[0]):
+        n_v = int(np.sum(ref_v[r] >= 0))
+        assert int(np.sum(fzd_v[r] >= 0)) == n_v
+        if n_v > 0:
+            order = np.argsort(ref_v[r, :n_v])
+            np.testing.assert_array_equal(fzd_v[r, :n_v], ref_v[r, :n_v][order])
+            if return_scores:
+                np.testing.assert_array_equal(
+                    np.asarray(fzd_vcap["scores"])[r, :n_v],
+                    np.asarray(ref_vcap["scores"])[r, :n_v][order],
+                )
+        np.testing.assert_array_equal(fzd_v[r, n_v:], -1)
+
+
+def test_pallas_fused_topk_batched_decode_past_first_row_block(interpret):
+    """When seq_batch_size > r_blk (32 > 16 with return_scores=True), rows past
+    block 0 must read their own sequences' visible lengths, not block 0's."""
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+        PallasFusedTopK,
+    )
+
+    rng = np.random.default_rng(77)
+    num_seqs = 32
+    q = jnp.asarray(rng.integers(-2, 3, (num_seqs, 4, 128)), jnp.bfloat16)
+    weights = jnp.full((num_seqs, 4), 0.25, jnp.float32)
+    raw_cache = np.zeros((32, 32, 4, 256), np.uint8)
+    raw_cache[..., :128] = rng.integers(0, 64, (32, 32, 4, 128), dtype=np.uint8)
+    raw_cache[..., 128] = 127
+    cache = jnp.asarray(raw_cache)
+    # Row block 0 (seqs 0..15) is short (80 visible < k=128); row block 1
+    # (seqs 16..31) is long (400 visible > k=128).
+    seq_lens = jnp.asarray([160] * 16 + [800] * 16, jnp.int32)
+    pages_per_seq = 16
+    page_indices = jnp.arange(num_seqs * pages_per_seq, dtype=jnp.int32) % 32
+    cu_q_lens = jnp.arange(num_seqs + 1, dtype=jnp.int32)
+    distribution = jnp.array([num_seqs, num_seqs, num_seqs], dtype=jnp.int32)
+    kwargs = dict(
+        k=128,
+        compression_ratio=2,
+        num_kv_pages_per_block=4,
+        num_queries_per_block=1,
+        decode_req_batch_size=32,
+        decode_only=True,
+        enable_early_exit=False,
+        return_scores=True,
+    )
+    ref_ids, ref_scores = streamindex.streamindex_topk(
+        q,
+        weights,
+        cache,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        topk_backend=ReferenceTopK(),
+        **kwargs,
+    )
+    fzd_ids, fzd_scores = streamindex.streamindex_topk(
+        q,
+        weights,
+        cache,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        topk_backend=PallasFusedTopK(min_tokens=1),
+        **kwargs,
+    )
+    ref_ids_np, ref_sc_np = np.asarray(ref_ids), np.asarray(ref_scores)
+    fzd_ids_np, fzd_sc_np = np.asarray(fzd_ids), np.asarray(fzd_scores)
+    for r in range(num_seqs):
+        n_v = int(np.sum(ref_ids_np[r] >= 0))
+        want_n = 80 if r < 16 else 128
+        assert n_v == want_n
+        assert int(np.sum(fzd_ids_np[r] >= 0)) == want_n
+        order = np.argsort(ref_ids_np[r, :n_v])
+        np.testing.assert_array_equal(fzd_ids_np[r, :n_v], ref_ids_np[r, :n_v][order])
+        np.testing.assert_array_equal(fzd_sc_np[r, :n_v], ref_sc_np[r, :n_v][order])
+        np.testing.assert_array_equal(fzd_ids_np[r, n_v:], -1)
