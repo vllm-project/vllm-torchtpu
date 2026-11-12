@@ -25,7 +25,19 @@ from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
 _SPECS = [{"layer": MagicMock()}]
 
 
-def _make_executor(engine_override, worker_overrides, pipeline_parallel_size=1):
+def _worker_rpcs(worker_overrides, block_bytes=None):
+    """collective_rpc answering the two calls the executors make to adopt
+    the workers' block count."""
+    answers = {
+        "get_num_gpu_blocks_override": worker_overrides,
+        "get_kv_block_budget_bytes": block_bytes or [None] * len(worker_overrides),
+    }
+    return MagicMock(side_effect=lambda method, *args, **kwargs: answers[method])
+
+
+def _make_executor(
+    engine_override, worker_overrides, pipeline_parallel_size=1, block_bytes=None
+):
     """Build an executor without running __init__, with a mocked engine
     cache_config and a collective_rpc that returns the per-worker overrides."""
     executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
@@ -34,7 +46,7 @@ def _make_executor(engine_override, worker_overrides, pipeline_parallel_size=1):
     executor.vllm_config.cache_config.num_gpu_blocks_override = engine_override
     executor.vllm_config.parallel_config.world_size = len(worker_overrides)
     executor.vllm_config.parallel_config.pipeline_parallel_size = pipeline_parallel_size
-    executor.collective_rpc = MagicMock(return_value=worker_overrides)
+    executor.collective_rpc = _worker_rpcs(worker_overrides, block_bytes)
     return executor
 
 
@@ -52,7 +64,7 @@ def test_copies_override_from_workers_when_engine_unset(mock_super):
     specs = executor.get_kv_cache_specs()
 
     assert specs is _SPECS
-    executor.collective_rpc.assert_called_once_with("get_num_gpu_blocks_override")
+    executor.collective_rpc.assert_any_call("get_num_gpu_blocks_override")
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 5428
 
 
@@ -181,7 +193,7 @@ def test_pipeline_stages_without_any_override_leave_it_unset(mock_super):
     assert executor.vllm_config.cache_config.num_gpu_blocks_override is None
 
 
-def _make_ray_executor(engine_override, worker_overrides):
+def _make_ray_executor(engine_override, worker_overrides, block_bytes=None):
     """Same shape as _make_executor but for the Ray multi-host executor."""
     from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
         RayDistributedExecutorV2,
@@ -193,7 +205,7 @@ def _make_ray_executor(engine_override, worker_overrides):
     executor.vllm_config.cache_config.num_gpu_blocks_override = engine_override
     executor.vllm_config.parallel_config.world_size = len(worker_overrides)
     executor.vllm_config.parallel_config.pipeline_parallel_size = 1
-    executor.collective_rpc = MagicMock(return_value=worker_overrides)
+    executor.collective_rpc = _worker_rpcs(worker_overrides, block_bytes)
     return executor
 
 
@@ -248,7 +260,7 @@ def test_adopts_the_count_workers_set_after_the_profile_run(kind):
     with patch.object(parent, "determine_available_memory", return_value=[1 << 30]):
         assert executor.determine_available_memory() == [1 << 30]
 
-    executor.collective_rpc.assert_called_once_with("get_num_gpu_blocks_override")
+    executor.collective_rpc.assert_any_call("get_num_gpu_blocks_override")
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 5310
 
 
@@ -263,3 +275,26 @@ def test_engine_override_is_kept_after_the_profile_run(kind):
 
     executor.collective_rpc.assert_not_called()
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 1234
+
+
+@pytest.mark.parametrize("kind", ["multiproc", "ray_v2"])
+def test_a_peer_replay_owner_within_the_byte_tolerance_is_adopted(kind):
+    """Under peer replay the profile bucket's owner keeps ~0.7 GiB more HBM:
+    463 fewer blocks than its 7 peers, past the 0.5% block tolerance (247)
+    but inside 1 GiB at ~1.5 MiB per block. Every executor pins its count."""
+    overrides = [49883] * 7 + [49420]
+    block_bytes = [3 << 19] * 8
+    if kind == "multiproc":
+        executor = _make_executor(None, overrides, block_bytes=block_bytes)
+        parent = MultiprocExecutor
+    else:
+        from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
+
+        executor = _make_ray_executor(None, overrides, block_bytes=block_bytes)
+        parent = RayExecutorV2
+
+    with patch.object(parent, "determine_available_memory", return_value=[1 << 30]):
+        executor.determine_available_memory()
+
+    executor.collective_rpc.assert_any_call("get_kv_block_budget_bytes")
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 49420
