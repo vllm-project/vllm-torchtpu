@@ -146,6 +146,13 @@ def replicated_token_shard_enabled() -> bool:
     """
     if not envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD:
         return False
+    return _token_sharded_replicated_graph_allowed(
+        "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD"
+    )
+
+
+def _token_sharded_replicated_graph_allowed(flag: str) -> bool:
+    """The guards shared by every route into ``Qwen4ExpBackboneRP``."""
     if envs.VLLM_TPU_QSA_COMPRESSED_DCP:
         return False
     from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
@@ -154,12 +161,42 @@ def replicated_token_shard_enabled() -> bool:
 
     if sparse_core_all_gather_offload():
         logger.warning_once(
-            "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD is ignored while the "
-            "SparseCore all-gather offload is on (its selection all-gather halts "
-            "a SparseCore)."
+            "%s is ignored while the SparseCore all-gather offload is on (its "
+            "selection all-gather halts a SparseCore).",
+            flag,
         )
         return False
     return True
+
+
+def decode_req_shard_enabled() -> bool:
+    """VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD, unless it cannot run here (the
+    same guards as ``replicated_token_shard_enabled``)."""
+    if not envs.VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD:
+        return False
+    return _token_sharded_replicated_graph_allowed("VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD")
+
+
+def decode_req_shard_eligible(
+    num_tokens: int, tp_size: int, rows_per_request: int
+) -> bool:
+    """Whether a decode / verify bucket outside the sequence-parallel graph
+    takes ``Qwen4ExpBackboneRP`` for the request-sharded decode indexer
+    (VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD).
+
+    Each rank's ``num_tokens / tp_size`` rows must hold whole verify requests
+    (``rows_per_request`` = num_speculative_tokens + 1), so a full step of
+    verify requests keeps every request in one shard and the shard indexer
+    runs; other layouts fall back to the whole-step indexer inside the op.
+    """
+    if not (tp_size > 1 and decode_req_shard_enabled()):
+        return False
+    per_rank, rest = divmod(num_tokens, tp_size)
+    return (
+        num_tokens >= int(envs.VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD_MIN_ROWS)
+        and rest == 0
+        and per_rank % max(rows_per_request, 1) == 0
+    )
 
 
 def replicated_token_shard_eligible(
