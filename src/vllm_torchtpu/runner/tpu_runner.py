@@ -130,6 +130,8 @@ from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_confi
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
+    _synthetic_sample_and_assemble_rng_impl,
+    _synthetic_verify_rows_rng_impl,
     initial_rng_counter,
     synthetic_sample_and_assemble,
     synthetic_sample_and_assemble_rng,
@@ -4402,10 +4404,20 @@ class TPUModelRunner(GPUModelRunner):
                             hidden_states, logits_indices
                         )
                     elif synthetic_verify and spec_decode_metadata is not None:
-                        logits = self.compute_selected_logits(
-                            hidden_states,
-                            self._plan_synthetic_verify(spec_decode_metadata),
-                        )
+                        if self._synthetic_head_fusion_applies(
+                            hidden_states, spec_decode_metadata
+                        ):
+                            logits = self._run_synthetic_verify_head(
+                                hidden_states,
+                                spec_decode_metadata,
+                                start_index,
+                                end_index,
+                            )
+                        else:
+                            logits = self.compute_selected_logits(
+                                hidden_states,
+                                self._plan_synthetic_verify(spec_decode_metadata),
+                            )
                     else:
                         logits = self.compute_selected_logits(
                             hidden_states, logits_indices
@@ -4903,6 +4915,61 @@ class TPUModelRunner(GPUModelRunner):
         md.synthetic_verify = (accepted_count, recover_draft)
         return rows
 
+    def _synthetic_head_fusion_applies(
+        self, hidden_states: torch.Tensor, md: SpecDecodeMetadata
+    ) -> bool:
+        """TPU_SPEC_SYNTHETIC_HEAD_FUSION on a decode-only verify chunk: every
+        hidden-state row is a verify row, so the fused program's shapes are
+        the (padded_logits_length, padded_num_reqs) pairs the precompile
+        warms."""
+        return (
+            envs.TPU_SPEC_SYNTHETIC_HEAD_FUSION
+            and envs.TPU_SPEC_SYNTHETIC_INGRAPH_RNG
+            and md.draft_token_ids is not None
+            and hidden_states.shape[0] == md.draft_token_ids.shape[0]
+        )
+
+    def _run_synthetic_verify_head(
+        self,
+        hidden_states: torch.Tensor,
+        md: SpecDecodeMetadata,
+        cur_start_idx: int,
+        cur_end_idx: int,
+    ) -> torch.Tensor:
+        """`_plan_synthetic_verify` + `compute_selected_logits` +
+        `_sample_synthetic_verify` as one program (synthetic_verify_head).
+        Parks the rejection output on ``md`` for `_sample_spec_verify_chunk`
+        and returns it in place of the step's logits."""
+        assert md.draft_token_ids is not None
+        assert self.rejection_sampler is not None
+        assert self.rejection_sampler.synthetic_conditional_rates is not None
+        assert self.speculative_config is not None
+        self._log_spec_glue_once("TPU_SPEC_SYNTHETIC_HEAD_FUSION")
+        temperatures, top_k, top_p = self._padded_sampling_params(
+            cur_start_idx, cur_end_idx, md.draft_lengths.shape[0], torch.float32
+        )
+        out, self._synthetic_rng_counter = self.synthetic_verify_head(
+            hidden_states,
+            md.draft_token_ids,
+            md.draft_lengths,
+            md.segment_ids,
+            md.group_indices,
+            md.target_logits_indices,
+            md.bonus_logits_indices,
+            md.final_logits_indices,
+            self._get_synthetic_rng_counter(),
+            self.rejection_sampler.synthetic_conditional_rates,
+            temperatures,
+            top_k,
+            top_p,
+            self.speculative_config.num_speculative_tokens,
+            self._sampler_topk_candidates(cur_start_idx, cur_end_idx, None),
+            self._sampler_applies_topk_topp(),
+            self._sampler_applies_top_k(),
+        )
+        md.synthetic_output = out
+        return out
+
     def _sample_synthetic_verify(
         self,
         logits: torch.Tensor,
@@ -4983,6 +5050,8 @@ class TPUModelRunner(GPUModelRunner):
         each row's greedy token instead (no request is below min_tokens then).
         """
         assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
+        if md.synthetic_output is not None:
+            return md.synthetic_output
         if md.synthetic_verify is not None:
             return self._sample_synthetic_verify(
                 logits, md, cur_start_idx, cur_end_idx, sampling_generator
@@ -7177,6 +7246,17 @@ class TPUModelRunner(GPUModelRunner):
                 counter,
                 self.rejection_sampler.synthetic_conditional_rates,
             )
+            if envs.TPU_SPEC_SYNTHETIC_HEAD_FUSION:
+                self._precompile_synthetic_verify_head(
+                    draft_token_ids,
+                    target_logits_indices,
+                    segment_ids,
+                    group_indices,
+                    draft_lengths,
+                    bonus_logits_indices,
+                    counter,
+                    variants,
+                )
             for variant in variants:
                 out, _ = synthetic_sample_and_assemble_rng(
                     logits,
@@ -7210,6 +7290,53 @@ class TPUModelRunner(GPUModelRunner):
                 group_indices,
                 self.speculative_config.num_speculative_tokens,
                 **variant,
+            )
+            synchronize_tensors(out)
+
+    def _precompile_synthetic_verify_head(
+        self,
+        draft_token_ids: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        counter: torch.Tensor,
+        variants: list[dict],
+    ) -> None:
+        """synthetic_verify_head at one (padded_logits_length,
+        padded_num_reqs) pair, on padded_logits_length hidden rows (a
+        decode-only chunk), in every sampler variant."""
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        num_tokens = draft_token_ids.shape[0]
+        num_reqs = draft_lengths.shape[0]
+        hidden = torch.zeros(
+            (num_tokens, self.model_config.get_hidden_size()),
+            dtype=self._hidden_states_dtype,
+        ).to(self.device)
+        temps = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
+        top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
+        top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
+        for variant in variants:
+            out, _ = self.synthetic_verify_head(
+                hidden,
+                draft_token_ids,
+                draft_lengths,
+                segment_ids,
+                group_indices,
+                target_logits_indices,
+                bonus_logits_indices,
+                target_logits_indices,
+                counter,
+                self.rejection_sampler.synthetic_conditional_rates,
+                temps,
+                top_k,
+                top_p,
+                self.speculative_config.num_speculative_tokens,
+                variant.get("topk_candidates", 0),
+                variant.get("apply_topk_topp", True),
+                variant.get("apply_top_k", True),
             )
             synchronize_tensors(out)
 
@@ -8789,11 +8916,21 @@ class TPUModelRunner(GPUModelRunner):
         cur_end_idx: int,
         logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._padded_sampling_params(
+            cur_start_idx, cur_end_idx, logits.shape[0], logits.dtype
+        )
+
+    def _padded_sampling_params(
+        self,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        padded_num_reqs: int,
+        temperature_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
-        padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
-        temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
+        temps_cpu = torch.ones(padded_num_reqs, dtype=temperature_dtype)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
         top_p_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
 
@@ -8813,9 +8950,9 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+            temps_cpu.unsqueeze(1).to(self.device, non_blocking=True),
+            top_k_cpu.unsqueeze(1).to(self.device, non_blocking=True),
+            top_p_cpu.unsqueeze(1).to(self.device, non_blocking=True),
         )
 
     def _topk_candidate_blocks(self) -> int:
@@ -8894,6 +9031,65 @@ class TPUModelRunner(GPUModelRunner):
             return torch.empty((0,), device=hidden_states.device)
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def synthetic_verify_head(
+        self,
+        hidden_states: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        final_logits_indices: torch.Tensor,
+        rng_counter: torch.Tensor,
+        synthetic_conditional_rates: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        max_draft_tokens: int,
+        topk_candidates: int,
+        apply_topk_topp: bool,
+        apply_top_k: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """TPU_SPEC_SYNTHETIC_HEAD_FUSION: synthetic_verify_rows_rng, then
+        compute_selected_logits on its rows, then
+        synthetic_sample_and_assemble_rng, in one program. ``temperatures``
+        arrive as float32 and are cast to the logits dtype, the value the
+        unfused path stages on the host."""
+        accepted_count, rows, recover_draft, rng_counter = (
+            _synthetic_verify_rows_rng_impl(
+                draft_token_ids,
+                draft_lengths,
+                segment_ids,
+                group_indices,
+                target_logits_indices,
+                bonus_logits_indices,
+                final_logits_indices,
+                rng_counter,
+                synthetic_conditional_rates,
+            )
+        )
+        selected = torch.index_select(hidden_states, 0, rows)
+        logits = self.model.compute_logits(selected)
+        return _synthetic_sample_and_assemble_rng_impl(
+            logits,
+            recover_draft,
+            accepted_count,
+            temperatures.to(logits.dtype),
+            top_k,
+            top_p,
+            rng_counter,
+            draft_token_ids,
+            draft_lengths,
+            segment_ids,
+            group_indices,
+            max_draft_tokens,
+            topk_candidates,
+            apply_topk_topp,
+            apply_top_k,
+        )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(

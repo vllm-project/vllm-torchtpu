@@ -63,6 +63,9 @@ class SpecDecodeMetadata:
     # request (accepted count, rejected draft token or -1), decided before the
     # LM head; the step's logits then hold one row per request.
     synthetic_verify: tuple[torch.Tensor, torch.Tensor] | None = None
+    # TPU_SPEC_SYNTHETIC_HEAD_FUSION: the chunk's rejection output, already
+    # sampled by the fused verify head in execute_model.
+    synthetic_output: torch.Tensor | None = None
 
     def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
         assert self.deferred_draft_token_ids_cpu is not None

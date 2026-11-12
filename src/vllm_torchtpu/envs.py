@@ -133,6 +133,7 @@ if TYPE_CHECKING:
     TPU_SPEC_GLUE_FUSION: bool = False
     TPU_SPEC_GATHER_IN_BOUNDS: bool = False
     TPU_SPEC_SYNTHETIC_INGRAPH_RNG: bool = False
+    TPU_SPEC_SYNTHETIC_HEAD_FUSION: bool = False
     TPU_DSPARK_MARKOV_KERNEL: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -993,6 +994,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # different random stream.
     "TPU_SPEC_SYNTHETIC_INGRAPH_RNG": env_bool(
         "TPU_SPEC_SYNTHETIC_INGRAPH_RNG", default=False
+    ),
+    # With TPU_SPEC_SYNTHETIC_INGRAPH_RNG, run a decode-only step's synthetic
+    # one-row verify (accept decisions, LM head on the chosen rows, sampling
+    # and assembly) as one compiled program instead of three. Same functions
+    # in the same order; the step's logits stay inside the program.
+    "TPU_SPEC_SYNTHETIC_HEAD_FUSION": env_bool(
+        "TPU_SPEC_SYNTHETIC_HEAD_FUSION", default=False
     ),
     # Run the DSpark greedy Markov chain over the vocab-parallel draft logits
     # as one Pallas call (kernels/collectives/markov_argmax.py) instead of K
