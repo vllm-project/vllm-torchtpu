@@ -142,22 +142,71 @@ def test_custom_op_cache_separates_lowtok_whole_expert(monkeypatch):
 
     monkeypatch.setattr(fused_moe_adapter.pallas, "jax_op", fake_jax_op)
     monkeypatch.setattr(fused_moe_adapter.envs, "TPU_MOE_LOWTOK_WHOLE_EXPERT", False)
+    monkeypatch.setattr(
+        fused_moe_adapter.envs, "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS", 0
+    )
     op_split = fused_moe_adapter._get_fused_moe_custom_op(
         topk=TOPK, activation="silu", use_ep=True
+    )
+    # With whole_expert=False, a non-zero min_tokens normalizes to 0.
+    monkeypatch.setattr(
+        fused_moe_adapter.envs, "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS", 64
+    )
+    assert (
+        fused_moe_adapter._get_fused_moe_custom_op(
+            topk=TOPK, activation="silu", use_ep=True
+        )
+        is op_split
+    )
+    monkeypatch.setattr(
+        fused_moe_adapter.envs, "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS", 0
     )
     monkeypatch.setattr(fused_moe_adapter.envs, "TPU_MOE_LOWTOK_WHOLE_EXPERT", True)
     op_whole = fused_moe_adapter._get_fused_moe_custom_op(
         topk=TOPK, activation="silu", use_ep=True
     )
+    monkeypatch.setattr(
+        fused_moe_adapter.envs, "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS", 64
+    )
+    op_min64 = fused_moe_adapter._get_fused_moe_custom_op(
+        topk=TOPK, activation="silu", use_ep=True
+    )
     assert op_split is not op_whole
+    assert op_whole is not op_min64
     assert built_partials[0].keywords["lowtok_whole_expert"] is False
+    assert built_partials[0].keywords["lowtok_whole_expert_min_tokens"] == 0
     assert built_partials[1].keywords["lowtok_whole_expert"] is True
+    assert built_partials[1].keywords["lowtok_whole_expert_min_tokens"] == 0
+    assert built_partials[2].keywords["lowtok_whole_expert_min_tokens"] == 64
     assert (
         fused_moe_adapter._get_fused_moe_custom_op(
             topk=TOPK, activation="silu", use_ep=True
         )
-        is op_whole
+        is op_min64
     )
+
+
+def test_gmm_whole_expert_min_tokens_selects_split_then_whole(monkeypatch):
+    monkeypatch.setattr(fused_moe_gmm, "_LOWTOK_MAX_TOKENS", 16)
+    seen_whole = []
+    real_lowtok = fused_moe_gmm.moe_lowtok
+
+    def spy_lowtok(*args, **kwargs):
+        seen_whole.append(kwargs.get("whole_expert", False))
+        return real_lowtok(*args, **kwargs, interpret=True)
+
+    monkeypatch.setattr(fused_moe_gmm, "moe_lowtok", spy_lowtok)
+    small = _inputs(tokens=4) | {
+        "lowtok_whole_expert": True,
+        "lowtok_whole_expert_min_tokens": 8,
+    }
+    large = _inputs(tokens=8) | {
+        "lowtok_whole_expert": True,
+        "lowtok_whole_expert_min_tokens": 8,
+    }
+    _ = np.asarray(fused_moe_gmm.fused_moe_func(**small))
+    _ = np.asarray(fused_moe_gmm.fused_moe_func(**large))
+    assert seen_whole == [False, True]
 
 
 @pytest.mark.parametrize(

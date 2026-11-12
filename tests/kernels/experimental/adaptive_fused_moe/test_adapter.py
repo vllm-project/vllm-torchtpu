@@ -212,6 +212,8 @@ def test_built_bridge_calls_experimental_kernel_and_separates_formats(monkeypatc
 
 @pytest.mark.parametrize("sequence_parallel", [False, True])
 def test_prebuild_passes_native_token_groups(context, monkeypatch, sequence_parallel):
+    monkeypatch.setenv("TPU_MOE_LOWTOK_WHOLE_EXPERT", "1")
+    monkeypatch.setenv("TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS", "192")
     value = layer()
     value.moe_config.moe_parallel_config.is_sequence_parallel = sequence_parallel
     groups = ((0,), (1,)) if sequence_parallel else ((1, 0),)
@@ -220,6 +222,8 @@ def test_prebuild_passes_native_token_groups(context, monkeypatch, sequence_para
     prebuild(value)
     discover.assert_called_once_with(is_sequence_parallel=sequence_parallel)
     assert context[1].call_args.kwargs["token_replica_groups"] == groups
+    assert context[1].call_args.kwargs["lowtok_whole_expert"] is True
+    assert context[1].call_args.kwargs["lowtok_whole_expert_min_tokens"] == 192
 
 
 def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(monkeypatch):
@@ -252,12 +256,23 @@ def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(monkeypatch
 
 
 def test_op_cache_separates_lowtok_whole_expert_and_forwards_it(monkeypatch):
+    import importlib
+
+    import jax
+    import jax.numpy as jnp
+
+    package = importlib.import_module(
+        "vllm_torchtpu.kernels.experimental.adaptive_fused_moe"
+    )
+    monkeypatch.setattr(package, "adaptive_fused_moe", Mock(return_value="adaptive"))
     monkeypatch.setattr(bridge, "_OPS", {})
-    monkeypatch.setattr(bridge, "moe_lowtok_ep_serves", Mock(return_value=True))
     lowtok_ep = Mock(return_value="lowtok_out")
     lowtok_scores_ep = Mock(return_value="lowtok_scores_out")
     monkeypatch.setattr(bridge, "moe_lowtok_ep", lowtok_ep)
     monkeypatch.setattr(bridge, "moe_lowtok_scores_ep", lowtok_scores_ep)
+    real_resolve = bridge.resolve_whole_expert_ep
+    resolve_spy = Mock(wraps=real_resolve)
+    monkeypatch.setattr(bridge, "resolve_whole_expert_ep", resolve_spy)
     functions = {}
 
     def create(name, fn, **kwargs):
@@ -266,24 +281,73 @@ def test_op_cache_separates_lowtok_whole_expert_and_forwards_it(monkeypatch):
         return op
 
     monkeypatch.setattr(bridge, "jax_op", create)
-    mesh = Mock(shape={bridge.EP_AXIS_NAME: 4})
+    ep = 4
+    mesh = Mock(shape={bridge.EP_AXIS_NAME: ep})
     split_op = bridge._build_op(
         mesh, 2, True, "silu", None, lowtok_max_tokens=16, lowtok_whole_expert=False
+    )
+    # When lowtok_whole_expert=False, a non-zero min_tokens normalizes to 0 and
+    # reuses the cached split_op instead of splitting custom-op caches.
+    assert (
+        bridge._build_op(
+            mesh,
+            2,
+            True,
+            "silu",
+            None,
+            lowtok_max_tokens=16,
+            lowtok_whole_expert=False,
+            lowtok_whole_expert_min_tokens=12,
+        )
+        is split_op
     )
     whole_op = bridge._build_op(
         mesh, 2, True, "silu", None, lowtok_max_tokens=16, lowtok_whole_expert=True
     )
+    gated_op = bridge._build_op(
+        mesh,
+        2,
+        True,
+        "silu",
+        None,
+        lowtok_max_tokens=16,
+        lowtok_whole_expert=True,
+        lowtok_whole_expert_min_tokens=12,
+    )
     assert split_op is not whole_op
+    assert gated_op is not whole_op
     assert (
         bridge._build_op(
             mesh, 2, True, "silu", None, lowtok_max_tokens=16, lowtok_whole_expert=True
         )
         is whole_op
     )
-    assert functions[whole_op](1, 2, 3, 4, 5, 6, 7) == "lowtok_out"
+
+    # Real ShapeDtypeStruct operands exercise real resolve_whole_expert_ep +
+    # moe_lowtok_ep_serves without mocking away coverage or VMEM checks.
+    w1 = jax.ShapeDtypeStruct((ep * 16, 512, 512), jnp.float8_e4m3fn)
+    w2 = jax.ShapeDtypeStruct((ep * 16, 256, 512), jnp.float8_e4m3fn)
+    s1 = jax.ShapeDtypeStruct((ep * 16, 512), jnp.float32)
+    s2 = jax.ShapeDtypeStruct((ep * 16, 512), jnp.float32)
+    x8 = jax.ShapeDtypeStruct((8, 512), jnp.bfloat16)
+    x16 = jax.ShapeDtypeStruct((16, 512), jnp.bfloat16)
+    x64 = jax.ShapeDtypeStruct((64, 512), jnp.bfloat16)
+    gate64 = SimpleNamespace(shape=(64, bridge.LANES), astype=lambda _: "gate_f32")
+
+    assert functions[whole_op](x8, w1, w2, s1, s2, 6, 7) == "lowtok_out"
     assert lowtok_ep.call_args.kwargs["whole_expert"] is True
-    assert bridge.moe_lowtok_ep_serves.call_args.kwargs["whole_expert"] is True
-    assert bridge.moe_lowtok_ep_serves.call_args.kwargs["scores"] is False
+    assert resolve_spy.call_args.kwargs["scores"] is False
+
+    # Same prebuilt gated_op selects split below 12 rows and whole at >= 12 rows.
+    assert functions[gated_op](x8, w1, w2, s1, s2, 6, 7) == "lowtok_out"
+    assert lowtok_ep.call_args.kwargs["whole_expert"] is False
+    assert functions[gated_op](x16, w1, w2, s1, s2, 6, 7) == "lowtok_out"
+    assert lowtok_ep.call_args.kwargs["whole_expert"] is True
+
+    # Prefill buckets above lowtok_max_tokens bypass resolve_whole_expert_ep.
+    resolve_spy.reset_mock()
+    assert functions[gated_op](x64, w1, w2, s1, s2, gate64, 7) == "adaptive"
+    resolve_spy.assert_not_called()
 
     scores_op = bridge._build_op(
         mesh,
@@ -294,14 +358,68 @@ def test_op_cache_separates_lowtok_whole_expert_and_forwards_it(monkeypatch):
         lowtok_max_tokens=16,
         lowtok_scores=True,
         lowtok_whole_expert=True,
+        lowtok_whole_expert_min_tokens=12,
     )
-    gating = SimpleNamespace(shape=(4, bridge.LANES))
+    gating8 = SimpleNamespace(shape=(8, bridge.LANES))
+    gating16 = SimpleNamespace(shape=(16, bridge.LANES))
     assert (
-        functions[scores_op](1, 2, 3, 4, 5, gating, *range(7, 17))
+        functions[scores_op](x8, w1, w2, s1, s2, gating8, *range(7, 17))
+        == "lowtok_scores_out"
+    )
+    assert lowtok_scores_ep.call_args.kwargs["whole_expert"] is False
+    assert resolve_spy.call_args.kwargs["scores"] is True
+    assert (
+        functions[scores_op](x16, w1, w2, s1, s2, gating16, *range(7, 17))
         == "lowtok_scores_out"
     )
     assert lowtok_scores_ep.call_args.kwargs["whole_expert"] is True
-    assert bridge.moe_lowtok_ep_serves.call_args.kwargs["scores"] is True
+
+    # Narrow inter=128 (two_inter=256) is only supported by whole_expert=True:
+    # even at 8 rows (< min_tokens=12), moe_from_scores falls back to whole=True
+    # instead of dropping out to adaptive_fused_moe.
+    w1_narrow = jax.ShapeDtypeStruct((ep * 16, 512, 256), jnp.float8_e4m3fn)
+    w2_narrow = jax.ShapeDtypeStruct((ep * 16, 128, 512), jnp.float8_e4m3fn)
+    s1_narrow = jax.ShapeDtypeStruct((ep * 16, 256), jnp.float32)
+    assert (
+        functions[scores_op](
+            x8, w1_narrow, w2_narrow, s1_narrow, s2, gating8, *range(7, 17)
+        )
+        == "lowtok_scores_out"
+    )
+    assert lowtok_scores_ep.call_args.kwargs["whole_expert"] is True
+
+    # Prefill buckets above lowtok_max_tokens fall back to adaptive_fused_moe on
+    # the scores entry too instead of calling moe_lowtok_scores_ep.
+    scores_copy_op = bridge._build_op(
+        mesh,
+        2,
+        True,
+        "silu",
+        None,
+        lowtok_max_tokens=16,
+        lowtok_scores=True,
+        lowtok_scores_copies=True,
+        lowtok_whole_expert=True,
+        lowtok_whole_expert_min_tokens=12,
+    )
+    resolve_spy.reset_mock()
+    lowtok_scores_ep.reset_mock()
+    assert (
+        functions[scores_copy_op](
+            x64,
+            w1,
+            w2,
+            s1,
+            s2,
+            jnp.zeros((64, bridge.LANES), jnp.bfloat16),
+            7,
+            jnp.zeros((64,), jnp.int32),
+            *range(9, 17),
+        )
+        == "adaptive"
+    )
+    resolve_spy.assert_not_called()
+    lowtok_scores_ep.assert_not_called()
 
 
 def test_disabled_lowtok_skips_serves_check(monkeypatch):

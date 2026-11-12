@@ -28,7 +28,11 @@ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
 )
-from vllm_torchtpu.kernels.moe_lowtok import can_use_moe_lowtok, moe_lowtok
+from vllm_torchtpu.kernels.moe_lowtok import (
+    can_use_moe_lowtok,
+    moe_lowtok,
+    resolve_whole_expert,
+)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
 )
@@ -677,6 +681,7 @@ def moe_gmm(
         "rhs_quant_dtype",
         "skip_padded_tokens",
         "lowtok_whole_expert",
+        "lowtok_whole_expert_min_tokens",
     ),
 )
 def fused_moe_func(
@@ -698,6 +703,7 @@ def fused_moe_func(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
     lowtok_whole_expert: bool = False,
+    lowtok_whole_expert_min_tokens: int = 0,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -761,6 +767,25 @@ def fused_moe_func(
     # shard's hit experts with the routing weights as the row mask, instead
     # of the sort, permute, grouped matmuls and unpermute below. The caller's
     # combine across shards is unchanged.
+    use_whole_expert = (
+        resolve_whole_expert(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation=activation,
+            whole_expert=lowtok_whole_expert,
+            whole_expert_min_tokens=lowtok_whole_expert_min_tokens,
+        )
+        if use_ep
+        and experts_start is not None
+        and 0 < num_tokens <= _LOWTOK_MAX_TOKENS
+        and rhs_quant_dtype is None
+        else False
+    )
     if (
         use_ep
         and experts_start is not None
@@ -775,7 +800,7 @@ def fused_moe_func(
             w1_bias,
             w2_bias,
             activation=activation,
-            whole_expert=lowtok_whole_expert,
+            whole_expert=use_whole_expert,
         )
     ):
         logger.info_once("Selected few-token MoE kernel (moe_lowtok)")
@@ -787,7 +812,7 @@ def fused_moe_func(
             w1_scale,
             w2,
             w2_scale,
-            whole_expert=lowtok_whole_expert,
+            whole_expert=use_whole_expert,
         )
 
     # Decode services also compile large prefill buckets. Apply the token

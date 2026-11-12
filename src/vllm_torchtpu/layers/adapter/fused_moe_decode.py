@@ -66,6 +66,7 @@ from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
     plan_weight_ring,
     vmem_bytes,
 )
+from vllm_torchtpu.kernels.moe_lowtok.kernel import normalize_whole_expert_min_tokens
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -121,6 +122,7 @@ def _gmm_layer(
     shared_gated,
     routed_scale,
     lowtok_whole_expert=False,
+    lowtok_whole_expert_min_tokens=0,
 ):
     """Above the cap: the layer as the runner computes it with the kernel off,
     shared expert + routed GMM MoE (scaled by routed_scale), all-reduced. Per
@@ -144,6 +146,7 @@ def _gmm_layer(
         rhs_quant_dtype=None,
         skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
         lowtok_whole_expert=lowtok_whole_expert,
+        lowtok_whole_expert_min_tokens=lowtok_whole_expert_min_tokens,
     )
     if routed_scale != 1.0:
         routed = routed * routed_scale
@@ -188,6 +191,7 @@ def _layer(
     shared_gated=True,
     routed_scale=1.0,
     lowtok_whole_expert=False,
+    lowtok_whole_expert_min_tokens=0,
 ):
     """Per-rank body of the op: the kernel up to `max_tokens`, GMM MoE above.
     An ungated layer still passes its placeholder shared_gate_weight operand
@@ -212,6 +216,7 @@ def _layer(
             shared_gated=shared_gated,
             routed_scale=routed_scale,
             lowtok_whole_expert=lowtok_whole_expert,
+            lowtok_whole_expert_min_tokens=lowtok_whole_expert_min_tokens,
         )
     # Trace-time, once per token bucket: the evidence that the kernel serves
     # this shape, and in which mode (the kernel's name carries it too).
@@ -259,7 +264,13 @@ def _build_op(
     shared_gated: bool = True,
     routed_scale: float = 1.0,
 ):
-    lowtok_whole_expert = bool(envs.TPU_MOE_LOWTOK_WHOLE_EXPERT)
+    raw_whole = bool(envs.TPU_MOE_LOWTOK_WHOLE_EXPERT)
+    lowtok_whole_expert_min_tokens = normalize_whole_expert_min_tokens(
+        raw_whole,
+        int(envs.TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS),
+        active=expert_parallel,
+    )
+    lowtok_whole_expert = raw_whole if expert_parallel else False
     key = (
         id(mesh),
         n_ranks,
@@ -269,6 +280,7 @@ def _build_op(
         shared_gated,
         routed_scale,
         lowtok_whole_expert,
+        lowtok_whole_expert_min_tokens,
     )
     op = _OPS.get(key)
     if op is not None:
@@ -283,6 +295,7 @@ def _build_op(
         shared_gated=shared_gated,
         routed_scale=routed_scale,
         lowtok_whole_expert=lowtok_whole_expert,
+        lowtok_whole_expert_min_tokens=lowtok_whole_expert_min_tokens,
     )
 
     # torch_tpu infers static arguments from annotations: every operand is a

@@ -142,7 +142,55 @@ def test_whole_expert_admits_single_lane_half_intermediate(scores_env, monkeypat
 
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
-    assert "TPU_MOE_LOWTOK_WHOLE_EXPERT" in TpuPlatform.additional_env_vars
+    for var in (
+        "TPU_MOE_LOWTOK_MAX_TOKENS",
+        "TPU_MOE_LOWTOK_FROM_SCORES",
+        "TPU_MOE_LOWTOK_SCORES_STRICT",
+        "TPU_MOE_LOWTOK_WHOLE_EXPERT",
+        "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS",
+    ):
+        assert var in TpuPlatform.additional_env_vars
+
+
+def test_strict_refuses_max_tokens_exceeding_vmem_cap(scores_env, monkeypatch):
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.moe_lowtok import kernel as lowtok_kernel
+
+    monkeypatch.setattr(
+        lowtok_kernel,
+        "_try_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    fp8 = torch.float8_e4m3fn
+    big_h, big_i = 4096, 1024
+    layer = _layer(
+        w13_weight=torch.nn.Parameter(
+            torch.empty((LOCAL, big_h, 2 * big_i), dtype=fp8, device="meta"),
+            requires_grad=False,
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.empty((LOCAL, big_i, big_h), dtype=fp8, device="meta"),
+            requires_grad=False,
+        ),
+        w13_weight_scale_inv=torch.nn.Parameter(
+            torch.empty((LOCAL, 1, 1, 2 * big_i), dtype=torch.float32, device="meta"),
+            requires_grad=False,
+        ),
+        w2_weight_scale_inv=torch.nn.Parameter(
+            torch.empty((LOCAL, 1, 1, big_h), dtype=torch.float32, device="meta"),
+            requires_grad=False,
+        ),
+    )
+    monkeypatch.setenv("TPU_MOE_LOWTOK_WHOLE_EXPERT", "1")
+    monkeypatch.setenv("TPU_MOE_LOWTOK_MAX_TOKENS", "4096")
+    # Without STRICT, ep_size rows fit in 48 MiB so smaller buckets still arm.
+    assert scores_entry.scores_entry_refusal(layer, "silu", True) is None
+    # With STRICT=1, probing at max_tokens=4096 catches the VMEM cap breach.
+    monkeypatch.setenv("TPU_MOE_LOWTOK_SCORES_STRICT", "1")
+    assert "VMEM" in scores_entry.scores_entry_refusal(layer, "silu", True)
+    with pytest.raises(RuntimeError, match="STRICT"):
+        scores_entry.arm(layer, "silu", adaptive=True)
 
 
 def test_off_is_a_no_op(monkeypatch):

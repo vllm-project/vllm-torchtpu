@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     TPU_MOE_LOWTOK_FROM_SCORES: bool = False
     TPU_MOE_LOWTOK_SCORES_STRICT: bool = False
     TPU_MOE_LOWTOK_WHOLE_EXPERT: bool = False
+    TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS: int = 0
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -777,6 +778,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # two-slot ping-pong VMEM ring in the few-token MoE kernel instead of
     # splitting w13 into column halves and materializing h_acc in VMEM.
     "TPU_MOE_LOWTOK_WHOLE_EXPERT": env_bool("TPU_MOE_LOWTOK_WHOLE_EXPERT"),
+    # Minimum post-all-gather hidden-state row count at which
+    # TPU_MOE_LOWTOK_WHOLE_EXPERT=1 switches from three-slot half-w13 streaming
+    # to two-slot whole-expert streaming (0 applies whole-expert streaming to
+    # all few-token buckets). Shapes that only whole-expert streaming can fit
+    # keep whole-expert streaming below this threshold.
+    "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS", 0
+    ),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:

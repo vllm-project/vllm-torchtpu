@@ -34,11 +34,39 @@ from vllm_torchtpu.kernels.moe_lowtok.kernel import (
     can_use_moe_lowtok,
     moe_lowtok,
     moe_lowtok_scores,
+    resolve_whole_expert,
 )
 
 
 def _local_shape(array, ep):
     return jax.ShapeDtypeStruct((array.shape[0] // ep, *array.shape[1:]), array.dtype)
+
+
+def resolve_whole_expert_ep(
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    *,
+    ep,
+    activation: str,
+    whole_expert: bool,
+    whole_expert_min_tokens: int = 0,
+    scores: bool = False,
+) -> bool:
+    """Whether an EP-sharded step `x` should run two-slot whole-expert streaming."""
+    return resolve_whole_expert(
+        x,
+        _local_shape(w1, ep),
+        _local_shape(w2, ep),
+        _local_shape(w1_scale, ep),
+        _local_shape(w2_scale, ep),
+        activation=activation,
+        whole_expert=whole_expert,
+        whole_expert_min_tokens=whole_expert_min_tokens,
+        scores=scores,
+    )
 
 
 def moe_lowtok_ep_serves(

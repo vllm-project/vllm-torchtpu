@@ -16,6 +16,15 @@ from vllm_torchtpu.kernels.moe_lowtok.kernel import (
     can_use_moe_lowtok,
     moe_lowtok,
     moe_lowtok_reference,
+    normalize_whole_expert_min_tokens,
+    resolve_whole_expert,
 )
 
-__all__ = ["LANES", "can_use_moe_lowtok", "moe_lowtok", "moe_lowtok_reference"]
+__all__ = [
+    "LANES",
+    "can_use_moe_lowtok",
+    "moe_lowtok",
+    "moe_lowtok_reference",
+    "normalize_whole_expert_min_tokens",
+    "resolve_whole_expert",
+]

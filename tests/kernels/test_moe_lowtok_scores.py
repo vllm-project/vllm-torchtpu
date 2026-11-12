@@ -396,12 +396,16 @@ def test_tpu_scores_entry_whole_expert(whole_expert):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("n_fixed_hits,n_copy_hits", [(0, 0), (0, 3), (1, 2)])
-def test_tpu_scores_whole_expert_copied_hits(n_fixed_hits, n_copy_hits):
+def test_tpu_scores_whole_expert_copied_hits(
+    tmp_path, monkeypatch, n_fixed_hits, n_copy_hits
+):
     """Compiles and runs whole_expert=True with has_copies=True on TPU across
     0-hit, copied-only late-prime, and mixed fixed+copy hit counts."""
     if jax.default_backend() != "tpu":
         pytest.skip("requires TPU")
-    test_scores_whole_expert_copied_only_late_prime(n_fixed_hits, n_copy_hits)
+    test_scores_whole_expert_copied_only_late_prime(
+        tmp_path, monkeypatch, n_fixed_hits, n_copy_hits
+    )
 
 
 def test_hot_tables_must_list_every_copy():
@@ -413,3 +417,106 @@ def test_hot_tables_must_list_every_copy():
     assert hot_primary[:2].tolist() == [1, 0] and hot_copy[:2].tolist() == [0, 1]
     with pytest.raises(ValueError):
         hot_tables(primary, copy, [5])
+
+
+@pytest.mark.multichip
+@pytest.mark.tpu_test
+def test_tpu_multichip_scores_ep_threshold_straddling_parity():
+    """On an 8-core TPU mesh, buckets below and at whole_expert_min_tokens
+    select split vs whole-expert streaming and match each other numerically."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from vllm_torchtpu.kernels.moe_lowtok.expert_parallel import (
+        moe_lowtok_scores_ep,
+        resolve_whole_expert_ep,
+    )
+
+    devices = jax.devices()
+    if jax.default_backend() != "tpu" or len(devices) < EP:
+        pytest.skip("requires >= 8 TPU devices")
+    mesh = Mesh(np.array(devices[:EP]), ("ep",))
+    sharding = NamedSharding(mesh, PartitionSpec("ep"))
+    rng = np.random.default_rng(91)
+    w13, s13, w2, s2 = _weights(rng, EP * LOCAL)
+    w13_d = jax.device_put(w13, sharding)
+    w2_d = jax.device_put(w2, sharding)
+    s13_d = jax.device_put(s13.reshape(EP * LOCAL, -1), sharding)
+    s2_d = jax.device_put(s2.reshape(EP * LOCAL, -1), sharding)
+    tabs, prims, copies, onehots = zip(
+        *(_contiguous_tables(r, LOCAL) for r in range(EP)), strict=True
+    )
+    tables_d = jax.device_put(np.stack(tabs), sharding)
+    prim_d = jax.device_put(np.stack(prims), sharding)
+    copy_d = jax.device_put(np.stack(copies), sharding)
+    hot_d = jax.device_put(np.stack(onehots), sharding)
+
+    min_tokens = 64
+    traced_modes: list[tuple[int, bool]] = []
+
+    @jax.jit
+    def gated_ep(x_in, g_in, p_in):
+        use_whole = resolve_whole_expert_ep(
+            x_in,
+            w13_d,
+            w2_d,
+            s13_d,
+            s2_d,
+            ep=EP,
+            activation="silu",
+            whole_expert=True,
+            whole_expert_min_tokens=min_tokens,
+            scores=True,
+        )
+        traced_modes.append((x_in.shape[0], use_whole))
+        return moe_lowtok_scores_ep(
+            x_in,
+            g_in,
+            p_in,
+            tables_d,
+            prim_d,
+            copy_d,
+            hot_d,
+            w13_d,
+            w2_d,
+            s13_d,
+            s2_d,
+            mesh=mesh,
+            topk=TOPK,
+            whole_expert=use_whole,
+        )
+
+    for local_rows, want_whole in ((4, False), (8, True)):
+        total_rows = EP * local_rows
+        x_np = rng.standard_normal((total_rows, HIDDEN)).astype(np.float32)
+        g_np = rng.standard_normal((total_rows, LANES)).astype(np.float32)
+        x_d = jax.device_put(jnp.asarray(x_np, jnp.bfloat16), sharding)
+        gate_d = jax.device_put(jnp.asarray(g_np, jnp.bfloat16), sharding)
+        pad_d = jax.device_put(np.zeros((total_rows,), dtype=np.int32), sharding)
+        got = np.asarray(gated_ep(x_d, gate_d, pad_d), np.float32)
+        assert traced_modes[-1] == (total_rows, want_whole)
+
+        # Independent cross-mode check: compare against the opposite streaming
+        # mode across the EP mesh so neither bucket compares a mode to itself.
+        opposite = np.asarray(
+            jax.jit(
+                lambda x_in, g_in, p_in, opp=(not want_whole): moe_lowtok_scores_ep(
+                    x_in,
+                    g_in,
+                    p_in,
+                    tables_d,
+                    prim_d,
+                    copy_d,
+                    hot_d,
+                    w13_d,
+                    w2_d,
+                    s13_d,
+                    s2_d,
+                    mesh=mesh,
+                    topk=TOPK,
+                    whole_expert=opp,
+                )
+            )(x_d, gate_d, pad_d),
+            np.float32,
+        )
+        scale = max(float(np.abs(opposite).max()), 1e-6)
+        np.testing.assert_allclose(got / scale, opposite / scale, atol=5e-3, rtol=0)

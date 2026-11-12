@@ -242,3 +242,70 @@ def test_arm_runner_models_skips_a_draft_that_is_the_target(monkeypatch):
     runner.drafter = SimpleNamespace(draft_model=runner.model)
     assert bridge.arm_runner_models(runner) == 1
     assert armed == [(runner.model, "target model")]
+
+
+def test_build_op_separates_and_forwards_lowtok_whole_expert_min_tokens(monkeypatch):
+    """_build_op keys on normalized (whole_expert, min_tokens) and forwards both
+    into fused_moe_func on the above-cap GMM fallback path."""
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    monkeypatch.setattr(bridge, "jax_op", lambda name, fn, **kw: Mock(name=name))
+    mesh = object()
+
+    monkeypatch.setenv("TPU_MOE_LOWTOK_WHOLE_EXPERT", "0")
+    monkeypatch.setenv("TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS", "0")
+    op_off = bridge._build_op(mesh, 8, 2, True, 64)
+
+    # With whole_expert=0, a non-zero min_tokens normalizes to 0 (same op).
+    monkeypatch.setenv("TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS", "192")
+    assert bridge._build_op(mesh, 8, 2, True, 64) is op_off
+
+    monkeypatch.setenv("TPU_MOE_LOWTOK_WHOLE_EXPERT", "1")
+    monkeypatch.setenv("TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS", "0")
+    op_whole = bridge._build_op(mesh, 8, 2, True, 64)
+    assert op_whole is not op_off
+
+    monkeypatch.setenv("TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS", "192")
+    op_gated = bridge._build_op(mesh, 8, 2, True, 64)
+    assert op_gated is not op_whole
+
+    captured = {}
+
+    def fake_fused_moe(x, *args, **kwargs):
+        captured.update(kwargs)
+        return x
+
+    monkeypatch.setattr(bridge, "fused_moe_func", fake_fused_moe)
+    monkeypatch.setattr(bridge, "_quantized_matmul_jax", lambda a, w, s: a @ (w * s))
+    monkeypatch.setattr(bridge, "resolve_onehot_permute_threshold", lambda: 0)
+    w = np.zeros((1, 1), np.float32)
+    x = np.zeros((4, H), np.float32)
+    w1s = np.zeros((H, 4), np.float32)
+    w2s = np.zeros((2, H), np.float32)
+
+    def body(x_in):
+        return bridge._layer(
+            np.array([[0, 0]], np.int32),
+            x_in,
+            *([w] * 4),
+            w1s,
+            np.ones(4, np.float32),
+            w2s,
+            np.ones(H, np.float32),
+            w,
+            np.zeros((4, 2), np.float32),
+            np.zeros((4, 2), np.int32),
+            n_ranks=1,
+            topk=2,
+            expert_parallel=True,
+            max_tokens=1,
+            shared_gated=False,
+            routed_scale=1.0,
+            lowtok_whole_expert=True,
+            lowtok_whole_expert_min_tokens=192,
+        )
+
+    jax.vmap(body, axis_name=EP_AXIS_NAME)(x[None])
+    assert captured["lowtok_whole_expert"] is True
+    assert captured["lowtok_whole_expert_min_tokens"] == 192

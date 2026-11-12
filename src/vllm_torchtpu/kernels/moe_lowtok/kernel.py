@@ -43,6 +43,10 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
 ROW_TILE = 32  # fp8 sublane packing: four rows per 32-bit word, eight words
 LANES = 512  # the routing table's expert axis
 LANE = 128  # the lane tile; column offsets inside a unit must sit on it
@@ -673,6 +677,100 @@ def can_use_moe_lowtok(
         if need > limit:
             return False
     return True
+
+
+def normalize_whole_expert_min_tokens(
+    whole_expert: bool,
+    whole_expert_min_tokens: int,
+    *,
+    active: bool = True,
+) -> int:
+    """Canonicalize ``whole_expert_min_tokens`` for custom-op and compile caches.
+
+    When ``whole_expert`` is False (or ``active`` is False because the caller
+    cannot run ``moe_lowtok``), ``whole_expert_min_tokens`` cannot alter any
+    traced program and normalizes to ``0`` so cache keys are not split. Logs a
+    one-time warning if a positive threshold was requested while
+    ``whole_expert`` is False.
+    """
+    if whole_expert_min_tokens < 0:
+        raise ValueError(
+            "whole_expert_min_tokens must be non-negative, got "
+            f"{whole_expert_min_tokens}"
+        )
+    if active and whole_expert_min_tokens > 0 and not whole_expert:
+        logger.warning_once(
+            "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS=%d has no effect while "
+            "TPU_MOE_LOWTOK_WHOLE_EXPERT is False",
+            whole_expert_min_tokens,
+        )
+    if not active or not whole_expert:
+        return 0
+    return int(whole_expert_min_tokens)
+
+
+def resolve_whole_expert(
+    hidden_states,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    w1_bias=None,
+    w2_bias=None,
+    *,
+    activation: str,
+    whole_expert: bool,
+    whole_expert_min_tokens: int = 0,
+    scores: bool = False,
+    vmem_limit_bytes: int | None = None,
+) -> bool:
+    """Whether a traced step should run two-slot whole-expert streaming.
+
+    Returns False when ``whole_expert`` is False or when whole-expert streaming
+    itself does not support the layer or shape. Otherwise, when
+    ``whole_expert_min_tokens`` is positive and the post-all-gather row count is
+    below ``whole_expert_min_tokens``, prefers three-slot half-``w13`` streaming
+    (``False``) whenever ``can_use_moe_lowtok(..., whole_expert=False)`` admits
+    the layer and shape, falling back to ``True`` on shapes only whole-expert
+    streaming supports (such as ``two_inter == 2 * LANE`` or tight VMEM caps).
+    """
+    if whole_expert_min_tokens < 0:
+        raise ValueError(
+            "whole_expert_min_tokens must be non-negative, got "
+            f"{whole_expert_min_tokens}"
+        )
+    if not whole_expert:
+        return False
+    if not can_use_moe_lowtok(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        activation=activation,
+        whole_expert=True,
+        scores=scores,
+        vmem_limit_bytes=vmem_limit_bytes,
+    ):
+        return False
+    rows = int(hidden_states.shape[0])
+    if whole_expert_min_tokens == 0 or rows >= whole_expert_min_tokens:
+        return True
+    return not can_use_moe_lowtok(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        activation=activation,
+        whole_expert=False,
+        scores=scores,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
 
 
 @functools.partial(

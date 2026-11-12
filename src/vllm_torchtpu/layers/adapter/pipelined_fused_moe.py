@@ -204,6 +204,8 @@ def pipelined_fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    lowtok_whole_expert: bool | None = None,
+    lowtok_whole_expert_min_tokens: int | None = None,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
 
@@ -294,6 +296,8 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            lowtok_whole_expert=lowtok_whole_expert,
+            lowtok_whole_expert_min_tokens=lowtok_whole_expert_min_tokens,
         )
 
         if parallel_size > 1:
@@ -381,6 +385,8 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            lowtok_whole_expert=lowtok_whole_expert,
+            lowtok_whole_expert_min_tokens=lowtok_whole_expert_min_tokens,
         )
 
         # Reduce-scatter partial output for current chunk

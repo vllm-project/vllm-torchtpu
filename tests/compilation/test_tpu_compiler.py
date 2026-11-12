@@ -119,7 +119,42 @@ class TestTpuCompilerCache:
             with patch.dict(os.environ, {"ONEHOT_MOE_PERMUTE_THRESHOLD": "4096"}):
                 enabled = compute_tpu_compilation_hash(self._config())
 
+            with patch.dict(
+                os.environ,
+                {
+                    "TPU_MOE_LOWTOK_WHOLE_EXPERT": "0",
+                    "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS": "0",
+                },
+            ):
+                whole_off_0 = compute_tpu_compilation_hash(self._config())
+            with patch.dict(
+                os.environ,
+                {
+                    "TPU_MOE_LOWTOK_WHOLE_EXPERT": "0",
+                    "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS": "192",
+                },
+            ):
+                whole_off_192 = compute_tpu_compilation_hash(self._config())
+            with patch.dict(
+                os.environ,
+                {
+                    "TPU_MOE_LOWTOK_WHOLE_EXPERT": "1",
+                    "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS": "0",
+                },
+            ):
+                whole_on_0 = compute_tpu_compilation_hash(self._config())
+            with patch.dict(
+                os.environ,
+                {
+                    "TPU_MOE_LOWTOK_WHOLE_EXPERT": "1",
+                    "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS": "192",
+                },
+            ):
+                whole_on_192 = compute_tpu_compilation_hash(self._config())
+
         assert disabled != enabled
+        assert whole_off_0 == whole_off_192
+        assert whole_on_0 != whole_on_192
 
     def test_tpu_hash_ignores_the_phased_profiler_switch(self):
         """Selecting a profiler must not bust the compile cache: otherwise a
@@ -279,6 +314,7 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/gdn_pool_layout.py",
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
+            "vllm_torchtpu/layers/adapter/fused_moe_decode.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed

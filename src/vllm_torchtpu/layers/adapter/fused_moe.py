@@ -22,6 +22,7 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.moe_lowtok.kernel import normalize_whole_expert_min_tokens
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
@@ -31,7 +32,9 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 )
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool, bool], Callable] = {}
+_fused_moe_kernel_cache: dict[
+    tuple[int, str, bool, Any, bool, bool, int], Callable
+] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -157,8 +160,16 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     lowtok_whole_expert: bool = False,
+    lowtok_whole_expert_min_tokens: int = 0,
     rhs_quant_dtype=None,
 ):
+    raw_whole = bool(lowtok_whole_expert)
+    lowtok_whole_expert_min_tokens = normalize_whole_expert_min_tokens(
+        raw_whole,
+        lowtok_whole_expert_min_tokens,
+        active=use_ep,
+    )
+    lowtok_whole_expert = raw_whole if use_ep else False
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
 
@@ -183,6 +194,7 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         lowtok_whole_expert=lowtok_whole_expert,
+        lowtok_whole_expert_min_tokens=lowtok_whole_expert_min_tokens,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -201,6 +213,7 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype,
         skip_padded_tokens,
         lowtok_whole_expert,
+        lowtok_whole_expert_min_tokens,
     )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
@@ -214,11 +227,21 @@ def _get_fused_moe_custom_op(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
     lowtok_whole_expert: bool | None = None,
+    lowtok_whole_expert_min_tokens: int | None = None,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
     if lowtok_whole_expert is None:
         lowtok_whole_expert = envs.TPU_MOE_LOWTOK_WHOLE_EXPERT
+    if lowtok_whole_expert_min_tokens is None:
+        lowtok_whole_expert_min_tokens = envs.TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS
+    raw_whole = bool(lowtok_whole_expert)
+    lowtok_whole_expert_min_tokens = normalize_whole_expert_min_tokens(
+        raw_whole,
+        int(lowtok_whole_expert_min_tokens),
+        active=use_ep,
+    )
+    lowtok_whole_expert = raw_whole if use_ep else False
     cache_key = (
         topk,
         activation,
@@ -226,6 +249,7 @@ def _get_fused_moe_custom_op(
         rhs_quant_dtype,
         skip_padded_tokens,
         lowtok_whole_expert,
+        lowtok_whole_expert_min_tokens,
     )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
@@ -237,6 +261,7 @@ def _get_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         lowtok_whole_expert=lowtok_whole_expert,
+        lowtok_whole_expert_min_tokens=lowtok_whole_expert_min_tokens,
     )
 
 
@@ -248,6 +273,7 @@ def prebuild_fused_moe_kernel(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
     lowtok_whole_expert: bool | None = None,
+    lowtok_whole_expert_min_tokens: int | None = None,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -257,6 +283,7 @@ def prebuild_fused_moe_kernel(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         lowtok_whole_expert=lowtok_whole_expert,
+        lowtok_whole_expert_min_tokens=lowtok_whole_expert_min_tokens,
     )
 
 
@@ -276,6 +303,7 @@ def fused_moe_gmm(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
     lowtok_whole_expert: bool | None = None,
+    lowtok_whole_expert_min_tokens: int | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -297,6 +325,7 @@ def fused_moe_gmm(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         lowtok_whole_expert=lowtok_whole_expert,
+        lowtok_whole_expert_min_tokens=lowtok_whole_expert_min_tokens,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand

@@ -120,21 +120,28 @@ def scores_entry_refusal(layer, activation: str, adaptive: bool) -> str | None:
     if not layer.renormalize:
         return "no renormalization of the top-k weights"
     hidden = layer.w13_weight.shape[1]
-    if not can_use_moe_lowtok(
-        jax.ShapeDtypeStruct((max(ep_size, 1), hidden), jnp.bfloat16),
-        _shape(layer.w13_weight),
-        _shape(layer.w2_weight),
-        _shape(layer.w13_weight_scale_inv),
-        _shape(layer.w2_weight_scale_inv),
-        getattr(layer, "w13_bias", None),
-        getattr(layer, "w2_bias", None),
-        activation=activation,
-        whole_expert=envs.TPU_MOE_LOWTOK_WHOLE_EXPERT,
-        scores=True,
-    ):
-        return (
-            "the kernel does not support this layer's weights, activation, or VMEM cap"
-        )
+    probe_rows = (
+        (max(ep_size, 1), max_tokens)
+        if envs.TPU_MOE_LOWTOK_SCORES_STRICT
+        else (max(ep_size, 1),)
+    )
+    for rows in probe_rows:
+        if not can_use_moe_lowtok(
+            jax.ShapeDtypeStruct((rows, hidden), jnp.bfloat16),
+            _shape(layer.w13_weight),
+            _shape(layer.w2_weight),
+            _shape(layer.w13_weight_scale_inv),
+            _shape(layer.w2_weight_scale_inv),
+            getattr(layer, "w13_bias", None),
+            getattr(layer, "w2_bias", None),
+            activation=activation,
+            whole_expert=envs.TPU_MOE_LOWTOK_WHOLE_EXPERT,
+            scores=True,
+        ):
+            return (
+                "the kernel does not support this layer's weights, "
+                "activation, or VMEM cap"
+            )
     return None
 
 

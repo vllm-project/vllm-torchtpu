@@ -487,3 +487,141 @@ def test_qwen35_397b_320_rows_fits_tpu7x_vmem_only_with_whole_expert():
         whole_expert=True,
         scores=True,
     )
+
+
+def test_resolve_whole_expert_threshold_and_coverage_fallback():
+    """resolve_whole_expert selects split below min_tokens when split is legal,
+    and retains whole_expert=True on shapes only whole-expert supports."""
+    from vllm_torchtpu.kernels.moe_lowtok.expert_parallel import (
+        resolve_whole_expert_ep,
+    )
+    from vllm_torchtpu.kernels.moe_lowtok.kernel import resolve_whole_expert
+
+    tpu7x_vmem_75pct = 48 * 1024 * 1024
+    w13 = jax.ShapeDtypeStruct((64, 4096, 2048), jnp.float8_e4m3fn)
+    w2 = jax.ShapeDtypeStruct((64, 1024, 4096), jnp.float8_e4m3fn)
+    s13 = jax.ShapeDtypeStruct((64, 2048), jnp.float32)
+    s2 = jax.ShapeDtypeStruct((64, 4096), jnp.float32)
+    x160 = jax.ShapeDtypeStruct((160, 4096), jnp.bfloat16)
+    x192 = jax.ShapeDtypeStruct((192, 4096), jnp.bfloat16)
+    x320 = jax.ShapeDtypeStruct((320, 4096), jnp.bfloat16)
+
+    with pytest.raises(ValueError, match="non-negative"):
+        resolve_whole_expert(
+            x160,
+            w13,
+            w2,
+            s13,
+            s2,
+            activation="silu",
+            whole_expert=True,
+            whole_expert_min_tokens=-1,
+        )
+
+    assert not resolve_whole_expert(
+        x192,
+        w13,
+        w2,
+        s13,
+        s2,
+        activation="silu",
+        whole_expert=False,
+        whole_expert_min_tokens=192,
+        scores=True,
+        vmem_limit_bytes=tpu7x_vmem_75pct,
+    )
+    assert resolve_whole_expert(
+        x160,
+        w13,
+        w2,
+        s13,
+        s2,
+        activation="silu",
+        whole_expert=True,
+        whole_expert_min_tokens=0,
+        scores=True,
+        vmem_limit_bytes=tpu7x_vmem_75pct,
+    )
+    assert not resolve_whole_expert(
+        x160,
+        w13,
+        w2,
+        s13,
+        s2,
+        activation="silu",
+        whole_expert=True,
+        whole_expert_min_tokens=192,
+        scores=True,
+        vmem_limit_bytes=tpu7x_vmem_75pct,
+    )
+    assert resolve_whole_expert(
+        x192,
+        w13,
+        w2,
+        s13,
+        s2,
+        activation="silu",
+        whole_expert=True,
+        whole_expert_min_tokens=192,
+        scores=True,
+        vmem_limit_bytes=tpu7x_vmem_75pct,
+    )
+    # 320 rows exceeds split's 48 MiB VMEM cap: retain whole_expert=True even
+    # when whole_expert_min_tokens exceeds 320.
+    assert resolve_whole_expert(
+        x320,
+        w13,
+        w2,
+        s13,
+        s2,
+        activation="silu",
+        whole_expert=True,
+        whole_expert_min_tokens=512,
+        scores=True,
+        vmem_limit_bytes=tpu7x_vmem_75pct,
+    )
+
+    # inter=128 (two_inter=256) is supported only by whole_expert=True.
+    ep = 8
+    w13_narrow = jax.ShapeDtypeStruct((ep * 8, 256, 256), jnp.float8_e4m3fn)
+    w2_narrow = jax.ShapeDtypeStruct((ep * 8, 128, 256), jnp.float8_e4m3fn)
+    s13_narrow = jax.ShapeDtypeStruct((ep * 8, 256), jnp.float32)
+    s2_narrow = jax.ShapeDtypeStruct((ep * 8, 256), jnp.float32)
+    x_small = jax.ShapeDtypeStruct((16, 256), jnp.bfloat16)
+    assert resolve_whole_expert_ep(
+        x_small,
+        w13_narrow,
+        w2_narrow,
+        s13_narrow,
+        s2_narrow,
+        ep=ep,
+        activation="silu",
+        whole_expert=True,
+        whole_expert_min_tokens=192,
+    )
+    # Layers or buckets unsupported even by whole_expert=True return False
+    # rather than falsely claiming whole-expert streaming applies.
+    assert not resolve_whole_expert(
+        x160,
+        w13,
+        w2,
+        s13,
+        s2,
+        activation="gelu",
+        whole_expert=True,
+        whole_expert_min_tokens=192,
+        scores=True,
+        vmem_limit_bytes=tpu7x_vmem_75pct,
+    )
+    assert not resolve_whole_expert(
+        x320,
+        w13,
+        w2,
+        s13,
+        s2,
+        activation="silu",
+        whole_expert=True,
+        whole_expert_min_tokens=192,
+        scores=True,
+        vmem_limit_bytes=1024,
+    )

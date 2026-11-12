@@ -273,6 +273,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/cp_attention.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
+    "vllm_torchtpu/layers/adapter/fused_moe_decode.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate
@@ -397,6 +398,10 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
             logger.warning(
                 "Skipping TPU compile environment variable %s: %s", name, exc
             )
+    if "TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS" in factors and not factors.get(
+        "TPU_MOE_LOWTOK_WHOLE_EXPERT"
+    ):
+        factors["TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS"] = 0
     return factors
 
 

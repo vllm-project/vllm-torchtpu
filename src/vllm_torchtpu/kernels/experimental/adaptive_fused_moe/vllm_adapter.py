@@ -49,8 +49,12 @@ from vllm_torchtpu.kernels.moe_lowtok.expert_parallel import (
     moe_lowtok_ep,
     moe_lowtok_ep_serves,
     moe_lowtok_scores_ep,
+    resolve_whole_expert_ep,
 )
-from vllm_torchtpu.kernels.moe_lowtok.kernel import LANES
+from vllm_torchtpu.kernels.moe_lowtok.kernel import (
+    LANES,
+    normalize_whole_expert_min_tokens,
+)
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.logger import init_logger
 
@@ -188,6 +192,7 @@ def prebuild_adaptive_fused_moe(
         lowtok_scores=lowtok_scores,
         lowtok_scores_copies=lowtok_scores_copies,
         lowtok_whole_expert=envs.TPU_MOE_LOWTOK_WHOLE_EXPERT,
+        lowtok_whole_expert_min_tokens=envs.TPU_MOE_LOWTOK_WHOLE_EXPERT_MIN_TOKENS,
     )
     logger.info_once(
         "Experimental adaptive fused MoE armed | format=%s W1=%d W2=%d "
@@ -436,6 +441,7 @@ def _build_op(
     lowtok_scores: bool = False,
     lowtok_scores_copies: bool = False,
     lowtok_whole_expert: bool = False,
+    lowtok_whole_expert_min_tokens: int = 0,
 ) -> torch.library.CustomOpDef:
     """The op for this closure, built once per distinct closure and reused.
 
@@ -449,6 +455,12 @@ def _build_op(
     scores entry, which routes and, with ``lowtok_scores_copies``, picks one
     holder per hit copied expert.
     """
+    lowtok_whole_expert = bool(lowtok_whole_expert)
+    lowtok_whole_expert_min_tokens = normalize_whole_expert_min_tokens(
+        lowtok_whole_expert,
+        lowtok_whole_expert_min_tokens,
+        active=lowtok_max_tokens > 0 and weight_format == "fp8",
+    )
     key = (
         mesh,
         topk,
@@ -462,6 +474,7 @@ def _build_op(
         lowtok_scores,
         lowtok_scores_copies,
         lowtok_whole_expert,
+        lowtok_whole_expert_min_tokens,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -483,38 +496,54 @@ def _build_op(
         gating: jax.Array,
         rank: jax.Array,
     ) -> jax.Array:
-        if (
-            lowtok_max_tokens > 0
-            and weight_format == "fp8"
-            and moe_lowtok_ep_serves(
+        if lowtok_max_tokens > 0 and weight_format == "fp8":
+            ep = mesh.shape[EP_AXIS_NAME]
+            use_whole_expert = (
+                resolve_whole_expert_ep(
+                    x,
+                    w1,
+                    w2,
+                    w1_scale,
+                    w2_scale,
+                    ep=ep,
+                    activation=activation,
+                    whole_expert=lowtok_whole_expert,
+                    whole_expert_min_tokens=lowtok_whole_expert_min_tokens,
+                    scores=False,
+                )
+                if 0 < x.shape[0] <= lowtok_max_tokens
+                and x.shape[0] % ep == 0
+                and (token_replica_groups is None or len(token_replica_groups[0]) == 1)
+                else False
+            )
+            if moe_lowtok_ep_serves(
                 x,
                 w1,
                 w2,
                 w1_scale,
                 w2_scale,
-                ep=mesh.shape[EP_AXIS_NAME],
+                ep=ep,
                 max_tokens=lowtok_max_tokens,
                 activation=activation,
                 token_replica_groups=token_replica_groups,
-                whole_expert=lowtok_whole_expert,
+                whole_expert=use_whole_expert,
                 scores=False,
-            )
-        ):
-            logger.info_once("Adaptive fused MoE: small steps run moe_lowtok")
-            return moe_lowtok_ep(
-                x,
-                gating,
-                rank,
-                w1,
-                w2,
-                w1_scale,
-                w2_scale,
-                mesh=mesh,
-                topk=topk,
-                renormalize=renormalize,
-                mesh_ep_ranks=mesh_expert_order,
-                whole_expert=lowtok_whole_expert,
-            )
+            ):
+                logger.info_once("Adaptive fused MoE: small steps run moe_lowtok")
+                return moe_lowtok_ep(
+                    x,
+                    gating,
+                    rank,
+                    w1,
+                    w2,
+                    w1_scale,
+                    w2_scale,
+                    mesh=mesh,
+                    topk=topk,
+                    renormalize=renormalize,
+                    mesh_ep_ranks=mesh_expert_order,
+                    whole_expert=use_whole_expert,
+                )
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -564,41 +593,61 @@ def _build_op(
     ) -> jax.Array:
         if (
             lowtok_max_tokens > 0
+            and weight_format == "fp8"
             and gating.shape[1] == LANES
-            and moe_lowtok_ep_serves(
+        ):
+            ep = mesh.shape[EP_AXIS_NAME]
+            use_whole_expert = (
+                resolve_whole_expert_ep(
+                    x,
+                    w1,
+                    w2,
+                    w1_scale,
+                    w2_scale,
+                    ep=ep,
+                    activation=activation,
+                    whole_expert=lowtok_whole_expert,
+                    whole_expert_min_tokens=lowtok_whole_expert_min_tokens,
+                    scores=True,
+                )
+                if 0 < x.shape[0] <= lowtok_max_tokens
+                and x.shape[0] % ep == 0
+                and (token_replica_groups is None or len(token_replica_groups[0]) == 1)
+                else False
+            )
+            if moe_lowtok_ep_serves(
                 x,
                 w1,
                 w2,
                 w1_scale,
                 w2_scale,
-                ep=mesh.shape[EP_AXIS_NAME],
+                ep=ep,
                 max_tokens=lowtok_max_tokens,
                 activation=activation,
                 token_replica_groups=token_replica_groups,
-                whole_expert=lowtok_whole_expert,
+                whole_expert=use_whole_expert,
                 scores=True,
-            )
-        ):
-            logger.info_once("Adaptive fused MoE: small steps run the scores entry")
-            return moe_lowtok_scores_ep(
-                x,
-                gating,
-                padding,
-                tables,
-                primary,
-                copy,
-                hot_onehot,
-                w1,
-                w2,
-                w1_scale,
-                w2_scale,
-                (copy_w1, copy_w2, copy_w1_scale, copy_w2_scale)
-                if lowtok_scores_copies
-                else None,
-                mesh=mesh,
-                topk=topk,
-                whole_expert=lowtok_whole_expert,
-            )
+            ):
+                logger.info_once("Adaptive fused MoE: small steps run the scores entry")
+                return moe_lowtok_scores_ep(
+                    x,
+                    gating,
+                    padding,
+                    tables,
+                    primary,
+                    copy,
+                    hot_onehot,
+                    w1,
+                    w2,
+                    w1_scale,
+                    w2_scale,
+                    (copy_w1, copy_w2, copy_w1_scale, copy_w2_scale)
+                    if lowtok_scores_copies
+                    else None,
+                    mesh=mesh,
+                    topk=topk,
+                    whole_expert=use_whole_expert,
+                )
         masked_gating = jnp.where(
             padding.reshape(-1, 1) != 0,
             jnp.full_like(gating, jnp.nan, dtype=jnp.float32),
