@@ -114,6 +114,9 @@ def hc_module():
 class PartialAttention(nn.Module):
     """Rank r returns a fixed share of a linear map, like a row-parallel o_proj."""
 
+    decode_token_shard = False
+    replicated_token_shard = False
+
     def __init__(self, tp, weight, layer_type):
         super().__init__()
         self.tp, self.weight, self.layer_type = tp, weight, layer_type
@@ -122,7 +125,8 @@ class PartialAttention(nn.Module):
         share = (self.tp.rank + 1) / (self.tp.size * (self.tp.size + 1) / 2)
         return (block.float() @ self.weight.T * share).to(block.dtype)
 
-    def forward(self, block):  # GDN: un-reduced output projection
+    def forward(self, block, gdn_step_metadata_cache=None):
+        # GDN: un-reduced output projection
         return self._partial(block)
 
     def forward_with_indices(
@@ -133,6 +137,7 @@ class PartialAttention(nn.Module):
         reduce=True,
         replicated_indexer=False,
         token_shard=False,
+        decode_token_shard=False,
     ):
         assert reduce is False
         return self._partial(block), None
@@ -306,6 +311,7 @@ def test_ple_gate_sequence_parallel_matches_tp(tp2):
         value_proj=lambda e: (e @ value_w.T, None),
         norm_key=rms,
         norm_query=rms,
+        gate_dot=None,
         hc_count=HC,
         hidden_size=HIDDEN,
     )
