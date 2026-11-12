@@ -18,6 +18,7 @@ import inspect
 import weakref
 from collections import defaultdict
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -3432,47 +3433,245 @@ def test_upload_unless_unchanged_reuses_only_identical_values(device):
 
 def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     """The draft shares the target's cached Pallas ops, which are traced
-    against the target's relayouted tables; the draft's own tables must get
-    the same layout (a column-major draft rope cache fails the shared op
-    with RuntimeProgramInputMismatch while precompiling the draft buckets).
+    against the target's relayouted tables; passing target and draft together
+    relayouts both models in one deduplicated pass.
     """
     from vllm_torchtpu import envs
 
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", True)
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
     monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", True)
-    seen = []
+    seen: list[tuple[str, tuple[object, ...]]] = []
     monkeypatch.setattr(
         runner_utils_module,
         "relayout_rope_caches",
-        lambda model: seen.append(("rope", model)),
+        lambda *models: seen.append(("rope", models)),
     )
     monkeypatch.setattr(
         runner_utils_module,
         "relayout_hash_tables",
-        lambda model: seen.append(("hash", model)),
+        lambda *models: seen.append(("hash", models)),
     )
     runner = MagicMock(spec=TPUModelRunner)
-    runner._truncate_rope_caches.side_effect = lambda model: seen.append(
-        ("truncate", model)
+    runner._truncate_rope_caches.side_effect = lambda *models: seen.append(
+        ("truncate", models)
     )
+    target_model = object()
     draft_model = object()
 
-    TPUModelRunner._relayout_tables(runner, draft_model)
+    TPUModelRunner._relayout_tables(runner, target_model, None, draft_model)
     assert seen == [
-        ("truncate", draft_model),
-        ("rope", draft_model),
-        ("hash", draft_model),
+        ("truncate", (target_model, draft_model)),
+        ("rope", (target_model, draft_model)),
+        ("hash", (target_model, draft_model)),
     ]
 
-    # No draft (ngram) or flags off: nothing to relayout.
+    # No live models or flags off: nothing to relayout.
     seen.clear()
-    TPUModelRunner._relayout_tables(runner, None)
+    TPUModelRunner._relayout_tables(runner, None, None)
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", False)
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", False)
     monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
-    TPUModelRunner._relayout_tables(runner, draft_model)
+    TPUModelRunner._relayout_tables(runner, target_model, draft_model)
     assert seen == []
+
+
+def test_patch_rope_in_graph_honors_env_and_skips_none_model(monkeypatch):
+    from vllm_torchtpu import envs, rope_patch
+
+    seen: list[tuple[torch.nn.Module, set[int] | None]] = []
+    drop_calls: list[torch.nn.Module] = []
+    orig_drop = rope_patch.drop_unused_rope_cache_aliases
+
+    def spy_drop(model: torch.nn.Module) -> None:
+        drop_calls.append(model)
+        orig_drop(model)
+
+    def fake_patch(model: torch.nn.Module, *, _skip_ids=None) -> int:
+        rope_patch.drop_unused_rope_cache_aliases(model)
+        seen.append((model, _skip_ids))
+        return 2
+
+    monkeypatch.setattr(rope_patch, "drop_unused_rope_cache_aliases", spy_drop)
+    monkeypatch.setattr(rope_patch, "patch_in_graph_rotary_embedding", fake_patch)
+    runner = MagicMock(spec=TPUModelRunner)
+    target_model = torch.nn.Module()
+    draft_model = torch.nn.Module()
+    draft_model._rope_cos_sin_cache = torch.ones(4, 4)
+
+    monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", True)
+    TPUModelRunner._patch_rope_in_graph(runner, target_model, None, draft_model)
+    assert [m for m, _ in seen] == [target_model, draft_model]
+    assert drop_calls == [target_model, draft_model]
+    assert "_rope_cos_sin_cache" not in draft_model.__dict__
+
+    seen.clear()
+    drop_calls.clear()
+    draft_model._rope_cos_sin_cache = torch.ones(4, 4)
+    TPUModelRunner._patch_rope_in_graph(runner, None)
+    monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", False)
+    TPUModelRunner._patch_rope_in_graph(runner, target_model, draft_model)
+    assert seen == []
+    # Even with TPU_ROPE_IN_GRAPH=0, unused CUDA _rope_cos_sin_cache aliases
+    # are dropped in a single pass per live model.
+    assert drop_calls == [target_model, draft_model]
+    assert "_rope_cos_sin_cache" not in draft_model.__dict__
+
+
+def test_load_model_patches_and_relayouts_after_async_drafter(monkeypatch):
+    """DFlash/DSpark draft constructors read `rotary_emb.cos_sin_cache` from a
+    `get_rope()`-shared instance during `_async_drafter.load_model`, so runner
+    `load_model()` must load the draft before patching or truncating tables."""
+    import contextlib
+
+    from vllm.config import DeviceConfig, set_current_vllm_config
+    from vllm.model_executor.layers.rotary_embedding import (
+        RotaryEmbedding,
+        YaRNScalingRotaryEmbedding,
+    )
+    from vllm.model_executor.layers.rotary_embedding.phi3_long_rope_scaled_rope import (
+        Phi3LongRoPEScaledRotaryEmbedding,
+    )
+
+    import vllm_torchtpu.runner.tpu_runner as tpu_runner_mod
+    from vllm_torchtpu import envs, rope_patch
+
+    monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", True)
+    cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    cfg.model_config = SimpleNamespace(max_model_len=64)  # type: ignore[assignment]
+    with set_current_vllm_config(cfg):
+        shared_rope = RotaryEmbedding(
+            head_size=8,
+            rotary_dim=8,
+            max_position_embeddings=64,
+            base=10000.0,
+            is_neox_style=True,
+            dtype=torch.bfloat16,
+        )
+        yarn_rope = YaRNScalingRotaryEmbedding(
+            8,
+            8,
+            64,
+            10000.0,
+            True,
+            4.0,
+            torch.bfloat16,
+        )
+        long_rope = Phi3LongRoPEScaledRotaryEmbedding(
+            8,
+            8,
+            64,
+            16,
+            10000.0,
+            True,
+            torch.bfloat16,
+            short_factor=[1.0, 1.1, 1.2, 1.3],
+            long_factor=[2.0, 2.5, 3.0, 3.5],
+        )
+    target_model = torch.nn.ModuleDict(
+        {"rotary_emb": shared_rope, "yarn_emb": yarn_rope, "long_emb": long_rope}
+    )
+    draft_model = torch.nn.ModuleDict({"rotary_emb": shared_rope})
+
+    events: list[Any] = []
+
+    def fake_drafter_load(loaded_target: torch.nn.Module) -> None:
+        assert loaded_target is target_model
+        # Tier-1 rotary modules already hold InGraphCosSinCache with 0 buffers;
+        # Tier-2 plain nn.Module tables stay Tensor buffers until _patch_rope_in_graph.
+        cache = loaded_target["rotary_emb"].cos_sin_cache
+        assert isinstance(cache, rope_patch.InGraphCosSinCache) and cache.shape == (
+            64,
+            8,
+        )
+        assert isinstance(
+            loaded_target["long_emb"].long_short_cos_sin_cache, torch.Tensor
+        )
+        draft_model._rope_cos_sin_cache = cache
+        events.append("drafter_load")
+
+    drafter = tpu_runner_mod.DFlashProposer.__new__(tpu_runner_mod.DFlashProposer)
+    drafter.draft_model = draft_model
+    drafter.load_model = fake_drafter_load
+    loader = SimpleNamespace(load_model=lambda **_: target_model)
+    monkeypatch.setattr(tpu_runner_mod, "get_tpu_quantization_config", lambda _: None)
+    monkeypatch.setattr(tpu_runner_mod, "get_model_loader", lambda _: loader)
+    monkeypatch.setattr(
+        tpu_runner_mod,
+        "set_vllm_model_wrapper_context",
+        lambda **_: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        tpu_runner_mod,
+        "set_current_vllm_config",
+        lambda *_: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(tpu_runner_mod, "validate_online_fp8", lambda *_: None)
+    orig_device = torch.device
+
+    class _DeviceProxyMeta(type):
+        def __instancecheck__(cls, instance: object) -> bool:
+            return isinstance(instance, orig_device)
+
+    class _DeviceProxy(metaclass=_DeviceProxyMeta):
+        def __new__(cls, *args: Any, **kwargs: Any) -> torch.device:
+            if args == ("tpu",) and not kwargs:
+                return orig_device("cpu")
+            return orig_device(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "device", _DeviceProxy)
+    assert isinstance(torch.device(type="cpu", index=0), torch.device)
+    monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", True)
+    monkeypatch.setattr(envs, "TPU_GREEDY_TOP_TOKENS", False)
+    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL", False)
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
+    monkeypatch.setattr(envs, "USE_MOE_TP_DECODE_KERNEL", False)
+
+    drop_calls: list[torch.nn.Module] = []
+    orig_drop = rope_patch.drop_unused_rope_cache_aliases
+    monkeypatch.setattr(
+        rope_patch,
+        "drop_unused_rope_cache_aliases",
+        lambda m: (drop_calls.append(m), orig_drop(m))[1],
+    )
+
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.device_config = SimpleNamespace(device=None)
+    runner.model_config = SimpleNamespace(quantization=None)
+    runner.load_config = SimpleNamespace()
+    runner.vllm_config = SimpleNamespace(device_config=None, quant_config=None)
+    runner.speculative_config = SimpleNamespace(
+        use_eagle=lambda: False, method="dflash"
+    )
+    runner.mesh = None
+    runner.lora_config = None
+    runner.is_pooling_model = False
+    runner.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+    runner._pp_is_last = True
+    runner.drafter = drafter
+    runner._initialize_pallas_kernels = lambda: None
+
+    orig_patch = TPUModelRunner._patch_rope_in_graph
+    runner._patch_rope_in_graph = lambda *models: (
+        events.append("patch_rope"),
+        orig_patch(runner, *models),
+    )
+    runner._relayout_tables = lambda *models: events.append(("relayout", models))
+
+    TPUModelRunner.load_model(runner)
+
+    assert events == [
+        "drafter_load",
+        "patch_rope",
+        ("relayout", (target_model, draft_model)),
+    ]
+    assert drop_calls == [target_model, draft_model]
+    assert "cos_sin_cache" not in shared_rope._buffers
+    assert isinstance(yarn_rope.cos_sin_cache, rope_patch.InGraphCosSinCache)
+    assert isinstance(long_rope.long_short_cos_sin_cache, rope_patch.InGraphCosSinCache)
+    assert "long_short_cos_sin_cache" not in long_rope._buffers
+    assert yarn_rope.cos_sin_cache.to(torch.device("cpu")) is yarn_rope.cos_sin_cache
+    assert "_rope_cos_sin_cache" not in draft_model.__dict__
 
 
 def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
@@ -3871,6 +4070,14 @@ def test_truncate_rope_caches_covers_deepseek_scaling(monkeypatch):
     sole_a.cos_sin_cache.fill_(1.0)
     sole_b = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
     sole_b.cos_sin_cache.fill_(2.0)
+    # Cross-model shared module (e.g. get_rope()) and shared buffer across
+    # target and draft must be truncated/relayouted only once.
+    cross_model_rope = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    cross_model_buf = torch.full((128, 8), 3.0)
+    cross_buf_target = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    cross_buf_target.cos_sin_cache = cross_model_buf
+    cross_buf_draft = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    cross_buf_draft.cos_sin_cache = cross_model_buf
     model = torch.nn.ModuleDict(
         {
             "rope": _bare_rope(RotaryEmbedding, 128),
@@ -3881,11 +4088,15 @@ def test_truncate_rope_caches_covers_deepseek_scaling(monkeypatch):
             "sole_b": sole_b,
             "shared_a": shared_a,
             "shared_b": shared_b,
+            "cross_rope": cross_model_rope,
+            "cross_buf": cross_buf_target,
             "short": _bare_rope(DeepseekScalingRotaryEmbedding, 16),
         }
     )
     other = torch.nn.Module()
     other.register_buffer("cos_sin_cache", torch.zeros(128, 8), persistent=False)
+    shared_hash = torch.arange(16, dtype=torch.int32).reshape(4, 4)
+    other.tid2eid = shared_hash
     model["other"] = other
 
     draft_shared_buf = torch.ones(128, 8)
@@ -3893,11 +4104,16 @@ def test_truncate_rope_caches_covers_deepseek_scaling(monkeypatch):
     draft_shared_b = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
     draft_shared_a.cos_sin_cache = draft_shared_buf
     draft_shared_b.cos_sin_cache = draft_shared_buf
+    draft_other = torch.nn.Module()
+    draft_other.tid2eid = shared_hash
     draft_model = torch.nn.ModuleDict(
         {
             "draft_rope": _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128),
             "shared_a": draft_shared_a,
             "shared_b": draft_shared_b,
+            "cross_rope": cross_model_rope,
+            "cross_buf": cross_buf_draft,
+            "draft_other": draft_other,
         }
     )
 
@@ -3910,7 +4126,7 @@ def test_truncate_rope_caches_covers_deepseek_scaling(monkeypatch):
 
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", True)
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
-    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", True)
     monkeypatch.setattr(runner_utils_module, "_to_row_major", fake_to_row_major)
     monkeypatch.setattr(runner_utils_module, "_install_entry_layout_pin", lambda: None)
 
@@ -3921,9 +4137,7 @@ def test_truncate_rope_caches_covers_deepseek_scaling(monkeypatch):
         is_multimodal_model=False, multimodal_config=None, max_model_len=max_len
     )
 
-    runner._truncate_rope_caches(model)
-    runner_utils_module.relayout_rope_caches(model)
-    runner._relayout_tables(draft_model)
+    runner._relayout_tables(model, draft_model)
 
     for name in (
         "rope",
@@ -3934,12 +4148,17 @@ def test_truncate_rope_caches_covers_deepseek_scaling(monkeypatch):
         "sole_b",
         "shared_a",
         "shared_b",
+        "cross_rope",
+        "cross_buf",
     ):
         assert model[name].cos_sin_cache.shape == (max_len, 8), name
     assert model["sole_a"].cos_sin_cache is not model["sole_b"].cos_sin_cache
     assert torch.all(model["sole_a"].cos_sin_cache == 1.0)
     assert torch.all(model["sole_b"].cos_sin_cache == 2.0)
     assert model["shared_a"].cos_sin_cache is model["shared_b"].cos_sin_cache
+    assert model["cross_rope"].cos_sin_cache is draft_model["cross_rope"].cos_sin_cache
+    assert model["cross_buf"].cos_sin_cache is draft_model["cross_buf"].cos_sin_cache
+    assert torch.all(model["cross_buf"].cos_sin_cache == 3.0)
     assert model["short"].cos_sin_cache.shape == (16, 8)
     assert model["other"].cos_sin_cache.shape == (128, 8)
     assert draft_model["draft_rope"].cos_sin_cache.shape == (max_len, 8)
@@ -3947,9 +4166,11 @@ def test_truncate_rope_caches_covers_deepseek_scaling(monkeypatch):
     assert (
         draft_model["shared_a"].cos_sin_cache is draft_model["shared_b"].cos_sin_cache
     )
-    # 8 unique RoPE buffers in `model` (shared_a/shared_b share 1, plus short)
-    # + 2 unique RoPE buffers in `draft_model` (draft_rope + shared_a/shared_b).
-    assert relayout_calls == 10
+    # 10 unique RoPE buffers in `model` (shared_a/shared_b share 1, plus
+    # cross_rope, cross_buf, short) + 2 unique RoPE buffers in `draft_model`
+    # (draft_rope + shared_a/shared_b; cross_rope and cross_buf are shared with
+    # `model`) + 1 shared MoE hash table (`shared_hash`).
+    assert relayout_calls == 13
 
 
 def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
@@ -3987,8 +4208,7 @@ def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
         is_multimodal_model=False, multimodal_config=None, max_model_len=max_len
     )
 
-    runner._truncate_rope_caches(model)
-    runner._relayout_tables(draft_model)
+    runner._relayout_tables(model, draft_model)
 
     assert model["rope"].cos_sin_cache.shape == (expected_rows, 8)
     assert draft_model["draft_rope"].cos_sin_cache.shape == (expected_rows, 8)

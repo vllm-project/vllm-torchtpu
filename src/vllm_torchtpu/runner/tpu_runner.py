@@ -91,7 +91,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, rope_patch, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -1438,26 +1438,62 @@ class TPUModelRunner(GPUModelRunner):
                     f"{self.speculative_config.method}"
                 )
 
-    def _relayout_tables(self, model: torch.nn.Module | None) -> None:
-        """Give ``model`` the table shapes and row-major layouts the env knobs ask for.
+    def _patch_rope_in_graph(self, *models: torch.nn.Module | None) -> None:
+        """Replace position-indexed rotary cache buffers on ``models`` in-graph."""
+        live_models = [m for m in models if m is not None]
+        if not live_models:
+            return
+        if not envs.TPU_ROPE_IN_GRAPH:
+            for m in live_models:
+                rope_patch.drop_unused_rope_cache_aliases(m)
+                rope_patch.materialize_model_cos_sin_caches(m)
+            logger.info_once(
+                "TPU_ROPE_IN_GRAPH=0: keeping precomputed rotary cos/sin tables."
+            )
+            return
+        skip_ids = rope_patch._collect_deepseek_v4_pallas_ropes(*live_models)
+        patched = sum(
+            rope_patch.patch_in_graph_rotary_embedding(m, _skip_ids=skip_ids)
+            for m in live_models
+        )
+        tier1_count = len(
+            {
+                id(sub)
+                for m in live_models
+                for _, sub in m.named_modules()
+                if getattr(sub, "_tpu_in_graph_tier1", False)
+            }
+        )
+        if tier1_count or patched:
+            logger.info(
+                "Enabled in-graph RoPE on %d Tier-1 and %d Tier-2 rotary module(s).",
+                tier1_count,
+                patched,
+            )
 
-        ``load_model`` truncates and relayouts the target inline; this applies
-        the same to the draft, which feeds the same cached Pallas ops and so
-        must share the target's table shape and layout.
+    def _relayout_tables(self, *models: torch.nn.Module | None) -> None:
+        """Give ``models`` the table shapes and row-major layouts the env knobs ask for.
+
+        Target and draft feed the same cached Pallas ops and must share table
+        shapes and layouts; passing them together deduplicates modules and
+        buffers shared across both models.
         """
-        if model is None:
+        live_models = [m for m in models if m is not None]
+        if not live_models:
             return
         if envs.TPU_ROPE_CACHE_TRUNCATE:
-            self._truncate_rope_caches(model)
+            self._truncate_rope_caches(*live_models)
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
-            runner_utils.relayout_rope_caches(model)
+            runner_utils.relayout_rope_caches(*live_models)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
-            runner_utils.relayout_hash_tables(model)
+            runner_utils.relayout_hash_tables(*live_models)
 
-    def _truncate_rope_caches(self, model: torch.nn.Module) -> None:
+    def _truncate_rope_caches(self, *models: torch.nn.Module) -> None:
         """Slice rotary cos_sin caches to max_model_len (plus speculative slack)
         which can reduce the overhead of xla layout data copy. Applicable to text-only.
         """
+        if not models:
+            return
         multimodal_config = self.model_config.multimodal_config
         if self.model_config.is_multimodal_model and not (
             multimodal_config is not None and multimodal_config.language_model_only
@@ -1478,45 +1514,51 @@ class TPUModelRunner(GPUModelRunner):
             max_len = cdiv(max_len + spec_tokens, 8) * 8
         num_eligible = 0
         num_truncated = 0
-        # Share one truncated tensor across modules that share a buffer.
+        # Share one truncated tensor across modules/models that share a buffer,
+        # and visit get_rope()-shared module instances once across models.
+        seen_modules: set[int] = set()
         truncated_by_id: dict[int, torch.Tensor] = {}
-        for name, module in model.named_modules():
-            # isinstance, not an exact type match: on TPU these are the
-            # out-of-tree subclasses from layers/adapter/rotary_embedding.py
-            # and layers/adapter/custom_ops/mla_attention_op.py. DeepSeek
-            # scaling (YaRN for MLA models, and DeepSeek-V4's subclass)
-            # derives from RotaryEmbeddingBase, not RotaryEmbedding.
-            if not isinstance(
-                module,
-                (
-                    RotaryEmbedding,
-                    MRotaryEmbedding,
-                    DeepseekScalingRotaryEmbedding,
-                ),
-            ):
-                continue
-            for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
-                buf = getattr(module, buf_name, None)
-                if buf is None or not isinstance(buf, torch.Tensor):
+        for model in models:
+            for name, module in model.named_modules():
+                if id(module) in seen_modules:
                     continue
-                num_eligible += 1
-                if buf.ndim >= 1 and buf.shape[0] > max_len:
-                    buf_id = id(buf)
-                    truncated = truncated_by_id.get(buf_id)
-                    if truncated is None:
-                        truncated = buf[:max_len].clone(
-                            memory_format=torch.contiguous_format
+                seen_modules.add(id(module))
+                # isinstance, not an exact type match: on TPU these are the
+                # out-of-tree subclasses from layers/adapter/rotary_embedding.py
+                # and layers/adapter/custom_ops/mla_attention_op.py. DeepSeek
+                # scaling (YaRN for MLA models, and DeepSeek-V4's subclass)
+                # derives from RotaryEmbeddingBase, not RotaryEmbedding.
+                if not isinstance(
+                    module,
+                    (
+                        RotaryEmbedding,
+                        MRotaryEmbedding,
+                        DeepseekScalingRotaryEmbedding,
+                    ),
+                ):
+                    continue
+                for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
+                    buf = getattr(module, buf_name, None)
+                    if buf is None or not isinstance(buf, torch.Tensor):
+                        continue
+                    num_eligible += 1
+                    if buf.ndim >= 1 and buf.shape[0] > max_len:
+                        buf_id = id(buf)
+                        truncated = truncated_by_id.get(buf_id)
+                        if truncated is None:
+                            truncated = buf[:max_len].clone(
+                                memory_format=torch.contiguous_format
+                            )
+                            truncated_by_id[buf_id] = truncated
+                        setattr(module, buf_name, truncated)
+                        num_truncated += 1
+                        logger.info(
+                            "Truncated rope cache %s.%s rows %d -> %d",
+                            name,
+                            buf_name,
+                            buf.shape[0],
+                            max_len,
                         )
-                        truncated_by_id[buf_id] = truncated
-                    setattr(module, buf_name, truncated)
-                    num_truncated += 1
-                    logger.info(
-                        "Truncated rope cache %s.%s rows %d -> %d",
-                        name,
-                        buf_name,
-                        buf.shape[0],
-                        max_len,
-                    )
         if num_eligible:
             logger.info(
                 "Truncated %d of %d rope caches (%d unique buffers)",
@@ -5839,12 +5881,6 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_topk_buffer is not None:
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
-        if envs.TPU_ROPE_CACHE_TRUNCATE:
-            self._truncate_rope_caches(self.model)
-        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
-            runner_utils.relayout_rope_caches(self.model)
-        if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
-            runner_utils.relayout_hash_tables(self.model)
         if (
             envs.TPU_GREEDY_TOP_TOKENS
             and self._pp_is_last
@@ -5856,14 +5892,10 @@ class TPUModelRunner(GPUModelRunner):
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
+        draft_model: torch.nn.Module | None = None
         if self._is_async_drafter:
             self._async_drafter.load_model(self.model)
-            # The draft reuses the target's Pallas ops (cached by op name),
-            # which were traced against the target's relayouted tables. Its
-            # own rope caches and hash tables need the same layout, or the
-            # shared op rejects them with RuntimeProgramInputMismatch while
-            # precompiling the draft buckets.
-            self._relayout_tables(getattr(self.drafter, "draft_model", None))
+            draft_model = getattr(self.drafter, "draft_model", None)
             if isinstance(self.drafter, DSparkProposer) and (
                 self.drafter.use_confidence_head
             ):
@@ -5886,6 +5918,14 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
+
+        # Patch and relayout rotary / MoE tables after any draft model loads:
+        # `get_rope()` memoizes `RotaryEmbedding` instances globally, and
+        # DFlash/DSpark draft constructors read `rotary_emb.cos_sin_cache`
+        # during `load_model()`. Both models also reuse cached Pallas ops and
+        # must share table shapes and layouts.
+        self._patch_rope_in_graph(self.model, draft_model)
+        self._relayout_tables(self.model, draft_model)
 
         # After the drafter: every placed MoE layer, the drafter's too, must
         # have had its router renumbered with its experts.
