@@ -169,6 +169,7 @@ class PrefixAwareScheduler(AsyncScheduler):
     _hp_every = 0
     _hp_n = 0
     _hp_promote_ns = 0
+    _hp_sub_ns: dict[str, int] = {}
     _prompt_np = False
     _paw_skip_full = False
     # VLLM_TPU_TAIL_HOLD_STEPS (core/tail_hold.py); None: off.
@@ -186,6 +187,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._hp_samples: dict[str, list[float]] = {}
         self._hp_n = 0
         self._hp_promote_ns = 0
+        self._hp_sub_ns: dict[str, int] = {}
+        if self._hp_every:
+            self._hp_install_sub_timers()
         self._prompt_np = _prompt_ids_ndarray()
         self._paw_skip_full = _paw_skip_full()
         steps = _tail_hold_steps()
@@ -277,6 +281,7 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _schedule_timed(self, throttle_prefills: bool):
         t0 = time.perf_counter_ns()
         self._hp_promote_ns = 0
+        self._hp_sub_ns = {}
         queue = getattr(self, "kv_holding_waiting", None) or getattr(
             self, "waiting", None
         )
@@ -289,6 +294,11 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._hp_note(f"{kind}.schedule", sched_us)
         self._hp_note(f"{kind}.promote", promote_us)
         self._hp_note(f"{kind}.waiting", float(len(queue) if queue is not None else 0))
+        if kind == "admit":
+            # Where an admitting schedule() spends its host time (see
+            # _hp_install_sub_timers); an absent call counts as 0.
+            for label in self._HP_SUB_LABELS:
+                self._hp_note(f"admit.{label}", self._hp_sub_ns.get(label, 0) / 1e3)
         # Read by the runner's host phases (pickled with the dataclass).
         try:
             out._host_phases_stamp = (time.time(), promote_us, sched_us)
@@ -314,6 +324,63 @@ class PrefixAwareScheduler(AsyncScheduler):
         super().add_request(request)
         if self._hp_every:
             self._hp_note("add_request", (time.perf_counter_ns() - t0) / 1e3)
+
+    #: Sub-phases of an admitting schedule() under VLLM_TPU_HOST_PHASES:
+    #: ``kv_lookup`` local prefix-cache hit, ``kv_alloc`` allocate_slots,
+    #: ``conn_match`` / ``conn_alloc`` / ``conn_meta`` the KV connector's
+    #: matched-token lookup, post-allocation state and metadata build.
+    _HP_SUB_LABELS = ("kv_lookup", "kv_alloc", "conn_match", "conn_alloc", "conn_meta")
+
+    def _hp_install_sub_timers(self) -> None:
+        """Time the scheduler's calls into the KV cache manager and the KV
+        connector (instance-level wrappers; only with VLLM_TPU_HOST_PHASES).
+        A label already being timed is not timed again when nested."""
+        targets = (
+            (
+                getattr(self, "kv_cache_manager", None),
+                "get_computed_blocks",
+                "kv_lookup",
+            ),
+            (
+                getattr(self, "kv_cache_manager", None),
+                "get_computed_blocks_for_connector",
+                "kv_lookup",
+            ),
+            (getattr(self, "kv_cache_manager", None), "allocate_slots", "kv_alloc"),
+            (
+                getattr(self, "connector", None),
+                "get_num_new_matched_tokens",
+                "conn_match",
+            ),
+            (
+                getattr(self, "connector", None),
+                "update_state_after_alloc",
+                "conn_alloc",
+            ),
+            (getattr(self, "connector", None), "build_connector_meta", "conn_meta"),
+        )
+        active: set[str] = set()
+        for obj, name, label in targets:
+            fn = getattr(obj, name, None) if obj is not None else None
+            if fn is None:
+                continue
+            setattr(obj, name, self._hp_timed_call(fn, label, active))
+
+    def _hp_timed_call(self, fn, label: str, active: set[str]):
+        def timed(*args, **kwargs):
+            if label in active:
+                return fn(*args, **kwargs)
+            active.add(label)
+            t0 = time.perf_counter_ns()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                active.discard(label)
+                self._hp_sub_ns[label] = (
+                    self._hp_sub_ns.get(label, 0) + time.perf_counter_ns() - t0
+                )
+
+        return timed
 
     def _hp_tick(self) -> None:
         self._hp_n += 1
@@ -358,11 +425,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         """Promote the request with the fewest uncached tokens within WINDOW."""
         if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
             return
-        if (
-            self._paw_skip_full
-            and len(queue) <= self.WINDOW
-            and self._no_seat_free()
-        ):
+        if self._paw_skip_full and len(queue) <= self.WINDOW and self._no_seat_free():
             # Nothing is admitted this step, and with the whole queue inside
             # the window the next promotion picks the same argmin regardless
             # of the order left behind (keys include arrival_time, no ties):

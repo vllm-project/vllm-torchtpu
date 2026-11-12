@@ -380,7 +380,9 @@ def test_prompt_ids_ndarray_early_real_preprocess(monkeypatch):
         data_parallel_rank=None,
     )
     fake_core = SimpleNamespace(
-        mm_receiver_cache=None, request_block_hasher=None, structured_output_manager=None
+        mm_receiver_cache=None,
+        request_block_hasher=None,
+        structured_output_manager=None,
     )
     request, wave = EngineCore.preprocess_add_request(fake_core, core_req)
     assert wave == 0
@@ -391,3 +393,77 @@ def test_prompt_ids_ndarray_early_real_preprocess(monkeypatch):
     with patch.object(AsyncScheduler, "add_request", return_value=None):
         s.add_request(request)
     assert request._prompt_ids_np is converted
+
+
+def test_host_phases_sub_timers_split_an_admitting_schedule():
+    """VLLM_TPU_HOST_PHASES: an admitting schedule() records the time spent
+    in the KV cache manager and connector calls under admit.<label>; a nested
+    call of the same label is counted once; return values pass through."""
+    s = _make_scheduler([], {})
+    s._hp_every = 1000
+    s._hp_samples = {}
+    s._hp_n = 0
+    s._hp_sub_ns = {}
+
+    def slow(result, inner=None):
+        def fn(*args, **kwargs):
+            time.sleep(0.002)
+            if inner is not None:
+                inner()
+            return result
+
+        return fn
+
+    kvm = SimpleNamespace(
+        get_computed_blocks=None,
+        get_computed_blocks_for_connector=None,
+        allocate_slots=slow("blocks"),
+    )
+    kvm.get_computed_blocks = slow(("hit", 512, 0))
+    # The connector variant falls back to get_computed_blocks (nested).
+    kvm.get_computed_blocks_for_connector = slow(
+        ("hit", 512, 0, False), inner=lambda: kvm.get_computed_blocks()
+    )
+    s.kv_cache_manager = kvm
+    s.connector = SimpleNamespace(
+        get_num_new_matched_tokens=slow((0, False)),
+        update_state_after_alloc=slow(None),
+        build_connector_meta=slow("meta"),
+    )
+    s._hp_install_sub_timers()
+
+    def fake_schedule(throttle_prefills):
+        assert kvm.get_computed_blocks_for_connector() == ("hit", 512, 0, False)
+        assert s.connector.get_num_new_matched_tokens() == (0, False)
+        assert kvm.allocate_slots() == "blocks"
+        assert s.connector.update_state_after_alloc() is None
+        assert s.connector.build_connector_meta() == "meta"
+        return SimpleNamespace(scheduled_new_reqs=[object()])
+
+    with patch.object(
+        PrefixAwareScheduler, "_schedule_with_tail_hold", side_effect=fake_schedule
+    ):
+        s._schedule_timed(False)
+    for label in PrefixAwareScheduler._HP_SUB_LABELS:
+        (us,) = s._hp_samples[f"admit.{label}"]
+        assert us >= 1500, (label, us)
+    # Nested lookup counted once: ~4 ms (2 + 2), not ~6 ms.
+    (lookup_us,) = s._hp_samples["admit.kv_lookup"]
+    assert lookup_us < 5800
+    # A non-admitting schedule records no sub-phase samples.
+    with patch.object(
+        PrefixAwareScheduler,
+        "_schedule_with_tail_hold",
+        return_value=SimpleNamespace(scheduled_new_reqs=[]),
+    ):
+        s._schedule_timed(False)
+    assert len(s._hp_samples["admit.kv_alloc"]) == 1
+
+
+def test_host_phases_sub_timers_off_by_default():
+    s = _make_scheduler([], {})
+    kvm = s.kv_cache_manager
+    before = kvm.allocate_slots
+    assert not s._hp_every
+    # __init__ installs the timers only with HOST_PHASES on; nothing else does.
+    assert s.kv_cache_manager.allocate_slots is before
