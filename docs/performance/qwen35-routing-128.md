@@ -17,11 +17,9 @@ reconstructs the sorted positions. One Pallas invocation produces both arrays.
 Signed comparisons avoid overflow at int32 extrema and no floating-point
 approximation or packed-key assumption is needed.
 
-When the joint path is ineligible, the first sort remains. The same flag gates
-an inverse-only helper for non-EP int32 IDs whose sorted permutation is
-int32[128]. Remaining inputs use both original sorts. Masking, expert counts,
-gathered hidden states, routing weights, and all six preparation outputs retain
-their existing semantics.
+When the joint path is ineligible, both original sorts remain. Masking,
+expert counts, gathered hidden states, routing weights, and all six preparation
+outputs retain their existing semantics.
 
 ## Recorded performance
 
@@ -59,10 +57,8 @@ Run the CPU regressions with:
 ```bash
 JAX_PLATFORMS=cpu PYTHONPATH=src python -m unittest discover \
     -s tests/kernels -p test_stable_order_and_inverse.py -v
-JAX_PLATFORMS=cpu PYTHONPATH=src python -m unittest discover \
-    -s tests/kernels -p test_inverse_permutation.py -v
 ```
 
-On TPU, the first test file also exercises both native Pallas kernels without
+On TPU, the test file also exercises the native Pallas kernel without
 interpretation. Fresh TPU performance validation of the flag-gated upstream
 port remains separate from the captured measurements above.

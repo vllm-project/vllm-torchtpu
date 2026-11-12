@@ -19,7 +19,6 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.inverse_permutation import inverse_permutation_128
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute, can_use_blockwise_onehot_unpermute)
@@ -226,16 +225,7 @@ def prepare_routed_gmm_inputs(
             sort_keys)
     else:
         sorted_indices = jnp.argsort(sort_keys)
-        # The inverse helper needs an int32 permutation, even if the sort keys
-        # have another dtype. The flag also gates this fallback, so disabling
-        # it restores the original two-sort implementation.
-        if (use_routing_128 and not use_ep
-                and topk_indices_flat.dtype == jnp.int32
-                and sorted_indices.shape == (128, )
-                and sorted_indices.dtype == jnp.int32):
-            argsort_revert_indices = inverse_permutation_128(sorted_indices)
-        else:
-            argsort_revert_indices = jnp.argsort(sorted_indices)
+        argsort_revert_indices = jnp.argsort(sorted_indices)
 
     token_indices_sorted = token_indices_flat[sorted_indices]
     topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)

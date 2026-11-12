@@ -30,7 +30,6 @@ import jax.numpy as jnp
 import numpy as np
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.inverse_permutation import inverse_permutation_128
 from vllm_torchtpu.kernels.stable_order_and_inverse import \
     stable_order_and_inverse_128
 
@@ -55,9 +54,9 @@ def _check_order_and_inverse(test, keys, order, inverse):
 
 
 def _baseline_order_and_inverse(keys):
-    # The immediate candidate2 chain, with only Pallas interpretation enabled.
+    # The two argsorts the joint kernel replaces.
     order = jnp.argsort(keys)
-    return order, inverse_permutation_128(order, interpret=True)
+    return order, jnp.argsort(order)
 
 
 class StableOrderAndInverseTest(unittest.TestCase):
@@ -230,17 +229,13 @@ class RoutedStableOrderAndInverseTest(unittest.TestCase):
                         kwargs = dict(use_ep=False,
                                       use_sparse_core=sparse_core,
                                       skip_padded_tokens=skip_padding)
-                        with patch.object(
-                                self.routing,
-                                "stable_order_and_inverse_128",
-                                wraps=functools.partial(
-                                    stable_order_and_inverse_128,
-                                    interpret=True)) as joint, patch.object(
-                                        self.routing, "inverse_permutation_128"
-                                    ) as old_inverse:
+                        with patch.object(self.routing,
+                                          "stable_order_and_inverse_128",
+                                          wraps=functools.partial(
+                                              stable_order_and_inverse_128,
+                                              interpret=True)) as joint:
                             actual = self._prepare(inputs, **kwargs)
                         joint.assert_called_once()
-                        old_inverse.assert_not_called()
                         with patch.object(self.routing,
                                           "stable_order_and_inverse_128",
                                           _baseline_order_and_inverse):
@@ -281,22 +276,18 @@ class RoutedStableOrderAndInverseTest(unittest.TestCase):
                               use_ep=use_ep,
                               x64=x64), jax.enable_x64(x64):
                 inputs = self._inputs(tokens=tokens, dtype=dtype, mask="none")
-                with patch.object(
-                        self.routing,
-                        "stable_order_and_inverse_128") as joint, patch.object(
-                            self.routing,
-                            "inverse_permutation_128") as old_inverse:
+                with patch.object(self.routing,
+                                  "stable_order_and_inverse_128") as joint:
                     actual = self._prepare(inputs,
                                            use_ep=use_ep,
                                            use_sparse_core=False)
                 joint.assert_not_called()
-                old_inverse.assert_not_called()
                 self._check_preparation(inputs, actual, False)
                 expected_dtype = jnp.int64 if x64 else jnp.int32
                 self.assertEqual(actual[2].dtype, expected_dtype)
                 self.assertEqual(actual[-1].dtype, expected_dtype)
 
-    def test_non_int32_sort_keys_retain_older_inverse_eligibility(self):
+    def test_non_int32_sort_keys_keep_both_argsorts(self):
         inputs = self._inputs()
         original_where = jnp.where
 
@@ -308,16 +299,19 @@ class RoutedStableOrderAndInverseTest(unittest.TestCase):
                 return result.astype(jnp.float32)
             return result
 
+        # An ineligible input runs exactly the original two argsorts, with no
+        # Pallas kernel behind the flag.
         with patch.object(self.routing.jnp, "where", promoted_sort_keys), \
                 patch.object(self.routing, "stable_order_and_inverse_128"
-                             ) as joint, patch.object(
-                                 self.routing, "inverse_permutation_128",
-                                 wraps=functools.partial(
-                                     inverse_permutation_128, interpret=True)
-                             ) as old_inverse:
+                             ) as joint, \
+                patch.object(self.routing.jnp, "argsort",
+                             wraps=jnp.argsort) as sorts:
             actual = self._prepare(inputs, use_ep=False, use_sparse_core=False)
+            jaxpr = jax.make_jaxpr(lambda *a: self._prepare(
+                a, use_ep=False, use_sparse_core=False))(*inputs)
         joint.assert_not_called()
-        old_inverse.assert_called_once()
+        self.assertEqual(sorts.call_count, 4)
+        self.assertNotIn("pallas_call", str(jaxpr))
         self._check_preparation(inputs, actual, False)
 
     def test_disabled_flag_preserves_original_sorts_and_all_outputs(self):
@@ -325,7 +319,6 @@ class RoutedStableOrderAndInverseTest(unittest.TestCase):
             with self.subTest(skip_padding=skip_padding), patch.object(
                     envs, "TPU_MOE_JOINT_ROUTING_128", False), patch.object(
                         self.routing, "stable_order_and_inverse_128") as joint, \
-                    patch.object(self.routing, "inverse_permutation_128") as inverse, \
                     patch.object(self.routing.jnp, "argsort", wraps=jnp.argsort) as sorts:
                 inputs = self._inputs(mask="poison_weights")
                 actual = self._prepare(inputs,
@@ -333,7 +326,6 @@ class RoutedStableOrderAndInverseTest(unittest.TestCase):
                                        use_sparse_core=False,
                                        skip_padded_tokens=skip_padding)
                 joint.assert_not_called()
-                inverse.assert_not_called()
                 self.assertEqual(sorts.call_count, 2)
                 self._check_preparation(inputs, actual, skip_padding)
 
@@ -374,7 +366,6 @@ class NativeRoutingKernelTest(unittest.TestCase):
     def test_native_order_and_inverse_match_numpy(self):
         """Exercise real Mosaic lowering in TPU CI, without interpretation."""
         sort = jax.jit(stable_order_and_inverse_128)
-        invert = jax.jit(inverse_permutation_128)
         limits = np.iinfo(np.int32)
         rng = np.random.default_rng(1729)
         cases = [
@@ -394,7 +385,6 @@ class NativeRoutingKernelTest(unittest.TestCase):
                 with self.subTest(case=i):
                     order, inverse = sort(jnp.asarray(keys))
                     _check_order_and_inverse(self, keys, order, inverse)
-                    np.testing.assert_array_equal(invert(order), inverse)
 
 
 if __name__ == "__main__":
