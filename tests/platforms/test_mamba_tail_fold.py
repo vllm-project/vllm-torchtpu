@@ -445,6 +445,44 @@ def test_config_sets_prefix_match_unit(monkeypatch):
     assert c.prefix_match_unit is None
 
 
+def test_config_unit_not_applied_under_context_parallel(monkeypatch):
+    """Main-KV DCP keeps the fold off, so the unit must not reach the hash:
+    alone it only adds short prefill chunks (c32 za9x small-step regression).
+    VLLM_TPU_MAMBA_TAIL_FOLD_UNIT_CP=1 restores the old behavior."""
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import _apply_tail_fold_unit
+
+    def cache():
+        return SimpleNamespace(
+            enable_prefix_caching=True, mamba_cache_mode="align", prefix_match_unit=None
+        )
+
+    cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1, prefill_context_parallel_size=1
+        )
+    )
+    monkeypatch.setenv("TPU_GDN_CHUNK_PAIR", "1")
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD", "1")
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", str(U))
+    monkeypatch.delenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT_CP", raising=False)
+    monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", "2")
+    c = cache()
+    _apply_tail_fold_unit(c, MB, cfg)
+    assert c.prefix_match_unit is None  # fold blocked by main-KV DCP
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT_CP", "1")
+    _apply_tail_fold_unit(c, MB, cfg)
+    assert c.prefix_match_unit == U  # opt-out: old behavior
+    monkeypatch.delenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT_CP")
+    monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", "1")
+    c = cache()
+    _apply_tail_fold_unit(c, MB, cfg)
+    assert c.prefix_match_unit == U  # no context parallelism: fold on
+    cfg.parallel_config.decode_context_parallel_size = 2
+    c = cache()
+    _apply_tail_fold_unit(c, MB, cfg)
+    assert c.prefix_match_unit is None  # vLLM DCP blocks it too
+
+
 def test_fine_unit_turn_resuming_mid_block_folds_and_chains(monkeypatch):
     """Turn 2 resumes at an odd-256 hit (768) and folds a long chunk; its
     checkpoint is the block the worker writes, and turn 3 hits it."""
