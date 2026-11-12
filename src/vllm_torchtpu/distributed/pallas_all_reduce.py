@@ -255,8 +255,10 @@ def all_reduce(ranks, x: torch.Tensor) -> torch.Tensor | None:
     chain = _CHAIN
     if chain is None or armed.ordered_op is None:
         return armed.op(x, armed.rank)
-    out = armed.op(x, armed.rank) if not chain else armed.ordered_op(
-        x, armed.rank, chain[-1]
+    out = (
+        armed.op(x, armed.rank)
+        if not chain
+        else armed.ordered_op(x, armed.rank, chain[-1])
     )
     chain.append(out)
     return out

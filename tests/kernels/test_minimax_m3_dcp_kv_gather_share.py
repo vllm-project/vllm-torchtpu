@@ -47,7 +47,9 @@ def _load_msa():
             isinstance(node, (ast.Assign, ast.AnnAssign))
             and any(
                 getattr(t, "id", None) in want
-                for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
+                for t in (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
             )
         )
     ]
@@ -56,7 +58,9 @@ def _load_msa():
     mod.__dict__.update(
         os=os, torch=torch, Any=typing.Any, init_logger=logging.getLogger
     )
-    exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), mod.__dict__)
+    exec(
+        compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), mod.__dict__
+    )
     return mod
 
 
@@ -92,7 +96,12 @@ def _run(msa, ks, vs, iqs, replicas, share):
         g = _Group(rec.inputs)
         out.append(
             msa.gather_group_kv(
-                ks[r], vs[r], iqs[r], g, DCP, replicas,
+                ks[r],
+                vs[r],
+                iqs[r],
+                g,
+                DCP,
+                replicas,
                 rank_tensors[r] if share else None,
             )
         )

@@ -24,8 +24,8 @@ from torch_tpu._internal import pallas
 from vllm.distributed import get_tp_group
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_dcp,
@@ -500,9 +500,7 @@ def gather_group_kv(
         gathered = group.all_gather(mine.contiguous(), dim=0)
         # Row block h * r + j is head h's token share j: [heads, T, 3, D].
         per_head = gathered.view(kv_heads, num_tokens, 3, head_dim)
-        return tuple(
-            per_head[:, :, i].transpose(0, 1).contiguous() for i in range(3)
-        )
+        return tuple(per_head[:, :, i].transpose(0, 1).contiguous() for i in range(3))
     per_rank = group.all_gather(torch.cat([k, v, index_q], dim=1).contiguous(), dim=1)
     per_head = per_rank.view(num_tokens, dcp, 3, head_dim)[:, ::kv_head_replicas]
     return tuple(per_head[:, :, i].contiguous() for i in range(3))

@@ -121,7 +121,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         pallas_all_reduce.begin_chain()
         attn = [
             tensor_model_parallel_all_reduce(partial.narrow(0, 0, half)),
-            tensor_model_parallel_all_reduce(partial.narrow(0, half, num_tokens - half)),
+            tensor_model_parallel_all_reduce(
+                partial.narrow(0, half, num_tokens - half)
+            ),
         ]
         out, res = [], []
         for i, a in enumerate(attn):

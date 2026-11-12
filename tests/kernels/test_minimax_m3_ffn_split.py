@@ -47,7 +47,9 @@ def _extract(path: pathlib.Path, names: set[str], namespace: dict) -> types.Modu
                     body.append(item)
     mod = types.ModuleType(path.stem)
     mod.__dict__.update(namespace)
-    exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), mod.__dict__)
+    exec(
+        compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), mod.__dict__
+    )
     return mod
 
 
@@ -68,7 +70,15 @@ def _pallas(log):
     ns = dict(dataclasses=dataclasses, torch=torch, Any=typing.Any)
     mod = _extract(
         SRC / "distributed/pallas_all_reduce.py",
-        {"_Armed", "_ARMED", "_CHAIN", "all_reduce", "armed", "begin_chain", "end_chain"},
+        {
+            "_Armed",
+            "_ARMED",
+            "_CHAIN",
+            "all_reduce",
+            "armed",
+            "begin_chain",
+            "end_chain",
+        },
         ns,
     )
     mod._ARMED = mod._Armed(
@@ -128,7 +138,11 @@ def test_ffn_halves_equal_unsplit(tokens):
     model = _extract(
         SRC / "models/minimax_m3/model.py",
         {"_forward_ffn_halves"},
-        dict(torch=torch, pallas_all_reduce=pr, tensor_model_parallel_all_reduce=all_reduce),
+        dict(
+            torch=torch,
+            pallas_all_reduce=pr,
+            tensor_model_parallel_all_reduce=all_reduce,
+        ),
     )
     hidden = torch.zeros(tokens, hidden, dtype=torch.float64)
     out, res = model._forward_ffn_halves(layer, None, hidden, residual, ffn)
