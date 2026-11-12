@@ -213,7 +213,7 @@ def test_tq_ragged_paged_attention_and_skip_update(preset, head_dim):
     page_words = layout.page_words_128(page_size)
     tq_cache = jnp.zeros((num_pages, num_kv_heads, page_words, 128), jnp.uint8)
     with jax.default_matmul_precision("float32"):
-        tq_cache, _ = tq.tq_ragged_paged_attention(
+        tq_cache, _ = tq.ref_tq_ragged_paged_attention(
             hq,
             hk,
             hv,
@@ -228,7 +228,7 @@ def test_tq_ragged_paged_attention_and_skip_update(preset, head_dim):
             sm_scale=sm_scale,
         )
         # Verify skip_kv_update=True leaves cache bitwise identical.
-        unchanged_cache, _ = tq.tq_ragged_paged_attention(
+        unchanged_cache, _ = tq.ref_tq_ragged_paged_attention(
             q,
             k,
             v,
@@ -245,7 +245,7 @@ def test_tq_ragged_paged_attention_and_skip_update(preset, head_dim):
         )
         np.testing.assert_array_equal(np.asarray(unchanged_cache), np.asarray(tq_cache))
 
-        tq_cache, tq_out = tq.tq_ragged_paged_attention(
+        tq_cache, tq_out = tq.ref_tq_ragged_paged_attention(
             q,
             k,
             v,
@@ -287,3 +287,56 @@ def test_tq_ragged_paged_attention_and_skip_update(preset, head_dim):
     # Unallocated pages in the pool must remain all-zero.
     untouched = [p for p in range(num_pages) if p not in {2, 5, 1, 4}]
     assert not np.any(np.asarray(tq_cache)[untouched])
+
+
+@pytest.mark.parametrize("preset", ["turboquant_k8v4", "turboquant_4bit_nc"])
+def test_tq_hook_caching_dtype_validation_and_bundled_dispatch(preset):
+    """Verify static hook caching, upfront Q/K/V dtype checks, and 5D dispatch."""
+    layout, tables = _layout_and_tables(preset, 128)
+    d1, d2 = (
+        tq._get_tq_dequant_page_fn(layout, tables),
+        tq._get_tq_dequant_page_fn(layout, tables),
+    )
+    u1, u2 = tq._get_tq_update_page_fn(layout), tq._get_tq_update_page_fn(layout)
+    assert d1 is d2 and hash(d1) == hash(d2) and u1 is u2 and hash(u1) == hash(u2)
+
+    q = jnp.zeros((4, 4, 128), jnp.bfloat16)
+    k = jnp.zeros((4, 2, 128), jnp.bfloat16)
+    pw = layout.page_words_128(16)
+    c4 = jnp.zeros((4, 2, pw, 128), jnp.uint8)
+    c5 = jnp.zeros((4, 3, 2, pw, 128), jnp.uint8)
+    meta = (
+        jnp.array([4], jnp.int32),
+        jnp.array([0], jnp.int32),
+        jnp.array([0, 4], jnp.int32),
+        jnp.array([0, 1, 1], jnp.int32),
+    )
+    base = dict(layout=layout, tables=tables, sm_scale=1.0)
+
+    with pytest.raises(ValueError, match="share one dtype"):
+        tq.tq_ragged_paged_attention(q, k, k.astype(jnp.float32), c4, *meta, **base)
+    with pytest.raises(ValueError, match="floating-point"):
+        tq.tq_ragged_paged_attention(
+            q.astype(jnp.int32),
+            k.astype(jnp.int32),
+            k.astype(jnp.int32),
+            c4,
+            *meta,
+            **base,
+        )
+    with pytest.raises(ValueError, match="layer_idx must be None"):
+        tq.tq_ragged_paged_attention(q, k, k, c4, *meta, layer_idx=jnp.int32(0), **base)
+    with pytest.raises(ValueError, match="layer_idx is required"):
+        tq.tq_ragged_paged_attention(q, k, k, c5, *meta, **base)
+
+    seen: dict[str, object] = {}
+
+    def stub(q_in, _k, _v, c, l_idx, *_m, **kw):
+        seen["layer_idx"], seen["dequant_fn"] = int(l_idx), kw["dequant_page_fn"]
+        return q_in, c
+
+    out_c, out_q = tq.tq_ragged_paged_attention(
+        q, k, k, c5, *meta, layer_idx=jnp.int32(2), rpa_fn=stub, **base
+    )
+    assert seen == {"layer_idx": 2, "dequant_fn": d1}
+    assert out_c.shape == c5.shape and out_q.shape == q.shape
