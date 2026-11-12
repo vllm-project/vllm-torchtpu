@@ -59,7 +59,7 @@ class PoolError(ValueError):
 
 
 class VmemPool:
-    def __init__(self, arena, capacity, *, report=None):
+    def __init__(self, arena, capacity):
         """``arena``: [capacity / 128, 128] uint8 VMEM ref (None: dry run)."""
         if capacity % ALIGN:
             raise PoolError("The arena capacity must be a multiple of 4 KiB")
@@ -67,7 +67,6 @@ class VmemPool:
         self.entries = {}  # live, in request order
         self.queue = []  # names of queued requests, FIFO
         self.events = []
-        self.report = bool(report)
         self.phase = ""
         self.finished = False
 

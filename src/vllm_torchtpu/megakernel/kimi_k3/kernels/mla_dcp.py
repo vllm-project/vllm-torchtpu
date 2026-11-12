@@ -384,7 +384,7 @@ class DcpAttention:
     """One DCP attention invocation for ``batch`` rows at ``position_ref``."""
 
     def __init__(self, cache: DcpCache, workspace: DcpWorkspace, position_ref, batch, *,
-                 probability_hilo=False, skip=(), sequence_rows=1, heads=HEADS_PER_RANK,
+                 probability_hilo=False, sequence_rows=1, heads=HEADS_PER_RANK,
                  chunk_rows=None, cache_verify_rows=False):
         if batch > MAX_ROWS:
             chunk = chunk_layout(batch, heads, chunk_rows=chunk_rows)[0]  # validates
@@ -417,7 +417,7 @@ class DcpAttention:
         self.span = workspace.pages.shape[1] // (self.page_tokens if self.native else self.page_rows)
         self.folds = staged_folds(batch, heads, sequence_rows, cache.dtype)
         self.fold_tokens = self.span * self.page_tokens // self.folds
-        self.probability_hilo, self.skip = probability_hilo, set(skip)
+        self.probability_hilo = probability_hilo
         rank = jax.lax.axis_index("tp")
         self.member = rank % self.group
         self.base = rank - self.member
@@ -501,8 +501,6 @@ class DcpAttention:
         def prefetch():
             self._start_step(step + self.buffers - 1)
 
-        if "pagecompute" in self.skip:
-            return
         row, visible, load = self._step_pages(step)
         if self.cache_verify_rows:
             self._attend_cached_verify(step, row, load, base)
@@ -624,10 +622,9 @@ class DcpAttention:
         # FP8-query plain decode at B16/B32/B64 (and DP2's 32 local rows), and
         # staged steps: rows with a partial last step fold its 1 .. span - 1
         # pages with static tail shapes.
-        if ((self.folds == 1 and (
+        if self.folds == 1 and (
                 self.sequence_rows != 1 or (self.heads != HEADS_PER_RANK and not (self.group == 16 and self.heads == 6 and self.batch == 32)) or self.batch not in (16, 32, 64) or self.ws.gathered.dtype != jnp.uint8
-                or (self.span != 2 and not (_config().mla_decode_ktile == 2048 and self.span == 4))))
-                or "attend" in self.skip or "pagecompute" in self.skip):
+                or (self.span != 2 and not (_config().mla_decode_ktile == 2048 and self.span == 4))):
             return self._attend_pipeline(first, end, base)
         chunk = chunk_layout(self.batch, self.heads, chunk_rows=self.chunk_rows)[0]
 
@@ -717,7 +714,7 @@ class DcpAttention:
         recomputes its own scores (unused), avoiding a branch before QK.
         ``peel`` is static: the split-tail path finishes PV outside the loop
         instead, before issuing the separate half-width QK/PV."""
-        if self.sequence_rows > 1 or "pagecompute" in self.skip:
+        if self.sequence_rows > 1:
             pl.loop(first, end)(lambda step: self._attend_step(step, base=base))
             return
 
@@ -1045,7 +1042,7 @@ class DcpAttention:
         ws.gathered[parity, member] = (_pack_fp8_query(ws.own_rows[...]) if ws.gathered.dtype == jnp.uint8
                                        else ws.own_rows[...].astype(jnp.bfloat16))
         for g in range(len(groups)):
-            for peer in range(0 if "gather" in self.skip else group):
+            for peer in range(group):
                 @pl.when(peer != member)
                 def send_query(peer=peer, g=g):
                     tpu.make_async_remote_copy(
@@ -1061,10 +1058,9 @@ class DcpAttention:
 
         for g, (first, end) in enumerate(groups):
             others = ws.gathered.at[parity, pl.ds(0, group - 1), rows_of(g)]
-            if "gather" not in self.skip:
-                with self._scope("gather_wait"):
-                    tpu.make_async_copy(others, others, ws.gather_semaphores.at[0, parity, g]).wait()
-                    tpu.make_async_copy(others, others, ws.gather_semaphores.at[1, parity, g]).wait()
+            with self._scope("gather_wait"):
+                tpu.make_async_copy(others, others, ws.gather_semaphores.at[0, parity, g]).wait()
+                tpu.make_async_copy(others, others, ws.gather_semaphores.at[1, parity, g]).wait()
             local_scope = self._scope("local")
             local_scope.__enter__()
             for b in range(first, end):
@@ -1082,16 +1078,15 @@ class DcpAttention:
             # 2. Local attention over this rank's pages (the group's steps).
             # Attention DP's group rows pipeline the fold as chunked calls do.
             if self.heads != HEADS_PER_RANK:
-                self._attend_pipeline(self.starts[first], self.starts[first] if "attend" in self.skip
-                                      else self.starts[end], 0)
+                self._attend_pipeline(self.starts[first], self.starts[end], 0)
             else:
-                @pl.loop(self.starts[first], self.starts[first] if "attend" in self.skip else self.starts[end])
+                @pl.loop(self.starts[first], self.starts[end])
                 def attend(step):
                     self._attend_step(step)
 
             # 3. Normalize and send each owner its heads' rows.
             self._pack_partials(first, end)
-            for peer in range(0 if "combine" in self.skip else group):
+            for peer in range(group):
                 @pl.when(peer != member)
                 def send_partial(peer=peer, g=g):
                     tpu.make_async_remote_copy(
@@ -1105,9 +1100,8 @@ class DcpAttention:
         with self._scope("combine_wait"):
             for g in range(len(groups)):
                 others = ws.receive.at[parity, pl.ds(0, group - 1), rows_of(g), self._combine_lanes()]
-                if "combine" not in self.skip:
-                    tpu.make_async_copy(others, others, ws.combine_semaphores.at[0, parity, g]).wait()
-                    tpu.make_async_copy(others, others, ws.combine_semaphores.at[1, parity, g]).wait()
+                tpu.make_async_copy(others, others, ws.combine_semaphores.at[0, parity, g]).wait()
+                tpu.make_async_copy(others, others, ws.combine_semaphores.at[1, parity, g]).wait()
         merge_scope = self._scope("merge")
         merge_scope.__enter__()
 
@@ -1326,7 +1320,7 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
     lookahead = 2 if ring_slots == 4 and not hier else 1
     self._lane_major = hier
     if hier:
-        if group != 4 * HOST_LANES or not self.lse_in_padding or keys is None or "combine" in self.skip:
+        if group != 4 * HOST_LANES or not self.lse_in_padding or keys is None:
             raise ValueError("host_combine: DCP32 explicit-keys sequences with lse_in_padding")
         stage2_recv, stage2_send, stage2_sems = self.host_combine
         hosts = group // HOST_LANES
@@ -1359,7 +1353,7 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
         own = ws.own_rows[c, :rows, :]
         ws.gathered[slot, member] = (_pack_fp8_query(own) if ws.gathered.dtype == jnp.uint8
                                      else own.astype(jnp.bfloat16))
-        for peer in range(0 if "gather" in self.skip else group):
+        for peer in range(group):
             @pl.when(peer != member)
             def send(peer=peer):
                 tpu.make_async_remote_copy(
@@ -1369,8 +1363,6 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
                 ).start()
 
     def wait_gather(c):
-        if "gather" in self.skip:
-            return
         slot = ring(c)
         others = ws.gathered.at[slot, pl.ds(0, group - 1)]
         tpu.make_async_copy(others, others, ws.gather_semaphores.at[0, slot]).wait()
@@ -1390,7 +1382,7 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
                 ).start()
             ws.receive[slot, pl.ds(lane * hosts, hosts)] = ws.send[pl.ds(lane * hosts, hosts)]
             return
-        for peer in range(0 if "combine" in self.skip else group):
+        for peer in range(group):
             @pl.when(peer != member)
             def send(peer=peer):
                 tpu.make_async_remote_copy(
@@ -1404,14 +1396,10 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
     peers_bytes = (HOST_LANES - 1) * (group // HOST_LANES) if hier else group - 1
 
     def wait_sent(c):  # this rank's partials of chunk c have left the send buffer
-        if "combine" in self.skip:
-            return
         others = ws.receive.at[ring(c), pl.ds(0, peers_bytes), :, self._combine_lanes()]
         tpu.make_async_copy(others, others, ws.combine_semaphores.at[0, ring(c)]).wait()
 
     def wait_received(c):
-        if "combine" in self.skip:
-            return
         others = ws.receive.at[ring(c), pl.ds(0, peers_bytes), :, self._combine_lanes()]
         tpu.make_async_copy(others, others, ws.combine_semaphores.at[1, ring(c)]).wait()
 
@@ -1454,8 +1442,6 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
         tpu.make_async_copy(others, others, stage2_sems.at[which, ring(c)]).wait()
 
     def merge(c):
-        if "merge" in self.skip:
-            return
         if self.sequence_rows == 1 or self.cache_verify_rows:
             unroll = (4 if (self.heads == 6 and (batch == 64 or batch == 48 and self.fp8))
                       or (self.heads == HEADS_PER_RANK and batch in (32, 64) and self.fp8)
@@ -1508,7 +1494,7 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
             wait_gather(c)
         local_scope = self._scope("local")
         local_scope.__enter__()
-        for j in range(0 if "build" in self.skip else chunk):
+        for j in range(chunk):
             # [G, slots, 640] -> [slots G, 640] (slot `slots` d + h is member d's head h),
             # padded to the tile's rows.
             gathered = ws.gathered[ring(c), :, pl.ds(slots * j, slots), :].reshape(heads, LANES)
@@ -1524,8 +1510,7 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
         ws.accumulator[...] = jnp.zeros(ws.accumulator.shape, jnp.float32)
         first = chunk * c
 
-        self._attend_range(first_step(first),
-                           first_step(first) if "attend" in self.skip else first_step(first + chunk), first)
+        self._attend_range(first_step(first), first_step(first + chunk), first)
 
         local_scope.__exit__(None, None, None)
 
@@ -1535,7 +1520,7 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
                 wait_sent(c - 1)
 
         with self._scope("pack_send"):
-            self._pack_partials(0, 0 if "pack" in self.skip else chunk)  # the chunk's rows: state rows 0..chunk
+            self._pack_partials(0, chunk)  # the chunk's rows: state rows 0..chunk
             send_partials(c)
 
         if hier:

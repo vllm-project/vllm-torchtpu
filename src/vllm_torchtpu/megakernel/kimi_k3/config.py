@@ -98,15 +98,8 @@ class KernelConfig:
     # Weight loading.
     read_streams: int = 4
     load_inflight_gb: float = 16.0
-    # Diagnostics (off in serving): dcp_skip and debug_skip skip named work, so
-    # results are invalid (timing or hang bisection only); the rest add trace
-    # scopes, VMEM reports or VMEM padding.
-    dcp_skip: tuple[str, ...] = ()
-    debug_skip: tuple[str, ...] = ()
+    # Named XProf trace scopes around the decode's phases (profiling only).
     phase_scopes: bool = False
-    pool_report: bool = False
-    vmem_report: bool = False
-    vmem_pad_kb: int = 0
 
     def __post_init__(self) -> None:
         if self.decode_expert_parallel not in (8, 16):

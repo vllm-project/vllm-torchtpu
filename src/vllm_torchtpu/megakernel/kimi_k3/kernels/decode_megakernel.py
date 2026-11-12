@@ -4827,12 +4827,7 @@ def mla(
     if not output_projection_after_query_down:
         start_copy("output")
 
-    # Diagnostic (KernelConfig.dcp_skip): skip the DCP query gather, local
-    # attention and/or partial combine, e.g. "gather,combine". Results are
-    # invalid; timing only.
-    dcp_skip = _config().dcp_skip
     dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, batch_size, sequence_rows=sequence_rows,
-                                         skip=dcp_skip,
                                          cache_verify_rows=sequence_rows > 1 and dcp[0].dtype == jnp.float8_e4m3fn)
     dcp_attention.prime()
 
@@ -5043,7 +5038,7 @@ def mla_dcp_shards(
 
     for name in ("query_up", "key_value_up", "output_gate"):
         start_copy(name)
-    dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, rows, skip=_config().dcp_skip, heads=3 * shards,
+    dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, rows, heads=3 * shards,
                                          sequence_rows=sequence_rows,
                                          chunk_rows=_verify_chunk(rows, 3 * shards, sequence_rows))
     dcp_attention.prime()
@@ -6147,9 +6142,6 @@ SHARED_SHARDS = _config().shared_shards
 # chunk loop is rolled into one pl.loop.
 # TODO: derive separate staging/rolling rules for B32/B64 with 8-row chunks.
 KDA_STAGED = _config().kda_staged
-# Diagnostic: skip named parts of each layer; results are invalid (timing/hang
-# bisection only). Every rank skips the same parts, so collectives stay paired.
-DEBUG_SKIP = set(_config().debug_skip)
 
 
 class _RowFunction:
@@ -6868,12 +6860,6 @@ def stack(
             common = common[5:]
         dcp_persistent = common[: len(mla_dcp.PERSISTENT_NAMES)]
         common = common[len(mla_dcp.PERSISTENT_NAMES) :]
-        if _config().vmem_pad_kb:
-            headroom_pad = common[-1]
-            headroom_pad[...] = jnp.zeros(headroom_pad.shape, jnp.float32)
-            common = common[:-1]
-        else:
-            headroom_pad = None
         gather_wire = None
         if b4_attention_gather:
             *common, gather_wire = common
@@ -6961,7 +6947,7 @@ def stack(
         # With the arena manager, where each layer's weights land (and when
         # their copies start) follows from the order of requests and releases.
         pool = (
-            VmemPool(projection_expert_pool_vmem, pool_layout["arena_bytes"], report=_config().pool_report)
+            VmemPool(projection_expert_pool_vmem, pool_layout["arena_bytes"])
             if pool_managed
             else None
         )
@@ -7770,7 +7756,7 @@ def stack(
                         communication_workspace.receive_semaphores,
                         communication_workspace.shared_local_reduction_vmem,
                     )
-                elif "gather" not in DEBUG_SKIP:
+                else:
                     for group in range(attention_dp):
                         @pl.when(data_group == group)
                         def gather_group_rows(group=group):
@@ -8037,12 +8023,6 @@ def stack(
                                     first_chunk=shard * chunks_per_shard,
                                     chunks=chunks_per_shard,
                                 )
-                            if "kda" in DEBUG_SKIP:
-                                for index in range(state_stream.chunks):
-                                    state_stream.acquire(index)
-                                    state_stream.release(index)
-                                state_stream.finish()
-                                continue
                             kda(
                                 group_input_vmem,
                                 group_input_vmem,
@@ -8079,14 +8059,12 @@ def stack(
                             # All KDA consumers have finished. The final three
                             # writes are the only outstanding DMAs: every read
                             # was acquired and earlier writes drained at reuse.
-                            if (attention_schedule in ("auto", "overlap")
-                                    and group_rows > 8 and "kda" not in DEBUG_SKIP):
+                            if attention_schedule in ("auto", "overlap") and group_rows > 8:
                                 shared_state_stream.finish_rolled()
                             else:
                                 shared_state_stream.finish()
-                        if "project" not in DEBUG_SKIP:
-                            release_kda_inputs()
-                            project_attention_dp(kda_projection_vmem[3], streams.get("output"))
+                        release_kda_inputs()
+                        project_attention_dp(kda_projection_vmem[3], streams.get("output"))
 
                     def execute_streamed(history_buffers, state_buffers, read_semaphores, write_semaphores):
                         state_stream = KdaStateStream(
@@ -8820,12 +8798,10 @@ def stack(
             if aux_capture == "mixture_input":
                 capture_aux_hidden(normalized_vmem)
             if dense_layer:
-                if "dense" not in DEBUG_SKIP:
-                    run_dense_mlp()
+                run_dense_mlp()
             else:
                 with _phase("p0_moe"):
-                    if "moe" not in DEBUG_SKIP:
-                        pl.run_scoped(run_mixture, *moe_scoped_scratch)
+                    pl.run_scoped(run_mixture, *moe_scoped_scratch)
             finish_scope = _phase_start("q0_finish_rows")
             if attention_dp_ownership:
                 # The MoE delivered the pair's rows of every DP group (with
@@ -8911,15 +8887,8 @@ def stack(
             layer(jnp.int32(0), dense_layer=True)
         if pool is not None:
             pool.loop(1, layers)(layer)
-            if pool.report:
-                print(pool.timeline(), flush=True)
         else:
             pl.loop(1, layers)(layer)
-        if headroom_pad is not None:
-            # Keep the pad live through the whole program (it holds zeros).
-            prefix_vmem[0:8, 0:128] += jnp.sum(
-                headroom_pad[...].reshape(-1, 8, 128), axis=0
-            ).astype(jnp.bfloat16)
 
         if sequence_parallel_pre_attention:
             final_weight_copies = (
@@ -9073,28 +9042,6 @@ def stack(
         managed=pool_managed, dense_bytes=dense_slabs * dense_slab_bytes,
     )
     pool_bytes = pool_layout["pool_bytes"]
-    if _config().vmem_report:
-        def _mib(name, experts=False):
-            value = pool_weights[name]
-            shape = (4, *value.shape[1:]) if experts else value.shape
-            return pool_alias.storage_size(shape, value.dtype) / 2**20
-        region_a = {
-            "kda": sum(_mib(n) for n in KDA[:4]),
-            "mla": sum(_mib(n) for n in MLA[:2]),
-            "experts": sum(_mib(n, True) for n in pooled_expert_names),
-        }
-        region_b = {
-            "mla_extra": sum(_mib(n) for n in MLA_EXTRA_WEIGHTS),
-            "moe_prepare": sum(_mib(n) for n in MOE_PREPARE_WEIGHTS),
-            "latent_up": _mib("latent_up"),
-        }
-        print("pool region A (MiB):", {k: round(v, 2) for k, v in region_a.items()}, flush=True)
-        if pool_managed:
-            print(f"arena (managed region A): {pool_layout['arena_bytes'] / 2**20:.2f} MiB, "
-                  f"attention {pool_layout['attention_bytes'] / 2**20:.2f}, dense slabs "
-                  f"{dense_slabs * dense_slab_bytes / 2**20:.2f}", flush=True)
-        print("pool region B (MiB):", {k: round(v, 2) for k, v in region_b.items()},
-              {n: round(_mib(n), 2) for n in (*MLA_EXTRA_WEIGHTS, *MOE_PREPARE_WEIGHTS, "latent_up")}, flush=True)
     assert pool_bytes >= expert_pool_bytes and pool_bytes % 128 == 0
     scratch = (
         tpu.VMEM(
@@ -9175,12 +9122,6 @@ def stack(
         # Private storage (see B4_ATTENTION_GATHER).
         *((tpu.VMEM((4, 32, 128), jnp.float32),)
           if b4_attention_gather else ()),
-        # Diagnostic: vmem_pad_kb reserves unused VMEM to probe headroom.
-        *(
-            (tpu.VMEM((_config().vmem_pad_kb * 2, 128), jnp.float32),)
-            if _config().vmem_pad_kb
-            else ()
-        ),
     )
     scratch_names = (
         "prefix", "blocks", "normalized", "attention", "mixture", *NORMS,
@@ -9200,7 +9141,6 @@ def stack(
         "receive_semaphores", "reduction_phase", "latent_gather",
         *(("projection_staging", "routed_send") if batch_size > 32 else ()),
         *(("attention_gather",) if b4_attention_gather else ()),
-        "headroom_pad",
     )
     persistent = [
         ("output window 1", tpu.VMEM(output_shapes[1].shape, output_shapes[1].dtype)),
@@ -9302,7 +9242,7 @@ def stack(
             ],
             [],
         )
-    vmem_report, vmem_peak = _vmem_budget(persistent, regions)
+    vmem_plan, vmem_peak = _vmem_budget(persistent, regions)
     if pool_managed:
         # Grow the arena, all or nothing, into VMEM above the spill reserve so
         # the next layer's attention projections and router (queued together
@@ -9328,18 +9268,14 @@ def stack(
                 (name, pool_spec if name == "projection_expert_pool" else spec)
                 for name, spec in persistent
             ]
-            vmem_report, vmem_peak = _vmem_budget(persistent, regions)
-        if _config().vmem_report:
-            print(f"arena with spare VMEM: {pool_layout['arena_bytes'] / 2**20:.2f} MiB", flush=True)
-    if _config().vmem_report:
-        print(f"VMEM plan, batch {batch_size}:\n{vmem_report}", flush=True)
+            vmem_plan, vmem_peak = _vmem_budget(persistent, regions)
     if vmem_peak > VMEM_LIMIT_BYTES:
-        raise ValueError(f"The decoder's static VMEM plan exceeds the limit:\n{vmem_report}")
+        raise ValueError(f"The decoder's static VMEM plan exceeds the limit:\n{vmem_plan}")
     if vmem_peak + VMEM_SPILL_RESERVE_BYTES > VMEM_LIMIT_BYTES:
         import warnings
 
         warnings.warn(
-            f"The decoder's VMEM plan leaves less than the spill reserve:\n{vmem_report}",
+            f"The decoder's VMEM plan leaves less than the spill reserve:\n{vmem_plan}",
             stacklevel=2,
         )
     return pl.pallas_call(
