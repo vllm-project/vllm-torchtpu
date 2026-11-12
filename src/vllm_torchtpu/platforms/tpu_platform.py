@@ -1499,11 +1499,14 @@ def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[i
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     """Install the pipeline chunk scheduler and the engine-core hook that
-    collects its chunk limits from the stages. Off when both
+    collects its chunk limits from the stages. A configured pipeline chunk
+    scheduler (``DYNAMIC_CHUNK_SCHEDULER_CLASSES``, such as
+    PrefixAwarePipelineChunkScheduler) is kept. Off when both
     TPU_PP_LONE_PROMPT_CHUNKS and TPU_PP_EQUAL_COST_CHUNKS are off, when the
     DP scheduler or another scheduler is configured, or when chunked prefill
     is disabled."""
     from vllm_torchtpu.core.pp_chunk_scheduler import (
+        DYNAMIC_CHUNK_SCHEDULER_CLASSES,
         SCHEDULER_CLS,
         patch_engine_core_for_pp_chunks,
     )
@@ -1511,7 +1514,7 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     scheduler_config = vllm_config.scheduler_config
     if not (envs.TPU_PP_LONE_PROMPT_CHUNKS or envs.TPU_PP_EQUAL_COST_CHUNKS):
         return
-    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
+    if scheduler_config.scheduler_cls not in (None, *DYNAMIC_CHUNK_SCHEDULER_CLASSES):
         logger.warning(
             "Pipeline chunk sizing is off: scheduler %s is configured.",
             scheduler_config.scheduler_cls,
@@ -1527,7 +1530,8 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
         raise ValueError(
             f"TPU_PP_CHUNK_SLACK must not be negative: {envs.TPU_PP_CHUNK_SLACK}"
         )
-    scheduler_config.scheduler_cls = SCHEDULER_CLS
+    if scheduler_config.scheduler_cls is None:
+        scheduler_config.scheduler_cls = SCHEDULER_CLS
     patch_engine_core_for_pp_chunks(vllm_config)
 
 

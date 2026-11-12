@@ -24,12 +24,19 @@ prioritizes requests with the fewest uncached prompt tokens. It modifies only
 the admission ordering; memory management, eviction, and preemption policies
 remain untouched.
 
-Enable with:
-    --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
+PrefixAwarePipelineChunkScheduler applies the same admission order on top of
+TpuPipelineChunkScheduler, so a pipeline-parallel deployment keeps its
+pipeline chunk sizing (``TPU_PP_LONE_PROMPT_CHUNKS``,
+``TPU_PP_EQUAL_COST_CHUNKS``).
+
+Enable with ``--scheduler-cls`` set to
+``vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler``, or, with
+``--pipeline-parallel-size`` above 1, to
+``vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwarePipelineChunkScheduler``.
 """
 
 from itertools import islice
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -40,6 +47,15 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu.core.pp_chunk_scheduler import TpuPipelineChunkScheduler
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    _WarmthMixinBase = Scheduler
+else:
+    _WarmthMixinBase = object
+
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
@@ -49,8 +65,12 @@ _TIER_PREEMPTED = 1
 _TIER_NORMAL = 2
 
 
-class PrefixAwareScheduler(AsyncScheduler):
-    """Admit ready requests prioritizing fewest uncached prompt tokens."""
+class _PrefixAwareWarmthMixin(_WarmthMixinBase):
+    """Admit ready requests prioritizing fewest uncached prompt tokens.
+
+    Listed before a vLLM scheduler class, whose ``schedule`` then runs with
+    the warmest request at the head of the waiting queue.
+    """
 
     #: Lookahead window of ready requests to evaluate for cached prefix length.
     WINDOW = 64
@@ -62,7 +82,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
 
-        logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
+        logger.info("%s ACTIVE (window=%d)", type(self).__name__, self.WINDOW)
 
     def _prefix_warmth(self, request: Request) -> int:
         """Prompt tokens of ``request`` resident in the KV cache."""
@@ -80,7 +100,8 @@ class PrefixAwareScheduler(AsyncScheduler):
             if not self._paw_scoring_broken:
                 self._paw_scoring_broken = True
                 logger.exception(
-                    "PrefixAwareScheduler: warmth scoring failed; falling back to FCFS."
+                    "%s: warmth scoring failed; falling back to FCFS.",
+                    type(self).__name__,
                 )
             return 0
 
@@ -137,3 +158,14 @@ class PrefixAwareScheduler(AsyncScheduler):
                 self._paw_cold_tokens / max(self._paw_prompt_tokens, 1),
                 len(queue),
             )
+
+
+class PrefixAwareScheduler(_PrefixAwareWarmthMixin, AsyncScheduler):
+    """Warmest-first admission over vLLM's AsyncScheduler."""
+
+
+class PrefixAwarePipelineChunkScheduler(
+    _PrefixAwareWarmthMixin, TpuPipelineChunkScheduler
+):
+    """Warmest-first admission over TpuPipelineChunkScheduler, which sizes
+    prefill chunks for a pipeline."""
