@@ -4,7 +4,10 @@
 import argparse
 import asyncio
 import codecs
+import collections
+import hashlib
 import itertools
+import json
 import logging
 import os
 import re
@@ -675,6 +678,119 @@ def _align_join() -> _AlignGroup:
     return group
 
 
+
+# PROXY_SESSION_AFFINITY_DP=<dp size> (default 0 = off): a request without an
+# X-data-parallel-rank header is pinned to rank hash(conversation head) % dp on
+# both hops. Prefix caches are per DP rank, and a multi-turn conversation only
+# appends to its messages, so every turn of one conversation lands on the rank
+# that already holds its prefix (agentic replay: P hit rate 26% -> see notes).
+_SESSION_AFFINITY_DP = int(os.environ.get("PROXY_SESSION_AFFINITY_DP", "0"))
+
+
+def _dumps(obj: Any) -> bytes:
+    if orjson is not None:
+        return orjson.dumps(obj)
+    return json.dumps(obj, separators=(",", ":")).encode()
+
+
+def _session_key(req_data: dict) -> int | None:
+    """Stable key of the conversation `req_data` belongs to, or None."""
+    if _SESSION_AFFINITY_DP <= 1:
+        return None
+    messages = req_data.get("messages")
+    if isinstance(messages, list) and messages:
+        # The system prompt is usually shared by every conversation and can be
+        # long, so key on the head of the system prompt AND of the first user
+        # message (where per-conversation markers such as aiperf's cache-bust
+        # RID sit); a later turn only appends messages, keeping both heads.
+        system = next((m for m in messages if m.get("role") == "system"), None)
+        user = next((m for m in messages if m.get("role") == "user"), None)
+        head = b"".join(
+            _dumps(m.get("content", ""))[:4096] if isinstance(m, dict) else b""
+            for m in (system, user)
+        )
+    else:
+        prompt = req_data.get("prompt")
+        if isinstance(prompt, str):
+            head = prompt[:8192].encode()
+        elif isinstance(prompt, list) and prompt:
+            head = _dumps(prompt[:2048])
+        else:
+            return None
+    digest = hashlib.blake2b(head, digest_size=8).digest()
+    return int.from_bytes(digest, "little")
+
+
+class _SessionRouter:
+    """Pins conversations to prefill DP ranks, keeping prefix-cache affinity
+    without letting a few long conversations pile up on one rank.
+
+    Each rank carries its outstanding prefill work in estimated tokens (request
+    bytes / 4). A first-seen conversation computes its whole prompt, so it goes
+    to the least-loaded rank. A known conversation only computes what it
+    appended since its last turn and stays on its rank, unless waiting there
+    (queued work + its new tokens) costs more than `migrate_factor` times
+    recomputing its whole prompt on the least-loaded rank; then it moves and
+    remembers the new rank (a low factor migrates often, and each migration's
+    full recompute loads its target). PROXY_AFFINITY_MIGRATE_FACTOR (default 3,
+    0 = never migrate); PROXY_AFFINITY_BALANCE=0 keeps plain hash % dp.
+    """
+
+    def __init__(
+        self,
+        dp: int,
+        balance: bool,
+        migrate_factor: float = 3.0,
+        capacity: int = 200_000,
+    ):
+        self.dp = dp
+        self.balance = balance
+        self.migrate_factor = migrate_factor
+        self.capacity = capacity
+        self.work = [0] * dp
+        self.homes: "collections.OrderedDict[int, tuple[int, int]]" = (
+            collections.OrderedDict()
+        )
+        self.migrations = 0
+
+    def assign(self, key: int, prompt_tokens: int) -> tuple[int, int]:
+        """(rank, work charged to it) for one request of conversation `key`."""
+        if not self.balance:
+            return key % self.dp, 0
+        least = min(range(self.dp), key=lambda r: (self.work[r], (key + r) % self.dp))
+        home = self.homes.get(key)
+        if home is None:
+            rank, work = least, prompt_tokens
+        else:
+            rank, last_tokens = home
+            work = max(prompt_tokens - last_tokens, 512)
+            if self.migrate_factor > 0 and self.work[rank] + work > (
+                self.migrate_factor * (self.work[least] + prompt_tokens)
+            ):
+                rank, work = least, prompt_tokens
+                self.migrations += 1
+        self.homes[key] = (rank, prompt_tokens)
+        self.homes.move_to_end(key)
+        while len(self.homes) > self.capacity:
+            self.homes.popitem(last=False)
+        self.work[rank] += work
+        return rank, work
+
+    def release(self, rank: int, work: int) -> None:
+        self.work[rank] = max(0, self.work[rank] - work)
+
+
+_SESSION_ROUTER = (
+    _SessionRouter(
+        _SESSION_AFFINITY_DP,
+        balance=os.environ.get("PROXY_AFFINITY_BALANCE", "1") != "0",
+        migrate_factor=float(os.environ.get("PROXY_AFFINITY_MIGRATE_FACTOR", "3")),
+    )
+    if _SESSION_AFFINITY_DP > 1
+    else None
+)
+
+
 async def _handle_completions(api: str, request: Request):
     align = _align_join() if _ALIGN_S > 0 else None
     try:
@@ -687,8 +803,20 @@ async def _handle_completions(api: str, request: Request):
         forwarded = {}
         if (dp_rank := request.headers.get("X-data-parallel-rank")) is not None:
             forwarded["X-data-parallel-rank"] = dp_rank
+        routed: tuple[int, int] | None = None
+        if "X-data-parallel-rank" not in forwarded and _SESSION_ROUTER is not None:
+            if (session_key := _session_key(req_data)) is not None:
+                prompt_tokens = len(await request.body()) // 4
+                routed = _SESSION_ROUTER.assign(session_key, prompt_tokens)
+                forwarded["X-data-parallel-rank"] = str(routed[0])
+        route_log = (
+            f" rank={routed[0]} work={routed[1]} migrations={_SESSION_ROUTER.migrations}"
+            if routed is not None
+            else ""
+        )
         print(
-            f"PERF PROXY req_received req_id={request_id} ts={time.time():.6f}",
+            f"PERF PROXY req_received req_id={request_id} ts={time.time():.6f}"
+            f"{route_log}",
             flush=True,
         )
 
@@ -749,9 +877,13 @@ async def _handle_completions(api: str, request: Request):
             f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
             flush=True,
         )
-        response = await send_request_to_prefill(
-            prefill_client_info, api, req_data, request_id, forwarded
-        )
+        try:
+            response = await send_request_to_prefill(
+                prefill_client_info, api, req_data, request_id, forwarded
+            )
+        finally:
+            if routed is not None:
+                _SESSION_ROUTER.release(*routed)
         t_prefill_recv = time.time()
         t_prefill_recv_perf = time.perf_counter()
         prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
@@ -809,7 +941,12 @@ async def _handle_completions(api: str, request: Request):
                     first = False
                 yield chunk
 
-        return StreamingResponse(generate_stream(), media_type="application/json")
+        # Streaming responses are SSE: clients such as aiperf pick the parser
+        # from the Content-Type and reject `data:` lines served as JSON.
+        media_type = (
+            "text/event-stream" if req_data.get("stream") else "application/json"
+        )
+        return StreamingResponse(generate_stream(), media_type=media_type)
 
     except Exception as e:
         if align is not None:
