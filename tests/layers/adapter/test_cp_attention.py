@@ -34,7 +34,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa.configs import (
     AttentionScope,
     KVLayout,
 )
-from vllm_torchtpu.layers.adapter import attention, cp_attention
+from vllm_torchtpu.layers.adapter import attention, cp_attention, native_fp8_scope
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -159,6 +159,64 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
         torch.testing.assert_close(output, torch.full_like(query, 5 / 3))
     assert len(built) == 4  # Forward must reuse the prebuilt ops for each layout.
     assert all(type(fn.keywords["kv_layout"]) is KVLayout for fn in built)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_dcp_forward_reuses_the_ops_built_with_the_layer_modes_and_tiles(
+    monkeypatch, compiled, cpu_vllm_config_context
+):
+    """The forward pass must look up the DCP ops initialize_kernel built for the
+    layer, with the same reduced-precision modes and tuned tiles. On a registry
+    miss it would build an op while torch.compile traces the forward, which
+    torch_tpu's jax_op cannot do under dynamo."""
+    built = []
+
+    def build_op(_name, fn):
+        built.append(fn)
+
+        def kernel(_cache, query, *args):
+            return torch.ones_like(query), torch.zeros(query.shape[:2])
+
+        return kernel
+
+    group = SimpleNamespace(
+        world_size=2,
+        rank_in_group=0,
+        all_gather=lambda tensor, dim: torch.cat([tensor, tensor], dim=dim),
+        reduce_scatter=lambda tensor, dim: tensor.chunk(2, dim)[0],
+    )
+    monkeypatch.setattr(attention, "_get_dcp_group", lambda: group)
+    monkeypatch.setattr(cp_attention, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
+    monkeypatch.setattr(cp_attention, "_build_dcp_kernel_op", build_op)
+    monkeypatch.setattr(cp_attention, "synchronize_tensors", lambda *a, **k: None)
+    layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
+    modes = native_fp8_scope.AttentionModes(
+        native_fp8="pvs", native_fp8_prefill="pvs", decode_exp2=True
+    )
+    impl = _impl()
+    # As the model's settings and tile rule set them before the kernels are built.
+    impl.attention_modes = modes
+    impl.tuned_tiles = True
+    with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
+        impl.initialize_kernel(layer)
+    assert len(built) == 2
+    assert all(fn.keywords["attention_modes"] == modes for fn in built)
+    assert all(fn.keywords["tuned_tiles"] is True for fn in built)
+
+    metadata = SimpleNamespace(
+        seq_lens=torch.tensor([2, 3, 4], dtype=torch.int32),
+        block_tables=torch.zeros(3, 2, dtype=torch.int32),
+        query_start_loc=torch.arange(4, dtype=torch.int32),
+        request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
+    )
+    query = torch.ones(3, 8, 256)
+    key = torch.ones(3, 1, 256)
+    forward = impl._run_dcp_forward
+    if compiled:
+        forward = torch.compile(forward, backend="eager", fullgraph=True)
+    forward(layer, query, key, key, torch.empty(1), metadata)
+    assert len(built) == 2  # No op is built in the forward pass.
 
 
 def test_dcp_kernel_default_layout_reuses_explicit_nhd(monkeypatch):
