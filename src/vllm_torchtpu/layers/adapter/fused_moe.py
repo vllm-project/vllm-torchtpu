@@ -23,6 +23,7 @@ from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    DISPATCH_TOKEN_SHAPE,
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
     requant_unpack_kmajor,
@@ -31,7 +32,28 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 )
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+_fused_moe_kernel_cache: dict[tuple, Callable] = {}
+# Between begin_dispatch_tokens and end_dispatch_tokens, fused_moe_gmm also
+# returns a few values of its dispatched (gathered) tokens and records them
+# here: a tensor that exists once the dispatch is done, which a later
+# collective can be ordered after.
+_DISPATCH_TOKENS: list | None = None
+
+
+def begin_dispatch_tokens() -> list:
+    """Until `end_dispatch_tokens`, record each fused_moe_gmm call's dispatch
+    token in the returned list."""
+    global _DISPATCH_TOKENS
+    assert _DISPATCH_TOKENS is None
+    _DISPATCH_TOKENS = []
+    return _DISPATCH_TOKENS
+
+
+def end_dispatch_tokens() -> None:
+    global _DISPATCH_TOKENS
+    _DISPATCH_TOKENS = None
+
+
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -157,6 +179,7 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
+    dispatch_token: bool = False,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -181,6 +204,7 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        dispatch_token=dispatch_token,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -188,11 +212,22 @@ def _build_fused_moe_custom_op(
     # We must overwrite the default fake implementation as vLLM uses dynamic
     # dimensions for the hidden_states.
     def _fake_fused_moe(hidden_states, *args, **kwargs):
-        return torch.empty_like(hidden_states)
+        out = torch.empty_like(hidden_states)
+        if not dispatch_token:
+            return out
+        token = hidden_states.new_empty(DISPATCH_TOKEN_SHAPE, dtype=torch.bfloat16)
+        return out, token
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        dispatch_token,
+    )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -204,10 +239,18 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    dispatch_token: bool = False,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        dispatch_token,
+    )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -217,6 +260,7 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        dispatch_token=dispatch_token,
     )
 
 
@@ -267,19 +311,21 @@ def fused_moe_gmm(
     the sparse-core parity path dispatches ragged gather/gather-reduce.
     """
     use_ep = experts_start is not None
+    tokens = _DISPATCH_TOKENS
     fused_moe = _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        dispatch_token=tokens is not None,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
         # (see the `if use_ep:` guard in fused_moe_func), but the custom op
         # still needs a concrete tensor to call with a fixed arity.
         experts_start = torch.zeros((), dtype=torch.int32, device=hidden_states.device)
-    return fused_moe(
+    out = fused_moe(
         hidden_states,
         w1,
         w2,
@@ -291,3 +337,8 @@ def fused_moe_gmm(
         topk_ids,
         experts_start,
     )
+    if tokens is None:
+        return out
+    out, token = out
+    tokens.append(token)
+    return out

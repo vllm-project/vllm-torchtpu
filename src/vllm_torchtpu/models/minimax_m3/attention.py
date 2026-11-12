@@ -404,10 +404,16 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.msa_op = get_msa_op(*msa_config, fp4=self.fp4)
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor, reduce: bool = True
-    ) -> torch.Tensor:
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        reduce: bool = True,
+        split_rows: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """The attention output; with ``reduce=False`` this rank's partial
-        (o_proj not all-reduced over the TP group)."""
+        (o_proj not all-reduced over the TP group); with ``split_rows`` this
+        rank's partials of the rows before and from ``split_rows``, each from
+        its own o_proj GEMM (so neither is a slice of a larger buffer)."""
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
@@ -448,6 +454,16 @@ class MiniMaxM3SparseAttention(nn.Module):
                 layer_metadata,
                 **extra,
             ).reshape(num_tokens, self.q_size)
+        if split_rows is not None:
+            apply = self.o_proj.quant_method.apply
+            return (
+                apply(self.o_proj, attn_output.narrow(0, 0, split_rows), None),
+                apply(
+                    self.o_proj,
+                    attn_output.narrow(0, split_rows, num_tokens - split_rows),
+                    None,
+                ),
+            )
         if not reduce:
             # o_proj has no bias, so the partial is just this rank's GEMM.
             return self.o_proj.quant_method.apply(self.o_proj, attn_output, None)

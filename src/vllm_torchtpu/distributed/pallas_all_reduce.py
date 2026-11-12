@@ -82,10 +82,15 @@ def _body(n: int, max_bytes: int, axis: str):
     return body
 
 
-def _ordered_body(n: int, max_bytes: int, axis: str):
+def _ordered_body(n: int, max_bytes: int, axis: str, barrier: bool = False):
     body = _body(n, max_bytes, axis)
 
     def ordered(x, rank, prev):
+        if barrier:
+            # x leaves the barrier only once `prev` exists: a dependency that
+            # neither copies x nor changes a value.
+            x, _ = lax.optimization_barrier((x, prev))
+            return body(x, rank)
         # An exact zero read from `prev` (NaN/inf mapped to 0 first) added to
         # one element: a data dependency that changes no value.
         zero = jnp.nan_to_num(prev[0, 0], nan=0.0, posinf=0.0, neginf=0.0) * 0
@@ -94,12 +99,15 @@ def _ordered_body(n: int, max_bytes: int, axis: str):
     return ordered
 
 
-def _make_op(mesh, max_bytes: int, ordered: bool = False):
+def _make_op(mesh, max_bytes: int, ordered: bool = False, barrier: bool = False):
     axis = mesh.axis_names[0]
     specs = (P(axis),) * (3 if ordered else 2)
-    make_body = _ordered_body if ordered else _body
+    if ordered:
+        body_fn = _ordered_body(int(mesh.size), max_bytes, axis, barrier)
+    else:
+        body_fn = _body(int(mesh.size), max_bytes, axis)
     sharded = jax.shard_map(
-        make_body(int(mesh.size), max_bytes, axis),
+        body_fn,
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -226,7 +234,12 @@ def arm(hidden: int, device: torch.device) -> bool:
         ranks=tuple(int(r) for r in tp.ranks),
         op=op,
         rank=rank,
-        ordered_op=_make_op(mesh, max_bytes, ordered=True),
+        ordered_op=_make_op(
+            mesh,
+            max_bytes,
+            ordered=True,
+            barrier=envs.TPU_MINIMAX_M3_FFN_SPLIT_DEP == "barrier",
+        ),
     )
     logger.info(
         "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views"
@@ -252,6 +265,10 @@ def all_reduce(ranks, x: torch.Tensor) -> torch.Tensor | None:
     # Every size goes to the op, which decides on the static size inside: a
     # branch here would give the model's Dynamo traces different graphs (and
     # inputs) per bucket, which shape_variants refuses to hand buckets between.
+    if _DEFERRED is not None:
+        # The caller all-reduces this partial itself (`begin_defer`).
+        _DEFERRED.append(x)
+        return x
     chain = _CHAIN
     if chain is None or armed.ordered_op is None:
         return armed.op(x, armed.rank)
@@ -262,6 +279,44 @@ def all_reduce(ranks, x: torch.Tensor) -> torch.Tensor | None:
     )
     chain.append(out)
     return out
+
+
+# Rows of an earlier output an ordered all-reduce waits on: any slice of it
+# carries the dependency.
+_AFTER_ROWS = 8
+
+
+def all_reduce_after(x: torch.Tensor, after: torch.Tensor | None) -> torch.Tensor:
+    """The armed op's TP all-reduce of x (2-D bf16), started only once `after`
+    (any 2-D bf16 tensor, e.g. an earlier all-reduce's output or a MoE
+    dispatch token) exists. XLA cannot combine it with a collective `after`
+    depends on. Needs `armed()`."""
+    armed = _ARMED
+    assert armed is not None and armed.ordered_op is not None
+    if after is None:
+        return armed.op(x, armed.rank)
+    if after.shape[0] > _AFTER_ROWS:
+        after = after.narrow(0, 0, _AFTER_ROWS)
+    return armed.ordered_op(x, armed.rank, after)
+
+
+# Between begin_defer and end_defer, every armed all-reduce returns its input
+# unreduced and records it: the caller reduces it later (`all_reduce_after`).
+_DEFERRED: list | None = None
+
+
+def begin_defer() -> list:
+    """Until `end_defer`, hand every armed all-reduce back unreduced (returns
+    the list its inputs are recorded in)."""
+    global _DEFERRED
+    assert _DEFERRED is None
+    _DEFERRED = []
+    return _DEFERRED
+
+
+def end_defer() -> None:
+    global _DEFERRED
+    _DEFERRED = None
 
 
 def armed() -> bool:

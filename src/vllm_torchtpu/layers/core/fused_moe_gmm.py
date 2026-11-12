@@ -80,9 +80,7 @@ _V3_PAYLOAD_SORT = (
     envs.TPU_MOE_V3_PAYLOAD_SORT and envs.RAGGED_GATHER_REDUCE_VERSION == "v3"
 )
 if _V3_PAYLOAD_SORT:
-    ragged_gather_reduce = functools.partial(
-        ragged_gather_reduce_v3, payload_sort=True
-    )
+    ragged_gather_reduce = functools.partial(ragged_gather_reduce_v3, payload_sort=True)
 # Fixed at import: EP steps of at least this many tokens combine the expert
 # outputs on the TensorCore (0 = never). See moe_tc_combine.
 _TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
@@ -99,6 +97,9 @@ if _TC_COMBINE_MIN_TOKENS or _V3_PAYLOAD_SORT or _FLAT_ROUTING_MIN_TOKENS:
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
+# fused_moe_func(dispatch_token=True)'s extra output: rows x lanes of the
+# dispatched tokens.
+DISPATCH_TOKEN_SHAPE = (8, 128)
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Fixed at import: let the counting sort replace the comparison sorts on the
@@ -703,6 +704,7 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
+
         def sc_combine():
             return ragged_gather_reduce(
                 gmm2_res,
@@ -774,8 +776,14 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
-) -> jax.Array:
+    dispatch_token: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Run MoE with precomputed expert ids and weights.
+
+    With ``dispatch_token`` it also returns DISPATCH_TOKEN_SHAPE bf16 values
+    of the dispatched tokens: they exist once the dispatch is done, so a
+    collective made to wait on them starts after the dispatch (the caller
+    orders SparseCore work with it).
 
     For linear EP placement, ``experts_start`` is the first global expert id
     owned by this shard, passed as a 0-d int32 array (real traced data, not a
@@ -889,6 +897,11 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
     )
+    token = None
+    if dispatch_token:
+        logger.info_once("fused_moe_func: returning a dispatch token")
+        rows, cols = DISPATCH_TOKEN_SHAPE
+        token = x[:rows, :cols].astype(jnp.bfloat16)
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
@@ -911,4 +924,7 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
     )
-    return x[:num_tokens, :hidden_size]
+    out = x[:num_tokens, :hidden_size]
+    if dispatch_token:
+        return out, token
+    return out

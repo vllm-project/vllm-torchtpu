@@ -80,6 +80,8 @@ if TYPE_CHECKING:
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS: int = 0
+    TPU_MINIMAX_M3_FFN_SPLIT_ORDER: str = "dispatch"
+    TPU_MINIMAX_M3_FFN_SPLIT_DEP: str = "barrier"
     TPU_MINIMAX_M3_DCP_KV_GATHER_SHARE: bool = False
     TPU_MINIMAX_M3_DCP_HP_BUFFER_STEP: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -758,6 +760,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 (default) = off.
     "TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS": env_int(
         "TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS", 0
+    ),
+    # How the split (TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS) orders its four
+    # all-reduces. "dispatch": attention half 1's all-reduce starts after FFN
+    # half 0's MoE dispatch and FFN half 0's after FFN half 1's dispatch, so
+    # each runs on the SparseCore while the TensorCore does the other half's
+    # expert GEMMs (dense layers: after the previous all-reduce). "chain":
+    # each after the previous one, in program order (attention 0, attention 1,
+    # FFN 0, FFN 1).
+    "TPU_MINIMAX_M3_FFN_SPLIT_ORDER": env_with_choices(
+        "TPU_MINIMAX_M3_FFN_SPLIT_ORDER", "dispatch", ["dispatch", "chain"]
+    ),
+    # How an ordered all-reduce waits: "barrier" (an optimization barrier,
+    # no copy) or "add" (adds an exact zero read from the earlier tensor).
+    "TPU_MINIMAX_M3_FFN_SPLIT_DEP": env_with_choices(
+        "TPU_MINIMAX_M3_FFN_SPLIT_DEP", "barrier", ["barrier", "add"]
     ),
     # MiniMax M3 MSA DCP: the KV-head replicas each send one token share of
     # the new k/v/index_q in the group's all-gather (half the bytes at DCP 8

@@ -36,6 +36,7 @@ from vllm.model_executor.models.utils import (
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed import pallas_all_reduce
+from vllm_torchtpu.layers.adapter import fused_moe
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
@@ -73,12 +74,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
         self.ffn_split_min_tokens = envs.TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS
+        self.ffn_split_order = envs.TPU_MINIMAX_M3_FFN_SPLIT_ORDER
         if self.ffn_split_min_tokens and layer_id == 0:
             logger.info(
                 "TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS=%d: post-attention block on "
-                "two token halves from %d tokens.",
+                "two token halves from %d tokens (TPU_MINIMAX_M3_FFN_SPLIT_ORDER=%s, "
+                "TPU_MINIMAX_M3_FFN_SPLIT_DEP=%s).",
                 self.ffn_split_min_tokens,
                 self.ffn_split_min_tokens,
+                self.ffn_split_order,
+                envs.TPU_MINIMAX_M3_FFN_SPLIT_DEP,
             )
 
     def forward(
@@ -100,6 +105,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
             and num_tokens % 2 == 0
             and pallas_all_reduce.armed()
         ):
+            if self.ffn_split_order == "dispatch":
+                return self._forward_ffn_halves_dispatch_order(
+                    positions, hidden_states, residual, ffn
+                )
             return self._forward_ffn_halves(positions, hidden_states, residual, ffn)
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -133,6 +142,47 @@ class MiniMaxM3DecoderLayer(nn.Module):
             res.append(r)
         pallas_all_reduce.end_chain()
         return torch.cat(out), torch.cat(res)
+
+    def _forward_ffn_halves_dispatch_order(
+        self, positions, hidden_states, residual, ffn
+    ):
+        """`_forward_ffn_halves` with the all-reduces placed around the MoE
+        dispatches.
+
+        The SparseCore runs the all-reduces and the MoE dispatch / combine one
+        after another, so the order they reach it decides what overlaps:
+        attention 0's all-reduce, FFN 0's dispatch, attention 1's all-reduce
+        (while the TensorCore runs FFN 0's expert GEMMs), FFN 1's dispatch,
+        FFN 0's all-reduce (while it runs FFN 1's), FFN 1's all-reduce. Each
+        all-reduce waits on the dispatch token before it (`fused_moe`), or on
+        the previous all-reduce in a dense layer. The attention runs whole;
+        o_proj runs once per half so the halves are separate buffers. The
+        rows see the same operations as unsplit."""
+        num_tokens = hidden_states.shape[0]
+        half = num_tokens // 2
+        rows = ((0, half), (half, num_tokens - half))
+        partials = self.self_attn(positions, hidden_states, split_rows=half)
+        prev = None
+        reduced = []  # (ffn partial, dispatch token or None, residual)
+        for i, partial in enumerate(partials):
+            prev = pallas_all_reduce.all_reduce_after(partial, prev)
+            h, r = self.post_attention_layernorm(prev, residual.narrow(0, *rows[i]))
+            deferred = pallas_all_reduce.begin_defer()
+            tokens = fused_moe.begin_dispatch_tokens()
+            out = ffn(h)
+            fused_moe.end_dispatch_tokens()
+            pallas_all_reduce.end_defer()
+            assert len(deferred) == 1 and len(tokens) <= 1, (len(deferred), len(tokens))
+            reduced.append((out, tokens[0] if tokens else None, r))
+            # The next all-reduce starts after this half's dispatch.
+            if tokens:
+                prev = tokens[0]
+        # FFN 0's all-reduce after FFN 1's dispatch, FFN 1's after FFN 0's.
+        f0 = pallas_all_reduce.all_reduce_after(
+            reduced[0][0], reduced[1][1] if reduced[1][1] is not None else prev
+        )
+        f1 = pallas_all_reduce.all_reduce_after(reduced[1][0], f0)
+        return torch.cat((f0, f1)), torch.cat((reduced[0][2], reduced[1][2]))
 
 
 @support_torch_compile(

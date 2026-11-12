@@ -74,6 +74,7 @@ def _pallas(log):
             "_Armed",
             "_ARMED",
             "_CHAIN",
+            "_DEFERRED",
             "all_reduce",
             "armed",
             "begin_chain",
@@ -152,3 +153,103 @@ def test_ffn_halves_equal_unsplit(tokens):
     half = tokens // 2
     assert order == [("ar", half), ("ar", half), ("ffn", half), ("ffn", half)]
     assert pr._CHAIN is None
+
+
+def _pallas_ordered(log):
+    ns = dict(dataclasses=dataclasses, torch=torch, Any=typing.Any)
+    mod = _extract(
+        SRC / "distributed/pallas_all_reduce.py",
+        {
+            "_Armed",
+            "_ARMED",
+            "_CHAIN",
+            "_DEFERRED",
+            "_AFTER_ROWS",
+            "all_reduce",
+            "all_reduce_after",
+            "begin_defer",
+            "end_defer",
+            "armed",
+        },
+        ns,
+    )
+
+    class Op:
+        """Two ranks holding the same partial: the sum is 2x, exact in bf16
+        for small integers."""
+
+        def __init__(self, ordered):
+            self.ordered = ordered
+
+        def __call__(self, x, rank, prev=None):
+            out = x * 2
+            log.append((self.ordered, None if prev is None else prev, out))
+            return out
+
+    mod._ARMED = mod._Armed(ranks=(0, 1), op=Op(False), rank=None, ordered_op=Op(True))
+    return mod
+
+
+def _fused_moe_stub():
+    ns = dict(torch=torch)
+    return _extract(
+        SRC / "layers/adapter/fused_moe.py",
+        {"_DISPATCH_TOKENS", "begin_dispatch_tokens", "end_dispatch_tokens"},
+        ns,
+    )
+
+
+@pytest.mark.parametrize("moe", [True, False])
+@pytest.mark.parametrize("tokens", [16, 24])
+def test_ffn_halves_dispatch_order(tokens, moe):
+    log = []
+    pr = _pallas_ordered(log)
+    fm = _fused_moe_stub()
+    hidden = 8
+    gen = torch.Generator().manual_seed(tokens)
+
+    def ints(*shape):
+        return torch.randint(-4, 5, shape, generator=gen).to(torch.bfloat16)
+
+    attn_out = ints(tokens, hidden)
+    residual = ints(tokens, hidden)
+    dispatch = []
+
+    def attn(positions, h, reduce=True, split_rows=None):
+        assert split_rows == tokens // 2
+        return attn_out[:split_rows].clone(), attn_out[split_rows:].clone()
+
+    def norm(a, r):
+        s = a + r
+        return s, s
+
+    def ffn(h):
+        if moe and fm._DISPATCH_TOKENS is not None:
+            token = h[:8, :4].clone()
+            dispatch.append(token)
+            fm._DISPATCH_TOKENS.append(token)
+        out = pr.all_reduce((0, 1), h * 3)  # the FFN's own all-reduce
+        return out
+
+    layer = types.SimpleNamespace(self_attn=attn, post_attention_layernorm=norm)
+    model = _extract(
+        SRC / "models/minimax_m3/model.py",
+        {"_forward_ffn_halves_dispatch_order"},
+        dict(torch=torch, pallas_all_reduce=pr, fused_moe=fm),
+    )
+    x = torch.zeros(tokens, hidden, dtype=torch.bfloat16)
+    out, res = model._forward_ffn_halves_dispatch_order(layer, None, x, residual, ffn)
+    # Unsplit reference: all-reduce (2x), norm, FFN (3x), all-reduce (2x).
+    ref_h, ref_r = norm(attn_out * 2, residual)
+    assert torch.equal(res, ref_r)
+    assert torch.equal(out, ref_h * 3 * 2)
+    # Four all-reduces, the FFNs' deferred ones done by the layer.
+    assert len(log) == 4 and [o for o, _, _ in log] == [False, True, True, True]
+    a0, a1, f0, f1 = (entry[2] for entry in log)
+    if moe:
+        # attention 1 after FFN 0's dispatch, FFN 0 after FFN 1's dispatch.
+        assert log[1][1] is dispatch[0] and log[2][1] is dispatch[1]
+    else:
+        assert torch.equal(log[1][1], a0[:8]) and torch.equal(log[2][1], a1[:8])
+    assert torch.equal(log[3][1], f0[:8])
+    assert pr._DEFERRED is None and fm._DISPATCH_TOKENS is None
