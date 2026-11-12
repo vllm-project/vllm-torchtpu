@@ -67,6 +67,9 @@ _PERF_FLAGS_OFF = {
     "moe.flush_in_ar1": False,
     "moe.sh_at": 0,
     "moe.ep_fast_refill": False,
+    "moe.cp_interleave": False,
+    "moe.route_early": False,
+    "moe.flush_pre_drain": False,
 }
 _LIBRARY_MODULES = (GQAModule, GDNModule, MoEModule)
 

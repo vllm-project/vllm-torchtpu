@@ -96,6 +96,15 @@ class MoETunables:
     flush_in_ar1: bool = False  # Dense-ring flush inside the following all-reduce
     sh_at: int = 0  # `sh_pre` placement: 0 before route, 1 inside, 2 after first DMAs
     ep_fast_refill: bool = False  # EP expert refills with static banks
+    # Vectorized routing: scan the copy slots rank-minor (slot j holds rank
+    # j % R's extra slot j // R) instead of rank-major (`route_shrink` needs it)
+    cp_interleave: bool = False
+    # Routing weights under the hit-list copy; the first expert fills right
+    # after the fixed-hit scan (vectorized routing)
+    route_early: bool = False
+    # Pipelined EP experts: the lazy dense-ring refill just before the last
+    # expert's down projection instead of after the expert loop
+    flush_pre_drain: bool = False
 
     # `exact`: moving the field keeps hidden states and caches bit-identical
     # (scheduling only); `approx`: changes or may change the arithmetic.
@@ -117,6 +126,9 @@ class MoETunables:
         "flush_in_ar1": "approx",
         "sh_at": "approx",
         "ep_fast_refill": "approx",
+        "cp_interleave": "approx",  # copy-slot scan order (Po2C is greedy)
+        "route_early": "approx",
+        "flush_pre_drain": "approx",
     }
 
 
