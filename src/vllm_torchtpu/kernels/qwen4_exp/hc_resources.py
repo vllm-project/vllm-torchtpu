@@ -106,6 +106,7 @@ def full_mix_memory(
     hardware: HcHardware,
     *,
     up_t: bool = False,
+    up_transposed: bool = False,
     combine: bool = False,
     inject: bool = False,
 ) -> FullMixMemory:
@@ -128,7 +129,7 @@ def full_mix_memory(
         return _plane(rows, cols, hardware.fp32_rows, hardware.lanes, 4)
 
     down_rows = lowrank + (branches if inject else 0)
-    up_bytes = bf(lowrank, width) if up_t else bf(width, lowrank)
+    up_bytes = bf(lowrank, width) if (up_t or up_transposed) else bf(width, lowrank)
     resident = _align(width, hardware.lanes) * 2 + bf(down_rows, width) + up_bytes
     buffers = 4 * bf(tile, width) + 2 * bf(tile, hidden)
     if combine:
@@ -158,6 +159,7 @@ def supports_full_mix(
     hardware: HcHardware | None,
     *,
     up_t: bool = False,
+    up_transposed: bool = False,
     combine: bool = False,
     inject: bool = False,
 ) -> bool:
@@ -182,6 +184,7 @@ def supports_full_mix(
             tile,
             hardware,
             up_t=up_t,
+            up_transposed=up_transposed,
             combine=combine,
             inject=inject,
         ).total_bytes

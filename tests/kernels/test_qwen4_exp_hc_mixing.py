@@ -72,12 +72,38 @@ def test_hc_staged_and_full_mix_match_cpu_reference(tokens):
     full_mix, full_norm = _full_mix(
         x, weight, down, up, branches=4, hidden=128, eps=1e-6, token_tile=128
     )
+    up_t = jax.device_put(
+        jnp.asarray(np.ascontiguousarray(np.asarray(arrays[3]).T), jnp.bfloat16), tpu
+    )
+    mixed_ut = _up_epilogue(
+        jax.device_put(mid, tpu),
+        norm,
+        up_t,
+        branches=4,
+        hidden=128,
+        token_tile=128,
+        up_transposed=True,
+    )
+    full_mix_ut, full_norm_ut = _full_mix(
+        x,
+        weight,
+        down,
+        up_t,
+        branches=4,
+        hidden=128,
+        eps=1e-6,
+        token_tile=128,
+        up_transposed=True,
+    )
     # Use the existing HC layer's NRMSE/cosine numerical acceptance contract.
     for actual, expected in [
         (norm, expected_norm),
         (mixed, expected_mix),
+        (mixed_ut, expected_mix),
         (full_norm, expected_norm),
         (full_mix, expected_mix),
+        (full_norm_ut, expected_norm),
+        (full_mix_ut, expected_mix),
     ]:
         a, e = (np.asarray(v, np.float32) for v in (actual, expected))
         assert np.isfinite(a).all()
@@ -86,6 +112,34 @@ def test_hc_staged_and_full_mix_match_cpu_reference(tokens):
             np.vdot(a.ravel(), e.ravel()) / (np.linalg.norm(a) * np.linalg.norm(e))
             >= 0.999
         )
+
+    from vllm_torchtpu.kernels.qwen4_exp.hc_decode import hc_decode_mix
+
+    compiled = (
+        jax.jit(
+            lambda x_in, w_in, d_in, u_in: hc_decode_mix(
+                x_in,
+                w_in,
+                d_in,
+                u_in,
+                branches=4,
+                hidden=2560,
+                eps=1e-6,
+                up_transposed=True,
+            )[0]
+        )
+        .lower(
+            jax.ShapeDtypeStruct((32, 10240), jnp.bfloat16),
+            jax.ShapeDtypeStruct((10240,), jnp.bfloat16),
+            jax.ShapeDtypeStruct((320, 10240), jnp.bfloat16),
+            jax.ShapeDtypeStruct((320, 10240), jnp.bfloat16),
+        )
+        .compile()
+    )
+    hlo_txt = compiled.as_text()
+    # Pre-transposed [320, 10240] must not emit any [10240,320]{0,1}->{1,0} copy.
+    assert "bf16[10240,320]" not in hlo_txt
+    assert "{0,1}" not in hlo_txt
 
 
 def _bitwise(actual, expected):
@@ -105,6 +159,7 @@ def _full_mix_variants_match(device):
     static = dict(branches=4, hidden=128, eps=1e-6, token_tile=128)
     expected = _full_mix(x, weight, down, up, **static)
     _bitwise(_full_mix(x, weight, down, up.T, **static, up_t=True), expected)
+    _bitwise(_full_mix(x, weight, down, up.T, **static, up_transposed=True), expected)
     combined = gated_residual_fn(4, 128, 128)(x, block, gates)
     mixed, norm = _full_mix(combined, weight, down, up, **static)
     for up_t in (False, True):
@@ -114,6 +169,12 @@ def _full_mix_variants_match(device):
             ),
             (mixed, norm, combined),
         )
+    _bitwise(
+        _combine_full_mix(
+            x, block, gates, weight, down, up.T, **static, up_transposed=True
+        ),
+        (mixed, norm, combined),
+    )
     # Rows are independent: a wider tile changes only the schedule.
     wide = dict(static, token_tile=256)
     _bitwise(_full_mix(x, weight, down, up, **wide), expected)
