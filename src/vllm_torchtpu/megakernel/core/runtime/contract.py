@@ -226,6 +226,12 @@ class MonoProgram(Protocol):
     `check_compiled_ir(debug, bucket)`, `attach_draft(drafter)` /
     `detach_draft()`, `on_warmup_done()` (called once per bind, after the
     worker finishes its whole warmup).
+    `attach_draft(drafter)` runs after `bind`, before the bind agreement,
+    with the runner's drafter (`None` without one); it returns `None` when
+    the program serves no draft, `True` when it attached one, or a `Decline`
+    (code `draft_declined`) when it was asked for a draft it can't serve on
+    this rank: that is the rank's bind vote, so every rank declines, and
+    `detach_draft()` runs on every rank whose megakernel declines at bind.
     `decide` may return `None` for a step it doesn't see (no metadata): stock,
     not counted in the step mix.
     """

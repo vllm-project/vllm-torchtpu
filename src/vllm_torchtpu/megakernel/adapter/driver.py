@@ -482,6 +482,7 @@ class ProgramDriver(StepRouting):
             decline: EligibilityResult | None = None
             try:
                 self.bind(runner)
+                decline = self._attach_draft(runner)
             except MegakernelLayoutError as exc:
                 decline = (
                     exc.result
@@ -526,6 +527,18 @@ class ProgramDriver(StepRouting):
                     )
                 return
             self.warmup(runner)
+
+    def _attach_draft(self, runner: Any) -> EligibilityResult | None:
+        """The program's optional `attach_draft(drafter)` with the runner's
+        drafter, after `bind` and before the bind agreement: a draft the
+        program can't serve on this rank (a `Decline`) is this rank's vote, so
+        every rank declines and detaches together. `None` / `True` (no draft
+        requested / attached) vote to serve."""
+        attach = getattr(self.program, "attach_draft", None)
+        if not callable(attach):
+            return None
+        out = attach(getattr(runner, "drafter", None))
+        return out.result if isinstance(out, Decline) else None
 
     def on_warmup_done(self, runner: Any) -> None:
         """The worker's warmup is over (after `capture_model`, i.e. after the

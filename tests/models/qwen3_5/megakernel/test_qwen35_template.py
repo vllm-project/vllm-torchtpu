@@ -404,6 +404,8 @@ _QWEN_DECLINES = frozenset(
         "pool_layout_mismatch",
         "conv_state_dtype_unsupported",
         "cache_layout_incompatible",
+        # attach_draft: an MTP draft the option asks for that can't be served
+        "draft_declined",
     }
 )
 

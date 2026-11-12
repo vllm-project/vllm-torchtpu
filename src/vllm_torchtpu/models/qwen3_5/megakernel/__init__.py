@@ -65,6 +65,9 @@ SPEC = TpuMonoSpec(
             "fused_pool_io_min_b_hi",
             "pool_gather",
             "compile_hlo_check",
+            "mtp_draft",
+            "mtp_draft_buckets",
+            "mtp_draft_verify_buckets",
         }
     ),
     # Of the default profile (qwen35-candidate30-fused); qwen35-baseline is

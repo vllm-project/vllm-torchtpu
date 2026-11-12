@@ -18,7 +18,9 @@ packs the weights (EP->TP reshard first when needed); `bind` aliases the
 runner's unified KV+GDN pools and checks the recurrent slot layout; `build`
 returns one exported-bridge step per bucket; `warmup_session` /
 `warmup_inputs` run the sentinel pool-write check; `decide` / `forward` route
-one decode (`T=1`) or MTP verify (`T=4`) step.
+one decode (`T=1`) or MTP verify (`T=4`) step. With the `mtp_draft` option,
+`attach_draft` also runs the MTP draft layer on an attention-only megakernel
+(`draft.py`) inside the drafter's own programs.
 """
 
 from __future__ import annotations
@@ -67,6 +69,7 @@ from vllm_torchtpu.megakernel.core.runtime.contract import (
     WarmupCase,
 )
 
+from . import draft as draft_mk
 from . import profiles
 from .model import Qwen35, register
 
@@ -83,8 +86,20 @@ OPTION_KEYS = frozenset(
         "fused_pool_io_min_b_hi",
         "pool_gather",
         "compile_hlo_check",
+        "mtp_draft",
+        "mtp_draft_buckets",
+        "mtp_draft_verify_buckets",
     }
 )
+# Options of the MTP draft megakernel (`draft.py`): `mtp_draft` turns it on
+# (default off); `mtp_draft_buckets` are the row buckets of a draft loop step
+# (one row per request) and `mtp_draft_verify_buckets` those of draft step 0
+# (K + 1 rows per request), each a multiple of 4 in 4..64.
+DRAFT_OPTION_KEYS = frozenset(
+    {"mtp_draft", "mtp_draft_buckets", "mtp_draft_verify_buckets"}
+)
+_TRUE_STRS = frozenset({"1", "true", "on", "yes"})
+_FALSE_STRS = frozenset({"0", "false", "off", "no", "none", ""})
 # The profile `create` serves when `options` names none: the candidate30 goal
 # configuration (approximate numerics). `qwen35-baseline` (exact numerics) is
 # one option away: `{"options": {"profile": "qwen35-baseline"}}`.
@@ -111,6 +126,30 @@ def _unwrap(x: Any) -> Any:
     return x
 
 
+def _parse_flag(name: str, val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int):
+        return bool(val)
+    s = str(val).strip().lower()
+    _need(s in _TRUE_STRS or s in _FALSE_STRS, f"invalid {name}={val!r}")
+    return s in _TRUE_STRS
+
+
+def parse_draft_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """The MTP draft megakernel's settings from the plugin `options`."""
+    raw = options.get("mtp_draft")
+    return {
+        "mtp_draft": False if raw is None else _parse_flag("mtp_draft", raw),
+        "mtp_draft_buckets": draft_mk.parse_draft_buckets(
+            options.get("mtp_draft_buckets"), draft_mk.DEFAULT_LOOP_BUCKETS
+        ),
+        "mtp_draft_verify_buckets": draft_mk.parse_draft_buckets(
+            options.get("mtp_draft_verify_buckets"), draft_mk.DEFAULT_VERIFY_BUCKETS
+        ),
+    }
+
+
 def parse_options(options: Mapping[str, Any]) -> dict[str, Any]:
     """This template's settings from the plugin `options` (unknown keys raise)."""
     if bad := sorted(options.keys() - OPTION_KEYS):
@@ -118,7 +157,9 @@ def parse_options(options: Mapping[str, Any]) -> dict[str, Any]:
             f"Qwen35Program: unknown option {bad[0]!r}; known: {sorted(OPTION_KEYS)}"
         )
     register()  # profile names resolve through the library registry
-    return mk_rt.parse_runtime_config(options)
+    cfg = mk_rt.parse_runtime_config(options)
+    cfg.update(parse_draft_options(options))
+    return cfg
 
 
 _TORCH_STEP_META_OPS = TorchStepMetaOps()
@@ -262,6 +303,9 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decl
         pool_gather=owned["pool_gather"],
         compile_hlo_check=cfg["compile_hlo_check"],
         dcp_size=dcp,
+        mtp_draft=cfg["mtp_draft"],
+        mtp_draft_buckets=cfg["mtp_draft_buckets"],
+        mtp_draft_verify_buckets=cfg["mtp_draft_verify_buckets"],
     )
 
 
@@ -273,6 +317,10 @@ class Qwen35Program:
 
     `dcp_size` is the decode context parallel size: each of the `dcp_size`
     ranks sharing a KV head holds one shard of its pages (`pool.dcp`).
+
+    `mtp_draft` (default off) runs the MTP draft layer on an attention-only
+    megakernel: `attach_draft` builds it over `mtp_draft_buckets` (loop) and
+    `mtp_draft_verify_buckets` (draft step 0) and hands it to the drafter.
     """
 
     # Decode context parallel size (`create` passes the runner's); 1: no DCP.
@@ -301,6 +349,9 @@ class Qwen35Program:
         pool_gather: bool | str | None = None,
         compile_hlo_check: bool | None = None,
         dcp_size: int = 1,
+        mtp_draft: bool = False,
+        mtp_draft_buckets: Sequence[int] | None = None,
+        mtp_draft_verify_buckets: Sequence[int] | None = None,
     ) -> None:
         register()
         _need(mode in ("ep", "tp"), f"invalid mode={mode!r}; expected 'ep' or 'tp'")
@@ -354,6 +405,19 @@ class Qwen35Program:
         self._warmup_plan: dict[tuple[int, ...], Any] | None = None
         self.view: RunnerView | None = None
         self.pool_layout_facts: Any = None
+        self.mtp_draft = bool(mtp_draft)
+        self.mtp_draft_buckets = tuple(
+            draft_mk.DEFAULT_LOOP_BUCKETS
+            if mtp_draft_buckets is None
+            else mtp_draft_buckets
+        )
+        self.mtp_draft_verify_buckets = tuple(
+            draft_mk.DEFAULT_VERIFY_BUCKETS
+            if mtp_draft_verify_buckets is None
+            else mtp_draft_verify_buckets
+        )
+        self.draft: draft_mk.Qwen35DraftProgram | None = None
+        self._drafter: Any = None
         if mesh is not None:
             self.load(mesh)
 
@@ -1039,6 +1103,107 @@ class Qwen35Program:
             )
 
         return WarmupCase(args, check)
+
+    # --- MTP draft ------------------------------------------------------------
+
+    def _draft_decline(self, why: str) -> Decline:
+        return Decline(
+            "draft_declined",
+            f"{self._display_name} MTP draft megakernel can't serve this drafter "
+            f"({why}); skipping.",
+        )
+
+    def attach_draft(self, drafter: Any) -> bool | Decline | None:
+        """Run the drafter's MTP layer on the draft megakernel (`draft.py`).
+
+        Called by the adapter after `bind`, before its bind agreement. `None`:
+        no draft requested (`mtp_draft` off, or no MTP drafter), nothing to
+        agree on; `True`: attached; a `Decline` (`draft_declined`): requested
+        and not servable on this rank, which declines the megakernel on every
+        rank (the adapter then calls `detach_draft`). The program builds and
+        binds `Qwen35DraftProgram` and hands it to the drafter's
+        `attach_draft_megakernel(program) -> bool`.
+        """
+        if not self.mtp_draft:
+            return None
+        view = self.view
+        assert view is not None, "bind() must run before attach_draft()"
+        spec_cfg = getattr(view.vllm_config, "speculative_config", None)
+        method = getattr(spec_cfg, "method", None)
+        if drafter is None or method != "mtp":
+            logger.warning(
+                "%s megakernel: mtp_draft is set but the server has no MTP drafter "
+                "(speculative method %r); no draft megakernel.",
+                self._display_name,
+                method,
+            )
+            return None
+        seam = getattr(drafter, "attach_draft_megakernel", None)
+        if not callable(seam):
+            return self._draft_decline("no attach_draft_megakernel seam")
+        if view.speculative_tokens != draft_mk.NUM_SPEC_TOKENS:
+            return self._draft_decline(
+                f"num_speculative_tokens={view.speculative_tokens} != "
+                f"{draft_mk.NUM_SPEC_TOKENS}"
+            )
+        if view.enforce_eager:
+            return self._draft_decline("enforce_eager")
+        for attr in ("_draft_replicated", "_draft_kv_shared", "_share_mtp_indices"):
+            if getattr(drafter, attr, False):
+                return self._draft_decline(f"drafter.{attr} is set")
+        predictor = getattr(getattr(drafter, "draft_model", None), "model", None)
+        layers = getattr(predictor, "layers", None)
+        if layers is None or len(layers) != 1 or not hasattr(predictor, "norm"):
+            return self._draft_decline("expected a one-layer MTP predictor")
+        sched = getattr(view.vllm_config, "scheduler_config", None)
+        max_reqs = int(getattr(sched, "max_num_seqs", 0) or 0)
+        try:
+            prog = draft_mk.Qwen35DraftProgram(
+                layers[0],
+                predictor.norm,
+                self.mesh,
+                profile=self.profile,
+                tp_rank=self.tp_rank,
+                dcp_size=self.dcp_size,
+                loop_buckets=self.mtp_draft_buckets,
+                verify_buckets=self.mtp_draft_verify_buckets,
+                max_reqs=max_reqs,
+                token_paddings=view.token_paddings,
+                model_def=self.model_def,
+                geom=draft_mk.draft_geometry_of(self.geom),
+                base_exec=dataclasses.replace(
+                    self.base_exec, T=1, cache=CacheExec(paged_kv=True)
+                ),
+            )
+            prog.bind()
+        except ValueError as exc:  # `DraftUnsupported`, and weight packing errors
+            logger.warning(
+                "%s MTP draft megakernel: %s", self._display_name, exc, exc_info=True
+            )
+            return self._draft_decline(str(exc))
+        if not seam(prog):
+            return self._draft_decline("the drafter built no draft program")
+        self.draft, self._drafter = prog, drafter
+        return True
+
+    def detach_draft(self) -> None:
+        """Undo `attach_draft` (the adapter calls it when the megakernel
+        declines at bind)."""
+        drafter, self._drafter, self.draft = self._drafter, None, None
+        detach = getattr(drafter, "detach_draft_megakernel", None)
+        if callable(detach):
+            detach()
+
+    def on_warmup_done(self) -> None:
+        """After the worker's warmup: every draft megakernel program the
+        drafter built must have compiled (a cold one would trace on the first
+        real draft step)."""
+        if self.draft is None:
+            return
+        check = getattr(self._drafter, "check_draft_megakernel_warm", None)
+        if callable(check):
+            check()
+        self.draft.reset_stats()
 
     # --- per step -------------------------------------------------------------
 

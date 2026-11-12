@@ -310,3 +310,81 @@ def test_bind_and_warmup_agreement_error_propagates_after_one_collective(
     with pytest.raises(RuntimeError, match="gloo timeout"):
         drv.bind_and_warmup(SimpleNamespace(_megakernel=drv))
     assert calls == [0] and drv.warmed == []
+
+
+# --- the optional draft hooks ----------------------------------------------------
+
+
+class _DraftProgram:
+    """A program with the optional `attach_draft` / `detach_draft` hooks."""
+
+    display_name = "test"
+
+    def __init__(self, out: Any) -> None:
+        self.out, self.calls = out, []
+
+    def attach_draft(self, drafter: Any) -> Any:
+        self.calls.append(("attach", drafter))
+        return self.out
+
+    def detach_draft(self) -> None:
+        self.calls.append(("detach",))
+
+
+def _draft_driver(out: Any) -> Any:
+    drv = _bind_driver(lambda runner: None)
+    drv.program = _DraftProgram(out)
+    return drv
+
+
+@pytest.mark.parametrize("out", [None, True])
+def test_bind_and_warmup_attaches_the_draft_before_the_agreement(
+    fake_tp_group: Any, out: Any
+) -> None:
+    from types import SimpleNamespace
+
+    g = fake_tp_group([0])
+    drv = _draft_driver(out)
+    drafter = object()
+    runner = SimpleNamespace(_megakernel=drv, drafter=drafter)
+    drv.bind_and_warmup(runner)
+    assert drv.program.calls == [("attach", drafter)]
+    assert g.calls == 1 and drv.warmed == [runner] and runner._megakernel is drv
+
+
+def test_a_draft_decline_declines_every_rank_and_detaches(
+    fake_tp_group: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.megakernel.core.runtime.contract import Decline
+
+    votes: list[int] = []
+    g = fake_tp_group([0])
+    orig = g.all_reduce_max
+
+    def spy(t: Any, group: Any) -> None:
+        votes.append(int(t[0]))
+        orig(t, group)
+
+    monkeypatch.setattr(agreement_mod, "_all_reduce_max", spy)
+    drv = _draft_driver(Decline("draft_declined", "no seam"))
+    runner = SimpleNamespace(_megakernel=drv)  # no drafter: attach gets None
+    drv.bind_and_warmup(runner)
+    assert drv.program.calls == [("attach", None), ("detach",)]
+    assert votes == [_vote("draft_declined")] and drv.warmed == []
+    assert isinstance(runner._megakernel, driver_mod.DeclinedDriver)
+    assert runner._megakernel.decline.code == "draft_declined"
+
+
+def test_a_peer_draft_decline_detaches_this_rank(fake_tp_group: Any) -> None:
+    from types import SimpleNamespace
+
+    g = fake_tp_group([_vote("draft_declined")])
+    drv = _draft_driver(True)
+    drafter = object()
+    runner = SimpleNamespace(_megakernel=drv, drafter=drafter)
+    drv.bind_and_warmup(runner)
+    assert drv.program.calls == [("attach", drafter), ("detach",)]
+    assert g.calls == 1 and drv.warmed == []
+    assert runner._megakernel.decline.code == "peer_declined:draft_declined"
