@@ -174,11 +174,17 @@ def test_packed_step_metadata_matches_per_layer(kind, fake_tpu):
     per_layer = list(fake_tpu)
     assert len(per_layer) == 1  # single launch: (BATCHED, PER_SEQ) metas
     fake_tpu.clear()
-    packed = _run(tokens, md, metadata_only=True)
-    assert packed.dtype == jnp.int32 and packed.ndim == 1
+    exact = _run(tokens, md, metadata_only=True)
+    assert exact.dtype == jnp.int32 and exact.ndim == 1
     assert not fake_tpu  # no kernel launch
     # Tile-sized: about 1 KB, not five token-long arrays.
-    assert packed.size < 5 * tokens
+    assert exact.size < 5 * tokens
+    # The served op pads to a static bound; the layer reads the prefix.
+    bound = wrapper.packed_kernel_metadata_size(8192, MAX_SEQS, NUM_SPEC)
+    packed = _run(tokens, md, metadata_only=True, packed_size=bound)
+    assert packed.shape == (bound,)
+    np.testing.assert_array_equal(np.asarray(packed[: exact.size]), np.asarray(exact))
+    assert not np.asarray(packed[exact.size :]).any()
     _run(tokens, md, packed_metadata=packed)
     (stepped,) = fake_tpu
     for got, want in zip(stepped, per_layer[0], strict=True):

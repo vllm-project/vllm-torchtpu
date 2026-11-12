@@ -882,6 +882,7 @@ def run_jax_gdn_attention_pooled_local(
     prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
     packed_metadata: jnp.ndarray | None = None,
     metadata_only: bool = False,
+    packed_size: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray] | jnp.ndarray:
     """GDN attention over the unified block pool.
 
@@ -954,6 +955,7 @@ def run_jax_gdn_attention_pooled_local(
         ),
         packed_metadata=packed_metadata,
         metadata_only=metadata_only,
+        packed_size=packed_size,
     )
     if metadata_only:
         return result
@@ -1025,6 +1027,7 @@ def run_jax_gdn_attention_pooled(
     prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
     packed_metadata: jnp.ndarray | None = None,
     metadata_only: bool = False,
+    packed_size: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray] | jnp.ndarray:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -1141,7 +1144,9 @@ def run_jax_gdn_attention_pooled(
         # the same on every rank (it is built from replicated step inputs).
         assert prefill_ckpt is None and step_metadata is None
         p_run_jax_gdn_attention_pooled_local = functools.partial(
-            p_run_jax_gdn_attention_pooled_local, metadata_only=metadata_only
+            p_run_jax_gdn_attention_pooled_local,
+            metadata_only=metadata_only,
+            packed_size=packed_size,
         )
         if metadata_only:
             out_specs = P(None)
