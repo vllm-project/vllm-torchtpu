@@ -718,6 +718,7 @@ def test_mla_requires_declared_g_proj():
 def test_mla_weight_layout_is_restored_on_error(layout):
     attention = VllmMLAAttention.__new__(VllmMLAAttention)
     torch.nn.Module.__init__(attention)
+    attention.dcp_q_replicate = False
     attention.kv_b_proj = torch.nn.Module()
     weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     parameter_name = "weight_packed" if layout == "packed" else "weight"
@@ -742,6 +743,80 @@ def test_mla_weight_layout_is_restored_on_error(layout):
     ):
         attention.process_weights_after_loading(torch.float32)
     torch.testing.assert_close(getattr(attention.kv_b_proj, parameter_name), weight)
+
+
+@pytest.mark.parametrize("with_scale", [False, True])
+def test_qrep_gather_replaces_the_parameter_upstream_registers(with_scale):
+    """Under qrep, upstream MLAAttention.process_weights_after_loading leaves
+    W_UK_T_dcp_qrep registered as a Parameter; the TPU gather must replace it
+    with one, since a module refuses a plain tensor under that name."""
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.dcp_q_replicate = True
+    w_uk_t = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    attention.W_UK_T = torch.nn.Parameter(w_uk_t, requires_grad=False)
+    if with_scale:
+        attention.W_UK_T_scale = torch.nn.Parameter(
+            torch.ones(2, 1, 4), requires_grad=False
+        )
+    # What upstream's replace_parameter leaves behind.
+    attention.W_UK_T_dcp_qrep = torch.nn.Parameter(
+        torch.zeros(4, 3, 4), requires_grad=False
+    )
+    group = SimpleNamespace(
+        world_size=2, all_gather=lambda t, dim: torch.cat([t, t + 100], dim=dim)
+    )
+    with patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op.get_dcp_group",
+        return_value=group,
+    ):
+        attention._gather_dcp_qrep_weights()
+    assert isinstance(attention.W_UK_T_dcp_qrep, torch.nn.Parameter)
+    torch.testing.assert_close(
+        attention.W_UK_T_dcp_qrep, torch.cat([w_uk_t, w_uk_t + 100])
+    )
+    if with_scale:
+        assert isinstance(attention.W_UK_T_dcp_qrep_scale, torch.nn.Parameter)
+        assert attention.W_UK_T_dcp_qrep_scale.shape == (4, 1, 4)
+    else:
+        assert attention.W_UK_T_dcp_qrep_scale is None
+
+
+def test_no_qrep_leaves_no_replicated_weights():
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.dcp_q_replicate = False
+    attention._gather_dcp_qrep_weights()
+    assert attention.W_UK_T_dcp_qrep is None
+    assert attention.W_UK_T_dcp_qrep_scale is None
+
+
+def test_upstream_weight_processing_runs_without_qrep():
+    """Upstream would gather W_UK_T across DCP as well; it must see the flag
+    off, and the flag must come back whether or not upstream raises."""
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.kv_b_proj = torch.nn.Module()
+    attention.kv_b_proj.register_parameter(
+        "weight", torch.nn.Parameter(torch.zeros(2, 3))
+    )
+    attention.dcp_q_replicate = True
+    seen = []
+
+    def upstream_process(act_dtype):
+        seen.append(attention.dcp_q_replicate)
+        raise RuntimeError("stop after upstream")
+
+    with (
+        patch(
+            "vllm.model_executor.layers.attention.mla_attention.MLAAttention.process_weights_after_loading",
+            side_effect=upstream_process,
+        ),
+        pytest.raises(RuntimeError, match="stop after upstream"),
+    ):
+        attention.process_weights_after_loading(torch.float32)
+    assert seen == [False]
+    assert attention.dcp_q_replicate is True
 
 
 def test_mla_flipped_projection_requires_weight():
@@ -1630,3 +1705,44 @@ def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, c
     )
     with pytest.raises(ValueError, match="Raiden GLM admission"):
         mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed, mode="sal")
+
+
+def test_sparse_page_size_packs_rope_by_default_on_sparsecore(monkeypatch):
+    """SparseCore sparse MLA packs the 64B fp8 RoPE cache to 8 tokens/row
+    (576 B/token total) by default; TensorCore keeps the 128B padded RoPE page
+    (640 B/token total), and TPU_SPARSE_MLA_PACKED_ROPE is removed."""
+    assert not hasattr(envs, "TPU_SPARSE_MLA_PACKED_ROPE")
+    block_size, fp8 = 256, torch.float8_e4m3fn
+    padded = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+        block_size, 1, 576, fp8
+    )
+    assert padded == 640 * block_size
+
+    nope, rope = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+        3, block_size, 576, fp8
+    )
+    assert nope.shape == (3, block_size, 128)
+    assert rope.shape == (3, block_size // 8, 128)
+    assert rope.token_bytes == 64
+    assert rope.tokens_per_row == 8
+    assert (
+        PallasMLAttentionBackend.get_sparse_kv_cache_page_size_bytes(
+            block_size, 576, fp8
+        )
+        == 576 * block_size
+        == padded - 64 * block_size
+    )
+
+    monkeypatch.setenv("TPU_SPARSE_MLA_NOPE_LAYOUT", "tensorcore")
+    monkeypatch.setenv("TPU_SPARSE_MLA_ROPE_LAYOUT", "tensorcore")
+    _, rope_tc = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+        3, block_size, 576, fp8
+    )
+    assert rope_tc.shape == (3, block_size // 4, 4, 128)
+    assert rope_tc.token_bytes == 128
+    assert (
+        PallasMLAttentionBackend.get_sparse_kv_cache_page_size_bytes(
+            block_size, 576, fp8
+        )
+        == padded
+    )

@@ -52,7 +52,10 @@ PACKING = 4
 TAPS = 3
 D_K = D_V = 128
 BF16 = 2
-LANE_BYTES = KERNEL_PAGE * BF16  # one BF16 conv row of carrier lanes
+# The unified GDN pool keeps the conv state in fp32 and stores it
+# segment-major ([Q heads | K heads | V heads] per tap); the SSM state here
+# stays BF16.
+CONV_BYTES = 4
 GRANULE = PACKING * KERNEL_PAGE
 SRC_STATE_BLOCK = 11
 DST_STATE_BLOCK = 77
@@ -75,7 +78,9 @@ class Topology:
     src_block: int = 384
     dst_block: int = 256
     head_dim: int = 32
-    qk_pair: bool = True
+    mtp: bool = False
+    ddp: int = 1
+    ddp_rank: int = 0
 
     @property
     def units(self) -> int:
@@ -89,14 +94,16 @@ class Topology:
 
     def stage_layers(self, stage: int) -> list[int]:
         first = stage * self.layers_per_stage
-        return list(range(first, first + self.layers_per_stage))
+        layers = list(range(first, first + self.layers_per_stage))
+        if self.mtp and stage == self.pp - 1:
+            layers.append(self.pp * self.layers_per_stage)
+        return layers
 
     def layers(self) -> list[int]:
-        return list(range(self.pp * self.layers_per_stage))
+        return list(range(self.pp * self.layers_per_stage + int(self.mtp)))
 
-
-def is_fa(layer: int) -> bool:
-    return layer % 2 == 1
+    def is_fa(self, layer: int) -> bool:
+        return layer % 2 == 1 or (self.mtp and layer == self.pp * self.layers_per_stage)
 
 
 # A hybrid model with 4 KV heads and 16 key / 128 value GDN heads, and a small
@@ -125,9 +132,7 @@ PP2_PCP2 = Topology(
     kv_heads=2,
     key_heads=16,
     value_heads=32,
-    qk_pair=False,
 )
-PP2_PCP2_QK_PAIR = dataclasses.replace(PP2_PCP2, qk_pair=True)
 # The same model at half width: 2 KV heads, 8 key / 64 value GDN heads.
 HALF_PCP8_TP2 = Topology(
     pp=1,
@@ -214,27 +219,14 @@ def _head_row(
     return np.uint32((layer << 25) | (tap << 23) | (kind << 21) | (head << 14)) + word
 
 
-def _conv_state(
-    layer: int, key_heads: list[int], value_heads: list[int], qk_pair: bool
-) -> np.ndarray:
-    """Per tap: stored Q/K block then V. The QK pair-blocked layout stores
-    [Q row, K row] pairs of the pooled kernel's logical row width."""
+def _conv_state(layer: int, key_heads: list[int], value_heads: list[int]) -> np.ndarray:
+    """Per tap: the fp32 Q heads, K heads, then V heads."""
     taps = []
     for tap in range(TAPS):
-        q = np.concatenate([_head_row(layer, tap, 0, h, D_K * BF16) for h in key_heads])
-        k = np.concatenate([_head_row(layer, tap, 1, h, D_K * BF16) for h in key_heads])
-        v = np.concatenate(
-            [_head_row(layer, tap, 2, h, D_V * BF16) for h in value_heads]
-        )
-        if qk_pair:
-            row_bytes = 4 * (q.size + k.size + v.size)
-            width = math.gcd(row_bytes, LANE_BYTES, 4 * q.size) // 4
-            qk = np.stack((q.reshape(-1, width), k.reshape(-1, width)), axis=1).reshape(
-                -1
-            )
-        else:
-            qk = np.concatenate((q, k))
-        taps.append(np.concatenate((qk, v)))
+        q = [_head_row(layer, tap, 0, h, D_K * CONV_BYTES) for h in key_heads]
+        k = [_head_row(layer, tap, 1, h, D_K * CONV_BYTES) for h in key_heads]
+        v = [_head_row(layer, tap, 2, h, D_V * CONV_BYTES) for h in value_heads]
+        taps.append(np.concatenate(q + k + v))
     return np.concatenate(taps).view(np.uint8)
 
 
@@ -271,7 +263,7 @@ def _manifest(
         value_head_dim=D_V,
     )
     conv_regions = rpm._gdn_conv_regions(
-        conv_shape=(64, TAPS, gdn.conv_dim), itemsize=BF16, geometry=gdn
+        conv_shape=(64, TAPS, gdn.conv_dim), itemsize=CONV_BYTES, geometry=gdn
     )
     ssm_regions = rpm._gdn_ssm_regions(
         ssm_shape=(64, value_heads, D_V, D_K), itemsize=BF16
@@ -284,7 +276,7 @@ def _manifest(
 
     pools = []
     for layer in layers:
-        if is_fa(layer):
+        if topo.is_fa(layer):
             pools.append(
                 rpm.PoolEntry(
                     tag("fa", layer),
@@ -310,7 +302,7 @@ def _manifest(
                 stride,
                 64,
                 conv_regions,
-                "bfloat16",
+                "float32",
             )
         )
         pools.append(
@@ -392,7 +384,8 @@ def _environment(monkeypatch, topo: Topology, per_layer_tags: bool) -> None:
     _set_env("TPU_RAIDEN_DST_SHARDS", topo.dtp)
     _set_env("TPU_RAIDEN_CONTROLLER_ADDRESS", CONTROLLER)
     _set_env("TPU_RAIDEN_POOL_TAGS_PER_LAYER", per_layer_tags)
-    _set_env("TPU_GDN_CONV_QK_PAIR_LAYOUT", topo.qk_pair)
+    # The unified pool's manifest rejects the QK pair-blocked layout.
+    _set_env("TPU_GDN_CONV_QK_PAIR_LAYOUT", False)
 
 
 def _set_model(config, topo: Topology) -> None:
@@ -511,9 +504,9 @@ def _produce(monkeypatch, topo: Topology, num_tokens: int, per_layer_tags: bool)
                     topo.key_heads, topo.value_heads, gdn_degree, t * topo.pcp + p
                 )
                 for layer in topo.stage_layers(stage):
-                    if not is_fa(layer):
+                    if not topo.is_fa(layer):
                         memory[(unit, layer, "conv", SRC_STATE_BLOCK)] = _conv_state(
-                            layer, key_heads, value_heads, topo.qk_pair
+                            layer, key_heads, value_heads
                         )
                         memory[(unit, layer, "ssm", SRC_STATE_BLOCK)] = _ssm_state(
                             layer, value_heads
@@ -544,7 +537,11 @@ def _decode_request(monkeypatch, topo: Topology, params: dict, per_layer_tags: b
     _set_env("TPU_RAIDEN_ENGINE_ID", "decode")
     num_tokens = params["num_tokens"]
     scheduler = _make_raiden_scheduler(
-        is_producer=False, tp_size=topo.dtp, block_size=topo.dst_block
+        is_producer=False,
+        tp_size=topo.dtp,
+        block_size=topo.dst_block,
+        dp_size=topo.ddp,
+        dp_rank=topo.ddp_rank,
     )
     scheduler.vllm_config.parallel_config.decode_context_parallel_size = topo.dcp
     scheduler._stage3_mamba_group_indices = [1]
@@ -567,12 +564,19 @@ def _decode_request(monkeypatch, topo: Topology, params: dict, per_layer_tags: b
     assert load.mamba_state_block_ids == [DST_STATE_BLOCK]
 
     worker = _make_raiden_worker(
-        is_producer=False, tp_rank=0, tp_size=topo.dtp, block_size=topo.dst_block
+        is_producer=False,
+        tp_rank=0,
+        tp_size=topo.dtp,
+        block_size=topo.dst_block,
+        dp_size=topo.ddp,
+        dp_rank=topo.ddp_rank,
     )
     worker.vllm_config.parallel_config.decode_context_parallel_size = topo.dcp
     _set_model(worker.vllm_config, topo)
     assert worker._raiden_qwen35_admission_topology() == (
-        f"tp{topo.dtp}dcp{topo.dcp}_decode"
+        f"dp{topo.ddp}tp{topo.dtp}_decode"
+        if topo.ddp > 1
+        else f"tp{topo.dtp}dcp{topo.dcp}_decode"
     )
     geometry = worker._gdn_head_geometry()
     manifest = _manifest(
@@ -785,10 +789,10 @@ def _check_destination(
             topo.key_heads, topo.value_heads, topo.dtp, d
         )
         for layer in topo.layers():
-            if not is_fa(layer):
+            if not topo.is_fa(layer):
                 np.testing.assert_array_equal(
                     dst_memory[(d, layer, "conv", DST_STATE_BLOCK)],
-                    _conv_state(layer, key_heads, value_heads, topo.qk_pair),
+                    _conv_state(layer, key_heads, value_heads),
                 )
                 np.testing.assert_array_equal(
                     dst_memory[(d, layer, "ssm", DST_STATE_BLOCK)],
@@ -865,12 +869,9 @@ def test_pcp16_tp2_to_tp32_dcp8_oracle(monkeypatch, num_tokens, per_layer_tags):
     _run_oracle(monkeypatch, PCP16_TP2, num_tokens, per_layer_tags)
 
 
-@pytest.mark.parametrize(
-    "topo", [PP2_PCP2, PP2_PCP2_QK_PAIR], ids=["split-qkv", "qk-pair"]
-)
 @pytest.mark.parametrize("num_tokens", TOKENS)
-def test_pp2_pcp2_to_tp4_dcp2_oracle(monkeypatch, topo, num_tokens):
-    _run_oracle(monkeypatch, topo, num_tokens, True)
+def test_pp2_pcp2_to_tp4_dcp2_oracle(monkeypatch, num_tokens):
+    _run_oracle(monkeypatch, PP2_PCP2, num_tokens, True)
 
 
 @pytest.mark.parametrize(
@@ -910,7 +911,7 @@ def test_replicated_fa_head_deals_copies_oracle(monkeypatch, num_tokens):
 
 def test_oracle_rejects_a_misrouted_span(monkeypatch):
     """The coverage port fails on a destination gap or overlap."""
-    topo = PP2_PCP2_QK_PAIR
+    topo = PP2_PCP2
     _environment(monkeypatch, topo, True)
     params, registrations, src_pools, src_live, src_memory = _produce(
         monkeypatch, topo, 1000, True
@@ -939,40 +940,13 @@ def test_oracle_rejects_a_misrouted_span(monkeypatch):
         )
 
 
-@pytest.mark.parametrize(
-    "keys,values,degree",
-    [(16, 128, 8), (16, 32, 2), (16, 32, 4), (16, 128, 32), (4, 32, 16)],
-)
-def test_stored_conv_order_matches_kernel_rows_perm(keys, values, degree):
-    """The oracle's stored conv order is the pooled kernel's rows_perm."""
-    pytest.importorskip("jax")
-    from vllm_torchtpu.kernels import pool_adapters
-
-    key_heads, value_heads = _gdn_heads(keys, values, degree, 0)
-    conv_dim = 2 * len(key_heads) * D_K + len(value_heads) * D_V
-    stored = _conv_state(3, key_heads, value_heads, True).view(np.uint32)
-    logical = _conv_state(3, key_heads, value_heads, False).view(np.uint32)
-    lanes = LANE_BYTES // BF16
-    width = math.gcd(math.gcd(conv_dim, lanes), len(key_heads) * D_K)
-    perm = pool_adapters._conv_qk_pair_rows_perm(
-        TAPS, conv_dim, len(value_heads), D_V, width
-    )
-    row_words = width * BF16 // 4
-    stored_rows = stored.reshape(-1, row_words)
-    logical_rows = logical.reshape(-1, row_words)
-    if perm is None:
-        np.testing.assert_array_equal(stored_rows, logical_rows)
-    else:
-        np.testing.assert_array_equal(stored_rows[list(perm)], logical_rows)
-
-
 # ---------------------------------------------------------------------------
 # GDN fan-out lowering on its own.
 # ---------------------------------------------------------------------------
 
 
-def _state_regions(kind: str, keys: int, values: int, degree: int, qk_pair: bool):
-    _set_env("TPU_GDN_CONV_QK_PAIR_LAYOUT", qk_pair)
+def _state_regions(kind: str, keys: int, values: int, degree: int):
+    _set_env("TPU_GDN_CONV_QK_PAIR_LAYOUT", False)
     key_heads, value_heads = _gdn_heads(keys, values, degree, 0)
     if kind == "ssm":
         return rpm._gdn_ssm_regions(
@@ -985,34 +959,31 @@ def _state_regions(kind: str, keys: int, values: int, degree: int, qk_pair: bool
         value_head_dim=D_V,
     )
     return rpm._gdn_conv_regions(
-        conv_shape=(4, TAPS, gdn.conv_dim), itemsize=BF16, geometry=gdn
+        conv_shape=(4, TAPS, gdn.conv_dim), itemsize=CONV_BYTES, geometry=gdn
     )
 
 
 @pytest.mark.parametrize(
-    "src,dst,keys,values,qk_pair",
+    "src,dst,keys,values",
     [
-        (8, 32, 16, 128, True),  # PP4 x PCP8 -> TP32: Q/K replication 1 -> 2.
-        (2, 4, 16, 32, True),  # Destinations keep four key heads.
-        (2, 4, 16, 32, False),
-        (4, 8, 16, 32, False),
-        (4, 16, 4, 32, True),  # Q/K replication 1 -> 4.
-        (8, 16, 4, 32, True),  # Q/K replicated on both sides, 2 -> 4.
-        (8, 16, 8, 64, True),  # Half-scale PP2 x PCP8 -> TP16.
+        (8, 32, 16, 128),  # PP4 x PCP8 -> TP32: Q/K replication 1 -> 2.
+        (2, 4, 16, 32),  # Destinations keep four key heads.
+        (4, 8, 16, 32),
+        (4, 16, 4, 32),  # Q/K replication 1 -> 4.
+        (8, 16, 4, 32),  # Q/K replicated on both sides, 2 -> 4.
+        (8, 16, 8, 64),  # Half-scale PP2 x PCP8 -> TP16.
     ],
 )
 @pytest.mark.parametrize("kind", ["conv", "ssm"])
-def test_gdn_fanout_reassembles_destination_states(
-    src, dst, keys, values, qk_pair, kind
-):
-    regions = _state_regions(kind, keys, values, src, qk_pair)
+def test_gdn_fanout_reassembles_destination_states(src, dst, keys, values, kind):
+    regions = _state_regions(kind, keys, values, src)
     tag = f"gdn.{kind}.g0.l2"
 
     def state(degree, rank):
         key_heads, value_heads = _gdn_heads(keys, values, degree, rank)
         if kind == "ssm":
             return _ssm_state(2, value_heads)
-        return _conv_state(2, key_heads, value_heads, qk_pair)
+        return _conv_state(2, key_heads, value_heads)
 
     received = [np.full(state(dst, d).size, DST_FILL, np.uint8) for d in range(dst)]
     coverage = [np.zeros(x.size, np.int32) for x in received]
@@ -1028,7 +999,6 @@ def test_gdn_fanout_reassembles_destination_states(
             physical_granule_bytes=GRANULE,
             num_key_heads=keys,
             num_value_heads=values,
-            conv_lane_bytes=LANE_BYTES,
         )
         fan_out = dst // src
         assert reg.block_ids == (9,)
@@ -1055,9 +1025,8 @@ def test_gdn_fanout_reassembles_destination_states(
 @pytest.mark.parametrize(
     "overrides,match",
     [
-        ({"conv_lane_bytes": 512}, "row pairs differ"),
+        # One 128-wide fp32 key head is 512 B, half a 1024 B granule.
         ({"physical_granule_bytes": 1024}, "physical granule"),
-        ({"conv_lane_bytes": None}, "lane width"),
         ({"num_key_heads": None}, "head counts"),
         ({"dst_shards": 12}, "must divide"),
     ],
@@ -1068,13 +1037,44 @@ def test_gdn_fanout_fails_closed(overrides, match):
         block_id=9,
         transfer_rank=3,
         parallelism=8,
-        regions=_state_regions("conv", 16, 128, 8, True),
+        regions=_state_regions("conv", 16, 128, 8),
         dst_shards=32,
         physical_granule_bytes=GRANULE,
         num_key_heads=16,
         num_value_heads=128,
-        conv_lane_bytes=LANE_BYTES,
     )
     args.update(overrides)
     with pytest.raises(sol.SeqOnLaneError, match=match):
         sol.lower_gdn_state_shard_spans_sol(**args)
+
+
+@pytest.mark.parametrize("tokens", [127, 128, 129, 8191])
+@pytest.mark.parametrize("pp,dtp", [(2, 16), (4, 32)])
+def test_pipeline_mtp_fans_out_only_from_last_stage(monkeypatch, tokens, pp, dtp):
+    topo = dataclasses.replace(PP4_PCP8, pp=pp, dtp=dtp, dcp=dtp // 4, mtp=True)
+    registrations, _ = _run_oracle(monkeypatch, topo, tokens, True)
+    draft_layer = pp * topo.layers_per_stage
+    for unit, entries in registrations.items():
+        stage = _unit_rank(unit) // topo.pcp
+        for entry in entries:
+            if split_layer_tag(entry.tag)[1] == draft_layer:
+                assert stage == pp - 1
+                assert class_tag(entry.tag) == "fa"
+
+
+@pytest.mark.parametrize("mtp", [False, True])
+@pytest.mark.parametrize("dp_rank", range(8))
+@pytest.mark.parametrize("num_tokens", [127, 129, 1000, 8191])
+def test_pp4_pcp8_to_dp8_tp4_oracle(monkeypatch, dp_rank, num_tokens, mtp):
+    topo = dataclasses.replace(PP4_PCP8, dtp=4, dcp=1, ddp=8, ddp_rank=dp_rank, mtp=mtp)
+    registrations, transfer = _run_oracle(monkeypatch, topo, num_tokens, True)
+    assert len(transfer["src_units"]) == 32
+    assert len(transfer["dst_units"]) == 4
+    assert all(
+        dict(unit)["data_replica_idx"] == dp_rank for unit in transfer["dst_units"]
+    )
+    for unit, entries in registrations.items():
+        stage = _unit_rank(unit) // topo.pcp
+        assert {split_layer_tag(e.tag)[1] for e in entries} <= set(
+            topo.stage_layers(stage)
+        )

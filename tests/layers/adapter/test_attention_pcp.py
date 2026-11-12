@@ -987,6 +987,26 @@ def test_forward_remaps_block_tables_for_the_block_major_pool(
         assert passed is block_tables
 
 
+def test_forward_accepts_missing_key_value_on_kv_shared_layer(
+    monkeypatch, cpu_vllm_config_context
+):
+    """vLLM passes key=value=None to KV-shared layers; the kernel still gets
+    K/V operands of the layer's shape and runs with skip_kv_update."""
+    captured = _capture_kernel(monkeypatch)
+    query, _, _, kv_cache = _tensors()
+    impl = _impl(kv_sharing_target_layer_name="shared")
+
+    with set_vllm_model_wrapper_context(
+        mesh=_mesh(), vllm_config=_vllm_config(pcp_size=1)
+    ):
+        outputs = impl.forward(_layer(), query, None, None, kv_cache, _metadata())
+
+    assert captured["build"]["skip_kv_update"] is True
+    key, value = captured["args"][2:4]
+    assert key.shape == value.shape == (query.shape[0], 1, 128)
+    assert outputs.shape == query.shape
+
+
 def test_build_rpa_kernel_rejects_an_entry_without_block_major(
     monkeypatch, cpu_vllm_config_context
 ):

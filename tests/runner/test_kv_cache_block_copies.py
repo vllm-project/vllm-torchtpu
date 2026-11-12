@@ -24,6 +24,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 import vllm_torchtpu
 import vllm_torchtpu.runner.tpu_runner as runner_mod
+from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.utils import tpu_bind_kv_cache
 
@@ -34,6 +35,7 @@ def _runner_with_raw_tensors(raw_tensors):
     runner._mamba_state_pos = {}
     runner._mamba_offset_seeded = set()
     runner._pre_async_results = None
+    runner._min_tokens = MinTokensTracker()
     runner._unified_kv_layout = bool(raw_tensors)
     runner.kv_cache_raw_tensors = raw_tensors
     runner._install_spec_token_room_guard = lambda: None

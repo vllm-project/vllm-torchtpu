@@ -92,3 +92,48 @@ def test_end_event_is_logged_when_the_block_raises(
 def test_names_with_whitespace_are_rejected() -> None:
     with pytest.raises(ValueError, match="whitespace"):
         trace("export load")
+
+
+def test_saving_the_checkpoint_is_a_span(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_torchtpu.experimental.export import checkpoint
+
+    saved = []
+    monkeypatch.setattr(checkpoint, "abstract_params_inputs", lambda _: [])
+    monkeypatch.setattr(checkpoint, "mesh_axis_sizes", lambda _: {})
+    monkeypatch.setattr(checkpoint, "iter_checkpoint_shards", lambda *_: iter(()))
+    monkeypatch.setattr(checkpoint, "save_checkpoint", lambda *a: saved.append(a))
+    checkpoint.save_model_checkpoint({}, "artifact", "artifact/data")
+    assert len(saved) == 1
+    names = [e[1] for e in _events(capsys.readouterr().err)]
+    assert names == ["export.save_checkpoint"] * 2
+
+
+@pytest.mark.parametrize(
+    ("load_format", "span"),
+    [("auto", "export.load_safetensors"), ("dummy", "export.load_dummy_weights")],
+)
+def test_loading_the_weights_is_a_span(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    load_format: str,
+    span: str,
+) -> None:
+    import types
+
+    from vllm.model_executor import model_loader
+
+    from vllm_torchtpu.experimental.export import universal_adapter
+
+    class Loader:
+        def load_model(self, *, vllm_config: object, model_config: object) -> str:
+            return "model"
+
+    monkeypatch.setattr(model_loader, "get_model_loader", lambda _: Loader())
+    config = types.SimpleNamespace(
+        load_config=types.SimpleNamespace(load_format=load_format), model_config=None
+    )
+    assert universal_adapter.run_model_loader(config) == "model"
+    names = [e[1] for e in _events(capsys.readouterr().err)]
+    assert names == [span] * 2

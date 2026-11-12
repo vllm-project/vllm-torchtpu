@@ -1005,6 +1005,11 @@ def _effective_row_lengths(
 ) -> jax.Array:  # i32[num_tokens]
     """Visible compressed KV positions per token row of the score matrix.
 
+    A token sees only the (token_pos + 1) // compression_ratio groups complete
+    at or before it. In a multi-token forward (chunked prefill, speculative
+    verify) its own group can already be in the cache, completed by a later
+    token of the same forward, but that entry covers tokens after it.
+
     Under context parallelism the score matrix is rank-local, so the row length
     is the number of globally-visible positions that *this* rank owns.
     """
@@ -1020,7 +1025,7 @@ def _effective_row_lengths(
     seq_len = seq_lens[seq_ids]
     token_pos = seq_len - q_len + (token_ids - q_start)
     kv_len = seq_len // compression_ratio
-    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    visible = jnp.minimum(kv_len, (token_pos + 1) // compression_ratio)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
     valid = token_ids < cu_q_lens[num_seqs]
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
@@ -1607,22 +1612,18 @@ def streamindex_topk(
         return out, scores_out
 
     def _fast_path(_):
-        token_idx = jnp.arange(q.shape[0])
-        seq_idx = jnp.minimum(
-            jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
-            seq_lens.shape[0] - 1,
+        # Every visible position wins, so a row is just its first row-length
+        # positions. Shares the scoring path's row lengths so the two agree.
+        row_lengths = _effective_row_lengths(
+            seq_lens=seq_lens,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            num_tokens=q.shape[0],
+            num_positions=k,
+            compression_ratio=compression_ratio,
         )
-        seq_len = seq_lens[seq_idx]
-        q_len = cu_q_lens[seq_idx + 1] - cu_q_lens[seq_idx]
-        q_start = cu_q_lens[seq_idx]
-        q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
-        max_valid_idx = jnp.minimum(
-            seq_len // compression_ratio - 1,
-            q_abs_pos // compression_ratio,
-        )
-        max_valid_idx = jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
-        return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
+        return jnp.where(s_idx < row_lengths[:, None], s_idx, -1)
 
     if not enable_early_exit:
         return _common_path(None)
