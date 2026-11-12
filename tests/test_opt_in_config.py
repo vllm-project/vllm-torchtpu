@@ -44,11 +44,15 @@ REPLACED_ENV = {
     "spec_synthetic_one_row_verify": "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY",
     "spec_warmup_sweep_token_buckets": "TPU_SPEC_WARMUP_SWEEP_TOKEN_BUCKETS",
     "minimax_indexer_large_pages_per_step": "TPU_MINIMAX_M3_INDEXER_LARGE_PAGES_PER_STEP",
+    "gmm_v2_prefill_tiles": "TPU_GMM_V2_PREFILL_TILES",
+    "gmm_v2_decode_w13": "TPU_GMM_V2_DECODE_W13",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
     "minimax_split_min_tokens": 4096,
     "minimax_indexer_large_pages_per_step": 64,
+    "gmm_v2_prefill_tiles": "256:128/256@12288",
+    "gmm_v2_decode_w13": "3072:2:2",
 }
 # Dropped with no key: hid the offload connector from draft forwards, which
 # v3's skip_draft_kv unbinding already covers in every served config.

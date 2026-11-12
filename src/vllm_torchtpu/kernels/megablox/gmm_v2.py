@@ -1242,6 +1242,7 @@ def gmm_vmem_estimate(
     lhs_cfgs: InputConfigs,
     rhs_cfgs: InputConfigs,
     fuse_act: str | None,
+    rhs_buffer_count: int = 3,
 ) -> int:
     """VMEM a gmm_v2 pipeline with these tiles needs."""
     lhs_bits = jax.dtypes.itemsize_bits(lhs_cfgs.dtype)
@@ -1267,7 +1268,7 @@ def gmm_vmem_estimate(
     if rhs_cfgs.has_bias:
         rhs_bias_vmem = tn * 4
     rhs_vmem = fuse_act_factor * (
-        3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
+        rhs_buffer_count * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
     )
 
     # 3. Accumulator
@@ -1282,6 +1283,139 @@ def gmm_vmem_estimate(
     return lhs_vmem + rhs_vmem + acc_vmem + out_vmem
 
 
+# Opt-in tile overrides for fp4-rhs (NVFP4 W4A16) calls on one k tile, set
+# from --additional-config before the model's first trace
+# (`set_tile_overrides`; default "" each: tiles unchanged).
+#   gmm_v2_prefill_tiles="<tile_m>:<bucket>/.../<tile_m>[@<max size_m>]":
+#     calls above FP8_DECODE_MAX_M rows (prefill / mixed steps). Buckets of
+#     at most FP8_RHS_MAX_BUCKET_M rows take the fp8 rhs feed (as decode tiles
+#     do); larger ones dequantize before the matmul. "256:128/256" (or
+#     "256:128,256") keeps every bucket on the default numerics. An optional
+#     "@<max size_m>" suffix limits it to calls of at most that many rows.
+#   gmm_v2_decode_w13="<tile_n>:<gate_up buffers>[:<down buffers>]":
+#     decode-sized buffers. Up to FP8_SMALL_DECODE_MAX_M rows the gate_up
+#     (fused activation) call takes tile_n and its rhs pipeline depth and the
+#     down call its own depth; above it, up to FP8_DECODE_MAX_M rows, only
+#     the gate_up depth applies (a wider tile_n stops kernel_mlp's fusion,
+#     which costs more there than it saves).
+PREFILL_TILES_KEY = "gmm_v2_prefill_tiles"
+DECODE_W13_KEY = "gmm_v2_decode_w13"
+_prefill_tiles: tuple[int, tuple[int, ...], int | None] | None = None
+_decode_w13: tuple[int, int, int] | None = None
+_tile_override_specs: dict[str, str] = {}
+
+
+def _parse_prefill_tiles(raw: str) -> tuple[int, tuple[int, ...], int | None] | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    spec, _, max_m = raw.partition("@")
+    tm, _, bks = spec.partition(":")
+    # "," or "/" between buckets.
+    buckets = tuple(
+        sorted({int(b) for b in bks.replace("/", ",").split(",") if b.strip()})
+    )
+    if not buckets or buckets[-1] != int(tm):
+        raise ValueError(f"{PREFILL_TILES_KEY}={raw!r}: buckets must end at tile_m")
+    return int(tm), buckets, int(max_m) if max_m else None
+
+
+def _parse_decode_w13(raw: str) -> tuple[int, int, int] | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    parts = [int(x) for x in raw.split(":")]
+    return (parts[0], *(parts[1:] + [3, 3])[:2])
+
+
+def set_tile_overrides(prefill_tiles: str = "", decode_w13: str = "") -> None:
+    """Keys gmm_v2_prefill_tiles / gmm_v2_decode_w13 ("" = off)."""
+    global _prefill_tiles, _decode_w13
+    _prefill_tiles = _parse_prefill_tiles(prefill_tiles)
+    _decode_w13 = _parse_decode_w13(decode_w13)
+    _tile_override_specs.clear()
+    _tile_override_specs.update(
+        {PREFILL_TILES_KEY: prefill_tiles, DECODE_W13_KEY: decode_w13}
+    )
+    _tile_override_logged.clear()
+
+
+def tile_overrides_active() -> bool:
+    return _prefill_tiles is not None or _decode_w13 is not None
+
+
+_tile_override_logged: set[str] = set()
+
+
+def _log_tile_override_once(name: str, dims: Dimensions, tiles: TileSizes) -> None:
+    if name in _tile_override_logged:
+        return
+    _tile_override_logged.add(name)
+    logger.info(
+        "gmm_v2 tile override %s=%s applied (size_m=%d k=%d n=%d): %s",
+        name,
+        _tile_override_specs.get(name),
+        dims.size_m,
+        dims.size_k,
+        dims.size_n,
+        tiles,
+    )
+
+
+def _apply_tile_overrides(
+    tiles: TileSizes,
+    dims: Dimensions,
+    lhs_cfgs: InputConfigs,
+    rhs_cfgs: InputConfigs,
+    vmem_limit_bytes: int,
+    fuse_act: str | None,
+) -> TileSizes:
+    prefill, decode_w13 = _prefill_tiles, _decode_w13
+    if (prefill is None and decode_w13 is None) or (
+        tiles.tile_k != align_to(dims.size_k, pltpu.get_tpu_info().num_lanes)
+        or fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is None
+    ):
+        return tiles
+    new, name = None, None
+    if prefill is not None and dims.size_m > FP8_DECODE_MAX_M:
+        tile_m, buckets, max_m = prefill
+        sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
+        if all(b % sublane == 0 for b in buckets) and (
+            max_m is None or dims.size_m <= max_m
+        ):
+            new = dataclasses.replace(
+                tiles, tile_m=tile_m, bucket_base=buckets[0], buckets=buckets
+            )
+            name = PREFILL_TILES_KEY
+    elif decode_w13 is not None and dims.size_m <= FP8_DECODE_MAX_M:
+        tile_n, buffers_gate_up, buffers_down = decode_w13
+        if dims.size_m > FP8_SMALL_DECODE_MAX_M:
+            if fuse_act is not None:
+                new = dataclasses.replace(tiles, rhs_buffer_count=buffers_gate_up)
+        elif fuse_act is None:
+            new = dataclasses.replace(tiles, rhs_buffer_count=buffers_down)
+        elif (dims.size_n // 2) % tile_n == 0:
+            new = dataclasses.replace(
+                tiles, tile_n=tile_n, rhs_buffer_count=buffers_gate_up
+            )
+        name = DECODE_W13_KEY
+    if new is None:
+        return tiles
+    est = gmm_vmem_estimate(
+        new.tile_m,
+        new.tile_n,
+        new.tile_k,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs,
+        fuse_act=fuse_act,
+        rhs_buffer_count=new.rhs_buffer_count,
+    )
+    if est > vmem_limit_bytes:
+        return tiles
+    _log_tile_override_once(name, dims, new)
+    return new
+
+
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -1290,6 +1424,21 @@ def calculate_tiling(
     fuse_act: str | None = None,
 ) -> TileSizes:
     """Calculate optimal tile sizes for GMM kernel."""
+    tiles = _calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+    if not tile_overrides_active():
+        return tiles
+    return _apply_tile_overrides(
+        tiles, dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act
+    )
+
+
+def _calculate_tiling(
+    dims: Dimensions,
+    lhs_cfgs: InputConfigs,
+    rhs_cfgs: InputConfigs,
+    vmem_limit_bytes: int,
+    fuse_act: str | None = None,
+) -> TileSizes:
 
     rhs_dtype = rhs_cfgs.quant_dtype or rhs_cfgs.dtype
     rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
@@ -1994,6 +2143,11 @@ def _mlp_tiles(cfgs: GmmConfigs) -> bool:
 def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) -> bool:
     """Whether kernel_mlp can run both gmms on one fill_metadata layout."""
 
+    # The rhs pipeline depth counts only under the opt-in tile overrides
+    # (`set_tile_overrides`); otherwise every pipeline is estimated 3-deep.
+    def depth(t):
+        return t.rhs_buffer_count if tile_overrides_active() else 3
+
     def vmem(cfgs):
         t = cfgs.tiles
         return gmm_vmem_estimate(
@@ -2003,6 +2157,7 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
             lhs_cfgs=cfgs.lhs_cfgs,
             rhs_cfgs=cfgs.rhs_cfgs,
             fuse_act=cfgs.fuse_act,
+            rhs_buffer_count=depth(t),
         )
 
     # The prefetch window (2 down weight blocks) lives through both pipelines;
@@ -2020,7 +2175,8 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
 
     fits = (
         vmem(cfgs1) + scratch(cfgs2) + window <= vmem_limit_bytes
-        and vmem(cfgs2) - 3 * block2 + scratch(cfgs1) + window <= vmem_limit_bytes
+        and vmem(cfgs2) - depth(t2) * block2 + scratch(cfgs1) + window
+        <= vmem_limit_bytes
     )
     return (
         fits

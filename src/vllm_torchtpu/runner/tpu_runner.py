@@ -5968,6 +5968,18 @@ class TPUModelRunner(GPUModelRunner):
                 "MoE gmm_v2 fp8 decode tiles on (additional_config "
                 "moe_gmm_fp8_decode_tiles)"
             )
+        gmm_prefill_tiles = option(additional, "gmm_v2_prefill_tiles")
+        gmm_decode_w13 = option(additional, "gmm_v2_decode_w13")
+        if gmm_prefill_tiles or gmm_decode_w13:
+            from vllm_torchtpu.kernels.megablox import gmm_v2
+
+            gmm_v2.set_tile_overrides(gmm_prefill_tiles, gmm_decode_w13)
+            logger.info(
+                "MoE gmm_v2 tile overrides: gmm_v2_prefill_tiles=%r "
+                "gmm_v2_decode_w13=%r",
+                gmm_prefill_tiles,
+                gmm_decode_w13,
+            )
         if isinstance(additional, dict) and "moe_gmm_tuned_tiles" in additional:
             from vllm_torchtpu.kernels.megablox import gmm_v2
 

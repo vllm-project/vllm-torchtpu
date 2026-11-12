@@ -83,6 +83,13 @@ DEFAULTS: dict[str, bool | int | str] = {
     # class, a positive multiple of 32 (0 = the default 32). Wider steps
     # amortize the per-step cost over more pages; same scores.
     "minimax_indexer_large_pages_per_step": 0,
+    # gmm_v2 tiles of fp4-rhs calls above FP8_DECODE_MAX_M rows:
+    # "<tile_m>:<bucket>/.../<tile_m>[@<max size_m>]" ("" = off;
+    # `gmm_v2.set_tile_overrides`). Same numerics per bucket.
+    "gmm_v2_prefill_tiles": "",
+    # gmm_v2 decode-sized gate_up / down calls:
+    # "<tile_n>:<gate_up buffers>[:<down buffers>]" ("" = off). Same bits.
+    "gmm_v2_decode_w13": "",
 }
 
 
