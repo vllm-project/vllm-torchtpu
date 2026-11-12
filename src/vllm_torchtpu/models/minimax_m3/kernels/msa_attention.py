@@ -33,6 +33,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import tight_vmem
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     check_page_dtype,
     slot_ids,
@@ -522,7 +523,7 @@ def _attention_call(
             pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
         ],
     )
-    out = pl.pallas_call(
+    out = tight_vmem.pallas_call(
         functools.partial(
             _KERNELS[kernel],
             sm_scale=sm_scale,
