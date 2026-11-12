@@ -18,7 +18,7 @@ import copy
 import dataclasses
 import functools
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -74,7 +74,7 @@ def _static_shape_args(fn):
 
     That is how `propose` used to die on its first draft step: `_forward_draft`
     runs the draft model on `positions`, marking it, and the very next line
-    passed the same object to `_draft_gather_carries`. It presented as flaky and
+    passed the same object to `_draft_gather_rows`. It presented as flaky and
     rank-dependent only because a warm compile cache short-circuits the backend
     call, so whether it fired depended on cache state rather than on shapes.
 
@@ -123,6 +123,55 @@ def _maybe_pad_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
     if target_len <= n:
         return t
     return torch.nn.functional.pad(t, (0, target_len - n))
+
+
+def _narrow_target_md(
+    target_md: dict[str, AttentionMetadata],
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    request_distribution: torch.Tensor,
+) -> dict[str, AttentionMetadata]:
+    """The target's step-0 metadata with one query per request: the three
+    per-request fields replaced, block tables kept. Layers that share one
+    metadata object keep sharing one."""
+    replaced: dict[int, AttentionMetadata] = {}
+    result = {}
+    for name, md in target_md.items():
+        if id(md) not in replaced:
+            # AttentionMetadata annotates these fields with the kernels'
+            # jax.Array; the runner fills them with torch tensors, as every
+            # builder of it does.
+            replaced[id(md)] = dataclasses.replace(
+                md,
+                # pyrefly: ignore[bad-argument-type]
+                seq_lens=seq_lens,
+                # pyrefly: ignore[bad-argument-type]
+                query_start_loc=query_start_loc,
+                # pyrefly: ignore[bad-argument-type]
+                request_distribution=request_distribution,
+            )
+        result[name] = replaced[id(md)]
+    return result
+
+
+def _step0_gather_indices(
+    last_token_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`(owner_mask, safe_gather_indices)` of step 0's per-request rows.
+
+    Clamped, not raw: a PCP-localized index is -1 for a row this rank does not
+    own, and -1 would wrap to the last row; the mask drops those rows later.
+    """
+    return last_token_indices.ge(0), last_token_indices.clamp_min(0)
+
+
+class _ChunkLoopInputs(NamedTuple):
+    """A chunk's one-query-per-request attention inputs, shared by every loop
+    step (and by pass 2 of a two-pass step 0)."""
+
+    rejected_dev: torch.Tensor | None
+    query_start_loc: torch.Tensor
+    request_distribution: torch.Tensor
 
 
 if TYPE_CHECKING:
@@ -281,6 +330,16 @@ class Eagle3Proposer:
         # load_model; None means the per-step loop.
         self._mtp_fused_loop: torch.nn.Module | None = None
         self._mtp_fused_loop_warm = False
+        # TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS: pass 1 of a two-pass draft step 0
+        # (see mtp_kv_only.py), a compiled program that only writes the MTP
+        # layer's KV and indexer-K caches. Built in load_model; None keeps the
+        # single full step-0 pass.
+        self._mtp_kv_only_model: torch.nn.Module | None = None
+        # The gate it runs under: the flag, raised above the largest loop
+        # bucket (see _build_mtp_kv_only_model). 0 while not built.
+        self._mtp_kv_only_min_tokens = 0
+        # Its copy of draft_vllm_config: compile_sizes at or above the gate.
+        self._mtp_kv_only_vllm_config: VllmConfig | None = None
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -352,6 +411,7 @@ class Eagle3Proposer:
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()
+        self._build_mtp_kv_only_model()
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
@@ -468,13 +528,9 @@ class Eagle3Proposer:
         # max_num_batched_tokens >= max_num_seqs to hold: if it does not, the
         # compaction store and the loop-step read both run off the end of the
         # buffer.
-        # Call the padding helper straight: `_loop_bucket`'s DP-lockstep branch
-        # needs per-step state and `_draft_has_moe`, neither valid at load time.
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
-
-        required_rows = _get_padded_token_len(
-            self.runner.num_tokens_paddings, self.runner.max_num_reqs
-        )
+        # The bound, not `_loop_bucket`: its DP-lockstep branch needs per-step
+        # state and `_draft_has_moe`, neither valid at load time.
+        required_rows = self._max_loop_bucket()
         for buf in self._mtp_topk_buffers:
             if buf.shape[0] < required_rows:
                 sched = self.vllm_config.scheduler_config
@@ -676,6 +732,315 @@ class Eagle3Proposer:
                 self._mtp_fused_loop_warm = True
             return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
 
+    def _build_mtp_kv_only_model(self) -> None:
+        """Build pass 1 of the two-pass draft step 0, when asked for.
+
+        `TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS` > 0 splits a large step 0 into a
+        KV-only pass over every row (`MtpKvOnlyModel`) and the full layer on
+        one row per request (see `_two_pass_step0`). Only a single-layer DSA
+        MTP draft that owns its KV cache qualifies; PCP localizes the gather
+        indices per rank, which pass 2's row selection does not model. A draft
+        that does not qualify, or a program that cannot be built, keeps the
+        single full pass.
+        """
+        self._mtp_kv_only_model = None
+        self._mtp_kv_only_min_tokens = 0
+        self._mtp_kv_only_vllm_config = None
+        if envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS <= 0:
+            return
+        reason = self._kv_only_unsupported_reason()
+        min_tokens = 0
+        if reason is None:
+            min_tokens = self._kv_only_gate()
+            largest_bucket = max(self.runner.num_tokens_paddings)
+            if min_tokens > largest_bucket:
+                reason = (
+                    f"no token bucket reaches the {min_tokens}-token gate (the "
+                    f"largest is {largest_bucket})"
+                )
+        if reason is None:
+            reason = self._build_kv_only_program(min_tokens)
+        if reason is not None:
+            logger.warning(
+                "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS=%d is set, but %s; draft "
+                "step 0 keeps the single full pass.",
+                envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS,
+                reason,
+            )
+            return
+        self._mtp_kv_only_min_tokens = min_tokens
+        logger.info(
+            "MTP draft step 0 of chunks with >= %d tokens runs a KV-only pass "
+            "over every row, then the full layer on one row per request.",
+            min_tokens,
+        )
+
+    def _kv_only_unsupported_reason(self) -> str | None:
+        """Why this draft cannot take the two-pass step 0, or None."""
+        from vllm_torchtpu.spec_decode.mtp_kv_only import (
+            kv_only_cache_layer_names,
+            kv_only_unsupported_reason,
+        )
+
+        if self.speculative_config.method != "mtp":
+            return f"the draft method is {self.speculative_config.method!r}"
+        if self._draft_kv_shared:
+            return "the draft reads the target's KV cache"
+        if self.runner._pcp_enabled:
+            return "prefill context parallelism is on"
+        if self._dp_lockstep_sharded():
+            # Same rule as _use_kv_only_two_pass: the idle ranks' replay of a
+            # peer's draft trace (run_dp_dummy_draft) knows only the single
+            # pass, so the program would never run.
+            return "EP-DP lockstep replays the draft as the single pass"
+        reason = kv_only_unsupported_reason(self.draft_model)
+        if reason is not None:
+            return reason
+        # Pass 1 reads the step-0 entries `_target_draft_attn_metadata` keeps,
+        # which are the draft's attention layers only.
+        names = set(kv_only_cache_layer_names(self.draft_model))
+        missing = names - (self._draft_attn_layer_names or set())
+        if missing:
+            return f"{sorted(missing)} are not draft attention layers"
+        return None
+
+    def _kv_only_gate(self) -> int:
+        """The smallest padded step 0 that takes the two-pass path."""
+        min_tokens = envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS
+        max_loop_bucket = self._max_loop_bucket()
+        if min_tokens > max_loop_bucket:
+            return min_tokens
+        # A step 0 of at most `max_loop_bucket` tokens is also a loop-step
+        # shape: the warmup's single-request specs at those sizes are what
+        # warm the draft at p = T, and two-pass would run it at a smaller p
+        # instead. It would save nearly nothing there anyway (pass 2 runs at
+        # p ~ T), so keep those sizes on the single pass.
+        logger.warning(
+            "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS=%d is not above the largest "
+            "draft loop bucket (%d); the two-pass step 0 starts at %d tokens.",
+            min_tokens,
+            max_loop_bucket,
+            max_loop_bucket + 1,
+        )
+        return max_loop_bucket + 1
+
+    def _build_kv_only_program(self, min_tokens: int) -> str | None:
+        """Build `MtpKvOnlyModel`; returns why it could not be built, or None.
+
+        It compiles under its own copy of the draft's config whose
+        `compile_sizes` keeps only the buckets at or above the gate, the only
+        ones `_use_kv_only_two_pass` dispatches.
+        """
+        from vllm_torchtpu.spec_decode.mtp_kv_only import MtpKvOnlyModel
+
+        assert self.draft_model is not None
+        config = copy.copy(self.draft_vllm_config)
+        config.compilation_config = copy.copy(self.draft_vllm_config.compilation_config)
+        self._mtp_kv_only_vllm_config = config
+        self._set_kv_only_compile_sizes(min_tokens)
+        try:
+            with (
+                set_model_tag("eagle_head"),
+                set_vllm_model_wrapper_context(
+                    mesh=self.runner.mesh, vllm_config=config
+                ),
+                set_current_vllm_config(config),
+            ):
+                self._mtp_kv_only_model = MtpKvOnlyModel(
+                    vllm_config=config,
+                    prefix="mtp_prefill_kv_only",
+                    mtp=self.draft_model,
+                    mesh=self.runner.mesh,
+                )
+        except Exception as e:
+            logger.warning("Could not build the MTP KV-only pass.", exc_info=True)
+            self._mtp_kv_only_vllm_config = None
+            return f"build failed ({type(e).__name__})"
+        return None
+
+    def _set_kv_only_compile_sizes(self, min_tokens: int) -> None:
+        config = self._mtp_kv_only_vllm_config
+        assert config is not None
+        # TPUPlatform sets compile_sizes to the token padding buckets (ints).
+        draft_sizes = [
+            int(size)
+            for size in self.draft_vllm_config.compilation_config.compile_sizes or ()
+        ]
+        config.compilation_config.compile_sizes = [
+            size for size in draft_sizes if size >= min_tokens
+        ]
+
+    def set_draft_compile_sizes(self, sizes: list[int]) -> None:
+        """Set the token buckets the draft's programs compile for.
+
+        The runner adds pipeline-chunk buckets after the draft is loaded; the
+        KV-only pass keeps its own copy, filtered to its gate.
+        """
+        self.draft_vllm_config.compilation_config.compile_sizes = list(sizes)
+        if self._mtp_kv_only_vllm_config is not None:
+            self._set_kv_only_compile_sizes(self._mtp_kv_only_min_tokens)
+
+    def _max_loop_bucket(self) -> int:
+        """The largest loop bucket p `_loop_bucket` can return."""
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+        runner = self.runner
+        return _get_padded_token_len(runner.num_tokens_paddings, runner.max_num_reqs)
+
+    def _use_kv_only_two_pass(
+        self, chunk: DraftChunkInputs, num_tokens: int, num_rows: int
+    ) -> bool:
+        """Whether this chunk's step 0 takes the two-pass path.
+
+        `num_tokens` is the chunk's padded step-0 token count and `num_rows`
+        the per-request row bucket p. Host-side only, so every rank of a TP
+        group, which sees the same scheduler output, decides the same way.
+        """
+        if self._mtp_kv_only_model is None:
+            return False
+        min_tokens = self._mtp_kv_only_min_tokens
+        if min_tokens <= 0 or num_tokens < min_tokens or num_tokens <= num_rows:
+            return False
+        # EP-DP lockstep replays a peer's draft trace on idle ranks
+        # (run_dp_dummy_draft), which only knows the single pass.
+        # TODO: take the two-pass path under EP-DP lockstep too, the usual
+        # DeepSeek-V3.2 / GLM-5.2 deployment: `_dp_dummy_draft_step` has to
+        # replay pass 1 at the coordinated token bucket and pass 2 at p when
+        # that bucket is at or above the gate, so idle ranks emit the same
+        # collectives as the busy ones.
+        if self._dp_lockstep_sharded():
+            return False
+        # Pass 2 derives its metadata from the target's own step-0 entries;
+        # None for dummy chunks and chunks without them.
+        return self._target_draft_attn_metadata(chunk) is not None
+
+    def _chunk_loop_inputs(
+        self,
+        chunk: DraftChunkInputs,
+        num_rejected: np.ndarray | torch.Tensor | None,
+    ) -> _ChunkLoopInputs:
+        """A chunk's one-query-per-request inputs, built once per propose and
+        shared by its loop steps (and pass 2 of a two-pass step 0).
+
+        The rejected count is padded to kernel_num_reqs so the loop's seq_lens
+        subtraction is full-length (constant): no per-num_reqs recompile. Sync
+        pads on the host; async pads the device tensor. query_start_loc and
+        request_distribution depend only on num_reqs, not the step.
+        """
+        runner = self.runner
+        knr = (
+            runner.num_reqs_max_model_len
+            if chunk.attn_ctx.use_max_model_len
+            else runner.num_reqs_most_model_len
+        )
+        assert knr is not None
+        rejected_dev = None
+        if isinstance(num_rejected, torch.Tensor):
+            # Async: the count is at the sampler's request-padding width, which
+            # can sit above the chunk's kernel_num_reqs; the rows past the
+            # chunk's requests are zeros either way.
+            rejected_dev = _maybe_pad_dim0(num_rejected[:knr], knr)
+        elif num_rejected is not None and np.any(num_rejected):
+            padded_nr = np.zeros(knr, dtype=np.int32)
+            padded_nr[: chunk.num_reqs] = num_rejected.astype(np.int32, copy=False)
+            rejected_dev = torch.from_numpy(padded_nr).to(runner.device)
+        qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), chunk.num_reqs)
+        query_start_loc = torch.from_numpy(qsl_np).to(runner.device)
+        request_distribution = torch.tensor(
+            [chunk.num_reqs] * 3, dtype=torch.int32, device=runner.device
+        )
+        return _ChunkLoopInputs(rejected_dev, query_start_loc, request_distribution)
+
+    def _pass2_attn_metadata(
+        self,
+        chunk: DraftChunkInputs,
+        target_md: dict[str, AttentionMetadata],
+        num_rejected: np.ndarray | torch.Tensor,
+        loop_inputs: _ChunkLoopInputs,
+    ) -> dict[str, AttentionMetadata]:
+        """Step-0 metadata narrowed to one query per request.
+
+        Request r's query is the end of its accepted prefix, at position
+        `seq_lens[r] - num_rejected[r] - 1`, so its seq_len is
+        `seq_lens[r] - num_rejected[r]`: the causal window that row has in the
+        full pass, rejected verify tail excluded. That is a loop step's
+        metadata at `seq_lens_delta=0` (`_loop_step_attn_inputs`); block
+        tables are unchanged.
+        """
+        seq_lens, query_start_loc, request_distribution = self._loop_step_attn_inputs(
+            chunk,
+            seq_lens_delta=0,
+            num_rejected_np=(
+                None if isinstance(num_rejected, torch.Tensor) else num_rejected
+            ),
+            num_rejected_dev=loop_inputs.rejected_dev,
+            loop_query_start_loc=loop_inputs.query_start_loc,
+            loop_request_distribution=loop_inputs.request_distribution,
+        )
+        return _narrow_target_md(
+            target_md, seq_lens, query_start_loc, request_distribution
+        )
+
+    def _two_pass_step0(
+        self,
+        chunk: DraftChunkInputs,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        gather_indices: torch.Tensor,
+        num_rejected: np.ndarray | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, _ChunkLoopInputs]:
+        """Draft step 0 of one chunk as KV-only pass + per-request full pass.
+
+        Returns the `[p]` carries `(last_hidden, hidden, positions)` the
+        single pass would gather at `gather_indices`, and the chunk's
+        one-query-per-request inputs for the loop steps to reuse.
+
+        Pass 1 writes the MTP KV and indexer-K entries of every row with the
+        target's step-0 metadata, through the writers the full pass uses.
+        Pass 2 runs the draft's own step-0 program (indexer on) on the rows at
+        `gather_indices` with `_pass2_attn_metadata`; each of those rows
+        attends to exactly the cache window it has in the single pass, which
+        pass 1 has just filled, and rewrites its own entries with the same
+        values. The other rows' outputs are never read, so they are not
+        computed.
+        """
+        assert self._mtp_kv_only_model is not None
+        kv_only_config = self._mtp_kv_only_vllm_config
+        assert kv_only_config is not None
+        runner = self.runner
+        target_md = self._target_draft_attn_metadata(chunk)
+        assert target_md is not None
+        num_tokens = input_ids.shape[0]
+        with (
+            set_model_tag("eagle_head"),
+            set_forward_context(
+                target_md,
+                kv_only_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=runner._dp_num_tokens_across_dp(num_tokens),
+            ),
+            set_vllm_model_wrapper_context(
+                mesh=runner.mesh, vllm_config=kv_only_config
+            ),
+        ):
+            self._mtp_kv_only_model(input_ids, positions, target_hidden_states)
+
+        rows_ids, rows_positions, rows_hidden = self._draft_gather_rows(
+            input_ids, positions, target_hidden_states, gather_indices
+        )
+        loop_inputs = self._chunk_loop_inputs(chunk, num_rejected)
+        last_hidden, hidden = self._run_draft_model(
+            input_ids=rows_ids,
+            positions=rows_positions,
+            target_hidden_states=rows_hidden,
+            step_idx=0,
+            attn_metadata=self._pass2_attn_metadata(
+                chunk, target_md, num_rejected, loop_inputs
+            ),
+        )
+        return last_hidden, hidden, rows_positions, loop_inputs
+
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
 
@@ -710,7 +1075,12 @@ class Eagle3Proposer:
         """
         assert self.draft_model is not None
         self.draft_model.model.compact_topk_indices(gather_indices)
-        num_rows = gather_indices.shape[0]
+        return self._mtp_save_topk(gather_indices.shape[0])
+
+    def _mtp_save_topk(self, num_rows: int) -> list[torch.Tensor]:
+        """Snapshot step 0's top-k rows when they are already one per request
+        (the two-pass step 0's pass 2): `_mtp_compact_and_save` without the
+        compaction."""
         return [buf[:num_rows].clone() for buf in self._mtp_topk_buffers]
 
     def _mtp_restore_topk(self, saved: list[torch.Tensor]) -> None:
@@ -1131,27 +1501,29 @@ class Eagle3Proposer:
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def _draft_gather_carries(
+    def _draft_gather_rows(
         self,
-        hidden: torch.Tensor,
+        x: torch.Tensor,
         positions: torch.Tensor,
-        last_hidden: torch.Tensor,
+        y: torch.Tensor,
         indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # First-pass per-request carries: gather the last-token hidden, position,
-        # and pre-lm-head hidden in one compiled region. Run raw (advanced
+        # The rows at `indices` of two token-major tensors and of positions,
+        # in one compiled region keyed on (T, p): step 0's per-request carries
+        # (hidden, positions, last_hidden), or pass 2's inputs (input_ids,
+        # positions, hidden) of a two-pass step 0. Run raw (advanced
         # indexing), these three gathers are eager ops the DEFER_AND_FUSE path
         # fuses with the step's seq_lens/positions arithmetic into a per-context
-        # program. index_select is value-identical to hidden[indices].
-        pos_carry = (
+        # program. index_select is value-identical to x[indices].
+        pos_rows = (
             torch.index_select(positions, 1, indices)
             if positions.ndim == 2
             else torch.index_select(positions, 0, indices)
         )
         return (
-            torch.index_select(hidden, 0, indices),
-            pos_carry,
-            torch.index_select(last_hidden, 0, indices),
+            torch.index_select(x, 0, indices),
+            pos_rows,
+            torch.index_select(y, 0, indices),
         )
 
     @_static_shape_args
@@ -1165,7 +1537,7 @@ class Eagle3Proposer:
         # the cat into a standalone program, (b) emit a distinct cat+mm grouping
         # per live dispatch context, or (c) fuse the combine mm forward into the
         # downstream draft_input_ids seed scatter. Same pattern as
-        # _draft_propose_token / _draft_gather_carries.
+        # _draft_propose_token / _draft_gather_rows.
         assert self.draft_model is not None
         return self.draft_model.combine_hidden_states(
             torch.cat((aux0, aux1, aux2), dim=-1)
@@ -1260,10 +1632,12 @@ class Eagle3Proposer:
         rejected_np_per_chunk: list[np.ndarray | None] = []
         uses_aux_hidden_state = self._draft_uses_aux_hidden_state()
         draft_tokens_per_chunk = []
-        is_async = next_tokens_per_chunk is not None
         # IndexShare: each chunk's step-0 top-k rows, saved right after its
         # compaction (see _mtp_compact_and_save).
         saved_topk_per_chunk: list[list[torch.Tensor]] = []
+        # Two-pass chunks (TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS): the
+        # one-query-per-request inputs pass 2 built, reused by the loop steps.
+        pass2_loop_inputs: dict[int, _ChunkLoopInputs] = {}
         for ci, chunk in enumerate(chunks):
             if uses_aux_hidden_state:
                 with set_model_tag("eagle_head"):
@@ -1305,32 +1679,60 @@ class Eagle3Proposer:
             rejected_np_per_chunk.append(
                 None if isinstance(num_rejected, torch.Tensor) else num_rejected
             )
-            last_hidden, hidden = self._forward_draft(
-                chunk=chunk,
-                input_ids=input_ids,
-                positions=positions,
-                target_hidden_states=target_hidden_states,
-                step_idx=0,
-                seq_lens_delta=0,
-                num_rejected_np=rejected_np_per_chunk[ci],
-                num_tokens_padded=input_ids.shape[0],
-            )
-            # [p, h] / [p] carries + first-pass draft token, computed in compiled
-            # regions (the three gathers, then lm-head+argmax) so torch-tpu's
-            # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
-            owner_mask = last_token_indices.ge(0)
-            safe_gather_indices = last_token_indices.clamp_min(0)
-            if self._share_mtp_indices:
-                # Clamped, not raw: a PCP-localized index is -1 for a row this
-                # rank does not own, and -1 would wrap to the buffer's last row.
-                saved_topk_per_chunk.append(
-                    self._mtp_compact_and_save(safe_gather_indices)
+            if self._use_kv_only_two_pass(
+                chunk, input_ids.shape[0], last_token_indices.shape[0]
+            ):
+                # TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS: KV-only pass over every
+                # row, then the full layer on the per-request rows only; its
+                # outputs are already the [p] carries.
+                owner_mask, safe_gather_indices = _step0_gather_indices(
+                    last_token_indices
                 )
-            hidden_carry, positions_carry, last_hidden_carry = (
-                self._draft_gather_carries(
-                    hidden, positions, last_hidden, safe_gather_indices
+                (
+                    last_hidden_carry,
+                    hidden_carry,
+                    positions_carry,
+                    pass2_loop_inputs[ci],
+                ) = self._two_pass_step0(
+                    chunk=chunk,
+                    input_ids=input_ids,
+                    positions=positions,
+                    target_hidden_states=target_hidden_states,
+                    gather_indices=safe_gather_indices,
+                    num_rejected=num_rejected,
                 )
-            )
+                if self._share_mtp_indices:
+                    # Pass 2 wrote one top-k row per request, in order.
+                    saved_topk_per_chunk.append(
+                        self._mtp_save_topk(safe_gather_indices.shape[0])
+                    )
+            else:
+                last_hidden, hidden = self._forward_draft(
+                    chunk=chunk,
+                    input_ids=input_ids,
+                    positions=positions,
+                    target_hidden_states=target_hidden_states,
+                    step_idx=0,
+                    seq_lens_delta=0,
+                    num_rejected_np=rejected_np_per_chunk[ci],
+                    num_tokens_padded=input_ids.shape[0],
+                )
+                # [p, h] / [p] carries + first-pass draft token, computed in
+                # compiled regions (the three gathers, then lm-head+argmax) so
+                # torch-tpu's eager DEFER_AND_FUSE path can't fuse them into
+                # per-context programs.
+                owner_mask, safe_gather_indices = _step0_gather_indices(
+                    last_token_indices
+                )
+                if self._share_mtp_indices:
+                    saved_topk_per_chunk.append(
+                        self._mtp_compact_and_save(safe_gather_indices)
+                    )
+                hidden_carry, positions_carry, last_hidden_carry = (
+                    self._draft_gather_rows(
+                        hidden, positions, last_hidden, safe_gather_indices
+                    )
+                )
             last_hidden_carry = (
                 chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
                     last_hidden_carry, owner_mask
@@ -1375,56 +1777,19 @@ class Eagle3Proposer:
                 else _maybe_pad_dim0(pos, p)
                 for pos, p in zip(positions_carry_per_chunk, padded_nr_per_chunk)
             ]
-            # Per-chunk rejected count padded to kernel_num_reqs so the loop's
-            # seq_lens subtraction is full-length (constant) — no per-num_reqs
-            # recompile. Sync pads on the host (free, reused across the K-1 loop
-            # steps); async pads the device tensor.
-            rejected_dev_per_chunk = []
-            for c, nr in zip(chunks, rejected_per_chunk):
-                knr = (
-                    runner.num_reqs_max_model_len
-                    if c.attn_ctx.use_max_model_len
-                    else runner.num_reqs_most_model_len
-                )
-                assert knr is not None
-                if is_async:
-                    # nr is at the sampler's request-padding width, which can
-                    # sit above a chunk's kernel_num_reqs; the rows past the
-                    # chunk's requests are zeros either way.
-                    rejected_dev_per_chunk.append(
-                        _maybe_pad_dim0(cast(torch.Tensor, nr)[:knr], knr)
-                        if nr is not None
-                        else None
-                    )
-                elif nr is not None and np.any(nr):
-                    padded_nr = np.zeros(knr, dtype=np.int32)
-                    padded_nr[: c.num_reqs] = cast(np.ndarray, nr).astype(
-                        np.int32, copy=False
-                    )
-                    rejected_dev_per_chunk.append(
-                        torch.from_numpy(padded_nr).to(runner.device)
-                    )
-                else:
-                    rejected_dev_per_chunk.append(None)
-            # Loop-step query_start_loc and request_distribution depend only on
-            # num_reqs (not the step), so build them once per chunk instead of
-            # rebuilding (with an H2D) on every one of the K-1 steps.
-            loop_qsl_per_chunk = []
-            loop_reqdist_per_chunk = []
-            for c in chunks:
-                knr = (
-                    runner.num_reqs_max_model_len
-                    if c.attn_ctx.use_max_model_len
-                    else runner.num_reqs_most_model_len
-                )
-                assert knr is not None
-                qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
-                loop_qsl_per_chunk.append(torch.from_numpy(qsl_np).to(runner.device))
-                loop_reqdist_per_chunk.append(
-                    torch.tensor(
-                        [c.num_reqs] * 3, dtype=torch.int32, device=runner.device
-                    )
-                )
+            # Two-pass chunks reuse the inputs pass 2 built; the rest build
+            # theirs once here for all K - 1 loop steps.
+            loop_inputs_per_chunk = [
+                pass2_loop_inputs[ci]
+                if ci in pass2_loop_inputs
+                else self._chunk_loop_inputs(c, nr)
+                for ci, (c, nr) in enumerate(zip(chunks, rejected_per_chunk))
+            ]
+            rejected_dev_per_chunk = [li.rejected_dev for li in loop_inputs_per_chunk]
+            loop_qsl_per_chunk = [li.query_start_loc for li in loop_inputs_per_chunk]
+            loop_reqdist_per_chunk = [
+                li.request_distribution for li in loop_inputs_per_chunk
+            ]
 
             def run_draft_step(ci: int, step: int) -> None:
                 """One separate draft step for chunk `ci`: a draft forward
@@ -1917,23 +2282,9 @@ class Eagle3Proposer:
                     loop_request_distribution=loop_request_distribution,
                 )
             )
-            replaced_target: dict[int, AttentionMetadata] = {}
-            result = {}
-            for name, md in target_md.items():
-                if id(md) not in replaced_target:
-                    # AttentionMetadata annotates these fields with the
-                    # kernels' jax.Array; the runner fills them with torch
-                    # tensors, as every builder of it does.
-                    replaced_target[id(md)] = dataclasses.replace(
-                        md,
-                        # pyrefly: ignore[bad-argument-type]
-                        seq_lens=seq_lens,
-                        # pyrefly: ignore[bad-argument-type]
-                        query_start_loc=query_start_loc,
-                        # pyrefly: ignore[bad-argument-type]
-                        request_distribution=request_distribution,
-                    )
-                result[name] = replaced_target[id(md)]
+            result = _narrow_target_md(
+                target_md, seq_lens, query_start_loc, request_distribution
+            )
             self._draft_md_cache[id(chunk)] = (result, seq_lens, seq_lens_delta)
             return result
 
@@ -2097,7 +2448,24 @@ class Eagle3Proposer:
             loop_query_start_loc=loop_query_start_loc,
             loop_request_distribution=loop_request_distribution,
         )
+        return self._run_draft_model(
+            input_ids=input_ids,
+            positions=positions,
+            target_hidden_states=target_hidden_states,
+            step_idx=step_idx,
+            attn_metadata=attn_metadata,
+        )
 
+    def _run_draft_model(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        step_idx: int,
+        attn_metadata: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run draft step `step_idx`'s program under `attn_metadata`; returns
+        `(last_hidden, hidden)`."""
         num_tokens = input_ids.shape[0]
 
         kwargs: dict[str, torch.Tensor | int] = {
@@ -2152,6 +2520,7 @@ class Eagle3Proposer:
         self._precompile_combine_hidden_states()
         self._precompile_draft_seed()
         self._precompile_compute_logits()
+        self._precompile_draft_gather_rows()
 
     def _draft_hidden_size(self) -> int:
         """Width of the hidden state the draft's lm_head consumes.
@@ -2267,16 +2636,12 @@ class Eagle3Proposer:
                 logger.info("  -- drafter combine num_tokens: %d", num_tokens)
 
     def _precompile_draft_seed(self) -> None:
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
-
         runner = self.runner
         # input_ids length = first-pass token bucket; index length = p =
         # pad(num_reqs), bounded by the loop bucket pad(max_num_reqs). Mirror the
         # bucket selection in _precompile_compute_logits so every sync first-pass
         # (T, p) shape-key is a startup cache hit.
-        max_loop_bucket = _get_padded_token_len(
-            runner.num_tokens_paddings, runner.max_num_reqs
-        )
+        max_loop_bucket = self._max_loop_bucket()
         idx_sizes = sorted(
             set(runner.num_reqs_paddings)
             | {t for t in runner.num_tokens_paddings if t <= max_loop_bucket}
@@ -2292,9 +2657,36 @@ class Eagle3Proposer:
                     out = self._draft_seed_input_ids(ids, lti, nti)
                     synchronize_tensors(out)
 
-    def _precompile_compute_logits(self) -> None:
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+    def _precompile_draft_gather_rows(self) -> None:
+        """Warm the two-pass step 0's pass-2 input gather on every (T, p) it
+        can take: T a token bucket at or above the gate, p a loop bucket."""
+        if self._mtp_kv_only_model is None:
+            return
+        runner = self.runner
+        min_tokens = self._mtp_kv_only_min_tokens
+        max_loop_bucket = self._max_loop_bucket()
+        # p is always `_loop_bucket(num_reqs)`, a token padding.
+        idx_sizes = [t for t in runner.num_tokens_paddings if t <= max_loop_bucket]
+        hidden_size = self._draft_hidden_size()
+        with runner._precompile_timed("drafter two-pass gather_rows"):
+            for num_tokens in runner.num_tokens_paddings:
+                if num_tokens < min_tokens:
+                    continue
+                ids = torch.zeros(num_tokens, dtype=torch.int32).to(runner.device)
+                pos = torch.zeros(
+                    (3, num_tokens) if runner.uses_mrope else (num_tokens,),
+                    dtype=torch.int32,
+                ).to(runner.device)
+                hidden = torch.zeros(
+                    (num_tokens, hidden_size), dtype=runner._hidden_states_dtype
+                ).to(runner.device)
+                for p in idx_sizes:
+                    if p >= num_tokens:
+                        continue
+                    idx = torch.zeros(p, dtype=torch.int64).to(runner.device)
+                    synchronize_tensors(self._draft_gather_rows(ids, pos, hidden, idx))
 
+    def _precompile_compute_logits(self) -> None:
         runner = self.runner
         hidden_size = self._draft_hidden_size()
         # compute_logits is called on (a) num_reqs buckets in the first pass and
@@ -2305,9 +2697,7 @@ class Eagle3Proposer:
         # max_num_batched_tokens, compiling large [n, vocab] matmuls the loop never
         # hits.) Filtering by <= max_loop_bucket keeps every intermediate bucket
         # the loop can land on, unlike sampling only at num_reqs_paddings points.
-        max_loop_bucket = _get_padded_token_len(
-            runner.num_tokens_paddings, runner.max_num_reqs
-        )
+        max_loop_bucket = self._max_loop_bucket()
         all_sizes = set(runner.num_reqs_paddings) | {
             t for t in runner.num_tokens_paddings if t <= max_loop_bucket
         }

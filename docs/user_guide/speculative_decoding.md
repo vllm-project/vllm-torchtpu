@@ -47,6 +47,8 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
   }'
 ```
 
+For a single-layer DSA MTP draft (`DeepSeek-V3.2`, `GLM-5.2`), `TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS=<n>` shortens draft step 0 of prefill chunks of at least `n` tokens: a KV-only pass writes the draft layer's KV and indexer-K caches for every row, and the full layer then runs only on each request's last accepted row. The draft tokens are the same. Prefill context parallelism and data parallel with expert parallel (EP-DP lockstep), the usual deployment for these models, keep the single pass. See the [Environment Variables Reference](../reference/env_vars.md).
+
 ---
 
 ## 3. DFlash & DSpark Speculative Decoding

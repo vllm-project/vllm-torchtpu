@@ -407,6 +407,17 @@ class TestTpuCompilerCache:
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED
         assert not serving_only & set(_tpu_compile_env_factors())
 
+    def test_mtp_kv_only_threshold_stays_out_of_the_compile_cache_key(self):
+        """Retuning the two-pass threshold must not recompile the target."""
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            _TPU_COMPILE_ENV_IGNORED,
+            _tpu_compile_env_factors,
+        )
+
+        name = "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS"
+        assert name in _TPU_COMPILE_ENV_IGNORED
+        assert name not in _tpu_compile_env_factors()
+
     def test_every_registry_entry_is_hashed_or_deliberately_ignored(self):
         """The two sets must partition the registry, so a new entry forces a
         deliberate hash-or-ignore choice, and a stale exemption cannot sit

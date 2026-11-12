@@ -30,31 +30,12 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 from vllm_torchtpu.spec_decode import utils as spec_decode_utils
 from vllm_torchtpu.spec_decode.eagle3 import (
     DraftChunkInputs,
-    Eagle3Proposer,
     _force_draft_tp1,
     _maybe_pad_dim0,
     _static_shape_args,
 )
 
-
-def _make_proposer(
-    draft_tp: int | None = 1, target_tp: int = 1, method: str = "eagle3"
-) -> Eagle3Proposer:
-    speculative_config = SimpleNamespace(
-        draft_tensor_parallel_size=draft_tp, method=method, draft_model_config=None
-    )
-    parallel_config = SimpleNamespace(
-        tensor_parallel_size=target_tp, pipeline_parallel_size=1
-    )
-    vllm_config = SimpleNamespace(
-        speculative_config=speculative_config, parallel_config=parallel_config
-    )
-    return Eagle3Proposer(
-        runner=mock.MagicMock(
-            _pcp_enabled=False, _mtp_enabled=method == "mtp", _mtp_prefill_only=False
-        ),
-        vllm_config=vllm_config,
-    )
+from .proposer_test_utils import make_proposer
 
 
 def _make_vocab_models():
@@ -134,14 +115,14 @@ def test_draft_tp_defaults_to_target_tp():
     # vLLM's _verify_and_get_draft_tp already resolves an unset eagle3 draft
     # tp to target_tp; Eagle3Proposer sets it explicitly too (defensive +
     # self-documenting).
-    proposer = _make_proposer(draft_tp=None, target_tp=8)
+    proposer = make_proposer(draft_tp=None, target_tp=8)
     assert proposer.speculative_config.draft_tensor_parallel_size == 8
     assert proposer._draft_replicated is False
 
 
 @pytest.mark.parametrize("draft_tp,target_tp", [(1, 1), (1, 8), (8, 8)])
 def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp, monkeypatch):
-    proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp, method="mtp")
+    proposer = make_proposer(draft_tp=draft_tp, target_tp=target_tp, method="mtp")
     draft, target = _make_vocab_models()
     draft_head = draft.lm_head
     original_gather_logits = draft.logits_processor._gather_logits
@@ -180,7 +161,7 @@ def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp, monkeypa
 def test_draft_tp_invalid_raises(draft_tp):
     # Only replicated (1) or fully sharded (== target tp) are supported.
     with pytest.raises(ValueError):
-        _make_proposer(draft_tp=draft_tp, target_tp=8)
+        make_proposer(draft_tp=draft_tp, target_tp=8)
 
 
 class TestDpLockstepSharded:
@@ -193,7 +174,7 @@ class TestDpLockstepSharded:
     """
 
     def _proposer(self, *, target_tp, lockstep, has_moe, loaded=True):
-        proposer = _make_proposer(draft_tp=None, target_tp=target_tp)
+        proposer = make_proposer(draft_tp=None, target_tp=target_tp)
         proposer.runner._dp_lockstep_enabled = lambda: lockstep
         proposer.draft_model = object() if loaded else None
         return proposer, mock.patch(
@@ -318,7 +299,7 @@ class _CarryAggregationAfterGatherPlan:
 
 @pytest.mark.tpu_test
 def test_prepare_draft_inputs(device):
-    proposer = _make_proposer(draft_tp=1)
+    proposer = make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
@@ -370,7 +351,7 @@ def test_prepare_draft_inputs(device):
 def test_prepare_draft_inputs_chunk_offset(device):
     """A non-zero start_index must slice the batch-level sampled tokens and
     rejection counts by the chunk's offset."""
-    proposer = _make_proposer(draft_tp=1)
+    proposer = make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(req_ids=["r0", "r1", "r2", "r3"]),
         device=device,
@@ -421,7 +402,7 @@ def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
 ):
     """The seed scatter stays in request-major coordinates; only the final
     draft input and gather values cross the chunk-local PCP layout boundary."""
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
@@ -490,7 +471,7 @@ def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
 def test_prepare_draft_inputs_all_layout_keeps_device_seed_gathers(device, monkeypatch):
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
@@ -536,7 +517,7 @@ def test_prepare_draft_inputs_all_layout_keeps_device_seed_gathers(device, monke
 
 def test_propose_delegates_carry_aggregation_after_gather():
     device = torch.device("cpu")
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     proposer.speculative_config.num_speculative_tokens = 1
     proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(num_reqs=2, req_ids=["r0", "r1"]),
@@ -579,7 +560,7 @@ def test_propose_delegates_carry_aggregation_after_gather():
         assert gather_indices.cpu().tolist() == [0, 2]
         return (hidden[:2], positions[:2], last_hidden[gather_indices])
 
-    proposer._draft_gather_carries = record_gather
+    proposer._draft_gather_rows = record_gather
 
     def record_token(last_hidden):
         events.append("propose_token")
@@ -601,7 +582,7 @@ def test_prepare_draft_inputs_async_device(device):
     """Async device path derives the seed token, the seed *position*
     (last_token_indices) and the rejected count from the on-device rejection
     output — matching the host path fed the equivalent num_rejected."""
-    proposer = _make_proposer(draft_tp=1)
+    proposer = make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
@@ -671,7 +652,7 @@ def test_prepare_draft_inputs_async_device_keeps_padded_width(device, discard):
     scatter result equals the host path's, and they report no rejections.
     A last request still in partial prefill seeds from its known next prompt
     token, and the padding rows repeat that token, not its sampled one."""
-    proposer = _make_proposer(draft_tp=1)
+    proposer = make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
@@ -751,7 +732,7 @@ def test_propose(num_speculative_tokens, chunk_sizes, return_device, device):
     # Distinct base token per request so cross-chunk ordering is checkable.
     base_token_ids = [40 + 10 * i for i in range(num_reqs)]
 
-    proposer = _make_proposer(draft_tp=1)
+    proposer = make_proposer(draft_tp=1)
     proposer.speculative_config.num_speculative_tokens = num_speculative_tokens
     proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(num_reqs=num_reqs),
@@ -874,7 +855,7 @@ def test_propose(num_speculative_tokens, chunk_sizes, return_device, device):
 
 
 def test_draft_combine_input_size_no_aux_hidden_state():
-    proposer = _make_proposer(draft_tp=1)
+    proposer = make_proposer(draft_tp=1)
     proposer.draft_model = SimpleNamespace(
         config=SimpleNamespace(hidden_size=8192),
         model=SimpleNamespace(use_aux_hidden_state=False),
@@ -884,7 +865,7 @@ def test_draft_combine_input_size_no_aux_hidden_state():
 
 
 def test_draft_combine_input_size_with_aux_hidden_state():
-    proposer = _make_proposer(draft_tp=1)
+    proposer = make_proposer(draft_tp=1)
     proposer.draft_model = SimpleNamespace(
         config=SimpleNamespace(hidden_size=8192),
         model=SimpleNamespace(use_aux_hidden_state=True, fc_input_size=24576),
@@ -896,7 +877,7 @@ def test_draft_combine_input_size_with_aux_hidden_state():
 @pytest.mark.tpu_test
 def test_propose_without_aux_hidden_state(device):
     hidden_size = 8
-    proposer = _make_proposer(draft_tp=1)
+    proposer = make_proposer(draft_tp=1)
     proposer.speculative_config.num_speculative_tokens = 1
     proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(num_reqs=1),
@@ -972,7 +953,7 @@ def test_propose_without_aux_hidden_state(device):
 
 
 def test_propose_empty_batch():
-    proposer = _make_proposer(draft_tp=1)
+    proposer = make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0))
     assert (
         proposer.propose([], [], None, SimpleNamespace(num_scheduled_tokens={})) == []
@@ -987,7 +968,7 @@ def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
 
     monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
     bucket, reqs = 64, 16
-    proposer = _make_proposer(draft_tp=1, method=method)
+    proposer = make_proposer(draft_tp=1, method=method)
     proposer.speculative_config.num_speculative_tokens = K
     proposer._draft_has_moe_cache = True
     proposer.runner = SimpleNamespace(
@@ -1027,7 +1008,7 @@ def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
     proposer._draft_combine_hidden_states = combine
     proposer._forward_draft = forward
     proposer._draft_propose_token = propose_token
-    proposer._draft_gather_carries = lambda h, pos, lh, _idx: (
+    proposer._draft_gather_rows = lambda h, pos, lh, _idx: (
         h[:reqs],
         pos[:reqs],
         lh[:reqs],
@@ -1087,7 +1068,7 @@ def test_loop_bucket_follows_dp_step_max_reqs_under_sharded_lockstep():
     """Sharded EP-DP lockstep sizes the loop bucket from the step's DP-wide max
     per-chunk request count, not max_num_reqs; the replicated draft keeps the
     per-chunk bucket."""
-    proposer = _make_proposer(draft_tp=2, target_tp=2)
+    proposer = make_proposer(draft_tp=2, target_tp=2)
     proposer.runner = SimpleNamespace(
         num_tokens_paddings=[16, 32, 64, 128],
         max_num_reqs=128,
@@ -1103,7 +1084,7 @@ def test_loop_bucket_follows_dp_step_max_reqs_under_sharded_lockstep():
     with pytest.raises(AssertionError, match="DP-coordinated"):
         proposer._loop_bucket(51)
 
-    rep = _make_proposer(draft_tp=1, target_tp=2)
+    rep = make_proposer(draft_tp=1, target_tp=2)
     rep.runner = SimpleNamespace(
         num_tokens_paddings=[16, 32, 64, 128], _dp_lockstep_enabled=lambda: False
     )
@@ -1120,7 +1101,7 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
 
     monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
 
-    proposer = _make_proposer(draft_tp=2, target_tp=2)
+    proposer = make_proposer(draft_tp=2, target_tp=2)
     proposer.speculative_config.num_speculative_tokens = 3
     proposer.runner = SimpleNamespace(
         _dp_target_bucket=64,
@@ -1184,7 +1165,7 @@ def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
 
     monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
 
-    proposer = _make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
+    proposer = make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
     proposer.speculative_config.num_speculative_tokens = 3
     proposer.runner = SimpleNamespace(
         _dp_target_bucket=64,
@@ -1234,7 +1215,7 @@ def test_run_dp_dummy_draft_loop_bucket_below_num_reqs_max_model_len(monkeypatch
 
     monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
 
-    proposer = _make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
+    proposer = make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
     proposer.speculative_config.num_speculative_tokens = 2
     proposer.runner = SimpleNamespace(
         _dp_target_bucket=64,
@@ -1290,7 +1271,7 @@ def test_run_dp_dummy_draft_positions_match_draft_graph_rank(monkeypatch, uses_m
 
     monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
 
-    proposer = _make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
+    proposer = make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
     proposer.speculative_config.num_speculative_tokens = 3
     proposer.runner = SimpleNamespace(
         _dp_target_bucket=64,
@@ -1340,7 +1321,7 @@ def test_build_draft_attn_metadata_loop_cache(device):
 
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
-    proposer = _make_proposer(draft_tp=1)
+    proposer = make_proposer(draft_tp=1)
     proposer._draft_attn_layer_names = {"draft.attn.0"}
     runner = SimpleNamespace(
         _has_mamba_state=False,
@@ -1427,7 +1408,7 @@ def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
     descriptor; defaulting it to ALL selects an incompatible attention path."""
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     proposer._draft_attn_layer_names = {"draft.attn.0"}
     descriptor = _rank0_pcp_plan().descriptor
     runner = SimpleNamespace(
@@ -1532,7 +1513,7 @@ def test_build_draft_attn_metadata_reuses_target_metadata(device):
     which disable the rebuild-path loop cache, do not matter here."""
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     proposer._draft_attn_layer_names = {"draft.attn.0", "draft.attn.1"}
     proposer.runner = _md_reuse_runner(device)
     chunk = _target_md_chunk(device, None)
@@ -1606,7 +1587,7 @@ def test_build_draft_attn_metadata_rebuilds_without_target_coverage(device, gap)
     metadata is rebuilt."""
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     proposer._draft_attn_layer_names = {"draft.attn.0"}
     runner = _md_reuse_runner(device)
     runner._has_mamba_state = False
@@ -1647,7 +1628,7 @@ def test_build_draft_attn_metadata_loop_cache_follows_seq_lens_delta(device, kv_
     seq_lens stay at step 1's."""
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     proposer._draft_attn_layer_names = {"draft.attn.0"}
     proposer._draft_kv_shared = kv_shared
     runner = _md_reuse_runner(device)
@@ -1691,7 +1672,7 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
     an equivalent contract."""
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     proposer.runner = SimpleNamespace(mesh=object())
     proposer.vllm_config.load_config = object()
     proposer.vllm_config.compilation_config = SimpleNamespace(
@@ -1734,7 +1715,7 @@ def test_forward_draft_uses_saved_draft_config_in_both_contexts(monkeypatch, dev
     draft config so PCP descriptor and interleave configuration agree."""
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     draft_config = object()
     proposer.draft_vllm_config = draft_config
     proposer.runner = SimpleNamespace(
@@ -1785,7 +1766,7 @@ def test_forward_draft_uses_saved_draft_config_in_both_contexts(monkeypatch, dev
 def test_prefill_only_mtp_draft_cache_specs_require_full_attention():
     """A prefill-only producer rejects draft cache specs that need
     unsupported routing."""
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     draft_attn_layer_names = {"draft.attn"}
     full_spec = FullAttentionSpec(
         block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
@@ -1808,7 +1789,7 @@ def test_prefill_only_mtp_draft_cache_specs_require_full_attention():
 def test_build_draft_attn_metadata_cache_cleared_per_propose(device):
     """A new propose() run must not reuse a previous step's cached metadata
     for a recycled chunk id — the cache is cleared at propose entry."""
-    proposer = _make_proposer(draft_tp=1)
+    proposer = make_proposer(draft_tp=1)
     proposer._draft_md_cache[12345] = ("stale", None)
     proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0))
     assert proposer.propose([], [], None, None) == []
@@ -1857,7 +1838,7 @@ def _mtp_proposer_with_buffer(
     max_num_reqs: int = 2,
     num_tokens_paddings=(2, 4, 6, 8),
 ):
-    proposer = _make_proposer(method="mtp")
+    proposer = make_proposer(method="mtp")
     proposer.draft_model = SimpleNamespace(model=_FakeMtpModel(buf, num_layers))
     proposer.speculative_config.draft_model_config = SimpleNamespace(
         hf_config=SimpleNamespace(index_share_for_mtp_iteration=share)
@@ -1959,7 +1940,7 @@ def test_propose_index_share_order_across_two_chunks():
     _forward_draft and tested through it below."""
     device = torch.device("cpu")
     K = 3
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     proposer.speculative_config.num_speculative_tokens = K
     proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(num_reqs=4, req_ids=["r0", "r1", "r2", "r3"]),
@@ -2026,7 +2007,7 @@ def test_propose_index_share_order_across_two_chunks():
         return (torch.zeros((2, 1), device=device), torch.zeros((2, 1), device=device))
 
     proposer._forward_draft = fake_forward
-    proposer._draft_gather_carries = lambda h, p, lh, gi: (h[:2], p[:2], lh[:2])
+    proposer._draft_gather_rows = lambda h, p, lh, gi: (h[:2], p[:2], lh[:2])
     proposer._draft_propose_token = lambda lh: torch.zeros(
         2, dtype=torch.int32, device=device
     )
@@ -2056,7 +2037,7 @@ def test_propose_index_share_survives_dp_padding_first_pass(monkeypatch):
     monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
     device = torch.device("cpu")
     K = 3
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     proposer.speculative_config.num_speculative_tokens = K
     proposer._draft_has_moe_cache = True
     proposer.runner = SimpleNamespace(
@@ -2118,7 +2099,7 @@ def test_propose_index_share_survives_dp_padding_first_pass(monkeypatch):
         return (torch.zeros((2, 1), device=device), torch.zeros((2, 1), device=device))
 
     proposer._forward_draft = fake_forward
-    proposer._draft_gather_carries = lambda h, p, lh, gi: (h[:2], p[:2], lh[:2])
+    proposer._draft_gather_rows = lambda h, p, lh, gi: (h[:2], p[:2], lh[:2])
     proposer._draft_propose_token = lambda lh: torch.zeros(
         lh.shape[0], dtype=torch.int32, device=device
     )
@@ -2157,7 +2138,7 @@ def _dsa_layer_classes():
 
 
 def _dsa_draft_proposer(layers, specs, draft_tp=8, target_tp=8):
-    proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp, method="mtp")
+    proposer = make_proposer(draft_tp=draft_tp, target_tp=target_tp, method="mtp")
     proposer.runner.get_kv_cache_spec.return_value = specs
     return proposer, set(layers)
 
@@ -2165,7 +2146,7 @@ def _dsa_draft_proposer(layers, specs, draft_tp=8, target_tp=8):
 def test_validate_dsa_draft_is_a_noop_for_a_non_sparse_draft():
     """An eagle3 / plain-MTP draft has no lightning indexer, so the check must
     not even ask the runner for specs (it is called on every load)."""
-    proposer = _make_proposer(method="eagle3")
+    proposer = make_proposer(method="eagle3")
     layers = {"draft.attn": torch.nn.Module()}
     proposer._validate_dsa_draft(layers, {"draft.attn"})
     proposer.runner.get_kv_cache_spec.assert_not_called()
@@ -2255,7 +2236,7 @@ def _nextn_layers(num_layers: int, with_shared_head: bool):
 def test_validate_mtp_layer_count_rejects_multi_layer_per_layer_heads():
     """DeepSeek-style: the proposer reads logits off layer 0's head at every
     step, and only the layer that ran at step 0 has its top-k buffer written."""
-    proposer = _make_proposer(method="mtp")
+    proposer = make_proposer(method="mtp")
     proposer.draft_model = SimpleNamespace(
         model=SimpleNamespace(
             num_mtp_layers=2, layers=_nextn_layers(2, with_shared_head=True)
@@ -2269,7 +2250,7 @@ def test_validate_mtp_layer_count_allows_multi_layer_single_head():
     """Qwen3.5-style: several nextn layers under one top-level lm_head and no
     indexer. Neither failure mode applies, so the count alone must not refuse
     it."""
-    proposer = _make_proposer(method="mtp")
+    proposer = make_proposer(method="mtp")
     proposer.draft_model = SimpleNamespace(
         model=SimpleNamespace(
             num_mtp_layers=3, layers=_nextn_layers(3, with_shared_head=False)
@@ -2279,7 +2260,7 @@ def test_validate_mtp_layer_count_allows_multi_layer_single_head():
 
 
 def test_validate_mtp_layer_count_accepts_a_single_layer_checkpoint():
-    proposer = _make_proposer(method="mtp")
+    proposer = make_proposer(method="mtp")
     proposer.draft_model = SimpleNamespace(
         model=SimpleNamespace(
             num_mtp_layers=1, layers=_nextn_layers(1, with_shared_head=True)
@@ -2290,7 +2271,7 @@ def test_validate_mtp_layer_count_accepts_a_single_layer_checkpoint():
 
 def test_validate_mtp_layer_count_is_a_noop_for_a_non_mtp_draft():
     """An eagle3 draft has no nextn layers to count."""
-    proposer = _make_proposer(method="eagle3")
+    proposer = make_proposer(method="eagle3")
     proposer.draft_model = SimpleNamespace(model=SimpleNamespace())
     proposer._validate_mtp_layer_count()
 
@@ -2318,7 +2299,7 @@ def _forward_draft_harness(monkeypatch):
     test. Which program a step runs does not depend on the device."""
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     proposer.draft_vllm_config = object()
     proposer.runner = SimpleNamespace(
         mesh=object(), _dp_num_tokens_across_dp=lambda n: n, num_tokens_paddings=[2]
@@ -2552,7 +2533,7 @@ def _kv_sharing_proposer(
         ),
     )
 
-    proposer = _make_proposer(method="mtp")
+    proposer = make_proposer(method="mtp")
     draft_text_config = SimpleNamespace(layer_types=list(draft_layer_types or []))
     proposer.draft_model = SimpleNamespace(
         config=SimpleNamespace(get_text_config=lambda: draft_text_config),
@@ -2765,7 +2746,7 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
 
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = make_proposer(draft_tp=1, method="mtp")
     proposer.runner = SimpleNamespace(mesh=object())
     proposer.vllm_config.load_config = SimpleNamespace(device=None)
     proposer.vllm_config.device_config = SimpleNamespace(device="cpu")
