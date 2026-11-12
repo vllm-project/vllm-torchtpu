@@ -73,10 +73,11 @@ def lane_sum_features():
     if raw in ("", "0"):
         return ()
     names = {name.strip() for name in raw.split(",") if name.strip()} - {"1"}
-    unknown = sorted(names - {"bf16mass"})
+    unknown = sorted(names - {"f32mass"})
     if unknown:
         raise ValueError(f"Unknown VLLM_TPU_QSA_PREFILL_LANE_SUM tokens: {unknown}")
-    return ("on",) + (("bf16mass",) if "bf16mass" in names else ())
+    # Default: the mass sums the BF16-rounded probabilities the PV dot uses.
+    return ("on",) + (() if "f32mass" in names else ("bf16mass",))
 
 
 def default_query_tile(query_block):
