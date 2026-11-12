@@ -4675,12 +4675,8 @@ class TPUModelRunner(GPUModelRunner):
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         next_tokens_tpu_offset = 0
-        # Non-spec chunks: bucketed device logprobs and their real row counts,
-        # copied to the host with the sampled tokens and materialized in
-        # AsyncTPUModelRunnerOutput.get_output instead of a blocking .tolists().
-        deferred_plain_logprobs: list[tuple[LogprobsTensors, int]] = []
-        # Spec step only: per-chunk logprobs, filtered to the accepted tokens
-        # once they reach the host (AsyncTPUModelRunnerOutput.get_output).
+        # Per-chunk logprobs, cut to each request's generated tokens once they
+        # reach the host (AsyncTPUModelRunnerOutput.get_output).
         spec_logprobs_chunks: list[SpecLogprobsChunk] = []
 
         # True if the step has drafts to verify (a request carried drafts in
@@ -4880,7 +4876,11 @@ class TPUModelRunner(GPUModelRunner):
                     next_tokens_tpu_offset += selected_token_ids.shape[0]
                 if needs_logprobs:
                     assert chunk_logprobs is not None
-                    deferred_plain_logprobs.append((chunk_logprobs, num_reqs))
+                    spec_logprobs_chunks.append(
+                        SpecLogprobsChunk(
+                            tensors=chunk_logprobs, row_starts=np.arange(num_reqs)
+                        )
+                    )
 
                 self._update_num_xla_graphs("decoding_step")
                 cur_start_idx = cur_end_idx
@@ -4923,7 +4923,6 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens,
                     combined_selected_tokens_real_lens,
                     spec_logprobs=spec_logprobs_chunks,
-                    plain_logprobs=deferred_plain_logprobs or None,
                 )
 
         if self.scheduler_config.async_scheduling:

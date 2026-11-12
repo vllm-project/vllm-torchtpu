@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import create_sequence_layout_planner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
 
 
 class _BlockTable:
@@ -267,4 +268,17 @@ def _scheduler_output(scheduled_tokens):
             f"req{i}": int(n) for i, n in enumerate(scheduled_tokens)
         },
         scheduled_spec_decode_tokens={},
+    )
+
+
+def _host_copy_state(chunks, lengths, **kwargs):
+    """Stand in for `AsyncTPUCopyState.from_device_chunks` in CPU tests: the
+    chunks are already host tensors and the ready event is a mock. Keyword
+    arguments reach `AsyncTPUCopyState` unchanged, so no stand-in needs an
+    edit when the method gains one."""
+    return AsyncTPUCopyState(
+        chunks_cpu=chunks,
+        chunk_real_lens=lengths,
+        copy_ready_event=MagicMock(),
+        **kwargs,
     )

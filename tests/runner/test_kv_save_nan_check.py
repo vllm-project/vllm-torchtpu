@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from runner_input_test_utils import _host_copy_state
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.sequence import IntermediateTensors
 
@@ -339,15 +340,6 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         has_structured_output_requests=False,
     )
 
-    def host_copy(chunks, lengths, spec_logprobs=None, plain_logprobs=None):
-        return AsyncTPUCopyState(
-            chunks_cpu=chunks,
-            chunk_real_lens=lengths,
-            copy_ready_event=MagicMock(),
-            spec_logprobs=spec_logprobs,
-            plain_logprobs=plain_logprobs,
-        )
-
     with (
         patch(
             "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
@@ -364,7 +356,9 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
             "vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context",
             side_effect=lambda *_a, **_kw: contextlib.nullcontext(),
         ),
-        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=host_copy),
+        patch.object(
+            AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
+        ),
     ):
         assert runner.execute_model(scheduler_output) is None
         output = runner.sample_tokens(None)

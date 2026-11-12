@@ -28,7 +28,6 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     assemble_spec_next_tokens,
     compute_num_rejected,
     extract_draft_token_ids,
-    plain_logprobs_lists,
     spec_logprobs_lists,
     subtract_num_rejected_tokens,
 )
@@ -289,24 +288,32 @@ def _assert_same_logprobs_lists(actual, expected):
 
 @pytest.mark.parametrize("num_logprobs", [0, 20])
 @pytest.mark.parametrize("real_rows", [[5], [16, 3], [16, 16, 7]])
-def test_plain_logprobs_lists_matches_the_blocking_path(num_logprobs, real_rows):
+def test_spec_logprobs_lists_without_gen_lens_matches_the_blocking_path(
+    num_logprobs, real_rows
+):
+    """gen_lens=None, one generated token per request: each chunk's first `n`
+    bucketed rows, in chunk order. A single chunk is sliced, not copied."""
     chunks = [
-        (_bucketed_logprobs(16, num_logprobs, seed), n)
+        SpecLogprobsChunk(_bucketed_logprobs(16, num_logprobs, seed), np.arange(n))
         for seed, n in enumerate(real_rows)
     ]
+    out = spec_logprobs_lists(chunks, gen_lens=None)
     _assert_same_logprobs_lists(
-        plain_logprobs_lists(chunks), _blocking_logprobs_lists(chunks)
+        out,
+        _blocking_logprobs_lists([(c.tensors, len(c.row_starts)) for c in chunks]),
     )
+    shared = np.shares_memory(out.logprobs, chunks[0].tensors.logprobs.numpy())
+    assert shared == (len(chunks) == 1)
 
 
 def test_get_output_attaches_plain_logprobs():
-    chunks = [(_bucketed_logprobs(8, 0, 0), 3)]
+    logprobs = _bucketed_logprobs(8, 0, 0)
     copy_state = AsyncTPUCopyState(
         chunks_cpu=[torch.tensor([[7], [8], [9], [0], [0], [0], [0], [0]])],
         chunk_real_lens=[3],
         copy_ready_event=None,
         completed=True,
-        plain_logprobs=chunks,
+        spec_logprobs=[SpecLogprobsChunk(logprobs, np.arange(3))],
     )
     out = AsyncTPUModelRunnerOutput(
         model_runner_output=ModelRunnerOutput(
@@ -319,7 +326,7 @@ def test_get_output_attaches_plain_logprobs():
         discard_sampled_tokens_req_indices=[1],
     ).get_output()
     assert out.sampled_token_ids == [[7], [], [9]]
-    _assert_same_logprobs_lists(out.logprobs, _blocking_logprobs_lists(chunks))
+    _assert_same_logprobs_lists(out.logprobs, _blocking_logprobs_lists([(logprobs, 3)]))
 
 
 def test_get_output_keeps_logprobs_without_plain_logprobs():
@@ -354,26 +361,26 @@ class _FakeEvent:
         self.synchronized += 1
 
 
-def test_from_device_chunks_copies_plain_logprobs_and_waits_for_them(
-    monkeypatch,
-):
+def test_from_device_chunks_copies_logprobs_and_waits_for_them(monkeypatch):
     monkeypatch.setattr(torch, "tpu", SimpleNamespace(Event=_FakeEvent), raising=False)
+    tokens = [torch.zeros((8, 1), dtype=torch.int32)]
     device_logprobs = _bucketed_logprobs(8, 2, 3)
     state = AsyncTPUCopyState.from_device_chunks(
-        [torch.zeros((8, 1), dtype=torch.int32)],
-        [5],
-        plain_logprobs=[(device_logprobs, 5)],
+        tokens, [5], spec_logprobs=[SpecLogprobsChunk(device_logprobs, np.arange(5))]
     )
     # The host copies ride the same async D2H as the sampled tokens; the
     # device sources stay alive until the copy event is waited on.
-    ((host_logprobs, num_rows),) = state.plain_logprobs
-    assert num_rows == 5
-    assert torch.equal(host_logprobs.logprobs, device_logprobs.logprobs)
-    assert state._plain_logprobs_tpu == [device_logprobs]
+    (host,) = state.spec_logprobs
+    assert np.array_equal(host.row_starts, np.arange(5))
+    assert torch.equal(host.tensors.logprobs, device_logprobs.logprobs)
+    assert state._logprobs_tpu is not None
+    assert state._logprobs_tpu[0] is device_logprobs
     state.wait()
     assert state.copy_ready_event.synchronized == 1
-    assert state._plain_logprobs_tpu is None
-    empty = AsyncTPUCopyState.from_device_chunks(
-        [torch.zeros((8, 1), dtype=torch.int32)], [5]
-    )
-    assert empty.plain_logprobs is None and empty._plain_logprobs_tpu is None
+    assert state._logprobs_tpu is None
+    empty = AsyncTPUCopyState.from_device_chunks(tokens, [5])
+    assert empty.spec_logprobs is None and empty._logprobs_tpu is None
+    # get_output needs one row start per real request in each chunk.
+    short = SpecLogprobsChunk(device_logprobs, np.arange(4))
+    with pytest.raises(AssertionError):
+        AsyncTPUCopyState.from_device_chunks(tokens, [5], spec_logprobs=[short])

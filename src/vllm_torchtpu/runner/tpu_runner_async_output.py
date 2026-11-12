@@ -28,14 +28,15 @@ INVALID_TOKEN_ID = -1
 
 @dataclass
 class SpecLogprobsChunk:
-    """One chunk's logprobs in a spec-decode step, one row per logits row.
+    """One chunk's logprobs, one row per logits row.
 
     A verify chunk's logits hold, per request, one row per draft token and
     then its bonus row, so request `i`'s verify slots are rows
     `row_starts[i]`, `row_starts[i] + 1`, ... in slot order, and its accepted
-    tokens are a prefix of them. A chunk without drafts has one row per
-    request (`row_starts[i] == i`). Rows are computed for every slot, accepted
-    or not, and filtered on the host once the accepted counts are known.
+    tokens are a prefix of them. A chunk without drafts, which includes every
+    chunk of a step without speculative decoding, has one row per request
+    (`row_starts[i] == i`). Rows are computed for every slot, accepted or
+    not, and filtered on the host once the accepted counts are known.
     """
 
     # Device tensors until the async copy is issued, CPU tensors after.
@@ -45,49 +46,57 @@ class SpecLogprobsChunk:
 
 
 def spec_logprobs_lists(
-    chunks: list[SpecLogprobsChunk], gen_lens: list[int]
+    chunks: list[SpecLogprobsChunk], gen_lens: list[int] | None
 ) -> LogprobsLists:
-    """Keep each request's accepted rows, in request order.
+    """Keep each request's generated rows, in request order.
 
     `gen_lens[i]` is request `i`'s number of generated tokens this step,
     counted across all chunks before any discard, as vLLM's rejection
-    sampler does.
+    sampler does. `gen_lens=None` means each request generated one token:
+    request `i` keeps row `row_starts[i]`, so a chunk without drafts keeps
+    the first `n` of its bucketed rows (`n` = its number of requests), in
+    chunk order, and `cu_num_generated_tokens` stays None.
     """
     ids, lps, ranks = [], [], []
     offset = 0
     for chunk in chunks:
         n = len(chunk.row_starts)
-        take = [
-            np.arange(start, start + g, dtype=np.int64)
-            for start, g in zip(chunk.row_starts, gen_lens[offset : offset + n])
-        ]
-        rows = np.concatenate(take) if take else np.zeros(0, dtype=np.int64)
-        ids.append(chunk.tensors.logprob_token_ids.numpy()[rows])
-        lps.append(chunk.tensors.logprobs.numpy()[rows])
-        ranks.append(chunk.tensors.selected_token_ranks.numpy()[rows])
+        if gen_lens is None:
+            rows = chunk.row_starts
+        else:
+            take = [
+                np.arange(start, start + g, dtype=np.int64)
+                for start, g in zip(chunk.row_starts, gen_lens[offset : offset + n])
+            ]
+            rows = np.concatenate(take) if take else np.zeros(0, dtype=np.int64)
+        index = _row_index(rows)
+        ids.append(chunk.tensors.logprob_token_ids[index])
+        lps.append(chunk.tensors.logprobs[index])
+        ranks.append(chunk.tensors.selected_token_ranks[index])
         offset += n
-    assert offset == len(gen_lens), (offset, len(gen_lens))
-    return LogprobsLists(
-        logprob_token_ids=np.concatenate(ids),
-        logprobs=np.concatenate(lps),
-        sampled_token_ranks=np.concatenate(ranks),
-        cu_num_generated_tokens=np.concatenate(([0], np.cumsum(gen_lens))).tolist(),
-    )
+    cu_num_generated_tokens = None
+    if gen_lens is not None:
+        assert offset == len(gen_lens), (offset, len(gen_lens))
+        cu_num_generated_tokens = np.concatenate(([0], np.cumsum(gen_lens))).tolist()
+    return LogprobsTensors(
+        logprob_token_ids=_cat_rows(ids),
+        logprobs=_cat_rows(lps),
+        selected_token_ranks=_cat_rows(ranks),
+        cu_num_generated_tokens=cu_num_generated_tokens,
+    ).tolists()
 
 
-def plain_logprobs_lists(chunks: list[tuple[LogprobsTensors, int]]) -> LogprobsLists:
-    """The LogprobsLists the blocking path builds in sample_tokens: each
-    chunk's first `n` rows, concatenated in chunk order, with
-    cu_num_generated_tokens None (one generated token per request)."""
-    return LogprobsLists(
-        logprob_token_ids=np.concatenate(
-            [t.logprob_token_ids.numpy()[:n] for t, n in chunks]
-        ),
-        logprobs=np.concatenate([t.logprobs.numpy()[:n] for t, n in chunks]),
-        sampled_token_ranks=np.concatenate(
-            [t.selected_token_ranks.numpy()[:n] for t, n in chunks]
-        ),
-    )
+def _row_index(rows: np.ndarray) -> slice | torch.Tensor:
+    """An index for `rows`: a slice, which takes a view instead of a copy,
+    when they are the leading rows 0, 1, ..., n - 1."""
+    if np.array_equal(rows, np.arange(len(rows))):
+        return slice(len(rows))
+    return torch.from_numpy(np.asarray(rows, dtype=np.int64))
+
+
+def _cat_rows(parts: list[torch.Tensor]) -> torch.Tensor:
+    """Concatenates the chunks' rows; a single chunk is returned uncopied."""
+    return parts[0] if len(parts) == 1 else torch.cat(parts)
 
 
 @dataclass
@@ -106,16 +115,12 @@ class AsyncTPUCopyState:
     chunks_tpu: list[torch.Tensor] | None = None
     completed: bool = False
     _sampled_token_ids_cpu: torch.Tensor | None = None
-    # Spec-decode step with logprobs requested: per-chunk logprobs, copied
-    # with the tokens and filtered to the accepted rows in `get_output`.
+    # Step with logprobs requested: per-chunk logprobs, copied with the
+    # tokens and cut to each request's rows in `get_output` (the accepted
+    # rows in a spec-decode step).
     spec_logprobs: list[SpecLogprobsChunk] | None = None
     # Device sources of `spec_logprobs`, kept alive until the copy lands.
-    _spec_logprobs_tpu: list[LogprobsTensors] | None = None
-    # Non-spec step with logprobs requested: per-chunk bucketed logprobs (CPU
-    # copies after from_device_chunks) and each chunk's real row count; trimmed
-    # and concatenated on the host in `get_output`.
-    plain_logprobs: list[tuple[LogprobsTensors, int]] | None = None
-    _plain_logprobs_tpu: list[LogprobsTensors] | None = None
+    _logprobs_tpu: list[LogprobsTensors] | None = None
 
     @classmethod
     def from_device_chunks(
@@ -123,17 +128,17 @@ class AsyncTPUCopyState:
         chunks_tpu: list[torch.Tensor],
         chunk_real_lens: list[int],
         spec_logprobs: list[SpecLogprobsChunk] | None = None,
-        plain_logprobs: list[tuple[LogprobsTensors, int]] | None = None,
     ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
-        plain_logprobs_tpu = None
-        if plain_logprobs:
-            plain_logprobs_tpu = [t for t, _ in plain_logprobs]
-            plain_logprobs = [(t.to_cpu_nonblocking(), n) for t, n in plain_logprobs]
-        spec_logprobs_tpu = None
+        logprobs_tpu = None
         if spec_logprobs:
-            spec_logprobs_tpu = [c.tensors for c in spec_logprobs]
+            # get_output takes request i's logprobs rows from the chunk that
+            # sampled it: one logprobs chunk per token chunk, with one row
+            # start per real request.
+            num_rows = [len(c.row_starts) for c in spec_logprobs]
+            assert num_rows == chunk_real_lens, (num_rows, chunk_real_lens)
+            logprobs_tpu = [c.tensors for c in spec_logprobs]
             spec_logprobs = [
                 SpecLogprobsChunk(c.tensors.to_cpu_nonblocking(), c.row_starts)
                 for c in spec_logprobs
@@ -146,9 +151,7 @@ class AsyncTPUCopyState:
             copy_ready_event=copy_ready_event,
             chunks_tpu=chunks_tpu,
             spec_logprobs=spec_logprobs or None,
-            _spec_logprobs_tpu=spec_logprobs_tpu,
-            plain_logprobs=plain_logprobs or None,
-            _plain_logprobs_tpu=plain_logprobs_tpu,
+            _logprobs_tpu=logprobs_tpu,
         )
 
     def fence_pending_device_work(self) -> None:
@@ -165,8 +168,7 @@ class AsyncTPUCopyState:
             return
         self.copy_ready_event.synchronize()
         self.chunks_tpu = None
-        self._spec_logprobs_tpu = None
-        self._plain_logprobs_tpu = None
+        self._logprobs_tpu = None
         self.completed = True
 
     @property
@@ -229,10 +231,6 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             return self._model_runner_output
 
         self.copy_state.wait()
-        if self.copy_state.plain_logprobs:
-            self._model_runner_output.logprobs = plain_logprobs_lists(
-                self.copy_state.plain_logprobs
-            )
         selected_token_ids = self.copy_state.sampled_token_ids_cpu
         if selected_token_ids.numel() == 0:
             self._model_runner_output.sampled_token_ids = []
@@ -243,6 +241,10 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         max_gen_len = selected_token_ids.shape[-1]
         if max_gen_len == 1:
             valid_sampled_token_ids = selected_token_ids.tolist()
+            if self.copy_state.spec_logprobs:
+                self._model_runner_output.logprobs = spec_logprobs_lists(
+                    self.copy_state.spec_logprobs, gen_lens=None
+                )
             for i in self.discard_sampled_tokens_req_indices:
                 valid_sampled_token_ids[i].clear()
         else:
