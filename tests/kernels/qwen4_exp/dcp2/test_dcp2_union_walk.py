@@ -52,6 +52,7 @@ from dcp2_harness import (  # noqa: E402
     D,
     ON_TPU,
     TPU_TOL,
+    Tolerance,
     check_partial,
     diff_report,
     make_case,
@@ -76,6 +77,10 @@ UNION_ENV = {
     "VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT": "32768",
     "VLLM_TPU_QSA_PREFILL_LEAN": "1",
     "VLLM_TPU_QSA_PREFILL_PREFIX_PAGES": "1",
+    # Correctness cases force the walk (random selections are dense); the
+    # bench sets the served alpha / precheck explicitly.
+    "VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0",
+    "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "0",
 }
 
 
@@ -193,9 +198,27 @@ def run_rank(case, rank, setenv, union_dcp, extra=None):
     return np.asarray(out), np.asarray(lse)
 
 
+def _err(x, ref, live):
+    """|x - ref| over live rows, relative to each head vector's max |ref|: (max, p99)."""
+    x, ref = np.asarray(x, np.float64), np.asarray(ref, np.float64)
+    scale = np.maximum(np.abs(ref).max(-1, keepdims=True), 1e-30)
+    e = (np.abs(x - ref) / scale)[np.asarray(live, bool)]
+    return (float(e.max(initial=0)), float(np.percentile(e, 99)) if e.size else 0.0)
+
+
+def _worst_rows(x, ref, case, kv_lens, k=4):
+    e = np.abs(np.asarray(x, np.float64) - np.asarray(ref, np.float64)).max(axis=(1, 2))
+    top = np.argsort(-e)[:k]
+    return [(int(i), round(float(e[i]), 5), int(case.lengths[i]), int(case.row_req[i]), int(kv_lens[i]))
+            for i in top]
+
+
 def check_union_case(case, setenv, *, tol=TPU_TOL):
-    """Union-walk DCP partials vs the f32 reference and the DCP block-sparse
-    kernel per rank; merged + gated vs the replicated served route."""
+    """Union-walk DCP partials and gated outputs, judged as the union walk is
+    accepted without DCP (test_qwen4_exp_union_walk_tp_rank): error vs the f32
+    reference within twice the DCP block-sparse kernel's (max and p99), exact
+    support (rows owning nothing: 0 / -inf), lse at the harness tolerance, no
+    NaN; and the walk must have run (not bitwise the block-sparse output)."""
     reports = {}
     union, sparse = [], []
     for r in range(D):
@@ -206,31 +229,43 @@ def check_union_case(case, setenv, *, tol=TPU_TOL):
                                             case.dcp_rows, case.rank_pools[r], dcp=dcp, **case.opts)
         _, kv_lens, _, _ = reference_metadata(case.blocks, case.lengths, case.dcp_rows,
                                               ratio=case.ratio, page_size=B, dcp=(r, D))
-        reports[f"union_vs_ref{r}"] = check_partial(*u, ref_out, ref_lse, kv_lens, tol,
-                                                    what=f"union rank {r} vs reference")
-        reports[f"union_vs_sparse{r}"] = check_partial(*u, *s, kv_lens, tol,
-                                                       what=f"union rank {r} vs block-sparse")
-        # The walk ran: its online softmax order differs from the block-sparse kernel's.
+        loose = Tolerance(rtol=1.0, atol=1.0, lse_atol=tol.lse_atol)  # support / NaN / lse checks only
+        check_partial(*u, ref_out, ref_lse, kv_lens, loose, what=f"union rank {r} vs reference")
+        check_partial(*s, ref_out, ref_lse, kv_lens, loose, what=f"block-sparse rank {r} vs reference")
+        live = np.broadcast_to((kv_lens > 0)[:, None], np.asarray(ref_lse).shape)
+        eu, es = _err(u[0], ref_out, live), _err(s[0], ref_out, live)
+        reports[f"err_vs_ref{r}"] = dict(union=eu, block_sparse=es,
+                                         worst_union=_worst_rows(u[0], ref_out, case, kv_lens),
+                                         worst_sparse=_worst_rows(s[0], ref_out, case, kv_lens))
+        assert eu[0] <= 2 * max(es[0], 1e-6) and eu[1] <= 2 * max(es[1], 1e-6), (
+            f"rank {r}: union error {eu} > 2x block-sparse {es}: {reports[f'err_vs_ref{r}']}")
         reports[f"walk_ran{r}"] = bool((u[0] != s[0]).any())
         reports[f"rows_owning_nothing{r}"] = int(((kv_lens == 0) & (case.lengths > 0)).sum())
         union.append(u)
         sparse.append(s)
     assert any(reports[f"walk_ran{r}"] for r in range(D)), "union walk output equals block-sparse bitwise"
-    from test_dcp2_prefill import check_pregate, merge_pair, production_replicated
-    from dcp2_harness import check_gated
+    from dcp2_harness import combine_lse, gate_output
+    from test_dcp2_prefill import merge_pair
 
-    out_pair = jnp.stack([jnp.asarray(u[0]) for u in union])
-    lse_pair = jnp.stack([jnp.asarray(u[1]) for u in union])
-    _set_env(setenv, False)
-    live = np.broadcast_to((case.lengths > 0)[:, None], (len(case.lengths), case.heads))
-    gated_rep = production_replicated(case)
-    pre_rep = production_replicated(case, pregate=True)
-    for r in range(D):
-        gate_r = case.gate[:, r * case.heads : (r + 1) * case.heads]
-        gated = qsa_rpa.dcp_combine(out_pair, lse_pair, gate_r, rank_operand(r))
-        reports[f"pregate{r}"] = check_pregate(*merge_pair(out_pair, lse_pair, r, case.heads),
-                                               *pre_rep[r], live, tol, what=f"union pre-gate {r}")
-        reports[f"gated{r}"] = check_gated(gated, gated_rep[r], live, tol, what=f"union gated {r}")
+    full_out, full_lse = reference_attend(case.q, case.gate, case.blocks, case.lengths, case.full_rows,
+                                          case.full_pool, **case.opts)
+    live_all = np.isfinite(np.asarray(full_lse))
+    for name, parts in (("union", union), ("block_sparse", sparse)):
+        out_pair = jnp.stack([jnp.asarray(p[0]) for p in parts])
+        lse_pair = jnp.stack([jnp.asarray(p[1]) for p in parts])
+        merged = np.concatenate([np.asarray(merge_pair(out_pair, lse_pair, r, case.heads)[0]) for r in range(D)],
+                                axis=1)
+        gated = np.concatenate([np.asarray(qsa_rpa.dcp_combine(
+            out_pair, lse_pair, case.gate[:, r * case.heads:(r + 1) * case.heads], rank_operand(r)), np.float32)
+            for r in range(D)], axis=1)
+        ref_gated = np.asarray(gate_output(full_out, case.gate, jnp.asarray(live_all)), np.float32)
+        assert not np.isnan(gated).any() and np.all(gated[~live_all] == 0), name
+        np.testing.assert_array_equal(np.isfinite(np.asarray(combine_lse(lse_pair))), live_all)
+        reports[f"merged_err_{name}"] = _err(merged, full_out, live_all)
+        reports[f"gated_err_{name}"] = _err(gated, ref_gated, live_all)
+    for kind in ("merged", "gated"):
+        eu, es = reports[f"{kind}_err_union"], reports[f"{kind}_err_block_sparse"]
+        assert eu[0] <= 2 * max(es[0], 1e-6) and eu[1] <= 2 * max(es[1], 1e-6), (kind, eu, es)
     return reports
 
 
@@ -297,6 +332,11 @@ def test_flag_routes_dcp_prefill_to_union_walk(monkeypatch, slot):
     _set_env(monkeypatch.setenv, False)
     off = _jaxpr(True, slot)
     assert "qsa_union_walk" not in off
+    # The served defaults (alpha 0.2, sampled precheck) trace too.
+    _set_env(monkeypatch.setenv, True, {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.2",
+                                        "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "8"})
+    served = _jaxpr(True, slot)
+    assert "qsa_union_walk_g128_kv1024_lean_fast_pg_lse" in served and served != on
     # Variants the DCP walk does not support keep the block-sparse kernel.
     _set_env(monkeypatch.setenv, True, {"VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS": "1"})
     assert "qsa_union_walk" not in _jaxpr(True, slot)
@@ -342,16 +382,30 @@ def test_tpu_union_dcp_fallback_is_block_sparse(monkeypatch, which):
 # Bench: per-layer union-walk DCP vs block-sparse DCP at an 8K chunk
 
 
-def clustered_blocks(rng, lengths, budget, ratio=RATIO, hot=3):
-    """Correlated selections: rows of a request draw from one shared candidate
-    pool of ``hot * budget`` groups (plus their causal tail), as indexer
-    selections of neighbouring rows overlap."""
+def model_blocks(rng, lengths, budget, model, ratio=RATIO, page_size=B):
+    """Selections of one long chunk. "random": uniform over the row's complete
+    groups (dense union). "hot<f>": rows draw from one request-wide pool of a
+    fraction f of the groups, spread uniformly (union ~ f, every page touched).
+    "pages<f>": the pool is every group of a random fraction f of the pages
+    (union ~ f, page-local: block-sparse skips the other pages)."""
     lengths = np.asarray(lengths)
     complete_max = int(lengths.max()) // ratio
-    pool = np.sort(rng.choice(complete_max, min(complete_max, hot * budget), replace=False))
+    if model == "random":
+        from dcp2_harness import random_blocks
+
+        return random_blocks(rng, lengths, ratio, budget)
+    frac = float(model.lstrip("hotpages"))
+    if model.startswith("hot"):
+        pool = np.sort(rng.choice(complete_max, max(1, int(frac * complete_max)), replace=False))
+    else:
+        per = page_size // ratio
+        pages = -(-complete_max // per)
+        keep = rng.choice(pages, max(1, int(round(frac * pages))), replace=False)
+        pool = np.sort((keep[:, None] * per + np.arange(per)[None]).reshape(-1))
+        pool = pool[pool < complete_max]
     blocks = np.full((len(lengths), budget), -1, np.int32)
     for i, n in enumerate(lengths):
-        cand = pool[pool < int(n) // ratio]
+        cand = pool[: np.searchsorted(pool, int(n) // ratio)]
         count = min(len(cand), budget)
         if count:
             blocks[i, :count] = rng.choice(cand, count, replace=False)
@@ -368,31 +422,86 @@ def _time(fn, iters=10):
     return (time.perf_counter() - t0) / iters * 1e3
 
 
-def bench(chunk=8192, context=74000, budget=2048, selections=("random", "clustered")):
+ARMS = {
+    "block_sparse": {"VLLM_TPU_QSA_PREFILL_UNION_DCP": "0"},
+    "walk_forced": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "0"},
+    "served_a0.2_pc8": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.2", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "8"},
+    "served_a0.2_nopc": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.2", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "0"},
+    "fallback_cap1": {"VLLM_TPU_QSA_PREFILL_UNION_CAP": "1"},
+}
+MODELS = ("random", "hot0.1", "hot0.2", "hot0.36", "pages0.1", "pages0.2", "pages0.36")
+
+
+def union_fraction(blocks, lengths, table_columns, rank):
+    """Owned union / owned visible per 128-row tile (median, max) for this rank."""
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_union_plan import union_bits_plan
+
+    lb, ll = ud.dcp_local_selection(jnp.asarray(blocks), jnp.asarray(lengths), rank=rank_operand(rank),
+                                    world=D, page_size=B, ratio=RATIO)
+    cap = table_columns * B // RATIO
+    _, _, usize, _ = union_bits_plan(lb, ll, group=128, union_cap=cap, groups_cap=cap, ratio=RATIO)
+    vis = np.asarray(jnp.max(((ll + RATIO - 1) // RATIO).reshape(-1, 128), axis=1))
+    f = np.asarray(usize) / np.maximum(vis, 1)
+    return round(float(np.median(f)), 3), round(float(f.max()), 3)
+
+
+def plan_breakdown(case, rank=0):
+    """(2): the DCP walk's per-layer plan pieces, timed alone."""
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_union_plan import union_bits_plan
+
+    blocks, lengths = jnp.asarray(case.blocks), jnp.asarray(case.lengths)
+    table = jnp.asarray(case.dcp_rows)
+    cap = table.shape[1] * B // RATIO
+    r = rank_operand(rank)
+    local = jax.jit(lambda b, l: ud.dcp_local_selection(b, l, rank=r, world=D, page_size=B, ratio=RATIO))
+    lb, ll = local(blocks, lengths)
+    plan = jax.jit(lambda b, l: union_bits_plan(b, l, group=128, union_cap=12288, groups_cap=cap, ratio=RATIO))
+    rows = blocks.shape[0] // 128
+    pick = np.arange(0, rows, 8)
+    pre = jax.jit(lambda b, l: union_bits_plan(b.reshape(rows, 128, -1)[pick].reshape(-1, b.shape[1]),
+                                               l.reshape(rows, 128)[pick].reshape(-1), group=128,
+                                               union_cap=12288, groups_cap=cap, ratio=RATIO)[2])
+    # Layer-invariant pieces: per-group page rows and per-word pool bases (identity layout).
+    words = -(-cap // 32)
+    word_start = jnp.arange(words, dtype=jnp.int32) * (32 * RATIO)
+    inv = jax.jit(lambda t: t.reshape(-1, 128, t.shape[1])[:, 0][..., jnp.minimum(word_start // B, t.shape[1] - 1)]
+                  * B + word_start % B)
+    out = dict(local_selection_ms=_time(lambda: local(blocks, lengths)),
+               plan_ms=_time(lambda: plan(lb, ll)),
+               precheck_stride8_ms=_time(lambda: pre(lb, ll)),
+               layer_invariant_ms=_time(lambda: inv(table)))
+    return {k: round(v, 3) for k, v in out.items()}
+
+
+def bench(chunk=8192, context=74000, budget=2048, models=MODELS, ranks=(0,)):
     results = {}
-    for sel in selections:
-        rng = np.random.default_rng(11)
-        case = union_case(rng, [(context - chunk, chunk)], budget=budget, pad_to=0)
-        if sel == "clustered":
-            case.blocks = clustered_blocks(rng, case.lengths, budget)
-        for r in range(D):
+    case = union_case(np.random.default_rng(11), [(context - chunk, chunk)], budget=budget, pad_to=0)
+    for model in models:
+        case.blocks = model_blocks(np.random.default_rng(12), case.lengths, budget, model)
+        if model == "random":
+            results["plan_breakdown"] = plan_breakdown(case)
+            print("BENCH plan_breakdown", results["plan_breakdown"], flush=True)
+        for r in ranks:
             args = (case.q, case.gate, jnp.asarray(case.blocks), jnp.asarray(case.lengths),
                     jnp.asarray(case.dcp_rows), case.rank_pools[r], jnp.asarray(case.starts))
-            times, outs = {}, {}
-            for arm, union_dcp in (("union", True), ("block_sparse", False)):
-                _set_env(os.environ.__setitem__, union_dcp)
+            row = dict(union_frac_median_max=union_fraction(case.blocks, case.lengths, case.dcp_rows.shape[1], r))
+            outs = {}
+            for arm, extra in ARMS.items():
+                for k, v in UNION_ENV.items():
+                    os.environ[k] = v
+                os.environ["VLLM_TPU_QSA_PREFILL_UNION_DCP"] = "1"
+                for k, v in extra.items():
+                    os.environ[k] = v
                 fn = jax.jit(lambda *a: qsa_rpa._prefill_attention(
                     *a, dcp=(rank_operand(r), D), return_lse=True, **case.opts)[:2])
-                times[arm] = _time(lambda: fn(*args))
-                outs[arm] = [np.asarray(x) for x in fn(*args)]
-            _, kv_lens, _, _ = reference_metadata(case.blocks, case.lengths, case.dcp_rows,
-                                                  ratio=RATIO, page_size=B, dcp=(r, D))
-            agree = check_partial(*outs["union"], *outs["block_sparse"], kv_lens, TPU_TOL,
-                                  what=f"bench {sel} rank {r}")
-            results[f"{sel}_rank{r}"] = dict(
-                union_ms=round(times["union"], 3), block_sparse_ms=round(times["block_sparse"], 3),
-                speedup=round(times["block_sparse"] / times["union"], 3), union_vs_sparse=agree)
-            print("BENCH", sel, r, results[f"{sel}_rank{r}"], flush=True)
+                row[arm] = round(_time(lambda: fn(*args)), 3)
+                outs[arm] = np.asarray(fn(*args)[0])
+            row["served_took_walk"] = bool((outs["served_a0.2_pc8"] != outs["block_sparse"]).any())
+            row["walk_vs_bs_max_abs"] = float(np.abs(outs["walk_forced"] - outs["block_sparse"]).max())
+            row["walk_speedup"] = round(row["block_sparse"] / row["walk_forced"], 3)
+            row["served_speedup"] = round(row["block_sparse"] / row["served_a0.2_pc8"], 3)
+            results[f"{model}_rank{r}"] = row
+            print("BENCH", model, r, row, flush=True)
     return results
 
 
