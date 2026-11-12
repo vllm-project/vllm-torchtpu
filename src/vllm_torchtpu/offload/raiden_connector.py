@@ -452,6 +452,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         req_status = self._req_status.get(req_id)
         if req_status is None:
             return False
+        if self._raiden_manager.refresh_lru:
+            # additional_config raiden_offload_refresh_lru: the request reused
+            # whatever of its prefix is host-resident; move that to the MRU end
+            # so a prefix that stays hot in HBM does not age out of the host.
+            for group_state in req_status.group_states:
+                self._raiden_manager.touch_prefix(group_state.offload_keys)
         blocks_per_chunk = self.config.blocks_per_chunk
         blocks: set[int] = set()
         for group_state in req_status.group_states:

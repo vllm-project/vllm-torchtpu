@@ -83,7 +83,7 @@ import os
 import socket
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -148,6 +148,9 @@ _SAVE_RETRIES = envs.VLLM_TPU_OFFLOAD_SAVE_RETRIES
 # sockets cannot claim the port or trigger TCP loopback self-connects while
 # workers poll before KVCacheStore binds.
 _DEFAULT_CONTROLLER_PORT = 27800
+
+# Seconds between the manager's host-pool stats lines (`_maybe_log_host_stats`).
+_HOST_STATS_LOG_INTERVAL_S = 30.0
 _IP_LOCAL_PORT_RANGE_PATH = "/proc/sys/net/ipv4/ip_local_port_range"
 _DEFAULT_EPHEMERAL_PORT_RANGE = (32768, 60999)
 
@@ -511,6 +514,12 @@ class RaidenOffloadingManager(OffloadingManager):
         # local loads by host block and stores by device block, so runs
         # consecutive on both sides move as one copy (`_dma_order`).
         host_order_dma: bool = False,
+        # additional_config raiden_offload_refresh_lru (default off): a key
+        # that is already host-resident moves to the Most Recently Used end
+        # when prepare_store offers it again, and a finished request's
+        # resident prefix is refreshed (`touch_prefix`), so prefixes that stay
+        # hot in HBM do not age out of the host LRU.
+        refresh_lru: bool = False,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -526,7 +535,19 @@ class RaidenOffloadingManager(OffloadingManager):
         self._capacity_keys = offload_logical_blocks_capacity
         self._device_block_size_factor = device_block_size_factor
         self._host_order_dma = host_order_dma
+        self._refresh_lru = refresh_lru
         self._key_namespace = key_namespace
+        # Host-pool counters for `_maybe_log_host_stats`, reset every line:
+        # lookup outcomes (HIT / MISS / HIT_PENDING), resident keys that
+        # prepare_store skipped, keys moved to the MRU end. Evicted sub-blocks
+        # are counted under `_eviction_lock` (the callback runs on a Raiden
+        # thread). `_host_blocks_used` estimates occupancy without asking the
+        # store: sub-blocks whose save landed minus sub-blocks evicted.
+        self.host_stats: Counter[str] = Counter()
+        self._host_evicted_blocks = 0
+        self._host_blocks_used = 0
+        self._host_blocks_total = kernel_physical_blocks_capacity
+        self._host_stats_last_log: float | None = None
         # Cross-instance sharing: publishing blocks to the global registry
         # requires a peer-reachable store_server_ip.
         self._enable_global = bool(global_registry_address)
@@ -792,6 +813,11 @@ class RaidenOffloadingManager(OffloadingManager):
         self._unloadable.pop(req_context.req_id, None)
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        result = self._lookup(key, req_context)
+        self.host_stats[result.name] += 1
+        return result
+
+    def _lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         if key in self._unloadable.get(req_context.req_id, ()):
             return LookupResult.MISS
         if key in self._inflight_store_keys:
@@ -896,6 +922,37 @@ class RaidenOffloadingManager(OffloadingManager):
             ]
             if held:
                 self._store.release(held)
+
+    @property
+    def refresh_lru(self) -> bool:
+        return self._refresh_lru
+
+    def touch_prefix(self, keys: Sequence[OffloadKey]) -> int:
+        """`touch` for a prefix chain in one store call; returns the number
+        of keys moved to the MRU end.
+
+        One pinning lookup over the chain's sub-hashes finds its resident
+        prefix (a lookup stops at the first miss, and nothing past a miss is
+        loadable anyway). The release goes tail first, so the head of the
+        chain ends up most recent and is evicted last: losing the tail keeps
+        the rest of the prefix usable. Entries answered from the storage tier
+        or a peer hold no pin and are not released (see `touch`).
+        """
+        if not keys:
+            return 0
+        skip = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
+        held = [
+            sub_hash
+            for sub_hash, block in self._store.lookup(self._expand_keys(list(keys)))
+            if block.status not in skip
+        ]
+        if not held:
+            return 0
+        held.reverse()
+        self._store.release(held)
+        refreshed = len(held) // self._device_block_size_factor
+        self.host_stats["refreshed"] += refreshed
+        return refreshed
 
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
@@ -1013,6 +1070,7 @@ class RaidenOffloadingManager(OffloadingManager):
             self._block_status.HOST_AND_HBM,
             self._block_status.REMOTE,
         )
+        resident_keys: list[OffloadKey] = []
         for key in keys:
             if key in self._inflight_store_keys:
                 continue
@@ -1021,8 +1079,14 @@ class RaidenOffloadingManager(OffloadingManager):
             if len(matches) == len(sub_hashes) and all(
                 block.status in resident_statuses for _, block in matches
             ):
+                resident_keys.append(key)
                 continue
             keys_to_store.append(key)
+        self.host_stats["skipped_resident"] += len(resident_keys)
+        if self._refresh_lru and resident_keys:
+            # The keys arrive in chain order; refreshing them as one chain
+            # leaves the earliest most recent.
+            self.touch_prefix(resident_keys)
         if len(keys_to_store) > self._capacity_keys:
             return None
         # Atomic admission happens at job-submit time via insert; in-flight
@@ -1057,6 +1121,7 @@ class RaidenOffloadingManager(OffloadingManager):
     def _on_eviction(self, evicted_hashes: list[bytes]) -> None:
         """Callback invoked by Raiden C++ store upon host LRU cache eviction."""
         with self._eviction_lock:
+            self._host_evicted_blocks += len(evicted_hashes)
             for sub_hash in evicted_hashes:
                 parsed = self._sub_hash_to_offload_key(sub_hash)
                 if parsed is None:
@@ -1096,6 +1161,51 @@ class RaidenOffloadingManager(OffloadingManager):
         # read_remote. Drop the leftovers each step; a request retried
         # next step re-runs lookup() and repopulates the stash.
         self._remote_slices.clear()
+        self._maybe_log_host_stats()
+
+    def _maybe_log_host_stats(self, now: float | None = None) -> None:
+        """One INFO line per `_HOST_STATS_LOG_INTERVAL_S` per scheduler
+        process: counters since the last line, nothing that scans the store."""
+        if now is None:
+            now = time.monotonic()
+        last = self._host_stats_last_log
+        if last is None:
+            self._host_stats_last_log = now
+            return
+        elapsed = now - last
+        if elapsed < _HOST_STATS_LOG_INTERVAL_S:
+            return
+        with self._eviction_lock:
+            evicted = self._host_evicted_blocks
+            self._host_evicted_blocks = 0
+        self._host_blocks_used = min(
+            max(0, self._host_blocks_used - evicted), self._host_blocks_total
+        )
+        # Pins held by live jobs (store pins not yet spent by a save, local
+        # loads not yet landed): bounded by the in-flight jobs, not the store.
+        pinned = sum(
+            len(self._pins_still_held(admission))
+            for admission in self._admissions.values()
+        )
+        c = self.host_stats
+        logger.info(
+            "Raiden host offload: %.0f s, lookups HIT %d MISS %d HIT_PENDING %d, "
+            "evictions %.1f blocks/s, pinned %d, host blocks used %d/%d (est.), "
+            "resident skipped %d, refreshed %d keys (refresh_lru=%s)",
+            elapsed,
+            c["HIT"],
+            c["MISS"],
+            c["HIT_PENDING"],
+            evicted / elapsed,
+            pinned,
+            self._host_blocks_used,
+            self._host_blocks_total,
+            c["skipped_resident"],
+            c["refreshed"],
+            self._refresh_lru,
+        )
+        c.clear()
+        self._host_stats_last_log = now
 
     def reset_cache(self) -> None:
         # Backstop only: TPURaidenOffloadingConnector.reset_cache() reports
@@ -1574,6 +1684,8 @@ class RaidenOffloadingManager(OffloadingManager):
                     # A save or a local load that landed spends the pin the
                     # job was holding for that sub-hash.
                     admission.consumed_sub_hashes.add(sub_hash)
+                    if admission.op == AdmissionOp.STORE:
+                        self._host_blocks_used += 1
                 admission.pending.discard(sub_hash)
                 if not admission.pending:
                     newly_terminal[admission.job_id] = admission
@@ -3014,6 +3126,12 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 dp_rank=self.dp_rank,
                 host_order_dma=bool(
                     option(self.vllm_config.additional_config, "raiden_host_order_dma")
+                ),
+                refresh_lru=bool(
+                    option(
+                        self.vllm_config.additional_config,
+                        "raiden_offload_refresh_lru",
+                    )
                 ),
             )
         return self._manager
