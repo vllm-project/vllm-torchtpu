@@ -38,8 +38,9 @@ PREFILL_IO = ("embedding", "lm_head", "output_res", "final_norm")
 PREFILL_KDA = ("k_gate", "k_fb", "k_projection", "k_conv", "k_a_log", "k_dt", "k_norm", "k_o")
 PREFILL_MLA = ("m_qa", "m_qb", "m_ka", "m_kb", "m_gate", "m_qnorm", "m_knorm", "m_o")
 PREFILL_MOE_DENSE = ("router", "router_bias", "latent_norm")
-# Prefill families that are the decode's tensors as loaded (EP8 experts; k_o and
-# m_o differ, and the latent and shared projections come from the SP cache).
+# Prefill families that are the decode's tensors as loaded (the experts and
+# router of an EP16 decode; k_o and m_o differ, and the latent and shared
+# projections come from the SP cache).
 PREFILL_SHARED = (PREFILL_IO + PREFILL_COMMON
                   + tuple(n for n in PREFILL_KDA if n != "k_o")
                   + tuple(n for n in PREFILL_MLA if n != "m_o")
@@ -749,8 +750,8 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
     Yields ``(group, name, array)`` with ``group`` in io/common/kda/mla/moe
     (per-rank arrays, without the rank axis); expert families first
     (``split_experts``: per file, as in :func:`iter_decode_rank`). Families in
-    ``skip`` (a subset of :data:`PREFILL_SHARED`, EP8 only for the experts)
-    are not read: the caller already holds them.
+    ``skip`` (a subset of :data:`PREFILL_SHARED`; the experts all four, from an
+    EP16 decode) are not read: the caller already holds them.
     """
     if not skip <= set(PREFILL_SHARED):
         raise ValueError(f"prefill families {sorted(skip - set(PREFILL_SHARED))} cannot be shared")
@@ -773,11 +774,13 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
                 lambda: projection(name))
 
     ep = _config().prefill_expert_parallel
-    if skip & set(EXPERT_FAMILIES) and (ep != 8 or not set(EXPERT_FAMILIES) <= skip):
-        raise ValueError("only all four EP8 prefill expert families are the decode's tensors")
+    if skip & set(EXPERT_FAMILIES) and (
+        ep != 16 or _config().decode_expert_parallel != 16 or not set(EXPERT_FAMILIES) <= skip
+    ):
+        raise ValueError("only all four EP16 prefill expert families, from an EP16 decode, are the decode's tensors")
     jobs: list[tuple] = []
     if skip & set(EXPERT_FAMILIES):
-        pass  # the decode's EP8 experts
+        pass  # the EP16 decode's experts
     elif ep == 16:
         jobs += _ep16_expert_jobs(presharded, rank_dir, rank, layers, prefill_expert_plan(layers))
     elif ep == 32:  # 28 whole experts, regrouped from the EP8 group's quarters (same host)

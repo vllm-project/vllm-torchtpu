@@ -6,10 +6,11 @@
 selected by an engine without a KV transfer config) holds a
 :class:`KimiPrefiller` and a :class:`KimiDecoder` over the same devices and the
 same vLLM unified pools, and one copy of the weights they share: the decoder
-loads its pre-shard as the decode role does, and the prefill takes the
-decoder's tensors for every family that is the same (EP8 experts, attention,
-router, embedding and LM head) and reads only its sequence-parallel projections
-(``rank_loader.PREFILL_SHARED``).
+loads its pre-shard as the decode role does except for the routed experts,
+which are the prefill's EP16/TP2 families (``decode_expert_parallel`` 16), and
+the prefill takes the decoder's tensors for every family that is the same
+(experts and router, attention, embedding and LM head) and reads only its
+sequence-parallel projections (``rank_loader.PREFILL_SHARED``).
 
 A step hands each request to one program, as a P/D pair splits it:
 
@@ -112,14 +113,10 @@ class KimiAggregate:
         from vllm_torchtpu.megakernel.kimi_k3.program import build_decoder
 
         kernel = active()
-        if kernel.prefill_expert_parallel not in (8, 16):
+        if kernel.prefill_expert_parallel != 16 or kernel.decode_expert_parallel != 16:
             raise NotImplementedError(
-                "the K3 aggregate engine requires prefill_expert_parallel 8 or 16"
-            )
-        if kernel.prefill_expert_parallel == 8 and kernel.kd_hot_plan:
-            raise NotImplementedError(
-                "the K3 aggregate engine does not run K3_HOT_PLAN at EP8; "
-                "use K3_REPLICA_PLAN instead"
+                "the K3 aggregate engine shares one EP16/TP2 expert copy: it needs "
+                "prefill_expert_parallel and decode_expert_parallel 16"
             )
         if config.attention_dp != 1:
             raise NotImplementedError(
@@ -141,31 +138,22 @@ class KimiAggregate:
             compute_logits=False,
         )
         self.rank = self.decoder.rank
-        self._prefill_ep = kernel.prefill_expert_parallel
         self._loaded = False
 
     def load_weights(self) -> None:
         if self._loaded:
             return
         from vllm_torchtpu.megakernel.kimi_k3.kernels.rank_loader import (
-            EXPERT_FAMILIES,
             PREFILL_SHARED,
         )
 
         started = time.perf_counter()
         self.decoder.load_weights()
         weights = self.decoder.ops.weights
-        kernel = active()
-        shared_names = list(PREFILL_SHARED)
-        if getattr(self, "_prefill_ep", 8) != 8:
-            excluded = set(EXPERT_FAMILIES)
-            if kernel.prefill_expert_plan:
-                excluded.update(("router", "router_bias"))
-            shared_names = [n for n in shared_names if n not in excluded]
-        missing = [n for n in shared_names if n not in weights]
+        missing = [n for n in PREFILL_SHARED if n not in weights]
         if missing:
             raise RuntimeError(f"K3 aggregate: the decoder holds no {missing}")
-        self.prefiller.load_weights({n: weights[n] for n in shared_names})
+        self.prefiller.load_weights({n: weights[n] for n in PREFILL_SHARED})
         self._loaded = True
         if self.rank == 0:
             logger.info(

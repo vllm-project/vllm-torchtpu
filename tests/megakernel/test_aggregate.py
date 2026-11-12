@@ -217,7 +217,7 @@ def preshard(tmp_path):
 def test_prefill_loader_skips_shared_families(monkeypatch, preshard):
     root, cache = preshard
     monkeypatch.setattr(
-        rank_loader, "_config", lambda: KernelConfig(prefill_expert_parallel=8)
+        rank_loader, "_config", lambda: KernelConfig(decode_expert_parallel=16)
     )
     full = {
         name
@@ -241,21 +241,36 @@ def test_prefill_loader_skips_shared_families(monkeypatch, preshard):
     }
 
 
-def test_prefill_loader_shares_experts_only_at_ep8(monkeypatch, preshard):
+@pytest.mark.parametrize(
+    "config",
+    [
+        KernelConfig(),  # an EP8 decode
+        KernelConfig(prefill_expert_parallel=8),
+        KernelConfig(prefill_expert_parallel=8, decode_expert_parallel=16),
+    ],
+)
+def test_prefill_loader_shares_experts_only_with_an_ep16_decode(
+    monkeypatch, preshard, config
+):
     root, cache = preshard
+    experts = frozenset(rank_loader.EXPERT_FAMILIES)
+    monkeypatch.setattr(rank_loader, "_config", lambda: config)
+    with pytest.raises(ValueError, match="EP16 decode"):
+        list(rank_loader.iter_prefill_rank(root, cache, 0, skip=experts))
+
+
+def test_prefill_loader_takes_all_four_ep16_expert_families(monkeypatch, preshard):
+    root, cache = preshard
+    experts = frozenset(rank_loader.EXPERT_FAMILIES)
     monkeypatch.setattr(
-        rank_loader, "_config", lambda: KernelConfig(prefill_expert_parallel=16)
+        rank_loader, "_config", lambda: KernelConfig(decode_expert_parallel=16)
     )
-    with pytest.raises(ValueError, match="EP8"):
-        list(
-            rank_loader.iter_prefill_rank(
-                root, cache, 0, skip=frozenset(rank_loader.EXPERT_FAMILIES)
-            )
-        )
-    monkeypatch.setattr(
-        rank_loader, "_config", lambda: KernelConfig(prefill_expert_parallel=8)
-    )
-    with pytest.raises(ValueError, match="EP8"):
+    left = {
+        n.partition("@")[0]
+        for _, n, _ in rank_loader.iter_prefill_rank(root, cache, 0, skip=experts)
+    }
+    assert not left & experts
+    with pytest.raises(ValueError, match="EP16 decode"):
         list(
             rank_loader.iter_prefill_rank(root, cache, 0, skip=frozenset({"expert_gu"}))
         )
@@ -302,13 +317,28 @@ def test_aggregate_aligns_prefiller_pool_order_to_decoder_mesh_rank(
         return types.SimpleNamespace(rank=8)
 
     monkeypatch.setattr(
-        agg_mod, "active", lambda: KernelConfig(prefill_expert_parallel=8)
+        agg_mod, "active", lambda: KernelConfig(decode_expert_parallel=16)
     )
     monkeypatch.setattr(prog_mod, "build_decoder", fake_build_decoder)
     monkeypatch.setattr(prefill_mod, "KimiPrefiller", fake_prefiller)
     engine = KimiAggregate(_engine_config(), tmp_path, tp_rank=0)
     assert engine.rank == 8
     assert seen == {"decoder_tp_rank": 0, "prefiller_tp_rank": 8}
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        KernelConfig(),  # an EP8 decode
+        KernelConfig(prefill_expert_parallel=8, decode_expert_parallel=16),
+    ],
+)
+def test_aggregate_needs_one_shared_ep16_expert_copy(monkeypatch, tmp_path, config):
+    from vllm_torchtpu.megakernel.kimi_k3 import aggregate as agg_mod
+
+    monkeypatch.setattr(agg_mod, "active", lambda: config)
+    with pytest.raises(NotImplementedError, match="EP16/TP2"):
+        KimiAggregate(_engine_config(), tmp_path, tp_rank=0)
 
 
 def test_aggregate_caches_prompt_tokens_only():
