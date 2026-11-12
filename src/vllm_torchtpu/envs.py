@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_PRECOMPILE_PEER_WAIT_S: float = 600.0
+    TPU_ARTIFACT_STORE: bool = False
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
@@ -949,6 +950,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PRECOMPILE_PEER_WAIT_S": env_nonnegative_float(
         "TPU_PRECOMPILE_PEER_WAIT_S", 600.0
     ),
+    # Also keep each compiled bucket in a store keyed by what decides the
+    # program (TPU compilation hash, vLLM's config hash, graph fingerprint,
+    # concrete inputs), not by vLLM's cache directory hash, and replay from it
+    # when that directory misses (see TpuCompilerAdaptor._store_path). Off by
+    # default: the key leaves out vLLM's env vars and traced-file contents, so
+    # its safety rests on custom ops baking in only config values, and the
+    # store has no eviction yet. Turning it on by default needs a debug mode
+    # that compiles anyway and compares against the stored artifact, run
+    # across the CI models with no mismatch, and a size cap.
+    "TPU_ARTIFACT_STORE": env_bool("TPU_ARTIFACT_STORE", default=False),
     # With shape-specialized backbone traces (one per token-bucket group, see
     # compilation/shape_variants.py), trace every group before compiling any
     # bucket, then compile all buckets at once across the host's ranks

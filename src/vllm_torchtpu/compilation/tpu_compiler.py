@@ -31,6 +31,7 @@ import re
 import shutil
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -176,6 +177,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PRECOMPILE_BIGGEST_FIRST",
     "TPU_PRECOMPILE_PEER_REPLAY",
     "TPU_PRECOMPILE_PEER_WAIT_S",
+    # Where artifacts are looked up, not what is compiled.
+    "TPU_ARTIFACT_STORE",
     "TPU_PRECOMPILE_TRACE_FIRST",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
@@ -525,6 +528,16 @@ class TpuCompilerAdaptor(CompilerInterface):
     def __init__(self):
         self.cache_dir: str | None = None
         self._disable_cache = False
+        # compute_tpu_compilation_hash of this run, set by compute_hash, which
+        # vLLM calls before compiling. Part of the artifact store key.
+        self._tpu_hash: str | None = None
+        # vLLM's config hash of this run (VllmConfig.compute_hash), also set
+        # by compute_hash. Part of the artifact store key: custom ops close
+        # over config values the graph cannot show (e.g. the RPA kernel's
+        # sm_scale, soft cap, sliding window and q/k/v scales behind an opaque
+        # op name), and it covers the parallel layout, which the TPU hash
+        # does not beyond the DP size.
+        self._config_hash: str | None = None
 
     def initialize_cache(
         self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
@@ -534,7 +547,73 @@ class TpuCompilerAdaptor(CompilerInterface):
 
     def compute_hash(self, vllm_config: VllmConfig) -> str:
         """Hash TPU runtime sources that sit behind custom-op boundaries."""
-        return compute_tpu_compilation_hash(vllm_config)
+        self._tpu_hash = compute_tpu_compilation_hash(vllm_config)
+        self._config_hash = vllm_config.compute_hash()
+        return self._tpu_hash
+
+    def _store_path(
+        self,
+        key: str,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        was_wrapped: bool,
+        fingerprint: str | None,
+    ) -> str | None:
+        """Where the artifact store keeps this bucket, or None if it is off.
+
+        The store (TPU_ARTIFACT_STORE) keys an artifact by what decides the
+        compiled program -- this run's TPU compilation hash (kernel sources
+        behind custom ops, compiler versions and flags, TPU env), vLLM's
+        config hash (model, cache, parallel, compilation and the other
+        configs: values custom ops bake into the program without showing them
+        in the graph), the graph fingerprint, the concrete inputs and vLLM's
+        per-(bucket, subgraph) key. vLLM's cache directory hash covers all of
+        that plus vLLM's compile-relevant env vars and the contents of the
+        files Dynamo traced; when only those change, vLLM's directory misses
+        but the store still holds the artifact, and the bucket is replayed
+        instead of traced, lowered and compiled again. An edit to a traced
+        file that changes a value baked into a custom op without changing the
+        graph is therefore not caught -- one reason the store is opt-in.
+
+        The store sits next to vLLM's `torch_compile_cache` (under
+        VLLM_CACHE_ROOT), so it is archived and restored with it.
+        """
+        if not envs.TPU_ARTIFACT_STORE or self._tpu_hash is None:
+            return None
+        if self._config_hash is None:
+            return None
+        if fingerprint is None or self.cache_dir is None:
+            return None
+        rank_dir = os.path.dirname(os.path.normpath(self.cache_dir))
+        if re.fullmatch(r"rank_\d+_\d+", os.path.basename(rank_dir)) is None:
+            return None
+        torch_compile_cache = os.path.dirname(os.path.dirname(rank_dir))
+        root = os.path.join(os.path.dirname(torch_compile_cache), "tpu_artifact_store")
+
+        def meta(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return (
+                    str(value.dtype),
+                    tuple(int(d) for d in value.shape),
+                    tuple(int(d) for d in value.stride()),
+                    int(value.storage_offset()),
+                )
+            if isinstance(value, (bool, int, float, str)):
+                return value
+            return type(value).__name__
+
+        factors = json.dumps(
+            [
+                self._tpu_hash,
+                self._config_hash,
+                key,
+                fingerprint,
+                [meta(value) for value in example_inputs],
+                was_wrapped,
+            ],
+            default=str,
+        )
+        return os.path.join(root, hashlib.sha256(factors.encode()).hexdigest())
 
     @staticmethod
     def _unwrap_compiled_fn(compiled_fn):
@@ -814,14 +893,25 @@ class TpuCompilerAdaptor(CompilerInterface):
     def _link_artifact(src: str, dst: str) -> bool:
         """Make `dst` the same file as `src`: a hard link, a copy if `src`
         is on another filesystem. True if `dst` now exists."""
-        tmp = f"{dst}.{os.getpid()}.tmp"
+        # Unique per attempt: ranks on hosts sharing a cache root can share a
+        # PID, and a shared name could make the copy fallback write through
+        # another rank's hard link.
+        tmp = f"{dst}.{uuid.uuid4().hex}.tmp"
         try:
+            # Already linked (e.g. a bucket replayed from the store): rename
+            # onto a link of the same file is a no-op that would leave `tmp`.
+            with contextlib.suppress(OSError):
+                if os.path.samefile(src, dst):
+                    return True
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             try:
                 os.link(src, tmp)
             except OSError:
                 shutil.copyfile(src, tmp)
             os.replace(tmp, dst)
+            # rename(2) leaves both names when they are one file already.
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
             return True
         except Exception as e:
             logger.warning(
@@ -886,10 +976,20 @@ class TpuCompilerAdaptor(CompilerInterface):
         peer = None
         fingerprint = (
             _graph_fingerprint(graph)
-            if caching and envs.TPU_PRECOMPILE_PEER_REPLAY
+            if caching and (envs.TPU_PRECOMPILE_PEER_REPLAY or envs.TPU_ARTIFACT_STORE)
             else None
         )
-        if fingerprint is not None:
+        store_path = (
+            self._store_path(key, graph, example_inputs, was_wrapped, fingerprint)
+            if caching and key is not None
+            else None
+        )
+        # The artifact store first: a hit needs no waiting and no compile.
+        if store_path is not None and os.path.exists(store_path):
+            stored = self._replay(store_path, graph, was_wrapped, fingerprint)
+            if stored is not None:
+                peer = (stored, store_path)
+        if peer is None and fingerprint is not None and envs.TPU_PRECOMPILE_PEER_REPLAY:
             assert key is not None
             peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
         if peer is not None:
@@ -906,6 +1006,8 @@ class TpuCompilerAdaptor(CompilerInterface):
                 if self._link_artifact(peer_path, save_path)
                 else None
             )
+            if store_path is not None and peer_path != store_path:
+                self._link_artifact(peer_path, store_path)
             if was_wrapped:
                 compiled_fn = self._unwrap_compiled_fn(compiled_fn)
             if size is not None:
@@ -939,6 +1041,8 @@ class TpuCompilerAdaptor(CompilerInterface):
                 key, save_path, entry, graph, was_wrapped, fingerprint
             ):
                 handle = (key, save_path, was_wrapped)
+                if store_path is not None:
+                    self._link_artifact(save_path, store_path)
         elif caching:
             logger.info(
                 "[TpuCompilerAdaptor] No serializable artifact for range %s; "
@@ -947,7 +1051,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             )
         # Under peer replay, other ranks of the host may be waiting for this
         # artifact: say so when it will not come, so they compile it now.
-        if fingerprint is not None:
+        if fingerprint is not None and envs.TPU_PRECOMPILE_PEER_REPLAY:
             assert key is not None
             if handle is None:
                 self._mark_failed(key, fingerprint)
