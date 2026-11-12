@@ -30,3 +30,4 @@ export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="/path/to/persistent_cache"
 - **Recommendation**:
     - `1`: Enable in CI and test pipelines to catch compilation leaks and un-warmed code paths.
     - `0`: Keep disabled in production and benchmarking for maximum throughput.
+- **Note**: With `VLLM_TPU_RELOAD_COMPILED_EXECUTABLE=1`, each newly compiled bucket clears `torch_tpu`'s in-memory compilation cache, which resets the cached graph count this detector reads. Use the `TpuCompilerAdaptor` reload logs or `torch.tpu._get_cache_stats().num_compilations` to count compilations instead.
