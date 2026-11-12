@@ -206,6 +206,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_TOKEN_SHARD: bool = False
     VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD: bool = False
     VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS: int = 256
+    VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD: bool = False
+    VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD_MIN_ROWS: int = 64
     VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS: int = 8
     VLLM_TPU_PLE_FUSED_GATE: bool = False
     VLLM_TPU_PLE_CONV_HISTORY_FAST: bool = False
@@ -1329,6 +1331,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS": env_nonnegative_int(
         "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS", 256
+    ),
+    # Qwen4-exp pooled QSA, decode / verify buckets of the replicated backbone
+    # under main-KV DCP (not VLLM_TPU_QSA_COMPRESSED_DCP): route the buckets of
+    # at least ..._MIN_ROWS rows whose per-rank share (rows / TP) holds whole
+    # requests (a multiple of num_speculative_tokens + 1) to the token-sharded
+    # replicated graph (Qwen4ExpBackboneRP). Each TP rank then scores its own
+    # requests' rows with the decode indexer and one TP all-gather brings the
+    # selections, instead of every rank scoring every request. A step whose
+    # requests cross a shard boundary indexes the whole step on every rank
+    # (token_shard_selection), so the selection is the replicated indexer's.
+    "VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD": env_bool(
+        "VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD", default=False
+    ),
+    "VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD_MIN_ROWS": env_nonnegative_int(
+        "VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD_MIN_ROWS", 64
     ),
     # Qwen4-exp resident PLE table: tokens per gather in the raw embedding
     # lookup (a multiple of 8). 8 is the originally validated chunk; an

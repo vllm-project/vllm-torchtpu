@@ -1525,23 +1525,41 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             sp_eligible = eligible
         scheduler_cfg = getattr(vllm_config, "scheduler_config", None)
         max_num_seqs = int(getattr(scheduler_cfg, "max_num_seqs", 0) or 0)
-        if sp.replicated_token_shard_eligible(1 << 30, tp_size, max_num_seqs):
+        rows_per_request = num_speculative_tokens(vllm_config) + 1
+        decode_req_shard = sp.decode_req_shard_enabled() and tp_size > 1
+        if (
+            sp.replicated_token_shard_eligible(1 << 30, tp_size, max_num_seqs)
+            or decode_req_shard
+        ):
             # VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD: a third graph for
             # the replicated prefill buckets, with the token-sharded indexer.
+            # VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD sends it the large decode /
+            # verify buckets too.
             self.model_rp = Qwen4ExpBackboneRP(
                 vllm_config=vllm_config, backbone=self.model
             )
             in_sp = sp_eligible or (lambda n: False)
 
             def in_rp(n, in_sp=in_sp):
-                return not in_sp(n) and sp.replicated_token_shard_eligible(
-                    n, tp_size, max_num_seqs
+                return not in_sp(n) and (
+                    sp.replicated_token_shard_eligible(n, tp_size, max_num_seqs)
+                    or sp.decode_req_shard_eligible(n, tp_size, rows_per_request)
                 )
 
             bucket_filter.assign(self.model_rp, in_rp)
             bucket_filter.assign(
                 self.model, lambda n, in_sp=in_sp: not in_sp(n) and not in_rp(n)
             )
+            if decode_req_shard:
+                logger.info_once(
+                    "QSA request-sharded decode indexer on "
+                    "(VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD): decode buckets of >= %d "
+                    "rows outside the SP graph, divisible by TP %d x %d rows per "
+                    "request, take the token-sharded replicated graph",
+                    envs.VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD_MIN_ROWS,
+                    tp_size,
+                    rows_per_request,
+                )
             logger.info_once(
                 "QSA token-sharded replicated prefill graph on "
                 "(VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD): buckets of >= %d "
@@ -1598,6 +1616,14 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     "bucket (backbone_rp)",
                     int(input_ids.shape[0]),
                 )
+                if int(input_ids.shape[0]) < int(
+                    envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS
+                ):
+                    logger.info_once(
+                        "QSA request-sharded decode indexer serving a %d-row "
+                        "bucket (backbone_rp)",
+                        int(input_ids.shape[0]),
+                    )
                 with bucket_filter.serving(serves_rp), set_model_tag("backbone_rp"):
                     return self.model_rp(input_ids, positions, inputs_embeds, **kwargs)
         serves_main = bucket_filter.assigned(self.model)
