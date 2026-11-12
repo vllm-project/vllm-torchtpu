@@ -249,6 +249,10 @@ def _chunk_ranges(word, groups):
     return lo.reshape(-1), jnp.maximum(hi, lo).reshape(-1)
 
 
+def _power_of_two(value):
+    return value > 0 and value & (value - 1) == 0
+
+
 # Scalar-prefetched (lo, hi) chunk-range tables of the ranged bitset kernel;
 # larger steps keep the full compare loop.
 RANGED_BITSET_SMEM_BYTES = 256 * 1024
@@ -266,6 +270,7 @@ def _selection_bitset(
     interpret=False,
     owned=None,
     ranged=None,
+    shift_owned=False,
 ):
     """int32[blocks, words, width] selection bitset without a scatter.
 
@@ -276,6 +281,8 @@ def _selection_bitset(
 
     ``owned=(rank, dcp_world, words_per_tile, live_words)``: keep only this
     DCP rank's words, numbered locally (``own_words`` of the global bitset).
+    ``shift_owned``: number them with shifts and masks when ``words_per_tile``
+    and ``dcp_world`` are powers of two (the same integers for valid words).
 
     Equals ``_scatter_bitset`` reshaped to query blocks, transposed to
     word-major rows and zero padded to ``width`` query lanes. Each block only
@@ -288,8 +295,17 @@ def _selection_bitset(
     word, bit = _selection_words(blocks, lengths, ratio=ratio, groups=groups)
     if owned is not None:
         rank, world, per_tile, live_words = owned
-        local = (word // (per_tile * world)) * per_tile + word % per_tile
-        keep = (word >= 0) & ((word // per_tile) % world == rank) & (local < live_words)
+        if shift_owned and _power_of_two(per_tile) and _power_of_two(world):
+            # Valid words are >= 0, where // and % by powers of two are shifts
+            # and masks; invalid words (-1) are dropped by ``word >= 0``.
+            tile_bits = per_tile.bit_length() - 1
+            pair_bits = (per_tile * world).bit_length() - 1
+            local = ((word >> pair_bits) << tile_bits) | (word & (per_tile - 1))
+            owner = (word >> tile_bits) & (world - 1)
+        else:
+            local = (word // (per_tile * world)) * per_tile + word % per_tile
+            owner = (word // per_tile) % world
+        keep = (word >= 0) & (owner == rank) & (local < live_words)
         word = jnp.where(keep, local, -1)
         bit = jnp.where(keep, bit, 0)
     rows = (word.shape[1] + 7) // 8 * 8
@@ -1069,6 +1085,7 @@ def _metadata_prefix_dispatch(
         "query_tile",
         "return_lse",
         "dcp_world",
+        "ascending",
     ),
 )
 def block_sparse_gqa_prefill(
@@ -1091,6 +1108,7 @@ def block_sparse_gqa_prefill(
     dcp_rank=None,
     dcp_world: int = 1,
     block_bits=None,
+    ascending: bool = False,
 ):
     """``_block_sparse_gqa_prefill``, optionally on a bounded page-table prefix.
 
@@ -1120,6 +1138,7 @@ def block_sparse_gqa_prefill(
             dcp_rank=dcp_rank,
             dcp_world=dcp_world,
             **({"block_bits": block_bits} if block_bits is not None else {}),
+            **({"ascending": True} if ascending else {}),
         )
 
     # A precomputed bitset (the union walk's shared fallback) is laid out over
@@ -1163,6 +1182,7 @@ def _block_sparse_gqa_prefill(
     dcp_rank=None,
     dcp_world: int = 1,
     block_bits=None,
+    ascending: bool = False,
 ):
     """Run exact selected-group attention with query-block KV reuse.
 
@@ -1179,6 +1199,10 @@ def _block_sparse_gqa_prefill(
     page at row ``t % page``. The KV tiles walk only those owned pages (one
     page per tile: ``kv_tile`` equal to the page), so no other rank's rows are
     fetched and the tile size does not grow with ``dcp_world``.
+
+    ``ascending``: each row's valid selections are in ascending order (only
+    a speed hint: VLLM_TPU_QSA_PREFILL_LEAN_WRAPPER takes the ranged bitset
+    loop on it; the bits are the same in any order).
 
     ``kv_head_offset`` skips that many KV heads of each cache row: a paired
     main KV page stores a second layer's head after the first layer's.
@@ -1269,7 +1293,14 @@ def _block_sparse_gqa_prefill(
     # VLLM_TPU_QSA_PREFILL_BITSET_OWNED: the bitset kernel numbers this rank's
     # words itself, so the global bitset, its relayout copy and the owned-word
     # gather drop out (bit-identical).
-    owned_kernel = dcp and envs.VLLM_TPU_QSA_PREFILL_BITSET_OWNED
+    #
+    # VLLM_TPU_QSA_PREFILL_LEAN_WRAPPER: under DCP the owned bitset kernel,
+    # numbered with shifts, and, on ascending rows, the ranged compare loop,
+    # which visits only the chunks holding each word group
+    # (bit-identical; the metadata outside the KV loop drops from about 1.5
+    # to 0.6 ms per 8K-row call at 76K context).
+    lean_wrapper = dcp and envs.VLLM_TPU_QSA_PREFILL_LEAN_WRAPPER
+    owned_kernel = dcp and (envs.VLLM_TPU_QSA_PREFILL_BITSET_OWNED or lean_wrapper)
     if block_bits is not None:
         if dcp or parts != 1 or not envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
             raise ValueError(
@@ -1295,6 +1326,10 @@ def _block_sparse_gqa_prefill(
                 if owned_kernel
                 else {}
             ),
+            **({"shift_owned": True} if lean_wrapper else {}),
+            # Unordered rows make every chunk range span the block, which is
+            # slower than the full compare loop: ranged on ascending rows only.
+            **({"ranged": True} if lean_wrapper and ascending else {}),
         )
         if dcp and not owned_kernel:
             block_bits_native = own_words(block_bits_native, 1)
@@ -1564,6 +1599,7 @@ def block_sparse_gqa_attention(
     query_tile: int | None = None,
     dcp=None,
     return_lse: bool = False,
+    ascending: bool = False,
 ):
     """Align requests, share KV tiles, then restore the original token order.
 
@@ -1579,6 +1615,8 @@ def block_sparse_gqa_attention(
         offset["return_lse"] = True
     if dcp is not None:
         offset["dcp_rank"], offset["dcp_world"] = dcp
+    if ascending:
+        offset["ascending"] = True
 
     def run_aligned(_):
         return block_sparse_gqa_prefill(

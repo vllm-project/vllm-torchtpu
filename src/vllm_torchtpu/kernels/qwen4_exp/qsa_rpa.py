@@ -613,9 +613,11 @@ def _prefill_attention(
     kv_head_offset=0,
     dcp=None,
     return_lse=False,
+    ascending=False,
 ):
     """With ``return_lse`` returns ``(out, lse, cache)`` (see
-    ``block_sparse_gqa_attention``)."""
+    ``block_sparse_gqa_attention``). ``ascending``: rows' valid selections
+    are ascending (a speed hint for the block-sparse DCP path)."""
     union_group = envs.VLLM_TPU_QSA_PREFILL_UNION_WALK
     if union_group and (128 % union_group or union_group < 8):
         raise ValueError(
@@ -711,6 +713,7 @@ def _prefill_attention(
         kv_head_offset=kv_head_offset,
         dcp=dcp,
         return_lse=return_lse,
+        **({"ascending": True} if ascending and dcp is not None else {}),
     )
 
 
@@ -740,6 +743,7 @@ def block_sparse_prefill(
     kv_head_offset=0,
     dcp=None,
     return_lse=False,
+    ascending=False,
 ):
     """``_prefill_attention``'s block-sparse call (served tiles, DCP tiles under
     ``dcp``); also the DCP union walk's fallback."""
@@ -788,6 +792,7 @@ def block_sparse_prefill(
         **({"query_tile": query_tile} if query_tile else {}),
         **({"dcp": dcp} if dcp is not None else {}),
         **({"return_lse": True} if return_lse else {}),
+        **({"ascending": True} if ascending else {}),
     )
 
 
@@ -945,6 +950,7 @@ def qsa_attention(
     if ascending and dcp is not None:
         # The selection rows are ascending (see virtual_page_metadata).
         decode_fn = functools.partial(decode_fn, ascending=True)
+        prefill_fn = functools.partial(prefill_fn, ascending=True)
     if len(query) <= (len(starts) - 1) * max_query_len:
         output, cache = decode_fn(query, gate, blocks, lengths, table, cache, **options)
         return split(output, lengths, cache) if dcp is not None else (output, cache)
