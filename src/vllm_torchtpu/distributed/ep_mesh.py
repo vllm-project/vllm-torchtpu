@@ -29,12 +29,14 @@ the ids it could and could not see, rather than letting a caller build a mesh
 that silently addresses the wrong device.
 """
 
+from collections.abc import Iterable
 from typing import Any
 
 import torch
 from vllm.distributed import parallel_state
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu import tpu_info
 from vllm_torchtpu.distributed.dcp import get_dcp_world_size
 from vllm_torchtpu.distributed.mesh_utils import (
     _collect_rank_to_device_id,
@@ -332,3 +334,58 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     )
     _MESH_CACHE[cache_key] = mesh
     return mesh
+
+
+def supports_hierarchical_core_count(num_cores: int) -> bool:
+    """Whether `num_cores` splits into a power-of-two number of dual-core chips
+    (`>= 2` chips)."""
+    num_chips = num_cores // 2
+    return num_cores >= 4 and num_cores % 2 == 0 and (num_chips & (num_chips - 1)) == 0
+
+
+def mesh_has_adjacent_chip_mates(devices: Iterable[Any]) -> bool:
+    """Whether `devices` pairs dual-core chip mates at `(2*c, 2*c + 1)` across
+    a power-of-two number of distinct physical chips (`>= 2`).
+
+    Handles both live PJRT devices (which expose `coords`, optional
+    `slice_index`, and `id`) and `torch.tpu.pallas.get_pallas_mesh`
+    compile-time devices (which expose PJRT `device_kind` and global `id`
+    without `coords`).
+    """
+    flat = list(devices)
+    n = len(flat)
+    if not supports_hierarchical_core_count(n):
+        return False
+    num_chips = n // 2
+    if getattr(flat[0], "coords", None) is not None:
+        seen_chips: set[tuple[int, ...]] = set()
+        for chip_idx in range(num_chips):
+            d0, d1 = flat[2 * chip_idx], flat[2 * chip_idx + 1]
+            c0, c1 = getattr(d0, "coords", None), getattr(d1, "coords", None)
+            id0, id1 = getattr(d0, "id", None), getattr(d1, "id", None)
+            if c0 is None or c1 is None or id0 is None or id1 is None:
+                return False
+            s0 = int(getattr(d0, "slice_index", 0))
+            s1 = int(getattr(d1, "slice_index", 0))
+            chip0 = (s0, *(int(v) for v in c0))
+            chip1 = (s1, *(int(v) for v in c1))
+            if chip0 != chip1 or int(id0) == int(id1):
+                return False
+            seen_chips.add(chip0)
+        return len(seen_chips) == num_chips
+
+    seen_chip_ids: set[int] = set()
+    for chip_idx in range(num_chips):
+        d0, d1 = flat[2 * chip_idx], flat[2 * chip_idx + 1]
+        kind0 = str(getattr(d0, "device_kind", ""))
+        kind1 = str(getattr(d1, "device_kind", ""))
+        if kind0 != kind1 or not tpu_info.is_non_megacore_dual_core_device_kind(kind0):
+            return False
+        id0, id1 = getattr(d0, "id", None), getattr(d1, "id", None)
+        if id0 is None or id1 is None:
+            return False
+        int_id0, int_id1 = int(id0), int(id1)
+        if int_id0 == int_id1 or (int_id0 // 2) != (int_id1 // 2):
+            return False
+        seen_chip_ids.add(int_id0 // 2)
+    return len(seen_chip_ids) == num_chips

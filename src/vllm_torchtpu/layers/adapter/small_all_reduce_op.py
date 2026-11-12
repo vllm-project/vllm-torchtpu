@@ -57,6 +57,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_mesh_index,
     ep_rank_order,
     get_ep_group,
+    mesh_has_adjacent_chip_mates,
 )
 from vllm_torchtpu.kernels.collectives import small_all_reduce as sar
 from vllm_torchtpu.kernels.collectives import small_gather_scatter as sgs
@@ -99,6 +100,9 @@ def _build_all_reduce(mesh, form):
             body, mesh=mesh, in_specs=(spec, spec), out_specs=spec, check_vma=False
         )(x, mesh_index)
 
+    # torch_tpu types the partition specs as tuples of axis names, but accepts
+    # jax PartitionSpecs.
+    # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         ALL_REDUCE_OP_NAME,
         fn,
@@ -116,11 +120,17 @@ def _build_all_reduce(mesh, form):
     return op
 
 
-def _build_reduce_scatter(mesh):
+def _build_reduce_scatter(mesh, hierarchical: bool = False):
     """Each rank's [num_cores * rows, hidden] partial sums (block r = rank r's
     rows) -> its own [rows, hidden] sum."""
     num_cores = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
+    mesh_devices = getattr(mesh, "devices", None)
+    use_hierarchical = (
+        hierarchical
+        and mesh_devices is not None
+        and mesh_has_adjacent_chip_mates(mesh_devices.flat)
+    )
 
     def body(block, mesh_index, rank_in_mesh, core_of_rank):
         return sgs.small_reduce_scatter(
@@ -130,6 +140,7 @@ def _build_reduce_scatter(mesh):
             rank=mesh_index,
             my_rank=rank_in_mesh,
             core_of_rank=core_of_rank,
+            hierarchical=use_hierarchical,
         )
 
     def fn(
@@ -146,6 +157,7 @@ def _build_reduce_scatter(mesh):
             check_vma=False,
         )(x, mesh_index, rank_in_mesh, core_of_rank)
 
+    # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         REDUCE_SCATTER_OP_NAME,
         fn,
@@ -184,6 +196,21 @@ def prebuild(device: torch.device) -> bool:
     rank_of_core = list(ep_rank_order() or range(num_cores))
     core_of_rank = [rank_of_core.index(r) for r in range(num_cores)]
     form = (envs.TPU_SMALL_ALL_REDUCE_FORM or "").lower() or None
+    requested_hierarchical_rs = envs.TPU_SMALL_REDUCE_SCATTER_HIERARCHICAL
+    mesh_devices = getattr(mesh, "devices", None)
+    use_hierarchical_rs = (
+        requested_hierarchical_rs
+        and mesh_devices is not None
+        and mesh_has_adjacent_chip_mates(mesh_devices.flat)
+    )
+    if requested_hierarchical_rs and not use_hierarchical_rs:
+        logger.warning_once(
+            "TPU_SMALL_REDUCE_SCATTER_HIERARCHICAL=1 requested, but the EP mesh "
+            "over %d cores does not pair adjacent dual-core chip mates across a "
+            "power-of-two chip count >= 2; falling back to one-stage "
+            "reduce-scatter.",
+            num_cores,
+        )
 
     _MESH_INDEX = torch.tensor([ep_mesh_index()], dtype=torch.int32, device=device)
     _RANK_IN_MESH = torch.tensor(
@@ -192,13 +219,15 @@ def prebuild(device: torch.device) -> bool:
     _CORE_OF_RANK = torch.tensor(core_of_rank, dtype=torch.int32, device=device)
     _MESH_RANKS = tuple(int(r) for r in group.ranks)
     _NUM_CORES = num_cores
-    _REDUCE_SCATTER_OP = _build_reduce_scatter(mesh)
+    _REDUCE_SCATTER_OP = _build_reduce_scatter(mesh, hierarchical=use_hierarchical_rs)
     _ALL_REDUCE_OP = _build_all_reduce(mesh, form)
     logger.info(
-        "Small all-reduce armed: up to %d rows per rank over %d cores, form %s",
+        "Small all-reduce armed: up to %d rows per rank over %d cores, form %s, "
+        "hierarchical_reduce_scatter=%s",
         envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS,
         num_cores,
         form or f"by size (one-shot up to {sar.ONE_SHOT_MAX_BYTES} bytes per core)",
+        use_hierarchical_rs,
     )
     return True
 
