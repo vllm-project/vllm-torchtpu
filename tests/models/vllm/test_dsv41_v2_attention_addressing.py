@@ -8,7 +8,6 @@ import torch
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import (
     _query_split,
-    _request_row_slots,
     _row_slots,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
@@ -17,7 +16,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     paged_attention_jax,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-    gather_cache_page_values,
     gather_cache_pieces,
     gather_cache_values,
     merge_halves,
@@ -44,19 +42,6 @@ def test_row_slots_matches_elementwise_gather(width):
         + safe % rows_per_page
     )
     torch.testing.assert_close(_row_slots(cache, table, requests, logical), expected)
-
-
-@pytest.mark.parametrize("width", [7, 300, 2560, 4000])
-def test_request_row_slots_matches_token_row_slots(width):
-    rows_per_page = 32
-    generator = torch.Generator().manual_seed(width)
-    table = torch.randint(0, 1000, (4, 90), generator=generator, dtype=torch.int32)
-    requests = torch.randint(0, 4, (17,), generator=generator)
-    cache = torch.empty((1, rows_per_page))
-    logical = torch.arange(width)[None, :].expand(requests.shape[0], -1)
-    expected = _row_slots(cache, table, requests, logical)
-    got = _request_row_slots(cache, table, width).index_select(0, requests)
-    torch.testing.assert_close(got, expected)
 
 
 @pytest.mark.parametrize("elements,fp32", [(512, False), (128, False), (64, True)])
@@ -162,30 +147,11 @@ def test_paged_attention_matches_dense(width):
 
 
 def _paged_records(rng, rows, width, page, pool_records):
-    """`_request_row_slots`-style records: random pages, contiguous inside."""
+    """Per-request records: random pages, contiguous inside."""
     pages = -(-width // page)
     table = rng.integers(0, pool_records // page, (rows, pages))
     logical = np.arange(width)
     return (table[:, logical // page] * page + logical % page).astype(np.int32)
-
-
-@pytest.mark.parametrize("page", [8, 16])
-def test_gather_cache_page_values_matches_records(page):
-    rng = np.random.default_rng(page)
-    pool = jnp.asarray(
-        rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
-    ) & jnp.int32(0x3FFF3FFF)
-    records = _paged_records(rng, 1, 6 * page, page, 512)[0]
-    records[-page:] = -1  # an invalid page reads arbitrary rows
-    expected = gather_cache_values(pool, jnp.asarray(records), 128, split=True)
-    got = gather_cache_page_values(pool, jnp.asarray(records[::page]), page, 128)
-    valid = records >= 0
-    assert got.shape == expected.shape
-    np.testing.assert_array_equal(
-        np.asarray(got, np.float32)[valid], np.asarray(expected, np.float32)[valid]
-    )
-    with pytest.raises(ValueError, match="whole pool word rows"):
-        gather_cache_page_values(pool, jnp.asarray(records[::page]), 3, 128)
 
 
 @pytest.mark.parametrize("width,count", [(64, 40), (32, 40), (64, 1), (32, 7)])

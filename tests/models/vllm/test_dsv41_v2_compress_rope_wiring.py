@@ -40,7 +40,6 @@ def _fixture(monkeypatch, ratio, banks, replay):
     attn.hidden_size = 16
     attn._tpu_rope_cache = torch.ones(64, 64)
     attn._rotate = lambda values, positions: values
-    attn._quantize_indexer = lambda values: values
     state = _cache(1024, torch.float32, banks=banks) if ratio == 2 else None
     main = _cache(512, torch.uint8, banks=banks, scale=True)
     index = _cache(128, torch.bfloat16, banks=banks)

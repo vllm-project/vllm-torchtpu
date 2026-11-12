@@ -570,7 +570,6 @@ def _patch_dspark_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(v2_dspark, "initialize_delayed_mhc", lambda: None)
     monkeypatch.setattr(v2_dspark, "initialize_mhc_post", lambda: None)
     monkeypatch.setattr(v2_dspark, "initialize_paged_attention", lambda: None)
-    monkeypatch.setattr(v2_dspark, "initialize_indexer", lambda: None)
     monkeypatch.setattr(v2_dspark, "compact_rope_caches", lambda *a: None)
     monkeypatch.setattr(v2_dspark, "get_current_vllm_config", lambda: SimpleNamespace())
     monkeypatch.setattr(v2_dspark, "DeepseekV41DecoderLayer", _FakeDraftDecoderLayer)

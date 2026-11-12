@@ -27,10 +27,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     initialize_paged_attention,
     paged_attention,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_bf16 import (
-    select_indexer_jax,
-    write_index_keys,
-)
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select import (
     _prefix_count,
     _sparsecore_top_k,
@@ -424,53 +420,3 @@ class TestThresholdAndVisibleTopK:
         )
         assert res_switch.shape == (16, 64)
         assert np.all(np.diff(np.asarray(res_switch[0])) > 0)
-
-
-class TestWriteIndexKeysAndSelect:
-    """Tests for write_index_keys and select_indexer_jax."""
-
-    def test_write_index_keys_validation(self):
-        pool = jnp.zeros((64, 128), dtype=jnp.int32)
-        keys_fp32 = jnp.zeros((4, 128), dtype=jnp.float32)
-        keys_bf16 = jnp.zeros((4, 128), dtype=jnp.bfloat16)
-        records = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
-
-        with pytest.raises(ValueError, match="Index keys must be BF16"):
-            write_index_keys(pool, records, keys_fp32)
-
-        with pytest.raises(
-            ValueError, match="One physical record index per key is required"
-        ):
-            write_index_keys(pool, records[:2], keys_bf16)
-
-        with pytest.raises(
-            ValueError, match="One physical record index per key is required"
-        ):
-            write_index_keys(pool, records, keys_bf16.reshape(2, 2, 128))
-
-    @pytest.mark.cpu_test
-    @pytest.mark.parametrize("two_banks", [False, True])
-    def test_select_reads_previously_written_index_keys(self, two_banks):
-        pool = jnp.zeros((4, 128), jnp.int32)
-        banks = (pool[:2], pool[2:]) if two_banks else pool
-        # The larger key crosses the bank boundary; a masked write must not win.
-        keys = jnp.broadcast_to(jnp.array([2, 4, 8], jnp.bfloat16)[:, None], (3, 128))
-        updated = write_index_keys(banks, jnp.array([1, 6, -1]), keys)
-        candidates = jnp.empty((2, 0), jnp.int32)
-        sel, pub = select_indexer_jax(
-            jnp.ones((2, 1, 128), jnp.bfloat16),
-            updated,
-            jnp.arange(8, dtype=jnp.int32)[None, :],
-            jnp.ones((2, 1), jnp.float32),
-            jnp.array([8, 0], jnp.int32),
-            candidates,
-            jnp.zeros(2, jnp.int32),
-            batch_max=jnp.array([8], jnp.int32),
-            topk=2,
-            block_size=1,
-            candidate_write=False,
-            sparse_logits=False,
-            unordered=False,
-        )
-        np.testing.assert_array_equal(sel, [[1, 6], [-1, -1]])
-        np.testing.assert_array_equal(pub, candidates)

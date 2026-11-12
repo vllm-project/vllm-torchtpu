@@ -10,16 +10,22 @@ from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
-from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
 from vllm_torchtpu.kernels.deepseek_v41.tile_scatter import tile_scatter
 
 ROW_BYTES = ROW_WORDS * 4
 # CSA2 reads and publishes BF16 SWA in 64-token word-pool pages (64 KiB).
 SWA_PAGE_TOKENS = 64
 SWA_PAGE_BYTES = SWA_PAGE_TOKENS * 512 * 2
-# Block-outer blocks are a whole number of SWA pages, so every page of every
-# cache group stays page-aligned under one shared block stride.
-BLOCK_STRIDE_ALIGNMENT = SWA_PAGE_BYTES
+
+
+def block_stride_alignment(block_size: int) -> int:
+    """Block stride unit declared by every V4.1 cache spec.
+
+    CSA2 addresses SWA pages and ratio-1 FP8 main pages (one 512-byte record
+    per token) in whole pages, so the shared block stride is a multiple of
+    both. One value for every spec keeps the cache groups mergeable.
+    """
+    return math.lcm(SWA_PAGE_BYTES, block_size * ROW_BYTES)
 
 
 # TPU7x SparseCore hardware addressing limit: a single HBM tensor passed to
@@ -223,15 +229,11 @@ def materialize_upstream_kv_cache(
 
 _read_values_op = None
 _read_values_2bank_op = None
-_read_index_values_op = None
-_read_index_values_2bank_op = None
 _write_op = None
 _write_tiles_op = None
 _write_values_op = None
 _write_values_after_op = None
 _encode_csa2_op = None
-_write_index_values_op = None
-_write_index_values_after_op = None
 
 
 class _CacheBinding(Protocol):
@@ -517,114 +519,6 @@ class PagedCacheRows:
         publish_main(self, records, words, scales)
 
 
-class IndexCacheRows(PagedCacheRows):
-    """Index-K records in fixed split-channel, two-record halfplane rows."""
-
-    def __init__(self, raw, layout):
-        super().__init__(raw, layout)
-        if (
-            self.dtype != torch.bfloat16
-            or self.row_bytes != index_key_layout.DIM * self.dtype.itemsize
-            or self.shape[1] % index_key_layout.SLOTS
-            or self.row_offset % index_key_layout.SLOTS
-            or self.page_stride % index_key_layout.SLOTS
-        ):
-            raise ValueError("Index-K requires D128 BF16 and whole 512-byte owner rows")
-
-    def __getitem__(self, indices):
-        blocks, rows = indices
-        records = self.row_indices(blocks * self.shape[1] + rows)
-        if self.raw.device.type == "cpu":
-            rec = records.long()
-            if bool(
-                ((rec < 0) | (rec >= self.total_rows * index_key_layout.SLOTS)).any()
-            ):
-                raise IndexError("Index-K record is outside its owner")
-            in_hi = rec >= self.bank_records
-            source = self.raw[rec.masked_fill(in_hi, 0) // index_key_layout.SLOTS]
-            if self.raw_hi is not None:
-                source_hi = self.raw_hi[
-                    (rec - self.bank_records).masked_fill(~in_hi, 0)
-                    // index_key_layout.SLOTS
-                ]
-                source = torch.where(in_hi[..., None], source_hi, source)
-            bits = (
-                (
-                    source
-                    >> (
-                        (rec % index_key_layout.SLOTS)[..., None]
-                        * index_key_layout.KEY_BITS
-                    )
-                )
-                & index_key_layout.KEY_MASK
-            ).to(torch.int16)
-            split = bits.contiguous().view(torch.bfloat16)
-            half = split.shape[-1] // 2
-            values = torch.stack((split[..., :half], split[..., half:]), -1).flatten(-2)
-        elif self.raw_hi is None:
-            assert _read_index_values_op is not None
-            values = _read_index_values_op(self.raw, records.flatten().int())
-        else:
-            assert _read_index_values_2bank_op is not None
-            values = _read_index_values_2bank_op(
-                self.raw, self.raw_hi, records.flatten().int()
-            )
-        return values.reshape(*records.shape, *self.shape[2:])
-
-    def write(self, slots, values, after=None):
-        """Encode normal-channel BF16 keys after the optional read dependency."""
-        records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
-        keys = values.to(torch.bfloat16).reshape(-1, index_key_layout.DIM)
-        if self.raw.device.type == "cpu":
-            split = torch.cat((keys[:, ::2], keys[:, 1::2]), -1)
-            bits = (
-                split.contiguous().view(torch.int16).to(torch.int32)
-                & index_key_layout.KEY_MASK
-            )
-            nan = ((bits & 0x7F80) == 0x7F80) & ((bits & 0x7F) != 0)
-            bits = torch.where(nan, (bits & 0x8000) | 0x7FC0, bits)
-            for i in range(records.numel()):
-                record = int(records[i])
-                if record < 0:
-                    continue
-                bank = self.raw
-                if record >= self.bank_records:
-                    if self.raw_hi is None:
-                        continue
-                    bank = self.raw_hi
-                    record -= self.bank_records
-                if record >= bank.shape[0] * index_key_layout.SLOTS:
-                    continue
-                shift = (record % index_key_layout.SLOTS) * index_key_layout.KEY_BITS
-                mask = (
-                    ~index_key_layout.KEY_MASK
-                    if shift == 0
-                    else index_key_layout.KEY_MASK
-                )
-                row = record // index_key_layout.SLOTS
-                bank[row] = (bank[row] & mask) | (bits[i] << shift)
-            return
-        assert _write_index_values_op is not None
-        records = records.int()
-        rec_lo = records.masked_fill(records >= self.bank_records, -1)
-        if after is None:
-            self.raw.copy_(_write_index_values_op(self.raw, rec_lo, keys))
-        else:
-            assert _write_index_values_after_op is not None
-            self.raw.copy_(_write_index_values_after_op(self.raw, rec_lo, keys, after))
-        if self.raw_hi is not None:
-            rec_hi = (records - self.bank_records).masked_fill(
-                records < self.bank_records, -1
-            )
-            if after is None:
-                self.raw_hi.copy_(_write_index_values_op(self.raw_hi, rec_hi, keys))
-            else:
-                assert _write_index_values_after_op is not None
-                self.raw_hi.copy_(
-                    _write_index_values_after_op(self.raw_hi, rec_hi, keys, after)
-                )
-
-
 class NativeCacheView:
     """Expose each shared physical pool once, deriving layer views in the graph."""
 
@@ -905,92 +799,6 @@ def gather_cache_values(
     return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(jnp.bfloat16)
 
 
-def gather_cache_page_words(
-    cache: jax.Array | tuple[jax.Array, jax.Array],
-    first_records: jax.Array,
-    page_records: int,
-    elements: int,
-) -> jax.Array:
-    """Raw int32 word rows ``[pages * rows, ROW_WORDS]`` of whole pages.
-
-    Each row holds ``ROW_WORDS // (elements // 2)`` consecutive records of
-    its page, in the split element order; see `gather_cache_page_values`.
-    """
-    import jax.numpy as jnp
-
-    record_words = elements // 2
-    if ROW_WORDS % record_words or (page_records * record_words) % ROW_WORDS:
-        raise ValueError("Pages must cover whole pool word rows")
-    total_rows = _cache_num_rows(cache)
-    per_row = ROW_WORDS // record_words
-    rows = page_records * record_words // ROW_WORDS
-    first_records = first_records.reshape(-1)
-    spread = jnp.arange(first_records.size, dtype=first_records.dtype) * rows
-    if isinstance(cache, tuple):
-        spread %= max(1, cache[0].shape[0] - rows + 1)
-    else:
-        spread %= max(1, total_rows - rows + 1)
-    starts = jnp.where(first_records >= 0, first_records // per_row, spread)
-    # A single-row index gather stays on SparseCore; vmap(dynamic_slice)
-    # lowers to a windowed gather that measured ~25x slower on TPU7x.
-    total = starts.size * rows
-    if 1 < rows <= 128 and 128 % rows == 0 and total % 1024 == 0:
-        indices = _lane_dense_page_rows(starts, rows)
-    else:
-        indices = (
-            starts[:, None] + jnp.arange(rows, dtype=starts.dtype)[None]
-        ).reshape(-1)
-    return _gather_raw_rows(cache, indices)
-
-
-def _lane_dense_page_rows(starts, rows):
-    """``(starts[:, None] + arange(rows)).reshape(-1)`` without the [N, rows] array.
-
-    The [N, rows] intermediate pads its rows-wide minor dim to 128 lanes and
-    then needs a relayout to 1-D. Instead expand each 128-lane row (128 // rows
-    starts) with an exact 0/1 matmul: split the int32 starts into 12-bit
-    halves, so every f32 product sum has one nonzero term below 2**24.
-    """
-    import jax
-    import jax.numpy as jnp
-
-    per = 128 // rows
-    grid = starts.reshape(-1, per)
-    expand = (jnp.arange(128)[None, :] // rows == jnp.arange(per)[:, None]).astype(
-        jnp.float32
-    )
-
-    def spread(x):
-        return jnp.dot(
-            x.astype(jnp.float32), expand, precision=jax.lax.Precision.HIGHEST
-        ).astype(starts.dtype)
-
-    lanes = (jnp.arange(128, dtype=starts.dtype) % rows)[None]
-    return ((spread(grid >> 12) << 12) + spread(grid & 4095) + lanes).reshape(-1)
-
-
-def gather_cache_page_values(
-    cache: jax.Array | tuple[jax.Array, jax.Array],
-    first_records: jax.Array,
-    page_records: int,
-    elements: int,
-) -> jax.Array:
-    """`gather_cache_values` (``split=True``) of whole pages.
-
-    Returns BF16 ``[pages * page_records, elements]`` for records
-    ``first + 0 .. first + page_records - 1`` of every ``first`` in
-    ``first_records``: one windowed gather of ``page_records`` contiguous
-    records per page instead of one gather per record. The caller guarantees
-    that each page's records are contiguous and that ``first`` starts a pool
-    word row; negative ``first`` reads arbitrary distinct rows (callers mask).
-    """
-    import jax.numpy as jnp
-
-    words = gather_cache_page_words(cache, first_records, page_records, elements)
-    words = words.reshape(first_records.size * page_records, elements // 2)
-    return jnp.concatenate(_split_words(words), axis=1)
-
-
 def initialize_cache_ops():
     from .csa2_adapter import initialize_csa2_ops
 
@@ -998,8 +806,6 @@ def initialize_cache_ops():
     global _read_values_op, _read_values_2bank_op, _write_op, _write_values_op
     global _write_tiles_op
     global _encode_csa2_op, _write_values_after_op
-    global _write_index_values_op, _write_index_values_after_op
-    global _read_index_values_op, _read_index_values_2bank_op
     if _write_op is not None:
         return
     from jax.sharding import PartitionSpec as P
@@ -1058,42 +864,6 @@ def initialize_cache_ops():
         )
     )
 
-    from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import (
-        gather_records,
-        to_ordinary,
-    )
-
-    def read_index_values(cache: jax.Array, records: jax.Array) -> jax.Array:
-        return to_ordinary(gather_records(cache, records))
-
-    _read_index_values_op = pallas.jax_op(
-        "pallas::dsv41v2_index_read_values",
-        read_index_values,
-        mesh=get_pallas_op_mesh(),
-        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P())),
-    )
-    _read_index_values_op.register_fake(
-        lambda cache, records: cache.new_empty(
-            (records.numel(), 128), dtype=torch.bfloat16
-        )
-    )
-
-    def read_index_values_2bank(
-        cache_lo: jax.Array, cache_hi: jax.Array, records: jax.Array
-    ) -> jax.Array:
-        return to_ordinary(gather_records((cache_lo, cache_hi), records))
-
-    _read_index_values_2bank_op = pallas.jax_op(
-        "pallas::dsv41v2_index_read_values_2bank",
-        read_index_values_2bank,
-        mesh=get_pallas_op_mesh(),
-        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P())),
-    )
-    _read_index_values_2bank_op.register_fake(
-        lambda cache_lo, cache_hi, records: cache_lo.new_empty(
-            (records.numel(), 128), dtype=torch.bfloat16
-        )
-    )
     _write_op = pallas.jax_op(
         "pallas::dsv41v2_cache_write",
         _scatter_rows,
@@ -1156,45 +926,6 @@ def initialize_cache_ops():
         lambda cache, records, values, after: torch.empty_like(cache)
     )
 
-    def write_index_values_jax(
-        cache: jax.Array, records: jax.Array, values: jax.Array
-    ) -> jax.Array:
-        return cast(jax.Array, scatter_index_keys(cache, records, values))
-
-    write_index_values = jax.shard_map(
-        write_index_values_jax,
-        mesh=mesh,
-        in_specs=(P(), P(), P()),
-        out_specs=P(),
-        check_vma=False,
-    )
-    _write_index_values_op = pallas.jax_op(
-        "pallas::dsv41v2_index_halfplane_write",
-        write_index_values,
-        donate_argnums=(0,),
-        mesh=get_pallas_op_mesh(),
-        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P())),
-    )
-    _write_index_values_op.register_fake(
-        lambda cache, records, values: torch.empty_like(cache)
-    )
-
-    def write_index_after(
-        cache: jax.Array, records: jax.Array, values: jax.Array, after: jax.Array
-    ) -> jax.Array:
-        cache, _ = jax.lax.optimization_barrier((cache, after))
-        return write_index_values(cache, records, values)
-
-    _write_index_values_after_op = pallas.jax_op(
-        "pallas::dsv41v2_index_halfplane_write_after",
-        write_index_after,
-        donate_argnums=(0,),
-        mesh=get_pallas_op_mesh(),
-        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P(), P())),
-    )
-    _write_index_values_after_op.register_fake(
-        lambda cache, records, values, after: torch.empty_like(cache)
-    )
     from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import encode_csa2_kv
 
     _encode_csa2_op = pallas.jax_op(
@@ -1447,27 +1178,3 @@ def scatter_cache_values(
         # Flatten only the small update batch. A partial DMA from a tiled 2D
         # source can straddle its padded minor dimension; the cache stays 2D.
     )(records, words.reshape(-1), cache)
-
-
-def scatter_index_keys(
-    cache: jax.Array | tuple[jax.Array, jax.Array],
-    records: jax.Array,
-    values: jax.Array,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
-    """Index-only half-plane RMW, retaining the existing aliased pool writer."""
-    import jax.numpy as jnp
-
-    from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import merge_record_rows
-
-    if isinstance(cache, tuple):
-        boundary = cache[0].shape[0] * 2
-        return (
-            scatter_index_keys(
-                cache[0], jnp.where(records < boundary, records, -1), values
-            ),
-            scatter_index_keys(
-                cache[1], jnp.where(records >= boundary, records - boundary, -1), values
-            ),
-        )
-    rows, words = merge_record_rows(cache, records, values)
-    return scatter_cache_values(cache, rows, words)

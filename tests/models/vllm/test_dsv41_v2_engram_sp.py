@@ -483,7 +483,9 @@ def test_select_paged_indices_projects_index_q_on_local_query_shard(monkeypatch)
         proj = (q_in @ w_idx_q).reshape(-1, n_head, head_dim)
         return proj + pos_in[:, None, None].to(proj.dtype) * 0.01
 
-    full_index_q = _project_fn(qr, positions)
+    full_index_q, _ = v2_attn.quantize_fp8_activation(
+        _project_fn(qr, positions), head_dim
+    )
     part, _ = v2_attn._query_split(count, tp)
     projected_shapes: list[torch.Size] = []
     captured_q_parts: list[torch.Tensor] = []
@@ -521,6 +523,7 @@ def test_select_paged_indices_projects_index_q_on_local_query_shard(monkeypatch)
             indexer=SimpleNamespace(
                 n_head=n_head,
                 head_dim=head_dim,
+                softmax_scale=head_dim**-0.5,
                 indexer_op=fake_indexer,
             ),
             candidate_block_buffer=torch.zeros((count, 0), dtype=torch.int32),
@@ -530,7 +533,7 @@ def test_select_paged_indices_projects_index_q_on_local_query_shard(monkeypatch)
             compress_ratio=2,
             candidate_block_size=16,
             _fp8_kv=True,
-            _project_index_q=lambda q_in, pos_in: (
+            _project_index_q_unquantized=lambda q_in, pos_in: (
                 projected_shapes.append(q_in.shape) or _project_fn(q_in, pos_in)
             ),
         )
@@ -548,19 +551,19 @@ def test_select_paged_indices_projects_index_q_on_local_query_shard(monkeypatch)
         )
         assert selected.shape == (count, topk)
 
-    # _project_index_q must run ONLY on the local [part, q_lora] shard.
+    # The index Q projection must run ONLY on the local [part, q_lora] shard.
     assert projected_shapes == [torch.Size([part, q_lora])] * tp
     valid_rank0 = min(part, count)
     torch.testing.assert_close(
-        captured_q_parts[0][:valid_rank0],
-        full_index_q[:valid_rank0],
+        captured_q_parts[0][:valid_rank0].float(),
+        full_index_q[:valid_rank0].float(),
         rtol=0,
         atol=0,
     )
     valid_rank1 = max(0, count - part)
     torch.testing.assert_close(
-        captured_q_parts[1][:valid_rank1],
-        full_index_q[part : part + valid_rank1],
+        captured_q_parts[1][:valid_rank1].float(),
+        full_index_q[part : part + valid_rank1].float(),
         rtol=0,
         atol=0,
     )
