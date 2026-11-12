@@ -77,6 +77,33 @@ def vmem_budget(rows, hidden, inter, w13_parts, two_inter):
     return min(need, vmem_limit())
 
 
+def vmem_budget_scores(rows, hidden, inter, w13_parts, two_inter, nc, x_itemsize=2):
+    """Reserve tile-padded VMEM operands, scratch, and router temporaries for
+    `moe_lowtok_scores` (`_kernel_scores`), bounded by `vmem_limit()`."""
+    unit = w13_parts + 1
+    half_width = 2 * (inter // w13_parts)
+    weights = unit * (hidden * half_width + inter * hidden)
+    # `[unit, 1, width]` float32 scale scratch pads sublane dim 1 up to 8.
+    scales = unit * 8 * (half_width + hidden) * 4
+    accumulators = rows * (two_inter + hidden) * 4
+    # VMEM inputs/outputs (`prim`, `copy`, `hot1h`, `scores`, `out`) and VMEM
+    # scratch (`wtab_ref`, `hits_v`, `cmp_v`, `x_vmem`), accounting for 8x128
+    # tile padding on `[1, LANES]` int32 tables.
+    tables_and_io = (
+        3 * 8 * LANES * 4
+        + LANES * nc * 2
+        + 8 * nc * 4
+        + 2 * rows * LANES * 4
+        + 2 * rows * hidden * x_itemsize
+    )
+    router_temporaries = 4 * rows * LANES * 4
+    need = int(
+        (weights + scales + accumulators + tables_and_io + router_temporaries)
+        * VMEM_MARGIN
+    )
+    return min(need, vmem_limit())
+
+
 def _quantize_rows(v):
     """Per-row fp8 quantization of a [rows, cols] f32 block: the value in fp8
     and the per-row scale that restores it."""
@@ -710,7 +737,9 @@ def moe_lowtok_scores(
         )
     if has_copies != (copy_weights is not None):
         raise ValueError("copy weights come exactly with has_copies")
-    n_experts = n_primary + (copy_weights[0].shape[0] if has_copies else 0)
+    n_experts = n_primary + (
+        copy_weights[0].shape[0] if copy_weights is not None else 0
+    )
     nc = hot1h.shape[-1]
     if nc % LANE:
         raise ValueError(f"the hot table's length {nc} must be a multiple of {LANE}")
@@ -732,13 +761,21 @@ def moe_lowtok_scores(
         )
 
     weights = (*scales(s13, s2, n_primary), w13, w2)
-    if has_copies:
+    if copy_weights is not None:
         cw13, cs13, cw2, cs2 = copy_weights
         weights += (*scales(cs13, cs2, cw13.shape[0]), cw13, cw2)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     if vmem_limit_bytes is None and not interpret:
-        vmem_limit_bytes = vmem_budget(rows, hidden, inter, w13_parts, two_inter)
+        vmem_limit_bytes = vmem_budget_scores(
+            rows,
+            hidden,
+            inter,
+            w13_parts,
+            two_inter,
+            nc,
+            x_rows.dtype.itemsize,
+        )
     half_width = 2 * (inter // w13_parts)
     out = pl.pallas_call(
         functools.partial(

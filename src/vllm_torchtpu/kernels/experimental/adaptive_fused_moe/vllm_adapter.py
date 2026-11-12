@@ -46,6 +46,7 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
     U32_SUBLANE_TILE,
 )
 from vllm_torchtpu.kernels.moe_lowtok.expert_parallel import (
+    can_gather_narrow_logits,
     moe_lowtok_ep,
     moe_lowtok_ep_serves,
     moe_lowtok_scores_ep,
@@ -175,6 +176,12 @@ def prebuild_adaptive_fused_moe(
         [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
     )
     groups = ep_token_replica_groups(is_sequence_parallel=parallel.is_sequence_parallel)
+    lowtok_gather_logits = envs.TPU_MOE_LOWTOK_GATHER_LOGITS
+    if lowtok_gather_logits and not lowtok_scores:
+        logger.warning_once(
+            "TPU_MOE_LOWTOK_GATHER_LOGITS=1 ignored because "
+            "TPU_MOE_LOWTOK_FROM_SCORES is not armed on this layer"
+        )
     op = _build_op(
         mesh,
         topk,
@@ -187,6 +194,7 @@ def prebuild_adaptive_fused_moe(
         lowtok_max_tokens=envs.TPU_MOE_LOWTOK_MAX_TOKENS,
         lowtok_scores=lowtok_scores,
         lowtok_scores_copies=lowtok_scores_copies,
+        lowtok_gather_logits=lowtok_gather_logits,
     )
     logger.info_once(
         "Experimental adaptive fused MoE armed | format=%s W1=%d W2=%d "
@@ -434,6 +442,7 @@ def _build_op(
     lowtok_max_tokens: int = 0,
     lowtok_scores: bool = False,
     lowtok_scores_copies: bool = False,
+    lowtok_gather_logits: bool = False,
 ) -> torch.library.CustomOpDef:
     """The op for this closure, built once per distinct closure and reused.
 
@@ -447,6 +456,7 @@ def _build_op(
     scores entry, which routes and, with ``lowtok_scores_copies``, picks one
     holder per hit copied expert.
     """
+    effective_gather_logits = bool(lowtok_scores and lowtok_gather_logits)
     key = (
         mesh,
         topk,
@@ -459,6 +469,7 @@ def _build_op(
         lowtok_max_tokens,
         lowtok_scores,
         lowtok_scores_copies,
+        effective_gather_logits,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -563,7 +574,20 @@ def _build_op(
             activation=activation,
             token_replica_groups=token_replica_groups,
         ):
-            logger.info_once("Adaptive fused MoE: small steps run the scores entry")
+            gather_narrow_logits = effective_gather_logits and can_gather_narrow_logits(
+                gating
+            )
+            if effective_gather_logits and not gather_narrow_logits:
+                logger.warning_once(
+                    "TPU_MOE_LOWTOK_GATHER_LOGITS=1 ignored for %s router "
+                    "logits; falling back to float32 score all-gather",
+                    gating.dtype,
+                )
+            logger.info_once(
+                "Adaptive fused MoE: small steps run the scores entry "
+                "(gather_logits=%s)",
+                gather_narrow_logits,
+            )
             return moe_lowtok_scores_ep(
                 x,
                 gating,
@@ -581,6 +605,7 @@ def _build_op(
                 else None,
                 mesh=mesh,
                 topk=topk,
+                gather_logits=gather_narrow_logits,
             )
         return moe(x, w1, w2, w1_scale, w2_scale, gating, rank)
 

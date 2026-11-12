@@ -150,6 +150,15 @@ def zero_scores_for_padding(scores, padding):
     return jnp.where(padding.reshape(-1, 1) != 0, 0.0, scores)
 
 
+_NARROW_LOGIT_DTYPES = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
+
+
+def can_gather_narrow_logits(gating) -> bool:
+    """Whether router logits use `bfloat16` or `float16`, which preserve `NaN`
+    padding markers across `all_gather` at half the `float32` wire payload."""
+    return jnp.dtype(gating.dtype) in _NARROW_LOGIT_DTYPES
+
+
 def moe_lowtok_scores_ep(
     x,
     gating,
@@ -166,6 +175,7 @@ def moe_lowtok_scores_ep(
     *,
     mesh,
     topk,
+    gather_logits: bool = False,
     interpret=False,
 ):
     """`moe_lowtok_ep` with the router and the holder choice in the kernel
@@ -176,22 +186,36 @@ def moe_lowtok_scores_ep(
     packed tables (`pack_tables`), the primary and copy holder ranks [1,
     LANES], the hot one-hot [LANES, NC]; copy_weights (w1, w2, w1_scale,
     w2_scale) of the copy slots, or None without copies. The tables name
-    ranks in EP rank order, so the mesh order needs no relabelling.
+    `ranks` in EP rank order, so the mesh order needs no relabelling. When
+    `gather_logits` is enabled and `gating` is `bfloat16` or `float16`, padded
+    rows are marked with `NaN`, `gating` is all-gathered before casting, and
+    `float32` `softmax` runs on the gathered logits.
     """
     (axis,) = mesh.axis_names
     ep = mesh.shape[axis]
     has_copies = copy_weights is not None
+    use_logit_gather = gather_logits and can_gather_narrow_logits(gating)
 
     def local_fn(x_l, gate_l, pad_l, tab_l, prim_l, copy_l, hot_l, *weights_l):
         w1_l, w2_l, w1s_l, w2s_l, *copies_l = weights_l
-        padded = (pad_l.reshape(-1, 1) != 0) | jnp.any(
+        local_padded = (pad_l.reshape(-1, 1) != 0) | jnp.any(
             jnp.isnan(gate_l), axis=-1, keepdims=True
         )
-        safe_gate = jnp.where(padded, 0.0, gate_l.astype(jnp.float32))
-        scores = jax.nn.softmax(safe_gate, axis=-1)
-        scores = jnp.where(padded, 0.0, scores)
-        rows = lax.all_gather(x_l, axis, axis=0, tiled=True)
-        scores = lax.all_gather(scores, axis, axis=0, tiled=True)
+        if use_logit_gather:
+            marked_gate = jnp.where(
+                local_padded, jnp.array(jnp.nan, dtype=gate_l.dtype), gate_l
+            )
+            rows = lax.all_gather(x_l, axis, axis=0, tiled=True)
+            gathered_gate = lax.all_gather(marked_gate, axis, axis=0, tiled=True)
+            padded = jnp.any(jnp.isnan(gathered_gate), axis=-1, keepdims=True)
+            safe_gate = jnp.where(padded, 0.0, gathered_gate.astype(jnp.float32))
+            scores = jnp.where(padded, 0.0, jax.nn.softmax(safe_gate, axis=-1))
+        else:
+            safe_gate = jnp.where(local_padded, 0.0, gate_l.astype(jnp.float32))
+            scores = jax.nn.softmax(safe_gate, axis=-1)
+            scores = jnp.where(local_padded, 0.0, scores)
+            rows = lax.all_gather(x_l, axis, axis=0, tiled=True)
+            scores = lax.all_gather(scores, axis, axis=0, tiled=True)
         if has_copies:
             cw1, cw2, cw1s, cw2s = copies_l
             copies = (cw1, cw1s, cw2, cw2s)

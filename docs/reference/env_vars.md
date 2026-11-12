@@ -63,6 +63,11 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
+| `TPU_EXPERT_PLACEMENT` | `""` | Path to a JSON expert-placement table mapping experts (and optional hot-expert copy slots) to EP ranks at model load. |
+| `TPU_MOE_LOWTOK_MAX_TOKENS` | `0` | Opt-in. Maximum post-all-gather row count served by the few-token expert-parallel MoE kernel (`0` disables). |
+| `TPU_MOE_LOWTOK_FROM_SCORES` | `False` | Opt-in. Inside `MOE_FUSED_EP_KERNEL_IMPL=adaptive`, routes steps up to `TPU_MOE_LOWTOK_MAX_TOKENS` rows through the few-token kernel's scores entry (with in-kernel top-k and copy-slot holder selection). |
+| `TPU_MOE_LOWTOK_SCORES_STRICT` | `False` | Raises at startup when `TPU_MOE_LOWTOK_FROM_SCORES=1` and a MoE layer cannot be served by the scores entry. |
+| `TPU_MOE_LOWTOK_GATHER_LOGITS` | `False` | Opt-in. With `TPU_MOE_LOWTOK_FROM_SCORES`, marks padded rows with `NaN` and all-gathers `bfloat16` or `float16` router logits across the EP axis before computing `float32` `softmax` instead of all-gathering `float32` softmax scores. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
 | `QUANTIZE_ON_LOAD_PREFIXES` | `[]` | Comma-separated dot-bounded module prefix names to quantize to FP8 on load (e.g., `"self_attn,shared_experts,layers.0.mlp"`), including `VocabParallelEmbedding` and `ParallelLMHead`. |
 | `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time linear weight requantization. |

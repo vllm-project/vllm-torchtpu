@@ -26,7 +26,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.moe_lowtok.expert_parallel import moe_lowtok_scores_ep
+from vllm_torchtpu.kernels.moe_lowtok.expert_parallel import (
+    can_gather_narrow_logits,
+    moe_lowtok_scores_ep,
+)
 from vllm_torchtpu.kernels.moe_lowtok.kernel import (
     LANES,
     hot_onehot,
@@ -76,6 +79,7 @@ def _contiguous_tables(rank, local):
     )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("tokens", [1, 7, 33])
 def test_scores_entry_matches_router_then_ids_entry(tokens):
     """With no copies, routing in the kernel equals the router's selection
@@ -164,6 +168,7 @@ def _dense_reference(x, scores, w13, s13, w2, s2):
     )
 
 
+@pytest.mark.multichip
 @pytest.mark.parametrize("with_copies", [False, True])
 def test_expert_parallel_scores_entry_matches_dense_layer(
     tmp_path, monkeypatch, with_copies
@@ -200,22 +205,24 @@ def test_expert_parallel_scores_entry_matches_dense_layer(
     if with_copies:
         copies = np.concatenate([c[LOCAL:] for c in cores])
         copy_weights = (w13[copies], w2[copies], s13[copies], s2[copies])
-    got = moe_lowtok_scores_ep(
-        x,
-        jnp.asarray(logits),
-        jnp.asarray(padding),
-        jnp.asarray(np.stack([t.tables for t in per_rank])),
-        jnp.asarray(np.stack([t.primary for t in per_rank])),
-        jnp.asarray(np.stack([t.copy for t in per_rank])),
-        jnp.asarray(np.concatenate([t.hot_onehot for t in per_rank])),
-        w13[primaries],
-        w2[primaries],
-        s13[primaries],
-        s2[primaries],
-        copy_weights,
-        mesh=mesh,
-        topk=TOPK,
-        interpret=_interpret(),
+    got = jax.block_until_ready(
+        moe_lowtok_scores_ep(
+            x,
+            jnp.asarray(logits),
+            jnp.asarray(padding),
+            jnp.asarray(np.stack([t.tables for t in per_rank])),
+            jnp.asarray(np.stack([t.primary for t in per_rank])),
+            jnp.asarray(np.stack([t.copy for t in per_rank])),
+            jnp.asarray(np.concatenate([t.hot_onehot for t in per_rank])),
+            w13[primaries],
+            w2[primaries],
+            s13[primaries],
+            s2[primaries],
+            copy_weights,
+            mesh=mesh,
+            topk=TOPK,
+            interpret=_interpret(),
+        )
     )
     got = np.asarray(got, np.float32)
     scores = jax.nn.softmax(jnp.asarray(logits), axis=-1)
@@ -226,6 +233,165 @@ def test_expert_parallel_scores_entry_matches_dense_layer(
     np.testing.assert_allclose(
         got[valid] / scale, want[valid] / scale, atol=3e-2, rtol=0
     )
+
+
+def test_can_gather_narrow_logits():
+    assert can_gather_narrow_logits(jax.ShapeDtypeStruct((4, LANES), jnp.bfloat16))
+    assert can_gather_narrow_logits(jax.ShapeDtypeStruct((4, LANES), jnp.float16))
+    assert not can_gather_narrow_logits(jax.ShapeDtypeStruct((4, LANES), jnp.float32))
+    assert not can_gather_narrow_logits(jax.ShapeDtypeStruct((4, LANES), jnp.int32))
+    assert not can_gather_narrow_logits(
+        jax.ShapeDtypeStruct((4, LANES), jnp.float8_e4m3fn)
+    )
+    assert not can_gather_narrow_logits(
+        jax.ShapeDtypeStruct((4, LANES), jnp.float8_e5m2)
+    )
+    fp4_dtype = getattr(jnp, "float4_e2m1fn", None)
+    if fp4_dtype is not None:
+        assert not can_gather_narrow_logits(jax.ShapeDtypeStruct((4, LANES), fp4_dtype))
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("with_copies", [False, True])
+@pytest.mark.parametrize("logits_dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
+def test_expert_parallel_gather_logits_matches_scores_gather(
+    tmp_path, monkeypatch, with_copies, logits_dtype
+):
+    """`gather_logits=True` produces bit-identical outputs to `gather_logits=False`
+    across narrow (`bfloat16`, `float16`) and wide (`float32`) router logits,
+    including `padding`-marked rows, `NaN`-logit rows, and `-inf`-masked experts."""
+    mesh = _ep_mesh()
+    rows_per_rank = 4
+    rows = EP * rows_per_rank
+    rng = np.random.default_rng(17 + int(with_copies))
+    x = jnp.asarray(
+        rng.standard_normal((rows, HIDDEN)).astype(np.float32), jnp.bfloat16
+    )
+    logits = rng.standard_normal((rows, LANES)).astype(np.float32)
+    if with_copies:
+        path, cores, copied = _copies_table(tmp_path)
+        monkeypatch.setenv("TPU_EXPERT_PLACEMENT", path)
+        logits[:, copied] += 4.0
+    else:
+        monkeypatch.delenv("TPU_EXPERT_PLACEMENT", raising=False)
+        cores = [list(range(r * LOCAL, (r + 1) * LOCAL)) for r in range(EP)]
+    # Mask one expert column with -inf on valid rows, mark each rank's last row
+    # via `padding`, and mark rank 0 row 2 via NaN router logits.
+    logits[:, 7] = -np.inf
+    logits[2, :] = np.nan
+    padding = np.zeros(rows, np.int32)
+    padding[rows_per_rank - 1 :: rows_per_rank] = 1
+    gating = jnp.asarray(logits, dtype=logits_dtype)
+    w13, s13, w2, s2 = _weights(rng, LANES)
+
+    per_rank = [
+        scores_entry.build_scores_tables("model.layers.0.mlp.experts", r, EP)
+        for r in range(EP)
+    ]
+    primaries = np.concatenate([c[:LOCAL] for c in cores])
+    copy_weights = None
+    if with_copies:
+        copies = np.concatenate([c[LOCAL:] for c in cores])
+        copy_weights = (w13[copies], w2[copies], s13[copies], s2[copies])
+
+    common_args = (
+        x,
+        gating,
+        jnp.asarray(padding),
+        jnp.asarray(np.stack([t.tables for t in per_rank])),
+        jnp.asarray(np.stack([t.primary for t in per_rank])),
+        jnp.asarray(np.stack([t.copy for t in per_rank])),
+        jnp.asarray(np.concatenate([t.hot_onehot for t in per_rank])),
+        w13[primaries],
+        w2[primaries],
+        s13[primaries],
+        s2[primaries],
+        copy_weights,
+    )
+    ref = jax.block_until_ready(
+        moe_lowtok_scores_ep(
+            *common_args,
+            mesh=mesh,
+            topk=TOPK,
+            gather_logits=False,
+            interpret=_interpret(),
+        )
+    )
+    cand = jax.block_until_ready(
+        moe_lowtok_scores_ep(
+            *common_args,
+            mesh=mesh,
+            topk=TOPK,
+            gather_logits=True,
+            interpret=_interpret(),
+        )
+    )
+    ref_u16 = np.asarray(ref.view(jnp.uint16))
+    cand_u16 = np.asarray(cand.view(jnp.uint16))
+    np.testing.assert_array_equal(cand_u16, ref_u16)
+    cand_f32 = np.asarray(cand, np.float32)
+    assert np.all(cand_f32[padding != 0] == 0)
+    assert np.all(cand_f32[2] == 0)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("ep"))
+    sharded_args = tuple(
+        None if a is None else jax.device_put(a, sharding) for a in common_args[:11]
+    )
+    sharded_copies = (
+        None
+        if copy_weights is None
+        else tuple(jax.device_put(c, sharding) for c in copy_weights)
+    )
+    fn = jax.jit(
+        lambda *a: moe_lowtok_scores_ep(
+            *a[:11],
+            a[11:] if with_copies else None,
+            mesh=mesh,
+            topk=TOPK,
+            gather_logits=True,
+            interpret=_interpret(),
+        )
+    )
+    lowered = fn.lower(*sharded_args, *(sharded_copies or ()))
+    pre_opt_hlo = lowered.as_text("hlo")
+    ag_rhs_types = [
+        line.split("=", 1)[1].split("all-gather(", 1)[0]
+        for line in pre_opt_hlo.splitlines()
+        if "=" in line and "all-gather(" in line
+    ]
+    assert ag_rhs_types, f"expected all-gather in HLO:\n{pre_opt_hlo}"
+    if logits_dtype == jnp.bfloat16:
+        assert any(f"bf16[{rows},{LANES}]" in t for t in ag_rhs_types)
+        assert not any(f"f32[{rows},{LANES}]" in t for t in ag_rhs_types)
+    elif logits_dtype == jnp.float16:
+        assert any(f"f16[{rows},{LANES}]" in t for t in ag_rhs_types)
+        assert not any(f"f32[{rows},{LANES}]" in t for t in ag_rhs_types)
+    else:
+        assert any(f"f32[{rows},{LANES}]" in t for t in ag_rhs_types)
+
+    if not _interpret():
+        compiled = lowered.compile()
+        post_opt_hlo = compiled.as_text()
+        post_ag_types = [
+            line.split("=", 1)[1].split(" all-gather(", 1)[0]
+            for line in post_opt_hlo.splitlines()
+            if "=" in line and " all-gather(" in line
+        ]
+        assert post_ag_types, (
+            f"expected all-gather in compiled TPU HLO:\n{post_opt_hlo}"
+        )
+        if logits_dtype == jnp.bfloat16:
+            assert any("bf16[" in t and f",{LANES}]" in t for t in post_ag_types)
+            assert not any("f32[" in t and f",{LANES}]" in t for t in post_ag_types)
+        elif logits_dtype == jnp.float16:
+            assert any("f16[" in t and f",{LANES}]" in t for t in post_ag_types)
+            assert not any("f32[" in t and f",{LANES}]" in t for t in post_ag_types)
+        else:
+            assert any("f32[" in t and f",{LANES}]" in t for t in post_ag_types)
+        jit_out = jax.block_until_ready(
+            compiled(*sharded_args, *(sharded_copies or ()))
+        )
+        np.testing.assert_array_equal(np.asarray(jit_out.view(jnp.uint16)), ref_u16)
 
 
 def test_hot_tables_must_list_every_copy():
