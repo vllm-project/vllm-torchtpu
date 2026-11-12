@@ -362,6 +362,9 @@ def test_batch_eviction_sync_and_server_padding_hook(monkeypatch) -> None:
     assert counts["reply_rounds"] == 1
     assert counts["reply_real_tokens"] == 1
     assert counts["reply_filler_tokens"] == 15
+    import os
+    assert os.path.exists(svc._padding_sync_path())
+    assert not os.path.exists(f"{svc._padding_sync_path()}.tmp.{os.getpid()}")
 
 
 def test_installer_fails_loudly_on_missing_anchor(tmp_path) -> None:
@@ -376,6 +379,71 @@ def test_installer_fails_loudly_on_missing_anchor(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="Failed to locate"):
         install_into_tree(pkg_dir)
+
+
+def test_installer_wires_compile_env_ignored_idempotently(tmp_path) -> None:
+    """`install_into_tree` wires `envs.py`, `patch_registry.py`, and `tpu_compiler`."""
+    import pytest
+
+    from vllm_torchtpu.telemetry.install import install_into_tree
+
+    pkg_dir = tmp_path / "vllm_torchtpu"
+    comp_dir = pkg_dir / "compilation"
+    comp_dir.mkdir(parents=True)
+
+    (pkg_dir / "envs.py").write_text(
+        "environment_variables: dict[str, Callable[[], Any]] = {\n"
+        '    "TPU_NAME": lambda: None,\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    (pkg_dir / "patch_registry.py").write_text(
+        "PATCHES = (\n"
+        "    Patch(\n"
+        '        "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",\n'
+        "        _ACTIVE,\n"
+        "    ),\n"
+        ")\n",
+        encoding="utf-8",
+    )
+
+    # Missing compilation/tpu_compiler.py raises loudly.
+    with pytest.raises(RuntimeError, match="Missing target file"):
+        install_into_tree(pkg_dir)
+
+    # Missing _TPU_COMPILE_ENV_IGNORED anchor raises loudly.
+    (comp_dir / "tpu_compiler.py").write_text(
+        "OTHER_SET = set()\n", encoding="utf-8"
+    )
+    with pytest.raises(
+        RuntimeError, match="Failed to locate _TPU_COMPILE_ENV_IGNORED anchor"
+    ):
+        install_into_tree(pkg_dir)
+
+    # Stock v0.32.0-shaped tpu_compiler.py gets both telemetry env vars wired once.
+    (comp_dir / "tpu_compiler.py").write_text(
+        "_TPU_COMPILE_ENV_IGNORED = {\n"
+        '    "TPU_NAME",\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    install_into_tree(pkg_dir)
+    first_compiler = (comp_dir / "tpu_compiler.py").read_text(encoding="utf-8")
+    first_envs = (pkg_dir / "envs.py").read_text(encoding="utf-8")
+    first_reg = (pkg_dir / "patch_registry.py").read_text(encoding="utf-8")
+
+    ns: dict[str, Any] = {}
+    exec(first_compiler, ns)
+    assert "VLLM_TPU_AGENTIC_TELEMETRY" in ns["_TPU_COMPILE_ENV_IGNORED"]
+    assert "VLLM_TPU_AGENTIC_SPAN_LOG" in ns["_TPU_COMPILE_ENV_IGNORED"]
+    assert first_compiler.count('"VLLM_TPU_AGENTIC_TELEMETRY"') == 1
+    assert first_compiler.count('"VLLM_TPU_AGENTIC_SPAN_LOG"') == 1
+
+    # Re-running is strictly idempotent across all 3 files.
+    install_into_tree(pkg_dir)
+    assert (comp_dir / "tpu_compiler.py").read_text(encoding="utf-8") == first_compiler
+    assert (pkg_dir / "envs.py").read_text(encoding="utf-8") == first_envs
+    assert (pkg_dir / "patch_registry.py").read_text(encoding="utf-8") == first_reg
 
 
 def test_golden_fixtures_match_schema_contract() -> None:
@@ -501,3 +569,146 @@ def test_delta_eviction_sync_compaction_and_lru_horizon_omitted(
     assert attrs_t2["vllm.kv_cache.time_since_eviction_ms"] == 2500.0
     assert "vllm.kv_cache.session_evicted_at_ms" in attrs_t2
     assert "vllm.kv_cache.lru_horizon_ms" not in attrs_t2
+
+
+def test_session_evicted_at_ms_clears_after_warm_turn_and_dram_recall(
+    monkeypatch, tmp_path
+) -> None:
+    """`session_evicted_at_ms` clears once re-warmed and fires on DRAM recall."""
+    import vllm_torchtpu.telemetry.vllm_hooks as hooks_mod
+
+    monkeypatch.setattr(envs, "VLLM_TPU_AGENTIC_TELEMETRY", True)
+    sync_base = str(tmp_path / ".evict_clear")
+    monkeypatch.setattr(hooks_mod, "_EVICTION_SYNC_PATH", sync_base)
+
+    engine_svc = AgenticTelemetryService(block_size=4, replica_id="rep-clr-0")
+    api_svc = AgenticTelemetryService(block_size=4, replica_id="rep-clr-0")
+
+    def run_turn(
+        req_id: str,
+        prompt: list[int],
+        out_toks: list[int],
+        cached: int,
+        turn_id: int,
+        now: float,
+        ext_cached: int = 0,
+    ) -> dict[str, Any]:
+        req = SimpleNamespace(
+            request_id=req_id,
+            prompt_token_ids=prompt,
+            num_cached_tokens=cached,
+            is_prefilling=True,
+            detokenizer=SimpleNamespace(output_token_ids=out_toks),
+        )
+        out = SimpleNamespace(
+            request_id=req_id,
+            num_cached_tokens=cached,
+            num_external_computed_tokens=ext_cached,
+            kv_transfer_params={"dram_tokens": ext_cached} if ext_cached else None,
+            new_token_ids=out_toks,
+            finish_reason="stop",
+            trace_headers={
+                "x-agent-session-id": "sess-W",
+                "x-agent-turn-id": str(turn_id),
+            },
+        )
+        api_svc.on_prefill_output(req, out)
+        return api_svc.build_span_attributes(req, out, now=now)
+
+    # Turn 1: cold start (8 prompt + 4 output = 12 tokens).
+    p1 = [1, 2, 3, 4, 5, 6, 7, 8]
+    o1 = [9, 10, 11, 12]
+    attrs_1 = run_turn("r1", p1, o1, cached=0, turn_id=1, now=5.0)
+    assert "vllm.kv_cache.session_evicted_at_ms" not in attrs_1
+
+    # Engine evicts sess-W at t=10.0.
+    engine_svc.eviction_tracker.record_eviction(
+        "blk-w1", now=10.0, wall_time_ms=1700000010000, session_id="sess-W"
+    )
+    engine_svc._eviction_sync_dirty = True
+    engine_svc.flush_eviction_sync()
+
+    # Turn 2: HBM eviction (cached=4 of 12) reports session_evicted_at_ms, then clears.
+    p2 = p1 + o1 + [13, 14, 15, 16]
+    o2 = [17, 18, 19, 20]
+    attrs_2 = run_turn("r2", p2, o2, cached=4, turn_id=2, now=12.0)
+    assert attrs_2["gen_ai.usage.input_tokens.affinity_honored_eviction"] == 8
+    assert attrs_2["vllm.kv_cache.session_evicted_at_ms"] == 1700000010000
+    assert attrs_2["vllm.kv_cache.time_since_eviction_ms"] == 2000.0
+    assert api_svc.eviction_tracker.session_evicted_at_ms("sess-W") is None
+
+    # Force EngineCore compaction; stale t=10.0 for sess-W must not resurrect.
+    monkeypatch.setattr(hooks_mod, "_MAX_EVICTION_SYNC_BYTES", 16)
+    engine_svc.on_block_evicted("blk-other", now=15.0, session_id="sess-other")
+
+    # Turn 3: warm HBM hit (cached=20 of 20) has 0 eviction and no stale timestamp.
+    p3 = p2 + o2 + [21, 22, 23, 24]
+    o3 = [25, 26, 27, 28]
+    attrs_3 = run_turn("r3", p3, o3, cached=20, turn_id=3, now=18.0)
+    assert attrs_3["gen_ai.usage.input_tokens.affinity_honored_eviction"] == 0
+    assert "vllm.kv_cache.session_evicted_at_ms" not in attrs_3
+    assert "vllm.kv_cache.time_since_eviction_ms" not in attrs_3
+
+    # Fresh eviction at t=25.0 + Raiden DRAM recall on Turn 4 (ext_cached=20):
+    # reports both eviction timestamps even with affinity_honored_eviction == 0.
+    engine_svc.eviction_tracker.record_eviction(
+        "blk-w2", now=25.0, wall_time_ms=1700000025000, session_id="sess-W"
+    )
+    engine_svc._eviction_sync_dirty = True
+    engine_svc.flush_eviction_sync()
+
+    p4 = p3 + o3 + [29, 30, 31, 32]
+    o4 = [33, 34, 35, 36]
+    attrs_4 = run_turn("r4", p4, o4, cached=28, turn_id=4, now=26.5, ext_cached=20)
+    assert attrs_4["gen_ai.usage.input_tokens.affinity_honored_eviction"] == 0
+    assert attrs_4["vllm.kv_cache.dram_tokens"] == 20
+    assert attrs_4["vllm.kv_cache.session_evicted_at_ms"] == 1700000025000
+    assert attrs_4["vllm.kv_cache.time_since_eviction_ms"] == 1500.0
+    assert api_svc.eviction_tracker.session_evicted_at_ms("sess-W") is None
+
+
+def test_padding_hook_only_syncs_ipc_from_per_replica_rank_zero(
+    monkeypatch, tmp_path
+) -> None:
+    """On TP=4, only per-replica rank 0 (`rank % world_size == 0`) writes `/dev/shm`."""
+    import os
+
+    import vllm_torchtpu.telemetry.vllm_hooks as hooks_mod
+    from vllm_torchtpu.telemetry.vllm_hooks import patch_tpu_padding_metrics
+
+    monkeypatch.setattr(envs, "VLLM_TPU_AGENTIC_TELEMETRY", True)
+    pad_base = str(tmp_path / ".pad_tp4")
+    monkeypatch.setattr(hooks_mod, "_PADDING_SYNC_PATH", pad_base)
+
+    class FakeTpRunner:
+        def __init__(self, rank: int, world_size: int = 4) -> None:
+            self.parallel_config = SimpleNamespace(rank=rank, world_size=world_size)
+            self._last_sequence_layout_plan = SimpleNamespace(
+                global_num_tokens=12,
+                global_padded_num_tokens=16,
+            )
+
+        def _prepare_inputs(
+            self, scheduler_output: Any, start_index: int
+        ) -> tuple[Any, ...]:
+            return (None, None, 1, 12)
+
+    svc_non_driver = AgenticTelemetryService(block_size=4, replica_id="rep-tp4")
+    patch_tpu_padding_metrics(FakeTpRunner, service=svc_non_driver)
+
+    # TP ranks 1, 2, 3 record locally in memory without touching /dev/shm.
+    for tp_rank in (1, 2, 3):
+        FakeTpRunner(rank=tp_rank)._prepare_inputs(SimpleNamespace(), 0)
+    assert not os.path.exists(svc_non_driver._padding_sync_path())
+
+    # TP rank 0 (and DP=2 replica-1 rank 4) atomically flushes /dev/shm.
+    svc_driver = AgenticTelemetryService(block_size=4, replica_id="rep-tp4")
+    FakeTpRunner._tpu_agentic_padding_patch = False
+    patch_tpu_padding_metrics(FakeTpRunner, service=svc_driver)
+    FakeTpRunner(rank=4, world_size=4)._prepare_inputs(SimpleNamespace(), 0)
+    assert os.path.exists(svc_driver._padding_sync_path())
+    api_reader = AgenticTelemetryService(block_size=4, replica_id="rep-tp4")
+    synced = api_reader.sync_padding_state()
+    assert synced["reply_rounds"] == 1
+    assert synced["reply_real_tokens"] == 12
+    assert synced["reply_filler_tokens"] == 4

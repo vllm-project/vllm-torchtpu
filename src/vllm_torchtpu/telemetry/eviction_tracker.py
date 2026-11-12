@@ -91,6 +91,9 @@ class BlockEvictionTracker:
         self._session_evicted_wall_ms: BoundedLRU[str, int] = BoundedLRU(
             session_maxsize
         )
+        self._session_cleared_ts: BoundedLRU[str, float] = BoundedLRU(
+            session_maxsize
+        )
         self._dirty_sessions: set[str] = set()
         self._last_evicted_ts: float | None = None
         self._last_evicted_wall_ms: int | None = None
@@ -128,6 +131,7 @@ class BlockEvictionTracker:
             self._block_owner.peek(block_hash) if block_hash is not None else None
         )
         if owner is not None:
+            self._session_cleared_ts.pop(owner)
             self._session_evicted_ts.put(owner, ts)
             self._session_evicted_wall_ms.put(owner, evict_wall)
             self._dirty_sessions.add(owner)
@@ -159,11 +163,38 @@ class BlockEvictionTracker:
             return self.session_eviction_age_ms(session_id, now=now)
         return self.last_eviction_age_ms(now=now)
 
+    def session_evicted_ts(self, session_id: str | None) -> float | None:
+        """Return monotonic timestamp when `session_id` blocks were evicted."""
+        if not session_id:
+            return None
+        return self._session_evicted_ts.peek(session_id)
+
     def session_evicted_at_ms(self, session_id: str | None) -> int | None:
         """Return epoch-ms timestamp when `session_id` blocks were evicted on this replica."""
         if not session_id:
             return None
         return self._session_evicted_wall_ms.peek(session_id)
+
+    def clear_session_eviction(
+        self,
+        session_id: str | None,
+        *,
+        up_to_ts: float | None = None,
+    ) -> None:
+        """Clear per-session eviction state once its prefix warms back up in HBM."""
+        if not session_id:
+            return
+        cur_ts = self._session_evicted_ts.peek(session_id)
+        if cur_ts is None:
+            return
+        if up_to_ts is not None and cur_ts > up_to_ts:
+            return
+        self._session_evicted_ts.pop(session_id)
+        self._session_evicted_wall_ms.pop(session_id)
+        self._dirty_sessions.discard(session_id)
+        prev_cleared = self._session_cleared_ts.peek(session_id)
+        if prev_cleared is None or cur_ts > prev_cleared:
+            self._session_cleared_ts.put(session_id, cur_ts)
 
     def time_since_eviction_ms(
         self,
@@ -231,8 +262,11 @@ class BlockEvictionTracker:
                 continue
             ts = float(pair[0])
             wall_ms = int(pair[1])
+            cleared_ts = self._session_cleared_ts.peek(sid)
             cur_ts = self._session_evicted_ts.peek(sid)
-            if cur_ts is None or ts > cur_ts:
+            if (cleared_ts is None or ts > cleared_ts) and (
+                cur_ts is None or ts > cur_ts
+            ):
                 self._session_evicted_ts.put(sid, ts)
                 self._session_evicted_wall_ms.put(sid, wall_ms)
             if self._last_evicted_ts is None or ts > self._last_evicted_ts:
@@ -244,6 +278,7 @@ class BlockEvictionTracker:
         self._block_owner.clear()
         self._session_evicted_ts.clear()
         self._session_evicted_wall_ms.clear()
+        self._session_cleared_ts.clear()
         self._dirty_sessions.clear()
         self._last_evicted_ts = None
         self._last_evicted_wall_ms = None
