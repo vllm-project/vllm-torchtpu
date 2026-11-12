@@ -1285,7 +1285,8 @@ class TPUModelRunner(GPUModelRunner):
         self._greedy_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        # Enabled in initialize_kv_cache once a KV connector, its only sink, exists.
+        self._stage_timing = RunnerStageTiming(profiler_rank, enabled=False)
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -1409,7 +1410,6 @@ class TPUModelRunner(GPUModelRunner):
 
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
-            self._stage_timing.take_samples()
             return None, None, set(), None, set(), None, None
         kv_connector = get_kv_transfer_group()
         # get_transfer_results, not get_finished: only it carries
@@ -1975,6 +1975,7 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
         if self.pcp_manager is not None:
             self.pcp_manager.set_page_size(mla_kv_page_size(kv_cache_config))
+        self._stage_timing.enabled = has_kv_transfer_group()
 
     def _init_prefill_checkpoint_units(self, kv_cache_config: KVCacheConfig) -> None:
         """Initializes the units the worker places prefill checkpoints with.
