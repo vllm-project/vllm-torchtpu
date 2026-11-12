@@ -827,6 +827,8 @@ def msa_attend_dcp(
         common["row_split"] = msa_attention_lse.PREFILL_ROW_SPLIT
         if msa_attention_lse.PREFILL_BLOCK_Q:
             common["block_q"] = msa_attention_lse.PREFILL_BLOCK_Q
+        if msa_attention_lse.PREFILL_PAGES_PER_STEP:
+            common["pages_per_step"] = msa_attention_lse.PREFILL_PAGES_PER_STEP
         if scale_cache is not None:
             common["page_cache_slots"] = msa_attention_lse.PREFILL_PAGE_CACHE_SLOTS
             common["page_cache_bf16"] = msa_attention_lse.PREFILL_PAGE_CACHE_BF16

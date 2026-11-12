@@ -80,6 +80,12 @@ PREFILL_PAGE_CACHE_BF16 = (
 # union. Not bitwise: a row's scores then sit in other columns of the step, so
 # sums over them may round in another order.
 PREFILL_BLOCK_Q = int(os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_BLOCK_Q", "0") or 0)
+# TPU_MINIMAX_M3_MSA_PREFILL_PAGES_PER_STEP=<n> (default 16): pages a prefill
+# group holds (a tile's union runs in ceil(union / n) groups). Not bitwise
+# when it changes how a tile's pages split into groups.
+PREFILL_PAGES_PER_STEP = int(
+    os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_PAGES_PER_STEP", "0") or 0
+)
 PREFILL_ROW_SPLIT = int(os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_ROW_SPLIT", "1") or 1)
 if PREFILL_PAGE_CACHE_SLOTS:
     logger.info(
@@ -105,6 +111,13 @@ if PREFILL_BLOCK_Q:
         "TPU_MINIMAX_M3_MSA_PREFILL_BLOCK_Q=%d: MSA prefill attention tiles of %d tokens.",
         PREFILL_BLOCK_Q,
         PREFILL_BLOCK_Q,
+    )
+if PREFILL_PAGES_PER_STEP:
+    logger.info(
+        "TPU_MINIMAX_M3_MSA_PREFILL_PAGES_PER_STEP=%d: MSA prefill attention groups of "
+        "%d pages.",
+        PREFILL_PAGES_PER_STEP,
+        PREFILL_PAGES_PER_STEP,
     )
 if PREFILL_ROW_SPLIT != 1:
     logger.info(
