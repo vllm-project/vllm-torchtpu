@@ -253,3 +253,21 @@ def test_ffn_halves_dispatch_order(tokens, moe):
         assert torch.equal(log[1][1], a0[:8]) and torch.equal(log[2][1], a1[:8])
     assert torch.equal(log[3][1], f0[:8])
     assert pr._DEFERRED is None and fm._DISPATCH_TOKENS is None
+
+
+def test_dispatch_token_op_variant(monkeypatch):
+    """The prebuilt dispatch-token variant is a distinct custom op returning
+    (out, token); the default variant keeps its single output."""
+    monkeypatch.setenv("TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS", "4096")
+    fm = pytest.importorskip("vllm_torchtpu.layers.adapter.fused_moe")
+    monkeypatch.setattr(fm, "_fused_moe_kernel_cache", {})
+    fm.prebuild_fused_moe_kernel(topk=4, activation="swigluoai", use_ep=True)
+    ops = {key[-1]: op for key, op in fm._fused_moe_kernel_cache.items()}
+    assert set(ops) == {False, True}
+
+    def returns(op):
+        name = op._name.split("::")[-1]
+        return str(getattr(torch.ops.pallas, name).default._schema).split(" -> ")[1]
+
+    assert returns(ops[False]) == "Tensor"
+    assert returns(ops[True]) == "(Tensor, Tensor)"
