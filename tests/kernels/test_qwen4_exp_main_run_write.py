@@ -281,3 +281,114 @@ def test_served_run_writer_checked_interpreter(monkeypatch, layout, rank):
     for i in np.flatnonzero(valid):
         expected[page[i], logical[i] % SERVED_ROWS] = new[i]
     np.testing.assert_array_equal(raw(got), expected)
+
+
+def recorded_dmas(monkeypatch):
+    """Patch the run writer's DMAs to log ``(to_hbm, page, row, vmem_row, rows,
+    pool_pages, page_rows, vmem_rows)`` for every copy the kernel issues,
+    paired reads included (the plain interpreter clamps out-of-range slices
+    instead of raising, so the bounds are checked on the log)."""
+    log = []
+    original = pltpu.make_async_copy
+
+    def indices(ref):
+        (indexer,) = ref.transforms
+        return indexer.indices, ref.ref.shape
+
+    def record(source, dest, semaphore):
+        (s_idx, s_shape), (d_idx, d_shape) = indices(source), indices(dest)
+        if 5 not in (len(s_shape), len(d_shape)):
+            return original(source, dest, semaphore)  # a wait descriptor
+        to_hbm = len(d_shape) == 5
+        h_idx, h_shape, v_idx, v_shape = (
+            (d_idx, d_shape, s_idx, s_shape) if to_hbm else (s_idx, s_shape, d_idx, d_shape)
+        )
+        assert h_idx[1].size == v_idx[0].size
+
+        def note(page, row, vmem_row):
+            log.append(
+                (to_hbm, int(page), int(row), int(vmem_row), h_idx[1].size,
+                 h_shape[0], h_shape[1], v_shape[0])
+            )
+
+        jax.debug.callback(note, h_idx[0], h_idx[1].start, v_idx[0].start)
+        return original(source, dest, semaphore)
+
+    monkeypatch.setattr(main_write.pltpu, "make_async_copy", record)
+    return log
+
+
+def dma_out_of_bounds(log):
+    return [
+        d for d in log
+        if not (0 <= d[1] < d[5] and 0 <= d[2] and d[2] + d[4] <= d[6]
+                and 0 <= d[3] and d[3] + d[4] <= d[7])
+    ]
+
+
+PAIRED_LAYOUTS = {
+    "precompile_4096": lambda: precompile_layout(4096),
+    "verify_k2_4096": lambda: verify_step_layout(4096, 2),
+    "verify_k3_4096": lambda: verify_step_layout(4096, 3),
+    # _warmup_one_spec_request's prefill: one fresh request whose table is
+    # range(1, 1 + entries).
+    **{f"spec_warmup_{p}": (lambda p=p: ([p], [0])) for p in (1024, 3072, 4096)},
+}
+
+
+@pytest.mark.parametrize("slot", [0, 1, None])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("layout", sorted(PAIRED_LAYOUTS))
+def test_served_paired_run_writer_dmas_in_bounds(interpret, monkeypatch, layout, rank, slot):
+    """``write_main_cache`` at the c32 recipe (RUN_WRITE=1, TILE=1024, paired
+    FP8 pages, main-KV DCP 2): every DMA the kernel issues, the paired
+    HBM->VMEM merge reads included, stays inside the pool, its page and its
+    tile's VMEM rows, and the pool matches the row-by-row reference."""
+    log = recorded_dmas(monkeypatch)
+    pages = 48
+    query_lens, contexts = PAIRED_LAYOUTS[layout]()
+    page, logical, valid = served_destinations(query_lens, contexts, rank, pages)
+    rng = np.random.default_rng(7 + rank)
+    pool = jnp.asarray(rng.normal(0, 1, (pages, SERVED_ROWS, 1, 4, 256)), jnp.float8_e4m3fn)
+    rows = rng.normal(0, 1, (len(page), 1, 4, 256))
+    if slot is not None:
+        rows[:, :, 2:] = 0
+    rows = jnp.asarray(rows, jnp.float8_e4m3fn)
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_MAIN_RUN_WRITE", True)
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_MAIN_RUN_WRITE_TILE", 1024)
+    kw = {} if slot is None else {"slot": slot}
+    got = pooled_qsa.write_main_cache(
+        pool, rows, jnp.asarray(page), jnp.asarray(logical), jnp.asarray(valid), **kw
+    )
+    got = raw(jax.block_until_ready(got))
+    jax.effects_barrier()
+    expected_reads = int(valid.sum()) if slot is not None else 0
+    assert sum(d[4] for d in log if not d[0]) == expected_reads
+    assert sum(d[4] for d in log if d[0]) == int(valid.sum())
+    assert dma_out_of_bounds(log) == []
+    expected, new = raw(pool).copy(), raw(rows)
+    for i in np.flatnonzero(valid):
+        p, o = page[i], logical[i] % SERVED_ROWS
+        if slot is None:
+            expected[p, o] = new[i]
+        else:
+            expected[p, o, :, 2 * slot : 2 * slot + 2] = new[i, :, :2]
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_recorded_dmas_catch_sentinel_page(interpret, monkeypatch):
+    """Positive control: a valid row on the ``len(pool)`` sentinel page shows
+    up as an out-of-bounds paired read."""
+    log = recorded_dmas(monkeypatch)
+    pool = jnp.zeros((4, SERVED_ROWS, 1, 4, 256), jnp.float8_e4m3fn)
+    rows = jnp.zeros((1024, 1, 4, 256), jnp.float8_e4m3fn)
+    page = jnp.full((1024,), 1, jnp.int32).at[700].set(len(pool))
+    offsets = jnp.arange(1024, dtype=jnp.int32) % SERVED_ROWS
+    jax.block_until_ready(
+        main_write.write_main_runs(
+            pool, rows, page, offsets, jnp.ones(1024, bool), keep=0xFFFF0000, tile=1024
+        )
+    )
+    jax.effects_barrier()
+    bad = dma_out_of_bounds(log)
+    assert bad and {d[0] for d in bad} == {False, True} and all(d[1] == 4 for d in bad)
