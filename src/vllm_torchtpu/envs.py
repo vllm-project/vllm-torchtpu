@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK: int = 0
+    VLLM_TPU_QSA_PREFILL_INDEXER_SMALL_CHUNK: int = 0
     VLLM_TPU_QSA_PREFILL_INDEXER_BQ: int = 128
     VLLM_TPU_QSA_PREFILL_INDEXER_BKV: int = 256
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
@@ -896,6 +897,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and winners do not depend on the chunking.
     "VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK": env_nonnegative_int(
         "VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK", 0
+    ),
+    # Qwen4-exp ragged prefill indexer on small steps (at most 1024 rows per
+    # rank, which the default runs as one call or two 512-row chunks): score/
+    # select in chunks of this many tokens so the SparseCore top-k of chunk g
+    # hides behind the TensorCore scoring of chunk g+1 instead of being fully
+    # exposed. 0 (default) = off. Must be a multiple of 8 that divides the step
+    # and is smaller than it, else the default applies. An explicit
+    # VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK takes precedence. Exact: per-row
+    # scores and winners do not depend on the chunking.
+    "VLLM_TPU_QSA_PREFILL_INDEXER_SMALL_CHUNK": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_INDEXER_SMALL_CHUNK", 0
     ),
     # Qwen4-exp ragged prefill indexer tiles: queries per block of the prefill
     # passes and compressed keys per KV block (a multiple of 256). Defaults

@@ -1202,11 +1202,28 @@ def prefill_indexer_chunk(tokens: int) -> int | None:
 
     Default: 512 when it divides the step. VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK
     overrides it with any multiple of 8 that divides the step.
+    VLLM_TPU_QSA_PREFILL_INDEXER_SMALL_CHUNK applies its chunk only to steps of
+    at most ``SMALL_INDEXER_STEP_TOKENS`` rows, whose top-k the default leaves
+    exposed (one call, or two 512-row chunks).
     """
     override = envs.VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK
     if override and override % 8 == 0 and tokens % override == 0:
         return override
+    small = envs.VLLM_TPU_QSA_PREFILL_INDEXER_SMALL_CHUNK
+    if (
+        small
+        and small % 8 == 0
+        and tokens <= SMALL_INDEXER_STEP_TOKENS
+        and small < tokens
+        and tokens % small == 0
+    ):
+        return small
     return 512 if tokens % 512 == 0 else None
+
+
+# Largest per-rank prefill indexer step VLLM_TPU_QSA_PREFILL_INDEXER_SMALL_CHUNK
+# re-chunks (replicated 256/512/1024 buckets; SP 2K/4K/8K chunks per rank).
+SMALL_INDEXER_STEP_TOKENS = 1024
 
 
 # Largest expanded kernel-page table the ragged prefill indexer prefetches
