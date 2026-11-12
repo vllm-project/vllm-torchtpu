@@ -454,9 +454,6 @@ def gather_group_heads(
 KV_GATHER_SHARE_ENV = "TPU_MINIMAX_M3_DCP_KV_GATHER_SHARE"
 
 
-_KV_GATHER_SHARE_TRACED: list[int] = []
-
-
 def kv_gather_share_enabled() -> bool:
     return os.environ.get(KV_GATHER_SHARE_ENV, "0") == "1"
 
@@ -494,12 +491,6 @@ def gather_group_kv(
         and kv_gather_share_enabled()
     ):
         share = num_tokens // kv_head_replicas
-        if not _KV_GATHER_SHARE_TRACED:
-            _KV_GATHER_SHARE_TRACED.append(num_tokens)
-            init_logger(__name__).info(
-                "%s=1: traced the share gather (%d tokens, %d replicas).",
-                KV_GATHER_SHARE_ENV, num_tokens, kv_head_replicas,
-            )
         mine = torch.cat([k, v, index_q], dim=1).view(
             kv_head_replicas, share, 3, head_dim
         )

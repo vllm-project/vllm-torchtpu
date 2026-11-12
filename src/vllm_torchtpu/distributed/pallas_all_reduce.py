@@ -34,6 +34,7 @@ import os
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 from jax import lax
@@ -59,9 +60,16 @@ class _Armed:
     ranks: tuple[int, ...]
     op: Any
     rank: torch.Tensor  # this rank's mesh index, int32 [1, 1]
+    # op(x, rank, prev): the same all-reduce, started only once `prev` exists.
+    ordered_op: Any = None
 
 
 _ARMED: _Armed | None = None
+# While a chain is open (`begin_chain`), every armed all-reduce starts after
+# the previous one in the chain: XLA keeps them in program order on the
+# SparseCore and cannot combine two of them into one that both consumers
+# would wait for.
+_CHAIN: list | None = None
 
 
 def _body(n: int, max_bytes: int, axis: str):
@@ -74,35 +82,51 @@ def _body(n: int, max_bytes: int, axis: str):
     return body
 
 
-def _make_op(mesh, max_bytes: int):
+def _ordered_body(n: int, max_bytes: int, axis: str):
+    body = _body(n, max_bytes, axis)
+
+    def ordered(x, rank, prev):
+        # An exact zero read from `prev` (NaN/inf mapped to 0 first) added to
+        # one element: a data dependency that changes no value.
+        zero = jnp.nan_to_num(prev[0, 0], nan=0.0, posinf=0.0, neginf=0.0) * 0
+        return body(x.at[0, 0].add(zero.astype(x.dtype)), rank)
+
+    return ordered
+
+
+def _make_op(mesh, max_bytes: int, ordered: bool = False):
     axis = mesh.axis_names[0]
-    specs = (P(axis), P(axis))
+    specs = (P(axis),) * (3 if ordered else 2)
+    make_body = _ordered_body if ordered else _body
     sharded = jax.shard_map(
-        _body(int(mesh.size), max_bytes, axis),
+        make_body(int(mesh.size), max_bytes, axis),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
         check_vma=False,
     )
 
+    def put(args):
+        return (jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+
     # torch_tpu reads the operand types from these annotations.
     def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
-        args = (x, rank)
-        return sharded(
-            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
-        )
+        return sharded(*put((x, rank)))
+
+    def fn_ordered(x: jax.Array, rank: jax.Array, prev: jax.Array) -> jax.Array:
+        return sharded(*put((x, rank, prev)))
 
     # PartitionSpecs, as other jax_op call sites pass them (torch_tpu's
     # annotation is narrower).
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        "pallas::tp_all_reduce",
-        fn,
+        "pallas::tp_all_reduce_ordered" if ordered else "pallas::tp_all_reduce",
+        fn_ordered if ordered else fn,
         mesh=mesh,
         input_partition_specs=specs,
         output_partition_specs=P(axis),
     )
-    op.register_fake(lambda x, rank: torch.empty_like(x))
+    op.register_fake(lambda x, *_: torch.empty_like(x))
     return op
 
 
@@ -198,7 +222,12 @@ def arm(hidden: int, device: torch.device) -> bool:
         raise RuntimeError(
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
         )
-    _ARMED = _Armed(ranks=tuple(int(r) for r in tp.ranks), op=op, rank=rank)
+    _ARMED = _Armed(
+        ranks=tuple(int(r) for r in tp.ranks),
+        op=op,
+        rank=rank,
+        ordered_op=_make_op(mesh, max_bytes, ordered=True),
+    )
     logger.info(
         "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views"
         " (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES=%d, kernel cap %d); libtpu %s",
@@ -223,4 +252,28 @@ def all_reduce(ranks, x: torch.Tensor) -> torch.Tensor | None:
     # Every size goes to the op, which decides on the static size inside: a
     # branch here would give the model's Dynamo traces different graphs (and
     # inputs) per bucket, which shape_variants refuses to hand buckets between.
-    return armed.op(x, armed.rank)
+    chain = _CHAIN
+    if chain is None or armed.ordered_op is None:
+        return armed.op(x, armed.rank)
+    out = armed.op(x, armed.rank) if not chain else armed.ordered_op(
+        x, armed.rank, chain[-1]
+    )
+    chain.append(out)
+    return out
+
+
+def armed() -> bool:
+    """Whether the op is armed (so `begin_chain` orders the all-reduces)."""
+    return _ARMED is not None and _ARMED.ordered_op is not None
+
+
+def begin_chain() -> None:
+    """Order every armed all-reduce from here to `end_chain` in program
+    order (each starts once the previous one's output exists)."""
+    global _CHAIN
+    _CHAIN = []
+
+
+def end_chain() -> None:
+    global _CHAIN
+    _CHAIN = None

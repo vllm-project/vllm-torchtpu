@@ -38,7 +38,7 @@ def _load_msa():
         "src/vllm_torchtpu/models/minimax_m3/ops/msa.py"
     )
     tree = ast.parse(path.read_text())
-    want = {"KV_GATHER_SHARE_ENV", "_KV_GATHER_SHARE_TRACED", "kv_gather_share_enabled", "gather_group_kv"}
+    want = {"KV_GATHER_SHARE_ENV", "kv_gather_share_enabled", "gather_group_kv"}
     body = [
         node
         for node in tree.body

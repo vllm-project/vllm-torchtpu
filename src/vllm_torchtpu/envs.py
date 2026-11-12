@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     TPU_MOE_COUNTING_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
+    TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
     TPU_MOE_V3_PAYLOAD_SORT: bool = False
@@ -746,6 +747,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # buckets up to 40 rows of 6144, where the two still differ.
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
+    ),
+    # MiniMax M3: steps of at least this many tokens run each layer's
+    # post-attention block (all-reduce, norm, FFN, all-reduce) on two token
+    # halves, so one half's all-reduce on the SparseCore runs while the
+    # TensorCore computes the other half's FFN. The attention runs whole.
+    # Needs TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES > 0 (the ordered all-reduces).
+    # 0 (default) = off.
+    "TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS": env_int(
+        "TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS", 0
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and

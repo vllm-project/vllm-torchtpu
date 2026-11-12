@@ -19,6 +19,7 @@ import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -33,9 +34,14 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.distributed import pallas_all_reduce
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
+
+logger = init_logger(__name__)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -66,6 +72,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
+        self.ffn_split_min_tokens = envs.TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS
+        if self.ffn_split_min_tokens and layer_id == 0:
+            logger.info(
+                "TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS=%d: post-attention block on "
+                "two token halves from %d tokens.",
+                self.ffn_split_min_tokens,
+                self.ffn_split_min_tokens,
+            )
 
     def forward(
         self,
@@ -78,10 +92,45 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        num_tokens = hidden_states.shape[0]
+        if (
+            self.ffn_split_min_tokens
+            and num_tokens >= self.ffn_split_min_tokens
+            and num_tokens % 2 == 0
+            and pallas_all_reduce.armed()
+        ):
+            return self._forward_ffn_halves(positions, hidden_states, residual, ffn)
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         return ffn(hidden_states), residual
+
+    def _forward_ffn_halves(self, positions, hidden_states, residual, ffn):
+        """The layer with its post-attention block on two token halves.
+
+        The attention runs on every token; its partial output is all-reduced
+        per half, and each half goes through the norm and the FFN (whose own
+        all-reduce ends it) on its own. The four all-reduces run in the order
+        attention 0, attention 1, FFN 0, FFN 1 (`pallas_all_reduce`
+        chain), so attention half 1's all-reduce overlaps FFN half 0 and FFN
+        half 0's all-reduce overlaps FFN half 1. Every row sees the same
+        operations as unsplit; the sums may round differently."""
+        num_tokens = hidden_states.shape[0]
+        half = num_tokens // 2
+        partial = self.self_attn(positions, hidden_states, reduce=False)
+        pallas_all_reduce.begin_chain()
+        attn = [
+            tensor_model_parallel_all_reduce(partial.narrow(0, 0, half)),
+            tensor_model_parallel_all_reduce(partial.narrow(0, half, num_tokens - half)),
+        ]
+        out, res = [], []
+        for i, a in enumerate(attn):
+            r = residual.narrow(0, i * half, half if i == 0 else num_tokens - half)
+            h, r = self.post_attention_layernorm(a, r)
+            out.append(ffn(h))
+            res.append(r)
+        pallas_all_reduce.end_chain()
+        return torch.cat(out), torch.cat(res)
 
 
 @support_torch_compile(

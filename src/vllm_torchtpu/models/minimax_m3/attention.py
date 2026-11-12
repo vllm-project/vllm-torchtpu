@@ -404,8 +404,10 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.msa_op = get_msa_op(*msa_config, fp4=self.fp4)
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self, positions: torch.Tensor, hidden_states: torch.Tensor, reduce: bool = True
     ) -> torch.Tensor:
+        """The attention output; with ``reduce=False`` this rank's partial
+        (o_proj not all-reduced over the TP group)."""
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
@@ -446,5 +448,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                 layer_metadata,
                 **extra,
             ).reshape(num_tokens, self.q_size)
+        if not reduce:
+            # o_proj has no bias, so the partial is just this rank's GEMM.
+            return self.o_proj.quant_method.apply(self.o_proj, attn_output, None)
         output, _ = self.o_proj(attn_output)
         return output
