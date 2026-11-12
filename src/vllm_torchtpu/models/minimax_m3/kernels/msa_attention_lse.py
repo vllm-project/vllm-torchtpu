@@ -43,11 +43,17 @@ PREFILL_STEP_WIDTHS = (
     if os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_WIDTH12", "0") == "1"
     else _STEP_WIDTHS
 )
-# TPU_MINIMAX_M3_MSA_PREFILL_WIDTHS=<w,w,...> (e.g. "2,4,6,8,12") sets the
+# TPU_MINIMAX_M3_MSA_PREFILL_WIDTHS=<w,w,...> (e.g. "2,4,6,8,12"; "/" also
+# separates, for env lists that are themselves comma-separated) sets the
 # prefill step widths outright (below 16, ascending); unset keeps the above.
 if os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_WIDTHS"):
     PREFILL_STEP_WIDTHS = tuple(
-        sorted(int(w) for w in os.environ["TPU_MINIMAX_M3_MSA_PREFILL_WIDTHS"].split(","))
+        sorted(
+            int(w)
+            for w in os.environ["TPU_MINIMAX_M3_MSA_PREFILL_WIDTHS"]
+            .replace("/", ",")
+            .split(",")
+        )
     )
 # With TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE=<slots> (0 = off), prefill-sized
 # calls on 4-bit caches copy each distinct page of a call once into a VMEM
