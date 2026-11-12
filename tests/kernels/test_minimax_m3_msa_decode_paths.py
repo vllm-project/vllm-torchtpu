@@ -48,7 +48,7 @@ def _keys(rng, calls, tokens, block_q, keys_per_req, fill):
 
 @pytest.mark.parametrize(
     "calls,tokens,block_q,fill",
-    [(1, 8, 8, 0.7), (1, 48, 8, 0.9), (2, 128, 8, 0.5), (1, 24, 8, 0.0), (1, 160, 16, 0.8)],
+    [(1, 8, 8, 0.7), (1, 48, 8, 0.9), (2, 128, 8, 0.5), (1, 24, 8, 0.0), (1, 160, 16, 0.8), (1, 2048, 16, 0.3)],
 )
 def test_work_list_kernel_matches_xla(calls, tokens, block_q, fill):
     rng = np.random.default_rng(tokens + calls)
@@ -111,6 +111,7 @@ def _attention_inputs(rng, heads, reqs, fp4):
         (msa_attention_lse.WORK_LIST_KERNEL_ENV, 1, 3, False),
         (msa_attention_lse.ONE_CALL_ENV, 4, 2, True),
         (msa_attention_lse.ONE_CALL_ENV, 2, 3, False),
+        (msa_attention_lse.ONE_CALL_ENV + "+W", 4, 3, True),
     ],
 )
 def test_decode_switch_same_bits(monkeypatch, env, heads, reqs, fp4):
@@ -125,9 +126,14 @@ def test_decode_switch_same_bits(monkeypatch, env, heads, reqs, fp4):
             scale_cache=sc, interpret=True, head_major=True,
         )
 
-    monkeypatch.delenv(env, raising=False)
+    envs = env.replace("+W", "").split(",")
+    if env.endswith("+W"):
+        envs.append(msa_attention_lse.WORK_LIST_KERNEL_ENV)
+    for e in envs:
+        monkeypatch.delenv(e, raising=False)
     ref = run()
-    monkeypatch.setenv(env, "1")
+    for e in envs:
+        monkeypatch.setenv(e, "1")
     got = run()
     for a, b in zip(ref, got):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
