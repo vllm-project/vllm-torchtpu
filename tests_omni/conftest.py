@@ -222,9 +222,11 @@ def omni_ctx() -> Generator[None, None, None]:
     from vllm.utils.network_utils import get_open_port
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.distributed.parallel_state import (
-        destroy_distributed_env,
+        destroy_distributed_environment,
+        destroy_model_parallel,
         init_distributed_environment,
         initialize_model_parallel,
+        model_parallel_is_initialized,
     )
     from vllm_omni.diffusion.forward_context import set_forward_context
 
@@ -237,13 +239,19 @@ def omni_ctx() -> Generator[None, None, None]:
             distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
             backend="gloo",
         )
+    owns_mp = not model_parallel_is_initialized()
+    if owns_mp:
         initialize_model_parallel(tensor_parallel_size=1, pipeline_parallel_size=1)
-    with set_forward_context(
-        vllm_config=VllmConfig(), omni_diffusion_config=OmniDiffusionConfig()
-    ):
-        yield
-    if owns_dist_env:
-        destroy_distributed_env()
+    try:
+        with set_forward_context(
+            vllm_config=VllmConfig(), omni_diffusion_config=OmniDiffusionConfig()
+        ):
+            yield
+    finally:
+        if owns_mp:
+            destroy_model_parallel()
+        if owns_dist_env:
+            destroy_distributed_environment()
 
 
 @pytest.fixture(autouse=True)
