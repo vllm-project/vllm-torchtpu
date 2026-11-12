@@ -86,12 +86,14 @@ class MoEParams:
     prim_now: bool = False
     # `MoETunables.sh_pre` resolved (lazy MoE segment, shared expert of at most
     # 4 dense tiles, each kind within `dmm_unroll`): the shared expert's tiles
-    # are taken with the router's and its matmuls run from registers, the
-    # gate|up before routing. `sh_hoist`: the router + shared tiles wait as one
-    # hoisted group (`Tiles.dwait_hoist`, router fully unrolled).
+    # are taken with the router's and its matmuls run from registers before
+    # (`sh_at` 0), inside (1) or after (2) routing. `sh_hoist`: the router +
+    # shared tiles wait as one hoisted group (`Tiles.dwait_hoist`, router
+    # fully unrolled).
     sh_pre: bool = False
     sh_hoist: bool = False
     sh2_pre_route: bool = False
+    sh_at: int = 0
     # `MoETunables.flush_pre_drain` resolved (lazy MoE segment, PIPE_EP).
     flush_pre_drain: bool = False
 
@@ -152,7 +154,7 @@ class MoETunables:
         "sh_pre": "exact",  # same tile sums, moved before routing
         "sh2_pre_route": "exact",  # same ops, moved
         "flush_in_ar1": "approx",
-        "sh_at": "approx",
+        "sh_at": "exact",  # same ops, moved
         "ep_fast_refill": "exact",  # same DMAs, static banks
         "cp_interleave": "approx",  # copy-slot scan order (Po2C is greedy)
         "route_early": "exact",  # same ops and DMAs, earlier
@@ -251,6 +253,10 @@ def derive_moe_params(
         and ex.R * extra + ex.R + 1 <= 128  # NCP + R + 1 <= 128 VREG lanes
         and nb_picks >= er  # elist/wlist capacity covers ER local slots
     )
+    if tt.sh_at not in (0, 1, 2):
+        raise MegakernelConfigError(
+            f"MoETunables.sh_at must be 0, 1 or 2, got {tt.sh_at!r}"
+        )
     # sh_pre sums the shared expert's tiles in registers, which is the dense
     # matmul's own order only on its fully unrolled path (nt <= dmm_unroll).
     dmu = min(tiles.dmm_unroll, tiles.nbd)
@@ -325,5 +331,6 @@ def derive_moe_params(
         sh_pre=sh_pre,
         sh_hoist=bool(sh_pre and tiles.dwait_hoist and plan.nt["router"] <= dmu),
         sh2_pre_route=bool(sh_pre and tt.sh2_pre_route),
+        sh_at=int(tt.sh_at) if sh_pre else 0,
         flush_pre_drain=bool(tt.flush_pre_drain and lazy_moe and pipe_ep),
     )

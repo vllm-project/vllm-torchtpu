@@ -330,6 +330,7 @@ def _plan_effect(field: str, g: Any, ex: mk.ExecSpec) -> Any:
         "moe.prim_now": bp["moe"].prim_now,
         "moe.sh_pre": bp["moe"].sh_pre,
         "moe.sh2_pre_route": bp["moe"].sh2_pre_route,
+        "moe.sh_at": bp["moe"].sh_at,
         "moe.flush_pre_drain": bp["moe"].flush_pre_drain,
     }.get(field)
 

@@ -143,6 +143,7 @@ EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
         (2, 4),
         {**_UNROLL, "moe.sh_pre": True},
     ),
+    ("sh_at", "moe.sh_at", 2, (2, 4), {**_UNROLL, "moe.sh_pre": True}),
     ("flush_pre_drain", "moe.flush_pre_drain", True, (2, 4), _PIPE_EP1),
 ]
 

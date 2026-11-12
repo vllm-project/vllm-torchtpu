@@ -407,6 +407,7 @@ class MoEModule(Module):
         H, E, ISR = mp.H, mp.E, mp.ISR
         PIPE, PIPE_EP, LAZY_MOE = mp.PIPE, mp.PIPE_EP, mp.LAZY_MOE
         SH_PRE = mp.sh_pre and "dense" not in m.skip
+        SH_AT = mp.sh_at if SH_PRE else 0
         FPD = mp.flush_pre_drain
         with stream.expert_stream():
             with stream.segment(lazy=LAZY_MOE, defer_flush=FPD):
@@ -424,13 +425,23 @@ class MoEModule(Module):
                     scr["sg"][...] = jnp.broadcast_to(jax.nn.sigmoid(glog), (MB, 128))
                     mx = jnp.max(logits, axis=-1, keepdims=True)
                     pexp = jnp.exp(logits - mx)
-                if SH_PRE:
+                if SH_PRE and SH_AT == 0:
                     _shared_up(m, ctx, slot, sh_w[0])
                     if mp.sh2_pre_route:
                         _shared_down(m, ctx, slot, sh_w[1])
                 with sc("moe_route"):
-                    n_hit = route(m, l, pexp)
-                if SH_PRE and not mp.sh2_pre_route:
+                    during = None
+                    if SH_AT == 1:
+
+                        def during() -> None:
+                            _shared_up(m, ctx, slot, sh_w[0])
+                            _shared_down(m, ctx, slot, sh_w[1])
+
+                    n_hit = route(m, l, pexp, during_dma=during)
+                if SH_AT == 2:
+                    _shared_up(m, ctx, slot, sh_w[0])
+                    _shared_down(m, ctx, slot, sh_w[1])
+                elif SH_PRE and SH_AT == 0 and not mp.sh2_pre_route:
                     _shared_down(m, ctx, slot, sh_w[1])
                 elif not SH_PRE:
                     with sc("moe_shared"):

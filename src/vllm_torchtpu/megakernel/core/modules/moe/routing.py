@@ -28,8 +28,12 @@ from .ring import fetch_e, fetch_loop, fetch_range
 from .topk import route_topk, route_weights
 
 
-def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
-    """Route layer `l_idx`'s rows; returns this rank's routed-expert count."""
+def route(m: MoEEmit, l_idx: Any, p8: Any, during_dma: Any = None) -> Any:
+    """Route layer `l_idx`'s rows; returns this rank's routed-expert count.
+
+    `during_dma()`, when given, runs while the hit-list copy is in flight
+    (`MoETunables.sh_at` 1: the shared expert under the copy's round trip).
+    """
     ctx, ex, mp, scr, sc, sp, skip = m.ctx, m.ex, m.mp, m.scr, m.sc, m.sp, m.skip
     MR, R = ex.MR, ex.R
     E, ECOPY, EXTRA, NBE, TE = mp.E, mp.ECOPY, mp.EXTRA, mp.NBE, mp.TE
@@ -75,6 +79,8 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
         cp.start()
         if early:
             route_weights(m, sel, p8)
+        if during_dma is not None:
+            during_dma()
         cp.wait()
     # `MoEModule.prologue` / `init_buffers` zeroes `scr["seen"]` before layer 0
     # of every step, so `stamp = l_idx + 1` (`1..L`) is unique per layer.

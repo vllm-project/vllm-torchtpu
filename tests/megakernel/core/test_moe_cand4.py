@@ -154,6 +154,8 @@ _EXACT = [
     ("sh_pre", "sh_pre", True, "sh_pre", {}),
     ("sh_pre-hoist", "sh_pre", True, "sh_hoist", {"tiles": {"dwait_hoist": True}}),
     ("sh2_pre_route", "sh2_pre_route", True, "sh2_pre_route", {"sh_pre": True}),
+    ("sh_at1", "sh_at", 1, "sh_at", {"sh_pre": True}),
+    ("sh_at2", "sh_at", 2, "sh_at", {"sh_pre": True}),
     ("flush_pre_drain", "flush_pre_drain", True, "flush_pre_drain", {}),
 ]
 
@@ -200,13 +202,16 @@ def test_route_shrink_requires_cp_interleave():
 
 
 def test_sh_pre_and_flush_gates():
-    """sh_pre needs a lazy MoE segment; sh2_pre_route needs sh_pre;
+    """sh_pre needs a lazy MoE segment; sh_at / sh2_pre_route need sh_pre;
     flush_pre_drain needs PIPE_EP and a lazy segment."""
     assert not _moe_params(4, 8, {"sh_pre": True, "tiles": {"lazy": False}}).sh_pre
+    assert _moe_params(4, 8, {"sh_at": 2}).sh_at == 0
     assert not _moe_params(4, 8, {"sh2_pre_route": True}).sh2_pre_route
     fpd = {"flush_pre_drain": True}
     assert not _moe_params(4, 8, {**fpd, "pipe_ep": False}).flush_pre_drain
     assert not _moe_params(4, 8, {**fpd, "tiles": {"lazy": False}}).flush_pre_drain
+    with pytest.raises(mk.MegakernelConfigError, match="sh_at"):
+        _moe_params(4, 8, {"sh_pre": True, "sh_at": 3})
 
 
 def test_prim_now_needs_route_shrink():
