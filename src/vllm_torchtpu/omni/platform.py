@@ -230,10 +230,12 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
             ValueError: If ``devices`` contains invalid, duplicate, or
                 non-contiguous multi-chip IDs.
         """
-        chip_ids = _parse_visible_chip_ids(devices)
+        # Restore first: scoped_spawn_device_env calls this from its `finally`
+        # with the parent's own value, which may not pass stage validation.
         if cls._is_parent_spawn_env_restore(devices):
             cls._restore_spawn_env()
             return
+        chip_ids = _parse_visible_chip_ids(devices)
 
         cls._save_spawn_env_if_needed()
         cls._clear_distributed_bootstrap_env()
@@ -323,10 +325,9 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         overwritten by later stages. Re-running _prepare_singlehost_tpu_env at
         spawn time gives this multi-chip stage fresh MASTER_PORT,
         TORCH_TPU_SLICEBUILDER_ADDRESSES, and TORCH_TPU_TOPOLOGY without
-        initializing libtpu or opening VFIO devices in the parent. When no
-        physical TPU PCI devices are attached (e.g. CPU-only unit test hosts),
-        device_count() == 0 skips hardware.get_tpu_topology(), which otherwise
-        raises ValueError("No TPU devices found.").
+        initializing libtpu or opening VFIO devices in the parent. On a host
+        with no TPU chips this raises instead of spawning a stage with no
+        bootstrap env.
         """
         # Never set TPU_VISIBLE_DEVICES to a multi-chip list: torch_tpu falls
         # back to LOCAL_RANK when TPU_VISIBLE_DEVICES is not a single integer,
@@ -334,8 +335,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         # DEBUG_TPU_LOCAL_RANK_OFFSET.
         os.environ.pop("TPU_VISIBLE_DEVICES", None)
         os.environ["DEBUG_TPU_LOCAL_RANK_OFFSET"] = str(chip_ids[0])
-        if cls.device_count() > 0:
-            cls._prepare_singlehost_tpu_env(len(chip_ids))
+        cls._prepare_singlehost_tpu_env(len(chip_ids))
 
     @classmethod
     def set_device(cls, device: torch.device | int) -> None:
@@ -344,14 +344,11 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
             cls._worker_world_size = world_size
             chips = os.environ.get("TPU_VISIBLE_CHIPS")
             if chips and [int(c) for c in chips.split(",")] != list(range(world_size)):
-                logger.warning(
-                    "Diffusion stage is pinned to TPU_VISIBLE_CHIPS=%s, but its "
-                    "%d ranks bind chips 0-%d by local rank. Multi-rank diffusion "
-                    "stages on other chips (e.g. in multi-stage pipelines) are "
-                    "not supported on TPU yet.",
-                    chips,
-                    world_size,
-                    world_size - 1,
+                raise ValueError(
+                    f"Diffusion stage is pinned to TPU_VISIBLE_CHIPS={chips}, but "
+                    f"its {world_size} ranks bind chips 0-{world_size - 1} by "
+                    "local rank. Multi-rank diffusion stages on other chips (e.g. "
+                    "in multi-stage pipelines) are not supported on TPU yet."
                 )
             cls._set_shared_slicebuilder_addresses(world_size)
             cls._offload_dense_all_to_all()

@@ -331,10 +331,13 @@ def test_dist_backend_after_world_size_pop(monkeypatch):
     assert OmniTpuPlatform().dist_backend == "tpu_dist"
 
 
-@pytest.mark.parametrize("chips, warns", [(None, False), ("0,1", False), ("1,2", True)])
-def test_set_device_warns_on_pinned_multi_rank_stage(monkeypatch, chips, warns):
+@pytest.mark.parametrize(
+    "chips, raises", [(None, False), ("0,1", False), ("1,2", True)]
+)
+def test_set_device_raises_on_pinned_multi_rank_stage(monkeypatch, chips, raises):
     # Ranks bind chips 0..N-1 by local rank, so a stage pinned to other chips
-    # (e.g. a diffusion stage in a multi-stage pipeline) is flagged.
+    # (e.g. a diffusion stage in a multi-stage pipeline) would land on chips
+    # another stage may own.
     monkeypatch.setenv("WORLD_SIZE", "2")
     monkeypatch.setenv("MASTER_PORT", "29500")
     monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1")
@@ -349,13 +352,12 @@ def test_set_device_warns_on_pinned_multi_rank_stage(monkeypatch, chips, warns):
         staticmethod(lambda world_size: None),
     )
     monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
-    with (
-        patch("vllm_torchtpu.omni.platform.logger.warning") as mock_warning,
-        patch("torch.empty"),
-        patch("torch.device"),
-    ):
-        OmniTpuPlatform.set_device(None)
-    assert mock_warning.called == warns
+    with patch("torch.empty"), patch("torch.device"):
+        if raises:
+            with pytest.raises(ValueError, match="not supported on TPU yet"):
+                OmniTpuPlatform.set_device(None)
+        else:
+            OmniTpuPlatform.set_device(None)
 
 
 def test_memory_methods(monkeypatch):
@@ -1168,6 +1170,52 @@ def test_scoped_spawn_device_env_roundtrip(monkeypatch):
     assert OmniTpuPlatform._saved_spawn_env is None
 
 
+def test_scoped_spawn_device_env_restores_parent_value_that_fails_validation(
+    monkeypatch,
+):
+    import threading
+
+    from vllm_omni.engine import stage_engine_startup
+
+    platform = OmniTpuPlatform()
+    monkeypatch.setattr(stage_engine_startup, "current_omni_platform", platform)
+    monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
+    monkeypatch.delenv("TPU_RUNTIME_METRICS_PORTS", raising=False)
+    monkeypatch.setenv("TPU_VISIBLE_DEVICES", "0")
+    # A non-contiguous parent value is legal for the user to set, but a stage
+    # spec like this is rejected by _parse_visible_chip_ids.
+    monkeypatch.setenv("TPU_VISIBLE_CHIPS", "0,2")
+
+    with stage_engine_startup.scoped_spawn_device_env(
+        "1", threading.Lock(), stage_id=1, replica_id=0
+    ):
+        assert os.environ["TPU_VISIBLE_CHIPS"] == "1"
+        assert os.environ["TPU_VISIBLE_DEVICES"] == "1"
+
+    assert os.environ["TPU_VISIBLE_CHIPS"] == "0,2"
+    assert os.environ["TPU_VISIBLE_DEVICES"] == "0"
+    assert "TPU_RUNTIME_METRICS_PORTS" not in os.environ
+    assert OmniTpuPlatform._saved_spawn_env is None
+
+
+def test_multi_chip_pin_runs_bootstrap_without_visible_chips(monkeypatch):
+    # With no chips, the bootstrap must run (and fail loudly in
+    # _get_tpu_topology) instead of spawning a stage with no MASTER_PORT.
+    monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
+    monkeypatch.setattr(OmniTpuPlatform, "device_count", classmethod(lambda cls: 0))
+    prepared_world_sizes: list[int] = []
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        classmethod(lambda cls, ws: prepared_world_sizes.append(ws)),
+    )
+    try:
+        OmniTpuPlatform.set_device_control_env_var("2,3")
+        assert prepared_world_sizes == [2]
+    finally:
+        OmniTpuPlatform.unset_device_control_env_var()
+
+
 def _find_free_tpu_chips(num_chips: int, needed: int = 2) -> list[str]:
     """Return unheld TPU chip IDs, preferring non-zero chips first."""
     from tests.tpu_release import tpu_device_owners
@@ -1227,11 +1275,11 @@ def test_tpu_single_stage_subprocess_chip_pinning(monkeypatch):
 
     num_chips = OmniTpuPlatform.device_count()
     if num_chips < 1:
-        pytest.skip("Requires at least 1 TPU chip")
+        pytest.fail("tpu_test lane has no TPU chip")
 
     free_chips = _find_free_tpu_chips(num_chips, needed=1)
     if not free_chips:
-        pytest.skip(f"Requires 1 free TPU chip on {num_chips}-chip host")
+        pytest.fail(f"No free TPU chip on {num_chips}-chip tpu_test host")
     chip_0 = free_chips[0]
 
     platform = OmniTpuPlatform()
@@ -1279,12 +1327,12 @@ def test_tpu_two_stage_concurrent_subprocess_chip_isolation(monkeypatch):
 
     num_chips = OmniTpuPlatform.device_count()
     if num_chips < 2:
-        pytest.skip(f"Requires at least 2 TPU chips, found {num_chips}")
+        pytest.fail(f"multichip lane has {num_chips} TPU chip(s), needs 2")
 
     free_chips = _find_free_tpu_chips(num_chips, needed=2)
     if len(free_chips) < 2:
-        pytest.skip(
-            f"Requires 2 free TPU chips on {num_chips}-chip host, found {free_chips}"
+        pytest.fail(
+            f"Needs 2 free TPU chips on {num_chips}-chip host, found {free_chips}"
         )
     chip_a, chip_b = free_chips[0], free_chips[1]
 
