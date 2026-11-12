@@ -1165,47 +1165,41 @@ def _routed_experts(
                     :, :tn
                 ].astype(jnp.bfloat16)
 
-        def route(i):
-            return (destinations[i], probabilities[i])
-
+        # Token combine: the GU rows already carry their route weights, so each
+        # expert row adds into its token's sums unweighted. A batch issues all
+        # loads before its stores; one expert holds a token at most once, so the
+        # destinations of a batch differ (padding rows go to the dummy slots).
         def batched_unclamped(source, begin, base_idx, width_b):
             idxs = [base_idx + r for r in range(width_b)]
-            routes = [route(i_r) for i_r in idxs]
+            dests = [destinations[i_r] for i_r in idxs]
             vals = [
                 source.at[pl.ds(i_r - begin, 1)][...].astype(jnp.float32)
                 for i_r in idxs
             ]
-            olds = [sums.at[pl.ds(d_r, 1)][...] for d_r, _ in routes]
-            accs = [olds[r] + vals[r] * routes[r][1] for r in range(width_b)]
+            olds = [sums.at[pl.ds(d_r, 1)][...] for d_r in dests]
             for r in range(width_b):
-                sums.at[pl.ds(routes[r][0], 1)][...] = accs[r]
+                sums.at[pl.ds(dests[r], 1)][...] = olds[r] + vals[r]
 
         def batched_clamped(
             source, begin, base_idx, end, width_b, *, guard, dummy_base=0
         ):
             idxs = [base_idx + r for r in range(width_b)]
-            actives = [guard & (idx_r < end) for idx_r in idxs]
             clamped = [jnp.minimum(idx_r, end - 1) for idx_r in idxs]
-            routes = [route(c_r) for c_r in clamped]
             dests = [
                 jnp.where(
-                    actives[r],
-                    routes[r][0],
+                    guard & (idxs[r] < end),
+                    destinations[clamped[r]],
                     tokens + ((dummy_base + r) % _RMW_DUMMY_SLOTS),
                 )
                 for r in range(width_b)
-            ]
-            weights = [
-                jnp.where(actives[r], routes[r][1], 0.0) for r in range(width_b)
             ]
             vals = [
                 source.at[pl.ds(c_r - begin, 1)][...].astype(jnp.float32)
                 for c_r in clamped
             ]
             olds = [sums.at[pl.ds(d_r, 1)][...] for d_r in dests]
-            accs = [olds[r] + vals[r] * weights[r] for r in range(width_b)]
             for r in range(width_b):
-                sums.at[pl.ds(dests[r], 1)][...] = accs[r]
+                sums.at[pl.ds(dests[r], 1)][...] = olds[r] + vals[r]
 
         def consume(tile_g, source, first=0, *, loop_unroll=unroll):
             start = metadata.gm_id_to_m_offset[tile_g]
@@ -1352,8 +1346,9 @@ def _routed_experts(
             gu_partial=pltpu.VMEM((sub, mid_width), gu_cfg.out_dtype),
             acts=pltpu.VMEM((2, tm, 2, 1792), latent.dtype),
             act_sems=pltpu.SemaphoreType.DMA((2,)),
+            row_weights=pltpu.VMEM((2, tm, 128), jnp.float32),
         )
-        def first_column(gu_partial, acts, act_sems):
+        def first_column(gu_partial, acts, act_sems, row_weights):
             def buffering(spec):
                 return dataclasses.replace(
                     spec, pipeline_mode=pl.Buffered(buffer_count=2)
@@ -1374,6 +1369,11 @@ def _routed_experts(
                 unroll = 16 if tokens == 8192 else 8
                 full = (n_active // unroll) * unroll
 
+                def weigh(i):
+                    row_weights.at[bank, pl.ds(first + i, 1)][...] = jnp.full(
+                        (1, 128), probabilities[raw_start + i], jnp.float32
+                    )
+
                 @pl.loop(0, n_active // unroll)
                 def row_vec(blk):
                     base = blk * unroll
@@ -1384,6 +1384,8 @@ def _routed_experts(
                             acts.at[bank, pl.ds(first + base + u, 1)],
                             act_sems.at[bank],
                         ).start()
+                    for u in range(unroll):
+                        weigh(base + u)
 
                 @pl.loop(full, n_active)
                 def row_rem(i):
@@ -1393,8 +1395,9 @@ def _routed_experts(
                         acts.at[bank, pl.ds(first + i, 1)],
                         act_sems.at[bank],
                     ).start()
+                    weigh(i)
 
-            def joint(gw, dw, gy, metadata, gu_partial, acts, act_sems):
+            def joint(gw, dw, gy, metadata, gu_partial, acts, act_sems, row_weights):
                 g = pl.program_id(1)
                 bank = g % 2
 
@@ -1407,6 +1410,7 @@ def _routed_experts(
                     sums[...] = jnp.zeros(sums.shape, jnp.float32)
                     packed.at[1][...] = jnp.zeros(packed.at[1].shape, packed.dtype)
                     acts[...] = jnp.zeros(acts.shape, acts.dtype)
+                    row_weights[...] = jnp.zeros(row_weights.shape, jnp.float32)
 
                 @pl.when(active_ng > 0)
                 def gate_up():
@@ -1433,6 +1437,7 @@ def _routed_experts(
                         gy,
                         gu_partial,
                         metadata,
+                        row_weights.at[bank],
                         cfgs=gu_cfg,
                         overlap_work=lambda panel, b_idx=0: gu_work(g, panel, b_idx),
                     )
@@ -1445,7 +1450,7 @@ def _routed_experts(
                 out_specs=gu_ys,
             )
             refs = (gu, w, middle.reshape(-1, sub, mid_width))
-            scratches = (metadata, gu_partial, acts, act_sems)
+            scratches = (metadata, gu_partial, acts, act_sems, row_weights)
             if tokens == 8192 and mid_width != 768:
                 # The EP16 8K schedule fills VMEM; retain its compact buffers.
                 pltpu.emit_pipeline(joint, **specs)(*refs, scratches=scratches)
@@ -1651,11 +1656,13 @@ def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
     return jnp.concatenate(panels, axis=1)
 
 
-def _gu_inner(lhs, rhs, output, partial, metadata, *, cfgs, overlap_work):
+def _gu_inner(lhs, rhs, output, partial, metadata, row_weights, *, cfgs, overlap_work):
     """GU/SiTU with the production row buckets and adjacent-expert carry.
 
-    Expert boundaries need not align with the 16-row BF16 sublane. Mask outside
-    the active expert, then preserve the preceding expert's partial first row.
+    Each row is scaled by its route weight (``row_weights``, lane-broadcast),
+    so the down projection's rows combine unweighted. Expert boundaries need
+    not align with the 16-row BF16 sublane. Mask outside the active expert,
+    then preserve the preceding expert's partial first row.
     """
     group = pl.program_id(1)
     start = metadata.gm_id_to_m_offset[group]
@@ -1672,7 +1679,7 @@ def _gu_inner(lhs, rhs, output, partial, metadata, *, cfgs, overlap_work):
             bucket_rows=rows,
             overlap_work=lambda panel: overlap_work(panel, bucket_index),
         )
-        value = k.apply_act_fn(value, cfgs.fuse_act)
+        value = k.apply_act_fn(value, cfgs.fuse_act) * row_weights[:rows, :1]
         row = lax.broadcasted_iota(jnp.int32, value.shape, 0)
         value = jnp.where((first <= row) & (row < last), value, 0)
         output.reshape(-1, cfgs.tiles.tile_n)[:rows] = value.astype(output.dtype)
@@ -1702,7 +1709,7 @@ def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work):
     """Down projection stored as packed rows for token-wise VALU combine.
 
     Each valid expert row is consumed individually, so this output needs no
-    adjacent-expert carry. BF16 rounding precedes FP32 routing weighting.
+    adjacent-expert carry. Rows arrive weighted (see ``_gu_inner``).
     """
     assert cfgs.fuse_act is None
     group = pl.program_id(1)
