@@ -210,6 +210,19 @@ class WarmupCase:
 StepFn = Callable[..., Any]
 
 
+class LoadTensorHook[TensorT](Protocol):
+    """Plugin hook observing streamed `(name, tensor, options)` pairs."""
+
+    def __call__(
+        self,
+        name: str,
+        tensor: TensorT,
+        options: Mapping[str, object],
+    ) -> object:
+        """Inspect a streamed checkpoint tensor before in-place packing."""
+        ...
+
+
 class MonoProgram(Protocol):
     """One megakernel instance on one TP rank (returned by `create`).
 
@@ -278,6 +291,11 @@ class TpuMonoSpec:
     "mode=ep,buckets=8"`); the runtime forwards those into `options`. It reads
     them from `SPEC` when the config has top-level keys, so the module that
     defines `SPEC` must stay stdlib-only at import.
+    `layout_request` and `load_tensor` are optional callables or `"module:attr"`
+    strings resolved lazily by the adapter: `layout_request(vllm_config,
+    options)` requests KV/Mamba cache geometry before pool allocation, and
+    `load_tensor(name, tensor, options)` observes streamed checkpoint tensors
+    before in-place quantization packing.
     """
 
     name: str
@@ -291,6 +309,7 @@ class TpuMonoSpec:
     numerics: str = "exact"
     collective_domain: str = DOMAIN_TP
     layout_request: str | Callable[..., Any] | None = None
+    load_tensor: str | LoadTensorHook[Any] | None = None
     decline_codes: tuple[str, ...] = ()
     source_root: str | None = None
     api_version: int = API_VERSION
@@ -356,6 +375,7 @@ __all__ = [
     "Decline",
     "EligibilityResult",
     "LayoutDecline",
+    "LoadTensorHook",
     "MonoProgram",
     "RunnerShape",
     "StepDecision",

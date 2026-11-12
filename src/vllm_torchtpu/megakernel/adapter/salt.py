@@ -11,30 +11,54 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The megakernel's compile-cache salt (stdlib only).
+"""Compile-cache salt and lazy plugin hook resolution for `megakernel.adapter`.
 
-The salt is the digest of the plugin's cache-layout request, or `None` when
-the plugin makes none. It carries no plugin fingerprint or source hash, so
-editing a plugin never re-keys stock graphs. The megakernel settings
-themselves (`VLLM_TPU_MEGAKERNEL`, `additional_config["megakernel"]`) are
-hashed with the other settings: a plugin may change the stock model (e.g.
-reshard its experts in place).
+The salt is the SHA-256 prefix of the plugin's canonicalized cache-layout
+request, or `None` when the plugin makes none. It carries no plugin source
+hash, so editing a plugin never re-keys stock graphs.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import hashlib
-from typing import Any
+from typing import TYPE_CHECKING
 
 import vllm_torchtpu.envs as envs
 
 from .config import import_plugin, missing_template, resolve_callable, select_plugin
+from .constants import HOOK_LAYOUT_REQUEST, PLUGIN_HOOK_NAMES
 from .fingerprint import canonical_json
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
-def compile_cache_salt(vllm_config: Any) -> str | None:
-    """`sha256(canonical(layout_request(vllm_config, options)))[:16]`, or `None`."""
+_SALT_HEX_CHARS: int = 16
+
+
+def resolve_plugin_hook(
+    vllm_config: object,
+    hook: str,
+) -> tuple[Callable[..., object], dict[str, object]] | None:
+    """Resolve an enabled megakernel plugin's optional hook callable and options.
+
+    Args:
+        vllm_config: Active vLLM configuration holding `additional_config` and
+            `model_config.hf_config`.
+        hook: Hook attribute name on `TpuMonoSpec` (`'layout_request'` or
+            `'load_tensor'`).
+
+    Returns:
+        Tuple `(resolved_callable, options_dict)` when megakernel is enabled and
+        the selected plugin defines `hook`, or `None` when disabled, missing a
+        template, or `getattr(spec, hook)` is `None`.
+
+    Raises:
+        ValueError: If `hook` is not in `PLUGIN_HOOK_NAMES`.
+    """
+    if hook not in PLUGIN_HOOK_NAMES:
+        msg = f"Unknown plugin hook {hook!r}"
+        raise ValueError(msg)
     model_cfg = getattr(vllm_config, "model_config", None)
     cfg, resolved = select_plugin(
         envs.VLLM_TPU_MEGAKERNEL,
@@ -47,15 +71,35 @@ def compile_cache_salt(vllm_config: Any) -> str | None:
     if missing_template(ref) is not None:
         return None
     plugin, module = import_plugin(ref)
-    if plugin.layout_request is None:
+    target = (
+        plugin.layout_request if hook == HOOK_LAYOUT_REQUEST else plugin.load_tensor
+    )
+    if target is None:
         return None
-    fn = resolve_callable(plugin.layout_request, module, what="layout_request")
+    return resolve_callable(target, module, what=hook), dict(options)
+
+
+def compile_cache_salt(vllm_config: object) -> str | None:
+    """Compute the 16-hex-char compile-cache salt from `layout_request`, or `None`.
+
+    Args:
+        vllm_config: Active vLLM configuration passed to `layout_request`.
+
+    Returns:
+        16-character SHA-256 hex digest of the canonical JSON layout request, or
+        `None` when megakernel is disabled or `layout_request` returns `None`.
+    """
+    resolved_hook = resolve_plugin_hook(vllm_config, HOOK_LAYOUT_REQUEST)
+    if resolved_hook is None:
+        return None
+    fn, options = resolved_hook
     req = fn(vllm_config, options)
     if req is None:
         return None
     if dataclasses.is_dataclass(req) and not isinstance(req, type):
         req = dataclasses.asdict(req)
-    return hashlib.sha256(canonical_json(req).encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(canonical_json(req).encode("utf-8")).hexdigest()
+    return digest[:_SALT_HEX_CHARS]
 
 
-__all__ = ["compile_cache_salt"]
+__all__ = ["compile_cache_salt", "resolve_plugin_hook"]

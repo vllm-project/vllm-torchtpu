@@ -17,12 +17,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from .constants import DRIVER_EXPORTS, JAX_BRIDGE_EXPORTS
 from .errors import MegakernelPluginError, MegakernelUnsupported
-from .hooks import StepContext, is_suppressed, suppressed
-
-_DRIVER_EXPORTS = frozenset({"ProgramDriver"})
-_JAX_BRIDGE_EXPORTS = frozenset(
-    {"build_jax_step_op", "make_typed_step_wrapper", "sharded_jax_callable"}
+from .hooks import (
+    StepContext,
+    is_suppressed,
+    load_tensor_stream,
+    observe_model_loader,
+    suppressed,
 )
 
 
@@ -53,7 +55,7 @@ def maybe_create(runner: Any) -> Any:
 
 
 def __getattr__(name: str) -> Any:
-    if name in _DRIVER_EXPORTS:
+    if name in DRIVER_EXPORTS:
         from . import driver
 
         return getattr(driver, name)
@@ -61,7 +63,7 @@ def __getattr__(name: str) -> Any:
         from .backbone import find_backbone
 
         return find_backbone
-    if name in _JAX_BRIDGE_EXPORTS:
+    if name in JAX_BRIDGE_EXPORTS:
         from . import jax_bridge
 
         return getattr(jax_bridge, name)
@@ -77,8 +79,10 @@ __all__ = [
     "find_backbone",
     "guard_weight_update",
     "is_suppressed",
+    "load_tensor_stream",
     "make_typed_step_wrapper",
     "maybe_create",
+    "observe_model_loader",
     "sharded_jax_callable",
     "suppressed",
 ]
