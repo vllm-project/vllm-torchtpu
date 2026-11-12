@@ -193,6 +193,46 @@ KV_LAYOUT_BY_VLLM_LAYOUT: dict[VllmKVCacheLayout, batched_rpa_configs.KVLayout] 
     VllmKVCacheLayout.BLHNC: batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
 }
 
+# The batched-RPA kernel page of a Qwen3.5 engine that transfers KV in the
+# seq-along-lane layout (see qwen3_5_kv_transfer_page).
+QWEN3_5_KV_TRANSFER_PAGE_TOKENS = 128
+
+
+def qwen3_5_kv_transfer_page(vllm_config: VllmConfig) -> int | None:
+    """The kernel page a Qwen3.5 engine with KV transfer runs the batched-RPA
+    seq-along-lane cache at, or None to keep vLLM's choice.
+
+    In the seq-along-lane layout the tokens of one kernel page lie on the
+    lane axis of the cache, so the page is part of the bytes a prefill and a
+    decode engine exchange: the Raiden transfer lowers its byte spans per
+    kernel page, and its layout fingerprint pins the page
+    (``fa_kernel_page_tokens``), so a pair whose pages differ is refused.
+    Each engine sizes its block to hold its own GDN state (2304 tokens at a
+    TP1 prefill, 640 at a TP8 decode), and vLLM picks the largest supported
+    page that divides the block: 256 and 128 there. Every block this backend
+    serves is a multiple of 128, so both engines page at 128.
+
+    The condition is that the engine has a KV transfer config, whatever its
+    role: vLLM's MultiConnector gives each child connector a copy of the
+    engine config carrying that child's own role (``kv_both`` for an
+    offloading connector inside a prefill engine), and the child must resolve
+    the page the runner allocated. Other models, engines without KV transfer
+    and the head-along-sublane layout keep vLLM's choice.
+    """
+    if vllm_config.kv_transfer_config is None:
+        return None
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    if (
+        KV_LAYOUT_BY_VLLM_LAYOUT.get(layout)
+        is not batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+    ):
+        return None
+    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+
+    if not qwen3_5_settings.is_qwen3_5(vllm_config.model_config):
+        return None
+    return QWEN3_5_KV_TRANSFER_PAGE_TOKENS
+
 
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
     parallel = vllm_config.parallel_config
@@ -838,6 +878,9 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
             > 1
         ):
             return [128, 256, 512, 1024, 2048, 4096]
+        page = qwen3_5_kv_transfer_page(get_current_vllm_config())
+        if page is not None:
+            return [page]
         return [128, 256]
 
 
