@@ -317,13 +317,20 @@ class DeviceKVCacheAllocator:
     so call `synchronize` once after the last allocation, before a compiled
     program receives the arrays: PJRT donates only buffers with no pending
     write.
+
+    The zero fill is part of the contract. Kernels load cache slots that no
+    token has written yet, and some need them to be finite: paths in the MLA
+    kernels (`kernels/mla/v2`, `kernels/deepseek_v4`) mask only the scores
+    of invalid entries, and 0 * NaN is NaN. Fresh device memory can hold any
+    bits, while zero bits are finite in every cache dtype.
     """
 
     def __init__(self, device: torch.device) -> None:
         self.device = device
         self.arrays: list[torch.Tensor] = []
 
-    def zeros(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    def allocate(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        """Returns a new zero-filled array that `synchronize` covers."""
         array = torch.zeros(shape, dtype=dtype, device=self.device)
         self.arrays.append(array)
         return array
@@ -429,7 +436,7 @@ def materialize_shared_attention_cache(
             packing,
             page_elements // (spec.block_size * packing),
         )
-    return allocator.zeros(pool_shape, spec.dtype)
+    return allocator.allocate(pool_shape, spec.dtype)
 
 
 def _can_allocate_attention_cache_directly(

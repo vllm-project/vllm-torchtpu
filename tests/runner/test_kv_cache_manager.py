@@ -446,7 +446,7 @@ def test_initialize_kv_cache_synchronizes_deepseek_v4_arrays(
     def allocate(kv_cache_config, per_layer_spec, kv_caches, num_blocks, allocator):
         for group in kv_cache_config.kv_cache_groups:
             for name in group.layer_names:
-                kv_caches[name] = allocator.zeros((num_blocks, 8), torch.uint8)
+                kv_caches[name] = allocator.allocate((num_blocks, 8), torch.uint8)
 
     ds_v4 = MagicMock()
     ds_v4._initialize_ds_v4_kv_cache.side_effect = allocate

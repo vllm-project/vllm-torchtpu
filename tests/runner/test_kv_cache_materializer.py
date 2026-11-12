@@ -652,8 +652,8 @@ def test_device_allocator_synchronizes_its_arrays_in_one_call():
         allocator.synchronize()
         synchronize.assert_not_called()
 
-        first = allocator.zeros((2, 3), torch.bfloat16)
-        second = allocator.zeros((4,), torch.int32)
+        first = allocator.allocate((2, 3), torch.bfloat16)
+        second = allocator.allocate((4,), torch.int32)
         allocator.synchronize()
 
     synchronize.assert_called_once()

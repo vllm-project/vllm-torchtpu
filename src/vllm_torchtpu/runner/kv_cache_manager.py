@@ -1769,7 +1769,9 @@ class KVCacheManager:
                     f"budget: region={region}, allocated={allocated_bytes}, "
                     f"required={required_bytes}, budget={budget}"
                 )
-            caches = tuple(allocator.zeros(shape, dtype) for shape, dtype in geometry)
+            caches = tuple(
+                allocator.allocate(shape, dtype) for shape, dtype in geometry
+            )
             if native_caches is not None:
                 native_caches[key] = caches
             return caches
@@ -1838,7 +1840,7 @@ class KVCacheManager:
                         zip(kv_cache_spec.shapes, kv_cache_spec.dtypes)
                     ):
                         cache_shape = (mamba_num_blocks, *shape)
-                        mamba_states.append(allocator.zeros(cache_shape, dtype))
+                        mamba_states.append(allocator.allocate(cache_shape, dtype))
                     kv_caches[layer_name] = tuple(mamba_states)
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
                     attn_module = self.runner.vllm_config.compilation_config.static_forward_context.get(  # noqa: E501
