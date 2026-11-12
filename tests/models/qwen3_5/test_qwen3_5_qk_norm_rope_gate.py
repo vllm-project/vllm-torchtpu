@@ -64,6 +64,7 @@ def test_parity_in_the_interpreter(tokens, tile, geometry):
         _assert_parity(tokens, geometry, interpret=True, tile=tile)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("tokens", [1, 4, 8, 13, 32, 64, 1024, 4096, 8192])
 @pytest.mark.parametrize("geometry", GEOMETRIES)
 def test_parity(tokens, geometry):
