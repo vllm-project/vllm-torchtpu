@@ -51,6 +51,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import mamba_ckpt_of, mamba_state_of
 from vllm_torchtpu.compilation import bucket_filter
 from vllm_torchtpu.core.mamba_tail_fold import prefill_checkpoint_targets
+from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_policy import HcPrefillMode
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     GdnStepMetadataCache,
 )
@@ -74,6 +75,21 @@ from .ple_storage import SharedPLEOptions
 from .pool_layout import POOLED_GDN_CONV_STATE_DTYPE
 from .pooled_ple import Qwen4ExpPooledPLE
 from .qsa import QSAMetadata, Qwen4ExpQSA
+
+
+def _hc_prefill_mode_arg(
+    qwen_cfg: dict[str, object],
+    key: str,
+    default: HcPrefillMode | None,
+) -> HcPrefillMode | None:
+    if key not in qwen_cfg or qwen_cfg[key] is None:
+        return default
+    val = qwen_cfg[key]
+    if isinstance(val, str) and val == "auto":
+        return "auto"
+    if isinstance(val, bool):
+        return val  # type: ignore[return-value]
+    return int(val)  # type: ignore[arg-type]
 
 
 def _parameter_storage_key(parameter):
@@ -349,26 +365,33 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 disable_tp=True,
                 prefix=prefix + ".mlp.shared_expert",
             )
-        hc_up_tile = int(
-            cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_up_tile", 0)
+        qwen_cfg = cfg.additional_config.get("qwen4_exp", {})
+        hc_up_tile = int(qwen_cfg.get("hc_prefill_up_tile", 0))
+        hc_norm_tile = int(qwen_cfg.get("hc_prefill_norm_tile", 0))
+        # Backbone layers use the hardware-aware auto policy by default; the
+        # single-trace MTP draft (index >= num_hidden_layers) stays untiled (0).
+        default_hc_mode: HcPrefillMode | None = (
+            None if index < t.num_hidden_layers else 0
         )
-        hc_norm_tile = int(
-            cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_norm_tile", 0)
+        hc_full_tile = _hc_prefill_mode_arg(
+            qwen_cfg, "hc_prefill_full_tile", default_hc_mode
         )
-        hc_full_tile = int(
-            cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_full_tile", 0)
+        hc_combine_tile = _hc_prefill_mode_arg(
+            qwen_cfg, "hc_prefill_combine_tile", default_hc_mode
         )
         self.attn_hyper_connection = GatedResidual(
             hc_config(t),
             prefill_up_tile=hc_up_tile,
             prefill_norm_tile=hc_norm_tile,
             prefill_full_tile=hc_full_tile,
+            prefill_combine_tile=hc_combine_tile,
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config(t),
             prefill_up_tile=hc_up_tile,
             prefill_norm_tile=hc_norm_tile,
             prefill_full_tile=hc_full_tile,
+            prefill_combine_tile=hc_combine_tile,
         )
 
     def forward(
@@ -649,15 +672,10 @@ class Qwen4ExpBackbone(nn.Module):
         ]
         for attention in attentions[1:]:
             attention.rope_cache = attentions[0].rope_cache
-        hc_up_tile = int(
-            cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_up_tile", 0)
-        )
-        hc_norm_tile = int(
-            cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_norm_tile", 0)
-        )
-        hc_full_tile = int(
-            cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_full_tile", 0)
-        )
+        qwen_cfg = cfg.additional_config.get("qwen4_exp", {})
+        hc_up_tile = int(qwen_cfg.get("hc_prefill_up_tile", 0))
+        hc_norm_tile = int(qwen_cfg.get("hc_prefill_norm_tile", 0))
+        hc_full_tile = _hc_prefill_mode_arg(qwen_cfg, "hc_prefill_full_tile", None)
         self.hyper_connection_mixer = GatedResidual(
             hc_config(t),
             use_combine=False,
@@ -1390,14 +1408,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 vllm_config=vllm_config, backbone=self.model
             )
             rows = sp.shard_rows(
-                tile
+                hc.sp_tile_alignment
                 for hc in self.model.modules()
                 if isinstance(hc, GatedResidual)
-                for tile in (
-                    2 * hc.prefill_full_tile,
-                    hc.prefill_up_tile,
-                    hc.prefill_norm_tile,
-                )
             )
             if sp.pad_hc_enabled():
                 # The shard is padded to the HC tile instead of required to

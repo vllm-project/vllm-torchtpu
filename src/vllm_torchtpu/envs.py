@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
+    VLLM_TPU_HC_PREFILL_TILE: int | None = None
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -56,7 +57,7 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
-    TPU_QWEN4_HC_DECODE_FUSED: bool = False
+    TPU_QWEN4_HC_DECODE_FUSED: bool = True
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
@@ -600,6 +601,11 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # HC debug override: auto/unset uses the kernel policy, 0 uses Torch,
+    # positive multiples of 128 override tile/profitability for both components.
+    "VLLM_TPU_HC_PREFILL_TILE": env_nonnegative_int_or_auto(
+        "VLLM_TPU_HC_PREFILL_TILE"
+    ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
@@ -1392,7 +1398,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qwen4_exp: run each hyper-connection mix (per-branch norm, low-rank
     # gate, branch mean and the combine's injection gate) at <= 512 tokens as
     # one Pallas call, with the attn combine fused ahead of the mlp mix.
-    "TPU_QWEN4_HC_DECODE_FUSED": env_bool("TPU_QWEN4_HC_DECODE_FUSED"),
+    "TPU_QWEN4_HC_DECODE_FUSED": env_bool("TPU_QWEN4_HC_DECODE_FUSED", True),
     # qwen4_exp: shard prefill-sized steps across TP ranks between attention
     # blocks (reduce-scatter instead of all-reduce), so the hyper-connection
     # streams, PLE gate and residual math run on 1/TP of the tokens. Steps
