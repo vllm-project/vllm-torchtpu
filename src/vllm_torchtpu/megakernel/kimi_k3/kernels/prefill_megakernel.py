@@ -30,8 +30,9 @@ The prefill program (``kimi_k3/prefill.py``) runs four ops per window:
 Per layer:
 
 * KDA, ``make_norm_gather_kda_sp``: one Pallas call for the residual mixture
-  and RMSNorm, the 32-rank all-gather of the window, the chunked gated delta
-  rule (``kda_prefill_tiled_body``) and the output projection ring;
+  and RMSNorm, the 32-rank all-gather of the window's unit-RMS rows (FP8),
+  the chunked gated delta rule (``kda_prefill_tiled_body``, which applies
+  the norm weight) and the output projection ring;
 * MLA, ``make_norm_gather_sp`` then ``make_mla_attention_layer_sp_ring``:
   the projections, packed flash attention over the window, context-parallel
   attention over every rank's cached prefix pages (``CpPrefix``), the
@@ -3534,16 +3535,16 @@ def mixture_norm_tiled_body(
     prefix_ref,  # [T, H] BF16 HBM
     blocks_ref,  # [8, T, H] BF16 HBM
     folded_ref,  # [1, H] FP32 HBM
-    norm_ref,  # [1, H] BF16 HBM
-    output_ref,  # [T, H] BF16 HBM
+    norm_ref,  # [1, H] BF16 HBM, or None: unit-RMS rows, the reader applies the weight
+    output_ref,  # [T, H] HBM: BF16, unit-RMS rows in output_bufs' dtype
     prefix_bufs,  # [2, tile, H] BF16
-    block_buf,  # [tile, H] BF16
-    output_bufs,  # [2, tile, H] BF16
+    block_buf,  # [2, tile, H] BF16
+    output_bufs,  # [2, tile, H] BF16 (unit-RMS rows: BF16 or E4M3FN)
     numerator_buf,  # [tile, H] FP32
     row_max_buf,  # [tile, 1] FP32
     row_sum_buf,  # [tile, 1] FP32
     folded_buf,  # [1, H] FP32
-    norm_buf,  # [1, H] BF16
+    norm_buf,  # [1, H] BF16 (unused without norm_ref)
     prefix_sems,
     block_sem,
     output_sems,
@@ -3583,10 +3584,9 @@ def mixture_norm_tiled_body(
             output_sems.at[slot],
         )
 
-    weights = (
-        pltpu.make_async_copy(folded_ref, folded_buf, weight_sems.at[0]),
-        pltpu.make_async_copy(norm_ref, norm_buf, weight_sems.at[1]),
-    )
+    weights = [pltpu.make_async_copy(folded_ref, folded_buf, weight_sems.at[0])]
+    if norm_ref is not None:
+        weights.append(pltpu.make_async_copy(norm_ref, norm_buf, weight_sems.at[1]))
     for copy in weights:
         copy.start()
     load_prefix(0, 0).start()
@@ -3646,8 +3646,11 @@ def mixture_norm_tiled_body(
 
         inv_sum = 1.0 / row_sum_buf[...]
         mixed = (numerator_buf[...] * inv_sum).astype(jnp.bfloat16).astype(jnp.float32)
-        rsqrt_var = jax.lax.rsqrt(jnp.mean(mixed * mixed, axis=1, keepdims=True) + eps)
-        normed = (mixed * rsqrt_var * norm_buf[...]).astype(jnp.bfloat16)
+        unit = mixed * jax.lax.rsqrt(jnp.mean(mixed * mixed, axis=1, keepdims=True) + eps)
+        if norm_ref is None:  # |unit| <= sqrt(H), 84.7 at H = 7168: under E4M3FN's 448
+            normed = unit.astype(output_bufs.dtype)
+        else:
+            normed = (unit * norm_buf[...]).astype(jnp.bfloat16)
         if output_vmem_ref is not None:
             output_vmem_ref.at[pl.ds(t * tile, tile)][...] = normed
         if output_ref is not None:
@@ -3760,7 +3763,7 @@ def make_mixture_norm_sp(mesh, *, seq_len, eps=1e-5):
 
 def kda_prefill_tiled_body(
     length_ref,  # [1] INT32 scalar prefetch
-    hidden_ref,  # [T, hidden] BF16 HBM
+    hidden_ref,  # [T, hidden] HBM: BF16, or unit-RMS rows with input_norm
     gate_w_ref,  # [hidden, 128] BF16
     fb_w_ref,  # [128, 384] BF16
     proj_w_ref,  # [hidden, 1664] BF16
@@ -3774,7 +3777,7 @@ def kda_prefill_tiled_body(
     rec_state_out_ref,  # [3, 128, 128] FP32
     conv_hist_out_ref,  # [3, 3, 3, 128] BF16
     # scratch
-    hidden_bufs,  # (2, tile, hidden) BF16 double buffer
+    hidden_bufs,  # (2, tile, hidden) double buffer, in hidden_ref's dtype
     out_bufs,  # (2, tile, 384) BF16 double buffer
     gate_w_vmem,
     fb_w_vmem,
@@ -3797,6 +3800,7 @@ def kda_prefill_tiled_body(
     tiles=None,
     block_tiles=None,
     projection=None,
+    input_norm=None,
 ):
     """Run one KDA layer, reading and writing tiled activations in HBM.
 
@@ -3817,6 +3821,9 @@ def kda_prefill_tiled_body(
     ``projection``: ``(weight_ref, weight_vmem, partial_ref, partial_bufs,
     partial_sems)``; also write each tile's BF16 output projection to
     ``partial_ref`` ``[T, hidden]``, the reduce-scatter's partial sums.
+    ``input_norm``: ``(norm_ref [1, hidden] BF16, norm_vmem)``; the hidden
+    rows are unit-RMS (BF16 or E4M3FN) and each tile takes the norm weight
+    before the projections.
     Scratch refs follow ``kda_prefill_tiled_scratch_shapes``.
     """
     tokens, hidden = hidden_ref.shape
@@ -3861,6 +3868,8 @@ def kda_prefill_tiled_body(
     if projection is not None:
         weight_ref, weight_vmem, partial_ref, partial_bufs, partial_sems = projection
         weight_copies += (pltpu.make_async_copy(weight_ref, weight_vmem, weight_sems.at[13]),)
+    if input_norm is not None:
+        weight_copies += (pltpu.make_async_copy(*input_norm, weight_sems.at[16]),)
 
     @when(start_weights)
     def start_load_weights():
@@ -4007,6 +4016,8 @@ def kda_prefill_tiled_body(
             dt_bias = dt_vmem[...]  # [3, 128] FP32
             norm = norm_vmem[0]
             hidden_tile = hidden_bufs.at[buf][...]  # [tile, hidden]
+            if input_norm is not None:
+                hidden_tile = hidden_tile.astype(jnp.bfloat16) * input_norm[1][...]
             # ---- projections ----
             gate_features = _dot(hidden_tile, gate_w_vmem[...]).astype(
                 jnp.bfloat16
@@ -4163,12 +4174,13 @@ class _Copies:
 
 
 def kda_prefill_tiled_scratch_shapes(
-    hidden_size, tile, gate_w, fb_w, proj_w, conv_w, alog, dt, norm, *, store_out=True
+    hidden_size, tile, gate_w, fb_w, proj_w, conv_w, alog, dt, norm, *, store_out=True,
+    hidden_dtype=jnp.bfloat16,
 ):
     """Scratch specs, in the order expected by ``kda_prefill_tiled_body``."""
     width = _HEADS * _CHANNELS
     return (
-        (pltpu.VMEM((2, tile, hidden_size), jnp.bfloat16),)
+        (pltpu.VMEM((2, tile, hidden_size), hidden_dtype),)
         + ((pltpu.VMEM((2, tile, width), jnp.bfloat16),) if store_out else ())
         + (
             pltpu.VMEM(gate_w.shape, gate_w.dtype),
@@ -4183,7 +4195,7 @@ def kda_prefill_tiled_scratch_shapes(
             pltpu.SemaphoreType.DMA((2,)),
         )
         + ((pltpu.SemaphoreType.DMA((2,)),) if store_out else ())
-        + (pltpu.SemaphoreType.DMA((16,)),)
+        + (pltpu.SemaphoreType.DMA((17,)),)
     )
 
 
@@ -6099,7 +6111,9 @@ def _kda_layer_body(
     i's window all-gather, a share of block ``i - 1``'s KDA tiles (with
     their output-projection partials) and ring step j of block ``i - 2``'s
     reduce-scatter, so both rings run under the delta rule. Steps b < blocks
-    first apply the mixture and RMSNorm to block b's local rows.
+    first apply the mixture and RMSNorm to block b's local rows, unit-RMS:
+    the window carries `_kda_window_dtype` rows and the KDA tiles apply the
+    norm weight.
     ``segment_ref`` is the SMEM ``[3 * count]`` descriptor (see
     ``kda_prefill_tiled_body``). KDA slot ``9k`` is layer ``12k``, the first
     layer of a residual block, whose attention output replaces the partial
@@ -6108,7 +6122,10 @@ def _kda_layer_body(
     step = pl.program_id(1)
     phase, ring_step = step // HALF_STEPS, step % HALF_STEPS
     stripe = window_stripe(prefix_ref.shape[0])
-    mix_small, gather_sems = scratch[:8], scratch[8:11]
+    # The mixture writes unit-RMS rows: its norm buffer holds the KDA tiles'
+    # input norm weight.
+    row_max, row_sum, folded_buf, input_norm_vmem, *mix_sems = scratch[:8]
+    gather_sems = scratch[8:11]
     reduce_sems, projection_scratch = scratch[11:16], scratch[16:19]
     hidden_bufs, *kda_weights_and_state, hidden_sems, weight_sems = scratch[19:]
 
@@ -6126,9 +6143,9 @@ def _kda_layer_body(
     def do_normalize(norm_block):
         rows = pl.ds(norm_block * stripe, stripe)
         mixture_norm_tiled_body(
-            active_ref, prefix_ref.at[rows], blocks_ref.at[:, rows], folded_ref, norm_ref,
-            normalized_ref.at[rows], *views(_kda_mix_shapes(stripe)), *mix_small,
-            tile=stripe, eps=eps,
+            active_ref, prefix_ref.at[rows], blocks_ref.at[:, rows], folded_ref, None,
+            normalized_ref.at[rows], *views(_kda_mix_shapes(stripe, normalized_ref.dtype)),
+            row_max, row_sum, folded_buf, None, *mix_sems, tile=stripe, eps=eps,
         )
 
     @pl.when(step == 0)
@@ -6176,16 +6193,23 @@ def _kda_layer_body(
         block_tiles=block_tiles,
         projection=(output_family_ref.at[slot], *projection_scratch[:1], partial_ref,
                     *projection_scratch[1:]),
+        input_norm=(norm_ref, input_norm_vmem),
     )
 
 
-def _kda_mix_shapes(mix_tile):
+def _kda_mix_shapes(mix_tile, rows_dtype):
     return (
         ((2, mix_tile, 7168), jnp.bfloat16),
         ((2, mix_tile, 7168), jnp.bfloat16),
-        ((2, mix_tile, 7168), jnp.bfloat16),
+        ((2, mix_tile, 7168), rows_dtype),  # the unit-RMS rows
         ((mix_tile, 7168), jnp.float32),
     )
+
+
+def _kda_window_dtype(stripe):
+    """The KDA window's unit-RMS rows: E4M3FN (half the all-gather's bytes)
+    where a stripe is whole 32-row FP8 tiles, BF16 for 16-row stripes."""
+    return jnp.float8_e4m3fn if stripe % 32 == 0 else jnp.bfloat16
 
 
 def _kda_reduce_shapes(stripe):
@@ -6207,7 +6231,8 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
 
     ``run(prefix, blocks, folded, norm, families, rec, hist, active, length,
     slot, segment_desc)`` returns ``(normalized, gathered, attended, rec,
-    hist, output, rec_at, hist_at)``: the ``*_at`` states are each
+    hist, output, rec_at, hist_at)``: ``normalized`` and ``gathered`` hold
+    the unit-RMS rows (`_kda_window_dtype`), the ``*_at`` states are each
     sequence's at its checkpoint position.
     """
     if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
@@ -6226,9 +6251,10 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
         ring_tables(list(mesh.devices.flat), token_ranks), jnp.int32,
     )
     streams = len(_half_ring_streams(width))
+    window_dtype = _kda_window_dtype(stripe)
     pool_bytes = max(
         sum(pool_alias.storage_size(shape, jnp.dtype(dtype))
-            for shape, dtype in _kda_mix_shapes(stripe)),
+            for shape, dtype in _kda_mix_shapes(stripe, window_dtype)),
         sum(pool_alias.storage_size(shape, jnp.dtype(dtype))
             for shape, dtype in _kda_reduce_shapes(stripe)),
     )
@@ -6255,12 +6281,13 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
         pltpu.VMEM((384, width), jnp.bfloat16),  # the output projection
         pltpu.VMEM((2, kda_tile, width), jnp.bfloat16),  # its partials
         pltpu.SemaphoreType.DMA((2,)),
-        *kda_prefill_tiled_scratch_shapes(width, kda_tile, *shapes, store_out=False),
+        *kda_prefill_tiled_scratch_shapes(width, kda_tile, *shapes, store_out=False,
+                                          hidden_dtype=window_dtype),
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     output_shapes = (
-        jax.ShapeDtypeStruct((rows, width), jnp.bfloat16),
-        jax.ShapeDtypeStruct((seq_len, width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, width), window_dtype),
+        jax.ShapeDtypeStruct((seq_len, width), window_dtype),
         jax.ShapeDtypeStruct((*state_lead, 3, 128, 128), jnp.float32),
         jax.ShapeDtypeStruct((*state_lead, 3, 3, 3, 128), jnp.bfloat16),
         jax.ShapeDtypeStruct((rows, width), jnp.bfloat16),
