@@ -130,6 +130,8 @@ def test_decode_fp8_kv(native_fp8, kv_lens_list):
         kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         decode_query_size=_QLEN,
         native_fp8=native_fp8,
+        # The tiles of the Qwen3.5 decode shapes these modes are tuned for.
+        tuned_tiles=True,
     )
     out = np.asarray(out[: len(kv_lens_list) * _QLEN].astype(jnp.float32))
     assert not np.isnan(out).any()
