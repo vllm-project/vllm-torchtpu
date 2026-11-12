@@ -44,13 +44,15 @@ REPLACED_ENV = {
     "spec_synthetic_one_row_verify": "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY",
     "spec_warmup_sweep_token_buckets": "TPU_SPEC_WARMUP_SWEEP_TOKEN_BUCKETS",
 }
+# Keys added after the env-var migration: they never had an env var.
+NEW_KEYS = {"raiden_offload_refresh_lru"}
 # Dropped with no key: hid the offload connector from draft forwards, which
 # v3's skip_draft_kv unbinding already covers in every served config.
 DROPPED_ENV = ("TPU_DRAFT_HIDE_NOOP_KV_CONNECTOR",)
 
 
 def test_every_key_replaces_an_env_var():
-    assert set(DEFAULTS) == set(REPLACED_ENV)
+    assert set(DEFAULTS) == set(REPLACED_ENV) | NEW_KEYS
     for name in (*REPLACED_ENV.values(), *DROPPED_ENV):
         assert name not in envs.environment_variables, name
         for path in SRC.rglob("*.py"):
@@ -125,6 +127,13 @@ def test_raiden_manager_host_order_dma():
     assert make_manager(FakeKVCacheStore(), host_order_dma=True)._host_order_dma
 
 
+def test_raiden_manager_refresh_lru():
+    from tests.offload.test_raiden_store_offload import FakeKVCacheStore, make_manager
+
+    assert make_manager(FakeKVCacheStore()).refresh_lru is False
+    assert make_manager(FakeKVCacheStore(), refresh_lru=True).refresh_lru
+
+
 def test_synthetic_one_row_verify_follows_the_runner_attribute():
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -158,6 +167,7 @@ def test_pallas_all_reduce_ordered_op_is_opt_in():
         ("spec_warmup_sweep_token_buckets", "runner/tpu_runner.py"),
         ("moe_gmm_fp8_decode_tiles", "runner/tpu_runner.py"),
         ("raiden_host_order_dma", "offload/raiden_store.py"),
+        ("raiden_offload_refresh_lru", "offload/raiden_store.py"),
         ("minimax_dspark_split_fc", "models/minimax_m3/dspark.py"),
     ],
 )

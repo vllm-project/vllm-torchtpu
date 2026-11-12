@@ -66,6 +66,12 @@ DEFAULTS: dict[str, bool | int] = {
     # consecutive-run allocation (`contiguous_alloc`) is the connector's
     # kv_connector_extra_config key contiguous_alloc_scan_factor.
     "raiden_host_order_dma": False,
+    # Raiden KV offload: refresh the host LRU for prefixes that stay hot in
+    # HBM. prepare_store moves keys that are already host-resident to the
+    # Most Recently Used end instead of skipping them untouched, and a
+    # request finishing under the write-back store policy touches its resident
+    # prefix. Changes only which host entries are evicted, never KV bytes.
+    "raiden_offload_refresh_lru": False,
     # gmm_v2: decode-sized MoE buffers take r6's decode tiles (tile_m 128 in
     # buckets 16/32/48/128, or fp8-sized tiles up to 512 rows) ahead of the
     # skinny paths (fp8_feed_wide etc.), and kernel_mlp fuses them.
