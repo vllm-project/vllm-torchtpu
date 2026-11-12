@@ -1205,14 +1205,20 @@ def gmm_vmem_estimate(
 #     FP8_RHS_MAX_BUCKET_M rows take the fp8 rhs feed (as decode tiles do);
 #     larger ones dequantize before the matmul. "256:128,256" (or
 #     "256:128/256") keeps every bucket on the default numerics.
-#   TPU_GMM_V2_DECODE_W13="<tile_n>:<rhs buffers>": the gate_up (fused
-#     activation) call of decode-sized buffers (<= FP8_DECODE_MAX_M rows).
+#   TPU_GMM_V2_DECODE_W13="<tile_n>:<gate_up buffers>[:<down buffers>]":
+#     decode-sized buffers. Up to FP8_SMALL_DECODE_MAX_M rows the gate_up
+#     (fused activation) call takes tile_n and its rhs pipeline depth and the
+#     down call its own depth; above it, up to FP8_DECODE_MAX_M rows, only
+#     the gate_up depth applies (a wider tile_n stops kernel_mlp's fusion,
+#     which costs more there than it saves).
 _PREFILL_TILES_ENV = "TPU_GMM_V2_PREFILL_TILES"
 _DECODE_W13_ENV = "TPU_GMM_V2_DECODE_W13"
 
 
 @functools.cache
-def _tile_env() -> tuple[tuple[int, tuple[int, ...]] | None, tuple[int, int] | None]:
+def _tile_env() -> (
+    tuple[tuple[int, tuple[int, ...]] | None, tuple[int, int, int] | None]
+):
     prefill = decode_w13 = None
     raw = os.environ.get(_PREFILL_TILES_ENV, "").strip()
     if raw:
@@ -1226,8 +1232,8 @@ def _tile_env() -> tuple[tuple[int, tuple[int, ...]] | None, tuple[int, int] | N
         prefill = (int(tm), buckets)
     raw = os.environ.get(_DECODE_W13_ENV, "").strip()
     if raw:
-        tn, _, nb = raw.partition(":")
-        decode_w13 = (int(tn), int(nb or 3))
+        parts = [int(x) for x in raw.split(":")]
+        decode_w13 = (parts[0], *(parts[1:] + [3, 3])[:2])
     return prefill, decode_w13
 
 
@@ -1275,15 +1281,17 @@ def _apply_tile_env(
                 tiles, tile_m=tile_m, bucket_base=buckets[0], buckets=buckets
             )
             name = _PREFILL_TILES_ENV
-    elif (
-        decode_w13 is not None
-        and fuse_act is not None
-        and dims.size_m <= FP8_DECODE_MAX_M
-        and (dims.size_n // 2) % decode_w13[0] == 0
-    ):
-        new = dataclasses.replace(
-            tiles, tile_n=decode_w13[0], rhs_buffer_count=decode_w13[1]
-        )
+    elif decode_w13 is not None and dims.size_m <= FP8_DECODE_MAX_M:
+        tile_n, buffers_gate_up, buffers_down = decode_w13
+        if dims.size_m > FP8_SMALL_DECODE_MAX_M:
+            if fuse_act is not None:
+                new = dataclasses.replace(tiles, rhs_buffer_count=buffers_gate_up)
+        elif fuse_act is None:
+            new = dataclasses.replace(tiles, rhs_buffer_count=buffers_down)
+        elif (dims.size_n // 2) % tile_n == 0:
+            new = dataclasses.replace(
+                tiles, tile_n=tile_n, rhs_buffer_count=buffers_gate_up
+            )
         name = _DECODE_W13_ENV
     if new is None:
         return tiles
