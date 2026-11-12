@@ -8,6 +8,7 @@ private pool sized for live windows, and those IDs are the physical page
 indices of the BF16 owner `cache._materialize_native_swa` allocates.
 """
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, fields, replace
 from typing import Any, Self
@@ -25,6 +26,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 @dataclass(frozen=True, kw_only=True)
 class DeepseekV41SWASpec(SlidingWindowMLASpec):
@@ -33,6 +38,10 @@ class DeepseekV41SWASpec(SlidingWindowMLASpec):
     max_num_seqs: int
     max_in_flight_tokens: int
     num_lookahead_tokens: int = 0
+    # Finished requests that still hold their window pages because a KV
+    # connector has not sent (P) or the scheduler has not yet run (D) them.
+    # They are not running, so `max_num_seqs` does not bound them.
+    held_seqs: int = 0
 
     @property
     def prefix_cacheable(self) -> bool:
@@ -52,7 +61,8 @@ class DeepseekV41SWASpec(SlidingWindowMLASpec):
         cdiv(x) gives one more page per request. Block lists never shrink, so
         after a rejection a request still holds pages allocated for its
         rejected drafts and their lookahead; the second lookahead term covers
-        that stale tail. Page 0 is the null block.
+        that stale tail. Page 0 is the null block. A held request (see
+        `held_seqs`) keeps at most the same per-request window.
         """
         retained = (
             self.sliding_window
@@ -62,7 +72,8 @@ class DeepseekV41SWASpec(SlidingWindowMLASpec):
         )
         return (
             1
-            + self.max_num_seqs * (cdiv(retained, self.block_size) + 2)
+            + (self.max_num_seqs + self.held_seqs)
+            * (cdiv(retained, self.block_size) + 2)
             + cdiv(self.max_in_flight_tokens, self.block_size)
         )
 
@@ -79,11 +90,17 @@ class DeepseekV41SWASpec(SlidingWindowMLASpec):
         merged = SlidingWindowMLASpec.merge(specs)
         first = specs[0]
         assert all(
-            (spec.max_num_seqs, spec.max_in_flight_tokens, spec.num_lookahead_tokens)
+            (
+                spec.max_num_seqs,
+                spec.max_in_flight_tokens,
+                spec.num_lookahead_tokens,
+                spec.held_seqs,
+            )
             == (
                 first.max_num_seqs,
                 first.max_in_flight_tokens,
                 first.num_lookahead_tokens,
+                first.held_seqs,
             )
             for spec in specs
         )
@@ -97,9 +114,18 @@ class DeepseekV41SWAManager(SlidingWindowManager):
     """Upstream sliding-window allocation and reclamation over a private pool.
 
     Demand is charged to the private pool only. `pool_capacity` bounds the
-    peak, so a shortfall is a capacity bug: fail loudly rather than returning
-    an admission failure that the scheduler would turn into preemption.
+    peak of running requests plus `held_seqs` held ones. A KV connector can
+    hold more finished requests than that (a P/D producer keeps every sent
+    request's window until the decode side pulls it), so a shortfall reports
+    an allocation failure: the scheduler leaves a new request waiting, or
+    preempts, until held pages come back, instead of killing the engine.
+    TPU_DSV41_SWA_EXHAUSTED_RAISE=1 restores the hard error for debugging.
     """
+
+    # Larger than any shared-pool free count, so `allocate_slots` fails.
+    _UNSATISFIABLE = 1 << 40
+    _raise_on_exhaustion = os.environ.get("TPU_DSV41_SWA_EXHAUSTED_RAISE") == "1"
+    _exhaustion_warnings = 0
 
     def __init__(self, kv_cache_spec: DeepseekV41SWASpec, **kwargs: Any) -> None:
         shared_pool = kwargs["block_pool"]
@@ -136,12 +162,26 @@ class DeepseekV41SWAManager(SlidingWindowManager):
             num_tokens_main_model,
             prefill_end=prefill_end,
         )
-        if required > self.block_pool.get_num_free_blocks():
-            raise RuntimeError(
+        free = self.block_pool.get_num_free_blocks()
+        if required > free:
+            message = (
                 f"DeepSeek-V4.1 SWA pool exhausted: {request_id} needs "
-                f"{required} pages, {self.block_pool.get_num_free_blocks()} free "
-                f"of {self.block_pool.num_gpu_blocks}"
+                f"{required} pages, {free} free of {self.block_pool.num_gpu_blocks}"
             )
+            if self._raise_on_exhaustion:
+                raise RuntimeError(message)
+            cls = type(self)
+            cls._exhaustion_warnings += 1
+            if cls._exhaustion_warnings in (1, 10, 100) or (
+                cls._exhaustion_warnings % 1000 == 0
+            ):
+                logger.warning(
+                    "%s; deferring the allocation (occurrence %d). Raise "
+                    "TPU_DSV41_SWA_HELD_SEQS if this persists.",
+                    message,
+                    cls._exhaustion_warnings,
+                )
+            return self._UNSATISFIABLE
         return 0
 
 

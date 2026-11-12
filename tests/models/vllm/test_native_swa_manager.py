@@ -107,7 +107,7 @@ def swa_managers(cache):
     ]
 
 
-def test_private_pool_is_charged_alone_and_exhaustion_is_an_error():
+def test_private_pool_is_charged_alone_and_exhaustion_defers():
     cache = manager(spec(sequences=1, in_flight=32))
     (swa,) = swa_managers(cache)
     assert swa.block_pool is not cache.block_pool
@@ -131,12 +131,31 @@ def test_private_pool_is_charged_alone_and_exhaustion_is_an_error():
         )
         == 0
     )
-    # A shortfall means the capacity bound is wrong: never turn it into
-    # an admission failure that the scheduler would answer with preemption.
-    with pytest.raises(RuntimeError, match="SWA pool exhausted"):
-        cache.allocate_slots(request("third"), 32)
+    # A KV connector can hold more finished requests than the pool is sized
+    # for: the allocation is deferred (the request keeps waiting) instead of
+    # killing the engine, and goes through once held pages come back.
+    third = request("third")
+    assert cache.allocate_slots(third, 32) is None
     cache.free(first)
-    assert cache.allocate_slots(request("third"), 32) is not None
+    assert cache.allocate_slots(third, 32) is not None
+
+
+def test_exhaustion_raises_when_requested(monkeypatch):
+    monkeypatch.setattr(DeepseekV41SWAManager, "_raise_on_exhaustion", True)
+    cache = manager(spec(sequences=1, in_flight=32))
+    (swa,) = swa_managers(cache)
+    first = request("first")
+    assert cache.allocate_slots(first, swa.block_pool.get_num_free_blocks() * 32)
+    with pytest.raises(RuntimeError, match="SWA pool exhausted"):
+        cache.allocate_slots(request("second"), 32)
+
+
+def test_capacity_reserves_windows_for_held_requests():
+    base = spec(sequences=48, in_flight=4096, lookahead=5)
+    held = replace(base, held_seqs=192)
+    assert held.pool_capacity == base.pool_capacity + 192 * (5 + 2)
+    with pytest.raises(AssertionError):
+        DeepseekV41SWASpec.merge([base, held])
 
 
 def test_swa_reclamation_waits_for_inflight_prefill():
