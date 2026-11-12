@@ -61,7 +61,7 @@ def install_release(
     requests, open sessions, and requests already in flight) and
     late-interaction pooling requests.
     """
-    import msgspec
+    import msgspec  # pyrefly: ignore[missing-import]
     from vllm.v1.engine import EngineCoreRequestType
     from vllm.v1.engine.exceptions import EngineDeadError
     from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
