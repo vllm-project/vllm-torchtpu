@@ -310,7 +310,9 @@ def pooled_pool_blocks(
     return blocks
 
 
-def _apply_tail_fold_unit(cache_config, mamba_block_size: int) -> None:
+def _apply_tail_fold_unit(
+    cache_config, mamba_block_size: int, vllm_config=None
+) -> None:
     """VLLM_TPU_MAMBA_TAIL_FOLD_UNIT: hash prompts at the fold unit.
 
     The fold checkpoints the Mamba state at the prompt's last unit boundary,
@@ -318,8 +320,21 @@ def _apply_tail_fold_unit(cache_config, mamba_block_size: int) -> None:
     prefix-match unit. Set it when the launch leaves ``--prefix-match-unit``
     unset; any other explicit value is kept and the fold's guard then turns
     the fold off with a warning (core/mamba_tail_fold.py).
+
+    When context parallelism keeps the fold off (``vllm_config`` given and
+    ``fold_blocked_by_context_parallel``), the unit is not applied either:
+    without the fold, a sub-block hash under main-KV DCP only adds prefill
+    steps. The hash then differs from the physical Mamba block, so the
+    split runs on the 1024-token scheduler block: a hit that ends inside it
+    costs a short chunk to the next boundary, and the prompt's 256-unit
+    checkpoint costs another short chunk before the tail (c32 za9x:
+    ~1400 extra small prefill steps per 1800 s, ~4% of wall).
+    ``VLLM_TPU_MAMBA_TAIL_FOLD_UNIT_CP=1`` keeps the old behavior.
     """
-    from vllm_torchtpu.core.mamba_tail_fold import fold_unit
+    from vllm_torchtpu.core.mamba_tail_fold import (
+        fold_blocked_by_context_parallel,
+        fold_unit,
+    )
 
     if (
         not envs.VLLM_TPU_MAMBA_TAIL_FOLD
@@ -328,6 +343,19 @@ def _apply_tail_fold_unit(cache_config, mamba_block_size: int) -> None:
         or cache_config.mamba_cache_mode != "align"
     ):
         return
+    if vllm_config is not None and not envs.VLLM_TPU_MAMBA_TAIL_FOLD_UNIT_CP:
+        from .pool_layout import main_kv_dcp
+
+        reason = fold_blocked_by_context_parallel(vllm_config, main_kv_dcp())
+        if reason is not None:
+            logger.info(
+                "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT=%d not applied: the fold is off "
+                "(%s), prefix hits stay at the Mamba block (%d).",
+                envs.VLLM_TPU_MAMBA_TAIL_FOLD_UNIT,
+                reason,
+                mamba_block_size,
+            )
+            return
     unit = fold_unit(mamba_block_size)
     if unit == mamba_block_size:
         return
@@ -387,7 +415,9 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
                 else None
             )
             vllm_config.cache_config.mamba_page_size_padded = layout.page_bytes
-            _apply_tail_fold_unit(vllm_config.cache_config, layout.block_size)
+            _apply_tail_fold_unit(
+                vllm_config.cache_config, layout.block_size, vllm_config
+            )
             if hbm_pool_sizing(vllm_config):
                 # Workers report the pool budget after profiling
                 # (Qwen4ExpPooledCache.memory_budget); vLLM plans the blocks.
