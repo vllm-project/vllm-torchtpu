@@ -112,6 +112,11 @@ def compare_tokens(on, off):
         if b is None:
             continue
         print(f"[{pname}] engine steps on/off {a['steps']}/{b['steps']}")
+        if a.get("gsm") or b.get("gsm"):
+            ga, gb = a.get("gsm") or {}, b.get("gsm") or {}
+            print(f"  GSM acc on {ga.get('ok')}/{ga.get('n')} (empty {ga.get('empty')}) vs off "
+                  f"{gb.get('ok')}/{gb.get('n')} (empty {gb.get('empty')})")
+            continue
         for arm, ph in (("on", a), ("off", b)):
             for x in ph["sched"]:
                 print(f"    {arm} step {x['step']}: {x['sched']} copies={x['copies']}")

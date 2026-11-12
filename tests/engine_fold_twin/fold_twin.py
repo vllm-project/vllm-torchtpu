@@ -38,15 +38,23 @@ import numpy as np  # noqa: E402
 
 import forward_run as fr  # noqa: E402
 
+_OFF = {"VLLM_TPU_MAMBA_TAIL_FOLD": "1", "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT": "256",
+        "VLLM_TPU_MAMBA_TAIL_FOLD_DCP": "0", "FOLDCP_FORCE": "0"}
+_ON = {"VLLM_TPU_MAMBA_TAIL_FOLD": "1", "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT": "256",
+       "VLLM_TPU_MAMBA_TAIL_FOLD_DCP": "1", "FOLDCP_FORCE": "1"}
 ARM_ENV = {
-    "on": {"VLLM_TPU_MAMBA_TAIL_FOLD": "1", "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT": "256",
-           "VLLM_TPU_MAMBA_TAIL_FOLD_DCP": "1", "FOLDCP_FORCE": "1"},
-    "off": {"VLLM_TPU_MAMBA_TAIL_FOLD": "1", "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT": "256",
-            "VLLM_TPU_MAMBA_TAIL_FOLD_DCP": "0", "FOLDCP_FORCE": "0"},
-    # Fold geometry on, the in-step checkpoint write off (foldtwin_hook FOLDTWIN_NOCKPT=1
-    # makes the worker mirror prefill_checkpoints return no checkpoint).
-    "nockpt": {"VLLM_TPU_MAMBA_TAIL_FOLD": "1", "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT": "256",
-               "VLLM_TPU_MAMBA_TAIL_FOLD_DCP": "1", "FOLDCP_FORCE": "1"},
+    "off": _OFF,
+    "on": _ON,
+    # Fold geometry on, the in-step checkpoint write off (foldtwin_hook FOLDTWIN_NOCKPT=1).
+    "nockpt": _ON,
+    # Bisect arms (fold on): each flips one suspect of the cross-request dependence.
+    # Prefill sequence parallelism (tokens of all requests sharded across TP ranks).
+    "on_sp0": {**_ON, "QWEN4_EXP_PREFILL_SP": "0", "QWEN4_EXP_PREFILL_SP_MOE": "0"},
+    # Prefill MoE: no fused EP kernel for any step size.
+    "on_moe": {**_ON, "MOE_FUSED_EP_KERNEL_MIN_TOKENS": "100000000"},
+    # DCP prefill attention: the plain visible-block walk (no bypass / lean / prefix-page paths).
+    "on_qsa": {**_ON, "VLLM_TPU_QSA_VISIBLE_BYPASS": "0", "VLLM_TPU_QSA_PREFILL_LEAN": "0",
+               "VLLM_TPU_QSA_PREFILL_PREFIX_PAGES": "0"},
 }
 # c48 (j-f37cd850) values the twin plan lacks.
 C48_EXTRA = {"VLLM_TPU_FAST_METADATA_BUILD": "1", "VLLM_TPU_QSA_PREFILL_INDEXER_BKV": "1024",
@@ -54,16 +62,15 @@ C48_EXTRA = {"VLLM_TPU_FAST_METADATA_BUILD": "1", "VLLM_TPU_QSA_PREFILL_INDEXER_
 
 # (name, [(rid, prompt_len, max_tokens, add_at_step)], dumped rids)
 PHASES = [
-    ("A900", [("A900", 900, 1, 0)], ["A900"]),
-    ("A1100", [("A1100", 1100, 1, 0)], ["A1100"]),
     ("A1300", [("A1300", 1300, 1, 0)], ["A1300"]),
-    ("A1500", [("A1500", 1500, 1, 0)], ["A1500"]),
-    ("A1700", [("A1700", 1700, 1, 0)], ["A1700"]),
-    ("A2100", [("A2100", 2100, 1, 0)], ["A2100"]),
     ("B", [("R0", 300, 10, 0), ("R1", 350, 10, 0), ("R2", 400, 10, 0), ("R3", 450, 10, 0),
            ("B1300", 1300, 1, 2)], ["B1300"]),
     ("C1300", [("C1300", 1300, 16, 0)], []),
+    # Real GSM8K 5-shot chat prompts (FOLDTWIN_GSM, ids tokenized offline): 60 with P > 1024
+    # (they fold under DCP-2) and 12 with P <= 1024, all added at once (24 seats).
+    ("GSM", "gsm", []),
 ]
+GSM_MAX_TOKENS = 384
 
 
 def fingerprint(worker):
@@ -140,6 +147,47 @@ def _dump_pages(worker, req_cols, path_prefix, ranks):
                     out[f"{rid}|g{gid}|c{col}|t{ti}|n{row.size}"] = row[:end].copy()
     np.savez(f"{path_prefix}_r{rank}.npz", **out)
     return {"rank": rank, "pages": len(ids), "keys": len(out)}
+
+
+def _answer(text):
+    import re
+
+    m = re.findall(r"####\s*\$?(-?[\d,]*\.?\d+)", text or "")
+    return m[-1].replace(",", "").rstrip(".") if m else None
+
+
+def score_gsm(rec, gsm, model_dir, arm):
+    """Detokenize with the checkpoint's tokenizer, cut at the eval's stop strings, and
+    score the last '#### N' against the target (flexible-extract style)."""
+    try:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(model_dir)
+    except Exception as e:  # noqa: BLE001
+        print("GSM no tokenizer:", repr(e)[:200], flush=True)
+        return None
+    ok = empty = 0
+    rows = []
+    for o in gsm:
+        r = rec[f"G{o['doc_id']}"]
+        text = tok.decode(r["tokens"], skip_special_tokens=False)
+        for stop in ("<|im_end|>", "</s>"):
+            text = text.split(stop)[0]
+        shown = text.split("</think>")[-1].strip()
+        good = _answer(shown) is not None and _answer(shown) == _answer(o["target"])
+        ok += good
+        empty += not shown
+        rows.append({"doc_id": o["doc_id"], "P": len(o["ids"]), "good": bool(good),
+                     "text": text[:400]})
+    big = [x for x in rows if x["P"] > 1024]
+    small = [x for x in rows if x["P"] <= 1024]
+    print(f"GSM {arm}: acc {ok}/{len(rows)} = {ok / max(1, len(rows)):.3f}; empty {empty}; "
+          f"P>1024 {sum(x['good'] for x in big)}/{len(big)}, "
+          f"P<=1024 {sum(x['good'] for x in small)}/{len(small)}", flush=True)
+    for x in rows[:6]:
+        print(f"  G{x['doc_id']} P={x['P']} good={x['good']}: {x['text'][:200]!r}", flush=True)
+    return {"acc": ok / max(1, len(rows)), "ok": ok, "n": len(rows), "empty": empty,
+            "rows": rows}
 
 
 def read_log(path, start_line):
@@ -237,13 +285,20 @@ def main():
     rng = np.random.default_rng(1234)
     result = {"arm": arm, "fingerprint": fp, "phases": {}}
     nlines = 0
+    gsm = json.load(open(os.environ["FOLDTWIN_GSM"])) if os.environ.get("FOLDTWIN_GSM") else []
     for pname, adds, dumped in PHASES:
-        prompts = {rid: rng.integers(100, min(vocab, 150000) - 1, n).tolist()
-                   for rid, n, _, _ in adds}
+        if adds == "gsm":
+            if not gsm:
+                continue
+            adds = [(f"G{o['doc_id']}", len(o["ids"]), GSM_MAX_TOKENS, 0) for o in gsm]
+            prompts = {f"G{o['doc_id']}": o["ids"] for o in gsm}
+        else:
+            prompts = {rid: rng.integers(100, min(vocab, 150000) - 1, n).tolist()
+                       for rid, n, _, _ in adds}
         rec = {rid: {"prompt_len": n, "tokens": [], "top1": [], "top5": [], "step": []}
                for rid, n, _, _ in adds}
         finished, step, done_dump = set(), 0, set()
-        while len(finished) < len(adds) and step < 300:
+        while len(finished) < len(adds) and step < 3000:
             for rid, n, mt, at in adds:
                 if at == step:
                     sp = SamplingParams(temperature=0.0, max_tokens=mt, logprobs=5,
@@ -289,8 +344,11 @@ def main():
         result["phases"][pname] = {"requests": rec, "steps": step, "sched": sched}
         print(f"PHASE {pname} ({arm}): {step} engine steps, finished {sorted(finished)}",
               flush=True)
-        for x in sched:
+        for x in sched[:40]:
             print(f"  sched step {x['step']}: {x['sched']} copies={x['copies']}", flush=True)
+        if pname == "GSM":
+            result["phases"][pname]["gsm"] = score_gsm(rec, gsm, real, arm)
+            continue
         for rid, r in rec.items():
             print(f"  {rid} P={r['prompt_len']} tokens={r['tokens'][:12]} "
                   f"top5[0]={(r['top5'] or [None])[0]}", flush=True)

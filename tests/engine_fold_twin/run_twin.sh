@@ -29,18 +29,19 @@ if [ -d $SRC ]; then
 else
   echo "NO $SRC: dummy weights"; 
 fi
-for ARM in off on nockpt; do
+export FOLDTWIN_GSM=$D/steps/gsm72.json
+for ARM in ${FOLDTWIN_ARMS:-off on on_sp0 on_moe on_qsa}; do
   if [ $ARM = off ]; then export FOLDCP_FORCE=0; else export FOLDCP_FORCE=1; fi
   if [ $ARM = nockpt ]; then export FOLDTWIN_NOCKPT=1; else export FOLDTWIN_NOCKPT=0; fi
   export FOLDTWIN_LOG=$W/sched_$ARM.jsonl
   rm -f $FOLDTWIN_LOG
-  timeout 3000 python3 $D/ab/fold_twin.py $ARM $D/steps/${FOLDTWIN_PLAN:-c32-twin.steps.json} $W > $W/arm_$ARM.log 2>&1
+  timeout 3300 python3 $D/ab/fold_twin.py $ARM $D/steps/${FOLDTWIN_PLAN:-c32-twin.steps.json} $W > $W/arm_$ARM.log 2>&1
   echo "ARM=$ARM EXIT=$?"
-  grep -aE "ARM |FINGERPRINT|engine init|FOLDCP_FORCE|FOLDTWIN|worker exports|exported [0-9]+ checkpoints|folded [0-9]+ tails|TAIL_FOLD: (on|disabled)|Traceback|Error: |DUMP |PHASE |sched step|  [ABRC][0-9]+ P=" $W/arm_$ARM.log | head -150
+  grep -aE "GSM |ARM |FINGERPRINT|engine init|FOLDCP_FORCE|FOLDTWIN|worker exports|exported [0-9]+ checkpoints|folded [0-9]+ tails|TAIL_FOLD: (on|disabled)|Traceback|Error: |DUMP |PHASE |sched step|  [ABRC][0-9]+ P=" $W/arm_$ARM.log | head -150
   tail -5 $W/arm_$ARM.log
   cp $W/arm_$ARM.log $W/arm_$ARM.json $W/sched_$ARM.jsonl $W/groups_$ARM.json $W/cols_${ARM}_*.json $O/ 2>/dev/null
 done
-for PAIR in "on off" "nockpt off" "on nockpt"; do
+for PAIR in "on off" "on_sp0 off" "on_moe off" "on_qsa off"; do
   python3 $D/ab/fold_twin_compare.py $W $PAIR > $W/compare_${PAIR// /_}.txt 2>&1
   cat $W/compare_${PAIR// /_}.txt | head -400
   cp $W/compare_${PAIR// /_}.txt $O/
