@@ -1955,23 +1955,26 @@ def ragged_paged_attention(
         static_q_len=1,
         case=RpaCase.DECODE,
     )
-    if chunk_prefill_size is not None:
-        # Prefill-only
+    # One token holds at most one request, with q_len 1, so a 1-token step is
+    # decode only; the other cases would launch empty (1.35 us per call on v7).
+    if max_num_tokens > 1:
+        if chunk_prefill_size is not None:
+            # Prefill-only
+            q, kv_cache = run_rpa_kernel(
+                q,
+                kv_cache,
+                **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
+                static_q_len=chunk_prefill_size,
+                case=RpaCase.PREFILL,
+            )
+        # Mixed
         q, kv_cache = run_rpa_kernel(
             q,
             kv_cache,
-            **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
-            static_q_len=chunk_prefill_size,
-            case=RpaCase.PREFILL,
+            **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
+            static_q_len=None,
+            case=RpaCase.MIXED,
         )
-    # Mixed
-    q, kv_cache = run_rpa_kernel(
-        q,
-        kv_cache,
-        **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
-        static_q_len=None,
-        case=RpaCase.MIXED,
-    )
 
     return (
         prepare_outputs(
