@@ -223,6 +223,7 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM: bool = False
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
+    TPU_FUSED_ADD_RMSNORM_QUANT: bool = False
 
 
 def env_with_choices(
@@ -1357,6 +1358,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN": env_int(
         "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN", 4096
     ),
+    # With TPU_FUSED_ADD_RMSNORM: the Pallas norm in front of a per-channel FP8
+    # linear (MLA fused_qkv_a_proj, dense gate_up_proj) also writes that linear's
+    # per-row fp8 input and scale, so the linear skips its own quantization.
+    # Bit-identical.
+    "TPU_FUSED_ADD_RMSNORM_QUANT": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT"),
 }
 
 
