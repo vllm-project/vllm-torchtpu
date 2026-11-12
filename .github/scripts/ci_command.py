@@ -38,10 +38,13 @@ EXPECTED_PR_WORKFLOWS = (
 HELP_TEXT = (
     "- `/ci precheck`: re-run all non-TPU checks "
     "(pre-commit, PR checks, CPU tests).\n"
-    "- `/ci run [perf-eval] [nightly-suite]`: TPU tests now.\n"
-    "- `/ci merge [perf-eval] [nightly-suite]`: queue for merge once approved "
-    "and green (with no extras, same as the **Merge when ready** button at the "
-    "bottom of the GitHub PR page).\n"
+    "- `/ci run`: run the TPU tests now. Optionally add `perf-eval` (perf and "
+    "eval lanes) and/or `nightly-suite` (the full nightly suite, ~3–4h of TPU), "
+    "e.g. `/ci run perf-eval`.\n"
+    "- `/ci merge`: queue for merge once approved and green, same as the "
+    "**Merge when ready** button at the bottom of the GitHub PR page. "
+    "Optionally add `perf-eval` and/or `nightly-suite` to run them in the queue "
+    "too, e.g. `/ci merge perf-eval`.\n"
     "- `/ci merge precheck-only`: queue for merge with prechecks only "
     "(no TPU; not on `releases/*`).\n"
     "- `/ci cancel`: stop this PR's running builds, take it out of the merge "
@@ -358,7 +361,9 @@ def _leave_merge(pr: dict[str, Any], gh_token: str) -> list[str]:
     state = gql(_MERGE_STATE_QUERY)
     if state.get("isInMergeQueue"):
         gql(_DEQUEUE_MUTATION)
-        done.append("Took the PR out of the merge queue.")
+        done.append(
+            "Took the PR out of the merge queue (its queue build is cancelled)."
+        )
         state = gql(_MERGE_STATE_QUERY)
     if state.get("autoMergeRequest"):
         gql(_DISABLE_AUTO_MERGE_MUTATION)
@@ -394,11 +399,12 @@ def handle_pr_info(
         guidance = (
             "- Every push runs non-TPU checks; comment `/ci precheck` to re-run "
             "all non-TPU checks (pre-commit, PR checks, CPU tests).\n"
-            "- TPU tests don't run on push: comment "
-            "`/ci run [perf-eval] [nightly-suite]` (`nightly-suite` is ~3–4h of TPU).\n"
+            "- TPU tests don't run on push: comment `/ci run` to run them. Optionally "
+            "add `perf-eval` and/or `nightly-suite` (~3–4h of TPU), e.g. "
+            "`/ci run perf-eval`.\n"
             "- To merge, click the **Merge when ready** button at the bottom of the "
-            "GitHub PR page, or comment `/ci merge [perf-eval] [nightly-suite]` "
-            "(same as the button when no extras are given).\n"
+            "GitHub PR page. To run extra tests in the queue too, comment "
+            "`/ci merge perf-eval` or `/ci merge nightly-suite` instead.\n"
             "- `/ci merge precheck-only`: queue for merge with prechecks only "
             "(no TPU; not on `releases/*`).\n"
             "- `/ci cancel` stops running builds and takes the PR out of the merge "
@@ -406,14 +412,17 @@ def handle_pr_info(
         )
     else:
         guidance = (
+            "- Your pushes don't build until a reviewer runs `/ci precheck` (CPU "
+            "checks) or `/ci run` (TPU tests).\n"
             "- You don't have write access, so a reviewer can run `/ci` commands "
             "for you (`/ci help` is open to anyone):\n"
             "  - `/ci precheck`: re-run all non-TPU checks "
             "(pre-commit, PR checks, CPU tests).\n"
-            "  - `/ci run [perf-eval] [nightly-suite]`: TPU tests now.\n"
-            "  - `/ci merge [perf-eval] [nightly-suite]`: queue for merge once "
-            "approved and green (or a reviewer can click the **Merge when ready** "
-            "button at the bottom of the GitHub PR page).\n"
+            "  - `/ci run`: run the TPU tests now; optionally add `perf-eval` "
+            "and/or `nightly-suite`.\n"
+            "  - `/ci merge`: queue for merge once approved and green, same as the "
+            "**Merge when ready** button at the bottom of the GitHub PR page; "
+            "optionally add `perf-eval` and/or `nightly-suite`.\n"
             "  - `/ci merge precheck-only`: queue for merge with prechecks only "
             "(no TPU; not on `releases/*`).\n"
             "  - `/ci cancel`: stop this PR's running builds and take it out of the "
@@ -488,9 +497,12 @@ def handle_comment(
             if cancelled:
                 nums = ", ".join(f"#{n}" for n in cancelled)
                 noun = "build" if len(cancelled) == 1 else "builds"
-                parts.append(f"Cancelled {noun} {nums}.")
+                parts.append(
+                    f"Cancelled {noun} {nums}. Comment `/ci precheck` to get a green "
+                    "check again before merging."
+                )
             else:
-                parts.append("No running CI builds for this PR.")
+                parts.append("No running PR builds to cancel.")
         except Exception as exc:
             parts.append(f"@{author}, could not cancel builds ({_err_summary(exc)}).")
         try:
@@ -593,7 +605,9 @@ def handle_comment(
     extras_label = ", ".join(extras) if extras else "none"
     return reply(
         f"Started `{cmd_text}` on `{pr['head']['sha'][:7]}` "
-        f"(extras: {extras_label}): {build['web_url']}"
+        f"(extras: {extras_label}): {build['web_url']}\n\n"
+        "The merge queue waits for this run. To merge without it, comment "
+        "`/ci cancel`, then `/ci precheck`."
     )
 
 

@@ -587,6 +587,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             num_reqs_list=[1],
             spec_decode_metadata_list=[None],
             mamba_state_indices_list=None,
+            mamba_boundary_plans=None,
             pooler_output_list=[],
             top_tokens=False,
             kv_save_nan_check=None,
