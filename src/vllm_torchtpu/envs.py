@@ -34,6 +34,11 @@ if TYPE_CHECKING:
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
+    VLLM_TPU_MOE_REQUANT_MTP: bool = False
+    VLLM_TPU_USE_ROUTING_MOE: bool = False
+    VLLM_TPU_ROUTING_MOE_MTP: bool = False
+    VLLM_TPU_ROUTING_MOE_ACC_DTYPE: str = "float32"
+    VLLM_TPU_ROUTING_MOE_X_QUANT_BLOCK: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
@@ -1556,6 +1561,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
     "MOE_FUSED_EP_ENABLE_W4A8": env_bool("MOE_FUSED_EP_ENABLE_W4A8"),
+    "VLLM_TPU_MOE_REQUANT_MTP": env_bool("VLLM_TPU_MOE_REQUANT_MTP", default=False),
+    "VLLM_TPU_USE_ROUTING_MOE": env_bool("VLLM_TPU_USE_ROUTING_MOE", default=False),
+    "VLLM_TPU_ROUTING_MOE_MTP": env_bool("VLLM_TPU_ROUTING_MOE_MTP", default=False),
+    "VLLM_TPU_ROUTING_MOE_ACC_DTYPE": env_str(
+        "VLLM_TPU_ROUTING_MOE_ACC_DTYPE", "float32"
+    ),
+    "VLLM_TPU_ROUTING_MOE_X_QUANT_BLOCK": env_positive_int_or_none(
+        "VLLM_TPU_ROUTING_MOE_X_QUANT_BLOCK"
+    ),
     # Largest node-wide token count, out of the scheduler's cap, at or above
     # which the fused kernel is armed for the whole deployment. Decided once at
     # weight load, not per step: a per-step choice would need the token count
