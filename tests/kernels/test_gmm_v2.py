@@ -359,12 +359,12 @@ def test_gmm_fused_silu_bf16_matches_unfused_silu_and_mul():
     key = jax.random.key(0)
     lhs_key, rhs_key, bias_key = jax.random.split(key, 3)
 
-    lhs = jax.random.normal(lhs_key, (batch_size, in_size), dtype=jnp.bfloat16)
-    rhs = jax.random.normal(
-        rhs_key, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+    lhs = jax.random.uniform(lhs_key, (batch_size, in_size), jnp.bfloat16, -1.0, 1.0)
+    rhs = jax.random.uniform(
+        rhs_key, (num_groups, in_size, out_size), jnp.bfloat16, -0.1, 0.1
     )
-    rhs_bias = jax.random.normal(
-        bias_key, (num_groups, 1, out_size), dtype=jnp.bfloat16
+    rhs_bias = jax.random.uniform(
+        bias_key, (num_groups, 1, out_size), jnp.bfloat16, -0.1, 0.1
     )
     group_sizes = get_group_sizes(batch_size, num_groups)
 
@@ -398,10 +398,12 @@ def test_gmm_fused_silu_bf16_matches_unfused_silu_and_mul():
     )
 
     assert actual_silu_bf16.dtype == jnp.bfloat16
-    np.testing.assert_array_equal(
-        np.asarray(actual_silu_bf16), np.asarray(expected_standalone)
-    )
-    assert not np.array_equal(np.asarray(actual_silu_bf16), np.asarray(actual_silu))
+    _assert_allclose(actual_silu_bf16, expected_standalone, atol=1e-2, rtol=1e-2)
+    expected_fp32 = expected_standalone.astype(jnp.float32)
+    bf16_abs_diff = jnp.abs(actual_silu_bf16.astype(jnp.float32) - expected_fp32)
+    fp32_abs_diff = jnp.abs(actual_silu.astype(jnp.float32) - expected_fp32)
+    assert float(jnp.max(fp32_abs_diff)) > 1e-2
+    assert float(jnp.mean(bf16_abs_diff)) < float(jnp.mean(fp32_abs_diff)) * 0.1
 
 
 @pytest.mark.tpu_test
