@@ -52,6 +52,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.attention_backend import TPUAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
@@ -2805,6 +2806,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
 
     runner = SimpleNamespace(
         device=torch.device("cpu"),
+        attention_backend=TPUAttentionBackend(),
         max_model_len=64,
         max_num_tokens=64,
         max_num_reqs=4,
