@@ -58,11 +58,22 @@ def _packed_gather(num_tokens: int) -> bool:
     return 0 < num_tokens <= envs.TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS
 
 
+# The packed merge's XLA fusion fence, built by the op builder: building a
+# `pallas.jax_op` inside the compiled forward fails under Dynamo.
+_FENCE: list[Callable[[torch.Tensor], torch.Tensor] | None] = [None]
+
+
 def _log_packed_collectives() -> None:
     """Once per process, from the op builders (outside the traced forward:
-    a logging call under Dynamo breaks the graph)."""
+    a logging call under Dynamo breaks the graph); also builds `_FENCE`."""
     merge = envs.TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS
     gather = envs.TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS
+    if merge and _FENCE[0] is None:
+        from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (
+            optimization_barrier_op,
+        )
+
+        _FENCE[0] = optimization_barrier_op()
     if merge:
         logger.info_once(
             "TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS=%d: MSA DCP partials merge "
@@ -446,7 +457,7 @@ def merge_head_partials(
     all-to-all instead (`dcp_pack.merge_head_partials_all_to_all`)."""
     if _packed_merge(out.shape[1]):
         merged = dcp_pack.merge_head_partials_all_to_all(
-            out, lse, group, _all_to_all, envs.TPU_DCP_RS_OUT_PRECISION
+            out, lse, group, _all_to_all, envs.TPU_DCP_RS_OUT_PRECISION, _FENCE[0]
         )
         if hadamard is not None:
             merged = _rotate_heads(merged, hadamard)
