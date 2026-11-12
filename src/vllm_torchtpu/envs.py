@@ -219,6 +219,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    VLLM_TPU_TOPK_BACKEND: str = ""
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -2331,6 +2332,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "QWEN4_EXP_PACK_COMPRESSED_K", default=False
     ),
     "QWEN4_EXP_PACK_MAIN_KV": env_bool("QWEN4_EXP_PACK_MAIN_KV", default=False),
+    # StreamIndex Top-K backend override ("", "auto", "xla", "tensorcore",
+    # or "sparsecore").
+    "VLLM_TPU_TOPK_BACKEND": env_str("VLLM_TPU_TOPK_BACKEND", ""),
 }
 
 

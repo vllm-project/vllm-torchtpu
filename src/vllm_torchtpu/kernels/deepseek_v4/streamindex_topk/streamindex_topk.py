@@ -42,8 +42,8 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     components as indexing,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
-    SparseCoreTopK,
     TopKBackend,
+    default_topk_backend,
 )
 
 try:
@@ -58,7 +58,6 @@ KVLayout = config.KVLayout
 DEFAULT_BUFFER_COUNT = config.DEFAULT_BUFFER_COUNT
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 DCP_AXIS_NAME = "dcp"
-_DEFAULT_TOPK_BACKEND = SparseCoreTopK()
 
 cp_local_to_global = metadata.cp_local_to_global
 cp_local_length = metadata.cp_local_length
@@ -1182,9 +1181,10 @@ def _effective_row_lengths(
         "decode_passes",
         "hoist_step_metadata",
         "tile_aligned_scores",
+        "decode_only",
     ),
 )
-def streamindex_topk(
+def _streamindex_topk(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     indexer_weights: jax.Array,  # [max_num_tokens, actual_num_q_heads]
     # D = align_to(actual_head_dim, 128); W = align_to(D + D // 128, 128)
@@ -1211,10 +1211,11 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     components: indexing.StreamIndexComponents | None = None,
-    topk_backend: TopKBackend = _DEFAULT_TOPK_BACKEND,
+    topk_backend: TopKBackend,
     decode_passes: bool = True,
     hoist_step_metadata: bool = False,
     tile_aligned_scores: bool = False,
+    decode_only: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1566,18 +1567,38 @@ def streamindex_topk(
             static_q_len=1,
             case=MlaCase.DECODE,
         )
+        single_batched_decode = (
+            decode_only
+            and max_num_seqs >= decode_req_batch_size
+            and max_num_seqs % decode_req_batch_size == 0
+            and q.shape[0] >= max_num_seqs
+        )
         batched_decode = (
             ()
             if max_num_seqs < decode_req_batch_size
             else (
                 dict(
                     start_seq_idx=jnp.array(0),
-                    end_seq_idx=decode_batch_end,
+                    end_seq_idx=(
+                        distribution[0] if single_batched_decode else decode_batch_end
+                    ),
                     seq_batch_size=decode_req_batch_size,
                     **decode_cfg,
                 ),
             )
         )
+        if decode_only:
+            if single_batched_decode:
+                return batched_decode
+            return (
+                *batched_decode,
+                dict(
+                    start_seq_idx=decode_batch_end,
+                    end_seq_idx=distribution[1],
+                    seq_batch_size=1,
+                    **decode_cfg,
+                ),
+            )
         return (
             *batched_decode,
             # Handle num_decode_seqs % decode_req_batch_size != 0 case.
@@ -1820,6 +1841,41 @@ def streamindex_topk(
         _common_path,
         None,
     )
+
+
+def _resolve_topk_backend(topk_backend: TopKBackend | None) -> TopKBackend:
+    return default_topk_backend() if topk_backend is None else topk_backend
+
+
+class _StreamIndexTopKDispatcher:
+    """Unjitted wrapper resolving default_topk_backend() before @jax.jit."""
+
+    __name__ = "streamindex_topk"
+    __wrapped__ = _streamindex_topk
+
+    def __call__(
+        self, *args: Any, topk_backend: TopKBackend | None = None, **kwargs: Any
+    ) -> Any:
+        return _streamindex_topk(
+            *args, topk_backend=_resolve_topk_backend(topk_backend), **kwargs
+        )
+
+    def trace(
+        self, *args: Any, topk_backend: TopKBackend | None = None, **kwargs: Any
+    ) -> Any:
+        return _streamindex_topk.trace(
+            *args, topk_backend=_resolve_topk_backend(topk_backend), **kwargs
+        )
+
+    def lower(
+        self, *args: Any, topk_backend: TopKBackend | None = None, **kwargs: Any
+    ) -> Any:
+        return _streamindex_topk.lower(
+            *args, topk_backend=_resolve_topk_backend(topk_backend), **kwargs
+        )
+
+
+streamindex_topk = _StreamIndexTopKDispatcher()
 
 
 @functools.partial(
