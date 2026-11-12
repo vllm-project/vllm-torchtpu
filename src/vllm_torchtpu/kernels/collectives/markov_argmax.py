@@ -87,8 +87,11 @@ def _call(
     rank_dim: int,
     vocab: int,
     w1_dtype,
+    rows: int,
     interpret=None,
 ):
+    # Only the `rows` real rows gather embeddings and hand ids to the scalar
+    # core; pad rows up to rp keep zero embeddings and are never read.
     nt = vp // TILE_COLS
     # Rows per (sublane) tile of markov_w1: 8 for 32-bit, 16 for bf16.
     blk = _SUBLANES_32 * 4 // jnp.dtype(w1_dtype).itemsize
@@ -124,7 +127,7 @@ def _call(
             )
 
         lg_copy(0).start()
-        for r in range(rp):
+        for r in range(rows):
             prev_s[r] = prev0_ref[r]
 
         barrier = pltpu.get_barrier_semaphore()
@@ -141,7 +144,7 @@ def _call(
             # A DMA offset along the tiled row axis must be tile aligned:
             # fetch the aligned block of `blk` rows holding each row.
             gathers = []
-            for r in range(rp):
+            for r in range(rows):
                 b0 = pl.multiple_of((prev_s[r] // blk) * blk, blk)
                 g = pltpu.make_async_copy(
                     w1_hbm.at[pl.ds(b0, blk)], e_v.at[r], e_sem.at[0]
@@ -160,7 +163,7 @@ def _call(
             erow = lax.broadcasted_iota(jnp.int32, (rp, rank_dim), 0)
             bsub = lax.broadcasted_iota(jnp.int32, (blk, rank_dim), 0)
             e = jnp.zeros((rp, rank_dim), F32)
-            for r in range(rp):
+            for r in range(rows):
                 hit = bsub == lax.rem(prev_s[r], blk)
                 row = jnp.sum(
                     jnp.where(hit, e_v[r].astype(F32), 0.0), axis=0, keepdims=True
@@ -226,7 +229,7 @@ def _call(
                 win = jnp.where(better, cand, win)
             ids = win[:, 1:2].astype(jnp.int32)  # [rp, 1]
             row = lax.broadcasted_iota(jnp.int32, (rp, 1), 0)
-            for r in range(rp):
+            for r in range(rows):
                 v = jnp.sum(jnp.where(row == r, ids, 0))
                 v = jnp.clip(v, 0, vocab - 1)
                 prev_s[r] = v
@@ -260,7 +263,7 @@ def _call(
             collective_id=COLLECTIVE_ID,
             vmem_limit_bytes=vmem_bytes(rp, vp, rank_dim) + (8 << 20),
         ),
-        name=f"dspark_markov_argmax-k_{k}-r_{rp}-v_{vp}-n_{n}",
+        name=f"dspark_markov_argmax-k_{k}-r_{rows}-v_{vp}-n_{n}",
         **({} if interpret is None else {"interpret": interpret}),
     )
 
@@ -297,7 +300,9 @@ def markov_argmax(
     lg = jnp.transpose(logits, (1, 0, 2))
     lg = jnp.pad(lg, ((0, 0), (0, rp - rows), (0, vp - vs)))
     p0 = jnp.pad(prev0.astype(jnp.int32), (0, rp - rows))
-    out = _call(n, k, rp, vp, vs, rank_dim, vocab, jnp.dtype(w1.dtype), interpret)(
+    out = _call(
+        n, k, rp, vp, vs, rank_dim, vocab, jnp.dtype(w1.dtype), rows, interpret
+    )(
         rank.reshape(1).astype(jnp.int32),
         start.reshape(1).astype(jnp.int32),
         p0,
