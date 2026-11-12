@@ -124,6 +124,11 @@ class SpecDecodeMetadata:
     # so the sampling generator's stream is the same as without the key.
     # None: padded_logits_length is the token-bucket length.
     rng_rows: int | None = None
+    # spec_verify_coarse_pad: final_logits_indices cut to rng_rows. A verify
+    # chunk that computes logits for every row (no one-row verify) runs the
+    # LM head on these and pads the logits, because the LM head's per-row
+    # results are not bitwise stable across row counts on TPU.
+    fine_logits_indices: torch.Tensor | None = None
 
     def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
         assert self.deferred_draft_token_ids_cpu is not None
@@ -390,6 +395,7 @@ class SpeculativeDecodingManager:
                     padded_draft_token_ids if defer_draft_token_ids else None
                 ),
                 rng_rows=rng_rows,
+                fine_logits_indices=self._meta_cache.fine_logits_indices,
             )
 
         # [num_reqs]
@@ -521,6 +527,17 @@ class SpeculativeDecodingManager:
                 padded_draft_token_ids if defer_draft_token_ids else None
             ),
             rng_rows=rng_rows,
+            fine_logits_indices=(
+                None
+                if rng_rows is None
+                else torch.from_numpy(
+                    np.ascontiguousarray(padded_logits_indices[:rng_rows])
+                    if rng_rows <= padded_logits_length
+                    else np.pad(
+                        padded_logits_indices, (0, rng_rows - padded_logits_length)
+                    )
+                ).to(device, non_blocking=True)
+            ),
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller
         # mutation can't diverge the cache from its key.

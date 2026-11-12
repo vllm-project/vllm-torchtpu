@@ -235,6 +235,12 @@ def _run(step, coarse, path, vocab, seed):
         if one_row:
             rows = runner._plan_synthetic_verify(md)
             logits = step.table_dev[rows]
+        elif md.fine_logits_indices is not None:
+            # As execute_model: the LM head at the token-bucket rows, padded.
+            logits = tpu_runner._fit_verify_rows(
+                step.table_dev[md.fine_logits_indices],
+                md.final_logits_indices.shape[0],
+            )
         else:
             # compute_selected_logits: the verify rows of the logits.
             logits = step.table_dev[md.final_logits_indices]
@@ -293,6 +299,11 @@ def test_coarse_pad_is_exact(conc):
                      "segment_ids", "group_indices"):  # fmt: skip
             a, b = getattr(off, name), getattr(on, name)
             assert torch.equal(a[:num_rows], b[:num_rows]), name
+        # The LM-head indices of a full-logits chunk are the off path's.
+        if on.rng_rows is None:
+            assert on.fine_logits_indices is None
+        else:
+            assert torch.equal(on.fine_logits_indices, off.final_logits_indices)
         # Padded verify rows belong to no real request.
         assert bool((on.segment_ids[num_rows:] == num_reqs).all())
         for path in PATHS:
@@ -329,6 +340,19 @@ def test_metadata_cache_hit_keeps_rng_rows():
     again = manager.get_spec_decode_metadata(drafts, cu, 32)
     assert first.rng_rows == again.rng_rows == 160
     assert again.draft_token_ids.shape[0] == 256
+    assert again.fine_logits_indices is first.fine_logits_indices
+    assert torch.equal(
+        first.fine_logits_indices, first.final_logits_indices[:160]
+    )
+
+
+def test_fit_verify_rows_pads_and_cuts():
+    t = torch.arange(12.0).view(3, 4)
+    with torch.compiler.set_stance("force_eager"):
+        padded = tpu_runner._fit_verify_rows(t, 5)
+        cut = tpu_runner._fit_verify_rows(t, 2)
+    assert torch.equal(padded[:3], t) and bool((padded[3:] == 0).all())
+    assert torch.equal(cut, t[:2])
 
 
 def test_uniform_draw_matches_off_path_stream():
@@ -388,14 +412,20 @@ def _rs_pairs(monkeypatch, conc, coarse):
     return sorted(set(runner.rejection_sampler.calls)), runner
 
 
-def _selected_logits_shapes(runner, monkeypatch):
+def _selected_logits_shapes(runner, monkeypatch, fits=None):
+    """(token bucket, rows) of the compute_selected_logits warmup; `fits`
+    collects the (rows, padded rows) of the `_fit_verify_rows` warmup."""
     seen = []
+    fits = set() if fits is None else fits
     runner.model_config = SimpleNamespace(get_hidden_size=lambda: 4)
     runner.compute_selected_logits = lambda h, i: seen.append(
         (h.shape[0], i.shape[0])
     )
-    runner._spec_logits_lengths = functools.partial(
-        TPUModelRunner._spec_logits_lengths, runner
+    runner._dummy_logits = lambda n: torch.zeros((n, 4))
+    for name in ("_spec_logits_lengths", "_verify_rows_fits"):
+        setattr(runner, name, functools.partial(getattr(TPUModelRunner, name), runner))
+    monkeypatch.setattr(
+        tpu_runner, "_fit_verify_rows", lambda t, rows: fits.add((t.shape[0], rows))
     )
     TPUModelRunner._precompile_compute_selected_logits(runner)
     return set(seen)
@@ -413,7 +443,8 @@ def test_sweeps_cover_every_reachable_shape(monkeypatch, conc):
     compute_selected_logits and glue sweeps, with the key on and off."""
     for coarse in (False, True):
         pairs, runner = _rs_pairs(monkeypatch, conc, coarse)
-        selected = _selected_logits_shapes(runner, monkeypatch)
+        fits = set()
+        selected = _selected_logits_shapes(runner, monkeypatch, fits)
         extract = _glue_extract(runner)
         vpads = verify_logits_paddings(runner)
         tpads = runner.num_tokens_paddings
@@ -424,9 +455,16 @@ def test_sweeps_cover_every_reachable_shape(monkeypatch, conc):
                 length = _get_padded_token_len(vpads, n)
                 assert (length, pnr) in pair_set, (coarse, n, r)
                 # The step's tokens: at least its rows, up to the budget.
-                for t in (_get_padded_token_len(tpads, n), tpads[-1]):
-                    assert (t, length) in selected, (coarse, t, n)
+                fine = _get_padded_token_len(tpads, n)
+                for t in (fine, tpads[-1]):
+                    # A full-logits chunk runs the LM head at the token-bucket
+                    # rows (fine_logits_indices), then pads them to `length`.
+                    assert (t, fine) in selected, (coarse, t, n)
                     assert (t, length) in extract, (coarse, t, n)
+                if length != fine:
+                    assert (fine, length) in fits, (coarse, n)
+        if not coarse:
+            assert not fits
 
 
 def test_program_counts(monkeypatch, capsys):
