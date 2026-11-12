@@ -402,6 +402,8 @@ def model_blocks(rng, lengths, budget, model, ratio=RATIO, page_size=B):
     (union ~ f, page-local: block-sparse skips the other pages)."""
     lengths = np.asarray(lengths)
     complete_max = int(lengths.max()) // ratio
+    if model in ("corr10", "tight2"):
+        return _served_like_blocks(rng, lengths, budget, model, ratio)
     if model == "random":
         from dcp2_harness import random_blocks
 
@@ -424,6 +426,70 @@ def model_blocks(rng, lengths, budget, model, ratio=RATIO, page_size=B):
     return blocks
 
 
+def _served_like_blocks(rng, lengths, budget, model, ratio=RATIO):
+    """~/q38f/c48dec/bench_qsapf_union.py's selections (the served-route bench, exos j-afbaae72):
+    corr10: per 64 rows a clustered base (runs of mean 4 plus the 128 newest groups), 10% per-row
+    redraw, the 16 newest groups; tight2: the base drifts 5% per 64 rows, 2% redraw."""
+
+    def clustered(visible, recent=128, mean_run=4):
+        picked = set(range(max(visible - recent, 0), visible))
+        while len(picked) < min(budget, visible):
+            s0 = int(rng.integers(0, visible))
+            picked.update(range(s0, min(s0 + int(rng.geometric(1 / mean_run)), visible)))
+        return np.fromiter(picked, np.int32)[:budget]
+
+    def fill_unique(sel, vis):
+        u = np.unique(sel[(sel >= 0) & (sel < vis)])
+        while len(u) < min(budget, vis):
+            u = np.unique(np.concatenate([u, rng.integers(0, vis, budget - len(u)).astype(np.int32)]))
+        return u[:budget] if len(u) > budget else u
+
+    rows = len(lengths)
+    blocks = np.full((rows, budget), -1, np.int32)
+    redraw = 0.10 if model == "corr10" else 0.02
+    base = None
+    for g0 in range(0, rows, 64):
+        vis0 = int(lengths[g0]) // ratio
+        if model == "corr10" or base is None:
+            base = clustered(vis0)
+        else:
+            k = len(base) // 20
+            base = base.copy()
+            base[rng.choice(len(base), k, replace=False)] = rng.integers(0, vis0, k)
+            base = fill_unique(base, vis0)
+        for i in range(g0, min(g0 + 64, rows)):
+            vis = int(lengths[i]) // ratio
+            sel = base.copy()
+            k = int(len(sel) * redraw)
+            sel[:k] = rng.integers(0, vis, k)
+            sel[k:k + 16] = np.arange(max(vis - 16, 0), vis)[:16]
+            u = fill_unique(sel, vis)
+            blocks[i, :len(u)] = rng.permutation(u)
+    return blocks
+
+
+def precheck_terms(blocks, lengths, rank, stride=8, ratio=RATIO, page_size=B):
+    """The precheck's cost-model inputs on the host: (sampled 1024-row blocks, union groups summed over
+    their 128-row tiles incl. partial tails, owned pages their union touches), for the offline fit."""
+    lb, ll = ud.dcp_local_selection(jnp.asarray(blocks), jnp.asarray(lengths), rank=rank_operand(rank),
+                                    world=D, page_size=page_size, ratio=ratio)
+    lb, ll = np.asarray(lb), np.asarray(ll)
+    nblocks = len(lengths) // 1024
+    sample = range(min(stride // 2, nblocks - 1), nblocks, stride)
+    union = pages = 0
+    for blk in sample:
+        ids_block = []
+        for t in range(8):
+            rows = slice(blk * 1024 + t * 128, blk * 1024 + t * 128 + 128)
+            ids = lb[rows][lb[rows] >= 0]
+            tails = ll[rows][ll[rows] % ratio != 0] // ratio
+            u = np.unique(np.concatenate([ids, tails]))
+            union += len(u)
+            ids_block.append(u)
+        pages += len(np.unique(np.concatenate(ids_block) // (page_size // ratio)))
+    return len(sample), int(union), int(pages)
+
+
 def _time(fn, iters=10):
     jax.block_until_ready(fn())
     jax.block_until_ready(fn())
@@ -434,6 +500,17 @@ def _time(fn, iters=10):
     return (time.perf_counter() - t0) / iters * 1e3
 
 
+# The served c32 QSA prefill env (bench_qsapf_union.py BASE_ENV, variant A): no VPU / page copies,
+# bitset not owned.
+SERVED_C32_ENV = {
+    "VLLM_TPU_QSA_DCP_SPLIT_LSE": "1",
+    "VLLM_TPU_QSA_PREFIX_SLICE": "1",
+    "VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY": "1",
+    "VLLM_TPU_QSA_PREFILL_INDEXER_BKV": "1024",
+    "VLLM_TPU_QSA_PREFILL_VPU": "0",
+    "VLLM_TPU_QSA_PREFILL_PAGE_COPIES": "0",
+    "VLLM_TPU_QSA_PREFILL_BITSET_OWNED": "0",
+}
 ARMS = {
     "block_sparse": {"VLLM_TPU_QSA_PREFILL_UNION_DCP": "0"},
     "walk_forced": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "0",
@@ -444,7 +521,7 @@ ARMS = {
     "alpha0.2_pc8": {"VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": "0.2", "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": "8",
                      "VLLM_TPU_QSA_PREFILL_UNION_DCP_COST": "off"},
 }
-MODELS = ("random", "hot0.1", "hot0.2", "hot0.36", "pages0.1", "pages0.2", "pages0.36")
+MODELS = ("corr10", "tight2", "random", "hot0.05", "hot0.1", "hot0.2", "pages0.1", "pages0.2", "pages0.36")
 
 
 def union_fraction(blocks, lengths, table_columns, rank):
@@ -488,21 +565,25 @@ def plan_breakdown(case, rank=0):
     return {k: round(v, 3) for k, v in out.items()}
 
 
-def bench(chunk=8192, context=74000, budget=2048, models=MODELS, ranks=(0,)):
+def bench(chunk=8192, context=75776, budget=512, models=MODELS, ranks=(0,)):
+    """Served shape: top-k 2048 tokens = 512 groups (ratio 4), served c32 env, 6 gathered heads."""
     results = {}
     case = union_case(np.random.default_rng(11), [(context - chunk, chunk)], budget=budget, pad_to=0)
     for model in models:
         case.blocks = model_blocks(np.random.default_rng(12), case.lengths, budget, model)
-        if model == "random":
+        if model == "corr10":
+            for k, v in {**UNION_ENV, **SERVED_C32_ENV}.items():
+                os.environ[k] = v
             results["plan_breakdown"] = plan_breakdown(case)
             print("BENCH plan_breakdown", results["plan_breakdown"], flush=True)
         for r in ranks:
             args = (case.q, case.gate, jnp.asarray(case.blocks), jnp.asarray(case.lengths),
                     jnp.asarray(case.dcp_rows), case.rank_pools[r], jnp.asarray(case.starts))
-            row = dict(union_frac_median_max=union_fraction(case.blocks, case.lengths, case.dcp_rows.shape[1], r))
+            row = dict(union_frac_median_max=union_fraction(case.blocks, case.lengths, case.dcp_rows.shape[1], r),
+                       precheck_blocks_union_pages=precheck_terms(case.blocks, case.lengths, r))
             outs = {}
             for arm, extra in ARMS.items():
-                for k, v in UNION_ENV.items():
+                for k, v in {**UNION_ENV, **SERVED_C32_ENV}.items():
                     os.environ[k] = v
                 os.environ["VLLM_TPU_QSA_PREFILL_UNION_DCP"] = "1"
                 for k, v in extra.items():
@@ -556,6 +637,6 @@ if __name__ == "__main__":
         if "--bench" in sys.argv:
             bench()
             print("BENCH shape 4096-row chunk, 40K context", flush=True)
-            bench(chunk=4096, context=40000, models=("random", "hot0.2", "hot0.36", "pages0.1", "pages0.36"))
+            bench(chunk=4096, context=40000, models=("corr10", "tight2", "random", "hot0.1", "pages0.2"))
     print("FAILURES", failures)
     sys.exit(1 if failures else 0)
