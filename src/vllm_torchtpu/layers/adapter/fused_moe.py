@@ -271,14 +271,20 @@ def prebuild_fused_moe_kernel(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
 ) -> None:
-    """Prebuild and cache fused MoE custom op outside compile-time tracing."""
-    _get_fused_moe_custom_op(
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    )
+    """Prebuild and cache fused MoE custom op outside compile-time tracing
+    (and its dispatch-token variant when TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS
+    is set, whose layer split asks for it)."""
+    for dispatch_token in (False, True)[
+        : 2 if envs.TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS else 1
+    ]:
+        _get_fused_moe_custom_op(
+            topk=topk,
+            activation=activation,
+            use_ep=use_ep,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+            dispatch_token=dispatch_token,
+        )
 
 
 def fused_moe_gmm(
