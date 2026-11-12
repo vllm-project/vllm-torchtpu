@@ -47,6 +47,8 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
+    TPU_MINIMAX_M3_MXFP8_W8A16_MAX_ROWS: int = 0
+    TPU_MINIMAX_M3_MXFP8_W8A16_SKIP: str = ""
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -576,6 +578,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
     ),
+    # MiniMax M3: token buckets of at most this many rows run the target
+    # model's MXFP8 dense linears from an extra e4m3 copy of the weight
+    # (W8A16 Pallas kernel, half the weight bytes); larger buckets keep the
+    # bf16 matmul. 0 (default) keeps bf16 everywhere and adds no weight copy.
+    "TPU_MINIMAX_M3_MXFP8_W8A16_MAX_ROWS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_MXFP8_W8A16_MAX_ROWS", 0
+    ),
+    # Comma-separated substrings of linear prefixes (e.g. "qkv_proj") that keep
+    # bf16 even when TPU_MINIMAX_M3_MXFP8_W8A16_MAX_ROWS is set.
+    "TPU_MINIMAX_M3_MXFP8_W8A16_SKIP": env_str("TPU_MINIMAX_M3_MXFP8_W8A16_SKIP", ""),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"

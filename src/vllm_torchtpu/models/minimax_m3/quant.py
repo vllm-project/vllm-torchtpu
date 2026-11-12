@@ -34,6 +34,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
     VllmNvfp4Config,
     VllmNvfp4MoEMethod,
@@ -43,7 +44,10 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedLinearMethod,
 )
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
+
+logger = init_logger(__name__)
 
 QUANT_METHOD = "mxfp8"
 MXFP8_BLOCK = 32
@@ -140,6 +144,86 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         return VllmUnquantizedLinearMethod().apply(layer, x, bias)
 
 
+def mxfp8_to_w8a16(
+    weight: torch.Tensor, scale_e8m0: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[n, k]`` e4m3 + ``[n, k // 32]`` e8m0 -> K-major ``[k, n]`` e4m3 and the
+    ``[k // 32, n]`` bf16 power-of-two block scale.
+
+    ``w[k, n] * scale[k // 32, n]`` in bf16 is bit-identical to
+    `dequantize_mxfp8`'s weight: an e4m3 value times ``2 ** j`` is exact.
+    """
+    w_kn = weight.view(torch.uint8).t().contiguous().view(torch.float8_e4m3fn)
+    scale = torch.exp2(scale_e8m0.to(torch.float32) - _E8M0_BIAS)
+    return w_kn, scale.t().contiguous().to(torch.bfloat16)
+
+
+@register_weight_loader_v2_supported_method
+class MiniMaxM3Mxfp8W8A16LinearMethod(MiniMaxM3Mxfp8LinearMethod):
+    """bf16 weight (as `MiniMaxM3Mxfp8LinearMethod`) plus an e4m3 copy.
+
+    Token buckets of at most ``max_rows`` rows run `mxfp8_w8a16_matmul` on the
+    e4m3 copy: the kernel dequantizes each chunk to the same bf16 weight in
+    VMEM, so decode reads half the weight bytes. Larger buckets (prefill) keep
+    the bf16 matmul unchanged.
+    """
+
+    _logged = False
+
+    def __init__(self, max_rows: int):
+        super().__init__()
+        self.max_rows = max_rows
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm_torchtpu.models.minimax_m3.kernels.mxfp8_w8a16 import (
+            supports_shape,
+        )
+
+        if hasattr(layer, "weight_w8"):
+            return  # reload paths re-enter this hook
+        n, k = layer.weight.shape
+        w8 = scale = None
+        if supports_shape(k, n):
+            w8, scale = mxfp8_to_w8a16(layer.weight.data, layer.weight_scale.data)
+        super().process_weights_after_loading(layer)
+        if w8 is None:
+            return
+        layer.register_parameter(
+            "weight_w8", torch.nn.Parameter(w8.to(layer.weight.device), requires_grad=False)
+        )
+        layer.register_parameter(
+            "weight_w8_scale",
+            torch.nn.Parameter(scale.to(layer.weight.device), requires_grad=False),
+        )
+        if layer.weight.device.type == "tpu":
+            synchronize_tensors([layer.weight_w8, layer.weight_w8_scale])
+        if not MiniMaxM3Mxfp8W8A16LinearMethod._logged:
+            MiniMaxM3Mxfp8W8A16LinearMethod._logged = True
+            logger.info(
+                "TPU_MINIMAX_M3_MXFP8_W8A16_MAX_ROWS=%d: MXFP8 dense linears add an "
+                "e4m3 copy (W8A16 kernel for buckets <= %d rows); first weight "
+                "[k, n]=%s",
+                self.max_rows,
+                self.max_rows,
+                [k, n],
+            )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        rows = x.numel() // x.shape[-1]
+        if bias is not None or not hasattr(layer, "weight_w8") or rows > self.max_rows:
+            return super().apply(layer, x, bias)
+        from vllm_torchtpu.models.minimax_m3.kernels.mxfp8_w8a16 import (
+            mxfp8_w8a16_linear,
+        )
+
+        return mxfp8_w8a16_linear(x, layer.weight_w8, layer.weight_w8_scale)
+
+
 class MiniMaxM3Nvfp4MoEMethod(VllmNvfp4MoEMethod):
     """Compressed-tensors NVFP4 experts on the TPU NVFP4 MoE path.
 
@@ -200,12 +284,21 @@ class MiniMaxM3QuantConfig(VllmNvfp4Config):
             new + name.removeprefix(old) if name.startswith(old) else name
             for name in config.get("ignored_layers") or []
         ]
-        return cls(
+        quant_config = cls(
             quant_method="NVFP4",
             is_checkpoint_nvfp4_serialized=True,
             exclude_modules=exclude_modules,
             group_size=_NVFP4_GROUP,
         )
+        # The DSpark draft's config names its modules under the draft prefix;
+        # the draft reads its qkv_proj weight raw, so it stays bf16.
+        is_draft = any(
+            name.startswith(old) for name in config.get("ignored_layers") or []
+        )
+        quant_config.w8a16_max_rows = (
+            0 if is_draft else envs.TPU_MINIMAX_M3_MXFP8_W8A16_MAX_ROWS
+        )
+        return quant_config
 
     def _get_checkpoint_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -214,6 +307,10 @@ class MiniMaxM3QuantConfig(VllmNvfp4Config):
         if isinstance(layer, LinearBase):
             if excluded:
                 return VllmUnquantizedLinearMethod()
+            max_rows = getattr(self, "w8a16_max_rows", 0)
+            skip = [s for s in envs.TPU_MINIMAX_M3_MXFP8_W8A16_SKIP.split(",") if s]
+            if max_rows and not any(s in prefix for s in skip):
+                return MiniMaxM3Mxfp8W8A16LinearMethod(max_rows)
             return MiniMaxM3Mxfp8LinearMethod()
         if isinstance(layer, RoutedExperts):
             if excluded:
