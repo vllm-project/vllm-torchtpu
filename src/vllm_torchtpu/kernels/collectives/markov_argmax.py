@@ -28,7 +28,7 @@ not one per step). Per step and rank:
   bias   = bf16(e @ w2_shard.T)            (f32 accumulation, rounded once)
   scores = bf16(logits[i] + bias)          (pad columns masked to -inf)
   pair   = (max score, first global id of the max)
-  prev   = id of the first rank holding the largest max (lowest ids win ties)
+  prev   = id of the largest max over the ranks (the lowest id on ties)
 
 which is the arithmetic of `markov_shard_pair` + `reduce_shard_argmax_pairs`.
 A NaN score is not given torch.argmax's NaN-wins semantics here.
@@ -52,6 +52,7 @@ _MESH = pl.DeviceIdType.MESH
 _LANES = 128
 # Rows padded to whole bf16 sublane tiles.
 _SUBLANES = 16
+_SUBLANES_32 = 8
 # Vocab columns per bias tile (a multiple of 128 lanes).
 TILE_COLS = 3584
 
@@ -70,7 +71,7 @@ def vmem_bytes(rows: int, vp: int, rank_dim: int) -> int:
     return (
         vp * rank_dim * 2  # Markov rows
         + 2 * rp * vp * 2  # two logits slots
-        + rp * rank_dim * 2 * 2  # embeddings
+        + rp * 16 * rank_dim * 4  # embedding row blocks
         + 6 * rp * _LANES * 4  # pairs
         + 2 * 8 * rp * _LANES * 4  # receive slots (n <= 8)
     )
@@ -89,9 +90,13 @@ def _call(
     interpret=None,
 ):
     nt = vp // TILE_COLS
+    # Rows per (sublane) tile of markov_w1: 8 for 32-bit, 16 for bf16.
+    blk = _SUBLANES_32 * 4 // jnp.dtype(w1_dtype).itemsize
+    assert vocab % blk == 0, (vocab, blk)
 
     def kernel(
-        rank_ref,  # SMEM [1]
+        rank_ref,  # SMEM [1] mesh index (remote DMA addressing)
+        start_ref,  # SMEM [1] global id of this rank's first vocab column
         prev0_ref,  # SMEM [rp]
         logits_hbm,  # ANY [k, rp, vp] bf16
         w1_hbm,  # ANY [vocab, rank_dim] bf16
@@ -129,14 +134,17 @@ def _call(
 
         lane = lax.broadcasted_iota(jnp.int32, (rp, _LANES), 1)
         col = lax.broadcasted_iota(jnp.int32, (rp, TILE_COLS), 1)
-        start = me * vs
+        start = start_ref[0]
 
         for i in range(k):
             par = i % 2
+            # A DMA offset along the tiled row axis must be tile aligned:
+            # fetch the aligned block of `blk` rows holding each row.
             gathers = []
             for r in range(rp):
+                b0 = pl.multiple_of((prev_s[r] // blk) * blk, blk)
                 g = pltpu.make_async_copy(
-                    w1_hbm.at[pl.ds(prev_s[r], 1)], e_v.at[r], e_sem.at[0]
+                    w1_hbm.at[pl.ds(b0, blk)], e_v.at[r], e_sem.at[0]
                 )
                 g.start()
                 gathers.append(g)
@@ -147,12 +155,17 @@ def _call(
             lg_copy(i).wait()
             for g in gathers:
                 g.wait()
-            # Rows land one per (1, r) slot; assemble [rp, r] in f32 (exact
-            # for bf16) rather than reshape a packed bf16 buffer.
+            # Pick row prev % blk of each block and assemble [rp, r] in f32
+            # (exact for bf16 values).
             erow = lax.broadcasted_iota(jnp.int32, (rp, rank_dim), 0)
+            bsub = lax.broadcasted_iota(jnp.int32, (blk, rank_dim), 0)
             e = jnp.zeros((rp, rank_dim), F32)
             for r in range(rp):
-                e = jnp.where(erow == r, e_v[r].astype(F32), e)
+                hit = bsub == lax.rem(prev_s[r], blk)
+                row = jnp.sum(
+                    jnp.where(hit, e_v[r].astype(F32), 0.0), axis=0, keepdims=True
+                )
+                e = jnp.where(erow == r, row, e)
             e = e.astype(BF16)
 
             def tile(t, carry, par=par, e=e):
@@ -203,11 +216,13 @@ def _call(
                 pltpu.make_async_copy(
                     recv_v.at[par, t], recv_v.at[par, t], recv_sem.at[par, t]
                 ).wait_recv()
-            win_m = recv_v[par, 0]
-            win = win_m
+            # Largest max; equal maxima -> the lower global id, whatever the
+            # mesh order of the ranks.
+            win = recv_v[par, 0]
             for s_ in range(1, n):
                 cand = recv_v[par, s_]
-                better = cand[:, 0:1] > win[:, 0:1]
+                cv, wv = cand[:, 0:1], win[:, 0:1]
+                better = (cv > wv) | ((cv == wv) & (cand[:, 1:2] < win[:, 1:2]))
                 win = jnp.where(better, cand, win)
             ids = win[:, 1:2].astype(jnp.int32)  # [rp, 1]
             row = lax.broadcasted_iota(jnp.int32, (rp, 1), 0)
@@ -224,13 +239,13 @@ def _call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((k, rp), jnp.int32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=3,
             in_specs=[hbm, hbm, hbm],
             out_specs=pl.BlockSpec(memory_space=pltpu.SMEM),
             scratch_shapes=[
                 pltpu.VMEM((vp, rank_dim), BF16),
                 pltpu.VMEM((2, rp, vp), BF16),
-                pltpu.VMEM((rp, 1, rank_dim), w1_dtype),
+                pltpu.VMEM((rp, blk, rank_dim), w1_dtype),
                 pltpu.VMEM((2, rp, _LANES), F32),
                 pltpu.VMEM((2, n, rp, _LANES), F32),
                 pltpu.SMEM((rp,), jnp.int32),
@@ -256,6 +271,7 @@ def markov_argmax(
     w1: jax.Array,
     w2p: jax.Array,
     rank: jax.Array,
+    start: jax.Array,
     n: int,
     vs: int,
     interpret=None,
@@ -265,12 +281,12 @@ def markov_argmax(
     Call under shard_map over the 1-D TP mesh, per rank:
       logits [rows, k, vs] bf16  this rank's vocab shard of the draft logits
       prev0  [rows] int          each row's first ``prev`` (the anchor id)
-      w1     [vocab, r] bf16/f32 markov_w1 (replicated; f32 holds the same
-                                 values and moves one row per DMA unpacked)
+      w1     [vocab, r] bf16/f32 markov_w1 (replicated); vocab a multiple of
+                                 the row tile (16 for bf16)
       w2p    [vp, r] bf16        this rank's markov_w2 rows, zero-padded to
                                  ``padded_vocab(vs)``
-      rank   [1] int32           this rank's mesh index (shard r owns ids from
-                                 r * vs)
+      rank   [1] int32           this rank's mesh index
+      start  [1] int32           global id of this rank's first vocab column
     """
     rows, k, width = logits.shape
     assert width == vs, (width, vs)
@@ -282,6 +298,11 @@ def markov_argmax(
     lg = jnp.pad(lg, ((0, 0), (0, rp - rows), (0, vp - vs)))
     p0 = jnp.pad(prev0.astype(jnp.int32), (0, rp - rows))
     out = _call(n, k, rp, vp, vs, rank_dim, vocab, jnp.dtype(w1.dtype), interpret)(
-        rank.reshape(1).astype(jnp.int32), p0, lg, w1, w2p
+        rank.reshape(1).astype(jnp.int32),
+        start.reshape(1).astype(jnp.int32),
+        p0,
+        lg,
+        w1,
+        w2p,
     )
     return jnp.transpose(out)[:rows]

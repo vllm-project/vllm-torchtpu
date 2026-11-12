@@ -326,3 +326,69 @@ def test_draft_aux_is_dropped_without_the_confidence_head():
         torch.ones(8, 4), 0, SimpleNamespace(start_index=0, num_reqs=8)
     )
     assert p.take_draft_confidences() is None
+
+
+class _FakeShardDraft(_FakeDraft):
+    """A vocab-parallel draft with the fused Markov kernel interface."""
+
+    def __init__(self, vocab=16):
+        super().__init__(vocab)
+        self.fused_calls = []
+        self.enable_calls = []
+
+    def enable_vocab_parallel_markov_argmax(self):
+        return True
+
+    def enable_fused_markov(self, k):
+        self.enable_calls.append(k)
+        return True
+
+    def compute_draft_logits_shard(self, hidden):
+        return self.compute_draft_logits(hidden).to(torch.bfloat16)
+
+    def markov_draft_fused(self, logits_3d, prev):
+        self.fused_calls.append((logits_3d.shape, prev.tolist()))
+        return torch.full((logits_3d.shape[0], logits_3d.shape[1]), 11, dtype=torch.int64)
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_fused_markov_arms_only_under_the_flag(monkeypatch, flag):
+    p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
+    draft = _FakeShardDraft()
+
+    def fake_load(self, target_model):
+        self.draft_model = draft
+        self._draft_replicated = False
+
+    monkeypatch.setattr(DFlashProposer, "load_model", fake_load)
+    monkeypatch.setattr(
+        "vllm_torchtpu.spec_decode.dspark.envs.TPU_DSPARK_MARKOV_KERNEL", flag
+    )
+    p.load_model(None)
+    assert p._vocab_parallel_markov
+    assert p._fused_markov is flag
+    assert draft.enable_calls == ([p.block_size] if flag else [])
+
+
+def test_fused_markov_replaces_the_chain():
+    p = _make_proposer(
+        {"dspark_noise_token_id": 7, **_LAYER_IDS},
+        num_speculative_tokens=3,
+    )
+    p.draft_model = _FakeShardDraft()
+    p._vocab_parallel_markov = True
+    p._fused_markov = True
+    forward = DSparkProposer._dflash_forward_and_sample.__wrapped__
+    input_ids = torch.tensor([5, 7, 7, 9, 7, 7])
+    positions = torch.zeros(6, dtype=torch.int32)
+    drafts, hidden = forward(p, input_ids, positions, 3)
+    assert drafts.tolist() == [[11, 11, 11], [11, 11, 11]]
+    # [rows, k, vocab shard] logits and the anchors seed the chain.
+    assert p.draft_model.fused_calls == [(torch.Size([2, 3, 16]), [5, 9])]
+    assert hidden.shape == (6, 2)
+    # The confidence head needs the per-step embeddings: the loop runs.
+    p.use_confidence_head = True
+    p.draft_model.markov_argmax_shard = lambda lg, e: (lg.float()).argmax(-1)
+    drafts, _ = forward(p, input_ids, positions, 3)
+    assert drafts.tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert len(p.draft_model.fused_calls) == 1

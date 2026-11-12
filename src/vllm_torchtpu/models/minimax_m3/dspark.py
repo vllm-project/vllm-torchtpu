@@ -345,6 +345,8 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         self.register_buffer("markov_w2_shard", None, persistent=False)
         self.register_buffer("vocab_shard_start", None, persistent=False)
         self.register_buffer("vocab_shard_pad_mask", None, persistent=False)
+        # The armed fused Markov kernel (TPU_DSPARK_MARKOV_KERNEL), or None.
+        self._fused_markov = None
 
     def _vocab_parallel_markov_blocker(self) -> str | None:
         """Why the shard argmax cannot reproduce the gathered argmax, or None."""
@@ -417,6 +419,45 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
             self.lm_head.num_embeddings_per_partition,
         )
         return True
+
+    def enable_fused_markov(self, k: int) -> bool:
+        """DSparkProposer opt-in (TPU_DSPARK_MARKOV_KERNEL), after the shard
+        path is on: arm one Pallas call for the K-step greedy chain. Collective
+        over the TP group. Returns False when the kernel's arithmetic (bf16
+        bias and scores, no pad columns inside the shard, ids = draft ids)
+        would not be this head's."""
+        blocker = None
+        if self.markov_w2_shard is None:
+            blocker = "the vocab-parallel Markov shard is off"
+        elif self.vocab_shard_pad_mask is not None:
+            blocker = "the LM head shard has pad columns"
+        elif self._markov_cast_dtype is not None:
+            blocker = "the logits processor casts to a head dtype"
+        elif self.draft_id_to_target_id is not None:
+            blocker = "draft ids are remapped to target ids"
+        elif self.markov_w2_shard.dtype != torch.bfloat16:
+            blocker = f"the Markov head is {self.markov_w2_shard.dtype}"
+        if blocker is not None:
+            logger.info("TPU_DSPARK_MARKOV_KERNEL=1 not armed: %s.", blocker)
+            return False
+        from vllm_torchtpu.spec_decode import markov_kernel_op
+
+        self._fused_markov = markov_kernel_op.arm(
+            self.model.markov_head.markov_w1.weight,
+            self.markov_w2_shard,
+            vs=self.lm_head.num_embeddings_per_partition,
+            vocab_start=int(self.vocab_shard_start),
+            k=k,
+        )
+        return self._fused_markov is not None
+
+    def markov_draft_fused(
+        self, logits_3d: torch.Tensor, prev: torch.Tensor
+    ) -> torch.Tensor:
+        """``[rows, k]`` greedy drafts from the ``[rows, k, vs]`` logits shard
+        and each row's anchor id, equal to k steps of markov_argmax_shard."""
+        assert self._fused_markov is not None
+        return self._fused_markov.draft(logits_3d, prev)
 
     def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's vocab shard of ``compute_draft_logits`` (pad columns

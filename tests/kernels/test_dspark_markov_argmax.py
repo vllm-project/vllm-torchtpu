@@ -70,19 +70,22 @@ def _inputs(rows, vs, seed, tie_heavy):
     return lg, w1, w2, p0
 
 
-def _run(lg, w1, w2, p0, vs):
+def _run(lg, w1, w2, p0, vs, perm=tuple(range(N))):
+    """Mesh position d holds vocab shard perm[d]."""
+    perm = np.asarray(perm)
     devs = jax.devices()
     if len(devs) < N:
         pytest.skip("needs 8 (simulated) devices")
     mesh = Mesh(np.array(devs[:N]), ("x",))
     vp = mk.padded_vocab(vs)
-    w2r = jnp.asarray(w2, jnp.bfloat16).reshape(N, vs, RD)
+    w2r = jnp.asarray(w2, jnp.bfloat16).reshape(N, vs, RD)[perm]
+    lg = lg[perm]
     # Pad rows hold large values: only the kernel's column mask may hide them.
     w2p = jnp.pad(w2r, ((0, 0), (0, vp - vs), (0, 0)), constant_values=8.0)
 
-    def body(lg, p0, w1, w2p, rank):
+    def body(lg, p0, w1, w2p, rank, start):
         return mk.markov_argmax(
-            lg[0], p0[0], w1, w2p[0], rank[0], N, vs,
+            lg[0], p0[0], w1, w2p[0], rank[0], start[0], N, vs,
             interpret=pltpu.InterpretParams(),
         )[None]
 
@@ -90,7 +93,7 @@ def _run(lg, w1, w2, p0, vs):
         jax.shard_map(
             body,
             mesh=mesh,
-            in_specs=(P("x"), P("x"), P(), P("x"), P("x")),
+            in_specs=(P("x"), P("x"), P(), P("x"), P("x"), P("x")),
             out_specs=P("x"),
             check_vma=False,
         )
@@ -106,6 +109,7 @@ def _run(lg, w1, w2, p0, vs):
         put(jnp.asarray(w1, jnp.bfloat16), P()),
         put(w2p, P("x")),
         put(jnp.arange(N, dtype=jnp.int32).reshape(N, 1), P("x")),
+        put(jnp.asarray(perm * vs, jnp.int32).reshape(N, 1), P("x")),
     )
     out = np.asarray(out)
     assert out.shape == (N, rows, K)
@@ -138,6 +142,18 @@ def test_markov_argmax_ties_go_to_the_lowest_id():
     lg[5, :, :, 2] = 5.0
     lg[3, :, :, 3500] = 5.0
     lg[3, :, :, 3700] = 5.0
-    out = _run(lg, w1, w2, p0, vs)
+    # Shards in a mesh order other than vocab order: ties still go by id.
+    out = _run(lg, w1, w2, p0, vs, perm=(5, 2, 7, 3, 0, 6, 1, 4))
     np.testing.assert_array_equal(out[0], np.full((rows, K), 3 * vs + 3500))
     np.testing.assert_array_equal(out[0], _reference(lg, w1, w2, p0, vs))
+
+
+def test_arm_selftest_expectation_matches_kernel():
+    """The load-time self-test's numpy answer is the kernel's."""
+    from vllm_torchtpu.spec_decode.markov_kernel_op import selftest_inputs
+
+    vs = 4000
+    lg, w1, w2, p0, expected = selftest_inputs(N, vs, N * vs, RD, K)
+    out = _run(lg, w1, w2, p0, vs)
+    np.testing.assert_array_equal(out[0], expected)
+    np.testing.assert_array_equal(expected, _reference(lg, w1, w2, p0, vs))
