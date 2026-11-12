@@ -64,12 +64,20 @@ _NEG_INF = float("-inf")
 
 
 def _token_layout(seq_lens: jax.Array, cu_q_lens: jax.Array, num_tokens: int):
-    """Per token: (sequence, global position, is-real)."""
+    """Per token: (sequence, global position, is-real); padding tokens get
+    sequence 0 and position 0.
+
+    Sums over a ``[sequences, tokens]`` membership mask (sequences on
+    sublanes): a search plus gathers of per-sequence values by token cost
+    ~50 us per 512 tokens and ~160 us per 8K on tpu7x."""
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq = jnp.searchsorted(cu_q_lens[1:], tok, side="right", method="compare_all")
-    seq = jnp.minimum(seq.astype(jnp.int32), seq_lens.shape[0] - 1)
-    q_len = cu_q_lens[seq + 1] - cu_q_lens[seq]
-    pos = seq_lens[seq] - q_len + (tok - cu_q_lens[seq])
+    starts, ends = cu_q_lens[:-1, None], cu_q_lens[1:, None]
+    inside = (starts <= tok[None, :]) & (tok[None, :] < ends)
+    index = jnp.arange(seq_lens.shape[0], dtype=jnp.int32)[:, None]
+    seq = jnp.sum(jnp.where(inside, index, 0), axis=0)
+    # A token's position: its index past its sequence's end, from the length.
+    shift = (seq_lens - cu_q_lens[1:])[:, None]
+    pos = tok + jnp.sum(jnp.where(inside, shift, 0), axis=0)
     valid = tok < cu_q_lens[-1]
     return seq, jnp.where(valid, pos, 0), valid
 

@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.layers.adapter.cp_draft_attention import (
+    _token_layout,
     write_pairs,
     write_runs,
     write_runs_batched,
@@ -100,3 +101,24 @@ def test_write_pairs_matches_half_word_scatter():
     got, expected = np.asarray(got, np.float32), np.asarray(expected, np.float32)
     np.testing.assert_array_equal(got[keep], expected[keep])
     assert np.isfinite(got).all()
+
+
+def test_token_layout_matches_search():
+    """Each real token's sequence and position equal a search of the query
+    starts (empty and trailing padding requests included)."""
+    q_lens = np.asarray([3, 0, 1, 7, 0, 2, 0, 0])
+    seq_lens = np.asarray([10, 4, 1, 300, 0, 9, 0, 0])
+    cu = np.concatenate([[0], np.cumsum(q_lens)])
+    num_tokens = 16
+    seq, pos, valid = _token_layout(
+        jnp.asarray(seq_lens, jnp.int32), jnp.asarray(cu, jnp.int32), num_tokens
+    )
+    tok = np.arange(num_tokens)
+    want_seq = np.searchsorted(cu[1:], tok, side="right")
+    real = tok < cu[-1]
+    np.testing.assert_array_equal(np.asarray(valid), real)
+    np.testing.assert_array_equal(np.asarray(seq)[real], want_seq[real])
+    s = want_seq[real]
+    want_pos = seq_lens[s] - q_lens[s] + tok[real] - cu[s]
+    np.testing.assert_array_equal(np.asarray(pos)[real], want_pos)
+    np.testing.assert_array_equal(np.asarray(pos)[~real], 0)
