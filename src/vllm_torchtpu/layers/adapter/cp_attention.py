@@ -308,6 +308,7 @@ def forward_with_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF,
     tuned_tiles: bool = False,
     skip_empty_mixed: bool = False,
 ) -> torch.Tensor:
@@ -341,6 +342,7 @@ def forward_with_dcp(
         cp_rank=dcp_rank,
         kv_layout=kv_layout,
         decode_query_size=decode_query_size,
+        attention_modes=attention_modes,
         tuned_tiles=tuned_tiles,
         skip_empty_mixed=skip_empty_mixed,
     )
