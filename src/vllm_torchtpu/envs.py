@@ -195,6 +195,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK: int = 0
     VLLM_TPU_QSA_PREFILL_INDEXER_SMALL_CHUNK: int = 0
+    VLLM_TPU_SORTED_SEARCH_MASK: bool = False
     VLLM_TPU_QSA_PREFILL_INDEXER_BQ: int = 128
     VLLM_TPU_QSA_PREFILL_INDEXER_BKV: int = 256
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
@@ -924,6 +925,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_INDEXER_SMALL_CHUNK": env_nonnegative_int(
         "VLLM_TPU_QSA_PREFILL_INDEXER_SMALL_CHUNK", 0
     ),
+    # QSA prefill token -> request maps (kernels/sorted_search.py): replace the
+    # jnp.searchsorted while loop over the request boundaries with an exact
+    # compare-and-sum. Same int32 result for sorted integer boundaries.
+    "VLLM_TPU_SORTED_SEARCH_MASK": env_bool("VLLM_TPU_SORTED_SEARCH_MASK"),
     # Qwen4-exp ragged prefill indexer tiles: queries per block of the prefill
     # passes and compressed keys per KV block (a multiple of 256). Defaults
     # 128 / 256 are the served tiles. Each score keeps its own expression, so

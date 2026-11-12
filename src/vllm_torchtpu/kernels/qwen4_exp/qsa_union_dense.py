@@ -28,6 +28,8 @@ import math
 
 import jax
 import jax.numpy as jnp
+
+from vllm_torchtpu.kernels import sorted_search
 import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
@@ -2139,7 +2141,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
             layout = query, walk_blocks, walk_lengths, table
             back = None
         else:
-            req = jnp.searchsorted(starts[1:], jnp.arange(tokens), side="right")
+            req = sorted_search.searchsorted(starts[1:], jnp.arange(tokens), side="right")
             req = jnp.minimum(req, len(real) - 1)
             positions = jnp.arange(tokens) - starts[req]
             valid = jnp.arange(tokens) < starts[-1]
@@ -2386,7 +2388,7 @@ def compact_plan(aligned_lengths, aligned_table, bounds, *, group, reqs, tokens_
     ``bounds`` int32[R + 1]: request starts in the layout's rows.
     """
     rows, width = aligned_table.shape
-    row_req = jnp.searchsorted(bounds[1:], jnp.arange(rows), side="right").astype(jnp.int32)
+    row_req = sorted_search.searchsorted(bounds[1:], jnp.arange(rows), side="right").astype(jnp.int32)
     group_req = row_req.reshape(-1, group)[:, 0]
     group_live = jnp.any((aligned_lengths > 0).reshape(-1, group), axis=1)
     fits = jnp.all(~group_live | (group_req < reqs))
@@ -2639,15 +2641,15 @@ def _lazy_served(query, blocks, lengths, table, starts, offsets, real, bits, lay
     s_spare = min(s_bucket + bsp.SPARE_QUERY_BLOCKS * served_qb, s_worst)
     ngroups_g = layout_rows // group
     row0 = jnp.arange(ngroups_g, dtype=jnp.int32) * group
-    g_req = jnp.minimum(jnp.searchsorted(offsets[1:], row0, side="right"), nreq - 1)
+    g_req = jnp.minimum(sorted_search.searchsorted(offsets[1:], row0, side="right"), nreq - 1)
     g_local = (row0 - offsets[g_req]) // group
     g_live = row0 < offsets[-1]
     t = jnp.arange(layout_rows, dtype=jnp.int32)
-    t_req = jnp.minimum(jnp.searchsorted(offsets[1:], t, side="right"), nreq - 1)
+    t_req = jnp.minimum(sorted_search.searchsorted(offsets[1:], t, side="right"), nreq - 1)
     t_pos = t - offsets[t_req]
     t_live = (t < offsets[-1]) & (t_pos < real[t_req])
     o = jnp.arange(tokens)
-    o_req = jnp.minimum(jnp.searchsorted(starts[1:], o, side="right"), nreq - 1)
+    o_req = jnp.minimum(sorted_search.searchsorted(starts[1:], o, side="right"), nreq - 1)
     o_live = o < starts[-1]
 
     def run(size):
