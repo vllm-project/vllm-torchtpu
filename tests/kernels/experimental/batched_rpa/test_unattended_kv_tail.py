@@ -35,6 +35,8 @@ from jax._src import test_util as jtu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
+pytestmark = pytest.mark.tpu_test
+
 _PAGE_SIZE = 128
 _NUM_KV_HEADS = 2
 _NUM_Q_HEADS = 8
