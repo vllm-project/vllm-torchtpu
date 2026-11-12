@@ -424,7 +424,9 @@ def _spec_row_gather_op():
     rows, 54 -> 9 us at 48 (exos microbench, same values)."""
     from torch_tpu._internal import pallas
 
-    def _gather(logits, bonus_idx, target_idx):
+    def _gather(
+        logits: jax.Array, bonus_idx: jax.Array, target_idx: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         return logits[bonus_idx], logits[target_idx]
 
     op = pallas.jax_op("pallas::spec_row_gather_in_bounds", _gather)
