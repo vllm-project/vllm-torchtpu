@@ -4861,7 +4861,7 @@ class TPUModelRunner(GPUModelRunner):
                 # temperature scaling) for the top-k logprobs. We can't enforce it
                 # due to recompilations outside torch.compiled code, so just make
                 # sure `sample_from_logits` does not modify the logits in-place.
-                logprobs = (
+                chunk_logprobs = (
                     self.gather_logprobs(logits, selected_token_ids)
                     if needs_logprobs
                     else None
@@ -4879,8 +4879,8 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     next_tokens_tpu_offset += selected_token_ids.shape[0]
                 if needs_logprobs:
-                    assert logprobs is not None
-                    deferred_plain_logprobs.append((logprobs, num_reqs))
+                    assert chunk_logprobs is not None
+                    deferred_plain_logprobs.append((chunk_logprobs, num_reqs))
 
                 self._update_num_xla_graphs("decoding_step")
                 cur_start_idx = cur_end_idx
@@ -4889,9 +4889,6 @@ class TPUModelRunner(GPUModelRunner):
         # Those copies are blocking. Once they become async., kv_save
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
-        # The step's logprobs are filled in AsyncTPUModelRunnerOutput.get_output
-        # from the copy state (non-spec: plain_logprobs; spec: spec_logprobs).
-        logprobs = []
 
         discard_sampled_tokens_req_indices = []
         num_reqs = self.input_batch.num_reqs
@@ -5178,7 +5175,7 @@ class TPUModelRunner(GPUModelRunner):
                 # Snapshot of the req_id_to_index for the VLLM scheduler.
                 req_id_to_index=dict(self.input_batch.req_id_to_index),
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
-                logprobs=logprobs,
+                logprobs=None,  # Filled in AsyncTPUModelRunnerOutput get_output
                 prompt_logprobs_dict={req_id: None for req_id in req_ids},
                 pooler_output=pooler_output,
                 kv_connector_output=kv_connector_output,
