@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
@@ -365,6 +366,35 @@ def stage_h2d_upload(runner: Any, host: torch.Tensor) -> torch.Tensor:
         release_cb = _noop_release
     runner._unfenced_h2d_sources.append((host, release_cb))
     return host.to(runner.device, non_blocking=True)
+
+
+def _upload_block_tables_if_changed(runner: Any, host: torch.Tensor) -> torch.Tensor:
+    """Upload `host` unless it equals the previous upload; then reuse that.
+
+    Staged rows change only at page boundaries or when requests join, finish,
+    are preempted, or are reordered, so consecutive decode steps often stage
+    the same rows. Comparing contents covers every cause of change. Each
+    upload makes a new device tensor, so reusing the previous one cannot
+    alter an execution that is still reading it. A skipped `host` buffer
+    goes straight back to the free list since no transfer reads it.
+    """
+    last_host = getattr(runner, "_last_block_table_host", None)
+    last_device = getattr(runner, "_last_block_table_device", None)
+    if (
+        last_host is not None
+        and last_device is not None
+        and last_host.shape == host.shape
+        and torch.equal(last_host, host)
+    ):
+        if id(host) in runner._registered_h2d_sources:
+            runner._free_h2d_sources.setdefault((host.numel(), host.dtype), []).append(
+                host
+            )
+        return last_device
+    device = stage_h2d_upload(runner, host)
+    runner._last_block_table_host = host.clone()
+    runner._last_block_table_device = device
+    return device
 
 
 def zeros_h2d_source(
@@ -721,7 +751,10 @@ def stage_block_table_uploads(
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed buffer: same staged layout, null blocks.
 
-    staged_dev = stage_h2d_upload(runner, flat)
+    if envs.TPU_SKIP_BLOCK_TABLE_UPLOAD:
+        staged_dev = _upload_block_tables_if_changed(runner, flat)
+    else:
+        staged_dev = stage_h2d_upload(runner, flat)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
