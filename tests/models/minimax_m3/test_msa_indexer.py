@@ -273,3 +273,57 @@ def test_int4_fp8_keys_match_bf16_keys(monkeypatch, folded_tile_q):
         live = -(-seq_lens[r] // PAGE)
         rows = slice(cu_q[r], cu_q[r + 1])
         np.testing.assert_array_equal(out[True][rows, :live], out[False][rows, :live])
+
+
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
+def test_large_class_pages_per_step_same_scores(dtype):
+    """Key minimax_indexer_large_pages_per_step widens the large (prefill)
+    class's grid step only: the scores stay bit-identical."""
+    rng = np.random.default_rng(7)
+    q_lens, ctx_lens = [1, 130, 3], [300, 200, 0]
+    num_seqs = len(q_lens)
+    num_real = sum(q_lens)
+    num_tokens = num_real + 5
+    seq_lens = np.zeros(MAX_SEQS, np.int32)
+    seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
+    cu_q = np.full(MAX_SEQS + 1, num_real, np.int32)
+    cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
+    tables = np.zeros((MAX_SEQS, PAGES_PER_SEQ), np.int32)
+    tables[:num_seqs] = rng.permutation(np.arange(1, NUM_PAGES))[
+        : num_seqs * PAGES_PER_SEQ
+    ].reshape(num_seqs, PAGES_PER_SEQ)
+    keys = rounded(rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM)), dtype)
+    cache = pack(keys, dtype)
+    index_q = jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
+
+    def scores(pages_per_step):
+        return np.asarray(
+            block_scores(
+                index_q,
+                cache,
+                jnp.asarray(seq_lens),
+                jnp.asarray(tables.reshape(-1)),
+                jnp.asarray(cu_q),
+                jnp.int32(num_seqs),
+                block_q=64,
+                large_block_q=48,
+                pages_per_step=pages_per_step,
+                small_pages_per_step=2,
+                interpret=True,
+            )
+        )
+
+    def live(s):
+        # Only the rows' own pages are defined (as in `test_matches_reference`).
+        return [
+            s[t, 0, : -(-seq_lens[r] // PAGE)].view(np.int32)
+            for r in range(num_seqs)
+            for t in range(cu_q[r], cu_q[r + 1])
+        ]
+
+    want = live(scores(2))
+    for pages_per_step in (4, 8):
+        for a, b in zip(want, live(scores(pages_per_step)), strict=True):
+            np.testing.assert_array_equal(a, b)

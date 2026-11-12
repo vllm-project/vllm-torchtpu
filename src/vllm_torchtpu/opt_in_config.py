@@ -20,7 +20,7 @@ so programs built with a key on and off never share a cache entry.
 
 from typing import Any
 
-DEFAULTS: dict[str, bool | int] = {
+DEFAULTS: dict[str, bool | int | str] = {
     # MiniMax M3: steps of at least this many tokens run every layer on the
     # step's two token halves, so one half's residual all-reduces overlap the
     # other half's attention and FFN. 0 = off.
@@ -79,10 +79,14 @@ DEFAULTS: dict[str, bool | int] = {
     # programs serving's partial prefill chunks reach are compiled before
     # serving (longer warm-up).
     "spec_warmup_sweep_token_buckets": False,
+    # MiniMax M3 indexer: pages per grid step of the large (prefill) tile
+    # class, a positive multiple of 32 (0 = the default 32). Wider steps
+    # amortize the per-step cost over more pages; same scores.
+    "minimax_indexer_large_pages_per_step": 0,
 }
 
 
-def option(additional_config: Any, key: str) -> bool | int:
+def option(additional_config: Any, key: str) -> bool | int | str:
     """`additional_config[key]`, or the key's default when unset."""
     default = DEFAULTS[key]
     if not isinstance(additional_config, dict) or key not in additional_config:

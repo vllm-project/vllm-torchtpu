@@ -28,7 +28,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_dcp,
     msa_indexer,
 )
-from vllm_torchtpu.opt_in_config import option
+from vllm_torchtpu.opt_in_config import DEFAULTS, option
 
 logger = init_logger(__name__)
 
@@ -53,9 +53,42 @@ def _set(additional_config: Any, key: str, module, attr: str) -> None:
         logger.info("MiniMax-M3 MSA kernel variant on: additional_config.%s", key)
 
 
+def _set_value(additional_config: Any, key: str, module, attr: str, value) -> None:
+    """Set a value-bearing key's resolved value; logs it once when not the
+    default."""
+    setattr(module, attr, value)
+    if option(additional_config, key) != DEFAULTS[key] and key not in _logged:
+        _logged.add(key)
+        logger.info(
+            "MiniMax-M3 MSA kernel variant on: additional_config.%s=%r (%s.%s=%r)",
+            key,
+            option(additional_config, key),
+            module.__name__.rsplit(".", 1)[-1],
+            attr,
+            value,
+        )
+
+
+def _large_pages_per_step(additional_config: Any) -> int:
+    key = "minimax_indexer_large_pages_per_step"
+    value = option(additional_config, key) or msa_indexer.DEFAULT_PAGES_PER_STEP
+    if value <= 0 or value % 32:
+        raise ValueError(
+            f"additional_config.{key} must be a positive multiple of 32, got {value}"
+        )
+    return value
+
+
 def apply(additional_config: Any) -> None:
     for key, module, attr in TOGGLES:
         _set(additional_config, key, module, attr)
+    _set_value(
+        additional_config,
+        "minimax_indexer_large_pages_per_step",
+        msa_indexer,
+        "LARGE_PAGES_PER_STEP",
+        _large_pages_per_step(additional_config),
+    )
     # The DCP op factory (`ops.msa`) reads this one when it builds the op.
     from vllm_torchtpu.models.minimax_m3.ops import msa as msa_ops
 

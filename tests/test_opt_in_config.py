@@ -43,6 +43,12 @@ REPLACED_ENV = {
     "moe_gmm_fp8_decode_tiles": "TPU_GMM_FP8_DECODE_TILES",
     "spec_synthetic_one_row_verify": "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY",
     "spec_warmup_sweep_token_buckets": "TPU_SPEC_WARMUP_SWEEP_TOKEN_BUCKETS",
+    "minimax_indexer_large_pages_per_step": "TPU_MINIMAX_M3_INDEXER_LARGE_PAGES_PER_STEP",
+}
+# Served values of the value-bearing keys (the rest are booleans).
+SAMPLE = {
+    "minimax_split_min_tokens": 4096,
+    "minimax_indexer_large_pages_per_step": 64,
 }
 # Dropped with no key: hid the offload connector from draft forwards, which
 # v3's skip_draft_kv unbinding already covers in every served config.
@@ -59,16 +65,17 @@ def test_every_key_replaces_an_env_var():
 
 @pytest.mark.parametrize("key", sorted(DEFAULTS))
 def test_defaults_match_the_old_env_defaults(key):
-    want = {"minimax_split_min_tokens": 0, "minimax_split_attention_first": True}
-    assert option(None, key) == want.get(key, False)
-    assert option({}, key) == want.get(key, False)
-    assert option({"other": 1}, key) == want.get(key, False)
+    want = {"minimax_split_attention_first": True}
+    for config in (None, {}, {"other": 1}):
+        assert option(config, key) == DEFAULTS[key]
+    # Every key but this one is off by default (False, 0 or "").
+    assert DEFAULTS[key] == want.get(key, type(DEFAULTS[key])())
 
 
 @pytest.mark.parametrize("key", sorted(DEFAULTS))
 def test_values_round_trip_through_json(key):
-    """`--additional-config` is parsed JSON: true/false and ints."""
-    value = 4096 if key == "minimax_split_min_tokens" else not DEFAULTS[key]
+    """`--additional-config` is parsed JSON: true/false, ints and strings."""
+    value = SAMPLE.get(key, not DEFAULTS[key])
     config = json.loads(json.dumps({key: value}))
     assert option(config, key) == value
 
@@ -88,6 +95,23 @@ def _toggles():
         *kernel_toggles.TOGGLES,
         ("minimax_dcp_heads_attend", msa_ops, "DCP_HEADS_ATTEND"),
     ]
+
+
+def test_indexer_large_pages_per_step_key():
+    from vllm_torchtpu.models.minimax_m3 import kernel_toggles
+    from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_indexer
+
+    key = "minimax_indexer_large_pages_per_step"
+    try:
+        kernel_toggles.apply({key: 64})
+        assert msa_indexer.LARGE_PAGES_PER_STEP == 64
+        assert msa.block_score_options(1)["pages_per_step"] == 64
+        for bad in (-32, 48):
+            with pytest.raises(ValueError, match=key):
+                kernel_toggles.apply({key: bad})
+    finally:
+        kernel_toggles.apply({})
+    assert msa_indexer.LARGE_PAGES_PER_STEP == msa_indexer.DEFAULT_PAGES_PER_STEP == 32
 
 
 def test_kernel_toggles_set_the_module_flags_their_env_vars_set():

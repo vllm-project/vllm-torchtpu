@@ -46,9 +46,15 @@ from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
 DEFAULT_BLOCK_Q = 128
 DEFAULT_LARGE_BLOCK_Q = 512
 DEFAULT_PAGES_PER_STEP = 32
+# Pages per grid step the MSA forward gives the large (prefill) class
+# (`msa.block_score_options`): a positive multiple of 32. Wider steps amortize
+# the per-step cost over more pages; the scores are bit-identical (each page
+# maximum is one dot, whatever the grid). Set from key
+# minimax_indexer_large_pages_per_step by the attention layer.
+LARGE_PAGES_PER_STEP = DEFAULT_PAGES_PER_STEP
 # The block_q class (decode, MTP verify) runs the v3 DMA ring; 128 pages per
 # step keep more bytes in flight (j-dba77583: 32 req x 8 tokens at 128K,
-# 1.95 -> 1.66 ms). The large prefill class keeps 32.
+# 1.95 -> 1.66 ms). The large prefill class keeps LARGE_PAGES_PER_STEP.
 DEFAULT_SMALL_PAGES_PER_STEP = 128
 DEFAULT_KERNEL = "v3"
 # Rows per token-major query tile of the block_q class (see `block_scores`).

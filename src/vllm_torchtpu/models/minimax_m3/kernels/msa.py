@@ -325,7 +325,7 @@ def block_score_options(index_heads: int = 1) -> dict[str, int]:
     return dict(
         block_q=msa_indexer.DEFAULT_BLOCK_Q,
         large_block_q=msa_indexer.DEFAULT_LARGE_BLOCK_Q,
-        pages_per_step=msa_indexer.DEFAULT_PAGES_PER_STEP,
+        pages_per_step=msa_indexer.LARGE_PAGES_PER_STEP,
         small_pages_per_step=msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
         folded_tile_q=min(_DECODE_ROWS * index_heads, msa_indexer.DEFAULT_BLOCK_Q),
     )
