@@ -777,11 +777,12 @@ def fused_moe_func(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
     dispatch_token: bool = False,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
+) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
-    With ``dispatch_token`` it also returns DISPATCH_TOKEN_SHAPE bf16 values
-    of the dispatched tokens: they exist once the dispatch is done, so a
+    With ``dispatch_token`` (see `fused_moe_func_with_dispatch_token`, whose
+    annotation says so) it also returns DISPATCH_TOKEN_SHAPE bf16 values of
+    the dispatched tokens: they exist once the dispatch is done, so a
     collective made to wait on them starts after the dispatch (the caller
     orders SparseCore work with it).
 
@@ -928,3 +929,46 @@ def fused_moe_func(
     if dispatch_token:
         return out, token
     return out
+
+
+def fused_moe_func_with_dispatch_token(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array | None = None,
+    topk: int = 1,
+    activation: str = "silu",
+    use_ep: bool = False,
+    use_sparse_core: bool = True,
+    onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """`fused_moe_func` and its dispatch token (torch_tpu reads the output
+    count from this annotation)."""
+    return fused_moe_func(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+        experts_start,
+        topk=topk,
+        activation=activation,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+        dispatch_token=True,
+    )

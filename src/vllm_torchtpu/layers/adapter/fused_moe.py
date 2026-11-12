@@ -25,6 +25,7 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     DISPATCH_TOKEN_SHAPE,
     fused_moe_func,
+    fused_moe_func_with_dispatch_token,
     quantize_to_native_fp4_kmajor,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
@@ -196,7 +197,7 @@ def _build_fused_moe_custom_op(
     # rank compiles an identical program.
     # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
     wrapped_fn = functools.partial(
-        fused_moe_func,
+        fused_moe_func_with_dispatch_token if dispatch_token else fused_moe_func,
         topk=topk,
         activation=activation,
         use_ep=use_ep,
@@ -204,7 +205,6 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
-        dispatch_token=dispatch_token,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -260,7 +260,6 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
-        dispatch_token=dispatch_token,
     )
 
 
