@@ -50,6 +50,8 @@ from vllm_torchtpu.megakernel.core.profile import DEFAULT_PROFILE, Profile
 from vllm_torchtpu.megakernel.core.runtime import (
     BucketPolicy,
     JaxStepMetaOps,
+    SentinelVariantPlan,
+    WarmupStepPlan,
     align_cache_exec,
     bucket_exec_spec,
     build_warmup_plan,
@@ -945,8 +947,7 @@ def test_second_framework_plain_jax_adapter_on_synthetic_model_def(
     # 3. Warmup plan + sentinel check via `make_pooled_step` + `pack_step_meta`
     warmup_steps, warmed_bkts, n_save = build_warmup_plan(
         ms,
-        pol.buckets,
-        pol.verify_buckets,
+        tuple(pol.iter_buckets()),
         {(1, 2): False},
         {(1, 2): False},
         num_pages=num_pages,
@@ -1256,7 +1257,7 @@ def test_no_kw_rejects_legacy_and_unknown_kwargs():
         )
     with pytest.raises(TypeError, match="unexpected keyword argument"):
         build_warmup_plan(  # type: ignore[call-arg]
-            ms, (4,), (), {}, {}, num_pages=64, max_pages_per_seq=2, unknown=1
+            ms, ((1, 4),), {}, {}, num_pages=64, max_pages_per_seq=2, unknown=1
         )
     with pytest.raises(TypeError, match="unexpected keyword argument"):
         verify_sentinel_step(  # type: ignore[call-arg]
@@ -1270,3 +1271,88 @@ def test_no_kw_rejects_legacy_and_unknown_kwargs():
             variant_key=(1, False, False),
             unknown=1,
         )
+
+    # `build_warmup_plan` takes `(T, B)` `bucket_keys` directly: default keys
+    # match the pre-generalization `WarmupStepPlan` list byte-for-byte, and
+    # `T=8` verify keys produce plans for `(8, b)` with `spv = spp * 8`.
+    pol_def = BucketPolicy((8, 16), (16, 32))
+    default_keys = list(pol_def.iter_buckets())
+    fio_def = {(1, 8): True, (1, 16): False, (4, 16): True, (4, 32): False}
+    gpr_def = {(1, 8): False, (1, 16): True, (4, 16): False, (4, 32): False}
+    steps_def, warmed_def, n_save_def = build_warmup_plan(
+        ms,
+        default_keys,
+        fio_def,
+        gpr_def,
+        num_pages=256,
+        max_pages_per_seq=4,
+        ckpt_window=4,
+        runner_tok_pads=(16, 32),
+        req_block_pairs=((8, 4), (16, 4)),
+        is_eager=False,
+    )
+    expected_default_steps = [
+        WarmupStepPlan(
+            1, 8, 16, 8, 4, 4, SentinelVariantPlan((1, True, False), 1, 3, 15, 1, True)
+        ),
+        WarmupStepPlan(1, 8, 16, 16, 4, 4, None),
+        WarmupStepPlan(
+            1,
+            16,
+            16,
+            8,
+            4,
+            4,
+            SentinelVariantPlan((1, False, True), 2, 15, 75, 1, True),
+        ),
+        WarmupStepPlan(1, 16, 16, 16, 4, 4, None),
+        WarmupStepPlan(
+            4,
+            16,
+            16,
+            8,
+            4,
+            4,
+            SentinelVariantPlan((4, True, False), 3, 27, 135, 4, True),
+        ),
+        WarmupStepPlan(4, 16, 16, 16, 4, 4, None),
+        WarmupStepPlan(
+            4,
+            32,
+            32,
+            8,
+            4,
+            4,
+            SentinelVariantPlan((4, False, False), 4, 39, 195, 4, True),
+        ),
+        WarmupStepPlan(4, 32, 32, 16, 4, 4, None),
+    ]
+    assert steps_def == expected_default_steps
+    assert repr(steps_def) == repr(expected_default_steps)
+    assert warmed_def == default_keys and n_save_def == 255
+
+    keys_t8 = [(1, 8), (8, 16), (8, 32)]
+    fio_t8 = {(1, 8): True, (8, 16): True, (8, 32): False}
+    gpr_t8 = {(1, 8): False, (8, 16): False, (8, 32): False}
+    steps_t8, warmed_t8, n_save_t8 = build_warmup_plan(
+        ms,
+        keys_t8,
+        fio_t8,
+        gpr_t8,
+        num_pages=512,
+        max_pages_per_seq=4,
+        ckpt_window=4,
+        is_eager=False,
+    )
+    assert warmed_t8 == keys_t8
+    assert [(s.tokens_per_seq, s.bucket_t, s.req_pad, s.c_cols) for s in steps_t8] == [
+        (1, 8, 8, 4),
+        (8, 16, 2, 8),
+        (8, 32, 4, 8),
+    ]
+    assert [s.sentinel for s in steps_t8] == [
+        SentinelVariantPlan((1, True, False), 1, 3, 15, 1, True),
+        SentinelVariantPlan((8, True, False), 2, 27, 135, 8, True),
+        SentinelVariantPlan((8, False, False), 3, 51, 255, 8, True),
+    ]
+    assert n_save_t8 == 375

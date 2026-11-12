@@ -798,8 +798,7 @@ class Qwen35Program:
         )
         warmup_steps, warmed_buckets, n_save = mk_rt.build_warmup_plan(
             self.spec,
-            self.decode_buckets,
-            self.verify_buckets,
+            self._expected_buckets,
             self._bucket_fused_io,
             self._bucket_gpr,
             **w_kw,
@@ -1044,7 +1043,7 @@ class Qwen35Program:
             bs = fwd.batch_shape(attn_md, m_mds[0])
             # The batch shape reports any uniform step size; serve only the
             # decode / verify sizes this program compiles (else decode).
-            served = bs.tokens_per_req in (1, mk_rt.MTP_VERIFY_TOKENS)
+            served = any(t == bs.tokens_per_req for t, _ in fwd.steps)
             num_reqs = bs.num_reqs
             tokens_per_seq = bs.tokens_per_req if served else 1
             active_rows = max(tokens_per_seq, num_reqs * tokens_per_seq)
