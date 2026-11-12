@@ -157,6 +157,41 @@ class ChunkLocator:
 
         return phase2_index_fn
 
+    def last_step_landing_row(self, chip_id, hcube_dim_idx):
+        """Packed row chunk that column half `hcube_dim_idx` of the last
+        hypercube step lands in, on chip `chip_id`.
+
+        The last step's chunk would otherwise land on one of the slots step 0
+        uses, and nothing stops a sender whose own step 0 is done from writing
+        it while step-0 data from a late chip is still due there. Step 0 only
+        fills rows whose bit along dim `hcube_dim_idx` equals the chip's own,
+        so flipping that bit names a row step 0 never touches: the fix costs
+        no extra memory. Two hypercube steps only (see hier_rs_kernel).
+        """
+        return chip_id ^ (1 << hcube_dim_idx)
+
+    def make_phase2_last_step_index_fn(self, mb_idx):
+        def phase2_last_step_index_fn(chunk_group_idx, hcube_dim_idx):
+            row = self.last_step_landing_row(self.topo.cur_chip_id, hcube_dim_idx)
+            mb_start_idx = mb_idx * self.config.num_hcube_dims + hcube_dim_idx
+            return (row, mb_start_idx)
+
+        return phase2_last_step_index_fn
+
+    def make_phase2_last_step_in_index_fn_with_recv_sem(self, mb_idx):
+        def phase2_last_step_in_index_fn_with_recv_sem(grid_indices, ref):
+            _, hcube_dim_idx = grid_indices
+            row = self.last_step_landing_row(self.topo.cur_chip_id, hcube_dim_idx)
+            chunk_slice = self.get_slice(
+                row,
+                mb_idx * self.config.mb_size
+                + hcube_dim_idx * self.config.hc_chunk_size,
+                self.config.hc_chunk_size,
+            )
+            return chunk_slice, self.config.hc_chunk_size
+
+        return phase2_last_step_in_index_fn_with_recv_sem
+
     def make_phase2_out_index_fn(self, step_idx, mb_idx):
         def phase2_out_index_fn(chunk_group_idx, hcube_dim_idx):
             mb_start_idx = mb_idx * self.config.num_hcube_dims + hcube_dim_idx

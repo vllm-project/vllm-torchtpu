@@ -137,6 +137,7 @@ def hierarchical_reduce_scatter_local(
     num_devices: int,
     num_micro_batches: int | None = None,
     axis_name: str | tuple[str, ...] = "x",
+    _debug_entry_delay: tuple[int, int] | None = None,
 ) -> jax.Array:
     num_chips = num_devices // 2
     num_hcube_dims = int(math.log2(num_chips))
@@ -233,6 +234,7 @@ def hierarchical_reduce_scatter_local(
             hier_rs_kernel,
             config=config,
             axis_name=axis_name,
+            debug_entry_delay=_debug_entry_delay,
         ),
         out_shape=tuple(out_shapes),
         grid_spec=grid_spec,

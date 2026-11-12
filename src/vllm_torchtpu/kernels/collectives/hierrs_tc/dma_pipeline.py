@@ -155,7 +155,12 @@ class DmaManager:
             ops.append(op)
         return ops
 
-    def start_phase2_c2c_copies(self, mb_idx, step_idx, src, dst):
+    def start_phase2_c2c_copies(self, mb_idx, step_idx, src, dst, last_step=False):
+        """Sends this step's chunks of `src` into each neighbour's `dst`.
+
+        On the `last_step` each chunk lands in the row
+        `ChunkLocator.last_step_landing_row` names, not at its own packed row.
+        """
         send_sems = self.phase2_send_sems
         recv_sems = self.phase2_recv_sems
         mb_ops = []
@@ -178,13 +183,20 @@ class DmaManager:
                 )
 
                 # Sender and receiver share chunk parity: one packed slice
-                # addresses both ends.
-                mb_slice = self.locator.get_packed_slice(
+                # addresses both ends, except on the last step.
+                src_slice = self.locator.get_packed_slice(
                     neighbor_chunk_idx, chunk_start, k_size
                 )
+                if last_step:
+                    row = self.locator.last_step_landing_row(
+                        self.topo.get_neighbor_chip_id(dim), hcube_dim_idx
+                    )
+                    dst_slice = self.locator.get_slice(row, chunk_start, k_size)
+                else:
+                    dst_slice = src_slice
                 data_op = pltpu.make_async_remote_copy(
-                    src_ref=src.at[mb_slice],
-                    dst_ref=dst.at[mb_slice],
+                    src_ref=src.at[src_slice],
+                    dst_ref=dst.at[dst_slice],
                     send_sem=send_sems.at[step_idx, mb_idx, hcube_dim_idx, op_idx],
                     recv_sem=recv_sems.at[step_idx, mb_idx, hcube_dim_idx, op_idx],
                     device_id=neigh_device_id,
@@ -258,7 +270,10 @@ class DmaManager:
         block_size,
         mb_idx,
         step_idx,
+        in1_index_fn=None,
     ):
+        # src1 is the landing buffer, src2 the running sum. `in1_index_fn`
+        # addresses src1 where it differs from src2 (the last step).
         def accum_body(s1_ref, s2_ref, d_ref):
             d_ref[...] = s1_ref[...] + s2_ref[...]
 
@@ -276,13 +291,21 @@ class DmaManager:
             block_shape=(self.config.seq_chunk_size, block_size),
             index_map=in_index_fn,
         )
+        in1_spec = (
+            in_spec
+            if in1_index_fn is None
+            else pl.BlockSpec(
+                block_shape=(self.config.seq_chunk_size, block_size),
+                index_map=in1_index_fn,
+            )
+        )
         out_spec = pl.BlockSpec(
             block_shape=(self.config.seq_chunk_size, block_size),
             index_map=out_index_fn,
         )
 
         s1_bref = RemoteWaitBufferedRef.from_ref(
-            self.recv_bref.with_spec(in_spec),
+            self.recv_bref.with_spec(in1_spec),
             index_fn_with_recv_sem=in_index_fn_with_recv_sem,
         )
         s2_bref = RemoteWaitBufferedRef.from_ref(self.run_bref.with_spec(in_spec))
@@ -291,6 +314,6 @@ class DmaManager:
         pltpu.emit_pipeline(
             accum_body,
             grid=grid,
-            in_specs=[in_spec, in_spec],
+            in_specs=[in1_spec, in_spec],
             out_specs=[out_spec],
         )(src1, src2, dst, allocations=[s1_bref, s2_bref, d_bref])

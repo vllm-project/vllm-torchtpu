@@ -38,12 +38,15 @@ def _make_mesh(num_devices: int, axis_name: str) -> jax.sharding.Mesh:
     return jax.sharding.Mesh(np.asarray(devices), (axis_name,))
 
 
-def _hierarchical_reduce_scatter(x, *, mesh, in_specs, num_micro_batches=None):
+def _hierarchical_reduce_scatter(
+    x, *, mesh, in_specs, num_micro_batches=None, **kwargs
+):
     return jax.shard_map(
         lambda local_x: hrs.hierarchical_reduce_scatter_local(
             local_x,
             num_devices=mesh.devices.size,
             num_micro_batches=num_micro_batches,
+            **kwargs,
         ),
         mesh=mesh,
         in_specs=in_specs,
@@ -230,6 +233,64 @@ class HierarchicalReduceScatterTest(jtu.JaxTestCase):
             msg=f"mb={num_micro_batches}: max relative error "
             f"{worst:.4g} over {runs} runs exceeds {tol}",
         )
+
+    @parameterized.parameters(
+        # Two micro-batches is where step 1 used to overwrite a step-0 landing
+        # slot under skew; four is the control.
+        ("bf16", 256, 2),
+        ("bf16", 512, 2),
+        ("bf16", 1024, 4),
+    )
+    def test_no_race_under_inter_chip_skew(self, wire, local_rows, num_micro_batches):
+        self._requires_devices(8)
+        axis_name, hidden, n = "x", 4096, 8
+        mesh = _make_mesh(n, axis_name)
+        in_specs = P(axis_name, None)
+        sharding = jax.sharding.NamedSharding(mesh, in_specs)
+        tol = 0.05
+        reps = 4
+
+        # The late chip is held at kernel entry by serial local DMAs, so every
+        # other chip starts phase 2 first. Chip 1, then chip 2: the late chip is
+        # a step-0 neighbour along each hypercube dim in turn. The copy counts
+        # span tens of microseconds to milliseconds: larger shapes need more.
+        for late_chip in (1, 2):
+            for num_copies in (40, 400, 4000):
+                for rep in range(reps):
+                    # A fresh input per call: a stale buffer looks right on a
+                    # repeat.
+                    key = jax.random.key(local_rows + num_micro_batches)
+                    for salt in (late_chip, num_copies, rep):
+                        key = jax.random.fold_in(key, salt)
+                    x = jax.random.normal(
+                        key, (n * local_rows, hidden), dtype=jnp.bfloat16
+                    )
+                    truth = (
+                        jnp.asarray(x, jnp.float32)
+                        .reshape(n, local_rows, hidden)
+                        .sum(axis=0)
+                    )
+                    out = jnp.asarray(
+                        _hierarchical_reduce_scatter(
+                            jax.device_put(x, sharding),
+                            mesh=mesh,
+                            in_specs=in_specs,
+                            num_micro_batches=num_micro_batches,
+                            _debug_entry_delay=(late_chip, num_copies),
+                        ),
+                        jnp.float32,
+                    )
+                    where = (
+                        f"{wire} rows={local_rows} mb={num_micro_batches} "
+                        f"late_chip={late_chip} copies={num_copies} rep={rep}"
+                    )
+                    scale = float(jnp.max(jnp.abs(truth))) or 1.0
+                    err = float(jnp.max(jnp.abs(out - truth))) / scale
+                    self.assertLess(
+                        err,
+                        tol,
+                        msg=f"{where}: relative error {err:.3g} -- skew race",
+                    )
 
     @parameterized.product(
         rows_per_device=[1024, 4096, 16384],
