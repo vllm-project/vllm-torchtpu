@@ -71,6 +71,7 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
+| `TPU_MOE_JOINT_ROUTING_128` | `False` | Opt-in. At exactly 128 routed rows on non-EP MoE layers (int32 expert ids, JAX x64 off), builds the routing order, its inverse and the sorted token ids with one Pallas kernel instead of the packed single sort. Bit-identical outputs. Applies only where the packed single sort would run: the counting sort keeps precedence, and `TPU_MOE_SINGLE_SORT=0` also turns it off. See [Opt-in routing order and inverse for 128 routes](../performance/qwen35-routing-128.md). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
 | `QUANTIZE_ON_LOAD_PREFIXES` | `[]` | Comma-separated dot-bounded module prefix names to quantize to FP8 on load (e.g., `"self_attn,shared_experts,layers.0.mlp"`), including `VocabParallelEmbedding` and `ParallelLMHead`. |
