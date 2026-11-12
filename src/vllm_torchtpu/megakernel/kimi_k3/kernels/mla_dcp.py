@@ -71,7 +71,8 @@ def chunk_layout(batch: int, heads: int = HEADS_PER_RANK, *, chunk_rows: int | N
     8-row chunks at B16/B32/B48/B64 (amortizing exchanges), else 4 (also
     attention DP2's B128: 64 group rows of six heads, for VMEM); ring slots
     4 at B32 with three heads per rank, 3 for 8-row chunks, else 2
-    (``persistent_scratch`` uses 4 for FP8 query packets). ``chunk_rows``
+    (``persistent_scratch`` uses 4 for FP8 query packets of more than two
+    chunks). ``chunk_rows``
     overrides the width and keeps at least three slots for a staged combine."""
     wide = batch <= 16 or batch in (32, 48, 64) and not (batch == 64 and heads == 6)
     rows = chunk_rows if chunk_rows is not None else 8 if wide else 4
@@ -261,10 +262,12 @@ def persistent_scratch(batch, group=GROUP, heads=HEADS_PER_RANK, *,
     if chunked(batch, force_chunks):
         chunk, ring = chunk_layout(batch, heads, chunk_rows=chunk_rows)
         rows = packet_layout(batch, heads)[0] * chunk
-        if query_dtype == jnp.uint8 and not (group == 16 and sequence_rows > 1):
+        if query_dtype == jnp.uint8 and not (group == 16 and sequence_rows > 1) and batch > 2 * chunk:
             # The smaller query buffers make two-chunk lookahead fit at B64.
             # Attention DP's verifies keep one chunk: two change their outputs
-            # at 128 rows.
+            # at 128 rows. A two-chunk call keeps three slots: one chunk
+            # ahead already sends its second chunk's queries before the first
+            # chunk's attention.
             ring = 4
         return (
             tpu.VMEM((ring, group, rows, LANES), query_dtype),
