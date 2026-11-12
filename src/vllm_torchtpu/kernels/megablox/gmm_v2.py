@@ -15,6 +15,7 @@
 import dataclasses
 import functools
 import math
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, cast
@@ -250,6 +251,8 @@ class TileSizes:
     # Ascending row counts a tile's matmul is compiled for, ending at tile_m;
     # empty means the multiples of bucket_base.
     buckets: tuple[int, ...] = ()
+    # Weight blocks the rhs pipeline keeps in flight.
+    rhs_buffer_count: int = 3
 
     @property
     def bucket_sizes(self) -> tuple[int, ...]:
@@ -424,7 +427,7 @@ def generate_block_specs(
     rhs_weight_spec = pl.BlockSpec(
         (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
         index_map.rhs_weight_index_map,
-        pipeline_mode=pl.Buffered(buffer_count=3),
+        pipeline_mode=pl.Buffered(buffer_count=cfgs.tiles.rhs_buffer_count),
     )
     rhs_scale_block_spec = rhs_bias_block_spec = None
     if cfgs.rhs_cfgs.has_bias:
@@ -1154,6 +1157,7 @@ def gmm_vmem_estimate(
     lhs_cfgs: InputConfigs,
     rhs_cfgs: InputConfigs,
     fuse_act: str | None,
+    rhs_buffer_count: int = 3,
 ) -> int:
     """VMEM a gmm_v2 pipeline with these tiles needs."""
     lhs_bits = jax.dtypes.itemsize_bits(lhs_cfgs.dtype)
@@ -1179,7 +1183,7 @@ def gmm_vmem_estimate(
     if rhs_cfgs.has_bias:
         rhs_bias_vmem = tn * 4
     rhs_vmem = fuse_act_factor * (
-        3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
+        rhs_buffer_count * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
     )
 
     # 3. Accumulator
@@ -1194,6 +1198,122 @@ def gmm_vmem_estimate(
     return lhs_vmem + rhs_vmem + acc_vmem + out_vmem
 
 
+# Opt-in tile overrides for fp4-rhs (NVFP4 W4A16) calls on one k tile, read
+# once per process (default off: tiles unchanged).
+#   TPU_GMM_V2_PREFILL_TILES="<tile_m>:<bucket>,...,<tile_m>": calls above
+#     FP8_DECODE_MAX_M rows (prefill / mixed steps). Buckets of at most
+#     FP8_RHS_MAX_BUCKET_M rows take the fp8 rhs feed (as decode tiles do);
+#     larger ones dequantize before the matmul. "256:128,256" (or
+#     "256:128/256") keeps every bucket on the default numerics. An optional
+#     "@<max size_m>" suffix limits it to calls of at most that many rows.
+#   TPU_GMM_V2_DECODE_W13="<tile_n>:<gate_up buffers>[:<down buffers>]":
+#     decode-sized buffers. Up to FP8_SMALL_DECODE_MAX_M rows the gate_up
+#     (fused activation) call takes tile_n and its rhs pipeline depth and the
+#     down call its own depth; above it, up to FP8_DECODE_MAX_M rows, only
+#     the gate_up depth applies (a wider tile_n stops kernel_mlp's fusion,
+#     which costs more there than it saves).
+_PREFILL_TILES_ENV = "TPU_GMM_V2_PREFILL_TILES"
+_DECODE_W13_ENV = "TPU_GMM_V2_DECODE_W13"
+
+
+@functools.cache
+def _tile_env() -> (
+    tuple[tuple[int, tuple[int, ...], int | None] | None, tuple[int, int, int] | None]
+):
+    prefill = decode_w13 = None
+    raw = os.environ.get(_PREFILL_TILES_ENV, "").strip()
+    if raw:
+        spec, _, max_m = raw.partition("@")
+        tm, _, bks = spec.partition(":")
+        # "," or "/" between buckets ("/" fits comma-separated env lists).
+        buckets = tuple(
+            sorted({int(b) for b in bks.replace("/", ",").split(",") if b.strip()})
+        )
+        if not buckets or buckets[-1] != int(tm):
+            raise ValueError(f"{_PREFILL_TILES_ENV}={raw!r}: buckets must end at tile_m")
+        prefill = (int(tm), buckets, int(max_m) if max_m else None)
+    raw = os.environ.get(_DECODE_W13_ENV, "").strip()
+    if raw:
+        parts = [int(x) for x in raw.split(":")]
+        decode_w13 = (parts[0], *(parts[1:] + [3, 3])[:2])
+    return prefill, decode_w13
+
+
+_tile_env_logged: set[str] = set()
+
+
+def _log_tile_env_once(name: str, dims: Dimensions, tiles: TileSizes) -> None:
+    if name in _tile_env_logged:
+        return
+    _tile_env_logged.add(name)
+    args = (
+        "gmm_v2 tile override %s=%s applied (size_m=%d k=%d n=%d): %s",
+        name, os.environ.get(name), dims.size_m, dims.size_k, dims.size_n, tiles,
+    )
+    try:
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(*args)
+    except ImportError:  # kernel-only use without vllm
+        import logging
+
+        logging.getLogger(__name__).info(*args)
+
+
+def _apply_tile_env(
+    tiles: TileSizes,
+    dims: Dimensions,
+    lhs_cfgs: InputConfigs,
+    rhs_cfgs: InputConfigs,
+    vmem_limit_bytes: int,
+    fuse_act: str | None,
+) -> TileSizes:
+    prefill, decode_w13 = _tile_env()
+    if (prefill is None and decode_w13 is None) or (
+        tiles.tile_k != align_to(dims.size_k, pltpu.get_tpu_info().num_lanes)
+        or fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is None
+    ):
+        return tiles
+    new, name = None, None
+    if prefill is not None and dims.size_m > FP8_DECODE_MAX_M:
+        tile_m, buckets, max_m = prefill
+        sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
+        if all(b % sublane == 0 for b in buckets) and (
+            max_m is None or dims.size_m <= max_m
+        ):
+            new = dataclasses.replace(
+                tiles, tile_m=tile_m, bucket_base=buckets[0], buckets=buckets
+            )
+            name = _PREFILL_TILES_ENV
+    elif decode_w13 is not None and dims.size_m <= FP8_DECODE_MAX_M:
+        tile_n, buffers_gate_up, buffers_down = decode_w13
+        if dims.size_m > FP8_SMALL_DECODE_MAX_M:
+            if fuse_act is not None:
+                new = dataclasses.replace(tiles, rhs_buffer_count=buffers_gate_up)
+        elif fuse_act is None:
+            new = dataclasses.replace(tiles, rhs_buffer_count=buffers_down)
+        elif (dims.size_n // 2) % tile_n == 0:
+            new = dataclasses.replace(
+                tiles, tile_n=tile_n, rhs_buffer_count=buffers_gate_up
+            )
+        name = _DECODE_W13_ENV
+    if new is None:
+        return tiles
+    est = gmm_vmem_estimate(
+        new.tile_m,
+        new.tile_n,
+        new.tile_k,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs,
+        fuse_act=fuse_act,
+        rhs_buffer_count=new.rhs_buffer_count,
+    )
+    if est > vmem_limit_bytes:
+        return tiles
+    _log_tile_env_once(name, dims, new)
+    return new
+
+
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -1202,6 +1322,23 @@ def calculate_tiling(
     fuse_act: str | None = None,
 ) -> TileSizes:
     """Calculate optimal tile sizes for GMM kernel."""
+    return _apply_tile_env(
+        _calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act),
+        dims,
+        lhs_cfgs,
+        rhs_cfgs,
+        vmem_limit_bytes,
+        fuse_act,
+    )
+
+
+def _calculate_tiling(
+    dims: Dimensions,
+    lhs_cfgs: InputConfigs,
+    rhs_cfgs: InputConfigs,
+    vmem_limit_bytes: int,
+    fuse_act: str | None = None,
+) -> TileSizes:
 
     rhs_dtype = rhs_cfgs.quant_dtype or rhs_cfgs.dtype
     rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
@@ -1758,6 +1895,7 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
             lhs_cfgs=cfgs.lhs_cfgs,
             rhs_cfgs=cfgs.rhs_cfgs,
             fuse_act=cfgs.fuse_act,
+            rhs_buffer_count=t.rhs_buffer_count,
         )
 
     # The prefetch window (2 down weight blocks) lives through both pipelines;
@@ -1775,7 +1913,8 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
 
     fits = (
         vmem(cfgs1) + scratch(cfgs2) + window <= vmem_limit_bytes
-        and vmem(cfgs2) - 3 * block2 + scratch(cfgs1) + window <= vmem_limit_bytes
+        and vmem(cfgs2) - t2.rhs_buffer_count * block2 + scratch(cfgs1) + window
+        <= vmem_limit_bytes
     )
     return (
         fits
