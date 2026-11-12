@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused EP16/TP2 prefill MoE for 512- through 8192-token windows.
+"""Fused EP16/TP2 prefill MoE for 512- through 16384-token windows.
 
 Schedule:
   1. Router/latent/shared projections overlap the incremental Top16, route sort,
-     route exchange, packed latent ring and shared-output reduction.
+     route exchange, packed latent ring and shared-output reduction (in two
+     256-row passes at 16K).
   2. Compact routing metadata moves to SMEM. GU/SiTU and the first down column
      share a pipeline; later down columns overlap token combine and reduction.
-  3. The reduced VMEM shard is normalized, projected up and added to the shared
+  3. The reduced shard is normalized, projected up and added to the shared
      expert and residual outputs.
 
-The factory at the end is the only production entry point. The small-window, 4K
-and 8K schedules are selected by window size; 8K skew overflow retains every route via
-an uncapped fallback. Python generators split work at tracing time, allowing
-independent vector/communication work between MXU panels without extra calls.
+The factory at the end is the only production entry point. The small-window,
+4K, 8K and 16K schedules are selected by window size; the 6K/10K/12K/14K
+windows chain 8K/4K/2K launches. From 8K a launch whose routes overflow the
+compact capacity keeps every route: 8K through an uncapped fallback, 16K by
+redoing the layer as two 8K launches. Python generators split work at tracing
+time, allowing independent vector/communication work between MXU panels
+without extra calls.
 """
 
 import dataclasses
