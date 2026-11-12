@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
+    TPU_FUSED_GATED_MLP_FP8: bool = True
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -597,6 +598,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
     ),
+    # Fuse dense gated-MLP activation (GeluAndMul / SiluAndMul) with dynamic
+    # per-row FP8 activation quantization on TPU v7x for allowlisted MLP
+    # classes (Gemma4MLP). Set to 0 to fall back to the unfused path.
+    "TPU_FUSED_GATED_MLP_FP8": env_bool("TPU_FUSED_GATED_MLP_FP8", default=True),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
