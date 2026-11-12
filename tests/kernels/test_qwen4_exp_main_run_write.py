@@ -6,6 +6,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 from test_qwen4_exp_fused_kv_write import interpret, raw  # noqa: F401 (fixture)
 
 from vllm_torchtpu import envs
@@ -135,3 +137,147 @@ def test_runs_split_at_pages_tiles_and_gaps():
     assert np.asarray(length)[:count].tolist() == [4, 2, 1]
     assert np.asarray(first).tolist() == [0, 1, 3]
     assert np.asarray(unique).tolist() == [1, 1]
+
+
+# Served geometry of the Qwen3.8 c32 recipe: paired FP8 main-KV pages of 512
+# rows, main-KV DCP 2 (a block-table entry spans 1024 tokens), run-writer
+# tile 1024, 24 request slots.
+SERVED_ROWS, SERVED_DCP, SERVED_SLOTS = 512, 2, 24
+
+
+def precompile_layout(tokens, slots=SERVED_SLOTS):
+    """``Qwen4ExpAdapter.dummy_run``'s rows (``dummy_query_lengths``): one-token
+    requests and a last request holding the rest, all at context 0."""
+    active = min(tokens, slots)
+    lengths = [1] * active + [0] * (slots - active)
+    lengths[active - 1] += tokens - active
+    return lengths, [0] * slots
+
+
+def verify_step_layout(tokens, speculative, slots=SERVED_SLOTS):
+    """A served mixed step: ``slots - 1`` verify requests of ``speculative + 1``
+    rows at contexts on both sides of the entry midpoint, plus one prefill chunk
+    filling the step that starts and ends inside a 1024-token entry."""
+    window = speculative + 1
+    contexts = [509 + 37 * i for i in range(slots - 1)] + [700]
+    return [window] * (slots - 1) + [tokens - window * (slots - 1)], contexts
+
+
+def served_destinations(query_lens, contexts, rank, pages):
+    """``qsa_cache_writes``' ``(page, logical, valid)`` under main-KV DCP, with
+    each request owning consecutive table entries from page 1."""
+    span = SERVED_DCP * SERVED_ROWS
+    page, logical, valid = [], [], []
+    first = 1
+    for n, ctx in zip(query_lens, contexts):
+        for t in range(ctx, ctx + n):
+            owned = (t // SERVED_ROWS) % SERVED_DCP == rank
+            logical.append(t)
+            valid.append(owned)
+            page.append(first + t // span if owned else pages)
+        first += -(-(ctx + n) // span)
+    assert first <= pages
+    return (np.asarray(page, np.int32), np.asarray(logical, np.int32), np.asarray(valid))
+
+
+def run_dmas(page, offsets, valid, tile, rows_per_page):
+    """Every DMA ``write_main_runs`` issues, as ``(page, row, vmem_row, rows)``,
+    from ``main_runs`` and the kernel's power-of-two split of each run."""
+    tokens = len(page)
+    padded = -(-tokens // tile) * tile
+    pad = (0, padded - tokens)
+    start, length, first, _ = main_write.main_runs(
+        jnp.asarray(np.pad(page, pad)),
+        jnp.asarray(np.pad(offsets, pad)),
+        jnp.asarray(np.pad(valid, pad)),
+        tile,
+        rows_per_page,
+    )
+    start, length, count = np.asarray(start), np.asarray(length), int(first[-1])
+    longest = min(tile, rows_per_page)
+    sizes = [1 << b for b in range(longest.bit_length() - 1, -1, -1)]
+    dmas = []
+    for token, run in zip(start[:count], length[:count]):
+        for size in sizes:
+            if run & size:
+                done = run & ~(2 * size - 1)
+                dmas.append(
+                    (page[token], offsets[token] + done, token % tile + done, size)
+                )
+    return dmas
+
+
+def out_of_bounds(dmas, pages, rows_per_page, tile):
+    return [
+        d
+        for d in dmas
+        if not (0 <= d[0] < pages and d[1] + d[3] <= rows_per_page and d[2] + d[3] <= tile)
+    ]
+
+
+SERVED_LAYOUTS = {
+    **{f"precompile_{t}": (lambda t=t: precompile_layout(t)) for t in (512, 1024, 2048, 3072, 4096, 6144, 8192)},
+    **{
+        f"verify_k{k}_{t}": (lambda t=t, k=k: verify_step_layout(t, k))
+        for k in (2, 3)
+        for t in (512, 1024, 4096, 8192)
+    },
+}
+
+
+@pytest.mark.parametrize("tile", [512, 1024])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("layout", sorted(SERVED_LAYOUTS))
+def test_served_run_dmas_stay_in_bounds(layout, rank, tile):
+    """Each run DMA stays inside its page, its tile's VMEM rows and the pool,
+    for the precompile buckets and K=2 / K=3 verify steps (j-4a493b32 halted
+    in this kernel at the 4096 bucket with BoundsCheck on dma.hbm_to_vmem)."""
+    pages = 64
+    query_lens, contexts = SERVED_LAYOUTS[layout]()
+    page, logical, valid = served_destinations(query_lens, contexts, rank, pages)
+    dmas = run_dmas(page, logical % SERVED_ROWS, valid, tile, SERVED_ROWS)
+    assert sum(d[3] for d in dmas) == int(valid.sum())
+    assert out_of_bounds(dmas, pages, SERVED_ROWS, tile) == []
+    if not valid.any():
+        return  # this rank owns none of the step's rows
+    # Positive control: one valid row sent past the pool is caught.
+    bad = page.copy()
+    bad[np.flatnonzero(valid)[-1]] = pages
+    assert out_of_bounds(run_dmas(bad, logical % SERVED_ROWS, valid, tile, SERVED_ROWS), pages, SERVED_ROWS, tile)
+
+
+@pytest.mark.parametrize("layout", ["precompile_4096", "verify_k2_4096", "verify_k3_4096"])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_served_run_writer_checked_interpreter(monkeypatch, layout, rank):
+    """The kernel itself on the TPU interpreter that raises on out-of-bounds
+    DMAs (whole rows: the paired path issues the same DMAs plus a merge the
+    checked interpreter cannot discharge), against the row-by-row reference."""
+    if not hasattr(pltpu, "InterpretParams"):
+        pytest.skip("jax without the checked TPU interpreter")
+    original = pl.pallas_call
+    monkeypatch.setattr(
+        pl,
+        "pallas_call",
+        lambda *a, **k: original(*a, **{**k, "interpret": pltpu.InterpretParams()}),
+    )
+    pages, width = 48, 256
+    query_lens, contexts = SERVED_LAYOUTS[layout]()
+    page, logical, valid = served_destinations(query_lens, contexts, rank, pages)
+    rng = np.random.default_rng(rank)
+    pool = jnp.asarray(
+        rng.normal(0, 1, (pages, SERVED_ROWS, 1, 4, width)), jnp.float8_e4m3fn
+    )
+    rows = jnp.asarray(rng.normal(0, 1, (len(page), 1, 4, width)), jnp.float8_e4m3fn)
+    got = main_write.write_main_runs(
+        pool,
+        rows,
+        jnp.asarray(page),
+        jnp.asarray(logical % SERVED_ROWS),
+        jnp.asarray(valid),
+        tile=1024,
+    )
+    expected = raw(pool).copy()
+    new = raw(rows)
+    for i in np.flatnonzero(valid):
+        expected[page[i], logical[i] % SERVED_ROWS] = new[i]
+    np.testing.assert_array_equal(raw(got), expected)
