@@ -89,7 +89,12 @@ def _call(
     w1_dtype,
     rows: int,
     interpret=None,
+    ablate: frozenset = frozenset(),
 ):
+    # `ablate` (timing attribution only; wrong ids): "gather" skips the
+    # embedding DMAs, "dot" the bias matmul, "score" the whole tile loop,
+    # "exchange" the remote DMAs. "T" (same ids) streams the Markov rows
+    # through the MXU against stationary embeddings.
     # Only the `rows` real rows gather embeddings and hand ids to the scalar
     # core; pad rows up to rp keep zero embeddings and are never read.
     nt = vp // TILE_COLS
@@ -144,7 +149,7 @@ def _call(
             # A DMA offset along the tiled row axis must be tile aligned:
             # fetch the aligned block of `blk` rows holding each row.
             gathers = []
-            for r in range(rows):
+            for r in range(0 if "gather" in ablate else rows):
                 b0 = pl.multiple_of((prev_s[r] // blk) * blk, blk)
                 g = pltpu.make_async_copy(
                     w1_hbm.at[pl.ds(b0, blk)], e_v.at[r], e_sem.at[0]
@@ -170,14 +175,25 @@ def _call(
                 )
                 e = jnp.where(erow == r, row, e)
             e = e.astype(BF16)
+            if "T" in ablate:
+                # Markov rows as the streamed operand, embeddings stationary.
+                e = jnp.concatenate([e, jnp.zeros((_LANES - rp, rank_dim), BF16)], 0)
 
             def tile(t, carry, par=par, e=e):
                 best_m, best_i = carry
                 c0 = pl.multiple_of(t * TILE_COLS, TILE_COLS)
                 w = w2_v[pl.ds(c0, TILE_COLS), :]
-                bias = lax.dot_general(
-                    e, w, (((1,), (1,)), ((), ())), preferred_element_type=F32
-                ).astype(BF16)
+                if "dot" in ablate:
+                    bias = jnp.zeros((rp, TILE_COLS), BF16) + w[0:1, 0:1]
+                elif "T" in ablate:
+                    bias_t = lax.dot_general(
+                        w, e, (((1,), (1,)), ((), ())), preferred_element_type=F32
+                    )
+                    bias = bias_t.T[:rp].astype(BF16)
+                else:
+                    bias = lax.dot_general(
+                        e, w, (((1,), (1,)), ((), ())), preferred_element_type=F32
+                    ).astype(BF16)
                 lg = lg_v[par, :, pl.ds(c0, TILE_COLS)]
                 s = (lg.astype(F32) + bias.astype(F32)).astype(BF16).astype(F32)
                 # Column ids in f32 (exact below 2**24): the first max by min.
@@ -190,7 +206,7 @@ def _call(
 
             best_m, best_i = lax.fori_loop(
                 0,
-                nt,
+                0 if "score" in ablate else nt,
                 tile,
                 (
                     jnp.full((rp, 1), -jnp.inf, F32),
@@ -202,7 +218,7 @@ def _call(
             send_v[par] = pair
             recv_v[par, me] = pair
             sends = []
-            for step in range(1, n):
+            for step in range(1, 1 if "exchange" in ablate else n):
                 t = lax.rem(me + step, n)
                 cp = pltpu.make_async_remote_copy(
                     send_v.at[par],
@@ -214,7 +230,7 @@ def _call(
                 )
                 cp.start()
                 sends.append(cp)
-            for step in range(1, n):
+            for step in range(1, 1 if "exchange" in ablate else n):
                 t = lax.rem(me + n - step, n)
                 pltpu.make_async_copy(
                     recv_v.at[par, t], recv_v.at[par, t], recv_sem.at[par, t]
@@ -278,6 +294,7 @@ def markov_argmax(
     n: int,
     vs: int,
     interpret=None,
+    ablate: frozenset = frozenset(),
 ) -> jax.Array:
     """Greedy Markov drafts ``[rows, k]`` int32 (global ids).
 
@@ -301,7 +318,7 @@ def markov_argmax(
     lg = jnp.pad(lg, ((0, 0), (0, rp - rows), (0, vp - vs)))
     p0 = jnp.pad(prev0.astype(jnp.int32), (0, rp - rows))
     out = _call(
-        n, k, rp, vp, vs, rank_dim, vocab, jnp.dtype(w1.dtype), rows, interpret
+        n, k, rp, vp, vs, rank_dim, vocab, jnp.dtype(w1.dtype), rows, interpret, ablate
     )(
         rank.reshape(1).astype(jnp.int32),
         start.reshape(1).astype(jnp.int32),
