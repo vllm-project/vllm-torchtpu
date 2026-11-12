@@ -131,11 +131,16 @@ class GatedResidual(common_hc.GatedResidual):
             full_tiles = (
                 AUTO_MIX_TILES if prefill_full_tile == "auto" else (prefill_full_tile,)
             )
+        self._full_tiles = full_tiles
         self._combine_token_tile = (
             AUTO_COMBINE_TILE
             if prefill_combine_tile == "auto"
             else prefill_combine_tile
         )
+        self._hardware = None
+        self._up_transposed = False
+        self._decode_disabled = False
+        self._prefill_disabled = False
         self._prefill_up_op = None
         self._prefill_norm_op = None
         self._prefill_full_ops: dict[int, Callable] = {}
@@ -154,22 +159,7 @@ class GatedResidual(common_hc.GatedResidual):
             and self.hidden_size % 128 == 0
             and hasattr(self, "input_mix_weight_down")
         ):
-            from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
-                build_decode_combine_mix_op,
-                build_decode_mix_op,
-            )
-
-            inject = self.use_combine and hasattr(self, "block_inject_weight")
-            eps = self.hc_norm.variance_epsilon
-            self._decode_mix_op = build_decode_mix_op(
-                self.hc_count, self.hidden_size, eps, inject
-            )
-            self._tpu_decode_mix_op = self._decode_mix_op
-            if inject:
-                # Used by the preceding HC's combine_mix (attn -> mlp).
-                self._decode_combine_mix_op = build_decode_combine_mix_op(
-                    self.hc_count, self.hidden_size, eps
-                )
+            self._build_decode_ops(up_transposed=False)
 
         if self.use_mix and prefill_norm_tile and self.config.hc_per_branch_norm:
             from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_norm_op
@@ -198,13 +188,8 @@ class GatedResidual(common_hc.GatedResidual):
         ):
             return
 
-        from vllm_torchtpu.kernels.qwen4_exp.hc_resources import (
-            supports_full_mix,
-            supports_residual,
-        )
+        from vllm_torchtpu.kernels.qwen4_exp.hc_resources import supports_residual
         from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
-            build_combine_full_mix_op,
-            build_full_mix_op,
             build_gated_residual_op,
             current_hc_hardware,
         )
@@ -212,6 +197,7 @@ class GatedResidual(common_hc.GatedResidual):
         # Worker initialization owns the device. Unknown layout/resources keep
         # the existing Torch path; CPU construction never initializes a TPU.
         hardware = current_hc_hardware()
+        self._hardware = hardware
         if self.use_combine and self._combine_token_tile:
             if (
                 prefill_combine_tile != "auto"
@@ -245,69 +231,7 @@ class GatedResidual(common_hc.GatedResidual):
                 self._prefill_inject = (
                     inject and self.use_combine and hasattr(self, "block_inject_weight")
                 )
-                lowrank = self.input_mix_weight_down.weight.shape[0]
-                eps = self.hc_norm.variance_epsilon
-                has_variant = self._prefill_full_up_t or self._prefill_inject
-                self._prefill_full_ops = {
-                    tile: (
-                        build_full_mix_op(
-                            self.hc_count,
-                            self.hidden_size,
-                            eps,
-                            tile,
-                            hardware,
-                            up_t=self._prefill_full_up_t,
-                            inject=self._prefill_inject,
-                        )
-                        if has_variant
-                        else build_full_mix_op(
-                            self.hc_count, self.hidden_size, eps, tile, hardware
-                        )
-                    )
-                    for tile in full_tiles
-                    if (
-                        supports_full_mix(
-                            self.hc_count,
-                            self.hidden_size,
-                            lowrank,
-                            tile,
-                            hardware,
-                            up_t=self._prefill_full_up_t,
-                            inject=self._prefill_inject,
-                        )
-                        if has_variant
-                        else supports_full_mix(
-                            self.hc_count,
-                            self.hidden_size,
-                            lowrank,
-                            tile,
-                            hardware,
-                        )
-                    )
-                }
-                if envs.VLLM_TPU_HC_PREFILL_COMBINE_MIX and self._prefill_full_ops:
-                    self._prefill_combine_full_ops = {
-                        tile: build_combine_full_mix_op(
-                            self.hc_count,
-                            self.hidden_size,
-                            eps,
-                            tile,
-                            hardware,
-                            up_t=self._prefill_full_up_t,
-                            inject=self._prefill_inject,
-                        )
-                        for tile in full_tiles
-                        if supports_full_mix(
-                            self.hc_count,
-                            self.hidden_size,
-                            lowrank,
-                            tile,
-                            hardware,
-                            up_t=self._prefill_full_up_t,
-                            combine=True,
-                            inject=self._prefill_inject,
-                        )
-                    }
+                self._build_prefill_full_ops(hardware, up_transposed=False)
                 reason = "unsupported resources/layout"
             else:
                 reason = "full mix requires per-branch normalization"
@@ -365,6 +289,108 @@ class GatedResidual(common_hc.GatedResidual):
         output = torch.cat(normalized, dim=-1)
         return (output * (1.0 + self.hc_norm.weight.float())).to(hyper_input.dtype)
 
+    def _build_decode_ops(self, *, up_transposed: bool) -> None:
+        from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
+            build_decode_combine_mix_op,
+            build_decode_mix_op,
+        )
+
+        inject = self.use_combine and hasattr(self, "block_inject_weight")
+        eps = self.hc_norm.variance_epsilon
+        self._decode_mix_op = (
+            build_decode_mix_op(
+                self.hc_count, self.hidden_size, eps, inject, up_transposed=True
+            )
+            if up_transposed
+            else build_decode_mix_op(self.hc_count, self.hidden_size, eps, inject)
+        )
+        self._tpu_decode_mix_op = self._decode_mix_op
+        if inject:
+            # Used by the preceding HC's combine_mix (attn -> mlp).
+            self._decode_combine_mix_op = (
+                build_decode_combine_mix_op(
+                    self.hc_count, self.hidden_size, eps, up_transposed=True
+                )
+                if up_transposed
+                else build_decode_combine_mix_op(self.hc_count, self.hidden_size, eps)
+            )
+
+    def _build_prefill_full_ops(self, hardware, *, up_transposed: bool) -> None:
+        from vllm_torchtpu.kernels.qwen4_exp.hc_resources import supports_full_mix
+        from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
+            build_combine_full_mix_op,
+            build_full_mix_op,
+        )
+
+        lowrank = self.input_mix_weight_down.weight.shape[0]
+        eps = self.hc_norm.variance_epsilon
+        has_variant = self._prefill_full_up_t or self._prefill_inject or up_transposed
+        self._prefill_full_ops = {
+            tile: (
+                build_full_mix_op(
+                    self.hc_count,
+                    self.hidden_size,
+                    eps,
+                    tile,
+                    hardware,
+                    up_t=self._prefill_full_up_t,
+                    inject=self._prefill_inject,
+                    up_transposed=up_transposed,
+                )
+                if has_variant
+                else build_full_mix_op(
+                    self.hc_count, self.hidden_size, eps, tile, hardware
+                )
+            )
+            for tile in self._full_tiles
+            if (
+                supports_full_mix(
+                    self.hc_count,
+                    self.hidden_size,
+                    lowrank,
+                    tile,
+                    hardware,
+                    up_t=self._prefill_full_up_t,
+                    up_transposed=up_transposed,
+                    inject=self._prefill_inject,
+                )
+                if has_variant
+                else supports_full_mix(
+                    self.hc_count, self.hidden_size, lowrank, tile, hardware
+                )
+            )
+        }
+        if (
+            envs.VLLM_TPU_HC_PREFILL_COMBINE_MIX
+            and self._prefill_full_ops
+            and self.use_combine
+            and hasattr(self, "block_inject_weight")
+        ):
+            self._prefill_combine_full_ops = {
+                tile: build_combine_full_mix_op(
+                    self.hc_count,
+                    self.hidden_size,
+                    eps,
+                    tile,
+                    hardware,
+                    up_t=self._prefill_full_up_t,
+                    inject=self._prefill_inject,
+                    up_transposed=up_transposed,
+                )
+                for tile in self._full_tiles
+                if supports_full_mix(
+                    self.hc_count,
+                    self.hidden_size,
+                    lowrank,
+                    tile,
+                    hardware,
+                    up_t=self._prefill_full_up_t,
+                    up_transposed=up_transposed,
+                    combine=True,
+                    inject=self._prefill_inject,
+                )
+            }
+
     def disable_decode_fused(self):
         """Keep the unfused mix at every token count.
 
@@ -372,17 +398,59 @@ class GatedResidual(common_hc.GatedResidual):
         fused path is chosen by the token count while tracing, so that one
         graph could not serve buckets on the other side of the choice.
         """
+        self._decode_disabled = True
         self._decode_mix_op = None
         self._tpu_decode_mix_op = None
         self._decode_combine_mix_op = None
 
     def disable_prefill_fused(self):
         """Disable token-count-dependent prefill HC Pallas ops on single graphs."""
+        self._prefill_disabled = True
         self._prefill_full_ops = {}
         self._prefill_combine_full_ops = {}
         self._prefill_combine_op = None
         self._prefill_up_op = None
         self._prefill_norm_op = None
+
+    def transpose_up_weight(self) -> None:
+        """Pre-transpose ``input_mix_weight_up.weight`` to ``[lowrank, hc*H]``.
+
+        Eliminates per-step runtime HBM ``{0, 1} -> {1, 0}`` layout copies on
+        ``[10240, 320]`` before Pallas/XLA HC projections while preserving
+        module parameter order across shape-variant buckets.
+        """
+        if (
+            not self.use_mix
+            or not hasattr(self, "input_mix_weight_up")
+            or self._up_transposed
+        ):
+            return
+        w = self.input_mix_weight_up.weight
+        self.input_mix_weight_up.weight = torch.nn.Parameter(
+            w.data.transpose(0, 1).contiguous(),
+            requires_grad=w.requires_grad,
+        )
+        self._up_transposed = True
+        if not self._decode_disabled and self._decode_mix_op is not None:
+            self._build_decode_ops(up_transposed=True)
+        if not self._prefill_disabled and self._prefill_up_op is not None:
+            from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
+                build_up_epilogue_op,
+            )
+
+            self._prefill_up_op = build_up_epilogue_op(
+                self.hc_count,
+                self.hidden_size,
+                self.prefill_up_tile,
+                up_transposed=True,
+            )
+        if (
+            not self._prefill_disabled
+            and self.prefill_full_tile
+            and self.config.hc_per_branch_norm
+            and self._hardware is not None
+        ):
+            self._build_prefill_full_ops(self._hardware, up_transposed=True)
 
     def _decode_weights(self):
         weights = (
@@ -521,7 +589,10 @@ class GatedResidual(common_hc.GatedResidual):
         ):
             mixed = self._prefill_up_op(gate, norm, self.input_mix_weight_up.weight)
             return mixed, self._residual(hyper_input, norm)
-        gate = F.linear(gate, self.input_mix_weight_up.weight)
+        if getattr(self, "_up_transposed", False):
+            gate = torch.matmul(gate, self.input_mix_weight_up.weight)
+        else:
+            gate = F.linear(gate, self.input_mix_weight_up.weight)
         gate = torch.sigmoid(gate.float())
         # Reduce the HC streams in the flat matmul-output layout. Unflattening
         # to [tokens, hc_count, hidden_size] forces an F32 layout conversion at
