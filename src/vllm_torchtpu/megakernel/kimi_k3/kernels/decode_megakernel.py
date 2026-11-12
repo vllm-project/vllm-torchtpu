@@ -6308,7 +6308,7 @@ def _vmem_budget(persistent, regions, *, limit=None, spill_reserve=None):
     return "\n".join(lines), peak
 
 
-VERIFY_CHUNK = 4  # kdecode P3.a: explicit DCP chunk rows (ring 3) for attention-DP verifies
+VERIFY_CHUNK = 4  # explicit DCP chunk rows (a three-chunk ring) for attention-DP verifies
 
 
 def _verify_chunk(rows, heads, sequence_rows):
@@ -8600,7 +8600,7 @@ def stack(
                         (attention_dp == 2 and batch_size == 128 and sequence_rows == 1)
                         or (attention_dp == 1 and batch_size in (16, 32) and sequence_rows == 1)
                     ),
-                    # Verify steps of 64 rows overlap it too; at 128 verify rows it is slower.
+                    # Verify steps of 64 rows overlap it too, those of 128 rows do not.
                     overlap_shared_reduction=(
                         batch_size in (16, 32, 64)
                         or (attention_dp == 2 and batch_size == 128 and sequence_rows == 1)
