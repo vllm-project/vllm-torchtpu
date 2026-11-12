@@ -1296,7 +1296,7 @@ def sparse_mla_attention_dcp(
     replicated_3d = P(None, None, None)
     in_specs = (
         replicated_3d,  # ql_nope
-        replicated_3d,  # q_pe
+        P(),  # q_pe: replicated 3D [T, H, *] or flat 2D [T, H * 256]
         P(None, None),  # kv_c_normed
         P(None, None),  # k_pe
         P(dcp_axis_name),  # kv_cache_nope
