@@ -6287,6 +6287,19 @@ class TPUModelRunner(GPUModelRunner):
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
 
+        # After the attention kernels: arming reads their final DCP, KV sharing
+        # and decode_query_size. Target model only; draft layers stay unfused.
+        if envs.TPU_FUSED_ATTN_PROJ:
+            from vllm_torchtpu.models.vllm import fused_attn_proj_patch
+
+            with set_current_vllm_config(self.vllm_config):
+                fused_attn_proj_patch.arm(
+                    self.model,
+                    self.model_config.hf_text_config,
+                    page_size=self._attention_kernel_block_size
+                    or self.cache_config.block_size,
+                )
+
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
         )
