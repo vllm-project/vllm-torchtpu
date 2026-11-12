@@ -128,6 +128,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_FINE_PREFIX_CONNECTOR: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_PREFILL_VPU: str = ""
+    VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX: str = ""
     VLLM_TPU_QSA_PREFILL_PAGE_COPIES: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_WALK: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT: int = 32768
@@ -975,6 +976,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kv_head_offset layers, short contexts, small steps, the union walk's
     # shared fallback).
     "VLLM_TPU_QSA_PREFILL_VPU": env_str("VLLM_TPU_QSA_PREFILL_VPU", ""),
+    # qwen4_exp QSA sparse prefill under DCP (block_sparse_gqa_prefill with
+    # dcp, FP32-score path, not with VLLM_TPU_QSA_PREFILL_VPU / BF16_MXU):
+    # online softmax with one stabilizer per (query subtile, KV head) taken
+    # from a whole-tile max and raised only when a tile exceeds it by more
+    # than 8 (lazy rescale), and lane-partial probability sums reduced once
+    # per query block, instead of a per-row max, rescale and sum per KV tile.
+    # A query block where any row with a visible key ends with a mass under
+    # e^-40 of the stabilizer is recomputed with the per-row softmax (exact
+    # fallback). Not bit-identical: f32 reassociation and BF16 rounding of
+    # differently scaled probabilities. "" / "0" = off; "1" = on. Test-only
+    # tokens (comma list with "1"): nobranch (always rescale), noguard (no
+    # fallback; the guard test's positive control).
+    "VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX": env_str(
+        "VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX", ""
+    ),
     # qwen4_exp QSA sparse prefill: fetch each KV tile with one DMA per
     # page-sized run instead of one per 128-row selection segment, when KV
     # tiles and pages nest (TP8: 1024-row tiles over 512-row pages; DCP: one
