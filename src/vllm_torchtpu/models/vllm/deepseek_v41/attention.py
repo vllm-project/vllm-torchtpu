@@ -36,6 +36,7 @@ from vllm_torchtpu.layers.adapter.custom_ops import deepseek_v41 as ops
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.vllm.deepseek_v4 import attention as v4_attn
 
+from . import pcp
 from .cache import ROPE_WORDS, ROW_WORDS, NativeCacheView, PagedCacheRows, write_cache
 from .compressor import (
     AttentionBackend,
@@ -549,8 +550,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         table_capacity = block_table(swa_meta).shape[1] * swa_cache.shape[1]
         window_cap = min(self.window_size + self.dspark_block_size, table_capacity)
+        cap = table_capacity if pcp.in_global_phase() else window_cap
         token_rows = torch.arange(positions.shape[0], device=positions.device)
-        keep_mask = (slots >= 0) & (token_rows >= query_ends[req_indices] - window_cap)
+        keep_mask = (slots >= 0) & (token_rows >= query_ends[req_indices] - cap)
         write_cache(swa_cache, slots, kv_rotated, keep_mask, after_read=after_read)
 
     def _gather_seq_swa(self, live_kv: Tensor | None = None) -> Tensor | None:
@@ -702,6 +704,25 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if self.compressor is not None and kv_score is not None:
             self._compress_kv(kv_score, positions, produce_indexer_k=True)
 
+    def _pcp_publish_kv(
+        self,
+        kv_rotated: Tensor,
+        kv_score: Tensor | None,
+    ) -> None:
+        """All-gather local KV projections and publish replicated step caches."""
+        step = pcp.current()
+        assert step is not None
+        with pcp.global_phase():
+            global_kv = step.gather(kv_rotated)
+            self._write_swa_kv(global_kv, step.positions)
+            if self.compressor is not None and kv_score is not None:
+                global_kv_score = step.gather(kv_score)
+                self._compress_kv(
+                    global_kv_score,
+                    step.positions,
+                    produce_indexer_k=True,
+                )
+
     # pyrefly: ignore[bad-override-param-name]
     def _prepare_and_attn(
         self,
@@ -736,6 +757,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if self.non_causal_multi_token_decode:
             pre_write_swa: Tensor | None = None
             compressed_latent: Tensor | None = None
+        elif pcp.current() is not None:
+            self._pcp_publish_kv(kv_rotated, kv_score)
+            pre_write_swa = self._gather_seq_swa()
+            swa_cache, _ = self._swa_state()
+            if isinstance(swa_cache, PagedCacheRows):
+                swa_cache._last_read = None
+            compressed_latent = None
         else:
             pre_write_swa = self._gather_seq_swa()
             self._write_swa_kv(

@@ -25,6 +25,7 @@ from vllm import forward_context
 
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
+from . import pcp
 from .cache import NativeCacheView, PagedCacheRows
 
 
@@ -74,9 +75,18 @@ def layer_meta(prefix: str) -> AttentionMetadata | None:
         Matching ``AttentionMetadata`` instance, or ``None`` if absent.
     """
     attn_metadata = forward_context.get_forward_context().attn_metadata
-    if isinstance(attn_metadata, dict):
-        return cast(AttentionMetadata | None, attn_metadata.get(prefix))
-    return cast(AttentionMetadata | None, attn_metadata)
+    meta = (
+        cast(AttentionMetadata | None, attn_metadata.get(prefix))
+        if isinstance(attn_metadata, dict)
+        else cast(AttentionMetadata | None, attn_metadata)
+    )
+    if (
+        meta is not None
+        and (step := pcp.current()) is not None
+        and not pcp.in_global_phase()
+    ):
+        return step.local(meta)
+    return meta
 
 
 def block_table(meta: AttentionMetadata) -> Tensor:
@@ -201,6 +211,17 @@ def replay_starts(
         Per-sequence lower bounds ``int32[num_seqs]``, or ``None`` if no replay
         or window lower bounds are active.
     """
+    if (step := pcp.current()) is not None and not ced_decoder:
+        starts = (
+            step.global_window_starts
+            if pcp.in_global_phase()
+            else step.local_window_starts
+        )
+        if starts is not None and starts.numel() > 0:
+            seq_indices = torch.arange(num_seqs, device=device).clamp_max(
+                starts.shape[0] - 1
+            )
+            return starts.int()[seq_indices]
     window_starts = _context_starts("deepseek_v41_window_starts", num_seqs, device)
     decoder_starts = _context_starts("deepseek_v41_replay_starts", num_seqs, device)
     if ced_decoder:

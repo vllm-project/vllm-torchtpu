@@ -299,6 +299,181 @@ def _patch_moe_explicit_pcp_collectives() -> None:
     )
 
 
+def _patch_vllm_engram_dp_group_pcp() -> None:
+    """Extend node-local DeepSeek-V4.1 Engram DP groups across PCP ranks at TP=1
+    so all PCP workers on a host share one ``/dev/shm`` L1 Engram table.
+    """
+    import torch
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.config.engram import EngramConfig
+    from vllm.distributed import parallel_state
+
+    engram_marker = "_tpu_engram_pcp_patch"
+    if not EngramConfig.resolve_dp_shared_memory.__dict__.get(engram_marker, False):
+        original_verify_model = EngramConfig.verify_model_config
+        original_resolve = EngramConfig.resolve_dp_shared_memory
+        original_verify = EngramConfig.verify_parallel_config
+
+        def _pcp_shares_engram_host_table(self: EngramConfig, parallel_config) -> bool:
+            return (
+                self.__dict__.get("_tpu_is_dsv41", True)
+                and parallel_config.prefill_context_parallel_size > 1
+                and parallel_config.tensor_parallel_size == 1
+                and not parallel_config.enable_elastic_ep
+            )
+
+        def verify_model_config(self: EngramConfig, model_config) -> None:
+            original_verify_model(self, model_config)
+            object.__setattr__(
+                self,
+                "_tpu_is_dsv41",
+                model_config is not None
+                and model_config.architecture == "DeepseekV41ForCausalLM",
+            )
+
+        def resolve_dp_shared_memory(self: EngramConfig, parallel_config) -> None:
+            if self.dp_shared_memory is None and _pcp_shares_engram_host_table(
+                self, parallel_config
+            ):
+                self.dp_shared_memory = self.cpu_offload and not self.use_thp
+                return
+            original_resolve(self, parallel_config)
+
+        def verify_parallel_config(self: EngramConfig, parallel_config) -> None:
+            if (
+                self.dp_shared_memory
+                and parallel_config.data_parallel_size <= 1
+                and _pcp_shares_engram_host_table(self, parallel_config)
+            ):
+                return
+            original_verify(self, parallel_config)
+
+        resolve_dp_shared_memory.__dict__[engram_marker] = True
+        EngramConfig.verify_model_config = verify_model_config
+        EngramConfig.resolve_dp_shared_memory = resolve_dp_shared_memory
+        EngramConfig.verify_parallel_config = verify_parallel_config
+
+    if parallel_state.__dict__.get("_tpu_engram_dp_pcp_patch", False):
+        return
+
+    original_shard_size = parallel_state._engram_dp_shard_size
+    original_init = parallel_state.initialize_model_parallel
+    defer_to_post_init = False
+
+    def _is_dsv41_engram_config(vllm_config) -> bool:
+        return (
+            vllm_config is not None
+            and vllm_config.engram_config is not None
+            and vllm_config.model_config is not None
+            and vllm_config.model_config.architecture == "DeepseekV41ForCausalLM"
+            and not vllm_config.parallel_config.enable_elastic_ep
+        )
+
+    def _engram_dp_shard_size(
+        world_size: int,
+        data_parallel_size: int,
+        replica_size: int,
+    ) -> int:
+        if defer_to_post_init:
+            return 1
+        vllm_config = get_current_vllm_config_or_none()
+        if _is_dsv41_engram_config(vllm_config):
+            assert vllm_config is not None
+            parallel = vllm_config.parallel_config
+            pcp = parallel.prefill_context_parallel_size
+            tp = parallel.tensor_parallel_size
+            if pcp > 1:
+                if tp == 1 and replica_size % pcp == 0:
+                    return original_shard_size(
+                        world_size,
+                        data_parallel_size * pcp,
+                        replica_size // pcp,
+                    )
+                logger.warning_once(
+                    "Cannot extend Engram DP group across PCP=%d ranks "
+                    "(tensor_parallel_size=%d, replica_size=%d); PCP workers "
+                    "will not share a node-local Engram table.",
+                    pcp,
+                    tp,
+                    replica_size,
+                )
+        return original_shard_size(world_size, data_parallel_size, replica_size)
+
+    def initialize_model_parallel(
+        tensor_model_parallel_size: int = 1,
+        pipeline_model_parallel_size: int = 1,
+        prefill_context_model_parallel_size: int = 1,
+        decode_context_model_parallel_size: int | None = 1,
+        backend: str | None = None,
+    ) -> None:
+        nonlocal defer_to_post_init
+        use_pcp_edp = (
+            prefill_context_model_parallel_size > 1 and tensor_model_parallel_size == 1
+        )
+        defer_to_post_init = use_pcp_edp
+        try:
+            original_init(
+                tensor_model_parallel_size=tensor_model_parallel_size,
+                pipeline_model_parallel_size=pipeline_model_parallel_size,
+                prefill_context_model_parallel_size=(
+                    prefill_context_model_parallel_size
+                ),
+                decode_context_model_parallel_size=decode_context_model_parallel_size,
+                backend=backend,
+            )
+        finally:
+            defer_to_post_init = False
+
+        if not use_pcp_edp or parallel_state._ENGRAM_DP is not None:
+            return
+        vllm_config = get_current_vllm_config_or_none()
+        if not _is_dsv41_engram_config(vllm_config):
+            return
+        assert vllm_config is not None
+        world_group = parallel_state.get_world_group()
+        world_size = world_group.world_size
+        dp_size = vllm_config.parallel_config.data_parallel_size
+        replica_size = (
+            tensor_model_parallel_size
+            * pipeline_model_parallel_size
+            * prefill_context_model_parallel_size
+        )
+        engram_dp_size = _engram_dp_shard_size(world_size, dp_size, replica_size)
+        if engram_dp_size <= 1:
+            return
+        all_ranks = torch.arange(world_size).reshape(
+            -1,
+            dp_size,
+            pipeline_model_parallel_size,
+            prefill_context_model_parallel_size,
+            tensor_model_parallel_size,
+        )
+        group_ranks = (
+            all_ranks.permute(0, 2, 4, 1, 3).reshape(-1, engram_dp_size).unbind(0)
+        )
+        resolved_backend = backend or torch.distributed.get_backend(
+            world_group.device_group
+        )
+        parallel_state._ENGRAM_DP = parallel_state.init_model_parallel_group(
+            [ranks.tolist() for ranks in group_ranks],
+            world_group.local_rank,
+            resolved_backend,
+            group_name="edp",
+        )
+        logger.info_once(
+            "Engram node-local DP+PCP group size: %d (DP=%d, PCP=%d, TP=%d)",
+            engram_dp_size,
+            dp_size,
+            prefill_context_model_parallel_size,
+            tensor_model_parallel_size,
+        )
+
+    parallel_state._engram_dp_shard_size = _engram_dp_shard_size
+    parallel_state.initialize_model_parallel = initialize_model_parallel
+    parallel_state.__dict__["_tpu_engram_dp_pcp_patch"] = True
+    logger.info("Applied TPU patch: extend Engram DP group across PCP ranks at TP=1.")
+
+
 def _patch_expert_map_host_lookup() -> None:
     """Build the expert map on the host and serve host readers from a copy.
 

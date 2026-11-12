@@ -760,19 +760,25 @@ class TpuPlatform(Platform):
         """Move DP metadata onto the TPU for DP+EP.
 
         vLLM builds ``num_tokens_across_dp_cpu`` on CPU, but TPU compiled
-        forwards require tensor arguments to be on device.
+        forwards require tensor arguments to be on device. Retain the host
+        integer tuple alongside it so CPU-side consumers do not synchronize
+        the device tensor back to host.
         """
+        extra: dict[str, tuple[int, ...]] = {}
         dp_metadata = kwargs.get("dp_metadata")
         if dp_metadata is not None:
             t = dp_metadata.num_tokens_across_dp_cpu
             if t.device.type == "cpu":
+                extra["tpu_num_tokens_across_dp_cpu"] = tuple(
+                    int(v) for v in t.tolist()
+                )
                 tpu_t = t.to("tpu")
                 try:
                     dp_metadata.num_tokens_across_dp_cpu = tpu_t
                 except Exception:
                     # Frozen dataclass fallback.
                     object.__setattr__(dp_metadata, "num_tokens_across_dp_cpu", tpu_t)
-        return {}
+        return extra
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

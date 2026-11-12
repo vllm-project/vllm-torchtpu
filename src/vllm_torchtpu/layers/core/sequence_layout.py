@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import bisect
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, cast
@@ -68,6 +69,7 @@ class SequenceLayoutPlan:
     logits_local_indices_cpu: torch.Tensor | None = None
     logits_owner_mask_cpu: torch.Tensor | None = None
     requires_hidden_state_gather: bool = False
+    is_dummy: bool = False
     # Optional packed-global to request-major token order. Padding rows use
     # -1. Real PCP plans carry both mapping directions.
     _packed_to_request_major_token_indices: np.ndarray | None = None
@@ -236,9 +238,16 @@ class SequenceLayoutPlanner(Protocol):
     @property
     def uses_selected_logits_hidden_states(self) -> bool: ...
 
+    @property
+    def retains_request_replay_starts(self) -> bool: ...
+
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int
     ) -> None: ...
+
+    def cap_local_token_paddings(
+        self, paddings: Sequence[int], max_batched_tokens: int
+    ) -> list[int]: ...
 
     def prepare_real(
         self,
@@ -300,10 +309,20 @@ class AllSequenceLayoutPlanner:
     def uses_selected_logits_hidden_states(self) -> bool:
         return False
 
+    @property
+    def retains_request_replay_starts(self) -> bool:
+        return False
+
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int
     ) -> None:
         del runner, required_num_tokens
+
+    def cap_local_token_paddings(
+        self, paddings: Sequence[int], max_batched_tokens: int
+    ) -> list[int]:
+        del max_batched_tokens
+        return [int(p) for p in paddings]
 
     def prepare_real(
         self,
@@ -360,6 +379,7 @@ class AllSequenceLayoutPlanner:
             global_padded_num_tokens=num_tokens,
             local_num_tokens=num_tokens,
             local_padded_num_tokens=num_tokens,
+            is_dummy=True,
         )
 
     def finalize_hidden_states(

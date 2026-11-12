@@ -966,7 +966,21 @@ class TPUModelRunner(GPUModelRunner):
         # are ints here; the config field's own type also admits str and None.
         compile_sizes = vllm_config.compilation_config.compile_sizes
         assert compile_sizes, "TPUPlatform sets compile_sizes"
-        self.num_tokens_paddings: list[int] = [int(size) for size in compile_sizes]
+        raw_paddings = [int(size) for size in compile_sizes]
+        max_batched_tokens = int(self.scheduler_config.max_num_batched_tokens)
+        capped_paddings = self.sequence_layout_planner.cap_local_token_paddings(
+            raw_paddings, max_batched_tokens
+        )
+        if capped_paddings != raw_paddings:
+            logger.info(
+                "Capped local token buckets for partial layout at %d (was %d).",
+                capped_paddings[-1],
+                raw_paddings[-1],
+            )
+            vllm_config.compilation_config.compile_sizes = cast(
+                list[int | str], list(capped_paddings)
+            )
+        self.num_tokens_paddings: list[int] = capped_paddings
         # Override parent's max_num_tokens with the last (largest) padding
         # bucket so all CPU staging buffers cover it.
         self.max_num_tokens = self.num_tokens_paddings[-1]
@@ -1024,15 +1038,16 @@ class TPUModelRunner(GPUModelRunner):
             self.mrope_positions = self._make_buffer(
                 3, self.max_num_tokens + 1, dtype=torch.int32
             )
+        req_buf_len = max(self.max_num_tokens, self.max_num_reqs)
         self.query_start_loc_cpu = torch.zeros(
-            self.max_num_tokens + 1,
+            req_buf_len + 1,
             dtype=torch.int32,
             device="cpu",
             pin_memory=PIN_MEMORY,
         )
         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
         self.seq_lens_cpu = torch.zeros(
-            self.max_num_tokens, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+            req_buf_len, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
         )
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         if self.supports_mm_inputs:
@@ -1042,7 +1057,7 @@ class TPUModelRunner(GPUModelRunner):
                 device="cpu",
                 pin_memory=PIN_MEMORY,
             )
-        self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
+        self.arange_np = np.arange(req_buf_len, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
@@ -3654,7 +3669,10 @@ class TPUModelRunner(GPUModelRunner):
             ),
             replay_starts_cpu=(
                 self._build_replay_starts_cpu(start_index, num_reqs, target_num_reqs)
-                if layout_plan.kind is SequenceLayoutKind.ALL
+                if (
+                    layout_plan.kind is SequenceLayoutKind.ALL
+                    or self.sequence_layout_planner.retains_request_replay_starts
+                )
                 else None
             ),
             mamba_state_indices=mamba_state_indices,
@@ -4081,8 +4099,16 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output
         )
+        pcp_world = (
+            max(1, int(self.parallel_config.prefill_context_parallel_size))
+            if self._pcp_enabled
+            else 1
+        )
+        local_sched_tokens = cdiv(
+            scheduler_output.total_num_scheduled_tokens, pcp_world
+        )
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
-            scheduler_output.total_num_scheduled_tokens,
+            local_sched_tokens,
             local_num_chunks,
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
@@ -4110,8 +4136,9 @@ class TPUModelRunner(GPUModelRunner):
         batch_composition_stats = None
         if self.phase_based_profiler:
             self.batch_counter += 1
-            padded_total_tokens = _get_padded_token_len(
-                self.num_tokens_paddings, scheduler_output.total_num_scheduled_tokens
+            padded_total_tokens = (
+                _get_padded_token_len(self.num_tokens_paddings, local_sched_tokens)
+                * pcp_world
             )
             batch_composition_stats = runner_utils.get_batch_composition_stats(
                 batch_id=self.batch_counter,
@@ -6029,6 +6056,7 @@ class TPUModelRunner(GPUModelRunner):
             num_reqs=num_reqs,
             kv_cache_initialized=kv_cache_initialized,
         )
+        self._last_sequence_layout_plan = dummy_layout_plan
 
         self._lookback_chunk_span = (0, num_reqs)
         if self.kv_cache_config is not None:
@@ -8222,9 +8250,12 @@ class TPUModelRunner(GPUModelRunner):
                 if span is None
                 else min(span[1], max(0, self.input_batch.num_reqs - start_idx))
             )
-            kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
-                chunk_reqs, start_index=start_idx
-            )
+            if not self.model.prepare_host_lookback_step(
+                self, chunk_reqs, start_index=start_idx
+            ):
+                kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
+                    chunk_reqs, start_index=start_idx
+                )
         out = self.model(
             input_ids=input_ids,
             positions=positions,

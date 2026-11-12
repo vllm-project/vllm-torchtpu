@@ -119,12 +119,14 @@ class PcpSequenceLayoutEligibility:
         dcp_size: int = 1,
         pipeline_parallel_size: int = 1,
         async_scheduling: bool = False,
+        contiguous_split: bool = False,
     ):
         self.pcp_size = pcp_size
         self.interleave_size = interleave_size
         self.dcp_size = dcp_size
         self.pipeline_parallel_size = pipeline_parallel_size
         self.async_scheduling = bool(async_scheduling)
+        self.contiguous_split = bool(contiguous_split)
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "PcpSequenceLayoutEligibility":
@@ -133,6 +135,9 @@ class PcpSequenceLayoutEligibility:
 
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
+        # Lightweight SimpleNamespace test stubs may omit model_config.
+        model_config = getattr(vllm_config, "model_config", None)
+        contiguous_split = bool(getattr(model_config, "use_mla", False))
 
         return cls(
             pcp_size=parallel_config.prefill_context_parallel_size,
@@ -140,6 +145,7 @@ class PcpSequenceLayoutEligibility:
             dcp_size=parallel_config.decode_context_parallel_size,
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             async_scheduling=bool(scheduler_config.async_scheduling),
+            contiguous_split=contiguous_split,
         )
 
     @property
@@ -277,16 +283,20 @@ class PcpSequenceLayoutEligibility:
                 "request in the chunk."
             )
 
-        q_block_size = _get_pcp_streaming_q_block_size()
-        if q_block_size % self.interleave_size != 0:
-            raise NotImplementedError(
-                "PCP streaming requires q_block_size to be a "
-                "multiple of cp_kv_cache_interleave_size, got "
-                f"{q_block_size=} "
-                f"cp_kv_cache_interleave_size={self.interleave_size}."
-            )
-
         q_lens = np.asarray([span.scheduled_tokens for span in spans], dtype=np.int32)
+        interleave_size = self.interleave_size
+        if self.contiguous_split:
+            interleave_size = max(1, -(-int(q_lens.sum()) // self.pcp_size))
+        else:
+            q_block_size = _get_pcp_streaming_q_block_size()
+            if q_block_size % self.interleave_size != 0:
+                raise NotImplementedError(
+                    "PCP streaming requires q_block_size to be a "
+                    "multiple of cp_kv_cache_interleave_size, got "
+                    f"{q_block_size=} "
+                    f"cp_kv_cache_interleave_size={self.interleave_size}."
+                )
+
         absolute_query_starts = np.asarray(
             [span.absolute_query_start for span in spans], dtype=np.int64
         )
@@ -300,7 +310,7 @@ class PcpSequenceLayoutEligibility:
         local_counts = pcp_local_token_counts(
             q_lens,
             self.pcp_size,
-            self.interleave_size,
+            interleave_size,
             token_owner_start_offsets_per_req=token_owner_starts,
         )
         local_required_tokens = int(local_counts.max(initial=0))
@@ -324,7 +334,7 @@ class PcpSequenceLayoutEligibility:
             mode=PcpSequenceLayoutMode.STREAMING,
             spans=spans,
             pcp_size=self.pcp_size,
-            interleave_size=self.interleave_size,
+            interleave_size=interleave_size,
             pcp_alignment=None,
             absolute_query_start_offsets_per_req=absolute_query_starts,
             token_owner_start_offsets_per_req=token_owner_starts,
@@ -373,11 +383,33 @@ class PcpSequenceLayoutPlanner:
     def uses_selected_logits_hidden_states(self) -> bool:
         return self.enabled
 
+    @property
+    def retains_request_replay_starts(self) -> bool:
+        return bool(self.enabled and self.eligibility.contiguous_split)
+
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int
     ) -> None:
         if self.enabled:
             _ensure_host_token_buffer_capacity(runner, required_num_tokens)
+
+    def cap_local_token_paddings(
+        self, paddings: Sequence[int], max_batched_tokens: int
+    ) -> list[int]:
+        sorted_paddings = sorted(int(p) for p in paddings)
+        if (
+            not sorted_paddings
+            or not self.enabled
+            or not self.eligibility.contiguous_split
+        ):
+            return sorted_paddings
+        cap = max(1, -(-int(max_batched_tokens) // self.eligibility.pcp_size))
+        ceiling = (
+            _first_ge(sorted_paddings, cap)
+            if cap <= sorted_paddings[-1]
+            else sorted_paddings[-1]
+        )
+        return [p for p in sorted_paddings if p <= ceiling]
 
     def prepare_real(
         self,
@@ -468,6 +500,7 @@ class PcpSequenceLayoutPlanner:
             local_num_tokens=num_tokens,
             local_padded_num_tokens=num_tokens,
             requires_hidden_state_gather=True,
+            is_dummy=True,
         )
 
     def finalize_hidden_states(

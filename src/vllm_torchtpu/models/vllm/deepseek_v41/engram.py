@@ -18,24 +18,31 @@ from __future__ import annotations
 import tempfile
 from collections.abc import Callable
 from contextlib import ExitStack
-from typing import cast
+from dataclasses import dataclass
+from typing import Any, cast
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from vllm.config import get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_engram_dp_group,
     get_engram_dp_size,
+    get_pcp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
 from vllm.models.deepseek_v41.common import engram as upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
+from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
+
 from .cache import NativeCacheView, write_cache
+
+_LOOKBACK_PAD_TOKEN_ID: int = -1
 
 _INVALID_SCALE: int = 255
 _FP32_MANTISSA_BITS: int = 23
@@ -105,6 +112,155 @@ def _gather_engram_rows(rows: torch.Tensor, dim: int) -> torch.Tensor:
     return gathered
 
 
+def engram_token_slot(default_tokens: int) -> int:
+    """Return the padded per-rank token slot across the Engram DP group."""
+    if not upstream.is_forward_context_available():
+        return default_tokens
+    forward_ctx = upstream.get_forward_context()
+    if forward_ctx.dp_metadata is None:
+        return default_tokens
+    saved = forward_ctx.additional_kwargs.get("tpu_num_tokens_across_dp_cpu")
+    if saved is not None and len(saved) > 0:
+        return max(int(val) for val in saved)
+    return default_tokens
+
+
+def gather_engram_hashes(
+    hash_ids: Tensor,
+    *,
+    dp_shared_memory: bool = False,
+) -> Tensor:
+    """All-gather Engram ``hash_ids`` across the Engram DP group.
+
+    Uses ``dp_group.cpu_group`` on CPU tensors to avoid device collectives or
+    D2H syncs when staging host-offloaded Engram tables.
+    """
+    if dp_shared_memory:
+        return hash_ids
+    dp_group = get_engram_dp_group()
+    if dp_group is None or dp_group.world_size <= 1:
+        if (
+            upstream.is_forward_context_available()
+            and upstream.get_forward_context().dp_metadata is not None
+        ):
+            return upstream.gather_engram_hashes(hash_ids, dp_shared_memory=False)
+        return hash_ids
+    slot = engram_token_slot(hash_ids.shape[0])
+    if hash_ids.shape[0] == slot:
+        padded = hash_ids.contiguous()
+    else:
+        padded = hash_ids.new_zeros((slot, *hash_ids.shape[1:]))
+        valid = min(slot, hash_ids.shape[0])
+        if valid > 0:
+            padded[:valid] = hash_ids[:valid]
+    if padded.device.type == "cpu":
+        chunks = [torch.empty_like(padded) for _ in range(dp_group.world_size)]
+        dist.all_gather(chunks, padded, group=dp_group.cpu_group)
+        return torch.cat(chunks, dim=0)
+    return dp_group.all_gather(padded, dim=0)
+
+
+@dataclass(frozen=True)
+class HostEngramInputs:
+    """Host-side request-major inputs for zero-sync Engram n-gram hashing."""
+
+    tokens: Tensor
+    positions: Tensor
+    query_start_loc: Tensor
+    lookback: Tensor
+    local_start: int
+    num_local: int
+    local_tokens: int
+
+
+def capture_host_engram_inputs(
+    runner: Any,
+    num_reqs: int,
+    start_index: int,
+    lookback_depth: int,
+) -> HostEngramInputs | None:
+    """Snapshot request-major CPU tokens, positions, and lookback from ``runner``."""
+    plan = runner._last_sequence_layout_plan
+    if num_reqs <= 0 or (plan is not None and plan.is_dummy):
+        return HostEngramInputs(
+            tokens=torch.empty(0, dtype=torch.int32),
+            positions=torch.empty(0, dtype=torch.int32),
+            query_start_loc=torch.zeros(1, dtype=torch.int32),
+            lookback=torch.empty((0, lookback_depth), dtype=torch.int32),
+            local_start=0,
+            num_local=0,
+            local_tokens=0 if plan is None else int(plan.local_padded_num_tokens),
+        )
+    if plan is None:
+        return None
+
+    qsl_np = runner.query_start_loc_np[: num_reqs + 1]
+    total = int(qsl_np[num_reqs])
+    qsl = torch.from_numpy(qsl_np.astype(np.int32, copy=True))
+    if plan.kind is SequenceLayoutKind.ALL:
+        tokens = runner.input_ids_cpu[:total].to(torch.int32).clone()
+        positions = runner.positions_cpu[:total].to(torch.int32).clone()
+        local_start = 0
+        num_local = total
+    else:
+        packed_idx = plan._request_major_to_packed_token_indices
+        if packed_idx is None or packed_idx.size != total:
+            return None
+        idx_t = torch.from_numpy(packed_idx).long()
+        tokens = runner.input_ids_cpu.index_select(0, idx_t).to(torch.int32)
+        positions = runner.positions_cpu.index_select(0, idx_t).to(torch.int32)
+        pcp_size = max(1, int(runner.parallel_config.prefill_context_parallel_size))
+        pcp_rank = int(get_pcp_group().rank_in_group) if pcp_size > 1 else 0
+        interleave = max(1, -(-total // pcp_size)) if total > 0 else 0
+        local_start = min(pcp_rank * interleave, total)
+        num_local = min(local_start + interleave, total) - local_start
+
+    batch = runner.input_batch
+    end_idx = start_index + num_reqs
+    starts = batch.num_computed_tokens_cpu[start_index:end_idx, None]
+    lookback_pos = starts - np.arange(1, lookback_depth + 1)
+    limits = batch.num_tokens_no_spec[start_index:end_idx, None]
+    valid_lb = (lookback_pos >= 0) & (lookback_pos < limits)
+    batch_rows = np.arange(start_index, end_idx)[:, None]
+    max_col = max(int(batch.token_ids_cpu.shape[1]) - 1, 0)
+    gathered_lb = batch.token_ids_cpu[batch_rows, np.clip(lookback_pos, 0, max_col)]
+    lb_np = np.where(valid_lb, gathered_lb, _LOOKBACK_PAD_TOKEN_ID).astype(np.int32)
+
+    pre_async = runner._pre_async_results
+    if pre_async is not None and pre_async.request_seq_lens:
+        discard = set(pre_async.discard_sampled_tokens_req_indices)
+        req_map = {
+            req_id: pre_req_idx
+            for pre_req_idx, _, _, req_id in pre_async.request_seq_lens
+            if pre_req_idx not in discard
+        }
+        chunk_req_ids = batch.req_ids[start_index:end_idx]
+        if any(req_id in req_map for req_id in chunk_req_ids):
+            pre_next_cpu = pre_async.wait_for_copy()
+            if pre_next_cpu is not None:
+                for row, req_id in enumerate(chunk_req_ids):
+                    pre_idx = req_map.get(req_id)
+                    if pre_idx is not None:
+                        sampled_tok = int(pre_next_cpu[pre_idx, 0].item())
+                        q_s, q_e = int(qsl_np[row]), int(qsl_np[row + 1])
+                        if q_e > q_s:
+                            tokens[q_e - 1] = sampled_tok
+                        placeholder_pos = int(limits[row, 0]) - 1
+                        lb_hits = lookback_pos[row] == placeholder_pos
+                        if np.any(lb_hits):
+                            lb_np[row, lb_hits] = sampled_tok
+
+    return HostEngramInputs(
+        tokens=tokens,
+        positions=positions,
+        query_start_loc=qsl,
+        lookback=torch.from_numpy(lb_np),
+        local_start=local_start,
+        num_local=num_local,
+        local_tokens=int(plan.local_padded_num_tokens),
+    )
+
+
 def _dp_gather_engram_rows(staged: torch.Tensor, num_tokens: int) -> torch.Tensor:
     """All-gather head-sharded ``staged`` rows across the Engram DP group.
 
@@ -127,9 +283,8 @@ def _dp_gather_engram_rows(staged: torch.Tensor, num_tokens: int) -> torch.Tenso
     gathered = dp_group.all_gather(padded, dim=0)
     if pad:
         gathered = gathered[..., :width]
-    start = dp_group.rank_in_group * tokens_per_rank
-    selected = gathered.view(dp_size, dp_size * tokens_per_rank, num_heads, width)[
-        :, start : start + num_tokens
+    selected = gathered.view(dp_size, dp_size, tokens_per_rank, num_heads, width)[
+        :, dp_group.rank_in_group, :num_tokens
     ]
     return (
         selected.transpose(0, 1)
@@ -238,6 +393,29 @@ class NgramHashState(upstream.NgramHashState):
     """
 
     _cached_cpu_tables: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        layout: upstream.EngramLayout,
+        swa_cache_module: nn.Module,
+    ) -> None:
+        target_device = torch.empty(0).device
+        with torch.device("cpu"):
+            super().__init__(vllm_config, layout, swa_cache_module)
+            flat_primes = self.primes.flatten(1)
+            offsets_cpu = torch.cumsum(flat_primes, dim=1) - flat_primes
+        self._cached_cpu_tables = (
+            self.token_map,
+            self.multipliers,
+            self.primes,
+            offsets_cpu,
+        )
+        self.offsets = offsets_cpu.to(target_device)
+        if target_device.type != "cpu":
+            self.token_map = self.token_map.to(target_device)
+            self.multipliers = self.multipliers.to(target_device)
+            self.primes = self.primes.to(target_device)
 
     def ensure_cache(self) -> bool:
         """Synchronize ``block_size`` with ``swa_cache_module`` and allocate slots.
@@ -674,7 +852,7 @@ class Engram(upstream.Engram):
         self._staged_raw = init.to(self.staged_rows.device)
 
     def _staged_pair(self, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(flat_root_i32, view_2d)`` device staging buffers for a bucket."""
+        """Return ``(flat_root_i32, dynamic_view)`` device staging buffers."""
         assert self._staged_raw is not None
         pair = self._staged_by_tokens.get(num_tokens)
         if pair is None:
@@ -687,9 +865,16 @@ class Engram(upstream.Engram):
                 init = torch.zeros(num_tokens * words_per_token, dtype=torch.int32)
                 init[raw_words:].fill_(-1)
                 staged = init.to(self._staged_raw.device)
-            view = staged.view(num_tokens, words_per_token)
-            if num_tokens >= 2:
-                torch._dynamo.mark_dynamic(view, 0)
+            dp_size = self.embed_tokens.dp_size
+            if dp_size > 1 and num_tokens % dp_size == 0:
+                slot = num_tokens // dp_size
+                view = staged.view(dp_size, slot, words_per_token)
+                if slot >= 2:
+                    torch._dynamo.mark_dynamic(view, 1)
+            else:
+                view = staged.view(num_tokens, words_per_token)
+                if num_tokens >= 2:
+                    torch._dynamo.mark_dynamic(view, 0)
             pair = (staged, view)
             self._staged_by_tokens[num_tokens] = pair
         return pair
@@ -700,6 +885,8 @@ class Engram(upstream.Engram):
 
     def staged_device_tensors(self) -> tuple[torch.Tensor, ...]:
         """Active staged device buffers prepared on the current step."""
+        if not self.is_staged():
+            return (self.staged_rows,) if self.staged_rows.numel() > 0 else ()
         return tuple(
             tensor
             for tensor in (self._active_staged, self._active_raw)
@@ -767,7 +954,7 @@ class Engram(upstream.Engram):
         dp_size = self.embed_tokens.dp_size
         if self._staged_raw is None:
             if dp_size > 1:
-                slot = upstream.engram_gathered_num_tokens()
+                slot = engram_token_slot(num_tokens)
                 return _dp_gather_engram_rows(
                     self.staged_rows[: slot * dp_size], num_tokens
                 )
@@ -780,12 +967,12 @@ class Engram(upstream.Engram):
         active = self._active_raw
         if active is None:
             fallback_tokens = (
-                num_tokens
-                if dp_size == 1
-                else upstream.engram_gathered_num_tokens() * dp_size
+                num_tokens if dp_size == 1 else engram_token_slot(num_tokens) * dp_size
             )
             _, active = self._staged_pair(fallback_tokens)
-        staged_tokens = active.shape[0]
+        staged_tokens = (
+            active.shape[0] * active.shape[1] if active.ndim == 3 else active.shape[0]
+        )
         by_word = active.view(raw_words_per_tok + scale_words_per_tok, staged_tokens)
         raw = _unpack_bytes(
             by_word[:raw_words_per_tok].reshape(-1),

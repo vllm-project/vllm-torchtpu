@@ -412,6 +412,16 @@ class TokenLookbackModel:
 
     token_lookback_depth: int = 0
 
+    def prepare_host_lookback_step(
+        self,
+        runner: Any,
+        num_reqs: int,
+        start_index: int = 0,
+    ) -> bool:
+        """Capture optional host-side lookback inputs; return True if handled."""
+        del runner, num_reqs, start_index
+        return False
+
 
 def tpu_bind_kv_cache(
     kv_caches: Mapping[str, torch.Tensor | Sequence[torch.Tensor]],
