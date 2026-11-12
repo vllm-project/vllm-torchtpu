@@ -129,7 +129,8 @@ def _compute_local_expert_ids() -> set[int] | None:
     ):
         return None
     # EPLB redundant slots may need foreign logical experts; do not filter.
-    if parallel_config.enable_eplb:
+    # Same for the TPU redundant experts (VLLM_TPU_MOE_REDUNDANT_EXPERTS).
+    if parallel_config.enable_eplb or envs.VLLM_TPU_MOE_REDUNDANT_EXPERTS:
         return None
     num_experts = model_config.get_num_experts()
     if num_experts <= 0:
