@@ -306,6 +306,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
     VLLM_TPU_MAMBA_TAIL_FOLD: bool = False
     VLLM_TPU_MAMBA_TAIL_FOLD_UNIT: int = 0
+    VLLM_TPU_MAMBA_TAIL_FOLD_UNIT_CP: bool = False
     VLLM_TPU_MAMBA_TAIL_FOLD_DCP: bool = False
     VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY: bool = False
     VLLM_TPU_TAIL_HOLD_STEPS: int = 0
@@ -2083,6 +2084,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stops at most unit - 1 tokens short of the prior prompt instead of up
     # to 511. Also sets --prefix-match-unit to the unit when it is unset.
     "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT": env_int("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", 0),
+    # VLLM_TPU_MAMBA_TAIL_FOLD_UNIT is not applied when context parallelism
+    # (e.g. VLLM_TPU_QSA_MAIN_KV_DCP=2) keeps the fold off: there the finer
+    # hash only adds short prefill chunks. 1 = apply it anyway (old behavior).
+    "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT_CP": env_bool(
+        "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT_CP", default=False
+    ),
     # PrefixAwareScheduler: hold a running request's short prefill remainder
     # (the Mamba-aligned tail) for up to this many steps while no other
     # prefill can run in the step and other requests still run in it, so the
