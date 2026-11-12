@@ -91,7 +91,8 @@ def _run_role(role: str, exchange: Path) -> None:
     apc = settings.get("apc", False)
     skip_blocks = settings.get("skip_blocks", 0)
     k = settings["producer_k" if role == "prefill" else "consumer_k"]
-    source_capacity = 256 if settings["producer_k"] else 128
+    # Multi-region pools allocate capacity per region (12/13 regions).
+    source_capacity = 32
     capacity = source_capacity if role == "prefill" else source_capacity * 5 // 4
     config, materialized = live_pool(
         device="tpu", num_blocks=capacity, ssm=ssm_dtype, k=k, apc=apc
@@ -188,7 +189,10 @@ def _run_role(role: str, exchange: Path) -> None:
     )
     tags, blocks, counts = worker._stage3_grouped_destination_pages(load, num_tokens)
     clips = worker._stage3_grouped_skip_bytes(load)
-    assert len(tags) == len(manifest.pools) == len(materialized.kv_caches)
+    ring_keys = {k for k in materialized.kv_caches if k.endswith(".raw_ring")}
+    assert (
+        len(tags) == len(manifest.pools) == len(materialized.kv_caches) - len(ring_keys)
+    )
     if role == "prefill":
         send = SendMeta(
             uuid=1,

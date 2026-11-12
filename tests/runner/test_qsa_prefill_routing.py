@@ -69,14 +69,15 @@ def runner_inputs(
     )
     runner.model_config = NS(hf_text_config=q4exp_text_config())
     runner.cache_config.block_size = page
+    runner._init_qsa_ring_slots = TPUModelRunner._init_qsa_ring_slots.__get__(runner)
+    runner._build_qsa_ring_slots = TPUModelRunner._build_qsa_ring_slots.__get__(runner)
+    runner._init_qsa_ring_slots(16)
     columns = math.ceil((context + tokens) / page)
-    # Compressed keys share main logical IDs; raw rings own separate IDs.
     tables = [
         torch.arange(1, columns + 1, dtype=torch.int32)[None],
-        torch.tensor([[columns + 1]], dtype=torch.int32),
     ]
     runner.input_batch.block_table = [_BlockTable(t) for t in tables]
-    names = ("model.layers.3.self_attn", "model.layers.3.self_attn.raw_ring")
+    names = ("model.layers.3.self_attn",)
     builders = [
         AttentionMetadataBuilder(
             specs[name], [name], cfg, torch.device("cpu"), runner, i
@@ -106,11 +107,10 @@ def runner_inputs(
     )
     assert kwargs["query_start_loc"].tolist() == [0] + [active_tokens] * 8
     assert kwargs["context_lens"].tolist() == [context] + [0] * 7
-    ring_tables = prepared[0][names[1]].block_tables
-    assert isinstance(ring_tables, torch.Tensor)
-    ring_tables = ring_tables.reshape(8, -1)
-    torch.testing.assert_close(ring_tables[0], tables[1][0])
-    assert torch.count_nonzero(ring_tables[1:]) == 0
+    ring_slots = prepared[0][names[0]].qsa_ring_slots
+    assert isinstance(ring_slots, torch.Tensor)
+    assert ring_slots[0].item() == 1
+    assert torch.count_nonzero(ring_slots[1:]) == 0
     main_tables = prepared[0][names[0]].block_tables
     distribution = prepared[0][names[0]].request_distribution
     assert isinstance(main_tables, torch.Tensor)
@@ -160,7 +160,7 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
     def rand(shape):
         return jnp.asarray(rng.normal(0, 0.3, shape), jnp.bfloat16)
 
-    # Null page, separate main/compressed rows, plus one ring owner.
+    # Null page, separate main/compressed rows, plus dedicated ring companion pool.
     ring_id = columns + 1
     pool = rand(
         (
@@ -173,6 +173,10 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
     ).astype(dtype)
     index_pool = rand(
         (ring_id + 1, layout.index_rows // 2, 1, 2, layout.compressed_width)
+    )
+    ring_pool = jnp.zeros(
+        (16, 8 if layout.cache_tags else 4, 1, 2, layout.compressed_width),
+        jnp.bfloat16,
     )
     index_pool = index_pool.at[jnp.asarray([0, ring_id])].set(0)
     pool = pool.at[jnp.asarray([0, ring_id])].set(0)
@@ -199,8 +203,8 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
     )
     rings = jnp.asarray(
         runner.test_attention_metadata[
-            "model.layers.3.self_attn.raw_ring"
-        ].block_tables.numpy(),
+            "model.layers.3.self_attn"
+        ].qsa_ring_slots.numpy(),
         jnp.int32,
     )
     attention = runner.test_attention_metadata["model.layers.3.self_attn"]
@@ -225,7 +229,8 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
         return torch.from_numpy(np.asarray(x).copy()).to("tpu")
 
     tensors = [
-        tensor(x) for x in (*producers, pool, index_pool, starts, contexts, rings)
+        tensor(x)
+        for x in (*producers, pool, index_pool, ring_pool, starts, contexts, rings)
     ]
     native_table = tensor(main_table_flat)
     tensors.extend((native_table, native_table, tensor(distribution)))
@@ -234,17 +239,22 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
     compiled_tensors = list(tensors)
     compiled_tensors[10] = tensor(pool)
     compiled_tensors[11] = tensor(index_pool)
+    compiled_tensors[12] = tensor(ring_pool)
     repeat_tensors = list(tensors)
     repeat_tensors[10] = tensor(pool)
     repeat_tensors[11] = tensor(index_pool)
+    repeat_tensors[12] = tensor(ring_pool)
     direct_owner, compiled_owner = tensors[10], compiled_tensors[10]
     direct_index, compiled_index = tensors[11], compiled_tensors[11]
+    direct_ring, compiled_ring = tensors[12], compiled_tensors[12]
     op = build_compact_pooled_qsa_op()
     with jax.profiler.TraceAnnotation("runner-qsa-direct"):
         output, selected = op(*tensors, **options)
         from torch_tpu._internal import sync
 
-        sync.synchronize([output, selected, tensors[10], tensors[11]], wait=True)
+        sync.synchronize(
+            [output, selected, tensors[10], tensors[11], tensors[12]], wait=True
+        )
         actual = output.cpu().float().numpy().reshape(tokens, local_heads, 256)
     selected_np = selected.cpu().numpy()
     assert np.isfinite(actual).all()
@@ -253,7 +263,13 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
     with jax.profiler.TraceAnnotation("runner-qsa-torchcompile"):
         repeated, selected_again = fullgraph(*compiled_tensors, **options)
         sync.synchronize(
-            [repeated, selected_again, compiled_tensors[10], compiled_tensors[11]],
+            [
+                repeated,
+                selected_again,
+                compiled_tensors[10],
+                compiled_tensors[11],
+                compiled_tensors[12],
+            ],
             wait=True,
         )
         compiled_actual = (
@@ -271,7 +287,14 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
     with jax.profiler.TraceAnnotation("runner-qsa-torchcompile-repeat"):
         again, selected_repeat = fullgraph(*repeat_tensors, **options)
         sync.synchronize(
-            [again, selected_repeat, repeat_tensors[10], repeat_tensors[11]], wait=True
+            [
+                again,
+                selected_repeat,
+                repeat_tensors[10],
+                repeat_tensors[11],
+                repeat_tensors[12],
+            ],
+            wait=True,
         )
         assert torch.equal(again.cpu(), repeated.cpu())
         assert torch.equal(selected_repeat.cpu(), selected_again.cpu())
@@ -281,13 +304,22 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
     )
     assert tensors[10] is direct_owner and compiled_tensors[10] is compiled_owner
     assert tensors[11] is direct_index and compiled_tensors[11] is compiled_index
+    assert tensors[12] is direct_ring and compiled_tensors[12] is compiled_ring
     assert torch.equal(
         repeat_tensors[11].cpu().view(torch.uint8),
         compiled_index.cpu().view(torch.uint8),
     )
     assert torch.equal(
+        repeat_tensors[12].cpu().view(torch.uint8),
+        compiled_ring.cpu().view(torch.uint8),
+    )
+    assert torch.equal(
         direct_index.cpu().view(torch.uint8)[0],
         torch.zeros_like(direct_index.cpu().view(torch.uint8)[0]),
+    )
+    assert torch.equal(
+        direct_ring.cpu().view(torch.uint8)[0],
+        torch.zeros_like(direct_ring.cpu().view(torch.uint8)[0]),
     )
     query, key, value, gate, _, _ = produce(
         *producers[:7], producers[8], producers[9], 1e-6, 64

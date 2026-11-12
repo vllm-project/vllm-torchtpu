@@ -50,6 +50,7 @@ def hardware():
         "ratio",
         "fp8",
         "short",
+        "short_notags",
         "chip",
     ],
 )
@@ -63,10 +64,11 @@ def test_fused_state_derives_layout_and_capacity(case, monkeypatch):
     width = 256 if case == "width" else 128
     ratio = 8 if case == "ratio" else 4
     dtype = jnp.float8_e4m3fn if case == "fp8" else jnp.bfloat16
-    pool = carrier(4 if case == "short" else 208, dtype, width)
+    pool = carrier(4 if case in ("short", "short_notags") else 208, dtype, width)
     raw = jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16)
+    cache_tags = case != "short_notags"
     assert policy.use_decode_state_fusion(
-        raw, pool, requests=requests, ratio=ratio
+        raw, pool, requests=requests, ratio=ratio, cache_tags=cache_tags
     ) == (case not in ("fp8", "short", "large", "requests"))
 
 
@@ -173,15 +175,18 @@ def test_same_payload_uses_batch_independently_of_page_stride(dtype, page, monke
 
 
 @pytest.mark.parametrize(
-    "requests,batch", [(1, 1), (6, 2), (7, 1), (8, 8), (12, 4), (16, 8)]
+    "requests,batch", [(1, 1), (4, 4), (6, 2), (7, 1), (8, 8), (12, 4), (16, 8)]
 )
-def test_request_divisibility_does_not_drop_tail_requests(requests, batch):
+@pytest.mark.parametrize("tag_elements", [16, 0])
+def test_request_divisibility_does_not_drop_tail_requests(
+    requests, batch, tag_elements
+):
     assert (
         policy.ring_tag_dma_batch(
             carrier(),
             requests,
             ring_elements=1024,
-            tag_elements=16,
+            tag_elements=tag_elements,
             hardware=hardware(),
         )
         == batch

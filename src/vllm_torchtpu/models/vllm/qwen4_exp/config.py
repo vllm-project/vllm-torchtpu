@@ -99,8 +99,8 @@ def gdn_cache_spec(cfg):
         ),
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
         num_speculative_blocks=(
-            cfg.speculative_config.num_speculative_tokens
-            if cfg.speculative_config is not None
+            getattr(cfg.speculative_config, "num_speculative_tokens", 0) or 0
+            if getattr(cfg, "speculative_config", None) is not None
             else 0
         ),
     )
@@ -115,9 +115,10 @@ def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
     from .qsa import get_qsa_cache_specs, qsa_ring_capacity
 
     t = cfg.model_config.hf_text_config
+    spec_cfg = getattr(cfg, "speculative_config", None)
     num_speculative_tokens = (
-        cfg.speculative_config.num_speculative_tokens
-        if cfg.speculative_config is not None
+        getattr(spec_cfg, "num_speculative_tokens", 0) or 0
+        if spec_cfg is not None
         else 0
     )
     main, auxiliary = get_qsa_cache_specs(
@@ -162,12 +163,21 @@ def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
 def native_cache_capacity(cfg, specs):
     """Return the full-concurrency demand ceiling from native cache groups."""
     from vllm.v1.core.kv_cache_planning import (
+        get_global_kv_cache_groups,
         get_kv_cache_groups,
     )
 
-    groups = get_kv_cache_groups(cfg, specs)
+    spec_cfg = getattr(cfg, "speculative_config", None)
+    groups = (
+        get_global_kv_cache_groups(cfg, [specs])
+        if spec_cfg is None or hasattr(spec_cfg, "use_eagle_block_drop")
+        else get_kv_cache_groups(cfg, specs)
+    )
     blocks_per_request = sum(
-        group.kv_cache_spec.max_num_blocks_per_req(cfg, cfg.model_config.max_model_len)
+        math.ceil(
+            group.kv_cache_spec.max_memory_usage_bytes(cfg)
+            / group.kv_cache_spec.page_size_bytes
+        )
         for group in groups
     )
     # One null block is reserved by the scheduler's pool.

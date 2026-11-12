@@ -37,11 +37,16 @@ def prepare_native_pool_inputs(cfg, plan, block_ids, contexts, scheduled, tokens
         pcp_size=1,
         block_size=cfg.cache_config.block_size,
     )
+    import inspect
+
     runner.model_config = cfg.model_config
     runner.cache_config = cfg.cache_config
     runner._unified_kv_layout = True
+    runner._init_qsa_ring_slots = TPUModelRunner._init_qsa_ring_slots.__get__(runner)
+    runner._build_qsa_ring_slots = TPUModelRunner._build_qsa_ring_slots.__get__(runner)
+    runner._init_qsa_ring_slots(max(16, runner.max_num_reqs * 2))
     specs = [g.kv_cache_spec for g in plan.kv_cache_groups]
-    table = MultiGroupBlockTable(
+    table_kwargs = dict(
         max_num_reqs=runner.max_num_reqs,
         max_num_batched_tokens=tokens,
         pin_memory=False,
@@ -57,6 +62,9 @@ def prepare_native_pool_inputs(cfg, plan, block_ids, contexts, scheduled, tokens
             for s in specs
         ],
     )
+    if "kernel_block_sizes" in inspect.signature(MultiGroupBlockTable).parameters:
+        table_kwargs["kernel_block_sizes"] = [s.block_size for s in specs]
+    table = MultiGroupBlockTable(**table_kwargs)
     for row, ids in enumerate(block_ids):
         table.add_row(ids, row)
     runner.input_batch.block_table = table
@@ -68,7 +76,14 @@ def prepare_native_pool_inputs(cfg, plan, block_ids, contexts, scheduled, tokens
     ]
 
     def build(**kwargs):
-        common = NS(num_reqs=kwargs["num_reqs"])
+        common = NS(
+            num_reqs=kwargs["num_reqs"],
+            qsa_ring_slots=getattr(
+                getattr(runner, "_attn_metadata_builder_ctx", None),
+                "qsa_ring_slots",
+                None,
+            ),
+        )
         result = {}
         for group, builder in zip(plan.kv_cache_groups, builders):
             metadata = builder.build(0, common)

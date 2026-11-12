@@ -43,6 +43,7 @@ from vllm_torchtpu.kv_cache_materializer import (
 )
 
 from .pd import build_transfer_groups
+from .pool_layout import resolve_ple_companion
 
 
 def build_transfer_manifest(
@@ -51,19 +52,41 @@ def build_transfer_manifest(
     *,
     index_tag_fields: int = 2,
 ) -> PoolManifest:
-    """Bind scheduler owners and co-owned compressed keys to live byte pages."""
+    """Bind scheduler owners and co-owned compressed/PLE keys to live byte pages."""
     if materialized.bm_pool_layout is not None:
         raise NotImplementedError("Qwen PD initially requires layer-major pools")
     if config.num_blocks <= 0:
         raise ManifestError("Qwen PD needs a positive pool capacity")
     groups = build_transfer_groups(config.kv_cache_groups)
     owners = {name for group in groups for name in group.layer_names}
-    aliases = {name + ".compressed_k" for name in owners if name.endswith(".self_attn")}
-    if owners != set(materialized.layer_to_raw) or owners | aliases != set(
-        materialized.kv_caches
-    ):
+    compressed_aliases = {
+        name + ".compressed_k" for name in owners if name.endswith(".self_attn")
+    }
+    ring_names = {name + ".raw_ring" for name in owners if name.endswith(".self_attn")}
+    linear_owners = {name for name in owners if name.endswith(".linear_attn")}
+    ple_by_owner: dict[str, list[str]] = {}
+    ple_aliases: set[str] = set()
+    for name in sorted(materialized.kv_caches):
+        if not name.endswith(".ple"):
+            continue
+        companion = resolve_ple_companion(name, linear_owners)
+        if companion is not None:
+            ple_aliases.add(name)
+            ple_by_owner.setdefault(companion, []).append(name)
+    if owners != set(materialized.layer_to_raw) or (
+        owners | compressed_aliases | ple_aliases | ring_names
+    ) != set(materialized.kv_caches):
         raise ManifestError("Qwen PD must bind every live cache owner exactly once")
-    storages = materialized.raw_tensors
+    ple_storages = [
+        t
+        for n in sorted(ple_aliases)
+        for t in (
+            materialized.kv_caches[n]
+            if isinstance(materialized.kv_caches[n], list)
+            else [materialized.kv_caches[n]]
+        )
+    ]
+    storages = [*materialized.raw_tensors, *ple_storages]
     indices = {id(raw): index for index, raw in enumerate(storages)}
     if len(indices) != len(storages):
         raise ManifestError("Qwen PD raw storage list repeats a carrier")
@@ -72,10 +95,10 @@ def build_transfer_manifest(
     for group in groups:
         used = set()
         for owner in group.layer_names:
-            names = (
+            names: tuple[str, ...] = (
                 (owner, owner + ".compressed_k")
                 if owner.endswith(".self_attn")
-                else (owner,)
+                else (owner, *ple_by_owner.get(owner, ()))
             )
             for name in names:
                 cache = materialized.kv_caches[name]
@@ -93,7 +116,8 @@ def build_transfer_manifest(
                 used.add(index)
                 referenced.add(index)
                 is_index = name.endswith((".compressed_k", ".raw_ring"))
-                dtype = torch.bfloat16 if is_index else torch.float8_e4m3fn
+                is_bf16 = is_index or name.endswith(".ple")
+                dtype = torch.bfloat16 if is_bf16 else torch.float8_e4m3fn
                 if (
                     raw.dtype != dtype
                     or raw.storage_offset() != 0
@@ -128,17 +152,18 @@ def build_transfer_manifest(
                 )
     if referenced != set(range(len(storages))):
         raise ManifestError("Qwen PD contains an unreferenced raw carrier")
-    # A compressed alias and ring must name the same index carrier, but retain
-    # main and ring block-table lifetimes respectively.
-    for name in aliases:
-        ring = name.removesuffix(".compressed_k") + ".raw_ring"
+    for name in compressed_aliases:
+        ring = materialized.kv_caches[name.removesuffix(".compressed_k") + ".raw_ring"]
         if (
-            ring not in owners
-            or materialized.kv_caches[name] is not materialized.kv_caches[ring]
+            materialized.kv_caches[name] is ring
+            or getattr(ring, "dtype", None) != torch.bfloat16
         ):
             raise ManifestError("Qwen PD compressed/ring bindings disagree")
-    manifest = PoolManifest(BINDING_ALIASED_RAW, list(storages), pools)
-    verify_storage_binding(manifest, materialized.kv_caches, storages)
+    manifest = PoolManifest(BINDING_ALIASED_RAW, storages, pools)
+    block_kv_caches = {
+        k: v for k, v in materialized.kv_caches.items() if k not in ring_names
+    }
+    verify_storage_binding(manifest, block_kv_caches, storages)
     return manifest
 
 

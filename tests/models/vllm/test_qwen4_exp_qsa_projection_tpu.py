@@ -44,6 +44,7 @@ def test_projected_decode_preserves_indices_and_cache(
     from vllm_torchtpu.models.vllm.qwen4_exp.qsa import QSAMetadata, Qwen4ExpQSA
     from vllm_torchtpu.utils import synchronize_tensors
 
+    torch._dynamo.reset()
     config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
     with set_current_vllm_config(config):
@@ -238,8 +239,8 @@ def test_projected_decode_preserves_indices_and_cache(
                 )
                 lengths = torch.zeros(requests, dtype=torch.int32)
                 lengths[:live] = context
-                slots = torch.arange(requests, dtype=torch.int32)
-                slots[live:] = -1
+                slots = torch.arange(1, requests + 1, dtype=torch.int32)
+                slots[live:] = 0
                 pages = torch.zeros((requests, columns), dtype=torch.int32)
                 pages[:live, 0] = torch.arange(1, live + 1)
                 starts, lengths, slots, pages = [
@@ -272,9 +273,10 @@ def test_projected_decode_preserves_indices_and_cache(
                 )
                 per_layer = {
                     layer.prefix: SimpleNamespace(
-                        block_tables=pages, request_distribution=distribution
+                        block_tables=pages,
+                        request_distribution=distribution,
+                        qsa_ring_slots=slots,
                     ),
-                    layer.prefix + ".raw_ring": SimpleNamespace(block_tables=slots),
                 }
                 with set_forward_context(per_layer, config, num_tokens=tokens):
                     layer.bind_pool(*base_owners)

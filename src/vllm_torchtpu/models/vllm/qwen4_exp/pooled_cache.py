@@ -13,6 +13,7 @@
 # limitations under the License.
 """Qwen4Exp binding over the native planner and existing unified pool allocator."""
 
+import math
 from dataclasses import replace
 
 import torch
@@ -21,12 +22,13 @@ from vllm.v1.core.kv_cache_planning import (
     check_enough_kv_cache_memory,
     get_global_kv_cache_groups,
     get_kv_cache_config_from_groups,
+    get_kv_cache_groups,
 )
 from vllm.v1.core.kv_cache_utils import (
     resolve_cache_hit_alignment_tokens,
     resolve_kv_cache_block_sizes,
 )
-from vllm.v1.kv_cache_interface import CircularBufferSpec, MambaSpec
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -59,6 +61,7 @@ class Qwen4ExpPooledCache:
         self._capacity_ceiling: int | None = None
         self.materialized = None
         self.draft_model = draft_model
+        self.max_slots = 0
 
     def get_specs(self, available_memory: int | None = None):
         cfg = self.runner.vllm_config
@@ -72,13 +75,19 @@ class Qwen4ExpPooledCache:
             raise ValueError("Qwen native cache geometry changed after allocation")
         self.layout, self.specs = layout, specs
         self._capacity_ceiling = pages
+        self.max_slots = math.ceil((cfg.scheduler_config.max_num_seqs + 1) / 8) * 8
         cache = cfg.cache_config
         cache.block_size = self.layout.block_size
         cache.mamba_block_size = (
             self.layout.block_size if cache.enable_prefix_caching else None
         )
         cache.mamba_page_size_padded = self.layout.page_bytes
-        self.groups = get_global_kv_cache_groups(cfg, [self.specs])
+        if cfg.speculative_config is None or hasattr(
+            cfg.speculative_config, "use_eagle_block_drop"
+        ):
+            self.groups = get_global_kv_cache_groups(cfg, [self.specs])
+        else:
+            self.groups = get_kv_cache_groups(cfg, self.specs)
         if available_memory is not None and self._budgeted_pages is None:
             previous_override = cache.num_gpu_blocks_override
             cache.num_gpu_blocks_override = self.requested_blocks
@@ -107,6 +116,13 @@ class Qwen4ExpPooledCache:
                 )
             check_enough_kv_cache_memory(cfg, self.specs, required)
             self._budgeted_pages = selected
+        elif self.requested_blocks is not None and self._budgeted_pages is None:
+            regions = max(len(g.layer_names) for g in self.groups)
+            check_enough_kv_cache_memory(
+                cfg,
+                self.specs,
+                self.requested_blocks * self.layout.page_bytes * regions,
+            )
         self.pages = (
             self._budgeted_pages
             if self._budgeted_pages is not None
@@ -134,7 +150,43 @@ class Qwen4ExpPooledCache:
             )
             available = int(value.item())
         available = min_across_ep_dp(cfg.parallel_config, available)
-        return self.get_specs(available_memory=available)
+        layout, specs = pooled_cache_specs(cfg)
+        if cfg.speculative_config is None or hasattr(
+            cfg.speculative_config, "use_eagle_block_drop"
+        ):
+            groups = get_global_kv_cache_groups(cfg, [specs])
+        else:
+            groups = get_kv_cache_groups(cfg, specs)
+        regions = max(len(g.layer_names) for g in groups)
+        max_slots = math.ceil((cfg.scheduler_config.max_num_seqs + 1) / 8) * 8
+        ring_bytes = (
+            regions * max_slots * layout.ring_slot_bytes
+            if layout.index_page_bytes
+            else 0
+        )
+        ple_count = len(set(cfg.model_config.hf_text_config.ple_layer_ids))
+        ple_per_block = ple_count * layout.ple_page_bytes
+        pool_per_block = regions * layout.page_bytes
+        net_available = max(0, available - ring_bytes)
+        pool_budget = (
+            (net_available * pool_per_block) // (pool_per_block + ple_per_block)
+            if ple_per_block > 0
+            else net_available
+        )
+        return self.get_specs(available_memory=pool_budget)
+
+    def _companion_bytes(self, num_blocks: int) -> int:
+        regions = max(len(g.layer_names) for g in self.groups)
+        ple_count = len(
+            set(self.runner.vllm_config.model_config.hf_text_config.ple_layer_ids)
+        )
+        ple_bytes = num_blocks * ple_count * self.layout.ple_page_bytes
+        ring_bytes = (
+            regions * self.max_slots * self.layout.ring_slot_bytes
+            if self.layout.index_page_bytes
+            else 0
+        )
+        return ple_bytes + ring_bytes
 
     def get_transfer_groups(self) -> tuple[TransferGroup, ...]:
         """Use the bound scheduler plan, including auxiliary and state groups."""
@@ -164,6 +216,15 @@ class Qwen4ExpPooledCache:
         config.cache_hit_alignment_tokens = resolve_cache_hit_alignment_tokens(
             config, runner.vllm_config, scheduler_block_size, hash_block_size
         )
+        ratio = runner.vllm_config.model_config.hf_text_config.indexer_compress_ratio
+        assert config.hash_block_size % ratio == 0, (
+            f"hash_block_size ({config.hash_block_size}) must be a multiple of "
+            f"indexer_compress_ratio ({ratio})"
+        )
+        assert config.cache_hit_alignment_tokens % ratio == 0, (
+            f"cache_hit_alignment_tokens ({config.cache_hit_alignment_tokens}) "
+            f"must be a multiple of indexer_compress_ratio ({ratio})"
+        )
         self.attn_groups = [
             [
                 AttentionGroup(
@@ -180,7 +241,9 @@ class Qwen4ExpPooledCache:
         budget = compute_hbm_budget(
             [runner.device], runner.cache_config.gpu_memory_utilization
         )
-        required = max(t.size for t in config.kv_cache_tensors)
+        required = max(t.size for t in config.kv_cache_tensors) + self._companion_bytes(
+            self.pages
+        )
         if required + TEMP_HEADROOM > budget.available:
             raise ValueError(
                 f"Qwen4Exp unified pool needs {required} bytes plus {TEMP_HEADROOM} "
@@ -213,12 +276,17 @@ class Qwen4ExpPooledCache:
             else:
                 main = caches[prefix + ".self_attn"]
                 index = caches[prefix + ".self_attn.compressed_k"]
-                assert index is caches[prefix + ".self_attn.raw_ring"]
-                assert main is not index
-                layer.self_attn.bind_pool(main, index)
+                ring = caches[prefix + ".self_attn.raw_ring"]
+                assert main is not index and index is not ring and main is not ring
+                layer.self_attn.bind_pool(main, index, ring)
             if layer.ple is not None:
                 layer.ple.bind_pool(caches[prefix + ".ple"][0])
-        synchronize_tensors(self.materialized.raw_tensors)
+        companion = [
+            v[0] if isinstance(v, list) else v
+            for k, v in caches.items()
+            if k.endswith((".raw_ring", ".ple"))
+        ]
+        synchronize_tensors(list(self.materialized.raw_tensors) + companion)
         self.native_config = config
         logger.info(
             "Qwen4Exp unified pool: manager_tokens=%d page_bytes=%d "
@@ -257,6 +325,26 @@ class Qwen4ExpPooledCache:
             )
         materialized = self.materialized
         assert materialized is not None
+        if hasattr(runner, "_init_qsa_ring_slots"):
+            runner._init_qsa_ring_slots(getattr(self, "max_slots", 0))
+        from .pool_layout import resolve_ple_companion
+
+        linear_owners = {
+            n
+            for g in config.kv_cache_groups
+            for n in g.layer_names
+            if n.endswith(".linear_attn")
+        }
+        ple_by_linear: dict[str, list[torch.Tensor]] = {}
+        extra_ple_tensors: list[torch.Tensor] = []
+        for k, v in sorted(materialized.kv_caches.items()):
+            if not k.endswith(".ple"):
+                continue
+            extra_ple_tensors.append(v[0])
+            companion = resolve_ple_companion(k, linear_owners)
+            if companion is not None:
+                ple_by_linear.setdefault(companion, []).append(v[0])
+        runner.extra_block_indexed_state_tensors = extra_ple_tensors
         runner.kv_caches = list(materialized.raw_tensors)
         runner.kv_cache_raw_tensors = list(materialized.raw_tensors)
         runner.bm_pool_layout = materialized.bm_pool_layout
@@ -279,6 +367,11 @@ class Qwen4ExpPooledCache:
                 materialized.layer_to_raw,
                 materialized.bm_pool_layout,
             )
+            for gid, raws in runner._mamba_copy_plan:
+                for name in config.kv_cache_groups[gid].layer_names:
+                    for ple_raw in ple_by_linear.get(name, ()):
+                        if all(r is not ple_raw for r in raws):
+                            raws.append(ple_raw)
         else:
             runner._mamba_copy_plan = []
             runner._mamba_state_block_size = None
@@ -321,7 +414,6 @@ class Qwen4ExpPooledCache:
         for group in self.groups:
             spec = group.kv_cache_spec
             state = isinstance(spec, MambaSpec)
-            ring = isinstance(spec, CircularBufferSpec)
             columns = (
                 1 + spec.num_speculative_blocks
                 if state
@@ -332,11 +424,10 @@ class Qwen4ExpPooledCache:
             )
             table = torch.zeros((rows, columns), dtype=torch.int32, device="cpu")
             for row in range(active_rows):
-                owned = 1 if ring else columns
-                table[row, :owned] = torch.arange(
-                    next_page, next_page + owned, dtype=torch.int32, device="cpu"
+                table[row, :columns] = torch.arange(
+                    next_page, next_page + columns, dtype=torch.int32, device="cpu"
                 )
-                next_page += owned
+                next_page += columns
             table = table.to(self.runner.device)
             item = replace(
                 metadata,
@@ -354,6 +445,7 @@ class Qwen4ExpPooledCache:
                     else None
                 ),
                 mamba_request_distribution=mamba_distribution if state else None,
+                qsa_ring_slots=None if state else metadata.qsa_ring_slots,
             )
             result.update({name: item for name in group.layer_names})
         assert next_page <= self.pages, "dummy owner pages exceed the planned pool"

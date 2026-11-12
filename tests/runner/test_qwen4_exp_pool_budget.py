@@ -14,6 +14,7 @@
 """Physical capacity selection and real native cache ownership, without TPU."""
 
 import copy
+import math
 from types import SimpleNamespace as NS
 
 import pytest
@@ -43,7 +44,15 @@ def test_real_worker_selects_budgeted_capacity_before_profile_and_freezes_owners
     )
 
     groups = get_kv_cache_groups(cfg, specs)
-    bytes_per_block = layout.page_bytes * max(len(g.layer_names) for g in groups)
+    regions = max(len(g.layer_names) for g in groups)
+    bytes_per_block = layout.page_bytes * regions
+    max_slots = math.ceil((cfg.scheduler_config.max_num_seqs + 1) / 8) * 8
+    ring_bytes = (
+        regions * max_slots * layout.ring_slot_bytes if layout.index_page_bytes else 0
+    )
+    ple_per_block = (
+        len(set(cfg.model_config.hf_text_config.ple_layer_ids)) * layout.ple_page_bytes
+    )
     budget_pages = ceiling - 1
     cfg.cache_config.num_gpu_blocks_override = {
         None: None,
@@ -55,7 +64,9 @@ def test_real_worker_selects_budgeted_capacity_before_profile_and_freezes_owners
         pooled_cache,
         "compute_hbm_budget",
         lambda *_: NS(
-            available=budget_pages * bytes_per_block + pooled_cache.TEMP_HEADROOM
+            available=budget_pages * (bytes_per_block + ple_per_block)
+            + ring_bytes
+            + pooled_cache.TEMP_HEADROOM
         ),
     )
     worker, adapter, _ = worker_and_adapter(cfg, [])
@@ -184,11 +195,21 @@ def test_worker_budget_coordinates_actual_tp_then_ep_dp_minimum(monkeypatch):
     )
 
     groups = get_kv_cache_groups(cfg, specs)
-    stride = layout.page_bytes * max(len(g.layer_names) for g in groups)
+    regions = max(len(g.layer_names) for g in groups)
+    max_slots = math.ceil((cfg.scheduler_config.max_num_seqs + 1) / 8) * 8
+    ring_bytes = (
+        regions * max_slots * layout.ring_slot_bytes if layout.index_page_bytes else 0
+    )
+    ple_per_block = (
+        len(set(cfg.model_config.hf_text_config.ple_layer_ids)) * layout.ple_page_bytes
+    )
+    stride = layout.page_bytes * regions + ple_per_block
     monkeypatch.setattr(
         pooled_cache,
         "compute_hbm_budget",
-        lambda *_: NS(available=ceiling * stride + pooled_cache.TEMP_HEADROOM),
+        lambda *_: NS(
+            available=ceiling * stride + ring_bytes + pooled_cache.TEMP_HEADROOM
+        ),
     )
     group = object()
     monkeypatch.setattr(pooled_cache, "get_tp_group", lambda: NS(cpu_group=group))
@@ -197,17 +218,20 @@ def test_worker_budget_coordinates_actual_tp_then_ep_dp_minimum(monkeypatch):
     def reduce(value, op, group):
         assert op is pooled_cache.torch.distributed.ReduceOp.MIN
         assert group is expected_group
-        assert value.item() == ceiling * stride
-        value.fill_((ceiling - 1) * stride)
+        assert value.item() == ceiling * stride + ring_bytes
+        value.fill_((ceiling - 1) * stride + ring_bytes)
         order.append("TP")
 
     expected_group = group
     monkeypatch.setattr(pooled_cache.torch.distributed, "all_reduce", reduce)
 
     def dp_min(parallel, value):
-        assert parallel is cfg.parallel_config and value == (ceiling - 1) * stride
+        assert (
+            parallel is cfg.parallel_config
+            and value == (ceiling - 1) * stride + ring_bytes
+        )
         order.append("EP/DP")
-        return (ceiling - 2) * stride
+        return (ceiling - 2) * stride + ring_bytes
 
     monkeypatch.setattr(pooled_cache, "min_across_ep_dp", dp_min)
     worker, adapter, _ = worker_and_adapter(cfg, [])

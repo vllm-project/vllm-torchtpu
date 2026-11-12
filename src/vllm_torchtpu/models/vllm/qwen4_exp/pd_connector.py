@@ -263,10 +263,27 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         manifest = build_transfer_manifest(
             cache.native_config,
             cache.materialized,
-            index_tag_fields=cache.layout.index_tag_fields,
+            index_tag_fields=getattr(
+                getattr(cache, "layout", None), "index_tag_fields", 2
+            ),
         )
+        block_kv_caches = {
+            k: v for k, v in self.named_kv_caches.items() if not k.endswith(".raw_ring")
+        }
+        ple_storages = [
+            t
+            for k in sorted(self.named_kv_caches)
+            if k.endswith(".ple")
+            for t in (
+                self.named_kv_caches[k]
+                if isinstance(self.named_kv_caches[k], list)
+                else [self.named_kv_caches[k]]
+            )
+        ]
         verify_storage_binding(
-            manifest, self.named_kv_caches, runner.kv_cache_raw_tensors
+            manifest,
+            block_kv_caches,
+            [*runner.kv_cache_raw_tensors, *ple_storages],
         )
         materialize_storages(manifest)
         semantics = self._collect_pd_semantics(runner)
@@ -350,6 +367,17 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             state_flags=dict(
                 gdn_conv_dtype=DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
                 gdn_granule_bytes=GRANULE_BYTES,
+                qsa_compress_ratio=(
+                    cache.layout.kernel_block_size
+                    // cache.layout.compressed_kernel_rows
+                    if getattr(cache, "layout", None) is not None
+                    else int(model.config.indexer_compress_ratio)
+                ),
+                qsa_ring_capacity=(
+                    cache.layout.ring_capacity
+                    if getattr(cache, "layout", None) is not None
+                    else int(model.config.indexer_compress_ratio)
+                ),
             ),
         )
         if cache.draft_model is not None:
@@ -543,29 +571,26 @@ class QwenPagePlan:
             for group in self.groups
             for name in group.layer_names
         }
-        # Compressed keys follow their main IDs; rings retain independent IDs.
-        expected = set(owners) | {
-            name + ".compressed_k" for name in owners if name.endswith(".self_attn")
-        }
+        for name in list(owners):
+            if name.endswith(".self_attn"):
+                owners[name + ".compressed_k"] = owners[name]
+        from .pool_layout import resolve_ple_companion
+
+        linear_owners = {n for n in owners if n.endswith(".linear_attn")}
+        for pool in self.manifest.pools:
+            if pool.layer_name.endswith(".ple") and pool.layer_name not in owners:
+                linear = resolve_ple_companion(pool.layer_name, linear_owners)
+                if linear is not None:
+                    owners[pool.layer_name] = owners[linear]
         names = [pool.layer_name for pool in self.manifest.pools]
         tags = [pool.tag for pool in self.manifest.pools]
         if (
             len(names) != len(set(names))
             or len(tags) != len(set(tags))
-            or set(names) != expected
+            or set(names) != set(owners)
         ):
             raise ValueError("Qwen PD page plan must cover every owner exactly once")
-        return tuple(
-            (
-                pool,
-                owners[
-                    pool.layer_name
-                    if pool.layer_name in owners
-                    else pool.layer_name.removesuffix(".compressed_k")
-                ],
-            )
-            for pool in self.manifest.pools
-        )
+        return tuple((pool, owners[pool.layer_name]) for pool in self.manifest.pools)
 
     def request_pages(
         self, tables: list[list[int]] | None, num_tokens: int

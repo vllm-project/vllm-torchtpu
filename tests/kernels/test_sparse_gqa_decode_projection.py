@@ -470,7 +470,9 @@ def test_native_torch_public_prepared_projected_offsets(
     def build(projected):
         op = build_compact_pooled_qsa_op(project_output=projected, rope_axes=axes)
 
-        def invoke(main, index, starts, context, slots, table, distribution, positions):
+        def invoke(
+            main, index, ring, starts, context, slots, table, distribution, positions
+        ):
             options = dict(k_norm_multiplier=multiplier, decode_cu=cached)
             if projected:
                 options.update(
@@ -485,6 +487,7 @@ def test_native_torch_public_prepared_projected_offsets(
                 trig,
                 main,
                 index,
+                ring,
                 starts,
                 context,
                 slots,
@@ -511,6 +514,7 @@ def test_native_torch_public_prepared_projected_offsets(
             (pages, 1664, math.ceil(2 * kv / packing), packing, dim), dtype=dtype
         ),
         torch.zeros((pages, 208, 1, 2, 128), dtype=torch.bfloat16),
+        torch.zeros((pages, 8, 1, 2, 128), dtype=torch.bfloat16),
     ]
     for owner in initial:
         owner[0] = torch.nan

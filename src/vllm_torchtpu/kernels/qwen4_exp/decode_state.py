@@ -20,7 +20,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import typed_ldst
 from vllm_torchtpu.kernels.qwen4_exp.cache_regions import region_rows
-from vllm_torchtpu.kernels.qwen4_exp.qsa import gemma_norm, index_rope
+from vllm_torchtpu.kernels.qwen4_exp.qsa import _token_metadata, gemma_norm, index_rope
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 
 
@@ -39,6 +39,7 @@ def update_decode_state(
     rotary_dim: int,
     rotate: bool = True,
     rope_axes: tuple[int, ...] | None = None,
+    cache_tags: bool = True,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Update small request batches; return normalized/rotated completed keys.
 
@@ -50,9 +51,11 @@ def update_decode_state(
     ring_rows = (ratio + 7) // 8 * 8
     axial = positions.ndim == 2
     axes = positions.shape[0] if axial else 1
-    tag_fields = axes + 1
+    tag_fields = (axes + 1) if cache_tags else 0
     ring_tokens, _ = region_rows(pool, ring_rows * width, jnp.bfloat16)
-    tag_tokens, tag_rows = region_rows(pool, ring_rows * tag_fields, jnp.int32)
+    tag_tokens, tag_rows = (
+        region_rows(pool, ring_rows * tag_fields, jnp.int32) if cache_tags else (0, 0)
+    )
     tokens = ring_tokens + tag_tokens
     # At most one nonempty request per query token. Its first token is a unique
     # DMA staging slot, even when active metadata rows are not a dense prefix.
@@ -60,22 +63,23 @@ def update_decode_state(
     # a synchronization dependency before this small TC state update.
     batch = min(count, len(ids))
 
-    def kernel(
-        ids_ref,
-        starts_ref,
-        context_ref,
-        positions_ref,
-        raw_ref,
-        norm_ref,
-        source,
-        target,
-        keys_ref,
-        tags_ref,
-        staged,
-        semaphores,
-    ):
+    def kernel(ids_ref, starts_ref, context_ref, *rest):
+        if cache_tags:
+            (
+                positions_ref,
+                raw_ref,
+                norm_ref,
+                source,
+                target,
+                keys_ref,
+                tags_ref,
+                staged,
+                semaphores,
+            ) = rest
+            tags_ref[...] = jnp.zeros(tags_ref.shape, tags_ref.dtype)
+        else:
+            raw_ref, norm_ref, source, target, keys_ref, staged, semaphores = rest
         keys_ref[...] = jnp.zeros(keys_ref.shape, keys_ref.dtype)
-        tags_ref[...] = jnp.zeros(tags_ref.shape, tags_ref.dtype)
         for row in range(len(ids)):
             lane = starts_ref[row] if count < len(ids) else row
 
@@ -98,23 +102,23 @@ def update_decode_state(
                     semaphores.at[lane],
                 ).wait()
                 ring_ref = staged.at[lane, pl.ds(0, ring_tokens)]
-                tag_ref = staged.at[lane, pl.ds(ring_tokens, tag_tokens)]
                 ring = typed_ldst.load_typed(ring_ref, view_dtype=jnp.bfloat16)
-                tags = typed_ldst.load_typed(tag_ref, view_dtype=jnp.int32)
                 old_context = context_ref[row]
                 ring = jnp.where(old_context > 0, ring, 0)
-                words = jnp.arange(tag_rows * width).reshape(tag_rows, width)
-                tags = jnp.where(
-                    words < ring_rows * tag_fields,
-                    jnp.where(old_context > 0, tags, -1),
-                    0,
-                )
                 typed_ldst.store_typed(ring_ref, ring)
-                typed_ldst.store_typed(tag_ref, tags)
+                if cache_tags:
+                    tag_ref = staged.at[lane, pl.ds(ring_tokens, tag_tokens)]
+                    tags = typed_ldst.load_typed(tag_ref, view_dtype=jnp.int32)
+                    words = jnp.arange(tag_rows * width).reshape(tag_rows, width)
+                    tags = jnp.where(
+                        words < ring_rows * tag_fields,
+                        jnp.where(old_context > 0, tags, -1),
+                        0,
+                    )
+                    typed_ldst.store_typed(tag_ref, tags)
 
                 def token(i, _):
                     ring = typed_ldst.load_typed(ring_ref, view_dtype=jnp.bfloat16)
-                    tags = typed_ldst.load_typed(tag_ref, view_dtype=jnp.int32)
                     slot = (old_context + i - starts_ref[row]) % ratio
                     token_mask = jnp.arange(count)[:, None] == i
                     # Select bits rather than summing floats: a floating sum
@@ -131,19 +135,21 @@ def update_decode_state(
                     ring = jnp.where(
                         jnp.arange(ring_rows)[:, None] == slot, raw_token, ring
                     )
-                    for axis in range(axes):
-                        coordinate = (
-                            positions_ref[axis, i] if axial else positions_ref[i]
-                        )
-                        tags = jnp.where(
-                            words == tag_fields * slot + axis, coordinate, tags
-                        )
-                    tags = jnp.where(words == tag_fields * slot + axes, 0, tags)
                     typed_ldst.store_typed(ring_ref, ring)
-                    typed_ldst.store_typed(tag_ref, tags)
-                    tags_ref[...] = jnp.where(
-                        token_mask, tags[0][None, :], tags_ref[...]
-                    )
+                    if cache_tags:
+                        tags = typed_ldst.load_typed(tag_ref, view_dtype=jnp.int32)
+                        for axis in range(axes):
+                            coordinate = (
+                                positions_ref[axis, i] if axial else positions_ref[i]
+                            )
+                            tags = jnp.where(
+                                words == tag_fields * slot + axis, coordinate, tags
+                            )
+                        tags = jnp.where(words == tag_fields * slot + axes, 0, tags)
+                        typed_ldst.store_typed(tag_ref, tags)
+                        tags_ref[...] = jnp.where(
+                            token_mask, tags[0][None, :], tags_ref[...]
+                        )
 
                     @pl.when(slot == ratio - 1)
                     def complete():
@@ -185,36 +191,57 @@ def update_decode_state(
                     semaphores.at[lane],
                 ).wait()
 
-    pool, normalized, first_tags = pl.pallas_call(
+    out_specs = [
+        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(raw.shape, lambda i, *_: (0, 0)),
+    ]
+    out_shape = [
+        jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        jax.ShapeDtypeStruct(raw.shape, raw.dtype),
+    ]
+    if cache_tags:
+        out_specs.append(pl.BlockSpec(raw.shape, lambda i, *_: (0, 0)))
+        out_shape.append(jax.ShapeDtypeStruct(raw.shape, jnp.int32))
+    call_args = (
+        (ids, starts, context, positions, raw, norm, pool)
+        if cache_tags
+        else (ids, starts, context, raw, norm, pool)
+    )
+    outputs = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4,
+            num_scalar_prefetch=4 if cache_tags else 3,
             grid=(1,),
             in_specs=[
                 pl.BlockSpec(raw.shape, lambda i, *_: (0, 0)),
                 pl.BlockSpec(norm.shape, lambda i, *_: (0,)),
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
-            out_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec(raw.shape, lambda i, *_: (0, 0)),
-                pl.BlockSpec(raw.shape, lambda i, *_: (0, 0)),
-            ],
+            out_specs=out_specs,
             scratch_shapes=[
                 pltpu.VMEM((batch, tokens, *pool.shape[2:]), pool.dtype),
                 pltpu.SemaphoreType.DMA((batch,)),
             ],
         ),
-        out_shape=(
-            jax.ShapeDtypeStruct(pool.shape, pool.dtype),
-            jax.ShapeDtypeStruct(raw.shape, raw.dtype),
-            jax.ShapeDtypeStruct(raw.shape, jnp.int32),
-        ),
-        input_output_aliases={6: 0},
+        out_shape=tuple(out_shape),
+        input_output_aliases={6 if cache_tags else 5: 0},
         name="qsa_decode_ring_update",
-    )(ids, starts, context, positions, raw, norm, pool)
-    first_positions = first_tags[:, :axes].T if axial else first_tags[:, 0]
-    first_positions = jnp.maximum(first_positions, 0)
+    )(*call_args)
+    if cache_tags:
+        pool, normalized, first_tags = outputs
+        first_positions = first_tags[:, :axes].T if axial else first_tags[:, 0]
+        first_positions = jnp.maximum(first_positions, 0)
+    else:
+        pool, normalized = outputs
+        active = starts[1:] > starts[:-1]
+        slots = jnp.where(active, jnp.arange(len(ids), dtype=jnp.int32), -1)
+        _, logical, _ = _token_metadata(count, starts, context, slots)
+        group_start = jnp.maximum((logical // ratio) * ratio, 0)
+        first_positions = (
+            jnp.broadcast_to(group_start[None, :], (axes, count))
+            if axial
+            else group_start
+        )
     if not rotate:
         return pool, normalized, first_positions
     keys = index_rope(normalized, first_positions, trig, rotary_dim, rope_axes)

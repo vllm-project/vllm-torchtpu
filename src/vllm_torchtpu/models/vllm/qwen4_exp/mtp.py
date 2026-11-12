@@ -82,6 +82,10 @@ def make_mtp_config(vllm_config):
     # Preserve target layer numbering; only the MTP decoder's position config
     # changes. Never mutate the target's shared text config or quant config.
     text.ple_layer_ids = []
+    target_model_cfg = getattr(vllm_config, "model_config", None)
+    target_text = getattr(target_model_cfg, "hf_text_config", None)
+    if getattr(target_text, "rope_parameters", None) is not None:
+        text.rope_parameters = copy.deepcopy(target_text.rope_parameters)
     text.rope_parameters["rope_theta"] = text.mtp["rope_theta"]
     text.rope_theta = text.mtp["rope_theta"]
     cfg.quant_config = get_tpu_quantization_config(cfg)

@@ -64,7 +64,7 @@ from .parallel import PLEParallel
 from .ple import PLEInputs
 from .ple_geometry import ple_state_shape
 from .ple_host import shared_ple_options
-from .pool_layout import pooled_cache_specs
+from .pool_layout import pooled_cache_specs, resolve_ple_companion
 from .pooled_ple import Qwen4ExpPooledPLE
 from .qsa import QSAMetadata, Qwen4ExpQSA
 
@@ -131,9 +131,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
         super().__init__()
         require_unified_pool()
         t = cfg.model_config.hf_text_config
+        spec_cfg = getattr(cfg, "speculative_config", None)
         num_speculative_tokens = (
-            cfg.speculative_config.num_speculative_tokens
-            if cfg.speculative_config is not None
+            getattr(spec_cfg, "num_speculative_tokens", 0) or 0
+            if spec_cfg is not None
             else 0
         )
         tp = get_tp_group()
@@ -243,7 +244,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 per_layer = cast(
                     dict[str, AttentionMetadata], get_forward_context().attn_metadata
                 )
-                ple_slots = per_layer[self.ple.prefix].mamba_state_indices
+                companion = resolve_ple_companion(
+                    self.ple.prefix,
+                    [k for k in per_layer if k.endswith(".linear_attn")],
+                )
+                ple_md = (
+                    per_layer[companion]
+                    if companion is not None and companion in per_layer
+                    else per_layer[self.ple.prefix]
+                )
+                ple_slots = ple_md.mamba_state_indices
                 assert isinstance(ple_slots, torch.Tensor)
                 hidden = hidden + self.ple.forward_with_history(
                     hidden,
@@ -354,7 +364,7 @@ class Qwen4ExpBackbone(nn.Module):
         )
         t = cfg.model_config.hf_text_config
         self.hc_count = t.hc_count
-        self.capture_mtp_hidden = cfg.speculative_config is not None
+        self.capture_mtp_hidden = getattr(cfg, "speculative_config", None) is not None
         self.embed_tokens = VocabParallelEmbedding(t.vocab_size, t.hidden_size)
         self.layers = nn.ModuleList(
             [

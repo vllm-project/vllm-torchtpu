@@ -35,6 +35,7 @@ from tests.models.vllm.qwen4_exp_test_utils import q4exp_text_config
 from tests.runner.test_qwen4_exp_pool import pool_config
 from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
 from vllm_torchtpu.models.vllm.qwen4_exp import pooled_cache
+from vllm_torchtpu.models.vllm.qwen4_exp.config import native_cache_capacity
 from vllm_torchtpu.models.vllm.qwen4_exp.inputs import Qwen4ExpAdapter
 from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
 from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
@@ -249,10 +250,7 @@ def test_load_negotiate_specs_profile_scheduler_with_independent_configs(
         assert layout.main_page_bytes >= max(
             layout.gdn_state_bytes, layout.ple_state_bytes
         )
-        expected_pages = 1 + 2 * sum(
-            group.kv_cache_spec.max_num_blocks_per_req(cfg, 512)
-            for group in cache.groups
-        )
+        expected_pages = native_cache_capacity(cfg, per_worker)
         assert (
             worker.get_num_gpu_blocks_override()
             == driver.cache_config.num_gpu_blocks_override
@@ -260,7 +258,7 @@ def test_load_negotiate_specs_profile_scheduler_with_independent_configs(
         )
         events.append("profile")
         cache.allocate()
-        assert len(owners) == (5 if k else 3) and owners[-1] is not owners[-2]
+        assert len(owners) == (7 if k else 4) and owners[-1] is not owners[-2]
         assert cache.materialized is not None
         raw_bytes = []
         for index, value in enumerate(cache.materialized.raw_tensors):

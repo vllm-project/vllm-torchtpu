@@ -59,6 +59,7 @@ def test_actual_pool_backing_does_not_allocate_main_sized_compressed_pages(
     )
     cfg.model_config.max_model_len = 512
     cfg.scheduler_config.max_num_seqs = 2
+    cfg.num_prefill_lookahead_tokens = 0
     runner = NS(
         vllm_config=cfg,
         cache_config=cfg.cache_config,
@@ -87,14 +88,12 @@ def test_actual_pool_backing_does_not_allocate_main_sized_compressed_pages(
     cfg.cache_config.num_gpu_blocks_override = cache.pages
     cache.allocate()
     assert bound
-    # Each request owns attention blocks, recurrent checkpoints and one ring,
-    # plus the shared null block. Compressed keys share the attention blocks.
     block_size = cache.layout.block_size
-    expected_blocks = 1 + 2 * (math.ceil(512 / block_size) * 2 + 1)
+    expected_blocks = cache.pages
     main_per_block = (
         block_size * math.ceil(2 * 2 / packing) * packing * 256 * dtype.itemsize
     )
-    index_per_block = max(8192, (block_size // 4) * 128 * 2)
+    index_per_block = (block_size // 4) * 128 * 2
     expected_bytes = expected_blocks * (main_per_block + index_per_block)
     unique = {
         t.untyped_storage()._cdata: t.untyped_storage().nbytes()
@@ -102,12 +101,14 @@ def test_actual_pool_backing_does_not_allocate_main_sized_compressed_pages(
     }
     assert sum(unique.values()) == expected_bytes
     assert cache.native_config.num_blocks == expected_blocks
-    assert len(bound[0]) == 2
-    main, index = bound[0]
+    assert len(bound[0]) == 3
+    main, index, ring = bound[0]
     assert main.dtype == dtype
     assert main.untyped_storage().nbytes() == expected_blocks * main_per_block
     assert index.dtype == torch.bfloat16
     assert index.untyped_storage().nbytes() == expected_blocks * index_per_block
+    assert ring.dtype == torch.bfloat16
+    assert ring.shape == (cache.max_slots, cache.layout.ring_carrier_rows, 1, 2, 128)
 
     # Equal byte counts can hide an unpacked "auto" probe shape. Trace the
     # actual GDN typed view: its FP32 bitcast rescales the second-minor axis.
@@ -154,6 +155,7 @@ def _startup_cache(
     runner._build_mamba_copy_plan = TPUModelRunner._build_mamba_copy_plan.__get__(
         runner
     )
+    runner._init_qsa_ring_slots = TPUModelRunner._init_qsa_ring_slots.__get__(runner)
     # Layer/runner lifecycle only are fixtures; planner, storage, binding,
     # metadata builders and state-copy planning are production implementations.
     layers = [
@@ -247,6 +249,35 @@ def test_initialize_retains_engine_scheduler_metadata(
     assert final.cache_hit_alignment_tokens is not None
     assert all(a is b for a, b in zip(owners, cache.runner.kv_caches))
     assert all(group[0].metadata_builders for group in cache.runner.attn_groups)
+    ple_pool = cache.materialized.kv_caches["model.layers.0.ple"][0]
+    ring_pool = cache.materialized.kv_caches["model.layers.1.self_attn.raw_ring"]
+    assert cache.runner.extra_block_indexed_state_tensors == [ple_pool]
+    assert all(t is not ring_pool for t in cache.runner.kv_cache_raw_tensors)
+    assert all(t is not ple_pool for t in cache.runner.kv_cache_raw_tensors)
+    if prefix:
+        assert any(
+            any(r is ple_pool for r in raws)
+            for _, raws in cache.runner._mamba_copy_plan
+        )
+
+
+@pytest.mark.parametrize("cache_tags", [True, False])
+def test_ring_pool_carrier_rows_depend_on_cache_tags(monkeypatch, cache_tags):
+    from tests.runner.test_qwen4_exp_compact_pool import (
+        compact_config,
+        native_allocation,
+    )
+
+    cfg = compact_config(prefix=False, layers=1, kv="fp8_e4m3")
+    if not cache_tags:
+        cfg.model_config.hf_text_config.rope_parameters.pop("mrope_section", None)
+        cfg.model_config.hf_text_config.rope_parameters.pop("mrope_interleaved", None)
+    layout, _, _, materialized = native_allocation(cfg)
+    assert layout.cache_tags is cache_tags
+    assert layout.ring_carrier_rows == (8 if cache_tags else 4)
+    ring = materialized.kv_caches["model.layers.1.self_attn.raw_ring"]
+    assert ring.shape[1] == (8 if cache_tags else 4)
+    assert ring.dtype == torch.bfloat16
 
 
 @pytest.mark.parametrize(
@@ -295,7 +326,10 @@ def test_initialize_rejects_changed_pool_contract(monkeypatch, mutation):
     elif mutation == "groups":
         changed.kv_cache_groups.reverse()
     elif mutation == "hash":
-        changed.hash_block_size += 1
+        if hasattr(changed, "hash_block_size"):
+            changed.hash_block_size = (changed.hash_block_size or 0) + 1
+        else:
+            changed.num_blocks += 1
     else:
         gid = next(
             i

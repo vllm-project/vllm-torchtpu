@@ -265,6 +265,7 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
     adapter.cache = NS(
         allocate=lambda: allocations.append(True),
         pages=44,
+        max_slots=16,
         specs={"gdn": None, "qsa": None, "ple": None},
         dummy_metadata=lambda metadata, active, *, use_max_model_len=True: {
             name: metadata for name in ("gdn", "qsa", "ple")
@@ -285,6 +286,7 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
     assert captured["metadata"]["gdn"].query_start_loc is kwargs["query_start_loc"]
     assert captured["metadata"]["ple"].seq_lens.tolist() == [128] + [0] * 7
     assert captured["metadata"]["gdn"].mamba_state_indices.tolist() == [1] + [0] * 7
+    assert captured["metadata"]["qsa"].qsa_ring_slots.tolist() == [1] + [0] * 7
     assert captured["metadata"]["gdn"].block_tables.max().item() == 1
     assert adapter.ngram_context.shape == (8, 2)
     assert kwargs["ngram_context"].tolist() == [[248044, 248044]] * 8
@@ -336,6 +338,7 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
     md = captured["metadata"]["gdn"]
     assert not kwargs["valid_tokens"].any()
     assert not md.mamba_state_indices.any()
+    assert not md.qsa_ring_slots.any()
     assert kwargs["ngram_context"].tolist() == [[248044, 248044]] * 8
     assert "ple_raw_embeddings" not in kwargs
     for value in (
@@ -869,3 +872,115 @@ def test_ngram_context_reads_sampler_commits_from_snapshot(
     ]
     assert history.tolist() == expected
     event.synchronize.assert_not_called()
+
+
+def test_ring_slot_allocator_lifecycle_and_eagle3_fallback():
+    """Verify _ring_slot_by_req_id lifecycle and Eagle3 qsa_ring_slots fallback."""
+    import numpy as np
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    from tests.runner.runner_input_test_utils import _make_runner
+    from vllm_torchtpu.layers.core.attention_metadata import (
+        AttentionMetadataBuilder,
+        AttentionMetadataBuilderContext,
+    )
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+    from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
+
+    runner = _make_runner(
+        num_computed_tokens=[4, 8, 12],
+        prompt_tokens=[8, 12, 16],
+        scheduled_tokens=[1, 1, 1],
+        token_paddings=[8],
+        pcp_size=1,
+    )
+    runner._init_qsa_ring_slots = TPUModelRunner._init_qsa_ring_slots.__get__(runner)
+    runner._build_qsa_ring_slots = TPUModelRunner._build_qsa_ring_slots.__get__(runner)
+    runner.requests = {"req0": NS(), "req1": NS(), "req2": NS()}
+    runner._init_qsa_ring_slots(8)
+    slots = runner._build_qsa_ring_slots(0, 3, 4)
+    assert slots.tolist() == [1, 2, 3, 0]
+    assert runner._ring_slot_by_req_id == {"req0": 1, "req1": 2, "req2": 3}
+
+    # Simulate req1 preempted/finished (removed from runner.requests) and req3 arriving
+    runner.requests.pop("req1")
+    runner.requests["req3"] = NS()
+    runner.input_batch.req_ids = ["req0", "req3", "req2"]
+    slots2 = runner._build_qsa_ring_slots(0, 3, 4)
+    # req1's slot 2 is returned to _free_ring_slots and immediately reused by req3
+    assert slots2.tolist() == [1, 2, 3, 0]
+    assert "req1" not in runner._ring_slot_by_req_id
+    assert runner._ring_slot_by_req_id["req3"] == 2
+
+    # Verify Eagle3Proposer._build_draft_attn_metadata fallback preserves qsa_ring_slots
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    builder = AttentionMetadataBuilder(
+        spec,
+        ["model.layers.3.self_attn"],
+        runner.vllm_config,
+        torch.device("cpu"),
+        runner,
+        0,
+    )
+    runner.position_ids = torch.zeros(4, dtype=torch.int32)
+    runner.num_reqs_max_model_len = 4
+    runner._attn_metadata_builder_ctx = None
+    runner.attn_groups = [[NS(metadata_builders=[builder])]]
+    fallback_calls = 0
+
+    def build_attn_md(**kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        md = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=NS(
+                num_reqs=kwargs["num_reqs"],
+                num_actual_tokens=kwargs["num_tokens"],
+            ),
+        )
+        return {"model.layers.3.self_attn": md}, {}
+
+    runner._build_attention_metadata = build_attn_md
+    proposer = Eagle3Proposer.__new__(Eagle3Proposer)
+    proposer.runner = runner
+    proposer.device = torch.device("cpu")
+    proposer._draft_kv_shared = False
+    proposer._draft_attn_layer_names = ["model.layers.3.self_attn"]
+    proposer._draft_md_cache = {}
+
+    ring_slots_tensor = torch.tensor([5, 6, 7, 0], dtype=torch.int32)
+    ctx = AttentionMetadataBuilderContext(
+        num_reqs=3,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.tensor([5, 9, 13, 0], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1, 2, 3, 3], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 3], dtype=torch.int32),
+        qsa_ring_slots=ring_slots_tensor,
+    )
+    chunk = DraftChunkInputs(
+        input_ids=torch.zeros(4, dtype=torch.int32),
+        position_ids=torch.zeros(4, dtype=torch.int32),
+        query_start_loc_np=np.array([0, 1, 2, 3, 3], dtype=np.int32),
+        attn_ctx=ctx,
+        start_index=0,
+        num_reqs=3,
+        aux_hidden_states=[],
+        attn_metadata=None,
+    )
+    for step_idx in (0, 1):
+        proposer._draft_md_cache.clear()
+        per_layer_md = proposer._build_draft_attn_metadata(
+            chunk,
+            step_idx=step_idx,
+            seq_lens_delta=0,
+            num_rejected_np=None,
+            loop_query_start_loc=torch.tensor([0, 1, 2, 3, 3], dtype=torch.int32),
+            loop_request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
+        )
+        rebuilt = per_layer_md["model.layers.3.self_attn"]
+        assert rebuilt.qsa_ring_slots is ring_slots_tensor
+    assert fallback_calls == 2

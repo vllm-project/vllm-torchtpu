@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""QSA over donated main and BF16 index pools with shared logical block IDs."""
+"""QSA over donated main, BF16 index, and request-slot ring pools."""
 
 import functools
 import math
@@ -633,6 +633,7 @@ def compact_pooled_qsa_step(
     trig: jax.Array,
     pool: jax.Array,
     index_pool: jax.Array,
+    ring_pool: jax.Array,
     starts: jax.Array,
     context: jax.Array,
     ring_ids: jax.Array,
@@ -660,13 +661,15 @@ def compact_pooled_qsa_step(
     sc_min_context: int | None = None,
     rope_axes: tuple[int, ...] | None = None,
     enable_sc_preparation: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    cache_tags: bool | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     # Keep the persisted custom-op parameter name while naming its main owner.
     main_pool = pool
     if len(qgate) == 0:
         return (
             main_pool,
             index_pool,
+            ring_pool,
             jnp.empty_like(residual)
             if residual is not None
             else jnp.empty((0, qgate.shape[1] // 2), jnp.bfloat16),
@@ -676,12 +679,13 @@ def compact_pooled_qsa_step(
     # shapes reconstruct their per-request rows inside the operator.
     main_table = main_table.reshape(len(context), -1)
     compressed_table = compressed_table.reshape(len(context), -1)
-    # Native BlockTable pads this one-block ring row to token alignment.
-    # Only column zero owns storage; the remaining entries are padding.
+    # Native BlockTable or runner ring slots: column zero owns storage.
     ring_ids = ring_ids.reshape(len(context), -1)[:, 0]
     # Keep request metadata independent of layer-specific page IDs so XLA can
     # share RPA schedules across layers.
     capacity = compress_ratio if ring_capacity is None else ring_capacity
+    if capacity <= 0:
+        raise ValueError("QSA ring capacity must be positive and fit the ring region")
     active = starts[1:] > starts[:-1]
     if capacity > compress_ratio:
         # Idle draft ranks replay collectives without writing the null page.
@@ -692,7 +696,14 @@ def compact_pooled_qsa_step(
     index_dim = niq.shape[0]
     # The persistent ring/tag ABI pads request rows to eight logical lanes.
     ring_rows = pl.cdiv(capacity, 8) * 8
-    tag_fields = (positions.shape[0] if positions.ndim == 2 else 1) + 1
+    use_tags = (
+        bool(cache_tags)
+        if cache_tags is not None
+        else ((rope_axes is not None) or (ring_pool.shape[1] >= 8))
+    )
+    tag_fields = (
+        ((positions.shape[0] if positions.ndim == 2 else 1) + 1) if use_tags else 0
+    )
 
     def read_index_state(owner):
         ring, tags = read_ring_and_tags(
@@ -700,7 +711,9 @@ def compact_pooled_qsa_step(
         )
         return (
             ring.reshape(len(ring_ids), ring_rows, index_dim),
-            tags.reshape(len(ring_ids), ring_rows, tag_fields),
+            None
+            if tags is None
+            else tags.reshape(len(ring_ids), ring_rows, tag_fields),
         )
 
     early_state = None
@@ -708,16 +721,16 @@ def compact_pooled_qsa_step(
     preparation_group = None
     early_raw = index_qk[:, -index_dim:]
     if (
-        capacity == compress_ratio
-        and enable_sc_preparation
+        enable_sc_preparation
+        and capacity == compress_ratio
         and scheduling_group_namespace > 0
         and use_prefill_index_preparation(
             early_raw, compress_ratio, requests=len(context)
         )
     ):
-        # Native main/index owners are independent allocations. Fork only reads
-        # here; compressed/state writes still consume the original owner barrier.
-        early_state = read_index_state(index_pool)
+        # Native main/index/ring owners are independent allocations. Fork only
+        # reads here; state writes still consume the ring owner barrier.
+        early_state = read_index_state(ring_pool)
         from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
         from vllm_torchtpu.kernels.qwen4_exp.index_pool_prepare_sc import (
             pool_index_groups_sc_async,
@@ -737,6 +750,12 @@ def compact_pooled_qsa_step(
             req,
             compress_ratio,
             scheduling_group_id=preparation_group,
+        )
+    if early_pooled is None:
+        # Keep small-bucket input_proj and q_proj scheduled together at entry so
+        # hidden does not stay live across index selection with divergent VMEM.
+        qgate, key, value, index_qk = jax.lax.optimization_barrier(
+            (qgate, key, value, index_qk)
         )
     from .retained_preparation import produce_prepared, use_retained_preparation
 
@@ -800,14 +819,17 @@ def compact_pooled_qsa_step(
             main_pool,
             _scheduling_group_id=preparation_group,
         )
-    # Retain the write dependency across the two owners.
-    main_pool, index_pool = jax.lax.optimization_barrier((main_pool, index_pool))
+    # Retain the write dependency across the three owners.
+    main_pool, index_pool, ring_pool = jax.lax.optimization_barrier(
+        (main_pool, index_pool, ring_pool)
+    )
     fused_state = capacity == compress_ratio and use_decode_state_fusion(
         raw,
-        index_pool,
+        ring_pool,
         requests=len(context),
         ratio=compress_ratio,
         position_axes=positions.shape[0] if positions.ndim == 2 else 1,
+        cache_tags=use_tags,
     )
     pending_state = None
     trig_rows = None
@@ -815,7 +837,7 @@ def compact_pooled_qsa_step(
     defer_rope = use_compressed_preparation(raw, trig, compress_ratio, rotary_dim)
     if fused_state:
         state_result = update_decode_state(
-            index_pool,
+            ring_pool,
             raw,
             positions,
             ring_ids,
@@ -828,10 +850,11 @@ def compact_pooled_qsa_step(
             rotary_dim=rotary_dim,
             rotate=not defer_rope,
             rope_axes=rope_axes,
+            cache_tags=use_tags,
         )
         if defer_rope:
             assert len(state_result) == 3
-            index_pool, completed, first_positions = state_result
+            ring_pool, completed, first_positions = state_result
             if use_completed_rope_dma(trig, first_positions):
                 compressed_positions = first_positions
             else:
@@ -842,12 +865,10 @@ def compact_pooled_qsa_step(
                 )
         else:
             assert len(state_result) == 2
-            index_pool, completed = state_result
+            ring_pool, completed = state_result
         complete = valid & (logical % compress_ratio == compress_ratio - 1)
     else:
-        ring, tags = (
-            read_index_state(index_pool) if early_state is None else early_state
-        )
+        ring, tags = read_index_state(ring_pool) if early_state is None else early_state
         completed, complete, req, logical, ring, tags = _indexer_updates(
             raw,
             positions,
@@ -862,8 +883,8 @@ def compact_pooled_qsa_step(
             norm_eps,
             rotary_dim,
             rope_axes,
-            ring_capacity=capacity,
             pooled_values=early_pooled,
+            ring_capacity=capacity,
         )
         pending_state = (ring, tags)
     index_pool = write_compressed(
@@ -886,8 +907,11 @@ def compact_pooled_qsa_step(
     if pending_state is not None:
         ring, tags = pending_state
         ids = jnp.where(active, ring_ids, 0)
-        index_pool = write_ring_and_tags(
-            index_pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
+        ring_pool = write_ring_and_tags(
+            ring_pool,
+            ring.reshape(len(ids), -1),
+            None if tags is None else tags.reshape(len(ids), -1),
+            ids,
         )
     lengths = jnp.where(valid, logical + 1, 0).astype(jnp.int32)
     blocks = select_blocks(
@@ -947,7 +971,7 @@ def compact_pooled_qsa_step(
         selected_tokens(blocks, lengths, token_topk, compress_ratio),
     )
 
-    return main_pool, index_pool, *result[1:]
+    return main_pool, index_pool, ring_pool, *result[1:]
 
 
 # Keep the protocol object outside the POD-only Torch custom-op schema.

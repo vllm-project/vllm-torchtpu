@@ -128,11 +128,25 @@ _TEXT_CONFIG = {
 def q4exp_text_config(**overrides):
     values = deepcopy(_TEXT_CONFIG)
     values.update(overrides)
+    if (
+        "rope_parameters" not in overrides
+        and ("head_dim" in overrides or "partial_rotary_factor" in overrides)
+        and isinstance(values.get("rope_parameters"), dict)
+        and "mrope_section" in values["rope_parameters"]
+    ):
+        half = int(values["head_dim"] * values["partial_rotary_factor"]) // 2
+        if sum(values["rope_parameters"]["mrope_section"]) != half and half > 0:
+            third = half // 3
+            values["rope_parameters"]["mrope_section"] = [
+                half - 2 * third,
+                third,
+                third,
+            ]
     return SimpleNamespace(**values)
 
 
 def qsa_test_pools(model, pages, *, block_size=128):
-    """Actual dual-store shapes from the configured native pool plan."""
+    """Actual 3-owner shapes from the configured native pool plan."""
     import math
 
     import torch
@@ -169,7 +183,11 @@ def qsa_test_pools(model, pages, *, block_size=128):
         (pages, layout.index_rows // 2, 1, 2, layout.compressed_width),
         dtype=torch.bfloat16,
     )
-    return (main, index), layout
+    ring = torch.zeros(
+        (max(pages, 64), layout.ring_carrier_rows, 1, 2, layout.compressed_width),
+        dtype=torch.bfloat16,
+    )
+    return (main, index, ring), layout
 
 
 def qsa_forward_context(
@@ -180,14 +198,12 @@ def qsa_forward_context(
     main = SimpleNamespace(
         block_tables=main_block_table,
         request_distribution=request_distribution,
+        qsa_ring_slots=state_slots,
     )
-    ring = SimpleNamespace(block_tables=state_slots)
     monkeypatch.setattr(
         qsa,
         "get_forward_context",
-        lambda: SimpleNamespace(
-            attn_metadata={model.prefix: main, model.prefix + ".raw_ring": ring}
-        ),
+        lambda: SimpleNamespace(attn_metadata={model.prefix: main}),
     )
 
 

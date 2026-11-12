@@ -39,7 +39,9 @@ def test_plan_includes_draft_and_ple_checkpoints(k):
     cfg.speculative_config = NS(num_speculative_tokens=k)
     native = native_cache_specs(cfg)
     layout, pooled = pooled_cache_specs(cfg)
-    assert set(pooled) == {n for n in native if not n.endswith(".compressed_k")}
+    assert set(pooled) == {
+        n for n in native if not n.endswith((".compressed_k", ".raw_ring", ".ple"))
+    }
     draft = "mtp.layers.48.self_attn"
     assert {draft, draft + ".compressed_k", draft + ".raw_ring"} <= native.keys()
     for name, spec in pooled.items():
@@ -50,17 +52,18 @@ def test_plan_includes_draft_and_ple_checkpoints(k):
                 spec.max_num_blocks_per_req(cfg, cfg.model_config.max_model_len)
                 == k + 1
             )
-            if name.endswith(".ple"):
-                text = cfg.model_config.hf_text_config
-                assert spec.shapes == (
-                    (
-                        (text.ple_conv_kernel_size - 1) * text.ngram_size,
-                        text.hidden_size * text.hc_count,
-                    ),
-                )
-        elif name.endswith("raw_ring"):
-            assert spec.block_size == 8
-    assert len([n for n in pooled if n.endswith("raw_ring")]) == 13
+    text = cfg.model_config.hf_text_config
+    ple_spec = native["model.layers.1.ple"]
+    assert ple_spec.num_speculative_blocks == k
+    assert ple_spec.shapes == (
+        (
+            (text.ple_conv_kernel_size - 1) * text.ngram_size,
+            text.hidden_size * text.hc_count,
+        ),
+    )
+    ring_names = [n for n in native if n.endswith("raw_ring")]
+    assert len(ring_names) == 13
+    assert all(native[n].block_size == 8 for n in ring_names)
 
 
 @pytest.mark.parametrize("k", [1, 2, 4, 5])
@@ -341,8 +344,24 @@ def test_dummy_state_metadata_matches_serving_storage_contract(k, state_name):
     cfg = pool_config()
     cfg.cache_config.enable_prefix_caching = False
     cfg.speculative_config = NS(num_speculative_tokens=k)
-    _, specs = pooled_cache_specs(cfg)
-    spec = next(spec for name, spec in specs.items() if name.endswith("." + state_name))
+    from dataclasses import replace
+
+    layout, specs = pooled_cache_specs(cfg)
+    if state_name == "ple":
+        spec = replace(
+            native_cache_specs(cfg)["model.layers.1.ple"],
+            page_size_padded=layout.page_bytes,
+            mamba_cache_mode=cfg.cache_config.mamba_cache_mode,
+            block_size=(
+                layout.block_size
+                if cfg.cache_config.enable_prefix_caching
+                else cfg.model_config.max_model_len
+            ),
+        )
+    else:
+        spec = next(
+            spec for name, spec in specs.items() if name.endswith("." + state_name)
+        )
     columns = 1 + spec.num_speculative_blocks
     assert columns == k + 1
     cache.groups = [NS(kv_cache_spec=spec, layer_names=["state"])]
@@ -497,3 +516,47 @@ def test_mtp_admission_with_model_owned_pd(monkeypatch, k, role):
     cfg.kv_transfer_config.kv_role = "kv_both"
     with pytest.raises(ValueError, match="producer or consumer role"):
         validate_config(cfg)
+
+
+def test_make_mtp_config_inherits_target_rope_parameters(monkeypatch):
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
+    from vllm_torchtpu.models.vllm.qwen4_exp import mtp
+
+    quant = VllmFp8Config.from_config(
+        {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "modules_to_not_convert": [],
+        }
+    )
+    target_text = NS(
+        num_hidden_layers=48,
+        ple_layer_ids=[2],
+        rope_parameters={
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10000,
+            "rope_type": "default",
+        },
+        mtp={"rope_theta": 10000000},
+    )
+    draft_text = NS(
+        num_hidden_layers=48,
+        ple_layer_ids=[2],
+        rope_parameters={
+            "mrope_interleaved": True,
+            "mrope_section": [11, 11, 10],
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10000,
+            "rope_type": "default",
+        },
+        mtp={"rope_theta": 10000000},
+    )
+    cfg = NS(
+        model_config=NS(hf_text_config=target_text),
+        speculative_config=NS(draft_model_config=NS(hf_text_config=draft_text)),
+    )
+    monkeypatch.setattr(mtp, "get_tpu_quantization_config", lambda _: quant)
+    draft = mtp.make_mtp_config(cfg)
+    assert "mrope_section" not in draft.model_config.hf_text_config.rope_parameters
+    assert draft.model_config.hf_text_config.rope_parameters["rope_theta"] == 10000000
+    assert target_text.rope_parameters["rope_theta"] == 10000

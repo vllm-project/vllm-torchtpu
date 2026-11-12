@@ -804,7 +804,9 @@ def _registered_qwen_pool(
 
     def construct(storages, *, num_slots):
         assert num_slots == 1
-        assert all(a is b for a, b in zip(storages, materialized.raw_tensors))
+        assert all(
+            a is b for a, b in zip(storages, worker._qwen_page_plan.manifest.storages)
+        )
         builds.append(storages)
         return engine
 
@@ -816,7 +818,8 @@ def _registered_qwen_pool(
         raise
     worker.register_runner(runner)
     assert len(builds) == len(facade.register_work_unit_calls) == 1
-    assert len(pools) == len(materialized.kv_caches)
+    ring_keys = {k for k in materialized.kv_caches if k.endswith(".raw_ring")}
+    assert len(pools) == len(materialized.kv_caches) - len(ring_keys)
     assert worker._qwen_page_plan is not None
     assert worker._qwen_page_plan.manifest.storages[0] is materialized.raw_tensors[0]
     return SimpleNamespace(
@@ -877,7 +880,7 @@ def test_qwen_registration_preserves_explicit_full_mirror_override(monkeypatch):
 
 def test_equal_carriers_with_different_ring_encoding_do_not_admit_as_peers(monkeypatch):
     peers = []
-    for ratio in (4, 8):
+    for ratio in (8, 16):
         peer = _registered_qwen_pool(
             monkeypatch,
             text_overrides=dict(
@@ -899,11 +902,13 @@ def test_equal_carriers_with_different_ring_encoding_do_not_admit_as_peers(monke
         peers[1]
     )
     assert [
-        payload["semantics"]["ranks"][0]["cache_specs"][
-            "model.layers.0.self_attn.raw_ring"
-        ]["block_size"]
+        payload["semantics"]["ranks"][0]["state_flags"]["qsa_compress_ratio"]
         for payload in peers
-    ] == [4, 8]
+    ] == [8, 16]
+    assert [
+        payload["semantics"]["ranks"][0]["state_flags"]["qsa_ring_capacity"]
+        for payload in peers
+    ] == [8, 16]
 
 
 @pytest.mark.parametrize(
@@ -931,6 +936,8 @@ def test_qwen_register_runner_admits_actual_materialized_owners(
         assert rank["state_flags"] == {
             "gdn_conv_dtype": "torch.float32",
             "gdn_granule_bytes": 512,
+            "qsa_compress_ratio": 4,
+            "qsa_ring_capacity": 4,
         }
         assert rank["kv_scales"] == [(0, 0.5, 0.25)]
         recurrent = [
@@ -1492,9 +1499,15 @@ def test_actual_mtp_depths_share_wire_contract_and_keep_local_allocation(
         assert cache.native_config.num_blocks == capacity
         state_specs = [s for s in cache.specs.values() if isinstance(s, MambaSpec)]
         assert state_specs and all(s.num_speculative_blocks == k for s in state_specs)
-        rings = {n: s for n, s in cache.specs.items() if n.endswith(".raw_ring")}
+        assert any(n.startswith("mtp.") for n in cache.specs)
+        assert cache.layout.ring_carrier_rows == 8
+        rings = {
+            n: tensor
+            for n, tensor in cache.materialized.kv_caches.items()
+            if n.endswith(".raw_ring")
+        }
         assert any(n.startswith("mtp.") for n in rings)
-        assert all(s.block_size == 8 for s in rings.values())
+        assert all(tensor.shape[1] * tensor.shape[3] >= 8 for tensor in rings.values())
         groups = Qwen4ExpRaidenConnector._build_stage3_transfer_groups(
             cache.native_config
         )

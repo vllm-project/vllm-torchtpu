@@ -97,6 +97,7 @@ def _dense_step(hidden, weights, positions, prior, fp8):
 def test_complete_layer_dense_context_against_plain_torch(
     fp8, tmp_path, decode_bucket, metadata_slots
 ):
+    torch._dynamo.reset()
     from torch_tpu._internal.compile._backend import TpuBackend
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed import (
@@ -224,8 +225,8 @@ def test_complete_layer_dense_context_against_plain_torch(
                             dtype=torch.int32,
                             device="tpu",
                         ),
+                        qsa_ring_slots=ring_ids,
                     ),
-                    model.prefix + ".raw_ring": SimpleNamespace(block_tables=ring_ids),
                 }
                 with set_forward_context(per_layer, config, num_tokens=bucket):
                     output, selected = compiled(
@@ -262,9 +263,7 @@ def test_complete_layer_dense_context_against_plain_torch(
                 assert (
                     torch.count_nonzero(owners[0][[0, 17, 18, 19]].cpu().float()) == 0
                 )
-                # Index owner page0 holds the active ring at independent ID0;
-                # unreferenced pages remain untouched in both physical owners.
-                assert torch.count_nonzero(owners[1][[17, 18, 19]].cpu()) == 0
+                assert torch.count_nonzero(owners[1][[0, 17, 18, 19]].cpu()) == 0
                 print(
                     f"DENSE_LAYER fp8={fp8} context={context} "
                     f"count={count} relative_l2={error}"

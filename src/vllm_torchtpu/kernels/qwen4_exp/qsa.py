@@ -146,15 +146,19 @@ def _indexer_updates(
     rotary_dim,
     rope_axes=None,
     *,
-    ring_capacity: int | None = None,
     pooled_values: jax.Array | None = None,
+    ring_capacity: int | None = None,
+    cache_tags: bool | None = None,
 ):
     count = len(raw)
+    if cache_tags is False:
+        tags = None
     req, logical, valid = _token_metadata(count, starts, context, slots)
     safe_slots = jnp.maximum(slots, 0)
     ratio = compress_ratio
     capacity = ratio if ring_capacity is None else ring_capacity
-    assert ratio <= capacity <= ring.shape[1]
+    if capacity <= 0 or capacity > ring.shape[1]:
+        raise ValueError("QSA ring capacity must be positive and fit the ring state")
     group_start = logical // ratio * ratio
     from .tuned_block_sizes import use_prefill_index_preparation
 
@@ -184,19 +188,26 @@ def _indexer_updates(
             (chunk_indices >= starts[req, None])[..., None], current, previous
         )
         pooled = bf16(jnp.mean(joined.astype(jnp.float32), axis=1))
-    first_index = starts[req] + group_start - context[req]
     axial = positions.ndim == 2
     token_positions = positions.T if axial else positions[:, None]
     axes = token_positions.shape[1]
-    if tags.shape[-1] != axes + 1:
-        raise ValueError("Indexer tags do not match the position-axis state ABI")
-    old_position = tags[safe_slots[req], group_start % capacity, :axes]
-    first_position = jnp.where(
-        (first_index >= starts[req])[:, None],
-        token_positions[jnp.clip(first_index, 0, count - 1)],
-        old_position,
-    )
-    first_position = first_position.T if axial else first_position[:, 0]
+    if tags is None:
+        first_position = (
+            jnp.broadcast_to(group_start[None, :], (axes, count))
+            if axial
+            else group_start
+        )
+    else:
+        if tags.shape[-1] != axes + 1:
+            raise ValueError("Indexer tags do not match the position-axis state ABI")
+        first_index = starts[req] + group_start - context[req]
+        old_position = tags[safe_slots[req], group_start % capacity, :axes]
+        first_position = jnp.where(
+            (first_index >= starts[req])[:, None],
+            token_positions[jnp.clip(first_index, 0, count - 1)],
+            old_position,
+        )
+        first_position = first_position.T if axial else first_position[:, 0]
     completed = index_rope(
         gemma_norm(pooled, norm_k, norm_eps),
         jnp.maximum(first_position, 0),
@@ -213,17 +224,18 @@ def _indexer_updates(
     last = end[:, None] - 1 - ((end[:, None] - 1 - lanes) % capacity)
     local = starts[:-1, None] + last - context[:, None]
     old_ring = ring[safe_slots]
-    old_tags = tags[safe_slots]
     old_ring = jnp.where((context > 0)[:, None, None], old_ring, 0)
-    old_tags = jnp.where((context > 0)[:, None, None], old_tags, -1)
     new_lane = (lanes < capacity) & (last >= context[:, None]) & (last < end[:, None])
     rr = jnp.where(new_lane[..., None], raw[jnp.clip(local, 0, count - 1)], old_ring)
-    pp = token_positions[jnp.clip(local, 0, count - 1)]
-    tag_pairs = jnp.concatenate([pp, jnp.zeros((*pp.shape[:-1], 1), pp.dtype)], -1)
-    tt = jnp.where(new_lane[..., None], tag_pairs, old_tags)
     dest = jnp.where((lengths > 0) & (slots >= 0), slots, ring.shape[0])
     ring = ring.at[dest].set(rr, mode="drop")
-    tags = tags.at[dest].set(tt, mode="drop")
+    if tags is not None:
+        old_tags = tags[safe_slots]
+        old_tags = jnp.where((context > 0)[:, None, None], old_tags, -1)
+        pp = token_positions[jnp.clip(local, 0, count - 1)]
+        tag_pairs = jnp.concatenate([pp, jnp.zeros((*pp.shape[:-1], 1), pp.dtype)], -1)
+        tt = jnp.where(new_lane[..., None], tag_pairs, old_tags)
+        tags = tags.at[dest].set(tt, mode="drop")
     return completed, complete, req, logical, ring, tags
 
 
@@ -242,6 +254,9 @@ def _update_indexer(
     compress_ratio,
     norm_eps,
     rotary_dim,
+    rope_axes=None,
+    *,
+    ring_capacity: int | None = None,
 ):
     if len(raw) == 0 or len(slots) == 0:
         return compressed, ring, tags
@@ -258,6 +273,8 @@ def _update_indexer(
         compress_ratio,
         norm_eps,
         rotary_dim,
+        rope_axes,
+        ring_capacity=ring_capacity,
     )
     groups_per_page = compressed.shape[1]
     cp = jnp.where(

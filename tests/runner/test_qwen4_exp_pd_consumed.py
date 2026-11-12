@@ -223,7 +223,7 @@ def test_pd_uses_the_same_public_weight_loaders(model_builder, pd_enabled):
 def test_real_mtp_attention_registry_admits_prefill_only(model_builder, monkeypatch):
     from vllm.config import get_current_vllm_config, get_layers_from_vllm_config
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-    from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
 
     from tests.runner.test_qwen4_exp_pool import pool_config
     from vllm_torchtpu.models.vllm.qwen4_exp import mtp
@@ -259,10 +259,7 @@ def test_real_mtp_attention_registry_admits_prefill_only(model_builder, monkeypa
     assert isinstance(
         registered[draft.attention_prefix].get_kv_cache_spec(config), FullAttentionSpec
     )
-    assert isinstance(
-        registered[draft.attention_prefix].get_auxiliary_cache_specs()["raw_ring"],
-        CircularBufferSpec,
-    )
+    assert registered[draft.attention_prefix].get_auxiliary_cache_specs() == {}
     runner = SimpleNamespace(vllm_config=config, cache_config=config.cache_config)
     cache = Qwen4ExpPooledCache(runner, target)
     specs = cache.get_specs()
@@ -270,4 +267,4 @@ def test_real_mtp_attention_registry_admits_prefill_only(model_builder, monkeypa
     proposer.runner = SimpleNamespace(get_kv_cache_spec=cache.get_specs)
     proposer._validate_prefill_only_draft_model(names)
     assert isinstance(specs[draft.attention_prefix], FullAttentionSpec)
-    assert isinstance(specs[draft.attention_prefix + ".raw_ring"], CircularBufferSpec)
+    assert draft.attention_prefix + ".raw_ring" not in specs

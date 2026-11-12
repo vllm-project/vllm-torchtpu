@@ -214,6 +214,9 @@ class Qwen4ExpAdapter:
             [0] + lengths, dtype=torch.int32, device="cpu"
         ).cumsum(0, dtype=torch.int32)
         active = sum(q > 0 for q in lengths)
+        assert active < getattr(self.cache, "max_slots", active + 1), (
+            "Dummy active requests exceed allocated QSA ring slots"
+        )
         slots_cpu = torch.tensor(
             list(range(1, active + 1)) + [-1] * (num_reqs - active),
             dtype=torch.int32,
@@ -263,6 +266,7 @@ class Qwen4ExpAdapter:
             query_start_loc=starts,
             request_distribution=distribution,
             mamba_state_indices=slots.clamp(min=0),
+            qsa_ring_slots=slots.clamp(min=0),
         )
         columns = context[:, None] + torch.arange(
             1 - self.config.ngram_size, 0, dtype=torch.int64, device=runner.device
@@ -313,6 +317,7 @@ class Qwen4ExpAdapter:
             query_start_loc=starts,
             request_distribution=torch.zeros(3, dtype=torch.int32, device=device),
             mamba_state_indices=torch.zeros_like(slots),
+            qsa_ring_slots=torch.zeros_like(slots),
         )
         kwargs = dict(
             query_start_loc=starts,
@@ -411,27 +416,27 @@ class Qwen4ExpAdapter:
             # Bound idle prefill work so newly arrived requests do not trail
             # other DP ranks by several chunks. Keep decode asynchronous.
             wait_for_output = not dp_lockstep or not runner._dp_step_other_decode
+            dp_vocab_logits = bool(getattr(runner, "_dp_vocab_logits", False))
             if dp_lockstep and (
-                runner._dp_vocab_logits
-                or runner.parallel_config.tensor_parallel_size > 1
+                dp_vocab_logits or runner.parallel_config.tensor_parallel_size > 1
             ):
                 # Match the busy rank's LM-head collectives. DP vocabulary
                 # sharding requires this even when tensor parallelism is one.
                 indices = torch.zeros(
                     runner._dp_vocab_logits_rows()
-                    if runner._dp_vocab_logits
+                    if dp_vocab_logits
                     else metadata.query_start_loc.shape[0] - 1,
                     dtype=torch.int32,
                     device=out.device,
                 )
                 logits = (
                     runner._compute_dp_vocab_logits(out, indices)
-                    if runner._dp_vocab_logits
+                    if dp_vocab_logits
                     else runner.compute_selected_logits(out, indices)
                 )
                 if wait_for_output:
                     synchronize_tensors(logits)
-                elif runner._dp_vocab_logits:
+                elif dp_vocab_logits:
                     # No caller consumes dummy logits; enqueue the collective
                     # before the subsequent draft, without blocking decode.
                     synchronize_tensors(logits, wait=False)

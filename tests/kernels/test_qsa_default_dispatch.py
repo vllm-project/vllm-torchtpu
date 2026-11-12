@@ -76,12 +76,19 @@ def test_real_default_registration_schema_cache_and_no_profile(monkeypatch):
     assert op is qsa_op.build_compact_pooled_qsa_op()
     name = qsa_op._op_name("compact_pooled_qsa", None, None)
     (schema,) = torch._C._jit_get_schemas_for_operator(name)
-    assert len(schema.arguments) == 33 and len(schema.returns) == 4
+    assert len(schema.arguments) == 35 and len(schema.returns) == 5
     assert [a.name for a in schema.arguments] == list(inspect.signature(op).parameters)
-    assert [a.name for a in schema.arguments][10:12] == ["pool", "index_pool"]
-    assert schema.arguments[-1].name == "scheduling_group_namespace"
+    assert [a.name for a in schema.arguments][10:13] == [
+        "pool",
+        "index_pool",
+        "ring_pool",
+    ]
+    assert [a.name for a in schema.arguments][-2:] == [
+        "scheduling_group_namespace",
+        "ring_capacity",
+    ]
     registered = inspect.getclosurevars(op).nonlocals["op"]
-    assert tuple(registered._init_fn.donate_argnums) == (10, 11)
+    assert tuple(registered._init_fn.donate_argnums) == (10, 11, 12)
     assert (
         "cost_model"
         not in inspect.signature(qsa_op._build_compact_pooled_qsa_op).parameters

@@ -148,12 +148,12 @@ def test_runner_padded_decode_reaches_native_fused_attention(
     )
     runner.model_config = NS(hf_text_config=q4exp_text_config())
     runner.cache_config.block_size = page
-    tables = (
-        torch.tensor([[4, 2], [3, 1]], dtype=torch.int32),
-        torch.tensor([[9], [10]], dtype=torch.int32),
-    )
+    runner._init_qsa_ring_slots = TPUModelRunner._init_qsa_ring_slots.__get__(runner)
+    runner._build_qsa_ring_slots = TPUModelRunner._build_qsa_ring_slots.__get__(runner)
+    runner._init_qsa_ring_slots(16)
+    tables = (torch.tensor([[4, 2], [3, 1]], dtype=torch.int32),)
     runner.input_batch.block_table = [_BlockTable(t) for t in tables]
-    names = tuple("model.layers.3.self_attn" + suffix for suffix in ("", ".raw_ring"))
+    names = ("model.layers.3.self_attn",)
     builders = [
         AttentionMetadataBuilder(specs[n], [n], cfg, torch.device("cpu"), runner, i)
         for i, n in enumerate(names)
@@ -194,6 +194,10 @@ def test_runner_padded_decode_reaches_native_fused_attention(
         (11, layout.index_rows // 2, 1, 2, layout.compressed_width),
         dtype=torch.bfloat16,
     )
+    initial_ring = torch.zeros(
+        (16, 8 if layout.cache_tags else 4, 1, 2, layout.compressed_width),
+        dtype=torch.bfloat16,
+    )
     producers = [
         normal((8, 48 * 256)),
         normal((8, 2 * 256)),
@@ -210,7 +214,7 @@ def test_runner_padded_decode_reaches_native_fused_attention(
     for x in producers[:4]:
         x[2:] = torch.nan
     starts, context = (metadata[n] for n in ("query_start_loc", "context_lens"))
-    rings = prepared[0][names[1]].block_tables
+    rings = prepared[0][names[0]].qsa_ring_slots
     main_table = prepared[0][names[0]].block_tables
     distribution = prepared[0][names[0]].request_distribution
     assert isinstance(rings, torch.Tensor)
@@ -229,7 +233,7 @@ def test_runner_padded_decode_reaches_native_fused_attention(
             )
         return jnp.asarray(x.numpy(), jnp.int32)
 
-    args = [array(x) for x in [*producers, initial, initial_index, *tail]]
+    args = [array(x) for x in [*producers, initial, initial_index, initial_ring, *tail]]
     hlo = (
         jax.jit(compact_pooled_qsa_step, static_argnames=tuple(options))
         .lower(*args, **options)
@@ -252,13 +256,14 @@ def test_runner_padded_decode_reaches_native_fused_attention(
     for label, function in (("direct", op), ("compiled", compiled)):
         owner = initial.to("tpu")
         index_owner = initial_index.to("tpu")
+        ring_owner = initial_ring.to("tpu")
         with jax.profiler.TraceAnnotation("runner-qsa-decode-" + label):
             out, selected = function(
-                *tensor_args, owner, index_owner, *tensor_tail, **options
+                *tensor_args, owner, index_owner, ring_owner, *tensor_tail, **options
             )
             from torch_tpu._internal import sync
 
-            sync.synchronize([out, selected, owner, index_owner], wait=True)
+            sync.synchronize([out, selected, owner, index_owner, ring_owner], wait=True)
             actual = out.cpu().float().numpy().reshape(8, 24, 256)
         assert np.isfinite(actual).all()
         np.testing.assert_array_equal(actual[2:], 0)
@@ -284,6 +289,12 @@ def test_runner_padded_decode_reaches_native_fused_attention(
         torch.testing.assert_close(
             index_owner.cpu()[[0, 5, 6, 7, 8]].view(torch.uint8),
             initial_index[[0, 5, 6, 7, 8]].view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            ring_owner.cpu()[0].view(torch.uint8),
+            initial_ring[0].view(torch.uint8),
             rtol=0,
             atol=0,
         )

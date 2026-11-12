@@ -65,8 +65,14 @@ class GroupedIndexConfig:
 # TPU7x BF16: measured at 1/8/16/32/64 requests, with ragged 1--16-query
 # windows and contexts through 128K. Eight queries share each 20-page DMA.
 _GROUPED_INDEX_BLOCKS = {
-    (batch, 4, 128, 416, 80, 4, 512): GroupedIndexConfig(8, 20, 3)
-    for batch in (16, 32, 64, 128, 256)
+    **{
+        (batch, 4, 128, 416, 40, 4, 512): GroupedIndexConfig(8, 20, 2)
+        for batch in (16, 32, 64, 128, 256)
+    },
+    **{
+        (batch, 4, 128, 416, 80, 4, 512): GroupedIndexConfig(8, 20, 3)
+        for batch in (16, 32, 64, 128, 256)
+    },
 }
 
 
@@ -100,6 +106,7 @@ def use_decode_state_fusion(
     requests: int,
     ratio: int,
     position_axes: int = 1,
+    cache_tags: bool = True,
 ) -> bool:
     """Fuse resident state and pair writes within the small-query bucket."""
     hw = _hardware()
@@ -122,22 +129,24 @@ def use_decode_state_fusion(
     # Persistent ring/tag storage pads compression groups to eight rows.
     ring_rows = _align(ratio, 8)
     ring_elements = ring_rows * raw.shape[-1]
-    tag_elements = ring_rows * (position_axes + 1)
+    tag_elements = ring_rows * (position_axes + 1) if cache_tags else 0
     rt, _ = region_rows(pool, ring_elements, jnp.bfloat16)
-    tt, _ = region_rows(pool, tag_elements, jnp.int32)
+    tt, _ = region_rows(pool, tag_elements, jnp.int32) if tag_elements > 0 else (0, 0)
     memory = ring_tag_dma_memory(
         pool, min(raw.shape[0], requests), requests, ring_elements, tag_elements, hw
     )
     resident = (
         3 * _vmem(raw.shape, jnp.bfloat16, hw)
-        + _vmem(raw.shape, jnp.int32, hw)
+        + (_vmem(raw.shape, jnp.int32, hw) if cache_tags else 0)
         + _vmem((1, raw.shape[1]), jnp.bfloat16, hw)
     )
+    smem_extra = (
+        requests * 2 + 1 + (raw.shape[0] * position_axes if cache_tags else 0)
+    ) * 4
     return (
         rt + tt <= pool.shape[1]
         and memory.vmem_bytes + resident <= hw.vmem_bytes
-        and memory.scalar + (requests * 2 + 1 + raw.shape[0] * position_axes) * 4
-        <= hw.smem_bytes
+        and memory.scalar + smem_extra <= hw.smem_bytes
     )
 
 
@@ -234,7 +243,10 @@ def _hardware() -> DmaHardware | None:
         device is not None and device.platform != "tpu"
     ):
         return None
-    return DmaHardware.from_tpu_info(pltpu.get_tpu_info())
+    info = pltpu.get_tpu_info()
+    if not hasattr(info, "smem_capacity_bytes"):
+        return None
+    return DmaHardware.from_tpu_info(info)
 
 
 def _align(value: int, tile: int) -> int:
@@ -301,10 +313,10 @@ def ring_tag_dma_memory(
     hw: DmaHardware,
 ) -> DmaMemory:
     rt, rr = region_rows(pool, ring_elements, jnp.bfloat16)
-    tt, tr = region_rows(pool, tag_elements, jnp.int32)
+    tt, tr = region_rows(pool, tag_elements, jnp.int32) if tag_elements > 0 else (0, 0)
     staged = _vmem((batch, rt + tt, *pool.shape[2:]), pool.dtype, hw)
-    typed = _vmem((batch, rr, pool.shape[-1]), jnp.bfloat16, hw) + _vmem(
-        (batch, tr, pool.shape[-1]), jnp.int32, hw
+    typed = _vmem((batch, rr, pool.shape[-1]), jnp.bfloat16, hw) + (
+        _vmem((batch, tr, pool.shape[-1]), jnp.int32, hw) if tag_elements > 0 else 0
     )
     vector = hw.int32_rows * hw.lanes * 4
     # Input/output blocks are double buffered by the pinned Pallas pipeline.
@@ -351,12 +363,13 @@ def ring_tag_dma_batch(
         not _carrier(pool, hardware)
         or requests <= 0
         or requests >= 2**31
-        or min(ring_elements, tag_elements) <= 0
+        or ring_elements <= 0
+        or tag_elements < 0
     ):
         return 1
     assert hardware is not None
     rt, _ = region_rows(pool, ring_elements, jnp.bfloat16)
-    tt, _ = region_rows(pool, tag_elements, jnp.int32)
+    tt, _ = region_rows(pool, tag_elements, jnp.int32) if tag_elements > 0 else (0, 0)
     if rt + tt > pool.shape[1]:
         return 1
     for batch in _DMA_BATCHES:

@@ -478,6 +478,7 @@ def test_pooled_step_forwards_geometry_and_backend_before_attention(
         jnp.tile(jnp.array([[1, 0]], jnp.bfloat16), (8, 1)),
         jnp.zeros((4, 128, 1, 2, 128), jnp.bfloat16),
         jnp.zeros((4, 16, 1, 2, 128), jnp.bfloat16),
+        jnp.zeros((4, 8, 1, 2, 128), jnp.bfloat16),
         starts,
         context,
         jnp.array([3, 0], jnp.int32),
@@ -551,7 +552,7 @@ def test_production_compact_factory_exposes_compiler_owned_namespace(monkeypatch
         topk_backend=ReferenceTopK(), topk_backend_key="namespace-contract-test-v1"
     )
     op, options = registrations[0]
-    assert options["donate_argnums"] == (10, 11)
+    assert options["donate_argnums"] == (10, 11, 12)
     schema = op._opoverload._schema
     namespace_index = next(
         i

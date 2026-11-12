@@ -231,10 +231,21 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             return torch.zeros_like(hidden_states)
         gated = self.gated_values(hidden_states, self.storage.decode(raw))
         state_kwargs = {}
-        if self.num_speculative_tokens > 0:
-            metadata = cast(
+        if getattr(self, "num_speculative_tokens", 0) > 0:
+            per_layer = cast(
                 dict[str, AttentionMetadata], get_forward_context().attn_metadata
-            )[self.prefix]
+            )
+            from .pool_layout import resolve_ple_companion
+
+            companion = resolve_ple_companion(
+                self.prefix,
+                [k for k in per_layer if k.endswith(".linear_attn")],
+            )
+            metadata = (
+                per_layer[companion]
+                if companion is not None and companion in per_layer
+                else per_layer[self.prefix]
+            )
             assert metadata.mamba_ckpt_indices is not None
             assert metadata.mamba_slot_read_offsets is not None
             assert metadata.mamba_request_distribution is not None

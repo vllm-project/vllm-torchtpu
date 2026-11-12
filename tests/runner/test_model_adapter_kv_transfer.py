@@ -142,7 +142,9 @@ def test_qwen_pool_adapter_registers_materialized_carriers(monkeypatch, ssm_dtyp
         SimpleNamespace(
             layer_type="indexed_attention",
             self_attn=SimpleNamespace(
-                bind_pool=lambda main, index: bound.update(main=main, index=index)
+                bind_pool=lambda main, index, ring: bound.update(
+                    main=main, index=index, ring=ring
+                )
             ),
             ple=None,
         ),
@@ -183,14 +185,16 @@ def test_qwen_pool_adapter_registers_materialized_carriers(monkeypatch, ssm_dtyp
             assert caches is materialized.kv_caches
             assert caches["model.layers.1.self_attn"] is bound["main"]
             assert caches["model.layers.1.self_attn.compressed_k"] is bound["index"]
-            assert caches["model.layers.1.self_attn.raw_ring"] is bound["index"]
+            assert caches["model.layers.1.self_attn.raw_ring"] is bound["ring"]
             assert caches["model.layers.0.ple"][0] is bound["ple"]
             assert all(
                 a is b
                 for a, b in zip(runner.kv_cache_raw_tensors, materialized.raw_tensors)
             )
             manifest = build_transfer_manifest(cache.native_config, materialized)
-            assert {p.layer_name for p in manifest.pools} == set(caches)
+            assert {p.layer_name for p in manifest.pools} == {
+                k for k in caches if not k.endswith(".raw_ring")
+            }
             events.append("caches")
 
         def register_runner(self, runner):

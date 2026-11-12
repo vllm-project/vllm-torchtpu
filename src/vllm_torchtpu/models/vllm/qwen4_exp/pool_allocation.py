@@ -92,6 +92,28 @@ def materialize_pool(
         if layout.index_page_bytes
         else []
     )
+    max_slots = math.ceil((cfg.scheduler_config.max_num_seqs + 1) / 8) * 8
+    rings = (
+        [
+            torch.zeros(
+                (max_slots, layout.ring_carrier_rows, 1, 2, layout.compressed_width),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            for _ in range(regions)
+        ]
+        if layout.index_page_bytes
+        else []
+    )
+    ple_pools = {
+        layer_id - 1: torch.zeros(
+            (blocks, layout.ple_rows, 1, 2, layout.compressed_width),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        for layer_id in sorted(set(cfg.model_config.hf_text_config.ple_layer_ids))
+        if layout.ple_rows > 0
+    }
     raw = mains + indices
     assert sum(t.untyped_storage().nbytes() for t in raw) == total
     kv_caches = {}
@@ -103,11 +125,14 @@ def materialize_pool(
         for n in g.layer_names
     }
     for name, region in placements.items():
-        tensor = indices[region] if name.endswith(".raw_ring") else mains[region]
+        tensor = mains[region]
         layer_to_raw[name] = tensor
         kv_caches[name] = [tensor] if name in state_names else tensor
         if name.endswith(".self_attn"):
             kv_caches[name + ".compressed_k"] = indices[region]
+            kv_caches[name + ".raw_ring"] = rings[region]
+    for layer_idx, ple_pool in ple_pools.items():
+        kv_caches[f"model.layers.{layer_idx}.ple"] = [ple_pool]
     return MaterializedKVCache(
         kv_caches=kv_caches, raw_tensors=raw, layer_to_raw=layer_to_raw
     )

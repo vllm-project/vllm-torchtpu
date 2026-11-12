@@ -70,6 +70,7 @@ def attention_block_table_width(
         "mamba_request_distribution",
         "mamba_prefill_ckpt_offsets",
         "mamba_prefill_ckpt_indices",
+        "qsa_ring_slots",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -128,6 +129,9 @@ class AttentionMetadata:
     # checkpoint (-1 if none). Present iff the group declares prefill
     # checkpoint blocks and mamba_prefill_ckpt_offsets is set.
     mamba_prefill_ckpt_indices: jax.Array | torch.Tensor | None = None
+    # (max_num_seqs,) int32: per-request QSA ring companion-pool slot id
+    # (slot 0 is the null/idle slot; active requests use [1, max_slots)).
+    qsa_ring_slots: jax.Array | torch.Tensor | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -170,6 +174,7 @@ class AttentionMetadataBuilderContext:
     # Device int32 (target_num_reqs,); populated on main-model steps and dummy
     # runs when GDN layers declare prefill checkpoint blocks.
     mamba_prefill_ckpt_offsets: torch.Tensor | None = None
+    qsa_ring_slots: torch.Tensor | None = None
     # Unified pool + spec decode only: the runner seeds this with an empty
     # list and each mamba group's builder appends the per-request state
     # block ids it derived from its block table, so the post-sampling
@@ -636,9 +641,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         if self.is_mamba_group:
             mamba_slot_read_offsets = ctx.mamba_slot_read_offsets
             mamba_request_distribution = ctx.mamba_request_distribution
+            qsa_ring_slots = None
         else:
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
+            qsa_ring_slots = ctx.qsa_ring_slots
         mamba_prefill_ckpt_offsets = (
             ctx.mamba_prefill_ckpt_offsets if self.has_prefill_ckpt_blocks else None
         )
@@ -659,6 +666,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_request_distribution=mamba_request_distribution,
             mamba_prefill_ckpt_offsets=mamba_prefill_ckpt_offsets,
             mamba_prefill_ckpt_indices=mamba_prefill_ckpt_indices,
+            qsa_ring_slots=qsa_ring_slots,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,

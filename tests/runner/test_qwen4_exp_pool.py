@@ -292,7 +292,8 @@ def test_native_pool_preserves_prefix_alignment_and_qsa_owner_aliases(
         if prefix
         else math.lcm(layout.block_size, cfg.model_config.max_model_len)
     )
-    assert layout.page_bytes >= max(layout.gdn_state_bytes, layout.ple_state_bytes)
+    assert layout.main_page_bytes >= layout.gdn_state_bytes
+    assert layout.ple_page_bytes >= layout.ple_state_bytes
     assert layout.block_size % 128 == 0
     assert {s.page_size_bytes for s in specs.values()} == {layout.page_bytes}
     for spec in specs.values():
@@ -301,7 +302,8 @@ def test_native_pool_preserves_prefix_alignment_and_qsa_owner_aliases(
             assert spec.block_size == cfg.cache_config.mamba_block_size
     for name in specs:
         if name.endswith(".self_attn"):
-            assert placements[name] == placements[name + ".raw_ring"]
+            assert name in placements
+            assert name + ".raw_ring" not in specs
             assert name + ".compressed_k" not in specs
             assert specs[name].block_size == layout.block_size
             assert (
@@ -318,10 +320,11 @@ def test_ple_geometry_can_determine_the_pool_page():
     cfg.model_config.hf_text_config.ple_conv_kernel_size = 65
     layout, _ = pooled_cache_specs(cfg)
     assert layout.ple_state_bytes > layout.gdn_state_bytes
-    assert layout.page_bytes >= layout.ple_state_bytes
-    # One fewer 128-token interval would not fit. No literal GDN/head/page
-    # constant may silently determine capacity when PLE is larger.
-    assert layout.main_page_bytes - 128 * layout.token_bytes < layout.ple_state_bytes
+    assert layout.main_page_bytes >= layout.gdn_state_bytes
+    assert layout.ple_page_bytes >= layout.ple_state_bytes
+    # PLE recurrent state now lives in its own companion ple_pool, so large PLE
+    # state no longer inflates the shared main KV/GDN page size.
+    assert layout.main_page_bytes < layout.ple_state_bytes
 
 
 def test_pool_warmup_tables_match_native_ring_padding():
@@ -358,24 +361,24 @@ def test_pool_warmup_tables_match_native_ring_padding():
             for s in specs
         ],
     )
+    ring_slots = torch.tensor([1] + [0] * 7, dtype=torch.int32, device="cpu")
     metadata = AttentionMetadata(
         input_positions=torch.arange(128, dtype=torch.int32, device="cpu"),
         query_start_loc=torch.tensor([0] + [128] * 8, dtype=torch.int32, device="cpu"),
         seq_lens=torch.tensor([128] + [0] * 7, dtype=torch.int32, device="cpu"),
+        qsa_ring_slots=ring_slots,
     )
     warmup = cache.dummy_metadata(metadata, active_rows=1)
     for gid, group in enumerate(cache.groups):
         item = warmup[group.layer_names[0]]
         if isinstance(group.kv_cache_spec, MambaSpec):
             assert item.mamba_state_indices.shape == (8,)
+            assert item.qsa_ring_slots is None
         else:
             assert (
                 item.block_tables.shape == native[gid].get_cpu_tensor().flatten().shape
             )
-        if group.layer_names[0].endswith(".raw_ring"):
-            table = item.block_tables.reshape(8, -1)
-            assert table[0, 0] > 0
-            assert torch.count_nonzero(table) == 1
+            assert torch.equal(item.qsa_ring_slots, ring_slots)
 
 
 @pytest.mark.parametrize("k", [0, 2])
@@ -419,6 +422,7 @@ def test_pooled_ops_register_and_dispatch_without_allocating_a_device(symbolic, 
         qgate = mode.from_tensor(qgate_cpu, static_shapes=not symbolic)
         operation = build_compact_pooled_qsa_op()
         index = bf(12, 208, 1, 2, 128)
+        ring = bf(16, 8, 1, 2, 128)
         output, selected = operation(
             qgate,
             bf(8, 512),
@@ -432,6 +436,7 @@ def test_pooled_ops_register_and_dispatch_without_allocating_a_device(symbolic, 
             bf(9216, 128),
             pool,
             index,
+            ring,
             ids(3),
             ids(2),
             ids(2),

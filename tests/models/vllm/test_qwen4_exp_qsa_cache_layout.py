@@ -53,14 +53,16 @@ def test_planner_covers_native_owner_and_binding(dtype, tp, monkeypatch):
     expected_dtype = torch.float8_e4m3fn if dtype == "fp8_e4m3" else torch.bfloat16
     assert owners[0].dtype == expected_dtype
     assert owners[1].dtype == torch.bfloat16
+    assert owners[2].dtype == torch.bfloat16
     assert owners[0].numel() * owners[0].element_size() == 3 * layout.main_page_bytes
     assert owners[1].numel() * owners[1].element_size() == 3 * layout.index_page_bytes
     assert owners[0].untyped_storage()._cdata != owners[1].untyped_storage()._cdata
-    assert len(model.cache_owners) == 2
+    assert owners[1].untyped_storage()._cdata != owners[2].untyped_storage()._cdata
+    assert len(model.cache_owners) == 3
     assert all(
         actual is expected for actual, expected in zip(model.cache_owners, owners)
     )
     backend = model.get_attn_backend()
     assert backend.get_supported_kernel_block_sizes()[0].base == 128
     with pytest.raises(TypeError):
-        model.bind_pool(owners[0])
+        model.bind_pool(owners[0], owners[1])

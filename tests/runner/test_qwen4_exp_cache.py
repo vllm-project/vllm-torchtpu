@@ -77,12 +77,14 @@ def test_native_groups_last_blocks_and_real_capacity(
     cc.num_gpu_blocks_override = expected
     native = get_kv_cache_config_from_groups(cfg, groups, 32 * 1024**3)
     assert native.num_blocks == cache.pages == expected
-    assert len(specs) == 61  # compressed keys share twelve main logical owners.
+    assert len(specs) == 48
+    assert len(groups) == 4
     assert all(
-        name + ".compressed_k" not in specs
+        name + ".compressed_k" not in specs and name + ".raw_ring" not in specs
         for name in specs
         if name.endswith(".self_attn")
     )
+    assert "model.layers.1.ple" not in specs
     assert {spec.page_size_bytes for spec in specs.values()} == {
         cache.layout.page_bytes
     }
@@ -178,12 +180,11 @@ def test_native_groups_last_blocks_and_real_capacity(
                 table = metadata[name].block_tables
                 assert isinstance(table, torch.Tensor)
                 assert table[0] == gid + 1
-            if name.endswith((".linear_attn", ".ple")):
+                assert metadata[name].qsa_ring_slots is not None
+                assert metadata[name].qsa_ring_slots[0] == 1
+            if name.endswith(".linear_attn"):
                 assert metadata[name].mamba_state_indices[0] == gid + 1
-                expected_dtype = (
-                    torch.float32 if name.endswith(".linear_attn") else torch.bfloat16
-                )
-                assert specs[name].dtypes[0] == expected_dtype
+                assert specs[name].dtypes[0] == torch.float32
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
@@ -233,3 +234,62 @@ def test_gdn_planner_matches_existing_adapter(monkeypatch, tp, ssm_dtype):
     assert spec.dtypes[1] == (
         torch.float32 if ssm_dtype == "float32" else torch.bfloat16
     )
+
+
+def test_apc_working_set_capacity_and_num_gpu_blocks_override_propagation(monkeypatch):
+    """APC uses max_memory_usage_bytes working-set floor and honors override."""
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+    cc = CacheConfig(
+        block_size=128,
+        cache_dtype="fp8_e4m3",
+        enable_prefix_caching=True,
+        mamba_cache_mode="align",
+        mamba_ssm_cache_dtype="bfloat16",
+    )
+    cc.kv_cache_layout = "BLHNC"
+    cfg = NS(
+        additional_config={},
+        attention_config=AttentionConfig(),
+        cache_config=cc,
+        scheduler_config=NS(
+            disable_hybrid_kv_cache_manager=False,
+            max_num_seqs=32,
+        ),
+        speculative_config=None,
+        kv_transfer_config=None,
+        num_prefill_lookahead_tokens=0,
+        model_config=NS(
+            max_model_len=67584,
+            supports_kv_cache_grouping=False,
+            dtype=torch.bfloat16,
+            hf_text_config=q4exp_text_config(),
+        ),
+        parallel_config=NS(
+            tensor_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+    )
+    runner = NS(vllm_config=cfg, cache_config=cc)
+    cache = Qwen4ExpPooledCache(runner, model=None)
+    cache.get_specs()
+    assert cache.layout.block_size == 1664
+    assert cache.layout.index_page_bytes == 106496
+    assert cache.layout.page_bytes == 1810432
+    assert len(cache.groups) == 4
+    # 8 * 158 (QSA) + 3 * (158 + 8 * 2) (GDN align) + 1 = 1264 + 240 + 1 = 1505
+    assert cache.pages == 1505
+    assert cc.num_gpu_blocks_override == 1505
+
+    # Reject override below working-set floor
+    cc.num_gpu_blocks_override = 1
+    cache_small = Qwen4ExpPooledCache(runner, model=None)
+    with pytest.raises(ValueError, match="memory|blocks"):
+        cache_small.get_specs()
+
+    # Accept larger override and propagate to self.pages and num_gpu_blocks_override
+    cc.num_gpu_blocks_override = 2000
+    cache_large = Qwen4ExpPooledCache(runner, model=None)
+    cache_large.get_specs()
+    assert cache_large.pages == 2000
+    assert cc.num_gpu_blocks_override == 2000

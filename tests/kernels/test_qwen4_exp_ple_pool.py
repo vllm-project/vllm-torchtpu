@@ -148,6 +148,7 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
     carrier = jnp.float8_e4m3fn if fp8 else jnp.bfloat16
     pool = jnp.zeros((12, 1664, 4 // packing, packing, 256), carrier)
     index_pool = jnp.zeros((12, 208, 1, 2, 128), jnp.bfloat16)
+    ring_pool = jnp.zeros((8, 8, 1, 2, 128), jnp.bfloat16)
     native = pool.reshape(-1, 128, *pool.shape[2:]).copy()
     main_k = jnp.zeros((12 * 13, 128, 2, 256), jnp.bfloat16)
     main_v = jnp.zeros_like(main_k)
@@ -161,12 +162,13 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
         )
     ring_ids = jnp.array([3, 6, 0], jnp.int32)
     write = jax.jit(write_region, donate_argnums=(0,), static_argnames=("tok0",))
-    index_pool = write(index_pool, ring.reshape(3, -1), ring_ids)
-    token_bytes = np.prod(index_pool.shape[2:]) * index_pool.dtype.itemsize
+    ring_pool = write(ring_pool, ring.reshape(3, -1), ring_ids)
+    token_bytes = np.prod(ring_pool.shape[2:]) * ring_pool.dtype.itemsize
     tag_start = 8 * 128 * 2 // token_bytes
-    index_pool = write(index_pool, tags.reshape(3, -1), ring_ids, tok0=tag_start)
+    ring_pool = write(ring_pool, tags.reshape(3, -1), ring_ids, tok0=tag_start)
     before = np.asarray(pool).view(np.uint8).copy()
     before_index = np.asarray(index_pool).view(np.uint8).copy()
+    before_ring = np.asarray(ring_pool).view(np.uint8).copy()
     main = jnp.array([[2, 7], [5, 9], [0, 0]], jnp.int32)
     comp = main
 
@@ -189,7 +191,9 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
         v_scale=2.5,
     )
     run = jax.jit(
-        compact_pooled_qsa_step, donate_argnums=(10, 11), static_argnames=tuple(options)
+        compact_pooled_qsa_step,
+        donate_argnums=(10, 11, 12),
+        static_argnames=tuple(options),
     )
     reference_options = {
         name: options[name] for name in ("compress_ratio", "token_topk", "norm_eps")
@@ -252,14 +256,14 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
         native = np.stack((np.asarray(ek), np.asarray(ev)), axis=-2).reshape(
             native.shape
         )
-        pool, index_pool, actual, blocks = run(
+        pool, index_pool, ring_pool, actual, blocks = run(
             *args,
             pool,
             index_pool,
+            ring_pool,
             starts,
             context,
-            # Native ring rows cover one block, padded to 128 / ratio columns.
-            jnp.pad(ring_ids[:, None], ((0, 0), (0, 31))).reshape(-1),
+            ring_ids,
             main,
             comp,
             request_distribution=jnp.array([0, 0, 2], jnp.int32),
@@ -277,12 +281,12 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
             np.asarray(pool)[[2, 5, 7, 9]].view(np.uint8), expected_main.view(np.uint8)
         )
         read = jax.jit(read_region, static_argnames=("elements", "dtype", "tok0"))
-        restored_ring = read(index_pool, ring_ids, elements=8 * 128, dtype=jnp.bfloat16)
+        restored_ring = read(ring_pool, ring_ids, elements=8 * 128, dtype=jnp.bfloat16)
         np.testing.assert_array_equal(
             np.asarray(restored_ring)[:2], np.asarray(ring).reshape(3, -1)[:2]
         )
         restored_tags = read(
-            index_pool, ring_ids, elements=8 * 2, dtype=jnp.int32, tok0=tag_start
+            ring_pool, ring_ids, elements=8 * 2, dtype=jnp.int32, tok0=tag_start
         )
         np.testing.assert_array_equal(
             np.asarray(restored_tags)[:2], np.asarray(tags).reshape(3, -1)[:2]
@@ -297,6 +301,7 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
             np.asarray(restored_keys)[..., :128], private_keys
         )
         assert index_pool.dtype == jnp.bfloat16
+        assert ring_pool.dtype == jnp.bfloat16
         assert index_pool.nbytes < pool.nbytes
         np.testing.assert_array_equal(
             np.sort(np.asarray(blocks)), np.sort(np.asarray(selected))
@@ -305,13 +310,18 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
             np.asarray(index_pool)[[0, 11]].view(np.uint8), before_index[[0, 11]]
         )
         untouched_main = [0, 1, 3, 4, 6, 8, 10, 11]
-        untouched_index = [0, 1, 4, 8, 10, 11]
+        untouched_index = [0, 1, 3, 4, 6, 8, 10, 11]
+        untouched_ring = [0, 1, 2, 4, 5, 7]
         np.testing.assert_array_equal(
             np.asarray(pool)[untouched_main].view(np.uint8), before[untouched_main]
         )
         np.testing.assert_array_equal(
             np.asarray(index_pool)[untouched_index].view(np.uint8),
             before_index[untouched_index],
+        )
+        np.testing.assert_array_equal(
+            np.asarray(ring_pool)[untouched_ring].view(np.uint8),
+            before_ring[untouched_ring],
         )
         context = context + jnp.array([3, 4, 0], jnp.int32)
 
@@ -536,7 +546,7 @@ def test_request_owned_history_gathers_scale_with_request_boundary():
         for eq in graph.eqns
         if eq.primitive.name == "gather" and eq.invars[0] is history
     ]
-    assert gathered_shapes == [(6, 9, 8), (6, 6, 8), (6, 3, 8), (6, 9, 8)]
+    assert gathered_shapes == [(6, 9, 8), (6, 6, 8), (6, 3, 8), (6, 1, 9, 8)]
     assert (128, 8) not in gathered_shapes
 
 

@@ -48,6 +48,7 @@ def build_compact_pooled_qsa_op(
     topk_backend_key: str | None = None,
     project_output: bool = False,
     rope_axes: tuple[int, ...] | None = None,
+    cache_tags: bool | None = None,
 ):
     """Bind a selector under a stable persisted-graph identity.
 
@@ -59,7 +60,12 @@ def build_compact_pooled_qsa_op(
     """
     sc_min_context = envs.environment_variables["VLLM_TPU_QSA_SC_MIN_CONTEXT"]()
     return _build_compact_pooled_qsa_op(
-        topk_backend, topk_backend_key, project_output, sc_min_context, rope_axes
+        topk_backend,
+        topk_backend_key,
+        project_output,
+        sc_min_context,
+        rope_axes,
+        cache_tags,
     )
 
 
@@ -70,6 +76,7 @@ def _build_compact_pooled_qsa_op(
     project_output: bool,
     sc_min_context: int | None,
     rope_axes: tuple[int, ...] | None,
+    cache_tags: bool | None,
 ):
     kind = "compact_pooled_qsa_projected_v2" if project_output else "compact_pooled_qsa"
     if sc_min_context is not None:
@@ -77,17 +84,20 @@ def _build_compact_pooled_qsa_op(
         kind += f"_sc_min_context_{suffix}"
     if rope_axes is not None:
         kind += "_mrope_" + hashlib.sha256(repr(rope_axes).encode()).hexdigest()
+    if cache_tags is False:
+        kind += "_notags"
     core = functools.partial(
         compact_pooled_qsa_step,
         topk_backend=topk_backend,
         sc_min_context=sc_min_context,
         rope_axes=rope_axes,
         enable_sc_preparation=True,
+        cache_tags=cache_tags,
     )
     op = pallas.jax_op(
         _op_name(kind, topk_backend, topk_backend_key),
         core,
-        donate_argnums=(10, 11),  # pool, index_pool
+        donate_argnums=(10, 11, 12),  # pool, index_pool, ring_pool
     )
 
     @op.register_fake
@@ -104,6 +114,7 @@ def _build_compact_pooled_qsa_op(
         trig,
         pool,
         index_pool,
+        ring_pool,
         starts,
         context,
         ring_ids,
@@ -125,11 +136,12 @@ def _build_compact_pooled_qsa_op(
         k_norm_multiplier=None,
         decode_cu=None,
         scheduling_group_namespace=0,
-        ring_capacity: int | None = None,
+        ring_capacity=None,
     ):
         return (
             torch.empty_like(pool),
             torch.empty_like(index_pool),
+            torch.empty_like(ring_pool),
             torch.empty_like(residual)
             if output_weight is not None
             else qgate.new_empty((qgate.shape[0], qgate.shape[-1] // 2)),
@@ -151,6 +163,7 @@ def _build_compact_pooled_qsa_op(
         trig: torch.Tensor,
         pool: torch.Tensor,
         index_pool: torch.Tensor,
+        ring_pool: torch.Tensor,
         starts: torch.Tensor,
         context: torch.Tensor,
         ring_ids: torch.Tensor,
@@ -182,7 +195,7 @@ def _build_compact_pooled_qsa_op(
         main_table = main_table.to(torch.int32)
         compressed_table = compressed_table.to(torch.int32)
         request_distribution = request_distribution.to(torch.int32)
-        updated, index_updated, output, blocks = op(
+        updated, index_updated, ring_updated, output, blocks = op(
             qgate,
             key,
             value,
@@ -195,6 +208,7 @@ def _build_compact_pooled_qsa_op(
             trig,
             pool,
             index_pool,
+            ring_pool,
             starts,
             context,
             ring_ids,
@@ -220,6 +234,7 @@ def _build_compact_pooled_qsa_op(
         )
         pool.copy_(updated)
         index_pool.copy_(index_updated)
+        ring_pool.copy_(ring_updated)
         return output, blocks
 
     return run

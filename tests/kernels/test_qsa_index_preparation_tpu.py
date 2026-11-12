@@ -368,20 +368,21 @@ def test_early_sc_preparation_keeps_two_callsite_owners_and_groups(record_proper
         return jnp.asarray(rng.normal(0, 0.2, shape), jnp.bfloat16)
 
     _, _, _, ring, tags, _, trig = _fixture(False)
-    ids = jnp.arange(25, 33, dtype=jnp.int32)
+    ids = jnp.arange(1, 9, dtype=jnp.int32)
     table = np.zeros((8, 16), np.int32)
     table[:, :3] = 1 + np.arange(24).reshape(8, 3)
     table = jnp.asarray(table)
-    main = jnp.zeros((33, 1664, 1, 4, 256), jnp.float8_e4m3fn)
-    index = jnp.zeros((33, 208, 1, 2, 128), jnp.bfloat16)
+    main = jnp.zeros((25, 1664, 1, 4, 256), jnp.float8_e4m3fn)
+    index = jnp.zeros((25, 208, 1, 2, 128), jnp.bfloat16)
+    ring_owner = jnp.zeros((16, 8, 1, 2, 128), jnp.bfloat16)
     tags = tags.at[:, :, 0].set(2048 - ((2048 - jnp.arange(8)) % 4))
-    index = jax.jit(qsa_state.write_ring_and_tags)(
-        index, ring.reshape(8, -1), tags.reshape(8, -1), ids
+    ring_owner = jax.jit(qsa_state.write_ring_and_tags)(
+        ring_owner, ring.reshape(8, -1), tags.reshape(8, -1), ids
     ).block_until_ready()
     second_main = main.at[1:25].set(jnp.float8_e4m3fn(0.25))
     second_index = index.at[1:25].set(jnp.bfloat16(0.125))
-    second_index = jax.jit(qsa_state.write_ring_and_tags)(
-        second_index, (ring + 1).reshape(8, -1), tags.reshape(8, -1), ids
+    second_ring = jax.jit(qsa_state.write_ring_and_tags)(
+        ring_owner, (ring + 1).reshape(8, -1), tags.reshape(8, -1), ids
     ).block_until_ready()
     weights = (rand((256,)), rand((256,)), rand((128,)), rand((128,)))
     distribution = jnp.array([0, 0, 8], jnp.int32)
@@ -400,8 +401,9 @@ def test_early_sc_preparation_keeps_two_callsite_owners_and_groups(record_proper
                     *weights,
                     positions,
                     trig,
-                    owners[2 * layer],
-                    owners[2 * layer + 1],
+                    owners[3 * layer],
+                    owners[3 * layer + 1],
+                    owners[3 * layer + 2],
                     starts,
                     context,
                     ids,
@@ -421,7 +423,14 @@ def test_early_sc_preparation_keeps_two_callsite_owners_and_groups(record_proper
     owners = [
         [
             owner.copy().block_until_ready()
-            for owner in (main, index, second_main, second_index)
+            for owner in (
+                main,
+                index,
+                ring_owner,
+                second_main,
+                second_index,
+                second_ring,
+            )
         ]
         for _ in range(2)
     ]
@@ -482,10 +491,10 @@ def test_early_sc_preparation_keeps_two_callsite_owners_and_groups(record_proper
                 assert starts_at[0] < writes_at[0] < joins_at[0]
         results = [run(state, *values) for run, state in zip(runs, owners, strict=True)]
         jax.block_until_ready(results)
-        assert not np.array_equal(_bits(results[0][2]), _bits(results[0][6]))
+        assert not np.array_equal(_bits(results[0][3]), _bits(results[0][8]))
         for actual, expected in zip(results[1], results[0], strict=True):
             _equal(actual, expected)
-        owners = [[output[i] for i in (0, 1, 4, 5)] for output in results]
+        owners = [[output[i] for i in (0, 1, 2, 5, 6, 7)] for output in results]
         contexts += np.asarray(lengths)
     record_property("early_sc_namespaces", [1, 2])
     record_property("full_two_callsite_outputs_and_owners_bitwise_equal", True)

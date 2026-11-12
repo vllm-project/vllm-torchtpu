@@ -24,6 +24,7 @@ import torch
 @pytest.mark.parametrize("requests", [16, 32])
 @torch.inference_mode()
 def test_decode_state_continuation_reset_and_mixed_windows(requests):
+    torch._dynamo.reset()
     from torch_tpu._internal import pallas
 
     from vllm_torchtpu.kernels.qwen4_exp.decode_state import update_decode_state
@@ -168,8 +169,155 @@ def test_decode_state_continuation_reset_and_mixed_windows(requests):
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize("requests", [16, 32])
+@torch.inference_mode()
+def test_decode_state_without_tags_continuation_and_reset(requests):
+    torch._dynamo.reset()
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.kernels.qwen4_exp.decode_state import update_decode_state
+    from vllm_torchtpu.kernels.qwen4_exp.qsa import _indexer_updates, _token_metadata
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_state import (
+        read_ring_and_tags,
+        write_ring_and_tags,
+    )
+
+    def make_run(fused):
+        def core(
+            pool: jax.Array,
+            raw: jax.Array,
+            pos: jax.Array,
+            ids: jax.Array,
+            starts: jax.Array,
+            context: jax.Array,
+            norm: jax.Array,
+            trig: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            active = starts[1:] > starts[:-1]
+            slots = jnp.where(active, jnp.arange(requests), -1)
+            if fused:
+                pool, keys = update_decode_state(
+                    pool,
+                    raw,
+                    pos,
+                    ids,
+                    starts,
+                    context,
+                    norm,
+                    trig,
+                    ratio=4,
+                    norm_eps=1e-6,
+                    rotary_dim=64,
+                    rope_axes=None,
+                    cache_tags=False,
+                )
+                _, logical, valid = _token_metadata(16, starts, context, slots)
+                complete = valid & (logical % 4 == 3)
+            else:
+                ring, tags = read_ring_and_tags(pool, ids, 1024, 0)
+                assert tags is None
+                keys, complete, _, _, ring, tags = _indexer_updates(
+                    raw,
+                    pos,
+                    ring.reshape(requests, 8, 128),
+                    None,
+                    norm,
+                    trig,
+                    starts,
+                    context,
+                    slots,
+                    4,
+                    1e-6,
+                    64,
+                    None,
+                    cache_tags=False,
+                )
+                assert tags is None
+                pool = write_ring_and_tags(
+                    pool,
+                    ring.reshape(requests, -1),
+                    None,
+                    jnp.where(active, ids, 0),
+                )
+            return pool, jnp.where(complete[:, None], keys, 0)
+
+        op = pallas.jax_op(
+            f"qsa_decode_state_test::no_tags_{fused}_{requests}",
+            core,
+            donate_argnums=(0,),
+        )
+
+        @op.register_fake
+        def fake(pool, raw, pos, ids, starts, context, norm, trig):
+            return torch.empty_like(pool), torch.empty_like(raw)
+
+        return torch.compile(op, backend="tpu", fullgraph=True, dynamic=False)
+
+    generator = torch.Generator().manual_seed(9319)
+    pages = requests + 4
+    pool = torch.randn(pages, 4, 1, 2, 128, generator=generator).bfloat16()
+    original = pool.view(torch.uint16).clone()
+    previous = original.clone()
+    owners = [pool.to("tpu"), pool.to("tpu")]
+    ids = torch.arange(1, requests + 1, dtype=torch.int32)
+    ids[0], ids[2] = 0, -1
+    context = torch.arange(requests, dtype=torch.int32) + 66048
+    norm = (torch.randn(128, generator=generator) * 0.1).bfloat16().to("tpu")
+    angles = torch.outer(torch.arange(67584).float(), 1e7 ** (-torch.arange(32) / 32))
+    trig = torch.nn.functional.pad(
+        torch.cat((angles.cos(), angles.sin()), 1).bfloat16(), (0, 64)
+    ).to("tpu")
+    runs = [make_run(False), make_run(True)]
+    for step, counts in enumerate(
+        (
+            [1] * 8 + [0] * 8,
+            [3, 0, 5, 0, 1, 0, 2, 1] + [0] * 8,
+            [0, 16] + [0] * 14,
+            [0] * 16,
+            [1] * 8 + [0] * 8,
+        )
+    ):
+        if requests == 32:
+            counts = [value for count in counts for value in (0, count)]
+        counts = torch.tensor(counts, dtype=torch.int32)
+        starts = torch.cat((torch.zeros(1, dtype=torch.int32), counts.cumsum(0).int()))
+        if step == 2:
+            context[3 if requests == 32 else 1] = 0
+        raw = torch.randn(16, 128, generator=generator).bfloat16().to("tpu")
+        _, logical, _ = _token_metadata(
+            16,
+            jnp.asarray(starts.numpy()),
+            jnp.asarray(context.numpy()),
+            jnp.arange(requests),
+        )
+        pos = torch.from_numpy(np.asarray(logical, dtype=np.int32)).to("tpu")
+        outputs = []
+        for index, run in enumerate(runs):
+            owners[index], keys = run(
+                owners[index],
+                raw,
+                pos,
+                ids.to("tpu"),
+                starts.to("tpu"),
+                context.to("tpu"),
+                norm,
+                trig,
+            )
+            outputs.append((owners[index].cpu().view(torch.uint16), keys.cpu()))
+        assert torch.equal(outputs[0][0], outputs[1][0]), step
+        torch.testing.assert_close(outputs[0][1], outputs[1][1], rtol=0, atol=0)
+        untouched = [0, requests + 1, requests + 2, requests + 3]
+        assert torch.equal(outputs[1][0][untouched], original[untouched])
+        inactive_ids = ids[(counts == 0) & (ids > 0)]
+        assert torch.equal(outputs[1][0][inactive_ids], previous[inactive_ids])
+        context += counts
+        previous = outputs[1][0].clone()
+
+
+@pytest.mark.tpu_test
 @torch.inference_mode()
 def test_decode_main_write_preserves_bytes_padding_and_last_duplicate():
+    torch._dynamo.reset()
     from torch_tpu._internal import pallas
 
     from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import write_main_cache

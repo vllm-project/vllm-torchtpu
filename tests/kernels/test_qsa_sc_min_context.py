@@ -218,9 +218,16 @@ def test_registered_identity_schema_and_fresh_getter_under_env_cache(monkeypatch
             )
         assert name == qsa_op._op_name(expected_kind, None, None)
         assert core.keywords["sc_min_context"] == value
-        assert kwargs["donate_argnums"] == (10, 11)
+        assert kwargs["donate_argnums"] == (10, 11, 12)
         (schema,) = torch._C._jit_get_schemas_for_operator(name)
-        assert len(schema.arguments) == 33 and len(schema.returns) == 4
-        assert [a.name for a in schema.arguments][10:12] == ["pool", "index_pool"]
-        assert schema.arguments[-1].name == "scheduling_group_namespace"
+        assert len(schema.arguments) == 35 and len(schema.returns) == 5
+        assert [a.name for a in schema.arguments][10:13] == [
+            "pool",
+            "index_pool",
+            "ring_pool",
+        ]
+        assert [a.name for a in schema.arguments][-2:] == [
+            "scheduling_group_namespace",
+            "ring_capacity",
+        ]
         assert "sc_min_context" not in inspect.signature(baseline).parameters

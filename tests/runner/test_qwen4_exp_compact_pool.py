@@ -80,6 +80,7 @@ def compact_config(
     )
     cfg.model_config.max_model_len = length
     cfg.scheduler_config.max_num_seqs = 2
+    cfg.num_prefill_lookahead_tokens = 0
     cfg.cache_config.enable_prefix_caching = prefix
     cfg.cache_config.mamba_cache_mode = "align" if prefix else "none"
     return cfg
@@ -145,12 +146,16 @@ def test_native_backing_and_semantic_capacity(
             main = actual.kv_caches[name]
             index_owner = actual.kv_caches[name + ".compressed_k"]
             ring = actual.kv_caches[name + ".raw_ring"]
-            assert index_owner is ring and index_owner is not main
+            assert (
+                index_owner is not ring and index_owner is not main and ring is not main
+            )
             assert index_owner.dtype == torch.bfloat16
+            assert ring.dtype == torch.bfloat16
             assert index_owner[0].nbytes >= semantic
             assert index_owner[0].nbytes < main[0].nbytes
             assert index_owner.shape[-1] >= index
             assert name + ".compressed_k" not in specs
+            assert name + ".raw_ring" not in specs
             assert spec.block_size == layout.block_size
     # No extra physical allocation for merely reading a typed index view.
     pointers = [t.untyped_storage()._cdata for t in actual.raw_tensors]
@@ -158,6 +163,10 @@ def test_native_backing_and_semantic_capacity(
 
 
 def test_compact_index_eliminates_separate_scheduler_owner():
+    from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
+        get_decode_index_page_group,
+    )
+
     cfg = compact_config(layers=1, gdn=True, ple=False)
     layout, specs, plan, actual = native_allocation(cfg)
     name = "model.layers.1.self_attn"
@@ -168,6 +177,29 @@ def test_compact_index_eliminates_separate_scheduler_owner():
     assert index[0].nbytes == 8192
     assert actual.kv_caches[name][0].nbytes == 256 << 10
     assert layout.block_size == 128
+
+    import jax
+    import jax.numpy as jnp
+
+    full_cfg = pool_config()
+    full_layout, _ = pooled_cache_specs(full_cfg)
+    assert full_layout.index_rows == 416
+    assert full_layout.index_page_bytes == 106496
+    assert (
+        get_decode_index_page_group(
+            jax.ShapeDtypeStruct((1, 4, full_layout.compressed_width), jnp.bfloat16),
+            jax.ShapeDtypeStruct(
+                (16, full_layout.index_rows // 2, 1, 2, full_layout.compressed_width),
+                jnp.bfloat16,
+            ),
+            logical_pages=full_layout.compressed_physical_pages,
+            pages_per_query=full_layout.compressed_physical_pages,
+            ratio=4,
+            topk=2048,
+            keys_per_base_page=full_layout.compressed_kernel_rows,
+        )
+        == 13
+    )
 
 
 @pytest.mark.parametrize("prefix", [False, True])
@@ -261,9 +293,10 @@ def test_copy_plan_uses_actual_main_row_not_paired_budget(monkeypatch, prefix):
     runner._precompile_mamba_state_seed_copies.assert_called_once_with()
     assert runner._pool_block_split == 1
     copied = [t for _, tensors in runner._mamba_copy_plan for t in tensors]
-    assert copied and all(t.shape[1] == layout.block_size for t in copied)
+    assert copied
+    assert copied[0].shape[1] == layout.block_size
+    assert copied[0][0].nbytes == layout.main_page_bytes
     assert all(t.dtype == torch.bfloat16 for t in copied)
-    assert all(t[0].nbytes == layout.main_page_bytes for t in copied)
     assert all(t[0].nbytes < layout.page_bytes for t in copied)
 
 
@@ -375,13 +408,7 @@ def test_native_manager_prefix_hit_and_request_reuse(monkeypatch, gdn):
         for i, g in enumerate(plan.kv_cache_groups)
         if any(n.endswith(".self_attn") for n in g.layer_names)
     )
-    ring_gid = next(
-        i
-        for i, g in enumerate(plan.kv_cache_groups)
-        if any(n.endswith(".raw_ring") for n in g.layer_names)
-    )
     assert initial[main_gid][:2] == reused[main_gid][:2]
-    assert set(initial[ring_gid]).isdisjoint(reused[ring_gid])
     retained = set(reused[main_gid][:2])
     manager.free(first)
     for block in retained:
@@ -445,6 +472,7 @@ def test_native_tables_real_runner_metadata_use_one_prefix_owner(monkeypatch, gd
     assert isinstance(blocks, torch.Tensor)
     table = blocks.reshape(8, -1)
     assert table[:2, 0].tolist() == [per_req[row][group_id][0] for row in range(2)]
+    assert metadata[attention].qsa_ring_slots.tolist() == [1, 2, 0, 0, 0, 0, 0, 0]
     assert kwargs["query_start_loc"].tolist() == [0, 3, 8, 8, 8, 8, 8, 8, 8]
     assert kwargs["context_lens"].tolist() == [128, 37, 0, 0, 0, 0, 0, 0]
     assert kwargs["valid_tokens"].tolist() == [True] * 8 + [False] * 8
@@ -452,3 +480,4 @@ def test_native_tables_real_runner_metadata_use_one_prefix_owner(monkeypatch, gd
     if gdn:
         state = metadata["model.layers.0.linear_attn"].mamba_state_indices
         assert state[0] > 0 and state[1] > 0 and torch.count_nonzero(state[2:]) == 0
+        assert metadata["model.layers.0.linear_attn"].qsa_ring_slots is None

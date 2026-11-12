@@ -85,7 +85,7 @@ def make_rope_cache(max_positions: int, *, rotary_dim: int, theta: float):
 QSA_BLOCK_SIZE = 128
 
 
-def qsa_ring_capacity(compress_ratio: int, num_speculative_tokens: int) -> int:
+def qsa_ring_capacity(compress_ratio: int, num_speculative_tokens: int = 0) -> int:
     """Preserve the open group while speculative suffixes overwrite the ring.
 
     Matches vLLM QSAKeyStateCache.get_kv_cache_spec at v0.31.0.
@@ -224,9 +224,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     """Config-derived gated attention with a fully replicated MQA indexer.
 
     Checkpoint names are relative to ``...self_attn.``. No quant_config enters
-    these BF16 projections. Both cache stores stay owned by the native allocator;
-    the custom op donates state then copy_ makes writes visible to that owner.
-    Profiling/capture uses explicitly bound scratch owners and shared metadata.
+    these BF16 projections. All three cache stores stay owned by the native
+    allocator; the custom op donates state then copy_ makes writes visible to
+    those owners. Profiling/capture uses explicitly bound scratch owners and
+    shared metadata.
     """
 
     supports_dcp = False
@@ -250,7 +251,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         topk_backend: TopKBackend | None = None,
         topk_backend_key: str | None = None,
         num_speculative_tokens: int = 0,
+        speculative_tokens: int | None = None,
     ):
+        if speculative_tokens is not None:
+            num_speculative_tokens = speculative_tokens
         super().__init__()
         validate_qsa_geometry(config, tp_size=tp_size, cache_dtype=cache_dtype)
         if not 0 <= tp_rank < tp_size:
@@ -340,24 +344,27 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             config.rope_parameters,
             int(self.head_dim * self.config.partial_rotary_factor),
         )
+        self.cache_tags = self.rope_axes is not None
         self._op = partial(
             build_compact_pooled_qsa_op(
                 topk_backend=self.topk_backend,
                 topk_backend_key=self.topk_backend_key,
                 rope_axes=self.rope_axes,
+                cache_tags=self.cache_tags,
             ),
             compress_ratio=self.compress_ratio,
             token_topk=self.token_topk,
             norm_eps=float(self.q_norm.variance_epsilon),
             rotary_dim=int(self.head_dim * self.config.partial_rotary_factor),
+            ring_capacity=self.ring_capacity,
         )
         self._projected_op = None
 
     def get_attn_backend(self):
         return Qwen4ExpPooledQSABackend
 
-    def bind_pool(self, main_pool, index_pool):
-        self.cache_owners = (main_pool, index_pool)
+    def bind_pool(self, main_pool, index_pool, ring_pool):
+        self.cache_owners = (main_pool, index_pool, ring_pool)
 
     def get_kv_cache_spec(self, vllm_config):
         return get_qsa_cache_specs(
@@ -365,10 +372,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         )[0]
 
     def get_auxiliary_cache_specs(self):
-        _, auxiliary = get_qsa_cache_specs(
-            self.config, self.tp_size, self.cache_dtype, self.ring_capacity
-        )
-        return {"raw_ring": auxiliary["raw_ring"]}
+        return {}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         parameters = dict(self.named_parameters())
@@ -503,11 +507,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     topk_backend_key=self.topk_backend_key,
                     project_output=True,
                     rope_axes=self.rope_axes,
+                    cache_tags=self.cache_tags,
                 ),
                 compress_ratio=self.compress_ratio,
                 token_topk=self.token_topk,
                 norm_eps=float(self.q_norm.variance_epsilon),
                 rotary_dim=int(self.head_dim * self.config.partial_rotary_factor),
+                ring_capacity=self.ring_capacity,
             )
 
     def _supports_projected_output(self) -> bool:
@@ -518,7 +524,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     def can_prefetch_output(self, hidden: torch.Tensor) -> bool:
         """Use a stable Torch ABI; plan fusion from actual arrays inside JAX."""
         return (
-            len(self.cache_owners) == 2
+            len(self.cache_owners) == 3
             and self._supports_projected_output()
             and self.output_weight_tiles is not None
             and hidden.device.type == "tpu"
@@ -537,11 +543,19 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         hc_token_tile=0,
         hc_min_tokens=1024,
     ):
-        assert len(self.cache_owners) == 2, (
-            "Bind main and index pools before QSA execution"
+        assert len(self.cache_owners) == 3, (
+            "Bind main, index and ring pools before QSA execution"
         )
         per_layer = cast(
             dict[str, AttentionMetadata], get_forward_context().attn_metadata
+        )
+        ring_ids = per_layer[self.prefix].qsa_ring_slots
+        if ring_ids is None and (self.prefix + ".raw_ring") in per_layer:
+            ring_ids = cast(
+                torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables
+            )
+        assert isinstance(ring_ids, torch.Tensor), (
+            "QSA execution requires per_layer[prefix].qsa_ring_slots"
         )
         key, value, index_qk = self.input_proj(hidden).split(
             self.input_sizes[1:], dim=-1
@@ -566,12 +580,11 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             *self.cache_owners,
             metadata.query_start_loc,
             metadata.context_lens,
-            cast(torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables),
+            ring_ids,
             cast(torch.Tensor, per_layer[self.prefix].block_tables),
             cast(torch.Tensor, per_layer[self.prefix].block_tables),
             cast(torch.Tensor, per_layer[self.prefix].request_distribution),
             k_norm_multiplier=self.k_norm_multiplier,
-            ring_capacity=self.ring_capacity,
             decode_cu=metadata.decode_cu,
             output_weight=self.output_weight_tiles if projected else None,
             residual=residual,

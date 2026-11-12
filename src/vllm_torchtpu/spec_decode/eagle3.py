@@ -2025,6 +2025,17 @@ class Eagle3Proposer:
             if runner._has_mamba_state
             else None
         )
+        qsa_ring_slots = (
+            chunk_ctx.qsa_ring_slots
+            if chunk_ctx.qsa_ring_slots is not None
+            else (
+                runner._build_qsa_ring_slots(
+                    chunk.start_index, num_reqs, kernel_num_reqs
+                )
+                if getattr(runner, "_has_qsa_ring_state", False)
+                else None
+            )
+        )
         # An idle DP rank may draft before its first target metadata build.
         saved_ctx = getattr(runner, "_attn_metadata_builder_ctx", chunk_ctx)
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
@@ -2035,6 +2046,7 @@ class Eagle3Proposer:
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             mamba_state_indices=mamba_state_indices,
+            qsa_ring_slots=qsa_ring_slots,
             # None for real chunks; the EP-DP dummy-run pairing sets fixed
             # positions so the block-table build uses the zeroed-table branch
             # instead of slicing the real (idle-rank) block table.
@@ -2444,6 +2456,11 @@ class Eagle3Proposer:
                 [actual_num_reqs, actual_num_reqs, actual_num_reqs],
                 dtype=torch.int32,
                 device=runner.device,
+            ),
+            qsa_ring_slots=(
+                torch.zeros((num_reqs,), dtype=torch.int32, device=runner.device)
+                if getattr(runner, "_has_qsa_ring_state", False)
+                else None
             ),
             # Fixed positions => the attn-metadata build takes the dummy-safe
             # zeroed-block-table branch (attention_metadata.py) instead of

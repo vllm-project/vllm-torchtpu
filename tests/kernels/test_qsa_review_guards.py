@@ -170,10 +170,12 @@ def test_empty_pooled_step_returns_before_reshape_or_producer(monkeypatch):
         jnp.zeros(0, jnp.int32),
     )
     index_pool = jnp.zeros((2, 16, 1, 2, 128), jnp.bfloat16)
+    ring_pool = jnp.zeros((2, 8, 1, 2, 128), jnp.bfloat16)
     result = pooled_qsa.compact_pooled_qsa_step(
         *producer,
         pool,
         index_pool,
+        ring_pool,
         *metadata,
         request_distribution=jnp.zeros(3, jnp.int32),
         compress_ratio=4,
@@ -183,8 +185,9 @@ def test_empty_pooled_step_returns_before_reshape_or_producer(monkeypatch):
     )
     assert result[0] is pool
     assert result[1] is index_pool
-    assert result[2].shape == (0, 128) and result[2].dtype == jnp.bfloat16
-    assert result[3].shape == (0, 67) and result[3].dtype == jnp.int32
+    assert result[2] is ring_pool
+    assert result[3].shape == (0, 128) and result[3].dtype == jnp.bfloat16
+    assert result[4].shape == (0, 67) and result[4].dtype == jnp.int32
 
 
 def test_state_capacity_has_explicit_error_before_launch(monkeypatch):

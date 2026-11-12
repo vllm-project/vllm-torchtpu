@@ -175,6 +175,7 @@ def test_alternative_config_drives_checkpoint_cache_and_custom_op(
         owners, layout = qsa_test_pools(model, 4)
         assert owners[0].shape[0] == owners[1].shape[0] == 4
         assert owners[1].dtype == torch.bfloat16
+        assert owners[2].dtype == torch.bfloat16
         assert owners[0].shape[1] == layout.block_size
         model.bind_pool(*owners)
         metadata = QSAMetadata(
@@ -488,7 +489,7 @@ def test_merged_inputs_forward_and_checkpoint_completeness(tp, rank, monkeypatch
 @pytest.mark.parametrize(
     "factory_name,donated",
     [
-        ("build_compact_pooled_qsa_op", (10, 11)),
+        ("build_compact_pooled_qsa_op", (10, 11, 12)),
     ],
 )
 def test_static_indexer_backend_cache_and_owner_contract(
@@ -504,10 +505,11 @@ def test_static_indexer_backend_cache_and_owner_contract(
             return function
 
         def __call__(self, *args, **kwargs):
-            main, index = args[10:12]
+            main, index, ring = args[10:13]
             return (
                 torch.full(main.shape, 2, dtype=torch.bfloat16).to(main.dtype),
                 torch.full_like(index, 3),
+                torch.full_like(ring, 4),
                 torch.zeros((1, 128), dtype=torch.bfloat16),
                 torch.full((1, 67), -1, dtype=torch.int32),
             )
@@ -542,7 +544,8 @@ def test_static_indexer_backend_cache_and_owner_contract(
             dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
         )
         index = torch.zeros((3, 16, 1, 2, 128), dtype=torch.bfloat16)
-        aliases = (main, index)
+        ring = torch.zeros((3, 8, 1, 2, 128), dtype=torch.bfloat16)
+        aliases = (main, index, ring)
         storages = [owner.untyped_storage()._cdata for owner in aliases]
         producer = [torch.zeros((1, 256), dtype=torch.bfloat16) for _ in range(10)]
         metadata = [torch.zeros((1,), dtype=torch.int64) for _ in range(5)]
@@ -550,6 +553,7 @@ def test_static_indexer_backend_cache_and_owner_contract(
             *producer,
             main,
             index,
+            ring,
             *metadata,
             request_distribution=torch.tensor([0, 0, 1], dtype=torch.int64),
             compress_ratio=4,
@@ -557,10 +561,15 @@ def test_static_indexer_backend_cache_and_owner_contract(
             norm_eps=1e-6,
             rotary_dim=64,
         )
-        assert main is aliases[0] and index is aliases[1]
+        assert main is aliases[0] and index is aliases[1] and ring is aliases[2]
         assert [owner.untyped_storage()._cdata for owner in aliases] == storages
-        assert torch.all(main.float() == 2) and torch.all(index == 3)
+        assert (
+            torch.all(main.float() == 2)
+            and torch.all(index == 3)
+            and torch.all(ring == 4)
+        )
         assert index.dtype == torch.bfloat16
+        assert ring.dtype == torch.bfloat16
         assert len(captured) == 3
         assert len({item[0] for item in captured}) == 3
         assert captured[1][1].keywords["topk_backend"] is backend
@@ -616,11 +625,12 @@ def test_actual_model_keeps_static_backend_when_binding_compact_owners(monkeypat
     )
     main = torch.zeros((2, 128, 1, 2, 256), dtype=torch.bfloat16)
     index = torch.zeros((2, 16, 1, 2, 128), dtype=torch.bfloat16)
+    ring = torch.zeros((2, 8, 1, 2, 128), dtype=torch.bfloat16)
     with pytest.raises(TypeError):
-        cast(Callable[..., None], layer.bind_pool)(main)
-    layer.bind_pool(main, index)
+        cast(Callable[..., None], layer.bind_pool)(main, index)
+    layer.bind_pool(main, index, ring)
     assert seen == [(backend, "reference-v1/forward")]
-    assert layer.cache_owners == (main, index)
+    assert layer.cache_owners == (main, index, ring)
     assert "topk_backend" not in layer._op.keywords
     assert "topk_backend_key" not in layer._op.keywords
     ref = weakref.ref(layer)

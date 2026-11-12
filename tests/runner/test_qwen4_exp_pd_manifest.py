@@ -69,8 +69,9 @@ def live_pool(
         layout.block_size if apc else cfg.model_config.max_model_len
     )
     groups = get_kv_cache_groups(cfg, specs)
+    regions = max(len(g.layer_names) for g in groups)
     config = get_kv_cache_config_from_groups(
-        cfg, groups, num_blocks * layout.page_bytes
+        cfg, groups, num_blocks * layout.page_bytes * regions
     )
     config.kv_cache_layout = "BLHNC"
     materialized = materialize_pool(cfg, config, layout, torch.device(device))
@@ -82,7 +83,8 @@ def live_pool(
 def test_full_pages_keep_all_owners_and_group_specific_aliases(tp, ssm):
     config, materialized = live_pool(tp, ssm=ssm)
     manifest = build_transfer_manifest(config, materialized)
-    assert len(manifest.pools) == len(materialized.kv_caches)
+    ring_keys = {k for k in materialized.kv_caches if k.endswith(".raw_ring")}
+    assert len(manifest.pools) == len(materialized.kv_caches) - len(ring_keys)
     assert len({p.tag for p in manifest.pools}) == len(manifest.pools)
     assert all(a is b for a, b in zip(manifest.storages, materialized.raw_tensors))
     by_name = {p.layer_name: p for p in manifest.pools}
@@ -91,14 +93,16 @@ def test_full_pages_keep_all_owners_and_group_specific_aliases(tp, ssm):
         assert p.regions[0].extent_end_bytes == p.block_stride_bytes
         if p.layer_name.endswith(".self_attn"):
             compressed = by_name[p.layer_name + ".compressed_k"]
-            ring = by_name[p.layer_name + ".raw_ring"]
             assert p.storage_index != compressed.storage_index
-            assert compressed.storage_index == ring.storage_index
             assert compressed.num_blocks == p.num_blocks == config.num_blocks
             assert p.block_stride_bytes + compressed.block_stride_bytes == (
                 config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
             )
-            assert len({p.tag, compressed.tag, ring.tag}) == 3
+            assert len({p.tag, compressed.tag}) == 2
+        if p.layer_name.endswith(".ple"):
+            linear = by_name[p.layer_name.removesuffix(".ple") + ".linear_attn"]
+            assert p.storage_index != linear.storage_index
+            assert p.num_blocks == config.num_blocks
 
 
 def test_reject_equal_shape_clone_instead_of_live_carrier():
@@ -210,21 +214,26 @@ def test_actual_dual_carriers_follow_owner_tables_and_preserve_other_bytes(extra
     assert cursor < config.num_blocks // 2
     source = [
         torch.arange(raw.nbytes, dtype=torch.int32).to(torch.uint8)
-        for raw in live.raw_tensors
+        for raw in manifest.storages
     ]
     actual = [torch.full_like(x, 211) for x in source]
     expected = [x.clone() for x in actual]
     # Independent oracle: enumerate actual model bindings from scheduler owners,
-    # adding compressed keys to the main table, never to the ring table.
+    # adding compressed keys to the main table and co-owned PLE to its GDN table.
     for group, pages in zip(groups, tables):
         for owner in group.layer_names:
             names = [owner]
             if owner.endswith(".self_attn"):
                 names.append(owner + ".compressed_k")
+            elif (
+                owner.endswith(".linear_attn")
+                and (owner.removesuffix(".linear_attn") + ".ple") in live.kv_caches
+            ):
+                names.append(owner.removesuffix(".linear_attn") + ".ple")
             for name in names:
                 raw = live.kv_caches[name]
                 raw = raw[0] if isinstance(raw, list) else raw
-                index = next(i for i, x in enumerate(live.raw_tensors) if x is raw)
+                index = next(i for i, x in enumerate(manifest.storages) if x is raw)
                 stride = raw[0].nbytes
                 for page in pages:
                     dest = config.num_blocks - page
@@ -241,18 +250,18 @@ def test_actual_dual_carriers_follow_owner_tables_and_preserve_other_bytes(extra
             ][page * stride : (page + 1) * stride]
     for got, want in zip(actual, expected):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
-    # Same physical index page cannot be assigned to ring and main sidecar.
+    # Same physical main page cannot be assigned to two groups sharing a carrier.
     main_gid = next(
         g.group_index
         for g in groups
         if any(n.endswith(".self_attn") for n in g.layer_names)
     )
-    ring_gid = next(
+    gdn_gid = next(
         g.group_index
         for g in groups
-        if any(n.endswith(".raw_ring") for n in g.layer_names)
+        if any(n.endswith(".linear_attn") for n in g.layer_names)
     )
-    tables[ring_gid] = tables[main_gid][:1]
+    tables[gdn_gid] = tables[main_gid][:1]
     with pytest.raises(ValueError, match="overlap"):
         plan.request_pages(tables, tokens)
 
@@ -268,7 +277,8 @@ def test_mtp_manifest_enumerates_draft_owners_and_checkpoint_geometry(k):
     draft = "mtp.layers.48.self_attn"
     assert (draft in owners) is bool(k)
     if k:
-        assert {draft, draft + ".compressed_k", draft + ".raw_ring"} <= set(owners)
+        assert {draft, draft + ".compressed_k"} <= set(owners)
+        assert draft + ".raw_ring" not in owners
     groups = build_transfer_groups(config.kv_cache_groups)
     cursor, tables = 1, []
     for group in groups:

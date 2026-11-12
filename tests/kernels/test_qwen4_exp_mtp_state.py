@@ -240,14 +240,19 @@ def test_pooled_qsa_rejection_matches_committed_prefix_next_output(k, prefix):
     rows, tokens = 8, 16
     pool = jnp.zeros((7, 1664, 1, 4, 256), jnp.float8_e4m3fn)
     index_pool = jnp.zeros((7, 208, 1, 2, 128), jnp.bfloat16)
+    ring_pool = jnp.zeros((7, 8, 1, 2, 128), jnp.bfloat16)
     ring = rand((rows, 8, 128))
     tags = jnp.zeros((rows, 8, 2), jnp.int32)
     tags = tags.at[0, :, 0].set(prefix - 1 - (prefix - 1 - jnp.arange(8)) % 8)
     owners = jnp.array([5] + [0] * (rows - 1), jnp.int32)
-    index_pool = jax.jit(write_ring_and_tags, donate_argnums=(0,))(
-        index_pool, ring.reshape(rows, -1), tags.reshape(rows, -1), owners
+    ring_pool = jax.jit(write_ring_and_tags, donate_argnums=(0,))(
+        ring_pool, ring.reshape(rows, -1), tags.reshape(rows, -1), owners
     )
-    original = (np.asarray(pool).copy(), np.asarray(index_pool).copy())
+    original = (
+        np.asarray(pool).copy(),
+        np.asarray(index_pool).copy(),
+        np.asarray(ring_pool).copy(),
+    )
     main = jnp.zeros((rows, 2), jnp.int32).at[0].set(jnp.array([1, 2]))
     comp = main
     norms = [rand((width,)) for width in (256, 256, 128, 128)]
@@ -265,7 +270,9 @@ def test_pooled_qsa_rejection_matches_committed_prefix_next_output(k, prefix):
         ring_capacity=8,
     )
     run = jax.jit(
-        compact_pooled_qsa_step, donate_argnums=(10, 11), static_argnames=tuple(options)
+        compact_pooled_qsa_step,
+        donate_argnums=(10, 11, 12),
+        static_argnames=tuple(options),
     )
     verify = [rand((tokens, width)) for width in (24 * 256 * 2, 512, 512, 5 * 128)]
     next_inputs = [rand((tokens, width)) for width in (24 * 256 * 2, 512, 512, 5 * 128)]
@@ -293,7 +300,7 @@ def test_pooled_qsa_rejection_matches_committed_prefix_next_output(k, prefix):
         return tuple(jax.device_put(value.copy()) for value in values)
 
     speculative = step(copy_owners(original), verify, prefix, k + 1)
-    verified = tuple(np.asarray(owner).copy() for owner in speculative[:2])
+    verified = tuple(np.asarray(owner).copy() for owner in speculative[:3])
     for after, before in zip(verified, original):
         np.testing.assert_array_equal(
             after[[0, 6]].view(np.uint8), before[[0, 6]].view(np.uint8)
@@ -301,11 +308,11 @@ def test_pooled_qsa_rejection_matches_committed_prefix_next_output(k, prefix):
     for accepted in range(k + 1):
         # The reference never executes the rejected suffix. Compare the next
         # output after rewind and overwrite, including compressed/page edges.
-        committed = step(copy_owners(original), verify, prefix, accepted + 1)[:2]
-        expected_main, expected_index, expected, expected_blocks = step(
+        committed = step(copy_owners(original), verify, prefix, accepted + 1)[:3]
+        expected_main, expected_index, _expected_ring, expected, expected_blocks = step(
             committed, next_inputs, prefix + accepted + 1, 1
         )
-        actual_main, actual_index, actual, actual_blocks = step(
+        actual_main, actual_index, _actual_ring, actual, actual_blocks = step(
             copy_owners(verified), next_inputs, prefix + accepted + 1, 1
         )
         np.testing.assert_allclose(
@@ -331,7 +338,7 @@ def test_pooled_qsa_rejection_matches_committed_prefix_next_output(k, prefix):
     idle = step(
         copy_owners(verified), next_inputs, prefix, 1, jnp.zeros(rows, jnp.int32)
     )
-    for after, before in zip(idle[:2], verified):
+    for after, before in zip(idle[:3], verified):
         np.testing.assert_array_equal(
             np.asarray(after).view(np.uint8), before.view(np.uint8)
         )

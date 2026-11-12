@@ -24,6 +24,7 @@ import torch
 @pytest.mark.parametrize("requests", [16, 32])
 @torch.inference_mode()
 def test_axial_decode_state_continuation_reset_and_mixed_windows(requests):
+    torch._dynamo.reset()
     from torch_tpu._internal import pallas
 
     from vllm_torchtpu.kernels.qwen4_exp.decode_state import update_decode_state
@@ -174,3 +175,126 @@ def test_axial_decode_state_continuation_reset_and_mixed_windows(requests):
         assert torch.equal(outputs[1][0][:, 5:], original[:, 5:])
         context += counts
         previous = outputs[1][0].clone()
+
+
+def test_mtp_3d_mrope_cross_chunk_closure_and_rollback():
+    """Verify k=3 (ring_capacity=8) with 3D MRoPE across chunk closure and rollback."""
+    from vllm_torchtpu.kernels.qwen4_exp.qsa import _indexer_updates
+
+    rng = np.random.default_rng(2026)
+    axes = tuple([0, 1, 2] * 10 + [0, 1])
+    norm = jnp.asarray(rng.normal(0, 0.1, (128,)), jnp.bfloat16)
+    angles = np.outer(np.arange(4096, dtype=np.float32), 1e7 ** (-np.arange(32) / 32))
+    trig = jnp.asarray(
+        np.concatenate(
+            (np.cos(angles), np.sin(angles), np.zeros((4096, 64), np.float32)), axis=1
+        ),
+        jnp.bfloat16,
+    )
+
+    # Generate 6 tokens at logical positions 1664..1669 with distinct 3D axes.
+    raw_all = jnp.asarray(rng.normal(0, 0.2, (6, 128)), jnp.bfloat16)
+    pos_all = jnp.stack(
+        [jnp.arange(1664, 1670, dtype=jnp.int32) + axis * 113 for axis in range(3)],
+        axis=0,
+    )
+    assert not bool(jnp.array_equal(pos_all[0], pos_all[1]))
+    assert not bool(jnp.array_equal(pos_all[1], pos_all[2]))
+
+    ring_init = jnp.zeros((1, 8, 128), jnp.bfloat16)
+    tags_init = jnp.zeros((1, 8, 4), jnp.int32)
+    slots = jnp.array([0], jnp.int32)
+
+    # Oracle: feed 1664..1667 in one non-speculative step starting from 1664.
+    oracle_keys, oracle_complete, _, _, _, _ = _indexer_updates(
+        raw_all[:4],
+        pos_all[:, :4],
+        ring_init,
+        tags_init,
+        norm,
+        trig,
+        jnp.array([0, 4], jnp.int32),
+        jnp.array([1664], jnp.int32),
+        slots,
+        4,
+        1e-6,
+        64,
+        axes,
+        ring_capacity=8,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(oracle_complete), [False, False, False, True]
+    )
+    expected_closed_key = np.asarray(oracle_keys[3], np.float32)
+
+    # Step 1: Prefill chunk ending at 1666 (writes 1664, 1665 into ring slots 0, 1).
+    _, comp1, _, _, ring1, tags1 = _indexer_updates(
+        raw_all[:2],
+        pos_all[:, :2],
+        ring_init,
+        tags_init,
+        norm,
+        trig,
+        jnp.array([0, 2], jnp.int32),
+        jnp.array([1664], jnp.int32),
+        slots,
+        4,
+        1e-6,
+        64,
+        axes,
+        ring_capacity=8,
+    )
+    assert not bool(jnp.any(comp1))
+    np.testing.assert_array_equal(
+        np.asarray(tags1[0, 0, :3]), np.asarray(pos_all[:, 0])
+    )
+    np.testing.assert_array_equal(
+        np.asarray(tags1[0, 1, :3]), np.asarray(pos_all[:, 1])
+    )
+
+    # Step 2: MTP verify 4 tokens at 1666, 1667, 1668, 1669 (k=3 -> ring capacity 8).
+    # Note: 1668 and 1669 land in ring slots 4 and 5 (% 8), preserving slots 0 and 1!
+    keys2, comp2, _, _, ring2, tags2 = _indexer_updates(
+        raw_all[2:6],
+        pos_all[:, 2:6],
+        ring1,
+        tags1,
+        norm,
+        trig,
+        jnp.array([0, 4], jnp.int32),
+        jnp.array([1666], jnp.int32),
+        slots,
+        4,
+        1e-6,
+        64,
+        axes,
+        ring_capacity=8,
+    )
+    np.testing.assert_array_equal(np.asarray(comp2), [False, True, False, False])
+    np.testing.assert_array_equal(np.asarray(keys2[1], np.float32), expected_closed_key)
+    # Verify slots 0, 1 (positions 1664, 1665) were NOT overwritten by 1668, 1669!
+    np.testing.assert_array_equal(np.asarray(ring2[0, :2]), np.asarray(ring1[0, :2]))
+    np.testing.assert_array_equal(np.asarray(tags2[0, :2]), np.asarray(tags1[0, :2]))
+
+    # Step 3: Suppose draft token at 1666 was accepted, but 1667..1669 were rejected!
+    # Next step rolls back context to 1667 and verifies 4 new tokens at 1667..1670.
+    # Replace token at 1667 with raw_all[3] so the closed group 1664..1667 must still
+    # match `expected_closed_key` after rollback!
+    keys3, comp3, _, _, _, _ = _indexer_updates(
+        jnp.concatenate([raw_all[3:6], raw_all[:1]], axis=0),
+        jnp.concatenate([pos_all[:, 3:6], pos_all[:, 5:6] + 1], axis=1),
+        ring2,
+        tags2,
+        norm,
+        trig,
+        jnp.array([0, 4], jnp.int32),
+        jnp.array([1667], jnp.int32),
+        slots,
+        4,
+        1e-6,
+        64,
+        axes,
+        ring_capacity=8,
+    )
+    np.testing.assert_array_equal(np.asarray(comp3), [True, False, False, False])
+    np.testing.assert_array_equal(np.asarray(keys3[0], np.float32), expected_closed_key)

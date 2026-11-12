@@ -858,6 +858,11 @@ class TPUModelRunner(GPUModelRunner):
         # upstream vLLM's InputBatch, which we do not subclass.
         self._mamba_slot_by_req_id: dict[str, int] = {}
         self._free_mamba_slots: list[int] = []
+        self._ring_num_blocks: int | None = None
+        self._ring_slot_by_req_id: dict[str, int] = {}
+        self._free_ring_slots: list[int] = []
+        self._has_qsa_ring_state: bool = False
+        self.extra_block_indexed_state_tensors: list[torch.Tensor] = []
         # State checkpoints per request under speculative decoding: one per
         # verify window position, so rejected drafts roll back by *selecting*
         # a checkpoint rather than by copying state. 1 without spec decoding.
@@ -2053,6 +2058,39 @@ class TPUModelRunner(GPUModelRunner):
             indices[i] = slot
         return stage_h2d_upload(self, indices)
 
+    def _init_ring_slot_pool(self, ring_num_blocks: int) -> None:
+        self._ring_num_blocks = ring_num_blocks
+        self._ring_slot_by_req_id = {}
+        self._free_ring_slots = list(reversed(range(1, ring_num_blocks)))
+        self._has_qsa_ring_state = True
+
+    _init_qsa_ring_slots = _init_ring_slot_pool
+
+    def _build_qsa_ring_slots(
+        self, start_index: int, num_reqs: int, target_num_reqs: int
+    ) -> torch.Tensor:
+        live = (
+            self.requests.keys()
+            if hasattr(self, "requests")
+            else {r for r in self.input_batch.req_ids if r is not None}
+        )
+        for req_id in list(self._ring_slot_by_req_id):
+            if req_id not in live:
+                self._free_ring_slots.append(self._ring_slot_by_req_id.pop(req_id))
+        indices = zeros_h2d_source(self, target_num_reqs)
+        req_ids = self.input_batch.req_ids
+        num_live = max(0, min(num_reqs, len(req_ids) - start_index))
+        for i in range(num_live):
+            req_id = req_ids[start_index + i]
+            if req_id is None:
+                continue
+            slot = self._ring_slot_by_req_id.get(req_id)
+            if slot is None:
+                slot = self._free_ring_slots.pop()
+                self._ring_slot_by_req_id[req_id] = slot
+            indices[i] = slot
+        return stage_h2d_upload(self, indices)
+
     def _build_mamba_copy_plan(
         self,
         kv_cache_config: KVCacheConfig,
@@ -2476,7 +2514,10 @@ class TPUModelRunner(GPUModelRunner):
         dst_t = torch.tensor([dst for _, dst in pairs], dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
+        raws = list(self.kv_cache_raw_tensors) + list(
+            getattr(self, "extra_block_indexed_state_tensors", ())
+        )
+        self._copy_mamba_state_blocks(raws, src_t, dst_t)
 
     def _dense_kv_copy_supported(self) -> bool:
         """Whether CoW copies run on the per-layer KV cache tensors.
@@ -2841,6 +2882,11 @@ class TPUModelRunner(GPUModelRunner):
             slot = self._mamba_slot_by_req_id.pop(req_id, None)
             if slot is not None:
                 self._free_mamba_slots.append(slot)
+            ring_slots = getattr(self, "_ring_slot_by_req_id", None)
+            if ring_slots is not None:
+                ring_slot = ring_slots.pop(req_id, None)
+                if ring_slot is not None:
+                    self._free_ring_slots.append(ring_slot)
         self._mamba_offset_seeded.difference_update(invalidated_req_ids)
         if self._pre_async_results is not None and invalidated_req_ids:
             # These results belong to freed KV state, including a finished ID
@@ -3704,8 +3750,17 @@ class TPUModelRunner(GPUModelRunner):
         # initialize_kv_cache); None otherwise so non-mamba models are
         # unaffected.
         mamba_state_indices = (
-            self._build_mamba_state_indices(start_index, num_reqs, target_num_reqs)
+            TPUModelRunner._build_mamba_state_indices(
+                self, start_index, num_reqs, target_num_reqs
+            )
             if self._has_mamba_state
+            else None
+        )
+        qsa_ring_slots = (
+            TPUModelRunner._build_qsa_ring_slots(
+                self, start_index, num_reqs, target_num_reqs
+            )
+            if getattr(self, "_has_qsa_ring_state", False)
             else None
         )
 
@@ -3761,6 +3816,7 @@ class TPUModelRunner(GPUModelRunner):
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             mamba_state_indices=mamba_state_indices,
+            qsa_ring_slots=qsa_ring_slots,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
             mamba_request_distribution=mamba_request_distribution,
@@ -6347,6 +6403,11 @@ class TPUModelRunner(GPUModelRunner):
                 if self._has_mamba_state
                 else None
             )
+            dummy_qsa_ring_slots = (
+                torch.zeros((num_reqs,), dtype=torch.int32).to(self.device)
+                if getattr(self, "_has_qsa_ring_state", False)
+                else None
+            )
             # Match _prepare_inputs: the spec-decode mamba fields are set iff
             # the model has mamba layers and spec decoding is enabled, so the
             # dummy runs compile the same GDN program signature — including
@@ -6373,6 +6434,7 @@ class TPUModelRunner(GPUModelRunner):
                 request_distribution=request_distribution,
                 position_ids_override=position_ids,
                 mamba_state_indices=dummy_mamba_state_indices,
+                qsa_ring_slots=dummy_qsa_ring_slots,
                 mamba_slot_read_offsets=self.mamba_slot_read_offsets,
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
@@ -6408,6 +6470,11 @@ class TPUModelRunner(GPUModelRunner):
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
+                qsa_ring_slots=(
+                    torch.zeros((num_reqs,), dtype=torch.int32).to(self.device)
+                    if getattr(self, "_has_qsa_ring_state", False)
+                    else None
+                ),
                 sequence_layout_kind=(dummy_layout_plan.descriptor.kind.value),
                 sequence_layout_protocol=(dummy_layout_plan.descriptor.protocol),
                 sequence_layout_version=(dummy_layout_plan.descriptor.version),
@@ -7759,9 +7826,12 @@ class TPUModelRunner(GPUModelRunner):
         for _, raws in self._mamba_copy_plan:
             raw_sets.setdefault(tuple(id(r) for r in raws), raws)
         if self.kv_cache_raw_tensors:
+            cow_raws = list(self.kv_cache_raw_tensors) + list(
+                getattr(self, "extra_block_indexed_state_tensors", ())
+            )
             raw_sets.setdefault(
-                tuple(id(r) for r in self.kv_cache_raw_tensors),
-                self.kv_cache_raw_tensors,
+                tuple(id(r) for r in cow_raws),
+                cow_raws,
             )
         # Serving calls the program under execute_model's no_grad, and dynamo
         # guards on grad mode: compile it the same way.

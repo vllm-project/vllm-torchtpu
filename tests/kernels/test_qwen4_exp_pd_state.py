@@ -256,11 +256,13 @@ def test_pd_draft_qsa_ring_and_kv_continue_after_relocation(prefix):
         ring_capacity=8,
     )
     run = jax.jit(
-        functools.partial(compact_pooled_qsa_step, **options), donate_argnums=(10, 11)
+        functools.partial(compact_pooled_qsa_step, **options),
+        donate_argnums=(10, 11, 12),
     )
     owners = (
         jnp.zeros((8, 1664, 1, 4, 256), jnp.float8_e4m3fn),
         jnp.zeros((8, 208, 1, 2, 128), jnp.bfloat16),
+        jnp.zeros((8, 8, 1, 2, 128), jnp.bfloat16),
     )
 
     def step(cache, start, count, pages, ring, *, verify=False):
@@ -285,17 +287,19 @@ def test_pd_draft_qsa_ring_and_kv_continue_after_relocation(prefix):
 
     for start in range(0, prefix, 16):
         result = step(owners, start, min(16, prefix - start), [1, 2], 6)
-        owners = result[:2]
+        owners = result[:3]
     destination = (
         _relocate(owners[0], [1, 2], [4, 5]),
-        _relocate(owners[1], [1, 2, 6], [4, 5, 7]),
+        _relocate(owners[1], [1, 2], [4, 5]),
+        _relocate(owners[2], [6], [7]),
     )
     for start, count in ((prefix, 1), (prefix + 1, 4)):
         expected = step(owners, start, count, [1, 2], 6, verify=True)
         actual = step(destination, start, count, [4, 5], 7, verify=True)
         np.testing.assert_array_equal(
-            np.asarray(actual[2])[:count], np.asarray(expected[2])[:count]
+            np.asarray(actual[3])[:count], np.asarray(expected[3])[:count]
         )
         _assert_pages(actual[0], expected[0], [4, 5], [1, 2])
-        _assert_pages(actual[1], expected[1], [4, 5, 7], [1, 2, 6])
-        owners, destination = expected[:2], actual[:2]
+        _assert_pages(actual[1], expected[1], [4, 5], [1, 2])
+        _assert_pages(actual[2], expected[2], [7], [6])
+        owners, destination = expected[:3], actual[:3]
