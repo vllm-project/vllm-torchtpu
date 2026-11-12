@@ -17,7 +17,8 @@ native owner shape. Six-query decode uses `bq=6`; longer queries use `bq=8` or
 The kernel builds query tiles in SMEM. Four Q/KV/SWA buffers overlap DMA and
 compute; two output buffers carry PV across tiles. Valid output rows are written
 directly to their original token positions, with padding zeroed in the kernel.
-Each 64-row packed-KV read is converted in four 16-row slices shared by QK/PV.
+Each 64-row packed-KV read is unpacked in two 32-row FP8 slices shared by QK/PV;
+the MXU takes FP8 RHS directly, so main KV is never widened to BF16 in VMEM.
 FP32 scale and inverse-RoPE tables remain resident when they fit within a quarter
 of core VMEM; larger tables are streamed through bounded buffers. Query, packed
 KV and SWA owners are constrained to HBM so the compiler does not copy a complete

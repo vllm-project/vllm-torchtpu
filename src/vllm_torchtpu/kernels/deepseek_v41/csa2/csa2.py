@@ -70,58 +70,25 @@ def swa_window(tile, tiles, positions, pages, bounds, *, page_size, non_causal):
     return position, left, jnp.where(active, right, left), anchor
 
 
-def _prepare_swa(
-    tile,
-    tiles_ref,
-    positions_ref,
-    swa_page_ref,
-    bounds_ref,
-    swa_kv_ref,
-    swa_ref,
-    *,
-    page_size,
-    cache_page_size,
-    num_banks,
-    low_pages,
-    non_causal,
-):
-    num_pages = 256 // page_size
-    request = jnp.minimum(_tile_field(tiles_ref, tile, 0), swa_page_ref.shape[0] - 1)
-    active = _tile_field(tiles_ref, tile, 0) < swa_page_ref.shape[0]
-    _, left, right, anchor = swa_window(
-        tile,
-        tiles_ref,
-        positions_ref,
-        swa_page_ref,
-        bounds_ref,
-        page_size=page_size,
-        non_causal=non_causal,
-    )
-    bf16_bits = jnp.dtype(jnp.bfloat16).itemsize * 8
-    low_mask = (1 << bf16_bits) - 1
-    high_mask = ~low_mask
-    for block in range(num_pages):
-        column = (
-            anchor + block * page_size - swa_page_ref[request, 0]
-        ) // cache_page_size
-        column = jnp.clip(column, 0, swa_page_ref.shape[1] - 3)
-        physical_page = swa_page_ref[request, column + 2]
-        values = swa_kv_ref[block * num_banks][0]
-        if num_banks == 2:
-            values = jnp.where(
-                physical_page < low_pages, values, swa_kv_ref[block * 2 + 1][0]
-            )
-        if values.dtype == jnp.int32:
-            values = pltpu.bitcast(values.reshape(page_size // 2, 512), jnp.bfloat16)
-        rows = pl.ds(block * page_size, page_size)
-        positions = anchor + block * page_size + 2 * jnp.arange(page_size // 2)
-        low = active & (positions >= left) & (positions < right)
-        high = active & (positions + 1 >= left) & (positions + 1 < right)
-        # A BF16 select triggers an invalid predicate layout on the pinned
-        # compiler. Mask pairs of rows through their zero-copy INT32 view.
-        mask = jnp.where(low, low_mask, 0) | jnp.where(high, high_mask, 0)
-        words = pltpu.bitcast(values, jnp.int32) & mask[:, None]
-        swa_ref[rows] = pltpu.bitcast(words, jnp.bfloat16)
+class _PageCopy:
+    """Copy one SWA page from the bank that holds it into a shared target."""
+
+    def __init__(self, sources, target, sem, owner):
+        self.sources, self.target, self.sem, self.owner = sources, target, sem, owner
+
+    def _copy(self, source):
+        return pltpu.make_async_copy(source, self.target, self.sem)
+
+    def start(self):
+        if len(self.sources) == 1:
+            self._copy(self.sources[0]).start()
+            return
+        for owner, source in enumerate(self.sources):
+            pl.when(self.owner == owner)(self._copy(source).start)
+
+    def wait(self):
+        # Each bank's copy moves the same bytes into the same target.
+        self._copy(self.sources[0]).wait()
 
 
 def _csa2_kernel(
@@ -171,6 +138,8 @@ def _csa2_kernel(
         swa_scores,
         main_p,
         swa_p,
+        inverses,
+        pv_raw,
         input_sems,
         swa_sems,
         output_sems,
@@ -180,7 +149,6 @@ def _csa2_kernel(
     tokens, heads = positions_ref.shape[0], q_hbm.shape[1]
     bq = q_buf.shape[1]
     batch = pages_ref.shape[0]
-    num_banks = len(swa_hbm)
     rows_per_token = 2 if swa_hbm[0].dtype == jnp.int32 else 1
     cache_page_size = swa_hbm[0].shape[1] // rows_per_token
     page_size = swa_buf.shape[-2] // rows_per_token
@@ -265,43 +233,29 @@ def _csa2_kernel(
         )
         copies = []
         for block in range(num_pages):
+            position = anchor + block * page_size
+            column = (position - pages_ref[request, 0]) // cache_page_size
+            physical = pages_ref[
+                request, jnp.clip(column, 0, pages_ref.shape[1] - 3) + 2
+            ]
+            # prepare() zeroes rows outside the window, so each copy only
+            # needs an in-bounds address in the bank that holds the page.
+            offset = position % cache_page_size
+            if rows_per_token == 2:
+                offset = pl.multiple_of(offset, page_size) * 2
+            sources = []
             for owner, source in enumerate(swa_hbm):
-                position = anchor + block * page_size
-                column = (position - pages_ref[request, 0]) // cache_page_size
-                physical = pages_ref[
-                    request, jnp.clip(column, 0, pages_ref.shape[1] - 3) + 2
-                ]
-                valid = (
-                    (position < right)
-                    & (position + page_size > left)
-                    & (column >= 0)
-                    & (column < pages_ref.shape[1] - 2)
-                    & (physical >= 0)
-                    & (physical < sum(owner.shape[0] for owner in swa_hbm))
+                first = swa_hbm[0].shape[0] if owner else 0
+                page = jnp.clip(physical - first, 0, source.shape[0] - 1)
+                sources.append(
+                    source.at[pl.ds(page, 1), pl.ds(offset, page_size * rows_per_token)]
                 )
-                if num_banks == 2:
-                    valid &= (
-                        (physical < swa_hbm[0].shape[0])
-                        if owner == 0
-                        else (physical >= swa_hbm[0].shape[0])
-                    )
-                    if owner:
-                        physical -= swa_hbm[0].shape[0]
-                physical = jnp.where(valid, physical, 0)
-                offset = jnp.where(valid, position % cache_page_size, 0)
-                if rows_per_token == 2:
-                    offset = pl.multiple_of(offset, page_size) * 2
-                index = block * num_banks + owner
-                copies.append(
-                    pltpu.make_async_copy(
-                        source.at[
-                            pl.ds(physical, 1),
-                            pl.ds(offset, page_size * rows_per_token),
-                        ],
-                        swa_buf.at[bank, index],
-                        swa_sems.at[bank, index],
-                    )
+            owner = (physical >= swa_hbm[0].shape[0]).astype(jnp.int32)
+            copies.append(
+                _PageCopy(
+                    sources, swa_buf.at[bank, block], swa_sems.at[bank, block], owner
                 )
+            )
         return copies
 
     def start(tile, bank):
@@ -327,44 +281,28 @@ def _csa2_kernel(
 
     def prepare(tile, bank, work_bank):
         tile = safe_tile(tile)
-        if num_banks == 1:
-            values = swa_buf[bank]
-            if values.dtype == jnp.int32:
-                values = pltpu.bitcast(values.reshape(128, 512), jnp.bfloat16)
-            values = values.reshape(256, 512)
-            active = _tile_field(tiles_ref, tile, 0) < batch
-            _, left, right, anchor = swa_window(
-                tile,
-                tiles_ref,
-                positions_ref,
-                pages_ref,
-                bounds_ref,
-                page_size=page_size,
-                non_causal=non_causal,
-            )
-            positions = anchor + 2 * jnp.arange(128)
-            low = active & (positions >= left) & (positions < right)
-            high = active & (positions + 1 >= left) & (positions + 1 < right)
-            mask = jnp.where(low, 0xFFFF, 0) | jnp.where(high, ~0xFFFF, 0)
-            values = pltpu.bitcast(
-                pltpu.bitcast(values, jnp.int32) & mask[:, None], jnp.bfloat16
-            )
-            swa_work[work_bank] = values
-            return
-        _prepare_swa(
+        values = swa_buf[bank]
+        if values.dtype == jnp.int32:
+            values = pltpu.bitcast(values.reshape(128, 512), jnp.bfloat16)
+        values = values.reshape(256, 512)
+        active = _tile_field(tiles_ref, tile, 0) < batch
+        _, left, right, anchor = swa_window(
             tile,
             tiles_ref,
             positions_ref,
             pages_ref,
             bounds_ref,
-            tuple(swa_buf.at[bank, i] for i in range(num_pages * num_banks)),
-            swa_work.at[work_bank],
             page_size=page_size,
-            cache_page_size=cache_page_size,
-            num_banks=num_banks,
-            low_pages=swa_hbm[0].shape[0],
             non_causal=non_causal,
         )
+        positions = anchor + 2 * jnp.arange(128)
+        low = active & (positions >= left) & (positions < right)
+        high = active & (positions + 1 >= left) & (positions + 1 < right)
+        mask = jnp.where(low, 0xFFFF, 0) | jnp.where(high, ~0xFFFF, 0)
+        values = pltpu.bitcast(
+            pltpu.bitcast(values, jnp.int32) & mask[:, None], jnp.bfloat16
+        )
+        swa_work[work_bank] = values
 
     def finish(tile, bank):
         """Drain pending PV, apply inverse RoPE, and mask padded rows."""
@@ -375,14 +313,20 @@ def _csa2_kernel(
         )
         start = _tile_field(tiles_ref, tile, 1)
         row_offset = start - jnp.minimum(start, tokens - bq)
+        # Drain every PV result to VMEM before any of its vector work.
         for i in range(bq):
-            output = jnp.concatenate(
+            pv_raw[i] = jnp.concatenate(
                 [
                     pltpu.matmul_pop(accumulators[mxu][bq + i])[:heads]
                     for mxu in range(2)
                 ],
                 axis=1,
             )
+        for i in range(bq):
+            output = pv_raw[i]
+            if has_main:
+                # PV accumulated unnormalized weights.
+                output = output * inverses[bank, i]
             tail = output[:, 384:]
             partner = jnp.take_along_axis(
                 tail,
@@ -500,20 +444,30 @@ def _csa2_kernel(
                 )
 
         def main_unpack(indices):
-            # Split each 64-row read into 16-row conversions shared by QK and PV.
+            # Split each 64-row read into 32-row FP8 tiles shared by QK and PV.
             unpack_rows = 64
             for i in indices:
                 for row in range(0, 512, unpack_rows):
                     rows = pl.ds(row, unpack_rows)
                     words = cast(jax.Ref, main_cache_ref)[i, rows, :]
-                    for subrow in range(0, unpack_rows, 16):
-                        subwords = words[pl.ds(subrow, 16)]
+                    for subrow in range(0, unpack_rows, 32):
+                        subwords = words[pl.ds(subrow, 32)]
+                        # Byte g of each word is column group g. Truncate to the
+                        # 16-bit halves once; a 32-bit shift of a packed half
+                        # moves byte 1 of each element into its low byte.
+                        halves = (
+                            subwords.astype(jnp.uint16),
+                            lax.shift_right_logical(subwords, 16).astype(jnp.uint16),
+                        )
                         for group in range(4):
-                            shifted = lax.shift_right_logical(subwords, 8 * group)
-                            bits = shifted.astype(jnp.uint8)
-                            fp8 = lax.bitcast_convert_type(bits, jnp.float8_e4m3fn)
-                            values = fp8.astype(jnp.bfloat16)
-                            subrows = pl.ds(row + subrow, 16)
+                            half = halves[group // 2]
+                            if group % 2:
+                                pairs = pltpu.bitcast(half, jnp.uint32)
+                                pairs = lax.shift_right_logical(pairs, jnp.uint32(8))
+                                half = pltpu.bitcast(pairs, jnp.uint16)
+                            bits = half.astype(jnp.uint8)
+                            values = lax.bitcast_convert_type(bits, jnp.float8_e4m3fn)
+                            subrows = pl.ds(row + subrow, 32)
                             main_kv_ref[i, subrows, pl.ds(group * 128, 128)] = values
 
         def main_qk_compute(indices):
@@ -544,18 +498,18 @@ def _csa2_kernel(
 
         def softmax(indices, qk_values):
             for r, i in enumerate(indices):
-                main_logits = qk_values[r]
                 # Scale each key column after QK, using FP32 KV scales.
                 kv_scales = cast(jax.Ref, main_scale_ref)[i]
-                main_logits = main_logits * (kv_scales * (scale * log2_e))
-
-                sink = sink_ref[...] * log2_e
+                factor = kv_scales * (scale * log2_e)
                 main_count = main_lengths_ref[
                     jnp.minimum(t0 + i, main_lengths_ref.shape[0] - 1)
                 ]
-                main_logits = main_logits + jnp.where(
-                    jnp.arange(512)[None, :] < main_count, 0.0, -jnp.inf
+                main_logits = jnp.where(
+                    jnp.arange(512)[None, :] < main_count,
+                    qk_values[r] * factor,
+                    -jnp.inf,
                 )
+                sink = sink_ref[...] * log2_e
                 swa_logits = swa_score_ref[i]
                 logits = jnp.concatenate((main_logits, swa_logits), axis=1)
                 maximum = jnp.maximum(sink, jnp.max(logits, axis=1, keepdims=True))
@@ -564,9 +518,9 @@ def _csa2_kernel(
                 denominator = sink_exponential + jnp.sum(
                     exponentials, axis=1, keepdims=True
                 )
-                exponentials = exponentials / denominator
-                # The denominator uses unscaled weights; fold KV scales into
-                # main PV weights and round once to BF16.
+                # Normalize after PV: no weight stays live until the sum ends.
+                inverses[bank, i] = 1.0 / denominator
+                # Fold KV scales into main PV weights and round once to BF16.
                 kv_scales = cast(jax.Ref, main_scale_ref)[i]
                 main_p_ref[i] = (exponentials[:, :512] * kv_scales).astype(jnp.bfloat16)
                 swa_p_ref[i] = exponentials[:, 512:].astype(jnp.bfloat16)
@@ -637,11 +591,11 @@ def _csa2_kernel(
             if not first_tile:
                 output_copy(tile - 1, 1 - bank).start()
             return
+        if not first_tile:
+            finish(tile - 1, 1 - bank)
         swa_qk_compute(0, bq)
         prepare_next()
         main_unpack(indices)
-        if not first_tile:
-            finish(tile - 1, 1 - bank)
         swa_qk_pop(0, bq)
         main_qk_compute(indices)
         for r, i in enumerate(indices):
@@ -680,9 +634,9 @@ def _csa2_kernel(
     def _():
         start(4, 0)
 
-    def step(tile, *, steady, last=False):
+    def step(tile, *, steady, last=False, bank=None):
         sb = tile & 3
-        bank = tile & 1
+        bank = tile & 1 if bank is None else bank
         for copy in input_copies(tile, sb):
             copy.wait()
 
@@ -702,19 +656,33 @@ def _csa2_kernel(
         def _():
             output_copy(tile - 3, 1 - bank).wait()
 
+        refill = ()
+        if steady:
+            # Index the refill DMAs while the vector units are busy; each DMA
+            # start orders the scalar work after it.
+            refill = (*input_copies(tile + 4, sb), *swa_copies(tile + 4, sb))
         compute(tile, bank, sb, steady=not last)
         if kv_out_hbm is not None:
             # The next input DMA reuses this KV buffer.
             kv_copy(tile, sb).wait()
 
         if steady:
-            start(tile + 4, sb)
+            for copy in refill:
+                copy.start()
         else:
             pl.when(tile + 4 < count)(lambda: start(tile + 4, sb))
 
-    # Retain one tile body per loop; the drain loop handles the prefetched tail.
+    # Steady pairs give each tile a static output bank; an odd steady tile
+    # left over joins the drain loop with the prefetched tail.
     end = max(count - 4, 1) if isinstance(count, int) else jnp.maximum(count - 4, 1)
-    lax.fori_loop(1, end, lambda tile, _: step(tile, steady=True), None, unroll=False)
+
+    def pair(k, unused):
+        for j in range(2):
+            step(1 + 2 * k + j, steady=True, bank=1 - j)
+
+    pairs = (end - 1) // 2
+    lax.fori_loop(0, pairs, pair, None)
+    end = 1 + 2 * pairs
     lax.fori_loop(
         end,
         jnp.maximum(count - 1, end),
@@ -972,7 +940,7 @@ def csa2(
                 pltpu.VMEM(
                     (
                         4,
-                        num_pages * len(banks),
+                        num_pages,
                         1,
                         page_size * rows_per_token,
                         banks[0].shape[-1],
@@ -980,13 +948,15 @@ def csa2(
                     banks[0].dtype,
                 ),
                 pltpu.VMEM((2, bq, heads, 512), jnp.bfloat16),
-                pltpu.VMEM((bq, 512, 512), jnp.bfloat16) if has_main else None,
+                pltpu.VMEM((bq, 512, 512), jnp.float8_e4m3fn) if has_main else None,
                 pltpu.VMEM((2, 256, 512), jnp.bfloat16),
                 pltpu.VMEM((bq, heads, 256), jnp.float32),
                 pltpu.VMEM((bq, heads, 512), jnp.bfloat16) if has_main else None,
                 pltpu.VMEM((bq, heads, 256), jnp.bfloat16),
+                pltpu.VMEM((2, bq, heads, 1), jnp.float32),
+                pltpu.VMEM((bq, heads, 512), jnp.float32),
                 pltpu.SemaphoreType.DMA((4, 2 if resident_metadata else 4)),
-                pltpu.SemaphoreType.DMA((4, num_pages * len(banks))),
+                pltpu.SemaphoreType.DMA((4, num_pages)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((4,)),
                 pltpu.SMEM((tile_capacity * 3,), jnp.int32),
