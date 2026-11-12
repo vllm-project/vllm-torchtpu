@@ -17,6 +17,8 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 # Provide lightweight stubs for optional heavy runtime dependencies if not present
 for mod_name in ("torch", "vllm", "vllm.utils"):
     if mod_name not in sys.modules:
@@ -155,6 +157,50 @@ def test_kv_cache_update_builds_block_specs_and_traces():
                 pl.ANY,
             ]
             assert [spec.memory_space for spec in grid_spec.out_specs] == [pl.ANY]
+
+
+@pytest.mark.parametrize("pipelined_dma", [False, True])
+@pytest.mark.parametrize(
+    "num_slices_per_block, expected_num_slices_per_block", [(4, 4), (None, 8)]
+)
+def test_kv_cache_update_honors_explicit_vmem_limit_bytes(
+    pipelined_dma, num_slices_per_block, expected_num_slices_per_block
+):
+    """An explicit vmem_limit_bytes reaches CompilerParams and sizes the block."""
+    import jax.numpy as jnp
+
+    page_size, num_combined_kv_heads, head_dim = 8, 2, 128
+    new_kv = jnp.zeros((16, num_combined_kv_heads, head_dim), dtype=jnp.bfloat16)
+    kv_cache = jnp.zeros((64, num_combined_kv_heads, head_dim), dtype=jnp.bfloat16)
+    slices = jnp.zeros((3, 8), dtype=jnp.int32)
+    num_slices = jnp.array([2], dtype=jnp.int32)
+    page_size_bytes = page_size * num_combined_kv_heads * head_dim * 2
+    # The 1 MiB reserve plus 8 pages: auto sizing picks 8 instead of the
+    # default budget's 64.
+    vmem_limit_bytes = 1024 * 1024 + 8 * page_size_bytes
+
+    traced = ragged_kv_cache_update.kv_cache_update.trace(
+        new_kv,
+        slices,
+        kv_cache,
+        num_slices,
+        page_size=page_size,
+        num_slices_per_block=num_slices_per_block,
+        vmem_limit_bytes=vmem_limit_bytes,
+        pipelined_dma=pipelined_dma,
+    )
+
+    (pallas_eqn,) = [
+        eqn for eqn in traced.jaxpr.eqns if eqn.primitive.name == "pallas_call"
+    ]
+    assert pallas_eqn.params["compiler_params"].vmem_limit_bytes == vmem_limit_bytes
+    scratch_ref = pallas_eqn.params["jaxpr"].invars[-2].aval
+    assert scratch_ref.shape == (
+        expected_num_slices_per_block,
+        page_size,
+        num_combined_kv_heads,
+        head_dim,
+    )
 
 
 def test_kernel_v3_prepare_inputs_outputs_wiring():
