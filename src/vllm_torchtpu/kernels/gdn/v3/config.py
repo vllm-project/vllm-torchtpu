@@ -217,8 +217,12 @@ class GDNConfig:
                 if head_groups * b * b <= 256:
                     return b
             return 2
-        # GDN: between-block updates scale as 1 / B.
-        return max(2, min(16, 16 // head_groups))
+        # GDN: between-block updates scale as 1 / B. Select a power of two so
+        # B divides every power-of-two chunk size (e.g. n_v=24 at TP=2 -> 4).
+        for b in (16, 8, 4):
+            if head_groups * b <= 16:
+                return b
+        return 2
 
     @property
     def use_recurrent(self) -> bool:

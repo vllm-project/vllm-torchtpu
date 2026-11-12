@@ -59,9 +59,7 @@ def _load_raw_rows(
     rows, width = block_ref.shape
     padded_width = stage_ref.shape[-1]
     num_lanes = pltpu.get_tpu_info().num_lanes
-    start = memory_ref.raw_block_start(
-        metadata_ref, p_id, rows, align, cfg.batch_size
-    )
+    start = memory_ref.raw_block_start(metadata_ref, p_id, rows, align, cfg.batch_size)
     if width == padded_width:
         for col in range(0, width, num_lanes):
             stage_ref[pl.ds(0, rows), 0, col : col + num_lanes] = block_ref[
@@ -692,9 +690,7 @@ def fused_conv1d_gdn(
         align = raw_row_align(x)
         return x.ndim == 2 and align > 0 and x.shape[0] % align == 0
 
-    use_raw_qkv = (
-        envs.TPU_GDN_RAW_QKV and not prepared_qkv and raw_eligible(qkv)
-    )
+    use_raw_qkv = envs.TPU_GDN_RAW_QKV and not prepared_qkv and raw_eligible(qkv)
     use_raw_ba = (
         envs.TPU_GDN_RAW_BA
         and not is_kda
@@ -800,7 +796,9 @@ def fused_conv1d_gdn(
             conv_state_dim_size=dim if conv_state is None else conv_state.shape[-1],
             act_out_dtype=act_out_dtype,
             recurrent_state_dtype=(
-                jnp.float32 if recurrent_state is None else recurrent_state.dtype
+                state_plan.recurrent.view_dtype
+                if pooled and state_plan is not None
+                else (jnp.float32 if recurrent_state is None else recurrent_state.dtype)
             ),
             num_lanes=num_lanes,
             decode_vmem_limit_bytes=decode_vmem_limit_bytes,
