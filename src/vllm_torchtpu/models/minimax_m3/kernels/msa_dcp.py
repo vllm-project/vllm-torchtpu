@@ -857,6 +857,8 @@ def msa_attend_dcp(
         q_head_major=q_head_major,
         interpret=interpret,
     )
+    if num_tokens >= _MIN_CANDIDATE_TOKENS:  # prefill-sized steps only
+        common["step_widths"] = msa_attention_lse.PREFILL_STEP_WIDTHS
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
     if scale_cache is not None:
         if num_heads == 1:
