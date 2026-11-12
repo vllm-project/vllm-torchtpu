@@ -407,6 +407,16 @@ def _spec_logprob_row_tokens(
     return out[:num_rows, None]
 
 
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _fit_verify_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
+    """`t` with its leading (verify row) dim zero-padded or cut to ``rows``."""
+    n = t.shape[0]
+    if n >= rows:
+        return t[:rows]
+    pad = [0, 0] * (t.dim() - 1) + [0, rows - n]
+    return torch.nn.functional.pad(t, pad)
+
+
 def _verify_rows_uniform(
     md: SpecDecodeMetadata,
     shape: tuple[int, ...],
@@ -4475,14 +4485,33 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states,
                         layout_plan,
                     )
+                    fine_indices = getattr(
+                        spec_decode_metadata, "fine_logits_indices", None
+                    )
                     if top_tokens:
-                        logits = self.compute_selected_top_tokens(
-                            hidden_states, logits_indices
-                        )
+                        if fine_indices is not None:
+                            logits = _fit_verify_rows(
+                                self.compute_selected_top_tokens(
+                                    hidden_states, fine_indices
+                                ),
+                                logits_indices.shape[0],
+                            )
+                        else:
+                            logits = self.compute_selected_top_tokens(
+                                hidden_states, logits_indices
+                            )
                     elif synthetic_verify and spec_decode_metadata is not None:
                         logits = self.compute_selected_logits(
                             hidden_states,
                             self._plan_synthetic_verify(spec_decode_metadata),
+                        )
+                    elif fine_indices is not None:
+                        # spec_verify_coarse_pad: the LM head at the token-bucket
+                        # row count (its per-row results depend on the row
+                        # count on TPU), then zero rows up to the coarse count.
+                        logits = _fit_verify_rows(
+                            self.compute_selected_logits(hidden_states, fine_indices),
+                            logits_indices.shape[0],
                         )
                     else:
                         logits = self.compute_selected_logits(
@@ -6902,6 +6931,14 @@ class TPUModelRunner(GPUModelRunner):
                     logger.info(
                         "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_rows
                     )
+            fits = (
+                self._verify_rows_fits()
+                if getattr(self, "_spec_verify_coarse_pad", False)
+                else []
+            )
+            for fine_rows, rows in fits:
+                out = _fit_verify_rows(self._dummy_logits(fine_rows), rows)
+                synchronize_tensors(out)
 
     def _spec_logits_lengths(self) -> list[int]:
         """Verify-logits row counts a spec step selects (`padded_logits_length`):
@@ -6909,9 +6946,29 @@ class TPUModelRunner(GPUModelRunner):
         if self.speculative_config is None:
             return []
         K = self.speculative_config.num_speculative_tokens
-        pads = verify_logits_paddings(self)
+        # The token buckets, with spec_verify_coarse_pad too: a full-logits
+        # verify chunk runs the LM head at its token-bucket row count
+        # (`fine_logits_indices`) and pads the logits after.
+        pads = list(self.num_tokens_paddings)
         most = _get_padded_token_len(pads, min(self.max_num_reqs * (1 + K), pads[-1]))
         return [n for n in pads if n <= most]
+
+    def _verify_rows_fits(self) -> list[tuple[int, int]]:
+        """(token-bucket rows, coarse rows) pairs `_fit_verify_rows` takes
+        under spec_verify_coarse_pad: every verify row count up to a full
+        batch, where the two paddings differ."""
+        if not getattr(self, "_spec_verify_coarse_pad", False):
+            return []
+        assert self.speculative_config is not None
+        K = self.speculative_config.num_speculative_tokens
+        fine = list(self.num_tokens_paddings)
+        coarse = verify_logits_paddings(self)
+        most = min(self.max_num_reqs * (1 + K), fine[-1])
+        pairs = {
+            (_get_padded_token_len(fine, n), _get_padded_token_len(coarse, n))
+            for n in range(1, most + 1)
+        }
+        return sorted(p for p in pairs if p[0] != p[1])
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -6941,6 +6998,19 @@ class TPUModelRunner(GPUModelRunner):
                     synchronize_tensors(out)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
+            # spec_verify_coarse_pad's padding of full verify rows; dummy_hidden
+            # is the largest token bucket here.
+            fits = (
+                self._verify_rows_fits()
+                if getattr(self, "_spec_verify_coarse_pad", False)
+                else []
+            )
+            for fine_rows, rows in fits:
+                indices = torch.zeros(fine_rows, dtype=torch.int32).to(self.device)
+                out = _fit_verify_rows(
+                    self.compute_selected_top_tokens(dummy_hidden, indices), rows
+                )
+                synchronize_tensors(out)
         if not _get_sequence_layout_planner_for_runner(
             self
         ).uses_selected_logits_hidden_states:
