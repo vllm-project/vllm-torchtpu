@@ -152,6 +152,34 @@ def test_decodes_are_counted_once_before_prefill_chunks_are_sized():
     assert scheduler._step_tokens == 16384
 
 
+def test_draft_tokens_are_counted_with_their_decode():
+    # MTP with three drafts: each decode verifies four tokens this step.
+    decodes = [
+        SimpleNamespace(**vars(_decode(f"d{i}", 8192)), num_tokens_with_spec=8196)
+        for i in range(8)
+    ]
+    scheduler = _scheduler(cost=_model(), running=decodes)
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._step_tokens == 32
+    assert scheduler._step_pairs == pytest.approx(32.0 * 8192)
+    assert scheduler._mamba_block_aligned_split(decodes[0], 4) == 4
+    assert scheduler._step_tokens == 32
+
+
+def test_an_async_decode_behind_a_finished_prefill_is_seeded():
+    # Async scheduling: the prompt's last chunk is computed and its sampled
+    # token is a placeholder, so the next step decodes one token.
+    request = SimpleNamespace(
+        **vars(_request(8192, 8192, "a")), num_output_placeholders=1
+    )
+    scheduler = _scheduler(cost=_model(), running=[request])
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._seeded == {"a"}
+    assert scheduler._step_tokens == 1
+
+
 def test_a_prefill_still_in_flight_is_not_seeded_as_a_decode():
     in_flight = [_request(8192, 8192, f"p{i}") for i in range(6)]
     scheduler = _scheduler(cost=_model(), running=in_flight)
@@ -318,12 +346,19 @@ def _config(pp=8, cls=SCHEDULER_CLS):
     )
 
 
-def test_uses_dynamic_chunks_follows_the_installed_scheduler_class():
+def test_uses_dynamic_chunks_follows_the_installed_scheduler_class(monkeypatch):
+    monkeypatch.setattr(pp_chunk_scheduler.envs, "TPU_DYNAMIC_CHUNKS", False)
     assert uses_dynamic_chunks(_config())
     assert not uses_dynamic_chunks(_config(pp=1))
     assert not uses_dynamic_chunks(_config(cls=None))
     assert not uses_dynamic_chunks(_config(cls="other.Scheduler"))
     assert not uses_dynamic_chunks(None)
+
+
+def test_one_stage_uses_dynamic_chunks_when_opted_in(monkeypatch):
+    monkeypatch.setattr(pp_chunk_scheduler.envs, "TPU_DYNAMIC_CHUNKS", True)
+    assert uses_dynamic_chunks(_config(pp=1))
+    assert not uses_dynamic_chunks(_config(pp=1, cls=None))
 
 
 class _Executor:
