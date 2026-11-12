@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The prefill KDA layer's pieces on CPU: unit-RMS window rows, the input
-norm in the KDA tiles, and the chunked delta rule's sub-block factors."""
+norm in the KDA tiles, the chunked delta rule's sub-block factors and the
+ring schedule. The ring test needs 32 devices:
+XLA_FLAGS=--xla_force_host_platform_device_count=32."""
+
+from collections import namedtuple
 
 import jax
 import jax.numpy as jnp
@@ -8,6 +12,8 @@ import numpy as np
 import pytest
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel.kimi_k3.kernels import prefill_megakernel as kernels
 
@@ -17,8 +23,8 @@ HBM = pl.BlockSpec(memory_space=pltpu.HBM)
 E4M3 = jnp.float8_e4m3fn
 
 
-def _interpret():
-    return pltpu.InterpretParams(detect_races=True)
+def _interpret(**params):
+    return pltpu.InterpretParams(detect_races=True, **params)
 
 
 def _mixture_inputs(rng, tokens, hidden):
@@ -288,3 +294,196 @@ def test_chunk_sub_blocks_against_the_sequential_delta_rule(kind, fast):
     # sub-blocks (``_kda_chunk_core``); other gates agree with 16 rows.
     saturated = kind in ("saturated", "boundary")
     assert errors[32] <= (1e-3 if saturated else 2e-5)
+
+
+WINDOWS = (512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384)
+
+
+def _blocks(window):
+    rows = window // 32
+    return rows // kernels.window_stripe(rows)
+
+
+def _old_schedule(blocks):
+    """One block per ring a phase: gather block p, reduce block p - 2."""
+    return tuple(
+        (min(p, blocks), int(p < blocks), max(p - 2, 0), int(p >= 2))
+        for p in range(blocks + 2)
+    )
+
+
+@pytest.mark.parametrize("window", WINDOWS)
+def test_ring_schedule_covers_every_segment_in_time(window):
+    blocks = _blocks(window)
+    halves, phases = kernels._kda_ring_schedule(blocks)
+    assert halves == (2 if blocks >= 3 else 1)
+    assert len(phases) == blocks + 2
+    assert phases[0] == (0, halves, 0, 0)
+    cap = -(-2 * halves * (blocks - 1) // blocks)
+    gathered = reduced = 0
+    for p, (gather_first, gathers, reduce_first, reduces) in enumerate(phases):
+        assert (gather_first, reduce_first) == (gathered, reduced)
+        gathered, reduced = gathered + gathers, reduced + reduces
+        # Block b's tiles run in phase b + 1 and need its whole window.
+        assert gathered >= halves * min(p + 1, blocks)
+        if reduces:  # only blocks whose tiles are done
+            assert (reduced - 1) // halves <= p - 2
+        if 0 < p <= blocks:
+            assert gathers + reduces <= cap
+    assert gathered == reduced == halves * blocks
+    if halves == 1:
+        assert phases == _old_schedule(blocks)
+
+
+FakeDevice = namedtuple("FakeDevice", "id coords core_on_chip")
+
+
+def _ring_tables():
+    """The ring tables of a 2x2x4 slice whose device ids follow the cores."""
+    devices = [
+        FakeDevice(((x * 2 + y) * 4 + z) * 2 + core, (x, y, z), core)
+        for x in range(2)
+        for y in range(2)
+        for z in range(4)
+        for core in range(2)
+    ]
+    devices.sort(key=lambda device: device.id)
+    return jnp.asarray(kernels.ring_tables(devices, tuple(range(32))), jnp.int32)
+
+
+def _rings(mesh, window, width):
+    """The KDA layer's window all-gather and reduce-scatter alone, phase by
+    phase: ``run(local, partial, prefix, length) -> (window, output)``."""
+    rows = window // 32
+    stripe = kernels.window_stripe(rows)
+    halves, schedule = kernels._kda_ring_schedule(rows // stripe)
+    part = stripe // halves
+    streams = len(kernels._half_ring_streams(width))
+    gather_lead = max(entry[1] for entry in schedule)
+    reduce_lead = max(entry[3] for entry in schedule)
+
+    def body(
+        tables_ref,
+        length_ref,
+        local_ref,
+        partial_ref,
+        prefix_ref,
+        window_ref,
+        output_ref,
+        *scratch,
+    ):
+        step = pl.program_id(1)
+        phase, ring_step = step // kernels.HALF_STEPS, step % kernels.HALF_STEPS
+        rank = jax.lax.axis_index("k3_sp")
+        pl.when(step == 0)(lambda: kernels._ring_enter(tables_ref, rank))
+        gather_first, gathers, reduce_first, reduces = kernels._kda_ring_phase(
+            schedule, phase
+        )
+        kernels._kda_gather_segments(
+            tables_ref,
+            local_ref,
+            window_ref,
+            scratch[:3],
+            first=gather_first,
+            count=gathers,
+            halves=halves,
+            ring_step=ring_step,
+        )
+        kernels._kda_reduce_segments(
+            tables_ref,
+            length_ref,
+            partial_ref,
+            prefix_ref,
+            output_ref,
+            scratch[3:8],
+            scratch[8:],
+            first=reduce_first,
+            count=reduces,
+            halves=halves,
+            ring_step=ring_step,
+            replace=False,
+        )
+
+    scratch = (
+        pltpu.SemaphoreType.DMA((gather_lead, streams)),
+        pltpu.SemaphoreType.DMA((gather_lead, streams)),
+        pltpu.SemaphoreType.DMA((gather_lead,)),
+        pltpu.SemaphoreType.DMA((reduce_lead, 2, streams)),
+        pltpu.SemaphoreType.DMA((reduce_lead, streams)),
+        pltpu.SemaphoreType.DMA((reduce_lead, 2, streams)),
+        pltpu.SemaphoreType.REGULAR((reduce_lead, streams)),
+        pltpu.SemaphoreType.DMA((reduce_lead,)),
+        pltpu.VMEM((reduce_lead, 2, 2, part, width), jnp.bfloat16),
+        pltpu.VMEM((reduce_lead, 2, part, width), jnp.bfloat16),
+        pltpu.VMEM((reduce_lead, 2, 2, part, width), jnp.bfloat16),
+    )
+    call = pl.pallas_call(
+        body,
+        out_shape=(
+            jax.ShapeDtypeStruct((window, width), kernels._kda_window_dtype(stripe)),
+            jax.ShapeDtypeStruct((rows, width), jnp.bfloat16),
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(1, kernels.HALF_STEPS * len(schedule)),
+            in_specs=[HBM] * 3,
+            out_specs=[HBM] * 2,
+            scratch_shapes=scratch,
+        ),
+        compiler_params=pltpu.CompilerParams(collective_id=7),
+        # A ring step waits for its incoming copy through its own outgoing
+        # copy's descriptor: copies must run when they start, not when waited.
+        interpret=_interpret(dma_execution_mode="eager"),
+    )
+    tables = _ring_tables()
+
+    def local(local_rows, partial, prefix, length):
+        gathered, output = call(tables, length, local_rows[0], partial[0], prefix[0])
+        return gathered[None], output[None]
+
+    return jax.jit(
+        jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=(P("k3_sp"),) * 3 + (P(),),
+            out_specs=(P("k3_sp"), P("k3_sp")),
+            check_vma=False,
+        )
+    )
+
+
+def test_half_stripe_rings_move_every_row_exactly():
+    """Three blocks: half stripes, three gathers and two reduces at once.
+    Interpreting 32 devices takes minutes."""
+    if len(jax.devices()) < 32:
+        pytest.skip(
+            "needs 32 devices: XLA_FLAGS=--xla_force_host_platform_device_count=32"
+        )
+    mesh = Mesh(np.asarray(jax.devices()[:32]), ("k3_sp",))
+    rng = np.random.default_rng(0)
+    window, width = 6144, 384
+    rows = window // 32
+    assert kernels._kda_ring_schedule(_blocks(window))[0] == 2
+    # Integers: every ring sum is exact, so the reduction checks bit for bit.
+    local_rows = rng.integers(-16, 17, (32, rows, width))  # exact in E4M3FN
+    partial = rng.integers(-4, 5, (32, window, width))  # sums within BF16's 256
+    prefix = rng.integers(-64, 65, (32, rows, width))
+    length = window - 100
+    gathered, output = _rings(mesh, window, width)(
+        jnp.asarray(local_rows, E4M3),
+        jnp.asarray(partial, jnp.bfloat16),
+        jnp.asarray(prefix, jnp.bfloat16),
+        jnp.asarray([length], jnp.int32),
+    )
+
+    order = kernels.sp_order(window)  # window token of each rank-major local row
+    expected_window = np.zeros((window, width))
+    expected_window[order] = local_rows.reshape(window, width)
+    for rank in range(32):
+        np.testing.assert_array_equal(
+            np.asarray(gathered[rank], np.float64), expected_window
+        )
+    tokens = order.reshape(32, rows)
+    valid = (tokens < length)[..., None]
+    expected = prefix + np.where(valid, partial.sum(axis=0)[tokens], 0)
+    np.testing.assert_array_equal(np.asarray(output, np.float64), expected)
