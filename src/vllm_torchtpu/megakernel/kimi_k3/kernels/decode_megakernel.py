@@ -2690,7 +2690,10 @@ def moe(
             # grouped execution. Its weight slots can only be populated once
             # all routes are known; otherwise a wait can consume another
             # expert's correctly sized DMA without detecting the mismatch.
-            if group_pending_expert_routes:
+            # Rows of a larger batch practically never share a route prefix,
+            # and the per-selection check would only lengthen the top-k loop:
+            # their first copies start after routing.
+            if group_pending_expert_routes or batch_size > 1:
                 return
             del unused_selected_experts
             nonlocal shared_route_prefix, prefetched_expert_count
