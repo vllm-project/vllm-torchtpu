@@ -1,0 +1,129 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""CPU tests of the opt-in gmm_v2 tile overrides (TPU_GMM_V2_*)."""
+
+from types import SimpleNamespace
+
+import jax.numpy as jnp
+import pytest
+
+from vllm_torchtpu.kernels.megablox import gmm_v2 as G
+
+# MiniMax-M3.1-Flash per-core MoE shapes (EP8, 16 local experts, NVFP4 block 128).
+H, FE, LOCAL = 6144, 3072, 16
+VMEM = int(64 * 1024 * 1024 * 0.9)
+
+
+@pytest.fixture(autouse=True)
+def _tpu7x(monkeypatch):
+    monkeypatch.setattr(
+        G.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(
+            num_lanes=128,
+            mxu_column_size=256,
+            vmem_capacity_bytes=64 * 1024 * 1024,
+            is_matmul_supported=lambda a, b: True,
+            get_sublane_tiling=lambda dtype: 16,
+        ),
+    )
+    for name in (G._PREFILL_TILES_ENV, G._DECODE_W13_ENV):
+        monkeypatch.delenv(name, raising=False)
+    G._tile_env.cache_clear()
+    yield
+    G._tile_env.cache_clear()
+
+
+def _cfgs(size_k):
+    lhs = G.InputConfigs(quant_dtype=None, quant_block_size=size_k, dtype=jnp.bfloat16)
+    rhs = G.InputConfigs(
+        quant_dtype=jnp.float4_e2m1fn,
+        quant_block_size=128,
+        dtype=jnp.float4_e2m1fn,
+        has_scale=True,
+    )
+    return lhs, rhs
+
+
+def _tiles(size_m, gate_up):
+    k, n = (H, 2 * FE) if gate_up else (FE, H)
+    dims = G.Dimensions(
+        size_m=size_m, size_k=k, size_n=n, size_group=LOCAL,
+        size_lhs_group=LOCAL, size_lhs_sublane=16,
+    )
+    lhs, rhs = _cfgs(k)
+    return G.calculate_tiling(dims, lhs, rhs, VMEM, "swigluoai" if gate_up else None)
+
+
+@pytest.mark.parametrize("size_m", [128, 2048, 4096, 32768])
+@pytest.mark.parametrize("gate_up", [True, False])
+def test_unset_env_keeps_default_tiles(size_m, gate_up):
+    assert _tiles(size_m, gate_up) == G._calculate_tiling(
+        *_args(size_m, gate_up)
+    )
+
+
+def _args(size_m, gate_up):
+    k, n = (H, 2 * FE) if gate_up else (FE, H)
+    dims = G.Dimensions(
+        size_m=size_m, size_k=k, size_n=n, size_group=LOCAL,
+        size_lhs_group=LOCAL, size_lhs_sublane=16,
+    )
+    lhs, rhs = _cfgs(k)
+    return dims, lhs, rhs, VMEM, "swigluoai" if gate_up else None
+
+
+@pytest.mark.parametrize("gate_up", [True, False])
+def test_prefill_tiles_apply_above_decode_max(monkeypatch, gate_up):
+    monkeypatch.setenv(G._PREFILL_TILES_ENV, "256:128,256")
+    for size_m in (4096, 32768):
+        t = _tiles(size_m, gate_up)
+        assert (t.tile_m, t.bucket_base, t.bucket_sizes) == (256, 128, (128, 256))
+        default = G._calculate_tiling(*_args(size_m, gate_up))
+        assert (t.tile_k, t.tile_n, t.rhs_buffer_count) == (
+            default.tile_k, default.tile_n, default.rhs_buffer_count)
+    # decode-sized buffers keep their tiles
+    assert _tiles(2048, gate_up) == G._calculate_tiling(*_args(2048, gate_up))
+
+
+def test_prefill_tiles_bad_spec(monkeypatch):
+    monkeypatch.setenv(G._PREFILL_TILES_ENV, "256:128")
+    with pytest.raises(ValueError):
+        _tiles(4096, True)
+
+
+def test_decode_w13_applies_to_gate_up_only(monkeypatch):
+    monkeypatch.setenv(G._DECODE_W13_ENV, "3072:2")
+    for size_m in (32, 512, 2048):
+        t = _tiles(size_m, True)
+        d = G._calculate_tiling(*_args(size_m, True))
+        assert (t.tile_n, t.rhs_buffer_count) == (3072, 2)
+        assert (t.tile_m, t.bucket_sizes) == (d.tile_m, d.bucket_sizes)
+        assert _tiles(size_m, False) == G._calculate_tiling(*_args(size_m, False))
+    assert _tiles(4096, True) == G._calculate_tiling(*_args(4096, True))
+
+
+def test_decode_w13_over_vmem_falls_back(monkeypatch):
+    # three 18.9 MB gate_up blocks do not fit
+    monkeypatch.setenv(G._DECODE_W13_ENV, "3072:3")
+    assert _tiles(512, True) == G._calculate_tiling(*_args(512, True))
+
+
+def test_vmem_estimate_counts_rhs_buffers():
+    lhs, rhs = _cfgs(H)
+    e3 = G.gmm_vmem_estimate(32, 3072, H, lhs_cfgs=lhs, rhs_cfgs=rhs, fuse_act="swigluoai")
+    e2 = G.gmm_vmem_estimate(
+        32, 3072, H, lhs_cfgs=lhs, rhs_cfgs=rhs, fuse_act="swigluoai", rhs_buffer_count=2
+    )
+    assert e3 - e2 == 2 * G.rhs_weight_block_bytes(H, 3072, rhs)
