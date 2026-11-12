@@ -170,9 +170,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
         from combining a pair into one that both halves would wait for.
         """
         attn, res = [], []
-        # The halves' cache writes are threaded from the first call into the
-        # second and written once (see MiniMaxM3SparseAttention.forward).
-        caches = None
         for i, h in enumerate(hidden_states):
             if attn and envs.TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST:
                 # The second half waits for the first half's attention, which
@@ -183,15 +180,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 n, r = self.input_layernorm(h), h
             else:
                 n, r = self.input_layernorm(h, residual[i])
-            writes: list[torch.Tensor] = []
-            attn.append(
-                self.self_attn(
-                    halves[i].positions, n, halves[i].metadata, caches, writes
-                )
-            )
-            caches = writes
+            attn.append(self.self_attn(halves[i].positions, n, halves[i].metadata))
             res.append(r)
-        self.self_attn.write_caches(caches)
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         post = []
         for i, a in enumerate(attn):
@@ -212,8 +202,9 @@ class _Half(NamedTuple):
     metadata: dict
 
 
-def _split_metadata(md: AttentionMetadata, split: int) -> tuple:
-    """`md` for the queries before token `split` and for the rest."""
+def _split_metadata(md: AttentionMetadata, split: torch.Tensor) -> tuple:
+    """`md` for the queries before token `split` (a 0-d tensor) and for the
+    rest."""
     first_qsl, first_lens, second_qsl, second_lens = split_query_layout(
         md.query_start_loc, md.seq_lens, split
     )
@@ -231,14 +222,22 @@ def _split_halves(
     metadata = get_forward_context().attn_metadata
     if not isinstance(metadata, dict):
         return None
+    first_positions = positions.narrow(0, 0, split)
+    # The split point enters the metadata as a tensor computed in the graph.
+    # As a python int it was frozen at the bucket the graph was traced at
+    # (the token count is dynamic, but a scalar argument of clip is not), so
+    # other buckets kept the traced split: at a smaller bucket the first half
+    # took every query and the second half none, and the second half's K/V
+    # were never written (TPU state check: every second-half page zero).
+    split_at = torch.ones_like(first_positions, dtype=torch.int32).sum()
     derived: dict[int, tuple] = {}
     first, second = {}, {}
     for prefix, md in metadata.items():
         if id(md) not in derived:
-            derived[id(md)] = _split_metadata(md, split)
+            derived[id(md)] = _split_metadata(md, split_at)
         first[prefix], second[prefix] = derived[id(md)]
     return (
-        _Half(positions.narrow(0, 0, split), first),
+        _Half(first_positions, first),
         _Half(positions.narrow(0, split, num_tokens - split), second),
     )
 
@@ -294,8 +293,8 @@ class MiniMaxM3Model(nn.Module):
             )
         if self.split_min_tokens:
             logger.info_once(
-                "TPU_MINIMAX_M3_SPLIT_MIN_TOKENS=%d: token-half split on, cache "
-                "writes threaded through the halves",
+                "TPU_MINIMAX_M3_SPLIT_MIN_TOKENS=%d: token-half split on, split "
+                "point traced as a tensor",
                 self.split_min_tokens,
             )
         if self.split_min_tokens and envs.TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES <= 0:

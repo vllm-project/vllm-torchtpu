@@ -88,3 +88,21 @@ def test_join_restores_real_rows(batch):
     joined = split.join_seq_lens(fs, sq, ss)
     real = qsl[1:] - qsl[:-1] > 0
     np.testing.assert_array_equal(joined[real], seq[real])
+
+
+@pytest.mark.parametrize("batch", list(_batches())[:50])
+def test_tensor_split_point_matches_int(batch):
+    """The model passes the split point as a 0-d int32 tensor computed in the
+    graph (a python int is frozen at the traced bucket)."""
+    torch = pytest.importorskip("torch")
+    qsl, seq, _, num_tokens = batch
+    split_at = num_tokens // 2
+    want = split.split_query_layout(qsl, seq, split_at)
+    got = split.split_query_layout(
+        torch.from_numpy(qsl),
+        torch.from_numpy(seq),
+        torch.ones(split_at, dtype=torch.int32).sum(),
+    )
+    for w, g in zip(want, got):
+        assert g.dtype == torch.int32
+        np.testing.assert_array_equal(g.numpy(), w)
