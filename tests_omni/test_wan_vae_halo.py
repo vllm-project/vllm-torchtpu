@@ -292,7 +292,9 @@ def _check_tiny_wan_decoder(rank: int, world_size: int, group) -> None:
     patches._patch_wan_vae_halo_allgather()
     patched_halo_fn = wan_spatial_shard._halo_exchange_p2p
 
-    torch.manual_seed(0)
+    # The CPU generator only: torch.manual_seed also seeds the TPU, which opens
+    # the chip in this spawned rank while the pytest parent already holds it.
+    torch.default_generator.manual_seed(0)
     ref_vae = OmniAutoencoderKLWan(**TINY_CONFIG).eval()
     ref_state = ref_vae.state_dict()
 
@@ -412,7 +414,8 @@ def _check_wan21_720p_on_8_ranks(
     patches._patch_wan_vae_halo_allgather()
     patches._patch_distributed_vae_host_metadata_collectives()
 
-    torch.manual_seed(0)
+    # CPU generator only (see _check_tiny_wan_decoder): keep the TPU closed.
+    torch.default_generator.manual_seed(0)
     ref_vae = OmniAutoencoderKLWan(**WAN21_SMALL_CONFIG).eval()
     ref_state = ref_vae.state_dict()
     z = torch.randn(
