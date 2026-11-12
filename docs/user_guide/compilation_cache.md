@@ -19,6 +19,10 @@ export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="/path/to/persistent_cache"
     - **Scope**: Stores PyTorch Dynamo FX graph bytecode, Guard expressions, AOTAutograd tracing artifacts (`torch_compile_cache/torch_aot_compile`), and `TpuCompilerAdaptor` metadata pickle handles (`artifact_compile_range_*`).
     - **Note**: `VLLM_CACHE_ROOT` manages Python framework artifacts and is completely independent of the C++ PJRT compiled binary executables managed by `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`.
 
+3. **`TPU_ARTIFACT_STORE`** (opt-in content-addressed store, under `VLLM_CACHE_ROOT/tpu_artifact_store`):
+    - **Purpose**: Replays a compiled bucket when vLLM's `torch_compile_cache/<hash>` directory misses only because a vLLM env var or a traced file changed. Each artifact is keyed by the TPU compilation hash, vLLM's config hash, the graph fingerprint, the concrete inputs and the per-bucket key.
+    - **Scope**: Hard links to the artifacts in `torch_compile_cache`, so it adds no disk on the run that writes it; it is not evicted. Off by default; see `TPU_ARTIFACT_STORE` in [Environment Variables](../reference/env_vars.md).
+
 ## Compilation Debugging & Telemetry
 
 ### `VLLM_XLA_CHECK_RECOMPILATION` (Runtime Recompilation Detector)

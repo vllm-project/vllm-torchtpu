@@ -254,6 +254,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
+    TPU_ARTIFACT_STORE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -1936,6 +1937,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per host and the others wait for its artifact. Off compiles every bucket
     # on every rank, sharing only through the Tier-2 cache.
     "TPU_PRECOMPILE_PEER_REPLAY": env_bool("TPU_PRECOMPILE_PEER_REPLAY", default=False),
+    # Also keep each compiled bucket in a store keyed by what decides the
+    # program (TPU compilation hash, vLLM's config hash, graph fingerprint,
+    # concrete inputs), not by vLLM's cache directory hash, and replay from it
+    # when that directory misses (see TpuCompilerAdaptor._store_path). Off by
+    # default: the key leaves out vLLM's env vars and traced-file contents, so
+    # its safety rests on custom ops baking in only config values, and the
+    # store has no eviction yet.
+    "TPU_ARTIFACT_STORE": env_bool("TPU_ARTIFACT_STORE", default=False),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
