@@ -22,6 +22,10 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from runner_input_test_utils import (
+    _assert_same_logprobs_lists,
+    _blocking_logprobs_lists,
+)
 from vllm.config import (
     CacheConfig,
     ModelConfig,
@@ -41,7 +45,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
@@ -3616,14 +3619,16 @@ def test_skipping_topk_topp_is_exact_at_the_default_sampling_params(dtype):
     assert not (flat_logits.float().gather(-1, skip.long()) >= fifth).all()
 
 
-@pytest.mark.parametrize("max_logprobs", [0, 3])
+@pytest.mark.parametrize("max_logprobs", [None, 0, 3])
 def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
     monkeypatch, max_logprobs
 ):
-    """The sampled-token logprobs that ride the async output copy equal what
-    the former blocking per-step copy built from the same device tensors
-    (slice to the real rows, .tolists(), concatenate in chunk order), for two
-    decode chunks with padded rows and a discarded request."""
+    """Each decode chunk's gathered logprobs ride the async output copy as one
+    chunk with a row per real request, in chunk order, and the step's
+    logprobs equal what the former blocking per-step copy built from the same
+    device tensors, for two decode chunks with padded rows and a discarded
+    request. Without logprobs requested, nothing is gathered and the output's
+    logprobs stay None."""
     monkeypatch.setattr(
         torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
     )
@@ -3643,8 +3648,8 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
         "from_device_chunks",
         capture_from_device_chunks,
     )
-    torch.manual_seed(0)
-    logits_list = [torch.randn(4, 64), torch.randn(4, 64)]
+    g = torch.Generator().manual_seed(0)
+    logits_list = [torch.randn(4, 64, generator=g), torch.randn(4, 64, generator=g)]
     num_reqs_list = [4, 2]
     req_ids = [f"r{i}" for i in range(6)]
 
@@ -3726,9 +3731,6 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
         return TPUModelRunner.sample_tokens(runner, None)
 
     deferred = run()
-    (chunks,) = captured
-    assert [len(c.row_starts) for c in chunks] == num_reqs_list
-    assert len(gathered) == len(num_reqs_list)
     argmax = [
         [int(t)]
         for logits, n in zip(logits_list, num_reqs_list)
@@ -3736,24 +3738,21 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
     ]
     argmax[1] = []  # r1's token is discarded.
     assert deferred.sampled_token_ids == argmax
-
-    # The former blocking copy in sample_tokens, on the same device tensors.
-    blocking = [
-        LogprobsTensors(
-            t.logprob_token_ids[:n],
-            t.logprobs[:n],
-            t.selected_token_ranks[:n],
-            t.cu_num_generated_tokens,
-        ).tolists()
-        for t, n in zip(gathered, num_reqs_list)
-    ]
+    (chunks,) = captured
+    if max_logprobs is None:
+        assert chunks == [] and gathered == []
+        assert deferred.logprobs is None
+        return
+    # The copied chunks are the gathered device tensors, with one row start
+    # per real request, in chunk order.
+    assert len(chunks) == len(gathered) == len(num_reqs_list)
+    for chunk, tensors, n in zip(chunks, gathered, num_reqs_list):
+        assert chunk.tensors is tensors
+        assert np.array_equal(chunk.row_starts, np.arange(n))
     assert deferred.logprobs.logprob_token_ids.shape == (6, max_logprobs + 1)
-    for field in ("logprob_token_ids", "logprobs", "sampled_token_ranks"):
-        actual = getattr(deferred.logprobs, field)
-        expected = np.concatenate([getattr(lp, field) for lp in blocking])
-        assert actual.dtype == expected.dtype, field
-        assert np.array_equal(actual, expected), field
-    assert deferred.logprobs.cu_num_generated_tokens is None
+    _assert_same_logprobs_lists(
+        deferred.logprobs, _blocking_logprobs_lists(zip(gathered, num_reqs_list))
+    )
 
 
 def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):

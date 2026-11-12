@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import create_sequence_layout_planner
@@ -282,3 +283,34 @@ def _host_copy_state(chunks, lengths, **kwargs):
         copy_ready_event=MagicMock(),
         **kwargs,
     )
+
+
+def _blocking_logprobs_lists(chunks):
+    """Reference for the logprobs of a step without drafts, built the way
+    sample_tokens built them with a blocking copy before the copy was
+    deferred: each `(tensors, num_rows)` chunk sliced to its first
+    `num_rows` rows, `.tolists()`, then concatenated in chunk order."""
+    lists = [
+        LogprobsTensors(
+            t.logprob_token_ids[:n],
+            t.logprobs[:n],
+            t.selected_token_ranks[:n],
+            t.cu_num_generated_tokens,
+        ).tolists()
+        for t, n in chunks
+    ]
+    return LogprobsLists(
+        logprob_token_ids=np.concatenate([lp.logprob_token_ids for lp in lists]),
+        logprobs=np.concatenate([lp.logprobs for lp in lists]),
+        sampled_token_ranks=np.concatenate([lp.sampled_token_ranks for lp in lists]),
+    )
+
+
+def _assert_same_logprobs_lists(actual, expected):
+    """Same rows, values and dtypes, one generated token per request."""
+    assert actual.cu_num_generated_tokens is None
+    assert expected.cu_num_generated_tokens is None
+    for field in ("logprob_token_ids", "logprobs", "sampled_token_ranks"):
+        a, e = getattr(actual, field), getattr(expected, field)
+        assert a.dtype == e.dtype, field
+        assert np.array_equal(a, e), field
