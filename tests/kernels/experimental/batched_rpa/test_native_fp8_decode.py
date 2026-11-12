@@ -128,6 +128,7 @@ def _reference(inp, kv_lens_list):
         kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         decode_query_size=_QLEN,
         native_fp8=native_fp8,
+        tuned_tiles=True,
     )
     out = np.asarray(out[: len(kv_lens_list) * _QLEN].astype(jnp.float32))
     assert not np.isnan(out).any()
