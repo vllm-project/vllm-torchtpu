@@ -55,6 +55,9 @@ _SUBLANES = 16
 _SUBLANES_32 = 8
 # Vocab columns per bias tile (a multiple of 128 lanes).
 TILE_COLS = 3584
+# Most rows (requests) one call takes: two logits slots of this many rows plus
+# the Markov rows stay well inside VMEM. Larger draft buckets keep XLA's loop.
+MAX_ROWS = 64
 
 
 def padded_vocab(vs: int) -> int:
@@ -329,6 +332,7 @@ def markov_argmax(
       start  [1] int32           global id of this rank's first vocab column
     """
     rows, k, width = logits.shape
+    assert rows <= MAX_ROWS, (rows, MAX_ROWS)
     assert width == vs, (width, vs)
     vp, rank_dim = w2p.shape
     assert vp == padded_vocab(vs), (vp, vs)

@@ -292,6 +292,7 @@ class DSparkProposer(DFlashProposer):
         if (
             vocab_parallel
             and self._fused_markov
+            and padded_num_reqs <= self.draft_model.fused_markov_max_rows
             and not self.use_confidence_head
         ):
             # TPU_DSPARK_MARKOV_KERNEL reads request-major [rows, k, vs]

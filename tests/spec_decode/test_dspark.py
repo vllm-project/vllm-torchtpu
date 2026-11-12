@@ -346,6 +346,8 @@ class _FakeShardDraft(_FakeDraft):
     def compute_draft_logits_shard(self, hidden):
         return self.compute_draft_logits(hidden).to(torch.bfloat16)
 
+    fused_markov_max_rows = 2
+
     def markov_draft_fused(self, logits_3d, prev):
         self.fused_calls.append((logits_3d.shape, prev.tolist()))
         return torch.full((logits_3d.shape[0], logits_3d.shape[1]), 11, dtype=torch.int64)
@@ -386,6 +388,13 @@ def test_fused_markov_replaces_the_chain():
     # [rows, k, vocab shard] logits and the anchors seed the chain.
     assert p.draft_model.fused_calls == [(torch.Size([2, 3, 16]), [5, 9])]
     assert hidden.shape == (6, 2)
+    # A bucket past the kernel's row cap keeps the loop.
+    p.draft_model.fused_markov_max_rows = 1
+    p.draft_model.markov_argmax_shard = lambda lg, e: (lg.float()).argmax(-1)
+    drafts, _ = forward(p, input_ids, positions, 3)
+    assert drafts.tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert len(p.draft_model.fused_calls) == 1
+    p.draft_model.fused_markov_max_rows = 2
     # The confidence head needs the per-step embeddings: the loop runs.
     p.use_confidence_head = True
     p.draft_model.markov_argmax_shard = lambda lg, e: (lg.float()).argmax(-1)
