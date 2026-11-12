@@ -20,13 +20,18 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+import vllm.model_executor.models.utils as vllm_utils
 from transformers import Qwen3OmniMoeAudioEncoderConfig
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeVisionEncoderConfig,
 )
+from vllm_omni.model_executor.models.qwen3_omni import (
+    qwen3_omni_moe_thinker as thinker_mod,
+)
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3Omni_VisionTransformer,
     Qwen3OmniMoeAudioEncoder,
+    Qwen3OmniMoeThinkerForConditionalGeneration,
     _get_feat_extract_output_lengths,
 )
 
@@ -37,6 +42,7 @@ from tests_omni.omni_test_utils import (
 )
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_STATIC_BUCKETING_PATCHED,
+    _MM_MERGE_STATIC_PATCHED,
     _VIT_STATIC_BUCKETING_PATCHED,
     _pad_rows,
     maybe_patch_qwen3_omni_thinker,
@@ -136,6 +142,7 @@ def encoders(
 
     audio_cls = Qwen3OmniMoeAudioEncoder
     vit_cls = Qwen3Omni_VisionTransformer
+    thinker_cls = Qwen3OmniMoeThinkerForConditionalGeneration
     upstream_forward = audio_cls.forward
     assert not getattr(upstream_forward, _AUDIO_STATIC_BUCKETING_PATCHED, False)
     audio_own = {
@@ -148,11 +155,17 @@ def encoders(
         )
     }
     vit_own = {n: vit_cls.__dict__.get(n) for n in ("forward", "_tpu_orig_forward")}
+    thinker_cls_own = {n: thinker_cls.__dict__.get(n) for n in ("embed_input_ids",)}
+    orig_vllm_merge = vllm_utils._merge_multimodal_embeddings
+    orig_thinker_merge = thinker_mod._merge_multimodal_embeddings
+    orig_check_interleaved = thinker_mod.check_interleaved_audio_video
+    orig_merge_interleaved = thinker_mod.merge_interleaved_embeddings
     try:
         config = SimpleNamespace(architectures=["Qwen3OmniMoeForConditionalGeneration"])
         assert maybe_patch_qwen3_omni_thinker(config) is True
         assert getattr(audio_cls.forward, _AUDIO_STATIC_BUCKETING_PATCHED, False)
         assert getattr(vit_cls.forward, _VIT_STATIC_BUCKETING_PATCHED, False)
+        assert getattr(thinker_cls.embed_input_ids, _MM_MERGE_STATIC_PATCHED, False)
         assert audio_cls._tpu_orig_forward is upstream_forward
 
         torch.manual_seed(0)
@@ -169,13 +182,21 @@ def encoders(
         tpu = tpu.to(torch.device("tpu")).to(torch.bfloat16)
         yield tpu, cpu, upstream_forward
     finally:
-        for cls, own in ((audio_cls, audio_own), (vit_cls, vit_own)):
+        for cls, own in (
+            (audio_cls, audio_own),
+            (vit_cls, vit_own),
+            (thinker_cls, thinker_cls_own),
+        ):
             for name, value in own.items():
                 if value is None:
                     if name in cls.__dict__:
                         delattr(cls, name)
                 else:
                     setattr(cls, name, value)
+        vllm_utils._merge_multimodal_embeddings = orig_vllm_merge
+        thinker_mod._merge_multimodal_embeddings = orig_thinker_merge
+        thinker_mod.check_interleaved_audio_video = orig_check_interleaved
+        thinker_mod.merge_interleaved_embeddings = orig_merge_interleaved
 
 
 @pytest.mark.xfail(
@@ -344,3 +365,35 @@ def test_vision_encoder_matches_cpu_reference(
         * (1 + len(VISION_CONFIG.deepstack_visual_indexes)),
     )
     _check(out, reference, f"vision encoder {grid}", (2e-2, 1.5e-2))
+
+
+def test_multimodal_merge_on_tpu_matches_cpu_reference(encoders) -> None:
+    """Patched static multimodal merge on TPU matches index-masked CPU reference."""
+    tpu_dev = torch.device("tpu")
+    is_video = torch.tensor([False, True, True, False, False, False], dtype=torch.bool)
+    is_audio = torch.tensor([False, False, False, False, True, False], dtype=torch.bool)
+    base_embeds = torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.bfloat16)
+    visual_embeds = torch.tensor(
+        [[10.0, 20.0, 30.0, 40.0], [50.0, 60.0, 70.0, 80.0]], dtype=torch.bfloat16
+    )
+    audio_embeds = torch.tensor([[90.0, 100.0, 110.0, 120.0]], dtype=torch.bfloat16)
+
+    expected = base_embeds.clone()
+    expected[1:3] = visual_embeds
+    expected[4:5] = audio_embeds
+
+    from vllm.multimodal.utils import set_mm_embedding_modality
+
+    is_mm = is_video | is_audio
+    merged_tpu = thinker_mod.merge_interleaved_embeddings(
+        inputs_embeds=base_embeds.to(tpu_dev),
+        multimodal_embeddings=[
+            set_mm_embedding_modality(visual_embeds.to(tpu_dev), "video"),
+            set_mm_embedding_modality(audio_embeds.to(tpu_dev), "audio"),
+        ],
+        is_video=is_video.to(tpu_dev),
+        is_audio=is_audio.to(tpu_dev),
+        is_multimodal=is_mm.to(tpu_dev),
+    )
+    assert merged_tpu.device.type == "tpu"
+    assert torch.equal(merged_tpu.cpu(), expected)

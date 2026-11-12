@@ -13,9 +13,12 @@
 # limitations under the License.
 """TPU model runner for autoregressive vLLM-Omni stages."""
 
-from typing import Any, Protocol, cast
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import torch
+from vllm.multimodal.utils import copy_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
@@ -27,6 +30,9 @@ from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     maybe_patch_qwen3_omni_thinker,
 )
 from vllm_torchtpu.omni.worker.tpu_model_runner import OmniTPUModelRunner
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 # Model capability flags that ``GPUARModelRunner`` reads (through
 # ``_model_omni_flag``) to drive the per-step preprocess / postprocess hooks.
@@ -65,6 +71,7 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self._omni_mm_embeds_list: list[torch.Tensor] = []
         if needs_omni_connector(self.model_config):
             raise NotImplementedError(
                 f"Stage {self.stage_id} ({self.model_stage!r}) needs inter-stage Omni "
@@ -96,6 +103,57 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
                 "talker's multi-token prediction), which TPUARModelRunner does not "
                 "run yet."
             )
+
+    def _gather_mm_embeddings(
+        self,
+        scheduler_output: SchedulerOutput,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Cache mixed-width multimodal embeddings and return 1D row-index ranges.
+
+        Audio embeddings (width 2048) and DeepStack vision embeddings (width
+        8192) cannot be concatenated along dim 0 by ``TPUModelRunner.execute_model``.
+        We cache the per-item embedding tensors in ``_omni_mm_embeds_list`` and
+        return a 1D row-index range ``[torch.arange(total)]`` so ``execute_model``
+        slices row indices per prefill chunk and ``_get_model_inputs`` reconstructs
+        the corresponding per-chunk embedding views with ``.modality`` preserved.
+        """
+        mm_embeds, is_multimodal = super()._gather_mm_embeddings(
+            scheduler_output, *args, **kwargs
+        )
+        self._omni_mm_embeds_list = list(mm_embeds)
+        if mm_embeds:
+            total = sum(embed.shape[0] for embed in mm_embeds)
+            return [torch.arange(total, dtype=torch.int64)], is_multimodal
+        return mm_embeds, is_multimodal
+
+    def _get_model_inputs(
+        self,
+        input_ids: torch.Tensor,
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if mm_embed_inputs is not None:
+            chunk_embeds, is_multimodal = mm_embed_inputs
+            mm_embeds = self._omni_mm_embeds_list
+            if chunk_embeds and mm_embeds and chunk_embeds[0].ndim == 1:
+                chunk_start = int(chunk_embeds[0][0])
+                chunk_end = chunk_start + chunk_embeds[0].shape[0]
+                sliced_embeds: list[torch.Tensor] = []
+                offset = 0
+                for embed in mm_embeds:
+                    rows = embed.shape[0]
+                    start = max(0, chunk_start - offset)
+                    end = min(rows, chunk_end - offset)
+                    if start < end:
+                        sliced = embed[start:end]
+                        copy_mm_embedding_modality(embed, sliced)
+                        sliced_embeds.append(sliced)
+                    offset += rows
+                if chunk_end >= offset:
+                    self._omni_mm_embeds_list.clear()
+                mm_embed_inputs = (sliced_embeds, is_multimodal)
+        return super()._get_model_inputs(input_ids, mm_embed_inputs)
 
     def forward_model(
         self,

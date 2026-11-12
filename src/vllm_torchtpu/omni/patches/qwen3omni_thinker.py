@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU patches for the Qwen3-Omni Thinker audio and vision encoders.
+"""TPU patches for the Qwen3-Omni Thinker encoders and multimodal merge.
 
 1. Audio encoder chunk-length math and static-shape bucketing:
    In vLLM-Omni 0.32.0rc1, ``Qwen3OmniMoeAudioEncoder.forward`` splits the mel
@@ -44,6 +44,12 @@
    ``forward_with_encoder_metadata``, keeping 3-int ``grid_thw`` metadata on
    CPU and all weights, submodules, and activations on TPU.
 
+3. Multimodal embedding merge:
+   Pads flattened multimodal embeddings to ``inputs_embeds.shape[0]`` for XLA
+   static shapes while keeping ``multimodal_embeddings`` on TPU and moving only
+   1D boolean masks (``is_video``, ``is_audio``, ``is_multimodal``) to CPU
+   where upstream GPU already indexes on host.
+
 Applied from ``TPUARModelRunner.load_model`` for
 ``Qwen3OmniMoeForConditionalGeneration`` before the stage model is loaded
 (kept outside ``patch_registry.PATCHES`` until Omni patches have a dedicated
@@ -52,8 +58,9 @@ registration hook; see #1862).
 TODO: remove the ``test_upstream_forward_miscounts_exact_window_multiples``
 canary in ``tests_omni/models/qwen3_omni/test_qwen3_omni_components.py`` once
 vLLM-Omni is bumped to 0.33.0rc1 or later (#2910 / vllm-omni#9010); keep the
-static-shape bucketing in ``_padded_forward_with_encoder_metadata`` and
-``_padded_vit_forward`` until upstream buckets multimodal encoder shapes on TPU.
+static-shape bucketing in ``_padded_forward_with_encoder_metadata``,
+``_padded_vit_forward``, and ``_omni_merge`` until upstream buckets multimodal
+encoder shapes on TPU.
 """
 
 from __future__ import annotations
@@ -75,9 +82,10 @@ logger = init_logger(__name__)
 
 _QWEN3_OMNI_ARCH = "Qwen3OmniMoeForConditionalGeneration"
 
-# Idempotence markers on the wrapped ``forward`` methods.
+# Idempotence markers on wrapped methods and functions.
 _AUDIO_STATIC_BUCKETING_PATCHED = "_tpu_audio_static_bucketing_patched"
 _VIT_STATIC_BUCKETING_PATCHED = "_tpu_vit_static_bucketing_patched"
+_MM_MERGE_STATIC_PATCHED = "_tpu_mm_merge_static_patched"
 
 # Each 100-frame window (n_window * 2) is 1 s of 16 kHz audio. A single
 # 32-window bucket (32 s -> 512 padded tokens) covers
@@ -370,29 +378,214 @@ def _patch_vision_encoder(vit_cls: type[Any]) -> bool:
     return True
 
 
+def _patch_mm_merge_and_embed_input_ids(thinker_mod: Any) -> bool:
+    """Install static-shape multimodal embedding merge and ``embed_input_ids``."""
+    import vllm.model_executor.models.utils as vllm_utils
+    from vllm.multimodal.utils import get_mm_embedding_modalities
+
+    from vllm_torchtpu import _patch_vllm_merge_multimodal_embeddings
+
+    patched = False
+
+    # First call installs static_merge_multimodal_embeddings on vllm_utils so
+    # base_merge captures the static-indexing implementation; the second call
+    # after rebinding vllm_utils._merge_multimodal_embeddings propagates
+    # _omni_merge across all already-imported vllm.model_executor.models.* modules.
+    _patch_vllm_merge_multimodal_embeddings()
+    base_merge = vllm_utils._merge_multimodal_embeddings
+    if not getattr(base_merge, _MM_MERGE_STATIC_PATCHED, False):
+
+        def _omni_merge(
+            inputs_embeds: torch.Tensor,
+            multimodal_embeddings: Any,
+            is_multimodal: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            sync_inputs: list[torch.Tensor] = []
+            if len(multimodal_embeddings) > 0:
+                flat = vllm_utils._flatten_embeddings(multimodal_embeddings)
+                if 0 < flat.shape[0] < inputs_embeds.shape[0]:
+                    flat = _pad_rows(flat, inputs_embeds.shape[0])
+                if flat.device.type == "tpu":
+                    flat = flat.contiguous()
+                    sync_inputs.append(flat)
+                multimodal_embeddings = [flat]
+            if is_multimodal is not None:
+                is_multimodal = is_multimodal.to(inputs_embeds.device)
+                if is_multimodal.device.type == "tpu":
+                    sync_inputs.append(is_multimodal)
+            if inputs_embeds.device.type == "tpu":
+                sync_inputs.append(inputs_embeds)
+            # Cut the deferred TorchTPU graph before and after base_merge so
+            # the static-padded (num_tokens, D) merge compiles once per token
+            # bucket rather than fusing with variable-row-count producers.
+            if sync_inputs:
+                synchronize_tensors(sync_inputs, wait=False)
+            merged = base_merge(inputs_embeds, multimodal_embeddings, is_multimodal)
+            if merged.device.type == "tpu":
+                synchronize_tensors(merged, wait=False)
+            return merged
+
+        setattr(_omni_merge, _MM_MERGE_STATIC_PATCHED, True)
+        vllm_utils._merge_multimodal_embeddings = _omni_merge
+        _patch_vllm_merge_multimodal_embeddings()
+        patched = True
+
+    active_merge = vllm_utils._merge_multimodal_embeddings
+    if thinker_mod._merge_multimodal_embeddings is not active_merge:
+        thinker_mod._merge_multimodal_embeddings = active_merge
+        patched = True
+
+    orig_check = thinker_mod.check_interleaved_audio_video
+    if not getattr(orig_check, _MM_MERGE_STATIC_PATCHED, False):
+
+        def _check_interleaved(
+            is_video: torch.Tensor,
+            is_audio: torch.Tensor,
+            num_videos: int,
+            num_audios: int,
+        ) -> bool:
+            if not num_videos or not num_audios:
+                return False
+            # Matches upstream GPU path (`input_ids.cpu()` before span check).
+            return orig_check(is_video.cpu(), is_audio.cpu(), num_videos, num_audios)
+
+        setattr(_check_interleaved, _MM_MERGE_STATIC_PATCHED, True)
+        thinker_mod.check_interleaved_audio_video = _check_interleaved
+        patched = True
+
+    if not getattr(
+        thinker_mod.merge_interleaved_embeddings, _MM_MERGE_STATIC_PATCHED, False
+    ):
+        # Adapted from merge_interleaved_embeddings in
+        # vllm/model_executor/models/qwen2_5_omni_thinker.py (vllm==0.33.0) and
+        # vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_moe_thinker.py
+        # (vllm-omni==0.32.0rc1 and 0.33.0rc1). Changes from upstream:
+        # 1. Moves 1D boolean masks (is_video, is_audio, is_multimodal) to CPU
+        #    and derives is_image_cpu = is_multimodal & ~is_video & ~is_audio.
+        # 2. Replaces boolean masked assignment (inputs_embeds[mask] = embeds)
+        #    with per-modality calls to thinker_mod._merge_multimodal_embeddings
+        #    in the upstream (video, audio, image) order so each merge uses
+        #    static cumsum + gather indexing on TPU.
+        # Can be removed once upstream merge_interleaved_embeddings delegates to
+        # _merge_multimodal_embeddings instead of indexing with boolean masks.
+        def _merge_interleaved(
+            inputs_embeds: torch.Tensor,
+            multimodal_embeddings: Any,
+            is_video: torch.Tensor,
+            is_audio: torch.Tensor,
+            is_multimodal: torch.Tensor,
+        ) -> torch.Tensor:
+            is_video_cpu = is_video.cpu()
+            is_audio_cpu = is_audio.cpu()
+            is_image_cpu = is_multimodal.cpu() & ~is_video_cpu & ~is_audio_cpu
+            modalities = get_mm_embedding_modalities(multimodal_embeddings)
+            for modality_mask, modality_name in (
+                (is_video_cpu, "video"),
+                (is_audio_cpu, "audio"),
+                (is_image_cpu, "image"),
+            ):
+                modality_embeds = [
+                    embed
+                    for embed, mod in zip(multimodal_embeddings, modalities)
+                    if mod == modality_name
+                ]
+                num_expected_tokens = int(modality_mask.sum().item())
+                num_actual_tokens = sum(embed.shape[0] for embed in modality_embeds)
+                if num_actual_tokens != num_expected_tokens:
+                    raise ValueError(
+                        f"Attempted to assign {num_actual_tokens} {modality_name} "
+                        f"tokens to {num_expected_tokens} placeholders"
+                    )
+                if modality_embeds:
+                    inputs_embeds = thinker_mod._merge_multimodal_embeddings(
+                        inputs_embeds, modality_embeds, modality_mask
+                    )
+            return inputs_embeds
+
+        setattr(_merge_interleaved, _MM_MERGE_STATIC_PATCHED, True)
+        thinker_mod.merge_interleaved_embeddings = _merge_interleaved
+        patched = True
+
+    thinker_cls = thinker_mod.Qwen3OmniMoeThinkerForConditionalGeneration
+    if not getattr(thinker_cls.embed_input_ids, _MM_MERGE_STATIC_PATCHED, False):
+        orig_embed_input_ids = thinker_cls.embed_input_ids
+
+        # Adapted from Qwen3OmniMoeThinkerForConditionalGeneration.embed_input_ids
+        # in vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_moe_thinker.py
+        # (vllm-omni==0.32.0rc1 and 0.33.0rc1).
+        def _patched_embed_input_ids(
+            self: Any,
+            input_ids: torch.Tensor,
+            multimodal_embeddings: Any = None,
+            *,
+            is_multimodal: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            cleared_deepstack = (
+                self.use_deepstack and self.deepstack_input_embeds_num_tokens > 0
+            )
+            if cleared_deepstack:
+                self._clear_deepstack_input_embeds(
+                    self.deepstack_input_embeds_num_tokens
+                )
+            if multimodal_embeddings:
+                multimodal_embeddings = list(multimodal_embeddings)
+            # Matches GPUModelRunner, where `is_mm_embed` stays on CPU so
+            # `torch.nonzero(is_multimodal)` runs on host while embeddings
+            # stay on device.
+            if is_multimodal is not None and is_multimodal.device.type != "cpu":
+                is_multimodal = is_multimodal.cpu()
+            out = orig_embed_input_ids(
+                self,
+                input_ids,
+                multimodal_embeddings=multimodal_embeddings,
+                is_multimodal=is_multimodal,
+            )
+            # Cut the deferred TorchTPU graph after embed_input_ids (including
+            # any updated deepstack_input_embeds buffers) so the embedding and
+            # deepstack scatter stays isolated at the static token bucket size.
+            if (
+                (multimodal_embeddings or cleared_deepstack)
+                and isinstance(out, torch.Tensor)
+                and out.device.type == "tpu"
+            ):
+                sync_tensors = [out]
+                if self.use_deepstack and (
+                    self.deepstack_input_embeds_num_tokens > 0 or cleared_deepstack
+                ):
+                    sync_tensors.extend(self.deepstack_input_embeds)
+                synchronize_tensors(sync_tensors, wait=False)
+            return out
+
+        setattr(_patched_embed_input_ids, _MM_MERGE_STATIC_PATCHED, True)
+        thinker_cls.embed_input_ids = _patched_embed_input_ids
+        patched = True
+
+    return patched
+
+
 def maybe_patch_qwen3_omni_thinker(
     model_config: ModelConfig | None = None,
 ) -> bool:
-    """Apply TPU static-shape bucketing to Qwen3-Omni audio and vision encoders.
+    """Apply TPU patches for Qwen3-Omni Thinker encoders and multimodal merge.
 
     Applies to ``Qwen3OmniMoeForConditionalGeneration`` only, matched
     literally in ``ModelConfig.architectures`` (the pipeline ``model_arch``
     vLLM-Omni gives every Qwen3-Omni stage). Returns ``True`` when the
-    vLLM-Omni encoder classes are newly patched, and ``False`` when the
-    config does not match or the classes are already patched.
+    vLLM-Omni thinker classes/functions are newly patched, and ``False``
+    when the config does not match or everything is already patched.
     """
     if model_config is None or _QWEN3_OMNI_ARCH not in model_config.architectures:
         return False
 
-    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
-        Qwen3Omni_VisionTransformer,
-        Qwen3OmniMoeAudioEncoder,
+    from vllm_omni.model_executor.models.qwen3_omni import (
+        qwen3_omni_moe_thinker as thinker_mod,
     )
 
-    patched = _patch_audio_encoder(Qwen3OmniMoeAudioEncoder)
-    patched = _patch_vision_encoder(Qwen3Omni_VisionTransformer) or patched
+    patched = _patch_audio_encoder(thinker_mod.Qwen3OmniMoeAudioEncoder)
+    patched = _patch_vision_encoder(thinker_mod.Qwen3Omni_VisionTransformer) or patched
+    patched = _patch_mm_merge_and_embed_input_ids(thinker_mod) or patched
     if patched:
         logger.info(
-            "Applied TPU patch: Qwen3-Omni audio and vision encoder static bucketing."
+            "Applied TPU patch: Qwen3-Omni Thinker encoders and multimodal merge."
         )
     return patched
