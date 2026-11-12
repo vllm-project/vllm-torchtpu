@@ -123,6 +123,7 @@ def _async_draft_seed_impl(
     num_draft: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_reqs: torch.Tensor,
+    seed_override: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Async draft seed from the on-device rejection-sampler output, as one
     program per request-padding bucket instead of ~15 eager ones.
@@ -135,6 +136,11 @@ def _async_draft_seed_impl(
     `(last_token_indices int64, next_token_ids int32, num_rejected int32)`,
     all `[width]`; padding rows repeat the last real request's seed position
     and token and report no rejections.
+
+    `seed_override` (VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL): `[width]` int32, the
+    seed token of each partial-prefill request (its known next prompt token)
+    and -1 elsewhere. It replaces the sampled token before the padding rows
+    copy the last real request, as the eager path does.
     """
     width = next_tokens.shape[0]
     num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1)
@@ -148,6 +154,9 @@ def _async_draft_seed_impl(
     if qsl_end.shape[0] < width:
         qsl_end = torch.cat([qsl_end, qsl_end[-1:].expand(width - qsl_end.shape[0])])
     last_token_indices = qsl_end - 1 - num_rejected.to(torch.int64)
+    if seed_override is not None:
+        seed_override = seed_override[:width].to(torch.int32)
+        next_token_ids = torch.where(seed_override >= 0, seed_override, next_token_ids)
     valid = torch.arange(width, device=next_tokens.device) < num_reqs
     last = (num_reqs - 1).view(1)
     last_token_indices = torch.where(
@@ -173,6 +182,7 @@ def _async_seed_inputs_impl(
     input_ids: torch.Tensor,
     p: int,
     num_rows: int = 0,
+    seed_override: torch.Tensor | None = None,
 ):
     """`_async_draft_seed_impl`, the eagle3 input shift + seed scatter
     (`Eagle3Proposer._draft_seed_input_ids`) and the loop-bucket pad of the
@@ -181,7 +191,7 @@ def _async_seed_inputs_impl(
     (the chunk's request capacity) also step 0's `draft_rows` and the
     loop's padded rejected counts, so neither is padded eagerly."""
     last_token_indices, next_token_ids, num_rejected = _async_draft_seed_impl(
-        next_tokens, num_draft, query_start_loc, num_reqs
+        next_tokens, num_draft, query_start_loc, num_reqs, seed_override
     )
     shifted = input_ids
     if input_ids.shape[0] > 1:
@@ -207,7 +217,7 @@ _async_seed_inputs_compiled = _static_shape_args(
 )
 
 
-def _async_draft_seed(*args: torch.Tensor):
+def _async_draft_seed(*args: torch.Tensor | None):
     # The tpu backend cannot trace CPU tensors (unit tests).
     fn = (
         _async_draft_seed_compiled
@@ -215,6 +225,22 @@ def _async_draft_seed(*args: torch.Tensor):
         else _async_draft_seed_impl
     )
     return fn(*args)
+
+
+def _async_seed_inputs(next_tokens: torch.Tensor, *args):
+    """`_async_seed_inputs_compiled` on TPU, the eager impl on CPU (tests)."""
+    fn = (
+        _async_seed_inputs_compiled
+        if next_tokens.device.type == "tpu"
+        else _async_seed_inputs_impl
+    )
+    return fn(next_tokens, *args)
+
+
+def _fused_seed_device(t: torch.Tensor) -> bool:
+    """Whether `t`'s device runs the fused async seed program (TPU only;
+    unit tests patch this to drive the fused path on CPU)."""
+    return t.device.type == "tpu"
 
 
 if TYPE_CHECKING:
@@ -2207,11 +2233,23 @@ class Eagle3Proposer:
                     for rid in req_ids
                 ]
                 num_draft_full = torch.from_numpy(num_draft_np).to(runner.device)
+            # VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL: the partial-prefill seeds
+            # enter the fused programs as an override vector, so a mixed step
+            # keeps them. Always passed while the flag is on (all -1 without a
+            # partial prefill): one program variant per warmed key.
+            seed_override = None
             if (
-                not ov_i
+                envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED
+                and envs.VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL
+            ):
+                seed_override = self._seed_override(
+                    ov_i, req_ids, scheduler_output, width
+                )
+            if (
+                (not ov_i or seed_override is not None)
                 and envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED
                 and envs.VLLM_TPU_DRAFT_SEED_FUSED
-                and nt.device.type == "tpu"
+                and _fused_seed_device(nt)
             ):
                 # Seed, input shift/scatter and gather pad in one program.
                 extras = (
@@ -2220,7 +2258,7 @@ class Eagle3Proposer:
                     and chunk.sequence_layout_plan.descriptor
                     == DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
                 )
-                seed_out = _async_seed_inputs_compiled(
+                seed_out = _async_seed_inputs(
                     nt,
                     num_draft_full,
                     chunk.attn_ctx.query_start_loc,
@@ -2231,6 +2269,7 @@ class Eagle3Proposer:
                     chunk.input_ids,
                     self._loop_bucket(num_reqs),
                     self._draft_rows_len(chunk) if extras else 0,
+                    seed_override,
                 )
                 draft_input_ids, gather_indices, num_rejected_out = seed_out[:3]
                 if extras:
@@ -2245,6 +2284,7 @@ class Eagle3Proposer:
                         gather_indices,
                         num_rejected_out,
                         self._seed_extras.get(id(chunk)),
+                        seed_override,
                     )
                 draft_input_ids, gather_indices = (
                     chunk.sequence_layout_plan.localize_token_tensor_and_gather_indices(
@@ -2259,7 +2299,9 @@ class Eagle3Proposer:
                     gather_indices,
                     num_rejected_out,
                 )
-            if not ov_i and envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED:
+            if (
+                not ov_i or seed_override is not None
+            ) and envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED:
                 # Unsliced inputs: slicing inside the program keeps the views
                 # from materializing as their own eager programs.
                 last_token_indices, next_token_ids, num_rejected_out = (
@@ -2271,6 +2313,7 @@ class Eagle3Proposer:
                             ("num_reqs", num_reqs),
                             lambda: torch.tensor(num_reqs, dtype=torch.int64),
                         ),
+                        seed_override,
                     )
                 )
             else:
@@ -2445,6 +2488,32 @@ class Eagle3Proposer:
 
         return (draft_input_ids, chunk.position_ids, gather_indices, num_rejected_out)
 
+    def _seed_override(
+        self, ov_i: list[int], req_ids, scheduler_output, width: int
+    ) -> torch.Tensor:
+        """`[width]` int32 seed override of the fused async seed
+        (VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL): each partial-prefill request's
+        next prompt token, the value the eager path scatters, and -1 for every
+        other row. Without a partial prefill it is a cached all -1 constant."""
+        if not ov_i:
+            return self._device_constant(
+                ("seed_override_none", width),
+                lambda: torch.full((width,), -1, dtype=torch.int32),
+            )
+        runner = self.runner
+        ov_np = np.full(width, -1, dtype=np.int32)
+        for i in ov_i:
+            req_state = runner.requests[req_ids[i]]
+            seq_len = (
+                req_state.num_computed_tokens
+                + scheduler_output.num_scheduled_tokens[req_ids[i]]
+            )
+            token = int(req_state.get_token_id(seq_len))
+            # -1 is the no-override marker; a prompt token is never negative.
+            assert token >= 0, (req_ids[i], seq_len, token)
+            ov_np[i] = token
+        return torch.from_numpy(ov_np).to(runner.device)
+
     def _check_seed_fused(
         self,
         nt: torch.Tensor,
@@ -2455,6 +2524,7 @@ class Eagle3Proposer:
         gather_indices: torch.Tensor,
         num_rejected: torch.Tensor,
         extras: tuple[torch.Tensor, torch.Tensor] | None = None,
+        seed_override: torch.Tensor | None = None,
     ) -> None:
         """VLLM_TPU_VERIFY_FUSED_CHECK for the fused draft seed: rerun the
         separate seed, scatter and pad on the same inputs and count mismatching
@@ -2464,7 +2534,7 @@ class Eagle3Proposer:
             ("num_reqs", num_reqs), lambda: torch.tensor(num_reqs, dtype=torch.int64)
         )
         lti, nti, nrej = _async_draft_seed(
-            nt, num_draft, chunk.attn_ctx.query_start_loc, n_dev
+            nt, num_draft, chunk.attn_ctx.query_start_loc, n_dev, seed_override
         )
         ref_ids = self._draft_seed_input_ids(chunk.input_ids, lti, nti)
         p = self._loop_bucket(num_reqs)
@@ -3209,8 +3279,15 @@ class Eagle3Proposer:
                                 if self._draft_rows and envs.VLLM_TPU_DRAFT_SEED_EXTRAS
                                 else 0
                             )
+                            ov = (
+                                torch.full((width,), -1, dtype=torch.int32).to(
+                                    runner.device
+                                )
+                                if envs.VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL
+                                else None
+                            )
                             out = _async_seed_inputs_compiled(
-                                nt, nd, qsl, n_dev, ids, p, num_rows
+                                nt, nd, qsl, n_dev, ids, p, num_rows, ov
                             )
                             synchronize_tensors(out)
 
