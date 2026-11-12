@@ -295,8 +295,9 @@ def test_aggregate_aligns_prefiller_pool_order_to_decoder_mesh_rank(
         seen["decoder_tp_rank"] = tp_rank
         return types.SimpleNamespace(rank=8)
 
-    def fake_prefiller(cfg, presharded, draft, *, tp_rank, compute_logits):
+    def fake_prefiller(cfg, presharded, draft, *, tp_rank, compute_logits, serial):
         seen["prefiller_tp_rank"] = tp_rank
+        seen["prefiller_serial"] = serial
         return types.SimpleNamespace(rank=8)
 
     monkeypatch.setattr(
@@ -306,7 +307,11 @@ def test_aggregate_aligns_prefiller_pool_order_to_decoder_mesh_rank(
     monkeypatch.setattr(prefill_mod, "KimiPrefiller", fake_prefiller)
     engine = KimiAggregate(_engine_config(), tmp_path, tp_rank=0)
     assert engine.rank == 8
-    assert seen == {"decoder_tp_rank": 0, "prefiller_tp_rank": 8}
+    assert seen == {
+        "decoder_tp_rank": 0,
+        "prefiller_tp_rank": 8,
+        "prefiller_serial": True,
+    }
 
 
 def test_aggregate_needs_one_shared_ep16_expert_copy(monkeypatch, tmp_path):
