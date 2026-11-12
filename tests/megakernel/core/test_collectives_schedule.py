@@ -96,8 +96,8 @@ def _ring_outputs(
     returns the step's primitive histogram (`prim_counts`) instead of the rows.
     With `fills`, every all-reduce gets a `fill` that appends its slot (at
     trace time) and zeroes a spare buffer. With `arp`, slot 1 is the ARPIPE
-    deferred all-reduce: primed, its other half added before the next slot-0
-    all-reduce and after the last step. With `ar0`, slot 0 is the AR0S
+    deferred all-reduce: primed, its other half added before every slot-0
+    all-reduce (as a layer's input projection would) and after the last step. With `ar0`, slot 0 is the AR0S
     all-reduce: its payload is packed and sent from `ar0_spec`'s column-group
     hooks (fed the partial's columns, as an output projection would) and
     finished by `ar0_finish`.
@@ -151,7 +151,10 @@ def _ring_outputs(
             if arp and slot == 1:
                 assert ar.allreduce(slot, src, first, fill=fill, defer=True) is None
                 continue
-            if arp and step_idx > 0:
+            if ar0 and slot == 1:
+                ar.add_residual(ar.allreduce(slot, src, first, fill=fill))
+                continue
+            if arp:  # slot 0: the deferred half (layer 0: the primed zeros)
                 ar.arp_round2_add()
             if ar0:  # slot 0
                 spec = ar.ar0_spec(0, first)
