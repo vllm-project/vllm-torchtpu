@@ -27,7 +27,9 @@ from typing import Any
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -85,6 +87,9 @@ def apply_omni_model_specific_patches() -> None:
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
     _patch_wan_vae_conv_out_lane_padding()
+    _patch_wan_vae_halo_allgather()
+    _patch_distributed_vae_host_metadata_collectives()
+    _patch_wan_vae_replicated_encode()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -701,3 +706,302 @@ def _patch_wan_vae_conv_out_lane_padding() -> None:
     logger.info(
         "Applied TPU patch: lane-dense output padding for the Wan VAE conv_out."
     )
+
+
+# Keyword-only parameters of vLLM-Omni wan_spatial_shard._halo_exchange_p2p.
+_HALO_EXCHANGE_P2P_PARAMS = (
+    "rank",
+    "world_size",
+    "group",
+    "top_row_ref",
+    "bottom_row_ref",
+    "recv_top_buf",
+    "recv_bottom_buf",
+)
+
+
+def _patch_wan_vae_halo_allgather() -> None:
+    # TODO: Remove once wan_spatial_shard uses collective halo exchange on TPU.
+    if not envs.VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES:
+        return
+
+    try:
+        from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
+    except ImportError:
+        # Installs without the Wan VAE spatial-shard module: nothing to patch.
+        return
+
+    if hasattr(wan_spatial_shard, "_tpu_orig_halo_exchange_p2p"):
+        return
+    orig_halo_exchange_p2p = getattr(wan_spatial_shard, "_halo_exchange_p2p", None)
+    if orig_halo_exchange_p2p is None:
+        logger.warning(
+            "Skipping TPU patch: vLLM-Omni wan_spatial_shard has no "
+            "_halo_exchange_p2p; update "
+            "vllm_torchtpu.omni.patches._patch_wan_vae_halo_allgather."
+        )
+        return
+    import inspect
+
+    params = tuple(inspect.signature(orig_halo_exchange_p2p).parameters)
+    if params != _HALO_EXCHANGE_P2P_PARAMS:
+        logger.warning(
+            "Skipping TPU patch: vLLM-Omni wan_spatial_shard._halo_exchange_p2p "
+            "has parameters %s, expected %s; update "
+            "vllm_torchtpu.omni.patches._patch_wan_vae_halo_allgather.",
+            params,
+            _HALO_EXCHANGE_P2P_PARAMS,
+        )
+        return
+    wan_spatial_shard._tpu_orig_halo_exchange_p2p = orig_halo_exchange_p2p
+
+    def _halo_exchange_allgather(
+        *,
+        rank: int,
+        world_size: int,
+        group: Any,
+        top_row_ref: torch.Tensor,
+        bottom_row_ref: torch.Tensor,
+        recv_top_buf: torch.Tensor,
+        recv_bottom_buf: torch.Tensor,
+    ) -> None:
+        if world_size <= 1:
+            recv_top_buf.zero_()
+            recv_bottom_buf.zero_()
+            return
+        # Upstream narrows both edges by the same halo size from one tensor.
+        if top_row_ref.shape != bottom_row_ref.shape:
+            raise ValueError(
+                "TPU all-gather halo exchange needs equal top and bottom "
+                f"edge shapes, got {tuple(top_row_ref.shape)} and "
+                f"{tuple(bottom_row_ref.shape)}."
+            )
+        local_edges = torch.stack([top_row_ref, bottom_row_ref])
+        edges = [torch.empty_like(local_edges) for _ in range(world_size)]
+        wan_spatial_shard.dist.all_gather(edges, local_edges, group=group)
+
+        if rank > 0:
+            # The previous rank's bottom edge is this rank's top halo.
+            recv_top_buf.copy_(edges[rank - 1][1])
+        else:
+            recv_top_buf.zero_()
+
+        if rank < world_size - 1:
+            # The next rank's top edge is this rank's bottom halo.
+            recv_bottom_buf.copy_(edges[rank + 1][0])
+        else:
+            recv_bottom_buf.zero_()
+
+    wan_spatial_shard._halo_exchange_p2p = _halo_exchange_allgather
+    orig_all_gather = getattr(wan_spatial_shard, "all_gather_along_dim", None)
+    if orig_all_gather is not None and not hasattr(
+        wan_spatial_shard, "_tpu_orig_all_gather_along_dim"
+    ):
+        wan_spatial_shard._tpu_orig_all_gather_along_dim = orig_all_gather
+
+        def _all_gather_along_dim(
+            x: torch.Tensor,
+            *,
+            group: Any,
+            dim: int,
+            dst: int | None = None,
+        ) -> torch.Tensor:
+            rank, world_size = wan_spatial_shard._rank_world(group)
+            if world_size <= 1:
+                return x
+            x = wan_spatial_shard._maybe_contiguous_for_shard_gather(x)
+            gathered = [torch.empty_like(x) for _ in range(world_size)]
+            wan_spatial_shard.dist.all_gather(gathered, x.contiguous(), group=group)
+            # Materialize each chunk before non-dst ranks drop gathered tensors.
+            if dst is not None and x.device.type == "tpu":
+                synchronize_tensors(gathered, wait=False)
+            if dst is not None and rank != dst:
+                return x.new_zeros(0)
+            return torch.cat(gathered, dim=dim)
+
+        wan_spatial_shard.all_gather_along_dim = _all_gather_along_dim
+    logger.info(
+        "Applied TPU patch: collective all-gather halo exchange for Wan VAE "
+        "spatial-shard decode."
+    )
+
+
+def _patch_distributed_vae_host_metadata_collectives() -> None:
+    # TODO: Remove once ProcessGroupTpu lowers ReduceOp.MAX and integer metadata.
+    # Uses DistributedVaeExecutor._sync_errors and the host _error_group of
+    # vLLM-Omni 0.32.0rc1; without them the upstream methods are kept.
+    if not envs.VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES:
+        return
+
+    from vllm_omni.diffusion.distributed.autoencoders import (
+        distributed_vae_executor,
+    )
+
+    executor_cls = getattr(distributed_vae_executor, "DistributedVaeExecutor", None)
+    if executor_cls is None or hasattr(
+        executor_cls, "_tpu_orig_compute_global_padding_shape"
+    ):
+        return
+    orig_compute = getattr(executor_cls, "_compute_global_padding_shape", None)
+    orig_gather = getattr(executor_cls, "gather_tensors", None)
+    orig_sync = getattr(executor_cls, "_sync_final_result", None)
+    if orig_compute is None or orig_gather is None:
+        logger.warning(
+            "Skipping TPU patch: DistributedVaeExecutor has no "
+            "_compute_global_padding_shape/gather_tensors."
+        )
+        return
+    if not callable(getattr(executor_cls, "_sync_errors", None)):
+        logger.warning(
+            "Skipping TPU patch: DistributedVaeExecutor has no _sync_errors."
+        )
+        return
+    executor_cls._tpu_orig_compute_global_padding_shape = orig_compute
+    executor_cls._tpu_orig_gather_tensors = orig_gather
+    dist = distributed_vae_executor.dist
+    warned_no_host_group = False
+
+    def _no_host_group(self: Any) -> bool:
+        nonlocal warned_no_host_group
+        if getattr(self, "_error_group", None) is not None:
+            return False
+        if not warned_no_host_group:
+            warned_no_host_group = True
+            logger.warning(
+                "DistributedVaeExecutor has no _error_group; keeping the "
+                "upstream device-group metadata collectives."
+            )
+        return True
+
+    def _compute_global_padding_shape(
+        self: Any, local_results: Any, output_ndim: int, device: Any
+    ) -> list[int]:
+        if _no_host_group(self):
+            return orig_compute(self, local_results, output_ndim, device)
+        with self._sync_errors("shape preparation"):
+            local_tile_max_dims = [0] * output_ndim
+            for _, tile_tensor in local_results:
+                for dim_idx, dim_size in enumerate(tile_tensor.shape):
+                    local_tile_max_dims[dim_idx] = max(
+                        local_tile_max_dims[dim_idx], int(dim_size)
+                    )
+            local_shape_stat = torch.tensor(
+                [len(local_results), *local_tile_max_dims],
+                dtype=torch.int64,
+                device="cpu",
+            )
+        dist.all_reduce(local_shape_stat, op=dist.ReduceOp.MAX, group=self._error_group)
+        return local_shape_stat.tolist()
+
+    def _gather_tensors(self: Any, tensor: torch.Tensor) -> Any:
+        if _no_host_group(self):
+            return orig_gather(self, tensor)
+        if tensor.is_floating_point():
+            with self._sync_errors("gather allocation"):
+                gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)]
+            dist.all_gather(gather_list, tensor, group=self.group)
+            # Materialize gathered tiles on all ranks before non-zero ranks drop them.
+            if tensor.device.type == "tpu":
+                synchronize_tensors(gather_list, wait=False)
+            return gather_list if self.rank == 0 else None
+        host_tensor = tensor.cpu().contiguous()
+        with self._sync_errors("gather allocation"):
+            gather_list = [
+                torch.empty_like(host_tensor) for _ in range(self.world_size)
+            ]
+        dist.all_gather(gather_list, host_tensor, group=self._error_group)
+        return gather_list if self.rank == 0 else None
+
+    executor_cls._compute_global_padding_shape = _compute_global_padding_shape
+    executor_cls.gather_tensors = _gather_tensors
+    if orig_sync is not None:
+        orig_sync_fn = orig_sync
+
+        def _sync_final_result(
+            self: Any,
+            rank0_result: Any,
+            output_ndim: int,
+            output_device: Any,
+            output_dtype: torch.dtype,
+        ) -> torch.Tensor:
+            if _no_host_group(self):
+                return orig_sync_fn(
+                    self, rank0_result, output_ndim, output_device, output_dtype
+                )
+            with self._sync_errors("output shape preparation"):
+                shape_tensor = torch.zeros((output_ndim,), dtype=torch.int64)
+                if self.rank == 0:
+                    shape_tensor.copy_(
+                        torch.tensor(tuple(rank0_result.shape), dtype=torch.int64)
+                    )
+            dist.broadcast(shape_tensor, src=0, group=self._error_group)
+
+            with self._sync_errors("output allocation"):
+                if self.rank != 0:
+                    sync_result = torch.empty(
+                        tuple(shape_tensor.tolist()),
+                        device=output_device,
+                        dtype=output_dtype,
+                    )
+                else:
+                    sync_result = rank0_result
+            dist.broadcast(sync_result, src=0, group=self.group)
+            # Materialize the broadcast result before it is consumed on every rank.
+            if sync_result.device.type == "tpu":
+                synchronize_tensors([sync_result], wait=False)
+            return sync_result
+
+        executor_cls._tpu_orig_sync_final_result = orig_sync_fn
+        executor_cls._sync_final_result = _sync_final_result
+    logger.info(
+        "Applied TPU patch: host (gloo) MAX all_reduce and integer metadata "
+        "all_gather/broadcast for distributed tile-parallel VAE."
+    )
+
+
+_WAN_VAE_REPLICATED_ENCODE_PATCHED = "_tpu_wan_vae_replicated_encode_patched"
+
+
+def _patch_wan_vae_replicated_encode() -> None:
+    # TODO: Remove once the distributed Wan VAE encode hang on TPU is understood
+    # and fixed (cause not found yet), and auto-enabled decode tiling does not
+    # force tiled encode on TPU.
+    if not envs.VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES:
+        return
+    try:
+        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
+            DistributedAutoencoderKLWan,
+        )
+    except ImportError:
+        return
+    from diffusers.models.autoencoders import AutoencoderKLWan
+
+    if getattr(
+        DistributedAutoencoderKLWan.tiled_encode,
+        _WAN_VAE_REPLICATED_ENCODE_PATCHED,
+        False,
+    ):
+        return
+    orig_encode = DistributedAutoencoderKLWan._encode
+    orig_tiled_encode = DistributedAutoencoderKLWan.tiled_encode
+    DistributedAutoencoderKLWan._tpu_orig_encode = orig_encode
+    DistributedAutoencoderKLWan._tpu_orig_tiled_encode = orig_tiled_encode
+
+    def _encode(self: Any, x: torch.Tensor) -> Any:
+        prev_use_tiling = getattr(self, "use_tiling", False)
+        if self.is_distributed_enabled() and prev_use_tiling:
+            self.use_tiling = False
+            try:
+                return orig_encode(self, x)
+            finally:
+                self.use_tiling = prev_use_tiling
+        return orig_encode(self, x)
+
+    def _tiled_encode(self: Any, x: torch.Tensor) -> torch.Tensor:
+        return AutoencoderKLWan.tiled_encode(self, x)
+
+    setattr(_encode, _WAN_VAE_REPLICATED_ENCODE_PATCHED, True)
+    setattr(_tiled_encode, _WAN_VAE_REPLICATED_ENCODE_PATCHED, True)
+    DistributedAutoencoderKLWan._encode = _encode
+    DistributedAutoencoderKLWan.tiled_encode = _tiled_encode
+    logger.info("Applied TPU patch: replicated untiled Wan VAE encode.")
