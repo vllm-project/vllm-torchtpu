@@ -557,6 +557,7 @@ def _pallas_rpa_kernel_batched(
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
     decode_lanes: int | None = None,
+    tuned_tiles: bool = False,
     block_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
@@ -564,6 +565,8 @@ def _pallas_rpa_kernel_batched(
     kernel_kwargs = batched_rpa_decode.kernel_kwargs(decode_lanes)
     if decode_query_size > 1:
         kernel_kwargs["decode_query_size"] = decode_query_size
+    if tuned_tiles:
+        kernel_kwargs["tuned_tiles"] = True
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -861,6 +864,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
     decode_lanes: int | None = None
+    # The tuned batched RPA tiles and decode lanes (wrapper.calculate_block_sizes,
+    # batched_rpa_decode); off unless a model rule turns them on.
+    tuned_tiles: bool = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -1006,6 +1012,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             self.decode_lanes,
+            self.tuned_tiles,
             block_major,
         )
         existing = self._kernel_config_cache.get(config_key)
@@ -1049,6 +1056,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             self.decode_lanes,
+            self.tuned_tiles,
             block_major,
         )
         existing = self._kernel_registry.get(registry_key)
@@ -1092,6 +1100,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 entry_kwargs["decode_query_size"] = self.decode_query_size
             if "decode_lanes" in entry_params:
                 entry_kwargs["decode_lanes"] = self.decode_lanes
+            if "tuned_tiles" in entry_params:
+                entry_kwargs["tuned_tiles"] = self.tuned_tiles
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
@@ -1446,6 +1456,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     cp_rank=self.dcp_rank,
                     kv_layout=self.kv_layout,
                     decode_query_size=self.decode_query_size,
+                    tuned_tiles=self.tuned_tiles,
                 )
             return
 
@@ -1721,6 +1732,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         if spec is not None and self.head_size != 64:
             self.decode_query_size = spec.num_speculative_tokens + 1
         model_config = vllm_config.model_config if vllm_config is not None else None
+        if self.tuned_tiles and model_config is not None and self.head_size != 64:
             self.decode_lanes = batched_rpa_decode.decode_lanes(
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_size,
