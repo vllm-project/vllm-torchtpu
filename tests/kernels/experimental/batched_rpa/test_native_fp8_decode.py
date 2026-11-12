@@ -28,6 +28,8 @@ from jax._src import test_util as jtu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
+pytestmark = pytest.mark.tpu_test
+
 _NQ, _NKV, _HD, _PAGE, _QLEN = 4, 1, 256, 128, 4
 _SM_SCALE = 1.0 / 16.0
 _FP8 = jnp.float8_e4m3fn
