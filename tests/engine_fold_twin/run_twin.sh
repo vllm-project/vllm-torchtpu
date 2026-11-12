@@ -31,8 +31,8 @@ else
 fi
 export FOLDTWIN_GSM=$D/steps/gsm72.json
 for ARM in ${FOLDTWIN_ARMS:-off on on_sp0 on_moe on_qsa}; do
-  if [ $ARM = off ]; then export FOLDCP_FORCE=0; else export FOLDCP_FORCE=1; fi
-  if [ $ARM = nockpt ]; then export FOLDTWIN_NOCKPT=1; else export FOLDTWIN_NOCKPT=0; fi
+  case $ARM in off*) export FOLDCP_FORCE=0;; *) export FOLDCP_FORCE=1;; esac
+  case $ARM in *nockpt) export FOLDTWIN_NOCKPT=1;; *) export FOLDTWIN_NOCKPT=0;; esac
   export FOLDTWIN_LOG=$W/sched_$ARM.jsonl
   rm -f $FOLDTWIN_LOG
   timeout 3300 python3 $D/ab/fold_twin.py $ARM $D/steps/${FOLDTWIN_PLAN:-c32-twin.steps.json} $W > $W/arm_$ARM.log 2>&1

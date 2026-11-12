@@ -53,6 +53,10 @@ ARM_ENV = {
     # Prefill MoE: no fused EP kernel for any step size.
     "on_moe": {**_ON, "MOE_FUSED_EP_KERNEL_MIN_TOKENS": "100000000"},
     # DCP prefill attention: the plain visible-block walk (no bypass / lean / prefix-page paths).
+    # Async scheduling, as served (FOLDTWIN_ASYNC=1 is read before the engine starts).
+    "off_async": {**_OFF, "FOLDTWIN_ASYNC": "1"},
+    "on_async": {**_ON, "FOLDTWIN_ASYNC": "1"},
+    "on_async_nockpt": {**_ON, "FOLDTWIN_ASYNC": "1"},
     "on_qsa": {**_ON, "VLLM_TPU_QSA_VISIBLE_BYPASS": "0", "VLLM_TPU_QSA_PREFILL_LEAN": "0",
                "VLLM_TPU_QSA_PREFILL_PREFIX_PAGES": "0"},
 }
@@ -245,7 +249,7 @@ def main():
     # the .pth hooks are active in every process (driver, engine core, workers; fork or spawn).
     log_path = os.environ["FOLDTWIN_LOG"]
     assert os.environ.get("FOLDCP_FORCE", "0") == ARM_ENV[arm]["FOLDCP_FORCE"], "arm env mismatch"
-    assert (os.environ.get("FOLDTWIN_NOCKPT", "0") == "1") == (arm == "nockpt"), "nockpt env"
+    assert (os.environ.get("FOLDTWIN_NOCKPT", "0") == "1") == arm.endswith("nockpt"), "nockpt env"
     sys.pycache_prefix = os.environ["PYTHONPYCACHEPREFIX"]
     print("ARM", arm, {k: os.environ.get(k) for k in sorted({*ARM_ENV[arm], *C48_EXTRA})},
           flush=True)
@@ -258,6 +262,9 @@ def main():
     sa = twin["server_args"]
     if "--enable-prefix-caching" not in argv:
         argv += ["--enable-prefix-caching"]
+    if os.environ.get("FOLDTWIN_ASYNC") == "1" and "--async-scheduling" not in argv:
+        # Served runs schedule asynchronously (engine_argv drops the flag for the twin).
+        argv += ["--async-scheduling"]
     if "--speculative-config" not in argv and sa.get("speculative-config"):
         argv += ["--speculative-config", str(sa["speculative-config"])]
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
