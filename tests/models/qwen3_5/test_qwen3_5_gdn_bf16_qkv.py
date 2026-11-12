@@ -312,9 +312,13 @@ def test_mode_2_matches_mode_0_with_prefill_on_tpu(
     )
     results = {}
     for mode in (0, 2):
+        # fused_conv1d_gdn donates `states` (its only donated argument), so
+        # each mode gets its own copy; reusing it raises "Array has been
+        # deleted" on TPU.
+        call_inputs = dict(inputs, states=jax.tree.map(jnp.copy, inputs["states"]))
         results[mode] = jax.block_until_ready(
             wrapper.fused_conv1d_gdn(
-                **inputs,
+                **call_inputs,
                 n_kq=n_kq,
                 n_v=n_v,
                 d_k=d,
