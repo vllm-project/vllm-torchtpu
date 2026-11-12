@@ -86,7 +86,7 @@ start_server() {
     local sharding seqs budget group
     read -r sharding seqs budget group <<< "$1"
     point_env+=(SHARDING="$sharding")
-    [ -n "${seqs:-}" ] && point_env+=(MAX_NUM_SEQS="$seqs" GLOBAL_MAX_NUM_BATCHED_TOKENS="$budget" DP_SCHED_BUFFER_THRESHOLD="$group")
+    [ -n "${seqs:-}" ] && point_env+=(MAX_NUM_SEQS="$seqs" GLOBAL_MAX_NUM_BATCHED_TOKENS="$budget" VLLM_TPU_DP_RELEASE_THRESHOLD="$group")
   fi
   if [ "${DRY_RUN:-0}" = "1" ]; then
     env "${point_env[@]}" bash "${SCRIPT_DIR}/server.sh"

@@ -43,7 +43,7 @@ point_settings() {
   read -r sharding seqs budget group <<< "$spec"
   echo "SHARDING=$sharding"
   if [ -n "${seqs:-}" ]; then
-    echo "MAX_NUM_SEQS=$seqs"; echo "GLOBAL_MAX_NUM_BATCHED_TOKENS=$budget"; echo "DP_SCHED_BUFFER_THRESHOLD=$group"
+    echo "MAX_NUM_SEQS=$seqs"; echo "GLOBAL_MAX_NUM_BATCHED_TOKENS=$budget"; echo "VLLM_TPU_DP_RELEASE_THRESHOLD=$group"
   fi
   for f in ${POINT_FLAGS[$isl,$osl,$conc]:-}; do echo "$f"; done
   if [ "$isl,$osl" = "8192,1024" ]; then

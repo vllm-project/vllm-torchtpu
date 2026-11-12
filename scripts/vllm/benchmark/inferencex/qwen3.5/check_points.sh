@@ -25,7 +25,7 @@ for c in ${@:-4 8 16 32 64 128 256 512 1024}; do
     diff <(echo "$sweep") <(echo "$alone") | grep '^[<>]' | cut -c1-200
     status=1
   else
-    echo "$c users: the sweep and a standalone launch resolve alike -- $(echo "$sweep" | grep -E '^(SHARDING|MAX_NUM_SEQS|GLOBAL_MAX_NUM_BATCHED_TOKENS|DP_SCHED_BUFFER_THRESHOLD|TPU_EXPERT_PLACEMENT|TPU_MOE_LOWTOK_FROM_SCORES|TPU_SMALL_ALL_REDUCE_MAX_ROWS|GDN_STATE_DTYPE)=' | tr '\n' ' ')"
+    echo "$c users: the sweep and a standalone launch resolve alike -- $(echo "$sweep" | grep -E '^(SHARDING|MAX_NUM_SEQS|GLOBAL_MAX_NUM_BATCHED_TOKENS|VLLM_TPU_DP_RELEASE_THRESHOLD|TPU_EXPERT_PLACEMENT|TPU_MOE_LOWTOK_FROM_SCORES|TPU_SMALL_ALL_REDUCE_MAX_ROWS|GDN_STATE_DTYPE)=' | tr '\n' ' ')"
   fi
 done
 exit "$status"
