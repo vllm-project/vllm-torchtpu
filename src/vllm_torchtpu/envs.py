@@ -350,6 +350,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STAGE_ENTRIES_CACHE: bool = False
     VLLM_TPU_SUBST_STATIC_ARGS: bool = False
     VLLM_TPU_SUBTRACT_REJECTED_COMPILED: bool = False
+    VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS: bool = False
     VLLM_TPU_SPEC_TAIL_COMPILED: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
     VLLM_TPU_LOOP_LAG_WATCHDOG_S: float = 30.0
@@ -2265,6 +2266,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # positions as one compiled program (precompiled per request bucket).
     "VLLM_TPU_SUBTRACT_REJECTED_COMPILED": env_bool(
         "VLLM_TPU_SUBTRACT_REJECTED_COMPILED"
+    ),
+    # Async spec decode, prefill/mixed steps: pad the previous step's rejected
+    # counts to max_num_reqs rows before the correction, so its shape depends
+    # only on the token bucket (precompiled with SUBTRACT_REJECTED_COMPILED)
+    # instead of compiling per (rows, bucket) mid-serve. Same values.
+    "VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS": env_bool(
+        "VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS"
     ),
     # Async spec decode, one chunk: the next step's substitution source and the
     # rejected count (with their row fits and the source pad) as one program.

@@ -17,7 +17,12 @@ import pytest
 import torch
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 
-from vllm_torchtpu.runner.tpu_runner import _spec_logprob_row_tokens
+from vllm_torchtpu.runner.tpu_runner import (
+    _get_padded_token_len,
+    _pad_rejected_rows,
+    _spec_logprob_row_tokens,
+    _subtract_rejected_shapes,
+)
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncTPUCopyState,
@@ -110,6 +115,59 @@ def test_subtract_num_rejected_tokens_skips_invalid(device):
 
     assert new_seq.tolist() == [10, 18]  # slot 0 unchanged, slot 1 -= 2
     assert new_pos.tolist() == [5, 4]
+
+
+@pytest.mark.tpu_test
+def test_subtract_num_rejected_tokens_padded_rows_bitwise(device):
+    # VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS: zero-padding num_rejected to
+    # max_num_reqs rows must not change either output, for any previous-step
+    # row count (exact or bucketed), any -1 mix and any token bucket.
+    gen = torch.Generator().manual_seed(0)
+    max_num_reqs = 24
+    for rows in (1, 2, 3, 7, 8, 16, 23, 24):
+        for tokens, target in ((256, 24), (1024, 32), (8192, 24)):
+            num_rejected = torch.randint(0, 4, (rows,), generator=gen).to(torch.int32)
+            seq_lens = torch.randint(1, 1 << 20, (target,), generator=gen)
+            positions = torch.randint(0, 1 << 20, (tokens,), generator=gen)
+            seq_idx = torch.randint(-1, rows, (target,), generator=gen)
+            pos_idx = torch.randint(-1, rows, (tokens,), generator=gen)
+            args = [
+                t.to(torch.int32).to(device)
+                for t in (seq_lens, positions, num_rejected, seq_idx, pos_idx)
+            ]
+            ref_seq, ref_pos = subtract_num_rejected_tokens(*args)
+            padded = _pad_rejected_rows(args[2], max_num_reqs)
+            assert padded.shape == (max_num_reqs,)
+            assert torch.equal(padded[:rows], args[2])
+            assert not padded[rows:].any()
+            got_seq, got_pos = subtract_num_rejected_tokens(
+                args[0], args[1], padded, args[3], args[4]
+            )
+            assert got_seq.dtype == ref_seq.dtype
+            assert got_pos.dtype == ref_pos.dtype
+            assert torch.equal(got_seq, ref_seq)
+            assert torch.equal(got_pos, ref_pos)
+
+
+def test_pad_rejected_rows_keeps_full_and_wider_inputs():
+    full = torch.arange(24, dtype=torch.int32)
+    assert _pad_rejected_rows(full, 24) is full
+    wider = torch.arange(30, dtype=torch.int32)  # several chunks concatenated
+    assert _pad_rejected_rows(wider, 24) is wider
+
+
+def test_subtract_rejected_shapes_pad_rows_covers_every_bucket():
+    paddings = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    targets = {24, 32}
+    base = _subtract_rejected_shapes(24, 4, paddings, targets, pad_rows=False)
+    padded = _subtract_rejected_shapes(24, 4, paddings, targets, pad_rows=True)
+    # Off: the steady-decode shapes only, each in the bucket holding its
+    # verify tokens (exact rows: rows * (1 + K)).
+    assert (3, _get_padded_token_len(paddings, 12), 24) in base
+    assert (24, 8192, 24) not in base
+    # On: the same plus max_num_reqs rows at every (token bucket, slots).
+    pad_shapes = {(24, t, n) for t in paddings for n in targets}
+    assert padded == base | pad_shapes
 
 
 @pytest.mark.tpu_test

@@ -799,6 +799,44 @@ def _subtract_num_rejected_tokens_compiled(*args):
 _subtract_num_rejected_tokens_fn = None
 
 
+def _subtract_rejected_shapes(
+    max_num_reqs: int,
+    width: int,
+    num_tokens_paddings: list[int],
+    targets: set[int],
+    pad_rows: bool,
+) -> set[tuple[int, int, int]]:
+    """(rows, tokens, seq_lens slots) the compiled rejected-count correction is
+    warmed for: steady spec decode at every request count (exact and bucketed
+    rows) in the bucket holding `rows * width` verify tokens, plus, with
+    VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS, `max_num_reqs` rows at every token
+    bucket (prefill/mixed steps, see `_pad_rejected_rows`)."""
+    shapes: set[tuple[int, int, int]] = set()
+    for n in range(1, max_num_reqs + 1):
+        if n * width > num_tokens_paddings[-1]:
+            break
+        tokens = _get_padded_token_len(num_tokens_paddings, n * width)
+        for rows in {n, _get_padded_num_reqs_with_upper_limit(n, max_num_reqs)}:
+            for target in targets:
+                shapes.add((rows, tokens, target))
+    if pad_rows:
+        for tokens in num_tokens_paddings:
+            for target in targets:
+                shapes.add((max_num_reqs, tokens, target))
+    return shapes
+
+
+def _pad_rejected_rows(num_rejected: torch.Tensor, rows: int) -> torch.Tensor:
+    """VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS: `num_rejected` zero-padded to
+    `rows`. The correction reads it only at indices of real requests (below its
+    original length; -1 slots are masked), so the result is unchanged while its
+    shape stops varying with the previous step's request count."""
+    n = num_rejected.shape[0]
+    if n >= rows:
+        return num_rejected
+    return torch.nn.functional.pad(num_rejected, (0, rows - n))
+
+
 def _spec_tail(next_tokens, drafts, draft_lengths, rows, num_reqs, bound):
     """One async-spec step's substitution source, padded to `bound`, and its
     per-request rejected count: `assemble_spec_next_tokens`,
@@ -4189,21 +4227,33 @@ class TPUModelRunner(GPUModelRunner):
             # The compiled program only for shapes warmup compiled (steady
             # decode); prefill/mixed steps keep the eager ops rather than
             # compiling mid-serve.
+            num_rejected = self._pre_async_results.spec_decode_num_rejected_tokens
+            compiled_shapes = self.__dict__.get("_subtract_compiled_shapes", ())
+            subtract_shape = (
+                num_rejected.shape[0],
+                self.position_ids.shape[-1],
+                seq_lens.shape[0],
+            )
+            if (
+                envs.VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS
+                and subtract_shape not in compiled_shapes
+            ):
+                # Prefill/mixed step: the (rows, token bucket) pair follows the
+                # previous step's batch, and each new pair compiled the eager
+                # correction mid-serve (45-95 ms on every rank). Padded rows
+                # leave one shape per bucket, precompiled below.
+                num_rejected = _pad_rejected_rows(num_rejected, self.max_num_reqs)
+                subtract_shape = (num_rejected.shape[0], *subtract_shape[1:])
             subtract = (
                 _subtract_num_rejected_tokens_compiled
                 if envs.VLLM_TPU_SUBTRACT_REJECTED_COMPILED
-                and (
-                    self._pre_async_results.spec_decode_num_rejected_tokens.shape[0],
-                    self.position_ids.shape[-1],
-                    seq_lens.shape[0],
-                )
-                in self.__dict__.get("_subtract_compiled_shapes", ())
+                and subtract_shape in compiled_shapes
                 else subtract_num_rejected_tokens
             )
             seq_lens, self.position_ids = subtract(
                 seq_lens,
                 self.position_ids,
-                self._pre_async_results.spec_decode_num_rejected_tokens,
+                num_rejected,
                 *subtract_idx,
             )
 
@@ -8779,30 +8829,37 @@ class TPUModelRunner(GPUModelRunner):
         """VLLM_TPU_SUBTRACT_REJECTED_COMPILED: compile the rejected-count
         correction for steady spec decode at every request count (exact and
         bucketed source rows), this step's request slots, and the token bucket
-        that holds `rows * (1 + K)` verify tokens. Other shapes (a prefill
-        joining) stay on the eager ops; see `_subtract_compiled_shapes`."""
+        that holds `rows * (1 + K)` verify tokens; with
+        VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS also `max_num_reqs` rows at every
+        token bucket (prefill/mixed steps). Other shapes (a prefill joining)
+        stay on the eager ops; see `_subtract_compiled_shapes`."""
         if not (
             envs.VLLM_TPU_SUBTRACT_REJECTED_COMPILED
             and self.speculative_config
             and self.scheduler_config.async_scheduling
         ):
             return
-        width = 1 + self.speculative_config.num_speculative_tokens
         targets = {
             n for n in (self.num_reqs_max_model_len, self.num_reqs_most_model_len) if n
         }
-        shapes: set[tuple[int, int, int]] = set()
-        for n in range(1, self.max_num_reqs + 1):
-            if n * width > self.num_tokens_paddings[-1]:
-                break
-            tokens = _get_padded_token_len(self.num_tokens_paddings, n * width)
-            for rows in {
-                n,
-                _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs),
-            }:
-                for target in targets:
-                    shapes.add((rows, tokens, target))
+        pad_rows = envs.VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS
+        shapes = _subtract_rejected_shapes(
+            self.max_num_reqs,
+            1 + self.speculative_config.num_speculative_tokens,
+            self.num_tokens_paddings,
+            targets,
+            pad_rows,
+        )
         with self._precompile_timed("async-spec rejected-count correction"):
+            if pad_rows:
+                # The row pad itself is an eager op, one program per row count.
+                for n in range(1, self.max_num_reqs):
+                    synchronize_tensors(
+                        _pad_rejected_rows(
+                            torch.zeros(n, dtype=torch.int32).to(self.device),
+                            self.max_num_reqs,
+                        )
+                    )
             for rows, tokens, target in sorted(shapes):
                 synchronize_tensors(
                     _subtract_num_rejected_tokens_compiled(
