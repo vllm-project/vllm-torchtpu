@@ -3018,7 +3018,7 @@ def gmm_v2(
 _HEADS = 3  # attention heads per rank (96 total)
 _CHANNELS = 128
 _KDA_CHUNK = 64
-_KDA_SUB_BLOCK = 16
+_KDA_SUB_BLOCK = 32
 
 
 def _dot(x, w):
@@ -3113,6 +3113,14 @@ def _invert_delta_rule_two_level(low, block=8):
     return _dot3(inv_ig, p)
 
 
+def _sub_block_anchor(gc, start, sub_block):
+    """[H, 1, K] midway between rows ``start + sub_block / 2 - 1`` and
+    ``start + sub_block / 2`` of the gate cumsum ``gc``: the anchor leaves
+    the sub-block's row and column factors the same range."""
+    middle = start + sub_block // 2
+    return 0.5 * (gc[:, middle - 1 : middle] + gc[:, middle : middle + 1])
+
+
 def _kda_chunk_core(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, invert=None):
     """One chunk of the Kimi delta rule in parallel (chunked) form.
 
@@ -3126,14 +3134,17 @@ def _kda_chunk_core(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, inv
     intermediates gc, aqk, low, solve and v_new.
 
     The intra-chunk decay factors use the sub-block anchor factorization
-    exp(g_r - g_t) = exp(g_r - a_i) * exp(a_i - g_t), ``a_i`` the gate
-    cumsum at the middle row of r's sub-block, so each sub-block's rows
-    (its diagonal block included) are one matmul. For the bounded K3 gate
-    (|gate| <= 5) the row factors stay within exp(+-40); a column factor
-    underflows only where the true product is below exp(-47), and products
-    above the diagonal (possibly inf) are masked out afterwards. The matmul
-    runs at HIGHEST precision: the factors' spread would otherwise cost the
-    diagonal blocks their FP32 accuracy.
+    exp(g_r - g_t) = exp(g_r - a_i) * exp(a_i - g_t), ``a_i`` midway between
+    the gate cumsums of the two middle rows of r's sub-block
+    (`_sub_block_anchor`), so each sub-block's rows (its diagonal block
+    included) are one matmul. For the bounded K3 gate (|gate| <= 5) the
+    factors stay within exp(+-5 (sub_block - 1) / 2), exp(+-77.5) at 32 rows,
+    so no causal product overflows. Scaled operands under 2^-126 ~ exp(-87)
+    flush to zero: a term of a causal product is dropped only where it is
+    below exp(5 (sub_block - 1) / 2 - 87), about exp(-10) at 32 rows.
+    Products above the diagonal (possibly inf) are masked out afterwards.
+    The matmul runs at HIGHEST precision: the factors' spread would
+    otherwise cost the diagonal blocks their FP32 accuracy.
     """
     if invert is None:
         invert = _invert_delta_rule_two_level
@@ -3155,7 +3166,7 @@ def _kda_chunk_core(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, inv
     col_iota = jax.lax.broadcasted_iota(jnp.int32, (chunk_size,), 0)  # [C]
     for i in range(nc):
         i_s = i * sub_block
-        anchor = gc[:, i_s + sub_block // 2, :][:, None, :]  # [H, 1, K]
+        anchor = _sub_block_anchor(gc, i_s, sub_block)
         row_scale = jnp.exp(gc[:, i_s : i_s + sub_block, :] - anchor)  # [H, BC, K]
         # Columns up to the sub-block's end (later ones are above the
         # diagonal for all its rows: zeroed rather than overflowing).
@@ -3215,10 +3226,12 @@ _LOG2E = 1.4426950408889634
 def _kda_chunk_fast(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, block=8):
     """Inference fast path for one 64-token KDA chunk inside Pallas VMEM.
 
-    Matches ``mega_kda``'s validated Kimi-K3 BF16/DEFAULT-precision formulation:
-    - Sub-block (16-row) ``both`` matmuls run at ``Precision.DEFAULT`` over only
-      the causal ``j_end = (i + 1) * sub_block`` prefix columns without
-      transposing ``k_scaled``.
+    Follows ``mega_kda``'s Kimi-K3 BF16/DEFAULT-precision formulation:
+    - Sub-block ``both`` matmuls run at ``Precision.DEFAULT`` over only the
+      causal ``j_end = (i + 1) * sub_block`` prefix columns without
+      transposing the scaled keys, within `_kda_chunk_core`'s factor bounds.
+      Each column's factor is formed from its own row: a factor carried
+      across anchors 32 rows apart can underflow.
     - Two-level (8x8 block) Neumann solve applies ``(I + G)^{-1} P`` directly
       to ``rhs`` without materializing ``solve = (I + G)^{-1} P``, fusing the
       doubling steps and ``P @ [F, rhs]``.
@@ -3238,29 +3251,17 @@ def _kda_chunk_fast(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, blo
     col_iota = jax.lax.broadcasted_iota(jnp.int32, (sub_block, chunk_size), 1)
     aqk_parts = []
     low_parts = []
-    k_eng_prefix = None
-    prev_anchor = None
     for i in range(nc):
         i_s = i * sub_block
         j_end = i_s + sub_block
         q_i = q[:, i_s:j_end]
         k_i = k[:, i_s:j_end]
-        g_i = gc[:, i_s:j_end]
-        anchor = g_i[:, sub_block // 2 : sub_block // 2 + 1, :]  # [H, 1, K]
-        diff_i = g_i - anchor
-        row_scale = jnp.exp2(diff_i)
-        k_eng_cur = k_i * jnp.exp2(-diff_i)
-        if i == 0:
-            k_eng_prefix = k_eng_cur
-        else:
-            k_eng_prefix = jnp.concatenate(
-                (k_eng_prefix * jnp.exp2(anchor - prev_anchor), k_eng_cur),
-                axis=1,
-            )
-        prev_anchor = anchor
+        anchor = _sub_block_anchor(gc, i_s, sub_block)
+        row_scale = jnp.exp2(gc[:, i_s:j_end] - anchor)
+        k_scaled = k[:, :j_end] * jnp.exp2(anchor - gc[:, :j_end])  # [H, j_end, K]
         both_valid = jax.lax.dot_general(
             jnp.concatenate((q_i * row_scale, k_i * row_scale), axis=1),
-            k_eng_prefix,
+            k_scaled,
             (((2,), (2,)), ((0,), (0,))),
             preferred_element_type=jnp.float32,
             precision=jax.lax.Precision.DEFAULT,
