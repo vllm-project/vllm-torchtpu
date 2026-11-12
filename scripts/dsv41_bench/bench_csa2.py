@@ -162,6 +162,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--baseline", type=Path)
+    parser.add_argument(
+        "--matmulw8a16",
+        action="store_true",
+        help="Compare the legacy CSA2 kernel with native row-packed W8A16",
+    )
     parser.add_argument("--batch", type=int, default=48)
     parser.add_argument("--num-tokens", type=int, default=6)
     parser.add_argument("--heads", type=int, default=64)
@@ -171,6 +176,12 @@ def main():
     root = Path(__file__).resolve().parents[2]
     kernel = load_kernel(root)
     variants = [("candidate", kernel)]
+    if args.matmulw8a16:
+        from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2_matmulw8a16 import (
+            csa2_matmulw8a16,
+        )
+
+        variants = [("legacy", kernel), ("matmulw8a16", csa2_matmulw8a16)]
     if args.baseline:
         spec = importlib.util.spec_from_file_location("baseline", args.baseline)
         module = importlib.util.module_from_spec(spec)
@@ -206,15 +217,28 @@ def main():
         }
     )
     expected = reference(host, selected)
+    row_packed = dict(host)
+    if args.matmulw8a16:
+        words = host["main_kv"].view(np.uint32)
+        shifts = 8 * np.arange(4, dtype=np.uint32)
+        values = (words[:, :, None, :] >> shifts[None, None, :, None]) & 255
+        values = values.reshape(-1, 128, 4, 512)
+        row_packed["main_kv"] = np.bitwise_or.reduce(
+            values << shifts[None, None, :, None], axis=2
+        ).view(np.int32)
     baseline_output = None
     with jax.default_device(device):
-        inputs = jax.device_put(host, device)
-        jax.block_until_ready(inputs)
         for name, call in variants:
             print(json.dumps(dict(action="compile", variant=name)), flush=True)
+            # Packing and placement are setup, outside both timed call regions.
+            inputs = jax.device_put(row_packed if name == "matmulw8a16" else host)
+            jax.block_until_ready(inputs)
+            options = dict(bq=args.bq)
+            if name == "matmulw8a16":
+                options["uniform_queries"] = args.num_tokens == args.bq
             start = time.perf_counter()
             compiled = compile_variant(
-                lambda data, call=call: call(**data, bq=args.bq), inputs
+                lambda data, call=call, options=options: call(**data, **options), inputs
             )
             compile_seconds = time.perf_counter() - start
             case = args.out / name
@@ -231,7 +255,7 @@ def main():
                     / np.linalg.norm(expected)
                 ),
             )
-            if name == "baseline":
+            if name in ("baseline", "legacy"):
                 baseline_output = output
             elif baseline_output is not None:
                 np.testing.assert_allclose(
@@ -258,6 +282,8 @@ def main():
             assert all(len(t) == 30 for t in times.values()), times
             metric = dict(
                 variant=name,
+                packing_in_timed_region=False,
+                main_layout="row_packed" if name == "matmulw8a16" else "column_packed",
                 batch_size=args.batch,
                 num_tokens=args.num_tokens,
                 heads=args.heads,

@@ -1,6 +1,6 @@
 # CSA2 kernel
 
-`csa2.py:csa2` is the single attention entry point for decode and both prefill
+`csa2.py:csa2` is the serving attention entry point for decode and both prefill
 stages. Callers supply request starts `[B+1]`, per-token positions `[T]`, packed
 main KV, FP32 scales, SWA word-row pages and visibility metadata directly.
 There are no decode adapters, query-compaction passes or output-reordering passes.
@@ -42,3 +42,37 @@ python scripts/dsv41_bench/bench_csa2.py --out /tmp/csa2-prefill \
 same interface. Reports separate kernel and complete XLA module timings, checks
 sampled outputs against NumPy, and compares full outputs for A/B (atol=3e-3, rtol=3e-2), reporting
 bitwise equality separately.
+
+## Native FP8 matmul W8A16 pipeline
+
+`csa2_matmulw8a16.csa2_matmulw8a16` is an explicit TPU7x entry point for
+row-packed main KV. Both QK and PV push an FP8 e4m3fn RHS against a BF16 LHS,
+without a decoded BF16 cache or shifts/masks to unpack main KV. It uses the
+existing tile/window helpers, four input buffers, alternating RHS staging,
+three-query softmax chunks over 256-wide key blocks, and post-PV normalization.
+The next tile's QK overlaps the current softmax; output DMA starts after issuing
+current PV so finishing the previous output does not serialize that work.
+
+Main KV is INT32 `[T,128,512]`: byte `r` of word `[t,k,d]` contains the FP8
+value `[t,4*k+r,d]`. Scales stay FP32 `[T,512]`, one scale per key row. This
+is a different packing from the legacy `[T,512,128]` interface, not a reshape.
+SWA must use native BF16 pages, optionally split across two owners. Ragged
+queries and explicit SWA visibility retain their semantics. The function returns
+only the attention output.
+`uniform_queries=True` requires a single SWA owner and exactly `bq` queries per request with
+`starts = arange(B+1)*bq`; otherwise use the default ragged path.
+
+Reproduce a same-input legacy/W8A16 comparison with:
+
+```bash
+python scripts/dsv41_bench/bench_csa2.py --matmulw8a16 \
+  --batch 48 --num-tokens 6 --heads 64 --page-size 64 --bq 6 \
+  --out /tmp/csa2-matmulw8a16
+```
+
+The benchmark converts fixture bytes before compilation/timing and records each
+layout. It validates against the independent FP32 reference and saves XProf
+traces, HLO and source hashes. The serving adapter still uses the legacy entry
+point: direct row-packed cache production, SWA-only layers and shared INT32 SWA
+word-pool integration remain follow-up work. Do not insert the benchmark's host
+packing conversion into the serving path or include it in the kernel timing.

@@ -12,6 +12,9 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import (
     build_query_tiles,
     csa2,
 )
+from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2_matmulw8a16 import (
+    csa2_matmulw8a16,
+)
 from vllm_torchtpu.kernels.deepseek_v41.csa2.reference import prefill_reference
 
 
@@ -319,3 +322,130 @@ def test_prefill_streams_metadata_larger_than_vmem(ragged):
         np.testing.assert_array_equal(output[-5:], 0)
         output = output[:-5]
     np.testing.assert_allclose(output, 128 / 129, atol=3e-3, rtol=3e-2)
+
+
+def row_pack_main(words):
+    """Test fixture: keep the exact FP8 bytes while packing adjacent key rows."""
+    words = np.asarray(words).view(np.uint32)
+    shifts = 8 * np.arange(4, dtype=np.uint32)
+    values = (words[:, :, None, :] >> shifts[None, None, :, None]) & 255
+    values = values.reshape(-1, 128, 4, 512)
+    return jnp.asarray(
+        np.bitwise_or.reduce(values << shifts[None, None, :, None], axis=2).view(
+            np.int32
+        )
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "banked,non_causal,heads,page_size",
+    [
+        (False, False, 8, 64),
+        (True, True, 8, 64),
+        (False, False, 64, 32),
+        (True, True, 128, 64),
+    ],
+)
+def test_matmulw8a16_ragged_visibility(banked, non_causal, heads, page_size):
+    """Trace on CPU; on TPU check native FP8 math, tails and poisoned SWA rows."""
+    args, kwargs = prefill_inputs(banked, non_causal, heads, page_size)
+    native = (args[0], row_pack_main(args[1]), *args[2:])
+    if jax.default_backend() == "tpu":
+        actual = csa2_matmulw8a16(*native, **kwargs, bq=6)
+        np.testing.assert_allclose(
+            np.asarray(actual, np.float32),
+            numpy_reference(args, kwargs),
+            atol=2e-3,
+            rtol=2e-2,
+        )
+        np.testing.assert_array_equal(actual[25:], 0)
+    else:
+        mesh = jax.sharding.AbstractMesh(
+            (1,),
+            ("core",),
+            abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+        )
+        with jax.sharding.use_abstract_mesh(mesh):
+            traced = jax.make_jaxpr(lambda *x: csa2_matmulw8a16(*x, **kwargs, bq=6))(
+                *native
+            )
+        assert traced.out_avals[0].shape == args[0].shape
+        assert traced.out_avals[0].dtype == jnp.bfloat16
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "invalid", ["column_pack", "missing_main", "uniform_count", "uniform_banks"]
+)
+def test_matmulw8a16_rejects_incompatible_contract(invalid):
+    args, kwargs = prefill_inputs(banked=invalid == "uniform_banks")
+    words = args[1] if invalid == "column_pack" else row_pack_main(args[1])
+    if invalid == "missing_main":
+        words = None
+    native = (args[0], words, *args[2:])
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("core",),
+        abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+    )
+    with jax.sharding.use_abstract_mesh(mesh), pytest.raises(ValueError):
+        jax.make_jaxpr(
+            lambda *x: csa2_matmulw8a16(
+                *x, **kwargs, bq=6, uniform_queries=invalid.startswith("uniform_")
+            )
+        )(*native)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("groups", [1, 2, 5, 8])
+def test_matmulw8a16_uniform_ring_wrap(groups):
+    """Exercise warmup, the four input slots, the steady loop and final drain."""
+    args, kwargs = prefill_inputs(heads=64)
+    q, words, scales, swa, _, positions, sink, rope = args
+    base = (
+        q[:6],
+        words[:6],
+        scales[:6],
+        swa,
+        jnp.array([0, 6], jnp.int32),
+        positions[:6],
+        sink,
+        rope[:6],
+    )
+    base_kwargs = dict(
+        swa_metadata=kwargs["swa_metadata"][1:2],
+        main_lengths=kwargs["main_lengths"][:6],
+        swa_bounds=None,
+    )
+    native = (
+        jnp.tile(q[:6], (groups, 1, 1)),
+        jnp.tile(row_pack_main(words[:6]), (groups, 1, 1)),
+        jnp.tile(scales[:6], (groups, 1)),
+        swa,
+        jnp.arange(groups + 1, dtype=jnp.int32) * 6,
+        jnp.tile(positions[:6], groups),
+        sink,
+        jnp.tile(rope[:6], (groups, 1, 1)),
+    )
+    options = dict(
+        swa_metadata=jnp.tile(base_kwargs["swa_metadata"], (groups, 1)),
+        main_lengths=jnp.tile(base_kwargs["main_lengths"], groups),
+        bq=6,
+        uniform_queries=True,
+    )
+    if jax.default_backend() == "tpu":
+        actual = csa2_matmulw8a16(*native, **options)
+        expected = np.tile(numpy_reference(base, base_kwargs), (groups, 1, 1))
+        np.testing.assert_allclose(
+            np.asarray(actual, np.float32), expected, atol=2e-3, rtol=2e-2
+        )
+    else:
+        mesh = jax.sharding.AbstractMesh(
+            (1,),
+            ("core",),
+            abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+        )
+        with jax.sharding.use_abstract_mesh(mesh):
+            traced = jax.make_jaxpr(lambda *x: csa2_matmulw8a16(*x, **options))(*native)
+        assert traced.out_avals[0].shape == native[0].shape
