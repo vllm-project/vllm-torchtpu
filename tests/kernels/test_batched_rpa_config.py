@@ -25,6 +25,7 @@ def _create_mock_tpu_info(
     generation: int,
     chip_version: str = "v8i",
     num_lanes: int = 128,
+    num_sublanes: int = 8,
     mxu_column_size: int = 128,
     vmem_capacity_bytes: int = 64 * 1024 * 1024,
     fp8_ops_per_second: int = 2,
@@ -34,6 +35,7 @@ def _create_mock_tpu_info(
     mock.generation = generation
     mock.chip_version = chip_version
     mock.num_lanes = num_lanes
+    mock.num_sublanes = num_sublanes
     mock.mxu_column_size = mxu_column_size
     mock.vmem_capacity_bytes = vmem_capacity_bytes
     mock.fp8_ops_per_second = fp8_ops_per_second
