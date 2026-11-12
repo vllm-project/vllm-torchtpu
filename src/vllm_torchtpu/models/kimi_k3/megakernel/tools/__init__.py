@@ -13,4 +13,8 @@
 # limitations under the License.
 
 # Source provenance: inferact/k3-megakernel@30c9ba966b tools/megakernel/__init__.py
-"""Standalone tools for megakernel programs (``python -m vllm_torchtpu.models.kimi_k3.megakernel.tools``)."""
+"""Standalone CLI tools for Kimi-K3 megakernel weight pre-sharding and verification.
+
+Standalone tools for megakernel programs (``python -m
+vllm_torchtpu.models.kimi_k3.megakernel.tools``).
+"""
