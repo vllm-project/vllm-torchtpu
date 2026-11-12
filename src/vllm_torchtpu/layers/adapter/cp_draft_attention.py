@@ -13,23 +13,29 @@
 # limitations under the License.
 """Sliding-window draft attention over a DCP-sharded KV cache, in XLA.
 
-A drafter's KV cache (e.g. the DSpark draft of MiniMax-M3) is sharded like
-the target's under decode context parallelism: global block ``b`` of 128
-tokens lives on DCP rank ``b % dcp`` in page ``block_tables[seq, b // dcp]``
-(vLLM's logical block ``j`` covers ``dcp`` blocks). A DCP group wider than
-a KV head's tensor-parallel replicas stores all ``G`` KV heads of the group
-per row (``kv_heads``), so every rank serves every query head of the group.
+A drafter's KV cache (e.g. the DSpark draft of MiniMax-M3) is sharded over
+the decode-context-parallel group with the target's block tables: vLLM's
+logical block ``j`` covers the ``dcp`` global blocks of 128 tokens
+``j * dcp .. j * dcp + dcp - 1`` and has page ``block_tables[seq, j]`` on
+every rank. Each rank stores only its own KV head. The ``head_ranks`` ranks
+of the group holding one KV head (its tensor-parallel replicas, at most
+``dcp``) split its tokens: global block ``b`` lives on the head's rank
+``b % head_ranks``, as the ``(b % dcp) // head_ranks``-th of the
+``dcp // head_ranks`` blocks its page holds (`_page_slot`). So a K/V write
+moves nothing between ranks, and attention exchanges queries and partial
+outputs only within the ranks of one head; with one rank per head
+(``head_ranks == 1``) nothing crosses at all.
 
 The draft attends a short query block (its draft tokens) over a window of
-cached context, so this runs without a Pallas kernel (the batched RPA DCP
+cached context, so this runs without the RPA kernels (the batched RPA DCP
 kernels reject sliding windows):
 
-1. `write_kv`: each rank writes the K/V rows of the tokens whose block it
-   owns, the other tokens are dropped.
-2. `attend_cached`: each rank attends every group query head over the
-   window's blocks it holds and returns the partial output and its
-   log-sum-exp; the caller merges the ranks' partials
-   (`dcp_comm.cp_lse_ag_out_rs`) back to its own heads.
+1. `write_kv`: each rank writes its KV head's K/V of the tokens whose block
+   it holds, the other tokens are dropped.
+2. `attend_cached`: each rank attends its head's query heads (gathered from
+   the head's ranks) over the window's blocks it holds and returns the
+   partial output and its log-sum-exp; the caller merges the head's ranks'
+   partials (`dcp_comm.cp_lse_ag_out_rs`) back to its own query heads.
 3. `attend_block`: the query block over its own new K/V (causal or not, as
    the layer; the block is shorter than the window), on every rank with its
    own heads; merged with step 2 by LSE.
@@ -38,8 +44,11 @@ Together they equal the RPA kernel's sliding-window attention over the full
 context (``q - k < window``, plus ``q >= k`` if causal; DSpark's query block
 is non-causal), with the block written to the cache.
 
-Cache rows use the RPA page layout ``[pages, S, 2G' / p, p, D]`` (``G'``
-the KV heads padded to the packing), K and V of head ``h`` interleaved.
+Pages keep the RPA shape ``[pages, S, words, p, D]`` (``p`` entries per
+32-bit word) and the byte size of ``dcp // head_ranks`` KV heads. Read as
+``S * words`` rows of one word each, a page holds its blocks' token-heads
+(a token's K and V, adjacent entries) in position order, `_halves` of them
+per word.
 """
 
 import functools
@@ -65,15 +74,41 @@ def _token_layout(seq_lens: jax.Array, cu_q_lens: jax.Array, num_tokens: int):
     return seq, jnp.where(valid, pos, 0), valid
 
 
-def merge_rows(key: jax.Array, value: jax.Array, page_shape) -> jax.Array:
-    """``[T, G, D]`` K and V -> cache rows ``[T, 2G' / p, p, D]`` (K_h, V_h
-    interleaved, zero-padded to the packing)."""
-    num_tokens, kv_heads, head_dim = key.shape
-    words, packing, width = page_shape
-    kv = jnp.concatenate([key, value], axis=-1).reshape(num_tokens, 2 * kv_heads, head_dim)
-    pad_heads = words * packing - 2 * kv_heads
-    kv = jnp.pad(kv, ((0, 0), (0, pad_heads), (0, width - head_dim)))
-    return kv.reshape(num_tokens, words, packing, width)
+def _page_slot(pos, *, page_size: int, dcp: int, head_ranks: int):
+    """Global position -> (rank of its KV head's ``head_ranks`` holding it,
+    token-head index in the page of its logical block)."""
+    block = pos // page_size
+    slot = (block % dcp) // head_ranks * page_size + pos % page_size
+    return block % head_ranks, slot
+
+
+def _halves(page_shape, page_blocks: int) -> int:
+    """Token-heads per 32-bit word of a page (``[S, words, p, D]``) holding
+    ``page_blocks`` blocks of one KV head."""
+    _, words, packing, _ = page_shape
+    if packing < 2:
+        raise NotImplementedError("a token's K and V must share a 32-bit word")
+    halves = min(packing // 2, page_blocks)
+    # Every slot of a page must be one of its blocks' (the readers treat them so).
+    if words * halves != page_blocks:
+        raise NotImplementedError(f"{page_blocks} blocks do not fill page {page_shape}")
+    return halves
+
+
+def token_head_rows(key: jax.Array, value: jax.Array, halves: int, page_shape):
+    """``[T, 1, D]`` K and V of one KV head -> ``[T, p / halves, D']`` half-word
+    rows of pages ``[S, words, p, D']`` (K, V, zero padding)."""
+    *_, packing, width = page_shape
+    entries = packing // halves
+    num_tokens, _, head_dim = key.shape
+    # Equal values, laid out differently by XLA: stacked pairs feed
+    # `write_pairs`' word views without a relayout (~300 us per 8K-token write
+    # at TP8/DCP8), the concatenation keeps the one-head pages' write as fast.
+    if halves == 2:
+        kv = jnp.stack([key[:, 0], value[:, 0]], axis=1)
+    else:
+        kv = jnp.concatenate([key, value], axis=-1).reshape(num_tokens, 2, head_dim)
+    return jnp.pad(kv, ((0, 0), (0, entries - 2), (0, width - head_dim)))
 
 
 def _quantize(x: jax.Array, dtype, scale: float | None) -> jax.Array:
@@ -94,37 +129,51 @@ def write_kv(
     cu_q_lens: jax.Array,
     *,
     dcp: int,
+    head_ranks: int,
     rank: jax.Array,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    interpret: bool = False,
 ) -> jax.Array:
-    """Write this step's K/V (``[T, G, D]``, every head of the group) at the
-    tokens' positions, keeping only the tokens of blocks this rank owns."""
+    """Write this step's K/V of this rank's KV head (``[T, 1, D]``) at the
+    tokens' positions, keeping only the tokens of blocks this rank holds."""
+    from vllm_torchtpu.models.minimax_m3.kernels.msa_write import max_write_runs
+
     num_tokens = key.shape[0]
-    num_pages, page_size = kv_cache.shape[:2]
+    num_pages, page_size, words, packing, width = kv_cache.shape
     max_seqs = seq_lens.shape[0]
     tables = block_tables.reshape(max_seqs, -1)
     seq, pos, valid = _token_layout(seq_lens, cu_q_lens, num_tokens)
-    block = pos // page_size
-    mine = valid & (block % dcp == rank)
-    page = jnp.where(mine, tables[seq, block // dcp], num_pages)
-    rows = merge_rows(
+    holder, slot = _page_slot(pos, page_size=page_size, dcp=dcp, head_ranks=head_ranks)
+    mine = valid & (holder == rank % head_ranks)
+    page = jnp.where(mine, tables[seq, pos // page_size // dcp], num_pages)
+    halves = _halves(kv_cache.shape[1:], dcp // head_ranks)
+    rows = token_head_rows(
         _quantize(key, kv_cache.dtype, k_scale),
         _quantize(value, kv_cache.dtype, v_scale),
-        kv_cache.shape[2:],
+        halves,
+        kv_cache.shape[1:],
     )
-    from vllm_torchtpu.models.minimax_m3.kernels.msa_write import max_write_runs
-
-    # A rank owns whole pages, so a request's tokens break into at most
-    # q // page_size + 2 runs, the bound `max_write_runs` takes.
-    write = write_runs if num_tokens >= _RUN_WRITE_MIN_TOKENS else write_runs_batched
-    return write(
-        kv_cache,
-        rows,
-        page,
-        pos % page_size,
-        max_runs=max_write_runs(num_tokens, max_seqs, page_size),
-    )
+    # A request's tokens on this rank break at each of its blocks, so into at
+    # most q // page_size + 2 runs, the bound `max_write_runs` takes.
+    max_runs = max_write_runs(num_tokens, max_seqs, page_size)
+    if halves == 2:
+        word_rows = kv_cache.reshape(num_pages, page_size * words, packing, width)
+        written = write_pairs(
+            word_rows, rows, page, slot, max_runs=max_runs, interpret=interpret
+        )
+    else:
+        # One token-head per word row ([.., 1, p, D], the page's own shape
+        # when it holds one block).
+        word_rows = kv_cache.reshape(num_pages, page_size * words, 1, packing, width)
+        write = (
+            write_runs if num_tokens >= _RUN_WRITE_MIN_TOKENS else write_runs_batched
+        )
+        rows = rows.reshape(num_tokens, 1, packing, width)
+        written = write(
+            word_rows, rows, page, slot, max_runs=max_runs, interpret=interpret
+        )
+    return written.reshape(kv_cache.shape)
 
 
 # Prefill-sized writes take one grid step per run (`write_runs`); a decode
@@ -148,7 +197,9 @@ def write_runs_batched(
     from vllm_torchtpu.models.minimax_m3.kernels.msa_write import token_runs
 
     num_pages, page_size = kv_cache.shape[:2]
-    pieces = [1 << b for b in reversed(range(page_size.bit_length()))]
+    # A run fits a page and the rows.
+    longest = min(page_size, rows.shape[0])
+    pieces = [1 << b for b in reversed(range(longest.bit_length()))]
     num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
         pages.astype(jnp.int32), slots.astype(jnp.int32), num_pages, max_runs
     )
@@ -217,7 +268,9 @@ def write_runs(
     from vllm_torchtpu.models.minimax_m3.kernels.msa_write import token_runs
 
     num_pages, page_size = kv_cache.shape[:2]
-    pieces = [1 << b for b in reversed(range(page_size.bit_length()))]
+    # A run fits a page and the rows.
+    longest = min(page_size, rows.shape[0])
+    pieces = [1 << b for b in reversed(range(longest.bit_length()))]
     num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
         pages.astype(jnp.int32), slots.astype(jnp.int32), num_pages, max_runs
     )
@@ -261,48 +314,154 @@ def write_runs(
     )(num_runs[None], run_page, run_lo, run_hi, run_tok0, rows, kv_cache)
 
 
-def gather_pages(kv_cache: jax.Array, pages: jax.Array, *, interpret: bool = False) -> jax.Array:
-    """``kv_cache[pages]`` for ``pages [R, L]`` by one page DMA per grid step.
+def write_pairs(
+    cache: jax.Array,
+    rows: jax.Array,
+    pages: jax.Array,
+    slots: jax.Array,
+    *,
+    max_runs: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """Write token ``t``'s half-word ``rows[t]`` (``[p / 2, D]``) at half
+    ``slots[t]`` of page ``pages[t]`` (dropped out of range) of a cache of
+    two-half words (``[pages, W, p, D]`` of 8-bit entries), by DMA from one
+    grid step, run by run (consecutive tokens taking consecutive halves of one
+    page) in whole words.
 
-    An XLA gather of whole pages from the paged cache converts the cache's
-    layout on SparseCore on every call (~1 ms per draft layer at c16 DCP2,
-    scaling with the cache), so copy the pages with a Pallas kernel instead.
+    A run starting at an odd half keeps its first word's first half from the
+    cache (read and merged in VMEM); a run ending at an odd half fills its
+    last word's second half with the next row. That half is the position after
+    the run, past what its request has written: cache positions are written in
+    order, so no earlier write holds data there.
     """
-    num_rows, num_cols = pages.shape
-    page_shape = kv_cache.shape[1:]
-    zeros = (0,) * len(page_shape)
+    from vllm_torchtpu.models.minimax_m3.kernels.msa_write import token_runs
 
-    def kernel(pages_ref, page_ref, o_ref):
-        del pages_ref
-        o_ref[0] = page_ref[...]
+    num_pages, page_words, packing, width = cache.shape
+    num_tokens = rows.shape[0]
+    assert jax.dtypes.itemsize_bits(cache.dtype) == 8 and rows.shape[1] * 2 == packing
+    num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
+        pages.astype(jnp.int32), slots.astype(jnp.int32), num_pages, max_runs
+    )
+    # Two word views of the rows: view 0 pairs rows (2w, 2w + 1), view 1 rows
+    # (2w - 1, 2w). A run's words start at row tok0 - (lo odd) in one of them.
+    view_words = num_tokens // 2 + 1
+    views = jnp.concatenate(
+        [
+            jnp.pad(rows, ((0, 2 * view_words - num_tokens), (0, 0), (0, 0))),
+            jnp.pad(rows, ((1, 2 * view_words - num_tokens - 1), (0, 0), (0, 0))),
+        ]
+    ).reshape(2 * view_words, packing, width)
+    first_row = run_tok0 - run_lo % 2
+    # A run's words fit a page and a view.
+    longest = min(page_words, view_words)
+    pieces = [1 << b for b in reversed(range(longest.bit_length()))]
+    run_src = (first_row % 2) * view_words + (first_row + 1) // 2
 
+    def kernel(
+        n_ref,
+        page_ref,
+        lo_ref,
+        hi_ref,
+        src_ref,
+        views_hbm,
+        cache_in,
+        cache_out,
+        *scratch,
+    ):
+        old, new, sem = scratch
+        del cache_in
+
+        def edge_copies(r):
+            word = (page_ref[r], pl.ds(lo_ref[r] // 2, 1))
+            return [
+                pltpu.make_async_copy(
+                    cache_out.at[word], old.at[pl.ds(r, 1)], sem.at[0]
+                ),
+                pltpu.make_async_copy(
+                    views_hbm.at[pl.ds(src_ref[r], 1)], new.at[pl.ds(r, 1)], sem.at[0]
+                ),
+            ]
+
+        def run_copies(r):
+            odd = lo_ref[r] % 2
+            first = lo_ref[r] // 2 + odd
+            count = (hi_ref[r] + 1) // 2 - first
+            copies = [
+                (
+                    odd == 1,
+                    pltpu.make_async_copy(
+                        new.at[pl.ds(r, 1)],
+                        cache_out.at[page_ref[r], pl.ds(lo_ref[r] // 2, 1)],
+                        sem.at[0],
+                    ),
+                )
+            ]
+            for size in pieces:
+                off = count & ~(2 * size - 1)  # after the larger pieces
+                copy = pltpu.make_async_copy(
+                    views_hbm.at[pl.ds(src_ref[r] + odd + off, size)],
+                    cache_out.at[page_ref[r], pl.ds(first + off, size)],
+                    sem.at[0],
+                )
+                copies.append(((count & size) != 0, copy))
+            return copies
+
+        def each_edge(method):
+            def body(r, carry):
+                @pl.when(lo_ref[r] % 2 == 1)
+                def _():
+                    for copy in edge_copies(r):
+                        getattr(copy, method)()
+
+                return carry
+
+            jax.lax.fori_loop(0, n_ref[0], body, 0)
+
+        each_edge("start")
+        each_edge("wait")
+        old_words = old.bitcast(jnp.uint32)
+        new_words = new.bitcast(jnp.uint32)
+
+        def merge(r, carry):
+            # Entries fill a word from its lowest bits: half 0 is bits 0-15.
+            @pl.when(lo_ref[r] % 2 == 1)
+            def _():
+                new_words[r] = (old_words[r] & low) | (new_words[r] & ~low)
+
+            return carry
+
+        low = jnp.uint32(0xFFFF)
+        jax.lax.fori_loop(0, n_ref[0], merge, 0)
+
+        def each_run(method):
+            def body(r, carry):
+                for todo, copy in run_copies(r):
+                    pl.when(todo)(getattr(copy, method))
+                return carry
+
+            jax.lax.fori_loop(0, n_ref[0], body, 0)
+
+        each_run("start")
+        each_run("wait")
+
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    edge = pltpu.VMEM((max_runs, packing, width), cache.dtype)
     return pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            grid=(num_rows, num_cols),
-            in_specs=[
-                pl.BlockSpec(
-                    (1, *page_shape),
-                    lambda r, c, pages_ref: (pages_ref[r * num_cols + c], *zeros),
-                )
-            ],
-            out_specs=pl.BlockSpec(
-                (1, 1, *page_shape), lambda r, c, pages_ref: (r, c, *zeros)
-            ),
+            num_scalar_prefetch=5,
+            grid=(1,),
+            in_specs=[hbm, hbm],
+            out_specs=hbm,
+            scratch_shapes=[edge, edge, pltpu.SemaphoreType.DMA((1,))],
         ),
-        out_shape=jax.ShapeDtypeStruct((num_rows, num_cols, *page_shape), kv_cache.dtype),
+        out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
+        # Operand 6 = the cache (after 5 scalar-prefetch operands and the rows).
+        input_output_aliases={6: 0},
         interpret=interpret,
-        name="dcp_draft_gather_pages",
-    )(pages.reshape(-1).astype(jnp.int32), kv_cache)
-
-
-def _read_heads(pages: jax.Array, kv_heads: int, head_dim: int):
-    """Gathered pages ``[..., S, 2G' / p, p, D]`` -> K, V ``[..., S, G, D]``."""
-    shape = pages.shape
-    kv = pages.reshape(*shape[:-3], -1, shape[-1])[..., : 2 * kv_heads, :head_dim]
-    kv = kv.reshape(*shape[:-3], kv_heads, 2, head_dim)
-    return kv[..., 0, :], kv[..., 1, :]
+        name="dcp_draft_write_pairs",
+    )(num_runs[None], run_page, run_lo, run_hi, run_src, views, cache)
 
 
 def _window_pages(
@@ -314,25 +473,28 @@ def _window_pages(
     sliding_window,
     page_size,
     dcp,
+    head_ranks,
     rank,
 ):
-    """Per request: the cached length, and the global blocks of the window this
-    rank holds with their pages (``[R, L]`` each)."""
+    """Per request: the cached length, and the pages of the window's logical
+    blocks with the global block each page's first slot holds on this rank
+    (``[R, L]`` each; slot ``k`` holds that block ``+ k * head_ranks``)."""
     max_seqs = seq_lens.shape[0]
     tables = block_tables.reshape(max_seqs, -1)
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     cache_lens = seq_lens - q_lens
     # Blocks a request's tokens can see: the window of its first query token
-    # through its last cached block; this rank's are every dcp-th.
+    # through its last cached block; this rank's are every head_ranks-th.
     window_blocks = -(-(sliding_window + max_query_len) // page_size) + 1
-    local_blocks = -(-window_blocks // dcp) + 1
+    num_pages = -(-window_blocks // dcp) + 1
     first = jnp.maximum(cache_lens - sliding_window + 1, 0) // page_size
-    first_mine = first + (rank - first) % dcp
-    blocks = first_mine[:, None] + dcp * jnp.arange(local_blocks)[None, :]
+    holder = rank % head_ranks
+    first_page = (first + (holder - first) % head_ranks) // dcp
+    logical = first_page[:, None] + jnp.arange(num_pages)[None, :]
     pages = tables[
-        jnp.arange(max_seqs)[:, None], jnp.minimum(blocks // dcp, tables.shape[1] - 1)
+        jnp.arange(max_seqs)[:, None], jnp.minimum(logical, tables.shape[1] - 1)
     ]
-    return q_lens, cache_lens, blocks, pages
+    return q_lens, cache_lens, logical * dcp + holder, pages
 
 
 def attend_cached(
@@ -342,7 +504,7 @@ def attend_cached(
     block_tables: jax.Array,
     cu_q_lens: jax.Array,
     *,
-    kv_heads: int,
+    head_ranks: int,
     max_query_len: int,
     sliding_window: int,
     sm_scale: float,
@@ -353,9 +515,9 @@ def attend_cached(
     interpret: bool = False,
     uniform_blocks: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """Partial attention of ``q [T, H, D]`` (every query head of the group,
-    head ``i`` reading KV head ``i * G // H``) over the cached tokens of the
-    window held by this rank. Returns ``(out [T, H, D], lse [T, H] f32)``;
+    """Partial attention of ``q [T, H, D]`` (every query head of this rank's
+    KV head) over the cached tokens of the window held by this rank. Returns
+    ``(out [T, H, D], lse [T, H] f32)``;
     ``lse`` is -inf where the rank holds none of a token's window.
 
     A request's query tokens are at most `max_query_len` (the draft block);
@@ -371,6 +533,7 @@ def attend_cached(
         sliding_window=sliding_window,
         page_size=kv_cache.shape[1],
         dcp=dcp,
+        head_ranks=head_ranks,
         rank=rank,
     )
     out, lse = attend_pages(
@@ -382,7 +545,8 @@ def attend_cached(
         q_lens,
         cu_q_lens[:-1],
         max_query_len=max_query_len,
-        kv_heads=kv_heads,
+        dcp=dcp,
+        head_ranks=head_ranks,
         sliding_window=sliding_window,
         sm_scale=sm_scale,
         k_scale=k_scale,
@@ -424,7 +588,8 @@ def attend_pages(
     q_starts: jax.Array,
     *,
     max_query_len: int,
-    kv_heads: int,
+    dcp: int,
+    head_ranks: int,
     sliding_window: int,
     sm_scale: float,
     k_scale: float | None = None,
@@ -433,10 +598,11 @@ def attend_pages(
 ) -> tuple[jax.Array, jax.Array]:
     """Each request's query tokens (``q [T, H, D]`` rows ``q_starts[r]`` on,
     ``q_lens[r]`` of at most ``max_query_len``) over its window pages
-    ``pages [R, L]`` (global blocks ``blocks [R, L]``), read straight from the
-    paged cache: one grid step per request DMAs its L pages and query rows into
-    VMEM (the next request's while this one computes), attends every KV
-    head's query group to them and DMAs the output rows back. Returns
+    ``pages [R, L]`` (first slots' global blocks ``blocks [R, L]``,
+    `_window_pages`), read straight from the paged cache: one grid step per
+    request DMAs its L pages and query rows into VMEM (the next request's
+    while this one computes), attends every query head to the pages'
+    token-heads and DMAs the output rows back. Returns
     ``(out [T, H, D] in q's dtype, lse [R, Q, H] f32)``; rows of ``out`` no request
     owns are undefined.
 
@@ -448,20 +614,20 @@ def attend_pages(
     num_reqs, num_cols = pages.shape
     q_block = max_query_len
     page_size, words, packing, width = kv_cache.shape[1:]
-    group = num_heads // kv_heads
-    rows = q_block * group
-    keys = num_cols * page_size
+    halves = _halves(kv_cache.shape[1:], dcp // head_ranks)
+    page_rows = page_size * words
+    rows = q_block * num_heads
+    # Word rows of the window; each holds `halves` keys.
+    keys = num_cols * page_rows
     bits = jax.dtypes.itemsize_bits(kv_cache.dtype)
-    # 8- and 16-bit caches hold bf16-exact values: QK^T takes them as bf16
-    # with the scales applied to the f32 products; PV stays f32 (P is not
-    # bf16-exact, and the kernel is VPU-bound, not MXU-bound).
-    mxu_dtype = jnp.bfloat16 if bits <= 16 else jnp.float32
+    # 8- and 16-bit caches (`_halves`) hold bf16-exact values: QK^T takes them
+    # as bf16 with the scales applied to the f32 products; PV stays f32 (P is
+    # not bf16-exact, and the kernel is VPU-bound, not MXU-bound).
+    mxu_dtype = jnp.bfloat16
     k_mult = sm_scale * (1.0 if k_scale is None else k_scale)
     v_mult = 1.0 if v_scale is None else v_scale
 
     def unpack(raw, slot):
-        if bits == 32:
-            return pltpu.bitcast(raw, kv_cache.dtype)
         part = (raw >> (bits * slot)) & ((1 << bits) - 1)
         return pltpu.bitcast(part.astype(jnp.dtype(f"uint{bits}")), kv_cache.dtype)
 
@@ -576,72 +742,72 @@ def attend_pages(
             cache_len = cache_ref[r]
             col = jax.lax.broadcasted_iota(jnp.int32, (1, keys), 1)
             row_k = jax.lax.broadcasted_iota(jnp.int32, (keys, 1), 0)
-            k_pos = jnp.zeros((1, keys), jnp.int32)
-            k_pos_col = jnp.zeros((keys, 1), jnp.int32)
-            for c in range(num_cols):
-                base = blocks_ref[r * num_cols + c] * page_size - c * page_size
-                k_pos = jnp.where(col // page_size == c, col + base, k_pos)
-                k_pos_col = jnp.where(row_k // page_size == c, row_k + base, k_pos_col)
-            q_tok = jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0) // group
-            visible = (
-                (k_pos < cache_len)
-                & (cache_len + q_tok - k_pos < sliding_window)
-                & (q_tok < qlen_ref[r])
+            q_tok = jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0) // num_heads
+            # [L * S * words, width] u32: one word row each, `packing` entries
+            # (token-head h's K and V at 2h, 2h + 1), lowest bits first.
+            kv_u32 = buf.at[slot].bitcast(jnp.uint32).reshape(keys, width)[...]
+            # [Q, H, D] -> [Q * H, D]: row q * H + h is token q, head h.
+            qv = q_buf[slot].reshape(rows, head_dim).astype(mxu_dtype)
+
+            def key_positions(index, half):
+                """Global position of half `half` of each word row ``index``."""
+                pos = jnp.zeros(index.shape, jnp.int32)
+                for c in range(num_cols):
+                    token_head = (index - c * page_rows) * halves + half
+                    block = (
+                        blocks_ref[r * num_cols + c]
+                        + token_head // page_size * head_ranks
+                    )
+                    pos = jnp.where(
+                        index // page_rows == c,
+                        block * page_size + token_head % page_size,
+                        pos,
+                    )
+                return pos
+
+            scores, values = [], []
+            for half in range(halves):
+                k_pos = key_positions(col, half)
+                visible = (
+                    (k_pos < cache_len)
+                    & (cache_len + q_tok - k_pos < sliding_window)
+                    & (q_tok < qlen_ref[r])
+                )
+                # Masked keys must hold finite values (the cache is
+                # zero-initialised and writes clip): an add, unlike a select,
+                # would carry a NaN score through.
+                bias = jnp.where(visible, 0.0, _NEG_INF)
+                k = unpack(kv_u32, 2 * half)[:, :head_dim].astype(mxu_dtype)
+                v = unpack(kv_u32, 2 * half + 1)[:, :head_dim].astype(jnp.float32)
+                values.append(jnp.where(key_positions(row_k, half) < cache_len, v, 0.0))
+                s = jax.lax.dot_general(
+                    qv, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+                )
+                scores.append(s * k_mult + bias)
+            m = functools.reduce(
+                jnp.maximum, [jnp.max(s, axis=-1, keepdims=True) for s in scores]
             )
-            cached = k_pos_col < cache_len
-            # One additive mask per request, shared by every KV head. Masked keys
-            # must hold finite values (the cache is zero-initialised and writes
-            # clip): an add, unlike a select, would carry a NaN score through.
-            bias = jnp.where(visible, 0.0, _NEG_INF)
-            # Moves a [rows, 1] column to a [1, rows] row (sublanes to lanes).
+            m_safe = jnp.where(m > _NEG_INF, m, 0.0)
+            probs = [jnp.exp(s - m_safe) for s in scores]
+            denom = functools.reduce(
+                jnp.add, [jnp.sum(p, axis=-1, keepdims=True) for p in probs]
+            )
+            safe = jnp.where(denom > 0, denom, 1.0)
+            out = functools.reduce(
+                jnp.add,
+                [
+                    jnp.dot(p, v, preferred_element_type=jnp.float32)
+                    for p, v in zip(probs, values)
+                ],
+            )
+            out = out * (v_mult / safe)
+            o_buf[slot] = out.reshape(q_block, num_heads, head_dim).astype(o_buf.dtype)
+            lse = jnp.where(denom > 0, m_safe + jnp.log(safe), _NEG_INF)
+            # Moves the [rows, 1] column to a [1, rows] row (sublanes to lanes).
             diag = jax.lax.broadcasted_iota(
                 jnp.int32, (rows, rows), 0
             ) == jax.lax.broadcasted_iota(jnp.int32, (rows, rows), 1)
-            # [L * S * words, width] u32: row (token, word), each word `packing`
-            # K/V entries (K and V of head h at 2h, 2h + 1), lowest bits first.
-            kv_u32 = buf.at[slot].bitcast(jnp.uint32).reshape(keys * words, width)
-            loaded = {}
-
-            def load_word(w):
-                if w not in loaded:
-                    loaded[w] = (
-                        kv_u32[pl.ds(w, keys, stride=words)]
-                        if words > 1
-                        else kv_u32[...]
-                    )
-                return loaded[w]
-
-            for g in range(kv_heads):
-                k_word, k_slot = divmod(2 * g, packing)
-                v_word, v_slot = divmod(2 * g + 1, packing)
-                k = unpack(load_word(k_word), k_slot)[:, :head_dim].astype(mxu_dtype)
-                v = unpack(load_word(v_word), v_slot)[:, :head_dim].astype(jnp.float32)
-                v = jnp.where(cached, v, 0.0)
-                # [Q, X, D] -> [Q * X, D]: row q * X + x is token q, head g * X + x.
-                qv = q_buf[slot, :, g * group : (g + 1) * group, :].reshape(
-                    rows, head_dim
-                )
-                s = jax.lax.dot_general(
-                    qv.astype(mxu_dtype),
-                    k,
-                    (((1,), (1,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
-                s = s * k_mult + bias
-                m = jnp.max(s, axis=-1, keepdims=True)
-                m_safe = jnp.where(m > _NEG_INF, m, 0.0)
-                p = jnp.exp(s - m_safe)
-                denom = jnp.sum(p, axis=-1, keepdims=True)
-                safe = jnp.where(denom > 0, denom, 1.0)
-                out = jnp.dot(p, v, preferred_element_type=jnp.float32)
-                out = out * (v_mult / safe)
-                o_buf[slot, :, g * group : (g + 1) * group, :] = out.reshape(
-                    q_block, group, head_dim
-                ).astype(o_buf.dtype)
-                lse = jnp.where(denom > 0, m_safe + jnp.log(safe), _NEG_INF)
-                lse_ref[0, g] = jnp.sum(
-                    jnp.where(diag, lse, 0.0), axis=0, keepdims=True
-                )
+            lse_ref[0] = jnp.sum(jnp.where(diag, lse, 0.0), axis=0, keepdims=True)
 
         pl.when(cache_ref[r] > 0)(attend)
 
@@ -673,7 +839,7 @@ def attend_pages(
             ],
             out_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec((1, kv_heads, 1, rows), lambda r, *_: (r, 0, 0, 0)),
+                pl.BlockSpec((1, 1, rows), lambda r, *_: (r, 0, 0)),
             ],
             scratch_shapes=[
                 pltpu.VMEM(
@@ -688,7 +854,7 @@ def attend_pages(
         ),
         out_shape=[
             jax.ShapeDtypeStruct((num_tokens, num_heads, head_dim), q.dtype),
-            jax.ShapeDtypeStruct((num_reqs, kv_heads, 1, rows), jnp.float32),
+            jax.ShapeDtypeStruct((num_reqs, 1, rows), jnp.float32),
         ],
         # The next request's pages are fetched in the current step.
         compiler_params=pltpu.CompilerParams(
@@ -705,7 +871,6 @@ def attend_pages(
         q,
         kv_cache,
     )
-    lse = lse.reshape(num_reqs, kv_heads, q_block, group).transpose(0, 2, 1, 3)
     return out, lse.reshape(num_reqs, q_block, num_heads)
 
 
@@ -716,7 +881,7 @@ def attend_cached_reference(
     block_tables: jax.Array,
     cu_q_lens: jax.Array,
     *,
-    kv_heads: int,
+    head_ranks: int,
     max_query_len: int,
     sliding_window: int,
     sm_scale: float,
@@ -724,31 +889,36 @@ def attend_cached_reference(
     rank: jax.Array,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`attend_cached` in XLA over gathered pages (the kernel's reference)."""
     num_tokens, num_heads, head_dim = q.shape
-    num_pages, page_size = kv_cache.shape[:2]
+    page_size, words, packing, width = kv_cache.shape[1:]
     max_seqs = seq_lens.shape[0]
-    tables = block_tables.reshape(max_seqs, -1)
-    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    cache_lens = seq_lens - q_lens
-    # Blocks a request's tokens can see: the window of its first query token
-    # through its last cached block; this rank's are every dcp-th.
-    window_blocks = -(-(sliding_window + max_query_len) // page_size) + 1
-    local_blocks = -(-window_blocks // dcp) + 1
-    first = jnp.maximum(cache_lens - sliding_window + 1, 0) // page_size
-    first_mine = first + (rank - first) % dcp
-    blocks = first_mine[:, None] + dcp * jnp.arange(local_blocks)[None, :]  # [R, L]
-    pages = tables[jnp.arange(max_seqs)[:, None], jnp.minimum(blocks // dcp, tables.shape[1] - 1)]
-    k, v = _read_heads(gather_pages(kv_cache, pages, interpret=interpret), kv_heads, head_dim)
-    k = k.reshape(max_seqs, -1, kv_heads, head_dim).astype(jnp.float32)
-    v = v.reshape(max_seqs, -1, kv_heads, head_dim).astype(jnp.float32)
+    q_lens, cache_lens, blocks, pages = _window_pages(
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        max_query_len=max_query_len,
+        sliding_window=sliding_window,
+        page_size=page_size,
+        dcp=dcp,
+        head_ranks=head_ranks,
+        rank=rank,
+    )
+    halves = _halves(kv_cache.shape[1:], dcp // head_ranks)
+    # [R, L, token-head, entries, D]: a page's token-heads in slot order.
+    kv = kv_cache[pages].reshape(
+        max_seqs, pages.shape[1], page_size * words * halves, packing // halves, width
+    )
+    k = kv[..., 0, :head_dim].reshape(max_seqs, -1, head_dim).astype(jnp.float32)
+    v = kv[..., 1, :head_dim].reshape(max_seqs, -1, head_dim).astype(jnp.float32)
     if k_scale is not None:
         k = k * k_scale
     if v_scale is not None:
         v = v * v_scale
-    k_pos = (blocks[:, :, None] * page_size + jnp.arange(page_size)).reshape(max_seqs, -1)
+    token_head = jnp.arange(page_size * words * halves)
+    block = blocks[:, :, None] + token_head // page_size * head_ranks
+    k_pos = (block * page_size + token_head % page_size).reshape(max_seqs, -1)
 
     # Query tokens padded per request: [R, Q].
     slot = jnp.arange(max_query_len)
@@ -756,23 +926,19 @@ def attend_cached_reference(
     tok_valid = slot[None, :] < q_lens[:, None]
     q_pos = cache_lens[:, None] + slot[None, :]
     qr = q[jnp.minimum(tok, num_tokens - 1)].astype(jnp.float32)  # [R, Q, H, D]
-    group = num_heads // kv_heads
-    qr = qr.reshape(max_seqs, max_query_len, kv_heads, group, head_dim)
-    s = jnp.einsum("rqgxd,rkgd->rqgxk", qr, k) * sm_scale
+    s = jnp.einsum("rqhd,rkd->rqhk", qr, k) * sm_scale
     visible = (
         (k_pos[:, None, :] < cache_lens[:, None, None])
         & (q_pos[:, :, None] - k_pos[:, None, :] < sliding_window)
         & tok_valid[:, :, None]
     )  # [R, Q, K]
-    s = jnp.where(visible[:, :, None, None, :], s, _NEG_INF)
+    s = jnp.where(visible[:, :, None, :], s, _NEG_INF)
     m = jnp.max(s, axis=-1, keepdims=True)
     m_safe = jnp.where(jnp.isfinite(m), m, 0.0)
     p = jnp.exp(s - m_safe)
     l = jnp.sum(p, axis=-1, keepdims=True)
-    out = jnp.einsum("rqgxk,rkgd->rqgxd", p, v) / jnp.where(l > 0, l, 1.0)
-    lse = jnp.where(l > 0, m_safe + jnp.log(jnp.where(l > 0, l, 1.0)), _NEG_INF)
-    out = out.reshape(max_seqs, max_query_len, num_heads, head_dim)
-    lse = lse.reshape(max_seqs, max_query_len, num_heads)
+    out = jnp.einsum("rqhk,rkd->rqhd", p, v) / jnp.where(l > 0, l, 1.0)
+    lse = jnp.where(l > 0, m_safe + jnp.log(jnp.where(l > 0, l, 1.0)), _NEG_INF)[..., 0]
     # Back to token order.
     seq, _, valid = _token_layout(seq_lens, cu_q_lens, num_tokens)
     col = jnp.arange(num_tokens) - cu_q_lens[seq]
@@ -873,7 +1039,7 @@ def merge(out_a, lse_a, out_b, lse_b):
 def build_ops(
     *,
     dcp: int,
-    kv_heads: int,
+    head_ranks: int,
     max_query_len: int,
     sliding_window: int,
     sm_scale: float,
@@ -886,9 +1052,9 @@ def build_ops(
     ``uniform_blocks``: every forward's query rows are ``max_query_len``
     tokens per request (`attend_cached`)."""
     return dict(
-        write=_write_op(dcp, k_scale, v_scale),
+        write=_write_op(dcp, head_ranks, k_scale, v_scale),
         attend=_attend_op(
-            kv_heads,
+            head_ranks,
             max_query_len,
             sliding_window,
             sm_scale,
@@ -902,7 +1068,7 @@ def build_ops(
 
 
 @functools.cache
-def _write_op(dcp: int, k_scale: float | None, v_scale: float | None):
+def _write_op(dcp: int, head_ranks: int, k_scale: float | None, v_scale: float | None):
     from torch_tpu._internal import pallas
 
     def _write(
@@ -922,12 +1088,14 @@ def _write_op(dcp: int, k_scale: float | None, v_scale: float | None):
             block_tables,
             query_start_loc,
             dcp=dcp,
+            head_ranks=head_ranks,
             rank=dcp_rank[0],
             k_scale=k_scale,
             v_scale=v_scale,
         )
 
-    name = f"pallas::dcp_draft_write_d{dcp}_k{k_scale}_v{v_scale}".replace(".", "p")
+    name = f"pallas::dcp_draft_write_d{dcp}_h{head_ranks}_k{k_scale}_v{v_scale}"
+    name = name.replace(".", "p")
     op = pallas.jax_op(name, _write, donate_argnums=(0,))
     op.register_fake(lambda kv_cache, *args: torch.empty_like(kv_cache))
     return op
@@ -935,7 +1103,7 @@ def _write_op(dcp: int, k_scale: float | None, v_scale: float | None):
 
 @functools.cache
 def _attend_op(
-    kv_heads: int,
+    head_ranks: int,
     max_query_len: int,
     sliding_window: int,
     sm_scale: float,
@@ -960,7 +1128,7 @@ def _attend_op(
             seq_lens,
             block_tables,
             query_start_loc,
-            kv_heads=kv_heads,
+            head_ranks=head_ranks,
             max_query_len=max_query_len,
             sliding_window=sliding_window,
             sm_scale=sm_scale,
@@ -972,7 +1140,7 @@ def _attend_op(
         )
 
     name = (
-        f"pallas::dcp_draft_attend_g{kv_heads}_q{max_query_len}_w{sliding_window}"
+        f"pallas::dcp_draft_attend_h{head_ranks}_q{max_query_len}_w{sliding_window}"
         f"_s{sm_scale:.8f}_d{dcp}_k{k_scale}_v{v_scale}_u{int(uniform_blocks)}"
     ).replace(".", "p")
     op = pallas.jax_op(name, _attend)
@@ -1023,20 +1191,11 @@ def write_with_dcp(
     kv_cache: torch.Tensor,
     attn_metadata: Any,
     dcp_rank: torch.Tensor,
-    dcp: int,
-    kv_head_replicas: int,
     ops: dict[str, Any],
 ) -> None:
-    """Write the drafter's context K/V (own KV head per rank) into the
-    DCP-sharded cache: each rank keeps the tokens of its blocks."""
-    from vllm_torchtpu.distributed.dcp import get_dcp_group
-
-    group = get_dcp_group()
-    if dcp > kv_head_replicas:
-        gathered = group.all_gather(torch.cat([key, value], dim=1).contiguous(), dim=1)
-        num_tokens, _, head_dim = gathered.shape
-        per_rank = gathered.view(num_tokens, dcp, 2, head_dim)[:, ::kv_head_replicas]
-        key, value = per_rank[:, :, 0].contiguous(), per_rank[:, :, 1].contiguous()
+    """Write the drafter's context K/V (``[T, 1, D]``, own KV head) into the
+    DCP-sharded cache: each rank keeps the tokens of the blocks it holds."""
+    assert key.shape[1] == 1, key.shape
     new_cache = ops["write"](
         kv_cache,
         key,
@@ -1059,6 +1218,7 @@ def forward_with_dcp(
     dcp_rank: torch.Tensor,
     dcp: int,
     kv_head_replicas: int,
+    head_group: Any | None,
     k_scale: float | None,
     v_scale: float | None,
     ops: dict[str, Any],
@@ -1066,14 +1226,14 @@ def forward_with_dcp(
     """The drafter's attention of its query block (``query [T, H, D]``, own
     heads; ``key``/``value [T, 1, D]``, own KV head) over the window of a
     DCP-sharded cache plus the block itself. The block is not written."""
-    from vllm_torchtpu.distributed.dcp import get_dcp_group
     from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 
-    del dcp, kv_head_replicas  # shared layer args (`write_with_dcp` uses them)
-    group = get_dcp_group()
-    # Every query head of the group; the window's K/V come from the cache and
-    # the block's own K/V stay on this rank, so only the queries cross.
-    q_all = group.all_gather(query.contiguous(), dim=1)
+    del dcp, kv_head_replicas  # shared layer args (the cache spec uses them)
+    # The window's K/V of this rank's KV head are split over `head_group`
+    # (the head's ranks), so only their query heads and partials cross.
+    q_all = query
+    if head_group is not None:
+        q_all = head_group.all_gather(query.contiguous(), dim=1)
     ctx_out, ctx_lse = ops["attend"](
         q_all,
         kv_cache,
@@ -1082,7 +1242,7 @@ def forward_with_dcp(
         attn_metadata.query_start_loc,
         dcp_rank,
     )
-    ctx_out, ctx_lse = cp_lse_ag_out_rs(ctx_out, ctx_lse, group, return_lse=True)
+    ctx_out, ctx_lse = cp_lse_ag_out_rs(ctx_out, ctx_lse, head_group, return_lse=True)
     # The block's K/V as the cache would hold them (quantized), own KV head.
     if kv_cache.dtype != key.dtype and k_scale is not None:
         key = (key.float() / k_scale).to(kv_cache.dtype).float() * k_scale

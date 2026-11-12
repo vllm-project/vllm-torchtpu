@@ -52,7 +52,7 @@ from vllm_torchtpu.block_major_pool import (
     unified_block_major_enabled,
 )
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
-from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import get_dcp_kv_head_group, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     indexer_kv_layout,
@@ -1193,15 +1193,17 @@ class PallasAttentionBackendImpl(AttentionImpl):
         quantized = bool(self.kv_cache_quantized_dtype)
         k_scale = layer._k_scale_float if quantized else None
         v_scale = layer._v_scale_float if quantized else None
+        head_ranks = min(dcp, kv_head_replicas)
         self.sharded_draft_dcp = dict(
             dcp=dcp,
             kv_head_replicas=kv_head_replicas,
+            head_group=get_dcp_kv_head_group(head_ranks),
             k_scale=k_scale,
             v_scale=v_scale,
             # Built here, outside any compiled forward (see `build_ops`).
             ops=_cp_draft_attention.build_ops(
                 dcp=dcp,
-                kv_heads=max(1, dcp // kv_head_replicas),
+                head_ranks=head_ranks,
                 max_query_len=max_query_len,
                 sliding_window=self.sliding_window,
                 sm_scale=self.scale,
@@ -1232,8 +1234,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
             dcp_rank=args["dcp_rank"],
-            dcp=args["dcp"],
-            kv_head_replicas=args["kv_head_replicas"],
             ops=args["ops"],
         )
 

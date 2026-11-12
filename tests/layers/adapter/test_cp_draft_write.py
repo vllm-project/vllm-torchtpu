@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.layers.adapter.cp_draft_attention import (
+    write_pairs,
     write_runs,
     write_runs_batched,
 )
@@ -55,3 +56,47 @@ def test_write_runs_matches_scatter(write, shape, dtype):
     np.testing.assert_array_equal(
         np.asarray(got.astype(jnp.float32)), np.asarray(expected.astype(jnp.float32))
     )
+
+
+def test_write_pairs_matches_half_word_scatter():
+    """Half-word rows (two token-heads per 8-bit word) at odd and even run
+    starts and ends: equal to a scatter of the halves, except each run's
+    half after an odd end (the position after the run, filled with the next
+    row), which stays finite."""
+    rng = np.random.default_rng(1)
+    num_pages, page_words = 24, 256
+    cache = jnp.asarray(
+        rng.standard_normal((num_pages, page_words, 4, 128)), jnp.float32
+    ).astype(jnp.float8_e4m3fn)
+    # (page, first half, length) runs; one is dropped (page out of range).
+    runs = [
+        (3, 0, 300),
+        (5, 7, 1),
+        (6, 8, 1),
+        (7, 13, 6),
+        (num_pages, 2, 5),
+        (9, 511, 1),
+        (11, 100, 129),
+    ]
+    pages = np.concatenate([np.full(n, p) for p, _, n in runs])
+    slots = np.concatenate([np.arange(lo, lo + n) for _, lo, n in runs])
+    rows = jnp.asarray(
+        rng.standard_normal((slots.shape[0], 2, 128)), jnp.float32
+    ).astype(jnp.float8_e4m3fn)
+    halves = cache.reshape(num_pages, page_words, 2, 2, 128)
+    expected = halves.at[pages, slots // 2, slots % 2].set(rows, mode="drop")
+    got = write_pairs(
+        cache,
+        rows,
+        jnp.asarray(pages, jnp.int32),
+        jnp.asarray(slots, jnp.int32),
+        max_runs=16,
+        interpret=True,
+    ).reshape(halves.shape)
+    keep = np.ones(halves.shape[:3], bool)
+    for page, lo, n in runs:
+        if page < num_pages and (lo + n) % 2:
+            keep[page, (lo + n) // 2, 1] = False
+    got, expected = np.asarray(got, np.float32), np.asarray(expected, np.float32)
+    np.testing.assert_array_equal(got[keep], expected[keep])
+    assert np.isfinite(got).all()
