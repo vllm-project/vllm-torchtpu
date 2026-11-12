@@ -23,6 +23,7 @@ destination"), which is what the pair below reproduces without the rule.
 """
 
 import contextlib
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -70,21 +71,35 @@ def _engine(monkeypatch, *, kv_role, arch=QWEN35, layout="HND", pcp=1):
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
+    from vllm_torchtpu import patch_registry
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
     was_cached = vllm_envs._is_envs_cache_enabled()
     vllm_envs.disable_envs_cache()
-    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
-    config = VllmConfig(
-        device_config=DeviceConfig(device="cpu"),
-        attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
-    )
-    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
-    config.parallel_config.prefill_context_parallel_size = pcp
-    config.model_config = SimpleNamespace(architectures=[arch])
-    if kv_role is not None:
-        config.kv_transfer_config = KVTransferConfig(
-            kv_connector="TPURaidenConnector", kv_role=kv_role
-        )
     try:
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
+        # Building a VllmConfig runs the platform's check_and_update_config.
+        # That applies the platform patches for the rest of the process (one
+        # replaces torch_tpu's Pallas shape conversion, which later tests rely
+        # on) and edits the TorchTPU bootstrap environment. The page selection
+        # needs neither, so stub both, as the platform tests do, and let
+        # monkeypatch restore the one variable the check pops.
+        monkeypatch.setattr(patch_registry, "apply", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            TpuPlatform, "_prepare_singlehost_tpu_env", lambda *args, **kwargs: None
+        )
+        monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
+        config = VllmConfig(
+            device_config=DeviceConfig(device="cpu"),
+            attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
+        )
+        resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+        config.parallel_config.prefill_context_parallel_size = pcp
+        config.model_config = SimpleNamespace(architectures=[arch])
+        if kv_role is not None:
+            config.kv_transfer_config = KVTransferConfig(
+                kv_connector="TPURaidenConnector", kv_role=kv_role
+            )
         with set_current_vllm_config(config):
             yield config
     finally:
@@ -208,3 +223,17 @@ def test_pcp_streaming_keeps_its_pages(monkeypatch):
             2048,
             4096,
         ]
+
+
+def test_engine_configs_leave_no_global_state(monkeypatch):
+    # Later tests in the process must see torch_tpu's own Pallas shape
+    # conversion and an unchanged environment. Run first or alone, this fails
+    # if building an engine config applies the platform patches.
+    from torch_tpu._internal.pallas import pallas
+
+    shapes = (pallas.get_global_shape, pallas.get_local_shape)
+    environ = dict(os.environ)
+    with _engine(monkeypatch, kv_role="kv_producer"):
+        pass
+    assert (pallas.get_global_shape, pallas.get_local_shape) == shapes
+    assert dict(os.environ) == environ
