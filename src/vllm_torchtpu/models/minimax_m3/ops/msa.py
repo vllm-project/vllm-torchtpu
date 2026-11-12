@@ -24,6 +24,8 @@ from vllm.distributed import get_tp_group
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.minimax_m3 import dcp_pack
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_dcp,
@@ -39,6 +41,52 @@ _SHARD_INDEX_CACHE_ARG = 5
 # 4-bit caches (`msa_fp4`): the scale cache follows the index cache.
 _SCALE_CACHE_ARG = 7
 _DCP_SCALE_CACHE_ARG = 6
+
+logger = init_logger(__name__)
+
+
+def _packed_merge(num_tokens: int) -> bool:
+    """Whether a DCP step of `num_tokens` merges with one packed all-to-all
+    (``TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS``). Compared while tracing:
+    the backbone is re-traced per token-bucket group."""
+    limit = envs.TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS
+    if limit:
+        logger.info_once(
+            "TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS=%d: MSA DCP partials merge "
+            "with one packed all-to-all on steps of at most %d tokens.",
+            limit,
+            limit,
+        )
+    return 0 < num_tokens <= limit
+
+
+def _packed_gather(num_tokens: int) -> bool:
+    """Whether a DCP step of `num_tokens` gathers its query heads and
+    candidates in one all-gather (``TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS``)."""
+    limit = envs.TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS
+    if limit:
+        logger.info_once(
+            "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS=%d: MSA DCP query heads "
+            "and candidates share one all-gather on steps of at most %d tokens.",
+            limit,
+            limit,
+        )
+    return 0 < num_tokens <= limit
+
+
+def _packed_collectives_enabled() -> bool:
+    """Whether either packed DCP collective env is set (fixed per process)."""
+    return bool(
+        envs.TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS
+        or envs.TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS
+    )
+
+
+def _packed_step(num_tokens: int) -> bool:
+    """Whether a one-KV-head DCP step of `num_tokens` takes a packed DCP
+    collective, and so the separate attend + `merge_head_partials` instead of
+    the fused `msa_dcp.attend_and_merge`."""
+    return _packed_gather(num_tokens) or _packed_merge(num_tokens)
 
 
 @functools.cache
@@ -406,7 +454,16 @@ def merge_head_partials(
     (`TPU_DCP_LSE_MERGE_A2A`, the MLA merge's all-to-all for small steps,
     does not apply); over one KV head the attention op merges, in f32
     (`msa_dcp.attend_and_merge`; `TPU_DCP_RS_OUT_PRECISION` does not apply
-    there)."""
+    there), unless the packed DCP collectives are on: steps of at most
+    ``TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS`` tokens take one packed
+    all-to-all here (`dcp_pack.merge_head_partials_all_to_all`)."""
+    if _packed_merge(out.shape[1]):
+        merged = dcp_pack.merge_head_partials_all_to_all(
+            out, lse, group, _all_to_all, envs.TPU_DCP_RS_OUT_PRECISION
+        )
+        if hadamard is not None:
+            merged = _rotate_heads(merged, hadamard)
+        return merged.transpose(0, 1)
     # The LSEs cross the all-gather token-major ([T, H], as the MLA merge
     # sends them): gathered head-major they took 2x as long (c48 / c64
     # twins, j-fe812c28, j-c5c4bdfc).
@@ -614,12 +671,12 @@ def get_msa_dcp_op(
         )
 
     score_op.register_fake(_score_fake)
+    attend_merge_op = attend_op = None
     if kv_heads == 1:
         attend_merge_op = _get_msa_dcp_attend_merge_op(
             sm_scale, topk, dcp, False, suffix
         )
-    else:
-        attend_merge_op = None
+    if kv_heads > 1 or _packed_collectives_enabled():
         attend_op = pallas.jax_op(
             f"pallas::minimax_m3_msa_dcp_attend_{suffix}", _attend_jax
         )
@@ -639,7 +696,16 @@ def get_msa_dcp_op(
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
-        if kv_heads > 1:
+        # The packed DCP collectives (TPU_MINIMAX_M3_DCP_QCAND_GATHER /
+        # MERGE_A2A_MAX_TOKENS) keep the separate attend + merge for their
+        # steps; otherwise one KV head attends and merges in one op.
+        packed_step = kv_heads == 1 and _packed_step(q.shape[0])
+        packed = packed_step and _packed_gather(q.shape[0])
+        if packed:
+            q_all = None
+        elif packed_step:
+            q_all = gather_query_heads(q, group)
+        elif kv_heads > 1:
             q_all, k, v, index_q = gather_group_heads(
                 q, k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
             )
@@ -658,7 +724,7 @@ def get_msa_dcp_op(
         )
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
-        if attend_merge_op is not None:
+        if not packed_step and attend_merge_op is not None:
             return attend_merge_op(
                 dcp_rank,
                 q,
@@ -668,7 +734,12 @@ def get_msa_dcp_op(
                 metadata.block_tables,
                 metadata.query_start_loc,
             )
-        candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+        if packed:
+            q_all, candidates = dcp_pack.gather_queries_and_candidates(
+                q.contiguous(), candidates, group
+            )
+        else:
+            candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
         out, lse = attend_op(
             q_all,
             kv_cache,
@@ -841,6 +912,12 @@ def _get_msa_dcp_fp4_op(
         if kv_heads == 1
         else None
     )
+    attend_op = None
+    if kv_heads == 1 and _packed_collectives_enabled():
+        attend_op = pallas.jax_op(
+            f"pallas::minimax_m3_msa_dcp_fp4_attend_{suffix}", _attend_jax
+        )
+        attend_op.register_fake(_head_major_attend_fake)
     heads_op = (
         _get_msa_dcp_heads_op(
             sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix
@@ -951,33 +1028,44 @@ def _get_msa_dcp_fp4_op(
                 metadata.query_start_loc,
                 metadata.request_distribution,
             )
-        if attend_rot_op is not None:
-            # TPU_MINIMAX_M3_DCP_EARLY_Q_GATHER: the query heads were gathered
-            # ahead of the scoring op; attend them, then merge the partials.
-            candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
-            out, lse = attend_rot_op(
-                q_all,
+        if attend_rot_op is None and not _packed_step(q.shape[0]):
+            assert attend_merge_op is not None
+            return attend_merge_op(
+                dcp_rank,
+                q,
                 kv_cache,
-                scale_cache,
                 candidates,
                 metadata.seq_lens,
                 metadata.block_tables,
                 metadata.query_start_loc,
-                dcp_rank,
+                scale_cache,
+                hadamard,
             )
-            return merge_head_partials(out, lse, group, hadamard)
-        assert attend_merge_op is not None
-        return attend_merge_op(
-            dcp_rank,
-            q,
+        # TPU_MINIMAX_M3_DCP_EARLY_Q_GATHER (query heads gathered ahead of the
+        # scoring op) or the packed DCP collectives: attend, then merge.
+        if q_all is None and _packed_gather(q.shape[0]):
+            q_all, candidates = dcp_pack.gather_queries_and_candidates(
+                q, candidates, group
+            )
+            attend = attend_op
+        else:
+            candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+            if q_all is None:
+                q_all = gather_query_heads(q, group)
+                attend = attend_op
+            else:
+                attend = attend_rot_op
+        out, lse = attend(
+            q_all,
             kv_cache,
+            scale_cache,
             candidates,
             metadata.seq_lens,
             metadata.block_tables,
             metadata.query_start_loc,
-            scale_cache,
-            hadamard,
+            dcp_rank,
         )
+        return merge_head_partials(out, lse, group, hadamard)
 
     return op
 
