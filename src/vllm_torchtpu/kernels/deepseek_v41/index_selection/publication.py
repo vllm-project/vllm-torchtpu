@@ -52,10 +52,6 @@ class Radix:
         counts, last = plsc.scan_count(digits, mask=bits > ORDERED_NEG_INF)
         plsc.addupdate_scatter(self.histogram, [digits], counts, mask=last)
 
-    def _bucket(self, bucket):
-        index = jnp.full(self.lanes, bucket, jnp.int32)
-        return plsc.load_gather(self.histogram, [index])[0]
-
     def pivot(self, quota):
         """The bucket holding the quota-th largest counted key."""
         histogram, lanes = self.histogram, self.lanes
@@ -73,8 +69,9 @@ class Radix:
             return bucket + plsc.all_reduce_population_count(below)[0]
 
         bucket = jnp.minimum(find, RADIX_MASK)
-        cumulative = self._bucket(bucket)
-        previous = self._bucket(jnp.maximum(bucket - 1, 0))
+        index = jnp.maximum(bucket - self.lane_ids, 0)
+        gathered = plsc.load_gather(histogram, [index])
+        cumulative, previous = gathered[0], gathered[1]
         count = cumulative - jnp.where(bucket > 0, previous, 0)
         return bucket, quota - (total - cumulative), total, count
 
@@ -102,7 +99,8 @@ class Radix:
             remaining_bits = jnp.where(done, remaining_bits, shift)
             done |= remaining == count
         lower = prefix.astype(jnp.uint32) << remaining_bits.astype(jnp.uint32)
-        gate = jnp.where(keep_all, jnp.uint32(ORDERED_NEG_INF + 1), lower)
+        floor = jnp.uint32(ORDERED_NEG_INF + 1)
+        gate = jnp.where(keep_all, floor, jnp.maximum(lower, floor))
         return total, lower, gate, remaining, done
 
     def emit(self, values, chunks, quota, selection, destination, ids=None):
@@ -126,9 +124,7 @@ class Radix:
         )
         def emit_whole(i, count):
             bits = values[pl.ds(i * lanes, lanes)].view(jnp.uint32)
-            return store(
-                i, count, (bits >= gate) & (bits > jnp.uint32(ORDERED_NEG_INF))
-            )
+            return store(i, count, bits >= gate)
 
         @plsc.parallel_loop(
             0,
