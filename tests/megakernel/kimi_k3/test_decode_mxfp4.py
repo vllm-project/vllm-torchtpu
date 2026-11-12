@@ -121,3 +121,23 @@ def test_compact_paired_gate_up_steps_are_bit_identical(monkeypatch, active):
     whole = _paired(monkeypatch, 512, first, packed, scales, second, active)
     stepped = _paired(monkeypatch, 256, first, packed, scales, second, active)
     np.testing.assert_array_equal(stepped.view(np.uint32), whole.view(np.uint32))
+
+
+@pytest.mark.parametrize(("rows", "active"), [(1, None), (8, 2), (8, 8)])
+def test_shared_rows_project_both_halves(monkeypatch, rows, active):
+    """EP16 halves share their rows, so a pair projects them once for both
+    halves: the single-source product holds the two-source product's diagonal
+    blocks (rows past the active capacity stay zero)."""
+    rng = np.random.default_rng(3 + rows + (active or 0))
+    packed, scales = _expert_weights(rng, 2)
+    source = _activation(rng, (rows, CONTRACTION))
+    single = _paired(monkeypatch, 256, source, packed, scales, active=active)
+    pair = _paired(monkeypatch, 256, source, packed, scales, source, active)
+    half = 2 * WIDTH
+    np.testing.assert_array_equal(
+        single[:, :half].view(np.uint32), pair[:rows, :half].view(np.uint32)
+    )
+    np.testing.assert_array_equal(
+        single[:, half:].view(np.uint32), pair[rows:, half:].view(np.uint32)
+    )
+    assert not np.any(single[active or rows :])

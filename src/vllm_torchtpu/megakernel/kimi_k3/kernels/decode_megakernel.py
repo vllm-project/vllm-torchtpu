@@ -883,6 +883,14 @@ def _paired_expert_gate_up(
                     half * columns:(half + 1) * columns,
                 ] += (result if active_capacity is None else
                       jnp.pad(result, ((0, rows - active), (0, 0))))
+        elif active_capacity is not None:
+            partial = _scale_block_partials(
+                activation[:active_capacity], values, MXFP4_PAIR_STEP
+            )
+            result = jnp.sum(partial * scale[None], axis=1)
+            accumulator[...] += jnp.pad(
+                result, ((0, source.shape[0] - active_capacity), (0, 0))
+            )
         else:
             partial = _scale_block_partials(activation, values, MXFP4_PAIR_STEP)
             accumulator[...] += jnp.sum(partial * scale[None], axis=1)
@@ -1107,6 +1115,9 @@ def _run_routed_expert_stream(
         output_row[...] += singleton_output * probability
 
     compact_capacity = first_compact_source_vmem.shape[0]
+    # A multi-row pair's second half sits in accumulator rows [C, 2 C); EP16
+    # halves share their rows and so their staged and accumulator rows.
+    second_half_row = 0 if EXPERT_HALVES == 2 else compact_capacity
     if compact_capacity > 1:
         first_single_source = first_compact_source_vmem.at[:1]
         second_single_source = second_compact_source_vmem.at[:1]
@@ -1619,6 +1630,10 @@ def _run_routed_expert_stream(
                 second_consumed,
                 has_second,
             ) = second_choice
+            if EXPERT_HALVES == 2:
+                # The halves of one physical expert (_next_route_pair) serve the
+                # same rows with the same probability (_expert_half_routes).
+                second_rows, second_slot_mask = first_rows, first_slot_mask
             third_lowest: Any = None
             fourth_lowest: Any = None
             remaining: Any = None
@@ -1720,7 +1735,10 @@ def _run_routed_expert_stream(
             # offsets the saved padded work.
             if batch_size >= 8:
                 first_row_count = jnp.sum(first_rows.astype(jnp.int32))
-                second_row_count = jnp.sum(second_rows.astype(jnp.int32))
+                second_row_count = (
+                    first_row_count if EXPERT_HALVES == 2
+                    else jnp.sum(second_rows.astype(jnp.int32))
+                )
                 compact_pair = (
                     has_first
                     & has_second
@@ -1729,7 +1747,10 @@ def _run_routed_expert_stream(
                 )
 
                 first_plan = compact_row_plan(first_rows) if reuse_row_plan else None
-                second_plan = compact_row_plan(second_rows) if reuse_row_plan else None
+                second_plan = (
+                    first_plan if EXPERT_HALVES == 2
+                    else compact_row_plan(second_rows) if reuse_row_plan else None
+                )
 
                 @pl.when(compact_pair)
                 @_scoped("e_single_pair")
@@ -1741,18 +1762,22 @@ def _run_routed_expert_stream(
                     stage_singleton_source(
                         first_rows, first_single_source
                     )
-                    stage_singleton_source(
-                        second_rows, second_single_source
-                    )
+                    # EP16 halves share their row: one staged row, one
+                    # projection of both halves' columns.
+                    second_row = 0 if EXPERT_HALVES == 2 else 1
+                    if EXPERT_HALVES == 1:
+                        stage_singleton_source(
+                            second_rows, second_single_source
+                        )
                     _paired_expert_gate_up(
                         first_single_source,
                         expert_gate_up_vmem,
                         expert_gate_up_scale_vmem,
-                        gate_up_accumulator.at[:2],
+                        gate_up_accumulator.at[:second_row + 1],
                         current_base_slot,
                         current_base_slot + 1,
                         expert_input_size,
-                        second_source=second_single_source,
+                        second_source=None if EXPERT_HALVES == 2 else second_single_source,
                     )
                     finish_singleton_expert(
                         first_rows,
@@ -1766,7 +1791,7 @@ def _run_routed_expert_stream(
                         second_rows,
                         second_slot_mask,
                         second_copies,
-                        1,
+                        second_row,
                         2 * expert_width,
                         current_base_slot + 1,
                     )
@@ -1786,17 +1811,19 @@ def _run_routed_expert_stream(
                         second_copies.gate_up.wait()
                         second_copies.gate_up_scales.wait()
                         stage_compact_rows(first_rows, first_compact_source_vmem, row_plan=first_plan)
-                        stage_compact_rows(second_rows, second_compact_source_vmem, row_plan=second_plan)
+                        if EXPERT_HALVES == 1:
+                            stage_compact_rows(second_rows, second_compact_source_vmem, row_plan=second_plan)
                         def project_pair(capacity=None):
+                            # EP16 halves share their rows: one source, both halves' columns.
                             _paired_expert_gate_up(
                                 first_compact_source_vmem,
                                 expert_gate_up_vmem,
                                 expert_gate_up_scale_vmem,
-                                gate_up_accumulator.at[:2 * compact_capacity],
+                                gate_up_accumulator.at[:compact_capacity + second_half_row],
                                 current_base_slot,
                                 current_base_slot + 1,
                                 expert_input_size,
-                                second_source=second_compact_source_vmem,
+                                second_source=None if EXPERT_HALVES == 2 else second_compact_source_vmem,
                                 active_capacity=capacity,
                             )
 
@@ -1819,7 +1846,7 @@ def _run_routed_expert_stream(
                             )
                             finish_compact_expert(
                                 second_rows, second_slot_mask, second_copies,
-                                compact_capacity, 2 * expert_width, current_base_slot + 1,
+                                second_half_row, 2 * expert_width, current_base_slot + 1,
                             )
                 else:
                     multi_pair = jnp.bool_(False)
@@ -1943,7 +1970,7 @@ def _run_routed_expert_stream(
                                 expert = jnp.where(first, first_expert, second_expert)
                                 slot = current_base_slot + index
                                 copies = copy_expert(expert, slot)
-                                finish_compact_expert(None, None, copies, index * compact_capacity,
+                                finish_compact_expert(None, None, copies, index * second_half_row,
                                                       index * 2 * expert_width, slot,
                                                       route_data=(selector, output_weights))
                         finish_selected()
