@@ -515,7 +515,7 @@ if __name__ == "__main__":
     test_local_selection_matches_owned_tokens()
     print("PASS local selection", flush=True)
     failures = 0
-    if ON_TPU:
+    if ON_TPU and "--bench-only" not in sys.argv:
         for name in sorted(CASES):
             for slot in (0, 1):
                 try:
@@ -537,7 +537,8 @@ if __name__ == "__main__":
             except Exception as e:  # noqa: BLE001
                 failures += 1
                 print("FAIL fallback", which, repr(e)[:4000], flush=True)
-        if "--bench" in sys.argv:
+    if ON_TPU:
+        if "--bench" in sys.argv or "--bench-only" in sys.argv:
             bench()
     print("FAILURES", failures)
     sys.exit(1 if failures else 0)
