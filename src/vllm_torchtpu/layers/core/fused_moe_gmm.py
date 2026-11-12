@@ -534,7 +534,7 @@ def moe_gmm(
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
-    ``row_cap``: `x` holds only the first ``row_cap`` permuted rows
+    ``row_cap``: only the first ``row_cap`` rows of `x` hold permuted routes
     (`prepare_routed_gmm_inputs`), and the one-hot combine contracts only them.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
@@ -678,6 +678,8 @@ def moe_gmm(
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
+            if row_cap:
+                gmm2_res = gmm2_res[:row_cap]
             computed = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < group_sizes.sum(
                 dtype=jnp.int32
             )
@@ -836,7 +838,11 @@ def fused_moe_func(
             skip_padded_tokens=skip_padded_tokens,
             row_cap=row_cap,
         )
-        x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+        # A capped permute pads back to every route's row: the GMM sees the
+        # same size_m, so it keeps the same tiles (its bf16 / fp8-feed
+        # buckets depend on size_m) and its valid rows come out bit for bit.
+        rows = num_tokens * topk - x.shape[0]
+        x = jnp.pad(x, ((0, rows), (0, padded_hidden_size - hidden_size)))
         x = moe_gmm(
             x,
             w1,
