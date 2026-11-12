@@ -35,6 +35,7 @@ from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
     VllmNvfp4Config,
     VllmNvfp4MoEMethod,
@@ -187,11 +188,11 @@ class MiniMaxM3Mxfp8W8A16LinearMethod(MiniMaxM3Mxfp8LinearMethod):
         if supports_shape(k, n):
             w8, scale = mxfp8_to_w8a16(layer.weight.data, layer.weight_scale.data)
         super().process_weights_after_loading(layer)
-        if w8 is None:
-            return
+        if w8 is None or not getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            return  # the bf16 weight must be K-major [k, n] like the copy
         # Build the torch op outside the compiled forward (its cache lock
         # cannot be traced).
-        mxfp8_w8a16_op()
+        mxfp8_w8a16_op(self.max_rows)
         layer.register_parameter(
             "weight_w8", torch.nn.Parameter(w8.to(layer.weight.device), requires_grad=False)
         )
@@ -218,10 +219,11 @@ class MiniMaxM3Mxfp8W8A16LinearMethod(MiniMaxM3Mxfp8LinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        rows = x.numel() // x.shape[-1]
-        if bias is not None or not hasattr(layer, "weight_w8") or rows > self.max_rows:
+        if bias is not None or not hasattr(layer, "weight_w8"):
             return super().apply(layer, x, bias)
-        return mxfp8_w8a16_linear(x, layer.weight_w8, layer.weight_w8_scale)
+        return mxfp8_w8a16_linear(
+            x, layer.weight, layer.weight_w8, layer.weight_w8_scale, self.max_rows
+        )
 
 
 class MiniMaxM3Nvfp4MoEMethod(VllmNvfp4MoEMethod):

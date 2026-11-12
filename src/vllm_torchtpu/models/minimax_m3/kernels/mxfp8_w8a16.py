@@ -91,33 +91,53 @@ def mxfp8_w8a16_matmul(x: jax.Array, w: jax.Array, scale: jax.Array) -> jax.Arra
     )(x, s3, w)
 
 
-_op: Callable | None = None
-_op_lock = Lock()
+_ops: dict[int, Callable] = {}
+_ops_lock = Lock()
 
 
-def mxfp8_w8a16_op() -> Callable:
-    """The cached torch op; call once eagerly before tracing a forward."""
-    global _op
-    if _op is not None:
-        return _op
-    with _op_lock:
-        if _op is None:
+def _linear_jax(x, w_bf16, w8, scale, *, max_rows):
+    # Rows are static at trace time: decode buckets read the e4m3 copy, larger
+    # buckets the bf16 weight. Both take the same four inputs, so every token
+    # bucket traces a graph with the same parameters (shape_variants requires it).
+    if x.shape[0] <= max_rows:
+        return mxfp8_w8a16_matmul(x, w8, scale)
+    return jnp.matmul(x, w_bf16)
+
+
+def mxfp8_w8a16_op(max_rows: int) -> Callable:
+    """The cached torch op for ``max_rows``; call once eagerly before tracing."""
+    op = _ops.get(max_rows)
+    if op is not None:
+        return op
+    with _ops_lock:
+        if max_rows not in _ops:
             from torch_tpu._internal import pallas
 
-            op = pallas.jax_op("pallas::minimax_mxfp8_w8a16", mxfp8_w8a16_matmul)
+            op = pallas.jax_op(
+                f"pallas::minimax_mxfp8_w8a16_r{max_rows}",
+                functools.partial(_linear_jax, max_rows=max_rows),
+            )
 
-            def _fake(x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor):
-                del scale
-                return torch.empty(x.shape[0], w.shape[1], dtype=x.dtype, device=x.device)
+            def _fake(x, w_bf16, w8, scale):
+                del w8, scale
+                return torch.empty(
+                    x.shape[0], w_bf16.shape[1], dtype=x.dtype, device=x.device
+                )
 
             op.register_fake(_fake)
-            _op = op
-    return _op
+            _ops[max_rows] = op
+    return _ops[max_rows]
 
 
 def mxfp8_w8a16_linear(
-    x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor
+    x: torch.Tensor,
+    w_bf16: torch.Tensor,
+    w8: torch.Tensor,
+    scale: torch.Tensor,
+    max_rows: int,
 ) -> torch.Tensor:
-    """Torch entry: ``x [..., k] @ w8a16(w [k, n], scale [k // 32, n])``."""
-    out_shape = (*x.shape[:-1], w.shape[1])
-    return mxfp8_w8a16_op()(x.reshape(-1, x.shape[-1]), w, scale).reshape(out_shape)
+    """Torch entry: ``x [..., k] @ w [k, n]``, from the e4m3 copy when the
+    bucket has at most ``max_rows`` rows, else from the bf16 weight."""
+    out_shape = (*x.shape[:-1], w_bf16.shape[1])
+    out = mxfp8_w8a16_op(max_rows)(x.reshape(-1, x.shape[-1]), w_bf16, w8, scale)
+    return out.reshape(out_shape)
