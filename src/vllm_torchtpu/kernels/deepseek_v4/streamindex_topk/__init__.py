@@ -53,6 +53,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import 
     streamindex_topk_dcp,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    PallasFusedTopK,
     SparseCoreTopK,
     TensorCoreTopK,
     TopKBackend,
@@ -70,6 +71,7 @@ __all__ = [
     "DEFAULT_BUFFER_COUNT",
     "DEFAULT_VMEM_LIMIT_BYTES",
     "DCP_AXIS_NAME",
+    "PallasFusedTopK",
     "SparseCoreTopK",
     "TensorCoreTopK",
     "TopKBackend",

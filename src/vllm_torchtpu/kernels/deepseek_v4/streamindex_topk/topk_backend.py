@@ -24,6 +24,7 @@ class TopKBackend(Protocol):
     """
 
     overlaps_scoring: ClassVar[bool]
+    fuses_in_streamindex: ClassVar[bool]
 
     def select(
         self,
@@ -45,6 +46,7 @@ class SparseCoreTopK:
     """
 
     overlaps_scoring: ClassVar[bool] = True
+    fuses_in_streamindex: ClassVar[bool] = False
     bounded_copy: bool = False
 
     def select(
@@ -200,6 +202,7 @@ class TensorCoreTopK:
     """Bounded tournament selector for TPUs without usable SparseCore DMA."""
 
     overlaps_scoring: ClassVar[bool] = False
+    fuses_in_streamindex: ClassVar[bool] = False
     enable_prefix_bucketing: bool = True
 
     def _select_tile(
@@ -344,16 +347,61 @@ class TensorCoreTopK:
         return jax.lax.switch(branch_idx, branches, score_bits, row_lengths)
 
 
+@dataclass(frozen=True)
+class PallasFusedTopK:
+    """In-VMEM Pallas fused selector inside ``streamindex_topk`` for TensorCore TPUs.
+
+    Batches with ``q.shape[0] >= min_tokens`` (default ``256``) run exact 2-bit
+    quaternary threshold bisection and bit-packed roll compaction directly on
+    VMEM score tiles inside the ``StreamIndex`` Pallas kernel, eliminating
+    external ``TensorCoreTopK`` launches and HBM score buffers while falling
+    back to ``TensorCoreTopK`` for smaller batches.
+    """
+
+    overlaps_scoring: ClassVar[bool] = False
+    fuses_in_streamindex: ClassVar[bool] = True
+    min_tokens: int = 256
+    enable_prefix_bucketing: bool = True
+
+    def select(
+        self,
+        score_bits: jax.Array,
+        k: int,
+        row_lengths: jax.Array,
+        *,
+        scheduling_group_id: int | None,
+        return_scores: bool,
+    ) -> jax.Array | tuple[jax.Array, jax.Array]:
+        return TensorCoreTopK(
+            enable_prefix_bucketing=self.enable_prefix_bucketing
+        ).select(
+            score_bits,
+            k,
+            row_lengths,
+            scheduling_group_id=scheduling_group_id,
+            return_scores=return_scores,
+        )
+
+
 def default_topk_backend() -> TopKBackend:
-    """SparseCore selector where available, bounded TensorCore tournament otherwise."""
+    """SparseCore selector where available, fused Pallas/TensorCore otherwise."""
     mode = envs.VLLM_TPU_TOPK_BACKEND.strip().lower()
+    min_tokens = envs.VLLM_TPU_TOPK_FUSED_MIN_TOKENS
     if mode in ("xla", "tensorcore"):
         return TensorCoreTopK()
     if mode == "sparsecore":
         return SparseCoreTopK()
+    if mode == "fused_all":
+        return PallasFusedTopK(min_tokens=1)
+    if mode == "fused":
+        return PallasFusedTopK(min_tokens=min_tokens)
     if mode not in ("", "auto"):
         raise ValueError(
             f"Invalid VLLM_TPU_TOPK_BACKEND={mode!r}; expected '', 'auto', "
-            "'xla', 'tensorcore', or 'sparsecore'."
+            "'fused', 'fused_all', 'xla', 'tensorcore', or 'sparsecore'."
         )
-    return SparseCoreTopK() if has_usable_sparse_core() else TensorCoreTopK()
+    return (
+        SparseCoreTopK()
+        if has_usable_sparse_core()
+        else PallasFusedTopK(min_tokens=min_tokens)
+    )

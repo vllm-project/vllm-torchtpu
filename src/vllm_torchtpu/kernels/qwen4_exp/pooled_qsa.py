@@ -19,6 +19,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
     SparseCoreTopK,
+    default_topk_backend,
 )
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import decode_query_chunk_size
 from vllm_torchtpu.kernels.qwen4_exp.fused_kv_write import (
@@ -1371,6 +1372,25 @@ def _select_blocks(
             prefill_bkv, prefill_bq, chunk = tuned
             if chunk and len(query) % chunk == 0:
                 chunk_tokens = None if chunk == len(query) else chunk
+        use_sc_bounded = (
+            envs.VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY
+            and shard is None
+            and dcp is None
+        )
+        prefill_backend = (
+            SparseCoreTopK(bounded_copy=True)
+            if use_sc_bounded
+            else default_topk_backend()
+        )
+        fuses_prefill = getattr(prefill_backend, "fuses_in_streamindex", False) and (
+            len(query) >= getattr(prefill_backend, "min_tokens", 1)
+        )
+        if (
+            fuses_prefill
+            and envs.VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK == 0
+            and tuned is None
+        ):
+            chunk_tokens = None
         # The scalar-prefetched kernel-page table holds every request slot's
         # whole row (slots x max_model_len / 128 pages). Past the SMEM budget
         # (e.g. 96 slots at 262144 tokens: 768 KiB) hand StreamIndex the
