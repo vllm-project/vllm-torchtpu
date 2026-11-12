@@ -678,7 +678,11 @@ def _prefill_attention(
             lean=envs.VLLM_TPU_QSA_PREFILL_LEAN,
             listed=envs.VLLM_TPU_QSA_PREFILL_UNION_LISTED or None,
             share_bits=envs.VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS,
-            union_alpha=envs.VLLM_TPU_QSA_PREFILL_UNION_ALPHA,
+            union_alpha=(
+                envs.VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA
+                if union_dcp
+                else envs.VLLM_TPU_QSA_PREFILL_UNION_ALPHA
+            ),
             qk16=envs.VLLM_TPU_QSA_PREFILL_UNION_QK16,
             run_tables=envs.VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES,
             lazy_share=envs.VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE,
@@ -689,7 +693,12 @@ def _prefill_attention(
             compact_copy_method=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY,
             sc_bitset=envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET,
             **(
-                {"dcp": dcp, "return_lse": True, "kv_head_offset": kv_head_offset}
+                {
+                    "dcp": dcp,
+                    "return_lse": True,
+                    "kv_head_offset": kv_head_offset,
+                    "precheck_stride": envs.VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK,
+                }
                 if union_dcp
                 else {}
             ),

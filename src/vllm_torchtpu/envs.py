@@ -144,6 +144,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY: str = "vmem"
     VLLM_TPU_QSA_PREFILL_UNION_DCP: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA: float = 0.2
+    VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK: int = 8
     VLLM_TPU_QSA_PREFILL_UNION_PROBE: int = 0
     VLLM_TPU_QSA_PREFILL_PREFIX_PAGES: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
@@ -1062,6 +1064,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block-sparse kernel. Not bitwise against it (union-order online
     # softmax, equal precision).
     "VLLM_TPU_QSA_PREFILL_UNION_DCP": env_bool("VLLM_TPU_QSA_PREFILL_UNION_DCP"),
+    # DCP_ALPHA (with DCP): the union walk's alpha under DCP (replaces ALPHA
+    # there): fall back to block-sparse when any 128-row group's owned union
+    # exceeds this fraction of its owned visible groups (0 = off). The walk
+    # wins only on sparse unions (74K context, 8K chunk: 9.5% union 0.70x,
+    # 36% union 1.78x the block-sparse time).
+    "VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA": env_float("VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA", 0.2),
+    # DCP_PRECHECK=<stride> (with DCP and DCP_ALPHA; 0 = off): check alpha on
+    # every stride-th 128-row tile before the full plan, so a dense step goes
+    # to block-sparse without paying the plan.
+    "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK", 8
+    ),
     # PROBE=<N> (debug-only, log-only; 0 = off): under main-KV DCP, for the
     # first N prefill steps with >= 4096 live rows, log per 128- and 256-row
     # query tile the owned union of selected groups, the owned visible groups
