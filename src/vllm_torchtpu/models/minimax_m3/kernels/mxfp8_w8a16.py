@@ -91,11 +91,17 @@ def mxfp8_w8a16_matmul(x: jax.Array, w: jax.Array, scale: jax.Array) -> jax.Arra
     )(x, s3, w)
 
 
-_ops: dict[int, Callable] = {}
-_ops_lock = Lock()
+_op: Callable | None = None
+_op_lock = Lock()
 
 
-def _linear_jax(x, w_bf16, w8, scale, *, max_rows):
+def _linear_jax(
+    x: jax.Array,
+    w_bf16: jax.Array,
+    w8: jax.Array,
+    scale: jax.Array,
+    max_rows: int = 0,
+) -> jax.Array:
     # Rows are static at trace time: decode buckets read the e4m3 copy, larger
     # buckets the bf16 weight. Both take the same four inputs, so every token
     # bucket traces a graph with the same parameters (shape_variants requires it).
@@ -104,29 +110,32 @@ def _linear_jax(x, w_bf16, w8, scale, *, max_rows):
     return jnp.matmul(x, w_bf16)
 
 
-def mxfp8_w8a16_op(max_rows: int) -> Callable:
-    """The cached torch op for ``max_rows``; call once eagerly before tracing."""
-    op = _ops.get(max_rows)
-    if op is not None:
-        return op
-    with _ops_lock:
-        if max_rows not in _ops:
+def mxfp8_w8a16_op() -> Callable:
+    """The cached torch op; call once eagerly before tracing a forward."""
+    global _op
+    if _op is not None:
+        return _op
+    with _op_lock:
+        if _op is None:
             from torch_tpu._internal import pallas
 
-            op = pallas.jax_op(
-                f"pallas::minimax_mxfp8_w8a16_r{max_rows}",
-                functools.partial(_linear_jax, max_rows=max_rows),
-            )
+            op = pallas.jax_op("pallas::minimax_mxfp8_w8a16", _linear_jax)
 
-            def _fake(x, w_bf16, w8, scale):
-                del w8, scale
+            def _fake(
+                x: torch.Tensor,
+                w_bf16: torch.Tensor,
+                w8: torch.Tensor,
+                scale: torch.Tensor,
+                max_rows: int = 0,
+            ):
+                del w8, scale, max_rows
                 return torch.empty(
                     x.shape[0], w_bf16.shape[1], dtype=x.dtype, device=x.device
                 )
 
             op.register_fake(_fake)
-            _ops[max_rows] = op
-    return _ops[max_rows]
+            _op = op
+    return _op
 
 
 def mxfp8_w8a16_linear(
@@ -139,5 +148,5 @@ def mxfp8_w8a16_linear(
     """Torch entry: ``x [..., k] @ w [k, n]``, from the e4m3 copy when the
     bucket has at most ``max_rows`` rows, else from the bf16 weight."""
     out_shape = (*x.shape[:-1], w_bf16.shape[1])
-    out = mxfp8_w8a16_op(max_rows)(x.reshape(-1, x.shape[-1]), w_bf16, w8, scale)
+    out = mxfp8_w8a16_op()(x.reshape(-1, x.shape[-1]), w_bf16, w8, scale, max_rows)
     return out.reshape(out_shape)

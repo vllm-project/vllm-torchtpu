@@ -192,7 +192,7 @@ class MiniMaxM3Mxfp8W8A16LinearMethod(MiniMaxM3Mxfp8LinearMethod):
             return  # the bf16 weight must be K-major [k, n] like the copy
         # Build the torch op outside the compiled forward (its cache lock
         # cannot be traced).
-        mxfp8_w8a16_op(self.max_rows)
+        mxfp8_w8a16_op()
         layer.register_parameter(
             "weight_w8", torch.nn.Parameter(w8.to(layer.weight.device), requires_grad=False)
         )
