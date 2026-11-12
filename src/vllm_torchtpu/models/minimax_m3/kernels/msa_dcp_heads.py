@@ -74,7 +74,10 @@ HP_BUFFER_STEP_ENV = "TPU_MINIMAX_M3_DCP_HP_BUFFER_STEP"
 
 
 def hp_buffer_step() -> int:
-    return int(os.environ.get(HP_BUFFER_STEP_ENV, "0") or 0)
+    # Read through envs, which keys the compile caches on it.
+    from vllm_torchtpu import envs
+
+    return int(envs.TPU_MINIMAX_M3_DCP_HP_BUFFER_STEP)
 
 
 if hp_buffer_step():

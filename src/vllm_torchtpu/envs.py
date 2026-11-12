@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     TPU_MINIMAX_M3_FFN_SPLIT_MIN_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_KV_GATHER_SHARE: bool = False
+    TPU_MINIMAX_M3_DCP_HP_BUFFER_STEP: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
     TPU_MOE_V3_PAYLOAD_SORT: bool = False
@@ -764,6 +765,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gathered tensors match the full gather only up to bf16 rounding.
     "TPU_MINIMAX_M3_DCP_KV_GATHER_SHARE": env_bool(
         "TPU_MINIMAX_M3_DCP_KV_GATHER_SHARE", default=False
+    ),
+    # MiniMax M3 MSA DCP head-parallel prefill: the first round exchanges a
+    # page buffer sized to its pages in steps of this many pages instead of
+    # one max-length request's buffer. Same output. 0 (default) = off.
+    "TPU_MINIMAX_M3_DCP_HP_BUFFER_STEP": env_int(
+        "TPU_MINIMAX_M3_DCP_HP_BUFFER_STEP", 0
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
