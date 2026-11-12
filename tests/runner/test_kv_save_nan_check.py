@@ -348,6 +348,15 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         has_structured_output_requests=False,
     )
 
+    def host_copy(chunks, lengths, spec_logprobs=None, plain_logprobs=None):
+        return AsyncTPUCopyState(
+            chunks_cpu=chunks,
+            chunk_real_lens=lengths,
+            copy_ready_event=MagicMock(),
+            spec_logprobs=spec_logprobs,
+            plain_logprobs=plain_logprobs,
+        )
+
     with (
         patch(
             "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
@@ -364,16 +373,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
             "vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context",
             side_effect=lambda *_a, **_kw: contextlib.nullcontext(),
         ),
-        patch.object(
-            AsyncTPUCopyState,
-            "from_device_chunks",
-            side_effect=lambda chunks, lengths, spec_logprobs=None: AsyncTPUCopyState(
-                chunks_cpu=chunks,
-                chunk_real_lens=lengths,
-                copy_ready_event=MagicMock(),
-                spec_logprobs=spec_logprobs,
-            ),
-        ),
+        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=host_copy),
     ):
         assert runner.execute_model(scheduler_output) is None
         output = runner.sample_tokens(None)

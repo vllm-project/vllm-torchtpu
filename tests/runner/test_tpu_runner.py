@@ -45,6 +45,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
@@ -52,6 +53,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
@@ -3626,6 +3628,298 @@ def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
     assert int(out_bf16.item()) == 0
 
 
+@pytest.mark.parametrize("speculative_config", [None, SimpleNamespace()])
+def test_sampler_applies_topk_topp_only_when_a_request_sets_them(
+    speculative_config,
+):
+    """The no-top-k/top-p graph is used whenever no running request sets top-k
+    or top-p, with or without speculative decoding."""
+    for no_top_k, no_top_p, expected in (
+        (True, True, False),
+        (False, True, True),
+        (True, False, True),
+        (False, False, True),
+    ):
+        runner = SimpleNamespace(
+            speculative_config=speculative_config,
+            input_batch=SimpleNamespace(no_top_k=no_top_k, no_top_p=no_top_p),
+        )
+        assert TPUModelRunner._sampler_applies_topk_topp(runner) is expected
+
+
+def test_precompile_warms_the_no_topk_topp_graph_without_spec_decode():
+    """Without speculative decoding the precompile also warms the graph that
+    skips top-k/top-p, so the first decode step that uses it compiles
+    nothing."""
+    seen = []
+
+    def fake_sample_from_logits(
+        logits,
+        temperatures,
+        u,
+        top_k,
+        top_p,
+        all_greedy=False,
+        topk_candidates=0,
+        apply_topk_topp=True,
+    ):
+        seen.append((all_greedy, topk_candidates, apply_topk_topp))
+        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
+
+    runner = SimpleNamespace(
+        num_reqs_paddings=[2, 4],
+        _hidden_states_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+        _topk_candidate_blocks=lambda: 0,
+        _precompile_timed=lambda _name: contextlib.nullcontext(),
+        sample_from_logits_func=fake_sample_from_logits,
+        speculative_config=None,
+    )
+    TPUModelRunner._precompile_sample_from_logits(runner)
+    variants = [(False, 0, True), (False, 0, False), (True, 0, True)]
+    assert seen == variants * 2
+
+
+@pytest.mark.parametrize("candidate_blocks", [0, 8])
+@pytest.mark.parametrize("speculative_config", [None, SimpleNamespace()])
+def test_every_runtime_sampler_variant_is_precompiled(
+    speculative_config, candidate_blocks
+):
+    """Every (all_greedy, topk_candidates, apply_topk_topp) graph that the
+    random sampling path picks at runtime is one the precompile warms, so
+    serving compiles no sampler graph after warmup."""
+    warmed = set()
+
+    def fake_sample_from_logits(
+        logits,
+        temperatures,
+        u,
+        top_k,
+        top_p,
+        all_greedy=False,
+        topk_candidates=0,
+        apply_topk_topp=True,
+    ):
+        warmed.add((all_greedy, topk_candidates, apply_topk_topp))
+        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
+
+    TPUModelRunner._precompile_sample_from_logits(
+        SimpleNamespace(
+            num_reqs_paddings=[2],
+            _hidden_states_dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+            _topk_candidate_blocks=lambda: candidate_blocks,
+            _precompile_timed=lambda _name: contextlib.nullcontext(),
+            sample_from_logits_func=fake_sample_from_logits,
+            speculative_config=speculative_config,
+        )
+    )
+
+    for top_k, top_p in (
+        ([0, 0], [1.0, 1.0]),
+        ([0, 0], [0.9, 1.0]),
+        ([2, 2], [1.0, 1.0]),
+        ([2, 0], [1.0, 1.0]),
+        ([100, 2], [0.9, 0.9]),
+    ):
+        runner = SimpleNamespace(
+            speculative_config=speculative_config,
+            _topk_candidate_blocks=lambda: candidate_blocks,
+            input_batch=SimpleNamespace(
+                top_k_cpu_tensor=torch.tensor(top_k, dtype=torch.int32),
+                no_top_k=not any(top_k),
+                no_top_p=all(p == 1.0 for p in top_p),
+            ),
+        )
+        for grammar_output in (None, object()):
+            variant = (
+                False,
+                TPUModelRunner._sampler_topk_candidates(runner, 0, 2, grammar_output),
+                TPUModelRunner._sampler_applies_topk_topp(runner),
+            )
+            assert variant in warmed, (top_k, top_p, grammar_output, variant)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_skipping_topk_topp_is_exact_at_the_default_sampling_params(dtype):
+    """At top_k == 0 and top_p == 1.0 (RL rollouts sample with top_k=-1 and
+    top_p=1) the no-top-k/top-p path samples exactly the tokens of the full
+    path; with top-k set, skipping would change them (negative control)."""
+    torch.manual_seed(0)
+    runner = SimpleNamespace()
+    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+    sample_fn = TPUModelRunner.sample_from_logits.__wrapped__
+    num_reqs, vocab = 16, 4096
+    logits = (torch.randn(num_reqs, vocab) * 4).to(dtype)
+    temperatures = torch.ones((num_reqs, 1), dtype=dtype)
+    temperatures[:2] = 0.0  # Greedy rows keep their argmax either way.
+    top_k = torch.zeros((num_reqs, 1), dtype=torch.int32)
+    top_p = torch.ones((num_reqs, 1), dtype=torch.float32)
+
+    scaled = runner._apply_temperature(logits, temperatures)
+    assert torch.equal(apply_top_k_top_p(scaled, top_k, top_p, 0), scaled)
+    for _ in range(4):
+        u = torch.rand((num_reqs, vocab), dtype=torch.float32)
+        full = sample_fn(runner, logits, temperatures, u, top_k, top_p)
+        skip = sample_fn(
+            runner, logits, temperatures, u, top_k, top_p, apply_topk_topp=False
+        )
+        assert torch.equal(full, skip)
+
+    flat_logits = (torch.randn(num_reqs, vocab) * 0.1).to(dtype)
+    top_5 = torch.full((num_reqs, 1), 5, dtype=torch.int32)
+    u = torch.rand((num_reqs, vocab), dtype=torch.float32)
+    ones = torch.ones((num_reqs, 1), dtype=dtype)
+    # Ties at the 5th value are allowed too.
+    fifth = flat_logits.float().topk(5, dim=-1).values[:, -1:]
+    full = sample_fn(runner, flat_logits, ones, u, top_5, top_p)
+    skip = sample_fn(runner, flat_logits, ones, u, top_5, top_p, apply_topk_topp=False)
+    assert (flat_logits.float().gather(-1, full.long()) >= fifth).all()
+    assert not (flat_logits.float().gather(-1, skip.long()) >= fifth).all()
+
+
+@pytest.mark.parametrize("max_logprobs", [0, 3])
+def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
+    monkeypatch, max_logprobs
+):
+    """The sampled-token logprobs that ride the async output copy equal what
+    the former blocking per-step copy built from the same device tensors
+    (slice to the real rows, .tolists(), concatenate in chunk order), for two
+    decode chunks with padded rows and a discarded request."""
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+    monkeypatch.setattr(
+        tpu_runner, "has_kv_transfer_group", lambda: False, raising=False
+    )
+    captured = []
+    from_device_chunks = tpu_runner.AsyncTPUCopyState.from_device_chunks
+
+    def capture_from_device_chunks(*args, **kwargs):
+        captured.append(kwargs.get("plain_logprobs"))
+        return from_device_chunks(*args, **kwargs)
+
+    monkeypatch.setattr(
+        tpu_runner.AsyncTPUCopyState,
+        "from_device_chunks",
+        capture_from_device_chunks,
+    )
+    torch.manual_seed(0)
+    logits_list = [torch.randn(4, 64), torch.randn(4, 64)]
+    num_reqs_list = [4, 2]
+    req_ids = [f"r{i}" for i in range(6)]
+
+    gathered = []
+
+    def run():
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={r: 1 for r in req_ids},
+            finished_req_ids=set(),
+            has_structured_output_requests=False,
+        )
+        requests = {
+            r: SimpleNamespace(num_computed_tokens=0, num_tokens=1, output_token_ids=[])
+            for r in req_ids
+        }
+        requests["r1"].num_tokens = 2  # A partial prefill: its token is discarded.
+        runner = SimpleNamespace(
+            _pp_wave=None,
+            execute_model_state=SimpleNamespace(
+                scheduler_output=scheduler_output,
+                draft_chunks=[],
+                logits_list=list(logits_list),
+                num_reqs_list=list(num_reqs_list),
+                spec_decode_metadata_list=[None, None],
+                mamba_state_indices_list=None,
+                pooler_output_list=[],
+                top_tokens=False,
+                kv_save_nan_check=None,
+            ),
+            input_batch=SimpleNamespace(
+                max_num_logprobs=max_logprobs,
+                num_reqs=6,
+                req_ids=list(req_ids),
+                req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                all_greedy=False,
+                num_tokens_no_spec=[1] * 6,
+                token_ids_cpu=np.zeros((6, 8), dtype=np.int32),
+                generators={},
+            ),
+            requests=requests,
+            speculative_config=None,
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            model_config=SimpleNamespace(max_logprobs=max_logprobs),
+            _is_async_drafter=False,
+            _is_dspark_pd_producer=False,
+            _fence_spec_kv_under_token_copy=False,
+            is_pooling_model=False,
+            drafter=SimpleNamespace(),
+            spec_decode_manager=SimpleNamespace(
+                propose_draft_token_ids=lambda **kw: None
+            ),
+            _get_sampling_generator=lambda: None,
+            # Temperature 0: every row samples its argmax, whatever the noise.
+            _build_padded_sampling_params=lambda start, end, logits: (
+                torch.zeros((logits.shape[0], 1)),
+                torch.zeros((logits.shape[0], 1), dtype=torch.int32),
+                torch.ones((logits.shape[0], 1)),
+            ),
+            _sampler_topk_candidates=lambda start, end, grammar: 0,
+            _sampler_applies_topk_topp=lambda: False,
+            _update_mamba_slot_read_offsets=lambda *_args: None,
+            _update_num_xla_graphs=lambda *_args: None,
+            _stage_timing=MagicMock(),
+        )
+        runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+        runner.sample_from_logits_func = (
+            TPUModelRunner.sample_from_logits.__wrapped__.__get__(runner)
+        )
+        gather_logprobs = TPUModelRunner.gather_logprobs.__wrapped__.__get__(runner)
+
+        def recording_gather_logprobs(*args, **kwargs):
+            gathered.append(gather_logprobs(*args, **kwargs))
+            return gathered[-1]
+
+        runner.gather_logprobs = recording_gather_logprobs
+        runner._stage_timing.take_samples.return_value = ([], [])
+        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+        return TPUModelRunner.sample_tokens(runner, None)
+
+    deferred = run()
+    (plain,) = captured
+    assert [n for _, n in plain] == num_reqs_list
+    assert len(gathered) == len(num_reqs_list)
+    argmax = [
+        [int(t)]
+        for logits, n in zip(logits_list, num_reqs_list)
+        for t in logits[:n].argmax(dim=-1)
+    ]
+    argmax[1] = []  # r1's token is discarded.
+    assert deferred.sampled_token_ids == argmax
+
+    # The former blocking copy in sample_tokens, on the same device tensors.
+    blocking = [
+        LogprobsTensors(
+            t.logprob_token_ids[:n],
+            t.logprobs[:n],
+            t.selected_token_ranks[:n],
+            t.cu_num_generated_tokens,
+        ).tolists()
+        for t, n in zip(gathered, num_reqs_list)
+    ]
+    assert deferred.logprobs.logprob_token_ids.shape == (6, max_logprobs + 1)
+    for field in ("logprob_token_ids", "logprobs", "sampled_token_ranks"):
+        actual = getattr(deferred.logprobs, field)
+        expected = np.concatenate([getattr(lp, field) for lp in blocking])
+        assert actual.dtype == expected.dtype, field
+        assert np.array_equal(actual, expected), field
+    assert deferred.logprobs.cu_num_generated_tokens is None
+
+
 def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     """All TPUModelRunner call sites into sample_from_logits_func must draw
     uniform random noise `u` in float32 even when logits are bfloat16."""
@@ -3659,9 +3953,9 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         torch.ones((2, 1), dtype=torch.float32),
     )
 
-    # 1. _precompile_sample_from_logits: two graphs without speculative
-    # decoding, plus the no-top-k/top-p graph with it.
-    for speculative_config, num_graphs in ((None, 2), (SimpleNamespace(), 3)):
+    # 1. _precompile_sample_from_logits: the full graph, the no-top-k/top-p
+    # graph and the greedy graph, with or without speculative decoding.
+    for speculative_config, num_graphs in ((None, 3), (SimpleNamespace(), 3)):
         precompile_runner = SimpleNamespace(
             num_reqs_paddings=[2],
             _hidden_states_dtype=torch.bfloat16,

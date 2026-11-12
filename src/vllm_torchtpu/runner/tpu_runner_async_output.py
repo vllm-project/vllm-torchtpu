@@ -76,6 +76,21 @@ def spec_logprobs_lists(
     )
 
 
+def plain_logprobs_lists(chunks: list[tuple[LogprobsTensors, int]]) -> LogprobsLists:
+    """The LogprobsLists the blocking path builds in sample_tokens: each
+    chunk's first `n` rows, concatenated in chunk order, with
+    cu_num_generated_tokens None (one generated token per request)."""
+    return LogprobsLists(
+        logprob_token_ids=np.concatenate(
+            [t.logprob_token_ids.numpy()[:n] for t, n in chunks]
+        ),
+        logprobs=np.concatenate([t.logprobs.numpy()[:n] for t, n in chunks]),
+        sampled_token_ranks=np.concatenate(
+            [t.selected_token_ranks.numpy()[:n] for t, n in chunks]
+        ),
+    )
+
+
 @dataclass
 class AsyncTPUCopyState:
     """Async D2H copy state for sampled tokens.
@@ -97,6 +112,11 @@ class AsyncTPUCopyState:
     spec_logprobs: list[SpecLogprobsChunk] | None = None
     # Device sources of `spec_logprobs`, kept alive until the copy lands.
     _spec_logprobs_tpu: list[LogprobsTensors] | None = None
+    # Non-spec step with logprobs requested: per-chunk bucketed logprobs (CPU
+    # copies after from_device_chunks) and each chunk's real row count; trimmed
+    # and concatenated on the host in `get_output`.
+    plain_logprobs: list[tuple[LogprobsTensors, int]] | None = None
+    _plain_logprobs_tpu: list[LogprobsTensors] | None = None
 
     @classmethod
     def from_device_chunks(
@@ -104,9 +124,14 @@ class AsyncTPUCopyState:
         chunks_tpu: list[torch.Tensor],
         chunk_real_lens: list[int],
         spec_logprobs: list[SpecLogprobsChunk] | None = None,
+        plain_logprobs: list[tuple[LogprobsTensors, int]] | None = None,
     ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
+        plain_logprobs_tpu = None
+        if plain_logprobs:
+            plain_logprobs_tpu = [t for t, _ in plain_logprobs]
+            plain_logprobs = [(t.to_cpu_nonblocking(), n) for t, n in plain_logprobs]
         spec_logprobs_tpu = None
         if spec_logprobs:
             spec_logprobs_tpu = [c.tensors for c in spec_logprobs]
@@ -123,6 +148,8 @@ class AsyncTPUCopyState:
             chunks_tpu=chunks_tpu,
             spec_logprobs=spec_logprobs or None,
             _spec_logprobs_tpu=spec_logprobs_tpu,
+            plain_logprobs=plain_logprobs or None,
+            _plain_logprobs_tpu=plain_logprobs_tpu,
         )
 
     def fence_pending_device_work(self) -> None:
@@ -140,6 +167,7 @@ class AsyncTPUCopyState:
         self.copy_ready_event.synchronize()
         self.chunks_tpu = None
         self._spec_logprobs_tpu = None
+        self._plain_logprobs_tpu = None
         self.completed = True
 
     @property
@@ -202,6 +230,10 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             return self._model_runner_output
 
         self.copy_state.wait()
+        if self.copy_state.plain_logprobs:
+            self._model_runner_output.logprobs = plain_logprobs_lists(
+                self.copy_state.plain_logprobs
+            )
         selected_token_ids = self.copy_state.sampled_token_ids_cpu
         if selected_token_ids.numel() == 0:
             self._model_runner_output.sampled_token_ids = []

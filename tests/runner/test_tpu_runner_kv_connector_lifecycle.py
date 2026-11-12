@@ -138,12 +138,13 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     return runner
 
 
-def _host_copy(chunks, lengths, spec_logprobs=None):
+def _host_copy(chunks, lengths, spec_logprobs=None, plain_logprobs=None):
     return AsyncTPUCopyState(
         chunks_cpu=chunks,
         chunk_real_lens=lengths,
         copy_ready_event=MagicMock(),
         spec_logprobs=spec_logprobs,
+        plain_logprobs=plain_logprobs,
     )
 
 
@@ -230,8 +231,8 @@ def test_spec_kv_fence_runs_after_drafter_before_connector_save(is_async):
         assert wait is False
         events.append("fence")
 
-    def host_copy(chunks, lengths, spec_logprobs=None):
-        state = _host_copy(chunks, lengths, spec_logprobs)
+    def host_copy(chunks, lengths, spec_logprobs=None, plain_logprobs=None):
+        state = _host_copy(chunks, lengths, spec_logprobs, plain_logprobs)
         state.fence_pending_device_work = lambda: events.append("rearm")
         return state
 
