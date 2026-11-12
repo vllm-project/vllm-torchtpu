@@ -423,6 +423,42 @@ class GdnStepMetadataCache:
         return value
 
 
+def _half_step(sp_half, attn_metadata, state_indices, distribution, slot_read_offsets):
+    """A GDN group's metadata for one token half of a micro-batched
+    sequence-parallel step: ``(memo key, query_start_loc, seq_lens,
+    distribution, slot_read_offsets)``.
+
+    Requests continued from an earlier half read checkpoint 0, where that half
+    wrote their final state: their entry of the per-block read offsets (indexed
+    by the same state ids as the op's gather) becomes 0.
+    """
+    plan, g = sp_half
+    half = plan.gdn(
+        attn_metadata,
+        attn_metadata.query_start_loc,
+        attn_metadata.seq_lens,
+        distribution,
+        g,
+    )
+    if half.resume_from_carry is not None and slot_read_offsets is not None:
+        ids = state_indices.long()
+        slot_read_offsets = slot_read_offsets.index_put(
+            (ids,),
+            torch.where(
+                half.resume_from_carry,
+                torch.zeros_like(slot_read_offsets[ids]),
+                slot_read_offsets[ids],
+            ),
+        )
+    return (
+        half,
+        half.query_start_loc,
+        half.seq_lens,
+        half.distribution,
+        slot_read_offsets,
+    )
+
+
 @QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Whether pooled ops consume the merged block-major unified pool, along
@@ -1403,10 +1439,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
         gdn_step_metadata_cache: GdnStepMetadataCache | None = None,
+        sp_half: tuple[Any, int] | None = None,
     ) -> torch.Tensor:
+        """``sp_half=(plan, g)``: ``hidden_states`` is token half ``g`` of a
+        micro-batched sequence-parallel step (``sequence_parallel.MicroBatchPlan``,
+        VLLM_TPU_SP_MICROBATCH_OVERLAP); the core runs it as a step of its own,
+        after the earlier halves wrote their states."""
         num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
         if self._has_active_pooled_pcp_state(kv_cache):
+            if sp_half is not None:
+                raise NotImplementedError("GDN PCP streaming with SP micro-batches")
             assert kv_cache is not None
             attn_metadata = cast(
                 "dict[str, _GdnAttentionMetadata]", get_forward_context().attn_metadata
@@ -1488,10 +1531,31 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         "Speculative decoding with GDN layers requires "
                         "mamba_slot_read_offsets in the attention metadata."
                     )
+                query_start_loc = attn_metadata.query_start_loc
+                seq_lens = attn_metadata.seq_lens
+                step_key: Any = attn_metadata
+                if sp_half is not None:
+                    (
+                        step_key,
+                        query_start_loc,
+                        seq_lens,
+                        request_distribution,
+                        slot_read_offsets,
+                    ) = _half_step(
+                        sp_half,
+                        attn_metadata,
+                        state_indices,
+                        request_distribution,
+                        slot_read_offsets,
+                    )
                 ckpt_indices = mamba_ckpt_of(attn_metadata)
                 step_metadata: tuple[torch.Tensor, ...] = ()
                 pooled_op = self.gdn_pooled_op
                 prefill_ckpt = getattr(attn_metadata, "mamba_prefill_ckpt", None)
+                if prefill_ckpt is not None and sp_half is not None:
+                    raise NotImplementedError(
+                        "VLLM_TPU_MAMBA_TAIL_FOLD with SP micro-batches"
+                    )
                 if prefill_ckpt is not None:
                     assert self.gdn_pooled_ckpt_op is not None, (
                         "mamba_prefill_ckpt without VLLM_TPU_MAMBA_TAIL_FOLD"
@@ -1521,14 +1585,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     group_inputs = (
                         slot_read_offsets,
                         state_indices,
-                        attn_metadata.query_start_loc,
-                        attn_metadata.seq_lens,
+                        query_start_loc,
+                        seq_lens,
                         request_distribution,
                         ckpt_indices,
                     )
                     slot_read_offsets, ckpt_indices, *rest = (
                         gdn_step_metadata_cache.get(
-                            attn_metadata,
+                            step_key,
                             lambda: tuple(self.gdn_step_metadata_op(*group_inputs)),
                         )
                     )
@@ -1544,9 +1608,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     self.A_log,
                     self.dt_bias,
                     state_indices,
-                    attn_metadata.query_start_loc,
+                    query_start_loc,
                     request_distribution,
-                    attn_metadata.seq_lens,
+                    seq_lens,
                     slot_read_offsets,
                     ckpt_indices,
                     *step_metadata,
@@ -1588,6 +1652,26 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 if mamba_request_distribution is not None:
                     request_distribution = mamba_request_distribution
                 use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
+                query_start_loc = attn_metadata.query_start_loc
+                seq_lens = attn_metadata.seq_lens
+                if sp_half is not None:
+                    if use_pcp_streaming:
+                        raise NotImplementedError(
+                            "GDN PCP prefill with SP micro-batches"
+                        )
+                    (
+                        _,
+                        query_start_loc,
+                        seq_lens,
+                        request_distribution,
+                        slot_read_offsets,
+                    ) = _half_step(
+                        sp_half,
+                        attn_metadata,
+                        state_indices,
+                        request_distribution,
+                        slot_read_offsets,
+                    )
                 if not use_pcp_streaming and self.num_spec > 0:
                     assert slot_read_offsets is not None, (
                         "Speculative decoding with GDN layers requires "
@@ -1607,9 +1691,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         self.A_log,
                         self.dt_bias,
                         state_indices,
-                        attn_metadata.query_start_loc,
+                        query_start_loc,
                         request_distribution,
-                        attn_metadata.seq_lens,
+                        seq_lens,
                         slot_read_offsets,
                     )
                 else:

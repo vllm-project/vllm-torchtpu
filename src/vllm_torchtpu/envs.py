@@ -65,6 +65,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_PLE_TRIM: bool = False
     QWEN4_EXP_PREFILL_SP_SHARED_LOCAL: bool = False
     QWEN4_EXP_PREFILL_SP_PAD_HC: bool = False
+    VLLM_TPU_SP_MICROBATCH_OVERLAP: bool = False
+    VLLM_TPU_SP_MICROBATCH_OVERLAP_FORCE_OFF: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -1496,6 +1498,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rank's shard to the HC kernels' row tile, so buckets whose shard does
     # not divide it (1024 and 3072 at TP8) take sequence parallelism too.
     "QWEN4_EXP_PREFILL_SP_PAD_HC": env_bool("QWEN4_EXP_PREFILL_SP_PAD_HC"),
+    # With QWEN4_EXP_PREFILL_SP=1: split the attention side of every layer of the
+    # sequence-parallel graph into two static token halves (input all-gather, GDN or
+    # QSA core, output projection, reduce-scatter), so the SparseCore runs the second
+    # half's all-gather and the first half's reduce-scatter while the TensorCore
+    # computes the other half. The MoE still runs once on the whole step. Off unless
+    # LIBTPU_INIT_ARGS turns on a SparseCore collective offload (nothing to overlap).
+    "VLLM_TPU_SP_MICROBATCH_OVERLAP": env_bool("VLLM_TPU_SP_MICROBATCH_OVERLAP"),
+    # Kill switch for VLLM_TPU_SP_MICROBATCH_OVERLAP (e.g. if a SparseCore halts on the
+    # half-size collectives); wins over the flag.
+    "VLLM_TPU_SP_MICROBATCH_OVERLAP_FORCE_OFF": env_bool(
+        "VLLM_TPU_SP_MICROBATCH_OVERLAP_FORCE_OFF"
+    ),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
