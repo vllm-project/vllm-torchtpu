@@ -93,8 +93,9 @@ def _call(
 ):
     # `ablate` (timing attribution only; wrong ids): "gather" skips the
     # embedding DMAs, "dot" the bias matmul, "score" the whole tile loop,
-    # "exchange" the remote DMAs. "T" (same ids) streams the Markov rows
-    # through the MXU against stationary embeddings.
+    # "exchange" the remote DMAs, "w2load" the Markov row load, "barrier"
+    # the entry barrier (only with "exchange"). "T" (same ids) streams the
+    # Markov rows through the MXU against stationary embeddings.
     # Only the `rows` real rows gather embeddings and hand ids to the scalar
     # core; pad rows up to rp keep zero embeddings and are never read.
     nt = vp // TILE_COLS
@@ -123,8 +124,21 @@ def _call(
         recv_sem,
     ):
         me = rank_ref[0]
-        w2_copy = pltpu.make_async_copy(w2_hbm, w2_v, load_sem.at[0])
-        w2_copy.start()
+
+        # The Markov rows load one tile per DMA; step 0 waits for each tile
+        # just before it uses it, so the load overlaps the barrier, the first
+        # gathers and step 0's own tiles.
+        def w2_copy(t):
+            c0 = pl.multiple_of(t * TILE_COLS, TILE_COLS)
+            return pltpu.make_async_copy(
+                w2_hbm.at[pl.ds(c0, TILE_COLS)],
+                w2_v.at[pl.ds(c0, TILE_COLS)],
+                load_sem.at[t],
+            )
+
+        if "w2load" not in ablate:
+            for t in range(nt):
+                w2_copy(t).start()
 
         def lg_copy(i):
             return pltpu.make_async_copy(
@@ -135,10 +149,13 @@ def _call(
         for r in range(rows):
             prev_s[r] = prev0_ref[r]
 
-        barrier = pltpu.get_barrier_semaphore()
-        for d in range(n):
-            pl.semaphore_signal(barrier, inc=1, device_id=(d,), device_id_type=_MESH)
-        pl.semaphore_wait(barrier, n)
+        if "barrier" not in ablate:
+            barrier = pltpu.get_barrier_semaphore()
+            for d in range(n):
+                pl.semaphore_signal(
+                    barrier, inc=1, device_id=(d,), device_id_type=_MESH
+                )
+            pl.semaphore_wait(barrier, n)
 
         lane = lax.broadcasted_iota(jnp.int32, (rp, _LANES), 1)
         col = lax.broadcasted_iota(jnp.int32, (rp, TILE_COLS), 1)
@@ -158,8 +175,6 @@ def _call(
                 gathers.append(g)
             if i + 1 < k:
                 lg_copy(i + 1).start()
-            if i == 0:
-                w2_copy.wait()
             lg_copy(i).wait()
             for g in gathers:
                 g.wait()
@@ -179,8 +194,10 @@ def _call(
                 # Markov rows as the streamed operand, embeddings stationary.
                 e = jnp.concatenate([e, jnp.zeros((_LANES - rp, rank_dim), BF16)], 0)
 
-            def tile(t, carry, par=par, e=e):
+            def tile(t, carry, par=par, e=e, first=(i == 0)):
                 best_m, best_i = carry
+                if first and "w2load" not in ablate:
+                    w2_copy(t).wait()
                 c0 = pl.multiple_of(t * TILE_COLS, TILE_COLS)
                 w = w2_v[pl.ds(c0, TILE_COLS), :]
                 if "dot" in ablate:
@@ -213,6 +230,9 @@ def _call(
                     jnp.zeros((rp, 1), F32),
                 ),
             )
+            if i == 0 and "score" in ablate and "w2load" not in ablate:
+                for t in range(nt):
+                    w2_copy(t).wait()
             gid = best_i + (jnp.zeros((rp, 1), jnp.int32) + start).astype(F32)
             pair = jnp.where(lane == 0, best_m, jnp.where(lane == 1, gid, 0.0))
             send_v[par] = pair
@@ -268,7 +288,7 @@ def _call(
                 pltpu.VMEM((2, rp, _LANES), F32),
                 pltpu.VMEM((2, n, rp, _LANES), F32),
                 pltpu.SMEM((rp,), jnp.int32),
-                pltpu.SemaphoreType.DMA((1,)),
+                pltpu.SemaphoreType.DMA((nt,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((1,)),
                 pltpu.SemaphoreType.DMA((2, n)),
