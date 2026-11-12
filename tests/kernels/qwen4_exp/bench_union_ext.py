@@ -74,6 +74,16 @@ ARMS = {
     "bsp_h1": (False, 1, False),
     "union_h1": (True, 1, False),
     "union_forced": (True, 0, True),
+    "union_sc": (True, 0, False),
+    "union_qk16": (True, 0, False),
+    "union_sc_qk16": (True, 0, False),
+}
+# extra env per arm (the union arms' sub-options)
+ARM_ENV = {
+    "union_noahead": {"VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD": "0"},
+    "union_sc": {"VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET": "1"},
+    "union_qk16": {"VLLM_TPU_QSA_PREFILL_UNION_QK16": "1"},
+    "union_sc_qk16": {"VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET": "1", "VLLM_TPU_QSA_PREFILL_UNION_QK16": "1"},
 }
 
 
@@ -312,8 +322,7 @@ def main():
             values = dict(SERVED_ENV)
             if union_on:
                 values.update(UNION_ENV)
-                if arm.endswith("noahead"):
-                    values["VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD"] = "0"
+                values.update(ARM_ENV.get(arm, {}))
             restore = lambda: None  # noqa: E731
             try:
                 with env(values):
