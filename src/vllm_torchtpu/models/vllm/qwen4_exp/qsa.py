@@ -474,6 +474,25 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             )
         return active
 
+    def _attach_union_probe(self, pool) -> None:
+        """VLLM_TPU_QSA_PREFILL_UNION_PROBE (debug, log-only): buffers for ``union_probe``."""
+        from vllm.config import get_current_vllm_config
+
+        from vllm_torchtpu.models.vllm.qwen4_exp import union_probe
+
+        config = get_current_vllm_config()
+        model_config = config.model_config
+        text = getattr(model_config, "hf_text_config", None) or model_config.hf_config
+        layer_types = getattr(text, "layer_types", None) or ()
+        if union_probe.maybe_attach(
+            self,
+            max_tokens=int(config.scheduler_config.max_num_batched_tokens),
+            width=self.max_selected_tokens,
+            device=self.rope_cache.device,
+            layer_types=layer_types,
+        ):
+            union_probe.set_page_size(int(pool.shape[1]))
+
     def get_attn_backend(self):
         return Qwen4ExpPooledQSABackend if self.pooled else Qwen4ExpQSABackend
 
@@ -644,6 +663,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     kv_heads=self.num_kv_heads,
                     **keywords,
                 )
+            if envs.VLLM_TPU_QSA_PREFILL_UNION_PROBE:
+                self._attach_union_probe(pool)
         # With VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP a single-graph module (the
         # MTP draft, traced once for every bucket including prefill chunks)
         # keeps the replicated indexer: it cannot pick per bucket.
@@ -969,6 +990,11 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 else {}
             ),
         )
+        if rows is None and getattr(self, "_union_probe_selected", None) is not None:
+            # VLLM_TPU_QSA_PREFILL_UNION_PROBE (debug, log-only): copies only.
+            from vllm_torchtpu.models.vllm.qwen4_exp import union_probe
+
+            union_probe.stash(self, selected, positions)
         if pick_rows:
             keep = (rows >= 0)[:, None]
             picked = rows.clamp_min(0)
