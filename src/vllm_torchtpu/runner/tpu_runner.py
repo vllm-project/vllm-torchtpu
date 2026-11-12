@@ -5993,7 +5993,9 @@ class TPUModelRunner(GPUModelRunner):
         if option(additional, "tight_vmem"):
             from vllm_torchtpu.kernels import tight_vmem
 
-            tight_vmem.set_options(True, option(additional, "tight_vmem_candidates_mib"))
+            tight_vmem.set_options(
+                True, option(additional, "tight_vmem_candidates_mib")
+            )
             logger.info(
                 "tight_vmem on: smallest compiling vmem_limit from %s MiB "
                 "(additional_config tight_vmem_candidates_mib=%r)",

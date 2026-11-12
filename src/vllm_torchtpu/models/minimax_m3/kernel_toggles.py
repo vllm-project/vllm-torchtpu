@@ -161,7 +161,9 @@ def _apply_r6(additional_config: Any) -> None:
         value = _non_negative(additional_config, key) or default
         _set_value(additional_config, key, r6, attr, value)
     if not option(additional_config, "minimax_msa_lse_r6"):
-        unused = [k for k in R6_ONLY_KEYS if option(additional_config, k) != DEFAULTS[k]]
+        unused = [
+            k for k in R6_ONLY_KEYS if option(additional_config, k) != DEFAULTS[k]
+        ]
         if unused and "r6_only" not in _logged:
             _logged.add("r6_only")
             logger.warning(
