@@ -4585,7 +4585,11 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 else:
                     chunk_embeds = []
-                chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
+                # A chunk without multimodal embeddings (every decode step)
+                # embeds its ids directly: an all-False mask changes no value
+                # but costs an upload per step.
+                if chunk_embeds:
+                    chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
             self._record_input_staging_fence()
             if self._pp_is_first:
