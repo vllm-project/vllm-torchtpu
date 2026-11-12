@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -25,6 +25,61 @@ from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+COARSE_PAD_KEY = "spec_verify_coarse_pad"
+# Smallest row count of the coarse verify ladder: one request's 1 + K window
+# at K = 7.
+COARSE_PAD_MIN_ROWS = 8
+
+
+def coarse_pad_enabled(additional_config: Any) -> bool:
+    """`additional_config["spec_verify_coarse_pad"]`; off by default.
+
+    Pads a verify chunk's logits rows (`padded_logits_length`, the length of
+    every verify-row tensor) to `coarse_verify_paddings` instead of the token
+    buckets, so the verify and sampler programs, which are compiled once per
+    (rows, padded_num_reqs) pair, do not multiply with
+    TPU_TOKEN_BUCKET_EXTRA. The backbone keeps the token buckets.
+    """
+    if not isinstance(additional_config, dict):
+        return False
+    enabled = additional_config.get(COARSE_PAD_KEY, False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"additional_config.{COARSE_PAD_KEY} must be a bool")
+    return enabled
+
+
+def coarse_verify_paddings(token_paddings: list[int], max_rows: int) -> list[int]:
+    """The coarse verify-row ladder: powers of two from COARSE_PAD_MIN_ROWS
+    below the token bucket that covers a full batch of verify windows
+    (`max_rows`), that bucket, then the token buckets above it.
+
+    The top of the ladder is the token bucket the fine path pads a full batch
+    to, so the largest verify programs and the structured-output target
+    bitmask (sized to that bucket) are unchanged. Buckets above it are only
+    reachable when a chunk holds more rows than max_num_reqs * (1 + K)."""
+    from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+    pads = sorted(token_paddings)
+    cap = _get_padded_token_len(pads, min(max_rows, pads[-1]))
+    ladder = []
+    rows = COARSE_PAD_MIN_ROWS
+    while rows < cap:
+        ladder.append(rows)
+        rows *= 2
+    ladder.append(cap)
+    ladder += [p for p in pads if p > cap]
+    return ladder
+
+
+def verify_logits_paddings(runner: Any) -> list[int]:
+    """The row counts a verify chunk's logits rows are padded to: the token
+    buckets, or the coarse ladder under spec_verify_coarse_pad."""
+    pads = list(runner.num_tokens_paddings)
+    if getattr(runner, "_spec_verify_coarse_pad", False) is not True:
+        return pads
+    k = runner.speculative_config.num_speculative_tokens
+    return coarse_verify_paddings(pads, runner.max_num_reqs * (1 + k))
 
 
 @dataclass
@@ -63,6 +118,12 @@ class SpecDecodeMetadata:
     # request (accepted count, rejected draft token or -1), decided before the
     # LM head; the step's logits then hold one row per request.
     synthetic_verify: tuple[torch.Tensor, torch.Tensor] | None = None
+    # spec_verify_coarse_pad: the row count the token buckets pad this
+    # chunk's verify rows to (padded_logits_length is the coarse one). Eager
+    # uniforms over the verify rows are drawn at this length and zero-padded,
+    # so the sampling generator's stream is the same as without the key.
+    # None: padded_logits_length is the token-bucket length.
+    rng_rows: int | None = None
 
     def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
         assert self.deferred_draft_token_ids_cpu is not None
@@ -95,7 +156,9 @@ class SpeculativeDecodingManager:
         self._meta_cache: SpecDecodeMetadata | None = None
         # (logits_indices, target_logits_indices, padded_logits_length) from
         # the cached build — needed to re-extract draft_token_ids on a hit.
-        self._meta_cache_np: tuple[np.ndarray, np.ndarray, int] | None = None
+        self._meta_cache_np: tuple[np.ndarray, np.ndarray, int, int | None] | None = (
+            None
+        )
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._staged_draft_copy is not None:
@@ -299,7 +362,7 @@ class SpeculativeDecodingManager:
         if cache_key == self._meta_cache_key:
             assert self._meta_cache is not None
             assert self._meta_cache_np is not None
-            logits_indices, target_logits_indices, padded_logits_length = (
+            logits_indices, target_logits_indices, padded_logits_length, rng_rows = (
                 self._meta_cache_np
             )
             # draft_token_ids depends on this step's input_ids_cpu content —
@@ -326,6 +389,7 @@ class SpeculativeDecodingManager:
                 deferred_draft_token_ids_cpu=(
                     padded_draft_token_ids if defer_draft_token_ids else None
                 ),
+                rng_rows=rng_rows,
             )
 
         # [num_reqs]
@@ -378,6 +442,14 @@ class SpeculativeDecodingManager:
         padded_logits_length = _get_padded_token_len(
             self.runner.num_tokens_paddings, logits_indices.shape[0]
         )
+        rng_rows = None
+        if getattr(self.runner, "_spec_verify_coarse_pad", False) is True:
+            fine_length = padded_logits_length
+            padded_logits_length = _get_padded_token_len(
+                verify_logits_paddings(self.runner), logits_indices.shape[0]
+            )
+            if padded_logits_length != fine_length:
+                rng_rows = fine_length
 
         padded_logits_indices = np.zeros(padded_logits_length, dtype=np.int32)
         padded_logits_indices[: logits_indices.shape[0]] = logits_indices
@@ -448,6 +520,7 @@ class SpeculativeDecodingManager:
             deferred_draft_token_ids_cpu=(
                 padded_draft_token_ids if defer_draft_token_ids else None
             ),
+            rng_rows=rng_rows,
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller
         # mutation can't diverge the cache from its key.
@@ -458,5 +531,6 @@ class SpeculativeDecodingManager:
             logits_indices,
             target_logits_indices,
             padded_logits_length,
+            rng_rows,
         )
         return metadata
