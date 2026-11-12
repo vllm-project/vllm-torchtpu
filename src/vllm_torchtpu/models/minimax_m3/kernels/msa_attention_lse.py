@@ -810,6 +810,7 @@ def _proof(flag: str, detail: str) -> None:
     if flag not in _PROVEN:
         _PROVEN.add(flag)
         logger.warning("%s=1: %s", flag, detail)
+        print(f"{flag}=1: {detail}", flush=True)  # workers may log nowhere
 
 
 # Decode work list by `_packed_work_kernel` instead of XLA (8-token tiles).
