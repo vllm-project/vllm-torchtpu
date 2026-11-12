@@ -23,10 +23,21 @@ import torch
 import vllm.model_executor.models.utils as vllm_utils
 from transformers import Qwen3OmniMoeAudioEncoderConfig
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeTalkerCodePredictorConfig,
     Qwen3OmniMoeVisionEncoderConfig,
+)
+from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
+    CodePredictorBaseModel,
+    CodePredictorWrapper,
+    CodePredictorWrapperConfig,
+    _RMSNorm,
+    _RotaryEmbedding,
 )
 from vllm_omni.model_executor.models.qwen3_omni import (
     qwen3_omni_moe_thinker as thinker_mod,
+)
+from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
+    Qwen3OmniMoeForConditionalGeneration,
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3Omni_VisionTransformer,
@@ -39,6 +50,9 @@ from tests_omni.omni_test_utils import (
     assert_parity,
     init_test_weights,
     use_native_ops_on_cpu,
+)
+from vllm_torchtpu.omni.patches.qwen3omni_talker import (
+    maybe_patch_qwen3_omni_talker,
 )
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_STATIC_BUCKETING_PATCHED,
@@ -369,9 +383,12 @@ def test_vision_encoder_matches_cpu_reference(
 
 def test_multimodal_merge_on_tpu_matches_cpu_reference(encoders) -> None:
     """Patched static multimodal merge on TPU matches index-masked CPU reference."""
+    from vllm.multimodal.utils import set_mm_embedding_modality
+
     tpu_dev = torch.device("tpu")
     is_video = torch.tensor([False, True, True, False, False, False], dtype=torch.bool)
     is_audio = torch.tensor([False, False, False, False, True, False], dtype=torch.bool)
+    is_mm = is_video | is_audio
     base_embeds = torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.bfloat16)
     visual_embeds = torch.tensor(
         [[10.0, 20.0, 30.0, 40.0], [50.0, 60.0, 70.0, 80.0]], dtype=torch.bfloat16
@@ -382,9 +399,6 @@ def test_multimodal_merge_on_tpu_matches_cpu_reference(encoders) -> None:
     expected[1:3] = visual_embeds
     expected[4:5] = audio_embeds
 
-    from vllm.multimodal.utils import set_mm_embedding_modality
-
-    is_mm = is_video | is_audio
     merged_tpu = thinker_mod.merge_interleaved_embeddings(
         inputs_embeds=base_embeds.to(tpu_dev),
         multimodal_embeddings=[
@@ -397,3 +411,96 @@ def test_multimodal_merge_on_tpu_matches_cpu_reference(encoders) -> None:
     )
     assert merged_tpu.device.type == "tpu"
     assert torch.equal(merged_tpu.cpu(), expected)
+
+
+def test_code_predictor_wrapper_on_tpu_matches_cpu_reference(encoders) -> None:
+    """Patched CodePredictorWrapper runs residual AR on CPU and returns TPU tensors."""
+    cp_config = Qwen3OmniMoeTalkerCodePredictorConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        vocab_size=64,
+        num_code_groups=4,
+    )
+    rms_own = _RMSNorm.__dict__.get("forward_tpu")
+    rotary_own = _RotaryEmbedding.__dict__.get("forward_tpu")
+    base_fwd = CodePredictorBaseModel.__dict__.get("forward")
+    wrapper_fwd = CodePredictorWrapper.__dict__.get("forward")
+    talker_pre = Qwen3OmniMoeForConditionalGeneration.__dict__.get("talker_preprocess")
+    try:
+        config = SimpleNamespace(architectures=["Qwen3OmniMoeForConditionalGeneration"])
+        assert maybe_patch_qwen3_omni_talker(config) is True
+
+        torch.manual_seed(0)
+        wrapper = CodePredictorWrapper(
+            vllm_config=SimpleNamespace(model_config=SimpleNamespace()),
+            cp_config=cp_config,
+            wrapper_config=CodePredictorWrapperConfig(
+                use_parallel_embedding=False,
+                use_projection=True,
+                use_cuda_graphs=False,
+                return_proj_buf=True,
+            ),
+            talker_hidden_size=48,
+        ).eval()
+        init_test_weights(wrapper, seed=0)
+        use_native_ops_on_cpu(wrapper)
+        wrapper.set_sampling_params(do_sample=False)
+
+        layer0_code = torch.tensor([[3]], dtype=torch.long)
+        layer0_embed = torch.randn(1, 1, 48)
+        last_talker_hidden = torch.randn(1, 1, 48)
+
+        with torch.no_grad():
+            ref_codes, ref_proj = wrapper(
+                layer0_code=layer0_code,
+                layer0_embed=layer0_embed,
+                last_talker_hidden=last_talker_hidden,
+                do_sample=False,
+            )
+
+        tpu_dev = torch.device("tpu")
+        tpu_wrapper = CodePredictorWrapper(
+            vllm_config=SimpleNamespace(model_config=SimpleNamespace()),
+            cp_config=cp_config,
+            wrapper_config=CodePredictorWrapperConfig(
+                use_parallel_embedding=False,
+                use_projection=True,
+                use_cuda_graphs=False,
+                return_proj_buf=True,
+            ),
+            talker_hidden_size=48,
+        ).eval()
+        tpu_wrapper.load_state_dict(wrapper.state_dict())
+        use_native_ops_on_cpu(tpu_wrapper)
+        tpu_wrapper.set_sampling_params(do_sample=False)
+        tpu_wrapper = tpu_wrapper.to(tpu_dev)
+
+        with torch.no_grad():
+            tpu_codes, tpu_proj = tpu_wrapper(
+                layer0_code=layer0_code.to(tpu_dev),
+                layer0_embed=layer0_embed.to(tpu_dev),
+                last_talker_hidden=last_talker_hidden.to(tpu_dev),
+                do_sample=False,
+            )
+        assert next(tpu_wrapper.parameters()).device.type == "cpu"
+        assert tpu_codes.device.type == "tpu"
+        assert tpu_proj.device.type == "tpu"
+        assert torch.equal(tpu_codes.cpu(), ref_codes)
+        assert torch.allclose(tpu_proj.cpu(), ref_proj, atol=1e-5)
+    finally:
+        for cls, attr, val in (
+            (_RMSNorm, "forward_tpu", rms_own),
+            (_RotaryEmbedding, "forward_tpu", rotary_own),
+            (CodePredictorBaseModel, "forward", base_fwd),
+            (CodePredictorWrapper, "forward", wrapper_fwd),
+            (Qwen3OmniMoeForConditionalGeneration, "talker_preprocess", talker_pre),
+        ):
+            if val is None:
+                if attr in cls.__dict__:
+                    delattr(cls, attr)
+            else:
+                setattr(cls, attr, val)
