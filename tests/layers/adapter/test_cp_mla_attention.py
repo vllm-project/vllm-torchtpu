@@ -543,7 +543,6 @@ def test_merge_spanning_pcp_matches_the_reference(pcp_size, tp_size, a2a, monkey
     """DCP rank (p, t) holds TP lane t's heads of PCP position p: the merge
     weights over every DCP rank and returns lane t's head block. The
     all-to-all merge assumes distinct heads per DCP rank, so it is skipped."""
-    monkeypatch.setattr(cp_mla.envs, "USE_TPU_PCP_MANAGER", True, raising=False)
     monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", a2a, raising=False)
     monkeypatch.setattr(
         cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 256, raising=False
@@ -561,7 +560,7 @@ def test_merge_spanning_pcp_matches_the_reference(pcp_size, tp_size, a2a, monkey
     hub = _LockstepHub(world)
     groups = threading.local()
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: groups.dcp)
-    monkeypatch.setattr(cp_mla, "_get_tp_group", lambda: groups.tp)
+    monkeypatch.setattr(cp_mla, "get_tp_group_or_none", lambda: groups.tp)
     monkeypatch.setattr(cp_mla, "get_pcp_group", lambda: groups.pcp)
 
     def run(rank):
@@ -569,7 +568,9 @@ def test_merge_spanning_pcp_matches_the_reference(pcp_size, tp_size, a2a, monkey
         groups.dcp = _SubGroup(hub, list(range(world)), rank)
         groups.tp = _SubGroup(hub, [p * tp_size + i for i in range(tp_size)], rank)
         groups.pcp = _SubGroup(hub, [i * tp_size + t for i in range(pcp_size)], rank)
-        return cp_mla.merge_lse_partials_scatter_heads(outputs[rank], lses[rank])
+        return cp_mla.merge_lse_partials_scatter_heads(
+            outputs[rank], lses[rank], spans_pcp=True
+        )
 
     with concurrent.futures.ThreadPoolExecutor(world) as pool:
         got = list(pool.map(run, range(world)))
@@ -589,20 +590,19 @@ def test_merge_spanning_pcp_matches_the_reference(pcp_size, tp_size, a2a, monkey
 def test_head_gather_spanning_pcp_uses_the_tp_group(lane, monkeypatch):
     """Only TP lanes hold distinct heads, so the gather is over TP, never
     over the DCP group."""
-    monkeypatch.setattr(cp_mla.envs, "USE_TPU_PCP_MANAGER", True, raising=False)
     rng = np.random.default_rng(41)
     per_lane = torch.from_numpy(rng.standard_normal((2, 6, 3, 8)).astype(np.float32))
     monkeypatch.setattr(
-        cp_mla, "_get_tp_group", lambda: _HeadGatherGroup(per_lane, lane)
+        cp_mla, "get_tp_group_or_none", lambda: _HeadGatherGroup(per_lane, lane)
     )
     monkeypatch.setattr(
         cp_mla, "get_dcp_group", lambda: pytest.fail("used the DCP group")
     )
 
-    got = cp_mla.all_gather_heads(per_lane[lane])
+    got = cp_mla.all_gather_heads(per_lane[lane], spans_pcp=True)
     np.testing.assert_array_equal(got.numpy(), torch.cat(list(per_lane), 1).numpy())
     nope, pe = cp_mla.all_gather_q_nope_pe_heads(
-        per_lane[lane][..., :5], per_lane[lane][..., 5:], 5
+        per_lane[lane][..., :5], per_lane[lane][..., 5:], 5, spans_pcp=True
     )
     np.testing.assert_array_equal(nope.numpy(), got[..., :5].numpy())
     np.testing.assert_array_equal(pe.numpy(), got[..., 5:].numpy())

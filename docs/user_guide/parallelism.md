@@ -138,10 +138,10 @@ Requirements:
 - A sparse MLA model.
 - `--decode-context-parallel-size` equal to `--prefill-context-parallel-size` x `--tensor-parallel-size`.
 - `--cp-kv-cache-interleave-size` a multiple of `4` (vLLM defaults to `1`).
-- No speculative decoding, LoRA, pipeline parallelism, data parallelism, or multimodal inputs.
+- Experimental features. Do not support speculative decoding, LoRA, pipeline parallelism, data parallelism, multimodal inputs, pooling models, and KV connectors (`--kv-transfer-config`, including disaggregated serving and KV offloading) right now.
 - MoE models also need `--enable-expert-parallel`.
 
 Sizing:
 
-- `TPU_PCP_KV_WORKSPACE_TOKENS` (default `1048576`): if the prefills in a step need more context tokens than this, the runner runs the step as several forwards. Must be at least `--max-model-len`.
+- `TPU_PCP_KV_WORKSPACE_TOKENS` (default `1048576`): if the prefills in a step need more context tokens than this, the runner runs the step as several forwards. Must be at least `--max-model-len`. A prefill forward allocates a temporary workspace of this many tokens, reused across layers: about 0.6 GB for the MLA latents and 0.27 GB for the indexer K at the default. KV cache sizing does not reserve it yet, so leave room for it in `--gpu-memory-utilization`.
 - `TPU_PCP_KV_CHUNK_TOKENS` (default `65536`): context tokens moved by each all-gather.

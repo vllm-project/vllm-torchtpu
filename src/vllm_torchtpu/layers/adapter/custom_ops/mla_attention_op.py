@@ -68,10 +68,10 @@ from vllm_torchtpu.layers.adapter.attention import (
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.dcp_indexer_cache import scatter_indexer_k_rows
 from vllm_torchtpu.layers.core.pcp_workspace import (
     pcp_prefill_topk,
     pcp_prefill_topk_partition_specs,
-    scatter_indexer_k_rows,
 )
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger

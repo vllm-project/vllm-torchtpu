@@ -568,7 +568,7 @@ def _compute_num_reqs_in_chunk(
     capacity: requests the attention metadata holds per forward.
     num_scheduled_tokens: scheduled tokens of requests `[start_index, num_reqs)`.
     """
-    pcp_manager = getattr(runner, "pcp_manager", None)
+    pcp_manager = runner.pcp_manager
     if pcp_manager is None:
         return min(capacity, num_reqs - start_index)
     else:
@@ -2630,7 +2630,7 @@ class TPUModelRunner(GPUModelRunner):
         token_in_tpu_pre_next_tokens_indices_list = []
         acc_cur_len = 0
         layout_plan = self._last_sequence_layout_plan
-        pcp_manager = getattr(self, "pcp_manager", None)
+        pcp_manager = self.pcp_manager
         pcp_plan = None if pcp_manager is None else pcp_manager.sharding_plan
 
         # 1+K for spec — `[bonus, draft_1..K]`), so a request's source span
@@ -4795,7 +4795,7 @@ class TPUModelRunner(GPUModelRunner):
         finished_np = (num_computed_np + num_scheduled_tokens_np) == prompt_lens_np
 
         spec = self._static_pooler_spec
-        default_layout = getattr(self, "pcp_manager", None) is None and (
+        default_layout = self.pcp_manager is None and (
             layout_plan is None
             or (
                 getattr(layout_plan, "kind", SequenceLayoutKind.ALL)
@@ -8800,7 +8800,7 @@ class TPUModelRunner(GPUModelRunner):
                 return self.max_num_blocks_per_req
             return cdiv(model_len, self.block_size)
 
-        max_num_local_reqs = getattr(self, "max_num_local_reqs", self.max_num_reqs)
+        max_num_local_reqs = self.max_num_local_reqs
         self.num_reqs_max_model_len = min(
             PallasAttentionBackend.get_max_num_seqs_for_pages(widest_table(None)),
             max_num_local_reqs,

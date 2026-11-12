@@ -2624,8 +2624,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         )
         partial, lse = layer.sparse_mla_dcp_op(
             kv_cache,
-            all_gather_heads(kvg.take_decode_rows(ql_nope, md)),
-            all_gather_heads(kvg.take_decode_rows(q_pe, md)),
+            all_gather_heads(kvg.take_decode_rows(ql_nope, md), spans_pcp=True),
+            all_gather_heads(kvg.take_decode_rows(q_pe, md), spans_pcp=True),
             kvg.take_decode_rows(kv_c_normed, md),
             kvg.take_decode_rows(k_pe, md),
             kvg.take_decode_rows(topk_indices, md),
@@ -2634,7 +2634,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             pcp.rep_query_start_loc,
             pcp.rep_request_distribution,
         )
-        decode_out = merge_lse_partials_scatter_heads(partial, lse)
+        decode_out = merge_lse_partials_scatter_heads(partial, lse, spans_pcp=True)
 
         prefill_out = layer.pcp_prefill_op(
             kv_cache,
@@ -2774,11 +2774,16 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     and all_gather_heads is _cp_mla_attention.all_gather_heads
                 ):
                     ql_nope_dcp, q_pe_dcp = all_gather_q_nope_pe_heads(
-                        ql_nope_flat, q_pe_flat, layer.kv_lora_rank
+                        ql_nope_flat,
+                        q_pe_flat,
+                        layer.kv_lora_rank,
+                        spans_pcp=self.pcp_kv_gather,
                     )
                 else:
-                    ql_nope_dcp = all_gather_heads(ql_nope_flat)
-                    q_pe_dcp = all_gather_heads(q_pe_flat)
+                    ql_nope_dcp = all_gather_heads(
+                        ql_nope_flat, spans_pcp=self.pcp_kv_gather
+                    )
+                    q_pe_dcp = all_gather_heads(q_pe_flat, spans_pcp=self.pcp_kv_gather)
                 # `topk_indices` here is not global positions: the DCP indexer
                 # already resolved each token's global top-k into this rank's
                 # own local cache indices, `-1` where it owns nothing.
@@ -2809,6 +2814,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     partial,
                     lse,
                     is_backbone=vllm_compilation_backends.model_tag == "backbone",
+                    spans_pcp=self.pcp_kv_gather,
                 )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:

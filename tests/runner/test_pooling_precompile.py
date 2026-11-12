@@ -820,6 +820,7 @@ def _fake_pool_chunk_runner(runner_mod, spec, pooler, prompt_lens, computed):
         _static_pooler_spec=spec,
         model=SimpleNamespace(pooler=pooler),
         device=torch.device("cpu"),
+        pcp_manager=None,
     )
 
 

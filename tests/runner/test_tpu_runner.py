@@ -212,6 +212,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     runner = SimpleNamespace(
         max_model_len=1048576,
         max_num_reqs=64,
+        max_num_local_reqs=64,
         max_num_tokens=256,
         block_size=384,
         max_num_blocks_per_req=pages,
@@ -332,6 +333,7 @@ def test_smem_caps_refresh_after_backend_block_size_update():
     runner = SimpleNamespace(
         max_model_len=32768,
         max_num_reqs=256,
+        max_num_local_reqs=256,
         max_num_tokens=8192,
         block_size=16,
         max_num_blocks_per_req=2048,
@@ -365,6 +367,7 @@ def test_smem_caps_refresh_keeps_block_table_width_when_block_size_unchanged():
     runner = SimpleNamespace(
         max_model_len=1000,
         max_num_reqs=256,
+        max_num_local_reqs=256,
         max_num_tokens=8192,
         block_size=16,
         max_num_blocks_per_req=64,  # placeholder table width, > cdiv(1000, 16)
@@ -391,6 +394,7 @@ def test_smem_caps_refresh_keeps_block_size_until_platform_finalizes_it():
     runner = SimpleNamespace(
         max_model_len=32768,
         max_num_reqs=256,
+        max_num_local_reqs=256,
         max_num_tokens=8192,
         block_size=384,
         max_num_blocks_per_req=86,
@@ -885,6 +889,7 @@ def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
             None if spec_k is None else SimpleNamespace(num_speculative_tokens=spec_k)
         ),
         _last_sequence_layout_plan=None,
+        pcp_manager=None,
         input_batch=SimpleNamespace(req_ids=req_ids),
     )
     cur, src = TPUModelRunner._prepare_async_token_substitution_indices(

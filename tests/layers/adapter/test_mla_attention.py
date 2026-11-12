@@ -1062,7 +1062,7 @@ def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
         )
     )
 
-    def _explode(*_args):
+    def _explode(*_args, **_kw):
         raise AssertionError("qrep must not all-gather the query heads")
 
     monkeypatch.setattr(attention_adapter, "all_gather_heads", _explode)
@@ -1112,7 +1112,7 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     monkeypatch.setattr(
         attention_adapter,
         "all_gather_heads",
-        lambda t: (gathered.append(t), t.repeat(1, dcp_size, 1))[1],
+        lambda t, **_kw: (gathered.append(t), t.repeat(1, dcp_size, 1))[1],
     )
     monkeypatch.setattr(
         attention_adapter,
@@ -1139,7 +1139,7 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     monkeypatch.setattr(
         attention_adapter,
         "all_gather_q_nope_pe_heads",
-        lambda nope, pe, rank: (
+        lambda nope, pe, rank, **_kw: (
             fused_calls.append((nope, pe, rank)),
             (nope.repeat(1, dcp_size, 1), pe.repeat(1, dcp_size, 1)),
         )[1],
@@ -1161,7 +1161,7 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     monkeypatch.setattr(
         attention_adapter,
         "all_gather_heads",
-        lambda t: (unfused_calls.append(t), t.repeat(1, dcp_size, 1))[1],
+        lambda t, **_kw: (unfused_calls.append(t), t.repeat(1, dcp_size, 1))[1],
     )
     impl.forward(
         layer=layer,
