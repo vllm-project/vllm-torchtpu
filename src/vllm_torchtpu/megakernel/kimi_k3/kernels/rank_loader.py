@@ -295,7 +295,7 @@ def _ep16_expert_jobs(presharded, rank_dir: RankDir, rank: int, layers: int, ord
     """The EP16/TP2 expert families, largest first, one job per file: chip
     ``rank // 2`` holds 56 experts at half the intermediate (TP4 quarters
     2 (rank % 2) and 2 (rank % 2) + 1), its EP8 group's half without a
-    placement ``order`` (see :func:`prefill_expert_plan`)."""
+    placement ``order`` (see :func:`expert_plan`)."""
     names = sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
     if order is not None:
         for name in names:
@@ -366,13 +366,13 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
 
     ``KernelConfig.decode_expert_parallel`` 16 (the aggregate engine): the
     experts are the prefill's EP16/TP2 families (:func:`_ep16_expert_jobs`),
-    placed and with the router columns permuted by ``prefill_expert_plan``,
+    placed and with the router columns permuted by ``expert_plan``,
     each joined on the host and yielded whole: the aggregate's prefill uses
     these tensors as they are.
     """
     rank_dir = RankDir(presharded, rank, layers)
     ep16 = _config().decode_expert_parallel == 16
-    expert_order = prefill_expert_plan(layers) if ep16 else None
+    expert_order = expert_plan(layers) if ep16 else None
     jobs: list[tuple[str, int, object]]
     if ep16:
         jobs = _host_joined(_ep16_expert_jobs(presharded, rank_dir, rank, layers, expert_order))
@@ -431,19 +431,19 @@ def _sequence_parallel_output(own: np.ndarray, peer_dir: RankDir, name: str, ran
     return np.ascontiguousarray(np.concatenate([h[:, rows] for h in halves], axis=-1))
 
 
-def prefill_expert_plan(layers: int):
-    """The expert placement (``KernelConfig.prefill_expert_plan``) of every
+def expert_plan(layers: int):
+    """The expert placement (``KernelConfig.expert_plan``) of every
     program holding EP16 experts -- the prefill and the aggregate's decode --
     or None: ``order [layers - 1, 896]``, ``order[l, p]`` the logical expert
     at physical slot ``p`` of MoE layer ``l``; chip ``c`` holds slots
     ``56 c .. 56 c + 55``. The expert weights and router columns are loaded
     in slot order. A bare name loads from kimi_k3/data."""
-    path = _config().prefill_expert_plan
+    path = _config().expert_plan
     if not path:
         return None
     order = np.load(_plan_path(path))["order"].astype(np.int64)
     if order.shape != (layers - 1, 896) or any(sorted(row) != list(range(896)) for row in order.tolist()):
-        raise ValueError(f"prefill expert plan {path}: order must be [{layers - 1}, 896] permutations")
+        raise ValueError(f"expert plan {path}: order must be [{layers - 1}, 896] permutations")
     return order
 
 
@@ -528,7 +528,7 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
         raise ValueError("only all four expert families, from an EP16 decode, are the decode's tensors")
     jobs: list[tuple] = []
     if not shared_experts:
-        jobs += _ep16_expert_jobs(presharded, rank_dir, rank, layers, prefill_expert_plan(layers))
+        jobs += _ep16_expert_jobs(presharded, rank_dir, rank, layers, expert_plan(layers))
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for name, source in (("latent_down", "latent_down"), ("latent_up", "latent_up"),
                          ("shared_gu", f"shared_gu_{parity}"), ("shared_down", f"shared_down_{parity}")):
@@ -560,7 +560,7 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
             if name == "m_o":
                 family = _sequence_parallel_output(family, peer_dir, "m_o", rank)
             yield "mla", name, family
-        plan = prefill_expert_plan(layers)
+        plan = expert_plan(layers)
         for name in PREFILL_MOE_DENSE:
             if name in skip:
                 continue

@@ -218,7 +218,9 @@ def preshard(tmp_path):
 def test_prefill_loader_skips_shared_families(monkeypatch, preshard):
     root, cache = preshard
     monkeypatch.setattr(
-        rank_loader, "_config", lambda: KernelConfig(decode_expert_parallel=16)
+        rank_loader,
+        "_config",
+        lambda: KernelConfig(decode_expert_parallel=16, expert_plan=""),
     )
     full = {name for _, name, _ in rank_loader.iter_prefill_rank(root, cache, 0)}
     skip = frozenset(rank_loader.PREFILL_SHARED)
@@ -246,7 +248,9 @@ def test_prefill_loader_takes_all_four_ep16_expert_families(monkeypatch, preshar
     root, cache = preshard
     experts = frozenset(rank_loader.EXPERT_FAMILIES)
     monkeypatch.setattr(
-        rank_loader, "_config", lambda: KernelConfig(decode_expert_parallel=16)
+        rank_loader,
+        "_config",
+        lambda: KernelConfig(decode_expert_parallel=16, expert_plan=""),
     )
     left = {
         n.partition("@")[0]

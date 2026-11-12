@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """EP16/TP2 decode experts (KernelConfig.decode_expert_parallel=16): the decode
-loader holds the prefill's EP16 families (placed by prefill_expert_plan, router
+loader holds the prefill's EP16 families (placed by expert_plan, router
 columns to match, each family joined on the host), each local expert half is an
 EP8 TP4 quarter of the pre-shard, and routes expand to both halves. Every
 reader lane-interleaves each quarter's gate/up columns, which the decode's
@@ -146,6 +146,8 @@ def _held_experts(rank, order, layer):
 
 
 def _decode(monkeypatch, root, rank, **config):
+    # The synthetic pre-shard is smaller than the default plan's model.
+    config.setdefault("expert_plan", "")
     monkeypatch.setattr(rl, "_config", lambda: KernelConfig(**config))
     return {
         name: value
@@ -273,14 +275,14 @@ def test_ep16_decode_yields_whole_families_in_plan_order(monkeypatch, preshard, 
         root,
         rank,
         decode_expert_parallel=16,
-        prefill_expert_plan=str(root / "identity.npz"),
+        expert_plan=str(root / "identity.npz"),
     )
     placed = _decode(
         monkeypatch,
         root,
         rank,
         decode_expert_parallel=16,
-        prefill_expert_plan=str(root / "plan.npz"),
+        expert_plan=str(root / "plan.npz"),
     )
     for name in (*SHAPES, "router", "router_bias"):
         np.testing.assert_array_equal(same[name], base[name])
@@ -303,9 +305,9 @@ def test_prefill_ep16_loader_matches_the_ep16_decode(monkeypatch, preshard, rank
     root, _, _ = preshard
     plan = str(root / "plan.npz")
     decode = _decode(
-        monkeypatch, root, rank, decode_expert_parallel=16, prefill_expert_plan=plan
+        monkeypatch, root, rank, decode_expert_parallel=16, expert_plan=plan
     )
-    monkeypatch.setattr(rl, "_config", lambda: KernelConfig(prefill_expert_plan=plan))
+    monkeypatch.setattr(rl, "_config", lambda: KernelConfig(expert_plan=plan))
     parts: dict[str, list] = {}
     for _, name, value in rl.iter_prefill_rank(
         root, root / "prefill-sp-cache", rank, layers=LAYERS
@@ -328,7 +330,7 @@ def test_plan_must_be_layer_permutations(monkeypatch, preshard, tmp_path):
                 root,
                 0,
                 decode_expert_parallel=16,
-                prefill_expert_plan=str(tmp_path / bad),
+                expert_plan=str(tmp_path / bad),
             )
 
 

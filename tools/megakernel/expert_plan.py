@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build an EP16 expert placement plan (``KernelConfig.prefill_expert_plan``)
+"""Build an EP16 expert placement plan (``KernelConfig.expert_plan``)
 from the prefill's MoE route counts.
 
     python -m tools.megakernel.expert_plan --counts DIR[:WEIGHT] ... --out PLAN.npz
@@ -7,16 +7,21 @@ from the prefill's MoE route counts.
 Each ``DIR`` holds the snapshots of one run with ``prefill_route_counts`` on
 (``prefill-rNN-wW.npy``, saved by each chip's even rank: chip ``NN // 2``'s
 cumulative ``[92, 56]`` route counts of its local experts); the latest
-snapshot of every chip is used, ``--counted-plan`` names the placement the run
-counted under (default: the pre-shard's, chip c holding experts 56c..56c+55),
-and the runs' counts add, each normalized to unit total and scaled by its
-``WEIGHT`` (default 1).
+snapshot of every chip is used, and ``--counted-plan`` names the placement the
+run counted under (default: the pre-shard's, chip c holding experts
+56c..56c+55).
 
-Per MoE layer, longest-processing-time places the experts, hottest first, on
-the least loaded of the 16 chips with a free slot (56 each); each chip's
-experts are then ordered hottest first, so its slot 0 holds its hottest
-expert. The plan's ``order[layer, 56 c + j]`` is the logical expert in chip
-c's slot j.
+Each run is one token distribution (e.g. random token ids, sequential id
+sweeps, real text): their hot experts differ, so a placement balanced for one
+can leave another's busiest chip with half again the mean load. Per MoE
+layer, each run's loads are normalized to a mean chip load of one and scaled
+by its ``WEIGHT`` (default 1), and the placement minimizes the largest chip
+load over all runs: experts are placed in decreasing order of their largest
+load, each on the open chip (56 slots) where the resulting largest load is
+smallest, then pairs of experts on the busiest chip and another are swapped
+while a swap lowers it. Each chip's experts are ordered hottest first (summed
+over runs), so its slot 0 holds its hottest expert. The plan's
+``order[layer, 56 c + j]`` is the logical expert in chip c's slot j.
 """
 
 from __future__ import annotations
@@ -58,21 +63,57 @@ def load_counts(directory: Path, counted_plan: np.ndarray) -> np.ndarray:
     return counts
 
 
-def place(counts: np.ndarray) -> np.ndarray:
-    """The plan ``order`` [LAYERS, EXPERTS] for per-expert loads ``counts``."""
+def _place_layer(loads: np.ndarray, max_swaps: int) -> list[np.ndarray]:
+    """Each chip's experts for one layer's normalized loads ``[EXPERTS, runs]``."""
+    members: list[list[int]] = [[] for _ in range(CHIPS)]
+    total = np.zeros((CHIPS, loads.shape[1]))
+    # Largest load first; ties by expert id, so the plan is reproducible.
+    for expert in np.lexsort((np.arange(EXPERTS), -loads.max(axis=1))):
+        open_chips = [c for c in range(CHIPS) if len(members[c]) < LOCAL]
+        chip = min(open_chips, key=lambda c: ((total[c] + loads[expert]).max(), c))
+        members[chip].append(int(expert))
+        total[chip] += loads[expert]
+    chips = [np.array(experts) for experts in members]
+    for _ in range(max_swaps):
+        peak = total.max(axis=1)
+        busiest = int(np.argmax(peak))
+        best, swap = peak[busiest], None
+        ours = loads[chips[busiest]]  # [LOCAL, runs]
+        for other in range(CHIPS):
+            if other == busiest:
+                continue
+            theirs = loads[chips[other]]
+            delta = theirs[None, :, :] - ours[:, None, :]  # [ours, theirs, runs]
+            after = np.maximum(
+                (total[busiest] + delta).max(axis=2), (total[other] - delta).max(axis=2)
+            )
+            rest = np.delete(peak, [busiest, other]).max()
+            i, j = np.unravel_index(np.argmin(after), after.shape)
+            if max(after[i, j], rest) < best - 1e-12:
+                best, swap = max(after[i, j], rest), (other, i, j)
+        if swap is None:
+            break
+        other, i, j = swap
+        a, b = chips[busiest][i], chips[other][j]
+        chips[busiest][i], chips[other][j] = b, a
+        total[busiest] += loads[b] - loads[a]
+        total[other] += loads[a] - loads[b]
+    return chips
+
+
+def place(runs: list[np.ndarray], max_swaps: int = 400) -> np.ndarray:
+    """The plan ``order`` [LAYERS, EXPERTS] for the runs' per-expert loads
+    (each ``[LAYERS, EXPERTS]``, already weighted)."""
     order = np.empty((LAYERS, EXPERTS), np.int32)
     for layer in range(LAYERS):
-        load = np.zeros(CHIPS)
-        members: list[list[int]] = [[] for _ in range(CHIPS)]
-        # Hottest first; ties by expert id, so the plan is reproducible.
-        for expert in np.lexsort((np.arange(EXPERTS), -counts[layer])):
-            open_chips = [c for c in range(CHIPS) if len(members[c]) < LOCAL]
-            chip = min(open_chips, key=lambda c: (load[c], c))
-            members[chip].append(int(expert))
-            load[chip] += counts[layer, expert]
-        for chip, experts in enumerate(members):
-            # Placed hottest first already: slot 0 is the chip's hottest.
-            order[layer, chip * LOCAL : (chip + 1) * LOCAL] = experts
+        loads = np.stack(
+            [CHIPS * run[layer] / max(run[layer].sum(), 1e-30) for run in runs],
+            axis=1,
+        )
+        hot = loads.sum(axis=1)
+        for chip, experts in enumerate(_place_layer(loads, max_swaps)):
+            ranked = experts[np.lexsort((experts, -hot[experts]))]
+            order[layer, chip * LOCAL : (chip + 1) * LOCAL] = ranked
     return order
 
 
@@ -96,21 +137,22 @@ def main(argv: list[str] | None = None) -> int:
     counted = identity()
     if args.counted_plan:
         counted = np.load(args.counted_plan)["order"].astype(np.int64)
-    total = np.zeros((LAYERS, EXPERTS))
+    runs = []
     for spec in args.counts:
         directory, _, weight = spec.partition(":")
         counts = load_counts(Path(directory), counted)
-        total += float(weight or 1) * counts / counts.sum()
-    order = place(total)
+        runs.append((directory, float(weight or 1) * counts))
+    order = place([counts for _, counts in runs])
     for layer in range(LAYERS):
         assert sorted(order[layer]) == list(range(EXPERTS))
     np.savez(args.out, order=order)
-    before, after = imbalance(total, identity()), imbalance(total, order)
-    print(
-        f"{args.out}: max/mean chip load, pre-shard placement mean "
-        f"{before.mean():.4f} worst {before.max():.4f}; plan mean "
-        f"{after.mean():.4f} worst {after.max():.4f}"
-    )
+    for directory, counts in runs:
+        before, after = imbalance(counts, identity()), imbalance(counts, order)
+        print(
+            f"{directory}: max/mean chip load, pre-shard placement mean "
+            f"{before.mean():.4f} worst {before.max():.4f}; plan mean "
+            f"{after.mean():.4f} worst {after.max():.4f}"
+        )
     return 0
 
 

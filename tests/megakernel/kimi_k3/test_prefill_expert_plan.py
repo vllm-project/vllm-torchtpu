@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""EP16 expert placement (KernelConfig.prefill_expert_plan): the planned loader
+"""EP16 expert placement (KernelConfig.expert_plan): the planned loader
 reproduces the pre-shard's regroup under the identity plan and places each
-planned expert's rows under a random plan; the shipped plan is valid."""
+planned expert's rows under a random plan; the default plan is valid."""
 
 import json
 import os
@@ -9,6 +9,7 @@ import os
 import numpy as np
 import pytest
 
+from vllm_torchtpu.megakernel.kimi_k3.config import KernelConfig
 from vllm_torchtpu.megakernel.kimi_k3.kernels import rank_loader as rl
 
 pytestmark = pytest.mark.cpu_test
@@ -109,9 +110,9 @@ def test_random_plan_places_each_expert(preshard, rank, name):
             np.testing.assert_array_equal(got[layer, slot], want)
 
 
-def test_shipped_plan_is_valid():
+def test_default_plan_is_valid():
     path = os.path.join(
-        os.path.dirname(rl.__file__), "..", "data", "plan_ep8_real_hotfirst.npz"
+        os.path.dirname(rl.__file__), "..", "data", KernelConfig().expert_plan
     )
     order = np.load(path)["order"]
     assert order.shape == (92, 896)

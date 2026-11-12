@@ -79,12 +79,14 @@ class KernelConfig:
     prefill_route_counts: bool = False
     prefill_route_counts_every: int = 200
     prefill_route_counts_dir: str = ""
-    # EP16 expert placement of the prefill and of an EP16 decode (empty: the
-    # pre-shard's): an npz whose ``order`` [92, 896] is the logical expert at
-    # each physical slot (chip c: slots 56c..56c+55); the router columns and
-    # expert weights are loaded in that order (rank_loader.prefill_expert_plan).
-    # A bare name loads from kimi_k3/data.
-    prefill_expert_plan: str = ""
+    # EP16 expert placement, shared by the prefill and the aggregate's decode
+    # (empty: the pre-shard's): an npz whose ``order`` [92, 896] is the logical
+    # expert at each physical slot (chip c: slots 56c..56c+55, hottest first);
+    # the router columns and expert weights are loaded in that order
+    # (rank_loader.expert_plan). A bare name loads from kimi_k3/data; the
+    # default is built by tools/megakernel/expert_plan.py from route counts of
+    # random-token, id-sweep and real-text prefills.
+    expert_plan: str = "plan_ep16_real_hotfirst.npz"
     # Weight loading.
     read_streams: int = 4
     load_inflight_gb: float = 16.0
