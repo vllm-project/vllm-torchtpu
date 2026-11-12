@@ -11,15 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The EP MoE combine's reduce-scatter on the hierrs_tc kernels.
+"""Arms the EP MoE combine's reduce-scatter on the hierrs_tc kernels.
 
-The EP mesh is in ascending device id, but `group.reduce_scatter` hands rank r
-the r-th row block, so mesh index i must receive the block of the rank there.
+The op runs on the EP mesh, which must be in ascending device id: arming
+refuses the rank-ordered mesh (`MOE_FUSED_EP_SORTED_GATHER`), because the
+kernel takes its neighbour chips from the mesh order. `group.reduce_scatter`
+hands rank r the r-th row block, so mesh index i receives the block of the
+rank there (`ep_rank_order`). Kernel selection lives in
+`kernels/collectives/hierrs_tc/dispatch.py`.
 """
 
 from typing import Any, NamedTuple
 
-import numpy as np
 import torch
 
 import vllm_torchtpu.envs as envs
@@ -28,8 +31,6 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 OP_NAME = "pallas::hier_reduce_scatter"
-
-STREAM_MIN_BYTES = 16 << 20
 
 
 class _Armed(NamedTuple):
@@ -44,8 +45,10 @@ def _unsupported_world_reason() -> str | None:
     import torch.distributed as dist
     from vllm.distributed.parallel_state import get_dp_group
 
+    from vllm_torchtpu.distributed.chip_topology import get_chip_topology
     from vllm_torchtpu.distributed.ep_mesh import get_ep_group
     from vllm_torchtpu.kernels.collectives.hierrs_tc.wrapper import (
+        supports_chip_topology,
         supports_num_devices,
     )
 
@@ -58,75 +61,63 @@ def _unsupported_world_reason() -> str | None:
         return "the EP group does not span the whole torch.distributed world"
     if list(get_dp_group().ranks) != list(ep.ranks):
         return "the DP group's ranks differ from the EP group's"
+    topology = get_chip_topology()
+    if topology is None:
+        return "the chip topology is unknown"
+    if not supports_chip_topology(topology.num_chips, topology.cores_per_chip):
+        return (
+            f"the kernel needs 4 chips of 2 TensorCores, not {topology.num_chips} "
+            f"of {topology.cores_per_chip}"
+        )
+    if envs.MOE_FUSED_EP_SORTED_GATHER:
+        return "MOE_FUSED_EP_SORTED_GATHER keeps the EP mesh in EP-rank order"
     return None
 
 
-def make_reduce_scatter_fn(
-    mesh: Any,
-    order: tuple[int, ...],
-    *,
-    axis_name: str,
-    stream: bool = True,
-    stream_min_bytes: int = STREAM_MIN_BYTES,
-):
-    """Reduce-scatter in which mesh index i gets the block of rank `order[i]`."""
+def _unordered_mesh_reason(mesh: Any) -> str | None:
+    ids = [int(d.id) for d in mesh.devices.flat]
+    if ids != sorted(ids):
+        return f"the EP mesh is not in ascending device id: {ids}"
+    return None
+
+
+def _build_op(mesh: Any, order: tuple[int, ...], axis_name: str) -> Any:
     import jax
     from jax.sharding import PartitionSpec as P
+    from torch_tpu._internal import pallas
 
-    from vllm_torchtpu.kernels.collectives.hierrs_tc.kernel_stream import (
-        reduce_scatter_stream_local,
-        supports_stream,
-    )
-    from vllm_torchtpu.kernels.collectives.hierrs_tc.wrapper import (
-        hierarchical_reduce_scatter_local,
+    from vllm_torchtpu.kernels.collectives.hierrs_tc.dispatch import (
+        make_reduce_scatter_fn,
     )
 
+    reduce_scatter = make_reduce_scatter_fn(mesh, order, axis_name=axis_name)
+
+    # torch_tpu reads the operand types from these annotations.
+    def fn(x: jax.Array) -> jax.Array:
+        return reduce_scatter(x)
+
+    spec = P(axis_name, None)
+    # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
+    # jax_op takes PartitionSpecs at runtime, as other jax_op call sites pass them.
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        OP_NAME,
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec,),
+        output_partition_specs=spec,
+    )
     num_devices = len(order)
-    perm = np.asarray(order, dtype=np.int32)
-    is_identity = bool(np.array_equal(perm, np.arange(num_devices)))
-
-    def permute(part: jax.Array) -> jax.Array:
-        if is_identity:
-            return part
-        rows, hidden = part.shape
-        blocks = part.reshape(num_devices, rows // num_devices, hidden)
-        return blocks[perm].reshape(rows, hidden)
-
-    def local(part: jax.Array) -> jax.Array:
-        rows = part.shape[0]
-        if stream and part.nbytes >= stream_min_bytes and supports_stream(rows):
-            return reduce_scatter_stream_local(part, axis_name=axis_name, order=order)
-        return hierarchical_reduce_scatter_local(
-            permute(part), num_devices=num_devices, axis_name=axis_name
-        )
-
-    def reduce_scatter(x: jax.Array) -> jax.Array:
-        return jax.shard_map(
-            local,
-            mesh=mesh,
-            in_specs=P(axis_name, None),
-            out_specs=P(axis_name, None),
-            check_vma=False,
-        )(x)
-
-    return reduce_scatter
+    # vLLM traces with a dynamic token dimension.
+    op.register_fake(lambda x: x.new_empty((x.shape[0] // num_devices, x.shape[1])))
+    return op
 
 
 def prebuild_hier_reduce_scatter() -> bool:
     """Returns whether the op is armed. Call outside Dynamo: it runs a collective."""
     global _ARMED
-    if _ARMED is not None or not envs.TPU_MOE_EP_HIER_RS:
+    if _ARMED is not None or envs.TPU_MOE_EP_HIER_RS == "off":
         return _ARMED is not None
-    reason = _unsupported_world_reason()
-    if reason is not None:
-        logger.warning_once(
-            "TPU_MOE_EP_HIER_RS is set, but the MoE combine keeps the group's "
-            "reduce-scatter: %s.",
-            reason,
-        )
-        return False
-
-    from jax.sharding import PartitionSpec as P
 
     from vllm_torchtpu.distributed.ep_mesh import (
         EP_AXIS_NAME,
@@ -134,27 +125,31 @@ def prebuild_hier_reduce_scatter() -> bool:
         ep_rank_order,
         get_ep_group,
     )
-    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 
-    mesh = build_ep_mesh(axis_name=EP_AXIS_NAME)
-    order = ep_rank_order()
-    ep = get_ep_group()
+    reason = _unsupported_world_reason()
+    mesh = order = ep = None
+    if reason is None:
+        mesh = build_ep_mesh(axis_name=EP_AXIS_NAME)
+        order = ep_rank_order()
+        ep = get_ep_group()
+        assert mesh is not None and order is not None and ep is not None
+        reason = _unordered_mesh_reason(mesh)
+    if reason is not None:
+        logger.warning_once(
+            "TPU_MOE_EP_HIER_RS=%s is set, but the MoE combine keeps the group's "
+            "reduce-scatter: %s.",
+            envs.TPU_MOE_EP_HIER_RS,
+            reason,
+        )
+        return False
     assert mesh is not None and order is not None and ep is not None
-    reduce_scatter = make_reduce_scatter_fn(mesh, order, axis_name=EP_AXIS_NAME)
-    op = sharded_jax_op(
-        OP_NAME,
-        reduce_scatter,
-        mesh=mesh,
-        input_partition_specs=(P(EP_AXIS_NAME, None),),
-        output_partition_specs=P(EP_AXIS_NAME, None),
-    )
-    num_devices = len(order)
-    op.register_fake(lambda x: x.new_empty((x.shape[0] // num_devices, x.shape[1])))
+
+    op = _build_op(mesh, order, EP_AXIS_NAME)
     _ARMED = _Armed(op=op, ranks=tuple(int(r) for r in ep.ranks))
     logger.info_once(
         "MoE combine reduce-scatter runs on hierrs_tc: %d devices, ici_dtype=bf16, "
         "rank at each mesh index=%s.",
-        num_devices,
+        len(order),
         order,
     )
     return True

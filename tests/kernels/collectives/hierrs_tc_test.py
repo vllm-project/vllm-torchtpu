@@ -23,12 +23,15 @@ from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
 from vllm_torchtpu.kernels.collectives.hierrs_tc import config as hrs_config
-from vllm_torchtpu.kernels.collectives.hierrs_tc import kernel_stream
+from vllm_torchtpu.kernels.collectives.hierrs_tc import dispatch, kernel_stream
 from vllm_torchtpu.kernels.collectives.hierrs_tc import wrapper as hrs
 
 jax.config.parse_flags_with_absl()
 
 P = jax.sharding.PartitionSpec
+
+# EP rank at each mesh index of a tpu7x host's ascending-device-id EP mesh.
+_TPU7X_RANK_AT_MESH_INDEX = (0, 1, 6, 7, 2, 3, 4, 5)
 
 
 def _make_mesh(num_devices: int, axis_name: str) -> jax.sharding.Mesh:
@@ -294,7 +297,7 @@ class HierarchicalReduceScatterTest(jtu.JaxTestCase):
 
     @parameterized.product(
         rows_per_device=[1024, 4096, 16384],
-        order=[tuple(range(8)), (0, 1, 6, 7, 2, 3, 4, 5)],
+        order=[tuple(range(8)), _TPU7X_RANK_AT_MESH_INDEX],
     )
     def test_stream_matches_reference(self, rows_per_device, order):
         """Mesh index i gets the sum of row block order[i]."""
@@ -320,12 +323,91 @@ class HierarchicalReduceScatterTest(jtu.JaxTestCase):
         snr = _snr_db(ref, out.astype(jnp.float32) - ref.astype(jnp.float32))
         self.assertGreater(snr, _MIN_BF16_SNR_DB, msg=f"SNR {snr:.1f} dB")
 
+    @parameterized.product(
+        num_micro_batches=[1, 2, 4],
+        order=[(7, 6, 5, 4, 3, 2, 1, 0), _TPU7X_RANK_AT_MESH_INDEX],
+    )
+    def test_micro_batched_order_matches_reference(self, num_micro_batches, order):
+        """Mesh index i gets the sum of row block order[i], with no input copy."""
+        self._requires_devices(8)
+        axis_name, rows, hidden, n = "x", 1024, 4096, 8
+        mesh = _make_mesh(n, axis_name)
+        in_specs = P(axis_name, None)
+        block = rows // n
+        sharding = jax.sharding.NamedSharding(mesh, in_specs)
+        x = jax.random.normal(
+            jax.random.key(num_micro_batches * 131 + order[1]),
+            (n * rows, hidden),
+            dtype=jnp.bfloat16,
+        )
+        x_ordered = x.reshape(n, n, block, hidden)[:, list(order)].reshape(x.shape)
+        ref = _reference_reduce_scatter(
+            jax.device_put(x_ordered, sharding), mesh, in_specs
+        )
+        out = _hierarchical_reduce_scatter(
+            jax.device_put(x, sharding),
+            mesh=mesh,
+            in_specs=in_specs,
+            num_micro_batches=num_micro_batches,
+            order=order,
+        )
+        snr = _snr_db(ref, out.astype(jnp.float32) - ref.astype(jnp.float32))
+        self.assertGreater(snr, _MIN_BF16_SNR_DB, msg=f"SNR {snr:.1f} dB")
+
+    @parameterized.product(
+        # Rows per rank x hidden at the default threshold: the micro-batched
+        # kernel padded (64, 160) and not (1024, 16000), the row-streaming one
+        # (2048, 16384), and a hidden too wide for its VMEM (2048 x 7168).
+        shape=[
+            (64, 4096),
+            (160, 4096),
+            (1024, 4096),
+            (16000, 4096),
+            (2048, 4096),
+            (16384, 4096),
+            (2048, 7168),
+        ],
+        order=[tuple(range(8)), _TPU7X_RANK_AT_MESH_INDEX],
+    )
+    def test_dispatch_matches_rank_ordered_reduce_scatter(self, shape, order):
+        """Mesh index i holds rank order[i]'s input and gets its block's sum."""
+        self._requires_devices(8)
+        rows, hidden = shape
+        n, axis_name = 8, "x"
+        mesh = _make_mesh(n, axis_name)
+        sharding = jax.sharding.NamedSharding(mesh, P(axis_name, None))
+        fn = jax.jit(dispatch.make_reduce_scatter_fn(mesh, order, axis_name=axis_name))
+        block = rows // n
+        # Two calls with new data, as serving makes one per MoE layer.
+        for call in range(2):
+            rng = np.random.default_rng([rows, hidden, *order, call])
+            per_rank = [
+                rng.standard_normal((rows, hidden), dtype=np.float32) for _ in range(n)
+            ]
+            per_rank = [
+                np.asarray(jnp.asarray(r, jnp.bfloat16), np.float32) for r in per_rank
+            ]
+            x = np.concatenate([per_rank[r] for r in order], axis=0)
+            out = fn(jax.device_put(jnp.asarray(x, jnp.bfloat16), sharding))
+            summed = sum(per_rank)
+            want = np.concatenate(
+                [summed[r * block : (r + 1) * block] for r in order], axis=0
+            )
+            snr = _snr_db(want, np.asarray(out, np.float32) - want)
+            self.assertGreater(
+                snr, _MIN_BF16_SNR_DB, msg=f"call {call}: SNR {snr:.1f} dB"
+            )
+
     def test_stream_supported_shapes(self):
-        self.assertTrue(kernel_stream.supports_stream(8 * 128))
-        self.assertTrue(kernel_stream.supports_stream(8 * 1024))
-        self.assertFalse(kernel_stream.supports_stream(8 * 64))
-        self.assertFalse(kernel_stream.supports_stream(8 * 192))
-        self.assertFalse(kernel_stream.supports_stream(8 * 128 + 8))
+        self.assertTrue(kernel_stream.supports_stream(8 * 128, 4096, 2))
+        self.assertTrue(kernel_stream.supports_stream(8 * 1024, 4096, 2))
+        self.assertFalse(kernel_stream.supports_stream(8 * 64, 4096, 2))
+        self.assertFalse(kernel_stream.supports_stream(8 * 192, 4096, 2))
+        self.assertFalse(kernel_stream.supports_stream(8 * 128 + 8, 4096, 2))
+        # Its scratch is 8448 bytes per bf16 hidden column: 53.6 MiB at 6656,
+        # which compiles, and 57.75 MiB at 7168, which does not.
+        self.assertTrue(kernel_stream.supports_stream(8 * 1024, 6656, 2))
+        self.assertFalse(kernel_stream.supports_stream(8 * 1024, 7168, 2))
 
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
@@ -361,6 +443,21 @@ class HierarchicalReduceScatterPlanningTest(jtu.JaxTestCase):
                     hrs_config.splits_hidden_evenly(hidden, mb, 8),
                     msg=f"hidden={hidden} rows={rows} picked mb={mb}",
                 )
+
+    def test_default_kernel_selection(self):
+        for rows, hidden, stream in (
+            (64, 4096, False),
+            (1024, 4096, False),
+            (16000, 4096, False),
+            (2048, 4096, True),
+            (16384, 4096, True),
+            (2048, 7168, False),
+        ):
+            self.assertEqual(
+                dispatch.uses_stream(rows, hidden, self.BF16_ITEMSIZE),
+                stream,
+                msg=f"{rows} x {hidden}",
+            )
 
     def test_unsplittable_hidden_is_unsupported(self):
         self.assertTrue(hrs.is_supported_by_hierrs_tc(8, 1024, 4096))

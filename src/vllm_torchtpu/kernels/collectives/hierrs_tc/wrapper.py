@@ -47,6 +47,19 @@ def supports_num_devices(num_devices: int) -> bool:
     return num_devices == _SUPPORTED_NUM_DEVICES
 
 
+# tpu7x 2x2x1: four chips of two TensorCores. Config asserts the core count
+# when JAX traces the kernel, so callers check this before arming it.
+_SUPPORTED_NUM_CHIPS = 4
+_SUPPORTED_CORES_PER_CHIP = 2
+
+
+def supports_chip_topology(num_chips: int, cores_per_chip: int) -> bool:
+    return (
+        num_chips == _SUPPORTED_NUM_CHIPS
+        and cores_per_chip == _SUPPORTED_CORES_PER_CHIP
+    )
+
+
 def is_supported_by_hierrs_tc(num_devices: int, rows: int, hidden: int) -> bool:
     return (
         supports_num_devices(num_devices)
@@ -137,8 +150,10 @@ def hierarchical_reduce_scatter_local(
     num_devices: int,
     num_micro_batches: int | None = None,
     axis_name: str | tuple[str, ...] = "x",
+    order: tuple[int, ...] | None = None,
     _debug_entry_delay: tuple[int, int] | None = None,
 ) -> jax.Array:
+    """Mesh index i receives the sum of input row block `order[i]`."""
     num_chips = num_devices // 2
     num_hcube_dims = int(math.log2(num_chips))
     local_seq_len, hidden_dim_size = local_x.shape
@@ -234,6 +249,7 @@ def hierarchical_reduce_scatter_local(
             hier_rs_kernel,
             config=config,
             axis_name=axis_name,
+            order=None if order is None else tuple(order),
             debug_entry_delay=_debug_entry_delay,
         ),
         out_shape=tuple(out_shapes),

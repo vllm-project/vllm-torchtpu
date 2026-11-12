@@ -285,10 +285,14 @@ class TestTpuCompilerCache:
             path.relative_to(source_root).as_posix()
             for path in tpu_compiler._iter_runtime_cache_key_files(source_root)
         }
+        # sharded_jax_op is the legacy helper some ops still register with.
         custom_op_boundaries = {
             path.relative_to(source_root).as_posix()
             for path in (source_root / "vllm_torchtpu").rglob("*.py")
-            if "pallas.jax_op" in path.read_text()
+            if any(
+                marker in path.read_text()
+                for marker in ("pallas.jax_op", "sharded_jax_op(")
+            )
         }
         excluded_files = set(tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
         excluded_dirs = tuple(

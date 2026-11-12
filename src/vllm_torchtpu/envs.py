@@ -103,7 +103,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
-    TPU_MOE_EP_HIER_RS: bool = False
+    TPU_MOE_EP_HIER_RS: str = "off"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -844,9 +844,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MOE_TOPK_WEIGHTS_FLOAT32", default=False
     ),
     # Runs the EP MoE combine's reduce-scatter on the hierrs_tc TensorCore
-    # kernels instead of the group's. Remove once that is the default or the
-    # kernels are retired.
-    "TPU_MOE_EP_HIER_RS": env_bool("TPU_MOE_EP_HIER_RS"),
+    # kernels instead of the group's, with this wire dtype between chips.
+    # Remove once that is the default or the kernels are retired.
+    "TPU_MOE_EP_HIER_RS": env_with_choices(
+        "TPU_MOE_EP_HIER_RS", "off", ["off", "bf16"]
+    ),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

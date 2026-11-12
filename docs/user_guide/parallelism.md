@@ -79,6 +79,7 @@ On multi-chip and multi-host slices, `vllm-torchtpu` provides specialized MoE ex
 | `USE_MOE_SPARSE_CORE` | `1` | Offloads MoE token routing/gather-reduce collectives to TPU SparseCores. |
 | `USE_MOE_FUSED_EP_KERNEL` | `0` | Enables the fused Expert-Parallel Pallas kernel (`v1` or `v2` via `MOE_FUSED_EP_KERNEL_IMPL`). |
 | `TPU_MOE_HIERARCHICAL_EP` | `0` | Enables two-level (intra-chip / inter-chip) hierarchical EP token dispatch on dual-core TPU v7x topologies. |
+| `TPU_MOE_EP_HIER_RS` | `off` | `bf16` runs the EP MoE combine's reduce-scatter on the hierrs_tc TensorCore kernels. Needs one tpu7x 2x2x1 host with `DP=8, TP=1 + EP` and no `MOE_FUSED_EP_SORTED_GATHER`; anywhere else it warns and keeps the group's reduce-scatter. See [Environment Variables](../reference/env_vars.md). |
 | `TPU_EXPERT_PLACEMENT` | `""` | Static expert placement: a JSON table (local path or `gs://` URI) giving, per MoE layer, which experts each EP rank holds, as a permutation that evens out their load. Applied at weight load; works with every MoE kernel. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `0` | Keeps activations sequence-parallel entering MoE layers to replace all-reduce with reduce-scatter + all-gather. |
 | `TPU_LATENT_PROJ_INTRA_CHIP_TP` | `0` | Shards MLA latent projections across the 2 cores of each physical TPU v7x chip even when `TP=1`. |

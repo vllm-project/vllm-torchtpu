@@ -298,6 +298,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
+    # Builds the hierrs_tc reduce-scatter op for the EP MoE combine.
+    "vllm_torchtpu/distributed/hier_reduce_scatter.py",
     # `prefill_checkpoint_enabled` decides whether the GDN op traces with
     # prefill checkpoint operands or with constant None inputs.
     "vllm_torchtpu/gdn_pool_layout.py",
