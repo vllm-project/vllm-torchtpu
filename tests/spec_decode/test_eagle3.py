@@ -60,6 +60,18 @@ def _make_proposer(
     )
 
 
+def _staged_runner(**fields):
+    """A runner stand-in with main's input-staging registry: the draft input
+    prep uploads through stage_h2d_upload, which reads it, and the real runner
+    creates it in __init__."""
+    return SimpleNamespace(
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+        _free_h2d_sources={},
+        **fields,
+    )
+
+
 def _make_vocab_models():
     target_embed = torch.nn.Embedding(3, 2)
     target_embed.org_vocab_size = 3
@@ -322,7 +334,7 @@ class _CarryAggregationAfterGatherPlan:
 @pytest.mark.tpu_test
 def test_prepare_draft_inputs(device):
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -374,7 +386,7 @@ def test_prepare_draft_inputs_chunk_offset(device):
     """A non-zero start_index must slice the batch-level sampled tokens and
     rejection counts by the chunk's offset."""
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1", "r2", "r3"]),
         device=device,
         requests={},
@@ -425,7 +437,7 @@ def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
     """The seed scatter stays in request-major coordinates; only the final
     draft input and gather values cross the chunk-local PCP layout boundary."""
     proposer = _make_proposer(draft_tp=1, method="mtp")
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -494,7 +506,7 @@ def test_prepare_draft_inputs_all_layout_keeps_device_seed_gathers(device, monke
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
     proposer = _make_proposer(draft_tp=1, method="mtp")
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -605,7 +617,7 @@ def test_prepare_draft_inputs_async_device(device):
     (last_token_indices) and the rejected count from the on-device rejection
     output — matching the host path fed the equivalent num_rejected."""
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -675,7 +687,7 @@ def test_prepare_draft_inputs_async_device_keeps_padded_width(device, discard):
     A last request still in partial prefill seeds from its known next prompt
     token, and the padding rows repeat that token, not its sampled one."""
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={
@@ -740,7 +752,7 @@ def test_prepare_draft_inputs_async_device_bucketed(device):
     """Bucketed async device prep pads num_rejected to knr and repeats the last
     valid request across the loop bucket p without recompiling across num_reqs."""
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=[f"r{i}" for i in range(8)]),
         device=device,
         requests={},
