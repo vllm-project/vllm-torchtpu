@@ -171,6 +171,10 @@
 /src/vllm_torchtpu/models/kimi_k3/ @yiw-wang @QiliangCui @qizzzh
 /tests/models/kimi_k3/ @yiw-wang @QiliangCui @qizzzh
 
+# Models: Qwen3.5 MoE
+/src/vllm_torchtpu/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
+/tests/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
+
 # Models: Qwen3.8 Flash
 /src/vllm_torchtpu/models/qwen38_flash/ @DRZDONG @caojx-google
 /tests/models/qwen38_flash/ @DRZDONG @caojx-google
