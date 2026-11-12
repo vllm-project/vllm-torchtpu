@@ -11,30 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Startup / post-mesh / step eligibility rules.
+"""Startup, post-mesh, and per-step eligibility rules.
 
-No torch or vLLM imports. It imports jax through the TPU chip table
-(`profiles.default`), but runs no jax code: the chip check takes the device
-kind as an argument. The step statistics (`BatchShape`, `inspect_batch_shape`,
-`StepMixTracker`, `MKABCalibrator`, ...) live in `stats` and are re-exported
-here.
+No torch or vLLM imports. Imports `jax` lazily only through the TPU chip table
+(`profiles.default`), executing no device code: the chip check takes
+`device_kind` as a string argument. Step statistics (`BatchShape`,
+`inspect_batch_shape`, `StepMixTracker`, `MKABCalibrator`) live in `stats` and
+are re-exported here.
 """
 
 from __future__ import annotations
 
 from collections.abc import Container, Sequence
+from typing import TYPE_CHECKING
 
 from ..errors import MegakernelConfigError
 from ..profiles.default import chip_budget
+from .constants import STARTUP_FLAG_RULES
 from .contract import (
     MESH_SIZE_MISMATCH,
-    PAR_DP_LOCKSTEP,
     UNSUPPORTED_TP_SIZE,
     UNSUPPORTED_TPU_CHIP,
     EligibilityResult,
     StepDecision,
 )
-from .policy import MTP_VERIFY_TOKENS, BucketPolicy
 from .stats import (
     BatchShape,
     MKABCalibrator,
@@ -44,18 +44,8 @@ from .stats import (
     inspect_batch_shape,
 )
 
-_STARTUP_FLAG_RULES = (
-    ("unaligned_cache_layout", "requires unified KV and recurrent cache layout"),
-    (
-        "multimodal_inputs",
-        "requires text-only token IDs (multimodal inputs unsupported)",
-    ),
-    ("lora_enabled", "does not support LoRA adapters"),
-    ("pipeline_parallel", "requires single-stage pipeline execution"),
-    ("context_parallel", "does not support context parallelism"),
-    (PAR_DP_LOCKSTEP, "does not support data-parallel lockstep"),
-    ("aux_hidden_states", "does not support auxiliary hidden-state capture"),
-)
+if TYPE_CHECKING:
+    from .policy import BucketPolicy
 
 
 def check_post_mesh_eligibility(
@@ -65,7 +55,18 @@ def check_post_mesh_eligibility(
     device_kind: str | None = None,
     bucket_policy: BucketPolicy | None = None,
 ) -> EligibilityResult:
-    """Validate post-mesh device count, TPU chip budget, and bucket policy."""
+    """Validate post-mesh device count, TPU chip budget, and bucket policy.
+
+    Args:
+        tp_size: Expected tensor-parallel device count.
+        mesh_size: Actual JAX mesh device count; `None` skips mesh size check.
+        device_kind: TPU device kind string (e.g. `'TPU7x'`); `None` skips chip
+            budget lookup.
+        bucket_policy: Resolved `BucketPolicy`; `None` skips empty-bucket check.
+
+    Returns:
+        `EligibilityResult` indicating whether post-mesh invariants hold.
+    """
     if mesh_size is not None and mesh_size != tp_size:
         msg = (
             f"Megakernel TP-rank mesh has {mesh_size} devices, "
@@ -109,16 +110,37 @@ def check_startup_eligibility(
 ) -> EligibilityResult:
     """Validate framework-neutral startup compatibility for the megakernel runtime.
 
-    `tp_size=None` skips the TP-size and mesh-size checks (a runtime that
-    enforces them itself, e.g. from a spec's `tp_sizes` and its mesh); passing
-    `mesh_size` without `tp_size` is then an error, since nothing would check
-    it.
+    Args:
+        enabled: Whether megakernel execution is enabled in config.
+        hf_config_result: Pre-computed HuggingFace config check; `None` skips.
+        num_layers: Actual model layer count.
+        expected_num_layers: Layer count required by the megakernel plugin.
+        unified_cache_layout: Whether KV and recurrent caches share unified layout.
+        multimodal_inputs: Whether multimodal inputs are enabled.
+        lora_enabled: Whether LoRA adapters are active.
+        pipeline_parallel: Whether multi-stage pipeline parallelism is active.
+        context_parallel: Whether prefill context parallelism is active.
+        dp_lockstep: Whether data-parallel lockstep mode is active.
+        aux_hidden_states: Whether auxiliary hidden-state capture is requested.
+        tp_size: Configured TP world size; `None` skips TP-size and mesh-size
+            checks (used when a caller enforces mesh topology separately).
+        supported_tp_sizes: Allowed TP world sizes when `tp_size` is not `None`.
+        mesh_size: Actual JAX mesh size; requires `tp_size` when not `None`.
+        device_kind: TPU device kind string; `None` skips chip budget check.
+        bucket_policy: Resolved `BucketPolicy`; `None` skips empty-bucket check.
+
+    Returns:
+        `EligibilityResult` describing startup eligibility or decline reason.
+
+    Raises:
+        ValueError: If `mesh_size` is provided while `tp_size` is `None`.
     """
     if tp_size is None and mesh_size is not None:
-        raise ValueError(
+        msg = (
             f"check_startup_eligibility: mesh_size={mesh_size} needs tp_size to "
             "check it against (tp_size=None skips the mesh-size check)"
         )
+        raise ValueError(msg)
     if not enabled:
         return EligibilityResult(False, "disabled", "", "debug")
     if hf_config_result is not None and not hf_config_result.eligible:
@@ -134,12 +156,14 @@ def check_startup_eligibility(
         dp_lockstep,
         aux_hidden_states,
     )
-    for is_bad, (code, detail) in zip(bad_flags, _STARTUP_FLAG_RULES, strict=True):
+    for is_bad, (code, detail) in zip(bad_flags, STARTUP_FLAG_RULES, strict=True):
         if is_bad:
             return EligibilityResult(False, code, f"Megakernel {detail}; skipping.")
     if tp_size is None:
         return check_post_mesh_eligibility(
-            tp_size=0, device_kind=device_kind, bucket_policy=bucket_policy
+            tp_size=0,
+            device_kind=device_kind,
+            bucket_policy=bucket_policy,
         )
     if not supported_tp_sizes:
         msg = (
@@ -173,33 +197,79 @@ def check_step_eligibility(
 ) -> StepDecision:
     """Decide whether a forward step with `batch_shape` can run on a bucket.
 
-    The bucket policy serves `T=1` decode and `T=MTP_VERIFY_TOKENS` verify
-    steps; any other uniform step size is `stock_q{T}`.
+    The bucket policy serves `T=1` decode and `T in bucket_policy.verify_tokens`
+    verify steps; any other uniform step width declines as `stock_q{T}`.
+
+    Args:
+        batch_shape: Uniformity and token-count inspection for the current step.
+        bucket_policy: Resolved decode and verify bucket policy.
+        compiled_buckets: Set/container of compiled `(tokens_per_seq, bucket)` keys.
+        input_rows: Actual padded row count of the runner's input tensor.
+        mrope_ok: Whether M-RoPE positions satisfy uniformity invariants.
+
+    Returns:
+        `StepDecision` naming the selected bucket or stock fallback reason.
     """
     if not batch_shape.eligible or batch_shape.num_reqs <= 0:
         return StepDecision(
-            False,
-            batch_shape.reason,
-            batch_shape.num_reqs,
-            batch_shape.tokens_per_req,
+            eligible=False,
+            reason=batch_shape.reason,
+            num_reqs=batch_shape.num_reqs,
+            tokens_per_seq=batch_shape.tokens_per_req,
         )
-    num_reqs, T = batch_shape.num_reqs, batch_shape.tokens_per_req
-    if T not in (1, MTP_VERIFY_TOKENS):
-        return StepDecision(False, f"stock_q{T}", num_reqs, T)
+    num_reqs = batch_shape.num_reqs
+    tokens_per_req = batch_shape.tokens_per_req
+    if tokens_per_req != 1 and tokens_per_req not in bucket_policy.verify_tokens:
+        return StepDecision(
+            eligible=False,
+            reason=f"stock_q{tokens_per_req}",
+            num_reqs=num_reqs,
+            tokens_per_seq=tokens_per_req,
+        )
     if not mrope_ok:
-        return StepDecision(False, "stock_mrope", num_reqs, T)
-    is_verify = T == MTP_VERIFY_TOKENS
-    b_list = bucket_policy.verify_buckets if is_verify else bucket_policy.buckets
-    max_b = bucket_policy.max_verify_bucket if is_verify else bucket_policy.max_bucket
-    active_rows = num_reqs * T
-    if not b_list or active_rows > max_b:
-        return StepDecision(False, f"stock_t{T}_n{num_reqs}", num_reqs, T)
-    bkt = bucket_policy.select(active_rows, T)
-    if (T, bkt) not in compiled_buckets:
-        return StepDecision(False, f"stock_t{T}_nobkt", num_reqs, T, bkt)
-    if bucket_policy.token_paddings and bucket_policy.out_rows(bkt) != input_rows:
-        return StepDecision(False, f"stock_t{T}_rows{bkt}", num_reqs, T, bkt)
-    return StepDecision(True, f"mk_t{T}_b{bkt}", num_reqs, T, bkt)
+        return StepDecision(
+            eligible=False,
+            reason="stock_mrope",
+            num_reqs=num_reqs,
+            tokens_per_seq=tokens_per_req,
+        )
+    valid_buckets = bucket_policy.verify_buckets_for(tokens_per_req)
+    max_bucket_rows = valid_buckets[-1] if valid_buckets else 0
+    active_rows = num_reqs * tokens_per_req
+    if not valid_buckets or active_rows > max_bucket_rows:
+        return StepDecision(
+            eligible=False,
+            reason=f"stock_t{tokens_per_req}_n{num_reqs}",
+            num_reqs=num_reqs,
+            tokens_per_seq=tokens_per_req,
+        )
+    bucket_rows = bucket_policy.select(active_rows, tokens_per_req)
+    if (tokens_per_req, bucket_rows) not in compiled_buckets:
+        return StepDecision(
+            eligible=False,
+            reason=f"stock_t{tokens_per_req}_nobkt",
+            num_reqs=num_reqs,
+            tokens_per_seq=tokens_per_req,
+            bucket_t=bucket_rows,
+        )
+    if (
+        bucket_policy.token_paddings
+        and bucket_policy.out_rows(bucket_rows) != input_rows
+    ):
+        return StepDecision(
+            eligible=False,
+            reason=f"stock_t{tokens_per_req}_rows{bucket_rows}",
+            num_reqs=num_reqs,
+            tokens_per_seq=tokens_per_req,
+            bucket_t=bucket_rows,
+        )
+    return StepDecision(
+        eligible=True,
+        reason=f"mk_t{tokens_per_req}_b{bucket_rows}",
+        num_reqs=num_reqs,
+        tokens_per_seq=tokens_per_req,
+        bucket_t=bucket_rows,
+    )
 
 
 __all__ = [
