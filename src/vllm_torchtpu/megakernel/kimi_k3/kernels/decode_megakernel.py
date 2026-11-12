@@ -503,6 +503,37 @@ def _expert_half_routes(selected_experts, selected_probabilities, local_route_co
     return experts, probabilities, 2 * local_route_counts
 
 
+def _scale_block_partials(activation, values, step):
+    """The products of ``activation`` [R, T] (BF16) and ``values`` [T, N] per
+    32-row scale block of the contraction, [R, T / 32, N] FP32 in block order:
+    each block's activation columns are masked into a row of their own. The
+    masked MXU products run ``step`` contraction rows at a time (a product's
+    MXU work grows with its rows); the caller's one reduction over the blocks
+    keeps the scale-reduction order."""
+    size = activation.shape[-1]
+    partials = []
+    for offset in range(0, size, step):
+        width = min(step, size - offset)
+        mask = (
+            jnp.arange(width // 32)[:, None]
+            == jnp.arange(width)[None, :] // 32
+        )
+        left = jnp.where(
+            mask[None],
+            activation[:, None, offset : offset + width],
+            jnp.bfloat16(0),
+        )
+        partials.append(
+            jax.lax.dot_general(
+                left,
+                values[offset : offset + width],
+                (((2,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+        )
+    return partials[0] if len(partials) == 1 else jnp.concatenate(partials, axis=1)
+
+
 def _quantized_expert_dot(
     source,
     packed,
@@ -601,27 +632,7 @@ def _quantized_expert_dot(
             # in block order and perform the same FP32 reduction as
             # the unsplit tile; reducing each subtile separately changes that
             # association and can perturb routing over many decode steps.
-            partials = []
-            for offset in range(0, size, dot_tile):
-                width = min(dot_tile, size - offset)
-                mask = (
-                    jnp.arange(width // 32)[:, None]
-                    == jnp.arange(width)[None, :] // 32
-                )
-                left = jnp.where(
-                    mask[None],
-                    activation[:, None, offset : offset + width],
-                    jnp.bfloat16(0),
-                )
-                partials.append(
-                    jax.lax.dot_general(
-                        left,
-                        values[offset : offset + width],
-                        (((2,), (0,)), ((), ())),
-                        preferred_element_type=jnp.float32,
-                    )
-                )
-            partial = jnp.concatenate(partials, axis=1)
+            partial = _scale_block_partials(activation, values, dot_tile)
             accumulator[...] += jnp.sum(partial * scale[None], axis=1)
             return
         scale_block_mask = (
@@ -807,23 +818,15 @@ def _paired_expert_gate_up(
                 ),
                 axis=0,
             )
-        scale_block_mask = (
-            jnp.arange(size // 32)[:, None]
-            == jnp.arange(size)[None, :] // 32
-        )
-        left = jnp.where(
-            scale_block_mask[None], activation[:, None, :], jnp.bfloat16(0)
-        )
         if second_source is not None:
             rows = source.shape[0]
             active = rows if active_capacity is None else active_capacity
             columns = values.shape[1] // 2
             for half in range(2):
-                partial = jax.lax.dot_general(
-                    left[half * rows:half * rows + active],
+                partial = _scale_block_partials(
+                    activation[half * rows:half * rows + active],
                     values[:, half * columns:(half + 1) * columns],
-                    (((2,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
+                    MXFP4_PAIR_STEP,
                 )
                 result = jnp.sum(
                     partial * scale[None, :, half * columns:(half + 1) * columns], axis=1
@@ -834,12 +837,7 @@ def _paired_expert_gate_up(
                 ] += (result if active_capacity is None else
                       jnp.pad(result, ((0, rows - active), (0, 0))))
         else:
-            partial = jax.lax.dot_general(
-                left,
-                values,
-                (((2,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
+            partial = _scale_block_partials(activation, values, MXFP4_PAIR_STEP)
             accumulator[...] += jnp.sum(partial * scale[None], axis=1)
 
     # Narrow scaled partials (MXFP4_PAIR_TILE) shorten register live ranges.
@@ -863,10 +861,7 @@ def _paired_order_expert_gate_up(source, packed, scales, accumulator, contractio
         exponents = scales[pl.ds(start // 32, size // 32), :].astype(jnp.uint32)
         scale = jax.lax.bitcast_convert_type(exponents << 23, jnp.float32)
         activation = source[:, pl.ds(start, size)].astype(jnp.bfloat16)
-        mask = jnp.arange(size // 32)[:, None] == jnp.arange(size)[None, :] // 32
-        left = jnp.where(mask[None], activation[:, None, :], jnp.bfloat16(0))
-        partial = jax.lax.dot_general(left, values, (((2,), (0,)), ((), ())),
-                                      preferred_element_type=jnp.float32)
+        partial = _scale_block_partials(activation, values, MXFP4_PAIR_STEP)
         accumulator[...] += jnp.sum(partial * scale[None], axis=1)
 
 
@@ -6091,6 +6086,11 @@ if MXFP4_DOT_TILE is not None and (MXFP4_DOT_TILE < 0 or MXFP4_DOT_TILE % 128):
     raise ValueError("KernelConfig.mxfp4_dot_tile must be zero or a positive multiple of 128")
 MXFP4_BLOCK = _config().mxfp4_block
 MXFP4_PAIR_TILE = _config().mxfp4_pair_tile
+# The paired gate/up's masked products run in 256-row contraction steps within
+# its tile (_scale_block_partials), half the MXU work of whole-tile products. A
+# step must stay a whole number of the MXU's 256-row contraction passes: the
+# block partials, and so the results, are then those of the whole tile.
+MXFP4_PAIR_STEP = 256
 # KernelConfig.mxfp4_static_tile=T: unroll the single-expert MXFP4 product over
 # static T-row tiles instead of a dynamic loop, keeping the unpacked tile small.
 MXFP4_STATIC_TILE = _config().mxfp4_static_tile
