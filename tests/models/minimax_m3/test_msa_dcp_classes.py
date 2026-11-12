@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 from tests.models.minimax_m3.packing import pack
-from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_fp4, msa_indexer
 
 PAGE = 128
 HEAD_DIM = 128
@@ -45,14 +45,6 @@ def _caches(dtype, num_pages, rng, heads=1):
 
 
 @pytest.mark.parametrize(
-    "q_lens,ctx_lens,max_num_seqs",
-    [
-        ([8, 9, 300], [3000, 700, 2100], 4),  # a prefill step
-        ([8] * 20, [900 + 37 * i for i in range(20)], 21),  # decode: no large one
-        ([8, 8, 200], [1500, 40, 1000], 4),  # not prefill-sized, one large
-    ],
-)
-@pytest.mark.parametrize(
     "dtype,rank,dcp,heads",
     [
         (jnp.bfloat16, 0, 2, 1),
@@ -66,14 +58,14 @@ def _caches(dtype, num_pages, rng, heads=1):
         ("int4", 3, 8, 4),
     ],
 )
-def test_class_candidates_match_token_order(
-    dtype, rank, dcp, heads, q_lens, ctx_lens, max_num_seqs, monkeypatch
-):
+def test_class_candidates_match_token_order(dtype, rank, dcp, heads, monkeypatch):
     rng = np.random.default_rng(rank)
+    q_lens, ctx_lens = [8, 9, 300], [3000, 700, 2100]
     num_seqs = len(q_lens)
+    max_num_seqs = num_seqs + 1
     num_real = sum(q_lens)
     num_tokens = num_real + 13
-    assert msa_dcp._picks_per_class(num_tokens * heads, max_num_seqs)
+    assert msa_indexer.is_prefill_step(num_tokens * heads, max_num_seqs)
     pages_per_seq = 16
     num_pages = max_num_seqs * pages_per_seq + 1
     perm = rng.permutation(np.arange(1, num_pages))
@@ -109,6 +101,6 @@ def test_class_candidates_match_token_order(
         )[-1]
 
     got = np.asarray(run())
-    monkeypatch.setattr(msa_dcp, "_picks_per_class", lambda *_: False)
+    monkeypatch.setattr(msa_indexer, "is_prefill_step", lambda *_: False)
     want = np.asarray(run())
     np.testing.assert_array_equal(got[:num_real], want[:num_real])
