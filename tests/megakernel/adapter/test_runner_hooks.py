@@ -75,8 +75,10 @@ def test_runner_dummy_run_forward_is_suppressed() -> None:
     assert n_guarded == len(fwd_calls)
 
 
-class _FakeIntermediateTensors:
-    pass
+class _FakeIntermediateTensors(list):
+    """Stands in for vLLM's `IntermediateTensors` in `forward_model`'s module
+    namespace. A one-element list, so only the `IntermediateTensors` branch
+    returns it whole: the list unwrapping after it would return its element."""
 
 
 def _runner_forward_model() -> Any:
@@ -115,17 +117,24 @@ def _raw_outputs() -> list[Any]:
 
     h = torch.arange(6.0).reshape(3, 2)
     aux = [torch.ones(3, 2)]
-    return [h, [h], (h,), (h, aux), [h, aux], _FakeIntermediateTensors()]
+    return [h, [h], (h,), (h, aux), [h, aux], _FakeIntermediateTensors([h])]
 
 
 @pytest.mark.parametrize("raw_idx", range(6))
-def test_runner_normalizes_megakernel_output_like_stock(raw_idx: int) -> None:
+def test_runner_normalizes_megakernel_output_like_stock(
+    raw_idx: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A megakernel step's output goes through the stock normalization."""
     from types import SimpleNamespace
 
     import torch
 
     forward_model = _runner_forward_model()
+    # The name `forward_model` checks against, whether it's the real runner
+    # (vLLM's class) or compiled from source.
+    monkeypatch.setitem(
+        forward_model.__globals__, "IntermediateTensors", _FakeIntermediateTensors
+    )
     raw = _raw_outputs()[raw_idx]
     stock_calls: list[dict[str, Any]] = []
 
@@ -161,6 +170,9 @@ def test_runner_normalizes_megakernel_output_like_stock(raw_idx: int) -> None:
     assert type(mk) is type(stock) and len(mk) == len(stock) == 2
     assert mk[0] is stock[0]
     assert mk[1] is stock[1]
+    if isinstance(raw, _FakeIntermediateTensors):
+        # A stage before the last: the intermediate tensors, whole.
+        assert stock[0] is raw and stock[1] is None
 
 
 def test_runner_declined_step_runs_the_stock_forward_unchanged() -> None:
