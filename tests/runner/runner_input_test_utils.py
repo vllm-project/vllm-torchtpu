@@ -59,6 +59,7 @@ def _make_runner(
     runner.num_reqs_most_model_len = None
     runner.num_tokens_paddings = list(token_paddings)
     runner.max_num_reqs = max_num_reqs
+    runner.max_num_local_reqs = max_num_reqs
     runner.max_num_tokens = max_num_tokens
     runner.max_model_len = max_model_len
     runner.block_size = block_size
@@ -89,6 +90,8 @@ def _make_runner(
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     runner.sequence_layout_planner = create_sequence_layout_planner(runner.vllm_config)
+    runner.pcp_manager = None
+    runner.get_pcp_planner = types.MethodType(TPUModelRunner.get_pcp_planner, runner)
     runner.cache_config = SimpleNamespace(
         block_size=block_size, num_gpu_blocks=8, num_gpu_blocks_override=None
     )

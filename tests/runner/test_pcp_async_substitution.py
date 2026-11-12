@@ -43,6 +43,7 @@ def _runner_with_async_state(
         _pre_async_results=pre_async_results,
         speculative_config=None,
         _last_sequence_layout_plan=sequence_layout_plan,
+        pcp_manager=None,
     )
 
 

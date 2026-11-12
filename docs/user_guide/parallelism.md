@@ -119,3 +119,29 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
   --kv-cache-dtype fp8 \
   --max-model-len 65536
 ```
+
+### PCP with PCP manager
+
+Set `USE_TPU_PCP_MANAGER=1` to combine `PCP` and `DCP` on sparse MLA models. Each prefill in a step is split over the `PCP` ranks: rank `r` holds chunks `r` and `2P-1-r` of the prompt to balance causal attention. For attention, every rank gathers those prefills' KV from the `DCP`-sharded cache into a workspace. Decode requests are replicated on every `PCP` rank and run the regular `DCP` decode path.
+
+```bash
+USE_TPU_PCP_MANAGER=1 vllm serve zai-org/GLM-5.2-FP8 \
+  --tensor-parallel-size 2 \
+  --prefill-context-parallel-size 4 \
+  --decode-context-parallel-size 8 \
+  --cp-kv-cache-interleave-size 4 \
+  --enable-expert-parallel
+```
+
+Requirements:
+
+- A sparse MLA model.
+- `--decode-context-parallel-size` equal to `--prefill-context-parallel-size` x `--tensor-parallel-size`.
+- `--cp-kv-cache-interleave-size` a multiple of `4` (vLLM defaults to `1`).
+- Experimental features. Do not support speculative decoding, LoRA, pipeline parallelism, data parallelism, multimodal inputs, pooling models, and KV connectors (`--kv-transfer-config`, including disaggregated serving and KV offloading) right now.
+- MoE models also need `--enable-expert-parallel`.
+
+Sizing:
+
+- `TPU_PCP_KV_WORKSPACE_TOKENS` (default `1048576`): if the prefills in a step need more context tokens than this, the runner runs the step as several forwards. Must be at least `--max-model-len`. A prefill forward allocates a temporary workspace of this many tokens, reused across layers: about 0.6 GB for the MLA latents and 0.27 GB for the indexer K at the default. KV cache sizing does not reserve it yet, so leave room for it in `--gpu-memory-utilization`.
+- `TPU_PCP_KV_CHUNK_TOKENS` (default `65536`): context tokens moved by each all-gather.

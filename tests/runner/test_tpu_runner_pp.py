@@ -302,6 +302,7 @@ class TestBufferedForwardRows:
             num_tokens_paddings=[16, 32, 64, 128],
             _dp_target_bucket=None,
             sequence_layout_planner=AllSequenceLayoutPlanner(),
+            pcp_manager=None,
         )
         for name in ("_pp_forward_rows", "_count_input_chunks"):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))

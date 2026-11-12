@@ -55,6 +55,7 @@ class TestAttentionMetadataBuilderPlumbing:
         runner._registered_h2d_sources = set()
         runner.attn_groups = []
         runner._unified_kv_layout = False
+        runner.pcp_manager = None
 
         block_tables = []
         for gid in range(num_groups):
