@@ -839,7 +839,10 @@ class Qwen4ExpBackbone(nn.Module):
         hidden = sp.pad_shard(hidden.repeat(1, self.hc_count), sp_pad)
         # One step-metadata memo for every GDN layer of this forward.
         gdn_step_metadata_cache = (
-            GdnStepMetadataCache() if envs.VLLM_TPU_GDN_HOIST_METADATA else None
+            GdnStepMetadataCache()
+            if envs.VLLM_TPU_GDN_HOIST_METADATA
+            or envs.VLLM_TPU_GDN_STEP_KERNEL_METADATA
+            else None
         )
         for index, layer in enumerate(self.layers):
             if ple_token is not None and index == self.host_ple_index:
