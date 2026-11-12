@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
-"""Shared pieces of the phase 3 AgentX harness benches.
-
-Used by p3_p_leg_bench.py and p3_d_leg_bench.py (offline vLLM engine benches)
-and by the kernel benches under tests/kernels/test_p3_*.py. It provides:
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Shared pieces of the TPU kernel benches under tests/kernels/test_p3_*.py.
 
   * environment_id(): image, libtpu, torch_tpu, jax, vLLM, source sha and
     dirty-tree hash, topology, job id. Every bench prints it and writes it to
-    env.json in its run directory.
-  * Timeline: absolute marks for the queue, init, load, compile, warmup and
-    timed windows, reported separately.
+    env.json in its run directory (write_env).
   * run_dir(): one output directory per run, never shared between pods.
-  * SITECUSTOMIZE: source of a sitecustomize.py that the engine processes load
-    at interpreter start (they are spawned and inherit PYTHONPATH). It patches
-    the dummy loader (synthetic weights that survive the fp8 cast), the fused
-    EP MoE routing (hash or trace replay), the scheduler (one JSONL record per
-    engine step with computed tokens, running count, spec tokens and sampled
-    tokens) and the TPU model runner (load, compile and warmup phase markers).
 
-Nothing here touches the TPU unless environment_id(devices=True) is asked for,
-so the engine benches can call it in the parent process before the workers
-spawn.
+Nothing here touches the TPU unless environment_id(devices=True) is asked for.
 """
 
 from __future__ import annotations
@@ -51,7 +50,10 @@ def _git(*args: str) -> str:
     try:
         return subprocess.run(
             ["git", "-C", str(REPO_ROOT), *args],
-            capture_output=True, text=True, timeout=60, check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -77,7 +79,9 @@ def source_identity() -> dict:
     if not out["source_sha"] and (REPO_ROOT / ".git").exists():
         out["source_sha"] = _git("rev-parse", "HEAD")
         diff = _git("diff", "HEAD", "--", "src", "scripts", "tests")
-        out["source_dirty_sha"] = hashlib.sha256(diff.encode()).hexdigest()[:12] if diff else ""
+        out["source_dirty_sha"] = (
+            hashlib.sha256(diff.encode()).hexdigest()[:12] if diff else ""
+        )
     out["source_sha"] = out["source_sha"] or "unknown"
     return out
 
@@ -86,8 +90,17 @@ def package_versions() -> dict:
     from importlib.metadata import PackageNotFoundError, version
 
     out = {}
-    for dist in ("torch-tpu", "libtpu", "jax", "jaxlib", "vllm", "vllm-torchtpu",
-                 "torch", "tpu-sync-torch", "tpu-raiden-torch"):
+    for dist in (
+        "torch-tpu",
+        "libtpu",
+        "jax",
+        "jaxlib",
+        "vllm",
+        "vllm-torchtpu",
+        "torch",
+        "tpu-sync-torch",
+        "tpu-raiden-torch",
+    ):
         try:
             out[dist] = version(dist)
         except PackageNotFoundError:
@@ -115,13 +128,15 @@ def environment_id(devices: bool = False) -> dict:
     offline engine benches never ask for it in the parent process.
     """
     env = {
-        "image": os.environ.get("P3_IMAGE") or os.environ.get("SERVER_IMAGE")
-        or os.environ.get("IMAGE") or "",
+        "image": os.environ.get("P3_IMAGE")
+        or os.environ.get("SERVER_IMAGE")
+        or os.environ.get("IMAGE")
+        or "",
         "libtpu_init_args": os.environ.get("LIBTPU_INIT_ARGS", ""),
         "host": socket.gethostname(),
         "python": platform.python_version(),
         "job": job_id(),
-        "utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "utc": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     env.update(package_versions())
     env.update(source_identity())
@@ -130,9 +145,13 @@ def environment_id(devices: bool = False) -> dict:
         import jax
 
         env["devices"] = [
-            {"id": d.id, "coords": list(getattr(d, "coords", ())),
-             "core": getattr(d, "core_on_chip", None), "kind": d.device_kind,
-             "process": d.process_index}
+            {
+                "id": d.id,
+                "coords": list(getattr(d, "coords", ())),
+                "core": getattr(d, "core_on_chip", None),
+                "kind": d.device_kind,
+                "process": d.process_index,
+            }
             for d in jax.devices()
         ]
         env["jax_process_count"] = jax.process_count()
@@ -144,7 +163,11 @@ def environment_id_string(env: dict) -> str:
     t = env.get("topology", {})
     image = env.get("image", "")
     if "@sha256:" in image:
-        image = image.split("@sha256:")[0].rsplit("/", 1)[-1] + "@" + image.split("@sha256:")[1][:12]
+        image = (
+            image.split("@sha256:")[0].rsplit("/", 1)[-1]
+            + "@"
+            + image.split("@sha256:")[1][:12]
+        )
     elif "/" in image:
         image = image.rsplit("/", 1)[-1]
     return (
@@ -162,7 +185,12 @@ def run_dir(bench: str, tag: str = "", root: str | None = None) -> str:
     root = root or os.environ.get("P3_OUT_ROOT") or DEFAULT_OUT_ROOT
     if not os.path.isdir(os.path.dirname(root.rstrip("/")) or "/"):
         root = os.path.join(os.getcwd(), "p3-harness-out")
-    name = bench + (f"-{tag}" if tag else "") + "-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    name = (
+        bench
+        + (f"-{tag}" if tag else "")
+        + "-"
+        + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    )
     path = os.path.join(root, job_id(), name)
     os.makedirs(path, exist_ok=True)
     return path
