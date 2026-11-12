@@ -31,10 +31,26 @@ MIXED_TILE_SIZES = (128, 64, 32, 16, 8, 4, 2, 1)
 _DECODE_STEP_COST_IN_HEAD_TRANSFERS = 16
 
 
-def decode_tile_target(num_seqs: int, n_v: int) -> int:
-    """Returns the largest candidate T with T^2 * n_v <= K * num_seqs, else 1."""
-    budget = _DECODE_STEP_COST_IN_HEAD_TRANSFERS * num_seqs
-    return next((t for t in DECODE_TILE_SIZES if t * t * n_v <= budget), 1)
+def decode_tile_target(
+    num_seqs: int,
+    n_v: int,
+    window_size: int = 1,
+    rec_state_bytes: int = 4,
+) -> int:
+    """Returns the largest candidate T with T^2 * eff_n_v <= budget, else 1.
+
+    For non-power-of-two head counts (e.g. 48 v-heads -> n_v in {6, 12, 24, 48}),
+    round n_v down to its leading power-of-two sublane tier and scale the 1-token
+    step budget for bf16 recurrent state (keeping window_size > 1 uninflated so
+    multi-token verify retains >= 4 pipeline steps).
+    """
+    eff_n_v = 1 << (max(1, n_v).bit_length() - 1)
+    if (n_v & (n_v - 1)) != 0 and window_size == 1:
+        dtype_scale = max(1, 4 // rec_state_bytes)
+        budget = _DECODE_STEP_COST_IN_HEAD_TRANSFERS * dtype_scale * num_seqs
+    else:
+        budget = _DECODE_STEP_COST_IN_HEAD_TRANSFERS * num_seqs
+    return next((t for t in DECODE_TILE_SIZES if t * t * eff_n_v <= budget), 1)
 
 
 def align_to(x: int, alignment: int) -> int:
@@ -74,7 +90,9 @@ def get_vmem_estimate_bytes(
     # Input state windows hold 1 state per sequence; output state windows hold
     # `window_size` checkpoints per sequence, giving `1 + window_size` state
     # slots per sequence per buffer.
-    state_slots_per_seq = 1 + window_size
+    state_slots_per_seq = (
+        1 if (not is_decode and (n_v & (n_v - 1)) != 0) else (1 + window_size)
+    )
     conv_state_buffer_bytes = 2 * (
         tile_b
         * state_slots_per_seq
@@ -315,6 +333,7 @@ def get_tile_sizes(
     # A batch of padded_batch_size tokens spans at most padded_batch_size
     # active sequences even when num_seqs reflects a larger static slot table.
     active_num_seqs = max(1, min(padded_batch_size, num_seqs))
+    rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
     if decode_tile_size is None or decode_tile_size <= 0:
         vmem_fit = calculate_decode_tile_size(
             batch_size=active_num_seqs,
@@ -330,7 +349,15 @@ def get_tile_sizes(
             kernel_size=kernel_size,
             window_size=window_size,
         )
-        decode_tile_size = min(decode_tile_target(active_num_seqs, n_v), vmem_fit)
+        decode_tile_size = min(
+            decode_tile_target(
+                active_num_seqs,
+                n_v,
+                window_size=window_size,
+                rec_state_bytes=rec_state_bytes,
+            ),
+            vmem_fit,
+        )
 
     if mixed_tile_size is None or mixed_tile_size <= 0:
         # Size the prefill/mixed chunk from batch_size rather than comparing

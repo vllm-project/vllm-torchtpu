@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
     VLLM_TPU_GDN_HOIST_METADATA: bool = False
-    TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
+    TPU_ENABLE_GDN_DYNAMIC_TILING: bool = True
     TPU_GDN_CHUNK_PAIR: bool = False
     TPU_GDN_RAW_QKV: bool = False
     TPU_GDN_RAW_BA: bool = False
@@ -655,7 +655,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.
     "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool(
-        "TPU_ENABLE_GDN_DYNAMIC_TILING", default=False
+        "TPU_ENABLE_GDN_DYNAMIC_TILING", default=True
     ),
     # GDN chunked prefill: each grid step takes two chunks of the same
     # sequence. The state-independent intra-chunk work (gates, K K^T, the
