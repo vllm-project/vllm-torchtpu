@@ -50,6 +50,10 @@ K = 7
 # VPAD_TEST_DEVICE=tpu runs the exactness cases through the compiled TPU
 # programs instead of eager CPU.
 DEVICE = os.environ.get("VPAD_TEST_DEVICE", "cpu")
+if DEVICE != "cpu":
+    # One compiled program per verify shape, as the runner allows (tpu_runner init).
+    torch._dynamo.config.cache_size_limit = 1024
+    torch._dynamo.config.accumulated_recompile_limit = 1024
 # The served deployments' (max_num_batched_tokens, max_num_seqs,
 # TPU_TOKEN_BUCKET_EXTRA) of the MiniMax-M3.1 v3 stack.
 CONFIGS = {
