@@ -29,11 +29,11 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `DP_SCHED_ENABLED` | `False` | Enables TPU data-parallel request scheduling optimizations. |
-| `DP_PLACEMENT` | `""` | `release`: the API server's data-parallel router holds new requests and releases them as a group, one per engine, so the engines run their prefill steps together. Requests pinned with `data_parallel_rank` keep their engine; streaming-input sessions and late-interaction pooling requests are never held. Unset or empty leaves vLLM's router unchanged. |
-| `DP_SCHED_BUFFER_THRESHOLD` | `0` | With `DP_PLACEMENT=release`, the number of held requests that triggers a release (`0` uses the engine count). |
-| `DP_SCHED_BUFFER_FLUSH_MS` | `5000` | With `DP_PLACEMENT=release`, the longest a request is held before its group is released, in milliseconds. |
-| `DP_SCHED_BUFFER_IDLE_TRIGGER` | `True` | With `DP_PLACEMENT=release`, releases the held requests as soon as any engine is idle (no waiting or running requests, or no wave running). |
-| `DP_SCHED_BUFFER_QUIET_MS` | `0` | With `DP_PLACEMENT=release`, releases the held requests once no request has arrived for this many milliseconds (`0` disables). |
+| `VLLM_TPU_DP_PLACEMENT` | `""` | `release`: the API server's data-parallel router holds new requests and releases them as a group, one per engine, so the engines run their prefill steps together. Requests pinned with `data_parallel_rank` keep their engine; streaming-input sessions and late-interaction pooling requests are never held. Unset or empty leaves vLLM's router unchanged. |
+| `VLLM_TPU_DP_RELEASE_THRESHOLD` | `0` | With `VLLM_TPU_DP_PLACEMENT=release`, the number of held requests that triggers a release (`0` uses the engine count). |
+| `VLLM_TPU_DP_RELEASE_DEADLINE_MS` | `5000` | With `VLLM_TPU_DP_PLACEMENT=release`, the longest a request is held before its group is released, in milliseconds. |
+| `VLLM_TPU_DP_RELEASE_IDLE_TRIGGER` | `True` | With `VLLM_TPU_DP_PLACEMENT=release`, releases the held requests as soon as any engine is idle (no waiting or running requests, or no wave running). |
+| `VLLM_TPU_DP_RELEASE_QUIET_MS` | `0` | With `VLLM_TPU_DP_PLACEMENT=release`, releases the held requests once no request has arrived for this many milliseconds (`0` disables). |
 | `VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS` | `8` | Consecutive `schedule()` steps a running prefill chunk may go without getting at least one KV block of tokens in `SrptPrefillScheduler` (held back or crowded out by shorter prefills) before it moves ahead of the other prefill chunks and is no longer held until it gets a block (`0` disables hold-back). |
 | `VLLM_TPU_SRPT_ATTN_WORK_CAP` | `0` | In `SrptPrefillScheduler`, cap on a step's attention work (`sum(n * (c + n / 2))` over scheduled chunks with `n` new tokens after `c` computed ones); while this rank decodes, or another DP rank decodes under EP lockstep (`DP > 1` with expert parallel), prefill chunks are shrunk to stay under it (`0` disables). |
 | `VLLM_TPU_SRPT_ATTN_TILE_TOKENS` | `32` | In `SrptPrefillScheduler`, a chunk shrunk by `VLLM_TPU_SRPT_ATTN_WORK_CAP` ends on a multiple of this many tokens, rounded down (the attention kernel's query tile). |

@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The data-parallel router's release placement (``DP_PLACEMENT=release``).
+"""The data-parallel router's release placement (``VLLM_TPU_DP_PLACEMENT=release``).
 
 vLLM's API-server router (``DPLBAsyncMPClient``) places each request on the
 least-loaded engine as it arrives, so arrivals follow completions and the
-engines' prefill steps drift apart. With ``DP_PLACEMENT=release`` the router
+engines' prefill steps drift apart. With ``VLLM_TPU_DP_PLACEMENT=release`` the router
 holds new requests and releases them as a group, one per engine where it can,
 so the engines run their prefill steps together. Streaming-input sessions and
 late-interaction pooling requests keep vLLM's own engine affinity and are
@@ -61,7 +61,6 @@ def install_release(
     requests, open sessions, and requests already in flight) and
     late-interaction pooling requests.
     """
-    import msgspec  # pyrefly: ignore[missing-import]
     from vllm.v1.engine import EngineCoreRequestType
     from vllm.v1.engine.exceptions import EngineDeadError
     from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
@@ -69,13 +68,13 @@ def install_release(
     if getattr(client_cls, "_tpu_dp_release_patch", False):
         return
     if threshold is None:
-        threshold = envs.DP_SCHED_BUFFER_THRESHOLD
+        threshold = envs.VLLM_TPU_DP_RELEASE_THRESHOLD
     if deadline_s is None:
-        deadline_s = envs.DP_SCHED_BUFFER_FLUSH_MS / 1000.0
+        deadline_s = envs.VLLM_TPU_DP_RELEASE_DEADLINE_MS / 1000.0
     if idle_trigger is None:
-        idle_trigger = envs.DP_SCHED_BUFFER_IDLE_TRIGGER
+        idle_trigger = envs.VLLM_TPU_DP_RELEASE_IDLE_TRIGGER
     if quiet_s is None:
-        quiet_s = envs.DP_SCHED_BUFFER_QUIET_MS / 1000.0
+        quiet_s = envs.VLLM_TPU_DP_RELEASE_QUIET_MS / 1000.0
     original_add_request = client_cls.add_request_async
     original_abort_requests = client_cls.abort_requests_async
     original_shutdown = client_cls.shutdown
@@ -90,8 +89,7 @@ def install_release(
     def _keeps_vllm_routing(self, request) -> bool:
         return (
             request.resumable
-            # vLLM releases before v0.33 have no streaming_reqs.
-            or request.request_id in getattr(self, "streaming_reqs", ())
+            or request.request_id in self.streaming_reqs
             or request.request_id in self.reqs_in_flight
             or get_late_interaction_engine_index(
                 request.pooling_params, len(self.core_engines)
@@ -134,16 +132,8 @@ def install_release(
             # As vLLM's router does: counts until the coordinator's next stats.
             engine_counts[engine_index][0] += self.client_count
         try:
-            pending_send = self._send_input(EngineCoreRequestType.ADD, request, engine)
-            # vLLM releases before v0.33 wake idle engines from the client by
-            # telling the coordinator about the first request; later releases
-            # wake them from the receiving engine and have no such socket.
-            first_request_socket = getattr(self, "first_req_send_socket", None)
-            if first_request_socket is not None and not self.engines_running:
-                await first_request_socket.send(
-                    msgspec.msgpack.encode(("FIRST_REQ", engine))
-                )
-            await pending_send
+            # As in vLLM's router, the receiving engine wakes idle ranks.
+            await self._send_input(EngineCoreRequestType.ADD, request, engine)
         except BaseException:
             # The counts must not claim a request no engine holds.
             self.reqs_in_flight.pop(request.request_id, None)
@@ -162,6 +152,9 @@ def install_release(
         num_engines = len(self.core_engines)
         assigned = Counter()
         next_engine = self.__dict__.get("_dp_release_next_engine", 0) % num_engines
+        # Requests that arrive while this release is sending join it: they are
+        # drained by this same loop and balanced with the same `assigned`
+        # counts, so a release never leaves a request held behind it.
         while held:
             # The request leaves the held list before its send: an abort that
             # lands during the send finds it gone here and, through the send's
@@ -198,20 +191,23 @@ def install_release(
             _settle_waiter(waiter)
         self._dp_release_next_engine = next_engine
 
-    def _log_release_failure(release_task) -> None:
-        if not release_task.cancelled() and release_task.exception() is not None:
-            logger.error(
-                "DP placement: release task failed", exc_info=release_task.exception()
-            )
+    def _on_background_task_done(self, name, task) -> None:
+        # An unexpected error in the release task or the poller fails every
+        # held request, so no add_request_async waits on a task that is gone.
+        if task.cancelled() or task.exception() is None:
+            return
+        logger.error("DP placement: %s failed", name, exc_info=task.exception())
+        _fail_held_requests(self, task.exception())
+
+    def _start_background_task(self, name, coro) -> None:
+        task = asyncio.get_running_loop().create_task(coro)
+        task.add_done_callback(lambda done: _on_background_task_done(self, name, done))
+        self.__dict__[f"_dp_{name}"] = task
 
     def _start_release(self) -> None:
         release_task = self.__dict__.get("_dp_release_task")
         if release_task is None or release_task.done():
-            release_task = asyncio.get_running_loop().create_task(
-                _release_held_requests(self)
-            )
-            release_task.add_done_callback(_log_release_failure)
-            self._dp_release_task = release_task
+            _start_background_task(self, "release_task", _release_held_requests(self))
 
     def _maybe_release(self) -> None:
         held = _held_requests(self)
@@ -230,12 +226,11 @@ def install_release(
             _start_release(self)
 
     async def _poll_release_triggers(self):
+        # An unexpected error ends the poller and fails the held requests
+        # (_on_background_task_done); the next add starts a new poller.
         while True:
             await asyncio.sleep(_RELEASE_POLL_INTERVAL_S)
-            try:
-                _maybe_release(self)
-            except Exception:  # The poller stays alive; the failure is logged.
-                logger.exception("DP placement: release poller")
+            _maybe_release(self)
 
     async def add_request_async(self, request):
         if _keeps_vllm_routing(self, request):
@@ -243,11 +238,24 @@ def install_release(
             return
         self._ensure_stats_update_task()
         loop = asyncio.get_running_loop()
-        if self.__dict__.get("_dp_release_poller") is None:
-            self._dp_release_poller = loop.create_task(_poll_release_triggers(self))
+        if self.client_count > 1:
+            logger.warning_once(
+                "DP placement: %d API servers each hold and release only their "
+                "own arrivals; use --api-server-count=1 so one router lines up "
+                "every engine's prefills.",
+                self.client_count,
+            )
+        self._dp_release_loop = loop
+        poller = self.__dict__.get("_dp_release_poller")
+        if poller is None or poller.done():
+            _start_background_task(self, "release_poller", _poll_release_triggers(self))
         waiter = loop.create_future()
         _held_requests(self).append((time.monotonic(), request, waiter))
-        _maybe_release(self)
+        try:
+            _maybe_release(self)
+        except Exception as exc:
+            _fail_held_requests(self, exc)
+            raise
         # Returns once this request has been sent, or raises its own send's
         # error; the sends run in the release task.
         await waiter
@@ -266,15 +274,30 @@ def install_release(
             held[:] = kept
         await original_abort_requests(self, request_ids)
 
+    def _stop_release(self) -> None:
+        for name in ("_dp_release_poller", "_dp_release_task"):
+            task = self.__dict__.get(name)
+            if task is not None:
+                task.cancel()
+        _fail_held_requests(self, EngineDeadError())
+
     def shutdown(self, *args, **kwargs):
-        try:
-            for name in ("_dp_release_poller", "_dp_release_task"):
-                task = self.__dict__.get(name)
-                if task is not None:
-                    task.cancel()
-            _fail_held_requests(self, EngineDeadError())
-        except RuntimeError:  # The event loop is closed: nobody is waiting.
-            pass
+        # vLLM may call shutdown off the event loop (AsyncLLM.__del__), where
+        # cancelling tasks and settling futures is not thread-safe, so the
+        # stop runs on the loop that owns them.
+        loop = self.__dict__.get("_dp_release_loop")
+        if loop is not None and not loop.is_closed():
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            try:
+                if running_loop is loop:
+                    _stop_release(self)
+                else:
+                    loop.call_soon_threadsafe(_stop_release, self)
+            except RuntimeError:  # The loop closed meanwhile: nobody is waiting.
+                pass
         return original_shutdown(self, *args, **kwargs)
 
     client_cls.add_request_async = add_request_async
@@ -283,8 +306,8 @@ def install_release(
     client_cls._tpu_dp_release_patch = True
     logger.info(
         "DP placement: held in the router and released across the engines "
-        "(DP_PLACEMENT=release; threshold %s, deadline %.1f s, idle trigger %s, "
-        "quiet release %s)",
+        "(VLLM_TPU_DP_PLACEMENT=release; threshold %s, deadline %.1f s, "
+        "idle trigger %s, quiet release %s)",
         threshold or "engine count",
         deadline_s,
         idle_trigger,
@@ -294,8 +317,8 @@ def install_release(
 
 def install_if_enabled() -> None:
     """Installs the release placement on vLLM's DP load-balancing client when
-    ``DP_PLACEMENT=release``."""
-    if envs.DP_PLACEMENT != "release":
+    ``VLLM_TPU_DP_PLACEMENT=release``."""
+    if envs.VLLM_TPU_DP_PLACEMENT != "release":
         return
     from vllm.v1.engine.core_client import DPLBAsyncMPClient
 

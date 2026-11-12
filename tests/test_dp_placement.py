@@ -102,6 +102,7 @@ def _release_client(
         else [[1, 8, 0.5] for _ in range(num_engines)]
     )
     client.resources = SimpleNamespace(engine_dead=False)
+    client._finalizer = SimpleNamespace(detach=lambda: None)  # vLLM's shutdown.
     client.sent = []
     client.aborted = []
     return client
@@ -282,10 +283,10 @@ def test_a_dead_engine_fails_every_held_request():
 
 
 def test_install_if_enabled_checks_the_mode(monkeypatch):
-    monkeypatch.setenv("DP_PLACEMENT", "relase")
+    monkeypatch.setenv("VLLM_TPU_DP_PLACEMENT", "relase")
     with pytest.raises(ValueError):
         dp_placement.install_if_enabled()
-    monkeypatch.setenv("DP_PLACEMENT", "")
+    monkeypatch.setenv("VLLM_TPU_DP_PLACEMENT", "")
     dp_placement.install_if_enabled()  # Off: nothing to install.
     assert not getattr(DPLBAsyncMPClient, "_tpu_dp_release_patch", False)
 
@@ -358,3 +359,70 @@ def test_a_cancelled_add_leaves_the_other_sends_alone():
     assert [request_id for request_id, _ in client.sent] == ["0"]
     assert client._dp_release_held == []
     assert client.reqs_in_flight["0"] == b"e2" and "1" not in client.reqs_in_flight
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "VLLM_TPU_DP_RELEASE_THRESHOLD",
+        "VLLM_TPU_DP_RELEASE_DEADLINE_MS",
+        "VLLM_TPU_DP_RELEASE_QUIET_MS",
+    ],
+)
+def test_a_negative_release_knob_raises(monkeypatch, name):
+    """A negative value would release every request at once (a silent no-op
+    mode), so it is rejected."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.setenv(name, "-1")
+    with pytest.raises(ValueError, match=">= 0"):
+        envs.environment_variables[name]()
+
+
+def test_an_unexpected_poller_error_fails_the_held_requests_and_restarts():
+    """An unexpected error while checking the release triggers ends the
+    poller and fails every held request instead of leaving it waiting; the
+    next add starts a new poller."""
+    client = _release_client(deadline_s=100.0)
+
+    async def run():
+        held = _add(client, Request("0"))
+        await asyncio.sleep(0.01)
+        first_poller = client._dp_release_poller
+        client.resources = None  # _maybe_release now raises AttributeError.
+        with pytest.raises(AttributeError):
+            await asyncio.wait_for(held, 5)
+        assert first_poller.done() and client._dp_release_held == []
+        client.resources = SimpleNamespace(engine_dead=False)
+        restarted = _add(client, Request("1"))
+        await asyncio.sleep(0.01)
+        assert client._dp_release_poller is not first_poller
+        assert not client._dp_release_poller.done()
+        client.shutdown()
+        with pytest.raises(EngineDeadError):
+            await restarted
+
+    asyncio.run(run())
+    assert client.sent == []
+
+
+def test_shutdown_off_the_event_loop_stops_on_the_loop():
+    """vLLM can call shutdown from another thread (AsyncLLM.__del__); the
+    tasks are cancelled and the held requests failed on their own loop."""
+    import threading
+
+    client = _release_client(deadline_s=100.0)
+
+    async def run():
+        held = _add(client, Request("0"))
+        await asyncio.sleep(0.01)
+        thread = threading.Thread(target=client.shutdown)
+        thread.start()
+        thread.join()
+        with pytest.raises(EngineDeadError):
+            await asyncio.wait_for(held, 5)
+        await asyncio.sleep(0)
+        assert client._dp_release_poller.cancelled()
+
+    asyncio.run(run())
+    assert client.sent == [] and client._dp_release_held == []
