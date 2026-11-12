@@ -15,11 +15,15 @@
 
 from __future__ import annotations
 
-import pytest
+import importlib
+from typing import Any
 
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels import dspark_mla_kernel
+import jax.numpy as jnp
+
+from vllm_torchtpu.models.kimi_k3.megakernel.kernels import dspark, dspark_mla_kernel
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels.dspark_mla import MlaDraftConfig
 
+pytest: Any = importlib.import_module("pytest")
 PAGES = 16
 
 
@@ -47,3 +51,53 @@ def test_fused_draft_admission(geometry: dict[str, int], error: str | None) -> N
             dspark_mla_kernel.fused_draft_local(
                 MlaDraftConfig(), pages=PAGES, **geometry
             )
+
+
+_RING_BLOCKS = 15
+_RING_TOTAL_LENGTH = 20
+_RING_FIRST_VALID = 12
+_SMALL_RING_WINDOW = 16
+_SMALL_RING_LAYERS = 2
+_SMALL_RING_HEAD_DIM = 8
+
+
+def test_dspark_ring_pack_unpack_and_positions_round_trip() -> None:
+    """Verify DSpark ring packing, magic validation, slot positions, and overflow."""
+    cfg = dspark.DraftConfig(
+        layers=_SMALL_RING_LAYERS,
+        window=_SMALL_RING_WINDOW,
+        head_dim=_SMALL_RING_HEAD_DIM,
+    )
+    ring_shape = (1, cfg.layers, cfg.window, 2 * cfg.head_dim)
+    ring = jnp.arange(
+        cfg.layers * cfg.window * 2 * cfg.head_dim, dtype=jnp.bfloat16
+    ).reshape(ring_shape)
+    meta = jnp.array([[_RING_TOTAL_LENGTH, _RING_FIRST_VALID]], dtype=jnp.int32)
+
+    packed = dspark.pack_ring(ring, meta, blocks=_RING_BLOCKS)
+    unpacked_ring, unpacked_meta = dspark.unpack_ring(
+        cfg, packed[0], length=_RING_TOTAL_LENGTH
+    )
+    assert jnp.array_equal(unpacked_ring, ring[0])
+    assert tuple(int(x) for x in unpacked_meta) == (
+        _RING_TOTAL_LENGTH,
+        _RING_FIRST_VALID,
+    )
+
+    _, mismatch_meta = dspark.unpack_ring(cfg, packed[0], length=_RING_TOTAL_LENGTH + 1)
+    assert tuple(int(x) for x in mismatch_meta) == (
+        _RING_TOTAL_LENGTH + 1,
+        _RING_TOTAL_LENGTH + 1,
+    )
+
+    positions = dspark.ring_positions(cfg, unpacked_meta)
+    valid_positions = [int(p) for p in positions if int(p) >= 0]
+    assert sorted(valid_positions) == list(range(_RING_FIRST_VALID, _RING_TOTAL_LENGTH))
+
+    full_cfg = dspark.DraftConfig()
+    huge_ring = jnp.zeros(
+        (1, full_cfg.layers, full_cfg.window, 2 * full_cfg.head_dim),
+        dtype=jnp.bfloat16,
+    )
+    with pytest.raises(ValueError, match="a ring needs"):
+        dspark.pack_ring(huge_ring, meta, blocks=1)
