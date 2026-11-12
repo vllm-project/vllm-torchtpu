@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
+    TPU_FUSED_ATTN_PROJ: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
@@ -482,6 +483,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
+    # Run eligible decoder layers' input norm through o_proj as the
+    # fused_attn_proj kernels (layers/adapter/fused_attn_proj.py).
+    "TPU_FUSED_ATTN_PROJ": env_bool("TPU_FUSED_ATTN_PROJ", default=False),
     # Store GDN's in_proj_qkvz in the matmul's (k, n) layout, like every other
     # linear, instead of vLLM's [n_out, n_in]. On the per-block FP8 path (gmm_v2)
     # the kept layout costs a full weight copy every step. Ignored with prefill

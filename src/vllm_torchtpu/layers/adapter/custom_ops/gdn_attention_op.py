@@ -1212,9 +1212,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 attn_metadata,
             )
 
-        # ============================================================
-        # Part 1: Input Projection
-        # ============================================================
+        mixed_qkv, z, b, a = self._project_inputs(hidden_states)
+        return self.forward_projected(num_tokens, mixed_qkv, z, b, a)
+
+    def _project_inputs(self, hidden_states: torch.Tensor):
+        """Part 1, the input projection: (mixed_qkv, z, b, a)."""
         if hasattr(self, "in_proj_qkv"):
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
@@ -1237,6 +1239,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
             a = a.contiguous()
+        return mixed_qkv, z, b, a
+
+    def forward_projected(self, num_tokens: int, mixed_qkv, z, b, a) -> torch.Tensor:
+        """Parts 2 and 3; fused_attn_proj enters here after its projection."""
+        kv_cache = self.kv_cache
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)

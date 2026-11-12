@@ -37,6 +37,7 @@ from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.layers.adapter import fused_attn_proj
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -98,16 +99,23 @@ def _overlap_forward(
     **kwargs: object,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     num_tokens = positions.shape[-1]
-    if residual is None:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    attn_module = (
+        self.linear_attn if self.layer_type == "linear_attention" else self.self_attn
+    )
+    fused = fused_attn_proj.attention(attn_module, hidden_states, residual, positions)
+    if fused is not None:
+        attn, residual = fused
     else:
-        hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-    if self.layer_type == "linear_attention":
-        attn = self.linear_attn(hidden_states=hidden_states)
-    else:
-        attn = self.self_attn(hidden_states=hidden_states, positions=positions)
+        if self.layer_type == "linear_attention":
+            attn = self.linear_attn(hidden_states=hidden_states)
+        else:
+            attn = self.self_attn(hidden_states=hidden_states, positions=positions)
     # out_proj / o_proj run with reduce_results=False: per-rank partial sum.
     if self.layer_scale:
         attn = attn * (self.attn_layer_scale.to(attn.dtype)[0] + 1)
