@@ -33,11 +33,13 @@ Gumbel-coupled sampling is not implemented.
 
 from __future__ import annotations
 
+import os
 from typing import NamedTuple
 
 import torch
 from vllm.config import VllmConfig
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
@@ -91,6 +93,9 @@ class DSparkProposer(DFlashProposer):
         # instead of the all-gathered full-vocab logits; set by load_model
         # when the draft model opts in. The compiled draft step traces on it.
         self._vocab_parallel_markov = False
+        # Whether the vocab-parallel Markov chain runs as one fused kernel
+        # (TPU_DSPARK_MARKOV_KERNEL); set by load_model, traced like the above.
+        self._fused_markov = False
         # The query block follows K, not the block length the checkpoint was
         # trained at; upstream vLLM likewise only enforces K == block for
         # Qwen3-Omni DSpark. The checkpoint's block is a query-block length in
@@ -157,6 +162,23 @@ class DSparkProposer(DFlashProposer):
                 "DSpark: greedy Markov drafting argmaxes the vocab-parallel "
                 "logits per rank; full-vocab logits are not gathered."
             )
+        # Opt-in on top of the shard path: the draft's enable_fused_markov(k)
+        # arms one Pallas call for the whole K-step chain (collective over the
+        # TP group, self-tested) and returns whether it armed; the draft step
+        # then calls markov_draft_fused() instead of the K-step loop.
+        enable_fused = getattr(self.draft_model, "enable_fused_markov", None)
+        if (
+            envs.TPU_DSPARK_MARKOV_KERNEL
+            and self._vocab_parallel_markov
+            and callable(enable_fused)
+        ):
+            k_steps = self.block_size - (0 if self.sample_from_anchor else 1)
+            self._fused_markov = bool(enable_fused(k_steps))
+            if self._fused_markov and os.environ.get("TPU_DSPARK_MARKOV_KERNEL_CHECK"):
+                # Debug: run every draft step both ways and count differing
+                # drafts (two compiled variants; host syncs every step).
+                self._markov_check = [0, 0, 0]
+                self._dflash_forward_and_sample = self._checked_draft_step
 
     def _observe_draft_aux(
         self, aux: torch.Tensor, chunk_index: int, chunk: DraftChunkInputs
@@ -197,6 +219,34 @@ class DSparkProposer(DFlashProposer):
         tail = mask_embed.expand(num_tokens - num_reqs * block_size, -1)
         return torch.cat([blocks, tail])
 
+    def _checked_draft_step(self, input_ids, positions, block_size):
+        """TPU_DSPARK_MARKOV_KERNEL_CHECK: the fused step, then the K-step loop
+        on the same inputs; logs the running count of differing drafts."""
+        step = DSparkProposer._dflash_forward_and_sample
+        fused, aux = step(self, input_ids, positions, block_size)
+        self._fused_markov = False
+        try:
+            looped, _ = step(self, input_ids, positions, block_size)
+        finally:
+            self._fused_markov = True
+        a, b = fused.cpu(), looped.cpu()
+        stats = self._markov_check
+        stats[0] += 1
+        stats[1] += a.numel()
+        stats[2] += int((a != b).sum())
+        if stats[0] <= 3 or stats[0] % 50 == 0:
+            logger.info(
+                "TPU_DSPARK_MARKOV_KERNEL_CHECK: steps=%d drafts=%d differing=%d "
+                "(last rows=%d, first row fused=%s loop=%s)",
+                stats[0],
+                stats[1],
+                stats[2],
+                a.shape[0],
+                a[0].tolist(),
+                b[0].tolist(),
+            )
+        return fused, aux
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
         self,
@@ -234,22 +284,39 @@ class DSparkProposer(DFlashProposer):
         # The vocab-parallel path keeps each rank's vocab shard of them.
         # Slot-major rows ([slot, request]), so each Markov step reads one
         # contiguous block: the hidden rows are relaid out, not the logits.
+        vocab_parallel = self._vocab_parallel_markov
+        ids_3d = input_ids[: padded_num_reqs * block_size].view(
+            padded_num_reqs, block_size
+        )
+        prev = ids_3d[:, 0]
+        if (
+            vocab_parallel
+            and self._fused_markov
+            and not self.use_confidence_head
+        ):
+            # TPU_DSPARK_MARKOV_KERNEL reads request-major [rows, k, vs]
+            # logits; the whole chain in one kernel, same ids as the loop below.
+            req_logits = self.draft_model.compute_draft_logits_shard(
+                valid_hidden.view(padded_num_reqs, block_size, -1)[
+                    :, sample_start:
+                ].reshape((block_size - sample_start) * padded_num_reqs, -1)
+            ).view(padded_num_reqs, block_size - sample_start, -1)
+            if req_logits.dtype == torch.bfloat16:
+                draft_tokens_chunk = self.draft_model.markov_draft_fused(
+                    req_logits, prev
+                )
+                return draft_tokens_chunk, hidden
         slot_hidden = (
             valid_hidden.view(padded_num_reqs, block_size, -1)[:, sample_start:]
             .transpose(0, 1)
             .reshape((block_size - sample_start) * padded_num_reqs, -1)
         )
-        vocab_parallel = self._vocab_parallel_markov
         if vocab_parallel:
             logits = self.draft_model.compute_draft_logits_shard(slot_hidden)
         else:
             logits = self.draft_model.compute_draft_logits(slot_hidden)
         slot_logits = logits.view(block_size - sample_start, padded_num_reqs, -1)
 
-        ids_3d = input_ids[: padded_num_reqs * block_size].view(
-            padded_num_reqs, block_size
-        )
-        prev = ids_3d[:, 0]
         draft_tokens = []
         markov_embeds = []
         for i in range(sample_start, block_size):
