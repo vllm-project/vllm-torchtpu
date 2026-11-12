@@ -822,6 +822,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         token_shard=False,
         shared=None,
         decode_token_shard=False,
+        write_sink=True,
     ):
         """Attention output and selected tokens.
 
@@ -836,6 +837,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         even when the TP-sharded one is built. ``token_shard`` (static per
         graph, the prefill sequence-parallel backbone): index this rank's
         token shard of the step and all-gather the selections, when built.
+        ``write_sink=False``: leave the MTP draft's shared selection to the
+        caller (``write_selection_sink``), which runs a step in token halves.
         """
         output, selected = self.attend_with_indices(
             hidden,
@@ -846,6 +849,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             token_shard,
             shared,
             decode_token_shard,
+            write_sink,
         )
         output = self.o_proj(output)
         if reduce and self.tp_size > 1:
@@ -866,6 +870,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         token_shard=False,
         shared=None,
         decode_token_shard=False,
+        write_sink=True,
     ):
         """``forward_with_indices`` without the output projection and all-reduce.
 
@@ -969,13 +974,18 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             picked = rows.clamp_min(0)
             output = torch.where(keep, output[picked], 0)
             selected = torch.where(keep, selected[picked], -1)
+        if write_sink and rows is None:
+            self.write_selection_sink(selected)
+        return output, selected
+
+    def write_selection_sink(self, selected):
+        """The target's selection of a whole step for the MTP draft
+        (bind_shared_selection); nothing without a draft bound."""
         sink = getattr(self, "_selection_sink", None)
-        if sink is not None and rows is None:
-            # The target's selection for the MTP draft (bind_shared_selection).
+        if sink is not None:
             # Both writes go through the donating row update: a slice copy_
             # into the buffer copied all of it every step (~42 us at 8192 rows).
             update_rows_(sink, selected)
-        return output, selected
 
     def select_for_kernel(self, hidden, positions, metadata: QSAMetadata):
         """Cache writes and the indexer only; the attention runs in the Qwen3.8

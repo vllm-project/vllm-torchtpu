@@ -13,6 +13,7 @@
 # limitations under the License.
 """Checkpoint-native text backbone with explicit TPU state/input ownership."""
 
+import math
 from collections.abc import Iterable, Sequence
 from functools import partial
 from pathlib import Path
@@ -348,9 +349,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
         sp_pad=0,
         gdn_step_metadata_cache=None,
         replicated_token_shard=False,
+        sp_microbatch=None,
     ):
         """``sequence_parallel``: ``hidden`` and the result are this TP rank's
         token shard; the token-indexed inputs still cover the whole step.
+        ``sp_microbatch``: the step's ``sequence_parallel.MicroBatchPlan``
+        (VLLM_TPU_SP_MICROBATCH_OVERLAP); the attention side runs in its token
+        halves (``_attention_in_halves``).
         ``sp_pad``: the shard's HC streams are padded to a multiple of this many
         rows; only the real rows enter collectives, attention and the MoE.
         ``replicated_token_shard``: the replicated prefill graph of
@@ -376,14 +381,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
         block, residual = self.attn_hyper_connection.mix(hidden)
         if sp_pad:
             block = sp.unpad(block, rows)
-        if sequence_parallel:
-            block = sp.gather(block, num_tokens)
-        if self.layer_type == "linear_attention":
-            block = sp.reduce(
-                self.linear_attn(block, gdn_step_metadata_cache), sequence_parallel
-            )
-        else:
-            block = self.self_attn.forward_with_indices(
+        if sequence_parallel and sp_microbatch is not None:
+            block = self._attention_in_halves(
                 block,
                 positions,
                 QSAMetadata(
@@ -393,22 +392,43 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     main_block_table,
                     compressed_block_table,
                 ),
-                reduce=False,
-                replicated_indexer=(
-                    sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP
-                ),
-                token_shard=(
-                    (sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD)
-                    or (
-                        replicated_token_shard
-                        and self.self_attn.replicated_token_shard
-                    )
-                ),
-                decode_token_shard=(
-                    not sequence_parallel and self.self_attn.decode_token_shard
-                ),
-            )[0]
-            block = sp.reduce(block, sequence_parallel)
+                sp_microbatch,
+                gdn_step_metadata_cache,
+            )
+        else:
+            if sequence_parallel:
+                block = sp.gather(block, num_tokens)
+            if self.layer_type == "linear_attention":
+                block = sp.reduce(
+                    self.linear_attn(block, gdn_step_metadata_cache), sequence_parallel
+                )
+            else:
+                block = self.self_attn.forward_with_indices(
+                    block,
+                    positions,
+                    QSAMetadata(
+                        query_start_loc,
+                        context_lens,
+                        state_slots,
+                        main_block_table,
+                        compressed_block_table,
+                    ),
+                    reduce=False,
+                    replicated_indexer=(
+                        sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP
+                    ),
+                    token_shard=(
+                        (sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD)
+                        or (
+                            replicated_token_shard
+                            and self.self_attn.replicated_token_shard
+                        )
+                    ),
+                    decode_token_shard=(
+                        not sequence_parallel and self.self_attn.decode_token_shard
+                    ),
+                )[0]
+                block = sp.reduce(block, sequence_parallel)
         block, residual = self.attn_hyper_connection.combine_mix(
             sp.pad_shard(block, sp_pad), residual, self.mlp_hyper_connection
         )
@@ -480,6 +500,55 @@ class Qwen4ExpDecoderLayer(nn.Module):
             combined_raw=ple_combined_raw,
         )
         return hidden + sp.pad_shard(addend, sp_pad)
+
+    def _attention_in_halves(
+        self, block, positions, metadata, plan, gdn_step_metadata_cache
+    ):
+        """The attention side of a sequence-parallel layer, token half by token
+        half (VLLM_TPU_SP_MICROBATCH_OVERLAP): this rank's rows of the summed
+        attention output, as ``sp.reduce`` of the whole step's would give.
+
+        ``block`` is this rank's (unpadded) shard, rows of half A then half B
+        (``sequence_parallel``). Half ``g``'s all-gather depends only on its
+        own rows and half A's reduce-scatter only on A's output, so the
+        SparseCore can gather B and reduce A while the TensorCore computes the
+        other half. Every all-gather is issued before the first core. The
+        cores run in token order: B's GDN resumes from the state A wrote, and
+        B's queries attend the keys A wrote (``sp.MicroBatchPlan``).
+        """
+        gathered = [
+            sp.all_gather_rows(part) for part in sp.group_rows(block, plan.groups)
+        ]
+        outputs, selections = [], []
+        for g, rows in enumerate(gathered):
+            if self.layer_type == "linear_attention":
+                partial_out = self.linear_attn(
+                    rows, gdn_step_metadata_cache, sp_half=(plan, g)
+                )
+            else:
+                starts, context = plan.qsa(
+                    metadata.query_start_loc, metadata.context_lens, g
+                )
+                partial_out, selected = self.self_attn.forward_with_indices(
+                    rows,
+                    plan.positions(positions, g),
+                    QSAMetadata(
+                        starts,
+                        context,
+                        metadata.state_slots,
+                        metadata.main_block_table,
+                        metadata.compressed_block_table,
+                    ),
+                    reduce=False,
+                    replicated_indexer=envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP,
+                    token_shard=envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD,
+                    write_sink=False,
+                )
+                selections.append(selected)
+            outputs.append(sp.reduce_scatter_rows(partial_out))
+        if selections and getattr(self.self_attn, "_selection_sink", None) is not None:
+            self.self_attn.write_selection_sink(torch.cat(selections))
+        return torch.cat(outputs)
 
     def _sequence_parallel_moe(self, block, num_tokens):
         """The MoE block's output at this rank's rows of a sharded step.
@@ -715,8 +784,13 @@ class Qwen4ExpBackbone(nn.Module):
         )
         num_tokens = input_ids.shape[0]
         sp_pad = self.sp_pad_rows if sequence_parallel else 0
+        # VLLM_TPU_SP_MICROBATCH_OVERLAP: the step's token halves.
+        sp_microbatch = None
         if sequence_parallel:
             sp.check_divisible(num_tokens)
+            if sp.microbatch_groups() > 1:
+                sp_microbatch = sp.MicroBatchPlan(num_tokens, sp.microbatch_groups())
+                sp.check_divisible(num_tokens, sp_microbatch.groups)
             hidden = sp.shard(hidden)
         rows = hidden.shape[0]
         hidden = sp.pad_shard(hidden.repeat(1, self.hc_count), sp_pad)
@@ -743,6 +817,7 @@ class Qwen4ExpBackbone(nn.Module):
                 sp_pad=sp_pad,
                 gdn_step_metadata_cache=gdn_step_metadata_cache,
                 replicated_token_shard=replicated_token_shard,
+                sp_microbatch=sp_microbatch,
             )
         mixed = self.hyper_connection_mixer.mix(hidden)[0]
         if sp_pad:
@@ -1440,6 +1515,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 if rows > sp.ROW_ALIGNMENT:
                     self.model.sp_pad_rows = rows
                 rows = sp.ROW_ALIGNMENT
+            rows = self._sp_microbatch_rows(vllm_config, tp_size, rows)
             eligible = partial(
                 sp.sequence_parallel_eligible, tp_size=tp_size, rows=rows
             )
@@ -1478,6 +1554,30 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+
+    @staticmethod
+    def _sp_microbatch_rows(vllm_config, tp_size, rows):
+        """Decide VLLM_TPU_SP_MICROBATCH_OVERLAP before any trace, and the row
+        multiple of a shard under it: each half of the shard stays a whole
+        number of sublane tiles. Blocks the split when the leading
+        decode/verify rows of the smallest sequence-parallel bucket may not
+        fit in its first half (GDN runs that segment in half A only)."""
+        if not envs.VLLM_TPU_SP_MICROBATCH_OVERLAP:
+            return rows
+        scheduler_cfg = getattr(vllm_config, "scheduler_config", None)
+        max_num_seqs = int(getattr(scheduler_cfg, "max_num_seqs", 0) or 0)
+        decode_rows = max_num_seqs * (num_speculative_tokens(vllm_config) + 1)
+        groups = sp.MICROBATCH_GROUPS
+        mb_rows = math.lcm(rows, groups * sp.ROW_ALIGNMENT)
+        first_half = sp.min_tokens(tp_size, mb_rows) // groups
+        if decode_rows > first_half:
+            sp.block_microbatch(
+                f"up to {decode_rows} decode/verify rows do not fit in the first "
+                f"half ({first_half} rows) of the smallest sequence-parallel bucket"
+            )
+        if not sp.microbatch_enabled():
+            return rows
+        return mb_rows
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
         # The route reads the padded bucket size outside both compiled graphs.
