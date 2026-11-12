@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
 
 from vllm_torchtpu.kernels.experimental.moe_lowtok import kernel
 from vllm_torchtpu.layers.core import fused_moe_gmm as wrapper
@@ -221,6 +222,95 @@ def test_interpreted_scores_entry_matches_router_then_reference(interpret, n_glo
     local = jnp.where((ids >= start) & (ids < start + experts), ids - start, -1)
     local = local.at[2].set(-1)
     _assert_close(got, _reference(x, local, w, *weights), 2.5e-2)
+
+
+ROUTER_EXPERTS = 512
+ROUTER_TOPK = 10
+_NINE_WINNERS = [20, 40, 60, 80, 120, 140, 160, 180, 220]
+
+
+def _tied_router_input(rows, from_logits, seed):
+    """Qwen3.5 router rows whose first four hold ties the selected set depends on.
+
+    Row 0 ties ids 5 and 511 for the 10th place under nine clear winners, row
+    1 is a padded token with every score equal, row 2 ties twelve ids
+    (100..111) for ten places, and row 3 ties ids 200 and 300 for the 10th
+    place. The other rows are a softmax of bf16 logits, or those logits.
+    """
+    rng = np.random.default_rng(seed)
+    logits = rng.standard_normal((rows, ROUTER_EXPERTS), dtype=np.float32) * 2.0
+    logits = np.asarray(jnp.asarray(logits, jnp.bfloat16).astype(jnp.float32))
+    if from_logits:
+        x, hi, tie, lo = logits.copy(), 8.0, 4.0, -8.0
+    else:
+        z = np.exp(logits - logits.max(axis=1, keepdims=True))
+        x, hi, tie, lo = (z / z.sum(axis=1, keepdims=True)), 0.5, 0.25, 0.0
+    for row, tied in ((0, [5, 511]), (3, [200, 300])):
+        x[row] = lo
+        x[row, _NINE_WINNERS] = hi + np.arange(9) * (hi / 64)
+        x[row, tied] = tie
+    x[1] = tie
+    x[2] = lo
+    x[2, 100:112] = hi
+    return jnp.asarray(x, jnp.bfloat16 if from_logits else jnp.float32)
+
+
+def _lowest_id_table(x, from_logits):
+    """The documented rule on the host: a stable sort keeps lower ids first."""
+    c = np.asarray(jnp.asarray(x).astype(jnp.float32))
+    ids = np.argsort(-c, axis=1, kind="stable")[:, :ROUTER_TOPK]
+    top = np.take_along_axis(c, ids, axis=1).astype(np.float64)
+    w = np.exp(top - top[:, :1]) if from_logits else top
+    table = np.zeros(c.shape, np.float32)
+    np.put_along_axis(table, ids, w / w.sum(axis=1, keepdims=True), axis=1)
+    return ids, np.asarray(jnp.asarray(table).astype(jnp.bfloat16), np.float32)
+
+
+def _select_topk_call(x, from_logits, interpret):
+    rows = x.shape[0]
+
+    def body(s_ref, o_ref):
+        o_ref[...] = kernel._select_topk(
+            s_ref[...], ROUTER_TOPK, from_logits=from_logits
+        )
+
+    block = pl.BlockSpec((rows, ROUTER_EXPERTS), lambda i: (0, 0))
+    return pl.pallas_call(
+        body,
+        grid=(1,),
+        in_specs=[block],
+        out_specs=block,
+        out_shape=jax.ShapeDtypeStruct((rows, ROUTER_EXPERTS), jnp.float32),
+        interpret=interpret,
+    )(x)
+
+
+@pytest.mark.parametrize(
+    "interpreted",
+    [
+        pytest.param(True, id="interpret"),
+        pytest.param(False, id="tpu", marks=pytest.mark.tpu_test),
+    ],
+)
+@pytest.mark.parametrize("from_logits", [False, True], ids=["scores", "logits"])
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_select_topk_ties_go_to_the_lowest_id(rows, from_logits, interpreted):
+    """The in-kernel router keeps its documented tie rule, compiled as well.
+
+    At 64 rows or fewer it once took each pass's index from one argmax, which
+    kept the lowest tied id in interpret mode and other ids compiled on TPU7x.
+    """
+    if not interpreted:
+        _needs("tpu")
+    x = _tied_router_input(rows, from_logits, seed=rows + 1000 * from_logits)
+    ids, want = _lowest_id_table(x, from_logits)
+    assert set(ids[0]) == {*_NINE_WINNERS, 5}
+    assert set(ids[1]) == set(range(10))
+    assert set(ids[2]) == set(range(100, 110))
+    assert set(ids[3]) == {*_NINE_WINNERS, 200}
+    got = np.asarray(_select_topk_call(x, from_logits, interpreted))
+    np.testing.assert_array_equal(got != 0, want != 0)
+    np.testing.assert_allclose(got, want, rtol=1e-2, atol=0)
 
 
 def _shapes(m, h, i, e):

@@ -359,8 +359,11 @@ def _stream(
 def _select_topk(scores, topk, *, from_logits: bool = False):
     """The served router as a routing table over global expert ids.
 
-    `topk` max-and-mask passes over the softmax scores or raw router logits
-    (ties to the lowest id), weights renormalized and rounded through bf16.
+    `topk` max-and-mask passes over the softmax scores or raw router logits,
+    weights renormalized and rounded through bf16. Ties go to the lowest id
+    at every row count: each pass takes the row max, then the lowest id equal
+    to it. A single argmax would leave the tie to Mosaic's reduction order,
+    which on TPU does not keep the lowest id.
     """
     lane = jax.lax.broadcasted_iota(jnp.int32, scores.shape, 1)
     scores_f32 = scores.astype(jnp.float32) if from_logits else scores
@@ -369,34 +372,18 @@ def _select_topk(scores, topk, *, from_logits: bool = False):
     masked = jnp.finfo(jnp.float32).min
     wsum = jnp.zeros((x.shape[0], 1), jnp.float32)
     m0 = None
-    if x.shape[0] <= 64:
-        # At <=64 rows, variadic argmax fits in VREGs without spilling.
-        for r in range(topk):
-            idx = jnp.argmax(x, axis=1).astype(jnp.int32)[:, None]
-            m = jnp.max(x, axis=1, keepdims=True)
-            if from_logits:
-                if r == 0:
-                    m0 = m
-                wsum = wsum + jnp.where(m > _NEG, jnp.exp(m - m0), 0.0)
-            else:
-                wsum = wsum + m
-            x = jnp.where(lane == idx, masked, x)
-    else:
-        # At >64 rows (e.g. 128), Mosaic variadic argmax spills VREGs
-        # (see router_topk.py:64), so two scalar reductions (max then
-        # min-index) are 2x faster.
-        for r in range(topk):
-            m = jnp.max(x, axis=1, keepdims=True)
-            idx = jnp.min(
-                jnp.where(x == m, lane, x.shape[1] - 1), axis=1, keepdims=True
-            )
-            if from_logits:
-                if r == 0:
-                    m0 = m
-                wsum = wsum + jnp.where(m > _NEG, jnp.exp(m - m0), 0.0)
-            else:
-                wsum = wsum + m
-            x = jnp.where(lane == idx, masked, x)
+    for r in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        # The other ids fill with the last one, so the min never picks an id
+        # below the max.
+        idx = jnp.min(jnp.where(x == m, lane, x.shape[1] - 1), axis=1, keepdims=True)
+        if from_logits:
+            if r == 0:
+                m0 = m
+            wsum = wsum + jnp.where(m > _NEG, jnp.exp(m - m0), 0.0)
+        else:
+            wsum = wsum + m
+        x = jnp.where(lane == idx, masked, x)
     num = jnp.exp(x0 - m0) if from_logits else x0
     wt = jnp.where((x == masked) & (wsum > 0), num / wsum, 0.0)
     return wt.astype(jnp.bfloat16).astype(jnp.float32)
