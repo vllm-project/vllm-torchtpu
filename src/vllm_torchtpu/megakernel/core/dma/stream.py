@@ -102,12 +102,17 @@ class TwoRing:
         self._active_branches: tuple[int, ...] = tuple(range(len(sp.branch_counts)))
         self._cur_layer: Any = None
         self._ering_busy: bool = False
+        # `segment(defer_flush=True)`: the flush left for `take_deferred_flush()`,
+        # and the taken flushes not yet issued (each one a `[issued]` box).
+        self._deferred_flush: Callable[[], None] | None = None
+        self._open_flushes: list[list[bool]] = []
 
     def begin_layer(self, lyr: Any) -> Any:
         """Reset `self.cursor` and per-branch segment offsets at layer `lyr`."""
         assert not self._in_segment, (
             "begin_layer() cannot be called inside stream.segment()"
         )
+        self.assert_flushed()
         self._cur_layer = lyr
         self.cursor = self.sp.layer_start_tile(lyr)
         self._cursor_delta = 0
@@ -201,11 +206,21 @@ class TwoRing:
         return out
 
     @contextlib.contextmanager
-    def segment(self, *, lazy: bool = False):
-        """Scope a module's dense weight stream consumption and optional lazy refill."""
+    def segment(self, *, lazy: bool = False, defer_flush: bool = False):
+        """Scope a module's dense weight stream consumption and optional lazy refill.
+
+        A lazy segment refills the slots of its tiles on exit. With
+        `defer_flush=True` it issues nothing on exit and leaves that refill to
+        `take_deferred_flush()`, whose closure must then be called exactly once
+        in the same trace (a no-op closure when there is nothing to refill).
+        """
         assert not self._in_segment, (
             "Nested stream.segment() is not allowed; call segment() only "
             "at the top level of Module.emit()"
+        )
+        assert self._deferred_flush is None, (
+            "stream.segment() entered before the previous segment's deferred "
+            "flush was taken (take_deferred_flush())"
         )
         g_start = self.cursor
         seg_offsets = (
@@ -225,48 +240,89 @@ class TwoRing:
             self._in_segment = False
             self._lazy = prev_lazy
             self._seg_tiles = prev_tiles
+            refill = None
             if lazy and n_tiles > 0:
-                with self.sc("refill"):
-                    if (
-                        self.sp.rel_fetch
-                        and self._cur_layer is not None
-                        and seg_offsets is not None
-                    ):
-                        sp = self.sp
-                        blk = (
-                            self._cur_layer
-                            if sp.period == 1
-                            else self._cur_layer // sp.period
+                cur_layer, active = self._cur_layer, self._active_branches
+
+                def refill() -> None:
+                    with self.sc("refill"):
+                        self._flush_segment(
+                            g_start, seg_offsets, n_tiles, cur_layer, active
                         )
-                        if len(self._active_branches) == 1:
-                            b_idx = self._active_branches[0]
-                            r0 = seg_offsets[b_idx]
-                            l_start = sum(sp.branch_counts[:b_idx])
-                            c_b = sp.branch_counts[b_idx]
-                            if c_b == 1:
-                                self.flush_rel(g_start, blk, l_start, r0, n_tiles)
-                            else:
-                                lt_tr = self._cur_layer % sp.period
-                                for lt_s in range(l_start, l_start + c_b):
-                                    pl.when(lt_tr == lt_s)(
-                                        lambda lt_s=lt_s, r0=r0: self.flush_rel(
-                                            g_start, blk, lt_s, r0, n_tiles
-                                        )
-                                    )
-                        else:
-                            lt_tr = self._cur_layer % sp.period
-                            for b_idx in self._active_branches:
-                                r0 = seg_offsets[b_idx]
-                                l_start = sum(sp.branch_counts[:b_idx])
-                                c_b = sp.branch_counts[b_idx]
-                                for lt_s in range(l_start, l_start + c_b):
-                                    pl.when(lt_tr == lt_s)(
-                                        lambda lt_s=lt_s, r0=r0: self.flush_rel(
-                                            g_start, blk, lt_s, r0, n_tiles
-                                        )
-                                    )
-                    else:
-                        self.flush(g_start, n_tiles)
+
+            if defer_flush:
+                self._deferred_flush = refill or (lambda: None)
+            elif refill is not None:
+                refill()
+
+    def take_deferred_flush(self) -> Callable[[], None]:
+        """The refill of the last `segment(defer_flush=True)`, as a closure.
+
+        Calling it issues exactly the refill the segment's exit would have
+        issued. It must be called exactly once, before the next layer
+        (`begin_layer`) and before `assert_flushed()`.
+        """
+        assert self._deferred_flush is not None, (
+            "take_deferred_flush() without a preceding segment(defer_flush=True)"
+        )
+        refill, self._deferred_flush = self._deferred_flush, None
+        box = [False]
+        self._open_flushes.append(box)
+
+        def flush() -> None:
+            assert not box[0], "a deferred segment flush was issued twice"
+            box[0] = True
+            self._open_flushes.remove(box)
+            refill()
+
+        return flush
+
+    def assert_flushed(self) -> None:
+        """Every deferred segment flush was taken and issued."""
+        assert self._deferred_flush is None, (
+            "a segment(defer_flush=True) flush was never taken (take_deferred_flush())"
+        )
+        assert not self._open_flushes, (
+            f"{len(self._open_flushes)} deferred segment flush(es) taken but "
+            "never issued"
+        )
+
+    def _flush_segment(
+        self, g_start, seg_offsets, n_tiles: int, cur_layer, active_branches
+    ) -> None:
+        """Refill the `n_tiles` slots a lazy segment consumed from `g_start`."""
+        if self.sp.rel_fetch and cur_layer is not None and seg_offsets is not None:
+            sp = self.sp
+            blk = cur_layer if sp.period == 1 else cur_layer // sp.period
+            if len(active_branches) == 1:
+                b_idx = active_branches[0]
+                r0 = seg_offsets[b_idx]
+                l_start = sum(sp.branch_counts[:b_idx])
+                c_b = sp.branch_counts[b_idx]
+                if c_b == 1:
+                    self.flush_rel(g_start, blk, l_start, r0, n_tiles)
+                else:
+                    lt_tr = cur_layer % sp.period
+                    for lt_s in range(l_start, l_start + c_b):
+                        pl.when(lt_tr == lt_s)(
+                            lambda lt_s=lt_s, r0=r0: self.flush_rel(
+                                g_start, blk, lt_s, r0, n_tiles
+                            )
+                        )
+            else:
+                lt_tr = cur_layer % sp.period
+                for b_idx in active_branches:
+                    r0 = seg_offsets[b_idx]
+                    l_start = sum(sp.branch_counts[:b_idx])
+                    c_b = sp.branch_counts[b_idx]
+                    for lt_s in range(l_start, l_start + c_b):
+                        pl.when(lt_tr == lt_s)(
+                            lambda lt_s=lt_s, r0=r0: self.flush_rel(
+                                g_start, blk, lt_s, r0, n_tiles
+                            )
+                        )
+        else:
+            self.flush(g_start, n_tiles)
 
     def mm(self, x, w, dims=NN):
         """Compute `dot_general(x, w, dims)` in `F32`, casting `w` in interpret mode."""
@@ -678,24 +734,18 @@ class TwoRing:
             xs.append(xsrc[:, pl.ds(k0, t_k)])
         return ws, xs
 
-    def dmatmul(
-        self,
-        kind: str,
-        xsrc,
-        N: int,
-        *,
-        g0=None,
-        lazy: bool | None = None,
-        ws_pre=None,
-        hook: HalfSplitHook | None = None,
-        split: ColumnSplit | None = None,
-    ):
-        """`acc[:, :N] = xsrc[:, :K] @ W(kind)`, advancing `self.cursor`.
+    def _consume(
+        self, kind: str, g0: Any, lazy: bool | None, what: str
+    ) -> tuple[Any, Any, bool]:
+        """Consume `kind`'s `nt` tiles: `(g0, dmm_ctx, lazy)`.
 
-        `ws_pre`, `hook`, `split`: see `dmatmul_pair` (each needs that path).
+        With `g0=None` the tiles start at `self.cursor`, which advances past
+        them together with the branch offsets (checked against the schedule)
+        and the segment tile count; an explicit `g0` leaves both alone. `what`
+        names the caller in error messages.
         """
         sp = self.sp
-        n_t, t_k = sp.nt[kind], sp.tk[kind]
+        n_t = sp.nt[kind]
         dmm_ctx = None
         if g0 is None:
             if self._branch_offsets is not None:
@@ -742,7 +792,7 @@ class TwoRing:
                         and matched[0][2] == cur_off + n_t
                     ), (
                         f"Stream consumption order mismatch on branch {b_idx}: "
-                        f"dmatmul({kind!r}) called at layer tile offset {cur_off}, "
+                        f"{what}) called at layer tile offset {cur_off}, "
                         f"expected {matched} in schedule {sp.branch_segs[b_idx]}"
                     )
                     self._branch_offsets[b_idx] = cur_off + n_t
@@ -752,20 +802,58 @@ class TwoRing:
             self._cursor_delta += n_t
         if self._in_segment and lazy is not None and bool(lazy) != bool(self._lazy):
             raise ValueError(
-                f"dmatmul({kind!r}, lazy={lazy}) disagrees with enclosing "
+                f"{what}, lazy={lazy}) disagrees with enclosing "
                 f"stream.segment(lazy={self._lazy})"
             )
         use_lazy = self._lazy if lazy is None else lazy
         if use_lazy and not self._in_segment:
             raise ValueError(
-                f"dmatmul({kind!r}, lazy=True) requires an enclosing "
-                "stream.segment(lazy=True)"
+                f"{what}, lazy=True) requires an enclosing stream.segment(lazy=True)"
             )
         if use_lazy:
             assert self._seg_tiles <= sp.NBD, (
-                f"Lazy stream.segment() exceeded ring depth on dmatmul({kind!r}): "
+                f"Lazy stream.segment() exceeded ring depth on {what}): "
                 f"segment tiles {self._seg_tiles} > NBD={sp.NBD}"
             )
+        return g0, dmm_ctx, use_lazy
+
+    def claim(self, kind: str) -> tuple[Any, Callable[[int], None]]:
+        """Consume `kind`'s tiles for a caller that takes them itself (`dtake`,
+        `dtake_group`, `dbanks_wait`) instead of through `dmatmul`.
+
+        Advances the cursor, branch offsets and segment tile count exactly as
+        `dmatmul(kind, ...)` does. Returns `(g0, give)`: the first tile, and
+        `give(u)`, which releases tile `g0 + u` (prefetches its ring
+        successor) inside a non-lazy segment and does nothing inside a lazy
+        one, whose exit refills every consumed tile.
+        """
+        g0, dmm_ctx, use_lazy = self._consume(kind, None, None, f"claim({kind!r}")
+
+        def give(u: int) -> None:
+            if not use_lazy:
+                self._give_tile(g0, 0, u, (), dmm_ctx)
+
+        return g0, give
+
+    def dmatmul(
+        self,
+        kind: str,
+        xsrc,
+        N: int,
+        *,
+        g0=None,
+        lazy: bool | None = None,
+        ws_pre=None,
+        hook: HalfSplitHook | None = None,
+        split: ColumnSplit | None = None,
+    ):
+        """`acc[:, :N] = xsrc[:, :K] @ W(kind)`, advancing `self.cursor`.
+
+        `ws_pre`, `hook`, `split`: see `dmatmul_pair` (each needs that path).
+        """
+        sp = self.sp
+        n_t, t_k = sp.nt[kind], sp.tk[kind]
+        g0, dmm_ctx, use_lazy = self._consume(kind, g0, lazy, f"dmatmul({kind!r}")
         DMU = min(sp.dmm_unroll, sp.NBD)
         if n_t <= DMU or sp.dense_acc_pair:
             return self.dmatmul_pair(

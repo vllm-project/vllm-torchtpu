@@ -261,6 +261,7 @@ def build(
                     if eff_ar is not None:
                         comm.add_residual(comm.allreduce(eff_ar, part, ar_first))
 
+            stream.assert_flushed()
             return carry
 
         # ------------------------------ step prologue ------------------------------

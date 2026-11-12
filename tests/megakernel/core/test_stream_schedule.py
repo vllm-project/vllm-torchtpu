@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Opt-in dense-ring schedule options of `TwoRing` (`Tiles.dwait_hoist`,
-`ws_pre`, and the `hook=` / `split=` forms of `dmatmul`).
+`ws_pre`, the `hook=` / `split=` forms of `dmatmul`), `TwoRing.claim` and the
+deferred lazy-segment flush.
 
 Each option is run in Pallas interpret mode against the default schedule
 (bit-identical outputs: the options only move waits and bank arithmetic) and
@@ -69,8 +70,17 @@ def _plain_layer(ring: stream.TwoRing, scr: dict[str, Any]) -> Any:
     return ring.dmatmul("w", scr["xb"], _N)
 
 
-def _run(tiles: Tiles, layer: LayerFn = _plain_layer, *, lazy: bool = False):
-    """Run `_L` layers of `res[:, :N] += layer(...)`; returns `(out, ref, call, args)`."""
+def _run(
+    tiles: Tiles,
+    layer: LayerFn = _plain_layer,
+    *,
+    lazy: bool = False,
+    own_segment: bool = False,
+):
+    """Run `_L` layers of `res[:, :N] += layer(...)`; returns `(out, ref, call, args)`.
+
+    `layer` runs inside `segment(lazy=lazy)` unless `own_segment`.
+    """
     ex = ExecSpec(B=4, T=1, R=1, ctx=128, tiles=tiles, interpret=True)
     g = FakeGeometry(L=_L, H=_K)
     ms = ModelSpec(
@@ -91,9 +101,13 @@ def _run(tiles: Tiles, layer: LayerFn = _plain_layer, *, lazy: bool = False):
 
         def layer_fn(lyr, _):
             ring.begin_layer(lyr)
-            with ring.segment(lazy=lazy):
+            if own_segment:
                 y = layer(ring, scr)
+            else:
+                with ring.segment(lazy=lazy):
+                    y = layer(ring, scr)
             scr["xb"][:, :_N] = (scr["xb"][:, :_N].astype(F32) + y).astype(BF16)
+            ring.assert_flushed()
             return 0
 
         lax.fori_loop(0, _L, layer_fn, 0)
@@ -328,3 +342,127 @@ def test_dmatmul_hook_and_split_require_unrolled_form(form: str):
 
     with pytest.raises(AssertionError, match=form):
         _run(_tiles(dense_acc_pair=True, dmm_unroll=0), layer)
+
+
+# ---------------------------------------------------------------------------
+# claim: a module takes its tiles itself
+# ---------------------------------------------------------------------------
+def _claim_layer(ring: stream.TwoRing, scr: dict[str, Any]) -> Any:
+    """`dmatmul('w', ...)` rebuilt from `claim` + `dtake_group` + `give`."""
+    g0, give = ring.claim("w")
+    t_k = ring.sp.tk["w"]
+    ws = ring.dtake_group([("w", g0 + u) for u in range(6)])
+    xs = [scr["xb"][:, pl.ds(u * t_k, t_k)] for u in range(6)]
+    acc = scr["acc"]
+    for c0, cw in ((0, 512), (512, _N - 512)):
+        p = ring.mm(xs[0], ws[0][:, c0 : c0 + cw])
+        for u in range(1, 6):
+            p = p + ring.mm(xs[u], ws[u][:, c0 : c0 + cw])
+        acc[:, c0 : c0 + cw] = p
+    for u in range(6):
+        give(u)
+    return acc[:, :_N]
+
+
+@pytest.mark.parametrize("dwait_hoist", [False, True])
+@pytest.mark.parametrize(
+    "lazy,rel_fetch", [(False, False), (False, True), (True, True)]
+)
+def test_claim_matches_dmatmul(dwait_hoist: bool, lazy: bool, rel_fetch: bool):
+    """`claim` consumes and refills the stream exactly as `dmatmul` does: same
+    outputs bit for bit, same primitive histogram."""
+    kw = dict(dense_acc_pair=True, dmm_unroll=8, dwait_hoist=dwait_hoist)
+    kw["rel_fetch"] = rel_fetch
+    out0, ref, call0, args = _run(_tiles(**kw), lazy=lazy)
+    out1, _, call1, _ = _run(_tiles(**kw), _claim_layer, lazy=lazy)
+    np.testing.assert_allclose(out0, ref, atol=1e-2, rtol=1e-2)
+    np.testing.assert_array_equal(out1, out0)
+    assert prim_counts(call1, *args) == prim_counts(call0, *args)
+
+
+def test_claim_advances_cursor_and_checks_order():
+    ex = ExecSpec(B=4, T=1, R=1, ctx=128, tiles=_tiles(), interpret=True)
+    ms = ModelSpec(
+        "claim_order",
+        config=FakeGeometry(L=_L, H=_K),
+        layer_type=LayerType("lt", (_WideTileModule(),)),
+    )
+    sp = vmem.build_scratch(ms, ex)[0].stream
+    ring = stream.TwoRing(sp, {}, {})
+    ring.begin_layer(1)
+    g0, _ = ring.claim("w")
+    assert g0 == sp.nt["w"] and ring.cursor == 2 * sp.nt["w"]
+    with pytest.raises(AssertionError, match=r"claim\('w'\) called at layer tile"):
+        ring.claim("w")
+
+
+# ---------------------------------------------------------------------------
+# segment(defer_flush=True): the lazy refill issued later
+# ---------------------------------------------------------------------------
+def _segment_layer(lazy: bool, defer: bool) -> LayerFn:
+    """One segment around `dmatmul('w')`; with `defer`, its refill is issued
+    after other work (a store to `part`)."""
+
+    def layer(ring: stream.TwoRing, scr: dict[str, Any]) -> Any:
+        with ring.segment(lazy=lazy, defer_flush=defer):
+            y = ring.dmatmul("w", scr["xb"], _N)
+        flush = ring.take_deferred_flush() if defer else (lambda: None)
+        scr["part"][:, :_N] = y
+        flush()
+        return scr["part"][:, :_N]
+
+    return layer
+
+
+@pytest.mark.parametrize("lazy,rel_fetch", [(True, False), (True, True), (False, True)])
+def test_deferred_flush_matches_segment_exit(lazy: bool, rel_fetch: bool):
+    """The deferred closure issues exactly the refill the exit would have
+    issued: same outputs bit for bit, same primitive histogram."""
+    kw = dict(dense_acc_pair=True, dmm_unroll=8, rel_fetch=rel_fetch)
+    out0, ref, call0, args = _run(
+        _tiles(**kw), _segment_layer(lazy, False), own_segment=True
+    )
+    out1, _, call1, _ = _run(_tiles(**kw), _segment_layer(lazy, True), own_segment=True)
+    np.testing.assert_allclose(out0, ref, atol=1e-2, rtol=1e-2)
+    np.testing.assert_array_equal(out1, out0)
+    assert prim_counts(call1, *args) == prim_counts(call0, *args)
+
+
+def _host_ring() -> stream.TwoRing:
+    ex = ExecSpec(B=4, T=1, R=1, ctx=128, tiles=_tiles(), interpret=True)
+    ms = ModelSpec(
+        "deferred_flush",
+        config=FakeGeometry(L=_L, H=_K),
+        layer_type=LayerType("lt", (_WideTileModule(),)),
+    )
+    ring = stream.TwoRing(vmem.build_scratch(ms, ex)[0].stream, {}, {})
+    ring.begin_layer(0)
+    return ring
+
+
+def test_deferred_flush_must_be_taken_and_issued_once():
+    ring = _host_ring()
+    with ring.segment(lazy=True, defer_flush=True):
+        pass
+    with pytest.raises(AssertionError, match="never taken"):
+        ring.assert_flushed()
+    with (
+        pytest.raises(AssertionError, match="deferred flush was taken"),
+        ring.segment(lazy=True),
+    ):
+        pass
+
+    ring = _host_ring()
+    with ring.segment(lazy=True, defer_flush=True):
+        pass
+    flush = ring.take_deferred_flush()
+    with pytest.raises(AssertionError, match="never issued"):
+        ring.assert_flushed()
+    with pytest.raises(AssertionError, match="never issued"):
+        ring.begin_layer(1)
+    flush()
+    ring.assert_flushed()
+    with pytest.raises(AssertionError, match="issued twice"):
+        flush()
+    with pytest.raises(AssertionError, match="without a preceding"):
+        ring.take_deferred_flush()
