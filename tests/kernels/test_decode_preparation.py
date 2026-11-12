@@ -250,7 +250,10 @@ def test_swa_word_pool_pack_matches_native(tokens, case):
         records, values, capacity=capacity, padded=padded, interpret=True
     )
     # Fused rows are segment-major (row j * padded + p); native rows are
-    # pair-major (row 4 * p + j). The publisher writes each row independently.
+    # pair-major (row 4 * p + j). The publisher writes each row independently
+    # and reads row r's mask at r % padded, so expand the shared mask rows.
+    assert fused[2].shape == (padded, 128)
+    fused = (fused[0], fused[1], jnp.tile(fused[2], (4, 1)))
     fused = tuple(
         np.asarray(x).reshape(4, padded, -1).swapaxes(0, 1).reshape(4 * padded, -1)
         for x in fused

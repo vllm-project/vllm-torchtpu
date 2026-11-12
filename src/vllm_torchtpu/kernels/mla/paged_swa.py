@@ -115,8 +115,15 @@ def _pack_native(records, values, capacity, page_size):
 
 
 def _publish_packed(banks, ids, words, masks, info, raw):
-    """Read-modify-write packed SWA rows into the word pool on SparseCore."""
+    """Read-modify-write packed SWA rows into the word pool on SparseCore.
+
+    Row r's mask is ``masks[r % len(masks)]``: the fused pack shares one mask
+    row across a pair's four segment-major rows; native masks are per row.
+    """
     lanes, cores = info.num_lanes, info.num_cores * info.num_subcores
+    if ids.size % masks.shape[0] or masks.shape[0] % lanes:
+        raise ValueError("SWA masks must tile the row ids in whole lane blocks")
+    mask_blocks = masks.shape[0] // lanes
     mesh = plsc.VectorSubcoreMesh(
         num_cores=info.num_cores,
         num_subcores=info.num_subcores,
@@ -156,7 +163,9 @@ def _publish_packed(banks, ids, words, masks, info, raw):
             in_specs=(
                 pl.BlockSpec((lanes,), lambda b: (b * cores + core,)),
                 pl.BlockSpec((lanes, 128), lambda b: (b * cores + core, 0)),
-                pl.BlockSpec((lanes, 128), lambda b: (b * cores + core, 0)),
+                pl.BlockSpec(
+                    (lanes, 128), lambda b: ((b * cores + core) % mask_blocks, 0)
+                ),
             ),
         )(ids_ref, values_ref, masks_ref)
 
