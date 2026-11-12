@@ -108,10 +108,12 @@ TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
     256: "4,8,8,2",
 }
 
-# Multi-host TPU slice mesh topologies for TPU v7x / Ironwood, which exposes
-# both cores of a chip as separate devices (8 devices per host). Same meshes
-# as above, addressed by twice as many devices.
+# TPU slice mesh topologies for TPU v7x / Ironwood, which exposes both cores
+# of a chip as separate devices (two devices per chip): a single 2x2x1 host
+# (8 devices, reached via the Ray executor) plus the multi-host meshes above
+# at twice their device counts.
 TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP = {
+    8: "2,2,1,2",
     16: "2,2,2,2",
     32: "2,2,4,2",
     64: "2,4,4,2",

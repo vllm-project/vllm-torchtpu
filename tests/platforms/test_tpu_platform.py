@@ -976,10 +976,14 @@ class TestTpuPlatform:
         assert get_tpu_multihost_topology(128, device_name="TPU v5p") == "4,4,8,2"
         assert get_tpu_multihost_topology(256, device_name="TPU v4") == "4,8,8,2"
 
-        # Test dual-device 3D torus lookup (v7x / Ironwood). Same meshes as
-        # v4 / v5p, but each chip contributes two devices, so a given mesh is
-        # reached at twice the world size. Both spellings of the device name
-        # have to select this map.
+        # Test dual-device 3D torus lookup (v7x / Ironwood): single-host 2x2x1
+        # (8 devices) plus the v4 / v5p meshes at twice the world size (two
+        # devices per chip). Both spellings of the device name and the default
+        # TpuPlatform.get_device_name() fallback have to select this map.
+        assert get_tpu_multihost_topology(8, device_name="TPU v7x") == "2,2,1,2"
+        assert get_tpu_multihost_topology(8, device_name="TPU7x") == "2,2,1,2"
+        monkeypatch.setattr(TpuPlatform, "get_device_name", lambda: "TPU v7")
+        assert get_tpu_multihost_topology(8) == "2,2,1,2"
         assert get_tpu_multihost_topology(16, device_name="TPU v7") == "2,2,2,2"
         assert get_tpu_multihost_topology(32, device_name="TPU7x") == "2,2,4,2"
         assert get_tpu_multihost_topology(64, device_name="TPU v7x") == "2,4,4,2"
