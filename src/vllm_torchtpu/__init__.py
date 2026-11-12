@@ -1674,15 +1674,16 @@ def _patch_vllm_packed_state_group_anchor() -> None:
     state groups at the block size before `block_stride_alignment` rounds it
     up, so part of every DeepSeek-V4.1 v2 SWA block stays empty and the SWA
     layers take extra groups. Rewrites `_get_packed_kv_cache_groups` in place;
-    a no-op once the source no longer has the needle.
+    a no-op once upstream has the fix, and a warning if the source changed
+    without it.
     """
     import inspect
     import textwrap
 
     from vllm.v1.core import kv_cache_utils
 
-    original = getattr(kv_cache_utils, "_get_packed_kv_cache_groups", None)
-    if original is None or getattr(original, "_tpu_state_group_anchor_patch", False):
+    original = kv_cache_utils._get_packed_kv_cache_groups
+    if getattr(original, "_tpu_state_group_anchor_patch", False):
         return
     source = textwrap.dedent(inspect.getsource(original))
     needle = "\n    groups = []\n    for spec, page_size_layers, balanced in bucketed:"
@@ -1691,7 +1692,14 @@ def _patch_vllm_packed_state_group_anchor() -> None:
         anchor_bytes,
         math.lcm(*(s.block_stride_alignment or 1 for s in kv_cache_spec.values())),
     )"""
-    if source.count(needle) != 1 or "anchor_bytes = round_up(" in source:
+    if "anchor_bytes = round_up(" in source:
+        return
+    if source.count(needle) != 1:
+        logger.warning_once(
+            "TPU patch for vllm#67171 not applied: _get_packed_kv_cache_groups "
+            "changed without the fix; DeepSeek-V4.1 v2 SWA groups use fewer "
+            "layers and the KV cache holds fewer tokens."
+        )
         return
     namespace: dict = {}
     exec(

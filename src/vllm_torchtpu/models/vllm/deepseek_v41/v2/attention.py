@@ -1954,7 +1954,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 published = _gather_query_rows(published)[:count]
         if candidate_write:
             if stage_cache is not None:
-                version_key = ("candidate_publication", self.candidate_source_layer)
+                version_key = (
+                    "candidate_publication",
+                    indexer.indexer_op.candidate_source_layer,
+                )
                 stage_cache[version_key] = stage_cache.get(version_key, 0) + 1
             self.candidate_block_buffer.copy_(
                 torch.nn.functional.pad(

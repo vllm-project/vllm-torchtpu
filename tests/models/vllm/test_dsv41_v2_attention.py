@@ -443,3 +443,67 @@ def test_write_encoder_global_kv_empty_metadata(monkeypatch):
 
     # With empty kv_cache or None metadata, does nothing
     attn.write_encoder_global_kv(torch.randn(2, 10), torch.tensor([0, 1]))
+
+
+def test_indexer_adapter_maps_upstream_attn_cls_arguments(monkeypatch):
+    """Upstream builds the scorer through `attn_cls` with its own argument order."""
+    config = SimpleNamespace(candidate_source_layer_id=3)
+    monkeypatch.setattr(
+        v2_attn,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(hf_config=config)),
+    )
+    k_cache = SimpleNamespace(prefix="model.layers.3.self_attn.indexer.k_cache")
+    blocks = torch.zeros(4, 8, dtype=torch.int32)
+
+    def build(candidate_blocks, candidate_write):
+        # As upstream `DeepseekV4Indexer.__init__` calls `self.attn_cls`.
+        return v2_attn.DeepseekV41Indexer.attn_cls(
+            k_cache,
+            128,
+            "ue8m0",
+            512,
+            128,
+            4096,
+            8192,
+            None,
+            skip_k_cache_insert=True,
+            use_fp4_cache=False,
+            compress_ratio=4,
+            candidate_blocks=candidate_blocks,
+            candidate_block_size=64,
+            candidate_write=candidate_write,
+        )
+
+    source = build(blocks, True)
+    assert source.topk_tokens == 512
+    assert source.candidate_blocks is blocks
+    assert source.candidate_block_size == 64
+    assert source.candidate_write
+    assert source.candidate_source_layer == 3
+    dense = build(None, False)
+    assert dense.candidate_source_layer is None
+    assert not dense.candidate_write
+
+
+def test_indexer_forward_q_projects_then_runs_the_query_op(monkeypatch):
+    indexer = v2_attn.DeepseekV41Indexer.__new__(v2_attn.DeepseekV41Indexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.n_head, indexer.head_dim = 2, 4
+    indexer.wq_b = lambda qr: (qr.repeat(1, 2), None)
+    calls = []
+
+    def query_op(q, positions, table, weights):
+        calls.append((q.shape, positions, table, weights))
+        return q + 1, weights * 2
+
+    monkeypatch.setattr(v2_attn.indexer_fp8, "_query_op", query_op)
+    qr = torch.arange(12.0).reshape(3, 4)
+    positions = torch.tensor([0, 1, 2])
+    table = torch.ones(8, 4)
+    weights = torch.ones(3, 2)
+    q, scale, out = indexer.forward_q(qr, None, weights, positions, table)
+    assert calls[0][0] == (3, 2, 4) and calls[0][2] is table
+    torch.testing.assert_close(q, qr.repeat(1, 2).reshape(3, 2, 4) + 1)
+    assert scale is None
+    torch.testing.assert_close(out, weights * 2)
