@@ -30,6 +30,7 @@ every rank gets the same bits.
 
 import dataclasses
 import faulthandler
+import os
 from typing import Any
 
 import jax
@@ -174,6 +175,26 @@ def _gather(obj) -> list:
     return seen
 
 
+# libtpu flags that decide which all-reduces the kernel competes with: below
+# the SparseCore offload minimum, XLA's all-reduce runs on the TensorCore.
+_COLLECTIVE_FLAGS = (
+    "xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
+    "xla_tpu_enable_sparse_core_collective_offload_reduce_scatter",
+    "xla_tpu_enable_sparse_core_hierarchical_all_reduce",
+)
+
+
+def collective_flags(libtpu_args: str) -> dict[str, str]:
+    """The last value of each of _COLLECTIVE_FLAGS in LIBTPU_INIT_ARGS (the
+    one libtpu uses), "default" when absent."""
+    found = dict.fromkeys(_COLLECTIVE_FLAGS, "default")
+    for arg in libtpu_args.split():
+        name, _, value = arg.lstrip("-").partition("=")
+        if name in found:
+            found[name] = value
+    return found
+
+
 def arm(hidden: int, device: torch.device, ordered: bool = False) -> bool:
     """Route the TP group's small bf16 all-reduces through the kernel; returns
     whether it armed. Collective over the TP group. `ordered` also builds the
@@ -207,10 +228,14 @@ def arm(hidden: int, device: torch.device, ordered: bool = False) -> bool:
         op_after=(_make_op(mesh, max_bytes, ordered=True) if ordered else None),
     )
     logger.info(
-        "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views",
+        "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views"
+        " (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES=%d, kernel cap %d); libtpu %s",
         n,
         mesh_index,
         max_bytes,
+        envs.TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES,
+        kernel.MAX_VIEW_BYTES,
+        collective_flags(os.environ.get("LIBTPU_INIT_ARGS", "")),
     )
     return True
 
