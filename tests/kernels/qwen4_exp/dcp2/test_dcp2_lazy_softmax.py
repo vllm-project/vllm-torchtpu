@@ -23,8 +23,22 @@ import sys
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
-from dcp2_harness import (
+
+try:
+    import pytest
+except ImportError:  # `python3 file.py` on an image without pytest (exos)
+    import types
+
+    def _identity(*args, **kwargs):
+        return lambda fn: fn
+
+    pytest = types.ModuleType("pytest")
+    pytest.mark = types.SimpleNamespace(skipif=_identity, parametrize=_identity)
+    pytest.fixture = lambda *a, **k: (a[0] if a and callable(a[0]) else _identity())
+    sys.modules["pytest"] = pytest  # for test_dcp2_prefill's import
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dcp2_harness import (  # noqa: E402
     D,
     ON_TPU,
     TPU_TOL,
@@ -35,7 +49,10 @@ from dcp2_harness import (
     reference_attend,
     reference_metadata,
 )
-from test_dcp2_prefill import check_production_prefill, production_prefill_attend
+from test_dcp2_prefill import (  # noqa: E402
+    check_production_prefill,
+    production_prefill_attend,
+)
 
 pytestmark = pytest.mark.skipif(not ON_TPU, reason="DCP2_HARNESS_DEVICE=tpu only")
 
