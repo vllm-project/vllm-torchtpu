@@ -90,6 +90,26 @@ DEFAULTS: dict[str, bool | int | str] = {
     # gmm_v2 decode-sized gate_up / down calls:
     # "<tile_n>:<gate_up buffers>[:<down buffers>]" ("" = off). Same bits.
     "gmm_v2_decode_w13": "",
+    # MiniMax M3 MSA attention, r6's lse kernel only (minimax_msa_lse_r6;
+    # `msa_attention_lse_r6`), prefill-sized calls: a 12-page step width;
+    # step widths outright ("<w>/<w>/...", overrides width12); a per-call
+    # VMEM page cache of this many slots for 4-bit caches (0 = off); the
+    # tile-union pages it covers (0 = 32); the cache unpacked to bf16 once;
+    # each group in n parts of the query heads (0 or 1 = off). All bitwise.
+    "minimax_msa_prefill_width12": False,
+    "minimax_msa_prefill_widths": "",
+    "minimax_msa_prefill_page_cache": 0,
+    "minimax_msa_prefill_page_cache_tile_pages": 0,
+    "minimax_msa_prefill_page_cache_bf16": False,
+    "minimax_msa_prefill_row_split": 0,
+    # Same kernel, prefill tile tokens / group pages (0 = 16 each). Not
+    # bitwise (another summation order / group split).
+    "minimax_msa_prefill_block_q": 0,
+    "minimax_msa_prefill_pages_per_step": 0,
+    # Same kernel, decode batches: the work list by one Pallas kernel; every
+    # KV head in one kernel call. Bitwise.
+    "minimax_msa_decode_work_list_kernel": False,
+    "minimax_msa_decode_one_call": False,
 }
 
 

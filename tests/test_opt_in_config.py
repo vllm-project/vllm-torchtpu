@@ -46,6 +46,18 @@ REPLACED_ENV = {
     "minimax_indexer_large_pages_per_step": "TPU_MINIMAX_M3_INDEXER_LARGE_PAGES_PER_STEP",
     "gmm_v2_prefill_tiles": "TPU_GMM_V2_PREFILL_TILES",
     "gmm_v2_decode_w13": "TPU_GMM_V2_DECODE_W13",
+    "minimax_msa_prefill_width12": "TPU_MINIMAX_M3_MSA_PREFILL_WIDTH12",
+    "minimax_msa_prefill_widths": "TPU_MINIMAX_M3_MSA_PREFILL_WIDTHS",
+    "minimax_msa_prefill_page_cache": "TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE",
+    "minimax_msa_prefill_page_cache_tile_pages": (
+        "TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_TILE_PAGES"
+    ),
+    "minimax_msa_prefill_page_cache_bf16": "TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_BF16",
+    "minimax_msa_prefill_row_split": "TPU_MINIMAX_M3_MSA_PREFILL_ROW_SPLIT",
+    "minimax_msa_prefill_block_q": "TPU_MINIMAX_M3_MSA_PREFILL_BLOCK_Q",
+    "minimax_msa_prefill_pages_per_step": "TPU_MINIMAX_M3_MSA_PREFILL_PAGES_PER_STEP",
+    "minimax_msa_decode_work_list_kernel": "TPU_MINIMAX_M3_MSA_DECODE_WORK_LIST_KERNEL",
+    "minimax_msa_decode_one_call": "TPU_MINIMAX_M3_MSA_DECODE_ONE_CALL",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -53,6 +65,12 @@ SAMPLE = {
     "minimax_indexer_large_pages_per_step": 64,
     "gmm_v2_prefill_tiles": "256:128/256@12288",
     "gmm_v2_decode_w13": "3072:2:2",
+    "minimax_msa_prefill_widths": "4/8/12",
+    "minimax_msa_prefill_page_cache": 512,
+    "minimax_msa_prefill_page_cache_tile_pages": 64,
+    "minimax_msa_prefill_row_split": 2,
+    "minimax_msa_prefill_block_q": 8,
+    "minimax_msa_prefill_pages_per_step": 8,
 }
 # Dropped with no key: hid the offload connector from draft forwards, which
 # v3's skip_draft_kv unbinding already covers in every served config.
@@ -116,6 +134,41 @@ def test_indexer_large_pages_per_step_key():
     finally:
         kernel_toggles.apply({})
     assert msa_indexer.LARGE_PAGES_PER_STEP == msa_indexer.DEFAULT_PAGES_PER_STEP == 32
+
+
+def test_r6_prefill_and_decode_keys():
+    from vllm_torchtpu.models.minimax_m3 import kernel_toggles
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse_r6 as r6
+
+    try:
+        kernel_toggles.apply(
+            {
+                "minimax_msa_lse_r6": True,
+                "minimax_msa_prefill_page_cache": 512,
+                "minimax_msa_prefill_page_cache_tile_pages": 64,
+                "minimax_msa_prefill_widths": "4/8/12",
+                "minimax_msa_decode_one_call": True,
+            }
+        )
+        assert r6.PREFILL_PAGE_CACHE_SLOTS == 512
+        assert r6.PAGE_CACHE_TILE_PAGES == 64
+        assert r6.PREFILL_STEP_WIDTHS == (4, 8, 12)
+        assert r6.DECODE_ONE_CALL is True
+        assert r6.prefill_options(True) == {
+            "step_widths": (4, 8, 12),
+            "page_cache_slots": 512,
+        }
+        kernel_toggles.apply({"minimax_msa_prefill_width12": True})
+        assert r6.PREFILL_STEP_WIDTHS == (4, 8, 12)
+        kernel_toggles.apply({"minimax_msa_prefill_widths": "2,4,6,8,12"})
+        assert r6.PREFILL_STEP_WIDTHS == (2, 4, 6, 8, 12)
+        with pytest.raises(ValueError, match="minimax_msa_prefill_page_cache"):
+            kernel_toggles.apply({"minimax_msa_prefill_page_cache": -1})
+    finally:
+        kernel_toggles.apply({})
+    assert r6.prefill_options(True) == {}
+    assert (r6.PREFILL_ROW_SPLIT, r6.PAGE_CACHE_TILE_PAGES) == (1, 32)
+    assert r6.DECODE_ONE_CALL is False and r6.DECODE_WORK_LIST_KERNEL is False
 
 
 def test_kernel_toggles_set_the_module_flags_their_env_vars_set():
@@ -218,3 +271,4 @@ def test_split_guard_refuses_split_keys(config):
 
     with pytest.raises(ValueError, match="leak data across requests"):
         check_split_disabled(config)
+

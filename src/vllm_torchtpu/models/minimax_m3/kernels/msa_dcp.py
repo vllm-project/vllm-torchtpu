@@ -51,6 +51,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_attention,
     msa_attention_lse,
+    msa_attention_lse_r6,
     msa_fp4,
     msa_indexer,
     msa_select,
@@ -1710,10 +1711,17 @@ def msa_attend_dcp(
         pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
         interpret=interpret,
     )
+    lse_kernel = msa_attention_lse
+    if msa_attention_lse.R6_KERNEL:
+        # r6's kernel (key minimax_msa_lse_r6) takes its opt-in prefill knobs
+        # on prefill-sized steps only; none is passed while they are unset.
+        lse_kernel = msa_attention_lse_r6
+        if num_tokens >= _MIN_CANDIDATE_TOKENS:
+            common.update(msa_attention_lse_r6.prefill_options(scale_cache is not None))
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
     if scale_cache is not None:
         if num_heads == 1:
-            return msa_attention_lse.msa_sparse_attention_lse(
+            return lse_kernel.msa_sparse_attention_lse(
                 q,
                 kv_cache,
                 keys[:, 0],
@@ -1724,14 +1732,14 @@ def msa_attend_dcp(
                 **msa._fp4_attention_kwargs(scale_cache),
             )
         # KV head h's K / V scales are scale-page rows 2h / 2h + 1.
-        return msa_attention_lse.msa_sparse_attention_lse_heads(
+        return lse_kernel.msa_sparse_attention_lse_heads(
             q, kv_cache, keys, *args, head_major=True, **common, scale_cache=scale_cache
         )
     if num_heads == 1:
-        return msa_attention_lse.msa_sparse_attention_lse(
+        return lse_kernel.msa_sparse_attention_lse(
             q, kv_cache, keys[:, 0], *args, head=0, head_major=True, **common
         )
     # One kernel for all the group's KV heads (the head is a kernel input).
-    return msa_attention_lse.msa_sparse_attention_lse_heads(
+    return lse_kernel.msa_sparse_attention_lse_heads(
         q, kv_cache, keys, *args, head_major=True, **common
     )
