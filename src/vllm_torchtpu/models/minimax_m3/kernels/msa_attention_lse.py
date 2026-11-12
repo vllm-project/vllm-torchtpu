@@ -21,16 +21,33 @@ output; the work list, page unpacking and masking are shared with it.
 
 import functools
 import math
+import os
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
+
+logger = init_logger(__name__)
 
 # Page counts a kernel step may run at besides the full group (`_kernel`).
 _STEP_WIDTHS = (4, 8)
+# With TPU_MINIMAX_M3_MSA_PREFILL_WIDTH12=1, prefill-sized calls
+# (`msa_dcp.msa_attend_dcp`) also run 9-12-page groups at a 12-page width
+# instead of the full 16: a quarter fewer score columns for those groups.
+PREFILL_STEP_WIDTHS = (
+    (4, 8, 12)
+    if os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_WIDTH12", "0") == "1"
+    else _STEP_WIDTHS
+)
+if PREFILL_STEP_WIDTHS != _STEP_WIDTHS:
+    logger.info(
+        "TPU_MINIMAX_M3_MSA_PREFILL_WIDTH12=1: MSA prefill attention step widths %s.",
+        PREFILL_STEP_WIDTHS,
+    )
 # Tiles per grid step: a step runs the groups of this many tiles in a loop.
 # One step per group paid a per-step cost worth ~2-3% of the call (pool48
 # selections, 1-2 groups a tile; bench j-caec1354).
@@ -66,6 +83,7 @@ def _kernel(
     tiles_per_step: int = 1,
     groups_per_tile: int = 1,
     transposed: bool = False,
+    step_widths: tuple[int, ...] = _STEP_WIDTHS,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -371,7 +389,7 @@ def _kernel(
         # standalone j-952e8a64), and a 16-token tile's union is ~8-12 of its
         # rank's pages at DCP 2, ~2-8 at DCP 8.
         single = first & last
-        widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
+        widths = [n for n in step_widths if n < pages_per_step] + [pages_per_step]
         for i, width in enumerate(widths):
             fits = count > (widths[i - 1] if i else 0)
             if width < pages_per_step:
@@ -416,6 +434,7 @@ def _attention_call(
     interpret,
     scale_cache=None,
     scale_rows=None,
+    step_widths=_STEP_WIDTHS,
 ):
     """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
     head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
@@ -532,6 +551,7 @@ def _attention_call(
             tiles_per_step=tiles_per_step,
             groups_per_tile=groups_per_tile,
             transposed=transposed,
+            step_widths=step_widths,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -618,6 +638,7 @@ def _chunked_call(
     scale_cache=None,
     scale_rows=None,
     head_major=False,
+    step_widths=_STEP_WIDTHS,
 ):
     """`_attention_call` per KV head and chunk of at most
     `MAX_TOKENS_PER_CALL` tokens (the work list lives in SMEM).
@@ -649,6 +670,7 @@ def _chunked_call(
         interpret=interpret,
         scale_cache=scale_cache,
         scale_rows=scale_rows,
+        step_widths=step_widths,
     )
     limit = msa_attention.MAX_TOKENS_PER_CALL
     step = min(num_tokens, max(block_q, limit - limit % block_q))
@@ -737,6 +759,7 @@ def _check_rows(kv_cache, head_dim, head=None):
         "v_scale_row",
         "interpret",
         "head_major",
+        "step_widths",
     ),
 )
 def msa_sparse_attention_lse(
@@ -756,6 +779,7 @@ def msa_sparse_attention_lse(
     v_scale_row: int = 1,
     interpret: bool = False,
     head_major: bool = False,
+    step_widths: tuple[int, ...] = _STEP_WIDTHS,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
     by `page_table`) returning ``(out [T, H, D], lse [T, H] f32)``.
@@ -789,6 +813,7 @@ def msa_sparse_attention_lse(
         scale_cache=scale_cache,
         scale_rows=None if scale_cache is None else (k_scale_row, v_scale_row),
         head_major=head_major,
+        step_widths=step_widths,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
@@ -803,6 +828,7 @@ def msa_sparse_attention_lse(
         "pages_per_step",
         "interpret",
         "head_major",
+        "step_widths",
     ),
 )
 def msa_sparse_attention_lse_heads(
@@ -819,6 +845,7 @@ def msa_sparse_attention_lse_heads(
     scale_cache: jax.Array | None = None,
     interpret: bool = False,
     head_major: bool = False,
+    step_widths: tuple[int, ...] = _STEP_WIDTHS,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_sparse_attention_lse` for every KV head of the cache rows at once.
 
@@ -861,6 +888,7 @@ def msa_sparse_attention_lse_heads(
         scale_cache=scale_cache,
         scale_rows=None if scale_cache is None else "head",
         head_major=head_major,
+        step_widths=step_widths,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
