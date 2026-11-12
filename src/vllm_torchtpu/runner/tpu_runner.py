@@ -14,8 +14,6 @@
 
 # Ensure environment overrides are applied before any other imports,
 # especially torch_tpu which might read them at import time.
-import functools
-
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import bisect
@@ -29,7 +27,7 @@ from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Concatenate, cast
+from typing import TYPE_CHECKING, Any, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -103,9 +101,11 @@ from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
-from vllm_torchtpu.distributed.pp_push import ring_handoff
-from vllm_torchtpu.distributed.pp_ring import PPRing, hbm_reserve_bytes
-from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
+from vllm_torchtpu.distributed.pp_buffered import (
+    PPBuffered,
+    hbm_reserve_bytes,
+    pp_rank_flags,
+)
 from vllm_torchtpu.gdn_pool_layout import (
     PrefillCheckpointUnits,
     prefill_checkpoint_enabled,
@@ -422,23 +422,6 @@ def _substitute_placeholder_token(
 logger = init_logger(__name__)
 
 
-def _pp_step[**P, R](
-    method: Callable[Concatenate[Any, P], R],
-) -> Callable[Concatenate[Any, P], R]:
-    """Brackets a runner call that traces device ops with the pipeline wave's
-    step."""
-
-    @functools.wraps(method)
-    def wrapper(self: Any, *args: P.args, **kwargs: P.kwargs) -> R:
-        wave = self._pp_wave
-        if wave is None:
-            return method(self, *args, **kwargs)
-        with wave.step():
-            return method(self, *args, **kwargs)
-
-    return wrapper
-
-
 def _rotate_precompile_sweep(items: Collection[Any], sweep: str) -> list[Any]:
     """Start this local rank at its own share of a precompile sweep.
 
@@ -673,8 +656,8 @@ class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     input_ids: torch.Tensor
     empty_slot_mappings: dict[int, torch.Tensor]
-    # Defaults for a runner built without __init__.
-    _pp_wave: PPWave | PPRing | None = None
+    # Default for a runner built without __init__.
+    _pp_handoff: PPBuffered | None = None
     _dp_step_other_decode: bool = False
     _adaptive_verification: AdaptiveVerificationManager | None = None
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
@@ -1154,9 +1137,9 @@ class TPUModelRunner(GPUModelRunner):
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
 
-        # Hand-off between stages (TPU_PP_HANDOFF); built in capture_model,
+        # Hand-off between stages (pp_buffered); built in capture_model,
         # where every stage reaches the same point.
-        self._pp_wave = None
+        self._pp_handoff = None
         # A sparse model's shared top-k index table, when this stage's layers
         # cannot all recompute it; set at load time under a pipeline.
         self._pp_topk_buffer: torch.Tensor | None = None
@@ -4151,7 +4134,6 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     @torch.no_grad()
-    @_pp_step
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4216,10 +4198,10 @@ class TPUModelRunner(GPUModelRunner):
         )
         if readmitted is not None:
             scheduler_output, num_decode_reqs, num_windowed_reqs = readmitted
-        if isinstance(self._pp_wave, PPRing) and not self._pp_is_first:
+        if self._pp_handoff is not None and not self._pp_is_first:
             # Post this step's receives first, so the previous stage can send
             # while this one prepares its inputs.
-            self._pp_wave.begin_step(self._pp_forward_rows(scheduler_output))
+            self._pp_handoff.begin_step(self._pp_forward_rows(scheduler_output))
 
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
@@ -4418,8 +4400,8 @@ class TPUModelRunner(GPUModelRunner):
             num_tokens_padded = sizing_input.shape[0]
             self._token_padding_update(num_tokens_padded)
             intermediate_tensors = None
-            if self._pp_wave is not None:
-                intermediate_tensors = self._pp_wave.start_forward(num_tokens_padded)
+            if self._pp_handoff is not None:
+                intermediate_tensors = self._pp_handoff.start_forward(num_tokens_padded)
                 self._pp_take_topk_indices(intermediate_tensors, num_tokens_padded)
 
             trace_kwargs: dict[str, Any] = {}
@@ -4505,16 +4487,16 @@ class TPUModelRunner(GPUModelRunner):
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
                 # happen on the last stage.
-                assert self._pp_wave is not None
-                self._pp_wave.end_forward(
+                assert self._pp_handoff is not None
+                self._pp_handoff.end_forward(
                     self._pp_outgoing_tensors(hidden_states.tensors, num_tokens_padded),
                     num_tokens_padded,
                 )
                 start_index = end_index
                 chunk_index += 1
                 continue
-            if self._pp_wave is not None:
-                self._pp_wave.end_forward(None, num_tokens_padded)
+            if self._pp_handoff is not None:
+                self._pp_handoff.end_forward(None, num_tokens_padded)
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
             layout_plan = self._last_sequence_layout_plan
@@ -5159,7 +5141,6 @@ class TPUModelRunner(GPUModelRunner):
             apply_topk_topp=self._sampler_applies_topk_topp(),
         )
 
-    @_pp_step
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -6132,7 +6113,6 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_kernels_initialized = True
 
     @torch.no_grad()
-    @_pp_step
     def _dummy_run(
         self,
         num_tokens: int,
@@ -6160,8 +6140,7 @@ class TPUModelRunner(GPUModelRunner):
 
         With ``through_handoff`` a pipeline stage takes its input from the
         hand-off and passes its output on, as a serving step does; every
-        stage must then run the same sequence of forwards, and the caller
-        settles the hand-off afterwards.
+        stage must then run the same sequence of forwards.
         """
         # Same fence discipline as a serving chunk: release the previous
         # chunk's host sources, then fence this one's before its forward.
@@ -6333,8 +6312,8 @@ class TPUModelRunner(GPUModelRunner):
         self._record_input_staging_fence()
         intermediate_tensors = None
         if through_handoff:
-            assert self._pp_wave is not None and not profiling
-            intermediate_tensors = self._pp_wave.start_forward(num_tokens)
+            assert self._pp_handoff is not None and not profiling
+            intermediate_tensors = self._pp_handoff.start_forward(num_tokens)
             self._pp_take_topk_indices(intermediate_tensors, num_tokens)
         elif not self._pp_is_first:
             intermediate_tensors = self._pp_intermediate_tensors(
@@ -6378,10 +6357,10 @@ class TPUModelRunner(GPUModelRunner):
             )
             if isinstance(out, IntermediateTensors):
                 if through_handoff:
-                    # The output leaves padded to the hand-off buffer; it is
+                    # The output leaves at the bucket's row count; it is
                     # submitted without waiting, as between serving steps.
-                    assert self._pp_wave is not None
-                    self._pp_wave.end_forward(
+                    assert self._pp_handoff is not None
+                    self._pp_handoff.end_forward(
                         self._pp_outgoing_tensors(out.tensors, num_tokens), num_tokens
                     )
                     synchronize_tensors(None, wait=False)
@@ -6391,8 +6370,8 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(list(out.tensors.values()))
                 return (time.perf_counter() - started) * 1000.0 if profiling else None
             if through_handoff:
-                assert self._pp_wave is not None
-                self._pp_wave.end_forward(None, num_tokens)
+                assert self._pp_handoff is not None
+                self._pp_handoff.end_forward(None, num_tokens)
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
@@ -6613,11 +6592,12 @@ class TPUModelRunner(GPUModelRunner):
             extra,
         )
 
-    def profile_pipeline_chunks(self) -> dict[str, Any]:
-        """Time this stage's forward at the points the pipeline chunk
-        scheduler fits its step cost model from. Returns the chunk
-        granularity and (tokens, prefix, ms) samples."""
-        from vllm_torchtpu.core.pp_chunks import chunk_pairs, profile_points
+    def pipeline_chunk_limits(self) -> dict[str, Any]:
+        """The chunk granularity and the batched attention kernel's
+        (pairs, bq, bkv) schedule capacity the pipeline chunk scheduler
+        sizes chunks with. Refuses a full step from one request that would
+        overrun the kernel's SMEM schedule."""
+        from vllm_torchtpu.core.pp_chunks import chunk_pairs
 
         capacity = self._attention_schedule_capacity()
         schedule = None if capacity is None else capacity["mixed"]
@@ -6636,10 +6616,22 @@ class TPUModelRunner(GPUModelRunner):
         # a step of that many rows per rank is pcp times as long, and the
         # scheduler sizes steps in tokens.
         pcp = self.parallel_config.prefill_context_parallel_size
+        granularity = self._pp_chunk_granularity
+        assert granularity is not None
+        return {"granularity": int(granularity) * pcp, "schedule": schedule}
+
+    def profile_pipeline_chunks(self) -> dict[str, Any]:
+        """Time this stage's forward at the points the pipeline chunk
+        scheduler fits its step cost model from. Returns the chunk limits
+        (`pipeline_chunk_limits`) and (tokens, prefix, ms) samples."""
+        from vllm_torchtpu.core.pp_chunks import profile_points
+
+        limits = self.pipeline_chunk_limits()
+        pcp = self.parallel_config.prefill_context_parallel_size
         step = self.scheduler_config.max_num_batched_tokens
         buckets = [b for b in self.num_tokens_paddings if b * pcp <= step]
         points = profile_points(
-            buckets, self.max_num_tokens, self.max_model_len, schedule
+            buckets, self.max_num_tokens, self.max_model_len, limits["schedule"]
         )
         samples = []
         started = time.perf_counter()
@@ -6664,14 +6656,7 @@ class TPUModelRunner(GPUModelRunner):
             time.perf_counter() - started,
             ", ".join(f"{t}+{p}: {ms:.1f} ms" for t, p, ms in samples),
         )
-        granularity = self._pp_chunk_granularity
-        assert granularity is not None
-        return {
-            # The scheduler sizes steps in tokens, like the samples above.
-            "granularity": int(granularity) * pcp,
-            "samples": samples,
-            "schedule": schedule,
-        }
+        return {**limits, "samples": samples}
 
     def _spec_verify_bucket_reachable(self, num_tokens: int, num_reqs: int) -> bool:
         """Whether a spec-decode verify step can land in this bucket pair.
@@ -7256,11 +7241,10 @@ class TPUModelRunner(GPUModelRunner):
                 logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs)
 
     def pp_handoff_hbm_reserve_bytes(self) -> int:
-        """Device memory the ring hand-off's buffers can take beyond the
-        model and the KV cache, allocated after profile_run
-        (``pp_ring.hbm_reserve_bytes``); 0 without a pipeline or with the
-        wave."""
-        if self.parallel_config.pipeline_parallel_size <= 1 or not ring_handoff():
+        """Device memory the buffered hand-off's buffers can take beyond
+        the model and the KV cache, allocated after profile_run
+        (``pp_buffered.hbm_reserve_bytes``); 0 without a pipeline."""
+        if self.parallel_config.pipeline_parallel_size <= 1:
             return 0
         from vllm_torchtpu.core.pp_chunk_scheduler import uses_dynamic_chunks
         from vllm_torchtpu.core.pp_chunks import chunk_buckets, chunk_granularity
@@ -7268,10 +7252,10 @@ class TPUModelRunner(GPUModelRunner):
         if self._pp_intermediate_template is None:
             self._pp_intermediate_tensors(1, zeros=True)
         assert self._pp_intermediate_template is not None
-        # The ring keeps a zero residual per token bucket a forward is padded
-        # to. The chunk buckets join the paddings once the KV block size is
-        # final (_add_pipeline_chunk_buckets); counted at the finest granule
-        # here, they bound that sum from above.
+        # The buffered hand-off keeps a zero residual per token bucket a
+        # forward is padded to. The chunk buckets join the paddings once the
+        # KV block size is final (_add_pipeline_chunk_buckets); counted at the
+        # finest granule here, they bound that sum from above.
         rows = set(self.num_tokens_paddings)
         if uses_dynamic_chunks(self.vllm_config):
             granularity = chunk_granularity(
@@ -7281,14 +7265,14 @@ class TPUModelRunner(GPUModelRunner):
         return hbm_reserve_bytes(
             self.max_num_tokens,
             self._pp_intermediate_template,
-            envs.TPU_PP_RING_DEPTH,
+            envs.TPU_PP_HANDOFF_DEPTH,
             sum(rows),
         )
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
         self._add_pipeline_chunk_buckets()
-        if self.parallel_config.pipeline_parallel_size > 1 and self._pp_wave is None:
+        if self.parallel_config.pipeline_parallel_size > 1 and self._pp_handoff is None:
             self._pp_intermediate_tensors(1, zeros=True)
             assert self._pp_intermediate_template is not None
             if (
@@ -7300,18 +7284,13 @@ class TPUModelRunner(GPUModelRunner):
                     f"{self._pp_topk_buffer.shape[0]} rows, fewer than the "
                     f"{self.max_num_tokens} tokens a hand-off carries"
                 )
-            if ring_handoff():
-                self._pp_wave = PPRing(
-                    self.device,
-                    self.max_num_tokens,
-                    self._pp_intermediate_template,
-                    depth=envs.TPU_PP_RING_DEPTH,
-                )
-            else:
-                self._pp_wave = PPWave(
-                    self.device, self.max_num_tokens, self._pp_intermediate_template
-                )
-            self._pp_wave.warmup()
+            self._pp_handoff = PPBuffered(
+                self.device,
+                self.max_num_tokens,
+                self._pp_intermediate_template,
+                depth=envs.TPU_PP_HANDOFF_DEPTH,
+            )
+            self._pp_handoff.warmup()
         if self.enforce_eager:
             return
         if self.lora_config is not None:
@@ -7409,11 +7388,7 @@ class TPUModelRunner(GPUModelRunner):
 
         Under a pipeline every stage runs the synthetic prefills, since the
         last stage's forward takes its input from the hand-off, and there is
-        no retry: a stage retrying alone would leave the others waiting. A
-        stage's output leaves it on its next launch (see ``PPWave``), and
-        one forward alone has none, so each stage settles the burst right
-        after each forward; those launches carry the prefill on to the last
-        stage, whose forward waits for it.
+        no retry: a stage retrying alone would leave the others waiting.
         """
         if not envs.SPEC_WARMUP:
             return
@@ -7434,12 +7409,7 @@ class TPUModelRunner(GPUModelRunner):
         ):
             for P in prompt_lens:
                 if pipeline:
-                    assert self._pp_wave is not None
-                    try:
-                        warmed = self._warmup_one_mtp_prefill(P)
-                    finally:
-                        self._pp_wave.settle()
-                    if not warmed:
+                    if not self._warmup_one_mtp_prefill(P):
                         raise RuntimeError(
                             f"MTP prefill warmup failed at P={P}; refusing to "
                             "start a producer whose first live proposal would "
@@ -7577,7 +7547,7 @@ class TPUModelRunner(GPUModelRunner):
         if trace_first:
             for num_tokens in self.num_tokens_paddings:
                 self._backbone_dummy_runs(num_tokens)
-        if self._pp_wave is not None:
+        if self._pp_handoff is not None:
             self._warmup_handoff_forwards()
 
     def _backbone_dummy_runs(self, num_tokens: int) -> None:
@@ -7601,15 +7571,15 @@ class TPUModelRunner(GPUModelRunner):
     def _warmup_handoff_forwards(self) -> None:
         """Run every token bucket once through the pipeline hand-off.
 
-        A stage's serving forward reads a slice of the received buffer and
-        pads its output into the sent one, and those ops fuse with the
-        forward's first and last programs; the standalone pass above leaves
+        A stage's serving forward reads the tensors it received and sums
+        the ones it hands on, and those ops fuse with the forward's first
+        and last programs; the standalone pass above leaves
         them to compile at the first serving step of each bucket, with every
         stage waiting. The stages run this pass in step, so it comes after
         the standalone pass, where each stage compiles its backbone on its
         own.
         """
-        assert self._pp_wave is not None
+        assert self._pp_handoff is not None
         started = time.perf_counter()
         for num_tokens in self.num_tokens_paddings:
             self._dummy_run(
@@ -7629,7 +7599,6 @@ class TPUModelRunner(GPUModelRunner):
                     use_max_model_len=False,
                     through_handoff=True,
                 )
-        self._pp_wave.settle()
         synchronize_device()
         logger.info(
             "Pipeline hand-off warmup: %d buckets in %.1f s",
@@ -8807,18 +8776,6 @@ class TPUModelRunner(GPUModelRunner):
         if self._pp_topk_buffer is None:
             return tensors
         return {**tensors, _TOPK_INDICES: self._pp_topk_buffer[:rows].clone()}
-
-    def pp_push(self) -> None:
-        """A pipeline hand-off that carries nothing, so the forwards in
-        flight move one stage further; a no-op without a pipeline."""
-        if self._pp_wave is not None:
-            self._pp_wave.push()
-
-    def pp_settle(self) -> None:
-        """Close the pipeline hand-off burst once nothing is in flight; a
-        no-op without a pipeline."""
-        if self._pp_wave is not None:
-            self._pp_wave.settle()
 
     def _sample_tokens_pp_intermediate_stage(self) -> ModelRunnerOutput:
         """Sampling runs on the last stage only; earlier stages report just

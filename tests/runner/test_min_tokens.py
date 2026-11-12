@@ -607,7 +607,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             )
         },
         _pre_async_results=None,
-        _pp_wave=None,
+        _pp_handoff=None,
         _dp_step_other_decode=False,
         _min_tokens=min_tokens.MinTokensTracker(),
         speculative_config=None,
