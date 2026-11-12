@@ -24,6 +24,8 @@ from vllm.distributed import get_tp_group
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.minimax_m3 import dcp_pack
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_dcp,
@@ -39,6 +41,53 @@ _SHARD_INDEX_CACHE_ARG = 5
 # 4-bit caches (`msa_fp4`): the scale cache follows the index cache.
 _SCALE_CACHE_ARG = 7
 _DCP_SCALE_CACHE_ARG = 6
+
+logger = init_logger(__name__)
+
+
+def _packed_merge(num_tokens: int) -> bool:
+    """Whether a DCP step of `num_tokens` merges with one packed all-to-all
+    (``TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS``). Compared while tracing:
+    the backbone is re-traced per token-bucket group."""
+    return 0 < num_tokens <= envs.TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS
+
+
+def _packed_gather(num_tokens: int) -> bool:
+    """Whether a DCP step of `num_tokens` gathers its query heads and
+    candidates in one all-gather (``TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS``)."""
+    return 0 < num_tokens <= envs.TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS
+
+
+# The packed merge's XLA fusion fence, built by the op builder: building a
+# `pallas.jax_op` inside the compiled forward fails under Dynamo.
+_FENCE: list[Callable[[torch.Tensor], torch.Tensor] | None] = [None]
+
+
+def _log_packed_collectives() -> None:
+    """Once per process, from the op builders (outside the traced forward:
+    a logging call under Dynamo breaks the graph); also builds `_FENCE`."""
+    merge = envs.TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS
+    gather = envs.TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS
+    if merge and _FENCE[0] is None:
+        from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (
+            optimization_barrier_op,
+        )
+
+        _FENCE[0] = optimization_barrier_op()
+    if merge:
+        logger.info_once(
+            "TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS=%d: MSA DCP partials merge "
+            "with one packed all-to-all on steps of at most %d tokens.",
+            merge,
+            merge,
+        )
+    if gather:
+        logger.info_once(
+            "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS=%d: MSA DCP query heads "
+            "and candidates share one all-gather on steps of at most %d tokens.",
+            gather,
+            gather,
+        )
 
 
 @functools.cache
@@ -403,7 +452,16 @@ def merge_head_partials(
     cache's `hadamard`, unrotated: the rotation is linear, so the merged sum
     unrotates as its terms would, up to bf16 rounding order). The MSA merge
     always reduce-scatters: `TPU_DCP_LSE_MERGE_A2A` (the MLA merge's
-    all-to-all for small steps) does not apply here."""
+    all-to-all for small steps) does not apply here; steps of at most
+    ``TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS`` tokens take one packed
+    all-to-all instead (`dcp_pack.merge_head_partials_all_to_all`)."""
+    if _packed_merge(out.shape[1]):
+        merged = dcp_pack.merge_head_partials_all_to_all(
+            out, lse, group, _all_to_all, envs.TPU_DCP_RS_OUT_PRECISION, _FENCE[0]
+        )
+        if hadamard is not None:
+            merged = _rotate_heads(merged, hadamard)
+        return merged.transpose(0, 1)
     # The LSEs cross the all-gather token-major ([T, H], as the MLA merge
     # sends them): gathered head-major they took 2x as long (c48 / c64
     # twins, j-fe812c28, j-c5c4bdfc).
@@ -507,6 +565,7 @@ def get_msa_dcp_op(
             "must divide one another."
         )
     kv_heads = max(1, dcp // kv_head_replicas)
+    _log_packed_collectives()
     if fp4:
         return _get_msa_dcp_fp4_op(
             sm_scale,
@@ -613,7 +672,10 @@ def get_msa_dcp_op(
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
-        if kv_heads == 1:
+        packed = kv_heads == 1 and _packed_gather(q.shape[0])
+        if packed:
+            q_all = None
+        elif kv_heads == 1:
             q_all = gather_query_heads(q, group)
         else:
             q_all, k, v, index_q = gather_group_heads(
@@ -634,7 +696,12 @@ def get_msa_dcp_op(
         )
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
-        candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+        if packed:
+            q_all, candidates = dcp_pack.gather_queries_and_candidates(
+                q.contiguous(), candidates, group
+            )
+        else:
+            candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
         out, lse = attend_op(
             q_all,
             kv_cache,
@@ -914,12 +981,18 @@ def _get_msa_dcp_fp4_op(
                 metadata.query_start_loc,
                 metadata.request_distribution,
             )
-        candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
-        if q_all is None:
-            q_all = gather_query_heads(q, group)
+        if q_all is None and _packed_gather(q.shape[0]):
+            q_all, candidates = dcp_pack.gather_queries_and_candidates(
+                q, candidates, group
+            )
             attend = attend_op
         else:
-            attend = attend_rot_op
+            candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+            if q_all is None:
+                q_all = gather_query_heads(q, group)
+                attend = attend_op
+            else:
+                attend = attend_rot_op
         out, lse = attend(
             q_all,
             kv_cache,
