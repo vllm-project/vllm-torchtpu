@@ -396,6 +396,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STAGED_WALK_STACKED: bool = False
     VLLM_TPU_WARMED_SUBSTITUTE_SOURCE: bool = False
     VLLM_TPU_PROPOSE_DEVICE_CONSTANTS: bool = False
+    VLLM_TPU_DRAFT_SHARD_ARGMAX: bool = False
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_SAMPLER_CANDIDATES_ONLY: bool = False
@@ -2451,6 +2452,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MTP propose: upload per-request-count constants once and reuse them.
     "VLLM_TPU_PROPOSE_DEVICE_CONSTANTS": env_bool(
         "VLLM_TPU_PROPOSE_DEVICE_CONSTANTS", default=False
+    ),
+    # MTP draft greedy token: each rank takes the argmax of its vocab shard and
+    # the ranks all-gather one (value, id) pair per row instead of the full
+    # logits (spec_decode/shard_argmax.py). Bit-identical to the full argmax.
+    "VLLM_TPU_DRAFT_SHARD_ARGMAX": env_bool(
+        "VLLM_TPU_DRAFT_SHARD_ARGMAX", default=False
     ),
     # MTP draft step 0 on a draft declaring `supports_draft_rows` (Qwen4Exp):
     # write the draft layer's caches for every token of the target's step but
