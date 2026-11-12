@@ -4411,8 +4411,8 @@ def _prefix_phase(carry, q, segment_ref, layer, head, first_row, rows, live, k_h
         return tuple(_mask_where(own, new, old) for new, old in zip(streamed, carry))
 
     # Visit only the sequences that meet the tile (contiguous: offsets
-    # ascend); any other visit is a no-op, but one per slot and query tile
-    # costs ~0.6 ms a layer at 16 slots.
+    # ascend); any other visit is a no-op that would still cost a pass over
+    # the tile per slot.
     first, end = jnp.int32(count), jnp.int32(0)
     for s in range(count):
         meets = live & (offsets[s] < first_row + q_tile) & (ends[s] > first_row)
@@ -4429,8 +4429,8 @@ def _prefix_phase(carry, q, segment_ref, layer, head, first_row, rows, live, k_h
 # delayed PV follow the scheduling idea in heavyball-research/flywheel-tpu
 # (Apache-2.0), f646686, pallas/fwd_pipeline.py).
 FRAGMENT = 512
-# The FP8 prefix phase's query fragment and exponentials (micro-bench j-3662e0e9:
-# fragment 256 + BF16 exp2 is 21% faster than the BF16 kernel at 8K on 2x128k).
+# The FP8 prefix phase's query fragment, and whether its exponentials run in
+# BF16.
 FP8_FRAGMENT = 256
 FP8_EXP_BF16 = True
 # Rerun an FP8 streamed block exactly when its maximum jumps (else the whole loop).
