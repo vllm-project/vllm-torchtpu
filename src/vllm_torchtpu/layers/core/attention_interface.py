@@ -416,6 +416,17 @@ def sharded_ragged_paged_attention(
     )
     out_specs = (qkv_spec, kv_cache_spec)
 
+    # Every scheduled request holds at least one of the step's tokens, so rows
+    # past q.shape[0] are padding. Dropping them keeps RPA from scalar-
+    # prefetching the whole max_num_seqs page table into SMEM on every call
+    # (512 KiB at 256 seqs x 512 pages: ~8 us per call, 128 calls per step).
+    num_rows = min(q.shape[0], kv_lens.shape[0])
+    if num_rows < kv_lens.shape[0]:
+        pages_per_seq = page_indices.shape[0] // kv_lens.shape[0]
+        kv_lens = kv_lens[:num_rows]
+        page_indices = page_indices[: num_rows * pages_per_seq]
+        cu_q_lens = cu_q_lens[: num_rows + 1]
+
     args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
 
     if use_hd64:
