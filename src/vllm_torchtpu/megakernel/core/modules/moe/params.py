@@ -96,6 +96,10 @@ class MoEParams:
     sh_at: int = 0
     # `MoETunables.flush_pre_drain` resolved (lazy MoE segment, PIPE_EP).
     flush_pre_drain: bool = False
+    # `MoETunables.flush_in_ar1` resolved (lazy MoE segment, not PIPE_EP): the
+    # segment's dense refill is handed to the builder (`ctx.deferred_fill`),
+    # which issues it inside the MoE all-reduce's first cross-chip round.
+    flush_in_ar1: bool = False
 
 
 @dataclass(frozen=True)
@@ -153,7 +157,7 @@ class MoETunables:
         "prim_now": "exact",  # derived instead of stored slots
         "sh_pre": "exact",  # same tile sums, moved before routing
         "sh2_pre_route": "exact",  # same ops, moved
-        "flush_in_ar1": "approx",
+        "flush_in_ar1": "exact",  # same refill, inside the all-reduce
         "sh_at": "exact",  # same ops, moved
         "ep_fast_refill": "exact",  # same DMAs, static banks
         "cp_interleave": "approx",  # copy-slot scan order (Po2C is greedy)
@@ -333,4 +337,5 @@ def derive_moe_params(
         sh2_pre_route=bool(sh_pre and tt.sh2_pre_route),
         sh_at=int(tt.sh_at) if sh_pre else 0,
         flush_pre_drain=bool(tt.flush_pre_drain and lazy_moe and pipe_ep),
+        flush_in_ar1=bool(tt.flush_in_ar1 and lazy_moe and not pipe_ep),
     )

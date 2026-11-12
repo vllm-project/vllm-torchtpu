@@ -47,7 +47,14 @@ class GDefer:
         n_ai = stream.sp.nt["att_in"]
         g0, self.give = stream.claim("att_in")
         kinds = [("att_in", g0 + u) for u in range(n_ai)]
-        if ap.WGROUP:
+        # ARPIPE (`ctx.layer_hook`): the q (and K / V) columns go through
+        # `arp_mm`, every deferred column is scaled by `ctx.arp_scale`.
+        self.hook = cx.ctx.layer_hook
+        self.banks: list[Any] = []
+        if self.hook is not None:
+            self.banks = stream.dbanks_wait("att_in", g0, n_ai)
+            self.ws = [stream.dview("att_in", b) for b in self.banks]
+        elif ap.WGROUP:
             self.ws = stream.dtake_group(kinds)
         else:
             self.ws = [stream.dtake(k, g) for k, g in kinds]
@@ -75,6 +82,12 @@ class GDefer:
                     xb[:, u * t_k : (u + 1) * t_k], self.ws[u][:, c0 : c0 + cw]
                 )
             p = st if p is None else p + st
+        return self.finish(p, c0, cw, in_s)
+
+    def finish(self, p: Any, c0: int, cw: int, in_s: Any) -> Any:
+        """Deferred RMS scale (ARPIPE), column scale, bf16 rounding."""
+        if self.hook is not None:
+            p = self.cx.ctx.arp_scale(p)
         if in_s is not None:
             p = p * in_s[:, c0 : c0 + cw]
         return round_bf16(p)
@@ -95,16 +108,27 @@ def att_q(
     QV, GQ, NHH, SR, QG = ap.QV, ap.GQ, ap.NHH, ap.SR, ap.QG
     with sc("att_in"):
         ybuf = scr["ybuf"]
+        hook = ctx.layer_hook
         if gd is not None:
             in_s = gd.scale()
-            for h in range(nh):
-                c0 = h * 2 * HD
-                ybuf[:, c0 : c0 + HD] = gd.cols(c0, HD, in_s)
+            cols = [(h * 2 * HD, HD) for h in range(nh)]
             if not ap.KVDEF:
-                ko = nh * 2 * HD
-                ybuf[:, ko : ko + 2 * HD] = gd.cols(ko, 2 * HD, in_s)
+                cols.append((nh * 2 * HD, 2 * HD))
+            if hook is not None:
+                # ARPIPE: this core's all-reduce half of the K tiles, the hook,
+                # then the other half (`TwoRing.arp_mm`)
+                stream.arp_mm("att_in", gd.banks, scr["xb"], cols, hook)
+                for c0, cw in cols:
+                    ybuf[:, c0 : c0 + cw] = gd.finish(
+                        scr["acc"][:, c0 : c0 + cw], c0, cw, in_s
+                    )
+            else:
+                for c0, cw in cols:
+                    ybuf[:, c0 : c0 + cw] = gd.cols(c0, cw, in_s)
         else:
-            y = stream.dmatmul("att_in", scr["xb"], NAI)
+            y = stream.dmatmul("att_in", scr["xb"], NAI, hook=hook)
+            if hook is not None:
+                y = ctx.arp_scale(y)
             ybuf[:, :NAI] = (
                 round_bf16(y * ctx.sm(slot, "in_s", NAI))
                 if ap.in_scaled

@@ -74,11 +74,21 @@ from .states import (
 )
 
 
+def gdn_out_split(ctx: Any, gp: GDNParams) -> Any:
+    """AR0S (`ctx.ar0`): lin_out's column split into the all-reduce (None off)."""
+    if ctx.ar0 is None:
+        return None
+    return ctx.ar0("out_s" if gp.out_scaled else None)
+
+
 class GDNModule(Module):
     """GatedDeltaNet module supporting decode (`T=1`), verify (`T>1`), and `GCH`."""
 
     name = "gdn"
     reduction = "allreduce"
+    # Honours the builder's ARPIPE hook (`ctx.layer_hook`) on lin_in and the
+    # AR0S output split (`ctx.ar0`) on lin_out, on every path.
+    layer_schedule = frozenset({"layer_hook", "ar0"})
     input_norm: str | None = "in_norm"
     Tunables = GDNTunables
     PARAM_NAMES = GDN_PARAM_NAMES
@@ -378,7 +388,10 @@ class GDNModule(Module):
                 if not GCH and "gdn_state" not in skip:
                     pltpu.make_async_copy(recb, O[rec_out_key].at[o], sem.at[3]).start()
                 scr["xb2"][:, :Z] = scr["mix"][:, :Z].astype(BF16)
-                yo = stream.dmatmul("lin_out", scr["xb2"], H)
+                split = gdn_out_split(ctx, gp)
+                yo = stream.dmatmul("lin_out", scr["xb2"], H, split=split)
+                if split is not None:
+                    return None
                 return yo * ctx.sm(slot, "out_s") if gp.out_scaled else yo
 
     def epilogue(self, ctx: Any) -> None:

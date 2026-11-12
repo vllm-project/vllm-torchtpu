@@ -70,6 +70,9 @@ class GQAModule(Module):
 
     name: str = "gqa"
     reduction = "allreduce"
+    # Honours the builder's ARPIPE hook (`ctx.layer_hook`) on att_in and the
+    # AR0S output split (`ctx.ar0`) on att_out.
+    layer_schedule = frozenset({"layer_hook", "ar0"})
     input_norm: str | None = "in_norm"
     Tunables = GQATunables
     PARAM_NAMES = GQA_PARAM_NAMES
@@ -308,7 +311,16 @@ class GQAModule(Module):
                         d.wait()
                 NO = nh * HD
                 scr["xb2"][:, :NO] = scr["mix"][:, :NO].astype(BF16)
-                yo = stream.dmatmul("att_out", scr["xb2"], H)
+                # AR0S (`ctx.ar0`): the output projection's column groups feed
+                # the all-reduce's round 0 directly; the builder finishes it.
+                split = (
+                    ctx.ar0("out_s" if ap.out_scaled else None)
+                    if ctx.ar0 is not None
+                    else None
+                )
+                yo = stream.dmatmul("att_out", scr["xb2"], H, split=split)
+        if split is not None:
+            return None
         return yo * ctx.sm(slot, "out_s") if ap.out_scaled else yo
 
     def epilogue(self, ctx: Any) -> None:

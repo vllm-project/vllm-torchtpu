@@ -409,8 +409,9 @@ class MoEModule(Module):
         SH_PRE = mp.sh_pre and "dense" not in m.skip
         SH_AT = mp.sh_at if SH_PRE else 0
         FPD = mp.flush_pre_drain
+        FIA = mp.flush_in_ar1
         with stream.expert_stream():
-            with stream.segment(lazy=LAZY_MOE, defer_flush=FPD):
+            with stream.segment(lazy=LAZY_MOE, defer_flush=FPD or FIA):
                 with sc("moe_router"):
                     assert ctx.norm_x is not None, (
                         "MoEModule requires input_norm='post_norm' to populate "
@@ -472,6 +473,10 @@ class MoEModule(Module):
                     experts_piped_ep(
                         m, l, n_hit, pre_drain=stream.take_deferred_flush()
                     )
+            elif FIA:
+                # flush_in_ar1: the refill inside the MoE all-reduce's first
+                # cross-chip round (the builder issues `deferred_fill`)
+                ctx.deferred_fill = stream.take_deferred_flush()
         return scr["part"][...]
 
     def hf_params(self, prefix: str | None = None, g: Any = None) -> list[HFParamDecl]:

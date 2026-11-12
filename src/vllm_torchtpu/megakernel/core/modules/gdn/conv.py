@@ -76,7 +76,10 @@ def gdn_in(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> Any:
                     for d in rec_in(ctx, gp, o):
                         d.start()
 
-        y = stream.dmatmul("lin_in", scr["xb"], NLI)
+        hook = ctx.layer_hook  # ARPIPE: the K halves around the builder's hook
+        y = stream.dmatmul("lin_in", scr["xb"], NLI, hook=hook)
+        if hook is not None:
+            y = ctx.arp_scale(y)
         ybuf = scr["ybuf"]
         ybuf[:, :NLI] = (
             round_bf16(y * ctx.sm(slot, "in_s", NLI)) if gp.in_scaled else round_bf16(y)

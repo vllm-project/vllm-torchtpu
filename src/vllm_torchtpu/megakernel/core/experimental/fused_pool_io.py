@@ -787,7 +787,10 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
             if "gdn_state" not in skip:
                 for s_ in range(min(NS, NGI)):
                     _start_gdn_in(o, s_)
-            y = stream.dmatmul("lin_in", scr["xb"], NLI)
+            hook = ctx.layer_hook  # ARPIPE: the K halves around the hook
+            y = stream.dmatmul("lin_in", scr["xb"], NLI, hook=hook)
+            if hook is not None:
+                y = ctx.arp_scale(y)
             ybuf = scr["ybuf"]
             ybuf[:, :NLI] = (
                 round_bf16(y * ctx.sm(slot, "in_s", NLI))
@@ -1120,7 +1123,10 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
             if B < ex.MB:
                 scr["mix"][B:, :Z] = jnp.zeros((ex.MB - B, Z), F32)
             scr["xb2"][:, :Z] = scr["mix"][:, :Z].astype(BF16)
-            yo = stream.dmatmul("lin_out", scr["xb2"], H)
+            split = _out_split(ctx, gp)
+            yo = stream.dmatmul("lin_out", scr["xb2"], H, split=split)
+            if split is not None:
+                return None
             return yo * ctx.sm(slot, "out_s") if gp.out_scaled else yo
 
 
@@ -1165,6 +1171,11 @@ def _gdn_lcv_emit(
     g_act = gdn_gate_act(gp.gate)
 
     ZDEF = gp.ZDEF
+    hook = ctx.layer_hook  # ARPIPE: lin_in's K halves around the hook
+
+    def arp(v: Any, rows: Any = None) -> Any:
+        """The deferred RMS scale of the hooked lin_in (identity off)."""
+        return v if hook is None else ctx.arp_scale(v, rows)
 
     def in_s() -> Any:
         return ctx.sm(slot, "in_s", NLI) if gp.in_scaled else None
@@ -1181,16 +1192,16 @@ def _gdn_lcv_emit(
             if ZDEF:
                 zd = _ZDefer(ctx, gp)
                 in_s0 = in_s()
-                ybuf[:, 0:QKV] = scaled(scr["acc"][:, 0:QKV], in_s0, 0, QKV)
+                ybuf[:, 0:QKV] = scaled(arp(scr["acc"][:, 0:QKV]), in_s0, 0, QKV)
                 ybuf[:, QKV + Z : NLI] = scaled(
-                    scr["acc"][:, QKV + Z : NLI], in_s0, QKV + Z, NLI
+                    arp(scr["acc"][:, QKV + Z : NLI]), in_s0, QKV + Z, NLI
                 )
             else:
-                y = stream.dmatmul("lin_in", scr["xb"], NLI)
+                y = stream.dmatmul("lin_in", scr["xb"], NLI, hook=hook)
                 ybuf[:, :NLI] = (
-                    round_bf16(y * ctx.sm(slot, "in_s", NLI))
+                    round_bf16(arp(y) * ctx.sm(slot, "in_s", NLI))
                     if gp.in_scaled
-                    else round_bf16(y)
+                    else round_bf16(arp(y))
                 )
 
         ow, _ = stream.sp.lay["conv"]
@@ -1450,15 +1461,27 @@ def _gdn_lcv_emit(
             zd.work(len(zd.items))
             zd.release()
             BL = NS * T
-            zz = scaled(scr["acc"][0:BL, QKV : QKV + Z], in_s(), QKV, QKV + Z)
+            zz = scaled(
+                arp(scr["acc"][0:BL, QKV : QKV + Z], slice(0, BL)), in_s(), QKV, QKV + Z
+            )
             scr["mix"][0:BL, :Z] = round_bf16(scr["mix"][0:BL, :Z] * g_act(zz))
 
         with sc("gdn_out"):
             if B < ex.MB:
                 scr["mix"][B:, :Z] = jnp.zeros((ex.MB - B, Z), F32)
             scr["xb2"][:, :Z] = scr["mix"][:, :Z].astype(BF16)
-            yo = stream.dmatmul("lin_out", scr["xb2"], H)
+            split = _out_split(ctx, gp)
+            yo = stream.dmatmul("lin_out", scr["xb2"], H, split=split)
+            if split is not None:
+                return None
             return yo * ctx.sm(slot, "out_s") if gp.out_scaled else yo
+
+
+def _out_split(ctx: Any, gp: Any) -> Any:
+    """AR0S (`ctx.ar0`): lin_out's column split into the all-reduce (None off)."""
+    if ctx.ar0 is None:
+        return None
+    return ctx.ar0("out_s" if gp.out_scaled else None)
 
 
 class _ZDefer:
@@ -1472,20 +1495,31 @@ class _ZDefer:
         self.stream, self.scr = stream, scr
         self.n_li, self.tk = stream.sp.nt["lin_in"], stream.sp.tk["lin_in"]
         g0, self.give = stream.claim("lin_in")
-        self.ws = [stream.dtake("lin_in", g0 + u) for u in range(self.n_li)]
+        hook = ctx.layer_hook
+        if hook is not None:  # ARPIPE: grouped wait, non-z chunks via arp_mm
+            banks = stream.dbanks_wait("lin_in", g0, self.n_li)
+            self.ws = [stream.dview("lin_in", b) for b in banks]
+        else:
+            self.ws = [stream.dtake("lin_in", g0 + u) for u in range(self.n_li)]
         self.items: list[tuple[int, int]] = []
         self.part: dict[int, Any] = {}
         self.next = 0
         QKV, Z, NLI = gp.QKV, gp.Z, gp.NLI
+        cols = []
         for c0 in range(0, NLI, 512):
             cw = min(512, NLI - c0)
             if QKV <= c0 < QKV + Z:
                 self.items.extend((c0, u) for u in range(self.n_li))
                 continue
+            if hook is not None:
+                cols.append((c0, cw))
+                continue
             p = self._mm(0, c0, cw)
             for u in range(1, self.n_li):
                 p = p + self._mm(u, c0, cw)
             scr["acc"][:, c0 : c0 + cw] = p
+        if hook is not None:
+            stream.arp_mm("lin_in", banks, scr["xb"], cols, hook)
 
     def _mm(self, u: int, c0: int, cw: int) -> Any:
         x = self.scr["xb"][:, u * self.tk : (u + 1) * self.tk]

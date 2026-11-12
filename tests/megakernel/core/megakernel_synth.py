@@ -146,6 +146,7 @@ EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ),
     ("sh_at", "moe.sh_at", 2, (2, 4), {**_UNROLL, "moe.sh_pre": True}),
     ("flush_pre_drain", "moe.flush_pre_drain", True, (2, 4), _PIPE_EP1),
+    ("flush_in_ar1", "moe.flush_in_ar1", True, (2, 4), {}),
     ("qswap", "gqa.qswap", True, (2, 4), {"gqa.gqa_qv": True}),
     ("gdefer", "gqa.gdefer", True, (2, 4), _GDEF),
     ("kvdefer", "gqa.kvdefer", True, (2, 4), {**_GDEF, "gqa.gdefer": True}),
