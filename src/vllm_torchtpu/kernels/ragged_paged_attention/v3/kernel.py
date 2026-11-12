@@ -1583,10 +1583,14 @@ def get_default_block_sizes(
                 bkv_csz = min(512, align_to(max_kv // 2, page_size))
         case 7:
             if case == RpaCase.DECODE:
+                # A decode block is padded work for every shorter sequence, and
+                # 4 MiB still streams long contexts at full rate: 16 MiB cost
+                # +0.38 ms/token at 340 tokens, 1 MiB +0.7 ms at 64k.
+                bkv_decode = max(page_size, min_bkv_sz_to_peak // 4)
                 bq_sz = 1
-                bkv_sz = min(min_bkv_sz_to_peak, max_kv)
+                bkv_sz = min(bkv_decode, max_kv)
                 bq_csz = 1
-                bkv_csz = min(min_bkv_sz_to_peak, max_kv)
+                bkv_csz = min(bkv_decode, max_kv)
             else:
                 bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
                 bkv_sz = min(2048, max_kv)
