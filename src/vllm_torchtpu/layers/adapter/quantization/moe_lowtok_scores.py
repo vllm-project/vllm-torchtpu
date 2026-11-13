@@ -31,7 +31,7 @@ requiring Dynamo shape-variant retraces.
 from __future__ import annotations
 
 from collections import Counter
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -63,6 +63,8 @@ from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
 
 logger = init_logger(__name__)
 _TABLE_LANES = 512
@@ -125,6 +127,7 @@ def armed_max_tokens() -> int:
 
 def _layer_has_placement_copies(layer: RoutedExperts) -> bool:
     """Whether `layer` holds copy slots from a copy-enabled `expert_placement`."""
+    layer = cast("TpuRoutedExperts", layer)
     if not expert_placement.has_copies():
         return False
     prefix = getattr(layer, "layer_name", "") or ""
@@ -147,6 +150,7 @@ def _set_layer_buffer(layer: Any, name: str, tensor: torch.Tensor) -> None:
 
 def _install_copy_tables(layer: RoutedExperts) -> None:
     """Attach per-layer holder tables as buffers on `layer`."""
+    layer = cast("TpuRoutedExperts", layer)
     layer_idx = expert_placement.layer_index(getattr(layer, "layer_name", "") or "")
     assert layer_idx is not None
     rank = int(getattr(layer.moe_config, "ep_rank", 0))
@@ -196,6 +200,7 @@ def _install_copy_tables(layer: RoutedExperts) -> None:
 
 def _unsupported_reason(layer: RoutedExperts, activation: str) -> str | None:
     """Why the kernel cannot serve this layer at all, or None."""
+    layer = cast("TpuRoutedExperts", layer)
     if not layer.moe_config.moe_parallel_config.use_ep:
         return "it needs expert parallelism"
     w13, w2 = layer.w13_weight, layer.w2_weight
@@ -227,6 +232,7 @@ def _unsupported_reason(layer: RoutedExperts, activation: str) -> str | None:
 
 def _routing_unsupported_reason(layer: RoutedExperts) -> str | None:
     """Why the in-kernel router would not reproduce this layer's routing."""
+    layer = cast("TpuRoutedExperts", layer)
     if layer.custom_routing_function is not None:
         return "the layer supplies a custom_routing_function"
     if layer.scoring_func != "softmax":
@@ -235,10 +241,11 @@ def _routing_unsupported_reason(layer: RoutedExperts) -> str | None:
         return "renormalize=False"
     if layer.e_score_correction_bias is not None:
         return "e_score_correction_bias is not applied in the kernel"
+    # vLLM's router requires both group sizes when grouped top-k is on.
     if (
         layer.use_grouped_topk
-        and layer.num_expert_group > 1
-        and layer.topk_group < layer.num_expert_group
+        and cast("int", layer.num_expert_group) > 1
+        and cast("int", layer.topk_group) < cast("int", layer.num_expert_group)
     ):
         return "grouped top-k is not implemented in the kernel"
     if getattr(layer, "hash_indices_table", None) is not None:
@@ -470,7 +477,7 @@ def prebuild(
             int(layer.moe_config.ep_size),
             int(expert_placement.owned()),
         )
-    layer._lowtok_has_copies = False
+    cast("TpuRoutedExperts", layer)._lowtok_has_copies = False
     return _build_op(layer.moe_config.experts_per_token)
 
 

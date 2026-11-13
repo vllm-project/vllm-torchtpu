@@ -653,11 +653,6 @@
     {
       "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `list[MemoryRef | MetadataRef] | list[MemoryRef | MetadataRef | None]` is not assignable to parameter `scratch_shapes` with type `Mapping[str, ScratchShape | ScratchShapeTree] | Sequence[ScratchShape | ScratchShapeTree | None]` in function `jax._src.pallas.mosaic.core.PrefetchScalarGridSpec.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
       "concise_description": "Argument `dict[str, float | int | str]` is not assignable to parameter `metadata` with type `dict[str, str] | None` in function `jax._src.pallas.pallas_call.pallas_call`"
     },
     {

@@ -26,6 +26,7 @@ The routing arrives either as a table built from the caller's local top-k ids
 """
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -380,11 +381,11 @@ def _select_topk(scores, topk, *, from_logits: bool = False):
         if from_logits:
             if r == 0:
                 m0 = m
-            wsum = wsum + jnp.where(m > _NEG, jnp.exp(m - m0), 0.0)
+            wsum = wsum + jnp.where(m > _NEG, jnp.exp(m - cast("jax.Array", m0)), 0.0)
         else:
             wsum = wsum + m
         x = jnp.where(lane == idx, masked, x)
-    num = jnp.exp(x0 - m0) if from_logits else x0
+    num = jnp.exp(x0 - cast("jax.Array", m0)) if from_logits else x0
     wt = jnp.where((x == masked) & (wsum > 0), num / wsum, 0.0)
     return wt.astype(jnp.bfloat16).astype(jnp.float32)
 

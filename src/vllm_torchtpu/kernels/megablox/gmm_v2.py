@@ -766,7 +766,7 @@ def fill_metadata(
     *,
     cfgs: GmmConfigs,
     run_to_group_ref: jax.Array | None = None,
-) -> jax.Array:
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Fills the metadata for the given lhs group sizes and group offset.
 
     Iterates over the lhs group sizes and if the group id is valid, determines
@@ -993,7 +993,7 @@ def kernel_main(
                     copy.start()
 
     # Fill metadata buffer and return number of group & m interations.
-    num_gm = fill_metadata(
+    num_gm: Any = fill_metadata(
         lhs_group_sizes_ref,
         group_offset_ref,
         metadata_ref,
@@ -1677,7 +1677,7 @@ def gmm_v2(
     # Initialize scratch shapes.
     max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
     acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
-    scratch_shapes = [
+    scratch_shapes: list[Any] = [
         # partial_out_ref
         pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
         # acc_ref

@@ -614,6 +614,8 @@ def install_copy_slot_hook() -> bool:
         if getattr(module, name, None) is original_factory:
             setattr(module, name, FusedMoEFactory)
     emm.ExpertMapManager._calculate_expert_maps = _calculate_expert_maps
+    # vLLM's module does not declare this marker; the hook adds it at runtime.
+    # pyrefly: ignore[missing-attribute]
     fused_layer._tpu_copy_slot_hook = True
     logger.info(
         "Expert placement %s has %d copy slots per rank: MoE layers it places "
