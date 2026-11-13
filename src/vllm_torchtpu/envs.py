@@ -83,6 +83,8 @@ if TYPE_CHECKING:
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
     TPU_MOE_V3_PAYLOAD_SORT: bool = False
     TPU_MOE_FLAT_ROUTING_MIN_TOKENS: int = 0
+    TPU_GMM_V2_PREFILL_DEQUANT_CHUNK: bool = False
+    TPU_GMM_V2_PREFILL_TILES_LARGE: str = ""
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
@@ -778,6 +780,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_FLAT_ROUTING_MIN_TOKENS": env_nonnegative_int(
         "TPU_MOE_FLAT_ROUTING_MIN_TOKENS", 0
     ),
+    # gmm_v2 prefill calls (above the decode-sized buffers) with a
+    # dequantize-before-matmul fp4 rhs dequantize it one MXU column chunk at
+    # a time instead of the whole weight tile up front. Same values.
+    "TPU_GMM_V2_PREFILL_DEQUANT_CHUNK": env_bool("TPU_GMM_V2_PREFILL_DEQUANT_CHUNK"),
+    # gmm_v2 tiles "<tile_m>:<bucket>/.../<tile_m>" for fp4-rhs prefill calls
+    # above TPU_GMM_V2_PREFILL_TILES' "@<max size_m>" cap (or above the
+    # decode-sized buffers without one): larger tiles for the large groups
+    # of big mixed steps. Same values (tile shapes only). Empty = off.
+    "TPU_GMM_V2_PREFILL_TILES_LARGE": env_str("TPU_GMM_V2_PREFILL_TILES_LARGE", ""),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.

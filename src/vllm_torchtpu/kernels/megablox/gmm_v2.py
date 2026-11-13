@@ -228,7 +228,9 @@ class WeightsRef(RhsRef):
 
     def get_scale_cols(self, start: int, size: int, replicate_size: int) -> jax.Array:
         assert self.scale is not None
-        return self.scale[:, pl.ds(0, replicate_size, 0), pl.ds(start, size)]
+        # Zero-stride loads take whole rows only: load, then broadcast.
+        cols = self.scale[:, :, pl.ds(start, size)]
+        return jnp.broadcast_to(cols, (cols.shape[0], replicate_size, size))
 
 
 @jax.tree_util.register_dataclass
@@ -1286,6 +1288,39 @@ def gmm_vmem_estimate(
 #     which costs more there than it saves).
 _PREFILL_TILES_ENV = "TPU_GMM_V2_PREFILL_TILES"
 _DECODE_W13_ENV = "TPU_GMM_V2_DECODE_W13"
+# Read through vllm_torchtpu.envs (part of the compile-cache key):
+#   TPU_GMM_V2_PREFILL_TILES_LARGE="<tile_m>:<bucket>/.../<tile_m>": prefill
+#     calls TPU_GMM_V2_PREFILL_TILES does not take (above its "@" cap, or
+#     every prefill call when it is unset).
+#   TPU_GMM_V2_PREFILL_DEQUANT_CHUNK=1: prefill calls dequantize the fp4 rhs
+#     per MXU column chunk (TileSizes.dequant_chunk).
+_PREFILL_TILES_LARGE_ENV = "TPU_GMM_V2_PREFILL_TILES_LARGE"
+_PREFILL_DEQUANT_CHUNK_ENV = "TPU_GMM_V2_PREFILL_DEQUANT_CHUNK"
+
+
+def _parse_tiles(name: str, raw: str) -> tuple[int, tuple[int, ...]]:
+    tm, _, bks = raw.partition(":")
+    # "," or "/" between buckets ("/" fits comma-separated env lists).
+    buckets = tuple(
+        sorted({int(b) for b in bks.replace("/", ",").split(",") if b.strip()})
+    )
+    if not buckets or buckets[-1] != int(tm):
+        raise ValueError(f"{name}={raw!r}: buckets must end at tile_m")
+    return int(tm), buckets
+
+
+def _envs_value(name: str, default):
+    try:
+        from vllm_torchtpu import envs
+    except ImportError:  # kernel-only use without vllm
+        return default
+    return getattr(envs, name)
+
+
+def _large_env() -> tuple[tuple[int, tuple[int, ...]] | None, bool]:
+    raw = str(_envs_value(_PREFILL_TILES_LARGE_ENV, "") or "").strip()
+    large = _parse_tiles(_PREFILL_TILES_LARGE_ENV, raw) if raw else None
+    return large, bool(_envs_value(_PREFILL_DEQUANT_CHUNK_ENV, False))
 
 
 @functools.cache
@@ -1296,14 +1331,8 @@ def _tile_env() -> (
     raw = os.environ.get(_PREFILL_TILES_ENV, "").strip()
     if raw:
         spec, _, max_m = raw.partition("@")
-        tm, _, bks = spec.partition(":")
-        # "," or "/" between buckets ("/" fits comma-separated env lists).
-        buckets = tuple(
-            sorted({int(b) for b in bks.replace("/", ",").split(",") if b.strip()})
-        )
-        if not buckets or buckets[-1] != int(tm):
-            raise ValueError(f"{_PREFILL_TILES_ENV}={raw!r}: buckets must end at tile_m")
-        prefill = (int(tm), buckets, int(max_m) if max_m else None)
+        tm, buckets = _parse_tiles(_PREFILL_TILES_ENV, spec)
+        prefill = (tm, buckets, int(max_m) if max_m else None)
     raw = os.environ.get(_DECODE_W13_ENV, "").strip()
     if raw:
         parts = [int(x) for x in raw.split(":")]
@@ -1320,7 +1349,9 @@ def _log_tile_env_once(name: str, dims: Dimensions, tiles: TileSizes) -> None:
     _tile_env_logged.add(name)
     args = (
         "gmm_v2 tile override %s=%s applied (size_m=%d k=%d n=%d): %s",
-        name, os.environ.get(name), dims.size_m, dims.size_k, dims.size_n, tiles,
+        name,
+        "|".join(str(os.environ.get(n)) for n in name.split("+")),
+        dims.size_m, dims.size_k, dims.size_n, tiles,
     )
     try:
         from vllm_torchtpu.logger import init_logger
@@ -1341,22 +1372,31 @@ def _apply_tile_env(
     fuse_act: str | None,
 ) -> TileSizes:
     prefill, decode_w13 = _tile_env()
-    if (prefill is None and decode_w13 is None) or (
+    large, chunk = _large_env()
+    if (prefill is None and decode_w13 is None and large is None and not chunk) or (
         tiles.tile_k != align_to(dims.size_k, pltpu.get_tpu_info().num_lanes)
         or fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is None
     ):
         return tiles
     new, name = None, None
-    if prefill is not None and dims.size_m > FP8_DECODE_MAX_M:
-        tile_m, buckets, max_m = prefill
+    if dims.size_m > FP8_DECODE_MAX_M:
         sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
-        if all(b % sublane == 0 for b in buckets) and (
-            max_m is None or dims.size_m <= max_m
-        ):
+        max_m = prefill[2] if prefill is not None else None
+        if prefill is not None and (max_m is None or dims.size_m <= max_m):
+            pick, name = prefill[:2], _PREFILL_TILES_ENV
+        elif large is not None:
+            pick, name = large, _PREFILL_TILES_LARGE_ENV
+        else:
+            pick = None
+        if pick is not None and all(b % sublane == 0 for b in pick[1]):
             new = dataclasses.replace(
-                tiles, tile_m=tile_m, bucket_base=buckets[0], buckets=buckets
+                tiles, tile_m=pick[0], bucket_base=pick[1][0], buckets=pick[1]
             )
-            name = _PREFILL_TILES_ENV
+        else:
+            name = None
+        if chunk and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None:
+            new = dataclasses.replace(new or tiles, dequant_chunk=True)
+            name = (name + "+" if name else "") + _PREFILL_DEQUANT_CHUNK_ENV
     elif decode_w13 is not None and dims.size_m <= FP8_DECODE_MAX_M:
         tile_n, buffers_gate_up, buffers_down = decode_w13
         if dims.size_m > FP8_SMALL_DECODE_MAX_M:

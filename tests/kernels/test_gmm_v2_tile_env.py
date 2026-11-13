@@ -38,7 +38,8 @@ def _tpu7x(monkeypatch):
             get_sublane_tiling=lambda dtype: 16,
         ),
     )
-    for name in (G._PREFILL_TILES_ENV, G._DECODE_W13_ENV):
+    for name in (G._PREFILL_TILES_ENV, G._DECODE_W13_ENV,
+                 G._PREFILL_TILES_LARGE_ENV, G._PREFILL_DEQUANT_CHUNK_ENV):
         monkeypatch.delenv(name, raising=False)
     G._tile_env.cache_clear()
     yield
@@ -146,3 +147,52 @@ def test_vmem_estimate_counts_rhs_buffers():
         32, 3072, H, lhs_cfgs=lhs, rhs_cfgs=rhs, fuse_act="swigluoai", rhs_buffer_count=2
     )
     assert e3 - e2 == 2 * G.rhs_weight_block_bytes(H, 3072, rhs)
+
+
+def test_large_tiles_above_prefill_cap(monkeypatch):
+    monkeypatch.setenv(G._PREFILL_TILES_ENV, "256:128/256@12288")
+    monkeypatch.setenv(G._PREFILL_TILES_LARGE_ENV, "384:128/256/384")
+    assert _tiles(12288, True).bucket_sizes == (128, 256)
+    for gate_up in (True, False):
+        t = _tiles(32768, gate_up)
+        d = G._calculate_tiling(*_args(32768, gate_up))
+        assert (t.tile_m, t.bucket_sizes) == (384, (128, 256, 384))
+        assert (t.tile_k, t.tile_n, t.dequant_chunk) == (d.tile_k, d.tile_n, False)
+    assert _tiles(2048, True) == G._calculate_tiling(*_args(2048, True))
+
+
+def test_large_tiles_alone_cover_all_prefill(monkeypatch):
+    monkeypatch.setenv(G._PREFILL_TILES_LARGE_ENV, "512:256,512")
+    assert _tiles(4096, True).bucket_sizes == (256, 512)
+    assert _tiles(512, True) == G._calculate_tiling(*_args(512, True))
+    monkeypatch.setenv(G._PREFILL_TILES_ENV, "256:128/256")  # uncapped wins
+    G._tile_env.cache_clear()
+    assert _tiles(32768, True).bucket_sizes == (128, 256)
+
+
+def test_large_tiles_bad_spec(monkeypatch):
+    monkeypatch.setenv(G._PREFILL_TILES_LARGE_ENV, "512:256")
+    with pytest.raises(ValueError):
+        _tiles(32768, True)
+
+
+def test_large_tiles_over_vmem_fall_back(monkeypatch):
+    monkeypatch.setenv(G._PREFILL_TILES_LARGE_ENV, "2048:1024/2048")
+    assert _tiles(32768, True) == G._calculate_tiling(*_args(32768, True))
+
+
+def test_dequant_chunk_prefill_only(monkeypatch):
+    monkeypatch.setenv(G._PREFILL_DEQUANT_CHUNK_ENV, "1")
+    for gate_up in (True, False):
+        assert _tiles(32768, gate_up) == G.dataclasses.replace(
+            G._calculate_tiling(*_args(32768, gate_up)), dequant_chunk=True)
+        assert _tiles(2048, gate_up) == G._calculate_tiling(*_args(2048, gate_up))
+    monkeypatch.setenv(G._PREFILL_TILES_ENV, "256:128/256@12288")
+    G._tile_env.cache_clear()
+    t = _tiles(8192, True)
+    assert (t.bucket_sizes, t.dequant_chunk) == ((128, 256), True)
+    assert _tiles(32768, True).dequant_chunk
+
+
+def test_dequant_chunk_unset_is_off():
+    assert not _tiles(32768, True).dequant_chunk
