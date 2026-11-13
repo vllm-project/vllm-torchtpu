@@ -919,6 +919,34 @@ class TestTpuPlatform:
     @pytest.mark.parametrize(
         ("initial_cls", "expected_cls"),
         [
+            ("auto", "vllm_torchtpu.worker.tpu_worker.TPUWorker"),
+            # A caller's choice (--worker-cls, or the stage worker vllm-omni
+            # resolves before this hook runs) is kept.
+            ("pkg.custom_worker.CustomWorker", "pkg.custom_worker.CustomWorker"),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_resolves_only_auto_worker_cls(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        initial_cls,
+        expected_cls,
+    ):
+        vllm_config.cache_config.block_size = 16
+        vllm_config.parallel_config.worker_cls = initial_cls
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.parallel_config.worker_cls == expected_cls
+
+    @pytest.mark.parametrize(
+        ("initial_cls", "expected_cls"),
+        [
             (None, "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"),
             (
                 "vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler",
@@ -1251,10 +1279,12 @@ def test_qwen_wrappers_are_installed_once_across_model_loads(
     for (target, name), original in zip(targets, originals):
         monkeypatch.setattr(target, name, original)
     other_model = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="llama"), model="llama"
+        hf_config=SimpleNamespace(model_type="llama"),
+        model="llama",
     )
     qwen_model = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="qwen3_vl"), model="Qwen/Qwen3-VL-4B"
+        hf_config=SimpleNamespace(model_type="qwen3_vl"),
+        model="Qwen/Qwen3-VL-4B",
     )
     reg.apply("platform_activation", model_config=other_model)
     assert [getattr(target, name) for target, name in targets] == originals

@@ -1117,7 +1117,8 @@ class TpuPlatform(Platform):
             )
 
         parallel_config = vllm_config.parallel_config
-        parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+        if parallel_config.worker_cls == "auto":
+            parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         if multihost_backend != "ray" and parallel_config.nnodes > 1:
