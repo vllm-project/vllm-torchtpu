@@ -196,7 +196,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB: int = 128
-    VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB: int = 0
+    VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB: int = 64
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -1235,7 +1235,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiB of one worker's KV that offload saves may have in flight at once
     # (0: no bound); the next forward's KV write waits for them.
     "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB": env_int(
-        "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB", 0
+        "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB", 64
     ),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
