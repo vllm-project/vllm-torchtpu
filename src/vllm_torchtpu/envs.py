@@ -242,6 +242,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
 
 
 def env_with_choices(
@@ -1508,6 +1509,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of two (`models.minimax_m3.dcp_pack`). 0 keeps two gathers.
     "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 4-bit MSA prefill attention with a page cache:
+    # "<threshold>:<block_q>:<tile_pages>" runs a call whose selections hold
+    # more than <threshold> distinct pages per query tile on average with
+    # <block_q>-token tiles and <tile_pages> cached union pages, other calls
+    # with the configured tiles (`msa_attention_lse.adaptive_prefill`). Empty
+    # keeps one configuration.
+    "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE": env_str(
+        "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE", ""
     ),
 }
 
