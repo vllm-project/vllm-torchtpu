@@ -1296,9 +1296,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TODO: derive where the two passes start to pay off from the padded chunk
     #   size T and the loop bucket p (or a tuned table) once it is measured,
     #   then make this the default for the drafts that support it.
-    # TODO: take the two passes under EP-DP lockstep too: the idle ranks'
-    #   replay of a peer's draft trace (run_dp_dummy_draft) has to run pass 1
-    #   and pass 2 where the busy ranks do.
     "TPU_MTP_KV_ONLY_STEP0": env_bool("TPU_MTP_KV_ONLY_STEP0"),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).

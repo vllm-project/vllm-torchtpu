@@ -268,10 +268,6 @@ def _layout_unsupported_reason(
     #   pass 2's row selection does not model yet.
     if proposer.runner._pcp_enabled:
         return "prefill context parallelism is on"
-    if proposer._dp_lockstep_sharded():
-        # The idle ranks' replay of a peer's draft trace (run_dp_dummy_draft)
-        # knows only the single pass, so the collectives would not match.
-        return "EP-DP lockstep replays the draft as the single pass"
     assert proposer.draft_model is not None
     reason = kv_only_unsupported_reason(proposer.draft_model)
     if reason is not None:

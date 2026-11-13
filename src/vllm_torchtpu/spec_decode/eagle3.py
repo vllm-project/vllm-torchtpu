@@ -239,6 +239,8 @@ class _DpDummyDraft:
     # drafts one plain tensor; MTP drafts combine nothing.
     combine_aux: list[torch.Tensor]
     combine_plain: torch.Tensor | None
+    # Whether step 0 replays the two-pass step 0 (TPU_MTP_KV_ONLY_STEP0).
+    two_pass: bool
 
 
 class Eagle3Proposer:
@@ -748,21 +750,56 @@ class Eagle3Proposer:
         if self._mtp_kv_only is not None:
             self._mtp_kv_only.set_compile_sizes(sizes)
 
+    def schedules_kv_only_prefill(self, num_scheduled_tokens: Iterable[int]) -> bool:
+        """Whether a step scheduling these per-request token counts carries
+        the prefill span the two-pass step 0 needs; False while it is off.
+        The runner all-reduces it under EP-DP lockstep."""
+        return self._mtp_kv_only is not None and schedules_prefill(
+            num_scheduled_tokens, self.speculative_config.num_speculative_tokens
+        )
+
     def _takes_two_pass_step0(self, chunk: DraftChunkInputs, num_tokens: int) -> bool:
         """Whether this chunk's step 0 (`num_tokens` padded tokens) runs as
         the KV-only pass plus the full layer on one row per request.
 
         Host-side only, so every rank of a TP group, which sees the same
-        scheduler output, decides the same way.
+        scheduler output, decides the same way. Under EP-DP lockstep the
+        decision is the step's, the same for every DP rank and chunk.
         """
         if self._mtp_kv_only is None:
             return False
+        if self._dp_lockstep_sharded():
+            # Every chunk's step 0 is padded to the coordinated bucket.
+            assert num_tokens == self.runner._dp_target_bucket, (
+                num_tokens,
+                self.runner._dp_target_bucket,
+            )
+            return self._dp_two_pass_step0()
         return self._mtp_kv_only.takes_two_pass(
             num_tokens,
             schedules_prefill(
                 np.diff(chunk.query_start_loc_np),
                 self.speculative_config.num_speculative_tokens,
             ),
+        )
+
+    def _dp_two_pass_step0(self) -> bool:
+        """Under EP-DP lockstep, whether this step's step 0 takes the two
+        passes, on every chunk of every DP rank, padding chunks included.
+
+        Decided from DP-wide values only, so every rank emits the same
+        programs in the same order: the coordinated token bucket and whether
+        any rank's step carries a prefill span, both from
+        `TPUModelRunner._dp_coordinated_step`'s all-reduce. A chunk that
+        takes the two passes without a prefill span of its own still gets
+        the single pass's draft tokens and caches.
+        """
+        runner = self.runner
+        if self._mtp_kv_only is None:
+            return False
+        assert runner._dp_target_bucket is not None
+        return self._mtp_kv_only.takes_two_pass(
+            runner._dp_target_bucket, runner._dp_step_any_prefill
         )
 
     def _run_kv_only_pass(
@@ -863,6 +900,11 @@ class Eagle3Proposer:
         rows_ids, rows_positions, rows_hidden = self._draft_gather_rows(
             input_ids, positions, target_hidden_states, gather_indices
         )
+        # TODO: under EP-DP lockstep, the host work between the two passes
+        # (this gather, the loop inputs and the pass-2 metadata) can delay
+        # pass 2 on a busy rank against its peers' replay, which then waits in
+        # pass 2's first MoE all-to-all. Building them before pass 1 would
+        # move that work off the path between the passes.
         loop_inputs = self._chunk_loop_inputs(chunk, num_rejected)
         last_hidden, hidden = self._run_draft_model(
             input_ids=rows_ids,
@@ -2689,6 +2731,7 @@ class Eagle3Proposer:
             ),
             combine_aux=combine_aux,
             combine_plain=combine_plain,
+            two_pass=self._dp_two_pass_step0(),
         )
 
     def _dp_dummy_draft_step(self, dummy: _DpDummyDraft, step: int) -> torch.Tensor:
@@ -2702,17 +2745,20 @@ class Eagle3Proposer:
                 elif dummy.combine_plain is not None:
                     assert self.draft_model is not None
                     self.draft_model.combine_hidden_states(dummy.combine_plain)
-            self._forward_draft(
-                chunk=dummy.chunk,
-                input_ids=dummy.input_ids,
-                positions=dummy.positions,
-                target_hidden_states=dummy.target_hidden_states,
-                step_idx=0,
-                seq_lens_delta=0,
-                num_rejected_np=None,
-                num_tokens_padded=dummy.bucket,
-            )
-            lm_head_input = dummy.first_pass_carry
+            if dummy.two_pass:
+                lm_head_input = self._dp_dummy_two_pass_step0(dummy)
+            else:
+                self._forward_draft(
+                    chunk=dummy.chunk,
+                    input_ids=dummy.input_ids,
+                    positions=dummy.positions,
+                    target_hidden_states=dummy.target_hidden_states,
+                    step_idx=0,
+                    seq_lens_delta=0,
+                    num_rejected_np=None,
+                    num_tokens_padded=dummy.bucket,
+                )
+                lm_head_input = dummy.first_pass_carry
         else:
             # A real loop step: forward @p -> lm head @p. Under IndexShare,
             # _forward_draft routes it to the loop-step program exactly as a
@@ -2740,3 +2786,43 @@ class Eagle3Proposer:
         # place in the collective order, without blocking the host.
         synchronize_tensors(tok, wait=False)
         return tok
+
+    def _dp_dummy_two_pass_step0(self, dummy: _DpDummyDraft) -> torch.Tensor:
+        """`_two_pass_step0` on an EP-DP padding chunk: pass 1 at the
+        coordinated bucket, then the step-0 program at the loop bucket p.
+
+        The metadata is built the way a real chunk's is (step 0's, then a
+        loop step's at `seq_lens_delta=0`), so pass 1 writes where the single
+        pass's replay writes: the dummy chunk's fixed positions select the
+        zeroed block table. The gather between the passes is local, so it is
+        not replayed. Returns the lm-head input, `[p, hidden]`.
+        """
+        logger.debug(
+            "EP-DP padding chunk: replaying the two-pass draft step 0 "
+            "(pass 1 at %d tokens, pass 2 at %d rows).",
+            dummy.bucket,
+            dummy.loop_bucket,
+        )
+        step0_md = self._build_draft_attn_metadata(
+            chunk=dummy.chunk,
+            step_idx=0,
+            seq_lens_delta=0,
+            num_rejected_np=None,
+            num_tokens_padded=dummy.bucket,
+        )
+        self._run_kv_only_pass(
+            step0_md, dummy.input_ids, dummy.positions, dummy.target_hidden_states
+        )
+        loop_inputs = _ChunkLoopInputs(
+            None, dummy.loop_query_start_loc, dummy.loop_request_distribution
+        )
+        last_hidden, _ = self._run_draft_model(
+            input_ids=dummy.loop_input_ids,
+            positions=dummy.loop_positions,
+            target_hidden_states=dummy.loop_hidden,
+            step_idx=0,
+            attn_metadata=self._pass2_attn_metadata(
+                dummy.chunk, None, loop_inputs, dummy.loop_bucket
+            ),
+        )
+        return last_hidden

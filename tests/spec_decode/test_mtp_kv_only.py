@@ -503,7 +503,6 @@ def test_set_draft_compile_sizes_keeps_the_kv_only_copy_at_its_gate(monkeypatch)
         ("eagle3", "draft method is 'eagle3'"),
         ("kv_shared", "reads the target's KV cache"),
         ("pcp", "prefill context parallelism"),
-        ("lockstep", "EP-DP lockstep"),
         ("unsupported", "not DSA"),
         ("two_mla_layers", "not one of each"),
         ("no_indexer_cache", "not one of each"),
@@ -526,8 +525,6 @@ def test_build_refusals_raise(monkeypatch, setup, message):
         proposer._draft_kv_shared = True
     if setup == "pcp":
         proposer.runner._pcp_enabled = True
-    if setup == "lockstep":
-        proposer._dp_lockstep_sharded = lambda: True
     if setup == "loop_bucket_is_the_largest":
         # max_num_reqs pads to the largest bucket, so no chunk could ever
         # reach the gate one past it.
@@ -540,6 +537,15 @@ def test_build_refusals_raise(monkeypatch, setup, message):
     assert message in str(e.value)
     # Every refusal is decided before the op is built (and registered).
     assert built == []
+
+
+def test_build_under_ep_dp_lockstep(monkeypatch):
+    """The idle ranks replay the two passes (see the lockstep tests below)."""
+    proposer = _build_proposer()
+    built = _patch_builder(monkeypatch)
+    proposer._dp_lockstep_sharded = lambda: True
+    assert MtpKvOnlyStep0.build(proposer, _attn_layers()).min_tokens == 33
+    assert len(built) == 1
 
 
 def test_build_error_propagates(monkeypatch):
@@ -1155,3 +1161,203 @@ def test_two_pass_step0_matches_the_single_pass(monkeypatch, mode, num_chunks, l
     # The last chunk's per-request top-k rows (IndexShare) are the same.
     num_last = len(_CHUNK0 if num_chunks == 1 else _CHUNK1)
     assert torch.equal(new.world.topk_buf[:num_last], ref.world.topk_buf[:num_last])
+
+
+# ---------------------------------------------------------------------------
+# EP-DP lockstep: idle ranks replay the busy ranks' programs
+# ---------------------------------------------------------------------------
+
+LOCKSTEP_GATE = 9
+LOCKSTEP_K = 3
+
+
+class _RecordingDraft:
+    def __init__(self, trace):
+        self.trace = trace
+
+    def __call__(self, *, input_ids, positions, hidden_states, spec_step_idx):
+        self.trace.append(("draft", spec_step_idx, input_ids.shape[0]))
+        return hidden_states, hidden_states
+
+
+class _RecordingKvOnly:
+    def __init__(self, trace):
+        self.trace = trace
+
+    def __call__(self, input_ids, positions, hidden_states):
+        self.trace.append(("kv_only", input_ids.shape[0]))
+        return hidden_states
+
+
+def _lockstep_proposer(monkeypatch, *, bucket, any_prefill, num_chunks):
+    """A proposer under EP-DP lockstep at one step's DP-wide values, whose
+    programs (pass 1, draft forward, lm head) and metadata builds append
+    `(name, ..., num_tokens)` to the returned trace instead of running. The
+    programs are where the collectives are; everything between them is
+    local."""
+    monkeypatch.setattr(
+        e3.Eagle3Proposer,
+        "_draft_gather_rows",
+        _eager_body(e3.Eagle3Proposer._draft_gather_rows),
+    )
+    for name in ("set_model_tag", "set_vllm_model_wrapper_context"):
+        monkeypatch.setattr(e3, name, lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(
+        e3, "set_forward_context", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
+    trace: list[tuple] = []
+    proposer = make_proposer(method="mtp")
+    proposer.speculative_config.num_speculative_tokens = LOCKSTEP_K
+    # A sharded draft: its collectives pair across the DP group.
+    proposer._draft_replicated = False
+    proposer.draft_vllm_config = object()
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        uses_mrope=False,
+        _hidden_states_dtype=torch.float32,
+        mesh=object(),
+        num_tokens_paddings=[4, 8, 16, 32],
+        max_num_reqs=4,
+        num_reqs_max_model_len=KNR,
+        num_reqs_most_model_len=None,
+        input_batch=SimpleNamespace(num_reqs=3),
+        _dp_lockstep_enabled=lambda: True,
+        _dp_num_tokens_across_dp=lambda n: n,
+        # The step's all-reduced values (TPUModelRunner._dp_coordinated_step).
+        _dp_target_bucket=bucket,
+        _dp_step_max_reqs=3,
+        _dp_step_num_chunks=num_chunks,
+        _dp_step_any_prefill=any_prefill,
+    )
+    proposer._draft_attn_layer_names = {DRAFT_LAYER}
+    proposer._draft_hidden_size = lambda: HIDDEN
+    proposer.draft_model = _RecordingDraft(trace)
+    proposer._mtp_kv_only = MtpKvOnlyStep0(
+        _RecordingKvOnly(trace), LOCKSTEP_GATE, object()
+    )
+
+    def build_md(chunk, step_idx, seq_lens_delta, num_rejected_np, **kwargs):
+        trace.append(("md", step_idx, seq_lens_delta, kwargs["num_tokens_padded"]))
+        return {DRAFT_LAYER: None}
+
+    def lm_head(hidden):
+        trace.append(("lm_head", hidden.shape[0]))
+        return torch.zeros(hidden.shape[0], dtype=torch.int32)
+
+    proposer._build_draft_attn_metadata = build_md
+    proposer._draft_propose_token = lm_head
+    return proposer, trace
+
+
+def _busy_chunk(q_lens, bucket):
+    num_reqs = len(q_lens)
+    qsl = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+    return DraftChunkInputs(
+        input_ids=torch.zeros(bucket, dtype=torch.int32),
+        position_ids=torch.arange(bucket, dtype=torch.int32),
+        query_start_loc_np=qsl,
+        attn_ctx=SimpleNamespace(use_max_model_len=True),
+        start_index=0,
+        num_reqs=num_reqs,
+        aux_hidden_states=[],
+        hidden_states=torch.zeros(bucket, HIDDEN),
+    )
+
+
+def _busy_rank_trace(monkeypatch, *, q_lens, bucket, any_prefill, num_chunks):
+    """One busy rank: one real chunk, padded with dummy chunks up to the
+    step's chunk count."""
+    proposer, trace = _lockstep_proposer(
+        monkeypatch, bucket=bucket, any_prefill=any_prefill, num_chunks=num_chunks
+    )
+    chunk = _busy_chunk(q_lens, bucket)
+    proposer.draft_chunks = [chunk]
+    p = proposer._loop_bucket(chunk.num_reqs)
+
+    def prepare(chunk, *args, **kwargs):
+        last_token_indices = torch.zeros(p, dtype=torch.int64)
+        last_token_indices[: chunk.num_reqs] = torch.from_numpy(
+            chunk.query_start_loc_np[1:] - 1
+        )
+        rejected = np.zeros(chunk.num_reqs, dtype=np.int32)
+        return chunk.input_ids, chunk.position_ids, last_token_indices, rejected
+
+    proposer._prepare_draft_inputs = prepare
+    proposer.propose(None, [], None, SimpleNamespace(), return_device=True)
+    return trace
+
+
+def _idle_rank_trace(monkeypatch, *, bucket, any_prefill, num_chunks):
+    proposer, trace = _lockstep_proposer(
+        monkeypatch, bucket=bucket, any_prefill=any_prefill, num_chunks=num_chunks
+    )
+    proposer.run_dp_dummy_draft(num_chunks)
+    return trace
+
+
+def _expected_trace(bucket, num_chunks, two_pass, p=4):
+    if two_pass:
+        step0 = [
+            ("md", 0, 0, bucket),
+            ("kv_only", bucket),
+            ("md", 1, 0, p),
+            ("draft", 0, p),
+            ("lm_head", p),
+        ]
+    else:
+        step0 = [("md", 0, 0, bucket), ("draft", 0, bucket), ("lm_head", p)]
+    trace = step0 * num_chunks
+    for step in range(1, LOCKSTEP_K):
+        trace += [("md", step, step, p), ("draft", step, p), ("lm_head", p)] * (
+            num_chunks
+        )
+    return trace
+
+
+@pytest.mark.parametrize(
+    "q_lens, bucket, any_prefill, two_pass",
+    [
+        # This rank's chunk carries a prefill span: the two passes.
+        ([4, 6, 5], 16, True, True),
+        # Verify only here, but a peer prefills: the step's decision wins.
+        ([4, 4, 4], 16, True, True),
+        # No rank prefills: the single pass, at any size.
+        ([4, 4, 4], 16, False, False),
+        # Below the gate: the single pass.
+        ([2, 3, 2], 8, True, False),
+    ],
+)
+def test_lockstep_idle_ranks_replay_the_busy_ranks_programs(
+    monkeypatch, q_lens, bucket, any_prefill, two_pass
+):
+    """Collectives pair across EP-DP ranks in emission order, so a busy
+    rank (one real chunk and one padding chunk) and an idle rank (two
+    padding chunks) must run the same programs at the same shapes, in the
+    same order: pass 1 at the bucket and pass 2 at p, or the single pass at
+    the bucket, then the lm head at p."""
+    num_chunks = 2
+    busy = _busy_rank_trace(
+        monkeypatch,
+        q_lens=q_lens,
+        bucket=bucket,
+        any_prefill=any_prefill,
+        num_chunks=num_chunks,
+    )
+    idle = _idle_rank_trace(
+        monkeypatch, bucket=bucket, any_prefill=any_prefill, num_chunks=num_chunks
+    )
+    assert busy == _expected_trace(bucket, num_chunks, two_pass)
+    assert idle == busy
+
+
+def test_lockstep_decision_ignores_the_chunks_own_prefill(monkeypatch):
+    """A rank whose own chunk prefills follows the DP-wide bit too: it is
+    set whenever this rank prefills, so a False here is only reachable in
+    this test, and the chunk keeps the single pass like its peers."""
+    proposer, _ = _lockstep_proposer(
+        monkeypatch, bucket=16, any_prefill=False, num_chunks=1
+    )
+    assert proposer._takes_two_pass_step0(_busy_chunk([4, 6, 5], 16), 16) is False
+    proposer.runner._dp_step_any_prefill = True
+    assert proposer._takes_two_pass_step0(_busy_chunk([4, 4, 4], 16), 16) is True
