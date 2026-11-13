@@ -229,3 +229,44 @@ def test_exchange_head_pages(live, lanes):
                 want = caches[src, pages[src, j * part : j * part + n]]
                 want = want[..., head * width : (head + 1) * width]
                 np.testing.assert_array_equal(got[rank, j, src, :n], want)
+
+
+def test_gather_by_permute_rank_order():
+    if len(jax.devices()) < DCP:
+        pytest.skip(
+            "needs 8 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)"
+        )
+    mesh = Mesh(np.asarray(jax.devices()[:DCP]), ("dcp",))
+    x = jnp.arange(DCP * 4, dtype=jnp.float32).reshape(DCP, 4)
+    f = jax.shard_map(
+        lambda r, x: msa_dcp.gather_by_permute(x[0], r[0], "dcp", DCP)[None],
+        mesh=mesh,
+        in_specs=(P("dcp"), P("dcp")),
+        out_specs=P("dcp"),
+        check_vma=False,
+    )
+    got = np.asarray(f(jnp.arange(DCP, dtype=jnp.int32), x))
+    for r in range(DCP):
+        np.testing.assert_array_equal(got[r], np.asarray(x))
+
+
+def test_all_to_all_by_permute_matches_all_to_all():
+    if len(jax.devices()) < DCP:
+        pytest.skip(
+            "needs 8 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)"
+        )
+    mesh = Mesh(np.asarray(jax.devices()[:DCP]), ("dcp",))
+    x = jnp.arange(DCP * DCP * 3, dtype=jnp.float32).reshape(DCP * DCP, 3)
+
+    def body(fn):
+        return jax.shard_map(
+            fn,
+            mesh=mesh,
+            in_specs=(P("dcp"), P("dcp")),
+            out_specs=P("dcp"),
+            check_vma=False,
+        )(jnp.arange(DCP, dtype=jnp.int32), x)
+
+    got = body(lambda r, x: msa_dcp.all_to_all_by_permute(x, r[0], "dcp", DCP))
+    want = body(lambda r, x: jax.lax.all_to_all(x, "dcp", 0, 0, tiled=True))
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))

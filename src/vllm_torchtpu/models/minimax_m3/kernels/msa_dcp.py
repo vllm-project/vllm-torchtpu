@@ -958,6 +958,45 @@ def merge_partials(
     )(lse.astype(jnp.float32), parts, *([hadamard] if rotated else []))
 
 
+def gather_by_permute(x: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
+    """Every rank's `x` in rank order, ``[dcp, *x.shape]``, by ``dcp - 1``
+    collective permutes (rank ``r`` gets rank ``r + s``'s `x` from shift
+    ``s``). For decode-sized operands of a DCP pair (two cores of one
+    chip): each XLA all-gather there blocks the TensorCore for its latency
+    (3.2 us per layer at c4 b3, j-c71e5160). Across chips (DCP 8) the
+    permutes' starts cost more than the all-gather (c64 twin j-f92f5540)."""
+    out = jnp.zeros((dcp, *x.shape), x.dtype)
+    out = jax.lax.dynamic_update_index_in_dim(out, x, rank, 0)
+    for shift in range(1, dcp):
+        perm = [(src, (src - shift) % dcp) for src in range(dcp)]
+        received = jax.lax.ppermute(x, axis, perm)
+        out = jax.lax.dynamic_update_index_in_dim(
+            out, received, (rank + shift) % dcp, 0
+        )
+    return out
+
+
+def all_to_all_by_permute(
+    x: jax.Array, rank: jax.Array, axis: str, dcp: int
+) -> jax.Array:
+    """`jax.lax.all_to_all` of ``x [dcp, ...]`` along its leading axis (block
+    ``d`` goes to rank ``d``; block ``s`` of the result came from rank
+    ``s``), by `gather_by_permute`'s permutes. For decode-sized blocks: each
+    XLA all-to-all costs its latency on the TensorCore (~1.3 us per layer at
+    c4 decode, j-c71e5160)."""
+    out = jnp.zeros_like(x)
+    own = jax.lax.dynamic_index_in_dim(x, rank, 0, False)
+    out = jax.lax.dynamic_update_index_in_dim(out, own, rank, 0)
+    for shift in range(1, dcp):
+        perm = [(src, (src - shift) % dcp) for src in range(dcp)]
+        send = jax.lax.dynamic_index_in_dim(x, (rank - shift) % dcp, 0, False)
+        received = jax.lax.ppermute(send, axis, perm)
+        out = jax.lax.dynamic_update_index_in_dim(
+            out, received, (rank + shift) % dcp, 0
+        )
+    return out
+
+
 def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
     """The group's head-major query heads ``[dcp * Hl, T, D]`` from this
     rank's ``q [Hl, T, D]``. A pair swaps its halves by one collective
@@ -1004,7 +1043,13 @@ def attend_and_merge(
     num_heads, num_tokens, head_dim = q.shape
     rank = rank_array(rank)[0]
     q_all = _gather_heads(q, rank, axis, dcp)
-    cand_all = jax.lax.all_gather(candidates, axis, axis=0)
+    # Decode-sized operands of a pair move by permutes (latency); a prefill
+    # step's partials by XLA's all-to-all, which writes them in place.
+    small = dcp == 2 and num_tokens <= DCP_SMALL_BATCH_TOKENS
+    if small:
+        cand_all = gather_by_permute(candidates, rank, axis, dcp)
+    else:
+        cand_all = jax.lax.all_gather(candidates, axis, axis=0)
     out, lse = msa_attend_dcp(
         q_all,
         kv_cache,
@@ -1021,14 +1066,12 @@ def attend_and_merge(
         interpret=interpret,
     )
     # Block r of each result came from rank r: its partial of this rank's heads.
-    parts = jax.lax.all_to_all(
-        out.reshape(dcp, num_heads, num_tokens, head_dim), axis, 0, 0, tiled=True
-    )
-    lses = jax.lax.all_to_all(
-        lse.reshape(dcp, num_heads, num_tokens).transpose(0, 2, 1),
-        axis,
-        0,
-        0,
-        tiled=True,
-    )
+    parts = out.reshape(dcp, num_heads, num_tokens, head_dim)
+    lses = lse.reshape(dcp, num_heads, num_tokens).transpose(0, 2, 1)
+    if small:
+        parts = all_to_all_by_permute(parts, rank, axis, dcp)
+        lses = all_to_all_by_permute(lses, rank, axis, dcp)
+    else:
+        parts = jax.lax.all_to_all(parts, axis, 0, 0, tiled=True)
+        lses = jax.lax.all_to_all(lses, axis, 0, 0, tiled=True)
     return merge_partials(parts, lses, hadamard, interpret=interpret)
