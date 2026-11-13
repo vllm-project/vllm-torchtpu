@@ -189,6 +189,16 @@ class RhsRef(ABC):
     @abstractmethod
     def get_bias(self) -> jax.Array: ...
 
+    @abstractmethod
+    def get_weight_cols(self, start: int, size: int) -> jax.Array:
+        """Columns [start, start + size) of get_weight()."""
+        ...
+
+    @abstractmethod
+    def get_scale_cols(self, start: int, size: int, replicate_size: int) -> jax.Array:
+        """Columns [start, start + size) of get_scale(replicate_size)."""
+        ...
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -212,6 +222,13 @@ class WeightsRef(RhsRef):
     def get_bias(self) -> jax.Array:
         assert self.bias is not None
         return self.bias[...]
+
+    def get_weight_cols(self, start: int, size: int) -> jax.Array:
+        return self.weight[:, pl.ds(start, size)]
+
+    def get_scale_cols(self, start: int, size: int, replicate_size: int) -> jax.Array:
+        assert self.scale is not None
+        return self.scale[:, pl.ds(0, replicate_size, 0), pl.ds(start, size)]
 
 
 @jax.tree_util.register_dataclass
@@ -237,6 +254,26 @@ class FusedWeightsRef(RhsRef):
         b_up = self.up.get_bias()
         return interleave_lane(b_gate, b_up)
 
+    # Interleaved columns [start, start + size) are gate and up columns
+    # [start / 2, (start + size) / 2) when both are whole lane pairs.
+    def _half_cols(self, start: int, size: int) -> tuple[int, int]:
+        pair = 2 * pltpu.get_tpu_info().num_lanes
+        assert start % pair == 0 and size % pair == 0, (start, size)
+        return start // 2, size // 2
+
+    def get_weight_cols(self, start: int, size: int) -> jax.Array:
+        s, n = self._half_cols(start, size)
+        return interleave_lane(
+            self.gate.get_weight_cols(s, n), self.up.get_weight_cols(s, n)
+        )
+
+    def get_scale_cols(self, start: int, size: int, replicate_size: int) -> jax.Array:
+        s, n = self._half_cols(start, size)
+        return interleave_lane(
+            self.gate.get_scale_cols(s, n, replicate_size),
+            self.up.get_scale_cols(s, n, replicate_size),
+        )
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -256,6 +293,10 @@ class TileSizes:
     buckets: tuple[int, ...] = ()
     # Weight blocks the rhs pipeline keeps in flight.
     rhs_buffer_count: int = 3
+    # Dequantize-before-matmul rhs one MXU column chunk at a time, right
+    # before that chunk's matmul, instead of the whole [tile_k, tile_n] block
+    # up front (same values, smaller live temporary).
+    dequant_chunk: bool = False
 
     @property
     def bucket_sizes(self) -> tuple[int, ...]:
@@ -510,19 +551,27 @@ def inner_kernel(
 
         # Step 1: Input pre-processing.
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
-        tiled_rhs = tiled_rhs_ref.get_weight()
 
         # This should only be taken in the case where we don't requantize
         # the scales and thus we need to dequantize inside VMEM to avoid small
         # contracting dimmensions
-        rhs_tile_n = tiled_rhs.shape[1]
+        rhs_tile_n = cfgs.tiles.tile_n * (1 if cfgs.fuse_act is None else 2)
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
         dequant_after = cfgs.rhs_cfgs.should_dequantize_after_matmul
         fp8_rhs = cfgs.fp8_rhs_dtype(bucket_m)
+        chunk_dequant = (
+            cfgs.tiles.dequant_chunk
+            and fp8_rhs is None
+            and cfgs.rhs_cfgs.should_dequantize_before_matmul
+            and not cfgs.lhs_cfgs.should_quantize
+        )
+        tiled_rhs = None if chunk_dequant else tiled_rhs_ref.get_weight()
         if fp8_rhs is not None:
             # Skinny m: the MXU weight push binds, and fp8 halves it.
             tiled_rhs = tiled_rhs.astype(fp8_rhs)
             dequant_after = True
+        elif chunk_dequant:
+            pass  # Dequantized per column chunk in the matmul loop below.
         elif cfgs.rhs_cfgs.should_dequantize_before_matmul:
             tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
                 cfgs.lhs_cfgs.dtype
@@ -536,13 +585,33 @@ def inner_kernel(
             rhs_qbs = cfgs.tiles.tile_k
 
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
-        if is_last_k_step and valid_k != 0:
+        if is_last_k_step and valid_k != 0 and tiled_rhs is not None:
             mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
             tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
         # Step 2: Matmul.
         acc_list = []
-        if not cfgs.lhs_cfgs.should_quantize:
+        if chunk_dequant:
+            # The same elementwise dequantization and the same full-tile_k
+            # matmul per column chunk as below, one chunk at a time.
+            num_blocks = cfgs.num_quant_blocks_per_tile_k
+            for start_n in range(0, rhs_tile_n, mxu_size):
+                col_size = min(rhs_tile_n, start_n + mxu_size) - start_n
+                w = tiled_rhs_ref.get_weight_cols(start_n, col_size)
+                sc = tiled_rhs_ref.get_scale_cols(start_n, col_size, rhs_qbs)
+                w = w.astype(cfgs.lhs_cfgs.dtype).reshape(num_blocks, rhs_qbs, col_size)
+                w = (w * sc.astype(cfgs.lhs_cfgs.dtype)).reshape(
+                    cfgs.tiles.tile_k, col_size
+                )
+                if is_last_k_step and valid_k != 0:
+                    mask_rhs = lax.broadcasted_iota(jnp.int32, w.shape, 0) < valid_k
+                    w = jnp.where(mask_rhs, w, 0)
+                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
+                acc_n += jnp.matmul(
+                    tiled_lhs, w, preferred_element_type=jnp.float32
+                ).astype(acc_ref.dtype)
+                acc_list.append(acc_n)
+        elif not cfgs.lhs_cfgs.should_quantize:
             # Unquantized matmul path.
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
