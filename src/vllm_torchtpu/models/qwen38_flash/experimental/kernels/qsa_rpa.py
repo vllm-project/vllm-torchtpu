@@ -1,0 +1,1113 @@
+# SPDX-License-Identifier: Apache-2.0
+# Provenance: copied from src/vllm_torchtpu/kernels/qwen4_exp/qsa_rpa.py
+#   at 3bb1b554d0ed8866766394cf8b5c4aeabd824ef7.
+#   Owned by models/qwen38_flash from this copy on.
+"""QSA with native HEAD_ALONG_SUBLANE storage and existing batched RPA decode.
+
+Scheduler pages remain intact. Selected compression groups become virtual RPA
+pages by a view; the returned cache is threaded through donation, never dropped.
+Prefill reuses KV tiles through block-sparse attention; decode uses batched RPA,
+or the fused sparse GQA decode kernel under VLLM_TPU_QSA_FUSED_SPARSE_DECODE.
+"""
+
+import functools
+
+import jax
+import jax.numpy as jnp
+
+from .. import settings
+from ..kernels import shape_tuned
+from ..kernels.decode_indexer import (
+    select_decode_blocks,
+)
+from ..kernels.qsa import (
+    _token_metadata,
+    _update_indexer,
+    bf16,
+    produce,
+    quantize_kv,
+)
+from ..kernels.request_types import (
+    short_request_prefix_tokens,
+)
+
+
+def pack_rows(key, value, *, fp8, k_scale=1.0, v_scale=1.0):
+    pad = ((0, 0), (0, 0), (0, (-key.shape[-1]) % 128))
+    key, value = jnp.pad(key, pad), jnp.pad(value, pad)
+    if fp8:
+        key, value = quantize_kv(key, k_scale), quantize_kv(value, v_scale)
+    packing = 4 if fp8 else 2
+    joined = jnp.stack((key, value), axis=-2).reshape(len(key), -1, key.shape[-1])
+    joined = jnp.pad(joined, ((0, 0), (0, (-joined.shape[1]) % packing), (0, 0)))
+    joined = joined.reshape(len(key), -1, packing, key.shape[-1])
+    return joined
+
+
+def virtual_page_metadata(
+    blocks, lengths, table, *, ratio=4, page_size=128, dcp=None, ascending=False
+):
+    """Map selected logical groups to physical micro-pages; no KV gathering.
+
+    ``dcp = (rank, D)`` (main-KV decode context parallel, ``rank`` an int32[1]
+    operand): a table entry covers ``D * page_size`` tokens and this rank holds
+    rows ``t % page_size`` of the tokens with ``(t // page_size) % D == rank``.
+    Only those groups are kept, ascending at the front of each row, then the
+    partial tail group when this rank owns it; ``kv_lens`` counts owned tokens.
+
+    ``ascending``: the caller guarantees each row's valid groups are already in
+    ascending order (e.g. ``compressed_dcp_blocks``); with
+    ``VLLM_TPU_QSA_DCP_META_PARTITION`` the DCP owned-first ordering is then a
+    stable partition instead of a sort (same output).
+    """
+    if dcp is not None:
+        return _dcp_page_metadata(
+            blocks,
+            lengths,
+            table,
+            ratio=ratio,
+            page_size=page_size,
+            dcp=dcp,
+            ascending=ascending,
+        )
+    batch, budget = blocks.shape
+    complete = lengths // ratio
+    count = jnp.minimum(complete, budget)
+    columns = jnp.arange(budget + 1)[None, :]
+    groups = jnp.concatenate((blocks, jnp.zeros((batch, 1), jnp.int32)), axis=1)
+    groups = jnp.where(columns == count[:, None], complete[:, None], groups)
+    valid = (columns < count[:, None]) | (
+        (columns == count[:, None]) & ((lengths % ratio)[:, None] > 0)
+    )
+    safe = jnp.where(valid, groups, 0)
+    # Reuse sparse MLA's vector lookup for small page tables; the generic
+    # gather lowers to a slower indirect lookup on this path.
+    from vllm_torchtpu.kernels.mla.sparse.kernel import gather_page_ids
+
+    physical = gather_page_ids(
+        table.reshape(-1),
+        safe // (page_size // ratio),
+        jnp.arange(batch, dtype=jnp.int32),
+        batch,
+    )
+    pages = jnp.where(
+        valid, physical * (page_size // ratio) + safe % (page_size // ratio), 0
+    )
+    kv_lens = count * ratio + lengths % ratio
+    cu_q_lens = jnp.concatenate(
+        (jnp.zeros((1,), jnp.int32), jnp.cumsum((lengths > 0).astype(jnp.int32)))
+    )
+    return pages, kv_lens, cu_q_lens, jnp.full((3,), batch, jnp.int32)
+
+
+_PARTITION_LOGGED = False
+
+
+def _log_partition_once(batch, budget):
+    """Trace-time proof that the partition path was taken (once per process)."""
+    global _PARTITION_LOGGED
+    if not _PARTITION_LOGGED:
+        _PARTITION_LOGGED = True
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(
+            "VLLM_TPU_QSA_DCP_META_PARTITION: decode DCP metadata uses the stable "
+            "partition (first traced shape [%d, %d])",
+            batch,
+            budget,
+        )
+
+
+def _owned_first(blocks, owned):
+    """Each row's owned entries at the front in their input order (a stable
+    partition), the other columns ``int32 max``. Equal to sorting
+    ``where(owned, blocks, max)`` when the owned non-negative entries are
+    ascending: owned ``-1`` padding (an empty selection slot inside the counted
+    columns; ``-1 // page_groups`` is odd) sorts first there, so it goes first
+    here too."""
+    batch, budget = blocks.shape
+    neg = owned & (blocks < 0)
+    pos = owned & (blocks >= 0)
+    n_neg = jnp.sum(neg, axis=1, keepdims=True, dtype=jnp.int32)
+    dest = jnp.where(
+        neg,
+        jnp.cumsum(neg.astype(jnp.int32), axis=1) - 1,
+        jnp.where(pos, n_neg + jnp.cumsum(pos.astype(jnp.int32), axis=1) - 1, budget),
+    )
+    rows = jnp.broadcast_to(jnp.arange(batch, dtype=jnp.int32)[:, None], dest.shape)
+    big = jnp.iinfo(jnp.int32).max
+    return (
+        jnp.full((batch, budget), big, jnp.int32)
+        .at[rows, dest]
+        .set(blocks.astype(jnp.int32), mode="drop", unique_indices=True)
+    )
+
+
+def _dcp_page_metadata(
+    blocks, lengths, table, *, ratio, page_size, dcp, ascending=False
+):
+    """:func:`virtual_page_metadata` for this DCP rank's owned groups; rows
+    with no owned token get ``kv_lens`` 0 and no query (see ``cu_q_lens``)."""
+    rank, world = dcp
+    rank = jnp.asarray(rank, jnp.int32).reshape(-1)[0]
+    batch, budget = blocks.shape
+    page_groups = page_size // ratio
+    big = jnp.iinfo(jnp.int32).max
+    complete = lengths // ratio
+    count = jnp.minimum(complete, budget)
+    columns = jnp.arange(budget)[None, :]
+    owned = (columns < count[:, None]) & ((blocks // page_groups) % world == rank)
+    # Owned groups ascending at the front, the rest after them.
+    if ascending and settings.VLLM_TPU_QSA_DCP_META_PARTITION:
+        # VLLM_TPU_QSA_DCP_META_PARTITION: the selection is already ascending,
+        # so a stable partition gives the sort's result without the
+        # [rows, budget] sort (~30 us per layer call at 32-128 rows).
+        groups = _owned_first(blocks, owned)
+        _log_partition_once(batch, budget)
+    else:
+        groups = jax.lax.sort(
+            jnp.where(owned, blocks, big), dimension=1, is_stable=False
+        )
+    owned_count = jnp.sum(owned, axis=1, dtype=jnp.int32)
+    tail = ((lengths % ratio) > 0) & ((complete // page_groups) % world == rank)
+    columns = jnp.arange(budget + 1)[None, :]
+    groups = jnp.concatenate((groups, jnp.zeros((batch, 1), jnp.int32)), axis=1)
+    groups = jnp.where(columns == owned_count[:, None], complete[:, None], groups)
+    valid = (columns < owned_count[:, None]) | (
+        (columns == owned_count[:, None]) & tail[:, None]
+    )
+    safe = jnp.where(valid, groups, 0)
+    from vllm_torchtpu.kernels.mla.sparse.kernel import gather_page_ids
+
+    # One table entry covers `world` pages' worth of tokens; this rank's half
+    # sits in that entry's physical page at row t % page_size.
+    physical = gather_page_ids(
+        table.reshape(-1),
+        safe // (world * page_groups),
+        jnp.arange(batch, dtype=jnp.int32),
+        batch,
+    )
+    pages = jnp.where(valid, physical * page_groups + safe % page_groups, 0)
+    kv_lens = owned_count * ratio + jnp.where(tail, lengths % ratio, 0)
+    cu_q_lens = jnp.concatenate(
+        (jnp.zeros((1,), jnp.int32), jnp.cumsum((kv_lens > 0).astype(jnp.int32)))
+    )
+    return pages, kv_lens, cu_q_lens, jnp.full((3,), batch, jnp.int32)
+
+
+def _rpa_attention_batch(
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    kv_heads,
+    ratio,
+    bkv_size=256,
+    batch_size=8,
+    k_scale=1.0,
+    v_scale=1.0,
+    kv_head_offset=0,
+    decode_only=False,
+    lean_fetch=False,
+    slot_read=False,
+    compact=False,
+    fast_fetch=False,
+    dcp=None,
+    return_lse=False,
+    ascending=False,
+):
+    """With ``return_lse`` returns ``(out, lse, cache)``: ``out`` f32 normalized
+    over the attended keys and not gated, ``lse`` [rows, heads] (natural log);
+    rows with no key get 0 and -inf. ``dcp``: see ``virtual_page_metadata``."""
+    from ..kernels.batched_rpa import (
+        configs,
+        wrapper,
+    )
+
+    kv_slot = None
+    if slot_read and slot_readable(cache, kv_heads, kv_head_offset):
+        # Read this layer's pair of the packed row directly: one KV head, no
+        # zero queries for the other layer's head, one pair unpacked.
+        kv_slot, kv_head_offset = kv_head_offset, 0
+    pages, kv_lens, cu_q_lens, distribution = virtual_page_metadata(
+        blocks,
+        lengths,
+        table,
+        ratio=ratio,
+        page_size=cache.shape[1],
+        **({"dcp": dcp, "ascending": ascending} if dcp is not None else {}),
+    )
+    # A row has a query when it attends any key: every live row, or under DCP
+    # every row this rank owns a key of.
+    live = kv_lens > 0 if dcp is not None else lengths > 0
+    # Queries are packed in request order; zero-length requests have no query.
+    order = jnp.argsort(~live if dcp is not None else lengths == 0, stable=True)
+    query = jnp.pad(
+        q[order].astype(jnp.float32),
+        ((0, 0), (0, 0), (0, cache.shape[-1] - q.shape[-1])),
+    )
+    virtual_cache = cache.reshape(-1, ratio, *cache.shape[2:])
+    # Paired pages store a second layer's KV head after the first. RPA reads
+    # a row's leading heads; the cache then presents kv_head_offset + kv_heads
+    # heads and zero queries attend the heads ahead of this layer's.
+    skipped_heads = kv_head_offset * (q.shape[1] // kv_heads)
+    if kv_head_offset:
+        if (kv_head_offset + kv_heads) * 2 > cache.shape[2] * cache.shape[3]:
+            raise ValueError("KV head offset exceeds the cache row's head slots")
+        query = jnp.pad(query, ((0, 0), (skipped_heads, 0), (0, 0)))
+    dummy_k = jnp.zeros(
+        (q.shape[0], kv_heads + kv_head_offset, query.shape[-1]), cache.dtype
+    )
+    decode = configs.BlockSizes(
+        bq_sz=1, bq_c_sz=1, bkv_sz=bkv_size, batch_size=batch_size
+    )
+    prefill = configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=bkv_size, batch_size=1)
+    result = wrapper.ragged_paged_attention(
+        query,
+        dummy_k,
+        dummy_k,
+        virtual_cache,
+        kv_lens,
+        pages.reshape(-1),
+        cu_q_lens,
+        distribution,
+        sm_scale=q.shape[-1] ** -0.5,
+        q_scale=None,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        out_dtype=jnp.dtype(jnp.float32),
+        skip_kv_update=True,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        decode_block_sizes=decode,
+        prefill_block_sizes=prefill,
+        # virtual_page_metadata makes every row a decode row.
+        decode_only=decode_only,
+        lean_kv_fetch=lean_fetch or fast_fetch,
+        fast_kv_fetch=fast_fetch,
+        kv_slot=kv_slot,
+        compact_kv_schedule=compact,
+        **({"return_lse": True} if return_lse else {}),
+    )
+    out, next_cache = result[0], result[1]
+    rows = jnp.minimum(cu_q_lens[:-1], len(q) - 1)
+    out = out[rows, :, : q.shape[-1]]
+    if kv_head_offset:
+        out = out[:, skipped_heads:]
+    if return_lse:
+        lse = result[2][rows]
+        if kv_head_offset:
+            lse = lse[:, skipped_heads:]
+        out = jnp.where(live[:, None, None], out, 0)
+        lse = jnp.where(live[:, None], lse.astype(jnp.float32), -jnp.inf)
+        return out, lse, next_cache.reshape(cache.shape)
+    out = bf16(
+        bf16(out).astype(jnp.float32)
+        * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
+    )
+    out = jnp.where((lengths > 0)[:, None, None], out, 0)
+    return out, next_cache.reshape(cache.shape)
+
+
+def slot_readable(cache, kv_heads, kv_head_offset):
+    """RPA can attend head slot ``kv_head_offset`` of a packed row directly:
+    one KV head and rows of one packed sublane (FP8 paired pages)."""
+    return (
+        kv_heads == 1
+        and cache.ndim == 5
+        and cache.shape[2] == 1
+        and kv_head_offset < cache.shape[3] // 2
+    )
+
+
+def rpa_query_batch_size(page_columns):
+    # RPA's minimum 128-step, batch8 schedule occupies about 815 KiB
+    # of v7's 1 MiB SMEM. A 64-query, 513-column page table fits alongside
+    # that schedule; keep larger tables within a 160 KiB scalar-data budget.
+    max_queries = min(64, (160 * 1024) // (4 * page_columns))
+    return 1 << (max_queries.bit_length() - 1)
+
+
+def rpa_attention(
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+    kv_head_offset=0,
+    decode_only=False,
+    lean_fetch=False,
+    slot_read=False,
+    compact=False,
+    fast_fetch=False,
+    dcp=None,
+    return_lse=False,
+    ascending=False,
+):
+    """With ``return_lse`` returns ``(out, lse, cache)`` (see
+    ``_rpa_attention_batch``); ``dcp`` attends this DCP rank's owned keys.
+    ``ascending``: see ``virtual_page_metadata``."""
+    batch_size = rpa_query_batch_size(blocks.shape[1] + 1)
+    if compact and settings.VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES:
+        # The compact schedule holds one entry per lane-tile instead of one
+        # per 4-token page, leaving SMEM for a larger scalar-prefetched page
+        # table: a full MTP verify step (24 requests x 4 rows) runs as one
+        # RPA call per layer instead of two 64-row chunks.
+        batch_size = settings.VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES
+    bkv_size = settings.VLLM_TPU_QSA_DECODE_RPA_BKV
+    lanes = settings.VLLM_TPU_QSA_DECODE_RPA_LANES
+    tuned = shape_tuned.rpa_decode_tiles(len(q)) if compact else None
+    if tuned is not None:
+        # VLLM_TPU_SHAPE_TUNED: measured tiles for this decode-rows bucket.
+        bkv_size, lanes, max_queries = tuned
+        batch_size = max_queries or batch_size
+    attend = functools.partial(
+        _rpa_attention_batch,
+        kv_heads=kv_heads,
+        ratio=ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        **({"decode_only": True} if decode_only else {}),
+        **({"lean_fetch": True} if lean_fetch else {}),
+        **({"slot_read": True} if slot_read else {}),
+        **({"fast_fetch": True} if fast_fetch else {}),
+        **(
+            dict(
+                compact=True,
+                bkv_size=bkv_size,
+                batch_size=lanes,
+            )
+            if compact
+            else {}
+        ),
+        **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
+        **({"dcp": dcp} if dcp is not None else {}),
+        **({"return_lse": True} if return_lse else {}),
+        **({"ascending": True} if ascending else {}),
+    )
+    if len(q) <= batch_size:
+        return attend(q, gate, blocks, lengths, table, cache)
+    padding = (-len(q)) % batch_size
+
+    def split(x):
+        x = jnp.pad(x, ((0, padding),) + ((0, 0),) * (x.ndim - 1))
+        return x.reshape(-1, batch_size, *x.shape[1:])
+
+    def step(cache, inputs):
+        query, gate, blocks, lengths, table = inputs
+        *output, cache = attend(query, gate, blocks, lengths, table, cache)
+        return cache, tuple(output)
+
+    # Keep the small-step path fully unrolled, but bound the unroll for large
+    # prefill steps. Fully expanding a 4K step repeats the RPA body 128 times
+    # in each QSA layer and makes whole-model compilation impractical.
+    num_chunks = (len(q) + batch_size - 1) // batch_size
+    cache, output = jax.lax.scan(
+        step,
+        cache,
+        tuple(map(split, (q, gate, blocks, lengths, table))),
+        unroll=min(num_chunks, 4),
+    )
+    out = output[0].reshape(-1, *q.shape[1:])[: len(q)]
+    if return_lse:
+        return out, output[1].reshape(-1, q.shape[1])[: len(q)], cache
+    return out, cache
+
+
+def fused_sparse_decode(
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+    kv_head_offset=0,
+):
+    """``rpa_attention`` on the fused sparse GQA decode kernel, or None.
+
+    Same contract as ``rpa_attention``: one query row per token, gated output
+    (the kernel applies the sigmoid gate before its output DMA, so callers
+    must not gate again), zero rows for zero lengths, and the cache returned
+    unchanged through donation. Returns None when the inputs fall outside the
+    kernel's static envelope (non-TPU7x, unsupported shapes or dtypes) so the
+    caller can fall back to RPA.
+
+    ``kv_head_offset`` follows ``rpa_attention``: the kernel reads a row's
+    leading heads, so the cache presents ``kv_head_offset + kv_heads`` heads
+    and zero queries/gates attend the heads ahead of this layer's.
+    """
+    from ..kernels import sparse_gqa_decode
+    from ..kernels.sparse_gqa_decode import (
+        decode,
+    )
+
+    if kv_heads <= 0 or kv_head_offset < 0 or q.shape[1] % kv_heads:
+        return None
+    skipped_heads = kv_head_offset * (q.shape[1] // kv_heads)
+    if skipped_heads:
+        pad = ((0, 0), (skipped_heads, 0), (0, 0))
+        q, gate = jnp.pad(q, pad), jnp.pad(gate, pad)
+    options = dict(
+        kv_heads=kv_heads + kv_head_offset,
+        ratio=ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    launch = sparse_gqa_decode.plan_decode(
+        q, gate, blocks, lengths, table, cache, **options
+    )
+    if launch is None:
+        return None
+    out, cache = decode.execute_decode(
+        q,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        launch=launch,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    return (out[:, skipped_heads:] if skipped_heads else out), cache
+
+
+def decode_attention(
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+    kv_head_offset=0,
+    fused=None,
+    shared_schedule=None,
+    dcp=None,
+    return_lse=False,
+    ascending=False,
+):
+    """Per-row decode attention: fused sparse decode when enabled, else RPA.
+
+    ``dcp`` / ``return_lse``: see ``rpa_attention`` (RPA only: the fused
+    sparse decode kernel has no LSE output). With ``return_lse`` returns
+    ``(out, lse, cache)``.
+
+    ``fused`` defaults to ``VLLM_TPU_QSA_FUSED_SPARSE_DECODE`` (read at trace
+    time). Ineligible inputs fall back to RPA.
+
+    ``shared_schedule`` (default ``VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE``)
+    presents every head slot of the cache row, with zero queries for the heads
+    that are not this layer's, so both layers of a paired main KV page (and
+    unpaired layers, whose FP8 rows hold the same slots) launch one kernel
+    configuration. The decode schedule depends only on the step's lengths
+    and that configuration, so XLA computes it once per step instead of once
+    per slot; RPA also skips its empty mixed-sequence pass. With
+    ``VLLM_TPU_QSA_DECODE_SLOT_READ`` RPA reads each layer's own head slot
+    instead, so every layer already launches one KV head and nothing is
+    padded.
+    """
+    shared = (
+        settings.VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE
+        if shared_schedule is None
+        else shared_schedule
+    )
+    trailing = 0
+    if shared and cache.ndim == 5:
+        trailing = cache.shape[2] * cache.shape[3] // 2 - kv_head_offset - kv_heads
+    use_fused = settings.VLLM_TPU_QSA_FUSED_SPARSE_DECODE if fused is None else fused
+    if return_lse or dcp is not None:
+        use_fused = fused = False
+    if (
+        settings.VLLM_TPU_QSA_DECODE_SLOT_READ
+        and not use_fused
+        and slot_readable(cache, kv_heads, kv_head_offset)
+    ):
+        # Every layer already launches one KV head (slot reads); no padding.
+        trailing = 0
+    if not shared or trailing <= 0 or q.shape[1] % kv_heads:
+        trailing = 0
+    pad = ((0, 0), (0, trailing * (q.shape[1] // kv_heads)), (0, 0))
+    result = _decode_attention(
+        jnp.pad(q, pad) if trailing else q,
+        jnp.pad(gate, pad) if trailing else gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        kv_heads=kv_heads + trailing,
+        ratio=ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_head_offset=kv_head_offset,
+        fused=fused,
+        decode_only=shared,
+        **({"dcp": dcp} if dcp is not None else {}),
+        **({"return_lse": True} if return_lse else {}),
+        **({"ascending": True} if ascending else {}),
+    )
+    *outs, cache = result
+    outs = [x[:, : q.shape[1]] if trailing else x for x in outs]
+    return (*outs, cache)
+
+
+def _decode_attention(
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    kv_heads,
+    ratio,
+    k_scale,
+    v_scale,
+    kv_head_offset,
+    fused,
+    decode_only=False,
+    dcp=None,
+    return_lse=False,
+    ascending=False,
+):
+    options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
+    if kv_head_offset:
+        options["kv_head_offset"] = kv_head_offset
+    if (
+        not return_lse
+        and dcp is None
+        and (settings.VLLM_TPU_QSA_FUSED_SPARSE_DECODE if fused is None else fused)
+    ):
+        result = fused_sparse_decode(q, gate, blocks, lengths, table, cache, **options)
+        if result is not None:
+            return result
+    if decode_only:
+        options["decode_only"] = True
+    if settings.VLLM_TPU_QSA_DECODE_LEAN_FETCH:
+        options["lean_fetch"] = True
+    if settings.VLLM_TPU_QSA_DECODE_SLOT_READ:
+        options["slot_read"] = True
+    if settings.VLLM_TPU_QSA_DECODE_FAST_FETCH:
+        options["fast_fetch"] = True
+    if settings.VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE:
+        options["compact"] = True
+    if dcp is not None:
+        options["dcp"] = dcp
+    if return_lse:
+        options["return_lse"] = True
+    if ascending and dcp is not None:
+        options["ascending"] = True
+
+    return rpa_attention(q, gate, blocks, lengths, table, cache, **options)
+
+
+def _prefill_attention(
+    query,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    starts,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+    kv_head_offset=0,
+    dcp=None,
+    return_lse=False,
+):
+    """With ``return_lse`` returns ``(out, lse, cache)`` (see
+    ``block_sparse_gqa_attention``)."""
+    union_group = settings.VLLM_TPU_QSA_PREFILL_UNION_WALK
+    if union_group and (128 % union_group or union_group < 8):
+        raise ValueError(
+            "VLLM_TPU_QSA_PREFILL_UNION_WALK must be a divisor of 128, at least 8"
+        )
+    if (
+        union_group
+        and dcp is None
+        and not return_lse
+        and kv_head_offset == 0
+        and ratio == 4
+        and cache.dtype == jnp.float8_e4m3fn
+        and cache.shape[1] % 128 == 0
+        and tuple(cache.shape[2:]) == (1, 4, 256)
+        # Unsharded Q24/KV2, or a TP rank's one KV head with 24 / TP queries.
+        and (query.shape[1], kv_heads) in ((24, 2), (12, 1), (6, 1), (3, 1))
+        and query.shape[2] == 256
+        and query.shape[0] % union_group == 0
+        and query.shape[0] >= 1024
+    ):
+        from ..kernels.qsa_union_dense import (
+            union_walk_prefill,
+        )
+
+        return union_walk_prefill(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            starts,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            group=union_group,
+            kv_tile=settings.VLLM_TPU_QSA_PREFILL_UNION_KV_TILE,
+            union_cap=settings.VLLM_TPU_QSA_PREFILL_UNION_CAP,
+            min_context=settings.VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT,
+            lean=settings.VLLM_TPU_QSA_PREFILL_LEAN,
+            listed=settings.VLLM_TPU_QSA_PREFILL_UNION_LISTED or None,
+            share_bits=settings.VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS,
+            union_alpha=settings.VLLM_TPU_QSA_PREFILL_UNION_ALPHA,
+            qk16=settings.VLLM_TPU_QSA_PREFILL_UNION_QK16,
+            run_tables=settings.VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES,
+            lazy_share=settings.VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE,
+            gathered=settings.VLLM_TPU_QSA_PREFILL_UNION_GATHERED or None,
+            gather_chunks=settings.VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS,
+            gather_growth=settings.VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH,
+            compact_reqs=settings.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS,
+            compact_copy_method=settings.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY,
+            sc_bitset=settings.VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET,
+        )
+    from ..kernels.block_sparse_gqa_prefill import (
+        block_sparse_gqa_attention,
+    )
+    from ..kernels.prefill_tiles import (
+        get_sparse_prefill_tiles,
+    )
+
+    query_block, kv_tile, query_tile = get_sparse_prefill_tiles(
+        query, cache, kv_heads=kv_heads, ratio=ratio, with_query_tile=True
+    )
+    if dcp is not None:
+        # One KV tile per owned page: the kernel walks this rank's pages only. The owned
+        # walk
+        # streams half the pages per query block, so a wider query block amortises them:
+        # 1024 / 256 (6 gathered heads) is bit-identical and 6-11% faster than 512 / 128
+        # at an
+        # 8K chunk over 90K-130K contexts (j-bdd87f65, j-7bedee35).
+        kv_tile = cache.shape[1]
+        if settings.VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK:
+            query_block = settings.VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK
+            query_tile = settings.VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE or None
+        tuned = shape_tuned.dcp_prefill_tiles(len(query))
+        if tuned is not None:
+            # VLLM_TPU_SHAPE_TUNED: measured tiles for this chunk-size bucket.
+            query_block, query_tile = tuned
+        if query_block % 128 or query_block * query.shape[1] > 256 * 24:
+            query_block, query_tile = 256, None
+        if query_tile and query_block % query_tile:
+            query_tile = None
+    return block_sparse_gqa_attention(
+        query,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        starts,
+        kv_heads=kv_heads,
+        ratio=ratio,
+        query_block=query_block,
+        kv_tile=kv_tile,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
+        **({"query_tile": query_tile} if query_tile else {}),
+        **({"dcp": dcp} if dcp is not None else {}),
+        **({"return_lse": True} if return_lse else {}),
+    )
+
+
+def _with_lse_channel(attend):
+    """``attend(..., return_lse=True) -> (out, lse, cache)`` as ``(out_ext, cache)``
+    with ``lse`` appended to ``out``'s lane axis, so the decode/prefill routing
+    moves both with the same row selects."""
+
+    def run(*args, **kwargs):
+        out, lse, cache = attend(*args, **kwargs)
+        return jnp.concatenate(
+            [out.astype(jnp.float32), lse[..., None]], axis=-1
+        ), cache
+
+    return run
+
+
+def _split_lse_channel(output, lengths, cache):
+    live = (lengths > 0)[:, None]
+    out = jnp.where(live[..., None], output[..., :-1], 0)
+    lse = jnp.where(live, output[..., -1], -jnp.inf)
+    return out, lse, cache
+
+
+def _with_lse_pair(attend):
+    """``attend(..., return_lse=True)`` as ``((out, lse), cache)``: the
+    VLLM_TPU_QSA_DCP_SPLIT_LSE form of ``_with_lse_channel``. The routing moves
+    both arrays with the same row selects, without the [.., D + 1] channel
+    concat and the slices that undo it (same values)."""
+
+    def run(*args, **kwargs):
+        out, lse, cache = attend(*args, **kwargs)
+        return (out.astype(jnp.float32), lse), cache
+
+    return run
+
+
+def _split_lse_pair(output, lengths, cache):
+    out, lse = output
+    live = (lengths > 0)[:, None]
+    return jnp.where(live[..., None], out, 0), jnp.where(live, lse, -jnp.inf), cache
+
+
+def _rows_where(mask, a, b):
+    """``where(mask[row], a, b)`` over arrays or (out, lse) pairs."""
+    return jax.tree.map(
+        lambda x, y: jnp.where(mask.reshape(mask.shape + (1,) * (x.ndim - 1)), x, y),
+        a,
+        b,
+    )
+
+
+def dcp_combine(out_pair, lse_pair, gate, rank, *, out_dtype=jnp.bfloat16):
+    """Merge a DCP group's partial attention for this rank's heads, then gate.
+
+    ``out_pair`` [size, T, size * H, D] f32 and ``lse_pair`` [size, T, size * H]
+    are every group rank's ``qsa_attention(dcp=...)`` results over the group's
+    concatenated heads (rank 0's first); ``gate`` [T, H, D] is this rank's
+    gate; ``rank`` int32 ``[1]``. Rows no rank owns a key of stay 0. The gate
+    rounding matches the replicated kernels'.
+    """
+    size, tokens, heads_all, dim = out_pair.shape
+    heads = heads_all // size
+    start = rank.reshape(()).astype(jnp.int32) * heads
+    out_pair = jax.lax.dynamic_slice_in_dim(out_pair, start, heads, axis=2)
+    lse_pair = jax.lax.dynamic_slice_in_dim(lse_pair, start, heads, axis=2)
+    return dcp_combine_own(out_pair, lse_pair, gate, out_dtype=out_dtype)
+
+
+def dcp_combine_own(out_pair, lse_pair, gate, *, out_dtype=jnp.bfloat16):
+    """``dcp_combine`` from every group rank's partials for this rank's heads
+    only: ``out_pair`` [size, T, H, D], ``lse_pair`` [size, T, H]."""
+    top = jnp.max(lse_pair, axis=0)
+    finite = jnp.isfinite(top)
+    weight = jnp.where(
+        finite[None], jnp.exp(lse_pair - jnp.where(finite, top, 0)[None]), 0
+    )
+    total = jnp.sum(weight, axis=0)
+    out = (
+        jnp.sum(weight[..., None] * out_pair, axis=0)
+        / jnp.where(total > 0, total, 1)[..., None]
+    )
+    gated = bf16(
+        bf16(out).astype(jnp.float32)
+        * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
+    )
+    return jnp.where(finite[..., None], gated, 0).astype(out_dtype)
+
+
+def dcp_combine_step(
+    out_pair: jax.Array, lse_pair: jax.Array, gate: jax.Array, rank: jax.Array
+) -> jax.Array:
+    """``dcp_combine`` with a fully annotated signature for ``jax_op``.
+
+    ``gate`` may be the whole ``[T, heads, 2 D]`` q/gate row
+    (VLLM_TPU_QSA_DCP_GATE_IN_COMBINE); its gate half is sliced here."""
+    head_dim = out_pair.shape[-1]
+    if gate.shape[-1] == 2 * head_dim:
+        gate = gate[..., head_dim:]
+    return dcp_combine(out_pair, lse_pair, gate, rank)
+
+
+def dcp_combine_own_step(
+    out_pair: jax.Array, lse_pair: jax.Array, gate: jax.Array
+) -> jax.Array:
+    """``dcp_combine_own`` with a fully annotated signature for ``jax_op``."""
+    head_dim = out_pair.shape[-1]
+    if (
+        gate.shape[-1] == 2 * head_dim
+    ):  # the whole q/gate row (VLLM_TPU_QSA_DCP_GATE_IN_COMBINE)
+        gate = gate[..., head_dim:]
+    return dcp_combine_own(out_pair, lse_pair, gate)
+
+
+def qsa_attention(
+    query,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    starts,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+    kv_head_offset=0,
+    max_query_len=1,
+    dcp=None,
+    ascending=False,
+):
+    """Route a decode prefix to per-row decode and the remaining rows to prefill.
+
+    Decode rows run on batched RPA, or on the fused sparse GQA decode kernel
+    when ``VLLM_TPU_QSA_FUSED_SPARSE_DECODE`` is set and the inputs qualify.
+
+    ``max_query_len`` is the most tokens a decoding request carries in one step
+    (``num_speculative_tokens + 1`` under MTP). A step with at most that many
+    tokens per request row is a decode/verify step and runs every token on RPA
+    as its own causal row; comparing tokens with request rows alone sent every
+    MTP verify step with more than ``rows / (K + 1)`` requests to prefill.
+
+    ``kv_head_offset`` reads this layer's KV heads after that many other heads
+    of each cache row (the second layer of a paired main KV page).
+
+    ``dcp=(rank, size)`` (VLLM_TPU_QSA_MAIN_KV_DCP): attend only this rank's
+    main-KV rows and return ``(out, lse, cache)``: ``out`` [T, heads, D] f32
+    normalized over the owned keys and NOT gated, ``lse`` [T, heads] f32
+    (natural log, ``-inf`` when the row owns no key). ``dcp_combine`` merges
+    the pair.
+    """
+    options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
+    if kv_head_offset:
+        options["kv_head_offset"] = kv_head_offset
+    split = _split_lse_channel
+    if dcp is not None:
+        options.update(dcp=dcp, return_lse=True)
+        if settings.VLLM_TPU_QSA_DCP_SPLIT_LSE:
+            wrap, split = _with_lse_pair, _split_lse_pair
+        else:
+            wrap = _with_lse_channel
+        decode_fn, prefill_fn = wrap(decode_attention), wrap(_prefill_attention)
+    else:
+        decode_fn, prefill_fn = decode_attention, _prefill_attention
+    if ascending and dcp is not None:
+        # The selection rows are ascending (see virtual_page_metadata).
+        decode_fn = functools.partial(decode_fn, ascending=True)
+    if len(query) <= (len(starts) - 1) * max_query_len:
+        output, cache = decode_fn(query, gate, blocks, lengths, table, cache, **options)
+        return split(output, lengths, cache) if dcp is not None else (output, cache)
+
+    # RPA rows: one per request row, times the tokens a verify request holds.
+    capacity = min(len(query), (len(starts) - 1) * max_query_len)
+    # Steps with a short-request prefix run its tokens on RPA and the rest on
+    # prefill; other steps run every row on prefill. Pick the route by masking
+    # the inputs, not with lax.cond: a conditional that returns the cache
+    # makes XLA copy it, which for the unified pool is a second full pool in
+    # HBM. RPA then runs on every step, on zero-length rows when unused, and
+    # the cache threads through both kernels exactly once.
+    prefix = short_request_prefix_tokens(starts, capacity)
+    decode_lengths = jnp.where(jnp.arange(capacity) < prefix, lengths[:capacity], 0)
+    decoded, cache = decode_fn(
+        query[:capacity],
+        gate[:capacity],
+        blocks[:capacity],
+        decode_lengths,
+        table[:capacity],
+        cache,
+        **options,
+    )
+    # Keep bucket shapes fixed while removing the decode prefix on device.
+    rows = jnp.arange(len(query))
+    if settings.VLLM_TPU_QSA_PREFIX_SLICE:
+        # Contiguous dynamic slices instead of row gathers: the same rows (clamped at
+        # the
+        # last one), read at HBM rate rather than per-row index rate.
+        def shift(x):
+            return _shift_rows_up(x, prefix, capacity)
+
+        prefill_lengths = jnp.where(rows < starts[-1] - prefix, shift(lengths), 0)
+        prefilled, cache = prefill_fn(
+            shift(query),
+            shift(gate),
+            shift(blocks),
+            prefill_lengths,
+            shift(table),
+            cache,
+            jnp.maximum(starts - prefix, 0),
+            **options,
+        )
+        output = _rows_where(
+            rows < prefix,
+            jax.tree.map(lambda x: _pad_rows(x, len(query)), decoded),
+            jax.tree.map(lambda x: _shift_rows_down(x, prefix, capacity), prefilled),
+        )
+        if dcp is not None:
+            return split(output, lengths, cache)
+        return jnp.where((lengths > 0)[:, None, None], output, 0), cache
+    ids = jnp.minimum(rows + prefix, len(query) - 1)
+    prefill_lengths = jnp.where(rows < starts[-1] - prefix, lengths[ids], 0)
+    prefilled, cache = prefill_fn(
+        query[ids],
+        gate[ids],
+        blocks[ids],
+        prefill_lengths,
+        table[ids],
+        cache,
+        jnp.maximum(starts - prefix, 0),
+        **options,
+    )
+    output = _rows_where(
+        rows < prefix,
+        jax.tree.map(lambda x: x[jnp.minimum(rows, capacity - 1)], decoded),
+        jax.tree.map(lambda x: x[jnp.maximum(rows - prefix, 0)], prefilled),
+    )
+    if dcp is not None:
+        return split(output, lengths, cache)
+    return jnp.where((lengths > 0)[:, None, None], output, 0), cache
+
+
+def _pad_rows(x: jax.Array, n: int) -> jax.Array:
+    """``x[min(r, len(x) - 1)]`` for ``r < n``: the last row repeated, a static
+    concat.
+    """
+    if len(x) >= n:
+        return x[:n]
+    return jnp.concatenate([x, jnp.broadcast_to(x[-1:], (n - len(x),) + x.shape[1:])])
+
+
+def _shift_rows_up(x: jax.Array, shift: jax.Array, max_shift: int) -> jax.Array:
+    """``x[min(r + shift, len(x) - 1)]`` for ``0 <= shift <= max_shift``, one dynamic
+    slice."""
+    return jax.lax.dynamic_slice_in_dim(
+        _pad_rows(x, len(x) + max_shift), shift, len(x), 0
+    )
+
+
+def _shift_rows_down(x: jax.Array, shift: jax.Array, max_shift: int) -> jax.Array:
+    """``x[max(r - shift, 0)]`` for ``0 <= shift <= max_shift``, one dynamic slice."""
+    head = jnp.broadcast_to(x[:1], (max_shift,) + x.shape[1:])
+    return jax.lax.dynamic_slice_in_dim(
+        jnp.concatenate([head, x]), max_shift - shift, len(x), 0
+    )
+
+
+def qsa_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    cache: jax.Array,
+    compressed: jax.Array,
+    ring: jax.Array,
+    tags: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    slots: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    if len(qgate) == 0:
+        return (
+            cache,
+            compressed,
+            ring,
+            tags,
+            jnp.empty((0, qgate.shape[1] // 2), jnp.bfloat16),
+            jnp.empty((0, token_topk + compress_ratio - 1), jnp.int32),
+        )
+    q, k, v, gate, iq, raw = produce(
+        qgate, key, value, index_qk, nq, nk, niq, positions, trig, norm_eps, rotary_dim
+    )
+    fp8 = cache.dtype == jnp.float8_e4m3fn
+    req, logical, valid = _token_metadata(len(q), starts, context, slots)
+    page = jnp.where(valid, main_table[req, logical // cache.shape[1]], cache.shape[0])
+    cache = cache.at[page, logical % cache.shape[1]].set(
+        pack_rows(k, v, fp8=fp8, k_scale=k_scale, v_scale=v_scale), mode="drop"
+    )
+    compressed, ring, tags = _update_indexer(
+        raw,
+        positions,
+        compressed,
+        ring,
+        tags,
+        nik,
+        trig,
+        starts,
+        context,
+        slots,
+        compressed_table,
+        compress_ratio,
+        norm_eps,
+        rotary_dim,
+    )
+
+    # Query-specific sparse pages: prefill queries of the same request can
+    # select different groups and have different causal lengths.
+    lengths = jnp.where(valid, logical + 1, 0).astype(jnp.int32)
+    blocks = select_decode_blocks(
+        iq,
+        compressed,
+        lengths,
+        compressed_table,
+        req,
+        compress_ratio=compress_ratio,
+        block_topk=token_topk // compress_ratio,
+    )
+    # Keep the persistent owner in RPA's native dtype. Full-cache uint8/FP8
+    # bitcast-converts lower to HBM reads/writes even when layouts match.
+    output, cache = qsa_attention(
+        q,
+        gate,
+        blocks,
+        lengths,
+        main_table[req],
+        cache,
+        starts,
+        kv_heads=k.shape[1],
+        ratio=compress_ratio,
+        k_scale=k_scale if fp8 else 1.0,
+        v_scale=v_scale if fp8 else 1.0,
+    )
+    selected = selected_tokens(blocks, lengths, token_topk, compress_ratio)
+    return cache, compressed, ring, tags, output.reshape(len(q), -1), selected
+
+
+def selected_tokens(blocks, lengths, token_topk, compress_ratio):
+    selected = jnp.where(
+        blocks[..., None] >= 0,
+        blocks[..., None] * compress_ratio + jnp.arange(compress_ratio),
+        -1,
+    ).reshape(len(blocks), token_topk)
+    selected = jnp.pad(selected, ((0, 0), (0, compress_ratio - 1)), constant_values=-1)
+    count = jnp.minimum(lengths // compress_ratio, blocks.shape[1])
+    for tail in range(compress_ratio - 1):
+        token = lengths // compress_ratio * compress_ratio + tail
+        selected = selected.at[
+            jnp.arange(len(blocks)), count * compress_ratio + tail
+        ].set(jnp.where(token < lengths, token, -1))
+    return selected
