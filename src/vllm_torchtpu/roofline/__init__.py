@@ -11,53 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU roofline serving, memory, collective, and execution modeling."""
+"""Analytical TPU serving roofline, step floor, and mesh solver."""
 
 from __future__ import annotations
 
-from .chips import (
-    CHIPS,
-    SUPPORTED_CHIPS,
-    TOPOLOGIES,
-    ChipOverrides,
-    ChipSpec,
-    SliceTopology,
-)
-from .collectives import (
-    Collective,
-    CollectiveConfig,
-    torus_collective_s,
-)
-from .constants import (
-    SUPPORTED_MODEL_TYPES,
-)
-from .geometry import (
-    LayerCounts,
-    ModelGeometry,
-    count_layer_types,
-    from_hf_config,
-)
+from .chips import CHIPS, TOPOLOGIES, ChipOverrides, ChipSpec, SliceTopology
+from .collectives import Collective, CollectiveConfig, torus_collective_s
+from .geometry import ModelGeometry, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
-from .modules import (
-    Dtypes,
-    ModuleCost,
-    Parallel,
-    StepShape,
-    pass_costs,
-)
+from .memory import HbmBreakdown, KvFitInput, SeqKvLayout, hbm_footprint_per_core_bytes
+from .modules import Dtypes, ModuleCost, Parallel, StepShape, pass_costs
 from .serving import ConcurrencyRow, ServingRequest, plan
-from .step import (
-    FloorOptions,
-    SpecShape,
-    StepFloor,
-    spec_cycle_floor,
-    step_floor,
+from .solver import (
+    ParetoPoint,
+    PoolMeshPlan,
+    ScenarioOverrides,
+    ServingPlan,
+    SolveOptions,
+    TrafficScenario,
+    build_example_scenario,
+    solve_serving_plan,
 )
+from .step import FloorOptions, SpecShape, StepFloor, spec_cycle_floor, step_floor
 
 __all__ = [
     "CHIPS",
-    "SUPPORTED_CHIPS",
-    "SUPPORTED_MODEL_TYPES",
     "TOPOLOGIES",
     "ChipOverrides",
     "ChipSpec",
@@ -66,21 +44,31 @@ __all__ = [
     "ConcurrencyRow",
     "Dtypes",
     "FloorOptions",
-    "LayerCounts",
+    "HbmBreakdown",
+    "KvFitInput",
     "ModelGeometry",
     "ModuleCost",
     "Parallel",
+    "ParetoPoint",
+    "PoolMeshPlan",
+    "ScenarioOverrides",
+    "SeqKvLayout",
+    "ServingPlan",
     "ServingRequest",
     "SliceTopology",
+    "SolveOptions",
     "SpecShape",
     "StepFloor",
     "StepShape",
-    "count_layer_types",
+    "TrafficScenario",
+    "build_example_scenario",
     "dtypes_from_hf_config",
     "from_hf_config",
+    "hbm_footprint_per_core_bytes",
     "load_hf_config",
     "pass_costs",
     "plan",
+    "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",
     "torus_collective_s",
