@@ -724,8 +724,14 @@ class TpuPlatform(Platform):
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            ensure_flywheel_enum_registered,
+        )
+
+        flywheel_enum = ensure_flywheel_enum_registered()
         return [
             AttentionBackendEnum.FLASH_ATTN,
+            flywheel_enum,
             AttentionBackendEnum.TORCH_SDPA,
         ]
 
@@ -738,6 +744,10 @@ class TpuPlatform(Platform):
     ) -> "AttentionBackendEnum":
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            MAX_FLYWHEEL_VIT_HEAD_DIM,
+        )
+
         supported = cls.get_supported_vit_attn_backends()
         if backend is not None:
             if backend not in supported:
@@ -746,6 +756,16 @@ class TpuPlatform(Platform):
                     f"[TpuPlatform] --mm-encoder-attn-backend {backend.name.lower()} "
                     f"is not supported on TPU (head_size={head_size}, dtype={dtype}). "
                     f"Supported backends: {supported_names}."
+                )
+            if (
+                backend.name == "FLYWHEEL"
+                and not 0 < head_size <= MAX_FLYWHEEL_VIT_HEAD_DIM
+            ):
+                raise ValueError(
+                    f"[TpuPlatform] --mm-encoder-attn-backend flywheel requires "
+                    f"0 < head_size <= {MAX_FLYWHEEL_VIT_HEAD_DIM}, got "
+                    f"head_size={head_size}. Use --mm-encoder-attn-backend "
+                    "flash_attn or torch_sdpa."
                 )
             logger.info_once(
                 "Using configured %s backend for TPU ViT attention.", backend.name

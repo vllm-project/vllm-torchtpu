@@ -405,6 +405,14 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
     return factors
 
 
+def _get_optional_package_version(package_name: str) -> str | None:
+    """Return installed package version, or None when the package is absent."""
+    try:
+        return importlib_metadata.version(package_name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
     # Deferred: tpu_info imports Pallas, which this module otherwise avoids.
@@ -426,6 +434,8 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "jax": importlib_metadata.version("jax"),
         "jaxlib": importlib_metadata.version("jaxlib"),
         "libtpu": get_libtpu_cache_key(),
+        # External Pallas kernels behind --mm-encoder-attn-backend flywheel.
+        "flywheel_tpu": _get_optional_package_version("flywheel-tpu"),
         "mm_encoder_attn_backend": mm_encoder_attn_backend,
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},

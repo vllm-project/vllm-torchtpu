@@ -96,7 +96,11 @@ class TestTpuCompilerCache:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            ensure_flywheel_enum_registered,
+        )
 
+        flywheel = ensure_flywheel_enum_registered()
         with patch(
             "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
             return_value=[],
@@ -108,10 +112,11 @@ class TestTpuCompilerCache:
             sdpa = compute_tpu_compilation_hash(
                 self._config(mm_encoder_attn_backend=AttentionBackendEnum.TORCH_SDPA)
             )
+            fw = compute_tpu_compilation_hash(
+                self._config(mm_encoder_attn_backend=flywheel)
+            )
 
-        assert unset != flash
-        assert flash != sdpa
-        assert unset != sdpa
+        assert len({unset, flash, sdpa, fw}) == 4
 
     def test_tpu_hash_covers_gdn_prefill_checkpoint_gate_only(self):
         """The hash follows prefill_checkpoint_enabled, not its raw inputs."""
@@ -204,6 +209,7 @@ class TestTpuCompilerCache:
             "jax": "1",
             "jaxlib": "1",
             "libtpu": "1",
+            "flywheel-tpu": "1",
         }
         with patch(
             "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
