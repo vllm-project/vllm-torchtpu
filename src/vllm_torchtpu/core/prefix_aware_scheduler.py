@@ -40,6 +40,8 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu.core.eviction_aware_connector import EvictionAwareConnector
+
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
@@ -61,6 +63,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+        connector = getattr(self, "connector", None)
+        if isinstance(connector, EvictionAwareConnector):
+            connector.attach_block_pool(self.kv_cache_manager.block_pool)
 
         logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
 
