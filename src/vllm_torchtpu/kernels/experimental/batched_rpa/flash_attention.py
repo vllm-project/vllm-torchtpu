@@ -169,7 +169,7 @@ def flash_attention_qk_softmax(
     cfgs: configs.RpaConfigs,
     bq_start: int,
     k_scale: jax.Array | float | None = None,  # [B, KV, S]
-    dma_q: jax.Ref | None = None,
+    dma_q: SmemWrapper | None = None,
 ):
     """Flash attention kernel.
 
