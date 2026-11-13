@@ -623,72 +623,52 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 f"plans {expected}"
             )
 
-        # QWEN4_EXP_MERGE_COMPRESSED_K: each carrier also holds a key region
-        # after its `num_blocks` pages, one `key_stride` block per block ID
-        # (qwen4_exp.offload.merged_key_geometry). A main-KV block's keys move
-        # with it, from a second view of the region.
-        merged_keys = None
         if is_qwen4_exp(getattr(self, "_vllm_config", None)):
             from vllm_torchtpu.models.vllm.qwen4_exp.offload import merged_key_geometry
 
-            merged_keys = merged_key_geometry(
-                self._vllm_config, self.connector_worker.kv_cache_config
-            )
+            if merged_key_geometry(self._vllm_config, self.connector_worker.kv_cache_config):
+                # A main-KV block's merged keys sit in a region after the
+                # carrier's pages, one smaller block per block ID; the Raiden
+                # store registers one uniform block array per storage from its
+                # base, so it cannot move them with the page. Offloading the
+                # pages alone would restore blocks without their keys.
+                raise ValueError(
+                    "TPURaidenOffloadingConnector (host tier) does not move "
+                    "QWEN4_EXP_MERGE_COMPRESSED_K key blocks yet; drop the host "
+                    "tier from --kv-transfer-config or unset "
+                    "QWEN4_EXP_MERGE_COMPRESSED_K"
+                )
 
         pool_tensors: list[CanonicalKVCacheTensor] = []
-        key_tensors: list[CanonicalKVCacheTensor] = []
         for storage, device in pool_storages.values():
             storage_bytes = storage.nbytes()
-            if merged_keys is not None:
-                page_size_bytes, key_stride = merged_keys
-                base = num_blocks * page_size_bytes
-                assert storage_bytes >= base + num_blocks * key_stride, (
-                    "Qwen4Exp merged-key carrier is smaller than its pages and key "
-                    f"region: storage_bytes={storage_bytes}, num_blocks={num_blocks}"
-                )
-                key_tensors.append(
-                    CanonicalKVCacheTensor(
-                        tensor=torch.empty(0, dtype=torch.int8, device=device).set_(
-                            storage, base, (num_blocks, key_stride), (key_stride, 1)
-                        ),
-                        page_size_bytes=key_stride,
-                    )
-                )
-            else:
-                assert storage_bytes % num_blocks == 0, (
-                    "KV pool storage must hold whole scheduler blocks: "
-                    f"storage_bytes={storage_bytes}, num_blocks={num_blocks}"
-                )
-                page_size_bytes = storage_bytes // num_blocks
-            int8_view = torch.empty(0, dtype=torch.int8, device=device).set_(
-                storage, 0, (num_blocks, page_size_bytes), (page_size_bytes, 1)
+            assert storage_bytes % num_blocks == 0, (
+                "KV pool storage must hold whole scheduler blocks: "
+                f"storage_bytes={storage_bytes}, num_blocks={num_blocks}"
+            )
+            page_size_bytes = storage_bytes // num_blocks
+            int8_view = (
+                torch.empty(0, dtype=torch.int8, device=device)
+                .set_(storage)
+                .view(num_blocks, page_size_bytes)
             )
             pool_tensors.append(
                 CanonicalKVCacheTensor(
                     tensor=int8_view, page_size_bytes=page_size_bytes
                 )
             )
-        page_tensors = len(pool_tensors)
-        pool_tensors += key_tensors
 
         # Retain pool tensor references to dispatch their writes during save fences.
         self._pool_sync_tensors = [pool_tensor.tensor for pool_tensor in pool_tensors]
 
-        def refs(group) -> list[CanonicalKVCacheRef]:
-            # Every group moves its block's page in every region; main-KV
-            # groups of a merged-key pool also move the block's keys.
-            indices = list(range(page_tensors))
-            if key_tensors and any(n.endswith(".self_attn") for n in group.layer_names):
-                indices += list(range(page_tensors, len(pool_tensors)))
-            return [
-                CanonicalKVCacheRef(
-                    tensor_idx=idx, page_size_bytes=pool_tensors[idx].page_size_bytes
-                )
-                for idx in indices
-            ]
-
         group_data_refs = [
-            refs(group) for group in self.connector_worker.kv_cache_config.kv_cache_groups
+            [
+                CanonicalKVCacheRef(
+                    tensor_idx=idx, page_size_bytes=pool_tensor.page_size_bytes
+                )
+                for idx, pool_tensor in enumerate(pool_tensors)
+            ]
+            for _ in self.connector_worker.kv_cache_config.kv_cache_groups
         ]
 
         self.connector_worker._init_worker(
