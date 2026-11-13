@@ -205,6 +205,7 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
+    VLLM_TPU_MTP_DRAFT_ROWS: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -1254,6 +1255,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # MTP draft step 0 on a draft declaring `supports_draft_rows` :
+    # write the draft layer's caches for every token of the target's step but
+    # run attention, MoE and hyper-connections only at each request's last
+    # token, the rows that produce a draft. Off by default until validated on
+    # TPU. Not used with IndexShare, context parallelism or EP-DP lockstep.
+    "VLLM_TPU_MTP_DRAFT_ROWS": env_bool("VLLM_TPU_MTP_DRAFT_ROWS"),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
