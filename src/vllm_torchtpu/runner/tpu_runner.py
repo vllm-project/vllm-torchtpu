@@ -20,6 +20,7 @@ import bisect
 import contextlib
 import copy
 import dataclasses
+import functools
 import math
 import os
 import time
@@ -486,6 +487,14 @@ def _spec_warmup_all_token_ids(
         req_id: [0] * (num_computed + 1)
         for req_id, num_computed in zip(req_ids, num_computed_tokens)
     }
+
+
+@functools.lru_cache(maxsize=1024)
+def _live_row_mask(num_reqs: int, rows: int, device: torch.device) -> torch.Tensor:
+    """`[rows]` int32 device mask, 1 for the first `num_reqs` rows. Uploaded,
+    not computed on device, so the live count never enters a program's
+    shape or constants. Cached: one upload per (count, bucket)."""
+    return (torch.arange(rows) < num_reqs).to(torch.int32).to(device)
 
 
 @contextmanager
@@ -4972,18 +4981,22 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self.mamba_slot_read_offsets is None or not indices_per_group:
             return None
-        offsets = torch.zeros(
-            indices_per_group[0].shape[0],
-            dtype=torch.int32,
-            device=indices_per_group[0].device,
-        )
-        if next_tokens is not None:
+        rows = indices_per_group[0].shape[0]
+        device = indices_per_group[0].device
+        if next_tokens is None:
+            offsets = torch.zeros(rows, dtype=torch.int32, device=device)
+        else:
             # num_valid = accepted drafts + 1 (bonus); the checkpoint of the
-            # last accepted token is at offset num_valid - 1.
-            num_valid = (
-                (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
+            # last accepted token is at offset num_valid - 1. Rows past the
+            # live count are zeroed by a mask rather than by slicing to it:
+            # torch-tpu compiles a program per shape, and an exact-count
+            # slice write compiled one per request count mid-serving
+            # (tt_jit_copy__as_strided_inverse).
+            next_tokens = fit_rows(next_tokens, rows, INVALID_TOKEN_ID)
+            num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
+            offsets = (num_valid - 1).clamp(min=0) * _live_row_mask(
+                num_reqs, rows, device
             )
-            offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
         if len(indices_per_group) == 1:
             self.mamba_slot_read_offsets.index_put_(
                 (indices_per_group[0].long(),), offsets
