@@ -55,7 +55,7 @@ class KernelConfig:
     compact_overflow: bool = True
     b4_attention_gather: bool = True
     fused_cache_commit: bool = True
-    decode_no_hlo_calls: bool = True  # no deduplicated HLO calls at B8..B128, DP B2/B4
+    decode_no_hlo_calls: bool = True  # no deduplicated HLO calls in plain decode steps
     shard_routing: bool = False
     kda_staged: bool = False
     # DP2 plain decode above B16: the kernel writes KDA post-states into their slots.

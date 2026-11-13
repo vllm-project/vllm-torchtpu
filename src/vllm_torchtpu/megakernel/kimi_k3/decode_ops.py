@@ -484,8 +484,7 @@ class DecodeOps:
     @staticmethod
     def _compiler_options(rows: int) -> dict[str, str]:
         config = kernel_config.active()
-        dp_rows = rows in (2, 4) and config.attention_dp > 1
-        if (rows in (8, 16, 32, 64, 96, 128) or dp_rows) and config.decode_no_hlo_calls:
+        if rows in (1, 2, 4, 8, 16, 32, 64, 96, 128) and config.decode_no_hlo_calls:
             return {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
         return {}
 
@@ -532,8 +531,7 @@ class DecodeOps:
 
     @staticmethod
     def _run(op: Any, rows: int, *args: Any) -> Any:
-        """``op(*args)`` for a ``rows``-row step: at 8, 16, 32, 64, 96 and 128 rows
-        (and attention DP's 2 and 4) with XLA's deduplicated calls off
+        """``op(*args)`` for a ``rows``-row step, with XLA's deduplicated calls off
         (``KernelConfig.decode_no_hlo_calls``)."""
         options = DecodeOps._compiler_options(rows)
         if options:
@@ -541,9 +539,9 @@ class DecodeOps:
             from torch_tpu._internal.sync import synchronize
 
             # Deduplicated calls prevent jumbo instruction overlays and split
-            # the B8/B16/B32 expert loop. Capture this option when the lazy
-            # graph is materialized, then restore the caller's compiler
-            # configuration.
+            # the decode's layer and expert loops over several overlays. Capture
+            # this option when the lazy graph is materialized, then restore the
+            # caller's compiler configuration.
             with custom_compiler_options(options):
                 outputs = op(*args)
                 synchronize(list(outputs), wait=False)
