@@ -43,6 +43,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_PCP_KV_CHUNK_TOKENS` | `65536` | With `USE_TPU_PCP_MANAGER=1`, the context tokens each all-gather moves. |
 | `TPU_DCP_MLA_TOPK_CAP` | `0` | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
 | `TPU_DP_VOCAB_PARALLEL` | `False` | Opt-in. Shards the input embedding and lm_head over every DP x TP rank (the EP group) instead of each DP engine's TP group, cutting their HBM per device by DP x. Needs DP with expert parallelism; ignored, with a warning, under pipeline or context parallelism, speculative decoding, LoRA, pooling or multimodal models, or `TPU_GREEDY_TOP_TOKENS`. |
+| `TPU_SMALL_ALL_REDUCE_MAX_ROWS` | `0` | Opt-in. TP all-reduces of compiled steps whose padded token bucket has at most this many bf16 rows run as a Pallas kernel over the expert-parallel mesh instead of XLA's all-reduce. Needs expert parallelism (`--enable-expert-parallel`): without an expert-parallel group, model load fails. With a TP group that is not the expert-parallel group, it has no effect and logs a warning. `0` keeps XLA's all-reduce. |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
