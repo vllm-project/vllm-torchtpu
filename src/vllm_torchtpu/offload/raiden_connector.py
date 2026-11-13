@@ -254,6 +254,20 @@ def _allocated_block_ids(scheduler_output: SchedulerOutput) -> set[int]:
     return allocated
 
 
+def _prefix_hit_block_ids(scheduler_output: SchedulerOutput, config) -> set[int]:
+    """Blocks new requests this step reuse as prefix-cache hits (stats only):
+    the leading blocks covering each new request's computed tokens."""
+    hits: set[int] = set()
+    tokens_per_block = {
+        g.group_idx: g.tokens_per_block for g in config.kv_group_configs
+    }
+    for req in scheduler_output.scheduled_new_reqs:
+        for group_idx, group in enumerate(req.block_ids or ()):
+            n = req.num_computed_tokens // tokens_per_block.get(group_idx, 1 << 62)
+            hits.update(bid for bid in group[:n] if bid != 0)
+    return hits
+
+
 class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     """Scheduler for the store-backed offload path.
 
@@ -266,6 +280,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     _write_back: WriteBackPolicy | None = None
     _block_pool = None
     _contiguous_alloc_scan_factor = 3
+    # TPU_RAIDEN_LRU_REFRESH == 2: refresh a finished request's resident chain.
+    _lru_refresh_on_finish = False
+    _offload_stats = False
 
     def __init__(
         self,
@@ -291,6 +308,20 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._wb_blocks: OrderedDict[str, set[int]] = OrderedDict()
         self._wb_owners: dict[int, set[str]] = {}
         self.wb_counters: Counter[str] = Counter()
+        lru_refresh = tpu_envs.TPU_RAIDEN_LRU_REFRESH
+        self._lru_refresh_on_finish = lru_refresh >= 2
+        self._offload_stats = bool(tpu_envs.TPU_RAIDEN_OFFLOAD_STATS)
+        self._stats_last_log: float | None = None
+        if lru_refresh or self._offload_stats:
+            logger.info(
+                "TPURaidenOffloadingConnector: TPU_RAIDEN_LRU_REFRESH=%d "
+                "(refresh resident keys on store: %s, on request finish: %s), "
+                "TPU_RAIDEN_OFFLOAD_STATS=%s",
+                lru_refresh,
+                lru_refresh >= 1,
+                lru_refresh >= 2,
+                self._offload_stats,
+            )
 
     def attach_block_pool(self, block_pool) -> None:
         """`EvictionAwareConnector`: the scheduler's block pool, whose free
@@ -400,6 +431,29 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             c["held_requests"],
             len(self._wb_owners),
         )
+        if self._offload_stats:
+            mgr_stats = getattr(self._raiden_manager, "_stats", None) or {}
+            logger.info(
+                "Raiden offload stats: drop blocks hit=%d fresh=%d | lookups "
+                "partial=%d stale_head=%d (%d tokens behind a missing head) | "
+                "store keys offered=%d resident=%d new=%d | jobs ok=%d failed=%d "
+                "cancelled=%d (%d keys) | refreshed entries=%d",
+                c["drop_blocks_hit"],
+                c["drop_blocks_fresh"],
+                c["lookup_partial"],
+                c["lookup_stale_head"],
+                c["lookup_stale_head_tokens"],
+                mgr_stats.get("store_keys_offered", 0),
+                mgr_stats.get("store_keys_resident", 0),
+                mgr_stats.get("store_keys_new", 0),
+                mgr_stats.get("store_jobs_ok", 0),
+                mgr_stats.get("store_jobs_failed", 0),
+                mgr_stats.get("store_jobs_cancelled", 0),
+                mgr_stats.get("store_keys_cancelled", 0),
+                mgr_stats.get("refreshed_entries", 0),
+            )
+            if mgr_stats:
+                mgr_stats.clear()
         held = c["held_requests"]
         c.clear()
         c["held_requests"] = held
@@ -418,6 +472,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         # After registering: a request that finished last step may already
         # have a block reused by this step's allocation.
         reused = allocated & self._wb_owners.keys()
+        if reused and self._offload_stats:
+            hits = _prefix_hit_block_ids(scheduler_output, self.config)
+            self.wb_counters["drop_blocks_hit"] += len(reused & hits)
+            self.wb_counters["drop_blocks_fresh"] += len(reused - hits)
         for req_id in {r for bid in reused for r in self._wb_owners.get(bid, ())}:
             self._wb_drop(req_id)
         flush = self._wb_near_eviction()
@@ -580,6 +638,69 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         dst_spec.block_ids = np.array(
             [b.block_id for b in aligned], dtype=dst_spec.block_ids.dtype
         )
+
+    def _prefix_offload_keys(self, request: Request, start_token: int):
+        """(tokens_per_chunk, keys) of the first prefix group's chunks from the
+        chunk holding `start_token` on; None without a prefix group."""
+        block_hashes = request.block_hashes
+        for group_config in self.config.kv_group_configs:
+            if group_config.is_eagle_group:
+                continue
+            if group_config.sliding_window_size_in_chunks is not None:
+                return None
+            hashes_per_chunk = group_config.hashes_per_chunk
+            start_chunk = start_token // group_config.tokens_per_chunk
+            keys = [
+                make_offload_key(block_hashes[idx], group_config.group_idx)
+                for idx in range(
+                    (start_chunk + 1) * hashes_per_chunk - 1,
+                    len(block_hashes),
+                    hashes_per_chunk,
+                )
+            ]
+            return group_config.tokens_per_chunk, keys
+        return None
+
+    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int, *args, **kwargs):
+        result = super().get_num_new_matched_tokens(
+            request, num_computed_tokens, *args, **kwargs
+        )
+        if self._offload_stats and result[0] is not None:
+            self._count_stale_head(request, num_computed_tokens, result[0])
+        return result
+
+    def _count_stale_head(
+        self, request: Request, num_computed_tokens: int, num_hit_tokens: int
+    ) -> None:
+        """Stats only: a host lookup that stopped short of the chain while its
+        last key is resident is a chain stranded behind a missing head."""
+        found = self._prefix_offload_keys(
+            request, num_computed_tokens + num_hit_tokens
+        )
+        if found is None:
+            return
+        tokens_per_chunk, keys = found
+        # The prompt's last token is never a hit; ignore a trailing one-chunk gap.
+        if len(keys) < 2:
+            return
+        self.wb_counters["lookup_partial"] += 1
+        if self._raiden_manager.count_resident_prefix(keys[-1:]):
+            self.wb_counters["lookup_stale_head"] += 1
+            self.wb_counters["lookup_stale_head_tokens"] += (
+                len(keys) * tokens_per_chunk
+            )
+
+    def request_finished(self, request: Request, *args, **kwargs):
+        if self._lru_refresh_on_finish:
+            req_status = self._req_status.get(request.request_id)
+            if req_status is not None:
+                for group_config, group_state in zip(
+                    self.config.kv_group_configs, req_status.group_states
+                ):
+                    if group_config.is_eagle_group or not group_state.offload_keys:
+                        continue
+                    self._raiden_manager.refresh_resident(group_state.offload_keys)
+        return super().request_finished(request, *args, **kwargs)
 
     def peek_external_prefix_tokens(
         self, request: Request, num_local_tokens: int
