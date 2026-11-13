@@ -1,0 +1,518 @@
+From 51e61e3bf01f9f3ca4682a1d7006bf2b2d480559 Mon Sep 17 00:00:00 2001
+From: Chaitanya Kulkarni <chaitanyapk@google.com>
+Date: Mon, 2 Nov 2026 18:01:26 +0000
+Subject: [PATCH] feat(kv-cache): disjoint BlockPool partition isolation and
+ 20L CED 1P1D scheduler handoff
+
+Signed-off-by: Chaitanya Kulkarni <chaitanyapk@google.com>
+---
+ vllm/v1/core/block_pool.py           | 169 +++++++++++++++++----------
+ vllm/v1/core/kv_cache_coordinator.py |  68 ++++++-----
+ vllm/v1/core/kv_cache_utils.py       |  19 ++-
+ vllm/v1/core/sched/scheduler.py      |  39 +++++++
+ 4 files changed, 209 insertions(+), 86 deletions(-)
+
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 87de1ce798..dc2ff43010 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Callable, Iterable, Sequence
++import os
+ from typing import Any
+ 
+ from vllm.distributed.kv_events import (
+@@ -177,7 +178,9 @@ class BlockPool:
+ 
+         # Cache for block lookup
+         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+-        self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
++        self.cached_block_hashes_by_block: dict[
++            tuple[str, int], set[BlockHashWithGroupId]
++        ] = {}
+ 
+         # To represent a placeholder block with block_id=0.
+         # The ref_cnt of null_block is not maintained, needs special care to
+@@ -186,6 +189,8 @@ class BlockPool:
+         self.null_block.is_null = True
+         self.swa_free_block_queue: FreeKVCacheBlockQueue | None = None
+         self.state_free_block_queue: FreeKVCacheBlockQueue | None = None
++        self.aux_free_block_queues: dict[str, FreeKVCacheBlockQueue] = {}
++        self._disjoint_aux_partitions: bool = False
+ 
+         self.enable_kv_cache_events = enable_kv_cache_events
+         self.kv_event_queue: list[KVCacheEvent] = []
+@@ -193,10 +198,15 @@ class BlockPool:
+         self.metrics_collector = metrics_collector
+         # Callbacks for blocks released with ``unpin_blocks`` whose contents
+         # are still being read until the pool reuses them.
+-        self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
++        self._reuse_watchers: dict[
++            tuple[str, int], tuple[KVCacheBlock, Callable[[KVCacheBlock], None]]
++        ] = {}
+ 
+     def configure_aux_partitions(
+-        self, num_swa_blocks: int, num_state_blocks: int
++        self,
++        num_swa_blocks: int,
++        num_state_blocks: int,
++        num_swa_groups: int = 3,
+     ) -> None:
+         """Partition the high end of the block pool for SWA and CompressorState."""
+         if (
+@@ -206,17 +216,49 @@ class BlockPool:
+             return
+         if num_swa_blocks + num_state_blocks <= 0:
+             return
++        if os.environ.get("VLLM_DSV41_PURE_20L_PREFILL") == "1":
++            cap = self.free_block_queue.num_free_blocks
++            if cap <= 0:
++                return
++            self._disjoint_aux_partitions = True
++            state_blocks = [
++                KVCacheBlock(idx, pool=self) for idx in range(1, cap + 1)
++            ]
++            for b in state_blocks:
++                b.pool_partition = "state"
++            self.state_free_block_queue = FreeKVCacheBlockQueue(state_blocks)
++            self.aux_free_block_queues["state"] = self.state_free_block_queue
++            self.blocks.extend(state_blocks)
++
++            for g_idx in range(max(1, num_swa_groups)):
++                part_name = f"swa_{g_idx}"
++                swa_g_blocks = [
++                    KVCacheBlock(idx, pool=self) for idx in range(1, cap + 1)
++                ]
++                for b in swa_g_blocks:
++                    b.pool_partition = part_name
++                q = FreeKVCacheBlockQueue(swa_g_blocks)
++                self.aux_free_block_queues[part_name] = q
++                if g_idx == 0:
++                    self.swa_free_block_queue = q
++                    self.aux_free_block_queues["swa"] = q
++                self.blocks.extend(swa_g_blocks)
++            self.num_gpu_blocks = len(self.blocks)
++            return
++
+         if num_swa_blocks + num_state_blocks >= self.free_block_queue.num_free_blocks:
+             return
+         state_blocks = self.free_block_queue.popright_n(num_state_blocks)
+         for b in state_blocks:
+             b.pool_partition = "state"
+         self.state_free_block_queue = FreeKVCacheBlockQueue(state_blocks)
++        self.aux_free_block_queues["state"] = self.state_free_block_queue
+ 
+         swa_blocks = self.free_block_queue.popright_n(num_swa_blocks)
+         for b in swa_blocks:
+             b.pool_partition = "swa"
+         self.swa_free_block_queue = FreeKVCacheBlockQueue(swa_blocks)
++        self.aux_free_block_queues["swa"] = self.swa_free_block_queue
+ 
+     def get_cached_block(
+         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+@@ -613,7 +655,8 @@ class BlockPool:
+         block_hashes: list[BlockHashWithGroupId] = []
+         if block.block_hash is not None:
+             block_hashes.append(block.block_hash)
+-        block_hashes.extend(self.cached_block_hashes_by_block.pop(block.block_id, ()))
++        bkey = (block.pool_partition, block.block_id)
++        block_hashes.extend(self.cached_block_hashes_by_block.pop(bkey, ()))
+         if not block_hashes:
+             return []
+ 
+@@ -659,7 +702,8 @@ class BlockPool:
+         if block.block_hash is None:
+             block.set_block_hash(block_hash_with_group_id, num_tokens=num_tokens)
+         else:
+-            self.cached_block_hashes_by_block.setdefault(block.block_id, set()).add(
++            bkey = (block.pool_partition, block.block_id)
++            self.cached_block_hashes_by_block.setdefault(bkey, set()).add(
+                 block_hash_with_group_id
+             )
+         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+@@ -676,13 +720,16 @@ class BlockPool:
+         under the same hashes instead. Entries stay live; no events emitted.
+         """
+         assert dst_block.block_hash is None
+-        assert dst_block.block_id not in self.cached_block_hashes_by_block
++        assert (dst_block.pool_partition, dst_block.block_id) not in self.cached_block_hashes_by_block
+         num_tokens = src_block.block_hash_num_tokens
+         for block_hash in self._remove_cached_block_hashes(src_block):
+             # `num_tokens` only applies to the first (primary) insertion.
+             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+ 
+     def _queue_for_partition(self, partition: str) -> FreeKVCacheBlockQueue:
++        q = self.aux_free_block_queues.get(partition)
++        if q is not None:
++            return q
+         if partition == "swa" and self.swa_free_block_queue is not None:
+             return self.swa_free_block_queue
+         if partition == "state" and self.state_free_block_queue is not None:
+@@ -710,15 +757,15 @@ class BlockPool:
+             )
+ 
+         q = self._queue_for_partition(partition)
+-        if q is not self.free_block_queue:
++        if q is not self.free_block_queue and not self._disjoint_aux_partitions:
+             take_aux = min(num_blocks, q.num_free_blocks)
+             ret: list[KVCacheBlock] = q.popleft_n(take_aux)
+             rem = num_blocks - take_aux
+             if rem > 0:
+-                borrowed = self.free_block_queue.popright_n(rem)
++                borrowed = self.free_block_queue.popleft_n(rem)
+                 ret.extend(borrowed)
+         else:
+-            ret = self.free_block_queue.popleft_n(num_blocks)
++            ret = q.popleft_n(num_blocks)
+ 
+         if self._reuse_watchers:
+             self._notify_reuse(ret)
+@@ -741,8 +788,10 @@ class BlockPool:
+ 
+     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
+         for block in blocks:
+-            watcher = self._reuse_watchers.pop(block.block_id, None)
+-            if watcher is not None:
++            bkey = (block.pool_partition, block.block_id)
++            entry = self._reuse_watchers.pop(bkey, None)
++            if entry is not None:
++                _, watcher = entry
+                 watcher(block)
+ 
+     def unpin_blocks(
+@@ -757,25 +806,19 @@ class BlockPool:
+         ``on_reuse`` fires when ``get_new_blocks`` hands a block out (or the
+         cache is reset), so the caller can stop reading it.
+         """
+-        released_main: list[KVCacheBlock] = []
+-        released_swa: list[KVCacheBlock] = []
+-        released_state: list[KVCacheBlock] = []
++        released_by_queue: dict[FreeKVCacheBlockQueue, list[KVCacheBlock]] = {}
+         for block in blocks:
+             assert block.ref_cnt > 0 and not block.is_null
+             block.ref_cnt -= 1
+-            self._reuse_watchers[block.block_id] = on_reuse
++            self._reuse_watchers[(block.pool_partition, block.block_id)] = (
++                block,
++                on_reuse,
++            )
+             if block.ref_cnt == 0:
+-                if block.pool_partition == "swa" and self.swa_free_block_queue is not None:
+-                    released_swa.append(block)
+-                elif block.pool_partition == "state" and self.state_free_block_queue is not None:
+-                    released_state.append(block)
+-                else:
+-                    released_main.append(block)
+-        self.free_block_queue.append_n(released_main)
+-        if self.swa_free_block_queue is not None and released_swa:
+-            self.swa_free_block_queue.append_n(released_swa)
+-        if self.state_free_block_queue is not None and released_state:
+-            self.state_free_block_queue.append_n(released_state)
++                q = self._queue_for_partition(block.pool_partition)
++                released_by_queue.setdefault(q, []).append(block)
++        for q, blks in released_by_queue.items():
++            q.append_n(blks)
+ 
+     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+         """If a block is cached in `cached_block_hash_to_block`, we reset its hash
+@@ -832,12 +875,8 @@ class BlockPool:
+ 
+         """
+         # Identify blocks with hash (LRU cache) and without it (never match APC)
+-        blocks_to_evict_last = []
+-        blocks_to_evict_first = []
+-        swa_first: list[KVCacheBlock] = []
+-        swa_last: list[KVCacheBlock] = []
+-        state_first: list[KVCacheBlock] = []
+-        state_last: list[KVCacheBlock] = []
++        by_queue_first: dict[FreeKVCacheBlockQueue, list[KVCacheBlock]] = {}
++        by_queue_last: dict[FreeKVCacheBlockQueue, list[KVCacheBlock]] = {}
+         other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
+         for block in ordered_blocks:
+             if block.pool is not None and block.pool is not self:
+@@ -846,27 +885,16 @@ class BlockPool:
+             block.ref_cnt -= 1
+             if block.ref_cnt == 0 and not block.is_null:
+                 is_first = block.block_hash is None or not self.enable_caching
+-                if block.pool_partition == "swa" and self.swa_free_block_queue is not None:
+-                    (swa_first if is_first else swa_last).append(block)
+-                elif block.pool_partition == "state" and self.state_free_block_queue is not None:
+-                    (state_first if is_first else state_last).append(block)
+-                elif is_first:
+-                    # LIFO reuse of non-cached blocks for better GPU locality.
+-                    blocks_to_evict_first.append(block)
+-                else:
+-                    # FIFO reuse of cached blocks for LRU eviction behavior.
+-                    blocks_to_evict_last.append(block)
++                q = self._queue_for_partition(block.pool_partition)
++                target = by_queue_first if is_first else by_queue_last
++                target.setdefault(q, []).append(block)
+ 
+         # Blocks to reuse first are prepended to the front of the free queue.
+-        self.free_block_queue.prepend_n(blocks_to_evict_first)
++        for q, blks in by_queue_first.items():
++            q.prepend_n(blks)
+         # Blocks to reuse last are appended to the end of the free queue.
+-        self.free_block_queue.append_n(blocks_to_evict_last)
+-        if self.swa_free_block_queue is not None:
+-            self.swa_free_block_queue.prepend_n(swa_first)
+-            self.swa_free_block_queue.append_n(swa_last)
+-        if self.state_free_block_queue is not None:
+-            self.state_free_block_queue.prepend_n(state_first)
+-            self.state_free_block_queue.append_n(state_last)
++        for q, blks in by_queue_last.items():
++            q.append_n(blks)
+         for pool, blocks in other_pools.items():
+             pool.free_blocks(blocks)
+ 
+@@ -914,7 +942,7 @@ class BlockPool:
+         self.cached_block_hashes_by_block.clear()
+         if self._reuse_watchers:
+             self._notify_reuse(
+-                [self.blocks[block_id] for block_id in list(self._reuse_watchers)]
++                [blk for blk, _ in list(self._reuse_watchers.values())]
+             )
+ 
+         # Remove all hashes from all blocks.
+@@ -941,15 +969,38 @@ class BlockPool:
+         main_free = self.free_block_queue.num_free_blocks
+         if partition == "main":
+             return main_free
+-        if partition == "swa" and self.swa_free_block_queue is not None:
+-            return self.swa_free_block_queue.num_free_blocks + main_free
+-        if partition == "state" and self.state_free_block_queue is not None:
+-            return self.state_free_block_queue.num_free_blocks + main_free
++        if partition is not None:
++            q = self.aux_free_block_queues.get(partition)
++            if q is not None:
++                return (
++                    q.num_free_blocks
++                    if self._disjoint_aux_partitions
++                    else q.num_free_blocks + main_free
++                )
++            if partition == "swa" and self.swa_free_block_queue is not None:
++                return (
++                    self.swa_free_block_queue.num_free_blocks
++                    if self._disjoint_aux_partitions
++                    else self.swa_free_block_queue.num_free_blocks + main_free
++                )
++            if partition == "state" and self.state_free_block_queue is not None:
++                return (
++                    self.state_free_block_queue.num_free_blocks
++                    if self._disjoint_aux_partitions
++                    else self.state_free_block_queue.num_free_blocks + main_free
++                )
+         total = main_free
+-        if self.swa_free_block_queue is not None:
+-            total += self.swa_free_block_queue.num_free_blocks
+-        if self.state_free_block_queue is not None:
+-            total += self.state_free_block_queue.num_free_blocks
++        if self.aux_free_block_queues:
++            seen: set[int] = set()
++            for q in self.aux_free_block_queues.values():
++                if id(q) not in seen:
++                    seen.add(id(q))
++                    total += q.num_free_blocks
++        else:
++            if self.swa_free_block_queue is not None:
++                total += self.swa_free_block_queue.num_free_blocks
++            if self.state_free_block_queue is not None:
++                total += self.state_free_block_queue.num_free_blocks
+         return total
+ 
+     def get_usage(self) -> float:
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index fc43c4f1b0..e623374b96 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -181,9 +181,21 @@ class KVCacheCoordinator(ABC):
+                 1152 if num_blocks >= 16384 else (1056 if num_blocks >= 4096 else max(16, num_blocks // 40))
+             )
+             num_swa = (
+-                2816 if num_blocks >= 16384 else (800 if num_blocks >= 4096 else max(32, num_blocks // 11))
++                2816 if num_blocks >= 16384 else (800 if num_blocks >= 2048 else max(32, num_blocks // 11))
+             )
+-            self.block_pool.configure_aux_partitions(num_swa, num_state)
++            num_swa_groups = sum(
++                1
++                for g in self.kv_cache_config.kv_cache_groups
++                if isinstance(_first_spec(g), SlidingWindowMLASpec)
++                and not any(
++                    name.endswith(".compressor.state_cache")
++                    for name in g.layer_names
++                )
++            )
++            self.block_pool.configure_aux_partitions(
++                num_swa, num_state, num_swa_groups=max(1, num_swa_groups)
++            )
++            swa_idx = 0
+             for manager, group in zip(
+                 self.single_type_managers, self.kv_cache_config.kv_cache_groups
+             ):
+@@ -194,7 +206,11 @@ class KVCacheCoordinator(ABC):
+                     ):
+                         manager.pool_partition = "state"
+                     else:
+-                        manager.pool_partition = "swa"
++                        if getattr(self.block_pool, "_disjoint_aux_partitions", False):
++                            manager.pool_partition = f"swa_{swa_idx}"
++                            swa_idx += 1
++                        else:
++                            manager.pool_partition = "swa"
+ 
+         # A positive retention interval must be a multiple of the base hit granularity
+         # (``scheduler_block_size``) to land on real cache-hit boundaries.
+@@ -241,9 +257,7 @@ class KVCacheCoordinator(ABC):
+ 
+         """
+         num_blocks_to_allocate = 0
+-        main_blocks_to_allocate = 0
+-        swa_blocks_to_allocate = 0
+-        state_blocks_to_allocate = 0
++        by_partition: dict[str, int] = {}
+         for i, manager in enumerate(self.single_type_managers):
+             if isinstance(manager, CrossAttentionManager):
+                 # For cross-attention, we issue a single static allocation
+@@ -268,27 +282,29 @@ class KVCacheCoordinator(ABC):
+                     apply_admission_cap=apply_admission_cap,
+                 )
+             num_blocks_to_allocate += req_b
+-            if manager.pool_partition == "swa":
+-                swa_blocks_to_allocate += req_b
+-            elif manager.pool_partition == "state":
+-                state_blocks_to_allocate += req_b
+-            else:
+-                main_blocks_to_allocate += req_b
++            part = manager.pool_partition or "main"
++            by_partition[part] = by_partition.get(part, 0) + req_b
+         if self.block_pool.swa_free_block_queue is not None:
+-            main_free = self.block_pool.get_num_free_blocks("main")
+-            if main_blocks_to_allocate > main_free:
+-                return self.block_pool.num_gpu_blocks + 1
+-            swa_free = self.block_pool.swa_free_block_queue.num_free_blocks
+-            state_free = (
+-                self.block_pool.state_free_block_queue.num_free_blocks
+-                if self.block_pool.state_free_block_queue is not None
+-                else 0
+-            )
+-            borrowed_needed = max(0, swa_blocks_to_allocate - swa_free) + max(
+-                0, state_blocks_to_allocate - state_free
+-            )
+-            if main_blocks_to_allocate + borrowed_needed > main_free:
+-                return self.block_pool.num_gpu_blocks + 1
++            if getattr(self.block_pool, "_disjoint_aux_partitions", False):
++                for part, needed in by_partition.items():
++                    if needed > self.block_pool.get_num_free_blocks(part):
++                        return self.block_pool.num_gpu_blocks + 1
++            else:
++                main_free = self.block_pool.get_num_free_blocks("main")
++                main_blocks_to_allocate = by_partition.get("main", 0)
++                if main_blocks_to_allocate > main_free:
++                    return self.block_pool.num_gpu_blocks + 1
++                swa_free = self.block_pool.swa_free_block_queue.num_free_blocks
++                state_free = (
++                    self.block_pool.state_free_block_queue.num_free_blocks
++                    if self.block_pool.state_free_block_queue is not None
++                    else 0
++                )
++                borrowed_needed = max(
++                    0, by_partition.get("swa", 0) - swa_free
++                ) + max(0, by_partition.get("state", 0) - state_free)
++                if main_blocks_to_allocate + borrowed_needed > main_free:
++                    return self.block_pool.num_gpu_blocks + 1
+         return num_blocks_to_allocate
+ 
+     def allocate_new_computed_blocks(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index b7633166d1..f27b3aeef0 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -2116,8 +2116,25 @@ def _get_packed_kv_cache_groups(
+         # it widen the block.
+         if anchor_bytes and is_state_bucket(spec):
+             states_per_block = max(anchor_bytes // spec.first_spec.page_size_bytes, 1)
++            eff_num_specs = len(spec.kv_cache_specs)
++            if (
++                os.environ.get("VLLM_DSV41_PURE_20L_PREFILL") == "1"
++                and os.environ.get("TPU_RAIDEN_DSV4_ADMISSION") == "1"
++                and isinstance(spec.first_spec, SlidingWindowSpec)
++                and getattr(spec.first_spec, "sliding_window", 0) > 2
++            ):
++                eff_num_specs = max(
++                    eff_num_specs,
++                    int(
++                        getattr(
++                            vllm_config.model_config.hf_text_config,
++                            "num_hidden_layers",
++                            0,
++                        )
++                    ),
++                )
+             num_groups = max(
+-                num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
++                num_groups, cdiv(eff_num_specs, states_per_block)
+             )
+         if num_groups == 1:
+             groups.append(KVCacheGroupSpec(list(spec.kv_cache_specs), spec))
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index de16b3ff12..b9922f7a9e 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1202,6 +1202,36 @@ class Scheduler(SchedulerInterface):
+                         # we can stop the scheduling here.
+                         break
+ 
++                    if (
++                        os.environ.get("TPU_RAIDEN_DSV4_MAX_TRANSFER_LAYER")
++                        and os.environ.get("VLLM_DSV41_PURE_20L_PREFILL") != "1"
++                        and (
++                            scheduled_running_reqs
++                            or scheduled_new_reqs
++                            or scheduled_resumed_reqs
++                        )
++                        and num_computed_tokens > 0
++                        and 1 < num_new_tokens <= self.max_num_scheduled_tokens
++                        and num_new_tokens > request_token_budget
++                    ):
++                        # Never split a 128-token SWA tail replay across two steps on Decode.
++                        break
++
++                    if (
++                        os.environ.get("VLLM_DSV41_PURE_20L_PREFILL") == "1"
++                        and (
++                            scheduled_running_reqs
++                            or scheduled_new_reqs
++                            or scheduled_resumed_reqs
++                        )
++                        and request_token_budget < 1024
++                        and num_new_tokens > request_token_budget
++                    ):
++                        # Avoid splitting a new long prefill into a tiny <1024-token
++                        # tail sliver (e.g. 128 tokens left from PD handoff truncation),
++                        # which would add an extra 16K XLA step to every subsequent prompt.
++                        break
++
+                     num_new_tokens = min(num_new_tokens, request_token_budget)
+                     assert num_new_tokens > 0
+ 
+@@ -3106,6 +3136,15 @@ class Scheduler(SchedulerInterface):
+                 self.kv_cache_manager.free(request)
+ 
+             self.failed_recving_kv_req_ids.remove(request.request_id)
++        elif (
++            request.num_computed_tokens <= 1
++            and os.environ.get("TPU_RAIDEN_DSV4_MAX_TRANSFER_LAYER")
++        ):
++            # Short prompt (N <= tail_tokens + 1) in 20L prefill mode:
++            # Stage-3 pulled 1 token to unpin the producer registration cleanly,
++            # but layers 20..39 SWA need token 0 computed locally on Decode.
++            request.num_computed_tokens = 0
++            self.kv_cache_manager.free(request)
+         else:
+             # Now that the blocks are ready, actually cache them.
+             # This will cache the blocks iff caching is enabled.
+-- 
+2.56.0.317.g454f8302e1-goog
+

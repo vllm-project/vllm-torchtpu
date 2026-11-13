@@ -1,0 +1,1084 @@
+diff --git a/vllm/benchmarks/datasets/datasets.py b/vllm/benchmarks/datasets/datasets.py
+index 8f9e87cf83..b95ab26636 100644
+--- a/vllm/benchmarks/datasets/datasets.py
++++ b/vllm/benchmarks/datasets/datasets.py
+@@ -515,12 +515,15 @@ def gen_prompt_decode_to_target_len(
+     and the token mismatch (final_len - target_token_len) if the retry budget
+     is exhausted.
+     """
+-    remain_num_try = max_retry
++    remain_num_try = 1 if target_token_len >= 32768 else max_retry
+     token_mismatch = 0
+     while True:
+         prompt = tokenizer.decode(token_sequence)
+         token_sequence = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+         if remain_num_try <= 0:
++            if len(token_sequence) > target_token_len:
++                token_sequence = token_sequence[:target_token_len]
++                prompt = tokenizer.decode(token_sequence)
+             if len(token_sequence) != target_token_len:
+                 token_mismatch = len(token_sequence) - target_token_len
+             break
+@@ -635,8 +638,10 @@ class RandomDataset(BenchmarkDataset):
+ 
+         requests: list[SampleRequest] = []
+         token_mismatch_total = 0
+-        for i in range(num_requests):
+-            prompt, total_input_len, token_mismatch = self.generate_token_sequence(  # noqa: E501
++        import concurrent.futures
++
++        def _build_one(i: int):
++            return i, self.generate_token_sequence(
+                 tokenizer=tokenizer,
+                 prefix_token_ids=prefix_token_ids,
+                 prefix_len=prefix_len,
+@@ -646,6 +651,11 @@ class RandomDataset(BenchmarkDataset):
+                 index=i,
+                 allowed_tokens=allowed_tokens,
+             )
++
++        with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, max(1, num_requests))) as pool:
++            built = list(pool.map(_build_one, range(num_requests)))
++
++        for i, (prompt, total_input_len, token_mismatch) in built:
+             token_mismatch_total += token_mismatch
+             lora_req = self.get_lora_request(
+                 index=i,
+@@ -721,6 +731,28 @@ class RandomDataset(BenchmarkDataset):
+             )
+         return adjusted_tokens
+ 
++    _NATURAL_PARAS = (
++        "In modern computer architecture, out-of-order superscalar processors maximize instruction-level parallelism by dynamically scheduling instructions across multiple execution pipelines. Register renaming eliminates false data dependencies by mapping architectural registers to a larger pool of physical registers maintained in a reorder buffer.\n\n",
++        "High-bandwidth memory (HBM) stacks multiple DRAM dies vertically using through-silicon vias and microbumps, connecting them to a compute die via an ultra-wide silicon interposer bus. While HBM provides several terabytes per second of sequential bandwidth, random uncoalesced accesses smaller than the cache-line granularity suffer severe effective bandwidth degradation.\n\n",
++        "Distributed consensus protocols such as Raft and Paxos guarantee linearizable state machine replication across fault-tolerant clusters in the presence of asynchronous network delays and node crashes. Leader election partitions time into monotonically increasing terms, ensuring that at most one leader can append log entries in any given term.\n\n",
++        "Compressed Sparse Attention (CSA) reduces the quadratic complexity of long-context transformer inference by scoring compressed key-value representations with a lightweight low-precision indexer before gathering the top-k most relevant pages into on-chip vector memory for full-precision matrix multiplication.\n\n",
++        "Speculative decoding accelerates autoregressive language model generation by using a fast draft model to propose K candidate tokens in parallel, which are then verified in a single batched forward pass of the target model. Because verification is compute-bound rather than memory-bandwidth-bound, accepting multiple tokens per target step directly reduces time-per-output-token.\n\n",
++        "In numerical linear algebra, block-scaled low-precision formats such as MXFP4 and FP8 E4M3 share a power-of-two exponent scale across small groups of elements, preserving dynamic range while cutting weight memory traffic and increasing systolic array throughput.\n\n",
++        "Operating system kernels manage virtual memory through hierarchical radix page tables cached in translation lookaside buffers (TLBs). Huge pages reduce TLB miss rates for large contiguous allocations such as database buffer pools and tensor accelerator host staging buffers.\n\n",
++        "Compiler intermediate representations in static single assignment (SSA) form make def-use chains explicit, enabling global value numbering, loop-invariant code motion, polyhedral tile scheduling, and software pipelining of asynchronous DMA transfers against vector compute.\n\n",
++    )
++
++    _NATURAL_SUFFIXES = (
++        "\n\nBased on the technical reference above, write a comprehensive, multi-section textbook chapter analyzing processor microarchitecture, memory hierarchy design, distributed systems consensus, and transformer inference optimization in full technical detail:\n\n## Chapter 1: Superscalar Execution and Memory Subsystems\n",
++        "\n\nDrawing from the engineering principles above, provide an exhaustive, step-by-step systems design specification for a planetary-scale distributed AI inference engine, including hardware roofline equations, network topology, fault recovery, and kernel scheduling:\n\n## 1. System Architecture and Roofline Model\n",
++        "\n\nUsing the concepts discussed above, write a detailed university lecture transcript explaining the mathematical foundations and practical engineering trade-offs of modern hardware accelerators, compilers, and low-precision quantization:\n\n### Lecture 1: From Systolic Arrays to Sparse Attention\n",
++        "\n\nSynthesizing the material above, compose a thorough technical whitepaper comparing CPU, GPU, and TPU execution models across dense linear algebra, sparse gather operations, collective communication, and speculative decoding:\n\n## Executive Technical Analysis\n",
++        "\n\nFrom the systems engineering archive above, write an in-depth architectural review of virtual memory management, DMA double-buffering, lock-free ring buffers, and high-throughput RPC load balancing across multi-process servers:\n\n## Part I: Kernel Memory and I/O Subsystems\n",
++        "\n\nBuilding upon the technical literature above, formulate a rigorous mathematical and algorithmic treatise on block-sparse attention indexers, two-level candidate filtering, and speculative verification trees:\n\n## Section 1: Mathematical Formulation of Sparse Indexers\n",
++        "\n\nReferring to the engineering compendium above, write a complete production engineering guide for profiling, diagnosing, and eliminating tail-latency bottlenecks in large-scale distributed model serving clusters:\n\n## 1. Methodology for End-to-End Latency Decomposition\n",
++        "\n\nIntegrating the computer science foundations above, author a detailed monograph on compiler loop transformations, vector lane utilization, VMEM tiling constraints, and collective communication overlap:\n\n## Chapter 1: Compiler Lowering and Vectorization\n",
++    )
++
+     def generate_token_sequence(
+         self,
+         *,
+@@ -733,17 +765,69 @@ class RandomDataset(BenchmarkDataset):
+         index: int,
+         allowed_tokens: np.ndarray,
+     ) -> tuple[str, int, int]:
+-        """Returns (prompt, total_input_len).
+-
+-        NOTE: After decoding the prompt we have to encode and decode it again.
+-        This is done because in some cases N consecutive tokens
+-        give a string tokenized into != N number of tokens.
+-        For example for GPT2Tokenizer:
+-        [6880, 6881] -> ['Ġcalls', 'here'] ->
+-        [1650, 939, 486] -> ['Ġcall', 'sh', 'ere']
+-        To avoid uncontrolled change of the prompt length,
+-        the encoded sequence is truncated before being decoded again.
+-        """
++        """Returns (prompt, total_input_len)."""
++        import os
++
++        total_input_len = prefix_len + int(input_len)
++        if os.environ.get("VLLM_BENCH_NATURAL_TEXT", "0") == "1":
++            import threading
++
++            lock = getattr(self, "_nl_lock", None)
++            if lock is None:
++                lock = threading.Lock()
++                self._nl_lock = lock
++            with lock:
++                cache = getattr(self, "_nl_tok_cache", None)
++                if cache is None:
++                    para_toks = [
++                        tokenizer.encode(p, add_special_tokens=False)
++                        for p in self._NATURAL_PARAS
++                    ]
++                    suf_toks = [
++                        tokenizer.encode(s, add_special_tokens=False)
++                        for s in self._NATURAL_SUFFIXES
++                    ]
++                    cache = (para_toks, suf_toks)
++                    self._nl_tok_cache = cache
++                tmpl_cache = getattr(self, "_nl_tmpl_cache", None)
++                if tmpl_cache is None:
++                    tmpl_cache = {}
++                    self._nl_tmpl_cache = tmpl_cache
++
++            para_toks, suf_toks = cache
++            suf_idx = index % len(suf_toks)
++            suf_ids = suf_toks[suf_idx]
++            suf_text = self._NATURAL_SUFFIXES[suf_idx]
++            hdr_text = f"Document Archive #{1000 + index}:\n\n"
++            hdr_ids = tokenizer.encode(hdr_text, add_special_tokens=False)
++            body_target = max(16, total_input_len - len(hdr_ids) - len(suf_ids))
++            p_rot = index % len(para_toks)
++            key = (p_rot, body_target, suf_idx)
++            with lock:
++                body_and_suf = tmpl_cache.get(key)
++                if body_and_suf is None:
++                    unit: list[int] = []
++                    for k in range(len(para_toks)):
++                        unit.extend(para_toks[(p_rot + k) % len(para_toks)])
++                    reps = (body_target // len(unit)) + 2
++                    raw_seq = (unit * reps)[:body_target] + suf_ids
++                    cand_str = tokenizer.decode(raw_seq, skip_special_tokens=True)
++                    re_ids = tokenizer.encode(cand_str, add_special_tokens=False)
++                    target_tail = body_target + len(suf_ids)
++                    diff = len(re_ids) - target_tail
++                    if diff > 0:
++                        trimmed = re_ids[: body_target - diff] + suf_ids
++                        cand_str = tokenizer.decode(trimmed, skip_special_tokens=True)
++                    elif diff < 0:
++                        need = int(-diff * 1.015) + 1
++                        pad_ids = (unit * ((need // len(unit)) + 2))[:need]
++                        padded = re_ids[: len(re_ids) - len(suf_ids)] + pad_ids + suf_ids
++                        cand_str = tokenizer.decode(padded, skip_special_tokens=True)
++                    tmpl_cache[key] = cand_str
++                    body_and_suf = cand_str
++            prompt = hdr_text + body_and_suf
++            return prompt, total_input_len, 0
++
+         # Build the inner sequence by sampling
+         # sequentially from the allowed tokens
+         inner_seq = allowed_tokens[
+@@ -752,7 +836,6 @@ class RandomDataset(BenchmarkDataset):
+         token_sequence = prefix_token_ids + inner_seq
+ 
+         # Decode, then re-encode and truncate to preserve token count invariants
+-        total_input_len = prefix_len + int(input_len)
+         prompt, adjusted_token_sequence, token_mismatch = (
+             gen_prompt_decode_to_target_len(
+                 tokenizer=tokenizer,
+diff --git a/vllm/benchmarks/lib/endpoint_request_func.py b/vllm/benchmarks/lib/endpoint_request_func.py
+index 2b4027b502..aa8d3cc856 100644
+--- a/vllm/benchmarks/lib/endpoint_request_func.py
++++ b/vllm/benchmarks/lib/endpoint_request_func.py
+@@ -138,14 +138,22 @@ def _update_payload_common(
+         payload.update(request_func_input.extra_body)
+ 
+ 
++_dp_rr_counter = 0
++
++
+ def _update_headers_common(
+     headers: dict[str, Any],
+     request_func_input: RequestFuncInput,
+ ) -> None:
++    global _dp_rr_counter
+     if request_func_input.extra_headers:
+         headers |= request_func_input.extra_headers
+     if request_func_input.request_id:
+         headers["x-request-id"] = request_func_input.request_id
++    dp_size = int(os.environ.get("VLLM_BENCH_DP_SIZE", "1"))
++    if dp_size > 1 and "X-data-parallel-rank" not in headers:
++        headers["X-data-parallel-rank"] = str(_dp_rr_counter % dp_size)
++        _dp_rr_counter += 1
+ 
+ 
+ def _get_headers(content_type: str | None = None) -> dict[str, str]:
+diff --git a/vllm/benchmarks/serve.py b/vllm/benchmarks/serve.py
+index 14c72386a5..6415b80e20 100644
+--- a/vllm/benchmarks/serve.py
++++ b/vllm/benchmarks/serve.py
+@@ -701,11 +701,15 @@ def calculate_metrics(
+                 current_time += itl_value
+                 token_times.append(current_time)
+ 
+-            # Add tokens to second buckets
++            # Add tokens to second buckets (weight by tokens per SSE chunk so
++            # speculative decoding multi-token chunks are counted accurately).
++            tokens_per_chunk = (
++                actual_output_lens[i] / len(token_times) if token_times else 1.0
++            )
+             for token_time in token_times:
+                 second_bucket = int(token_time - min_start_time)
+                 if 0 <= second_bucket < duration_seconds:
+-                    tokens_per_second[second_bucket] += 1
++                    tokens_per_second[second_bucket] += tokens_per_chunk
+ 
+             # Track concurrent requests for each second this request was active
+             request_start_second = int(output.start_time - min_start_time)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py
+index cff2367966..70f57e68ac 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py
+@@ -396,21 +396,15 @@ class DecodeBenchConnectorWorker:
+ 
+         assert self.kv_caches is not None, "KV caches must be registered before filling"
+ 
+-        for req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
+-            # Fill blocks for each KV cache group
++        merged_per_group: dict[int, list[int]] = {}
++        total_tokens = 0
++        for _req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
++            total_tokens += num_tokens
+             for group_idx, block_ids in enumerate(block_ids_per_group):
+-                self._fill_blocks(group_idx, block_ids, num_tokens)
+-
+-            block_counts = tuple(len(group) for group in block_ids_per_group)
+-            logger.debug(
+-                "DecodeBenchConnector: Filled %d total blocks (%d tokens) across "
+-                "%d groups for request %s (per-group counts: %s)",
+-                sum(block_counts),
+-                num_tokens,
+-                len(block_ids_per_group),
+-                req_id,
+-                ", ".join(map(str, block_counts)),
+-            )
++                merged_per_group.setdefault(group_idx, []).extend(block_ids)
++
++        for group_idx, block_ids in merged_per_group.items():
++            self._fill_blocks(group_idx, block_ids, total_tokens)
+ 
+     def _fill_blocks(self, group_idx: int, block_ids: list[int], num_tokens: int):
+         """Fill specified blocks with dummy values for a specific KV cache group.
+@@ -497,40 +491,29 @@ class DecodeBenchConnectorWorker:
+             fill_std: Standard deviation for the fill.
+ 
+         """
+-        # Convert block_ids to tensor on device
+-        block_ids_tensor = torch.tensor(
+-            block_ids, dtype=torch.long, device=kv_cache.device
+-        )
+-
+-        # Filter invalid block IDs
+-        valid_mask = block_ids_tensor < kv_cache.shape[0]
+-        valid_block_ids = block_ids_tensor[valid_mask]
+-
+-        if len(valid_block_ids) == 0:
++        max_blk = kv_cache.shape[0]
++        valid = sorted({b for b in block_ids if 0 <= b < max_blk})
++        if not valid:
+             return
+ 
+-        # Create fill values - either constant or random
+-        block_shape = kv_cache.shape[1:]
+-        if fill_std > 0:
+-            # Random normal sampling
+-            fill_values = torch.normal(
+-                mean=fill_mean,
+-                std=fill_std,
+-                size=(len(valid_block_ids),) + block_shape,
+-                dtype=kv_cache.dtype,
+-                device=kv_cache.device,
+-            )
+-        else:
+-            # Constant fill value
+-            fill_values = torch.full(
+-                (len(valid_block_ids),) + block_shape,
+-                fill_mean,
+-                dtype=kv_cache.dtype,
+-                device=kv_cache.device,
+-            )
+-
+-        # Batch fill operation
+-        kv_cache[valid_block_ids] = fill_values
++        lo = valid[0]
++        hi = lo + 1
++        runs: list[tuple[int, int]] = []
++        for b in valid[1:]:
++            if b == hi:
++                hi += 1
++            else:
++                runs.append((lo, hi))
++                lo = b
++                hi = b + 1
++        runs.append((lo, hi))
++
++        for r_lo, r_hi in runs:
++            view = kv_cache[r_lo:r_hi]
++            if fill_std > 0:
++                view.normal_(mean=fill_mean, std=fill_std)
++            else:
++                view.fill_(fill_mean)
+ 
+     def _fill_state_tensor(
+         self, kv_cache: torch.Tensor, fill_mean: float, fill_std: float
+diff --git a/vllm/model_executor/layers/quantization/__init__.py b/vllm/model_executor/layers/quantization/__init__.py
+index 39e613a611..db7843862a 100644
+--- a/vllm/model_executor/layers/quantization/__init__.py
++++ b/vllm/model_executor/layers/quantization/__init__.py
+@@ -117,11 +117,15 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
+     from vllm.config.quantization import _ONLINE_SHORTHANDS
+     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+ 
+-    if current_platform.is_cuda() or current_platform.is_rocm():
++    if (
++        current_platform.is_cuda()
++        or current_platform.is_rocm()
++        or current_platform.is_tpu()
++        or current_platform.is_out_of_tree()
++    ):
+         # The v4.1 class is the v4 one extended to accept model_type
+-        # "deepseek_v41" and its 32x32 MXFP8 linear layout. V4.1 has
+-        # platform-specific implementations for both CUDA and ROCm.
+-        from vllm.models.deepseek_v41 import (
++        # "deepseek_v41" and its 32x32 MXFP8 linear layout.
++        from vllm.models.deepseek_v41.quant_config import (
+             DeepseekV4FP8Config as DeepseekV41FP8Config,
+         )
+ 
+diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
+index a9ac307159..04c2e52d31 100644
+--- a/vllm/model_executor/layers/quantization/modelopt.py
++++ b/vllm/model_executor/layers/quantization/modelopt.py
+@@ -2661,3 +2661,5 @@ def build_linear_method(config, algo: str, prefix: str) -> LinearMethodBase:
+         return builder(config, prefix)
+     spec, ctx, format_scheme = resolve(algo, config, prefix)
+     return ModelOptLinearMethod(spec, ctx, format_scheme)
++
++ModelOptNvFp4LinearMethod = ModelOptLinearMethod
+diff --git a/vllm/models/deepseek_v41/__init__.py b/vllm/models/deepseek_v41/__init__.py
+index b69e1c6dcd..306d0184ef 100644
+--- a/vllm/models/deepseek_v41/__init__.py
++++ b/vllm/models/deepseek_v41/__init__.py
+@@ -9,7 +9,7 @@ from .quant_config import DeepseekV4FP8Config
+ if current_platform.is_rocm():
+     from .amd.dspark import DSparkDeepseekV4ForCausalLM
+     from .amd.vl_model import DeepseekV41ForCausalLM
+-else:
++elif current_platform.is_cuda():
+     from .nvidia.dspark import DSparkDeepseekV4ForCausalLM
+     from .nvidia.vl_model import DeepseekV41ForCausalLM
+ 
+diff --git a/vllm/renderers/base.py b/vllm/renderers/base.py
+index 87d11b7b92..6433aea043 100644
+--- a/vllm/renderers/base.py
++++ b/vllm/renderers/base.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import asyncio
++import os
+ import time
+ import weakref
+ from abc import ABC, abstractmethod
+@@ -73,6 +74,58 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++# Opt-in: tokenize text prompts of at least this many characters as independent
++# pieces in one Rust `encode_batch` call (GIL released, pieces run on the
++# tokenizers thread pool). 0 disables.
++_SPLIT_TOKENIZE_MIN_CHARS = int(os.getenv("VLLM_SPLIT_TOKENIZE_MIN_CHARS", "0"))
++_SPLIT_TOKENIZE_PIECES = int(os.getenv("VLLM_SPLIT_TOKENIZE_PIECES", "16"))
++
++
++def _split_tokenize(tokenizer: Any, text: str, kwargs: dict[str, Any]) -> list[int] | None:
++    """Token ids of `text` computed piecewise, or None to use the normal path.
++
++    Pieces are cut only at i with text[i] == " ", text[i - 1] not whitespace and
++    text[i + 1] a letter. For byte-level BPE with an empty normalizer and a
++    GPT/DeepSeek-style regex pre-tokenizer, every pre-token match that touches
++    such a space starts at it (letter runs exclude spaces; " ?[punct]+" and
++    " ?letters" take a space only as a prefix; whitespace runs start at the first
++    whitespace), so the cut is a pre-token boundary in any context and BPE never
++    merges across it. Validated bit-exact against one-shot encode on random and
++    natural text with the DeepSeek-V4.1 tokenizer. Opt in per model.
++    """
++    if _SPLIT_TOKENIZE_MIN_CHARS <= 0 or len(text) < _SPLIT_TOKENIZE_MIN_CHARS:
++        return None
++    backend = getattr(tokenizer, "_tokenizer", None)
++    if backend is None or not hasattr(backend, "encode_batch"):
++        return None
++    if getattr(backend, "padding", None) is not None:
++        return None
++    if kwargs.get("add_special_tokens", True) and tokenizer.num_special_tokens_to_add():
++        return None
++    n = len(text)
++    cuts = [0]
++    for k in range(1, _SPLIT_TOKENIZE_PIECES):
++        i = max(cuts[-1] + 1, k * n // _SPLIT_TOKENIZE_PIECES)
++        end = min(n - 1, i + 65536)
++        while i < end and not (
++            text[i] == " " and not text[i - 1].isspace() and text[i + 1].isalpha()
++        ):
++            i += 1
++        if i < end:
++            cuts.append(i)
++    cuts.append(n)
++    ids: list[int] = []
++    pieces = [text[a:b] for a, b in zip(cuts[:-1], cuts[1:])]
++    for enc in backend.encode_batch(pieces, add_special_tokens=False):
++        ids.extend(enc.ids)
++    max_length = kwargs.get("max_length")
++    if kwargs.get("truncation") and max_length is not None and len(ids) > max_length:
++        if getattr(tokenizer, "truncation_side", "right") == "left":
++            ids = ids[-max_length:]
++        else:
++            ids = ids[:max_length]
++    return ids
++
+ 
+ _T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
+ 
+@@ -114,7 +167,7 @@ class BaseRenderer(ABC, Generic[_T]):
+         # Thread pool executor for blocking tokenizer operations.  The
+         # multimodal processor receives a deep-copied tokenizer (see #36557)
+         # so it is safe to run tokenization and MM preprocessing concurrently.
+-        pool_workers = config.model_config.renderer_num_workers
++        pool_workers = max(8, config.model_config.renderer_num_workers or 1)
+         self._executor = ThreadPoolExecutor(max_workers=pool_workers)
+         self._resources.callback(self._executor.shutdown, wait=False)
+ 
+@@ -534,13 +587,14 @@ class BaseRenderer(ABC, Generic[_T]):
+         a BatchEncoding; pass it only when offsets were requested, and it
+         is attached as ``prompt_token_offsets``.
+         """
++        ids_list = token_ids if isinstance(token_ids, list) else list(token_ids)
+         if offset_mapping is not None:
+             return TokensPrompt(
+-                prompt_token_ids=list(token_ids),
++                prompt_token_ids=ids_list,
+                 prompt_token_offsets=[(int(s), int(e)) for s, e in offset_mapping],
+                 **prompt,
+             )
+-        return TokensPrompt(prompt_token_ids=list(token_ids), **prompt)
++        return TokensPrompt(prompt_token_ids=ids_list, **prompt)
+ 
+     @staticmethod
+     def _apply_prompt_char_offset(
+@@ -573,6 +627,8 @@ class BaseRenderer(ABC, Generic[_T]):
+         kwargs = params.get_encode_kwargs()
+         if want_offsets:
+             kwargs = {**kwargs, "return_offsets_mapping": True}
++        elif (ids := _split_tokenize(tokenizer, prompt["prompt"], kwargs)) is not None:
++            return self._build_tokens_prompt(ids, prompt, offset_mapping=None)
+         encoding = tokenizer(prompt["prompt"], **kwargs)
+         return self._build_tokens_prompt(
+             encoding["input_ids"],
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index b4c9dcaa29..754257d487 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -184,6 +184,8 @@ class BlockPool:
+         # avoid freeing it.
+         self.null_block = self.free_block_queue.popleft()
+         self.null_block.is_null = True
++        self.swa_free_block_queue: FreeKVCacheBlockQueue | None = None
++        self.state_free_block_queue: FreeKVCacheBlockQueue | None = None
+ 
+         self.enable_kv_cache_events = enable_kv_cache_events
+         self.kv_event_queue: list[KVCacheEvent] = []
+@@ -193,6 +195,29 @@ class BlockPool:
+         # are still being read until the pool reuses them.
+         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+ 
++    def configure_aux_partitions(
++        self, num_swa_blocks: int, num_state_blocks: int
++    ) -> None:
++        """Partition the high end of the block pool for SWA and CompressorState."""
++        if (
++            self.swa_free_block_queue is not None
++            or self.state_free_block_queue is not None
++        ):
++            return
++        if num_swa_blocks + num_state_blocks <= 0:
++            return
++        if num_swa_blocks + num_state_blocks >= self.free_block_queue.num_free_blocks:
++            return
++        state_blocks = self.free_block_queue.popright_n(num_state_blocks)
++        for b in state_blocks:
++            b.pool_partition = "state"
++        self.state_free_block_queue = FreeKVCacheBlockQueue(state_blocks)
++
++        swa_blocks = self.free_block_queue.popright_n(num_swa_blocks)
++        for b in swa_blocks:
++            b.pool_partition = "swa"
++        self.swa_free_block_queue = FreeKVCacheBlockQueue(swa_blocks)
++
+     def get_cached_block(
+         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+     ) -> list[KVCacheBlock] | None:
+@@ -657,22 +682,45 @@ class BlockPool:
+             # `num_tokens` only applies to the first (primary) insertion.
+             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+ 
+-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
++    def _queue_for_partition(self, partition: str) -> FreeKVCacheBlockQueue:
++        if partition == "swa" and self.swa_free_block_queue is not None:
++            return self.swa_free_block_queue
++        if partition == "state" and self.state_free_block_queue is not None:
++            return self.state_free_block_queue
++        return self.free_block_queue
++
++    def get_new_blocks(
++        self, num_blocks: int, partition: str = "main"
++    ) -> list[KVCacheBlock]:
+         """Get new blocks from the free block pool.
+ 
+         Note that we do not check block cache in this function.
+ 
+         Args:
+             num_blocks: The number of blocks to allocate.
++            partition: Target partition ("main", "swa", or "state").
+ 
+         Returns:
+             A list of new block.
+ 
+         """
+-        if num_blocks > self.get_num_free_blocks():
+-            raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
++        if num_blocks > self.get_num_free_blocks(partition):
++            raise ValueError(
++                f"Cannot get {num_blocks} free blocks from the pool (partition={partition})"
++            )
+ 
+-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
++        q = self._queue_for_partition(partition)
++        if q is not self.free_block_queue:
++            take_aux = min(num_blocks, q.num_free_blocks)
++            ret: list[KVCacheBlock] = q.popleft_n(take_aux)
++            rem = num_blocks - take_aux
++            if rem > 0:
++                borrowed = self.free_block_queue.popright_n(rem)
++                for b in borrowed:
++                    b.pool_partition = partition
++                ret.extend(borrowed)
++        else:
++            ret = self.free_block_queue.popleft_n(num_blocks)
+ 
+         if self._reuse_watchers:
+             self._notify_reuse(ret)
+@@ -711,14 +759,25 @@ class BlockPool:
+         ``on_reuse`` fires when ``get_new_blocks`` hands a block out (or the
+         cache is reset), so the caller can stop reading it.
+         """
+-        released: list[KVCacheBlock] = []
++        released_main: list[KVCacheBlock] = []
++        released_swa: list[KVCacheBlock] = []
++        released_state: list[KVCacheBlock] = []
+         for block in blocks:
+             assert block.ref_cnt > 0 and not block.is_null
+             block.ref_cnt -= 1
+             self._reuse_watchers[block.block_id] = on_reuse
+             if block.ref_cnt == 0:
+-                released.append(block)
+-        self.free_block_queue.append_n(released)
++                if block.pool_partition == "swa" and self.swa_free_block_queue is not None:
++                    released_swa.append(block)
++                elif block.pool_partition == "state" and self.state_free_block_queue is not None:
++                    released_state.append(block)
++                else:
++                    released_main.append(block)
++        self.free_block_queue.append_n(released_main)
++        if self.swa_free_block_queue is not None and released_swa:
++            self.swa_free_block_queue.append_n(released_swa)
++        if self.state_free_block_queue is not None and released_state:
++            self.state_free_block_queue.append_n(released_state)
+ 
+     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+         """If a block is cached in `cached_block_hash_to_block`, we reset its hash
+@@ -756,7 +815,7 @@ class BlockPool:
+             # ref_cnt=0 means this block is in the free list (i.e. eviction
+             # candidate), so remove it.
+             if block.ref_cnt == 0 and not block.is_null:
+-                self.free_block_queue.remove(block)
++                self._queue_for_partition(block.pool_partition).remove(block)
+             block.ref_cnt += 1
+             if self.metrics_collector:
+                 self.metrics_collector.on_block_accessed(block)
+@@ -777,6 +836,10 @@ class BlockPool:
+         # Identify blocks with hash (LRU cache) and without it (never match APC)
+         blocks_to_evict_last = []
+         blocks_to_evict_first = []
++        swa_first: list[KVCacheBlock] = []
++        swa_last: list[KVCacheBlock] = []
++        state_first: list[KVCacheBlock] = []
++        state_last: list[KVCacheBlock] = []
+         other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
+         for block in ordered_blocks:
+             if block.pool is not None and block.pool is not self:
+@@ -784,7 +847,12 @@ class BlockPool:
+                 continue
+             block.ref_cnt -= 1
+             if block.ref_cnt == 0 and not block.is_null:
+-                if block.block_hash is None or not self.enable_caching:
++                is_first = block.block_hash is None or not self.enable_caching
++                if block.pool_partition == "swa" and self.swa_free_block_queue is not None:
++                    (swa_first if is_first else swa_last).append(block)
++                elif block.pool_partition == "state" and self.state_free_block_queue is not None:
++                    (state_first if is_first else state_last).append(block)
++                elif is_first:
+                     # LIFO reuse of non-cached blocks for better GPU locality.
+                     blocks_to_evict_first.append(block)
+                 else:
+@@ -795,6 +863,12 @@ class BlockPool:
+         self.free_block_queue.prepend_n(blocks_to_evict_first)
+         # Blocks to reuse last are appended to the end of the free queue.
+         self.free_block_queue.append_n(blocks_to_evict_last)
++        if self.swa_free_block_queue is not None:
++            self.swa_free_block_queue.prepend_n(swa_first)
++            self.swa_free_block_queue.append_n(swa_last)
++        if self.state_free_block_queue is not None:
++            self.state_free_block_queue.prepend_n(state_first)
++            self.state_free_block_queue.append_n(state_last)
+         for pool, blocks in other_pools.items():
+             pool.free_blocks(blocks)
+ 
+@@ -859,14 +933,26 @@ class BlockPool:
+ 
+         return True
+ 
+-    def get_num_free_blocks(self) -> int:
++    def get_num_free_blocks(self, partition: str | None = None) -> int:
+         """Get the number of free blocks in the pool.
+ 
+         Returns:
+             The number of free blocks.
+ 
+         """
+-        return self.free_block_queue.num_free_blocks
++        main_free = self.free_block_queue.num_free_blocks
++        if partition == "main":
++            return main_free
++        if partition == "swa" and self.swa_free_block_queue is not None:
++            return self.swa_free_block_queue.num_free_blocks + main_free
++        if partition == "state" and self.state_free_block_queue is not None:
++            return self.state_free_block_queue.num_free_blocks + main_free
++        total = main_free
++        if self.swa_free_block_queue is not None:
++            total += self.swa_free_block_queue.num_free_blocks
++        if self.state_free_block_queue is not None:
++            total += self.state_free_block_queue.num_free_blocks
++        return total
+ 
+     def get_usage(self) -> float:
+         """Get the KV cache usage.
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 8061999409..ea7295b1b0 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -24,6 +24,8 @@ from vllm.v1.kv_cache_interface import (
+     KVCacheConfig,
+     KVCacheSpec,
+     MambaSpec,
++    MLAAttentionSpec,
++    SlidingWindowMLASpec,
+     SlidingWindowSpec,
+ )
+ from vllm.v1.request import Request
+@@ -158,6 +160,35 @@ class KVCacheCoordinator(ABC):
+             manager.block_size for manager in self.single_type_managers
+         )
+ 
++        has_mla = any(
++            isinstance(g.kv_cache_spec, MLAAttentionSpec)
++            for g in self.kv_cache_config.kv_cache_groups
++        )
++        has_swa_mla = any(
++            isinstance(g.kv_cache_spec, SlidingWindowMLASpec)
++            for g in self.kv_cache_config.kv_cache_groups
++        )
++        if has_mla and has_swa_mla and kv_cache_config.num_blocks >= 256:
++            num_blocks = kv_cache_config.num_blocks
++            num_state = min(
++                1152 if num_blocks >= 16384 else 160, max(16, num_blocks // 40)
++            )
++            num_swa = min(
++                2816 if num_blocks >= 16384 else 640, max(32, num_blocks // 11)
++            )
++            self.block_pool.configure_aux_partitions(num_swa, num_state)
++            for manager, group in zip(
++                self.single_type_managers, self.kv_cache_config.kv_cache_groups
++            ):
++                if isinstance(group.kv_cache_spec, SlidingWindowMLASpec):
++                    if any(
++                        name.endswith(".compressor.state_cache")
++                        for name in group.layer_names
++                    ):
++                        manager.pool_partition = "state"
++                    else:
++                        manager.pool_partition = "swa"
++
+         # A positive retention interval must be a multiple of the base hit granularity
+         # (``scheduler_block_size``) to land on real cache-hit boundaries.
+         # 0 = keep only the latest replay boundary; None = dense;
+@@ -203,11 +234,14 @@ class KVCacheCoordinator(ABC):
+ 
+         """
+         num_blocks_to_allocate = 0
++        main_blocks_to_allocate = 0
++        swa_blocks_to_allocate = 0
++        state_blocks_to_allocate = 0
+         for i, manager in enumerate(self.single_type_managers):
+             if isinstance(manager, CrossAttentionManager):
+                 # For cross-attention, we issue a single static allocation
+                 # of blocks based on the number of encoder input tokens.
+-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
++                req_b = manager.get_num_blocks_to_allocate(
+                     request_id,
+                     num_encoder_tokens,
+                     [],
+@@ -217,7 +251,7 @@ class KVCacheCoordinator(ABC):
+                     apply_admission_cap=apply_admission_cap,
+                 )
+             else:
+-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
++                req_b = manager.get_num_blocks_to_allocate(
+                     request_id,
+                     num_tokens,
+                     new_computed_blocks[i],
+@@ -226,6 +260,28 @@ class KVCacheCoordinator(ABC):
+                     num_tokens_main_model,
+                     apply_admission_cap=apply_admission_cap,
+                 )
++            num_blocks_to_allocate += req_b
++            if manager.pool_partition == "swa":
++                swa_blocks_to_allocate += req_b
++            elif manager.pool_partition == "state":
++                state_blocks_to_allocate += req_b
++            else:
++                main_blocks_to_allocate += req_b
++        if self.block_pool.swa_free_block_queue is not None:
++            main_free = self.block_pool.get_num_free_blocks("main")
++            if main_blocks_to_allocate > main_free:
++                return self.block_pool.num_gpu_blocks + 1
++            swa_free = self.block_pool.swa_free_block_queue.num_free_blocks
++            state_free = (
++                self.block_pool.state_free_block_queue.num_free_blocks
++                if self.block_pool.state_free_block_queue is not None
++                else 0
++            )
++            borrowed_needed = max(0, swa_blocks_to_allocate - swa_free) + max(
++                0, state_blocks_to_allocate - state_free
++            )
++            if main_blocks_to_allocate + borrowed_needed > main_free:
++                return self.block_pool.num_gpu_blocks + 1
+         return num_blocks_to_allocate
+ 
+     def allocate_new_computed_blocks(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index af1112c54a..c22b8ec444 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -198,6 +198,8 @@ class KVCacheBlock:
+ 
+     # Whether the block is a null block that should never be cached.
+     is_null: bool = False
++    # Partition tag ("main", "swa", or "state") for isolating overlay caches.
++    pool_partition: str = "main"
+ 
+     @property
+     def block_hash(self) -> BlockHashWithGroupId | None:
+@@ -368,6 +370,28 @@ class FreeKVCacheBlockQueue:
+             curr_block.prev_free_block = self.fake_free_list_head
+         return ret
+ 
++    def popright_n(self, n: int) -> list[KVCacheBlock]:
++        """Pop the last n free blocks from the tail and reduce num_free_blocks by n."""
++        if n == 0:
++            return []
++        assert self.num_free_blocks >= n
++        self.num_free_blocks -= n
++
++        curr_block = self.fake_free_list_tail.prev_free_block
++        ret = []
++        for _ in range(n):
++            assert curr_block is not None and curr_block is not self.fake_free_list_head
++            ret.append(curr_block)
++            prev_block = curr_block.prev_free_block
++            curr_block.prev_free_block = None
++            curr_block.next_free_block = None
++            curr_block = prev_block
++
++        assert curr_block is not None
++        self.fake_free_list_tail.prev_free_block = curr_block
++        curr_block.next_free_block = self.fake_free_list_tail
++        return ret
++
+     def remove(self, block: KVCacheBlock) -> None:
+         """Remove a block in the free list and reduce num_free_blocks by 1.
+ 
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index 56a532b809..50c06547a4 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -41,7 +41,14 @@ class AsyncScheduler(Scheduler):
+             )
+             # Add placeholders for the new draft/spec tokens.
+             # We will update the actual spec token ids in the worker process.
+-            request.spec_token_ids = self._spec_token_placeholders
++            req_k = self._get_request_num_spec_tokens(
++                request, scheduler_output.num_spec_tokens_to_schedule
++            )
++            request.spec_token_ids = (
++                self._spec_token_placeholders
++                if req_k == len(self._spec_token_placeholders)
++                else [-1] * req_k
++            )
+ 
+             if self.use_v2_model_runner:
+                 # Set the next step index in which this request is eligible to be
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index d77b63b4aa..fbe81a3b51 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import json
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -296,6 +298,11 @@ class Scheduler(SchedulerInterface):
+                     "This is experimental and may affect speculative-token "
+                     "acceptance rates."
+                 )
++        self._dspark_k_config_file = os.environ.get("VLLM_DSPARK_K_CONFIG_FILE")
++        self._dspark_k_config_mtime: int = -1
++        self._max_verify_tokens: int | None = None
++        self._context_k_schedule: list[tuple[int, int]] = []
++        self._reload_dspark_k_config(force=True)
+ 
+         # Create the KV cache manager.
+         if hash_block_size is None:
+@@ -550,8 +557,72 @@ class Scheduler(SchedulerInterface):
+             num_new_tokens -= self.num_prefill_lookahead - remaining
+         return max(num_new_tokens, 0)
+ 
++    @staticmethod
++    def _parse_context_k_schedule(raw: str | None) -> list[tuple[int, int]]:
++        if not raw:
++            return []
++        schedule: list[tuple[int, int]] = []
++        for item in raw.split(","):
++            item = item.strip()
++            if not item or ":" not in item:
++                continue
++            ctx_str, k_str = item.split(":", 1)
++            schedule.append((int(ctx_str.strip()), int(k_str.strip())))
++        schedule.sort(key=lambda x: x[0])
++        return schedule
++
++    def _reload_dspark_k_config(self, force: bool = False) -> None:
++        if self._dspark_k_config_file:
++            try:
++                st = os.stat(self._dspark_k_config_file)
++                if not force and st.st_mtime_ns == self._dspark_k_config_mtime:
++                    return
++                with open(self._dspark_k_config_file) as f:
++                    cfg = json.load(f)
++                mvt = cfg.get("max_verify_tokens")
++                self._max_verify_tokens = int(mvt) if mvt is not None else None
++                self._context_k_schedule = self._parse_context_k_schedule(
++                    cfg.get("context_k_schedule")
++                )
++                self._dspark_k_config_mtime = st.st_mtime_ns
++                return
++            except FileNotFoundError:
++                self._dspark_k_config_mtime = -1
++            except Exception as exc:
++                logger.warning("Failed to reload %s: %s", self._dspark_k_config_file, exc)
++                return
++        if force:
++            mvt_env = os.environ.get("VLLM_DSPARK_MAX_VERIFY_TOKENS")
++            self._max_verify_tokens = (
++                int(mvt_env) if mvt_env is not None and mvt_env.strip() != "" else None
++            )
++            self._context_k_schedule = self._parse_context_k_schedule(
++                os.environ.get("VLLM_DSPARK_CONTEXT_K_SCHEDULE")
++            )
++
++    def _get_request_num_spec_tokens(self, request: Request, default_k: int) -> int:
++        if default_k <= 0 or self.num_spec_tokens <= 0:
++            return 0
++        k = min(default_k, self.num_spec_tokens)
++        if self._context_k_schedule:
++            ctx_len = max(
++                request.num_tokens,
++                request.num_computed_tokens - request.num_output_placeholders,
++            )
++            sched_k = k
++            for min_ctx, tier_k in self._context_k_schedule:
++                if ctx_len >= min_ctx:
++                    sched_k = tier_k
++                else:
++                    break
++            k = min(k, sched_k)
++        if self._max_verify_tokens is not None:
++            k = min(k, self._max_verify_tokens)
++        return max(0, k)
++
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
++        self._reload_dspark_k_config()
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+         # Each request just has the num_computed_tokens and
+@@ -1078,14 +1149,17 @@ class Scheduler(SchedulerInterface):
+                     # Pad new decode requests to uniform spec decoding size to
+                     # preserve full cudagraph for this step.
+                     # Not for diffusion where draft tokens can't be padded.
++                    req_spec_k = self._get_request_num_spec_tokens(
++                        request, self.num_spec_tokens
++                    )
+                     if (
+-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
++                        (req_spec_k > 0 and self.dynamic_sd_lookup is None)
+                         and self.num_sampled_tokens_per_step > 0
+                         and num_new_tokens == 1
+                         and not prefill_scheduled
+                         and (scheduled_running_reqs or num_computed_tokens > 0)
+                     ):
+-                        padded_num_tokens = 1 + self.num_spec_tokens
++                        padded_num_tokens = 1 + req_spec_k
+                         # Pad only when there is room for the sampled token(s).
+                         if (
+                             num_computed_tokens
+@@ -1127,7 +1201,7 @@ class Scheduler(SchedulerInterface):
+                             break
+                         if (
+                             pad_spec_decode
+-                            and num_new_tokens != 1 + self.num_spec_tokens
++                            and num_new_tokens != 1 + req_spec_k
+                         ):
+                             # Alignment clipped the placeholder rows. The split
+                             # aligns prefill chunks, but the padded tail rows are
+@@ -1306,10 +1380,10 @@ class Scheduler(SchedulerInterface):
+                 request.status = RequestStatus.RUNNING
+                 request.num_computed_tokens = num_computed_tokens
+                 if pad_spec_decode:
+-                    assert num_new_tokens == 1 + self.num_spec_tokens
++                    assert num_new_tokens == 1 + req_spec_k
+                     scheduled_spec_decode_tokens[request_id] = [
+                         -1
+-                    ] * self.num_spec_tokens
++                    ] * req_spec_k
+                 # Only track requests that will still be prefilling after this chunk.
+                 if num_computed_tokens + num_new_tokens < request.num_tokens:
+                     self._inflight_prefills.add(request)
+@@ -1436,6 +1510,15 @@ class Scheduler(SchedulerInterface):
+             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                 len(num_scheduled_tokens)
+             ]
++        if (
++            self._context_k_schedule or self._max_verify_tokens is not None
++        ) and len(num_scheduled_tokens) > 0:
++            num_spec_tokens_to_schedule = max(
++                self._get_request_num_spec_tokens(
++                    self.requests[rid], num_spec_tokens_to_schedule
++                )
++                for rid in num_scheduled_tokens
++            )
+ 
+         scheduled_encoder_input_stats = None
+         if (
+@@ -2421,8 +2504,9 @@ class Scheduler(SchedulerInterface):
+                 continue
+ 
+             # Add newly generated spec token ids to the request.
++            req_k = self._get_request_num_spec_tokens(request, self.num_spec_tokens)
+             request.spec_token_ids = self.structured_output_manager.validate_tokens(
+-                request, spec_token_ids
++                request, spec_token_ids[:req_k]
+             )
+ 
+     def update_draft_token_ids_in_output(
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 70d56c6543..a13dc3f7b8 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -137,6 +137,7 @@ class SingleTypeKVCacheManager(ABC):
+ 
+         self.kv_cache_group_id = kv_cache_group_id
+         self._null_block = block_pool.null_block
++        self.pool_partition: str = "main"
+ 
+         # Whether this group's prefix-cache hits drop the EAGLE/MTP lookahead
+         # block. Only consulted by managers whose hit logic is sparse within an
+@@ -358,7 +359,9 @@ class SingleTypeKVCacheManager(ABC):
+         num_new_blocks = max(
+             0, cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+         )
+-        allocated_blocks = self.block_pool.get_new_blocks(num_new_blocks)
++        allocated_blocks = self.block_pool.get_new_blocks(
++            num_new_blocks, partition=self.pool_partition
++        )
+         req_blocks.extend(allocated_blocks)
+         if self._record_new_block_ids:
+             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
+@@ -388,7 +391,9 @@ class SingleTypeKVCacheManager(ABC):
+             # correct; the extra block was reserved by
+             # get_num_blocks_to_allocate.
+             block_idx, source_block = self._partial_hit_reqs.pop(request_id)
+-            cow_block = self.block_pool.get_new_blocks(1)[0]
++            cow_block = self.block_pool.get_new_blocks(
++                1, partition=self.pool_partition
++            )[0]
+             self._apply_cow(request_id, block_idx, source_block, cow_block)
+             self.new_block_ids.append(cow_block.block_id)
+             cow_blocks.append(cow_block)
+@@ -399,7 +404,9 @@ class SingleTypeKVCacheManager(ABC):
+         if num_new_blocks <= 0:
+             return cow_blocks
+         else:
+-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
++            new_blocks = self.block_pool.get_new_blocks(
++                num_new_blocks, partition=self.pool_partition
++            )
+             req_blocks.extend(new_blocks)
+             if self._record_new_block_ids:
+                 self.new_block_ids.extend(b.block_id for b in new_blocks)
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index cb7d3d4718..d1076c518e 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -482,7 +482,11 @@ class InputProcessor:
+             lora_request=lora_request,
+             cache_salt=decoder_input.get("cache_salt"),
+             priority=priority,
+-            data_parallel_rank=data_parallel_rank,
++            data_parallel_rank=(
++                int(data_parallel_rank) % max(int(self.vllm_config.parallel_config.data_parallel_size), 1)
++                if data_parallel_rank is not None
++                else None
++            ),
+             trace_headers=trace_headers,
+             resumable=resumable,
+             session_id=session_id,
+diff --git a/vllm/v1/utils.py b/vllm/v1/utils.py
+index a89ccbb9ed..38d7fde2e5 100644
+--- a/vllm/v1/utils.py
++++ b/vllm/v1/utils.py
+@@ -251,6 +251,10 @@ class APIServerProcessManager:
+             # Drop parent's write end so reader sees EOF on child death.
+             child_send.close()
+ 
++        if num_servers > 1 and not getattr(args, "uds", None) and sock is not None:
++            with contextlib.suppress(Exception):
++                sock.close()
++
+         logger.info("Started %d API server processes", len(self.processes))
+ 
+         # Shutdown only the API server processes on garbage collection
+@@ -521,9 +525,14 @@ def run_api_server_worker_proc(
+ ) -> None:
+     """Entrypoint for individual API server worker processes."""
+     from vllm.entrypoints.launchers.api_server.entry import run_server_worker
++    from vllm.entrypoints.launchers.launcher import create_server_socket
+ 
+     client_config = client_config or {}
+     server_index = client_config.get("client_index", 0)
++    if client_config.get("client_count", 1) > 1 and not getattr(args, "uds", None):
++        with contextlib.suppress(Exception):
++            sock.close()
++        sock = create_server_socket((args.host or "", args.port), reuse_port=True)
+ 
+     # Set process title and add process-specific prefix to stdout and stderr.
+     set_process_title("APIServer", str(server_index))

@@ -1,0 +1,139 @@
+--- a/vllm/benchmarks/lib/endpoint_request_func.py
++++ b/vllm/benchmarks/lib/endpoint_request_func.py
+@@ -150,7 +150,7 @@
+         headers |= request_func_input.extra_headers
+     if request_func_input.request_id:
+         headers["x-request-id"] = request_func_input.request_id
+-    dp_size = int(os.environ.get("VLLM_BENCH_DP_SIZE", "1"))
++    dp_size = int(os.environ.get("VLLM_BENCH_DP_SIZE", "8"))
+     if dp_size > 1 and "X-data-parallel-rank" not in headers:
+         headers["X-data-parallel-rank"] = str(_dp_rr_counter % dp_size)
+         _dp_rr_counter += 1
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py
+@@ -231,7 +231,7 @@
+         req_id = request.request_id
+ 
+         # Only fill once per request on first scheduling
+-        if req_id in self._filled_requests:
++        if request.num_tokens < 4096 or __import__("os").path.exists("/tmp/disable_decode_bench_fill") or req_id in self._filled_requests:
+             return 0, False
+ 
+         # Calculate how many tokens we need to fill
+@@ -391,7 +391,7 @@
+ 
+         Supports both single- and multi-group KV cache configurations.
+         """
+-        if not metadata.reqs_to_fill:
++        if not metadata.reqs_to_fill or __import__('os').path.exists('/tmp/disable_decode_bench_fill'):
+             return
+ 
+         assert self.kv_caches is not None, "KV caches must be registered before filling"
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -716,8 +716,6 @@
+             rem = num_blocks - take_aux
+             if rem > 0:
+                 borrowed = self.free_block_queue.popright_n(rem)
+-                for b in borrowed:
+-                    b.pool_partition = partition
+                 ret.extend(borrowed)
+         else:
+             ret = self.free_block_queue.popleft_n(num_blocks)
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -65,6 +65,13 @@
+         )
+ 
+ 
++
++def _first_spec(g):
++    s = g.kv_cache_spec
++    if hasattr(s, 'kv_cache_specs') and s.kv_cache_specs:
++        return next(iter(s.kv_cache_specs.values()))
++    return s
++
+ class KVCacheCoordinator(ABC):
+     """Coordinate the KV cache of different KV cache groups."""
+ 
+@@ -161,26 +168,26 @@
+         )
+ 
+         has_mla = any(
+-            isinstance(g.kv_cache_spec, MLAAttentionSpec)
++            isinstance(_first_spec(g), MLAAttentionSpec)
+             for g in self.kv_cache_config.kv_cache_groups
+         )
+         has_swa_mla = any(
+-            isinstance(g.kv_cache_spec, SlidingWindowMLASpec)
++            isinstance(_first_spec(g), SlidingWindowMLASpec)
+             for g in self.kv_cache_config.kv_cache_groups
+         )
+         if has_mla and has_swa_mla and kv_cache_config.num_blocks >= 256:
+             num_blocks = kv_cache_config.num_blocks
+-            num_state = min(
+-                1152 if num_blocks >= 16384 else 160, max(16, num_blocks // 40)
++            num_state = (
++                1152 if num_blocks >= 16384 else (1056 if num_blocks >= 4096 else max(16, num_blocks // 40))
+             )
+-            num_swa = min(
+-                2816 if num_blocks >= 16384 else 640, max(32, num_blocks // 11)
++            num_swa = (
++                2816 if num_blocks >= 16384 else (800 if num_blocks >= 4096 else max(32, num_blocks // 11))
+             )
+             self.block_pool.configure_aux_partitions(num_swa, num_state)
+             for manager, group in zip(
+                 self.single_type_managers, self.kv_cache_config.kv_cache_groups
+             ):
+-                if isinstance(group.kv_cache_spec, SlidingWindowMLASpec):
++                if isinstance(_first_spec(group), SlidingWindowMLASpec):
+                     if any(
+                         name.endswith(".compressor.state_cache")
+                         for name in group.layer_names
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1727,9 +1727,7 @@
+             _,
+         ) = glm5_layout
+         bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
+-        num_blocks = may_override_num_blocks(
+-            vllm_config, available_memory // bytes_per_block
+-        )
++        num_blocks = may_override_num_blocks(vllm_config, min(available_memory // bytes_per_block, 16384))
+         size = bytes_per_block * num_blocks
+         attn_specs = cast(
+             UniformTypeKVCacheSpecs, attn_group.kv_cache_spec
+@@ -1783,7 +1781,7 @@
+     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
+     interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
+ 
+-    num_blocks = available_memory // bytes_per_block
++    num_blocks = min(available_memory // bytes_per_block, 16384)
+     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+     size = bytes_per_block * num_blocks
+ 
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -355,7 +355,10 @@
+         if num_external_computed_tokens <= 0:
+             return
+ 
++        num_skipped_blocks = num_skipped_tokens // self.block_size
+         req_blocks = self.req_to_blocks[request_id]
++        if num_skipped_blocks > len(req_blocks):
++            req_blocks.extend([self._null_block] * (num_skipped_blocks - len(req_blocks)))
+         num_new_blocks = max(
+             0, cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+         )
+@@ -1059,7 +1062,10 @@
+                     computed.pop()
+         if drop_eagle_block and computed_blocks[0]:
+             for computed in computed_blocks:
+-                computed.pop()
++                popped = computed.pop()
++                if not popped.is_null and popped.ref_cnt == 0:
++                    block_pool.touch((popped,))
++                    block_pool.free_blocks((popped,))
+             # Re-align after eagle pop: the pop may break the alignment
+             # when block_size != alignment_tokens (hybrid models with
+             # different page sizes, e.g. Gemma4).

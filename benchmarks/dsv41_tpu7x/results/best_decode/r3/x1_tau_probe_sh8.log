@@ -1,0 +1,4 @@
+[TAU] thinking=off temp=1.0 tau=3.227459430341391 per_pos=[0.7068, 0.534, 0.407, 0.3224, 0.2572] tokens=47892 tok/s=1176
+[TAU] thinking=on temp=1.0 tau=3.1126787295963556 per_pos=[0.7244, 0.5261, 0.3822, 0.2809, 0.1991] tokens=49152 tok/s=1293
+[TAU] thinking=off temp=0.0 tau=4.166465517241379 per_pos=[0.86, 0.7226, 0.6154, 0.5226, 0.4459] tokens=48263 tok/s=1763
+[TAU] thinking=on temp=0.0 tau=3.606551370364942 per_pos=[0.8237, 0.6407, 0.4934, 0.374, 0.2747] tokens=49152 tok/s=2489

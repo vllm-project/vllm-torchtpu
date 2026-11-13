@@ -1,0 +1,104 @@
+{
+ "rows": [
+  {
+   "conc": 64,
+   "seqs_per_rank": 8,
+   "tokens_per_rank_step": 48,
+   "ctx": 20000,
+   "out_len": 512,
+   "step_ms": 38.75,
+   "tau": 2.8686,
+   "interior_tok_s": 4737.29,
+   "interior_tok_s_at_3p5": 5780.01,
+   "wall_tok_s": 1771.57,
+   "tpot_ms": 21.598,
+   "ttft_p50_s": 4.5938,
+   "per_pos": [
+    0.7293,
+    0.4857,
+    0.3169,
+    0.1988,
+    0.138
+   ],
+   "duration_s": 18.497,
+   "per_chip_interior": 1184.3225,
+   "per_user_tok_s": 74.02015625
+  },
+  {
+   "conc": 128,
+   "seqs_per_rank": 16,
+   "tokens_per_rank_step": 96,
+   "ctx": 20000,
+   "out_len": 512,
+   "step_ms": 45.18,
+   "tau": 2.8282,
+   "interior_tok_s": 8012.46,
+   "interior_tok_s_at_3p5": 9915.71,
+   "wall_tok_s": 2276.85,
+   "tpot_ms": 31.637,
+   "ttft_p50_s": 11.1657,
+   "per_pos": [
+    0.726,
+    0.4759,
+    0.3066,
+    0.1915,
+    0.1282
+   ],
+   "duration_s": 28.784,
+   "per_chip_interior": 2003.115,
+   "per_user_tok_s": 62.59734375
+  },
+  {
+   "conc": 256,
+   "seqs_per_rank": 32,
+   "tokens_per_rank_step": 192,
+   "ctx": 20000,
+   "out_len": 512,
+   "step_ms": 57.52,
+   "tau": 2.9067,
+   "interior_tok_s": 12936.58,
+   "interior_tok_s_at_3p5": 15577.13,
+   "wall_tok_s": 5278.4,
+   "tpot_ms": 26.824,
+   "ttft_p50_s": 5.8478,
+   "per_pos": [
+    0.7381,
+    0.4946,
+    0.3264,
+    0.2076,
+    0.14
+   ],
+   "duration_s": 24.832,
+   "per_chip_interior": 3234.145,
+   "per_user_tok_s": 50.533515625
+  },
+  {
+   "conc": 512,
+   "seqs_per_rank": 64,
+   "tokens_per_rank_step": 384,
+   "ctx": 20000,
+   "out_len": 512,
+   "step_ms": null,
+   "tau": 2.8858,
+   "interior_tok_s": null,
+   "interior_tok_s_at_3p5": null,
+   "wall_tok_s": 7173.57,
+   "tpot_ms": 33.927,
+   "ttft_p50_s": 7.7878,
+   "per_pos": [
+    0.7363,
+    0.4893,
+    0.3199,
+    0.2033,
+    0.137
+   ],
+   "duration_s": 36.543,
+   "per_chip_interior": 0.0,
+   "per_user_tok_s": 0.0
+  }
+ ],
+ "fit": {
+  "floor_ms": 32.579999999999984,
+  "slope_ms_per_token": 0.13008928571428582
+ }
+}

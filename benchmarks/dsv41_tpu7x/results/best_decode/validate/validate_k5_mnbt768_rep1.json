@@ -1,0 +1,56 @@
+{
+ "rows": [
+  {
+   "conc": 256,
+   "seqs_per_rank": 32,
+   "tokens_per_rank_step": 192,
+   "ctx": 4000,
+   "out_len": 1024,
+   "step_ms": 60.94,
+   "tau": 3.0718,
+   "interior_tok_s": 12903.73,
+   "interior_tok_s_at_3p5": 14702.49,
+   "wall_tok_s": 4985.93,
+   "tpot_ms": 30.516,
+   "ttft_p50_s": 14.0606,
+   "per_pos": [
+    0.7617,
+    0.5373,
+    0.3668,
+    0.2472,
+    0.1588
+   ],
+   "duration_s": 52.577,
+   "per_chip_interior": 3225.9325,
+   "per_user_tok_s": 50.4051953125
+  },
+  {
+   "conc": 512,
+   "seqs_per_rank": 64,
+   "tokens_per_rank_step": 384,
+   "ctx": 4000,
+   "out_len": 1024,
+   "step_ms": 97.3,
+   "tau": 3.1037,
+   "interior_tok_s": 16332.43,
+   "interior_tok_s_at_3p5": 18417.88,
+   "wall_tok_s": 9044.19,
+   "tpot_ms": 37.987,
+   "ttft_p50_s": 12.1648,
+   "per_pos": [
+    0.7639,
+    0.5454,
+    0.3756,
+    0.2544,
+    0.1644
+   ],
+   "duration_s": 57.97,
+   "per_chip_interior": 4083.1075,
+   "per_user_tok_s": 31.89927734375
+  }
+ ],
+ "fit": {
+  "floor_ms": 24.580000000000155,
+  "slope_ms_per_token": 0.1893749999999995
+ }
+}
