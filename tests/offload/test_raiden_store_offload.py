@@ -4374,3 +4374,43 @@ class TestDenseDpIndex(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHostPoolCgroupCheck(unittest.TestCase):
+    """check_host_pool_fits_cgroup: fail before pinning instead of OOM-kill."""
+
+    GiB = 1 << 30
+
+    def _cgroup(self, limit, anon, shmem, file=0):
+        import tempfile
+
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "memory.max"), "w") as f:
+            f.write(f"{limit}\n" if isinstance(limit, int) else f"{limit}\n")
+        with open(os.path.join(d, "memory.stat"), "w") as f:
+            f.write(f"anon {anon}\nfile {file}\nshmem {shmem}\nkernel 123\n")
+        return d
+
+    def test_fits(self):
+        from vllm_torchtpu.offload.raiden_store import check_host_pool_fits_cgroup
+
+        d = self._cgroup(900 * self.GiB, 300 * self.GiB, 50 * self.GiB, 400 * self.GiB)
+        # Page cache (file) does not count: 350 + 480 <= 873.
+        check_host_pool_fits_cgroup(480 * self.GiB, d)
+
+    def test_does_not_fit_raises_with_numbers(self):
+        from vllm_torchtpu.offload.raiden_store import check_host_pool_fits_cgroup
+
+        d = self._cgroup(900 * self.GiB, 350 * self.GiB, 100 * self.GiB)
+        with self.assertRaisesRegex(ValueError, r"480\.0 GiB on top of 450\.0 GiB"):
+            check_host_pool_fits_cgroup(480 * self.GiB, d)
+
+    def test_unlimited_or_unreadable_is_skipped(self):
+        from vllm_torchtpu.offload.raiden_store import check_host_pool_fits_cgroup
+
+        check_host_pool_fits_cgroup(10**15, self._cgroup("max", 0, 0))
+        check_host_pool_fits_cgroup(10**15, "/nonexistent-cgroup-dir")
+        d = self._cgroup(900 * self.GiB, 0, 0)
+        with open(os.path.join(d, "memory.stat"), "w") as f:
+            f.write("file 1\n")  # no anon/shmem keys
+        check_host_pool_fits_cgroup(10**15, d)
