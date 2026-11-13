@@ -51,6 +51,16 @@ DEFAULTS: dict[str, bool | int | str] = {
     # MiniMax M3 indexer kernel v3: fp8 index caches score small tiles
     # (<= 64 rows) transposed with fp8 MXU keys, as the folded 4-bit caches do.
     "minimax_indexer_fp8_transposed": False,
+    # MiniMax M3 indexer, steps that score the large (prefill) tile class
+    # under a cond (decode-sized buckets): that class's tiles, work list and
+    # columns and each row's gather column outside the cond, so XLA computes
+    # them once per step instead of once per layer. Same scores.
+    "minimax_indexer_hoist_metadata": False,
+    # MiniMax M3 indexer, token-major small scores: rows from a row gather of
+    # the small class and a column gather of the large class, selected per
+    # row, instead of one column gather over both (no transposed copy of the
+    # small class). Same scores.
+    "minimax_indexer_row_gather": False,
     # MiniMax M3 MSA attention (DCP lse kernel): r6's kernel instead of v3's
     # (`msa_attention_lse_r6`: 4 tiles per grid step, a 3-group 4-bit page
     # prefetch ring, transposed scores for 8/16-bit full tiles; no 12-page

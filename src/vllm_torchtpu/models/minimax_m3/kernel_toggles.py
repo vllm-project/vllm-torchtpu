@@ -42,6 +42,8 @@ TOGGLES = (
     ("minimax_msa_onehot_lookup", msa_indexer, "ONEHOT_LOOKUP"),
     ("minimax_indexer_dma_ring3", msa_indexer, "DMA_RING3"),
     ("minimax_indexer_fp8_transposed", msa_indexer, "FP8_TRANSPOSED"),
+    ("minimax_indexer_hoist_metadata", msa_indexer, "HOIST_METADATA"),
+    ("minimax_indexer_row_gather", msa_indexer, "ROW_GATHER"),
     ("minimax_msa_lse_r6", msa_attention_lse, "R6_KERNEL"),
     # r6 kernel only (with minimax_msa_lse_r6):
     (
