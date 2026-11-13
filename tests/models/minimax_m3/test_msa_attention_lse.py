@@ -320,3 +320,76 @@ def test_fp4_lse_matches_dense_reference(
         outs.append(o)
         lses.append(lse_h)
     _check(got, (np.concatenate(outs, axis=1), np.concatenate(lses, axis=1)))
+
+
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
+@pytest.mark.parametrize("block_q,pages_per_step", [(8, 32), (32, 32), (8, 64)])
+def test_lse_wide_groups(block_q, pages_per_step, dtype, monkeypatch):
+    """Unions of tens of pages: 32- and 64-page groups, their remainders at
+    the 24-page step width and full-group steps."""
+    monkeypatch.setitem(globals(), "PAGES", 96)
+    monkeypatch.setitem(globals(), "TOPK", 16)
+    num_tokens = 64
+    rng = np.random.default_rng(block_q + pages_per_step)
+    q, kv_rows, kv, table, keys, local_key, local_limit = _inputs(
+        rng, num_tokens, num_tokens - 2, 1, dtype
+    )
+    got = msa_sparse_attention_lse(
+        q,
+        kv,
+        jnp.asarray(keys[:, 0]),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        sm_scale=SCALE,
+        block_q=block_q,
+        pages_per_step=pages_per_step,
+        interpret=True,
+    )
+    want = _reference(
+        np.asarray(q.astype(jnp.float32)),
+        kv_rows,
+        keys[:, 0],
+        local_key,
+        local_limit,
+        table,
+        0,
+    )
+    _check(got, want)
+
+
+@pytest.mark.parametrize("block_q,pages_per_step", [(8, 32), (8, 64)])
+def test_fp4_lse_wide_groups(block_q, pages_per_step, monkeypatch):
+    """4-bit pages and their scale pages in 32-page groups (the 4-bit prefill
+    calls) and 64-page ones (the kernel's general support for wide groups)."""
+    monkeypatch.setitem(globals(), "PAGES", 96)
+    monkeypatch.setitem(globals(), "TOPK", 16)
+    num_tokens = 64
+    rng = np.random.default_rng(7 + pages_per_step)
+    q, _, _, table, keys, local_key, local_limit = _inputs(
+        rng, num_tokens, num_tokens - 2, 1, jnp.bfloat16
+    )
+    kv, scales, rows = _fp4_cache(rng, 1)
+    got = msa_sparse_attention_lse(
+        q,
+        kv,
+        jnp.asarray(keys[:, 0]),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        sm_scale=SCALE,
+        block_q=block_q,
+        pages_per_step=pages_per_step,
+        scale_cache=jnp.asarray(scales),
+        interpret=True,
+    )
+    want = _reference(
+        np.asarray(q.astype(jnp.float32)),
+        rows,
+        keys[:, 0],
+        local_key,
+        local_limit,
+        table,
+        0,
+    )
+    _check(got, want)
