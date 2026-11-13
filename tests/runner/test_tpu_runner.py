@@ -4094,3 +4094,35 @@ class TestLogitsAtDpVocabRows:
             TPUModelRunner._logits_at_dp_vocab_rows(
                 runner, torch.zeros(9, 2), torch.arange(9)
             )
+
+
+# A K=7 drafter at max_num_seqs 48: the served token
+# buckets, a 8192-token budget.
+SERVED_PADDINGS = [4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 384, 512]
+SERVED_PADDINGS += [1024, 2048, 3072, 4096, 8192]
+
+
+def test_compute_selected_logits_warms_verify_row_counts(monkeypatch):
+    """A verify step selects one logits row per verified token, a token
+    bucket up to max_num_reqs * (1 + K), not a request bucket (a serving run
+    retraced it at (1024 tokens, 64 rows) and every such pair)."""
+    warmed = set()
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(get_hidden_size=lambda: 4),
+        _hidden_states_dtype=torch.float32,
+        device=torch.device("cpu"),
+        num_tokens_paddings=SERVED_PADDINGS,
+        num_reqs_paddings=[8, 16, 32, 48],
+        max_num_reqs=48,
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        _precompile_timed=lambda name: contextlib.nullcontext(),
+        compute_selected_logits=lambda h, i: warmed.add((h.shape[0], i.shape[0])),
+    )
+    runner._spec_logits_lengths = TPUModelRunner._spec_logits_lengths.__get__(runner)
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+
+    TPUModelRunner._precompile_compute_selected_logits(runner)
+
+    assert (1024, 64) in warmed and (8192, 384) in warmed and (64, 64) in warmed
+    assert (64, 96) not in warmed  # a verify step never selects more rows
+    assert max(rows for _, rows in warmed) == 384
