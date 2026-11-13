@@ -89,7 +89,8 @@ class KernelConfig:
     # expert at each physical slot (chip c: slots 56c..56c+55, hottest first);
     # the router columns and expert weights are loaded in that order
     # (rank_loader.expert_plan). A bare name loads from kimi_k3/data; the
-    # default is built by tools/megakernel/expert_plan.py from route counts of
+    # default is built by tools/megakernel/expert_plan.py from the route counts
+    # of a served random-text benchmark (every context depth) and of prefix-free
     # random-token, id-sweep and real-text prefills.
     expert_plan: str = "plan_ep16_real_hotfirst.npz"
     # Weight loading.

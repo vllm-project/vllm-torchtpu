@@ -2,13 +2,15 @@
 """Build an EP16 expert placement plan (``KernelConfig.expert_plan``)
 from the prefill's MoE route counts.
 
-    python -m tools.megakernel.expert_plan --counts DIR[:WEIGHT] ... --out PLAN.npz
+    python -m tools.megakernel.expert_plan \
+        --counts DIR[:weight=W][:plan=NPZ][:windows=A-B] ... --out PLAN.npz
 
 Each ``DIR`` holds the snapshots of one run with ``prefill_route_counts`` on
 (``prefill-rNN-wW.npy``, saved by each chip's even rank: chip ``NN // 2``'s
-cumulative ``[92, 56]`` route counts of its local experts); the latest
-snapshot of every chip is used, and ``--counted-plan`` names the placement the
-run counted under (default: the pre-shard's, chip c holding experts
+cumulative ``[92, 56]`` route counts of its local experts after window W).
+The latest snapshot of every chip is used, or with ``windows=A-B`` the routes
+of windows A..B (snapshot B less snapshot A - 1); ``plan`` names the placement
+the run counted under (default: the pre-shard's, chip c holding experts
 56c..56c+55).
 
 Each run is one token distribution (e.g. random token ids, sequential id
@@ -37,30 +39,65 @@ LOCAL = EXPERTS // CHIPS
 SNAPSHOT = re.compile(r"prefill-r(\d+)-w(\d+)\.npy$")
 
 
-def load_counts(directory: Path, counted_plan: np.ndarray) -> np.ndarray:
-    """``[LAYERS, EXPERTS]`` route counts per logical expert of one run."""
-    latest: dict[int, tuple[int, Path]] = {}
+def load_counts(
+    directory: Path,
+    counted_plan: np.ndarray,
+    windows: tuple[int, int] | None = None,
+) -> np.ndarray:
+    """``[LAYERS, EXPERTS]`` route counts per logical expert of one run: all
+    its windows, or windows ``first..last``."""
+    snapshots: dict[int, dict[int, Path]] = {}
     for path in directory.iterdir():
         match = SNAPSHOT.search(path.name)
-        if not match:
-            continue
-        chip, window = int(match.group(1)) // 2, int(match.group(2))
-        if chip not in latest or window > latest[chip][0]:
-            latest[chip] = (window, path)
-    if sorted(latest) != list(range(CHIPS)):
-        found = sorted(latest)
+        if match:
+            chip, window = int(match.group(1)) // 2, int(match.group(2))
+            snapshots.setdefault(chip, {})[window] = path
+    if sorted(snapshots) != list(range(CHIPS)):
+        found = sorted(snapshots)
         raise SystemExit(f"{directory}: snapshots of chips {found}, need 0..15")
-    windows = {window for window, _ in latest.values()}
-    if len(windows) != 1:
-        raise SystemExit(f"{directory}: chips' latest snapshots differ ({windows})")
-    counts = np.zeros((LAYERS, EXPERTS), np.float64)
-    for chip, (_, path) in latest.items():
+    if windows is None:
+        latest = {max(saved) for saved in snapshots.values()}
+        if len(latest) != 1:
+            raise SystemExit(f"{directory}: chips' latest snapshots differ ({latest})")
+        first, last = 1, latest.pop()
+    else:
+        first, last = windows
+
+    def snapshot(chip: int, window: int) -> np.ndarray:
+        if window < 1:
+            return np.zeros((LAYERS, LOCAL), np.int64)
+        path = snapshots[chip].get(window)
+        if path is None:
+            raise SystemExit(f"{directory}: chip {chip} saved no window {window}")
         local = np.load(path)
         if local.shape != (LAYERS, LOCAL):
             raise SystemExit(f"{path}: shape {local.shape}, expected {(LAYERS, LOCAL)}")
+        return local.astype(np.int64)
+
+    counts = np.zeros((LAYERS, EXPERTS), np.float64)
+    for chip in range(CHIPS):
+        local = snapshot(chip, last) - snapshot(chip, first - 1)
         slots = counted_plan[:, chip * LOCAL : (chip + 1) * LOCAL]
         np.add.at(counts, (np.arange(LAYERS)[:, None], slots), local)
     return counts
+
+
+def parse_run(spec: str) -> tuple[Path, float, str, tuple[int, int] | None]:
+    """``DIR[:weight=W][:plan=NPZ][:windows=A-B]``."""
+    directory, *options = spec.split(":")
+    weight, plan, windows = 1.0, "", None
+    for option in options:
+        key, _, value = option.partition("=")
+        if key == "weight":
+            weight = float(value)
+        elif key == "plan":
+            plan = value
+        elif key == "windows":
+            first, _, last = value.partition("-")
+            windows = (int(first), int(last))
+        else:
+            raise SystemExit(f"--counts {spec}: unknown option {key!r}")
+    return Path(directory), weight, plan, windows
 
 
 def _place_layer(loads: np.ndarray, max_swaps: int) -> list[np.ndarray]:
@@ -130,18 +167,22 @@ def identity() -> np.ndarray:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--counts", nargs="+", required=True, metavar="DIR[:WEIGHT]")
-    parser.add_argument("--counted-plan", default="", help="npz the runs counted under")
+    parser.add_argument(
+        "--counts",
+        nargs="+",
+        required=True,
+        metavar="DIR[:weight=W][:plan=NPZ][:windows=A-B]",
+    )
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
-    counted = identity()
-    if args.counted_plan:
-        counted = np.load(args.counted_plan)["order"].astype(np.int64)
     runs = []
     for spec in args.counts:
-        directory, _, weight = spec.partition(":")
-        counts = load_counts(Path(directory), counted)
-        runs.append((directory, float(weight or 1) * counts))
+        directory, weight, plan, windows = parse_run(spec)
+        counted = identity()
+        if plan:
+            counted = np.load(plan)["order"].astype(np.int64)
+        counts = load_counts(directory, counted, windows)
+        runs.append((spec, weight * counts))
     order = place([counts for _, counts in runs])
     for layer in range(LAYERS):
         assert sorted(order[layer]) == list(range(EXPERTS))
