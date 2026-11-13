@@ -1160,6 +1160,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             w1_scale, w2_scale = adaptive_moe.runtime_channel_scales(
                 layer, layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
             )
+            if envs.MOE_ADAPTIVE_SKIP_UNROUTED and envs.TPU_MOE_SKIP_PADDED_TOKENS:
+                # Padded rows' logits -> NaN: the kernel then routes them nowhere.
+                router_logits = token_padding.mask_router_logits_for_padding(router_logits)
             return adaptive_moe.run_adaptive_fused_moe(
                 self,
                 x,

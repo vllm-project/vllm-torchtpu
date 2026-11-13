@@ -227,6 +227,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_ADAPTIVE_2D_CHANNEL_SCALES: bool = False
     MOE_ADAPTIVE_AG_LEAD_AXIS: bool = False
+    MOE_ADAPTIVE_SKIP_UNROUTED: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -1780,6 +1781,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of gathering in {2,0,1} and relayouting the whole [T, H/128,
     # 128] block (~140 us per layer at 8K tokens on tpu7x).
     "MOE_ADAPTIVE_AG_LEAD_AXIS": env_bool("MOE_ADAPTIVE_AG_LEAD_AXIS"),
+    # Adaptive fused EP MoE: token-padding rows (NaN-masked router logits) and other
+    # rows that route nowhere are dropped from the dispatch instead of landing on expert 0.
+    "MOE_ADAPTIVE_SKIP_UNROUTED": env_bool("MOE_ADAPTIVE_SKIP_UNROUTED"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the
