@@ -1495,6 +1495,13 @@ class StagedConsumer:
                     for r in ranks:
                         pool_name = key if r is None else f"{key}.pcp{r}"
                         self._key_pools[pool_name] = group.group_index
+                        # Routed: the producer's key blocks land as compact
+                        # pair rows in staging pages like every routed owner's.
+                        regions = (
+                            page_regions(pool_name, page_bytes, None)
+                            if self.route
+                            else (RegionSpec("keys", 0, self.src_layout.page_bytes, key_stride, 1),)
+                        )
                         key_entries.append(
                             PoolEntry(
                                 tag=pool_tag(
@@ -1504,11 +1511,11 @@ class StagedConsumer:
                                 layer_name=pool_name,
                                 storage_index=0,
                                 base_offset_bytes=0,
-                                block_stride_bytes=self.src_layout.page_bytes,
-                                num_blocks=self.pages,
-                                regions=(
-                                    RegionSpec("keys", 0, self.src_layout.page_bytes, key_stride, 1),
+                                block_stride_bytes=(
+                                    page_bytes if self.route else self.src_layout.page_bytes
                                 ),
+                                num_blocks=self.pages,
+                                regions=regions,
                                 dtype_tag="qwen4-whole-fp8-page-v1",
                             )
                         )
