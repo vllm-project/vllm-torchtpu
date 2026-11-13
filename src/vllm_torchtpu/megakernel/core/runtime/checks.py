@@ -298,8 +298,7 @@ class WarmupStepPlan:
 
 def build_warmup_plan(
     spec: ModelSpec,
-    buckets: Sequence[int],
-    verify_buckets: Sequence[int],
+    bucket_keys: Sequence[tuple[int, int]],
     bucket_fused_io: _BktMap,
     bucket_gpr: _BktMap,
     *,
@@ -314,8 +313,8 @@ def build_warmup_plan(
     ckpt_cols = max(1, ckpt_window)
     pinfo = pool_schedule_info(spec)
     pps, spp = pinfo.pages_per_slot, pinfo.slots_per_pool
-    spv = spp * MTP_VERIFY_TOKENS
-    all_bkts = [(1, b) for b in buckets] + [(4, b) for b in verify_buckets]
+    all_bkts = list(bucket_keys)
+    spv = spp * max((t for t, _ in all_bkts if t > 1), default=MTP_VERIFY_TOKENS)
     fio, gpr = bucket_fused_io, bucket_gpr
     n_var = len(
         {(k[0], bool(fio.get(k, False)), bool(gpr.get(k, False))) for k in all_bkts}

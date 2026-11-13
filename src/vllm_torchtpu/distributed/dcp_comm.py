@@ -20,6 +20,31 @@ from typing import Any, Literal, overload
 import torch
 
 
+def weight_by_lse(
+    output: torch.Tensor, lse: torch.Tensor, group: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """This rank's `softmax_r(lse) * o_r` term of the merge over `group`.
+
+    Args:
+      output: [T, H * group, D], this rank's partial.
+      lse: [T, H * group], its log-sum-exps.
+
+    Returns:
+      The weighted partial [T, H * group, D] and the merged LSE [T, H * group],
+      both f32. Summing the weighted partials over `group` gives the merge.
+    """
+    # TODO(weiyulin): Evaluate if we need LSE and reduce to be fp32.
+    lse = lse.to(torch.float32)
+    lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
+    merged_lse = torch.logsumexp(lses, dim=0)
+
+    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+    weight = torch.exp(lse - merged_lse).unsqueeze(-1)
+    weighted = output.to(torch.float32) * weight
+    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+    return weighted, merged_lse
+
+
 @overload
 def cp_lse_ag_out_rs(
     output: torch.Tensor,
@@ -67,16 +92,7 @@ def cp_lse_ag_out_rs(
     if group is None or int(group.world_size) == 1:
         return (output, lse) if return_lse else output
 
-    # TODO(weiyulin): Evaluate if we need LSE and reduce to be fp32.
-    lse = lse.to(torch.float32)
-    lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
-    merged_lse = torch.logsumexp(lses, dim=0)
-
-    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-    weight = torch.exp(lse - merged_lse).unsqueeze(-1)
-    weighted = output.to(torch.float32) * weight
-    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
-
+    weighted, merged_lse = weight_by_lse(output, lse, group)
     if rs_dtype is not None:
         weighted = weighted.to(rs_dtype)
     merged = group.reduce_scatter(weighted.contiguous(), dim=1).to(output.dtype)

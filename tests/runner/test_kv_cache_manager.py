@@ -216,6 +216,7 @@ def test_get_kv_cache_spec_sparse_mla(monkeypatch, layout):
     runner.shared_kv_cache_layers = {}
     runner.runner_only_attn_layers = set()
     runner.speculative_config = None
+    runner.pcp_manager = None
     runner.kv_cache_manager = KVCacheManager(runner)
     runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(runner)
     mock_mla = MagicMock(spec=MLAAttention)
@@ -292,9 +293,10 @@ class TestKVCacheManager:
         self.runner.runner_only_attn_layers = set()
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
+        self.runner.pcp_manager = None
         # No LoRA, so adapter swaps reserve no HBM.
         self.runner.lora_slot_write_hbm_bytes.return_value = 0
-        # No ring hand-off, so no buffers are reserved for it.
+        # No buffered hand-off, so no buffers are reserved for it.
         self.runner.pp_handoff_hbm_reserve_bytes.return_value = 0
         self.runner.post_profile_hbm_reserves = (
             TPUModelRunner.post_profile_hbm_reserves.__get__(self.runner)
@@ -2572,6 +2574,7 @@ def test_dsv4_request_caps_match_runner_refresh():
             max_model_len=1048576,
             most_model_len=65536,
             max_num_reqs=64,
+            max_num_local_reqs=64,
             max_num_tokens=1024,
             block_size=1024,
             max_num_blocks_per_req=1024,

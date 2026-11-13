@@ -103,7 +103,14 @@ for name in ("torch", "jax", "jaxlib", "vllm", "numpy"):
 import vllm_torchtpu.models.qwen3_5.megakernel as t
 from vllm_torchtpu.megakernel.adapter.salt import compile_cache_salt
 assert t.SPEC.name == "qwen35"
-cfg = type("C", (), {"additional_config": {"megakernel": {"plugin": "qwen35"}}})()
+cfg = type(
+    "C",
+    (),
+    {
+        "additional_config": {"megakernel": {"plugin": "qwen35"}},
+        "model_config": type("M", (), {"hf_config": None})(),
+    },
+)()
 assert compile_cache_salt(cfg) is None
 print("OK")
 """

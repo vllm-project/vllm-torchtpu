@@ -25,21 +25,23 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-from typing import Any
+from typing import TYPE_CHECKING
 
 import vllm_torchtpu.envs as envs
 
 from .config import import_plugin, missing_template, resolve_callable, select_plugin
 from .fingerprint import canonical_json
 
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
-def compile_cache_salt(vllm_config: Any) -> str | None:
+
+def compile_cache_salt(vllm_config: VllmConfig) -> str | None:
     """`sha256(canonical(layout_request(vllm_config, options)))[:16]`, or `None`."""
-    model_cfg = getattr(vllm_config, "model_config", None)
     cfg, resolved = select_plugin(
         envs.VLLM_TPU_MEGAKERNEL,
-        getattr(vllm_config, "additional_config", None),
-        getattr(model_cfg, "hf_config", None),
+        vllm_config.additional_config,
+        vllm_config.model_config.hf_config,
     )
     if not cfg.enabled or resolved is None:
         return None
