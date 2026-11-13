@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     KDA_FWD_MB: int | None = None
     TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
+    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
     SPEC_WARMUP: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
@@ -1248,6 +1249,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # env_override.py resolves it from the chip family. 0 sets no flag.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": env_nonnegative_int_or_auto(
         "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"
+    ),
+    # TP all-reduces of compiled steps whose padded token bucket (compile_sizes)
+    # has at most this many bf16 rows run as a Pallas kernel
+    # (kernels/experimental/small_collectives) instead of XLA's. 0, the
+    # default, keeps XLA's for every all-reduce. Needs expert parallelism and a
+    # TP group equal to the expert-parallel group. The crossover against XLA
+    # depends on the core count and the hidden size.
+    "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
     ),
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
