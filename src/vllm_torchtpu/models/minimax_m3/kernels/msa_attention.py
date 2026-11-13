@@ -51,12 +51,24 @@ SMALL_BATCH_TOKENS = 1024
 # neighbouring tokens share most of their pages. Served c4 xprof, every
 # 8192-token call of one capture timed at 8/16/32-token tiles on the same
 # selections (j-4396c8a5): 11.8 / 7.7 / 5.5 ms in total; twin c4 mixed step
-# 332.8 -> 328.0 ms (j-e1f0a4fa). 4-bit caches keep 16: twin c48 mixed
-# 352.3 -> 363.6 ms (j-c9516e2e), no served measurement. Outputs change by
-# accumulation order only.
+# 332.8 -> 328.0 ms (j-e1f0a4fa). 4-bit caches take `PREFILL_BLOCK_Q_4BIT`.
+# Outputs change by accumulation order only.
 PREFILL_BLOCK_Q = 32
 SMALL_BATCH_BLOCK_Q = 8
 DEFAULT_PAGES_PER_STEP = 16
+# Prefill / mixed-step tiles of the DCP LSE calls over 4-bit caches: 8-token
+# tiles and 32-page groups. A kernel step costs ~0.7 us besides its score work
+# (unpack, selection compares, loop and scratch traffic: timing-only removal
+# arms, j-aec3278d), so fewer, wider groups win, and an 8-token tile's union is
+# small enough to fit one. Standalone call, 8192 tokens with served-c48-like
+# dispersion (5.0 us per 16-token tile as served, j-da859161): 2.60 -> 2.00 ms
+# (j-ac9898cc).
+PREFILL_BLOCK_Q_4BIT = 8
+PREFILL_PAGES_PER_STEP_4BIT = 32
+# 8/16-bit prefill / mixed-step groups: 32 pages, with the 24-page step width
+# (`msa_attention_lse._STEP_WIDTHS`). Standalone fp8 32-token tiles: 1.62-1.66
+# -> 1.55 ms (moderate dispersion), 0.886 -> 0.870 ms (low; j-492a1bb9).
+PREFILL_PAGES_PER_STEP = 32
 DEFAULT_KERNEL = "v2"
 # Tokens per kernel call. The work list lives in SMEM, sized for the worst
 # case of tokens * topk pages.

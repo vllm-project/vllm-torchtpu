@@ -833,20 +833,23 @@ def msa_attend_dcp(
     mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
     keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
     small = num_tokens <= DCP_SMALL_BATCH_TOKENS
+    if small:
+        block_q = msa_attention.SMALL_BATCH_BLOCK_Q
+        pages_per_step = (
+            _SMALL_BATCH_PAGES_PER_STEP
+            if num_tokens >= _WIDE_GROUP_MIN_TOKENS
+            else msa_attention.DEFAULT_PAGES_PER_STEP
+        )
+    elif scale_cache is not None:
+        block_q = msa_attention.PREFILL_BLOCK_Q_4BIT
+        pages_per_step = msa_attention.PREFILL_PAGES_PER_STEP_4BIT
+    else:
+        block_q = msa_attention.PREFILL_BLOCK_Q
+        pages_per_step = msa_attention.PREFILL_PAGES_PER_STEP
     common = dict(
         sm_scale=sm_scale,
-        block_q=(
-            msa_attention.SMALL_BATCH_BLOCK_Q
-            if small
-            else msa_attention.DEFAULT_BLOCK_Q
-            if scale_cache is not None
-            else msa_attention.PREFILL_BLOCK_Q
-        ),
-        pages_per_step=(
-            _SMALL_BATCH_PAGES_PER_STEP
-            if small and num_tokens >= _WIDE_GROUP_MIN_TOKENS
-            else msa_attention.DEFAULT_PAGES_PER_STEP
-        ),
+        block_q=block_q,
+        pages_per_step=pages_per_step,
         q_head_major=q_head_major,
         interpret=interpret,
     )

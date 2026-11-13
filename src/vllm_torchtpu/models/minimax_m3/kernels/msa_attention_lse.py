@@ -30,7 +30,10 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 
 # Page counts a kernel step may run at besides the full group (`_kernel`).
-_STEP_WIDTHS = (4, 8, 16)
+# 24 serves 32-page groups: a step costs per score column, filled or not, and
+# a 17-24-page remainder is common there (standalone 4-bit 8-token tiles at
+# served-c48-like dispersion: 2.00 -> 1.83 ms, j-492a1bb9).
+_STEP_WIDTHS = (4, 8, 16, 24)
 # Tiles per grid step: a step runs the groups of this many tiles in a loop.
 # One step per group paid a per-step cost worth ~2-3% of the call (pool48
 # selections, 1-2 groups a tile; bench j-caec1354).
@@ -387,10 +390,10 @@ def _kernel(
 
         # Slots past the group's pages hold stale bytes: their limits are 0, so
         # their scores are masked and their value rows zeroed.
-        # Run at the narrowest width holding the group's pages. A step costs per
-        # score column, filled or not (~2.3 us at 16 pages, ~1.1 us at 4, twin
-        # standalone j-952e8a64), and a 16-token tile's union is ~8-12 of its
-        # rank's pages at DCP 2, ~2-8 at DCP 8.
+        # Run at the narrowest width holding the group's pages (`_STEP_WIDTHS`;
+        # groups are 16 or 32 pages by call). A step costs per score column,
+        # filled or not (~2.3 us at 16 pages, ~1.1 us at 4, twin standalone
+        # j-952e8a64), plus ~0.7 us whatever its width (j-aec3278d).
         single = first & last
         widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
         for i, width in enumerate(widths):
