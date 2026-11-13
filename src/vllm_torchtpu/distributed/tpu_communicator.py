@@ -42,6 +42,12 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
 
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        from vllm_torchtpu.distributed import pallas_all_reduce
+
+        out = pallas_all_reduce.all_reduce(self.ranks, input_)
+        return super().all_reduce(input_) if out is None else out
+
     def _moe_group(self, is_sequence_parallel: bool):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
         return group if group.world_size > 1 else None
