@@ -3181,6 +3181,27 @@ def moe(
             device_id_type=pl.DeviceIdType.MESH,
         )
 
+    def routed_gather_storage():
+        """Where the routed all-gather collects the lanes' reduced tokens
+        [8, lane payload, 128]. With a separate send buffer (above B32) it is
+        that buffer: lane ``l``'s block there held this rank's shard for ``l``,
+        which ``l`` has received before it gathers, while the local reduction
+        buffer may still hold shards a slower lane is reducing."""
+        if routed_send_vmem is not None:
+            return routed_send_storage().reshape(8, lane_payload, 128)
+        return expert_local_reduction_vmem
+
+    def routed_gather_copy(offset):
+        view = routed_gather_storage().at[rank % 8, :lane_payload, :]
+        return tpu.make_async_remote_copy(
+            view,
+            view,
+            send_semaphores.at[offset - 1],
+            receive_semaphores.at[offset - 1],
+            device_id=(rank ^ offset,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
     def begin_shared_reduction(local_shared_outputs):
         if reduce_scatter_shared_output:
             lane = rank % 8
@@ -3328,12 +3349,10 @@ def moe(
             reduced_token = decode_expert(
                 expert_host_reduction_vmem[:, :lane_payload, :]
             )
-            encode_expert(
-                reduced_token,
-                expert_local_reduction_vmem.at[lane],
-            )
+            gathered = routed_gather_storage()
+            encode_expert(reduced_token, gathered.at[lane])
             for offset in range(7, 0, -1):
-                expert_copy(lane_payload, offset).start()
+                routed_gather_copy(offset).start()
             if overlap_shared_reduction and not token_pipeline:
                 # Shared-output conversion/reduction is independent of the
                 # routed gather and uses a separate transport buffer.
@@ -3357,7 +3376,7 @@ def moe(
                     # Each gathered lane contains fully reduced latent
                     # vectors, not feature fragments. Same BF16 rounding point
                     # and token order as the unpipelined gather.
-                    packed = expert_local_reduction_vmem[
+                    packed = gathered[
                         first_lane:first_lane + lane_count, :lane_payload, :
                     ]
                     values = tpu.bitcast(
@@ -3373,17 +3392,15 @@ def moe(
                     batch_size=batch_size,
                     tokens_per_lane=tokens_per_lane,
                     lane=lane,
-                    wait_for_peer=lambda offset: expert_copy(lane_payload, offset).wait(),
+                    wait_for_peer=lambda offset: routed_gather_copy(offset).wait(),
                     consume=consume,
                 )
                 _phase_end(t5)
             else:
                 for offset in range(7, 0, -1):
-                    expert_copy(lane_payload, offset).wait()
+                    routed_gather_copy(offset).wait()
                 reduced_expert_outputs[:, :expert_output_size] = (
-                    decode_gathered_experts(
-                        expert_local_reduction_vmem[:, :lane_payload, :]
-                    )
+                    decode_gathered_experts(gathered[:, :lane_payload, :])
                 )
                 _phase_end(t5)
                 if not overlap_shared_reduction:
