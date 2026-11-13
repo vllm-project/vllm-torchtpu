@@ -20,17 +20,19 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def writer_capacity(tokens: int, requests: int, ratio: int) -> int:
+def writer_capacity(tokens: int, requests: int, ratio: int, keys_per_row: int = 2) -> int:
     """Upper bound on the pairs one step writes.
 
     A pair covers ``2 * ratio`` tokens of one request, so a request of ``n``
-    tokens touches at most ``n // (2 * ratio) + 2`` pairs.
+    tokens touches at most ``n // (2 * ratio) + 2`` pairs. In-row keys
+    (``keys_per_row=1``, QWEN4_EXP_INROW_COMPRESSED_K) write one row per
+    ``ratio`` tokens.
     """
-    cap = tokens // (2 * ratio) + 2 * requests + 8
+    cap = tokens // (keys_per_row * ratio) + 2 * requests + 8
     return -(-cap // 8) * 8
 
 
-def write_runs(view, pair, write, mask, values, requests, ratio):
+def write_runs(view, pair, write, mask, values, requests, ratio, keys_per_row: int = 2):
     """``view`` (``pool.reshape(-1, packing, width)``) with the writers applied.
 
     ``pair``/``write``/``mask``/``values`` are ``compressed_pairs``' outputs:
@@ -39,7 +41,7 @@ def write_runs(view, pair, write, mask, values, requests, ratio):
     """
     tokens = len(pair)
     packing, width = view.shape[1:]
-    cap = writer_capacity(tokens, requests, ratio)
+    cap = writer_capacity(tokens, requests, ratio, keys_per_row)
     (idx,) = jnp.nonzero(write, size=cap, fill_value=tokens)
     valid = idx < tokens
     safe = jnp.minimum(idx, tokens - 1)

@@ -561,3 +561,82 @@ def test_pcp_served_geometry_spans_are_dense_and_few():
     keys = rt.producer_spans("compressed", n, ids, g)
     assert keys[0][3] == 800 * RB and rt.compressed_rows(ids, g) == ids * 800
     assert g.key()[-5:] == ["pcp", 2, 128, "keys", 2]
+
+
+# --- an in-row decode (QWEN4_EXP_INROW_COMPRESSED_K) ---------------------------------
+# The decode keeps each layer's compressed keys in the second BF16 half (bytes 2-3
+# of every lane word) of its own main-KV rows: key g of a DCP entry of DCP x
+# DST_BLOCK tokens at row g % (DCP * DST_BLOCK / RATIO) of the entry's page.
+
+
+def inrow_consumer(rank, geo):
+    c = consumer(rank)
+    c.route = geo
+    names = owners()
+    c._src_split = {n for n in names if st.owner_kind(n) == "main"} if geo.pcp > 1 else set()
+    c._inrow_keys = {f"{n}.compressed_k": (n, DCP) for n in names if st.owner_kind(n) == "main"}
+    return c
+
+
+def make_inrow_fn(rank):
+    return make_fn(rank, True)
+
+
+def run_inrow(fn, pool, staging, idx):
+    size = st.bucket(max(len(idx[0]), len(idx[2]), len(idx[8]), 1), 16)
+    out = jnp.asarray(pool)
+    for plan in st.repack_chunks(*idx[:6], size, max(1, len(idx[4])), inrow=idx[6:]):
+        out = fn(out, jnp.asarray(staging), *(jnp.asarray(v, jnp.int32) for v in plan))
+    return np.asarray(out)
+
+
+@pytest.mark.parametrize("num_tokens,skip", [(1, 0), (129, 0), (640, 0), (1000, 0), (2049, 0),
+                                             (2049, 512), (1000, 768)])
+def test_inrow_decode_lands_main_kv_and_keys_in_one_row(num_tokens, skip):
+    """PCP2 merged producer -> routed staging -> in-row decode: bytes 0-1 of
+    the rank's token rows are the broadcast landing's main KV, bytes 2-3 of
+    key row g % per_entry of entry g * RATIO // entry are key g's BF16 half,
+    and nothing else is written."""
+    rng = np.random.default_rng(3000 + num_tokens + skip)
+    prod = pcp_producer_pages(num_tokens, rng)
+    tables = dst_tables(num_tokens, rng)
+    entry, per_entry = DCP * DST_BLOCK, DCP * DST_BLOCK // RATIO
+    for r in range(TP):
+        rank = rank_slice(r)
+        want_main = pcp_broadcast_landing(num_tokens, skip, rank, prod, tables)
+        counts = {n: rt.staging_pages(st.pool_kind(n), num_tokens, len(d), skip, PGEO,
+                                      st.split_pool(n)[1]) for n, d in prod.items()}
+        staging = np.zeros((sum(counts.values()) + 1, PGEO.stage_rows, 1, ROWS, LANES), np.uint8)
+        flat = staging.reshape(-1, ROWS, LANES)
+        pages, cur = {}, 1
+        for name, data in prod.items():
+            pages[name] = list(range(cur, cur + counts[name]))
+            cur += counts[name]
+            kind, pr = st.pool_kind(name), st.split_pool(name)[1]
+            apply_spans_geo(rt.producer_spans(kind, num_tokens, len(data), PGEO, pr), data, r,
+                            pages[name], rt.skip_rows(kind, skip, PGEO) * RB, flat,
+                            PGEO.stage_rows * RB)
+        idx = inrow_consumer(rank, PGEO)._routed_indices(pages, tables, num_tokens, skip)
+        assert len(idx) == 9 and len(idx[0]) == 0  # every QSA layer took the in-row stream
+        pool = np.zeros((400, DST_BLOCK, 1, ROWS, LANES), np.uint8)
+        got = run_inrow(make_inrow_fn(rank), pool, staging, idx)
+        want = want_main.copy()
+        for name in owners():
+            if st.owner_kind(name) != "main":
+                continue
+            # Main KV: bytes 0-1 as broadcast; the broadcast pool has no keys.
+            ck = prod[f"{name}.compressed_k"].reshape(-1, ROWS, LANES)  # pairs, request order
+            want_keys_rows = want.reshape(-1, ROWS, LANES)
+            assert np.shares_memory(want_keys_rows, want)
+            for g in range(skip // RATIO, -(-num_tokens // RATIO)):
+                row = tables[name][g * RATIO // entry] * DST_BLOCK + g % per_entry
+                want_keys_rows[row, 2:4] = ck[g // 2, 2 * (g % 2): 2 * (g % 2) + 2]
+        # The broadcast reference also wrote the plain compressed groups; an
+        # in-row decode has none: clear those rows before comparing.
+        for name in owners():
+            if st.owner_kind(name) == "compressed":
+                for p in tables[name]:
+                    want[p] = 0
+        np.testing.assert_array_equal(got, want, err_msg=f"rank {r}, {num_tokens} tokens, skip {skip}")
+        if num_tokens - skip >= RATIO:
+            assert got.reshape(-1, ROWS, LANES)[:, 2:4].any()  # keys landed

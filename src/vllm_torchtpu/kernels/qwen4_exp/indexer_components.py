@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """BF16 key reads and completed-group scheduling composed with StreamIndex."""
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.components import (
     StreamIndexComponents,
@@ -48,6 +50,44 @@ class BF16KeyReader:
 
 
 @dataclass(frozen=True)
+class InRowKeyReader:
+    """Keys in the second BF16 half of 1 KiB FP8 main-KV rows, one per row.
+
+    QWEN4_EXP_INROW_COMPRESSED_K (``pooled_qsa.inrow_compressed_slot``): a
+    token row's lane word holds K and V of the device's one KV head in bytes
+    0 and 1 and a compressed key's BF16 value in bytes 2 and 3. A kernel page
+    of ``rows`` keys is ``rows`` token rows, so the DMA carries twice the key
+    bytes; the high half of each word, with the low half cleared, is the
+    key's exact FP32 value.
+    """
+
+    @property
+    def packing(self) -> int:
+        return 1
+
+    def validate(self, cache: jax.Array, width: int, layout: KVLayout) -> None:
+        if layout != KVLayout.HEAD_ALONG_SUBLANE or cache.ndim != 4:
+            raise ValueError("in-row index keys require a four-dimensional HEAD cache")
+        if cache.dtype not in (jnp.uint8, jnp.float8_e4m3fn) or cache.shape[2] != 4:
+            raise ValueError("in-row index keys require an 8-bit carrier of packing 4")
+        if cache.shape[-1] < width or cache.shape[-1] % 128:
+            raise ValueError("in-row index keys require an aligned storage width")
+
+    def read(self, ref: Any, rows: int, width: int) -> tuple[jax.Array, jax.Array]:
+        # VLLM_TPU_QSA_INROW_READ picks the lowering (trace-time): "u32" views
+        # the rows as words and keeps their high halves; "bf16" views them as
+        # BF16 pairs and takes the second.
+        if os.environ.get("VLLM_TPU_QSA_INROW_READ", "u32") == "bf16":
+            pairs = ref.bitcast(jnp.bfloat16)[...]
+            keys = pairs.reshape(rows, 2, ref.shape[-1])[:, 1, :width]
+        else:
+            words = ref.bitcast(jnp.uint32)[...].reshape(rows, ref.shape[-1])
+            high = words & jnp.uint32(0xFFFF0000)
+            keys = pltpu.bitcast(high, jnp.float32).astype(jnp.bfloat16)[:, :width]
+        return keys, jnp.ones((1, rows), jnp.float32)
+
+
+@dataclass(frozen=True)
 class QSAIndexSchedule:
     """Prefill excludes incomplete groups; expanded decode already bounds lengths."""
 
@@ -82,9 +122,10 @@ def qsa_indexing(
     per_token_scores: bool = False,
     table_expansion: tuple[int, int, int] = (1, 1, 0),
     coalesce_entries: bool = False,
+    inrow: bool = False,
 ) -> StreamIndexComponents:
     return StreamIndexComponents(
-        BF16KeyReader(),
+        InRowKeyReader() if inrow else BF16KeyReader(),
         QSAIndexSchedule(causal_position_offset),
         per_token_scores,
         table_expansion,

@@ -376,24 +376,31 @@ def bucket(n: int, floor: int = 1024) -> int:
 
 def repack_chunks(
     main_s, main_d, copy_s, copy_d, gdn_s, gdn_d,
-    size=REPACK_CHUNK_ROWS, gdn_pages=REPACK_GDN_PAGES,
+    size=REPACK_CHUNK_ROWS, gdn_pages=REPACK_GDN_PAGES, inrow=None,
 ):
     """Padded index lists per repack program, each of one fixed shape.
 
     A chunk with nothing left of a kind rewrites the null page (row 0, page 0
-    on both sides) in its place.
+    on both sides) in its place. ``inrow = (main, key, dst)``
+    (QWEN4_EXP_INROW_COMPRESSED_K): a fourth kind, appended to every chunk.
     """
+    n_inrow = len(inrow[2]) if inrow is not None else 0
     chunks = max(
-        1, -(-len(main_s) // size), -(-len(copy_s) // size), -(-len(gdn_s) // gdn_pages)
+        1, -(-len(main_s) // size), -(-len(copy_s) // size), -(-len(gdn_s) // gdn_pages),
+        -(-n_inrow // size),
     )
     for i in range(chunks):
         part = slice(i * size, (i + 1) * size)
         pages = slice(i * gdn_pages, (i + 1) * gdn_pages)
-        yield (
+        chunk = (
             _pad(main_s[part], size), _pad(main_d[part], size),
             _pad(copy_s[part], size), _pad(copy_d[part], size),
             _pad(gdn_s[pages], gdn_pages), _pad(gdn_d[pages], gdn_pages),
         )
+        if inrow is not None:
+            # An empty part rewrites the null page's row 0 with zeros.
+            chunk += tuple(_pad(v[part], size) for v in inrow)
+        yield chunk
 
 
 def _pad(values, size: int):
@@ -651,6 +658,12 @@ def compressed_destinations(
     """
     member_rows = dst_block // (2 * ratio)
     out: dict[str, tuple[int, int]] = {}
+    if getattr(layout, "inrow_compressed", False):
+        # In-row keys ride their layer's main-KV pages (StagedConsumer's
+        # in-row stream writes them); offset -1 marks them.
+        for prefix, owner, _ in layout.compressed_owners:
+            out[prefix + ".compressed_k"] = (dst_owner[owner], -1)
+        return out
     if layout.compressed_owners:
         if member_rows * layout.compressed_slots > dst_block:
             raise ValueError("Packed compressed members overflow the page")
@@ -661,6 +674,41 @@ def compressed_destinations(
             if owner_kind(name) == "compressed":
                 out[name] = (gi, 0)
     return out
+
+
+def inrow_key_dst_np(num_tokens, ratio, dst_pages, dst_block, span, start=0) -> np.ndarray:
+    """Destination rows of an in-row layer's compressed keys from ``start``
+    (QWEN4_EXP_INROW_COMPRESSED_K, ``pooled_qsa.inrow_compressed_slot``): key
+    ``g`` of a table entry of ``span * dst_block`` tokens sits at row
+    ``g % keys_per_entry`` of the entry's page, on every rank."""
+    entry = span * dst_block
+    per_entry = entry // ratio
+    g = np.arange(start // ratio, math.ceil(num_tokens / ratio), dtype=np.int64)
+    dp = np.asarray(dst_pages, dtype=np.int64)
+    return dp[g * ratio // entry] * dst_block + g % per_entry
+
+
+def inrow_key_codes(pair_src: np.ndarray, num_tokens: int, ratio: int, start=0) -> np.ndarray:
+    """Per key from ``start``, ``2 * staging row + half`` of its BF16 half in
+    the staged pair rows ``pair_src`` (pair ``p`` holds keys ``2p``, ``2p+1``;
+    ``pair_src`` lists pairs from ``start``'s)."""
+    g = np.arange(start // ratio, math.ceil(num_tokens / ratio), dtype=np.int64)
+    p = g // 2 - start // (2 * ratio)
+    return np.asarray(pair_src, dtype=np.int64)[p] * 2 + g % 2
+
+
+def inrow_union_np(main_s, main_d, key_codes, key_d):
+    """One write per destination row of an in-row layer: the sorted union of
+    its main-KV and key destinations, with each row's main source (0: the
+    null page's zero row) and key code (0: zero)."""
+    main_d = np.asarray(main_d, dtype=np.int64)
+    key_d = np.asarray(key_d, dtype=np.int64)
+    d = np.union1d(main_d, key_d)
+    m = np.zeros(len(d), dtype=np.int64)
+    k = np.zeros(len(d), dtype=np.int64)
+    m[np.searchsorted(d, main_d)] = main_s
+    k[np.searchsorted(d, key_d)] = key_codes
+    return m, k, d
 
 
 def page_prefix_rows(
@@ -910,6 +958,23 @@ def make_repack(
         ):
             raise ValueError("routed GDN staging needs whole-row per-rank SSM state")
 
+    def inrow_rows(staging: jax.Array, inrow_main: jax.Array, inrow_key: jax.Array):
+        """QWEN4_EXP_INROW_COMPRESSED_K: whole destination rows ``[the rank's
+        K, V | a compressed key's BF16 half]`` (byte rows 0-1 | 2-3); a key
+        code is ``2 * staging row + half``. Code / row 0 reads the null
+        page's zero row."""
+        stage = staging.reshape(-1, ROW_SUBLANES, ROW_LANES)
+
+        def gather_u8(flat):
+            rows = gather(stage, flat)
+            return rows if rows.dtype == jnp.uint8 else jax.lax.bitcast_convert_type(rows, jnp.uint8)
+
+        main = gather_u8(inrow_main)[:, 2 * kv_head : 2 * kv_head + 2]
+        pairs = gather_u8(inrow_key // 2)
+        half = (inrow_key % 2)[:, None, None]
+        key = jnp.where(half == 0, pairs[:, 0:2], pairs[:, 2:4])
+        return jnp.concatenate([main, key], axis=1)
+
     def rows(
         staging: jax.Array, main_src: jax.Array, copy_src: jax.Array, gdn_src: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -957,10 +1022,16 @@ def make_repack(
         copy_dst: jax.Array,
         gdn_src: jax.Array,
         gdn_dst: jax.Array,
+        inrow_main: jax.Array | None = None,
+        inrow_key: jax.Array | None = None,
+        inrow_dst: jax.Array | None = None,
     ) -> jax.Array:
         main, copies, gdn = rows(staging, main_src, copy_src, gdn_src)
         values = [main, copies]
         flat = [main_dst, copy_dst]
+        if inrow_dst is not None:
+            values.append(inrow_rows(staging, inrow_main, inrow_key))
+            flat.append(inrow_dst)
         if has_gdn:
             values.append(gdn)
             flat.append((gdn_dst[:, None] * dst_block + jnp.arange(d_rows)).reshape(-1))
@@ -979,6 +1050,7 @@ def make_repack(
         return write(pool, values, flat // kernel_rows, flat, valid)
 
     fn.rows = rows
+    fn.inrow_rows = inrow_rows
     return fn
 
 
@@ -1510,6 +1582,22 @@ class StagedConsumer:
         self._dst_compressed = {
             n: v for n, v in self._dst_compressed.items() if n not in missing
         }
+        # QWEN4_EXP_INROW_COMPRESSED_K on this decode: compressed-key owner ->
+        # (its main-KV owner, table entry span in pages). The repack writes
+        # each such layer's main KV and keys as whole rows (inrow stream).
+        self._inrow_keys = {}
+        if getattr(decode_layout, "inrow_compressed", False):
+            from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import inrow_span
+
+            if draft_kv or self._zero_draft:
+                raise ValueError(
+                    "QWEN4_EXP_INROW_COMPRESSED_K is not combined with "
+                    "QWEN4_EXP_PD_DRAFT_KV or QWEN4_EXP_PD_ZERO_DRAFT_KV"
+                )
+            for prefix, owner, slot in decode_layout.compressed_owners:
+                name = prefix + ".compressed_k"
+                if name in self._dst_compressed and owner in self._dst_owner:
+                    self._inrow_keys[name] = (owner, inrow_span(slot))
         # A speculative state table holds the committed state, then K
         # speculative checkpoints; the connector hands the repack only the
         # committed entry (_Stage3TransferGroup.transfer_pages).
@@ -1797,8 +1885,13 @@ class StagedConsumer:
         first = first or [0] * len(self.src_groups)
         main_s, main_d, copy_s, copy_d = [], [], [], []
         gdn_s, gdn_d = [], []
+        inrow_keys = getattr(self, "_inrow_keys", {})
+        key_src: dict[str, np.ndarray] = {}  # in-row layers' staged pair rows
+        inrow_rows: list = []
         gap = _DraftGap(draft_zero_until if draft_zero_until > skip_tokens else 0)
         for name, (gi, offset) in self._dst_compressed.items():
+            if name in inrow_keys and self.src_split_keys:
+                raise ValueError("in-row decode keys need unsplit producer keys")
             if self.src_split_keys:
                 # Keys of token t come from producer rank (t // B) % P, in that
                 # rank's page for t's main-KV ID (B-token pages, P per ID).
@@ -1821,6 +1914,9 @@ class StagedConsumer:
                 src_first=first[self._src_owner[name]], dst_offset=offset,
                 src_page_rows=self.src_block if merged else None,
             )
+            if name in inrow_keys:
+                key_src[name] = s
+                continue
             s, d = gap.split(name, s, d, lambda: pair_tokens_np(num_tokens, self.ratio, skip_tokens))
             copy_s.append(s)
             copy_d.append(d)
@@ -1843,6 +1939,8 @@ class StagedConsumer:
                 s, d = main_rows_np(num_tokens, src, self.src_block, dst, self.dst_block,
                                     self.rank, start=skip_tokens, src_first=src_first,
                                     src_pcp=pcp)
+                if self._inrow_append(name, s, d, key_src, dst, num_tokens, skip_tokens, inrow_rows):
+                    continue
                 s, d = gap.split(
                     name, s, d,
                     lambda: main_tokens_np(num_tokens, self.dst_block, self.rank, skip_tokens),
@@ -1886,7 +1984,45 @@ class StagedConsumer:
         return (
             cat(main_s), cat(main_d), cat(copy_s), cat(copy_d),
             np.asarray(gdn_s, dtype=np.int64), np.asarray(gdn_d, dtype=np.int64),
-        )
+        ) + self._inrow_streams(inrow_rows)
+
+    def _inrow_append(
+        self, name, main_s, main_d, key_src, dst, num_tokens, skip_tokens, pending
+    ) -> bool:
+        """QWEN4_EXP_INROW_COMPRESSED_K: queue main-KV owner ``name``'s rows
+        with its keys as whole rows (``inrow_union_np``); False if ``name``
+        has no in-row keys."""
+        inrow_keys = getattr(self, "_inrow_keys", {})
+        key = name + ".compressed_k"
+        if key not in inrow_keys:
+            return False
+        _, span = inrow_keys[key]
+        codes = inrow_key_codes(key_src[key], num_tokens, self.ratio, skip_tokens)
+        key_d = inrow_key_dst_np(num_tokens, self.ratio, dst, self.dst_block, span, skip_tokens)
+        pending.append(inrow_union_np(main_s, main_d, codes, key_d))
+        return True
+
+    def _inrow_streams(self, pending) -> tuple:
+        """The queued in-row rows as ``(main, key, dst)``, or ``()`` when this
+        decode has no in-row layers. Each layer's union is padded to whole
+        repack tiles with its last row (an idempotent rewrite)."""
+        if not getattr(self, "_inrow_keys", {}):
+            return ()
+        if len(pending) != len(self._inrow_keys):
+            raise RuntimeError(
+                f"in-row repack built {len(pending)} of {len(self._inrow_keys)} layers"
+            )
+
+        def tiles(i):
+            parts = []
+            for m, k, d in pending:
+                if len(d):
+                    pad = -len(d) % REPACK_TILE
+                    v = (m, k, d)[i]
+                    parts.append(np.concatenate([v, np.full(pad, v[-1], dtype=v.dtype)]))
+            return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
+
+        return tiles(0), tiles(1), tiles(2)
 
     def _routed_indices(self, src_pages, dst_tables, num_tokens, skip_tokens, draft_zero_until=0):
         """``indices`` over routed compact staging: same destination rows in
@@ -1903,7 +2039,17 @@ class StagedConsumer:
         # (shared_passes), not by the repack. The gather runs first, so a
         # draft gap's zero rows (from the repack) overwrite what it wrote.
         shared = self._shared_load(num_tokens)
+        inrow_keys = getattr(self, "_inrow_keys", {})
+        key_src: dict[str, np.ndarray] = {}
+        inrow_rows: list = []
         for name, (gi, offset) in self._dst_compressed.items():
+            if name in inrow_keys:
+                if shared:
+                    raise ValueError("in-row decode keys land through the repack, not shared")
+                key_src[name] = pd_route.compressed_src_rows(
+                    num_tokens, skip_tokens, src_pages[name], g
+                )
+                continue
             d = compressed_dst_np(
                 num_tokens, self.ratio, dst_tables[gi], self.dst_block, skip_tokens, offset
             )
@@ -1926,10 +2072,12 @@ class StagedConsumer:
                     if g.pcp > 1 and name in getattr(self, "_src_split", ())
                     else src_pages[name]
                 )
+                s = pd_route.main_src_rows(num_tokens, skip_tokens, rank.tp_rank, src, g)
+                d = main_dst_np(num_tokens, dst, self.dst_block, rank, skip_tokens)
+                if self._inrow_append(name, s, d, key_src, dst, num_tokens, skip_tokens, inrow_rows):
+                    continue
                 s, d = gap.split(
-                    name,
-                    pd_route.main_src_rows(num_tokens, skip_tokens, rank.tp_rank, src, g),
-                    main_dst_np(num_tokens, dst, self.dst_block, rank, skip_tokens),
+                    name, s, d,
                     lambda: main_tokens_np(num_tokens, self.dst_block, rank, skip_tokens),
                 )
                 main_s.append(s)
@@ -1954,7 +2102,7 @@ class StagedConsumer:
             cat(main_s), cat(main_d), cat(copy_s), cat(copy_d),
             np.asarray(gdn_s, dtype=np.int64).reshape(-1, n_gdn),
             np.asarray(gdn_d, dtype=np.int64),
-        )
+        ) + self._inrow_streams(inrow_rows)
 
     def _shared_load(self, num_tokens: int) -> bool:
         """Whether this load's compressed keys go once per host."""
@@ -2012,7 +2160,8 @@ class StagedConsumer:
             if getattr(self, "route", None) is not None
             else []
         )
-        return RepackPlan(passes=passes, chunks=list(repack_chunks(*idx)))
+        inrow = idx[6:] if len(idx) > 6 else None
+        return RepackPlan(passes=passes, chunks=list(repack_chunks(*idx[:6], inrow=inrow)))
 
     def run_repack(self, plan: RepackPlan) -> None:
         if plan.passes:
@@ -2050,20 +2199,43 @@ class StagedConsumer:
 
         fn = self._fn
 
-        def repack_fn(
-            pool: jax.Array,
-            staging: jax.Array,
-            main_src: jax.Array,
-            main_dst: jax.Array,
-            copy_src: jax.Array,
-            copy_dst: jax.Array,
-            gdn_src: jax.Array,
-            gdn_dst: jax.Array,
-        ) -> tuple[jax.Array, jax.Array]:
-            out = fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst)
-            return out, main_src[0]
+        if getattr(self, "_inrow_keys", {}):
+            # QWEN4_EXP_INROW_COMPRESSED_K: every chunk carries the in-row stream.
+            def repack_fn(
+                pool: jax.Array,
+                staging: jax.Array,
+                main_src: jax.Array,
+                main_dst: jax.Array,
+                copy_src: jax.Array,
+                copy_dst: jax.Array,
+                gdn_src: jax.Array,
+                gdn_dst: jax.Array,
+                inrow_main: jax.Array,
+                inrow_key: jax.Array,
+                inrow_dst: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                out = fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src,
+                         gdn_dst, inrow_main, inrow_key, inrow_dst)
+                return out, main_src[0]
 
-        op = pallas.jax_op("pallas::qwen4_pd_staged_repack", repack_fn, donate_argnums=(0,))
+            op = pallas.jax_op(
+                "pallas::qwen4_pd_staged_repack_inrow", repack_fn, donate_argnums=(0,)
+            )
+        else:
+            def repack_fn(
+                pool: jax.Array,
+                staging: jax.Array,
+                main_src: jax.Array,
+                main_dst: jax.Array,
+                copy_src: jax.Array,
+                copy_dst: jax.Array,
+                gdn_src: jax.Array,
+                gdn_dst: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                out = fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst)
+                return out, main_src[0]
+
+            op = pallas.jax_op("pallas::qwen4_pd_staged_repack", repack_fn, donate_argnums=(0,))
         op.register_fake(
             lambda pool, staging, main_src, *rest: (
                 torch.empty_like(pool),
@@ -2072,10 +2244,8 @@ class StagedConsumer:
         )
 
         @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-        def run(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst):
-            new_pool, marker = op(
-                pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst
-            )
+        def run(pool, staging, *indices):
+            new_pool, marker = op(pool, staging, *indices)
             pool.copy_(new_pool)
             return marker
 

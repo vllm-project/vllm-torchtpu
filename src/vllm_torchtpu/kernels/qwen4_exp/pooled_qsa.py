@@ -27,6 +27,7 @@ from vllm_torchtpu.kernels.qwen4_exp.fused_kv_write import (
     read_ring_and_tags_concurrent,
 )
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
+from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing as _qsa_indexing
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _indexer_updates,
     _shift_clip,
@@ -499,6 +500,41 @@ def write_main_cache(
 
 MERGED_SPAN_CODES = 8
 
+# QWEN4_EXP_INROW_COMPRESSED_K: ``compressed_slot`` codes past every packed
+# slot (packed slots are < 8 members per page).
+INROW_SLOT_BASE = 1 << 20
+
+
+def inrow_compressed_slot(span: int) -> int:
+    """``compressed_slot`` of a layer whose keys ride its own main-KV rows.
+
+    QWEN4_EXP_INROW_COMPRESSED_K: with one FP8 KV head per device a main-KV
+    token row holds K and V in bytes 0 and 1 of each 32-bit lane word
+    (``_main_slot_keep_mask``); bytes 2 and 3 -- the row's second BF16 half --
+    hold one compressed key. A main-KV table entry covers ``span`` pool pages
+    of tokens (``main_dcp`` for a DCP-split owner), whose ``span * B / ratio``
+    keys sit at rows ``0, 1, ...`` of the entry's page on every rank (keys
+    stay replicated). Static, like every slot."""
+    assert 1 <= span < MERGED_SPAN_CODES, span
+    return INROW_SLOT_BASE + span
+
+
+def is_inrow(slot: int) -> bool:
+    return slot > INROW_SLOT_BASE
+
+
+def inrow_span(slot: int) -> int:
+    """Pool pages of tokens one main-KV table entry covers, for an in-row slot."""
+    assert is_inrow(slot), slot
+    return slot - INROW_SLOT_BASE
+
+
+def inrow_keys_per_entry(slot: int, page_tokens: int, ratio: int) -> int:
+    """Compressed keys of one table entry (rows of its page they occupy)."""
+    keys = inrow_span(slot) * page_tokens // ratio
+    assert keys <= page_tokens, (slot, page_tokens, ratio)
+    return keys
+
 
 def merged_compressed_slot(region: int, span: int = 1) -> int:
     """``compressed_slot`` of a merged layer: the region's first column and
@@ -572,6 +608,23 @@ def compressed_pairs(
     packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
     width = pool.shape[-1]
     pairs_per_page = math.prod(pool.shape[1:-1]) // packing
+    if is_inrow(slot):
+        # In-row keys (``inrow_compressed_slot``): each completed group's key
+        # goes alone into the second BF16 half of row ``g % keys_per_entry`` of
+        # its entry's page; the first half (the token row's own K and V) is
+        # preserved by the half-masked writers.
+        if dcp is not None:
+            raise ValueError("in-row compressed keys stay replicated (no compressed DCP)")
+        if pairs_per_page != pool.shape[1]:
+            raise ValueError("in-row compressed keys need one 1 KiB row per token")
+        entry = inrow_span(slot) * pool.shape[1]
+        rows = inrow_keys_per_entry(slot, pool.shape[1], ratio)
+        pair = table[req, logical // entry] * pool.shape[1] + (logical % entry) // ratio
+        assert rows == entry // ratio
+        key = jnp.pad(keys, ((0, 0), (0, width - keys.shape[-1])))
+        values = jnp.stack([jnp.zeros_like(key), key], axis=1)
+        mask = jnp.broadcast_to(jnp.asarray([False, True]), (len(keys), 2))
+        return pair, complete, mask, values
     group = logical // ratio
     end = context[req] + starts[req + 1] - starts[req]
     write = complete & ((group % 2 == 1) | (logical + ratio >= end))
@@ -829,9 +882,10 @@ def write_compressed(
     ):
         from vllm_torchtpu.kernels.qwen4_exp.compressed_write import write_runs
 
-        return write_runs(view, pair, write, mask, values, len(context), ratio).reshape(
-            pool.shape
-        )
+        return write_runs(
+            view, pair, write, mask, values, len(context), ratio,
+            keys_per_row=1 if is_inrow(slot) else 2,
+        ).reshape(pool.shape)
     tile = 128
     if len(keys) >= tile and len(keys) % tile == 0:
         # A complete ratio-4 prefill page contains sixteen adjacent carrier
@@ -1207,6 +1261,10 @@ def _compressed_expansion(logical_pages: int, physical_pages: int, slot: int):
     """StreamIndex ``table_expansion`` for a compressed block table (see
     ``compressed_kernel_pages``): kernel page ``k`` of column ``c`` is
     ``c * stride + offset + k % logical_pages``."""
+    if is_inrow(slot):
+        # `logical_pages`: the entry's kernel pages of keys; `physical_pages`:
+        # kernel pages (of one key per row) per pool page.
+        return (logical_pages, physical_pages, 0)
     if slot < 0:
         # `logical_pages` here is the entry's (merged_span pages of keys).
         base = logical_pages // merged_span(slot)
@@ -1269,6 +1327,13 @@ def compressed_kernel_pages(pages: jax.Array, pool: jax.Array, slot: int = 0, ra
     megakernel's page tables.
     """
     rows = 128 // ratio
+    if is_inrow(slot):
+        # In-row keys: a kernel page is `rows` token rows (one key each); a
+        # pool page holds B // rows of them, an entry's keys the first
+        # `keys_per_entry // rows`.
+        per_page = pool.shape[1] // rows
+        per_entry = inrow_keys_per_entry(slot, pool.shape[1], ratio) // rows
+        return (pages[..., None] * per_page + jnp.arange(per_entry)).reshape(-1)
     physical_pages = (
         math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * pool.shape[-1] * 2)
     )
@@ -1398,13 +1463,26 @@ def _select_blocks(
         math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * width * 2)
     )
     logical_pages = pool.shape[1] // 128
-    cache = pool.reshape(-1, rows // 2, packing, width)
-    assert slot <= 0 or (slot + 1) * logical_pages <= physical_pages, (
+    inrow = is_inrow(slot)
+    if inrow:
+        # In-row keys: one key per 1 KiB token row, so a kernel page of `rows`
+        # keys is `rows` token rows (the reader takes each row's second half).
+        if packing != 4:
+            raise ValueError("in-row compressed keys need the FP8 main-KV carrier")
+        cache = pool.reshape(-1, rows, packing, width)
+        physical_pages = pool.shape[1] // rows
+        logical_pages = inrow_keys_per_entry(slot, pool.shape[1], ratio) // rows
+    else:
+        cache = pool.reshape(-1, rows // 2, packing, width)
+    assert inrow or slot <= 0 or (slot + 1) * logical_pages <= physical_pages, (
         "packed compressed-key slot exceeds its pool page"
     )
     if slot < 0:
         # Merged keys: one table entry expands to merged_span pages of keys.
         logical_pages *= merged_span(slot)
+
+    def qsa_indexing(*args, **kwargs):
+        return _qsa_indexing(*args, inrow=inrow, **kwargs)
 
     def expand_pages(pages):
         return compressed_kernel_pages(pages, pool, slot, ratio)

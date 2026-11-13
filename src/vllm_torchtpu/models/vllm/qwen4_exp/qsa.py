@@ -576,6 +576,14 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self._select_op = None
         raw_mk = str(vllm_torchtpu_envs.VLLM_TPU_MEGAKERNEL or "").strip().lower()
         if raw_mk and raw_mk not in ("0", "false", "off"):
+            from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import is_inrow
+
+            if is_inrow(slot):
+                # The megakernel paths address keys by packed slots only.
+                raise ValueError(
+                    "QWEN4_EXP_INROW_COMPRESSED_K is not supported with "
+                    "VLLM_TPU_MEGAKERNEL"
+                )
             from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
                 build_pooled_qsa_select_op,
             )

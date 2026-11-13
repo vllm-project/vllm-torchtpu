@@ -64,6 +64,22 @@ def merge_compressed_k_enabled() -> bool:
     return value in ("1", "true", "yes", "on")
 
 
+INROW_COMPRESSED_K_ENV = "QWEN4_EXP_INROW_COMPRESSED_K"
+
+
+def inrow_compressed_k_enabled() -> bool:
+    """Whether each QSA layer's compressed keys ride its own main-KV rows.
+
+    Off by default. ``QWEN4_EXP_INROW_COMPRESSED_K=1`` (one FP8 KV head per
+    device, e.g. a TP8 decode): a main-KV token row holds the head's K and V
+    in two of its four bytes per lane; the other two -- half of every row --
+    hold one BF16 compressed key (``pooled_qsa.inrow_compressed_slot``). The
+    compressed-key groups drop out and the keys cost no pool bytes.
+    """
+    value = os.environ.get(INROW_COMPRESSED_K_ENV, "0").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
 PCP_SPLIT_COMPRESSED_K_ENV = "QWEN4_EXP_PCP_SPLIT_COMPRESSED_K"
 
 
@@ -160,6 +176,9 @@ class Qwen4ExpPoolLayout:
     # QWEN4_EXP_PCP_SPLIT_COMPRESSED_K: merged keys split over the PCP ranks
     # by page owner (one region column per block ID per rank).
     split_compressed: bool = False
+    # QWEN4_EXP_INROW_COMPRESSED_K: compressed keys live in the second BF16
+    # half of the layer's own main-KV rows (``pooled_qsa.inrow_compressed_slot``).
+    inrow_compressed: bool = False
 
     def compressed_owner(self, attention_prefix: str) -> tuple[str, int]:
         """Cache owner name and in-page slot of a QSA layer's compressed keys."""
@@ -232,6 +251,7 @@ def pooled_cache_specs(
     main_interleave: int | None = None,
     split_compressed: bool | None = None,
     draft_prefix_cacheable: bool | None = None,
+    inrow_compressed: bool | None = None,
 ):
     """Derive uniform physical pages without widening compressed-key coverage.
 
@@ -309,6 +329,30 @@ def pooled_cache_specs(
     if pack_compressed is None:
         pack_compressed = pack_compressed_k_enabled()
     merged = merge_compressed_k_enabled() if merge_compressed is None else merge_compressed
+    inrow = inrow_compressed_k_enabled() if inrow_compressed is None else inrow_compressed
+    if inrow:
+        problems = [
+            env
+            for env, on in (
+                (MERGE_COMPRESSED_K_ENV, merged),
+                (PACK_COMPRESSED_K_ENV, pack_compressed),
+                (PACK_MAIN_KV_ENV, pack_main_kv_enabled()),
+            )
+            if on
+        ]
+        if problems:
+            raise ValueError(
+                f"{INROW_COMPRESSED_K_ENV}=1 replaces {' and '.join(problems)}; unset them"
+            )
+        if main.dtype != torch.float8_e4m3fn or main.num_kv_heads != 1:
+            raise ValueError(
+                f"{INROW_COMPRESSED_K_ENV}=1 keeps keys in the free half of an FP8 "
+                "main-KV row, which needs one KV head per device and "
+                f"--kv-cache-dtype fp8; got {main.num_kv_heads} heads of {main.dtype}"
+            )
+        if 2 * compressed_width * 2 > token_bytes:
+            raise ValueError("a compressed key must fit half a main-KV row")
+        packed_slots = 1
     if merged:
         if pack_compressed or pack_main_kv_enabled():
             raise ValueError(
@@ -326,7 +370,7 @@ def pooled_cache_specs(
             for prefix in (name.removesuffix(".compressed_k") for name in compressed_names)
         ]
         packed_slots = 1
-    elif pack_compressed and packed_slots > 1:
+    elif pack_compressed and packed_slots > 1 and not inrow:
         # Consecutive QSA layers (the MTP draft's last) share one owner
         # group; one block table and one page lifetime cover all of them,
         # since compressed keys of every layer track the same token span.
@@ -443,6 +487,31 @@ def pooled_cache_specs(
             dcp_owners += tuple(
                 name for name in specs if name.endswith(".compressed_k")
             )
+    if inrow:
+        if interleave:
+            raise ValueError(f"{INROW_COMPRESSED_K_ENV}=1 is a TP decode layout, not PCP")
+        if dcp > 1 and envs.VLLM_TPU_QSA_COMPRESSED_DCP:
+            raise ValueError(
+                f"{INROW_COMPRESSED_K_ENV}=1 keeps keys replicated: unset "
+                "VLLM_TPU_QSA_COMPRESSED_DCP"
+            )
+        from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import inrow_compressed_slot
+
+        ratio = int(text.indexer_compress_ratio)
+        owners, main_owners = [], []
+        for name in compressed_names:
+            prefix = name.removesuffix(".compressed_k")
+            # A DCP-split owner's entry covers `dcp` pages of tokens; its keys
+            # (dcp * B / ratio of them) must fit the B rows of one page.
+            span = dcp if prefix in dcp_owners else 1
+            if span * block_size // ratio > block_size:
+                raise ValueError(
+                    f"{INROW_COMPRESSED_K_ENV}=1: an entry of {span} x {block_size} "
+                    f"tokens has more keys than its page has rows (ratio {ratio})"
+                )
+            owners.append((prefix, prefix, inrow_compressed_slot(span)))
+            # Slot 0: the layer's K/V writes keep bytes 2-3 (its keys).
+            main_owners.append((prefix, prefix, 0))
     layout = Qwen4ExpPoolLayout(
         block_size=block_size,
         page_bytes=page_bytes,
@@ -465,6 +534,7 @@ def pooled_cache_specs(
                 pcp_split_compressed_k_enabled() if split_compressed is None else split_compressed
             )
         ),
+        inrow_compressed=inrow,
     )
     # Members other than their group's owner get no scheduler group.
     packed_away = {prefix + ".compressed_k" for prefix, owner, _ in owners} - {
@@ -540,8 +610,8 @@ def check_packed_compressed_groups(layout: Qwen4ExpPoolLayout, groups) -> None:
     Members address slots of their owner's pages, so two owners sharing one
     group (one block ID per token span) would overwrite each other's slots.
     """
-    if layout.merged_compressed:
-        # Merged keys sit in the owner layer's own carrier slot, never shared.
+    if layout.merged_compressed or layout.inrow_compressed:
+        # Merged / in-row keys sit in the owner layer's own pages, never shared.
         compressed = set()
     else:
         compressed = {owner for _, owner, _ in layout.compressed_owners}
