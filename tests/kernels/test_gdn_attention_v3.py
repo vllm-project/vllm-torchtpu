@@ -669,14 +669,32 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
 
 
 class GDNChunkedComputeTest(parameterized.TestCase):
-    def test_chunked_gdn_per_seq_shared_kq_heads_matches_recurrent_ref(self):
-        n_kq, n_v, chunk, d = 2, 16, 16, 128
+    @parameterized.named_parameters(
+        dict(testcase_name="ratio_1", n_kq=2, n_v=2, valid_len=16),
+        dict(testcase_name="ratio_2", n_kq=2, n_v=4, valid_len=16),
+        dict(testcase_name="ratio_4", n_kq=2, n_v=8, valid_len=16),
+        dict(testcase_name="ratio_8", n_kq=2, n_v=16, valid_len=16),
+        dict(
+            testcase_name="partial_chunk_zero_trailing_beta",
+            n_kq=2,
+            n_v=16,
+            valid_len=11,
+        ),
+    )
+    def test_chunked_gdn_per_seq_shared_kq_heads_matches_recurrent_ref(
+        self, n_kq: int, n_v: int, valid_len: int
+    ):
+        chunk, d = 16, 128
         k0, k1, k2, k3, k4, k5 = jax.random.split(jax.random.key(41), 6)
         q = compute_gdn.l2_norm(jax.random.normal(k0, (n_kq, chunk, d))) * (d**-0.5)
         k = compute_gdn.l2_norm(jax.random.normal(k1, (n_kq, chunk, d)))
         v = jax.random.normal(k2, (n_v, chunk, d))
         gating_log = -jnp.abs(jax.random.normal(k3, (1, chunk, n_v))) * 0.1
         beta = jax.nn.sigmoid(jax.random.normal(k4, (1, chunk, n_v)))
+        if valid_len < chunk:
+            valid_mask = (jnp.arange(chunk) < valid_len)[None, :, None]
+            gating_log = jnp.where(valid_mask, gating_log, 0.0)
+            beta = jnp.where(valid_mask, beta, 0.0)
         state_prev = jax.random.normal(k5, (n_v, d, d))
         f32 = jnp.dtype(jnp.float32)
         cfg = config.GDNConfig(
