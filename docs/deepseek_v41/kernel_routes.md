@@ -49,7 +49,7 @@ Run kernel correctness tests before full serving:
 ```bash
 python -m pytest tests/kernels/deepseek_v41/test_fp8_paged_mqa_logits.py \
   tests/kernels/deepseek_v41/test_fp8_indexer_select.py \
-  tests/models/vllm/test_dsv41_v2_decode_indexer.py
+  tests/models/deepseek_v41/test_dsv41_v2_decode_indexer.py
 ```
 
 Use `scripts/dsv41_bench/server_steps/run.py` for paired `encoder_extend` and

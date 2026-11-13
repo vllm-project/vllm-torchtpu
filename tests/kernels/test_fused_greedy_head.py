@@ -9,7 +9,7 @@ import torch
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import fused_greedy_head as kernel
 from vllm_torchtpu.layers.adapter.sample.fused_greedy_head import FusedGreedyHead
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import DeepseekV41ForCausalLM
+from vllm_torchtpu.models.deepseek_v41.v2.model import DeepseekV41ForCausalLM
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 

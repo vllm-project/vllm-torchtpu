@@ -17,7 +17,7 @@ def test_compressor_admission_fullgraph(monkeypatch, caplog, capacity, mode, reg
     import torch
 
     from vllm_torchtpu.kernels.experimental import decode_preparation as prep
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import (
+    from vllm_torchtpu.models.deepseek_v41.v2.attention import (
         DeepseekV41Attention,
     )
 
@@ -68,8 +68,8 @@ def test_compressor_admission_fullgraph(monkeypatch, caplog, capacity, mode, reg
 def test_csa2_bridge_registration(monkeypatch):
     from types import SimpleNamespace
 
+    from vllm_torchtpu.models.deepseek_v41.v2 import csa2_adapter
     from vllm_torchtpu.models.vllm import vllm_model_wrapper_context as context
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import csa2_adapter
 
     mesh = jax.sharding.Mesh(np.array(jax.devices("cpu")[:1]), ("data",))
     monkeypatch.setattr(
@@ -88,8 +88,8 @@ def test_swa_bridge_preserves_dynamic_token_dimension(monkeypatch):
 
     import torch
 
+    from vllm_torchtpu.models.deepseek_v41.v2 import csa2_adapter
     from vllm_torchtpu.models.vllm import vllm_model_wrapper_context as context
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import csa2_adapter
 
     mesh = jax.sharding.Mesh(np.array(jax.devices("cpu")[:1]), ("data",))
     monkeypatch.setattr(

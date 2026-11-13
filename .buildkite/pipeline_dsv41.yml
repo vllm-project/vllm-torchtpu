@@ -71,8 +71,8 @@ steps:
         commands:
           - >-
             .buildkite/kubernetes/run.sh python -m pytest
-            tests/models/vllm/test_dsv41_common_mhc.py
-            tests/models/vllm/test_dsv41_common_engram.py
+            tests/models/deepseek_v41/test_dsv41_common_mhc.py
+            tests/models/deepseek_v41/test_dsv41_common_engram.py
             -k 'test_aux_mean_preserves_tpu_reduction_order or test_ready_rows_packed_scales_match_tpu_and_cpu'
             -q --junitxml=perf_eval_results/dsv41-layout-parity.xml
 
@@ -100,7 +100,7 @@ steps:
         commands:
           - >-
             .buildkite/kubernetes/run.sh bash -euc '
-            python -m pytest tests/models/vllm/test_dsv41_output_projection.py
+            python -m pytest tests/models/deepseek_v41/test_dsv41_output_projection.py
             -q --junitxml=perf_eval_results/dsv41-output-projection.xml;
             export LIBTPU_INIT_ARGS="--xla_tpu_dvfs_p_state=7 --xla_enable_custom_call_region_trace=false";
             python scripts/dsv41_bench/bench_output_projection.py --tokens 240
@@ -118,7 +118,7 @@ steps:
         commands:
           - >-
             .buildkite/kubernetes/run.sh python -m pytest
-            tests/models/vllm/test_dsv41_projection_rope.py
+            tests/models/deepseek_v41/test_dsv41_projection_rope.py
             -q --junitxml=perf_eval_results/dsv41-projection-rope.xml
 
       # One pod for both checks: the CPU-only config test needs the image, not
@@ -133,11 +133,11 @@ steps:
         commands:
           - >-
             .buildkite/kubernetes/run.sh bash -euc '
-            python -m pytest tests/models/vllm/test_dsv41_v2_attention_addressing.py
+            python -m pytest tests/models/deepseek_v41/test_dsv41_v2_attention_addressing.py
             -k "test_pure_swa_pallas_preserves_cache_addressing or test_swa_query_group_bridge_keeps_token_count_dynamic"
             -q --junitxml=perf_eval_results/dsv41-swa-parity.xml;
             env JAX_PLATFORMS=cpu python -m pytest
-            tests/models/vllm/test_dsv41_v2_attention.py
+            tests/models/deepseek_v41/test_dsv41_v2_attention.py
             -k test_dsv41_attention_init_buffers_and_flags_bfloat16
             -q --junitxml=perf_eval_results/dsv41-swa-config.xml'
 
@@ -174,14 +174,14 @@ steps:
         commands:
           - >-
             .buildkite/kubernetes/run.sh python -m pytest
-            tests/models/vllm/test_dsv41_config.py
-            tests/models/vllm/test_dsv41_v2_model_full.py
-            tests/models/vllm/test_dsv41_v2_model_sp.py
-            tests/models/vllm/test_dsv41_v2_prefix_replay.py
+            tests/models/deepseek_v41/test_dsv41_config.py
+            tests/models/deepseek_v41/test_dsv41_v2_model_full.py
+            tests/models/deepseek_v41/test_dsv41_v2_model_sp.py
+            tests/models/deepseek_v41/test_dsv41_v2_prefix_replay.py
             tests/layers/adapter/test_fused_moe_ep.py
             tests/kernels/test_decode_preparation.py
             tests/kernels/test_decode_bridge.py
-            tests/models/vllm/test_csa2_chunk_cache.py
+            tests/models/deepseek_v41/test_csa2_chunk_cache.py
             tests/models/vllm/test_native_swa_manager.py
             tests/compilation/test_moe_schedule.py
             tests/kernels/deepseek_v41/test_csa2_prefill.py

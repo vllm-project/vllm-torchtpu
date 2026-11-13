@@ -129,7 +129,7 @@ def _stage_wrapper(original: Any, stage: str) -> Any:
             bounds = [int(n) for n in metadata.query_start_loc_cpu]
             ends = [int(n) for n in metadata.seq_lens_cpu]
             prompts = [int(n) for n in metadata.prompt_lens_cpu]
-            from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import (
+            from vllm_torchtpu.models.deepseek_v41.v2.ced import (
                 plan_decoder_replay,
             )
 
@@ -416,7 +416,7 @@ class ServerStepWorker:
 
     def benchmark_begin(self, scenario: str) -> list[dict]:
         global _ACTIVE, _INSTALLED
-        from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
+        from vllm_torchtpu.models.deepseek_v41.v2.model import (
             DeepseekV41DecoderStage,
             DeepseekV41EncoderHeadStage,
             DeepseekV41EncoderStage,
@@ -467,7 +467,7 @@ class ServerStepWorker:
         recorder = self._server_step_recorder
         if recorder.enabled:
             raise RuntimeError("Benchmark already active")
-        from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as model_module
+        from vllm_torchtpu.models.deepseek_v41.v2 import model as model_module
 
         source = Path(model_module.__file__)
         recorder.provenance = {

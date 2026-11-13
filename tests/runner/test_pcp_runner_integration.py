@@ -979,7 +979,7 @@ def test_pcp_streaming_does_not_use_batched_smem_capacity(
 
 @pytest.mark.parametrize("idle", [False, True])
 def test_idle_dummy_ced_replay_has_no_local_rows(monkeypatch, idle):
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ced
+    from vllm_torchtpu.models.deepseek_v41.v2 import ced
 
     runner = _make_runner(
         num_computed_tokens=[0],

@@ -894,7 +894,7 @@ def test_single_request_draft_bucket_is_separate_from_prefill_token_budget(
 
 
 def test_v41_dspark_tp1_pairs_idle_dp_draft_collectives():
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.dspark import (
+    from vllm_torchtpu.models.deepseek_v41.v2.dspark import (
         DSparkDeepseekV41ForCausalLM,
     )
 

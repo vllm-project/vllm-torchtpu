@@ -29,7 +29,7 @@ class VllmDeepseekV41Fp8Config(VllmDeepseekV4Fp8Config):
     ) -> "VllmDeepseekV4Mxfp4MoEMethod":
         from vllm.config import get_current_vllm_config
 
-        from vllm_torchtpu.models.vllm.deepseek_v41.config import (
+        from vllm_torchtpu.models.deepseek_v41.config import (
             DeepseekV41Config,
             MoEBackend,
         )

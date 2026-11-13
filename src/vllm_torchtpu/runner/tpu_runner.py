@@ -7391,7 +7391,7 @@ class TPUModelRunner(GPUModelRunner):
         if backend == "logits":
             return
 
-        from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
+        from vllm_torchtpu.models.deepseek_v41.v2.model import (
             DeepseekV41ForCausalLM,
         )
 

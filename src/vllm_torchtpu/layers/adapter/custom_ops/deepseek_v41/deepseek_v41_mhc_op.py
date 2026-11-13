@@ -36,7 +36,7 @@ def _post_pre_rms_jax(
     if not shifted_post_pre_rms.is_supported_shape(tokens, mult, dim) or (
         tokens % 32 and not envs.TPU_DEEPSEEK_V41_MHC_SHIFTED_T16
     ):
-        from vllm_torchtpu.models.vllm.deepseek_v41.common.mhc import (
+        from vllm_torchtpu.models.deepseek_v41.common.mhc import (
             delayed_post_pre_flat_jax,
         )
 

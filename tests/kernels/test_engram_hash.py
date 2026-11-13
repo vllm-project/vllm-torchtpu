@@ -10,7 +10,7 @@ import torch
 from vllm.models.deepseek_v41.common import engram as upstream
 
 from vllm_torchtpu.kernels.engram_hash import engram_hash, hash_tables
-from vllm_torchtpu.models.vllm.deepseek_v41.common.engram import NgramHashState
+from vllm_torchtpu.models.deepseek_v41.common.engram import NgramHashState
 
 VOCAB, COMPRESSED, BLOCK = 129280, 99092, 64
 
@@ -231,7 +231,7 @@ def _with_sentinels(rng, data):
 def test_masks_from_ids_match_given_masks(tables, monkeypatch, use_cache):
     # TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: forward without masks writes the
     # same slot-cache values and returns the same hashes as with the eager masks.
-    from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common
+    from vllm_torchtpu.models.deepseek_v41.common import engram as common
 
     rng = np.random.default_rng(11)
     data = _with_sentinels(rng, _inputs(rng, 48, 6, 0, use_cache))
@@ -288,7 +288,7 @@ def test_masks_omitted_only_with_the_fused_hash(tables):
 def test_state_fused_hash_matches_state_hash(tables, monkeypatch, use_cache):
     # The NgramHashState plumbing (tables, statics, operand order) of the fused
     # path, with the TPU op replaced by a direct call of the JAX function.
-    from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common
+    from vllm_torchtpu.models.deepseek_v41.common import engram as common
 
     rng = np.random.default_rng(7)
     data = _inputs(rng, 48, 6, 0, use_cache)

@@ -17,7 +17,7 @@ Two TPU-specific decisions use vLLM's OOT config transport:
 --additional-config '{"deepseek_v41":{"execution":"ced","moe":"fused_ep_w4a8"}}'
 ```
 
-`models/vllm/deepseek_v41/config.py` parses that namespace into a frozen typed
+`models/deepseek_v41/config.py` parses that namespace into a frozen typed
 policy, rejects unknown keys and invalid values, validates combinations, and
 publishes canonical defaults before workers are created. Consumers use that
 policy rather than reading the dictionary themselves. The canonical values

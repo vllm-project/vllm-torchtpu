@@ -241,7 +241,7 @@ class CorrectnessTest(parameterized.TestCase):
     @parameterized.parameters((16, 16), (128, 125), (256, 204), (272, 257), (256, 0))
     def test_two_bank_prefetch_preserves_attention(self, tokens, valid):
         """Lookahead keeps each chunk's KV and tail bounds paired with its query."""
-        from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
+        from vllm_torchtpu.models.deepseek_v41.v2.attention_kernels import (
             sparse_ragged_paged_attention_union_gather,
         )
 

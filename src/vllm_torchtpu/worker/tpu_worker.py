@@ -475,7 +475,7 @@ class TPUWorker(WorkerBase):
     def _reserve_deepseek_v41_scale_companion(self, available: int) -> int:
         if envs.TPU_DEEPSEEK_V41_IMPL != "v2":
             return available
-        from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+        from vllm_torchtpu.models.deepseek_v41.v2.cache import (
             reserve_scale_companion,
         )
 

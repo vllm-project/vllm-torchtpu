@@ -2,7 +2,7 @@
 """Q-A/KV projection, both RMSNorms and SWA RoPE for integration into the model.
 
 Replaces ``_fused_wqa_wkv_gemm`` -> ``_split_qkv_and_norm`` -> the SWA
-``_rotate`` of ``models/vllm/deepseek_v41/v2/attention.py``:
+``_rotate`` of ``models/deepseek_v41/v2/attention.py``:
 
 * rows are FP8-quantized like ``quantized_matmul.util.quantize_tensor``,
   projected, scaled and rounded at the linear layer's BF16 output boundary;

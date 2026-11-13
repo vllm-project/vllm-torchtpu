@@ -15,7 +15,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.dense_logits import (
     fp8_paged_mqa_logits,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_fp8 import (
+from vllm_torchtpu.models.deepseek_v41.v2.indexer_fp8 import (
     select_fp8_indexer_jax,
 )
 

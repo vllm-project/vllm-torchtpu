@@ -6,7 +6,7 @@ Covers all lines and branches in:
   (moe_runner.py:134-154, VllmMoERunner._maybe_dispatch)
 - vllm_torchtpu.layers.adapter.moe_routing
   (moe_routing.py:136-225, _gather_partitioned_topk and route)
-- vllm_torchtpu.models.vllm.deepseek_v41.v2.attention
+- vllm_torchtpu.models.deepseek_v41.v2.attention
   (attention.py:456-475, 617-621, _prepare_tpu & forward SP gather assertions)
 """
 
@@ -23,8 +23,8 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.custom_ops import moe_runner as oot_moe_runner
 from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import DeepseekV41Attention
+from vllm_torchtpu.models.deepseek_v41.v2 import attention as v2_attn
+from vllm_torchtpu.models.deepseek_v41.v2.attention import DeepseekV41Attention
 
 # ==============================================================================
 # Helpers & Mocks

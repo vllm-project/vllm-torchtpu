@@ -1371,7 +1371,7 @@ class KVCacheManager:
         native_scale_pools = None
         if use_upstream_allocator:
             if envs.TPU_DEEPSEEK_V41_IMPL == "v2":
-                from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+                from vllm_torchtpu.models.deepseek_v41.v2.cache import (
                     materialize_upstream_kv_cache,
                 )
 

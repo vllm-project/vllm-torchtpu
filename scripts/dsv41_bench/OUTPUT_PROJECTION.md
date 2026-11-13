@@ -23,7 +23,7 @@ In the pinned TPU development environment:
 export LIBTPU_INIT_ARGS="--xla_tpu_dvfs_p_state=7 --xla_enable_custom_call_region_trace=false"
 python scripts/dsv41_bench/bench_output_projection.py --tokens 288 --output /tmp/output-projection-288
 python scripts/dsv41_bench/bench_output_projection.py --tokens 240 --output /tmp/output-projection-240
-pytest -q tests/models/vllm/test_dsv41_output_projection.py
+pytest -q tests/models/deepseek_v41/test_dsv41_output_projection.py
 ```
 
 The benchmark imports the production kernels and bypasses O-A auto-dispatch

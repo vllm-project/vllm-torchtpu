@@ -411,7 +411,7 @@ def _runner_group() -> tuple[str, int]:
 
     The current config's `runner_type` says "draft" for the DSpark drafter.
     The drafter's decoder layers are modules `layers.{n + i}` of an n-layer
-    target (models/vllm/deepseek_v41/v2/dspark.py), built from the
+    target (models/deepseek_v41/v2/dspark.py), built from the
     checkpoint's `mtp.{i}.*` tensors, so draft layer i is module n + i; the
     layout's draft group is keyed by i.
     """
