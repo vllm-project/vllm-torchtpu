@@ -782,6 +782,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
+    # Token-sharded variant for layers whose model runs sequence-parallel
+    # steps (adaptive_moe.prebuild_sequence_parallel_variant).
+    _adaptive_fused_moe_op_sp: torch.library.CustomOpDef | None = None
 
     def __init__(
         self,
@@ -1071,6 +1074,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                activation=activation_str,
+            )
+            adaptive_moe.prebuild_sequence_parallel_variant(
+                self,
                 layer,
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
