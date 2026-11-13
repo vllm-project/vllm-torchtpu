@@ -185,6 +185,7 @@ if TYPE_CHECKING:
     TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
+    TPU_FUSED_OPROJ_AR: bool = False
     SPEC_WARMUP: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
@@ -1262,6 +1263,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
         "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
     ),
+    # With TPU_SMALL_ALL_REDUCE_MAX_ROWS > 0 and self_attn.o_proj in
+    # TPU_FP8_LINEAR_PALLAS_SITES: attention's output projection at decode (at
+    # most 16 rows) runs its FP8 matmul and its TP all-reduce as one Pallas
+    # kernel, so the all-reduce barrier hides under the weight stream. The output
+    # is bitwise that of fp8_skinny followed by the small all-reduce, for blocks of
+    # at most TPU_SMALL_ALL_REDUCE_MAX_ROWS rows. Without the two settings above,
+    # or with a TP group that is not the whole mesh, it has no effect and the
+    # server logs a warning at load.
+    "TPU_FUSED_OPROJ_AR": env_bool("TPU_FUSED_OPROJ_AR"),
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
