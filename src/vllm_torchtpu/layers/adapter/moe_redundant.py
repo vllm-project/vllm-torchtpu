@@ -352,8 +352,8 @@ def prepare(layer: Any) -> int:
         reason = f"{num_logical} experts do not split evenly over ep={ep}"
     elif getattr(layer, "expert_placement_strategy", "linear") != "linear":
         reason = "placement strategy is not linear"
-    elif envs.USE_MOE_FUSED_EP_KERNEL or envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive":
-        reason = "the fused EP kernel path does not take a physical expert map"
+    elif envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive":
+        reason = "the adaptive fused EP kernel does not take a physical expert map"
     elif _pipelined():
         reason = "pipelined collective+compute MoE is on"
     elif _env_flag("TPU_MOE_SEQUENCE_PARALLEL"):
@@ -534,6 +534,9 @@ def install(layer: Any) -> None:
     layer.register_buffer(
         "_rx_copies", copies_table(plan).to(device), persistent=False
     )
+    if device.type == "tpu":
+        # Register outside tracing: Dynamo cannot trace the registration.
+        _get_assign_op()
     layer._rx_num_physical = plan.num_physical
     per_slot = sum(
         int(p[0].numel()) * p.element_size()
@@ -624,7 +627,9 @@ def _get_assign_op():
 
         from vllm_torchtpu.kernels.moe_replica_assign import replica_assign
 
-        def assign(ids, copies, ep, slots):
+        import jax
+
+        def assign(ids: jax.Array, copies: jax.Array, ep: int, slots: int) -> jax.Array:
             return replica_assign(ids, copies, ep=ep, slots=slots)
 
         op = pallas.jax_op("pallas::moe_replica_assign", assign)
@@ -654,7 +659,7 @@ def remap_ids_reference(
     native = tab[:, 0].to(ids.device)[ids.clamp(min=0)]
     if ids.numel() > MAX_ROUTES or tab.shape[1] < 2:
         return torch.where(ids >= 0, native, -1).to(torch.int32)
-    hit = sorted({e for e in ids.flatten().tolist() if e >= 0})
+    hit = list(dict.fromkeys(e for e in ids.flatten().tolist() if e >= 0))
     load = [0] * ep
     choice: dict[int, int] = {}
     flexible = []

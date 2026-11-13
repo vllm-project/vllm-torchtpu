@@ -157,7 +157,7 @@ def test_remap_large_batches_use_native_copies():
 
 def _greedy(ids, table, ep, slots):
     """Independent restatement of the assignment rule."""
-    hit = sorted({e for e in ids.reshape(-1).tolist() if e >= 0})
+    hit = list(dict.fromkeys(e for e in ids.reshape(-1).tolist() if e >= 0))
     load = [0] * ep
     pick = {}
     for e in hit:
