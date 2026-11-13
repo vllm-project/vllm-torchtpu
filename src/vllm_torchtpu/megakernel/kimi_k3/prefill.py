@@ -696,6 +696,32 @@ class PrefillProgram:
         self._ops[window] = ops
         return ops
 
+    @staticmethod
+    def compiler_options(window: int) -> dict[str, str]:
+        """XLA options of a window's programs that carry the fused MoE (the
+        stack, group and final ops; ``KernelConfig.prefill_no_hlo_calls`` from
+        ``prefill_no_hlo_calls_from``): with deduplicated HLO calls the
+        compiler splits their visit loops over instruction overlays."""
+        config = active()
+        if config.prefill_no_hlo_calls and window >= config.prefill_no_hlo_calls_from:
+            return {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
+        return {}
+
+    @classmethod
+    def _run(cls, op: Any, window: int, *args: Any) -> Any:
+        """``op(*args)`` under :meth:`compiler_options`, captured when the lazy
+        graph is materialized (as ``DecodeOps._run`` does)."""
+        options = cls.compiler_options(window)
+        if not options:
+            return op(*args)
+        from torch_tpu._internal.compiler_options import custom_compiler_options
+        from torch_tpu._internal.sync import synchronize
+
+        with custom_compiler_options(options):
+            outputs = op(*args)
+            synchronize(list(outputs), wait=False)
+        return outputs
+
     def _op_name(self, base: str, window: int) -> str:
         suffix = ("" if self.has_draft else "_nd") + (
             "" if self.compute_logits else "_nl"
@@ -745,7 +771,8 @@ class PrefillProgram:
         sequence and at its checkpoint).
         ``ring(blocks, prefix, middle)`` (the DSpark ring's update, if any)
         runs on the residual streams before the final op consumes them."""
-        ops = self._build(int(shard.shape[-1]) * 32)
+        window = int(shard.shape[-1]) * 32
+        ops = self._build(window)
         tail = (ids, local, *ops["meta"](pools[0], ids, local))
         first_args = (
             shard,
@@ -759,9 +786,11 @@ class PrefillProgram:
         )
         middle = tap3 = tap90 = None
         if self.has_draft:
-            *state, tap3 = ops["first"](*first_args)
+            *state, tap3 = self._run(ops["first"], window, *first_args)
             for p, pair in enumerate(self._pairs):
-                *state, middle, tap90 = ops["group"](
+                *state, middle, tap90 = self._run(
+                    ops["group"],
+                    window,
                     *state,
                     extent,
                     pair,
@@ -772,9 +801,11 @@ class PrefillProgram:
                     *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
                 )
         else:
-            state = ops["first"](*first_args)
+            state = self._run(ops["first"], window, *first_args)
             for p, pair in enumerate(self._pairs):
-                state = ops["group"](
+                state = self._run(
+                    ops["group"],
+                    window,
                     *state,
                     extent,
                     pair,
@@ -810,10 +841,10 @@ class PrefillProgram:
             *self._flat(*final_groups, expert_bank=12),
         )
         if use_logits:
-            logits, latents, *routes = final_op(*final_args)
+            logits, latents, *routes = self._run(final_op, window, *final_args)
         else:
             logits = None
-            latents, *routes = final_op(*final_args)
+            latents, *routes = self._run(final_op, window, *final_args)
         self.last_routes = routes[0] if routes else None
         return logits, latents, rec, hist, rec_at, hist_at
 
@@ -1936,8 +1967,10 @@ class KimiPrefiller:
         def i32(*shape):
             return torch.empty(shape, dtype=torch.int32)
 
-        def add(op, operands, priority=0):
-            calls.append(CompileCall(op, tuple(operands), {}, priority=priority))
+        def add(op, operands, priority=0, options=None):
+            calls.append(
+                CompileCall(op, tuple(operands), options or {}, priority=priority)
+            )
 
         cache = None  # a draft ring's cache, [1, layers, window, 128] per rank
         if ring is not None:
@@ -1948,6 +1981,7 @@ class KimiPrefiller:
         for window in program.windows:
             count, rows = program.window_slots(window), window // 32
             ops = program._build(window)
+            window_options = program.compiler_options(window)
             # Per rank: the residual streams, the packed KDA states and latents.
             stream = torch.empty((1, rows, HIDDEN_SIZE), dtype=torch.bfloat16)
             blocks = torch.empty((1, 8, rows, HIDDEN_SIZE), dtype=torch.bfloat16)
@@ -1986,6 +2020,7 @@ class KimiPrefiller:
                     *program._flat("io", "common", "kda", "mla", "moe"),
                 ),
                 priority=window,
+                options=window_options,
             )
             add(
                 ops["group"],
@@ -2000,6 +2035,7 @@ class KimiPrefiller:
                     *program._flat("common", "kda", "mla", "moe", expert_bank=1),
                 ),
                 priority=window,
+                options=window_options,
             )
             final_groups = (
                 ("io", "common", "mla", "moe")
@@ -2020,6 +2056,7 @@ class KimiPrefiller:
                     *program._flat(*final_groups, expert_bank=12),
                 ),
                 priority=window,
+                options=window_options,
             )
             if "final_nologits" in ops:
                 nl_groups = program._nl_groups()
@@ -2037,6 +2074,7 @@ class KimiPrefiller:
                         *program._flat(*nl_groups, expert_bank=12),
                     ),
                     priority=window,
+                    options=window_options,
                 )
             one = (recurrent[:, :, 0], conv[:, :, 0])
             add(

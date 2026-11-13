@@ -56,6 +56,13 @@ class KernelConfig:
     b4_attention_gather: bool = True
     fused_cache_commit: bool = True
     decode_no_hlo_calls: bool = True  # no deduplicated HLO calls in plain decode steps
+    # The prefill's window programs (stack, groups, final) compile without
+    # deduplicated HLO calls, so each fused MoE visit loop stays in one
+    # instruction overlay. A compiler option: the traces do not depend on it.
+    prefill_no_hlo_calls: bool = _host_side(True)
+    # The smallest window whose programs it applies to: their code grows, and
+    # the full 16K windows carry most served prefill tokens.
+    prefill_no_hlo_calls_from: int = _host_side(16384)
     shard_routing: bool = False
     kda_staged: bool = False
     # DP2 plain decode above B16: the kernel writes KDA post-states into their slots.

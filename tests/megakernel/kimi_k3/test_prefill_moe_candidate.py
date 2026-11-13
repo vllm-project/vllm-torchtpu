@@ -538,3 +538,33 @@ def test_route_count_snapshot_settings_leave_the_kernel_key():
     )
     assert per_host.key() == base.key()
     assert base.key() != config.KernelConfig().key()
+
+
+def test_prefill_no_hlo_calls_leaves_the_kernel_key():
+    # A compiler option of the window programs: their traces (the export
+    # cache) do not depend on it.
+    from vllm_torchtpu.megakernel.kimi_k3 import config
+
+    default = config.KernelConfig()
+    assert default.prefill_no_hlo_calls
+    assert default.replace(prefill_no_hlo_calls=False).key() == default.key()
+    assert default.replace(prefill_no_hlo_calls_from=512).key() == default.key()
+
+
+def test_prefill_window_programs_compile_without_deduplicated_calls(monkeypatch):
+    pytest.importorskip("torch_tpu")
+    from vllm_torchtpu.megakernel.kimi_k3 import config, prefill
+
+    options = {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
+    default = config.KernelConfig()
+    monkeypatch.setattr(prefill, "active", lambda: default)
+    for window in prefill.WINDOWS:
+        expected = options if window == 16384 else {}
+        assert prefill.PrefillProgram.compiler_options(window) == expected
+    every = default.replace(prefill_no_hlo_calls_from=512)
+    monkeypatch.setattr(prefill, "active", lambda: every)
+    for window in prefill.WINDOWS:
+        assert prefill.PrefillProgram.compiler_options(window) == options
+    off = default.replace(prefill_no_hlo_calls=False)
+    monkeypatch.setattr(prefill, "active", lambda: off)
+    assert prefill.PrefillProgram.compiler_options(16384) == {}
