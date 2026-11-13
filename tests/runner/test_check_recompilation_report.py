@@ -24,7 +24,9 @@ does carry is ``last_read``/``read_count``, so "first read since the previous
 report" is the available definition, and that is what these tests pin.
 """
 
+import contextlib
 import datetime as dt
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -62,19 +64,41 @@ def set_cache(monkeypatch, entries):
     )
 
 
-@pytest.fixture
-def capture(captured_report):
-    """The report one check emits, as one block of text."""
+@contextlib.contextmanager
+def captured_report(logger_name: str = "vllm"):
+    """Collect the INFO lines emitted under `logger_name`.
 
-    def run(runner, case):
-        with captured_report() as messages:
-            runner._update_num_xla_graphs(case)
-        return "\n".join(messages)
+    Deliberately not pytest's `caplog`: vLLM's dictConfig sets
+    `propagate=False` on the `vllm` logger, so these records never reach the
+    root logger where `caplog` installs its handler.
+    """
+    messages: list[str] = []
+    handler = logging.Handler(logging.INFO)
+    handler.emit = lambda record: messages.append(record.getMessage())
+    logger = logging.getLogger(logger_name)
+    old_level = logger.level
+    # Another test may have raised the level or called logging.disable();
+    # either drops the record before any handler runs.
+    old_disable = logging.root.manager.disable
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logging.disable(logging.NOTSET)
+    try:
+        yield messages
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+        logging.disable(old_disable)
 
-    return run
+
+def capture(runner, case):
+    """The report one check emitted, as one block of text."""
+    with captured_report() as messages:
+        runner._update_num_xla_graphs(case)
+    return "\n".join(messages)
 
 
-def test_the_first_report_runs_before_anything_has_been_checked(monkeypatch, capture):
+def test_the_first_report_runs_before_anything_has_been_checked(monkeypatch):
     """The boot crash this report first shipped with.
 
     ``__init__`` calls the report before it could assign any state of its own,
@@ -91,7 +115,7 @@ def test_the_first_report_runs_before_anything_has_been_checked(monkeypatch, cap
     assert runner.num_xla_graphs == 2
 
 
-def test_a_runtime_compile_is_described(monkeypatch, capture):
+def test_a_runtime_compile_is_described(monkeypatch):
     runner = make_runner()
     boot = [entry(0, read_count=9), entry(1, read_count=4)]
     set_cache(monkeypatch, boot)
@@ -111,7 +135,7 @@ def test_a_runtime_compile_is_described(monkeypatch, capture):
     assert runner.num_xla_graphs == 3
 
 
-def test_a_reread_boot_graph_is_not_reported_as_fresh(monkeypatch, capture):
+def test_a_reread_boot_graph_is_not_reported_as_fresh(monkeypatch):
     """The failure that made the first version of this report useless.
 
     The list is not append-only, so its tail is full of boot programs. Those
@@ -132,7 +156,7 @@ def test_a_reread_boot_graph_is_not_reported_as_fresh(monkeypatch, capture):
     assert "graph 1/" not in text
 
 
-def test_a_cache_hit_is_counted_but_costs_no_compile_time(monkeypatch, capture):
+def test_a_cache_hit_is_counted_but_costs_no_compile_time(monkeypatch):
     """An entry with a zero duration was loaded, not compiled here."""
     runner = make_runner()
     set_cache(monkeypatch, [entry(0, read_count=3)])
@@ -145,7 +169,7 @@ def test_a_cache_hit_is_counted_but_costs_no_compile_time(monkeypatch, capture):
     assert "1 first read since the last check, 0.000s compiling" in text
 
 
-def test_the_costliest_compiles_are_described_first(monkeypatch, capture):
+def test_the_costliest_compiles_are_described_first(monkeypatch):
     runner = make_runner()
     set_cache(monkeypatch, [entry(0, read_count=2)])
     capture(runner, "init")
@@ -169,7 +193,7 @@ def test_the_costliest_compiles_are_described_first(monkeypatch, capture):
     assert order == sorted(order, reverse=True), order
 
 
-def test_long_reports_are_capped_but_say_so(monkeypatch, capture):
+def test_long_reports_are_capped_but_say_so(monkeypatch):
     runner = make_runner()
     count = TPUModelRunner._MAX_DESCRIBED_GRAPHS + 7
     set_cache(monkeypatch, [entry(i) for i in range(count)])
@@ -179,9 +203,7 @@ def test_long_reports_are_capped_but_say_so(monkeypatch, capture):
     assert "... 7 more not shown" in text
 
 
-def test_a_shrinking_cache_resynchronizes_instead_of_going_negative(
-    monkeypatch, capture
-):
+def test_a_shrinking_cache_resynchronizes_instead_of_going_negative(monkeypatch):
     runner = make_runner()
     set_cache(monkeypatch, [entry(i, read_count=2) for i in range(5)])
     capture(runner, "init")
