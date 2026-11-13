@@ -143,6 +143,30 @@ def _has_align_mamba(coordinator) -> bool:
     )
 
 
+_GATE_LOGGED: set[tuple[bool, int]] = set()
+
+
+def decode_checkpoints_active(manager, knob: bool) -> bool:
+    """Whether ``manager`` publishes decode checkpoints: the knob is on and its
+    spec has no speculative blocks (with MTP the last write into a column is
+    the first position of a verify window, not the column's last token)."""
+    return bool(knob) and int(manager.num_speculative_blocks) == 0
+
+
+def _log_decode_checkpoint_gate(manager, knob: bool) -> None:
+    key = (bool(knob), int(manager.num_speculative_blocks))
+    if key in _GATE_LOGGED:
+        return
+    _GATE_LOGGED.add(key)
+    logger.info(
+        "Mamba decode checkpoints: %s (VLLM_TPU_MAMBA_DECODE_CHECKPOINT=%d, "
+        "num_speculative_blocks=%d).",
+        "on" if decode_checkpoints_active(manager, knob) else "off",
+        int(bool(knob)),
+        key[1],
+    )
+
+
 def patch_mamba_checkpoint_retention() -> None:
     if not envs.VLLM_TPU_MAMBA_CHECKPOINT_RETENTION:
         return
@@ -182,10 +206,14 @@ def patch_mamba_checkpoint_retention() -> None:
                 replay_boundaries=replay_boundaries,
             )
         request_id = request.request_id
+        if not self.__dict__.get("_tpu_decode_ckpt_logged"):
+            # The install-time line reports only the knob; the gate is this
+            # manager's speculative blocks (MTP: num_speculative_tokens).
+            self._tpu_decode_ckpt_logged = True
+            _log_decode_checkpoint_gate(self, decode_checkpoints)
         decode_boundary = None
         if (
-            decode_checkpoints
-            and self.num_speculative_blocks == 0
+            decode_checkpoints_active(self, decode_checkpoints)
             # Dense retention (None) already caches every boundary.
             and retention_interval is not None
             # Decode only: one token per step, so the column the state just
@@ -313,5 +341,7 @@ def patch_mamba_checkpoint_retention() -> None:
     logger.info(
         "Applied TPU patch: Mamba align checkpoints pinned until request free, "
         "freed after their KV (decode checkpoints: %s).",
-        "on (no spec decode)" if decode_checkpoints else "off",
+        "enabled, only for Mamba groups without speculative blocks"
+        if decode_checkpoints
+        else "off",
     )
