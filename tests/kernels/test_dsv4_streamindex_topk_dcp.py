@@ -311,13 +311,14 @@ def _dcp_case(dcp_size, seed, q_len=Q_LEN):
 
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
-@pytest.mark.parametrize("a2a_merge", [False, True])
-def test_dcp_reassembles_the_unsharded_global_topk(dcp_size, a2a_merge):
+@pytest.mark.parametrize("merge", ["all_gather", "a2a", "hist"])
+def test_dcp_reassembles_the_unsharded_global_topk(dcp_size, merge):
     """Union the per-rank lists back together; it must be the global top-k.
-    Both merge paths; the unsharded reference is all they must agree on."""
+    Every merge path; the unsharded reference is all they must agree on."""
     _need_devices(dcp_size)
     rec, args, kwargs = _dcp_case(dcp_size, 0)
-    kwargs["a2a_merge"] = a2a_merge
+    kwargs["a2a_merge"] = merge == "a2a"
+    kwargs["hist_merge"] = merge == "hist"
     q, weights = args[0], args[1]
 
     pages = KV_LEN // PAGE_SIZE
@@ -424,9 +425,11 @@ def test_all_to_all_round_trip_preserves_token_order(dcp_size):
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 @pytest.mark.parametrize("chunk_tokens", [32, 64, 128])
-def test_dcp_chunking_does_not_change_the_result(chunk_tokens, dcp_size):
+@pytest.mark.parametrize("hist_merge", [False, True])
+def test_dcp_chunking_does_not_change_the_result(chunk_tokens, dcp_size, hist_merge):
     _need_devices(dcp_size)
     _, args, kwargs = _dcp_case(dcp_size, 11)
+    kwargs["hist_merge"] = hist_merge
 
     hlo = streamindex_topk_dcp.lower(
         *args, **kwargs, chunk_tokens=chunk_tokens
@@ -631,7 +634,8 @@ def _entry_order(compiled_text, names):
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 8])
 @pytest.mark.parametrize("q_len", [16, 256], ids=["decode16", "mixed256"])
-def test_overlap_fn_is_exact(dcp_size, q_len):
+@pytest.mark.parametrize("hist_merge", [False, True])
+def test_overlap_fn_is_exact(dcp_size, q_len, hist_merge):
     """The overlapped q_b and the top-k both match running them apart, byte
     for byte, and the positive control (one weight byte changed) is caught."""
     from vllm_torchtpu.layers.adapter.linear_common import _fp8_linear_pallas_jax
@@ -639,6 +643,7 @@ def test_overlap_fn_is_exact(dcp_size, q_len):
     _need_devices(dcp_size)
     _require_sparsecore()
     _, args, kwargs = _dcp_case(dcp_size, 31, q_len=q_len)
+    kwargs["hist_merge"] = hist_merge
     x, w, s = _qb_overlap_operands(m=q_len)
 
     want_topk = np.asarray(streamindex_topk_dcp(*args, **kwargs))

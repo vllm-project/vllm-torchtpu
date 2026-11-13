@@ -85,6 +85,7 @@ from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
     project_uv_heads,
+    weight_lse_partials,
 )
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
@@ -2491,6 +2492,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 fused_exchange=fused_exchange,
                 fused_merge=fused_merge,
                 dcp_lane_ids=lane_ids,
+                # TPU_DCP_MLA_OPROJ_ALL_REDUCE reads the partial whole on every
+                # bucket the pieces would serve (and the drafter never chunks).
+                merge_pieces=getattr(layer, "W_O_dcp_qrep", None) is None,
             )
 
         # The torch op schema is inferred from the signature: no varargs or
@@ -2820,8 +2824,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
-        """Executes complete TPU multi-head latent attention evaluation."""
+    ) -> torch.Tensor | list[tuple[torch.Tensor, torch.Tensor]]:
+        """Executes complete TPU multi-head latent attention evaluation.
+
+        A large qrep step under TPU_DCP_MLA_OPROJ_ALL_REDUCE returns the
+        unmerged, quantized `weight_lse_partials` instead of the output."""
         assert isinstance(q, tuple) and len(q) == 2, (
             "q must be a tuple of (q_nope, q_pe)"
         )
@@ -3041,8 +3048,24 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     # drafter keeps the reduce-scatter, as with the flag off.
                     is_backbone = vllm_compilation_backends.model_tag == "backbone"
                     wire_dtype = partial.dtype
-                    if uv_first and _cp_mla_attention.vspace_fused_applies(
-                        partial.shape[0], is_backbone
+                    # TPU_DCP_MLA_OPROJ_ALL_REDUCE: on the buckets the merge
+                    # would reduce-scatter (not its all-to-all ones).
+                    oproj_all_reduce = (
+                        uv_first
+                        and is_backbone
+                        and getattr(layer, "W_O_dcp_qrep", None) is not None
+                        and not (
+                            envs.TPU_DCP_LSE_MERGE_A2A
+                            and partial.shape[0]
+                            <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+                        )
+                    )
+                    if (
+                        uv_first
+                        and not oproj_all_reduce
+                        and _cp_mla_attention.vspace_fused_applies(
+                            partial.shape[0], is_backbone
+                        )
                     ):
                         # Experimental TPU_DCP_MERGE_VSPACE_FUSED: the chunked
                         # merge builds its operand in V space (no pre-merge
@@ -3066,13 +3089,37 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                 layer.W_UV_dcp_qrep_scale,
                                 out_dtype=wire_dtype if narrow else torch.float32,
                             )
-                        outputs = merge_lse_partials_scatter_heads(
-                            partial,
-                            lse,
-                            is_backbone=is_backbone,
-                            wire_dtype=wire_dtype,
-                            query_start_loc=attn_metadata.query_start_loc,
-                        )
+                        if oproj_all_reduce:
+                            # Every group head, unsummed and quantized by token
+                            # chunk: the wrapper's o_proj all-reduce sums the
+                            # ranks (TPU_DCP_MLA_OPROJ_ALL_REDUCE).
+                            chunks = weight_lse_partials(
+                                partial,
+                                lse,
+                                layer.W_O_dcp_qrep.dtype,
+                                envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS
+                                or partial.shape[0],
+                            )
+                            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS > 0:
+                                # The latent-merge buckets' W_UV, as at the end.
+                                q, s = chunks[0]
+                                chunks[0] = (
+                                    q,
+                                    _retain_buffers(
+                                        s,
+                                        layer.W_UV,
+                                        getattr(layer, "W_UV_scale", None),
+                                    ),
+                                )
+                            return chunks
+                        else:
+                            outputs = merge_lse_partials_scatter_heads(
+                                partial,
+                                lse,
+                                is_backbone=is_backbone,
+                                wire_dtype=wire_dtype,
+                                query_start_loc=attn_metadata.query_start_loc,
+                            )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)

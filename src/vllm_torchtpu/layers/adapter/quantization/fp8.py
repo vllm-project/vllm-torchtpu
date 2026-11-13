@@ -72,6 +72,7 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     config as streamidx_config,
 )
@@ -86,6 +87,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    DCP_ROWS_ATTR,
     FP8_PALLAS_HBM_PIN_ATTR,
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
@@ -340,6 +342,21 @@ def _process_fp8_linear_weights(
         logical_widths=layer.logical_widths,
         out_dtype=torch.float32,
     )
+    if (
+        getattr(layer, DCP_ROWS_ATTR, False)
+        and not getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+        # The path's activation quant (lse_rescale_quantize) is float8 only.
+        and requant_dtype.is_floating_point
+    ):
+        # The DCP group's rows, quantized once per output channel over the
+        # whole K from the checkpoint: requantizing the shards would round twice.
+        group = get_dcp_group()
+        assert group is not None
+        w, s = quantize_tensor(
+            group.all_gather(weight_f, dim=1), quant_dtype=requant_dtype, axis=-1
+        )
+        layer.weight_dcp = fresh_buffer(w.transpose(0, 1))  # canonical (k, n)
+        layer.weight_scale_dcp = fresh_buffer(s.reshape(-1))
     if requant_block_size is not None and weight_f.shape[-1] < requant_block_size:
         # Sub-block TP partition along the contracting dimension (e.g. RowParallel
         # down_proj with input_size_per_partition=64 < 128 at TP=16) has a single
