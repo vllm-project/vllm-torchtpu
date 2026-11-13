@@ -401,10 +401,12 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     Returns the unions as ``[tiles * groups_per_tile * pages_per_step]``
     (``-1`` past a tile's union; see `_slot`), one meta word per group (see
     `_ROW_SHIFT`), the number of groups, and each group's page count (its
-    present slots are the first ones). The kernel reads its group's pages in
-    the unions directly, so no [groups, pages_per_step] gather builds a
-    per-group list (a SparseCore offload of ~65 us per 2,048-token call in
-    the c4 prefill twin, j-3c651507).
+    present slots are the first ones). Groups past the last have no pages and
+    no first bit, and only a tile's first group can be live with no pages
+    (`msa_attention_lse._packed_work` tells live groups by that). The kernel
+    reads its group's pages in the unions directly, so no [groups,
+    pages_per_step] gather builds a per-group list (a SparseCore offload of
+    ~65 us per 2,048-token call in the c4 prefill twin, j-3c651507).
     """
     num_tokens, topk = selected.shape
     num_tiles = num_tokens // block_q
@@ -454,9 +456,9 @@ def _single_tile_work_list(union: jax.Array, groups_per_tile: int, pages_per_ste
     """`_work_list` of one tile (a decode batch of at most `block_q` tokens),
     with the same values. Its groups are its union's windows of
     `pages_per_step` slots in order, so each group's page count and liveness
-    come from its own window. No op reduces to a scalar for another op to
-    read: in the decode twin that scalar's round trip cost ~2.5 us per layer
-    (j-67494143)."""
+    come from its own window, and nothing that `_packed_work` keeps reduces
+    to a scalar for a later op to read (the group count it returns is for
+    the non-LSE kernel's grid)."""
     width = groups_per_tile * pages_per_step
     union = jnp.pad(
         jnp.where(union == _NO_PAGE, -1, union)[0],

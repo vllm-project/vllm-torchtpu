@@ -32,6 +32,17 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 )
 
 
+@pytest.mark.parametrize(
+    "group_sizes",
+    [[0] * 16, [5] + [0] * 15, [0] * 15 + [7], [2, 0, 3, 1] * 4, [32] + [0] * 15],
+)
+def test_computed_rows_are_the_rows_the_groups_cover(group_sizes):
+    sizes = jnp.asarray(group_sizes, jnp.int32)
+    got = fused_moe_gmm._computed_rows(sizes, 32)
+    want = np.arange(32) < sum(group_sizes)
+    np.testing.assert_array_equal(np.asarray(got), want)
+
+
 @pytest.mark.parametrize("version", ["v1", "v2", "v3"])
 def test_select_ragged_gather_reduce(version):
     selected = fused_moe_gmm._select_ragged_gather_reduce(version)

@@ -323,9 +323,8 @@ def select_experts(
         bias = e_score_correction_bias.float().view(bias_shape)
         scores_for_choice = scores + bias
         _, topk_ids = _topk(scores_for_choice, topk)
-        # A one-hot select, not `scores.gather`: the TPU runs a gather as its
-        # own fusion of ~0.65 us even for a decode step's few rows, while
-        # this compare-select-sum fuses (one nonzero term per sum: exact).
+        # A one-hot select, not `scores.gather`, so it fuses; one nonzero
+        # term per sum, so exact.
         experts = torch.arange(
             scores.shape[-1], dtype=topk_ids.dtype, device=scores.device
         )

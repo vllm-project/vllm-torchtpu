@@ -505,6 +505,15 @@ def prepare_routed_gmm_inputs(
     )
 
 
+def _computed_rows(group_sizes: jax.Array, num_rows: int) -> jax.Array:
+    """``rows < group_sizes.sum()``: the GMM rows its groups cover. Row r is
+    covered iff some group ends past it, a vector compare against the
+    groups' (non-negative counts') ends rather than a scalar summed count."""
+    rows = jnp.arange(num_rows, dtype=jnp.int32)
+    ends = jnp.cumsum(group_sizes, dtype=jnp.int32)
+    return jnp.any(rows[:, None] < ends[None, :], axis=1)
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -670,14 +679,7 @@ def moe_gmm(
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
-            # Row r is computed iff some group ends past it: a vector compare
-            # against the groups' ends, not against their summed count, whose
-            # scalar round trip cost ~0.6 us per decode layer (j-6bc5967f).
-            rows = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32)
-            computed = jnp.any(
-                rows[:, None] < jnp.cumsum(group_sizes, dtype=jnp.int32)[None, :],
-                axis=1,
-            )
+            computed = _computed_rows(group_sizes, gmm2_res.shape[0])
             gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(

@@ -415,11 +415,17 @@ def gather_queries_with_candidates(
     return q_all, gathered[..., width:]
 
 
-# Decode-sized steps (8-token verify rows of up to 16 requests): their
-# partials are a few KiB per head, so moving them costs no more than
-# reduce-scattering them, and the exchange needs no LSE gather first; their
-# queries likewise cross with the candidates (`gather_queries_with_candidates`).
-EXCHANGE_MERGE_MAX_TOKENS = 128
+# Decode steps (8-token verify rows of up to 8 requests) move their attention
+# partials (f32, with the LSEs as extra rows: 4.5 KiB per head at 8 tokens) by
+# one all-to-all instead of an LSE gather and a reduce-scatter, and their
+# queries with the candidates (`gather_queries_with_candidates`): the
+# collectives' latency, not their bytes, is the cost there. Measured at DCP 2
+# up to 48 tokens; the cap is the default of the MLA merge's all-to-all cap
+# (`TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS`, measured there), past which the
+# reduce-scatter, which sums in the network, wins. Only the backbone, traced
+# per token bucket, runs the MSA op (the DSpark drafter's layers are not
+# MSA), so the branch on the token count is fixed per traced bucket.
+EXCHANGE_MERGE_MAX_TOKENS = 64
 
 
 def _merge_exchanged_partials(
@@ -427,11 +433,14 @@ def _merge_exchanged_partials(
 ) -> torch.Tensor:
     """`merge_head_partials`' reduce-scatter result ``[H / DCP, T, D]`` from
     one exchange: an all-to-all brings this rank every rank's partial and LSE
-    of its own heads, which it weights and sums itself, as the reduce-scatter
-    would (each rank's weighted term rounded to the output dtype first, when
-    `TPU_DCP_RS_OUT_PRECISION`). The partial crosses in f32 (exact for bf16)
-    with its LSE as trailing rows of each head, so the exchange is one
-    collective, where the reduce-scatter waited on an LSE gather."""
+    of its own heads, which it weights as the reduce-scatter path does (each
+    rank's weighted term rounded to the output dtype first, when
+    `TPU_DCP_RS_OUT_PRECISION`) and adds in f32, rounding once. At DCP 2 that
+    is the reduce-scatter's sum; wider groups may round the last bit
+    differently from the collective's own accumulation. The partial crosses in
+    f32 (exact for bf16) with its LSE as trailing rows of each head, so the
+    exchange is one collective, where the reduce-scatter waited on an LSE
+    gather."""
     world = int(group.world_size)
     num_heads, num_tokens, head_dim = out.shape
     local = num_heads // world
@@ -446,9 +455,12 @@ def _merge_exchanged_partials(
         ],
         dim=1,
     )
-    got = _all_to_all(payload, group).view(world, local, -1, head_dim)
+    got = _all_to_all(payload, group).view(
+        world, local, num_tokens + lse_rows, head_dim
+    )
     outs = got[:, :, :num_tokens]
-    lses = got[:, :, num_tokens:].reshape(world, local, -1)[..., :num_tokens]
+    lses = got[:, :, num_tokens:].reshape(world, local, lse_rows * head_dim)
+    lses = lses[..., :num_tokens]
     weight = torch.exp(lses - torch.logsumexp(lses, dim=0)).unsqueeze(-1)
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
     weighted = torch.where(
