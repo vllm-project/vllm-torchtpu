@@ -1,0 +1,104 @@
+{
+ "rows": [
+  {
+   "conc": 128,
+   "seqs_per_rank": 8,
+   "tokens_per_rank_step": 48,
+   "ctx": 20000,
+   "out_len": 512,
+   "step_ms": 32.16,
+   "tau": 2.9315,
+   "interior_tok_s": 11666.51,
+   "interior_tok_s_at_3p5": 13928.99,
+   "wall_tok_s": 6971.7,
+   "tpot_ms": 12.949,
+   "ttft_p50_s": 0.7047,
+   "per_pos": [
+    0.7463,
+    0.5014,
+    0.3309,
+    0.2104,
+    0.1427
+   ],
+   "duration_s": 9.4,
+   "per_chip_interior": 1458.31375,
+   "per_user_tok_s": 91.144609375
+  },
+  {
+   "conc": 256,
+   "seqs_per_rank": 16,
+   "tokens_per_rank_step": 96,
+   "ctx": 20000,
+   "out_len": 512,
+   "step_ms": 41.06,
+   "tau": 2.8909,
+   "interior_tok_s": 18022.78,
+   "interior_tok_s_at_3p5": 21820.09,
+   "wall_tok_s": 8800.26,
+   "tpot_ms": 18.583,
+   "ttft_p50_s": 1.1953,
+   "per_pos": [
+    0.7405,
+    0.4908,
+    0.323,
+    0.2015,
+    0.1352
+   ],
+   "duration_s": 14.894,
+   "per_chip_interior": 2252.8475,
+   "per_user_tok_s": 70.401484375
+  },
+  {
+   "conc": 512,
+   "seqs_per_rank": 32,
+   "tokens_per_rank_step": 192,
+   "ctx": 20000,
+   "out_len": 512,
+   "step_ms": 55.81,
+   "tau": 2.9134,
+   "interior_tok_s": 26726.89,
+   "interior_tok_s_at_3p5": 32108.23,
+   "wall_tok_s": 12845.42,
+   "tpot_ms": 24.253,
+   "ttft_p50_s": 2.1192,
+   "per_pos": [
+    0.7434,
+    0.4945,
+    0.3273,
+    0.2071,
+    0.1411
+   ],
+   "duration_s": 20.408,
+   "per_chip_interior": 3340.86125,
+   "per_user_tok_s": 52.20095703125
+  },
+  {
+   "conc": 1024,
+   "seqs_per_rank": 64,
+   "tokens_per_rank_step": 384,
+   "ctx": 20000,
+   "out_len": 512,
+   "step_ms": null,
+   "tau": 2.894,
+   "interior_tok_s": null,
+   "interior_tok_s_at_3p5": null,
+   "wall_tok_s": 8282.2,
+   "tpot_ms": 63.517,
+   "ttft_p50_s": 21.3248,
+   "per_pos": [
+    0.7353,
+    0.4878,
+    0.3235,
+    0.2068,
+    0.1405
+   ],
+   "duration_s": 63.303,
+   "per_chip_interior": 0.0,
+   "per_user_tok_s": 0.0
+  }
+ ],
+ "fit": {
+  "floor_ms": 24.784999999999986,
+  "slope_ms_per_token": 0.16272321428571437
+ }
+}

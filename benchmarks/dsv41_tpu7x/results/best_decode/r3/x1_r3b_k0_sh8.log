@@ -1,0 +1,3 @@
+[X1] conc= 512 seqs/rank= 64 tok/step/rank=  64 | step=40.03 ms tau=1.0 | interior=12791.29 tok/s (3198/chip, 25.0/user) | @3.5=44769.51 | tpot=43.256 ms ttft_p50=4.522 s
+[X1] conc=1024 seqs/rank=128 tok/step/rank= 128 | step=None ms tau=1.0 | interior=None tok/s (0/chip, 0.0/user) | @3.5=None | tpot=65.884 ms ttft_p50=9.0137 s
+[X1] conc=2048 seqs/rank=256 tok/step/rank= 256 | step=None ms tau=1.0 | interior=None tok/s (0/chip, 0.0/user) | @3.5=None | tpot=68.02 ms ttft_p50=80.8046 s

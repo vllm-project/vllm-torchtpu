@@ -1,0 +1,31 @@
+Loaded 12 tool-calling templates and 30 exact sampling specs from /data/requests_mocked.jsonl.xz (model=deepseek-ai/DeepSeek-V4.1-Flash)
+Waiting for prefill health at http://127.0.0.1:8400/health ...
+  [prefill] Healthy (HTTP 200)!
+Waiting for decode health at http://10.11.0.6:9400/health ...
+  [decode] Healthy (HTTP 200)!
+
+>>> [n=256 SESSIONS, TRUNKS=40] (600s) Measured Zero-Compile Benchmark Run (Exact Temps, 50:20:12:9:9) <<<
+  [reset_prefix_cache] prefill: OK (HTTP 200)
+  [reset_prefix_cache] decode: OK (HTTP 200)
+
+[n=256] Phase 0 (Warmup — 40 Distinct Trunks {'1-8K': 8, '8-16K': 8, '16-32K': 8, '32-64K': 8, '64K+': 8}): Stage1=40 trunks (964,055 prefix tok), Stage2=0 trunks (total target ISL=1,357,824 tok, 71% prefix=964,055 tok)...
+[n=256] Phase 0 Warmup complete: 40/40 distinct trunks populated (1,484,562 total prompt tokens) in 10.18s. Starting measured benchmark...
+============================================================================================================
+RESULTS FOR n=256 SESSIONS (Trunks=40, Continuous 600s Window) | TrunksUsed=40/40 | OK=4006/4006 (ToolCalls=1880, In-Win=3750) | Win=600.0s | DrainWall=829.82s
+------------------------------------------------------------------------------------------------------------
+  Mean ISL: 21,715.9 tok | Cached: 14,694.6 tok (67.67%) | Mean Output: 1,871.1 tok
+  Steady-State Window Tput : Output=10,971.5 tok/s | Input=144,842.6 tok/s | Uncached=46,833.8 tok/s
+  Full-Drain Wall Tput     : Output=9,032.9 tok/s | Input=104,835.0 tok/s | RPS=4.83
+  3-Yr CUD Cost ($43.20/hr) : Out(Win)=$1.09/1M | Out(Drain)=$1.33/1M | In(Win)=$0.083/1M | Blended=$0.077/1M
+  Client Decode Speed/Strm : Median=38.43 tok/s (P95_low=31.06, P90_low=32.36, P90_hi=51.83) | Per-Token ITL=26.02ms (StepChunk=61.09ms, Mean=78.77ms)
+  Latency                  : Median TTFT=0.94s (P90=1.80s) [all 4006 completions; in-window only: med=0.94s P90=1.86s n=3750] | Median E2E=21.55s
+  Per-Chip (4P+4D)      : Out/D-chip=2,743 tok/s | Out/total-chip=1,371 tok/s | Uncached/P-chip=11,708 tok/s | Rev@18:1/71% list 100%=7.02 $/chip/hr, 50%list 70%util=2.46 (rental $5.40)
+  Per-Bucket Breakdown:
+    1-8K     (trunks= 8): reqs=2003 | Mean ISL=  7,036 | Mean OSL= 642.5 | Hit= 65.9% | Med TTFT=  0.84s | P90 TTFT=  1.62s | Med TPS/strm= 36.6 (P90_low= 31.6)
+    8-16K    (trunks= 8): reqs=801 | Mean ISL= 13,242 | Mean OSL=3,288.1 | Hit= 67.6% | Med TTFT=  0.89s | P90 TTFT=  1.71s | Med TPS/strm= 37.7 (P90_low= 33.0)
+    16-32K   (trunks= 8): reqs=481 | Mean ISL= 26,184 | Mean OSL=2,318.8 | Hit= 67.6% | Med TTFT=  0.90s | P90 TTFT=  1.83s | Med TPS/strm= 45.5 (P90_low= 35.0)
+    32-64K   (trunks= 8): reqs=361 | Mean ISL= 54,004 | Mean OSL=4,936.8 | Hit= 68.2% | Med TTFT=  1.15s | P90 TTFT=  1.74s | Med TPS/strm= 45.3 (P90_low= 35.6)
+    64K+     (trunks= 8): reqs=360 | Mean ISL= 83,903 | Mean OSL=1,881.5 | Hit= 68.2% | Med TTFT=  1.39s | P90 TTFT=  2.36s | Med TPS/strm= 42.7 (P90_low= 34.0)
+============================================================================================================
+
+Saved full 5-or-N trunks exact-temps sweep summary to /tmp/e4c_hit71_n256.json
