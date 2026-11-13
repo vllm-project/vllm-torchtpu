@@ -300,6 +300,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # prefill checkpoint operands or with constant None inputs.
     "vllm_torchtpu/gdn_pool_layout.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
+    "vllm_torchtpu/layers/adapter/rmsnorm_fp8.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
