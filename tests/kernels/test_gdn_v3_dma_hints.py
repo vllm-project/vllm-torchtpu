@@ -16,8 +16,8 @@
 kernels/gdn/v3/memory_ref.py asks for DMA `priority` / `strict_ordering`
 hints that only an internal Pallas build accepts. They go through
 kernels/pallas_compat.py, so the kernel traces and lowers for TPU on the
-pinned public JAX, and the qkv and state copies still issue at priority 1
-there (public Pallas takes `priority` on `start`).
+pinned public JAX, and the qkv, b, a, out and state copies still issue at
+priority 1 there (public Pallas takes `priority` on `start`).
 """
 import collections
 import contextlib
@@ -154,6 +154,6 @@ def test_kernel_lowers_with_priority_dmas(state, num_tokens, num_seqs):
         traced = wrapper.fused_conv1d_gdn.trace(**args)
         traced.lower(lowering_platforms=("tpu", ))
     priorities = _dma_start_priorities(traced.jaxpr.jaxpr)
-    # memory_ref.create_allocs asks for priority 1 on the qkv and state
-    # copies; the rest stay at 0.
-    assert priorities[1] > 0 and set(priorities) <= {0, 1}, priorities
+    # memory_ref.create_allocs asks for priority 1 on every copy: qkv, b, a,
+    # out and the states.
+    assert priorities[1] > 0 and set(priorities) == {1}, priorities

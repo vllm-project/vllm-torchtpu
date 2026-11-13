@@ -17,6 +17,7 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 """
 import functools
 import math
+import os
 from typing import Optional, Tuple
 
 import jax
@@ -776,7 +777,8 @@ def _gdn_form() -> str:
     Log the selected entry and decode tile once per process.
     """
     global _GDN_FORM_LOGGED
-    tables = bool(tpu_envs.TPU_GDN_TABLES_IN_KERNEL)
+    tables = (bool(tpu_envs.TPU_GDN_TABLES_IN_KERNEL)
+              if "TPU_GDN_TABLES_IN_KERNEL" in os.environ else True)
     form = "tables" if tables else "two_calls"
     if not _GDN_FORM_LOGGED:
         logger.info("GDN pooled decode entry: form %s, decode tile %d", form,

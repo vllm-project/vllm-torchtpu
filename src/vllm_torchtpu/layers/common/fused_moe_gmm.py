@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 
 import jax
 from jax import numpy as jnp
@@ -274,8 +275,10 @@ def prepare_routed_gmm_inputs(
     # declines shapes whose bucket count exceeds its block. Compatibility
     # with speculative draft acceptance requires separate validation;
     # keep this flag off with multi-token prediction.
+    use_counting_sort = (envs.USE_MOE_COUNTING_SORT
+                         if "USE_MOE_COUNTING_SORT" in os.environ else True)
     argsort_revert_indices, bucket_counts = (_counting_sort_positions(
-        sort_keys, local_num_experts + 1) if envs.USE_MOE_COUNTING_SORT else
+        sort_keys, local_num_experts + 1) if use_counting_sort else
                                              (None, None))
     # The packed (key, token) sort requires both fields to fit in int32.
     # Shapes that exceed that range use the gather path to avoid overflow.
