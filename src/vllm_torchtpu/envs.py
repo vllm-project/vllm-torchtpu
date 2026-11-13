@@ -215,6 +215,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 0
+    TPU_FUSED_ADD_RMSNORM_QUANT: bool = False
 
 
 def env_with_choices(
@@ -1321,6 +1322,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS": env_nonnegative_int(
         "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS", 0
     ),
+    # With TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: the Pallas norm in front of a
+    # per-channel FP8 linear (MLA fused_qkv_a_proj, dense gate_up_proj) also
+    # writes that linear's per-row fp8 input and scale, so the linear skips its
+    # own quantization. Bit-identical. No effect when
+    # TPU_FUSED_ADD_RMSNORM_MIN_TOKENS is 0: the runner logs a warning.
+    "TPU_FUSED_ADD_RMSNORM_QUANT": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT"),
 }
 
 
