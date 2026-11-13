@@ -307,6 +307,27 @@ class Layout:
         }
 
 
+COMPILE_BEGINS = "bench moe compile begins:"  # bench_moe's lines around a compile
+COMPILE_ENDS = "bench moe compile ends:"
+
+
+def overlays_by_window(log: str) -> dict[int, list[dict[str, int | str]]]:
+    """:func:`overlay_programs` of each window's compile in a bench moe process
+    log: the lines between its compile markers."""
+    import re
+
+    found, window, lines = {}, None, []
+    for line in log.splitlines():
+        if match := re.search(re.escape(COMPILE_BEGINS) + r" w(\d+)", line):
+            window, lines = int(match[1]), []
+        elif window is not None and COMPILE_ENDS in line:
+            found[window] = overlay_programs("\n".join(lines))
+            window = None
+        elif window is not None:
+            lines.append(line)
+    return found
+
+
 def overlay_programs(log: str) -> list[dict[str, int | str]]:
     """The overlay layout of every program compiled in a libtpu log written
     with ``--vmodule=overlay_partitioner=1,overlay=1``: its input bundle count,
@@ -330,6 +351,14 @@ def overlay_programs(log: str) -> list[dict[str, int | str]]:
             programs[-1][kind] = int(programs[-1].get(kind, 0)) + 1
             programs[-1]["partitions"] = int(programs[-1]["partitions"]) + 1
     return programs
+
+
+def inputs_digest(length: int, *rows: np.ndarray) -> str:
+    """sha256 of a rank's routed length and operand rows."""
+    digest = hashlib.sha256(str(length).encode())
+    for part in rows:
+        digest.update(np.ascontiguousarray(part, np.float32).tobytes())
+    return digest.hexdigest()
 
 
 def held_family(value: np.ndarray, layers: int, index: int) -> np.ndarray:

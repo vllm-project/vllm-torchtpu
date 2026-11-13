@@ -317,6 +317,23 @@ I1113 overlay.cc:7142] OverlayProgram(), input program bundle count: 412
 """
 
 
+def test_overlays_follow_the_bench_compile_markers():
+    log = "\n".join(
+        [
+            "[   10.0s r00] bench moe compile begins: w16384",
+            _OVERLAY_LOG,
+            "[  400.0s r00] bench moe compile ends: w16384: first launch 390.0 s",
+            "I1113 overlay.cc:7142] OverlayProgram(), input program bundle count: 5",
+            "[  401.0s r00] bench moe compile begins: w8192",
+            "[  402.0s r00] bench moe compile ends: w8192: first launch 1.0 s",
+        ]
+    )
+    by_window = ml.overlays_by_window(log)
+    assert list(by_window) == [16384, 8192]
+    assert [p["bundles"] for p in by_window[16384]] == [1297546, 412]
+    assert by_window[8192] == []  # a cached executable leaves no records
+
+
 def test_overlay_programs_read_the_compile_log():
     first, second = ml.overlay_programs(_OVERLAY_LOG)
     assert first == {
@@ -393,6 +410,28 @@ def test_synthesized_rows_select_their_experts_in_the_kernels_top16(
     assert np.all(np.asarray(weights)[~valid] == 0)
     ours, _ = ml.top16(hidden @ router, bias)
     np.testing.assert_array_equal(np.sort(ours, axis=1), selected)
+
+
+def test_selection_needs_a_gap_between_the_16th_and_17th_scores(router_layer):
+    router, norm, bias, solver = router_layer
+    rng = np.random.default_rng(16)
+    sets = ml.uniform_sets(8, seed=3)
+    valid = np.ones(8, bool)
+    logits = ml.target_logits(sets, valid, bias, rng, margin=0.1)
+    hidden = ml.post_norm(solver.residual(logits, rng)[0], norm)
+    margin = ml.check_selection(hidden, router, bias, sets, valid)
+    with pytest.raises(ValueError, match="apart"):
+        ml.check_selection(hidden, router, bias, sets, valid, least=margin + 1e-3)
+
+
+def test_inputs_digest_tells_any_change_apart():
+    rows = ml.bf16(np.random.default_rng(17).standard_normal((4, 8)))
+    digest = ml.inputs_digest(16384, rows, rows)
+    assert digest == ml.inputs_digest(16384, rows.copy(), rows.copy())
+    changed = rows.copy()
+    changed[2, 3] = np.nextafter(changed[2, 3], np.float32(np.inf))
+    assert digest != ml.inputs_digest(16384, rows, changed)
+    assert digest != ml.inputs_digest(16383, rows, rows)
 
 
 def test_unreachable_selection_fails_loudly():

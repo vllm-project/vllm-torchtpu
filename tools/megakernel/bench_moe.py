@@ -39,10 +39,11 @@ comparison of two runs:
 A counted case runs at the windows that hold its tokens (a served 16K
 window's counts only at 16384). ``--trace DIR``: rank 0 saves an xprof trace
 of each case's last repeat. The log also gives each family's byte range of
-the layer's entry, and, when libtpu logs the overlay partitioner
-(``[libtpu:--vmodule=overlay_partitioner=1,overlay=1]`` with
-``TPU_STDERR_LOG_LEVEL=0``), the overlays of the window's compile, read from
-this process's file descriptor 2 during its first launch.
+the layer's entry, and brackets each window's compile between two lines: when
+libtpu logs its overlay partitioner there
+(``[libtpu:--vmodule=overlay_partitioner=1,overlay=1]`` with libtpu's log on
+stderr), ``python -m tools.megakernel.bench_moe overlays RANK_LOG`` reports
+each window's compiled overlays from the process's log.
 """
 
 from __future__ import annotations
@@ -50,10 +51,8 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import os
 import statistics
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -224,68 +223,6 @@ def _device_i32(value: int):
     return torch.tensor([value], dtype=torch.int32).to("tpu")
 
 
-class _StderrTee:
-    """Inside the block, everything written to file descriptor 2 (libtpu's
-    log as well) still reaches it and is also kept, for :meth:`text`."""
-
-    def __init__(self, active: bool) -> None:
-        self.active, self.chunks = active, []
-
-    def __enter__(self) -> _StderrTee:
-        if not self.active:
-            return self
-        sys.stderr.flush()
-        self.saved = os.dup(2)
-        read, write = os.pipe()
-        os.dup2(write, 2)
-        os.close(write)
-
-        def pump():
-            while data := os.read(read, 1 << 16):
-                os.write(self.saved, data)
-                self.chunks.append(data)
-            os.close(read)
-
-        self.pump = threading.Thread(target=pump, daemon=True)
-        self.pump.start()
-        return self
-
-    def __exit__(self, *exc) -> None:
-        if not self.active:
-            return
-        sys.stderr.flush()
-        os.dup2(self.saved, 2)  # closes the pipe's write end: the pump drains
-        self.pump.join()
-        os.close(self.saved)
-
-    def text(self) -> str:
-        return b"".join(self.chunks).decode(errors="replace")
-
-
-def _overlay_line(window: int, log: str) -> tuple[str, list]:
-    """A log line on the overlays of the programs compiled in ``log``."""
-    from tools.megakernel import moe_layer
-
-    programs = moe_layer.overlay_programs(log)
-    if not programs:
-        return (
-            f"w{window}: no overlay records in this compile (a cached executable, "
-            "or libtpu without --vmodule=overlay_partitioner=1,overlay=1 and "
-            "TPU_STDERR_LOG_LEVEL=0)",
-            programs,
-        )
-    largest = max(programs, key=lambda p: p["bundles"])
-    kinds = " ".join(
-        f"{k} {v}" for k, v in sorted(largest.items()) if k.startswith("kind")
-    )
-    return (
-        f"w{window}: compiled {len(programs)} overlaid program(s); the largest has "
-        f"{largest['bundles']} bundles, overlay sizes (regular/jumbo/hlo) "
-        f"{largest['sizes']}, {largest['partitions']} partitions ({kinds})",
-        programs,
-    )
-
-
 class _Layer:
     """MoE layer ``layer``'s weights for this rank: on the host (routing,
     reference) and resident on the device as ``layout`` holds them."""
@@ -360,11 +297,9 @@ class _Inputs:
     scaled: int  # rows whose target logits were scaled to stay reachable
 
     def digest(self) -> str:
-        """sha256 of this rank's operand rows and routed length."""
-        digest = hashlib.sha256(str(self.length).encode())
-        for rows in (self.residual, self.hidden):
-            digest.update(np.ascontiguousarray(rows, np.float32).tobytes())
-        return digest.hexdigest()
+        from tools.megakernel import moe_layer
+
+        return moe_layer.inputs_digest(self.length, self.residual, self.hidden)
 
 
 def _synthesize(case, window: int, rank: int, layer: _Layer, args) -> _Inputs:
@@ -634,7 +569,7 @@ def run(args, records: harness.Records) -> None:
     for window in windows:
         op = _build_op(mesh, window, mixture, counting)
         parts = fused._COMPOUND_PARTS.get(window, (window,))
-        compile_s, overlays = None, None
+        compile_s = None
         for case in cases:
             tag = _tag(window, case.label)
             if not case.fits(window):
@@ -648,17 +583,16 @@ def run(args, records: harness.Records) -> None:
             loads = moe_layer.case_loads(inputs.sets, inputs.length, parts)
             operands = _operands(inputs, layer, mixture, active)
             harness.sync()
+            if compile_s is None:
+                harness.log(f"{moe_layer.COMPILE_BEGINS} w{window}")
             began = time.perf_counter()
-            with _StderrTee(compile_s is None and logger) as compile_log:
-                first = _launch(op, operands, 1)
+            first = _launch(op, operands, 1)
             if compile_s is None:
                 compile_s = time.perf_counter() - began
                 harness.log(
-                    f"w{window}: first launch (compile + run) {compile_s:.1f} s"
+                    f"{moe_layer.COMPILE_ENDS} w{window}: first launch (compile + "
+                    f"run) {compile_s:.1f} s"
                 )
-                if logger:
-                    line, overlays = _overlay_line(window, compile_log.text())
-                    harness.log(line)
             first_bits = _bits(first[0])
             routes_error = _routes_error(first[1], inputs, rank) if counting else ""
             _fail_on(_gather(routes_error), f"{tag}: the op routed elsewhere")
@@ -719,7 +653,13 @@ def run(args, records: harness.Records) -> None:
                 f"{loads['routed']}, GU rows {loads['gu_rows']}, visits "
                 f"{loads['visits']}, down rows {loads['down_rows']} (mean chip GU "
                 f"{loads['mean_gu_rows']:.0f})"
-                + (" OVER THE COMPACT ROUTE CAPACITY" if loads["overflow"] else "")
+                + (
+                    " OVER THE COMPACT ROUTE CAPACITY (the op takes its overflow "
+                    "path: at 16K two 8K launches, at 8K the uncapped routed "
+                    "experts; the loads describe the compact launch)"
+                    if loads["overflow"]
+                    else ""
+                )
                 + f" | margin {margin:.4f} | inputs {inputs_digest} | digest "
                 f"{digest} sum {checksum:.6e} abs {magnitude:.6e}"
                 + ("" if same else " | LAST LAUNCH DIFFERS FROM THE FIRST")
@@ -743,7 +683,6 @@ def run(args, records: harness.Records) -> None:
                 slot=layout.slot,
                 expert_index=layout.expert_index,
                 offsets=offsets,
-                overlays=overlays,
                 length=inputs.length,
                 mode=mode,
                 launches=args.launches,
@@ -843,7 +782,28 @@ def compare(path_a: str, path_b: str) -> int:
     return status
 
 
+def overlays(path: str) -> int:
+    """Print each window's compiled overlays from a bench moe process log."""
+    from tools.megakernel import moe_layer
+
+    by_window = moe_layer.overlays_by_window(Path(path).read_text(errors="replace"))
+    if not by_window:
+        print(f"{path}: no bench moe compile in this log")
+        return 2
+    for window, programs in by_window.items():
+        if not programs:
+            print(f"w{window}: no overlay records (a cached executable, or no vmodule)")
+        for program in programs:
+            print(f"w{window}: " + json.dumps(program))
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "overlays":
+        sys.exit(overlays(sys.argv[2]))
     if len(sys.argv) != 3:
-        raise SystemExit("usage: python -m tools.megakernel.bench_moe A.npz B.npz")
+        raise SystemExit(
+            "usage: python -m tools.megakernel.bench_moe A.npz B.npz\n"
+            "       python -m tools.megakernel.bench_moe overlays RANK_LOG"
+        )
     sys.exit(compare(sys.argv[1], sys.argv[2]))
