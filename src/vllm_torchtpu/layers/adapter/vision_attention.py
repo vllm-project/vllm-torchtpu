@@ -140,7 +140,7 @@ class TpuMMEncoderAttention(MMEncoderAttention):
         def _prep(x: torch.Tensor) -> torch.Tensor:
             # [b, s, h, d] -> pad seq -> [b, h, s_pad, d]
             if pad:
-                x = F.pad(x, (0, 0, 0, 0, 0, pad))
+                x = torch.cat((x, torch.zeros((x.shape[0], pad, *x.shape[2:]), dtype=x.dtype, device=x.device)), dim=1)
             return x.permute(0, 2, 1, 3).contiguous()
 
         op = TpuMMEncoderAttention._vision_op

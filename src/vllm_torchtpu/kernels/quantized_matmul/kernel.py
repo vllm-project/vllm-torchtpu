@@ -293,11 +293,11 @@ def quantized_matmul_kernel(
             x_q_dtype=jnp.dtype(x_q_dtype).name,
             w_q_dtype=jnp.dtype(w_q.dtype).name,
         )
-    batch_block_size = tuned_value.batch_block_size
+    batch_block_size = max(8, (tuned_value.batch_block_size + 7) & ~7)
     out_block_size = tuned_value.out_block_size
     in_block_size = tuned_value.in_block_size
 
-    # Pad the inputs to be multiple of block size.
+    # Pad the inputs to be multiple of block size (always >= 8 and % 8 == 0).
     padded_n_batch = next_multiple(orig_n_batch, batch_block_size)
     if orig_n_batch < padded_n_batch:
         x = jnp.pad(x, ((0, padded_n_batch - orig_n_batch), (0, 0)))

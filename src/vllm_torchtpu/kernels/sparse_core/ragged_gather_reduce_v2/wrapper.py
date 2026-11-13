@@ -24,6 +24,10 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import (
     kernel,
     memory_ref,
 )
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
+    ragged_gather_reduce as ragged_gather_reduce_v3,
+    token_block_alignment,
+)
 
 
 def _fallback_implementation(
@@ -62,13 +66,16 @@ def _preprocess_scalar_data(
     num_simd_lanes = cfg.sc_info.num_lanes
     valid_rows_mask_2d = valid_rows_mask.reshape(cfg.num_row_partitions, -1)
 
-    # Stable sort of a boolean key is a stable partition: valid rows keep their
-    # relative order and move ahead of the invalid ones.
-    sorted_by_validity = jnp.argsort(
-        ~valid_rows_mask_2d, descending=False, stable=True, axis=-1
+    # Pack the 1-bit validity flag into bit 30 and the strictly increasing
+    # global row index into bits 0..29 so a single-key unstable sort produces
+    # the exact stable partition + global offset in one pass.
+    global_iota = jnp.arange(cfg.padded_input_size, dtype=jnp.int32).reshape(
+        cfg.num_row_partitions, cfg.row_partition_size
     )
-    sorted_by_validity += (
-        jnp.arange(cfg.num_row_partitions)[:, None] * cfg.row_partition_size
+    packed = jnp.where(valid_rows_mask_2d, global_iota, global_iota | (1 << 30))
+    sorted_by_validity = jnp.bitwise_and(
+        jax.lax.sort(packed, dimension=-1, is_stable=False),
+        (1 << 30) - 1,
     )
 
     padding = cfg.row_partition_size_padded - cfg.row_partition_size
@@ -79,7 +86,33 @@ def _preprocess_scalar_data(
         jnp.sum(valid_rows_mask_2d, axis=-1).astype(jnp.int32),
         (0, max(0, num_simd_lanes - cfg.num_row_partitions)),
     )
-    mask = jnp.any(valid_rows_mask.reshape(-1, cfg.reduce_group_size), axis=-1)
+    if cfg.reduce_group_size == 1:
+        mask = valid_rows_mask
+    else:
+        # Avoid reshaping 1D `pred[N]{0:T(1024)}` to 2D `pred[N//G, G]{1,0:T(8,128)}`
+        # (95.3% lane padding waste for G=6). Reshape to 128-lane-aligned 3D
+        # `(-1, G, 128)` (zero-copy bitcast) and contract on the MXU.
+        g = cfg.reduce_group_size
+        num_groups = cfg.padded_input_size // g
+        block_elems = g * 128
+        rem = cfg.padded_input_size % block_elems
+        v_pad = (
+            jnp.pad(valid_rows_mask, (0, block_elems - rem))
+            if rem
+            else valid_rows_mask
+        )
+        v_3d = v_pad.reshape(-1, g, 128).astype(jnp.bfloat16)
+        pat = (
+            (jnp.arange(block_elems)[:, None] // g == jnp.arange(128)[None, :])
+            .reshape(g, 128, 128)
+            .astype(jnp.bfloat16)
+        )
+        mask = (
+            jnp.einsum(
+                "brc,rcg->bg", v_3d, pat, preferred_element_type=jnp.float32
+            )
+            > 0
+        ).reshape(-1)[:num_groups]
     scalar = memory_ref.IndexRef(
         indices=indices,
         sorted_by_validity=sorted_by_validity.astype(jnp.int32),
@@ -169,6 +202,20 @@ def ragged_gather_reduce_v2(
             x, indices, topk_weights, valid_rows_mask, reduce_group_size
         )
 
+    if (
+        x.dtype == jnp.bfloat16
+        and reduce_group_size >= 2
+        and x.shape[0] == cfg.input_size
+        and x.shape[0] <= (1 << 20)
+        and cfg.sc_info.num_lanes == 16
+        and cfg.hidden_size % cfg.tpu_info.num_lanes == 0
+    ):
+        alignment = token_block_alignment(cfg.hidden_size, cfg.tpu_info)
+        if cfg.output_size >= alignment and cfg.output_size % alignment == 0:
+            return ragged_gather_reduce_v3(
+                x, indices, topk_weights, valid_rows_mask, reduce_group_size
+            )
+
     # Step 3: Pre-process inputs (weights, padding, sort by validity).
     # Simplify topk gather by using fp32 and ensure data is always word aligned.
     topk_weights_f32 = topk_weights.astype(jnp.float32)
@@ -212,7 +259,6 @@ def ragged_gather_reduce_v2(
     )(scalar, x, topk_weights_f32)
 
     # Step 5: Post-process the output (drop padding, zero empty groups, cast).
-    out = out[: cfg.output_size, : cfg.hidden_size]
+    out = out[: cfg.output_size, : cfg.hidden_size].astype(x.dtype)
     # TODO(kyuyeunk): Use zero initialization instead of masking.
-    out = jnp.where(mask[: cfg.output_size, None], out, jnp.zeros_like(out))
-    return out.astype(x.dtype)
+    return jnp.where(mask[: cfg.output_size, None], out, 0)

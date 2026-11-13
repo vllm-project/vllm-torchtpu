@@ -152,6 +152,7 @@ _TPU_DUAL_DEVICE_GENERATIONS = ("v7", "tpu7x")
 
 # TPU v8i / TPU8i generations.
 _TPU_8I_GENERATIONS = ("v8i", "tpu8i")
+_DS_V4_ARCHS = ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
 
 
 def get_tpu_multihost_topology(
@@ -494,6 +495,13 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_ITER_MODE",
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
+        "TPU_DEEPSEEK_V41_ENGRAM_DEBUG_VERIFY",
+        "TPU_ROPE_CACHE_TRUNCATE",
+        "TPU_ROPE_CACHE_ROW_MAJOR",
+        "TPU_MOE_SKIP_PADDED_TOKENS",
+        "TPU_MOE_DENSE_EXPERT_THRESHOLD",
+        "TPU_MOE_COLLECTION_CHUNK_SIZE",
+        "USE_MOE_FUSED_EP_KERNEL",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "TPU_DP_VOCAB_PARALLEL",
         "MOE_FUSED_EP_ENABLE_W4A8",
@@ -508,6 +516,44 @@ class TpuPlatform(Platform):
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
+        "VLLM_DSV41_CED",
+        "VLLM_DSV41_PURE_20L_PREFILL",
+        "VLLM_DSV41_CSA_UNION",
+        "VLLM_DSV41_REPL_SHARED_EXPERTS",
+        "VLLM_DSV41_FUSED_SEAM_QUANT",
+        "VLLM_DSV41_FUSED_Q_ROPE",
+        "VLLM_DSV41_TP_ATTN",
+        "VLLM_DSV41_TP_ATTN_TP8",
+        "VLLM_DSV41_TP_ATTN_MIN_TOKENS",
+        "VLLM_DSV41_TP_INDEXER",
+        "VLLM_DSV41_TP_INDEXER_MIN_TOKENS",
+        "VLLM_DSV41_TP_ATTN_LOCAL_TOPK",
+        "VLLM_DSV41_MOE_EP_V2_ALL39",
+        "VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS",
+        "VLLM_DSV41_MOE_FP8_PATH_C_MAX_TOKENS",
+        "VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS",
+        "VLLM_DSV41_MOE_V2_SUBCHANNEL_FP8",
+        "VLLM_DSV41_MOE_V2_REQUANTIZE",
+        "VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS",
+        "VLLM_DSV41_MOE_V2_CAPACITY",
+        "VLLM_DSV41_MOE_V2_COALESCED_PUSH",
+        "VLLM_DSV41_ENGRAM_H2D_PREFIX",
+        "VLLM_DSV41_SC_UNION_MAX_SHIFT",
+        "VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT",
+        "VLLM_DSV41_CSA_UNION_VERIFY_BQ",
+        "VLLM_DSV41_CSA_UNION_MAX_TOKENS",
+        "VLLM_DSV41_FAST_GROUPED_ATTN",
+        "VLLM_DSV41_MOE_V2_MAX_PREFETCH",
+        "VLLM_DSV41_MOE_V2_VMEM_MB",
+        "VLLM_DSV41_DECODER_TP_ATTN_VERIFY",
+        "VLLM_DSV41_ENCODER_CAND_MODE",
+        "VLLM_DSV41_DECODER_TP_ATTN_MIN_TOKENS",
+        "VLLM_DSV41_MOE_SUBLANE_TILING",
+        "VLLM_DSV41_MOE_FP4_GMM1_FP8",
+        "VLLM_DSV41_MOE_FP4_GMM2_FP8",
+        "VLLM_DSV41_MOE_FP4_BF16_LHS",
+        "VLLM_DSV41_FLASHMLA_TP8",
+        "VLLM_DSV41_DSPARK_SHARDED_CTX_KV",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -901,9 +947,8 @@ class TpuPlatform(Platform):
         else:
             backend = PallasAttentionBackend
         supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
-        if (
-            vllm_config.model_config is not None
-            and "DeepseekV4ForCausalLM" in vllm_config.model_config.architectures
+        if vllm_config.model_config is not None and any(
+            a in _DS_V4_ARCHS for a in vllm_config.model_config.architectures
         ):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
@@ -1021,15 +1066,18 @@ class TpuPlatform(Platform):
         from vllm.config.compilation import DynamicShapesType
 
         dynamic_shapes_config = compilation_config.dynamic_shapes_config
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
         if (
-            1 in compilation_config.compile_sizes
+            any(s <= tp_size for s in compilation_config.compile_sizes)
             and dynamic_shapes_config.type == DynamicShapesType.BACKED
         ):
             dynamic_shapes_config.type = DynamicShapesType.BACKED_SIZE_OBLIVIOUS
             logger.info(
-                "compile_sizes contains 1, which backed dynamic shapes "
-                "cannot compile (0/1 specialization); switching to "
-                "backed_size_oblivious dynamic shapes."
+                "compile_sizes contains size <= tp_size (%d), which backed "
+                "dynamic shapes cannot compile (0/1 specialization on "
+                "token-sharded dims); switching to backed_size_oblivious "
+                "dynamic shapes.",
+                tp_size,
             )
 
         model_config = vllm_config.model_config
@@ -1331,7 +1379,7 @@ class TpuPlatform(Platform):
                 )
                 or []
             )
-            is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
+            is_ds_v4 = any(name in a for a in architectures for name in _DS_V4_ARCHS)
 
             if is_ds_v4 and not cache_config.user_specified_block_size:
                 # DSv4 pages hold compressed rows. Its backend's
@@ -1355,7 +1403,7 @@ class TpuPlatform(Platform):
                 update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
             min_page_size = backend_cls.get_min_page_size(vllm_config)
-            if min_page_size > cache_config.block_size:
+            if not is_ds_v4 and min_page_size > cache_config.block_size:
                 logger.warning(
                     "Increase the page size from %s to %s to make sure there's"
                     "no SMEM OOM",

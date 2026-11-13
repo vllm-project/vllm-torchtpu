@@ -21,6 +21,7 @@ from vllm.model_executor.layers.quantization import (
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.utils import replace_parameter
 from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
 
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
@@ -36,9 +37,35 @@ from vllm_torchtpu.layers.core.quant_methods import (
     DEEPSEEK_V4_FP8,
     get_tpu_quant_method,
 )
+from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+class VllmDeepseekV41FlashFp8LinearMethod(VllmFp8LinearMethodTPU):
+    """FP8 linear method for DeepSeek-V4.1-Flash's 32x32 ue8m0 block-scaled layers."""
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        scale_inv = getattr(layer, "weight_scale_inv", None)
+        if scale_inv is not None and scale_inv.dtype == torch.float8_e8m0fnu:
+            # Decode the exponent bytes exactly instead of a dtype cast.
+            replace_parameter(
+                layer,
+                "weight_scale_inv",
+                e8m0_to_fp32(scale_inv.data.view(torch.uint8)),
+            )
+        dtype_name, dtype, block_size, _ = self._linear_quant_config
+        out_dim, in_dim = layer.weight.shape
+        if block_size is not None and (
+            # The fused o-projection reads a per-channel scale.
+            self.prefix.endswith(".wo_a")
+            # Blockwise requantization needs whole blocks.
+            or in_dim % block_size
+            or out_dim % 128
+        ):
+            self._linear_quant_config = (dtype_name, dtype, None, False)
+        super().process_weights_after_loading(layer)
 
 
 @register_quantization_config(DEEPSEEK_V4_FP8)
@@ -50,7 +77,8 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
     Dispatches MoE quant methods based on the checkpoint's expert_dtype:
       - "fp4" → VllmDeepseekV4Mxfp4MoEMethod
       - "fp8" → VllmFp8MoEMethodTPU
-    Linear layers always use VllmFp8LinearMethodTPU (FP8 block-quant).
+    Linear layers use VllmFp8LinearMethodTPU (FP8 block-quant), or
+    VllmDeepseekV41FlashFp8LinearMethod for V4.1-Flash's 32x32 ue8m0 layout.
     """
 
     @property
@@ -70,6 +98,15 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
     def get_name(cls) -> QuantizationMethods:
         return DEEPSEEK_V4_FP8
 
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
+        # This class replaces the fork's registration, but the V4 base claims
+        # model_type deepseek_v4 only; V4.1 checkpoints use the same format.
+        model_type = getattr(hf_config, "model_type", None)
+        if model_type in ("deepseek_v41", "deepseek_v41_text"):
+            user_quant = DEEPSEEK_V4_FP8
+        return super().override_quantization_method(hf_quant_cfg, user_quant, hf_config)
+
     def get_quant_method(
         self,
         layer: torch.nn.Module,
@@ -87,6 +124,11 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
                 )
 
                 return VllmUnquantizedLinearMethod()
+            # Same layout test as the fork's V4.1 quant config.
+            if self.weight_block_size == [32, 32] and self.is_scale_e8m0:
+                return VllmDeepseekV41FlashFp8LinearMethod(
+                    self, linear_config, prefix=prefix
+                )
             return VllmFp8LinearMethodTPU(self, linear_config, prefix=prefix)
         elif isinstance(layer, RoutedExperts):
             if is_layer_skipped(

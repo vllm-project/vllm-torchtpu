@@ -27,6 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.utils import PPMissingLayer
 
+from vllm_torchtpu.distributed.tp_collectives import tp_all_gather
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
     SequenceLayoutPlan,
@@ -35,6 +36,301 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
+
+def _get_shard_meta_tensors(
+    lm_head: torch.nn.Module, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cached = getattr(lm_head, "_tp_shard_meta_dev", None)
+    if cached is not None and cached[0].device == device:
+        return cached
+    start_t = torch.tensor(
+        [int(lm_head.shard_indices.org_vocab_start_index)],
+        dtype=torch.int32,
+        device=device,
+    )
+    valid_t = torch.tensor(
+        [
+            int(
+                lm_head.shard_indices.org_vocab_end_index
+                - lm_head.shard_indices.org_vocab_start_index
+            )
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    pair = (start_t, valid_t)
+    object.__setattr__(lm_head, "_tp_shard_meta_dev", pair)
+    return pair
+
+
+def tp_local_argmax_logits(
+    logits_processor,
+    lm_head: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    bias_local: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute global argmax across TP-sharded lm_head without all-gathering full vocab."""
+    tp_size = getattr(lm_head, "tp_size", 1)
+    if tp_size <= 1:
+        logits = logits_processor(lm_head, hidden_states)
+        if bias_local is not None:
+            logits = logits + bias_local
+        return logits.argmax(dim=-1)
+
+    logits_local = logits_processor._get_logits(
+        hidden_states, lm_head, None, skip_gather=True
+    )
+    if bias_local is not None:
+        logits_local = logits_local + bias_local
+    start_t, valid_t = _get_shard_meta_tensors(lm_head, logits_local.device)
+    col_mask = (
+        torch.arange(logits_local.shape[-1], device=logits_local.device) >= valid_t
+    )
+    logits_local = logits_local.masked_fill(col_mask, float("-inf"))
+    local_val, local_idx = logits_local.max(dim=-1)
+    global_idx = local_idx.to(torch.int32) + start_t
+    packed = torch.stack(
+        [local_val.to(torch.float32).view(torch.int32), global_idx], dim=-1
+    )
+    gathered = tp_all_gather(packed, dim=0).view(
+        tp_size, packed.shape[0], 2
+    )
+    all_vals = gathered[..., 0].view(torch.float32)
+    all_idxs = gathered[..., 1]
+    best_rank = all_vals.argmax(dim=0, keepdim=True)
+    return all_idxs.gather(0, best_rank).squeeze(0).to(torch.int64)
+
+
+def _stateless_counter_uniform_u(
+    row_indices: torch.Tensor,
+    col_indices: torch.Tensor,
+    seed_i32: torch.Tensor,
+    min_val: float = 1e-4,
+    span: float = 0.9998,
+) -> torch.Tensor:
+    """Zero-HBM 3-round bijective 32-bit counter hash in pure s32 VPU ALU."""
+    h = (
+        row_indices.to(torch.int32) * 0x5BD1E995
+        ^ (col_indices.to(torch.int32) * 0x27D4EB2F)
+        ^ seed_i32.to(torch.int32)
+    )
+    h = (h ^ ((h >> 16) & 0xFFFF)) * 0x7FEB352D
+    h = (h ^ ((h >> 15) & 0x1FFFF)) * 0x165667B1
+    h = h ^ ((h >> 16) & 0xFFFF)
+    return ((h & 0x007FFFFF).to(torch.float32) + 0.5) * (span / 8388608.0) + min_val
+
+
+def tp_local_random_spec_verify_logits(
+    logits_processor,
+    lm_head: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    inv_temperatures_per_tok: torch.Tensor,
+    row_draft_token_ids: torch.Tensor,
+    seed_lo: torch.Tensor,
+    u_local: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute exact global logsumexp, draft logit, and Gumbel-sampled token IDs across TP shards.
+
+    Avoids materializing or AllGathering full-vocabulary [N, V] logits OR [N, V_shard] float32 uniform
+    tensors in HBM by generating stateless counter-hash uniform variates in VPU registers when u_local
+    is None and reducing each local shard to [N, 4] int32-bitcast scalars before tp_all_gather.
+    """
+    tp_size = getattr(lm_head, "tp_size", 1)
+    if tp_size <= 1:
+        logits_full = (
+            logits_processor(lm_head, hidden_states).to(torch.float32)
+            * inv_temperatures_per_tok
+        )
+        global_lse = torch.logsumexp(logits_full, dim=-1)
+        safe_d = row_draft_token_ids.clamp(min=0, max=logits_full.shape[-1] - 1)
+        draft_logit = torch.where(
+            row_draft_token_ids.squeeze(-1) >= 0,
+            logits_full.gather(-1, safe_d.to(torch.int64)).squeeze(-1),
+            torch.full(
+                (logits_full.shape[0],),
+                -1e30,
+                dtype=torch.float32,
+                device=logits_full.device,
+            ),
+        )
+        v_cols = torch.arange(
+            logits_full.shape[-1], dtype=torch.int32, device=logits_full.device
+        ).unsqueeze(0)
+        if u_local is None:
+            row_idx = torch.arange(
+                logits_full.shape[0], dtype=torch.int32, device=logits_full.device
+            ).unsqueeze(1)
+            u_eff = _stateless_counter_uniform_u(row_idx, v_cols, seed_lo)
+        else:
+            u_eff = u_local
+        gumbel_noise = -torch.log(-torch.log(u_eff) + 1e-30)
+        scores = torch.where(
+            v_cols == row_draft_token_ids,
+            torch.full_like(logits_full, -1e30),
+            logits_full + gumbel_noise,
+        )
+        sampled_ids = scores.argmax(dim=-1).to(torch.int32)
+        return global_lse, draft_logit, sampled_ids
+
+    logits_local = (
+        logits_processor._get_logits(
+            hidden_states, lm_head, None, skip_gather=True
+        ).to(torch.float32)
+        * inv_temperatures_per_tok
+    )
+    start_t, valid_t = _get_shard_meta_tensors(lm_head, logits_local.device)
+    shard_cols = torch.arange(
+        logits_local.shape[-1], dtype=torch.int32, device=logits_local.device
+    )
+    col_mask = shard_cols >= valid_t
+    logits_local = logits_local.masked_fill(col_mask, float("-inf"))
+    local_lse = torch.logsumexp(logits_local, dim=-1, keepdim=True)
+
+    global_cols = shard_cols.unsqueeze(0) + start_t
+    in_shard = (row_draft_token_ids >= start_t) & (
+        row_draft_token_ids < (start_t + valid_t)
+    )
+    local_draft_idx = (row_draft_token_ids - start_t).clamp(
+        min=0, max=logits_local.shape[-1] - 1
+    )
+    local_draft_logit = torch.where(
+        in_shard,
+        logits_local.gather(-1, local_draft_idx.to(torch.int64)),
+        torch.full(
+            (logits_local.shape[0], 1),
+            -1e30,
+            dtype=torch.float32,
+            device=logits_local.device,
+        ),
+    )
+
+    if u_local is None:
+        row_idx = torch.arange(
+            logits_local.shape[0], dtype=torch.int32, device=logits_local.device
+        ).unsqueeze(1)
+        u_eff = _stateless_counter_uniform_u(row_idx, global_cols, seed_lo)
+    else:
+        u_eff = u_local
+    gumbel_noise = -torch.log(-torch.log(u_eff) + 1e-30)
+    gumbel_scores = torch.where(
+        global_cols == row_draft_token_ids,
+        torch.full_like(logits_local, -1e30),
+        logits_local + gumbel_noise,
+    )
+    local_best_score, local_best_idx = gumbel_scores.max(dim=-1, keepdim=True)
+    global_idx = local_best_idx.to(torch.int32) + start_t
+
+    packed = torch.cat(
+        [
+            local_lse.view(torch.int32),
+            local_draft_logit.view(torch.int32),
+            local_best_score.view(torch.int32),
+            global_idx,
+        ],
+        dim=-1,
+    )
+    n_rows, raw_width = packed.shape[0], packed.shape[1]
+    pad_width = ((raw_width + 127) // 128) * 128
+    packed_aligned = (
+        torch.cat((packed, torch.zeros((*packed.shape[:-1], pad_width - raw_width), dtype=packed.dtype, device=packed.device)), dim=-1)
+        if pad_width > raw_width
+        else packed
+    )
+    gathered = tp_all_gather(packed_aligned, dim=0).view(
+        tp_size, n_rows, pad_width
+    )[..., :raw_width]
+
+    global_lse = torch.logsumexp(gathered[..., 0].view(torch.float32), dim=0)
+    global_draft_logit = gathered[..., 1].view(torch.float32).max(dim=0).values
+    winner_rank = gathered[..., 2].view(torch.float32).argmax(dim=0, keepdim=True)
+    sampled_ids = gathered[..., 3].gather(0, winner_rank).squeeze(0).to(torch.int32)
+    return global_lse, global_draft_logit, sampled_ids
+
+
+def tp_local_topk_logits(
+    logits_processor,
+    lm_head: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    k_top: int,
+) -> torch.Tensor:
+    """Compute exact global logsumexp + max tie rank + top-k (values, token_ids) with 128-lane aligned ICI gather."""
+    k_eff = max(int(k_top), 1)
+    tp_size = getattr(lm_head, "tp_size", 1)
+    if tp_size <= 1:
+        logits = logits_processor(lm_head, hidden_states)
+        lse = torch.logsumexp(logits.to(torch.float32), dim=-1, keepdim=True)
+        top_v, top_i = torch.topk(logits, k_eff, dim=-1)
+        exact_rank = (logits >= top_v[:, 0:1]).sum(
+            dim=-1, keepdim=True, dtype=torch.int32
+        )
+        return torch.cat(
+            [
+                lse.view(torch.int32),
+                exact_rank,
+                top_v.to(torch.float32).view(torch.int32),
+                top_i.to(torch.int32),
+            ],
+            dim=-1,
+        )
+
+    logits_local = logits_processor._get_logits(
+        hidden_states, lm_head, None, skip_gather=True
+    )
+    start_t, valid_t = _get_shard_meta_tensors(lm_head, logits_local.device)
+    col_mask = (
+        torch.arange(logits_local.shape[-1], device=logits_local.device) >= valid_t
+    )
+    logits_local = logits_local.masked_fill(col_mask, float("-inf"))
+    local_lse = torch.logsumexp(logits_local.to(torch.float32), dim=-1, keepdim=True)
+    local_v, local_i = torch.topk(logits_local, k_eff, dim=-1)
+    local_ties = (logits_local >= local_v[:, 0:1]).sum(
+        dim=-1, keepdim=True, dtype=torch.int32
+    )
+    global_i = local_i.to(torch.int32) + start_t
+    packed = torch.cat(
+        [
+            local_lse.view(torch.int32),
+            local_ties,
+            local_v.to(torch.float32).view(torch.int32),
+            global_i,
+        ],
+        dim=-1,
+    )
+    n_rows, raw_width = packed.shape[0], packed.shape[1]
+    pad_width = ((raw_width + 127) // 128) * 128
+    packed_aligned = (
+        torch.cat((packed, torch.zeros((*packed.shape[:-1], pad_width - raw_width), dtype=packed.dtype, device=packed.device)), dim=-1)
+        if pad_width > raw_width
+        else packed
+    )
+    gathered = tp_all_gather(packed_aligned, dim=0).view(
+        tp_size, n_rows, pad_width
+    )[..., :raw_width]
+    all_lse = gathered[..., 0:1].view(torch.float32)
+    global_lse = torch.logsumexp(all_lse, dim=0)
+    merged_v = (
+        gathered[..., 2 : 2 + k_eff]
+        .view(torch.float32)
+        .permute(1, 0, 2)
+        .reshape(n_rows, tp_size * k_eff)
+    )
+    merged_i = (
+        gathered[..., 2 + k_eff :]
+        .permute(1, 0, 2)
+        .reshape(n_rows, tp_size * k_eff)
+    )
+    top_v, sel = torch.topk(merged_v, k_eff, dim=-1)
+    top_i = merged_i.gather(-1, sel)
+    shard_max = gathered[..., 2:3].view(torch.float32)
+    shard_ties = gathered[..., 1:2]
+    exact_rank = torch.where(
+        shard_max == top_v[:, 0:1].unsqueeze(0), shard_ties, 0
+    ).sum(dim=0, dtype=torch.int32)
+    return torch.cat(
+        [global_lse.view(torch.int32), exact_rank, top_v.view(torch.int32), top_i],
+        dim=-1,
+    )
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.interfaces import SupportsMultiModal

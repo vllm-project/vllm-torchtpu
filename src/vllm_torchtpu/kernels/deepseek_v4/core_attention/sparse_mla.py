@@ -91,7 +91,7 @@ def gather_page_ids(
     seq_ids_segment: jax.Array,  # i32[num_tokens]  (token -> seq id)
     max_num_seqs: int,
     *,
-    block_tokens: int = 8,
+    block_tokens: int = 128,
 ) -> jax.Array:
     """Gathers physical page ids for the CSA top-k tokens."""
     num_tokens, topk = seq_page_ids.shape
@@ -106,7 +106,8 @@ def gather_page_ids(
     windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
     logical = jnp.clip(seq_page_ids, 0, pages_per_seq - 1)
 
-    padded_tokens = align_to(num_tokens, block_tokens)
+    eff_block_tokens = min(block_tokens, max(8, align_to(num_tokens, 8)))
+    padded_tokens = align_to(num_tokens, eff_block_tokens)
     if padded_tokens != num_tokens:
         pad = padded_tokens - num_tokens
         windows = jnp.pad(windows, ((0, pad), (0, 0)))
@@ -117,11 +118,11 @@ def gather_page_ids(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
-                pl.BlockSpec((block_tokens, padded_pps), lambda t: (t, 0)),
-                pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
+                pl.BlockSpec((eff_block_tokens, padded_pps), lambda t: (t, 0)),
+                pl.BlockSpec((eff_block_tokens, topk), lambda t: (t, 0)),
             ],
-            out_specs=pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
-            grid=(padded_tokens // block_tokens,),
+            out_specs=pl.BlockSpec((eff_block_tokens, topk), lambda t: (t, 0)),
+            grid=(padded_tokens // eff_block_tokens,),
         ),
         out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
         compiler_params=pltpu.CompilerParams(
@@ -141,16 +142,37 @@ NOPE_DIM = 448
 NOPE_SCALE_PERIOD = 64
 
 
+def _nope_byte_planes(nope: jax.Array) -> list[jax.Array]:
+    """The four 128-lane uint8 planes of a gathered NoPE record block.
+
+    Plane b holds record bytes [128 b, 128 b + 128): planes 0..2 and the low
+    half of plane 3 are the 448 fp8 NoPE dims, the upper half of plane 3 the
+    64 e8m0 scales. Two input views are accepted:
+
+      * int32 [rows, 128] words as csa_gather writes them (byte b of word w is
+        record byte 128 b + w, see `csa_cache_layout`): each plane is one byte
+        shift, so no sublane relayout is needed (upstream load_bkv).
+      * uint8 [rows, 512] records in dim order (the DSv4.1 kernels reshape
+        their uint8 VMEM scratch this way): each plane is a lane-aligned slice.
+    """
+    if nope.dtype == jnp.uint8:
+        assert nope.shape[-1] == 4 * 128, nope.shape
+        return [nope[:, 128 * b : 128 * (b + 1)] for b in range(4)]
+    assert nope.dtype == jnp.int32 and nope.shape[-1] == 128, (nope.dtype, nope.shape)
+    return [lax.shift_right_logical(nope, 8 * b).astype(jnp.uint8) for b in range(4)]
+
+
 def _dequant_dsv4_fp8(words: jax.Array):
     """Dequantize gathered NoPE records to BF16 [rows, NOPE_DIM].
 
-    `words` is int32 [rows, 128], byte b of word w holding record byte
-    128 b + w (see `csa_cache_layout`). Each byte plane is converted on its own
+    `words` is either int32 [rows, 128] (byte b of word w holding record byte
+    128 b + w, see `csa_cache_layout`) or uint8 [rows, 512] in record dim
+    order; see `_nope_byte_planes`. Each byte plane is converted on its own
     and the planes are joined along lanes, which is the record in dim order; a
     uint8 [4 rows, 128] -> [rows, 512] reshape first would relayout every byte
     across sublanes.
     """
-    planes = [lax.shift_right_logical(words, 8 * b).astype(jnp.uint8) for b in range(4)]
+    planes = _nope_byte_planes(words)
     nope_fp8 = jnp.concatenate(
         [
             pltpu.bitcast(plane, jnp.float8_e4m3fn).astype(jnp.bfloat16)
@@ -166,6 +188,43 @@ def _dequant_dsv4_fp8(words: jax.Array):
     )
     nope_scales = jnp.concatenate([tile] * 4, axis=1)[:, :NOPE_DIM]
     return (nope_fp8 * nope_scales).astype(jnp.bfloat16)
+
+
+def _dequant_and_merge_bkv(
+    words: jax.Array,
+    bkv_rope: jax.Array,
+    lane_128: jax.Array | None = None,
+) -> jax.Array:
+    """128-lane-aligned FP8 dequantization + RoPE half-row merge into [bkv_sz, 512].
+
+    `words` is the NoPE record block in either of the views accepted by
+    `_nope_byte_planes` (int32 [bkv_sz, 128] words or uint8 [bkv_sz, 512]).
+    `bkv_rope` is the gathered bf16 [bkv_sz // 2, 128] block pairing entry i
+    (lanes 0:64) with entry i + bkv_sz // 2 (lanes 64:128). The RoPE values
+    are merged straight into the upper half of the last 128-lane tile, so no
+    448-lane slice/concatenate is needed.
+    """
+    bkv_sz = words.shape[0]
+    if lane_128 is None:
+        lane_128 = lax.broadcasted_iota(jnp.int32, (bkv_sz, 128), 1)
+    planes = _nope_byte_planes(words)
+    tail = pltpu.bitcast(planes[3], jnp.float8_e8m0fnu).astype(jnp.bfloat16)
+    scale_tile = jnp.where(
+        lane_128 < NOPE_SCALE_PERIOD,
+        pltpu.roll(tail, NOPE_SCALE_PERIOD, 1),
+        tail,
+    )
+    nope_tiles = [
+        (
+            pltpu.bitcast(plane, jnp.float8_e4m3fn).astype(jnp.bfloat16) * scale_tile
+        ).astype(jnp.bfloat16)
+        for plane in planes
+    ]
+
+    bkv_rope_rot = pltpu.roll(bkv_rope, NOPE_SCALE_PERIOD, 1)
+    rope_hi = jnp.concatenate([bkv_rope_rot, bkv_rope], axis=0)
+    tile3 = jnp.where(lane_128 < NOPE_SCALE_PERIOD, nope_tiles[3], rope_hi)
+    return jnp.concatenate(nope_tiles[:3] + [tile3], axis=1)
 
 
 def _attention_kernel(
@@ -223,6 +282,9 @@ def _attention_kernel(
 
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
+    lane_128 = lax.broadcasted_iota(jnp.int32, (bkv_sz, 128), 1)
+    k_span_512 = lax.broadcasted_iota(jnp.int32, (bkv_sz, head_dim), 0)
+    k_span_s = lax.broadcasted_iota(jnp.int32, (num_q_heads, bkv_sz), 1)
 
     def flash_attention_step1_qk_softmax(
         q,  # [bq_sz * num_q_heads, head_dim]
@@ -243,7 +305,11 @@ def _attention_kernel(
         s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
         s *= sm_scale
         if masked:
-            k_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+            k_span = (
+                k_span_s
+                if s.shape == (num_q_heads, bkv_sz)
+                else lax.broadcasted_iota(jnp.int32, s.shape, 1)
+            )
             s = jnp.where(k_span < kv_len, s, jnp.finfo(s.dtype).min)
 
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
@@ -417,19 +483,24 @@ def _attention_kernel(
     def load_bkv(bkv_sem_idx, batch_idx, masked):
         # The gathered NoPE rows as the int32 words csa_gather wrote.
         words = bkv_nope_x2_ref.bitcast(jnp.int32).at[bkv_sem_idx, batch_idx][...]
-        bkv_nope = _dequant_dsv4_fp8(words)
 
         # The gathered rope block is [bkv_sz // 2, 2 * rope_dim]: entry i in
         # lanes 0:rope_dim, entry i + bkv_sz // 2 in the upper half (see
-        # csa_gather). Mosaic has no [m, 2n] -> [2m, n] shape cast, but the
-        # lane slice + row concatenate below is one lane rotate per vreg.
+        # csa_gather).
         bkv_rope = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx][...]
         bkv_rope = bkv_rope.reshape(bkv_sz // 2, -1)
-        rope_dim = bkv_rope.shape[-1] // 2
-        bkv_rope = jnp.concatenate(
-            [bkv_rope[:, :rope_dim], bkv_rope[:, rope_dim:]], axis=0
-        )
-        bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+        if head_dim == 512 and bkv_rope.shape[1] == 128:
+            # Fused dequant + RoPE merge on 128-lane aligned tiles.
+            bkv = _dequant_and_merge_bkv(words, bkv_rope, lane_128)
+        else:
+            bkv_nope = _dequant_dsv4_fp8(words)
+            # Mosaic has no [m, 2n] -> [2m, n] shape cast, but the lane slice +
+            # row concatenate below is one lane rotate per vreg.
+            rope_dim = bkv_rope.shape[-1] // 2
+            bkv_rope = jnp.concatenate(
+                [bkv_rope[:, :rope_dim], bkv_rope[:, rope_dim:]], axis=0
+            )
+            bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
 
         # In vLLM, multiple caches may overlay on the same KV Tensor. For example,
         # compressor state cache write data in bfloat16 / float32 format, certain
@@ -439,7 +510,11 @@ def _attention_kernel(
         # to the downstream computation.
         if masked:
             kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            k_span = (
+                k_span_512
+                if bkv.shape == (bkv_sz, head_dim)
+                else lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            )
             bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
@@ -477,7 +552,6 @@ def _attention_kernel(
         prev_exp_m_diff = None
         prev_l = None
         prev_swa_acc = None
-        prev_out = None
 
         # Wait for cur blocks if not ready yet
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
@@ -491,14 +565,6 @@ def _attention_kernel(
         for batch_idx in range(batch_size):
             bkv = load_bkv(bi_sem_idx, batch_idx, masked)
             bq = load_bq(bi_sem_idx, batch_idx)
-
-            if prev_out is not None:
-                # Artificial dependency to force MXU/VPU interleaving by limiting
-                # LLO's QK runahead
-                # We use jnp.where to prevent XLA from optimizing the dependency away.
-                # prev_out won't be inf in practice.
-                bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
-
             swa_acc, swa_l, swa_m = load_swa_output(bi_sem_idx, batch_idx)
 
             p, exp_m_diff, l_total = flash_attention_step1_qk_softmax(
@@ -525,7 +591,6 @@ def _attention_kernel(
 
                 # Store output from acc to bo.
                 bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out
-                prev_out = out
 
             prev_p = p
             prev_bkv = bkv
@@ -583,15 +648,16 @@ def prepare_q_inputs(
     q_packing = get_dtype_packing(q.dtype)
     num_q_heads = align_to(actual_num_q_heads, q_packing)
     head_dim = align_to(actual_head_dim, 128)
-    q = jnp.pad(
-        q,
-        (
-            (0, 0),
-            (0, num_q_heads - actual_num_q_heads),
-            (0, head_dim - actual_head_dim),
-        ),
-        constant_values=0,
-    )
+    if num_q_heads != actual_num_q_heads or head_dim != actual_head_dim:
+        q = jnp.pad(
+            q,
+            (
+                (0, 0),
+                (0, num_q_heads - actual_num_q_heads),
+                (0, head_dim - actual_head_dim),
+            ),
+            constant_values=0,
+        )
     return q
 
 
@@ -604,32 +670,34 @@ def prepare_swa_inputs(
     swa_packing = get_dtype_packing(swa_accumution.dtype)
     num_q_heads = align_to(actual_num_q_heads, swa_packing)
     head_dim = align_to(actual_head_dim, 128)
-    swa_accumution = jnp.pad(
-        swa_accumution,
-        (
-            (0, 0),
-            (0, num_q_heads - actual_num_q_heads),
-            (0, head_dim - actual_head_dim),
-        ),
-        constant_values=0,
-    )
+    if num_q_heads != actual_num_q_heads or head_dim != actual_head_dim:
+        swa_accumution = jnp.pad(
+            swa_accumution,
+            (
+                (0, 0),
+                (0, num_q_heads - actual_num_q_heads),
+                (0, head_dim - actual_head_dim),
+            ),
+            constant_values=0,
+        )
     num_l_heads = align_to(num_q_heads, 128)
-    swa_l = jnp.pad(
-        swa_l,
-        (
-            (0, 0),
-            (0, num_l_heads - actual_num_q_heads),
-        ),
-        constant_values=0,
-    )
-    swa_m = jnp.pad(
-        swa_m,
-        (
-            (0, 0),
-            (0, num_l_heads - actual_num_q_heads),
-        ),
-        constant_values=0,
-    )
+    if swa_l.shape[1] != num_l_heads:
+        swa_l = jnp.pad(
+            swa_l,
+            (
+                (0, 0),
+                (0, num_l_heads - swa_l.shape[1]),
+            ),
+            constant_values=0,
+        )
+        swa_m = jnp.pad(
+            swa_m,
+            (
+                (0, 0),
+                (0, num_l_heads - swa_m.shape[1]),
+            ),
+            constant_values=0,
+        )
     return swa_accumution, swa_l, swa_m
 
 
@@ -638,6 +706,8 @@ def prepare_outputs(
     actual_num_q_heads: int,
     actual_head_dim: int,
 ):
+    if out.shape[1] == actual_num_q_heads and out.shape[2] == actual_head_dim:
+        return out
     return out[:, :actual_num_q_heads, :actual_head_dim]
 
 
@@ -704,11 +774,12 @@ def sparse_ragged_paged_attention(
 
     q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
     head_dim = q.shape[-1]
-    attention_sinks = jnp.pad(
-        attention_sinks,
-        (0, q.shape[1] - actual_num_q_heads),
-        constant_values=jnp.finfo(attention_sinks.dtype).min,
-    )
+    if q.shape[1] != actual_num_q_heads:
+        attention_sinks = jnp.pad(
+            attention_sinks,
+            (0, q.shape[1] - actual_num_q_heads),
+            constant_values=jnp.finfo(attention_sinks.dtype).min,
+        )
     assert swa_accumution.dtype == q.dtype
     swa_accumution, swa_l, swa_m = prepare_swa_inputs(swa_accumution, swa_l, swa_m)
 

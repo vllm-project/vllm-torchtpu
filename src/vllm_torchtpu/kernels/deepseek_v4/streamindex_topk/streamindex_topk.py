@@ -784,15 +784,16 @@ def prepare_q_inputs(
     q_packing = get_dtype_packing(q.dtype)
     num_q_heads = align_to(actual_num_q_heads, q_packing)
     head_dim = align_to(actual_head_dim, 128)
-    q = jnp.pad(
-        q,
-        (
-            (0, 0),
-            (0, num_q_heads - actual_num_q_heads),
-            (0, head_dim - actual_head_dim),
-        ),
-        constant_values=0,
-    )
+    if num_q_heads != actual_num_q_heads or head_dim != actual_head_dim:
+        q = jnp.pad(
+            q,
+            (
+                (0, 0),
+                (0, num_q_heads - actual_num_q_heads),
+                (0, head_dim - actual_head_dim),
+            ),
+            constant_values=0,
+        )
     return q
 
 
@@ -801,16 +802,18 @@ def prepare_index_weights(
     q_dtype,
 ):
     _, actual_num_q_heads = index_weights.shape
-    index_weights = index_weights.astype(jnp.float32)
+    if index_weights.dtype != jnp.float32:
+        index_weights = index_weights.astype(jnp.float32)
     num_q_heads = align_to(actual_num_q_heads, get_dtype_packing(q_dtype))
-    index_weights = jnp.pad(
-        index_weights,
-        (
-            (0, 0),
-            (0, num_q_heads - actual_num_q_heads),
-        ),
-        constant_values=0,
-    )
+    if num_q_heads != actual_num_q_heads:
+        index_weights = jnp.pad(
+            index_weights,
+            (
+                (0, 0),
+                (0, num_q_heads - actual_num_q_heads),
+            ),
+            constant_values=0,
+        )
     return index_weights
 
 

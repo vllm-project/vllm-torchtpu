@@ -82,7 +82,8 @@ def pallas_select(scores, topk=10, block_rows=256, weight_scores=None, interpret
     lowering. Serving never sets it.
     """
     R, N = scores.shape
-    assert R % block_rows == 0, (R, block_rows)
+    if block_rows % 8 != 0 or R % block_rows != 0:
+        block_rows = R
     if weight_scores is not None and weight_scores.shape != scores.shape:
         raise ValueError(
             f"weight_scores {weight_scores.shape} must match scores {scores.shape}"

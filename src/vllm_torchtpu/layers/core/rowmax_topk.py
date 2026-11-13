@@ -25,12 +25,21 @@ import torch
 NEG = -3.0e38
 
 
-def rowmax_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+def rowmax_topk(
+    scores: torch.Tensor,
+    k: int,
+    raw_scores: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """``torch.topk(scores, k, dim=-1)`` without the sort.
 
     Returns ``(values, indices)``, values descending and indices int32. Ties
     resolve to the lowest expert id; the sort path leaves them undefined,
     since torch_tpu emits ``is_stable=false``.
+
+    When ``raw_scores`` is provided (e.g. unbiased scores paired with biased
+    ``scores`` for expert choice), the returned weights are extracted directly
+    from ``raw_scores`` at each pass's selected column without materializing a
+    post-pass 3D ``[rows, k, experts]`` mask tensor.
 
     Scores at or below ``NEG`` are clamped up to it, so every returned index
     is a real expert. A row made entirely of such scores keeps NaN weights and
@@ -49,13 +58,18 @@ def rowmax_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tenso
         # Lowest column attaining the max; the rest fill with the last expert
         # so the min never selects a phantom.
         idx = torch.amin(torch.where(cur == m, iota, n - 1), dim=-1, keepdim=True)
-        values.append(m)
+        sel = iota == idx
+        if raw_scores is not None:
+            values.append(torch.where(sel, raw_scores, 0).sum(dim=-1, keepdim=True))
+        else:
+            values.append(m)
         indices.append(idx)
-        cur = torch.where(iota == idx, masked, cur)
+        cur = torch.where(sel, masked, cur)
 
     weights = torch.cat(values, dim=-1)
     ids = torch.cat(indices, dim=-1)
-    # No score above the sentinel means no real maximum: keep the row
-    # poisonous so the caller's renormalization propagates it.
-    weights = torch.where(weights[..., :1] <= NEG, torch.nan, weights)
+    if raw_scores is None:
+        # No score above the sentinel means no real maximum: keep the row
+        # poisonous so the caller's renormalization propagates it.
+        weights = torch.where(weights[..., :1] <= NEG, torch.nan, weights)
     return weights, ids

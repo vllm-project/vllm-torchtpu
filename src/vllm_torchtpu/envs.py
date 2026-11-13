@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     RAIDEN_STORAGE_CAPACITY_GB: str = ""
     RAIDEN_STORAGE_PROPERTIES: str = ""
     EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK: bool = False
+    VLLM_TPU_MOE_FP8_DISPATCH: bool = False
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
@@ -213,6 +214,53 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    TPU_DEEPSEEK_V41_ENGRAM_DEBUG_VERIFY: bool = False
+    VLLM_DSV41_CED: bool = False
+    VLLM_DSV41_HYBRID_CED_DECODE: bool = False
+    VLLM_DSV41_PURE_20L_PREFILL: bool = False
+    VLLM_DSV41_CSA_UNION: bool = True
+    VLLM_DSV41_CSA_UNION_M: int = 0
+    VLLM_DSV41_CSA_UNION_BQ: int = 32
+    VLLM_DSV41_FUSED_SEAM_QUANT: bool = True
+    VLLM_DSV41_FUSED_Q_ROPE: bool = False
+    VLLM_DSV41_TP_ATTN: bool = False
+    VLLM_DSV41_TP_ATTN_MIN_TOKENS: int = 0
+    VLLM_DSV41_TP_INDEXER: bool = False
+    VLLM_DSV41_TP_INDEXER_MIN_TOKENS: int = 64
+    VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS: int = 0
+    VLLM_DSV41_TP_ATTN_LOCAL_TOPK: bool = False
+    VLLM_DSV41_ENGRAM_H2D_PREFIX: bool = True
+    VLLM_DSV41_MOE_V2_REQUANTIZE: bool = True
+    VLLM_DSV41_MOE_V2_SUBCHANNEL_FP8: bool = True
+    VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS: int = 768
+    VLLM_DSV41_REPL_SHARED_EXPERTS: bool = False
+    VLLM_DSV41_TP_ATTN_TP8: bool = False
+    VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS: int = 0
+    VLLM_DSV41_MOE_FP8_PATH_C_MAX_TOKENS: int = 512
+    VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS: int | None = None
+    VLLM_DSV41_MOE_EP_V2_ALL39: bool = True
+    VLLM_DSV41_MOE_V2_CAPACITY: int | None = None
+    VLLM_DSV41_MOE_V2_COALESCED_PUSH: bool = False
+    ENABLE_DECODE_BENCH_CONNECTOR: bool = False
+    VLLM_XLA_CACHE_PATH: str = "/tmp/xla_cache"
+    VLLM_DSV41_SC_UNION_MAX_SHIFT: int = 9
+    VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT: int | None = None
+    VLLM_DSV41_CSA_UNION_VERIFY_BQ: int = 0
+    VLLM_DSV41_CSA_UNION_MAX_TOKENS: int = 16384
+    VLLM_DSV41_CSA_FUSED_MAX_TOKENS: int = 384
+    VLLM_DSV41_STREAMIDX_SCHED_GROUPS: bool = True
+    VLLM_DSV41_FAST_GROUPED_ATTN: bool = True
+    VLLM_DSV41_MOE_V2_MAX_PREFETCH: int = 2
+    VLLM_DSV41_MOE_V2_VMEM_MB: float | None = None
+    VLLM_DSV41_DECODER_TP_ATTN_VERIFY: bool = False
+    VLLM_DSV41_ENCODER_CAND_MODE: bool = True
+    VLLM_DSV41_DECODER_TP_ATTN_MIN_TOKENS: int = 1024
+    VLLM_DSV41_MOE_SUBLANE_TILING: bool = True
+    VLLM_DSV41_MOE_FP4_GMM1_FP8: bool = True
+    VLLM_DSV41_MOE_FP4_GMM2_FP8: bool = False
+    VLLM_DSV41_MOE_FP4_BF16_LHS: bool | None = None
+    VLLM_DSV41_FLASHMLA_TP8: bool = False
+    VLLM_DSV41_DSPARK_SHARDED_CTX_KV: bool = True
 
 
 def env_with_choices(
@@ -833,6 +881,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    "VLLM_TPU_MOE_FP8_DISPATCH": env_bool("VLLM_TPU_MOE_FP8_DISPATCH"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
@@ -856,8 +905,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gather and reduce-scatter. The transport then overlaps the matmuls;
     # the reduce-scatter it replaces is otherwise fully exposed.
     "USE_MOE_FUSED_EP_KERNEL": lambda: (
-        environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]() is not None
-        or env_bool("USE_MOE_FUSED_EP_KERNEL")()
+        False
+        if os.environ.get("USE_MOE_FUSED_EP_KERNEL") == "0"
+        else (
+            environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]() is not None
+            or env_bool("USE_MOE_FUSED_EP_KERNEL")()
+        )
     ),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
@@ -1301,6 +1354,121 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
+    "TPU_DEEPSEEK_V41_ENGRAM_DEBUG_VERIFY": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_DEBUG_VERIFY", False
+    ),
+    "VLLM_DSV41_CED": env_bool("VLLM_DSV41_CED", False),
+    "VLLM_DSV41_HYBRID_CED_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DSV41_HYBRID_CED_DECODE", "0"))
+    ),
+    "VLLM_DSV41_PURE_20L_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DSV41_PURE_20L_PREFILL", "0"))
+    ),
+    # 0 = exact per-token sparse kernel for every CSA prefill token instead of
+    # the 32-query candidate union (which drops rows past m_union = 3 * topk).
+    "VLLM_DSV41_CSA_UNION": env_bool("VLLM_DSV41_CSA_UNION", True),
+    "VLLM_DSV41_CSA_UNION_M": env_int("VLLM_DSV41_CSA_UNION_M", 0),
+    "VLLM_DSV41_CSA_UNION_BQ": env_int("VLLM_DSV41_CSA_UNION_BQ", 32),
+    "VLLM_DSV41_SINGLE_BACKBONE_COND": lambda: bool(
+        int(os.getenv("VLLM_DSV41_SINGLE_BACKBONE_COND", "0"))
+    ),
+    "VLLM_DSV41_FUSED_SEAM_QUANT": env_bool("VLLM_DSV41_FUSED_SEAM_QUANT", True),
+    "VLLM_DSV41_FUSED_Q_ROPE": env_bool("VLLM_DSV41_FUSED_Q_ROPE", False),
+    # Token-parallel attention core at TP>1: each rank attends with all heads
+    # for its T/tp token slice (replicated wq_b/wo_a/wo_b, no attention
+    # reduce-scatter). Used for token-sharded, non-CED steps with
+    # T >= MIN_TOKENS (0 = every bucket; a threshold above the smallest
+    # bucket splits the trace and fails the shape_variants hand-over).
+    "VLLM_DSV41_TP_ATTN": env_bool("VLLM_DSV41_TP_ATTN", False),
+    "VLLM_DSV41_TP_ATTN_MIN_TOKENS": env_int("VLLM_DSV41_TP_ATTN_MIN_TOKENS", 0),
+    # Token-parallel indexer at TP>1: each rank scores T/tp tokens, then the
+    # top-k indices are all-gathered. Used when T >= MIN_TOKENS and T/tp >= 8.
+    "VLLM_DSV41_TP_INDEXER": env_bool("VLLM_DSV41_TP_INDEXER", False),
+    "VLLM_DSV41_TP_INDEXER_MIN_TOKENS": env_int("VLLM_DSV41_TP_INDEXER_MIN_TOKENS", 64),
+    # L12: steps with fewer tokens keep the mHC residual replicated over TP
+    # (all-reduce) instead of token-sharded (reduce-scatter + all-gathers).
+    # tp_collectives.tp_token_shard_ok is the one predicate for the Engram
+    # prefetch, prelude, DecoderStage and zeros fallback. 0 = always shard.
+    "VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS": env_int(
+        "VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS", 0
+    ),
+    # Keep the token-parallel indexer's top-k rows rank-local (no all-gather)
+    # when the indexer layer and every layer reusing its top-k rows run
+    # token-parallel attention, which reads only this rank's T/tp rows.
+    "VLLM_DSV41_TP_ATTN_LOCAL_TOPK": env_bool("VLLM_DSV41_TP_ATTN_LOCAL_TOPK", False),
+    # Enable host Engram prefetch and active-bucket prefix H2D upload across
+    # 1+K speculative verify tokens.
+    "VLLM_DSV41_ENGRAM_H2D_PREFIX": env_bool("VLLM_DSV41_ENGRAM_H2D_PREFIX", True),
+    "VLLM_DSV41_MOE_V2_REQUANTIZE": env_bool("VLLM_DSV41_MOE_V2_REQUANTIZE", True),
+    "VLLM_DSV41_MOE_V2_SUBCHANNEL_FP8": env_bool(
+        "VLLM_DSV41_MOE_V2_SUBCHANNEL_FP8", True
+    ),
+    "VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS": env_int(
+        "VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS", 768
+    ),
+    "VLLM_DSV41_REPL_SHARED_EXPERTS": env_bool("VLLM_DSV41_REPL_SHARED_EXPERTS", False),
+    "VLLM_DSV41_TP_ATTN_TP8": env_bool("VLLM_DSV41_TP_ATTN_TP8", False),
+    "VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS": env_int(
+        "VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS", 0
+    ),
+    "VLLM_DSV41_MOE_FP8_PATH_C_MAX_TOKENS": env_int(
+        "VLLM_DSV41_MOE_FP8_PATH_C_MAX_TOKENS", 512
+    ),
+    "VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS": env_optional_int(
+        "VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS"
+    ),
+    "VLLM_DSV41_MOE_EP_V2_ALL39": env_bool("VLLM_DSV41_MOE_EP_V2_ALL39", True),
+    "VLLM_DSV41_MOE_V2_CAPACITY": env_optional_int("VLLM_DSV41_MOE_V2_CAPACITY"),
+    "VLLM_DSV41_MOE_V2_COALESCED_PUSH": env_bool(
+        "VLLM_DSV41_MOE_V2_COALESCED_PUSH", False
+    ),
+    "ENABLE_DECODE_BENCH_CONNECTOR": env_bool("ENABLE_DECODE_BENCH_CONNECTOR", False),
+    "VLLM_XLA_CACHE_PATH": env_str("VLLM_XLA_CACHE_PATH", "/tmp/xla_cache"),
+    "VLLM_DSV41_SC_UNION_MAX_SHIFT": env_int("VLLM_DSV41_SC_UNION_MAX_SHIFT", 9),
+    "VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT": env_optional_int(
+        "VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT"
+    ),
+    "VLLM_DSV41_CSA_UNION_VERIFY_BQ": env_int("VLLM_DSV41_CSA_UNION_VERIFY_BQ", 0),
+    "VLLM_DSV41_CSA_UNION_MAX_TOKENS": env_int(
+        "VLLM_DSV41_CSA_UNION_MAX_TOKENS", 16384
+    ),
+    # Largest token bucket that projects through the fused CSA (w_qkv_a ‖ w_p)
+    # decode weights. Buckets above it fall back to the plain w_qkv_a weights,
+    # which changes the backbone graph's placeholder set; the shape-variants
+    # warmup cannot hand buckets across such a boundary, so a decode role with
+    # max-num-batched-tokens above 384 must raise this to (at least) that value.
+    "VLLM_DSV41_CSA_FUSED_MAX_TOKENS": env_int("VLLM_DSV41_CSA_FUSED_MAX_TOKENS", 384),
+    # Whether the V4.1 chunked stream-index top-k annotates its TensorCore /
+    # SparseCore passes with XLA scheduling groups. torch_tpu lowers a jax_op
+    # once per (op, shapes) and reuses that MLIR for every layer, so the ids
+    # baked in at trace time repeat across the CSA layers; XLA then sees one
+    # group with gaps. libtpu 0.0.48 compiled that with
+    # --xla_tpu_scheduling_annotation_deannotate_unsupported_groups=true; the
+    # runtime upstream main pins (libtpu 0.0.50 / torch_tpu 0.2.0) fails the
+    # compile even with the flag set. 0 emits no groups at all.
+    "VLLM_DSV41_STREAMIDX_SCHED_GROUPS": env_bool(
+        "VLLM_DSV41_STREAMIDX_SCHED_GROUPS", True
+    ),
+    "VLLM_DSV41_FAST_GROUPED_ATTN": env_bool("VLLM_DSV41_FAST_GROUPED_ATTN", True),
+    "VLLM_DSV41_MOE_V2_MAX_PREFETCH": env_int("VLLM_DSV41_MOE_V2_MAX_PREFETCH", 2),
+    "VLLM_DSV41_MOE_V2_VMEM_MB": lambda: (
+        float(v) if (v := os.getenv("VLLM_DSV41_MOE_V2_VMEM_MB")) else None
+    ),
+    "VLLM_DSV41_DECODER_TP_ATTN_VERIFY": env_bool(
+        "VLLM_DSV41_DECODER_TP_ATTN_VERIFY", False
+    ),
+    "VLLM_DSV41_ENCODER_CAND_MODE": env_bool("VLLM_DSV41_ENCODER_CAND_MODE", True),
+    "VLLM_DSV41_DECODER_TP_ATTN_MIN_TOKENS": env_int(
+        "VLLM_DSV41_DECODER_TP_ATTN_MIN_TOKENS", 1024
+    ),
+    "VLLM_DSV41_MOE_SUBLANE_TILING": env_bool("VLLM_DSV41_MOE_SUBLANE_TILING", True),
+    "VLLM_DSV41_MOE_FP4_GMM1_FP8": env_bool("VLLM_DSV41_MOE_FP4_GMM1_FP8", True),
+    "VLLM_DSV41_MOE_FP4_GMM2_FP8": env_bool("VLLM_DSV41_MOE_FP4_GMM2_FP8", False),
+    "VLLM_DSV41_MOE_FP4_BF16_LHS": env_optional_bool("VLLM_DSV41_MOE_FP4_BF16_LHS"),
+    "VLLM_DSV41_FLASHMLA_TP8": env_bool("VLLM_DSV41_FLASHMLA_TP8", False),
+    "VLLM_DSV41_DSPARK_SHARDED_CTX_KV": env_bool(
+        "VLLM_DSV41_DSPARK_SHARDED_CTX_KV", True
+    ),
 }
 
 
@@ -1332,7 +1500,7 @@ def enable_envs_cache() -> None:
 
     # Cache all environment variables
     for key in environment_variables:
-        __getattr__(key)
+        globals()[key] = __getattr__(key)
 
 
 def __dir__() -> list[str]:

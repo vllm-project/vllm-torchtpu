@@ -18,6 +18,13 @@ PiecewiseBackend to compile FX graphs via TorchTPU's FX->MLIR->PjRt
 pipeline. Each shape bucket gets its own compiled executable.
 """
 
+# DSv4.1 fork: load jax (and its libtpu) before torch_tpu is imported below;
+# the import order matters for the JAX-backed kernels. No-op without jax.
+try:
+    import jax  # noqa: F401
+except ImportError:
+    pass
+
 import contextlib
 import copy
 import dataclasses
@@ -260,6 +267,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # with the venv prefix or mount path. get_libtpu_cache_key() already
     # identifies the loaded build without its path.
     "TPU_LIBRARY_PATH",
+    "ENABLE_DECODE_BENCH_CONNECTOR",
+    "VLLM_XLA_CACHE_PATH",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -402,6 +411,9 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
             logger.warning(
                 "Skipping TPU compile environment variable %s: %s", name, exc
             )
+    if factors.get("VLLM_DSV41_SINGLE_BACKBONE_COND"):
+        factors["VLLM_DSV41_CED"] = True
+        factors["VLLM_DSV41_PURE_20L_PREFILL"] = False
     return factors
 
 
@@ -511,6 +523,65 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
 def _single_size(compile_range: Range) -> int | None:
     """The token bucket a compile range pins, or None for a size range."""
     return compile_range.start if compile_range.is_single_size() else None
+
+
+def _concretize_symint(val: torch.SymInt, size: int) -> int | torch.SymInt:
+    """Substitute the static bucket size into a SymInt expression."""
+    sym_node = getattr(val, "node", None)
+    expr = getattr(sym_node, "expr", None)
+    if expr is None:
+        return val
+    try:
+        sub = {s: size for s in expr.free_symbols}
+        return int(expr.subs(sub))
+    except Exception:
+        return val
+
+
+def _concretize_graph_symints(graph: fx.GraphModule, size: int) -> None:
+    """Replace SymInt uses and literal SymInt args in a deep-copied FX graph.
+
+    Placeholder nodes and their `example_value` metadata are left intact so
+    `shape_variants.graph_signature(graph)` and input arity are unchanged.
+    """
+    dead_nodes: list[fx.Node] = []
+    for node in list(graph.graph.nodes):
+        val = node.meta.get("example_value", node.meta.get("val"))
+        if isinstance(val, torch.SymInt):
+            c_val = _concretize_symint(val, size)
+            if isinstance(c_val, int):
+                node.replace_all_uses_with(c_val)
+                if node.op != "placeholder" and len(node.users) == 0:
+                    dead_nodes.append(node)
+                continue
+        if node.op != "placeholder":
+            node.args = fx.node.map_aggregate(
+                node.args,
+                lambda x: _concretize_symint(x, size)
+                if isinstance(x, torch.SymInt)
+                else x,
+            )
+            node.kwargs = fx.node.map_aggregate(
+                node.kwargs,
+                lambda x: _concretize_symint(x, size)
+                if isinstance(x, torch.SymInt)
+                else x,
+            )
+    for node in reversed(dead_nodes):
+        if len(node.users) == 0:
+            graph.graph.erase_node(node)
+    graph.recompile()
+
+
+def _concretize_example_inputs(
+    example_inputs: list[Any], size: int | None
+) -> list[Any]:
+    if size is None:
+        return example_inputs
+    return [
+        _concretize_symint(x, size) if isinstance(x, torch.SymInt) else x
+        for x in example_inputs
+    ]
 
 
 class TpuCompilerAdaptor(CompilerInterface):
@@ -871,6 +942,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         # and vLLM keeps its own reference to `graph`. Only the output node
         # moves, so the placeholder signature is unaffected.
         graph = copy.deepcopy(graph)
+        if size is not None:
+            _concretize_graph_symints(graph, size)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         caching = (
@@ -913,7 +986,9 @@ class TpuCompilerAdaptor(CompilerInterface):
                 shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
             return compiled_fn, handle
 
-        compiled_fn, entry = self._run_backend(graph, example_inputs)
+        compiled_fn, entry = self._run_backend(
+            graph, _concretize_example_inputs(example_inputs, size)
+        )
 
         if was_wrapped:
             # Undo _ensure_tuple_output on the result side, so callers see the
@@ -999,6 +1074,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
         # artifact is checked against is shaped the way it was when saved.
         graph = copy.deepcopy(graph)
+        if size is not None:
+            _concretize_graph_symints(graph, size)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)
@@ -1006,7 +1083,9 @@ class TpuCompilerAdaptor(CompilerInterface):
             fingerprint = (
                 _graph_fingerprint(graph) if envs.TPU_PRECOMPILE_PEER_REPLAY else None
             )
-            compiled_fn, entry = self._run_backend(graph, example_inputs)
+            compiled_fn, entry = self._run_backend(
+                graph, _concretize_example_inputs(example_inputs, size)
+            )
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.
             if (

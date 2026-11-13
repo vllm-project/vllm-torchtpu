@@ -34,11 +34,14 @@ drafts with the checkpoint's confidence head (``adaptive_verification.py``).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 
+from vllm_torchtpu.distributed.tp_collectives import tp_token_shard_ok
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
@@ -102,6 +105,10 @@ class DSparkProposer(DFlashProposer):
                 self.block_size,
                 trained_block,
             )
+        # DeepSeek-V4.1 captures each target layer's entry stream, so its
+        # target layer ids are used unshifted.
+        if getattr(hf_config, "model_type", None) == "deepseek_v41":
+            self._aux_layer_shift = 0
         logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
 
     # A reduced-vocab DSpark checkpoint carries its own lm_head
@@ -116,6 +123,55 @@ class DSparkProposer(DFlashProposer):
         # predicts the next token. Speculators-format checkpoints keep the
         # DFlash 1 + K layout.
         return K if self.sample_from_anchor else K + 1
+
+    def _draft_token_paddings(self) -> list[int]:
+        # Request-aligned buckets pad less than the generic token buckets.
+        # These are the draft-forward buckets only (`_get_padded_len` and
+        # `draft_forward_buckets` read them); precompile warms the context-KV
+        # update at the target's own buckets regardless.
+        max_chunk_reqs = self._max_chunk_reqs()
+        if self.block_size in (3, 4, 5):
+            b = self.block_size
+            if max_chunk_reqs == 64:
+                return [16, 8 * b, 16 * b, 32 * b, 48 * b, 64 * b]
+            if max_chunk_reqs > 64:
+                max_draft_tokens = max_chunk_reqs * b
+                base = [
+                    16,
+                    8 * b,
+                    16 * b,
+                    32 * b,
+                    48 * b,
+                    64 * b,
+                    80 * b,
+                    128 * b,
+                    256 * b,
+                    512 * b,
+                ]
+                buckets = [p for p in base if p <= max_draft_tokens]
+                if buckets and buckets[-1] < max_draft_tokens:
+                    buckets.append((max_draft_tokens + 7) & ~7)
+                if buckets:
+                    return sorted(set(buckets))
+        return super()._draft_token_paddings()
+
+    def _draft_kv_num_blocks(self, use_max_model_len: bool) -> int:
+        # The draft's KV group (e.g. DeepSeek-V4.1's sliding-window cache) can
+        # be narrower than group 0, so size the dummies from its own builder.
+        runner = self.runner
+        get_names = getattr(self.draft_model, "get_draft_kv_cache_layer_names", None)
+        if get_names is not None:
+            first_layer = get_names()[0]
+            for group_list in runner.attn_groups:
+                for group in group_list:
+                    if first_layer in group.layer_names:
+                        ctx = SimpleNamespace(
+                            use_max_model_len=use_max_model_len,
+                            mamba_ckpt_window=runner._mamba_ckpt_window,
+                        )
+                        builder = group.metadata_builders[0]
+                        return builder._block_table_geometry(ctx)[1]
+        return super()._draft_kv_num_blocks(use_max_model_len)
 
     def load_model(self, target_model) -> None:
         super().load_model(target_model)
@@ -132,6 +188,8 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
+        if hasattr(self.draft_model, "init_tp_markov_meta"):
+            self.draft_model.init_tp_markov_meta()
         if self.speculative_config.enable_adaptive_verification:
             assert self.draft_model is not None
             # Every DSpark backbone declares confidence_head, None when the
@@ -166,8 +224,7 @@ class DSparkProposer(DFlashProposer):
         confidences, self._draft_confidences = self._draft_confidences, None
         return confidences
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def _dflash_forward_and_sample(
+    def _dflash_forward_and_sample_body(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -188,6 +245,35 @@ class DSparkProposer(DFlashProposer):
         token, never the token it drafts.
         """
         assert self.draft_model is not None
+        sample_start = 0 if self.sample_from_anchor else 1
+        num_pred = block_size - sample_start
+        tp_size = get_tensor_model_parallel_world_size()
+        num_tokens = positions.shape[0]
+        padded_num_reqs = num_tokens // block_size
+        # The TP-local Markov samplers below return only the draft tokens; the
+        # confidence head also needs each slot's Markov embedding, so adaptive
+        # verification takes the generic path.
+        use_model_sampler = not self.use_confidence_head
+        can_skip_final_ag = (
+            use_model_sampler
+            and sample_start == 0
+            and num_tokens == padded_num_reqs * block_size
+            and tp_token_shard_ok(num_tokens, tp_size)
+            and hasattr(self.draft_model, "can_run_fused_sharded_markov")
+            and self.draft_model.can_run_fused_sharded_markov()
+        )
+        if can_skip_final_ag:
+            sharded_hidden = self.draft_model.model(
+                input_ids=input_ids,
+                positions=positions,
+                skip_final_all_gather=True,
+            )
+            prev = input_ids[: padded_num_reqs * block_size : block_size]
+            draft_tokens_chunk = self.draft_model.sample_draft_tokens(
+                sharded_hidden, prev, num_pred, pred_sharded=True
+            )
+            return draft_tokens_chunk, sharded_hidden
+
         hidden = self.draft_model.model(
             input_ids=input_ids,
             positions=positions,
@@ -195,24 +281,38 @@ class DSparkProposer(DFlashProposer):
 
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
-
-        # Draft-vocab logits for every slot; the Markov bias is added in
-        # draft space and ids are remapped to target vocab after argmax.
-        logits = self.draft_model.compute_draft_logits(valid_hidden)
-        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
+        if sample_start > 0:
+            pred_hidden = valid_hidden.view(
+                padded_num_reqs, block_size, hidden.shape[-1]
+            )[:, sample_start:].reshape(-1, hidden.shape[-1])
+        else:
+            pred_hidden = valid_hidden
 
         ids_3d = input_ids[: padded_num_reqs * block_size].view(
             padded_num_reqs, block_size
         )
         prev = ids_3d[:, 0]
+        if use_model_sampler and hasattr(self.draft_model, "sample_draft_tokens"):
+            draft_tokens_chunk = self.draft_model.sample_draft_tokens(
+                pred_hidden, prev, num_pred
+            )
+            return draft_tokens_chunk, hidden
+
+        # Hoist the step-0 Markov embedding + projection so XLA overlaps it
+        # with compute_draft_logits(pred_hidden).
+        markov_embed = self.draft_model.markov_embed(prev)
+        bias = self.draft_model.markov_bias(markov_embed)
+        logits = self.draft_model.compute_draft_logits(pred_hidden)
+        logits_3d = logits.view(padded_num_reqs, num_pred, logits.shape[-1])
+
         draft_tokens = []
         markov_embeds = []
-        sample_start = 0 if self.sample_from_anchor else 1
-        for i in range(sample_start, block_size):
-            markov_embed = self.draft_model.markov_embed(prev)
-            bias = self.draft_model.markov_bias(markov_embed)
+        for idx in range(num_pred):
+            if idx > 0:
+                markov_embed = self.draft_model.markov_embed(prev)
+                bias = self.draft_model.markov_bias(markov_embed)
             step = self.draft_model.map_draft_to_target(
-                (logits_3d[:, i] + bias).argmax(dim=-1)
+                (logits_3d[:, idx] + bias).argmax(dim=-1)
             )
             draft_tokens.append(step)
             markov_embeds.append(markov_embed)
@@ -229,3 +329,12 @@ class DSparkProposer(DFlashProposer):
             torch.stack(markov_embeds, dim=1).flatten(0, 1),
         )
         return draft_tokens_chunk, confidence.view(padded_num_reqs, -1)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _dflash_forward_and_sample(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._dflash_forward_and_sample_body(input_ids, positions, block_size)

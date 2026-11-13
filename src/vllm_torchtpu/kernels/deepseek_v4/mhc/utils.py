@@ -88,6 +88,24 @@ def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     )
 
 
+def split_fn3_torch(fn):
+    """Pre-split float32 [mix_hc, hc_dim] into bfloat16 [3, mix_hc, hc_dim] on CPU."""
+    import torch
+
+    fn_cpu = fn.detach().to(device="cpu", dtype=torch.float32)
+    fn_hi = fn_cpu.to(torch.bfloat16)
+    rem1 = fn_cpu - fn_hi.to(torch.float32)
+    fn_mid = rem1.to(torch.bfloat16)
+    rem2 = rem1 - fn_mid.to(torch.float32)
+    fn_lo = rem2.to(torch.bfloat16)
+    return (
+        torch.stack([fn_hi, fn_mid, fn_lo], dim=0)
+        .clone()
+        .contiguous()
+        .to(device=fn.device)
+    )
+
+
 def mhc_pre_gates(
     mixes: jax.Array,
     sqrsum: jax.Array,
@@ -110,24 +128,36 @@ def mhc_pre_gates(
 
     mixes = mixes * jax.lax.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
 
-    pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    mix_hc = mixes.shape[1]
+    if hc_scale.size == mix_hc:
+        scale_vec = hc_scale.reshape(1, mix_hc)
+    else:
+        scale_vec = jnp.repeat(
+            hc_scale.reshape(3),
+            jnp.array([hc_mult, hc_mult, hc_mult * hc_mult]),
+            total_repeat_length=mix_hc,
+        ).reshape(1, mix_hc)
+    hb_vec = hc_base.reshape(1, mix_hc)
+    logits = mixes * scale_vec + hb_vec
+
+    pre_logits = logits[:, :hc_mult]
     pre_mix = jax.nn.sigmoid(pre_logits) + hc_pre_eps
 
-    post_logits = (
-        mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
-    )
+    post_logits = logits[:, hc_mult : 2 * hc_mult]
     post_mix = jax.nn.sigmoid(post_logits) * hc_post_mult_value
 
-    comb_logits = mixes[:, 2 * hc_mult :].reshape(
-        num_tokens, hc_mult, hc_mult
-    ) * hc_scale[2] + hc_base[2 * hc_mult :].reshape(1, hc_mult, hc_mult)
+    comb_logits = logits[:, 2 * hc_mult :].reshape(num_tokens, hc_mult, hc_mult)
     comb_mix = jax.nn.softmax(comb_logits, axis=-1) + hc_sinkhorn_eps
-    comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps)
+    comb_mix = comb_mix * (
+        1.0 / (jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps)
+    )
+
     for _ in range(sinkhorn_repeat - 1):
-        comb_mix = comb_mix / (
-            jnp.sum(comb_mix, axis=-1, keepdims=True) + hc_sinkhorn_eps
+        comb_mix = comb_mix * (
+            1.0 / (jnp.sum(comb_mix, axis=-1, keepdims=True) + hc_sinkhorn_eps)
         )
-        comb_mix = comb_mix / (
-            jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps
+        comb_mix = comb_mix * (
+            1.0 / (jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps)
         )
     return pre_mix, post_mix, comb_mix
+

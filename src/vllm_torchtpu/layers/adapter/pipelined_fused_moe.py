@@ -28,11 +28,21 @@ from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
-from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
+from vllm_torchtpu.layers.adapter.fused_moe import (
+    fused_moe_gmm,
+    fused_moe_gmm_fp8_dispatch,
+    moe_fp8_dispatch_enabled,
+    quantize_moe_dispatch,
+)
+from vllm_torchtpu.layers.core.fused_moe_gmm import MOE_FP8_DISPATCH_BLOCK
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+# Resolved once, at import, so the compiled forward never reads the environment.
+_TPU_MOE_COLLECTION_CHUNK_SIZE: int = int(envs.TPU_MOE_COLLECTION_CHUNK_SIZE)
 
 
 # A module global rather than a ContextVar: Dynamo guards on the global's
@@ -84,12 +94,10 @@ def collection_chunks(seq_len: int, parallel_size: int) -> tuple[int, int]:
     """Chunk count and local chunk size for this rank's ``seq_len`` tokens."""
     if _fixed_chunk_buckets is not None and parallel_size > 1:
         num_chunks = fixed_chunk_count(
-            _fixed_chunk_buckets, parallel_size, envs.TPU_MOE_COLLECTION_CHUNK_SIZE
+            _fixed_chunk_buckets, parallel_size, _TPU_MOE_COLLECTION_CHUNK_SIZE
         )
         return num_chunks, seq_len // num_chunks
-    return calculate_moe_chunks(
-        seq_len, parallel_size, envs.TPU_MOE_COLLECTION_CHUNK_SIZE
-    )
+    return calculate_moe_chunks(seq_len, parallel_size, _TPU_MOE_COLLECTION_CHUNK_SIZE)
 
 
 def enable_pipelined_collective_and_compute() -> bool:
@@ -99,7 +107,7 @@ def enable_pipelined_collective_and_compute() -> bool:
         bool: True if `envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0`, False otherwise.
 
     """
-    return envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0
+    return _TPU_MOE_COLLECTION_CHUNK_SIZE > 0
 
 
 # Alias for alternative naming convention
@@ -120,6 +128,28 @@ def _quantized_all_gather(
         ag_rows.view(torch.float8_e4m3fn), ag_scale, axis=-1, out_dtype=out_dtype
     )
     return ag_hidden_states
+
+
+def _all_gather_hidden(collective_group, hidden_states, quantize_ag: bool = False):
+    """All-gathers MoE inputs: a tensor or an fp8 dispatch (rows, scales) pair.
+
+    `quantize_ag` (``TPU_MOE_FP8_ALL_GATHER``) applies to plain bf16 activations
+    only; an fp8 dispatch pair is already quantized.
+    """
+    if isinstance(hidden_states, tuple):
+        return tuple(collective_group.all_gather(t, dim=0) for t in hidden_states)
+    if quantize_ag:
+        return _quantized_all_gather(collective_group, hidden_states)
+    return collective_group.all_gather(hidden_states, dim=0)
+
+
+def _slice_hidden(hidden_states, start: int, end: int):
+    """Token slice of MoE inputs: a tensor or an fp8 dispatch (rows, scales) pair."""
+    if isinstance(hidden_states, tuple):
+        rows, scales = hidden_states
+        per_token = rows.shape[-1] // MOE_FP8_DISPATCH_BLOCK  # flat scales
+        return rows[start:end], scales[start * per_token : end * per_token]
+    return hidden_states[start:end]
 
 
 def calculate_moe_chunks(
@@ -249,36 +279,56 @@ def pipelined_fused_moe_gmm(
     )
     num_chunks, chunk_size_local = collection_chunks(seq_len, parallel_size)
 
+    # Independent of the token count, so every bucket traces the same inputs.
+    moe_fn = fused_moe_gmm
+    packed_fp8 = False
+    if parallel_size > 1 and moe_fp8_dispatch_enabled(w1, w1_scale, rhs_quant_dtype):
+        # Quantize and pack (hidden_q, hidden_scale, topk_weights, topk_ids)
+        # before the all-gather so a single 2D 128-lane-aligned AllGather
+        # replaces 4 separate collectives per chunk.
+        if topk_weights is not None and topk_ids is not None:
+            hidden_states = quantize_moe_dispatch(
+                hidden_states, topk_weights, topk_ids
+            )
+        else:
+            hidden_states = quantize_moe_dispatch(hidden_states)
+        packed_fp8 = not isinstance(hidden_states, tuple)
+        moe_fn = fused_moe_gmm_fp8_dispatch
+
     # There is no gather to make cheaper on a single rank, so quantizing there
-    # would only round the activations for nothing.
-    quantize_ag = parallel_size > 1 and envs.TPU_MOE_FP8_ALL_GATHER
+    # would only round the activations for nothing. The fp8 dispatch path
+    # above already gathers quantized rows, so it is not quantized again.
+    quantize_ag = (
+        parallel_size > 1 and envs.TPU_MOE_FP8_ALL_GATHER and moe_fn is fused_moe_gmm
+    )
 
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
             # parallel_size > 1 only when collective_group is set.
             assert collective_group is not None
-            if quantize_ag:
-                ag_hidden_states = _quantized_all_gather(
-                    collective_group, hidden_states
-                )
+            ag_hidden_states = _all_gather_hidden(
+                collective_group, hidden_states, quantize_ag
+            )
+            if packed_fp8:
+                ag_topk_weights = topk_weights
+                ag_topk_ids = topk_ids
             else:
-                ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
-            ag_topk_weights = (
-                collective_group.all_gather(topk_weights, dim=0)
-                if topk_weights is not None
-                else None
-            )
-            ag_topk_ids = (
-                collective_group.all_gather(topk_ids, dim=0)
-                if topk_ids is not None
-                else None
-            )
+                ag_topk_weights = (
+                    collective_group.all_gather(topk_weights, dim=0)
+                    if topk_weights is not None
+                    else None
+                )
+                ag_topk_ids = (
+                    collective_group.all_gather(topk_ids, dim=0)
+                    if topk_ids is not None
+                    else None
+                )
         else:
             ag_hidden_states = hidden_states
             ag_topk_weights = topk_weights
             ag_topk_ids = topk_ids
 
-        out = fused_moe_gmm(
+        out = moe_fn(
             hidden_states=ag_hidden_states,
             w1=w1,
             w2=w2,
@@ -306,43 +356,51 @@ def pipelined_fused_moe_gmm(
 
     # Slice local inputs into num_chunks chunks along dim 0
     hs_slices = [
-        hidden_states[i * chunk_size_local : (i + 1) * chunk_size_local]
+        _slice_hidden(
+            hidden_states, i * chunk_size_local, (i + 1) * chunk_size_local
+        )
         for i in range(num_chunks)
     ]
-    weights_slices = (
-        [
-            topk_weights[i * chunk_size_local : (i + 1) * chunk_size_local]
-            for i in range(num_chunks)
-        ]
-        if topk_weights is not None
-        else [None] * num_chunks
-    )
-    ids_slices = (
-        [
-            topk_ids[i * chunk_size_local : (i + 1) * chunk_size_local]
-            for i in range(num_chunks)
-        ]
-        if topk_ids is not None
-        else [None] * num_chunks
-    )
+    if packed_fp8:
+        weights_slices = [topk_weights] * num_chunks
+        ids_slices = [topk_ids] * num_chunks
+    else:
+        weights_slices = (
+            [
+                topk_weights[i * chunk_size_local : (i + 1) * chunk_size_local]
+                for i in range(num_chunks)
+            ]
+            if topk_weights is not None
+            else [None] * num_chunks
+        )
+        ids_slices = (
+            [
+                topk_ids[i * chunk_size_local : (i + 1) * chunk_size_local]
+                for i in range(num_chunks)
+            ]
+            if topk_ids is not None
+            else [None] * num_chunks
+        )
 
     def _all_gather_hs(hs_slice):
-        if quantize_ag:
-            return _quantized_all_gather(collective_group, hs_slice)
-        return collective_group.all_gather(hs_slice, dim=0)
+        return _all_gather_hidden(collective_group, hs_slice, quantize_ag)
 
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = _all_gather_hs(hs_slices[0])
-    ag_tw_curr = (
-        collective_group.all_gather(weights_slices[0], dim=0)
-        if weights_slices[0] is not None
-        else None
-    )
-    ag_ti_curr = (
-        collective_group.all_gather(ids_slices[0], dim=0)
-        if ids_slices[0] is not None
-        else None
-    )
+    if packed_fp8:
+        ag_tw_curr = weights_slices[0]
+        ag_ti_curr = ids_slices[0]
+    else:
+        ag_tw_curr = (
+            collective_group.all_gather(weights_slices[0], dim=0)
+            if weights_slices[0] is not None
+            else None
+        )
+        ag_ti_curr = (
+            collective_group.all_gather(ids_slices[0], dim=0)
+            if ids_slices[0] is not None
+            else None
+        )
 
     rs_outputs = []
 
@@ -351,22 +409,26 @@ def pipelined_fused_moe_gmm(
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = _all_gather_hs(hs_slices[i + 1])
-            # Locals let the None checks below narrow; subscripts do not.
-            weights_next = weights_slices[i + 1]
-            ag_tw_next = (
-                collective_group.all_gather(weights_next, dim=0)
-                if weights_next is not None
-                else None
-            )
-            ids_next = ids_slices[i + 1]
-            ag_ti_next = (
-                collective_group.all_gather(ids_next, dim=0)
-                if ids_next is not None
-                else None
-            )
+            if packed_fp8:
+                ag_tw_next = weights_slices[i + 1]
+                ag_ti_next = ids_slices[i + 1]
+            else:
+                # Locals let the None checks below narrow; subscripts do not.
+                weights_next = weights_slices[i + 1]
+                ag_tw_next = (
+                    collective_group.all_gather(weights_next, dim=0)
+                    if weights_next is not None
+                    else None
+                )
+                ids_next = ids_slices[i + 1]
+                ag_ti_next = (
+                    collective_group.all_gather(ids_next, dim=0)
+                    if ids_next is not None
+                    else None
+                )
 
         # Compute MoE kernel for current gathered chunk
-        out_i = fused_moe_gmm(
+        out_i = moe_fn(
             hidden_states=ag_hs_curr,
             w1=w1,
             w2=w2,

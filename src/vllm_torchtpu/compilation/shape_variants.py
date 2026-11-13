@@ -52,6 +52,7 @@ import sympy
 import torch
 import torch.fx as fx
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -62,6 +63,19 @@ logger = init_logger(__name__)
 
 class ShapeSpecializationError(RuntimeError):
     """A token bucket cannot be served by the graph asked to compile it."""
+
+
+def _strict_op_handover() -> bool:
+    """Prefill-role (VLLM_DSV41_PURE_20L_PREFILL=1) hand-over rules.
+
+    The prefill tree's graph signature also covers the graph's call_function
+    targets ("runs the same ops"), and a bucket is handed over between traces
+    only when the ops match (or this trace cannot serve the bucket anyway);
+    cached placeholders may be a subset of the caller's. The decode tree keys on
+    placeholders only, requires equal placeholder sets and falls back to a
+    positional (dtype, ndim) match.
+    """
+    return bool(envs.VLLM_DSV41_PURE_20L_PREFILL)
 
 
 # ---------------------------------------------------------------------------
@@ -157,15 +171,32 @@ def _signature(graph: fx.GraphModule) -> tuple:
     in one variant and two in another -- does not.
     """
 
-    def shape(value: Any) -> Any:
+    def shape(node: fx.Node) -> Any:
+        value = node.meta.get("example_value")
+        tag = (
+            node.target
+            if isinstance(node.target, str)
+            and node.target.lower().startswith("l_self_")
+            else None
+        )
         if not isinstance(value, torch.Tensor):
-            return type(value).__name__
+            return (tag, type(value).__name__) if tag is not None else type(value).__name__
         dims = tuple(
             "?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape
         )
-        return (str(value.dtype), dims)
+        return (tag, str(value.dtype), dims) if tag is not None else (str(value.dtype), dims)
 
-    return tuple(shape(value) for value in _placeholder_values(graph))
+    if _strict_op_handover():
+        return tuple(
+            shape(node) if node.op == "placeholder" else ("CALL", str(node.target))
+            for node in graph.graph.nodes
+            if node.op in ("placeholder", "call_function")
+        )
+    return tuple(
+        shape(node)
+        for node in graph.graph.nodes
+        if node.op == "placeholder"
+    )
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:
@@ -173,7 +204,8 @@ def graph_signature(graph: fx.GraphModule) -> tuple:
 
     Stable across processes -- dtypes as strings, dims as ints or "?" -- so a
     compile cache written by one run can check that the graph it is being
-    replayed against still takes the same inputs.
+    replayed against still takes the same inputs (and, on the prefill role,
+    runs the same ops; see :func:`_strict_op_handover`).
     """
     return _signature(graph)
 
@@ -181,6 +213,29 @@ def graph_signature(graph: fx.GraphModule) -> tuple:
 # ---------------------------------------------------------------------------
 # Handing a bucket from the trace that cannot serve it to the one that can
 # ---------------------------------------------------------------------------
+
+
+def _placeholder_keys(graph: fx.GraphModule) -> tuple:
+    keys = []
+    sym_idx = 0
+    for node in graph.graph.nodes:
+        if node.op != "placeholder":
+            continue
+        value = node.meta.get("example_value")
+        if isinstance(value, torch.Tensor):
+            keys.append((str(node.target), str(value.dtype), int(value.ndim)))
+        else:
+            keys.append((f"sym_{type(value).__name__}_{sym_idx}", type(value).__name__, -1))
+            sym_idx += 1
+    return tuple(keys)
+
+
+def _op_keys(graph: fx.GraphModule) -> tuple:
+    return tuple(
+        str(node.target)
+        for node in graph.graph.nodes
+        if node.op == "call_function"
+    )
 
 
 class BucketExecutables:
@@ -195,27 +250,74 @@ class BucketExecutables:
 
     def __init__(self) -> None:
         self._runnables: dict[
-            tuple[str | None, str], tuple[Callable[..., Any], tuple]
+            tuple[str | None, str], tuple[Callable[..., Any], tuple, tuple, tuple]
         ] = {}
         self.refused: set[int] = set()
         self.traces = 0
 
     def get(
-        self, cache_dir: str | None, key: str, graph: fx.GraphModule
+        self,
+        cache_dir: str | None,
+        key: str,
+        graph: fx.GraphModule,
+        *,
+        require_same_ops: bool = True,
     ) -> Callable[..., Any] | None:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature = found
-        if signature != _signature(graph):
-            raise ShapeSpecializationError(
-                f"{key} was compiled by another trace of this model whose "
-                f"inputs differ ({signature} vs {_signature(graph)}). The "
-                "graph is split, so its subgraph boundaries move with the "
-                "specialization and a bucket cannot be handed between traces; "
-                "unset TPU_KERNEL_ITER_MODE to serve this model."
+        runnable, signature, keys, ops = found
+        caller_sig = _signature(graph)
+        if signature == caller_sig:
+            return runnable
+        strict = _strict_op_handover()
+        if strict and require_same_ops and ops != _op_keys(graph):
+            return None
+        caller_keys = _placeholder_keys(graph)
+        if strict:
+            keys_match = (
+                len(set(keys)) == len(keys)
+                and len(set(caller_keys)) == len(caller_keys)
+                and set(keys).issubset(set(caller_keys))
             )
-        return runnable
+        else:
+            keys_match = (
+                len(keys) == len(caller_keys)
+                and len(set(keys)) == len(keys)
+                and set(keys) == set(caller_keys)
+            )
+        if keys_match:
+            pos_in_caller = {item: idx for idx, item in enumerate(caller_keys)}
+            perm = tuple(pos_in_caller[item] for item in keys)
+            n_swapped = sum(1 for i, p in enumerate(perm) if i != p)
+            if strict and perm == tuple(range(len(caller_keys))):
+                return runnable
+            logger.info(
+                "[shape-variants] %s remapping %d/%d permuted placeholder inputs to match earlier trace",
+                key,
+                n_swapped,
+                len(perm),
+            )
+            orig_runnable = runnable
+            return lambda *args: orig_runnable(*(args[i] for i in perm))
+        if (
+            not strict
+            and len(keys) == len(caller_keys)
+            and [(k[1], k[2]) for k in keys] == [(k[1], k[2]) for k in caller_keys]
+        ):
+            logger.info(
+                "[shape-variants] %s handing over matching %d-arg positional signature across traces",
+                key,
+                len(keys),
+            )
+            return runnable
+        logger.info(
+            "[shape-variants] %s live placeholder set differs across traces (%d vs %d); compiling natively for active trace",
+            key,
+            len(keys),
+            len(caller_keys),
+        )
+        return None
 
     def put(
         self,
@@ -224,7 +326,12 @@ class BucketExecutables:
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
     ) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
+        self._runnables[(cache_dir, key)] = (
+            runnable,
+            _signature(graph),
+            _placeholder_keys(graph),
+            _op_keys(graph),
+        )
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.
@@ -265,12 +372,25 @@ def runnable_for(
     Refusing here leaves the bucket to the trace that owns it, which is the
     only one that can rebuild a wrapper matching the executable.
     """
-    ready = _session.get(cache_dir, key, graph) if _session else None
+    if _strict_op_handover():
+        reason = (
+            None if size is None else unsupported_reason(trace_shape_env(graph), size)
+        )
+        ready = (
+            _session.get(cache_dir, key, graph, require_same_ops=(reason is None))
+            if _session
+            else None
+        )
+    else:
+        ready = _session.get(cache_dir, key, graph) if _session else None
     if ready is not None:
         logger.info("[shape-variants] %s handed over by an earlier trace", key)
         return ready
 
-    reason = None if size is None else unsupported_reason(trace_shape_env(graph), size)
+    if not _strict_op_handover():
+        reason = (
+            None if size is None else unsupported_reason(trace_shape_env(graph), size)
+        )
     if reason is None:
         return None
     if _session is None:

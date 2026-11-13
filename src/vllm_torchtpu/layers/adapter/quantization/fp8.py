@@ -41,6 +41,11 @@ the blockwise Pallas kernel path instead.
 
 from __future__ import annotations
 
+try:
+    import jax
+except ImportError:
+    pass
+
 from collections.abc import Callable
 from math import gcd
 from typing import TYPE_CHECKING, Literal, cast
@@ -76,6 +81,16 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+    FUSED_MOE_EP_OP_ATTR,
+    fused_moe_ep,
+    fused_moe_ep_supported,
+    fused_moe_ep_unsupported_reason,
+    hash_topk_ids_operand,
+    prebuild_fused_moe_ep,
+    register_score_bias_buffer,
+    score_bias_operand,
+)
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
@@ -1093,24 +1108,19 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             register_score_bias_buffer,
         )
 
+        _use_all39_ep_v2 = (
+            __import__("os").environ.get("VLLM_DSV41_MOE_EP_V2_ALL39", "1") == "1"
+        )
         _ep_op = prebuild_fused_moe_ep(
             layer,
             topk=layer.moe_config.experts_per_token,
             renormalize=layer.renormalize,
             activation=activation_str,
+            supplies_hash_ids=_use_all39_ep_v2,
+            precomputed_routing=_use_all39_ep_v2,
         )
         setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
         if _ep_op is not None:
-            # Stage the bias, exactly as the nvfp4 and mxfp4 methods do. This
-            # is the other half of the arity contract: `_routing_config`
-            # decides the op's operand count from
-            # `layer.e_score_correction_bias`, while the call site reads the
-            # STAGED buffer via `score_bias_operand`. Register nothing and the
-            # two disagree -- the op is built with eight operands and
-            # `fused_moe_ep` takes its `score_bias is None` branch and passes
-            # seven, which Dynamo rejects with `missing value for argument
-            # 'score_bias'`. Passing the operand at the call site is not
-            # sufficient on its own; it has to exist.
             register_score_bias_buffer(layer)
 
     def apply_monolithic(
@@ -1126,10 +1136,6 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
         )
-        # The fused EP kernel takes this rank's own tokens and returns this
-        # rank's own tokens: it routes, exchanges, computes and combines inside
-        # one program. Keyed on the same predicate `supports_internal_mk` uses,
-        # so ownership and the path that exercises it cannot disagree.
         if self._use_adaptive_fused_moe:
             return adaptive_moe.run_adaptive_fused_moe(
                 self,
@@ -1141,24 +1147,21 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
             )
 
-        # `score_bias_operand` is not optional, and omitting it is silent on
-        # every model that does not have one. `prebuild_fused_moe_ep` builds
-        # the op with an eighth operand exactly when the layer carries an
-        # `e_score_correction_bias`, so a layer that has one and a call site
-        # that does not pass it disagree on the op's arity and Dynamo refuses
-        # the trace with `pallas::fused_moe_ep() is missing value for argument
-        # 'score_bias'`. A biasless router -- plain softmax or sigmoid top-k --
-        # takes the seven-argument call and matches, which is why the omission
-        # survived here for as long as this path served only such models; a
-        # `noaux_tc` router carries the bias and does not. The nvfp4 and mxfp4
-        # methods already pass it.
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
             fused_moe_ep_supported,
-            score_bias_operand,
         )
 
         if fused_moe_ep_supported(self):
+            topk_weights, topk_ids = moe_routing.route(
+                layer, x, router_logits, input_ids=input_ids
+            )
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+                topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                    topk_ids,
+                    topk_weights,
+                    is_local_tensor=True,
+                )
             return fused_moe_ep(
                 self,
                 x,
@@ -1167,7 +1170,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w13_weight_scale_inv,
                 layer.w2_weight_scale_inv,
                 router_logits,
-                score_bias_operand(layer),
+                precomputed_topk_ids=topk_ids,
+                precomputed_topk_weights=topk_weights,
             )
         from vllm_torchtpu.layers.adapter.moe_tp_decode import (
             moe_tp_decode_forward,
