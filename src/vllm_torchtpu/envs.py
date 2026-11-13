@@ -225,7 +225,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
-    TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS: int = 0
+    TPU_MINIMAX_M3_FUSED_NORM_ROPE: bool = False
 
 
 def env_with_choices(
@@ -1392,12 +1392,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS", 0
     ),
-    # MiniMax M3 steps of at least this many tokens apply the per-head q / k /
-    # index norms and the partial RoPE in one Pallas pass
-    # (`models.minimax_m3.kernels.norm_rope`) instead of five XLA passes. The
-    # norms' rsqrt stays in XLA, so the values are the same. 0 = off.
-    "TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS": env_nonnegative_int(
-        "TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS", 0
+    # MiniMax M3: apply the per-head q / k / index norms and the partial RoPE
+    # in one Pallas pass (`models.minimax_m3.kernels.norm_rope`) instead of
+    # five XLA passes, on every step (a token-count threshold would split the
+    # Dynamo trace into shape variants). The norms' rsqrt stays in XLA.
+    "TPU_MINIMAX_M3_FUSED_NORM_ROPE": lambda: bool(
+        int(os.getenv("TPU_MINIMAX_M3_FUSED_NORM_ROPE", "0") or "0")
     ),
 }
 

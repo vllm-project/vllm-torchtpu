@@ -242,7 +242,7 @@ def norm_rope_heads(
     )
     eps = q_norm.variance_epsilon
     assert all(n.variance_epsilon == eps for n in norms)
-    if norm_rope.applies(num_tokens, qkv, rotary_emb):
+    if norm_rope.applies(qkv, rotary_emb):
         # The norms' rsqrt as `ir_ops.rms_norm` computes it; the apply and the
         # rope run in one Pallas pass over qkv (same values).
         variance = x.to(torch.float32).pow(2).mean(dim=-1)

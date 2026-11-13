@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Torch bridge for the one-pass q / k / index norm + RoPE kernel
-(`kernels/norm_rope.py`), used by `attention.norm_rope_heads` on steps of at
-least ``TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS`` tokens."""
+(`kernels/norm_rope.py`), used by `attention.norm_rope_heads` with ``TPU_MINIMAX_M3_FUSED_NORM_ROPE=1`` (every
+step: a token-count branch here would split the Dynamo trace into shape
+variants that cannot share compiled buckets)."""
 
 import torch
 from torch_tpu._internal import pallas
@@ -24,14 +25,12 @@ from vllm_torchtpu.models.minimax_m3.kernels.norm_rope import minimax_m3_norm_ro
 
 logger = init_logger(__name__)
 
-MIN_TOKENS = envs.TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS
-if MIN_TOKENS:
+ENABLED = envs.TPU_MINIMAX_M3_FUSED_NORM_ROPE
+if ENABLED:
     # At import, not in the forward: Dynamo cannot trace the lazy logger.
     logger.info(
-        "TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS=%d: one-pass q/k/index norm + "
-        "rope kernel armed for steps of >= %d tokens",
-        MIN_TOKENS,
-        MIN_TOKENS,
+        "TPU_MINIMAX_M3_FUSED_NORM_ROPE=1: one-pass q/k/index norm + rope "
+        "kernel armed"
     )
 
 
@@ -47,13 +46,11 @@ _op = pallas.jax_op("pallas::minimax_m3_norm_rope", minimax_m3_norm_rope)
 _op.register_fake(_fake)
 
 
-def applies(num_tokens: int, qkv: torch.Tensor, rotary_emb) -> bool:
-    """Whether this step takes the fused kernel: the flag is on, the step has
-    at least ``MIN_TOKENS`` tokens, and the rope is the plain NeoX partial
-    rotation the kernel reproduces."""
+def applies(qkv: torch.Tensor, rotary_emb) -> bool:
+    """Whether the fused kernel runs: the flag is on and the rope is the plain
+    NeoX partial rotation the kernel reproduces (no shape condition)."""
     return (
-        MIN_TOKENS > 0
-        and num_tokens >= MIN_TOKENS
+        ENABLED
         and qkv.device.type == "tpu"
         and qkv.dtype == torch.bfloat16
         and getattr(rotary_emb, "is_neox_style", False)
