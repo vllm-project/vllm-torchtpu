@@ -799,6 +799,39 @@ def _subtract_num_rejected_tokens_compiled(*args):
 _subtract_num_rejected_tokens_fn = None
 
 
+def _extract_drafts_compiled(*args):
+    """VLLM_TPU_EXTRACT_DRAFTS_COMPILED: `extract_draft_token_ids` as one
+    static-shape compiled program per (input ids, logits indices) length pair,
+    warmed by `_precompile_extract_drafts`. Run eagerly, the gather compiled
+    every new pair mid-serve: the ids length is the step's token bucket and the
+    index length its padded logits length, and warmup ran neither."""
+    global _extract_drafts_fn
+    if _extract_drafts_fn is None:
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            extract_draft_token_ids,
+        )
+
+        _extract_drafts_fn = _static_shape_args(_tpu_compile(extract_draft_token_ids))
+    return _extract_drafts_fn(*args)
+
+
+_extract_drafts_fn = None
+
+
+def _extract_drafts_shapes(
+    num_tokens_paddings: list[int], max_logits_len: int
+) -> list[tuple[int, int]]:
+    """(input ids length, padded logits length) pairs a verify step can reach:
+    both are token buckets, and a step samples at most one logits row per
+    token and at most `max_logits_len` rows."""
+    return [
+        (n, m)
+        for n in num_tokens_paddings
+        for m in num_tokens_paddings
+        if m <= n and m <= max_logits_len
+    ]
+
+
 def _subtract_rejected_shapes(
     max_num_reqs: int,
     width: int,
@@ -5186,7 +5219,12 @@ class TPUModelRunner(GPUModelRunner):
                     spec_decode_metadata.draft_token_ids = self._subst_extract_out
                     self._subst_extract_out = None
                 else:
-                    spec_decode_metadata.draft_token_ids = extract_draft_token_ids(
+                    extract = (
+                        _extract_drafts_compiled
+                        if envs.VLLM_TPU_EXTRACT_DRAFTS_COMPILED
+                        else extract_draft_token_ids
+                    )
+                    spec_decode_metadata.draft_token_ids = extract(
                         input_ids,
                         spec_decode_metadata.final_logits_indices,
                         spec_decode_metadata.target_logits_indices,
@@ -8514,6 +8552,7 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_mamba_rollback_helpers()
             self._precompile_spec_boundary_pairs()
             self._precompile_subtract_rejected()
+            self._precompile_extract_drafts()
             self._precompile_spec_tail()
             model_adapter = getattr(self, "model_adapter", None)
             precompile_inputs = getattr(model_adapter, "precompile_fused_inputs", None)
@@ -8861,7 +8900,15 @@ class TPUModelRunner(GPUModelRunner):
             targets,
             pad_rows,
         )
-        with self._precompile_timed("async-spec rejected-count correction"):
+        # Serving calls both programs under execute_model's no_grad, and dynamo
+        # guards on grad mode: warmed outside it, every shape compiled again on
+        # its first served step.
+        grad = (
+            torch.no_grad()
+            if envs.VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD
+            else contextlib.nullcontext()
+        )
+        with self._precompile_timed("async-spec rejected-count correction"), grad:
             if pad_rows:
                 # The row pad itself is an eager op, one program per row count.
                 for n in range(1, self.max_num_reqs):
@@ -8882,6 +8929,37 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
         self._subtract_compiled_shapes = frozenset(shapes)
+
+    def _precompile_extract_drafts(self) -> None:
+        """VLLM_TPU_EXTRACT_DRAFTS_COMPILED: compile the verified-draft gather
+        for every (token bucket, padded logits length) pair a verify step can
+        reach, under no_grad like execute_model, so serving never compiles it."""
+        if not (
+            envs.VLLM_TPU_EXTRACT_DRAFTS_COMPILED
+            and self.speculative_config
+            and self.scheduler_config.async_scheduling
+        ):
+            return
+        k = self.speculative_config.num_speculative_tokens
+        max_logits_len = _get_padded_token_len(
+            self.num_tokens_paddings,
+            min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
+        )
+        shapes = _extract_drafts_shapes(self.num_tokens_paddings, max_logits_len)
+        with (
+            self._precompile_timed(f"verified-draft gather ({len(shapes)} shapes)"),
+            torch.no_grad(),
+        ):
+            for num_tokens, logits_len in shapes:
+                # dtypes mirror serving: int32 input ids (input_ids_cpu) and
+                # int32 logits indices (get_spec_decode_metadata).
+                synchronize_tensors(
+                    _extract_drafts_compiled(
+                        torch.zeros(num_tokens, dtype=torch.int32).to(self.device),
+                        torch.zeros(logits_len, dtype=torch.int32).to(self.device),
+                        torch.zeros(logits_len, dtype=torch.int32).to(self.device),
+                    )
+                )
 
     def _precompile_spec_tail(self) -> None:
         """VLLM_TPU_SPEC_TAIL_COMPILED: compile the one-chunk spec tail for
