@@ -286,6 +286,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
+    # Same for the small all-reduce op, which this module builds.
+    "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
     # Still listed: the K3 collective ops (`kimi_k3/collective_ops.py`) build
     # their ops with it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
@@ -301,6 +303,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/gdn_pool_layout.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
+    "vllm_torchtpu/layers/adapter/rmsnorm.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
