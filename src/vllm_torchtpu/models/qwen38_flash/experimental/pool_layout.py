@@ -1,0 +1,393 @@
+# SPDX-License-Identifier: Apache-2.0
+# Provenance: copied from src/vllm_torchtpu/models/vllm/qwen4_exp/pool_layout.py at
+# 39eb62872237661ddc6e78a0c03d12c20dd36165.
+#   Owned by models/qwen38_flash from this copy on.
+"""Model-owned geometry for QSA, GDN and PLE in attention-shaped pool pages.
+
+The scheduler page fits every state type. QSA continues to use 128-token
+kernel pages; compressed keys remain BF16 even when the pool carrier is FP8.
+No allocation or device initialization takes place here.
+"""
+
+import math
+from dataclasses import dataclass, field, replace
+from typing import Any
+
+import torch
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+)
+
+from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+
+from . import settings
+from .attention import QSA_BLOCK_SIZE
+from .config import first_qsa_layer_index, mtp_layer_prefixes, native_cache_specs
+from .mamba_tail_fold import (
+    fold_blocked_by_context_parallel,
+    with_prefill_checkpoint,
+)
+
+# Explicit physical format shared by this model's page planner and GDN ops.
+POOLED_GDN_CONV_STATE_DTYPE = torch.float32
+
+PACK_COMPRESSED_K_ENV = "QWEN4_EXP_PACK_COMPRESSED_K"
+
+
+def pack_compressed_k_enabled() -> bool:
+    """Whether several QSA layers' compressed keys share one pool page.
+
+    Off by default. ``QWEN4_EXP_PACK_COMPRESSED_K=1`` packs; see
+    ``pooled_cache_specs``.
+    """
+    return settings.QWEN4_EXP_PACK_COMPRESSED_K
+
+
+PACK_MAIN_KV_ENV = "QWEN4_EXP_PACK_MAIN_KV"
+
+
+def pack_main_kv_enabled() -> bool:
+    """Whether two QSA layers' main KV heads share one pool page.
+
+    Off by default. ``QWEN4_EXP_PACK_MAIN_KV=1`` pairs; see
+    ``pooled_cache_specs``.
+    """
+    return settings.QWEN4_EXP_PACK_MAIN_KV
+
+
+MAIN_KV_DCP_ENV = "VLLM_TPU_QSA_MAIN_KV_DCP"
+
+
+def main_kv_dcp() -> int:
+    """Decode-context-parallel size of the QSA main KV (1 when off).
+
+    ``VLLM_TPU_QSA_MAIN_KV_DCP=2``: the two TP ranks sharing a KV head
+    (``tp_rank // 2``) split each request's main KV by token. One main-KV
+    block-table entry then covers ``2 * B`` tokens; token ``t`` lives on pair
+    rank ``(t // B) % 2`` at row ``t % B`` of that entry's page, so each rank
+    stores half of the span in an unchanged page. 0 and 1 mean off. This is
+    not vLLM's ``decode_context_parallel_size``, which stays 1.
+    """
+
+    value = settings.VLLM_TPU_QSA_MAIN_KV_DCP
+    if value not in (0, 1, 2):
+        raise ValueError(f"{MAIN_KV_DCP_ENV} must be 0, 1 or 2, got {value}")
+    return max(value, 1)
+
+
+@dataclass(frozen=True)
+class Qwen4ExpPoolLayout:
+    block_size: int
+    page_bytes: int
+    token_bytes: int
+    kernel_block_size: int
+    gdn_state_bytes: int
+    ple_state_bytes: int
+    compressed_kernel_rows: int
+    compressed_kernel_bytes: int
+    compressed_width: int
+    # Layers whose compressed keys share one pool page (1 = unpacked).
+    compressed_slots: int = 1
+    # (QSA attention prefix, compressed-key cache owner name, page slot);
+    # empty when unpacked, where every layer owns ``<prefix>.compressed_k``.
+    compressed_owners: tuple[tuple[str, str, int], ...] = field(default=())
+    # (QSA attention prefix, main KV cache owner name, head-pair slot) of
+    # layers sharing main KV pages; empty when every layer owns its pages.
+    main_owners: tuple[tuple[str, str, int], ...] = field(default=())
+    # `main_kv_dcp()`: tokens per target main-KV block-table entry are
+    # ``main_dcp * block_size``; each pair rank stores ``block_size`` rows of
+    # them per page. MTP draft main KV keeps ``block_size`` unless
+    # VLLM_TPU_QSA_MTP_KV_DCP splits it too.
+    main_dcp: int = 1
+    # Main KV owner groups whose block size is scaled (the draft's with
+    # VLLM_TPU_QSA_MTP_KV_DCP).
+    main_dcp_owners: tuple[str, ...] = field(default=())
+
+    def compressed_owner(self, attention_prefix: str) -> tuple[str, int]:
+        """Cache owner name and in-page slot of a QSA layer's compressed keys."""
+        for prefix, owner, slot in self.compressed_owners:
+            if prefix == attention_prefix:
+                return owner, slot
+        return attention_prefix + ".compressed_k", 0
+
+    def main_owner(self, attention_prefix: str) -> tuple[str, int]:
+        """Cache owner name and head-pair slot of a QSA layer's main KV.
+
+        Slot -1: the layer owns whole rows of its own pages.
+        """
+        for prefix, owner, slot in self.main_owners:
+            if prefix == attention_prefix:
+                return owner, slot
+        return attention_prefix, -1
+
+    @property
+    def main_kernel_pages(self):
+        return self.block_size // self.kernel_block_size
+
+    @property
+    def main_block_size(self):
+        """Logical tokens per target main-KV block-table entry."""
+        return self.main_dcp * self.block_size
+
+    @property
+    def compressed_physical_pages(self):
+        return self.page_bytes // self.compressed_kernel_bytes
+
+
+def pooled_cache_specs(cfg):
+    """Derive uniform physical pages without widening compressed-key coverage.
+
+    Increasing a compressed page's *logical* span merely to fill the pool
+    would multiply prefix-match alignment by the compression ratio. Instead,
+    main and compressed pages cover the same token interval; compressed pages
+    have unused tail bytes. Raw rings retain their non-cacheable lifecycle.
+
+    With ``QWEN4_EXP_PACK_COMPRESSED_K=1`` those tail bytes hold other
+    layers' compressed keys instead: consecutive QSA layers (the MTP draft's
+    included) form one scheduler group named after its first member, whose
+    page stores member ``s`` at kernel pages
+    ``[s * main_kernel_pages, (s + 1) * main_kernel_pages)``. Each member
+    still covers exactly the group's token interval, so prefix alignment,
+    hashing and eviction are unchanged; only the page count per token drops.
+
+    ``QWEN4_EXP_PACK_MAIN_KV=1`` likewise pairs main KV pages. With one FP8
+    KV head per device a token row has four head slots, K and V fill two.
+    Consecutive target QSA layers pair up: the group is named after the
+    first, member ``s`` stores K and V at head slots ``2s`` and ``2s + 1``.
+    MTP draft layers keep pages of their own (the proposer addresses its
+    layer's group by name), as does an odd last target layer.
+
+    ``VLLM_TPU_QSA_MAIN_KV_DCP=2`` (``main_kv_dcp``) gives the target main KV
+    groups, paired or not, ``block_size = 2 * B`` with unchanged page bytes:
+    the two ranks of a KV-head pair each store ``B`` of the entry's ``2 * B``
+    tokens. vLLM then schedules in LCM blocks (``2 * B``) and hashes in GCD
+    blocks (``B``); compressed keys, rings, GDN, PLE and the MTP draft's main
+    KV keep ``B``, so prefix hashing and the draft are unchanged.
+    ``VLLM_TPU_QSA_MTP_KV_DCP`` gives the draft's main KV groups ``2 * B`` too.
+    """
+    specs = native_cache_specs(cfg)
+    text = cfg.model_config.hf_text_config
+    main: Any = specs[
+        f"model.layers.{first_qsa_layer_index(text.layer_types)}.self_attn"
+    ]
+    token_bytes = main.page_size_bytes // main.block_size
+    gdn = specs[
+        f"model.layers.{text.layer_types.index('linear_attention')}.linear_attn"
+    ]
+    assert isinstance(gdn, MambaSpec)
+    state = derive_pooled_gdn_state_layout(
+        ssm_bytes=math.prod(gdn.shapes[1]) * gdn.dtypes[1].itemsize,
+        conv_bytes=math.prod(gdn.shapes[0]) * POOLED_GDN_CONV_STATE_DTYPE.itemsize,
+        token_bytes=token_bytes,
+    )
+    ple_bytes = max(
+        (spec.page_size_bytes for name, spec in specs.items() if name.endswith(".ple")),
+        default=0,
+    )
+    required_rows = max(state.required_tokens, math.ceil(ple_bytes / token_bytes))
+    block_size = math.ceil(required_rows / QSA_BLOCK_SIZE) * QSA_BLOCK_SIZE
+    page_bytes = block_size * token_bytes
+    compressed_rows = QSA_BLOCK_SIZE // text.indexer_compress_ratio
+    # Preserve the pool's lane axis. Narrowing 256 lanes to 128 outside the
+    # kernel can relayout the entire owner; a padded query/key contraction
+    # instead pays for only the active key tiles and keeps native RPA storage.
+    compressed_width = math.ceil(text.head_dim / 128) * 128
+    if text.indexer_head_dim > compressed_width:
+        raise ValueError(
+            "Qwen4Exp pooled indexer width must fit the main KV lane width"
+        )
+    compressed_bytes = compressed_rows * compressed_width * 2
+    if page_bytes % compressed_bytes:
+        raise ValueError("Qwen4Exp pool page must contain whole BF16 indexer pages")
+    # A layer's compressed keys for one manager page fill only
+    # ``main_kernel_pages`` kernel pages; the rest of the pool page is free.
+    packed_slots = page_bytes // (block_size // QSA_BLOCK_SIZE * compressed_bytes)
+    compressed_names = [name for name in specs if name.endswith(".compressed_k")]
+    owners: list[tuple[str, str, int]] = []
+    if pack_compressed_k_enabled() and packed_slots > 1:
+        # Consecutive QSA layers (the MTP draft's last) share one owner
+        # group; one block table and one page lifetime cover all of them,
+        # since compressed keys of every layer track the same token span.
+        for start in range(0, len(compressed_names), packed_slots):
+            chunk = compressed_names[start : start + packed_slots]
+            owners.extend(
+                (name.removesuffix(".compressed_k"), chunk[0], slot)
+                for slot, name in enumerate(chunk)
+            )
+    else:
+        packed_slots = 1
+    main_owners: list[tuple[str, str, int]] = []
+    if pack_main_kv_enabled():
+        packing = 4 if main.dtype == torch.float8_e4m3fn else 2
+        if main.num_kv_heads != 1 or packing * main.num_head_slots != 4:
+            raise ValueError(
+                f"{PACK_MAIN_KV_ENV}=1 pairs layers in the two padding head "
+                "slots of an FP8 main KV row, which needs one KV head per "
+                f"device and --kv-cache-dtype fp8; got {main.num_kv_heads} "
+                f"heads of {main.dtype}"
+            )
+        draft = {prefix + ".self_attn" for prefix in mtp_layer_prefixes(cfg)}
+        targets = [
+            name for name in specs if name.endswith(".self_attn") and name not in draft
+        ]
+        for start in range(0, len(targets) - 1, 2):
+            owner = targets[start]
+            main_owners.extend(
+                (name, owner, slot)
+                for slot, name in enumerate(targets[start : start + 2])
+            )
+    dcp = main_kv_dcp()
+    draft_attention = {prefix + ".self_attn" for prefix in mtp_layer_prefixes(cfg)}
+    paired_away = {name for name, owner, _ in main_owners if name != owner}
+    dcp_owners: tuple[str, ...] = ()
+    if dcp > 1:
+        p = cfg.parallel_config
+        if p.tensor_parallel_size < 2 or p.tensor_parallel_size % dcp:
+            raise ValueError(
+                f"{MAIN_KV_DCP_ENV}={dcp} splits a KV head's main KV over TP rank "
+                f"pairs; needs an even tensor_parallel_size >= 2, got "
+                f"{p.tensor_parallel_size}"
+            )
+        if p.decode_context_parallel_size != 1:
+            raise ValueError(
+                f"{MAIN_KV_DCP_ENV} replaces vLLM's decode context parallelism; "
+                "keep decode_context_parallel_size=1"
+            )
+        from .kernels.block_sparse_gqa_prefill import (
+            PAIRED_KV_TILES,
+        )
+
+        # DCP prefill attends one table entry (dcp pages) per KV tile through
+        # the paired-page kernel; fail here, not in the first prefill.
+        if dcp * block_size not in PAIRED_KV_TILES or main.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"{MAIN_KV_DCP_ENV}={dcp} needs a prefill KV tile of {dcp} x "
+                f"{block_size}-row pages = {dcp * block_size} in the paired-page "
+                f"kernel's {PAIRED_KV_TILES} and an FP8 main KV cache; got "
+                f"{main.dtype}"
+            )
+
+        # VLLM_TPU_QSA_MTP_KV_DCP: the draft's main KV splits like the target's.
+        split_draft = bool(settings.VLLM_TPU_QSA_MTP_KV_DCP)
+        # VLLM_TPU_QSA_COMPRESSED_DCP: compressed keys too. Their groups hold
+        # the draft's keys as well (packed), so the draft must be split.
+        split_compressed = bool(settings.VLLM_TPU_QSA_COMPRESSED_DCP)
+        if split_compressed and not split_draft:
+            raise ValueError(
+                "VLLM_TPU_QSA_COMPRESSED_DCP needs VLLM_TPU_QSA_MTP_KV_DCP: the "
+                "MTP draft writes compressed keys into the split groups"
+            )
+        dcp_owners = tuple(
+            name
+            for name in specs
+            if name.endswith(".self_attn")
+            and (split_draft or name not in draft_attention)
+            and name not in paired_away
+        )
+        if split_compressed:
+            dcp_owners += tuple(
+                name for name in specs if name.endswith(".compressed_k")
+            )
+    layout = Qwen4ExpPoolLayout(
+        block_size=block_size,
+        page_bytes=page_bytes,
+        token_bytes=token_bytes,
+        kernel_block_size=QSA_BLOCK_SIZE,
+        gdn_state_bytes=state.required_bytes,
+        ple_state_bytes=ple_bytes,
+        compressed_kernel_rows=compressed_rows,
+        compressed_kernel_bytes=compressed_bytes,
+        compressed_width=compressed_width,
+        compressed_slots=packed_slots,
+        compressed_owners=tuple(owners),
+        main_owners=tuple(main_owners),
+        main_dcp=dcp,
+        main_dcp_owners=dcp_owners,
+    )
+    # Members other than their group's owner get no scheduler group.
+    packed_away = {prefix + ".compressed_k" for prefix, owner, _ in owners} - {
+        owner for _, owner, _ in owners
+    }
+    packed_away |= {name for name, owner, _ in main_owners if name != owner}
+    pooled: dict[str, KVCacheSpec] = {}
+    # Upstream uses one persistent Mamba state block per request without APC.
+    # Its logical span is max_model_len, while the physical state still fits
+    # in a single uniform pool page. APC uses position-indexed align blocks.
+    mamba_mode = "align" if cfg.cache_config.enable_prefix_caching else "none"
+    mamba_block_size = (
+        block_size if mamba_mode == "align" else cfg.model_config.max_model_len
+    )
+    for name, spec in specs.items():
+        if name in packed_away:
+            continue
+        if isinstance(spec, MambaSpec):
+            dtypes = (
+                (POOLED_GDN_CONV_STATE_DTYPE, spec.dtypes[1])
+                if name.endswith(".linear_attn")
+                else spec.dtypes
+            )
+            pooled[name] = replace(
+                spec,
+                block_size=mamba_block_size,
+                page_size_padded=page_bytes,
+                dtypes=dtypes,
+                mamba_cache_mode=mamba_mode,
+            )
+            if (
+                mamba_mode == "align"
+                and settings.VLLM_TPU_MAMBA_TAIL_FOLD
+                and fold_blocked_by_context_parallel(cfg, dcp) is None
+            ):
+                # The GDN kernel and the PLE layer write the state at the
+                # prompt's last block boundary from inside the step, so the
+                # scheduler need not split the tail off (core/mamba_tail_fold.py).
+                pooled[name] = with_prefill_checkpoint(pooled[name])
+        else:
+            assert isinstance(spec, AttentionSpec)
+            if name.endswith(".compressed_k"):
+                assert isinstance(spec, MLAAttentionSpec)
+                spec = replace(spec, state_content_bytes=compressed_width * 2)
+            if name in dcp_owners:
+                # 2B tokens per entry, B stored rows per rank: one state per
+                # `dcp` tokens keeps the unpadded page at B rows (= page_bytes).
+                pooled[name] = replace(
+                    spec,
+                    block_size=dcp * block_size,
+                    tokens_per_state=dcp,
+                    page_size_padded=page_bytes,
+                )
+                continue
+            pooled[name] = replace(
+                spec,
+                block_size=spec.block_size
+                if name.endswith(".raw_ring")
+                else block_size,
+                page_size_padded=page_bytes,
+            )
+    return layout, pooled
+
+
+def check_packed_compressed_groups(layout: Qwen4ExpPoolLayout, groups) -> None:
+    """Each packed compressed-key or main KV owner needs a block table of its own.
+
+    Members address slots of their owner's pages, so two owners sharing one
+    group (one block ID per token span) would overwrite each other's slots.
+    """
+    for kind, owners, env in (
+        (
+            "compressed keys",
+            {owner for _, owner, _ in layout.compressed_owners},
+            PACK_COMPRESSED_K_ENV,
+        ),
+        ("main KV", {owner for _, owner, _ in layout.main_owners}, PACK_MAIN_KV_ENV),
+    ):
+        for group in groups:
+            names = set(group.layer_names)
+            if names & owners and len(names) != 1:
+                raise ValueError(
+                    f"Qwen4Exp packed {kind} need one scheduler group per "
+                    f"owner, got {sorted(names)}; unset {env}"
+                )
