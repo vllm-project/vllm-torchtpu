@@ -584,9 +584,15 @@ class TPUWorker(WorkerBase):
         # accounting misses those bytes, so subtract them from the KV-cache
         # budget.
         reserves = self.model_runner.post_profile_hbm_reserves()
-        available = utils.min_across_ep_dp(
-            self.parallel_config, budget.available - sum(reserves)
-        )
+        local_available = budget.available - sum(reserves)
+        # A model adapter that owns its cache can report the bytes that cache
+        # may take, e.g. after profiling on a scratch pool.
+        adapter = getattr(self.model_runner, "model_adapter", None)
+        adapter_budget = getattr(adapter, "kv_cache_memory_budget", None)
+        sized = adapter_budget() if callable(adapter_budget) else None
+        if isinstance(sized, int):
+            local_available = sized
+        available = utils.min_across_ep_dp(self.parallel_config, local_available)
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)

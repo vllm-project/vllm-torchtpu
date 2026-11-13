@@ -410,6 +410,21 @@ def test_determine_available_memory_reserves_the_pp_hand_off_buffers(monkeypatch
     assert worker.determine_available_memory() == 6 * utils.GBYTES
 
 
+@pytest.mark.parametrize("sized", [None, 5])
+def test_determine_available_memory_takes_the_model_adapter_budget(monkeypatch, sized):
+    """A model adapter that owns its cache may size it itself; None keeps the
+    measured budget."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=7 * utils.GBYTES, peer=0
+    )
+    budget = None if sized is None else sized * utils.GBYTES
+    worker.model_runner.model_adapter = SimpleNamespace(
+        kv_cache_memory_budget=lambda: budget
+    )
+
+    assert worker.determine_available_memory() == (budget or 7 * utils.GBYTES)
+
+
 def test_out_of_memory_error_shows_the_lora_reserve(monkeypatch):
     """The used HBM is under the cap and only the LoRA reserve pushes the
     budget below zero, so the error must show the reserve and name the LoRA

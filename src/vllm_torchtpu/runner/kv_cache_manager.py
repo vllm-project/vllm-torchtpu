@@ -72,6 +72,7 @@ from vllm_torchtpu.core.runner_slot_mamba import (
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
+    LayerKVCache,
     build_kernel_block_size_by_group_id,
     can_share_attention_cache,
     format_kv_cache_layout_summary,
@@ -265,6 +266,9 @@ class KVCacheManager:
 
     def __init__(self, runner: TPUModelRunner) -> None:
         self.runner = runner
+        # The runner's optional model adapter (set in load_model); when set it
+        # owns the KV cache spec and allocation.
+        self.model_adapter = None
         self.ds_v4 = DsV4KVCacheAllocator(runner)
         # Set when get_kv_cache_spec selects the compact-mamba layout.
         self._compact_mamba_sizing: _CompactMambaSizing | None = None
@@ -277,6 +281,8 @@ class KVCacheManager:
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
+        if self.model_adapter is not None:
+            return self.model_adapter.get_kv_cache_spec()
         layers = get_layers_from_vllm_config(
             self.runner.vllm_config,
             (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
@@ -1409,13 +1415,7 @@ class KVCacheManager:
         if materialized.bm_pool_layout is not None:
             self._bind_block_major_pool_layers(materialized.bm_pool_layout)
 
-        if has_kv_transfer_group():
-            kv_connector = get_kv_transfer_group()
-            kv_connector.register_kv_caches(kv_caches)
-            if hasattr(kv_connector, "set_host_xfer_buffer_ops"):
-                kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
-            if hasattr(kv_connector, "register_runner"):
-                kv_connector.register_runner(self.runner)
+        self._register_kv_connector(kv_caches)
 
         # For hybrid models with spec decoding on the unified pool, keep a
         # per-block device buffer of mamba read offsets (num_accepted - 1
@@ -1492,6 +1492,20 @@ class KVCacheManager:
                     "the block-major unified pool"
                 )
 
+    def _register_kv_connector(self, kv_caches: dict[str, LayerKVCache] | None) -> None:
+        if not has_kv_transfer_group():
+            return
+        if kv_caches is None:
+            raise NotImplementedError(
+                "The model cache must expose its live named buffers for KV transfer"
+            )
+        kv_connector = get_kv_transfer_group()
+        kv_connector.register_kv_caches(kv_caches)
+        if hasattr(kv_connector, "set_host_xfer_buffer_ops"):
+            kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
+        if hasattr(kv_connector, "register_runner"):
+            kv_connector.register_runner(self.runner)
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -1499,6 +1513,10 @@ class KVCacheManager:
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        if self.model_adapter is not None:
+            caches = self.model_adapter.initialize_kv_cache(kv_cache_config)
+            self._register_kv_connector(caches)
+            return
         assert kv_cache_config.num_blocks is not None, (
             "KVCacheConfig.num_blocks must be resolved by the scheduler"
         )
