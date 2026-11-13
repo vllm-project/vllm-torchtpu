@@ -5892,6 +5892,8 @@ class TPUModelRunner(GPUModelRunner):
                 # which torch_tpu compiles against the device's default
                 # generator; seed it the same way on every rank.
                 dev_idx = self.device.index or 0
+                # torch_tpu adds torch.tpu at runtime; torch's stubs do not declare it.
+                # pyrefly: ignore[missing-attribute]
                 default_gens = getattr(torch.tpu, "default_generators", ())
                 if dev_idx < len(default_gens):
                     default_gens[dev_idx].manual_seed(seed)

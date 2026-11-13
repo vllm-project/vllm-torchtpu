@@ -384,8 +384,8 @@ def _quantized_head_local_max(
     # CPU execution path (unit tests and host validation).
     x_q, _ = _quantize_fp8_per_row(hidden_states.float())
     x_f32 = x_q.float()
-    logits = (x_f32 @ lm_head._w8a8_weight_kn.float()) * (
-        lm_head._w8a8_scale.float().unsqueeze(0)
+    logits = (x_f32 @ cast(torch.Tensor, lm_head._w8a8_weight_kn).float()) * (
+        cast(torch.Tensor, lm_head._w8a8_scale).float().unsqueeze(0)
     )
 
     if isinstance(pad_buf, torch.Tensor) and (
@@ -404,7 +404,7 @@ def _quantized_head_local_max(
 
 def tpu_get_top_tokens(
     self: LogitsProcessor,
-    lm_head: torch.nn.Module,
+    lm_head: VocabParallelEmbedding,
     hidden_states: torch.Tensor,
     embedding_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -609,8 +609,8 @@ def _quantized_head_local_topk(
     # CPU execution path (unit tests and host validation).
     x_q, x_s = _quantize_fp8_per_row(hidden_states.float())
     x_f32 = x_q.float()
-    logits = (x_f32 @ lm_head._w8a8_weight_kn.float()) * (
-        x_s.unsqueeze(-1) * lm_head._w8a8_scale.float().unsqueeze(0)
+    logits = (x_f32 @ cast(torch.Tensor, lm_head._w8a8_weight_kn).float()) * (
+        x_s.unsqueeze(-1) * cast(torch.Tensor, lm_head._w8a8_scale).float().unsqueeze(0)
     )
     logits = logits.to(hidden_states.dtype)
 
@@ -629,7 +629,7 @@ def _quantized_head_local_topk(
 
 def tpu_get_topk_candidates(
     self: LogitsProcessor,
-    lm_head: torch.nn.Module,
+    lm_head: VocabParallelEmbedding,
     hidden_states: torch.Tensor,
     embedding_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -770,8 +770,8 @@ def _apply_w8a8_lm_head(
     """Apply an in-place ``W8A8`` quantized ``ParallelLMHead`` when full logits
     are requested (e.g. ``_precompile_compute_logits_from_hidden_states`` or
     non-greedy sampling)."""
-    w_kn = layer._w8a8_weight_kn
-    w_s = layer._w8a8_scale
+    w_kn = cast(torch.Tensor, layer._w8a8_weight_kn)
+    w_s = cast(torch.Tensor, layer._w8a8_scale)
     if x.device.type == "tpu":
         from vllm_torchtpu.layers.adapter import linear_common
 
@@ -827,7 +827,10 @@ def quantize_lm_head(
         )
     _ensure_head_shard_buffers(head, device=w.device)
     if parsed_mode is None:
+        # torch's Module.__setattr__ stub only accepts modules and tensors.
+        # pyrefly: ignore[bad-argument-type]
         head._quant_mode = None
+        # pyrefly: ignore[bad-argument-type]
         head._quant_desc = "bf16"
         return head
 
@@ -863,9 +866,14 @@ def quantize_lm_head(
         w_scale_f32 = w_scale_f32_cpu.to(w.device)
     head.register_buffer("_w8a8_weight_kn", w_fp8_kn, persistent=False)
     head.register_buffer("_w8a8_scale", w_scale_f32, persistent=False)
+    # torch's Module.__setattr__ stub only accepts modules and tensors.
+    # pyrefly: ignore[bad-argument-type]
     head._quant_mode = "fp8"
+    # pyrefly: ignore[bad-argument-type]
     head._quant_desc = "w8a8"
     if in_place:
+        # torch's Module.__setattr__ stub only accepts modules and tensors.
+        # pyrefly: ignore[bad-argument-type]
         head.quant_method = _W8A8EmbeddingQuantMethod()
         if hasattr(head, "weight"):
             delattr(head, "weight")
@@ -1014,7 +1022,8 @@ def topk_candidates_supported(owner: torch.nn.Module) -> bool:
 
 def num_packed_candidates(owner: torch.nn.Module) -> int:
     """Total number of vocabulary-parallel candidates across TP ranks."""
-    return LOCAL_TOPK_CANDIDATES * int(owner.lm_head.tp_size)
+    head = cast("VocabParallelEmbedding", owner.lm_head)
+    return LOCAL_TOPK_CANDIDATES * int(head.tp_size)
 
 
 def topk_candidates(
@@ -1022,6 +1031,8 @@ def topk_candidates(
 ) -> torch.Tensor:
     """Packed ``[rows, 2 * C]`` ``float32`` vocabulary-parallel top-32
     candidates per TP rank (``C = 32 * tp_size``)."""
+    # Module.__getattr__ is typed Tensor | Module; LogitsProcessor gets this at import.
+    # pyrefly: ignore[missing-attribute]
     return owner.logits_processor.get_topk_candidates(owner.lm_head, hidden_states)
 
 
