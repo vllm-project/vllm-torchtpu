@@ -695,104 +695,133 @@ def rpa_kernel(
             ),
         )
         def _run(final_allocs, schedule_ref, dma_sem, scratches):
+            flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
+            flat_smem = jax.tree_util.tree_leaves(schedule_ref)
 
-            @pl.when(num_safe_step_iterations > 0)
-            def _do_run():
-                # Initialize Q to zeros to prevent NaN pollution.
-                #
-                # When a query block is partially filled, tail slots in uninitialized VMEM
-                # may contain residual NaNs. In our implementation, invalid Q rows bypass
-                # invalid row masking and produce NaNs in p_rowsum and later pollute
-                # l_scratch and acc_scratch. Once l_scratch / acc_scratch becomes NaN,
-                # subsequent iterations cannot recover (0 * NaN = NaN).
+            def chunk_bounds(step_idx):
+                start = step_idx * cfgs.max_steps_ub
+                rem = actual_steps % cfgs.max_steps_ub
+                last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
+                is_last_step = step_idx == num_safe_step_iterations - 1
+                size = jnp.where(is_last_step, last_step_size,
+                                 cfgs.max_steps_ub)
+                return start, size
 
-                # Initialize KV cache to zeros.
-                # When perfomring p * v, we perform causal masking on lhs (p) by zeroing
-                # out columns that should not be processed for a given row. Even if we
-                # don't perform masking on rows of rhs (v), the output is still correct
-                # since reuslt of multiplication will be zero thanks zero on lhs. However,
-                # this assumption does not hold if a row of rhs has NaNs. To avoid this,
-                # we initiallize scratch memory with non-zero values. Even if the scratch
-                # memory is storing kv cache from previous step, as long as the data is
-                # not NaNs, there will be no numeric concerns.
+            def schedule_chunk_copies(start_step, num_steps):
+                # All reads are aligned to 128 and some extra steps are copied in
+                # the process.
+                aligned_start_step = (start_step // 128) * 128
+                prefix_steps = start_step - aligned_start_step
+                copies = []
+                for h, s in zip(flat_hbm, flat_smem):
+                    if jax.typeof(h).memory_space == pltpu.HBM:
+                        element_size = s.shape[0] // cfgs.max_steps_ub
+                        read_size = element_size * (num_steps + prefix_steps)
+                        read_size = utils.align_to(read_size, 1024)
+                        read_size = jnp.minimum(read_size, s.shape[0])
 
-                scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
-
-                num_lanes = pltpu.get_tpu_info().num_lanes
-                q_ref_flat = final_allocs[0].window_ref.bitcast(
-                    jnp.uint32).reshape(-1, num_lanes)
-                kv_ref_flat = final_allocs[1].window_ref.bitcast(
-                    jnp.uint32).reshape(-1, num_lanes)
-
-                # Explicitly zero out scratches and Q/KV buffers.
-                for ref in (scratches[1], scratches[2], q_ref_flat,
-                            kv_ref_flat):
-                    ref[...] = jnp.zeros_like(ref)
-
-                def execute_schedule_chunk(start_step, num_steps):
-                    # All reads are aligned to 128 and some extra steps are copied in the
-                    # process.
-                    aligned_start_step = (start_step // 128) * 128
-                    prefix_steps = start_step - aligned_start_step
-
-                    flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
-                    flat_smem = jax.tree_util.tree_leaves(schedule_ref)
-                    dma_list = []
-                    for h, s in zip(flat_hbm, flat_smem):
-                        if jax.typeof(h).memory_space == pltpu.HBM:
-                            element_size = s.shape[0] // cfgs.max_steps_ub
-                            read_size = element_size * (num_steps +
-                                                        prefix_steps)
-                            read_size = utils.align_to(read_size, 128)
-                            read_size = jnp.minimum(read_size, s.shape[0])
-
-                            src_off = element_size * aligned_start_step
+                        src_off = element_size * aligned_start_step
+                        if not isinstance(src_off, int):
                             src_off = pl.multiple_of(src_off, 128)
+                        src = h.at[pl.ds(src_off, read_size)]
+                        dst = s.at[pl.ds(0, read_size)]
+                        copies.append((src, dst))
+                return prefix_steps, copies
 
-                            copy = pltpu.make_async_copy(
-                                h.at[pl.ds(src_off, read_size)],
-                                s.at[pl.ds(0, read_size)],
-                                dma_sem.at[0],
-                            )
-                            copy.start(priority=1, strict_ordering=False)
-                            dma_list.append(copy)
-                    jax.tree.map(lambda x: x.wait(strict_ordering=False),
-                                 dma_list)
+            def enqueue_schedule_chunk(step_idx):
+                # Issue point of the HBM->SMEM scheduler-table DMAs of a chunk;
+                # completion is awaited by `wait_schedule_chunk(step_idx)`.
+                _, copies = schedule_chunk_copies(*chunk_bounds(step_idx))
+                for src, dst in copies:
+                    utils.enqueue_dma(src,
+                                      dst,
+                                      dma_sem.at[0],
+                                      priority=1,
+                                      strict_ordering=False)
 
-                    pipeline_func = pltpu.emit_pipeline(
-                        body=functools.partial(
-                            rpa_body,
-                            cfgs=cfgs,
-                            cu_q_lens_ref=cu_q_lens_ref,
-                            q_offsets_ref=q_offsets_ref,
-                            kv_cache_lens_ref=kv_cache_lens_ref,
-                            kv_new_lens_ref=kv_new_lens_ref,
-                        ),
-                        grid=(num_steps + prefix_steps, ),
-                        in_specs=(q_alloc.spec, kv_cache_alloc.spec),
-                        out_specs=(o_alloc.spec,
-                                   lse_alloc.spec if return_lse else None),
-                    )
-                    pipeline_func(
-                        (q_hbm_ref, schedule_ref),
-                        (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref,
-                         page_indices_ref),
-                        (o_hbm_ref, schedule_ref),
-                        (lse_hbm_ref, schedule_ref) if return_lse else None,
-                        scratches=(schedule_ref, ) + scratches,
-                        allocations=final_allocs,
-                    )
+            def wait_schedule_chunk(step_idx):
+                prefix_steps, copies = schedule_chunk_copies(
+                    *chunk_bounds(step_idx))
+                for src, dst in copies:
+                    pltpu.make_async_copy(
+                        src, dst, dma_sem.at[0]).wait(strict_ordering=False)
+                return prefix_steps
 
-                @pl.loop(0, num_safe_step_iterations)
-                def loop_body(step_idx):
-                    start = step_idx * cfgs.max_steps_ub
-                    rem = actual_steps % cfgs.max_steps_ub
-                    last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub,
-                                               rem)
-                    is_last_step = step_idx == num_safe_step_iterations - 1
-                    size = jnp.where(is_last_step, last_step_size,
-                                     cfgs.max_steps_ub)
-                    execute_schedule_chunk(start, size)
+            # Enqueue the first chunk's scheduler tables before initializing the
+            # VMEM scratches/buffers below, so the HBM->SMEM transfer overlaps
+            # with the vector stores instead of serializing in front of the
+            # pipeline prologue.
+            @pl.when(num_safe_step_iterations > 0)
+            def _():
+                enqueue_schedule_chunk(0)
+
+            # Initialize Q to zeros to prevent NaN pollution.
+            #
+            # When a query block is partially filled, tail slots in uninitialized VMEM
+            # may contain residual NaNs. In our implementation, invalid Q rows bypass
+            # invalid row masking and produce NaNs in p_rowsum and later pollute
+            # l_scratch and acc_scratch. Once l_scratch / acc_scratch becomes NaN,
+            # subsequent iterations cannot recover (0 * NaN = NaN).
+
+            # Initialize KV cache to zeros.
+            # When perfomring p * v, we perform causal masking on lhs (p) by zeroing
+            # out columns that should not be processed for a given row. Even if we
+            # don't perform masking on rows of rhs (v), the output is still correct
+            # since reuslt of multiplication will be zero thanks zero on lhs. However,
+            # this assumption does not hold if a row of rhs has NaNs. To avoid this,
+            # we initiallize scratch memory with non-zero values. Even if the scratch
+            # memory is storing kv cache from previous step, as long as the data is
+            # not NaNs, there will be no numeric concerns.
+
+            scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
+
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            q_ref_flat = final_allocs[0].window_ref.bitcast(
+                jnp.uint32).reshape(-1, num_lanes)
+            kv_ref_flat = final_allocs[1].window_ref.bitcast(
+                jnp.uint32).reshape(-1, num_lanes)
+
+            # Explicitly zero out scratches and Q/KV buffers.
+            for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
+                ref[...] = jnp.zeros_like(ref)
+
+            def execute_schedule_chunk(step_idx):
+                _, num_steps = chunk_bounds(step_idx)
+                prefix_steps = wait_schedule_chunk(step_idx)
+
+                pipeline_func = pltpu.emit_pipeline(
+                    body=functools.partial(
+                        rpa_body,
+                        cfgs=cfgs,
+                        cu_q_lens_ref=cu_q_lens_ref,
+                        q_offsets_ref=q_offsets_ref,
+                        kv_cache_lens_ref=kv_cache_lens_ref,
+                        kv_new_lens_ref=kv_new_lens_ref,
+                    ),
+                    grid=(num_steps + prefix_steps, ),
+                    in_specs=(q_alloc.spec, kv_cache_alloc.spec),
+                    out_specs=(o_alloc.spec,
+                               lse_alloc.spec if return_lse else None),
+                )
+                pipeline_func(
+                    (q_hbm_ref, schedule_ref),
+                    (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref,
+                     page_indices_ref),
+                    (o_hbm_ref, schedule_ref),
+                    (lse_hbm_ref, schedule_ref) if return_lse else None,
+                    scratches=(schedule_ref, ) + scratches,
+                    allocations=final_allocs,
+                )
+
+            @pl.loop(0, num_safe_step_iterations)
+            def loop_body(step_idx):
+                execute_schedule_chunk(step_idx)
+
+                # The SMEM scheduler tables are free once the chunk's pipeline
+                # has drained; enqueue the next chunk's tables right away.
+                @pl.when(step_idx + 1 < num_safe_step_iterations)
+                def _():
+                    enqueue_schedule_chunk(step_idx + 1)
 
         _run()
 

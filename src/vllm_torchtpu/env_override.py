@@ -1,7 +1,14 @@
+# ruff: noqa: F401
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
 
 import os
+
+try:
+    import jax
+    from jax import core as _jax_core
+except Exception:
+    pass
 
 # Configure TorchTPU compilation cache environment variables directly
 if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
@@ -129,6 +136,24 @@ def _fetch_tpu_type_from_metadata() -> str | None:
     return None
 
 
+def _detect_tpu_type() -> str | None:
+    tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
+    if tpu_type:
+        return tpu_type.strip().lower()
+    for var in ("HIEREVO_TARGET_NAME", "TPU_NAME", "HIEREVO_HARDWARE"):
+        val = os.getenv(var, "").strip().lower()
+        if "tpu7" in val or "v7x" in val:
+            return "tpu7x"
+        if "v6e" in val or "tpu6e" in val:
+            return "v6e"
+    libtpu_args = os.getenv("LIBTPU_INIT_ARGS", "").lower()
+    if "tpu7" in libtpu_args or "v7x" in libtpu_args:
+        return "tpu7x"
+    if os.getenv("TORCH_TPU_TOPOLOGY") or os.getenv("BORG_TPUNETD_ARGS"):
+        return "tpu7x"
+    return _fetch_tpu_type_from_metadata()
+
+
 def _resolve_sc_offload_threshold_bytes() -> int | None:
     # SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES:
     #   "auto" (default): look up per-family constant
@@ -152,10 +177,7 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
             return None
         return value if value > 0 else None
 
-    tpu_type = (os.getenv("TPU_ACCELERATOR_TYPE")
-                or os.getenv("HIEREVO_TARGET_NAME"))
-    if not tpu_type:
-        tpu_type = _fetch_tpu_type_from_metadata()
+    tpu_type = _detect_tpu_type()
     if not tpu_type:
         return None
     tpu_type = tpu_type.strip().lower()
@@ -164,6 +186,29 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
             return size
     return None
 
+
+_detected_tpu = _detect_tpu_type()
+if _detected_tpu and ("tpu7" in _detected_tpu or "v7x" in _detected_tpu):
+    os.environ.setdefault("TPU_ACCELERATOR_TYPE", "tpu7x")
+    # High-throughput serving defaults for TPU v7x (matching scripts/vllm/benchmark/inferencex/qwen3.5/server.sh):
+    os.environ.setdefault("TPU_SP_MIN_ROWS", "257")
+    os.environ.setdefault("TPU_SP_FP8_GATHER", "0")
+    os.environ.setdefault("USE_MOE_FUSED_EP_KERNEL", "1")
+    os.environ.setdefault("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "33")
+    os.environ.setdefault("TPU_MOE_LOWTOK_MAX_TOKENS", "256")
+    os.environ.setdefault("TPU_MOE_LOWTOK_FROM_SCORES", "1")
+    os.environ.setdefault("TPU_MOE_LOWTOK_SCORES_STRICT", "1")
+    os.environ.setdefault("TPU_GDN_FUSED_NORM_QUANT", "1")
+    os.environ.setdefault("TPU_FUSED_QK_NORM_ROPE", "1")
+    os.environ.setdefault("USE_MOE_COUNTING_SORT", "1")
+    os.environ.setdefault("TPU_NORM_WEIGHT_HOIST", "1")
+    os.environ.setdefault("TPU_GREEDY_TOP_TOKENS", "1")
+    os.environ.setdefault("TPU_GDN_TABLES_IN_KERNEL", "1")
+    os.environ.setdefault("TPU_GATED_NORM_TILE", "256")
+    os.environ.setdefault("TPU_TOKEN_BUCKET_STEP", "512")
+    os.environ.setdefault("TPU_SMALL_ALL_REDUCE_MAX_ROWS", "64")
+    os.environ.setdefault("USE_MOE_SPARSE_CORE", "1")
+    os.environ.setdefault("RAGGED_GATHER_REDUCE_VERSION", "v3")
 
 _existing_libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
 
@@ -203,6 +248,28 @@ if _sc_offload_bytes is not None:
     ):
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
+
+if _detected_tpu and ("tpu7" in _detected_tpu or "v7x" in _detected_tpu):
+    if not _user_has_flag(
+            "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter"):
+        _libtpu_extra_args.append(
+            "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true"
+        )
+    if not _user_has_flag("--xla_enable_async_all_gather"):
+        _libtpu_extra_args.append("--xla_enable_async_all_gather=true")
+    if not _user_has_flag(
+            "--xla_tpu_enable_sparse_core_collective_offload_all_gather"):
+        _libtpu_extra_args.append(
+            "--xla_tpu_enable_sparse_core_collective_offload_all_gather=true")
+    if not _user_has_flag(
+            "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"):
+        _libtpu_extra_args.append(
+            "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=262144"
+        )
+    if not _user_has_flag(
+            "--xla_tpu_enable_sparse_core_collective_offload_all_reduce"):
+        _libtpu_extra_args.append(
+            "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false")
 
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)

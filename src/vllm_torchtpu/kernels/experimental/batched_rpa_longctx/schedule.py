@@ -27,6 +27,9 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
                                                                     utils)
 
+# Words of the `actual_steps` field; see RpaSchedule.create_shape_dtype.
+ACTUAL_STEPS_WORDS = configs.ACTUAL_STEPS_WORDS
+
 
 class FieldOffset:
     """A Python descriptor that generates the `.at[pos + offset]` lazy lookup.
@@ -214,7 +217,7 @@ class RpaSchedule:
     total_wait_q_in: SmemWrapper  # [steps]
     total_wait_o_out: SmemWrapper  # [steps]
     total_wait_lse_out: SmemWrapper  # [steps]
-    actual_steps: Any  # [1]
+    actual_steps: Any  # [ACTUAL_STEPS_WORDS]; [0] holds the step count.
 
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
@@ -256,7 +259,13 @@ class RpaSchedule:
             total_wait_q_in=steps_wrapper,
             total_wait_o_out=steps_wrapper,
             total_wait_lse_out=steps_wrapper,
-            actual_steps=jax.ShapeDtypeStruct((1, ), jnp.int32),
+            # Padded to ACTUAL_STEPS_WORDS (> 1) words so XLA's
+            # ShapeUtil::IsEffectiveScalar is False for this SMEM operand of
+            # rpa_kernel: it is then fetched by the kernel's batched SMEM operand
+            # DMA instead of a synchronous HBM->VMEM->vreg->v2sf->sreg caller
+            # stub (dma.simple + vwait + vld + vpush/spop) before every call.
+            actual_steps=jax.ShapeDtypeStruct((ACTUAL_STEPS_WORDS, ),
+                                              jnp.int32),
             cfgs=cfgs,
         )
 
@@ -291,17 +300,15 @@ class RpaSchedule:
     def in_specs(self):
         """Returns a Pytree of input BlockSpecs."""
 
-        def wrapper(x):
-            if x.size == 1:
-                return pl.BlockSpec(memory_space=pltpu.SMEM)
-            else:
-                # Since we use maximum upper bound when allocating scheduler data,
-                # it is not feasible to use scalar prefetch and fetch entire scheduler
-                # data into the kernel. Instead, we stored it to HBM first and perform
-                # dynamic sized DMA inside the kernel using actual number of steps.
-                return pl.BlockSpec(memory_space=pltpu.HBM)
-
-        return jax.tree.map(wrapper, self)
+        # Since we use maximum upper bound when allocating scheduler data,
+        # it is not feasible to use scalar prefetch and fetch entire scheduler
+        # data into the kernel. Instead, we stored it to HBM first and perform
+        # dynamic sized DMA inside the kernel using actual number of steps.
+        # Only the step count (`actual_steps`) is an SMEM operand.
+        specs = jax.tree.map(lambda x: pl.BlockSpec(memory_space=pltpu.HBM),
+                             self)
+        return dataclasses.replace(
+            specs, actual_steps=pl.BlockSpec(memory_space=pltpu.SMEM))
 
     def out_specs(self):
         """Returns a Pytree of output BlockSpecs."""
@@ -360,10 +367,11 @@ def _write_schedule_to_hbm(
     hbm_offset_aligned = pl.multiple_of(hbm_offset, 128)  # pytype: disable=bad-argument-type
     flat_hbm = jax.tree_util.tree_leaves(schedule_hbm)
     flat_smem = jax.tree_util.tree_leaves(schedule_smem)
+    actual_steps_hbm = schedule_hbm.actual_steps
     dma_list = []
     for h, s in zip(flat_hbm, flat_smem):
         element_size = s.shape[0] // cfgs.max_steps_ub
-        if h.shape[0] > 1:
+        if h is not actual_steps_hbm:
             write_size = num_steps * element_size
             write_size = utils.align_to(write_size, 128)
             output_offset = hbm_offset_aligned * element_size
@@ -865,6 +873,8 @@ def rpa_metadata_schedule_kernel(
     hbm_offset = loop_carry.hbm_offset
     steps = pl.cdiv(count, cfgs.batch_size) + hbm_offset
     schedule_ref.actual_steps[0] = steps
+    for i in range(1, ACTUAL_STEPS_WORDS):
+        schedule_ref.actual_steps[i] = 0
     # Step 3: Mask out unvisited steps.
     flush_to_hbm(
         count,

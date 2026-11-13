@@ -34,6 +34,7 @@ from typing import Any, Callable
 
 import jax
 import torch
+from jax import core as jax_core
 from jax.sharding import NamedSharding, PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
@@ -72,7 +73,7 @@ def _placeholder(aval, spec, mesh):
     partitioning from ``spec``. Outputs ``jax.export`` did not label, and
     non-array outputs, go through the installed path unchanged.
     """
-    if spec is None or not isinstance(aval, jax.core.ShapedArray):
+    if spec is None or not isinstance(aval, jax_core.ShapedArray):
         return pallas_impl.torch_placeholder(aval, mesh=mesh)
     torch_dtype = pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype)
     if torch_dtype is None:
