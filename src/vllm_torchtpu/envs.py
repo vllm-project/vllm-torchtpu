@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 2048
+    TPU_DCP_MLA_PIECE_ORDER_EDGE: bool = False
     TPU_DCP_MERGE_WEIGHTED_HM: bool = True
     TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS: int = 2048
     TPU_MLA_DECODE_BODY_LEVERS: str = "1"
@@ -759,6 +760,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # min(this, TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS) instead.
     "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS", 2048
+    ),
+    # Order merge pieces' attention by a data edge instead of a barrier, so
+    # chunk k's reduce-scatter runs under piece k+1 (pieces of several chunks).
+    "TPU_DCP_MLA_PIECE_ORDER_EDGE": env_bool(
+        "TPU_DCP_MLA_PIECE_ORDER_EDGE", default=False
     ),
     # The chunked reduce-scatter merge (TPU_DCP_MERGE_CHUNKED) builds each
     # chunk's weighted operand heads-major in one TensorCore Pallas kernel
