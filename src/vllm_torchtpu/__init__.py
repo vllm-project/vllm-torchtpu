@@ -646,6 +646,42 @@ def _patch_vllm_compile_all_ranges() -> None:
         logger.info("Applied TPU patch: compile_all_ranges.")
 
 
+def _patch_vllm_bucket_filter() -> None:
+    """Compile and load only the buckets the module being built serves.
+
+    A model that routes some buckets to a second compiled module (see
+    vllm_torchtpu.compilation.bucket_filter) has each module build, and load
+    from the cache, only its own buckets. Wraps whichever compile_all_ranges /
+    load_all_ranges is installed, so it holds with or without
+    TPU_PARALLEL_PRECOMPILE. Outside a routed call every bucket is kept.
+    """
+    from vllm.compilation.piecewise_backend import PiecewiseBackend
+
+    from vllm_torchtpu.compilation import bucket_filter
+
+    def only_served(method):
+        def run(self, *args, **kwargs):
+            others = {
+                r: e
+                for r, e in self.range_entries.items()
+                if r.is_single_size() and not bucket_filter.serves(r.start)
+            }
+            for r in others:
+                del self.range_entries[r]
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                self.range_entries.update(others)
+
+        return run
+
+    PiecewiseBackend.compile_all_ranges = only_served(
+        PiecewiseBackend.compile_all_ranges
+    )
+    PiecewiseBackend.load_all_ranges = only_served(PiecewiseBackend.load_all_ranges)
+    logger.info("Applied TPU patch: per-module bucket filter.")
+
+
 def _patch_sequence_parallel_moe_admission() -> None:
     """Gate vLLM's sequence-parallel MoE on TPU.
 
