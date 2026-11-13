@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     KDA_FWD_MB: int | None = None
     TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
+    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
     SPEC_WARMUP: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
@@ -213,6 +214,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 0
+    TPU_FUSED_ADD_RMSNORM_QUANT: bool = False
 
 
 def env_with_choices(
@@ -1249,6 +1252,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": env_nonnegative_int_or_auto(
         "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"
     ),
+    # TP all-reduces of compiled steps whose padded token bucket (compile_sizes)
+    # has at most this many bf16 rows run as a Pallas kernel
+    # (kernels/experimental/small_collectives) instead of XLA's. 0, the
+    # default, keeps XLA's for every all-reduce. Needs expert parallelism and a
+    # TP group equal to the expert-parallel group. The crossover against XLA
+    # depends on the core count and the hidden size.
+    "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
+    ),
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
@@ -1301,6 +1313,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
+    # Number of tokens in the padded compile_sizes bucket at or above which the
+    # residual-stream RMSNorms (hidden size at least 4096 and a multiple of 128)
+    # run as one Pallas pass (kernels/fused_add_rmsnorm). Buckets that are not
+    # a multiple of 256 keep vLLM's path. 0, the default, keeps vLLM's RMSNorm:
+    # no lm_eval has been run with the kernel. Same residual; y differs from the
+    # native provider by at most 2 bf16 ulp.
+    "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS": env_nonnegative_int(
+        "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS", 0
+    ),
+    # With TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: the Pallas norm in front of a
+    # per-channel FP8 linear (MLA fused_qkv_a_proj, dense gate_up_proj) also
+    # writes that linear's per-row fp8 input and scale, so the linear skips its
+    # own quantization. Bit-identical. No effect when
+    # TPU_FUSED_ADD_RMSNORM_MIN_TOKENS is 0: the runner logs a warning.
+    "TPU_FUSED_ADD_RMSNORM_QUANT": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT"),
 }
 
 
