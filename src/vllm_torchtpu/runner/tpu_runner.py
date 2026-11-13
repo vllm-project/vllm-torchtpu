@@ -1492,6 +1492,7 @@ class TPUModelRunner(GPUModelRunner):
         # see rows in that segment; see static_verify_q_len for why.
         self._static_verify_q_len: int | None = static_verify_q_len(self.vllm_config)
         self._num_static_verify_reqs = 0
+        self._num_reqs_device: dict[int, torch.Tensor] = {}
         # Drafting and verification happen where sampling happens, on the
         # last pipeline stage; the other stages keep the config for the KV
         # cache spec and the scheduler, and nothing else.
@@ -3979,6 +3980,19 @@ class TPUModelRunner(GPUModelRunner):
                 release_cb()
             self._fenced_h2d_sources.clear()
 
+    def _upload_keyed(
+        self, slot: str, host: torch.Tensor, values: bytes
+    ) -> torch.Tensor:
+        """`_upload_unless_unchanged` with the caller's value key (for dtypes
+        numpy cannot view)."""
+        key = (host.dtype, tuple(host.shape), values)
+        prev = self._h2d_reuse.get(slot)
+        if prev is not None and prev[0] == key:
+            return prev[1]
+        dev = host.to(self.device, non_blocking=True)
+        self._h2d_reuse[slot] = (key, dev, host)
+        return dev
+
     def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
         """`host.to(self.device)`, reusing `slot`'s previous upload when the
         values have not changed.
@@ -4931,7 +4945,7 @@ class TPUModelRunner(GPUModelRunner):
                 self.mamba_slot_read_offsets,
                 list(indices_per_group),
                 next_tokens,
-                torch.tensor(num_reqs, dtype=torch.int64, device=self.device),
+                self._num_reqs_tensor(num_reqs),
             )
         offsets = torch.zeros(
             indices_per_group[0].shape[0],
@@ -4954,6 +4968,18 @@ class TPUModelRunner(GPUModelRunner):
             all_offsets = offsets.repeat(len(indices_per_group))
             self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
         return offsets
+
+    def _num_reqs_tensor(self, num_reqs: int) -> torch.Tensor:
+        """A cached 0-d int64 device tensor holding `num_reqs` (read-only), so
+        the per-step read-offset update does not upload a fresh scalar."""
+        # Lazily created: runners built without __init__ (tests, partial
+        # construction) have no cache yet.
+        cache = self.__dict__.setdefault("_num_reqs_device", {})
+        t = cache.get(num_reqs)
+        if t is None:
+            t = torch.tensor(num_reqs, dtype=torch.int64, device=self.device)
+            cache[num_reqs] = t
+        return t
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -9006,11 +9032,22 @@ class TPUModelRunner(GPUModelRunner):
         cur_end_idx: int,
         logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._padded_sampling_params(
+            cur_start_idx, cur_end_idx, logits.shape[0], logits.dtype, logits.device
+        )
+
+    def _padded_sampling_params(
+        self,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        padded_num_reqs: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
-        padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
-        temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
+        temps_cpu = torch.ones(padded_num_reqs, dtype=dtype)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
         top_p_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
 
@@ -9029,10 +9066,23 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
         )
 
+        if device == self.device:
+            # Requests' sampling parameters rarely change between steps: reuse
+            # the previous uploads while the values match (keyed in float32,
+            # as numpy has no bfloat16).
+            return (
+                self._upload_keyed(
+                    "sampling_temps",
+                    temps_cpu.unsqueeze(1),
+                    temps_cpu.float().numpy().tobytes(),
+                ),
+                self._upload_unless_unchanged("sampling_top_k", top_k_cpu.unsqueeze(1)),
+                self._upload_unless_unchanged("sampling_top_p", top_p_cpu.unsqueeze(1)),
+            )
         return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+            temps_cpu.unsqueeze(1).to(device, non_blocking=True),
+            top_k_cpu.unsqueeze(1).to(device, non_blocking=True),
+            top_p_cpu.unsqueeze(1).to(device, non_blocking=True),
         )
 
     def _topk_candidate_blocks(self) -> int:
