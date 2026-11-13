@@ -51,6 +51,7 @@ the header); the TP32 rings from ``vllm_torchtpu.kernels.kimi_k3.collectives``.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import math
@@ -2793,6 +2794,33 @@ def make_mixture_norm_sp(mesh, *, seq_len, eps=1e-5):
 # The window streams through VMEM in tiles; the KDA state carries across them.
 
 
+def _phase(name):
+    """A named XProf trace scope around a KDA layer phase
+    (KernelConfig.phase_scopes), else nothing."""
+    return jax.named_scope(name) if _config().phase_scopes else contextlib.nullcontext()
+
+
+def _phase_start(name):
+    scope = _phase(name)
+    scope.__enter__()
+    return scope
+
+
+def _phase_end(scope):
+    scope.__exit__(None, None, None)
+
+
+def _scoped(name):
+    """Decorator form of _phase (pl.when and pl.loop bodies)."""
+    def wrap(function):
+        @functools.wraps(function)
+        def scoped(*args, **kwargs):
+            with _phase(name):
+                return function(*args, **kwargs)
+        return scoped
+    return wrap
+
+
 def kda_prefill_tiled_body(
     length_ref,  # [1] INT32 scalar prefetch
     hidden_ref,  # [T, hidden] HBM: BF16, or unit-RMS rows with input_norm
@@ -2909,10 +2937,12 @@ def kda_prefill_tiled_body(
             c.start()
 
     @when(first)
+    @_scoped("kda_weights")
     def load_weights():
         for c in weight_copies:
             c.wait()
 
+    @_scoped("kda_state")
     def copy_now(pairs, first_semaphore):
         copies = [pltpu.make_async_copy(source, destination, weight_sems.at[first_semaphore + i])
                   for i, (source, destination) in enumerate(pairs)]
@@ -2980,6 +3010,7 @@ def kda_prefill_tiled_body(
             ))
         return _Copies(copies)
 
+    @_scoped("kda_tile")
     def tile_body(t):
         buf = t % 2
         in_block = t % block_tiles
@@ -2989,7 +3020,8 @@ def kda_prefill_tiled_body(
             def load_first_tile():  # the block's later tiles are prefetched
                 load_tile(t, buf).start()
 
-        load_tile(t, buf).wait()
+        with _phase("kda_tile_wait"):
+            load_tile(t, buf).wait()
         if packed:
             # The tile's sequence (-1: padding only; offsets are page-aligned,
             # so no tile holds two) and where its rows end. The state copies
@@ -3018,6 +3050,7 @@ def kda_prefill_tiled_body(
             row_end, tile_segment = length, None
 
         @pl.when(in_block >= 2)
+        @_scoped("kda_store_wait")
         def wait_previous_store():
             store_tile(t - 2, buf).wait()
 
@@ -3046,6 +3079,7 @@ def kda_prefill_tiled_body(
             a_log = jnp.exp(alog_vmem[...])  # [3, 1] FP32
             dt_bias = dt_vmem[...]  # [3, 128] FP32
             norm = norm_vmem[0]
+            scope = _phase_start("kda_proj")
             hidden_tile = hidden_bufs.at[buf][...]  # [tile, hidden]
             if input_norm is not None:
                 hidden_tile = hidden_tile.astype(jnp.bfloat16) * input_norm[1][...]
@@ -3066,6 +3100,8 @@ def kda_prefill_tiled_body(
                 projected[:, 3 * width : 4 * width].astype(jnp.float32)
             ).astype(jnp.bfloat16)
             update_rate = projected[:, 4 * width : 4 * width + head_count]  # [tile, 3]
+            _phase_end(scope)
+            scope = _phase_start("kda_conv")
             real_rows = jnp.arange(tile, dtype=jnp.int32) + t * tile < row_end
             raw_gate = _row_where(real_rows, raw_gate, -1e30)
             update_rate = _row_where(real_rows, update_rate, -1e30)
@@ -3092,8 +3128,10 @@ def kda_prefill_tiled_body(
                 decay_lower_bound, a_log[None], raw_gate, dt_bias[None]
             )  # [tile, 3, 128] FP32
             beta = jax.nn.sigmoid(update_rate.astype(jnp.float32))  # [tile, 3] FP32
+            _phase_end(scope)
 
             # ---- chunked delta rule over this tile's 64-token chunks ----
+            scope = _phase_start("kda_chunk")
             outputs = []
             for c in range(tile // _KDA_CHUNK):
                 s0, s1 = c * _KDA_CHUNK, (c + 1) * _KDA_CHUNK
@@ -3120,14 +3158,17 @@ def kda_prefill_tiled_body(
                 outputs.append(chunk_att)
 
             attended = jnp.concatenate(outputs, axis=0)
+            _phase_end(scope)
             if out_bufs is not None:
                 out_bufs.at[buf][...] = attended
             if projection is not None:
+                scope = _phase_start("kda_out_proj")
                 columns = weight_vmem.shape[1] // 14
                 for c in range(14):  # in 512-column panels: fits in 64 FP32 VREGs
                     partial_bufs.at[buf, :, pl.ds(c * columns, columns)][...] = _dot(
                         attended, weight_vmem[:, pl.ds(c * columns, columns)]
                     ).astype(jnp.bfloat16)
+                _phase_end(scope)
 
             # Defer @pl.when conv-history carry until after the entire compute +
             # projection chain so Mosaic keeps all tile intermediates in VREGs
@@ -3164,6 +3205,7 @@ def kda_prefill_tiled_body(
         store_tile(t, buf).start()
 
         @pl.when(in_block == block_tiles - 1)
+        @_scoped("kda_store_wait")
         def drain():  # the block's last two stores
             store_tile(t, buf).wait()
             if block_tiles > 1:
@@ -5248,6 +5290,7 @@ def _kda_layer_body(
 
     pl.when(step == 0)(lambda: _ring_enter(tables_ref, jax.lax.axis_index("k3_sp")))
 
+    @_scoped("kda_mixture")
     def do_normalize(norm_block):
         rows = pl.ds(norm_block * stripe, stripe)
         mixture_norm_tiled_body(
@@ -5375,6 +5418,7 @@ def _kda_gather_segments(tables_ref, local_ref, window_ref, sems, *, first, coun
     rows = window_stripe(local_ref.shape[0]) // halves
 
     @pl.loop(0, count)
+    @_scoped("kda_gather")
     def gather(i):
         s = first + i
         block, row0 = (s // 2, s % 2 * rows) if halves == 2 else (s, 0)
@@ -5391,6 +5435,7 @@ def _kda_reduce_segments(tables_ref, length_ref, partial_ref, prefix_ref, output
     rows = stripe // halves
 
     @pl.loop(0, count)
+    @_scoped("kda_reduce")
     def reduce(i):
         s = first + i
         block, row0 = (s // 2, s % 2 * rows) if halves == 2 else (s, 0)

@@ -107,8 +107,8 @@ class KernelConfig:
     # Weight loading.
     read_streams: int = _host_side(4)
     load_inflight_gb: float = _host_side(16.0)
-    # Named XProf trace scopes around the phases of the decode and of the fused
-    # prefill MoE (profiling only).
+    # Named XProf trace scopes around the phases of the decode, the fused prefill
+    # MoE and the prefill KDA layer (profiling only).
     phase_scopes: bool = False
 
     def __post_init__(self) -> None:

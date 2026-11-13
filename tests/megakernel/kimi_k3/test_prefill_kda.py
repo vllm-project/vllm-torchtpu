@@ -12,9 +12,11 @@ import numpy as np
 import pytest
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.extend import core as jax_core
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.megakernel.kimi_k3.config import KernelConfig
 from vllm_torchtpu.megakernel.kimi_k3.kernels import prefill_megakernel as kernels
 
 pytestmark = pytest.mark.cpu_test
@@ -222,6 +224,49 @@ def test_kda_tiles_apply_the_input_norm_to_fp8_unit_rows(length):
     np.testing.assert_array_equal(got[length:], 0)
     rec_err = np.abs(np.asarray(fused[1]) - np.asarray(rec)).max()
     assert rec_err <= 0.1 * np.abs(np.asarray(rec)).max()
+
+
+def _scope_names(jaxpr):
+    """The named scopes on the equations of ``jaxpr`` and of its sub-jaxprs."""
+    names = set()
+    for eqn in jaxpr.eqns:
+        names.update(str(eqn.source_info.name_stack).split("/"))
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, tuple | list) else (param,):
+                if isinstance(sub, jax_core.ClosedJaxpr):
+                    sub = sub.jaxpr
+                if isinstance(sub, jax_core.Jaxpr):
+                    names |= _scope_names(sub)
+    return names
+
+
+@pytest.mark.parametrize("scopes", [False, True])
+def test_kda_tile_phase_scopes_follow_the_kernel_config(monkeypatch, scopes):
+    monkeypatch.setattr(kernels, "_config", lambda: KernelConfig(phase_scopes=scopes))
+    tokens, hidden = 128, 256
+    rows = jnp.zeros((tokens, hidden), E4M3)
+    state = (
+        jnp.zeros((3, 128, 128), jnp.float32),
+        jnp.zeros((3, 3, 3, 128), jnp.bfloat16),
+    )
+    norm = jnp.ones((1, hidden), jnp.bfloat16)
+    count = jnp.asarray([tokens], jnp.int32)
+    weights = _kda_weights(np.random.default_rng(0), hidden)
+    # A fresh function: a trace cached under the other config would be reused.
+    jaxpr = jax.make_jaxpr(lambda *args: _kda_unit_rows(*args))(
+        rows, weights, state, norm, count
+    )
+    names = {name for name in _scope_names(jaxpr.jaxpr) if name.startswith("kda_")}
+    phases = {
+        "kda_weights",
+        "kda_tile",
+        "kda_tile_wait",
+        "kda_store_wait",
+        "kda_proj",
+        "kda_conv",
+        "kda_chunk",
+    }
+    assert names == (phases if scopes else set())
 
 
 def _delta_rule(q, k, v, gate, beta, state):
