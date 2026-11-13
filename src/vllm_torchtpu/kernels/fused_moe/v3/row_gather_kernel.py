@@ -18,6 +18,7 @@ grouped expert FFN execution.
 """
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -103,7 +104,9 @@ def sparse_core_program(
 
         @jax.jit
         def run(*operands):
-            return tuple(program(*operands))
+            # pl.kernel is typed as also returning its decorator form; with a
+            # body it returns the out_types tuple of arrays.
+            return tuple(cast("tuple[jax.Array, ...]", program(*operands)))
 
         return run
 
