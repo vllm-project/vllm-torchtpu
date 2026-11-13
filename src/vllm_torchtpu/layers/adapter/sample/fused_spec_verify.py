@@ -29,6 +29,7 @@ from typing import Any
 import torch
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+    PLACEHOLDER_TOKEN_ID,
     _random_rejection_sample_with_segment_impl,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
@@ -79,8 +80,7 @@ def sample_rows(
     return torch.argmax(final_logits, dim=-1, keepdim=True)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def spec_verify_sample_fused(
+def _spec_verify_sample_impl(
     logits: torch.Tensor,
     bonus_logits_indices: torch.Tensor,
     target_logits_indices: torch.Tensor,
@@ -145,3 +145,27 @@ def spec_verify_sample_fused(
         None,
         apply_top_k,
     )
+
+
+spec_verify_sample_fused = torch.compile(
+    _spec_verify_sample_impl, backend="tpu", fullgraph=True, dynamic=False
+)
+
+
+def _spec_verify_sample_read_offsets_impl(*args, num_reqs: torch.Tensor, **kwargs):
+    """`_spec_verify_sample_impl` that also returns each row's mamba read
+    offset: `num_accepted - 1` (the checkpoint of its last accepted token),
+    0 for rows at or past `num_reqs` (a 0-d tensor, so it enters as a value).
+    Returns `(tokens [rows, K + 1], row_offsets [rows])`."""
+    next_tokens = _spec_verify_sample_impl(*args, **kwargs)
+    num_valid = (next_tokens != PLACEHOLDER_TOKEN_ID).sum(dim=1)
+    valid = torch.arange(next_tokens.shape[0], device=next_tokens.device) < num_reqs
+    row_offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0)
+    return next_tokens, row_offsets.to(torch.int32)
+
+
+# The verify above plus the post-verify read offsets in one program, for hybrid
+# (mamba) models: the runner then only scatters the offsets into its slot buffer.
+spec_verify_sample_fused_read_offsets = torch.compile(
+    _spec_verify_sample_read_offsets_impl, backend="tpu", fullgraph=True, dynamic=False
+)

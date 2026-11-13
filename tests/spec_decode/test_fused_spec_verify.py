@@ -257,3 +257,55 @@ def test_precompile_warms_every_fused_variant(monkeypatch, blocks):
     if blocks:
         want.append((True, True, blocks))
     assert seen == want
+
+
+def test_fused_verify_also_returns_the_read_offsets():
+    """With a mamba read-offset buffer, the fused verify also returns each
+    row's offset (num_accepted - 1; 0 past num_reqs), and the tokens are the
+    same as the unfused verify's."""
+    vocab, num_reqs, padded = 4096, 13, 16
+    logits, md, input_batch = _case(3, num_reqs, padded, vocab, torch.float32, 0)
+    args = (True, vocab, input_batch, False)
+    want = _verify(_runner(False, *args), logits, md, num_reqs, 3)
+    runner = _runner(True, *args)
+    runner.device = torch.device("cpu")
+    runner._fold_read_offsets = ([torch.arange(padded, dtype=torch.int32)], num_reqs)
+    got = _verify(runner, logits, md, num_reqs, 3)
+    assert torch.equal(got, want)
+    num_valid = (want != -1).sum(dim=1)
+    expected = torch.where(
+        torch.arange(want.shape[0]) < num_reqs, (num_valid - 1).clamp(min=0), 0
+    ).to(torch.int32)
+    assert torch.equal(runner._folded_row_offsets, expected)
+
+
+@pytest.mark.parametrize("num_groups", [1, 2])
+@pytest.mark.parametrize("rows,width", [(4, 4), (6, 4), (3, 4)])
+def test_scatter_folded_read_offsets_matches_the_separate_update(
+    num_groups, rows, width
+):
+    from vllm_torchtpu.runner import tpu_runner
+
+    num_blocks = 32
+    groups = [
+        torch.arange(width, dtype=torch.int32) + 1 + g * width
+        for g in range(num_groups)
+    ]
+    tokens = torch.full((rows, K + 1), -1, dtype=torch.int32)
+    for r in range(rows):
+        tokens[r, : (r % (K + 1)) + 1] = 7
+    num_reqs = min(rows, width) - 1
+    want = torch.full((num_blocks,), 9, dtype=torch.int32)
+    tpu_runner._update_read_offsets_impl(
+        want, groups, tokens, torch.tensor(num_reqs, dtype=torch.int64)
+    )
+    num_valid = (tokens != -1).sum(dim=1)
+    row_offsets = torch.where(
+        torch.arange(rows) < num_reqs, (num_valid - 1).clamp(min=0), 0
+    ).to(torch.int32)
+    runner = SimpleNamespace(
+        mamba_slot_read_offsets=torch.full((num_blocks,), 9, dtype=torch.int32)
+    )
+    offsets = TPUModelRunner._scatter_folded_read_offsets(runner, groups, row_offsets)
+    assert torch.equal(runner.mamba_slot_read_offsets, want)
+    assert offsets.shape == (width,)
