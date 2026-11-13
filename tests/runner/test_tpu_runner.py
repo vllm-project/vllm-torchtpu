@@ -217,6 +217,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     runner = SimpleNamespace(
         max_model_len=1048576,
         max_num_reqs=64,
+        max_num_local_reqs=64,
         max_num_tokens=256,
         block_size=384,
         max_num_blocks_per_req=pages,
@@ -337,6 +338,7 @@ def test_smem_caps_refresh_after_backend_block_size_update():
     runner = SimpleNamespace(
         max_model_len=32768,
         max_num_reqs=256,
+        max_num_local_reqs=256,
         max_num_tokens=8192,
         block_size=16,
         max_num_blocks_per_req=2048,
@@ -370,6 +372,7 @@ def test_smem_caps_refresh_keeps_block_table_width_when_block_size_unchanged():
     runner = SimpleNamespace(
         max_model_len=1000,
         max_num_reqs=256,
+        max_num_local_reqs=256,
         max_num_tokens=8192,
         block_size=16,
         max_num_blocks_per_req=64,  # placeholder table width, > cdiv(1000, 16)
@@ -396,6 +399,7 @@ def test_smem_caps_refresh_keeps_block_size_until_platform_finalizes_it():
     runner = SimpleNamespace(
         max_model_len=32768,
         max_num_reqs=256,
+        max_num_local_reqs=256,
         max_num_tokens=8192,
         block_size=384,
         max_num_blocks_per_req=86,
@@ -484,10 +488,8 @@ def test_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
 @pytest.mark.parametrize("succeeds", [True, False])
 def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
     # Every stage runs the synthetic prefill through the hand-off in step,
-    # so a stage never retries on its own, and settles the burst after its
-    # forward so the launches that carry the prefill on are issued.
+    # so a stage never retries on its own.
     attempts = MagicMock(return_value=succeeds)
-    wave = MagicMock()
     runner = SimpleNamespace(
         enforce_eager=False,
         speculative_config=object(),
@@ -495,7 +497,6 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
             pipeline_parallel_size=4, prefill_context_parallel_size=1
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
-        _pp_wave=wave,
         input_batch=SimpleNamespace(num_reqs=0),
         num_tokens_paddings=[4096],
         max_model_len=262144,
@@ -519,14 +520,12 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
         TPUModelRunner._warmup_mtp_prefill(runner)
 
     assert attempts.call_args_list == [((4096,), {})]
-    assert wave.settle.call_count == 1
 
 
 def test_mtp_prefill_warmup_fills_every_bucket():
     # Buckets are per rank: a PCP8 prompt of 8 x 512 tokens pads to 512 per
     # rank. Prompts above one scheduler step collapse onto its size.
     attempts = MagicMock(return_value=True)
-    wave = MagicMock()
     runner = SimpleNamespace(
         enforce_eager=False,
         speculative_config=object(),
@@ -534,7 +533,6 @@ def test_mtp_prefill_warmup_fills_every_bucket():
             pipeline_parallel_size=4, prefill_context_parallel_size=8
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32768),
-        _pp_wave=wave,
         input_batch=SimpleNamespace(num_reqs=0),
         num_tokens_paddings=[512, 1024, 1536, 2048, 4096, 8192],
         max_model_len=262144,
@@ -554,7 +552,6 @@ def test_mtp_prefill_warmup_fills_every_bucket():
         ((16384,), {}),
         ((32768,), {}),
     ]
-    assert wave.settle.call_count == 5
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -890,6 +887,7 @@ def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
             None if spec_k is None else SimpleNamespace(num_speculative_tokens=spec_k)
         ),
         _last_sequence_layout_plan=None,
+        pcp_manager=None,
         input_batch=SimpleNamespace(req_ids=req_ids),
     )
     cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
@@ -1543,6 +1541,7 @@ class TestAttentionMetadataBuilder:
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
         runner._unified_kv_layout = False
+        runner.pcp_manager = None
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
         runner._unfenced_h2d_sources = []
         runner._free_h2d_sources = {}
@@ -2819,7 +2818,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         uses_mrope=False,
         supports_mm_inputs=False,
         _pp_is_first=True,
-        _pp_wave=None,
+        _pp_handoff=None,
         _pp_topk_buffer=None,
         _kv_cache_bundle=None,
         lora_config=None,
@@ -2839,6 +2838,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         _free_h2d_sources={},
         _registered_h2d_sources=set(),
         _token_padding_state=None,
+        pcp_manager=None,
         sequence_layout_planner=SimpleNamespace(
             prepare_dummy=lambda **kw: SimpleNamespace(
                 descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
@@ -3080,7 +3080,7 @@ class TestInputStagingFence:
         assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
 
         # With through_handoff=True, the fence must be recorded before
-        # _pp_wave.start_forward so the next wait never blocks on the receive.
+        # _pp_handoff.start_forward so the next wait never blocks on the receive.
         handoff_checked = []
 
         def start_forward(n):
@@ -3089,8 +3089,7 @@ class TestInputStagingFence:
             handoff_checked.append(n)
             return None
 
-        runner._pp_wave = SimpleNamespace(
-            step=contextlib.nullcontext,
+        runner._pp_handoff = SimpleNamespace(
             start_forward=start_forward,
             end_forward=lambda *a: None,
         )
@@ -3882,8 +3881,9 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             has_structured_output_requests=False,
         )
         runner = SimpleNamespace(
-            _pp_wave=None,
+            _pp_handoff=None,
             _dp_step_other_decode=False,
+            num_prompt_logprobs={},
             execute_model_state=SimpleNamespace(
                 scheduler_output=scheduler_output,
                 draft_chunks=[],
@@ -3895,6 +3895,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
                 pooler_output_list=[],
                 top_tokens=False,
                 kv_save_nan_check=None,
+                prompt_logprobs_chunks=[],
             ),
             input_batch=SimpleNamespace(
                 max_num_logprobs=None,

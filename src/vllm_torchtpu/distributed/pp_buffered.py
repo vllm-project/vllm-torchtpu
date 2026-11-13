@@ -21,10 +21,16 @@ landing buffer, and once the sender's data is ready the runtime copies it
 there. So a stage waits only for its own input, never for the other stages
 to reach the same point, and a forward moves on as soon as it is done.
 
-What travels is what ``pp_wave`` carries: the sum of hidden states and
-residual in the model dtype, plus any side tensor such as a sparse model's
-top-k table. The next stage starts from that sum and a zero residual, one
-kept per padded token count.
+What travels is the sum of hidden states and residual, one tensor in the
+model dtype, plus any side tensor such as a sparse model's top-k table. The
+next stage starts from that sum and a zero residual, one kept per padded
+token count. Its first norm adds hidden states and residual in float32,
+normalizes that sum, and keeps it rounded to the model dtype as the new
+residual. Given the rounded sum and a zero residual, the norm keeps the
+identical residual but normalizes a sum rounded once more than in a
+single-stage model: a relative difference of at most 2^-8 per element for
+bfloat16. Sending the sum halves the bytes on the link; sending both
+tensors would reproduce the single-stage arithmetic exactly.
 
 A forward is one runner forward over one token chunk. Every stage runs the
 same sequence of forwards, so a count of transfers kept by each process
@@ -53,8 +59,8 @@ end_forward records a fence after every forward, on the last stage too,
 and the send thread advances ``landed_through`` once that fence completes.
 The posting thread posts a transfer only while at most 7 receive calls are
 posted whose forwards have not completed, so a step of many forwards, or a
-deep ring, waits in that thread rather than stalling the sender.
-``check_ring_receives`` refuses a depth that, with one forward per step,
+large depth, waits in that thread rather than stalling the sender.
+``check_buffered_receives`` refuses a depth that, with one forward per step,
 could hold more than 7 at once.
 
 The sender hands its output on from a helper thread. end_forward submits the
@@ -68,29 +74,25 @@ taken up its step. At most ``depth`` forwards wait in a stage's queue, the
 one being sent included; end_forward blocks until there is room, which
 bounds the memory a stage that runs ahead holds for its outputs. The engine
 keeps more steps in flight than the pipeline has stages
-(``pp_push.ring_extra_steps``), so stage 0 has its next forward queued
-while the engine core prepares the following step.
+(``pp_engine.buffered_extra_steps``), so stage 0 has its next forward
+queued while the engine core prepares the following step.
 
-Unlike the wave, nothing here needs the stages to issue the same launches:
-there is no prologue, the engine sends no pushes and no settles (``push``
-and ``settle`` do nothing), a stage of several chips neither drains its
-device nor waits at a world barrier before a hand-off, and the only programs
-a stage runs across its devices are its forwards.
+Nothing here needs the stages to issue matching launches: a stage of
+several chips neither drains its device nor waits at a world barrier before
+a hand-off, and the only programs a stage runs across its devices are its
+forwards.
 """
 
 import math
 import threading
 from collections import deque
-from collections.abc import Iterator
 from concurrent.futures import Future
-from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.sequence import IntermediateTensors
 
-from vllm_torchtpu.distributed.pp_push import ring_extra_steps
-from vllm_torchtpu.distributed.pp_wave import HIDDEN_STATES, RESIDUAL, _fence, _flush
+from vllm_torchtpu.distributed.pp_engine import buffered_extra_steps
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
@@ -99,25 +101,55 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# The intermediate tensors every stage passes on.
+HIDDEN_STATES = "hidden_states"
+RESIDUAL = "residual"
+
 # Tags are C ints; transfer numbers wrap well before they would overflow one.
 _TAG_SPAN = 1 << 30
 
 _LIBTPU_REQUIREMENT = (
-    "TPU_PP_HANDOFF=ring needs a libtpu whose transfers between hosts land in "
-    "the posted receive, as libtpu 0.0.50 and later do with torch_tpu 0.2.0 "
-    "and later; TPU_PP_HANDOFF=wave does not"
+    "The pipeline hand-off needs a libtpu whose transfers between hosts "
+    "land in the posted receive, as libtpu 0.0.50 and later do with "
+    "torch_tpu 0.2.0 and later"
 )
 
 # Receive calls a device may have posted whose data has not landed, each
 # counted until the forward that read it has completed. A device has 8
 # receive flags, and a receive posted beyond them stalls its sender without
-# an error; the ring keeps one spare.
+# an error; the hand-off keeps one spare.
 _MAX_RECEIVES = 7
 
 
-def ring_receives_posted(stages: int, depth: int, carried: int = 1) -> int:
-    """The most receive calls a device of a ``stages``-stage ring of
-    ``depth`` can have posted whose data has not landed, with one forward
+def pp_rank_flags(parallel_config: Any) -> tuple[bool, bool]:
+    """(is_first_stage, is_last_stage) for this worker."""
+    if parallel_config.pipeline_parallel_size <= 1:
+        return True, True
+    from vllm.distributed.parallel_state import get_pp_group
+
+    group = get_pp_group()
+    return bool(group.is_first_rank), bool(group.is_last_rank)
+
+
+def _flush(tensors: tuple[torch.Tensor, ...]) -> None:
+    """Submits the pending ops producing ``tensors`` without blocking."""
+    from torch_tpu._internal.sync import sync
+
+    sync.synchronize(list(tensors), wait=False)
+
+
+def _fence() -> "TpuEvent":
+    """Records a device event for all work submitted so far."""
+    from torch_tpu._internal.stream.streams import TpuEvent
+
+    event = TpuEvent()
+    event.record()
+    return event
+
+
+def buffered_receives_posted(stages: int, depth: int, carried: int = 1) -> int:
+    """The most receive calls a device of a ``stages``-stage pipeline
+    with ``depth`` can have posted whose data has not landed, with one forward
     per step and ``carried`` tensors per forward.
 
     A stage posts a step's receives when it begins the step. The last stage
@@ -126,28 +158,28 @@ def ring_receives_posted(stages: int, depth: int, carried: int = 1) -> int:
     ``depth`` earlier forwards: end_forward waits while that many are
     unsent, and a forward is sent only after it has run on the data it
     received. No stage holds more than the steps the engine keeps in
-    flight: ``stages`` plus ``pp_push.ring_extra_steps``.
+    flight: ``stages`` plus ``pp_engine.buffered_extra_steps``.
 
     At run time every device holds its posted receives to _MAX_RECEIVES,
     whether a step queues them ahead or a forward posts its own, so a step
-    of more forwards, or a deeper ring, waits there instead.
+    of more forwards, or a larger depth, waits there instead.
     """
     if stages < 2:
         return 0
-    held = 1 if stages == 2 else min(stages + ring_extra_steps(stages), depth + 1)
+    held = 1 if stages == 2 else min(stages + buffered_extra_steps(stages), depth + 1)
     return carried * held
 
 
-def check_ring_receives(stages: int, depth: int, carried: int = 1) -> None:
+def check_buffered_receives(stages: int, depth: int, carried: int = 1) -> None:
     """Raises ValueError when a device could have more receives posted than
-    the ring allows."""
-    posted = ring_receives_posted(stages, depth, carried)
+    the hand-off allows."""
+    posted = buffered_receives_posted(stages, depth, carried)
     if posted > _MAX_RECEIVES:
         raise ValueError(
-            f"TPU_PP_RING_DEPTH={depth} lets a device of a {stages}-stage "
+            f"TPU_PP_HANDOFF_DEPTH={depth} lets a device of a {stages}-stage "
             f"pipeline post {posted} receives at once ({carried} per forward); "
-            "at most 8 receives can be outstanding per device, and the ring "
-            "keeps one spare. Lower TPU_PP_RING_DEPTH."
+            "at most 8 receives can be outstanding per device, and the "
+            "hand-off keeps one spare. Lower TPU_PP_HANDOFF_DEPTH."
         )
 
 
@@ -157,10 +189,10 @@ def hbm_reserve_bytes(
     depth: int,
     zero_residual_rows: int,
 ) -> int:
-    """An upper bound on the device memory a stage's ring holds beyond the
+    """An upper bound on the device memory a stage's hand-off holds beyond the
     model and the KV cache. Outgoing: up to ``depth`` forwards queued for
     sending plus the one end_forward holds while it waits for room, each
-    the tensors the ring carries at ``max_rows`` rows. Landing: up to
+    the tensors the hand-off carries at ``max_rows`` rows. Landing: up to
     _MAX_RECEIVES posted receives, each one carried tensor at ``max_rows``
     rows. Zero residuals: one per padded row count the runner can hand a
     forward, ``zero_residual_rows`` rows in all. The first stage posts no
@@ -185,11 +217,7 @@ def _first_and_last(x: torch.Tensor) -> tuple[float, float]:
     return float(x[0, 0].item()), float(x[-1, -1].item())
 
 
-class PPRing:
-    # Read by the worker's pp_drains_before_handoff: no stage waits for the
-    # slice before a hand-off.
-    drain_before_handoff = False
-
+class PPBuffered:
     def __init__(
         self,
         device: torch.device,
@@ -226,8 +254,8 @@ class PPRing:
                 f"tensors are {template}"
             )
         if depth < 1:
-            raise ValueError(f"the ring needs a depth of at least 1, got {depth}")
-        check_ring_receives(self.size, depth, 1 + len(extras))
+            raise ValueError(f"the hand-off needs a depth of at least 1, got {depth}")
+        check_buffered_receives(self.size, depth, 1 + len(extras))
         # The first is the activation sum; the rest are side data a stage
         # passes on unchanged. Every stage builds from the same template,
         # so the order matches across stages.
@@ -275,7 +303,7 @@ class PPRing:
         # KV-cache budget reserves them (hbm_reserve_bytes).
         self._zero_residuals: dict[int, torch.Tensor] = {}
         logger.info(
-            "PP ring: rank %d/%d column %d/%d (global rank %d, from %s, to %s), "
+            "PP buffered: rank %d/%d column %d/%d (global rank %d, from %s, to %s), "
             "depth %d, hand-off carries %s",
             self.rank,
             self.size,
@@ -302,7 +330,7 @@ class PPRing:
         self._check_rows(transfer, rows)
         if transfer != self.posted_through + 1:
             raise RuntimeError(
-                f"PP ring rank {self.rank}: posting transfer {transfer} after "
+                f"PP buffered rank {self.rank}: posting transfer {transfer} after "
                 f"{self.posted_through}"
             )
         received = []
@@ -319,7 +347,7 @@ class PPRing:
     def _check_rows(self, transfer: int, rows: int) -> None:
         if not 0 < rows <= self.max_rows:
             raise RuntimeError(
-                f"PP ring rank {self.rank}: transfer {transfer} of {rows} rows, "
+                f"PP buffered rank {self.rank}: transfer {transfer} of {rows} rows, "
                 f"the hand-off holds 1 to {self.max_rows}"
             )
 
@@ -330,21 +358,15 @@ class PPRing:
     def _raise_send_failure_locked(self) -> None:
         if self._error is not None:
             raise RuntimeError(
-                f"PP ring rank {self.rank}: the send thread failed"
+                f"PP buffered rank {self.rank}: the send thread failed"
             ) from self._error
 
     def _raise_post_failure(self) -> None:
         with self._cv:
             if self._post_error is not None:
                 raise RuntimeError(
-                    f"PP ring rank {self.rank}: the posting thread failed"
+                    f"PP buffered rank {self.rank}: the posting thread failed"
                 ) from self._post_error
-
-    @contextmanager
-    def step(self) -> Iterator[None]:
-        """Marks a runner call that traces device ops. The helper threads
-        trace none, so there is nothing to keep out of it."""
-        yield
 
     def warmup(self) -> None:
         """One small transfer of every carried tensor from each device to
@@ -383,7 +405,7 @@ class PPRing:
             got = [_first_and_last(x) for x in received]
         except Exception as exc:
             raise RuntimeError(
-                f"PP ring rank {self.rank}: the hand-off self-test failed. "
+                f"PP buffered rank {self.rank}: the hand-off self-test failed. "
                 f"{_LIBTPU_REQUIREMENT}."
             ) from exc
         if self.prev is None:
@@ -395,7 +417,7 @@ class PPRing:
             want = float(torch.tensor(self.prev + 1).to(dtype).item())
             if any(value != want for value in values):
                 raise RuntimeError(
-                    f"PP ring rank {self.rank}: hand-off self-test tensor "
+                    f"PP buffered rank {self.rank}: hand-off self-test tensor "
                     f"{key!r} received {values}, expected {want} from global "
                     f"rank {self.prev}. {_LIBTPU_REQUIREMENT}."
                 )
@@ -409,7 +431,7 @@ class PPRing:
         self._raise_post_failure()
         if self._posted:
             raise RuntimeError(
-                f"PP ring rank {self.rank}: {len(self._posted)} receives were "
+                f"PP buffered rank {self.rank}: {len(self._posted)} receives were "
                 "posted for forwards that never ran"
             )
         if self.rank == 0 or not rows_per_forward:
@@ -422,7 +444,7 @@ class PPRing:
             queued.append((transfer, rows, Future()))
         if self._post_thread is None:
             self._post_thread = threading.Thread(
-                target=self._post_loop, name="pp-ring-post", daemon=True
+                target=self._post_loop, name="pp-buffered-post", daemon=True
             )
             self._post_thread.start()
         with self._cv:
@@ -438,7 +460,7 @@ class PPRing:
         return outstanding <= _MAX_RECEIVES
 
     def _post_stops(self) -> bool:
-        """Whether the posting thread stops: the ring closes, or its send
+        """Whether the posting thread stops: the hand-off closes, or its send
         thread failed, which also fails what is queued for posting."""
         return self._closing or self._error is not None
 
@@ -466,7 +488,9 @@ class PPRing:
                     received = self._post(transfer, rows)
             except BaseException as exc:  # re-raised on the worker thread
                 logger.exception(
-                    "PP ring rank %d: posting transfer %d failed", self.rank, transfer
+                    "PP buffered rank %d: posting transfer %d failed",
+                    self.rank,
+                    transfer,
                 )
                 # Nothing after it can be posted in order.
                 with self._cv:
@@ -488,7 +512,7 @@ class PPRing:
         self._raise_send_failure()
         if error is not None:
             raise RuntimeError(
-                f"PP ring rank {self.rank}: the posting thread failed"
+                f"PP buffered rank {self.rank}: the posting thread failed"
             ) from error
         return landing.result()
 
@@ -519,7 +543,7 @@ class PPRing:
             received = self._post(transfer, rows)
         if transfer != self.transfers or posted_rows != rows:
             raise RuntimeError(
-                f"PP ring rank {self.rank}: forward {self.transfers} of {rows} "
+                f"PP buffered rank {self.rank}: forward {self.transfers} of {rows} "
                 f"rows found the receive of transfer {transfer} posted for "
                 f"{posted_rows} rows"
             )
@@ -548,10 +572,10 @@ class PPRing:
         missing = [key for key in self.carried if key not in tensors]
         if missing:
             raise RuntimeError(
-                f"PP ring rank {self.rank}: the forward produced no "
+                f"PP buffered rank {self.rank}: the forward produced no "
                 f"{missing} to hand on"
             )
-        # Summed in the model dtype; see pp_wave's module docstring.
+        # Summed in the model dtype; see the module docstring.
         total = tensors[HIDDEN_STATES] + tensors[RESIDUAL]
         outgoing = (total, *(tensors[key] for key in self.carried[1:]))
         # Sending a view would build its copy on the send thread; the copy is
@@ -564,7 +588,7 @@ class PPRing:
         }
         if wrong:
             raise RuntimeError(
-                f"PP ring rank {self.rank}: forward {self._current} of {rows} "
+                f"PP buffered rank {self.rank}: forward {self._current} of {rows} "
                 f"rows hands on {wrong}"
             )
         _flush(outgoing)
@@ -575,13 +599,13 @@ class PPRing:
     ) -> None:
         if self._thread is None:
             self._thread = threading.Thread(
-                target=self._send_loop, name="pp-ring-send", daemon=True
+                target=self._send_loop, name="pp-buffered-send", daemon=True
             )
             self._thread.start()
         with self._cv:
             # A fence alone holds no outputs and waits for no room.
             if outgoing and len(self._sends) >= self.depth and self._error is None:
-                with TraceAnnotation("PP:RingFull"):
+                with TraceAnnotation("PP:SendQueueFull"):
                     self._cv.wait_for(
                         lambda: len(self._sends) < self.depth or self._error is not None
                     )
@@ -623,7 +647,9 @@ class PPRing:
                 self._send(*self._sends[0])
             except BaseException as exc:  # re-raised on the worker thread
                 logger.exception(
-                    "PP ring rank %d: sending transfer %d failed", self.rank, transfer
+                    "PP buffered rank %d: sending transfer %d failed",
+                    self.rank,
+                    transfer,
                 )
                 error = exc
             with self._cv:
@@ -642,13 +668,6 @@ class PPRing:
                 if outgoing:
                     self.sent += 1
                 self._cv.notify_all()
-
-    def push(self) -> None:
-        """Does nothing: every forward moves on as soon as it is done, and
-        the engine sends no pushes with the ring."""
-
-    def settle(self) -> None:
-        """Does nothing: no stage holds launches for the others to match."""
 
     def close(self) -> None:
         """Drops the receives still queued, whose forwards will not run,
