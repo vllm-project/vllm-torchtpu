@@ -48,7 +48,6 @@ from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
-import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
@@ -493,12 +492,10 @@ class TPUWorker(WorkerBase):
             "rank=%s | "
             "is_first_rank=%s | "
             "is_last_rank=%s | "
-            "node_id=%s | "
             "is_driver_worker=%s | ",
             self.rank,
             is_first_rank,
             is_last_rank,
-            dist_utils.get_node_id(),
             self.is_driver_worker,
         )
         # f"hbm={utils.hbm_usage_gb(self.devices)}GiB")
@@ -920,16 +917,6 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
-
-    def get_node_kv_ip_port(self) -> tuple[int, str, int]:
-        node_id = dist_utils.get_node_id()
-        ip = dist_utils.get_host_ip()
-        tp_size = self.parallel_config.tensor_parallel_size
-        n_cfg = dist_utils.get_transfer_channel_number()
-        n_channels = tp_size if n_cfg <= 0 else min(n_cfg, tp_size)
-        n_channels = max(1, n_channels)
-        base_port = int(dist_utils.get_kv_transfer_port()) + node_id * n_channels
-        return (node_id, ip, base_port)
 
     def sync_weights(
         self,

@@ -92,30 +92,6 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh
 
-      # PR and merge-queue builds only; a nightly does not run it.
-      - label: "Presubmit: disagg-single-host"
-        key: "presubmit_disagg_single_host"
-        if: "build.pull_request.id != null || build.merge_queue.base_branch != null"
-        env:
-          SHAPE: *shape_8_core
-        <<: *integration_step
-        plugins:
-          - *kube_plugin
-        # Each role compiles only what this benchmark runs: 512-token prompts at
-        # 4 req/s, prefill-only on P (at most 4 prompts in a 2048-token step),
-        # one recomputed token per request on D, whose running set peaked at
-        # 72. The defaults compile request buckets up to 256 on both and token
-        # buckets up to 2048 on D.
-        commands:
-          - >-
-            .buildkite/kubernetes/run.sh
-            env
-            TPU_KV_RESHARD_TRANSPORT=zmq
-            LOG_DIR=perf_eval_results/disagg_single_host
-            PREFILL_EXTRA_ARGS="--max-num-seqs 8"
-            DECODE_EXTRA_ARGS="--max-num-batched-tokens 128 --max-num-seqs 128"
-            bash ./examples/disagg/run_disagg_single_host.sh
-
       - label: "Integration: qwen35-apc-correctness"
         key: "integration_qwen35_apc_correctness"
         env:

@@ -16,7 +16,10 @@
 import os
 from typing import Any
 
-from vllm_torchtpu.distributed.kv_transfer.connector_names import kv_connector_names
+from vllm_torchtpu.distributed.kv_transfer.connector_names import (
+    RAIDEN_PD_CONNECTOR_NAMES,
+    kv_connector_names,
+)
 
 
 def _torch_tpu_builds_stage_meshes() -> bool:
@@ -44,7 +47,7 @@ _FULL_ATTENTION_LAYER_TYPES = [
 # KV transfer connectors that register each stage's own layers: the
 # disaggregation connector with the stage's peer, the offloading connector
 # with the offload controller.
-_RAIDEN_CONNECTORS = ("TPURaidenConnector", "TPURaidenOffloadingConnector")
+_RAIDEN_CONNECTORS = (*RAIDEN_PD_CONNECTOR_NAMES, "TPURaidenOffloadingConnector")
 
 
 def _non_raiden_connectors(kv_transfer_config: Any) -> list[str]:

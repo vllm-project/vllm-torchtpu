@@ -408,7 +408,6 @@ def _pp_pcp_coordinates(stage, pcp_rank):
 def test_pp_pcp_producer_topology_and_unit_identity(monkeypatch, pp, pcp):
     worker = _pp_pcp_worker(monkeypatch, pp=pp, pcp=pcp)
     assert worker._raiden_qwen35_admission_topology() == f"pp{pp}pcp{pcp}_prefill"
-    monkeypatch.setattr(worker, "_raiden_stage3_enabled", lambda: True)
     ranks, ports = [], set()
     for stage in range(pp):
         for p in range(pcp):
