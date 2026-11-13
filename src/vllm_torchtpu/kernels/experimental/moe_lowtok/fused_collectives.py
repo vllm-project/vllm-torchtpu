@@ -42,7 +42,7 @@ axes are ("dp", "tp") in that order, with TP pairs on one chip.
 """
 
 import functools
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -1132,10 +1132,11 @@ def moe_lowtok_fused(
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=vmem_budget(sc.vmem_bytes, operand_bytes),
-            **(
+            **cast(
+                "dict[str, Any]",
                 {"collective_id": COLLECTIVE_ID}
                 if "inkernel" in (dispatch, combine)
-                else {}
+                else {},
             ),
         ),
         name=name,
