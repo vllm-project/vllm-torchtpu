@@ -323,7 +323,15 @@ def select_experts(
         bias = e_score_correction_bias.float().view(bias_shape)
         scores_for_choice = scores + bias
         _, topk_ids = _topk(scores_for_choice, topk)
-        topk_weights = scores.gather(-1, topk_ids.long())
+        # A one-hot select, not `scores.gather`: the TPU runs a gather as its
+        # own fusion of ~0.65 us even for a decode step's few rows, while
+        # this compare-select-sum fuses (one nonzero term per sum: exact).
+        experts = torch.arange(
+            scores.shape[-1], dtype=topk_ids.dtype, device=scores.device
+        )
+        topk_weights = torch.where(
+            topk_ids.unsqueeze(-1) == experts, scores.unsqueeze(-2), 0.0
+        ).sum(dim=-1)
     else:
         topk_weights, topk_ids = _topk(scores, topk)
 

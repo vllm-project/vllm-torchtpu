@@ -153,6 +153,31 @@ def test_select_experts_rowmax_matches_sort(monkeypatch):
     assert torch.equal(got_i, ref_i.to(torch.int32))
 
 
+def test_select_experts_bias_weights_are_the_unbiased_scores(monkeypatch):
+    """With a routing bias, experts are picked on biased scores and weighted
+    by their unbiased ones: the picked columns of the scores, exactly."""
+    torch = pytest.importorskip("torch")
+    torch.manual_seed(1)
+    hidden = torch.randn(24, 8, dtype=torch.bfloat16)
+    logits = torch.randn(24, 128)
+    layer = _routing_layer(topk=4, renormalize=False)
+    layer.e_score_correction_bias = torch.randn(128) * 0.5
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    weights, ids = moe_routing.select_experts(
+        hidden_states=hidden,
+        router_logits=logits,
+        topk=4,
+        renormalize=False,
+        scoring_fn="sigmoid",
+        layer=layer,
+    )
+    scores = torch.sigmoid(logits.float())
+    biased = scores + layer.e_score_correction_bias
+    assert torch.equal(ids, torch.topk(biased, 4, dim=-1).indices.to(torch.int32))
+    want = scores.gather(-1, ids.long()).to(weights.dtype)
+    assert torch.equal(weights, want)
+
+
 def test_router_topk_op_is_registered_at_import():
     """The op must exist before the first call: a lazy, lock-guarded
     registration is untraceable by Dynamo and aborts the MoE compile."""
