@@ -169,14 +169,16 @@ def route_topk(
         in_rank = jnp.logical_and(lane_b >= rr * ER, lane_b < (rr + 1) * ER)
         # copy slot row j: rank-major (rank j // EXTRA, extra slot j % EXTRA,
         # code j + 1) or with cp_interleave rank-minor (rank j % R, extra slot
-        # j // R); `ecopy` holds 1 + rank * EXTRA + slot.
-        cp_code = (
-            (row_b % R) * mp.EXTRA + lax.div(row_b, R) + 1
-            if mp.cp_interleave
-            else row_b + 1
-        )
+        # j // R); `ecopy` holds 1 + rank * EXTRA + slot. With cp_interleave
+        # off the row test is traced before the code, as without the option.
+        if mp.cp_interleave:
+            cp_code = (row_b % R) * mp.EXTRA + lax.div(row_b, R) + 1
+            in_cp = row_b < NCP
+        else:
+            in_cp = row_b < NCP
+            cp_code = row_b + 1
         bm = jnp.where(
-            row_b < NCP,
+            in_cp,
             jnp.where(cpi == cp_code, 1.0, 0.0),
             jnp.where(
                 rr < R,
