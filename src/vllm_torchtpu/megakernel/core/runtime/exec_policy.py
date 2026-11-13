@@ -283,6 +283,16 @@ def bucket_exec_spec(
     use_fused = should_fuse_pool_io(
         spec, ex_cand, fused_pool_io=eff_fused, max_b_low=max_b, min_b_hi=min_b
     )
+    if use_fused:
+        # The fused decision depends only on the bucket and the pool backend;
+        # re-resolve the tiles so the profile's rule sees it.
+        ex_cand = profile.exec_for(
+            base_exec,
+            B=bucket_t,
+            T=tokens_per_seq,
+            g=spec.config,
+            fused_pool_io=True,
+        )
     ex_cand2 = with_cache(ex_cand, fused_pool_io=use_fused)
     pb = spec.cache_backend
     use_gpr = (

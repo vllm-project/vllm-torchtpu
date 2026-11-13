@@ -108,6 +108,10 @@ class GDNTunables:
     conv_stage: bool = False  # Stage fused-path conv taps through VMEM `sb`
     # Head-major recurrence (per-head state update; reassociates the sums)
     gdn_head_major: bool = False
+    # Fused-path schedule and recurrence options (off by default).
+    lcv: bool = False  # Assemble the conv window in VMEM (fused pool I/O path)
+    mxu_dr: bool = False  # Delta-rule state update on the MXU (verify rows)
+    zdefer: bool = False  # Defer the z-column chunks of `lin_in` into the recurrence
 
     # `exact`: moving the field keeps hidden states and caches bit-identical
     # (scheduling only); `approx`: changes or may change the arithmetic.
@@ -116,6 +120,10 @@ class GDNTunables:
         "gdn_bufs": "exact",  # state ring depth (scheduling)
         "conv_stage": "approx",  # fused-path conv staging
         "gdn_head_major": "approx",  # head-major state update (reassociates)
+        # `approx` until a bit-identity flip (`EXACT_FLIPS`) shows otherwise.
+        "lcv": "approx",
+        "mxu_dr": "approx",
+        "zdefer": "approx",
     }
 
 

@@ -117,6 +117,11 @@ class GQATunables:
     gqa_qv: bool = False  # Head-batched Q/K norm+RoPE and 128-lane Q/O staging
     gq_pack: bool = False  # Pack G*nh Q heads into 16-row MXU tiles (needs gqa_qv)
     rope_fp32: bool = False  # Keep RoPE intermediate products and sums in float32
+    # Deferred-wait schedule (off by default; a tile rule turns them on).
+    gdefer: bool = False  # `att_in` gate columns after the Q exchange starts
+    kvdefer: bool = False  # With `gdefer`: the K / V columns after it too
+    qswap: bool = False  # RoPE partner lanes by lane rolls (duplicated cos / sin rows)
+    wgroup: bool = False  # Grouped `att_in` ring waits (one bank computation)
 
     # `exact`: moving the field keeps hidden states and caches bit-identical
     # (scheduling only); `approx`: changes or may change the arithmetic.
@@ -133,6 +138,11 @@ class GQATunables:
         "gqa_qv": "exact",  # head-batched Q/K norm + RoPE (TPU bisect, CPU test)
         "gq_pack": "approx",  # packed G*nh query tiles
         "rope_fp32": "approx",  # float32 vs bfloat16-rounded RoPE intermediates
+        # `approx` until a bit-identity flip (`EXACT_FLIPS`) shows otherwise.
+        "gdefer": "approx",
+        "kvdefer": "approx",
+        "qswap": "approx",
+        "wgroup": "approx",
     }
 
 

@@ -87,6 +87,15 @@ class MoETunables:
     route_vec: bool = False
     topk_lanes: bool = False  # Batcher odd-even top-k on lanes for E >= 128
     moe_unroll: bool = False  # Unrolled expert tile loops + grouped expert refills
+    # Routing / shared-expert / refill schedule options (off by default).
+    # Copy slot packed above the expert id in the copy list (shorter scalar chain)
+    route_shrink: bool = False
+    prim_now: bool = False  # Fixed-hit compaction stores no worklist entries
+    sh_pre: bool = False  # Shared expert before routing (short shared-expert streams)
+    sh2_pre_route: bool = False  # With `sh_pre`: its down projection before routing
+    flush_in_ar1: bool = False  # Dense-ring flush inside the following all-reduce
+    sh_at: int = 0  # `sh_pre` placement: 0 before route, 1 inside, 2 after first DMAs
+    ep_fast_refill: bool = False  # EP expert refills with static banks
 
     # `exact`: moving the field keeps hidden states and caches bit-identical
     # (scheduling only); `approx`: changes or may change the arithmetic.
@@ -100,6 +109,14 @@ class MoETunables:
         "route_vec": "approx",  # vectorized routing policy
         "topk_lanes": "approx",  # Batcher odd-even lane top-k
         "moe_unroll": "approx",  # unrolled expert tiles (not exact on TPU, bisect)
+        # `approx` until a bit-identity flip (`EXACT_FLIPS`) shows otherwise.
+        "route_shrink": "approx",
+        "prim_now": "approx",
+        "sh_pre": "approx",
+        "sh2_pre_route": "approx",
+        "flush_in_ar1": "approx",
+        "sh_at": "approx",
+        "ep_fast_refill": "approx",
     }
 
 

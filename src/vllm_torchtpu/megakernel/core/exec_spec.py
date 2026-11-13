@@ -77,6 +77,20 @@ class Tiles:
     dense_acc_pair: bool = False  # Unrolled / paired dense matmul accumulation
     dmm_unroll: int = 0  # Max tiles to fully unroll in dmatmul (0: never)
     rel_fetch: bool = False  # Trace-time-decoded dense refills (fetch_rel/flush_rel)
+    # Opt-in collective / dense-ring schedule options (off by default; a tile
+    # rule turns them on per bucket where its gates hold).
+    # Defer the layer's last all-reduce round into the next layer's input
+    # projection, with the input norm split in halves (`hier=2` buckets).
+    arpipe: bool = False
+    arpipe_h1: bool = False  # `arpipe` on `hier=1` buckets as well
+    # Start round-0 all-reduce sends from inside the producing output projection.
+    ar0s: bool = False
+    dwait_hoist: bool = False  # One ring-bank computation per dense wait group
+    # `hier=2`: a 4-chip reduce-scatter + all-gather of the half-sum instead of
+    # the 4-chip push.
+    hx: bool = False
+    # `hier=1`: cross-chip peer offsets (`me ^ off`) of the 4-chip push round.
+    hier1_peers: tuple[int, int, int] = (2, 4, 6)
     # Per-module tunables (registered `Tunables` instances keyed by module name).
     modules: Mapping[str, Any] = TunablesMap()
 
@@ -140,6 +154,14 @@ TILE_NUMERICS: dict[str, NumericsClass] = {
     "dense_acc_pair": "approx",  # paired dense accumulation
     "dmm_unroll": "approx",  # unrolled dense matmul accumulation
     "rel_fetch": "exact",  # trace-time-decoded dense refills (scheduling)
+    # Collective / dense-ring schedule options: `approx` until a bit-identity
+    # flip (`EXACT_FLIPS`) shows otherwise.
+    "arpipe": "approx",  # split input norm + deferred all-reduce round
+    "arpipe_h1": "approx",  # `arpipe` on `hier=1`
+    "ar0s": "approx",  # early round-0 all-reduce sends
+    "dwait_hoist": "approx",  # dense wait-group bank hoist (scheduling, unproven)
+    "hx": "approx",  # `hier=2` 4-chip RS + AG
+    "hier1_peers": "approx",  # `hier=1` cross-chip peers (unproven)
 }
 
 
