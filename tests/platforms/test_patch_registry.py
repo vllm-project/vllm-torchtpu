@@ -223,9 +223,14 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_offload_fine_prefix_alignment",
         "_patch_vllm_hybrid_kv_load_failure_recovery",
         "_patch_vllm_same_step_prefix_hits",
+        "patch_decode_priority",
+        "patch_zero_schedule_diag",
+        "patch_prompt_ids_ndarray_early",
         "patch_disable_eagle_block_drop",
         "patch_mamba_checkpoint_retention",
         "patch_mamba_tail_fold",
+        "patch_kv_coord",
+        "patch_block_pool_victims",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
     assert stages["platform_activation"] == (

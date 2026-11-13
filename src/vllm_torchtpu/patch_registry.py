@@ -115,6 +115,9 @@ PATCHES = (
     ),
     # Outermost split wrapper: counts what the wrapped split folds.
     Patch("vllm_torchtpu.core.mamba_tail_fold:patch_mamba_tail_fold", _ENGINE),
+    # Hybrid coordinator speedups (inert unless their flags are set); after
+    # the Mamba manager patches, whose methods they call.
+    Patch("vllm_torchtpu.core.kv_coord_replay:patch_kv_coord", _ENGINE),
     # Victim host-tier policy hooks (inert unless the policy is on), after the
     # LIFO free patch and retention so they wrap the final free paths.
     Patch("vllm_torchtpu.offload.victim:patch_block_pool_victims", _ENGINE),
