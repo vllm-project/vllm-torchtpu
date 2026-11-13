@@ -1371,9 +1371,9 @@ def streamindex_topk(
       kv_layout: memory layout of `cache_kv`. `SEQ_ALONG_LANE` removes the lane
         padding that per-token quantization forces on `HEAD_ALONG_SUBLANE` and is
         therefore substantially faster whenever the kernel is HBM bound.
-      lane_gather_axis: all-gather each chunk's top-k over this mesh axis as soon
-        as it is done, so the gathers overlap the later chunks' scoring, and
-        return every lane's rows, lane-major (TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER).
+      lane_gather_axis: all-gather each chunk's top-k over this mesh axis
+        instead of once at the end, and return every lane's rows, lane-major
+        (TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER).
       chunk_tokens: size, in tokens, of each piece to cut the flat token axis
         into. Each piece scores into its own buffer and runs its own SparseCore
         top-k, and consecutive pieces share an XLA scheduling group so chunk i's
@@ -2100,6 +2100,7 @@ SMALL_AG_MAX_TOKENS = 8
         "small_all_gather",
         "lane_split",
         "lane_local",
+        "chunk_gather",
         "decode_pack",
         "shared_meta",
     ),
@@ -2143,6 +2144,7 @@ def streamindex_topk_dcp(
     shared_meta: bool = False,
     lane_split: bool = False,
     lane_local: bool = False,
+    chunk_gather: bool = False,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -2232,6 +2234,9 @@ def streamindex_topk_dcp(
       lane_local: with `lane_split`, skip the lane all-gather: each rank
         returns only its lane's rows, `[padded_num_tokens / lanes, k]` local
         (TPU_DCP_MLA_TOKEN_SPLIT).
+      chunk_gather: with `lane_split` and the hist merge, all-gather each
+        top-k chunk's rows over the lanes instead of once at the end
+        (TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER).
       global_scheduling_group_id: XLA scheduling group of the cross-rank
         SparseCore merge (stage 2), which the layer's independent TensorCore
         work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
@@ -2363,15 +2368,8 @@ def streamindex_topk_dcp(
         raise ValueError("lane_split cannot pin the overlap work to the local top-k.")
     if lane_local and not lane_split:
         raise ValueError("lane_local needs lane_split over more than one lane.")
-    from vllm_torchtpu import envs as _lane_envs
-
     # The hist merge's chunks already hold this rank's share of the top-k.
-    chunk_gather = (
-        lane_split
-        and hist_merge
-        and not lane_local
-        and _lane_envs.TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER
-    )
+    chunk_gather = chunk_gather and lane_split and hist_merge and not lane_local
 
     def _local(
         q,
