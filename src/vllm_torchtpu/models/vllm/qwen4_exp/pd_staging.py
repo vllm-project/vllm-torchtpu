@@ -1402,6 +1402,9 @@ class StagedConsumer:
             merge_compressed=self.src_merged,
             split_compressed=self.src_split_keys,
             main_interleave=pcp_interleave() if self.src_pcp > 1 else None,
+            # The producer's keys are never in-row (QWEN4_EXP_INROW_COMPRESSED_K
+            # is this decode's own layout).
+            inrow_compressed=False,
         )
         if not src_draft_cacheable:
             layout_kwargs["draft_prefix_cacheable"] = False
