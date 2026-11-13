@@ -2,9 +2,10 @@
 
 This branch adds what the Qwen3.5 megakernel needs to serve the decode leg of a
 prefill / decode disaggregated (PD) deployment. It is a hand-off branch on top
-of `nanwei/mk-dev` (`1b9f7a5fd`), meant to be taken apart and landed in the
-megakernel lanes; it is not a PR. (It was first built on `c69cc7c14` and
-rebased; the only change the rebase needed is in the startup guard, see §2.)
+of `nanwei/mk-dev` (`c297d9a45`, merged in; measured below at `1b9f7a5fd`),
+meant to be taken apart and landed in the megakernel lanes; it is not a PR.
+(It was first built on `c69cc7c14` and rebased; the only change the rebase
+needed is in the startup guard, see §2.)
 
 ## Why
 

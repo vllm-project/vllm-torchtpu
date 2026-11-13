@@ -1,6 +1,6 @@
 # Qwen3.5 candidate4 megakernel levers on the library layout
 
-This branch carries, on top of `nanwei/mk-dev` (at `1b9f7a5fd`) plus PD
+This branch carries, on top of `nanwei/mk-dev` (at `c297d9a45`) plus PD
 support (see `PD_SUPPORT.md`), the megakernel changes our Qwen3.5 PD submission ran
 between candidate30 and candidate4 (`5a1c82686`), in the library's form:
 every lever is a default-off tile field, module tunable or plugin option,
