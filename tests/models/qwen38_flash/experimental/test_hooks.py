@@ -37,12 +37,45 @@ def test_register_is_noop_without_selector(monkeypatch):
 
 def test_register_takes_over_qwen4_exp_architectures(monkeypatch):
     monkeypatch.setenv("VLLM_TPU_QWEN38_FLASH_EXPERIMENTAL", "1")
-    with mock.patch(
-        "vllm.model_executor.models.ModelRegistry.register_model"
-    ) as register:
+    with (
+        mock.patch(
+            "vllm.model_executor.models.ModelRegistry.register_model"
+        ) as register,
+        mock.patch.dict(
+            "vllm.model_executor.models.config.MODELS_CONFIG_MAP", clear=True
+        ),
+        mock.patch(
+            "vllm_torchtpu.compilation.tpu_compiler.register_compile_cache_key"
+        ) as cache_key,
+        mock.patch(
+            "vllm_torchtpu.platforms.tpu_platform.register_tpu_kv_connector"
+        ) as kv_connector,
+        mock.patch(
+            "vllm_torchtpu.offload.model_owned_pool.register_model_owned_pool"
+        ) as offload_pool,
+        mock.patch(
+            "vllm_torchtpu.runner.model_adapters.register_model_adapter"
+        ) as model_adapter,
+    ):
         hooks.register()
+        from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+        config_map = dict(MODELS_CONFIG_MAP)
     registered = {call.args[0]: call.args[1] for call in register.call_args_list}
-    assert set(registered) == set(hooks.QWEN4_EXP_ARCHITECTURES)
+    assert set(registered) == {*hooks.QWEN4_EXP_ARCHITECTURES, "Qwen4ExpMTP"}
+    assert set(config_map) == set(hooks.QWEN4_EXP_ARCHITECTURES)
+    assert cache_key.call_args.args == ("qwen38_flash",)
+    assert set(offload_pool.call_args.args[0]) == set(hooks.QWEN4_EXP_ARCHITECTURES)
+    adapter_archs, make_adapter = model_adapter.call_args.args
+    assert set(adapter_archs) == set(hooks.QWEN4_EXP_ARCHITECTURES)
+    assert make_adapter is hooks._make_adapter
+    kv_connector.assert_called_once_with(
+        "Qwen4ExpRaidenConnector",
+        "vllm_torchtpu.models.qwen38_flash.experimental.pd_connector",
+    )
+    factors = cache_key.call_args.kwargs["env_factors"]()
+    assert "QWEN4_EXP_POOL_SIZING" not in factors
+    assert "VLLM_TPU_QSA_FUSED_SPARSE_DECODE" in factors
     for target in registered.values():
         assert target.startswith("vllm_torchtpu.models.qwen38_flash.experimental.")
 
@@ -50,4 +83,3 @@ def test_register_takes_over_qwen4_exp_architectures(monkeypatch):
 def test_unknown_setting_raises():
     with pytest.raises(AttributeError):
         _ = settings.NOT_A_QWEN38_FLAG
-
