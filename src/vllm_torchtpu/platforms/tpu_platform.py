@@ -1410,7 +1410,14 @@ class TpuPlatform(Platform):
         cls, kv_cache_dtype: str, _model_config: ModelConfig
     ) -> bool:
         supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
-        return kv_cache_dtype in supported
+        if kv_cache_dtype in supported:
+            return True
+        from vllm_torchtpu.layers.core.model_kv_cache_dtypes import (
+            is_model_kv_cache_dtype_supported,
+        )
+
+        architectures = getattr(_model_config, "architectures", None) or []
+        return is_model_kv_cache_dtype_supported(kv_cache_dtype, architectures)
 
     @classmethod
     def use_sync_weight_loader(cls) -> bool:

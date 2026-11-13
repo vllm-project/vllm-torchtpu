@@ -12,15 +12,30 @@ Self-contained TPU model directory for
 
 ## Directory Layout
 
-- `model.py`, `attention.py`, `moe.py`, `quant.py`: TPU model wiring,
-  block-sparse attention, MoE layers, and `mxfp8` / `NVFP4` weight loading.
-- `kernels/`: model-owned copies of specialized JAX/Pallas kernels (each file
-  records its upstream reference path and commit hash in its header).
-- `ops/`: Torch-to-JAX custom op bridges scoped to `minimax_m3`.
-- `hooks.py`, `settings.py`: shared-core interface hooks and model-scoped
-  configuration.
-- `validation/`: serving configs, golden checks, and accuracy/performance
-  baselines.
+`__init__.py` is import-free and registers the model at plugin load
+(`models.vllm.register_model_directories`). Hill-climbing work lives under
+`experimental/` (Experimental tier: not in the support matrix, must not
+change any supported configuration):
+
+- `experimental/model.py`, `attention.py`, `moe.py`, `quant.py`, `dspark.py`:
+  TPU model wiring, block-sparse (MSA) attention, MoE layers, `mxfp8` /
+  `NVFP4` weight loading, and the DSpark draft.
+- `experimental/kernels/`: model-owned JAX/Pallas kernels (MSA attention,
+  indexer, selection, DCP candidate merge, 4-bit caches, cache writes).
+- `experimental/ops/`: Torch-to-JAX custom op bridges scoped to `minimax_m3`.
+- `experimental/hooks.py`: the vLLM config hook (block size, KV cache dtype,
+  DCP, speculative decoding checks).
+- `experimental/vocab_parallel_argmax.py`: the DSpark draft's vocab-parallel
+  greedy argmax.
+- `experimental/validation/`: serving configs.
+
+Shared-core hooks it uses: `register_tpu_quant_config`, `TpuOwnedKVCache`,
+`register_model_kv_cache_dtype` (`int4_per_token_head`),
+`register_multi_shapes_kv_architectures`,
+`register_kv_head_spanning_dcp_architectures`.
+
+Tests: `tests/models/minimax_m3/experimental/` (microbenchmarks under
+`benchmarks/`).
 
 ## Coordination
 
