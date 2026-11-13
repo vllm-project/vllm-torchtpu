@@ -1,0 +1,95 @@
+/* Copyright 2026 Google LLC */
+:root {
+  --bg: #0b1120;
+  --card: #1e293b;
+  --border: #334155;
+  --text: #f8fafc;
+  --muted: #94a3b8;
+}
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  margin: 0;
+  padding: 24px;
+  line-height: 1.5;
+}
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+}
+h1, h2 {
+  margin-top: 0;
+}
+.grid-kpi {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 20px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+.kpi-label {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+.kpi-val {
+  font-size: 22px;
+  font-weight: 700;
+  margin-top: 4px;
+}
+.kpi-sub {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+.grid-charts {
+  display: grid;
+  gap: 16px;
+  margin-bottom: 20px;
+  grid-template-columns: repeat(auto-fit, minmax(520px, 1fr));
+}
+.chart-svg {
+  width: 100%;
+  height: auto;
+  border-radius: 6px;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+th, td {
+  border-bottom: 1px solid var(--border);
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  color: var(--muted);
+  font-weight: 600;
+  background: #0f172a;
+}
+.badge {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  font-size: 12px;
+}
+.badge-whole_step {
+  background: #065f46;
+  color: #6ee7b7;
+}
+.badge-layer_group, .badge-single_layer {
+  background: #78350f;
+  color: #fde68a;
+}
+.badge-per_op {
+  background: #0c4a6e;
+  color: #7dd3fc;
+}
