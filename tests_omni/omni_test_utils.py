@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import sys
 from collections.abc import Iterator
 from typing import Any
 
@@ -167,12 +168,14 @@ def use_native_ops_on_cpu(module: nn.Module) -> None:
 @contextlib.contextmanager
 def isolate_thinker_patch_targets() -> Iterator[None]:
     """Snapshot and restore Qwen3-Omni Thinker patch targets across a test."""
+    import vllm.model_executor.models.utils as vllm_utils
     from vllm_omni.model_executor.models.qwen3_omni import (
         qwen3_omni_moe_thinker as thinker_mod,
     )
 
     audio_cls = thinker_mod.Qwen3OmniMoeAudioEncoder
     vit_cls = thinker_mod.Qwen3Omni_VisionTransformer
+    thinker_cls = thinker_mod.Qwen3OmniMoeThinkerForConditionalGeneration
 
     saved_audio = {
         attr: audio_cls.__dict__.get(attr)
@@ -186,12 +189,33 @@ def isolate_thinker_patch_targets() -> Iterator[None]:
     saved_vit = {
         attr: vit_cls.__dict__.get(attr) for attr in ("forward", "_tpu_orig_forward")
     }
+    saved_thinker = {
+        attr: thinker_cls.__dict__.get(attr) for attr in ("embed_input_ids",)
+    }
+    saved_mod = {
+        attr: getattr(thinker_mod, attr, None)
+        for attr in (
+            "_merge_multimodal_embeddings",
+            "check_interleaved_audio_video",
+            "merge_interleaved_embeddings",
+        )
+    }
+    saved_vllm_merge = vllm_utils._merge_multimodal_embeddings
+    models_prefix = "vllm.model_executor.models."
+    saved_model_merges = {
+        mod: mod.__dict__["_merge_multimodal_embeddings"]
+        for name, mod in list(sys.modules.items())
+        if name.startswith(models_prefix)
+        and mod is not None
+        and "_merge_multimodal_embeddings" in mod.__dict__
+    }
     try:
         yield
     finally:
         for cls, saved in (
             (audio_cls, saved_audio),
             (vit_cls, saved_vit),
+            (thinker_cls, saved_thinker),
         ):
             for attr, val in saved.items():
                 if val is None:
@@ -199,3 +223,9 @@ def isolate_thinker_patch_targets() -> Iterator[None]:
                         delattr(cls, attr)
                 else:
                     setattr(cls, attr, val)
+        for attr, val in saved_mod.items():
+            if val is not None:
+                setattr(thinker_mod, attr, val)
+        vllm_utils._merge_multimodal_embeddings = saved_vllm_merge
+        for mod, fn in saved_model_merges.items():
+            mod.__dict__["_merge_multimodal_embeddings"] = fn

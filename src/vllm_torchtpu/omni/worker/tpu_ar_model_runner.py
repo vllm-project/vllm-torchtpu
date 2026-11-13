@@ -16,6 +16,7 @@
 from typing import Any, Protocol, cast
 
 import torch
+from vllm.multimodal.utils import copy_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
@@ -65,6 +66,7 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self._omni_mm_embeds_list: list[torch.Tensor] | None = None
         if needs_omni_connector(self.model_config):
             raise NotImplementedError(
                 f"Stage {self.stage_id} ({self.model_stage!r}) needs inter-stage Omni "
@@ -96,6 +98,75 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
                 "talker's multi-token prediction), which TPUARModelRunner does not "
                 "run yet."
             )
+
+    def _gather_mm_embeddings(
+        self,
+        scheduler_output: Any,
+        target_pad_len: int | None = None,
+    ) -> tuple[list[torch.Tensor], torch.Tensor | None]:
+        """Gather multimodal embeddings without concatenating mixed feature widths.
+
+        For Qwen3-Omni Thinker, vision embeddings have width 8192 (2048 base +
+        6144 DeepStack) while audio embeddings have width 2048. Upstream
+        ``TPUModelRunner.execute_model`` runs ``torch.cat(mm_embeds, dim=0)`` and
+        slices ``mm_embeds[start:end]`` per prefill chunk, which fails on mixed
+        widths and drops the ``.modality`` attribute on each tensor. We cache
+        the per-item embeddings in ``self._omni_mm_embeds_list`` and return a
+        single-element list holding a 1D row-index range ``[torch.arange(total)]``
+        so ``execute_model`` slices row indices per chunk and
+        ``_get_model_inputs`` reconstructs the per-chunk embedding list.
+        """
+        mm_embeds, is_mm_embed = super()._gather_mm_embeddings(
+            scheduler_output, target_pad_len
+        )
+        if not mm_embeds:
+            self._omni_mm_embeds_list = None
+            return [], is_mm_embed
+        self._omni_mm_embeds_list = list(mm_embeds)
+        total_rows = sum(int(e.shape[0]) for e in mm_embeds)
+        return [torch.arange(total_rows, dtype=torch.long)], is_mm_embed
+
+    def _slice_mm_embeds_by_row_indices(
+        self, row_indices: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Slice cached ``self._omni_mm_embeds_list`` across ``row_indices``."""
+        cached = self._omni_mm_embeds_list or []
+        if row_indices.numel() == 0 or not cached:
+            return []
+        start = int(row_indices[0].item())
+        end = int(row_indices[-1].item()) + 1
+        result: list[torch.Tensor] = []
+        offset = 0
+        for emb in cached:
+            n = int(emb.shape[0])
+            item_start, item_end = offset, offset + n
+            offset = item_end
+            if item_end <= start or item_start >= end:
+                continue
+            s = max(0, start - item_start)
+            e = min(n, end - item_start)
+            sliced = emb[s:e]
+            copy_mm_embedding_modality(emb, sliced)
+            result.append(sliced)
+        return result
+
+    def _get_model_inputs(
+        self,
+        input_ids: torch.Tensor,
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Resolve 1D row-index ranges back to per-item multimodal embeddings."""
+        if mm_embed_inputs is not None:
+            chunk_embeds, is_mm_embed = mm_embed_inputs
+            if (
+                len(chunk_embeds) == 1
+                and isinstance(chunk_embeds[0], torch.Tensor)
+                and chunk_embeds[0].ndim == 1
+                and self._omni_mm_embeds_list is not None
+            ):
+                resolved = self._slice_mm_embeds_by_row_indices(chunk_embeds[0])
+                mm_embed_inputs = (resolved, is_mm_embed) if resolved else None
+        return super()._get_model_inputs(input_ids, mm_embed_inputs)
 
     def forward_model(
         self,

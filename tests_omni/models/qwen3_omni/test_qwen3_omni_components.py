@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU vs. float32 CPU parity tests for Qwen3-Omni Audio and Vision Encoders."""
+"""TPU vs. float32 CPU parity tests for Qwen3-Omni Thinker components."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -27,9 +27,11 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder as HfQwen3OmniMoeAudioEncoder,
 )
+from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3Omni_VisionTransformer,
     Qwen3OmniMoeAudioEncoder,
+    Qwen3OmniMoeThinkerForConditionalGeneration,
     _get_feat_extract_output_lengths,
 )
 
@@ -47,10 +49,6 @@ from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
 
 pytestmark = pytest.mark.omni
 
-# Qwen3-Omni-30B-A3B audio geometry with 2 transformer layers instead of 32 so
-# the fixture stays small and fast; every patched code path (conv stack,
-# positional slice, _flash_attention with padded cu_seqlens, output projection)
-# still runs.
 AUDIO_CONFIG = Qwen3OmniMoeAudioEncoderConfig(
     num_mel_bins=128,
     d_model=128,
@@ -79,15 +77,8 @@ VISION_CONFIG = Qwen3OmniMoeVisionEncoderConfig(
     deepstack_visual_indexes=[0, 1],
 )
 
-# 800 frames = 8 full 100-frame windows (1 attention segment); 801 takes the
-# partial-window branch across two attention segments; 3200 hits the exact
-# 32-window bucket boundary; 3201 (33 windows) exercises the 8-window aligned
-# fallback (40 windows) beyond _AUDIO_CHUNK_BUCKETS.
 PARITY_LENGTHS = [800, 801, 3200, 3201]
 
-# Single image (600 patches -> 4096 bucket), medium video (4800 patches -> 8192
-# bucket), and multi-chunk video (20480 patches > 16384 split into 4 + 1 frames
-# hitting the 16384 and 4096 buckets).
 VISION_PARITY_GRIDS = [
     [[1, 20, 30]],
     [[8, 20, 30]],
@@ -304,4 +295,80 @@ def test_vision_encoder_matches_cpu_reference(encoders, grid: list[list[int]]) -
         name=f"vision encoder grid={grid}",
         max_rel_l2=VISION_LIMITS[0],
         max_abs=VISION_LIMITS[1],
+    )
+
+
+@torch.no_grad()
+def test_multimodal_merge_and_embed_input_ids_on_tpu(encoders) -> None:
+    """Verify interleaved video+audio+image merge and DeepStack scatter on TPU."""
+    del encoders
+    tpu_dev = torch.device("tpu")
+    hidden_size = 16
+    deepstack_layers = 2
+    vis_width = hidden_size * (1 + deepstack_layers)
+
+    # Prompt layout (8 tokens): [text, video, video, audio, video, image, text, text]
+    # Video ID=10, Audio ID=11, Image ID=12
+    input_ids_cpu = torch.tensor([1, 10, 10, 11, 10, 12, 2, 3], dtype=torch.long)
+    is_mm_cpu = torch.tensor([False, True, True, True, True, True, False, False])
+
+    vid_cpu = torch.arange(3 * vis_width, dtype=torch.float32).reshape(3, vis_width)
+    aud_cpu = torch.full((1, hidden_size), 100.0, dtype=torch.float32)
+    img_cpu = torch.full((1, vis_width), 200.0, dtype=torch.float32)
+
+    class _FakeThinker(Qwen3OmniMoeThinkerForConditionalGeneration):
+        def __init__(self) -> None:
+            self.use_deepstack = True
+            self.deepstack_input_embeds_num_tokens = 4
+            self.deepstack_input_embeds = [
+                torch.ones((8, hidden_size), device=tpu_dev, dtype=torch.float32)
+                for _ in range(deepstack_layers)
+            ]
+            self.config = SimpleNamespace(
+                video_token_id=10,
+                audio_token_id=11,
+                text_config=SimpleNamespace(hidden_size=hidden_size),
+            )
+            self.visual = SimpleNamespace(deepstack_visual_indexes=[0, 1])
+            self.language_model = SimpleNamespace(
+                embed_input_ids=lambda ids: torch.zeros(
+                    (ids.shape[0], hidden_size), device=ids.device, dtype=torch.float32
+                )
+            )
+
+        def _clear_deepstack_input_embeds(self, num_tokens: int) -> None:
+            for buf in self.deepstack_input_embeds:
+                buf[:num_tokens].zero_()
+            self.deepstack_input_embeds_num_tokens = 0
+
+        def _set_deepstack_input_embeds(
+            self, deepstack_input_embeds: torch.Tensor
+        ) -> None:
+            n = deepstack_input_embeds.shape[1]
+            for i in range(deepstack_layers):
+                self.deepstack_input_embeds[i][:n].copy_(deepstack_input_embeds[i])
+            self.deepstack_input_embeds_num_tokens = n
+
+    thinker = _FakeThinker()
+    vid_tpu = set_mm_embedding_modality(vid_cpu.to(tpu_dev), "video")
+    aud_tpu = set_mm_embedding_modality(aud_cpu.to(tpu_dev), "audio")
+    img_tpu = set_mm_embedding_modality(img_cpu.to(tpu_dev), "image")
+
+    merged_tpu = thinker.embed_input_ids(
+        input_ids_cpu.to(tpu_dev),
+        multimodal_embeddings=[vid_tpu, aud_tpu, img_tpu],
+        is_multimodal=is_mm_cpu.to(tpu_dev),
+    )
+
+    expected_main = torch.zeros((8, hidden_size), dtype=torch.float32)
+    expected_main[[1, 2, 4]] = vid_cpu[:, :hidden_size]
+    expected_main[3] = aud_cpu[0]
+    expected_main[5] = img_cpu[0, :hidden_size]
+
+    assert torch.allclose(merged_tpu.cpu(), expected_main)
+    assert thinker.deepstack_input_embeds_num_tokens == 8
+    # Interleaved path scatters video deepstack features into video positions [1, 2, 4]
+    assert torch.allclose(
+        thinker.deepstack_input_embeds[0].cpu()[[1, 2, 4]],
+        vid_cpu[:, hidden_size : 2 * hidden_size],
     )
