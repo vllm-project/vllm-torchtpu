@@ -126,6 +126,31 @@ def reserve_scheduling_group_ids(count: int) -> int:
     return first
 
 
+# Ids for callers that name their call site (`scheduling_group_slot`, e.g. the
+# layer index). The counter above is read while tracing, so a call that hits
+# `jax.jit`'s cache -- a model's second layer with the first one's shapes --
+# reuses the first call's ids, and XLA joins the two layers into one group: the
+# path between them is un-annotated, which libtpu 0.0.50 rejects ("annotation
+# groups with gaps"). A slot is a static argument instead, so it is part of the
+# cache key: slot `s` owns `[SLOT_ID_BASE + s * MAX_IDS_PER_SLOT, +
+# MAX_IDS_PER_SLOT)`, the same ids whatever was compiled before. The base keeps
+# them clear of the counter's.
+SLOT_ID_BASE = 1 << 16
+MAX_IDS_PER_SLOT = 1024
+
+
+def slot_scheduling_group_ids(slot: int, count: int) -> int:
+    """The first of `count` scheduling group ids owned by call site `slot`."""
+    if slot < 0:
+        raise ValueError(f"scheduling group slot ({slot}) must be non-negative.")
+    if not 1 <= count <= MAX_IDS_PER_SLOT:
+        raise ValueError(
+            f"count ({count}) must be in [1, {MAX_IDS_PER_SLOT}]: a slot owns "
+            f"{MAX_IDS_PER_SLOT} ids."
+        )
+    return SLOT_ID_BASE + slot * MAX_IDS_PER_SLOT
+
+
 def reset_scheduling_group_ids() -> None:
     """Restarts the ids at 1, for the start of a new compiled program.
 
