@@ -368,11 +368,11 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         patch.object(
             AsyncTPUCopyState,
             "from_device_chunks",
-            side_effect=lambda chunks, lengths, spec_logprobs=None: AsyncTPUCopyState(
+            side_effect=lambda chunks, lengths, **logprobs: AsyncTPUCopyState(
                 chunks_cpu=chunks,
                 chunk_real_lens=lengths,
                 copy_ready_event=MagicMock(),
-                spec_logprobs=spec_logprobs,
+                **logprobs,
             ),
         ),
     ):

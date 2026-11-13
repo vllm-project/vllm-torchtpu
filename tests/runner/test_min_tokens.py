@@ -652,12 +652,13 @@ def test_plain_step_masks_below_min_tokens(num_output, expected):
     logits[0, 3], logits[0, 5] = 4.0, 2.0
     runner = _plain_step_runner(num_output, logits)
 
-    def host_copy(chunks, lengths, spec_logprobs=None):
+    def host_copy(chunks, lengths, spec_logprobs=None, logprobs=None):
         return AsyncTPUCopyState(
             chunks_cpu=chunks,
             chunk_real_lens=lengths,
             copy_ready_event=MagicMock(),
             spec_logprobs=spec_logprobs,
+            logprobs=logprobs,
         )
 
     with (
@@ -738,12 +739,13 @@ def test_plain_step_logprobs_come_from_the_unmasked_logits():
 
     runner.gather_logprobs = gather_logprobs
 
-    def host_copy(chunks, lengths, spec_logprobs=None):
+    def host_copy(chunks, lengths, spec_logprobs=None, logprobs=None):
         return AsyncTPUCopyState(
             chunks_cpu=chunks,
             chunk_real_lens=lengths,
             copy_ready_event=MagicMock(),
             spec_logprobs=spec_logprobs,
+            logprobs=logprobs,
         )
 
     with (
@@ -756,6 +758,27 @@ def test_plain_step_logprobs_come_from_the_unmasked_logits():
         output = TPUModelRunner.sample_tokens(runner, None)
     assert output.sampled_token_ids == [[5]]  # sampled from the masked logits
     assert len(seen) == 1 and seen[0][0, 3] == 4.0  # logprobs from the raw ones
+
+
+def test_plain_step_logprobs_keep_one_row_per_real_request():
+    """The logits chunk is a bucket of 2 rows holding one request; its padded
+    logprobs row is dropped on the host, with the padded token."""
+    from vllm.v1.outputs import LogprobsTensors
+
+    logits = torch.zeros(2, 8)
+    logits[0, 3], logits[1, 5] = 4.0, 4.0
+    runner = _plain_step_runner(None, logits)
+    runner.input_batch.max_num_logprobs = 0
+    runner.gather_logprobs = lambda x, tokens: LogprobsTensors(
+        tokens.view(-1, 1),
+        x.gather(1, tokens.view(-1, 1)),
+        torch.ones(x.shape[0], dtype=torch.int64),
+    )
+    output = _run_sample_tokens(runner)
+    assert output.sampled_token_ids == [[3]]
+    assert output.logprobs.logprob_token_ids.tolist() == [[3]]
+    assert output.logprobs.logprobs.tolist() == [[4.0]]
+    assert output.logprobs.sampled_token_ranks.tolist() == [1]
 
 
 @pytest.mark.parametrize(
@@ -791,12 +814,13 @@ def test_draft_less_chunk_of_a_spec_step_masks_below_min_tokens(num_output, expe
     )
     runner._sync_replicated_drafts_across_tp = lambda drafts: drafts
 
-    def host_copy(chunks, lengths, spec_logprobs=None):
+    def host_copy(chunks, lengths, spec_logprobs=None, logprobs=None):
         return AsyncTPUCopyState(
             chunks_cpu=chunks,
             chunk_real_lens=lengths,
             copy_ready_event=MagicMock(),
             spec_logprobs=spec_logprobs,
+            logprobs=logprobs,
         )
 
     with (
@@ -851,12 +875,13 @@ def _spec_step_runner(num_output, logits_list, md_list, req_ids):
 
 
 def _run_sample_tokens(runner):
-    def host_copy(chunks, lengths, spec_logprobs=None):
+    def host_copy(chunks, lengths, spec_logprobs=None, logprobs=None):
         return AsyncTPUCopyState(
             chunks_cpu=chunks,
             chunk_real_lens=lengths,
             copy_ready_event=MagicMock(),
             spec_logprobs=spec_logprobs,
+            logprobs=logprobs,
         )
 
     with (
