@@ -78,7 +78,7 @@ import functools
 import gc
 from collections.abc import Callable
 from itertools import islice
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -1118,6 +1118,8 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         elif isinstance(module, qwen3_next.Qwen3NextAttention):
             _get_sigmoid_gate_quant_op()
             o_proj = getattr(module, "o_proj", None)
+            # torch's Module.__setattr__ stub only accepts modules and tensors.
+            # pyrefly: ignore[bad-argument-type]
             module._pal_gate_q_eligible = bool(
                 o_proj is not None
                 and _is_fp8_per_channel_linear(o_proj)
@@ -1136,8 +1138,8 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
                 if module.attn_layer_scale.device.type == "tpu":
                     hoisted_norm_tensors.extend(
                         [
-                            module._tpu_attn_layer_scale_2d,
-                            module._tpu_ffn_layer_scale_2d,
+                            cast("torch.Tensor", module._tpu_attn_layer_scale_2d),
+                            cast("torch.Tensor", module._tpu_ffn_layer_scale_2d),
                         ]
                     )
             if getattr(module, "layer_type", None) == "linear_attention":
@@ -1236,7 +1238,7 @@ def install_qwen3_next_v6_patches() -> None:
             return res
 
         base_loader.process_weights_after_loading = _process_weights_after_loading
-        base_loader._qwen3_next_v6_process_patched = True
+        cast(Any, base_loader)._qwen3_next_v6_process_patched = True
 
     _V6_PATCHES_INSTALLED = True
 
@@ -1572,15 +1574,15 @@ def patched_mtp_forward(
     # the first PP rank (vllm-project/vllm#46994).
     if intermediate_tensors is None:
         if inputs_embeds is None:
-            inputs_embeds = self.embed_input_ids(input_ids)
+            inputs_embeds = cast("torch.Tensor", self.embed_input_ids(input_ids))
         assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
-        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        inputs_embeds = cast("torch.Tensor", self.pre_fc_norm_embedding(inputs_embeds))
         hidden_states = self.pre_fc_norm_hidden(hidden_states)
         hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
         hidden_states = self.fc(hidden_states)
         residual = None
     else:
-        hidden_states = intermediate_tensors["hidden_states"]
+        hidden_states = cast("torch.Tensor", intermediate_tensors["hidden_states"])
         residual = intermediate_tensors["residual"]
 
     current_step_idx = spec_step_idx % self.num_mtp_layers
@@ -1833,8 +1835,8 @@ def maybe_patch_qwen3_next(model_config: "ModelConfig | None" = None) -> bool | 
     # instead of letting a later draft load replace patched_mtp_forward.
     import vllm_torchtpu.models.vllm.qwen3_5_mtp  # noqa: F401
 
-    qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward = patched_mtp_forward
-    qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward = patched_mtp_forward
+    cast(Any, qwen3_next_mtp.Qwen3NextMultiTokenPredictor).forward = patched_mtp_forward
+    cast(Any, qwen3_5_mtp.Qwen3_5MultiTokenPredictor).forward = patched_mtp_forward
     if envs.TPU_MOE_SEQUENCE_PARALLEL:
         logger.info(
             "Applied TPU patch: Qwen3.5 MoE trace-stable sequence-parallel "
