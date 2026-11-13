@@ -226,6 +226,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS: int = 0
+    TPU_MINIMAX_M3_MSA_PAGE_CACHE_ONE_SORT: bool = False
 
 
 def env_with_choices(
@@ -1398,6 +1399,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # norms' rsqrt stays in XLA, so the values are the same. 0 = off.
     "TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS", 0
+    ),
+    # MiniMax M3 MSA prefill page cache (`msa_attention_lse._page_cache`):
+    # build each call's slot table with one sort and two scatters instead of
+    # three sorts. Same table.
+    "TPU_MINIMAX_M3_MSA_PAGE_CACHE_ONE_SORT": lambda: bool(
+        int(os.getenv("TPU_MINIMAX_M3_MSA_PAGE_CACHE_ONE_SORT", "0"))
     ),
 }
 
