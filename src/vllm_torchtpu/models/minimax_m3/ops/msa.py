@@ -737,7 +737,14 @@ def _keys_dump_op(topk: int, dcp: int, suffix: str):
     """Debug only (`keys_dump`): a JAX op returning this rank's selected page
     keys packed ``[T, 3 + G * topk]`` int32 (`msa_dcp.selected_keys_packed`)."""
 
-    def _keys_jax(kv_cache, candidates, seq_lens, block_tables, query_start_loc, dcp_rank):
+    def _keys_jax(
+        kv_cache: jax.Array,
+        candidates: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        dcp_rank: jax.Array,
+    ) -> jax.Array:
         return msa_dcp.selected_keys_packed(
             kv_cache,
             candidates,
