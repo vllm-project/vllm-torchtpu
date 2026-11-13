@@ -75,6 +75,13 @@ def _chip_family() -> str | None:
     return {"v7x": "7x"}.get(name, name)
 
 
+def has_calibrated_shape(model_config) -> bool:
+    """Whether the checkpoint has the shape the IX points ran
+    (Qwen3.5-397B-A17B's text config), whatever the device."""
+    text = getattr(model_config, "hf_text_config", None)
+    return all(getattr(text, k, None) == v for k, v in _CALIBRATED_SHAPE.items())
+
+
 def _is_calibrated(model_config) -> bool:
     """Whether the KV budget below was measured for this engine: the
     calibrated checkpoint shape on a TPU7x device. Any other shape, a smaller

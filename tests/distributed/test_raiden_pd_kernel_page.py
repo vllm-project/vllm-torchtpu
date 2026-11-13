@@ -38,6 +38,10 @@ from .raiden_test_utils import FakeTensor
 BATCHED = PallasBatchedRPAAttentionBackend
 QWEN35 = "Qwen3_5MoeForConditionalGeneration"
 OTHER = "Qwen3NextForCausalLM"
+# The text-config shape of the checkpoint the IX points ran (Qwen3.5-397B-A17B),
+# and of Qwen3.5-35B-A3B, which main's PCP disagg integration runs serve.
+SHAPE_397B = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
+SHAPE_35B = {"num_experts": 256, "hidden_size": 2048, "num_hidden_layers": 40}
 
 # Block sizes on main's GDN state sizing (bf16 SSM, fp32 conv).
 PREFILL_BLOCK = 2304  # TP1 (pipeline-parallel) prefill
@@ -56,10 +60,12 @@ SOL_LAYOUT = ((4, 3, 2, 1, 0), ((4, 128), (4, 1)), 8)
 
 
 @contextlib.contextmanager
-def _engine(monkeypatch, *, kv_role, arch=QWEN35, layout="HND", pcp=1):
+def _engine(
+    monkeypatch, *, kv_role, arch=QWEN35, layout="HND", pcp=1, shape=SHAPE_397B
+):
     """A current vLLM config for one engine: the KV cache layout resolved as
-    the runner resolves it, the model's architecture, and a KV transfer
-    config with ``kv_role`` (None: no KV transfer)."""
+    the runner resolves it, the model's architecture and text-config shape,
+    and a KV transfer config with ``kv_role`` (None: no KV transfer)."""
     from vllm import envs as vllm_envs
     from vllm.config import (
         DeviceConfig,
@@ -95,7 +101,9 @@ def _engine(monkeypatch, *, kv_role, arch=QWEN35, layout="HND", pcp=1):
         )
         resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
         config.parallel_config.prefill_context_parallel_size = pcp
-        config.model_config = SimpleNamespace(architectures=[arch])
+        config.model_config = SimpleNamespace(
+            architectures=[arch], hf_text_config=SimpleNamespace(**shape)
+        )
         if kv_role is not None:
             config.kv_transfer_config = KVTransferConfig(
                 kv_connector="TPURaidenConnector", kv_role=kv_role
@@ -237,3 +245,30 @@ def test_engine_configs_leave_no_global_state(monkeypatch):
         pass
     assert (pallas.get_global_shape, pallas.get_local_shape) == shapes
     assert dict(os.environ) == environ
+
+
+def test_other_qwen3_5_checkpoints_keep_vllms_page(monkeypatch):
+    # The 128-token page is for the checkpoint the IX points ran. Any other
+    # Qwen3.5 checkpoint keeps vLLM's choice, as on main.
+    with _engine(monkeypatch, kv_role="kv_consumer", shape=SHAPE_35B):
+        assert BATCHED.get_supported_kernel_block_sizes() == [128, 256]
+    assert (
+        _kernel_page(monkeypatch, PREFILL_BLOCK, kv_role="kv_producer", shape=SHAPE_35B)
+        == 256
+    )
+
+
+def test_pcp_prefill_and_its_decode_page_alike_on_mains_runs(monkeypatch):
+    """Main's PCP4 disagg runs (Qwen3.5-35B-A3B): a PCP4 prefill engine with
+    768-token blocks keeps vLLM's PCP page list, and its TP2 decode engine with
+    2304-token blocks must land on the same page (256), or the Raiden layout
+    fingerprints differ and every transfer is refused."""
+    with _engine(monkeypatch, kv_role="kv_producer", pcp=4, shape=SHAPE_35B):
+        assert BATCHED.get_supported_kernel_block_sizes()[-1] == 4096
+    prefill_page = _kernel_page(
+        monkeypatch, 768, kv_role="kv_producer", pcp=4, shape=SHAPE_35B
+    )
+    decode_page = _kernel_page(
+        monkeypatch, 2304, kv_role="kv_consumer", shape=SHAPE_35B
+    )
+    assert prefill_page == decode_page == 256
