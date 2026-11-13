@@ -33,7 +33,11 @@ from jax.sharding import PartitionSpec as P
 
 from .. import prefill_megakernel as k
 
+# Token-combine rows per load/store batch between expert MXU panels (a wider
+# batch spills there) and in the combine loops, where a batch amortizes the
+# store-to-load ordering on the token sums.
 _RMW_BATCH = 2
+_RMW_LOOP_BATCH = 8
 _RMW_DUMMY_SLOTS = 16
 _LOCAL_EXPERTS = 56  # EP16/TP2: a chip's two ranks share 56 experts
 _MIDDLE = 1536  # each rank's half of an expert's intermediate width
@@ -1269,6 +1273,89 @@ def _prologue(
     pl.run_scoped(body, scratch)
 
 
+class _TokenCombine:
+    """Adds expert rows into one column block's FP32 token sums.
+
+    The GU rows already carry their route weights, so each expert row adds into
+    its token's sums unweighted. A batch issues all loads before its stores;
+    one expert holds a token at most once, so the destinations of a batch
+    differ (padding rows go to the dummy slots after the ``tokens`` rows).
+    """
+
+    def __init__(self, sums, destinations, tokens):
+        self.sums = sums
+        self.destinations = destinations
+        self.tokens = tokens
+
+    def _add(self, dests, vals):
+        olds = [self.sums.at[pl.ds(d, 1)][...] for d in dests]
+        for d, old, val in zip(dests, olds, vals, strict=True):
+            self.sums.at[pl.ds(d, 1)][...] = old + val
+
+    def rows(self, rows, base, count):
+        """Routes ``base .. base + count``, held by ``rows`` from its first row.
+
+        Static offsets into one view leave one source address computation per
+        batch instead of one per row.
+        """
+        dests = [self.destinations[base + r] for r in range(count)]
+        vals = [rows.at[pl.ds(r, 1)][...].astype(jnp.float32) for r in range(count)]
+        self._add(dests, vals)
+
+    def clamped(self, source, begin, base, end, count, *, guard, dummy_base=0):
+        """Routes ``base .. base + count`` of ``source`` (whose row 0 is route
+        ``begin``); routes from ``end`` on, or all when ``guard`` is false,
+        add into dummy slots."""
+        idxs = [base + r for r in range(count)]
+        clamped = [jnp.minimum(i, end - 1) for i in idxs]
+        dests = [
+            jnp.where(
+                guard & (idxs[r] < end),
+                self.destinations[clamped[r]],
+                self.tokens + ((dummy_base + r) % _RMW_DUMMY_SLOTS),
+            )
+            for r in range(count)
+        ]
+        vals = [
+            source.at[pl.ds(c - begin, 1)][...].astype(jnp.float32) for c in clamped
+        ]
+        self._add(dests, vals)
+
+    def visit(self, source, start, end, *, sublane, first, unroll):
+        """Routes ``start + first .. end`` of one expert tile: ``unroll``-row
+        chunks, then batches, then clamped pairs. ``source`` row 0 holds route
+        ``start`` rounded down to the ``sublane`` boundary."""
+        begin = start // sublane * sublane
+        start = jnp.minimum(start + first, end)
+        batch = min(_RMW_LOOP_BATCH, unroll)
+        assert unroll % batch == 0
+        full = (end - start) // unroll
+
+        @pl.loop(0, full)
+        def chunk(b):
+            base = start + b * unroll
+            rows = source.at[pl.ds(base - begin, unroll)]
+            for u in range(0, unroll, batch):
+                self.rows(rows.at[pl.ds(u, batch)], base + u, batch)
+
+        chunked = start + full * unroll
+        groups = (end - chunked) // batch if batch < unroll else 0
+
+        @pl.loop(0, groups)
+        def group(i):
+            base = chunked + i * batch
+            self.rows(source.at[pl.ds(base - begin, batch)], base, batch)
+
+        grouped = chunked + groups * batch
+
+        @pl.loop(0, pl.cdiv(end - grouped, _RMW_BATCH))
+        def tail(t):
+            self.clamped(
+                source, begin, grouped + t * _RMW_BATCH, end, _RMW_BATCH,
+                guard=jnp.bool_(True),
+            )
+
+
 def _routed_experts(
     latent,
     gu_weights,
@@ -1458,6 +1545,8 @@ def _routed_experts(
                 streams=regions, buffers=2, state=state, ring_meta=ring_meta, drain=drain, poll_round=poll_round, sparse_poll=(ng >= 72),
             )
 
+        combine = _TokenCombine(sums, destinations, tokens)
+
         @_scoped("m_emit_subtotals")
         def emit_subtotals(subtotal_vmem):
             @pl.loop(0, tokens // store_tile)
@@ -1471,69 +1560,15 @@ def _routed_experts(
                     :, :tn
                 ].astype(jnp.bfloat16)
 
-        # Token combine: the GU rows already carry their route weights, so each
-        # expert row adds into its token's sums unweighted. A batch issues all
-        # loads before its stores; one expert holds a token at most once, so the
-        # destinations of a batch differ (padding rows go to the dummy slots).
-        def batched_unclamped(source, begin, base_idx, width_b):
-            idxs = [base_idx + r for r in range(width_b)]
-            dests = [destinations[i_r] for i_r in idxs]
-            vals = [
-                source.at[pl.ds(i_r - begin, 1)][...].astype(jnp.float32)
-                for i_r in idxs
-            ]
-            olds = [sums.at[pl.ds(d_r, 1)][...] for d_r in dests]
-            for r in range(width_b):
-                sums.at[pl.ds(dests[r], 1)][...] = olds[r] + vals[r]
-
-        def batched_clamped(
-            source, begin, base_idx, end, width_b, *, guard, dummy_base=0
-        ):
-            idxs = [base_idx + r for r in range(width_b)]
-            clamped = [jnp.minimum(idx_r, end - 1) for idx_r in idxs]
-            dests = [
-                jnp.where(
-                    guard & (idxs[r] < end),
-                    destinations[clamped[r]],
-                    tokens + ((dummy_base + r) % _RMW_DUMMY_SLOTS),
-                )
-                for r in range(width_b)
-            ]
-            vals = [
-                source.at[pl.ds(c_r - begin, 1)][...].astype(jnp.float32)
-                for c_r in clamped
-            ]
-            olds = [sums.at[pl.ds(d_r, 1)][...] for d_r in dests]
-            for r in range(width_b):
-                sums.at[pl.ds(dests[r], 1)][...] = olds[r] + vals[r]
-
         def consume(tile_g, source, first=0, *, loop_unroll=unroll):
-            start = metadata.gm_id_to_m_offset[tile_g]
-            end = metadata.gm_id_to_m_offset[tile_g + 1]
-            begin = start // sub * sub
-            start = jnp.minimum(start + first, end)
-            step_b = min(_RMW_BATCH, loop_unroll)
-            full = (end - start) // loop_unroll
-
-            @pl.loop(0, full)
-            def chunk(b):
-                base = start + b * loop_unroll
-                for u in range(0, loop_unroll, step_b):
-                    batched_unclamped(source, begin, base + u, min(step_b, loop_unroll - u))
-
-            tail_start = start + full * loop_unroll
-            tail_steps = pl.cdiv(end - tail_start, step_b)
-
-            @pl.loop(0, tail_steps)
-            def tail(tb):
-                batched_clamped(
-                    source,
-                    begin,
-                    tail_start + tb * step_b,
-                    end,
-                    step_b,
-                    guard=jnp.bool_(True),
-                )
+            combine.visit(
+                source,
+                metadata.gm_id_to_m_offset[tile_g],
+                metadata.gm_id_to_m_offset[tile_g + 1],
+                sublane=sub,
+                first=first,
+                unroll=loop_unroll,
+            )
 
         gu_panels = pl.cdiv(gu_width, pltpu.get_tpu_info().mxu_column_size)
         moved_rows = gu_panels * gu_unroll
@@ -1547,7 +1582,7 @@ def _routed_experts(
             previous = packed.at[(g + 1) % 2]
             step_b = min(_RMW_BATCH, gu_u)
             for row in range(0, gu_u, step_b):
-                batched_clamped(
+                combine.clamped(
                     previous,
                     begin,
                     start + panel * gu_u + row,
@@ -1596,7 +1631,7 @@ def _routed_experts(
                 base_off = gu_moved + panel * down_u
                 step_b = min(_RMW_BATCH, down_u)
                 for row in range(0, down_u, step_b):
-                    batched_clamped(
+                    combine.clamped(
                         previous,
                         begin,
                         start + base_off + row,

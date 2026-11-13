@@ -4,10 +4,13 @@ the stepped down reduction and the single-launch 16K geometry."""
 
 import types
 
+import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.megakernel.kimi_k3.kernels import prefill_megakernel as kernels
 from vllm_torchtpu.megakernel.kimi_k3.kernels import rank_loader
@@ -183,3 +186,91 @@ def test_16k_reduce_ring_regions_cover_the_column_block():
         covered[row : row + rows, col : col + cols] += 1
     assert len(regions) == 12
     np.testing.assert_array_equal(covered, 1)
+
+
+def _combine_call(kernel_body, sums, ids, source):
+    """Run ``kernel_body(bounds, combine, source)`` over token sums in Pallas
+    interpret mode; returns the updated sums."""
+    tokens = sums.shape[0] - fused._RMW_DUMMY_SLOTS
+
+    def kernel(bounds, ids_ref, source_ref, sums_in, sums_out):
+        sums_out[...] = sums_in[...]
+        combine = fused._TokenCombine(sums_out, fused._FlatMetadata(ids_ref), tokens)
+        kernel_body(bounds, combine, source_ref)
+
+    def call(bounds):
+        return np.asarray(
+            pl.pallas_call(
+                kernel,
+                out_shape=jax.ShapeDtypeStruct(sums.shape, jnp.float32),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=2,
+                    in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
+                    out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                ),
+                interpret=True,
+            )(
+                jnp.asarray(bounds, jnp.int32),
+                jnp.asarray(ids.reshape(-1, 128)),
+                jnp.asarray(source),
+                jnp.asarray(sums),
+            )
+        )
+
+    return call
+
+
+def _combine_inputs(rng, *, tokens, start, end):
+    """Token sums, an expert tile's packed rows and the routes' distinct
+    ascending token ids (one expert holds a token at most once)."""
+    sums = rng.standard_normal((tokens + fused._RMW_DUMMY_SLOTS, 2, 256))
+    source = rng.standard_normal((256, 2, 256)).astype(ml_dtypes.bfloat16)
+    ids = np.zeros(1024, np.int32)
+    ids[start:end] = np.sort(rng.choice(tokens, end - start, replace=False))
+    return sums.astype(np.float32), source, ids
+
+
+@pytest.mark.parametrize(
+    "start, rows, first, unroll",
+    [
+        (37, 211, 64, 32),  # later column: chunks, batches and a clamped tail
+        (16, 240, 112, 8),  # first column (rows past the GU and first-down overlap)
+        (5, 37, 0, 32),  # a short last tile: batches and tail only
+        (100, 30, 64, 32),  # every row already combined during the products
+    ],
+)
+def test_token_combine_visit_is_the_scatter_add(start, rows, first, unroll):
+    rng = np.random.default_rng(start)
+    tokens, end = 1024, start + rows
+    sums, source, ids = _combine_inputs(rng, tokens=tokens, start=start, end=end)
+
+    def body(bounds, combine, source_ref):
+        combine.visit(
+            source_ref, bounds[0], bounds[1], sublane=16, first=first, unroll=unroll
+        )
+
+    actual = _combine_call(body, sums, ids, source)([start, end])
+    expected = sums.copy()
+    begin = start // 16 * 16
+    for route in range(start + first, end):
+        expected[ids[route]] += source[route - begin].astype(np.float32)
+    # Bit-identical: each token takes one FP32 add per tile; padding rows of
+    # the clamped tail land in the dummy slots past the token rows.
+    np.testing.assert_array_equal(actual[:tokens], expected[:tokens])
+
+
+def test_token_combine_clamped_rows_past_the_tile_go_to_dummy_slots():
+    rng = np.random.default_rng(7)
+    tokens, start, end = 1024, 20, 25
+    sums, source, ids = _combine_inputs(rng, tokens=tokens, start=start, end=end)
+
+    def body(bounds, combine, source_ref):
+        combine.clamped(source_ref, 16, bounds[0], bounds[1], 8, guard=True)
+        combine.clamped(source_ref, 16, bounds[0], bounds[1], 2, guard=False)
+
+    actual = _combine_call(body, sums, ids, source)([start, end])
+    expected = sums.copy()
+    for route in range(start, end):
+        expected[ids[route]] += source[route - 16].astype(np.float32)
+    np.testing.assert_array_equal(actual[:tokens], expected[:tokens])
+    assert (actual[tokens:] != sums[tokens:]).any()
