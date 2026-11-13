@@ -1000,6 +1000,37 @@ def all_to_all_by_permute(
     return out
 
 
+def _exchange_partials(
+    parts: jax.Array, lses: jax.Array, rank: jax.Array, axis: str, dcp: int
+) -> tuple[jax.Array, jax.Array]:
+    """`all_to_all_by_permute` of ``parts [dcp, Hl, T, D]`` and ``lses [dcp,
+    T, Hl]`` f32 in one set of permutes: the LSEs' bits ride as one more uint16
+    head row (a permute copies bytes; every permute start costs ~1 us on the
+    TensorCore at decode, c4 twin j-6bbe97e2)."""
+    num_ranks, num_heads, num_tokens, head_dim = parts.shape
+    if parts.dtype.itemsize != 2 or 2 * num_heads > head_dim:
+        raise ValueError(
+            f"16-bit partials with 2 * heads <= head_dim, got {parts.dtype} "
+            f"{parts.shape}"
+        )
+    # As 16-bit integers: float copies may canonicalize NaN or flush
+    # subnormal bit patterns (the LSE halves are arbitrary bits).
+    words = jax.lax.bitcast_convert_type(parts, jnp.uint16)
+    bits = jax.lax.bitcast_convert_type(lses, jnp.uint16)  # [dcp, T, Hl, 2]
+    bits = bits.reshape(num_ranks, 1, num_tokens, 2 * num_heads)
+    bits = jnp.pad(bits, ((0, 0), (0, 0), (0, 0), (0, head_dim - 2 * num_heads)))
+    both = all_to_all_by_permute(
+        jnp.concatenate([words, bits], axis=1), rank, axis, dcp
+    )
+    bits = both[:, num_heads, :, : 2 * num_heads].reshape(
+        num_ranks, num_tokens, num_heads, 2
+    )
+    return (
+        jax.lax.bitcast_convert_type(both[:, :num_heads], parts.dtype),
+        jax.lax.bitcast_convert_type(bits, lses.dtype),
+    )
+
+
 def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
     """The group's head-major query heads ``[dcp * Hl, T, D]`` from this
     rank's ``q [Hl, T, D]``. A pair swaps its halves by one collective
@@ -1072,8 +1103,7 @@ def attend_and_merge(
     parts = out.reshape(dcp, num_heads, num_tokens, head_dim)
     lses = lse.reshape(dcp, num_heads, num_tokens).transpose(0, 2, 1)
     if small:
-        parts = all_to_all_by_permute(parts, rank, axis, dcp)
-        lses = all_to_all_by_permute(lses, rank, axis, dcp)
+        parts, lses = _exchange_partials(parts, lses, rank, axis, dcp)
     else:
         parts = jax.lax.all_to_all(parts, axis, 0, 0, tiled=True)
         lses = jax.lax.all_to_all(lses, axis, 0, 0, tiled=True)

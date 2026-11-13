@@ -270,3 +270,36 @@ def test_all_to_all_by_permute_matches_all_to_all():
     got = body(lambda r, x: msa_dcp.all_to_all_by_permute(x, r[0], "dcp", DCP))
     want = body(lambda r, x: jax.lax.all_to_all(x, "dcp", 0, 0, tiled=True))
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_exchange_partials_matches_all_to_all():
+    """The LSEs cross bit for bit (-inf and NaN included) beside the partials."""
+    if len(jax.devices()) < 2:
+        pytest.skip("needs 2 devices")
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("dcp",))
+    rng = np.random.default_rng(0)
+    parts = jnp.asarray(rng.standard_normal((4, 8, 16, 128)), jnp.bfloat16)
+    lses = rng.standard_normal((4, 16, 8)).astype(np.float32)
+    lses[0, 0, 0], lses[1, 2, 3] = -np.inf, np.nan
+    lses = jnp.asarray(lses)
+
+    def run(fn):
+        return jax.shard_map(
+            fn,
+            mesh=mesh,
+            in_specs=(P("dcp"), P("dcp"), P("dcp")),
+            out_specs=(P("dcp"), P("dcp")),
+            check_vma=False,
+        )(jnp.arange(2, dtype=jnp.int32), parts, lses)
+
+    got = run(lambda r, p, s: msa_dcp._exchange_partials(p, s, r[0], "dcp", 2))
+    want = run(
+        lambda r, p, s: tuple(
+            jax.lax.all_to_all(x, "dcp", 0, 0, tiled=True) for x in (p, s)
+        )
+    )
+    for g, w in zip(got, want):
+        np.testing.assert_array_equal(
+            np.asarray(g).view(np.uint16 if g.dtype == jnp.bfloat16 else np.uint32),
+            np.asarray(w).view(np.uint16 if w.dtype == jnp.bfloat16 else np.uint32),
+        )
