@@ -28,17 +28,15 @@ from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
 
 pytestmark = pytest.mark.omni
 
-THINKER = SimpleNamespace(architectures=["Qwen3OmniMoeForConditionalGeneration"])
+THINKER_ARCHS = ["Qwen3OmniMoeForConditionalGeneration"]
 
 
 def test_non_omni_config_is_not_patched() -> None:
     before = Qwen3OmniMoeAudioEncoder.forward
     assert maybe_patch_qwen3_omni_thinker(None) is False
+    assert maybe_patch_qwen3_omni_thinker([]) is False
     for arch in ("LlamaForCausalLM", "Qwen3OmniMoeThinkerForConditionalGeneration"):
-        assert (
-            maybe_patch_qwen3_omni_thinker(SimpleNamespace(architectures=[arch]))
-            is False
-        )
+        assert maybe_patch_qwen3_omni_thinker([arch]) is False
     assert Qwen3OmniMoeAudioEncoder.forward is before
 
 
@@ -49,9 +47,9 @@ def test_patch_moves_chunk_lengths_to_cpu_and_cnn_lengths_back(
     monkeypatch.setattr(cls, "forward", lambda self, x, lens, after: lens)
     monkeypatch.setattr(cls, "_get_cnn_output_lengths", lambda self, x: x)
 
-    assert maybe_patch_qwen3_omni_thinker(THINKER) is True
-    patched = cls.forward
-    assert getattr(patched, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+    patched_forward = cls.forward
+    assert getattr(patched_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
 
     class TrackedTensor(torch.Tensor):
         cpu_called: bool = False
@@ -62,7 +60,7 @@ def test_patch_moves_chunk_lengths_to_cpu_and_cnn_lengths_back(
 
     enc = SimpleNamespace(conv2d1=SimpleNamespace(weight=torch.empty(0, device="meta")))
     lens = torch.tensor([800]).as_subclass(TrackedTensor)
-    out_lens = patched(enc, torch.randn(128, 800), lens, torch.tensor([104]))
+    out_lens = patched_forward(enc, torch.randn(128, 800), lens, torch.tensor([104]))
     assert lens.cpu_called is True
     assert out_lens.device.type == "cpu"
 
@@ -70,5 +68,5 @@ def test_patch_moves_chunk_lengths_to_cpu_and_cnn_lengths_back(
     assert cnn_out.device.type == "meta"
 
     # Idempotent on repeated calls.
-    assert maybe_patch_qwen3_omni_thinker(THINKER) is False
-    assert cls.forward is patched
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is False
+    assert cls.forward is patched_forward

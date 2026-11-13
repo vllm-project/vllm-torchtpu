@@ -14,26 +14,25 @@
 """Unit tests for src/vllm_torchtpu/omni/worker/tpu_ar_model_runner.py."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from typing import Any
 
 import pytest
 import torch
 from vllm.sequence import IntermediateTensors
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.worker.omni_connector_model_runner_mixin import (
-    OmniConnectorModelRunnerMixin,
-)
 
 from vllm_torchtpu.omni.worker.tpu_ar_model_runner import TPUARModelRunner
-from vllm_torchtpu.omni.worker.tpu_model_runner import OmniTPUModelRunner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 pytestmark = pytest.mark.omni
 
 
-def _stage_config(**fields) -> OmniModelConfig:
+def _stage_config(**fields: Any) -> OmniModelConfig:
     defaults = dict(
+        model_arch_config=SimpleNamespace(
+            architectures=["Qwen3OmniMoeForConditionalGeneration"]
+        ),
         model_stage="thinker",
         stage_id=0,
         requires_full_payload_input=False,
@@ -46,104 +45,178 @@ def _stage_config(**fields) -> OmniModelConfig:
     return config
 
 
-def _build(model_config=None, model=None, speculative_config=None) -> TPUARModelRunner:
-    if model_config is None:
-        model_config = _stage_config()
-
-    def _fake_init(self, vllm_config, *args, **kwargs):
+@pytest.fixture(autouse=True)
+def _stub_tpu_model_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_init(self: Any, vllm_config: Any, *args: Any, **kwargs: Any) -> None:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.speculative_config = vllm_config.speculative_config
 
-    with patch.object(TPUModelRunner, "__init__", _fake_init):
-        runner = TPUARModelRunner(
-            SimpleNamespace(
-                model_config=model_config,
-                speculative_config=speculative_config,
-            ),
-            "tpu",
-        )
-    if model is not None:
-        with (
-            patch(
-                "vllm_torchtpu.omni.worker.tpu_ar_model_runner.maybe_patch_qwen3_omni_thinker"
-            ) as mock_patch,
-            patch.object(
-                TPUModelRunner, "load_model", lambda self: setattr(self, "model", model)
-            ),
-        ):
-            runner.load_model()
-            mock_patch.assert_called_once_with(runner.model_config)
-    return runner
+    monkeypatch.setattr(TPUModelRunner, "__init__", _fake_init)
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.worker.tpu_ar_model_runner.maybe_patch_qwen3_omni_thinker",
+        lambda *_: False,
+    )
+
+
+@pytest.fixture
+def tpu_ar_model_runner(request: pytest.FixtureRequest) -> TPUARModelRunner:
+    model_config = getattr(request, "param", None)
+    if model_config is None:
+        model_config = _stage_config()
+    vllm_config = SimpleNamespace(
+        model_config=model_config,
+        speculative_config=None,
+    )
+    return TPUARModelRunner(vllm_config, "tpu")
 
 
 class _StageModel:
-    def __init__(self, result, *, has_preprocess=False, has_postprocess=False):
+    def __init__(
+        self,
+        result: Any,
+        *,
+        has_preprocess: bool = False,
+        has_postprocess: bool = False,
+    ):
         self.result = result
         self.has_preprocess = has_preprocess
         self.has_postprocess = has_postprocess
-        self.wrapped = []
+        self.wrapped: list[Any] = []
+        self.kwargs: dict[str, Any] = {}
 
-    def __call__(self, **kwargs):
+    def __call__(self, **kwargs: Any) -> Any:
         self.kwargs = kwargs
         return self.result
 
-    def make_omni_output(self, model_outputs, **kwargs) -> OmniOutput:
+    def make_omni_output(self, model_outputs: Any, **kwargs: Any) -> OmniOutput:
         self.wrapped.append(model_outputs)
         hidden = model_outputs[0] if isinstance(model_outputs, tuple) else model_outputs
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"embed": {}})
 
 
-def test_tpu_ar_model_runner_init_and_inheritance():
-    assert TPUARModelRunner.__bases__ == (
-        OmniTPUModelRunner,
-        OmniConnectorModelRunnerMixin,
+@pytest.mark.parametrize(
+    ("tpu_ar_model_runner", "expected"),
+    [
+        (_stage_config(model_stage="thinker", stage_id=0), ("thinker", 0)),
+        (SimpleNamespace(architectures=[]), (None, None)),
+    ],
+    indirect=["tpu_ar_model_runner"],
+    ids=["omni_stage_config", "plain_vllm_config"],
+)
+def test_tpu_ar_model_runner_stage_metadata(
+    tpu_ar_model_runner: TPUARModelRunner,
+    expected: tuple[str | None, int | None],
+) -> None:
+    assert (tpu_ar_model_runner.model_stage, tpu_ar_model_runner.stage_id) == expected
+
+
+@pytest.mark.parametrize(
+    ("model_config", "speculative_config", "match"),
+    [
+        (
+            _stage_config(
+                custom_process_next_stage_input_func="pkg.mod.thinker2talker"
+            ),
+            None,
+            "connectors",
+        ),
+        (
+            _stage_config(),
+            SimpleNamespace(method="eagle3"),
+            "speculative_config",
+        ),
+    ],
+    ids=["connectors", "speculative_config"],
+)
+def test_tpu_ar_model_runner_init_rejects_unsupported_config(
+    model_config: Any,
+    speculative_config: Any,
+    match: str,
+) -> None:
+    vllm_config = SimpleNamespace(
+        model_config=model_config,
+        speculative_config=speculative_config,
     )
-    assert OmniConnectorModelRunnerMixin not in OmniTPUModelRunner.__mro__
-
-    runner = _build(_stage_config(model_stage="thinker", stage_id=0))
-    assert (runner.model_stage, runner.stage_id) == ("thinker", 0)
-    plain = _build(SimpleNamespace())
-    assert (plain.model_stage, plain.stage_id) == (None, None)
-
-    with pytest.raises(NotImplementedError, match="connectors"):
-        _build(
-            _stage_config(custom_process_next_stage_input_func="pkg.mod.thinker2talker")
-        )
-
-    with pytest.raises(NotImplementedError, match="speculative_config"):
-        _build(speculative_config=SimpleNamespace(method="eagle3"))
+    with pytest.raises(NotImplementedError, match=match):
+        TPUARModelRunner(vllm_config, "tpu")
 
 
-def test_load_model_checks_per_step_hook_capabilities():
-    thinker = _StageModel(torch.zeros(1, 4))
-    assert _build(model=thinker).get_model() is thinker
+@pytest.mark.parametrize(
+    ("has_preprocess", "has_postprocess", "error_match"),
+    [
+        (False, False, None),
+        (True, False, "has_preprocess"),
+        (False, True, "has_postprocess"),
+        (True, True, "has_preprocess, has_postprocess"),
+    ],
+    ids=["thinker", "preprocess_only", "postprocess_only", "talker_both"],
+)
+def test_load_model_checks_per_step_hook_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+    tpu_ar_model_runner: TPUARModelRunner,
+    has_preprocess: bool,
+    has_postprocess: bool,
+    error_match: str | None,
+) -> None:
+    model = _StageModel(
+        torch.zeros(1, 4),
+        has_preprocess=has_preprocess,
+        has_postprocess=has_postprocess,
+    )
+    monkeypatch.setattr(
+        TPUModelRunner,
+        "load_model",
+        lambda self: setattr(self, "model", model),
+    )
+    if error_match is None:
+        tpu_ar_model_runner.load_model()
+        assert tpu_ar_model_runner.get_model() is model
+    else:
+        with pytest.raises(NotImplementedError, match=error_match):
+            tpu_ar_model_runner.load_model()
 
-    talker = _StageModel(torch.zeros(1, 4), has_preprocess=True, has_postprocess=True)
-    with pytest.raises(NotImplementedError, match="has_preprocess, has_postprocess"):
-        _build(model=talker)
+
+_HIDDEN = torch.arange(8.0).reshape(2, 4)
+_STAGED = (_HIDDEN, {"layer_0": torch.zeros(2, 4)})
+_INTERMEDIATE = IntermediateTensors({"hidden_states": _HIDDEN})
 
 
-def test_forward_model_normalizes_stage_outputs():
+@pytest.mark.parametrize(
+    ("raw_output", "intermediate_tensors", "expected_out", "expected_wrapped"),
+    [
+        (_HIDDEN, None, _HIDDEN, [_HIDDEN]),
+        ([_HIDDEN], None, _HIDDEN, [_HIDDEN]),
+        (_STAGED, None, _HIDDEN, [_STAGED]),
+        (OmniOutput(text_hidden_states=_HIDDEN), None, _HIDDEN, []),
+        (_INTERMEDIATE, _INTERMEDIATE, _INTERMEDIATE, []),
+    ],
+    ids=[
+        "tensor",
+        "single_elem_list",
+        "staged_tuple",
+        "omni_output",
+        "intermediate_tensors",
+    ],
+)
+def test_forward_model_normalizes_stage_outputs(
+    tpu_ar_model_runner: TPUARModelRunner,
+    raw_output: Any,
+    intermediate_tensors: IntermediateTensors | None,
+    expected_out: Any,
+    expected_wrapped: list[Any],
+) -> None:
     ids, pos = torch.tensor([1, 2]), torch.tensor([0, 1])
-    hidden = torch.arange(8.0).reshape(2, 4)
-    staged = (hidden, {"layer_0": torch.zeros(2, 4)})
+    model = _StageModel(raw_output)
+    tpu_ar_model_runner.model = model
 
-    for raw, expected_wrapped in [
-        (hidden, [hidden]),
-        ([hidden], [hidden]),
-        (staged, [staged]),
-        (OmniOutput(text_hidden_states=hidden), []),
-    ]:
-        runner = _build(model=(model := _StageModel(raw)))
-        assert runner.forward_model(ids, pos) == (hidden, None)
-        assert model.wrapped == expected_wrapped
-        assert "intermediate_tensors" not in model.kwargs
-
-    tensors = IntermediateTensors({"hidden_states": hidden})
-    runner = _build(model=(model := _StageModel(tensors)))
-    assert runner.forward_model(ids, pos, intermediate_tensors=tensors) == (
-        tensors,
-        None,
+    out, aux = tpu_ar_model_runner.forward_model(
+        ids, pos, intermediate_tensors=intermediate_tensors
     )
-    assert model.kwargs["intermediate_tensors"] is tensors
+    assert out is expected_out
+    assert aux is None
+    assert model.wrapped == expected_wrapped
+    if intermediate_tensors is None:
+        assert "intermediate_tensors" not in model.kwargs
+    else:
+        assert model.kwargs["intermediate_tensors"] is intermediate_tensors
