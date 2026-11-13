@@ -41,34 +41,56 @@ def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:
 # NOTE: Fork of recurrent_scan_v2.py but applied various optimizations.
 def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     """Compute invert matrix of a given triauglar matrix."""
+
+    # NOTE: if chunk_size=1, compiler will perform DCE.
     del block_size
     out_dtype = t.dtype
     chunk = t.shape[-1]
-    t_f32 = t.astype(jnp.float32)
-    iota_r = jax.lax.broadcasted_iota(jnp.int32, t.shape, 1)
-    iota_c = jax.lax.broadcasted_iota(jnp.int32, t.shape, 2)
+    t = t.astype(jnp.float32)
+
+    iota_r = jax.lax.broadcasted_iota(jnp.int32, (1, chunk, chunk), 1)
+    iota_c = jax.lax.broadcasted_iota(jnp.int32, (1, chunk, chunk), 2)
     xor_lower = jnp.where(iota_r > iota_c, iota_r ^ iota_c, 0)
 
     inv = jnp.where(
-        xor_lower == 1,
-        -t_f32,
-        jnp.where(iota_r == iota_c, 1.0, 0.0),
+        iota_r == iota_c,
+        1.0,
+        jnp.where(xor_lower == 1, -t, 0.0),
     )
-    dot_dims = (((2, ), (1, )), ((0, ), (0, )))
+
     shift = 1
     while (1 << shift) < chunk:
-        t_sub = jnp.where((xor_lower >> shift) == 1, t_f32, 0.0)
-        inv = inv - jax.lax.dot(
-            inv,
-            jax.lax.dot(
-                t_sub,
+        b = 1 << shift
+        step_mask = (xor_lower >> shift) == 1
+        if b * 2 == chunk and b % 8 == 0:
+            t_bot = jnp.where(step_mask[:, b:, :], t[:, b:, :], 0.0)
+            prod_bot = jax.lax.dot(
+                t_bot,
                 inv,
-                dimension_numbers=dot_dims,
+                dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
                 preferred_element_type=jnp.float32,
-            ),
-            dimension_numbers=dot_dims,
-            preferred_element_type=jnp.float32,
-        )
+            )
+            inv_bot = inv[:, b:, :] - jax.lax.dot(
+                inv[:, b:, :],
+                jnp.concatenate([prod_bot, prod_bot], axis=1),
+                dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+                preferred_element_type=jnp.float32,
+            )
+            inv = jnp.concatenate([inv[:, :b, :], inv_bot], axis=1)
+        else:
+            t_step = jnp.where(step_mask, t, 0.0)
+            prod = jax.lax.dot(
+                t_step,
+                inv,
+                dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+                preferred_element_type=jnp.float32,
+            )
+            inv = inv - jax.lax.dot(
+                inv,
+                prod,
+                dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+                preferred_element_type=jnp.float32,
+            )
         shift += 1
 
     return inv.astype(out_dtype)
@@ -86,8 +108,8 @@ def fused_transpose_broadcast(
     dtype = x.dtype
     mask_dtype = get_mask_dtype(dtype)
     mask_shape = list(x.shape)
-    mask_size = mask_shape[src_dim]
-    mask_shape[dst_dim] = mask_size if dst_size is None else dst_size
+    mask_size = mask_shape[src_dim] if dst_size is None else dst_size
+    mask_shape[dst_dim] = mask_size
     src_mask = jax.lax.broadcasted_iota(mask_dtype, mask_shape, src_dim)
     dst_mask = jax.lax.broadcasted_iota(mask_dtype, mask_shape, dst_dim)
     mask = src_mask == dst_mask
@@ -105,8 +127,8 @@ def chunked_gdn_per_seq(
 ) -> tuple[jax.Array, jax.Array]:
     """Perform chunked GDN over input [num_heads, chunk, head_dim]."""
 
-    # Compute cumulative sum of decay via logarithmic tree scan.
-    # [1, chunk, aligned_num_v_heads]
+    # Compute cumulative sum of decay via logarithmic tree prefix sum.
+    # [1, chunk, num_v_heads]
     g_cum_sum_log = gating_log
     step = 1
     while step < cfg.chunk_size:
@@ -143,8 +165,9 @@ def chunked_gdn_per_seq(
     gating_last = gating_forward[:, -1:]
 
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
-    iota_r = jax.lax.broadcasted_iota(mask_dtype, g_cum_sum_diff_log.shape, 1)
-    iota_c = jax.lax.broadcasted_iota(mask_dtype, g_cum_sum_diff_log.shape, 2)
+    mask_shape = (1, cfg.chunk_size, cfg.chunk_size)
+    iota_r = jax.lax.broadcasted_iota(mask_dtype, mask_shape, 1)
+    iota_c = jax.lax.broadcasted_iota(mask_dtype, mask_shape, 2)
     identity_mask = iota_r == iota_c
     lower_mask = iota_r >= iota_c
     gating_map = jnp.where(lower_mask, jnp.exp(g_cum_sum_diff_log), 0)

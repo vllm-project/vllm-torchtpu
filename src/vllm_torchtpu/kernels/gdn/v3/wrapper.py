@@ -110,7 +110,6 @@ def inner_kernel(
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
         carry_conv_scratch_ref[...] = new_conv_state[:, -1]
-
     if cfg.state_plan is None:
         conv_state_slot_ref[...] = new_conv_state
     else:
@@ -120,18 +119,18 @@ def inner_kernel(
         for idx in range(cfg.seq_tile_size):
 
             for t in range(cfg.window_size):
+                src_conv = (carry_conv_scratch_ref[idx]
+                            if carry_conv_scratch_ref is not None
+                            and cfg.window_size == 1 else new_conv_state[idx,
+                                                                         t])
+                args = (conv_state_slot_ref.at[idx, t], cfg.state_plan.conv,
+                        src_conv)
                 if carry_conv_scratch_ref is None:
-                    vmem_ldst.store_state_region(
-                        conv_state_slot_ref.at[idx, t], cfg.state_plan.conv,
-                        new_conv_state[idx, t])
+                    vmem_ldst.store_state_region(*args)
                 else:
                     # copy_out only DMAs the tile that ends a sequence.
-                    state_val = (carry_conv_scratch_ref[idx] if cfg.window_size
-                                 == 1 else new_conv_state[idx, t])
                     pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
-                        functools.partial(vmem_ldst.store_state_region,
-                                          conv_state_slot_ref.at[idx, t],
-                                          cfg.state_plan.conv, state_val))
+                        functools.partial(vmem_ldst.store_state_region, *args))
 
     # Apply activation function.
     qkv_out_compact = jax.nn.silu(qkv_out_compact)
@@ -205,7 +204,6 @@ def inner_kernel(
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
-
     if cfg.state_plan is None:
         recurrent_slot_ref[...] = new_recurrent_state.astype(
             recurrent_slot_ref.dtype)
@@ -213,18 +211,17 @@ def inner_kernel(
         for idx in range(cfg.seq_tile_size):
 
             for t in range(cfg.window_size):
-                if carry_recurrent_scratch_ref is None:
-                    vmem_ldst.store_state_region(recurrent_slot_ref.at[idx, t],
-                                                 cfg.state_plan.recurrent,
-                                                 new_recurrent_state[idx, t])
-                else:
-                    state_val = (carry_recurrent_scratch_ref[idx]
-                                 if cfg.window_size == 1 else
+                src_recurrent = (carry_recurrent_scratch_ref[idx]
+                                 if carry_recurrent_scratch_ref is not None
+                                 and cfg.window_size == 1 else
                                  new_recurrent_state[idx, t])
+                args = (recurrent_slot_ref.at[idx, t],
+                        cfg.state_plan.recurrent, src_recurrent)
+                if carry_recurrent_scratch_ref is None:
+                    vmem_ldst.store_state_region(*args)
+                else:
                     pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
-                        functools.partial(vmem_ldst.store_state_region,
-                                          recurrent_slot_ref.at[idx, t],
-                                          cfg.state_plan.recurrent, state_val))
+                        functools.partial(vmem_ldst.store_state_region, *args))
 
 
 def outer_kernel(

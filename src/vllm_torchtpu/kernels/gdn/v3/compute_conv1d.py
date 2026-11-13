@@ -56,24 +56,25 @@ def causal_conv1d(
     for w_idx in range(cfg.window_size):
         last_row = 1 + cfg.chunk_size - cfg.window_size + w_idx
         if last_row == 64:
-            r = jnp.where((real_sizes >= 1) & (real_sizes < 64), real_sizes,
-                          64)
-            idx0 = r - 1
-            d2 = idx0 >> 4
-            d1 = (idx0 >> 2) & 3
-            d0 = idx0 & 3
-            w2 = 16 + cfg.prev_kernel_size - 1
-            b2 = lhs[:, 49:49 + w2]
-            for k in range(3):
-                b2 = jnp.where(d2 == k, lhs[:, 1 + 16 * k:1 + 16 * k + w2], b2)
-            w1 = 4 + cfg.prev_kernel_size - 1
-            b1 = b2[:, 12:12 + w1]
-            for k in range(3):
-                b1 = jnp.where(d1 == k, b2[:, 4 * k:4 * k + w1], b1)
-            new_conv_state = b1[:, 3:3 + cfg.prev_kernel_size]
-            for k in range(3):
-                new_conv_state = jnp.where(d0 == k,
-                                           b1[:, k:k + cfg.prev_kernel_size],
+            r = jnp.where(
+                (real_sizes >= 1) & (real_sizes < 64), real_sizes, 64) - 1
+            i2 = r >> 4
+            i1 = (r >> 2) & 3
+            i0 = r & 3
+            w1 = 15 + cfg.prev_kernel_size
+            c1 = lhs[:, 49:49 + w1]
+            for k2 in range(3):
+                start = 1 + 16 * k2
+                c1 = jnp.where(i2 == k2, lhs[:, start:start + w1], c1)
+            w2 = 3 + cfg.prev_kernel_size
+            c2 = c1[:, 12:12 + w2]
+            for k1 in range(3):
+                start = 4 * k1
+                c2 = jnp.where(i1 == k1, c1[:, start:start + w2], c2)
+            new_conv_state = c2[:, 3:3 + cfg.prev_kernel_size]
+            for k0 in range(3):
+                new_conv_state = jnp.where(i0 == k0,
+                                           c2[:, k0:k0 + cfg.prev_kernel_size],
                                            new_conv_state)
         else:
             # Checkpoint of sequences whose last real token is at or past this

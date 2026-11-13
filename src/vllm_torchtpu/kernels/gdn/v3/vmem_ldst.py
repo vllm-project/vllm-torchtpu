@@ -96,7 +96,7 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
     if col_size <= num_lanes:
-        return vmem_ref[...].reshape(new_shape)
+        return vmem_ref.reshape(new_shape)[...]
 
     vreg_list = []
     vmem_ref = vmem_ref.reshape(-1, col_size)
@@ -135,10 +135,9 @@ def load_state_region(slot_ref: jax.Ref, region: config.StateRegion,
     Returns:
         The logical state of ``shape`` in ``region.view_dtype``.
     """
-    arr = typed_ldst.load_typed(slot_ref,
-                                view_dtype=region.view_dtype,
-                                lane_split=region.lane_split)
-    arr = arr[:region.rows_used]
+    arr = typed_ldst.load_typed(
+        slot_ref, view_dtype=region.view_dtype,
+        lane_split=region.lane_split)[:region.rows_used]
     if region.rows_perm is not None:
         # Static row gather from the stored order to the logical order;
         # sublane-dim slices + concat only, no lane crossing.
