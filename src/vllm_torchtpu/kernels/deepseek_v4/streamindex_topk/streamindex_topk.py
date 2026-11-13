@@ -1375,9 +1375,6 @@ def streamindex_topk(
       kv_layout: memory layout of `cache_kv`. `SEQ_ALONG_LANE` removes the lane
         padding that per-token quantization forces on `HEAD_ALONG_SUBLANE` and is
         therefore substantially faster whenever the kernel is HBM bound.
-      lane_gather_axis: all-gather each chunk's top-k over this mesh axis
-        instead of once at the end, and return every lane's rows, lane-major
-        (TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER).
       chunk_tokens: size, in tokens, of each piece to cut the flat token axis
         into. Each piece scores into its own buffer and runs its own SparseCore
         top-k, and consecutive pieces share an XLA scheduling group so chunk i's
@@ -1385,6 +1382,9 @@ def streamindex_topk(
         `max_num_tokens`, runs a single unpipelined pass. Defaults to None: the
         size that wins depends on the workload and the KV layout, so the caller
         picks it.
+      lane_gather_axis: all-gather each chunk's top-k over this mesh axis
+        instead of once at the end, and return every lane's rows, lane-major
+        (TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER).
       cp_size: number of context-parallel ranks the compressed KV cache is sharded
         over. 1 (default) means no sharding and the whole CP path compiles away.
         When > 1, `cache_kv` / `page_indices` describe only this rank's shard, and

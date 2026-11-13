@@ -832,8 +832,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # load, in an order that makes the DCP reduce-scatter plus a lane
     # all-to-all land each rank on its o_proj heads), so the per-token KV
     # gather is not repeated on every lane. Needs TPU_DCP_INDEXER_LANE_SPLIT,
-    # TPU_DCP_INDEXER_HIST_MERGE, TPU_DCP_RANK_OPERAND, query replication and
-    # TPU_DCP_MLA_UV_BEFORE_MERGE; exclusive with TPU_DCP_MLA_OPROJ_ALL_REDUCE.
+    # TPU_DCP_INDEXER_HIST_MERGE and TPU_DCP_RANK_OPERAND (raises otherwise);
+    # without query replication or with one lane (tp == dcp) it is off, with a
+    # warning. Its buckets always apply W_UV before the DCP merge. Exclusive
+    # with TPU_DCP_MLA_OPROJ_ALL_REDUCE.
     # Costs one 64-head q_b, W_UK_T and W_UV per layer of HBM.
     "TPU_DCP_MLA_TOKEN_SPLIT": env_bool("TPU_DCP_MLA_TOKEN_SPLIT", default=False),
     # Smallest padded token bucket that takes TPU_DCP_MLA_TOKEN_SPLIT.
