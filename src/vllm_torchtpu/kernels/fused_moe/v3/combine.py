@@ -17,6 +17,8 @@ Accumulates top-k routed expert outputs weighted by routing probabilities and
 optionally fuses the shared expert residual addition.
 """
 
+from typing import cast
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -78,7 +80,7 @@ def _weighted_sum_body(
             # call: its term is dropped, not multiplied, so a NaN or Inf
             # there cannot reach the token.
             term = jnp.where(coef != 0, term, jnp.zeros_like(term))
-            acc = term if k == 0 else acc + term
+            acc = term if k == 0 else cast("jax.Array", acc) + term
         assert acc is not None  # top_k >= 1
         row0 = pl.multiple_of(t * lane_blocks, _stage_align(sum_vmem.dtype))
         sum_vmem[pl.ds(row0, lane_blocks), :] = acc.astype(sum_vmem.dtype)
