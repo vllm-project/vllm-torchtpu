@@ -10465,7 +10465,8 @@ class TPUModelRunner(GPUModelRunner):
                         and getattr(self.drafter, "draft_model", None) is not None
                     ):
                         shape_variants.retrace(
-                            self.drafter.draft_model, self.drafter.draft_vllm_config
+                            cast("torch.nn.Module", self.drafter.draft_model),
+                            cast("Eagle3Proposer", self.drafter).draft_vllm_config,
                         )
                     # Greedy and non-greedy (do_sampling=True) verify+sample are
                     # DISTINCT fused programs, so sweep both at every prompt bucket.

@@ -487,7 +487,9 @@ def maybe_share_lm_head(
                 "Populating draft's own lm_head with a host-gathered, "
                 "per-worker replicated copy of the target lm_head."
             )
-            populate_draft_lm_head_from_target(draft_model, draft_lm_head)
+            populate_draft_lm_head_from_target(
+                draft_model, cast("VocabParallelEmbedding", draft_lm_head)
+            )
         if tp_layout_matches or materialize_if_mismatched:
             logger.info(
                 "Draft lm_head precision: %s (target lm_head: %s; %s).",

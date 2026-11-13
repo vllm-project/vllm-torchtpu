@@ -1454,6 +1454,9 @@ class Eagle3Proposer:
                 # TPU_GREEDY_TOP_TOKENS: the vocab-parallel argmax, over the
                 # quantized draft head proxy when TPU_DRAFT_LM_HEAD_QUANT
                 # set one.
+                # torch's Module.__getattr__ stub types the owner's
+                # logits_processor submodule as Module | Tensor.
+                # pyrefly: ignore[missing-attribute]
                 tokens = owner.logits_processor.get_top_tokens(owner.lm_head, hidden)
                 return tokens.to(torch.int32)
             # No draft->target mapping table. Upstream compute_logits then asserts
@@ -1960,7 +1963,7 @@ class Eagle3Proposer:
                     pos_step1, seq_lens_step1 = cached_prep_step1
                     hidden_carry = hidden
                     rej_dev = (
-                        _maybe_pad_dim0(num_rejected, knr)
+                        _maybe_pad_dim0(cast("torch.Tensor", num_rejected), knr)
                         if num_rejected is not None
                         else None
                     )
@@ -1968,15 +1971,15 @@ class Eagle3Proposer:
                     p = self._loop_bucket(chunk.num_reqs)
                     if is_async:
                         rej_dev = (
-                            _maybe_pad_dim0(num_rejected, knr)
+                            _maybe_pad_dim0(cast("torch.Tensor", num_rejected), knr)
                             if num_rejected is not None
                             else None
                         )
                     elif num_rejected is not None and np.any(num_rejected):
                         padded_nr = np.zeros(knr, dtype=np.int32)
-                        padded_nr[: chunk.num_reqs] = num_rejected.astype(
-                            np.int32, copy=False
-                        )
+                        padded_nr[: chunk.num_reqs] = cast(
+                            "np.ndarray", num_rejected
+                        ).astype(np.int32, copy=False)
                         rej_dev = torch.from_numpy(padded_nr).to(runner.device)
                     else:
                         rej_dev = None
@@ -2015,9 +2018,11 @@ class Eagle3Proposer:
                 hidden_carry, positions_carry, last_hidden_carry = (
                     self._draft_gather_carries(*gather_args)
                 )
+                # owner_mask is None only under the ALL layout, whose default
+                # descriptor returns before reading it.
                 last_hidden_carry = (
                     chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
-                        last_hidden_carry, owner_mask
+                        last_hidden_carry, cast("torch.Tensor", owner_mask)
                     )
                 )
                 hidden_carry_per_chunk.append(hidden_carry)
@@ -2090,7 +2095,9 @@ class Eagle3Proposer:
                     if nr is not None and nr.shape[0] > knr:
                         nr = nr[:knr]
                     rejected_dev_per_chunk.append(
-                        _maybe_pad_dim0(nr, knr) if nr is not None else None
+                        _maybe_pad_dim0(cast("torch.Tensor", nr), knr)
+                        if nr is not None
+                        else None
                     )
                 elif nr is not None and np.any(nr):
                     padded_nr = np.zeros(knr, dtype=np.int32)
@@ -2657,7 +2664,7 @@ class Eagle3Proposer:
         for name, md in md_dict.items():
             new_md = replaced.get(id(md))
             if new_md is None:
-                rd = md.request_distribution
+                rd = cast("torch.Tensor | None", md.request_distribution)
                 if rd is None or rd.device.type != "tpu":
                     return md_dict
                 hit = cache.get(id(rd))

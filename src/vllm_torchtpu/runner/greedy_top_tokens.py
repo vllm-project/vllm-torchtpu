@@ -938,7 +938,7 @@ class _VocabParallelDraftHead(torch.nn.Module):
         tp_size: int,
     ) -> None:
         super().__init__()
-        weight = base_head.weight
+        weight = cast("torch.Tensor", base_head.weight)
         shard_vocab = int(weight.shape[0])
         if shard_vocab % dp_size:
             raise ValueError(
@@ -946,7 +946,7 @@ class _VocabParallelDraftHead(torch.nn.Module):
                 "equal DP slices"
             )
         n = shard_vocab // dp_size
-        si = base_head.shard_indices
+        si: Any = base_head.shard_indices
         shard_pad = int(si.num_org_vocab_padding)
         valid = max(0, min(n, shard_vocab - shard_pad - dp_rank * n))
         start = int(si.org_vocab_start_index) + dp_rank * n
@@ -996,7 +996,7 @@ class _VocabParallelDraftHead(torch.nn.Module):
 
 def _vocab_parallel_draft_top_tokens(
     processor: LogitsProcessor,
-    lm_head: torch.nn.Module,
+    lm_head: Any,
     hidden_states: torch.Tensor,
     embedding_bias: torch.Tensor | None,
 ) -> torch.Tensor:
@@ -1048,7 +1048,7 @@ def vocab_parallel_draft_owner(owner: torch.nn.Module) -> torch.nn.Module:
         get_tp_group,
     )
 
-    head = owner.lm_head
+    head = cast("VocabParallelEmbedding", owner.lm_head)
     weight: Any = getattr(head, "weight", None)
     if (
         getattr(head, "_quant_mode", None) is not None
@@ -1096,7 +1096,9 @@ def vocab_parallel_draft_owner(owner: torch.nn.Module) -> torch.nn.Module:
         str(vp_head.weight.dtype).replace("torch.", ""),
         tuple(weight.shape),
     )
-    return _DraftHeadOwnerProxy(owner.logits_processor, vp_head)
+    return _DraftHeadOwnerProxy(
+        cast("LogitsProcessor", owner.logits_processor), vp_head
+    )
 
 
 # The draft's BF16 head, kept on the target head when the target's is
