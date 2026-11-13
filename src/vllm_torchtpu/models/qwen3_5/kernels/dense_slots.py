@@ -47,7 +47,7 @@ result_rows="bf16" (and elementwise float32, where every compilation agrees).
 """
 
 import functools
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -873,7 +873,7 @@ def build_kernel(
                     coef = c[:, k : k + 1]
                     term = arrivals_ref[pos_ref[t, k]].astype(jnp.float32) * coef
                     term = jnp.where(coef != 0, term, jnp.zeros_like(term))
-                    acc = term if k == 0 else acc + term
+                    acc = term if k == 0 else cast("jax.Array", acc) + term
                 row0 = pl.multiple_of(t * LB, 8)
                 sum_vmem[pl.ds(row0, LB), :] = acc
                 return carry
