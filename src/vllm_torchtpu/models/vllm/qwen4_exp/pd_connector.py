@@ -1185,6 +1185,12 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             route.pairs_per_src_page * pd_route.ROW_BYTES
         ):
             raise ValueError("routed compressed keys need one pair row per 2*ratio tokens")
+        # A PP x PCP producer: this unit's split main KV is its PCP rank's.
+        pcp_rank = None
+        if route.pcp > 1:
+            from vllm_torchtpu.distributed.pcp import get_pcp_rank
+
+            pcp_rank = get_pcp_rank()
         registrations = []
         for pool, group_index in plan.pool_groups():
             ids = pages[group_index]
@@ -1199,7 +1205,10 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
 
                 routed = shared_spans(num_tokens, len(ids), shared, pd_route.ROW_BYTES)
             else:
-                routed = pd_route.producer_spans(kind, num_tokens, len(ids), route)
+                routed = pd_route.producer_spans(
+                    kind, num_tokens, len(ids), route,
+                    pcp_rank if kind == "main" else None,
+                )
             spans = tuple(
                 PoolByteSpan(
                     src_block_ordinal=src,

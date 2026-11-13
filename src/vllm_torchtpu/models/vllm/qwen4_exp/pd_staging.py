@@ -327,6 +327,20 @@ def pair_tokens_np(num_tokens, ratio, start=0) -> np.ndarray:
     return np.arange(start // span, pairs, dtype=np.int64) * span
 
 
+def split_pool(name: str) -> tuple[str, int | None]:
+    """``(owner, producer PCP rank)`` of a staging pool name: a PCP producer's
+    split main KV is staged per rank as ``<owner>.pcp<r>``, else ``(name, None)``."""
+    base, sep, rank = name.rpartition(".pcp")
+    if sep and rank.isdigit():
+        return base, int(rank)
+    return name, None
+
+
+def pool_kind(name: str) -> str:
+    """``owner_kind`` of a staging pool, per-rank split pools included."""
+    return owner_kind(split_pool(name)[0])
+
+
 def owner_kind(name: str) -> str:
     if name.endswith(".compressed_k"):
         return "compressed"
@@ -576,14 +590,23 @@ def route_geometry_for(cfg, src_layout, decode_layout, rank) -> "pd_route.RouteG
     row = ROW_SUBLANES * ROW_LANES
     if src_layout.token_bytes != row or decode_layout.token_bytes != row:
         raise ValueError("routed staging needs 1,024-byte rows on both legs")
-    if getattr(src_layout, "merged_compressed", False) or int(getattr(src_layout, "main_dcp", 1)) > 1:
-        # pd_route models a plain TP1 producer: one main-KV page per ID and
-        # unmerged compressed keys. Merged keys (QWEN4_EXP_MERGE_COMPRESSED_K /
-        # QWEN4_EXP_PD_PRODUCER_MERGED) and a PCP producer's split main KV
-        # (QWEN4_EXP_PD_PRODUCER_PCP > 1) are refused rather than mis-routed.
+    # A PP x PCP producer (QWEN4_EXP_PD_PRODUCER_PCP > 1) splits each main-KV
+    # ID over its ranks in pcp_interleave() units; a merged-key producer
+    # (QWEN4_EXP_MERGE_COMPRESSED_K / QWEN4_EXP_PD_PRODUCER_MERGED) holds one
+    # key block per ID. pd_route routes both; keys split by page owner
+    # (QWEN4_EXP_PCP_SPLIT_COMPRESSED_K) are refused rather than mis-routed.
+    pcp = int(getattr(src_layout, "main_dcp", 1) or 1)
+    interleave = int(getattr(src_layout, "main_dcp_interleave", 0) or 0)
+    if pcp > 1 and not interleave:
         raise ValueError(
-            "QWEN4_EXP_PD_ROUTED_DST supports a plain TP1 producer only "
-            "(no merged compressed keys, no PCP split main KV)"
+            "QWEN4_EXP_PD_ROUTED_DST routes a TP1 or PP x PCP producer; this one "
+            f"splits main KV over TP rank pairs (main_dcp={pcp})"
+        )
+    merged = bool(getattr(src_layout, "merged_compressed", False))
+    if merged and getattr(src_layout, "split_compressed", False):
+        raise ValueError(
+            "QWEN4_EXP_PD_ROUTED_DST does not route keys split by page owner "
+            "(QWEN4_EXP_PCP_SPLIT_COMPRESSED_K / QWEN4_EXP_PD_PRODUCER_SPLIT_KEYS)"
         )
     src_gdn = gdn_geometry(cfg, 1, src_layout.token_bytes)
     dst_gdn = gdn_geometry(cfg, tp, decode_layout.token_bytes)
@@ -596,6 +619,9 @@ def route_geometry_for(cfg, src_layout, decode_layout, rank) -> "pd_route.RouteG
         ssm_rows_src=src_gdn.ssm_tokens,
         conv_rows_src=src_gdn.conv_tokens,
         ssm_rows_dst=dst_gdn.ssm_tokens,
+        pcp=pcp if pcp > 1 else 1,
+        interleave=interleave if pcp > 1 else 0,
+        key_span=int(src_layout.merged_key_span) if merged else 0,
     )
 
 
@@ -1364,6 +1390,11 @@ class StagedConsumer:
                     "QWEN4_EXP_PD_SHARED_COMPRESSED lands into routed compact staging: "
                     "set QWEN4_EXP_PD_ROUTED_DST"
                 )
+            if self.route.pcp > 1 or self.route.key_span:
+                raise ValueError(
+                    "QWEN4_EXP_PD_SHARED_COMPRESSED is not combined with a PCP or "
+                    "merged-key producer"
+                )
             self.shared = pd_shared_compressed.geometry_for(self.route)
         from .pd_manifest import compressed_live_bytes, page_regions, pool_tag
 
@@ -1520,12 +1551,13 @@ class StagedConsumer:
             owners = [pool.layer_name for pool in self.manifest.pools]
             src_pages = [g.page_count(num_tokens) for g in self.src_groups]
             shared = self._shared_load(num_tokens)
+            pool_group = self._pool_group_map()
             counts = [
                 self.shared.staged_pages(num_tokens, skip_tokens)
-                if shared and owner_kind(name) == "compressed"
+                if shared and pool_kind(name) == "compressed"
                 else pd_route.staging_pages(
-                    owner_kind(name), num_tokens, src_pages[self._src_owner[name]],
-                    skip_tokens, self.route,
+                    pool_kind(name), num_tokens, src_pages[pool_group[name]],
+                    skip_tokens, self.route, split_pool(name)[1],
                 )
                 for name in owners
             ]
@@ -1640,7 +1672,7 @@ class StagedConsumer:
                 return pd_route.skip_rows(kind, skip, self.route)
 
             return [
-                rows(owner_kind(pool.layer_name)) * pd_route.ROW_BYTES
+                rows(pool_kind(pool.layer_name)) * pd_route.ROW_BYTES
                 for pool in self.manifest.pools
             ]
         # The clip is in the destination's live bytes: a merged key pool's
@@ -1888,9 +1920,15 @@ class StagedConsumer:
                 continue
             dst = dst_tables[gi]
             if kind == "main":
+                # A PCP producer's split main KV: one staged space per rank.
+                src = (
+                    [src_pages[f"{name}.pcp{r}"] for r in range(g.pcp)]
+                    if g.pcp > 1 and name in getattr(self, "_src_split", ())
+                    else src_pages[name]
+                )
                 s, d = gap.split(
                     name,
-                    pd_route.main_src_rows(num_tokens, skip_tokens, rank.tp_rank, src_pages[name], g),
+                    pd_route.main_src_rows(num_tokens, skip_tokens, rank.tp_rank, src, g),
                     main_dst_np(num_tokens, dst, self.dst_block, rank, skip_tokens),
                     lambda: main_tokens_np(num_tokens, self.dst_block, rank, skip_tokens),
                 )

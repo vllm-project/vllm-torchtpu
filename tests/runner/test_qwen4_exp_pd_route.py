@@ -359,20 +359,205 @@ def test_a_consumer_built_without_init_takes_the_broadcast_path():
     assert int(s.free.sum()) == 15
 
 
-@pytest.mark.parametrize("layout", [{"merged_compressed": True}, {"main_dcp": 2}])
-def test_routed_staging_refuses_a_merged_key_or_pcp_producer(monkeypatch, layout):
-    """pd_route models a plain TP1 producer. A producer with merged compressed
-    keys or a PCP producer's split main KV (main_dcp > 1 on its layout) must
-    fail when either leg builds the route, not be mis-routed."""
+def test_routed_staging_refuses_split_keys_and_tp_pair_dcp(monkeypatch):
+    """pd_route routes a TP1 or PP x PCP producer, merged keys or not. Keys
+    split by page owner, and main KV split over TP rank pairs (main_dcp > 1
+    without a PCP interleave), must fail when either leg builds the route,
+    not be mis-routed."""
     monkeypatch.setenv("QWEN4_EXP_PD_ROUTED_DST", "8:4:512")
     row = ROWS * LANES
     dst = SimpleNamespace(token_bytes=row, block_size=512)
     rank = SimpleNamespace(tp_size=8, main_dcp=4)
-    plain = SimpleNamespace(token_bytes=row, block_size=3200, merged_compressed=False, main_dcp=1)
-    with pytest.raises(ValueError, match="plain TP1 producer"):
-        st.route_geometry_for(None, SimpleNamespace(**{**plain.__dict__, **layout}), dst, rank)
-    # Control: the plain producer passes this check and fails later, on the
-    # missing model config, for a different reason.
-    with pytest.raises(Exception) as other:
-        st.route_geometry_for(None, plain, dst, rank)
-    assert "plain TP1 producer" not in str(other.value)
+    base = dict(token_bytes=row, block_size=3200, merged_compressed=False, main_dcp=1,
+                main_dcp_interleave=0, split_compressed=False, merged_key_span=1)
+    for bad, match in (
+        (dict(main_dcp=2), "TP rank pairs"),
+        (dict(merged_compressed=True, split_compressed=True, main_dcp=2,
+              main_dcp_interleave=128), "split by page owner"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            st.route_geometry_for(None, SimpleNamespace(**{**base, **bad}), dst, rank)
+    # Controls: a plain, a merged and a PCP producer pass these checks and
+    # fail later, on the missing model config, for a different reason.
+    for ok in ({}, dict(merged_compressed=True), dict(main_dcp=2, main_dcp_interleave=128,
+                                                      merged_compressed=True, merged_key_span=2)):
+        with pytest.raises(Exception) as other:
+            st.route_geometry_for(None, SimpleNamespace(**{**base, **ok}), dst, rank)
+        assert not isinstance(other.value, ValueError), other.value
+
+
+# --- a PP x PCP producer with merged keys --------------------------------------------
+# Each main-KV ID covers PCP pages of SRC_BLOCK tokens, split over the producer's
+# PCP ranks in INTERLEAVE-token units; each QSA layer's keys are one block per ID.
+
+PCP, INTERLEAVE = 2, 32
+PGEO = rt.RouteGeometry(**{**GEO.__dict__, "pcp": PCP, "interleave": INTERLEAVE, "key_span": PCP})
+KEY_ROWS = PCP * SRC_BLOCK // (2 * RATIO)
+
+
+def pcp_producer_pages(num_tokens, rng):
+    """Per staging pool name, producer pages: split main KV per PCP rank
+    (``<owner>.pcp<r>``, a page per ID), merged keys (a block of KEY_ROWS per
+    ID), everything else as the plain producer."""
+    ids = -(-num_tokens // (PCP * SRC_BLOCK))
+    out = {}
+    for name in owners():
+        kind = st.owner_kind(name)
+        if kind == "main":
+            for r in range(PCP):
+                out[f"{name}.pcp{r}"] = rng.integers(0, 256, (ids, SRC_BLOCK, ROWS, LANES), dtype=np.uint8)
+        elif kind == "compressed":
+            out[name] = rng.integers(0, 256, (ids, KEY_ROWS, ROWS, LANES), dtype=np.uint8)
+        else:
+            out[name] = rng.integers(0, 256, (1, SRC_BLOCK, ROWS, LANES), dtype=np.uint8)
+    return out
+
+
+def pcp_broadcast_landing(num_tokens, skip, rank, prod, tables):
+    """The reference: whole producer pages staged, repacked by the broadcast
+    helpers (main_rows_np's src_pcp, compressed_rows_np's merged key pages)."""
+    staging = np.zeros((sum(len(v) for v in prod.values()) + 1, SRC_BLOCK, 1, ROWS, LANES), np.uint8)
+    pages, cur = {}, 1
+    for name, data in prod.items():
+        pages[name] = list(range(cur, cur + len(data)))
+        staging[cur:cur + len(data), : data.shape[1], 0] = data
+        cur += len(data)
+    main_s, main_d, copy_s, copy_d, gdn_s, gdn_d = [], [], [], [], [], []
+    for name in owners():
+        kind = st.owner_kind(name)
+        if kind == "compressed":
+            s, d = st.compressed_rows_np(num_tokens, RATIO, pages[name], PCP * SRC_BLOCK,
+                                         tables[name], DST_BLOCK, start=skip,
+                                         src_page_rows=SRC_BLOCK)
+            copy_s.append(s); copy_d.append(d)
+    for name in owners():
+        kind = st.owner_kind(name)
+        if kind == "main":
+            s, d = st.main_rows_np(num_tokens, [pages[f"{name}.pcp{r}"] for r in range(PCP)],
+                                   SRC_BLOCK, tables[name], DST_BLOCK, rank, start=skip,
+                                   src_pcp=(PCP, INTERLEAVE))
+            main_s.append(s); main_d.append(d)
+        elif kind in ("ring", "ple"):
+            s, d = st.page_prefix_rows(pages[name][0], SRC_BLOCK, tables[name][0], DST_BLOCK,
+                                       min(SRC_BLOCK, DST_BLOCK))
+            copy_s.append(np.asarray(s)); copy_d.append(np.asarray(d))
+        elif kind == "gdn":
+            gdn_s.append(pages[name][0]); gdn_d.append(tables[name][0])
+
+    def cat(parts):
+        parts = [st.align_rows(p) for p in parts if len(p)]
+        return np.concatenate(parts) if parts else np.zeros(0, np.int64)
+
+    idx = (cat(main_s), cat(main_d), cat(copy_s), cat(copy_d),
+           np.asarray(gdn_s, np.int64), np.asarray(gdn_d, np.int64))
+    pool = np.zeros((400, DST_BLOCK, 1, ROWS, LANES), np.uint8)
+    return run(make_fn(rank, False), pool, staging, idx)
+
+
+def pcp_routed_landing(num_tokens, skip, rank, prod, tables):
+    counts = {}
+    for name, data in prod.items():
+        kind, r = st.pool_kind(name), st.split_pool(name)[1]
+        counts[name] = rt.staging_pages(kind, num_tokens, len(data), skip, PGEO, r)
+    staging = np.zeros((sum(counts.values()) + 1, PGEO.stage_rows, 1, ROWS, LANES), np.uint8)
+    flat = staging.reshape(-1, ROWS, LANES)
+    pages, cur = {}, 1
+    for name, data in prod.items():
+        pages[name] = list(range(cur, cur + counts[name]))
+        cur += counts[name]
+        kind, r = st.pool_kind(name), st.split_pool(name)[1]
+        spans = rt.producer_spans(kind, num_tokens, len(data), PGEO, r)
+        page_bytes = PGEO.stage_rows * RB
+        skip_b = rt.skip_rows(kind, skip, PGEO) * RB
+        apply_spans_geo(spans, data, rank.tp_rank, pages[name], skip_b, flat, page_bytes)
+    c = consumer(rank)
+    c.route = PGEO
+    c._src_split = {n for n in owners() if st.owner_kind(n) == "main"}
+    idx = c._routed_indices(pages, tables, num_tokens, skip)
+    pool = np.zeros((400, DST_BLOCK, 1, ROWS, LANES), np.uint8)
+    return run(make_fn(rank, True), pool, staging, idx), counts
+
+
+def apply_spans_geo(spans, src, unit, dest_pages, skip_bytes, staging_flat, page_bytes):
+    """``apply_spans`` (the same Raiden rules) for a geometry's staging pages."""
+    assert skip_bytes % page_bytes == 0
+    cover = []
+    for p, so, do, n, u in spans:
+        assert n > 0 and so % RB == 0 and do % RB == 0 and n % RB == 0
+        assert so + n <= src[p].nbytes, "span past its producer page"
+        if u is not None and u != unit:
+            continue
+        lo, hi = do, do + n
+        if hi <= skip_bytes:
+            continue
+        if lo < skip_bytes:
+            so, n, lo = so + skip_bytes - lo, n - (skip_bytes - lo), skip_bytes
+        g0 = lo - skip_bytes
+        cover.append((g0, g0 + n))
+        data = src[p].reshape(-1)[so:so + n]
+        for off in range(0, n, RB):
+            gpage, inpage = divmod(g0 + off, page_bytes)
+            assert gpage < len(dest_pages)
+            row = dest_pages[gpage] * (page_bytes // RB) + inpage // RB
+            staging_flat[row] = data[off:off + RB].reshape(ROWS, LANES)
+    cover.sort()
+    end = 0
+    for a, b in cover:
+        assert a == end, f"coverage gap or overlap at byte {end} (span at {a})"
+        end = b
+    assert (len(dest_pages) - 1) * page_bytes < end <= len(dest_pages) * page_bytes
+
+
+PCP_CASES = [1, 63, 64, 65, 127, 128, 129, 320, 639, 640, 641, 1000, 1280, 2049]
+
+
+@pytest.mark.parametrize("num_tokens", PCP_CASES)
+def test_pcp_merged_routed_landing_is_byte_identical(num_tokens):
+    rng = np.random.default_rng(1000 + num_tokens)
+    prod = pcp_producer_pages(num_tokens, rng)
+    tables = dst_tables(num_tokens, rng)
+    for r in range(TP):
+        rank = rank_slice(r)
+        want = pcp_broadcast_landing(num_tokens, 0, rank, prod, tables)
+        got, _ = pcp_routed_landing(num_tokens, 0, rank, prod, tables)
+        np.testing.assert_array_equal(got, want, err_msg=f"rank {r}, {num_tokens} tokens")
+        assert want.any()
+
+
+@pytest.mark.parametrize("num_tokens,skip", [(600, 256), (2049, 512), (2049, 1792), (1000, 768)])
+def test_pcp_merged_routed_prefix_aware_landing_is_byte_identical(num_tokens, skip):
+    rng = np.random.default_rng(2000 + num_tokens + skip)
+    prod = pcp_producer_pages(num_tokens, rng)
+    tables = dst_tables(num_tokens, rng)
+    for r in range(TP):
+        rank = rank_slice(r)
+        want = pcp_broadcast_landing(num_tokens, skip, rank, prod, tables)
+        got, _ = pcp_routed_landing(num_tokens, skip, rank, prod, tables)
+        np.testing.assert_array_equal(got, want, err_msg=f"rank {r}, skip {skip}")
+
+
+def test_pcp_served_geometry_spans_are_dense_and_few():
+    """PP4 x PCP2 producer (3200-token pages, 128-token units, merged keys)
+    to the served TP8 + DCP4 decode: dense coverage per rank and tag, and the
+    two PCP ranks' spaces together hold each slice once."""
+    g = rt.RouteGeometry(tp=8, dcp=4, dst_block=512, src_block=3200, ratio=4,
+                         ssm_rows_src=3072, conv_rows_src=128, ssm_rows_dst=384,
+                         pcp=2, interleave=128, key_span=2)
+    n = 88001
+    ids = -(-n // 6400)
+    total = 0
+    for r in range(2):
+        spans = rt.producer_spans("main", n, ids, g, r)
+        assert len(spans) < 8 * n // 256, len(spans)  # merged per 512-token run
+        for unit in range(8):
+            cov = sorted((do, do + sz) for _, _, do, sz, u in spans if u == unit)
+            end = 0
+            for a, b in cov:
+                assert a == end
+                end = b
+            assert end == rt.main_rows(n, g, r) * RB
+        total += rt.slice_rows(n, g, 0, r)
+    assert total == rt.slice_rows(n, rt.RouteGeometry(**{**g.__dict__, "pcp": 1, "interleave": 0}), 0)
+    keys = rt.producer_spans("compressed", n, ids, g)
+    assert keys[0][3] == 800 * RB and rt.compressed_rows(ids, g) == ids * 800
+    assert g.key()[-5:] == ["pcp", 2, 128, "keys", 2]
