@@ -165,6 +165,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_RAIDEN_JOB_NAME",
     "TPU_RAIDEN_TRANSFER_PARALLELISM",
     "TPU_RAIDEN_TRANSFER_STREAMS",
+    # Store-mode reshard/dispatch service addresses only. The advertised host
+    # is the per-pod IP, so it must stay out of a key shared across pods.
+    "TPU_RAIDEN_ADVERTISE_HOST",
+    "TPU_RAIDEN_RESHARD_PORT_BASE",
+    "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE",
     "TPU_WORKER_ID",
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
@@ -205,15 +210,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_USE_RAIDEN_CONNECTOR",
     # Pipeline chunk sizing: scheduling and the extra token buckets, which
     # are keyed by shape inside the same cache.
-    "TPU_PP_DYNAMIC_CHUNKS",
+    "TPU_PP_LONE_PROMPT_CHUNKS",
+    "TPU_PP_EQUAL_COST_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
-    # Engine-side timing of the pipeline pushes; the workers' programs are
-    # the same either way.
-    "TPU_PP_LAZY_PUSH",
-    # The hand-off between pipeline stages and its depth: it runs outside
-    # the compiled forwards, which take the same inputs either way.
-    "TPU_PP_HANDOFF",
-    "TPU_PP_RING_DEPTH",
+    # The depth of the hand-off between pipeline stages: it runs outside the
+    # compiled forwards, which take the same inputs at any depth.
+    "TPU_PP_HANDOFF_DEPTH",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the
@@ -275,6 +277,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/core",
     "vllm_torchtpu/layers/adapter/attention.py",
     "vllm_torchtpu/layers/adapter/cp_attention.py",
+    "vllm_torchtpu/layers/adapter/pcp_kv_gather.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
@@ -284,8 +287,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
-    # Still listed: on this base `pp_shift.py` is a second caller, so the
-    # module stays even though the fused EP op no longer needs it.
+    # Still listed: the K3 collective ops (`kimi_k3/collective_ops.py`) build
+    # their ops with it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
     # And the mesh they export with: `build_ep_mesh` decides the axis, the
     # shape and the device order (the DeviceAssignment) the kernel runs on.
