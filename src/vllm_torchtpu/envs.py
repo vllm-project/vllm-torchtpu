@@ -216,6 +216,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 0
     TPU_FUSED_ADD_RMSNORM_QUANT: bool = False
+    TPU_FP8_LINEAR_PALLAS_SITES: str = ""
 
 
 def env_with_choices(
@@ -1328,6 +1329,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # own quantization. Bit-identical. No effect when
     # TPU_FUSED_ADD_RMSNORM_MIN_TOKENS is 0: the runner logs a warning.
     "TPU_FUSED_ADD_RMSNORM_QUANT": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT"),
+    # Comma-separated layer-prefix suffixes, matched on a "." boundary, for
+    # example "self_attn.o_proj". A per-channel FP8 dense linear whose prefix
+    # matches, and whose weight shape is in fp8_skinny.TUNED, runs calls of at
+    # most 16 rows as the weight-streaming Pallas kernel
+    # (kernels/quantized_matmul/fp8_skinny.py) and other calls on XLA. Empty, the
+    # default, keeps XLA for every linear. The kernel accumulates in float32, so
+    # its outputs differ slightly from XLA's fp8 x fp8 dot. A matched layer whose
+    # width is not a multiple of 128 also keeps a zero-padded copy of its weight
+    # for the kernel (for a [6144, 2624] FP8 weight, 16.5 MB more per layer).
+    # The copy is a device buffer of its own (fresh_buffer). Its per-step cost
+    # is not measured in that form. Measured on TPU v7x with the copy stored as a
+    # float8 view of a uint8 buffer, it costs more device time per step than the
+    # kernel saves, so measure a padded site before listing it. List only
+    # linears whose weight XLA reads from HBM during the call: for a weight that
+    # XLA already prefetches into VMEM, the kernel is not measured to be faster.
+    "TPU_FP8_LINEAR_PALLAS_SITES": env_str("TPU_FP8_LINEAR_PALLAS_SITES", ""),
 }
 
 
