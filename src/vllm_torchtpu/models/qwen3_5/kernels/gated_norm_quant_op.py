@@ -25,6 +25,7 @@ FP8 quantization.
 """
 
 from collections.abc import Callable
+from typing import cast
 
 import jax
 import torch
@@ -115,9 +116,10 @@ def unsupported_reason(layer: QwenGatedDeltaNetAttention) -> str | None:
         return f"the output norm groups by {norm.group_size}, not per head"
     if out_proj.weight.dtype != torch.float8_e4m3fn:
         return f"out_proj weight is {out_proj.weight.dtype}, not float8_e4m3fn"
-    if out_proj.weight_scale.shape != (out_proj.weight.shape[-1],):
+    weight_scale = cast(torch.Tensor, out_proj.weight_scale)
+    if weight_scale.shape != (cast(torch.Tensor, out_proj.weight).shape[-1],):
         return (
-            f"out_proj scale is {tuple(out_proj.weight_scale.shape)}, not "
+            f"out_proj scale is {tuple(weight_scale.shape)}, not "
             "per-channel (set no REQUANTIZE_BLOCK_SIZE)"
         )
     if not getattr(out_proj, WEIGHT_FLIPPED_ATTR, False):
@@ -157,6 +159,8 @@ def install(model: torch.nn.Module) -> int:
             )
     for layer in layers:
         _build_ops(float(layer.norm.eps))
+        # torch's Module.__setattr__ stub only accepts modules and tensors.
+        # pyrefly: ignore[bad-argument-type]
         layer.fused_norm_quant = True
     logger.info(
         "[GDN] %d layers run the gated norm and out_proj fp8 quantization "
