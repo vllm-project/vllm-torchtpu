@@ -1716,3 +1716,59 @@ def test_recommend_parallelism_multi_axis_dcp() -> None:
     )
     rec_kv2 = advisor.recommend_parallelism(kv2_profile, "tpu7x", dcp=0)
     assert rec_kv2.dcp >= 1
+
+
+def test_cli_and_html_render_layer_group_search(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Verify `--search-layer-groups` CLI table/JSON and HTML card render."""
+    rc = advisor.main(
+        [
+            "--model",
+            "kimi-k3",
+            "--phase",
+            "prefill",
+            "--isl",
+            "512",
+            "--tp",
+            "32",
+            "--ep",
+            "16",
+            "--pcp",
+            "32",
+            "--search-layer-groups",
+        ]
+    )
+    assert rc == 0
+    stdout_text = capsys.readouterr().out
+    assert "Layer-Group Partition Search: kimi-k3" in stdout_text
+    assert "one fused kernel per group" in stdout_text
+
+    json_out = tmp_path / "lg_search.json"
+    rc_json = advisor.main(
+        [
+            "--model",
+            "kimi-k3",
+            "--phase",
+            "prefill",
+            "--isl",
+            "512",
+            "--tp",
+            "32",
+            "--ep",
+            "16",
+            "--pcp",
+            "32",
+            "--search-layer-groups",
+            "--json",
+            str(json_out),
+        ]
+    )
+    assert rc_json == 0
+    payload = json.loads(json_out.read_text(encoding="utf-8"))
+    assert payload["best"]["num_groups"] == 1
+
+    sweep = advisor.advise_regimes("kimi-k3", "tpu7x")
+    html_text = advisor.render_advisor_html(sweep)
+    assert "7. Layer-Group Partition Search" in html_text
