@@ -25,6 +25,7 @@ and ``eagle_head`` graphs. Other models that use ``Qwen3NextAttention``
 
 import functools
 from collections.abc import Callable
+from typing import TYPE_CHECKING, cast
 
 import jax
 import torch
@@ -39,6 +40,9 @@ from vllm_torchtpu.models.qwen3_5.kernels.qk_norm_rope_gate import (
 from vllm_torchtpu.models.qwen3_5.kernels.qk_norm_rope_gate import (
     reference as qk_norm_rope_gate_reference,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
 logger = init_logger(__name__)
 
@@ -57,6 +61,7 @@ _ops: dict[tuple[int, int, int, int, float], Callable] = {}
 
 
 def _op_key(layer: torch.nn.Module) -> tuple[int, int, int, int, float]:
+    layer = cast("Qwen3NextAttention", layer)
     return (
         layer.num_heads,
         layer.num_kv_heads,
@@ -113,12 +118,13 @@ def _build_op(key: tuple[int, int, int, int, float]) -> None:
 def _weight_plus_one(norm: torch.nn.Module) -> torch.Tensor:
     hoisted = getattr(norm, _HOISTED_WEIGHT_ATTR, None)
     if hoisted is None:
-        hoisted = norm.weight.float() + 1.0
+        hoisted = cast(torch.Tensor, norm.weight).float() + 1.0
         setattr(norm, _HOISTED_WEIGHT_ATTR, hoisted)
     return hoisted
 
 
 def _unsupported_reason(layer: torch.nn.Module, model_config) -> str | None:
+    layer = cast("Qwen3NextAttention", layer)
     mm_config = model_config.multimodal_config if model_config is not None else None
     if not layer.attn_output_gate:
         return "the attention has no output gate"
@@ -146,6 +152,7 @@ def _log_armed_rows(vllm_config: VllmConfig) -> None:
 
 
 def _prebuild(layer: torch.nn.Module, model_config) -> bool:
+    layer = cast("Qwen3NextAttention", layer)
     reason = _unsupported_reason(layer, model_config)
     if reason is not None:
         logger.warning_once(
@@ -167,6 +174,7 @@ def project_qkv_gate(
     layer: torch.nn.Module, qkv: torch.Tensor, positions: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``Qwen3NextAttention._project_qkv_gate`` through the fused kernel."""
+    layer = cast("Qwen3NextAttention", layer)
     q_gate, k, v = qkv.split([layer.q_size * 2, layer.kv_size, layer.kv_size], dim=-1)
     if positions.ndim == 2:
         # Text-only M-RoPE: the three position rows agree.
