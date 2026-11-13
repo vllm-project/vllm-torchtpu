@@ -1,0 +1,1827 @@
+# SPDX-License-Identifier: Apache-2.0
+# Provenance: copied from src/vllm_torchtpu/layers/adapter/custom_ops/qsa_op.py
+#   at 7e63451d8625852becf8159b6eb295f3d539b300.
+#   Owned by models/qwen38_flash from this copy on.
+"""Torch custom-op boundaries for sparse attention and its native pool."""
+
+import functools
+from collections.abc import Callable
+
+import torch
+from torch_tpu._internal import pallas
+
+from .. import settings
+from ..kernels.pooled_qsa import (
+    pooled_qsa_rows_step,
+    pooled_qsa_shard_attend_rows_step,
+    pooled_qsa_shard_attend_step,
+    pooled_qsa_shard_merge,
+    pooled_qsa_shard_pages_step,
+    pooled_qsa_shard_select_rows_step,
+    pooled_qsa_shard_select_step,
+    pooled_qsa_shared_rows_step,
+    pooled_qsa_shared_step,
+    pooled_qsa_step,
+    pooled_qsa_token_select_step,
+)
+from ..kernels.qsa_rpa import qsa_step
+
+
+@functools.cache
+def build_qsa_op() -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+    op = pallas.jax_op(
+        "qwen38_flash::qsa",
+        qsa_step,
+        donate_argnums=(10, 11, 12, 13),
+    )
+
+    @op.register_fake
+    def fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        packed_kv,
+        compressed,
+        ring,
+        tags,
+        starts,
+        context,
+        slots,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale=1.0,
+        v_scale=1.0,
+    ):
+        return (
+            *(torch.empty_like(x) for x in (packed_kv, compressed, ring, tags)),
+            qgate.new_empty((qgate.shape[0], qgate.shape[1] // 2)),
+            positions.new_empty((qgate.shape[0], token_topk + compress_ratio - 1)),
+        )
+
+    def run(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        packed_kv,
+        compressed,
+        ring,
+        tags,
+        starts,
+        context,
+        slots,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale=1.0,
+        v_scale=1.0,
+    ):
+        planes = torch.stack((tags.to(torch.int32), (tags >> 32).to(torch.int32)), -1)
+        packed, c, r, p, output, selected = op(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            nk,
+            niq,
+            nik,
+            positions.to(torch.int32),
+            trig,
+            packed_kv,
+            compressed,
+            ring,
+            planes,
+            starts.to(torch.int32),
+            context.to(torch.int32),
+            slots.to(torch.int32),
+            main_table.to(torch.int32),
+            compressed_table.to(torch.int32),
+            compress_ratio,
+            token_topk,
+            norm_eps,
+            rotary_dim,
+            k_scale,
+            v_scale,
+        )
+        for owner, updated in zip((packed_kv, compressed, ring), (packed, c, r)):
+            owner.copy_(updated)
+        tags.copy_(
+            (p[..., 1].to(torch.int64) << 32) | (p[..., 0].to(torch.int64) & 0xFFFFFFFF)
+        )
+        return output, selected
+
+    return run
+
+
+@functools.cache
+def build_pooled_qsa_op():
+    op = pallas.jax_op(
+        "qwen38_flash::pooled_qsa", pooled_qsa_step, donate_argnums=(10,)
+    )
+
+    @op.register_fake
+    def fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((qgate.shape[0], qgate.shape[-1] // 2)),
+            positions.new_empty(
+                (qgate.shape[0], token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
+        )
+
+    def run(*args, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        updated, output, blocks = op(*args, **kwargs)
+        args[10].copy_(updated)
+        return output, blocks
+
+    return run
+
+
+@functools.cache
+def build_pooled_qsa_select_op() -> Callable[..., tuple[torch.Tensor, ...]]:
+    """``build_pooled_qsa_op`` up to the indexer, for an attention computed in the
+    Qwen3.8 segment megakernel: returns ``(q, gate, pages, kv_lens)``."""
+    from ..kernels.pooled_qsa import (
+        pooled_qsa_select_step,
+    )
+
+    op = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_select", pooled_qsa_select_step, donate_argnums=(10,)
+    )
+
+    @op.register_fake
+    def fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        tokens, dim = qgate.shape[0], nq.shape[-1]
+        heads = qgate.shape[-1] // 2 // dim
+        budget = token_topk // compress_ratio
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((tokens, heads, dim), dtype=torch.bfloat16),
+            qgate.new_empty((tokens, heads, dim), dtype=torch.bfloat16),
+            positions.new_empty((tokens, budget + 1), dtype=torch.int32),
+            positions.new_empty((tokens,), dtype=torch.int32),
+        )
+
+    def run(*args, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        updated, q, gate, pages, kv_lens = op(*args, **kwargs)
+        args[10].copy_(updated)
+        return q, gate, pages, kv_lens
+
+    return run
+
+
+@functools.cache
+def build_pooled_qsa_rows_op() -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+    """``build_pooled_qsa_op`` attending only the trailing ``rows`` operand."""
+    op = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_rows", pooled_qsa_rows_step, donate_argnums=(10,)
+    )
+
+    @op.register_fake
+    def fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        rows,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((rows.shape[0], qgate.shape[-1] // 2)),
+            positions.new_empty(
+                (rows.shape[0], token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
+        )
+
+    def run(*args, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15, 16):
+            args[index] = args[index].to(torch.int32)
+        updated, output, blocks = op(*args, **kwargs)
+        args[10].copy_(updated)
+        return output, blocks
+
+    return run
+
+
+@functools.cache
+def build_pooled_qsa_shared_op(with_rows: bool):
+    """``build_pooled_qsa_op`` (``with_rows``: ``build_pooled_qsa_rows_op``)
+    taking a trailing ``shared`` operand: another layer's ``selected`` for
+    the attended rows, used in place of this layer's indexer selection."""
+    suffix = "_rows" if with_rows else ""
+    op = pallas.jax_op(
+        f"qwen38_flash::pooled_qsa_shared{suffix}",
+        pooled_qsa_shared_rows_step if with_rows else pooled_qsa_shared_step,
+        donate_argnums=(10,),
+    )
+
+    def shapes(qgate, positions, pool, shared, compress_ratio, token_topk):
+        rows = shared.shape[0]
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((rows, qgate.shape[-1] // 2)),
+            positions.new_empty(
+                (rows, token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
+        )
+
+    if with_rows:
+
+        @op.register_fake
+        def fake_rows(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            nk,
+            niq,
+            nik,
+            positions,
+            trig,
+            pool,
+            starts,
+            context,
+            ring_ids,
+            main_table,
+            compressed_table,
+            rows,
+            shared,
+            compress_ratio,
+            token_topk,
+            norm_eps,
+            rotary_dim,
+            k_scale=1.0,
+            v_scale=1.0,
+            compressed_slot=0,
+            main_slot=-1,
+            max_query_len=1,
+        ):
+            return shapes(qgate, positions, pool, shared, compress_ratio, token_topk)
+
+    else:
+
+        @op.register_fake
+        def fake(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            nk,
+            niq,
+            nik,
+            positions,
+            trig,
+            pool,
+            starts,
+            context,
+            ring_ids,
+            main_table,
+            compressed_table,
+            shared,
+            compress_ratio,
+            token_topk,
+            norm_eps,
+            rotary_dim,
+            k_scale=1.0,
+            v_scale=1.0,
+            compressed_slot=0,
+            main_slot=-1,
+            max_query_len=1,
+        ):
+            return shapes(qgate, positions, pool, shared, compress_ratio, token_topk)
+
+    ints = (8, 11, 12, 13, 14, 15, 16, 17) if with_rows else (8, 11, 12, 13, 14, 15, 16)
+
+    def run(*args, **kwargs):
+        args = list(args)
+        for index in ints:
+            args[index] = args[index].to(torch.int32)
+        updated, output, blocks = op(*args, **kwargs)
+        args[10].copy_(updated)
+        return output, blocks
+
+    return run
+
+
+def _qgate_dims(qgate: torch.Tensor) -> tuple[int, int]:
+    """(tokens, joined width) of a ``_pair_qgate`` result."""
+    if qgate.dim() == 4:  # rank-major q heads only (VLLM_TPU_QSA_DCP_Q_GATHER)
+        return qgate.shape[1], qgate.shape[0] * qgate.shape[2] * qgate.shape[3] * 2
+    if qgate.dim() == 3:
+        return qgate.shape[1], qgate.shape[0] * qgate.shape[2]
+    return qgate.shape[0], qgate.shape[1]
+
+
+def _all_gather_ranks(x: torch.Tensor, group) -> torch.Tensor:
+    """``[...]`` on every rank -> ``[ranks, ...]`` in rank order."""
+    return group.all_gather(x.unsqueeze(0).contiguous(), dim=0)
+
+
+def _all_to_all(x: torch.Tensor, group) -> torch.Tensor:
+    """Block ``d`` of the leading axis goes to rank ``d``; block ``r`` of the
+    result came from rank ``r``."""
+    from torch.distributed import _functional_collectives as funcol
+
+    out = funcol.all_to_all_single(x.contiguous(), None, None, group.device_group)
+    if isinstance(out, funcol.AsyncCollectiveTensor):
+        return funcol.wait_tensor(out)
+    return out
+
+
+@functools.cache
+def _shard_ops(with_rows: bool):
+    suffix = "_rows" if with_rows else ""
+    select = pallas.jax_op(
+        f"qwen38_flash::pooled_qsa_shard_select{suffix}",
+        (
+            pooled_qsa_shard_select_rows_step
+            if with_rows
+            else pooled_qsa_shard_select_step
+        ),
+        donate_argnums=(10,),
+    )
+    attend = pallas.jax_op(
+        f"qwen38_flash::pooled_qsa_shard_attend{suffix}",
+        (
+            pooled_qsa_shard_attend_rows_step
+            if with_rows
+            else pooled_qsa_shard_attend_step
+        ),
+        donate_argnums=(7,),
+    )
+
+    def select_shapes(qgate, nq, positions, pool, starts, context, rows, ratio, topk):
+        tokens, slots = qgate.shape[0], starts.shape[0]
+        if rows is not None and rows.shape[0] <= context.shape[0]:
+            tokens, slots = rows.shape[0], rows.shape[0] + 1
+        head_dim = nq.shape[0]
+        heads = qgate.shape[1] // (2 * head_dim)
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((tokens, heads, head_dim)),
+            qgate.new_empty((tokens, heads, head_dim)),
+            positions.new_empty((tokens,), dtype=torch.int32),
+            positions.new_empty((tokens,), dtype=torch.int32),
+            positions.new_empty((slots,), dtype=torch.int32),
+            positions.new_empty((tokens, topk // ratio, 2), dtype=torch.int32),
+        )
+
+    def attend_shapes(q, lengths, context, pool, rows, ratio, topk):
+        tokens = q.shape[0]
+        if rows is not None and rows.shape[0] > context.shape[0]:
+            tokens = rows.shape[0]
+        return (
+            torch.empty_like(pool),
+            q.new_empty((tokens, q.shape[1] * q.shape[2])),
+            lengths.new_empty((tokens, topk + ratio - 1), dtype=torch.int32),
+        )
+
+    if with_rows:
+
+        @select.register_fake
+        def select_rows_fake(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            nk,
+            niq,
+            nik,
+            positions,
+            trig,
+            pool,
+            starts,
+            context,
+            ring_ids,
+            main_table,
+            compressed_table,
+            rows,
+            compress_ratio,
+            token_topk,
+            norm_eps,
+            rotary_dim,
+            shard_rank,
+            shard_size,
+            k_scale=1.0,
+            v_scale=1.0,
+            compressed_slot=0,
+            main_slot=-1,
+            max_query_len=1,
+        ):
+            return select_shapes(
+                qgate,
+                nq,
+                positions,
+                pool,
+                starts,
+                context,
+                rows,
+                compress_ratio,
+                token_topk,
+            )
+
+        @attend.register_fake
+        def attend_rows_fake(
+            q,
+            gate,
+            lengths,
+            req,
+            starts,
+            main_table,
+            context,
+            pool,
+            gathered,
+            rows,
+            kv_heads,
+            compress_ratio,
+            token_topk,
+            k_scale=1.0,
+            v_scale=1.0,
+            main_slot=-1,
+            max_query_len=1,
+            merged=False,
+        ):
+            return attend_shapes(
+                q, lengths, context, pool, rows, compress_ratio, token_topk
+            )
+
+    else:
+
+        @select.register_fake
+        def select_fake(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            nk,
+            niq,
+            nik,
+            positions,
+            trig,
+            pool,
+            starts,
+            context,
+            ring_ids,
+            main_table,
+            compressed_table,
+            compress_ratio,
+            token_topk,
+            norm_eps,
+            rotary_dim,
+            shard_rank,
+            shard_size,
+            k_scale=1.0,
+            v_scale=1.0,
+            compressed_slot=0,
+            main_slot=-1,
+            max_query_len=1,
+        ):
+            return select_shapes(
+                qgate,
+                nq,
+                positions,
+                pool,
+                starts,
+                context,
+                None,
+                compress_ratio,
+                token_topk,
+            )
+
+        @attend.register_fake
+        def attend_fake(
+            q,
+            gate,
+            lengths,
+            req,
+            starts,
+            main_table,
+            context,
+            pool,
+            gathered,
+            kv_heads,
+            compress_ratio,
+            token_topk,
+            k_scale=1.0,
+            v_scale=1.0,
+            main_slot=-1,
+            max_query_len=1,
+            merged=False,
+        ):
+            return attend_shapes(
+                q, lengths, context, pool, None, compress_ratio, token_topk
+            )
+
+    return select, attend
+
+
+@functools.cache
+def _merge_op():
+    merge = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_shard_merge", pooled_qsa_shard_merge
+    )
+
+    @merge.register_fake
+    def merge_fake(received, compress_ratio, token_topk):
+        return received.new_empty(
+            (received.shape[1], token_topk // compress_ratio), dtype=torch.int32
+        )
+
+    return merge
+
+
+def _exchange_candidates(candidates, tp_group, a2a_min_tokens, merge_op, ratio, topk):
+    """Cross the TP group with every rank's local top-k candidates.
+
+    Returns ``(gathered, merged)``: ``[ranks, tokens, k, 2]`` candidates, or,
+    for steps of at least ``a2a_min_tokens`` tokens (0: never), ``[tokens, k]``
+    blocks merged per 1/TP token block after an all-to-all and all-gathered.
+    """
+    world = int(tp_group.world_size)
+    tokens = candidates.shape[0]
+    # Fixed at trace time: each token bucket compiles its own graph.
+    if a2a_min_tokens and tokens >= a2a_min_tokens and tokens % world == 0:
+        received = _all_to_all(
+            candidates.reshape(world, tokens // world, *candidates.shape[1:]),
+            tp_group,
+        )
+        blocks = merge_op(received, ratio, topk)
+        return _all_gather_ranks(blocks, tp_group).reshape(tokens, -1), True
+    return _all_gather_ranks(candidates, tp_group), False
+
+
+def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
+    """``build_pooled_qsa_op`` with the indexer split across ``tp_group``.
+
+    Each rank scores an interleaved 1/TP of every request's compressed keys
+    and keeps its local top-k (scores and global positions). The candidates
+    cross the TP group once, then every rank merges the exact global top-k
+    and attends its own heads. Steps of at least ``a2a_min_tokens`` tokens
+    (0: never) instead merge a 1/TP token block per rank after an
+    all-to-all, then all-gather the merged blocks.
+
+    The returned callable takes the pooled op's operands plus an optional
+    trailing ``rows`` operand (as ``build_pooled_qsa_rows_op``) and a
+    ``kv_heads`` keyword.
+    """
+    world = int(tp_group.world_size)
+    rank = int(tp_group.rank_in_group)
+    # Build the Pallas ops now, at layer construction: jax_op inspects the
+    # step function's signature, which Dynamo cannot trace inside forward.
+    shard_ops = {with_rows: _shard_ops(with_rows) for with_rows in (False, True)}
+    merge_op = _merge_op()
+
+    def run(*args, kv_heads, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15, 16):
+            if index < len(args):
+                args[index] = args[index].to(torch.int32)
+        with_rows = len(args) == 17
+        select, attend = shard_ops[with_rows]
+        pool = args[10]
+        updated, q, gate, lengths, req, starts, candidates = select(
+            *args, shard_rank=rank, shard_size=world, **kwargs
+        )
+        pool.copy_(updated)
+        ratio, topk = kwargs["compress_ratio"], kwargs["token_topk"]
+        gathered, merged = _exchange_candidates(
+            candidates, tp_group, a2a_min_tokens, merge_op, ratio, topk
+        )
+        attend_kwargs = {
+            name: kwargs[name]
+            for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
+            if name in kwargs
+        }
+        updated, output, selected = attend(
+            q,
+            gate,
+            lengths,
+            req,
+            starts,
+            args[14],
+            args[12],
+            pool,
+            gathered,
+            *args[16:],
+            kv_heads=kv_heads,
+            compress_ratio=ratio,
+            token_topk=topk,
+            merged=merged,
+            **attend_kwargs,
+        )
+        pool.copy_(updated)
+        return output, selected
+
+    return run
+
+
+@functools.cache
+def _token_select_op():
+    select = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_token_select",
+        pooled_qsa_token_select_step,
+        donate_argnums=(10,),
+    )
+
+    @select.register_fake
+    def select_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        shard_index,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        shard_size,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        tokens, head_dim = qgate.shape[0], nq.shape[0]
+        heads = qgate.shape[1] // (2 * head_dim)
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((tokens, heads, head_dim)),
+            qgate.new_empty((tokens, heads, head_dim)),
+            positions.new_empty((tokens,), dtype=torch.int32),
+            positions.new_empty((tokens,), dtype=torch.int32),
+            positions.new_empty((starts.shape[0],), dtype=torch.int32),
+            positions.new_empty(
+                (tokens // shard_size, token_topk // compress_ratio), dtype=torch.int32
+            ),
+        )
+
+    return select
+
+
+def build_pooled_qsa_token_shard_op(tp_group):
+    """``build_pooled_qsa_op`` with the indexer split over the step's tokens.
+
+    For the prefill sequence-parallel backbone, whose QSA input is the whole
+    gathered step on every rank: rank ``r`` indexes token rows
+    ``[r * T / TP, (r + 1) * T / TP)``, the ``[T / TP, k]`` blocks are
+    all-gathered (16 MB per layer at T = 8192, TP 8) and every rank attends its
+    heads over all tokens. The selection is the replicated indexer's.
+
+    The returned callable takes the pooled op's operands plus a trailing
+    ``shard_index`` operand (int32 ``[1]``, the rank) and a ``kv_heads``
+    keyword. Use it for every bucket of a graph or none (the buckets share
+    traced artifacts, and the all-gather moves the graph's split points):
+    each bucket's ``T`` must divide by TP and its shard must keep the ragged
+    prefill indexer (more rows than request slots), as the module checks
+    once for the graph's smallest bucket.
+    """
+    world = int(tp_group.world_size)
+    select = _token_select_op()
+    _, attend = _shard_ops(False)
+
+    def run(*args, shard_index, kv_heads, **kwargs):
+        tokens, slots = args[0].shape[0], args[12].shape[0]
+        assert tokens % world == 0 and tokens // world > slots, (
+            f"token-sharded indexer: {tokens} tokens do not shard over TP "
+            f"{world} with more rows than {slots} request slots"
+        )
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        pool = args[10]
+        updated, q, gate, lengths, req, starts, blocks = select(
+            *args, shard_index, shard_size=world, **kwargs
+        )
+        pool.copy_(updated)
+        attend_kwargs = {
+            name: kwargs[name]
+            for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
+            if name in kwargs
+        }
+        updated, output, selected = attend(
+            q,
+            gate,
+            lengths,
+            req,
+            starts,
+            args[14],
+            args[12],
+            pool,
+            _all_gather_ranks(blocks, tp_group).reshape(tokens, -1),
+            kv_heads=kv_heads,
+            compress_ratio=kwargs["compress_ratio"],
+            token_topk=kwargs["token_topk"],
+            merged=True,
+            **attend_kwargs,
+        )
+        pool.copy_(updated)
+        return output, selected
+
+    return run
+
+
+@functools.cache
+def _shard_pages_op():
+    pages = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_shard_pages", pooled_qsa_shard_pages_step
+    )
+
+    @pages.register_fake
+    def pages_fake(
+        q,
+        gate,
+        lengths,
+        req,
+        main_table,
+        context,
+        gathered,
+        compress_ratio,
+        token_topk,
+        page_size,
+        merged=False,
+    ):
+        tokens = q.shape[0]
+        return (
+            q.new_empty(q.shape, dtype=torch.bfloat16),
+            gate.new_empty(gate.shape, dtype=torch.bfloat16),
+            lengths.new_empty((tokens, token_topk // compress_ratio + 1)),
+            lengths.new_empty((tokens,)),
+        )
+
+    return pages
+
+
+def build_pooled_qsa_shard_select_op(tp_group, a2a_min_tokens: int = 0):
+    """``build_pooled_qsa_select_op`` with the indexer split across ``tp_group``
+    (as ``build_pooled_qsa_shard_op``): returns ``(q, gate, pages, kv_lens)``
+    for an attention computed in the Qwen3.8 segment megakernel."""
+    world = int(tp_group.world_size)
+    rank = int(tp_group.rank_in_group)
+    # Build the Pallas ops now, at layer construction (see build_pooled_qsa_shard_op).
+    select, _ = _shard_ops(False)
+    merge_op = _merge_op()
+    pages_op = _shard_pages_op()
+
+    def run(*args, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        pool = args[10]
+        updated, q, gate, lengths, req, starts, candidates = select(
+            *args, shard_rank=rank, shard_size=world, **kwargs
+        )
+        pool.copy_(updated)
+        ratio, topk = kwargs["compress_ratio"], kwargs["token_topk"]
+        gathered, merged = _exchange_candidates(
+            candidates, tp_group, a2a_min_tokens, merge_op, ratio, topk
+        )
+        return pages_op(
+            q,
+            gate,
+            lengths,
+            req,
+            args[14],
+            args[12],
+            gathered,
+            ratio,
+            topk,
+            pool.shape[1],
+            merged=merged,
+        )
+
+    return run
+
+
+@functools.cache
+def _dcp_ops():
+    """The DCP-2 main-KV ops (VLLM_TPU_QSA_MAIN_KV_DCP): the all-token step,
+    the token-sharded select/attend pair, and the pair combine."""
+    from ..kernels.pooled_qsa import (
+        pooled_qsa_dcp_step,
+        pooled_qsa_shard_attend_dcp_step,
+        pooled_qsa_token_select_dcp_step,
+    )
+    from ..kernels.qsa_rpa import (
+        dcp_combine_own_step,
+        dcp_combine_step,
+    )
+
+    step = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_dcp", pooled_qsa_dcp_step, donate_argnums=(10,)
+    )
+
+    def partial_shapes(qgate, nq, positions, pool, ratio, topk):
+        tokens, head_dim = qgate.shape[0], nq.shape[0]
+        heads = qgate.shape[1] // (2 * head_dim)
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((tokens, heads, head_dim), dtype=torch.float32),
+            qgate.new_empty((tokens, heads), dtype=torch.float32),
+            positions.new_empty((tokens, topk + ratio - 1), dtype=torch.int32),
+        )
+
+    @step.register_fake
+    def step_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        return partial_shapes(qgate, nq, positions, pool, compress_ratio, token_topk)
+
+    select = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_token_select_dcp",
+        pooled_qsa_token_select_dcp_step,
+        donate_argnums=(10,),
+    )
+
+    @select.register_fake
+    def select_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        shard_index,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        shard_size,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        tokens, head_dim = qgate.shape[0], nq.shape[0]
+        heads = qgate.shape[1] // (2 * head_dim)
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((tokens, heads, head_dim)),
+            qgate.new_empty((tokens, heads, head_dim)),
+            positions.new_empty((tokens,), dtype=torch.int32),
+            positions.new_empty((tokens,), dtype=torch.int32),
+            positions.new_empty((starts.shape[0],), dtype=torch.int32),
+            positions.new_empty(
+                (tokens // shard_size, token_topk // compress_ratio), dtype=torch.int32
+            ),
+        )
+
+    attend = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_shard_attend_dcp",
+        pooled_qsa_shard_attend_dcp_step,
+        donate_argnums=(7,),
+    )
+
+    @attend.register_fake
+    def attend_fake(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        gathered,
+        dcp_rank,
+        kv_heads,
+        compress_ratio,
+        token_topk,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        main_slot=-1,
+        max_query_len=1,
+        merged=False,
+    ):
+        tokens = q.shape[0]
+        return (
+            torch.empty_like(pool),
+            q.new_empty((tokens, q.shape[1], q.shape[2]), dtype=torch.float32),
+            q.new_empty((tokens, q.shape[1]), dtype=torch.float32),
+            lengths.new_empty(
+                (tokens, token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
+        )
+
+    combine = pallas.jax_op("qwen38_flash::qsa_dcp_combine", dcp_combine_step)
+
+    @combine.register_fake
+    def combine_fake(out_pair, lse_pair, gate, rank):
+        # ``gate`` may be the whole q/gate row (VLLM_TPU_QSA_DCP_GATE_IN_COMBINE).
+        return gate.new_empty(
+            (*gate.shape[:-1], out_pair.shape[-1]), dtype=torch.bfloat16
+        )
+
+    if settings.VLLM_TPU_QSA_DCP_HEAD_EXCHANGE:
+        own = pallas.jax_op("qwen38_flash::qsa_dcp_combine_own", dcp_combine_own_step)
+
+        @own.register_fake
+        def own_fake(out_pair, lse_pair, gate):
+            return gate.new_empty(
+                (*gate.shape[:-1], out_pair.shape[-1]), dtype=torch.bfloat16
+            )
+
+        # _dcp_finish exchanges heads instead of gathering every partial.
+        combine = (combine, own)
+
+    return step, select, attend, combine
+
+
+def _dcp_finish(out, lse, qgate, head_dim, dcp_rank, pair_group, combine):
+    """Gather the pair's partial attention and merge this rank's heads."""
+    tokens = qgate.shape[0]
+    heads = qgate.shape[1] // (2 * head_dim)
+    gate = qgate.reshape(tokens, heads, 2 * head_dim)
+    if not settings.VLLM_TPU_QSA_DCP_GATE_IN_COMBINE:
+        # The strided gate half runs as a standalone slice plus a relayout
+        # copy; with the flag the combine slices it, fused with its consumer.
+        gate = gate[..., head_dim:]
+    if isinstance(combine, tuple):
+        # VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: each rank sends every other rank
+        # only that rank's heads of its partials (an all-to-all over the
+        # pair), half the bytes of gathering all of them; same values.
+        size = out.shape[1] // heads
+        out_mine = _all_to_all(
+            out.reshape(tokens, size, heads, head_dim)
+            .transpose(0, 1)
+            .reshape(size * tokens, heads, head_dim),
+            pair_group,
+        ).reshape(size, tokens, heads, head_dim)
+        lse_mine = _all_to_all(
+            lse.reshape(tokens, size, heads)
+            .transpose(0, 1)
+            .reshape(size * tokens, heads),
+            pair_group,
+        ).reshape(size, tokens, heads)
+        return combine[1](out_mine, lse_mine, gate).reshape(tokens, heads * head_dim)
+    out_pair = pair_group.all_gather(out.unsqueeze(0).contiguous(), dim=0)
+    lse_pair = pair_group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
+    return combine(out_pair, lse_pair, gate, dcp_rank).reshape(tokens, heads * head_dim)
+
+
+def build_pooled_qsa_dcp_op(pair_group, size: int):
+    """``build_pooled_qsa_op`` with the main KV split over ``pair_group``
+    (VLLM_TPU_QSA_MAIN_KV_DCP): the pair's q heads are gathered, each rank
+    attends its owned main-KV rows for all of them, and ``dcp_combine`` merges
+    this rank's heads. Takes a trailing ``dcp_rank`` (int32 ``[1]``) keyword."""
+    step, _, _, combine = _dcp_ops()
+
+    def run(*args, dcp_rank, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        qgate = args[0]
+        head_dim = args[4].shape[0]
+        args[0] = pair_group.all_gather(qgate.contiguous(), dim=-1)
+        updated, out, lse, blocks = step(*args, dcp_rank, dcp_size=size, **kwargs)
+        args[10].copy_(updated)
+        return _dcp_finish(
+            out, lse, qgate, head_dim, dcp_rank, pair_group, combine
+        ), blocks
+
+    return run
+
+
+@functools.cache
+def _dcp_draft_ops():
+    """The MTP draft's DCP steps (VLLM_TPU_QSA_MTP_KV_DCP): ``rows``, ``shared``
+    and ``shared_rows``, each returning ``(pool, out, lse, selected)``."""
+    from ..kernels.pooled_qsa import (
+        pooled_qsa_rows_dcp_step,
+        pooled_qsa_shared_dcp_step,
+        pooled_qsa_shared_rows_dcp_step,
+    )
+
+    def shapes(qgate, nq, positions, pool, rows, compress_ratio, token_topk):
+        head_dim = nq.shape[0]
+        heads = qgate.shape[1] // (2 * head_dim)
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((rows, heads, head_dim), dtype=torch.float32),
+            qgate.new_empty((rows, heads), dtype=torch.float32),
+            positions.new_empty(
+                (rows, token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
+        )
+
+    rows_op = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_rows_dcp",
+        pooled_qsa_rows_dcp_step,
+        donate_argnums=(10,),
+    )
+
+    @rows_op.register_fake
+    def rows_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        rows,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        return shapes(
+            qgate, nq, positions, pool, rows.shape[0], compress_ratio, token_topk
+        )
+
+    shared_op = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_shared_dcp",
+        pooled_qsa_shared_dcp_step,
+        donate_argnums=(10,),
+    )
+
+    @shared_op.register_fake
+    def shared_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        shared,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+        compressed_dcp=False,
+    ):
+        return shapes(
+            qgate, nq, positions, pool, shared.shape[0], compress_ratio, token_topk
+        )
+
+    shared_rows_op = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_shared_rows_dcp",
+        pooled_qsa_shared_rows_dcp_step,
+        donate_argnums=(10,),
+    )
+
+    @shared_rows_op.register_fake
+    def shared_rows_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        rows,
+        shared,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+        compressed_dcp=False,
+    ):
+        return shapes(
+            qgate, nq, positions, pool, shared.shape[0], compress_ratio, token_topk
+        )
+
+    return rows_op, shared_op, shared_rows_op
+
+
+def build_pooled_qsa_draft_dcp_op(
+    pair_group, size: int, *, shared: bool, with_rows: bool
+):
+    """The MTP draft's ops under VLLM_TPU_QSA_MTP_KV_DCP, as
+    ``build_pooled_qsa_rows_op`` (``with_rows``, not ``shared``) or
+    ``build_pooled_qsa_shared_op(with_rows)`` (``shared``), with the main KV
+    split over ``pair_group`` like ``build_pooled_qsa_dcp_op``. Takes a
+    trailing ``dcp_rank`` (int32 ``[1]``) keyword."""
+    assert shared or with_rows, "the all-token draft step is build_pooled_qsa_dcp_op"
+    rows_op, shared_op, shared_rows_op = _dcp_draft_ops()
+    step = (shared_rows_op if with_rows else shared_op) if shared else rows_op
+    _, _, _, combine = _dcp_ops()
+    extra = int(with_rows) + int(shared)
+    ints = (8, 11, 12, 13, 14, 15) + tuple(range(16, 16 + extra))
+
+    def run(*args, dcp_rank, **kwargs):
+        args = list(args)
+        for index in ints:
+            args[index] = args[index].to(torch.int32)
+        qgate = args[0]
+        head_dim = args[4].shape[0]
+        args[0] = pair_group.all_gather(qgate.contiguous(), dim=-1)
+        updated, out, lse, blocks = step(*args, dcp_rank, dcp_size=size, **kwargs)
+        args[10].copy_(updated)
+        # The combine gates each attended row with its token's gate.
+        gate_rows = qgate[args[16].clamp_min(0)] if with_rows else qgate
+        return _dcp_finish(
+            out, lse, gate_rows, head_dim, dcp_rank, pair_group, combine
+        ), blocks
+
+    return run
+
+
+@functools.cache
+def _compressed_dcp_ops():
+    """VLLM_TPU_QSA_COMPRESSED_DCP: the owned-group select step and the
+    merge-and-attend step around the pair's gather of local top-k lists."""
+    from ..kernels.pooled_qsa import (
+        pooled_qsa_compressed_dcp_attend_step,
+        pooled_qsa_compressed_dcp_select_step,
+        pooled_qsa_token_select_compressed_dcp_step,
+    )
+
+    select = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_compressed_dcp_select",
+        pooled_qsa_compressed_dcp_select_step,
+        donate_argnums=(10,),
+    )
+
+    @select.register_fake
+    def select_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        (tokens, width), head_dim = _qgate_dims(qgate), nq.shape[0]
+        heads = width // (2 * head_dim)
+        k = token_topk // compress_ratio
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((tokens, heads, head_dim)),
+            qgate.new_empty((tokens, heads, head_dim)),
+            positions.new_empty((tokens,), dtype=torch.int32),
+            positions.new_empty((tokens,), dtype=torch.int32),
+            positions.new_empty((starts.shape[0],), dtype=torch.int32),
+            qgate.new_empty((tokens, k), dtype=torch.float32),
+            positions.new_empty((tokens, k), dtype=torch.int32),
+        )
+
+    attend = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_compressed_dcp_attend",
+        pooled_qsa_compressed_dcp_attend_step,
+        donate_argnums=(7,),
+    )
+
+    @attend.register_fake
+    def attend_fake(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        vals_pair,
+        pos_pair,
+        dcp_rank,
+        kv_heads,
+        compress_ratio,
+        token_topk,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        tokens = q.shape[0]
+        return (
+            torch.empty_like(pool),
+            q.new_empty((tokens, q.shape[1], q.shape[2]), dtype=torch.float32),
+            q.new_empty((tokens, q.shape[1]), dtype=torch.float32),
+            lengths.new_empty(
+                (tokens, token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
+        )
+
+    token_select = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_token_select_compressed_dcp",
+        pooled_qsa_token_select_compressed_dcp_step,
+        donate_argnums=(10,),
+    )
+
+    @token_select.register_fake
+    def token_select_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        shard_index,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        shard_size,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        out = select_fake(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            nk,
+            niq,
+            nik,
+            positions,
+            trig,
+            pool,
+            starts,
+            context,
+            ring_ids,
+            main_table,
+            compressed_table,
+            dcp_rank,
+            compress_ratio,
+            token_topk,
+            norm_eps,
+            rotary_dim,
+        )
+        rows = _qgate_dims(qgate)[0] // shard_size
+        return (*out[:6], out[6][:rows], out[7][:rows])
+
+    return select, attend, token_select
+
+
+@functools.cache
+def _shard_merge_ops():
+    """VLLM_TPU_QSA_DCP_SHARD_MERGE: the pair merge of a subset of rows and
+    the attend step from the merged selection."""
+    from ..kernels.pooled_qsa import (
+        pooled_qsa_compressed_dcp_attend_blocks_step,
+        pooled_qsa_compressed_dcp_merge_step,
+    )
+
+    merge = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_compressed_dcp_merge",
+        pooled_qsa_compressed_dcp_merge_step,
+    )
+
+    @merge.register_fake
+    def merge_fake(vals_pair, pos_pair, block_topk):
+        return pos_pair.new_empty((pos_pair.shape[1], block_topk), dtype=torch.int32)
+
+    attend_blocks = pallas.jax_op(
+        "qwen38_flash::pooled_qsa_compressed_dcp_attend_blocks",
+        pooled_qsa_compressed_dcp_attend_blocks_step,
+        donate_argnums=(7,),
+    )
+
+    @attend_blocks.register_fake
+    def attend_blocks_fake(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        blocks,
+        dcp_rank,
+        kv_heads,
+        compress_ratio,
+        token_topk,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        tokens = q.shape[0]
+        return (
+            torch.empty_like(pool),
+            q.new_empty((tokens, q.shape[1], q.shape[2]), dtype=torch.float32),
+            q.new_empty((tokens, q.shape[1]), dtype=torch.float32),
+            lengths.new_empty(
+                (tokens, token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
+        )
+
+    return merge, attend_blocks
+
+
+def _shard_merged_blocks(
+    merge, vals, pos, dcp_rank, tp_group, pair_group, size, tokens, block_topk
+):
+    """The global selection [tokens, block_topk] from this pair's shard lists
+    ``vals`` / ``pos`` [rows, k]: the pair gathers its shard's lists, rank
+    ``dcp_rank`` merges rows [dcp_rank * rows / size, ...) of them, and a TP
+    all-gather of the merged rows restores token order (TP rank r = pair
+    r // size, DCP rank r % size, holding rows r * rows / size onward)."""
+    rows, k = vals.shape
+    part = rows // size
+
+    def mine(x):
+        pair = pair_group.all_gather(x.unsqueeze(0).contiguous(), dim=0)
+        # index_select keeps the traced graph free of a data-dependent index.
+        pair = pair.reshape(size, size, part, k)
+        return torch.index_select(pair, 1, dcp_rank.reshape(1).long()).squeeze(1)
+
+    blocks = merge(mine(vals), mine(pos), block_topk=block_topk)
+    gathered = tp_group.all_gather(blocks.unsqueeze(0).contiguous(), dim=0)
+    return gathered.reshape(-1, block_topk)[:tokens]
+
+
+def _gathered_lists(vals, pos, group, size, tokens):
+    """``[size, tokens, k]`` lists per pair rank from a ``group`` all-gather:
+    rank ``r`` = pair ``r // size``'s DCP rank ``r % size``, each holding its
+    pair's token shard (one shard for the whole step when ``group`` is the
+    pair)."""
+    k = vals.shape[-1]
+
+    def gather(x):
+        g = group.all_gather(x.unsqueeze(0).contiguous(), dim=0)
+        g = g.reshape(-1, size, *x.shape).permute(1, 0, 2, 3)
+        return g.reshape(size, -1, k)[:, :tokens]
+
+    if (
+        settings.VLLM_TPU_QSA_DCP_PACK_LISTS
+        and vals.dtype == torch.float32
+        and pos.dtype == torch.int32
+    ):
+        # One all-gather for both lists: the f32 values ride as their int32 bits.
+        both = torch.stack([vals.view(torch.int32), pos], dim=-2)  # [rows, 2, k]
+        g = group.all_gather(both.unsqueeze(0).contiguous(), dim=0)
+        g = g.reshape(-1, size, *both.shape).permute(1, 0, 2, 3, 4)
+        g = g.reshape(size, -1, 2, k)[:, :tokens]
+        return g[:, :, 0].contiguous().view(torch.float32), g[:, :, 1].contiguous()
+    return gather(vals), gather(pos)
+
+
+def build_pooled_qsa_compressed_dcp_op(pair_group, size: int):
+    """``build_pooled_qsa_dcp_op`` with the compressed keys split too
+    (VLLM_TPU_QSA_COMPRESSED_DCP): each rank scores its owned groups, the
+    pair gathers the local top-k lists (values and group ids, ``2 * T * k``
+    words per rank), and both ranks merge them into the global selection
+    before attending their owned main KV. Takes ``dcp_rank`` and ``kv_heads``
+    keywords."""
+    select, attend, _ = _compressed_dcp_ops()
+    _, _, _, combine = _dcp_ops()
+
+    def run(*args, dcp_rank, kv_heads, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        qgate = args[0]
+        head_dim = args[4].shape[0]
+        args[0] = _pair_qgate(
+            qgate, head_dim, pair_group, pair_major=True, q_gather=False
+        )
+        pool = args[10]
+        updated, q, gate, lengths, req, starts, vals, pos = select(
+            *args, dcp_rank, dcp_size=size, **kwargs
+        )
+        pool.copy_(updated)
+        vals_pair, pos_pair = _gathered_lists(
+            vals, pos, pair_group, size, qgate.shape[0]
+        )
+        attend_kwargs = {
+            name: kwargs[name]
+            for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
+            if name in kwargs
+        }
+        updated, out, lse, selected = attend(
+            q,
+            gate,
+            lengths,
+            req,
+            starts,
+            args[14],
+            args[12],
+            pool,
+            vals_pair,
+            pos_pair,
+            dcp_rank,
+            kv_heads=kv_heads,
+            compress_ratio=kwargs["compress_ratio"],
+            token_topk=kwargs["token_topk"],
+            dcp_size=size,
+            **attend_kwargs,
+        )
+        pool.copy_(updated)
+        return _dcp_finish(
+            out, lse, qgate, head_dim, dcp_rank, pair_group, combine
+        ), selected
+
+    return run
+
+
+def _pair_qgate(qgate, head_dim, pair_group, pair_major=False, q_gather=True):
+    """The pair's ``qgate`` for the DCP prefill select step: ``[T, pair * C]``
+    (heads joined by a dim -1 all-gather, which copies the rows into place).
+
+    VLLM_TPU_QSA_DCP_Q_GATHER: gather only the q halves and zero the gates;
+    the DCP attention returns ungated partials and ``_dcp_finish`` gates with
+    this rank's own ``qgate``, so half the bytes and the same values.
+    ``pair_major`` with VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR (steps that join the
+    heads themselves): the dim-0 gather's rank-major ``[pair, T, C]``, or with
+    the q gather ``[pair, T, H, D]`` q heads whose zero gates the step adds.
+    ``q_gather=False``: never drop the gates (ops the q gather does not cover)."""
+    q_only = q_gather and settings.VLLM_TPU_QSA_DCP_Q_GATHER
+    tokens = qgate.shape[0]
+    if q_only:
+        qgate = qgate.reshape(tokens, -1, 2 * head_dim)[..., :head_dim]
+    if pair_major and settings.VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR:
+        return pair_group.all_gather(qgate.contiguous().unsqueeze(0), dim=0)
+    if not q_only:
+        return pair_group.all_gather(qgate.contiguous(), dim=-1)
+    q_pair = pair_group.all_gather(qgate.contiguous(), dim=1)
+    return torch.cat([q_pair, torch.zeros_like(q_pair)], dim=-1).reshape(tokens, -1)
+
+
+def build_pooled_qsa_token_shard_compressed_dcp_op(
+    tp_group, pair_group, size: int, shard_merge: bool | None = None
+):
+    """``build_pooled_qsa_compressed_dcp_op`` for the prefill sequence-parallel
+    graph (and, with VLLM_TPU_QSA_DECODE_TOKEN_SHARD, the replicated backbone,
+    whose shards of at most one row per request slot take the decode
+    indexer): each DCP pair scores one token shard (``TP / size`` shards, both
+    ranks over their owned groups), one TP all-gather brings every pair's
+    local lists, and every rank merges all rows. Takes ``shard_index`` (the
+    TP rank), ``dcp_rank`` and ``kv_heads`` keywords. ``shard_merge``
+    (default VLLM_TPU_QSA_DCP_SHARD_MERGE): split the merge over the ranks;
+    it reshapes by the step's rows, so graphs traced with symbolic rows (the
+    replicated backbone) build the op without it."""
+    world = int(tp_group.world_size)
+    _, attend, token_select = _compressed_dcp_ops()
+    _, _, _, combine = _dcp_ops()
+    if shard_merge is None:
+        shard_merge = settings.VLLM_TPU_QSA_DCP_SHARD_MERGE
+    # Built here, outside the traced forward: jax_op inspects the step.
+    merge, attend_blocks = _shard_merge_ops() if shard_merge else (None, None)
+
+    def run(*args, shard_index, dcp_rank, kv_heads, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        qgate = args[0]
+        tokens, head_dim = qgate.shape[0], args[4].shape[0]
+        assert tokens % (world // size) == 0, (
+            f"token-sharded indexer: {tokens} rows do not split over "
+            f"{world // size} DCP pairs"
+        )
+        args[0] = _pair_qgate(qgate, head_dim, pair_group, pair_major=True)
+        pool = args[10]
+        updated, q, gate, lengths, req, starts, vals, pos = token_select(
+            *args,
+            torch.div(shard_index, size, rounding_mode="floor"),
+            dcp_rank,
+            shard_size=world // size,
+            dcp_size=size,
+            **kwargs,
+        )
+        pool.copy_(updated)
+        attend_kwargs = {
+            name: kwargs[name]
+            for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
+            if name in kwargs
+        }
+        if merge is not None:
+            blocks = _shard_merged_blocks(
+                merge,
+                vals,
+                pos,
+                dcp_rank,
+                tp_group,
+                pair_group,
+                size,
+                tokens,
+                kwargs["token_topk"] // kwargs["compress_ratio"],
+            )
+            updated, out, lse, selected = attend_blocks(
+                q,
+                gate,
+                lengths,
+                req,
+                starts,
+                args[14],
+                args[12],
+                pool,
+                blocks,
+                dcp_rank,
+                kv_heads=kv_heads,
+                compress_ratio=kwargs["compress_ratio"],
+                token_topk=kwargs["token_topk"],
+                dcp_size=size,
+                **attend_kwargs,
+            )
+        else:
+            vals_pair, pos_pair = _gathered_lists(vals, pos, tp_group, size, tokens)
+            updated, out, lse, selected = attend(
+                q,
+                gate,
+                lengths,
+                req,
+                starts,
+                args[14],
+                args[12],
+                pool,
+                vals_pair,
+                pos_pair,
+                dcp_rank,
+                kv_heads=kv_heads,
+                compress_ratio=kwargs["compress_ratio"],
+                token_topk=kwargs["token_topk"],
+                dcp_size=size,
+                **attend_kwargs,
+            )
+        pool.copy_(updated)
+        return _dcp_finish(
+            out, lse, qgate, head_dim, dcp_rank, pair_group, combine
+        ), selected
+
+    return run
+
+
+def build_pooled_qsa_token_shard_dcp_op(tp_group, pair_group, size: int):
+    """``build_pooled_qsa_token_shard_op`` with the DCP main-KV split."""
+    world = int(tp_group.world_size)
+    _, select, attend, combine = _dcp_ops()
+
+    def run(*args, shard_index, dcp_rank, kv_heads, **kwargs):
+        tokens = args[0].shape[0]
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        qgate = args[0]
+        head_dim = args[4].shape[0]
+        args[0] = _pair_qgate(qgate, head_dim, pair_group)
+        pool = args[10]
+        updated, q, gate, lengths, req, starts, blocks = select(
+            *args, shard_index, dcp_rank, shard_size=world, dcp_size=size, **kwargs
+        )
+        pool.copy_(updated)
+        attend_kwargs = {
+            name: kwargs[name]
+            for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
+            if name in kwargs
+        }
+        updated, out, lse, selected = attend(
+            q,
+            gate,
+            lengths,
+            req,
+            starts,
+            args[14],
+            args[12],
+            pool,
+            _all_gather_ranks(blocks, tp_group).reshape(-1, blocks.shape[-1])[:tokens],
+            dcp_rank,
+            kv_heads=kv_heads,
+            compress_ratio=kwargs["compress_ratio"],
+            token_topk=kwargs["token_topk"],
+            dcp_size=size,
+            merged=True,
+            **attend_kwargs,
+        )
+        pool.copy_(updated)
+        return _dcp_finish(
+            out, lse, qgate, head_dim, dcp_rank, pair_group, combine
+        ), selected
+
+    return run
