@@ -306,6 +306,8 @@ if TYPE_CHECKING:
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TPU_MAMBA_CHECKPOINT_RETENTION: bool = True
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
+    VLLM_TPU_KV_COORD_TAIL_SCAN: bool = False
+    VLLM_TPU_KV_COORD_GROUP_REPLAY: bool = False
     VLLM_TPU_MAMBA_TAIL_FOLD: bool = False
     VLLM_TPU_MAMBA_TAIL_FOLD_UNIT: int = 0
     VLLM_TPU_MAMBA_TAIL_FOLD_UNIT_CP: bool = False
@@ -2086,6 +2088,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decoding, where that state is exact. Host-only.
     "VLLM_TPU_MAMBA_DECODE_CHECKPOINT": env_bool(
         "VLLM_TPU_MAMBA_DECODE_CHECKPOINT", default=True
+    ),
+    # Scheduler: count a Mamba prefix hit's evictable blocks from its tail
+    # (the hit is [null] * k + [state]) instead of scanning every entry
+    # (core/kv_coord_replay.py). Exact. Host-only.
+    "VLLM_TPU_KV_COORD_TAIL_SCAN": env_bool(
+        "VLLM_TPU_KV_COORD_TAIL_SCAN", default=False
+    ),
+    # Scheduler: in the hybrid KV cache coordinator, run one Mamba "align"
+    # group of each same-spec set first and skip the others for a request
+    # when that call changed nothing and their per-request state is verified
+    # identical (core/kv_coord_replay.py). Exact. Host-only.
+    "VLLM_TPU_KV_COORD_GROUP_REPLAY": env_bool(
+        "VLLM_TPU_KV_COORD_GROUP_REPLAY", default=False
     ),
     # Qwen4Exp unified pool: finish a prefill in one chunk instead of
     # splitting off the tokens past its last Mamba block boundary, and write
