@@ -39,7 +39,12 @@ from vllm_torchtpu.megakernel.core.ops import BF16, F32
 
 
 @pytest.fixture(autouse=True)
-def _use_cpu_default_device():
+def _use_cpu_default_device(request: pytest.FixtureRequest):
+    # The TPU test picks its own device, and skips when the TPU backend is
+    # unavailable; `jax.devices("cpu")` would raise there instead.
+    if request.node.get_closest_marker("tpu_test") is not None:
+        yield
+        return
     with jax.default_device(jax.devices("cpu")[0]):
         yield
 
@@ -131,7 +136,6 @@ def test_scatter_writes_the_packed_slot(ckpt_ndim: int, T: int, conv: Any):
 
 def test_scatter_cold_start_on_the_packed_slot():
     ts._check_scatter(_packed(1), ts._exec(R=1, B=2, T=1), 3, 91, cold_start=True)
-
 
 
 def _scatter_states(lay: pool.PoolLayout, ex: Any, seed: int) -> dict:
