@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from . import (
     assets,
+    calibrate,
     chips,
     cli,
     constants,
@@ -30,14 +31,15 @@ from . import (
     verdict,
     vmem,
 )
+from .calibrate import CalibrateOptions, calibrate_trace
 from .chips import (
     BUILTIN_CHIP_SPECS,
+    ChipSpec,
+    FieldSource,
     REQUIRED_CHIP_SPEC_KEYS,
     SUPPORTED_CHIPS,
     TPU6E_TOPOLOGIES,
     TPU7X_TOPOLOGIES,
-    ChipSpec,
-    FieldSource,
     UnsupportedChipError,
     build_builtin_chip_spec,
     detect_tpu_from_sysfs,
@@ -142,6 +144,7 @@ __all__ = [
     "AdvisorSweepReport",
     "BUILTIN_CHIP_SPECS",
     "CORE_LIMITS",
+    "CalibrateOptions",
     "ChipSpec",
     "CollectiveCall",
     "CollectiveStepKind",
@@ -194,6 +197,8 @@ __all__ = [
     "assets",
     "build_arg_parser",
     "build_builtin_chip_spec",
+    "calibrate",
+    "calibrate_trace",
     "chips",
     "cli",
     "compare_parallelism_candidates",
