@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.experimental import xla_metadata
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41 import (
     indexer,
@@ -31,12 +32,18 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.candidates import (
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.dense_logits import (
     fp8_paged_mqa_logits,
 )
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.prefill_topk import (
+    prefill_topk,
+)
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.sparse_logits import (
     candidate_windows,
     fp8_gathered_mqa_logits,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.tuned import (
     PACKED_FP8_MQA_CONFIG,
+    PACKED_FP8_PREFILL_MAX_ROWS,
+    PACKED_FP8_PREFILL_MAX_WIDTH,
+    PACKED_FP8_PREFILL_ROWS,
     indexer_query_rows,
     paged_mqa_key_tile,
     topk_reconstruction_threshold,
@@ -765,34 +772,111 @@ def select_fp8_indexer_jax(
         score_width, layout.page_size, PACKED_FP8_MQA_CONFIG.key_tile
     )
     capacity = (score_width + width - 1) // width * width
+
     chunk = max(
         PACKED_FP8_MQA_CONFIG.query_tile,
         _INDEX_UNTILED_SCORE_ELEMENTS // max(capacity, 1),
     )
-    if (
-        width >= score_width
-        or chunk >= q.shape[0]
-        or q.shape[0] % chunk
-        or candidate_write
-        or sparse_logits
-        or not unordered
-        or topk > width
-        or jax.default_backend() != "tpu"
-    ):
-        return _select_fp8_indexer_jax(*arguments, score_width)
 
-    # Preserve score-buffer row boundaries for both widths. Only contexts
-    # covered by one K tile can narrow the scores and retain their keys.
-    live = (requests >= 0) & (requests < page_table.shape[0])
-    longest = jnp.where(live, lengths, 0).max()
-    grouped = jnp.all(requests[1:] >= requests[:-1])
-    return jax.lax.cond(
-        grouped & (longest <= width),
-        lambda: _select_fp8_indexer_jax(*arguments, width, prefill_chunk_rows=chunk),
-        lambda: _select_fp8_indexer_jax(
-            *arguments, score_width, prefill_chunk_rows=chunk
-        ),
-    )
+    def fallback():
+        if (
+            width >= score_width
+            or chunk >= q.shape[0]
+            or q.shape[0] % chunk
+            or candidate_write
+            or sparse_logits
+            or not unordered
+            or topk > width
+            or jax.default_backend() != "tpu"
+        ):
+            return _select_fp8_indexer_jax(*arguments, score_width)
+
+        # Preserve score-buffer row boundaries for both widths. Only contexts
+        # covered by one K tile can narrow the scores and retain their keys.
+        live = (requests >= 0) & (requests < page_table.shape[0])
+        longest = jnp.where(live, lengths, 0).max()
+        grouped = jnp.all(requests[1:] >= requests[:-1])
+        return jax.lax.cond(
+            grouped & (longest <= width),
+            lambda: _select_fp8_indexer_jax(
+                *arguments, width, prefill_chunk_rows=chunk
+            ),
+            lambda: _select_fp8_indexer_jax(
+                *arguments, score_width, prefill_chunk_rows=chunk
+            ),
+        )
+
+    fused_width = capacity if capacity <= PACKED_FP8_PREFILL_MAX_WIDTH else width
+    if (
+        jax.default_backend() == "tpu"
+        and pltpu.get_tpu_info().generation == 7
+        and PACKED_FP8_PREFILL_ROWS[0] <= q.shape[0] <= PACKED_FP8_PREFILL_MAX_ROWS
+        and q.shape[0] > page_table.shape[0] * PACKED_FP8_MQA_CONFIG.query_tile
+        and q.shape[0] % min(q.shape[0], chunk) == 0
+        and topk <= score_width
+        and q.shape[1:] == (32, 128)
+        and q.dtype == jnp.float8_e4m3fn
+        and layout.page_size in (128, 256)
+        and fused_width <= PACKED_FP8_PREFILL_MAX_WIDTH
+        and not candidate_write
+        and not sparse_logits
+        and unordered
+        and streaming_topk.is_supported(
+            fused_width, topk, reconstruct_threshold=topk_reconstruction_threshold(topk)
+        )
+    ):
+        layout.validate(tuple(bank.shape[0] for bank in banks))
+        if query_start_loc.shape != (page_table.shape[0] + 1,):
+            raise ValueError("query_start_loc needs one boundary per request, plus one")
+        valid = (requests >= 0) & (requests < page_table.shape[0])
+        visible_lengths = jnp.where(valid, jnp.clip(lengths, 0, score_width), 0)
+        offsets = jnp.minimum(query_start_loc.astype(jnp.int32), q.shape[0])
+        offsets = offsets.at[-1].set(q.shape[0])
+
+        # Keep the old scoring-call boundaries: regrouping six-query tiles
+        # across them can change BF16 head-sum rounding.
+        shared_rows = indexer_query_rows(q.shape[0], PACKED_FP8_MQA_CONFIG.query_tile)
+        score_rows = chunk if chunk < q.shape[0] else shared_rows
+        reference_rows = score_rows if score_rows < q.shape[0] else None
+        # The old block selector returns stable ordered IDs even when its
+        # caller permits arbitrary order. Preserve that stronger contract.
+        ordered_blocks = chunk >= q.shape[0] and block_topk.is_supported(
+            shared_rows,
+            capacity,
+            topk,
+            _BLOCK_TOPK_BLOCK,
+        )
+
+        def fused():
+            selected = prefill_topk(
+                q,
+                banks,
+                weights.astype(jnp.float32),
+                visible_lengths,
+                page_table,
+                offsets,
+                requests,
+                layout=layout,
+                width=fused_width,
+                k=topk,
+                unordered=unordered and not ordered_blocks,
+                reference_rows=reference_rows,
+            )
+            ids = jnp.arange(topk, dtype=jnp.int32)
+            visible = jnp.where(ids < visible_lengths[:, None], ids, -1)
+            short = jnp.minimum(batch_max.max(), score_width) <= topk
+            return jnp.where(short, visible, selected), candidates
+
+        # A padded decode bucket can have the same Q shape as a short prefill.
+        # Use the real request boundaries, before extending trailing padding.
+        prefill = jnp.max(jnp.diff(query_start_loc)) > PACKED_FP8_MQA_CONFIG.query_tile
+        fits = visible_lengths.max() <= fused_width
+        if chunk < q.shape[0]:
+            # The legacy wide-score route narrows only monotone request IDs.
+            # Keep that route for negative padding IDs to preserve its results.
+            fits = fits & jnp.all(requests[1:] >= requests[:-1])
+        return jax.lax.cond(prefill & fits, fused, fallback)
+    return fallback()
 
 
 def _prepare(
