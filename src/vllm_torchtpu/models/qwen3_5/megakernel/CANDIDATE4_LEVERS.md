@@ -238,7 +238,9 @@ has run; the rest of the TPU checklist is at the end.
   slots (vectorized routing, 4 copies per rank; split and fused; T=1 and
   T=4; interpret and TPU lowering), 8 on the tiny geometry, and 8 on the
   `qwen35-candidate30` and `-candidate30-fused` tiles at T=4 (8 and 32 rows,
-  split and fused).
+  split and fused). It is sensitive: on a tree without the
+  `cp_interleave`-off trace order in `moe/topk.py`, exactly the 8
+  configurations with expert copy slots differ.
 - **Compiled code at the default profiles.** AOT for tpu7x on CPU with
   mk-dev's `compiler_stats`. In one configuration (T=4, 4 rows, EP with 72
   expert slots, `qwen35-candidate30-fused`) the megakernel's full LLO
@@ -330,18 +332,22 @@ has run; the rest of the TPU checklist is at the end.
   232 passed), `test_pool_gather`, `test_pool_scatter`, `test_runtime_api`
   and `test_b7_deferred_minors` (63 passed), and the MoE tests `test_moe`,
   `test_moe_routing_ring` and `test_moe_cand4` (49 passed) all pass. Before
-  the merge, with the same megakernel code, the other test files passed
+  the merge, with the same megakernel code apart from that trace order, the
+  other test files passed
   (572 tests, none failing apart from the stale fake above): GQA,
   GDN, MoE, collectives and layer schedule, stream and kernel step, pool and
   DCP, the m1 attention + MoE and m2 GDN model tests, and the planner, VMEM,
-  weights and model-definition files. Still running at hand-off (on the
-  shared CPU machine a few files exceed the 40-minute per-file limit, so
-  they continue in node-id chunks): the core chunk with `test_exec_spec`,
-  the tunables and the profiles (70 passed so far), `test_b1_tiles_profiles`
-  (36 passed before the limit), `test_verify_model` (15 passed before the
-  limit), `test_m3_cache_eplb` (41 of 56 passed in three chunks, the fourth
-  hit the limit) and `test_module_api` (stopped by the machine after 3
-  passed). None of them has failed.
+  weights and model-definition files. The rest ran on the merged tree, the
+  slowest files in node-id chunks because they exceed the 40-minute
+  per-file limit on the shared CPU machine: the core chunk with
+  `test_exec_spec`, the tunables and the profiles (19 files, 160 passed),
+  `test_b1_tiles_profiles` (48 passed, 2 expected failures),
+  `test_verify_model` (18 passed), `test_m3_cache_eplb` (53 tests: 46
+  passed, 1 skipped, 6 expected failures) and `test_module_api` (12
+  passed); the first 36 of `test_b1_tiles_profiles`' tests, 15 of
+  `test_verify_model`'s and 42 of `test_m3_cache_eplb`'s ran before the
+  merge. Every test file of the suite has run on this code, and none
+  failed.
 
 ## TPU checklist
 
