@@ -671,9 +671,11 @@ def ragged_paged_attention(
         decode_query_size: Number of query tokens in decode (1 by default, can be
             higher in case of speculative decoding).
         decode_batch_size: Most sequences a decode step works on concurrently.
-        tuned_tiles: Choose the default block sizes with the tile rules tuned
-            for the Qwen3.5 PD deployments; see `calculate_block_sizes`.
-            Defaults to False.
+        tuned_tiles: Run as the Qwen3.5 PD deployments were tuned: choose the
+            default block sizes with the tuned tile rules (see
+            `calculate_block_sizes`), and skip the MIXED call when it has no
+            sequences. Defaults to False: the heuristic's tiles, and DECODE
+            and MIXED both run on every call.
         cp_group_size: Size of the context parallelism (CP) group. KV cache is
             sharded across devices in this group. Defaults to None.
         cp_rank: Rank of the current device within the CP group, which determine
@@ -920,15 +922,31 @@ def ragged_paged_attention(
             lse_out = None
         return o_out, kv_out, lse_out
 
+    # With tuned_tiles (the Qwen3.5 PD deployments), the MIXED call is skipped
+    # when it has no work: a call of at most decode_query_size tokens runs
+    # DECODE alone over every sequence, and any other call skips MIXED at run
+    # time (lax.cond) when its sequence range is empty. Otherwise DECODE and
+    # MIXED both run on every call. The conditional, one per attention layer,
+    # changes how XLA schedules and places the whole compiled step; that alone
+    # changed other models' greedy outputs, with every kernel's results equal.
+    skip_empty_mixed = tuned_tiles
     effective_decode_blocks = decode_block_sizes or default_decode
     if (
-        serve_cfgs.total_q_tokens
+        skip_empty_mixed
+        and serve_cfgs.total_q_tokens
         <= min(decode_query_size, effective_decode_blocks.bq_sz)
         and cp_group_size is None
     ):
         decode_dist = jnp.repeat(distribution[2:3], 3)
         o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
             configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init, decode_dist
+        )
+    elif not skip_empty_mixed:
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
+        )
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
         )
     else:
         o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
