@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 import jax.numpy as jnp
 import pytest
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils, wrapper
 
 
 def _create_mock_tpu_info(
@@ -86,7 +86,8 @@ def test_calculate_block_sizes_generation(
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
 
 
-# bkv_sz must be a page multiple in every layout (see RpaConfigs.validate_inputs).
+# The cached-KV DMA schedule fetches block k from pages k * bkv_p with no
+# intra-page offset, so bkv_sz must be a page multiple in every layout.
 @pytest.mark.parametrize(
     "kv_layout",
     [configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE],
@@ -133,3 +134,68 @@ def test_calculate_block_sizes_bkv_is_page_multiple(
             f"{kv_layout=} {kv_dtype=} {num_kv_heads=} {page_size=}:"
             f" bkv_sz={blocks.bkv_sz} is not a page multiple"
         )
+
+
+@pytest.mark.parametrize(
+    "kv_layout,expected_error",
+    [
+        (configs.KVLayout.HEAD_ALONG_SUBLANE, ValueError),
+        (configs.KVLayout.SEQ_ALONG_LANE, NotImplementedError),
+    ],
+)
+def test_validate_inputs_rejects_unaligned_bkv_sz(kv_layout, expected_error):
+    page_size, head_dim, num_kv_heads, num_seqs, num_pages = 512, 128, 2, 8, 4
+    dtype = jnp.bfloat16
+    packing = utils.get_dtype_packing(dtype)
+    cfgs = configs.RpaConfigs(
+        block=configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=768, batch_size=8),
+        model=configs.ModelConfigs(
+            num_q_heads=6 * num_kv_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            mask_value=-1e9,
+        ),
+        serve=configs.ServingConfigs(
+            num_seqs=num_seqs,
+            page_size=page_size,
+            total_q_tokens=num_seqs,
+            num_page_indices=num_seqs * num_pages,
+            dtype_q=dtype,
+            dtype_kv=dtype,
+            dtype_out=dtype,
+            kv_layout=kv_layout,
+        ),
+        mode=configs.RpaCase.DECODE,
+        vmem_limit_bytes=64 * 1024 * 1024,
+    )
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            kv_cache_shape = (
+                num_pages,
+                num_kv_heads * 2,
+                cfgs.aligned_kv_head_dim // packing,
+                packing,
+                page_size,
+            )
+        else:
+            kv_cache_shape = (
+                num_pages,
+                page_size,
+                cfgs.aligned_num_kv_heads_x2 // packing,
+                packing,
+                cfgs.aligned_kv_head_dim,
+            )
+        with pytest.raises(expected_error, match="multiple of"):
+            cfgs.validate_inputs(
+                q=jnp.zeros((num_seqs, 6 * num_kv_heads, head_dim), dtype),
+                k=jnp.zeros((num_seqs, num_kv_heads, head_dim), dtype),
+                v=jnp.zeros((num_seqs, num_kv_heads, head_dim), dtype),
+                kv_cache=jnp.zeros(kv_cache_shape, dtype),
+                kv_lens=jnp.zeros((num_seqs,), jnp.int32),
+                page_indices=jnp.zeros((num_seqs * num_pages,), jnp.int32),
+                cu_q_lens=jnp.zeros((num_seqs + 1,), jnp.int32),
+                distribution=jnp.zeros((3,), jnp.int32),
+            )

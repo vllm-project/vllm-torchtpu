@@ -665,7 +665,10 @@ class RpaConfigs:
         bkv_sz = self.block.bkv_sz
         page_size = self.serve.page_size
         if bkv_sz % page_size != 0:
-            raise ValueError(
+            msg = (
                 f"Expected {bkv_sz=} to be a multiple of {page_size=} for"
                 f" kv_layout={self.serve.kv_layout}."
             )
+            if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+                raise NotImplementedError(msg)
+            raise ValueError(msg)
