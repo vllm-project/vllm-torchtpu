@@ -95,6 +95,10 @@ def test_dummy_run_preserves_multimodal_embedding_dtype(monkeypatch):
     runner.vllm_config = SimpleNamespace()
     runner.mesh = runner._kv_cache_bundle = runner.lora_config = None
     runner._pp_topk_buffer = None
+    runner.pcp_manager = None
+    runner._input_staging_fence = None
+    runner._unfenced_h2d_sources = []
+    runner._fenced_h2d_sources = []
     runner.maybe_select_dummy_loras = lambda *args: contextlib.nullcontext()
     runner.model = SimpleNamespace(
         embed_input_ids=lambda ids, **kwargs: torch.full(
@@ -113,6 +117,9 @@ def test_dummy_run_preserves_multimodal_embedding_dtype(monkeypatch):
         lambda *args, **kwargs: contextlib.nullcontext(),
     )
     monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *args: None)
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+    )
 
     runner._dummy_run(num_tokens=3, num_reqs=3, num_blocks=1, profile_prefix=4)
 
