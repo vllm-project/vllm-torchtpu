@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTE_TRACE_EVERY: int = 8192
     VLLM_TPU_MOE_REDUNDANT_EXPERTS: int = 0
     TPU_MOE_NVFP4_SKIP_PADDED: bool = False
+    TPU_MOE_SKIP_PADDED_MIN_ROUTES: int = 0
     VLLM_TPU_MOE_REDUNDANT_PLACEMENT: str = ""
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -795,6 +796,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # but today they route like real tokens and every expert they touch costs
     # its weight read. Needs TPU_MOE_SKIP_PADDED_TOKENS=1. Default off.
     "TPU_MOE_NVFP4_SKIP_PADDED": env_bool("TPU_MOE_NVFP4_SKIP_PADDED"),
+    # TPU_MOE_SKIP_PADDED_TOKENS drops padded rows from the grouped matmul only
+    # in batches of at least this many routes (T * top_k); smaller batches run
+    # them as with the skip off (bitwise for real rows). 0 = every size.
+    "TPU_MOE_SKIP_PADDED_MIN_ROUTES": env_nonnegative_int(
+        "TPU_MOE_SKIP_PADDED_MIN_ROUTES", 0
+    ),
     # Redundant MoE experts on the grouped-matmul EP path
     # (layers/adapter/moe_redundant.py): extra expert slots per EP rank per
     # MoE layer, each holding a copy of another rank's expert, and a per-step
