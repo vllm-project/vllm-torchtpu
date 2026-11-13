@@ -191,3 +191,74 @@ def test_bare_scheduler_request_finished_without_trace_state():
         OffloadingConnectorScheduler, "request_finished", return_value=(False, None)
     ):
         assert s.request_finished(SimpleNamespace(request_id="x")) == (False, None)
+
+
+# -- write-back covered drop -----------------------------------------------------
+
+
+def _wb_scheduler(drop_covered=True):
+    from vllm_torchtpu.offload.raiden_connector import WriteBackPolicy
+
+    s, pool = _scheduler_with_pool(flush_real_reuse=False)
+    s._wb_drop_covered = drop_covered
+    if drop_covered:
+        # attach_block_pool ran before the flag was set: watch again.
+        s.attach_block_pool(pool)
+    s._write_back = WriteBackPolicy()
+    s._block_pool = None  # flush every held request only when asked
+    s._wb_blocks = collections.OrderedDict()
+    s._wb_owners = {}
+    dropped = []
+    s._wb_drop = lambda rid: (dropped.append(rid), s._wb_unregister(rid))
+    s._wb_near_eviction = lambda: []
+    s._maybe_log_write_back = lambda: None
+    return s, pool, dropped
+
+
+def _hold(s, rid, blocks):
+    s._wb_blocks[rid] = set(blocks)
+    for b in blocks:
+        s._wb_owners.setdefault(b, set()).add(rid)
+
+
+def _wb_step(s, listed):
+    out = SimpleNamespace(
+        finished_req_ids=set(), num_scheduled_tokens={}, scheduled_new_reqs=[]
+    )
+    with patch(
+        "vllm_torchtpu.offload.raiden_connector._allocated_block_ids",
+        return_value=set(listed),
+    ), patch(
+        "vllm_torchtpu.offload.raiden_connector.dataclasses.replace",
+        side_effect=lambda o, **kw: o,
+    ):
+        s._write_back_output(out)
+
+
+def test_covered_drop_keeps_partially_hit_parent_and_drops_covered_turn():
+    s, pool, dropped = _wb_scheduler()
+    _hold(s, "parent", [1, 2, 3, 4])
+    _hold(s, "prev_turn", [5, 6])
+    # A sibling hits the parent's shared prefix (1, 2); the next turn hits all of 5, 6.
+    _wb_step(s, {1, 2, 5, 6, 7})
+    assert dropped == ["prev_turn"]
+    assert "parent" in s._wb_blocks
+    assert s.wb_counters["kept_partial_hit"] == 1
+    assert s.wb_counters["drop_covered"] == 1
+
+
+def test_covered_drop_still_drops_on_reallocation_of_a_hit_block():
+    s, pool, dropped = _wb_scheduler()
+    _hold(s, "parent", [1, 2, 3])
+    _wb_step(s, {1})  # partial hit: kept
+    assert dropped == []
+    s._fresh_block_ids.add(1)  # the hit block is later handed out fresh
+    _wb_step(s, {1})
+    assert dropped == ["parent"]
+
+
+def test_covered_drop_off_drops_on_any_hit():
+    s, pool, dropped = _wb_scheduler(drop_covered=False)
+    _hold(s, "parent", [1, 2, 3])
+    _wb_step(s, {1})
+    assert dropped == ["parent"]
