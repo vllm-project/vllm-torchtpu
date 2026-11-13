@@ -86,8 +86,8 @@ def _kernel(
     coeff_ref,  # VMEM [m, E_pad] f32
     w1_hbm,  # [E, h, 2i] fp4
     w2_hbm,  # [E, i, h] fp4
-    s1_hbm,  # [E, h / 128, 2i] f32
-    s2_hbm,  # [E, i / 128, h] f32
+    s1_hbm,  # [E, h / 128, 1, 2i] f32
+    s2_hbm,  # [E, i / 128, 1, h] f32
     out_ref,  # VMEM [m, h] bf16
     wg_ref,
     wu_ref,
@@ -138,10 +138,10 @@ def _kernel(
                 w2_hbm.at[e, pl.ds(col, chunk), :], wd_ref.at[slot], sem.at[2]
             ),
             pltpu.make_async_copy(
-                s1_hbm.at[e, :, pl.ds(col, chunk)], sg_ref.at[slot], sem.at[3]
+                s1_hbm.at[e, :, :, pl.ds(col, chunk)], sg_ref.at[slot], sem.at[3]
             ),
             pltpu.make_async_copy(
-                s1_hbm.at[e, :, pl.ds(i + col, chunk)], su_ref.at[slot], sem.at[4]
+                s1_hbm.at[e, :, :, pl.ds(i + col, chunk)], su_ref.at[slot], sem.at[4]
             ),
             pltpu.make_async_copy(
                 s2_hbm.at[e, pl.ds(blk, chunk // _QUANT_BLOCK), :],
@@ -165,7 +165,7 @@ def _kernel(
                     wg_ref[slot, k : k + _QUANT_BLOCK, :].astype(fp8),
                     preferred_element_type=jnp.float32,
                 )
-                * sg_ref[slot, b : b + 1, :]
+                * sg_ref[slot, b]
             )
             up += (
                 jnp.matmul(
@@ -173,7 +173,7 @@ def _kernel(
                     wu_ref[slot, k : k + _QUANT_BLOCK, :].astype(fp8),
                     preferred_element_type=jnp.float32,
                 )
-                * su_ref[slot, b : b + 1, :]
+                * su_ref[slot, b]
             )
         act = apply_act_fn(interleave_lane(gate, up), activation).astype(x.dtype)
         down = jnp.zeros((x.shape[0], h), jnp.float32)
@@ -185,7 +185,7 @@ def _kernel(
                     wd_ref[slot, k : k + _QUANT_BLOCK, :].astype(fp8),
                     preferred_element_type=jnp.float32,
                 )
-                * sd_ref[slot, b : b + 1, :]
+                * sd_ref[slot, b]
             )
 
         @pl.when(c == 0)
@@ -281,9 +281,9 @@ def dense_expert_moe_fp4(
                 pltpu.VMEM((_NUM_BUFFERS, h, chunk), w1.dtype),
                 pltpu.VMEM((_NUM_BUFFERS, h, chunk), w1.dtype),
                 pltpu.VMEM((_NUM_BUFFERS, chunk, h), w2.dtype),
-                pltpu.VMEM((_NUM_BUFFERS, h // _QUANT_BLOCK, chunk), jnp.float32),
-                pltpu.VMEM((_NUM_BUFFERS, h // _QUANT_BLOCK, chunk), jnp.float32),
-                pltpu.VMEM((_NUM_BUFFERS, chunk // _QUANT_BLOCK, h), jnp.float32),
+                pltpu.VMEM((_NUM_BUFFERS, h // _QUANT_BLOCK, 1, chunk), jnp.float32),
+                pltpu.VMEM((_NUM_BUFFERS, h // _QUANT_BLOCK, 1, chunk), jnp.float32),
+                pltpu.VMEM((_NUM_BUFFERS, chunk // _QUANT_BLOCK, 1, h), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.float32),
                 pltpu.SMEM((experts,), jnp.int32),
@@ -300,7 +300,9 @@ def dense_expert_moe_fp4(
         coeff,
         w1,
         w2,
-        s1.reshape(experts, -1, 2 * i),
-        s2.reshape(experts, -1, h),
+        # 4-D as the GMM path holds them: a reshape that drops the size-1
+        # axis is a relayout copy of every scale on each call.
+        s1,
+        s2,
     )
     return out[:m]
