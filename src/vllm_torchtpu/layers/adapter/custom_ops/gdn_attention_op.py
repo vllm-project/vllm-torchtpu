@@ -34,8 +34,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import (
-    BlockMajorPoolLayout,
-    flat_manager_ids,
+    BlockMajorPoolBindable,
     kernel_view,
     unified_block_major_enabled,
 )
@@ -351,12 +350,9 @@ def _localize_gdn_mamba_spec_for_pcp(
 
 
 @QwenGatedDeltaNetAttention.register_oot
-class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
-    # Whether pooled ops consume the merged block-major unified pool, along
-    # with `(pool_index, layout)` once bound by `set_block_major_pool()`.
-    # Class-level defaults support test/mock instances constructed without `__init__`.
-    _bm_kernel: bool = False
-    _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBindable):
+    # `_bm_kernel`, `_bm_region`, `set_block_major_pool` and `_bm_state_ids`
+    # come from BlockMajorPoolBindable.
     _checkpoint_alignment: int | None = None
 
     # Narrowed to the layer that _create_conv1d installs.
@@ -412,20 +408,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
         if pcp_enabled or not kernel_layout:
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
-
-    def set_block_major_pool(
-        self, pool_index: int, layout: BlockMajorPoolLayout
-    ) -> None:
-        """Binds this layer to its region index within the merged block-major pool."""
-        assert self._bm_kernel, "pooled ops were built for per-region pools"
-        self._bm_region = (pool_index, layout)
-
-    def _bm_state_ids(self, ids: torch.Tensor) -> torch.Tensor:
-        if not self._bm_kernel:
-            return ids
-        assert self._bm_region is not None
-        pool_index, layout = self._bm_region
-        return flat_manager_ids(ids, pool_index, layout.num_pools)
 
     def _prefill_ckpt_operands(
         self, attn_metadata: "_GdnAttentionMetadata"
