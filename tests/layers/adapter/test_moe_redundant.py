@@ -89,6 +89,11 @@ def test_layer_key_and_sources(tmp_path):
     assert rx.hot_for_layer({"moe0": [7]}, "model.layers.3.mlp.experts", 0) == [7]
     with pytest.raises(ValueError):
         rx._load_source("builtin:nope")
+    served = rx._load_source("builtin:minimax_m31_agentx")
+    assert len(served) == 57 and not any(k.startswith("_") for k in served)
+    plan = rx.compute_placement(128, 8, 8, served["moe0"])
+    top = sorted(served["moe0"], key=lambda e: -served["moe0"][e])[:8]
+    assert {int(e) for e in top} <= set(plan.rep_logical)
 
 
 # --------------------------------------------------------------------------
