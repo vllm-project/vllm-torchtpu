@@ -15,6 +15,7 @@
 
 from collections.abc import Callable
 
+import torch
 from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import (
     RoutingSimulatorRouter,
 )
@@ -60,6 +61,15 @@ class VllmMoERunner(MoERunner):
         # Before the weights load, and whatever the quant method and kernel:
         # a placed layer loads its experts in slot order.
         expert_placement.apply(self)
+        self.routed_experts.capture_fn = None
+
+    @property
+    def capture_fn(self) -> Callable[[torch.Tensor], None] | None:
+        return self.routed_experts.capture_fn
+
+    @capture_fn.setter
+    def capture_fn(self, fn: Callable[[torch.Tensor], None] | None) -> None:
+        self.routed_experts.capture_fn = fn
 
     def _take_over_moe_quant_config_init(self) -> None:
         routed_experts = self.routed_experts

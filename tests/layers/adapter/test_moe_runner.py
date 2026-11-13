@@ -171,3 +171,41 @@ def test_routing_simulation_keeps_real_logits_for_tpu_methods(monkeypatch):
     runner = VllmMoERunner()
     logits = torch.randn(3, 8)
     assert runner.router.prepare_monolithic_logits(logits) is logits
+
+
+@pytest.fixture
+def capture_runner(monkeypatch):
+    """A runner built through VllmMoERunner.__init__, monolithic quant method."""
+
+    def base_init(self, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.router = None
+        self.routed_experts = _RoutedExperts(_QuantMethod(is_monolithic=True))
+        self.layer_name = "model.layers.7.mlp.experts"
+
+    monkeypatch.setattr(MoERunner, "__init__", base_init)
+    return VllmMoERunner()
+
+
+def test_binder_hooks_the_layer_route_reads(capture_runner):
+    """vLLM's binder reaches the layer `moe_routing.route` reads.
+
+    The quant method is monolithic with no `moe_kernel`, so a binder that
+    missed the runner's `capture_fn` would raise instead.
+    """
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+        bind_routed_experts_capturer,
+    )
+
+    assert capture_runner.routed_experts.capture_fn is None
+    calls = []
+    capturer = SimpleNamespace(
+        capture=lambda layer_id, ids: calls.append((layer_id, ids))
+    )
+
+    bind_routed_experts_capturer(capture_runner, capturer)
+    ids = torch.zeros(3, 2, dtype=torch.int32)
+    capture_runner.routed_experts.capture_fn(ids)
+
+    assert len(calls) == 1
+    assert calls[0][0] == 7 and calls[0][1] is ids
