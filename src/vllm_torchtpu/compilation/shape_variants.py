@@ -52,6 +52,7 @@ import sympy
 import torch
 import torch.fx as fx
 
+from vllm_torchtpu.compilation import bucket_filter
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -318,7 +319,9 @@ def aot_cache_tag() -> str | None:
     return f"trace{_session.traces}" if _session is not None else None
 
 
-def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
+def retrace(
+    model: torch.nn.Module, vllm_config: VllmConfig, size: int | None = None
+) -> None:
     """Give the model's compiled modules a fresh, untraced torch.compile wrapper.
 
     ``VllmBackend`` refuses a second call ("VllmBackend can only be called
@@ -331,17 +334,17 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
     puts a wrapper wherever it is applied, which for a per-layer model is every
     decoder layer, and the wrappers are what hold the bytecode hooks that have
     to be dropped before they are replaced.
+
+    With ``size``, only the wrappers serving that bucket are replaced (see
+    compilation/bucket_filter): a model routing buckets to two compiled modules
+    retraces one without dropping the other's graph, which the ladder may
+    already be past.
     """
     from vllm.compilation.wrapper import (
         TorchCompileWithNoGuardsWrapper,
         reset_compile_wrapper,
     )
     from vllm.config import set_current_vllm_config
-
-    if _session is not None:
-        _session.traces += 1
-        # The refusals belong to the traces being replaced.
-        _session.refused.clear()
 
     wrappers = (
         [model]
@@ -350,6 +353,25 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
             m for m in model.modules() if isinstance(m, TorchCompileWithNoGuardsWrapper)
         ]
     )
+    # Only a model that assigned buckets to its modules retraces part of itself.
+    partial = size is not None and any(
+        bucket_filter.assigned(w) is not None for w in wrappers
+    )
+    if partial:
+        wrappers = [w for w in wrappers if bucket_filter.module_serves(w, size)]
+
+    if _session is not None:
+        _session.traces += 1
+        # The refusals belong to the traces being replaced.
+        if partial:
+            _session.refused = {
+                refused
+                for refused in _session.refused
+                if not any(bucket_filter.module_serves(w, refused) for w in wrappers)
+            }
+        else:
+            _session.refused.clear()
+
     for wrapper in wrappers:
         wrapper.cleanup()  # drop its bytecode hook before replacing it
 
@@ -360,7 +382,11 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
     config = vllm_config.compilation_config
     saved = (config.cache_dir, config.local_cache_dir)
     with set_current_vllm_config(vllm_config):
-        reset_compile_wrapper(model)
+        if partial:
+            for wrapper in wrappers:
+                reset_compile_wrapper(wrapper)
+        else:
+            reset_compile_wrapper(model)
     config.cache_dir, config.local_cache_dir = saved
 
 
