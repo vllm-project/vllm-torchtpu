@@ -17,8 +17,9 @@ Draft step 0 runs the MTP layer on every row of the target's chunk, but a draft
 token is read from one row per request only (the end of its accepted prefix,
 `last_token_indices`). Every other row still has to leave its MTP KV entry and
 its indexer-K entry behind, because later rows and later steps attend to them,
-yet nothing reads its attention output, MoE output or top-k. A two-pass step 0
-splits it:
+yet nothing reads its attention output, MoE output or top-k. With
+`TPU_MTP_KV_ONLY_STEP0` the proposer splits a large step 0 that carries a
+prefill span in two (`MtpKvOnlyStep0`):
 
 * pass 1 (`MtpKvOnlyModel`, this module) runs only what produces the two cache
   entries -- embedding, enorm/hnorm, eh_proj, input norm, then kv_a + kv norm +
@@ -38,12 +39,16 @@ This lives outside eagle3.py because that module uses postponed annotations,
 which ``support_torch_compile`` cannot read.
 """
 
-from typing import Any, cast
+import copy
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import nn
+from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.deepseek_mtp import (
     DeepSeekMTP,
     DeepSeekMultiTokenPredictor,
@@ -53,6 +58,17 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MLAAttention,
 )
+
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    set_vllm_model_wrapper_context,
+)
+from vllm_torchtpu.utils import synchronize_tensors
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+logger = init_logger(__name__)
 
 # Same dims as the draft's own compile (`MTP_DYNAMIC_ARG_DIMS`): dim 0, the
 # token dimension, of every tensor argument.
@@ -230,3 +246,160 @@ class MtpKvOnlyModel(nn.Module):
     ) -> torch.Tensor:
         _, attn_input = mtp_layer_input(self.mtp, input_ids, positions, hidden_states)
         return self._write(positions, attn_input)
+
+
+def _sizes_at_or_above(sizes: Iterable[int | str], min_tokens: int) -> list[int | str]:
+    """Pass 1's compile sizes: the draft's token buckets at or above the
+    gate, the only ones `MtpKvOnlyStep0.takes_two_pass` dispatches."""
+    # TPUPlatform sets compile_sizes to the token padding buckets (ints).
+    kept: list[int | str] = [int(size) for size in sizes if int(size) >= min_tokens]
+    return kept
+
+
+def _layout_unsupported_reason(
+    proposer: "Eagle3Proposer", all_attn_layers: dict[str, AttentionLayerBase]
+) -> str | None:
+    """Why `proposer`'s draft or layout cannot take the two-pass step 0."""
+    if proposer.speculative_config.method != "mtp":
+        return f"the draft method is {proposer.speculative_config.method!r}"
+    if proposer._draft_kv_shared:
+        return "the draft reads the target's KV cache"
+    # TODO: support PCP: it localizes the gather indices per rank, which
+    #   pass 2's row selection does not model yet.
+    if proposer.runner._pcp_enabled:
+        return "prefill context parallelism is on"
+    if proposer._dp_lockstep_sharded():
+        # The idle ranks' replay of a peer's draft trace (run_dp_dummy_draft)
+        # knows only the single pass, so the collectives would not match.
+        return "EP-DP lockstep replays the draft as the single pass"
+    assert proposer.draft_model is not None
+    reason = kv_only_unsupported_reason(proposer.draft_model)
+    if reason is not None:
+        return reason
+    # Pass 1 reads the step-0 metadata of the draft's MLA layer and indexer
+    # cache, which the draft's attention layers carry.
+    assert proposer._draft_attn_layer_names is not None
+    indexer_names, mla_names = proposer._split_dsa_draft_layers(
+        all_attn_layers, proposer._draft_attn_layer_names
+    )
+    if len(mla_names) != 1 or len(indexer_names) != 1:
+        return (
+            f"the draft registered MLA layers {mla_names} and indexer caches "
+            f"{indexer_names}, not one of each"
+        )
+    return None
+
+
+class MtpKvOnlyStep0:
+    """What `TPU_MTP_KV_ONLY_STEP0` adds to `Eagle3Proposer`.
+
+    Pass 1's compiled program (`model`), the smallest padded step 0 that
+    takes the two passes (`min_tokens`), and the copy of the draft's config
+    pass 1 compiles under, whose `compile_sizes` keep only the buckets at or
+    above that gate. The proposer runs the two passes
+    (`Eagle3Proposer._two_pass_step0`).
+    """
+
+    def __init__(
+        self, model: nn.Module, min_tokens: int, vllm_config: VllmConfig
+    ) -> None:
+        self.model = model
+        self.min_tokens = min_tokens
+        self.vllm_config = vllm_config
+
+    @classmethod
+    def build(
+        cls,
+        proposer: "Eagle3Proposer",
+        all_attn_layers: dict[str, AttentionLayerBase],
+    ) -> "MtpKvOnlyStep0":
+        """Pass 1 for `proposer`'s loaded draft.
+
+        The switch is explicit, so a draft or layout that cannot take the
+        path raises, and so does a failed build: falling back on one rank
+        would leave it on the single pass while its TP peers run the two
+        passes, and their collectives would not match.
+        """
+        runner = proposer.runner
+        reason = _layout_unsupported_reason(proposer, all_attn_layers)
+        if reason is not None:
+            raise NotImplementedError(
+                f"TPU_MTP_KV_ONLY_STEP0 is set, but {reason}. Unset it to keep "
+                "the single full draft step 0."
+            )
+        # A step 0 of at most the largest loop bucket is also a loop-step
+        # shape: the warmup's single-request specs at those sizes are what
+        # warm the draft at p = T, and the two passes would run it at a
+        # smaller p instead. Pass 2 at p ~ T would save nearly nothing there
+        # anyway.
+        min_tokens = proposer._max_loop_bucket() + 1
+        largest_bucket = max(runner.num_tokens_paddings)
+        if min_tokens > largest_bucket:
+            raise ValueError(
+                f"TPU_MTP_KV_ONLY_STEP0 is set, but no token bucket reaches its "
+                f"{min_tokens}-token gate (the largest is {largest_bucket}). Raise "
+                "max_num_batched_tokens above the largest draft loop bucket, or "
+                "unset it."
+            )
+        assert proposer.draft_model is not None
+        config = copy.copy(proposer.draft_vllm_config)
+        config.compilation_config = copy.copy(config.compilation_config)
+        config.compilation_config.compile_sizes = _sizes_at_or_above(
+            config.compilation_config.compile_sizes or (), min_tokens
+        )
+        with (
+            set_model_tag("eagle_head"),
+            set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=config),
+            set_current_vllm_config(config),
+        ):
+            model = MtpKvOnlyModel(
+                vllm_config=config,
+                prefix="mtp_prefill_kv_only",
+                mtp=proposer.draft_model,
+                mesh=runner.mesh,
+            )
+        logger.info(
+            "MTP draft step 0 of chunks with >= %d padded tokens and a prefill "
+            "span runs a KV-only pass over every row, then the full layer on "
+            "one row per request.",
+            min_tokens,
+        )
+        return cls(model, min_tokens, config)
+
+    def takes_two_pass(self, num_tokens: int, carries_prefill: bool) -> bool:
+        """Whether a step 0 of `num_tokens` padded tokens takes the two
+        passes; verify-only steps keep the single pass."""
+        return carries_prefill and num_tokens >= self.min_tokens
+
+    def set_compile_sizes(self, draft_sizes: Iterable[int | str]) -> None:
+        """Follow the draft's token buckets (the runner adds pipeline-chunk
+        buckets after load), keeping those at or above the gate."""
+        self.vllm_config.compilation_config.compile_sizes = _sizes_at_or_above(
+            draft_sizes, self.min_tokens
+        )
+
+    def precompile_gather_rows(self, proposer: "Eagle3Proposer") -> None:
+        """Warm pass 2's input gather (`_draft_gather_rows`) on every (T, p)
+        it can take: T a token bucket at or above the gate, p a loop bucket."""
+        runner = proposer.runner
+        max_loop_bucket = proposer._max_loop_bucket()
+        # p is always `_loop_bucket(num_reqs)`, a token padding below the gate.
+        idx_sizes = [t for t in runner.num_tokens_paddings if t <= max_loop_bucket]
+        hidden_size = proposer._draft_hidden_size()
+        with runner._precompile_timed("drafter two-pass gather_rows"):
+            for num_tokens in runner.num_tokens_paddings:
+                if num_tokens < self.min_tokens:
+                    continue
+                ids = torch.zeros(num_tokens, dtype=torch.int32).to(runner.device)
+                pos = torch.zeros(
+                    (3, num_tokens) if runner.uses_mrope else (num_tokens,),
+                    dtype=torch.int32,
+                ).to(runner.device)
+                hidden = torch.zeros(
+                    (num_tokens, hidden_size), dtype=runner._hidden_states_dtype
+                ).to(runner.device)
+                for p in idx_sizes:
+                    idx = torch.zeros(p, dtype=torch.int64).to(runner.device)
+                    synchronize_tensors(
+                        proposer._draft_gather_rows(ids, pos, hidden, idx)
+                    )

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -74,6 +75,16 @@ def dp_lockstep_num_reqs(dp_step_max_reqs: int, local_num_reqs: int) -> int:
         f"bound is {num_reqs}"
     )
     return num_reqs
+
+
+def schedules_prefill(
+    num_scheduled_tokens: Iterable[int], num_speculative_tokens: int
+) -> bool:
+    """Whether some request is scheduled more tokens than a verify step gives
+    it (1 + K), i.e. a prefill span. A verify-only step never is; a prefill
+    span of at most 1 + K tokens is not counted."""
+    counts = np.fromiter(num_scheduled_tokens, dtype=np.int64)
+    return bool(counts.max(initial=0) > 1 + num_speculative_tokens)
 
 
 @dataclass

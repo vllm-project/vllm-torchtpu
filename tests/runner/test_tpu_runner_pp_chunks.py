@@ -234,9 +234,6 @@ def test_chunk_buckets_reach_the_draft_compilation_config():
 
     runner = _bucket_runner([512, 1024, 2048, 4096], 4096, False, "none", pp=4, pcp=8)
     drafter = MagicMock(spec=Eagle3Proposer)
-    drafter.draft_vllm_config = SimpleNamespace(
-        compilation_config=SimpleNamespace(compile_sizes=[512, 1024, 2048, 4096])
-    )
     runner.drafter = drafter
     runner._add_pipeline_chunk_buckets()
     assert runner.num_tokens_paddings == [
@@ -249,9 +246,7 @@ def test_chunk_buckets_reach_the_draft_compilation_config():
         3584,
         4096,
     ]
-    assert drafter.draft_vllm_config.compilation_config.compile_sizes == (
-        runner.num_tokens_paddings
-    )
+    drafter.set_draft_compile_sizes.assert_called_once_with(runner.num_tokens_paddings)
     assert runner.vllm_config.compilation_config.compile_sizes == (
         runner.num_tokens_paddings
     )
@@ -264,6 +259,9 @@ def _draft_bucket_runner(draft_sizes):
     drafter = MagicMock(spec=Eagle3Proposer)
     drafter.draft_vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(compile_sizes=list(draft_sizes))
+    )
+    drafter.set_draft_compile_sizes.side_effect = lambda sizes: setattr(
+        drafter.draft_vllm_config.compilation_config, "compile_sizes", list(sizes)
     )
     runner.drafter = drafter
     runner._check_draft_buckets = TPUModelRunner._check_draft_buckets.__get__(runner)

@@ -209,6 +209,7 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    TPU_MTP_KV_ONLY_STEP0: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -1285,6 +1286,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # MTP draft (DeepSeek-V3.2 / GLM-5.2 DSA): draft step 0 of a chunk that
+    # carries a prefill span and is padded above the largest draft loop bucket
+    # runs in two passes. Pass 1 only writes the MTP layer's KV and indexer-K
+    # caches for every row; pass 2 runs the full layer on one row per request,
+    # the only rows a draft token is read from. That skips the indexer, sparse
+    # attention, MoE and DCP merge of every other row
+    # (spec_decode/mtp_kv_only.py). Off by default.
+    # TODO: derive where the two passes start to pay off from the padded chunk
+    #   size T and the loop bucket p (or a tuned table) once it is measured,
+    #   then make this the default for the drafts that support it.
+    # TODO: take the two passes under EP-DP lockstep too: the idle ranks'
+    #   replay of a peer's draft trace (run_dp_dummy_draft) has to run pass 1
+    #   and pass 2 where the busy ranks do.
+    "TPU_MTP_KV_ONLY_STEP0": env_bool("TPU_MTP_KV_ONLY_STEP0"),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has
