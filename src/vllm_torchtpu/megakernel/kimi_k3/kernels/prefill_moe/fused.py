@@ -653,18 +653,16 @@ def _latent_gather_steps(
     seed.wait()
 
 
-def _latent_ready_init(
-    tables, payload, output, send, recv, stores, state, meta, *, rank, stride, offset
-):
-    """Seed twelve independently progressing streams of a 256-row latent gather.
+def _latent_ready_init(tables, payload, output, send, recv, stores, state, meta, *, rank):
+    """Seed twelve independently progressing streams of a latent gather.
 
-    Rank r's rows land at ``r * stride + offset`` of ``output`` (``stride``
-    rows per rank: 256, or 512 for a 16K window's two passes). Cache neighbor
-    IDs and owner row offsets in SMEM once. Each stream tracks its hop and
-    receive/forward/complete phase; state[0] counts active streams.
+    Rank r's ``rows`` payload rows (256 or 512) land at ``r * rows`` of
+    ``output``. Cache neighbor IDs and owner row offsets in SMEM once. Each
+    stream tracks its hop and receive/forward/complete phase; state[0] counts
+    active streams.
     """
     rows = payload.shape[0]
-    assert rows == 256
+    assert rows in (256, 512)
     for directed in range(6):
         family, direction = directed // 2, -1 if directed % 2 == 0 else 1
         position = tables[family, 0, rank]
@@ -674,9 +672,9 @@ def _latent_ready_init(
         @pl.loop(0, 32)
         def owners(step, *, family=family, position=position, direction=direction, directed=directed):
             owner = tables[family, 1, (position - direction * step) & 31]
-            meta[directed * 34 + 2 + step] = owner * stride + offset
+            meta[directed * 34 + 2 + step] = owner * rows
 
-    own = pl.ds(rank * stride + offset, rows)
+    own = pl.ds(rank * rows, rows)
     pltpu.make_async_copy(payload, output.at[own, :, :], stores).start()
     state[0] = 12
     begin = 0
@@ -685,7 +683,7 @@ def _latent_ready_init(
         part = pl.ds(begin, size)
         pltpu.make_async_remote_copy(
             payload.at[part, :, :],
-            output.at[pl.ds(rank * stride + offset + begin, size), :, :],
+            output.at[pl.ds(rank * rows + begin, size), :, :],
             send.at[stream],
             recv.at[0, stream],
             device_id=meta[(stream % 6) * 34],
@@ -697,8 +695,7 @@ def _latent_ready_init(
 
 
 def _latent_ready_progress(
-    payload, output, send, recv, credits, stores, state, meta, *, rank, stride,
-    offset, drain=False,
+    payload, output, send, recv, credits, stores, state, meta, *, rank, drain=False
 ):
     """Advance ready streams without blocking unrelated compute or streams.
 
@@ -783,7 +780,7 @@ def _latent_ready_progress(
             return i + 1
 
         jax.lax.while_loop(lambda i: state[0] != 0, body, jnp.int32(0))
-        own = pl.ds(rank * stride + offset, rows)
+        own = pl.ds(rank * rows, rows)
         pltpu.make_async_copy(payload, output.at[own, :, :], stores).wait()
     else:
 
@@ -828,13 +825,14 @@ def _prologue(
     routed-expert scratch is allocated.
 
     The dense work runs in passes of at most 256 rows (two for a 16K window's
-    512) over the caller's ``pair`` buffer (``[2 * pass rows, hidden]``, our
-    half at ``parity * pass rows``): each pass loads its rows from
-    ``sources[pass]`` (HBM; None when the caller has already put them in our
-    half), sends them to the peer for the shared experts, runs the
-    router/Top16 and the latent projection, starts its own latent ring and
-    runs the shared experts; the route exchange and the route metadata cover
-    every pass's routes and start after the last pass's Top16.
+    512) over the caller's ``pair`` buffer (``[passes, 2 * pass rows,
+    hidden]``, our half at ``parity * pass rows``): each pass loads its rows
+    from ``sources[pass]`` (HBM; None when the caller has already put them in
+    our half), sends them to the peer for the shared experts and runs the
+    router/Top16 and the latent projection. Then one latent ring carries every
+    pass's rows while the passes' shared experts run; the route exchange and
+    the route metadata cover every pass's routes and start after the last
+    pass's Top16.
     """
     hidden_size = router.shape[-2]
     passes = 2 if rows == 512 else 1
@@ -852,8 +850,9 @@ def _prologue(
     vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
 
     def body(s):
-        pair_v = pair
-        own = pair_v.at[pl.ds(parity * part, part), :]
+        def own(h):
+            return pair.at[h, pl.ds(parity * part, part), :]
+
         if big:
             buffers = tuple(s["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4))
             router_v = s["router_gu"].at[:, :896]
@@ -863,7 +862,7 @@ def _prologue(
         gate_sems, up_sems = s["gu_sems"][:2], s["gu_sems"][2:]
 
         def input_copy(h):
-            return pltpu.make_async_copy(sources[h], own, s["input_sem"])
+            return pltpu.make_async_copy(sources[h], own(h), s["input_sem"])
 
         # The router's VMEM doubles as the panel buffers: each pass reloads it.
         router_copy = pltpu.make_async_copy(router, router_v, s["gu_sems"][0])
@@ -900,33 +899,33 @@ def _prologue(
 
         gu_steps = down_steps = (2 if rows <= 128 else 5) * passes
         if _sorts_local_routes(rows * 32):
-            # The compaction (one step per 128 tokens) goes between the last
-            # pass's 24 GU products, the sort's steps between its 56 down
+            # The compaction (one step per 128 tokens) goes between the passes'
+            # 24 GU products each, the sort's steps between their 56 down
             # products, which have half their MXU work to hide under.
-            gu_steps, down_steps = -(-rows // 4 // 24), 2
+            gu_steps, down_steps = -(-rows // 4 // (24 * passes)), 1
 
-        rings = []  # big: each pass's 256-row latent ring, progressed together
+        rings = []  # big: the latent ring of every pass's rows, once started
 
-        def ring(h):
-            payload = s["latent_payload"].at[h]
+        def ring():
             refs = (
-                s["latent_send_sems"][h],
-                s["latent_recv_sems"][h],
-                s["latent_credits"][h],
-                s["latent_stores"][h],
-                s["latent_state"][h],
-                s["latent_meta"][h],
+                s["latent_payload"],
+                s["latent_send_sems"],
+                s["latent_recv_sems"],
+                s["latent_credits"],
+                s["latent_stores"],
+                s["latent_state"],
+                s["latent_meta"],
             )
-            send, recv, credits, stores, state, meta = refs
+            payload, send, recv, credits, stores, state, meta = refs
             _latent_ready_init(
                 tables, payload, latent_hbm, send, recv, stores, state, meta,
-                rank=rank, stride=rows, offset=h * part,
+                rank=rank,
             )
 
             def progress(drain):
                 _latent_ready_progress(
                     payload, latent_hbm, send, recv, credits, stores, state, meta,
-                    rank=rank, stride=rows, offset=h * part, drain=drain,
+                    rank=rank, drain=drain,
                 )
 
             rings.append(progress)
@@ -958,7 +957,20 @@ def _prologue(
                 s["down_sems"][panel % 2],
             )
 
-        for h in range(passes):
+        def peer_input(h):
+            return pltpu.make_async_remote_copy(
+                own(h),
+                own(h),
+                s["peer_send"][h],
+                s["peer_recv"][h],
+                device_id=peer,
+                device_id_type=pl.DeviceIdType.LOGICAL,
+            )
+
+        def front(h):
+            """Pass ``h``'s rows to the peer, router/Top16, latent projection
+            and latent ring; after the last pass, the route exchange."""
+            nonlocal route_steps, route_started, latent_steps
             last = h == passes - 1
             scope = _phase_start("m_input")
             if h:
@@ -971,21 +983,13 @@ def _prologue(
             if sources[h] is not None:
                 input_copy(h).wait()
             pl.semaphore_wait(s["peer_credit"], 1)
-            peer_input = pltpu.make_async_remote_copy(
-                own,
-                own,
-                s["peer_send"],
-                s["peer_recv"],
-                device_id=peer,
-                device_id_type=pl.DeviceIdType.LOGICAL,
-            )
-            peer_input.start()
+            peer_input(h).start()
             router_copy.wait()
             if not h:
                 bias_copy.wait()
             _phase_end(scope)
             scope = _phase_start("m_router")
-            hx = own[...]
+            hx = own(h)[...]
             logits = jnp.matmul(hx, router_v[...], preferred_element_type=jnp.float32)
             top = _Top16(logits, s["bias"][...])
             _phase_end(scope)
@@ -1018,9 +1022,9 @@ def _prologue(
                         # Assemble both halves before writing their packed words.
                         assert first_half is not None
                         paired = jnp.concatenate((first_half, fragment), axis=1)
-                        s["latent_payload"][h, :, :, pl.ds(col - 1792, 256)] = (
-                            paired.reshape(part, 2, 256)
-                        )
+                        s["latent_payload"][
+                            pl.ds(h * part, part), :, pl.ds(col - 1792, 256)
+                        ] = paired.reshape(part, 2, 256)
                 else:
                     s["latent"][:, pl.ds(col, 256)] = product.astype(jnp.bfloat16)
                 for _ in range(min(2, 16 - top.index)):
@@ -1053,6 +1057,8 @@ def _prologue(
                         next(route_steps, None)
                         route_started = True
             _phase_end(scope)
+            if big and last:
+                ring()
             if last:
                 for _ in route_steps:
                     pass
@@ -1070,15 +1076,17 @@ def _prologue(
                     s["latent_stores"],
                     rank=rank,
                 )
+
+        def back(h):
+            """Pass ``h``'s shared experts."""
+            pair_v = pair.at[h]
             with _phase("m_peer_wait"):
-                peer_input.wait_send()
-                peer_input.wait_recv()
+                peer_input(h).wait_send()
+                peer_input(h).wait_recv()
 
             scope = _phase_start("m_shared_gu")
             gu_copy(0, 0, gate_buffers, gate_sems).start()
             gu_copy(0, 3072, up_buffers, up_sems).start()
-            if big:
-                ring(h)
             for panel in range(12):
                 if not big:
                     latent_progress()
@@ -1163,6 +1171,14 @@ def _prologue(
             for panel in (26, 27):
                 shared_store(panel).wait()
             _phase_end(scope)
+
+        # The latent ring of every pass's rows starts before the first shared
+        # expert.
+        for h in range(passes):
+            front(h)
+        for h in range(passes):
+            back(h)
+
         if big:
             with _phase("m_metadata_tail"):
                 for _ in metadata_steps:
@@ -1178,7 +1194,6 @@ def _prologue(
                 for _ in metadata_steps:
                     pass
 
-    ring_count = passes if big else 1
     scratch = dict(
         router=vmem((hidden_size, 896), jnp.bfloat16) if not big else None,
         router_gu=vmem((hidden_size, 1024), jnp.bfloat16) if big else None,
@@ -1188,8 +1203,8 @@ def _prologue(
         gu_sems=tuple(dma for _ in range(4)),
         bias=vmem((1, 896), jnp.float32),
         input_sem=dma if any(source is not None for source in sources) else None,
-        peer_send=dma,
-        peer_recv=dma,
+        peer_send=tuple(dma for _ in range(passes)),
+        peer_recv=tuple(dma for _ in range(passes)),
         peer_credit=pltpu.SemaphoreType.REGULAR,
         latent=vmem((rows, 3584), jnp.bfloat16) if not big else None,
         route_payload=vmem((rows // 4, 128), jnp.int32),
@@ -1198,24 +1213,14 @@ def _prologue(
         route_recv=dma((5,)),
         keys=vmem((_sort_rows(rows * 32), 128), jnp.int32),
         tallies=vmem((counts.shape[0] + 896 // counts.shape[0], 8, 128), jnp.int32),
-        latent_payload=vmem((passes, part, 2, 1792), jnp.bfloat16)
-        if big
-        else vmem((rows, 2, 1792), jnp.bfloat16),
+        latent_payload=vmem((rows, 2, 1792), jnp.bfloat16),
         latent_recv=vmem((2, rows, 2, 1792), jnp.bfloat16) if not big else None,
-        latent_state=tuple(pltpu.SMEM((25,), jnp.int32) for _ in range(ring_count))
-        if big
-        else None,
-        latent_meta=tuple(pltpu.SMEM((6 * 34,), jnp.int32) for _ in range(ring_count))
-        if big
-        else None,
-        latent_send_sems=tuple(dma((12,)) for _ in range(ring_count)) if big else dma((12,)),
-        latent_recv_sems=tuple(dma((2, 12)) for _ in range(ring_count))
-        if big
-        else dma((2, 12)),
-        latent_credits=tuple(pltpu.SemaphoreType.REGULAR((12,)) for _ in range(ring_count))
-        if big
-        else pltpu.SemaphoreType.REGULAR((12,)),
-        latent_stores=tuple(dma for _ in range(ring_count)) if big else dma((12,)),
+        latent_state=pltpu.SMEM((25,), jnp.int32) if big else None,
+        latent_meta=pltpu.SMEM((6 * 34,), jnp.int32) if big else None,
+        latent_send_sems=dma((12,)),
+        latent_recv_sems=dma((2, 12)),
+        latent_credits=pltpu.SemaphoreType.REGULAR((12,)),
+        latent_stores=dma if big else dma((12,)),
         middle=vmem((2 * part, 3072), jnp.bfloat16),
         down_buffers=tuple(vmem((3072, 256), jnp.bfloat16) for _ in range(2)),
         down_sems=(dma, dma),
@@ -2465,23 +2470,15 @@ def _layer_kernel(
     if mixture_refs is not None:
         blocks_ref, mlp_res_ref, ffn_norm_ref = mixture_refs
         mix_tile = min(128, part)
-        # Pass 0 is mixed into the prologue's VMEM rows; later passes into their
-        # rows of ``output`` (free until their shared experts), which the
-        # prologue then loads, so no mixture scratch lives inside the prologue.
-        sources = (None,) + tuple(
-            output.at[pl.ds(h * part, part)] for h in range(1, passes)
-        )
+        # Every pass is mixed into its rows of the prologue's VMEM pair buffer,
+        # so no mixture scratch lives inside the prologue.
+        sources = (None,) * passes
 
-        def mixture(h, *, own=None, hbm=None):
-            """Residual mixture + RMSNorm of pass ``h``'s rows into VMEM ``own``
-            or HBM ``hbm``."""
+        def mixture(h, own):
+            """Residual mixture + RMSNorm of pass ``h``'s rows into VMEM ``own``."""
             rows_h = pl.ds(h * part, part)
-            store = hbm is not None
 
             def run(*mix_s):
-                mix_s = list(mix_s)
-                output_bufs = mix_s.pop(2) if store else None
-                output_sems = mix_s.pop(-2) if store else None
                 (
                     prefix_bufs,
                     block_buf,
@@ -2500,10 +2497,10 @@ def _layer_kernel(
                     blocks_ref.at[:, rows_h],
                     mlp_res_ref,
                     ffn_norm_ref,
-                    hbm,
+                    None,
                     prefix_bufs,
                     block_buf,
-                    output_bufs,
+                    None,
                     numerator_buf,
                     row_max_buf,
                     row_sum_buf,
@@ -2511,7 +2508,7 @@ def _layer_kernel(
                     norm_buf,
                     prefix_sems,
                     block_sem,
-                    output_sems,
+                    None,
                     weight_sems,
                     tile=mix_tile,
                     eps=1e-5,
@@ -2521,7 +2518,7 @@ def _layer_kernel(
             pl.run_scoped(
                 run,
                 *k.mixture_norm_tiled_scratch_shapes(
-                    hidden_size, mix_tile, store_output=store
+                    hidden_size, mix_tile, store_output=False
                 ),
             )
 
@@ -2562,9 +2559,8 @@ def _layer_kernel(
             if mixture is not None:
                 scope = _phase_start("m_mixture")
                 parity = jax.lax.axis_index("k3_sp") % 2
-                mixture(0, own=pair.at[pl.ds(parity * part, part), :])
-                for h in range(1, passes):
-                    mixture(h, hbm=sources[h])
+                for h in range(passes):
+                    mixture(h, pair.at[h, pl.ds(parity * part, part), :])
                 _phase_end(scope)
             scope = _phase_start("m_prologue")
             _prologue(
@@ -2615,7 +2611,7 @@ def _layer_kernel(
                 probability_copy(probs_v).wait()
             _phase_end(scope)
 
-        pair = vmem((2 * part, hidden_size), jnp.bfloat16)
+        pair = vmem((passes, 2 * part, hidden_size), jnp.bfloat16)
         if compact:
             # The compact path completes both metadata DMAs before expert work.
             # Reclaim the full probability array for expert scratch.
