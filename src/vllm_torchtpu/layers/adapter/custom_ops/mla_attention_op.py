@@ -19,6 +19,7 @@ from typing import Any, cast
 import jax
 import jax.numpy as jnp
 import torch
+from jax.sharding import PartitionSpec as P
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
@@ -71,6 +72,10 @@ from vllm_torchtpu.layers.adapter.attention import (
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core import turboquant
+from vllm_torchtpu.layers.core.attention_interface import (
+    sparse_mla_cache_partition_spec,
+    sparse_mla_write_kv_shard,
+)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger
@@ -993,6 +998,21 @@ class VllmTPUIndexer(Indexer):
         )
         return k_pe, k_nope, weights
 
+    def k_packed(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor, rotary_emb
+    ) -> torch.Tensor:
+        """The packed fp8 + e8m0 K rows `forward` hands the indexer op to
+        write into the indexer cache, without the q path (`MlaKvWriteOp`).
+        k_pe is rotated alone, as in
+        `VllmTPUMultiHeadLatentAttentionWrapper.kv_latents`."""
+        k_pe, k_nope, _ = self._project_k(hidden_states)
+        k_pe = k_pe.unsqueeze(1)
+        _, k_pe = rotary_emb(positions, k_pe.clone(), k_pe)
+        assert k_pe is not None
+        k_pe = k_pe.reshape(-1, 1, self.rope_dim)
+        k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+        return VllmTPUSparseAttnIndexer.pack_k(k)
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
@@ -1417,6 +1437,28 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         return self.kv_a_layernorm(kv_c), k_pe
 
+    def kv_latents(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(kv_c_normed, k_pe)` exactly as `forward` hands them to the MLA
+        attention, without the q path (`MlaKvWriteOp`).
+
+        The q columns of `fused_qkv_a_proj` are computed and dropped, as in
+        `forward`. The rope is applied to k_pe alone: it doubles as the query
+        argument through a copy whose result is dropped, and a rope's key
+        output does not depend on the query.
+        """
+        assert self.kimi_preprocess is None, "the Kimi fused preprocess has no k path"
+        _, kv_lora, _ = self._project_qkv_a(hidden_states)
+        kv_c_normed, k_pe = self._split_kv_lora(kv_lora)
+        k_pe = k_pe.unsqueeze(1)
+        if self.rotary_emb is not None:
+            k_pe_dtype = k_pe.dtype
+            _, k_pe = self.rotary_emb(positions, k_pe.clone(), k_pe)
+            assert k_pe is not None
+            k_pe = k_pe.to(dtype=k_pe_dtype)
+        return kv_c_normed, k_pe
+
     def _q_proj_layer(self):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
@@ -1541,6 +1583,276 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
 
 VllmMultiHeadLatentAttentionWrapper = VllmTPUMultiHeadLatentAttentionWrapper
+
+
+def mla_kv_write_caches(
+    nope: jax.Array,
+    rope: jax.Array,
+    idx_cache: jax.Array,
+    kv_c: jax.Array,
+    k_pe: jax.Array,
+    k_packed: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    qsl: jax.Array,
+    idx_seq_lens: jax.Array,
+    idx_pages: jax.Array,
+    idx_cu: jax.Array,
+    *,
+    mla_kv_spec: tuple[Any, Any],
+    mesh: Any,
+    kv_cache_mode: str | None,
+    dcp_size: int = 1,
+    interleave_size: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Write one step's MLA latents and indexer-K rows, without the attention.
+
+    Takes global arrays: the caches are replicated, or sharded over the DCP
+    axis when `dcp_size > 1`; the rows and the metadata are replicated.
+
+    The MLA half is the `sparse_mla_write_kv_shard` step that
+    `sparse_mla_attention` / `sparse_mla_attention_dcp` run, in a shard_map
+    with the same cache partition spec. The indexer half is the writer the
+    indexer's top-k op runs (`indexer_k_append`, or `_cp_scatter_indexer_k`
+    under DCP), with the same writer / layout resolution for
+    `kv_cache_mode`.
+    """
+    nope_spec, rope_spec = mla_kv_spec
+    cache_spec = sparse_mla_cache_partition_spec(dcp_size)
+
+    def _local(nope_, rope_, kv_c_, k_pe_, sl_, bt_, qsl_):
+        return sparse_mla_write_kv_shard(
+            nope_,
+            rope_,
+            kv_c_,
+            k_pe_,
+            sl_,
+            bt_,
+            qsl_,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+
+    nope, rope = jax.jit(
+        jax.shard_map(
+            _local,
+            mesh=mesh,
+            in_specs=(
+                cache_spec,
+                cache_spec,
+                P(None, None),
+                P(None, None),
+                P(None),
+                P(None),
+                P(None),
+            ),
+            out_specs=(cache_spec, cache_spec),
+            check_vma=False,
+        )
+    )(nope, rope, kv_c, k_pe, seq_lens, block_tables, qsl)
+    writer, kv_layout = _resolve_indexer_kv_cache_mode(
+        idx_cache, k_packed, mode=kv_cache_mode
+    )
+    if dcp_size > 1:
+        idx_cache = _cp_scatter_indexer_k(
+            idx_cache,
+            k_packed,
+            idx_seq_lens,
+            idx_pages,
+            idx_cu,
+            mesh=mesh,
+            cp_size=dcp_size,
+            interleave_size=interleave_size,
+            axis_name=DCP_AXIS_NAME,
+            writer=writer,
+            kv_layout=kv_layout,
+        )
+    else:
+        idx_cache = indexer_k_append(
+            idx_cache,
+            k_packed,
+            idx_seq_lens,
+            idx_pages,
+            idx_cu,
+            writer=writer,
+            kv_layout=kv_layout,
+        )
+    return nope, rope, idx_cache
+
+
+class MlaKvWriteOp:
+    """Writes one sparse MLA layer's KV and indexer-K rows, nothing else.
+
+    For a pass over rows whose attention output nobody reads. The latents come
+    from the wrapper's and indexer's own projections (`kv_latents`,
+    `k_packed`) and the attention impl's `_quantized_kv_latents`, and both
+    writers are the ones the full pass uses, inside the same partition specs:
+    under DCP the caches are sharded over the DCP axis and the rows are
+    replicated, and each rank keeps only the rows it owns.
+
+    Built eagerly at load (Dynamo cannot trace an op's construction).
+    """
+
+    def __init__(self, wrapper: VllmTPUMultiHeadLatentAttentionWrapper, mesh: Any):
+        self.wrapper = wrapper
+        # `mla_kv_spec` is attached when the caches are allocated, so the MLA
+        # layer is read as `Any`, as `_build_sparse_mla_op` reads it.
+        mla_layer: Any = wrapper.mla_attn
+        self.mla_layer = mla_layer
+        assert isinstance(wrapper.indexer, VllmTPUIndexer)
+        self.indexer = wrapper.indexer
+        indexer_op = self.indexer.indexer_op
+        if not isinstance(indexer_op, VllmTPUSparseAttnIndexer):
+            raise TypeError(
+                f"MLA KV write: expected a VllmTPUSparseAttnIndexer, got "
+                f"{type(indexer_op).__name__}"
+            )
+        self.indexer_op = indexer_op
+        impl = mla_layer.impl
+        if not isinstance(impl, PallasMLAttentionBackendImpl):
+            raise TypeError(
+                f"MLA KV write: expected a PallasMLAttentionBackendImpl, got "
+                f"{type(impl).__name__}"
+            )
+        self.impl = impl
+        # Paths whose writes this op does not mirror: refuse them at load
+        # rather than write rows the full pass would place differently.
+        if wrapper.kimi_preprocess is not None:
+            raise NotImplementedError(
+                "MLA KV write: the Kimi fused preprocess has no k-only path"
+            )
+        dcp_size = impl.dcp_size
+        if indexer_op.dcp_size != dcp_size:
+            raise ValueError(
+                "the MLA and indexer caches disagree on the DCP size: "
+                f"{dcp_size} vs {indexer_op.dcp_size}"
+            )
+        self.dcp_size = dcp_size
+        # The indexer op's own mode, so both writers of its cache agree.
+        kv_cache_mode = indexer_op.kv_cache_mode
+        interleave_size = 1
+        write_mesh = mesh
+        if dcp_size > 1:
+            # The indexer's DCP op takes the same parallel-config interleave.
+            interleave_size = impl.dcp_interleave_size
+            write_mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
+        name = mla_layer.layer_name.replace(".", "_")
+
+        # Fixed arity: torch custom-op schemas take no varargs.
+        def _write_jax(
+            nope: jax.Array,
+            rope: jax.Array,
+            idx_cache: jax.Array,
+            kv_c: jax.Array,
+            k_pe: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            qsl: jax.Array,
+            idx_seq_lens: jax.Array,
+            idx_pages: jax.Array,
+            idx_cu: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return mla_kv_write_caches(
+                nope,
+                rope,
+                idx_cache,
+                kv_c,
+                k_pe,
+                k_packed,
+                seq_lens,
+                block_tables,
+                qsl,
+                idx_seq_lens,
+                idx_pages,
+                idx_cu,
+                # Recorded when the caches are allocated, after this op is
+                # built, so it is read at trace time.
+                mla_kv_spec=mla_layer.mla_kv_spec,
+                mesh=write_mesh,
+                kv_cache_mode=kv_cache_mode,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+            )
+
+        def _fake(nope, rope, idx_cache, *rest):
+            del rest
+            return (
+                torch.empty_like(nope),
+                torch.empty_like(rope),
+                torch.empty_like(idx_cache),
+            )
+
+        if dcp_size > 1:
+            cache_spec = sparse_mla_cache_partition_spec(dcp_size)
+            idx_cache_spec = P(DCP_AXIS_NAME)
+            self.jax_op = pcp_streaming_jax_op(
+                f"pallas::mla_kv_write_dcp_{name}",
+                _write_jax,
+                donate_argnums=(0, 1, 2),
+                mesh=write_mesh,
+                input_partition_specs=(cache_spec, cache_spec, idx_cache_spec)
+                + (P(),) * 9,
+                output_partition_specs=(cache_spec, cache_spec, idx_cache_spec),
+            )
+        else:
+            self.jax_op = pallas.jax_op(
+                f"pallas::mla_kv_write_{name}", _write_jax, donate_argnums=(0, 1, 2)
+            )
+        self.jax_op.register_fake(_fake)
+
+    def __call__(self, positions: torch.Tensor, hidden_states: torch.Tensor):
+        """Write this step's rows; returns k_pe (the program needs an output)."""
+        wrapper, layer = self.wrapper, self.mla_layer
+        kv_c_normed, k_pe = wrapper.kv_latents(positions, hidden_states)
+        k_packed = self.indexer.k_packed(
+            hidden_states, positions, wrapper.indexer_rope_emb
+        )
+
+        md, _, kv_cache, _ = get_attention_context(layer.layer_name)
+        fwd_md = get_forward_context().attn_metadata
+        idx_prefix = self.indexer_op.k_cache.prefix
+        idx_md = fwd_md.get(idx_prefix) if isinstance(fwd_md, dict) else None
+        idx_cache = self.indexer_op.k_cache.kv_cache
+        # A program traced without bound caches or metadata would never
+        # write, and readers of these rows would get stale entries; once
+        # traced, the guards that would retrace it may be gone. Refuse
+        # instead.
+        if not isinstance(kv_cache, (tuple, list)) or idx_cache.numel() == 0:
+            raise RuntimeError(
+                f"MLA KV write: the caches of {layer.layer_name!r} or "
+                f"{idx_prefix!r} are not bound"
+            )
+        if not isinstance(md, AttentionMetadata) or not isinstance(
+            idx_md, AttentionMetadata
+        ):
+            raise RuntimeError(
+                "MLA KV write: no attention metadata for "
+                f"{layer.layer_name!r} or {idx_prefix!r}"
+            )
+
+        kv_c_flat, k_pe_flat = self.impl._quantized_kv_latents(layer, kv_c_normed, k_pe)
+        nope, rope = kv_cache
+        new_nope, new_rope, new_idx = self.jax_op(
+            nope,
+            rope,
+            idx_cache,
+            kv_c_flat,
+            k_pe_flat,
+            k_packed,
+            md.seq_lens,
+            md.block_tables,
+            md.query_start_loc,
+            idx_md.seq_lens,
+            idx_md.block_tables,
+            idx_md.query_start_loc,
+        )
+        nope.copy_(new_nope)
+        rope.copy_(new_rope)
+        idx_cache.copy_(new_idx)
+        return k_pe
 
 
 @DeepseekScalingRotaryEmbedding.register_oot
