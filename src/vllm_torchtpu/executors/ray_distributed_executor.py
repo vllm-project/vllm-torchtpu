@@ -37,7 +37,7 @@ from vllm.v1.executor.ray_utils import RayWorkerWrapper as RayWorkerWrapperV1
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
+from vllm_torchtpu.distributed.utils import set_node_kv_ip_port, slicebuilder_address
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
 from vllm_torchtpu.runner.tpu_runner import AsyncTPUModelRunnerOutput
@@ -401,7 +401,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         base_port = tpu_envs.TORCH_TPU_BASE_PORT
         for ip in sorted(host_workers.keys()):
             for i in range(len(host_workers[ip])):
-                sb_addresses.append(f"{ip}:{base_port + i}")
+                sb_addresses.append(slicebuilder_address(ip, base_port + i))
 
         os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
         logger.info(

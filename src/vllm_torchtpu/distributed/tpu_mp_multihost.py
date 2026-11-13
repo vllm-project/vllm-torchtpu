@@ -19,9 +19,9 @@ each:
 In both cases TorchTPU needs a handful of env vars describing the *whole*
 multi-host ICI mesh before local workers are forked:
 
-  * TORCH_TPU_SLICEBUILDER_ADDRESSES - "ip:port" for every worker on every
-    host, ordered by increasing global rank, so all torch_tpu processes in
-    the mesh can find each other. Mirrors the address list
+  * TORCH_TPU_SLICEBUILDER_ADDRESSES - "host:port" (an IPv6 host by name) for
+    every worker on every host, ordered by increasing global rank, so all
+    torch_tpu processes in the mesh can find each other. Mirrors the address list
     ray_distributed_executor.py builds for the Ray backend.
   * TORCH_TPU_TOPOLOGY - ICI mesh shape for the full chip count, looked up
     the same way the Ray backend does (get_tpu_multihost_topology).
@@ -57,6 +57,7 @@ import torch.distributed as dist
 from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.utils import slicebuilder_address
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -160,7 +161,7 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     # ordered by (host, local_rank), spanning every host in the slice.
     base_port = envs.TORCH_TPU_BASE_PORT
     sb_addresses = [
-        f"{ip}:{base_port + local_rank}"
+        slicebuilder_address(ip, base_port + local_rank)
         for ip in host_ips
         for local_rank in range(local_world_size)
     ]
@@ -266,7 +267,7 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     local_chip_count = world_size * dp_size_local
     base_port = envs.TORCH_TPU_BASE_PORT
     sb_addresses = [
-        f"{ip}:{base_port + local_slot}"
+        slicebuilder_address(ip, base_port + local_slot)
         for ip in host_ips
         for local_slot in range(local_chip_count)
     ]

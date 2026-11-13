@@ -191,6 +191,41 @@ def test_dp_bootstrap_sets_slice_and_reapplies_master_ports(
     assert rendezvous.call_count == 1
 
 
+@pytest.mark.parametrize("resolvable", [True, False])
+def test_dp_bootstrap_passes_ipv6_hosts_by_name(monkeypatch, bootstrap, resolvable):
+    # IPv6-only hosts (Exos linked runners): torch_tpu takes host:port with a
+    # name or IPv4 address, so an IPv6 host goes by the name /etc/hosts gives
+    # it, and only without one in brackets.
+    import socket
+
+    from vllm_torchtpu.distributed import utils as dist_utils
+
+    names = {"2002:a05::1": "host-0", "2002:a05::2": "host-1"}
+
+    def getnameinfo(sockaddr, flags):
+        assert flags == socket.NI_NAMEREQD
+        if not resolvable:
+            raise socket.gaierror("no name")
+        return names[sockaddr[0]], "0"
+
+    monkeypatch.setattr(dist_utils.socket, "getnameinfo", getnameinfo)
+    rendezvous, _ = bootstrap
+    rendezvous.return_value = (list(names), "session")
+    config = SimpleNamespace(
+        data_parallel_size=4,
+        data_parallel_size_local=2,
+        data_parallel_rank=0,
+        data_parallel_rpc_port=9000,
+        data_parallel_master_ip="2002:a05::1",
+        world_size=1,
+    )
+    assert mp.prepare_mp_multihost_dp_env(config, 4)
+    hosts = list(names.values()) if resolvable else [f"[{ip}]" for ip in names]
+    assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == ",".join(
+        f"{h}:{p}" for h in hosts for p in (8070, 8071)
+    )
+
+
 def test_failed_bootstrap_can_retry(bootstrap):
     rendezvous, topology = bootstrap
     rendezvous.side_effect = RuntimeError("peer timeout")

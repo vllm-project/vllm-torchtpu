@@ -1,4 +1,6 @@
-from vllm.utils.network_utils import get_ip
+import socket
+
+from vllm.utils.network_utils import get_ip, is_valid_ipv6_address, join_host_port
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
@@ -298,3 +300,21 @@ def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> 
             logger.info("Configured TPU Raiden C++ telemetry backends")
     except Exception as e:
         logger.warning("Failed to configure TPU Raiden C++ telemetry: %s", e)
+
+
+def slicebuilder_address(host: str, port: int) -> str:
+    """One TORCH_TPU_SLICEBUILDER_ADDRESSES entry, ``host:port``.
+
+    torch_tpu's create_process_group() parses each entry as host:port and
+    accepts a name or an IPv4 address, but no IPv6 literal, bracketed or not.
+    An IPv6 host (IPv6-only hosts such as Exos linked TPU runners) is passed by
+    the name it reverse-resolves to (their /etc/hosts lists every slice peer);
+    only when it has none is the bracketed form used.
+    """
+    if is_valid_ipv6_address(host):
+        try:
+            name, _ = socket.getnameinfo((host, 0), socket.NI_NAMEREQD)
+            return f"{name}:{port}"
+        except OSError:
+            return join_host_port(host, port)
+    return f"{host}:{port}"
