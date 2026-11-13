@@ -23,13 +23,18 @@ from vllm_torchtpu.kernels.qwen4_exp.indexer_components import InRowKeyReader
 
 RATIO = 4
 W = 256
-ON_TPU = jax.default_backend() == "tpu"
+
+
+def on_tpu() -> bool:
+    # Called inside tests only: probing the backend at import claims the TPU
+    # (tests/conftest.py refuses that).
+    return jax.default_backend() == "tpu"
 
 
 @pytest.fixture
 def interpret(monkeypatch):
     """The Pallas writers and readers in interpret mode, off TPU."""
-    if ON_TPU:
+    if on_tpu():
         yield
         return
     original = pl.pallas_call
@@ -200,12 +205,13 @@ def test_inrow_pooled_step_lowers(variant, tokens, monkeypatch):
     assert "tpu_custom_call" in text
 
 
-@pytest.mark.skipif(not ON_TPU, reason="StreamIndex top-k runs on TPU only")
 @pytest.mark.parametrize("variant", ["u32", "bf16"])
 @pytest.mark.parametrize("seq", [700, 5000])
 def test_inrow_selection_matches_plain_pages(variant, seq, monkeypatch):
     """select_blocks over in-row keys picks what it picks over the same keys
     in pages of their own (one query per request, a decode step)."""
+    if not on_tpu():
+        pytest.skip("StreamIndex top-k runs on TPU only")
     monkeypatch.setenv("VLLM_TPU_QSA_INROW_READ", variant)
     block, span, req_n = 512, 4, 2
     rng = np.random.default_rng(seq)
