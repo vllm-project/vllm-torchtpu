@@ -811,16 +811,6 @@
       "concise_description": "Class member `VllmGatedDeltaNetAttention.get_state_shape` overrides parent class `QwenGatedDeltaNetAttention` in an inconsistent manner"
     },
     {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/gdn_attention_op.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `Tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/gdn_attention_op.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `Tensor`"
-    },
-    {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
       "name": "bad-override",
       "concise_description": "Class member `VllmTPUSparseAttnIndexer.forward_oot` overrides parent class `SparseAttnIndexer` in an inconsistent manner"
