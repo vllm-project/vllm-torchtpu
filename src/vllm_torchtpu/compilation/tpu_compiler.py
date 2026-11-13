@@ -1025,3 +1025,23 @@ class TpuCompilerAdaptor(CompilerInterface):
         if size is not None:
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn
+
+
+def agree_all_ranks(ok: bool) -> bool:
+    """True only if every rank passes `ok` (a MIN all-reduce on the world CPU
+    group). Lets the ranks fail a rank-dependent compile together."""
+    import torch.distributed as dist
+
+    if (
+        not (dist.is_available() and dist.is_initialized())
+        or dist.get_world_size() == 1
+    ):
+        return ok
+    group = None
+    with contextlib.suppress(Exception):
+        from vllm.distributed.parallel_state import get_world_group
+
+        group = get_world_group().cpu_group
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    return bool(flag.item())

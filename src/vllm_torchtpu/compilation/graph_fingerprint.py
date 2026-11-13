@@ -136,12 +136,47 @@ def _normalized_module_code(
             node.kwargs = orig_kwargs
 
 
+# Ops whose result depends on the calling rank even though the traced code is
+# the same on every rank (sequence_parallel_chunk keeps this rank's shard): a
+# graph calling one is never replayed across ranks.
+_RANK_DEPENDENT_OPS: set[str] = {"sequence_parallel_chunk"}
+
+
+def mark_rank_dependent(op_fragment: str) -> None:
+    """Never replay a graph whose code mentions `op_fragment` across ranks."""
+    _RANK_DEPENDENT_OPS.add(op_fragment)
+
+
+def _rank_salt(code: str) -> str:
+    if not any(fragment in code for fragment in _RANK_DEPENDENT_OPS):
+        return ""
+    import torch.distributed as dist
+
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    return f"\nrank-dependent:{rank}"
+
+
+def graph_is_rank_dependent(graph: fx.GraphModule) -> bool:
+    """Whether `graph` (or a submodule) calls a rank-dependent op: its
+    fingerprint is salted with the rank, so no peer ever replays its artifacts
+    and waiting for a peer's is pointless."""
+    try:
+        return any(
+            _rank_salt(module.code)
+            for _, module in graph.named_modules()
+            if isinstance(module, fx.GraphModule)
+        )
+    except Exception:
+        return False
+
+
 def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
     """Hash of the code of `graph` and its submodules and of their constants.
 
     Two ranks with the same fingerprint traced the same program, so either can
     replay the other's artifact. A rank-dependent value baked into the graph,
-    e.g. a Python int from `rank_in_group`, changes the code and so the hash.
+    e.g. a Python int from `rank_in_group`, changes the code and so the hash;
+    a call to a rank-dependent op (`_RANK_DEPENDENT_OPS`) salts it with the rank.
     Rank-local `c10d` `group_name` identifiers on symmetric subgroup collectives
     are canonicalized via `_normalized_module_code` because TorchTPU lowers
     symmetric subgroup collectives into global SPMD HLO covering all partitions.
@@ -155,9 +190,8 @@ def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
         for name, module in graph.named_modules():
             if not isinstance(module, fx.GraphModule):
                 continue
-            h.update(
-                f"{name}\n{_normalized_module_code(module, canonical_by_raw)}".encode()
-            )
+            code = _normalized_module_code(module, canonical_by_raw)
+            h.update(f"{name}\n{code}{_rank_salt(module.code)}".encode())
             for node in module.graph.nodes:
                 if node.op != "get_attr":
                     continue
