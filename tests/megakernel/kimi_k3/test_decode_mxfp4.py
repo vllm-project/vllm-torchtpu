@@ -8,6 +8,8 @@ comparison does not depend on the order in which a backend accumulates a
 product's contraction (the CPU's dot reorders it with the operand shapes).
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -72,7 +74,8 @@ def test_scaled_block_sum_keeps_the_block_order(rows, blocks):
     spread = np.exp2(rng.integers(-24, 24, (rows, blocks, 256)))
     partial = (rng.standard_normal((rows, blocks, 256)) * spread).astype(np.float32)
     scale = np.exp2(rng.integers(-8, 8, (blocks, 256))).astype(np.float32)
-    got = np.asarray(jax.jit(dm._scaled_block_sum)(partial, scale))
+    shared = jax.jit(functools.partial(dm._scaled_block_sum, share_rows=True))
+    got = np.asarray(shared(partial, scale))
     want = _block_tree(partial * scale[None])
     np.testing.assert_array_equal(got.view(np.uint32), want.view(np.uint32))
     # These partials detect a different order: a sequential sum differs.
@@ -83,7 +86,9 @@ def test_scaled_block_sum_keeps_the_block_order(rows, blocks):
     assert not np.array_equal(sequential, want)
 
 
-def _paired(monkeypatch, step, source, packed, scales, second=None, active=None):
+def _paired(
+    monkeypatch, step, source, packed, scales, second=None, active=None, share=False
+):
     monkeypatch.setattr(dm, "MXFP4_PAIR_STEP", step)
     rows = source.shape[0] * (2 if second is not None else 1)
 
@@ -103,6 +108,7 @@ def _paired(monkeypatch, step, source, packed, scales, second=None, active=None)
             CONTRACTION,
             second_source=second_ref,
             active_capacity=active,
+            share_block_sums=share,
         )
 
     operands = (source,) if second is None else (source, second)
@@ -115,12 +121,18 @@ def _paired(monkeypatch, step, source, packed, scales, second=None, active=None)
     )
 
 
-def _single(monkeypatch, step, source, packed, scales):
+def _single(monkeypatch, step, source, packed, scales, share=False):
     monkeypatch.setattr(dm, "MXFP4_PAIR_STEP", step)
 
     def kernel(source_ref, packed_ref, scales_ref, out_ref):
         dm._paired_order_expert_gate_up(
-            source_ref, packed_ref, scales_ref, out_ref, CONTRACTION, 512
+            source_ref,
+            packed_ref,
+            scales_ref,
+            out_ref,
+            CONTRACTION,
+            512,
+            share_block_sums=share,
         )
 
     return np.asarray(
@@ -146,6 +158,24 @@ def test_paired_gate_up_steps_are_bit_identical(monkeypatch, rows):
     np.testing.assert_array_equal(
         single.view(np.uint32), whole[:, : 2 * WIDTH].view(np.uint32)
     )
+
+
+@pytest.mark.parametrize("rows", [4, 8, 16])
+def test_shared_block_sums_match_the_plain_sums(monkeypatch, rows):
+    """The shared and plain scale-block sums run the same products (exact
+    block sums here, so this checks the plumbing, not the order; the order is
+    test_scaled_block_sum_keeps_the_block_order's)."""
+    rng = np.random.default_rng(20 + rows)
+    packed, scales = _expert_weights(rng, 2)
+    source = _activation(rng, (rows, CONTRACTION))
+    for active in (None, 4) if rows == 8 else (None,):
+        operands = (monkeypatch, 256, source, packed, scales)
+        plain = _paired(*operands, active=active)
+        shared = _paired(*operands, active=active, share=True)
+        np.testing.assert_array_equal(shared.view(np.uint32), plain.view(np.uint32))
+    plain = _single(monkeypatch, 256, source, packed, scales)
+    shared = _single(monkeypatch, 256, source, packed, scales, share=True)
+    np.testing.assert_array_equal(shared.view(np.uint32), plain.view(np.uint32))
 
 
 @pytest.mark.parametrize("active", [None, 2, 8])

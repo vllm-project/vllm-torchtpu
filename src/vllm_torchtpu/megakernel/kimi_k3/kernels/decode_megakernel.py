@@ -581,7 +581,7 @@ def _scale_block_partials(activation, values, step):
     return partials[0] if len(partials) == 1 else jnp.concatenate(partials, axis=1)
 
 
-def _scaled_block_sum(partial, scale):
+def _scaled_block_sum(partial, scale, share_rows=False):
     """``jnp.sum(partial * scale[None], axis=1)`` of [R, B, N] scale-block
     partials (B a multiple of 8), adding in the order Mosaic lowers that sum to
     (read from the compiled kernel): per row its 8-block groups left to right,
@@ -589,12 +589,12 @@ def _scaled_block_sum(partial, scale):
     apart, then the last pair). A compiler that lowers the sum differently
     would change the plain-sum paths' rounding, not this function's.
 
-    With 4 rows or a multiple of 8, the rows' trees share their rotations and
-    additions: each level packs the rows into the sublanes it leaves unused,
-    instead of reducing every row's 8 sublanes on their own.
+    With ``share_rows`` and 4 rows or a multiple of 8, the rows' trees share
+    their rotations and additions: each level packs the rows into the sublanes
+    it leaves unused, instead of reducing every row's 8 sublanes on their own.
     """
     rows, blocks, width = partial.shape
-    if blocks % 8 or not (rows == 4 or rows % 8 == 0):
+    if not share_rows or blocks % 8 or not (rows == 4 or rows % 8 == 0):
         return jnp.sum(partial * scale[None], axis=1)
     products = partial * scale[None]
     sums = [
@@ -646,6 +646,7 @@ def _quantized_expert_dot(
     *,
     block_major=False,
     dot_tile=None,
+    share_block_sums=False,
 ):
     """Multiply by one resident MXFP4 matrix or reblocked FP8 matrix.
 
@@ -735,7 +736,7 @@ def _quantized_expert_dot(
             # the unsplit tile; reducing each subtile separately changes that
             # association and can perturb routing over many decode steps.
             partial = _scale_block_partials(activation, values, dot_tile)
-            accumulator[...] += _scaled_block_sum(partial, scale)
+            accumulator[...] += _scaled_block_sum(partial, scale, share_block_sums)
             return
         scale_block_mask = (
             jnp.arange(size // 32)[:, None]
@@ -781,7 +782,7 @@ def _quantized_expert_dot(
                 (((2,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )
-            accumulator[...] += _scaled_block_sum(partial, scale)
+            accumulator[...] += _scaled_block_sum(partial, scale, share_block_sums)
 
     if static_tiles:
         for start in range(0, contraction_size, MXFP4_STATIC_TILE):
@@ -812,6 +813,7 @@ def _paired_expert_gate_up(
     *,
     second_source=None,
     active_capacity=None,
+    share_block_sums=False,
 ):
     """Run two resident expert gate/up projections.
 
@@ -931,7 +933,7 @@ def _paired_expert_gate_up(
                     MXFP4_PAIR_STEP,
                 )
                 result = _scaled_block_sum(
-                    partial, scale[:, half * columns:(half + 1) * columns]
+                    partial, scale[:, half * columns:(half + 1) * columns], share_block_sums
                 )
                 accumulator[
                     half * rows:(half + 1) * rows,
@@ -942,13 +944,13 @@ def _paired_expert_gate_up(
             partial = _scale_block_partials(
                 activation[:active_capacity], values, MXFP4_PAIR_STEP
             )
-            result = _scaled_block_sum(partial, scale)
+            result = _scaled_block_sum(partial, scale, share_block_sums)
             accumulator[...] += jnp.pad(
                 result, ((0, source.shape[0] - active_capacity), (0, 0))
             )
         else:
             partial = _scale_block_partials(activation, values, MXFP4_PAIR_STEP)
-            accumulator[...] += _scaled_block_sum(partial, scale)
+            accumulator[...] += _scaled_block_sum(partial, scale, share_block_sums)
 
     # Narrow scaled partials (MXFP4_PAIR_TILE) shorten register live ranges.
     tile_size = MXFP4_PAIR_TILE
@@ -956,7 +958,9 @@ def _paired_expert_gate_up(
         tile(start, min(tile_size, contraction_size - start))
 
 
-def _paired_order_expert_gate_up(source, packed, scales, accumulator, contraction_size, tile_size):
+def _paired_order_expert_gate_up(
+    source, packed, scales, accumulator, contraction_size, tile_size, *, share_block_sums=False
+):
     """Project one expert in the paired gate/up's FP32 accumulation order.
 
     Pair membership changes when null routes disappear. Tail and overflow
@@ -972,7 +976,7 @@ def _paired_order_expert_gate_up(source, packed, scales, accumulator, contractio
         scale = jax.lax.bitcast_convert_type(exponents << 23, jnp.float32)
         activation = source[:, pl.ds(start, size)].astype(jnp.bfloat16)
         partial = _scale_block_partials(activation, values, MXFP4_PAIR_STEP)
-        accumulator[...] += _scaled_block_sum(partial, scale)
+        accumulator[...] += _scaled_block_sum(partial, scale, share_block_sums)
 
 
 def _dot_scoped(function, name_of):
@@ -1045,6 +1049,12 @@ def _run_routed_expert_stream(
         STAGE_BLOCKS if STAGE_BLOCKS is not None
         else batch_size in (16, 32, 64, 96, 128)
     )
+    # The rows share their scale-block sums' rotations (_scaled_block_sum) up to
+    # B8; from B16 the decode runs faster with every row's own sums. The two
+    # forms round alike while Mosaic lowers the plain sum in the order
+    # _scaled_block_sum keeps.
+    share_block_sums = batch_size <= 8
+
     def expert_dot(source, packed, scales, accumulator, contraction_size, output_size, **options):
         if (batch_size > 1 and contraction_size == expert_input_size
                 and packed.dtype == jnp.uint32):
@@ -1052,11 +1062,12 @@ def _run_routed_expert_stream(
             # as other rows enter or leave. Match the paired gate's scale
             # reduction tree, including its final partial tile.
             return _paired_order_expert_gate_up(
-                source, packed, scales, accumulator, contraction_size, MXFP4_PAIR_TILE
+                source, packed, scales, accumulator, contraction_size, MXFP4_PAIR_TILE,
+                share_block_sums=share_block_sums,
             )
         return _quantized_expert_dot(
             source, packed, scales, accumulator, contraction_size, output_size,
-            dot_tile=dot_tile, **options,
+            dot_tile=dot_tile, share_block_sums=share_block_sums, **options,
         )
     if PHASE_SCOPES:
         # Profiling: time spent waiting for expert weights (e_wait).
@@ -1453,6 +1464,7 @@ def _run_routed_expert_stream(
                     expert_gate_up_scale_vmem.at[slot],
                     gate_up_accumulator.at[:compact_capacity, : 2 * expert_width],
                     expert_input_size, MXFP4_PAIR_TILE,
+                    share_block_sums=share_block_sums,
                 )
             else:
                 expert_dot(
@@ -1565,6 +1577,7 @@ def _run_routed_expert_stream(
                 first_slot,
                 second_slot,
                 expert_input_size,
+                share_block_sums=share_block_sums,
             )
             finish_shared_expert(first, first_slot, 0)
             finish_shared_expert(
@@ -1748,6 +1761,7 @@ def _run_routed_expert_stream(
                     current_base_slot,
                     current_base_slot + 1,
                     expert_input_size,
+                    share_block_sums=share_block_sums,
                 )
                 if not share_full_finish:
                     finish_expert(
@@ -1833,6 +1847,7 @@ def _run_routed_expert_stream(
                         current_base_slot + 1,
                         expert_input_size,
                         second_source=None if EXPERT_HALVES == 2 else second_single_source,
+                        share_block_sums=share_block_sums,
                     )
                     finish_singleton_expert(
                         first_rows,
@@ -1880,6 +1895,7 @@ def _run_routed_expert_stream(
                                 expert_input_size,
                                 second_source=None if EXPERT_HALVES == 2 else second_compact_source_vmem,
                                 active_capacity=capacity,
+                                share_block_sums=share_block_sums,
                             )
 
                         if share_compact_finish:
@@ -6197,8 +6213,8 @@ MXFP4_BLOCK = _config().mxfp4_block
 MXFP4_PAIR_TILE = _config().mxfp4_pair_tile
 # The paired gate/up's masked products run in 256-row contraction steps within
 # its tile (_scale_block_partials), half the MXU work of whole-tile products. A
-# step must stay a whole number of the MXU's 256-row contraction passes: the
-# block partials, and so the results, are then those of the whole tile.
+# step must stay a whole number of the MXU's 256-row contraction passes (tpu7x):
+# the block partials, and so the results, are then those of the whole tile.
 MXFP4_PAIR_STEP = 256
 # KernelConfig.mxfp4_static_tile=T: unroll the single-expert MXFP4 product over
 # static T-row tiles instead of a dynamic loop, keeping the unpacked tile small.
