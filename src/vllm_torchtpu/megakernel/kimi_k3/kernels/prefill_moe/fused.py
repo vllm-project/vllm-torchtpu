@@ -1598,12 +1598,16 @@ def _routed_experts(
                     dummy_base=panel * gu_u + row,
                 )
 
-        def inner(x, w, metadata, *, first=False, subtotal_vmem=None, tile=None, poll=True):
+        def inner(
+            x, w, metadata, *, first=False, subtotal_vmem=None, tile=None, column=None,
+            poll=True,
+        ):
             """One expert tile of a down column: the pipeline's grid step, or
-            ``tile`` of a paired step. ``poll`` (a static or traced bool) runs
-            the reduce ring's progress before the tile."""
+            ``tile`` of a paired step, of the first column or of ``column``.
+            ``poll`` (a static or traced bool) runs the reduce ring's progress
+            before the tile."""
             g = pl.program_id(1) if tile is None else tile
-            n = 0 if first else pl.program_id(0) + 1
+            n = 0 if first else column
             if not first:
 
                 @_scoped("m_ring_poll")
@@ -1670,20 +1674,23 @@ def _routed_experts(
                     loop_unroll=first_tail_unroll if first else unroll,
                 )
 
-            @pl.when(g == ng - 1)
-            def finish():
-                with _phase("m_consume_last"):
-                    consume(g, current, loop_unroll=first_tail_unroll if first else unroll)
-                if not first:
-                    with _phase("m_ring_drain"):
-                        advance(jnp.int32(32), n - 1, subtotal_vmem, drain=True)
-                    emit_subtotals(subtotal_vmem)
-                    state[0] = 0
+            if first:
 
-                    @pl.when(n == width // tn - 1)
-                    @_scoped("m_ring_final_drain")
-                    def last():
-                        advance(jnp.int32(32), n, subtotal_vmem, drain=True)
+                @pl.when(g == ng - 1)
+                def finish():
+                    with _phase("m_consume_last"):
+                        consume(g, current, loop_unroll=first_tail_unroll)
+
+        def finish_column(n, subtotal_vmem):
+            """Down column ``n`` after its tiles: its last tile's rows, then the
+            previous column's ring and this column's subtotals."""
+            last = ng - 1
+            with _phase("m_consume_last"):
+                consume(last, packed.at[last % 2])
+            with _phase("m_ring_drain"):
+                advance(jnp.int32(32), n - 1, subtotal_vmem, drain=True)
+            emit_subtotals(subtotal_vmem)
+            state[0] = 0
 
         (_, gu_ws), gu_ys = k.generate_block_specs(metadata, gu_cfg)
         gu_ws = _interleaved_gate_up_specs(gu_ws, gu_width)
@@ -1811,70 +1818,83 @@ def _routed_experts(
         def remaining_columns(subtotal_vmem):
             emit_subtotals(subtotal_vmem)
             state[0] = 0
-
-            def shifted(spec):
-                index_map = spec.index_map
-                return dataclasses.replace(
-                    spec, index_map=lambda n, g, k: index_map(n + 1, g, k)
-                )
-
-            shifted_ws = jax.tree.map(
-                shifted, ws, is_leaf=lambda v: isinstance(v, pl.BlockSpec)
-            )
             rows = middle.reshape(-1, sub, mid_width)
-            if tokens == 16384:
-                # The 16K token sums leave no room for a second tile's blocks.
-                def remaining(x, w, metadata):
-                    inner(x, w, metadata, subtotal_vmem=subtotal_vmem)
+
+            def paired_tiles(n, column_ws):
+                """The tiles of column ``n``, two expert tiles per pipeline step."""
+                # Tiles 2h and 2h + 1 (an odd count's last step fetches its last
+                # tile twice and skips the copy), with one reduce-ring poll per
+                # step: half the steps' fixed cost. Two buffers per input: each
+                # step's pair plus the next pair in flight.
+                def paired(spec, second):
+                    index_map = spec.index_map
+
+                    def mapped(i, h, k):
+                        return index_map(i, jnp.minimum(2 * h + second, ng - 1), k)
+
+                    return dataclasses.replace(
+                        spec, index_map=mapped, pipeline_mode=pl.Buffered(buffer_count=2)
+                    )
+
+                def pair(specs, second):
+                    return jax.tree.map(
+                        lambda spec: paired(spec, second),
+                        specs,
+                        is_leaf=lambda v: isinstance(v, pl.BlockSpec),
+                    )
+
+                def remaining(xa, xb, wa, wb, metadata):
+                    h = pl.program_id(1)
+                    inner(
+                        xa, wa, metadata, subtotal_vmem=subtotal_vmem, tile=2 * h, column=n
+                    )
+
+                    @pl.when(2 * h + 1 < ng)
+                    def second():
+                        inner(
+                            xb, wb, metadata, subtotal_vmem=subtotal_vmem,
+                            tile=2 * h + 1, column=n, poll=False,
+                        )
 
                 pltpu.emit_pipeline(
                     remaining,
-                    grid=(width // tn - 1, ng, 1),
-                    in_specs=(xs, shifted_ws),
+                    grid=(1, (ng + 1) // 2, 1),
+                    in_specs=(
+                        pair(xs, 0), pair(xs, 1), pair(column_ws, 0), pair(column_ws, 1)
+                    ),
                     out_specs=(),
-                )(rows, w, scratches=(metadata,))
-                return
+                )(rows, rows, w, w, scratches=(metadata,))
 
-            # Two expert tiles per pipeline step (tiles 2h and 2h + 1; an odd
-            # count's last step fetches its last tile twice and skips the copy),
-            # with one reduce-ring poll per step: half the steps' fixed cost.
-            # Two buffers per input: each step's pair plus the next pair in flight.
-            def paired(spec, second):
-                index_map = spec.index_map
-
-                def mapped(n, h, k):
-                    return index_map(n, jnp.minimum(2 * h + second, ng - 1), k)
-
-                return dataclasses.replace(
-                    spec, index_map=mapped, pipeline_mode=pl.Buffered(buffer_count=2)
-                )
-
-            def pair(specs, second):
-                return jax.tree.map(
-                    lambda spec: paired(spec, second),
-                    specs,
-                    is_leaf=lambda v: isinstance(v, pl.BlockSpec),
-                )
-
-            def remaining(xa, xb, wa, wb, metadata):
-                h = pl.program_id(1)
-                inner(xa, wa, metadata, subtotal_vmem=subtotal_vmem, tile=2 * h)
-
-                @pl.when(2 * h + 1 < ng)
-                def second():
-                    inner(
-                        xb, wb, metadata, subtotal_vmem=subtotal_vmem,
-                        tile=2 * h + 1, poll=False,
+            # One pipeline per column, followed by the column's finish, so that
+            # the pipeline's step loop holds only the per-tile work.
+            @pl.loop(1, width // tn)
+            def column(n):
+                def at_column(spec):
+                    index_map = spec.index_map
+                    return dataclasses.replace(
+                        spec, index_map=lambda _, g, k: index_map(n, g, k)
                     )
 
-            pltpu.emit_pipeline(
-                remaining,
-                grid=(width // tn - 1, (ng + 1) // 2, 1),
-                in_specs=(
-                    pair(xs, 0), pair(xs, 1), pair(shifted_ws, 0), pair(shifted_ws, 1)
-                ),
-                out_specs=(),
-            )(rows, rows, w, w, scratches=(metadata,))
+                column_ws = jax.tree.map(
+                    at_column, ws, is_leaf=lambda v: isinstance(v, pl.BlockSpec)
+                )
+                if tokens == 16384:
+                    # The 16K token sums leave no room for a second tile's blocks.
+                    def remaining(x, w, metadata):
+                        inner(x, w, metadata, subtotal_vmem=subtotal_vmem, column=n)
+
+                    pltpu.emit_pipeline(
+                        remaining,
+                        grid=(1, ng, 1),
+                        in_specs=(xs, column_ws),
+                        out_specs=(),
+                    )(rows, w, scratches=(metadata,))
+                else:
+                    paired_tiles(n, column_ws)
+                finish_column(n, subtotal_vmem)
+
+            with _phase("m_ring_final_drain"):
+                advance(jnp.int32(32), width // tn - 1, subtotal_vmem, drain=True)
 
     def run(**scratch):
         kernel(

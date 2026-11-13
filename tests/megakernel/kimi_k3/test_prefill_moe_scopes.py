@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Phase scopes of the fused prefill MoE: none unless KernelConfig.phase_scopes,
-and with it the documented set of each window class (traced, not compiled,
-over a deviceless tpu7x mesh)."""
+and with it the documented set of each window class; the scopes also show
+which loop holds which phase (traced, not compiled, over a deviceless tpu7x
+mesh)."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
 from jax.experimental import topologies
+from jax.experimental.pallas import tpu as pltpu
 from jax.extend import core as jax_core
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -78,18 +81,32 @@ _WINDOW_PHASES = {
 }
 
 
+def _sub_jaxprs(eqn):
+    for param in eqn.params.values():
+        for sub in param if isinstance(param, tuple | list) else (param,):
+            if isinstance(sub, jax_core.ClosedJaxpr):
+                sub = sub.jaxpr
+            if isinstance(sub, jax_core.Jaxpr):
+                yield sub
+
+
 def _scope_names(jaxpr):
     """The named scopes on the equations of ``jaxpr`` and of its sub-jaxprs."""
     names = set()
     for eqn in jaxpr.eqns:
         names.update(str(eqn.source_info.name_stack).split("/"))
-        for param in eqn.params.values():
-            for sub in param if isinstance(param, tuple | list) else (param,):
-                if isinstance(sub, jax_core.ClosedJaxpr):
-                    sub = sub.jaxpr
-                if isinstance(sub, jax_core.Jaxpr):
-                    names |= _scope_names(sub)
+        for sub in _sub_jaxprs(eqn):
+            names |= _scope_names(sub)
     return names
+
+
+def _loop_bodies(jaxpr):
+    """The sub-jaxprs of every loop equation in ``jaxpr``, nested ones included."""
+    for eqn in jaxpr.eqns:
+        for sub in _sub_jaxprs(eqn):
+            if eqn.primitive.name in ("while", "scan"):
+                yield sub
+            yield from _loop_bodies(sub)
 
 
 @pytest.mark.parametrize(
@@ -123,3 +140,84 @@ def test_fused_moe_phase_scopes_follow_the_kernel_config(monkeypatch, window, sc
     op = fused.make_indexed_mixture_moe_sp_ring(mesh, seq_len=window)
     names = {n for n in _scope_names(op.trace(*args).jaxpr.jaxpr) if n.startswith("m_")}
     assert names == (_PHASES | _WINDOW_PHASES[window] if scopes else set())
+
+
+def _traced_routed_experts(mesh, window):
+    """The jaxpr of one rank's routed experts (``fused._routed_experts``) in a
+    kernel of their own, with one layer of expert weights."""
+    capacity = fused._route_capacity(window)
+    smem = (
+        pltpu.SMEM((fused._LOCAL_EXPERTS,), jnp.int32),  # counts
+        pltpu.SMEM((capacity // 128, 128), jnp.int32),  # token ids
+        pltpu.SMEM((capacity // 128, 128), jnp.float32),  # route weights
+        pltpu.SMEM((1,), jnp.int32),  # family slot
+        pltpu.SMEM((1,), jnp.int32),  # expert offset
+    )
+
+    def body(tables, latent, gu, gus, down, ds, middle, reduced):
+        def run(counts, ids, probs, family, offset):
+            fused._routed_experts(
+                latent, gu, gus, down, ds, counts,
+                fused._FlatMetadata(ids), fused._FlatMetadata(probs),
+                tables, family, offset, middle, reduced,
+                tokens=window, probabilities_ready=lambda: None,
+            )  # fmt: skip
+
+        pl.run_scoped(run, *smem)
+
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    kernel = pl.pallas_call(
+        body,
+        out_shape=(
+            jax.ShapeDtypeStruct((capacity, fused._MIDDLE), jnp.bfloat16),
+            jax.ShapeDtypeStruct((window // 32, 3584), jnp.bfloat16),
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1, in_specs=(hbm,) * 5, out_specs=(hbm, hbm)
+        ),
+    )
+
+    def local(tables, latent, *weights):
+        return kernel(tables, latent[0], *(w[0] for w in weights))[1][None]
+
+    def rank(shape, dtype):
+        sharding = NamedSharding(mesh, P("k3_sp"))
+        return jax.ShapeDtypeStruct((32, *shape), dtype, sharding=sharding)
+
+    tables = jax.ShapeDtypeStruct(
+        (3, 3, 32), jnp.int32, sharding=NamedSharding(mesh, P())
+    )
+    weights = [
+        rank((1, *_FAMILIES[name][0]), _FAMILIES[name][1])
+        for name in ("expert_gu", "expert_gus", "expert_down", "expert_ds")
+    ]
+    op = jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(P(), *[P("k3_sp")] * 5),
+        out_specs=P("k3_sp"),
+        check_vma=False,
+    )
+    latent = rank((window, 2, 1792), jnp.bfloat16)
+    return jax.jit(op).trace(tables, latent, *weights).jaxpr.jaxpr
+
+
+@pytest.mark.parametrize("window", [2048, 8192, 16384])
+def test_remaining_column_tile_loops_hold_no_column_finish(monkeypatch, window):
+    """The loop over a later down column's expert tiles holds only per-tile
+    work; the column's last rows, ring drains and subtotals follow it."""
+    monkeypatch.setattr(fused, "PHASE_SCOPES", True)
+    devices = topologies.get_topology_desc("tpu7x:2x2x4", platform="tpu").devices
+    mesh = Mesh(np.array(sorted(devices, key=lambda d: d.id)), ("k3_sp",))
+    later_tiles = []
+    for body in _loop_bodies(_traced_routed_experts(mesh, window)):
+        names = _scope_names(body)
+        if any(n.startswith("m_down_bm") for n in names) and not any(
+            n.startswith("m_gu_bm") for n in names
+        ):
+            later_tiles.append(names)
+    # The innermost such loop (fewest scopes) steps over the tiles.
+    tiles = min(later_tiles, key=len)
+    assert "m_ring_poll" in tiles
+    finish = {"m_consume_last", "m_ring_drain", "m_emit_subtotals"}
+    assert not tiles & (finish | {"m_ring_final_drain"})
