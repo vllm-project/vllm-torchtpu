@@ -417,6 +417,8 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     else:
         union = _sorted_unions(per_tile)
     groups_per_tile = _groups_per_tile(block_q, topk, pages_per_step)
+    if num_tiles == 1:
+        return _single_tile_work_list(union, groups_per_tile, pages_per_step)
     # A tile with no page still gets one all-masked group so its output is set.
     pages_in_tile = jnp.sum(union != _NO_PAGE, axis=1, dtype=jnp.int32)
     groups_in_tile = jnp.maximum(-(-pages_in_tile // pages_per_step), 1)
@@ -446,6 +448,34 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
         constant_values=-1,
     )
     return union.reshape(-1), meta.astype(jnp.int32), ends[-1], count
+
+
+def _single_tile_work_list(union: jax.Array, groups_per_tile: int, pages_per_step: int):
+    """`_work_list` of one tile (a decode batch of at most `block_q` tokens),
+    with the same values. Its groups are its union's windows of
+    `pages_per_step` slots in order, so each group's page count and liveness
+    come from its own window. No op reduces to a scalar for another op to
+    read: in the decode twin that scalar's round trip cost ~2.5 us per layer
+    (j-67494143)."""
+    width = groups_per_tile * pages_per_step
+    union = jnp.pad(
+        jnp.where(union == _NO_PAGE, -1, union)[0],
+        (0, width - union.shape[1]),
+        constant_values=-1,
+    )
+    count = jnp.sum(union.reshape(groups_per_tile, pages_per_step) >= 0, axis=1)
+    count = count.astype(jnp.int32)
+    group = jnp.arange(groups_per_tile, dtype=jnp.int32)
+    # The union is compacted, so the live groups are a prefix; an empty tile
+    # still gets its one all-masked group.
+    live = (count > 0) | (group == 0)
+    last = live & ~jnp.pad(live[1:], (0, 1))
+    meta = (
+        (group << _ROW_SHIFT)
+        | jnp.where(group == 0, _FIRST_BIT, 0)
+        | jnp.where(last, _LAST_BIT, 0)
+    )
+    return union, meta.astype(jnp.int32), jnp.sum(live, dtype=jnp.int32), count
 
 
 def _attention_call(

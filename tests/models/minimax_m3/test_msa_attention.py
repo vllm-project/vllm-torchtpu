@@ -267,6 +267,68 @@ def test_dense_work_list_matches_unique(
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
+def _reference_work_list(selected, block_q, pages_per_step):
+    """`msa_attention._work_list` by loops: each tile's sorted distinct pages,
+    its groups packed after the earlier tiles' (an empty tile gets one), and
+    the groups past them as the packed form leaves them (last tile, no bits,
+    no pages)."""
+    num_tokens, topk = selected.shape
+    tiles = num_tokens // block_q
+    per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+    unions = np.full((tiles, per_tile * pages_per_step), -1, np.int32)
+    meta = np.zeros(tiles * per_tile, np.int32)
+    count = np.zeros(tiles * per_tile, np.int32)
+    w = 0
+    for t in range(tiles):
+        pages = sorted(set(selected[t * block_q : (t + 1) * block_q].ravel()) - {-1})
+        unions[t, : len(pages)] = pages
+        groups = max(-(-len(pages) // pages_per_step), 1)
+        for g in range(groups):
+            meta[w] = (
+                ((t * per_tile + g) << msa_attention._ROW_SHIFT)
+                | (msa_attention._FIRST_BIT if g == 0 else 0)
+                | (msa_attention._LAST_BIT if g == groups - 1 else 0)
+            )
+            count[w] = min(max(len(pages) - g * pages_per_step, 0), pages_per_step)
+            w += 1
+        last_start = w - groups
+    num_groups = w
+    for dead in range(num_groups, tiles * per_tile):
+        group = min(dead - last_start, per_tile - 1)
+        meta[dead] = ((tiles - 1) * per_tile + group) << msa_attention._ROW_SHIFT
+    return unions.reshape(-1), meta, num_groups, count
+
+
+@pytest.mark.parametrize(
+    "num_tokens,block_q,pages_per_step",
+    [(8, 8, 16), (16, 16, 16), (8, 8, 8), (24, 8, 16), (32, 16, 8)],
+)
+@pytest.mark.parametrize("fill", ["none", "few", "distinct", "sparse"])
+def test_work_list_matches_the_reference(num_tokens, block_q, pages_per_step, fill):
+    """One tile (a decode batch, its own scalar-free form) and several tiles
+    give the reference work list, value for value."""
+    rng = np.random.default_rng(num_tokens + block_q + pages_per_step)
+    topk = 16
+    selected = {
+        "none": np.full((num_tokens, topk), -1),
+        "few": rng.integers(0, 40, size=(num_tokens, topk)),
+        "distinct": np.arange(num_tokens * topk).reshape(num_tokens, topk)[:, ::-1],
+        "sparse": np.where(
+            rng.random((num_tokens, topk)) < 0.3,
+            -1,
+            rng.integers(0, 3000, size=(num_tokens, topk)),
+        ),
+    }[fill].astype(np.int32)
+    got = msa_attention._work_list(jnp.asarray(selected), block_q, pages_per_step)
+    want = _reference_work_list(selected, block_q, pages_per_step)
+    for g, w in zip(got, want, strict=True):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+    # `msa_attention_lse._packed_work` tells the live groups this way.
+    _, meta, num_groups, count = want
+    live = (count > 0) | ((meta & msa_attention._FIRST_BIT) != 0)
+    np.testing.assert_array_equal(live, np.arange(meta.size) < num_groups)
+
+
 def test_fp4_lse_small_tiles_match_default_tiles():
     """The DCP attention's 8-token tiles (small batches) on a 4-bit cache give
     the 16-token tiles' output and lse."""

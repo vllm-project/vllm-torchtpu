@@ -595,7 +595,8 @@ def _packed_work(selected, block_q, pages_per_step):
     groups_per_tile = msa_attention._groups_per_tile(
         block_q, selected.shape[2], pages_per_step
     )
-    live = jnp.arange(meta.shape[1], dtype=jnp.int32)[None] < ends[:, None]
+    del ends  # a live group holds pages or opens its tile: no scalar to wait on
+    live = (counts > 0) | ((meta & msa_attention._FIRST_BIT) != 0)
     tile = jnp.where(live, msa_attention._meta_tile(meta, groups_per_tile), num_tiles)
     bounds = jnp.arange(0, num_tiles + 1, tiles_per_step, dtype=jnp.int32)
     starts = jnp.sum(tile[:, None, :] < bounds[None, :, None], axis=2, dtype=jnp.int32)
