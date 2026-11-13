@@ -922,6 +922,7 @@ def _rpa_step(
             schedule_ref,
             acc_next,
             l_next,
+            cast("jax.Array", m_next),
             o_vref,
             lse_o_vref,
             chunk_start=chunk_start,
