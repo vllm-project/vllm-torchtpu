@@ -83,6 +83,22 @@ class TpuCompilationHandle:
     fingerprint: str | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class _CompileRequest:
+    """Inputs for `TpuCompilerAdaptor._compile_and_persist`.
+
+    `graph` is the tuple-output copy handed to the backend; `save_path` is
+    None when nothing is persisted.
+    """
+
+    key: str | None
+    save_path: str | None
+    graph: fx.GraphModule
+    example_inputs: list[Any]
+    was_wrapped: bool
+    fingerprint: str | None
+
+
 _tpu_backend = TpuBackend()
 
 # How often a rank looks for the artifact of the rank of its host that compiles
@@ -610,6 +626,35 @@ class TpuCompilerAdaptor(CompilerInterface):
                 )
         return compiled_fn, entry
 
+    def _compile_and_persist(
+        self, req: _CompileRequest
+    ) -> tuple[Callable[..., Any], bool]:
+        """Compile `req.graph` and, when `req.save_path` is set, save its entry.
+
+        Returns `(runnable, saved)`.
+        """
+        compiled_fn, entry = self._run_backend(req.graph, req.example_inputs)
+        if entry is None:
+            if req.save_path is not None:
+                logger.info(
+                    "[TpuCompilerAdaptor] No serializable artifact for %s; it "
+                    "will be recompiled on the next start",
+                    req.save_path,
+                )
+            return compiled_fn, False
+        if req.save_path is None:
+            return compiled_fn, False
+        assert req.key is not None
+        saved = self._save_handle(
+            req.key,
+            req.save_path,
+            entry,
+            req.graph,
+            req.was_wrapped,
+            req.fingerprint,
+        )
+        return compiled_fn, saved
+
     def _save_handle(
         self,
         key: str,
@@ -913,13 +958,6 @@ class TpuCompilerAdaptor(CompilerInterface):
                 shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
             return compiled_fn, handle
 
-        compiled_fn, entry = self._run_backend(graph, example_inputs)
-
-        if was_wrapped:
-            # Undo _ensure_tuple_output on the result side, so callers see the
-            # single tensor the original graph returned.
-            compiled_fn = self._unwrap_compiled_fn(compiled_fn)
-
         # Persist torch's bundled AOTAutograd entry -- the aot_autograd wrapper
         # metadata and the compiled executable as one object. It has to be one
         # object: `load` cannot rebuild a wrapper from a fresh trace and pair
@@ -932,20 +970,23 @@ class TpuCompilerAdaptor(CompilerInterface):
         # When the Tier-3 C++ persistent cache is active torch_tpu also keeps
         # the PJRT binary itself (torch_tpu_tier3/*.bin); that covers the
         # recompile path in `load`, not this one.
-        handle = None
-        if caching and entry is not None:
-            assert self.cache_dir is not None
-            save_path = os.path.join(self.cache_dir, key)
-            if self._save_handle(
-                key, save_path, entry, graph, was_wrapped, fingerprint
-            ):
-                handle = (key, save_path, was_wrapped)
-        elif caching:
-            logger.info(
-                "[TpuCompilerAdaptor] No serializable artifact for range %s; "
-                "it will be recompiled on the next start",
-                compile_range,
+        save_path = (
+            os.path.join(self.cache_dir, key)
+            if caching and key is not None and self.cache_dir is not None
+            else None
+        )
+        compiled_fn, saved = self._compile_and_persist(
+            _CompileRequest(
+                key=key,
+                save_path=save_path,
+                graph=graph,
+                example_inputs=example_inputs,
+                was_wrapped=was_wrapped,
+                fingerprint=fingerprint,
             )
+        )
+        handle = (key, save_path, was_wrapped) if saved else None
+
         # Under peer replay, other ranks of the host may be waiting for this
         # artifact: say so when it will not come, so they compile it now.
         if fingerprint is not None:
@@ -954,6 +995,11 @@ class TpuCompilerAdaptor(CompilerInterface):
                 self._mark_failed(key, fingerprint)
             else:
                 self._clear_failed(key)
+
+        if was_wrapped:
+            # Undo _ensure_tuple_output on the result side, so callers see the
+            # single tensor the original graph returned.
+            compiled_fn = self._unwrap_compiled_fn(compiled_fn)
 
         # Offer this bucket to later traces of the same model, so a graph that
         # refuses it reuses this runnable instead of building a second
@@ -1006,15 +1052,19 @@ class TpuCompilerAdaptor(CompilerInterface):
             fingerprint = (
                 _graph_fingerprint(graph) if envs.TPU_PRECOMPILE_PEER_REPLAY else None
             )
-            compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.
-            if (
-                entry is not None
-                and self.cache_dir is not None
-                and not self._disable_cache
-            ):
-                self._save_handle(key, path, entry, graph, was_wrapped, fingerprint)
+            can_save = self.cache_dir is not None and not self._disable_cache
+            compiled_fn, _ = self._compile_and_persist(
+                _CompileRequest(
+                    key=key,
+                    save_path=path if can_save else None,
+                    graph=graph,
+                    example_inputs=example_inputs,
+                    was_wrapped=was_wrapped,
+                    fingerprint=fingerprint,
+                )
+            )
 
         if was_wrapped:
             compiled_fn = self._unwrap_compiled_fn(compiled_fn)

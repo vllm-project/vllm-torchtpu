@@ -648,6 +648,71 @@ class TestTpuCompilerCache:
             is None
         )
 
+    def test_compile_without_cache_and_load_self_heal(self, tmp_path, monkeypatch):
+        """Uncached `compile` skips persistence, and `load` overwrites a stale
+        artifact via `_compile_and_persist`."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation import shape_variants, tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        monkeypatch.setattr(shape_variants, "_session", None)
+        compiled = []
+        replayed = []
+
+        class FakeCompiled:
+            def __call__(self, *args):
+                return ("compiled",)
+
+            def serialize(self):
+                return "saved-entry"
+
+        monkeypatch.setattr(
+            tpu_compiler,
+            "_tpu_backend",
+            lambda g, inp: (compiled.append(1) or FakeCompiled()),
+        )
+        monkeypatch.setattr(
+            tpu_compiler,
+            "_deserialize_entry",
+            lambda entry: (replayed.append(entry) or (lambda *a: (entry,))),
+        )
+
+        uncached = TpuCompilerAdaptor()
+        fn, handle = uncached.compile(
+            torch.fx.symbolic_trace(lambda x: x + 1),
+            [],
+            {},
+            Range(start=1, end=1),
+            key=None,
+        )
+        assert handle is None
+        assert fn() == "compiled"
+        assert len(compiled) == 1
+
+        c = TpuCompilerAdaptor()
+        c.initialize_cache(cache_dir=str(tmp_path / "cache"))
+        stale = tmp_path / "cache" / "stale_bucket"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"corrupt")
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+        healed = c.load(
+            ("stale_bucket", str(stale), True), graph, [], 0, Range(start=2, end=2)
+        )
+        assert len(compiled) == 2
+        assert replayed == []
+        assert healed() == "compiled"
+        assert stale.read_bytes() != b"corrupt"
+
+        monkeypatch.setattr(shape_variants, "_session", None)
+        warm = c.load(
+            ("stale_bucket", str(stale), True), graph, [], 0, Range(start=2, end=2)
+        )
+        assert len(compiled) == 2
+        assert replayed == ["saved-entry"]
+        assert warm() == "saved-entry"
+
     def test_compiler_initialize_cache(self):
         """Verify that TpuCompilerAdaptor sets cache_dir accurately."""
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
