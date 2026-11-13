@@ -116,6 +116,7 @@ def _select_body(
         logits = jnp.where(expert_iota == index[:, None], UNROUTABLE_LOGIT, logits)
     if renormalize:
         assert selected is not None
+        assert routes is not None and peak is not None  # top_k >= 1
         if drop_nan_rows:
             routes = jnp.logical_and(
                 jnp.logical_not(jnp.any(is_nan, axis=1, keepdims=True)), routes
@@ -128,6 +129,7 @@ def _select_body(
         # A row that routes nowhere carries the index one past the last
         # expert on every slot: the tables allocate it no routed row and
         # the combine gives it weight zero. Padded rows arrive this way.
+        assert routes is not None  # top_k >= 1
         index_out[...] = jnp.where(routes, index_out[...], jnp.int32(num_experts))
         step = pl.program_id(0)
         block_rows, lanes = index_out.shape
