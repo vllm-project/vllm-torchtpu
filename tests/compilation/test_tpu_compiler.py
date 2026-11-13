@@ -1028,3 +1028,55 @@ def test_deserialize_entry_does_not_copy_the_entry():
             raise AssertionError("replay must not deepcopy the entry")
 
     assert _deserialize_entry(Entry())(2, 3, 7) == 12
+
+
+class TestModelDirectoryCacheKey:
+    def _tree(self, root):
+        for rel in (
+            "vllm_torchtpu/models/vllm/x/kernels/upstream.py",
+            "vllm_torchtpu/models/foo/README.md",
+            "vllm_torchtpu/models/foo/model.py",
+            "vllm_torchtpu/models/foo/pool_layout.py",
+            "vllm_torchtpu/models/foo/experimental/kernels/k.py",
+            "vllm_torchtpu/models/foo/experimental/ops/op.py",
+        ):
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# x\n")
+
+    def test_model_kernels_and_ops_are_hashed(self, tmp_path, monkeypatch):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        self._tree(tmp_path)
+        monkeypatch.setattr(tpu_compiler, "_RUNTIME_CACHE_KEY_PATHS", ())
+        monkeypatch.setattr(tpu_compiler, "_MODEL_CACHE_KEY_PATHS", {})
+        hashed = {
+            p.relative_to(tmp_path).as_posix()
+            for p in tpu_compiler._iter_runtime_cache_key_files(tmp_path)
+        }
+        assert hashed == {
+            "vllm_torchtpu/models/foo/experimental/kernels/k.py",
+            "vllm_torchtpu/models/foo/experimental/ops/op.py",
+        }
+
+    def test_registered_paths_and_settings(self, tmp_path, monkeypatch):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        self._tree(tmp_path)
+        monkeypatch.setattr(tpu_compiler, "_RUNTIME_CACHE_KEY_PATHS", ())
+        monkeypatch.setattr(tpu_compiler, "_MODEL_CACHE_KEY_PATHS", {})
+        monkeypatch.setattr(tpu_compiler, "_MODEL_ENV_FACTORS", {})
+        tpu_compiler.register_compile_cache_key(
+            "foo",
+            paths=("vllm_torchtpu/models/foo/pool_layout.py",),
+            env_factors=lambda: {"FOO_FLAG": 1},
+        )
+        hashed = {
+            p.relative_to(tmp_path).as_posix()
+            for p in tpu_compiler._iter_runtime_cache_key_files(tmp_path)
+        }
+        assert "vllm_torchtpu/models/foo/pool_layout.py" in hashed
+        assert "vllm_torchtpu/models/foo/model.py" not in hashed
+        assert tpu_compiler._tpu_compile_env_factors()["model:foo"] == {"FOO_FLAG": 1}
+        tpu_compiler.register_compile_cache_key("foo")
+        assert "model:foo" not in tpu_compiler._tpu_compile_env_factors()
