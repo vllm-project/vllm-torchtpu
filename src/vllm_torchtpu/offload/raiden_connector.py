@@ -649,7 +649,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 key_tensors.append(
                     CanonicalKVCacheTensor(
                         tensor=torch.empty(0, dtype=torch.int8, device=device).set_(
-                            storage, base, (num_blocks, key_stride)
+                            storage, base, (num_blocks, key_stride), (key_stride, 1)
                         ),
                         page_size_bytes=key_stride,
                     )
@@ -661,7 +661,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 )
                 page_size_bytes = storage_bytes // num_blocks
             int8_view = torch.empty(0, dtype=torch.int8, device=device).set_(
-                storage, 0, (num_blocks, page_size_bytes)
+                storage, 0, (num_blocks, page_size_bytes), (page_size_bytes, 1)
             )
             pool_tensors.append(
                 CanonicalKVCacheTensor(
