@@ -75,6 +75,9 @@ _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
+    # CLAUDE COMMENT: per-token FP4 KV cache. Two e2m1 values per byte, plus
+    # the per-token scale bytes the batched RPA kernel stores in each row.
+    "nvfp4": torch.uint8,
 }
 
 _SLOT_ALIGNMENT_BYTES = 16

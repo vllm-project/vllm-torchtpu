@@ -906,6 +906,28 @@ class TpuPlatform(Platform):
             and "DeepseekV4ForCausalLM" in vllm_config.model_config.architectures
         ):
             supported = ["BLHNC"]
+        # CLAUDE COMMENT: per-token FP4 (--kv-cache-dtype nvfp4) stores each
+        # token's per-token scale in the trailing sublanes of its K/V row, which
+        # only the batched RPA kernel's SEQ_ALONG_LANE layout (vLLM's HND /
+        # LBHNC) implements. Pin the layout here so users do not also have to
+        # set VLLM_KV_CACHE_LAYOUT=HND, and fail early for unsupported setups.
+        if vllm_config.cache_config.cache_dtype == "nvfp4":
+            if backend is not PallasBatchedRPAAttentionBackend:
+                raise NotImplementedError(
+                    "--kv-cache-dtype nvfp4 (per-token FP4 KV cache) is only "
+                    "implemented by the batched RPA kernel. Add "
+                    "--attention-backend CUSTOM."
+                )
+            if (
+                vllm_config.model_config is not None
+                and vllm_config.model_config.get_head_size() == 64
+            ):
+                raise NotImplementedError(
+                    "--kv-cache-dtype nvfp4 needs the batched RPA kernel, which "
+                    "has no head_dim==64 variant. Use --kv-cache-dtype fp8 or "
+                    "auto for this model."
+                )
+            supported = [VllmKVCacheLayout.LBHNC.name]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
         # The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND.
         if (
@@ -1409,7 +1431,9 @@ class TpuPlatform(Platform):
     def is_kv_cache_dtype_supported(
         cls, kv_cache_dtype: str, _model_config: ModelConfig
     ) -> bool:
-        supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
+        # CLAUDE COMMENT: "nvfp4" is the per-token FP4 KV cache of the batched
+        # RPA (CUSTOM) backend; check_and_update_config rejects other backends.
+        supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2", "nvfp4"}
         return kv_cache_dtype in supported
 
     @classmethod

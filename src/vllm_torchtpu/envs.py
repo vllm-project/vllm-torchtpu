@@ -146,6 +146,8 @@ if TYPE_CHECKING:
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
+    # CLAUDE COMMENT: ported from per-token-fp4-quantization (per-token FP4 KV).
+    TPU_KV_CACHE_PER_TOKEN_SCALE_DTYPE: str = "bfloat16"
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
@@ -1065,6 +1067,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-block transfers from F independent DMAs into a single hardware DMA.
     # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
     "VLLM_TPU_BLOCK_MAJOR_KV": env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
+    # CLAUDE COMMENT: ported from per-token-fp4-quantization. Dtype of the
+    # per-token scale stored next to each token's packed FP4 K/V when
+    # --kv-cache-dtype nvfp4 is used with the batched RPA (CUSTOM) backend.
+    "TPU_KV_CACHE_PER_TOKEN_SCALE_DTYPE": env_with_choices(
+        "TPU_KV_CACHE_PER_TOKEN_SCALE_DTYPE",
+        "bfloat16",
+        ["bfloat16", "bf16", "float32", "fp32"],
+        case_sensitive=False,
+    ),
     # Evict host page cache for checkpoint weight files via posix_fadvise
     # after loading into TPU HBM.
     "TPU_EVICT_WEIGHTS_PAGE_CACHE": env_bool(

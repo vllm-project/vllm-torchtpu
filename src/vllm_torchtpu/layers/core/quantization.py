@@ -514,3 +514,86 @@ def fp4_indices_to_float(indices: torch.Tensor) -> torch.Tensor:
     )
 
     return FP4_VALUES[indices.to(torch.int64)]
+
+
+# CLAUDE COMMENT: everything below is ported from the per-token-fp4-quantization
+# branch (layers/common/quantization.py there) to back --kv-cache-dtype nvfp4 on
+# the batched RPA (CUSTOM) backend. The Hadamard rotation that branch once had
+# is intentionally not ported.
+
+# Largest magnitude representable in FP4 e2m1.
+FP4_E2M1_MAX = 6.0
+
+# Midpoints between adjacent FP4 e2m1 magnitudes (0, .5, 1, 1.5, 2, 3, 4, 6),
+# each paired with the comparison that reproduces round-to-nearest-even on an
+# exact tie: ``True`` means a strict ``>`` because the lower neighbour has the
+# even significand, ``False`` means ``>=``. Counting how many midpoints a
+# magnitude is past gives its index 0-7; see `_quantize_to_fp4_per_token`.
+_FP4_E2M1_MIDPOINTS = (
+    (0.25, True),
+    (0.75, False),
+    (1.25, True),
+    (1.75, False),
+    (2.5, True),
+    (3.5, False),
+    (5.0, True),
+)
+
+
+def _quantize_to_fp4_per_token(
+    tensor: torch.Tensor, scale_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token FP4 quantization of the trailing axis.
+
+    Returns packed uint8 ``[..., head_dim // 2]`` (two e2m1 values per byte, in
+    `pack_fp4_indices` order) and the per-token scale ``[..., 1]`` in
+    `scale_dtype`.
+
+    The e2m1 index table is sorted by magnitude then sign, so an index is
+    ``magnitude_index | (sign << 3)``, and the magnitude index is how many of
+    the seven midpoints the value is past. Rounding matches the hardware
+    ``float4_e2m1fn`` cast the batched RPA kernel reads back with.
+    """
+    if tensor.shape[-1] % 2:
+        raise ValueError(f"FP4 packing needs an even head_dim, got {tensor.shape[-1]}")
+    # CLAUDE COMMENT: change vs. the branch: round the scale to the dtype it is
+    # stored in *before* dividing by it. The branch divided by the float32 scale
+    # and stored a bf16-rounded copy, so the kernel dequantized with a scale up
+    # to ~0.4% off the one used to quantize.
+    scale = (
+        (tensor.abs().amax(dim=-1, keepdim=True).to(torch.float32) / FP4_E2M1_MAX)
+        .to(scale_dtype)
+        .to(torch.float32)
+    )
+    scaled = tensor.to(torch.float32) * _safe_inverse_scale(scale)
+
+    # Unrolled at trace time into seven elementwise compares; no control flow.
+    magnitude = scaled.abs()
+    indices = torch.zeros_like(magnitude, dtype=torch.uint8)
+    for midpoint, strict in _FP4_E2M1_MIDPOINTS:
+        past = magnitude > midpoint if strict else magnitude >= midpoint
+        indices += past.to(torch.uint8)
+    indices |= (scaled < 0).to(torch.uint8) << 3
+    return pack_fp4_indices(indices), scale.to(scale_dtype)
+
+
+def quantize_kv_fp4_per_token(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dynamic per-token (one scale per token and KV head) FP4 quantization.
+
+    Args:
+        key: ``[num_tokens, num_kv_heads, head_dim]``.
+        value: same shape as `key`.
+        scale_dtype: dtype the per-token scales are stored in.
+
+    Returns:
+        ``(k_packed, v_packed, k_scale, v_scale)``: uint8 tensors of shape
+        ``[..., head_dim // 2]`` and `scale_dtype` tensors of shape
+        ``[..., 1]``.
+    """
+    k_packed, k_scale = _quantize_to_fp4_per_token(key, scale_dtype)
+    v_packed, v_scale = _quantize_to_fp4_per_token(value, scale_dtype)
+    return k_packed, v_packed, k_scale, v_scale
