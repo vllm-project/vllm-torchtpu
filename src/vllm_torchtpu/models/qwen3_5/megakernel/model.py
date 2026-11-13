@@ -42,7 +42,7 @@ from vllm_torchtpu.megakernel.core.schedule import FromHFLayerTypes, Schedule
 from vllm_torchtpu.megakernel.core.spec import ModelSpec, Module
 
 from . import hf_oracle, pool
-from .profiles import baseline, candidate30
+from .profiles import baseline, candidate4, candidate30
 from .profiles.baseline import DEFAULT_HF_CONFIG, QWEN35_MODEL_NAME
 
 _GEOM_FIELDS = tuple(f.name for f in dataclasses.fields(ModelGeometry))
@@ -145,6 +145,8 @@ class Qwen35(ModelDef):
         "default": baseline.PROFILE,
         "candidate30": candidate30.PROFILE,
         "candidate30-fused": candidate30.FUSED_PROFILE,
+        "candidate4": candidate4.PROFILE,
+        "candidate4-sh-at2": candidate4.SH_AT2_PROFILE,
     }
 
 

@@ -18,6 +18,8 @@
 - `qwen35-candidate30` / `qwen35-candidate30-fused` (`candidate30.py`): the
   tuned schedule, approx numerics; `-fused` adds 1-launch fused pool I/O and
   is the template's serving default (`DEFAULT_PROFILE`).
+- `qwen35-candidate4` / `qwen35-candidate4-sh-at2` (`candidate4.py`): the
+  schedule of our PD submission's decode legs, approx numerics; opt-in only.
 
 Importing this package registers nothing (`model.register()` does).
 """
@@ -26,12 +28,18 @@ from __future__ import annotations
 
 from vllm_torchtpu.megakernel.core.profile import Profile
 
-from . import baseline, candidate30
+from . import baseline, candidate4, candidate30
 
 PROFILES: dict[str, Profile] = {
     p.name: p
-    for p in (baseline.PROFILE, candidate30.PROFILE, candidate30.FUSED_PROFILE)
+    for p in (
+        baseline.PROFILE,
+        candidate30.PROFILE,
+        candidate30.FUSED_PROFILE,
+        candidate4.PROFILE,
+        candidate4.SH_AT2_PROFILE,
+    )
 }
 DEFAULT_PROFILE: Profile = candidate30.FUSED_PROFILE
 
-__all__ = ["DEFAULT_PROFILE", "PROFILES", "baseline", "candidate30"]
+__all__ = ["DEFAULT_PROFILE", "PROFILES", "baseline", "candidate4", "candidate30"]
