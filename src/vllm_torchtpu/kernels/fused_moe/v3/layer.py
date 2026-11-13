@@ -503,15 +503,21 @@ def _pallas_step(x,
         starts = (expert_base.astype(jnp.int32)[:, None] +
                   run_start.astype(jnp.int32) * ROW_BLOCK).reshape(-1)
         ends = starts + push_rows.reshape(-1).astype(jnp.int32)
-        edges = (jnp.zeros((n_sorted + 1, ), jnp.int32).at[jnp.minimum(
-            starts, n_sorted)].add(1).at[jnp.minimum(ends, n_sorted)].add(-1))
-        live = jnp.cumsum(edges)[:n_sorted] > 0
-        row = jnp.arange(n_sorted, dtype=jnp.int32)
-        index = jnp.where(live, index, row % gathered_rows.shape[0])
         # The table is sized to its bound (every shard's pairs); the FFN
         # kernel reads only the used prefix, so only that is sorted.
         used = jnp.max(
             expert_base.astype(jnp.int32) + expert_rows.astype(jnp.int32))
+        n_blocks = n_sorted // ROW_BLOCK
+        block_idx = jnp.arange(n_blocks, dtype=jnp.int32)
+        block_live = jnp.where(block_idx * ROW_BLOCK < used,
+                               jnp.int32(ROW_BLOCK), jnp.int32(0))
+        rem = ends & (ROW_BLOCK - 1)
+        tail_block = jnp.where(rem != 0, ends // ROW_BLOCK, n_blocks)
+        block_live = block_live.at[tail_block].set(rem, mode="drop")
+        live = (jnp.arange(ROW_BLOCK, dtype=jnp.int32)[None, :]
+                < block_live[:, None]).reshape(-1)
+        row = jnp.arange(n_sorted, dtype=jnp.int32)
+        index = jnp.where(live, index, row % gathered_rows.shape[0])
         rows_in = gather.gather_rows_prefix(
             landed,
             index,
