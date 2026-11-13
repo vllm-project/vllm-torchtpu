@@ -224,3 +224,35 @@ def test_published_word_pool_attention(benchmark, banked):
     _, actual = compiled(raw, records, values, inputs)
     assert np.isfinite(actual).all()
     np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [6, 7])
+@pytest.mark.parametrize("heads", [16, 64])
+def test_decode_reuses_executable_across_request_boundaries(
+    benchmark, num_tokens, heads
+):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Async MXU operations require TPU")
+    batch, page_size = 4, 64
+    host = benchmark.make_inputs(batch, num_tokens, heads, page_size=page_size)
+    inputs = jax.device_put(host)
+    executable = jax.jit(lambda data: csa2(**data, bq=6)).lower(inputs).compile()
+    for case in ("uniform", "ragged", "empty", "padding"):
+        starts = np.arange(batch + 1, dtype=np.int32) * num_tokens
+        if case == "ragged":
+            starts[1] += 1
+        elif case == "empty":
+            starts[1] = 0
+        elif case == "padding":
+            starts[-1] -= 2
+        positions = host["positions"].copy()
+        for request in range(batch):
+            begin, end = starts[request : request + 2]
+            first = 2048 + (request * 31) % page_size
+            positions[begin:end] = first + np.arange(end - begin, dtype=np.int32)
+        data = dict(host, starts=starts, positions=positions)
+        expected = np.zeros(host["q"].shape, np.float32)
+        expected[: starts[-1]] = benchmark.reference(data, range(starts[-1]))
+        actual = np.asarray(executable(jax.device_put(data)), np.float32)
+        np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
+        np.testing.assert_array_equal(actual[starts[-1] :], 0)
