@@ -83,6 +83,12 @@ if TYPE_CHECKING:
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
     TPU_MOE_V3_PAYLOAD_SORT: bool = False
     TPU_MOE_FLAT_ROUTING_MIN_TOKENS: int = 0
+    TPU_MOE_ROUTE_TRACE: int = 0
+    TPU_MOE_ROUTE_TRACE_EVERY: int = 8192
+    VLLM_TPU_MOE_REDUNDANT_EXPERTS: int = 0
+    TPU_MOE_NVFP4_SKIP_PADDED: bool = False
+    TPU_MOE_SKIP_PADDED_MIN_ROUTES: int = 0
+    VLLM_TPU_MOE_REDUNDANT_PLACEMENT: str = ""
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
@@ -778,6 +784,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_FLAT_ROUTING_MIN_TOKENS": env_nonnegative_int(
         "TPU_MOE_FLAT_ROUTING_MIN_TOKENS", 0
     ),
+    # Diagnostics (layers/adapter/moe_route_trace.py): keep the per-expert
+    # routed-row counts of the last N forward steps of every MoE layer in a
+    # device ring buffer and log them from TP rank 0 every
+    # TPU_MOE_ROUTE_TRACE_EVERY model-runner steps. Adds an index_copy per MoE
+    # layer to the graph, so it is compile-hashed here. 0 = off.
+    "TPU_MOE_ROUTE_TRACE": env_nonnegative_int("TPU_MOE_ROUTE_TRACE", 0),
+    "TPU_MOE_ROUTE_TRACE_EVERY": env_nonnegative_int(
+        "TPU_MOE_ROUTE_TRACE_EVERY", 8192
+    ),
+    # NVFP4 GMM MoE: give padded rows of a token bucket zero routing weights
+    # (token_padding mask), so TPU_MOE_SKIP_PADDED_TOKENS drops them from the
+    # grouped matmul as the FP8 path already does. Their outputs are discarded,
+    # but today they route like real tokens and every expert they touch costs
+    # its weight read. Needs TPU_MOE_SKIP_PADDED_TOKENS=1. Default off.
+    "TPU_MOE_NVFP4_SKIP_PADDED": env_bool("TPU_MOE_NVFP4_SKIP_PADDED"),
+    # TPU_MOE_SKIP_PADDED_TOKENS drops padded rows from the grouped matmul only
+    # in batches of at least this many routes (T * top_k); smaller batches run
+    # them as with the skip off (bitwise for real rows). 0 = every size.
+    "TPU_MOE_SKIP_PADDED_MIN_ROUTES": env_nonnegative_int(
+        "TPU_MOE_SKIP_PADDED_MIN_ROUTES", 0
+    ),
+    # Redundant MoE experts on the grouped-matmul EP path
+    # (layers/adapter/moe_redundant.py): extra expert slots per EP rank per
+    # MoE layer, each holding a copy of another rank's expert, and a per-step
+    # router remap that moves work onto the replicas. 0 = off.
+    "VLLM_TPU_MOE_REDUNDANT_EXPERTS": env_nonnegative_int(
+        "VLLM_TPU_MOE_REDUNDANT_EXPERTS", 0
+    ),
+    # Which experts get the redundant slots: a JSON file path, inline JSON
+    # ('{"L3": [17, ...]}', hottest first), or "builtin:<name>". Empty = the
+    # built-in round-robin fill. Placement reaches the compiled graph as
+    # buffers, never as constants. Route-trace keys ("moe<i>", the i-th MoE
+    # layer) come from `python -m vllm_torchtpu.layers.adapter.moe_redundant LOG`.
+    "VLLM_TPU_MOE_REDUNDANT_PLACEMENT": env_str("VLLM_TPU_MOE_REDUNDANT_PLACEMENT", ""),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.

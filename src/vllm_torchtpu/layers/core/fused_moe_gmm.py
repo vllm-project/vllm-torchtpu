@@ -87,6 +87,12 @@ if _V3_PAYLOAD_SORT:
 # outputs on the TensorCore (0 = never). See moe_tc_combine.
 _TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
 _FLAT_ROUTING_MIN_TOKENS = envs.TPU_MOE_FLAT_ROUTING_MIN_TOKENS
+# Skip padded rows (skip_padded_tokens) only in batches of at least this many
+# routes (T * top_k). Below it the rows still run, so the grouped matmul and the
+# one-hot permute see the same layout as with the skip off and real rows come
+# out bitwise identical; their zero routing weights only drop them from the
+# combine. 0 = skip at every size.
+_SKIP_PADDED_MIN_ROUTES = envs.TPU_MOE_SKIP_PADDED_MIN_ROUTES
 if _TC_COMBINE_MIN_TOKENS or _V3_PAYLOAD_SORT or _FLAT_ROUTING_MIN_TOKENS:
     logger.info(
         "MoE row movement: TPU_MOE_TC_COMBINE_MIN_TOKENS=%d "
@@ -832,6 +838,9 @@ def fused_moe_func(
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    if skip_padded_tokens and num_tokens * topk < _SKIP_PADDED_MIN_ROUTES:
+        skip_padded_tokens = False
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
