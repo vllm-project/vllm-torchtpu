@@ -217,7 +217,10 @@ def qwen3_5_kv_transfer_page(vllm_config: VllmConfig) -> int | None:
     engine config carrying that child's own role (``kv_both`` for an
     offloading connector inside a prefill engine), and the child must resolve
     the page the runner allocated. Other models, engines without KV transfer
-    and the head-along-sublane layout keep vLLM's choice.
+    and the head-along-sublane layout keep vLLM's choice. So do other
+    Qwen3.5 checkpoints than the one the IX points ran (Qwen3.5-397B-A17B):
+    their peer may be a PCP prefill engine, which keeps vLLM's choice, so a
+    fixed page there would make the two fingerprints differ instead.
     """
     if vllm_config.kv_transfer_config is None:
         return None
@@ -227,9 +230,12 @@ def qwen3_5_kv_transfer_page(vllm_config: VllmConfig) -> int | None:
         is not batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
     ):
         return None
+    from vllm_torchtpu.models.qwen3_5 import hooks as qwen3_5_hooks
     from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
 
     if not qwen3_5_settings.is_qwen3_5(vllm_config.model_config):
+        return None
+    if not qwen3_5_hooks.has_calibrated_shape(vllm_config.model_config):
         return None
     return QWEN3_5_KV_TRANSFER_PAGE_TOKENS
 
