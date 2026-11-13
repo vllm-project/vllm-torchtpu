@@ -360,6 +360,7 @@ def materialize_shared_attention_cache(
     num_blocks: int,
     attn_backend: Any,
     device: torch.device,
+    seq_along_lane: bool = False,
 ) -> torch.Tensor:
     """Allocate one tensor for attention groups sharing scheduler pages."""
     if not layer_specs:
@@ -394,13 +395,27 @@ def materialize_shared_attention_cache(
         or math.prod(pool_shape[1:]) != page_elements
     ):
         # Keep the packed dtype axis separate when reinterpreting head shapes.
+        # Under SEQ_ALONG_LANE (HND), native 5-D pages place `block_size` on
+        # the minor lane axis `(..., packing, block_size)`, so keep `block_size`
+        # at dim -1 to make 4-D <-> 5-D views zero-copy bitcasts.
+        # Note: TPURaidenOffloadingConnector rejects mixed-geometry non-MLA
+        # groups (raiden_store.py), and Raiden P/D fingerprints the live
+        # tensor's physical minor_to_major layout directly (layout_fingerprint.py).
         packing = 4 // spec.dtype.itemsize
-        pool_shape = (
-            num_blocks,
-            spec.block_size,
-            packing,
-            page_elements // (spec.block_size * packing),
-        )
+        if seq_along_lane:
+            pool_shape = (
+                num_blocks,
+                page_elements // (packing * spec.block_size),
+                packing,
+                spec.block_size,
+            )
+        else:
+            pool_shape = (
+                num_blocks,
+                spec.block_size,
+                packing,
+                page_elements // (spec.block_size * packing),
+            )
     return torch.zeros(pool_shape, dtype=spec.dtype, device=device)
 
 
