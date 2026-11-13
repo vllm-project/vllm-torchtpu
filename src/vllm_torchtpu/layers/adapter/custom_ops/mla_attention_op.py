@@ -587,9 +587,12 @@ def _gather_linear_output_channels(
     layer: torch.nn.Module, group: Any, index: torch.Tensor
 ) -> torch.nn.Module:
     """A processed linear's copy whose output channels are `index` into its
-    own output channels all-gathered over `group` (rank-major). Parameter
-    layouts are `permute_linear_output_channels`'; the decode kernel copy
-    (TPU_FP8_LINEAR_PALLAS) is dropped, so `apply` takes the XLA matmul."""
+    own output channels all-gathered over `group` (rank-major). `weight` is
+    `[n_in, n_out]` when flipped (WEIGHT_FLIPPED_ATTR), else `[n_out, n_in]`;
+    any other parameter is per output channel on its last or first axis (FP8
+    `weight_scale` `[..., n_out]` / `[n_out]`, a bias) or a scalar, and any
+    other layout raises. The decode kernel copy (TPU_FP8_LINEAR_PALLAS) is
+    dropped, so `apply` takes the XLA matmul."""
     flipped = getattr(layer, WEIGHT_FLIPPED_ATTR, False)
     weight = cast(torch.Tensor, layer.weight)
     n_out = weight.shape[1 if flipped else 0]
@@ -2370,17 +2373,27 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # (registered after the rope permutes) has built the 64-head q_b.
         self.token_split = False
         self.ts_lanes = 1
-        if (
+        ts_layer = (
             envs.TPU_DCP_MLA_TOKEN_SPLIT
-            and self.mla_attn.dcp_q_replicate
             and self.q_lora_rank is not None
             and not _is_draft_prefix(prefix)
-        ):
+        )
+        if ts_layer and not self.mla_attn.dcp_q_replicate:
+            logger.warning_once(
+                "TPU_DCP_MLA_TOKEN_SPLIT needs query replication "
+                "(VLLM_DCP_Q_REPLICATE); off"
+            )
+        if ts_layer and self.mla_attn.dcp_q_replicate:
             _check_token_split_env()
             from vllm.distributed import get_tensor_model_parallel_world_size
 
             lanes = get_tensor_model_parallel_world_size() // self.dcp_group_size
-            if lanes > 1:
+            if lanes <= 1:
+                logger.warning_once(
+                    "TPU_DCP_MLA_TOKEN_SPLIT needs more than one DCP lane "
+                    "(tp // dcp > 1); off"
+                )
+            else:
                 self.ts_lanes = lanes
                 self.mla_attn.token_split_head_order = dcp_token_split.head_order(
                     self.dcp_group_size, lanes, self.num_heads
