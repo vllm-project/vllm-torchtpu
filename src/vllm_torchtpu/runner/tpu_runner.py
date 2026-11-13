@@ -168,6 +168,7 @@ from vllm_torchtpu.runner import (
 )
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.bucket_stats import BucketStats
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -1236,6 +1237,11 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
+        # Diagnostics only, with the post-warmup compile reports
+        # (VLLM_XLA_CHECK_RECOMPILATION): which token buckets traffic hits.
+        self._bucket_stats = BucketStats(
+            enabled=profiler_rank == 0 and vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
+        )
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -3593,6 +3599,11 @@ class TPUModelRunner(GPUModelRunner):
             )
             request_major_input_ids = request_major_input_ids_cpu_padded.to(
                 self.device, non_blocking=True
+            )
+        if (bucket_stats := getattr(self, "_bucket_stats", None)) is not None:
+            bucket_stats.record(
+                local_padded_total_num_scheduled_tokens,
+                local_total_num_scheduled_tokens,
             )
         if zero_pad_tail:
             # Zero out to avoid spurious values from prev iteration.
