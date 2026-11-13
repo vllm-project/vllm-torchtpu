@@ -1,0 +1,5 @@
+{
+  "schema": "advisor.measured_points.v1",
+  "description": "Recorded hardware benchmark measurements for megakernel advisor validation. Each entry requires job_id, model, chip, scope, workload, layout, step_time_us, and n >= 1.",
+  "points": []
+}
