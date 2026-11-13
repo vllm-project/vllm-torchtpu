@@ -378,8 +378,9 @@ def _write_schedule_to_hbm(
         )
         dma_list.append(copy)
 
-    jax.tree.map(lambda x: x.start(), dma_list)
-    jax.tree.map(lambda x: x.wait(), dma_list)
+    jax.tree.map(lambda x: x.start(priority=1, strict_ordering=False),
+                 dma_list)
+    jax.tree.map(lambda x: x.wait(strict_ordering=False), dma_list)
 
 
 def _compute_waits(
