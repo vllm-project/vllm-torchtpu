@@ -234,6 +234,7 @@ def _metadata_steps(
     token_ids,
     counts,
     maximum,
+    tallies,
     *,
     tokens,
     rank,
@@ -245,17 +246,21 @@ def _metadata_steps(
     The all-gathered wire contains 16 expert IDs followed by 16 probability bit
     patterns per token. Every rank counts all expert groups at 8K, making the
     compact-capacity decision uniform before any conditional collective runs.
+    ``tallies`` ([local experts + groups, 8, 128] int32) accumulates the counts
+    lane-wise; each is reduced once after the last chunk.
     """
     ep_groups = 896 // local_experts
     expert_tp = 32 // ep_groups
     bits = (tokens * 16 - 1).bit_length()
     shape = (128, 16) if tokens < 4096 else (16, 128)
-    expert_index = jnp.arange(local_experts, dtype=jnp.int32)
-    group_index = jnp.arange(ep_groups, dtype=jnp.int32)
     lanes = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
     rows = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
-    total_counts = jnp.zeros((local_experts,), jnp.int32)
-    total_groups = jnp.zeros((ep_groups,), jnp.int32)
+    tallies[...] = jnp.zeros(tallies.shape, jnp.int32)
+
+    def tally(index, hits):
+        hits = hits.astype(jnp.int32)
+        tallies[index] += hits[:8] + hits[8:]
+
     for chunk in range(tokens // 128):
         if tokens < 4096:
             records = wire[pl.ds(chunk * 32, 32), :].reshape(128, 32)
@@ -281,24 +286,29 @@ def _metadata_steps(
         probabilities[pl.ds(chunk * 16, 16), :] = probs.reshape(16, 128)
         # Count routes on the packed 16x128 layout.
         local_flat = local.reshape(16, 128)
-        tile_counts = jnp.zeros((local_experts,), jnp.int32)
         for expert in range(local_experts):
-            count = jnp.sum((local_flat == expert).astype(jnp.int32))
-            tile_counts = jnp.where(expert_index == expert, count, tile_counts)
-        total_counts += tile_counts
+            tally(expert, local_flat == expert)
         if maximum is not None:
+            # Group g holds the live routes below (g + 1) * local_experts less
+            # those below g * local_experts.
             ids_flat = ids.reshape(16, 128)
             live_flat = probs.reshape(16, 128) != 0
-            tile_groups = jnp.zeros((ep_groups,), jnp.int32)
-            groups = ids_flat // local_experts
             for group in range(ep_groups):
-                count = jnp.sum((live_flat & (groups == group)).astype(jnp.int32))
-                tile_groups = jnp.where(group_index == group, count, tile_groups)
-            total_groups += tile_groups
+                below = live_flat & (ids_flat < (group + 1) * local_experts)
+                tally(local_experts + group, below)
         yield
+    expert_index = jnp.arange(local_experts, dtype=jnp.int32)
+    total_counts = jnp.zeros((local_experts,), jnp.int32)
+    for expert in range(local_experts):
+        count = jnp.sum(tallies[expert])
+        total_counts = jnp.where(expert_index == expert, count, total_counts)
     counts[...] = total_counts
     if maximum is not None:
-        maximum[...] = jnp.max(total_groups)[None]
+        cumulative = [jnp.sum(tallies[local_experts + g]) for g in range(ep_groups)]
+        largest = cumulative[0]
+        for group in range(1, ep_groups):
+            largest = jnp.maximum(largest, cumulative[group] - cumulative[group - 1])
+        maximum[...] = largest[None]
     counts_ready()
     yield from _sort_route_steps(
         keys, probabilities, token_ids, size=tokens * 16, bits=bits
@@ -763,6 +773,7 @@ def _prologue(
                     token_ids,
                     counts,
                     maximum,
+                    s["tallies"],
                     tokens=rows * 32,
                     rank=rank,
                     counts_ready=counts_ready,
@@ -1065,6 +1076,7 @@ def _prologue(
         route_send=dma((5,)),
         route_recv=dma((5,)),
         keys=vmem((rows * 4, 128), jnp.int32),
+        tallies=vmem((counts.shape[0] + 896 // counts.shape[0], 8, 128), jnp.int32),
         latent_payload=vmem((passes, part, 2, 1792), jnp.bfloat16)
         if big
         else vmem((rows, 2, 1792), jnp.bfloat16),

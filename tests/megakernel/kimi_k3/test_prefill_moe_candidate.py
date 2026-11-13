@@ -205,10 +205,13 @@ def test_metadata_steps_ep16(tokens, local_experts):
         for g in range(896 // local_experts)
     )
 
+    tallies_shape = (local_experts + 896 // local_experts, 8, 128)
     if tokens == 512:
         wire = jnp.asarray(wire_np)
 
-        def kern(wire_ref, rank_ref, keys_ref, probs_ref, tids_ref, counts_ref):
+        def kern(
+            wire_ref, rank_ref, keys_ref, probs_ref, tids_ref, counts_ref, tallies_ref
+        ):
             for _ in fused._metadata_steps(
                 wire_ref,
                 keys_ref,
@@ -216,6 +219,7 @@ def test_metadata_steps_ep16(tokens, local_experts):
                 tids_ref,
                 counts_ref,
                 None,
+                tallies_ref,
                 tokens=tokens,
                 rank=rank_ref[0],
                 counts_ready=lambda: None,
@@ -228,6 +232,7 @@ def test_metadata_steps_ep16(tokens, local_experts):
             jax.ShapeDtypeStruct((tokens // 8, 128), jnp.float32),
             jax.ShapeDtypeStruct((tokens // 8, 128), jnp.int32),
             jax.ShapeDtypeStruct((local_experts,), jnp.int32),
+            jax.ShapeDtypeStruct(tallies_shape, jnp.int32),
         )
         fn = jax.jit(pl.pallas_call(kern, out_shape=out_shapes, interpret=True))
         ranks_to_check = (0, 3, 4, 17, 31)
@@ -237,7 +242,7 @@ def test_metadata_steps_ep16(tokens, local_experts):
 
     for rank in ranks_to_check:
         if fn is not None:
-            _, probs_out, tids_out, counts_out = fn(
+            _, probs_out, tids_out, counts_out, _ = fn(
                 wire, jnp.array([rank], dtype=jnp.int32)
             )
         else:
@@ -246,6 +251,7 @@ def test_metadata_steps_ep16(tokens, local_experts):
             tids_buf = np.zeros((tokens // 8, 128), dtype=np.int32)
             counts_buf = np.zeros((local_experts,), dtype=np.int32)
             max_buf = np.zeros((1,), dtype=np.int32)
+            tallies_buf = np.zeros(tallies_shape, dtype=np.int32)
             for _ in fused._metadata_steps(
                 _ArrayRef(wire_np),
                 _ArrayRef(keys_buf),
@@ -253,6 +259,7 @@ def test_metadata_steps_ep16(tokens, local_experts):
                 _ArrayRef(tids_buf),
                 _ArrayRef(counts_buf),
                 _ArrayRef(max_buf),
+                _ArrayRef(tallies_buf),
                 tokens=tokens,
                 rank=jnp.int32(rank),
                 counts_ready=lambda: None,
