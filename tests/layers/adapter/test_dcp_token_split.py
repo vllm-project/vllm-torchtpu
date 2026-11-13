@@ -197,7 +197,8 @@ def _ts_wrapper(tokens):
 
 def _lifted_names(tokens, monkeypatch):
     """Graph input names Dynamo lifts tracing the wrapper at `tokens` in warmup
-    (TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS = 8: 16 splits, 4 does not)."""
+    and whether the token split takes that bucket (minimums at 8: 32 splits,
+    4 does not; the indexer lane split must take the bucket too)."""
     import torch._dynamo
 
     from vllm_torchtpu import envs
@@ -207,7 +208,12 @@ def _lifted_names(tokens, monkeypatch):
     monkeypatch.setattr(shape_variants, "in_warmup", lambda: True)
     monkeypatch.setattr(op.vllm_compilation_backends, "model_tag", "backbone")
     monkeypatch.setattr(envs, "TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS", 8, raising=False)
+    monkeypatch.setattr(envs, "TPU_DCP_INDEXER_LANE_SPLIT", True, raising=False)
+    monkeypatch.setattr(envs, "TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS", 8, raising=False)
+    monkeypatch.setattr(envs, "TPU_DCP_INDEXER_HIST_MERGE", True, raising=False)
+    monkeypatch.setattr(envs, "TPU_DCP_INDEXER_A2A_MIN_TOKENS", 8, raising=False)
     w = _ts_wrapper(tokens)
+    splits = w._token_split_applies(tokens, None, None)
     names = set()
 
     def backend(gm, example_inputs):
@@ -220,13 +226,15 @@ def _lifted_names(tokens, monkeypatch):
     fn = torch.compile(w.forward, backend=backend, dynamic=False)
     out = fn(torch.arange(tokens), torch.ones(tokens, 8))
     assert out.shape[0] == tokens
-    return {n for n in names if "hidden_states" not in n and "positions" not in n}
+    lifted = {n for n in names if "hidden_states" not in n and "positions" not in n}
+    return lifted, splits
 
 
 def test_both_sides_of_the_token_split_branch_lift_the_same_inputs(monkeypatch):
     """The warmup hands a bucket over only between traces that lift the same
     named buffers: the head-split and token-split traces must agree."""
-    split = _lifted_names(16, monkeypatch)
-    head = _lifted_names(4, monkeypatch)
+    split, took_split = _lifted_names(32, monkeypatch)
+    head, took_head = _lifted_names(4, monkeypatch)
+    assert took_split and not took_head
     assert any("q_b_ts" in n for n in split) and any("ts_lane" in n for n in head)
     assert split == head, (sorted(split - head), sorted(head - split))
