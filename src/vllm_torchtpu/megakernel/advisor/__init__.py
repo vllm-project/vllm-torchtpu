@@ -31,6 +31,7 @@ from . import (
     support,
     verdict,
     vmem,
+    workbench,
     workbench_engine,
 )
 from .calibrate import CalibrateOptions, calibrate_trace
@@ -129,6 +130,11 @@ from .vmem import (
     compute_per_token_vmem_bytes,
     fit_vmem_budget_bytes,
     validate_advise_inputs,
+)
+from .workbench import (
+    render_workbench_body,
+    render_workbench_css,
+    render_workbench_script,
 )
 from .workbench_engine import render_workbench_engine_js
 
@@ -234,7 +240,11 @@ __all__ = [
     "verdict",
     "verify_chip_spec_against_jax",
     "vmem",
+    "workbench",
     "workbench_engine",
+    "render_workbench_body",
+    "render_workbench_css",
+    "render_workbench_script",
     "write_advisor_html",
     "write_bucket_schedule",
 ]
