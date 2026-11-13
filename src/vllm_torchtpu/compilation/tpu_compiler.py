@@ -260,6 +260,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # with the venv prefix or mount path. get_libtpu_cache_key() already
     # identifies the loaded build without its path.
     "TPU_LIBRARY_PATH",
+    # Host thread CPU affinity and placement probe; never affect lowered HLO.
+    "VLLM_TPU_CPU_PIN",
+    "VLLM_TPU_CPU_PIN_RESERVE",
+    "VLLM_TPU_CPU_PROBE_S",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (

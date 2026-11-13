@@ -206,6 +206,9 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_CPU_PIN: str = "off"
+    VLLM_TPU_CPU_PIN_RESERVE: int = 2
+    VLLM_TPU_CPU_PROBE_S: float = 0.0
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -1260,6 +1263,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # After warmup, pin each worker's threads near its chip: "numa" (its
+    # chip's NUMA node) or "slice" (own physical cores on that node, keeping
+    # VLLM_TPU_CPU_PIN_RESERVE cores per node free). See worker/cpu_pinning.py.
+    "VLLM_TPU_CPU_PIN": env_with_choices(
+        "VLLM_TPU_CPU_PIN", "off", ["off", "numa", "slice"]
+    ),
+    "VLLM_TPU_CPU_PIN_RESERVE": env_nonnegative_int("VLLM_TPU_CPU_PIN_RESERVE", 2),
+    # Log each worker's thread CPU placement every N seconds (0 = off).
+    "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has
