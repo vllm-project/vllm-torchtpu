@@ -54,6 +54,7 @@ _PHASES = {
     "m_consume_tail",
     "m_consume_last",
     "m_remaining_columns",
+    "m_expert_block",
     "m_emit_subtotals",
     "m_ring_poll",
     "m_ring_drain",

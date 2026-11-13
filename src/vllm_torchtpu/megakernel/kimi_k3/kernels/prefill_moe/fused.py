@@ -1491,7 +1491,9 @@ def _routed_experts(
 
     Down columns are 1792 wide below 8K, 896 at 8K and 512 at 16K (the
     window's FP32 token sums of one column block fill half of VMEM either
-    way); the remaining columns pair expert tiles up to 8K.
+    way); the remaining columns take one expert tile per step
+    (_single_tile_columns), polling the reduce ring before every tile at 16K
+    and before every other tile below.
     """
     columns = {8192: 896, 16384: 512}.get(tokens, 1792)
     tile = 128 if tokens < 8192 else 256
@@ -1638,7 +1640,7 @@ def _routed_experts(
             metadata.gm_id_to_m_offset[1] = 0
 
         ng = jnp.maximum(active_ng, 1)
-        (xs, ws), _ = k.generate_block_specs(metadata, cfg)
+        (_, ws), _ = k.generate_block_specs(metadata, cfg)
         state[0] = 0
         _phase_end(scope)
 
@@ -1916,90 +1918,30 @@ def _routed_experts(
         def remaining_columns(subtotal_vmem):
             emit_subtotals(subtotal_vmem)
             state[0] = 0
-            rows = middle.reshape(-1, sub, mid_width)
+            # Below 16K, a reduce-ring poll every other tile (rounds alternating
+            # with the polls) bounds the polling cost of the shorter columns.
+            spaced = tokens < 16384
 
-            def paired_tiles(n, column_ws):
-                """The tiles of column ``n``, two expert tiles per pipeline step."""
-                # Tiles 2h and 2h + 1 (an odd count's last step fetches its last
-                # tile twice and skips the copy), with one reduce-ring poll per
-                # step: half the steps' fixed cost. Two buffers per input: each
-                # step's pair plus the next pair in flight.
-                def paired(spec, second):
-                    index_map = spec.index_map
-
-                    def mapped(i, h, k):
-                        return index_map(i, jnp.minimum(2 * h + second, ng - 1), k)
-
-                    return dataclasses.replace(
-                        spec, index_map=mapped, pipeline_mode=pl.Buffered(buffer_count=2)
-                    )
-
-                def pair(specs, second):
-                    return jax.tree.map(
-                        lambda spec: paired(spec, second),
-                        specs,
-                        is_leaf=lambda v: isinstance(v, pl.BlockSpec),
-                    )
-
-                def remaining(xa, xb, wa, wb, metadata):
-                    h = pl.program_id(1)
-                    inner(
-                        xa, wa, metadata, subtotal_vmem=subtotal_vmem, tile=2 * h,
-                        column=n, poll_round=h,
-                    )
-
-                    @pl.when(2 * h + 1 < ng)
-                    def second():
-                        inner(
-                            xb, wb, metadata, subtotal_vmem=subtotal_vmem,
-                            tile=2 * h + 1, column=n, poll=False,
-                        )
-
-                pltpu.emit_pipeline(
-                    remaining,
-                    grid=(1, (ng + 1) // 2, 1),
-                    in_specs=(
-                        pair(xs, 0), pair(xs, 1), pair(column_ws, 0), pair(column_ws, 1)
-                    ),
-                    out_specs=(),
-                )(rows, rows, w, w, scratches=(metadata,))
-
-            if tokens == 16384:
-                # The 16K token sums leave no room for a second tile's blocks.
-                def step(x, w, g, n):
-                    inner(
-                        x, w, metadata, subtotal_vmem=subtotal_vmem, tile=g, column=n
-                    )
-
-                block = cfg.rhs_cfgs.quant_block_size
-                pl.run_scoped(
-                    functools.partial(
-                        _single_tile_columns, step,
-                        lambda n: finish_column(n, subtotal_vmem), metadata, ng,
-                        middle, w, columns=(1, width // tn), sublane=sub,
-                    ),
-                    rows_buf=pltpu.VMEM((2, tm, mid_width), x.dtype),
-                    weight_buf=pltpu.VMEM((2, mid_width, tn), w.weight.dtype),
-                    scale_buf=pltpu.VMEM((2, mid_width // block, tn), w.scale.dtype),
-                    sems=pltpu.SemaphoreType.DMA((3, 2)),
-                    run=pltpu.SMEM((1,), jnp.int32),
+            def step(x, w, g, n):
+                inner(
+                    x, w, metadata, subtotal_vmem=subtotal_vmem, tile=g, column=n,
+                    poll=(g % 2 == 0) if spaced else True,
+                    poll_round=g // 2 if spaced else g,
                 )
-            else:
-                # One pipeline per column, followed by the column's finish, so
-                # that the pipeline's step loop holds only the per-tile work.
-                @pl.loop(1, width // tn)
-                def column(n):
-                    def at_column(spec):
-                        index_map = spec.index_map
-                        return dataclasses.replace(
-                            spec, index_map=lambda _, g, k: index_map(n, g, k)
-                        )
 
-                    column_ws = jax.tree.map(
-                        at_column, ws, is_leaf=lambda v: isinstance(v, pl.BlockSpec)
-                    )
-                    paired_tiles(n, column_ws)
-                    finish_column(n, subtotal_vmem)
+            block = cfg.rhs_cfgs.quant_block_size
+            pl.run_scoped(
+                functools.partial(
+                    _single_tile_columns, step,
+                    lambda n: finish_column(n, subtotal_vmem), metadata, ng,
+                    middle, w, columns=(1, width // tn), sublane=sub,
+                ),
+                rows_buf=pltpu.VMEM((2, tm, mid_width), x.dtype),
+                weight_buf=pltpu.VMEM((2, mid_width, tn), w.weight.dtype),
+                scale_buf=pltpu.VMEM((2, mid_width // block, tn), w.scale.dtype),
+                sems=pltpu.SemaphoreType.DMA((3, 2)),
+                run=pltpu.SMEM((1,), jnp.int32),
+            )
 
             with _phase("m_ring_final_drain"):
                 advance(jnp.int32(32), width // tn - 1, subtotal_vmem, drain=True)
