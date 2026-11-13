@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -945,3 +946,65 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
 def test_supports_talker_mtp_graph_capture_disabled():
     assert OmniTpuPlatform.supports_talker_mtp_graph_capture() is False
     assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False
+
+
+@pytest.mark.parametrize(
+    ("model_class_name", "ulysses_degree", "ulysses_mode", "expected"),
+    [
+        # 30 heads % 8 != 0 and user left the default -> promoted.
+        ("ZImagePipeline", 8, "strict", "advanced_uaa"),
+        ("ZImagePipeline", 4, "strict", "advanced_uaa"),
+        # Divisors of 30 stay in strict mode.
+        ("ZImagePipeline", 2, "strict", "strict"),
+        ("ZImagePipeline", 6, "strict", "strict"),
+        # No sequence parallelism -> untouched.
+        ("ZImagePipeline", 1, "strict", "strict"),
+        # An explicit user choice is never overridden.
+        ("ZImagePipeline", 8, "advanced_uaa", "advanced_uaa"),
+        # Models outside the table keep vLLM-Omni's default behaviour.
+        ("FluxPipeline", 8, "strict", "strict"),
+        (None, 8, "strict", "strict"),
+    ],
+)
+def test_init_diffusion_model_runner_runtime_ulysses_mode(
+    model_class_name, ulysses_degree, ulysses_mode, expected
+):
+    od_config = SimpleNamespace(
+        model_class_name=model_class_name,
+        parallel_config=SimpleNamespace(
+            ulysses_degree=ulysses_degree, ulysses_mode=ulysses_mode
+        ),
+    )
+    OmniTpuPlatform.init_diffusion_model_runner_runtime(
+        vllm_config=None, od_config=od_config, device=torch.device("cpu")
+    )
+    assert od_config.parallel_config.ulysses_mode == expected
+
+
+def test_init_diffusion_model_runner_runtime_without_parallel_config():
+    # Configs with parallel_config=None are left alone.
+    OmniTpuPlatform.init_diffusion_model_runner_runtime(
+        vllm_config=None,
+        od_config=SimpleNamespace(
+            model_class_name="ZImagePipeline", parallel_config=None
+        ),
+        device=torch.device("cpu"),
+    )
+
+
+def test_ulysses_head_counts_matches_upstream_z_image():
+    from vllm_omni.diffusion.models.z_image.z_image_transformer import (
+        ZImageTransformer2DModel,
+    )
+    from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+    from vllm_torchtpu.omni.platform import _ULYSSES_HEAD_COUNTS
+
+    assert "ZImagePipeline" in _DIFFUSION_MODELS
+    assert "ZImagePipeline" in _ULYSSES_HEAD_COUNTS
+    n_heads_default = (
+        inspect.signature(ZImageTransformer2DModel.__init__)
+        .parameters["n_heads"]
+        .default
+    )
+    assert n_heads_default == _ULYSSES_HEAD_COUNTS["ZImagePipeline"]
