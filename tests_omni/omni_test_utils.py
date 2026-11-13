@@ -13,8 +13,22 @@
 # limitations under the License.
 """Numerical-parity and image-metric helpers shared by the Omni tests."""
 
+from __future__ import annotations
+
+import contextlib
+from collections.abc import Iterator
+from typing import Any
+
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.attention.mm_encoder_attention import (
+    MMEncoderAttention,
+)
+from vllm.model_executor.layers.conv import Conv3dLayer
+from vllm.model_executor.layers.linear import LinearBase
 
 
 def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
@@ -85,3 +99,103 @@ def assert_all_loaded(loaded: set[str], module: torch.nn.Module) -> None:
     assert not missing, (
         f"vllm-omni parameters not loaded from checkpoint: {sorted(missing)[:10]}"
     )
+
+
+def init_test_weights(module: nn.Module, seed: int = 0) -> None:
+    """Seed vLLM CustomOp layers (``LinearBase``, ``Conv3dLayer``) deterministically."""
+    generator = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for submodule in module.modules():
+            if isinstance(submodule, (LinearBase, Conv3dLayer)):
+                for param in submodule.parameters(recurse=False):
+                    if param.dim() > 1:
+                        param.copy_(
+                            torch.randn(param.shape, generator=generator) * 0.02
+                        )
+                    else:
+                        param.zero_()
+
+
+def use_native_ops_on_cpu(module: nn.Module) -> None:
+    """Bind CPU-compatible reference methods on vLLM ``CustomOp`` instances."""
+
+    def _attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: Any = None,
+        **_: Any,
+    ) -> torch.Tensor:
+        del max_seqlen
+        q, k, v = (t.transpose(1, 2).double() for t in (query, key, value))
+        bounds = cu_seqlens.tolist() if cu_seqlens is not None else [0, q.shape[2]]
+        scale = q.shape[-1] ** -0.5
+        out = torch.empty_like(q)
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            if start >= q.shape[2] or end <= start:
+                continue
+            end_clipped = min(int(end), int(q.shape[2]))
+            scores = (
+                q[:, :, start:end_clipped]
+                @ k[:, :, start:end_clipped].transpose(-1, -2)
+                * scale
+            )
+            out[:, :, start:end_clipped] = (
+                scores.softmax(dim=-1) @ v[:, :, start:end_clipped]
+            )
+        return out.transpose(1, 2).to(query.dtype)
+
+    def _make_conv3d_cpu_forward(conv_mod: Conv3dLayer) -> Any:
+        def _conv3d_forward(x: torch.Tensor) -> torch.Tensor:
+            # vLLM Conv3dLayer flattens patches [N, C * T * H * W] as a linear
+            # projection.
+            w = conv_mod.weight.view(conv_mod.out_channels, -1)
+            return F.linear(x.reshape(x.shape[0], -1), w, conv_mod.bias)
+
+        return _conv3d_forward
+
+    for submodule in module.modules():
+        if isinstance(submodule, MMEncoderAttention):
+            submodule._forward_method = _attention
+        elif isinstance(submodule, Conv3dLayer):
+            submodule._forward_method = _make_conv3d_cpu_forward(submodule)
+        elif isinstance(submodule, CustomOp):
+            submodule._forward_method = submodule.forward_native
+
+
+@contextlib.contextmanager
+def isolate_thinker_patch_targets() -> Iterator[None]:
+    """Snapshot and restore Qwen3-Omni Thinker patch targets across a test."""
+    from vllm_omni.model_executor.models.qwen3_omni import (
+        qwen3_omni_moe_thinker as thinker_mod,
+    )
+
+    audio_cls = thinker_mod.Qwen3OmniMoeAudioEncoder
+    vit_cls = thinker_mod.Qwen3Omni_VisionTransformer
+
+    saved_audio = {
+        attr: audio_cls.__dict__.get(attr)
+        for attr in (
+            "forward",
+            "prepare_encoder_metadata",
+            "forward_with_encoder_metadata",
+            "_tpu_orig_forward",
+        )
+    }
+    saved_vit = {
+        attr: vit_cls.__dict__.get(attr) for attr in ("forward", "_tpu_orig_forward")
+    }
+    try:
+        yield
+    finally:
+        for cls, saved in (
+            (audio_cls, saved_audio),
+            (vit_cls, saved_vit),
+        ):
+            for attr, val in saved.items():
+                if val is None:
+                    if attr in cls.__dict__:
+                        delattr(cls, attr)
+                else:
+                    setattr(cls, attr, val)
