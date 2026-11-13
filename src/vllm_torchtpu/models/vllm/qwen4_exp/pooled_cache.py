@@ -7,7 +7,6 @@ from dataclasses import replace
 import torch
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.v1.core.kv_cache_utils import (
-    _get_kv_cache_bytes_per_block,
     _project_kv_cache_groups_to_worker,
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
@@ -26,6 +25,7 @@ from vllm_torchtpu.utils import compute_hbm_budget, synchronize_tensors
 from .cache import TEMP_HEADROOM, logger
 from .config import (
     check_producer_draft_grouping,
+    get_qsa_kv_cache_bytes_per_block,
     hbm_pool_sizing,
     mtp_layer_prefixes,
     native_cache_capacity,
@@ -82,7 +82,7 @@ class Qwen4ExpPooledCache:
             if pd_prefill_mtp_producer(cfg):
                 check_producer_draft_grouping(cfg, model_specs, model_groups)
             self.groups = _project_kv_cache_groups_to_worker(model_groups, self.specs)
-        self.block_bytes = _get_kv_cache_bytes_per_block(self.groups)
+        self.block_bytes = get_qsa_kv_cache_bytes_per_block(self.groups, cfg)
         self.hbm_sizing = hbm_pool_sizing(cfg)
         # Pages of the current pool; for static sizing, the fixed capacity
         # the config hook planned from the whole model.
@@ -405,13 +405,29 @@ class Qwen4ExpPooledCache:
             self.allocate()
         runner = self.runner
         runner.qwen4_stage_page_map = None
-        if config.num_blocks != self.native_config.num_blocks:
+        planned = self.native_config
+        assert planned is not None
+        if config.num_blocks != planned.num_blocks:
             # The scheduler plans more block IDs than this stage has pages;
             # the stage maps its own groups' IDs onto its pool.
-            config = self._bind_stage_page_map(config)
-        assert config == self.native_config, (
+            planned = self._bind_stage_page_map(config)
+            config = replace(
+                config,
+                num_blocks=planned.num_blocks,
+                kv_cache_tensors=planned.kv_cache_tensors,
+                kv_cache_groups=planned.kv_cache_groups,
+            )
+        # vLLM 0.32's engine core also resolves the layout and prefix-cache
+        # granularity into the config it hands back; only the pool plan must
+        # match. Adopt the engine's resolved fields.
+        assert (
+            config.num_blocks,
+            config.kv_cache_tensors,
+            config.kv_cache_groups,
+        ) == (planned.num_blocks, planned.kv_cache_tensors, planned.kv_cache_groups), (
             "Qwen4Exp native pool plan changed after profiling"
         )
+        self.native_config = config
         runner.kv_cache_config = config
         runner.empty_slot_mappings = {
             gid: torch.empty(0, device=runner.device) for gid in range(len(self.groups))
@@ -466,6 +482,7 @@ class Qwen4ExpPooledCache:
         # must trace the same checkpoint/read-offset branches serving takes.
         window = num_speculative_tokens(self.runner.vllm_config) + 1
         read_offsets = None
+        mamba_distribution = None
         if window > 1:
             read_offsets = torch.zeros(
                 self.pages, dtype=torch.int32, device=self.runner.device
@@ -476,20 +493,43 @@ class Qwen4ExpPooledCache:
             combined = torch.cat([metadata.request_distribution] * 2)
             metadata = replace(metadata, request_distribution=combined[0:3])
             mamba_distribution = combined[3:6]
+        # VLLM_TPU_MAMBA_TAIL_FOLD: serving hands every state group one shared
+        # checkpoint tensor; trace the same input (all zero: no checkpoint).
+        prefill_ckpt = None
+        if any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            and g.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+            for g in self.groups
+        ):
+            prefill_ckpt = torch.zeros(
+                (2, rows), dtype=torch.int32, device=self.runner.device
+            )
         for group in self.groups:
             spec = group.kv_cache_spec
             state = isinstance(spec, MambaSpec)
             ring = isinstance(spec, CircularBufferSpec)
+            # A state group's table is read only through its state and
+            # checkpoint indices, so `window` columns trace it. With the tail
+            # fold, `prefill_checkpoint_targets` also gathers each row's
+            # checkpoint block from the whole table inside the forward, so
+            # the compiled program (no guards) must trace the row width that
+            # serving stages: cdiv(max_model_len, block) + speculative
+            # blocks. A `window`-wide trace made the first served step pass
+            # s32[rows * 515] to a program built for s32[rows * 4]
+            # (RuntimeProgramInputMismatch).
+            wide = not state or prefill_ckpt is not None
             columns = (
-                window
-                if state
-                else get_block_table_width(
+                get_block_table_width(
                     spec.max_num_blocks_per_req(
                         self.runner.vllm_config, self.runner.max_model_len
                     ),
                     spec.block_size,
                 )
+                if wide
+                else window
             )
+            if state:
+                columns = max(columns, window)
             table = torch.zeros((rows, columns), dtype=torch.int32, device="cpu")
             for row in range(active_rows):
                 req_blocks = max(
@@ -514,9 +554,13 @@ class Qwen4ExpPooledCache:
                     item,
                     mamba_state_indices=table[:, 0].clone(),
                     mamba_slot_read_offsets=read_offsets,
-                    mamba_ckpt_indices=table.clone(),
+                    mamba_ckpt_indices=(
+                        table[:, :window].clone() if columns > window else table.clone()
+                    ),
                     mamba_request_distribution=mamba_distribution,
                 )
+            if state and prefill_ckpt is not None:
+                item = replace(item, mamba_prefill_ckpt=prefill_ckpt)
             result.update({name: item for name in group.layer_names})
         assert next_page <= self.pages, "dummy owner pages exceed the planned pool"
         return result

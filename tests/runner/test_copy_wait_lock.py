@@ -46,7 +46,9 @@ def test_pinned_copy_reuses_a_ring_and_copies_tokens_out(monkeypatch):
         def synchronize(self):
             pass
 
-    monkeypatch.setattr(mod.torch, "tpu", type("T", (), {"Event": _Event}), raising=False)
+    monkeypatch.setattr(
+        mod.torch, "tpu", type("T", (), {"Event": _Event}), raising=False
+    )
     states = []
     for step in range(mod._PINNED_RING + 2):
         src = torch.full((6,), step, dtype=torch.int32)

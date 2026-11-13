@@ -9,12 +9,16 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
+    _chunk_ranges,
     _scatter_bitset,
     _selection_bitset,
 )
 
 
-def _expected(blocks, lengths, *, ratio, groups, words, query_block, width):
+def _expected(
+    blocks, lengths, *, ratio, groups, words, query_block, width, ranged=False
+):
+    del ranged
     bitset = _scatter_bitset(
         jnp.asarray(blocks),
         jnp.asarray(lengths),
@@ -24,6 +28,11 @@ def _expected(blocks, lengths, *, ratio, groups, words, query_block, width):
     )
     bitset = np.asarray(bitset).reshape(-1, query_block, words).transpose(0, 2, 1)
     return np.pad(bitset, ((0, 0), (0, 0), (0, width - query_block)))
+
+
+@pytest.fixture(params=[False, True], ids=["full", "ranged"])
+def ranged(request):
+    return request.param
 
 
 def _actual(blocks, lengths, **kwargs):
@@ -63,8 +72,9 @@ CASES = [
 
 @pytest.mark.parametrize("tokens,k,groups,query_block,kv_tile", CASES)
 @pytest.mark.parametrize("seed", [0, 1])
+@pytest.mark.parametrize("ascending", [False, True])
 def test_indexer_like_selections_match_scatter(
-    tokens, k, groups, query_block, kv_tile, seed
+    tokens, k, groups, query_block, kv_tile, seed, ranged, ascending
 ):
     ratio = 4
     rng = np.random.default_rng(seed)
@@ -78,8 +88,18 @@ def test_indexer_like_selections_match_scatter(
     lengths[multiple] = lengths[multiple] // ratio * ratio
     lengths[: min(tokens, 3)] = groups * ratio - np.arange(min(tokens, 3))
     blocks = _topk(rng, tokens, k, groups, lengths, ratio)
+    if ascending:
+        # The SparseCore top-k's order: ascending ids, -1 suffix.
+        blocks = np.where(blocks < 0, np.iinfo(np.int32).max, blocks)
+        blocks = np.sort(blocks, axis=1)
+        blocks = np.where(blocks == np.iinfo(np.int32).max, -1, blocks)
     kwargs = dict(
-        ratio=ratio, groups=groups, words=words, query_block=query_block, width=width
+        ratio=ratio,
+        groups=groups,
+        words=words,
+        query_block=query_block,
+        width=width,
+        ranged=ranged,
     )
     np.testing.assert_array_equal(
         _actual(blocks, lengths, **kwargs), _expected(blocks, lengths, **kwargs)
@@ -87,7 +107,7 @@ def test_indexer_like_selections_match_scatter(
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
-def test_adversarial_selections_match_scatter(seed):
+def test_adversarial_selections_match_scatter(seed, ranged):
     """Duplicates, interior -1, out-of-range IDs and all-empty blocks."""
     ratio, groups, query_block, tokens, k = 4, 1500, 32, 160, 24
     rng = np.random.default_rng(seed)
@@ -105,14 +125,19 @@ def test_adversarial_selections_match_scatter(seed):
     # Extreme groups.
     blocks[10, :2] = (0, groups - 1)
     kwargs = dict(
-        ratio=ratio, groups=groups, words=words, query_block=query_block, width=128
+        ratio=ratio,
+        groups=groups,
+        words=words,
+        query_block=query_block,
+        width=128,
+        ranged=ranged,
     )
     np.testing.assert_array_equal(
         _actual(blocks, lengths, **kwargs), _expected(blocks, lengths, **kwargs)
     )
 
 
-def test_word_carries_match_scatter_add():
+def test_word_carries_match_scatter_add(ranged):
     """Duplicate bits add with carry, exactly like the scatter-add."""
     ratio, groups, query_block = 4, 256, 8
     words = _geometry(ratio, 128, groups)
@@ -121,7 +146,12 @@ def test_word_carries_match_scatter_add():
     blocks[1] = (31, 31, 63, 63, 0)
     lengths = np.full((8,), 4 * 200 + 1, np.int32)
     kwargs = dict(
-        ratio=ratio, groups=groups, words=words, query_block=query_block, width=128
+        ratio=ratio,
+        groups=groups,
+        words=words,
+        query_block=query_block,
+        width=128,
+        ranged=ranged,
     )
     actual = _actual(blocks, lengths, **kwargs)
     np.testing.assert_array_equal(actual, _expected(blocks, lengths, **kwargs))
@@ -130,10 +160,38 @@ def test_word_carries_match_scatter_add():
     assert actual[0, 6, 0] == 1 << (200 % 32)
 
 
-def test_empty_input():
-    kwargs = dict(ratio=4, groups=64, words=128, query_block=8, width=128)
+def test_empty_input(ranged):
+    kwargs = dict(
+        ratio=4, groups=64, words=128, query_block=8, width=128, ranged=ranged
+    )
     blocks = np.full((16, 4), -1, np.int32)
     lengths = np.zeros((16,), np.int32)
     actual = _actual(blocks, lengths, **kwargs)
     assert actual.shape == (2, 128, 128)
     assert not actual.any()
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_chunk_ranges_cover_every_word_of_each_group(seed):
+    """Every chunk holding a word of group g lies in [lo, hi), in any order;
+    on ascending rows the ranges are a small fraction of the chunks."""
+    rng = np.random.default_rng(seed)
+    nblocks, rows, width, groups = 3, 64, 16, 40
+    word = rng.integers(-1, groups * 8, (nblocks, rows, width)).astype(np.int32)
+    word[1] = -1
+    for order in ("random", "ascending"):
+        if order == "ascending":
+            word = np.sort(np.where(word < 0, 1 << 30, word), axis=1)
+            word = np.where(word == 1 << 30, -1, word).astype(np.int32)
+        lo, hi = (
+            np.asarray(x).reshape(nblocks, groups)
+            for x in _chunk_ranges(jnp.asarray(word), groups)
+        )
+        assert np.all(hi >= lo)
+        chunk_groups = word.reshape(nblocks, rows // 8, -1)
+        for b in range(nblocks):
+            for c in range(rows // 8):
+                for g in set(chunk_groups[b, c][chunk_groups[b, c] >= 0] // 8):
+                    assert lo[b, g] <= c < hi[b, g], (order, b, c, g)
+        if order == "ascending":
+            assert np.mean(hi - lo) < rows // 8 / 2

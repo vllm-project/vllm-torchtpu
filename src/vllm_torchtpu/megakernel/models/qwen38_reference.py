@@ -52,7 +52,7 @@ def segment_reference(
     L: int,
     moe_inputs: list | None = None,
     head: bool = False,
-) -> tuple[jax.Array, dict[str, Any]]:
+) -> tuple[jax.Array, dict[int, Any]]:
     """Return `(new residual [B, NHC*H], {gdn_idx: new GDN states})`.
 
     `moe_inputs`, when a list, receives each layer's MoE input `[B, H]`.

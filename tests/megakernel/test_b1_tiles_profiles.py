@@ -20,6 +20,7 @@ import os
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
 import dataclasses
+import gc
 import subprocess
 import sys
 from typing import Any
@@ -28,10 +29,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from conftest import EXACT_FLIPS, tile_field, with_tile_fields
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from tests.megakernel.megakernel_helpers import (
+    EXACT_FLIPS,
+    tile_field,
+    with_tile_fields,
+)
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import profile as profile_mod
 from vllm_torchtpu.megakernel.cache import should_use_pool_gather
@@ -43,6 +48,13 @@ from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_
 def _use_cpu_default_device():
     with jax.default_device(jax.devices("cpu")[0]):
         yield
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _clear_out_cache():
+    yield
+    _OUT_CACHE.clear()
+    gc.collect()
 
 
 def test_per_bucket_thresholds_come_from_tiles():
@@ -256,15 +268,12 @@ def _flip_exec(
 
 def _pooled_outputs(prof: mk.Profile | str, *, T: int, B: int, **kw: Any) -> list:
     """Bytes of hidden + pools of one tiny paged pooled step under `prof` (cached)."""
-    key = (
-        prof if isinstance(prof, str) else id(prof),
-        T,
-        B,
-        repr(sorted(kw.items())),
-    )
-    if key not in _OUT_CACHE:
-        _OUT_CACHE[key] = _pooled_outputs_uncached(prof, T=T, B=B, **kw)
-    return _OUT_CACHE[key]
+    if prof == _QWEN35_DEFAULT and not kw:
+        key = (prof, T, B)
+        if key not in _OUT_CACHE:
+            _OUT_CACHE[key] = _pooled_outputs_uncached(prof, T=T, B=B)
+        return _OUT_CACHE[key]
+    return _pooled_outputs_uncached(prof, T=T, B=B, **kw)
 
 
 def _pooled_outputs_uncached(
@@ -290,7 +299,17 @@ def _pooled_outputs_uncached(
         mesh, spec, ex, donate=False
     )
     out, raw = step(pos, hid_mk, w_mk, pools, pt, ckpt, roff)
-    return [np.asarray(x).view(np.uint8) for x in (out, *raw)]
+    res = [np.asarray(x).view(np.uint8).copy() for x in (out, *raw)]
+    del step, out, raw, pools, hid_mk, w_mk
+    from tests.conftest import (
+        _CPU_JAX_GROUP_RSS_LIMIT_MIB,
+        _current_rss_mib,
+        _reclaim_cpu_jax_memory,
+    )
+
+    if _current_rss_mib() >= _CPU_JAX_GROUP_RSS_LIMIT_MIB:
+        _reclaim_cpu_jax_memory()
+    return res
 
 
 def _assert_same(a: list, b: list) -> None:

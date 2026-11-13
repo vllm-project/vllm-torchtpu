@@ -40,7 +40,12 @@ def written(monkeypatch, run_write, args, options):
     "layout", ["fp8_paired_slot1_packed_k", "fp8_whole_rows", "bf16_whole_rows"]
 )
 @pytest.mark.parametrize("case", sorted(CASES))
-def test_run_writer_matches_write_compressed(interpret, monkeypatch, case, layout):
+def test_run_writer_matches_write_compressed(
+    interpret,  # noqa: F811
+    monkeypatch,
+    case,
+    layout,
+):
     dtype, options = LAYOUTS[layout]
     query_lens, contexts = CASES[case]
     args = make_step(np.random.default_rng(5), query_lens, contexts, dtype)

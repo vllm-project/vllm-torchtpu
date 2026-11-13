@@ -111,10 +111,7 @@ def hc_combine(
     blk = rnd(block.astype(F32))
     x = x.astype(F32)
     return jnp.concatenate(
-        [
-            rnd(x[:, b * h : (b + 1) * h] + blk * inj[:, b : b + 1])
-            for b in range(nhc)
-        ],
+        [rnd(x[:, b * h : (b + 1) * h] + blk * inj[:, b : b + 1]) for b in range(nhc)],
         axis=-1,
     )
 

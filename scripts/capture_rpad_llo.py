@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Dump the LLO / Mosaic of the QSA RPA decode kernel (one config) for bundle study.
 
 Sets the libtpu dump flags before importing jax, compiles and runs one
@@ -28,10 +41,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import functools  # noqa: E402
 
+import bench_qsa_rpa_decode as b  # noqa: E402
 import jax  # noqa: E402
 import numpy as np  # noqa: E402
 
-import bench_qsa_rpa_decode as b  # noqa: E402
 from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa  # noqa: E402
 
 
@@ -43,8 +56,14 @@ def test_capture():
     )
     attend = jax.jit(
         functools.partial(
-            qsa_rpa._rpa_attention_batch, kv_heads=1, ratio=b.RATIO, k_scale=0.375,
-            v_scale=2.5, lean_fetch=True, decode_only=True, slot_read=True,
+            qsa_rpa._rpa_attention_batch,
+            kv_heads=1,
+            ratio=b.RATIO,
+            k_scale=0.375,
+            v_scale=2.5,
+            lean_fetch=True,
+            decode_only=True,
+            slot_read=True,
             kv_head_offset=1,
         ),
         donate_argnums=(5,),
@@ -58,7 +77,12 @@ def test_capture():
         jax.block_until_ready(out)
     dest.mkdir(parents=True, exist_ok=True)
     jf = sorted(Path(f"{LOCAL}/jf").rglob("*"))
-    print("jf files", len(jf), "mosaic files", len(list(Path(f"{LOCAL}/mosaic").rglob("*"))))
+    print(
+        "jf files",
+        len(jf),
+        "mosaic files",
+        len(list(Path(f"{LOCAL}/mosaic").rglob("*"))),
+    )
     with tarfile.open(dest / "jf.tgz", "w:gz") as tar:
         tar.add(f"{LOCAL}/jf", arcname="jf")
     with tarfile.open(dest / "mosaic.tgz", "w:gz") as tar:

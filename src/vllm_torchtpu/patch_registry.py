@@ -87,6 +87,7 @@ PATCHES = (
         _ENGINE,
         refresh="vllm_torchtpu:_patch_vllm_dcp_fine_prefix_hits",
     ),
+    Patch("vllm_torchtpu:_patch_vllm_qsa_dcp_fine_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_mamba_split_scheduler_block_size", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offloading_config_build", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offload_all_ranks_kv_bytes", _ENGINE),
@@ -95,6 +96,15 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_kv_cache_group_size", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
+    Patch("vllm_torchtpu.core.decode_priority:patch_decode_priority", _ENGINE),
+    Patch("vllm_torchtpu.compilation.aot_guard_skip:patch_aot_guard_skip", _ACTIVE),
+    Patch("vllm_torchtpu.core.zero_schedule_diag:patch_zero_schedule_diag", _ENGINE),
+    Patch(
+        "vllm_torchtpu.core.prefix_aware_scheduler:patch_prompt_ids_ndarray_early",
+        _ENGINE,
+    ),
+    # API server: reasoning-token count at stream end without tool re-parsing.
+    Patch("vllm_torchtpu.core.reasoning_count_patch:patch_reasoning_count_skip_tools", _ACTIVE),
     Patch(
         "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
         _ENGINE,
@@ -108,6 +118,8 @@ PATCHES = (
         "vllm_torchtpu.core.divergent_hybrid_hits:patch_divergent_hybrid_hits",
         _ENGINE,
     ),
+    # Outermost split wrapper: counts what the wrapped split folds.
+    Patch("vllm_torchtpu.core.mamba_tail_fold:patch_mamba_tail_fold", _ENGINE),
     # Victim host-tier policy hooks (inert unless the policy is on), after the
     # LIFO free patch and retention so they wrap the final free paths.
     Patch("vllm_torchtpu.offload.victim:patch_block_pool_victims", _ENGINE),

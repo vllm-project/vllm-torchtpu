@@ -8,9 +8,15 @@ import torch
 from vllm.distributed import GroupCoordinator
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
-from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
+try:
+    from transformers import Qwen4ExpTextConfig
+except ImportError:
+    from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
+
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
+    build_pooled_prefill_checkpoint_op,
     build_pooled_short_conv_op,
     build_pooled_speculative_short_conv_op,
     build_short_conv_op,
@@ -64,6 +70,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         self._finalized = False
         self._conv: Callable[..., torch.Tensor] | None = None
         self._speculative_conv: Callable[..., torch.Tensor] | None = None
+        self._prefill_checkpoint: Callable[..., None] | None = None
 
     @property
     def storage(self) -> ResidentPLETable:
@@ -96,6 +103,13 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         self.storage.finalize_weights()
         self._finalized = True
 
+    def lookup_partial(
+        self, inputs: PLEInputs, valid_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """This rank's raw n-gram rows before `parallel.combine` (resident table)."""
+        assert not self.cpu_offload and not self.parallel.across_dp
+        return self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens))
+
     def bind_history(self, history: torch.Tensor) -> None:
         if history.ndim != 3 or history.shape[1:] != self.state_shape:
             raise ValueError(f"PLE history must have shape [slots,{self.state_shape}]")
@@ -111,6 +125,10 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         self._speculative_conv = build_pooled_speculative_short_conv_op(
             self.conv_dilation, self.conv_state_len
         )
+        if envs.VLLM_TPU_MAMBA_TAIL_FOLD:
+            self._prefill_checkpoint = build_pooled_prefill_checkpoint_op(
+                self.conv_state_len
+            )
 
     def _lookup_ids(
         self, inputs: PLEInputs, valid_tokens: torch.Tensor
@@ -141,7 +159,9 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             self.prefix,
         )
 
-    def lookup_start(self, inputs: PLEInputs, valid_tokens: torch.Tensor) -> torch.Tensor:
+    def lookup_start(
+        self, inputs: PLEInputs, valid_tokens: torch.Tensor
+    ) -> torch.Tensor:
         """Device ids, then start their copy to the host (see ple_offload)."""
         assert self.cpu_offload
         return host_lookup_start(self._lookup_ids(inputs, valid_tokens), self.prefix)
@@ -171,9 +191,15 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         raw_embeddings: torch.Tensor | None = None,
         speculative: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         sequence_parallel: bool = False,
+        prefill_ckpt: tuple[torch.Tensor, torch.Tensor] | None = None,
+        combined_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``speculative`` is (read_ids, ckpt_ids, windowed) on the unified pool
         with speculative decoding; see ``pooled_short_conv_speculative``.
+
+        ``prefill_ckpt`` is (offsets, block ids) per request on the unified
+        pool (VLLM_TPU_MAMBA_TAIL_FOLD): the history at each nonzero offset
+        is also written to its block; see ``write_prefill_checkpoint``.
 
         With ``sequence_parallel`` the hidden states and the returned rows are
         this TP rank's token shard (see ``sequence_parallel``); the lookup,
@@ -184,7 +210,10 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         )
         assert self._finalized and self._conv is not None
         assert len(self.cache_owners) == 1
-        if self.cpu_offload:
+        if combined_raw is not None:
+            # `lookup_partial` rows already combined (merged_embed_all_reduce).
+            raw = combined_raw
+        elif self.cpu_offload:
             assert raw_embeddings is not None, "Host PLE requires prepared raw rows"
             # Own narrow-type inputs before in-place collective dtype views.
             raw = raw_embeddings.reshape(
@@ -195,15 +224,17 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             ).clone()
         else:
             raw = self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens))
-        raw = self.parallel.combine(raw, num_tokens)
+        if combined_raw is None:
+            raw = self.parallel.combine(raw, num_tokens)
         gated = self.gated_values(
             hidden_states,
             self.storage.decode(raw),
             num_tokens if sequence_parallel else None,
         )
+        normed = self.norm_conv(gated)
         if speculative is None:
             conv = self._conv(
-                self.norm_conv(gated),
+                normed,
                 self.conv1d.weight[:, 0],
                 self.cache_owners[0],
                 inputs.query_start_loc,
@@ -214,7 +245,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             assert self._speculative_conv is not None, "bind the pool first"
             read_ids, ckpt_ids, windowed = speculative
             conv = self._speculative_conv(
-                self.norm_conv(gated),
+                normed,
                 self.conv1d.weight[:, 0],
                 self.cache_owners[0],
                 inputs.query_start_loc,
@@ -223,6 +254,11 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
                 read_ids,
                 ckpt_ids,
                 windowed,
+            )
+        if prefill_ckpt is not None:
+            assert self._prefill_checkpoint is not None, "bind the pool first"
+            self._prefill_checkpoint(
+                self.cache_owners[0], normed, inputs.query_start_loc, *prefill_ckpt
             )
         if state_indices.shape[0] == 0:
             return torch.zeros_like(hidden_states)

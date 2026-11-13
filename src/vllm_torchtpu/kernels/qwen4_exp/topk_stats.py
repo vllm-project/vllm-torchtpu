@@ -10,11 +10,28 @@ sum of the rows' selections (what fetching a request's union once would save).
 import jax
 import numpy as np
 
-_acc = {"calls": 0, "rows": 0, "runs": 0, "picks": 0, "pairs": 0, "shared": 0, "union": 0, "sum4": 0}
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+_acc = {
+    "calls": 0,
+    "rows": 0,
+    "runs": 0,
+    "picks": 0,
+    "pairs": 0,
+    "shared": 0,
+    "union": 0,
+    "sum4": 0,
+}
 
 
 def _record(blocks, lengths, starts, every):
-    blocks, lengths, starts = np.asarray(blocks), np.asarray(lengths), np.asarray(starts)
+    blocks, lengths, starts = (
+        np.asarray(blocks),
+        np.asarray(lengths),
+        np.asarray(starts),
+    )
     a = _acc
     a["calls"] += 1
     sets = []
@@ -27,7 +44,11 @@ def _record(blocks, lengths, starts, every):
             a["runs"] += 1 + int(np.count_nonzero(np.diff(g) != 1))
     for r in range(len(starts) - 1):
         lo, hi = int(starts[r]), int(starts[r + 1])
-        if hi - lo != 4 or hi > len(sets) or not all(len(sets[i]) for i in range(lo, hi)):
+        if (
+            hi - lo != 4
+            or hi > len(sets)
+            or not all(len(sets[i]) for i in range(lo, hi))
+        ):
             continue
         for i in range(lo, hi - 1):
             a["pairs"] += len(sets[i])
@@ -35,18 +56,18 @@ def _record(blocks, lengths, starts, every):
         a["union"] += len(np.unique(np.concatenate(sets[lo:hi])))
         a["sum4"] += sum(len(sets[i]) for i in range(lo, hi))
     if a["calls"] % every == 0 and a["rows"]:
-        print(
-            "qsa topk stats calls=%d rows=%d mean_run=%.2f adj_overlap=%.3f union_over_sum=%.3f"
-            % (
-                a["calls"],
-                a["rows"],
-                a["picks"] / max(a["runs"], 1),
-                a["shared"] / max(a["pairs"], 1),
-                a["union"] / max(a["sum4"], 1),
-            ),
-            flush=True,
+        logger.info(
+            "qsa topk stats calls=%d rows=%d mean_run=%.2f "
+            "adj_overlap=%.3f union_over_sum=%.3f",
+            a["calls"],
+            a["rows"],
+            a["picks"] / max(a["runs"], 1),
+            a["shared"] / max(a["pairs"], 1),
+            a["union"] / max(a["sum4"], 1),
         )
 
 
 def record(blocks, lengths, starts, every: int) -> None:
-    jax.debug.callback(lambda b, l, s: _record(b, l, s, every), blocks, lengths, starts)
+    jax.debug.callback(
+        lambda b, ln, s: _record(b, ln, s, every), blocks, lengths, starts
+    )

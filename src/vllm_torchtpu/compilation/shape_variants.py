@@ -33,6 +33,8 @@ ShapeEnv, vLLM drops that guard, and nothing here can see it.
 from __future__ import annotations
 
 import contextlib
+import os
+import re
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -153,6 +155,64 @@ def _signature(graph: fx.GraphModule) -> tuple:
     return tuple(shape(value) for value in _placeholder_values(graph))
 
 
+# One compiled range can serve many decoder layers, so a layer index in a state
+# path is not part of the state's identity.
+_MODULE_INDEX = re.compile(r"_modules_\d+_")
+
+
+def _identities(graph: fx.GraphModule) -> tuple:
+    """Per placeholder (aligned with :func:`_signature`): which module state it
+    is, else None.
+
+    Dynamo lifts parameters and buffers as placeholders named after their path
+    (``l_self_modules_..._modules_attn_hyper_connection_buffers__up_t_``);
+    activations get trace-local names and match by shape only. Shapes alone
+    cannot tell two same-shaped weights apart, so a trace that takes them in
+    the other order would be handed a bucket with the two exchanged (t128:
+    HC down and the kept up transpose, both [320, 10240]).
+    """
+    out = []
+    for node in graph.graph.nodes:
+        if node.op != "placeholder":
+            break
+        if node.meta.get("example_value", node.meta.get("val")) is None:
+            continue
+        name = str(node.target)
+        if "_parameters_" in name or "_buffers_" in name:
+            out.append(_MODULE_INDEX.sub("_modules_#_", name))
+        else:
+            out.append(None)
+    return tuple(out)
+
+
+def _identity_mismatch(old: tuple, new: tuple, perm: list[int] | None) -> str | None:
+    """The first module state the new trace takes where the old one took
+    another, or None (positions mapped through ``perm`` when given)."""
+    if len(old) != len(new):
+        return f"{len(old)} vs {len(new)} placeholders"
+    for o, ident in enumerate(old):
+        n = perm[o] if perm is not None else o
+        if ident != new[n]:
+            return f"input {o}: {ident} vs {new[n]}"
+    return None
+
+
+def _check_identities(key: str, old: tuple, new: tuple, perm: list[int] | None) -> None:
+    mismatch = _identity_mismatch(old, new, perm)
+    if mismatch is None:
+        return
+    message = (
+        f"{key} was compiled by another trace of this model that takes its "
+        f"module state in another order ({mismatch}); handing it over would "
+        "bind those inputs exchanged."
+    )
+    if os.environ.get("VLLM_TPU_SHAPE_VARIANT_IDENTITY_WARN") == "1":
+        logger.warning("[shape-variants] %s (VLLM_TPU_SHAPE_VARIANT_IDENTITY_WARN=1: "
+                       "handing over anyway)", message)
+        return
+    raise ShapeSpecializationError(message)
+
+
 def _symint_sources(graph: fx.GraphModule) -> tuple:
     """Per placeholder: where a SymInt's value comes from, else None.
 
@@ -226,13 +286,15 @@ def symint_permutation(
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:
-    """:func:`_signature`, for callers outside this module.
+    """:func:`_signature` and :func:`_identities`, for callers outside this
+    module.
 
-    Stable across processes -- dtypes as strings, dims as ints or "?" -- so a
-    compile cache written by one run can check that the graph it is being
-    replayed against still takes the same inputs.
+    Stable across processes -- dtypes as strings, dims as ints or "?", state
+    paths as strings -- so a compile cache written by one run can check that
+    the graph it is being replayed against still takes the same inputs, the
+    same module state in the same order included.
     """
-    return _signature(graph)
+    return _signature(graph) + (("identities",) + _identities(graph),)
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +314,7 @@ class BucketExecutables:
 
     def __init__(self) -> None:
         self._runnables: dict[
-            tuple[str | None, str], tuple[Callable[..., Any], tuple, tuple]
+            tuple[str | None, str], tuple[Callable[..., Any], tuple, tuple, tuple]
         ] = {}
         self.refused: set[int] = set()
         self.traces = 0
@@ -263,13 +325,15 @@ class BucketExecutables:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature, sources = found
+        runnable, signature, sources, identities = found
         new_signature = _signature(graph)
         if signature == new_signature:
+            _check_identities(key, identities, _identities(graph), None)
             return runnable
         new_sources = _symint_sources(graph)
         perm = symint_permutation((signature, sources), (new_signature, new_sources))
         if perm is not None:
+            _check_identities(key, identities, _identities(graph), perm)
             moved = [
                 (o, n, sources[o]) if sources[o] is not None else (o, n)
                 for o, n in enumerate(perm)
@@ -306,6 +370,7 @@ class BucketExecutables:
             runnable,
             _signature(graph),
             _symint_sources(graph),
+            _identities(graph),
         )
 
     def needs_retrace(self, size: int) -> bool:

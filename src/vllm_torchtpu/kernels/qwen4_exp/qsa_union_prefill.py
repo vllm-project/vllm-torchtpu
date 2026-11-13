@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""QSA prefill over each query group's union of selected groups (D2 prototype, P-ATTN).
+"""QSA prefill over each query group's union of selected groups (D2 prototype).
 
 Not used by any served path. The block-sparse kernel computes every KV tile any
 of a 256-query block selected, which at served contexts is nearly every causal
@@ -18,8 +18,8 @@ the row the virtual length ``rank(tail) * ratio + position % ratio + 1``
 ratio) makes the kernel's causal mask hide exactly those, and keeps
 ``length % ratio``. Each row keeps the same keys and values; only the order of
 the online-softmax accumulation changes (not bitwise; equal precision).
-DeepSeek-V4's union-dense CSA (kernels/deepseek_v4/core_attention/
-csa_union_dense.py on its branch) is the template for a dedicated kernel.
+A union-dense CSA kernel
+is the template for a dedicated kernel.
 """
 
 import functools

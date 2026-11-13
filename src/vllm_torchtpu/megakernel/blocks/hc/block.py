@@ -23,9 +23,14 @@ The model's residual is `NHC` streams of width `h`; the core residual buffer
            static double-buffer `ar_slot` (one per layer slot, as in the core)
   combine  res_b = rnd(res_b + rnd(block) * 2 sigmoid(xn @ inj / NHC)_b)
 
+`fp8_weights` (target-model whole-step layers only, `VLLM_TPU_MK_HC_FP8`): the mix
+weights stream as FP8 E4M3 with per-output-column scales (`<name>_hdn_s`,
+`<name>_hup_s`), applied to the f32 matmul output.
+
 `down` and `inj` share one streamed weight (`<name>_hdn`, columns
 `[down | inj | pad]`); `up` is one weight per stream (`<name>_hup<b>`) so a
-128-row tile fits the weight bank. With `mix=False` the sublayer input comes from the inner
+128-row tile fits the weight bank. With `mix=False` the sublayer input comes from the
+inner
 block alone and `xn` is recomputed for the injection (`<name>_hinj`).
 
 The inner block sees a context whose geometry is `inner_geometry` (width `h`)
@@ -45,7 +50,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, rmsnorm, rnd, rup
+from ...ops import BF16, F32, FP8, rmsnorm, rnd, rup
 from ...spec import Block, ScratchReq, SmallField, StateDecl, WeightDecl
 from .comm import hc_comm_scratch, hc_drain, hc_ring
 
@@ -79,6 +84,7 @@ class HCSublayer(Block):
         allreduce: bool = True,
         emit_residual: bool = False,
         ar_slot: int = 0,
+        fp8_weights: bool = False,
     ) -> None:
         self.inner = inner
         self.gi = inner_geometry
@@ -89,6 +95,7 @@ class HCSublayer(Block):
         self.allreduce = bool(allreduce)
         self.emit_residual = bool(emit_residual)
         self.ar_slot = int(ar_slot)
+        self.fp8 = bool(fp8_weights) and self.mix
         self.prefix = getattr(inner, "prefix", "")
 
     # ------------------------------------------------------------ geometry
@@ -110,17 +117,18 @@ class HCSublayer(Block):
         return rup(self.lowrank, 128)
 
     def _check(self, g: Any) -> None:
-        assert g.H == self.width, (g.H, self.nhc, self.h)
+        assert self.width == g.H, (g.H, self.nhc, self.h)
 
     # ------------------------------------------------------- declarations
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         self._check(g)
         n = self.name
         if self.mix:
+            dt = FP8 if self.fp8 else BF16
             own = [
-                WeightDecl(f"{n}_hdn", K=self.width, N=self.n_down, dtype=BF16),
+                WeightDecl(f"{n}_hdn", K=self.width, N=self.n_down, dtype=dt),
             ] + [
-                WeightDecl(f"{n}_hup{b}", K=self.k_up, N=self.h, dtype=BF16)
+                WeightDecl(f"{n}_hup{b}", K=self.k_up, N=self.h, dtype=dt)
                 for b in range(self.nhc)
             ]
         else:
@@ -142,9 +150,13 @@ class HCSublayer(Block):
         return list(self.inner.extra_inputs(self.gi, ex))
 
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
-        return [SmallField(f"{self.name}_hcn", self.width)] + list(
-            self.inner.smalls(self.gi, ex)
-        )
+        own = [SmallField(f"{self.name}_hcn", self.width)]
+        if self.fp8:
+            own += [
+                SmallField(f"{self.name}_hdn_s", self.n_down),
+                SmallField(f"{self.name}_hup_s", self.width),
+            ]
+        return own + list(self.inner.smalls(self.gi, ex))
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
         sw = dict(self.inner.shared_widths(self.gi, ex))
@@ -206,15 +218,20 @@ class HCSublayer(Block):
         with ctx.sc("hc_mix"):
             self._normalize(ctx, slot)
             y = s.dmatmul(f"{n}_hdn", scr["xb"], self.n_down)
+            if self.fp8:
+                y = y * ctx.sm(slot, f"{n}_hdn_s")
             gate = rnd(jax.nn.silu(rnd(rnd(y[:, :lr]) / nhc)))
             scr["hc_g"][:, :lr] = gate.astype(BF16)
             self._set_injection(ctx, y[:, lr : lr + nhc])
-            mixed = None
+            mixed: Any = None
             for b in range(nhc):
                 u = s.dmatmul(f"{n}_hup{b}", scr["hc_g"], h)
+                if self.fp8:
+                    u = u * ctx.sm(slot, f"{n}_hup_s")[:, b * h : (b + 1) * h]
                 xn_b = scr["xb"][:, b * h : (b + 1) * h].astype(F32)
                 term = jax.nn.sigmoid(rnd(u)) * xn_b
                 mixed = term if mixed is None else mixed + term
+            assert mixed is not None
             mixed = rnd(mixed / nhc)
             scr["hc_xb"][...] = mixed.astype(BF16)
         return mixed
@@ -277,5 +294,10 @@ class HCSublayer(Block):
 
 def _res_bf16(ctx: Any) -> Any:
     """Stage the residual as BF16 in `scr['xb']` (free after the last layer)."""
-    ctx.scr["xb"][...] = ctx.scr["res"][...].astype(BF16)
+    MB, c = ctx.ex.MB, ctx.ex.resolved_tiles.io_chunk
+    if c and MB % c == 0:  # row chunks (`Tiles.io_chunk`): smaller spill area
+        for r0 in range(0, MB, c):
+            ctx.scr["xb"][r0 : r0 + c] = ctx.scr["res"][r0 : r0 + c].astype(BF16)
+    else:
+        ctx.scr["xb"][...] = ctx.scr["res"][...].astype(BF16)
     return ctx.scr["xb"]

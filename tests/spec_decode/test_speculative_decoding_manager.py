@@ -31,6 +31,7 @@ def test_speculative_decoding_manager_metadata_indices(device):
     # Mock TPUModelRunner
     mock_runner = MagicMock()
     mock_runner.device = device
+    _give_h2d_staging(mock_runner)
     mock_runner.arange_np = np.arange(100, dtype=np.int32)
     mock_runner.num_tokens_paddings = [8, 16, 32, 64]
 
@@ -59,6 +60,12 @@ def test_speculative_decoding_manager_metadata_indices(device):
 
     # Verify shapes and properties of the returned SpecDecodeMetadata
     assert isinstance(metadata, SpecDecodeMetadata)
+    # Every index tensor goes through `stage_h2d_upload`, so the runner owns
+    # its host copy until a staging fence covers the upload: draft ids, draft
+    # lengths, three logits index sets, segment ids and group indices.
+    staged = [host for host, _ in mock_runner._unfenced_h2d_sources]
+    assert len(staged) == 7
+    assert staged[1].tolist() == [3, 2, 0, 0]
 
     # Expected draft lengths cpu array
     assert np.array_equal(metadata.draft_lengths_cpu, num_draft_tokens)
@@ -258,9 +265,16 @@ def test_propose_draft_token_ids_ngram_dispatches_correctly():
     mock_drafter.propose.assert_called_once_with(4, [[1], [2]], "NTS", "TIDS")
 
 
+def _give_h2d_staging(runner):
+    """Real staging lists, as `stage_h2d_upload` appends to the runner's."""
+    runner._unfenced_h2d_sources = []
+    runner._registered_h2d_sources = set()
+
+
 def _fresh_metadata_manager(device, input_ids):
     mock_runner = MagicMock()
     mock_runner.device = device
+    _give_h2d_staging(mock_runner)
     mock_runner.arange_np = np.arange(100, dtype=np.int32)
     mock_runner.num_tokens_paddings = [8, 16, 32, 64]
     mock_runner.input_ids_cpu = input_ids
@@ -316,9 +330,13 @@ def test_spec_decode_metadata_deferred_draft_token_ids(device):
             nd, cu, 4
         )
         assert ref.deferred_draft_token_ids_cpu is None
-        uploaded = md.upload_deferred_draft_token_ids(device)
+        staged_before = len(manager.runner._unfenced_h2d_sources)
+        uploaded = md.upload_deferred_draft_token_ids(manager.runner)
         assert uploaded.device.type == device.type
         assert torch.equal(uploaded.cpu(), ref.draft_token_ids.cpu())
+        # The runner holds the host drafts until a staging fence covers them.
+        ((host, _),) = manager.runner._unfenced_h2d_sources[staged_before:]
+        assert np.shares_memory(host.numpy(), md.deferred_draft_token_ids_cpu)
 
 
 @pytest.mark.tpu_test

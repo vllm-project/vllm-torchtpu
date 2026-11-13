@@ -513,8 +513,20 @@ BOUNDED_SHAPES = [
 def _bounded_lengths(b, n, k):
     """Edge lengths, with a long row ahead of a short one on each subcore."""
     chunk = sc_module.BOUNDED_CHUNK_WORDS
-    edges = [0, 1, LANES - 1, LANES, LANES + 1, k, chunk - 1, chunk, chunk + 1,
-             25000, n - 1, n]
+    edges = [
+        0,
+        1,
+        LANES - 1,
+        LANES,
+        LANES + 1,
+        k,
+        chunk - 1,
+        chunk,
+        chunk + 1,
+        25000,
+        n - 1,
+        n,
+    ]
     lengths = np.array([edges[i % len(edges)] for i in range(b)], np.int32)
     # Rows w * 32 + s share subcore s across waves: wave 0 full, later short,
     # so a later wave's buffer still holds the earlier row past its length.
@@ -579,7 +591,9 @@ def test_bounded_copy_runs_one_subcore_per_row_only_when_it_fits(monkeypatch):
     monkeypatch.setattr(sc_module, "_sc_topk_direct", capture)
     for b, n in ((96, N_QSA_DECODE), (16, N_QSA_DECODE), (64, N_128K)):
         sc_module.sparsecore_topk(
-            jnp.zeros((b, n), jnp.float32), 512, jnp.full((b,), n, jnp.int32),
+            jnp.zeros((b, n), jnp.float32),
+            512,
+            jnp.full((b,), n, jnp.int32),
             bounded_copy=True,
         )
     assert calls == [

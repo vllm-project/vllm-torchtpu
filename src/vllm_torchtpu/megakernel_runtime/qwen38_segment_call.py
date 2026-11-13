@@ -30,6 +30,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models import qwen38
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
@@ -42,12 +43,13 @@ T_VERIFY = 4
 
 # All-reduce mode and (expert, dense) ring slots when the caller passes none
 # (`VLLM_TPU_MEGAKERNEL=...,hier=N,rings=E:D` sets them; rings for every bucket).
-DEFAULT_HIER = 2
+DEFAULT_HIER: int = 2
 DEFAULT_RINGS: tuple[int, int] | None = None
 # `pipeep=0`: the MoE experts on the non-pipelined EP path (A/B of a served factor).
-PIPE_EP = True
-# `VLLM_TPU_MEGAKERNEL=...,gdnclamp=1`: block ids outside the pool go to the null block 0.
-CLAMP_BLOCKS = False
+PIPE_EP: bool = True
+# `VLLM_TPU_MEGAKERNEL=...,gdnclamp=1`: block ids outside the pool go to the null block
+# 0.
+CLAMP_BLOCKS: bool = False
 
 
 def ring_depths(B: int) -> tuple[int, int]:
@@ -81,12 +83,12 @@ def segment_tiles(
     )
 
 
-GDN_META = 5  # per GDN layer: state ids, slot read offsets, ckpt ids, query start loc, seq lens
+# Per GDN layer: state ids, slot read offsets, ckpt ids, query start loc, seq lens
+GDN_META = 5
 
 
 def _fit(x: Any, n: int) -> Any:
     """First `n` rows of `x`, zero-padded when the runner's array is shorter."""
-
 
     x = x[:n]
     if x.shape[0] < n:
@@ -106,19 +108,39 @@ def gdn_blocks(
     def inside(x):
         return x if n_blocks is None else jnp.where((x >= 0) & (x < n_blocks), x, 0)
 
-
-    rbs, wbs, his = [], [], []
-    for i in range(0, len(meta), GDN_META):
-        st, off, ck, qsl, seq = meta[i : i + GDN_META]
-        st = _fit(st, NS)
+    def one(idx, ck, qsl, seq):  # idx: this layer's `off[st]`
         ck = _fit(ck[:, :T_VERIFY], NS)
         qsl = _fit(qsl, NS + 1)
         q_len = qsl[1:] - qsl[:-1]
         live = q_len > 0
-        rb = jnp.take_along_axis(ck, off[st][:, None], axis=1)[:, 0]
-        rbs.append(inside(jnp.where(live, rb, 0)))
-        wbs.append(inside(jnp.where(live[:, None] & write, ck, 0)))
-        his.append(live & ((_fit(seq, NS) - q_len) > 0))
+        rb = jnp.take_along_axis(ck, idx[:, None], axis=1)[:, 0]
+        return (
+            inside(jnp.where(live, rb, 0)),
+            inside(jnp.where(live[:, None] & write, ck, 0)),
+            live & ((_fit(seq, NS) - q_len) > 0),
+        )
+
+    metas = [meta[i : i + GDN_META] for i in range(0, len(meta), GDN_META)]
+    if (
+        envs.VLLM_TPU_MK_WHOLE_BATCHED_INPUTS
+        and len(metas) > 1
+        and all(
+            (x.shape, x.dtype) == (y.shape, y.dtype)
+            for lay in metas
+            for x, y in zip(lay, metas[0], strict=True)
+        )
+    ):
+        # One vmapped pass instead of ~8 small ops per GDN layer (33 in the whole step).
+        # The slot-offset table is the runner's one `mamba_slot_read_offsets` (indexed by
+        # physical slot, the same tensor in every mamba group's metadata), so all layers'
+        # offsets come from one vector gather: per-layer `off[st]` lowered to scalar
+        # dynamic slices, two vector->scalar stalls of ~34 us per step (xprof j-30c70bee
+        # fusion.1614/1615); stacking the table per layer would copy 33 x 113728 int32.
+        st, ck, qsl, seq = (jnp.stack([lay[k] for lay in metas]) for k in (0, 2, 3, 4))
+        idx = metas[0][1][jax.vmap(lambda s: _fit(s, NS))(st)]
+        return jax.vmap(one)(idx, ck, qsl, seq)
+    layers = [(off[_fit(st, NS)], ck, qsl, seq) for st, off, ck, qsl, seq in metas]
+    rbs, wbs, his = zip(*(one(*lay) for lay in layers), strict=True)
     return jnp.stack(rbs), jnp.stack(wbs), jnp.stack(his)
 
 
@@ -178,14 +200,21 @@ def build_segment_call(
         out_specs=tp,
         check_vma=False,
     )
-    unpad = jax.shard_map(lambda r: r[:B], mesh=mesh, in_specs=tp, out_specs=tp, check_vma=False)
+    unpad = jax.shard_map(
+        lambda r: r[:B], mesh=mesh, in_specs=tp, out_specs=tp, check_vma=False
+    )
     pos = jnp.zeros((B,), jnp.int32)
     n_lead = 1 if head else 2
     n_meta = GDN_META * (L if head else L - 1) if has_gdn else 0
 
     gather = jax.shard_map(
         lambda pool, rb, hi: gather_gdn_states(
-            pool, rb, layout=layout, T=T_VERIFY, has_initial_state=hi, interpret=interpret
+            pool,
+            rb,
+            layout=layout,
+            T=T_VERIFY,
+            has_initial_state=hi,
+            interpret=interpret,
         ),
         mesh=mesh,
         in_specs=(tp, rep, rep),
@@ -194,7 +223,9 @@ def build_segment_call(
     )
     scatter_fn = scatter_gdn_ckpts_fast if fast_scatter else scatter_gdn_ckpts
     scatter = jax.shard_map(
-        lambda pool, c, r, wb: scatter_fn(pool, c, r, wb, layout=layout, interpret=interpret),
+        lambda pool, c, r, wb: scatter_fn(
+            pool, c, r, wb, layout=layout, interpret=interpret
+        ),
         mesh=mesh,
         in_specs=(tp, tp, tp, rep),
         out_specs=tp,
@@ -212,10 +243,15 @@ def build_segment_call(
         x = pad(hidden)
         named = {} if head else {"qsa_attn": pad(attn)}
         states: tuple = ()
+        pool: Any = None
+        wb: Any = None
         if has_gdn:
             pool, meta = args[n_lead + n_w], args[n_lead + n_w + 1 :]
             rb, wb, hi = gdn_blocks(
-                meta, NS, write, layout.pool_shape[0] // layout.split if CLAMP_BLOCKS else None
+                meta,
+                NS,
+                write,
+                layout.pool_shape[0] // layout.split if CLAMP_BLOCKS else None,
             )
             if pool_gdn:
                 named.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32))

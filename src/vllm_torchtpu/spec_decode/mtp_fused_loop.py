@@ -24,8 +24,11 @@ from typing import Any, Protocol
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.sequence import IntermediateTensors
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.spec_decode.shard_argmax import greedy_draft_token
 
 
 class MtpDraftModel(Protocol):
@@ -45,12 +48,14 @@ class _MtpFusedLoop(nn.Module):
         prefix: str = "",
         mtp: MtpDraftModel,
         num_steps: int,
+        use_mk: bool = False,
     ) -> None:
         super().__init__()
         # Own compile-cache folder, as in MtpLoopStepModel.
         self.prefix = prefix
         self.mtp = mtp
         self.num_steps = num_steps
+        self.use_mk = use_mk
 
     def forward(
         self,
@@ -64,10 +69,22 @@ class _MtpFusedLoop(nn.Module):
         """`positions` and `seq_lens` are step 1's. Returns the K-1 draft
         tokens, one [p] int32 tensor per step."""
         tokens = []
+        # VLLM_TPU_MK_DRAFT: each step is one kernel call returning the carry and the
+        # greedy token (attached before the first trace, so a static choice here).
+        # The MK choice is a construction-time attribute, never a branch on the token
+        # count: vLLM traces one graph for every compile range, so a shape branch would
+        # freeze at the first traced bucket (za9g ShapeSpecializationError). The MK
+        # variant is a separate program compiled only at the kernel's rows
+        # (`mk_draft_compile_config`); the caller picks it per step in Python.
+        mk_step = getattr(self.mtp, "mk_draft_step", None) if self.use_mk else None
         for i in range(self.num_steps):
             if i > 0:
                 positions = positions + 1
                 seq_lens.add_(1)
+            if mk_step is not None:
+                hidden_states, input_ids = mk_step(input_ids, positions, hidden_states, 1)
+                tokens.append(input_ids)
+                continue
             out = type(self.mtp).forward(
                 self.mtp,
                 input_ids,
@@ -84,11 +101,46 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
-            input_ids = (
-                self.mtp.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
-            )
+            input_ids = greedy_draft_token(self.mtp, last_hidden)
             tokens.append(input_ids)
         return tuple(tokens)
+
+
+def mk_draft_rows_ok(inner: Any, rows: int, rows_per_request: int) -> bool:
+    """VLLM_TPU_MK_DRAFT: the draft kernel takes this traced row count (`max_rows` of
+    the attached MkDraft per T); larger compile ranges use the stock draft step."""
+    mk = getattr(inner, "mk_draft", None)
+    if mk is None:
+        return False
+    cap = getattr(mk, "max_rows", {}).get(rows_per_request, 0)
+    return 0 < rows <= cap
+
+
+def mk_draft_compile_config(vllm_config: VllmConfig, inner: Any, rows_per_request: int):
+    """`(config, sizes)`: the draft config with compile sizes cut to the draft
+    kernel's rows (`MkDraft.max_rows`), so the MK draft programs are never built at a
+    prefill-sized range (VMEM: 1872 MiB at 8192 rows, za9e j-c6b8b17f). Empty sizes:
+    no MK program."""
+    import copy
+
+    cap = getattr(getattr(inner, "mk_draft", None), "max_rows", {}).get(rows_per_request, 0)
+    sizes = [s for s in (vllm_config.compilation_config.compile_sizes or []) if 0 < s <= cap]
+    cfg = copy.copy(vllm_config)
+    cc = copy.copy(vllm_config.compilation_config)
+    cc.compile_sizes = list(sizes)
+    # No open range either: vLLM appends max_num_batched_tokens to the range
+    # endpoints, and an MK program must never be traced past the kernel's rows.
+    cc.compile_ranges_endpoints = []
+    # Built after the stock draft programs compiled: by then the shared inductor config
+    # carries the backend's pre-grad pass, which a fresh backend asserts absent
+    # (vllm backends.configure_post_pass; exos j-87ff00d1). Give the MK programs their
+    # own copy without it.
+    cc.inductor_compile_config = {
+        k: v for k, v in dict(cc.inductor_compile_config or {}).items()
+        if k != "pre_grad_custom_pass"
+    }
+    object.__setattr__(cfg, "compilation_config", cc)
+    return cfg, sizes
 
 
 def build_mtp_fused_loop(
@@ -98,6 +150,7 @@ def build_mtp_fused_loop(
     mtp: MtpDraftModel,
     num_steps: int,
     dynamic_arg_dims: dict,
+    use_mk: bool = False,
 ) -> nn.Module:
     """Compile `_MtpFusedLoop` with the draft's own dynamic dims (Qwen3.5's
     MTP marks positions -1, DeepSeek's 0), so both programs specialise the
@@ -110,4 +163,63 @@ def build_mtp_fused_loop(
     cls = support_torch_compile(dynamic_arg_dims=dims)(
         type("MtpFusedLoop", (_MtpFusedLoop,), {})
     )
-    return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps)
+    with set_current_vllm_config(vllm_config):
+        return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps,
+                   use_mk=use_mk)
+
+
+class _MkDraftStep0(nn.Module):
+    """VLLM_TPU_MK_DRAFT: draft step 0 as one kernel call over the verify rows (4 per
+    request) plus the per-request carry: `(hidden carry [p], token 0 [p] int32,
+    positions carry [p])` at the last accepted row of each request (`rows`). Replaces
+    the draft forward, `_draft_rows_carry_and_token`'s position gather and its
+    lm-head + argmax. Only for uniform verify steps (the whole-step's), where every
+    request has the same 4 rows."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", mtp: MtpDraftModel,
+                 rows_per_request: int) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.mtp = mtp
+        self.rows_per_request = rows_per_request
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        draft_rows: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        carry, tokens = self.mtp.mk_draft_step(  # type: ignore[attr-defined]
+            input_ids, positions, hidden_states, self.rows_per_request
+        )
+        rows = draft_rows.clamp_min(0)
+        return (
+            torch.index_select(carry, 0, rows),
+            torch.index_select(tokens, 0, rows),
+            torch.index_select(positions, positions.ndim - 1, rows),
+        )
+
+
+def build_mk_draft_step0(
+    *,
+    vllm_config: VllmConfig,
+    prefix: str,
+    mtp: MtpDraftModel,
+    rows_per_request: int,
+    dynamic_arg_dims: dict,
+) -> nn.Module:
+    """Compile `_MkDraftStep0` with the draft's own dynamic dims (as the fused loop)."""
+    step_args = inspect.signature(_MkDraftStep0.forward).parameters
+    dims = {k: v for k, v in dict(dynamic_arg_dims).items() if k in step_args}
+    cls = support_torch_compile(dynamic_arg_dims=dims)(
+        type("MkDraftStep0", (_MkDraftStep0,), {})
+    )
+    # The compile wrapper builds its backend from the *current* config, not the
+    # vllm_config argument: pin it here so the caller's context cannot widen the
+    # compile sizes (za9j j-d4040629).
+    with set_current_vllm_config(vllm_config):
+        return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp,
+                   rows_per_request=rows_per_request)

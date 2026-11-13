@@ -29,7 +29,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, rnd
+from ...ops import BF16, F32
 from ...spec import Block, ExtraInput, ScratchReq, WeightDecl
 
 ATTN_INPUT = "qsa_attn"

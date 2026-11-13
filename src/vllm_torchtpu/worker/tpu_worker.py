@@ -39,6 +39,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.parallel_requirements import requires_dp_collectives
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker.kv_budget_pin import pin_kv_budget
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -537,6 +538,13 @@ class TPUWorker(WorkerBase):
                     - kv_connector_hbm_reserve
                     - pp_handoff_hbm_reserve,
                 )
+        # Same budget as an earlier start with the same compile hash, so the
+        # KV block count and the backbone compile hash do not move with HBM
+        # measurement noise and a restored compile cache is used. Before the
+        # cross-rank minimum, so every rank still agrees afterwards.
+        local_available = pin_kv_budget(
+            self.vllm_config, local_available, write=self.local_rank == 0
+        )
         available = utils.min_across_ep_dp(self.parallel_config, local_available)
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
@@ -795,6 +803,13 @@ class TPUWorker(WorkerBase):
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
         freeze_gc_heap()
+        if envs.VLLM_TPU_GC_THRESHOLD:
+            import gc
+
+            gc.set_threshold(
+                *(int(v) for v in envs.VLLM_TPU_GC_THRESHOLD.split(","))
+            )
+            logger.info("GC thresholds after warmup: %s", gc.get_threshold())
         maybe_attach_gc_debug_callback()
         from vllm_torchtpu.runner.compile_watch import (
             install_post_warmup_compile_log,
@@ -807,7 +822,7 @@ class TPUWorker(WorkerBase):
         from vllm_torchtpu import stall_watchdog
 
         stall_watchdog.arm()
-        if os.environ.get("VLLM_TPU_PY_SAMPLER_S"):
+        if envs.VLLM_TPU_PY_SAMPLER_S > 0:
             from vllm_torchtpu.runner import py_sampler
 
             # Called on the step thread, which the sampler then watches.

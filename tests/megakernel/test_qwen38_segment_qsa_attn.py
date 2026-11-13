@@ -32,7 +32,10 @@ from vllm_torchtpu.megakernel.blocks.hc import RESIDUAL_OUT
 from vllm_torchtpu.megakernel.blocks.qsa_attn.block import MICRO, reference_rows
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models import qwen38
-from vllm_torchtpu.megakernel.models.qwen38_inputs import pack_segment, random_segment_inputs
+from vllm_torchtpu.megakernel.models.qwen38_inputs import (
+    pack_segment,
+    random_segment_inputs,
+)
 from vllm_torchtpu.megakernel.models.qwen38_pack import shard_step_inputs
 from vllm_torchtpu.megakernel.models.qwen38_reference import segment_reference
 from vllm_torchtpu.megakernel.ops import BF16, F32
@@ -54,14 +57,25 @@ def test_segment_with_in_kernel_qsa_attention_matches_reference():
     pages = jnp.asarray(
         rng.integers(0, PAGES * 128 // MICRO, size=(ex.M, BUDGET + 1)), jnp.int32
     )
-    kv_len = jnp.asarray(([0, 1, 9, 100, 255, 257, 130, 64] + [0] * ex.M)[: ex.M], jnp.int32)
+    kv_len = jnp.asarray(
+        ([0, 1, 9, 100, 255, 257, 130, 64] + [0] * ex.M)[: ex.M], jnp.int32
+    )
     q = jnp.asarray(rng.standard_normal((R, ex.M, nh, G.HD)), BF16)
     gate = jnp.asarray(rng.standard_normal((R, ex.M, nh, G.HD)), BF16)
     sm = G.HD**-0.5
     attn = jnp.stack(
         [
-            reference_rows(q[r, :B], gate[r, :B], pool[r], pages[:B], kv_len[:B],
-                           off=OFF, scale_k=1.0, scale_v=1.0, sm_scale=sm).reshape(B, -1)
+            reference_rows(
+                q[r, :B],
+                gate[r, :B],
+                pool[r],
+                pages[:B],
+                kv_len[:B],
+                off=OFF,
+                scale_k=1.0,
+                scale_v=1.0,
+                sm_scale=sm,
+            ).reshape(B, -1)
             for r in range(R)
         ]
     ).astype(BF16)
@@ -69,12 +83,16 @@ def test_segment_with_in_kernel_qsa_attention_matches_reference():
 
     inp = random_segment_inputs(jax.random.PRNGKey(9), G, ex, L)
     inp.attn = attn
-    ref, _ = segment_reference(G, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L)
+    ref, _ = segment_reference(
+        G, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L
+    )
 
     spec = qwen38.segment_spec(G, R, L=L, qsa_attn=dict(budget=BUDGET))
     w_mk, states, _ = pack_segment(qwen38.segment_spec(G, R, L=L), G, ex, inp)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, inp.pos, inp.x, w_mk, states)
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+        mesh, ex, inp.pos, inp.x, w_mk, states
+    )
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     extras = (
         jax.device_put(kernel.fold(pool), tp),
@@ -86,7 +104,13 @@ def test_segment_with_in_kernel_qsa_attention_matches_reference():
         jax.device_put(jnp.asarray([1.0, 1.0], F32), rep),
     )
     assert [x.name for x in kernel.extra_inputs(spec, ex)] == [
-        "qsa_pool", "qsa_q", "qsa_gate", "qsa_pages", "qsa_kvlen", "qsa_off", "qsa_scales"
+        "qsa_pool",
+        "qsa_q",
+        "qsa_gate",
+        "qsa_pages",
+        "qsa_kvlen",
+        "qsa_off",
+        "qsa_scales",
     ]
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *extras)

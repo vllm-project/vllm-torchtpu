@@ -34,7 +34,11 @@ LEAN = "VLLM_TPU_QSA_DECODE_LEAN_FETCH"
 
 
 @pytest.mark.parametrize("lean", [False, True])
-def test_lean_fetch_reaches_rpa_and_matches(monkeypatch, kernels, lean):
+def test_lean_fetch_reaches_rpa_and_matches(
+    monkeypatch,
+    kernels,  # noqa: F811
+    lean,
+):
     from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper
 
     seen = []
@@ -53,8 +57,13 @@ def test_lean_fetch_reaches_rpa_and_matches(monkeypatch, kernels, lean):
         monkeypatch.setenv(LEAN, value)
         out, _ = jax.jit(
             functools.partial(
-                qsa_rpa.qsa_attention, starts=starts, kv_heads=1, ratio=RATIO,
-                k_scale=0.375, v_scale=2.5, max_query_len=4,
+                qsa_rpa.qsa_attention,
+                starts=starts,
+                kv_heads=1,
+                ratio=RATIO,
+                k_scale=0.375,
+                v_scale=2.5,
+                max_query_len=4,
             )
         )(*args)
         outs.append(np.asarray(out))
@@ -65,11 +74,12 @@ def test_lean_fetch_reaches_rpa_and_matches(monkeypatch, kernels, lean):
 def test_schedule_lands_tile_pages_consecutively(monkeypatch):
     """The decode schedule's cache entries for a tile are page-table entries
     p0 + i landing at i * page_size: what the lean fetch reconstructs."""
+    from jax.experimental import pallas as pl
+
     from vllm_torchtpu.kernels.experimental.batched_rpa import (
         configs,
         schedule,
     )
-    from jax.experimental import pallas as pl
 
     original = pl.pallas_call
     monkeypatch.setattr(
@@ -86,10 +96,15 @@ def test_schedule_lands_tile_pages_consecutively(monkeypatch):
             num_q_heads=6, num_kv_heads=2, head_dim=WIDTH, mask_value=-1e30
         ),
         serve=configs.ServingConfigs(
-            num_seqs=seqs, page_size=page, total_q_tokens=seqs,
-            num_page_indices=seqs * pages_per_seq, dtype_q=jnp.float32,
-            dtype_kv=jnp.float8_e4m3fn, dtype_out=jnp.float32,
-            skip_kv_update=True, lean_kv_fetch=True,
+            num_seqs=seqs,
+            page_size=page,
+            total_q_tokens=seqs,
+            num_page_indices=seqs * pages_per_seq,
+            dtype_q=jnp.float32,
+            dtype_kv=jnp.float8_e4m3fn,
+            dtype_out=jnp.float32,
+            skip_kv_update=True,
+            lean_kv_fetch=True,
         ),
         vmem_limit_bytes=64 * 1024 * 1024,
         mode=configs.RpaCase.DECODE,
@@ -97,8 +112,12 @@ def test_schedule_lands_tile_pages_consecutively(monkeypatch):
     q_lens = (kv_lens > 0).astype(jnp.int32)
     cu = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(q_lens)))
     sched = schedule.generate_rpa_metadata(
-        cu, kv_lens - q_lens, kv_lens - q_lens, q_lens,
-        jnp.full((3,), seqs, jnp.int32), cfgs=cfgs,
+        cu,
+        kv_lens - q_lens,
+        kv_lens - q_lens,
+        q_lens,
+        jnp.full((3,), seqs, jnp.int32),
+        cfgs=cfgs,
     )
     entries = np.asarray(sched.dma_kv_cache.data).reshape(-1, cfgs.bkv_p_cache, 3)
     steps = int(np.asarray(sched.actual_steps)[0]) * cfgs.batch_size

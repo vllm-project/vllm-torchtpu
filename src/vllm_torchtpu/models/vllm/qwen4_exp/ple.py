@@ -26,14 +26,19 @@ state is passed in and returned, so the caller decides where it is stored.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from vllm.distributed import GroupCoordinator, tensor_model_parallel_all_reduce
+from vllm.distributed import (
+    GroupCoordinator,
+    tensor_model_parallel_all_reduce,
+)
+
+from vllm_torchtpu import envs
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.models.qwen4_exp.common.hyperconnection import GroupedGemmaRMSNorm
@@ -42,7 +47,13 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEFp8EmbeddingMethod,
 )
 from vllm.models.qwen4_exp.common.ple import PLEVocabParallelEmbedding
-from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
+
+from vllm_torchtpu import envs
+
+try:
+    from transformers import Qwen4ExpTextConfig
+except ImportError:
+    from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
 _MASK64 = (1 << 64) - 1
 _MAX_INT64 = (1 << 63) - 1
@@ -135,9 +146,9 @@ def ngram_ids(
     ngram_context: torch.Tensor,
     request: torch.Tensor,
     chunk_pos: torch.Tensor,
-    multipliers: torch.Tensor,
-    vocab_sizes: torch.Tensor,
-    offsets: torch.Tensor,
+    multipliers: torch.Tensor | Sequence[int],
+    vocab_sizes: torch.Tensor | Sequence[int],
+    offsets: torch.Tensor | Sequence[int],
     *,
     eos_token_id: int,
     heads_per_ngram: int,
@@ -172,10 +183,58 @@ def ngram_ids(
         # non-negative and the remainder matches the reference.
         mixed = torch.bitwise_xor(mixed, token * multipliers[shift])
         heads = slice((shift - 1) * heads_per_ngram, shift * heads_per_ngram)
-        blocks.append(
-            torch.remainder(mixed.unsqueeze(-1), vocab_sizes[heads]) + offsets[heads]
-        )
+        if isinstance(vocab_sizes, torch.Tensor):
+            blocks.append(
+                torch.remainder(mixed.unsqueeze(-1), vocab_sizes[heads]) + offsets[heads]
+            )
+        else:  # trace-time constants (VLLM_TPU_MK_PLE_TRIM): same int64 math
+            blocks.append(
+                torch.stack(
+                    [
+                        torch.remainder(mixed, size) + offset
+                        for size, offset in zip(
+                            vocab_sizes[heads], offsets[heads], strict=True
+                        )
+                    ],
+                    dim=-1,
+                )
+            )
     return torch.cat(blocks, dim=-1)
+
+
+def merged_embed_all_reduce(
+    embed: torch.Tensor,
+    raws: Sequence[torch.Tensor],
+    all_reduce,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """One all-reduce for the token embedding and PLE raw n-gram rows.
+
+    ``embed`` is this rank's masked vocab-parallel lookup (zeros for tokens it does
+    not own) and each ``raws[i]`` its raw rows before ``PLEParallel.combine``
+    (zeros for rows it does not own). Every embedding element and every raw byte
+    has exactly one non-zero owner, so the reduced values are the owner's: the
+    embedding rows keep their own BF16 lanes (the same per-element sum as their
+    own all-reduce) and each raw byte travels as an integer-valued BF16 lane
+    (0..255, exact), appended as extra rows of the same width.
+    """
+    if embed.dtype != torch.bfloat16:
+        raise ValueError("merged_embed_all_reduce carries raw bytes in BF16 lanes")
+    width = embed.shape[-1]
+    lanes = [r.contiguous().view(torch.uint8).reshape(-1).to(embed.dtype) for r in raws]
+    sizes = [lane.numel() for lane in lanes]
+    flat = torch.cat(lanes)
+    pad = (-flat.numel()) % width
+    if pad:
+        flat = F.pad(flat, (0, pad))
+    rows = embed.numel() // width
+    out = all_reduce(torch.cat([embed.reshape(rows, width), flat.reshape(-1, width)]))
+    tail = out[rows:].reshape(-1)
+    combined, start = [], 0
+    for raw, size in zip(raws, sizes, strict=True):
+        part = tail[start : start + size].to(torch.uint8)
+        combined.append(part.view(raw.dtype).reshape(raw.shape))
+        start += size
+    return out[:rows].reshape(embed.shape), combined
 
 
 def dilated_short_conv(
@@ -419,14 +478,23 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"request; ngram_size={self.ngram_size} needs "
                 f"{self.ngram_size - 1}."
             )
+        consts = getattr(self, "_hash_constants", None)
+        if envs.VLLM_TPU_MK_PLE_TRIM and consts is not None:
+            multipliers, sizes, offsets = consts
+        else:
+            multipliers, sizes, offsets = (
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+            )
         return ngram_ids(
             input_ids,
             ngram_context,
             request,
             chunk_pos,
-            self.layer_multipliers,
-            self.ngram_heads_vocab_sizes,
-            self.ngram_heads_offsets,
+            multipliers,
+            sizes,
+            offsets,
             eos_token_id=self.eos_token_id,
             heads_per_ngram=self.heads_per_ngram,
         )
@@ -485,6 +553,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             else:
                 raise ValueError(f"Unexpected PLE embedding weight {name!r}.")
             loaded.add(name)
+        # The loaded hash buffers as Python ints: VLLM_TPU_MK_PLE_TRIM traces them
+        # as constants (no int64 operands to split per step).
+        self._hash_constants = tuple(
+            [int(v) for v in self.get_buffer(n).cpu().tolist()]
+            for n in ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets")
+        )
         max_multiplier = int(self.layer_multipliers.max())
         if max_multiplier * (self.vocab_size - 1) > _MAX_INT64:
             raise ValueError(
@@ -515,7 +589,11 @@ class Qwen4ExpPLELayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
         hc_hidden_size = config.hidden_size * config.hc_count
-        embed_dim = config.ple_embed_dim
+        embed_dim = (
+            config.hidden_size
+            if config.ple_embed_dim is None
+            else int(config.ple_embed_dim)
+        )
         self.conv_dilation = config.ngram_size
         self.conv_state_len = (config.ple_conv_kernel_size - 1) * self.conv_dilation
         self.ple_embedding = Qwen4ExpNGramEmbedding(
@@ -547,6 +625,16 @@ class Qwen4ExpPLELayer(nn.Module):
             )
             for _ in range(3)
         )
+        # VLLM_TPU_PLE_FUSED_GATE: the gate dot as one Pallas kernel (TPU only).
+        self.gate_dot = None
+        if envs.VLLM_TPU_PLE_FUSED_GATE:
+            from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
+                build_normalized_gate_dot_dispatch,
+            )
+
+            self.gate_dot = build_normalized_gate_dot_dispatch(
+                self.hc_count, config.hidden_size
+            )
         # Holds the checkpoint's [channels, 1, kernel] weight; forward runs the
         # conv with dilated_short_conv to carry state across steps.
         self.conv1d = nn.Conv1d(
@@ -610,13 +698,18 @@ class Qwen4ExpPLELayer(nn.Module):
         else:
             key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
-        streams = (self.hc_count, self.hidden_size)
-        key = self.norm_key(key).unflatten(-1, streams)
-        query = self.norm_query(hidden_states).unflatten(-1, streams)
-        # As in upstream's gate kernel, the products are rounded to the
-        # activation dtype and then summed in fp32.
-        dot = (key * query).float().sum(dim=-1, keepdim=True).to(key.dtype)
+        if self.gate_dot is not None:
+            dot = self.gate_dot(key, hidden_states, self.norm_key, self.norm_query)
+        else:
+            streams = (self.hc_count, self.hidden_size)
+            key = self.norm_key(key).unflatten(-1, streams)
+            query = self.norm_query(hidden_states).unflatten(-1, streams)
+            # As in upstream's gate kernel, the products are rounded to the
+            # activation dtype and then summed in fp32.
+            dot = (key * query).float().sum(dim=-1, keepdim=True).to(key.dtype)
         if sequence_parallel_tokens is not None:
+            from . import sequence_parallel as sp
+
             dot = sp.gather(dot.flatten(-2), sequence_parallel_tokens).unsqueeze(-1)
         gate = dot / math.sqrt(self.hidden_size)
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()

@@ -20,13 +20,13 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import pytest
-from conftest import TINY_TILES, FakeGeometry
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from tests.megakernel.megakernel_helpers import TINY_TILES, FakeGeometry
 from vllm_torchtpu.megakernel import comm, planner, stream, vmem
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rnd

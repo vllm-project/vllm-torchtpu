@@ -11,7 +11,10 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kv_cache_materializer import LayerKVCache
-from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.attention_metadata import (
+    AttentionMetadata,
+    stage_h2d_upload,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -19,7 +22,12 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 from vllm_torchtpu.utils import synchronize_tensors
 
 from .cache import Qwen4ExpCache
-from .config import mtp_layer_prefixes, num_speculative_tokens, use_unified_pool
+from .config import (
+    first_qsa_layer_index,
+    mtp_layer_prefixes,
+    num_speculative_tokens,
+    use_unified_pool,
+)
 from .pp import stage_layers
 
 if TYPE_CHECKING:
@@ -44,18 +52,27 @@ def ngram_context_from_store(
 def ngram_window_from_host(
     token_ids, num_computed, row_start, num_requests, rows, width, eos_token_id
 ):
-    """Host side of the windowed n-gram context: per live row the last ``width`` host-store tokens
-    before its host context ``num_computed[row_start + i]`` (async spec decoding advances the host
-    context optimistically; the device context is at most ``width - ngram_size + 1`` tokens shorter),
-    as one ``[rows, width + 1]`` int64 array whose last column is the window's first position."""
+    """Host side of the windowed n-gram context: per live row the last ``width``
+    host-store tokens
+    before its host context ``num_computed[row_start + i]`` (async spec decoding
+    advances the host
+    context optimistically; the device context is at most ``width - ngram_size + 1``
+    tokens shorter),
+    as one ``[rows, width + 1]`` int64 array whose last column is the window's first
+    position."""
     import numpy as np
 
     out = np.zeros((rows, width + 1), dtype=np.int64)
     if num_requests:
-        ctx = np.asarray(num_computed[row_start : row_start + num_requests], dtype=np.int64)
+        ctx = np.asarray(
+            num_computed[row_start : row_start + num_requests], dtype=np.int64
+        )
         lo = ctx - width
         cols = lo[:, None] + np.arange(width)
-        vals = token_ids[np.arange(row_start, row_start + num_requests)[:, None], np.clip(cols, 0, None)]
+        vals = token_ids[
+            np.arange(row_start, row_start + num_requests)[:, None],
+            np.clip(cols, 0, None),
+        ]
         out[:num_requests, :width] = np.where(cols >= 0, vals, eos_token_id)
         out[:num_requests, width] = lo
     return out
@@ -121,6 +138,7 @@ def fused_step_inputs(
     spec_window: int,
     eos_token_id: int,
     ngram_size: int,
+    functional: bool = False,
 ):
     """``Qwen4ExpAdapter.prepare_inputs``'s device work as one function, so it
     compiles to one program (VLLM_TPU_QWEN4_FUSED_PREP) instead of ~20 eager
@@ -130,7 +148,10 @@ def fused_step_inputs(
     ``store`` is the device token store, or with ``window`` the uploaded
     ``ngram_window_from_host`` array. ``current``'s three record tensors are
     updated in place exactly like ``_speculative_ngram_context``. Returns
-    (context, history, slots, valid_tokens).
+    (context, history, slots, valid_tokens). With ``functional``
+    (VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL) ``current`` is left alone and its
+    updated record is returned as a fifth item instead: input mutations cost a
+    per-tensor eager copy-back after the program.
     """
     rows = starts.shape[0] - 1
     row_start = scalars[0]
@@ -150,8 +171,14 @@ def fused_step_inputs(
             store, row_ids, context, eos_token_id, ngram_size
         )
     if spec_window:
+        prev_tokens, prev_context, prev_lengths = previous
         history = merge_recent_ngram_context(
-            history, *previous, scalars[2 : 2 + rows], context
+            history,
+            prev_tokens,
+            prev_context,
+            prev_lengths,
+            scalars[2 : 2 + rows],
+            context,
         )
         tokens, recent_context, recent_lengths = current
         ids64 = ids.to(torch.int64)
@@ -160,12 +187,21 @@ def fused_step_inputs(
             (starts[:-1, None].to(torch.int64) + offsets).clamp(0, ids.shape[0] - 1)
         ]
         target = torch.where(valid_rows, row_range + row_start, tokens.shape[0] - 1)
-        tokens.index_copy_(0, target, torch.cat([history, chunk], dim=1))
-        recent_context.index_copy_(0, target, context)
-        recent_lengths.index_copy_(
-            0, target, lengths_now.to(torch.int64).clamp(max=spec_window)
-        )
+        new_tokens = torch.cat([history, chunk], dim=1)
+        new_lengths = lengths_now.to(torch.int64).clamp(max=spec_window)
+        if functional:
+            record = (
+                tokens.index_copy(0, target, new_tokens),
+                recent_context.index_copy(0, target, context),
+                recent_lengths.index_copy(0, target, new_lengths),
+            )
+        else:
+            tokens.index_copy_(0, target, new_tokens)
+            recent_context.index_copy_(0, target, context)
+            recent_lengths.index_copy_(0, target, new_lengths)
     valid_tokens = torch.arange(ids.shape[0], device=ids.device) < starts[-1]
+    if functional:
+        return context, history, slots, valid_tokens, (record if spec_window else None)
     return context, history, slots, valid_tokens
 
 
@@ -184,10 +220,11 @@ class Qwen4ExpAdapter:
         self.block_size = runner.cache_config.block_size
         # Every QSA layer reads the same main/compressed block tables (one
         # scheduler group each); take them from this pipeline stage's first
-        # full-attention layer, whose metadata the stage builds.
+        # QSA attention layer, whose metadata the stage builds.
         stage = stage_layers(runner.vllm_config)
-        self.attention_prefix = "model.layers.%d" % next(
-            i for i in stage if self.config.layer_types[i] == "full_attention"
+        self.attention_prefix = "model.layers.%d" % (
+            stage.start
+            + first_qsa_layer_index(list(self.config.layer_types)[stage.start : stage.stop])
         )
         self.cache: Qwen4ExpCache | Qwen4ExpPooledCache | None = None
         self.token_store = None
@@ -276,8 +313,11 @@ class Qwen4ExpAdapter:
         # Row numbers in this store are unrelated to state slots/page IDs.
         batch = self.runner.input_batch
         mode = envs.VLLM_TPU_QWEN4_NGRAM_WINDOW
-        if mode == "1" or (mode == "check" and getattr(self, "_ngram_check_left", 200) <= 0):
-            # Windowed n-gram context: prepare_inputs copies only the rows' windows (`check`:
+        if mode == "1" or (
+            mode == "check" and getattr(self, "_ngram_check_left", 200) <= 0
+        ):
+            # Windowed n-gram context: prepare_inputs copies only the rows' windows
+            # (`check`:
             # once its comparisons are done, it runs exactly like `1`).
             self.token_store = batch.token_ids_cpu_tensor
         else:
@@ -323,7 +363,7 @@ class Qwen4ExpAdapter:
         history = merge_recent_ngram_context(
             history,
             *previous,
-            previous_np.to(runner.device, non_blocking=True),
+            stage_h2d_upload(runner, previous_np),
             context,
         )
         tokens, recent_context, lengths = current
@@ -347,7 +387,10 @@ class Qwen4ExpAdapter:
         return history
 
     def prepare_inputs(self, snapshot):
-        if envs.VLLM_TPU_QWEN4_FUSED_PREP and envs.VLLM_TPU_QWEN4_NGRAM_WINDOW != "check":
+        if (
+            envs.VLLM_TPU_QWEN4_FUSED_PREP
+            and envs.VLLM_TPU_QWEN4_NGRAM_WINDOW != "check"
+        ):
             return self._prepare_inputs_fused(snapshot)
         return self._prepare_inputs_eager(snapshot)
 
@@ -371,7 +414,8 @@ class Qwen4ExpAdapter:
         row_ids = row_ids.clamp(max=snapshot.token_store.shape[0] - 1)
         mode = envs.VLLM_TPU_QWEN4_NGRAM_WINDOW
         if mode in ("1", "check"):
-            # Device context >= host context - spec tokens: a window of spec + ngram - 1 tokens.
+            # Device context >= host context - spec tokens: a window of spec + ngram - 1
+            # tokens.
             width = max(self.spec_window - 1, 0) + self.config.ngram_size - 1
             window = ngram_window_from_host(
                 runner.input_batch.token_ids_cpu_tensor.numpy(),
@@ -383,7 +427,7 @@ class Qwen4ExpAdapter:
                 self.config.eos_token_id,
             )
             history = ngram_context_from_window(
-                torch.from_numpy(window).to(runner.device, non_blocking=True),
+                stage_h2d_upload(runner, torch.from_numpy(window)),
                 context,
                 self.config.eos_token_id,
                 self.config.ngram_size,
@@ -429,11 +473,9 @@ class Qwen4ExpAdapter:
         ]
 
     def _host_upload(self, array):
-        """Upload a small host array; keep the source alive for a few steps
-        because a non-blocking copy may still be reading it."""
-        host = torch.from_numpy(array)
-        self._host_keep = (getattr(self, "_host_keep", ()) + (host,))[-8:]
-        return host.to(self.runner.device, non_blocking=True)
+        """Upload a small host array, owned by the runner until a staging
+        fence covers the non-blocking copy (see `stage_h2d_upload`)."""
+        return stage_h2d_upload(self.runner, torch.from_numpy(array))
 
     def _scalars_upload(self, scalars):
         """The step's [row_start, num_requests, previous rows] upload, reused
@@ -492,7 +534,8 @@ class Qwen4ExpAdapter:
             clones = tuple(t.clone() for t in current) if current is not None else None
             reference = (self._prepare_inputs_eager(snapshot, clones), clones)
         seq_lens = ctx.seq_lens - 1 if check == "fault" else ctx.seq_lens
-        context, history, slots, valid_tokens = self._fused_fn()(
+        functional = envs.VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL
+        out = self._fused_fn()(
             starts,
             seq_lens,
             state_indices,
@@ -506,7 +549,11 @@ class Qwen4ExpAdapter:
             spec_window=self.spec_window,
             eos_token_id=self.config.eos_token_id,
             ngram_size=self.config.ngram_size,
+            functional=functional,
         )
+        context, history, slots, valid_tokens = out[:4]
+        if functional and current is not None:
+            current = self._recent[1] = out[4]
         if reference is not None:
             self._check_fused(
                 snapshot.num_requests,
@@ -528,7 +575,9 @@ class Qwen4ExpAdapter:
             compressed_block_table=tables[1],
         )
 
-    def _check_fused(self, n, reference, current, context, history, slots, valid_tokens):
+    def _check_fused(
+        self, n, reference, current, context, history, slots, valid_tokens
+    ):
         """VLLM_TPU_QWEN4_FUSED_PREP_CHECK=check (``fault``: the fused program
         reads context - 1, its positive control): on every step with live
         requests compare the fused outputs and this step's speculative record
@@ -543,7 +592,9 @@ class Qwen4ExpAdapter:
             for got, want in zip(current, ref_current):
                 bad = bad + (got != want).reshape(got.shape[0], -1).any(dim=1).sum()
         if getattr(self, "_fused_check_bad", None) is None:
-            self._fused_check_bad = torch.zeros((), dtype=torch.int64, device=bad.device)
+            self._fused_check_bad = torch.zeros(
+                (), dtype=torch.int64, device=bad.device
+            )
             self._fused_check_steps = self._fused_check_rows = 0
             self._fused_check_multi = self._fused_check_max_rows = 0
         self._fused_check_bad += bad
@@ -586,7 +637,9 @@ class Qwen4ExpAdapter:
                 state = torch.zeros(rows, dtype=torch.int32, device=device)
                 if window:
                     width = max(self.spec_window - 1, 0) + self.config.ngram_size - 1
-                    store = torch.zeros((rows, width + 1), dtype=torch.int64, device=device)
+                    store = torch.zeros(
+                        (rows, width + 1), dtype=torch.int64, device=device
+                    )
                 else:
                     store = torch.zeros(
                         (store_rows, runner.input_batch.token_ids_cpu_tensor.shape[1]),
@@ -617,8 +670,9 @@ class Qwen4ExpAdapter:
                         spec_window=self.spec_window,
                         eos_token_id=self.config.eos_token_id,
                         ngram_size=self.config.ngram_size,
+                        functional=envs.VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL,
                     )
-                    synchronize_tensors(out)
+                    synchronize_tensors(out[:4])
         logger.info(
             "Compiled fused qwen4 step inputs for rows %s x %d token buckets",
             sorted({r for r in rows_options if r}),
@@ -626,22 +680,32 @@ class Qwen4ExpAdapter:
         )
 
     def _check_ngram_window(self, snapshot, row_ids, context, history):
-        """``VLLM_TPU_QWEN4_NGRAM_WINDOW=check``: compare the windowed context with the full-store
-        one on the live rows for the first 200 steps (one sync each), log the mismatches."""
+        """``VLLM_TPU_QWEN4_NGRAM_WINDOW=check``: compare the windowed context with the
+        full-store
+        one on the live rows for the first 200 steps (one sync each), log the
+        mismatches."""
         left = getattr(self, "_ngram_check_left", 200)
         if left <= 0 or snapshot.num_requests == 0:
             return
         self._ngram_check_left = left - 1
         ref = ngram_context_from_store(
-            snapshot.token_store, row_ids, context, self.config.eos_token_id, self.config.ngram_size
+            snapshot.token_store,
+            row_ids,
+            context,
+            self.config.eos_token_id,
+            self.config.ngram_size,
         )
         n = snapshot.num_requests
         bad = int((ref[:n] != history[:n]).any(dim=1).sum().item())
         self._ngram_check_bad = getattr(self, "_ngram_check_bad", 0) + bad
         if bad or left in (200, 1):
             logger.info(
-                "qwen4 ngram window check: %d of %d rows differ this step, %d total, %d checks left",
-                bad, n, self._ngram_check_bad, left - 1,
+                "qwen4 ngram window check: %d of %d rows differ this step, %d total, "
+                "%d checks left",
+                bad,
+                n,
+                self._ngram_check_bad,
+                left - 1,
             )
 
     def dummy_run(

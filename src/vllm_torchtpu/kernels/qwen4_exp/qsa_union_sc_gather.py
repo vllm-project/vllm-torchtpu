@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """SparseCore union gather, step 2: the list and gather steps on v7x SparseCore.
 
-P-ATTN. The walking D2 kernel (``qsa_union_dense.union_walk_kernel`` with
+The walking D2 kernel (``qsa_union_dense.union_walk_kernel`` with
 ``fast_walk=True``) spends about 12 ns of scalar TensorCore time per union
 group finding the next set bit of the union bitset and issuing its 4-token DMA
-(i1j: ``walk_issue``, about 23% of the kernel). The gathered path moves that
+(a TPU run: ``walk_issue``, about 23% of the kernel). The gathered path moves that
 walk off the TensorCore. Two SparseCore kernels write each query group's
 union, in rank order, to contiguous HBM, and the attention kernel reads each KV
 tile as two contiguous copies (``union_walk_kernel(gathered=...)``, already
@@ -52,7 +52,7 @@ helpers below are shared by the kernels and the CPU emulation in
 Status: CPU-traced and lowered to Mosaic under an abstract TPU7x mesh; the
 SparseCore compile and the outputs are unverified until a TPU run.
 
-Run-table walk (``union_walk_kernel(run_tables=..., listed_lines=...)``, i1n:
+Run-table walk (``union_walk_kernel(run_tables=..., listed_lines=...)``, a TPU run:
 0.88x the listed walk, bitwise) needs two more SparseCore steps:
 
 ``union_sc_lines`` returns ``qsa_union_dense.union_lines_reference``'s lines:
@@ -159,7 +159,7 @@ def padding_rows(first_bases):
     """The padding fill's row vector: word 0's pool base on every lane.
 
     ``first_bases``: the first 16 per-word bases (a contiguous vector load).
-    Lane 0 is extracted and broadcast. i1l (M): ``load_gather(physw, [zeros])``
+    Lane 0 is extracted and broadcast. a TPU run (M): ``load_gather(physw, [zeros])``
     wrote ``physw[lane]`` on lanes 1-15 on the SparseCore (a contiguous load,
     not a broadcast), so only padding lane 0 matched the reference.
     """
@@ -186,7 +186,7 @@ def bits_row_index(ids, gwords):
     """Row of the flat bitset ``[ngroups * words, width]`` holding id ``ids``.
 
     Padding ids (-1) read one of the group's first 8 words by lane (their lines are zeroed, so the row is free):
-    every padding rank reading word 0 made one 512 B row a hot spot (i1k2: the padding hot spot dominated the
+    every padding rank reading word 0 made one 512 B row a hot spot (a TPU run: the padding hot spot dominated the
     gather). ``words`` is a multiple of 8, so the rows exist.
     """
     lane = lax.broadcasted_iota(jnp.int32, jnp.shape(ids), jnp.ndim(ids) - 1) & 7
@@ -980,7 +980,7 @@ class ScOps:
 def carry_pad(nsizes, even_carry=True):
     """Dummy counts that make pass B's tuple carry even: 1 for an odd carry above 1 (R4: 3 sizes, R16: 5), else 0.
 
-    i1o (M, TPU): R4 tables at KV1024 failed and halted the device on mixed-size tiles, while R1/R2/R8/R32 (carries of
+    a TPU run (M, TPU): R4 tables at KV1024 failed and halted the device on mixed-size tiles, while R1/R2/R8/R32 (carries of
     1/2/4/6 counts) passed and the CPU emulation of R4 passed. R4 was the only odd carry above 1 tested. Hypothesis
     (I, unconfirmed): an odd scalar-tuple carry in ``parallel_loop(unroll=2)`` miscompiles on the SparseCore. The
     dummy is carried unchanged and never read. ``even_carry=False`` keeps the old carry (TPU diagnosis only).
@@ -1203,7 +1203,7 @@ def union_sc_run_tables(rows, ids, *, ratio, kv_tile, max_run=8, tiles_per_step=
     slot``; unused slots 0). ``tiles_per_step``: tiles per pipeline step (a
     divisor of ``ngroups * cap_tiles``; default from ``table_plan``). ``even_carry``: see ``carry_pad`` (keep
     the default; False only to diagnose the old R4/R16 carry on TPU). ``copy_unroll``: unroll of the tile's
-    list-concatenation and zero-fill loops (dynamic trip counts). 1, the default since i1u (M): at 2, R4 tables at
+    list-concatenation and zero-fill loops (dynamic trip counts). 1, the default since a TPU run (M): at 2, R4 tables at
     KV512 and KV1024 put the size-2 list late (overlapping full-vector stores reordered, I) and a walk on them halted
     the device; at 1 every R4 case matches the host reference. 2 is kept only to reproduce that on TPU.
     """
@@ -1242,7 +1242,7 @@ def union_sc_run_tables(rows, ids, *, ratio, kv_tile, max_run=8, tiles_per_step=
 
 
 # SparseCore selection bitset (lane_attn.md option A): union_bits_plan's per-row bitset built on the SparseCore, off
-# the TensorCore (i1u2 xprof, M: the TensorCore bitset was 1.15 ms of an 11.85 ms FA call, serial before attention).
+# the TensorCore (a TPU run xprof, M: the TensorCore bitset was 1.15 ms of an 11.85 ms FA call, serial before attention).
 
 
 def bits_slab(ops, sel, lengths, out, *, k, words, ratio, groups):

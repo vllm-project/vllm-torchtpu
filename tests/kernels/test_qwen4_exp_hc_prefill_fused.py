@@ -375,13 +375,13 @@ def fake_adapter(monkeypatch):
     fake = types.ModuleType("vllm_torchtpu.kernels.qwen4_exp.vllm_adapter")
 
     def builder(name):
-        def build(*args):
+        def build(*args, **kwargs):
             built.append(name)
             return lambda *a: name
 
         return build
 
-    for name in ("build_gated_residual_op", "build_full_mix_op", "build_norm_op",
+    for name in ("build_gated_residual_op", "build_full_mix_op", "build_combine_full_mix_op", "build_norm_op",
                  "build_up_epilogue_op", "build_decode_mix_op", "build_decode_combine_mix_op",
                  "build_prefill_inj_mix_op", "build_prefill_combine_mix_op"):
         setattr(fake, name, builder(name))
@@ -513,14 +513,15 @@ def test_norm_env_reaches_builders(monkeypatch, fake_adapter):
     seen = []
     fake = sys.modules["vllm_torchtpu.kernels.qwen4_exp.vllm_adapter"]
 
-    def record(*args):
-        seen.append(args)
+    def record(*args, **kwargs):
+        seen.append(kwargs)
         return lambda *a: None
 
     monkeypatch.setattr(fake, "build_full_mix_op", record)
     monkeypatch.setattr(envs, "TPU_QWEN4_HC_PREFILL_NORM", "gram64")
     GatedResidual(_module(3).config, prefill_full_tile=256)
-    assert seen and seen[-1][-1] == "gram64", seen
+    # norm_impl goes in by keyword (positional slots 5-6 are up_t / inject).
+    assert seen and seen[-1].get("norm_impl") == "gram64", seen
 
 
 # ---- bf16 norm epilogue (TPU_QWEN4_HC_PREFILL_NORM=bf16ep): bitwise by argument

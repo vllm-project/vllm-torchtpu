@@ -39,8 +39,12 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
 )
-from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+try:
+    from transformers import Qwen4ExpTextConfig
+except ImportError:
+    from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
 from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
@@ -83,13 +87,14 @@ def _cpu_model_tests(monkeypatch):
 
 
 def _text_config(**overrides) -> Qwen4ExpTextConfig:
+    layer_types = overrides.get("layer_types", LAYER_TYPES)
     kwargs = dict(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
         hc_count=HC,
         hc_lowrank=8,
-        num_hidden_layers=len(LAYER_TYPES),
-        layer_types=LAYER_TYPES,
+        num_hidden_layers=len(layer_types),
+        layer_types=layer_types,
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=8,
@@ -198,6 +203,7 @@ def test_fp8_checkpoint_quantizes_routed_experts_and_ple_table() -> None:
 # N-gram PLE
 # ---------------------------------------------------------------------------
 _PLE = dict(
+    layer_types=["linear_attention", "linear_attention", "full_attention"],
     ple_layer_ids=[2],
     ngram_size=3,
     heads_per_ngram=2,

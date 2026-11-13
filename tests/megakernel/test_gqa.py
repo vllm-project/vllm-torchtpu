@@ -19,10 +19,15 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
-from conftest import TINY_TILES, FakeGeometry, MiniCtx
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from tests.megakernel.megakernel_helpers import (
+    TINY_TILES,
+    FakeGeometry,
+    MiniCtx,
+    _fake_ex_fixture,  # noqa: F401
+)
 from vllm_torchtpu.megakernel import comm, planner, stream, vmem
 from vllm_torchtpu.megakernel.blocks import GQABlock, MoEBlock
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec

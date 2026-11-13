@@ -26,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.core.mamba_tail_fold import fold_unit
 from vllm_torchtpu.gdn_pool_layout import (
     derive_pooled_gdn_state_layout,
     pooled_gdn_conv_state_bytes,
@@ -36,6 +37,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
+from vllm_torchtpu.kernels.gdn.v3 import metadata as gdn_v3_metadata
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput, QKVColumns
@@ -882,6 +884,7 @@ def run_jax_gdn_attention_pooled_local(
     seq_lens: jnp.ndarray,
     read_offsets: jnp.ndarray | None = None,
     ckpt_indices: jnp.ndarray | None = None,
+    per_seq_inputs: tuple[jnp.ndarray, ...] | None = None,
     *,
     n_kq: int,
     n_v: int,
@@ -893,8 +896,16 @@ def run_jax_gdn_attention_pooled_local(
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+    prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
+    packed_metadata: jnp.ndarray | None = None,
+    metadata_only: bool = False,
+    packed_size: int = 0,
+) -> tuple[jnp.ndarray, jnp.ndarray] | jnp.ndarray:
     """GDN attention over the unified block pool.
+
+    ``packed_metadata`` / ``metadata_only``: see ``fused_conv1d_gdn``
+    (VLLM_TPU_GDN_STEP_KERNEL_METADATA); with ``metadata_only`` the result is
+    the packed kernel metadata alone.
 
     ``recurrent_state`` is the attention-shaped pool holding the SSM region
     in ``recurrent_state_dtype`` at token offset 0 and the configured Conv
@@ -930,7 +941,12 @@ def run_jax_gdn_attention_pooled_local(
     zero_initialize_out = pooled_gdn_zero_initialize_out(
         num_rows, seq_lens.shape[0], num_spec_tokens
     )
-    recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
+    if metadata_only:
+        # The metadata reads only the pool's geometry (already in `plan`).
+        # Hand the donating kernel wrapper a one-block copy so the caller's
+        # pool is never donated by a call that does not write it.
+        recurrent_state = jax.lax.slice_in_dim(recurrent_state, 0, 1)
+    result = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
         b,
         a,
@@ -956,8 +972,54 @@ def run_jax_gdn_attention_pooled_local(
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
         zero_initialize_out=zero_initialize_out,
+        per_seq_inputs=per_seq_inputs,
+        prefill_ckpt=prefill_ckpt,
+        # Checkpoint offsets are whole fold units, by default whole manager
+        # blocks (core/mamba_tail_fold.py).
+        prefill_ckpt_alignment=(
+            fold_unit(pool_block_tokens) if prefill_ckpt is not None else 0
+        ),
+        packed_metadata=packed_metadata,
+        metadata_only=metadata_only,
+        packed_size=packed_size,
     )
+    if metadata_only:
+        return result
+    recurrent_state, output = result
     return recurrent_state, output
+
+
+def gdn_step_metadata(
+    slot_read_offsets: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    distribution: jnp.ndarray,
+    ckpt_indices: jnp.ndarray,
+) -> tuple[jnp.ndarray, ...]:
+    """The per-step GDN index metadata every pooled layer of a step shares.
+
+    `run_jax_gdn_attention_pooled` otherwise derives these inside each layer
+    (the read-offset gather, the int32 casts and the PER_SEQ roll of
+    `fused_conv1d_gdn`); the per-layer ops are separate programs, so XLA
+    repeats them once per GDN layer. The values are the same integers.
+
+    Returns `(read_offsets, ckpt_indices, *per_seq_inputs)`: the
+    `(num_seqs,)` read offsets, the `(num_seqs, num_spec + 1)` checkpoint
+    ids, and the five rolled per-sequence arrays of
+    `metadata.roll_per_seq_inputs`.
+    """
+    read_offsets = slot_read_offsets[state_indices].astype(jnp.int32)
+    ckpt_indices = ckpt_indices.astype(jnp.int32)
+    per_seq_inputs = gdn_v3_metadata.roll_per_seq_inputs(
+        query_start_loc,
+        seq_lens,
+        state_indices,
+        read_offsets,
+        distribution[0],
+        ckpt_indices,
+    )
+    return (read_offsets, ckpt_indices, *per_seq_inputs)
 
 
 def run_jax_gdn_attention_pooled(
@@ -987,7 +1049,12 @@ def run_jax_gdn_attention_pooled(
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+    step_metadata: tuple[jnp.ndarray, ...] | None = None,
+    prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
+    packed_metadata: jnp.ndarray | None = None,
+    metadata_only: bool = False,
+    packed_size: int = 0,
+) -> tuple[jnp.ndarray, jnp.ndarray] | jnp.ndarray:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
     Args:
@@ -1020,6 +1087,13 @@ def run_jax_gdn_attention_pooled(
         d_v: Dimension of value.
         kernel_size: Convolution kernel size.
         mesh: The device mesh for distributed computation.
+        step_metadata: Optional `gdn_step_metadata(...)` output computed once
+          for the step; replaces `slot_read_offsets` and `ckpt_indices`
+          (pass both as None) and the per-layer index math they feed.
+        prefill_ckpt: Optional `(offsets, blocks)`, int32 `(num_seqs,)` each:
+          internal prefill checkpoints (VLLM_TPU_MAMBA_TAIL_FOLD). Sequence
+          `s` also writes its state after `offsets[s]` query tokens to pool
+          block `blocks[s]`; 0 means none.
 
     Returns:
         A tuple containing:
@@ -1050,6 +1124,17 @@ def run_jax_gdn_attention_pooled(
         P(None),  # distribution
         P(None),  # seq_lens
     )
+    if step_metadata is not None:
+        assert slot_read_offsets is None and ckpt_indices is None, (
+            "step_metadata replaces slot_read_offsets and ckpt_indices"
+        )
+        # Read offsets, checkpoint ids and the rolled per-sequence inputs,
+        # all replicated like the other per-sequence inputs.
+        in_specs = in_specs + (
+            P(None),
+            P(None, None),
+            (P(None), P(None), P(None), P(None), P(None, None)),
+        )
     if slot_read_offsets is not None:
         # Per-sequence read offsets (see below), replicated like the other
         # per-sequence inputs.
@@ -1083,8 +1168,39 @@ def run_jax_gdn_attention_pooled(
         conv_state_dtype=conv_state_dtype,
         conv_weight_kmajor=conv_weight_kmajor,
     )
+    if packed_metadata is not None or metadata_only:
+        # VLLM_TPU_GDN_STEP_KERNEL_METADATA: one replicated packed vector,
+        # the same on every rank (it is built from replicated step inputs).
+        assert prefill_ckpt is None and step_metadata is None
+        p_run_jax_gdn_attention_pooled_local = functools.partial(
+            p_run_jax_gdn_attention_pooled_local,
+            metadata_only=metadata_only,
+            packed_size=packed_size,
+        )
+        if metadata_only:
+            out_specs = P(None)
+    local_fn = p_run_jax_gdn_attention_pooled_local
+    if packed_metadata is not None:
+        in_specs = in_specs + (P(None),)
+        inner_fn = local_fn
+
+        def local_fn(*args):
+            *rest, packed = args
+            return inner_fn(*rest, packed_metadata=packed)
+
+    if prefill_ckpt is not None:
+        # Two more replicated per-sequence inputs, appended after whichever
+        # optional inputs precede them.
+        in_specs = in_specs + (P(None), P(None))
+
+        def local_fn(*args):
+            *rest, ckpt_offsets, ckpt_blocks = args
+            return p_run_jax_gdn_attention_pooled_local(
+                *rest, prefill_ckpt=(ckpt_offsets, ckpt_blocks)
+            )
+
     mapped_fn = jax.shard_map(
-        p_run_jax_gdn_attention_pooled_local,
+        local_fn,
         mesh=mesh,
         in_specs=in_specs,
         out_specs=out_specs,
@@ -1099,7 +1215,10 @@ def run_jax_gdn_attention_pooled(
     # initial state from checkpoint `read_offsets[s]` of block
     # `state_indices[s]`. Both operands are replicated, so gather here,
     # outside the shard_map (mirrors run_jax_gdn_attention).
-    if slot_read_offsets is not None:
+    if step_metadata is not None:
+        read_offsets, step_ckpt_indices, *per_seq_inputs = step_metadata
+        extra_args = (read_offsets, step_ckpt_indices, tuple(per_seq_inputs))
+    elif slot_read_offsets is not None:
         extra_args = (slot_read_offsets[state_indices],)
     else:
         extra_args = ()
@@ -1107,6 +1226,10 @@ def run_jax_gdn_attention_pooled(
         # Already per-sequence (row s names sequence s's checkpoint blocks),
         # so it needs no gather by state_indices.
         extra_args = extra_args + (ckpt_indices,)
+    if prefill_ckpt is not None:
+        extra_args = extra_args + tuple(prefill_ckpt)
+    if packed_metadata is not None:
+        extra_args = extra_args + (packed_metadata,)
     outputs = mapped_fn(
         j_mixed_qkv,
         j_b,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sort-free union plan for the D2 union prefill (P-ATTN prototype; not served).
+"""Sort-free union plan for the D2 union prefill (prototype).
 
 ``qsa_union_prefill.union_plan`` builds each query group's union with
 ``jnp.sort`` and ranks selections with ``searchsorted``. On TPU an XLA sort is

@@ -47,6 +47,7 @@ Select with ``--scheduler-cls``
 """
 
 from itertools import chain
+from typing import Any, cast
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -360,8 +361,9 @@ class SrptPrefillScheduler(AsyncScheduler):
         if kept:
             # allocate_slots() adds the watermark when others are scheduled.
             needed += self.kv_cache_manager.watermark_blocks
-        reserved = (
-            self._inflight_prefill_reserved_blocks() + self._spec_decode_step_blocks()
+        spec_blocks = self._spec_decode_step_blocks
+        reserved = self._inflight_prefill_reserved_blocks() + (
+            cast(Any, spec_blocks)() if callable(spec_blocks) else int(spec_blocks)
         )
         free = self.kv_cache_manager.block_pool.get_num_free_blocks()
         return free - reserved >= needed

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native pool allocation, prefix alignment and state ownership contracts."""
 
+import inspect
 import math
 from dataclasses import replace
 from types import SimpleNamespace as NS
@@ -228,6 +229,127 @@ def test_pool_warmup_tables_match_native_ring_padding():
             table = item.block_tables.reshape(8, -1)
             assert table[0, 0] > 0
             assert torch.count_nonzero(table) == 1
+
+
+@pytest.mark.parametrize("num_spec", [0, 3])
+@pytest.mark.parametrize("fold", [False, True])
+def test_pool_warmup_state_tables_match_serving_under_tail_fold(
+    monkeypatch, fold, num_spec
+):
+    """VLLM_TPU_MAMBA_TAIL_FOLD reads each state group's whole block table in
+    the forward (`prefill_checkpoint_targets`). The compiled forward keeps no
+    guards, so warmup must trace the row width serving stages. A `window`-wide
+    trace failed the first served step with RuntimeProgramInputMismatch
+    (s32[32 * 4] compiled, s32[32 * 515] supplied). Here a mixed batch of three
+    verify windows plus one prefill: every warmup table has the served shape,
+    and the checkpoint lookup returns per-request operands."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+    from vllm.v1.worker.block_table import MultiGroupBlockTable, SlotMappingMode
+
+    from vllm_torchtpu.core.mamba_tail_fold import prefill_checkpoint_targets
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+    from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
+
+    if fold:
+        monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD", "1")
+    else:
+        monkeypatch.delenv("VLLM_TPU_MAMBA_TAIL_FOLD", raising=False)
+    monkeypatch.delenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", raising=False)
+    cfg = pool_config()
+    layout, _ = pooled_cache_specs(cfg)
+    cfg.cache_config.block_size = cfg.cache_config.mamba_block_size = layout.block_size
+    runner = NS(vllm_config=cfg, max_model_len=9216, device=torch.device("cpu"))
+    cache = Qwen4ExpPooledCache(runner, model=None)
+    # MTP: the warmup traces one checkpoint block per verify position, and
+    # serving's state specs carry them as speculative blocks.
+    if num_spec:
+        cfg.speculative_config = NS(num_speculative_tokens=num_spec)
+    cache.groups = [
+        replace(
+            g, kv_cache_spec=replace(g.kv_cache_spec, num_speculative_blocks=num_spec)
+        )
+        if isinstance(g.kv_cache_spec, MambaSpec)
+        else g
+        for g in cache.groups
+    ]
+    specs = [g.kv_cache_spec for g in cache.groups]
+    assert any(isinstance(s, MambaSpec) for s in specs)
+    assert all(
+        (s.num_prefill_checkpoint_blocks > 0) == fold
+        for s in specs
+        if isinstance(s, MambaSpec)
+    )
+    rows, window = 8, num_spec + 1
+    # What `stage_block_table_uploads` hands each group in serving
+    # (use_max_model_len: the BlockTable's own row width).
+    # vLLM's GPUModelRunner.may_reinitialize_input_batch sizes each group's
+    # row as spec.max_num_blocks_per_req(vllm_config, max_model_len).
+    table_kwargs = dict(
+        max_num_reqs=rows,
+        max_num_batched_tokens=128,
+        pin_memory=False,
+        device=runner.device,
+        block_sizes=[s.block_size for s in specs],
+        kernel_block_sizes=[s.block_size for s in specs],
+        max_num_blocks=[s.max_num_blocks_per_req(cfg, 9216) for s in specs],
+        slot_mapping_modes=[
+            SlotMappingMode.NONE
+            if isinstance(s, MambaSpec)
+            else SlotMappingMode.TOKEN_TO_KV_SLOT
+            for s in specs
+        ],
+    )
+    accepted = inspect.signature(MultiGroupBlockTable.__init__).parameters
+    native = MultiGroupBlockTable(
+        **{k: v for k, v in table_kwargs.items() if k in accepted}
+    )
+    lengths = [window] * 3 + [128 - 3 * window] + [0] * (rows - 4)
+    seq_lens = [600] * 3 + [lengths[3]] + [0] * (rows - 4)
+    starts = [0]
+    for n in lengths:
+        starts.append(starts[-1] + n)
+    metadata = AttentionMetadata(
+        input_positions=torch.arange(128, dtype=torch.int32, device="cpu"),
+        query_start_loc=torch.tensor(starts, dtype=torch.int32, device="cpu"),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device="cpu"),
+        request_distribution=torch.tensor([3, 3, 4], dtype=torch.int32),
+    )
+    cache.pages = cache.dummy_pages(seq_lens[:4], active_rows=4)
+    warmup = cache.dummy_metadata(metadata, active_rows=4)
+    for gid, group in enumerate(cache.groups):
+        item = warmup[group.layer_names[0]]
+        served = native[gid].get_cpu_tensor().flatten().shape
+        if not isinstance(group.kv_cache_spec, MambaSpec):
+            assert item.block_tables.shape == served
+            continue
+        # The state and checkpoint indices keep their shapes either way.
+        assert item.mamba_state_indices.shape == (rows,)
+        if num_spec:
+            assert item.mamba_ckpt_indices.shape == (rows, window)
+            table = item.block_tables.reshape(rows, -1)
+            assert torch.equal(item.mamba_ckpt_indices, table[:, :window])
+            assert torch.equal(item.mamba_state_indices, table[:, 0])
+        if not fold:
+            # Flag off: unchanged, the table is never read in the forward.
+            assert item.mamba_prefill_ckpt is None
+            assert item.block_tables.shape == (rows * window,)
+            continue
+        assert item.block_tables.shape == served
+        assert served[0] > rows * window
+        assert item.mamba_prefill_ckpt.shape == (2, rows)
+        offsets, blocks = prefill_checkpoint_targets(
+            item.mamba_prefill_ckpt, item.block_tables, rows
+        )
+        assert offsets.shape == blocks.shape == (rows,)
+        assert not blocks.any()
+        # A served checkpoint column past the window resolves to its block.
+        width = served[0] // rows
+        table = torch.zeros((rows, width), dtype=torch.int32)
+        table[3, width - 1] = 77
+        ckpt = torch.zeros((2, rows), dtype=torch.int32)
+        ckpt[0, 3], ckpt[1, 3] = 512, width - 1
+        _, blocks = prefill_checkpoint_targets(ckpt, table.reshape(-1), rows)
+        assert blocks.tolist() == [0, 0, 0, 77] + [0] * (rows - 4)
 
 
 @pytest.mark.parametrize("symbolic", [False, True])
@@ -580,6 +702,44 @@ def dcp_config(monkeypatch, *, pair=False, compressed=False, dcp="2", tp=8):
         monkeypatch.setenv("QWEN4_EXP_PACK_MAIN_KV", "0")
     monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", dcp)
     return cfg
+
+
+@pytest.mark.parametrize("dcp", ["1", "2"])
+def test_tail_fold_turns_off_under_main_kv_dcp(monkeypatch, caplog, dcp):
+    """za5 c48 (VLLM_TPU_QSA_MAIN_KV_DCP=2) ran the fold's worker path while
+    the scheduler guard rejected the doubled scheduler block. Under any
+    context parallelism the state specs carry no checkpoint block, so the
+    scheduler, the manager and the worker all see the fold off, and the
+    reason is logged."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from vllm_torchtpu.core import mamba_tail_fold
+
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD", "1")
+    monkeypatch.delenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", raising=False)
+    monkeypatch.setattr(mamba_tail_fold, "_DCP_LOGGED", set())
+    cfg = dcp_config(monkeypatch, dcp=dcp)
+    cfg.cache_config.enable_prefix_caching = True
+    _, specs = pooled_cache_specs(cfg)
+    states = [s for s in specs.values() if isinstance(s, MambaSpec)]
+    assert states
+    folded = {s.num_prefill_checkpoint_blocks > 0 for s in states}
+    assert folded == {dcp == "1"}
+    blocked = mamba_tail_fold.fold_blocked_by_context_parallel(cfg, int(dcp))
+    assert (blocked is None) == (dcp == "1")
+    # Opt-in: main-KV DCP folds, with the Mamba specs exactly as without DCP.
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_DCP", "1")
+    assert mamba_tail_fold.fold_blocked_by_context_parallel(cfg, int(dcp)) is None
+    _, opted = pooled_cache_specs(cfg)
+    monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", "1")
+    _, plain = pooled_cache_specs(cfg)
+    for name, spec in opted.items():
+        if isinstance(spec, MambaSpec):
+            assert spec.num_prefill_checkpoint_blocks == 1
+            assert spec == plain[name], name
+    # vLLM DCP stays off even with the opt-in.
+    cfg.parallel_config.decode_context_parallel_size = 2
+    assert mamba_tail_fold.fold_blocked_by_context_parallel(cfg, 1)
 
 
 @pytest.mark.parametrize(

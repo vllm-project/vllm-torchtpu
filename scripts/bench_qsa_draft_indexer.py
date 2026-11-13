@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """QSA decode indexer microbench for one-token request rows (MTP draft steps).
 
 Qwen3.8-Flash TP8 geometry: 4 index heads x 128, FP8 unified pool with
@@ -52,9 +65,13 @@ def run(pool, args, block):
     @jax.jit
     def loop(pool, query):
         def body(i, acc):
-            sel = select(query=query + acc.astype(query.dtype) * 0, pool=pool,
-                         **{k: v for k, v in args.items() if k != "query"})
+            sel = select(
+                query=query + acc.astype(query.dtype) * 0,
+                pool=pool,
+                **{k: v for k, v in args.items() if k != "query"},
+            )
             return acc + jnp.sum(sel).astype(jnp.float32) * 0
+
         return jax.lax.fori_loop(0, ITERS, body, jnp.float32(0))
 
     jax.block_until_ready(loop(pool, args["query"]))
@@ -63,17 +80,18 @@ def run(pool, args, block):
         t0 = time.perf_counter()
         jax.block_until_ready(loop(pool, args["query"]))
         samples.append((time.perf_counter() - t0) / ITERS * 1e6)
-    sel = jax.jit(lambda pool, query: select(
-        query=query, pool=pool, **{k: v for k, v in args.items() if k != "query"}
-    ))(pool, args["query"])
+    sel = jax.jit(
+        lambda pool, query: select(
+            query=query, pool=pool, **{k: v for k, v in args.items() if k != "query"}
+        )
+    )(pool, args["query"])
     return float(np.median(samples)), np.sort(np.asarray(sel), axis=-1)
 
 
 def test_draft_indexer():
     rng = np.random.default_rng(0)
-    pool = (
-        jax.random.normal(jax.random.key(0), (POOL_PAGES, PAGE, 1, 4, 256))
-        .astype(jnp.float8_e4m3fn)
+    pool = jax.random.normal(jax.random.key(0), (POOL_PAGES, PAGE, 1, 4, 256)).astype(
+        jnp.float8_e4m3fn
     )
     results = []
     for rows, max_ctx in itertools.product((4, 8, 32), (16384, 65536)):

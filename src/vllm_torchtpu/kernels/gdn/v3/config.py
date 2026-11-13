@@ -131,6 +131,59 @@ class GDNConfig:
     # (VLLM_TPU_GDN_PREFILL_DENSE_CONV); resolved by the wrapper. Left out of
     # the kernel metadata while False, so other kernels' metadata is unchanged.
     dense_conv: bool = False
+    # PER_SEQ chunked GDN only: the tile holds two chunks of the same
+    # sequence (tile_size = 2 * sub_chunk_size), whose state-independent
+    # work is batched over heads (TPU_GDN_CHUNK_PAIR).
+    chunk_pair: bool = False
+    # Raw activation inputs (TPU_GDN_RAW_QKV / TPU_GDN_RAW_BA): qkv (and b/a)
+    # arrive as the projection's 2D [tokens, width] array, unpadded and in its
+    # own dtype. Each tile DMAs `raw_*_rows` rows starting at a multiple of
+    # `raw_*_align` (the HBM row tile) that cover the tile's tokens, then
+    # casts and places them in the compact layout in VMEM. 0 = off.
+    raw_qkv_rows: int = 0
+    raw_qkv_align: int = 0
+    raw_ba_rows: int = 0
+    raw_ba_align: int = 0
+    # TPU_GDN_KERNEL_ZERO_OUT: the kernel zero-fills the output rows
+    # [query_start_loc[distribution[zero_out_from]], batch_size), which no
+    # kernel of the call writes, instead of an XLA zero-initialized buffer.
+    # -1 = off.
+    zero_out_from: int = -1
+    # VLLM_TPU_GDN_V3_WINDOW_VERIFY: verify-window tiles (BATCHED, window_size
+    # > 1, GDN) run window_tile, one window position and one value head at a
+    # time, instead of inner_kernel. The wrapper sets it only where
+    # window_tile.supported holds for the pool.
+    window_verify: bool = False
+
+    # Output rows zeroed per DMA by the in-kernel zero-fill.
+    ZERO_OUT_ROWS: ClassVar[int] = 32
+
+    @property
+    def raw_qkv(self) -> bool:
+        return self.raw_qkv_rows > 0
+
+    @property
+    def raw_ba(self) -> bool:
+        return self.raw_ba_rows > 0
+
+    @property
+    def kernel_zero_out(self) -> bool:
+        return self.zero_out_from >= 0
+
+    @property
+    def per_head_windows(self) -> bool:
+        """Whether this tile runs window_tile (see `window_verify`)."""
+        return (
+            self.window_verify
+            and self.mode == GDNMode.BATCHED
+            and self.window_size > 1
+            and not self.is_kda
+        )
+
+    @property
+    def sub_chunk_size(self) -> int:
+        """Rows of one GDN chunk: half the tile when chunks are paired."""
+        return self.chunk_size // 2 if self.chunk_pair else self.chunk_size
 
     @property
     def chunk_size(self) -> int:
@@ -244,6 +297,16 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
+        if self.chunk_pair:
+            suffix += "_pair"
+        if self.raw_qkv:
+            suffix += "_rawqkv"
+        if self.raw_ba:
+            suffix += "_rawba"
+        if self.kernel_zero_out:
+            suffix += "_zf"
+        if self.per_head_windows:
+            suffix += "_wt"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
@@ -253,6 +316,9 @@ class GDNConfig:
         cfgs_dict = dataclasses.asdict(self)
         if not cfgs_dict.get("dense_conv"):
             cfgs_dict.pop("dense_conv", None)
+        if not self.window_verify:
+            # Off: the kernel metadata stays what it was before the switch.
+            del cfgs_dict["window_verify"]
         ret = {}
         for path, val in jax.tree_util.tree_leaves_with_path(cfgs_dict):
             key = jax.tree_util.keystr(path, simple=True, separator=".")
@@ -298,9 +364,44 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
+        raw_scratch = None
+        if self.raw_qkv or self.raw_ba:
+            act = (self.seq_tile_size, self.chunk_size, 1)
+            raw_scratch = {}
+            if self.raw_qkv:
+                # Rows [0, raw_qkv_rows) hold the cast row block; the extra
+                # chunk_size rows keep every per-sequence window read in
+                # bounds (rows past a sequence's tokens are masked).
+                raw_scratch["qkv_stage"] = pltpu.VMEM(
+                    (self.raw_qkv_rows + self.chunk_size, 1, self.dim_size),
+                    jnp.float32,
+                )
+                raw_scratch["qkv_act"] = pltpu.VMEM(act + (self.dim_size,), jnp.float32)
+            if self.raw_ba:
+                for name, width in (
+                    ("b", self.aligned_num_v_heads),
+                    ("a", self.aligned_gate_dim),
+                ):
+                    raw_scratch[f"{name}_stage"] = pltpu.VMEM(
+                        (self.raw_ba_rows + self.chunk_size, 1, width), jnp.float32
+                    )
+                    raw_scratch[f"{name}_act"] = pltpu.VMEM(act + (width,), jnp.float32)
+
+        zero_out_scratch = None
+        if self.kernel_zero_out:
+            zero_out_scratch = (
+                pltpu.VMEM(
+                    (self.ZERO_OUT_ROWS, self.num_v_heads, self.v_head_dim),
+                    self.dtypes.act_out,
+                ),
+                pltpu.SemaphoreType.DMA,
+            )
+
         scratches = dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
+            raw_scratch_ref=raw_scratch,
+            zero_out_scratch_ref=zero_out_scratch,
         )
         if self.dense_conv:
             # Token-dense f32 rows of the tile: rows [8 - prev_kernel_size, 8)
@@ -315,5 +416,24 @@ class GDNConfig:
             scratches["act_scratch_ref"] = pltpu.VMEM(
                 (self.seq_tile_size, self.qkv_2d_aligned_chunk, 1, self.dim_size),
                 jnp.float32,
+            )
+        if self.per_head_windows:
+            # window_tile: FP32 head states, dense conv inputs (the previous
+            # taps, then the window's tokens) and dense conv weights (taps,
+            # then the bias).
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            rows = pl.cdiv(self.dim_size, num_lanes)
+            scratches["window_scratch_refs"] = (
+                pltpu.VMEM(recurrent_shape, jnp.float32),
+                pltpu.VMEM(
+                    (
+                        self.seq_tile_size,
+                        self.chunk_size + self.prev_kernel_size,
+                        rows,
+                        num_lanes,
+                    ),
+                    jnp.float32,
+                ),
+                pltpu.VMEM((self.kernel_size + 1, rows, num_lanes), jnp.float32),
             )
         return scratches

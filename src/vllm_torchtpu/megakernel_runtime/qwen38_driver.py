@@ -35,7 +35,9 @@ import torch
 from torch import nn
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.core.attention_metadata import mamba_ckpt_of, mamba_state_of
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel.errors import MegakernelSetupError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen38
 
@@ -53,14 +55,29 @@ from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
 
 logger = init_logger(__name__)
 
+
+def _mk_fail(msg: str, exc: BaseException | None = None) -> None:
+    """A requested megakernel part failed. Fatal unless VLLM_TPU_MK_ALLOW_FALLBACK=1:
+    a silent stock fallback after a partial attach served garbage (za8d GSM8K 0.004),
+    so by default the server dies with this error instead."""
+    if not envs.VLLM_TPU_MK_ALLOW_FALLBACK:
+        raise MegakernelSetupError(
+            f"{msg} (set VLLM_TPU_MK_ALLOW_FALLBACK=1 to fall back to the stock path)"
+        ) from exc
+    if exc is not None:
+        logger.exception("%s; VLLM_TPU_MK_ALLOW_FALLBACK=1: falling back", msg)
+    else:
+        logger.warning("%s; VLLM_TPU_MK_ALLOW_FALLBACK=1: falling back", msg)
+
 # With the C1 tiles the kernel beats stock through 64 rows (mk/kernel_work/
 # mk-row-slope/report.md vs mk/stock-segment-vs-rows.md); 64 is the margin case.
 # 24 and 48 are serving token buckets too (TPU_TOKEN_BUCKET_EXTRA); without them
 # 24-/48-row verify steps (6 or 12 requests) run stock.
 # 96 rows (24 requests, the default seat cap; a serving token bucket) runs as row
-# chunks of at most KERNEL_ROWS. 128+ is left out: the segment program shares the
-# stock hyper-connection code, which branches at its 128-row prefill tile.
-DEFAULT_BUCKETS = (4, 8, 16, 24, 32, 48, 64, 96)
+# chunks of at most KERNEL_ROWS; 128 (32 requests, the c32 full load) as 2 x 64. The
+# stock hyper-connections the programs trace keep their small-row path at 128 rows
+# (hyperconnection.verify_rows); larger buckets are left out.
+DEFAULT_BUCKETS = (4, 8, 16, 24, 32, 48, 64, 96, 128)
 # The segment kernel's row limit (Qwen38InnerGeometry.check: B <= M <= 64).
 KERNEL_ROWS = 64
 
@@ -94,33 +111,70 @@ def _parse_int(raw: str, key: str) -> int | None:
     return None
 
 
-def _real_traffic(kw: dict) -> bool:
-    """A served step rather than a warmup dummy: some request has more than 64 tokens of context."""
+def _real_traffic(kw: dict, runner: Any = None, n_req: int | None = None) -> bool:
+    """A served step rather than a warmup dummy: some request has more than 64 tokens of context.
+
+    Reads the runner's host-side computed-token counts when it has them: `context_lens`
+    is a device tensor, and `int(ctx.max())` on it is a device program plus a host sync
+    on every megakernel step (~0.65 ms idle per step in serving, j-3f588cde)."""
+    host = getattr(getattr(runner, "input_batch", None), "num_computed_tokens_cpu", None)
+    if host is not None and n_req:
+        return int(host[:n_req].max()) > 64
     ctx = kw.get("context_lens")
-    if not isinstance(ctx, torch.Tensor) or ctx.numel() == 0:
+    if ctx is None or not isinstance(ctx, torch.Tensor) or ctx.numel() == 0:
         return True
     return int(ctx.max()) > 64
 
 
 def _diff_stats(a: torch.Tensor, b: torch.Tensor, n: int, hc: int) -> dict:
-    """`a` vs reference `b` over the first `n` rows: rel, per-stream rel/cos/norm ratio, per-row rel."""
+    """`a` vs reference `b` over the first `n` rows: rel, per-stream rel/cos/norm ratio,
+    per-row rel."""
     a, b = a.float()[:n], b.float()[:n]
 
     def rel(x, y):
         return float((x - y).abs().mean() / y.abs().mean().clamp_min(1e-12))
 
-    out = {"rel": round(rel(a, b), 5), "nan_a": int(torch.isnan(a).any(-1).sum()), "nan_b": int(torch.isnan(b).any(-1).sum())}
+    out: dict[str, Any] = {
+        "rel": round(rel(a, b), 5),
+        "nan_a": int(torch.isnan(a).any(-1).sum()),
+        "nan_b": int(torch.isnan(b).any(-1).sum()),
+    }
     if a.shape[-1] % hc == 0 and hc > 1:
         a3, b3 = a.unflatten(-1, (hc, -1)), b.unflatten(-1, (hc, -1))
         out["stream_rel"] = [round(rel(a3[:, k], b3[:, k]), 4) for k in range(hc)]
-        out["stream_cos"] = [round(float(torch.nn.functional.cosine_similarity(a3[:, k], b3[:, k], dim=-1).mean()), 4) for k in range(hc)]
-        out["stream_ratio"] = [round(float((a3[:, k].norm(dim=-1) / b3[:, k].norm(dim=-1).clamp_min(1e-12)).mean()), 4) for k in range(hc)]
-    out["row_rel"] = [round(float((a[r] - b[r]).abs().mean() / b[r].abs().mean().clamp_min(1e-12)), 3) for r in range(min(n, 8))]
+        out["stream_cos"] = [
+            round(
+                float(
+                    torch.nn.functional.cosine_similarity(
+                        a3[:, k], b3[:, k], dim=-1
+                    ).mean()
+                ),
+                4,
+            )
+            for k in range(hc)
+        ]
+        out["stream_ratio"] = [
+            round(
+                float(
+                    (
+                        a3[:, k].norm(dim=-1) / b3[:, k].norm(dim=-1).clamp_min(1e-12)
+                    ).mean()
+                ),
+                4,
+            )
+            for k in range(hc)
+        ]
+    out["row_rel"] = [
+        round(float((a[r] - b[r]).abs().mean() / b[r].abs().mean().clamp_min(1e-12)), 3)
+        for r in range(min(n, 8))
+    ]
     return out
 
 
 def _zeros_like(t: torch.Tensor) -> torch.Tensor:
-    """`zeros_like` that also works for FP8 on torch_tpu (fills a same-size int view)."""
+    """`zeros_like` that also works for FP8 on torch_tpu (fills a same-size int
+    view).
+    """
     if t.dtype.itemsize == 1 and t.dtype not in (torch.uint8, torch.int8, torch.bool):
         return torch.zeros(t.shape, dtype=torch.uint8, device=t.device).view(t.dtype)
     return torch.zeros_like(t)
@@ -140,7 +194,9 @@ def _cpu_proxy(m: Any, memo: dict | None = None) -> Any:
     """A CPU copy of module `m` with the attributes `pack_segment_operands` reads."""
     import types
 
-    from vllm_torchtpu.layers.adapter.quantization.unquantized import WEIGHT_FLIPPED_ATTR
+    from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+        WEIGHT_FLIPPED_ATTR,
+    )
 
     memo = {} if memo is None else memo
     if id(m) in memo:
@@ -162,16 +218,19 @@ def _cpu_proxy(m: Any, memo: dict | None = None) -> Any:
     return ns
 
 
-# `VLLM_TPU_MEGAKERNEL=...,nodonate=1`: the GDN pool is not donated to the segment op; it
-# writes a fresh pool that `_run` copies back into the live cache (bisecting a served hang).
+# `VLLM_TPU_MEGAKERNEL=...,nodonate=1`: the GDN pool is not donated to the segment op;
+# it
+# writes a fresh pool that `_run` copies back into the live cache (bisecting a served
+# hang).
 NO_DONATE = False
-# Largest whole-step bucket: its VMEM plan fits up to 64 rows (`wholestep_tiles`).
-WHOLE_MAX_ROWS = 64
+# Largest whole-step bucket: its VMEM plan fits up to 96 rows (`wholestep_tiles`).
+WHOLE_MAX_ROWS = 96
+MK_DRAFT_LOOP_MAX_ROWS = 16  # T=1 draft kernel rows measured on TPU (j-d06a37a7)
 # Model steps after warmup (verify steps; any step once disabled) by which a `whole=1`
 # server must have made a whole-step call.
 WHOLE_SELF_CHECK_STEPS = 200
 STEP_MIX_EVERY = 5000  # steps between periodic step-mix log lines
-STEP_MIX_INTERVAL_S = float(os.environ.get("VLLM_TPU_MK_STEP_MIX_INTERVAL_S", "10") or 0)
+STEP_MIX_INTERVAL_S = envs.VLLM_TPU_MK_STEP_MIX_INTERVAL_S
 
 _UNSET = object()
 
@@ -252,7 +311,11 @@ def _pallas_tp_mesh(runner: Any) -> Any:
             logger.info(
                 "Qwen3.8 megakernel mesh %s (runner mesh %s)",
                 [getattr(d, "id", d) for d in mesh.devices.flat],
-                None if runner_mesh is None else [getattr(d, "id", d) for d in np.asarray(runner_mesh.devices).flat],
+                None
+                if runner_mesh is None
+                else [
+                    getattr(d, "id", d) for d in np.asarray(runner_mesh.devices).flat
+                ],
             )
             return mesh
     except Exception as exc:
@@ -271,7 +334,8 @@ def pool_layout_of(pool: torch.Tensor) -> Any:
 
 
 class _SegmentKind:
-    """One torch op for a segment kind (`L` layers); buckets resolve on the concrete rows.
+    """One torch op for a segment kind (`L` layers); buckets resolve on the concrete
+    rows.
 
     The torch side passes the runner-padded `hidden` / `attention` and the raw
     GDN metadata; padding to the kernel's `M` rows, the block-id arithmetic,
@@ -280,14 +344,22 @@ class _SegmentKind:
     """
 
     def __init__(
-        self, mesh: Any, g: Any, L: int, layout: Any, write: bool, head: bool = False,
+        self,
+        mesh: Any,
+        g: Any,
+        L: int,
+        layout: Any,
+        write: bool,
+        head: bool = False,
         suffix: str = "",
     ) -> None:
         self.mesh, self.g, self.L, self.layout, self.write = mesh, g, L, layout, write
         self.head = head
         self.has_gdn = head or L > 1
         self._calls: dict[int, Any] = {}
-        self.tag = f"{'head' if head else 'seg'}_l{L}" + ("" if write else "_shadow") + suffix
+        self.tag = (
+            f"{'head' if head else 'seg'}_l{L}" + ("" if write else "_shadow") + suffix
+        )
         name = f"qwen38_mk::{self.tag}"
         has_gdn = self.has_gdn
 
@@ -315,7 +387,9 @@ class _SegmentKind:
 
         self.op = op
 
-    def _chunked(self, hidden: Any, attn: Any, weights: list, gdn_io: list, B: int) -> list:
+    def _chunked(
+        self, hidden: Any, attn: Any, weights: list, gdn_io: list, B: int
+    ) -> list:
         """`B > KERNEL_ROWS` rows as consecutive kernel calls over request-aligned
         row chunks. Rows are independent and a request's T_VERIFY rows never
         straddle a chunk, so this is exact; the GDN pool is threaded through the
@@ -332,10 +406,20 @@ class _SegmentKind:
                 io = [pool]
                 for i in range(0, len(meta), GDN_META):
                     st, off, ck, qsl, seq = meta[i : i + GDN_META]
-                    io += [st[s0 : s0 + ns], off, ck[s0 : s0 + ns], qsl[s0 : s0 + ns + 1], seq[s0 : s0 + ns]]
+                    io += [
+                        st[s0 : s0 + ns],
+                        off,
+                        ck[s0 : s0 + ns],
+                        qsl[s0 : s0 + ns + 1],
+                        seq[s0 : s0 + ns],
+                    ]
             call = self.callable_for(b)
             h = hidden[r0 : r0 + b]
-            res = call(h, *weights, *io) if self.head else call(h, attn[r0 : r0 + b], *weights, *io)
+            res = (
+                call(h, *weights, *io)
+                if self.head
+                else call(h, attn[r0 : r0 + b], *weights, *io)
+            )
             outs.append(res[0])
             if self.has_gdn:
                 pool = res[1]
@@ -344,7 +428,13 @@ class _SegmentKind:
     def callable_for(self, B: int) -> Any:
         if B not in self._calls:
             full, in_specs, outs, donate = build_segment_call(
-                self.mesh, self.g, self.L, B, self.layout, self.write, head=self.head,
+                self.mesh,
+                self.g,
+                self.L,
+                B,
+                self.layout,
+                self.write,
+                head=self.head,
                 flat_smalls=bool(envs.VLLM_TPU_MK_OWN_OPERANDS),
             )
             # JaxCallable needs explicit, jax.Array-annotated positional parameters.
@@ -364,6 +454,10 @@ class _SegmentKind:
 
 class Qwen38Segments(nn.Module):
     """Per-segment kernel call; owns the packed operands as buffers."""
+
+    _shared: Qwen38Segments | None
+    pool: torch.Tensor | None
+    layout: Any
 
     def __init__(
         self,
@@ -399,9 +493,15 @@ class Qwen38Segments(nn.Module):
         self.n_w: list[int] = []
         for s in range(self.n_seg):
             L = len(segment_layers(g, s))
-            ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
+            ex = ExecSpec(
+                R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0])
+            )
             ops = pack_segment_operands(
-                model, g, s, qwen38.segment_spec(g, R, L=L), ex,
+                model,
+                g,
+                s,
+                qwen38.segment_spec(g, R, L=L),
+                ex,
                 boundary=bool(envs.VLLM_TPU_MK_OWN_OPERANDS),
             )
             ops = self._own(ops, f"segment {s}")
@@ -411,10 +511,18 @@ class Qwen38Segments(nn.Module):
         self.n_hw: list[int] = []
         for h, group in enumerate(self.head_groups):
             L = len(group)
-            ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
+            ex = ExecSpec(
+                R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0])
+            )
             spec = qwen38.segment_spec(g, R, L=L, head=True)
             ops = pack_segment_operands(
-                model, g, -1, spec, ex, layer_ids=group, head=True,
+                model,
+                g,
+                -1,
+                spec,
+                ex,
+                layer_ids=group,
+                head=True,
                 boundary=bool(envs.VLLM_TPU_MK_OWN_OPERANDS),
             )
             ops = self._own(ops, f"head group {h}")
@@ -425,24 +533,29 @@ class Qwen38Segments(nn.Module):
         self.layout = None
         logger.info(
             "Qwen3.8 segment megakernel: packed operands %s (buckets %s)",
-            hbm_summary(self.buffers(), model), buckets,
+            hbm_summary(self.buffers(), model),
+            buckets,
         )
 
     @staticmethod
     def _own(ops: list[torch.Tensor], what: str) -> list[torch.Tensor]:
         """Debug: with VLLM_TPU_MK_OPERAND_DUMP, log every operand's layout."""
-        if os.environ.get("VLLM_TPU_MK_OPERAND_DUMP"):
+        if envs.VLLM_TPU_MK_OPERAND_DUMP:
             for i, t in enumerate(ops):
                 logger.info(
-                    "qwen38 megakernel operand %s[%d]: %s %s stride=%s offset=%d view=%s",
-                    what, i, tuple(t.shape), t.dtype, t.stride(), t.storage_offset(),
+                    "qwen38 megakernel operand %s[%d]: %s %s stride=%s offset=%d "
+                    "view=%s",
+                    what,
+                    i,
+                    tuple(t.shape),
+                    t.dtype,
+                    t.stride(),
+                    t.storage_offset(),
                     t._base is not None,
                 )
         return ops
 
     def bind_pool(self) -> None:
-        from .qwen38_gdn_state import Qwen38GdnPoolLayout
-
         if self._shared is not None:
             self.pool, self.layout = self._shared.pool, self._shared.layout
         else:
@@ -454,16 +567,23 @@ class Qwen38Segments(nn.Module):
             base = pools[0]
             for p in pools:
                 if p.data_ptr() != base.data_ptr():
-                    raise RuntimeError("Qwen3.8 megakernel needs one unified GDN pool tensor")
+                    raise RuntimeError(
+                        "Qwen3.8 megakernel needs one unified GDN pool tensor"
+                    )
             if getattr(self.layers[0].linear_attn, "_bm_kernel", False):
-                raise RuntimeError("Qwen3.8 megakernel does not support block-major pools yet")
+                raise RuntimeError(
+                    "Qwen3.8 megakernel does not support block-major pools yet"
+                )
             if envs.VLLM_TPU_MK_OWN_OPERANDS and base._base is not None:
                 # The unified pool is a view of the runner's raw KV buffer. A
                 # detached alias keeps the same storage (in-place writes still
                 # land in the cache) without view metadata.
                 logger.info(
-                    "qwen38 megakernel GDN pool: view %s (offset %d, contiguous %s) aliased",
-                    tuple(base.shape), base.storage_offset(), base.is_contiguous(),
+                    "qwen38 megakernel GDN pool: view %s (offset %d, contiguous %s) "
+                    "aliased",
+                    tuple(base.shape),
+                    base.storage_offset(),
+                    base.is_contiguous(),
                 )
                 base = base.detach()
             self.pool = base
@@ -480,14 +600,14 @@ class Qwen38Segments(nn.Module):
     def _gdn_meta(self, layer_ids: list[int]) -> list[torch.Tensor]:
         from vllm.forward_context import get_forward_context
 
-        md_all = get_forward_context().attn_metadata
+        md_all: Any = get_forward_context().attn_metadata
         meta: list[torch.Tensor] = []
         for i in layer_ids:
-            md = md_all[self.layers[i].linear_attn.prefix]
+            md: Any = md_all[self.layers[i].linear_attn.prefix]
             meta += [
-                md.mamba_state_indices.to(torch.int32),
+                mamba_state_of(md).to(torch.int32),
                 md.mamba_slot_read_offsets.to(torch.int32),
-                md.mamba_ckpt_indices.to(torch.int32),
+                mamba_ckpt_of(md).to(torch.int32),
                 md.query_start_loc.to(torch.int32),
                 md.seq_lens.to(torch.int32),
             ]
@@ -501,13 +621,16 @@ class Qwen38Segments(nn.Module):
         (ShapeSpecializationError). The op resolves the bucket itself.
         """
         if kind.has_gdn:
+            assert self.pool is not None
             res, pool = kind.op(hidden, lead, w, [self.pool, *meta])
             self.pool.copy_(pool)
             return res
         (res,) = kind.op(hidden, lead, w, [])
         return res
 
-    def forward(self, s: int, hidden: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, s: int, hidden: torch.Tensor, attention: torch.Tensor
+    ) -> torch.Tensor:
         ids = segment_layers(self.g, s)
         kind = self.kinds[(len(ids), False)]
         w = [getattr(self, f"w{s}_{i}") for i in range(self.n_w[s])]
@@ -523,20 +646,29 @@ class Qwen38Segments(nn.Module):
 
 
 class MtpTail(nn.Module):
-    """The MTP draft layer after attention (o_proj, both HCs, MoE) as one tail-kernel call.
+    """The MTP draft layer after attention (o_proj, both HCs, MoE) as one tail-kernel
+    call.
 
     Its own op (`MtpTailKind`): the draft reaches the tail at every rows count it
     is traced at, and counts past the buckets run in largest-bucket chunks.
     Owns the draft layer's packed operands as buffers.
     """
 
-    def __init__(self, draft: Any, g: Any, mesh: Any, kind: MtpTailKind, buckets: tuple[int, ...]):
+    kind: MtpTailKind
+
+    def __init__(
+        self, draft: Any, g: Any, mesh: Any, kind: MtpTailKind, buckets: tuple[int, ...]
+    ):
         super().__init__()
         object.__setattr__(self, "kind", kind)
         self.buckets = buckets
         R = mesh.size
-        ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
-        ops = pack_segment_operands(draft, g, -1, qwen38.segment_spec(g, R, L=1), ex, layer_ids=[0])
+        ex = ExecSpec(
+            R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0])
+        )
+        ops = pack_segment_operands(
+            draft, g, -1, qwen38.segment_spec(g, R, L=1), ex, layer_ids=[0]
+        )
         ops = Qwen38Segments._own(ops, "MTP tail")  # MTP tail keeps the plain layout
         self.n_w = len(ops)
         for i, t in enumerate(ops):
@@ -553,15 +685,23 @@ class Qwen38SegmentDriver:
 
     takes_model_kwargs = True
 
-    def __init__(self, runner: Any, buckets: tuple[int, ...], head: bool = True) -> None:
+    def __init__(
+        self, runner: Any, buckets: tuple[int, ...], head: bool = True
+    ) -> None:
         self.buckets = buckets
         self.g = qwen38.FULL
         self.mesh = _pallas_tp_mesh(runner)
-        self.segments = Qwen38Segments(runner.model, self.g, self.mesh, buckets, head=head)
-        self.program = None
+        self.segments = Qwen38Segments(
+            runner.model, self.g, self.mesh, buckets, head=head
+        )
+        self.program: Any = None
         self.check_left = 0
+        self.check_rows: frozenset[int] = frozenset()
+        self.check_warm: set[int] = set()
         self.shadow = None
         self.h0check_left = 0
+        self.h0rows = 0
+        self.h0dump = False
         self.h0kind = None
         self.segx_left = 0
         self.segx_set: list[int] = []
@@ -569,24 +709,45 @@ class Qwen38SegmentDriver:
         self.private_kinds: dict = {}
         self.stats: dict[str, int] = {}
         self.mtp = False
-        self.cfg = None
+        self.cfg: Any = None
         self.seq = 0  # try_forward calls, to compare the step sequence across ranks
         self.mk_calls = 0
-        self.sync = False  # `sync=1`: wait for the first calls' outputs and log it (bisecting)
+        self.sync = (
+            False  # `sync=1`: wait for the first calls' outputs and log it (bisecting)
+        )
         self.warm = False  # `warm=1`: host barriers around the first (compiling) call
-        self.noaot = False  # `noaot=1`: no AOT serialization / compile cache for the segment program
-        # `whole=1`: layers 3..46 in one whole-step call (`Qwen4ExpWholeStepModel`) on steps
-        # whose every request's context is <= `wholecap=N` tokens (others: segment program).
+        # `noaot=1`: no AOT serialization / compile cache for the segment program
+        self.noaot = False
+        # `whole=1`: layers 3..46 in one whole-step call (`Qwen4ExpWholeStepModel`) on
+        # steps
+        # whose every request's context is <= `wholecap=N` tokens (others: segment
+        # program).
         self.whole = False
         self.whole_cap = 32768
-        self.whole_hold = "buffer"  # `wholehold=param|list|buffer`: how the operands are held
-        # `wholerows=N`: whole-step only up to N rows (its in-kernel indexer / attention run row
-        # by row, ~0.25 ms per row: it loses to the segment / stock path at high concurrency).
+        self.whole_hold = (
+            "buffer"  # `wholehold=param|list|buffer`: how the operands are held
+        )
+        # `wholerows=N`: whole-step only up to N rows (its in-kernel indexer / attention
+        # run row
+        # by row, ~0.25 ms per row: it loses to the segment / stock path at high
+        # concurrency).
         self.whole_max_rows = 16
         self.whole_above = "stock"  # `wholeabove=stock|seg`: steps above `wholerows`
-        self.whole_program = None
+        self.whole_program: Any = None
         self.whole_calls = 0
         self.whole_dry = False  # `wholedry=1`: decide and count as whole=1, run stock (AL control)
+        # `wholecheck=N`: the first N real whole-eligible steps run the whole-step program
+        # without GDN / QSA cache writes, then stock; log MK vs stock, serve stock.
+        self.wholecheck_left = 0
+        self.whole_shadow = None
+        self.wholecheck_warm: set[int] = set()
+        self.wholecheck_agg: dict[int, list[float]] = {}
+        # `wholefault=1`: positive control; each checked step also runs the shadow on the step's
+        # token ids rolled by one row (a row-misaligned embedding / PLE input) and logs its diff.
+        self.whole_fault = False
+        # `wholecheckrows=16:24`: check (and compile the shadow programs for) only these
+        # buckets; default every whole-step bucket.
+        self.wholecheck_rows: frozenset[int] = frozenset()
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -600,15 +761,24 @@ class Qwen38SegmentDriver:
         if int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0) != T_VERIFY - 1:
             reasons.append("needs MTP with 3 speculative tokens")
         t = runner.model_config.hf_text_config
-        for field, want in (("hidden_size", 2560), ("num_hidden_layers", 48), ("hc_count", 4)):
+        for field, want in (
+            ("hidden_size", 2560),
+            ("num_hidden_layers", 48),
+            ("hc_count", 4),
+        ):
             if getattr(t, field, None) != want:
                 reasons.append(f"{field}={getattr(t, field, None)} != {want}")
-        if getattr(getattr(runner.model, "model", None), "host_ple_index", None) is not None:
+        if (
+            getattr(getattr(runner.model, "model", None), "host_ple_index", None) is not None
+            and not envs.VLLM_TPU_MK_HOST_PLE
+        ):
             # PLE CPU offload (PLE_CPU_OFFLOAD, auto-on at max concurrency >= 32): the MK programs need
             # the PLE table on HBM, so no driver at all - building one would still pack the segment
             # operands into HBM before KV-cache sizing and shrink the pool of an all-stock run
             # (c32 j-f34a09a4: prefix hit 0.9403 vs 0.9454 MK-unset).
-            reasons.append("PLE CPU offload is on (the segment program needs the PLE table on HBM)")
+            reasons.append(
+                "PLE CPU offload is on (the segment program needs the PLE table on HBM)"
+            )
         if reasons:
             logger.warning("Qwen3.8 megakernel disabled: %s", "; ".join(reasons))
             return None
@@ -625,6 +795,12 @@ class Qwen38SegmentDriver:
                 qwen38_segment_call.DEFAULT_RINGS = (int(e), int(d))
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
+        # `checkrows=16:24`: check=N compares only these buckets. Checks count real steps
+        # only (after warmup, real context); warmup runs each bucket's shadow once to
+        # compile it (j-ef8effe9: all 300 checks went to warmup dummies, rel 0).
+        for part in raw.split(","):
+            if part.startswith("checkrows="):
+                drv.check_rows = frozenset(int(x) for x in part[len("checkrows=") :].split(":"))
         # `h0check=N`: every eligible step runs stock; the first N real ones also
         # compare the head-0 (layer 0) kernel against stock layer 0 on the same
         # input, the kernel reading a private copy of layer 0's state blocks.
@@ -645,12 +821,20 @@ class Qwen38SegmentDriver:
             # `segset=1:5` / `headset=0`: only these segments / head groups run
             # their kernels, the rest stock (bisection).
             if part.startswith("segset="):
-                drv.segments.mk_segment_set = {int(x) for x in part[7:].split(":")}
+                object.__setattr__(
+                    drv.segments,
+                    "mk_segment_set",
+                    {int(x) for x in part[7:].split(":")},
+                )
             if part.startswith("headset="):
-                drv.segments.mk_head_set = {int(x) for x in part[8:].split(":") if x != ""}
+                object.__setattr__(
+                    drv.segments,
+                    "mk_head_set",
+                    {int(x) for x in part[8:].split(":") if x != ""},
+                )
         segs = _parse_int(raw, "segs")
         if segs is not None:
-            drv.segments.mk_segments = segs
+            object.__setattr__(drv.segments, "mk_segments", segs)
         drv.mtp = _parse_flag(raw, "mtp", False)
         drv.sync = _parse_flag(raw, "sync", False)
         drv.warm = _parse_flag(raw, "warm", False)
@@ -664,6 +848,11 @@ class Qwen38SegmentDriver:
         if refusal:
             logger.warning("Qwen3.8 megakernel: %s", refusal)
         drv.whole_dry = _parse_flag(raw, "wholedry", False)
+        drv.wholecheck_left = _parse_int(raw, "wholecheck") or 0
+        drv.whole_fault = _parse_flag(raw, "wholefault", False)
+        for part in raw.split(","):
+            if part.startswith("wholecheckrows="):
+                drv.wholecheck_rows = frozenset(int(x) for x in part[len("wholecheckrows=") :].split(":"))
         cap = _parse_int(raw, "wholecap")
         if cap is not None:
             drv.whole_cap = cap
@@ -708,11 +897,15 @@ class Qwen38SegmentDriver:
 
             mark_rank_dependent("qwen38_mk")
         logger.info(
-            "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d, hier %s, rings %s, head %s",
+            "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d, "
+            "hier %s, rings %s, head %s",
             drv.buckets,
             drv.check_left,
             qwen38_segment_call.DEFAULT_HIER,
-            f"{qwen38_segment_call.DEFAULT_RINGS or 'per bucket'}, gdnclamp {qwen38_segment_call.CLAMP_BLOCKS}, nodonate {NO_DONATE}",
+            (
+                f"{qwen38_segment_call.DEFAULT_RINGS or 'per bucket'}, "
+                f"gdnclamp {qwen38_segment_call.CLAMP_BLOCKS}, nodonate {NO_DONATE}"
+            ),
             bool(drv.segments.head_groups),
         )
         return drv
@@ -732,7 +925,9 @@ class Qwen38SegmentDriver:
         cfg = copy.copy(runner.vllm_config)
         cc = copy.copy(runner.vllm_config.compilation_config)
         paddings = set(int(x) for x in (cc.compile_sizes or []))
-        cc.compile_sizes = sorted(b for b in self.buckets if not paddings or b in paddings)
+        cc.compile_sizes = sorted(
+            b for b in self.buckets if not paddings or b in paddings
+        )
         object.__setattr__(cfg, "compilation_config", cc)
         return cfg
 
@@ -749,17 +944,23 @@ class Qwen38SegmentDriver:
 
         stack = contextlib.ExitStack()
         stack.enter_context(set_model_tag(tag))
-        cfg = (getattr(self, "whole_cfg", None) if tag == "model_mk_whole" else None) or (
+        # Both whole-step programs (served and `wholecheck` shadow) compile only the whole buckets.
+        if tag in ("model_mk_whole_shadow", "model_mk_segcut_shadow"):
+            cfg = getattr(self, "check_cfg", None) or getattr(self, "whole_cfg", None)
+        else:
+            cfg = getattr(self, "whole_cfg", None) if tag == "model_mk_whole" else None
+        cfg = cfg or (
             getattr(self, "cfg", None) or runner.vllm_config
         )
-        stack.enter_context(set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=cfg))
         stack.enter_context(set_current_vllm_config(cfg))
         if getattr(self, "noaot", False):
             # `noaot=1`: the segment program is compiled without vLLM's AOT
             # serialization and compile cache (as the Qwen3.5 megakernel step,
             # torch.compile(..., serializable=False)); the main model keeps both.
             stack.enter_context(
-                _vllm_env_override(VLLM_USE_AOT_COMPILE=False, VLLM_DISABLE_COMPILE_CACHE=True)
+                _vllm_env_override(
+                    VLLM_USE_AOT_COMPILE=False, VLLM_DISABLE_COMPILE_CACHE=True
+                )
             )
         return stack
 
@@ -782,8 +983,11 @@ class Qwen38SegmentDriver:
                 if calls == last_calls:
                     if not quiet_logged:
                         logger.warning(
-                            "qwen38 megakernel self-check: driver not called in the last %.0f s "
-                            "(idle server, or forward steps bypass the megakernel hook)", period_s,
+                            "qwen38 megakernel self-check: driver not called in the "
+                            "last %.0f s "
+                            "(idle server, or forward steps bypass the megakernel "
+                            "hook)",
+                            period_s,
                         )
                         quiet_logged = True
                 else:
@@ -795,12 +999,18 @@ class Qwen38SegmentDriver:
                         and not getattr(self, "whole_dry", False)
                     ):
                         logger.error(
-                            "qwen38 megakernel self-check: 0 MK calls in %d driver steps over %.0f s; "
-                            "step mix %s", calls - last_calls, period_s, dict(sorted(self.stats.items())),
+                            "qwen38 megakernel self-check: 0 MK calls in %d driver "
+                            "steps over %.0f s; "
+                            "step mix %s",
+                            calls - last_calls,
+                            period_s,
+                            dict(sorted(self.stats.items())),
                         )
                 last_calls, last_mk = calls, mk
 
-        self._watchdog = threading.Thread(target=loop, name="qwen38-mk-selfcheck", daemon=True)
+        self._watchdog = threading.Thread(
+            target=loop, name="qwen38-mk-selfcheck", daemon=True
+        )
         self._watchdog.start()
 
     def _serve_contexts(self, runner: Any) -> Any:
@@ -813,16 +1023,46 @@ class Qwen38SegmentDriver:
             return self._contexts(runner, "model_mk_segments")
         return _StackedContexts(fast)
 
+    def _whole_contexts(self, runner: Any) -> Any:
+        """`_contexts(runner, "model_mk_whole")` for the per-step whole-step call.
+
+        VLLM_TPU_PREFLAT_FWD_ARGS: the two context factories (model tag, config)
+        are resolved once, as `_serve_contexts` does for the segment program,
+        instead of per-step imports, attribute lookups and an ExitStack. Same
+        contexts, entered and exited in the same order around every call."""
+        if not envs.VLLM_TPU_PREFLAT_FWD_ARGS or getattr(self, "noaot", False):
+            return self._contexts(runner, "model_mk_whole")
+        cfg = (
+            getattr(self, "whole_cfg", None)
+            or getattr(self, "cfg", None)
+            or runner.vllm_config
+        )
+        fast = self.__dict__.get("_whole_ctx")
+        if fast is None or fast[0] is not cfg:
+            from vllm.compilation.backends import set_model_tag
+            from vllm.config import set_current_vllm_config
+
+            fast = self._whole_ctx = (
+                cfg,
+                (
+                    lambda: set_model_tag("model_mk_whole"),
+                    lambda: set_current_vllm_config(cfg),
+                ),
+            )
+        return _StackedContexts(fast[1])
+
     def bind_and_warmup(self, runner: Any) -> None:
         from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentModel
 
-        if getattr(runner.model.model, "host_ple_index", None) is not None:
+        if getattr(runner.model.model, "host_ple_index", None) is not None and not envs.VLLM_TPU_MK_HOST_PLE:
             # forward_segments needs the PLE table on HBM; with PLE CPU offload
             # (PLE_CPU_OFFLOAD, auto-on at max concurrency >= 32) the first MK
             # call would fail to trace and fail closed. Say so once, up front.
             logger.warning(
-                "Qwen3.8 megakernel disabled: PLE CPU offload is on (host_ple_index=%s); "
-                "the segment program needs the PLE table on HBM. Every step runs stock.",
+                "Qwen3.8 megakernel disabled: PLE CPU offload is on "
+                "(host_ple_index=%s); "
+                "the segment program needs the PLE table on HBM. Every step runs "
+                "stock.",
                 runner.model.model.host_ple_index,
             )
             self.disabled_reason = "stock_host_ple"
@@ -852,7 +1092,9 @@ class Qwen38SegmentDriver:
             )
         if self.whole:
             self._attach_whole(runner)
-        if self.mtp:
+        if envs.VLLM_TPU_MK_DRAFT:
+            self._attach_mk_draft(runner)
+        elif self.mtp:
             self._attach_mtp_tail(runner)
         if self.check_left > 0:
             shadow_seg = Qwen38Segments(
@@ -864,35 +1106,51 @@ class Qwen38SegmentDriver:
                 head=bool(self.segments.head_groups),
             )
             shadow_seg.bind_pool()
+            from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentShadowModel
+
+            # Own compiled class: a second Qwen4ExpSegmentModel instance would share the served
+            # segment program's compiled graph (see `_attach_whole_shadow`).
             with self._contexts(runner, "model_mk_segments_shadow"):
-                self.shadow = Qwen4ExpSegmentModel(
+                self.shadow = Qwen4ExpSegmentShadowModel(
                     vllm_config=self.cfg,
                     prefix="model_mk_segments_shadow",
                     backbone=runner.model.model,
                     segments=shadow_seg,
                 )
 
-    def _h0check(self, runner: Any, input_ids: Any, positions: Any, kw: dict, rows: int, n_req: int) -> Any:
+    def _h0check(
+        self,
+        runner: Any,
+        input_ids: Any,
+        positions: Any,
+        kw: dict,
+        rows: int,
+        n_req: int,
+    ) -> Any:
         from vllm.forward_context import get_forward_context
-
-        from .qwen38_gdn_state import Qwen38GdnPoolLayout
 
         segs, bb = self.segments, runner.model.model
         layer = bb.layers[0]
         hc = bb.hc_count
         NS, T = rows // T_VERIFY, T_VERIFY
-        md = get_forward_context().attn_metadata[layer.linear_attn.prefix]
-        st = md.mamba_state_indices.to(torch.int64)[:NS]
+        md_h0: Any = get_forward_context().attn_metadata
+        md: Any = md_h0[layer.linear_attn.prefix]
+        st = mamba_state_of(md).to(torch.int64)[:NS]
         off_tab = md.mamba_slot_read_offsets.to(torch.int64)
-        ck = md.mamba_ckpt_indices.to(torch.int64)[:NS, :T]
-        qsl = md.query_start_loc.to(torch.int32)[: NS + 1]
+        ck = mamba_ckpt_of(md).to(torch.int64)[:NS, :T]
         seq = md.seq_lens.to(torch.int32)[:NS]
         w = [getattr(segs, f"h0_{i}") for i in range(segs.n_hw[0])]
         with torch.no_grad():
             h_in = bb.embed_tokens(input_ids).repeat(1, hc)
             ids0 = list(segs.head_groups[0])
             R = self.mesh.size
-            ex = ExecSpec(R=R, B=segs.buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(segs.buckets[0]))
+            ex = ExecSpec(
+                R=R,
+                B=segs.buckets[0],
+                T=T_VERIFY,
+                ctx=128,
+                tiles=segment_tiles(segs.buckets[0]),
+            )
             spec = qwen38.segment_spec(self.g, R, L=len(ids0), head=True)
             names = _operand_names(spec, ex, len(ids0))
             if not getattr(self, "h0_audited", False):
@@ -900,22 +1158,36 @@ class Qwen38SegmentDriver:
                 self._audit_operands(runner, w, names, spec, ex, ids0, "head0", True)
             # Zero-weight splits: no MoE (routed + shared expert weights 0, so the
             # MoE adds exactly 0) and no GDN (out_proj 0, so the GDN adds exactly 0).
-            no_moe = [_zeros_like(t) if n.split("[")[0] in ("e13", "e2", "sh13", "sh2") else t for n, t in zip(names, w)]
+            no_moe = [
+                _zeros_like(t) if n.split("[")[0] in ("e13", "e2", "sh13", "sh2") else t
+                for n, t in zip(names, w)
+            ]
             no_gdn = [_zeros_like(t) if n == "lin_out" else t for n, t in zip(names, w)]
+
             def ok(tag, t):
                 # Materialize `t` so an async failure names its stage.
-                logger.info("qwen38 h0check stage %s ok: sum %.6g", tag, float(t.float().sum()))
+                logger.info(
+                    "qwen38 h0check stage %s ok: sum %.6g", tag, float(t.float().sum())
+                )
 
             snap0 = self._snap(ids0, NS)
             ok("snap", snap0[0])
             # The kernel donates the pool operand: copy the snapshot first.
-            snap_cpu = [t.detach().cpu() for t in snap0] if getattr(self, "h0dump", False) else None
+            snap_cpu = (
+                [t.detach().cpu() for t in snap0]
+                if getattr(self, "h0dump", False)
+                else None
+            )
             mk_out = self._mk_run(len(ids0), True, w, h_in, None, snap0)
             ok("mk", mk_out)
             ok("zeros", no_moe[names.index("e13[0]")])
-            mk_nomoe = self._mk_run(len(ids0), True, no_moe, h_in, None, self._snap(ids0, NS))
+            mk_nomoe = self._mk_run(
+                len(ids0), True, no_moe, h_in, None, self._snap(ids0, NS)
+            )
             ok("mk_nomoe", mk_nomoe)
-            mk_nogdn = self._mk_run(len(ids0), True, no_gdn, h_in, None, self._snap(ids0, NS))
+            mk_nogdn = self._mk_run(
+                len(ids0), True, no_gdn, h_in, None, self._snap(ids0, NS)
+            )
             ok("mk_nogdn", mk_nogdn)
             # Stock layer 0, staged like Qwen4ExpDecoderLayer.forward.
             from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
@@ -932,32 +1204,48 @@ class Qwen38SegmentDriver:
 
                 def grab(tag):
                     def hook(mod, args, out):
-                        cap[tag + "_in"] = [a for a in args if isinstance(a, torch.Tensor)]
+                        cap[tag + "_in"] = [
+                            a for a in args if isinstance(a, torch.Tensor)
+                        ]
                         cap[tag + "_out"] = out[0] if isinstance(out, tuple) else out
+
                     return hook
 
-                hooks = [la.norm.register_forward_hook(grab("norm")), la.out_proj.register_forward_hook(grab("out_proj"))]
+                hooks = [
+                    la.norm.register_forward_hook(grab("norm")),
+                    la.out_proj.register_forward_hook(grab("out_proj")),
+                ]
             try:
                 g = sp.reduce(la(block), False)
             finally:
                 for hk in hooks:
                     hk.remove()
-            mixed2, residual2 = layer.attn_hyper_connection.combine_mix(g, residual, layer.mlp_hyper_connection)
+            mixed2, residual2 = layer.attn_hyper_connection.combine_mix(
+                g, residual, layer.mlp_hyper_connection
+            )
             valid = kw["valid_tokens"].to(torch.bool)
             mixed2 = torch.where(valid[:, None], mixed2, 0)
             moe = layer.mlp(mixed2)
             st_out = layer.mlp_hyper_connection.combine(moe, residual2)
             # Stock counterparts of the splits (no GDN: block output 0).
             st_nomoe = residual2[0] if isinstance(residual2, tuple) else residual2
-            m0, r0 = layer.attn_hyper_connection.combine_mix(torch.zeros_like(g), residual, layer.mlp_hyper_connection)
+            m0, r0 = layer.attn_hyper_connection.combine_mix(
+                torch.zeros_like(g), residual, layer.mlp_hyper_connection
+            )
             m0 = torch.where(valid[:, None], m0, 0)
             st_nogdn = layer.mlp_hyper_connection.combine(layer.mlp(m0), r0)
             # Stock layer 0 above is this step's served layer 0 (its GDN writes are the
             # real ones); the rest of the model runs stock here and serves the step.
             args = (
-                positions.to(torch.int64), input_ids.to(torch.int64), kw["query_start_loc"],
-                kw["ngram_context"], kw["state_slots"], kw["context_lens"], kw["valid_tokens"],
-                kw["main_block_table"], kw["compressed_block_table"],
+                positions.to(torch.int64),
+                input_ids.to(torch.int64),
+                kw["query_start_loc"],
+                kw["ngram_context"],
+                kw["state_slots"],
+                kw["context_lens"],
+                kw["valid_tokens"],
+                kw["main_block_table"],
+                kw["compressed_block_table"],
             )
             h = st_out
             for later in bb.layers[1:]:
@@ -969,23 +1257,34 @@ class Qwen38SegmentDriver:
         if getattr(self, "h0dump", False):
             self.h0dump = False
             try:
-                import os
-
                 from vllm.distributed import get_tensor_model_parallel_rank
 
                 cpu = lambda t: t.detach().cpu()  # noqa: E731
                 r2 = residual2[0] if isinstance(residual2, tuple) else residual2
                 d = {
-                    "names": names, "rows": rows, "n_req": n_req,
-                    "w": [cpu(t) for t in w], "h_in": cpu(h_in),
-                    "snap": snap_cpu, "mk_out": cpu(mk_out), "st_out": cpu(st_out),
-                    "stock_block": cpu(block), "stock_g": cpu(g), "stock_res2": cpu(r2),
-                    "stock_mixed2": cpu(mixed2), "stock_moe": cpu(moe),
-                    "mk_nomoe": cpu(mk_nomoe), "mk_nogdn": cpu(mk_nogdn),
-                    "st_nogdn": cpu(st_nogdn), "valid": cpu(kw["valid_tokens"]),
-                    "stock_gdn": {k: ([cpu(t) for t in v] if isinstance(v, list) else cpu(v)) for k, v in cap.items()},
+                    "names": names,
+                    "rows": rows,
+                    "n_req": n_req,
+                    "w": [cpu(t) for t in w],
+                    "h_in": cpu(h_in),
+                    "snap": snap_cpu,
+                    "mk_out": cpu(mk_out),
+                    "st_out": cpu(st_out),
+                    "stock_block": cpu(block),
+                    "stock_g": cpu(g),
+                    "stock_res2": cpu(r2),
+                    "stock_mixed2": cpu(mixed2),
+                    "stock_moe": cpu(moe),
+                    "mk_nomoe": cpu(mk_nomoe),
+                    "mk_nogdn": cpu(mk_nogdn),
+                    "st_nogdn": cpu(st_nogdn),
+                    "valid": cpu(kw["valid_tokens"]),
+                    "stock_gdn": {
+                        k: ([cpu(t) for t in v] if isinstance(v, list) else cpu(v))
+                        for k, v in cap.items()
+                    },
                 }
-                out = os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp/cdk_output"), "h0dump")
+                out = os.path.join(envs.CDK_OUTPUT_DIR, "h0dump")
                 os.makedirs(out, exist_ok=True)
                 path = os.path.join(out, f"rank{get_tensor_model_parallel_rank()}.pt")
                 torch.save(d, path)
@@ -993,21 +1292,48 @@ class Qwen38SegmentDriver:
             except Exception:
                 logger.exception("qwen38 h0check dump failed")
         logger.info(
-            "qwen38 h0check inputs: rows=%d n_req=%d h_in_norm=%.4f st=%s off=%s ck0=%s seq=%s",
-            rows, n_req, float(h_in.float()[:n].norm()), st.tolist()[:8], off_tab[st].tolist()[:8],
-            ck[:2].tolist(), seq.tolist()[:8],
+            "qwen38 h0check inputs: rows=%d n_req=%d h_in_norm=%.4f st=%s off=%s "
+            "ck0=%s seq=%s",
+            rows,
+            n_req,
+            float(h_in.float()[:n].norm()),
+            st.tolist()[:8],
+            off_tab[st].tolist()[:8],
+            ck[:2].tolist(),
+            seq.tolist()[:8],
         )
         logger.info(
-            "qwen38 h0check layer0_out MK vs stock: %s | stock residual-after-GDN(norm)=%.4f moe(norm)=%.4f (%d left)",
-            _diff_stats(mk_out, st_out, n, hc), float((residual2[0] if isinstance(residual2, tuple) else residual2).float()[:n].norm()),
-            float(moe.float()[:n].norm()), self.h0check_left,
+            "qwen38 h0check layer0_out MK vs stock: %s | stock "
+            "residual-after-GDN(norm)=%.4f moe(norm)=%.4f (%d left)",
+            _diff_stats(mk_out, st_out, n, hc),
+            float(
+                (residual2[0] if isinstance(residual2, tuple) else residual2)
+                .float()[:n]
+                .norm()
+            ),
+            float(moe.float()[:n].norm()),
+            self.h0check_left,
         )
-        logger.info("qwen38 h0check split no-MoE (GDN + attn HC) MK vs stock: %s", _diff_stats(mk_nomoe, st_nomoe, n, hc))
-        logger.info("qwen38 h0check split no-GDN (MoE + HC) MK vs stock: %s", _diff_stats(mk_nogdn, st_nogdn, n, hc))
+        logger.info(
+            "qwen38 h0check split no-MoE (GDN + attn HC) MK vs stock: %s",
+            _diff_stats(mk_nomoe, st_nomoe, n, hc),
+        )
+        logger.info(
+            "qwen38 h0check split no-GDN (MoE + HC) MK vs stock: %s",
+            _diff_stats(mk_nogdn, st_nogdn, n, hc),
+        )
         return (mixed, h) if bb.emit_mtp_hidden else mixed
 
     def _audit_operands(
-        self, runner: Any, w: list, names: list, spec: Any, ex: Any, ids: list, tag: str, head: bool
+        self,
+        runner: Any,
+        w: list,
+        names: list,
+        spec: Any,
+        ex: Any,
+        ids: list,
+        tag: str,
+        head: bool,
     ) -> None:
         """Each served operand vs the same packing done on CPU from CPU copies of
         the modules (torch_tpu op check), one log line per operand; then what the
@@ -1020,21 +1346,40 @@ class Qwen38SegmentDriver:
                 layers[i] = _cpu_proxy(runner.model.model.layers[i])
             proxy = types.SimpleNamespace(model=types.SimpleNamespace(layers=layers))
             ref = pack_segment_operands(
-                proxy, self.g, -1, spec, ex, layer_ids=ids, head=head,
+                proxy,
+                self.g,
+                -1,
+                spec,
+                ex,
+                layer_ids=ids,
+                head=head,
                 boundary=bool(envs.VLLM_TPU_MK_OWN_OPERANDS),
             )
             for n, a, b in zip(names, w, ref):
                 a = a.detach().cpu()
                 if tuple(a.shape) != tuple(b.shape):
-                    logger.info("qwen38 audit %s %s: SHAPE served %s cpu %s", tag, n, tuple(a.shape), tuple(b.shape))
+                    logger.info(
+                        "qwen38 audit %s %s: SHAPE served %s cpu %s",
+                        tag,
+                        n,
+                        tuple(a.shape),
+                        tuple(b.shape),
+                    )
                     continue
                 af, bf = a.float(), b.float()
                 d = (af - bf).abs()
                 logger.info(
-                    "qwen38 audit %s %s %s %s: maxabs %.4g rel %.4g |cpu| %.4g nz served %d cpu %d",
-                    tag, n, tuple(a.shape), str(a.dtype).removeprefix("torch."), float(d.max()),
-                    float(d.mean() / bf.abs().mean().clamp_min(1e-30)), float(bf.abs().mean()),
-                    int((af != 0).sum()), int((bf != 0).sum()),
+                    "qwen38 audit %s %s %s %s: maxabs %.4g rel %.4g |cpu| %.4g nz "
+                    "served %d cpu %d",
+                    tag,
+                    n,
+                    tuple(a.shape),
+                    str(a.dtype).removeprefix("torch."),
+                    float(d.max()),
+                    float(d.mean() / bf.abs().mean().clamp_min(1e-30)),
+                    float(bf.abs().mean()),
+                    int((af != 0).sum()),
+                    int((bf != 0).sum()),
                 )
             self._audit_jax_view(w, ref, names, tag)
         except Exception:
@@ -1049,16 +1394,27 @@ class Qwen38SegmentDriver:
             out = []
             for x in xs:
                 f = x.astype(jnp.float32).reshape(-1)
-                pos = (jnp.arange(f.shape[0], dtype=jnp.int32) % 7 + 1).astype(jnp.float32)
+                pos = (jnp.arange(f.shape[0], dtype=jnp.int32) % 7 + 1).astype(
+                    jnp.float32
+                )
                 out.append(jnp.stack([jnp.sum(jnp.abs(f)), jnp.sum(f * pos)])[None])
             return tuple(out)
 
         n = len(w)
-        body = jax.shard_map(stats, mesh=self.mesh, in_specs=(P("tp"),) * n, out_specs=(P("tp"),) * n, check_vma=False)
+        body = jax.shard_map(
+            stats,
+            mesh=self.mesh,
+            in_specs=(P("tp"),) * n,
+            out_specs=(P("tp"),) * n,
+            check_vma=False,
+        )
         typed = make_typed_step_wrapper(f"qwen38_audit_{tag}", body, n, n)
         call = sharded_jax_callable(
-            f"qwen38_mk::audit_{tag}", typed, mesh=self.mesh,
-            input_partition_specs=(P("tp"),) * n, output_partition_specs=(P("tp"),) * n,
+            f"qwen38_mk::audit_{tag}",
+            typed,
+            mesh=self.mesh,
+            input_partition_specs=(P("tp"),) * n,
+            output_partition_specs=(P("tp"),) * n,
         )
         outs = call(*w)
         for name, o, b in zip(names, outs, ref):
@@ -1068,7 +1424,12 @@ class Qwen38SegmentDriver:
             o = o.detach().cpu().reshape(-1).tolist()
             logger.info(
                 "qwen38 audit-jax %s %s: jax abs %.6g pos %.6g | cpu abs %.6g pos %.6g",
-                tag, name, o[0], o[1], cpu[0], cpu[1],
+                tag,
+                name,
+                o[0],
+                o[1],
+                cpu[0],
+                cpu[1],
             )
 
     def _snap(self, gdn_ids: list, NS: int) -> list:
@@ -1084,8 +1445,9 @@ class Qwen38SegmentDriver:
             return []
         segs = self.segments
         T, CAP = T_VERIFY, 32
-        md_all = get_forward_context().attn_metadata
+        md_all: Any = get_forward_context().attn_metadata
         pool = segs.pool
+        assert pool is not None
         n_blk = 1 + len(gdn_ids) * CAP * T
         dev = pool.device
         new_off = torch.zeros(n_blk, dtype=torch.int32, device=dev)
@@ -1095,19 +1457,34 @@ class Qwen38SegmentDriver:
         src = [torch.zeros(1, dtype=torch.int64, device=dev)]
         meta = []
         for k, i in enumerate(gdn_ids):
-            md = md_all[segs.layers[i].linear_attn.prefix]
-            st = md.mamba_state_indices.to(torch.int64)[:NS]
-            ck = md.mamba_ckpt_indices.to(torch.int64)[:NS, :T]
+            md: Any = md_all[segs.layers[i].linear_attn.prefix]
+            st = mamba_state_of(md).to(torch.int64)[:NS]
+            ck = mamba_ckpt_of(md).to(torch.int64)[:NS, :T]
             base = 1 + k * CAP * T
-            src += [ck.reshape(-1), torch.zeros(CAP * T - NS * T, dtype=torch.int64, device=dev)]
-            new_ck = (base + torch.arange(NS * T, device=dev).reshape(NS, T)).to(torch.int32)
+            src += [
+                ck.reshape(-1),
+                torch.zeros(CAP * T - NS * T, dtype=torch.int64, device=dev),
+            ]
+            new_ck = (base + torch.arange(NS * T, device=dev).reshape(NS, T)).to(
+                torch.int32
+            )
             new_ck = torch.where(ck > 0, new_ck, torch.zeros_like(new_ck))
-            new_off[new_ck[:, 0].long()] = md.mamba_slot_read_offsets.to(torch.int32)[st]
-            meta += [new_ck[:, 0], None, new_ck, md.query_start_loc.to(torch.int32)[: NS + 1], md.seq_lens.to(torch.int32)[:NS]]
+            new_off[new_ck[:, 0].long()] = md.mamba_slot_read_offsets.to(torch.int32)[
+                st
+            ]
+            meta += [
+                new_ck[:, 0],
+                None,
+                new_ck,
+                md.query_start_loc.to(torch.int32)[: NS + 1],
+                md.seq_lens.to(torch.int32)[:NS],
+            ]
         small = pool[torch.cat(src)]
         return [small, *[new_off if m is None else m for m in meta]]
 
-    def _mk_run(self, L: int, head: bool, w: list, h: Any, att: Any, gdn_io: list) -> Any:
+    def _mk_run(
+        self, L: int, head: bool, w: list, h: Any, att: Any, gdn_io: list
+    ) -> Any:
         """The `L`-layer kernel on `gdn_io` from `_snap` (checkpoints not written)."""
         from .qwen38_gdn_state import Qwen38GdnPoolLayout
 
@@ -1115,14 +1492,20 @@ class Qwen38SegmentDriver:
         if key not in self.private_kinds:
             lay = self.segments.layout
             if gdn_io:
+                assert lay is not None
                 lay = Qwen38GdnPoolLayout(
-                    pool_shape=tuple(int(d) for d in gdn_io[0].shape), pool_dtype=lay.pool_dtype
+                    pool_shape=tuple(int(d) for d in gdn_io[0].shape),
+                    pool_dtype=lay.pool_dtype,
                 )
             sfx = f"_check{key[2]}"
-            self.private_kinds[key] = _SegmentKind(self.mesh, self.g, L, lay, write=False, head=head, suffix=sfx)
+            self.private_kinds[key] = _SegmentKind(
+                self.mesh, self.g, L, lay, write=False, head=head, suffix=sfx
+            )
         return self.private_kinds[key].op(h, h if att is None else att, w, gdn_io)[0]
 
-    def _segxcheck(self, runner: Any, input_ids: Any, positions: Any, kw: dict, rows: int) -> Any:
+    def _segxcheck(
+        self, runner: Any, input_ids: Any, positions: Any, kw: dict, rows: int
+    ) -> Any:
         """Serve the step with eager stock layers; on the named segments also run
         the kernel on the same input (private GDN state) and log the diff."""
         from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
@@ -1133,12 +1516,22 @@ class Qwen38SegmentDriver:
         NS = rows // T_VERIFY
         pos64, ids64 = positions.to(torch.int64), input_ids.to(torch.int64)
         args = (
-            pos64, ids64, kw["query_start_loc"], kw["ngram_context"], kw["state_slots"],
-            kw["context_lens"], kw["valid_tokens"], kw["main_block_table"], kw["compressed_block_table"],
+            pos64,
+            ids64,
+            kw["query_start_loc"],
+            kw["ngram_context"],
+            kw["state_slots"],
+            kw["context_lens"],
+            kw["valid_tokens"],
+            kw["main_block_table"],
+            kw["compressed_block_table"],
         )
         meta = QSAMetadata(
-            kw["query_start_loc"], kw["context_lens"], kw["state_slots"],
-            kw["main_block_table"], kw["compressed_block_table"],
+            kw["query_start_loc"],
+            kw["context_lens"],
+            kw["state_slots"],
+            kw["main_block_table"],
+            kw["compressed_block_table"],
         )
         starts = {segment_layers(self.g, s)[0]: s for s in self.segx_set}
         n = rows
@@ -1151,9 +1544,14 @@ class Qwen38SegmentDriver:
                     ids = segment_layers(self.g, s)
                     q = layers[i]
 
-                    def ok(tag, t):
+                    def ok(tag, t, s=s):
                         # Materialize `t` so an async failure names its stage.
-                        logger.info("qwen38 segxcheck seg%d stage %s ok: sum %.6g", s, tag, float(t.float().sum()))
+                        logger.info(
+                            "qwen38 segxcheck seg%d stage %s ok: sum %.6g",
+                            s,
+                            tag,
+                            float(t.float().sum()),
+                        )
 
                     ok("in", h)
                     block, residual = q.attn_hyper_connection.mix(h)
@@ -1163,9 +1561,24 @@ class Qwen38SegmentDriver:
                     if s not in self.segx_audited:
                         self.segx_audited.add(s)
                         R = self.mesh.size
-                        ex = ExecSpec(R=R, B=segs.buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(segs.buckets[0]))
+                        ex = ExecSpec(
+                            R=R,
+                            B=segs.buckets[0],
+                            T=T_VERIFY,
+                            ctx=128,
+                            tiles=segment_tiles(segs.buckets[0]),
+                        )
                         spec = qwen38.segment_spec(self.g, R, L=len(ids))
-                        self._audit_operands(runner, w, _operand_names(spec, ex, len(ids)), spec, ex, ids, f"seg{s}", False)
+                        self._audit_operands(
+                            runner,
+                            w,
+                            _operand_names(spec, ex, len(ids)),
+                            spec,
+                            ex,
+                            ids,
+                            f"seg{s}",
+                            False,
+                        )
                     snap = self._snap(ids[1:], NS)
                     ok("snap", snap[0])
                     mk = self._mk_run(len(ids), False, w, h, att, snap)
@@ -1175,39 +1588,77 @@ class Qwen38SegmentDriver:
                     # Stock QSA layer on the same `att` (attention and its cache
                     # writes run once), staged like Qwen4ExpDecoderLayer.forward.
                     o = sp.reduce(q.self_attn.o_proj(att), False)
-                    mixed2, residual2 = q.attn_hyper_connection.combine_mix(o, residual, q.mlp_hyper_connection)
-                    mixed2 = torch.where(kw["valid_tokens"].to(torch.bool)[:, None], mixed2, 0)
-                    st, ins = q.mlp_hyper_connection.combine(q.mlp(mixed2), residual2), [h]
+                    mixed2, residual2 = q.attn_hyper_connection.combine_mix(
+                        o, residual, q.mlp_hyper_connection
+                    )
+                    mixed2 = torch.where(
+                        kw["valid_tokens"].to(torch.bool)[:, None], mixed2, 0
+                    )
+                    st, ins = (
+                        q.mlp_hyper_connection.combine(q.mlp(mixed2), residual2),
+                        [h],
+                    )
                     ok("stock-qsa", st)
                     for j in ids[1:]:
                         ins.append(st)
                         st = layers[j](st, *args)
                     logger.info(
-                        "qwen38 segxcheck seg%d layers %d-%d rows=%d in_norm=%.4f MK vs stock: %s (%d left)",
-                        s, ids[0], ids[-1], rows, float(h.float().norm()), _diff_stats(mk, st, n, hc), self.segx_left,
+                        "qwen38 segxcheck seg%d layers %d-%d rows=%d in_norm=%.4f MK "
+                        "vs stock: %s (%d left)",
+                        s,
+                        ids[0],
+                        ids[-1],
+                        rows,
+                        float(h.float().norm()),
+                        _diff_stats(mk, st, n, hc),
+                        self.segx_left,
                     )
                     # Each layer alone on its stock input: the QSA layer as an L=1
                     # segment, each GDN layer as an L=1 head (weights packed here and
                     # dropped after, to keep HBM free).
                     R = self.mesh.size
-                    ex = ExecSpec(R=R, B=segs.buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(segs.buckets[0]))
+                    ex = ExecSpec(
+                        R=R,
+                        B=segs.buckets[0],
+                        T=T_VERIFY,
+                        ctx=128,
+                        tiles=segment_tiles(segs.buckets[0]),
+                    )
                     try:
                         for k, j in enumerate(ids):
                             head = k > 0
                             spec = qwen38.segment_spec(self.g, R, L=1, head=head)
                             wj = pack_segment_operands(
-                                runner.model, self.g, -1, spec, ex, layer_ids=[j], head=head,
+                                runner.model,
+                                self.g,
+                                -1,
+                                spec,
+                                ex,
+                                layer_ids=[j],
+                                head=head,
                                 boundary=bool(envs.VLLM_TPU_MK_OWN_OPERANDS),
                             )
-                            out_j = self._mk_run(1, head, wj, ins[k], att if k == 0 else None, snaps[k - 1] if head else [])
+                            out_j = self._mk_run(
+                                1,
+                                head,
+                                wj,
+                                ins[k],
+                                att if k == 0 else None,
+                                snaps[k - 1] if head else [],
+                            )
                             ref_j = ins[k + 1] if k + 1 < len(ids) else st
                             logger.info(
                                 "qwen38 segxcheck seg%d layer %d (%s) MK vs stock: %s",
-                                s, j, "gdn" if head else "qsa-out", _diff_stats(out_j, ref_j, n, hc),
+                                s,
+                                j,
+                                "gdn" if head else "qsa-out",
+                                _diff_stats(out_j, ref_j, n, hc),
                             )
                             del wj, out_j
                     except Exception:
-                        logger.exception("qwen38 segxcheck seg%d per-layer check failed", s)
+                        logger.exception(
+                            "qwen38 segxcheck seg%d per-layer check failed", s
+                        )
                     h = st
                     i = ids[-1] + 1
                     continue
@@ -1216,7 +1667,6 @@ class Qwen38SegmentDriver:
             mixed = bb.hyper_connection_mixer.mix(h)[0]
         return (mixed, h) if bb.emit_mtp_hidden else mixed
 
-
     def _attach_whole(self, runner: Any) -> None:
         """The whole-step program (its own compiled class); on failure it stays off."""
         from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpWholeStepModel
@@ -1224,25 +1674,44 @@ class Qwen38SegmentDriver:
         from .qwen38_wholestep import Qwen38WholeStep
 
         try:
-            attn = next(l.self_attn for l in self.segments.layers if l.layer_type == "full_attention")
+            attn = next(
+                lay.self_attn
+                for lay in self.segments.layers
+                if lay.layer_type == "full_attention"
+            )
             budget = int(attn.token_topk) // int(attn.compress_ratio)
             max_groups = -(-self.whole_cap // 4 // 1024) * 1024
-            # vLLM compiles a module for every compile size on its first call: the whole-step
-            # program compiles only the buckets it can serve (w04 j-05391f11: the 96-row bucket
-            # of the segment driver ran out of VMEM, 67.9 of 63 MiB, and disabled the MK).
-            buckets = tuple(b for b in self.buckets if b <= min(WHOLE_MAX_ROWS, self.whole_max_rows))
+            # vLLM compiles a module for every compile size on its first call: the
+            # whole-step
+            # program compiles only the buckets it can serve (w04 j-05391f11: the 96-row
+            # bucket
+            # of the segment driver ran out of VMEM, 67.9 of 63 MiB, and disabled the
+            # MK).
+            buckets = tuple(
+                b for b in self.buckets if b <= min(WHOLE_MAX_ROWS, self.whole_max_rows)
+            )
             if not buckets:
-                raise ValueError(f"no whole-step bucket <= {self.whole_max_rows} rows in {self.buckets}")
+                raise ValueError(
+                    f"no whole-step bucket <= {self.whole_max_rows} rows "
+                    f"in {self.buckets}"
+                )
             import copy
 
+            assert self.cfg is not None
             self.whole_cfg = copy.copy(self.cfg)
             cc = copy.copy(self.cfg.compilation_config)
             cc.compile_sizes = list(buckets)
             object.__setattr__(self.whole_cfg, "compilation_config", cc)
             whole = Qwen38WholeStep(
-                runner.model, self.g, self.mesh, buckets, budget=budget, max_groups=max_groups,
+                runner.model,
+                self.g,
+                self.mesh,
+                buckets,
+                budget=budget,
+                max_groups=max_groups,
                 hold=self.whole_hold,
             )
+            assert self.segments.pool is not None
             whole.bind_pool(self.segments.pool, self.segments.layout)
             self.whole_module = whole
             with self._contexts(runner, "model_mk_whole"):
@@ -1253,20 +1722,254 @@ class Qwen38SegmentDriver:
                     segments=self.segments,
                     whole=whole,
                 )
+            if self.wholecheck_left > 0 and whole.tail:
+                logger.warning("Qwen3.8 whole-step: wholecheck skipped with VLLM_TPU_MK_WHOLE_L47")
+            elif self.wholecheck_left > 0:
+                self._attach_whole_shadow(runner, whole)
             logger.info(
-                "Qwen3.8 whole-step megakernel attached: layers 3..46, context cap %d, rows <= %d, "
-                "budget %d, max_groups %d, %d operands, hold %s", self.whole_cap, self.whole_max_rows,
-                budget, max_groups, whole.n_w, self.whole_hold,
+                "Qwen3.8 whole-step megakernel attached: layers 3..%d, context cap "
+                "%d, rows <= %d, "
+                "budget %d, max_groups %d, %d operands, hold %s",
+                47 if whole.tail else 46,
+                self.whole_cap,
+                self.whole_max_rows,
+                budget,
+                max_groups,
+                whole.n_w,
+                self.whole_hold,
             )
-        except Exception:
-            logger.exception("Qwen3.8 whole-step: setup failed; segment program only")
+        except Exception as exc:
             self.whole_program = None
+            _mk_fail("Qwen3.8 whole-step: setup failed; segment program only", exc)
+
+    def _attach_whole_shadow(self, runner: Any, whole: Any) -> None:
+        """`wholecheck=N`: the whole-step program again, writing no GDN checkpoints (shadow
+        segments for the head groups and L47) and no QSA cache rows; the packed operands are
+        the served module's (a shallow copy shares its buffers)."""
+        import copy
+
+        from vllm_torchtpu.models.vllm.qwen4_exp.model import (
+            Qwen4ExpSegmentCutModel,
+            Qwen4ExpWholeStepShadowModel,
+        )
+
+        # One write-free segments instance for both programs: each instance registers its
+        # kernels as custom ops named by tag, and two instances re-register the same names
+        # (j-3628e449: TP2 failed with no schema for qwen38_mk::seg_l1_shadow, the other ranks
+        # waited PEER_WAIT_S = 3600 s for its artifact). `stop_before_last` only stops
+        # `forward_segments`; the whole-step forward does not read it.
+        seg = Qwen38Segments(
+            runner.model, self.g, self.mesh, self.buckets, shared=self.segments,
+            head=bool(self.segments.head_groups),
+        )
+        seg.bind_pool()
+        seg.stop_before_last = True
+        # Compile the shadow programs only for the checked buckets.
+        rows = sorted(self.wholecheck_rows) or list(self.whole_cfg.compilation_config.compile_sizes)
+        self.wholecheck_rows = frozenset(rows)
+        self.check_cfg = copy.copy(self.whole_cfg)
+        cc = copy.copy(self.whole_cfg.compilation_config)
+        cc.compile_sizes = rows
+        object.__setattr__(self.check_cfg, "compilation_config", cc)
+
+        sw = copy.copy(whole)
+        sw.write, sw.tag = False, "whole_shadow"
+        sw.bind_pool(self.segments.pool, self.segments.layout)
+        # Own compiled classes: a second instance of the served program's class would share
+        # its compiled graph (j-5635b8b7: model_mk_whole never compiled; the served whole
+        # steps ran the shadow's write-free graph).
+        with self._contexts(runner, "model_mk_whole_shadow"):
+            self.whole_shadow = Qwen4ExpWholeStepShadowModel(
+                vllm_config=self.check_cfg,
+                prefix="model_mk_whole_shadow",
+                backbone=runner.model.model,
+                segments=seg,
+                whole=sw,
+            )
+        # Cut reference: the segment program over the same layers 3..46, stopped before the
+        # last QSA layer's cache-writing attention core (compared with the shadow's residual
+        # at the same point, so a double cache write in L47 cannot enter the comparison).
+        with self._contexts(runner, "model_mk_segcut_shadow"):
+            self.whole_cut_ref = Qwen4ExpSegmentCutModel(
+                vllm_config=self.check_cfg,
+                prefix="model_mk_segcut_shadow",
+                backbone=runner.model.model,
+                segments=seg,
+            )
+        logger.info(
+            "Qwen3.8 whole-step shadow check attached: %d steps, buckets %s",
+            self.wholecheck_left, sorted(self.wholecheck_rows),
+        )
+
+    def _whole_shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict,
+                           rows: int, real: bool, n_req: int = 0) -> Any:
+        """Whole-step shadow (no cache writes) and the cut segment reference, then stock; log
+        the diffs on real steps, serve stock."""
+        with self._contexts(runner, "model_mk_whole_shadow"):
+            mk, mk_pre = self.whole_shadow(input_ids=input_ids, positions=positions, **kw)
+        with self._contexts(runner, "model_mk_segcut_shadow"):
+            seg_pre = self.whole_cut_ref(input_ids=input_ids, positions=positions, **kw)
+        seg_pre = seg_pre[0] if isinstance(seg_pre, (tuple, list)) else seg_pre
+        stock = runner.model(input_ids=input_ids, positions=positions, **kw)
+        if not real:  # warmup: compile this bucket's shadow programs, compare nothing
+            return stock
+        rel, max_abs, agree = self._vs_stock(runner, mk, stock)
+        self._log_per_request(runner, mk, stock, mk_pre, seg_pre, kw, positions, rows, n_req)
+        if self.whole_fault:
+            with self._contexts(runner, "model_mk_whole_shadow"):
+                bad = self.whole_shadow(input_ids=input_ids.roll(1, 0), positions=positions, **kw)[0]
+            f_rel, f_max, f_agree = self._vs_stock(runner, bad, stock)
+            logger.info(
+                "qwen38 whole-step shadow FAULT CONTROL rows=%d mean_rel=%.4g max_abs=%.4g "
+                "top1_agree=%.4f", rows, f_rel, f_max, f_agree,
+            )
+        self.wholecheck_left -= 1
+        agg = self.wholecheck_agg.setdefault(rows, [0.0, 0.0, 0.0, 0.0])
+        agg[0] += 1
+        agg[1] += rel
+        agg[2] = max(agg[2], rel)
+        agg[3] += agree
+        logger.info(
+            "qwen38 whole-step shadow check rows=%d mean_rel=%.4g max_abs=%.4g top1_agree=%.4f "
+            "(%d left)", rows, rel, max_abs, agree, self.wholecheck_left,
+        )
+        if self.wholecheck_left == 0:
+            logger.info(
+                "qwen38 whole-step shadow check summary {rows: (n, mean_rel, max_rel, top1_agree)}: %s",
+                {r: (int(a[0]), round(a[1] / a[0], 5), round(a[2], 5), round(a[3] / a[0], 4))
+                 for r, a in sorted(self.wholecheck_agg.items())},
+            )
+        return stock
+
+    def _log_per_request(self, runner: Any, mk: Any, stock: Any, mk_pre: Any, seg_pre: Any,
+                         kw: dict, positions: Any, rows: int, n_req: int) -> None:
+        """Per request: top-1 agreement MK vs stock, residual rel (shadow vs cut segment
+        reference) entering the last QSA layer; per-request ctx / pos / state slot and the
+        final-hidden rel scaled by each request's own magnitude, logged for every request."""
+        T = T_VERIFY
+        n = n_req or rows // T
+        mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
+        st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
+        lm = runner.model.compute_logits(mk_h).float()[: n * T]
+        ls = runner.model.compute_logits(st_h).float()[: n * T]
+        eq = (lm.argmax(-1) == ls.argmax(-1)).float().reshape(n, T)
+        agree = [round(float(v), 2) for v in eq.mean(-1).cpu()]
+        self._margin_diag(lm, ls, mk_h.float()[: n * T], st_h.float()[: n * T], kw, n)
+        pre = None  # check=N: no cut reference
+        if mk_pre is not None:
+            a, b = mk_pre.float()[: n * T], seg_pre.float()[: n * T]
+            scale = b.abs().mean().clamp_min(1e-6)
+            pre = [round(float(v), 4) for v in ((a - b).abs().reshape(n, T, -1).mean((1, 2)) / scale).cpu()]
+        pre_own = None  # same, scaled by each request's own reference magnitude
+        if mk_pre is not None:
+            pre_own = [round(float(v), 4) for v in
+                       ((a - b).abs().reshape(n, T, -1).mean((1, 2))
+                        / b.abs().reshape(n, T, -1).mean((1, 2)).clamp_min(1e-6)).cpu()]
+        fa = mk_h.float()[: n * T].reshape(n, T, -1)
+        fb = st_h.float()[: n * T].reshape(n, T, -1)
+        fin = [round(float(v), 4) for v in
+               ((fa - fb).abs().mean((1, 2)) / fb.abs().mean((1, 2)).clamp_min(1e-6)).cpu()]
+
+        def col(name):
+            t = kw.get(name)
+            if isinstance(t, torch.Tensor) and t.numel() >= n:
+                return [int(v) for v in t[:n].cpu()]
+            return None
+
+        bad = [q for q in range(n) if agree[q] < 0.5]
+        logger.info(
+            "qwen38 whole-step shadow per-request rows=%d agree=%s pre_last_rel_vs_seg=%s bad=%s",
+            rows, agree, pre, bad,
+        )
+        logger.info(
+            "qwen38 per-request meta rows=%d ctx=%s pos=%s slot=%s qsl=%s fin_rel_own=%s "
+            "pre_rel_own=%s", rows, col("context_lens"),
+            [int(v) for v in positions[: n * T : T].cpu()], col("state_slots"),
+            col("query_start_loc"), fin, pre_own,
+        )
+
+    # Context buckets (tokens) for the per-row hidden-state error.
+    _CTX_EDGES = (8192, 32768, 65536, 131072)
+    # Stock top-1 minus top-2 logit margin bins.
+    _MARGIN_EDGES = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+
+    def _margin_diag(self, lm: Any, ls: Any, mk_h: Any, st_h: Any, kw: dict, n: int) -> None:
+        """Near-tie noise vs drift. Per checked row: the stock top1 - top2 logit margin, and
+        for a row whose top-1 differs, MK's pick's rank in the stock logits and |MK - stock|
+        at the stock top-1 token; per-row final-hidden relative error by request context.
+        Noise flips only at margins below the logit error and picks stock's runner-up; drift
+        flips at large margins or picks deep. Logs a summary every 50 checked steps."""
+        T = T_VERIFY
+        top2 = ls.topk(2, dim=-1)
+        margin = (top2.values[:, 0] - top2.values[:, 1]).cpu()
+        s_arg = top2.indices[:, 0]
+        m_arg = lm.argmax(-1)
+        flip = (m_arg != s_arg).cpu()
+        dlogit = (lm.gather(1, s_arg[:, None]) - ls.gather(1, s_arg[:, None])).abs()[:, 0].cpu()
+        rank = (ls > ls.gather(1, m_arg[:, None])).sum(-1).cpu()  # 0 = stock top-1
+        rel = ((mk_h - st_h).abs().mean(-1) / st_h.abs().mean(-1).clamp_min(1e-6)).cpu()
+        ctx = kw.get("context_lens")
+        ctx = ctx[:n].cpu() if isinstance(ctx, torch.Tensor) and ctx.numel() >= n else None
+        agg = self.__dict__.setdefault("_mdiag", dict(
+            steps=0, rows=0, flips=0, margin_all=[0] * 7, margin_flip=[0] * 7,
+            rank=[0] * 4, flip_over_dlogit=0, rel_ctx=[[0.0, 0] for _ in range(5)],
+        ))
+        import bisect
+
+        agg["steps"] += 1
+        flips = []
+        for r in range(n * T):
+            mb = bisect.bisect_right(self._MARGIN_EDGES, float(margin[r]))
+            agg["rows"] += 1
+            agg["margin_all"][mb] += 1
+            q = r // T
+            c = int(ctx[q]) if ctx is not None else -1
+            cb = bisect.bisect_right(self._CTX_EDGES, c) if c >= 0 else 0
+            agg["rel_ctx"][cb][0] += float(rel[r])
+            agg["rel_ctx"][cb][1] += 1
+            if flip[r]:
+                agg["flips"] += 1
+                agg["margin_flip"][mb] += 1
+                agg["rank"][min(int(rank[r]), 3)] += 1
+                agg["flip_over_dlogit"] += int(float(margin[r]) > float(dlogit[r]))
+                flips.append((r, round(float(margin[r]), 3), int(rank[r]),
+                              round(float(dlogit[r]), 3), c))
+        logger.info(
+            "qwen38 MK margin-diag rows=%d flips(row,margin,mk_rank_in_stock,dlogit,ctx)=%s "
+            "rel_per_row=%s", n * T, flips, [round(float(v), 3) for v in rel],
+        )
+        if agg["steps"] % 50 == 0:
+            logger.info(
+                "qwen38 MK margin-diag SUMMARY steps=%d rows=%d flips=%d margin_edges=%s "
+                "margin_all=%s margin_flip=%s mk_rank_in_stock[0,1,2,3+]=%s "
+                "flips_with_margin>dlogit=%d ctx_edges=%s mean_row_rel_by_ctx=%s",
+                agg["steps"], agg["rows"], agg["flips"], self._MARGIN_EDGES,
+                agg["margin_all"], agg["margin_flip"], agg["rank"], agg["flip_over_dlogit"],
+                self._CTX_EDGES,
+                [(round(t / k, 4) if k else None, k) for t, k in agg["rel_ctx"]],
+            )
+
+    @staticmethod
+    def _vs_stock(runner: Any, mk: Any, stock: Any) -> tuple[float, float, float]:
+        """(mean rel diff, max abs diff, top-1 agreement) of the first outputs."""
+        mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
+        st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
+        d = (mk_h.float() - st_h.float()).abs()
+        rel = float(d.mean() / st_h.float().abs().mean().clamp_min(1e-6))
+        top_mk = runner.model.compute_logits(mk_h).argmax(-1)
+        top_st = runner.model.compute_logits(st_h).argmax(-1)
+        return rel, float(d.max()), float((top_mk == top_st).float().mean())
 
     def _whole_self_check(self, runner: Any) -> None:
-        """Loud error if `whole=1` but no whole-step call ran in the first model steps after
-        warmup: a silent fall-back to stock (w06g / w07g served GSM8K on stock after the MK
-        failed at its first call) then shows within minutes instead of at the end of a run."""
-        if getattr(self, "_whole_checked", False) or not getattr(runner, "warmup_done", False):
+        """Loud error if `whole=1` but no whole-step call ran in the first model steps
+        after
+        warmup: a silent fall-back to stock (w06g / w07g served GSM8K on stock after the
+        MK
+        failed at its first call) then shows within minutes instead of at the end of a
+        run."""
+        if getattr(self, "_whole_checked", False) or not getattr(
+            runner, "warmup_done", False
+        ):
             return
         if not hasattr(self, "_whole_check_base"):
             self._whole_check_base, self._whole_check_steps = self.whole_calls, 0
@@ -1275,35 +1978,102 @@ class Qwen38SegmentDriver:
             return
         self._whole_checked = True
         served = self.whole_calls - self._whole_check_base
-        if self.whole_dry:  # no whole-step call by design; report the would-be count instead
+        if (
+            self.whole_dry
+        ):  # no whole-step call by design; report the would-be count instead
             logger.info(
-                "Qwen3.8 whole-step self-check (wholedry): %d whole-step calls (expected 0), %d "
+                "Qwen3.8 whole-step self-check (wholedry): %d whole-step calls "
+                "(expected 0), %d "
                 "dry whole-eligible steps so far; step mix %s",
-                served, sum(v for k, v in self.stats.items() if k.startswith("dry_whole_b")),
+                served,
+                sum(v for k, v in self.stats.items() if k.startswith("dry_whole_b")),
                 dict(sorted(self.stats.items())),
             )
         elif served == 0:
             logger.error(
-                "Qwen3.8 whole-step SELF-CHECK FAILED: whole=1 but no whole-step call in the "
+                "Qwen3.8 whole-step SELF-CHECK FAILED: whole=1 but no whole-step call "
+                "in the "
                 "first %d steps after warmup (megakernel %s); step mix %s",
                 WHOLE_SELF_CHECK_STEPS,
                 "disabled" if self.whole_program is None else "on, nothing eligible",
                 dict(sorted(self.stats.items())),
             )
+            if self.whole_program is None:  # disabled, not merely nothing eligible
+                _mk_fail(
+                    "Qwen3.8 whole-step SELF-CHECK FAILED: whole=1 but the whole-step "
+                    "program is disabled"
+                )
         else:
             logger.info(
-                "Qwen3.8 whole-step self-check: %d whole-step calls in the first %d verify steps",
-                served, WHOLE_SELF_CHECK_STEPS,
+                "Qwen3.8 whole-step self-check: %d whole-step calls in the first %d "
+                "verify steps",
+                served,
+                WHOLE_SELF_CHECK_STEPS,
             )
 
     def _whole_eligible(self, runner: Any, n_req: int, rows: int) -> bool:
-        if self.whole_program is None or rows > min(WHOLE_MAX_ROWS, self.whole_max_rows):
+        if self.whole_program is None or rows > min(
+            WHOLE_MAX_ROWS, self.whole_max_rows
+        ):
             return False
         try:
             ctx = runner.input_batch.num_computed_tokens_cpu[:n_req]
             return int(ctx.max()) + T_VERIFY <= self.whole_cap
         except Exception:
             return False
+
+    def _detach_draft_kernels(self, runner: Any) -> None:
+        """Drop the MTP tail / MK draft from the draft model: they must not run once the
+        target megakernel is off."""
+        draft = getattr(getattr(runner, "drafter", None), "draft_model", None)
+        inner = getattr(draft, "model", None)
+        for name in ("mk_tail", "mk_draft"):
+            if getattr(inner, name, None) is not None:
+                setattr(inner, name, None)
+                logger.warning("Qwen3.8 megakernel off: %s detached from the draft", name)
+
+    def _attach_mk_draft(self, runner: Any) -> None:
+        """VLLM_TPU_MK_DRAFT: the MTP draft's step 0 (and loop steps, VLLM_TPU_MK_DRAFT_LOOP)
+        as one whole-step kernel call each (`qwen38_draft.MkDraft`): draft layer, final
+        mixer, lm_head and greedy pick. Needs the whole-step program (its pool and
+        geometry) and the fused draft loop; on failure the draft stays stock."""
+        from vllm_torchtpu.models.vllm.qwen4_exp.mtp import Qwen4ExpMTP
+
+        from .qwen38_draft import MkDraft
+
+        whole = getattr(self, "whole_module", None)
+        if whole is None or self.whole_program is None:
+            _mk_fail("Qwen3.8 MK draft: needs the whole-step program")
+            return
+        if not envs.VLLM_TPU_FUSED_DRAFT_LOOP:
+            _mk_fail("Qwen3.8 MK draft: needs the fused draft loop")
+            return
+        draft = getattr(getattr(runner, "drafter", None), "draft_model", None)
+        if not isinstance(draft, Qwen4ExpMTP):
+            _mk_fail(f"Qwen3.8 MK draft: no Qwen4ExpMTP draft model ({type(draft)})")
+            return
+        try:
+            mk = MkDraft(
+                draft, self.g, self.mesh, self.segments.layout, whole.pool,
+                budget=whole.budget, max_groups=whole.max_groups,
+                norm_eps=whole.norm_eps, rotary_dim=whole.rotary_dim,
+            )
+        except Exception as exc:
+            _mk_fail("Qwen3.8 MK draft: setup failed; draft stays stock", exc)
+            return
+        object.__setattr__(mk, "count", self._count)  # mk_draft_step0 / stock_step0
+        # Rows the draft kernel is built for: step 0 runs after whole-step target steps
+        # (<= the whole-step rows); loop steps take one row per request, measured up to
+        # 16 requests (T=1, VMEM). Larger compile ranges trace the stock draft.
+        whole_rows = min(WHOLE_MAX_ROWS, self.whole_max_rows)
+        mk.max_rows.update({4: whole_rows, 1: min(MK_DRAFT_LOOP_MAX_ROWS, whole_rows)})
+        draft.model.mk_draft = mk
+        logger.info(
+            "Qwen3.8 MK draft attached: draft layer + mixer + lm_head + greedy pick per "
+            "step (draft weights at checkpoint precision: FP8 routed experts with their "
+            "scales, BF16 attention / HC / shared expert / router / lm_head; %d operands)",
+            mk.n_w,
+        )
 
     def _attach_mtp_tail(self, runner: Any) -> None:
         """Route the MTP draft layer's post-attention half to the tail kernel.
@@ -1316,33 +2086,52 @@ class Qwen38SegmentDriver:
         if not (envs.VLLM_TPU_MTP_DRAFT_ROWS and envs.VLLM_TPU_FUSED_DRAFT_LOOP):
             # Without draft rows, step 0's all-token draft call could carry a
             # prefill-sized chunk, which the tail kernel does not take.
-            logger.warning("Qwen3.8 MTP tail: needs MTP draft rows and the fused draft loop")
+            logger.warning(
+                "Qwen3.8 MTP tail: needs MTP draft rows and the fused draft loop"
+            )
             return
         draft = getattr(getattr(runner, "drafter", None), "draft_model", None)
         if not isinstance(draft, Qwen4ExpMTP):
-            logger.warning("Qwen3.8 MTP tail: no Qwen4ExpMTP draft model (%s)", type(draft))
+            logger.warning(
+                "Qwen3.8 MTP tail: no Qwen4ExpMTP draft model (%s)", type(draft)
+            )
             return
-        o_proj = draft.model.layers[0].self_attn.o_proj.weight
+        draft_attn: Any = draft.model.layers[0].self_attn
+        o_proj = draft_attn.o_proj.weight
         if self.g.NH // self.mesh.size * self.g.HD not in tuple(o_proj.shape):
-            logger.warning("Qwen3.8 MTP tail: draft o_proj %s is not TP-sharded like the target", tuple(o_proj.shape))
+            logger.warning(
+                "Qwen3.8 MTP tail: draft o_proj %s is not TP-sharded like the target",
+                tuple(o_proj.shape),
+            )
             return
         try:
             kind = MtpTailKind(
-                self.mesh, self.g, self.segments.layout, self.segments.write_ckpts,
+                self.mesh,
+                self.g,
+                self.segments.layout,
+                self.segments.write_ckpts,
                 min(max(self.buckets), KERNEL_ROWS),
             )
             tail = MtpTail(draft, self.g, self.mesh, kind, self.buckets)
-        except Exception:
-            logger.exception("Qwen3.8 MTP tail: packing failed; draft stays stock")
+        except Exception as exc:
+            _mk_fail("Qwen3.8 MTP tail: packing failed; draft stays stock", exc)
             return
         draft.model.mk_tail = tail
-        logger.info("Qwen3.8 MTP draft tail kernel attached, rows buckets %s", self.buckets)
+        logger.info(
+            "Qwen3.8 MTP draft tail kernel attached, rows buckets %s", self.buckets
+        )
 
-    def _shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict) -> Any:
+    def _shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict,
+                     real: bool = True, n_req: int = 0) -> Any:
         """Run the kernel program (no GDN writes) then the stock model; log, return stock."""
         with self._contexts(runner, "model_mk_segments_shadow"):
             mk = self.shadow(input_ids=input_ids, positions=positions, **kw)
         stock = runner.model(input_ids=input_ids, positions=positions, **kw)
+        if not real:  # warmup: compile this bucket's shadow program, compare nothing
+            return stock
+        # n_req, not rows // T: a padded request slot (stale context_lens) is no request.
+        self._log_per_request(runner, mk, stock, None, None, kw, positions,
+                              int(input_ids.shape[0]), n_req)
         mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
         st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
         d = (mk_h.float() - st_h.float()).abs()
@@ -1373,7 +2162,8 @@ class Qwen38SegmentDriver:
         logger.info("qwen38 megakernel tp barrier %s: %.2f s", what, time.time() - t0)
 
     def _log_program_fingerprint(self) -> None:
-        """md5 of each compiled segment-program artifact of this rank (are all ranks' programs the same?)."""
+        """md5 of each compiled segment-program artifact of this rank (are all ranks'
+        programs the same?)."""
         import glob
         import hashlib
 
@@ -1381,15 +2171,17 @@ class Qwen38SegmentDriver:
 
         r = get_tp_group().rank_in_group
         files = sorted(
-            glob.glob(f"/root/vllm-torchtpu-cache/vllm/torch_compile_cache/*/rank_{r}_*/model_mk_segments/*")
+            glob.glob(
+                f"/root/vllm-torchtpu-cache/vllm/torch_compile_cache/*/rank_{r}_*/model_mk_segments/*"
+            )
         )
-        import os
-
         marks = []
         for f in files:
             h = hashlib.md5()
-            parts = [f] if os.path.isfile(f) else sorted(
-                os.path.join(d, n) for d, _, ns in os.walk(f) for n in ns
+            parts = (
+                [f]
+                if os.path.isfile(f)
+                else sorted(os.path.join(d, n) for d, _, ns in os.walk(f) for n in ns)
             )
             for part in parts:
                 try:
@@ -1398,22 +2190,37 @@ class Qwen38SegmentDriver:
                 except OSError:
                     continue
             marks.append(f"{f.rsplit('/', 1)[-1]}={h.hexdigest()[:10]}")
-        logger.info("qwen38 megakernel program fingerprint rank %d: %s", r, " ".join(marks) or "no artifacts")
+        logger.info(
+            "qwen38 megakernel program fingerprint rank %d: %s",
+            r,
+            " ".join(marks) or "no artifacts",
+        )
 
     def _log_gdn_meta(self) -> None:
-        """Host-side ranges of the first GDN layer's metadata and the pool block count."""
+        """Host-side ranges of the first GDN layer's metadata and the pool block
+        count.
+        """
         try:
             from vllm.forward_context import get_forward_context
 
             seg = self.segments
-            layer = next(l for l in seg.layers if l.layer_type == "linear_attention")
-            md = get_forward_context().attn_metadata[layer.linear_attn.prefix]
+            layer = next(
+                lay for lay in seg.layers if lay.layer_type == "linear_attention"
+            )
+            md_log: Any = get_forward_context().attn_metadata
+            md: Any = md_log[layer.linear_attn.prefix]
             parts = []
-            for name in ("mamba_state_indices", "mamba_slot_read_offsets", "mamba_ckpt_indices",
-                         "query_start_loc", "seq_lens"):
+            for name in (
+                "mamba_state_indices",
+                "mamba_slot_read_offsets",
+                "mamba_ckpt_indices",
+                "query_start_loc",
+                "seq_lens",
+            ):
                 t = getattr(md, name).detach().to("cpu").to(torch.int64)
                 parts.append(f"{name}{tuple(t.shape)}[{int(t.min())},{int(t.max())}]")
             lay = seg.layout
+            assert lay is not None
             logger.info(
                 "qwen38 megakernel gdn meta: %s; pool blocks %d",
                 " ".join(parts),
@@ -1423,30 +2230,48 @@ class Qwen38SegmentDriver:
             logger.info("qwen38 megakernel gdn meta: unavailable (%s)", exc)
 
     def _count(self, key: str, n: int) -> None:
-        """Add `n` to a counter logged with the step mix without counting a step (drafted
-        tokens per path, for attributing accepted tokens to whole-step vs stock steps)."""
+        """Add `n` to a counter logged with the step mix without counting a step
+        (drafted
+        tokens per path, for attributing accepted tokens to whole-step vs stock steps).
+        """
         self.counters = getattr(self, "counters", {})
         self.counters[key] = self.counters.get(key, 0) + n
 
     def _note(self, key: str) -> None:
         self.stats[key] = self.stats.get(key, 0) + 1
-        n = sum(self.stats.values())
-        # Powers of two early, then every STEP_MIX_EVERY steps, so the mix can be joined in
+        if envs.VLLM_TPU_MK_TRYFWD_LEAN:
+            # Running total: `stats` is only written here, so this equals
+            # sum(stats.values()). Re-seeded from the dict whenever it is unset.
+            n = self.__dict__.get("_note_n")
+            n = sum(self.stats.values()) if n is None else n + 1
+            self._note_n = n
+        else:
+            self._note_n = None
+            n = sum(self.stats.values())
+        # Powers of two early, then every STEP_MIX_EVERY steps, so the mix can be joined
+        # in
         # time to the serving metrics (AL windows) over a whole run.
         if (n & (n - 1) == 0 and n >= 64) or n % STEP_MIX_EVERY == 0:
-            logger.info("qwen38 megakernel step mix: %s", dict(sorted(self.stats.items())))
+            logger.info(
+                "qwen38 megakernel step mix: %s counters %s",
+                dict(sorted(self.stats.items())),
+                dict(sorted(getattr(self, "counters", {}).items())),
+            )
         if STEP_MIX_INTERVAL_S:
             import time
 
             now = time.monotonic()
             if now - getattr(self, "_mix_t", 0.0) >= STEP_MIX_INTERVAL_S:
-                # Cumulative counts on a wall-clock cadence matching vLLM's spec-decode metrics
-                # interval: differencing both per window attributes accepted / drafted tokens to
+                # Cumulative counts on a wall-clock cadence matching vLLM's spec-decode
+                # metrics
+                # interval: differencing both per window attributes accepted / drafted
+                # tokens to
                 # whole-step vs stock steps (tools: whole_path_al.py).
                 self._mix_t = now
                 logger.info(
                     "qwen38 megakernel step mix (timed): %s counters %s",
-                    dict(sorted(self.stats.items())), dict(getattr(self, "counters", {})),
+                    dict(sorted(self.stats.items())),
+                    dict(getattr(self, "counters", {})),
                 )
 
     def try_forward(
@@ -1459,17 +2284,26 @@ class Qwen38SegmentDriver:
         model_kwargs: Any = None,
     ) -> tuple[bool, Any]:
         self.calls_total = getattr(self, "calls_total", 0) + 1
+        # VLLM_TPU_MK_DRAFT: draft step 0 takes its MK call only after a whole-step
+        # target forward (a uniform verify step).
+        runner._mk_whole_step = False
         if inputs_embeds is not None or intermediate_tensors is not None:
             # Counted like every other stock route, so a bypass shows in the mix.
-            self._note("stock_embeds" if inputs_embeds is not None else "stock_intermediate")
+            self._note(
+                "stock_embeds" if inputs_embeds is not None else "stock_intermediate"
+            )
             return False, None
-        if self.program is None:  # disabled (it failed): the self-check still counts steps
+        if (
+            self.program is None
+        ):  # disabled (it failed): the self-check still counts steps
             self._note(getattr(self, "disabled_reason", "stock_noprogram"))
             if self.whole:
                 self._whole_self_check(runner)
             return False, None
         self.seq += 1
-        ok, n_req, t_seq, reason = MegakernelDriver._inspect_step_detail(None, None, runner)
+        ok, n_req, t_seq, reason = MegakernelDriver._inspect_step_detail(
+            None, None, runner
+        )
         rows = int(input_ids.shape[0])
         if not ok or t_seq != T_VERIFY:
             self._note(reason if not ok else f"stock_t{t_seq}")
@@ -1479,21 +2313,29 @@ class Qwen38SegmentDriver:
         if rows not in self.buckets or n_req * T_VERIFY > rows:
             self._note(f"stock_rows{rows}_n{n_req}")
             return False, None
-        if (
-            self.whole_program is not None
-            and self.whole_above == "stock"
-            and not self._whole_eligible(runner, n_req, rows)
-        ):
-            # Above `wholerows` or past `wholecap`: stock, not the segment program, which only
-            # compiles (all its buckets, mid-serving) on its first call (w05 j-84f89805: a c1
-            # AgentX request past the 32K cap started that compile and the sampler RPC timed out).
+        lean = envs.VLLM_TPU_MK_TRYFWD_LEAN
+        # VLLM_TPU_MK_TRYFWD_LEAN: the eligibility of this step, computed at most once
+        # (None = not computed yet). Nothing between here and the call changes its
+        # inputs (rows, n_req, the runner's host token counts).
+        eligible: bool | None = None
+        if self.whole_program is not None and self.whole_above == "stock":
+            eligible = self._whole_eligible(runner, n_req, rows)
+        if eligible is False:
+            # Above `wholerows` or past `wholecap`: stock, not the segment program,
+            # which only
+            # compiles (all its buckets, mid-serving) on its first call (w05 j-84f89805:
+            # a c1
+            # AgentX request past the 32K cap started that compile and the sampler RPC
+            # timed out).
             above = rows > min(WHOLE_MAX_ROWS, self.whole_max_rows)
             self._note(f"stock_above_whole_b{rows}" if above else "stock_whole_ctx")
             self._count("drafts_stock", n_req * (T_VERIFY - 1))
             return False, None
         if self.whole_dry and self.whole_program is not None:
-            # `wholedry=1`: the same eligibility decision and per-path draft counters, but the
-            # whole-step-eligible steps run stock too: the stock acceptance of exactly the
+            # `wholedry=1`: the same eligibility decision and per-path draft counters,
+            # but the
+            # whole-step-eligible steps run stock too: the stock acceptance of exactly
+            # the
             # requests whole-step would serve (per-path AL control).
             self._note(f"dry_whole_b{rows}")
             self._count("drafts_whole", n_req * (T_VERIFY - 1))
@@ -1503,24 +2345,29 @@ class Qwen38SegmentDriver:
         if self.mk_calls <= 4:
             logger.info(
                 "qwen38 megakernel call %d at step seq %d: rows=%d n_req=%d",
-                self.mk_calls, self.seq, rows, n_req,
+                self.mk_calls,
+                self.seq,
+                rows,
+                n_req,
             )
             if self.mk_calls <= 2:
                 self._log_gdn_meta()
         # Read-only below: no per-step copy.
         kw = model_kwargs if model_kwargs is not None else {}
         if self.segx_left > 0 or getattr(self, "segx_done", False):
-            if self.segx_left > 0 and getattr(runner, "warmup_done", False) and _real_traffic(kw):
+            if self.segx_left > 0 and getattr(runner, "warmup_done", False) and _real_traffic(kw, runner, n_req):
                 self.segx_left -= 1
                 self.segx_done = True
                 try:
                     return True, self._segxcheck(runner, input_ids, positions, kw, rows)
                 except Exception:
-                    logger.exception("qwen38 megakernel segxcheck failed; segxcheck off")
+                    logger.exception(
+                        "qwen38 megakernel segxcheck failed; segxcheck off"
+                    )
                     self.segx_left = 0
             return False, None
         if self.h0check_left > 0 or getattr(self, "h0check_done", False):
-            warm, real = bool(getattr(runner, "warmup_done", False)), _real_traffic(kw)
+            warm, real = bool(getattr(runner, "warmup_done", False)), _real_traffic(kw, runner, n_req)
             want = not getattr(self, "h0rows", 0) or rows == self.h0rows
             seen = self.__dict__.setdefault("_h0_gate_seen", set())
             if self.h0check_left > 0 and (rows, warm, real) not in seen:
@@ -1528,14 +2375,22 @@ class Qwen38SegmentDriver:
                 # each (rows, warmup_done, real traffic) gate state once.
                 seen.add((rows, warm, real))
                 logger.info(
-                    "qwen38 h0check gate: rows=%d n_req=%d warmup_done=%s real_traffic=%s rows_wanted=%s left=%d",
-                    rows, n_req, warm, real, want, self.h0check_left,
+                    "qwen38 h0check gate: rows=%d n_req=%d warmup_done=%s "
+                    "real_traffic=%s rows_wanted=%s left=%d",
+                    rows,
+                    n_req,
+                    warm,
+                    real,
+                    want,
+                    self.h0check_left,
                 )
             if self.h0check_left > 0 and warm and real and want:
                 self.h0check_left -= 1
                 self.h0check_done = True
                 try:
-                    return True, self._h0check(runner, input_ids, positions, kw, rows, n_req)
+                    return True, self._h0check(
+                        runner, input_ids, positions, kw, rows, n_req
+                    )
                 except Exception:
                     logger.exception("qwen38 megakernel h0check failed; h0check off")
                     self.h0check_left = 0
@@ -1544,33 +2399,78 @@ class Qwen38SegmentDriver:
         if first_warm:
             self._tp_barrier("before the first (compiling) call")
         try:
-            if self.check_left > 0 and self.shadow is not None:
-                out = self._shadow_step(runner, input_ids, positions, kw)
-            elif self._whole_eligible(runner, n_req, rows):
+            if lean:
+                # The real-traffic gate only matters to the shadow check below.
+                check_real = False
+                if self.check_left > 0 and self.shadow is not None:
+                    warm = bool(getattr(runner, "warmup_done", False))
+                    check_real = warm and _real_traffic(kw, runner, n_req)
+            else:
+                check_real = bool(getattr(runner, "warmup_done", False)) and _real_traffic(kw, runner, n_req)
+            if (
+                self.check_left > 0
+                and self.shadow is not None
+                and (not self.check_rows or rows in self.check_rows)
+                and (rows not in self.check_warm or check_real)
+            ):
+                self.check_warm.add(rows)
+                self._note(f"check_b{rows}" if check_real else f"check_warm_b{rows}")
+                out = self._shadow_step(runner, input_ids, positions, kw, check_real, n_req)
+            elif (
+                self.wholecheck_left > 0
+                and self.whole_shadow is not None
+                and rows in self.wholecheck_rows
+                and self._whole_eligible(runner, n_req, rows)
+                and (
+                    rows not in self.wholecheck_warm
+                    or (getattr(runner, "warmup_done", False) and _real_traffic(kw, runner, n_req))
+                )
+            ):
+                real = bool(getattr(runner, "warmup_done", False)) and _real_traffic(kw, runner, n_req)
+                self.wholecheck_warm.add(rows)
+                self._note(f"wholecheck_b{rows}" if real else f"wholecheck_warm_b{rows}")
+                out = self._whole_shadow_step(runner, input_ids, positions, kw, rows, real, n_req)
+            elif (
+                eligible
+                if lean and eligible is not None
+                else self._whole_eligible(runner, n_req, rows)
+            ):
                 self.whole_calls += 1
                 self._count("drafts_whole", n_req * (T_VERIFY - 1))
                 self._note(f"whole_b{rows}")
-                with self._contexts(runner, "model_mk_whole"):
-                    out = self.whole_program(input_ids=input_ids, positions=positions, **kw)
+                assert self.whole_program is not None
+                with self._whole_contexts(runner):
+                    out = self.whole_program(
+                        input_ids=input_ids, positions=positions, **kw
+                    )
+                runner._mk_whole_step = True
                 from . import qwen38_wholestep_call as wsc
 
-                if wsc.union_stats_on() and self.whole_calls % wsc.UNION_STATS_EVERY == 0:
+                if (
+                    wsc.union_stats_on()
+                    and self.whole_calls % wsc.UNION_STATS_EVERY == 0
+                ):
                     self.whole_module.log_union_stats(self.whole_calls)
             else:
                 with self._serve_contexts(runner):
                     out = self.program(input_ids=input_ids, positions=positions, **kw)
-        except Exception:
-            # Fail closed: one failure disables the megakernel for this server;
-            # this step and all later ones run the stock model.
-            logger.exception("Qwen3.8 megakernel failed; disabling it, stock path from now on")
+        except Exception as exc:
+            # One failure disables the megakernel for this server. Fatal by default;
+            # with VLLM_TPU_MK_ALLOW_FALLBACK=1 this step and all later ones run the
+            # stock model, and the draft-side kernels (MTP tail, MK draft) are detached
+            # too so no megakernel part runs on its own.
             self.program = self.shadow = self.whole_program = None
+            self._detach_draft_kernels(runner)
+            _mk_fail("Qwen3.8 megakernel failed; disabling it, stock path from now on", exc)
             return False, None
         if isinstance(out, (list, tuple)):
             out = tuple(out)
         if first_warm:
             from torch_tpu._internal import sync as tpu_sync
 
-            tpu_sync.synchronize(list(out) if isinstance(out, tuple) else [out], wait=True)
+            tpu_sync.synchronize(
+                list(out) if isinstance(out, tuple) else [out], wait=True
+            )
             self._log_program_fingerprint()
             self._tp_barrier("after the first call finished on device")
         if self.sync and self.mk_calls <= 4:
@@ -1579,9 +2479,13 @@ class Qwen38SegmentDriver:
             from torch_tpu._internal import sync as tpu_sync
 
             t0 = time.time()
-            tpu_sync.synchronize(list(out) if isinstance(out, tuple) else [out], wait=True)
+            tpu_sync.synchronize(
+                list(out) if isinstance(out, tuple) else [out], wait=True
+            )
             logger.info(
-                "qwen38 megakernel call %d done on device after %.2f s", self.mk_calls, time.time() - t0
+                "qwen38 megakernel call %d done on device after %.2f s",
+                self.mk_calls,
+                time.time() - t0,
             )
         return True, out
 

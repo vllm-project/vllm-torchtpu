@@ -13,22 +13,30 @@
 # limitations under the License.
 """Checkpoint-native text backbone with explicit TPU state/input ownership."""
 
+import itertools
+import math
 from collections.abc import Iterable, Sequence
 from functools import partial
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import nn
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
-from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
+from vllm.distributed import (
+    get_dp_group,
+    get_ep_group,
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    get_masked_input_and_mask,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
@@ -48,8 +56,14 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.core.attention_metadata import mamba_ckpt_of, mamba_state_of
 from vllm_torchtpu.compilation import bucket_filter
+from vllm_torchtpu.core.mamba_tail_fold import prefill_checkpoint_targets
+from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+    GdnStepMetadataCache,
+)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.logger import init_logger
 
 from . import sequence_parallel as sp
 from .config import (
@@ -62,7 +76,7 @@ from .gdn import Qwen4ExpGatedDeltaNetAttention
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .parallel import PLEParallel
 from .pd_identity import LoadedWeightIdentity
-from .ple import PLEInputs
+from .ple import PLEInputs, merged_embed_all_reduce
 from .ple_geometry import ple_state_shape
 from .ple_host import shared_ple_options
 from .ple_storage import SharedPLEOptions
@@ -70,6 +84,8 @@ from .pool_layout import POOLED_GDN_CONV_STATE_DTYPE
 from .pooled_ple import Qwen4ExpPooledPLE
 from .pp import is_first_stage, is_last_stage, pipeline_size, stage_layers
 from .qsa import QSAMetadata, Qwen4ExpQSA
+
+logger = init_logger(__name__)
 
 
 def _parameter_storage_key(parameter):
@@ -89,6 +105,48 @@ def moe_weights_mapper():
             "shared_expert.up_proj": ("shared_expert.gate_up_proj", 1),
         }
     )
+
+
+_SHARED_LOCAL_MAPPER = WeightsMapper(
+    orig_to_new_stacked={
+        "shared_expert_local.gate_proj": ("shared_expert_local.gate_up_proj", 0),
+        "shared_expert_local.up_proj": ("shared_expert_local.gate_up_proj", 1),
+    }
+)
+
+
+def load_layer_mlp_weights(
+    loader: AutoWeightsLoader,
+    mlp: nn.Module,
+    items: Iterable[tuple[str, torch.Tensor]],
+    moe_mapper: WeightsMapper,
+    layer_idx: int,
+) -> set[str]:
+    """Load a contiguous batch of checkpoint tensors into one layer's MLP."""
+    has_shared_local = hasattr(mlp, "shared_expert_local")
+    local_shared: list[tuple[str, torch.Tensor]] = []
+
+    def _stream() -> Iterable[tuple[str, torch.Tensor]]:
+        for relative, weight in items:
+            if has_shared_local and relative.startswith("shared_expert."):
+                local_shared.append(
+                    ("shared_expert_local." + relative.split(".", 1)[1], weight)
+                )
+            yield relative, weight
+
+    prefix = f"model.layers.{layer_idx}.mlp."
+    loaded = {
+        prefix + target
+        for target in loader.load_weights(_stream(), mapper=moe_mapper)
+    }
+    if local_shared:
+        loaded.update(
+            prefix + target
+            for target in loader.load_weights(
+                iter(local_shared), mapper=_SHARED_LOCAL_MAPPER
+            )
+        )
+    return loaded
 
 
 def verify_shared_expert_replica(mlp, tp, label):
@@ -168,10 +226,10 @@ def ple_speculative_state(metadata):
     (decodes and verify windows) and its final history to checkpoint 0
     otherwise; the same contract the pooled GDN kernel follows.
     """
-    ckpt = metadata.mamba_ckpt_indices
+    ckpt = mamba_ckpt_of(metadata)
     if ckpt is None:
         return None
-    state = cast(torch.Tensor, metadata.mamba_state_indices)
+    state = cast(torch.Tensor, mamba_state_of(metadata))
     offsets = cast(torch.Tensor, metadata.mamba_slot_read_offsets)
     distribution = cast(torch.Tensor, metadata.mamba_request_distribution)
     assert offsets is not None and distribution is not None
@@ -241,7 +299,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         )
         if self.ple is not None and engram.get("cpu_offload", False):
             cfg.compilation_config.static_forward_context[prefix + ".ple"] = self.ple
-        self.layer_type = layer_type or t.layer_types[index]
+        raw_layer_type = layer_type or t.layer_types[index]
+        self.layer_type = (
+            "linear_attention"
+            if raw_layer_type == "linear_attention"
+            else "full_attention"
+        )
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen4ExpGatedDeltaNetAttention(
                 t,
@@ -257,6 +320,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             if out_proj is not None:
                 out_proj.reduce_results = False
         else:
+            scheduler_cfg = getattr(cfg, "scheduler_config", None)
             self.self_attn = Qwen4ExpQSA(
                 config=t,
                 max_model_len=cfg.model_config.max_model_len,
@@ -267,7 +331,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=prefix + ".self_attn",
                 pooled=use_unified_pool(),
                 max_query_len=num_speculative_tokens(cfg) + 1,
-                max_num_seqs=cfg.scheduler_config.max_num_seqs,
+                max_num_seqs=scheduler_cfg.max_num_seqs
+                if scheduler_cfg is not None
+                else 0,
             )
             cfg.compilation_config.static_forward_context[prefix + ".self_attn"] = (
                 self.self_attn
@@ -275,21 +341,23 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.mlp = Qwen3NextSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
         if (
             envs.QWEN4_EXP_PREFILL_SP_SHARED_LOCAL
-            and index < t.num_hidden_layers  # backbone only: the MTP draft never takes SP
+            and index
+            < t.num_hidden_layers  # backbone only: the MTP draft never takes SP
             and envs.QWEN4_EXP_PREFILL_SP_MOE
             and sp.enabled(tp.world_size)
             and getattr(self.mlp, "shared_expert", None) is not None
             and not getattr(self.mlp, "replicate_shared_expert", True)
         ):
             # Replicated copy of the TP-sliced shared expert for sequence-parallel steps
-            # (`_sequence_parallel_moe`); same prefix, so it takes the same quantization.
+            # (`_sequence_parallel_moe`); same prefix, so it takes the same
+            # quantization.
             self.mlp.shared_expert_local = Qwen3NextMLP(
                 hidden_size=t.hidden_size,
                 intermediate_size=t.shared_expert_intermediate_size,
                 hidden_act=t.hidden_act,
                 quant_config=cfg.quant_config,
                 reduce_results=False,
-                expert_gate=self.mlp.shared_expert_gate,
+                expert_gate=cast(Any, self.mlp.shared_expert_gate),
                 disable_tp=True,
                 prefix=prefix + ".mlp.shared_expert",
             )
@@ -330,13 +398,26 @@ class Qwen4ExpDecoderLayer(nn.Module):
         ple_raw_embeddings=None,
         sequence_parallel=False,
         sp_pad=0,
+        gdn_step_metadata_cache=None,
+        replicated_token_shard=False,
+        sp_microbatch=None,
     ):
         """``sequence_parallel``: ``hidden`` and the result are this TP rank's
         token shard; the token-indexed inputs still cover the whole step.
+        ``sp_microbatch``: the step's ``sequence_parallel.MicroBatchPlan``
+        (VLLM_TPU_SP_MICROBATCH_OVERLAP); the attention side runs in its token
+        halves (``_attention_in_halves``).
         ``sp_pad``: the shard's HC streams are padded to a multiple of this many
-        rows; only the real rows enter collectives, attention and the MoE."""
+        rows; only the real rows enter collectives, attention and the MoE.
+        ``replicated_token_shard``: the replicated prefill graph of
+        VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD; QSA runs the
+        token-sharded indexer."""
         num_tokens = input_ids.shape[0] if sequence_parallel else None
-        rows = num_tokens // sp.tp_world_size() if sp_pad else None
+        rows = (
+            num_tokens // sp.tp_world_size()
+            if sp_pad and num_tokens is not None
+            else None
+        )
         hidden = self.apply_ple(
             hidden,
             input_ids,
@@ -351,12 +432,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
         block, residual = self.attn_hyper_connection.mix(hidden)
         if sp_pad:
             block = sp.unpad(block, rows)
-        if sequence_parallel:
-            block = sp.gather(block, num_tokens)
-        if self.layer_type == "linear_attention":
-            block = sp.reduce(self.linear_attn(block), sequence_parallel)
-        else:
-            block = self.self_attn.forward_with_indices(
+        if sequence_parallel and sp_microbatch is not None:
+            block = self._attention_in_halves(
                 block,
                 positions,
                 QSAMetadata(
@@ -366,15 +443,43 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     main_block_table,
                     compressed_block_table,
                 ),
-                reduce=False,
-                replicated_indexer=(
-                    sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP
-                ),
-                token_shard=(
-                    sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD
-                ),
-            )[0]
-            block = sp.reduce(block, sequence_parallel)
+                sp_microbatch,
+                gdn_step_metadata_cache,
+            )
+        else:
+            if sequence_parallel:
+                block = sp.gather(block, num_tokens)
+            if self.layer_type == "linear_attention":
+                block = sp.reduce(
+                    self.linear_attn(block, gdn_step_metadata_cache), sequence_parallel
+                )
+            else:
+                block = self.self_attn.forward_with_indices(
+                    block,
+                    positions,
+                    QSAMetadata(
+                        query_start_loc,
+                        context_lens,
+                        state_slots,
+                        main_block_table,
+                        compressed_block_table,
+                    ),
+                    reduce=False,
+                    replicated_indexer=(
+                        sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP
+                    ),
+                    token_shard=(
+                        (sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD)
+                        or (
+                            replicated_token_shard
+                            and self.self_attn.replicated_token_shard
+                        )
+                    ),
+                    decode_token_shard=(
+                        not sequence_parallel and self.self_attn.decode_token_shard
+                    ),
+                )[0]
+                block = sp.reduce(block, sequence_parallel)
         block, residual = self.attn_hyper_connection.combine_mix(
             sp.pad_shard(block, sp_pad), residual, self.mlp_hyper_connection
         )
@@ -407,8 +512,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         ple_raw_embeddings=None,
         sequence_parallel=False,
         sp_pad=0,
+        ple_combined_raw=None,
     ):
         """``hidden`` plus this layer's per-layer embedding (unchanged without PLE).
+
+        ``ple_combined_raw``: this layer's raw n-gram rows already combined across
+        ranks (``Qwen4ExpBackbone._merged_head_embed``).
 
         ``sequence_parallel``: ``hidden`` is this TP rank's token shard, padded
         to a multiple of ``sp_pad`` rows when that is set (see ``pad_shard``).
@@ -417,14 +526,21 @@ class Qwen4ExpDecoderLayer(nn.Module):
             return hidden
         ple_slots = state_slots
         speculative = None
+        prefill_ckpt = None
         if self.pooled:
             per_layer = cast(
                 dict[str, AttentionMetadata], get_forward_context().attn_metadata
             )
             ple_metadata = per_layer[self.ple.prefix]
-            ple_slots = ple_metadata.mamba_state_indices
+            ple_slots = mamba_state_of(ple_metadata)
             assert ple_slots is not None
             speculative = ple_speculative_state(ple_metadata)
+            ckpt = getattr(ple_metadata, "mamba_prefill_ckpt", None)
+            if ckpt is not None:
+                # VLLM_TPU_MAMBA_TAIL_FOLD: this PLE group's checkpoint blocks.
+                prefill_ckpt = prefill_checkpoint_targets(
+                    ckpt, ple_metadata.block_tables, ple_slots.shape[0]
+                )
         source = hidden
         if sp_pad:
             source = sp.unpad(hidden, input_ids.shape[0] // sp.tp_world_size())
@@ -437,6 +553,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             ple_raw_embeddings,
             speculative,
             sequence_parallel=sequence_parallel,
+            prefill_ckpt=prefill_ckpt,
+            combined_raw=ple_combined_raw,
         )
         return hidden + sp.pad_shard(addend, sp_pad)
 
@@ -457,6 +575,55 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         return fused_moe_ep_supported(method) or adaptive_fused_moe_supported(method)
 
+    def _attention_in_halves(
+        self, block, positions, metadata, plan, gdn_step_metadata_cache
+    ):
+        """The attention side of a sequence-parallel layer, token half by token
+        half (VLLM_TPU_SP_MICROBATCH_OVERLAP): this rank's rows of the summed
+        attention output, as ``sp.reduce`` of the whole step's would give.
+
+        ``block`` is this rank's (unpadded) shard, rows of half A then half B
+        (``sequence_parallel``). Half ``g``'s all-gather depends only on its
+        own rows and half A's reduce-scatter only on A's output, so the
+        SparseCore can gather B and reduce A while the TensorCore computes the
+        other half. Every all-gather is issued before the first core. The
+        cores run in token order: B's GDN resumes from the state A wrote, and
+        B's queries attend the keys A wrote (``sp.MicroBatchPlan``).
+        """
+        gathered = [
+            sp.all_gather_rows(part) for part in sp.group_rows(block, plan.groups)
+        ]
+        outputs, selections = [], []
+        for g, rows in enumerate(gathered):
+            if self.layer_type == "linear_attention":
+                partial_out = self.linear_attn(
+                    rows, gdn_step_metadata_cache, sp_half=(plan, g)
+                )
+            else:
+                starts, context = plan.qsa(
+                    metadata.query_start_loc, metadata.context_lens, g
+                )
+                partial_out, selected = self.self_attn.forward_with_indices(
+                    rows,
+                    plan.positions(positions, g),
+                    QSAMetadata(
+                        starts,
+                        context,
+                        metadata.state_slots,
+                        metadata.main_block_table,
+                        metadata.compressed_block_table,
+                    ),
+                    reduce=False,
+                    replicated_indexer=envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP,
+                    token_shard=envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD,
+                    write_sink=False,
+                )
+                selections.append(selected)
+            outputs.append(sp.reduce_scatter_rows(partial_out))
+        if selections and getattr(self.self_attn, "_selection_sink", None) is not None:
+            self.self_attn.write_selection_sink(torch.cat(selections))
+        return torch.cat(outputs)
+
     def _sequence_parallel_moe(self, block, num_tokens):
         """The MoE block's output at this rank's rows of a sharded step.
 
@@ -470,10 +637,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         mlp = self.mlp
         routed = getattr(getattr(mlp, "experts", None), "routed_experts", None)
         method = getattr(routed, "quant_method", None)
+        shared_expert = getattr(mlp, "shared_expert", None)
         if (
             not envs.QWEN4_EXP_PREFILL_SP_MOE
+            or routed is None
             or getattr(method, "_adaptive_fused_moe_op_sp", None) is None
-            or getattr(mlp, "shared_expert", None) is None
+            or shared_expert is None
             or getattr(mlp, "replicate_shared_expert", True)
         ):
             return sp.shard(mlp(sp.gather(block, num_tokens)))
@@ -497,9 +666,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
         )
         local = getattr(mlp, "shared_expert_local", None)
         if local is not None:
-            # This rank's rows through the replicated shared expert: no gather, no reduce.
+            # This rank's rows through the replicated shared expert: no gather, no
+            # reduce.
             return local(block) + output
-        shared = sp.reduce(mlp.shared_expert(sp.gather(block, num_tokens)), True)
+        shared = sp.reduce(shared_expert(sp.gather(block, num_tokens)), True)
         return shared + output
 
     def forward_rows(
@@ -657,7 +827,8 @@ class Qwen4ExpBackbone(nn.Module):
     ):
         """The replicated-TP backbone; sequence-parallel steps go to
         ``Qwen4ExpBackboneSP``, a separate compiled graph over the same layers."""
-        return self._forward_impl(
+        return Qwen4ExpBackbone._forward_impl(
+            self,
             input_ids,
             positions,
             inputs_embeds,
@@ -687,11 +858,14 @@ class Qwen4ExpBackbone(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        replicated_token_shard: bool = False,
     ):
         # Resolve host lookup before any decoder work so shape arithmetic
         # stays in the main graph and model preparation precedes the D2H wait.
         ple_raw_embeddings = None
         ple_token = None
+        ple: Any = None
+        ple_inputs: Any = None
         if self.host_ple_index is not None:
             ple = cast(Qwen4ExpDecoderLayer, self.layers[self.host_ple_index]).ple
             assert ple is not None
@@ -700,6 +874,9 @@ class Qwen4ExpBackbone(nn.Module):
                 envs.VLLM_TPU_PLE_HOST_OVERLAP
                 and self.host_ple_index > self.stage.start
                 and not sequence_parallel
+                # The replicated prefill graph's token-shard all-gathers keep
+                # the single boundary too.
+                and not replicated_token_shard
             ):
                 # Start the ids' copy now; finish it just before the PLE layer
                 # so the earlier layers run on the device meanwhile. The
@@ -714,12 +891,19 @@ class Qwen4ExpBackbone(nn.Module):
                 )
         num_tokens = input_ids.shape[0]
         sp_pad = self.sp_pad_rows if sequence_parallel else 0
+        # VLLM_TPU_SP_MICROBATCH_OVERLAP: the step's token halves.
+        sp_microbatch = None
         if self.first_stage:
             hidden = (
                 self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
             )
             if sequence_parallel:
                 sp.check_divisible(num_tokens)
+                if sp.microbatch_groups() > 1:
+                    sp_microbatch = sp.MicroBatchPlan(
+                        num_tokens, sp.microbatch_groups()
+                    )
+                    sp.check_divisible(num_tokens, sp_microbatch.groups)
                 hidden = sp.shard(hidden)
             rows = hidden.shape[0]
             hidden = sp.pad_shard(hidden.repeat(1, self.hc_count), sp_pad)
@@ -729,6 +913,13 @@ class Qwen4ExpBackbone(nn.Module):
             assert intermediate_tensors is not None and not sequence_parallel
             hidden = intermediate_tensors["hidden_states"]
             rows = hidden.shape[0]
+        # One step-metadata memo for every GDN layer of this forward.
+        gdn_step_metadata_cache = (
+            GdnStepMetadataCache()
+            if envs.VLLM_TPU_GDN_HOIST_METADATA
+            or envs.VLLM_TPU_GDN_STEP_KERNEL_METADATA
+            else None
+        )
         for index in self.stage:
             layer = self.layers[index]
             if ple_token is not None and index == self.host_ple_index:
@@ -747,6 +938,9 @@ class Qwen4ExpBackbone(nn.Module):
                 ple_raw_embeddings,
                 sequence_parallel=sequence_parallel,
                 sp_pad=sp_pad,
+                gdn_step_metadata_cache=gdn_step_metadata_cache,
+                replicated_token_shard=replicated_token_shard,
+                sp_microbatch=sp_microbatch,
             )
         if not self.last_stage:
             return IntermediateTensors(
@@ -762,6 +956,72 @@ class Qwen4ExpBackbone(nn.Module):
         if self.emit_mtp_hidden:
             return mixed, hidden
         return mixed
+
+    def _megakernel_host_ple(self, input_ids, query_start_loc, ngram_context):
+        """With PLE CPU offload, the per-layer embedding rows of the megakernel programs'
+        PLE layer, looked up on the host as ``_forward_impl`` does (None with the table
+        on HBM). The kernels never read the PLE table: apply_ple runs before the head
+        group that starts at the PLE layer, so the host rows go in there."""
+        if self.host_ple_index is None:
+            return None
+        if not envs.VLLM_TPU_MK_HOST_PLE:
+            raise AssertionError("segments need the PLE table on HBM (or VLLM_TPU_MK_HOST_PLE=1)")
+        ple = cast(Qwen4ExpDecoderLayer, self.layers[self.host_ple_index]).ple
+        assert ple is not None
+        return ple.lookup_for_model(
+            PLEInputs(input_ids, query_start_loc, ngram_context), query_start_loc[-1:]
+        )
+
+    def _merged_head_embed(self, input_ids, ids64, query_start_loc, ngram_context, groups):
+        """VLLM_TPU_MK_PLE_TRIM: the token embedding and the resident PLE raw rows of
+        the head groups ``groups`` (lists of layer ids) reduced by ONE all-reduce
+        (``merged_embed_all_reduce``); ``(embedding, {layer: combined raw})``, or
+        None where the layout does not allow it (the separate collectives then run).
+        """
+        emb = self.embed_tokens
+        if (
+            not envs.VLLM_TPU_MK_PLE_TRIM
+            or emb.tp_size == 1
+            # The pinned vLLM's VocabParallelEmbedding has no `reduce_results` field
+            # (newer releases do): its forward always all-reduces, so a missing field
+            # means True. A direct read raised inside the whole-step trace (za8d).
+            or getattr(emb, "reduce_results", True) is not True
+            or getattr(emb, "parallel_group", None) is not None
+            or getattr(emb, "use_fused_embedding", False)
+            or emb.weight.dtype != torch.bfloat16
+            # Measured (v7x, 8 ranks): one merged all-reduce wins at 4 rows
+            # (19 -> 11 us) and loses from 16 rows on (36 -> 45 us).
+            or input_ids.shape[0] > 8
+        ):
+            return None
+        layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
+        tp = get_tp_group()
+        ples = [
+            (group[0], layers[group[0]].ple)
+            for group in groups
+            if layers[group[0]].ple is not None
+        ]
+        if not ples or any(
+            p.cpu_offload or p.parallel.across_dp or p.parallel.group is not tp
+            for _, p in ples
+        ):
+            return None
+        masked, mask = get_masked_input_and_mask(
+            input_ids,
+            emb.shard_indices.org_vocab_start_index,
+            emb.shard_indices.org_vocab_end_index,
+            emb.shard_indices.num_org_vocab_padding,
+            emb.shard_indices.added_vocab_start_index,
+            emb.shard_indices.added_vocab_end_index,
+        )
+        part = emb.quant_method.embedding(emb, masked.long())
+        part = part.masked_fill(mask.unsqueeze(-1), 0)
+        inputs = PLEInputs(ids64, query_start_loc, ngram_context)
+        raws = [p.lookup_partial(inputs, query_start_loc[-1:]) for _, p in ples]
+        embedding, combined = merged_embed_all_reduce(
+            part, raws, tensor_model_parallel_all_reduce
+        )
+        return embedding, {i: raw for (i, _), raw in zip(ples, combined, strict=True)}
 
     def forward_segments(
         self,
@@ -787,19 +1047,31 @@ class Qwen4ExpBackbone(nn.Module):
         projection and MoE, then the linear-attention layers until the next QSA
         layer (the last segment ends after ``l``'s MoE).
         """
-        assert self.host_ple_index is None, "segments need the PLE table on HBM"
+        ple_raw = self._megakernel_host_ple(input_ids, query_start_loc, ngram_context)
         positions64 = positions.to(torch.int64)
         ids64 = input_ids.to(torch.int64)
         # The segment megakernels walk every decoder layer in one program.
         assert len(self.stage) == len(self.layers), "megakernels need PP1"
-        hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
-        layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
-        qsa_layers = [i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"]
         head_groups = getattr(segment_call, "head_groups", None)
+        head_set = getattr(segment_call, "mk_head_set", None)
+        merged = (
+            self._merged_head_embed(
+                input_ids, ids64, query_start_loc, ngram_context,
+                [g for h, g in enumerate(head_groups) if head_set is None or h in head_set],
+            )
+            if head_groups
+            else None
+        )
+        combined = {} if merged is None else merged[1]
+        embedding = self.embed_tokens(input_ids) if merged is None else merged[0]
+        hidden = embedding.repeat(1, self.hc_count)
+        layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
+        qsa_layers = [
+            i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"
+        ]
         if head_groups:
             # Layers before the first QSA layer: one kernel call per group, the
             # per-layer embedding added before the group that starts at its layer.
-            head_set = getattr(segment_call, "mk_head_set", None)
             for h, group in enumerate(head_groups):
                 if head_set is not None and h not in head_set:
                     for stock in layers[group[0] : group[-1] + 1]:
@@ -817,7 +1089,9 @@ class Qwen4ExpBackbone(nn.Module):
                         )
                     continue
                 hidden = layers[group[0]].apply_ple(
-                    hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens
+                    hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens,
+                    ple_raw if group[0] == self.host_ple_index else None,
+                    ple_combined_raw=combined.get(group[0]),
                 )
                 hidden = segment_call.head(h, hidden)
         else:
@@ -854,7 +1128,12 @@ class Qwen4ExpBackbone(nn.Module):
         # `mk_segment_set`: only these segments run their kernel (bisection).
         mk_set = getattr(segment_call, "mk_segment_set", None)
         ends = qsa_layers[1:] + [len(layers)]
+        stop_last = bool(getattr(segment_call, "stop_before_last", False))
         for s, i in enumerate(qsa_layers):
+            if stop_last and s == len(qsa_layers) - 1:
+                # `wholecheck` cut reference: the residual entering the last QSA layer,
+                # before its cache-writing attention core.
+                return hidden
             layer = layers[i]
             if s >= n_mk or (mk_set is not None and s not in mk_set):
                 for stock in layers[i : ends[s]]:
@@ -871,13 +1150,15 @@ class Qwen4ExpBackbone(nn.Module):
                         compressed_block_table,
                     )
                 continue
-            block, _ = layer.attn_hyper_connection.mix(hidden)
+            block, _ = layer.attn_hyper_connection.mix(hidden, small_rows=True)
             if in_kernel:
-                attention = layer.self_attn.select_for_kernel(block, positions64, metadata)
+                attention = layer.self_attn.select_for_kernel(
+                    block, positions64, metadata
+                )
             else:
                 attention = layer.self_attn.attend(block, positions64, metadata)
             hidden = segment_call(s, hidden, attention)
-        mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        mixed = self.hyper_connection_mixer.mix(hidden, small_rows=True)[0]
         if self.emit_mtp_hidden:
             return mixed, hidden
         return mixed
@@ -896,40 +1177,63 @@ class Qwen4ExpBackbone(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        with_pre_last=False,
     ):
-        """``forward_segments`` with layers ``whole``'s first .. last-1 in ONE whole-step
+        """``forward_segments`` with layers ``whole``'s first .. last-1 in ONE
+        whole-step
         megakernel call (attention, indexer and cache writes in-kernel / in-call).
 
-        Head groups as in ``forward_segments``; then ``whole`` (layers 3..46); the last QSA
+        Head groups as in ``forward_segments``; then ``whole`` (layers 3..46); the last
+        QSA
         layer keeps its stock attention core and the segment kernel for the rest.
         """
-        assert self.host_ple_index is None, "segments need the PLE table on HBM"
+        ple_raw = self._megakernel_host_ple(input_ids, query_start_loc, ngram_context)
         ids64 = input_ids.to(torch.int64)
         positions64 = positions.to(torch.int64)
         # The segment megakernels walk every decoder layer in one program.
         assert len(self.stage) == len(self.layers), "megakernels need PP1"
-        hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
+        merged = self._merged_head_embed(
+            input_ids, ids64, query_start_loc, ngram_context, segment_call.head_groups
+        )
+        combined = {} if merged is None else merged[1]
+        embedding = self.embed_tokens(input_ids) if merged is None else merged[0]
+        hidden = embedding.repeat(1, self.hc_count)
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
         for h, group in enumerate(segment_call.head_groups):
             hidden = layers[group[0]].apply_ple(
-                hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens
+                hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens,
+                ple_raw if group[0] == self.host_ple_index else None,
+                ple_combined_raw=combined.get(group[0]),
             )
             hidden = segment_call.head(h, hidden)
         hidden = whole(hidden, positions, query_start_loc, context_lens)
+        if getattr(whole, "tail", False):  # VLLM_TPU_MK_WHOLE_L47: L47 ran in the call
+            assert not with_pre_last, "wholecheck needs the stock last QSA layer"
+            mixed = self.hyper_connection_mixer.mix(hidden, small_rows=True)[0]
+            if self.emit_mtp_hidden:
+                return mixed, hidden
+            return mixed
+        pre_last = hidden
         qsa_layers = [i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"]
         last = layers[qsa_layers[-1]]
         metadata = QSAMetadata(
-            query_start_loc, context_lens, state_slots, main_block_table, compressed_block_table
+            query_start_loc,
+            context_lens,
+            state_slots,
+            main_block_table,
+            compressed_block_table,
         )
         cap = getattr(segment_call, "attention_rows", 0)  # as forward_segments
         in_kernel = bool(cap) and int(hidden.shape[0]) <= cap
-        block, _ = last.attn_hyper_connection.mix(hidden)
+        block, _ = last.attn_hyper_connection.mix(hidden, small_rows=True)
         if in_kernel:
             attention = last.self_attn.select_for_kernel(block, positions64, metadata)
         else:
             attention = last.self_attn.attend(block, positions64, metadata)
         hidden = segment_call(len(qsa_layers) - 1, hidden, attention)
-        mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        mixed = self.hyper_connection_mixer.mix(hidden, small_rows=True)[0]
+        if with_pre_last:  # `wholecheck` shadow: also the residual entering the last QSA layer
+            return mixed, pre_last
         if self.emit_mtp_hidden:
             return mixed, hidden
         return mixed
@@ -1004,7 +1308,9 @@ class Qwen4ExpBackboneSP(nn.Module):
     (compilation/bucket_filter), so neither graph branches on the token count.
     """
 
-    def __init__(self, *, backbone):
+    _backbone: Any
+
+    def __init__(self, *, vllm_config: Any = None, backbone):
         super().__init__()
         object.__setattr__(self, "_backbone", backbone)
 
@@ -1045,6 +1351,63 @@ class Qwen4ExpBackboneSP(nn.Module):
         "valid_tokens": 0,
     }
 )
+class Qwen4ExpBackboneRP(nn.Module):
+    """The replicated backbone's prefill graph with the token-sharded QSA
+    indexer (VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD).
+
+    Like ``Qwen4ExpBackboneSP``: a compiled module of its own over the
+    backbone's layers, holding the backbone without registering it. The
+    router sends it the non-sequence-parallel buckets that
+    ``sequence_parallel.replicated_token_shard_eligible`` admits; the layers
+    run as in ``Qwen4ExpBackbone`` except that each QSA layer indexes this
+    rank's 1/TP of the step's rows and all-gathers the selection, so the
+    graph holds an all-gather the decode buckets must not pay.
+    """
+
+    _backbone: Any
+
+    def __init__(self, *, vllm_config: Any = None, backbone):
+        super().__init__()
+        object.__setattr__(self, "_backbone", backbone)
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        return self._backbone._forward_impl(
+            input_ids,
+            positions,
+            inputs_embeds,
+            sequence_parallel=False,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+            replicated_token_shard=True,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
 class Qwen4ExpWholeStepModel(nn.Module):
     """A third compiled program: the backbone with the whole-step megakernel.
 
@@ -1052,7 +1415,9 @@ class Qwen4ExpWholeStepModel(nn.Module):
     ``support_torch_compile`` class over the same backbone share one compiled graph.
     """
 
-    def __init__(self, *, vllm_config, prefix: str = "", backbone, segments, whole) -> None:
+    def __init__(
+        self, *, vllm_config, prefix: str = "", backbone, segments, whole
+    ) -> None:
         super().__init__()
         self.prefix = prefix
         self.backbone = backbone
@@ -1089,6 +1454,154 @@ class Qwen4ExpWholeStepModel(nn.Module):
         )
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
+class Qwen4ExpWholeStepShadowModel(nn.Module):
+    """`wholecheck`: the whole-step program built over write-free kernels, returning the
+    output and the residual entering the last QSA layer. Its own class and forward: a second
+    ``Qwen4ExpWholeStepModel`` instance would share the served program's compiled graph."""
+
+    def __init__(self, *, vllm_config, prefix: str = "", backbone, segments, whole) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.backbone = backbone
+        self.segments = segments
+        self.whole = whole
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        backbone = self.backbone
+        return type(backbone).forward_wholestep(
+            backbone,
+            input_ids,
+            positions,
+            self.segments,
+            self.whole,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+            with_pre_last=True,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
+class Qwen4ExpSegmentShadowModel(nn.Module):
+    """`check=N`: the segment program over write-free kernels. Its own class and forward: a
+    second ``Qwen4ExpSegmentModel`` instance would share the served program's compiled graph."""
+
+    def __init__(self, *, vllm_config, prefix: str = "", backbone, segments) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.backbone = backbone
+        self.segments = segments
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        shadow_backbone = self.backbone
+        return type(shadow_backbone).forward_segments(
+            shadow_backbone,
+            input_ids,
+            positions,
+            self.segments,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
+class Qwen4ExpSegmentCutModel(nn.Module):
+    """`wholecheck` reference: the segment program over write-free kernels, stopped at the
+    residual entering the last QSA layer (``segments.stop_before_last``)."""
+
+    def __init__(self, *, vllm_config, prefix: str = "", backbone, segments) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.backbone = backbone
+        self.segments = segments
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        backbone = self.backbone
+        return type(backbone).forward_segments(
+            backbone,
+            input_ids,
+            positions,
+            self.segments,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+        )
+
+
 class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
     requires_raw_input_tokens = True
     hf_to_vllm_mapper = WeightsMapper(
@@ -1111,7 +1624,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         self.config = vllm_config.model_config.hf_text_config
         self.model = Qwen4ExpBackbone(vllm_config)
         self.model_sp = None
+        self.model_rp = None
         tp_size = sp.tp_world_size()
+        sp_eligible = None
         if sp.enabled(tp_size):
             self.model_sp = Qwen4ExpBackboneSP(
                 vllm_config=vllm_config, backbone=self.model
@@ -1132,12 +1647,59 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
                 if rows > sp.ROW_ALIGNMENT:
                     self.model.sp_pad_rows = rows
                 rows = sp.ROW_ALIGNMENT
+            rows = self._sp_microbatch_rows(vllm_config, tp_size, rows)
             eligible = partial(
                 sp.sequence_parallel_eligible, tp_size=tp_size, rows=rows
             )
             # One rule for the router, both bucket filters and retraces.
             bucket_filter.assign(self.model_sp, eligible)
             bucket_filter.assign(self.model, lambda n: not eligible(n))
+            sp_eligible = eligible
+        scheduler_cfg = getattr(vllm_config, "scheduler_config", None)
+        max_num_seqs = int(getattr(scheduler_cfg, "max_num_seqs", 0) or 0)
+        rows_per_request = num_speculative_tokens(vllm_config) + 1
+        decode_req_shard = sp.decode_req_shard_enabled() and tp_size > 1
+        if (
+            sp.replicated_token_shard_eligible(1 << 30, tp_size, max_num_seqs)
+            or decode_req_shard
+        ):
+            # VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD: a third graph for
+            # the replicated prefill buckets, with the token-sharded indexer.
+            # VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD sends it the large decode /
+            # verify buckets too.
+            self.model_rp = Qwen4ExpBackboneRP(
+                vllm_config=vllm_config, backbone=self.model
+            )
+            in_sp = sp_eligible or (lambda n: False)
+
+            def in_rp(n, in_sp=in_sp):
+                return not in_sp(n) and (
+                    sp.replicated_token_shard_eligible(n, tp_size, max_num_seqs)
+                    or sp.decode_req_shard_eligible(n, tp_size, rows_per_request)
+                )
+
+            bucket_filter.assign(self.model_rp, in_rp)
+            bucket_filter.assign(
+                self.model, lambda n, in_sp=in_sp: not in_sp(n) and not in_rp(n)
+            )
+            if decode_req_shard:
+                logger.info_once(
+                    "QSA request-sharded decode indexer on "
+                    "(VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD): decode buckets of >= %d "
+                    "rows outside the SP graph, divisible by TP %d x %d rows per "
+                    "request, take the token-sharded replicated graph",
+                    envs.VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD_MIN_ROWS,
+                    tp_size,
+                    rows_per_request,
+                )
+            logger.info_once(
+                "QSA token-sharded replicated prefill graph on "
+                "(VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD): buckets of >= %d "
+                "rows outside the SP graph, divisible by TP %d, > %d rows per rank",
+                envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS,
+                tp_size,
+                max_num_seqs,
+            )
         self.lm_head = (
             ParallelLMHead(
                 self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
@@ -1146,7 +1708,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
             else PPMissingLayer()
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
-        if pipeline_size(vllm_config) > 1 and self.model_sp is not None:
+        if pipeline_size(vllm_config) > 1 and (
+            self.model_sp is not None or self.model_rp is not None
+        ):
             raise NotImplementedError("Qwen4Exp pipeline stages run TP1, without SP")
 
     def make_empty_intermediate_tensors(
@@ -1154,15 +1718,62 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
     ) -> IntermediateTensors:
         return self.model.make_empty_intermediate_tensors(batch_size, dtype, device)
 
+    @staticmethod
+    def _sp_microbatch_rows(vllm_config, tp_size, rows):
+        """Decide VLLM_TPU_SP_MICROBATCH_OVERLAP before any trace, and the row
+        multiple of a shard under it: each half of the shard stays a whole
+        number of sublane tiles. Blocks the split when the leading
+        decode/verify rows of the smallest sequence-parallel bucket may not
+        fit in its first half (GDN runs that segment in half A only)."""
+        if not envs.VLLM_TPU_SP_MICROBATCH_OVERLAP:
+            return rows
+        scheduler_cfg = getattr(vllm_config, "scheduler_config", None)
+        max_num_seqs = int(getattr(scheduler_cfg, "max_num_seqs", 0) or 0)
+        decode_rows = max_num_seqs * (num_speculative_tokens(vllm_config) + 1)
+        groups = sp.MICROBATCH_GROUPS
+        mb_rows = math.lcm(rows, groups * sp.ROW_ALIGNMENT)
+        first_half = sp.min_tokens(tp_size, mb_rows) // groups
+        if decode_rows > first_half:
+            sp.block_microbatch(
+                f"up to {decode_rows} decode/verify rows do not fit in the first "
+                f"half ({first_half} rows) of the smallest sequence-parallel bucket"
+            )
+        if not sp.microbatch_enabled():
+            return rows
+        return mb_rows
+
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
         # The route reads the padded bucket size outside both compiled graphs.
-        if self.model_sp is None:
+        if self.model_sp is None and self.model_rp is None:
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
-        serves_sp = bucket_filter.assigned(self.model_sp)
-        if serves_sp(input_ids.shape[0]):
-            with bucket_filter.serving(serves_sp), set_model_tag("backbone_sp"):
-                return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
-        with bucket_filter.serving(bucket_filter.assigned(self.model)):
+        if self.model_sp is not None:
+            serves_sp = bucket_filter.assigned(self.model_sp)
+            assert serves_sp is not None
+            if serves_sp(input_ids.shape[0]):
+                with bucket_filter.serving(serves_sp), set_model_tag("backbone_sp"):
+                    return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
+        if self.model_rp is not None:
+            serves_rp = bucket_filter.assigned(self.model_rp)
+            assert serves_rp is not None
+            if serves_rp(input_ids.shape[0]):
+                logger.info_once(
+                    "QSA token-sharded replicated prefill graph serving a %d-row "
+                    "bucket (backbone_rp)",
+                    int(input_ids.shape[0]),
+                )
+                if int(input_ids.shape[0]) < int(
+                    envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS
+                ):
+                    logger.info_once(
+                        "QSA request-sharded decode indexer serving a %d-row "
+                        "bucket (backbone_rp)",
+                        int(input_ids.shape[0]),
+                    )
+                with bucket_filter.serving(serves_rp), set_model_tag("backbone_rp"):
+                    return self.model_rp(input_ids, positions, inputs_embeds, **kwargs)
+        serves_main = bucket_filter.assigned(self.model)
+        assert serves_main is not None
+        with bucket_filter.serving(serves_main):
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
 
     def embed_input_ids(self, input_ids):
@@ -1239,19 +1850,25 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         self.pd_loaded_ple_identity = None
         self.pd_loaded_weight_records = None
         identity = LoadedWeightIdentity() if self._pd_weight_identity_enabled else None
-        if identity is not None:
-            weights = identity.observe(weights)
         parameters = dict(self.named_parameters())
         loaded, source = set(), set()
         moe_mapper = moe_weights_mapper()
-        local_mapper = WeightsMapper(
-            orig_to_new_stacked={
-                "shared_expert_local.gate_proj": ("shared_expert_local.gate_up_proj", 0),
-                "shared_expert_local.up_proj": ("shared_expert_local.gate_up_proj", 1),
-            }
-        )
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.model.layers)
         moe_loaders = {i: AutoWeightsLoader(layers[i].mlp) for i in self.model.stage}
+        local_expert_ids: set[int] | None = None
+        # The first layer this pipeline stage builds (layer 0 without PP).
+        first_layer = next(iter(self.model.stage), None)
+        if first_layer is not None:
+            routed_experts = layers[first_layer].mlp.experts.routed_experts
+            if routed_experts.use_ep:
+                local_expert_ids = {
+                    expert_id
+                    for expert_id in range(routed_experts.global_num_experts)
+                    if routed_experts._map_global_expert_id_to_local_expert_id(
+                        expert_id
+                    )
+                    >= 0
+                }
         # Exactly the Qwen3.5 checkpoint projection mapping. HC remains
         # separate checkpoint-native parameters (no NVIDIA packed-HC mapper).
         gdn_map = {
@@ -1260,58 +1877,87 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
             "in_proj_b.weight": ("in_proj_ba.weight", 0),
             "in_proj_a.weight": ("in_proj_ba.weight", 1),
         }
-        for original, weight in weights:
-            if original.startswith(("model.visual.", "mtp.")):
-                continue
-            name = next(iter(self.hf_to_vllm_mapper.apply([(original, weight)])))[0]
-            if name in source:
-                raise ValueError(f"Duplicate checkpoint tensor {original}")
-            # Another pipeline stage's layer, embedding, mixer or LM head.
-            if is_pp_missing_parameter(name, self):
-                continue
-            source.add(name)
-            if name.startswith("model.layers."):
-                _, _, idx, family, relative = name.split(".", 4)
-                layer = layers[int(idx)]
-                if family == "mlp":
-                    targets = moe_loaders[int(idx)].load_weights(
-                        iter([(relative, weight)]), mapper=moe_mapper
+
+        def _classified_weights():
+            for original, weight in weights:
+                if original.startswith(("model.visual.", "mtp.")):
+                    continue
+                mapped = self.hf_to_vllm_mapper._map_name(original)
+                name = original if mapped is None else mapped
+                if name in source:
+                    raise ValueError(f"Duplicate checkpoint tensor {original}")
+                # Another pipeline stage's layer, embedding, mixer or LM head.
+                # The PD identity still covers it: a TP1 stage's digest then
+                # matches a peer that loaded the whole model.
+                if is_pp_missing_parameter(name, self):
+                    if identity is not None:
+                        identity.observe_tensor(original, weight)
+                    continue
+                if name.startswith("model.layers."):
+                    _, _, idx, family, relative = name.split(".", 4)
+                    if family == "mlp":
+                        if local_expert_ids is not None and relative.startswith(
+                            "experts."
+                        ):
+                            expert_str = relative.split(".", 2)[1]
+                            if (
+                                expert_str.isdigit()
+                                and int(expert_str) not in local_expert_ids
+                            ):
+                                source.add(name)
+                                continue
+                        if identity is not None:
+                            identity.observe_tensor(original, weight)
+                        source.add(name)
+                        yield ("mlp", int(idx)), (original, name, relative, weight)
+                        continue
+                if identity is not None:
+                    identity.observe_tensor(original, weight)
+                source.add(name)
+                yield None, (original, name, "", weight)
+
+        for group_key, group in itertools.groupby(
+            _classified_weights(), key=lambda item: item[0]
+        ):
+            if group_key is not None:
+                _, layer_idx = group_key
+                loaded.update(
+                    load_layer_mlp_weights(
+                        moe_loaders[layer_idx],
+                        layers[layer_idx].mlp,
+                        ((relative, weight) for _, (_, _, relative, weight) in group),
+                        moe_mapper,
+                        layer_idx,
                     )
-                    loaded.update(
-                        f"model.layers.{idx}.mlp.{target}" for target in targets
-                    )
-                    if relative.startswith("shared_expert.") and hasattr(
-                        layer.mlp, "shared_expert_local"
-                    ):
-                        # The same tensor, unsliced, into the replicated copy.
-                        local = "shared_expert_local." + relative.split(".", 1)[1]
-                        targets = moe_loaders[int(idx)].load_weights(
-                            iter([(local, weight)]), mapper=local_mapper
+                )
+                continue
+
+            for _, (original, name, _, weight) in group:
+                if name.startswith("model.layers."):
+                    _, _, idx, family, relative = name.split(".", 4)
+                    layer = layers[int(idx)]
+                    if family == "ple":
+                        assert layer.ple is not None
+                        layer.ple.load_checkpoint([(relative, weight)])
+                        continue
+                    if family == "self_attn":
+                        layer.self_attn.load_weights([(relative, weight)])
+                        continue
+                    if family == "linear_attn" and relative in gdn_map:
+                        mapped, shard = gdn_map[relative]
+                        target = f"model.layers.{idx}.linear_attn.{mapped}"
+                        param = parameters[target]
+                        cast(BasevLLMParameter, param).weight_loader(
+                            param, weight, shard
                         )
-                        loaded.update(
-                            f"model.layers.{idx}.mlp.{target}" for target in targets
-                        )
-                    continue
-                if family == "ple":
-                    assert layer.ple is not None
-                    layer.ple.load_checkpoint([(relative, weight)])
-                    continue
-                if family == "self_attn":
-                    layer.self_attn.load_weights([(relative, weight)])
-                    continue
-                if family == "linear_attn" and relative in gdn_map:
-                    mapped, shard = gdn_map[relative]
-                    target = f"model.layers.{idx}.linear_attn.{mapped}"
-                    param = parameters[target]
-                    cast(BasevLLMParameter, param).weight_loader(param, weight, shard)
-                    loaded.add(target)
-                    continue
-            if name not in parameters:
-                raise ValueError(f"Unknown Qwen4Exp checkpoint tensor {original}")
-            param = parameters[name]
-            loader = getattr(param, "weight_loader", default_weight_loader)
-            loader(param, weight)
-            loaded.add(name)
+                        loaded.add(target)
+                        continue
+                if name not in parameters:
+                    raise ValueError(f"Unknown Qwen4Exp checkpoint tensor {original}")
+                param = parameters[name]
+                loader = getattr(param, "weight_loader", default_weight_loader)
+                loader(param, weight)
+                loaded.add(name)
         for i in self.model.stage:
             layer = layers[i]
             verify_moe_checkpoint(

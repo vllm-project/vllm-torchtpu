@@ -23,7 +23,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from conftest import TINY_TILES, FakeGeometry, FakeMixerBlock, MiniCtx
 from jax import lax
 from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
 from jax.experimental import pallas as pl
@@ -31,6 +30,13 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from tests.megakernel.megakernel_helpers import (
+    TINY_TILES,
+    FakeGeometry,
+    FakeMixerBlock,
+    MiniCtx,
+    _fake_ex_fixture,  # noqa: F401
+)
 from vllm_torchtpu.megakernel import blocks, comm, planner, stream, vmem
 from vllm_torchtpu.megakernel.blocks import MoEBlock
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
@@ -934,6 +940,7 @@ def test_moe_dynamic_dma_race_invariants(
             pltpu.make_async_copy(
                 W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
             ).wait()
+            moe.on_layer_start(ctx, jnp.int32(0), jnp.int32(0))
             ring.begin_layer(jnp.int32(0))
             ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
             part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))

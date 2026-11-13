@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from typing import cast
 
 import jax
@@ -31,11 +32,53 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     metadata,
     tiling,
     vmem_ldst,
+    window_tile,
 )
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput, QKVColumns
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+# Trace-time record of which opt-in raw/zero-out paths were taken (log once each).
+_RAW_PATH_LOGGED: set = set()
+
+
+def _load_raw_rows(
+    block_ref: jax.Ref,  # [rows, width] raw row block (RowBlockInBufferedRef)
+    stage_ref: jax.Ref,  # [rows + chunk, 1, padded_width] float32 scratch
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+    align: int,
+) -> jax.Array:
+    """Casts a raw row block to FP32 and gathers each sequence's rows.
+
+    Returns [seq_tile_size, chunk_size, 1, padded_width] float32, the value the
+    prepared [tokens, 1, padded_width] FP32 input's slot would hold: the
+    same cast (exact), and lanes past `width` zero like the wrapper's pad.
+    Rows past a sequence's real size hold neighbouring rows instead of
+    stale data; the kernel masks them either way.
+    """
+    rows, width = block_ref.shape
+    padded_width = stage_ref.shape[-1]
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    start = memory_ref.raw_block_start(
+        metadata_ref, p_id, rows, align, cfg.batch_size
+    )
+    if width == padded_width:
+        for col in range(0, width, num_lanes):
+            stage_ref[pl.ds(0, rows), 0, col : col + num_lanes] = block_ref[
+                :, col : col + num_lanes
+            ].astype(jnp.float32)
+    else:
+        block = block_ref[...].astype(jnp.float32)
+        stage_ref[pl.ds(0, rows), 0, :] = jnp.pad(
+            block, ((0, 0), (0, padded_width - width))
+        )
+    parts = []
+    for idx in range(cfg.seq_tile_size):
+        offset = jnp.clip(metadata_ref.p_id_to_r_base[p_id, idx] - start, 0, rows)
+        parts.append(stage_ref[pl.ds(offset, cfg.chunk_size)])
+    return jnp.stack(parts, axis=0)
 
 
 def _unpack_qkv_2d(
@@ -92,6 +135,8 @@ def inner_kernel(
     weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
+    raw_scratch_ref: dict[str, jax.Ref] | None = None,
+    window_scratch_refs: tuple[jax.Ref, ...] | None = None,
     act_scratch_ref: jax.Ref | None = None,
     *,
     cfg: config.GDNConfig,
@@ -119,6 +164,10 @@ def inner_kernel(
             convolution carry.
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
+        raw_scratch_ref: With `cfg.raw_qkv` / `cfg.raw_ba`, the VMEM stages
+            the raw row blocks are cast into.
+        window_scratch_refs: window_tile's VMEM scratches (head states,
+            conv inputs, conv weights) when `cfg.per_head_windows`.
         act_scratch_ref: With `cfg.qkv_2d`, the f32 VMEM scratch the 2D bf16
             qkv rows are cast into; it then stands in for `qkv_slot_ref`.
         cfg: GDN configuration object.
@@ -145,6 +194,52 @@ def inner_kernel(
             carry_conv_scratch_ref=carry_conv_scratch_ref,
             carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
             dense_ref=act_scratch_ref,
+            cfg=cfg,
+            p_id=p_id,
+        )
+        return
+
+    if cfg.per_head_windows:
+        # Verify-window tile, one position and one value head at a time
+        # (VLLM_TPU_GDN_V3_WINDOW_VERIFY). Raw inputs are staged to the
+        # FP32 tiles inner_kernel would read.
+        assert window_scratch_refs is not None
+        if cfg.raw_qkv:
+            assert raw_scratch_ref is not None
+            raw_scratch_ref["qkv_act"][...] = _load_raw_rows(
+                qkv_slot_ref,
+                raw_scratch_ref["qkv_stage"],
+                metadata_ref,
+                p_id,
+                cfg,
+                cfg.raw_qkv_align,
+            )
+            qkv_slot_ref = raw_scratch_ref["qkv_act"]
+        if cfg.raw_ba:
+            assert raw_scratch_ref is not None
+            for name, raw_ref in (("b", b_slot_ref), ("a", a_slot_ref)):
+                raw_scratch_ref[f"{name}_act"][...] = _load_raw_rows(
+                    raw_ref,
+                    raw_scratch_ref[f"{name}_stage"],
+                    metadata_ref,
+                    p_id,
+                    cfg,
+                    cfg.raw_ba_align,
+                )
+            b_slot_ref = raw_scratch_ref["b_act"]
+            a_slot_ref = raw_scratch_ref["a_act"]
+        window_tile.run(
+            qkv_slot_ref,
+            b_slot_ref,
+            a_slot_ref,
+            conv_state_in_slot_ref,
+            recurrent_in_slot_ref,
+            out_slot_ref,
+            conv_state_out_slot_ref,
+            recurrent_out_slot_ref,
+            metadata_ref,
+            weights_ref,
+            *window_scratch_refs,
             cfg=cfg,
             p_id=p_id,
         )
@@ -178,7 +273,35 @@ def inner_kernel(
     # single register which necessitate costly shuffling for every sliding.
     # Therefore, it is extremely important to leverage compact layout that
     # ensures 1 register only stores data from 1 row.
-    qkv_in_compact = qkv_work_ref[...].astype(jnp.float32)
+    if cfg.raw_qkv:
+        assert not cfg.qkv_2d and raw_scratch_ref is not None
+        qkv_in_compact = _load_raw_rows(
+            qkv_slot_ref,
+            raw_scratch_ref["qkv_stage"],
+            metadata_ref,
+            p_id,
+            cfg,
+            cfg.raw_qkv_align,
+        )
+        # FP32 compact scratch the activation loaders stage the conv output
+        # through (the raw block is neither FP32 nor compact).
+        qkv_work_ref = raw_scratch_ref["qkv_act"]
+    else:
+        qkv_in_compact = qkv_work_ref[...].astype(jnp.float32)
+    if cfg.raw_ba:
+        assert raw_scratch_ref is not None
+        for name, raw_ref in (("b", b_slot_ref), ("a", a_slot_ref)):
+            act_ref = raw_scratch_ref[f"{name}_act"]
+            act_ref[...] = _load_raw_rows(
+                raw_ref,
+                raw_scratch_ref[f"{name}_stage"],
+                metadata_ref,
+                p_id,
+                cfg,
+                cfg.raw_ba_align,
+            )
+        b_slot_ref = raw_scratch_ref["b_act"]
+        a_slot_ref = raw_scratch_ref["a_act"]
     qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
     # Prepare conv1d weights.
@@ -479,6 +602,9 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    raw_scratch_ref: dict[str, jax.Array] | None = None,
+    zero_out_scratch_ref: tuple[jax.Array, jax.Array] | None = None,
+    window_scratch_refs: tuple[jax.Array, ...] | None = None,
     act_scratch_ref: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
@@ -533,12 +659,18 @@ def outer_kernel(
         ),
     )
 
+    # inner_kernel's scratch arguments, in its positional order; trailing
+    # optional ones are passed only when set (window_scratch_refs and
+    # act_scratch_ref belong to disjoint BATCHED / PER_SEQ configs).
     scratches = (
         metadata_ref,
         weights_ref,
         carry_conv_scratch_ref,
         carry_recurrent_scratch_ref,
+        raw_scratch_ref,
     )
+    if window_scratch_refs is not None or act_scratch_ref is not None:
+        scratches += (window_scratch_refs,)
     if act_scratch_ref is not None:
         scratches += (act_scratch_ref,)
 
@@ -568,7 +700,192 @@ def outer_kernel(
             allocations=allocations,
         )
 
+    if not cfg.kernel_zero_out:
+        _run()
+        return
+
+    # Zero the output rows [first, batch_size) that no kernel of this call
+    # writes (bucket padding, plus the PER_SEQ rows when PER_SEQ will not
+    # run), in ZERO_OUT_ROWS-row DMAs overlapped with the pipeline. They are
+    # disjoint from the rows the pipeline writes.
+    zero_ref, zero_sem = cast(tuple[jax.Array, jax.Array], zero_out_scratch_ref)
+    zero_ref[...] = jnp.zeros(zero_ref.shape, zero_ref.dtype)
+    zero_rows = cfg.ZERO_OUT_ROWS
+    first = metadata_ref.zero_out_query_start_loc[
+        metadata_ref.zero_out_distribution[cfg.zero_out_from]
+    ]
+    num_copies = (cfg.batch_size - first + zero_rows - 1) // zero_rows
+
+    def zero_copy(i):
+        row = first + i * zero_rows
+        size = jnp.minimum(zero_rows, cfg.batch_size - row)
+        return pltpu.make_async_copy(
+            zero_ref.at[pl.ds(0, size)], out_ref.at[pl.ds(row, size)], zero_sem
+        )
+
+    @pl.loop(0, num_copies)
+    def _(i):
+        zero_copy(i).start()
+
     _run()
+
+    @pl.loop(0, num_copies)
+    def _(i):
+        zero_copy(i).wait()
+
+
+# VLLM_TPU_GDN_V3_SINGLE_LAUNCH covers decode / verify programs only. In a
+# prefill program (thousands of rows) the single-launch kernel next to a
+# SparseCore-offloaded all-gather halts the step (c32, offload on: TC halt in
+# the following adaptive_fused_moe, SC3 tile halt), while the two-call path
+# runs clean. Decode steps never carry an all-gather above the 8 MiB offload
+# threshold, and they are where the single launch saves its ~0.24 ms.
+_SINGLE_LAUNCH_MAX_ROWS = 256
+
+
+def _both_segments_kernel(
+    metadata_refs: tuple[memory_ref.MetadataRef, memory_ref.MetadataRef],
+    qkv_ref: jax.Array,
+    b_ref: jax.Array,
+    a_ref: jax.Array,
+    source_ref: jax.Array,
+    in_act_ref: jax.Array | None,
+    weights_ref: memory_ref.WeightRefs,
+    out_ref: jax.Array,
+    source_out_ref: jax.Array,
+    *,
+    cfgs: tuple[config.GDNConfig, config.GDNConfig],
+):
+    """outer_kernel of the pooled BATCHED segment, then of the PER_SEQ one,
+    on the same activations, output and state source
+    (VLLM_TPU_GDN_V3_SINGLE_LAUNCH)."""
+    for metadata_ref, cfg in zip(metadata_refs, cfgs, strict=True):
+
+        def segment(metadata_ref=metadata_ref, cfg=cfg, **scratch_refs):
+            outer_kernel(
+                metadata_ref,
+                qkv_ref,
+                b_ref,
+                a_ref,
+                source_ref,
+                None,
+                in_act_ref,
+                weights_ref,
+                out_ref,
+                source_out_ref,
+                None,
+                **scratch_refs,
+                cfg=cfg,
+            )
+
+        pl.run_scoped(segment, **cfg.get_scratch_shape_dict())
+
+
+def kernel_metadata(
+    cfg: config.GDNConfig,
+    *,
+    seq_lens: jax.Array,
+    query_start_loc: jax.Array,
+    state_indices: jax.Array,
+    read_offsets: jax.Array,
+    distribution: jax.Array,
+    ckpt_indices: jax.Array | None,
+    per_seq_inputs: tuple[jax.Array, ...] | None = None,
+    prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
+    tile_sized: bool = False,
+) -> memory_ref.MetadataRef:
+    """The scalar-prefetch metadata of one `fused_conv1d_gdn` kernel call.
+
+    `tile_sized`: PER_SEQ per-tile arrays sized by tiles, not tokens
+    (`metadata.per_seq_tile_slots`)."""
+    if cfg.mode != config.GDNMode.PER_SEQ:
+        return metadata.compute_batched_seq_metadata(
+            cfg=cfg,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            read_offsets=read_offsets,
+            end_seq=distribution[0],
+            ckpt_indices=ckpt_indices,
+        )
+    if per_seq_inputs is not None:
+        ps_qsl, ps_seq_lens, ps_state, ps_read, ps_ckpt = per_seq_inputs
+        return metadata.compute_per_seq_metadata(
+            cfg=cfg,
+            seq_lens=ps_seq_lens,
+            query_start_loc=ps_qsl,
+            state_indices=ps_state,
+            read_offsets=ps_read,
+            start_seq=distribution[0],
+            end_seq=distribution[-1],
+            ckpt_indices=ps_ckpt,
+            prerolled=True,
+            prefill_ckpt=prefill_ckpt,
+            tile_sized=tile_sized,
+        )
+    return metadata.compute_per_seq_metadata(
+        cfg=cfg,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        state_indices=state_indices,
+        read_offsets=read_offsets,
+        start_seq=distribution[0],
+        end_seq=distribution[-1],
+        ckpt_indices=ckpt_indices,
+        prefill_ckpt=prefill_ckpt,
+        tile_sized=tile_sized,
+    )
+
+
+def pack_kernel_metadata(metas: tuple[memory_ref.MetadataRef, ...]) -> jax.Array:
+    """Every leaf of `metas`, flattened in order, as one int32 vector.
+
+    All MetadataRef leaves are int32 or bool scalars / arrays, so the round
+    trip through `unpack_kernel_metadata` is exact.
+    """
+    leaves = jax.tree.leaves(metas)
+    for leaf in leaves:
+        dtype = jnp.result_type(leaf)
+        if not (jnp.issubdtype(dtype, jnp.integer) or dtype == jnp.bool_):
+            raise TypeError(f"GDN kernel metadata leaf of dtype {dtype}")
+    return jnp.concatenate([jnp.ravel(x).astype(jnp.int32) for x in leaves])
+
+
+def packed_kernel_metadata_size(
+    max_tokens: int, max_seqs: int, num_spec_tokens: int
+) -> int:
+    """Static upper bound on `pack_kernel_metadata`'s length for calls of at
+    most `max_tokens` rows and `max_seqs` sequence slots.
+
+    Depends on no traced shape, so the op returning it keeps a static output
+    shape under a dynamic token dim. Per segment: `num_tiles`, up to six
+    per-tile arrays (at most one entry per token, or per slot), the
+    per-sequence arrays incl. the checkpoint ids, and the zero-fill
+    `query_start_loc` / `distribution`.
+    """
+    per_tile = max(max_tokens, max_seqs) + 2
+    per_seq = max_seqs * (num_spec_tokens + 4) + (max_seqs + 1) + 3
+    return 2 * (1 + 6 * per_tile + per_seq)
+
+
+def unpack_kernel_metadata(
+    packed: jax.Array, abstract: tuple[memory_ref.MetadataRef, ...]
+) -> tuple[memory_ref.MetadataRef, ...]:
+    """Inverse of `pack_kernel_metadata` for metadata shaped like `abstract`
+    (`jax.eval_shape` of the same builders)."""
+    leaves, treedef = jax.tree.flatten(abstract)
+    sizes = [math.prod(leaf.shape) for leaf in leaves]
+    # A static-size vector (packed_size) carries zero padding past the end.
+    if packed.ndim != 1 or packed.shape[0] < sum(sizes):
+        raise ValueError(
+            f"packed GDN kernel metadata {packed.shape} < ({sum(sizes)},)"
+        )
+    out, offset = [], 0
+    for leaf, size in zip(leaves, sizes, strict=True):
+        part = packed[offset : offset + size].reshape(leaf.shape)
+        out.append(part.astype(leaf.dtype))
+        offset += size
+    return jax.tree.unflatten(treedef, out)
 
 
 def bf16_qkv_2d_eligible(
@@ -634,6 +951,9 @@ def bf16_qkv_2d_eligible(
         "state_plan",
         "attention_mode",
         "gate_lower_bound",
+        "prefill_ckpt_alignment",
+        "metadata_only",
+        "packed_size",
         "bf16_qkv_2d",
         "dense_conv",
     ),
@@ -673,9 +993,19 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    per_seq_inputs: tuple[jax.Array, ...] | None = None,
+    prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
+    prefill_ckpt_alignment: int = 0,
+    packed_metadata: jax.Array | None = None,
+    metadata_only: bool = False,
+    packed_size: int = 0,
     bf16_qkv_2d: bool | None = None,
     dense_conv: bool | None = None,
-) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
+) -> (
+    tuple[tuple[jax.Array, jax.Array], jax.Array]
+    | tuple[jax.Array, jax.Array]
+    | jax.Array
+):
     """Perform conv1d and gdn in a single fused kernel.
 
     Args:
@@ -745,16 +1075,41 @@ def fused_conv1d_gdn(
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
         decode_tile_size: Tile size along sequence dimension for decode sequences.
+        per_seq_inputs: Optional `metadata.roll_per_seq_inputs(query_start_loc,
+            seq_lens, state_indices, read_offsets, distribution[0],
+            ckpt_indices)` (read offsets and checkpoint ids as int32), rolled
+            once per step by the caller instead of once per layer here.
             Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences. Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
+        prefill_ckpt: Optional `(offsets, blocks)`, int32 [num_seqs] each:
+            internal prefill checkpoints (VLLM_TPU_MAMBA_TAIL_FOLD). A PER_SEQ
+            sequence also writes its state after its first `offsets[s]` query
+            tokens to checkpoint block `blocks[s]`; 0 means none. See
+            `metadata.compute_per_seq_metadata`.
+        prefill_ckpt_alignment: Every nonzero checkpoint offset is a multiple
+            of this; the PER_SEQ tile must divide it.
+        packed_metadata: Optional int32 vector from a `metadata_only` call
+            with the same shapes and step inputs (VLLM_TPU_GDN_STEP_KERNEL_METADATA):
+            both segments' kernel metadata, built once per step and shared by
+            every layer, replacing the per-call metadata computation. Pooled
+            calls running both segments only.
+        metadata_only: Return the call's packed kernel metadata (see
+            `pack_kernel_metadata`) instead of running the kernel.
+        packed_size: With `metadata_only`, zero-pad the packed vector to this
+            static length (`packed_kernel_metadata_size`), so its shape does
+            not depend on the token count of the call; 0 keeps it exact.
         bf16_qkv_2d: Let a raw bf16 [tokens, dim] qkv reach the PER_SEQ kernel
             as 2D bf16 rows, DMAed in 16-row aligned tiles and cast to f32 in
             VMEM, instead of through an f32 copy in HBM. The BATCHED kernel
             then reads f32 rows cast from the leading num_seqs * window rows
             only. Taken only where `bf16_qkv_2d_eligible` holds; otherwise,
             and for a prepared Conv1DInput, qkv is cast to f32 as before.
+            Not combined with TPU_GDN_RAW_QKV, which takes precedence.
             None reads VLLM_TPU_GDN_PREFILL_BF16_QKV_2D.
+        dense_conv: Run the PER_SEQ chunked tile over those 2D bf16 rows on
+            token-dense rows (see `_dense_inner_kernel`). None reads
+            VLLM_TPU_GDN_PREFILL_DENSE_CONV.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -762,6 +1117,11 @@ def fused_conv1d_gdn(
             source (aliased in place) instead of the state pair.
         out: Fused output tensor.
     """
+    step_metadata = packed_metadata is not None or metadata_only
+    if step_metadata and (prefill_ckpt is not None or per_seq_inputs is not None):
+        raise ValueError(
+            "packed GDN kernel metadata excludes prefill_ckpt and per_seq_inputs"
+        )
     # QKVColumns: the conv input is the first `cols` columns of a wider bf16
     # projection. The 2D PER_SEQ kernel DMAs those columns in place; every
     # other path slices them out below.
@@ -796,34 +1156,79 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    # 2D bf16 rows skip the HBM f32 cast; see `bf16_qkv_2d_eligible`.
+    # Step 1: Validate inputs.
+    is_kda = attention_mode == config.AttentionMode.KDA
+
+    # Raw inputs: the kernel DMAs tile-aligned row blocks of the unpadded 2D
+    # projection outputs and casts in VMEM (see RowBlockInBufferedRef), so
+    # the token count must be a whole number of HBM row tiles.
+    def raw_row_align(x: jax.Array) -> int:
+        itemsize = jnp.dtype(x.dtype).itemsize
+        return 8 * (4 // itemsize) if itemsize in (2, 4) else 0
+
+    def raw_eligible(x: jax.Array) -> bool:
+        align = raw_row_align(x)
+        return x.ndim == 2 and align > 0 and x.shape[0] % align == 0
+
+    # Eligibility reads only the row count and dtype, so a QKVColumns
+    # projection (sliced below unless it streams as 2D rows) qualifies alike.
+    use_raw_qkv = (
+        envs.TPU_GDN_RAW_QKV and not prepared_qkv and raw_eligible(qkv)
+    )
+    use_raw_ba = (
+        envs.TPU_GDN_RAW_BA
+        and not is_kda
+        and raw_eligible(b)
+        and raw_eligible(a)
+        and b.shape[0] == a.shape[0] == qkv.shape[0]
+        and raw_row_align(b) == raw_row_align(a)
+    )
+
+    # 2D bf16 rows skip the HBM f32 cast; see `bf16_qkv_2d_eligible`. Not
+    # combined with the raw qkv path (TPU_GDN_RAW_QKV wins when both are
+    # set), and raw b/a, which reads unpadded rows, only where the 16-row
+    # token padding of 2D rows adds none.
     if bf16_qkv_2d is None:
         bf16_qkv_2d = envs.VLLM_TPU_GDN_PREFILL_BF16_QKV_2D
     # Token-dense conv of the PER_SEQ tile over those rows; see `_dense_inner_kernel`.
     if dense_conv is None:
         dense_conv = envs.VLLM_TPU_GDN_PREFILL_DENSE_CONV
     decode_capacity = state_indices.size * (num_spec_tokens + 1)
-    qkv_2d = not prepared_qkv and bf16_qkv_2d_eligible(
-        enabled=bf16_qkv_2d,
-        shape=(qkv.shape[0], qkv_cols or qkv.shape[1]),
-        dtype=qkv.dtype,
-        decode_capacity=decode_capacity,
-        mixed_tile_size=min(mixed_tile_size, qkv.shape[0]),
-        num_lanes=pltpu.get_tpu_info().num_lanes,
-        is_kda=attention_mode == config.AttentionMode.KDA,
-        batched_only=batched_only,
+    qkv_2d = (
+        not prepared_qkv
+        and not use_raw_qkv
+        and not (use_raw_ba and qkv.shape[0] % config.QKV_2D_ROW_ALIGN)
+        and bf16_qkv_2d_eligible(
+            enabled=bf16_qkv_2d,
+            shape=(qkv.shape[0], qkv_cols or qkv.shape[1]),
+            dtype=qkv.dtype,
+            decode_capacity=decode_capacity,
+            mixed_tile_size=min(mixed_tile_size, qkv.shape[0]),
+            num_lanes=pltpu.get_tpu_info().num_lanes,
+            is_kda=is_kda,
+            batched_only=batched_only,
+        )
     )
-
     if qkv_cols is not None and not qkv_2d:
         qkv = qkv[:, :qkv_cols]
         qkv_cols = None
-    if not prepared_qkv and not qkv_2d:
-        qkv = qkv.astype(jnp.float32)
-    b = b.astype(jnp.float32)
-    a = a.astype(jnp.float32)
+    use_kernel_zero_out = (
+        envs.TPU_GDN_KERNEL_ZERO_OUT and zero_initialize_out and not prefill_only
+    )
+    if use_raw_qkv or use_raw_ba or use_kernel_zero_out:
+        _key = (use_raw_qkv, use_raw_ba, use_kernel_zero_out, qkv.shape[0])
+        if _key not in _RAW_PATH_LOGGED:
+            _RAW_PATH_LOGGED.add(_key)
+            logger.info(
+                "GDN_RAW_PATH raw_qkv=%s raw_ba=%s kernel_zero_out=%s rows=%d",
+                *_key,
+            )
 
-    # Step 1: Validate inputs.
-    is_kda = attention_mode == config.AttentionMode.KDA
+    if not prepared_qkv and not use_raw_qkv and not qkv_2d:
+        qkv = qkv.astype(jnp.float32)
+    if not use_raw_ba:
+        b = b.astype(jnp.float32)
+        a = a.astype(jnp.float32)
     if gate_lower_bound is not None:
         if not is_kda:
             raise ValueError(
@@ -873,7 +1278,7 @@ def fused_conv1d_gdn(
         )
         ckpt_indices = ckpt_indices.astype(jnp.int32)
     act_in_dtype = jnp.dtype(jnp.float32)
-    assert a.dtype == b.dtype == act_in_dtype
+    assert use_raw_ba or a.dtype == b.dtype == act_in_dtype
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     # 2D bf16 rows DMA whole 16-row tiles, so pad the tokens to one.
@@ -881,6 +1286,12 @@ def fused_conv1d_gdn(
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
+    if envs.VLLM_TPU_GDN_MIXED_TILE_POW2 and mixed_tile_size > 1:
+        # Round the static clip down to a power of two so a non-power-of-two
+        # token bucket (24, 40 rows) stays divisible by the triangular
+        # solver's block size (port of PR #2821 ece3d83b5 / PR #2438).
+        # Dynamic tiling already picks powers of two.
+        mixed_tile_size = 1 << (mixed_tile_size.bit_length() - 1)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
     window_size = num_spec_tokens + 1
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
@@ -952,15 +1363,21 @@ def fused_conv1d_gdn(
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv_padding = ((0, batch_padding_size),) + ((0, 0),) * (qkv.ndim - 1)
-    qkv = jnp.pad(qkv, qkv_padding)
-    b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
-    a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
-
-    if not qkv_2d:
-        qkv = qkv.reshape(padded_batch_size, 1, -1)
-    b = b.reshape(padded_batch_size, 1, -1)
-    a = a.reshape(padded_batch_size, 1, -1)
+    # FP32 activations need no batch padding (packing is 1); the raw path
+    # relies on that to read the unpadded inputs with batch_size rows. (2D
+    # bf16 rows pad to 16 rows; qkv_2d is not taken where that would pad
+    # raw b/a, see above.)
+    assert not (use_raw_qkv or use_raw_ba) or padded_batch_size == batch_size
+    if not use_raw_qkv:
+        qkv_padding = ((0, batch_padding_size),) + ((0, 0),) * (qkv.ndim - 1)
+        qkv = jnp.pad(qkv, qkv_padding)
+        if not qkv_2d:
+            qkv = qkv.reshape(padded_batch_size, 1, -1)
+    if not use_raw_ba:
+        b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
+        a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
+        b = b.reshape(padded_batch_size, 1, -1)
+        a = a.reshape(padded_batch_size, 1, -1)
 
     # Operand of the BATCHED kernel, which keeps f32 compact rows. Its rows
     # are decode/verify windows of at most `num_spec_tokens + 1` tokens for
@@ -992,23 +1409,47 @@ def fused_conv1d_gdn(
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
-    def call_kernel(
+    def make_cfg_and_metadata(
         in_conv_state: jax.Array,
         in_recurrent_state: jax.Array | None,
         in_act: jax.Array | None,
         mode: config.GDNMode,
-    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    ) -> tuple[config.GDNConfig, memory_ref.MetadataRef]:
         # With a state source, it rides the conv-state slot and the dense
         # recurrent-state input is absent.
+        chunk_pair = False
         if mode == config.GDNMode.PER_SEQ:
             tile_size = mixed_tile_size
             # Prefill / mixed sequences keep a single state checkpoint.
             window_size = 1
-            kernel_qkv = qkv
+            # Two chunks per grid step (chunked GDN only; chunk 1 is the
+            # token-recurrent scan).
+            if (
+                envs.TPU_GDN_CHUNK_PAIR
+                and not is_kda
+                and tile_size > 1
+                and 2 * tile_size <= padded_batch_size
+            ):
+                tile_size, chunk_pair = 2 * tile_size, True
         else:
             tile_size = decode_tile_size
             window_size = num_spec_tokens + 1
-            kernel_qkv = batched_qkv
+
+        # Rows a tile's tokens span (seq_tile_size * chunk_size, both modes).
+        tile_rows = tile_size * (1 if mode == config.GDNMode.PER_SEQ else window_size)
+
+        def raw_rows(x: jax.Array) -> int:
+            # A block starting up to align - 1 rows before the tile's first
+            # token still covers all of its tokens.
+            align = raw_row_align(x)
+            return min(pl.cdiv(tile_rows, align) * align + align, batch_size)
+
+        # The first kernel of the call zero-fills the rows no kernel writes:
+        # those past the PER_SEQ segment, or past the BATCHED one when
+        # PER_SEQ does not run.
+        zero_out_from = -1
+        if use_kernel_zero_out and in_act is None:
+            zero_out_from = 0 if batched_only else 2
 
         cfg = config.GDNConfig(
             mode=mode,
@@ -1023,9 +1464,15 @@ def fused_conv1d_gdn(
             v_head_dim=d_v,
             attention_mode=attention_mode,
             gate_lower_bound=gate_lower_bound,
+            chunk_pair=chunk_pair,
             dtypes=config.Dtypes(
-                # bf16 only for 2D rows into PER_SEQ (GDNConfig.qkv_2d).
-                act_in=jnp.dtype(kernel_qkv.dtype),
+                # bf16 only for 2D rows into PER_SEQ (GDNConfig.qkv_2d); raw
+                # qkv / b / a blocks are cast in VMEM and keep the f32 config.
+                act_in=(
+                    jnp.dtype(jnp.bfloat16)
+                    if qkv_2d and mode == config.GDNMode.PER_SEQ
+                    else act_in_dtype
+                ),
                 act_out=act_out_dtype,
                 compute=compute_precision,
                 recurrent_state=(
@@ -1036,7 +1483,30 @@ def fused_conv1d_gdn(
                 conv_state=(jnp.float32.dtype if pooled else in_conv_state.dtype),
             ),
             state_plan=state_plan,
+            raw_qkv_rows=raw_rows(qkv) if use_raw_qkv else 0,
+            raw_qkv_align=raw_row_align(qkv) if use_raw_qkv else 0,
+            raw_ba_rows=raw_rows(b) if use_raw_ba else 0,
+            raw_ba_align=raw_row_align(b) if use_raw_ba else 0,
+            zero_out_from=zero_out_from,
         )
+        if (
+            envs.VLLM_TPU_GDN_V3_WINDOW_VERIFY
+            and pooled
+            and mode == config.GDNMode.BATCHED
+            and window_size > 1
+            and not is_kda
+        ):
+            window_cfg = dataclasses.replace(cfg, window_verify=True)
+            if window_tile.supported(
+                window_cfg, in_conv_state.shape, in_conv_state.dtype
+            ):
+                cfg = window_cfg
+            else:
+                logger.info_once(
+                    "GDN window verify: pool layout not supported by "
+                    "window_tile; verify keeps inner_kernel"
+                )
+
         if (
             dense_conv
             and cfg.qkv_2d
@@ -1046,33 +1516,63 @@ def fused_conv1d_gdn(
             and cfg.seq_tile_size == 1
             and cfg.window_size == 1
             and cfg.chunk_size % 8 == 0
+            # The dense tile reads b / a slots directly and runs one chunk.
+            and not cfg.raw_ba
+            and not cfg.chunk_pair
         ):
             cfg = dataclasses.replace(cfg, dense_conv=True)
 
-        # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
-        # but will be CSEed by compiler.
-        if mode != config.GDNMode.PER_SEQ:
-            metadata_obj = metadata.compute_batched_seq_metadata(
-                cfg=cfg,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                read_offsets=read_offsets,
-                end_seq=distribution[0],
-                ckpt_indices=ckpt_indices,
-            )
-        else:
-            metadata_obj = metadata.compute_per_seq_metadata(
-                cfg=cfg,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                read_offsets=read_offsets,
-                start_seq=distribution[0],
-                end_seq=distribution[-1],
-                ckpt_indices=ckpt_indices,
-            )
+        # Step 6: Metadata preprocessing. Runs once per layer: each layer's
+        # op is its own program, so XLA does not share it across layers
+        # (pass `per_seq_inputs` to hoist the PER_SEQ roll).
+        ckpt = prefill_ckpt if mode == config.GDNMode.PER_SEQ else None
+        if ckpt is not None:
+            if prefill_ckpt_alignment <= 0:
+                raise ValueError("prefill_ckpt needs a prefill_ckpt_alignment")
+            # A checkpoint needs a query longer than one alignment unit, so
+            # smaller buckets (and their odd tile sizes) never carry one.
+            if padded_batch_size <= prefill_ckpt_alignment:
+                ckpt = None
+            elif prefill_ckpt_alignment % cfg.chunk_size:
+                raise ValueError(
+                    f"GDN prefill tile {cfg.chunk_size} does not divide the "
+                    f"checkpoint alignment {prefill_ckpt_alignment}"
+                )
+        metadata_obj = kernel_metadata(
+            cfg,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            read_offsets=read_offsets,
+            distribution=distribution,
+            ckpt_indices=ckpt_indices,
+            per_seq_inputs=per_seq_inputs,
+            prefill_ckpt=ckpt,
+            tile_sized=step_metadata,
+        )
 
+        if cfg.kernel_zero_out:
+            metadata_obj = dataclasses.replace(
+                metadata_obj,
+                zero_out_query_start_loc=query_start_loc,
+                zero_out_distribution=distribution,
+            )
+        return cfg, metadata_obj
+
+    def call_kernel(
+        in_conv_state: jax.Array,
+        in_recurrent_state: jax.Array | None,
+        in_act: jax.Array | None,
+        mode: config.GDNMode,
+        metadata_override: memory_ref.MetadataRef | None = None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        cfg, metadata_obj = make_cfg_and_metadata(
+            in_conv_state, in_recurrent_state, in_act, mode
+        )
+        if metadata_override is not None:
+            metadata_obj = metadata_override
+        # 2D bf16 rows feed PER_SEQ only; BATCHED reads the f32 leading rows.
+        kernel_qkv = qkv if mode == config.GDNMode.PER_SEQ else batched_qkv
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
         # Step 7: Handle case where write needs to be done in existing out.
@@ -1085,14 +1585,14 @@ def fused_conv1d_gdn(
             input_output_aliases[len(metadata_obj) + 4] = 2
         out_shape = cfg.get_out_shape()
 
-        if in_act is None and zero_initialize_out:
+        if in_act is None and zero_initialize_out and not cfg.kernel_zero_out:
             in_act = jnp.zeros_like(out_shape)
         if in_act is not None:
             out_shape = in_act
             in_out_spec = hbm_spec
             input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
 
-        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(cfg.window_size)
 
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
@@ -1130,15 +1630,120 @@ def fused_conv1d_gdn(
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
 
+    # VLLM_TPU_GDN_STEP_KERNEL_METADATA: both segments' metadata as one packed
+    # int32 vector, built by a `metadata_only` call once per step.
+    segment_metas = None
+    if step_metadata:
+        if not pooled or prefill_only or batched_only:
+            raise ValueError(
+                "packed GDN kernel metadata covers pooled calls running both "
+                "segments only"
+            )
+        source = cast(jax.Array, state_source)
+
+        def build(mode: config.GDNMode, in_act):
+            return make_cfg_and_metadata(source, None, in_act, mode)[1]
+
+        batched_build = functools.partial(build, config.GDNMode.BATCHED, None)
+        batched_out = make_cfg_and_metadata(
+            source, None, None, config.GDNMode.BATCHED
+        )[0].get_out_shape()
+        per_seq_build = functools.partial(build, config.GDNMode.PER_SEQ, batched_out)
+        if metadata_only:
+            packed = pack_kernel_metadata((batched_build(), per_seq_build()))
+            if packed_size:
+                if packed.size > packed_size:
+                    raise ValueError(
+                        f"GDN kernel metadata needs {packed.size} entries, "
+                        f"more than the static bound {packed_size}"
+                    )
+                packed = jnp.pad(packed, (0, packed_size - packed.size))
+            return packed
+        segment_metas = unpack_kernel_metadata(
+            cast(jax.Array, packed_metadata),
+            (jax.eval_shape(batched_build), jax.eval_shape(per_seq_build)),
+        )
+
+    if (
+        pooled
+        and envs.VLLM_TPU_GDN_V3_SINGLE_LAUNCH
+        and not (prefill_only or batched_only)
+        and batch_size <= _SINGLE_LAUNCH_MAX_ROWS
+        # One launch shares one qkv operand; 2D bf16 rows give the two
+        # segments different ones, so they keep the two-call path.
+        and not qkv_2d
+    ):
+        # Both segments in one kernel (VLLM_TPU_GDN_V3_SINGLE_LAUNCH), each
+        # with the configuration, metadata and scratch it has as its own
+        # call; the BATCHED segment owns the in-kernel zero-fill.
+        source = cast(jax.Array, state_source)
+        batched_cfg, batched_meta = make_cfg_and_metadata(
+            source, None, None, config.GDNMode.BATCHED
+        )
+        if segment_metas is not None:
+            batched_meta = segment_metas[0]
+        in_act = None
+        if zero_initialize_out and not batched_cfg.kernel_zero_out:
+            in_act = jnp.zeros_like(batched_cfg.get_out_shape())
+        # The PER_SEQ segment writes into the BATCHED segment's output, as
+        # its own call does through the aliased `in_act`.
+        per_seq_cfg, per_seq_meta = make_cfg_and_metadata(
+            source,
+            None,
+            batched_cfg.get_out_shape(),
+            config.GDNMode.PER_SEQ,
+        )
+        if segment_metas is not None:
+            per_seq_meta = segment_metas[1]
+        cfgs = (batched_cfg, per_seq_cfg)
+        metas = (batched_meta, per_seq_meta)
+        num_meta = len(batched_meta) + len(per_seq_meta)
+        aliases = {num_meta + 3: 1}
+        if in_act is not None:
+            aliases[num_meta + 4] = 0
+        out_act, out_source = pl.pallas_call(
+            functools.partial(_both_segments_kernel, cfgs=cfgs),
+            out_shape=(batched_cfg.get_out_shape(), source),
+            in_specs=(
+                jax.tree.map(lambda _: smem_spec, metas),
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                None if in_act is None else hbm_spec,
+                weights_spec,
+            ),
+            out_specs=(hbm_spec, hbm_spec),
+            input_output_aliases=aliases,
+            compiler_params=pltpu.CompilerParams(
+                disable_bounds_checks=True,
+                vmem_limit_bytes=max(
+                    config.GDNConfig.get_vmem_limit_bytes(c.window_size) for c in cfgs
+                ),
+            ),
+            name=f"{batched_cfg.get_kernel_name()}_and_per_seq",
+            metadata=batched_cfg.get_metadata(),
+        )(metas, qkv, b, a, source, in_act, weights)
+        out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+        return out_source, out_act
+
     if pooled:
         out_act, out_source = None, state_source
         if not prefill_only:
             out_act, out_source, _ = call_kernel(
-                state_source, None, None, config.GDNMode.BATCHED
+                state_source,
+                None,
+                None,
+                config.GDNMode.BATCHED,
+                None if segment_metas is None else segment_metas[0],
             )
         if not batched_only:
             out_act, out_source, _ = call_kernel(
-                out_source, None, out_act, config.GDNMode.PER_SEQ
+                out_source,
+                None,
+                out_act,
+                config.GDNMode.PER_SEQ,
+                None if segment_metas is None else segment_metas[1],
             )
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act

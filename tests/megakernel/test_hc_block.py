@@ -65,11 +65,20 @@ def _hc_params(key: jax.Array, L: int) -> dict[str, jax.Array]:
 
 
 def _hc_weight_arrays(name: str, hc: dict[str, jax.Array], R: int) -> dict[str, Any]:
-    blk = HCSublayer(MoEBlock(), inner_geometry=dataclasses.replace(qwen35.TINY, H=H_SUB),
-                     nhc=NHC, lowrank=LOWRANK)
+    blk = HCSublayer(
+        MoEBlock(),
+        inner_geometry=dataclasses.replace(qwen35.TINY, H=H_SUB),
+        nhc=NHC,
+        lowrank=LOWRANK,
+    )
     L, W = hc["down"].shape[0], NHC * H_SUB
     hdn = jnp.zeros((L, W, blk.n_down), BF16)
-    hdn = hdn.at[:, :, :LOWRANK].set(hc["down"]).at[:, :, LOWRANK : LOWRANK + NHC].set(hc["inj"])
+    hdn = (
+        hdn.at[:, :, :LOWRANK]
+        .set(hc["down"])
+        .at[:, :, LOWRANK : LOWRANK + NHC]
+        .set(hc["inj"])
+    )
     hup = jnp.zeros((L, blk.k_up, W), BF16).at[:, :LOWRANK].set(hc["up"])
 
     def rep(x):
@@ -104,8 +113,11 @@ def _torch_gated_residual(x, norm_w, down, up, inj, block, nhc, eps):
     mixed = (mixed / nhc).to(x.dtype)
     injection = 2.0 * torch.sigmoid(F.linear(norm, inj).float() / nhc)
     out = torch.cat(
-        [x.float()[..., b * h : (b + 1) * h] + block.float() * injection[..., b : b + 1]
-         for b in range(nhc)],
+        [
+            x.float()[..., b * h : (b + 1) * h]
+            + block.float() * injection[..., b : b + 1]
+            for b in range(nhc)
+        ],
         dim=-1,
     ).to(x.dtype)
     return mixed, out
@@ -123,20 +135,32 @@ def test_hc_reference_matches_torch_definition():
         return torch.from_numpy(np.asarray(a, np.float32)).to(dt)
 
     mixed_t, out_t = _torch_gated_residual(
-        tt(x), tt(hc["norm"], torch.float32), tt(hc["down"]).T.contiguous(),
-        tt(hc["up"]).T.contiguous(), tt(hc["inj"]).T.contiguous(), tt(block), NHC, 1e-6,
+        tt(x),
+        tt(hc["norm"], torch.float32),
+        tt(hc["down"]).T.contiguous(),
+        tt(hc["up"]).T.contiguous(),
+        tt(hc["inj"]).T.contiguous(),
+        tt(block),
+        NHC,
+        1e-6,
     )
     mixed, xn = hc_mix(x, hc, nhc=NHC, eps=1e-6)
     out = hc_combine(block, x, xn, hc, nhc=NHC)
-    np.testing.assert_allclose(np.asarray(mixed), mixed_t.float().numpy(), atol=1e-2, rtol=1e-2)
-    np.testing.assert_allclose(np.asarray(out), out_t.float().numpy(), atol=1e-2, rtol=1e-2)
+    np.testing.assert_allclose(
+        np.asarray(mixed), mixed_t.float().numpy(), atol=1e-2, rtol=1e-2
+    )
+    np.testing.assert_allclose(
+        np.asarray(out), out_t.float().numpy(), atol=1e-2, rtol=1e-2
+    )
     assert float(np.mean(np.asarray(mixed) == mixed_t.float().numpy())) > 0.98
 
 
 def _run_hc_moe(T: int, hc_cls: type = HCSublayer) -> tuple[np.ndarray, np.ndarray]:
     R, B = 2, 2 * T
     ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=True, tiles=_TILES)
-    gi = dataclasses.replace(qwen35.TINY, L=1, att_every=1, H=H_SUB, IS=256, moe_tp=False)
+    gi = dataclasses.replace(
+        qwen35.TINY, L=1, att_every=1, H=H_SUB, IS=256, moe_tp=False
+    )
     g = _ResidualGeometry()
     pos, _, w_l, _ = qwen35.random_logical_inputs(jax.random.PRNGKey(30), gi, ex)
     # Library test scales give a ~5e-5 MoE delta; scale the output projections so
@@ -156,17 +180,23 @@ def _run_hc_moe(T: int, hc_cls: type = HCSublayer) -> tuple[np.ndarray, np.ndarr
     assert float(jnp.std(delta)) > 0.05
 
     blk = hc_cls(moe, inner_geometry=gi, nhc=NHC, lowrank=LOWRANK, emit_residual=True)
-    spec = ModelSpec(name="hc_moe", config=g, layer_type=LayerType("hc_moe", slots=(blk,)))
+    spec = ModelSpec(
+        name="hc_moe", config=g, layer_type=LayerType("hc_moe", slots=(blk,))
+    )
     weights = {
         "router": jnp.broadcast_to(w_l["router"][None], (R, *w_l["router"].shape)),
         "sh13": w_l["sh13"],
         "sh2": w_l["sh2"],
-        "e13": tuple(w_l["e13"][:, l] for l in range(gi.L)),
-        "e2": tuple(w_l["e2"][:, l] for l in range(gi.L)),
+        "e13": tuple(w_l["e13"][:, ln] for ln in range(gi.L)),
+        "e2": tuple(w_l["e2"][:, ln] for ln in range(gi.L)),
         "es": jnp.concatenate([w_l["e13_s"], w_l["e2_s"]], axis=-1)[:, :, :, None, :],
         **_hc_weight_arrays(blk.name, hc, R),
     }
-    smalls = {k: w_l[k] for k in ("post_norm", "sh_gate", "sh13_s", "sh2_s", "ecopy") if k in w_l}
+    smalls = {
+        k: w_l[k]
+        for k in ("post_norm", "sh_gate", "sh13_s", "sh2_s", "ecopy")
+        if k in w_l
+    }
     smalls[f"{blk.name}_hcn"] = hc["norm"]
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     w_mk = pack_weights(spec, ex, weights, smalls)

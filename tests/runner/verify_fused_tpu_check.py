@@ -23,15 +23,20 @@ import torch
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     _random_rejection_sample_with_segment,
 )
+from vllm_torchtpu.runner.tpu_runner import (
+    _sample_from_logits_impl,
+    _verify_fused_compiled,
+)
 from vllm_torchtpu.spec_decode.eagle3 import (
     _async_draft_seed_compiled,
     _async_seed_inputs_compiled,
     _maybe_pad_dim0,
 )
-from vllm_torchtpu.runner.tpu_runner import (
-    _sample_from_logits_impl,
-    _verify_fused_compiled,
-)
+
+# The server raises dynamo's limits for its per-bucket graphs; do the same so
+# the sweep below (buckets x params x synthetic x candidates) can compile.
+torch._dynamo.config.recompile_limit = 1024
+torch._dynamo.config.accumulated_recompile_limit = 8192
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 
@@ -47,13 +52,43 @@ _sample_compiled = _tpu_compile(_sample_from_logits_impl)
 
 
 def separate(args):
-    (logits, bonus_idx, target_idx, temps, top_k, top_p, bonus_u, accept_u,
-     recover_u, draft, draft_lengths, seg, grp, rates, k, synthetic, cand) = args
+    (
+        logits,
+        bonus_idx,
+        target_idx,
+        temps,
+        top_k,
+        top_p,
+        bonus_u,
+        accept_u,
+        recover_u,
+        draft,
+        draft_lengths,
+        seg,
+        grp,
+        rates,
+        k,
+        synthetic,
+        cand,
+    ) = args
     bonus_logits, target_logits = _gather(logits, bonus_idx, target_idx)
     bonus = _sample_compiled(bonus_logits, temps, bonus_u, top_k, top_p, cand).view(-1)
     return _random_rejection_sample_with_segment(
-        draft, target_logits, draft_lengths, bonus, seg, grp, k,
-        temps[seg], top_k[seg], top_p[seg], accept_u, recover_u, rates, synthetic, cand,
+        draft,
+        target_logits,
+        draft_lengths,
+        bonus,
+        seg,
+        grp,
+        k,
+        temps[seg],
+        top_k[seg],
+        top_p[seg],
+        accept_u,
+        recover_u,
+        rates,
+        synthetic,
+        cand,
     )
 
 
@@ -93,9 +128,16 @@ def make_case(gen_cpu, num_reqs_real, num_reqs_pad, k, vocab, params, device):
     top_p[:num_reqs_real] = tp
     t = lambda x: x.to(device)  # noqa: E731
     return dict(
-        logits=t(logits), bonus_idx=t(bonus_idx), target_idx=t(target_idx),
-        temps=t(temps), top_k=t(top_k), top_p=t(top_p), draft=t(draft),
-        draft_lengths=t(draft_lengths), seg=t(seg), grp=t(grp),
+        logits=t(logits),
+        bonus_idx=t(bonus_idx),
+        target_idx=t(target_idx),
+        temps=t(temps),
+        top_k=t(top_k),
+        top_p=t(top_p),
+        draft=t(draft),
+        draft_lengths=t(draft_lengths),
+        seg=t(seg),
+        grp=t(grp),
     )
 
 
@@ -120,8 +162,13 @@ def check_seed(device, seeds: int) -> int:
             nt = torch.full((width, k + 1), -1, dtype=torch.int32)
             for r in range(n):
                 acc = int(torch.randint(0, int(d[r]) + 1, (1,), generator=g))
-                nt[r, : acc + 1] = torch.randint(0, 1000, (acc + 1,), generator=g, dtype=torch.int32)
-            q = torch.cumsum(torch.cat([torch.zeros(1, dtype=torch.int64), (d + 1).to(torch.int64)]), 0)
+                nt[r, : acc + 1] = torch.randint(
+                    0, 1000, (acc + 1,), generator=g, dtype=torch.int32
+                )
+            q = torch.cumsum(
+                torch.cat([torch.zeros(1, dtype=torch.int64), (d + 1).to(torch.int64)]),
+                0,
+            )
             qsl = torch.full((qsl_len,), int(q[n]), dtype=torch.int32)
             qsl[: n + 1] = q[: n + 1].to(torch.int32)
             ids = torch.randint(0, 1000, (T,), generator=g, dtype=torch.int32)
@@ -133,8 +180,11 @@ def check_seed(device, seeds: int) -> int:
             ref_ids = _seed_scatter(dv(ids), lti, nti)
             ref_g = _maybe_pad_dim0(lti[:p], p)
             out_ids, out_g, out_nrej = _async_seed_inputs_compiled(*args, dv(ids), p)
-            ok = (torch.equal(ref_ids.cpu(), out_ids.cpu()) and torch.equal(ref_g.cpu(), out_g.cpu())
-                  and torch.equal(nrej.cpu(), out_nrej.cpu()))
+            ok = (
+                torch.equal(ref_ids.cpu(), out_ids.cpu())
+                and torch.equal(ref_g.cpu(), out_g.cpu())
+                and torch.equal(nrej.cpu(), out_nrej.cpu())
+            )
             if not ok:
                 fail += 1
                 if fail <= 10:
@@ -171,17 +221,43 @@ def main() -> int:
             g1.manual_seed(1000003 * seed + 7)
             bl, tl = _gather(c["logits"], c["bonus_idx"], c["target_idx"])
             bu1 = torch.rand_like(bl, dtype=torch.float32, generator=g1)
-            au1 = torch.rand(c["draft"].shape, dtype=torch.float32, device=device, generator=g1)
+            au1 = torch.rand(
+                c["draft"].shape, dtype=torch.float32, device=device, generator=g1
+            )
             ru1 = torch.rand_like(tl, dtype=torch.float32, generator=g1)
             g2 = torch.Generator(device=device)
             g2.manual_seed(1000003 * seed + 7)
-            bu2 = torch.rand((npad, a.vocab), dtype=torch.float32, device=device, generator=g2)
+            bu2 = torch.rand(
+                (npad, a.vocab), dtype=torch.float32, device=device, generator=g2
+            )
             au2 = torch.rand((n_tok,), dtype=torch.float32, device=device, generator=g2)
-            ru2 = torch.rand((n_tok, a.vocab), dtype=torch.float32, device=device, generator=g2)
-            rng_eq = bool(torch.equal(bu1, bu2) and torch.equal(au1, au2) and torch.equal(ru1, ru2))
-            args = (c["logits"], c["bonus_idx"], c["target_idx"], c["temps"], c["top_k"],
-                    c["top_p"], bu2, au2, ru2, c["draft"], c["draft_lengths"], c["seg"],
-                    c["grp"], rates if synthetic else None, k, synthetic, cand)
+            ru2 = torch.rand(
+                (n_tok, a.vocab), dtype=torch.float32, device=device, generator=g2
+            )
+            rng_eq = bool(
+                torch.equal(bu1, bu2)
+                and torch.equal(au1, au2)
+                and torch.equal(ru1, ru2)
+            )
+            args = (
+                c["logits"],
+                c["bonus_idx"],
+                c["target_idx"],
+                c["temps"],
+                c["top_k"],
+                c["top_p"],
+                bu2,
+                au2,
+                ru2,
+                c["draft"],
+                c["draft_lengths"],
+                c["seg"],
+                c["grp"],
+                rates if synthetic else None,
+                k,
+                synthetic,
+                cand,
+            )
             ref = separate(args)
             out = _verify_fused_compiled(*args)
             eq = bool(torch.equal(ref.cpu(), out.cpu()))
@@ -189,13 +265,19 @@ def main() -> int:
             if not (eq and rng_eq):
                 fail += 1
                 if fail <= 20:
-                    print(f"MISMATCH bucket={(nr, npad)} params={params} synthetic={synthetic} "
-                          f"cand={cand} seed={seed} tokens_equal={eq} rng_equal={rng_eq}")
+                    print(
+                        f"MISMATCH bucket={(nr, npad)} params={params} "
+                        f"synthetic={synthetic} cand={cand} seed={seed} "
+                        f"tokens_equal={eq} rng_equal={rng_eq}"
+                    )
                     if not eq:
                         print("  ref", ref.cpu().tolist())
                         print("  out", out.cpu().tolist())
-        print(f"done bucket={(nr, npad)} params={params} synthetic={synthetic} cand={cand} "
-              f"checked={checked} failures={fail}", flush=True)
+        print(
+            f"done bucket={(nr, npad)} params={params} synthetic={synthetic} "
+            f"cand={cand} checked={checked} failures={fail}",
+            flush=True,
+        )
     print(f"VERIFY_FUSED_TPU_CHECK checked={checked} failures={fail}")
     seed_fail = check_seed(device, max(a.seeds // 3, 20))
     return 1 if (fail or seed_fail) else 0

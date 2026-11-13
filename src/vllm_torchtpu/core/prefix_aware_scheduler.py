@@ -28,8 +28,12 @@ Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
 """
 
+import threading
+import time
 from itertools import islice
 from typing import cast
+
+import numpy as np
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -40,7 +44,112 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu.core.tail_hold import TailHold
+
 logger = init_logger("vllm." + __name__)
+
+
+def _host_phases_every() -> int:
+    from vllm_torchtpu import envs
+
+    return envs.VLLM_TPU_HOST_PHASES
+
+
+def _prompt_ids_ndarray() -> bool:
+    from vllm_torchtpu import envs
+
+    return envs.VLLM_TPU_PROMPT_IDS_NDARRAY
+
+
+def _prompt_ids_ndarray_early() -> bool:
+    from vllm_torchtpu import envs
+
+    return envs.VLLM_TPU_PROMPT_IDS_NDARRAY and envs.VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY
+
+
+def prompt_ids_to_ndarray(request) -> None:
+    """Cache ``request.prompt_token_ids`` as an int32 ndarray on the request
+    (``_prompt_ids_np``), once; a non-list prompt is left alone."""
+    if getattr(request, "_prompt_ids_np", None) is None and isinstance(
+        request.prompt_token_ids, list
+    ):
+        request._prompt_ids_np = np.asarray(request.prompt_token_ids, np.int32)
+
+
+def patch_prompt_ids_ndarray_early() -> None:
+    """VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY: convert the prompt in the engine
+    core's input thread (``EngineCore.preprocess_add_request``), so
+    ``PrefixAwareScheduler.add_request`` on the busy loop finds it done."""
+    if not _prompt_ids_ndarray_early():
+        return
+    from vllm.v1.engine.core import EngineCore
+
+    if getattr(EngineCore.preprocess_add_request, "_tpu_prompt_np_early", False):
+        return
+    original = EngineCore.preprocess_add_request
+
+    first = [True]
+
+    def preprocess_add_request(self, request):
+        out = original(self, request)
+        try:
+            prompt_ids_to_ndarray(out[0])
+            if first[0] and getattr(out[0], "_prompt_ids_np", None) is not None:
+                first[0] = False
+                logger.info(
+                    "PROMPT_IDS_NDARRAY_EARLY first conversion: %d ids on thread %s",
+                    len(out[0]._prompt_ids_np),
+                    threading.current_thread().name,
+                )
+        except Exception:  # never fail a request over an optimization
+            logger.exception("PROMPT_IDS_NDARRAY_EARLY: conversion failed")
+        return out
+
+    preprocess_add_request._tpu_prompt_np_early = True
+    EngineCore.preprocess_add_request = preprocess_add_request
+    logger.info(
+        "PROMPT_IDS_NDARRAY_EARLY ACTIVE: prompt ids -> int32 ndarray in the "
+        "engine core input thread"
+    )
+
+
+def _tail_hold_steps() -> int:
+    from vllm_torchtpu import envs
+
+    return envs.VLLM_TPU_TAIL_HOLD_STEPS
+
+
+def _tail_hold_require_waiting() -> bool:
+    from vllm_torchtpu import envs
+
+    return envs.VLLM_TPU_TAIL_HOLD_REQUIRE_WAITING
+
+
+def _paw_skip_full() -> bool:
+    from vllm_torchtpu import envs
+
+    return envs.VLLM_TPU_PAW_SKIP_FULL
+
+
+def ship_prompt_ids_as_ndarray(scheduler_output, requests) -> None:
+    """Replace each new request's ``prompt_token_ids`` list in the scheduler
+    output by the int32 ndarray cached on its ``Request`` at add time.
+
+    Only the IPC copy changes: the engine's ``Request`` keeps its list. The
+    workers' consumers (``len``, slicing into ``token_ids_cpu``, indexing)
+    see the same values; the copy into ``token_ids_cpu`` becomes a memcpy
+    and the pickle carries one buffer instead of ~100K int objects.
+    """
+    for new_req in scheduler_output.scheduled_new_reqs:
+        ids = new_req.prompt_token_ids
+        if ids is None or not isinstance(ids, list):
+            continue
+        request = requests.get(new_req.req_id)
+        arr = getattr(request, "_prompt_ids_np", None)
+        # A streaming-input request may have grown its list since add time.
+        if arr is None or request.prompt_token_ids is not ids or len(arr) != len(ids):
+            continue
+        new_req.prompt_token_ids = arr
 
 _LOG_EVERY = 1000
 
@@ -55,12 +164,41 @@ class PrefixAwareScheduler(AsyncScheduler):
     #: Lookahead window of ready requests to evaluate for cached prefix length.
     WINDOW = 64
 
+    # VLLM_TPU_HOST_PHASES instrumentation; class defaults keep it off for
+    # instances built without __init__.
+    _hp_every = 0
+    _hp_n = 0
+    _hp_promote_ns = 0
+    _hp_sub_ns: dict[str, int] = {}
+    _prompt_np = False
+    _paw_skip_full = False
+    # VLLM_TPU_TAIL_HOLD_STEPS (core/tail_hold.py); None: off.
+    _tail_hold: TailHold | None = None
+    _tail_hold_now: frozenset[str] = frozenset()
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._paw_n = 0
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+        # VLLM_TPU_HOST_PHASES: engine-side host time per scheduler call.
+        self._hp_every = _host_phases_every()
+        self._hp_samples: dict[str, list[float]] = {}
+        self._hp_n = 0
+        self._hp_promote_ns = 0
+        self._hp_sub_ns: dict[str, int] = {}
+        if self._hp_every:
+            self._hp_install_sub_timers()
+        self._prompt_np = _prompt_ids_ndarray()
+        self._paw_skip_full = _paw_skip_full()
+        steps = _tail_hold_steps()
+        self._tail_hold = (
+            TailHold(steps, require_waiting=_tail_hold_require_waiting())
+            if steps > 0
+            else None
+        )
+        self._tail_hold_now = frozenset()
 
         logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
 
@@ -102,16 +240,196 @@ class PrefixAwareScheduler(AsyncScheduler):
         return queue
 
     def schedule(self, throttle_prefills: bool = False):
+        if self._hp_every:
+            out = self._schedule_timed(throttle_prefills)
+        else:
+            queue = getattr(self, "kv_holding_waiting", None) or getattr(
+                self, "waiting", None
+            )
+            if queue is not None:
+                self._promote_warmest(queue)
+            out = self._schedule_with_tail_hold(throttle_prefills)
+        if self._prompt_np and out.scheduled_new_reqs:
+            ship_prompt_ids_as_ndarray(out, self.requests)
+        return out
+
+    def _schedule_with_tail_hold(self, throttle_prefills: bool):
+        hold = self._tail_hold
+        if hold is None:
+            return super().schedule(throttle_prefills)
+        self._tail_hold_now = hold.plan(
+            self, seat_free=not throttle_prefills and not self._no_seat_free()
+        )
+        try:
+            return super().schedule(throttle_prefills)
+        finally:
+            self._tail_hold_now = frozenset()
+
+    def _mamba_block_aligned_split(self, request, num_new_tokens, *args, **kwargs):
+        # VLLM_TPU_TAIL_HOLD_STEPS: 0 new tokens skips a held tail this step
+        # (the running loop's "cannot be scheduled" path).
+        if self._tail_hold_now and request.request_id in self._tail_hold_now:
+            return 0
+        return super()._mamba_block_aligned_split(
+            request, num_new_tokens, *args, **kwargs
+        )
+
+    # ---- VLLM_TPU_HOST_PHASES instrumentation (off by default) ----
+    def _hp_note(self, name: str, us: float) -> None:
+        self._hp_samples.setdefault(name, []).append(us)
+
+    def _schedule_timed(self, throttle_prefills: bool):
+        t0 = time.perf_counter_ns()
+        self._hp_promote_ns = 0
+        self._hp_sub_ns = {}
         queue = getattr(self, "kv_holding_waiting", None) or getattr(
             self, "waiting", None
         )
         if queue is not None:
             self._promote_warmest(queue)
-        return super().schedule(throttle_prefills)
+        out = self._schedule_with_tail_hold(throttle_prefills)
+        sched_us = (time.perf_counter_ns() - t0) / 1e3
+        promote_us = self._hp_promote_ns / 1e3
+        kind = "admit" if out.scheduled_new_reqs else "other"
+        self._hp_note(f"{kind}.schedule", sched_us)
+        self._hp_note(f"{kind}.promote", promote_us)
+        self._hp_note(f"{kind}.waiting", float(len(queue) if queue is not None else 0))
+        if kind == "admit":
+            # Where an admitting schedule() spends its host time (see
+            # _hp_install_sub_timers); an absent call counts as 0.
+            for label in self._HP_SUB_LABELS:
+                self._hp_note(f"admit.{label}", self._hp_sub_ns.get(label, 0) / 1e3)
+        # Read by the runner's host phases (pickled with the dataclass).
+        try:
+            out._host_phases_stamp = (time.time(), promote_us, sched_us)
+        except AttributeError:  # a slotted SchedulerOutput: no stamp
+            pass
+        self._hp_tick()
+        return out
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        if not self._hp_every:
+            return super().update_from_output(scheduler_output, model_runner_output)
+        t0 = time.perf_counter_ns()
+        out = super().update_from_output(scheduler_output, model_runner_output)
+        self._hp_note("update_from_output", (time.perf_counter_ns() - t0) / 1e3)
+        return out
+
+    def add_request(self, request: Request) -> None:
+        t0 = time.perf_counter_ns() if self._hp_every else 0
+        if self._prompt_np:
+            # Once per request, at arrival; already done in the input thread
+            # under VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY.
+            prompt_ids_to_ndarray(request)
+        super().add_request(request)
+        if self._hp_every:
+            self._hp_note("add_request", (time.perf_counter_ns() - t0) / 1e3)
+
+    #: Sub-phases of an admitting schedule() under VLLM_TPU_HOST_PHASES:
+    #: ``kv_lookup`` local prefix-cache hit, ``kv_alloc`` allocate_slots,
+    #: ``conn_match`` / ``conn_alloc`` / ``conn_meta`` the KV connector's
+    #: matched-token lookup, post-allocation state and metadata build.
+    _HP_SUB_LABELS = ("kv_lookup", "kv_alloc", "conn_match", "conn_alloc", "conn_meta")
+
+    def _hp_install_sub_timers(self) -> None:
+        """Time the scheduler's calls into the KV cache manager and the KV
+        connector (instance-level wrappers; only with VLLM_TPU_HOST_PHASES).
+        A label already being timed is not timed again when nested."""
+        targets = (
+            (
+                getattr(self, "kv_cache_manager", None),
+                "get_computed_blocks",
+                "kv_lookup",
+            ),
+            (
+                getattr(self, "kv_cache_manager", None),
+                "get_computed_blocks_for_connector",
+                "kv_lookup",
+            ),
+            (getattr(self, "kv_cache_manager", None), "allocate_slots", "kv_alloc"),
+            (
+                getattr(self, "connector", None),
+                "get_num_new_matched_tokens",
+                "conn_match",
+            ),
+            (
+                getattr(self, "connector", None),
+                "update_state_after_alloc",
+                "conn_alloc",
+            ),
+            (getattr(self, "connector", None), "build_connector_meta", "conn_meta"),
+        )
+        active: set[str] = set()
+        for obj, name, label in targets:
+            fn = getattr(obj, name, None) if obj is not None else None
+            if fn is None:
+                continue
+            setattr(obj, name, self._hp_timed_call(fn, label, active))
+
+    def _hp_timed_call(self, fn, label: str, active: set[str]):
+        def timed(*args, **kwargs):
+            if label in active:
+                return fn(*args, **kwargs)
+            active.add(label)
+            t0 = time.perf_counter_ns()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                active.discard(label)
+                self._hp_sub_ns[label] = (
+                    self._hp_sub_ns.get(label, 0) + time.perf_counter_ns() - t0
+                )
+
+        return timed
+
+    def _hp_tick(self) -> None:
+        self._hp_n += 1
+        if self._hp_n % self._hp_every:
+            return
+        parts = []
+        for name, values in sorted(self._hp_samples.items()):
+            v = np.asarray(values, dtype=np.float64)
+            parts.append(
+                f"{name}={np.percentile(v, 50):.0f}/{np.percentile(v, 90):.0f}"
+                f"/{v.max():.0f}/n{len(v)}"
+            )
+        logger.info(
+            "SCHEDPHASES calls=%d host us (p50/p90/max/count) %s",
+            self._hp_n,
+            " ".join(parts),
+        )
+        self._hp_samples.clear()
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
+        if not self._hp_every:
+            return self._promote_warmest_impl(queue)
+        t0 = time.perf_counter_ns()
+        try:
+            return self._promote_warmest_impl(queue)
+        finally:
+            self._hp_promote_ns += time.perf_counter_ns() - t0
+
+    def _no_seat_free(self) -> bool:
+        """True when this schedule() cannot admit a waiting request: every
+        seat is taken at entry, and seats only free up in update_from_output
+        (a preemption inside schedule() blocks admissions for the step)."""
+        limit = getattr(self, "max_num_active_reqs", None)
+        if limit is None:
+            return False
+        running = len(self.running) + getattr(
+            self, "num_waiting_for_streaming_input", 0
+        )
+        return running >= limit
+
+    def _promote_warmest_impl(self, queue: RequestQueue) -> None:
         """Promote the request with the fewest uncached tokens within WINDOW."""
         if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
+            return
+        if self._paw_skip_full and len(queue) <= self.WINDOW and self._no_seat_free():
+            # Nothing is admitted this step, and with the whole queue inside
+            # the window the next promotion picks the same argmin regardless
+            # of the order left behind (keys include arrival_time, no ties):
+            # skip the per-request prefix-cache lookups.
             return
 
         window = list(islice(queue, self.WINDOW))

@@ -50,7 +50,9 @@ def test_compaction_matches_nonzero(mask):
     np.testing.assert_array_equal(np.asarray(actual), expected)
     # One-dimensional form, also under vmap and lax.map (the bounded path).
     for row, want in zip(mask, expected):
-        np.testing.assert_array_equal(np.asarray(_compact_active(jnp.asarray(row))), want)
+        np.testing.assert_array_equal(
+            np.asarray(_compact_active(jnp.asarray(row))), want
+        )
     np.testing.assert_array_equal(
         np.asarray(jax.vmap(_compact_active)(jnp.asarray(mask))), expected
     )

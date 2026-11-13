@@ -17,6 +17,7 @@ import math
 import os
 
 import torch
+from vllm.logger import init_logger
 from vllm.model_executor.models.config import (
     Qwen4ExpForCausalLMConfig,
     VerifyAndUpdateConfig,
@@ -27,6 +28,8 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import unified_kv_layout_enabled_for_architecture
 
 from .ple_host import host_available_memory
+
+logger = init_logger(__name__)
 
 # Model-owned prefill/decode disaggregation (see pd_connector.py).
 PD_CONNECTOR = "Qwen4ExpRaidenConnector"
@@ -375,12 +378,41 @@ def ensure_kv_group_size_rule() -> None:
     _patch_vllm_kv_cache_group_size()
 
 
+QSA_LAYER_TYPES = ("full_attention", "qwen_sparse_attention", "indexed_attention")
+
+
+def first_qsa_layer_index(layer_types) -> int:
+    """Return the 0-based index of the first QSA attention layer."""
+    return next(i for i, kind in enumerate(layer_types) if kind in QSA_LAYER_TYPES)
+
+
+def resolve_qsa_kv_cache_layout(cfg):
+    """Return the resolved KV cache layout, defaulting to QSA's BLHNC layout."""
+    from vllm.v1.kv_cache_interface import KVCacheLayout
+
+    cache_cfg = getattr(cfg, "cache_config", None)
+    get_layout = getattr(cache_cfg, "get_resolved_kv_cache_layout", None)
+    if get_layout is not None and getattr(cache_cfg, "kv_cache_layout", None):
+        return get_layout()
+    return KVCacheLayout.BLHNC
+
+
+def get_qsa_kv_cache_bytes_per_block(groups, cfg) -> int:
+    """Compute per-block KV cache bytes across 1-arg and 2-arg vLLM signatures."""
+    import inspect
+    from collections.abc import Callable
+
+    from vllm.v1.core.kv_cache_utils import _get_kv_cache_bytes_per_block
+
+    fn: Callable[..., int] = _get_kv_cache_bytes_per_block
+    if len(inspect.signature(_get_kv_cache_bytes_per_block).parameters) >= 2:
+        return fn(groups, resolve_qsa_kv_cache_layout(cfg))
+    return fn(groups)
+
+
 def native_cache_capacity(cfg, specs=None):
     """Size scheduler block IDs with the same upstream planner used at runtime."""
-    from vllm.v1.core.kv_cache_utils import (
-        _get_kv_cache_bytes_per_block,
-        get_kv_cache_groups,
-    )
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 
     ensure_kv_group_size_rule()
     specs = native_cache_specs(cfg) if specs is None else specs
@@ -392,7 +424,11 @@ def native_cache_capacity(cfg, specs=None):
     # One null block is reserved by the scheduler's pool.
     pages = 1 + cfg.scheduler_config.max_num_seqs * blocks_per_request
     bytes_per_block = _stage_bytes_per_block(cfg, groups, specs)
-    max_pool_bytes = int(os.environ.get("QWEN4_EXP_MAX_POOL_BYTES", str(48 * 1024**3)))
+    max_pool_bytes = (
+        envs.QWEN4_EXP_MAX_POOL_BYTES
+        if envs.QWEN4_EXP_MAX_POOL_BYTES is not None
+        else 48 * 1024**3
+    )
     if bytes_per_block > 0 and max_pool_bytes > 0:
         max_pages = max_pool_bytes // bytes_per_block
         from .pool_layout import merge_compressed_k_enabled, pooled_cache_specs
@@ -430,14 +466,11 @@ def _stage_bytes_per_block(cfg, groups, specs) -> int:
     block-ID count, so the busiest stage sizes it. Without a pipeline it is
     the whole model's bytes per block.
     """
-    from vllm.v1.core.kv_cache_utils import (
-        _get_kv_cache_bytes_per_block,
-        _project_kv_cache_groups_to_worker,
-    )
+    from vllm.v1.core.kv_cache_utils import _project_kv_cache_groups_to_worker
 
     size = int(getattr(cfg.parallel_config, "pipeline_parallel_size", 1) or 1)
     if size == 1:
-        return _get_kv_cache_bytes_per_block(groups)
+        return get_qsa_kv_cache_bytes_per_block(groups, cfg)
     from vllm.distributed.utils import get_pp_indices
 
     from .pp import owns_cache
@@ -452,7 +485,7 @@ def _stage_bytes_per_block(cfg, groups, specs) -> int:
             if owns_cache(name, layers, rank == size - 1)
         }
         projected = _project_kv_cache_groups_to_worker(groups, local)
-        worst = max(worst, _get_kv_cache_bytes_per_block(projected))
+        worst = max(worst, get_qsa_kv_cache_bytes_per_block(projected, cfg))
     return worst
 
 
@@ -486,6 +519,7 @@ POOL_HEADROOM_BYTES = 6 * 1024**3
 
 
 def _env_int(name: str, default: int) -> int:
+    # Only for flags not (yet) in vllm_torchtpu.envs (QWEN4_EXP_STATIC_POOL_FILL).
     value = os.environ.get(name, "").strip()
     return int(value) if value else default
 
@@ -507,7 +541,7 @@ def hbm_pool_sizing(cfg) -> bool:
             or (host_offload_enabled(cfg) and not pd_transfer_enabled(cfg))
         )
         and getattr(cfg.cache_config, "num_gpu_blocks_override", None) is None
-        and os.environ.get("QWEN4_EXP_POOL_SIZING", "hbm").strip().lower() != "static"
+        and envs.QWEN4_EXP_POOL_SIZING.lower() != "static"
     )
 
 
@@ -522,11 +556,11 @@ def pool_graph_copies() -> int:
     needed 96.89 GiB = 15.6 GiB resident + 40 + 40). Set
     ``QWEN4_EXP_POOL_GRAPH_COPIES=1`` to reserve such a copy again.
     """
-    return max(0, _env_int("QWEN4_EXP_POOL_GRAPH_COPIES", 0))
+    return max(0, envs.QWEN4_EXP_POOL_GRAPH_COPIES)
 
 
 def pool_headroom_bytes() -> int:
-    return max(0, _env_int("QWEN4_EXP_POOL_HEADROOM_BYTES", POOL_HEADROOM_BYTES))
+    return max(0, envs.QWEN4_EXP_POOL_HEADROOM_BYTES)
 
 
 def pooled_pool_blocks(
@@ -549,7 +583,7 @@ def pooled_pool_blocks(
         cap_available - headroom,
         (physical_available - headroom) // (1 + pool_graph_copies()),
     )
-    cap = _env_int("QWEN4_EXP_MAX_POOL_BYTES", 0)
+    cap = envs.QWEN4_EXP_MAX_POOL_BYTES or 0
     if cap > 0:
         budget = min(budget, cap)
     blocks = max(0, budget) // bytes_per_block
@@ -562,6 +596,66 @@ def pooled_pool_blocks(
             "max_model_len or the headroom"
         )
     return blocks
+
+
+def _apply_tail_fold_unit(
+    cache_config, mamba_block_size: int, vllm_config=None
+) -> None:
+    """VLLM_TPU_MAMBA_TAIL_FOLD_UNIT: hash prompts at the fold unit.
+
+    The fold checkpoints the Mamba state at the prompt's last unit boundary,
+    and prefix hits must land on the same boundaries, so the unit is also the
+    prefix-match unit. Set it when the launch leaves ``--prefix-match-unit``
+    unset; any other explicit value is kept and the fold's guard then turns
+    the fold off with a warning (core/mamba_tail_fold.py).
+
+    When context parallelism keeps the fold off (``vllm_config`` given and
+    ``fold_blocked_by_context_parallel``), the unit is not applied either:
+    without the fold, a sub-block hash under main-KV DCP only adds prefill
+    steps. The hash then differs from the physical Mamba block, so the
+    split runs on the 1024-token scheduler block: a hit that ends inside it
+    costs a short chunk to the next boundary, and the prompt's 256-unit
+    checkpoint costs another short chunk before the tail (c32 za9x:
+    ~1400 extra small prefill steps per 1800 s, ~4% of wall).
+    ``VLLM_TPU_MAMBA_TAIL_FOLD_UNIT_CP=1`` keeps the old behavior.
+    """
+    from vllm_torchtpu.core.mamba_tail_fold import (
+        fold_blocked_by_context_parallel,
+        fold_unit,
+    )
+
+    if (
+        not envs.VLLM_TPU_MAMBA_TAIL_FOLD
+        or envs.VLLM_TPU_MAMBA_TAIL_FOLD_UNIT <= 0
+        or not cache_config.enable_prefix_caching
+        or cache_config.mamba_cache_mode != "align"
+    ):
+        return
+    if vllm_config is not None and not envs.VLLM_TPU_MAMBA_TAIL_FOLD_UNIT_CP:
+        from .pool_layout import main_kv_dcp
+
+        reason = fold_blocked_by_context_parallel(vllm_config, main_kv_dcp())
+        if reason is not None:
+            logger.info(
+                "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT=%d not applied: the fold is off "
+                "(%s), prefix hits stay at the Mamba block (%d).",
+                envs.VLLM_TPU_MAMBA_TAIL_FOLD_UNIT,
+                reason,
+                mamba_block_size,
+            )
+            return
+    unit = fold_unit(mamba_block_size)
+    if unit == mamba_block_size:
+        return
+    if getattr(cache_config, "prefix_match_unit", None) is None:
+        cache_config.prefix_match_unit = unit
+        logger.info(
+            "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT=%d: prefix_match_unit set to %d "
+            "(Mamba block %d).",
+            unit,
+            unit,
+            mamba_block_size,
+        )
 
 
 class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
@@ -620,6 +714,9 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
                 else None
             )
             vllm_config.cache_config.mamba_page_size_padded = layout.page_bytes
+            _apply_tail_fold_unit(
+                vllm_config.cache_config, layout.block_size, vllm_config
+            )
             if hbm_pool_sizing(vllm_config):
                 # Workers report the pool budget after profiling
                 # (Qwen4ExpPooledCache.memory_budget); vLLM plans the blocks.
@@ -689,9 +786,9 @@ def validate_config(cfg):
     if (
         len(t.layer_types) != t.num_hidden_layers
         or any(
-            kind not in ("full_attention", "linear_attention") for kind in t.layer_types
+            kind not in (*QSA_LAYER_TYPES, "linear_attention") for kind in t.layer_types
         )
-        or "full_attention" not in t.layer_types
+        or not any(kind in QSA_LAYER_TYPES for kind in t.layer_types)
         or any(not 1 <= layer <= t.num_hidden_layers for layer in t.ple_layer_ids)
     ):
         raise ValueError(
@@ -708,7 +805,9 @@ def validate_config(cfg):
             "Qwen4Exp requires HC, sigmoid gates, SiLU and unbiased "
             "projections with valid top-k"
         )
-    if t.decoder_sparse_step != 1 or t.mlp_only_layers:
+    # transformers >= 5.19 ships Qwen4ExpTextConfig without these two fields
+    # (the checkpoint does not set them); their absence means MoE everywhere.
+    if getattr(t, "decoder_sparse_step", 1) != 1 or getattr(t, "mlp_only_layers", None):
         raise ValueError(
             "Qwen4Exp TPU currently requires routed MoE in every decoder layer"
         )
@@ -1070,9 +1169,9 @@ def validate_host_offload_config(cfg):
             "it cannot run with QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR > 1, where a "
             "pipeline stage maps block IDs onto fewer pages"
         )
-    cpu_bytes = extra.get("cpu_bytes_to_use")
+    raw_cpu_bytes = extra.get("cpu_bytes_to_use")
     try:
-        cpu_bytes = int(cpu_bytes)
+        cpu_bytes = 0 if raw_cpu_bytes is None else int(raw_cpu_bytes)
     except (TypeError, ValueError):
         cpu_bytes = 0
     if cpu_bytes <= 0:
@@ -1137,9 +1236,11 @@ def validate_mtp_config(cfg):
         )
     if not use_unified_pool():
         raise ValueError("Qwen4Exp MTP requires the unified block pool")
-    if int(getattr(t, "mtp_num_hidden_layers", 0) or 0) != 1 or mtp_types != [
-        "full_attention"
-    ]:
+    if (
+        int(getattr(t, "mtp_num_hidden_layers", 0) or 0) != 1
+        or len(mtp_types) != 1
+        or mtp_types[0] not in QSA_LAYER_TYPES
+    ):
         raise ValueError(
             "Qwen4Exp TPU MTP requires exactly one full-attention MTP layer"
         )

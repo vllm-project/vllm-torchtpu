@@ -25,7 +25,6 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -38,16 +37,30 @@ from ..blocks.moe.reference import moe_reference
 from ..blocks.qsa_attn.block import MICRO, reference_rows
 from ..exec_spec import ExecSpec
 from ..models.qwen38 import Qwen38Geometry
-from ..models.qwen38_inputs import _hc_params, _rep, _rows, hc_weight_arrays, random_segment_inputs
+from ..models.qwen38_inputs import (
+    _hc_params,
+    _rep,
+    _rows,
+    hc_weight_arrays,
+    random_segment_inputs,
+)
 from ..models.qwen38_pack import pack_weights
 from ..ops import BF16, F32, rmsnorm, rnd, rup
 from .qsa_full import project_reference, qkvg_width
 
-EXTRA_NAMES = ["qsa_pool", "qsa_pages", "qsa_kvlen", "qsa_off", "qsa_scales", "qsa_rope"]
+EXTRA_NAMES = [
+    "qsa_pool",
+    "qsa_pages",
+    "qsa_kvlen",
+    "qsa_off",
+    "qsa_scales",
+    "qsa_rope",
+]
 
 
 def att_layers(g: Qwen38Geometry, L: int, first: str = "gdn") -> tuple[int, ...]:
-    """Kernel layers that are QSA layers: the last of each cycle, or the first (`first="qsa"`)."""
+    """Kernel layers that are QSA layers: the last of each cycle, or the first
+    (`first="qsa"`)."""
     at = 0 if first == "qsa" else g.att_every - 1
     return tuple(j for j in range(L) if j % g.att_every == at)
 
@@ -69,14 +82,16 @@ def random_wholestep_inputs(
     first: str = "gdn",
     vocab_shard: int = 0,
 ) -> dict[str, Any]:
-    """`kv_len` per row (default: `4 * budget + 3`, the full selection plus a partial group)."""
+    """`kv_len` per row (default: `4 * budget + 3`, the full selection plus a partial
+    group)."""
     R = ex.R
     nh, hd = g.NH // R, g.HD
     inp = random_segment_inputs(
         jax.random.PRNGKey(key), g, ex, L, router_gain=router_gain, zero=zero, gain=gain
     )
     if identical_experts:
-        # Every routed expert of a layer is the same expert, so a 1-ulp router flip cannot
+        # Every routed expert of a layer is the same expert, so a 1-ulp router flip
+        # cannot
         # change the output: the strict half of the MoE parity gate.
         for n in ("e13", "e13_s", "e2", "e2_s"):
             w = inp.w_l[n]
@@ -89,14 +104,22 @@ def random_wholestep_inputs(
         "qsa_full": _hc_params(k[0], g, n_att),
         "moe": inp.hc["moe"],
     }
-    qkvg = (jax.random.normal(k[1], (R, n_att, g.H, qkvg_width(nh, hd)), F32) * 0.06).astype(BF16)
-    o_proj = (jax.random.normal(k[2], (R, n_att, nh * hd, g.H), F32) * 0.05 * gain).astype(BF16)
+    qkvg = (
+        jax.random.normal(k[1], (R, n_att, g.H, qkvg_width(nh, hd)), F32) * 0.06
+    ).astype(BF16)
+    o_proj = (
+        jax.random.normal(k[2], (R, n_att, nh * hd, g.H), F32) * 0.05 * gain
+    ).astype(BF16)
     qn = jax.random.normal(k[3], (n_att, hd), F32) * 0.05
     kn = jax.random.normal(k[4], (n_att, hd), F32) * 0.05
     rng = np.random.default_rng(key)
-    pool = jax.random.normal(k[5], (R, n_pages, 128, 1, 4, hd), F32).astype(jnp.float8_e4m3fn)
+    pool = jax.random.normal(k[5], (R, n_pages, 128, 1, 4, hd), F32).astype(
+        jnp.float8_e4m3fn
+    )
     pages = jnp.asarray(
-        rng.permutation(n_pages * 128 // MICRO)[: ex.M * (budget + 1)].reshape(ex.M, budget + 1)
+        rng.permutation(n_pages * 128 // MICRO)[: ex.M * (budget + 1)].reshape(
+            ex.M, budget + 1
+        )
         if n_pages * 128 // MICRO >= ex.M * (budget + 1)
         else rng.integers(0, n_pages * 128 // MICRO, size=(ex.M, budget + 1)),
         jnp.int32,
@@ -107,16 +130,31 @@ def random_wholestep_inputs(
     pos = rng.integers(0, 1 << 17, size=(ex.M,))
     inv = 1.0 / (g.theta ** (np.arange(0, g.ROT, 2) / g.ROT))
     ang = pos[:, None] * inv[None, :]
-    rope = np.zeros((ex.M, 128), np.float32)  # host-only (traceable under jit): ml_dtypes BF16
-    rope[:, : g.ROT // 2] = np.cos(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
-    rope[:, g.ROT // 2 : g.ROT] = np.sin(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
+    rope = np.zeros(
+        (ex.M, 128), np.float32
+    )  # host-only (traceable under jit): BF16-rounded sin/cos
+    rope[:, : g.ROT // 2] = np.cos(ang).astype(BF16).astype(np.float32)
+    rope[:, g.ROT // 2 : g.ROT] = np.sin(ang).astype(BF16).astype(np.float32)
     out = dict(
-        inp=inp, hc=hc, qkvg=qkvg, o_proj=o_proj, qn=qn, kn=kn, pool=pool, pages=pages,
-        kv_len=kvl, rope=jnp.asarray(rope), off=off, budget=budget, first=first,
+        inp=inp,
+        hc=hc,
+        qkvg=qkvg,
+        o_proj=o_proj,
+        qn=qn,
+        kn=kn,
+        pool=pool,
+        pages=pages,
+        kv_len=kvl,
+        rope=jnp.asarray(rope),
+        off=off,
+        budget=budget,
+        first=first,
     )
     if vocab_shard:  # the decode tail after the last layer (final HC mixer + lm_head)
         out["hc"]["tail"] = _hc_params(k[6], g, 1)
-        out["lm_head"] = (jax.random.normal(k[7], (R, g.H, vocab_shard), F32) * 0.05).astype(BF16)
+        out["lm_head"] = (
+            jax.random.normal(k[7], (R, g.H, vocab_shard), F32) * 0.05
+        ).astype(BF16)
     return out
 
 
@@ -138,11 +176,22 @@ def wholestep_reference(
         if j in att:
             p = {n: v[o_att] for n, v in hc["qsa_full"].items()}
             mixed, xn = hc_mix(x, p, nhc=nhc, eps=eps)
-            delta, kvs = 0.0, []
+            delta: Any = 0.0
+            kvs = []
+            ssel: dict[str, Any] = {}
+            pages: Any = None
+            kvl: Any = None
             for r in range(R):
                 q, gate, kk, vv = project_reference(
-                    mixed, d["qkvg"][r, o_att], d["qn"][o_att], d["kn"][o_att], d["rope"][:B],
-                    nh=nh, hd=hd, rot=g.ROT, eps=eps,
+                    mixed,
+                    d["qkvg"][r, o_att],
+                    d["qn"][o_att],
+                    d["kn"][o_att],
+                    d["rope"][:B],
+                    nh=nh,
+                    hd=hd,
+                    rot=g.ROT,
+                    eps=eps,
                 )
                 kvs.append(jnp.concatenate([kk, vv], axis=-1))
                 if "ring" in d:  # stage C: the step's own tokens and group
@@ -151,21 +200,41 @@ def wholestep_reference(
                         ssel = step_selection(g, ex, dl, mixed, o_att, d["budget"])
                         ssel["kr"] = {}
                         step_out.append(ssel)
-                    # The un-normed key projection of this rank's KV head (cache-writer input).
-                    y_r = rnd(jnp.dot(mixed.astype(BF16), d["qkvg"][r, o_att], preferred_element_type=F32))
+                    # The un-normed key projection of this rank's KV head (cache-writer
+                    # input).
+                    y_r = rnd(
+                        jnp.dot(
+                            mixed.astype(BF16),
+                            d["qkvg"][r, o_att],
+                            preferred_element_type=F32,
+                        )
+                    )
                     ssel["kr"][r] = y_r[:, 2 * nh * hd : (2 * nh + 1) * hd].astype(BF16)
-                    attn = step_attention(g, ex, dl, ssel["sel"], q, gate, kk, vv, r).reshape(B, -1)
+                    attn = step_attention(
+                        g, ex, dl, ssel["sel"], q, gate, kk, vv, r
+                    ).reshape(B, -1)
                     delta = delta + jnp.dot(
-                        attn.astype(BF16), d["o_proj"][r, o_att], preferred_element_type=F32
+                        attn.astype(BF16),
+                        d["o_proj"][r, o_att],
+                        preferred_element_type=F32,
                     )
                     continue
-                if "idx_w" in d and r == 0:  # replicated indexer: one selection for all ranks
+                if (
+                    "idx_w" in d and r == 0
+                ):  # replicated indexer: one selection for all ranks
                     pages, kvl = indexer_selection(g, ex, d, mixed, o_att, d["budget"])
                 elif "idx_w" not in d:
                     pages, kvl = d["pages"][:B], d["kv_len"][:B]
                 attn = reference_rows(
-                    q, gate, d["pool"][r], pages, kvl,
-                    off=d["off"], scale_k=1.0, scale_v=1.0, sm_scale=hd**-0.5,
+                    q,
+                    gate,
+                    d["pool"][r],
+                    pages,
+                    kvl,
+                    off=d["off"],
+                    scale_k=1.0,
+                    scale_v=1.0,
+                    sm_scale=hd**-0.5,
                 ).reshape(B, -1)
                 delta = delta + jnp.dot(
                     attn.astype(BF16), d["o_proj"][r, o_att], preferred_element_type=F32
@@ -187,10 +256,36 @@ def wholestep_reference(
     return x, jnp.stack(kv_new, axis=1)
 
 
+def _fp8_columns(w: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`w [..., K, N]` as FP8 E4M3 with per-column f32 scales `[..., N]` (the
+    `VLLM_TPU_MK_HC_FP8` packing)."""
+    wf = w.astype(F32)
+    amax = jnp.max(jnp.abs(wf), axis=-2)
+    scale = jnp.where(amax > 0, amax / 448.0, 1.0)
+    return (wf / scale[..., None, :]).astype(jnp.float8_e4m3fn), scale
+
+
+def _hc_fp8(weights: dict, smalls: dict, name: str, g: Any, rows: Any, L: int) -> None:
+    q, s = _fp8_columns(weights[f"{name}_hdn"])
+    weights[f"{name}_hdn"] = q
+    ups = []
+    for b in range(g.NHC):
+        qb, sb = _fp8_columns(weights[f"{name}_hup{b}"])
+        weights[f"{name}_hup{b}"] = qb
+        ups.append(sb)
+    up = jnp.concatenate(ups, axis=-1)
+    smalls[f"{name}_hdn_s"] = s if rows is None else _rows(s, rows, L)
+    smalls[f"{name}_hup_s"] = up if rows is None else _rows(up, rows, L)
+
+
 def pack_wholestep(
-    spec: Any, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int
+    spec: Any, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int,
+    hc_fp8: bool = False,
 ) -> tuple[dict, dict]:
-    """`(weights, states)` per-rank operands (leading `R`, not yet folded)."""
+    """`(weights, states)` per-rank operands (leading `R`, not yet folded).
+
+    `hc_fp8`: the layers' HC mix weights as FP8 + per-column scales (a spec built with
+    `hc_fp8=True`)."""
     R, T = ex.R, ex.T
     hc, w_l, st_l = d["hc"], d["inp"].w_l, d["inp"].st_l
     att_rows = att_layers(g, L, d.get("first", "gdn"))
@@ -208,32 +303,59 @@ def pack_wholestep(
         **hc_weight_arrays("qsa_full", hc["qsa_full"], g, R, mix=True),
         **({"idx_w": _rep(d["idx_w"], R)} if "idx_w" in d else {}),
         **(
-            {"lin_in": w_l["lin_in"], "lin_out": w_l["lin_out"],
-             **hc_weight_arrays("gdn", hc["gdn"], g, R, mix=True)}
-            if gdn_rows else {}
+            {
+                "lin_in": w_l["lin_in"],
+                "lin_out": w_l["lin_out"],
+                **hc_weight_arrays("gdn", hc["gdn"], g, R, mix=True),
+            }
+            if gdn_rows
+            else {}
         ),
         **(
-            {"lm_head": d["lm_head"][:, None], **hc_weight_arrays("tail", hc["tail"], g, R, mix=True)}
-            if "lm_head" in d else {}
+            {
+                "lm_head": d["lm_head"][:, None],
+                **hc_weight_arrays("tail", hc["tail"], g, R, mix=True),
+            }
+            if "lm_head" in d
+            else {}
         ),
     }
     smalls = {
         "moe_hcn": hc["moe"]["norm"],
-        **{k: w_l[k] for k in ("post_norm", "sh_gate", "sh13_s", "sh2_s", "ecopy") if k in w_l},
+        **{
+            k: w_l[k]
+            for k in ("post_norm", "sh_gate", "sh13_s", "sh2_s", "ecopy")
+            if k in w_l
+        },
         "qsa_full_hcn": _rows(_rep(hc["qsa_full"]["norm"], R), att_rows, L),
         "qsa_qn": _rows(_rep(d["qn"], R), att_rows, L),
         "qsa_kn": _rows(_rep(d["kn"], R), att_rows, L),
         **({"qsa_iqn": _rows(_rep(d["iqn"], R), att_rows, L)} if "iqn" in d else {}),
         **({"qsa_ikn": _rows(_rep(d["ikn"], R), att_rows, L)} if "ikn" in d else {}),
         **(
-            {"gdn_hcn": _rows(_rep(hc["gdn"]["norm"], R), gdn_rows, L),
-             "in_s": _rows(w_l["lin_in_s"], gdn_rows, L),
-             "out_s": _rows(w_l["lin_out_s"], gdn_rows, L),
-             **{k: _rows(w_l[k], gdn_rows, L) for k in ("conv", "alog", "dtb", "gnorm")}}
-            if gdn_rows else {}
+            {
+                "gdn_hcn": _rows(_rep(hc["gdn"]["norm"], R), gdn_rows, L),
+                "in_s": _rows(w_l["lin_in_s"], gdn_rows, L),
+                "out_s": _rows(w_l["lin_out_s"], gdn_rows, L),
+                **{
+                    k: _rows(w_l[k], gdn_rows, L)
+                    for k in ("conv", "alog", "dtb", "gnorm")
+                },
+            }
+            if gdn_rows
+            else {}
         ),
-        **({"tail_hcn": _rows(_rep(hc["tail"]["norm"], R), (L - 1,), L)} if "lm_head" in d else {}),
+        **(
+            {"tail_hcn": _rows(_rep(hc["tail"]["norm"], R), (L - 1,), L)}
+            if "lm_head" in d
+            else {}
+        ),
     }
+    if hc_fp8:
+        _hc_fp8(weights, smalls, "moe", g, None, L)
+        _hc_fp8(weights, smalls, "qsa_full", g, att_rows, L)
+        if gdn_rows:
+            _hc_fp8(weights, smalls, "gdn", g, gdn_rows, L)
     if not gdn_rows:
         return pack_weights(spec, ex, weights, smalls), {}
     lay = GDNBlock.lin_in_layout(g.inner(R, L), ex)
@@ -241,13 +363,16 @@ def pack_wholestep(
     conv = jnp.pad(st_l["conv"], ((0, 0),) * 3 + ((0, hr - 3), (0, 0)))
     states = {
         "conv": conv.astype(F32),
-        "rec": st_l["rec"].reshape(R, len(gdn_rows), ex.NS * lay.vh, lay.KD, lay.VD).astype(BF16),
+        "rec": st_l["rec"]
+        .reshape(R, len(gdn_rows), ex.NS * lay.vh, lay.KD, lay.VD)
+        .astype(BF16),
     }
     return pack_weights(spec, ex, weights, smalls), states
 
 
 def extras(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
-    """Kernel extra inputs in `EXTRA_NAMES` order: HBM extras folded per rank, SMEM replicated."""
+    """Kernel extra inputs in `EXTRA_NAMES` order: HBM extras folded per rank, SMEM
+    replicated."""
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     return (
         jax.device_put(kernel.fold(d["pool"]), tp),
@@ -259,28 +384,46 @@ def extras(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
     )
 
 
-# ------------------------------------------------------------ stage B (in-kernel indexer)
+# ------------------------------------------------------------ stage B (in-kernel
+# indexer)
 EXTRA_NAMES_B = [
-    "qsa_pool", "qsa_ck", "qsa_nvis", "qsa_tail", "qsa_mtab", "qsa_off", "qsa_scales", "qsa_rope"
+    "qsa_pool",
+    "qsa_ck",
+    "qsa_nvis",
+    "qsa_tail",
+    "qsa_mtab",
+    "qsa_off",
+    "qsa_scales",
+    "qsa_rope",
 ]
 
 
 def add_indexer_inputs(
-    key: int, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int, *,
-    max_groups: int, ctx: list[int],
+    key: int,
+    g: Qwen38Geometry,
+    ex: ExecSpec,
+    d: dict[str, Any],
+    L: int,
+    *,
+    max_groups: int,
+    ctx: list[int],
 ) -> dict[str, Any]:
-    """Indexer weights, per-request compressed keys, lengths and a shuffled main page table.
+    """Indexer weights, per-request compressed keys, lengths and a shuffled main page
+    table.
 
-    `ctx[q]`: tokens of request `q` before this step; its `T` verify rows see `ctx + t + 1`.
+    `ctx[q]`: tokens of request `q` before this step; its `T` verify rows see `ctx + t +
+    1`.
     Replaces `pool` with one large enough for `requests x pages_per_seq` pages.
     """
     from .indexer import IDX_DIM
 
     R, T, M = ex.R, ex.T, ex.M
     nreq = M // T
-    n_att = len(att_layers(g, L))
+    n_att = len(att_layers(g, L, d.get("first", "gdn")))
     k = jax.random.split(jax.random.PRNGKey(key + 7), 4)
-    idx_w = (jax.random.normal(k[0], (n_att, g.H, 5 * IDX_DIM), F32) * 0.06).astype(BF16)
+    idx_w = (jax.random.normal(k[0], (n_att, g.H, 5 * IDX_DIM), F32) * 0.06).astype(
+        BF16
+    )
     iqn = jax.random.normal(k[1], (n_att, IDX_DIM), F32) * 0.05
     ck = jax.random.normal(k[2], (nreq, max_groups, IDX_DIM), F32).astype(BF16)
     pps = -(-max_groups * 4 // 128)
@@ -295,22 +438,37 @@ def add_indexer_inputs(
         jnp.float8_e4m3fn
     )
     return {
-        **d, "idx_w": idx_w, "iqn": iqn, "ck": ck, "mtab": jnp.asarray(mtab), "pool": pool,
-        "nvis": jnp.asarray(lens // 4), "tail": jnp.asarray(lens % 4), "max_groups": max_groups,
+        **d,
+        "idx_w": idx_w,
+        "iqn": iqn,
+        "ck": ck,
+        "mtab": jnp.asarray(mtab),
+        "pool": pool,
+        "nvis": jnp.asarray(lens // 4),
+        "tail": jnp.asarray(lens % 4),
+        "max_groups": max_groups,
     }
 
 
 def indexer_selection(
-    g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], mixed: jax.Array, o_att: int, K: int
+    g: Qwen38Geometry,
+    ex: ExecSpec,
+    d: dict[str, Any],
+    mixed: jax.Array,
+    o_att: int,
+    K: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """Reference `(micro-page ids [B, K+1], kv_len [B])` of one QSA layer from its mixed input."""
+    """Reference `(micro-page ids [B, K+1], kv_len [B])` of one QSA layer from its mixed
+    input."""
     from .indexer import IDX_HEADS, index_query, score_rows, topk_reference
 
     B, T = ex.B, ex.T
     y = rnd(jnp.dot(mixed.astype(BF16), d["idx_w"][o_att], preferred_element_type=F32))
     rope = d["rope"][:B]
     cos, sin = rope[:, : g.ROT // 2], rope[:, g.ROT // 2 : g.ROT]
-    iq = index_query(y, d["iqn"][o_att], cos, sin, g.ROT, g.eps, jax.lax.bitcast_convert_type)
+    iq = index_query(
+        y, d["iqn"][o_att], cos, sin, g.ROT, g.eps, jax.lax.bitcast_convert_type
+    )
     pages = np.zeros((B, K + 1), np.int32)
     kvl = np.zeros((B,), np.int32)
     mtab = np.asarray(d["mtab"])
@@ -318,7 +476,9 @@ def indexer_selection(
     for q in range(-(-B // T)):
         rows = range(q * T, min(B, (q + 1) * T))
         qr = jnp.stack([jnp.stack([iq[h][r] for h in range(IDX_HEADS)]) for r in rows])
-        st = np.asarray(score_rows(qr.reshape(-1, qr.shape[-1]).astype(BF16), d["ck"][q]))
+        st = np.asarray(
+            score_rows(qr.reshape(-1, qr.shape[-1]).astype(BF16), d["ck"][q])
+        )
         for i, r in enumerate(rows):
             n, tail = int(d["nvis"][r]), int(d["tail"][r])
             sel = sorted(topk_reference(st[i], n, K))  # the kernel emits ascending ids
@@ -329,9 +489,13 @@ def indexer_selection(
     return jnp.asarray(pages), jnp.asarray(kvl)
 
 
-def add_carrier(key: int, d: dict[str, Any], width: int = 256, mp: int = 0) -> dict[str, Any]:
-    """The served compressed-key layout for `d["ck"]`: kernel pages of 32 groups, BF16 view
-    `[pages, 16, 2, width]` (row 2i+j of a page = carrier row i, half j; lanes >= 128 zero),
+def add_carrier(
+    key: int, d: dict[str, Any], width: int = 256, mp: int = 0
+) -> dict[str, Any]:
+    """The served compressed-key layout for `d["ck"]`: kernel pages of 32 groups, BF16
+    view
+    `[pages, 16, 2, width]` (row 2i+j of a page = carrier row i, half j; lanes >= 128
+    zero),
     pages shuffled per request, `cktab [requests, max_groups // 32]`."""
     ck = np.asarray(d["ck"].astype(F32))
     if ck.ndim == 4:  # per-layer keys: one carrier, pages disjoint across layers
@@ -348,7 +512,9 @@ def add_carrier(key: int, d: dict[str, Any], width: int = 256, mp: int = 0) -> d
         tab = (mtab[:, :, None] * mp + np.arange(mp)).reshape(nreq, ppr)
         n_pages = (nreq * nm + 1) * mp
     else:
-        mtab = tab = (rng.permutation(nreq * ppr) + 1).reshape(nreq, ppr).astype(np.int32)
+        mtab = tab = (
+            (rng.permutation(nreq * ppr) + 1).reshape(nreq, ppr).astype(np.int32)
+        )
         n_pages = nreq * ppr + 1
     car = np.zeros((n_pages, 32, width), np.float32)
     for q in range(nreq):
@@ -361,22 +527,28 @@ def add_carrier(key: int, d: dict[str, Any], width: int = 256, mp: int = 0) -> d
 
 
 def _flat(x: Any) -> Any:
-    """Per-layer `[n_att, requests, …]` tables -> `[n_att * requests, …]` (row = o * nreq + q)."""
+    """Per-layer `[n_att, requests, …]` tables -> `[n_att * requests, …]` (row = o *
+    nreq + q)."""
     return x.reshape(-1, *x.shape[2:])
 
 
 def extras_b(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     pl_ = d.get("per_layer")
+    car = d.get("carrier")
+    if car is not None and car.ndim == 4:  # per-rank carriers (compressed-key DCP) are [R, ...]
+        car = _rep(car, R)
     ck = (
-        (jax.device_put(kernel.fold(_rep(d["carrier"], R)), tp),
+        (jax.device_put(kernel.fold(car), tp),
          jax.device_put(_flat(d["cktab"]) if pl_ else d["cktab"], rep))
         if "carrier" in d
         else (jax.device_put(kernel.fold(_rep(d["ck"], R)), tp),)
     )
     assert not pl_ or "carrier" in d, "per-layer metadata needs the served key layout"
     mtab = _flat(d["mtab"]) if pl_ else d["mtab"]
-    if d.get("hbm_tables"):  # [layers, requests, cols] per-rank HBM extras (`hbm_tables=True`)
+    if d.get(
+        "hbm_tables"
+    ):  # [layers, requests, cols] per-rank HBM extras (`hbm_tables=True`)
         nreq = d["nvis"].shape[0] // 4
 
         def lay(t):
@@ -399,35 +571,67 @@ def extras_b(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
     )
 
 
-# ------------------------------------------------------------ stage C (the step's own tokens)
+# ------------------------------------------------------------ stage C (the step's own
+# tokens)
 EXTRA_NAMES_C = EXTRA_NAMES_B + ["qsa_ctx", "qsa_ring", "qsa_rope_ck"]
 
 
-def add_step_inputs(key: int, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int,
-                    *, ctx: list[int]) -> dict[str, Any]:
-    """Raw index-key ring, request contexts, the completed groups' RoPE rows, k-norm weights."""
+def add_step_inputs(
+    key: int,
+    g: Qwen38Geometry,
+    ex: ExecSpec,
+    d: dict[str, Any],
+    L: int,
+    *,
+    ctx: list[int],
+) -> dict[str, Any]:
+    """Raw index-key ring, request contexts, the completed groups' RoPE rows, k-norm
+    weights."""
     from .indexer import IDX_DIM
 
     nreq = ex.M // ex.T
-    n_att = len(att_layers(g, L))
+    n_att = len(att_layers(g, L, d.get("first", "gdn")))
     k = jax.random.split(jax.random.PRNGKey(key + 11), 2)
     ctxq = np.array([ctx[q % len(ctx)] for q in range(nreq)], np.int32)
     ring = jax.random.normal(k[0], (nreq, 8, IDX_DIM), F32).astype(BF16)
     ikn = jax.random.normal(k[1], (n_att, IDX_DIM), F32) * 0.05
-    j0 = ctxq + (3 - ctxq % 4) % 4 - 3  # first position of the group completed this step
+    j0 = (
+        ctxq + (3 - ctxq % 4) % 4 - 3
+    )  # first position of the group completed this step
     inv = 1.0 / (g.theta ** (np.arange(0, g.ROT, 2) / g.ROT))
     ang = j0[:, None] * inv[None, :]
     rope_ck = np.zeros((nreq, 1, 128), np.float32)
-    rope_ck[:, 0, : g.ROT // 2] = np.cos(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
-    rope_ck[:, 0, g.ROT // 2 : g.ROT] = np.sin(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
-    return {**d, "ctxq": jnp.asarray(ctxq), "ring": ring, "ikn": ikn, "rope_ck": jnp.asarray(rope_ck)}
+    rope_ck[:, 0, : g.ROT // 2] = np.cos(ang).astype(BF16).astype(np.float32)
+    rope_ck[:, 0, g.ROT // 2 : g.ROT] = np.sin(ang).astype(BF16).astype(np.float32)
+    return {
+        **d,
+        "ctxq": jnp.asarray(ctxq),
+        "ring": ring,
+        "ikn": ikn,
+        "rope_ck": jnp.asarray(rope_ck),
+    }
 
 
-def step_selection(g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], mixed: jax.Array,
-                   o_att: int, K: int) -> dict[str, Any]:
-    """Stock semantics of one QSA layer's indexer with the step's own group (rank-independent):
-    per request the completed group's key and new ring, per row the selected group set."""
-    from .indexer import IDX_DIM, IDX_HEADS, index_query, index_rope, score_rows, topk_reference
+def step_selection(
+    g: Qwen38Geometry,
+    ex: ExecSpec,
+    d: dict[str, Any],
+    mixed: jax.Array,
+    o_att: int,
+    K: int,
+) -> dict[str, Any]:
+    """Stock semantics of one QSA layer's indexer with the step's own group
+    (rank-independent):
+    per request the completed group's key and new ring, per row the selected group set.
+    """
+    from .indexer import (
+        IDX_DIM,
+        IDX_HEADS,
+        index_query,
+        index_rope,
+        score_rows,
+        topk_reference,
+    )
 
     B, T = ex.B, ex.T
     bc = jax.lax.bitcast_convert_type
@@ -436,12 +640,12 @@ def step_selection(g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], mixed: ja
     cos, sin = rope[:, : g.ROT // 2], rope[:, g.ROT // 2 : g.ROT]
     iq = index_query(y, d["iqn"][o_att], cos, sin, g.ROT, g.eps, bc)
     raw = y[:, 4 * IDX_DIM : 5 * IDX_DIM]
-    out = {"ck": {}, "ring": {}, "sel": {}, "raw": raw.astype(BF16)}
+    out: dict[str, Any] = {"ck": {}, "ring": {}, "sel": {}, "raw": raw.astype(BF16)}
     for q in range(-(-B // T)):
         c0 = int(d["ctxq"][q])
         p3 = c0 + (3 - c0 % 4) % 4
         ring = d["ring"][q].astype(F32)
-        acc = None
+        acc: Any = None
         for j in range(4):
             pos = p3 - 3 + j
             m = raw[q * T + pos - c0][None] if pos >= c0 else ring[pos % 8][None]
@@ -450,7 +654,10 @@ def step_selection(g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], mixed: ja
         rc = d["rope_ck"][q]
         ck = index_rope(
             rmsnorm(pooled, d["ikn"][o_att], g.eps, zero_centered=True),
-            rc[:, : g.ROT // 2], rc[:, g.ROT // 2 : g.ROT], g.ROT, bc,
+            rc[:, : g.ROT // 2],
+            rc[:, g.ROT // 2 : g.ROT],
+            g.ROT,
+            bc,
         ).astype(BF16)
         end = c0 + T
         new_ring = np.array(ring)
@@ -462,15 +669,27 @@ def step_selection(g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], mixed: ja
         qr = jnp.stack([jnp.stack([iq[h][r] for h in range(IDX_HEADS)]) for r in rows])
         qr = qr.reshape(-1, qr.shape[-1]).astype(BF16)
         st = np.array(score_rows(qr, d["ck"][q]))
-        st[:, p3 // 4] = np.asarray(score_rows(qr, jnp.broadcast_to(ck, (8, IDX_DIM))))[:, 0]
+        st[:, p3 // 4] = np.asarray(score_rows(qr, jnp.broadcast_to(ck, (8, IDX_DIM))))[
+            :, 0
+        ]
         for i, r in enumerate(rows):
             out["sel"][r] = set(topk_reference(st[i], int(d["nvis"][r]), K))
     return out
 
 
-def step_attention(g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], sel: dict[str, Any],
-                   q: jax.Array, gate: jax.Array, kk: jax.Array, vv: jax.Array, r_: int) -> jax.Array:
-    """Per-rank stock attention of every row: selected groups older than the step from the
+def step_attention(
+    g: Qwen38Geometry,
+    ex: ExecSpec,
+    d: dict[str, Any],
+    sel: dict[int, Any],
+    q: jax.Array,
+    gate: jax.Array,
+    kk: jax.Array,
+    vv: jax.Array,
+    r_: int,
+) -> jax.Array:
+    """Per-rank stock attention of every row: selected groups older than the step from
+    the
     pool, the step's own tokens FP8 write-then-read, the partial group causal."""
     from .qsa_full_c import quant_fp8
 
@@ -486,10 +705,12 @@ def step_attention(g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], sel: dict
         n_r = int(d["nvis"][r])
         keys, vals = [], []
 
-        def token(pos):
+        def token(pos, qi=qi, c0=c0):
             if pos >= c0:  # the step's own token: FP8 write-then-read
                 t = qi * T + pos - c0
-                return quant_fp8(kk[t].astype(F32), 1.0), quant_fp8(vv[t].astype(F32), 1.0)
+                return quant_fp8(kk[t].astype(F32), 1.0), quant_fp8(
+                    vv[t].astype(F32), 1.0
+                )
             gid = pos // 4
             mic = mtab[qi, gid // per_page] * per_page + gid % per_page
             row = pool[mic // per_page, (mic % per_page) * MICRO + pos % 4, 0]
@@ -520,26 +741,33 @@ def extras_c(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     return extras_b(d, mesh, R) + (
         jax.device_put(d["ctxq"], rep),
-        jax.device_put(kernel.fold(_rep(_flat(d["ring"]) if d.get("per_layer") else d["ring"], R)), tp),
+        jax.device_put(
+            kernel.fold(_rep(_flat(d["ring"]) if d.get("per_layer") else d["ring"], R)),
+            tp,
+        ),
         jax.device_put(kernel.fold(_rep(d["rope_ck"], R)), tp),
     )
 
 
-# ------------------------------------------------------------ per-layer metadata (served packing)
+# ------------------------------------------------------------ per-layer metadata
+# (served packing)
 PER_LAYER_KEYS = ("ck", "mtab", "ring", "off", "cktab")
 
 
 def layer_view(d: dict[str, Any], o: int) -> dict[str, Any]:
-    """`d` with the per-layer tables of QSA layer `o` (identity without per-layer metadata)."""
+    """`d` with the per-layer tables of QSA layer `o` (identity without per-layer
+    metadata)."""
     if not d.get("per_layer"):
         return d
     return {**d, **{k: d[k][o] for k in PER_LAYER_KEYS if k in d}}
 
 
-def add_per_layer(key: int, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int) -> dict:
-    """Different keys, main page tables, rings and head-pair offsets per QSA layer, pages disjoint
+def add_per_layer(
+    key: int, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int
+) -> dict:
+    """Different keys, main page tables, rings and head-pair offsets per QSA layer,
+    pages disjoint
     across layers in one pool (the served pool packs layers into shared pages)."""
-    from .indexer import IDX_DIM
 
     R, nreq = ex.R, ex.M // ex.T
     n_att = len(att_layers(g, L, d.get("first", "gdn")))
@@ -547,28 +775,50 @@ def add_per_layer(key: int, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], 
     rng = np.random.default_rng(key + 31)
     k = jax.random.split(jax.random.PRNGKey(key + 31), 3)
     ck = jnp.concatenate(
-        [d["ck"][None], jax.random.normal(k[0], (n_att - 1,) + d["ck"].shape, F32).astype(BF16)]
+        [
+            d["ck"][None],
+            jax.random.normal(k[0], (n_att - 1,) + d["ck"].shape, F32).astype(BF16),
+        ]
     )
-    ring = jnp.concatenate(
-        [d["ring"][None],
-         jax.random.normal(k[1], (n_att - 1,) + d["ring"].shape, F32).astype(BF16)]
-    ) if "ring" in d else None
-    mtab = (rng.permutation(n_att * nreq * pps) + 1).reshape(n_att, nreq, pps).astype(np.int32)
+    ring = (
+        jnp.concatenate(
+            [
+                d["ring"][None],
+                jax.random.normal(k[1], (n_att - 1,) + d["ring"].shape, F32).astype(
+                    BF16
+                ),
+            ]
+        )
+        if "ring" in d
+        else None
+    )
+    mtab = (
+        (rng.permutation(n_att * nreq * pps) + 1)
+        .reshape(n_att, nreq, pps)
+        .astype(np.int32)
+    )
     pool = jax.random.normal(
         k[2], (R, n_att * nreq * pps + 1, 128, 1, 4, g.HD), F32
     ).astype(jnp.float8_e4m3fn)
-    out = {**d, "per_layer": True, "ck": ck, "mtab": jnp.asarray(mtab), "pool": pool,
-           "off": jnp.asarray([(o + 1) % 2 for o in range(n_att)], jnp.int32)}
+    out = {
+        **d,
+        "per_layer": True,
+        "ck": ck,
+        "mtab": jnp.asarray(mtab),
+        "pool": pool,
+        "off": jnp.asarray([(o + 1) % 2 for o in range(n_att)], jnp.int32),
+    }
     if ring is not None:
         out["ring"] = ring
     return out
 
 
 def fp8_carrier(carrier_bf16: jax.Array) -> jax.Array:
-    """The served FP8 carrier `[pages, 16, 4, W]` whose BF16 ref-bitcast view is `carrier_bf16
-    [pages, 16, 2, W]` — written through the same ref bitcast the readers use (TPU only)."""
+    """The served FP8 carrier `[pages, 16, 4, W]` whose BF16 ref-bitcast view is
+    `carrier_bf16
+    [pages, 16, 2, W]` — written through the same ref bitcast the readers use (TPU
+    only)."""
     from jax.experimental import pallas as pl
-    from jax.experimental.pallas import tpu as pltpu
 
     P_, _, _, W = carrier_bf16.shape
 
@@ -585,8 +835,10 @@ def fp8_carrier(carrier_bf16: jax.Array) -> jax.Array:
 
 
 def repeat_layers(d: dict[str, Any], Lg: int, L: int) -> dict[str, Any]:
-    """Timing inputs for `L` layers from `Lg`-layer random ones (`L % Lg == 0`): every per-layer
-    stack (weights, HC params, states, norms) repeated `L // Lg` times. Numerics are meaningless
+    """Timing inputs for `L` layers from `Lg`-layer random ones (`L % Lg == 0`): every
+    per-layer
+    stack (weights, HC params, states, norms) repeated `L // Lg` times. Numerics are
+    meaningless
     across the copies; the work and the bytes per layer are the real ones."""
     assert L % Lg == 0, (L, Lg)
     n = L // Lg
@@ -598,7 +850,8 @@ def repeat_layers(d: dict[str, Any], Lg: int, L: int) -> dict[str, Any]:
     w_l = {}
     layer_first = {"in_norm", "post_norm", "router"}  # [L, ...], no rank axis
     for k, v in inp.w_l.items():
-        # Every other per-layer stack is [R, L (or GDN layers), ...]; final_norm has no layer.
+        # Every other per-layer stack is [R, L (or GDN layers), ...]; final_norm has no
+        # layer.
         if k == "final_norm":
             w_l[k] = v
         elif k in layer_first:

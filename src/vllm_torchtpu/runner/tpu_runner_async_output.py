@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -12,8 +12,9 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
-INVALID_TOKEN_ID = -1
 from vllm_torchtpu import envs
+
+INVALID_TOKEN_ID = -1
 
 
 @dataclass
@@ -71,7 +72,7 @@ def spec_logprobs_lists(
 # buffer is reused after _PINNED_RING steps; `sampled_token_ids_cpu` copies out
 # of it at wait time, well within that window.
 _PINNED_RING = 8
-_pinned: dict[tuple, list] = {}
+_pinned: dict[tuple[tuple[int, ...], torch.dtype], list[Any]] = {}
 
 
 def _pinned_buffer(like: torch.Tensor) -> torch.Tensor:
@@ -79,7 +80,8 @@ def _pinned_buffer(like: torch.Tensor) -> torch.Tensor:
     entry = _pinned.get(key)
     if entry is None:
         entry = _pinned[key] = [[], 0]
-    buffers, turn = entry
+    buffers = cast(list[torch.Tensor], entry[0])
+    turn = cast(int, entry[1])
     if len(buffers) < _PINNED_RING:
         buffers.append(torch.empty(like.shape, dtype=like.dtype, pin_memory=True))
         out = buffers[-1]
@@ -127,9 +129,15 @@ class AsyncTPUCopyState:
         spec_logprobs: list[SpecLogprobsChunk] | None = None,
     ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
-        pinned = envs.VLLM_TPU_PINNED_TOKEN_COPY
+        # Pinned ring reads race the device-to-host copy once TOKEN_PADDING_REUSE drops
+        # the per-step host-to-device barrier (c32 GSM8K 0.14 with both on, 0.968 with
+        # pinned off), so the pinned ring is only used without padding reuse.
+        pinned = (envs.VLLM_TPU_PINNED_TOKEN_COPY
+                  and not envs.VLLM_TPU_TOKEN_PADDING_REUSE)
         if pinned:
-            chunks_cpu = [_pinned_buffer(t).copy_(t, non_blocking=True) for t in chunks_tpu]
+            chunks_cpu = [
+                _pinned_buffer(t).copy_(t, non_blocking=True) for t in chunks_tpu
+            ]
         else:
             chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
         spec_logprobs_tpu = None
@@ -350,7 +358,11 @@ def extract_draft_token_ids(
     """Gather the draft tokens the target just verified, from the (post-async-
     substitution) device ``input_ids``.
     """
-    return input_ids[logits_indices[target_logits_indices + 1]]
+    # index_select is ~2x cheaper on the host than advanced indexing (eager
+    # TPU microbench j-14dfb410: 17-21 vs 39-49 us per call); same values.
+    return input_ids.index_select(
+        0, logits_indices.index_select(0, target_logits_indices + 1)
+    )
 
 
 def compute_num_rejected(

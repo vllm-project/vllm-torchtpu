@@ -106,8 +106,9 @@ def _rank_salt(code: str) -> str:
 
 
 def graph_is_rank_dependent(graph: fx.GraphModule) -> bool:
-    """Whether `graph` (or a submodule) calls a rank-dependent op: its artifacts are salted
-    with the rank, so no peer ever replays them and waiting for a peer's is pointless."""
+    """Whether `graph` (or a submodule) calls a rank-dependent op: its artifacts
+    are salted with the rank, so no peer ever replays them and waiting for a
+    peer's is pointless."""
     try:
         return any(
             _rank_salt(module.code)
@@ -121,21 +122,23 @@ def graph_is_rank_dependent(graph: fx.GraphModule) -> bool:
 def agree_all_ranks(ok: bool) -> bool:
     """True only if every rank passes `ok` (a MIN all-reduce on the world CPU group).
 
-    Lets the ranks fail a rank-dependent compile together: a rank that failed alone would leave
-    its peers running an SPMD program it never joins, or waiting on an artifact it never saves
-    (w04 j-05391f11: one rank's VMEM OOM left the other seven idle ~62 min).
+    Lets the ranks fail a rank-dependent compile together: a rank that failed
+    alone would leave its peers running an SPMD program it never joins, or
+    waiting on an artifact it never saves (w04 j-05391f11: one rank's VMEM OOM
+    left the other seven idle ~62 min).
     """
     import torch.distributed as dist
 
-    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+    if (
+        not (dist.is_available() and dist.is_initialized())
+        or dist.get_world_size() == 1
+    ):
         return ok
     group = None
-    try:
+    with contextlib.suppress(Exception):
         from vllm.distributed.parallel_state import get_world_group
 
         group = get_world_group().cpu_group
-    except Exception:
-        pass
     flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
     return bool(flag.item())
@@ -213,7 +216,12 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
 _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
     # compiled model or custom-kernel lowering.
+    "CDK_OUTPUT_DIR",
     "DP_SCHED_ENABLED",
+    "VLLM_TPU_MK_OPERAND_DUMP",
+    "VLLM_TPU_MK_STEP_MIX_INTERVAL_S",
+    "VLLM_TPU_PY_SAMPLER_DELAY_S",
+    "VLLM_TPU_PY_SAMPLER_INTERVAL_MS",
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
@@ -231,6 +239,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PARALLEL_PRECOMPILE",
     "TPU_PRECOMPILE_BIGGEST_FIRST",
     "TPU_PRECOMPILE_PEER_REPLAY",
+    "VLLM_TPU_KV_BUDGET_PIN_TOLERANCE",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
@@ -340,6 +349,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # Qwen4Exp pool sizing: reaches the compiled graph only through num_gpu_blocks.
+    "QWEN4_EXP_MAX_POOL_BYTES",
+    "QWEN4_EXP_POOL_SIZING",
+    "QWEN4_EXP_POOL_GRAPH_COPIES",
+    "QWEN4_EXP_POOL_HEADROOM_BYTES",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (

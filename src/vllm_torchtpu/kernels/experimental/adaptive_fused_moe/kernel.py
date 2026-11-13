@@ -17,6 +17,7 @@ result row to the shard that owns its token, so the layer needs no dense
 combine reduce-scatter."""
 
 import functools
+import os
 import threading
 from typing import cast
 
@@ -60,6 +61,9 @@ QCHUNK = 512
 # which is why this is a handful of heights and not one per ROWBLK -- and the
 # top rung is always tile_m, so a full tile is unchanged.
 HEIGHT_RUNGS = 4
+# MOE_ADAPTIVE_PREFILL_RUNGS=1: emit the tail-tile height rungs on prefill-sized builds too (a
+# routed expert spans several tiles there, but its last tile still rounds up to a full height).
+PREFILL_RUNGS = os.environ.get("MOE_ADAPTIVE_PREFILL_RUNGS", "0") == "1"
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -154,7 +158,7 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
         HEIGHT_RUNGS < 2
         or step % ROWBLK
         or step * HEIGHT_RUNGS != tile_m
-        or rows_alloc > ep * g_local * tile_m
+        or (rows_alloc > ep * g_local * tile_m and not PREFILL_RUNGS)
     ):
         return (tile_m,)
     return tuple(range(step, tile_m + 1, step))
@@ -1992,6 +1996,11 @@ COMBINE_PARITIES = 4
 # more lead keeps descriptors in flight across it. Must divide the rotation:
 # 0 < COMBINE_LEAD < COMBINE_PARITIES.
 COMBINE_LEAD = 2
+# MOE_ADAPTIVE_COMBINE_LANDED=1 (default off): land the whole arrival buffer in VMEM with a few
+# contiguous DMAs and reduce from there (see landed_call), where it fits in this share of VMEM.
+COMBINE_LANDED = os.environ.get("MOE_ADAPTIVE_COMBINE_LANDED", "0") == "1"
+COMBINE_LAND_CHUNKS = 8
+COMBINE_LAND_VMEM_FRACTION = 0.85
 
 
 def combine_step_tokens(t_local):
@@ -2144,6 +2153,104 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
         name=f"moe_v2_combine_t{t_local}_k{topk}_b{tb}",
     )
 
+    landed_calls = {}
+
+    def landed_call(recv_rows):
+        """The landed variant (MOE_ADAPTIVE_COMBINE_LANDED=1), or None if it does not fit.
+
+        The whole arrival buffer lands in VMEM in COMBINE_LAND_CHUNKS contiguous DMAs, so the
+        10 * t_local per-row descriptors of the default path disappear; each token then reads its
+        rows by index out of VMEM. The per-token sum is the default path's expression in the same
+        slot order, so the output is bit-identical.
+        """
+        if recv_rows in landed_calls:
+            return landed_calls[recv_rows]
+        row_bytes = host.align_up(lane_blocks, 32) * lanes * jnp.dtype(wire_dtype).itemsize
+        need = recv_rows * row_bytes + (COMBINE_PARITIES + 1) * tb * hidden * 4
+        if need > int(host.vmem_limit() * COMBINE_LAND_VMEM_FRACTION):
+            landed_calls[recv_rows] = None
+            return None
+        nch = COMBINE_LAND_CHUNKS
+        bounds = [recv_rows * c // nch for c in range(nch + 1)]
+
+        def kernel(pos_sm, coef_sm, arr_hbm, out_hbm, land_vm, tile_vm, out_vm, land_sems, out_sems):
+            for c in range(nch):
+                lo, hi = bounds[c], bounds[c + 1]
+                pltpu.make_async_copy(
+                    arr_hbm.at[pl.ds(lo, hi - lo)], land_vm.at[pl.ds(lo, hi - lo)], land_sems.at[c]
+                ).start(priority=c % 2)
+            for c in range(nch):
+                lo, hi = bounds[c], bounds[c + 1]
+                pltpu.make_async_copy(
+                    arr_hbm.at[pl.ds(lo, hi - lo)], land_vm.at[pl.ds(lo, hi - lo)], land_sems.at[c]
+                ).wait()
+
+            def reduce_token(base, i):
+                acc = None
+                for k in range(topk):
+                    term = (
+                        land_vm[pos_sm[(base + i) * topk + k]].astype(jnp.float32)
+                        * coef_sm[(base + i) * topk + k]
+                    )
+                    acc = term if acc is None else acc + term
+                tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
+
+            def one_step(step, parity):
+                base = step * tb
+
+                @pl.when(step >= COMBINE_PARITIES)
+                def _():
+                    pltpu.make_async_copy(
+                        out_vm.at[parity], out_vm.at[parity], out_sems.at[parity]
+                    ).wait()
+
+                def one_chunk(chunk, carry):
+                    for u in range(COMBINE_CHUNK):
+                        reduce_token(base, chunk * COMBINE_CHUNK + u)
+                    return carry
+
+                lax.fori_loop(0, tb // COMBINE_CHUNK, one_chunk, jnp.int32(0))
+                for g in range(groups):
+                    out_vm[parity, pl.ds(g * gt, gt)] = tile_vm[pl.ds(g * gt, gt)].reshape(
+                        gt, hidden
+                    )
+                pltpu.make_async_copy(
+                    out_vm.at[parity], out_hbm.at[pl.ds(step * tb, tb)], out_sems.at[parity]
+                ).start()
+
+            def step_group(sg, carry):
+                for parity in range(COMBINE_PARITIES):
+                    one_step(sg * COMBINE_PARITIES + parity, parity)
+                return carry
+
+            lax.fori_loop(0, steps // COMBINE_PARITIES, step_group, jnp.int32(0))
+            for p in range(COMBINE_PARITIES):
+                pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], out_sems.at[p]).wait()
+
+        c = pl.pallas_call(
+            kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                in_specs=[hbm],
+                out_specs=hbm,
+                scratch_shapes=(
+                    pltpu.VMEM((recv_rows, lane_blocks, lanes), wire_dtype),
+                    pltpu.VMEM((tb, lane_blocks, lanes), out_dtype),
+                    pltpu.VMEM((COMBINE_PARITIES, tb, hidden), out_dtype),
+                    pltpu.SemaphoreType.DMA((nch,)),
+                    pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
+                ),
+                grid=(),
+            ),
+            out_shape=jax.ShapeDtypeStruct((t_local, hidden), out_dtype),
+            compiler_params=pltpu.CompilerParams(
+                vmem_limit_bytes=host.vmem_limit(), disable_bounds_checks=True
+            ),
+            name=f"moe_v2_combine_landed_t{t_local}_k{topk}_b{tb}",
+        )
+        landed_calls[recv_rows] = c
+        return c
+
     def fn(arrivals, coef, pos):
         # Both tables flatten TOKEN-major, so a token's topk entries are one
         # contiguous SMEM run and its 2 * topk scalar reads share a single
@@ -2155,7 +2262,10 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
                 f"[{t_local}, {topk}] tables, got pos "
                 f"{pos.shape} and coef {coef.shape}"
             )
-        return call(pos.astype(jnp.int32).reshape(-1), coef.reshape(-1), arrivals)
+        use = call
+        if COMBINE_LANDED:
+            use = landed_call(arrivals.shape[0]) or call
+        return use(pos.astype(jnp.int32).reshape(-1), coef.reshape(-1), arrivals)
 
     return fn
 

@@ -9,6 +9,7 @@ No allocation or device initialization takes place here.
 import math
 import os
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -18,9 +19,14 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.core.mamba_tail_fold import (
+    fold_blocked_by_context_parallel,
+    with_prefill_checkpoint,
+)
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 
-from .config import mtp_layer_prefixes, native_cache_specs
+from .config import first_qsa_layer_index, mtp_layer_prefixes, native_cache_specs
 from .qsa import QSA_BLOCK_SIZE
 
 # Explicit physical format shared by this model's page planner and GDN ops.
@@ -35,8 +41,7 @@ def pack_compressed_k_enabled() -> bool:
     Off by default. ``QWEN4_EXP_PACK_COMPRESSED_K=1`` packs; see
     ``pooled_cache_specs``.
     """
-    value = os.environ.get(PACK_COMPRESSED_K_ENV, "0").strip().lower()
-    return value in ("1", "true", "yes", "on")
+    return envs.QWEN4_EXP_PACK_COMPRESSED_K
 
 
 MERGE_COMPRESSED_K_ENV = "QWEN4_EXP_MERGE_COMPRESSED_K"
@@ -82,8 +87,7 @@ def pack_main_kv_enabled() -> bool:
     Off by default. ``QWEN4_EXP_PACK_MAIN_KV=1`` pairs; see
     ``pooled_cache_specs``.
     """
-    value = os.environ.get(PACK_MAIN_KV_ENV, "0").strip().lower()
-    return value in ("1", "true", "yes", "on")
+    return envs.QWEN4_EXP_PACK_MAIN_KV
 
 
 MAIN_KV_DCP_ENV = "VLLM_TPU_QSA_MAIN_KV_DCP"
@@ -114,8 +118,6 @@ def main_kv_dcp() -> int:
     stores half of the span in an unchanged page. 0 and 1 mean off. This is
     not vLLM's ``decode_context_parallel_size``, which stays 1.
     """
-    from vllm_torchtpu import envs
-
     value = envs.VLLM_TPU_QSA_MAIN_KV_DCP
     if value not in (0, 1, 2, 4):
         raise ValueError(f"{MAIN_KV_DCP_ENV} must be 0, 1, 2 or 4, got {value}")
@@ -267,7 +269,9 @@ def pooled_cache_specs(
     tp = cfg.parallel_config.tensor_parallel_size if tp is None else tp
     specs = native_cache_specs(cfg, tp, draft_prefix_cacheable=draft_prefix_cacheable)
     text = cfg.model_config.hf_text_config
-    main = specs[f"model.layers.{text.layer_types.index('full_attention')}.self_attn"]
+    main: Any = specs[
+        f"model.layers.{first_qsa_layer_index(text.layer_types)}.self_attn"
+    ]
     token_bytes = main.page_size_bytes // main.block_size
     gdn = specs[
         f"model.layers.{text.layer_types.index('linear_attention')}.linear_attn"
@@ -417,7 +421,6 @@ def pooled_cache_specs(
                 f"kernel's {PAIRED_KV_TILES} and an FP8 main KV cache; got "
                 f"{main.dtype}"
             )
-        from vllm_torchtpu import envs
 
         # VLLM_TPU_QSA_MTP_KV_DCP: the draft's main KV splits like the target's.
         split_draft = bool(envs.VLLM_TPU_QSA_MTP_KV_DCP)
@@ -494,6 +497,18 @@ def pooled_cache_specs(
                 dtypes=dtypes,
                 mamba_cache_mode=mamba_mode,
             )
+            if (
+                mamba_mode == "align"
+                and envs.VLLM_TPU_MAMBA_TAIL_FOLD
+                and fold_blocked_by_context_parallel(cfg, dcp) is None
+                # A PCP split (also a staged decode's view of a PCP producer)
+                # keeps the fold off, as the PCP producer itself does.
+                and not interleave
+            ):
+                # The GDN kernel and the PLE layer write the state at the
+                # prompt's last block boundary from inside the step, so the
+                # scheduler need not split the tail off (core/mamba_tail_fold.py).
+                pooled[name] = with_prefill_checkpoint(pooled[name])
         else:
             assert isinstance(spec, AttentionSpec)
             if name.endswith(".compressed_k"):

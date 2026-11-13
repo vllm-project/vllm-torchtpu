@@ -57,8 +57,20 @@ def _inputs(seed: int):
 
 
 def _kernel_rows(
-    pool, pages, kv_len, q, gate, *, off, tile_cut=0, fold=False, slots=2,
-    table=None, rows_per_req=1, table_row_base=0, recent=None,
+    pool,
+    pages,
+    kv_len,
+    q,
+    gate,
+    *,
+    off,
+    tile_cut=0,
+    fold=False,
+    slots=2,
+    table=None,
+    rows_per_req=1,
+    table_row_base=0,
+    recent=None,
 ):
     """Rows through `attend_row`; `table` (group-id pages) and `recent` (per row
     `(k [n, NREC, DIM] f32, v, ok [n, NREC] int32)`) exercise the optional hooks."""
@@ -107,7 +119,9 @@ def _kernel_rows(
 
         jax.lax.fori_loop(0, n, row, (jnp.int32(0), jnp.int32(0)))
 
-    lens = jnp.maximum(kv_len - tile_cut, jnp.minimum(kv_len, 1)) if tile_cut else kv_len
+    lens = (
+        jnp.maximum(kv_len - tile_cut, jnp.minimum(kv_len, 1)) if tile_cut else kv_len
+    )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     prefetch = [pages, lens] + ([table] if has_t else [])
     ins = [q, gate]
@@ -131,12 +145,18 @@ def _kernel_rows(
     )(*prefetch, *ins, pool)
 
 
-@pytest.mark.parametrize("off,fold,slots", [(0, False, 2), (1, False, 4), (1, True, 3), (0, False, 8)])
+@pytest.mark.parametrize(
+    "off,fold,slots", [(0, False, 2), (1, False, 4), (1, True, 3), (0, False, 8)]
+)
 def test_attend_row_matches_reference(off, fold, slots):
     pool, pages, kv_len, q, gate = _inputs(3 + off)
-    got = np.asarray(_kernel_rows(pool, pages, kv_len, q, gate, off=off, fold=fold, slots=slots))
+    got = np.asarray(
+        _kernel_rows(pool, pages, kv_len, q, gate, off=off, fold=fold, slots=slots)
+    )
     want = np.asarray(
-        reference_rows(q, gate, pool, pages, kv_len, off=off, scale_k=SK, scale_v=SV, sm_scale=SM)
+        reference_rows(
+            q, gate, pool, pages, kv_len, off=off, scale_k=SK, scale_v=SV, sm_scale=SM
+        )
     )
     assert np.all(got[0] == 0)  # empty row
     assert float(np.abs(want).mean()) > 1e-2
@@ -147,10 +167,14 @@ def test_attend_row_matches_reference(off, fold, slots):
 def test_attend_row_catches_wrong_pair_and_dropped_tile():
     pool, pages, kv_len, q, gate = _inputs(11)
     want = np.asarray(
-        reference_rows(q, gate, pool, pages, kv_len, off=0, scale_k=SK, scale_v=SV, sm_scale=SM)
+        reference_rows(
+            q, gate, pool, pages, kv_len, off=0, scale_k=SK, scale_v=SV, sm_scale=SM
+        )
     )
     wrong_pair = np.asarray(_kernel_rows(pool, pages, kv_len, q, gate, off=1))
-    dropped = np.asarray(_kernel_rows(pool, pages, kv_len, q, gate, off=0, tile_cut=TILE))
+    dropped = np.asarray(
+        _kernel_rows(pool, pages, kv_len, q, gate, off=0, tile_cut=TILE)
+    )
     for bad in (wrong_pair, dropped):
         assert not np.allclose(bad[1:], want[1:], atol=2e-2, rtol=2e-2)
 
@@ -160,15 +184,24 @@ def test_table_group_ids_match_direct_micro_pages():
     pool, _, kv_len, q, gate = _inputs(21)
     n, per_page, pps, rpr, base = len(LENGTHS), 128 // MICRO, 8, 2, 1
     rng = np.random.default_rng(22)
-    table = rng.integers(0, PAGES, size=(base + (n + rpr - 1) // rpr, pps)).astype(np.int32)
+    table = rng.integers(0, PAGES, size=(base + (n + rpr - 1) // rpr, pps)).astype(
+        np.int32
+    )
     groups = rng.integers(0, pps * per_page, size=(n, BUDGET + 1)).astype(np.int32)
     req = base + np.arange(n)[:, None] // rpr
     direct = table[req, groups >> 5] * per_page + (groups & (per_page - 1))
     want = np.asarray(_kernel_rows(pool, jnp.asarray(direct), kv_len, q, gate, off=1))
     got = np.asarray(
         _kernel_rows(
-            pool, jnp.asarray(groups), kv_len, q, gate, off=1,
-            table=jnp.asarray(table), rows_per_req=rpr, table_row_base=base,
+            pool,
+            jnp.asarray(groups),
+            kv_len,
+            q,
+            gate,
+            off=1,
+            table=jnp.asarray(table),
+            rows_per_req=rpr,
+            table_row_base=base,
         )
     )
     np.testing.assert_array_equal(got, want)
@@ -180,12 +213,20 @@ def test_recent_tokens_merge_like_pool_tokens(fold):
     """VMEM `recent` tokens equal the same tokens appended to the row's pool pages."""
     off, nrec = 1, 8
     lengths = [0, 0, 4, 64, 256, 300, 512]
-    nrecs = [8, 0, 4, 8, 4, 8, 4]  # row 0: recent only (attended), row 1: nothing (zero)
+    nrecs = [
+        8,
+        0,
+        4,
+        8,
+        4,
+        8,
+        4,
+    ]  # row 0: recent only (attended), row 1: nothing (zero)
     n = len(lengths)
     rng = np.random.default_rng(31)
-    pool = jnp.asarray(rng.standard_normal((PAGES + 1, 128, 1, 4, DIM)) * 2, jnp.float32).astype(
-        jnp.float8_e4m3fn
-    )
+    pool = jnp.asarray(
+        rng.standard_normal((PAGES + 1, 128, 1, 4, DIM)) * 2, jnp.float32
+    ).astype(jnp.float8_e4m3fn)
     per_page = 128 // MICRO
     q = jnp.asarray(rng.standard_normal((n, NH, DIM)), jnp.bfloat16)
     gate = jnp.asarray(rng.standard_normal((n, NH, DIM)), jnp.bfloat16)
@@ -200,20 +241,35 @@ def test_recent_tokens_merge_like_pool_tokens(fold):
         for j in range(nrecs[r] // MICRO):
             mp = PAGES * per_page + 2 * r + j
             ext[r, lengths[r] // MICRO + j] = mp
-            toks = pool_np[PAGES, (mp % per_page) * MICRO : (mp % per_page + 1) * MICRO, 0]
+            toks = pool_np[
+                PAGES, (mp % per_page) * MICRO : (mp % per_page + 1) * MICRO, 0
+            ]
             rk[r, j * MICRO : (j + 1) * MICRO] = toks[:, 2 * off]
             rv[r, j * MICRO : (j + 1) * MICRO] = toks[:, 2 * off + 1]
         ok[r, : nrecs[r]] = 1
     lens = jnp.asarray(lengths, jnp.int32)
     want = np.asarray(
         reference_rows(
-            q, gate, pool, jnp.asarray(ext), lens + jnp.asarray(nrecs, jnp.int32),
-            off=off, scale_k=SK, scale_v=SV, sm_scale=SM,
+            q,
+            gate,
+            pool,
+            jnp.asarray(ext),
+            lens + jnp.asarray(nrecs, jnp.int32),
+            off=off,
+            scale_k=SK,
+            scale_v=SV,
+            sm_scale=SM,
         )
     )
     got = np.asarray(
         _kernel_rows(
-            pool, jnp.asarray(pages), lens, q, gate, off=off, fold=fold,
+            pool,
+            jnp.asarray(pages),
+            lens,
+            q,
+            gate,
+            off=off,
+            fold=fold,
             recent=(jnp.asarray(rk), jnp.asarray(rv), jnp.asarray(ok)),
         )
     )

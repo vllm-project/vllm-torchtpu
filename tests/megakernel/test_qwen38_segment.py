@@ -19,7 +19,6 @@ import dataclasses
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding
@@ -29,17 +28,23 @@ from vllm_torchtpu.megakernel import kernel
 from vllm_torchtpu.megakernel.blocks.hc import RESIDUAL_OUT
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models import qwen38
-from vllm_torchtpu.megakernel.models.qwen38_inputs import pack_segment, random_segment_inputs
+from vllm_torchtpu.megakernel.models.qwen38_inputs import (
+    pack_segment,
+    random_segment_inputs,
+)
 from vllm_torchtpu.megakernel.models.qwen38_pack import shard_step_inputs
 from vllm_torchtpu.megakernel.models.qwen38_reference import segment_reference
-from vllm_torchtpu.megakernel.ops import BF16, F32, rup
 
 _TILES = Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64)
 G = qwen38.TINY
 
 
 def _run(
-    T: int, key: int = 40, L: int = qwen38.SEGMENT_LAYERS, g: Any = G, head: bool = False
+    T: int,
+    key: int = 40,
+    L: int = qwen38.SEGMENT_LAYERS,
+    g: Any = G,
+    head: bool = False,
 ):
     R, B = 2, 2 * T
     ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=True, tiles=_TILES)
@@ -50,8 +55,14 @@ def _run(
     )
     w_mk, states, attn = pack_segment(spec, g, ex, inp, head=head)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, inp.pos, inp.x, w_mk, states)
-    extra = () if head else (jax.device_put(kernel.fold(attn), NamedSharding(mesh, P("tp"))),)
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+        mesh, ex, inp.pos, inp.x, w_mk, states
+    )
+    extra = (
+        ()
+        if head
+        else (jax.device_put(kernel.fold(attn), NamedSharding(mesh, P("tp"))),)
+    )
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *extra)
     res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, :B], np.float32)
@@ -97,7 +108,9 @@ def test_qwen38_segment_hidden_not_a_multiple_of_1024():
 
 
 def test_qwen38_segment_budget_catches_a_dropped_layer(monkeypatch):
-    """Positive control: the budget rejects a kernel whose last MoE sublayer is skipped."""
+    """Positive control: the budget rejects a kernel whose last MoE sublayer is
+    skipped.
+    """
     from vllm_torchtpu.megakernel.blocks.hc import HCSublayer
 
     orig = HCSublayer._combine
@@ -105,7 +118,6 @@ def test_qwen38_segment_budget_catches_a_dropped_layer(monkeypatch):
     def drop_last_moe(self, ctx, block):
         if self.name != "moe":
             return orig(self, ctx, block)
-        import jax.numpy as jnp
         from jax import lax
 
         keep = ctx.stream.sp.block_ord(ctx._hc_layer, "moe") < qwen38.SEGMENT_LAYERS - 1
@@ -113,7 +125,7 @@ def test_qwen38_segment_budget_catches_a_dropped_layer(monkeypatch):
 
     orig_emit = HCSublayer.emit
 
-    def emit(self, ctx, l, slot):
+    def emit(self, ctx, l, slot):  # noqa: E741
         ctx._hc_layer = l
         return orig_emit(self, ctx, l, slot)
 
@@ -135,7 +147,9 @@ def test_qwen38_flat_segment_step_matches_make_step():
     inp = random_segment_inputs(jax.random.PRNGKey(7), G, ex, L)
     w_mk, states, attn = pack_segment(spec, G, ex, inp)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, inp.pos, inp.x, w_mk, states)
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+        mesh, ex, inp.pos, inp.x, w_mk, states
+    )
     attn_mk = jax.device_put(kernel.fold(attn), NamedSharding(mesh, P("tp")))
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk, attn_mk)
@@ -145,7 +159,11 @@ def test_qwen38_flat_segment_step_matches_make_step():
     for name in kernel.build(spec, ex)[1]["plan"].w_names:
         v = w_mk[name]
         flat.extend(v if isinstance(v, tuple) else (v,))
-    assert len(flat) == n_w and len(in_specs) == 3 + n_w + 2 and fn.extra_names == ("qsa_attn",)
+    assert (
+        len(flat) == n_w
+        and len(in_specs) == 3 + n_w + 2
+        and fn.extra_names == ("qsa_attn",)
+    )
     res = jax.jit(fn)(pos_mk, hid_mk, attn_mk, *flat, st_mk["conv"], st_mk["rec"])
     assert len(res) == len(out_specs) == 3
     np.testing.assert_array_equal(np.asarray(res[0]), np.asarray(outs[RESIDUAL_OUT]))

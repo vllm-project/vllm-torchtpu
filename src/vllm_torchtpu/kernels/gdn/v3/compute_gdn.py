@@ -15,6 +15,7 @@
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.gdn.v3 import config
 
 
@@ -41,6 +42,12 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     out_dtype = t.dtype
     chunk = t.shape[-1]
     block_size = min(block_size, chunk)
+    if envs.VLLM_TPU_GDN_MIXED_TILE_POW2:
+        # The blocked solve covers exactly num_blocks * block_size rows; a
+        # remainder would be dropped and surface later as a shape error.
+        assert chunk % block_size == 0, (
+            f"chunk ({chunk}) must be divisible by block_size ({block_size})"
+        )
     num_blocks = chunk // block_size
 
     def local_forward_sub(t_mat, b_mat):
@@ -101,45 +108,80 @@ def fused_transpose_broadcast(x: jax.Array, src_dim: int, dst_dim: int) -> jax.A
     return jnp.where(mask, x, 0).sum(axis=src_dim, keepdims=True, dtype=dtype)
 
 
-def chunked_gdn_per_seq(
-    q_large: jax.Array,  # [num_kq_heads, chunk, kq_head_dim]
-    k_large: jax.Array,  # [num_kq_heads, chunk, kq_head_dim]
-    v_large: jax.Array,  # [num_v_heads, chunk, v_head_dim]
-    gating_log: jax.Array,  # [1, 1, num_v_heads]
-    beta: jax.Array,  # [1, 1, num_v_heads]
-    state_prev: jax.Array,  # [num_v_heads, kq_head_dim, v_head_dim]
+def _chunk_gates(
+    gating_log: jax.Array,  # [num_chunks, chunk, aligned_num_v_heads]
+    beta: jax.Array,  # [num_chunks, chunk, aligned_num_v_heads]
     cfg: config.GDNConfig,
-) -> tuple[jax.Array, jax.Array]:
-    """Perform chunked GDN over input [num_heads, chunk, head_dim]."""
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Per-head decay cumsum, its row form and beta for stacked chunks.
+
+    Returns [num_chunks * num_v_heads, chunk, 1] cumsum,
+    [num_chunks * num_v_heads, 1, chunk] cumsum and
+    [num_chunks * num_v_heads, chunk, 1] beta, chunk-major over heads.
+    """
+    num_chunks, chunk = gating_log.shape[0], gating_log.shape[1]
+
+    # Compute cumulative sum of decay.
+    # [num_chunks, 1, aligned_num_v_heads]
+    g_cum_sum_list = [gating_log[:, :1]]
+    for row in range(1, chunk):
+        g_cum_sum_list.append(g_cum_sum_list[-1] + gating_log[:, row : row + 1])
+    # [num_chunks, chunk, aligned_num_v_heads]
+    g_cum_sum_log = jnp.concat(g_cum_sum_list, axis=1)
+
+    if num_chunks > 1:
+        # Heads sit on the (128-lane padded) last axis: take each real head's
+        # lane as a column and transpose once for the row form. Pure data
+        # movement, so bit-identical to the masked reduces below.
+        heads = range(cfg.num_v_heads)
+        g_cols, b_cols, g_rows = [], [], []
+        for j in range(num_chunks):
+            g2 = g_cum_sum_log[j]  # [chunk, aligned_heads]
+            b2 = beta[j]
+            g_t = g2.T[: cfg.num_v_heads]
+            g_cols += [g2[:, h : h + 1] for h in heads]
+            b_cols += [b2[:, h : h + 1] for h in heads]
+            g_rows += [g_t[h : h + 1] for h in heads]
+        # [num_chunks * num_v_heads, chunk, 1]
+        g_cum_sum_log = jnp.stack(g_cols, axis=0)
+        beta_large = jnp.stack(b_cols, axis=0)
+        # [num_chunks * num_v_heads, 1, chunk]
+        g_cum_sum_log_t = jnp.stack(g_rows, axis=0)
+    else:
+        # [num_v_heads, chunk, 1]
+        g_cum_sum_log = fused_transpose_broadcast(g_cum_sum_log, src_dim=2, dst_dim=0)
+        g_cum_sum_log = g_cum_sum_log[: cfg.num_v_heads]
+        beta = fused_transpose_broadcast(beta, src_dim=2, dst_dim=0)
+        beta_large = beta[: cfg.num_v_heads]
+
+        # [num_v_heads, 1, chunk]
+        g_cum_sum_log_t = fused_transpose_broadcast(g_cum_sum_log, src_dim=1, dst_dim=2)
+    return g_cum_sum_log, g_cum_sum_log_t, beta_large
+
+
+def _chunk_intra(
+    q_large: jax.Array,  # [heads_kq, chunk, kq_head_dim]
+    k_large: jax.Array,  # [heads_kq, chunk, kq_head_dim]
+    v_large: jax.Array,  # [heads_v, chunk, v_head_dim]
+    g_cum_sum_log: jax.Array,  # [heads_v, chunk, 1]
+    g_cum_sum_log_t: jax.Array,  # [heads_v, 1, chunk]
+    beta_large: jax.Array,  # [heads_v, chunk, 1]
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, ...]:
+    """State-independent part of a chunk; heads may stack several chunks."""
 
     # NOTE: Repeat along non lane/sublane dim is free.
     q_repeat = jnp.repeat(q_large, cfg.v_per_kq_head, axis=0)
     k_repeat = jnp.repeat(k_large, cfg.v_per_kq_head, axis=0)
 
-    # Compute cumulative sum of decay.
-    # [1, 1, num_v_heads]
-    g_cum_sum_list = [gating_log[:, :1]]
-    for row in range(1, cfg.chunk_size):
-        g_cum_sum_list.append(g_cum_sum_list[-1] + gating_log[:, row : row + 1])
-    # [1, chunk, num_v_heads]
-    g_cum_sum_log = jnp.concat(g_cum_sum_list, axis=1)
-
-    # [num_v_heads, chunk, 1]
-    g_cum_sum_log = fused_transpose_broadcast(g_cum_sum_log, src_dim=2, dst_dim=0)
-    g_cum_sum_log = g_cum_sum_log[: cfg.num_v_heads]
-    beta = fused_transpose_broadcast(beta, src_dim=2, dst_dim=0)
-    beta_large = beta[: cfg.num_v_heads]
-
-    # [num_v_heads, 1, chunk]
-    g_cum_sum_log_t = fused_transpose_broadcast(g_cum_sum_log, src_dim=1, dst_dim=2)
-    # [num_v_heads, chunk, chunk]
+    # [heads_v, chunk, chunk]
     g_cum_sum_diff_log = g_cum_sum_log - g_cum_sum_log_t
     gating_map = jnp.exp(g_cum_sum_diff_log)
-    # [num_v_heads, chunk, 1]
+    # [heads_v, chunk, 1]
     gating_backward = jnp.exp(-g_cum_sum_diff_log[..., -1:])
-    # [num_v_heads, chunk, 1]
+    # [heads_v, chunk, 1]
     gating_forward = jnp.exp(g_cum_sum_log)
-    # [num_v_heads, 1, 1]
+    # [heads_v, 1, 1]
     gating_last = gating_forward[:, -1:]
 
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
@@ -148,13 +190,13 @@ def chunked_gdn_per_seq(
     identity_mask = iota_r == iota_c
     strictly_lower_mask = iota_r > iota_c
     lower_mask = iota_r >= iota_c
-    # [num_v_heads, chunk, chunk]
+    # [heads_v, chunk, chunk]
     gating_map_masked = jnp.where(strictly_lower_mask, gating_map, 0)
 
-    # [num_v_heads, chunk, kq_head_dim]
+    # [heads_v, chunk, kq_head_dim]
     k_beta_repeat = k_repeat * beta_large
 
-    # [num_v_heads, chunk, chunk]
+    # [heads_v, chunk, chunk]
     beta_k_k_t = jax.lax.dot(
         k_beta_repeat,
         k_repeat,
@@ -164,17 +206,17 @@ def chunked_gdn_per_seq(
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
     t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
 
-    # [num_v_heads, chunk, chunk]
+    # [heads_v, chunk, chunk]
     t_inv = invert_triangular_matrix(t, block_size=cfg.triangular_block_size)
 
-    # [num_v_heads, chunk, v_head_dim]
+    # [heads_v, chunk, v_head_dim]
     v_beta_large = v_large * beta_large
-    # [num_v_heads, chunk, kv_head_dim]
+    # [heads_v, chunk, kv_head_dim]
     k_beta_gating = k_beta_repeat * gating_forward
     # NOTE: If v_head_dim < mxu size, concatenating them will help increase mxu
     # utilization. Also, if v_head_dim is multiple of lane size, concat / split
     # along lane dim is free - making this optimization strictly beneficial.
-    # [num_v_heads, chunk, v_head_dim + kq_head_dim]
+    # [heads_v, chunk, v_head_dim + kq_head_dim]
     merged_v_k = jnp.concat([v_beta_large, k_beta_gating], axis=-1)
     merged_uw = jax.lax.dot(
         t_inv,
@@ -183,11 +225,42 @@ def chunked_gdn_per_seq(
         preferred_element_type=jnp.float32,
     ).astype(cfg.dtypes.compute)
 
-    # [num_v_heads, chunk, v_head_dim]
+    # [heads_v, chunk, v_head_dim]
     u, w = jnp.split(merged_uw, [cfg.v_head_dim], axis=-1)
 
-    # [num_v_heads, chunk, kq_head_dim]
+    # [heads_v, chunk, kq_head_dim]
     q_large_gating = q_repeat * gating_forward
+    # [heads_v, chunk, kq_head_dim]
+    k_repeat_gating = k_repeat * gating_backward
+
+    # [heads_kq, chunk, chunk]
+    out_qk = jax.lax.dot(
+        q_large,
+        k_large,
+        dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+        preferred_element_type=jnp.float32,
+    ).astype(cfg.dtypes.compute)
+    # NOTE: must perform repeat after matmul to reduce required compute.
+    # [heads_v, chunk, chunk]
+    out_qk = jnp.repeat(out_qk, cfg.v_per_kq_head, axis=0)
+    out_qk *= gating_map
+    out_qk = jnp.where(lower_mask, out_qk, 0)
+
+    return u, w, q_large_gating, k_repeat_gating, gating_last, out_qk
+
+
+def _chunk_inter(
+    u: jax.Array,  # [num_v_heads, chunk, v_head_dim]
+    w: jax.Array,  # [num_v_heads, chunk, kq_head_dim]
+    q_large_gating: jax.Array,  # [num_v_heads, chunk, kq_head_dim]
+    k_repeat_gating: jax.Array,  # [num_v_heads, chunk, kq_head_dim]
+    gating_last: jax.Array,  # [num_v_heads, 1, 1]
+    out_qk: jax.Array,  # [num_v_heads, chunk, chunk]
+    state_prev: jax.Array,  # [num_v_heads, kq_head_dim, v_head_dim]
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """State-dependent part of one chunk."""
+
     # NOTE: Concatenate lhs with same rhs to leverage weight
     # stationary architecture.
     # [num_v_heads, 2 * chunk, kq_head_dim]
@@ -207,9 +280,6 @@ def chunked_gdn_per_seq(
     # [num_v_heads, chunk, v_head_dim]
     u_ws = u - ws
 
-    # [num_v_heads, chunk, kq_head_dim]
-    k_repeat_gating = k_repeat * gating_backward
-
     # [num_v_heads, kq_head_dim, v_head_dim]
     state_new = jax.lax.dot(
         k_repeat_gating,
@@ -222,19 +292,6 @@ def chunked_gdn_per_seq(
     state_updated = state_prev * gating_last
     state = state_updated + state_new
 
-    # [num_kq_heads, chunk, chunk]
-    out_qk = jax.lax.dot(
-        q_large,
-        k_large,
-        dimension_numbers=(((2,), (2,)), ((0,), (0,))),
-        preferred_element_type=jnp.float32,
-    ).astype(cfg.dtypes.compute)
-    # NOTE: must perform repeat after matmul to reduce required compute.
-    # [num_v_heads, chunk, chunk]
-    out_qk = jnp.repeat(out_qk, cfg.v_per_kq_head, axis=0)
-    out_qk *= gating_map
-    out_qk = jnp.where(lower_mask, out_qk, 0)
-
     # [num_v_heads, chunk, v_head_dim]
     out_new = jax.lax.dot(
         out_qk,
@@ -245,6 +302,61 @@ def chunked_gdn_per_seq(
     out = out_updated + out_new
 
     return out, state
+
+
+def chunked_gdn_per_seq(
+    q_large: jax.Array,  # [num_kq_heads, chunk, kq_head_dim]
+    k_large: jax.Array,  # [num_kq_heads, chunk, kq_head_dim]
+    v_large: jax.Array,  # [num_v_heads, chunk, v_head_dim]
+    gating_log: jax.Array,  # [1, chunk, aligned_num_v_heads]
+    beta: jax.Array,  # [1, chunk, aligned_num_v_heads]
+    state_prev: jax.Array,  # [num_v_heads, kq_head_dim, v_head_dim]
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Perform chunked GDN over input [num_heads, chunk, head_dim]."""
+
+    gates = _chunk_gates(gating_log, beta, cfg)
+    parts = _chunk_intra(q_large, k_large, v_large, *gates, cfg)
+    return _chunk_inter(*parts, state_prev, cfg)
+
+
+def chunked_gdn_per_seq_pair(
+    q_large: jax.Array,  # [num_kq_heads, 2 * chunk, kq_head_dim]
+    k_large: jax.Array,  # [num_kq_heads, 2 * chunk, kq_head_dim]
+    v_large: jax.Array,  # [num_v_heads, 2 * chunk, v_head_dim]
+    gating_log: jax.Array,  # [1, 2 * chunk, aligned_num_v_heads]
+    beta: jax.Array,  # [1, 2 * chunk, aligned_num_v_heads]
+    state_prev: jax.Array,  # [num_v_heads, kq_head_dim, v_head_dim]
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Chunked GDN over two consecutive chunks of one sequence.
+
+    The state-independent work of both chunks runs once, batched over heads
+    (chunk-major), then the two state updates run in order. Each chunk sees
+    exactly the ops of `chunked_gdn_per_seq`. An empty second chunk (all rows
+    masked) has zero inputs and unit decay, so it leaves the state unchanged.
+    """
+    c = cfg.sub_chunk_size
+    n_v = cfg.num_v_heads
+
+    def halves(x):
+        return x[:, :c], x[:, c:]
+
+    gates = _chunk_gates(
+        jnp.concat(halves(gating_log), axis=0),
+        jnp.concat(halves(beta), axis=0),
+        cfg,
+    )
+    parts = _chunk_intra(
+        jnp.concat(halves(q_large), axis=0),
+        jnp.concat(halves(k_large), axis=0),
+        jnp.concat(halves(v_large), axis=0),
+        *gates,
+        cfg,
+    )
+    out0, state0 = _chunk_inter(*(x[:n_v] for x in parts), state_prev, cfg)
+    out1, state1 = _chunk_inter(*(x[n_v:] for x in parts), state0, cfg)
+    return jnp.concat([out0, out1], axis=1), state1
 
 
 def chunked_gdn(
@@ -305,7 +417,8 @@ def chunked_gdn(
     out_list = []
     state_list = []
     for idx in range(cfg.seq_tile_size):
-        out, state = chunked_gdn_per_seq(
+        per_seq_fn = chunked_gdn_per_seq_pair if cfg.chunk_pair else chunked_gdn_per_seq
+        out, state = per_seq_fn(
             q_large[idx],
             k_large[idx],
             v_large[idx],

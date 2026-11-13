@@ -67,8 +67,11 @@ def _host(monkeypatch, ranks_per_host):
     monkeypatch.setattr(parallel_state, "get_node_count", lambda: 2)
 
 
-def _compile(compile_all_ranges, monkeypatch, local_rank, ranks_per_host=8, fail_at=None):
-    """(range end, peer wait in seconds) per compile, in order. `fail_at`: the range whose
+def _compile(
+    compile_all_ranges, monkeypatch, local_rank, ranks_per_host=8, fail_at=None
+):
+    """(range end, peer wait in seconds) per compile, in order. `fail_at`: the range
+    whose
     compile raises MemoryError."""
     _host(monkeypatch, ranks_per_host)
     monkeypatch.setenv("LOCAL_RANK", str(local_rank))
@@ -187,13 +190,15 @@ def test_peer_replay_off_compiles_every_range_without_waiting(
         assert sorted(end for end, _ in calls) == SIZES
 
 
-# --- rank-dependent graphs (rank-salted artifacts: no peer ever replays them) ----------
+# --- rank-dependent graphs (rank-salted artifacts: no peer ever replays them)
+# ----------
 
 
 def test_rank_dependent_graph_compiles_every_range_without_waiting(
     compile_all_ranges, monkeypatch
 ):
-    """A graph calling a rank-dependent op (e.g. the Qwen3.8 megakernel) has no owner to wait
+    """A graph calling a rank-dependent op (e.g. the Qwen3.8 megakernel) has no owner to
+    wait
     for: every rank compiles every range at once, then the ranks agree on success."""
     monkeypatch.setattr(tpu_compiler, "graph_is_rank_dependent", lambda graph: True)
     agreed = []
@@ -219,7 +224,8 @@ def test_rank_dependent_failure_on_another_rank_fails_here(
 def test_rank_dependent_failure_here_still_joins_the_agreement(
     compile_all_ranges, monkeypatch
 ):
-    """The failing rank reaches the agreement (its peers would otherwise block in it) and then
+    """The failing rank reaches the agreement (its peers would otherwise block in it)
+    and then
     raises its own error."""
     monkeypatch.setattr(tpu_compiler, "graph_is_rank_dependent", lambda graph: True)
     agreed = []

@@ -35,6 +35,8 @@ def test_substitution_disabled_by_default():
     runner = SimpleNamespace(
         _fast_token_substitution=False,
         device=torch.device("cpu"),
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
         _pre_async_results=SimpleNamespace(
             next_tokens_tpu=torch.tensor([101, 102, 103, 104], dtype=torch.int64)
         ),
@@ -52,6 +54,12 @@ def test_substitution_disabled_by_default():
         )
         assert mock_kernel.called
         assert torch.equal(out, torch.tensor([101, 102, 103, 104], dtype=torch.int32))
+    # The kernel's index uploads stay owned by the runner until a staging
+    # fence covers them.
+    assert [host.tolist() for host, _ in runner._unfenced_h2d_sources] == [
+        [0, 1, 2, 3],
+        [0, 1, 2, 3],
+    ]
 
 
 def test_substitution_enabled_fast_path():
@@ -59,6 +67,8 @@ def test_substitution_enabled_fast_path():
     runner = SimpleNamespace(
         _fast_token_substitution=True,
         device=torch.device("cpu"),
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
         _pre_async_results=SimpleNamespace(
             next_tokens_tpu=torch.tensor([201, 202, 203, 204], dtype=torch.int64)
         ),
@@ -76,3 +86,35 @@ def test_substitution_enabled_fast_path():
         # Direct slice returns next_tokens_tpu[:4] without calling kernel
         assert not mock_kernel.called
         assert torch.equal(out, torch.tensor([201, 202, 203, 204], dtype=torch.int32))
+
+
+def test_subst_extract_fused_matches_prefix_then_extract():
+    """VLLM_TPU_SUBST_EXTRACT_FUSED: one function returns the same input ids
+    as `_subst_prefix_impl` and the same drafts as `extract_draft_token_ids`."""
+    from vllm_torchtpu.runner.tpu_runner import (
+        _subst_prefix_extract_impl,
+        _subst_prefix_impl,
+    )
+    from vllm_torchtpu.runner.tpu_runner_async_output import extract_draft_token_ids
+
+    src = torch.arange(100, 164, dtype=torch.int32)
+    n = 8
+    logits_idx = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int32)
+    target_idx = torch.tensor([0, 1, 2, 4, 5, 6, 0, 0], dtype=torch.int32)
+    ids_ref = _subst_prefix_impl(src, n, torch.int32)
+    drafts_ref = extract_draft_token_ids(ids_ref, logits_idx, target_idx)
+    ids, drafts = _subst_prefix_extract_impl(src, n, torch.int32, logits_idx, target_idx)
+    assert ids.dtype == ids_ref.dtype and torch.equal(ids, ids_ref)
+    assert drafts.dtype == drafts_ref.dtype and torch.equal(drafts, drafts_ref)
+    assert ids.data_ptr() != src.data_ptr()
+
+
+def test_subst_static_args_strips_without_a_view():
+    """VLLM_TPU_SUBST_STATIC_ARGS wraps the substitution with the owned-alias
+    strip (runner/owned_args.py), not eagle3's `a[:]` view, so the forward
+    gets back the caller's own input-ids tensor."""
+    from vllm_torchtpu.runner import tpu_runner
+
+    static = tpu_runner._substitute_placeholder_token_static
+    assert static.__wrapped__ is tpu_runner._substitute_placeholder_token
+    assert static.__code__.co_filename.endswith("owned_args.py")

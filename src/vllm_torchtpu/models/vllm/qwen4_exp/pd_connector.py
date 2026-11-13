@@ -503,6 +503,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 self._enable_shared_compressed()
             self._log_hbm_after_staging(runner)
         else:
+            assert cache.native_config is not None
             from .config import pd_prefill_mtp_producer
 
             if pd_prefill_mtp_producer(self.vllm_config):

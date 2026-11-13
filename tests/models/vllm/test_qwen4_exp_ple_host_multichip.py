@@ -10,7 +10,6 @@ import argparse
 import datetime
 import json
 import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -24,33 +23,42 @@ pytestmark = [
 ]
 
 
+@pytest.mark.timeout(1200)
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
 def test_host_ple_compiled_transport_preserves_checkpoint_bits(tp, tmp_path):
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--tp",
-        str(tp),
-        "--out",
-        str(tmp_path),
-    ]
-    with (tmp_path / "workers.log").open("w") as log:
-        child = subprocess.Popen(
-            command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
-        )
-        try:
-            code = child.wait(timeout=600)
-        finally:
-            if child.poll() is None:
-                os.killpg(child.pid, signal.SIGTERM)
-                try:
-                    child.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    child.wait()
-    assert code == 0, (tmp_path / "workers.log").read_text()[-12000:]
+    from tests.distributed.tpu_test_utils import (
+        kill_process_group,
+        run_tpu_worker_session,
+    )
+
+    def _run_attempt(attempt: int) -> tuple[int, str, Path]:
+        attempt_dir = tmp_path / f"attempt_{attempt}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--tp",
+            str(tp),
+            "--out",
+            str(attempt_dir),
+        ]
+        log_path = attempt_dir / "workers.log"
+        with log_path.open("w", encoding="utf-8") as log:
+            child = subprocess.Popen(
+                command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            )
+            try:
+                code = child.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                code = 124
+            finally:
+                kill_process_group(child)
+        return code, log_path.read_text(errors="replace"), attempt_dir
+
+    code, log_text, attempt_dir = run_tpu_worker_session(_run_attempt)
+    assert code == 0, log_text[-12000:]
     for rank in range(8):
-        result = json.loads((tmp_path / f"rank{rank}.json").read_text())
+        result = json.loads((attempt_dir / f"rank{rank}.json").read_text())
         assert result["checks"] == 96
         assert not result["errors"], result
 
@@ -60,6 +68,9 @@ def _worker(tp, out):
     import torch_tpu  # noqa: F401
     from torch import distributed as dist
 
+    torch._dynamo.config.cache_size_limit = max(
+        torch._dynamo.config.cache_size_limit, 64
+    )
     rank = int(os.environ["RANK"])
     dp, dp_rank = 8 // tp, rank // tp
     dist.init_process_group(backend="tpu_dist", timeout=datetime.timedelta(seconds=120))
@@ -202,8 +213,8 @@ def _worker(tp, out):
                                     scenario=scenario,
                                 )
                             )
-                    torch._dynamo.reset()
             finally:
+                torch._dynamo.reset()
                 table.close()
     (out / f"rank{rank}.json").write_text(
         json.dumps(dict(rank=rank, checks=checks, errors=errors))
@@ -224,8 +235,12 @@ def _main():
         _worker(args.tp, args.out)
         return
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from tests.distributed.tpu_test_utils import prepare_tpu_environment
+    from tests.distributed.tpu_test_utils import (
+        clear_tpu_launch_env,
+        prepare_tpu_environment,
+    )
 
+    clear_tpu_launch_env()
     prepare_tpu_environment(world_size=8)
     command = [
         sys.executable,

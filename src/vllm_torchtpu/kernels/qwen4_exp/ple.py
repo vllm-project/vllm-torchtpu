@@ -6,6 +6,8 @@ import math
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu import envs
+
 
 def compact_rows(table, ids, *, head_dim: int):
     """Gather rows from 128-element storage segments without row padding.
@@ -83,7 +85,9 @@ def decode_embeddings(raw_embeddings, scale):
     if raw_embeddings.dtype == jnp.int16:
         return jax.lax.bitcast_convert_type(raw_embeddings, jnp.bfloat16)
     values = jax.lax.bitcast_convert_type(raw_embeddings, jnp.float8_e4m3fn)
-    return _bf16(_bf16(values) * scale.astype(jnp.bfloat16))
+    # FP8 E4M3 values are exactly representable in BF16, so the widening
+    # needs no rounding barrier of its own (bit-identical).
+    return _bf16(values.astype(jnp.bfloat16) * scale.astype(jnp.bfloat16))
 
 
 def resident_lookup(
@@ -136,19 +140,48 @@ def short_conv(
     valid = (t < starts[-1]) & (slots[req] >= 0)
     safe_slots = jnp.clip(slots, 0, history.shape[0] - 1)
     state_len = history.shape[1]
+    # VLLM_TPU_PLE_CONV_HISTORY_FAST: request-owned history starts at packed
+    # position zero, so taps read history only for each request's first rows.
+    fast_history = request_owned_history and envs.VLLM_TPU_PLE_CONV_HISTORY_FAST
     accum = jnp.zeros((token_count, channels), jnp.float32)
     for tap in range(weight.shape[-1]):
         distance = state_len - tap * dilation
         position = relative - distance
-        # A one-tap convolution has no historical state and only distance 0.
-        past = (
-            history[safe_slots[req], jnp.clip(position + state_len, 0, state_len - 1)]
-            if state_len
-            else jnp.zeros_like(x)
-        )
-        past = jnp.where(has_initial_states[req, None], past, 0)
         current = x[jnp.clip(t - distance, 0, token_count - 1)]
-        value = jnp.where((position >= 0)[:, None], current, past)
+        if fast_history and distance == 0:
+            # Packed positions are nonnegative, so distance 0 reads no history.
+            value = current
+        elif (
+            fast_history
+            and state_len
+            and distance > 0
+            and requests * distance < token_count
+        ):
+            # History supplies only rows with relative < distance: gather
+            # O(R*distance*C) elements instead of one history row per token.
+            # Inactive scatter destinations are out of bounds and dropped.
+            offsets = jnp.arange(distance, dtype=jnp.int32)
+            past = history[safe_slots[:, None], state_len - distance + offsets]
+            past = jnp.where(has_initial_states[:, None, None], past, 0)
+            destinations = starts[:-1, None] + offsets
+            lengths = starts[1:] - starts[:-1]
+            active = (offsets < lengths[:, None]) & (slots[:, None] >= 0)
+            destinations = jnp.where(active, destinations, token_count)
+            value = jnp.where((position >= 0)[:, None], current, 0)
+            value = value.at[destinations.reshape(-1)].set(
+                past.reshape(-1, channels), mode="drop"
+            )
+        else:
+            # A one-tap convolution has no historical state and only distance 0.
+            past = (
+                history[
+                    safe_slots[req], jnp.clip(position + state_len, 0, state_len - 1)
+                ]
+                if state_len
+                else jnp.zeros_like(x)
+            )
+            past = jnp.where(has_initial_states[req, None], past, 0)
+            value = jnp.where((position >= 0)[:, None], current, past)
         accum = accum + value.astype(jnp.float32) * weight[:, tap].astype(jnp.float32)
     pre = _bf16(accum)
     output = _bf16(jax.nn.silu(pre.astype(jnp.float32)))

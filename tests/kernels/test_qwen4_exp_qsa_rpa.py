@@ -330,8 +330,11 @@ def test_empty_step_preserves_native_owners(fp8):
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("prefix_slice", [False, True])
 @pytest.mark.parametrize("fp8", [False, True])
-def test_mixed_prefill_decode_matches_independent_state_reference(fp8, prefix_slice, monkeypatch):
-    """VLLM_TPU_QSA_PREFIX_SLICE moves the decode prefix with dynamic slices, not row gathers."""
+def test_mixed_prefill_decode_matches_independent_state_reference(
+    fp8, prefix_slice, monkeypatch
+):
+    """VLLM_TPU_QSA_PREFIX_SLICE moves the decode prefix with dynamic slices, not row
+    gathers."""
     from vllm_torchtpu import envs
 
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFIX_SLICE", prefix_slice)
@@ -353,4 +356,6 @@ def test_prefix_slice_helpers_match_the_row_gathers(cap):
         )
     if cap:
         d = x[:cap]
-        np.testing.assert_array_equal(qsa_rpa._pad_rows(d, 64), d[np.minimum(r, cap - 1)])
+        np.testing.assert_array_equal(
+            qsa_rpa._pad_rows(d, 64), d[np.minimum(r, cap - 1)]
+        )

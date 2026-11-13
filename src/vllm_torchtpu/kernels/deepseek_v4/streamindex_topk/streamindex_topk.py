@@ -21,6 +21,8 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+
+from vllm_torchtpu.kernels import sorted_search
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
@@ -1181,6 +1183,7 @@ def _effective_row_lengths(
         "topk_backend",
         "decode_passes",
         "hoist_step_metadata",
+        "tile_aligned_scores",
     ),
 )
 def streamindex_topk(
@@ -1213,12 +1216,19 @@ def streamindex_topk(
     topk_backend: TopKBackend = _DEFAULT_TOPK_BACKEND,
     decode_passes: bool = True,
     hoist_step_metadata: bool = False,
+    tile_aligned_scores: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
+    ``tile_aligned_scores=True`` rounds each token's score rows up to a whole
+    (8, 128) int32 tile. The HBM scores are then the row-major flat array the
+    SparseCore top-k reads, so handing them over is a bitcast instead of a
+    relayout copy; the padding is past every ``row_lengths`` and never read.
+
     ``hoist_step_metadata=True`` builds the step-level metadata (and the pass
-    schedules of a single-chunk call) outside the early-exit ``lax.cond``, so
-    XLA can CSE them across the layers of a step.
+    schedules of a single-chunk call) outside the early-exit ``lax.cond``, and
+    each pass schedule without the empty-pass ``lax.cond``, so XLA can CSE
+    them across the layers of a step.
 
     ``decode_passes=False`` emits only the mixed pass. The caller must then pass
     ``distribution = [0, 0, n]``, so the mixed pass covers every sequence; this
@@ -1384,8 +1394,10 @@ def streamindex_topk(
         page_size = page_size_per_kv_packing * (
             kv_packing if components is None else components.keys.packing
         )
-    pages_per_seq = page_indices.shape[0] // max_num_seqs * (
-        1 if components is None else components.table_expansion[0]
+    pages_per_seq = (
+        page_indices.shape[0]
+        // max_num_seqs
+        * (1 if components is None else components.table_expansion[0])
     )
 
     for bkv_p in num_kv_pages_per_blocks:
@@ -1399,6 +1411,8 @@ def streamindex_topk(
         align_to(pages_per_seq, bkv_p) * page_size // 128
         for bkv_p in num_kv_pages_per_blocks
     )
+    if tile_aligned_scores:
+        num_sublanes_total = align_to(num_sublanes_total, 8)
 
     def _block_sizes(num_queries_per_block, bkv_p, static_q_len):
         """Query and KV block sizes a pass runs with."""
@@ -1603,6 +1617,7 @@ def streamindex_topk(
             cp_rank=cp_rank,
             cp_size=cp_size,
             interleave_c=interleave_c,
+            select_empty_pass=hoist_step_metadata,
         )
 
     def _scores_for_chunk(
@@ -1782,7 +1797,7 @@ def streamindex_topk(
     def _fast_path(_):
         token_idx = jnp.arange(q.shape[0])
         seq_idx = jnp.minimum(
-            jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
+            sorted_search.searchsorted(cu_q_lens[1:], token_idx, side="right"),
             seq_lens.shape[0] - 1,
         )
         seq_len = seq_lens[seq_idx]

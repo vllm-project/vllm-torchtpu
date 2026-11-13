@@ -120,7 +120,9 @@ def quantize_kv(value, scale):
 
 
 def _shift_clip(x, d: int):
-    """``x[clip(t + d, 0, len(x) - 1)]`` for a static ``d``: slices and an edge repeat."""
+    """``x[clip(t + d, 0, len(x) - 1)]`` for a static ``d``: slices and an edge
+    repeat.
+    """
     if d == 0 or len(x) == 0:
         return x
     d = max(-len(x), min(d, len(x)))
@@ -130,7 +132,9 @@ def _shift_clip(x, d: int):
 
 
 def _select_shift(x, phase, j: int, ratio: int):
-    """``x[clip(t - phase[t] + j)]``: member ``j`` of token ``t``'s compression group."""
+    """``x[clip(t - phase[t] + j)]``: member ``j`` of token ``t``'s compression
+    group.
+    """
     out = _shift_clip(x, j)
     for p in range(1, ratio):
         mask = (phase == p).reshape((-1,) + (1,) * (x.ndim - 1))
@@ -190,8 +194,10 @@ def _indexer_updates(
     chunk_indices = starts[req, None] + members - context[req, None]
     first_index = starts[req] + group_start - context[req]
     if envs.VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT:
-        # Same values without per-token row gathers: a token's group members sit at static
-        # offsets -3..3 from it (selected by logical % ratio), and the ring / tag rows come
+        # Same values without per-token row gathers: a token's group members sit at
+        # static
+        # offsets -3..3 from it (selected by logical % ratio), and the ring / tag rows
+        # come
         # from a one-hot product over the few (slot, lane) pairs.
         phase = logical % ratio
         current = jnp.stack(

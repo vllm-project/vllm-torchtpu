@@ -83,12 +83,14 @@ def _write_f32_rows(raw_block: np.ndarray, rows: np.ndarray, row0: int) -> None:
 
 
 def _manager_view(raw: np.ndarray) -> np.ndarray:
-    """[blocks * split, kb, ...] -> [blocks, 512, ...]: the same bytes, row-major per manager block."""
+    """[blocks * split, kb, ...] -> [blocks, 512, ...]: the same bytes, row-major per
+    manager block."""
     return raw.reshape(-1, 512, *raw.shape[2:])
 
 
 def ref_read(raw: np.ndarray, mgr: int) -> tuple[np.ndarray, np.ndarray]:
-    """(ssm [VH, KD, VD] f32, conv [3, QKV] f32) of manager block `mgr` (any kernel block)."""
+    """(ssm [VH, KD, VD] f32, conv [3, QKV] f32) of manager block `mgr` (any kernel
+    block)."""
     rows = _f32_rows(_manager_view(raw)[mgr])
     ssm = rows[:384].reshape(-1)[: VH * KD * VD].view(np.float32).reshape(VH, KD, VD)
     conv = rows[384:400].reshape(-1)[: 3 * QKV].view(np.float32).reshape(3, QKV)
@@ -102,7 +104,10 @@ def ref_conv_pad_row(raw: np.ndarray, mgr: int) -> np.ndarray:
 def ref_write(raw: np.ndarray, mgr: int, ssm: np.ndarray, conv: np.ndarray) -> None:
     view = _manager_view(raw)  # a view: writes land in `raw`
     flat = np.concatenate(
-        [ssm.astype(np.float32).reshape(-1, LANES), conv.astype(np.float32).reshape(15, LANES)]
+        [
+            ssm.astype(np.float32).reshape(-1, LANES),
+            conv.astype(np.float32).reshape(15, LANES),
+        ]
     )
     _write_f32_rows(view[mgr], flat, 0)
 
@@ -148,11 +153,11 @@ def _metadata():
     read = jnp.stack(
         [
             gs.read_blocks_from_metadata(
-                jnp.asarray(state_indices[l]),
-                jnp.asarray(slot_read_offsets[l]),
-                jnp.asarray(ckpt[l]),
+                jnp.asarray(state_indices[ln]),
+                jnp.asarray(slot_read_offsets[ln]),
+                jnp.asarray(ckpt[ln]),
             )
-            for l in range(NL)
+            for ln in range(NL)
         ]
     )
     return read, jnp.asarray(ckpt)
@@ -183,13 +188,13 @@ def check_gather(raw, read, conv, rec):
     assert conv.shape == (NL, NS, 8, QKV) and conv.dtype == np.float32
     assert rec.shape == (NL, NS * VH, KD, VD)
     read = np.asarray(read)
-    for l in range(NL):
+    for ln in range(NL):
         for s in range(NS):
-            ssm_ref, conv_ref = ref_read(raw, int(read[l, s]))
-            np.testing.assert_array_equal(conv[l, s, :3], conv_ref)
-            np.testing.assert_array_equal(conv[l, s, 3:], 0.0)
+            ssm_ref, conv_ref = ref_read(raw, int(read[ln, s]))
+            np.testing.assert_array_equal(conv[ln, s, :3], conv_ref)
+            np.testing.assert_array_equal(conv[ln, s, 3:], 0.0)
             np.testing.assert_array_equal(
-                rec[l, s * VH : (s + 1) * VH], _bf16_round(ssm_ref)
+                rec[ln, s * VH : (s + 1) * VH], _bf16_round(ssm_ref)
             )
 
 
@@ -197,17 +202,17 @@ def check_scatter(before, after, conv_ckpt, rec_ckpt, write):
     write = np.asarray(write)
     rec_f32 = np.asarray(jnp.asarray(rec_ckpt).astype(jnp.float32))
     written = {int(b) for b in write.reshape(-1)}
-    for l in range(NL):
+    for ln in range(NL):
         for s in range(NS):
             for t in range(T):
-                b = int(write[l, s, t])
+                b = int(write[ln, s, t])
                 if b == 0:
                     continue  # null block: shared by padded slots
                 ssm, conv = ref_read(after, b)
                 row = (s * T + t) * VH
-                np.testing.assert_array_equal(ssm, rec_f32[l, row : row + VH])
+                np.testing.assert_array_equal(ssm, rec_f32[ln, row : row + VH])
                 # conv window ending at token t = last 3 inputs: rows t+1..t+3
-                np.testing.assert_array_equal(conv, conv_ckpt[l, s, t + 1 : t + 4])
+                np.testing.assert_array_equal(conv, conv_ckpt[ln, s, t + 1 : t + 4])
                 np.testing.assert_array_equal(ref_conv_pad_row(after, b), 0)
     for m in range(NMB):
         rows = slice(m * SPLIT, (m + 1) * SPLIT)
@@ -249,7 +254,12 @@ def test_reference_matches_pool_adapters_typed_view():
     raw = _make_pool(1)
     idx = jnp.asarray([3, 7], jnp.int32)
     got = pool_adapters.gather_region(
-        _to_pool(raw), idx, tok0=384, ntok=16, out_dtype=jnp.float32, split=4,
+        _to_pool(raw),
+        idx,
+        tok0=384,
+        ntok=16,
+        out_dtype=jnp.float32,
+        split=4,
         interpret=True,
     )
     for i, m in enumerate((3, 7)):
@@ -309,16 +319,16 @@ def test_round_trip_resumes_from_accepted_checkpoint():
     read = jnp.asarray(picked)
     conv, rec = _gather(pool, read)
     conv, rec = np.asarray(conv), np.asarray(rec)
-    for l in range(NL):
+    for ln in range(NL):
         for s in range(NS - 1):  # skip the padded slot (null block)
-            t = int(offs[l, s])
+            t = int(offs[ln, s])
             np.testing.assert_array_equal(
-                conv[l, s, :3], conv_ckpt[l, s, t + 1 : t + 4]
+                conv[ln, s, :3], conv_ckpt[ln, s, t + 1 : t + 4]
             )
             row = (s * T + t) * VH
             np.testing.assert_array_equal(
-                rec[l, s * VH : (s + 1) * VH].view(np.uint16),
-                rec_ckpt[l, row : row + VH].view(np.uint16),
+                rec[ln, s * VH : (s + 1) * VH].view(np.uint16),
+                rec_ckpt[ln, row : row + VH].view(np.uint16),
             )
 
 

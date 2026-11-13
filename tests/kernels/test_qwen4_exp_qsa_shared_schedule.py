@@ -54,7 +54,11 @@ def _attend(args, starts, *, fused, shared, **options):
 
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("offset", [0, 1])
-def test_shared_schedule_matches_per_slot_launch(kernels, fused, offset):
+def test_shared_schedule_matches_per_slot_launch(
+    kernels,  # noqa: F811
+    fused,
+    offset,
+):
     rng = np.random.default_rng(31 + offset)
     args, starts = _verify_step(rng, [300, 0, 41, 129, 7], 4, 24, 16, 128, 3)
     options = dict(max_query_len=4)
@@ -77,7 +81,7 @@ def test_shared_schedule_matches_per_slot_launch(kernels, fused, offset):
     assert cache.shape == args[5].shape
 
 
-def test_shared_schedule_mixed_step_prefix(kernels):
+def test_shared_schedule_mixed_step_prefix(kernels):  # noqa: F811
     rng = np.random.default_rng(17)
     args, starts = _verify_step(rng, [100, 600, 31], 2, 12, 16, 128, 6)
     # Make the last request a prefill chunk past the decode capacity.
@@ -94,8 +98,11 @@ def _schedules(text):
     calls = [line for line in text.splitlines() if "@tpu_custom_call" in line]
     names = [re.search(r'kernel_name = "([^"]+)"', c).group(1) for c in calls]
     return (
-        [c[c.index("backend_config") :] for c, n in zip(calls, names)
-         if n == "rpa_metadata_schedule"],
+        [
+            c[c.index("backend_config") :]
+            for c, n in zip(calls, names)
+            if n == "rpa_metadata_schedule"
+        ],
         [n for n in names if n.startswith("RPA")],
     )
 

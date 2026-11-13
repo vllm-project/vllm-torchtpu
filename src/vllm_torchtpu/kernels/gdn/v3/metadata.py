@@ -63,6 +63,44 @@ def compute_batched_seq_metadata(
     )
 
 
+def roll_per_seq_inputs(
+    query_start_loc: jax.Array,
+    seq_lens: jax.Array,
+    state_indices: jax.Array,
+    read_offsets: jax.Array,
+    start_seq: jax.Array,
+    ckpt_indices: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None]:
+    """Shifts the per-sequence inputs so the first element is `start_seq`.
+
+    The PER_SEQ metadata reads these rolled arrays. They depend only on the
+    step's metadata, so a caller running many GDN layers per step may roll
+    them once and pass them to `compute_per_seq_metadata(prerolled=True)`.
+    """
+    query_start_loc = jnp.roll(query_start_loc, shift=-start_seq)
+    seq_lens = jnp.roll(seq_lens, shift=-start_seq)
+    state_indices = jnp.roll(state_indices, shift=-start_seq)
+    read_offsets = jnp.roll(read_offsets, shift=-start_seq)
+    if ckpt_indices is not None:
+        # Sequence-major axis only: the checkpoint axis must stay put or the
+        # read offset would select another slot's block.
+        ckpt_indices = jnp.roll(ckpt_indices, shift=-start_seq, axis=0)
+    return query_start_loc, seq_lens, state_indices, read_offsets, ckpt_indices
+
+
+def per_seq_tile_slots(cfg: config.GDNConfig, max_seqs: int, tile_sized: bool) -> int:
+    """Length of the PER_SEQ per-tile metadata arrays.
+
+    A sequence of `q` tokens takes `cdiv(q, chunk)` tiles, so a call takes at
+    most `cdiv(batch, chunk) + max_seqs` of them. Two spare slots keep the
+    pipeline's one-tile lookahead past the last tile on entries that the
+    token-sized arrays hold there too (the `jnp.repeat` fill).
+    """
+    if not tile_sized:
+        return cfg.batch_size
+    return min(cfg.batch_size, pl.cdiv(cfg.batch_size, cfg.chunk_size) + max_seqs + 2)
+
+
 def compute_per_seq_metadata(
     cfg: config.GDNConfig,
     seq_lens: jax.Array,
@@ -72,6 +110,9 @@ def compute_per_seq_metadata(
     start_seq: jax.Array,
     end_seq: jax.Array,
     ckpt_indices: jax.Array | None = None,
+    prerolled: bool = False,
+    prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
+    tile_sized: bool = False,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing single sequence per tile.
 
@@ -81,21 +122,34 @@ def compute_per_seq_metadata(
     prefix-cache resume on the unified pool may land on a boundary state
     block whose committed state is a non-zero checkpoint from a verify step.
     The final state is always written to checkpoint 0.
+
+    With `prerolled`, the per-sequence inputs already went through
+    `roll_per_seq_inputs` with this `start_seq`.
+
+    `prefill_ckpt` is `(offsets, blocks)`, both `[max_seqs]` and indexed like
+    `seq_lens` (never prerolled): sequence `s` also writes the state after
+    its first `offsets[s]` query tokens to source block `blocks[s]`, an
+    internal prefill checkpoint (VLLM_TPU_MAMBA_TAIL_FOLD). The offset must be
+    a multiple of `cfg.chunk_size`: the tile ending there is marked as a last
+    tile with that block as its destination, and the next tile still resumes
+    from the carry. Offset or block 0 means none.
     """
     max_seqs = seq_lens.size
-    max_tokens = cfg.batch_size
+    max_tokens = per_seq_tile_slots(cfg, max_seqs, tile_sized)
     all_seqs = jnp.arange(max_seqs)
     all_tokens = jnp.arange(max_tokens)
 
-    # Shift to ensure first element is for start_seq.
-    query_start_loc = jnp.roll(query_start_loc, shift=-start_seq)
-    seq_lens = jnp.roll(seq_lens, shift=-start_seq)
-    state_indices = jnp.roll(state_indices, shift=-start_seq)
-    read_offsets = jnp.roll(read_offsets, shift=-start_seq)
-    if ckpt_indices is not None:
-        # Sequence-major axis only: the checkpoint axis must stay put or the
-        # read offset would select another slot's block.
-        ckpt_indices = jnp.roll(ckpt_indices, shift=-start_seq, axis=0)
+    if not prerolled:
+        query_start_loc, seq_lens, state_indices, read_offsets, ckpt_indices = (
+            roll_per_seq_inputs(
+                query_start_loc,
+                seq_lens,
+                state_indices,
+                read_offsets,
+                start_seq,
+                ckpt_indices,
+            )
+        )
 
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     # NOTE: query_lens is used for calculating num_tiles. Defensive programming
@@ -140,6 +194,20 @@ def compute_per_seq_metadata(
     has_initial_state = (seq_lens - query_lens) > 0
     p_id_is_first_tile = p_id_to_t_id == 0
     p_id_is_last_tile = p_id_to_t_id == (s_idx_to_num_tiles[p_id_to_s_idx] - 1)
+    p_id_to_state_override = None
+    if prefill_ckpt is not None:
+        ckpt_offsets, ckpt_blocks = (
+            jnp.roll(x.astype(jnp.int32), shift=-start_seq) for x in prefill_ckpt
+        )
+        tile_offset = ckpt_offsets[p_id_to_s_idx]
+        tile_block = ckpt_blocks[p_id_to_s_idx]
+        is_ckpt_tile = (
+            (tile_offset > 0)
+            & (tile_block > 0)
+            & ((p_id_to_t_id + 1) * cfg.chunk_size == tile_offset)
+        )
+        p_id_is_last_tile = p_id_is_last_tile | is_ckpt_tile
+        p_id_to_state_override = jnp.where(is_ckpt_tile, tile_block, 0)
 
     # NOTE: Since query_lens[i] = 0 where i >= num_seqs, s_idx_to_num_tiles[i]
     # where i >= num_seqs will also be 0. Therefore, s_idx_to_num_tiles.sum()
@@ -158,4 +226,5 @@ def compute_per_seq_metadata(
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
         s_idx_to_ckpt_indices=ckpt_indices,
+        p_id_to_state_override=p_id_to_state_override,
     )

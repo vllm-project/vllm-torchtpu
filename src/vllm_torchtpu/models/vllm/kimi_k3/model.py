@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Hashable, Iterable
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 import torch
@@ -589,7 +589,8 @@ class KimiK3ForConditionalGeneration(
             else:
                 self.vision_tower = self.vision_tower.to(device=self.device)
 
-            self.mm_projector = KimiK25MultiModalProjector(
+            projector_cls = cast(Any, KimiK25MultiModalProjector)
+            self.mm_projector = projector_cls(
                 config=config.vision_config,
                 use_data_parallel=self.use_data_parallel,
                 quant_config=vision_quant_config,

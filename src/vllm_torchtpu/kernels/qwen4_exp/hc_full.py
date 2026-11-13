@@ -13,6 +13,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+# RMS-norm variants of the norm loop (TPU_QWEN4_HC_PREFILL_NORM); shared with
+# the fused prefill mix kernel.
 from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_fused import (
     NORM_IMPLS,
     branch_variance,
@@ -22,41 +24,44 @@ from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_fused import (
 
 
 def _kernel(
-    x_hbm,
-    weight_hbm,
-    down_hbm,
-    up_hbm,
-    mixed_hbm,
-    norm_hbm,
-    x_vm,
-    weight_vm,
-    down_vm,
-    up_vm,
-    mixed_vm,
-    norm_vm,
-    x_sems,
-    weight_sem,
-    down_sem,
-    up_sem,
-    mixed_sems,
-    norm_sems,
-    *,
-    token_tile,
-    tokens,
-    hidden,
-    branches,
-    eps,
-    norm_impl="vpu",
+    *refs, token_tile, tokens, hidden, branches, eps, up_t, combine, inject, norm_impl="vpu"
 ):
+    refs = iter(refs)
+    take = lambda n: [next(refs) for _ in range(n)]  # noqa: E731
+    x_hbm, *extra_hbm = take(3 if combine else 1)
+    weight_hbm, down_hbm, up_hbm, *inject_hbm = take(4 if inject else 3)
+    # With ``inject`` the kernel emits the combine's gate projection in place
+    # of the normalized input (its only other consumer).
+    mixed_hbm, norm_hbm, *combined_hbm = take(3 if combine else 2)
+    x_vm, *extra_vm = take(3 if combine else 1)
+    # With ``inject`` the gate weight rows follow the down projection's in
+    # ``down_vm``: one matmul yields both (the MXU pads 320 columns anyway).
+    weight_vm, down_vm, up_vm = take(3)
+    mixed_vm, norm_vm, *proj_vm = take(3 if inject else 2)
+    x_sems, *extra_sems = take(3 if combine else 1)
+    weight_sem, down_sem, up_sem, *inject_sem = take(4 if inject else 3)
+    mixed_sems, norm_sems, *combined_sems = take(3 if combine else 2)
+    if combine:
+        block_hbm, gates_hbm = extra_hbm
+        block_vm, gates_vm = extra_vm
+        block_sems, gates_sems = extra_sems
+        (combined_hbm,) = combined_hbm
+        (combined_sems,) = combined_sems
+    lowrank = down_hbm.shape[0]
+    if inject:
+        (proj_vm,) = proj_vm
+        inject_dma = pltpu.make_async_copy(
+            inject_hbm[0], down_vm.at[pl.ds(lowrank, branches)], inject_sem[0]
+        )
+        inject_dma.start()
     weight_dma = pltpu.make_async_copy(weight_hbm, weight_vm, weight_sem)
-    down_dma = pltpu.make_async_copy(down_hbm, down_vm, down_sem)
+    down_dma = pltpu.make_async_copy(
+        down_hbm, down_vm.at[pl.ds(0, lowrank)] if inject else down_vm, down_sem
+    )
     up_dma = pltpu.make_async_copy(up_hbm, up_vm, up_sem)
     weight_dma.start()
     down_dma.start()
     up_dma.start()
-    pltpu.make_async_copy(
-        x_hbm.at[pl.ds(0, token_tile)], x_vm.at[0], x_sems.at[0]
-    ).start()
 
     num_full = tokens // token_tile
     # TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: a last tile of `remainder` rows (a
@@ -68,29 +73,88 @@ def _kernel(
     def rows_of(ref, parity, rows):
         return ref.at[parity] if rows == token_tile else ref.at[parity, pl.ds(0, rows)]
 
+    def wait_norm_output(slot, rows=token_tile):
+        """Wait for the slot's last ``norm`` (or gate projection) output copy."""
+        out_vm = proj_vm if inject else norm_vm
+        pltpu.make_async_copy(
+            rows_of(out_vm, slot, rows), rows_of(out_vm, slot, rows), norm_sems.at[slot]
+        ).wait()
+
+    def input_copies(step, slot, count=token_tile):
+        rows = pl.ds(step * token_tile, count)
+        copies = [
+            pltpu.make_async_copy(
+                x_hbm.at[rows], rows_of(x_vm, slot, count), x_sems.at[slot]
+            )
+        ]
+        if combine:
+            copies.append(
+                pltpu.make_async_copy(
+                    block_hbm.at[rows], rows_of(block_vm, slot, count), block_sems.at[slot]
+                )
+            )
+            copies.append(
+                pltpu.make_async_copy(
+                    gates_hbm.at[rows], rows_of(gates_vm, slot, count), gates_sems.at[slot]
+                )
+            )
+        return copies
+
+    for copy in input_copies(0, 0):
+        copy.start()
+
+    def combine_rows(parity, count=token_tile):
+        """x tile <- bf16(residual + block * gate) per branch (the gated residual)."""
+
+        def rows(index, carry):
+            offset = pl.ds(index * 32, 32)
+            block = block_vm[parity, offset, :].astype(jnp.float32)
+            gates = gates_vm[parity, offset, :]
+            for branch in range(branches):
+                cols = pl.ds(branch * hidden, hidden)
+                residual = x_vm[parity, offset, cols].astype(jnp.float32)
+                x_vm[parity, offset, cols] = (
+                    residual + block * gates[:, branch : branch + 1]
+                ).astype(jnp.bfloat16)
+            return carry
+
+        jax.lax.fori_loop(0, count // 32, rows, jnp.int32(0))
+
     def one_step(step, parity, rows=token_tile):
         # The previous step started this input copy. Wait at its first read.
-        pltpu.make_async_copy(
-            rows_of(x_vm, parity, rows), rows_of(x_vm, parity, rows), x_sems.at[parity]
-        ).wait()
+        for copy in input_copies(step, parity, rows):
+            copy.wait()
+
+        if combine:
+
+            @pl.when(step >= 1)
+            def _wait_prior_combined_output():
+                # The next input copy reuses the slot the previous step wrote out.
+                pltpu.make_async_copy(
+                    x_vm.at[1 - parity],
+                    x_vm.at[1 - parity],
+                    combined_sems.at[1 - parity],
+                ).wait()
 
         @pl.when(step + 1 < num_full)
         def _start_next_input():
-            pltpu.make_async_copy(
-                x_hbm.at[pl.ds((step + 1) * token_tile, token_tile)],
-                x_vm.at[1 - parity],
-                x_sems.at[1 - parity],
-            ).start()
+            for copy in input_copies(step + 1, 1 - parity):
+                copy.start()
 
         if remainder and rows == token_tile:
 
             @pl.when(step + 1 == num_full)
             def _start_partial_input():
-                pltpu.make_async_copy(
-                    x_hbm.at[pl.ds((step + 1) * token_tile, remainder)],
-                    x_vm.at[1 - parity, pl.ds(0, remainder)],
-                    x_sems.at[1 - parity],
-                ).start()
+                for copy in input_copies(step + 1, 1 - parity, remainder):
+                    copy.start()
+
+        if combine:
+            combine_rows(parity, rows)
+            pltpu.make_async_copy(
+                rows_of(x_vm, parity, rows),
+                combined_hbm.at[pl.ds(step * token_tile, rows)],
+                combined_sems.at[parity],
+            ).start()
 
         if token_tile >= 32 and token_tile % 32 == 0:
 
@@ -100,32 +164,37 @@ def _kernel(
 
             @pl.when(step >= 2)
             def _wait_prior_norm_output():
-                pltpu.make_async_copy(
-                    norm_vm.at[parity], norm_vm.at[parity], norm_sems.at[parity]
-                ).wait()
+                wait_norm_output(parity)
 
             step_rows = norm_rows_per_step(norm_impl, rows)
 
             def normalize_rows(index, carry):
                 offset = index * step_rows
-                weight = weight_vm[...].astype(jnp.float32)
+                if norm_impl == "vpu":
+                    weight = weight_vm[...].astype(jnp.float32)
                 for branch in range(branches):
                     start = branch * hidden
-                    xb = x_vm[parity, pl.ds(offset, step_rows), pl.ds(start, hidden)]
-                    values = xb.astype(jnp.float32)
-                    variance = branch_variance(values, xb, hidden, norm_impl)
-                    if norm_impl.startswith("bf16ep"):
+                    if norm_impl != "vpu":
+                        # TPU_QWEN4_HC_PREFILL_NORM variants.
+                        xb = x_vm[parity, pl.ds(offset, step_rows), pl.ds(start, hidden)]
+                        values = xb.astype(jnp.float32)
+                        variance = branch_variance(values, xb, hidden, norm_impl)
+                        w_bf16 = weight_vm[pl.ds(start, hidden)][None, :]
                         norm_vm[
                             parity, pl.ds(offset, step_rows), pl.ds(start, hidden)
                         ] = norm_epilogue(
                             values,
                             variance,
-                            None,
-                            weight_vm[pl.ds(start, hidden)][None, :],
+                            w_bf16.astype(jnp.float32),
+                            w_bf16,
                             eps,
                             norm_impl,
                         )
                         continue
+                    values = x_vm[
+                        parity, pl.ds(offset, 32), pl.ds(start, hidden)
+                    ].astype(jnp.float32)
+                    variance = jnp.mean(values * values, axis=-1, keepdims=True)
                     normalized = (
                         (values * jax.lax.rsqrt(variance + eps))
                         .astype(jnp.bfloat16)
@@ -136,7 +205,7 @@ def _kernel(
                         .astype(jnp.bfloat16)
                         .astype(jnp.float32)
                     )
-                    norm_vm[parity, pl.ds(offset, step_rows), pl.ds(start, hidden)] = (
+                    norm_vm[parity, pl.ds(offset, 32), pl.ds(start, hidden)] = (
                         normalized + scaled
                     ).astype(jnp.bfloat16)
                 return carry
@@ -144,6 +213,7 @@ def _kernel(
             jax.lax.fori_loop(0, rows // step_rows, normalize_rows, jnp.int32(0))
             norm = norm_vm[parity] if rows == token_tile else norm_vm[parity, pl.ds(0, rows)]
         else:
+            # Only whole tiles here: a partial tile needs token_tile % 32 == 0.
             x = x_vm[parity].astype(jnp.float32)
 
             @pl.when(step == 0)
@@ -171,20 +241,21 @@ def _kernel(
 
             @pl.when(step >= 2)
             def _wait_prior_norm_output():
-                pltpu.make_async_copy(
-                    norm_vm.at[parity], norm_vm.at[parity], norm_sems.at[parity]
-                ).wait()
+                wait_norm_output(parity)
 
             norm_vm[parity] = norm
-        pltpu.make_async_copy(
-            rows_of(norm_vm, parity, rows),
-            norm_hbm.at[pl.ds(step * token_tile, rows)],
-            norm_sems.at[parity],
-        ).start()
+        if not inject:
+            pltpu.make_async_copy(
+                rows_of(norm_vm, parity, rows),
+                norm_hbm.at[pl.ds(step * token_tile, rows)],
+                norm_sems.at[parity],
+            ).start()
 
         @pl.when(step == 0)
         def _wait_down():
             down_dma.wait()
+            if inject:
+                inject_dma.wait()
 
         down = jax.lax.dot_general(
             norm,
@@ -192,6 +263,17 @@ def _kernel(
             dimension_numbers=(((1,), (1,)), ((), ())),
             preferred_element_type=jnp.float32,
         ).astype(jnp.bfloat16)
+        if inject:
+            if rows == token_tile:
+                proj_vm[parity] = down[:, lowrank:]
+            else:
+                proj_vm[parity, pl.ds(0, rows)] = down[:, lowrank:]
+            pltpu.make_async_copy(
+                rows_of(proj_vm, parity, rows),
+                norm_hbm.at[pl.ds(step * token_tile, rows)],
+                norm_sems.at[parity],
+            ).start()
+            down = down[:, :lowrank]
         gate = (down / branches).astype(jnp.bfloat16)
         gate = jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16)
 
@@ -203,7 +285,7 @@ def _kernel(
             jax.lax.dot_general(
                 gate,
                 up_vm[...],
-                dimension_numbers=(((1,), (1,)), ((), ())),
+                dimension_numbers=(((1,), (0 if up_t else 1,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )
             .astype(jnp.bfloat16)
@@ -250,55 +332,108 @@ def _kernel(
     if remainder:
         last_rows[num_full % 2] = remainder
     for parity in range(2):
-        pltpu.make_async_copy(
-            rows_of(norm_vm, parity, last_rows[parity]),
-            rows_of(norm_vm, parity, last_rows[parity]),
-            norm_sems.at[parity],
-        ).wait()
+        wait_norm_output(parity, last_rows[parity])
         pltpu.make_async_copy(
             rows_of(mixed_vm, parity, last_rows[parity]),
             rows_of(mixed_vm, parity, last_rows[parity]),
             mixed_sems.at[parity],
         ).wait()
+    if combine:
+        # The last step wrote the final combined tile (earlier ones were waited
+        # by their successor): parity 1 for an even whole-tile count.
+        last = (num_full + (1 if remainder else 0) - 1) % 2
+        pltpu.make_async_copy(
+            rows_of(x_vm, last, last_rows[last]),
+            rows_of(x_vm, last, last_rows[last]),
+            combined_sems.at[last],
+        ).wait()
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "branches", "hidden", "eps", "token_tile", "interpret", "partial", "norm_impl"
-    ),
-)
-def _full_mix(
+def _pallas_mix(
     x,
     weight,
     down,
     up,
+    extra,
+    inject,
     *,
     branches,
     hidden,
     eps,
     token_tile,
-    interpret=False,
-    partial=False,
+    up_t,
     norm_impl="vpu",
+    partial=False,
+    interpret=False,
 ):
+    """The full mix over ``x`` (``extra``: (block, gates) to combine into it first).
+
+    ``inject`` (the combine's [branches, width] gate weight, or ``()``): return the
+    BF16 gate projection ``norm @ inject.T`` [tokens, branches] in place of ``norm``.
+    """
     tokens, width = x.shape
-    if norm_impl not in NORM_IMPLS:
-        raise ValueError(f"unknown HC norm_impl {norm_impl!r}")
     lowrank = down.shape[0]
     # At least two whole tiles: the drain below waits on both parities. With
-    # `partial`, a last tile of any multiple of 32 rows.
+    # `partial` (TPU_QWEN4_HC_PREFILL_PARTIAL_TILE), a last tile of any multiple
+    # of 32 rows.
     if (
         (tokens % 32 or token_tile % 32 if partial else tokens % token_tile)
         or tokens < 2 * token_tile
         or width != branches * hidden
         or weight.shape != (width,)
         or down.shape != (lowrank, width)
-        or up.shape != (width, lowrank)
+        or up.shape != ((lowrank, width) if up_t else (width, lowrank))
         or any(a.dtype != jnp.bfloat16 for a in (x, weight, down, up))
     ):
         raise ValueError("HC full mix requires even BF16 token tiles")
+    if norm_impl not in NORM_IMPLS:
+        raise ValueError(f"unknown HC norm_impl {norm_impl!r}")
+    combine = bool(extra)
+    if combine:
+        block, gates = extra
+        if (
+            block.shape != (tokens, hidden)
+            or gates.shape != (tokens, branches)
+            or block.dtype != jnp.bfloat16
+            or gates.dtype != jnp.float32
+        ):
+            raise ValueError("HC combine requires a BF16 block and FP32 gates")
+    if inject and (
+        inject[0].shape != (branches, width) or inject[0].dtype != jnp.bfloat16
+    ):
+        raise ValueError("HC inject requires a BF16 [branches, width] weight")
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    dma = pltpu.SemaphoreType.DMA
+    tiles = [pltpu.VMEM((2, token_tile, width), jnp.bfloat16)]
+    if combine:
+        tiles += [
+            pltpu.VMEM((2, token_tile, hidden), jnp.bfloat16),
+            pltpu.VMEM((2, token_tile, branches), jnp.float32),
+        ]
+    scratch = (
+        *tiles,
+        pltpu.VMEM((width,), jnp.bfloat16),
+        pltpu.VMEM((lowrank + (branches if inject else 0), width), jnp.bfloat16),
+        pltpu.VMEM(up.shape, jnp.bfloat16),
+        pltpu.VMEM((2, token_tile, hidden), jnp.bfloat16),
+        pltpu.VMEM((2, token_tile, width), jnp.bfloat16),
+        *((pltpu.VMEM((2, token_tile, branches), jnp.bfloat16),) if inject else ()),
+        *(dma((2,)) for _ in tiles),
+        dma,
+        dma,
+        dma,
+        *((dma,) if inject else ()),
+        dma((2,)),
+        dma((2,)),
+        *((dma((2,)),) if combine else ()),
+    )
+    out_shape = [
+        jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16),
+        jax.ShapeDtypeStruct((tokens, branches if inject else width), jnp.bfloat16),
+    ]
+    if combine:
+        out_shape.append(jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16))
+    inputs = (x, *extra, weight, down, up, *inject)
     return pl.pallas_call(
         functools.partial(
             _kernel,
@@ -307,33 +442,124 @@ def _full_mix(
             hidden=hidden,
             branches=branches,
             eps=eps,
+            up_t=up_t,
+            combine=combine,
+            inject=bool(inject),
             norm_impl=norm_impl,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             grid=(),
-            in_specs=(hbm,) * 4,
-            out_specs=(hbm,) * 2,
-            scratch_shapes=(
-                pltpu.VMEM((2, token_tile, width), jnp.bfloat16),
-                pltpu.VMEM((width,), jnp.bfloat16),
-                pltpu.VMEM((lowrank, width), jnp.bfloat16),
-                pltpu.VMEM((width, lowrank), jnp.bfloat16),
-                pltpu.VMEM((2, token_tile, hidden), jnp.bfloat16),
-                pltpu.VMEM((2, token_tile, width), jnp.bfloat16),
-                pltpu.SemaphoreType.DMA((2,)),
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA((2,)),
-                pltpu.SemaphoreType.DMA((2,)),
-            ),
+            in_specs=(hbm,) * len(inputs),
+            out_specs=(hbm,) * len(out_shape),
+            scratch_shapes=scratch,
         ),
-        out_shape=(
-            jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16),
-            jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16),
-        ),
+        out_shape=tuple(out_shape),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=60 << 20),
         interpret=interpret,
-        name=f"qwen4exp_hc_branchstore32_m{token_tile}",
-    )(x, weight, down, up)
+        name=f"qwen4exp_hc_{'combine_' if combine else ''}branchstore32_m{token_tile}"
+        + ("" if norm_impl == "vpu" else f"_n{norm_impl}"),
+    )(*inputs)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "branches",
+        "hidden",
+        "eps",
+        "token_tile",
+        "up_t",
+        "norm_impl",
+        "partial",
+        "interpret",
+    ),
+)
+def _full_mix(
+    x,
+    weight,
+    down,
+    up,
+    inject=None,
+    *,
+    branches,
+    hidden,
+    eps,
+    token_tile,
+    up_t=False,
+    norm_impl="vpu",
+    partial=False,
+    interpret=False,
+):
+    """``up_t``: ``up`` is given as its [low rank, width] transpose. ``inject``: the
+    second output is the gate projection (see ``_pallas_mix``)."""
+    return _pallas_mix(
+        x,
+        weight,
+        down,
+        up,
+        (),
+        () if inject is None else (inject,),
+        branches=branches,
+        hidden=hidden,
+        eps=eps,
+        token_tile=token_tile,
+        up_t=up_t,
+        norm_impl=norm_impl,
+        partial=partial,
+        interpret=interpret,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "branches",
+        "hidden",
+        "eps",
+        "token_tile",
+        "up_t",
+        "norm_impl",
+        "partial",
+        "interpret",
+    ),
+)
+def _combine_full_mix(
+    residual,
+    block,
+    gates,
+    weight,
+    down,
+    up,
+    inject=None,
+    *,
+    branches,
+    hidden,
+    eps,
+    token_tile,
+    up_t=False,
+    norm_impl="vpu",
+    partial=False,
+    interpret=False,
+):
+    """``_full_mix(gated_residual(residual, block, gates), ...)`` in one kernel.
+
+    Returns ``(mixed, norm, combined)``; ``combined`` is the gated residual
+    (the next hyper input), written once while its tile is normalized.
+    """
+    return _pallas_mix(
+        residual,
+        weight,
+        down,
+        up,
+        (block, gates),
+        () if inject is None else (inject,),
+        branches=branches,
+        hidden=hidden,
+        eps=eps,
+        token_tile=token_tile,
+        up_t=up_t,
+        norm_impl=norm_impl,
+        partial=partial,
+        interpret=interpret,
+    )

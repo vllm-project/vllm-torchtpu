@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """QSA ring/tag state I/O microbench on the 512-token FP8 pool page.
 
 Qwen3.8-Flash TP8: compress ratio 4 -> 8 ring rows x 128 lanes (1024 BF16
@@ -58,30 +71,37 @@ def test_ring_io():
                         pool, ids + (acc * 0).astype(jnp.int32), RING, TAGS
                     )
                     return acc + r[0, 0].astype(jnp.float32) * 0 + t[0, 0] * 0
+
                 return jax.lax.fori_loop(0, ITERS, body, jnp.float32(0))
 
             @jax.jit
             def write_loop(pool, ring, tags, ids):
                 def body(i, pool):
                     return qsa_state.write_ring_and_tags(pool, ring, tags, ids)
+
                 return jax.lax.fori_loop(0, ITERS, body, pool)
 
             read_us = timed(read_loop, pool, ids)
             write_us = timed(write_loop, pool, ring, tags, ids)
-            r, t = jax.jit(
-                lambda p, i: qsa_state.read_ring_and_tags(p, i, RING, TAGS)
-            )(pool, ids)
+            r, t = jax.jit(lambda p, i: qsa_state.read_ring_and_tags(p, i, RING, TAGS))(
+                pool, ids
+            )
             written = jax.jit(qsa_state.write_ring_and_tags)(pool, ring, tags, ids)
-            back = jax.jit(
-                lambda p, i: qsa_state.read_ring_and_tags(p, i, RING, TAGS)
-            )(written, ids)
-            got = (np.asarray(r).view(np.uint16), np.asarray(t),
-                   np.asarray(back[0]).view(np.uint16), np.asarray(back[1]))
+            back = jax.jit(lambda p, i: qsa_state.read_ring_and_tags(p, i, RING, TAGS))(
+                written, ids
+            )
+            got = (
+                np.asarray(r).view(np.uint16),
+                np.asarray(t),
+                np.asarray(back[0]).view(np.uint16),
+                np.asarray(back[1]),
+            )
             if ref is None:
                 ref = got
             same = all(np.array_equal(a, b) for a, b in zip(got, ref))
-            row = dict(live=live, batch=batch, read_us=read_us, write_us=write_us,
-                       same=same)
+            row = dict(
+                live=live, batch=batch, read_us=read_us, write_us=write_us, same=same
+            )
             print("RING", json.dumps(row), flush=True)
             results.append(row)
     out = os.environ.get("CDK_OUTPUT_DIR", "/tmp")

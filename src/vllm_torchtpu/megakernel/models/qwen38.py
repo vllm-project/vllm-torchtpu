@@ -64,11 +64,22 @@ class Qwen38InnerGeometry(Qwen35Geometry):
     # sigmoid(z) (Qwen3.5: silu(z)).
     gdn_gate: str = "sigmoid"
 
+    # A partial last cycle (`L % att_every == 1`) is one QSA layer: the whole-step
+    # kernel's cycles start at their QSA layer (`first="qsa"`, layers 3..47).
+    @property
+    def NATT(self) -> int:  # type: ignore[override]
+        n, rem = divmod(self.L, self.att_every)
+        return n + int(rem == 1 and self.att_every <= self.L)
+
+    @property
+    def NGDN(self) -> int:  # type: ignore[override]
+        return self.L - self.NATT
+
     def check(self, ex: ExecSpec) -> None:
         R, B, T, M = ex.R, ex.B, ex.T, ex.M
-        assert self.att_every > self.L or self.L % self.att_every == 0
+        assert self.att_every > self.L or self.L % self.att_every in (0, 1)
         assert self.NH % R == 0 and R % self.NKV == 0
-        assert self.E % R == 0 and B * self.TOPK <= 640 and 1 <= B <= M <= 64
+        assert self.E % R == 0 and B * self.TOPK <= 1280 and 1 <= B <= M <= 128
         assert self.E % 128 == 0 and self.E <= 1024 and (R & (R - 1)) == 0
         assert T >= 1 and B % T == 0, (B, T)
         for n in (self.H, self.HD, self.IR(R), self.ISR(R)):
@@ -115,7 +126,9 @@ class Qwen38Geometry:
         """Shared-expert width padded so each rank's slice is a 128 multiple."""
         return rup(self.IS, 128 * R)
 
-    def inner(self, R: int, L: int = SEGMENT_LAYERS, head: bool = False) -> Qwen35Geometry:
+    def inner(
+        self, R: int, L: int = SEGMENT_LAYERS, head: bool = False
+    ) -> Qwen35Geometry:
         """Sublayer geometry seen by the GDN / MoE / o_proj blocks.
 
         A one-layer (tail) segment has no GDN layer (`att_every=1`); a head

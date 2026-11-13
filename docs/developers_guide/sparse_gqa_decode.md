@@ -49,6 +49,6 @@ python scripts/benchmark_sparse_gqa_decode.py --help
 Use `tpu_test` markers for hardware tests. Fixture correctness and synchronized
 samples do not establish full-model or every-shape performance.
 
-[eligibility]: ../../src/vllm_torchtpu/kernels/sparse_gqa_decode/eligibility.py
-[planning]: ../../src/vllm_torchtpu/kernels/sparse_gqa_decode/planning.py
-[abi]: ../../src/vllm_torchtpu/kernels/sparse_gqa_decode/abi.py
+[eligibility]: https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/kernels/sparse_gqa_decode/eligibility.py
+[planning]: https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/kernels/sparse_gqa_decode/planning.py
+[abi]: https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/kernels/sparse_gqa_decode/abi.py

@@ -12,33 +12,32 @@ class LoadedWeightIdentity:
     def __init__(self) -> None:
         self._records: dict[str, tuple[str, tuple[int, ...], str]] = {}
 
+    def observe_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        if name in self._records:
+            raise ValueError(f"Duplicate PD checkpoint tensor: {name}")
+        if (
+            tensor.device.type != "cpu"
+            or not tensor.is_contiguous()
+            or tensor.is_conj()
+            or tensor.is_neg()
+        ):
+            raise ValueError("PD identity requires contiguous CPU checkpoint tensors")
+        # A uint8 view also supports BF16 and FP8 without conversion or a
+        # second tensor-sized allocation. Keep no reference after loading.
+        raw = memoryview(tensor.detach().reshape(-1).view(torch.uint8).numpy())
+        digest = hashlib.sha256(raw).hexdigest()
+        self._records[name] = (
+            str(tensor.dtype),
+            tuple(tensor.shape),
+            digest,
+        )
+        del raw
+
     def observe(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterator[tuple[str, torch.Tensor]]:
         for name, tensor in weights:
-            if name in self._records:
-                raise ValueError(f"Duplicate PD checkpoint tensor: {name}")
-            if (
-                tensor.device.type != "cpu"
-                or not tensor.is_contiguous()
-                or tensor.is_conj()
-                or tensor.is_neg()
-            ):
-                raise ValueError(
-                    "PD identity requires contiguous CPU checkpoint tensors"
-                )
-            # A uint8 view also supports BF16 and FP8 without conversion or a
-            # second tensor-sized allocation. Keep no reference after loading.
-            raw = memoryview(tensor.detach().reshape(-1).view(torch.uint8).numpy())
-            digest = hashlib.sha256()
-            for offset in range(0, len(raw), 4 * 1024 * 1024):
-                digest.update(raw[offset : offset + 4 * 1024 * 1024])
-            self._records[name] = (
-                str(tensor.dtype),
-                tuple(tensor.shape),
-                digest.hexdigest(),
-            )
-            del raw
+            self.observe_tensor(name, tensor)
             yield name, tensor
 
     def records(self) -> dict[str, tuple[str, tuple[int, ...], str]]:

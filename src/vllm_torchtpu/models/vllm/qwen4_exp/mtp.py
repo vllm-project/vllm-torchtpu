@@ -21,9 +21,10 @@ forward-context metadata, which the runner's MTP proposer builds for step 0
 """
 
 import copy
+import itertools
 import re
 from collections.abc import Iterable
-from typing import ClassVar, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import torch
 from torch import nn
@@ -50,10 +51,10 @@ from .model import (
     Qwen4ExpForCausalLM,
     _parameter_storage_key,
     hc_config,
+    load_layer_mlp_weights,
     moe_weights_mapper,
     verify_moe_checkpoint,
 )
-
 from .qsa import QSAMetadata
 
 _CHECKPOINT_LAYER = re.compile(r"^mtp\.layers\.(\d+)\.")
@@ -143,6 +144,9 @@ def mtp_checkpoint_name(name):
 
 
 class Qwen4ExpMultiTokenPredictor(nn.Module):
+    fc_embedding: ReplicatedLinear
+    fc_hidden: ReplicatedLinear
+
     def __init__(self, cfg, prefixes):
         super().__init__()
         t = cfg.model_config.hf_text_config
@@ -192,13 +196,16 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         # decode mix (TPU_QWEN4_HC_DECODE_FUSED picks the fused path by the
         # token count while tracing).
         for layer in self.layers:
-            layer.self_attn.single_graph = True
+            cast(Any, layer.self_attn).single_graph = True
         for module in self.modules():
             if isinstance(module, GatedResidual):
                 module.disable_decode_fused()
         # Set by the Qwen3.8 megakernel driver before the first trace: the
         # layer's o_proj, both HCs and the MoE as one tail-kernel call.
         self.mk_tail: nn.Module | None = None
+        # VLLM_TPU_MK_DRAFT: the whole draft step as one kernel call
+        # (megakernel_runtime.qwen38_draft.MkDraft), attached by the MK driver.
+        self.mk_draft: nn.Module | None = None
 
     def fuse_inputs(self, input_ids, hidden_states, inputs_embeds=None):
         """[T, hc*H] decoder input from the token and the previous hidden."""
@@ -287,7 +294,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 # dynamic draft_rows dim was compiled at the bucket size (s64[256] at bucket
 # 256) and failed against the request-sized rows a step passes. The proposer
 # always passes it at the chunk's fixed request capacity instead.
-QWEN4_EXP_MTP_DYNAMIC_ARG_DIMS = {
+QWEN4_EXP_MTP_DYNAMIC_ARG_DIMS: dict[str, Any] = {
     "input_ids": 0,
     "positions": 0,
     "hidden_states": 0,
@@ -409,52 +416,87 @@ class Qwen4ExpMTP(nn.Module):
             )
         return True
 
+    def mk_draft_step(self, input_ids, positions, hidden_states, rows_per_request: int):
+        """VLLM_TPU_MK_DRAFT: `(next hidden carry, greedy tokens int32)` of one draft
+        step: `forward(...)` then `compute_logits(...).argmax(-1)` as one kernel call
+        (the input fusion stays here)."""
+        mk = self.model.mk_draft
+        assert mk is not None
+        hidden = self.model.fuse_inputs(input_ids, hidden_states, None)
+        metadata = get_forward_context().attn_metadata
+        return mk.step(hidden, positions, rows_per_request, metadata)
+
     def compute_logits(self, hidden_states, spec_step_idx: int = 0):
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def is_unused_checkpoint_weight(self, weight_name: str) -> bool:
+        return mtp_checkpoint_name(weight_name) is None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         parameters = dict(self.named_parameters())
         moe_mapper = moe_weights_mapper()
         layers = cast(nn.ModuleList, self.model.layers)
-        moe_loaders = [AutoWeightsLoader(layer.mlp) for layer in layers]
+        moe_loaders = [
+            AutoWeightsLoader(cast(nn.Module, layer.mlp)) for layer in layers
+        ]
         loaded: set[str] = set()
         source: set[str] = set()
         own_embed = bool(self.has_own_embed_tokens)
-        for original, weight in weights:
-            if own_embed and original in TARGET_EMBED_CHECKPOINT_NAMES:
-                if "model.embed_tokens.weight" in loaded:
-                    raise ValueError(f"Duplicate checkpoint embedding {original}")
-                param = parameters["model.embed_tokens.weight"]
+
+        def _classified_weights():
+            for original, weight in weights:
+                if own_embed and original in TARGET_EMBED_CHECKPOINT_NAMES:
+                    if "model.embed_tokens.weight" in loaded:
+                        raise ValueError(f"Duplicate checkpoint embedding {original}")
+                    param = parameters["model.embed_tokens.weight"]
+                    getattr(param, "weight_loader", default_weight_loader)(param, weight)
+                    loaded.add("model.embed_tokens.weight")
+                    continue
+                name = mtp_checkpoint_name(original)
+                if name is None:
+                    continue
+                if name in source:
+                    raise ValueError(f"Duplicate checkpoint tensor {original}")
+                source.add(name)
+                if name.startswith("model.layers."):
+                    _, _, idx, family, relative = name.split(".", 4)
+                    if int(idx) >= len(layers):
+                        raise ValueError(f"Unexpected Qwen4Exp MTP layer {original}")
+                    if family == "mlp":
+                        yield ("mlp", int(idx)), (original, name, relative, weight)
+                        continue
+                yield None, (original, name, "", weight)
+
+        for group_key, group in itertools.groupby(
+            _classified_weights(), key=lambda item: item[0]
+        ):
+            if group_key is not None:
+                _, layer_idx = group_key
+                loaded.update(
+                    load_layer_mlp_weights(
+                        moe_loaders[layer_idx],
+                        cast(nn.Module, layers[layer_idx].mlp),
+                        ((relative, weight) for _, (_, _, relative, weight) in group),
+                        moe_mapper,
+                        layer_idx,
+                    )
+                )
+                continue
+
+            for _, (original, name, _, weight) in group:
+                if name.startswith("model.layers."):
+                    _, _, idx, family, relative = name.split(".", 4)
+                    layer = cast(Qwen4ExpDecoderLayer, layers[int(idx)])
+                    if family == "self_attn":
+                        layer.self_attn.load_weights([(relative, weight)])
+                        continue
+                if name not in parameters:
+                    raise ValueError(
+                        f"Unknown Qwen4Exp MTP checkpoint tensor {original}"
+                    )
+                param = parameters[name]
                 getattr(param, "weight_loader", default_weight_loader)(param, weight)
-                loaded.add("model.embed_tokens.weight")
-                continue
-            name = mtp_checkpoint_name(original)
-            if name is None:
-                continue
-            if name in source:
-                raise ValueError(f"Duplicate checkpoint tensor {original}")
-            source.add(name)
-            if name.startswith("model.layers."):
-                _, _, idx, family, relative = name.split(".", 4)
-                if int(idx) >= len(layers):
-                    raise ValueError(f"Unexpected Qwen4Exp MTP layer {original}")
-                layer = cast(Qwen4ExpDecoderLayer, layers[int(idx)])
-                if family == "mlp":
-                    targets = moe_loaders[int(idx)].load_weights(
-                        iter([(relative, weight)]), mapper=moe_mapper
-                    )
-                    loaded.update(
-                        f"model.layers.{idx}.mlp.{target}" for target in targets
-                    )
-                    continue
-                if family == "self_attn":
-                    layer.self_attn.load_weights([(relative, weight)])
-                    continue
-            if name not in parameters:
-                raise ValueError(f"Unknown Qwen4Exp MTP checkpoint tensor {original}")
-            param = parameters[name]
-            getattr(param, "weight_loader", default_weight_loader)(param, weight)
-            loaded.add(name)
+                loaded.add(name)
         for i, layer in enumerate(layers):
             verify_moe_checkpoint(
                 layer.mlp,
@@ -463,7 +505,7 @@ class Qwen4ExpMTP(nn.Module):
                 moe_mapper,
                 f"MTP layer{i}",
             )
-            layer.self_attn.finalize_weights()
+            cast(Any, layer.self_attn).finalize_weights()
         ordinary = {
             name
             for name in parameters

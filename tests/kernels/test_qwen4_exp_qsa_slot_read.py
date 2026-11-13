@@ -56,7 +56,12 @@ def _attend(args, starts, *, slot_read, shared=True, **options):
 
 @pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize("offset", [0, 1])
-def test_slot_read_matches_padded_heads(kernels, monkeypatch, offset, shared):
+def test_slot_read_matches_padded_heads(
+    kernels,  # noqa: F811
+    monkeypatch,
+    offset,
+    shared,
+):
     from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper
 
     calls = []
@@ -86,7 +91,7 @@ def test_slot_read_matches_padded_heads(kernels, monkeypatch, offset, shared):
     np.testing.assert_array_equal(actual, expected)
 
 
-def test_bf16_rows_keep_the_padded_route(kernels, monkeypatch):
+def test_bf16_rows_keep_the_padded_route(kernels, monkeypatch):  # noqa: F811
     """Two-sublane BF16 paired rows are not slot-readable."""
     cache = jnp.zeros((4, 128, 2, 2, WIDTH), jnp.bfloat16)
     assert not qsa_rpa.slot_readable(cache, 1, 1)
@@ -121,7 +126,7 @@ def test_slots_lower_one_schedule_for_tpu7x(monkeypatch):
         )
         return text, _schedules(text)
 
-    (text0, (first, kernels0)), (text1, (second, _)) = lower(0), lower(1)
+    (_, (first, kernels0)), (text1, (second, _)) = lower(0), lower(1)
     assert len(first) == 1 and first == second
     assert all(k.startswith("RPAd") for k in kernels0)
     # Three queries per row: no zero queries for the other slot.
@@ -155,8 +160,13 @@ def test_compact_schedule_lowers_for_tpu7x(monkeypatch, bkv, lanes):
     )
     text = _lower(
         functools.partial(
-            qsa_rpa.qsa_attention, kv_heads=1, ratio=RATIO, k_scale=0.375,
-            v_scale=2.5, max_query_len=4, kv_head_offset=1,
+            qsa_rpa.qsa_attention,
+            kv_heads=1,
+            ratio=RATIO,
+            k_scale=0.375,
+            v_scale=2.5,
+            max_query_len=4,
+            kv_head_offset=1,
         ),
         *specs,
     )

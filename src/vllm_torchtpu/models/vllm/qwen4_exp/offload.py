@@ -27,6 +27,7 @@ and a key covers the block on every stage.
 """
 
 import math
+from dataclasses import replace
 
 from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 
@@ -43,11 +44,21 @@ def is_qwen4_exp(vllm_config) -> bool:
 
 
 def _carrier_spec(kv_cache_config) -> AttentionSpec:
+    """The attention spec whose rows describe one pool page: the first one,
+    by its stored rows when it is a VLLM_TPU_QSA_MAIN_KV_DCP main-KV spec
+    (``tokens_per_state`` tokens per stored row)."""
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
         if isinstance(spec, AttentionSpec) and not isinstance(
             spec, EncoderOnlyAttentionSpec
         ):
+            tokens_per_state = getattr(spec, "tokens_per_state", 1)
+            if isinstance(tokens_per_state, int) and tokens_per_state > 1:
+                return replace(
+                    spec,
+                    block_size=spec.block_size // tokens_per_state,
+                    tokens_per_state=1,
+                )
             return spec
     raise ValueError("Qwen4Exp unified pool has no attention carrier group")
 

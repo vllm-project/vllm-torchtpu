@@ -37,7 +37,15 @@ TABLE_COLUMNS = 8
 class ReferenceTopK:
     """JAX stand-in for the SparseCore selector (lowest IDs win ties)."""
 
+    _instance = None
     overlaps_scoring = False
+
+    def __new__(cls, *args, **kwargs):
+        if cls is ReferenceTopK and not args and not kwargs:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
+        return super().__new__(cls)
 
     def select(self, score_bits, k, row_lengths, *, scheduling_group_id, return_scores):
         scores = jax.lax.bitcast_convert_type(score_bits, jnp.float32)
@@ -87,15 +95,23 @@ def _copy_in_whole_pages(self, src_ref, grid_indices):
             ).start()
 
 
+_REFERENCE_TOPK = ReferenceTopK()
+
+
+@functools.cache
+def _tpu7x_info():
+    return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+
+
+@functools.cache
+def _interpret_pallas_call():
+    return functools.partial(pl.pallas_call, interpret=pltpu.InterpretParams())
+
+
 @pytest.fixture
 def interpret(monkeypatch):
-    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
-    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
-    monkeypatch.setattr(
-        streamindex.pl,
-        "pallas_call",
-        functools.partial(pl.pallas_call, interpret=pltpu.InterpretParams()),
-    )
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x_info)
+    monkeypatch.setattr(streamindex.pl, "pallas_call", _interpret_pallas_call())
     monkeypatch.setattr(
         bref_override.StreamIndexKVBufferedRef, "copy_in", _copy_in_whole_pages
     )
@@ -108,7 +124,7 @@ def capture_scores(monkeypatch):
     def scored(*args, **kwargs):
         kwargs.update(enable_early_exit=False, return_scores=True)
         ids, bits = streamindex.streamindex_topk(
-            *args, topk_backend=ReferenceTopK(), **kwargs
+            *args, topk_backend=_REFERENCE_TOPK, **kwargs
         )
         calls.append((kwargs["num_queries_per_block"], bits))
         return ids

@@ -399,7 +399,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                     full = (last == page_size) & jnp.logical_not(is_no_op)
 
                     @pl.when(full)
-                    def _full_tile(b=b, p0=p0):
+                    def _full_tile(b=b, p0=p0, pages=pages):
                         row = page_indices_ref.at[pl.ds(p0, pages)]
                         for i in range(pages):
                             pltpu.make_async_copy(

@@ -16,6 +16,11 @@ from vllm_torchtpu.models.vllm.qwen4_exp.inputs import (
 from vllm_torchtpu.runner.model_adapters import ModelInputSnapshot, select_model_adapter
 
 
+def _h2d_staging():
+    """Runner fields `stage_h2d_upload` appends the uploaded host tensors to."""
+    return {"_unfenced_h2d_sources": [], "_registered_h2d_sources": set()}
+
+
 @pytest.mark.parametrize("offload", [False, True])
 @pytest.mark.parametrize("qsa_index", [0, 3])
 @pytest.mark.parametrize("pooled", [False, True])
@@ -31,7 +36,7 @@ def test_reordered_history_slots_and_group_tables_are_independent(
         seq_lens=torch.tensor([4, 4, 0], dtype=torch.int32),
         mamba_state_indices=torch.tensor([7, 2, 0], dtype=torch.int32),
     )
-    runner = NS(device="cpu", _attn_metadata_builder_ctx=ctx)
+    runner = NS(device="cpu", _attn_metadata_builder_ctx=ctx, **_h2d_staging())
     runner.model_config = NS(hf_text_config=q4exp_text_config())
     runner.cache_config = NS(block_size=128)
     runner.model_config.hf_text_config.layer_types[qsa_index] = "full_attention"
@@ -169,6 +174,7 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
     monkeypatch.setattr(inputs, "synchronize_tensors", lambda tensor: None)
     runner = NS(
         device="cpu",
+        **_h2d_staging(),
         parallel_config=NS(tensor_parallel_size=tp),
         scheduler_config=NS(max_num_seqs=1),
         input_batch=NS(
@@ -254,7 +260,11 @@ def test_async_history_reads_committed_prefix_after_reorder_and_row_reuse():
         dtype=torch.int32,
     )
     order = torch.tensor([1, 2, 0])
-    runner = NS(device="cpu", input_batch=NS(token_ids_cpu_tensor=host[order]))
+    runner = NS(
+        device="cpu",
+        input_batch=NS(token_ids_cpu_tensor=host[order]),
+        **_h2d_staging(),
+    )
     runner.model_config = NS(hf_text_config=q4exp_text_config())
     runner.cache_config = NS(block_size=128)
     adapter = Qwen4ExpAdapter(runner)
@@ -295,9 +305,12 @@ def test_ngram_history_uses_configured_width_and_eos():
 
 @pytest.mark.parametrize("spec", [0, 3])
 def test_ngram_window_matches_full_store(spec):
-    """VLLM_TPU_QWEN4_NGRAM_WINDOW: the per-row host window (width spec + ngram - 1 before the host
-    context) gives the full-store n-gram context for every device context the async rejection
-    correction can produce (host context minus 0..spec), incl. contexts shorter than the n-gram;
+    """VLLM_TPU_QWEN4_NGRAM_WINDOW: the per-row host window (width spec + ngram - 1
+    before the host
+    context) gives the full-store n-gram context for every device context the async
+    rejection
+    correction can produce (host context minus 0..spec), incl. contexts shorter than the
+    n-gram;
     a window one token too narrow is caught."""
     import numpy as np
 
@@ -311,30 +324,46 @@ def test_ngram_window_matches_full_store(spec):
     store = rng.integers(100, 999, (8, 64)).astype(np.int32)
     host_ctx = np.array([0, 0, 1, 2, 30, 63, 5, 9], dtype=np.int64)
     width = spec + ngram - 1
-    window = torch.from_numpy(ngram_window_from_host(store, host_ctx, start, n, rows, width, eos))
+    window = torch.from_numpy(
+        ngram_window_from_host(store, host_ctx, start, n, rows, width, eos)
+    )
     row_ids = torch.arange(rows, dtype=torch.int64) + start
     for r in range(spec + 1):
         dev_ctx = torch.zeros(rows, dtype=torch.int64)
         dev_ctx[:n] = torch.from_numpy(np.maximum(host_ctx[start : start + n] - r, 0))
-        ref = ngram_context_from_store(torch.from_numpy(store), row_ids, dev_ctx, eos, ngram)
+        ref = ngram_context_from_store(
+            torch.from_numpy(store), row_ids, dev_ctx, eos, ngram
+        )
         got = ngram_context_from_window(window, dev_ctx, eos, ngram)
         assert torch.equal(got[:n], ref[:n]), (r, got[:n], ref[:n])
     if spec:
-        narrow = torch.from_numpy(ngram_window_from_host(store, host_ctx, start, n, rows, width - 1, eos))
+        narrow = torch.from_numpy(
+            ngram_window_from_host(store, host_ctx, start, n, rows, width - 1, eos)
+        )
         dev_ctx = torch.zeros(rows, dtype=torch.int64)
-        dev_ctx[:n] = torch.from_numpy(np.maximum(host_ctx[start : start + n] - spec, 0))
-        ref = ngram_context_from_store(torch.from_numpy(store), row_ids, dev_ctx, eos, ngram)
-        assert not torch.equal(ngram_context_from_window(narrow, dev_ctx, eos, ngram)[:n], ref[:n])
+        dev_ctx[:n] = torch.from_numpy(
+            np.maximum(host_ctx[start : start + n] - spec, 0)
+        )
+        ref = ngram_context_from_store(
+            torch.from_numpy(store), row_ids, dev_ctx, eos, ngram
+        )
+        assert not torch.equal(
+            ngram_context_from_window(narrow, dev_ctx, eos, ngram)[:n], ref[:n]
+        )
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("check", ["", "check", "fault"])
 @pytest.mark.parametrize("window", ["", "1"])
 @pytest.mark.parametrize("pooled", [False, True])
 @pytest.mark.parametrize("spec", [0, 3])
-def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window, check):
+def test_fused_prepare_inputs_matches_eager(
+    monkeypatch, spec, pooled, window, check, functional
+):
     """VLLM_TPU_QWEN4_FUSED_PREP: the one-program input preparation returns the
     eager path's kwargs and leaves the same speculative records, step after step,
-    as requests move rows and drop out."""
+    as requests move rows and drop out (FUSED_PREP_FUNCTIONAL: by returning the
+    record instead of updating it in place)."""
     import numpy as np
 
     from vllm_torchtpu import envs
@@ -344,7 +373,7 @@ def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window, c
     rng = np.random.default_rng(spec * 10 + pooled)
 
     def make():
-        runner = NS(device="cpu", max_num_reqs=max_reqs)
+        runner = NS(device="cpu", max_num_reqs=max_reqs, **_h2d_staging())
         runner.model_config = NS(hf_text_config=q4exp_text_config())
         runner.cache_config = NS(block_size=128)
         runner.input_batch = NS(
@@ -361,9 +390,14 @@ def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window, c
 
     r_eager, a_eager = make()
     r_fused, a_fused = make()
-    r_fused.input_batch.token_ids_cpu_tensor.copy_(r_eager.input_batch.token_ids_cpu_tensor)
+    r_fused.input_batch.token_ids_cpu_tensor.copy_(
+        r_eager.input_batch.token_ids_cpu_tensor
+    )
     monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_NGRAM_WINDOW", window, raising=False)
     monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_FUSED_PREP_CHECK", check, raising=False)
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL", functional, raising=False
+    )
     monkeypatch.setattr(a_fused, "_fused_fn", lambda: inputs_mod.fused_step_inputs)
     attention = f"{a_eager.attention_prefix}.self_attn"
     main = torch.arange(rows * 3).reshape(rows, 3)
@@ -373,7 +407,11 @@ def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window, c
         a_eager._compressed_owner(attention): NS(block_tables=compressed),
     }
     for step, (req_ids, lengths) in enumerate(
-        [(["a", "b", "c"], [4, 1, 4]), (["c", "a"], [4, 4]), (["c", "d", "a"], [1, 4, 4])]
+        [
+            (["a", "b", "c"], [4, 1, 4]),
+            (["c", "a"], [4, 4]),
+            (["c", "d", "a"], [1, 4, 4]),
+        ]
     ):
         n = len(req_ids)
         ctx_lens = rng.integers(5, max_len - 8, n)
@@ -384,7 +422,10 @@ def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window, c
         seq_lens[:n] = torch.tensor(ctx_lens + np.array(lengths), dtype=torch.int32)
         ids = torch.from_numpy(rng.integers(100, 999, num_tokens).astype(np.int32))
         outs = []
-        for runner, adapter, fused in ((r_eager, a_eager, False), (r_fused, a_fused, True)):
+        for runner, adapter, fused in (
+            (r_eager, a_eager, False),
+            (r_fused, a_fused, True),
+        ):
             monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_FUSED_PREP", fused, raising=False)
             runner.input_batch.req_ids = req_ids
             runner.input_batch.num_computed_tokens_cpu[:n] = ctx_lens
@@ -395,7 +436,9 @@ def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window, c
             )
             store = adapter.begin_step()
             outs.append(
-                adapter.prepare_inputs(ModelInputSnapshot(store, 0, n, num_tokens, tables, ids))
+                adapter.prepare_inputs(
+                    ModelInputSnapshot(store, 0, n, num_tokens, tables, ids)
+                )
             )
         eager, fused = outs
         if check == "fault":

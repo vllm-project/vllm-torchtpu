@@ -90,6 +90,17 @@ class MetadataRef:
     # speculative decoding, where the only checkpoint is the slot's own
     # state block (`s_idx_to_state_indices`).
     s_idx_to_ckpt_indices: Any = None
+    # TPU_GDN_KERNEL_ZERO_OUT only: the call's query_start_loc and
+    # distribution, from which the kernel finds the first output row no
+    # kernel writes (see GDNConfig.zero_out_from). None otherwise.
+    zero_out_query_start_loc: Any = None
+    zero_out_distribution: Any = None
+    # Internal prefill checkpoints (VLLM_TPU_MAMBA_TAIL_FOLD), PER_SEQ only:
+    # per tile, the source block that receives the state after this tile
+    # instead of the sequence's own checkpoint block (0: none). Such a tile
+    # also has `p_id_is_last_tile` set, though its sequence goes on. None
+    # without internal checkpoints.
+    p_id_to_state_override: Any = None
 
     @classmethod
     def create(
@@ -105,6 +116,7 @@ class MetadataRef:
         s_idx_to_state_indices: jax.Array,
         s_idx_to_read_offset: jax.Array,
         s_idx_to_ckpt_indices: jax.Array | None = None,
+        p_id_to_state_override: jax.Array | None = None,
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
@@ -119,7 +131,19 @@ class MetadataRef:
             s_idx_to_state_indices=s_idx_to_state_indices,
             s_idx_to_read_offset=s_idx_to_read_offset,
             s_idx_to_ckpt_indices=s_idx_to_ckpt_indices,
+            p_id_to_state_override=(
+                None
+                if p_id_to_state_override is None
+                else SmemWrapper(p_id_to_state_override, shape)
+            ),
         )
+
+    def state_override(self, p_id, idx, state_idx):
+        """`state_idx`, or the tile's internal checkpoint block if it has one."""
+        if self.p_id_to_state_override is None:
+            return state_idx
+        override = self.p_id_to_state_override[p_id, idx]
+        return jnp.where(override > 0, override, state_idx)
 
     def __len__(self) -> int:
         return len(jax.tree_util.tree_leaves(self))
@@ -248,6 +272,57 @@ class InBufferedRef(BaseBufferedRef):
         ).wait()
 
 
+def raw_block_start(
+    metadata_ref: MetadataRef, p_id: jax.Array, rows: int, align: int, total: int
+) -> jax.Array:
+    """First row of the raw-input row block a tile reads.
+
+    The tile's tokens are rows [r0, r0 + seq_tile_size * chunk_size) of the
+    2D [total, width] input, r0 being its first sequence's base row. The
+    block is `rows` rows starting at r0 rounded down to the HBM row tile
+    (`align`), moved back so it stays inside the array; `rows` is sized so
+    the block still covers the tile's tokens.
+    """
+    r0 = metadata_ref.p_id_to_r_base[p_id, 0]
+    start = jnp.minimum((r0 // align) * align, total - rows)
+    return pl.multiple_of(start, align)
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class RowBlockInBufferedRef(BaseBufferedRef):
+    """Raw 2D activation input: one tile-aligned row block per tile.
+
+    The source is the projection output [tokens, width] in its own dtype
+    and HBM tiling, whose rows can only be sliced at tile-aligned offsets.
+    So each tile DMAs `rows` rows from `raw_block_start` and the kernel
+    places each sequence's rows in VMEM (wrapper._load_raw_rows).
+    """
+
+    rows: int = dataclasses.field(metadata=dict(static=True))
+    align: int = dataclasses.field(metadata=dict(static=True))
+
+    def _copy(self, src_ref: jax.Ref, grid_indices, slot):
+        assert self.window_ref is not None
+        p_id = grid_indices[0]
+        start = raw_block_start(
+            self.metadata_ref, p_id, self.rows, self.align, src_ref.shape[0]
+        )
+        return pltpu.make_async_copy(
+            src_ref.at[pl.ds(start, self.rows)],
+            cast(jax.Ref, self.window_ref.at[slot]),
+            cast(Any, self.sem_recvs).at[slot],
+        )
+
+    def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        assert self.sem_recvs is not None
+        self._copy(src_ref, grid_indices, self.current_copy_in_slot).start()
+
+    def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        assert self.sem_recvs is not None
+        self._copy(src_ref, grid_indices, self.current_wait_in_slot).wait()
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class OutBufferedRef(BaseBufferedRef):
@@ -369,7 +444,9 @@ class StateOutBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
+            state_idx = self.metadata_ref.state_override(
+                p_id, idx, self.metadata_ref.s_idx_to_state_indices[s_idx]
+            )
             # Write one checkpoint per valid window position, starting at the
             # group's base slot. `r_size` never exceeds `window_size` for
             # windowed sequences; the clamp is for PER_SEQ tiles, which hold
@@ -572,6 +649,9 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
         assert self.sem_sends is not None
         assert self.window_ref is not None
         assert self.compact_output_ref is not None
+        assert self.metadata_ref.p_id_to_state_override is None, (
+            "compact state outputs have no internal prefill checkpoints"
+        )
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
@@ -613,7 +693,9 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
             for t in range(self.cfg.window_size):
                 should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
                 nblocks = jnp.where(should_write, self.region.nblocks, 0)
-                state_idx = self._ckpt_state_idx(s_idx, t)
+                state_idx = self.metadata_ref.state_override(
+                    p_id, idx, self._ckpt_state_idx(s_idx, t)
+                )
                 pltpu.make_async_copy(
                     vmem_ref.at[idx, t, pl.ds(0, nblocks)],
                     self._region_slice(dst_ref, state_idx, nblocks),
@@ -677,7 +759,8 @@ def create_allocs(
             f"windows, got window_size={cfg.window_size}."
         )
 
-    if qkv_ref.ndim == 2:
+    if qkv_ref.ndim == 2 and not cfg.raw_qkv:
+        # (a raw qkv is 2D too but allocates its own row blocks below)
         # 2D bf16 rows: the chunk plus one row tile of slack for a sequence
         # tile that starts part-way into an aligned row tile.
         assert cfg.qkv_2d and qkv_ref.dtype == jnp.bfloat16
@@ -716,9 +799,35 @@ def create_allocs(
         cfg=cfg,
         metadata_ref=metadata_ref,
     )
-    qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
-    b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
-    a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
+    raw_partial = functools.partial(
+        RowBlockInBufferedRef.input,
+        buffer_count=pipeline_mode.buffer_count,
+        use_lookahead=pipeline_mode.use_lookahead,
+        cfg=cfg,
+        metadata_ref=metadata_ref,
+    )
+    if cfg.raw_qkv:
+        qkv_alloc = raw_partial(
+            spec=block_spec_partial(block_shape=(cfg.raw_qkv_rows, qkv_ref.shape[-1])),
+            dtype_or_type=qkv_ref,
+            rows=cfg.raw_qkv_rows,
+            align=cfg.raw_qkv_align,
+        )
+    else:
+        qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
+    if cfg.raw_ba:
+        b_alloc, a_alloc = (
+            raw_partial(
+                spec=block_spec_partial(block_shape=(cfg.raw_ba_rows, ref.shape[-1])),
+                dtype_or_type=ref,
+                rows=cfg.raw_ba_rows,
+                align=cfg.raw_ba_align,
+            )
+            for ref in (b_ref, a_ref)
+        )
+    else:
+        b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
+        a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
 
     out_alloc = OutBufferedRef.output(
         spec=block_spec_partial(block_shape=out_shape),

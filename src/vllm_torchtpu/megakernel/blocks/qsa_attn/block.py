@@ -114,7 +114,8 @@ def attend_row(
 
     `table` (SMEM `[tables, pages_per_seq]`): `pages` then holds request-local
     group ids `v`, mapped to the micro-page
-    `table[table_row_base + row // rows_per_req, v >> shift] * per_page + (v & (per_page - 1))`
+    `table[table_row_base + row // rows_per_req, v >> shift] * per_page + (v & (per_page
+    - 1))`
     (one extra SMEM load per copy). Without it `pages` holds micro-page ids.
 
     `recent = (k [n, 256], v [n, 256], ok_row [1, n], ok_col [n, 1])`: extra tokens
@@ -156,10 +157,9 @@ def attend_row(
         for j in range(TILE // MICRO):
             v = pages[row, jnp.minimum(t * (TILE // MICRO) + j, ncols - 1)]
             if table is not None:
-                v = (
-                    table[table_row_base + row // rows_per_req, v >> shift] * per_page
-                    + (v & (per_page - 1))
-                )
+                v = table[
+                    table_row_base + row // rows_per_req, v >> shift
+                ] * per_page + (v & (per_page - 1))
             out.append(
                 pltpu.make_async_copy(
                     pool.at[v >> shift, pl.ds((v & (per_page - 1)) * MICRO, MICRO)],
@@ -199,7 +199,7 @@ def attend_row(
     static = lambda x: isinstance(x, (int, float))  # noqa: E731
 
     def tile(t: Any, carry: Any) -> Any:
-        m, l, acc = carry
+        m, l_sum, acc = carry
         s = slot(t)
         wait(t, s)
         ahead = t + nslots - 1  # into the slot tile t - 1 has freed
@@ -220,10 +220,14 @@ def attend_row(
             k8, v8 = _unpack_kv(ring.at[s], off, interpret)
         tok = t * TILE + jax.lax.broadcasted_iota(I32, (1, TILE), 1)
         valid = tok < length
-        key = k8.astype(F32) if static(k_mul) and k_mul == 1.0 else k8.astype(F32) * k_mul
+        key = (
+            k8.astype(F32) if static(k_mul) and k_mul == 1.0 else k8.astype(F32) * k_mul
+        )
         # A column iota, not `valid.reshape`: Mosaic has no i1 shape cast.
         tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
-        vf = v8.astype(F32) if static(v_mul) and v_mul == 1.0 else v8.astype(F32) * v_mul
+        vf = (
+            v8.astype(F32) if static(v_mul) and v_mul == 1.0 else v8.astype(F32) * v_mul
+        )
         value = jnp.where(tok_col < length, vf, 0.0)
         if ablate == "matmul":
             score = jnp.zeros((nh, TILE), F32)
@@ -237,7 +241,7 @@ def attend_row(
         m_new = jnp.maximum(m, jnp.max(score, axis=-1, keepdims=True))
         p = jnp.where(valid, jnp.exp(score - m_new), 0.0)
         alpha = jnp.exp(m - m_new)
-        l_new = l * alpha + jnp.sum(p, axis=-1, keepdims=True)
+        l_new = l_sum * alpha + jnp.sum(p, axis=-1, keepdims=True)
         pv = (
             jnp.zeros((nh, dim), F32)
             if ablate == "matmul"
@@ -251,12 +255,14 @@ def attend_row(
         jnp.zeros((nh, 1), F32),
         jnp.zeros((nh, dim), F32),
     )
-    m, l, acc = jax.lax.fori_loop(0, ntiles, tile, init)
+    m, l_sum, acc = jax.lax.fori_loop(0, ntiles, tile, init)
     has = length > 0
     if recent is not None:
         rk, rv, ok_row, ok_col = recent
         key = rk if static(k_mul) and k_mul == 1.0 else rk * k_mul
-        sc = jax.lax.dot_general(qf, key, (((1,), (1,)), ((), ())), preferred_element_type=F32)
+        sc = jax.lax.dot_general(
+            qf, key, (((1,), (1,)), ((), ())), preferred_element_type=F32
+        )
         if not (static(s_mul) and s_mul == 1.0):
             sc = sc * s_mul
         sc = jnp.where(ok_row, sc, -jnp.inf)
@@ -265,13 +271,20 @@ def attend_row(
         p = jnp.where(ok_row, jnp.exp(sc - safe), 0.0)
         alpha = jnp.where(m == -jnp.inf, 0.0, jnp.exp(m - safe))
         val = rv if static(v_mul) and v_mul == 1.0 else rv * v_mul
-        l = l * alpha + jnp.sum(p, axis=-1, keepdims=True)
-        acc = acc * alpha + jnp.dot(p, jnp.where(ok_col, val, 0.0), preferred_element_type=F32)
+        l_sum = l_sum * alpha + jnp.sum(p, axis=-1, keepdims=True)
+        acc = acc * alpha + jnp.dot(
+            p, jnp.where(ok_col, val, 0.0), preferred_element_type=F32
+        )
         has = has | (jnp.max(jnp.where(ok_row, 1, 0)) > 0)
-    attn = acc / jnp.where(l > 0, l, 1.0) * (scale_v if fold else 1.0)
+    attn = acc / jnp.where(l_sum > 0, l_sum, 1.0) * (scale_v if fold else 1.0)
     gated = (
-        attn.astype(BF16).astype(F32) * jax.nn.sigmoid(gate.astype(F32)).astype(BF16).astype(F32)
-    ).astype(BF16).astype(F32)
+        (
+            attn.astype(BF16).astype(F32)
+            * jax.nn.sigmoid(gate.astype(F32)).astype(BF16).astype(F32)
+        )
+        .astype(BF16)
+        .astype(F32)
+    )
     pre_next = jnp.where(cross, jnp.minimum(nslots - 1, ntiles_next), 0)
     return jnp.where(has, gated, 0.0), g0 + ntiles, pre_next
 
@@ -325,7 +338,7 @@ class QSASparseAttnBlock(QSAOutBlock):
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex, scr, g = ctx.ex, ctx.scr, ctx.g
-        nh, K = g.NH // ex.R, self.k_dim(g, ex)
+        nh = g.NH // ex.R
         qg = [
             pltpu.make_async_copy(
                 ctx.extra[name].at[pl.ds(0, ex.MB)], scr[dst], scr["qa_qg_sem"].at[i]
@@ -370,7 +383,9 @@ class QSASparseAttnBlock(QSAOutBlock):
             )
 
         zeros = tuple(jnp.zeros((ex.MB, g.HD), F32) for _ in range(nh))
-        *outs, _, _ = jax.lax.fori_loop(0, ex.MB, row, (*zeros, jnp.int32(0), jnp.int32(0)))
+        *outs, _, _ = jax.lax.fori_loop(
+            0, ex.MB, row, (*zeros, jnp.int32(0), jnp.int32(0))
+        )
         for h, o in enumerate(outs):
             scr["xb2"][:, pl.ds(h * g.HD, g.HD)] = o.astype(BF16)
         with ctx.stream.segment(lazy=False):
@@ -391,7 +406,8 @@ def reference_rows(
 ) -> jax.Array:
     """Pure-JAX oracle, the stock `fused_kernel.decode_kernel` semantics per row.
 
-    `q`, `gate`: `[N, nh, 256]`; `pool`: `[P, 128, 1, 4, 256]` FP8; returns `[N, nh, 256]`.
+    `q`, `gate`: `[N, nh, 256]`; `pool`: `[P, 128, 1, 4, 256]` FP8; returns `[N, nh,
+    256]`.
     """
     micro = pool.reshape(-1, MICRO, 4, pool.shape[-1])  # [P * 32, 4, 4, 256]
     outs = []
