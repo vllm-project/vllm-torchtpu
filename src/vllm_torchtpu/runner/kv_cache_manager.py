@@ -85,6 +85,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
+from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -94,6 +95,9 @@ from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.attention.backend import AttentionBackend
+
     from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -122,6 +126,57 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+
+
+def dense_attention_backend(vllm_config: VllmConfig) -> type[AttentionBackend] | None:
+    """The backend that lays out the plain (non-MLA) attention caches.
+
+    vLLM's `_find_non_ssm_backend` returns the first backend in layer order,
+    which is the target's. When the target's layers declare an MLA-family
+    backend (e.g. model-owned caches, `TpuOwnedKVCache`) and a drafter adds
+    plain `Attention` layers, the drafter's pages would take the MLA geometry:
+    a 128-token block becomes a 32-token RPA page, so the RPA kernel indexes
+    the block table at 4x the block count and, past a quarter of
+    max_model_len, beyond the table. Take the first
+    `PallasAttentionBackend`-family backend instead; deployments without one
+    (pure MLA) keep the first backend.
+    """
+    first = TpuPlatform._find_non_ssm_backend(vllm_config)
+    if first is None or _is_dense_attention_backend(first):
+        return first
+    for backend in TpuPlatform._find_non_ssm_backends(vllm_config):
+        if _is_dense_attention_backend(backend):
+            return backend
+    return first
+
+
+def _is_dense_attention_backend(backend: object) -> bool:
+    return isinstance(backend, type) and issubclass(backend, PallasAttentionBackend)
+
+
+def dcp_replicated_page_tokens(
+    attn_module: object, block_size: int, vllm_config: VllmConfig
+) -> int:
+    """Tokens per physical page of an attention layer.
+
+    Under DCP every attention spec in a group is DCP-sharded, so the manager
+    block is ``block_size * dcp`` tokens. A layer that keeps its KV whole on
+    every rank (`PallasAttentionBackendImpl.kv_replicated_over_dcp`, e.g. a
+    drafter next to a DCP-sharded target) stores that whole logical block in
+    one page: its spec keeps ``block_size`` (so it groups with the sharded
+    layers) and budgets ``dcp`` times the page bytes, and it is allocated
+    with ``block_size * dcp``-token pages that the logical block table
+    addresses directly.
+    """
+    dcp = vllm_config.parallel_config.decode_context_parallel_size
+    impl = getattr(attn_module, "impl", None)
+    if (
+        dcp > 1
+        and getattr(impl, "kv_replicated_over_dcp", False)
+        and getattr(impl, "sharded_draft_dcp", None) is None
+    ):
+        return block_size * dcp
+    return block_size
 
 
 def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
@@ -281,7 +336,7 @@ class KVCacheManager:
             self.runner.vllm_config,
             (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
         )
-        backend_cls = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
+        backend_cls = dense_attention_backend(self.runner.vllm_config)
         block_size = self.runner.vllm_config.cache_config.block_size
         cache_dtype_str = self.runner.vllm_config.cache_config.cache_dtype
 
@@ -311,6 +366,14 @@ class KVCacheManager:
         # Sparse MLA layers sized from their allocated (nope, rope) specs,
         # which the normalizer's dense MLA page formula does not model.
         sparse_mla_layers: set[str] = set()
+        # Model-owned caches that allocate their own exact shape
+        # (`TpuOwnedKVCache.kv_cache_shape`); their specs are exact as given.
+        owned_shape_layers: set[str] = set()
+        # Their per-block shapes, for the native-region budget below.
+        owned_block_shapes: dict[str, tuple[int, ...]] = {}
+        # Attention layers kept whole on every DCP rank, with exact specs
+        # (`dcp_replicated_page_tokens`).
+        dcp_replicated_layers: set[str] = set()
         for layer_name, attn_module in layers.items():
             # Linear Attention path
             if isinstance(attn_module, MambaBase):
@@ -384,6 +447,68 @@ class KVCacheManager:
                         attn_module.head_size,
                         self.runner.kv_cache_dtype,
                     )
+                    sharded_draft = getattr(attn_module.impl, "sharded_draft_dcp", None)
+                    if sharded_draft is not None:
+                        # A drafter's sliding-window KV sharded over DCP like
+                        # the target's (`cp_draft_attention`): block_size-token
+                        # pages holding every KV head of the DCP group. Exact
+                        # spec; full attention as vLLM's sliding-window
+                        # manager rejects DCP (the window is applied on read).
+                        kv_heads = max(
+                            1, sharded_draft["dcp"] // sharded_draft["kv_head_replicas"]
+                        )
+                        kv_cache_spec[layer_name] = FullAttentionSpec(
+                            block_size=block_size,
+                            num_kv_heads=kv_heads,
+                            head_size=attn_module.head_size,
+                            dtype=self.runner.kv_cache_dtype,
+                            page_size_padded=cast(
+                                "type[_TpuKVCacheBackend]", backend_cls
+                            ).get_kv_cache_page_size_bytes(
+                                block_size,
+                                kv_heads,
+                                attn_module.head_size,
+                                self.runner.kv_cache_dtype,
+                            ),
+                            sliding_window=attn_module.sliding_window,
+                        )
+                        dcp_replicated_layers.add(layer_name)
+                        continue
+                    page_tokens = dcp_replicated_page_tokens(
+                        attn_module, block_size, self.runner.vllm_config
+                    )
+                    if page_tokens != block_size:
+                        if (
+                            hma_enabled
+                            or self.runner._hybrid_uniform_page_size_bytes is not None
+                        ):
+                            raise NotImplementedError(
+                                f"Layer {layer_name} keeps its KV whole under DCP; "
+                                "that needs --disable-hybrid-kv-cache-manager and "
+                                "no hybrid uniform page layout."
+                            )
+                        # Exact page bytes of a block_size * dcp-token page; a
+                        # full-attention spec (the sliding window, if any, is
+                        # applied by the kernel), as vLLM's sliding-window
+                        # manager rejects DCP. Normalization would size the
+                        # page for block_size tokens, so it skips the layer.
+                        kv_cache_spec[layer_name] = FullAttentionSpec(
+                            block_size=block_size,
+                            num_kv_heads=attn_module.num_kv_heads,
+                            head_size=attn_module.head_size,
+                            dtype=self.runner.kv_cache_dtype,
+                            page_size_padded=cast(
+                                "type[_TpuKVCacheBackend]", backend_cls
+                            ).get_kv_cache_page_size_bytes(
+                                page_tokens,
+                                attn_module.num_kv_heads,
+                                attn_module.head_size,
+                                self.runner.kv_cache_dtype,
+                            ),
+                            sliding_window=attn_module.sliding_window,
+                        )
+                        dcp_replicated_layers.add(layer_name)
+                        continue
                     page_size_padded = (
                         self.runner._hybrid_uniform_page_size_bytes
                         if self.runner._hybrid_uniform_page_size_bytes is not None
@@ -473,6 +598,14 @@ class KVCacheManager:
                 kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(
                     self.runner.vllm_config
                 )
+            elif isinstance(attn_module, TpuOwnedKVCache):
+                spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
+                if spec is not None:
+                    kv_cache_spec[layer_name] = spec
+                    owned_block_shape = attn_module.kv_cache_shape(1)
+                    if owned_block_shape is not None:
+                        owned_shape_layers.add(layer_name)
+                        owned_block_shapes[layer_name] = tuple(owned_block_shape)
             else:
                 continue
 
@@ -525,7 +658,12 @@ class KVCacheManager:
             kv_cache_spec,
             self.runner.kv_cache_dtype,
             enable_unified_kv_layout=self.runner._unified_kv_layout,
-            exempt_layers=ds_v4_layers | sparse_mla_layers,
+            exempt_layers=(
+                ds_v4_layers
+                | sparse_mla_layers
+                | owned_shape_layers
+                | dcp_replicated_layers
+            ),
             attention_backend=cast("type[PallasAttentionBackend] | None", backend_cls),
         )
         if (
@@ -537,7 +675,9 @@ class KVCacheManager:
         ):
             assert backend_cls is not None
             kv_cache_spec = self._pad_native_attention_regions(
-                kv_cache_spec, cast("type[_TpuKVCacheBackend]", backend_cls)
+                kv_cache_spec,
+                cast("type[_TpuKVCacheBackend]", backend_cls),
+                owned_block_shapes,
             )
         return kv_cache_spec
 
@@ -545,7 +685,12 @@ class KVCacheManager:
         self,
         kv_cache_specs: dict[str, KVCacheSpec],
         backend_cls: type[_TpuKVCacheBackend],
+        owned_block_shapes: dict[str, tuple[int, ...]] | None = None,
     ) -> dict[str, KVCacheSpec]:
+        """`owned_block_shapes`: per-block shapes of model-owned caches
+        (`TpuOwnedKVCache.kv_cache_shape`), budgeted as allocated rather than
+        through the backend's shape for their spec."""
+        owned_block_shapes = owned_block_shapes or {}
         if can_share_attention_cache(list(kv_cache_specs.values()), backend_cls):
             return kv_cache_specs
         # Layouts that cannot share a packed pool need separate native arrays;
@@ -566,9 +711,22 @@ class KVCacheManager:
                 if isinstance(spec, MLAAttentionSpec)
                 else backend_cls
             )
-            shape = tuple(
-                backend.get_kv_cache_shape(
-                    1, spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+            owned = [
+                owned_block_shapes[n]
+                for n in group.layer_names
+                if n in owned_block_shapes
+            ]
+            shape = (
+                owned[0]
+                if owned
+                else tuple(
+                    backend.get_kv_cache_shape(
+                        1,
+                        spec.block_size,
+                        spec.num_kv_heads,
+                        spec.head_size,
+                        spec.dtype,
+                    )
                 )
             )
             native_pages[shape, spec.dtype] = math.prod(shape) * spec.dtype.itemsize
@@ -753,7 +911,7 @@ class KVCacheManager:
         attn_page_sizes = set()
         backend_cls = cast(
             "type[_TpuKVCacheBackend] | None",
-            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+            dense_attention_backend(self.runner.vllm_config),
         )
         for m in layers.values():
             if isinstance(m, Attention):
@@ -834,7 +992,7 @@ class KVCacheManager:
         )
         attention_backend = cast(
             "type[_TpuKVCacheBackend] | None",
-            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+            dense_attention_backend(self.runner.vllm_config),
         )
         assert attention_backend is not None
         if block_size is None:
@@ -1521,7 +1679,7 @@ class KVCacheManager:
             return
         backend_cls = cast(
             "type[_TpuKVCacheBackend] | None",
-            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+            dense_attention_backend(self.runner.vllm_config),
         )
 
         for group in kv_cache_config.kv_cache_groups:
@@ -1787,6 +1945,9 @@ class KVCacheManager:
                     region_specs.setdefault(region, []).append(
                         (name, _per_layer_spec(name))
                     )
+            forward_context = (
+                self.runner.vllm_config.compilation_config.static_forward_context
+            )
             for region, layer_specs in region_specs.items():
                 attention_specs = [
                     (name, spec)
@@ -1794,8 +1955,18 @@ class KVCacheManager:
                     if isinstance(spec, AttentionSpec)
                     and not isinstance(spec, MLAAttentionSpec)
                 ]
+                replicated = any(
+                    dcp_replicated_page_tokens(
+                        forward_context.get(name),
+                        spec.block_size,
+                        self.runner.vllm_config,
+                    )
+                    != spec.block_size
+                    for name, spec in attention_specs
+                )
                 if (
-                    len(attention_specs) <= 1
+                    replicated
+                    or len(attention_specs) <= 1
                     or len(attention_specs) != len(layer_specs)
                     or attention_specs[0][1].page_size_bytes != region[1]
                     or not can_share_attention_cache(
@@ -1884,12 +2055,21 @@ class KVCacheManager:
                         if isinstance(attn_module, DeepseekV32IndexerCache)
                         else PallasMLAttentionBackend
                     )
-                    kv_cache_shape = mla_backend_cls.get_kv_cache_shape(
-                        num_blocks,
-                        kv_cache_spec.block_size,
-                        kv_cache_spec.num_kv_heads,
-                        kv_cache_spec.head_size,
-                        kv_cache_spec.dtype,
+                    owned_shape = (
+                        attn_module.kv_cache_shape(num_blocks)
+                        if isinstance(attn_module, TpuOwnedKVCache)
+                        else None
+                    )
+                    kv_cache_shape = (
+                        owned_shape
+                        if owned_shape is not None
+                        else mla_backend_cls.get_kv_cache_shape(
+                            num_blocks,
+                            kv_cache_spec.block_size,
+                            kv_cache_spec.num_kv_heads,
+                            kv_cache_spec.head_size,
+                            kv_cache_spec.dtype,
+                        )
                     )
                     dtype = kv_cache_spec.dtype
                     kv_caches[layer_name] = allocate_attention_region(
@@ -1915,7 +2095,13 @@ class KVCacheManager:
                         assert backend_cls is not None
                         kv_cache_shape = backend_cls.get_kv_cache_shape(
                             num_blocks,
-                            kv_cache_spec.block_size,
+                            dcp_replicated_page_tokens(
+                                self.runner.vllm_config.compilation_config.static_forward_context.get(  # noqa: E501
+                                    layer_name
+                                ),
+                                kv_cache_spec.block_size,
+                                self.runner.vllm_config,
+                            ),
                             kv_cache_spec.num_kv_heads,
                             kv_cache_spec.head_size,
                             kv_cache_spec.dtype,
