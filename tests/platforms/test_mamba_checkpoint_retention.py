@@ -248,3 +248,37 @@ def test_patch_is_idempotent(patched):
     methods = [getattr(owner, name) for owner, name in _PATCHED]
     mamba_checkpoint_retention.patch_mamba_checkpoint_retention()
     assert [getattr(owner, name) for owner, name in _PATCHED] == methods
+
+
+@pytest.mark.parametrize("spec_blocks", [0, 3])
+def test_decode_checkpoint_gate_follows_speculative_blocks(patched, spec_blocks):
+    """The install-time line reports only the knob (it read "on (no spec
+    decode)" in MTP K=3 runs); the gate is the manager's speculative blocks."""
+    manager = _manager(num_speculative_blocks=spec_blocks)
+    mambas = [
+        m
+        for m in manager.coordinator.single_type_managers
+        if isinstance(m, MambaManager)
+    ]
+    assert mambas
+    for m in mambas:
+        assert mamba_checkpoint_retention.decode_checkpoints_active(m, True) == (
+            spec_blocks == 0
+        )
+        assert not mamba_checkpoint_retention.decode_checkpoints_active(m, False)
+    mamba_checkpoint_retention._GATE_LOGGED.clear()
+    messages = []
+    original = mamba_checkpoint_retention.logger.info
+    mamba_checkpoint_retention.logger.info = lambda fmt, *a: messages.append(fmt % a)
+    try:
+        first = _request("turn1", PROMPT)
+        _run(manager, first, num_decode=30)
+    finally:
+        mamba_checkpoint_retention.logger.info = original
+    gate = [m for m in messages if m.startswith("Mamba decode checkpoints")]
+    assert gate == [
+        f"Mamba decode checkpoints: {'on' if spec_blocks == 0 else 'off'} "
+        f"(VLLM_TPU_MAMBA_DECODE_CHECKPOINT=1, num_speculative_blocks={spec_blocks})."
+    ]
+    # Spec decode: no decode-boundary state is ever published.
+    assert (_cached_state_block(manager, first, 64) is None) == (spec_blocks > 0)
