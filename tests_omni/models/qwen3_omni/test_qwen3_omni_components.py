@@ -16,22 +16,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from types import SimpleNamespace
 
 import pytest
 import torch
 from transformers import Qwen3OmniMoeAudioEncoderConfig
-from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.attention.mm_encoder_attention import (
-    MMEncoderAttention,
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeAudioEncoder as HfQwen3OmniMoeAudioEncoder,
 )
-from vllm.model_executor.layers.linear import LinearBase
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeAudioEncoder,
     _get_feat_extract_output_lengths,
 )
 
-from tests_omni.omni_test_utils import assert_parity
+from tests_omni.omni_test_utils import assert_all_loaded, assert_parity
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_CHUNK_LENGTHS_PATCHED,
     maybe_patch_qwen3_omni_thinker,
@@ -54,81 +51,15 @@ AUDIO_CONFIG = Qwen3OmniMoeAudioEncoderConfig(
 # the partial-window branch across two attention segments.
 PARITY_LENGTHS = [800, 801]
 
-# (max relative L2, max abs) vs float32 CPU reference (~2.5x measured on TPU v6e).
-END_TO_END_LIMITS = (1.5e-2, 4.5e-3)
-COMPONENT_LIMITS = {
-    "conv stack + positional embedding": (5e-3, 1.5e-2),
-    "layers.0.self_attn": (9e-3, 3.5e-3),
-    "layers.0": (8e-3, 3e-2),
-    "ln_post + proj": (1.2e-2, 4.5e-3),
-}
+# (max relative L2, max abs) vs float32 HF CPU reference (~2.5x measured on TPU v6e).
+ATTN_LIMITS = (1.0e-2, 3.0e-3)
+LAYER_LIMITS = (8.0e-3, 5.5e-2)
+END_TO_END_LIMITS = (1.5e-2, 3.5e-3)
 
 
-def _init_linear_weights(module: torch.nn.Module, seed: int) -> None:
-    """Seed vLLM's parallel linear layers, which ``torch.empty`` leaves to a loader."""
-    generator = torch.Generator().manual_seed(seed)
-    with torch.no_grad():
-        for submodule in module.modules():
-            if isinstance(submodule, LinearBase):
-                for param in submodule.parameters(recurse=False):
-                    if param.dim() > 1:
-                        param.copy_(
-                            torch.randn(param.shape, generator=generator) * 0.02
-                        )
-                    else:
-                        param.zero_()
-
-
-def _use_native_ops_on_cpu(module: torch.nn.Module) -> None:
-    """Bind CPU-compatible reference methods on vLLM CustomOp instances."""
-
-    def _attention(query, key, value, cu_seqlens=None, max_seqlen=None, **_):
-        q, k, v = (t.transpose(1, 2).double() for t in (query, key, value))
-        bounds = cu_seqlens.tolist() if cu_seqlens is not None else [0, q.shape[2]]
-        scale = q.shape[-1] ** -0.5
-        out = torch.empty_like(q)
-        for start, end in zip(bounds[:-1], bounds[1:]):
-            scores = q[:, :, start:end] @ k[:, :, start:end].transpose(-1, -2) * scale
-            out[:, :, start:end] = scores.softmax(dim=-1) @ v[:, :, start:end]
-        return out.transpose(1, 2).to(query.dtype)
-
-    for submodule in module.modules():
-        if isinstance(submodule, MMEncoderAttention):
-            submodule._forward_method = _attention
-        elif isinstance(submodule, CustomOp):
-            submodule._forward_method = submodule.forward_native
-
-
-def _encode(
-    encoder: Qwen3OmniMoeAudioEncoder,
-    n_frames: int,
-    forward: Callable[..., torch.Tensor] | None = None,
-) -> torch.Tensor:
-    generator = torch.Generator().manual_seed(n_frames)
-    features = (
-        torch.randn(AUDIO_CONFIG.num_mel_bins, n_frames, generator=generator)
-        .to(torch.bfloat16)
-        .float()
-    )
-    param = next(encoder.parameters())
-    device, dtype = param.device, param.dtype
-    feature_lens = torch.tensor([n_frames], dtype=torch.long, device=device)
-    aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
-    run = encoder if forward is None else forward.__get__(encoder)
-    with torch.no_grad():
-        out = run(features.to(device=device, dtype=dtype), feature_lens, aftercnn_lens)
-    assert feature_lens.device == device
-    return out
-
-
-def _check(actual: torch.Tensor, reference: torch.Tensor, name: str, limits) -> None:
-    diff = actual.detach().cpu().double() - reference.detach().cpu().double()
-    rel_l2 = float(diff.norm() / reference.detach().cpu().double().norm())
-    print(
-        f"parity {name:<40} rel_l2={rel_l2:.3e} max_abs={float(diff.abs().max()):.3e}"
-    )
-    max_rel_l2, max_abs = limits
-    assert_parity(actual, reference, name=name, max_rel_l2=max_rel_l2, max_abs=max_abs)
+def _make_mel_features(n_frames: int) -> torch.Tensor:
+    generator = torch.Generator().manual_seed(0)
+    return torch.randn(AUDIO_CONFIG.num_mel_bins, n_frames, generator=generator)
 
 
 @pytest.fixture(scope="module")
@@ -136,7 +67,9 @@ def encoders(
     omni_ctx: None,
 ) -> Iterator[
     tuple[
-        Qwen3OmniMoeAudioEncoder, Qwen3OmniMoeAudioEncoder, Callable[..., torch.Tensor]
+        Qwen3OmniMoeAudioEncoder,
+        HfQwen3OmniMoeAudioEncoder,
+        Callable[..., torch.Tensor],
     ]
 ]:
     if not torch.accelerator.is_available():
@@ -144,29 +77,26 @@ def encoders(
 
     cls = Qwen3OmniMoeAudioEncoder
     upstream_forward = cls.forward
+    orig_get_cnn_lengths = cls._get_cnn_output_lengths
     assert not getattr(upstream_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
-    own = {n: cls.__dict__.get(n) for n in ("forward", "_get_cnn_output_lengths")}
     try:
-        config = SimpleNamespace(architectures=["Qwen3OmniMoeForConditionalGeneration"])
-        assert maybe_patch_qwen3_omni_thinker(config) is True
+        assert (
+            maybe_patch_qwen3_omni_thinker(["Qwen3OmniMoeForConditionalGeneration"])
+            is True
+        )
         assert getattr(cls.forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
 
         torch.manual_seed(0)
-        cpu = cls(AUDIO_CONFIG).eval()
-        _init_linear_weights(cpu, seed=0)
-        assert all(torch.isfinite(p).all() for p in cpu.parameters())
-        _use_native_ops_on_cpu(cpu)
+        ref = HfQwen3OmniMoeAudioEncoder(AUDIO_CONFIG).eval()
 
         tpu = cls(AUDIO_CONFIG).eval()
-        tpu.load_state_dict(cpu.state_dict())
-        tpu = tpu.to(torch.device("tpu")).to(torch.bfloat16)
-        yield tpu, cpu, upstream_forward
+        loaded = tpu.load_weights(ref.named_parameters())
+        assert_all_loaded(loaded, tpu)
+        tpu = tpu.to(device="tpu", dtype=torch.bfloat16)
+        yield tpu, ref, upstream_forward
     finally:
-        for name, value in own.items():
-            if value is None:
-                delattr(cls, name)
-            else:
-                setattr(cls, name, value)
+        cls.forward = upstream_forward
+        cls._get_cnn_output_lengths = orig_get_cnn_lengths
 
 
 @pytest.mark.xfail(
@@ -175,10 +105,14 @@ def encoders(
     reason="vLLM-Omni 0.32.0rc1 takes ceil(feature_lens / 100) on the device, "
     "which TPU rounds up to 9 windows for 800 frames; the split then fails",
 )
+@torch.no_grad()
 def test_upstream_forward_miscounts_exact_window_multiples(encoders) -> None:
     tpu, _, upstream_forward = encoders
+    features = _make_mel_features(800).to(device="tpu", dtype=torch.bfloat16)
+    feature_lens = torch.tensor([800], dtype=torch.long, device="tpu")
+    aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
     try:
-        out = _encode(tpu, 800, forward=upstream_forward)
+        out = upstream_forward(tpu, features, feature_lens, aftercnn_lens)
     except RuntimeError as exc:
         assert "split_with_sizes expects split_sizes to sum exactly to 800" not in str(
             exc
@@ -187,57 +121,71 @@ def test_upstream_forward_miscounts_exact_window_multiples(encoders) -> None:
     assert out.shape[0] == int(_get_feat_extract_output_lengths(800))
 
 
+@torch.no_grad()
+def test_audio_encoder_layer_matches_cpu_reference(encoders) -> None:
+    tpu, ref, _ = encoders
+    generator = torch.Generator().manual_seed(0)
+    hidden = torch.randn(105, AUDIO_CONFIG.d_model, generator=generator)
+    cu_seqlens_cpu = torch.tensor([0, 104, 105], dtype=torch.int32)
+    cu_seqlens_tpu = cu_seqlens_cpu.to("tpu")
+    max_seqlen = 104
+
+    ref_attn = ref.layers[0].self_attn(hidden, cu_seqlens_cpu, max_seqlen=max_seqlen)
+    if isinstance(ref_attn, tuple):
+        ref_attn = ref_attn[0]
+    tpu_attn = tpu.layers[0].self_attn(
+        hidden.to(device="tpu", dtype=torch.bfloat16),
+        cu_seqlens_tpu,
+        max_seqlen=max_seqlen,
+    )
+    assert_parity(
+        tpu_attn,
+        ref_attn,
+        name="layers.0.self_attn",
+        max_rel_l2=ATTN_LIMITS[0],
+        max_abs=ATTN_LIMITS[1],
+    )
+
+    ref_layer = ref.layers[0](hidden, cu_seqlens_cpu, max_seqlen=max_seqlen)[0]
+    tpu_layer = tpu.layers[0](
+        hidden.to(device="tpu", dtype=torch.bfloat16),
+        cu_seqlens_tpu,
+        max_seqlen=max_seqlen,
+    )
+    assert_parity(
+        tpu_layer,
+        ref_layer,
+        name="layers.0",
+        max_rel_l2=LAYER_LIMITS[0],
+        max_abs=LAYER_LIMITS[1],
+    )
+
+
 @pytest.mark.parametrize("n_frames", PARITY_LENGTHS)
+@torch.no_grad()
 def test_audio_encoder_matches_cpu_reference(encoders, n_frames: int) -> None:
-    tpu, cpu, _ = encoders
-    captured: dict[str, tuple[tuple, dict, torch.Tensor]] = {}
+    tpu, ref, _ = encoders
+    features = _make_mel_features(n_frames)
+    ref_lens = torch.tensor([n_frames], dtype=torch.long)
+    reference = ref(features, ref_lens).last_hidden_state
 
-    def _capture(name):
-        def hook(module, args, kwargs, output):
-            captured[name] = (args, kwargs, output)
-
-        return hook
-
-    hooks = [
-        cpu.layers[0].register_forward_hook(_capture("layer"), with_kwargs=True),
-        cpu.layers[0].self_attn.register_forward_hook(
-            _capture("attn"), with_kwargs=True
-        ),
-        tpu.layers[0].register_forward_hook(_capture("tpu_layer"), with_kwargs=True),
-    ]
-    try:
-        reference = _encode(cpu, n_frames)
-        out = _encode(tpu, n_frames)
-    finally:
-        for hook in hooks:
-            hook.remove()
+    feature_lens = torch.tensor([n_frames], dtype=torch.long, device="tpu")
+    aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
+    out = tpu(
+        features.to(device="tpu", dtype=torch.bfloat16),
+        feature_lens,
+        aftercnn_lens,
+    )
+    assert feature_lens.device.type == "tpu"
     assert out.device.type == "tpu"
     assert out.shape == (
         int(_get_feat_extract_output_lengths(n_frames)),
         AUDIO_CONFIG.output_dim,
     )
-    assert out.shape == reference.shape
-
-    def _on_tpu(t: torch.Tensor) -> torch.Tensor:
-        return t.to(torch.device("tpu"), torch.bfloat16)
-
-    (layer_in, _, _), _, layer_out = captured["layer"]
-    _, attn_kwargs, attn_out = captured["attn"]
-    (tpu_layer_in, tpu_cu_seqlens, tpu_max_seqlen), _, _ = captured["tpu_layer"]
-    with torch.no_grad():
-        tpu_attn_out = tpu.layers[0].self_attn(
-            _on_tpu(attn_kwargs["hidden_states"]), tpu_cu_seqlens, tpu_max_seqlen
-        )
-        tpu_layer_out = tpu.layers[0](_on_tpu(layer_in), tpu_cu_seqlens, tpu_max_seqlen)
-        h = tpu.ln_post(_on_tpu(layer_out))
-        tpu_proj_out = tpu.proj2(tpu.act(tpu.proj1(h)[0]))[0]
-
-    tag = f" ({n_frames} frames)"
-    for name, actual, expected in [
-        ("conv stack + positional embedding", tpu_layer_in, layer_in),
-        ("layers.0.self_attn", tpu_attn_out, attn_out),
-        ("layers.0", tpu_layer_out, layer_out),
-        ("ln_post + proj", tpu_proj_out, reference),
-    ]:
-        _check(actual, expected, name + tag, COMPONENT_LIMITS[name])
-    _check(out, reference, "audio encoder end to end" + tag, END_TO_END_LIMITS)
+    assert_parity(
+        out,
+        reference,
+        name=f"audio encoder ({n_frames} frames)",
+        max_rel_l2=END_TO_END_LIMITS[0],
+        max_abs=END_TO_END_LIMITS[1],
+    )

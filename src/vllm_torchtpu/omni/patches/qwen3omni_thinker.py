@@ -58,14 +58,11 @@ upstream or once TPU float division becomes exact for these lengths.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 
 from vllm_torchtpu.logger import init_logger
-
-if TYPE_CHECKING:
-    from vllm.config import ModelConfig
 
 logger = init_logger(__name__)
 
@@ -114,17 +111,18 @@ def _wrap_chunk_length_math(encoder_cls: type[Any]) -> bool:
 
 
 def maybe_patch_qwen3_omni_thinker(
-    model_config: ModelConfig | None = None,
+    architectures: list[str] | None = None,
 ) -> bool:
     """Route the audio encoder's chunk-length math through CPU on TPU.
 
     Applies to ``Qwen3OmniMoeForConditionalGeneration`` only, matched
-    literally in ``ModelConfig.architectures`` (the pipeline ``model_arch``
+    literally in ``architectures`` (the pipeline ``model_arch``
     vLLM-Omni gives every Qwen3-Omni stage). Returns ``True`` when the
     vLLM-Omni ``Qwen3OmniMoeAudioEncoder`` class is newly wrapped, and
-    ``False`` when the config does not match or the class is already patched.
+    ``False`` when the architecture does not match or the class is already
+    patched.
     """
-    if model_config is None or _QWEN3_OMNI_ARCH not in model_config.architectures:
+    if not architectures or _QWEN3_OMNI_ARCH not in architectures:
         return False
 
     from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
