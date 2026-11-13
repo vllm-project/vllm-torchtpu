@@ -34,12 +34,12 @@ from . import (
 from .calibrate import CalibrateOptions, calibrate_trace
 from .chips import (
     BUILTIN_CHIP_SPECS,
+    ChipSpec,
+    FieldSource,
     REQUIRED_CHIP_SPEC_KEYS,
     SUPPORTED_CHIPS,
     TPU6E_TOPOLOGIES,
     TPU7X_TOPOLOGIES,
-    ChipSpec,
-    FieldSource,
     UnsupportedChipError,
     build_builtin_chip_spec,
     detect_tpu_from_sysfs,
@@ -81,6 +81,7 @@ from .regimes import (
     recommend_parallelism,
 )
 from .report import (
+    build_bucket_schedule,
     format_advisor_summary,
     format_layer_group_search,
     format_regime_table,
@@ -88,13 +89,18 @@ from .report import (
     render_regime_dot_plot_svg,
     svg_text_width,
     write_advisor_html,
+    write_bucket_schedule,
 )
 from .roofline import validate_workload
 from .spec_bridge import advise_from_spec
 from .specs import (
+    BUCKET_CONSUMER_STATUS,
+    BUCKET_SCHEDULE_SCHEMA,
     SUPPORTED_ONCHIP_FAMILIES,
     AdvisorReport,
     AdvisorSweepReport,
+    BucketSchedulePayload,
+    BucketScheduleRule,
     CollectiveCall,
     DisaggHandoffSpec,
     DispatchRegime,
@@ -142,7 +148,11 @@ from .vmem import (
 __all__ = [
     "AdvisorReport",
     "AdvisorSweepReport",
+    "BUCKET_CONSUMER_STATUS",
+    "BUCKET_SCHEDULE_SCHEMA",
     "BUILTIN_CHIP_SPECS",
+    "BucketSchedulePayload",
+    "BucketScheduleRule",
     "CORE_LIMITS",
     "CalibrateOptions",
     "ChipSpec",
@@ -196,6 +206,7 @@ __all__ = [
     "advise_regimes",
     "assets",
     "build_arg_parser",
+    "build_bucket_schedule",
     "build_builtin_chip_spec",
     "calibrate",
     "calibrate_trace",
@@ -248,4 +259,5 @@ __all__ = [
     "verdict",
     "vmem",
     "write_advisor_html",
+    "write_bucket_schedule",
 ]
