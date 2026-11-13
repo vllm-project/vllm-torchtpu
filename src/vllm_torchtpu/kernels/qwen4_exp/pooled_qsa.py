@@ -206,6 +206,16 @@ def _write_main_cache_paired(pool, rows, page, logical, valid, slot):
     rows = main_slot_rows(rows, slot)
     offsets = logical % pool.shape[1]
     tile = 128
+    if len(rows) % tile and pool.shape[1] % tile == 0:
+        # Small steps (decode, verify) take the DMA kernel too, padded with
+        # invalid rows: an XLA gather/select of the FP8 carrier canonicalizes
+        # bytes that read as FP8 NaN (0x7F, 0xFF), which the partner half may
+        # hold -- e.g. in-row compressed keys' BF16 bytes
+        # (QWEN4_EXP_INROW_COMPRESSED_K).
+        pad = -len(rows) % tile
+        rows = jnp.pad(rows, ((0, pad),) + ((0, 0),) * (rows.ndim - 1))
+        page, offsets, logical = (jnp.pad(x, (0, pad)) for x in (page, offsets, logical))
+        valid = jnp.pad(valid, (0, pad))
     if len(rows) % tile or pool.shape[1] % tile:
         # Small steps: a gather of the touched rows feeds the in-place scatter.
         mine = (jnp.arange(packing) // 2 == slot)[:, None]
