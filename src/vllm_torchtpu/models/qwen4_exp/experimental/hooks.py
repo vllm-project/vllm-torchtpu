@@ -43,6 +43,14 @@ def _make_adapter(runner):
     return Qwen4ExpAdapter(runner)
 
 
+def _make_draft_proposer(runner, vllm_config):
+    # Deferred: the proposer copy imports the shared spec decode stack, which
+    # only a runner on the last pipeline stage needs.
+    from .spec_decode.eagle3 import Eagle3Proposer
+
+    return Eagle3Proposer(runner, vllm_config)
+
+
 def register() -> None:
     """Register the experimental model for the Qwen4Exp architectures.
 
@@ -76,6 +84,11 @@ def register() -> None:
     from vllm_torchtpu.worker.cpu_pinning import register_cpu_pinning
 
     register_cpu_pinning("numa", *QWEN4_EXP_ARCHITECTURES)
+
+    # The MTP draft runs on this directory's copy of the EAGLE/MTP proposer.
+    from vllm_torchtpu.spec_decode.proposer_registry import register_draft_proposer
+
+    register_draft_proposer(("Qwen4ExpMTP",), _make_draft_proposer)
 
     # kernels/ and ops/ are hashed by the shared rule; the pooled cache layout
     # changes graph argument extents, and the model plan changes graphs.
