@@ -370,14 +370,19 @@ def _claim_layer(ring: stream.TwoRing, scr: dict[str, Any]) -> Any:
 )
 def test_claim_matches_dmatmul(dwait_hoist: bool, lazy: bool, rel_fetch: bool):
     """`claim` consumes and refills the stream exactly as `dmatmul` does: same
-    outputs bit for bit, same primitive histogram."""
+    outputs bit for bit, and the same primitive histogram apart from scalar
+    `add`s (the rebuilt layer offsets tile `u` as `g0 + u` where `dmatmul`
+    traces `g0 + t + u` with `t = 0`)."""
     kw = dict(dense_acc_pair=True, dmm_unroll=8, dwait_hoist=dwait_hoist)
     kw["rel_fetch"] = rel_fetch
     out0, ref, call0, args = _run(_tiles(**kw), lazy=lazy)
     out1, _, call1, _ = _run(_tiles(**kw), _claim_layer, lazy=lazy)
     np.testing.assert_allclose(out0, ref, atol=1e-2, rtol=1e-2)
     np.testing.assert_array_equal(out1, out0)
-    assert prim_counts(call1, *args) == prim_counts(call0, *args)
+    c0, c1 = prim_counts(call0, *args), prim_counts(call1, *args)
+    del c0["add"], c1["add"]
+    assert c1 == c0
+    assert c0["dma_wait"] > 0 and c0["dma_start"] > 0 and c0["dot_general"] > 0
 
 
 def test_claim_advances_cursor_and_checks_order():
