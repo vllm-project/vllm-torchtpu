@@ -299,8 +299,34 @@ def test_kda_tiles_match_the_reference(length):
     want = jax.jit(functools.partial(_kda_reference, length=length))(
         rows, weights, state
     )
-    for g, w in zip(got, want, strict=True):
-        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+    # The tile reduces on other layouts (heads on lanes, chunks batched):
+    # last-bit differences only.
+    attended, want_attended = (np.asarray(x, np.float32) for x in (got[0], want[0]))
+    error = np.abs(attended - want_attended)
+    assert error.max() <= 2**-6 * np.abs(want_attended).max()
+    assert np.linalg.norm(error) <= 1e-3 * np.linalg.norm(want_attended)
+    rec, want_rec = np.asarray(got[1]), np.asarray(want[1])
+    assert np.linalg.norm(rec - want_rec) <= 1e-4 * np.linalg.norm(want_rec)
+    np.testing.assert_array_equal(np.asarray(got[2]), np.asarray(want[2]))
+
+
+def test_chunk_intra_batches_heads_and_chunks():
+    rng = np.random.default_rng(11)
+    shape = (6, 64, 128)
+    q, k = (rng.standard_normal(shape) for _ in range(2))
+    q = jnp.asarray(
+        q / np.linalg.norm(q, axis=-1, keepdims=True) / 128**0.5, jnp.float32
+    )
+    k = jnp.asarray(k / np.linalg.norm(k, axis=-1, keepdims=True), jnp.float32)
+    v = jnp.asarray(rng.standard_normal(shape), jnp.float32)
+    gate = jnp.asarray(_gates("realistic", rng, shape), jnp.float32)
+    beta = jnp.asarray(1 / (1 + np.exp(-rng.standard_normal(shape[:2]))), jnp.float32)
+    intra = jax.jit(kernels._kda_chunk_intra)
+    both = intra(q, k, v, gate, beta)
+    for half in (slice(0, 3), slice(3, 6)):
+        alone = intra(q[half], k[half], v[half], gate[half], beta[half])
+        for x, y in zip(both, alone, strict=True):
+            np.testing.assert_array_equal(np.asarray(x[half]), np.asarray(y))
 
 
 def _scope_names(jaxpr):

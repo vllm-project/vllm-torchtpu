@@ -2239,7 +2239,17 @@ _LOG2E = 1.4426950408889634
 
 
 def _kda_chunk_fast(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, block=8):
-    """Inference fast path for one 64-token KDA chunk inside Pallas VMEM.
+    """Inference fast path for one 64-token KDA chunk inside Pallas VMEM: its
+    state-independent part (`_kda_chunk_intra`), then the state recurrence
+    (`_kda_chunk_apply`). Returns (out, new_state)."""
+    return _kda_chunk_apply(
+        _kda_chunk_intra(q, k, v, gate, beta, sub_block=sub_block, block=block), state)
+
+
+def _kda_chunk_intra(q, k, v, gate, beta, *, sub_block=_KDA_SUB_BLOCK, block=8):
+    """The state-independent part of `_kda_chunk_fast` for a batch of chunks
+    (``q``, ``k``, ``v``, ``gate`` [B, C, K], ``beta`` [B, C]; B any mix of
+    heads and chunks): the operands of `_kda_chunk_apply`.
 
     Follows ``mega_kda``'s Kimi-K3 BF16/DEFAULT-precision formulation:
     - Sub-block ``both`` matmuls run at ``Precision.DEFAULT`` over only the
@@ -2250,8 +2260,8 @@ def _kda_chunk_fast(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, blo
     - Two-level (8x8 block) Neumann solve applies ``(I + G)^{-1} P`` directly
       to ``rhs`` without materializing ``solve = (I + G)^{-1} P``, fusing the
       doubling steps and ``P @ [F, rhs]``.
-    - Inter-chunk state read/update matmuls fuse ``[w, q_scaled] @ state`` and
-      ``[aqk, kg^T] @ v_new``.
+    - The state read/update matmuls of `_kda_chunk_apply` take ``[w,
+      q_scaled]`` and ``[aqk, kg^T]`` fused.
     """
     head_count, chunk_size, _ = q.shape
     value_channels = v.shape[-1]
@@ -2352,12 +2362,20 @@ def _kda_chunk_fast(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, blo
 
     u, w = solved[..., :value_channels], solved[..., value_channels:]
     q_scaled = q * jnp.where(gc > -126.0, jnp.exp2(gc), jnp.float32(0))
-    state_prods = _dot3(jnp.concatenate((w, q_scaled), axis=1), state)
-    v_new = u - state_prods[:, :chunk_size]
-
     g_last = gc[:, -1, :]  # [H, K]
     kg = k * jnp.exp2(g_last[:, None, :] - gc)
-    v_prods = _dot3(jnp.concatenate((aqk, kg.transpose(0, 2, 1)), axis=1), v_new)
+    return (jnp.concatenate((w, q_scaled), axis=1), u,
+            jnp.concatenate((aqk, kg.transpose(0, 2, 1)), axis=1), g_last)
+
+
+def _kda_chunk_apply(parts, state):
+    """The state recurrence of one chunk from its `_kda_chunk_intra` operands
+    (one entry per head): returns (out [H, C, V], new_state [H, K, V])."""
+    w_q, u, aqk_kg, g_last = parts
+    chunk_size = u.shape[1]
+    state_prods = _dot3(w_q, state)
+    v_new = u - state_prods[:, :chunk_size]
+    v_prods = _dot3(aqk_kg, v_new)
     out = state_prods[:, chunk_size:] + v_prods[:, :chunk_size]
     new_state = state * jnp.exp2(g_last)[:, :, None] + v_prods[:, chunk_size:]
     return out, new_state
@@ -3082,11 +3100,13 @@ def kda_prefill_tiled_body(
 
         @pl.when(real_count > 0)
         def compute_active_tile():
-            # The weights are read here: a value live across the loop would be a
-            # VMEM copy (24.5 MiB for the projection).
-            conv_filter = conv_w_vmem[...].astype(jnp.float32)
-            a_log = jnp.exp(alog_vmem[...])  # [3, 1] FP32
-            dt_bias = dt_vmem[...]  # [3, 128] FP32
+            # The tile's arrays keep the heads side by side on lanes ([tile, 384 k],
+            # head h at lanes 128 h). The weights are read here: a value live across
+            # the loop would be a VMEM copy (24.5 MiB for the projection).
+            conv_filter = conv_w_vmem[...].astype(jnp.float32).reshape(4, 3 * width)
+            decay_rate = jnp.broadcast_to(
+                jnp.exp(alog_vmem[...]), (head_count, channels)).reshape(1, width)
+            dt_bias = dt_vmem[...].reshape(1, width)
             norm = norm_vmem[0]
             scope = _phase_start("kda_proj")
             hidden_tile = hidden_bufs.at[buf][...]  # [tile, hidden]
@@ -3096,15 +3116,11 @@ def kda_prefill_tiled_body(
             projected = _dot(hidden_tile, proj_w_vmem[...]).astype(
                 jnp.bfloat16
             )  # [tile, 1792]
-            raw_gate = (
-                _dot(projected[:, :channels], fb_w_vmem[...])
-                .astype(jnp.bfloat16)
-                .reshape(tile, head_count, channels)
-            )  # [tile, 3, 128]
+            raw_gate = _dot(projected[:, :channels], fb_w_vmem[...]).astype(
+                jnp.bfloat16
+            )  # [tile, 384]
             update_rate = projected[:, channels : channels + head_count]  # [tile, 3]
-            qkv = projected[:, lead : lead + 3 * width].reshape(
-                tile, 3, head_count, channels
-            )
+            qkv = projected[:, lead : lead + 3 * width]  # [tile, 1152]
             out_gate_sig = jax.nn.sigmoid(
                 projected[:, lead + 3 * width : lead + qkvg].astype(jnp.float32)
             ).astype(jnp.bfloat16)
@@ -3116,56 +3132,58 @@ def kda_prefill_tiled_body(
 
             # ---- 4-tap causal conv (carrying the 3-token history) ----
             window = jnp.concatenate(
-                (conv_hist_vmem[...], qkv), axis=0
-            )  # [tile+3, 3,3,128]
-            convolved = jnp.zeros((tile, 3, head_count, channels), jnp.float32)
+                (conv_hist_vmem[...].reshape(3, 3 * width), qkv), axis=0
+            )  # [tile+3, 1152]
+            convolved = jnp.zeros((tile, 3 * width), jnp.float32)
             for tap in range(4):
                 convolved = (
                     convolved
                     + window[tap : tap + tile].astype(jnp.float32) * conv_filter[tap]
                 )
-            filtered = jax.nn.silu(convolved).astype(jnp.bfloat16)
-            filtered = _row_where(real_rows, filtered)
-            query, key = kda_normalize_query_key(
-                filtered[:, 0].astype(jnp.float32),
-                filtered[:, 1].astype(jnp.float32),
-                channels,
-            )
-            value = filtered[:, 2].astype(jnp.float32)
-            decay = kda_decay(
-                decay_lower_bound, a_log[None], raw_gate, dt_bias[None]
-            )  # [tile, 3, 128] FP32
+            filtered = _row_where(real_rows, jax.nn.silu(convolved).astype(jnp.bfloat16))
+
+            def heads(x, first=0):  # the [tile, 128] lanes of each head
+                return [x[:, first + h * channels : first + (h + 1) * channels]
+                        for h in range(head_count)]
+
+            query, key = zip(*(
+                kda_normalize_query_key(q.astype(jnp.float32), k.astype(jnp.float32),
+                                        channels)
+                for q, k in zip(heads(filtered), heads(filtered, width), strict=True)))
+            value = [v.astype(jnp.float32) for v in heads(filtered, 2 * width)]
+            decay = heads(kda_decay(decay_lower_bound, decay_rate, raw_gate, dt_bias))
             beta = jax.nn.sigmoid(update_rate.astype(jnp.float32))  # [tile, 3] FP32
             _phase_end(scope)
 
             # ---- chunked delta rule over this tile's 64-token chunks ----
             scope = _phase_start("kda_chunk")
             outputs = []
-            for c in range(tile // _KDA_CHUNK):
+            chunks = tile // _KDA_CHUNK
+
+            def entries(xs):  # [chunks * 3, 64, 128], chunk-major: one batch for the
+                # state-independent part of every chunk, before the recurrence
+                return jnp.stack([x[c * _KDA_CHUNK:(c + 1) * _KDA_CHUNK]
+                                  for c in range(chunks) for x in xs])
+
+            parts = _kda_chunk_intra(
+                entries(query), entries(key), entries(value), entries(decay),
+                jnp.concatenate([beta[c * _KDA_CHUNK:(c + 1) * _KDA_CHUNK].transpose(1, 0)
+                                 for c in range(chunks)]))
+            for c in range(chunks):
                 s0, s1 = c * _KDA_CHUNK, (c + 1) * _KDA_CHUNK
-                chunk_out, new_state = kda_chunk(
-                    query[s0:s1].transpose(1, 0, 2),
-                    key[s0:s1].transpose(1, 0, 2),
-                    value[s0:s1].transpose(1, 0, 2),
-                    decay[s0:s1].transpose(1, 0, 2),
-                    beta[s0:s1].transpose(1, 0),
-                    rec_state_vmem[...],
-                )
+                chunk_out, new_state = _kda_chunk_apply(
+                    [x[c * head_count:(c + 1) * head_count] for x in parts],
+                    rec_state_vmem[...])
                 rec_state_vmem[...] = new_state
                 chunk_att = chunk_out.astype(jnp.bfloat16).astype(jnp.float32)
                 chunk_att *= jax.lax.rsqrt(
                     jnp.mean(chunk_att * chunk_att, axis=-1, keepdims=True) + epsilon
                 )
-                chunk_att = (
-                    (chunk_att * norm)
-                    .astype(jnp.bfloat16)
-                    .transpose(1, 0, 2)
-                    .reshape(_KDA_CHUNK, width)
-                    * out_gate_sig[s0:s1]
-                )
-                outputs.append(chunk_att)
+                chunk_att = (chunk_att * norm).astype(jnp.bfloat16)
+                outputs.append(
+                    jnp.concatenate(list(chunk_att), axis=1) * out_gate_sig[s0:s1])
 
-            attended = jnp.concatenate(outputs, axis=0)
+            attended = jnp.concatenate(outputs, axis=0)  # [tile, 384]
             _phase_end(scope)
             if out_bufs is not None:
                 out_bufs.at[buf][...] = attended
@@ -3183,7 +3201,7 @@ def kda_prefill_tiled_body(
             # without flushing across @pl.when basic-block boundaries.
             @pl.when(real_count == tile)
             def carry_full_tile():
-                conv_hist_vmem[...] = window[tile : tile + 3]
+                conv_hist_vmem[...] = window[tile : tile + 3].reshape(conv_hist_vmem.shape)
 
             @pl.when(real_count < tile)
             def carry_partial_tile():
@@ -3193,7 +3211,7 @@ def kda_prefill_tiled_body(
                     picked.append(
                         jnp.sum(_row_where(rows == real_count + i, window), axis=0)
                     )
-                conv_hist_vmem[...] = jnp.stack(picked)
+                conv_hist_vmem[...] = jnp.stack(picked).reshape(conv_hist_vmem.shape)
 
         if tile_segment is not None:
             segment, segment_end, current, offset, position = tile_segment
