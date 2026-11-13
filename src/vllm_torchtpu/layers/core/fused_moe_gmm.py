@@ -670,8 +670,13 @@ def moe_gmm(
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
-            computed = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < group_sizes.sum(
-                dtype=jnp.int32
+            # Row r is computed iff some group ends past it: a vector compare
+            # against the groups' ends, not against their summed count, whose
+            # scalar round trip cost ~0.6 us per decode layer (j-6bc5967f).
+            rows = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32)
+            computed = jnp.any(
+                rows[:, None] < jnp.cumsum(group_sizes, dtype=jnp.int32)[None, :],
+                axis=1,
             )
             gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
