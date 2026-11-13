@@ -22,6 +22,7 @@ apply_omni_model_specific_patches() at attention backend selection
 patch_registry.py.
 """
 
+import functools
 from functools import cache as run_once
 from typing import Any
 
@@ -84,6 +85,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_omnivoice_cpu_safetensors_load()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -645,3 +647,45 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+@run_once
+def _patch_omnivoice_cpu_safetensors_load() -> None:
+    # Problem: OmniVoiceGenerator.load_weights and the OmniVoice/HiggsAudio
+    #   decoder loaders call safetensors.torch.load_file(path,
+    #   device=str(device)). On TPU that is "tpu:N". safetensors resolves the
+    #   device in its Rust core, which only knows built-in device types, and
+    #   raises `SafetensorError: device tpu is invalid`, so the k2-fsa/OmniVoice
+    #   diffusion worker dies at weight load.
+    # Fix: load_file is wrapped to try the requested device first. On
+    #   SafetensorError the file is read on CPU and each tensor is moved with
+    #   torch's .to(), which every registered backend (including torch_tpu)
+    #   supports. If the CPU read also fails, the problem is the file rather
+    #   than the device, so the original error is re-raised. Keyword arguments
+    #   (e.g. backend= in safetensors >= 0.8) are passed through. Calls that
+    #   succeed today return unchanged, and once safetensors supports the device
+    #   the fallback never runs. The loaders import load_file inside the
+    #   function at call time, so rebinding the safetensors.torch attribute
+    #   covers every caller.
+    # Effect: k2-fsa/OmniVoice loads its generator and decoder weights on TPU.
+    # -------------------------------------------------------------------------
+    import safetensors.torch as safetensors_torch
+    from safetensors import SafetensorError
+
+    original = safetensors_torch.load_file
+
+    @functools.wraps(original)
+    def load_file(
+        filename: Any, device: Any = "cpu", **kwargs: Any
+    ) -> dict[str, torch.Tensor]:
+        try:
+            return original(filename, device, **kwargs)
+        except SafetensorError as device_error:
+            try:
+                state = original(filename, "cpu", **kwargs)
+            except Exception as cpu_error:
+                raise device_error from cpu_error
+            return {name: tensor.to(device) for name, tensor in state.items()}
+
+    safetensors_torch.load_file = load_file
+    logger.info("Applied TPU patch: safetensors.load_file falls back to CPU staging.")
