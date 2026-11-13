@@ -25,6 +25,14 @@ from vllm_torchtpu.models.minimax_m3.kernels.norm_rope import minimax_m3_norm_ro
 logger = init_logger(__name__)
 
 MIN_TOKENS = envs.TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS
+if MIN_TOKENS:
+    # At import, not in the forward: Dynamo cannot trace the lazy logger.
+    logger.info(
+        "TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS=%d: one-pass q/k/index norm + "
+        "rope kernel armed for steps of >= %d tokens",
+        MIN_TOKENS,
+        MIN_TOKENS,
+    )
 
 
 def _fake(qkv, r, w, cos_sin, num_heads, num_kv_heads, head_dim, rot):
@@ -65,12 +73,6 @@ def fused_norm_rope(
 ) -> torch.Tensor:
     """``[T, heads, head_dim]`` normed + rotated q / k / index_q / index_k
     heads of ``qkv``; ``r [T, heads]`` f32 is the norms' ``rsqrt`` factor."""
-    logger.info_once(
-        "TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS=%d: one-pass q/k/index norm + "
-        "rope kernel armed (first step %d tokens)",
-        MIN_TOKENS,
-        qkv.shape[0],
-    )
     # Same cache rows as `rotary_embedding._rotary_forward_fp32`.
     cache = rotary_emb._match_cos_sin_cache_dtype(qkv)
     cos_sin = cache.index_select(0, positions.flatten())
