@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_VSPACE_FUSED: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
+    TPU_DCP_MLA_TOKEN_SPLIT: bool = False
+    TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS: int = 1024
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
@@ -812,6 +814,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and with an output gate. Costs one o_proj per layer of HBM.
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE": env_bool(
         "TPU_DCP_MLA_OPROJ_ALL_REDUCE", default=False
+    ),
+    # Prototype. Backbone prefill buckets of at least
+    # TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS split their query tokens over the DCP
+    # lanes (tp // dcp > 1) instead of the heads: each lane attends its half of
+    # the tokens with every head (64-head q_b / W_UK_T / W_UV copies built at
+    # load, in an order that makes the DCP reduce-scatter plus a lane
+    # all-to-all land each rank on its o_proj heads), so the per-token KV
+    # gather is not repeated on every lane. Needs TPU_DCP_INDEXER_LANE_SPLIT,
+    # TPU_DCP_INDEXER_HIST_MERGE, TPU_DCP_RANK_OPERAND, query replication and
+    # TPU_DCP_MLA_UV_BEFORE_MERGE; exclusive with TPU_DCP_MLA_OPROJ_ALL_REDUCE.
+    # Costs one 64-head q_b, W_UK_T and W_UV per layer of HBM.
+    "TPU_DCP_MLA_TOKEN_SPLIT": env_bool("TPU_DCP_MLA_TOKEN_SPLIT", default=False),
+    # Smallest padded token bucket that takes TPU_DCP_MLA_TOKEN_SPLIT.
+    "TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS", 1024
     ),
     # Its o_proj and all-reduce run in chunks of this many tokens (a multiple
     # of 128), pipelined: each chunk's all-reduce under the next chunk's

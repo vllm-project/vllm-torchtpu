@@ -14,6 +14,8 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
+import copy
+import functools
 import re
 from typing import Any, cast
 
@@ -22,8 +24,9 @@ import jax.numpy as jnp
 import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
+from vllm.compilation import backends as vllm_compilation_backends
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
-from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -48,6 +51,7 @@ from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import (
+    DCP_LANE_AXIS_NAME,
     dcp_lane_operand,
     dcp_rank_operand,
     get_dcp_group,
@@ -73,7 +77,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
-from vllm_torchtpu.layers.adapter import small_all_reduce_op
+from vllm_torchtpu.layers.adapter import dcp_token_split, small_all_reduce_op
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
@@ -82,10 +86,13 @@ from vllm_torchtpu.layers.adapter.attention import (
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     DCP_ROWS_ATTR,
+    FP8_PALLAS_HBM_PIN_ATTR,
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
+    FP8_PALLAS_SCHED_GROUP_ATTR,
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
+    PREQUANT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     _fp8_linear_pallas_hbm_pinned_jax,
     _fp8_linear_pallas_jax,
@@ -515,6 +522,91 @@ def _is_draft_layer_prefix(prefix: str, num_hidden_layers: int | None) -> bool:
     return m is not None and int(m.group(1)) >= num_hidden_layers
 
 
+def _is_draft_prefix(prefix: str) -> bool:
+    """`_is_draft_layer_prefix` against the current model's layer count."""
+    model_config = getattr(get_current_vllm_config_or_none(), "model_config", None)
+    num_layers = getattr(
+        getattr(model_config, "hf_config", None), "num_hidden_layers", None
+    )
+    return _is_draft_layer_prefix(
+        prefix, num_layers if isinstance(num_layers, int) else None
+    )
+
+
+def _check_token_split_env() -> None:
+    """TPU_DCP_MLA_TOKEN_SPLIT's prerequisites and exclusions; raises."""
+    needs = (
+        "TPU_DCP_INDEXER_LANE_SPLIT",
+        "TPU_DCP_INDEXER_HIST_MERGE",
+        "TPU_DCP_RANK_OPERAND",
+    )
+    missing = [name for name in needs if not getattr(envs, name)]
+    if missing:
+        raise ValueError(f"TPU_DCP_MLA_TOKEN_SPLIT needs {', '.join(missing)}")
+    if envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE:
+        raise ValueError(
+            "TPU_DCP_MLA_TOKEN_SPLIT is exclusive with TPU_DCP_MLA_OPROJ_ALL_REDUCE"
+        )
+    edge = envs.bucket_gate_edge(envs.TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS)
+    for name in (
+        "TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS",
+        "TPU_DCP_INDEXER_A2A_MIN_TOKENS",
+    ):
+        if edge < envs.bucket_gate_edge(getattr(envs, name)):
+            raise ValueError(
+                f"TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS must be at least {name}: "
+                "every token-split bucket must take the indexer lane split"
+            )
+
+
+def _gather_linear_output_channels(
+    layer: torch.nn.Module, group: Any, index: torch.Tensor
+) -> torch.nn.Module:
+    """A processed linear's copy whose output channels are `index` into its
+    own output channels all-gathered over `group` (rank-major). Parameter
+    layouts are `permute_linear_output_channels`'; the decode kernel copy
+    (TPU_FP8_LINEAR_PALLAS) is dropped, so `apply` takes the XLA matmul."""
+    flipped = getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+    weight = cast(torch.Tensor, layer.weight)
+    n_out = weight.shape[1 if flipped else 0]
+    new = copy.copy(layer)
+    new._parameters = {}
+    new._buffers = dict(layer._buffers)
+    new._modules = {}
+    for attr in (
+        FP8_PALLAS_N_ATTR,
+        FP8_PALLAS_SCHED_GROUP_ATTR,
+        FP8_PALLAS_HBM_PIN_ATTR,
+    ):
+        new.__dict__.pop(attr, None)
+    for name, param in layer.named_parameters(recurse=False):
+        if name in (FP8_PALLAS_WEIGHT, FP8_PALLAS_SCALE):
+            continue
+        t = param.data
+        if name == "weight":
+            axis = 1 if flipped else 0
+        elif t.ndim >= 1 and t.shape[-1] == n_out:
+            axis = t.ndim - 1
+        elif t.ndim >= 1 and t.shape[0] == n_out:
+            axis = 0
+        elif t.numel() == 1:
+            new._parameters[name] = param
+            continue
+        else:
+            raise NotImplementedError(
+                f"token split: {name} {tuple(t.shape)} is not per output channel"
+            )
+        gathered = group.all_gather(t.contiguous(), dim=axis)
+        out = _index_select_bits(gathered, axis, index)
+        new._parameters[name] = Parameter(out, requires_grad=False)
+    if hasattr(new, "output_size_per_partition"):
+        new.output_size_per_partition = index.numel()
+    tensors = [p for p in new._parameters.values() if p is not None]
+    if tensors and tensors[0].device.type == "tpu":
+        synchronize_tensors(tensors)
+    return new
+
+
 def _streamidx_shared_meta_for(prefix: str) -> bool:
     """TPU_STREAMIDX_SHARED_META for the indexer at `prefix`: off for the MTP
     draft layer. Its rows are q_len 1, so the DECODE pass runs, and under the
@@ -559,8 +651,18 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                     "once."
                 )
             assert parallel_config is not None
+            # TPU_DCP_MLA_TOKEN_SPLIT: the same op also takes lane_local=True
+            # (this lane's rows), so both sides lift its operands by one name.
+            self.ts_lanes = 1
+            with_ts = bool(
+                envs.TPU_DCP_MLA_TOKEN_SPLIT
+                and not _is_draft_prefix(self.k_cache.prefix)
+            )
+            if with_ts:
+                _check_token_split_env()
+                self.ts_lanes = get_or_create_dcp_mesh().size // dcp_size
             self.topk_op_dcp = self._build_streamidx_dcp_op(
-                dcp_size, parallel_config.cp_kv_cache_interleave_size
+                dcp_size, parallel_config.cp_kv_cache_interleave_size, with_ts=with_ts
             )
             # TPU_INDEXER_QB_OVERLAP: the same op, also running the MLA q_b
             # projection under the SparseCore top-k (see `forward_oot`).
@@ -710,7 +812,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         return op
 
     def _build_streamidx_dcp_op(
-        self, dcp_size: int, interleave_size: int, qb_overlap: bool = False
+        self,
+        dcp_size: int,
+        interleave_size: int,
+        qb_overlap: bool = False,
+        with_ts: bool = False,
     ):
         """The DCP twin of `_build_streamidx_op`.
 
@@ -727,6 +833,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         the schedule: `streamindex_topk_dcp(overlap_fn=...)` pins it under the
         local SparseCore top-k, so on decode the TensorCore runs it while the
         top-k it would otherwise idle on is in flight.
+
+        `with_ts` (TPU_DCP_MLA_TOKEN_SPLIT): the returned op also takes
+        `lane_local=True`, returning only this lane's `[num_tokens / lanes,
+        topk]` rows (no lane all-gather); every bucket it is called on that
+        way must take the lane split.
         """
         topk = self.topk_tokens
         mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
@@ -773,6 +884,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # TPU_DCP_INDEXER_LANE_SPLIT slices each lane's tokens by the same operand.
         pass_lane = small_ag or bool(lane_split_env and rank_operand)
         lane_tensor = dcp_lane_operand() if pass_lane else None
+        assert not with_ts or (pass_lane and not qb_overlap), (
+            "with_ts needs the lane operand and no q_b overlap"
+        )
+        num_lanes = mesh.size // dcp_size
         k_write_compact = envs.TPU_INDEXER_K_WRITE_COMPACT
         qb_overlap_fn = _fp8_linear_pallas_jax
         if qb_overlap:
@@ -798,6 +913,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             qb_args: tuple[jax.Array, ...],  # (x, w_q, w_s), replicated, or ()
             rank_ids_arg: jax.Array | None,  # TPU_DCP_RANK_OPERAND: i32[dcp]
             lane_ids_arg: jax.Array | None = None,  # TPU_DCP_INDEXER_SMALL_AG
+            lane_local: bool = False,
         ) -> tuple[jax.Array, ...]:
             writer, kv_layout = _resolve_indexer_kv_cache_mode(
                 cache_kv, k_packed, mode=kv_cache_mode
@@ -834,7 +950,6 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 )
             # The histogram merge, if on, replaces the all-to-all one.
             large = _dcp_indexer_a2a_for_bucket(q.shape[0], True, a2a_min_tokens)
-            num_lanes = mesh.size // dcp_size
             lane_split = (
                 lane_split_env
                 and lane_ids_arg is not None
@@ -845,6 +960,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 and q.shape[0] >= lane_split_min_tokens
                 and q.shape[0] % (num_lanes * dcp_size) == 0
             )
+            if lane_local and not (lane_split and hist_merge):
+                raise ValueError(
+                    f"TPU_DCP_MLA_TOKEN_SPLIT: the {q.shape[0]}-token bucket "
+                    "does not take the indexer lane split with the hist merge"
+                )
             if lane_split:
                 logger.info_once(
                     "DCP indexer lane split: %d-token bucket over %d lanes",
@@ -879,6 +999,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 decode_pack=decode_pack,
                 shared_meta=shared_meta,
                 lane_split=lane_split,
+                lane_local=lane_local,
                 **overlap,
             )
             if qb_overlap:
@@ -989,6 +1110,33 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 rank_ids,
             )
 
+        def _streamidx_topk_dcp_rank_lane_ts_jax(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+            lane_ids: jax.Array,  # i32[dcp], sharded: each shard its lane
+        ) -> tuple[jax.Array, jax.Array]:
+            return _streamidx_topk_dcp_impl(  # pyrefly: ignore[bad-return]
+                q_bytes,
+                weights,
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                (),
+                rank_ids,
+                lane_ids,
+                lane_local=True,
+            )
+
         def _streamidx_topk_dcp_rank_lane_jax(
             q_bytes: jax.Array,
             weights: jax.Array,
@@ -1062,9 +1210,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # once the mesh and the specs are arguments, and the reason it exists --
         # `jax_placeholders` specializing the dynamic token dim while scaling
         # sharded dims to global size -- applies identically here.
-        jax_op = pcp_streaming_jax_op(
-            op_name,
-            jax_fn,
+        jax_op_kwargs = dict(
             donate_argnums=(2,),
             mesh=mesh,
             input_partition_specs=(
@@ -1086,6 +1232,12 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 *((replicated,) if qb_overlap else ()),  # q
             ),
         )
+        jax_op = pcp_streaming_jax_op(op_name, jax_fn, **jax_op_kwargs)
+        jax_op_ts = None
+        if with_ts:
+            jax_op_ts = pcp_streaming_jax_op(
+                op_name + "_ts", _streamidx_topk_dcp_rank_lane_ts_jax, **jax_op_kwargs
+            )
 
         # We must overwrite the default fake implementation as vLLM uses
         # dynamic dimensions for the query.
@@ -1099,13 +1251,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens,
             distribution,
             *rest,  # (qb_x, qb_w, qb_s) with qb_overlap, then rank, lane ids
+            lane_local=False,
             **kwargs,
         ):
             del weights, k_packed, seq_lens, page_indices, cu_q_lens, distribution
             del kwargs
+            rows = q_bytes.shape[0] // num_lanes if lane_local else q_bytes.shape[0]
             outs = (
                 torch.empty_like(cache_kv),
-                q_bytes.new_empty((q_bytes.shape[0], topk), dtype=torch.int32),
+                q_bytes.new_empty((rows, topk), dtype=torch.int32),
             )
             if qb_overlap:
                 qb_x, qb_w = rest[0], rest[1]
@@ -1113,13 +1267,21 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             return outs
 
         jax_op.register_fake(_fake_streamidx_topk_dcp)
+        if jax_op_ts is not None:
+            jax_op_ts.register_fake(
+                functools.partial(_fake_streamidx_topk_dcp, lane_local=True)
+            )
 
-        def op(*args):
+        def op(*args, lane_local: bool = False):
             if rank_tensor is not None:
                 args = (*args, rank_tensor)
             if lane_tensor is not None:
                 args = (*args, lane_tensor)
-            new_cache, local_topk, *rest = jax_op(*args)
+            if lane_local:
+                assert jax_op_ts is not None, "built without with_ts"
+                new_cache, local_topk, *rest = jax_op_ts(*args)
+            else:
+                new_cache, local_topk, *rest = jax_op(*args)
             args[2].copy_(new_cache)
             if qb_overlap:
                 return local_topk, rest[0]
@@ -1134,12 +1296,16 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         k: torch.Tensor,
         weights: torch.Tensor,
         qb_overlap: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        token_split: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         """`qb_overlap=(x, w_q, w_s)` (TPU_INDEXER_QB_OVERLAP) also returns the
         MLA q_b projection of `x`, computed under the SparseCore top-k: a pair
         `(topk, q)`, `q` None where the op did not run (the caller then runs
-        the projection itself)."""
-        rows, q = self._forward_impl(hidden_states, q_values, k, weights, qb_overlap)
+        the projection itself). `token_split` (TPU_DCP_MLA_TOKEN_SPLIT): only
+        this lane's rows."""
+        rows, q = self._forward_impl(
+            hidden_states, q_values, k, weights, qb_overlap, token_split
+        )
         return rows if qb_overlap is None else (rows, q)
 
     def _forward_impl(
@@ -1149,6 +1315,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         k: torch.Tensor,
         weights: torch.Tensor,
         qb_overlap: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        token_split: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert q_values.dtype == torch.float8_e4m3fn, (
             f"streamindex_topk expects fp8 q, got {q_values.dtype}"
@@ -1185,8 +1352,23 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         distribution = torch.stack([rd[0], rd[0], rd[2]])
 
         q_b_out = None
+        num_rows = hidden_states.shape[0]
         topk_op_dcp_qb = getattr(self, "topk_op_dcp_qb", None)
-        if qb_overlap is not None and topk_op_dcp_qb is not None:
+        if token_split:
+            assert self.topk_op_dcp is not None
+            topk_indices = self.topk_op_dcp(
+                q_values.view(torch.uint8),
+                weights,
+                kv_cache,
+                k_quant_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                lane_local=True,
+            )
+            num_rows = num_rows // self.ts_lanes
+        elif qb_overlap is not None and topk_op_dcp_qb is not None:
             # Same op plus the MLA q_b projection, run under the top-k.
             topk_indices, q_b_out = topk_op_dcp_qb(
                 q_values.view(torch.uint8),
@@ -1230,7 +1412,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # The top-k ops return a (topk, q) pair only with a q_b layer, which
         # this path never passes.
         rows = self._write_topk_rows(
-            hidden_states.shape[0],
+            num_rows,
             topk_indices,  # pyrefly: ignore[bad-argument-type]
         )
         if envs.TPU_INDEXER_TOPK_SHARED_READ:
@@ -1408,10 +1590,12 @@ class VllmTPUIndexer(Indexer):
         positions,
         rotary_emb,
         q_b_layer: torch.nn.Module | None = None,
+        token_split: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         """`q_b_layer` (TPU_INDEXER_QB_OVERLAP): also return `q_b_layer(qr)`,
         run inside the top-k op, as `(topk, q)`; `q` None where the op could
-        not take it (the caller runs `q_b_layer` itself)."""
+        not take it (the caller runs `q_b_layer` itself). `token_split`
+        (TPU_DCP_MLA_TOKEN_SPLIT, no `q_b_layer`): this lane's rows only."""
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         # Fused wk + weights_proj: one GEMM, then split
@@ -1437,7 +1621,7 @@ class VllmTPUIndexer(Indexer):
             q_fp8, q_scale = qprep_op(q.reshape(-1, self.n_head * self.head_dim), c, s_)
             q_scale = q_scale.view(-1, self.n_head, 1)
             return self._finish_forward(
-                hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer
+                hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer, token_split
             )
         if permuted and rope_half_split_leading_supported(rotary_emb):
             # Half-split columns: rope the whole head in place, no split/cat.
@@ -1477,10 +1661,12 @@ class VllmTPUIndexer(Indexer):
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
         return self._finish_forward(
-            hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer
+            hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer, token_split
         )
 
-    def _finish_forward(self, hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer):
+    def _finish_forward(
+        self, hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer, token_split
+    ):
         # q_scale is fp32, so fold it in and cast back: the kernel expects the
         # weights in the activation dtype.
         weights_dtype = weights.dtype
@@ -1489,6 +1675,9 @@ class VllmTPUIndexer(Indexer):
         )
         weights = weights.squeeze(-1).to(weights_dtype)
 
+        if token_split:
+            assert q_b_layer is None
+            return self.indexer_op(hidden_states, q_fp8, k, weights, token_split=True)
         if q_b_layer is None:
             return self.indexer_op(hidden_states, q_fp8, k, weights)
         operands = _qb_overlap_operands(q_b_layer)
@@ -1877,6 +2066,29 @@ class VllmTPUMLAAttention(MLAAttention):
             elif hasattr(self.kv_b_proj, key):
                 delattr(self.kv_b_proj, key)
 
+        # TPU_DCP_MLA_TOKEN_SPLIT: every TP rank's heads in the wrapper's
+        # `dcp_token_split.head_order` (see there).
+        self.W_UK_T_ts = None
+        self.W_UK_T_ts_scale = None
+        self.W_UV_ts = None
+        self.W_UV_ts_scale = None
+        order = getattr(self, "token_split_head_order", None)
+        if order is not None and self.dcp_q_replicate:
+            tp_group = get_tp_group()
+            index = torch.tensor(order, dtype=torch.int64)
+
+            def _all_heads(t):
+                if t is None:
+                    return None
+                return _index_select_bits(
+                    tp_group.all_gather(t.contiguous(), dim=0), 0, index
+                )
+
+            self.W_UK_T_ts = _all_heads(self.W_UK_T)
+            self.W_UK_T_ts_scale = _all_heads(getattr(self, "W_UK_T_scale", None))
+            self.W_UV_ts = _all_heads(self.W_UV)
+            self.W_UV_ts_scale = _all_heads(getattr(self, "W_UV_scale", None))
+
         if self.W_UK_T.device.type == "tpu":
             tensors = [self.W_UK_T, self.W_UV]
             if hasattr(self, "W_UK_T_scale"):
@@ -1890,6 +2102,10 @@ class VllmTPUMLAAttention(MLAAttention):
                     self.W_UV_dcp_qrep_scale,
                     self.W_O_dcp_qrep,
                     self.W_O_dcp_qrep_scale,
+                    self.W_UK_T_ts,
+                    self.W_UK_T_ts_scale,
+                    self.W_UV_ts,
+                    self.W_UV_ts_scale,
                 )
                 if t is not None
             )
@@ -1907,10 +2123,19 @@ class VllmTPUMLAAttention(MLAAttention):
         self.sparse_mla_dcp_rope_op = None
         self.sparse_mla_dcp_send_op = None
         self.sparse_mla_dcp_fused_op = None
+        self.sparse_mla_dcp_ts_op = None
+        self.ts_lane_a2a_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
             )
+            if self.W_UK_T_ts is not None:
+                self.sparse_mla_dcp_ts_op = impl._build_sparse_mla_dcp_op(
+                    self, dcp_size, impl.dcp_interleave_size, lane_split=True
+                )
+                self.ts_lane_a2a_op = dcp_token_split.get_lane_all_to_all_op(
+                    impl._dcp_mesh, DCP_LANE_AXIS_NAME
+                )
             # TPU_MLA_DECODE_PROLOGUE: the variant that takes the raw q head
             # and ropes q_pe in the attention kernel (query replication only).
             if envs.TPU_MLA_DECODE_PROLOGUE and self.dcp_q_replicate:
@@ -1965,6 +2190,7 @@ class VllmTPUMLAAttention(MLAAttention):
             output=output,
             topk_indices=kwargs.get("topk_indices"),
             q_dcp_replicated=kwargs.get("q_dcp_replicated"),
+            token_split=kwargs.get("token_split", False),
         )
 
 
@@ -2113,6 +2339,27 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and self.q_lora_rank is not None
         )
 
+        # TPU_DCP_MLA_TOKEN_SPLIT (prototype): backbone layers with query
+        # replication over more than one DCP lane; on once the post-load hook
+        # (registered after the rope permutes) has built the 64-head q_b.
+        self.token_split = False
+        self.ts_lanes = 1
+        if (
+            envs.TPU_DCP_MLA_TOKEN_SPLIT
+            and self.mla_attn.dcp_q_replicate
+            and self.q_lora_rank is not None
+            and not _is_draft_prefix(prefix)
+        ):
+            _check_token_split_env()
+            from vllm.distributed import get_tensor_model_parallel_world_size
+
+            lanes = get_tensor_model_parallel_world_size() // self.dcp_group_size
+            if lanes > 1:
+                self.ts_lanes = lanes
+                self.mla_attn.token_split_head_order = dcp_token_split.head_order(
+                    self.dcp_group_size, lanes, self.num_heads
+                )
+
         # TPU_MLA_ROPE_NEOX_PERMUTE: set once the q / k_pe projection columns
         # are in half-split order, which is what switches `forward` to NeoX
         # rope -- the two can never disagree.
@@ -2141,6 +2388,52 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     "indexer rope head (indexer_rope_interleave); got "
                     f"{type(self.indexer_rope_emb).__name__} is_neox_style={neox}"
                 )
+        if self.ts_lanes > 1:
+            hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
+            hooks.append(self.build_token_split_q)
+
+    def build_token_split_q(self) -> None:
+        """TPU_DCP_MLA_TOKEN_SPLIT: the q projection over every head in
+        `dcp_token_split.head_order`, from the processed (rope-permuted) q_b."""
+        layer = self._q_proj_layer()
+        if getattr(layer, PREQUANT_ATTR, None) is not None:
+            logger.warning_once(
+                "TPU_DCP_MLA_TOKEN_SPLIT: q_b takes a prequantized input; off"
+            )
+            return
+        if self.mla_attn.W_UK_T_ts is None:
+            return
+        index = dcp_token_split.q_column_index(
+            self.dcp_group_size, self.ts_lanes, self.num_heads, self.qk_head_dim
+        )
+        q_b_ts = _gather_linear_output_channels(layer, get_tp_group(), index)
+        # Plain attribute: not a submodule of the model.
+        self.__dict__["q_b_ts"] = q_b_ts
+        # Parameter names each side retains of the other's q projection.
+        self._ts_qb_names = tuple(n for n, _ in layer.named_parameters(recurse=False))
+        self._ts_qb_ts_names = tuple(
+            n for n, p in q_b_ts._parameters.items() if p is not None
+        )
+        self.ts_rank = dcp_rank_operand()
+        self.ts_lane = dcp_lane_operand()
+        self.token_split = True
+
+    def _token_split_applies(
+        self, num_tokens: int, prefill_group, llama_4_scaling
+    ) -> bool:
+        """TPU_DCP_MLA_TOKEN_SPLIT for this bucket, fixed at trace time: the
+        backbone is traced once per bucket; the MTP drafter never splits."""
+        if not getattr(self, "token_split", False):
+            return False
+        if prefill_group is not None or llama_4_scaling is not None:
+            return False
+        if self.kimi_preprocess is not None:
+            return False
+        if vllm_compilation_backends.model_tag != "backbone":
+            return False
+        return num_tokens > envs.bucket_gate_edge(
+            envs.TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS
+        )
 
     def permute_rope_to_half_split(self) -> None:
         """Put the q and k_pe rope columns in half-split order (see
@@ -2204,6 +2497,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         kv_lora = None
         output_gate = None
         early_topk = None
+        token_split = self._token_split_applies(
+            hidden_states.shape[0], prefill_group, llama_4_scaling
+        )
+        lanes = self.ts_lanes if token_split else 1
 
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
@@ -2246,7 +2543,20 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         dim=-1,
                     )
                 q_c = self.q_a_layernorm(q_c)
-                if getattr(self, "qb_overlap", False) and self.kimi_preprocess is None:
+                if getattr(self, "token_split", False):
+                    # Lift the rank and lane operands here on both sides, before
+                    # any op that captures them, so both name them alike.
+                    q_c = _retain_buffers(q_c, self.ts_rank, self.ts_lane)
+                if token_split:
+                    # This lane's tokens, every head (the q_b overlap is off here).
+                    q_c_lane = dcp_token_split.lane_rows(q_c, self.ts_lane, lanes)
+                    q_b_ts = self.q_b_ts
+                    q = q_b_ts.quant_method.apply(
+                        q_b_ts, q_c_lane, getattr(q_b_ts, "bias", None)
+                    )
+                elif (
+                    getattr(self, "qb_overlap", False) and self.kimi_preprocess is None
+                ):
                     # The indexer runs on q_c anyway; it returns q too.
                     assert self.indexer is not None
                     early_topk, q = self.indexer(
@@ -2278,7 +2588,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         # `dcp_group_size` is 1 unless query replication is on, in which case
         # the projection already returned the whole DCP group's heads.
-        q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
+        q = q.view(-1, self.num_heads * self.dcp_group_size * lanes, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # Add head dim of 1 to k_pe
@@ -2289,6 +2599,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             getattr(self, "decode_prologue", False)
             and getattr(self, "_rope_neox_permuted", False)
             and llama_4_scaling is None
+            and not token_split
         )
         if fold_q_rope:
             # k_pe exactly as below (the unused q half is dead code to XLA);
@@ -2302,9 +2613,16 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q_pe_dtype = q_pe.dtype
             k_pe_dtype = k_pe.dtype
             if getattr(self, "_rope_neox_permuted", False):
-                q_pe, k_pe = rope_half_split(self.rotary_emb, positions, q_pe, k_pe)
+                rope = functools.partial(rope_half_split, self.rotary_emb)
             else:
-                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+                rope = self.rotary_emb
+            if token_split:
+                # q holds this lane's tokens, k every token.
+                q_pos = dcp_token_split.lane_rows(positions, self.ts_lane, lanes)
+                q_pe, _ = rope(q_pos, q_pe, q_pe[..., :1, :])
+                _, k_pe = rope(positions, k_pe, k_pe)
+            else:
+                q_pe, k_pe = rope(positions, q_pe, k_pe)
             # RoPE caches/frequencies can be fp32 and promote the rotated
             # tensors.  Dense MLA requires new KV values to exactly match the
             # cache dtype, and queries should remain in the activation dtype.
@@ -2316,14 +2634,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             if early_topk is not None:
                 topk_index = early_topk
             elif self.indexer is not None and not self.skip_topk:
+                ts_kwargs = {"token_split": True} if token_split else {}
                 topk_index = self.indexer(
-                    hidden_states, q_c, positions, self.indexer_rope_emb
+                    hidden_states, q_c, positions, self.indexer_rope_emb, **ts_kwargs
                 )
             else:
                 # reuse the indices an earlier layer wrote into the shared buffer.
                 topk_index = self.topk_indices_buffer
             assert topk_index is not None
-            topk_indices = topk_index[: hidden_states.shape[0]]
+            topk_indices = topk_index[: hidden_states.shape[0] // lanes]
 
             # print(f"top_k_indices.shape: {topk_indices.shape}, topk_indices: {topk_indices[0]}")  # noqa: E501
 
@@ -2356,10 +2675,19 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             (q_nope, q_pe),
             kv_c_normed,
             k_pe,
-            output_shape=(q.shape[0], self.num_heads * self.v_head_dim),
+            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
             q_dcp_replicated=q_dcp_replicated,
+            token_split=token_split,
         )
+        if getattr(self, "token_split", False) and isinstance(attn_out, torch.Tensor):
+            # Each branch also lifts the other's q projection, through the
+            # attribute path the other side reads it by (_retain_buffers).
+            if token_split:
+                src, names = self._q_proj_layer(), self._ts_qb_names
+            else:
+                src, names = self.q_b_ts, self._ts_qb_ts_names
+            attn_out = _retain_buffers(attn_out, *[getattr(src, n) for n in names])
 
         if output_gate is not None:
             attn_out *= output_gate.sigmoid()

@@ -2099,6 +2099,7 @@ SMALL_AG_MAX_TOKENS = 8
         "flat_merge",
         "small_all_gather",
         "lane_split",
+        "lane_local",
         "decode_pack",
         "shared_meta",
     ),
@@ -2141,6 +2142,7 @@ def streamindex_topk_dcp(
     decode_pack: bool = False,
     shared_meta: bool = False,
     lane_split: bool = False,
+    lane_local: bool = False,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -2227,6 +2229,9 @@ def streamindex_topk_dcp(
         hold replicas of the same shards) scores only its share of the tokens;
         an all-gather over the lanes restores the token axis. Needs
         `dcp_lane_ids` and the hist or all-to-all merge. Same result.
+      lane_local: with `lane_split`, skip the lane all-gather: each rank
+        returns only its lane's rows, `[padded_num_tokens / lanes, k]` local
+        (TPU_DCP_MLA_TOKEN_SPLIT).
       global_scheduling_group_id: XLA scheduling group of the cross-rank
         SparseCore merge (stage 2), which the layer's independent TensorCore
         work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
@@ -2356,11 +2361,16 @@ def streamindex_topk_dcp(
 
     if lane_split and pin:
         raise ValueError("lane_split cannot pin the overlap work to the local top-k.")
+    if lane_local and not lane_split:
+        raise ValueError("lane_local needs lane_split over more than one lane.")
     from vllm_torchtpu import envs as _lane_envs
 
     # The hist merge's chunks already hold this rank's share of the top-k.
     chunk_gather = (
-        lane_split and hist_merge and _lane_envs.TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER
+        lane_split
+        and hist_merge
+        and not lane_local
+        and _lane_envs.TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER
     )
 
     def _local(
@@ -2466,7 +2476,7 @@ def streamindex_topk_dcp(
                 scores, ov = lax.optimization_barrier((scores, ov))
 
         def _ret(topk, merge_pinned=False):
-            if lane_split and not chunk_gather:
+            if lane_split and not chunk_gather and not lane_local:
                 topk = lax.all_gather(topk, lane_axis, axis=0, tiled=True)
             if overlap_fn is None:
                 return topk

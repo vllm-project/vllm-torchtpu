@@ -2395,6 +2395,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         q_rope: bool = False,
         send_layout: bool = False,
         fused_exchange: bool = False,
+        lane_split: bool = False,
     ):
         """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
 
@@ -2418,6 +2419,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         the op takes this rank's lane operand and returns `(o_recv, l_recv)`,
         the received partials and lse (`cp_mla_attention.merge_fused_recv`).
         Buckets `cp_mla_attention.fused_small_a2a_applies` takes only.
+
+        `lane_split` (TPU_DCP_MLA_TOKEN_SPLIT; needs TPU_DCP_RANK_OPERAND, not
+        `q_rope`): q and the top-k are this lane's block of the tokens; the op
+        takes the lane operand after the rank operand.
         """
         from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
         from vllm_torchtpu.layers.core.attention_interface import (
@@ -2438,7 +2443,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # (built here, outside Dynamo) instead of the iota all_to_all.
         rank_tensor = dcp_rank_operand() if envs.TPU_DCP_RANK_OPERAND else None
         # TPU_MLA_FUSED_SMALL_A2A: peers are (my lane, j), both as data.
-        lane_tensor = dcp_lane_operand() if fused_exchange else None
+        lane_tensor = dcp_lane_operand() if fused_exchange or lane_split else None
+        assert not lane_split or (rank_tensor is not None and not q_rope), (
+            "lane_split needs TPU_DCP_RANK_OPERAND and no q rope table"
+        )
         # TPU_MLA_FUSED_SMALL_A2A_MERGE: the kernel also merges; the op returns
         # the merged [T, L, V] bf16 instead of the unpacked partials + lse.
         fused_merge = bool(fused_exchange and envs.TPU_MLA_FUSED_SMALL_A2A_MERGE)
@@ -2466,6 +2474,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             lane_ids: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             nope_spec, rope_spec = layer.mla_kv_spec
+            if lane_split:
+                logger.info_once(
+                    "DCP MLA token split: %d-token bucket", kv_c_normed.shape[0]
+                )
             # pyrefly: ignore[bad-return]
             return sparse_mla_attention_dcp(
                 ql_nope,
@@ -2495,6 +2507,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # TPU_DCP_MLA_OPROJ_ALL_REDUCE reads the partial whole on every
                 # bucket the pieces would serve (and the drafter never chunks).
                 merge_pieces=getattr(layer, "W_O_dcp_qrep", None) is None,
+                lane_split=lane_split,
             )
 
         # The torch op schema is inferred from the signature: no varargs or
@@ -2654,6 +2667,38 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 lane_ids,
             )
 
+        def sparse_mla_attention_core_tpu_dcp_rank_lane(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+            lane_ids: jax.Array,  # i32[dcp], sharded: each shard its lane
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _sparse_mla_attention_dcp_run(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                None,
+                rank_ids,
+                lane_ids,
+            )
+
         core_fn = {
             (False, False): sparse_mla_attention_core_tpu_dcp,
             (True, False): sparse_mla_attention_core_tpu_dcp_qrope,
@@ -2662,6 +2707,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         }[(bool(q_rope), rank_tensor is not None)]
         if fused_exchange:
             core_fn = sparse_mla_attention_core_tpu_dcp_qrope_rank_lane
+        if lane_split:
+            core_fn = sparse_mla_attention_core_tpu_dcp_rank_lane
 
         op_name = (
             f"pallas::sparse_mla_attention_dcp_{layer.layer_name.replace('.', '_')}"
@@ -2676,6 +2723,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             op_name += "_xa2a"
         if fused_merge:
             op_name += "m"
+        if lane_split:
+            op_name += "_ts"
         input_specs = _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS
         if q_rope:
             input_specs = input_specs + (P(),)  # rope table, replicated
@@ -2840,8 +2889,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # after binding, sparse layers hold a (nope, rope) pair).
         if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
             if output is None:
-                # Preserve symbolic token dimensions during the memory probe.
-                template = q_nope.flatten(1)[:, :1].expand(
+                # Preserve symbolic token dimensions during the memory probe
+                # (kv_c_normed: q holds one lane's tokens under token split).
+                template = kv_c_normed.flatten(1)[:, :1].expand(
                     -1, layer.num_heads * layer.v_head_dim
                 )
                 return torch.ones_like(template)
@@ -2859,6 +2909,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             and topk_indices is not None
         )
         q_rope_table: list[torch.Tensor] = []
+        # TPU_DCP_MLA_TOKEN_SPLIT: q is this lane's tokens in every head.
+        token_split = bool(kwargs.get("token_split")) and use_qrep
         if use_qrep:
             assert layer.W_UK_T_dcp_qrep is not None, (
                 "q_dcp_replicated was passed but W_UK_T_dcp_qrep was never "
@@ -2869,15 +2921,21 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             q_nope, q_pe, *q_rope_table = q_dcp_replicated
             w_uk_t_src = layer.W_UK_T_dcp_qrep
             w_uk_t_scale = layer.W_UK_T_dcp_qrep_scale
+            if token_split:
+                assert not q_rope_table, "token split ropes q in the wrapper"
+                w_uk_t_src = layer.W_UK_T_ts
+                w_uk_t_scale = layer.W_UK_T_ts_scale
         else:
             w_uk_t_src = layer.W_UK_T
             w_uk_t_scale = getattr(layer, "W_UK_T_scale", None)
         attn_heads = layer.num_heads * (self.dcp_size if use_qrep else 1)
+        if token_split:
+            attn_heads = w_uk_t_src.shape[0]
         # W_UV runs before the DCP merge, so the merge carries v_head_dim.
         # Not in the MTP drafter under TPU_MTP_DCP_MERGE_SIZED: the drafter's
         # projected partial stays f32, and the sized merge only takes a 2-byte
         # partial, so it would silently fall back to the f32 reduce-scatter.
-        uv_first = (
+        uv_first = token_split or (
             use_qrep
             and getattr(layer, "W_UV_dcp_qrep", None) is not None
             and (
@@ -2952,7 +3010,30 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # own local cache indices, `-1` where it owns nothing.
                 is_backbone = vllm_compilation_backends.model_tag == "backbone"
                 send_op = getattr(layer, "sparse_mla_dcp_send_op", None)
-                if (
+                if token_split:
+                    from vllm_torchtpu.layers.adapter import dcp_token_split
+
+                    partial, lse = layer.sparse_mla_dcp_ts_op(
+                        kv_cache,
+                        ql_nope_dcp,
+                        q_pe_dcp,
+                        kv_c_normed_flat,
+                        k_pe_flat,
+                        topk_indices,
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.request_distribution,
+                    )
+                    outputs = dcp_token_split.merge_scatter_heads(
+                        partial,
+                        lse,
+                        layer.W_UV_ts,
+                        layer.W_UV_ts_scale,
+                        partial.dtype,
+                        layer.ts_lane_a2a_op,
+                    )
+                elif (
                     q_rope_table
                     and send_op is not None
                     # The send buffer is the latent partial; W_UV-before-merge
@@ -3188,6 +3269,28 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     (layer.W_UV, getattr(layer, "W_UV_scale", None))
                     if uv_first
                     else (layer.W_UV_dcp_qrep, layer.W_UV_dcp_qrep_scale)
+                ),
+            )
+
+        if getattr(layer, "W_UK_T_ts", None) is not None:
+            # TPU_DCP_MLA_TOKEN_SPLIT: each branch also lifts the other's
+            # attention weights (see _retain_buffers).
+            outputs = _retain_buffers(
+                outputs,
+                *(
+                    (
+                        layer.W_UK_T_dcp_qrep,
+                        layer.W_UK_T_dcp_qrep_scale,
+                        layer.W_UV_dcp_qrep,
+                        layer.W_UV_dcp_qrep_scale,
+                    )
+                    if token_split
+                    else (
+                        layer.W_UK_T_ts,
+                        layer.W_UK_T_ts_scale,
+                        layer.W_UV_ts,
+                        layer.W_UV_ts_scale,
+                    )
                 ),
             )
 
