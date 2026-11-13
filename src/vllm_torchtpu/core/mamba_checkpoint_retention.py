@@ -48,7 +48,7 @@ This patch:
 from collections.abc import Sequence
 from functools import wraps
 
-from vllm.logger import init_logger
+from vllm_torchtpu.logger import init_logger
 
 from vllm_torchtpu import envs
 
