@@ -274,3 +274,32 @@ def test_token_combine_clamped_rows_past_the_tile_go_to_dummy_slots():
         expected[ids[route]] += source[route - 16].astype(np.float32)
     np.testing.assert_array_equal(actual[:tokens], expected[:tokens])
     assert (actual[tokens:] != sums[tokens:]).any()
+
+
+@pytest.mark.parametrize("half, width", [(256, 512), (512, 896)])
+def test_token_combine_emit_copies_the_column_and_restarts_the_sums(half, width):
+    rng = np.random.default_rng(width)
+    tokens = 512
+    sums = rng.standard_normal((tokens + fused._RMW_DUMMY_SLOTS, 2, half))
+    sums = sums.astype(np.float32)
+
+    def kernel(sums_in, sums_out, subtotals):
+        sums_out[...] = sums_in[...]
+        combine = fused._TokenCombine(sums_out, None, tokens)
+        combine.emit(subtotals, rows=128)
+
+    restarted, subtotals = pl.pallas_call(
+        kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct(sums.shape, jnp.float32),
+            jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16),
+        ),
+        interpret=True,
+    )(jnp.asarray(sums))
+    expected = sums[:tokens].reshape(tokens, 2 * half)[:, :width]
+    np.testing.assert_array_equal(
+        np.asarray(subtotals), expected.astype(ml_dtypes.bfloat16)
+    )
+    restarted = np.asarray(restarted)
+    assert not restarted[:tokens].any()
+    np.testing.assert_array_equal(restarted[tokens:], sums[tokens:])

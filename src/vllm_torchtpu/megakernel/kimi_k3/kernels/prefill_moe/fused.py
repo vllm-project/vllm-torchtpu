@@ -1287,6 +1287,21 @@ class _TokenCombine:
         self.destinations = destinations
         self.tokens = tokens
 
+    def emit(self, subtotals, *, rows):
+        """BF16 copy of the token sums for the reduce ring, ``rows`` tokens at
+        a time. The token rows restart at zero for the next column while they
+        are read here (the dummy slots are never read)."""
+        width = subtotals.shape[-1]
+
+        @pl.loop(0, self.tokens // rows)
+        def block(b):
+            tile = pl.ds(b * rows, rows)
+            values = self.sums[tile].reshape(rows, -1)
+            # Trim the aligned-layout padding before the existing ring.
+            # The cut at tn=896 is lane aligned, unlike a 448-wide half.
+            subtotals.at[tile][...] = values[:, :width].astype(subtotals.dtype)
+            self.sums[tile] = jnp.zeros((rows, *self.sums.shape[1:]), jnp.float32)
+
     def _add(self, dests, vals):
         olds = [self.sums.at[pl.ds(d, 1)][...] for d in dests]
         for d, old, val in zip(dests, olds, vals, strict=True):
@@ -1549,16 +1564,7 @@ def _routed_experts(
 
         @_scoped("m_emit_subtotals")
         def emit_subtotals(subtotal_vmem):
-            @pl.loop(0, tokens // store_tile)
-            def block(b):
-                # Trim the aligned-layout padding before the existing ring.
-                # The cut at tn=896 is lane aligned, unlike a 448-wide half.
-                values = sums[pl.ds(b * store_tile, store_tile)].reshape(
-                    store_tile, 2 * packed_half
-                )
-                subtotal_vmem.at[pl.ds(b * store_tile, store_tile)][...] = values[
-                    :, :tn
-                ].astype(jnp.bfloat16)
+            combine.emit(subtotal_vmem, rows=store_tile)
 
         def consume(tile_g, source, first=0, *, loop_unroll=unroll):
             combine.visit(
@@ -1599,11 +1605,6 @@ def _routed_experts(
             g = pl.program_id(1) if tile is None else tile
             n = 0 if first else pl.program_id(0) + 1
             if not first:
-
-                @pl.when(g == 0)
-                @_scoped("m_clear")
-                def clear():
-                    sums[...] = jnp.zeros(sums.shape, jnp.float32)
 
                 @_scoped("m_ring_poll")
                 def ring_poll():

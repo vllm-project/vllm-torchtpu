@@ -52,7 +52,6 @@ _PHASES = {
     "m_consume_last",
     "m_remaining_columns",
     "m_emit_subtotals",
-    "m_clear",
     "m_ring_poll",
     "m_ring_drain",
     "m_ring_final_drain",
