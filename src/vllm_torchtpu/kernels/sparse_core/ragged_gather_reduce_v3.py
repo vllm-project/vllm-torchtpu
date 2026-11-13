@@ -379,24 +379,29 @@ def ragged_gather_reduce(
 
     # A stable boolean partition keeps routes for each destination adjacent
     # while placing the exact valid prefix first in every destination block.
-    route_order = jnp.argsort(~valid_blocks, axis=1, stable=True)
-    compact_valid = jnp.take_along_axis(valid_blocks, route_order, axis=1)
-    route_indices = jnp.take_along_axis(indices_blocks, route_order, axis=1)
-    route_destinations = jnp.take_along_axis(destination_blocks,
-                                             route_order,
-                                             axis=1)
+    # Pre-pack route metadata and weights before sorting so a single fused
+    # TensorCore lax.sort(num_keys=1) permutes everything in registers without
+    # emitting 4 dynamic gather (take_along_axis) ops that XLA would offload to
+    # SparseCore (gather_offload_async_start/done + blocking vwait.ge).
     weights_blocks = weights_2d.reshape(num_blocks, metadata_block_size)
-    route_weights = jnp.take_along_axis(weights_blocks, route_order, axis=1)
-    route_indices = jnp.where(compact_valid, route_indices,
-                              0).astype(jnp.int32)
-    route_destinations = jnp.where(compact_valid, route_destinations,
-                                   0).astype(jnp.int32)
-    route_metadata = jnp.bitwise_or(
-        route_indices,
-        jnp.left_shift(route_destinations, _ROUTE_INDEX_BITS),
-    ).reshape(-1)
-    route_weights = jnp.where(compact_valid, route_weights, 0).reshape(-1)
-    route_weights = route_weights.astype(jnp.float32)
+    raw_indices = jnp.where(valid_blocks, indices_blocks, 0).astype(jnp.int32)
+    raw_destinations = jnp.where(valid_blocks, destination_blocks,
+                                 0).astype(jnp.int32)
+    raw_metadata = jnp.bitwise_or(
+        raw_indices,
+        jnp.left_shift(raw_destinations, _ROUTE_INDEX_BITS),
+    )
+    raw_weights = jnp.where(valid_blocks, weights_blocks,
+                            0).astype(jnp.float32)
+    _, sorted_metadata, sorted_weights = jax.lax.sort(
+        [~valid_blocks, raw_metadata, raw_weights],
+        dimension=1,
+        is_stable=True,
+        num_keys=1,
+    )
+    route_metadata = sorted_metadata.reshape(-1)
+    route_weights = sorted_weights.reshape(-1)
+    route_destinations = jnp.right_shift(sorted_metadata, _ROUTE_INDEX_BITS)
     route_counts = jnp.sum(valid_blocks, axis=1, dtype=jnp.int32)
     paired_destinations = route_destinations[:, :2 * _TOKEN_BLOCK].reshape(
         num_blocks, _TOKEN_BLOCK, 2)
