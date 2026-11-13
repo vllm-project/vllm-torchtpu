@@ -156,14 +156,19 @@ def att_q(
                 else:
                     qh = gqa_rms(ap, ybuf[:B, q0_ : q0_ + HD], qn)
                     qh = round_bf16(rope(ap, qh, cos, sin) * HD**-0.5)
-                    qparts = [qh[:, j * 128 : (j + 1) * 128] for j in range(NHH)]
+                    qparts = None
                 for j in range(NHH):
+                    # Without qswap each part is sliced just before its store
+                    # (the default trace order).
+                    part = (
+                        qh[:, j * 128 : (j + 1) * 128] if qparts is None else qparts[j]
+                    )
                     scr["qg"][
                         0 if GQ else gi,
                         jnp.int32(j),
                         pl.ds(h, B, stride=SR),
                         :,
-                    ] = qparts[j]
+                    ] = part
             if GQ:
                 for sq in range(NS):
                     r0 = sq * QG

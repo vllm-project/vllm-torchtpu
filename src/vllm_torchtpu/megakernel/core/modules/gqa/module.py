@@ -265,9 +265,10 @@ class GQAModule(Module):
             for b in range(ex.B):
                 pf = jnp.where(rows_ == b, pos_ref[b].astype(F32), pf)
             ang_ = pf * inv_
-            cos_t = round_bf16(jnp.cos(ang_))
-            sin_t = round_bf16(jnp.sin(ang_))
             if ap.QSW:
+                cos_t = round_bf16(jnp.cos(ang_))
+                sin_t = round_bf16(jnp.sin(ang_))
+
                 # lanes [half, ROT) repeat lanes [0, half), the rest are zero
                 def dup_(v):
                     parts = [v, v]
@@ -277,9 +278,9 @@ class GQAModule(Module):
 
                 scr["rope"][0] = dup_(cos_t)
                 scr["rope"][1] = dup_(sin_t)
-            else:
-                scr["rope"][0, :, :half_] = cos_t
-                scr["rope"][1, :, :half_] = sin_t
+            else:  # each table stored before the next is computed (default order)
+                scr["rope"][0, :, :half_] = round_bf16(jnp.cos(ang_))
+                scr["rope"][1, :, :half_] = round_bf16(jnp.sin(ang_))
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ap: GQAParams = ctx.module_params(self.name)
