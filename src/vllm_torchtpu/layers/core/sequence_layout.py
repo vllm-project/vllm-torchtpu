@@ -126,10 +126,18 @@ class SequenceLayoutPlan:
             return request_major_token_tensor, request_major_gather_indices
 
         num_gathers = request_major_gather_indices.shape[0]
-        request_major_gather_indices = torch.nn.functional.pad(
-            request_major_gather_indices[:num_valid_gathers],
-            (0, num_gathers - num_valid_gathers),
-            value=-1,
+        valid_gathers = request_major_gather_indices[:num_valid_gathers]
+        request_major_gather_indices = torch.cat(
+            (
+                valid_gathers,
+                torch.full(
+                    (num_gathers - num_valid_gathers,),
+                    -1,
+                    dtype=valid_gathers.dtype,
+                    device=valid_gathers.device,
+                ),
+            ),
+            dim=0,
         )
 
         packed_to_request = cast(

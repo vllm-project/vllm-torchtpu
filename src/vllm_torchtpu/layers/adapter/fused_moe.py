@@ -1,3 +1,8 @@
+
+try:
+    import jax
+except ImportError:
+    pass
 # Copyright 2025 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,19 +24,34 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+from jax import numpy as jnp
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    MOE_FP8_DISPATCH_BLOCK,
     fused_moe_func,
+    fused_moe_func_fp8_dispatch,
+    quantize_moe_dispatch_packed_rows,
+    quantize_moe_dispatch_rows,
     quantize_to_native_fp4_kmajor,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
 )
 
+# Opt-in: quantize MoE inputs to fp8 before the DP/PCP all-gather instead of
+# inside the routed GMM, halving the gathered bytes. Bit-identical output (see
+# fused_moe_func_fp8_dispatch). Fixed at import, like the other MoE selectors.
+MOE_FP8_DISPATCH = envs.VLLM_TPU_MOE_FP8_DISPATCH
+
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+_fused_moe_fp8_dispatch_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+# rhs_quant_dtype -> fp8 dispatch admitted; filled by prebuild_fused_moe_kernel.
+_moe_fp8_dispatch_rhs_dtypes: dict[Any, bool] = {}
+_moe_fp8_dispatch_quant_op = None
+_moe_fp8_dispatch_packed_quant_op = None
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -236,6 +256,118 @@ def prebuild_fused_moe_kernel(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
     )
+    if MOE_FP8_DISPATCH:
+        # Decided here, outside tracing: Dynamo cannot trace jnp.issubdtype.
+        admitted = (
+            True
+            if rhs_quant_dtype is None
+            else bool(jnp.issubdtype(rhs_quant_dtype, jnp.floating))
+        )
+        _moe_fp8_dispatch_rhs_dtypes[rhs_quant_dtype] = admitted
+        if admitted:
+            _get_moe_fp8_dispatch_quant_op()
+            _get_moe_fp8_dispatch_packed_quant_op()
+            _get_fused_moe_fp8_dispatch_op(
+                topk=topk,
+                activation=activation,
+                use_ep=use_ep,
+                rhs_quant_dtype=rhs_quant_dtype,
+                skip_padded_tokens=skip_padded_tokens,
+            )
+
+
+def _get_moe_fp8_dispatch_quant_op():
+    global _moe_fp8_dispatch_quant_op
+    if _moe_fp8_dispatch_quant_op is None:
+        op = pallas.jax_op(
+            "pallas::moe_fp8_dispatch_quant", quantize_moe_dispatch_rows
+        )
+
+        # Dynamic token counts need a hand-written fake (see _fake_fused_moe).
+        def _fake_quant(hidden_states):
+            num_tokens, hidden_size = hidden_states.shape
+            return (
+                hidden_states.new_empty((num_tokens, hidden_size), dtype=torch.int8),
+                hidden_states.new_empty(
+                    (num_tokens * (hidden_size // MOE_FP8_DISPATCH_BLOCK),)
+                ),
+            )
+
+        op.register_fake(_fake_quant)
+        _moe_fp8_dispatch_quant_op = op
+    return _moe_fp8_dispatch_quant_op
+
+
+def _get_moe_fp8_dispatch_packed_quant_op():
+    global _moe_fp8_dispatch_packed_quant_op
+    if _moe_fp8_dispatch_packed_quant_op is None:
+        op = pallas.jax_op(
+            "pallas::moe_fp8_dispatch_packed_quant",
+            quantize_moe_dispatch_packed_rows,
+        )
+
+        def _fake_packed_quant(hidden_states, topk_weights, topk_ids):
+            num_tokens, hidden_size = hidden_states.shape
+            topk = topk_weights.shape[1]
+            itemsize = hidden_states.element_size()
+            used_bytes = (
+                (hidden_size // MOE_FP8_DISPATCH_BLOCK) * itemsize
+                + topk * itemsize
+                + topk * 4
+            )
+            trailer_bytes = ((used_bytes + 127) // 128) * 128
+            return hidden_states.new_empty(
+                (num_tokens, hidden_size + trailer_bytes), dtype=torch.int8
+            )
+
+        op.register_fake(_fake_packed_quant)
+        _moe_fp8_dispatch_packed_quant_op = op
+    return _moe_fp8_dispatch_packed_quant_op
+
+
+def _get_fused_moe_fp8_dispatch_op(
+    *,
+    topk: int,
+    activation: str,
+    use_ep: bool,
+    rhs_quant_dtype=None,
+    skip_padded_tokens: bool | None = None,
+):
+    if skip_padded_tokens is None:
+        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
+    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    kernel = _fused_moe_fp8_dispatch_cache.get(cache_key)
+    if kernel is not None:
+        return kernel
+    # Mirrors _build_fused_moe_custom_op, with its own op-name counter so the
+    # bf16 kernels keep their names.
+    kernel = pallas.jax_op(
+        f"pallas::fused_moe_fp8_dispatch_kernel_{len(_fused_moe_fp8_dispatch_cache)}",
+        functools.partial(
+            fused_moe_func_fp8_dispatch,
+            topk=topk,
+            activation=activation,
+            use_ep=use_ep,
+            use_sparse_core=envs.USE_MOE_SPARSE_CORE,
+            onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+        ),
+    )
+
+    def _fake_fused_moe_fp8_dispatch(hidden_q, hidden_scale, w1, w2, *args, **kwargs):
+        out_dim = (
+            w2.shape[-1] * 2
+            if w2.dtype == getattr(torch, "float4_e2m1fn_x2", None)
+            else w2.shape[-1]
+        )
+        return hidden_q.new_empty(
+            (hidden_q.shape[0], out_dim), dtype=hidden_scale.dtype
+        )
+
+    kernel.register_fake(_fake_fused_moe_fp8_dispatch)
+    _fused_moe_fp8_dispatch_cache[cache_key] = kernel
+    return kernel
 
 
 def fused_moe_gmm(
@@ -281,6 +413,94 @@ def fused_moe_gmm(
         experts_start = torch.zeros((), dtype=torch.int32, device=hidden_states.device)
     return fused_moe(
         hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+        experts_start,
+    )
+
+
+def moe_fp8_dispatch_enabled(
+    w1: torch.Tensor, w1_scale: torch.Tensor | None, rhs_quant_dtype=None
+) -> bool:
+    """Whether MOE_FP8_DISPATCH applies to these expert weights.
+
+    Admits packed FP4 W4A8 (DeepSeek-V4 MXFP4: uint8 carrier, float rhs quant
+    dtype admitted by prebuild_fused_moe_kernel, block scales), whose gmm1
+    quantizes activations to fp8. gmm_v2 re-checks the exact quantization
+    config when tracing.
+    """
+    return (
+        MOE_FP8_DISPATCH
+        and w1.dtype in (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8))
+        and w1_scale is not None
+        and _moe_fp8_dispatch_rhs_dtypes.get(rhs_quant_dtype, False)
+    )
+
+
+def quantize_moe_dispatch(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Quantizes local MoE inputs for the all-gather.
+
+    When `topk_weights` and `topk_ids` are provided, returns a single packed
+    128-lane-aligned int8 tensor `[S, H + 128]` containing `hidden_q`,
+    `hidden_scale`, `topk_weights`, and `topk_ids`. Otherwise returns
+    `(int8 rows [S, H], flat scales [S * H // 512])`; see
+    `quantize_moe_dispatch_rows`.
+    """
+    if topk_weights is not None and topk_ids is not None:
+        return _get_moe_fp8_dispatch_packed_quant_op()(
+            hidden_states, topk_weights, topk_ids
+        )
+    return _get_moe_fp8_dispatch_quant_op()(hidden_states)
+
+
+def fused_moe_gmm_fp8_dispatch(
+    hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    w1_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    experts_start: torch.Tensor | None,
+    topk: int,
+    activation: str,
+    rhs_quant_dtype=None,
+    skip_padded_tokens: bool | None = None,
+) -> torch.Tensor:
+    """fused_moe_gmm on (gathered) quantize_moe_dispatch output.
+
+    Bit-identical to fused_moe_gmm on the unquantized rows.
+    """
+    if isinstance(hidden_states, tuple):
+        hidden_q, hidden_scale = hidden_states
+    else:
+        hidden_q = hidden_states
+        hidden_scale = topk_weights
+    fused_moe = _get_fused_moe_fp8_dispatch_op(
+        topk=topk,
+        activation=activation,
+        use_ep=experts_start is not None,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+    if experts_start is None:
+        # Unread for use_ep=False; see fused_moe_gmm.
+        experts_start = torch.zeros((), dtype=torch.int32, device=hidden_q.device)
+    return fused_moe(
+        hidden_q,
+        hidden_scale,
         w1,
         w2,
         w1_scale,

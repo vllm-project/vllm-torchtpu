@@ -22,6 +22,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
 
@@ -30,9 +31,13 @@ def main_kernel(
     rope_in_hbm_ref: Any,
     indices_hbm_ref: Any,
     valid_indices_ref: Any,
+    max_active_hbm_ref: Any,
     nope_out_hbm_ref: Any,
     rope_out_hbm_ref: Any,
-    nope_sem: Any,
+    valid_vmem_ref: Any,
+    nope_vmem: Any,
+    nope_in_sem: Any,
+    nope_out_sem: Any,
     *,
     core_axis_name: str,
     subcore_axis_name: str,
@@ -47,9 +52,6 @@ def main_kernel(
     num_cores = jax.lax.axis_size((core_axis_name, subcore_axis_name))
     row_subchunk_size = num_simd_lanes
     row_chunk_size = row_subchunk_size * num_row_subchunks
-    block_size = row_chunk_size * num_cores
-    num_blocks = pl.cdiv(indices_hbm_ref.shape[0], block_size)
-
     core_index = lax.axis_index((core_axis_name, subcore_axis_name))
 
     nope_in_cols = nope_in_hbm_ref.shape[1]
@@ -60,6 +62,18 @@ def main_kernel(
     # of each `top_k`-entry period with entry `i + top_k // 2`, which the
     # consumer splits apart with a lane slice and a row concatenate.
     rope_out_cols = rope_out_hbm_ref.shape[1] // 2
+    rope_rows_per_stream = row_subchunk_size // 2
+    step_size = num_streams * row_subchunk_size
+
+    cp_val = pltpu.make_async_copy(
+        valid_indices_ref.at[pl.ds(0, row_subchunk_size)],
+        valid_vmem_ref.at[pl.ds(0, row_subchunk_size)],
+        nope_out_sem.at[0],
+    )
+    cp_val.start()
+    cp_val.wait()
+    valid_indices = valid_vmem_ref[pl.ds(0, row_subchunk_size)][0]
+    active_waves = pl.cdiv(pl.cdiv(valid_indices, row_chunk_size), num_cores)
 
     def process_rope(gather_ref, out_ref, out_row_base=0):
         # bf16 output rows 2t and 2t + 1 are the low and high halves of int32
@@ -78,48 +92,69 @@ def main_kernel(
                 jnp.bitwise_and(odd, jnp.int32(-65536)),  # 0xFFFF0000
             )
 
-    def outer_pipeline(idx_ref, valid_ref):
-        valid_indices = valid_ref[pl.ds(0, row_subchunk_size)][0]
+    def outer_pipeline(idx_ref, active_ref):
         b = pl.program_id(0)
-        out_row_base = (b * num_cores + core_index) * num_row_subchunks
+        period_idx = b * num_cores + core_index
+        out_row_base = period_idx * num_row_subchunks
+        chunk_active_rows = active_ref[pl.ds(0, row_subchunk_size)][0]
+        active_inner_steps = pl.cdiv(chunk_active_rows, step_size)
 
-        # Subchunk handled by stream `s` at inner step `r`. `num_streams`
-        # independent `pl.Indirect` gathers run concurrently per step, keeping
-        # several gather DMAs in flight to raise effective read bandwidth. A
-        # step's subchunks are consecutive, so they lie in one half of a
-        # period.
+        # Subchunk handled by stream `s` at inner step `r`.
         def subchunk(r, s):
             return r * num_streams + s
 
         def idx_window(r, s):
-            return idx_ref[pl.ds(subchunk(r, s) * row_subchunk_size, row_subchunk_size)]
-
-        # int32 rows produced per stream in the rope output (2 tokens per row).
-        rope_rows_per_stream = row_subchunk_size // 2
+            return idx_ref[
+                pl.ds(subchunk(r, s) * row_subchunk_size, row_subchunk_size)
+            ]
 
         def _body(*refs):
             r = pl.program_id(0)
-            nope_g = refs[0 * num_streams : 1 * num_streams]
-            rope_g = refs[1 * num_streams : 2 * num_streams]
-            rope_o = refs[2 * num_streams]
+            cur_buf = jnp.mod(r, 3)
+            prv_buf = jnp.mod(r + 2, 3)  # == (r - 1) % 3 == (r + 2) % 3
+            cur_sem = jnp.bitwise_and(r, 1)
+            prv_sem = 1 - cur_sem
+            rope_g = refs[0 : num_streams]
+            rope_o = refs[num_streams]
 
-            # nope needs no vector work at all. The nope output keeps the
-            # cache's raw per-token layout. The gathered row *is* the output
-            # row.
-            #
-            # DMA the gather buffer straight to HBM rather than routing it
-            # through a pipeline output buffer: staging it there costs a
-            # VMEM->VMEM copy.
-            nope_copies = []
+            # 1. Complete step r - 1's direct VMEM -> HBM DMA on `prv_buf`
+            # BEFORE reusing `prv_buf` for step r + 2's indirect HBM -> VMEM gather.
+            @pl.when(r > 0)
+            def _wait_prev_nope_out():
+                for s in range(num_streams):
+                    prev_row = (out_row_base + subchunk(r - 1, s)) * row_subchunk_size
+                    pltpu.make_async_copy(
+                        nope_vmem.at[prv_buf, s],
+                        nope_out_hbm_ref.at[pl.ds(prev_row, row_subchunk_size)],
+                        nope_out_sem.at[prv_sem],
+                    ).wait()
+
+            # 2. Strictly after `prv_buf` is free, prefetch step r + 2 into `prv_buf`.
+            @pl.when(r + 2 < active_inner_steps)
+            def _prefetch_next_nope_in():
+                for s in range(num_streams):
+                    pltpu.make_async_copy(
+                        nope_in_hbm_ref.at[idx_window(r + 2, s), pl.ds(0, nope_in_cols)],
+                        nope_vmem.at[prv_buf, s],
+                        nope_in_sem.at[prv_buf, s],
+                    ).start()
+
+            # 3. Wait for step r's indirect gather (`cur_buf`, started 2 steps ago).
+            for s in range(num_streams):
+                pltpu.make_async_copy(
+                    nope_in_hbm_ref.at[idx_window(r, s), pl.ds(0, nope_in_cols)],
+                    nope_vmem.at[cur_buf, s],
+                    nope_in_sem.at[cur_buf, s],
+                ).wait()
+
+            # 4. Launch zero-copy direct `cur_buf` -> HBM write overlapped with VPU rope packing.
             for s in range(num_streams):
                 out_row = (out_row_base + subchunk(r, s)) * row_subchunk_size
-                copy = pltpu.make_async_copy(
-                    nope_g[s],
+                pltpu.make_async_copy(
+                    nope_vmem.at[cur_buf, s],
                     nope_out_hbm_ref.at[pl.ds(out_row, row_subchunk_size)],
-                    nope_sem.at[s],
-                )
-                copy.start()
-                nope_copies.append(copy)
+                    nope_out_sem.at[cur_sem],
+                ).start()
 
             for s in range(num_streams):
                 process_rope(
@@ -128,23 +163,17 @@ def main_kernel(
                     out_row_base=s * rope_rows_per_stream,
                 )
 
-            # Wait for all nope DMAs to complete.
-            for copy in nope_copies:
-                copy.wait()
+            # 5. Drain final step's direct VMEM -> HBM write before exiting period.
+            @pl.when(r + 1 == active_inner_steps)
+            def _wait_last_nope_out():
+                for s in range(num_streams):
+                    last_row = (out_row_base + subchunk(r, s)) * row_subchunk_size
+                    pltpu.make_async_copy(
+                        nope_vmem.at[cur_buf, s],
+                        nope_out_hbm_ref.at[pl.ds(last_row, row_subchunk_size)],
+                        nope_out_sem.at[cur_sem],
+                    ).wait()
 
-        # Multiple parallel `pl.Indirect` gathers hide random-access read
-        # latency. The writes are contiguous and need no extra parallelism:
-        # rope writes one block per step, and nope issues one DMA per stream
-        # only because each stream has its own gather buffer.
-
-        # nope: gather int32 row == index (1 int32 row per entry).
-        nope_in_specs = tuple(
-            pl.BlockSpec(
-                (pl.Indirect(row_subchunk_size), nope_in_cols),
-                lambda r, s=s: (idx_window(r, s), 0),
-            )
-            for s in range(num_streams)
-        )
         # rope: gather the entry's own 32-word quarter row == index.
         rope_in_specs = tuple(
             pl.BlockSpec(
@@ -154,10 +183,7 @@ def main_kernel(
             for s in range(num_streams)
         )
 
-        # One rope output block per step, covering all `num_streams`
-        # subchunks: a step in the first half of a period fills int32 lanes
-        # [0, rope_out_cols) of its rows, a step in the second half lanes
-        # [rope_out_cols, 2 * rope_out_cols) of the same rows.
+        # One rope output block per step, covering all `num_streams` subchunks.
         steps_per_half = top_k // 2 // (num_streams * row_subchunk_size)
 
         def rope_out_block(r):
@@ -165,37 +191,66 @@ def main_kernel(
             return (half // 2) * steps_per_half + step, half % 2
 
         rope_out_spec = pl.BlockSpec(
-            (num_streams * rope_rows_per_stream, rope_out_cols), rope_out_block
+            (num_streams * rope_rows_per_stream, rope_out_cols),
+            rope_out_block,
         )
-        core_start_idx = out_row_base * row_subchunk_size
+        core_start_idx = period_idx * row_chunk_size
+        run_period = (core_start_idx < valid_indices) & (active_inner_steps > 0)
+        if not envs.VLLM_DSV41_PURE_20L_PREFILL:
+            # [merge] Decode-side (common-base) guard: a period whose first
+            # index is negative -- `_build_candidate_union_and_bitmask` marks
+            # inactive union chunks with -1 when u_chunk < m_union -- is
+            # skipped instead of gathering row -1 with bounds checks disabled.
+            # The prefill tree (cd4eedb) has no such guard; keep its kernel
+            # body byte-identical on the prefill role.
+            first_idx = idx_ref[pl.ds(0, row_subchunk_size)][0]
+            run_period = run_period & (first_idx >= 0)
 
-        @pl.when(core_start_idx < valid_indices)
+        @pl.when(run_period)
         def _run_gather():
+            # Prefetch r = 0 (`buf 0`) and r = 1 (`buf 1`) before entering inner pipeline.
+            for s in range(num_streams):
+                pltpu.make_async_copy(
+                    nope_in_hbm_ref.at[idx_window(0, s), pl.ds(0, nope_in_cols)],
+                    nope_vmem.at[0, s],
+                    nope_in_sem.at[0, s],
+                ).start()
+
+            @pl.when(active_inner_steps > 1)
+            def _prefetch_step1():
+                for s in range(num_streams):
+                    pltpu.make_async_copy(
+                        nope_in_hbm_ref.at[idx_window(1, s), pl.ds(0, nope_in_cols)],
+                        nope_vmem.at[1, s],
+                        nope_in_sem.at[1, s],
+                    ).start()
+
             pltpu.emit_pipeline(
                 _body,
-                grid=(num_row_subchunks // num_streams,),
-                in_specs=nope_in_specs + rope_in_specs,
+                grid=(active_inner_steps,),
+                in_specs=rope_in_specs,
                 out_specs=(rope_out_spec,),
             )(
-                *([nope_in_hbm_ref] * num_streams),
                 *([rope_in_hbm_ref] * num_streams),
                 rope_out_hbm_ref,
             )
 
-    pltpu.emit_pipeline(
-        outer_pipeline,
-        grid=(num_blocks,),
-        in_specs=(
-            pl.BlockSpec(
-                (row_chunk_size,),
-                lambda b: (b * num_cores + core_index,),
+    @pl.when(active_waves > 0)
+    def _launch_waves():
+        pltpu.emit_pipeline(
+            outer_pipeline,
+            grid=(active_waves,),
+            in_specs=(
+                pl.BlockSpec(
+                    (row_chunk_size,),
+                    lambda b: (b * num_cores + core_index,),
+                ),
+                pl.BlockSpec(
+                    (row_subchunk_size,),
+                    lambda b: (b * num_cores + core_index,),
+                ),
             ),
-            pl.BlockSpec(
-                (row_subchunk_size,),
-                lambda b: (0,),
-            ),
-        ),
-    )(indices_hbm_ref, valid_indices_ref)
+        )(indices_hbm_ref, max_active_hbm_ref)
 
 
 @functools.partial(jax.jit, static_argnames=("top_k",))
@@ -206,6 +261,7 @@ def csa_gather(
     num_valid_indices: jax.Array | None = None,
     *,
     top_k: int = 1024,
+    max_active_per_chunk: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -217,11 +273,13 @@ def csa_gather(
       indices: (N,) int32. Token indices into the caches; N a multiple of
         top_k.
       num_valid_indices: Optional (1,) or scalar int32. Number of valid indices to
-        gather, a multiple of top_k. A subcore skips every top_k period that
-        starts at or past this count, leaving those output rows unwritten.
+        gather. A subcore skips every top_k period that starts at or past this
+        count, leaving those output rows unwritten.
       top_k: the consumer's row block (the attention kernel's top-k), a
         multiple of 128. `rope_out` pairs entry i of a period with entry
         i + top_k // 2.
+      max_active_per_chunk: Optional int32 array of length `N // top_k` giving
+        the active token count in each `top_k` period (`[top_k // 2, top_k]`).
 
     Returns:
       Both outputs are int32 with 128 lanes, which XLA lays out byte-for-byte
@@ -255,27 +313,51 @@ def csa_gather(
     num_cores = sc_info.num_cores * sc_info.num_subcores
     row_subchunk_size = num_simd_lanes
 
-    if num_valid_indices is None:
-        valid_indices = jnp.full((row_subchunk_size,), out_size, dtype=jnp.int32)
-    else:
-        valid_indices = jnp.full(
-            (row_subchunk_size,), num_valid_indices, dtype=jnp.int32
-        )
+    valid_scalar = (
+        jnp.int32(out_size)
+        if num_valid_indices is None
+        else jnp.reshape(num_valid_indices, ()).astype(jnp.int32)
+    )
+    valid_indices = jnp.full((row_subchunk_size,), valid_scalar, dtype=jnp.int32)
 
-    # `num_streams` independent `pl.Indirect` gathers are issued per
-    # pipeline step to keep multiple gather DMAs in flight.
-    # See `outer_pipeline` for details.
-    num_streams = 4
+    # `num_streams` independent indirect gathers are issued per step to keep
+    # multiple gather DMAs in flight.
+    num_streams = min(4, max(1, (top_k // 2) // row_subchunk_size))
     assert out_size % top_k == 0
     num_row_subchunks = top_k // row_subchunk_size
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
     if out_pad_size:
-        # spread the padding to avoid hotspots
+        # spread the padding across valid [0, num_tokens) indices to avoid OOB
         num_tokens = nope_cache.shape[0]
         pad = (jnp.arange(out_pad_size, dtype=indices.dtype) * 104729) % num_tokens
         indices = jnp.concatenate([indices, pad])
+
+    num_chunks = out_size // row_chunk_size
+    padded_chunks = (out_size + out_pad_size) // row_chunk_size
+    chunk_starts = jnp.arange(num_chunks, dtype=jnp.int32) * row_chunk_size
+    rem_rows = jnp.clip(valid_scalar - chunk_starts, 0, row_chunk_size)
+    if max_active_per_chunk is None:
+        chunk_active = jnp.where(rem_rows > 0, row_chunk_size, 0)
+    else:
+        chunk_active = jnp.where(
+            rem_rows > 0,
+            jnp.minimum(
+                jnp.maximum(row_chunk_size // 2, max_active_per_chunk),
+                row_chunk_size,
+            ),
+            0,
+        )
+    if padded_chunks > num_chunks:
+        chunk_active = jnp.concatenate(
+            [
+                chunk_active,
+                jnp.zeros((padded_chunks - num_chunks,), dtype=jnp.int32),
+            ]
+        )
+    max_active_vec = jnp.repeat(chunk_active, row_subchunk_size)
+
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
         num_subcores=sc_info.num_subcores,
@@ -302,9 +384,15 @@ def csa_gather(
                     jnp.int32,
                 ),
             ),
-            # One DMA semaphore per stream for the direct nope gather-buffer -> HBM
-            # copies issued in `main_kernel`.
-            scratch_types=(pltpu.SemaphoreType.DMA((num_streams,)),),
+            scratch_types=(
+                pltpu.VMEM((row_subchunk_size,), jnp.int32),
+                pltpu.VMEM(
+                    (3, num_streams, row_subchunk_size, csa_cache_layout.ROW_WORDS),
+                    jnp.int32,
+                ),
+                pltpu.SemaphoreType.DMA((3, num_streams)),
+                pltpu.SemaphoreType.DMA((2,)),
+            ),
             compiler_params=pltpu.CompilerParams(
                 use_tc_tiling_on_sc=False,
                 needs_layout_passes=True,
@@ -312,6 +400,6 @@ def csa_gather(
             ),
             mesh=vector_mesh,
             name="sc_csa_gather",
-        )(nope_cache, rope_cache, indices, valid_indices),
+        )(nope_cache, rope_cache, indices, valid_indices, max_active_vec),
     )  # pyrefly: ignore[not-iterable]
     return nope_out[:out_size], rope_out[: out_size // 4]

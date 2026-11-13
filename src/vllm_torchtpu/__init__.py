@@ -20,6 +20,19 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Decode-stack (D) behaviour: wrap torch_tpu's pallas.jax_op factory in
+# torch._dynamo.disable. Skipped on the pure-20L prefill role, whose tree never
+# had it (prefill builds every jax_op outside Dynamo tracing, so the wrap buys
+# nothing there and would add an early torch_tpu import to every process).
+if not envs.VLLM_DSV41_PURE_20L_PREFILL:
+    try:
+        import torch
+        from torch_tpu._internal import pallas as _pallas_mod
+
+        _pallas_mod.jax_op = torch._dynamo.disable(_pallas_mod.jax_op)
+    except Exception:
+        pass
+
 
 def _patch_vllm_compact_mamba_streaming_input() -> None:
     """Reject input sessions whose retained state can exceed the compact pool."""
@@ -712,6 +725,15 @@ def _patch_multiproc_worker_global_rank_env() -> None:
                 device,
                 order,
             )
+        # DSv4.1 Raiden PD: POD_G_CHIP_ID pins one two-core v7x chip per
+        # engine (P or D role); each local rank gets one physical core of it.
+        pod_g_chip = _os.environ.get("POD_G_CHIP_ID")
+        if pod_g_chip is not None and pod_g_chip != "":
+            phys_core = int(pod_g_chip) * 2 + int(local_rank)
+            _os.environ["TPU_VISIBLE_CHIPS"] = str(phys_core)
+            _os.environ["TPU_VISIBLE_DEVICES"] = str(phys_core)
+            _os.environ["TORCH_TPU_TOPOLOGY"] = "1,1,1,2"
+            _os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
         logger.info(
             "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
             "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
@@ -736,6 +758,15 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
 
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
+    if envs.VLLM_DSV41_PURE_20L_PREFILL:
+        # Prefill role only: compact SWA aux partition in the scheduler's
+        # BlockPool (pairs with the compact SWA KV layout in
+        # kv_cache_deepseek_v41_flash.py).
+        from vllm_torchtpu.runner.kv_cache_deepseek_v41_flash import (
+            _apply_compact_swa_block_pool_patch,
+        )
+
+        _apply_compact_swa_block_pool_patch()
     from vllm_torchtpu import patch_registry
 
     patch_registry.apply("engine_core")
@@ -1647,15 +1678,20 @@ def _patch_vllm_piecewise_backend() -> None:
             self.compile_sizes and len(self.compile_sizes) > 1
         ):
             # Dynamic token count from tensor dimension 0
-            first_tensor = next((x for x in args if isinstance(x, torch.Tensor)), None)
-            if first_tensor is not None:
-                runtime_shape = first_tensor.shape[0]
-                range_entry = self._find_range_for_shape(runtime_shape)
+            range_entry = None
+            runtime_shape = None
+            for x in args:
+                if isinstance(x, torch.Tensor) and x.ndim >= 1:
+                    runtime_shape = x.shape[0]
+                    range_entry = self._find_range_for_shape(runtime_shape)
+                    if range_entry is not None:
+                        break
+            if range_entry is None and runtime_shape is not None:
                 assert range_entry is not None, (
                     f"Shape: {runtime_shape} out of considered ranges: "
                     f"{self.compile_ranges}"
                 )
-            else:
+            elif range_entry is None:
                 compiled_entries = [
                     re for re in self.range_entries.values() if re.compiled
                 ]
@@ -1682,6 +1718,172 @@ def _patch_vllm_piecewise_backend() -> None:
     patched_call._tpu_piecewise_backend_patch = True
     PiecewiseBackend.__call__ = patched_call
     logger.info("Applied TPU patch: PiecewiseBackend tensor-dim-0 bucket dispatch.")
+
+
+def _patch_vllm_split_graph_symint() -> None:
+    """Recompute derived SymInt nodes (e.g. s72 // tp) inside each subgraph.
+
+    fx_to_mlir rejects SymInt subgraph outputs, so split_graph must not pass them.
+    """
+    import torch
+    import torch.fx as fx
+    import vllm.compilation.backends as backends_mod
+
+    if getattr(backends_mod, "_tpu_split_graph_symint_patch", False):
+        return
+    orig_merge = backends_mod._merge_empty_only_subgraphs
+
+    def _is_sym_scalar(node: fx.Node) -> bool:
+        return isinstance(
+            node.meta.get("example_value"),
+            (torch.SymInt, torch.SymFloat, torch.SymBool),
+        )
+
+    def _is_pure_sym_tree(node: fx.Node, memo: dict[fx.Node, bool]) -> bool:
+        if node in memo:
+            return memo[node]
+        if node.op == "placeholder":
+            res = _is_sym_scalar(node)
+        elif node.op == "call_function" and _is_sym_scalar(node):
+            res = all(_is_pure_sym_tree(inp, memo) for inp in node.all_input_nodes)
+        else:
+            res = False
+        memo[node] = res
+        return res
+
+    def _localize_cross_subgraph_symints(
+        node_to_subgraph_id: dict[fx.Node, int],
+    ) -> None:
+        if not node_to_subgraph_id:
+            return
+        fx_graph = next(iter(node_to_subgraph_id)).graph
+
+        root_sym_placeholders: dict[object, fx.Node] = {}
+        pure_sym_by_expr: dict[object, fx.Node] = {}
+        first_node_in_sg: dict[int, fx.Node] = {}
+        pure_memo: dict[fx.Node, bool] = {}
+
+        for node in fx_graph.nodes:
+            if node.op == "placeholder" and _is_sym_scalar(node):
+                expr = node.meta["example_value"].node.expr
+                root_sym_placeholders.setdefault(expr, node)
+                continue
+            sg = node_to_subgraph_id.get(node)
+            if sg is not None and sg not in first_node_in_sg:
+                first_node_in_sg[sg] = node
+            if _is_pure_sym_tree(node, pure_memo):
+                expr = node.meta["example_value"].node.expr
+                pure_sym_by_expr.setdefault(expr, node)
+
+        clone_memo: dict[tuple[fx.Node, int], fx.Node] = {}
+
+        def localize_for_sg(sym_node: fx.Node, dst_sg: int) -> fx.Node:
+            if sym_node.op == "placeholder":
+                return sym_node
+            expr = sym_node.meta["example_value"].node.expr
+            if expr in root_sym_placeholders:
+                return root_sym_placeholders[expr]
+            source_node = sym_node
+            if not _is_pure_sym_tree(sym_node, pure_memo):
+                source_node = pure_sym_by_expr.get(expr, sym_node)
+            if node_to_subgraph_id.get(source_node) == dst_sg:
+                return source_node
+            key = (source_node, dst_sg)
+            if key in clone_memo:
+                return clone_memo[key]
+
+            def _remap(arg):
+                if isinstance(arg, fx.Node) and _is_sym_scalar(arg):
+                    return localize_for_sg(arg, dst_sg)
+                return arg
+
+            new_args = fx.graph.map_arg(source_node.args, _remap)
+            new_kwargs = fx.graph.map_arg(source_node.kwargs, _remap)
+            anchor = first_node_in_sg[dst_sg]
+            with fx_graph.inserting_before(anchor):
+                cloned = fx_graph.create_node(
+                    op=source_node.op,
+                    target=source_node.target,
+                    args=new_args,
+                    kwargs=new_kwargs,
+                    type_expr=source_node.type,
+                )
+            cloned.meta = source_node.meta.copy()
+            node_to_subgraph_id[cloned] = dst_sg
+            clone_memo[key] = cloned
+            return cloned
+
+        for node in list(fx_graph.nodes):
+            if node.op in ("placeholder", "output") or not _is_sym_scalar(node):
+                continue
+            src_sg = node_to_subgraph_id.get(node)
+            for user in list(node.users):
+                if user.op == "output":
+                    continue
+                user_sg = node_to_subgraph_id.get(user)
+                if user_sg is not None and user_sg != src_sg:
+                    local_sym = localize_for_sg(node, user_sg)
+                    if local_sym is not node:
+                        user.args = fx.graph.map_arg(
+                            user.args,
+                            lambda n, old=node, new=local_sym: new if n is old else n,
+                        )
+                        user.kwargs = fx.graph.map_arg(
+                            user.kwargs,
+                            lambda n, old=node, new=local_sym: new if n is old else n,
+                        )
+
+        for node in reversed(list(fx_graph.nodes)):
+            if (
+                node.op not in ("placeholder", "output")
+                and _is_sym_scalar(node)
+                and len(node.users) == 0
+            ):
+                node_to_subgraph_id.pop(node, None)
+                fx_graph.erase_node(node)
+
+    def patched_merge_empty_only_subgraphs(
+        node_to_subgraph_id: dict[fx.Node, int],
+        split_op_graphs: list[int],
+    ) -> None:
+        orig_merge(node_to_subgraph_id, split_op_graphs)
+        _localize_cross_subgraph_symints(node_to_subgraph_id)
+
+    orig_split_graph = backends_mod.split_graph
+
+    def patched_split_graph(graph: fx.GraphModule, splitting_ops: list[str]):
+        split_gm, outputs = orig_split_graph(graph, splitting_ops)
+        recompiled_root = False
+        for item in outputs:
+            submod = item.graph
+            placeholders = [n for n in submod.graph.nodes if n.op == "placeholder"]
+            dead_indices = [
+                idx
+                for idx, n in enumerate(placeholders)
+                if _is_sym_scalar(n) and len(n.users) == 0
+            ]
+            if not dead_indices:
+                continue
+            dead_set = set(dead_indices)
+            for idx in reversed(dead_indices):
+                submod.graph.erase_node(placeholders[idx])
+            submod.recompile()
+            for node in split_gm.graph.nodes:
+                if node.op == "call_module" and node.target == item.submod_name:
+                    node.args = tuple(
+                        arg for idx, arg in enumerate(node.args) if idx not in dead_set
+                    )
+                    recompiled_root = True
+        if recompiled_root:
+            split_gm.recompile()
+        return split_gm, outputs
+
+    backends_mod._merge_empty_only_subgraphs = patched_merge_empty_only_subgraphs
+    backends_mod.split_graph = patched_split_graph
+    backends_mod._tpu_split_graph_symint_patch = True
+    logger.info(
+        "Applied TPU patch: localize cross-subgraph SymInt nodes in split_graph."
+    )
 
 
 def _patch_vllm_compile_prefix_isolation() -> None:
@@ -2155,3 +2357,108 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         "Applied TPU patch: register shard index bounds as buffers in "
         "VocabParallelEmbedding"
     )
+
+
+def _patch_decode_bench_connector_safe_main_end() -> None:
+    """Restrict DecodeBenchConnectorWorker fills to [1 : _main_end) blocks only."""
+    import torch
+    from vllm.distributed.kv_transfer.kv_connector.v1 import (
+        decode_bench_connector as _dbc,
+    )
+
+    cls = getattr(_dbc, "DecodeBenchConnectorWorker", None)
+    if cls is None or getattr(cls, "_tpu_safe_main_end_patch", False):
+        return
+
+    def _safe_runs(kv_cache: torch.Tensor, block_ids: list[int]) -> list[tuple[int, int]]:
+        max_blk = getattr(kv_cache, "_main_end", kv_cache.shape[0])
+        valid = sorted({b for b in block_ids if 1 <= b < max_blk})
+        if not valid:
+            return []
+        lo = valid[0]
+        hi = lo + 1
+        runs: list[tuple[int, int]] = []
+        for b in valid[1:]:
+            if b == hi:
+                hi += 1
+            else:
+                runs.append((lo, hi))
+                lo = b
+                hi = b + 1
+        runs.append((lo, hi))
+        return runs
+
+    def _fill_kv_tensor(
+        self, kv_cache: torch.Tensor, block_ids: list[int], num_tokens: int
+    ) -> None:
+        for r_lo, r_hi in _safe_runs(kv_cache, block_ids):
+            if self.fill_std > 0:
+                kv_cache[r_lo:r_hi] = torch.normal(
+                    mean=self.fill_mean,
+                    std=self.fill_std,
+                    size=(r_hi - r_lo,) + kv_cache.shape[1:],
+                    dtype=kv_cache.dtype,
+                    device=kv_cache.device,
+                )
+            else:
+                kv_cache[r_lo:r_hi] = self.fill_mean
+
+    def _fill_block_tensor(
+        self,
+        kv_cache: torch.Tensor,
+        block_ids: list[int],
+        fill_mean: float,
+        fill_std: float,
+    ) -> None:
+        for r_lo, r_hi in _safe_runs(kv_cache, block_ids):
+            view = kv_cache[r_lo:r_hi]
+            if fill_std > 0:
+                view.normal_(mean=fill_mean, std=fill_std)
+            else:
+                view.fill_(fill_mean)
+
+    def _fill_blocks(self, group_idx: int, block_ids: list[int], num_tokens: int) -> None:
+        if not block_ids:
+            return
+        assert self.kv_caches is not None
+        fill_mean, fill_std = (
+            (0.0, 0.0)
+            if group_idx in self._zero_fill_group_ids
+            else (self.fill_mean, self.fill_std)
+        )
+        for layer_name in self.group_to_layers.get(group_idx, []):
+            kv_cache = self.kv_caches.get(layer_name)
+            if kv_cache is None:
+                continue
+            if isinstance(kv_cache, torch.Tensor):
+                self._fill_block_tensor(kv_cache, block_ids, fill_mean, fill_std)
+            elif isinstance(kv_cache, (list, tuple)) and all(
+                isinstance(t, torch.Tensor) for t in kv_cache
+            ):
+                for t in kv_cache:
+                    if hasattr(t, "_main_end"):
+                        self._fill_block_tensor(t, block_ids, fill_mean, fill_std)
+                    else:
+                        self._fill_state_tensor(t, fill_mean, fill_std)
+
+    cls._fill_kv_tensor = _fill_kv_tensor
+    cls._fill_block_tensor = _fill_block_tensor
+    cls._fill_blocks = _fill_blocks
+    cls._tpu_safe_main_end_patch = True
+
+
+# Decode role only (the prefill tree never patched DecodeBenchConnector).
+if not envs.VLLM_DSV41_PURE_20L_PREFILL:
+    try:
+        _patch_decode_bench_connector_safe_main_end()
+    except Exception:
+        pass
+
+    try:
+        from vllm_torchtpu.distributed.kv_transfer.decode_bench_seeding import (
+            patch_decode_bench_seeding,
+        )
+
+        patch_decode_bench_seeding()
+    except Exception:
+        pass

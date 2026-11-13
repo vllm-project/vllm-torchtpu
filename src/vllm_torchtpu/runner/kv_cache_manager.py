@@ -41,6 +41,8 @@ from vllm.models.deepseek_v4.attention import (
     DeepseekV4IndexerCache,
 )
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
+from vllm.models.deepseek_v41 import attention as deepseek_v41_flash_attention
+from vllm.models.deepseek_v41 import compressor as deepseek_v41_flash_compressor
 from vllm.v1.attention.backend import AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
@@ -90,6 +92,9 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+from vllm_torchtpu.runner.kv_cache_deepseek_v41_flash import (
+    DeepseekV41FlashKVCacheAllocator,
+)
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -124,6 +129,18 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def is_cache_for_deepseek_v41_flash(attn_module: AttentionLayerBase) -> bool:
+    """Whether this module owns one of DeepSeek-V4.1-Flash's custom KV caches."""
+    return isinstance(
+        attn_module,
+        (
+            deepseek_v41_flash_attention.DeepseekV4Attention,
+            deepseek_v41_flash_attention.DeepseekV4IndexerCache,
+            deepseek_v41_flash_compressor.CompressorStateCache,
+        ),
+    )
+
+
 def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     """Whether this module owns one of DeepSeek-V4's custom KV caches.
 
@@ -138,7 +155,7 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
             DeepseekV4IndexerCache,
             CompressorStateCache,
         ),
-    )
+    ) or is_cache_for_deepseek_v41_flash(attn_module)
 
 
 def sparse_mla_page_size_bytes(
@@ -266,6 +283,7 @@ class KVCacheManager:
     def __init__(self, runner: TPUModelRunner) -> None:
         self.runner = runner
         self.ds_v4 = DsV4KVCacheAllocator(runner)
+        self.deepseek_v41_flash = DeepseekV41FlashKVCacheAllocator(runner)
         # Set when get_kv_cache_spec selects the compact-mamba layout.
         self._compact_mamba_sizing: _CompactMambaSizing | None = None
 
@@ -1721,7 +1739,14 @@ class KVCacheManager:
             )
 
         if _is_ds_v4:
-            self.ds_v4._initialize_ds_v4_kv_cache(
+            _is_deepseek_v41_flash = any(
+                is_cache_for_deepseek_v41_flash(module)
+                for module in self.runner.vllm_config.compilation_config.static_forward_context.values()  # noqa: E501
+            )
+            allocator = (
+                self.deepseek_v41_flash if _is_deepseek_v41_flash else self.ds_v4
+            )
+            allocator._initialize_ds_v4_kv_cache(
                 kv_cache_config, _per_layer_spec, kv_caches, kv_cache_config.num_blocks
             )
 

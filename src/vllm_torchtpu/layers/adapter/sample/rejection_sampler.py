@@ -344,6 +344,68 @@ def _greedy_rejection_sample(
 
     draft_token_ids = draft_token_ids.to(torch.int32)
 
+    # Fast zero-scatter 2D block path when every request has fixed max_draft_tokens slots
+    if batch_size >= 8 and total_tokens > 0 and total_tokens == batch_size * max_draft_tokens:
+        target_2d = target_logits_argmax.view(batch_size, max_draft_tokens)
+        draft_2d = draft_token_ids.view(batch_size, max_draft_tokens)
+        col_idx = torch.arange(
+            max_draft_tokens, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        valid_2d = col_idx < num_draft_tokens.to(torch.int32).unsqueeze(1)
+        if synthetic_mode:
+            if accept_u is None or synthetic_conditional_rates is None:
+                raise ValueError(
+                    "synthetic rejection sampling requires accept_u and "
+                    "synthetic_conditional_rates"
+                )
+            rates = synthetic_conditional_rates[col_idx.to(torch.int64)]
+            accepted_2d = (accept_u.view(batch_size, max_draft_tokens) < rates) & (
+                draft_2d >= 0
+            )
+            emitted_2d = torch.where(accepted_2d, draft_2d, target_2d)
+        else:
+            accepted_2d = draft_2d == target_2d
+            emitted_2d = target_2d
+
+        slot_ok = torch.where(
+            valid_2d, accepted_2d, torch.ones_like(accepted_2d)
+        )
+        prefix_all = torch.cumprod(slot_ok.to(torch.int32), dim=1).to(torch.bool)
+        keep_2d = torch.cat(
+            [
+                torch.ones((batch_size, 1), dtype=torch.bool, device=device),
+                prefix_all[:, :-1],
+            ],
+            dim=1,
+        )
+        main_2d = torch.where(
+            valid_2d & keep_2d,
+            emitted_2d,
+            torch.tensor(PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device),
+        )
+        full_out = torch.cat(
+            [
+                main_2d,
+                torch.full(
+                    (batch_size, 1),
+                    PLACEHOLDER_TOKEN_ID,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            ],
+            dim=1,
+        )
+        all_ok_col = prefix_all[:, -1:]
+        bonus_pos = (
+            torch.arange(
+                max_draft_tokens + 1, dtype=torch.int32, device=device
+            ).unsqueeze(0)
+            == num_draft_tokens.to(torch.int32).unsqueeze(1)
+        ) & all_ok_col
+        return torch.where(
+            bonus_pos, bonus_token_ids.to(torch.int32).unsqueeze(1), full_out
+        )
+
     # Find the first mismatch index per segment using matrix masking.
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices
@@ -505,7 +567,7 @@ def _random_rejection_sample_with_segment(
 
     # Temperature scaling cannot resolve greedy ties; greedy decisions below
     # use the original logits' first argmax, as in the all-greedy path.
-    scaled_logits = target_logits.to(torch.float32) / (
+    scaled_logits = target_logits.to(torch.float32) * torch.reciprocal(
         temperatures.to(torch.float32) + TEMPERATURE_EPS
     )
     if apply_topk_topp:
@@ -551,44 +613,94 @@ def _random_rejection_sample_with_segment(
     # On rejection, resample from the residual max(0, p - q). Placeholder
     # drafts have no q mass to subtract, so their recovery distribution
     # remains the full target distribution.
+    recover_u = torch.clamp(
+        recover_u,
+        min=torch.finfo(target_probs.dtype).tiny,
+        max=1.0 - torch.finfo(target_probs.dtype).eps,
+    )
+    # Fused single-pass residual Gumbel recovery: fold the exponential noise
+    # into the residual and take a single [T, V] max, without materializing an
+    # int64 one_hot or running duplicate [T, V] argmax/any scans.
+    inv_exp_noise = torch.reciprocal(
+        -torch.log(recover_u) + torch.finfo(target_probs.dtype).tiny
+    )
     if draft_probs is not None:
         recovered_dist = torch.where(
             valid_draft_token_ids.unsqueeze(-1),
             torch.clamp(target_probs - draft_probs.to(target_probs.dtype), min=0.0),
             target_probs,
         )
+        scores = recovered_dist * inv_exp_noise
     else:
         # With q a delta at x, subtracting q only touches entry x, so the
         # residual is just p with the drafted token zeroed out. Do not let
         # the safe clamp above accidentally mask vocabulary token 0.
-        draft_token_mask = torch.nn.functional.one_hot(
-            safe_draft_token_ids, num_classes=vocab_size
-        ).to(torch.bool)
-        draft_token_mask = draft_token_mask & valid_draft_token_ids.unsqueeze(-1)
-        recovered_dist = torch.where(
+        draft_token_mask = (
+            torch.arange(vocab_size, dtype=torch.int32, device=device).unsqueeze(0)
+            == safe_draft_token_ids.to(torch.int32).unsqueeze(1)
+        ) & valid_draft_token_ids.unsqueeze(-1)
+        scores = torch.where(
             draft_token_mask,
             torch.tensor(0.0, dtype=target_probs.dtype, device=device),
-            target_probs,
+            target_probs * inv_exp_noise,
         )
-    recover_u = torch.clamp(
-        recover_u,
-        min=torch.finfo(target_probs.dtype).tiny,
-        max=1.0 - torch.finfo(target_probs.dtype).eps,
-    )
-    exp_noise = -torch.log(recover_u)
-    recovered_token_ids = torch.argmax(
-        recovered_dist / (exp_noise + torch.finfo(target_probs.dtype).tiny),
-        dim=-1,
-    ).to(torch.int32)
+    max_score, recovered_token_ids = torch.max(scores, dim=-1)
     # Greedy rows recover the target argmax. Synthetic rejection can also leave
-    # a random row with no residual mass: its target is one-hot at the draft,
-    # so the draft is that row's unique argmax, which it recovers as well.
-    has_recovery_mass = torch.any(recovered_dist > 0, dim=-1)
+    # a random row with no residual mass (max_score == 0): its target is
+    # one-hot at the draft, so the draft is that row's unique argmax, which it
+    # recovers as well.
     recovered_token_ids = torch.where(
-        is_greedy | ~has_recovery_mass,
+        is_greedy | ~(max_score > 0.0),
         target_logits_argmax,
-        recovered_token_ids,
+        recovered_token_ids.to(torch.int32),
     )
+
+    if batch_size >= 8 and total_tokens > 0 and total_tokens == batch_size * max_draft_tokens:
+        draft_2d = draft_token_ids.to(torch.int32).view(batch_size, max_draft_tokens)
+        rec_2d = recovered_token_ids.view(batch_size, max_draft_tokens)
+        accepted_2d = accepted.view(batch_size, max_draft_tokens)
+        col_idx = torch.arange(
+            max_draft_tokens, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        valid_2d = col_idx < num_draft_tokens.to(torch.int32).unsqueeze(1)
+        emitted_2d = torch.where(accepted_2d, draft_2d, rec_2d)
+        slot_ok = torch.where(
+            valid_2d, accepted_2d, torch.ones_like(accepted_2d)
+        )
+        prefix_all = torch.cumprod(slot_ok.to(torch.int32), dim=1).to(torch.bool)
+        keep_2d = torch.cat(
+            [
+                torch.ones((batch_size, 1), dtype=torch.bool, device=device),
+                prefix_all[:, :-1],
+            ],
+            dim=1,
+        )
+        main_2d = torch.where(
+            valid_2d & keep_2d,
+            emitted_2d,
+            torch.tensor(PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device),
+        )
+        full_out = torch.cat(
+            [
+                main_2d,
+                torch.full(
+                    (batch_size, 1),
+                    PLACEHOLDER_TOKEN_ID,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            ],
+            dim=1,
+        )
+        bonus_pos = (
+            torch.arange(
+                max_draft_tokens + 1, dtype=torch.int32, device=device
+            ).unsqueeze(0)
+            == num_draft_tokens.to(torch.int32).unsqueeze(1)
+        ) & prefix_all[:, -1:]
+        return torch.where(
+            bonus_pos, bonus_token_ids.to(torch.int32).unsqueeze(1), full_out
+        )
 
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices

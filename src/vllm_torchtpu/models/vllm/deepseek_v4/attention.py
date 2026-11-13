@@ -336,7 +336,11 @@ class VllmDeepseekV4MLAAttention(
             not swa_only
             and main_cache is not None
             and swa_tensor is not None
-            and main_cache.data_ptr() == swa_tensor.data_ptr()
+            and (
+                (main_cache is swa_tensor)
+                if torch.compiler.is_compiling()
+                else (main_cache.data_ptr() == swa_tensor.data_ptr())
+            )
         )
 
         built_from_real_caches = swa_tensor is not None

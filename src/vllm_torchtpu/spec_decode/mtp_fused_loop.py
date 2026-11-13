@@ -95,9 +95,30 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
-            input_ids = (
-                self.mtp.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
+            lm_head = getattr(self.mtp, "lm_head", None)
+            lp = getattr(
+                self.mtp,
+                "logits_processor",
+                getattr(getattr(self.mtp, "model", None), "logits_processor", None),
             )
+            norm_fn = getattr(getattr(self.mtp, "model", None), "norm", None)
+            if (
+                lm_head is not None
+                and lp is not None
+                and norm_fn is not None
+                and getattr(lm_head, "tp_size", 1) > 1
+            ):
+                from vllm_torchtpu.spec_decode.utils import tp_local_argmax_logits
+
+                input_ids = tp_local_argmax_logits(
+                    lp, lm_head, norm_fn(last_hidden)
+                ).to(torch.int32)
+            else:
+                input_ids = (
+                    self.mtp.compute_logits(last_hidden)
+                    .argmax(dim=-1)
+                    .to(torch.int32)
+                )
             tokens.append(input_ids)
         return tuple(tokens)
 

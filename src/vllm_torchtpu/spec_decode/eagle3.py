@@ -111,9 +111,9 @@ def _maybe_pad_dim0(t: torch.Tensor, target_len: int) -> torch.Tensor:
     if target_len <= n:
         return t
     if t.ndim == 1:
-        return torch.nn.functional.pad(t, (0, target_len - n))
+        return torch.cat((t, torch.zeros((target_len - n,), dtype=t.dtype, device=t.device)), dim=0)
     if t.ndim == 2:
-        return torch.nn.functional.pad(t, (0, 0, 0, target_len - n))
+        return torch.cat((t, torch.zeros((target_len - n, t.shape[1]), dtype=t.dtype, device=t.device)), dim=0)
     raise ValueError(f"_maybe_pad_dim0: unsupported ndim {t.ndim}, expected 1 or 2")
 
 
@@ -122,7 +122,7 @@ def _maybe_pad_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
     n = t.shape[1]
     if target_len <= n:
         return t
-    return torch.nn.functional.pad(t, (0, target_len - n))
+    return torch.cat((t, torch.zeros((*t.shape[:-1], target_len - n), dtype=t.dtype, device=t.device)), dim=-1)
 
 
 if TYPE_CHECKING:

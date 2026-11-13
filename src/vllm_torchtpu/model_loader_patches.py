@@ -1028,6 +1028,9 @@ def patch_moe_expert_write_staging() -> None:
     def process_weights_after_loading(model, model_config, target_device):
         during_load = stager.flushed
         stager.flush_all()
+        stager._pool.clear()
+        stager.written_early.clear()
+        gc.collect()
         logger.info(
             "Expert parameters written to the device: %d as their last "
             "expert landed, %d at the end of loading.",

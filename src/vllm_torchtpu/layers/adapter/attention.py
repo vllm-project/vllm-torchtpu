@@ -1568,9 +1568,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
             tuple(kv_cache.shape[-3:]), native_page, pool_head_dim, self.head_size
         )
         if pad_size:
-            query = torch.nn.functional.pad(query, (0, pad_size))
-            key = torch.nn.functional.pad(key, (0, pad_size))
-            value = torch.nn.functional.pad(value, (0, pad_size))
+            # Explicit zero-concat instead of F.pad (see r25 "zero F.pad").
+            def _pad_last(t: torch.Tensor) -> torch.Tensor:
+                zeros = torch.zeros(
+                    (*t.shape[:-1], pad_size), dtype=t.dtype, device=t.device
+                )
+                return torch.cat((t, zeros), dim=-1)
+
+            query = _pad_last(query)
+            key = _pad_last(key)
+            value = _pad_last(value)
         if self.kv_cache_quantized_dtype:
             k_scale_value = layer._k_scale_float
             v_scale_value = layer._v_scale_float

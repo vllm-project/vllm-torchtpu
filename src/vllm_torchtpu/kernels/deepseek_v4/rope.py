@@ -21,13 +21,20 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.layers.core.quantization import dtype_max
+from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX, dtype_max
 from vllm_torchtpu.utils import largest_divisor
 
 # Native lane count; the roped channels are the tail of the last lane block.
 LANE = 128
+SUBLANE = 8
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+
+
+def _rope_tile_n(num_tokens: int, cap: int) -> int:
+    if num_tokens >= SUBLANE and num_tokens % SUBLANE == 0:
+        return SUBLANE * largest_divisor(num_tokens // SUBLANE, cap=cap // SUBLANE)
+    return largest_divisor(num_tokens, cap=cap)
 
 
 @jax.tree_util.register_dataclass
@@ -417,7 +424,7 @@ def _rope_call(
         # is exactly LANE).
         raise ValueError(f"quantization requires head_dim == {LANE}, got {head_dim}")
 
-    tile_n = largest_divisor(num_tokens, cap=128)
+    tile_n = _rope_tile_n(num_tokens, cap=128)
     assert num_tokens % tile_n == 0
 
     x_block_shape = (tile_n, rows_per_token, LANE) if x.ndim == 3 else (tile_n, LANE)
@@ -541,7 +548,7 @@ def qnorm_rope(
     rotary_dim = cos_sin_cache.shape[1]
     assert head_dim % LANE == 0
     assert rotary_dim % 2 == 0 and rotary_dim <= LANE
-    tile_n = largest_divisor(num_tokens, cap=64)
+    tile_n = _rope_tile_n(num_tokens, cap=64)
 
     x_block_shape = (tile_n, rows_per_token, head_dim)
     kernel = functools.partial(
@@ -578,12 +585,77 @@ def qnorm_rope(
     )(positions, x, cos_sin_cache)
 
 
+def _expand_cos_sin(
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    inverse: bool = False,
+) -> jax.Array:
+    """Expand ``cos_sin_cache[positions]`` to ``[T, 2 * LANE]`` in XLA so it CSEs across kernels/layers."""
+    num_tokens = positions.shape[0]
+    rotary_dim = cos_sin_cache.shape[1]
+    half = rotary_dim // 2
+    cs = cos_sin_cache[positions]
+    pad_w = LANE - rotary_dim
+    if pad_w == 0 and not inverse:
+        return jnp.repeat(cs, 2, axis=-1).astype(jnp.float32)
+    c = jnp.repeat(cs[:, :half], 2, axis=-1)
+    s = jnp.repeat(cs[:, half:], 2, axis=-1)
+    if inverse:
+        s = -s
+    if pad_w > 0:
+        ones = jnp.ones((num_tokens, pad_w), dtype=cs.dtype)
+        zeros = jnp.zeros((num_tokens, pad_w), dtype=cs.dtype)
+        return jnp.concatenate([ones, c, zeros, s], axis=-1).astype(jnp.float32)
+    return jnp.concatenate([c, s], axis=-1).astype(jnp.float32)
+
+
+def _rope_quant_body(
+    x_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    *rest_refs: jax.Ref,
+    quant_dtype: jnp.dtype,
+    has_w_scale: bool = False,
+) -> None:
+    """Process one ``(tile_n, [num_heads,] LANE)`` chunk with optional w_scale."""
+    x_raw = x_ref[...]
+    w_sign = None
+    if has_w_scale:
+        w_ref, q_ref, scale_ref = rest_refs
+        w_val = w_ref[...].astype(jnp.float32)[..., None]
+        w_sign = jnp.sign(w_val)
+        x_raw = (x_raw.astype(jnp.float32) * jnp.abs(w_val)).astype(x_raw.dtype)
+    else:
+        q_ref, scale_ref = rest_refs
+    x = x_raw.astype(jnp.float32)
+    cs = cos_sin_ref[...]
+    cos = cs[:, :LANE]
+    lane = jnp.arange(LANE)
+    sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
+    sin = cs[:, LANE:] * sign
+    if x.ndim == 3:
+        cos = cos[:, None, :]
+        sin = sin[:, None, :]
+
+    y = x * cos + _lane_gather(x, lane ^ 1) * sin
+
+    qmax = dtype_max(quant_dtype)
+    abs_max = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
+    scale = abs_max / qmax
+    scale_inv = jnp.where(abs_max == 0.0, 0.0, 1.0 / scale)
+    q_ref[...] = (y * scale_inv).astype(quant_dtype)
+    if w_sign is not None:
+        scale = scale * w_sign
+    scale_ref[...] = scale.reshape(scale_ref.shape)
+
+
 @functools.partial(jax.jit, static_argnames=("inverse", "quant_dtype", "name"))
 def rope_quant(
     x: jax.Array,  # [num_tokens, head_dim] | [num_tokens, num_heads, head_dim]
     positions: jax.Array,  # [num_tokens] int
     cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
     *,
+    w_scale: jax.Array | None = None,
     inverse: bool = False,
     quant_dtype: jnp.dtype = jnp.float8_e4m3fn,
     name: str = "rope_quant",
@@ -591,16 +663,658 @@ def rope_quant(
     """RoPE fused with per-row dynamic quantization of the rotated values.
 
     Same rotation as ``rope``, but the result is quantized to ``quant_dtype``
-    inside the kernel.
+    inside the kernel. Optional ``w_scale`` (shape ``x.shape[:-1]``) is multiplied
+    into ``x`` in VMEM before RoPE rotation.
     """
-    return cast(
-        tuple[jax.Array, jax.Array],
-        _rope_call(
-            x,
-            positions,
-            cos_sin_cache,
-            inverse=inverse,
+    if x.ndim not in (2, 3):
+        raise ValueError(f"x must be rank 2 or 3, got {x.shape}")
+    assert positions.ndim == 1 and positions.shape[0] == x.shape[0]
+    assert cos_sin_cache.ndim == 2
+
+    num_tokens = x.shape[0]
+    head_dim = x.shape[-1]
+    rows_per_token = x.shape[1] if x.ndim == 3 else 1
+    rotary_dim = cos_sin_cache.shape[1]
+    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
+    if head_dim != LANE:
+        raise ValueError(f"quantization requires head_dim == {LANE}, got {head_dim}")
+
+    cap_n = 128 if x.ndim == 3 else 512
+    tile_n = _rope_tile_n(num_tokens, cap=cap_n)
+    x_block_shape = (tile_n, rows_per_token, LANE) if x.ndim == 3 else (tile_n, LANE)
+    scale_block_shape = x_block_shape[:-1]
+    x_idx_map = (lambda i: (i, 0, 0)) if x.ndim == 3 else (lambda i: (i, 0))
+    s_idx_map = (lambda i: (i, 0)) if x.ndim == 3 else (lambda i: (i,))
+
+    cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
+    in_specs = [
+        pl.BlockSpec(x_block_shape, x_idx_map),
+        pl.BlockSpec((tile_n, 2 * LANE), lambda i: (i, 0)),
+    ]
+    in_args = [x, cos_sin]
+    if w_scale is not None:
+        in_specs.append(pl.BlockSpec(scale_block_shape, s_idx_map))
+        in_args.append(w_scale)
+
+    return pl.pallas_call(
+        functools.partial(
+            _rope_quant_body,
             quant_dtype=quant_dtype,
-            name=name,
+            has_w_scale=(w_scale is not None),
         ),
+        out_shape=(
+            jax.ShapeDtypeStruct(x.shape, quant_dtype),
+            jax.ShapeDtypeStruct(x.shape[:-1], jnp.float32),
+        ),
+        grid=(num_tokens // tile_n,),
+        in_specs=in_specs,
+        out_specs=[
+            pl.BlockSpec(x_block_shape, x_idx_map),
+            pl.BlockSpec(scale_block_shape, s_idx_map),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(*in_args)
+
+
+def _rmsnorm_rope_body(
+    x_ref: jax.Ref,
+    w_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    out_ref: jax.Ref,
+    *,
+    eps: float,
+    out_dtype: jnp.dtype,
+) -> None:
+    """Process one ``(tile_n, head_dim)`` chunk: weighted RMSNorm + RoPE."""
+    x = x_ref[...].astype(jnp.float32)
+    rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+    normed = (x * rms).astype(out_dtype) * w_ref[...]
+
+    tail = normed[..., -LANE:].astype(jnp.float32)
+    cs = cos_sin_ref[...]
+    cos = cs[:, :LANE]
+    sin = cs[:, LANE:]
+    if tail.ndim == 3:
+        cos = cos[:, None, :]
+        sin = sin[:, None, :]
+    roped = (tail * cos + _rotate_gptj(tail) * sin).astype(out_dtype)
+
+    out_ref[...] = jnp.concatenate([normed[..., :-LANE], roped], axis=-1)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("eps", "inverse", "name"),
+)
+def rmsnorm_rope(
+    x: jax.Array,  # [num_tokens, head_dim]
+    weight: jax.Array,  # [head_dim]
+    positions: jax.Array,  # [num_tokens] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    eps: float = 1e-6,
+    inverse: bool = False,
+    name: str = "rmsnorm_rope",
+) -> jax.Array:
+    """Weighted RMSNorm fused with DeepSeek-V4 RoPE in a single Pallas kernel."""
+    assert x.ndim in (2, 3)
+    assert positions.ndim == 1 and positions.shape[0] == x.shape[0]
+    assert cos_sin_cache.ndim == 2
+
+    num_tokens = x.shape[0]
+    head_dim = x.shape[-1]
+    rotary_dim = cos_sin_cache.shape[1]
+    assert head_dim % LANE == 0
+    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
+    cap_n = 1024 if x.ndim == 2 else 256
+    tile_n = _rope_tile_n(num_tokens, cap=cap_n)
+
+    x_block_shape = (tile_n, *x.shape[1:])
+    w_reshaped = weight.astype(x.dtype).reshape((1,) * (x.ndim - 1) + (head_dim,))
+    w_block_shape = (1,) * (len(x_block_shape) - 1) + (x_block_shape[-1],)
+    cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
+
+    x_idx_map = (lambda i: (i, 0, 0)) if len(x_block_shape) == 3 else (lambda i: (i, 0))
+    w_idx_map = (lambda i: (0, 0, 0)) if len(x_block_shape) == 3 else (lambda i: (0, 0))
+
+    return pl.pallas_call(
+        functools.partial(
+            _rmsnorm_rope_body,
+            eps=eps,
+            out_dtype=x.dtype,
+        ),
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        grid=(num_tokens // tile_n,),
+        in_specs=[
+            pl.BlockSpec(x_block_shape, x_idx_map),
+            pl.BlockSpec(w_block_shape, w_idx_map),
+            pl.BlockSpec((tile_n, 2 * LANE), lambda i: (i, 0)),
+        ],
+        out_specs=pl.BlockSpec(x_block_shape, x_idx_map),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(x, w_reshaped, cos_sin)
+
+
+def _qkv_norm_rope_quant_body(
+    qr_kv_ref: jax.Ref,
+    q_w_ref: jax.Ref,
+    kv_w_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    qr_fp8_ref: jax.Ref,
+    qr_s_ref: jax.Ref,
+    kv_out_ref: jax.Ref,
+    *,
+    q_dim: int,
+    q_eps: float,
+    kv_eps: float,
+    out_dtype: jnp.dtype,
+) -> None:
+    """Fused q_norm + FP8 dynamic quant + kv_norm + RoPE on a (tile_n, q_dim + kv_dim) chunk."""
+    qr_kv = qr_kv_ref[...]
+    q_x = qr_kv[:, :q_dim].astype(jnp.float32)
+    kv_x = qr_kv[:, q_dim:].astype(jnp.float32)
+
+    q_rms = jax.lax.rsqrt(jnp.mean(q_x * q_x, axis=-1, keepdims=True) + q_eps)
+    qr_normed = (q_x * q_rms).astype(out_dtype) * q_w_ref[...]
+    qr_f32 = qr_normed.astype(jnp.float32)
+    abs_max = jnp.max(jnp.abs(qr_f32), axis=-1, keepdims=True)
+    lhs_s = abs_max / FP8_E4M3_MAX
+    lhs_s_safe = jnp.where(lhs_s == 0.0, 1.0, lhs_s)
+    qr_fp8_ref[...] = jnp.clip(qr_f32 / lhs_s_safe, -FP8_E4M3_MAX, FP8_E4M3_MAX).astype(
+        jnp.float8_e4m3fn
+    )
+    qr_s_ref[...] = jnp.broadcast_to(lhs_s_safe, (qr_kv.shape[0], LANE))
+
+    kv_rms = jax.lax.rsqrt(jnp.mean(kv_x * kv_x, axis=-1, keepdims=True) + kv_eps)
+    kv_normed = (kv_x * kv_rms).astype(out_dtype) * kv_w_ref[...]
+    tail = kv_normed[:, -LANE:].astype(jnp.float32)
+    cs = cos_sin_ref[...]
+    cos = cs[:, :LANE]
+    sin = cs[:, LANE:]
+    roped = (tail * cos + _rotate_gptj(tail) * sin).astype(out_dtype)
+    kv_out_ref[...] = jnp.concatenate([kv_normed[:, :-LANE], roped], axis=-1)
+
+
+def _qkv_tile_n(t_pad: int) -> int:
+    cap_n = 32 if t_pad <= 64 else (128 if t_pad <= 384 else 256)
+    fp8_row_align = 4 * SUBLANE
+    if t_pad % fp8_row_align == 0:
+        return fp8_row_align * largest_divisor(
+            t_pad // fp8_row_align, cap=max(1, cap_n // fp8_row_align)
+        )
+    return t_pad
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("eps", "q_eps", "kv_eps", "name"),
+)
+def qkv_norm_rope_quant_cos_sin(
+    qr_kv: jax.Array,  # [num_tokens, q_dim + kv_dim]
+    q_weight: jax.Array,  # [q_dim]
+    kv_weight: jax.Array,  # [kv_dim]
+    cos_sin: jax.Array,  # [num_tokens, 2 * LANE] float32
+    *,
+    eps: float = 1e-6,
+    q_eps: float | None = None,
+    kv_eps: float | None = None,
+    name: str = "qkv_norm_rope_quant",
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Fused q_norm + qr FP8 quant + kv_norm + RoPE consuming pre-gathered cos_sin."""
+    assert qr_kv.ndim == 2
+    num_tokens, total_dim = qr_kv.shape
+    q_dim = q_weight.shape[0]
+    kv_dim = kv_weight.shape[0]
+    assert total_dim == q_dim + kv_dim
+    assert q_dim % LANE == 0 and kv_dim % LANE == 0
+
+    pad_t = (SUBLANE - (num_tokens % SUBLANE)) % SUBLANE
+    if pad_t > 0:
+        qr_kv = jnp.pad(qr_kv, ((0, pad_t), (0, 0)))
+        cos_sin = jnp.pad(cos_sin, ((0, pad_t), (0, 0)))
+    t_pad = qr_kv.shape[0]
+    tile_n = _qkv_tile_n(t_pad)
+    q_w_2d = q_weight.astype(qr_kv.dtype).reshape(1, q_dim)
+    kv_w_2d = kv_weight.astype(qr_kv.dtype).reshape(1, kv_dim)
+    eff_q_eps = eps if q_eps is None else q_eps
+    eff_kv_eps = eps if kv_eps is None else kv_eps
+
+    qr_fp8, qr_s_128, kv_out = pl.pallas_call(
+        functools.partial(
+            _qkv_norm_rope_quant_body,
+            q_dim=q_dim,
+            q_eps=eff_q_eps,
+            kv_eps=eff_kv_eps,
+            out_dtype=qr_kv.dtype,
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct((t_pad, q_dim), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((t_pad, LANE), jnp.float32),
+            jax.ShapeDtypeStruct((t_pad, kv_dim), qr_kv.dtype),
+        ),
+        grid=(t_pad // tile_n,),
+        in_specs=[
+            pl.BlockSpec((tile_n, total_dim), lambda i: (i, 0)),
+            pl.BlockSpec((1, q_dim), lambda i: (0, 0)),
+            pl.BlockSpec((1, kv_dim), lambda i: (0, 0)),
+            pl.BlockSpec((tile_n, 2 * LANE), lambda i: (i, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((tile_n, q_dim), lambda i: (i, 0)),
+            pl.BlockSpec((tile_n, LANE), lambda i: (i, 0)),
+            pl.BlockSpec((tile_n, kv_dim), lambda i: (i, 0)),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(qr_kv, q_w_2d, kv_w_2d, cos_sin)
+    if pad_t > 0:
+        return qr_fp8[:num_tokens], qr_s_128[:num_tokens], kv_out[:num_tokens]
+    return qr_fp8, qr_s_128, kv_out
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("eps", "q_eps", "kv_eps", "inverse", "name"),
+)
+def qkv_norm_rope_quant(
+    qr_kv: jax.Array,  # [num_tokens, q_dim + kv_dim]
+    q_weight: jax.Array,  # [q_dim]
+    kv_weight: jax.Array,  # [kv_dim]
+    positions: jax.Array,  # [num_tokens] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    eps: float = 1e-6,
+    q_eps: float | None = None,
+    kv_eps: float | None = None,
+    inverse: bool = False,
+    name: str = "qkv_norm_rope_quant",
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Fused q_norm + qr FP8 quant + kv_norm + RoPE in a single Pallas kernel."""
+    cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
+    return qkv_norm_rope_quant_cos_sin(
+        qr_kv,
+        q_weight,
+        kv_weight,
+        cos_sin,
+        eps=eps,
+        q_eps=q_eps,
+        kv_eps=kv_eps,
+        name=name,
+    )
+
+
+def _qkv_norm_rope_body(
+    qr_kv_ref: jax.Ref,
+    q_w_ref: jax.Ref,
+    kv_w_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    out_ref: jax.Ref,
+    *,
+    q_dim: int,
+    q_eps: float,
+    kv_eps: float,
+    out_dtype: jnp.dtype,
+) -> None:
+    """Fused q_norm + kv_norm + RoPE outputting concatenated [tile_n, q_dim + kv_dim] in bfloat16."""
+    qr_kv = qr_kv_ref[...]
+    q_x = qr_kv[:, :q_dim].astype(jnp.float32)
+    kv_x = qr_kv[:, q_dim:].astype(jnp.float32)
+
+    q_rms = jax.lax.rsqrt(jnp.mean(q_x * q_x, axis=-1, keepdims=True) + q_eps)
+    qr_normed = (q_x * q_rms).astype(out_dtype) * q_w_ref[...]
+
+    kv_rms = jax.lax.rsqrt(jnp.mean(kv_x * kv_x, axis=-1, keepdims=True) + kv_eps)
+    kv_normed = (kv_x * kv_rms).astype(out_dtype) * kv_w_ref[...]
+    tail = kv_normed[:, -LANE:].astype(jnp.float32)
+    cs = cos_sin_ref[...]
+    cos = cs[:, :LANE]
+    sin = cs[:, LANE:]
+    roped = (tail * cos + _rotate_gptj(tail) * sin).astype(out_dtype)
+    kv_out = jnp.concatenate([kv_normed[:, :-LANE], roped], axis=-1)
+    out_ref[...] = jnp.concatenate([qr_normed, kv_out], axis=-1)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("eps", "q_eps", "kv_eps", "name"),
+)
+def qkv_norm_rope_cos_sin(
+    qr_kv: jax.Array,  # [num_tokens, q_dim + kv_dim]
+    q_weight: jax.Array,  # [q_dim]
+    kv_weight: jax.Array,  # [kv_dim]
+    cos_sin: jax.Array,  # [num_tokens, 2 * LANE] float32
+    *,
+    eps: float = 1e-6,
+    q_eps: float | None = None,
+    kv_eps: float | None = None,
+    name: str = "qkv_norm_rope",
+) -> jax.Array:
+    """Fused q_norm + kv_norm + RoPE consuming pre-gathered cos_sin."""
+    assert qr_kv.ndim == 2
+    num_tokens, total_dim = qr_kv.shape
+    q_dim = q_weight.shape[0]
+    kv_dim = kv_weight.shape[0]
+    assert total_dim == q_dim + kv_dim
+    assert q_dim % LANE == 0 and kv_dim % LANE == 0
+
+    pad_t = (SUBLANE - (num_tokens % SUBLANE)) % SUBLANE
+    if pad_t > 0:
+        qr_kv = jnp.pad(qr_kv, ((0, pad_t), (0, 0)))
+        cos_sin = jnp.pad(cos_sin, ((0, pad_t), (0, 0)))
+    t_pad = qr_kv.shape[0]
+    tile_n = _qkv_tile_n(t_pad)
+    q_w_2d = q_weight.astype(qr_kv.dtype).reshape(1, q_dim)
+    kv_w_2d = kv_weight.astype(qr_kv.dtype).reshape(1, kv_dim)
+    eff_q_eps = eps if q_eps is None else q_eps
+    eff_kv_eps = eps if kv_eps is None else kv_eps
+
+    out = pl.pallas_call(
+        functools.partial(
+            _qkv_norm_rope_body,
+            q_dim=q_dim,
+            q_eps=eff_q_eps,
+            kv_eps=eff_kv_eps,
+            out_dtype=qr_kv.dtype,
+        ),
+        out_shape=jax.ShapeDtypeStruct((t_pad, total_dim), qr_kv.dtype),
+        grid=(t_pad // tile_n,),
+        in_specs=[
+            pl.BlockSpec((tile_n, total_dim), lambda i: (i, 0)),
+            pl.BlockSpec((1, q_dim), lambda i: (0, 0)),
+            pl.BlockSpec((1, kv_dim), lambda i: (0, 0)),
+            pl.BlockSpec((tile_n, 2 * LANE), lambda i: (i, 0)),
+        ],
+        out_specs=pl.BlockSpec((tile_n, total_dim), lambda i: (i, 0)),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(qr_kv, q_w_2d, kv_w_2d, cos_sin)
+    return out[:num_tokens] if pad_t > 0 else out
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("eps", "q_eps", "kv_eps", "inverse", "name"),
+)
+def qkv_norm_rope(
+    qr_kv: jax.Array,  # [num_tokens, q_dim + kv_dim]
+    q_weight: jax.Array,  # [q_dim]
+    kv_weight: jax.Array,  # [kv_dim]
+    positions: jax.Array,  # [num_tokens] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    eps: float = 1e-6,
+    q_eps: float | None = None,
+    kv_eps: float | None = None,
+    inverse: bool = False,
+    name: str = "qkv_norm_rope",
+) -> jax.Array:
+    """Fused q_norm + kv_norm + RoPE outputting [num_tokens, q_dim + kv_dim] directly for tp_all_gather."""
+    cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
+    return qkv_norm_rope_cos_sin(
+        qr_kv,
+        q_weight,
+        kv_weight,
+        cos_sin,
+        eps=eps,
+        q_eps=q_eps,
+        kv_eps=kv_eps,
+        name=name,
+    )
+
+
+def _qkv_norm_rope_split_body(
+    qr_kv_ref: jax.Ref,
+    q_w_ref: jax.Ref,
+    kv_w_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    qr_out_ref: jax.Ref,
+    kv_out_ref: jax.Ref,
+    *,
+    q_dim: int,
+    q_eps: float,
+    kv_eps: float,
+    out_dtype: jnp.dtype,
+) -> None:
+    qr_kv = qr_kv_ref[...]
+    q_x = qr_kv[:, :q_dim].astype(jnp.float32)
+    kv_x = qr_kv[:, q_dim:].astype(jnp.float32)
+
+    q_rms = jax.lax.rsqrt(jnp.mean(q_x * q_x, axis=-1, keepdims=True) + q_eps)
+    qr_out_ref[...] = (q_x * q_rms).astype(out_dtype) * q_w_ref[...]
+
+    kv_rms = jax.lax.rsqrt(jnp.mean(kv_x * kv_x, axis=-1, keepdims=True) + kv_eps)
+    kv_normed = (kv_x * kv_rms).astype(out_dtype) * kv_w_ref[...]
+    tail = kv_normed[:, -LANE:].astype(jnp.float32)
+    cs = cos_sin_ref[...]
+    cos = cs[:, :LANE]
+    sin = cs[:, LANE:]
+    roped = (tail * cos + _rotate_gptj(tail) * sin).astype(out_dtype)
+    kv_out_ref[...] = jnp.concatenate([kv_normed[:, :-LANE], roped], axis=-1)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("eps", "q_eps", "kv_eps", "name"),
+)
+def qkv_norm_rope_split_cos_sin(
+    qr_kv: jax.Array,  # [num_tokens, q_dim + kv_dim]
+    q_weight: jax.Array,  # [q_dim]
+    kv_weight: jax.Array,  # [kv_dim]
+    cos_sin: jax.Array,  # [num_tokens, 2 * LANE] float32
+    *,
+    eps: float = 1e-6,
+    q_eps: float | None = None,
+    kv_eps: float | None = None,
+    name: str = "qkv_norm_rope_split",
+) -> tuple[jax.Array, jax.Array]:
+    """Fused q_norm + kv_norm + RoPE writing separate contiguous (qr, kv) outputs."""
+    assert qr_kv.ndim == 2
+    num_tokens, total_dim = qr_kv.shape
+    q_dim = q_weight.shape[0]
+    kv_dim = kv_weight.shape[0]
+    assert total_dim == q_dim + kv_dim
+    assert q_dim % LANE == 0 and kv_dim % LANE == 0
+
+    pad_t = (SUBLANE - (num_tokens % SUBLANE)) % SUBLANE
+    if pad_t > 0:
+        qr_kv = jnp.pad(qr_kv, ((0, pad_t), (0, 0)))
+        cos_sin = jnp.pad(cos_sin, ((0, pad_t), (0, 0)))
+    t_pad = qr_kv.shape[0]
+    tile_n = _qkv_tile_n(t_pad)
+    q_w_2d = q_weight.astype(qr_kv.dtype).reshape(1, q_dim)
+    kv_w_2d = kv_weight.astype(qr_kv.dtype).reshape(1, kv_dim)
+    eff_q_eps = eps if q_eps is None else q_eps
+    eff_kv_eps = eps if kv_eps is None else kv_eps
+
+    qr_out, kv_out = pl.pallas_call(
+        functools.partial(
+            _qkv_norm_rope_split_body,
+            q_dim=q_dim,
+            q_eps=eff_q_eps,
+            kv_eps=eff_kv_eps,
+            out_dtype=qr_kv.dtype,
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct((t_pad, q_dim), qr_kv.dtype),
+            jax.ShapeDtypeStruct((t_pad, kv_dim), qr_kv.dtype),
+        ),
+        grid=(t_pad // tile_n,),
+        in_specs=[
+            pl.BlockSpec((tile_n, total_dim), lambda i: (i, 0)),
+            pl.BlockSpec((1, q_dim), lambda i: (0, 0)),
+            pl.BlockSpec((1, kv_dim), lambda i: (0, 0)),
+            pl.BlockSpec((tile_n, 2 * LANE), lambda i: (i, 0)),
+        ],
+        out_specs=(
+            pl.BlockSpec((tile_n, q_dim), lambda i: (i, 0)),
+            pl.BlockSpec((tile_n, kv_dim), lambda i: (i, 0)),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(qr_kv, q_w_2d, kv_w_2d, cos_sin)
+    if pad_t > 0:
+        return qr_out[:num_tokens], kv_out[:num_tokens]
+    return qr_out, kv_out
+
+
+def _qkv_norm_rope_and_quant_body(
+    qr_kv_ref: jax.Ref,
+    q_w_ref: jax.Ref,
+    kv_w_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    qr_kv_out_ref: jax.Ref,
+    qr_fp8_ref: jax.Ref,
+    qr_s_ref: jax.Ref,
+    *,
+    q_dim: int,
+    q_eps: float,
+    kv_eps: float,
+    out_dtype: jnp.dtype,
+) -> None:
+    """Fused q_norm + kv_norm + RoPE outputting [tile_n, q_dim + kv_dim] bf16 AND (qr_fp8, qr_scale) for local indexer."""
+    qr_kv = qr_kv_ref[...]
+    q_x = qr_kv[:, :q_dim].astype(jnp.float32)
+    kv_x = qr_kv[:, q_dim:].astype(jnp.float32)
+
+    q_rms = jax.lax.rsqrt(jnp.mean(q_x * q_x, axis=-1, keepdims=True) + q_eps)
+    qr_normed = (q_x * q_rms).astype(out_dtype) * q_w_ref[...]
+    qr_f32 = qr_normed.astype(jnp.float32)
+    abs_max = jnp.max(jnp.abs(qr_f32), axis=-1, keepdims=True)
+    lhs_s = abs_max / FP8_E4M3_MAX
+    lhs_s_safe = jnp.where(lhs_s == 0.0, 1.0, lhs_s)
+    qr_fp8_ref[...] = jnp.clip(qr_f32 / lhs_s_safe, -FP8_E4M3_MAX, FP8_E4M3_MAX).astype(
+        jnp.float8_e4m3fn
+    )
+    qr_s_ref[...] = jnp.broadcast_to(lhs_s_safe, (qr_kv.shape[0], LANE))
+
+    kv_rms = jax.lax.rsqrt(jnp.mean(kv_x * kv_x, axis=-1, keepdims=True) + kv_eps)
+    kv_normed = (kv_x * kv_rms).astype(out_dtype) * kv_w_ref[...]
+    tail = kv_normed[:, -LANE:].astype(jnp.float32)
+    cs = cos_sin_ref[...]
+    cos = cs[:, :LANE]
+    sin = cs[:, LANE:]
+    roped = (tail * cos + _rotate_gptj(tail) * sin).astype(out_dtype)
+    kv_out = jnp.concatenate([kv_normed[:, :-LANE], roped], axis=-1)
+    qr_kv_out_ref[...] = jnp.concatenate([qr_normed, kv_out], axis=-1)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("eps", "q_eps", "kv_eps", "name"),
+)
+def qkv_norm_rope_and_quant_cos_sin(
+    qr_kv: jax.Array,  # [num_tokens, q_dim + kv_dim]
+    q_weight: jax.Array,  # [q_dim]
+    kv_weight: jax.Array,  # [kv_dim]
+    cos_sin: jax.Array,  # [num_tokens, 2 * LANE] float32
+    *,
+    eps: float = 1e-6,
+    q_eps: float | None = None,
+    kv_eps: float | None = None,
+    name: str = "qkv_norm_rope_and_quant",
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Fused q_norm + kv_norm + RoPE + local qr FP8 quant consuming pre-gathered cos_sin."""
+    assert qr_kv.ndim == 2
+    num_tokens, total_dim = qr_kv.shape
+    q_dim = q_weight.shape[0]
+    kv_dim = kv_weight.shape[0]
+    assert total_dim == q_dim + kv_dim
+    assert q_dim % LANE == 0 and kv_dim % LANE == 0
+
+    pad_t = (SUBLANE - (num_tokens % SUBLANE)) % SUBLANE
+    if pad_t > 0:
+        qr_kv = jnp.pad(qr_kv, ((0, pad_t), (0, 0)))
+        cos_sin = jnp.pad(cos_sin, ((0, pad_t), (0, 0)))
+    t_pad = qr_kv.shape[0]
+    tile_n = _qkv_tile_n(t_pad)
+    q_w_2d = q_weight.astype(qr_kv.dtype).reshape(1, q_dim)
+    kv_w_2d = kv_weight.astype(qr_kv.dtype).reshape(1, kv_dim)
+    eff_q_eps = eps if q_eps is None else q_eps
+    eff_kv_eps = eps if kv_eps is None else kv_eps
+
+    qr_kv_out, qr_fp8, qr_s_128 = pl.pallas_call(
+        functools.partial(
+            _qkv_norm_rope_and_quant_body,
+            q_dim=q_dim,
+            q_eps=eff_q_eps,
+            kv_eps=eff_kv_eps,
+            out_dtype=qr_kv.dtype,
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct((t_pad, total_dim), qr_kv.dtype),
+            jax.ShapeDtypeStruct((t_pad, q_dim), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((t_pad, LANE), jnp.float32),
+        ),
+        grid=(t_pad // tile_n,),
+        in_specs=[
+            pl.BlockSpec((tile_n, total_dim), lambda i: (i, 0)),
+            pl.BlockSpec((1, q_dim), lambda i: (0, 0)),
+            pl.BlockSpec((1, kv_dim), lambda i: (0, 0)),
+            pl.BlockSpec((tile_n, 2 * LANE), lambda i: (i, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((tile_n, total_dim), lambda i: (i, 0)),
+            pl.BlockSpec((tile_n, q_dim), lambda i: (i, 0)),
+            pl.BlockSpec((tile_n, LANE), lambda i: (i, 0)),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(qr_kv, q_w_2d, kv_w_2d, cos_sin)
+    if pad_t > 0:
+        return (
+            qr_kv_out[:num_tokens],
+            qr_fp8[:num_tokens],
+            qr_s_128[:num_tokens],
+        )
+    return qr_kv_out, qr_fp8, qr_s_128
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("eps", "q_eps", "kv_eps", "inverse", "name"),
+)
+def qkv_norm_rope_and_quant(
+    qr_kv: jax.Array,  # [num_tokens, q_dim + kv_dim]
+    q_weight: jax.Array,  # [q_dim]
+    kv_weight: jax.Array,  # [kv_dim]
+    positions: jax.Array,  # [num_tokens] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    eps: float = 1e-6,
+    q_eps: float | None = None,
+    kv_eps: float | None = None,
+    inverse: bool = False,
+    name: str = "qkv_norm_rope_and_quant",
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Fused q_norm + kv_norm + RoPE + local qr FP8 quant in a single Pallas kernel."""
+    cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
+    return qkv_norm_rope_and_quant_cos_sin(
+        qr_kv,
+        q_weight,
+        kv_weight,
+        cos_sin,
+        eps=eps,
+        q_eps=q_eps,
+        kv_eps=kv_eps,
+        name=name,
     )

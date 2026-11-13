@@ -1,3 +1,4 @@
+import vllm_torchtpu.envs as envs
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -620,13 +621,25 @@ class DeepseekV4Model(nn.Module):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """Generate MoE expert parameter mappings for weight loading."""
-        return fused_moe_make_expert_params_mapping(
+        mapping = fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
             num_experts=self.config.n_routed_experts,
         )
+        if getattr(envs, "VLLM_DSV41_MODULO_EXPERT_BALANCE", False):
+            from vllm.distributed import get_ep_group
+
+            ep_size = get_ep_group().world_size
+            num_experts = self.config.n_routed_experts
+            if ep_size > 1 and num_experts % ep_size == 0:
+                g_local = num_experts // ep_size
+                return [
+                    (pname, wname, (eid % ep_size) * g_local + (eid // ep_size), sid)
+                    for pname, wname, eid, sid in mapping
+                ]
+        return mapping
 
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:

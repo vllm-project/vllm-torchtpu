@@ -57,6 +57,11 @@ BITS_NEG_INF = int(np.array(-np.inf, np.float32).view(np.int32))
 KEY_NEG_INF = int(np.int32(BITS_NEG_INF) ^ np.int32(0x7FFFFFFF))
 
 
+def _get_sc_subcores() -> int:
+    sc = pltpu.get_tpu_info().sparse_core
+    return 32 if sc is None else sc.num_cores * sc.num_subcores
+
+
 def _cdiv(a, b):
     return (a + b - 1) // b
 
@@ -96,8 +101,9 @@ def _topk_body(
     local_idxs_hbm: Any = None,
 ):
     dcp_merge = local_idxs_hbm is not None
-    num_subcores = 16
-    num_sc_cores = 2
+    sc = pltpu.get_tpu_info().sparse_core
+    num_subcores = 16 if sc is None else sc.num_subcores
+    num_sc_cores = 2 if sc is None else sc.num_cores
     core = lax.axis_index("core")
     sub = lax.axis_index("subcore")
     flat = core * num_subcores + sub
@@ -677,7 +683,7 @@ def _sc_topk_direct(
         if scores.dtype == jnp.int32
         else jax.lax.bitcast_convert_type(scores, jnp.int32)
     )
-    groups_per_chip = 32 // p
+    groups_per_chip = (sc.num_cores * sc.num_subcores) // p
     slice_len = _align_to(n // p, LANES)
     num_waves = _cdiv(b, groups_per_chip)
     padded_b = num_waves * groups_per_chip

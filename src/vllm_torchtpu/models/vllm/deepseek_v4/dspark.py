@@ -1,3 +1,8 @@
+
+try:
+    import jax
+except ImportError:
+    pass
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -81,19 +86,49 @@ def _rewrite_dspark_name(
     return mapped.removeprefix("model.")
 
 
+_DSPARK_INSERT_KV_OP_CACHE: dict[int, object] = {}
+
+
+def _get_dspark_swa_store_op(logical_page_size: int):
+    op = _DSPARK_INSERT_KV_OP_CACHE.get(logical_page_size)
+    if op is None:
+        import functools
+
+        from jax.sharding import PartitionSpec as P
+        from torch_tpu._internal import pallas
+        from vllm_torchtpu.kernels.deepseek_v41.tp_attention import (
+            swa_store_all_pallas,
+        )
+        from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+            deepseek_v4_attention_op as _dsv4_attn_op,
+        )
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            get_pallas_op_mesh,
+            get_vllm_model_wrapper_context,
+        )
+
+        mesh = get_vllm_model_wrapper_context().mesh
+        if mesh is None:
+            return None
+        b_ax = _dsv4_attn_op.BATCH_AXIS
+        op = pallas.jax_op(
+            f"pallas::dspark_swa_store_ps{logical_page_size}",
+            functools.partial(
+                swa_store_all_pallas, logical_page_size=logical_page_size
+            ),
+            mesh=get_pallas_op_mesh(),
+            donate_argnums=(0,),
+            input_partition_specs=(P(), P(), P(b_ax), P(b_ax), P(), P()),
+        )
+        op.register_fake(lambda sw_cache, *_: torch.empty_like(sw_cache))
+        _DSPARK_INSERT_KV_OP_CACHE[logical_page_size] = op
+    return op
+
+
 def _insert_context_kv(
     attn, kv: torch.Tensor, positions: torch.Tensor, metadata
 ) -> None:
-    """Insert the context KV of verified tokens into one draft layer's cache.
-
-    ``attn`` is one draft layer's attention module, ``kv`` that layer's
-    already-normalised latent K/V for the verified tokens, ``positions``
-    their absolute positions, and ``metadata`` this layer's sliding-window
-    attention metadata, built by the proposer from the target's verify batch.
-    The DSV4 Pallas attention op is the only KV-write path on this backend,
-    so the insert runs the op with a zero query and discards the attention
-    output.
-    """
+    """Insert the context KV of verified tokens into one draft layer's cache."""
     orig_sw_cache = attn._get_active_sw_cache()
     if orig_sw_cache is None:
         return
@@ -104,13 +139,33 @@ def _insert_context_kv(
     )
 
     kv = attn.kv_rope(kv, positions)
+    if orig_sw_cache.device.type == "tpu":
+        store_op = _get_dspark_swa_store_op(int(attn.swa_cache_layer.block_size))
+        if store_op is not None:
+            m_pad = (kv.shape[0] + 7) & ~7
+            kv_store = (
+                torch.cat((kv, torch.zeros((m_pad - kv.shape[0], *kv.shape[1:]), dtype=kv.dtype, device=kv.device)), dim=0)
+                if m_pad > kv.shape[0]
+                else kv
+            )
+            new_sw_cache = store_op(
+                orig_sw_cache,
+                kv_store,
+                metadata.seq_lens,
+                metadata.block_tables,
+                metadata.query_start_loc,
+                metadata.request_distribution,
+            )
+            if new_sw_cache is not None and new_sw_cache.numel() > 0:
+                orig_sw_cache.copy_(new_sw_cache)
+            return
+
     num_tokens = kv.shape[0]
     dummy_q = torch.zeros(
         (num_tokens, attn.mla_attn.n_local_heads, attn.mla_attn.head_dim),
         dtype=kv.dtype,
         device=kv.device,
     )
-    # only writes the SWA cache, and the clones keep the traced signature.
     operands = (
         dummy_q,
         kv,
@@ -127,10 +182,6 @@ def _insert_context_kv(
         metadata.request_distribution.clone(),
         attn.attn_sink,
     )
-    # TODO: this runs the full attention op to write the K/V rows into
-    # the SWA cache and throws the attention output away. Replace with
-    # a dedicated paged-cache insert kernel (like RPA's
-    # ragged_kv_cache_update) once one exists for the DSV4 SWA layout.
     _, new_sw_cache = attn.attn_op(*operands)
     if new_sw_cache is not None and new_sw_cache.numel() > 0:
         orig_sw_cache.copy_(new_sw_cache)
@@ -152,6 +203,9 @@ class DSparkDeepseekV4Model(nn.Module):
         # Aliased to the target's embedding by the proposer's sharing
         # utility after load (has_own_embed_tokens=False).
         self.embed_tokens: nn.Module | None = None
+
+        for _preload_lps in (16, 32, 64, 128):
+            _get_dspark_swa_store_op(_preload_lps)
 
         self.main_proj = ReplicatedLinear(
             config.hidden_size * len(self.target_layer_ids),
@@ -231,20 +285,111 @@ class DSparkDeepseekV4Model(nn.Module):
                 config.hidden_size + config.dspark_markov_rank,
                 prefix=maybe_prefix(prefix, "confidence_head"),
             )
+        self._fused_ctx_wkv_weight: torch.Tensor | None = None
+        self._main_proj_w: torch.Tensor | None = None
+        self._main_proj_s: torch.Tensor | None = None
+        self._main_proj_bf16_splits: tuple[torch.Tensor, ...] | None = None
 
     # Borrowed from the target: the lazily built MHC post op, the expert
     # mapping, and the per-layer loader.
     # The loader expects names already rewritten by ``_rewrite_dspark_name``.
     mhc_post_op = DeepseekV4Model.mhc_post_op
     get_expert_mapping = DeepseekV4Model.get_expert_mapping
-    load_weights = DeepseekV4Model.load_weights
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loaded = DeepseekV4Model.load_weights(self, weights)
+        self._init_fused_ctx_wkv_weight()
+        self._init_split_main_proj_weights()
+        return loaded
+
+    def _init_split_main_proj_weights(self) -> None:
+        from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        mp_w = getattr(self.main_proj, "weight", None)
+        mp_s = getattr(self.main_proj, "weight_scale", None)
+        n_chunks = len(self.target_layer_ids)
+        hidden = self.config.hidden_size
+        if mp_w is None or n_chunks != 3:
+            return
+        w_data = mp_w.data
+        if mp_s is not None:
+            if getattr(self.main_proj, KEEP_VLLM_LAYOUT_ATTR, False):
+                w_data = w_data.transpose(0, 1).contiguous()
+            self._main_proj_w = w_data
+            self._main_proj_s = mp_s.data.contiguous()
+            if w_data.device.type == "tpu":
+                synchronize_tensors([self._main_proj_w, self._main_proj_s], wait=True)
+        elif w_data.dtype in (torch.bfloat16, torch.float16, torch.float32):
+            if w_data.shape == (hidden, hidden * n_chunks):
+                splits = tuple(
+                    c.contiguous() for c in w_data.split(hidden, dim=1)
+                )
+                self._main_proj_bf16_splits = splits
+                if w_data.device.type == "tpu":
+                    synchronize_tensors(list(splits), wait=True)
+
+    def _init_fused_ctx_wkv_weight(self) -> None:
+        slices: list[torch.Tensor] = []
+        for layer in self.layers:
+            wqa_wkv = getattr(layer.attn, "fused_wqa_wkv", None)
+            w = getattr(wqa_wkv, "weight", None)
+            mla = layer.attn.mla_attn
+            expected_rows = (
+                mla.q_lora_rank + mla.kv_lora_rank + mla.qk_rope_head_dim
+            )
+            if (
+                w is None
+                or w.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+                or w.shape[0] != expected_rows
+            ):
+                self._fused_ctx_wkv_weight = None
+                return
+            slices.append(w[mla.q_lora_rank :])
+        if slices:
+            self._fused_ctx_wkv_weight = torch.cat(slices, dim=0).contiguous()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None
         return self.embed_tokens(input_ids)
 
-    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
+    def combine_hidden_states(
+        self,
+        aux_hidden_states: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+    ) -> torch.Tensor:
         """main_x = main_norm(main_proj(concat of target aux states))."""
+        hidden = self.config.hidden_size
+        mp_w = self._main_proj_w
+        mp_s = self._main_proj_s
+        if mp_w is not None and mp_s is not None:
+            from vllm_torchtpu.models.vllm.deepseek_v41.dspark import (
+                _dspark_zero_cat_qmm_op,
+            )
+
+            if _dspark_zero_cat_qmm_op is not None:
+                if isinstance(aux_hidden_states, (list, tuple)):
+                    h0, h1, h2 = aux_hidden_states
+                else:
+                    h0, h1, h2 = aux_hidden_states.split(hidden, dim=-1)
+                proj = _dspark_zero_cat_qmm_op(h0, h1, h2, mp_w, mp_s)
+                return self.main_norm(proj)
+
+        bf16_splits = self._main_proj_bf16_splits
+        if bf16_splits is not None:
+            w0, w1, w2 = bf16_splits
+            if isinstance(aux_hidden_states, (list, tuple)):
+                h0, h1, h2 = aux_hidden_states
+            else:
+                h0, h1, h2 = aux_hidden_states.split(hidden, dim=-1)
+            proj = (
+                torch.nn.functional.linear(h0, w0)
+                + torch.nn.functional.linear(h1, w1)
+                + torch.nn.functional.linear(h2, w2)
+            )
+            return self.main_norm(proj)
+
+        if isinstance(aux_hidden_states, (list, tuple)):
+            aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
         return self.main_norm(self.main_proj(aux_hidden_states))
 
     def get_draft_attn_causal(self) -> list[bool]:
@@ -270,7 +415,19 @@ class DSparkDeepseekV4Model(nn.Module):
         mirroring upstream; the paged insert goes through the TPU attention op.
         """
         main_x = self.combine_hidden_states(target_hidden_states)
-        for i, layer in enumerate(cast(Iterable[DeepseekV4DecoderLayer], self.layers)):
+        layers = cast(Iterable[DeepseekV4DecoderLayer], self.layers)
+        fused_wkv = self._fused_ctx_wkv_weight
+        if fused_wkv is not None:
+            kv_all = torch.nn.functional.linear(main_x, fused_wkv).view(
+                main_x.shape[0], len(self.layers), -1
+            )
+            for i, layer in enumerate(layers):
+                attn = layer.attn
+                kv = attn.kv_norm(kv_all[:, i])
+                _insert_context_kv(attn, kv, positions, metadata[i])
+            return main_x
+
+        for i, layer in enumerate(layers):
             attn = layer.attn
             qr_kv, _ = attn.fused_wqa_wkv(main_x)
             kv = qr_kv[..., attn.mla_attn.q_lora_rank :]
@@ -331,6 +488,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # Aliased to the target's lm_head by the proposer's sharing utility.
         self.lm_head: nn.Module | None = None
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self._markov_w2_shard: torch.Tensor | None = None
 
     # --- Hooks consumed by DFlashProposer / DSparkProposer -----------------
 
@@ -372,6 +530,76 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Full-vocab draft: base logits, no d2t scatter.
         return self.compute_logits(hidden_states)
+
+    def sample_draft_tokens(
+        self,
+        pred_hidden: torch.Tensor,
+        prev_init: torch.Tensor,
+        num_pred: int,
+    ) -> torch.Tensor:
+        """Shard-local K-step Markov greedy sampler avoiding [B*K, V] ICI all-gather."""
+        assert self.lm_head is not None
+        tp_size = getattr(self.lm_head, "tp_size", 1)
+        markov_w2 = self.model.markov_head.markov_w2
+        if (
+            tp_size <= 1
+            or getattr(self.logits_processor, "_gather_logits", None) is not None
+            and tp_size == 1
+        ):
+            prev = prev_init
+            bias = self.markov_bias(self.markov_embed(prev))
+            logits = self.compute_draft_logits(pred_hidden)
+            logits_3d = logits.view(prev_init.shape[0], num_pred, logits.shape[-1])
+            draft_tokens = []
+            for idx in range(num_pred):
+                if idx > 0:
+                    bias = self.markov_bias(self.markov_embed(prev))
+                step = self.map_draft_to_target(
+                    (logits_3d[:, idx] + bias).argmax(dim=-1)
+                )
+                draft_tokens.append(step)
+                prev = step
+            return torch.stack(draft_tokens, dim=1)
+
+        from vllm_torchtpu.distributed.tp_collectives import tp_all_gather
+
+        start_idx = int(self.lm_head.shard_indices.org_vocab_start_index)
+        end_idx = int(self.lm_head.shard_indices.org_vocab_end_index)
+        w2_shard = markov_w2.weight[start_idx:end_idx]
+
+        prev = prev_init
+        # Overlap step-0 local Markov bias ([B, r] @ [r, V_shard]) with local lm_head
+        bias_local = torch.nn.functional.linear(self.markov_embed(prev), w2_shard)
+        logits_local = self.logits_processor._get_logits(
+            self.model.norm(pred_hidden), self.lm_head, None, skip_gather=True
+        )
+        batch_size = prev_init.shape[0]
+        logits_local_3d = logits_local.view(batch_size, num_pred, -1)
+
+        draft_tokens = []
+        for idx in range(num_pred):
+            if idx > 0:
+                bias_local = torch.nn.functional.linear(
+                    self.markov_embed(prev), w2_shard
+                )
+            local_val, local_idx = (
+                logits_local_3d[:, idx] + bias_local
+            ).max(dim=-1)
+            global_idx = local_idx.to(torch.int32) + start_idx
+            packed = torch.stack(
+                [local_val.to(torch.float32).view(torch.int32), global_idx],
+                dim=-1,
+            )
+            gathered = tp_all_gather(packed, dim=0).view(tp_size, batch_size, 2)
+            all_vals = gathered[..., 0].view(torch.float32)
+            all_idxs = gathered[..., 1]
+            best_rank = all_vals.argmax(dim=0, keepdim=True)
+            step = self.map_draft_to_target(
+                all_idxs.gather(0, best_rank).squeeze(0).to(torch.int64)
+            )
+            draft_tokens.append(step)
+            prev = step
+        return torch.stack(draft_tokens, dim=1)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
