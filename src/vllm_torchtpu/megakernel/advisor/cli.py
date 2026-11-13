@@ -24,9 +24,11 @@ from typing import TYPE_CHECKING, get_args
 
 from vllm_torchtpu.megakernel.core import errors
 
+from .calibrate import CalibrateOptions, calibrate_trace
 from .chips import ChipSpec, resolve_chip_spec
 from .constants import (
     DEFAULT_CHIP,
+    DEFAULT_PHASE,
     DEFAULT_PREFILL_ISL,
     INVALID_CONFIG_EXIT_CODE,
     MIN_VMEM_MIB,
@@ -510,12 +512,64 @@ def _run_sweep_command(
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run the fusion-scope advisor command-line interface."""
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-    _validate_cli_args(args)
+def build_calibrate_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for `advisor calibrate`."""
+    parser = argparse.ArgumentParser(
+        prog="python -m vllm_torchtpu.megakernel.advisor calibrate",
+        description="Calibrate TPU megakernel advisor priors from XPlane/Perfetto.",
+    )
+    parser.add_argument(
+        "--trace",
+        required=True,
+        help="Path to .xplane.pb, profile directory, or Perfetto .json/.json.gz",
+    )
+    parser.add_argument(
+        "--out",
+        required=True,
+        help="Destination path for advisor.measurements.v1 JSON",
+    )
+    parser.add_argument("--chip", default=DEFAULT_CHIP)
+    parser.add_argument("--model", default=None)
+    parser.add_argument(
+        "--phase",
+        choices=get_args(Phase),
+        default=DEFAULT_PHASE,
+    )
+    parser.add_argument("--batch", type=int, default=None)
+    parser.add_argument("--tp", type=int, default=None)
+    return parser
 
+
+def _validate_calibrate_args(args: argparse.Namespace) -> None:
+    """Validate explicit `advisor calibrate` CLI arguments before parsing traces."""
+    resolve_chip_spec(args.chip)
+    if args.model is not None:
+        resolve_model_profile(args.model)
+    if args.batch is not None and args.batch < 1:
+        msg = f"batch must be >= 1, got {args.batch}"
+        raise errors.MegakernelConfigError(msg)
+    if args.tp is not None and (args.tp < 1 or (args.tp & (args.tp - 1)) != 0):
+        msg = f"tp must be a power of 2 >= 1, got {args.tp}"
+        raise errors.MegakernelConfigError(msg)
+
+
+def _run_calibrate_cli(argv: Sequence[str]) -> int:
+    """Parse arguments and execute the `calibrate` subcommand."""
+    args = build_calibrate_arg_parser().parse_args(list(argv))
+    _validate_calibrate_args(args)
+    opts = CalibrateOptions(
+        chip=args.chip,
+        model=args.model,
+        phase=args.phase,
+        batch=args.batch,
+        tp=args.tp,
+    )
+    calibrate_trace(args.trace, args.out, options=opts)
+    return 0
+
+
+def _run_main_command(args: argparse.Namespace) -> int:
+    """Execute the resolved non-calibrate advisor CLI action."""
     if args.config and not Path(args.config).is_file():
         msg = f"Missing config file: {args.config!r}"
         raise errors.MegakernelConfigError(msg)
@@ -565,3 +619,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     sys.stdout.write(out + "\n")
     return exit_code
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the fusion-scope advisor command-line interface."""
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if argv_list and argv_list[0] == "calibrate":
+        return _run_calibrate_cli(argv_list[1:])
+    parser = build_arg_parser()
+    args = parser.parse_args(argv_list)
+    _validate_cli_args(args)
+    return _run_main_command(args)
