@@ -161,6 +161,7 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         contracting `x_q.to(weight.dtype) @ weight` first and scaling the
         `[m, n_out]` result by `x_s`, avoiding materializing a full `[m, k]`
         float32/bfloat16 dequantized activation buffer."""
+        layer = cast("TpuLinear", layer)
         weight = layer.weight
         x_cast = x_q.to(weight.dtype)
         if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
