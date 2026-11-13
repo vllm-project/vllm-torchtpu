@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from typing import Any
 
 import jax.numpy as jnp
@@ -25,45 +24,13 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..collectives.hooks import ColumnSplit, HalfSplitHook
 from ..ops import F32
 from . import pool_alias
 from .vmem import StreamParams
 
 # lax.dot_general dimension_numbers for a standard [M, K] @ [K, N] -> [M, N] matmul.
 NN = (((1,), (0,)), ((), ()))
-
-
-@dataclass(frozen=True)
-class HalfSplitHook:
-    """`hook=` of `TwoRing.dmatmul` / `TwoRing.arp_mm`: `fn()` runs between the
-    two lane halves of a dense matmul's `K` tiles.
-
-    `K` tile `s` (for `s` in `tiles`) belongs to half 0 and tile `s + hpt` to
-    half 1. `first` (0 or 1, may be traced) is the half whose tiles are summed
-    before `fn()`; the other half's tiles are summed after it, so `fn()` may
-    still write that half's lanes of the matmul input.
-    """
-
-    tiles: tuple[int, ...]
-    hpt: int
-    first: Any
-    fn: Callable[[], None]
-
-
-@dataclass(frozen=True)
-class ColumnSplit:
-    """`split=` of `TwoRing.dmatmul`: the output columns in groups whose sums go
-    to hooks instead of `acc`.
-
-    `pre()` runs before the matmul. Group `i` covers the `(c0, width)` column
-    chunks `cols[i]` (`c0` may be traced); once its chunks are summed,
-    `hooks[i](vals)` receives their f32 sums in `cols[i]` order. The groups
-    must cover all `N` columns.
-    """
-
-    pre: Callable[[], None]
-    cols: tuple[Sequence[tuple[Any, int]], ...]
-    hooks: tuple[Callable[[list[Any]], None], ...]
 
 
 class TwoRing:
