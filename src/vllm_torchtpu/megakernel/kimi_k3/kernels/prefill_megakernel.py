@@ -2839,9 +2839,8 @@ def kda_prefill_tiled_body(
     # scratch
     hidden_bufs,  # (2, tile, hidden) double buffer, in hidden_ref's dtype
     out_bufs,  # (2, tile, 384) BF16 double buffer
-    gate_w_vmem,
     fb_w_vmem,
-    proj_w_vmem,
+    proj_w_vmem,  # (hidden, 1792) BF16: gate | update rate | q, k, v, output gate
     conv_w_vmem,
     alog_vmem,
     dt_vmem,
@@ -2899,10 +2898,20 @@ def kda_prefill_tiled_body(
             return segment_ref[index * count + s]
 
     # ---- load the layer weights (+ the carried state, unpacked) into VMEM once ----
+    # One projection for every tile input: the gate's columns fill the
+    # update rate's half-empty 256-column MXU pass, and both lead so that
+    # the decay can start first.
+    lead, qkvg = 2 * channels, 4 * width
     weight_copies = (
-        pltpu.make_async_copy(gate_w_ref, gate_w_vmem, weight_sems.at[0]),
+        pltpu.make_async_copy(
+            gate_w_ref, proj_w_vmem.at[:, pl.ds(0, channels)], weight_sems.at[0]),
         pltpu.make_async_copy(fb_w_ref, fb_w_vmem, weight_sems.at[1]),
-        pltpu.make_async_copy(proj_w_ref, proj_w_vmem, weight_sems.at[2]),
+        pltpu.make_async_copy(
+            proj_w_ref.at[:, pl.ds(0, qkvg)], proj_w_vmem.at[:, pl.ds(lead, qkvg)],
+            weight_sems.at[2]),
+        pltpu.make_async_copy(
+            proj_w_ref.at[:, pl.ds(qkvg, channels)], proj_w_vmem.at[:, pl.ds(channels, channels)],
+            weight_sems.at[17]),
         pltpu.make_async_copy(conv_w_ref, conv_w_vmem, weight_sems.at[3]),
         pltpu.make_async_copy(alog_ref, alog_vmem, weight_sems.at[4]),
         pltpu.make_async_copy(dt_ref, dt_vmem, weight_sems.at[5]),
@@ -3074,7 +3083,7 @@ def kda_prefill_tiled_body(
         @pl.when(real_count > 0)
         def compute_active_tile():
             # The weights are read here: a value live across the loop would be a
-            # VMEM copy (22.75 MiB for the projection).
+            # VMEM copy (24.5 MiB for the projection).
             conv_filter = conv_w_vmem[...].astype(jnp.float32)
             a_log = jnp.exp(alog_vmem[...])  # [3, 1] FP32
             dt_bias = dt_vmem[...]  # [3, 128] FP32
@@ -3084,22 +3093,21 @@ def kda_prefill_tiled_body(
             if input_norm is not None:
                 hidden_tile = hidden_tile.astype(jnp.bfloat16) * input_norm[1][...]
             # ---- projections ----
-            gate_features = _dot(hidden_tile, gate_w_vmem[...]).astype(
+            projected = _dot(hidden_tile, proj_w_vmem[...]).astype(
                 jnp.bfloat16
-            )  # [tile, 128]
+            )  # [tile, 1792]
             raw_gate = (
-                _dot(gate_features, fb_w_vmem[...])
+                _dot(projected[:, :channels], fb_w_vmem[...])
                 .astype(jnp.bfloat16)
                 .reshape(tile, head_count, channels)
             )  # [tile, 3, 128]
-            projected = _dot(hidden_tile, proj_w_vmem[...]).astype(
-                jnp.bfloat16
-            )  # [tile, 1664]
-            qkv = projected[:, : 3 * width].reshape(tile, 3, head_count, channels)
+            update_rate = projected[:, channels : channels + head_count]  # [tile, 3]
+            qkv = projected[:, lead : lead + 3 * width].reshape(
+                tile, 3, head_count, channels
+            )
             out_gate_sig = jax.nn.sigmoid(
-                projected[:, 3 * width : 4 * width].astype(jnp.float32)
+                projected[:, lead + 3 * width : lead + qkvg].astype(jnp.float32)
             ).astype(jnp.bfloat16)
-            update_rate = projected[:, 4 * width : 4 * width + head_count]  # [tile, 3]
             _phase_end(scope)
             scope = _phase_start("kda_conv")
             real_rows = jnp.arange(tile, dtype=jnp.int32) + t * tile < row_end
@@ -3256,9 +3264,8 @@ def kda_prefill_tiled_scratch_shapes(
         (pltpu.VMEM((2, tile, hidden_size), hidden_dtype),)
         + ((pltpu.VMEM((2, tile, width), jnp.bfloat16),) if store_out else ())
         + (
-            pltpu.VMEM(gate_w.shape, gate_w.dtype),
             pltpu.VMEM(fb_w.shape, fb_w.dtype),
-            pltpu.VMEM(proj_w.shape, proj_w.dtype),
+            pltpu.VMEM((hidden_size, gate_w.shape[1] + proj_w.shape[1]), proj_w.dtype),
             pltpu.VMEM(conv_w.shape, conv_w.dtype),
             pltpu.VMEM(alog.shape, alog.dtype),
             pltpu.VMEM(dt.shape, dt.dtype),
@@ -3268,7 +3275,7 @@ def kda_prefill_tiled_scratch_shapes(
             pltpu.SemaphoreType.DMA((2,)),
         )
         + ((pltpu.SemaphoreType.DMA((2,)),) if store_out else ())
-        + (pltpu.SemaphoreType.DMA((17,)),)
+        + (pltpu.SemaphoreType.DMA((18,)),)
     )
 
 

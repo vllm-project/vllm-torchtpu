@@ -4,6 +4,7 @@ norm in the KDA tiles, the chunked delta rule's sub-block factors and the
 ring schedule. The ring test needs 32 devices:
 XLA_FLAGS=--xla_force_host_platform_device_count=32."""
 
+import functools
 from collections import namedtuple
 
 import jax
@@ -17,6 +18,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel.kimi_k3.config import KernelConfig
+from vllm_torchtpu.megakernel.kimi_k3.kernels import helpers
 from vllm_torchtpu.megakernel.kimi_k3.kernels import prefill_megakernel as kernels
 
 pytestmark = pytest.mark.cpu_test
@@ -224,6 +226,81 @@ def test_kda_tiles_apply_the_input_norm_to_fp8_unit_rows(length):
     np.testing.assert_array_equal(got[length:], 0)
     rec_err = np.abs(np.asarray(fused[1]) - np.asarray(rec)).max()
     assert rec_err <= 0.1 * np.abs(np.asarray(rec)).max()
+
+
+def _kda_reference(rows, weights, state, length, tile=128, eps=1e-5):
+    """The KDA tiles in plain jnp: each tile's gate, projection and output
+    projection as separate dots, the conv carrying its 3-row history, the
+    chunked delta rule (``kernels.kda_chunk``, checked against the sequential
+    rule below), the output RMSNorm and gate."""
+    gate_w, fb_w, proj_w, conv_w, a_log, dt_bias, norm = weights
+    rec, hist = state
+    f32, bf16 = jnp.float32, jnp.bfloat16
+    out = []
+    for t in range(rows.shape[0] // tile):
+        real = min(max(length - t * tile, 0), tile)
+        if real == 0:
+            out.append(jnp.zeros((tile, 384), bf16))
+            continue
+        x = rows[t * tile : (t + 1) * tile]
+        features = kernels._dot(x, gate_w).astype(bf16)
+        gate = kernels._dot(features, fb_w).astype(bf16).reshape(tile, 3, 128)
+        projected = kernels._dot(x, proj_w).astype(bf16)
+        qkv = projected[:, :1152].reshape(tile, 3, 3, 128)
+        out_gate = jax.nn.sigmoid(projected[:, 1152:1536].astype(f32)).astype(bf16)
+        rate = projected[:, 1536:1539]
+        live = jnp.arange(tile) < real
+        gate = jnp.where(live[:, None, None], gate, -1e30)
+        rate = jnp.where(live[:, None], rate, -1e30)
+        window = jnp.concatenate((hist, qkv))
+        conv = jnp.zeros((tile, 3, 3, 128), f32)
+        for tap in range(4):
+            conv = conv + window[tap : tap + tile].astype(f32) * conv_w[tap]
+        filtered = jnp.where(
+            live[:, None, None, None], jax.nn.silu(conv).astype(bf16), 0
+        )
+        q, k = helpers.kda_normalize_query_key(
+            filtered[:, 0].astype(f32), filtered[:, 1].astype(f32), 128
+        )
+        v = filtered[:, 2].astype(f32)
+        decay = helpers.kda_decay(-5.0, jnp.exp(a_log)[None], gate, dt_bias[None])
+        beta = jax.nn.sigmoid(rate.astype(f32))
+        for c in range(0, tile, 64):
+            s = slice(c, c + 64)
+            o, rec = kernels.kda_chunk(
+                q[s].transpose(1, 0, 2),
+                k[s].transpose(1, 0, 2),
+                v[s].transpose(1, 0, 2),
+                decay[s].transpose(1, 0, 2),
+                beta[s].T,
+                rec,
+            )
+            o = o.astype(bf16).astype(f32)
+            o = o * jax.lax.rsqrt(jnp.mean(o * o, axis=-1, keepdims=True) + eps)
+            o = (o * norm[0]).astype(bf16).transpose(1, 0, 2).reshape(64, 384)
+            out.append(o * out_gate[s])
+        hist = window[real : real + 3]
+    return jnp.concatenate(out), rec, hist
+
+
+@pytest.mark.parametrize("length", [384, 200, 128])
+def test_kda_tiles_match_the_reference(length):
+    rng = np.random.default_rng(length)
+    tokens, hidden = 384, 1024
+    rows = jnp.asarray(rng.standard_normal((tokens, hidden)), jnp.bfloat16)
+    weights = _kda_weights(rng, hidden)
+    state = (
+        jnp.asarray(0.05 * rng.standard_normal((3, 128, 128)), jnp.float32),
+        jnp.asarray(0.5 * rng.standard_normal((3, 3, 3, 128)), jnp.bfloat16),
+    )
+    tiled = kernels.make_kda_tiled(seq_len=tokens, interpret=_interpret())
+    got = tiled(rows, *weights, *state, jnp.asarray([length], jnp.int32))
+    # Compiled like the interpreted kernel: eager ops round differently.
+    want = jax.jit(functools.partial(_kda_reference, length=length))(
+        rows, weights, state
+    )
+    for g, w in zip(got, want, strict=True):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
 
 
 def _scope_names(jaxpr):
