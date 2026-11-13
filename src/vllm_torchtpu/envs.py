@@ -708,10 +708,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax-M3 target-model MXFP8 linears run on e4m3 weights with a
     # per-channel power-of-two scale (models/minimax_m3/quant.py); 0 restores
     # the exact bf16 dequantization.
-    "TPU_MINIMAX_M3_FP8_LINEARS": lambda: os.getenv(
-        "TPU_MINIMAX_M3_FP8_LINEARS", "1"
-    ).lower()
-    not in ("0", "false"),
+    "TPU_MINIMAX_M3_FP8_LINEARS": env_bool("TPU_MINIMAX_M3_FP8_LINEARS", default=True),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after

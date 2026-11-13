@@ -193,9 +193,11 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         if weight.device.type == "tpu":
             synchronize_tensors([layer.weight, layer.weight_scale])
         logger.info_once(
-            "MXFP8 linears run on e4m3 weights with per-channel power-of-two "
-            "scales (first: %s, %d of %d elements below e4m3's normal range "
-            "after the block shift).",
+            "MXFP8 linears run on e4m3 weights with per-channel power-of-two scales."
+        )
+        logger.debug(
+            "MXFP8 linear %s kept e4m3: %d of %d elements below e4m3's normal "
+            "range after the block shift.",
             str(tuple(weight.shape)),
             changed,
             weight.numel(),
