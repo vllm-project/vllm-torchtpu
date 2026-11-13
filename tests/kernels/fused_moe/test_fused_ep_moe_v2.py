@@ -744,6 +744,73 @@ def test_slab_run_copy_and_sort_lookup_are_bit_exact(monkeypatch, shape):
     np.testing.assert_array_equal(outs[True], outs[False])
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(dict(SMALL), id="small"),
+        pytest.param(dict(PROD, tokens=PROD_TOKENS[0]), id="prod_t2048"),
+        pytest.param(dict(PROD, tokens=PROD_TOKENS[1]), id="prod_t16384"),
+    ],
+)
+def test_256_row_tiles_track_the_128_row_build(shape):
+    """A taller tile changes how rows are grouped, not what each row computes.
+
+    The adapter slabs prefill-sized steps in 256-row tiles. Every row's two
+    matmuls, its scales and its wire quantization are its own, so the layer
+    has to stay inside the fp8 bands of the dense reference at both heights
+    and agree with the 128-row build far inside them. The lowered programs
+    are checked to carry each height's kernel, so the comparison is real.
+    """
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        80,
+        hidden=shape["hidden"],
+        inter=shape["inter"],
+        e_total=shape["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        81,
+        tokens=shape["tokens"],
+        hidden=shape["hidden"],
+        e_total=shape["e_total"],
+    )
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    outs, names = {}, {}
+    for capacity in (128, 256):
+
+        def run(*a, capacity=capacity):
+            return fused_ep_moe_v2(
+                *a,
+                topk=shape["topk"],
+                renormalize=True,
+                mesh=mesh,
+                capacity=capacity,
+                weight_format=WeightFormat.FP8,
+                sharded_plan=True,
+            )
+
+        names[capacity] = set(
+            re.findall(
+                r"fused_ep_moe_v2[A-Za-z0-9_]*?_c(\d+)_nb\d+",
+                jax.jit(run).lower(*args).as_text(),
+            )
+        )
+        outs[capacity] = run(*args)
+    assert names == {128: {"128"}, 256: {"256"}}, names
+    want = _dense_reference(
+        mesh, x, w1, w2, w1_scale, w2_scale, gating, topk=shape["topk"]
+    )
+    for capacity, out in outs.items():
+        assert _relative_l2(out, want) < FP8_RELATIVE_BOUND, capacity
+        assert _worst_token_relative_l2(out, want) < FP8_TOKEN_BOUND, capacity
+    # Far inside the bands; equal outright where the matmuls accumulate in the
+    # same order at both heights.
+    assert _relative_l2(outs[256], outs[128]) < FP8_RELATIVE_BOUND / 10
+
+
 @pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
 def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
     wire_dtype,

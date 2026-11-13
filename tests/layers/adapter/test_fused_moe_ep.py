@@ -303,8 +303,9 @@ def test_qwen_4096_bucket_is_not_refused_by_smem():
 
 
 def test_fixed_smem_working_set_is_still_checked():
-    gather_bytes = token_gather_smem_bytes(bridge._TILE_M)
-    assert gather_bytes == 2048
+    # The taller prefill tile sets the gather windows' footprint.
+    gather_bytes = token_gather_smem_bytes(max(bridge._TILE_M, bridge._PREFILL_TILE_M))
+    assert gather_bytes == 3072
     needed = bridge._SMEM_OVERHEAD_BYTES + gather_bytes
     assert _prebuild(_layer(), smem_bytes=needed) == "op"
     assert _prebuild(_layer(), smem_bytes=needed - 1) is None
@@ -1208,3 +1209,22 @@ def test_fused_scale_buffers_are_fresh_bases_aliased_by_the_parameters():
         assert buf in dict(layer.named_buffers())
         assert isinstance(weight, torch.nn.Parameter) and not weight.requires_grad
         assert weight.shape == ref.shape and weight.data_ptr() == table.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "x_rows,groups,want",
+    [
+        # Qwen3.8 DP16 x TP2 + EP32: every TP pair holds its engine's tokens
+        # twice, so the layer's step is half the input rows.
+        (32 * 1024, tuple((2 * i, 2 * i + 1) for i in range(16)), 256),  # 16384
+        (32 * 512, tuple((2 * i, 2 * i + 1) for i in range(16)), 256),  # 8192
+        (32 * 256, tuple((2 * i, 2 * i + 1) for i in range(16)), 128),  # 4096
+        (32 * 93, tuple((2 * i, 2 * i + 1) for i in range(16)), 128),  # decode
+        # No replica groups: the input rows are the step.
+        (8192, None, 256),
+        (8184, None, 128),
+    ],
+)
+def test_prefill_steps_take_the_taller_tile(x_rows, groups, want):
+    """The tile height follows the layer's step size, counted after the split."""
+    assert bridge.tile_rows_for_step(x_rows, groups) == want

@@ -75,6 +75,17 @@ logger = init_logger(__name__)
 # rounds to. The kernel's routing tables are built against this value, so it
 # is not free to change here alone.
 _TILE_M = 128
+# Prefill-sized steps -- at least _PREFILL_TILE_MIN_TOKENS tokens after the
+# replica split, the step size the layer also builds its slab tables by run
+# copy at -- slab their rows in taller tiles. A tile pays fixed costs (the
+# token-row wait, the commits and pushes, the epilogue, its scales) and loads
+# each weight block into the matrix unit once; at prefill an expert holds
+# hundreds of rows (the busiest shard's hot experts ~800 at 16k tokens), so a
+# taller tile pays those half as often, on the shard every other waits for.
+# Decode stays at _TILE_M: an expert holds a few dozen rows there and the
+# step is bound by streaming the weights.
+_PREFILL_TILE_M = 256
+_PREFILL_TILE_MIN_TOKENS = 8192
 
 # SMEM used by the resident routing tables and Mosaic's scalar working set,
 # excluding the two fixed token-gather windows. Measured by subtracting the
@@ -165,6 +176,17 @@ def fused_moe_ep_supported(owner: Any) -> bool:
     return getattr(owner, FUSED_MOE_EP_OP_ATTR, None) is not None
 
 
+def tile_rows_for_step(x_rows, token_replica_groups):
+    """The kernel's tile height for a step whose MoE input has `x_rows` rows.
+
+    The step is counted as the layer counts it, after the token replica split:
+    a group of TP ranks holds the same tokens, each its share once.
+    """
+    width = len(token_replica_groups[0]) if token_replica_groups else 1
+    tokens = x_rows // width
+    return _PREFILL_TILE_M if tokens >= _PREFILL_TILE_MIN_TOKENS else _TILE_M
+
+
 def _build_op(
     mesh,
     topk: int,
@@ -235,7 +257,7 @@ def _build_op(
             topk=topk,
             renormalize=renormalize,
             mesh=mesh,
-            capacity=_TILE_M,
+            capacity=tile_rows_for_step(x.shape[0], token_replica_groups),
             block=None,
             ragged_stride=None,
             weight_format=WeightFormat(weight_format),
@@ -833,7 +855,7 @@ def prebuild_fused_moe_ep(
         ep_sorted_gather_group() if envs.MOE_FUSED_EP_SORTED_GATHER else None
     )
 
-    gather_bytes = token_gather_smem_bytes(_TILE_M)
+    gather_bytes = token_gather_smem_bytes(max(_TILE_M, _PREFILL_TILE_M))
     needed_smem = _SMEM_OVERHEAD_BYTES + gather_bytes
     smem = _smem_capacity_bytes()
     if needed_smem > smem:
