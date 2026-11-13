@@ -16,18 +16,23 @@
 vLLM-Omni diffusion workers run in separate worker processes spawned by
 vLLM-Omni's DiffusionEngine rather than through TPUWorker's worker_init /
 model_load lifecycle stages, so OmniTpuPlatform applies the Omni patches
-itself: apply_omni_tpu_patches() when the platform is constructed, and
+itself: apply_omni_tpu_patches() when the platform is constructed,
+set_device() for worker runtime/RoPE/thread patches, and
 apply_omni_model_specific_patches() at attention backend selection
 (get_diffusion_attn_backend_cls). Tracked in #1862 for unification with
 patch_registry.py.
 """
 
+import contextlib
+import dataclasses
+from collections.abc import Iterator
 from functools import cache as run_once
 from typing import Any
 
 import torch
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -68,6 +73,16 @@ def apply_omni_tpu_patches() -> None:
 
     os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
     logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
+    _patch_flow_match_scheduler_step_flush()
+    _patch_group_norm_tpu()
+    _patch_vae_image_processor_pil_output()
+
+
+@run_once
+def apply_omni_worker_patches() -> None:
+    """Apply diffusion-worker runtime patches on ``OmniTpuPlatform.set_device``."""
+    _patch_diffusion_worker_runtime_threads()
+    _patch_rotary_embedding_tpu()
 
 
 @run_once
@@ -84,6 +99,8 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_z_image_transformer_block_flush()
+    _patch_z_image_prompt_encoder_tpu()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -645,3 +662,546 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_ZIMAGE_BLOCK_PATCHED = "_tpu_zimage_block_patched"
+_ZIMAGE_MODEL_PATCHED = "_tpu_zimage_model_patched"
+_ZIMAGE_PROMPT_ENCODER_PATCHED = "_tpu_zimage_prompt_encoder_patched"
+_VAE_PIL_OUTPUT_PATCHED = "_tpu_vae_pil_output_patched"
+_WORKER_THREADS_PATCHED = "_tpu_worker_threads_patched"
+
+
+def _pt_images_to_pil(images: torch.Tensor) -> list[Any]:
+    """diffusers' ``numpy_to_pil(pt_to_numpy(images))`` computed in torch."""
+    # pyrefly: ignore[missing-import]
+    from PIL import Image
+
+    u8 = images.detach().cpu().to(torch.float32, copy=True).mul_(255).round_()
+    u8 = u8.to(torch.uint8).permute(0, 2, 3, 1).contiguous().numpy()
+    if u8.shape[-1] == 1:
+        return [Image.fromarray(im.squeeze(-1), mode="L") for im in u8]
+    return [Image.fromarray(im) for im in u8]
+
+
+def _patch_vae_image_processor_pil_output() -> None:
+    # TODO: Remove once diffusers' pt_to_numpy / numpy_to_pil converts in
+    # contiguous torch/numpy rather than strided NHWC loops.
+    # pyrefly: ignore[missing-import]
+    from diffusers.image_processor import VaeImageProcessor
+
+    orig_postprocess = VaeImageProcessor.postprocess
+    if getattr(orig_postprocess, _VAE_PIL_OUTPUT_PATCHED, False):
+        return
+
+    def _postprocess(
+        self: Any,
+        image: Any,
+        output_type: str = "pil",
+        do_denormalize: Any = None,
+    ) -> Any:
+        if (
+            output_type != "pil"
+            or not isinstance(image, torch.Tensor)
+            or image.dim() != 4
+        ):
+            return orig_postprocess(
+                self, image, output_type=output_type, do_denormalize=do_denormalize
+            )
+        image = orig_postprocess(
+            self, image, output_type="pt", do_denormalize=do_denormalize
+        )
+        return _pt_images_to_pil(image)
+
+    setattr(_postprocess, _VAE_PIL_OUTPUT_PATCHED, True)
+    VaeImageProcessor.postprocess = _postprocess
+    logger.info("Applied TPU patch: torch-native PIL output in VaeImageProcessor.")
+
+
+_GROUP_NORM_PATCHED = "_tpu_group_norm_patched"
+_SCHEDULER_STEP_PATCHED = "_tpu_scheduler_step_patched"
+_ROTARY_EMBEDDING_PATCHED = "_tpu_rotary_embedding_patched"
+
+
+def _patch_rotary_embedding_tpu() -> None:
+    # TODO: Remove once vLLM-Omni's RotaryEmbedding.forward_native avoids
+    # minor-dim strided slices or torch_tpu fuses them without relayouts.
+    from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+
+    from vllm_torchtpu.omni.rope import tpu_apply_rotary
+
+    orig_forward_native = RotaryEmbedding.forward_native
+    if getattr(orig_forward_native, _ROTARY_EMBEDDING_PATCHED, False):
+        return
+
+    def _forward_native(
+        self: Any, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        if x.device.type != "tpu" or x.dtype != torch.bfloat16 or x.dim() < 3:
+            return orig_forward_native(self, x, cos, sin)
+        cos_h, sin_h = self._prepare_half_head_dim_cos_sin(cos, sin)
+        if (
+            cos_h.dim() != 2
+            or cos_h.shape[-1] * 2 != x.shape[-1]
+            or cos_h.shape != sin_h.shape
+        ):
+            return orig_forward_native(self, x, cos, sin)
+        return tpu_apply_rotary(
+            x, cos_h.to(x.dtype), sin_h.to(x.dtype), bool(self.interleaved)
+        )
+
+    setattr(_forward_native, _ROTARY_EMBEDDING_PATCHED, True)
+    RotaryEmbedding.forward_native = _forward_native
+    logger.info(
+        "Applied TPU patch: matmul-based rotate_half in RotaryEmbedding.forward_native."
+    )
+
+
+def _tpu_group_norm(
+    input: torch.Tensor,
+    num_groups: int,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    """GroupNorm reduced over ``[N, G, C/G, *spatial]`` in fp32."""
+    n, c = input.shape[0], input.shape[1]
+    if c % num_groups != 0:
+        raise ValueError(
+            f"Expected channels ({c}) to be divisible by num_groups ({num_groups})."
+        )
+    spatial = tuple(input.shape[2:])
+    x = input.reshape(n, num_groups, c // num_groups, *spatial).float()
+    reduce_dims = tuple(range(2, x.dim()))
+    mean = x.mean(reduce_dims, keepdim=True)
+    xc = x - mean
+    var = (xc * xc).mean(reduce_dims, keepdim=True)
+    y = (xc * torch.rsqrt(var + eps)).reshape(input.shape)
+    affine_shape = (1, c) + (1,) * len(spatial)
+    if weight is not None:
+        y = y * weight.reshape(affine_shape).float()
+    if bias is not None:
+        y = y + bias.reshape(affine_shape).float()
+    return y.to(input.dtype)
+
+
+def _patch_group_norm_tpu() -> None:
+    # TODO: Remove once torch_tpu's native_group_norm lowering keeps spatial dims
+    # separate instead of flattening each group into a serial XLA while-loop.
+    orig_group_norm = torch.nn.functional.group_norm
+    if getattr(orig_group_norm, _GROUP_NORM_PATCHED, False):
+        return
+
+    def _group_norm(
+        input: torch.Tensor,
+        num_groups: int,
+        weight: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+        eps: float = 1e-5,
+    ) -> torch.Tensor:
+        if input.device.type == "tpu" and input.dim() >= 2:
+            return _tpu_group_norm(input, num_groups, weight, bias, eps)
+        return orig_group_norm(input, num_groups, weight, bias, eps)
+
+    setattr(_group_norm, _GROUP_NORM_PATCHED, True)
+    torch.nn.functional.group_norm = _group_norm
+    logger.info("Applied TPU patch: fused-reduce torch.nn.functional.group_norm.")
+
+
+def _patch_flow_match_scheduler_step_flush() -> None:
+    # TODO: Remove once vLLM-Omni compiles the denoise loop on TPU and avoids
+    # the step-0 (timesteps == timestep).nonzero() D2H sync.
+    # pyrefly: ignore[missing-import]
+    from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+
+    orig_step = FlowMatchEulerDiscreteScheduler.step
+    if getattr(orig_step, _SCHEDULER_STEP_PATCHED, False):
+        return
+
+    def _resolve_first_step_index(self: Any, timestep: Any) -> None:
+        # Only fast-path full-schedule runs starting at step 0; mid-schedule
+        # callers (e.g. img2img with sliced timesteps) have len(timesteps) !=
+        # num_inference_steps or _begin_index set.
+        if self._step_index is not None or self._begin_index is not None:
+            return
+        if not (isinstance(timestep, torch.Tensor) and timestep.device.type == "tpu"):
+            return
+        timesteps = self.timesteps
+        if (
+            isinstance(timesteps, torch.Tensor)
+            and timesteps.numel() > 0
+            and len(timesteps) == self.num_inference_steps
+        ):
+            self._step_index = 0
+
+    def _step_and_flush(self: Any, *args: Any, **kwargs: Any) -> Any:
+        timestep = args[1] if len(args) > 1 else kwargs.get("timestep")
+        _resolve_first_step_index(self, timestep)
+        out = orig_step(self, *args, **kwargs)
+        sample = out[0] if isinstance(out, tuple) else out.prev_sample
+        if isinstance(sample, torch.Tensor) and sample.device.type == "tpu":
+            synchronize_tensors(sample, wait=False)
+        return out
+
+    setattr(_step_and_flush, _SCHEDULER_STEP_PATCHED, True)
+    FlowMatchEulerDiscreteScheduler.step = _step_and_flush
+    logger.info(
+        "Applied TPU patch: async per-step flush + step-0 index on "
+        "FlowMatchEulerDiscreteScheduler.step."
+    )
+
+
+def _patch_diffusion_worker_runtime_threads() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni passes local_world_size=num_gpus to
+    # set_multiprocessing_worker_envs and/or calls set_torch_threads_for_runtime()
+    # in DiffusionWorker after load_model.
+    #
+    # DiffusionMultiprocExecutor calls set_multiprocessing_worker_envs() with
+    # local_world_size=1, so every spawned worker starts with OMP_NUM_THREADS =
+    # all host CPUs. With N SP workers that causes N-fold OpenMP oversubscription
+    # on per-image CPU ops, stalling the slowest rank at the first collective.
+    # -------------------------------------------------------------------------
+    from vllm.utils.torch_utils import set_torch_threads_for_runtime
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    orig_load_model = DiffusionWorker.load_model
+    if getattr(orig_load_model, _WORKER_THREADS_PATCHED, False):
+        return
+
+    def _load_model_then_trim_threads(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = orig_load_model(self, *args, **kwargs)
+        set_torch_threads_for_runtime()
+        return result
+
+    setattr(_load_model_then_trim_threads, _WORKER_THREADS_PATCHED, True)
+    DiffusionWorker.load_model = _load_model_then_trim_threads
+    logger.info(
+        "Applied TPU patch: steady-state torch CPU threads "
+        "(set_torch_threads_for_runtime) after DiffusionWorker.load_model."
+    )
+
+
+# ZImageTransformer2DModel.__init__ numbers noise_refiner blocks starting at
+# 1000 + layer_id; flush before block 0 of both noise_refiner and main/context.
+_NOISE_REFINER_FIRST_LAYER_ID = 1000
+
+
+@contextlib.contextmanager
+def _tpu_compile_config() -> Iterator[None]:
+    """Scope AOTAutograd/Dynamo overrides to TPU diffusion compilations."""
+    # AOTAutograd's disk cache does not key on TPU world_size / mesh,
+    # so an sp=1 entry would be replayed on sp=8 with replica_count=1.
+    with (
+        torch._functorch.config.patch(enable_autograd_cache=False),
+        torch._dynamo.config.patch(recompile_limit=64, cache_size_limit=64),
+    ):
+        yield
+
+
+def _has_sp_plan_hooks(module: Any) -> bool:
+    registry = module.__dict__.get("_hook_registry")
+    if registry is None:
+        return False
+    return bool(registry._hooks)
+
+
+class _TpuCompiledZImageLayers:
+    """Runs all ``ZImageTransformer2DModel.layers`` blocks as one TPU graph."""
+
+    def __init__(self, layers: Any, orig_block_forward: Any) -> None:
+        self._layers = list(layers)
+        self._orig_block_forward = orig_block_forward
+        with _tpu_compile_config():
+            self._compiled = torch.compile(self._forward, backend="tpu", dynamic=False)
+
+    def _forward(
+        self,
+        unified: torch.Tensor,
+        unified_attn_mask: torch.Tensor,
+        unified_cos: torch.Tensor,
+        unified_sin: torch.Tensor,
+        adaln_input: torch.Tensor,
+    ) -> torch.Tensor:
+        for layer in self._layers:
+            unified = self._orig_block_forward(
+                layer,
+                unified,
+                unified_attn_mask,
+                unified_cos,
+                unified_sin,
+                adaln_input,
+            )
+        return unified
+
+    def __call__(
+        self,
+        unified: torch.Tensor,
+        unified_attn_mask: torch.Tensor,
+        unified_cos: torch.Tensor,
+        unified_sin: torch.Tensor,
+        adaln_input: torch.Tensor,
+        qk_norm_rope_table: Any = None,
+    ) -> torch.Tensor:
+        if qk_norm_rope_table is not None:
+            raise ValueError(
+                "TPU compiled ZImage layers do not support pre-packed CUDA "
+                "qk_norm_rope_table."
+            )
+        with _tpu_compile_config():
+            out = self._compiled(
+                unified, unified_attn_mask, unified_cos, unified_sin, adaln_input
+            )
+        synchronize_tensors(out, wait=False)
+        return out
+
+
+def _patch_z_image_transformer_block_flush() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni compiles ZImageTransformerBlock with
+    # backend="tpu" (dynamic=False) and restores ForwardContext.sp_plan_hooks_applied
+    # across per-step contexts.
+    #
+    # 1. Compiles ZImageTransformerBlock.forward with torch.compile(backend="tpu",
+    #    dynamic=False) and flushes asynchronously at block boundaries so each
+    #    block compiles to one static graph without mid-layer kSplitTraversal.
+    # 2. Sets auto_pad=True on ZImageTransformer2DModel._sp_plan["unified_prepare"]
+    #    to eliminate per-layer _all_gather_int host syncs in advanced_uaa mode
+    #    (safe once each block flushes its collectives).
+    # 3. Restores ForwardContext.sp_plan_hooks_applied = True in
+    #    ZImageTransformer2DModel.forward when unified_prepare has SP hooks.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.attention.parallel.ulysses import (
+        UlyssesParallelAttention,
+    )
+    from vllm_omni.diffusion.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+    from vllm_omni.diffusion.models.z_image.z_image_transformer import (
+        ZImageTransformer2DModel,
+        ZImageTransformerBlock,
+    )
+
+    sp_plan = ZImageTransformer2DModel._sp_plan
+    unified_prepare_plan = sp_plan.get("unified_prepare")
+    if isinstance(unified_prepare_plan, dict):
+        sp_plan["unified_prepare"] = {
+            idx: (
+                dataclasses.replace(sp_input, auto_pad=True)
+                if dataclasses.is_dataclass(sp_input) and not isinstance(sp_input, type)
+                else sp_input
+            )
+            for idx, sp_input in unified_prepare_plan.items()
+        }
+
+    orig_block_forward = ZImageTransformerBlock.forward
+    orig_model_forward = ZImageTransformer2DModel.forward
+    if not getattr(orig_model_forward, _ZIMAGE_MODEL_PATCHED, False):
+
+        def _model_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+            sp_active = _has_sp_plan_hooks(self.unified_prepare)
+            if sp_active and is_forward_context_available():
+                get_forward_context().sp_plan_hooks_applied = True
+            x_arg = args[0] if args else kwargs.get("x")
+            x_first: Any = (
+                x_arg[0] if isinstance(x_arg, (list, tuple)) and x_arg else None
+            )
+            on_tpu = isinstance(x_first, torch.Tensor) and x_first.device.type == "tpu"
+            if (
+                not sp_active
+                and on_tpu
+                and not getattr(orig_block_forward, _ZIMAGE_BLOCK_PATCHED, False)
+            ):
+                runner = self.__dict__.get("_tpu_compiled_layers_runner")
+                if runner is None:
+                    runner = _TpuCompiledZImageLayers(self.layers, orig_block_forward)
+                    self._tpu_compiled_layers_runner = runner
+                had_dict_layers = "layers" in self.__dict__
+                orig_dict_layers = self.__dict__.get("layers")
+                object.__setattr__(self, "layers", [runner])
+                try:
+                    return orig_model_forward(self, *args, **kwargs)
+                finally:
+                    if had_dict_layers:
+                        object.__setattr__(self, "layers", orig_dict_layers)
+                    else:
+                        object.__delattr__(self, "layers")
+            return orig_model_forward(self, *args, **kwargs)
+
+        setattr(_model_forward, _ZIMAGE_MODEL_PATCHED, True)
+        ZImageTransformer2DModel.forward = _model_forward
+
+    if getattr(orig_block_forward, _ZIMAGE_BLOCK_PATCHED, False):
+        return
+
+    compile_state: dict[str, Any] = {"fn": None}
+
+    def _compiled_forward() -> Any:
+        if compile_state["fn"] is None:
+            # Keep Ulysses all_to_all_single collectives outside torch.compile
+            # to avoid non-deterministic collective lowering on TPU, while still
+            # compiling the surrounding norms, QKV, RoPE, attention, and MLP.
+            # torch._dynamo.disable is a no-op outside torch.compile (harmless
+            # in eager mode across non-ZImage callers).
+            for method_name in ("pre_attention", "post_attention"):
+                fn = getattr(UlyssesParallelAttention, method_name)
+                if not getattr(fn, "_tpu_dynamo_disabled", False):
+                    wrapped = torch._dynamo.disable(fn)
+                    wrapped._tpu_dynamo_disabled = True
+                    setattr(UlyssesParallelAttention, method_name, wrapped)
+            with _tpu_compile_config():
+                compile_state["fn"] = torch.compile(
+                    orig_block_forward, backend="tpu", dynamic=False
+                )
+        return compile_state["fn"]
+
+    def _forward_and_flush(self: Any, *args: Any, **kwargs: Any) -> Any:
+        x = args[0] if args else kwargs.get("x")
+        on_tpu = (
+            x is not None and isinstance(x, torch.Tensor) and x.device.type == "tpu"
+        )
+        if on_tpu and self.layer_id in (0, _NOISE_REFINER_FIRST_LAYER_ID):
+            synchronize_tensors(x, wait=False)
+        if on_tpu:
+            with _tpu_compile_config():
+                out = _compiled_forward()(self, *args, **kwargs)
+        else:
+            out = orig_block_forward(self, *args, **kwargs)
+        if on_tpu and isinstance(out, torch.Tensor):
+            synchronize_tensors(out, wait=False)
+        return out
+
+    setattr(_forward_and_flush, _ZIMAGE_BLOCK_PATCHED, True)
+    ZImageTransformerBlock.forward = _forward_and_flush
+    logger.info(
+        "Applied TPU patch: async per-block graph flush and torch.compile "
+        "around ZImageTransformerBlock.forward."
+    )
+
+
+class _TpuCompiledPromptEncoder:
+    """``hidden_states[-2]`` of a HF decoder-only LM as one compiled TPU program."""
+
+    def __init__(self, text_encoder: Any) -> None:
+        decoder = text_encoder.get_decoder()
+        self._embed_tokens = decoder.embed_tokens
+        self._rotary_emb = decoder.rotary_emb
+        self._layers = list(decoder.layers)[:-1]
+        with _tpu_compile_config():
+            self._compiled = torch.compile(self._forward, backend="tpu", dynamic=False)
+
+    def _forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = self._embed_tokens(input_ids)
+        position_embeddings = self._rotary_emb(hidden, position_ids)
+        for layer in self._layers:
+            hidden = layer(
+                hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
+            if isinstance(hidden, tuple):
+                hidden = hidden[0]
+        return hidden
+
+    @staticmethod
+    def build_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+        """``[B, 1, S, S]`` bool mask: causal & key padding, diagonal kept."""
+        seq = attention_mask.shape[-1]
+        eye = torch.eye(seq, dtype=torch.bool, device=attention_mask.device)
+        causal = torch.ones_like(eye).tril()
+        return (causal & attention_mask.bool()[:, None, None, :]) | eye
+
+    def __call__(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        bsz, seq = input_ids.shape
+        device = input_ids.device
+        mask = self.build_mask(attention_mask).to(device)
+        position_ids = torch.arange(seq).unsqueeze(0).expand(bsz, seq).to(device)
+        with torch.no_grad(), _tpu_compile_config():
+            return self._compiled(input_ids, mask, position_ids)
+
+
+def _is_tpu_device(device: Any) -> bool:
+    return isinstance(device, torch.device) and device.type == "tpu"
+
+
+def _patch_z_image_prompt_encoder_tpu() -> None:
+    # TODO: Remove once vLLM-Omni compiles diffusion text encoders with
+    # backend="tpu" (dynamic=False) and drops the boolean-mask D2H gather.
+    from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
+
+    orig_encode_prompt = ZImagePipeline._encode_prompt
+    if getattr(orig_encode_prompt, _ZIMAGE_PROMPT_ENCODER_PATCHED, False):
+        return
+
+    def _get_encoder(pipe: Any) -> _TpuCompiledPromptEncoder:
+        encoder = pipe.__dict__.get("_tpu_prompt_encoder")
+        if encoder is None:
+            encoder = _TpuCompiledPromptEncoder(pipe.text_encoder)
+            pipe._tpu_prompt_encoder = encoder
+        return encoder
+
+    def _encode_prompt(
+        self: Any,
+        prompt: Any,
+        device: torch.device | None = None,
+        prompt_embeds: Any = None,
+        max_sequence_length: int = 512,
+    ) -> Any:
+        device = device or self._execution_device
+        if not (prompt_embeds is None and _is_tpu_device(device)):
+            return orig_encode_prompt(
+                self,
+                prompt,
+                device=device,
+                prompt_embeds=prompt_embeds,
+                max_sequence_length=max_sequence_length,
+            )
+
+        encoder = _get_encoder(self)
+        # Mirrors vllm-omni==0.32.0rc1
+        # (vllm_omni/diffusion/models/z_image/pipeline_z_image.py,
+        # ZImagePipeline._encode_prompt) chat-template formatting and
+        # tokenization, then runs the compiled decoder[:-1] graph and slices
+        # valid tokens using the host attention_mask to avoid device nonzero()
+        # syncs.
+        prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt_item}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            for prompt_item in prompts
+        ]
+        text_inputs = self.tokenizer(
+            prompts,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        attention_mask = text_inputs.attention_mask
+        hidden = encoder(text_inputs.input_ids.to(device), attention_mask)
+        embeddings_list = []
+        for i in range(hidden.shape[0]):
+            valid = attention_mask[i].nonzero().flatten()
+            start = int(valid[0]) if valid.numel() else 0
+            stop = int(valid[-1]) + 1 if valid.numel() else 0
+            if stop - start == valid.numel():
+                embeddings_list.append(hidden[i, start:stop])
+            else:
+                embeddings_list.append(hidden[i][attention_mask[i].bool()])
+        return embeddings_list
+
+    setattr(_encode_prompt, _ZIMAGE_PROMPT_ENCODER_PATCHED, True)
+    ZImagePipeline._encode_prompt = _encode_prompt
+    logger.info("Applied TPU patch: compiled Qwen3 prompt encoder for ZImagePipeline.")
