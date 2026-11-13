@@ -504,6 +504,7 @@ class TpuPlatform(Platform):
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
+        "TPU_FUSED_QK_NORM_ROPE",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

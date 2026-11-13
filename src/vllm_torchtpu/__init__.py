@@ -382,96 +382,279 @@ def _patch_expert_map_host_lookup() -> None:
     logger.info("Applied TPU patch: host-built expert map with host-side reads.")
 
 
-# The fused Q/K norm kernel holds all of its rows in VMEM, so larger steps
-# (prefill) keep vLLM's eager path.
-_FUSED_QK_NORM_ROPE_MAX_ROWS = 64
-
-
 def _patch_qwen3_next_fused_qk_norm_rope_gate() -> None:
-    """Run Qwen3-Next/Qwen3.5 attention's q/gate split, Q/K RMSNorm, RoPE and
-    gate copy as one Pallas call for steps of up to 64 rows.
+    """Run Qwen3-Next/Qwen3.5 attention's QKV+gate split, Q/K RMSNorm, and RoPE
+    through one ``pallas.jax_op`` per layer (row-tiled Pallas at or above
+    ``1 MiB`` of ``qkv``, inline XLA ops below ``1 MiB``).
 
     Opt-in with TPU_FUSED_QK_NORM_ROPE. vLLM's own fused kernel is CUDA/XPU
     only, so on TPU these run as separate eager ops. The fused path is used
-    for text-only models with output gating and NeoX RoPE.
+    for text-only models with output gating, 128-aligned head_dim, and NeoX RoPE.
     """
     if not envs.TPU_FUSED_QK_NORM_ROPE:
         return
+    import math
+    from typing import Any
+
+    import torch
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+    from vllm.model_executor.layers.rotary_embedding import (
+        LinearScalingRotaryEmbedding,
+        MRotaryEmbedding,
+        RotaryEmbedding,
+    )
     from vllm.model_executor.models import qwen3_next as _qn
 
     cls = _qn.Qwen3NextAttention
     if getattr(cls, "_tpu_fused_qk_norm_rope_patch", False):
         return
-    if not hasattr(cls, "_project_qkv_gate"):
-        logger.warning(
-            "TPU_FUSED_QK_NORM_ROPE is set but this vLLM's Qwen3NextAttention "
-            "has no _project_qkv_gate; the fused Q/K norm stays off."
-        )
-        return
     from vllm_torchtpu.layers.adapter import fused_qk_norm_rope_tpu as _fused
+    from vllm_torchtpu.layers.adapter.rotary_embedding import (
+        TPU_ROPE_CLASSES,
+        _uses_static_rotary_forward,
+    )
+
+    _tpu_static_rope_types = tuple(TPU_ROPE_CLASSES.values())
+
+    def _is_supported_rope_module(rotary_emb: Any) -> bool:
+        rope_cls = type(rotary_emb)
+        if isinstance(rotary_emb, _tpu_static_rope_types) or (
+            issubclass(rope_cls, RotaryEmbedding)
+            and _uses_static_rotary_forward(rope_cls)
+        ):
+            if isinstance(rotary_emb, LinearScalingRotaryEmbedding):
+                return len(rotary_emb.scaling_factors) <= 1
+            return True
+        if issubclass(rope_cls, MRotaryEmbedding):
+            for base in rope_cls.__mro__:
+                if "forward_native" in base.__dict__:
+                    return base is MRotaryEmbedding
+        return False
+
+    def _resolve_default_chip_info():
+        from jax._src import xla_bridge
+        from jax.experimental.pallas import tpu as pltpu
+
+        from vllm_torchtpu.tpu_info import get_chip_version
+
+        if (
+            envs.TPU_ACCELERATOR_TYPE is None
+            and xla_bridge.backends_are_initialized()
+            and pltpu.is_tpu_device()
+        ):
+            live_info = pltpu.get_tpu_info()
+            return (
+                int(live_info.vmem_capacity_bytes),
+                int(live_info.num_sublanes),
+                live_info.chip_version,
+            )
+        chip_ver = get_chip_version()
+        chip_info = pltpu.get_tpu_info_for_chip(chip_ver, 1)
+        return (
+            int(chip_info.vmem_capacity_bytes),
+            int(chip_info.num_sublanes),
+            chip_ver,
+        )
 
     original_init = cls.__init__
     original_project_qkv_gate = cls._project_qkv_gate
 
     def __init__(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
+        vllm_cfg = get_current_vllm_config_or_none()
+        self._tpu_compilation_config = (
+            vllm_cfg.compilation_config if vllm_cfg is not None else None
+        )
         model_config = kwargs.get("model_config", args[1] if len(args) > 1 else None)
-        mm_config = getattr(model_config, "multimodal_config", None)
-        text_only = mm_config is None or getattr(
-            mm_config, "language_model_only", False
-        )
-        self._tpu_fused_qk_norm_rope = bool(
-            getattr(self, "attn_output_gate", False)
-            and getattr(self.rotary_emb, "is_neox_style", False)
-            and getattr(self.rotary_emb, "cos_sin_cache", None) is not None
-            and text_only
-        )
-        if self._tpu_fused_qk_norm_rope:
-            _fused.prebuild(
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.rotary_emb.rotary_dim,
-                self.q_norm.variance_epsilon,
+        has_mrope = bool(getattr(self.rotary_emb, "mrope_section", None))
+        if model_config is None:
+            text_only = not has_mrope
+        else:
+            mm_config = model_config.multimodal_config
+            enable_mm_embeds = (
+                bool(mm_config.enable_mm_embeds) if mm_config is not None else False
             )
+            parent_mc = vllm_cfg.model_config if vllm_cfg is not None else None
+            target_mc = (
+                parent_mc
+                if model_config.runner_type == "draft" and parent_mc is not None
+                else model_config
+            )
+            text_only = not enable_mm_embeds and not bool(
+                target_mc.supports_multimodal_inputs
+            )
+        rope_supported = _is_supported_rope_module(self.rotary_emb)
+        rotary_dim = int(self.rotary_emb.rotary_dim) if rope_supported else 0
+        q_eps = self.q_norm.variance_epsilon
+        k_eps = self.k_norm.variance_epsilon
+        eps = float(q_eps)
+        norms_compatible = (
+            isinstance(self.q_norm, GemmaRMSNorm)
+            and isinstance(self.k_norm, GemmaRMSNorm)
+            and q_eps == k_eps
+        )
+        cos_sin = getattr(self.rotary_emb, "cos_sin_cache", None)
+        eligible_mode = bool(
+            self.attn_output_gate
+            and norms_compatible
+            and rope_supported
+            and self.rotary_emb.is_neox_style
+            and cos_sin is not None
+            and isinstance(cos_sin, torch.Tensor)
+            and cos_sin.ndim == 2
+            and cos_sin.shape[1] == rotary_dim
+            and text_only
+            and self.num_heads > 0
+            and self.num_kv_heads > 0
+            and 0 < rotary_dim <= self.head_dim
+            and rotary_dim % 2 == 0
+            and math.isfinite(eps)
+            and eps > 0
+        )
+        head_dim_aligned = self.head_dim > 0 and self.head_dim % 128 == 0
+        if eligible_mode and not head_dim_aligned:
+            logger.info_once(
+                "TPU_FUSED_QK_NORM_ROPE skipped for head_dim=%d "
+                "(requires a multiple of 128).",
+                self.head_dim,
+            )
+        elif not eligible_mode:
+            logger.info_once(
+                "TPU_FUSED_QK_NORM_ROPE skipped on ineligible Qwen3NextAttention "
+                "layer (text_only=%s, norms_compatible=%s, rope_supported=%s, "
+                "rotary_dim=%d).",
+                text_only,
+                norms_compatible,
+                rope_supported,
+                rotary_dim,
+            )
+        self._tpu_fused_qk_norm_rope = eligible_mode and head_dim_aligned
+        if self._tpu_fused_qk_norm_rope:
+            vmem_cap, num_sublanes, chip_ver = _resolve_default_chip_info()
+            self._tpu_chip_vmem_bytes = vmem_cap
+            self._tpu_chip_num_sublanes = num_sublanes
+            self._tpu_chip_version = chip_ver
+            cc = self._tpu_compilation_config
+            compile_sizes = (cc.compile_sizes or []) if cc is not None else []
+            int_sizes = [int(s) for s in compile_sizes if isinstance(s, int)]
+            if int_sizes:
+                init_itemsize = self.q_norm.weight.element_size()
+                unsupported_init = [
+                    s
+                    for s in int_sizes
+                    if not _fused.can_run_qk_norm_rope_gate(
+                        s,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        rotary_dim,
+                        dtype_itemsize=init_itemsize,
+                        vmem_capacity_bytes=vmem_cap,
+                        num_sublanes=num_sublanes,
+                        chip_version=chip_ver,
+                        min_pallas_qkv_bytes=_fused.MIN_PALLAS_QKV_BYTES,
+                    )
+                ]
+                if unsupported_init:
+                    logger.warning_once(
+                        "TPU_FUSED_QK_NORM_ROPE falling back to eager during "
+                        "torch.compile for unsupported compile_sizes=%s "
+                        "(head_dim=%d, num_heads=%d).",
+                        unsupported_init,
+                        self.head_dim,
+                        self.num_heads,
+                    )
+            if vllm_cfg is None or vllm_cfg.device_config.device_type == "tpu":
+                _fused.prebuild(
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    rotary_dim,
+                    eps,
+                    vmem_capacity_bytes=vmem_cap,
+                    num_sublanes=num_sublanes,
+                    chip_version=chip_ver,
+                )
 
     def _norm_weight_plus_one(norm):
-        # GemmaRMSNorm scales by (1 + w). Use the f32 buffer that
-        # TPU_NORM_WEIGHT_HOIST keeps on the module when it is installed, so
-        # the eager and fused traces read the same input; else compute it the
-        # way GemmaRMSNorm.forward_native does.
         hoisted = getattr(norm, "_tpu_weight_plus_one", None)
         return hoisted if hoisted is not None else norm.weight.float() + 1.0
 
     def _project_qkv_gate(self, qkv, positions):
-        if (
-            not getattr(self, "_tpu_fused_qk_norm_rope", False)
-            or qkv.shape[0] > _FUSED_QK_NORM_ROPE_MAX_ROWS
+        if not getattr(self, "_tpu_fused_qk_norm_rope", False):
+            return original_project_qkv_gate(self, qkv, positions)
+        vmem_cap = self._tpu_chip_vmem_bytes
+        num_sublanes = self._tpu_chip_num_sublanes
+        chip_ver = self._tpu_chip_version
+        rotary_dim = self.rotary_emb.rotary_dim
+        check_rows = True
+        if torch.compiler.is_compiling():
+            cc = self._tpu_compilation_config
+            compile_sizes = (cc.compile_sizes or []) if cc is not None else []
+            int_sizes = [int(s) for s in compile_sizes if isinstance(s, int)]
+            if int_sizes:
+                all_buckets_supported = all(
+                    _fused.can_run_qk_norm_rope_gate(
+                        s,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        rotary_dim,
+                        dtype_itemsize=qkv.element_size(),
+                        vmem_capacity_bytes=vmem_cap,
+                        num_sublanes=num_sublanes,
+                        chip_version=chip_ver,
+                        min_pallas_qkv_bytes=_fused.MIN_PALLAS_QKV_BYTES,
+                    )
+                    for s in int_sizes
+                )
+                if not all_buckets_supported:
+                    return original_project_qkv_gate(self, qkv, positions)
+                check_rows = False
+        q_weight_plus_one = _norm_weight_plus_one(self.q_norm)
+        k_weight_plus_one = _norm_weight_plus_one(self.k_norm)
+        if not isinstance(
+            getattr(self.rotary_emb, "cos_sin_cache", None), torch.Tensor
         ):
             return original_project_qkv_gate(self, qkv, positions)
-        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
-        q, k, gate = _fused.fused_qk_rmsnorm_rope_gate(
-            q_gate,
-            k,
-            _norm_weight_plus_one(self.q_norm),
-            _norm_weight_plus_one(self.k_norm),
-            self.rotary_emb.cos_sin_cache,
+        cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+        if not _fused.can_dispatch_fused_qk_norm_rope(
+            qkv,
+            positions,
+            cos_sin_cache,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            rotary_dim,
+            vmem_cap,
+            num_sublanes=num_sublanes,
+            chip_version=chip_ver,
+            check_rows=check_rows,
+        ):
+            return original_project_qkv_gate(self, qkv, positions)
+        return _fused.fused_qk_rmsnorm_rope_gate(
+            qkv,
+            q_weight_plus_one,
+            k_weight_plus_one,
+            cos_sin_cache,
             positions,
             self.q_norm.variance_epsilon,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
-            self.rotary_emb.rotary_dim,
+            rotary_dim,
+            vmem_capacity_bytes=vmem_cap,
+            num_sublanes=num_sublanes,
+            chip_version=chip_ver,
         )
-        return q, k, v, gate
 
     cls.__init__ = __init__
     cls._project_qkv_gate = _project_qkv_gate
     cls._tpu_fused_qk_norm_rope_patch = True
     logger.info(
-        "Applied TPU patch: fused Q/K RMSNorm + RoPE + gate for Qwen3-Next "
-        "attention steps of up to %d rows.",
-        _FUSED_QK_NORM_ROPE_MAX_ROWS,
+        "Applied TPU patch: row-tiled fused Q/K RMSNorm + RoPE + gate for "
+        "Qwen3-Next attention."
     )
 
 

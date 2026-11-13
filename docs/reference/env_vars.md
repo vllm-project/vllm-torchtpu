@@ -88,6 +88,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `TPU_FUSED_QK_NORM_ROPE` | `False` | Opt-in. Fuses Qwen3-Next and Qwen3.5 text-only full-attention QKV+gate split, per-head Q/K RMSNorm, and partial NeoX RoPE in one op per layer (row-tiled Pallas kernel at or above `1 MiB` of `qkv`; inline XLA ops below `1 MiB`). |
 
 ---
 

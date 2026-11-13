@@ -12,9 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from vllm_torchtpu.kernels.qk_norm_rope_gate.kernel import (
+    DEFAULT_MAX_TILE,
+    MIN_PALLAS_QKV_BYTES,
+    can_run_qk_norm_rope_gate,
+    legal_row_tile,
     qk_norm_rope_gate,
     qk_norm_rope_gate_rows,
     reference,
+    scoped_vmem_limit_bytes,
+    unfused_qk_norm_rope_gate_rows,
 )
 
-__all__ = ["qk_norm_rope_gate", "qk_norm_rope_gate_rows", "reference"]
+__all__ = [
+    "DEFAULT_MAX_TILE",
+    "MIN_PALLAS_QKV_BYTES",
+    "can_run_qk_norm_rope_gate",
+    "legal_row_tile",
+    "qk_norm_rope_gate",
+    "qk_norm_rope_gate_rows",
+    "reference",
+    "scoped_vmem_limit_bytes",
+    "unfused_qk_norm_rope_gate_rows",
+]
