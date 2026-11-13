@@ -47,7 +47,7 @@ import time
 from bisect import bisect_right
 from itertools import islice
 from operator import itemgetter
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -61,6 +61,9 @@ from vllm.v1.request import Request, RequestStatus
 from vllm_torchtpu.core import prefix_change_log, scheduler_options
 from vllm_torchtpu.core.hybrid_retention import format_counts, is_waiting_status
 from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
+
+if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 
 logger = init_logger("vllm." + __name__)
 
@@ -548,7 +551,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             self._memo_verified += 1
             return fresh
         cached = (epoch,) + cached[1:]
-        request._paw_hit_cache = cached
+        cast(Any, request)._paw_hit_cache = cached
         self._memo_hits += 1
         return cached
 
@@ -573,7 +576,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._memo_computes = getattr(self, "_memo_computes", 0) + 1
         cached = (epoch, max_len, result, warmth, probes, len(request.block_hashes))
         if epoch is not None:
-            request._paw_hit_cache = cached
+            cast(Any, request)._paw_hit_cache = cached
         return cached
 
     def _promote_warmest_on(self) -> bool:
@@ -1044,7 +1047,7 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
-    ) -> tuple[object, int, int, bool]:
+    ) -> tuple["KVCacheBlocks", int, int, bool]:
         connector = getattr(self, "connector", None)
         if connector is None or not connector.supports_divergent_local_hybrid_hits:
             kvm = self.kv_cache_manager
@@ -1079,7 +1082,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                         num_new_computed_tokens + num_uncached if num_uncached else 0
                     )
                     blocks = kvm.create_kv_cache_blocks(computed_blocks)
-                    request._tpu_local_hit_tokens = num_new_computed_tokens
+                    cast(Any, request)._tpu_local_hit_tokens = num_new_computed_tokens
                     return (
                         blocks,
                         num_new_computed_tokens,
@@ -1099,7 +1102,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                 request, num_local, num_reconciled, block_size
             )
             if target_local is None:
-                request._tpu_local_hit_tokens = num_reconciled
+                cast(Any, request)._tpu_local_hit_tokens = num_reconciled
                 return (
                     reconciled_blocks,
                     num_reconciled,
@@ -1107,7 +1110,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                     False,
                 )
             if target_local <= 0:
-                request._tpu_local_hit_tokens = 0
+                cast(Any, request)._tpu_local_hit_tokens = 0
                 return (
                     kvm.empty_kv_cache_blocks,
                     0,
@@ -1117,7 +1120,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             if target_local < num_local:
                 blocks = kvm.truncate_computed_blocks(blocks, target_local)
                 num_local = target_local
-        request._tpu_local_hit_tokens = num_local
+        cast(Any, request)._tpu_local_hit_tokens = num_local
         return blocks, num_local, shared_prefix_boundary, hit_diverged
 
     def _external_warmth(self, request: Request, local_warmth: int) -> int:
