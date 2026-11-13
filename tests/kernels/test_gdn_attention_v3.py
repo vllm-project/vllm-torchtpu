@@ -670,7 +670,7 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
 
 class GDNChunkedComputeTest(parameterized.TestCase):
     @parameterized.named_parameters(
-        dict(testcase_name="qwen3_8_paired", n_kq=2, n_v=16),
+        dict(testcase_name="even_v_per_kq_paired", n_kq=2, n_v=16),
         dict(testcase_name="odd_v_per_kq_unpaired", n_kq=2, n_v=6),
     )
     def test_chunked_gdn_per_seq_shared_kq_heads_matches_recurrent_ref(
@@ -717,7 +717,7 @@ class GDNChunkedComputeTest(parameterized.TestCase):
         np.testing.assert_allclose(state, ref_state[0], rtol=1e-5, atol=1e-5)
 
     def test_pack_unpack_v_head_pairs_roundtrip(self):
-        """Packing and unpacking Qwen 3.8 V-head pairs along lanes is exact."""
+        """Packing and unpacking 8-KQ / 64-V head pairs along lanes is exact."""
         n_kq, n_v, d_k, d_v = 8, 64, 128, 128
         v_per_kq = n_v // n_kq
         x = jax.random.normal(jax.random.key(53), (n_v, d_k, d_v))

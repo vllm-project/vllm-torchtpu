@@ -135,7 +135,7 @@ def _dot_kq_with_v_heads(
     axis, so that each matmul fills 2 * v_head_dim MXU columns.
     """
     v_per_kq_head = v_operand.shape[0] // kq_operand.shape[0]
-    pair_v_heads = v_per_kq_head % 2 == 0
+    pair_v_heads = v_per_kq_head % 2 == 0 and v_operand.shape[-1] % 128 == 0
     kq_repeats = v_per_kq_head // 2 if pair_v_heads else v_per_kq_head
     kq_operand = jnp.repeat(kq_operand, kq_repeats, axis=0)
     if pair_v_heads:
