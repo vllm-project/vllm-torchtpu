@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Component-wise TPU vs CPU tests for the Qwen3-Omni thinker audio encoder."""
+"""TPU vs. float32 CPU parity tests for the Qwen3-Omni Audio Encoder."""
 
 from __future__ import annotations
 
@@ -34,27 +34,35 @@ from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     maybe_patch_qwen3_omni_thinker,
 )
 
-pytestmark = [pytest.mark.omni]
+pytestmark = pytest.mark.omni
 
-# Production chunking geometry (num_mel_bins 128, n_window 50 -> 100-frame
-# windows, n_window_infer 800, three stride-2 convolutions) on a tiny encoder.
+# Qwen3-Omni-30B-A3B audio geometry with 2 transformer layers instead of 32 so
+# the fixture stays small and fast; every patched code path (conv stack,
+# positional slice, _flash_attention with padded cu_seqlens, output projection)
+# still runs.
 AUDIO_CONFIG = Qwen3OmniMoeAudioEncoderConfig(
-    d_model=256,
-    encoder_layers=1,
+    num_mel_bins=128,
+    d_model=128,
+    encoder_layers=2,
     encoder_attention_heads=4,
-    encoder_ffn_dim=512,
+    encoder_ffn_dim=256,
+    downsample_hidden_size=64,
     output_dim=128,
-    downsample_hidden_size=32,
+    n_window=50,
+    n_window_infer=400,
 )
 
-# 800 frames (8 s) is the exact 100-frame multiple the patch fixes; 801 takes
-# the partial-window branch across two attention segments.
-PARITY_LENGTHS = [800, 801]
+# 800 frames = 8 full 100-frame windows (1 attention segment); 801 takes the
+# partial-window branch across two attention segments; 3200 hits the exact
+# 32-window bucket boundary; 3201 (33 windows) exercises the 8-window aligned
+# fallback (40 windows) beyond _AUDIO_CHUNK_BUCKETS.
+PARITY_LENGTHS = [800, 801, 3200, 3201]
 
-# (max relative L2, max abs) vs float32 HF CPU reference (~2.5x measured on TPU v6e).
+# (max relative L2, max abs) vs float32 HF CPU reference (~2.5x measured on TPU
+# v6e across 800, 801, 3200, 3201 frames and multi-clip [800, 801] batches).
 ATTN_LIMITS = (1.0e-2, 3.0e-3)
 LAYER_LIMITS = (8.0e-3, 5.5e-2)
-END_TO_END_LIMITS = (1.5e-2, 3.5e-3)
+END_TO_END_LIMITS = (1.5e-2, 4.5e-3)
 
 
 def _make_mel_features(n_frames: int) -> torch.Tensor:
@@ -77,7 +85,15 @@ def encoders(
 
     cls = Qwen3OmniMoeAudioEncoder
     upstream_forward = cls.forward
-    orig_get_cnn_lengths = cls._get_cnn_output_lengths
+    own_attrs = {
+        name: cls.__dict__.get(name)
+        for name in (
+            "forward",
+            "prepare_encoder_metadata",
+            "forward_with_encoder_metadata",
+            "_tpu_orig_forward",
+        )
+    }
     assert not getattr(upstream_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
     try:
         assert (
@@ -95,8 +111,12 @@ def encoders(
         tpu = tpu.to(device="tpu", dtype=torch.bfloat16)
         yield tpu, ref, upstream_forward
     finally:
-        cls.forward = upstream_forward
-        cls._get_cnn_output_lengths = orig_get_cnn_lengths
+        for name, value in own_attrs.items():
+            if value is None:
+                if name in cls.__dict__:
+                    delattr(cls, name)
+            else:
+                setattr(cls, name, value)
 
 
 @pytest.mark.xfail(
@@ -186,6 +206,34 @@ def test_audio_encoder_matches_cpu_reference(encoders, n_frames: int) -> None:
         out,
         reference,
         name=f"audio encoder ({n_frames} frames)",
+        max_rel_l2=END_TO_END_LIMITS[0],
+        max_abs=END_TO_END_LIMITS[1],
+    )
+
+
+@torch.no_grad()
+def test_audio_encoder_multi_clip_batch_matches_cpu_reference(encoders) -> None:
+    """Verify multi-clip batching and 0.33.0rc1 metadata API parity against CPU."""
+    tpu, ref, _ = encoders
+    f_800 = _make_mel_features(800)
+    f_801 = _make_mel_features(801)
+    ref_800 = ref(f_800, torch.tensor([800], dtype=torch.long)).last_hidden_state
+    ref_801 = ref(f_801, torch.tensor([801], dtype=torch.long)).last_hidden_state
+    reference = torch.cat([ref_800, ref_801], dim=0)
+
+    feats_tpu = torch.cat([f_800, f_801], dim=-1).to(device="tpu", dtype=torch.bfloat16)
+    lens_tpu = torch.tensor([800, 801], dtype=torch.long, device="tpu")
+    aftercnn_tpu = _get_feat_extract_output_lengths(lens_tpu)
+
+    out_fwd = tpu(feats_tpu, lens_tpu, aftercnn_tpu)
+    metadata = tpu.prepare_encoder_metadata([800, 801])
+    out_meta = tpu.forward_with_encoder_metadata(feats_tpu, metadata)
+
+    assert torch.equal(out_fwd, out_meta)
+    assert_parity(
+        out_fwd,
+        reference,
+        name="audio encoder multi-clip [800, 801]",
         max_rel_l2=END_TO_END_LIMITS[0],
         max_abs=END_TO_END_LIMITS[1],
     )
