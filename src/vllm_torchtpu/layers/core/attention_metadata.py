@@ -256,30 +256,62 @@ def _staged_walk_products(
     if include_tables:
         for off, n, t in table_geom:
             outs.append(staged_dev[off : off + n * t].clone())
-    states = []
-    ckpts = []
+    states: list = [None] * len(mamba_geom)
+    ckpts: list = [None] * len(mamba_geom)
     prefill_ckpts = []
     if mamba_geom:
         active = seq_lens > 0
-        for ti, t, bs, prefill_ckpt_spec_blocks in mamba_geom:
-            off, n, _ = table_geom[ti]
-            tbl = staged_dev[off : off + n * t].view(n, t)
+        device = seq_lens.device
+        # Groups sharing (num_blocks, block_size) share every row offset, so
+        # each such class is one gather over the flat staged buffer instead
+        # of one small gather per group (~1.5 us each, ~70 per step).
+        classes: dict[tuple[int, int], list[int]] = {}
+        for j, (_, t, bs, _) in enumerate(mamba_geom):
+            classes.setdefault((t, bs), []).append(j)
+        for (t, bs), members in classes.items():
+            n = table_geom[mamba_geom[members[0]][0]][1]
+            # Flat offset of row r of member g: table offset + r * t.
+            bases = torch.tensor(
+                [table_geom[mamba_geom[j][0]][0] for j in members],
+                device=device,
+                dtype=torch.int64,
+            ).unsqueeze(1) + (
+                torch.arange(n, device=device, dtype=torch.int64) * t
+            ).unsqueeze(0)
             state_offsets = torch.clamp((seq_lens - 1) // bs, min=0, max=t - 1).to(
                 torch.int64
             )
-            gathered = torch.gather(tbl, 1, state_offsets.unsqueeze(1)).squeeze(1)
-            states.append(torch.where(active, gathered, torch.zeros_like(gathered)))
+            gathered = staged_dev[bases + state_offsets.unsqueeze(0)]
+            gathered = torch.where(
+                active.unsqueeze(0), gathered, torch.zeros_like(gathered)
+            )
+            ck: torch.Tensor | None = None
             if ckpt_window > 1:
                 ckpt_offsets = state_offsets.unsqueeze(1) + torch.arange(
-                    ckpt_window, device=seq_lens.device, dtype=torch.int64
+                    ckpt_window, device=device, dtype=torch.int64
                 ).unsqueeze(0)
                 in_row = (ckpt_offsets < t) & active.unsqueeze(1)
                 safe = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
-                ckpts.append(torch.gather(tbl, 1, safe) * in_row)
-            if (
-                prefill_ckpt_offsets is not None
-                and prefill_ckpt_spec_blocks is not None
-            ):
+                ck = staged_dev[bases.unsqueeze(2) + safe.unsqueeze(0)] * in_row
+            # Clone each slice: a sliced graph output is a view into the
+            # class's [G, ...] buffer, and the model programs compiled for a
+            # standalone [n] input reject the larger backing buffer
+            # (RuntimeProgramInputMismatch).
+            for k, j in enumerate(members):
+                states[j] = gathered[k].clone()
+                if ck is not None:
+                    ckpts[j] = ck[k].clone()
+        # Internal prefill checkpoints stay per group, in group order: only
+        # the few groups that declare them gather.
+        if prefill_ckpt_offsets is not None:
+            for ti, t, bs, prefill_ckpt_spec_blocks in mamba_geom:
+                if prefill_ckpt_spec_blocks is None:
+                    continue
+                off, n, _ = table_geom[ti]
+                tbl = staged_dev[off : off + n * t].view(n, t)
+                state_offsets = torch.clamp((seq_lens - 1) // bs, min=0, max=t - 1).to(
+                    torch.int64
+                )
                 prefill_ckpts.append(
                     _gather_prefill_ckpt_ids(
                         tbl,
@@ -288,6 +320,8 @@ def _staged_walk_products(
                         prefill_ckpt_spec_blocks,
                     )
                 )
+    if ckpt_window <= 1:
+        ckpts = []
     return tuple(outs) + tuple(states) + tuple(ckpts) + tuple(prefill_ckpts)
 
 
