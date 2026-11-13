@@ -29,6 +29,7 @@ import os
 import pickle
 import re
 import shutil
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -325,6 +326,26 @@ _RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
     "vllm_torchtpu/omni/rope.py",
 )
 
+# Model directories may hold copy-on-write specializations of the reference
+# kernels in their own `kernels/` directory (`models/<model>/kernels/`,
+# `models/vllm/<model>/kernels/`). They sit behind the same custom-op
+# boundaries as `vllm_torchtpu/kernels`, so they are hashed the same way. The
+# directories are discovered rather than listed, so a model that adds one is
+# covered without editing this file.
+_MODEL_KERNELS_ROOT = "vllm_torchtpu/models"
+_MODEL_KERNELS_DIRNAME = "kernels"
+_MODEL_PACKAGE_PREFIX = "vllm_torchtpu.models."
+
+
+def _model_kernel_dirs(repo_root: Path) -> list[Path]:
+    """Return every `kernels/` directory under the models package, sorted."""
+    models_root = repo_root / _MODEL_KERNELS_ROOT
+    if not models_root.is_dir():
+        return []
+    return sorted(
+        path for path in models_root.rglob(_MODEL_KERNELS_DIRNAME) if path.is_dir()
+    )
+
 
 def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
     """Return runtime source files that affect TPU custom-op lowering."""
@@ -341,6 +362,10 @@ def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
                 files_by_relpath[child_relpath] = child
             continue
         logger.warning("[TpuCompilerAdaptor] Cache key source path missing: %s", path)
+
+    for kernels_dir in _model_kernel_dirs(repo_root):
+        for child in sorted(kernels_dir.rglob("*.py")):
+            files_by_relpath[child.relative_to(repo_root).as_posix()] = child
 
     excluded_files = set(_RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
     excluded_dirs = tuple(
@@ -513,6 +538,33 @@ def _single_size(compile_range: Range) -> int | None:
     return compile_range.start if compile_range.is_single_size() else None
 
 
+def _reset_scheduling_group_ids() -> None:
+    """Restart every loaded kernel's scheduling-group counter at 1.
+
+    Besides the reference `streamindex_topk` config, a per-model copy of a
+    kernel under `vllm_torchtpu.models.<...>.kernels` keeps its own counter.
+    Only copies that are already imported are reset: a copy that was never
+    imported cannot be traced into the program about to be compiled, and
+    importing it here would load model code this process does not use.
+    """
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+    resets = [config.reset_scheduling_group_ids]
+    # Snapshot: another thread may import a module while this loop runs.
+    for name, module in sorted(list(sys.modules.items())):
+        if module is None or not name.startswith(_MODEL_PACKAGE_PREFIX):
+            continue
+        if _MODEL_KERNELS_DIRNAME not in name.split("."):
+            continue
+        # Read the module dict directly so a module-level __getattr__ (lazy
+        # imports) is never triggered.
+        reset = vars(module).get("reset_scheduling_group_ids")
+        if callable(reset) and reset not in resets:
+            resets.append(reset)
+    for reset in resets:
+        reset()
+
+
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 
@@ -588,9 +640,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # not depend on what this process compiled before: every rank then
         # builds the same key for a bucket and can hit an executable another
         # rank already put in the Tier-2 cache.
-        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
-
-        config.reset_scheduling_group_ids()
+        _reset_scheduling_group_ids()
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
