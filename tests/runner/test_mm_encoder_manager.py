@@ -383,7 +383,8 @@ def test_data_parallel_execute_gathers_between_synchronizations(
     """Ranks encode different image shares, so the all-gather runs on its own."""
     manager = coordinated_manager
     manager.use_dp = True
-    max_tokens = max(sum(counts[i] for i in assigned) for assigned in assignments)
+    largest = max(sum(counts[i] for i in assigned) for assigned in assignments)
+    max_tokens = next(b for b in manager.token_budgets if b >= largest)
     tp = SimpleNamespace(world_size=2, rank_in_group=rank, all_gather=Mock())
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp)
     monkeypatch.setattr(
@@ -419,6 +420,20 @@ def test_data_parallel_execute_gathers_between_synchronizations(
         assert (output == count).all()
     assert mm.synchronize_tensors.call_args == call(gathered, wait=True)
     tp.all_gather.assert_called_once()
+
+
+@pytest.mark.parametrize("use_dp", [True, False])
+def test_precompile_gathers_every_budget_under_data_parallelism(
+    coordinated_manager, monkeypatch, use_dp
+):
+    """A new all-gather size compiles on first use, so startup gathers each budget."""
+    manager = coordinated_manager
+    manager.use_dp = use_dp
+    tp = SimpleNamespace(all_gather=Mock(side_effect=lambda t, *, dim: t.repeat(2, 1)))
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp)
+    manager.precompile_vision_encoder()
+    sizes = [c.args[0].shape[0] for c in tp.all_gather.call_args_list]
+    assert sizes == (list(manager.token_budgets) if use_dp else [])
 
 
 @pytest.mark.parametrize("capture_axes", [(), ((1, 2),)])
