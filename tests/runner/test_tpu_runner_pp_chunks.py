@@ -334,6 +334,7 @@ def test_profile_pipeline_chunks_times_every_point_twice_and_keeps_faster():
 
     runner._dummy_run = dummy_run
     runner._attention_schedule_capacity = lambda: None
+    runner.pipeline_chunk_limits = lambda: TPUModelRunner.pipeline_chunk_limits(runner)
     report = TPUModelRunner.profile_pipeline_chunks(runner)
 
     points = [(t, p) for t, p, _ in report["samples"]]
@@ -369,6 +370,7 @@ def _profile_runner(paddings, max_tokens, capacity, pcp=1):
     runner._pp_chunk_granularity = max_tokens // 8
     runner._dummy_run = lambda *args, **kwargs: 1.0
     runner._attention_schedule_capacity = lambda: capacity
+    runner.pipeline_chunk_limits = lambda: TPUModelRunner.pipeline_chunk_limits(runner)
     return runner
 
 
@@ -409,6 +411,23 @@ def test_profile_refuses_a_step_one_request_cannot_run():
     runner = _profile_runner([16, 32768, 65536], 65536, capacity)
     with pytest.raises(RuntimeError, match="32896 .* holds 13436"):
         TPUModelRunner.profile_pipeline_chunks(runner)
+
+
+def test_chunk_limits_report_the_granule_and_capacity_without_timing():
+    capacity = {"decode": (3912, 1, 1792), "mixed": (13436, 256, 256)}
+    runner = _profile_runner([16, 8192, 16384, 32768], 32768, capacity, pcp=2)
+    runner._dummy_run = MagicMock()
+    report = TPUModelRunner.pipeline_chunk_limits(runner)
+    # A granule of 4096 rows on each of two ranks is 8192 tokens.
+    assert report == {"granularity": 8192, "schedule": (13436, 256, 256)}
+    runner._dummy_run.assert_not_called()
+
+
+def test_chunk_limits_refuse_a_step_one_request_cannot_run():
+    capacity = {"decode": (3912, 1, 1792), "mixed": (13436, 256, 256)}
+    runner = _profile_runner([16, 32768, 65536], 65536, capacity)
+    with pytest.raises(RuntimeError, match="32896 .* holds 13436"):
+        TPUModelRunner.pipeline_chunk_limits(runner)
 
 
 def _capacity_runner():

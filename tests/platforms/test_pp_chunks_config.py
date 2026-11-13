@@ -34,8 +34,9 @@ def _config(dp=1, cls=None, chunked=True):
     )
 
 
-def _env(monkeypatch, dynamic=True, dp_sched=False, slack=0.1):
-    monkeypatch.setattr(tpu_platform.envs, "TPU_PP_DYNAMIC_CHUNKS", dynamic)
+def _env(monkeypatch, lone_prompt=True, equal_cost=True, dp_sched=False, slack=0.1):
+    monkeypatch.setattr(tpu_platform.envs, "TPU_PP_LONE_PROMPT_CHUNKS", lone_prompt)
+    monkeypatch.setattr(tpu_platform.envs, "TPU_PP_EQUAL_COST_CHUNKS", equal_cost)
     monkeypatch.setattr(tpu_platform.envs, "DP_SCHED_ENABLED", dp_sched)
     monkeypatch.setattr(tpu_platform.envs, "TPU_PP_CHUNK_SLACK", slack)
 
@@ -48,8 +49,13 @@ def _configure(config):
     return hook
 
 
-def test_pipeline_gets_the_chunk_scheduler_and_the_engine_hook(monkeypatch):
-    _env(monkeypatch)
+@pytest.mark.parametrize(
+    "lone_prompt,equal_cost", [(True, True), (True, False), (False, True)]
+)
+def test_pipeline_gets_the_chunk_scheduler_and_the_engine_hook(
+    monkeypatch, lone_prompt, equal_cost
+):
+    _env(monkeypatch, lone_prompt=lone_prompt, equal_cost=equal_cost)
     config = _config()
     hook = _configure(config)
     assert config.scheduler_config.scheduler_cls == SCHEDULER_CLS
@@ -57,7 +63,7 @@ def test_pipeline_gets_the_chunk_scheduler_and_the_engine_hook(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "dynamic,dp_sched,dp,cls,chunked",
+    "both,dp_sched,dp,cls,chunked",
     [
         (False, False, 1, None, True),
         (True, True, 2, None, True),
@@ -66,9 +72,9 @@ def test_pipeline_gets_the_chunk_scheduler_and_the_engine_hook(monkeypatch):
     ],
 )
 def test_chunk_scheduler_is_off_when_gated(
-    monkeypatch, dynamic, dp_sched, dp, cls, chunked
+    monkeypatch, both, dp_sched, dp, cls, chunked
 ):
-    _env(monkeypatch, dynamic=dynamic, dp_sched=dp_sched)
+    _env(monkeypatch, lone_prompt=both, equal_cost=both, dp_sched=dp_sched)
     config = _config(dp=dp, cls=cls, chunked=chunked)
     hook = _configure(config)
     assert config.scheduler_config.scheduler_cls == cls
@@ -100,7 +106,15 @@ def test_negative_slack_fails_at_config_time(monkeypatch):
         _configure(_config())
 
 
+def test_slack_is_not_checked_without_equal_cost_chunks(monkeypatch):
+    _env(monkeypatch, equal_cost=False, slack=-0.5)
+    config = _config()
+    _configure(config)
+    assert config.scheduler_config.scheduler_cls == SCHEDULER_CLS
+
+
 def test_pipeline_knobs_do_not_change_the_compile_cache_key():
-    assert "TPU_PP_DYNAMIC_CHUNKS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+    assert "TPU_PP_LONE_PROMPT_CHUNKS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+    assert "TPU_PP_EQUAL_COST_CHUNKS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
     assert "TPU_PP_CHUNK_SLACK" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
-    assert "TPU_PP_LAZY_PUSH" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+    assert "TPU_PP_HANDOFF_DEPTH" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
