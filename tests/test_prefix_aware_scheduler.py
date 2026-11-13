@@ -208,3 +208,71 @@ def test_coordinator_failure_falls_back_to_fcfs():
     assert q is not None
     assert [r.request_id for r in q] == ["r1", "r2"]
     assert s._paw_scoring_broken is True
+
+
+def test_aged_request_outranks_warmer_ones():
+    now = time.time()
+    r_old_cold = _make_request("old", num_tokens=100_000, arrival_time=now - 120)
+    r_warm = _make_request("warm", num_tokens=1_000, arrival_time=now - 5)
+    r_older_cold = _make_request("older", num_tokens=100_000, arrival_time=now - 300)
+    s = _make_scheduler(
+        [r_warm, r_old_cold, r_older_cold], {"warm": 1_000, "old": 0, "older": 0}
+    )
+    s._paw_max_wait_s = 60.0
+
+    q = s._select_waiting_queue_for_scheduling()
+    assert q is not None
+    assert [r.request_id for r in q][0] == "older"  # oldest aged first
+    assert s._paw_aged == 1
+
+
+def test_aging_disabled_keeps_warmest_first():
+    now = time.time()
+    r_old_cold = _make_request("old", num_tokens=100_000, arrival_time=now - 600)
+    r_warm = _make_request("warm", num_tokens=1_000, arrival_time=now - 5)
+    s = _make_scheduler([r_old_cold, r_warm], {"warm": 1_000, "old": 0})
+    s._paw_max_wait_s = 0.0
+
+    q = s._select_waiting_queue_for_scheduling()
+    assert q is not None
+    assert [r.request_id for r in q] == ["warm", "old"]
+
+
+def test_preempted_still_outranks_aged():
+    now = time.time()
+    r_aged = _make_request("aged", num_tokens=1_000, arrival_time=now - 600)
+    r_pre = _make_request(
+        "pre", num_tokens=1_000, arrival_time=now - 1, num_preemptions=1
+    )
+    s = _make_scheduler([r_aged, r_pre], {"aged": 0, "pre": 0})
+    q = s._select_waiting_queue_for_scheduling()
+    assert q is not None
+    assert [r.request_id for r in q] == ["pre", "aged"]
+
+
+def test_max_wait_from_additional_config():
+    import pytest
+
+    from vllm_torchtpu.core.prefix_aware_scheduler import (
+        DEFAULT_PAW_MAX_WAIT_S,
+        _max_wait_from_config,
+    )
+
+    assert _max_wait_from_config(None) == DEFAULT_PAW_MAX_WAIT_S
+    cfg = SimpleNamespace(additional_config={})
+    assert _max_wait_from_config(cfg) == DEFAULT_PAW_MAX_WAIT_S
+    cfg = SimpleNamespace(additional_config={"paw_max_wait_s": 30})
+    assert _max_wait_from_config(cfg) == 30.0
+    cfg = SimpleNamespace(additional_config={"paw_max_wait_s": 0})
+    assert _max_wait_from_config(cfg) == 0.0
+    for bad in (-1, "x"):
+        with pytest.raises(ValueError):
+            _max_wait_from_config(
+                SimpleNamespace(additional_config={"paw_max_wait_s": bad})
+            )
+
+
+def test_max_wait_key_excluded_from_compile_hash():
+    from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+
+    assert "paw_max_wait_s" in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
