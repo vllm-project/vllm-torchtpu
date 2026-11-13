@@ -837,6 +837,57 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, ctx_preinit, 4)
         assert ctx_preinit.staged_block_tables is None
 
+    def test_staged_walk_class_gather_matches_per_group(self):
+        """Class-batched mamba gathers produce bit-identical results across multiple
+        distinct (num_blocks, block_size) geometries compared to eager execution."""
+        window = 3
+        runner = self._make_runner_mock(num_groups=4, max_num_blocks_per_req=6)
+        # Group 3 uses a distinct (num_blocks, block_size) class from groups 1 & 2.
+        runner.input_batch.block_table[3].max_num_blocks_per_req = 4
+        runner.input_batch.block_table[3].get_cpu_tensor.return_value = (
+            torch.arange(runner.max_num_reqs * 4, dtype=torch.int32).reshape(
+                runner.max_num_reqs, 4
+            )
+            + 300
+        )
+        runner._unified_kv_layout = True
+        runner._block_table_stage_cpu = None
+        attn = self._make_builder(runner, kv_cache_group_id=0)
+        mambas = [
+            self._make_mamba_builder(runner, kv_cache_group_id=1, block_size=16),
+            self._make_mamba_builder(runner, kv_cache_group_id=2, block_size=16),
+            self._make_mamba_builder(runner, kv_cache_group_id=3, block_size=32),
+        ]
+        self._make_attn_groups(runner, [attn] + mambas)
+
+        def walk(seq_lens, staged):
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=4,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+                mamba_ckpt_window=window,
+                unified_mamba_state_indices=[],
+            )
+            runner._attn_metadata_builder_ctx = ctx
+            if staged:
+                stage_block_table_uploads(runner, ctx, 4)
+            metas = [
+                b.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
+                for b in [attn] + mambas
+            ]
+            return ctx, metas
+
+        _, metas_staged = walk([0, 17, 33, 65], staged=True)
+        _, metas_plain = walk([0, 17, 33, 65], staged=False)
+        for a, b in zip(metas_staged, metas_plain):
+            assert torch.equal(a.block_tables, b.block_tables)
+            if b.mamba_state_indices is not None:
+                assert torch.equal(a.mamba_state_indices, b.mamba_state_indices)
+                assert torch.equal(a.mamba_ckpt_indices, b.mamba_ckpt_indices)
+
 
 class TestPrefillCheckpointIds:
     """Tests for per-group internal prefill checkpoint block ID gathering."""
