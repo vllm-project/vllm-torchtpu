@@ -693,6 +693,7 @@ class TPUWorker(WorkerBase):
     def take_draft_token_ids(self):
         return self.model_runner.take_draft_token_ids()
 
+    @torch.no_grad()
     def execute_dummy_batch(self) -> None:
         """Run an idle DP step with the same collective pattern as active DP."""
         runner = self.model_runner
@@ -837,17 +838,19 @@ class TPUWorker(WorkerBase):
         # allocator keeps their pages. Return them before initialize_from_config,
         # where a KV connector may allocate its host store.
         _release_free_host_heap()
+        # Switch to the serving thread count right after weight loading so
+        # profile_run(), initialize_kv_cache(), and capture_model() all trace
+        # under the runtime GLOBAL_STATE guard.
+        set_torch_threads_for_runtime()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
-        if getattr(self, "speculative_config", None) is not None:
-            # Record the warm-up traces under the serving thread count. Other
-            # models keep upstream's warm-up at the startup count.
-            set_torch_threads_for_runtime()
+        # Fallback for callers/tests invoking compile_or_warm_up_model directly
+        # without load_model().
+        set_torch_threads_for_runtime()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
-        set_torch_threads_for_runtime()
         # torch records every compile artifact for save_cache_artifacts(), which
         # vLLM never calls; drop the record so its memory can be freed.
         CacheArtifactManager.clear()

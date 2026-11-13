@@ -2324,6 +2324,7 @@ class Eagle3Proposer:
                 synchronize_tensors(out)
                 logger.info("  -- drafter compute_logits n: %d", n)
 
+    @torch.no_grad()
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
         """Replay a busy rank's DRAFT collective trace on an idle/padding rank,
         for `num_chunks` padding chunks (EP-DP lockstep).
