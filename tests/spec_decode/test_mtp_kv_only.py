@@ -50,6 +50,7 @@ from vllm.model_executor.models.deepseek_v2 import (
 )
 
 import vllm_torchtpu.spec_decode.eagle3 as e3
+from tests.layers.adapter import mla_test_utils as mla
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackendImpl
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -89,37 +90,37 @@ class _Capture(nn.Module):
         raise _Stop
 
 
-def _rms_norm(gen):
-    norm = nn.RMSNorm(MTP_HIDDEN, eps=1e-6).bfloat16()
+def _rms_norm(gen, hidden):
+    norm = nn.RMSNorm(hidden, eps=1e-6).bfloat16()
     with torch.no_grad():
-        norm.weight.copy_(torch.randn(MTP_HIDDEN, generator=gen))
+        norm.weight.copy_(torch.randn(hidden, generator=gen))
     return norm
 
 
-def _embedding(gen):
+def _embedding(gen, hidden):
     # Seeded like every other weight here: the default init would draw from
     # the global RNG, whose state depends on the tests that ran before.
-    embed = nn.Embedding(MTP_VOCAB, MTP_HIDDEN).bfloat16()
+    embed = nn.Embedding(MTP_VOCAB, hidden).bfloat16()
     with torch.no_grad():
-        embed.weight.copy_(torch.randn(MTP_VOCAB, MTP_HIDDEN, generator=gen))
+        embed.weight.copy_(torch.randn(MTP_VOCAB, hidden, generator=gen))
     return embed
 
 
-def _upstream_mtp(self_attn: nn.Module, seed=0) -> DeepSeekMTP:
+def _upstream_mtp(self_attn: nn.Module, seed=0, hidden=MTP_HIDDEN) -> DeepSeekMTP:
     gen = torch.Generator().manual_seed(seed)
     block = _module(
         DeepseekV2DecoderLayer,
         use_sequence_parallel_moe=False,
         use_mha=False,
-        input_layernorm=_rms_norm(gen),
+        input_layernorm=_rms_norm(gen, hidden),
         self_attn=self_attn,
     )
-    eh_proj = nn.Linear(2 * MTP_HIDDEN, MTP_HIDDEN, bias=False).bfloat16()
+    eh_proj = nn.Linear(2 * hidden, hidden, bias=False).bfloat16()
     nn.init.normal_(eh_proj.weight, generator=gen)
     layer = _module(
         DeepSeekMultiTokenPredictorLayer,
-        enorm=_rms_norm(gen),
-        hnorm=_rms_norm(gen),
+        enorm=_rms_norm(gen, hidden),
+        hnorm=_rms_norm(gen, hidden),
         eh_proj=eh_proj,
         mtp_block=block,
     )
@@ -128,7 +129,7 @@ def _upstream_mtp(self_attn: nn.Module, seed=0) -> DeepSeekMTP:
         layers=nn.ModuleDict({"78": layer}),
         mtp_start_layer_idx=78,
         num_mtp_layers=1,
-        embed_tokens=_embedding(gen),
+        embed_tokens=_embedding(gen, hidden),
     )
     return _module(DeepSeekMTP, model=predictor)
 
@@ -1361,3 +1362,198 @@ def test_lockstep_decision_ignores_the_chunks_own_prefill(monkeypatch):
     assert proposer._takes_two_pass_step0(_busy_chunk([4, 6, 5], 16), 16) is False
     proposer.runner._dp_step_any_prefill = True
     assert proposer._takes_two_pass_step0(_busy_chunk([4, 4, 4], 16), 16) is True
+
+
+# ---------------------------------------------------------------------------
+# On TPU: the KV-only pass and the two-pass step 0 vs the full MTP step 0
+# ---------------------------------------------------------------------------
+
+# Own op names: test_mla_kv_write_op.py builds the same layer under its own.
+TPU_NAMES = ("kv_only_test.mtp.mla_attn", "kv_only_test.mtp.indexer.k_cache")
+
+
+class _Step0(nn.Module):
+    """Draft step 0 as the full pass runs it, up to the attention output: the
+    MTP prefix, then the wrapper's forward (indexer, sparse MLA)."""
+
+    def __init__(self, mtp):
+        super().__init__()
+        self.mtp = mtp
+
+    def forward(self, input_ids, positions, hidden_states):
+        layer, attn_input = mtp_kv_only.mtp_layer_input(
+            self.mtp, input_ids, positions, hidden_states
+        )
+        return layer.mtp_block.self_attn.mla_attn(positions, attn_input)
+
+
+@pytest.fixture(scope="module")
+def tpu_mtp():
+    """A synthetic single-layer DSA MTP draft on one TPU chip (the shared
+    sparse MLA layer under the upstream MTP prefix), built once per module:
+    the ops register under fixed names. Request 0 has `TPU_PREFIX` tokens
+    cached before the step (written here by the full step 0); the step is a
+    64-token chunk: request 0's next 32 tokens, request 1's first 24, 8
+    padded rows."""
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    torch._dynamo.reset()
+    dev = torch.device("tpu")
+    built = mla.build_tpu_sparse_mla(*TPU_NAMES)
+    self_attn = _module(DeepseekV2MLAAttention, mla_attn=built.wrapper)
+    mtp = _upstream_mtp(self_attn, hidden=mla.HIDDEN)
+    mtp.model.to(dev)
+    assert mtp_kv_only.kv_only_unsupported_reason(mtp) is None
+    with set_vllm_model_wrapper_context(mesh=built.mesh):
+        kv_only = mtp_kv_only.MtpKvOnlyModel(
+            vllm_config=_uncompiled_config(),
+            prefix="mtp_prefill_kv_only",
+            mtp=mtp,
+            mesh=built.mesh,
+        )
+    built.step0_c = mla.tpu_compiled(_Step0(mtp))
+    built.kv_only_c = mla.tpu_compiled(kv_only)
+    gen = torch.Generator().manual_seed(9)
+
+    def tokens(positions):
+        n = len(positions)
+        return (
+            torch.randint(0, MTP_VOCAB, (n,), generator=gen, dtype=torch.int32).to(dev),
+            torch.tensor(positions, dtype=torch.int32, device=dev),
+            torch.randn(n, mla.HIDDEN, generator=gen).bfloat16().to(dev),
+        )
+
+    prefix_len = mla.TPU_PREFIX
+    end = prefix_len + 32
+    prefix_md = mla.tpu_md(
+        TPU_NAMES, [prefix_len, 0], [0, prefix_len, prefix_len], [0, 0, 1]
+    )
+    mla.on_tpu(built, built.step0_c, prefix_md, *tokens(list(range(prefix_len))))
+    # Host copies: a deferred on-device clone can lose its source to the
+    # next op that donates the cache.
+    built.prefix_caches = [c.cpu() for c in built.caches]
+    built.end = end
+    built.step = tokens(list(range(prefix_len, end)) + list(range(24)) + [0] * 8)
+    built.step_qsl = [0, 32, 56]
+    built.step_md = lambda: mla.tpu_md(TPU_NAMES, [end, 24], built.step_qsl, [0, 0, 2])
+    # Pass 2's rows: each request's last row, padded to p = 8 with row 0.
+    built.last_rows = torch.tensor([31, 55] + [0] * 6, dtype=torch.int64, device=dev)
+    built.rows_md = lambda: mla.tpu_md(TPU_NAMES, [end, 24], [0, 1, 2], [2, 2, 2])
+    return built
+
+
+def _tpu_single_pass(built):
+    mla.reset_caches(built, built.prefix_caches)
+    out = mla.on_tpu(built, built.step0_c, built.step_md(), *built.step)
+    return out.cpu(), [c.cpu() for c in built.caches]
+
+
+def _selected(rows):
+    return [{int(i) for i in row if i >= 0} for row in rows]
+
+
+@pytest.mark.tpu_test
+def test_kv_only_pass_writes_the_full_step0_cache_entries_on_tpu(tpu_mtp):
+    """`MtpKvOnlyModel` (MTP prefix + `MlaKvWriteOp`), compiled for TPU with
+    the default writers and an fp8 latent cache, leaves the same MLA and
+    indexer-K caches as the full step 0 over the same rows."""
+    _, want = _tpu_single_pass(tpu_mtp)
+    assert any(not torch.equal(w, p) for w, p in zip(want, tpu_mtp.prefix_caches)), (
+        "the step wrote nothing"
+    )
+    mla.reset_caches(tpu_mtp, tpu_mtp.prefix_caches)
+    mla.on_tpu(tpu_mtp, tpu_mtp.kv_only_c, tpu_mtp.step_md(), *tpu_mtp.step)
+    mla.assert_same_bytes(tpu_mtp.caches, want, "KV-only pass vs full step 0")
+
+
+@pytest.mark.tpu_test
+def test_proposer_two_pass_step0_matches_the_single_pass_on_tpu(monkeypatch, tpu_mtp):
+    """`Eagle3Proposer._two_pass_step0` on TPU: pass 1 over every row, the
+    compiled `_draft_gather_rows`, then step 0 on one row per request with
+    the pass-2 metadata it narrows from the chunk's own. Same caches as the
+    single pass, and each request's last row gets the same attention output
+    (within a tolerance: pass 2 runs the decode path of the kernels)."""
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    built = tpu_mtp
+    want_out, want_caches = _tpu_single_pass(built)
+    # Each request's last row: request 0's context (352) is longer than the
+    # top-k (256), so its indexer really selects.
+    want_topk = _selected(built.topk_rows[[31, 55]].cpu())
+    mla.reset_caches(built, built.prefix_caches)
+
+    @contextlib.contextmanager
+    def forward_context(attn_metadata, *_args, **_kwargs):
+        ctx = ForwardContext(
+            no_compile_layers={built.mla_layer.layer_name: built.mla_layer},
+            attn_metadata=attn_metadata,
+            slot_mapping={},
+        )
+        with override_forward_context(ctx):
+            yield
+
+    monkeypatch.setattr(e3, "set_forward_context", forward_context)
+    monkeypatch.setattr(
+        e3,
+        "set_vllm_model_wrapper_context",
+        lambda **_kwargs: set_vllm_model_wrapper_context(mesh=built.mesh),
+    )
+    proposer = make_proposer(method="mtp")
+    proposer.runner = SimpleNamespace(
+        device=torch.device("tpu"),
+        mesh=built.mesh,
+        num_reqs_max_model_len=2,
+        num_reqs_most_model_len=None,
+        num_tokens_paddings=[8, 64, 512],
+        _dp_num_tokens_across_dp=lambda n: None,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    proposer.draft_vllm_config = object()
+    proposer._draft_attn_layer_names = set(TPU_NAMES)
+    proposer.draft_model = (
+        lambda *, input_ids, positions, hidden_states, spec_step_idx: built.step0_c(
+            input_ids, positions, hidden_states
+        )
+    )
+    proposer._mtp_kv_only = MtpKvOnlyStep0(built.kv_only_c, 9, object())
+    ids, positions, hidden = built.step
+    md = built.step_md()
+    chunk = DraftChunkInputs(
+        input_ids=ids,
+        position_ids=positions,
+        query_start_loc_np=np.array(built.step_qsl, dtype=np.int32),
+        attn_ctx=SimpleNamespace(
+            use_max_model_len=True,
+            seq_lens=md[TPU_NAMES[0]].seq_lens,
+            position_ids_override=None,
+        ),
+        start_index=0,
+        num_reqs=2,
+        aux_hidden_states=[],
+        hidden_states=hidden,
+        attn_metadata=md,
+    )
+    with torch.no_grad():
+        last_hidden, _, rows_positions, _, owner_mask = proposer._two_pass_step0(
+            chunk=chunk,
+            input_ids=ids,
+            positions=positions,
+            target_hidden_states=hidden,
+            last_token_indices=built.last_rows,
+            num_rejected=np.zeros(2, dtype=np.int32),
+        )
+    mla.assert_same_bytes(built.caches, want_caches, "two-pass vs single pass")
+    assert rows_positions.cpu()[:2].tolist() == [built.end - 1, 23]
+    assert owner_mask.cpu().all()
+    # Pass 2 runs the decode path of the top-k, which may order the selected
+    # positions differently: compare them as sets.
+    assert _selected(built.topk_rows[:2].cpu()) == want_topk
+    torch.testing.assert_close(
+        last_hidden.cpu()[:2], want_out[[31, 55]], rtol=1e-2, atol=1e-2
+    )
