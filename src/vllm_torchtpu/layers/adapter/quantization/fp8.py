@@ -1725,6 +1725,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             quantized_matmul_prequant,
         )
 
+        layer = cast("TpuLinear", layer)
         weight = layer.weight
         if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
             weight = weight.transpose(0, 1)
