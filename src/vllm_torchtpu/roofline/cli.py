@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CLI entrypoint for solve, plan, and explain subcommands."""
+"""CLI entrypoint for solve, emit, ceiling, plan, and explain subcommands."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ import argparse
 import json
 import sys
 from dataclasses import asdict, replace
+from typing import TYPE_CHECKING
 
 from .chips import CHIPS
 from .constants import (
@@ -34,6 +35,10 @@ from .constants import (
     UNIT_MICROS_PER_SECOND,
     WEIGHT_DTYPE_BYTES,
 )
+from .emit import (
+    emit_ceiling_rows,
+    emit_launch_args,
+)
 from .geometry import from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import Dtypes, Parallel, StepShape
@@ -41,12 +46,16 @@ from .serving import ServingRequest, plan
 from .solver import (
     EXAMPLE_SCENARIOS,
     ScenarioOverrides,
+    ServingPlan,
     SolveOptions,
     TrafficScenario,
     build_example_scenario,
     solve_serving_plan,
 )
 from .step import FloorOptions, SpecShape, spec_cycle_floor, step_floor
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 def _add_model_source(p: argparse.ArgumentParser) -> None:
@@ -127,12 +136,18 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build argument parser for solve, plan, and explain subcommands."""
+    """Build argument parser for solve, emit, ceiling, plan, and explain."""
     parser = argparse.ArgumentParser(prog="python -m vllm_torchtpu.roofline")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_solve = sub.add_parser("solve")
     _add_scenario_args(p_solve)
+
+    p_emit = sub.add_parser("emit")
+    _add_scenario_args(p_emit)
+
+    p_ceil = sub.add_parser("ceiling")
+    _add_scenario_args(p_ceil)
 
     p_plan = sub.add_parser("plan")
     _add_common_args(p_plan)
@@ -198,12 +213,48 @@ def _resolve_scenario(
     )
 
 
+def _dispatch_ceiling(args: argparse.Namespace, splan: ServingPlan) -> int:
+    """Write Pareto ceiling rows as JSON array or JSON lines."""
+    rows_ceil = emit_ceiling_rows(splan)
+    if not rows_ceil:
+        for w in splan.warnings:
+            sys.stderr.write(f"WARNING: {w}\n")
+        if args.json:
+            sys.stdout.write("[]\n")
+        return 1
+    if args.json:
+        sys.stdout.write(json.dumps(rows_ceil) + "\n")
+        return 0
+    for rc_row in rows_ceil:
+        sys.stdout.write(json.dumps(rc_row) + "\n")
+    return 0
+
+
+def _dispatch_emit(
+    args: argparse.Namespace, splan: ServingPlan, dt_auto: Dtypes
+) -> int:
+    """Write emitted vLLM serve launch commands or JSON payload."""
+    emitted = emit_launch_args(splan, dtypes=dt_auto, model=args.model)
+    if not emitted["commands"]:
+        for w in emitted["warnings"]:
+            sys.stderr.write(f"WARNING: {w}\n")
+        if args.json:
+            sys.stdout.write(json.dumps(emitted) + "\n")
+        return 1
+    if args.json:
+        sys.stdout.write(json.dumps(emitted) + "\n")
+        return 0
+    for cmd_line in emitted["commands"]:
+        sys.stdout.write(cmd_line + "\n")
+    return 0
+
+
 def _dispatch_solve(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
     cfg: dict[str, object],
 ) -> int:
-    """Execute the solve subcommand and write JSON or table output."""
+    """Execute the solve, emit, or ceiling subcommands."""
     scen = _resolve_scenario(args, parser)
     if args.max_chips is None and args.max_instances is None:
         parser.error("Either --max-chips or --max-instances is required.")
@@ -219,6 +270,10 @@ def _dispatch_solve(
             gpu_memory_utilization=args.gpu_memory_utilization,
         ),
     )
+    if args.cmd == "ceiling":
+        return _dispatch_ceiling(args, splan)
+    if args.cmd == "emit":
+        return _dispatch_emit(args, splan, dtypes_from_hf_config(cfg))
     if args.json:
         sys.stdout.write(json.dumps(asdict(splan)) + "\n")
         return 0
@@ -395,14 +450,14 @@ def _dispatch_explain(
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Run the roofline CLI subcommand."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
     args = parser.parse_args(raw_argv)
     src = args.model if args.model is not None else args.config
     cfg = load_hf_config(src)
-    if args.cmd == "solve":
+    if args.cmd in ("solve", "emit", "ceiling"):
         return _dispatch_solve(args, parser, cfg)
     if args.cmd == "plan":
         return _dispatch_plan(args, parser, cfg)
