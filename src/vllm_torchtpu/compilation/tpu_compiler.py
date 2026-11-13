@@ -50,6 +50,7 @@ from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.compilation.graph_fingerprint import _graph_fingerprint
 from vllm_torchtpu.gdn_pool_layout import prefill_checkpoint_enabled
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel.adapter.salt import compile_cache_salt
 
 logger = init_logger(__name__)
 
@@ -457,6 +458,20 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             else None,
         },
     }
+    # The megakernel settings (VLLM_TPU_MEGAKERNEL in "env",
+    # additional_config["megakernel"] in VllmConfig.compute_hash) key the
+    # stock graphs like any other setting: a plugin may change the stock
+    # model, e.g. reshard its experts in place. A plugin's cache-layout
+    # request adds its digest; without one (None) no factor is added.
+    # The request is config-only, and so is its use: the KV-cache allocation
+    # is to apply it from this same config, after the driver's load-time
+    # checks (check_spec, create) and before bind, whatever the driver
+    # decided. A declined driver's stock graphs then run on the requested
+    # layout, so the salt stays. No allocator applies a request yet and no
+    # in-tree plugin declares one, so today this factor is never added.
+    mk_salt = compile_cache_salt(vllm_config)
+    if mk_salt is not None:
+        factors["megakernel_layout"] = mk_salt
 
     repo_root = Path(__file__).resolve().parents[2]
     hash_obj = hashlib.sha256(
