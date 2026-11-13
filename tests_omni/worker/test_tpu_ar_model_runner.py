@@ -15,9 +15,11 @@
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import torch
+from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -40,7 +42,7 @@ def _stage_config(**fields: Any) -> OmniModelConfig:
         stage_connector_config=None,
     )
     config = OmniModelConfig.__new__(OmniModelConfig)
-    for name, value in {**defaults, **fields}.items():
+    for name, value in (defaults | fields).items():
         object.__setattr__(config, name, value)
     return config
 
@@ -220,3 +222,49 @@ def test_forward_model_normalizes_stage_outputs(
         assert "intermediate_tensors" not in model.kwargs
     else:
         assert model.kwargs["intermediate_tensors"] is intermediate_tensors
+
+
+def test_tpu_ar_model_runner_mixed_dim_mm_slicing(
+    tpu_ar_model_runner: TPUARModelRunner,
+) -> None:
+    """Verify _gather_mm_embeddings and _get_model_inputs preserve mixed widths."""
+    vid_emb = set_mm_embedding_modality(torch.ones(4, 32), "video")
+    aud_emb = set_mm_embedding_modality(torch.full((3, 8), 2.0), "audio")
+    mask = torch.ones(10, dtype=torch.bool)
+
+    with patch.object(
+        TPUModelRunner,
+        "_gather_mm_embeddings",
+        return_value=([vid_emb, aud_emb], mask),
+    ):
+        idx_list, out_mask = tpu_ar_model_runner._gather_mm_embeddings(
+            SimpleNamespace()
+        )
+
+    assert out_mask is mask
+    assert len(idx_list) == 1
+    assert torch.equal(idx_list[0], torch.arange(7, dtype=torch.long))
+
+    # Simulate TPUModelRunner.execute_model slicing row indices [2:6] across the
+    # video->audio boundary (last 2 rows of video + first 2 rows of audio).
+    captured_mm: list[Any] = []
+
+    def _fake_parent_get_model_inputs(self, input_ids, mm_embed_inputs):
+        captured_mm.append(mm_embed_inputs)
+        return None, input_ids
+
+    with patch.object(
+        TPUModelRunner, "_get_model_inputs", _fake_parent_get_model_inputs
+    ):
+        tpu_ar_model_runner._get_model_inputs(
+            torch.zeros(10, dtype=torch.long),
+            ([idx_list[0][2:6]], mask),
+        )
+
+    resolved_embeds, resolved_mask = captured_mm[0]
+    assert resolved_mask is mask
+    assert len(resolved_embeds) == 2
+    assert resolved_embeds[0].shape == (2, 32)
+    assert resolved_embeds[0].modality == "video"
+    assert resolved_embeds[1].shape == (2, 8)
+    assert resolved_embeds[1].modality == "audio"
