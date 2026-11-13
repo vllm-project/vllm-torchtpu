@@ -22,9 +22,13 @@ column-parallel matmuls read raw. The experts reuse the TPU NVFP4 MoE path
 after renaming the compressed-tensors tensors to ModelOpt's.
 """
 
+import math
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 import torch
+from torch_tpu._internal import pallas
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -54,6 +58,21 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
+# From this many rows the matmul is MXU-bound and XLA's dot runs slower on an
+# in-fusion e4m3 -> bf16 convert (o_proj +7%, dense up +16% at 8192 rows,
+# measured) than on a bf16 copy materialized first.
+_UPCAST_MIN_ROWS = 4096
+
+
+def _upcast_e4m3(w: jax.Array) -> jax.Array:
+    return jax.lax.optimization_barrier(w.astype(jnp.bfloat16))
+
+
+# Built at import: torch_tpu cannot create a jax_op inside a traced forward.
+_materialized_bf16 = pallas.jax_op("pallas::minimax_m3_upcast_e4m3", _upcast_e4m3)
+_materialized_bf16.register_fake(lambda w: torch.empty_like(w, dtype=torch.bfloat16))
+
 
 QUANT_METHOD = "mxfp8"
 MXFP8_BLOCK = 32
@@ -211,8 +230,13 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if layer.weight.dtype != torch.float8_e4m3fn:
             return VllmUnquantizedLinearMethod().apply(layer, x, bias)
+        rows = math.prod(x.shape[:-1])
+        if rows >= _UPCAST_MIN_ROWS and x.dtype == torch.bfloat16:
+            weight = _materialized_bf16(layer.weight)
+        else:
+            weight = layer.weight.to(x.dtype)
         # The scale is a power of two, so this rounds once, like x @ bf16(W).
-        return torch.matmul(x, layer.weight.to(x.dtype)) * layer.weight_scale
+        return torch.matmul(x, weight) * layer.weight_scale
 
 
 class MiniMaxM3Nvfp4MoEMethod(VllmNvfp4MoEMethod):
