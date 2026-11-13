@@ -56,6 +56,7 @@ def require_dp16_recipe() -> None:
         MOE_FUSED_EP_PUSH_SC_PREPUSH,
         MOE_FUSED_EP_PUSH_TC_EXCHANGE,
         TPU_MOE_EPLB_DYNAMIC,
+        TPU_MOE_EPLB_MODE,
     )
 
     mesh = build_ep_mesh()
@@ -79,6 +80,8 @@ def require_dp16_recipe() -> None:
                 "DP16 decode CI requires TPU_MOE_EPLB_DYNAMIC=1 or a static "
                 "expert layout"
             )
+    elif TPU_MOE_EPLB_MODE != "decode_only":
+        raise ValueError("DP16 decode CI requires TPU_MOE_EPLB_MODE=decode_only")
 
 
 def classify_rows(starts: list[int], ends: list[int], prompts: list[int]) -> str:

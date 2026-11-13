@@ -55,6 +55,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Protocol
 
 import numpy as np
@@ -74,6 +75,8 @@ CLEAN_FILL = 0.8
 # The first decode window after a phase change is this many steps (or the
 # window, if shorter), so a layout for the decode mix lands early.
 DECODE_FIRST_WINDOW = 16
+# Minimum clean window supported by the asynchronous snapshot protocol.
+PREFILL_WINDOW = 8
 # How long the ranks drain a timed-out generation's host exchange together.
 DRAIN_S = 30.0
 
@@ -332,7 +335,8 @@ def _budgeted_next(
     for r in range(shards):
         for e in removes[r]:
             nxt.held[r][nxt.held[r].index(e)] = FREE
-        free = nxt.free_slots(r)
+        # Retiring slots remain live under the old table until install.
+        free = old.free_slots(r)
         for e, j in zip(kept[r], free, strict=False):
             nxt.held[r][j] = e
     return nxt
@@ -511,7 +515,8 @@ def _direct_staged_next(
         added = sorted(cur_sets[r] - old_sets[r])
         for e in removed:
             res.held[r][res.held[r].index(e)] = FREE
-        free = res.free_slots(r)
+        # Only the original staging slots may receive this generation.
+        free = old.free_slots(r)
         for e, j in zip(added, free, strict=False):
             res.held[r][j] = e
     return res
@@ -523,8 +528,16 @@ def _moves_between(
     moves = []
     for r in range(old.shards):
         for j, e in enumerate(nxt.held[r]):
-            if e == FREE or e in old.held[r]:
+            if e == FREE:
                 continue
+            if e in old.held[r]:
+                if old.held[r][j] != e:
+                    raise ValueError("retained expert must keep its physical slot")
+                continue
+            if old.held[r][j] != FREE:
+                raise ValueError(
+                    "migration destination must be an original staging slot"
+                )
             src = min(old.holders(e))  # deterministic: the lowest holder sends
             moves.append(Move(group, layer, int(e), src, old.slot_of(src, e), r, j))
     return moves
@@ -816,6 +829,12 @@ def _get_solve_worker() -> _SolveWorker:
         return _SOLVE_WORKER
 
 
+class EplbMode(StrEnum):
+    OFF = "off"
+    PREFILL_ONLY = "prefill_only"
+    DECODE_ONLY = "decode_only"
+
+
 class Controller:
     """One rank's view of the generation protocol (module docstring)."""
 
@@ -837,10 +856,16 @@ class Controller:
         synchronous_solve: bool = False,
         move_bytes: dict[str, int] | None = None,
         step_budget_bytes: int = 0,
+        mode: EplbMode = EplbMode.DECODE_ONLY,
     ) -> None:
         """groups: name -> dict(experts, active, staging, replica_cap).
         snapshot(): (group, layer) -> cumulative counts [P]. install(module,
         table): writes a layer's table. layouts: the live layouts at arm."""
+        self.mode = EplbMode(mode)
+        self._sample_phase = {
+            EplbMode.PREFILL_ONLY: "prefill",
+            EplbMode.DECODE_ONLY: "decode",
+        }.get(self.mode)
         self.rank = rank
         self.groups = groups
         self.layouts = layouts
@@ -890,11 +915,12 @@ class Controller:
         self._need_read_issue: bool = False
         self._last_step: int = 0
         self.decode_first_window: int = max(DECODE_FIRST_WINDOW, 8)
-        self._decode_only: bool = True
-        self._chain_decode: bool = True
-        self._freeze_converged: bool = True
-        self._decode_logical_windows: dict[tuple[str, int], np.ndarray] | None = None
-        self._decode_converged: bool = False
+        # Prefill windows can change with context length; sample fresh counts
+        # after each install or rejected plan instead of freezing that mix.
+        self._chain_layouts: bool = self._sample_phase != "prefill"
+        self._freeze_converged: bool = self._sample_phase != "prefill"
+        self._logical_windows: dict[tuple[str, int], np.ndarray] | None = None
+        self._converged: bool = False
 
     # -- the three int64 fields of the per-step all-reduce
 
@@ -913,6 +939,8 @@ class Controller:
     ) -> None:
         """`phase` is the step's `step_phase`; None (tests) triggers every
         `window_steps` steps without gating."""
+        if self.mode == EplbMode.OFF:
+            return
         from vllm_torchtpu.layers.adapter import expert_load
 
         expert_load.on_step(step)
@@ -1000,15 +1028,17 @@ class Controller:
             self.history = []
             return
 
-        if self._phase == "prefill" and self._decode_only:
+        if self._phase != self._sample_phase:
             return
 
-        if self._phase == "decode" and self._decode_converged:
+        if self._converged:
             return
 
         self._steps_since_reset += 1
         target_win = (
-            min(self.decode_first_window, self.window_steps)
+            PREFILL_WINDOW
+            if self._sample_phase == "prefill"
+            else min(self.decode_first_window, self.window_steps)
             if (self._phase == "decode" and self._first_decode_window)
             else self.window_steps
         )
@@ -1024,8 +1054,6 @@ class Controller:
         if self._steps_since_reset == target_win - 4:
             self._need_read_issue = True
         if self._steps_since_reset >= target_win:
-            if self._phase == "prefill" and step < self.warmup_steps:
-                return
             self._first_decode_window = False
             self._steps_since_reset = 0
             self._trigger(step)
@@ -1128,9 +1156,9 @@ class Controller:
         history = list(self.history)
         layouts = {k: v.copy() for k, v in self.layouts.items()}
         logical_windows = None
-        if self._phase == "decode" and self._chain_decode:
+        if self._phase == self._sample_phase and self._chain_layouts:
             logical_windows = self._compute_logical_windows(history, layouts)
-            self._decode_logical_windows = logical_windows
+            self._logical_windows = logical_windows
         self._launch_solve(step, history, layouts, logical_windows=logical_windows)
 
     def _collect_solve(self, step: int) -> None:
@@ -1146,7 +1174,7 @@ class Controller:
             )
             self._solve_error = None
             self.stats["skipped"] += 1
-            self._decode_logical_windows = None
+            self._logical_windows = None
             self.state = IDLE
             if self._phase in ("prefill", "decode") and self.history:
                 self.history = self.history[-1:]
@@ -1156,15 +1184,19 @@ class Controller:
         self._solve_result = None
         if plan is None or not plan.layouts:
             self.stats["skipped"] += 1
-            was_chaining = self._decode_logical_windows is not None
-            self._decode_logical_windows = None
-            if (self._phase == "decode" or was_chaining) and self._freeze_converged:
-                self._decode_converged = True
+            was_chaining = self._logical_windows is not None
+            self._logical_windows = None
+            if (
+                self._phase == self._sample_phase or was_chaining
+            ) and self._freeze_converged:
+                self._converged = True
             logger.info(
                 "expert relayout | step %d: no layer clears the %.0f%% gain gate%s",
                 step,
                 100 * self.min_gain,
-                " (decode converged; freezing)" if self._decode_converged else "",
+                f" ({self._sample_phase} converged; freezing)"
+                if self._converged
+                else "",
             )
             self.state = IDLE
             if self._phase in ("prefill", "decode") and self.history:
@@ -1294,13 +1326,13 @@ class Controller:
             self._steps_since_reset = 0
         self.pending = None
         self.state = IDLE
-        if self._chain_decode and self._decode_logical_windows:
+        if self._chain_layouts and self._logical_windows:
             layouts = {k: v.copy() for k, v in self.layouts.items()}
             self._launch_solve(
                 step,
                 [],
                 layouts,
-                logical_windows=self._decode_logical_windows,
+                logical_windows=self._logical_windows,
             )
 
     def _abort(self, step: int, why: str, drain: bool = False) -> None:
@@ -1366,7 +1398,8 @@ def arm(
     from vllm_torchtpu import envs, expert_mover, expert_placement
     from vllm_torchtpu.layers.adapter import expert_load
 
-    if not envs.TPU_MOE_EPLB_DYNAMIC:
+    mode = EplbMode(envs.TPU_MOE_EPLB_MODE)
+    if mode == EplbMode.OFF or not envs.TPU_MOE_EPLB_DYNAMIC:
         return None
     placement = expert_placement.current(vllm_config)
     modules = expert_placement.applied_layers()
@@ -1452,7 +1485,9 @@ def arm(
         min_gain=envs.TPU_MOE_EPLB_MIN_GAIN,
         move_bytes=move_bytes,
         step_budget_bytes=mover.step_budget_bytes,
+        mode=mode,
     )
+    logger.info("expert relayout policy | mode=%s", controller.mode)
     first = next(iter(kept_modules.values()))
     try:
         parts = expert_mover.describe_parts(first, transport)
