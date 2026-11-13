@@ -929,3 +929,101 @@ def test_main_kv_dcp_allocation_and_prefix_hits_align_to_scheduler_blocks(
     _, hit, *_ = manager.get_computed_blocks(second)
     assert hit > 0 and hit % scheduler_block == 0, (hit, scheduler_block)
     assert hit <= len(prompt) - 1
+
+
+# --- in-row compressed keys (QWEN4_EXP_INROW_COMPRESSED_K) ---------------------------
+
+
+def inrow_config(monkeypatch, *, dcp=0, mtp_dcp=False, tp=8, kv="fp8_e4m3"):
+    cfg = packed_config(monkeypatch, False, tp=tp)
+    cfg.cache_config.cache_dtype = kv
+    monkeypatch.setenv("QWEN4_EXP_INROW_COMPRESSED_K", "1")
+    monkeypatch.delenv("QWEN4_EXP_PACK_MAIN_KV", raising=False)
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_MAIN_KV_DCP", dcp, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_MTP_KV_DCP", mtp_dcp, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_COMPRESSED_DCP", False, raising=False)
+    return cfg
+
+
+@pytest.mark.parametrize("dcp,mtp_dcp", [(0, False), (4, False), (4, True)])
+def test_inrow_keys_drop_every_compressed_group(monkeypatch, dcp, mtp_dcp):
+    """TP8 + MTP: every QSA layer's keys ride its own main-KV pages (slot-0
+    main KV, an in-row slot of its entry span); no compressed spec remains
+    and every other spec is unchanged."""
+    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import inrow_span, is_inrow
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import (
+        check_packed_compressed_groups,
+    )
+
+    monkeypatch.delenv("QWEN4_EXP_INROW_COMPRESSED_K", raising=False)
+    cfg = inrow_config(monkeypatch, dcp=dcp, mtp_dcp=mtp_dcp)
+    monkeypatch.setenv("QWEN4_EXP_INROW_COMPRESSED_K", "0")
+    plain_layout, plain = pooled_cache_specs(cfg)
+    monkeypatch.setenv("QWEN4_EXP_INROW_COMPRESSED_K", "1")
+    layout, specs = pooled_cache_specs(cfg)
+    attention = [n for n in plain if n.endswith(".self_attn")]
+    assert attention[-1].startswith("mtp.layers.")
+    assert layout.inrow_compressed and not plain_layout.inrow_compressed
+    assert not [n for n in specs if n.endswith(".compressed_k")]
+    assert set(plain) - set(specs) == {n + ".compressed_k" for n in attention}
+    assert all(specs[n] == plain[n] for n in specs)
+    for name in attention:
+        owner, slot = layout.compressed_owner(name)
+        assert owner == name and is_inrow(slot)
+        split = dcp > 1 and (mtp_dcp or not name.startswith("mtp."))
+        assert inrow_span(slot) == (dcp if split else 1)
+        assert layout.main_owner(name) == (name, 0)
+    cfg.cache_config.block_size = layout.block_size
+    cfg.cache_config.mamba_block_size = layout.block_size
+    groups = get_kv_cache_groups(cfg, specs)
+    check_packed_compressed_groups(layout, groups)
+    token_groups = [g for g in groups if g.layer_names[0].endswith(".self_attn")]
+    assert len(token_groups) == len(attention)
+
+
+@pytest.mark.parametrize(
+    "setup,match",
+    [
+        (dict(tp=1), "one KV head per device"),
+        (dict(kv="auto"), "one KV head per device"),
+    ],
+)
+def test_inrow_keys_need_one_fp8_head_per_device(monkeypatch, setup, match):
+    with pytest.raises(ValueError, match=match):
+        pooled_cache_specs(inrow_config(monkeypatch, **setup))
+
+
+@pytest.mark.parametrize("env", ["QWEN4_EXP_PACK_COMPRESSED_K", "QWEN4_EXP_MERGE_COMPRESSED_K"])
+def test_inrow_keys_refuse_other_key_layouts(monkeypatch, env):
+    cfg = inrow_config(monkeypatch)
+    monkeypatch.setenv(env, "1")
+    with pytest.raises(ValueError, match="QWEN4_EXP_INROW_COMPRESSED_K=1 replaces"):
+        pooled_cache_specs(cfg)
+
+
+def test_inrow_pool_binds_keys_and_main_kv_to_the_layer(monkeypatch):
+    from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
+
+    cfg = inrow_config(monkeypatch, dcp=4)
+    layout, specs = pooled_cache_specs(cfg)
+    cache = object.__new__(Qwen4ExpPooledCache)
+    cache.layout = layout
+    carrier = object()
+    caches = {name: carrier for name in specs}
+    bound = {}
+
+    class Attention:
+        def __init__(self, name):
+            self.name = name
+
+        def bind_pool(self, pool, owner, **main):
+            assert pool is carrier
+            bound[self.name] = (owner, main)
+
+    for name in [n for n in specs if n.endswith(".self_attn")]:
+        cache._bind_qsa(Attention(name), name + "", caches)
+        owner, main = bound[name]
+        assert owner == layout.compressed_owner(name)
+        assert main == {"main_owner": (name, 0)}
