@@ -30,6 +30,10 @@ step by step:
 Only the f32 summation order of ``mean(s^2)`` is free. So the new residual is
 bit-identical to the upstream op, and ``y`` can differ by at most 2 bf16 ulp.
 
+``fused_add_rms_norm_quant`` also writes the per-row fp8 quantization of
+``y``, which the FP8 matmul that reads ``y`` would otherwise compute in two
+more passes over ``y``.
+
 Example for one row with hidden size 4 (the arithmetic only; the kernel needs
 a hidden size that is a multiple of 128), ``eps`` = 1e-6 and a weight of ones:
 ``x`` = [1, 1, 1, 1] and ``residual`` = [1, -1, 3, -3] give ``s`` =
@@ -243,3 +247,161 @@ def fused_add_rms_norm(
     if has_residual:
         return outs[0], outs[1]
     return outs[0]
+
+
+def _quant_kernel(*refs, eps: float, emit_y: bool, q_max: float):
+    """``_kernel`` plus a per-row quantization of the bf16-rounded ``y``.
+
+    The quantization is the one of ``quantized_matmul.util.quantize_block``:
+
+        amax  = max|y|                       (exact, because y is bf16)
+        scale = f32(amax) / q_max;  0 -> 1
+        y_q   = fp8(clip(f32(y) / scale, -q_max, q_max))
+    """
+    if emit_y:
+        x_ref, r_ref, w_ref, y_ref, q_ref, s_ref, ro_ref = refs
+    else:
+        x_ref, r_ref, w_ref, q_ref, s_ref, ro_ref = refs
+        y_ref = None
+    s = x_ref[...].astype(jnp.float32) + r_ref[...].astype(jnp.float32)
+    ro_ref[...] = s.astype(ro_ref.dtype)
+    var = jnp.mean(s * s, axis=-1, keepdims=True)
+    normed = (s * jax.lax.rsqrt(var + eps)).astype(x_ref.dtype)
+    y = (normed.astype(jnp.float32) * w_ref[...].astype(jnp.float32)).astype(
+        x_ref.dtype
+    )
+    if emit_y:
+        y_ref[...] = y
+    yf = y.astype(jnp.float32)
+    amax = jnp.max(jnp.abs(yf), axis=-1, keepdims=True)
+    scale = amax / jnp.float32(q_max)
+    scale = jnp.where(scale == 0, jnp.float32(1.0), scale)
+    s_ref[...] = scale
+    q_ref[...] = jnp.clip(yf / scale, -q_max, q_max).astype(q_ref.dtype)
+
+
+@functools.partial(
+    jax.jit, static_argnames=("eps", "quant_dtype", "emit_y", "block_rows", "interpret")
+)
+def fused_add_rms_norm_quant(
+    x: jax.Array,
+    residual: jax.Array,
+    weight: jax.Array,
+    *,
+    eps: float,
+    quant_dtype=jnp.float8_e4m3fn,
+    emit_y: bool = True,
+    block_rows: int = DEFAULT_BLOCK_ROWS,
+    interpret: bool = False,
+):
+    """Computes add + RMSNorm and also the per-row quantization of its output.
+
+    An FP8 matmul that reads ``y`` first quantizes it per row, which reads
+    ``y`` twice: once for the row maximum and once for the conversion. This
+    kernel computes the same quantization while the row is still in VMEM.
+
+    Example for one row: if ``y`` = [0.5, -2.0, 1.0] and ``quant_dtype`` is
+    float8_e4m3fn (``q_max`` = 448), then ``scale`` = 2.0 / 448 = 0.0044643
+    and ``y_q`` = [112, -448, 224].
+
+    Args:
+        x: ``[rows, hidden]`` input, for example bf16.
+        residual: ``[rows, hidden]`` residual stream of the same dtype as
+            ``x``.
+        weight: ``[hidden]`` scale of the same dtype as ``x``.
+        eps: Constant added to the mean of the squares before the rsqrt.
+        quant_dtype: Dtype of ``y_q``, a floating dtype such as
+            ``jnp.float8_e4m3fn``.
+        emit_y: Also write ``y``, for callers with a second consumer of it.
+        block_rows: Rows per grid step. ``rows`` must be a multiple of it.
+            A value that is not a multiple of 8 is valid only when it equals
+            ``rows``.
+        interpret: Run the kernel in the Pallas interpreter.
+
+    Returns:
+        ``(y, y_q, scale, new_residual)``. ``y`` and ``new_residual`` are as
+        in ``fused_add_rms_norm``; ``y`` is None when ``emit_y`` is False.
+        ``y_q`` is ``[rows, hidden]`` in ``quant_dtype`` and ``scale`` is
+        ``[rows, 1]`` f32. ``(y_q, scale)`` are bit for bit
+        ``quantize_tensor(y, quant_dtype)``.
+
+    Raises:
+        ValueError: If ``rows`` is not a multiple of ``block_rows``, if
+            ``hidden`` is not a multiple of 128, if ``block_rows`` is not a
+            multiple of 8 and not equal to ``rows``, or if ``quant_dtype`` is
+            not a floating dtype.
+    """
+    rows, hidden = x.shape
+    _check_shape(rows, hidden, block_rows)
+    if not jnp.issubdtype(quant_dtype, jnp.floating):
+        raise ValueError(
+            f"{quant_dtype=} is not supported; use a floating fp8 dtype such as "
+            "jnp.float8_e4m3fn"
+        )
+    q_max = float(jnp.finfo(quant_dtype).max)
+    row_spec = pl.BlockSpec((block_rows, hidden), lambda i: (i, 0))
+    w_spec = pl.BlockSpec((1, hidden), lambda i: (0, 0))
+    s_spec = pl.BlockSpec((block_rows, 1), lambda i: (i, 0))
+    out_shape = []
+    out_specs = []
+    if emit_y:
+        out_shape.append(jax.ShapeDtypeStruct((rows, hidden), x.dtype))
+        out_specs.append(row_spec)
+    out_shape += [
+        jax.ShapeDtypeStruct((rows, hidden), quant_dtype),
+        jax.ShapeDtypeStruct((rows, 1), jnp.float32),
+        jax.ShapeDtypeStruct((rows, hidden), x.dtype),
+    ]
+    out_specs += [row_spec, s_spec, row_spec]
+    # 14 f32 tiles, counted as in fused_add_rms_norm: each row block counts as
+    # one f32 tile and is double-buffered, so x, residual, new residual, y and
+    # y_q give 10 tiles; the f32 temporaries give about 4 more. The bf16 and
+    # fp8 blocks are smaller than an f32 tile, so the count is an upper bound.
+    tile = block_rows * hidden * 4
+    vmem_limit = min(100 * 1024 * 1024, max(32 * 1024 * 1024, 14 * tile))
+    outs = pl.pallas_call(
+        functools.partial(_quant_kernel, eps=eps, emit_y=emit_y, q_max=q_max),
+        grid=(rows // block_rows,),
+        in_specs=[row_spec, row_spec, w_spec],
+        out_specs=out_specs,
+        out_shape=out_shape,
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=vmem_limit,
+        ),
+        name=f"fused_add_rmsnorm_quant_y{int(emit_y)}_b{block_rows}_h{hidden}",
+        interpret=interpret,
+    )(x, residual, weight.reshape(1, hidden))
+    if emit_y:
+        return outs[0], outs[1], outs[2], outs[3]
+    return None, outs[0], outs[1], outs[2]
+
+
+def reference(x, residual, weight, eps):
+    """Computes (fused add +) RMSNorm with plain JAX ops, lowered by XLA.
+
+    The arithmetic is the one of ``fused_add_rms_norm``. On CPU, a test checks
+    it against the bound of the kernel: the new residual is bit-identical to
+    the host oracle of the kernel tests, and ``y`` differs by at most 2 bf16
+    ulp on at most 0.1% of the elements. On TPU, XLA can keep f32 where the
+    kernel rounds to bf16, so ``y`` can differ on more elements. No test
+    checks that case.
+
+    Args:
+        x: ``[rows, hidden]`` input.
+        residual: ``[rows, hidden]`` residual stream, or None.
+        weight: ``[hidden]`` scale.
+        eps: Constant added to the mean of the squares before the rsqrt.
+
+    Returns:
+        ``(y, new_residual)``, or ``y`` alone when ``residual`` is None.
+    """
+    orig = x.dtype
+    s = x.astype(jnp.float32)
+    if residual is not None:
+        s = s + residual.astype(jnp.float32)
+        new_res = s.astype(orig)
+    var = jnp.mean(s * s, axis=-1, keepdims=True)
+    y = (s * jax.lax.rsqrt(var + eps)).astype(weight.dtype) * weight
+    y = y.astype(orig)
+    return (y, new_res) if residual is not None else y

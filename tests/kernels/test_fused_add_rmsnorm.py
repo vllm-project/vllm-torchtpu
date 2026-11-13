@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels import fused_add_rmsnorm as K
+from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
 
 EPS = 1e-5
 MAX_ULP_FRACTION = 1e-3
@@ -191,3 +192,59 @@ def test_tpu_large_magnitude_residual():
     got = _run(x, r, w, False)
     ref = _oracle(x, r, w)
     assert _check(got[0], ref[0], got[1], ref[1])
+
+
+def _require_host():
+    if jax.devices()[0].platform == "tpu":
+        # On a TPU host, XLA can drop the intermediate bf16 rounding (excess
+        # precision), which these host checks rely on.
+        pytest.skip("host-only check")
+
+
+@pytest.mark.parametrize("has_res", [True, False])
+def test_reference_matches_oracle(has_res):
+    _require_host()
+    x, r, w = _inputs(256, 512, seed=3)
+    r = r if has_res else None
+    got = jax.jit(K.reference, static_argnames=("eps",))(x, r, w, eps=EPS)
+    ref = _oracle(x, r, w)
+    if has_res:
+        assert _check(got[0], ref[0], got[1], ref[1])
+    else:
+        assert _check(got, ref)
+
+
+def test_quant_interpret_matches_quantize_tensor():
+    """Interpret mode: (y_q, scale) equal quantize_tensor of the kernel's own y."""
+    _require_host()
+    x, r, w = _inputs(256, 512, seed=5)
+    y, y_q, scale, res = K.fused_add_rms_norm_quant(
+        x, r, w, eps=EPS, block_rows=64, interpret=True
+    )
+    q_ref, s_ref = jax.jit(quantize_tensor, static_argnums=1)(y, jnp.float8_e4m3fn)
+    y_ref, res_ref = _oracle(x, r, w)
+    assert _check(y, y_ref, res, res_ref)
+    q_got, q_ref = np.asarray(y_q).view(np.uint8), np.asarray(q_ref).view(np.uint8)
+    assert np.array_equal(q_got, q_ref)
+    s_got, s_ref = np.asarray(scale).view(np.int32), np.asarray(s_ref).view(np.int32)
+    assert np.array_equal(s_got, s_ref)
+
+
+def test_quant_rejects_hidden_not_multiple_of_128():
+    x, r, w = _inputs(64, 200)
+    with pytest.raises(ValueError, match="hidden=200 must be a multiple of 128"):
+        K.fused_add_rms_norm_quant(x, r, w, eps=EPS, block_rows=64, interpret=True)
+
+
+def test_quant_rejects_block_rows_not_multiple_of_8():
+    x, r, w = _inputs(24, 512)
+    with pytest.raises(ValueError, match="block_rows=12 must be a multiple of 8"):
+        K.fused_add_rms_norm_quant(x, r, w, eps=EPS, block_rows=12, interpret=True)
+
+
+def test_quant_rejects_integer_quant_dtype():
+    x, r, w = _inputs(64, 512)
+    with pytest.raises(ValueError, match="quant_dtype=.* is not supported"):
+        K.fused_add_rms_norm_quant(
+            x, r, w, eps=EPS, quant_dtype=jnp.int8, block_rows=64, interpret=True
+        )
