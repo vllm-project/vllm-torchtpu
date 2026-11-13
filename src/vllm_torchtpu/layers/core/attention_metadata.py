@@ -534,7 +534,6 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         runner = self.runner
         ctx = runner._attn_metadata_builder_ctx
         target_num_reqs = common_attn_metadata.num_reqs
-        block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
 
         # `position_ids` is only used for the dummy run in dummy runs, where we
         # want to use fixed position IDs instead of copying from the CPU tensor
@@ -544,6 +543,9 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             if ctx.staged_block_tables is not None
             else None
         )
+        # The table geometry (~59 groups' width arithmetic per step for
+        # Qwen4Exp) is derived only on the paths below that slice or reshape
+        # a table; the staged path hands out the walk's outputs as they are.
         if staged is not None:
             # The walk pre-uploaded every group's table in one batched
             # transfer; see `stage_block_table_uploads`.
@@ -554,11 +556,13 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 else runner.position_ids
             )
         elif ctx.position_ids_override is not None:
+            _, target_num_blocks = self._block_table_geometry(ctx)
             block_tables_dev = torch.zeros(
                 (target_num_reqs * target_num_blocks,), dtype=torch.int32
             ).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
+            block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
             # Per-call buffer: a later chunk or draft walk must not overwrite a
             # table whose upload is still in flight (see `stage_h2d_upload`).
             flat = zeros_h2d_source(runner, target_num_reqs * target_num_blocks)
@@ -606,6 +610,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                     mamba_prefill_ckpt_indices,
                 ) = staged_products
             else:
+                _, target_num_blocks = self._block_table_geometry(ctx)
                 block_tables_2d = block_tables_dev.reshape(
                     target_num_reqs, target_num_blocks
                 )
@@ -703,11 +708,14 @@ def _install_block_table_version() -> None:
     if getattr(BlockTable, "_tpu_version_patch", False):
         return
 
+    # Each table also keeps its own version (`_tpu_version`), so a re-pack
+    # can recopy only the tables that changed (`_pack_delta`).
     def bump_if_blocks(orig):
         @functools.wraps(orig)
         def append_row(self, block_ids, row_idx):
             if len(block_ids):
                 _BLOCK_TABLE_VERSION[0] += 1
+                self._tpu_version = _BLOCK_TABLE_VERSION[0]
             return orig(self, block_ids, row_idx)
 
         return append_row
@@ -716,6 +724,7 @@ def _install_block_table_version() -> None:
         @functools.wraps(orig)
         def wrapper(self, *args, **kwargs):
             _BLOCK_TABLE_VERSION[0] += 1
+            self._tpu_version = _BLOCK_TABLE_VERSION[0]
             return orig(self, *args, **kwargs)
 
         return wrapper
@@ -802,6 +811,16 @@ def stage_block_table_uploads(
 
 def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_key):
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
+    # Upload reuse is always on, so re-pack only the changed tables.
+    if ctx.position_ids_override is None and all(
+        isinstance(getattr(bt, "_tpu_version", 0), int) for _, bt, _ in entries
+    ):
+        staged_dev = _pack_delta(
+            runner, ctx, entries, num_reqs_padded, table_geom, total
+        )
+        runner._block_table_stage_prev = (table_geom, None, staged_dev, stage_key)
+        return staged_dev
+    runner.__dict__.pop("_block_table_pack_delta", None)
     # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
     # drains, so a later chunk or draft walk must not refill a shared scratch
     # (see `stage_h2d_upload`).
@@ -831,6 +850,7 @@ def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_ke
         ctx.position_ids_override is None
         and prev is not None
         and prev[0] == table_geom
+        and prev[1] is not None
         and torch.equal(prev[1], flat)
     ):
         staged_dev = prev[2]
@@ -845,6 +865,61 @@ def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_ke
     # Dummy runs (zero-filled) never key a reuse.
     key = stage_key if ctx.position_ids_override is None else None
     runner._block_table_stage_prev = (table_geom, flat.clone(), staged_dev, key)
+    return staged_dev
+
+
+def _pack_delta(runner, ctx, entries, num_reqs_padded, table_geom, total):
+    """Re-pack only the tables whose rows changed since the previous pack of
+    the same layout, and upload only when one did. The full pack zero-fills,
+    copies and compares the whole staged buffer (a few MB at 59 groups) every
+    time any one table changed.
+
+    The packed tables live in a CPU mirror that is never an H2D source; an
+    upload copies it into a fresh per-walk buffer (see `zeros_h2d_source`), so
+    an in-flight transfer never sees the mirror change."""
+    mirror = runner.__dict__.get("_block_table_pack_mirror")
+    if mirror is None or mirror.numel() < total:
+        mirror = torch.zeros((total,), dtype=torch.int32, device="cpu")
+        runner._block_table_pack_mirror = mirror
+    flat = mirror[:total]
+    layout = (
+        tuple(table_geom),
+        tuple(id(bt) for _, bt, _ in entries),
+        ctx.start_index,
+        ctx.num_reqs,
+        flat.data_ptr(),
+    )
+    state = runner.__dict__.get("_block_table_pack_delta")
+    full = state is None or state[0] != layout
+    versions: list[int | None]
+    if full:
+        flat.zero_()
+        versions = [None] * len(entries)
+    else:
+        versions = state[1]
+    flat_np = flat.numpy()
+    start, n = ctx.start_index, ctx.num_reqs
+    changed = full
+    for i, (_, block_table_obj, target_num_blocks) in enumerate(entries):
+        version = getattr(block_table_obj, "_tpu_version", 0)
+        if not full and versions[i] == version:
+            continue
+        off = table_geom[i][0]
+        rows = flat_np[off : off + num_reqs_padded * target_num_blocks].reshape(
+            num_reqs_padded, target_num_blocks
+        )
+        rows[:n] = block_table_obj.get_numpy_array()[
+            start : start + n, :target_num_blocks
+        ]
+        versions[i] = version
+        changed = True
+    if changed or state is None or state[2] is None:
+        source = zeros_h2d_source(runner, total)
+        source.copy_(flat)
+        staged_dev = stage_h2d_upload(runner, source)
+    else:
+        staged_dev = state[2]
+    runner._block_table_pack_delta = (layout, versions, staged_dev)
     return staged_dev
 
 
