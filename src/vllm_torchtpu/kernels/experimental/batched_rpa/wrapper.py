@@ -998,18 +998,30 @@ def ragged_paged_attention(
             lse_out = None
         return o_out, kv_out, lse_out
 
+    # DECODE alone over every sequence, and any other call skips MIXED at run
+    # time (lax.cond) when its sequence range is empty. Otherwise DECODE and
+    # MIXED both run on every call. The conditional, one per attention layer,
     effective_decode_blocks = decode_block_sizes or default_decode
     if (
+        skip_empty_mixed
+        and serve_cfgs.total_q_tokens
         <= min(decode_query_size, effective_decode_blocks.bq_sz)
         and cp_group_size is None
     ):
         decode_dist = jnp.repeat(distribution[2:3], 3)
         o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
             configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init, decode_dist
+        )
+    elif not skip_empty_mixed:
         o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
             configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
         )
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
+        )
     else:
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
         )
         # Skip the MIXED call when its sequence range
         # [distribution[0], distribution[2]) (`configs.RpaConfigs.seq_range`)
