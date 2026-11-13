@@ -223,7 +223,10 @@ def compute_placement(
         r = min(cands, key=lambda c: (rank_load[c] + added[c], slots - free[c], c))
         assign[i] = r
         free[r] -= 1
-        added[r] += weights.get(logical, 0.0)
+        # The two copies then share the expert's load about evenly.
+        share = weights.get(logical, 0.0) / 2
+        added[r] += share
+        added[home] -= share
     rep: list[int] = [-1] * total
     next_slot = [0] * ep
     for i, logical in enumerate(chosen):
@@ -252,7 +255,9 @@ def layer_key(name: str) -> str:
 # Placement source
 # ---------------------------------------------------------------------------
 
-_BUILTIN: dict[str, dict[str, list[int]]] = {}
+# Placement tables measured on served routing (route-trace lines), one JSON per
+# workload: {"moe<i>": {"<expert>": <% of decode steps touching it>, ...}}.
+_BUILTIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe_placements")
 
 _placement_cache: dict[str, Any] | None = None
 
@@ -263,12 +268,16 @@ def _load_source(spec: str) -> dict[str, Any]:
         return {}
     if spec.startswith("builtin:"):
         name = spec.split(":", 1)[1]
-        if name not in _BUILTIN:
+        path = os.path.join(_BUILTIN_DIR, f"{name}.json")
+        if not os.path.isfile(path):
+            have = sorted(f[:-5] for f in os.listdir(_BUILTIN_DIR) if f.endswith(".json"))
             raise ValueError(
                 f"VLLM_TPU_MOE_REDUNDANT_PLACEMENT={spec!r}: unknown builtin "
-                f"(have {sorted(_BUILTIN)})"
+                f"(have {have})"
             )
-        return dict(_BUILTIN[name])
+        with open(path) as f:
+            data = json.load(f)
+        return {k: v for k, v in data.items() if not k.startswith("_")}
     if spec.startswith("{"):
         data = json.loads(spec)
     else:
