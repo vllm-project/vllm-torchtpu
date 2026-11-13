@@ -80,11 +80,14 @@ def min_over_group(value: int, cpu_group: Any) -> int:
 
 
 def dp_engines_in_lockstep(parallel_config) -> bool:
-    """Whether EP couples the DP engines. Their MoE combine reduces partial
-    expert outputs across engines, so every engine must enter the same
-    collectives with matching token buckets each step; uncoupled DP engines
-    stay independently schedulable."""
-    return get_dp_size(parallel_config) > 1 and parallel_config.enable_expert_parallel
+    """Whether EP (or a model's cross-DP collectives, see distributed/dp_world)
+    couples the DP engines. Their MoE combine reduces partial expert outputs
+    across engines, so every engine must enter the same collectives with
+    matching token buckets each step; uncoupled DP engines stay independently
+    schedulable."""
+    from vllm_torchtpu.distributed.dp_world import unified_dp_world
+
+    return get_dp_size(parallel_config) > 1 and unified_dp_world(parallel_config)
 
 
 def ep_rank(
