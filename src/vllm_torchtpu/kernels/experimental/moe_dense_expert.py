@@ -311,8 +311,8 @@ _FP4_ACTIVATIONS = {
     "silu": lambda gate, up: jax.nn.silu(gate) * up,
     "swigluoai": swigluoai,
 }
-# Down-projection output columns per accumulator: bounds the live f32 tile.
-_FP4_DOWN_COLS = 2048
+# Most down-projection output columns per accumulator: bounds the live f32 tile.
+_FP4_MAX_DOWN_COLS = 2048
 _MAX_FP4_EXPERT_BUFFERS = 4
 
 
@@ -320,6 +320,13 @@ def _fp4_expert_bytes(h, i, bk1, bk2):
     """VMEM of one FP4 expert slot. A [blocks, 1, N] f32 scale pads its unit
     sublane dimension to a full 8-row tile."""
     return h * i + 4 * 8 * (h // bk1 * 2 * i + i // bk2 * h)
+
+
+def _down_cols(h, lanes):
+    """The widest lane-aligned divisor of h up to _FP4_MAX_DOWN_COLS."""
+    return max(
+        c for c in range(lanes, min(h, _FP4_MAX_DOWN_COLS) + 1, lanes) if h % c == 0
+    )
 
 
 def _select_fp4_expert_buffers(m, h, i, experts, bk1, bk2, vmem_capacity_bytes):
@@ -362,7 +369,7 @@ def can_use_dense_expert_fp4(
         return False
     tpu_info = pltpu.get_tpu_info()
     lanes = tpu_info.num_lanes
-    if h % _FP4_DOWN_COLS or i % lanes or bk1 % lanes or bk2 % lanes:
+    if h % lanes or i % lanes or bk1 % lanes or bk2 % lanes:
         return False
     if not tpu_info.is_matmul_supported(jnp.bfloat16, _FP8):
         return False
@@ -404,6 +411,7 @@ def _kernel_fp4(
     owner_ref[...] = jnp.zeros((m, h), jnp.float32)
     expert_columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
     act_fn = _FP4_ACTIVATIONS[activation]
+    down_cols = _down_cols(h, pltpu.get_tpu_info().num_lanes)
 
     def compute(e, slot):
         coeff = jnp.sum(
@@ -422,23 +430,21 @@ def _kernel_fp4(
             )
             acc += part * s1_ref[slot, b]
         act = act_fn(acc[:, :i], acc[:, i:]).astype(jnp.bfloat16)
-        for n in range(0, h, _FP4_DOWN_COLS):
-            acc2 = jnp.zeros((m, _FP4_DOWN_COLS), jnp.float32)
+        for n in range(0, h, down_cols):
+            acc2 = jnp.zeros((m, down_cols), jnp.float32)
             for b in range(i // bk2):
-                rhs = w2_ref[
-                    slot, b * bk2 : (b + 1) * bk2, n : n + _FP4_DOWN_COLS
-                ].astype(_FP8)
+                rhs = w2_ref[slot, b * bk2 : (b + 1) * bk2, n : n + down_cols].astype(
+                    _FP8
+                )
                 part = jnp.matmul(
                     act[:, b * bk2 : (b + 1) * bk2],
                     rhs,
                     preferred_element_type=jnp.float32,
                 )
-                acc2 += part * s2_ref[slot, b, :, n : n + _FP4_DOWN_COLS]
+                acc2 += part * s2_ref[slot, b, :, n : n + down_cols]
             down = acc2.astype(jnp.bfloat16).astype(jnp.float32)
             # Zero routing must suppress even non-finite unused expert outputs.
-            owner_ref[:, n : n + _FP4_DOWN_COLS] += jnp.where(
-                coeff != 0, down * coeff, 0
-            )
+            owner_ref[:, n : n + down_cols] += jnp.where(coeff != 0, down * coeff, 0)
 
     def compact(e, count):
         @pl.when(active_ref[e] != 0)
