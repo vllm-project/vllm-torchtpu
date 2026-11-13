@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""VLLM_TPU_QSA_UNION_LEAN_GLUE and VLLM_TPU_QSA_INDEXER_META_SELECT on TPU
-(DCP2_HARNESS_DEVICE=tpu; skipped elsewhere).
+"""VLLM_TPU_QSA_UNION_LEAN_GLUE, VLLM_TPU_QSA_UNION_CHAINED_CALLS and
+VLLM_TPU_QSA_INDEXER_META_SELECT on TPU (DCP2_HARNESS_DEVICE=tpu; skipped
+elsewhere).
 
 On every rank of a DCP group of 4, in the served union decode env:
 
 - the compressed-DCP select step with VLLM_TPU_QSA_INDEXER_META_SELECT against
   without: all eight outputs equal in bits;
-- the attend step with VLLM_TPU_QSA_UNION_LEAN_GLUE against without, for the
+- the attend step with VLLM_TPU_QSA_UNION_LEAN_GLUE, with
+  VLLM_TPU_QSA_UNION_CHAINED_CALLS and with both, against neither, for the
   local merge and the global merge: the same pool bytes, attention output, LSE
   and ``selected``, bit for bit, and no NaN in the flag-off output's rows;
 - three steps: 64 rows in 16 request slots (one call over the step's rows, a
   request with no rows, rows past the last request), 16 rows in 32 slots (the
-  served 16-row shape, 28 slots with no rows), and 192 rows in 48 slots (two calls of
-  128 rows, where only the selection layout changes); random keys and mostly
-  zero compressed keys.
+  served 16-row shape, 28 slots with no rows), and 192 rows in 48 slots (two
+  calls: sliced, or chained over the step's rows); random keys and mostly zero
+  compressed keys.
 
 The compiled attend step holds the union metadata kernel in every case, so the
 union path is the one compared. The report line prints, from the compiled
@@ -67,6 +69,12 @@ STEPS = {  # query lens, contexts
     "rows192": ([4] * 48, [37 + 331 * i for i in range(48)]),
 }
 VARIANTS = ("random", "zero_keys")
+ATTEND_FLAGS = {  # VLLM_TPU_QSA_UNION_LEAN_GLUE, VLLM_TPU_QSA_UNION_CHAINED_CALLS
+    "off": ("0", "0"),
+    "lean": ("1", "0"),
+    "chained": ("0", "1"),
+    "both": ("1", "1"),
+}
 
 
 def _glue(text):
@@ -157,8 +165,9 @@ def test_tpu_attn_glue_flags_the_same(monkeypatch, step_name, variant):
     vals_pair = jnp.stack([x[6] for x in selects])
     pos_pair = jnp.stack([x[7] for x in selects])
 
-    def attend(flag, local_merge):
-        monkeypatch.setenv("VLLM_TPU_QSA_UNION_LEAN_GLUE", flag)
+    def attend(flags, local_merge):
+        monkeypatch.setenv("VLLM_TPU_QSA_UNION_LEAN_GLUE", ATTEND_FLAGS[flags][0])
+        monkeypatch.setenv("VLLM_TPU_QSA_UNION_CHAINED_CALLS", ATTEND_FLAGS[flags][1])
         step = jax.jit(
             functools.partial(
                 pooled_qsa.pooled_qsa_compressed_dcp_attend_step,
@@ -189,21 +198,25 @@ def test_tpu_attn_glue_flags_the_same(monkeypatch, step_name, variant):
 
     for local_merge in (True, False):
         merge = "local" if local_merge else "global"
-        base, text = attend("0", local_merge)
-        lean, text_on = attend("1", local_merge)
+        base, text = attend("off", local_merge)
         if "qsa_union_meta" not in text:
             failures.append(f"{merge}: the union metadata kernel is not compiled")
         for r in range(DCP):
-            for i, name in ((0, "pool"), (1, "out"), (2, "lse"), (3, "selected")):
-                if not np.array_equal(_bits(lean[r][i]), _bits(base[r][i])):
-                    failures.append(f"{merge} rank {r}: {name} differs")
             if np.isnan(base[r][1][: int(starts[-1])]).any():
                 failures.append(f"{merge} rank {r}: NaN in the flag-off output")
-        report[f"{merge} glue off/on"] = (_glue(text), _glue(text_on))
-        report[f"{merge}"] = (
-            "bit-equal"
-            if not any(f.startswith(f"{merge} ") for f in failures)
-            else "differs"
-        )
+        glue = {"off": _glue(text)}
+        for flags in ("lean", "chained", "both"):
+            got, glue_text = attend(flags, local_merge)
+            glue[flags] = _glue(glue_text)
+            for r in range(DCP):
+                for i, name in ((0, "pool"), (1, "out"), (2, "lse"), (3, "selected")):
+                    if not np.array_equal(_bits(got[r][i]), _bits(base[r][i])):
+                        failures.append(f"{merge} {flags} rank {r}: {name} differs")
+            report[f"{merge} {flags}"] = (
+                "bit-equal"
+                if not any(f.startswith(f"{merge} {flags} ") for f in failures)
+                else "differs"
+            )
+        report[f"{merge} glue"] = glue
     print(step_name, variant, report)
     assert not failures, failures

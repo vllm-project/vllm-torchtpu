@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Host-side checks of VLLM_TPU_QSA_UNION_LEAN_GLUE and
-VLLM_TPU_QSA_INDEXER_META_SELECT; the kernels themselves are compared on TPU in
+"""Host-side checks of VLLM_TPU_QSA_UNION_LEAN_GLUE,
+VLLM_TPU_QSA_UNION_CHAINED_CALLS and VLLM_TPU_QSA_INDEXER_META_SELECT; the
+kernels themselves are compared on TPU in
 tests/kernels/qwen4_exp/dcp2/test_dcp2_attn_glue_flags_tpu.py.
 
 - The union decode attention's calls, with the batched RPA replaced by a fake
-  that writes rows the way the kernel does (rows of the call's sequences, the
-  rest keep the aliased query): flag on and off give the same output and LSE,
-  and with the flag a step one call covers is one call over its own rows whose
+  that writes rows the way the kernel does (rows of the call's sequences; the
+  rest keep their buffer's values): every flag setting gives the flag-off
+  output and LSE; with VLLM_TPU_QSA_UNION_LEAN_GLUE a step one call covers is
+  one call over its own rows, with VLLM_TPU_QSA_UNION_CHAINED_CALLS each of
+  several calls runs over the step's rows on the previous call's buffers, and
   padded request slots schedule nothing.
 - The selection mask built from word rows equals the one built from the
   padded layout, and the kernel metadata of a call without word rows is what
@@ -38,10 +41,28 @@ HEAD_DIM, HEADS = 192, 12
 
 
 def _fake_rpa(calls):
+    """The batched RPA's row contract: each row of the call's sequences gets a
+    value from its query, its sequence's kv length and selection words; every
+    other row keeps what its buffer held (the query, or under ``carry`` an
+    earlier call's output). Buffers are in the kernel's layout, as the wrapper
+    returns them with return_carry."""
+
     def rpa(
-        query, keys, values, cache, kv_lens, pages, cu, dist, *, selection_bits, **kw
+        query,
+        keys,
+        values,
+        cache,
+        kv_lens,
+        pages,
+        cu,
+        dist,
+        *,
+        selection_bits,
+        carry=None,
+        return_carry=False,
+        **kw,
     ):
-        rows = query.shape[0]
+        rows, heads, dim = query.shape
         calls.append(
             dict(
                 rows=rows,
@@ -49,15 +70,27 @@ def _fake_rpa(calls):
                 cu=np.asarray(cu),
                 kv_lens=np.asarray(kv_lens),
                 word_rows=kw.get("selection_word_rows", False),
+                carried=carry is not None,
             )
         )
+        if carry is None:
+            buf = query.reshape(1, rows, heads, 1, dim)
+            lse_buf = jnp.full((1, rows, heads, 1, 128), -jnp.inf, jnp.float32)
+        else:
+            buf, lse_buf = carry
+        view = buf.reshape(rows, heads, dim)
         row = jnp.arange(rows)
         seq = jnp.clip(jnp.searchsorted(cu[1:], row, side="right"), 0, len(kv_lens) - 1)
         inside = (row >= cu[0]) & (row < cu[-1])
         words = jnp.sum(selection_bits % 7, axis=1).astype(jnp.float32)
         bias = (kv_lens[seq].astype(jnp.float32) + words[seq])[:, None, None]
-        out = jnp.where(inside[:, None, None], query * 2 + bias, query)
-        lse = jnp.where(inside[:, None], query[..., 0] + bias[..., 0], -jnp.inf)
+        view = jnp.where(inside[:, None, None], view * 2 + bias, view)
+        lse_rows = (view[..., 0] + bias[..., 0])[None, :, :, None, None]
+        lse_buf = jnp.where(inside[None, :, None, None, None], lse_rows, lse_buf)
+        buf = view.reshape(1, rows, heads, 1, dim)
+        if return_carry:
+            return buf, cache, lse_buf
+        out, lse = wrapper.finish_carry((buf, lse_buf), query.shape, 1, query.dtype)
         return out, cache, lse
 
     return rpa
@@ -93,24 +126,33 @@ CASES = {
     "32 rows from row 4": (32, [4] * 5 + [3, 2], 32, 4),
     "128 rows": (128, [4] * 32, 32, 0),
     "192 rows, two calls": (192, [4] * 48, 64, 0),
+    "256 rows, second call partly empty": (256, [4] * 40 + [2, 3] + [4] * 10, 64, 0),
+    "384 rows, three calls": (384, [4] * 90 + [3] * 2, 96, 0),
+}
+FLAGS = {  # VLLM_TPU_QSA_UNION_LEAN_GLUE, VLLM_TPU_QSA_UNION_CHAINED_CALLS
+    "off": ("0", "0"),
+    "lean": ("1", "0"),
+    "chained": ("0", "1"),
+    "both": ("1", "1"),
 }
 
 
 @pytest.mark.parametrize("case", sorted(CASES))
-def test_union_lean_glue_same_rows_one_call_over_the_step(monkeypatch, case):
+def test_union_lean_glue_same_rows_one_buffer_over_the_step(monkeypatch, case):
+    _tpu7x_info(monkeypatch)
     rows, query_lens, slots, first = CASES[case]
     for key, value in UNION_ENV.items():
         monkeypatch.setenv(key, value)
-    q, meta = _step(
-        np.random.default_rng(len(query_lens) + rows), query_lens, slots, rows, first
-    )
+    rng = np.random.default_rng(len(query_lens) + rows)
+    q, meta = _step(rng, query_lens, slots, rows, first)
     cache = jnp.zeros((8, 512, 1, 4, 256), jnp.float8_e4m3fn)
     dcp = (jnp.zeros((1,), jnp.int32), 4)
     results, calls = {}, {}
-    for flag in ("0", "1"):
-        monkeypatch.setenv("VLLM_TPU_QSA_UNION_LEAN_GLUE", flag)
-        calls[flag] = []
-        monkeypatch.setattr(wrapper, "ragged_paged_attention", _fake_rpa(calls[flag]))
+    for name, (lean, chained) in FLAGS.items():
+        monkeypatch.setenv("VLLM_TPU_QSA_UNION_LEAN_GLUE", lean)
+        monkeypatch.setenv("VLLM_TPU_QSA_UNION_CHAINED_CALLS", chained)
+        calls[name] = []
+        monkeypatch.setattr(wrapper, "ragged_paged_attention", _fake_rpa(calls[name]))
         out, lse, _ = qsa_rpa.union_decode_attention(
             q,
             None,
@@ -127,26 +169,42 @@ def test_union_lean_glue_same_rows_one_call_over_the_step(monkeypatch, case):
             read_only=True,
             metadata=meta,
         )
-        results[flag] = (np.asarray(out), np.asarray(lse))
-    for i, name in ((0, "out"), (1, "lse")):
-        assert np.array_equal(
-            results["0"][i].view(np.uint32), results["1"][i].view(np.uint32)
-        ), f"{case}: {name} differs"
-    assert results["1"][0].shape == (rows, HEADS, HEAD_DIM)
-    assert all(c["rows"] == 128 and not c["word_rows"] for c in calls["0"])
-    assert all(c["word_rows"] for c in calls["1"])
-    if rows > 128:
-        assert [c["rows"] for c in calls["1"]] == [128, 128]
-        return
-    (call,) = calls["1"]
-    assert call["rows"] == call["keys"] == rows
+        results[name] = (np.asarray(out), np.asarray(lse))
+    for name in FLAGS:
+        for i, what in ((0, "out"), (1, "lse")):
+            assert np.array_equal(
+                results["off"][i].view(np.uint32), results[name][i].view(np.uint32)
+            ), f"{case}: {what} differs with {name}"
+    assert results["off"][0].shape == (rows, HEADS, HEAD_DIM)
+    assert np.any(np.asarray(meta[4])), "no live row"
+    chunks = slots // 32
+    assert all(c["rows"] == 128 and not c["word_rows"] for c in calls["off"])
+    assert all(c["word_rows"] for f in ("lean", "both") for c in calls[f])
     starts = np.asarray(meta[0])
-    assert np.array_equal(call["cu"], np.clip(starts, 0, rows))
-    # Request slots past the live requests schedule nothing: no rows, no keys.
     live = len(query_lens)
-    assert np.all(np.diff(call["cu"])[live:] == 0) and np.all(
-        call["kv_lens"][live:] == 0
-    )
+    if chunks == 1:
+        # One call: the chained flag alone leaves the sliced call.
+        assert [c["rows"] for c in calls["chained"]] == [128]
+        for name in ("lean", "both"):
+            (call,) = calls[name]
+            assert call["rows"] == call["keys"] == rows and not call["carried"]
+            assert np.array_equal(call["cu"], np.clip(starts, 0, rows))
+            # Request slots past the live requests schedule nothing.
+            assert np.all(np.diff(call["cu"])[live:] == 0)
+            assert np.all(call["kv_lens"][live:] == 0)
+        return
+    assert [c["rows"] for c in calls["lean"]] == [128] * chunks
+    for name in ("chained", "both"):
+        assert [c["rows"] for c in calls[name]] == [rows] * chunks
+        assert [c["carried"] for c in calls[name]] == [False] + [True] * (chunks - 1)
+        cu = [c["cu"] for c in calls[name]]
+        for k in range(chunks):
+            edges = starts[32 * k : 32 * k + 33]
+            want = np.clip(edges, edges[0], min(edges[0] + 128, rows))
+            assert np.array_equal(cu[k], want), (name, k)
+        # Every live row is in exactly one call; padded slots schedule nothing.
+        lens = np.concatenate([np.diff(x) for x in cu])
+        assert lens.sum() == sum(query_lens) and np.all(lens[live:] == 0)
 
 
 def _tpu7x_info(monkeypatch):

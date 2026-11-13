@@ -538,8 +538,14 @@ def union_decode_attention(
     # the step's own rows, so its query, output and LSE buffers have the step's
     # size and call row r is step row r. A row before starts[0] belongs to no
     # request; union_row_live masks whatever the kernel leaves in it.
+    # VLLM_TPU_QSA_UNION_CHAINED_CALLS: with several calls, each runs over the
+    # whole step too and takes the previous call's output and LSE buffers, in
+    # the kernel's layout, as its own (wrapper carry). A call reads the queries
+    # of its own sequences, rows no earlier call wrote, and writes only them.
     lean = bool(envs.VLLM_TPU_QSA_UNION_LEAN_GLUE)
-    whole = lean and chunks == 1 and len(q) <= call_rows
+    chained = bool(envs.VLLM_TPU_QSA_UNION_CHAINED_CALLS) and chunks > 1
+    whole = (lean and chunks == 1 and len(q) <= call_rows) or chained
+    span = call_rows
     if whole:
         call_rows = len(q)
     # Rows past the last call's slice are padding, so a slice never clamps.
@@ -558,10 +564,18 @@ def union_decode_attention(
     skip = envs.VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY
     out = None if whole else jnp.zeros(query.shape, jnp.float32)
     lse = None if whole else jnp.full(query.shape[:2], -jnp.inf, jnp.float32)
+    carry = None
     for c in range(chunks):
         first = c * UNION_REQUESTS
         part = slice(first, first + UNION_REQUESTS)
         row0 = 0 if whole else starts[first]
+        edges = starts[first : first + UNION_REQUESTS + 1]
+        if chained:
+            # The rows a sliced call would attend, [starts[first], + span),
+            # in step coordinates.
+            cu_q_lens = jnp.clip(edges, edges[0], jnp.minimum(edges[0] + span, len(q)))
+        else:
+            cu_q_lens = jnp.clip(edges - row0, 0, call_rows)
         out_c, virtual_cache, lse_c = wrapper.ragged_paged_attention(
             query if whole else jax.lax.dynamic_slice_in_dim(query, row0, call_rows),
             dummy_k,
@@ -572,7 +586,7 @@ def union_decode_attention(
             # A request of more than max_query_len rows (the precompile's
             # dummy steps) could carry a call past its query slice; rows
             # past the slice are not attended.
-            jnp.clip(starts[first : first + UNION_REQUESTS + 1] - row0, 0, call_rows),
+            cu_q_lens,
             jnp.full((3,), UNION_REQUESTS, jnp.int32),
             sm_scale=q.shape[-1] ** -0.5,
             q_scale=None,
@@ -597,7 +611,11 @@ def union_decode_attention(
             **({"read_only_cache": True} if read_only else {}),
             schedule_in_hbm=envs.VLLM_TPU_RPA_SCHEDULE_HBM,
             **({"selection_word_rows": True} if lean else {}),
+            **({"carry": carry, "return_carry": True} if chained else {}),
         )
+        if chained:
+            carry = (out_c, lse_c)
+            continue
         if whole:
             out, lse = out_c, lse_c.astype(jnp.float32)
             continue
@@ -605,6 +623,8 @@ def union_decode_attention(
         # value its own call wrote.
         out = jax.lax.dynamic_update_slice_in_dim(out, out_c, row0, 0)
         lse = jax.lax.dynamic_update_slice_in_dim(lse, lse_c.astype(jnp.float32), row0, 0)
+    if chained:
+        out, lse = wrapper.finish_carry(carry, query.shape, 1, query.dtype)
     out = jnp.where(live[:, None, None], out[: len(q), :, : q.shape[-1]], 0)
     lse = jnp.where(live[:, None], lse[: len(q)], -jnp.inf)
     return out, lse, virtual_cache.reshape(cache.shape)

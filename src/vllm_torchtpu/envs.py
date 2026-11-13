@@ -195,6 +195,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_MERGE_SCORES: bool = False
     VLLM_TPU_RPA_SCHEDULE_HBM: bool = False
     VLLM_TPU_QSA_UNION_LEAN_GLUE: bool = False
+    VLLM_TPU_QSA_UNION_CHAINED_CALLS: bool = False
     VLLM_TPU_QSA_INDEXER_META_SELECT: bool = False
     VLLM_TPU_QSA_DCP_MERGE: str = ""
     VLLM_TPU_QSA_DCP_MERGE_CHECK: bool = False
@@ -1096,6 +1097,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selection words as [tiles * bkv / 128, 1, 128], the union kernel's flat
     # output without a relayout. Same results.
     "VLLM_TPU_QSA_UNION_LEAN_GLUE": env_bool("VLLM_TPU_QSA_UNION_LEAN_GLUE"),
+    # With VLLM_TPU_QSA_DECODE_RPA_UNION: a step of several union RPA calls
+    # runs each over the step's rows and threads one output and one LSE buffer
+    # through them in the kernel's layout, in place of a padded query sliced
+    # per call and each call's output scattered back. Same results.
+    "VLLM_TPU_QSA_UNION_CHAINED_CALLS": env_bool("VLLM_TPU_QSA_UNION_CHAINED_CALLS"),
     # The indexer kernel's step metadata is selected (empty pass: zeros) rather
     # than computed in a conditional, whose small outputs XLA places in VMEM
     # and then copies to HBM before every StreamIdxTC call. Same integers.
