@@ -48,7 +48,10 @@ from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
-from vllm_torchtpu.compilation.graph_fingerprint import _graph_fingerprint
+from vllm_torchtpu.compilation.graph_fingerprint import (
+    _graph_fingerprint,
+    graph_is_rank_dependent,
+)
 from vllm_torchtpu.gdn_pool_layout import prefill_checkpoint_enabled
 from vllm_torchtpu.logger import init_logger
 
@@ -936,14 +939,17 @@ class TpuCompilerAdaptor(CompilerInterface):
         # that rank; this rank's cache entry becomes a hard link to it.
         # With peer replay off, nothing replays another rank's artifact, so
         # none records a fingerprint either: `load` replays a rank's own
-        # artifact without one, and a peer with replay on refuses it.
+        # artifact without one, and a peer with replay on refuses it. A
+        # rank-dependent graph always records its rank-salted fingerprint:
+        # `load` checks it (see there).
+        caching = save_path is not None
+        peer_replay = caching and envs.TPU_PRECOMPILE_PEER_REPLAY
+        rank_dependent = caching and graph_is_rank_dependent(graph)
         peer = None
         fingerprint = (
-            _graph_fingerprint(graph)
-            if save_path is not None and envs.TPU_PRECOMPILE_PEER_REPLAY
-            else None
+            _graph_fingerprint(graph) if peer_replay or rank_dependent else None
         )
-        if fingerprint is not None:
+        if peer_replay and fingerprint is not None:
             assert key is not None
             peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
         if peer is not None:
@@ -994,7 +1000,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         del entry
         # Under peer replay, other ranks of the host may be waiting for this
         # artifact: say so when it will not come, so they compile it now.
-        if fingerprint is not None:
+        if peer_replay and fingerprint is not None:
             assert key is not None
             if handle is None:
                 self._mark_failed(key, fingerprint)
@@ -1066,10 +1072,29 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        compiled_fn = self._replay(path, graph, was_wrapped)
+        # A rank-dependent graph's artifact must carry this rank's salted
+        # fingerprint. Caches written before the salt existed may hold a
+        # peer's artifact hard-linked into this rank's dir (an earlier peer
+        # replay), which would compute the peer's shard: such an artifact, or
+        # one with no fingerprint, is recompiled once and overwritten below.
+        rank_fingerprint = None
+        rank_dependent = graph_is_rank_dependent(graph)
+        if rank_dependent:
+            rank_fingerprint = _graph_fingerprint(graph)
+        compiled_fn = (
+            None
+            if rank_dependent and rank_fingerprint is None
+            else self._replay(path, graph, was_wrapped, rank_fingerprint)
+        )
         if compiled_fn is None:
             fingerprint = (
-                _graph_fingerprint(graph) if envs.TPU_PRECOMPILE_PEER_REPLAY else None
+                rank_fingerprint
+                if rank_dependent
+                else (
+                    _graph_fingerprint(graph)
+                    if envs.TPU_PRECOMPILE_PEER_REPLAY
+                    else None
+                )
             )
             compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
@@ -1098,3 +1123,23 @@ class TpuCompilerAdaptor(CompilerInterface):
         if size is not None:
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn
+
+
+def agree_all_ranks(ok: bool) -> bool:
+    """True only if every rank passes `ok` (a MIN all-reduce on the world CPU
+    group). Lets the ranks fail a rank-dependent compile together."""
+    import torch.distributed as dist
+
+    if (
+        not (dist.is_available() and dist.is_initialized())
+        or dist.get_world_size() == 1
+    ):
+        return ok
+    group = None
+    with contextlib.suppress(Exception):
+        from vllm.distributed.parallel_state import get_world_group
+
+        group = get_world_group().cpu_group
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    return bool(flag.item())
