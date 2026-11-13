@@ -7069,6 +7069,7 @@ class TPUModelRunner(GPUModelRunner):
                 pairs.append((num_tokens, num_reqs))
                 if num_reqs >= min(num_tokens, self.max_num_reqs):
                     break
+        head_pairs = list(pairs)
         pairs = _rotate_precompile_sweep(pairs, "rejection_sampler")
         with self._precompile_timed("rejection_sampler"):
             # padded_logits_length-shaped inputs, rebuilt when the length
@@ -7236,6 +7237,7 @@ class TPUModelRunner(GPUModelRunner):
                     num_tokens,
                     num_reqs,
                 )
+        self._precompile_synthetic_verify_heads(head_pairs)
 
     def _precompile_synthetic_verify(
         self,
@@ -7299,17 +7301,6 @@ class TPUModelRunner(GPUModelRunner):
                 counter,
                 self.rejection_sampler.synthetic_conditional_rates,
             )
-            if envs.TPU_SPEC_SYNTHETIC_HEAD_FUSION:
-                self._precompile_synthetic_verify_head(
-                    draft_token_ids,
-                    target_logits_indices,
-                    segment_ids,
-                    group_indices,
-                    draft_lengths,
-                    bonus_logits_indices,
-                    counter,
-                    variants,
-                )
             for variant in variants:
                 out, _ = synthetic_sample_and_assemble_rng(
                     logits,
@@ -7346,28 +7337,61 @@ class TPUModelRunner(GPUModelRunner):
             )
             synchronize_tensors(out)
 
+    def _precompile_synthetic_verify_heads(
+        self, pairs: list[tuple[int, int]]
+    ) -> None:
+        """synthetic_verify_head at every (padded_logits_length,
+        padded_num_reqs) pair of the rejection-sampler sweep, on
+        padded_logits_length hidden rows (a decode-only chunk), in every
+        sampler variant. The LM head inside holds the vocab all-gather, so
+        unlike the rejection-sampler sweep this one is not rotated: every
+        rank compiles and runs the shapes in the same order."""
+        if not (
+            envs.TPU_SPEC_SYNTHETIC_HEAD_FUSION
+            and envs.TPU_SPEC_SYNTHETIC_INGRAPH_RNG
+            and envs.TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY
+            and self.rejection_sampler is not None
+            and self.rejection_sampler.synthetic_mode
+        ):
+            return
+        assert self.rejection_sampler.synthetic_conditional_rates is not None
+        assert self.speculative_config is not None
+        variants: list[dict] = [
+            {},
+            {"apply_topk_topp": False},
+            {"apply_top_k": False},
+        ]
+        if blocks := self._topk_candidate_blocks():
+            variants.append({"topk_candidates": blocks})
+        hsize = self.model_config.get_hidden_size()
+        counter = torch.zeros((), dtype=torch.int32).to(self.device)
+        with self._precompile_timed("synthetic_verify_head"):
+            for num_tokens, num_reqs in pairs:
+                self._precompile_synthetic_verify_head(
+                    num_tokens, num_reqs, hsize, counter, variants
+                )
+
     def _precompile_synthetic_verify_head(
         self,
-        draft_token_ids: torch.Tensor,
-        target_logits_indices: torch.Tensor,
-        segment_ids: torch.Tensor,
-        group_indices: torch.Tensor,
-        draft_lengths: torch.Tensor,
-        bonus_logits_indices: torch.Tensor,
+        num_tokens: int,
+        num_reqs: int,
+        hsize: int,
         counter: torch.Tensor,
         variants: list[dict],
     ) -> None:
-        """synthetic_verify_head at one (padded_logits_length,
-        padded_num_reqs) pair, on padded_logits_length hidden rows (a
-        decode-only chunk), in every sampler variant."""
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
-        num_tokens = draft_token_ids.shape[0]
-        num_reqs = draft_lengths.shape[0]
-        hidden = torch.zeros(
-            (num_tokens, self.model_config.get_hidden_size()),
-            dtype=self._hidden_states_dtype,
-        ).to(self.device)
+        hidden = torch.zeros((num_tokens, hsize), dtype=self._hidden_states_dtype).to(
+            self.device
+        )
+        draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
+        target_logits_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
+            self.device
+        )
+        segment_ids = torch.zeros(num_tokens, dtype=torch.int64).to(self.device)
+        group_indices = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
+        draft_lengths = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
+        bonus_logits_indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
         temps = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
         top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
         top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
