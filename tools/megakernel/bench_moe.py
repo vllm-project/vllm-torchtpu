@@ -232,6 +232,13 @@ class _Inputs:
     margin: float  # smallest 16th-17th biased score gap of this rank's rows
     scaled: int  # rows whose target logits were scaled to stay reachable
 
+    def digest(self) -> str:
+        """sha256 of this rank's operand rows and routed length."""
+        digest = hashlib.sha256(str(self.length).encode())
+        for rows in (self.residual, self.hidden):
+            digest.update(np.ascontiguousarray(rows, np.float32).tobytes())
+        return digest.hexdigest()
+
 
 def _synthesize(case, window: int, rank: int, layer: _Layer, args) -> _Inputs:
     """This rank's rows of ``case`` in a ``window``-token launch (raises when
@@ -286,13 +293,15 @@ def _build_op(mesh, window: int, mixture: bool, counting: bool):
 
         in_specs = (sharded,) * 2 + (replicated,) * 2 + (sharded,) * len(names)
     kind = "mixture" if mixture else "plain"
+    # The export cache keys on the package's sources; this wrapper is not one.
+    wrapper = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
     return register_global_op(
         f"pallas::k3_bench_moe_{kind}_w{window}",
         mesh,
         run,
         in_specs,
         (sharded,) * (2 if counting else 1),
-        export_key=repr(("bench-moe", kind, window, names)),
+        export_key=repr(("bench-moe", kind, window, names, wrapper)),
     )
 
 
@@ -519,6 +528,7 @@ def run(args, records: harness.Records) -> None:
                     "abs": float(np.abs(values).sum()),
                     "margin": inputs.margin,
                     "scaled": inputs.scaled,
+                    "inputs": inputs.digest(),
                     "sample": bits[:SAMPLE_ROWS] if args.save_output else None,
                 }
             )
@@ -526,6 +536,9 @@ def run(args, records: harness.Records) -> None:
                 "".join(s["digest"] for s in summary).encode()
             ).hexdigest()[:16]
             same = all(s["same"] for s in summary)
+            inputs_digest = hashlib.sha256(
+                "".join(s["inputs"] for s in summary).encode()
+            ).hexdigest()[:16]
             checksum = sum(s["sum"] for s in summary)
             magnitude = sum(s["abs"] for s in summary)
             margin = min(s["margin"] for s in summary)
@@ -549,8 +562,9 @@ def run(args, records: harness.Records) -> None:
                 f"{[round(t, 1) for t in times]}) | busiest chip: routed "
                 f"{loads['routed']}, GU rows {loads['gu_rows']}, visits "
                 f"{loads['visits']}, down rows {loads['down_rows']} (mean chip GU "
-                f"{loads['mean_gu_rows']:.0f}) | margin {margin:.4f} | digest "
-                f"{digest} sum {checksum:.6e} abs {magnitude:.6e}"
+                f"{loads['mean_gu_rows']:.0f}) | margin {margin:.4f} | inputs "
+                f"{inputs_digest} | digest {digest} sum {checksum:.6e} abs "
+                f"{magnitude:.6e}"
                 + ("" if same else " | LAST LAUNCH DIFFERS FROM THE FIRST")
                 + (
                     " | vs reference: max rel {max_rel:.3e} rms rel {rms_rel:.3e} "
@@ -582,6 +596,7 @@ def run(args, records: harness.Records) -> None:
                 mean_gu_rows=round(loads["mean_gu_rows"], 1),
                 margin=round(margin, 5),
                 scaled_rows=scaled,
+                inputs_digest=inputs_digest,
                 digest=digest,
                 checksum=checksum,
                 magnitude=magnitude,

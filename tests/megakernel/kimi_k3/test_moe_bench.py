@@ -180,7 +180,7 @@ def test_parse_places_served_counts_by_the_plan(tmp_path):
     order = np.stack([rng.permutation(896) for _ in range(92)])
     np.save(tmp_path / "slots.npy", logical[:2])
     cases = ml.parse(
-        f"uniform:3,serving:9:2,sweep:2,counts:{tmp_path / 'slots.npy'}",
+        f"uniform:3,serving:9:2,sweep:2,uniform:3,counts:{tmp_path / 'slots.npy'}",
         order=order,
         routes_file=str(tmp_path / "routes.npz"),
     )
@@ -189,7 +189,8 @@ def test_parse_places_served_counts_by_the_plan(tmp_path):
     assert cases[1].fits(16384) and not cases[1].fits(8192) and cases[0].fits(512)
     np.testing.assert_array_equal(cases[1].counts, logical[2][order[2]])
     assert (cases[1].window, cases[1].layer) == (9, 2)
-    assert labels[2:4] == ["serving:7:2", "serving:9:2"]  # the lightest, heaviest
+    assert labels[2] == "serving:7:2"  # sweep's lightest; its heaviest is a repeat
+    assert len(labels) == len(set(labels)) == 5
     assert labels[-2:] == [f"counts:{tmp_path / 'slots.npy'}#{i}" for i in (0, 1)]
     with pytest.raises(ValueError, match="no window 8"):
         ml.parse("serving:8:2", order=order, routes_file=str(tmp_path / "routes.npz"))

@@ -179,7 +179,10 @@ def parse(
             raise ValueError(f"--routes {spec!r}: uniform, serving, sweep or counts")
     if not cases:
         raise ValueError("--routes names no case")
-    return cases
+    unique: dict[str, Case] = {}
+    for case in cases:  # a case named twice (e.g. also picked by a sweep) runs once
+        unique.setdefault(case.label, case)
+    return list(unique.values())
 
 
 class ServedRoutes:
@@ -423,11 +426,13 @@ def check_selection(
     bias: np.ndarray,
     sets: np.ndarray,
     valid: np.ndarray,
+    least: float = 1e-3,
 ) -> float:
     """Check that every valid row of ``hidden`` (BF16 values) selects exactly
-    its 16 experts ``sets`` through ``router`` and ``bias`` (:func:`top16`),
-    and return the smallest gap between a valid row's 16th and 17th score.
-    Raises with the first row that selects other experts."""
+    its 16 experts ``sets`` through ``router`` and ``bias`` (:func:`top16`)
+    with a gap of at least ``least`` between its 16th and 17th score (so the
+    device's own rounding cannot reorder them), and return the smallest gap.
+    Raises with the first row that fails."""
     logits = matmul(np.asarray(hidden, np.float32), np.asarray(router, np.float32))
     selected, scores = top16(logits, bias)
     selected = np.sort(selected, axis=1)
@@ -439,8 +444,11 @@ def check_selection(
             f"{wrong.size} rows route elsewhere; row {row} selects "
             f"{selected[row].tolist()} instead of {expected[row].tolist()}"
         )
-    gaps = scores[:, TOP_K - 1] - scores[:, TOP_K]
-    return float(gaps[valid].min()) if valid.any() else float("inf")
+    gaps = np.where(valid, scores[:, TOP_K - 1] - scores[:, TOP_K], np.inf)
+    if gaps.min() < least:
+        row = int(np.argmin(gaps))
+        raise ValueError(f"row {row}'s 16th and 17th scores are {gaps[row]:.2e} apart")
+    return float(gaps.min())
 
 
 # ----------------------------------------------------------------- reference
