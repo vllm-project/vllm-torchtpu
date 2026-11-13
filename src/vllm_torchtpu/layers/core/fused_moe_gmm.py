@@ -23,6 +23,10 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
+from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import (
+    can_use_dense_expert_fp4,
+    dense_expert_moe_fp4,
+)
 from vllm_torchtpu.kernels.megablox import tc_combine
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     get_packing_factor,
@@ -82,6 +86,7 @@ ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VE
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
+_DENSE_FP4_MAX_TOKENS = envs.TPU_MOE_DENSE_FP4_MAX_TOKENS
 # Fixed at import: one-hot permute/combine over the valid prefix only.
 _BOUNDED_ONEHOT = envs.TPU_MOE_BOUNDED_ONEHOT
 # Fixed at import: build the MoE permutation from one packed sort.
@@ -861,6 +866,31 @@ def fused_moe_func(
             hidden_states = _zero_non_finite(hidden_states)
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+        )
+
+    # Decode under EP: a core holds few routed rows per expert and weight
+    # streaming binds, so the permutation-free kernel skips the routing sort,
+    # permute and combine around the GMM.
+    if (
+        use_ep
+        and 0 < num_tokens <= _DENSE_FP4_MAX_TOKENS
+        and rhs_quant_dtype is None
+        and w1_bias is None
+        and w2_bias is None
+        and can_use_dense_expert_fp4(
+            hidden_states, w1, w2, w1_scale, w2_scale, activation=activation
+        )
+    ):
+        logger.info_once("Selected dense-expert fp4 decode MoE")
+        return dense_expert_moe_fp4(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            activation=activation,
         )
 
     (
