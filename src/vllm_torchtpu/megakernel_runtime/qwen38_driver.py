@@ -842,8 +842,13 @@ class Qwen38SegmentDriver:
         drv.whole = _parse_flag(raw, "whole", False)
         from .qwen38_guards import whole_step_allowed
 
+        # The whole-step program carries main-KV DCP-2 on its union path
+        # (megakernel/wholestep qsa_full_b: dcp in (1, 2), union_attn only).
+        main_kv_dcp = int(envs.VLLM_TPU_QSA_MAIN_KV_DCP or 0)
         drv.whole, refusal = whole_step_allowed(
-            drv.whole, int(envs.VLLM_TPU_QSA_MAIN_KV_DCP or 0), dcp_capable=False
+            drv.whole,
+            main_kv_dcp,
+            dcp_capable=main_kv_dcp == 2 and _parse_flag(raw, "wholeunion", False),
         )
         if refusal:
             logger.warning("Qwen3.8 megakernel: %s", refusal)

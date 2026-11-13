@@ -12,9 +12,11 @@ def whole_step_allowed(whole: bool, main_kv_dcp: int, dcp_capable: bool = False)
     Under main-KV DCP (VLLM_TPU_QSA_MAIN_KV_DCP > 1) each rank holds only 1/dcp
     of a request's pages, and a whole-step program without a DCP path would
     write whole rows into a DCP-sharded pool and attend a quarter of the
-    context as if it were all of it. Until the whole-step program carries a DCP
-    path (``dcp_capable``), it is refused there and the segment program, whose
-    QSA core is stock and DCP-correct, serves instead."""
+    context as if it were all of it. Where the whole-step program carries no DCP
+    path (``dcp_capable`` False), it is refused and the segment program, whose
+    QSA core is stock and DCP-correct, serves instead. The driver passes
+    ``dcp_capable`` for main-KV DCP-2 on the union path (wholeunion=1), which
+    the whole-step kernel implements; DCP-4 and the non-union path stay refused."""
     if not whole:
         return False, None
     if int(main_kv_dcp or 0) > 1 and not dcp_capable:
