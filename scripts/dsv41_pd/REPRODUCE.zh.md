@@ -277,10 +277,14 @@ CONC=256 DURATION=3600 TAG=base bash run_agentx.sh      # 结果和每 30s 的 P
 - `--scenario inferencex-agentx-mvp` 锁定：ignore_eos、流式、`--cache-bust first_turn_prefix`、轮间延迟按 trace 回放（只截系统空闲间隔到 10s）、至少 900s。
   `--concurrency` 是**会话数**，同时在跑的请求只有其中一部分。
 - aiperf 构造数据集约 5 分钟，`run_agentx.sh` 把 `AIPERF_DATASET_CONFIGURATION_TIMEOUT` 调到 1800s（默认 300s 不够）；数据写到 `/tmp/aiperf_mmap_*`（根分区），跑完删掉。
-- **会话亲和**（`PROXY_SESSION_AFFINITY_DP=<dp>`）：前缀缓存按 DP rank 存，不开时同一会话的后续轮次落到别的 rank，P 命中率只有 26%、TTFT P50 84s。
+- **前缀路由**（`PROXY_SESSION_AFFINITY_DP=<dp>` 时默认开）：前缀缓存按 DP rank 存，不做亲和时同一会话的后续轮次落到别的 rank，P 命中率只有 26%、TTFT P50 84s。
+  proxy 把 messages（和 tools）拼成文本、每 2048 字符一块做链式哈希，每个 rank 记一份发过去的块（LRU，容量按 P 的 KV 大小），
+  请求发到已缓存最长前缀的 rank（一样长时选排队少的），子 agent 自然跟着父会话走。`PROXY_PREFIX_MIGRATE_FACTOR` 默认 0 = 不迁移（见 5.6）。
+  `PROXY_PREFIX_ROUTING=0` 退回下面的会话 key 路由：
   proxy 用 system prompt 和第一条用户消息的开头做会话 key；新会话分到估计 prefill 工作量最少的 rank，老会话留在原 rank，
   除非在原 rank 等待的代价超过"最闲 rank 重算整个上下文"的 `PROXY_AFFINITY_MIGRATE_FACTOR` 倍（默认 3，0 = 不迁移）；`PROXY_AFFINITY_BALANCE=0` 退回 hash % dp。
 - 流式响应的 Content-Type 必须是 `text/event-stream`（aiperf 按它选解析器），proxy 已修。
+- **命中诊断** `PROXY_HIT_DIAG=1`（P 加 `EXTRA_ARGS=--enable-prompt-tokens-details`）：每个请求记 P 实际命中、同会话 / 本 rank / 全局能命中多少（按 P 返回的 token id 每 128 个一块哈希），`hitdiag_report.py <proxy.log> <跳过前 N 个>` 汇总、按缺口类型分类。
 
 ### 4.5 单请求时间线 / 耗时分解
 
@@ -431,12 +435,19 @@ python3 transfer_stats.py ...                                                   
 | c512 + P 修复 + D 桶 | 900s | **8.58** | **7,947** | 3.82 / 19.2 s | 17.1 ms | 82.0% |
 | c512 + P 修复 + 更细 D 桶（加 240/336） | 900s | 8.33 | 7,772 | 4.76 / 20.0 s | 16.7 ms | 81.7% |
 | c768 + P 修复 + D 桶 | 900s | 4.89 | 4,794 | 34 / 160 s | 19.4 ms | 60.2% |
+| c512 + P 修复 + D 桶，会话亲和（复测） | 900s | 8.38 | 7,775 | 3.86 / 20.8 s | 16.4 ms | 稳态 92.4% |
+| c512 前缀路由，迁移阈值 3 | 900s | 8.08 | 7,455 | 6.21 / 24.8 s | 17.4 ms | 稳态 90.4% |
+| c512 **前缀路由，不迁移（默认）** | 900s | **8.82** | **8,091** | **2.83** / 18.8 s | 16.8 ms | 稳态 **93.3%** |
 | 参考（客户提供，c256） | 3600s | 5.22 | 5,218 | 0.22 / 0.48 s | 4.83 ms | 理论 97% |
 
 - 峰值在 c512 附近；c768 时 P 8 个 rank 全忙、平均排队 261，D 只跑 146 个请求、KV 28%：这个负载下 **P 是瓶颈**（每个会话第一轮整段 prefill，单 rank 算）。
 - ITL 随 D 并发上升（69 → 175 个请求：16 → 40 ms），DSpark 接受长度约 3.0（greedy bench 约 4.9）。
 - c512 起曾反复崩溃：P 的 SWA 私有池耗尽（见第 7 节），已修。
-- P 修复后 TTFT 减半（c256 P50 2.29→1.23s、P99 23.6→7.4s）；D 加 144/288 桶后 c512 的 ITL 34→17 ms、吞吐 +43%。再细（240/336）没有额外收益。现在 c512 下 TTFT 又由 P 决定（P50 3.8s）；c768 时 P 过载，命中率掉到 60%（前缀被挤出后重算，越算越慢），吞吐反而下降，峰值仍在 c512。
+- P 修复后 TTFT 减半（c256 P50 2.29→1.23s、P99 23.6→7.4s）；D 加 144/288 桶后 c512 的 ITL 34→17 ms、吞吐 +43%。再细（240/336）没有额外收益。现在 c512 下 TTFT 又由 P 决定（P50 3.8s）；c768 时 P 过载，吞吐反而下降，峰值仍在 c512。
+- **P 命中率的缺口在路由，不在容量**（命中诊断，2026-11-13）：P 的 KV 使用率一直 0–15%、没有抢占，P 实际命中和"本 rank 模拟"完全一致；
+  整轮平均偏低主要是 aiperf warmup（前约 12 分钟，512 个会话的首轮全部冷算）。稳态下会话亲和 92.4%，全局理论 95.7%，差的 3.3% 全是前缀在别的 rank：
+  子 agent 的 key 和父会话不同、负载触发的迁移。前缀路由跟着缓存走、不迁移后到 93.3%，c512 吞吐 8.82 req/s、TTFT P50 2.83s。
+  迁移阈值 3 时 P 一饱和就频繁迁移（483 次），每次整段重算又加重 P，反而更差（8.08）；按加性代价（排队 + 2 × 重算）选 rank 时迁移 1895 次，只有 6.67 req/s。
 
 ---
 
@@ -467,6 +478,7 @@ python3 transfer_stats.py ...                                                   
     和 `TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER=0` 一样快，PD logprob 检查不变。AgentX c512 吞吐 +21%、TTFT P50 减半（5.6）。
 12. **D 编译桶加 144 / 288**（DSpark K=5，每请求 6 行；`MAX_NUM_SEQS=64` 时最多 384 行）：`[16,48,96,192,384,2048]` → `[16,48,96,144,192,288,384,2048]`。
     原来 96→192→384 之间最多补齐 2 倍，AgentX c512 的 ITL 34→17 ms、输出吞吐 5,538→7,947 tok/s。D 编译缓存多约 10 GB（42 GB）。
+14. **proxy 前缀路由**（2026-11-13）：按文本前缀哈希把请求发到已缓存最长前缀的 P rank、不迁移，AgentX c512 稳态命中 92.4→93.3%、吞吐 8.38→8.82 req/s、TTFT P50 3.86→2.83s（5.6）。
 13. **proxy 复用 P 的 prompt token ids**（159e4efe4）：chat 请求让 P 返回 `prompt_token_ids`，放进 `kv_transfer_params` 交给 D，D 不再渲染模板、重新分词（`PROXY_REUSE_PROMPT_IDS=0` 关）。100k token 命中缓存的 chat TTFT 873→678–774ms，输出一致。
 
 ### 6.2 D 这一跳的控制路径优化（2026-10-29，已部署）

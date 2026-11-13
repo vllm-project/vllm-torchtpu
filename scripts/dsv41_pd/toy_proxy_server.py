@@ -695,6 +695,75 @@ def _align_join() -> _AlignGroup:
 # ~130k-token conversation costs ~0.35 s to template and tokenize per hop.
 _REUSE_PROMPT_IDS = os.environ.get("PROXY_REUSE_PROMPT_IDS", "1") != "0"
 
+
+class _HitDiag:
+    """PROXY_HIT_DIAG=1: per-request prefix-hit accounting from P's prompt ids.
+
+    Prompts are cut into 128-token blocks with chained hashes. For each request
+    it logs how many leading tokens were seen before in the same conversation,
+    on the same P rank (an LRU sized like that rank's KV cache) and anywhere
+    (unbounded, i.e. a single shared cache), next to what P reports cached.
+    """
+
+    BLOCK = 128
+
+    def __init__(self, rank_blocks: int, global_blocks: int = 8_000_000):
+        self.rank_blocks = rank_blocks
+        self.global_blocks = global_blocks
+        self.sessions: "collections.OrderedDict[int, list[bytes]]" = collections.OrderedDict()
+        self.ranks: dict[int, "collections.OrderedDict[bytes, None]"] = {}
+        self.seen: "collections.OrderedDict[bytes, None]" = collections.OrderedDict()
+
+    def _hashes(self, ids: list[int]) -> list[bytes]:
+        import array
+
+        raw = array.array("i", ids).tobytes()
+        step, prev, out = self.BLOCK * 4, b"", []
+        for i in range(0, len(raw) - step + 1, step):
+            prev = hashlib.blake2b(prev + raw[i : i + step], digest_size=8).digest()
+            out.append(prev)
+        return out
+
+    @staticmethod
+    def _lcp(hashes: list[bytes], contains) -> int:
+        n = 0
+        for h in hashes:
+            if not contains(h):
+                break
+            n += 1
+        return n
+
+    def observe(self, key: int | None, rank: int, ids: list[int]) -> tuple[int, int, int]:
+        hs = self._hashes(ids)
+        prev = set(self.sessions.get(key, ())) if key is not None else set()
+        cache = self.ranks.setdefault(rank, collections.OrderedDict())
+        sess = self._lcp(hs, prev.__contains__)
+        rank_hit = self._lcp(hs, cache.__contains__)
+        glob = self._lcp(hs, self.seen.__contains__)
+        for h in hs:
+            cache[h] = None
+            cache.move_to_end(h)
+            self.seen[h] = None
+            self.seen.move_to_end(h)
+        while len(cache) > self.rank_blocks:
+            cache.popitem(last=False)
+        while len(self.seen) > self.global_blocks:
+            self.seen.popitem(last=False)
+        if key is not None:
+            self.sessions[key] = hs
+            self.sessions.move_to_end(key)
+            while len(self.sessions) > 8192:
+                self.sessions.popitem(last=False)
+        b = self.BLOCK
+        return sess * b, rank_hit * b, glob * b
+
+
+_HIT_DIAG = (
+    _HitDiag(int(os.environ.get("PROXY_HIT_DIAG_RANK_TOKENS", "8874043")) // _HitDiag.BLOCK)
+    if os.environ.get("PROXY_HIT_DIAG", "0") == "1"
+    else None
+)
+
 _SESSION_AFFINITY_DP = int(os.environ.get("PROXY_SESSION_AFFINITY_DP", "0"))
 
 
@@ -791,6 +860,112 @@ class _SessionRouter:
         self.work[rank] = max(0, self.work[rank] - work)
 
 
+class _PrefixRouter:
+    """Routes each request to the prefill DP rank that already caches the
+    longest prefix of it (default when PROXY_SESSION_AFFINITY_DP > 1;
+    PROXY_PREFIX_ROUTING=0 falls back to _SessionRouter).
+
+    The request's messages (and tools) are flattened to text and cut into
+    fixed-size character blocks with chained hashes; each rank keeps an LRU of
+    the blocks sent to it, sized like its KV cache. A request goes to the rank
+    holding its longest cached prefix, so a conversation follows its cache and
+    so does a subagent whose context starts with its parent's; it moves to the
+    cheapest rank (queued work + tokens to compute) only when staying costs
+    more than PROXY_PREFIX_MIGRATE_FACTOR times that (default 0 = never: on
+    AgentX c512 the recompute a move causes cost more than the imbalance it
+    fixed). Queued work is charged at routing time and released when the
+    prefill returns.
+    """
+
+    BLOCK_CHARS = 2048
+    CHARS_PER_TOKEN = 3.5
+
+    def __init__(self, dp: int, rank_tokens: int, migrate_factor: float):
+        self.dp = dp
+        self.capacity = int(rank_tokens * self.CHARS_PER_TOKEN / self.BLOCK_CHARS)
+        self.migrate_factor = migrate_factor
+        self.work = [0] * dp
+        self.caches = [collections.OrderedDict() for _ in range(dp)]
+        self.migrations = 0  # requests not sent to their longest-match rank
+
+    @staticmethod
+    def _text(req_data: dict) -> str | None:
+        messages = req_data.get("messages")
+        if isinstance(messages, list) and messages:
+            parts = []
+            if req_data.get("tools"):
+                parts.append(_dumps(req_data["tools"]).decode())
+            for m in messages:
+                if not isinstance(m, dict):
+                    continue
+                c = m.get("content", "")
+                parts.append(f"\x00{m.get('role')}\x00")
+                parts.append(c if isinstance(c, str) else _dumps(c).decode())
+                if m.get("tool_calls"):
+                    parts.append(_dumps(m["tool_calls"]).decode())
+            return "".join(parts)
+        prompt = req_data.get("prompt")
+        return prompt if isinstance(prompt, str) else None
+
+    def assign(self, req_data: dict) -> tuple[int, int] | None:
+        text = self._text(req_data)
+        if text is None:
+            return None
+        raw = text.encode("utf-8", "surrogatepass")
+        step, prev, hashes = self.BLOCK_CHARS, b"", []
+        for i in range(0, len(raw) - step + 1, step):
+            prev = hashlib.blake2b(prev + raw[i : i + step], digest_size=8).digest()
+            hashes.append(prev)
+        total = len(raw) / self.CHARS_PER_TOKEN
+        matches, costs = [], []
+        for r in range(self.dp):
+            cache, n = self.caches[r], 0
+            for h in hashes:
+                if h not in cache:
+                    break
+                n += 1
+            matches.append(n)
+            costs.append(self.work[r] + total - n * step / self.CHARS_PER_TOKEN)
+        # Stay with the longest cached prefix (least loaded among ties); move
+        # only if that costs more than `migrate_factor` x the cheapest rank,
+        # since a move recomputes the prefix and adds load P cannot spare.
+        home = max(range(self.dp), key=lambda r: (matches[r], -costs[r]))
+        cheapest = min(range(self.dp), key=lambda r: (costs[r], -matches[r]))
+        best = home
+        if (
+            matches[home] > 0
+            and self.migrate_factor > 0
+            and costs[home] > self.migrate_factor * costs[cheapest]
+        ):
+            best = cheapest
+            self.migrations += 1
+        elif matches[home] == 0:
+            best = cheapest
+        best_match = matches[best]
+        cache = self.caches[best]
+        for h in hashes:
+            cache[h] = None
+            cache.move_to_end(h)
+        while len(cache) > self.capacity:
+            cache.popitem(last=False)
+        work = int(max(total - best_match * step / self.CHARS_PER_TOKEN, 512))
+        self.work[best] += work
+        return best, work
+
+    def release(self, rank: int, work: int) -> None:
+        self.work[rank] = max(0, self.work[rank] - work)
+
+
+_PREFIX_ROUTER = (
+    _PrefixRouter(
+        _SESSION_AFFINITY_DP,
+        int(os.environ.get("PROXY_PREFIX_RANK_TOKENS", "8874043")),
+        float(os.environ.get("PROXY_PREFIX_MIGRATE_FACTOR", "0")),
+    )
+    if _SESSION_AFFINITY_DP > 1 and os.environ.get("PROXY_PREFIX_ROUTING", "1") == "1"
+    else None
+)
+
 _SESSION_ROUTER = (
     _SessionRouter(
         _SESSION_AFFINITY_DP,
@@ -815,13 +990,20 @@ async def _handle_completions(api: str, request: Request):
         if (dp_rank := request.headers.get("X-data-parallel-rank")) is not None:
             forwarded["X-data-parallel-rank"] = dp_rank
         routed: tuple[int, int] | None = None
-        if "X-data-parallel-rank" not in forwarded and _SESSION_ROUTER is not None:
+        session_key = None
+        router = _PREFIX_ROUTER or _SESSION_ROUTER
+        if "X-data-parallel-rank" not in forwarded and _PREFIX_ROUTER is not None:
+            routed = _PREFIX_ROUTER.assign(req_data)
+            if routed is not None:
+                forwarded["X-data-parallel-rank"] = str(routed[0])
+                session_key = _session_key(req_data)
+        elif "X-data-parallel-rank" not in forwarded and _SESSION_ROUTER is not None:
             if (session_key := _session_key(req_data)) is not None:
                 prompt_tokens = len(await request.body()) // 4
                 routed = _SESSION_ROUTER.assign(session_key, prompt_tokens)
                 forwarded["X-data-parallel-rank"] = str(routed[0])
         route_log = (
-            f" rank={routed[0]} work={routed[1]} migrations={_SESSION_ROUTER.migrations}"
+            f" rank={routed[0]} work={routed[1]} migrations={router.migrations}"
             if routed is not None
             else ""
         )
@@ -894,7 +1076,7 @@ async def _handle_completions(api: str, request: Request):
             )
         finally:
             if routed is not None:
-                _SESSION_ROUTER.release(*routed)
+                router.release(*routed)
         t_prefill_recv = time.time()
         t_prefill_recv_perf = time.perf_counter()
         prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
@@ -913,6 +1095,21 @@ async def _handle_completions(api: str, request: Request):
             f"dur_ms={prefill_ms:.2f}{kv_uuid_log}",
             flush=True,
         )
+
+        if _HIT_DIAG is not None and response_json.get("prompt_token_ids"):
+            ids = response_json["prompt_token_ids"]
+            details = (response_json.get("usage") or {}).get("prompt_tokens_details") or {}
+            sess, rank_hit, glob = _HIT_DIAG.observe(
+                session_key if routed is not None else None,
+                routed[0] if routed is not None else -1,
+                ids,
+            )
+            print(
+                f"PERF PROXY hit req_id={request_id} rank={routed[0] if routed else -1} "
+                f"isl={len(ids)} p_cached={details.get('cached_tokens')} "
+                f"sess_lcp={sess} rank_sim={rank_hit} global_sim={glob}",
+                flush=True,
+            )
 
         if kv_transfer_params:
             prompt_ids = response_json.get("prompt_token_ids")
