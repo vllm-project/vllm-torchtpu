@@ -29,11 +29,15 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.spec_decode import utils as spec_decode_utils
 from vllm_torchtpu.spec_decode.eagle3 import (
+    INVALID_TOKEN_ID,
     DraftChunkInputs,
     Eagle3Proposer,
+    _async_draft_seed_eager,
+    _async_draft_seed_impl,
     _force_draft_tp1,
     _maybe_pad_dim0,
     _static_shape_args,
+    _use_fused_async_draft_seed,
 )
 
 
@@ -2858,3 +2862,97 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     assert seen["names"] == expected
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
+
+
+def _async_seed_inputs(width, num_reqs, qsl_len, draft_dtype):
+    """Rejection-sampler output for K=3 with every accept count 0..3, draft
+    counts of 0..3 per row, and a query_start_loc of `qsl_len` entries."""
+    k = 3
+    rows = []
+    for i in range(width):
+        num_valid = i % (k + 2)  # 0 (all-invalid padding row) .. k+1
+        rows.append(
+            [
+                100 + 10 * i + j if j < num_valid else INVALID_TOKEN_ID
+                for j in range(k + 1)
+            ]
+        )
+    next_tokens = torch.tensor(rows, dtype=torch.int32)
+    num_draft = torch.tensor([i % (k + 1) for i in range(width + 2)], dtype=draft_dtype)
+    query_start_loc = torch.arange(qsl_len, dtype=torch.int32) * (k + 1)
+    return next_tokens, num_draft, query_start_loc
+
+
+@pytest.mark.parametrize("draft_dtype", [torch.int32, torch.int64])
+def test_async_draft_seed_values(draft_dtype):
+    """Hand-computed seed for K=3: accepted prefix 3/1/4 tokens with 3/2/3
+    drafts, one padding row, and a query_start_loc shorter than the bucket."""
+    next_tokens = torch.tensor(
+        [[5, 6, 7, -1], [8, -1, -1, -1], [9, 10, 11, 12], [-1, -1, -1, -1]],
+        dtype=torch.int32,
+    )
+    num_draft = torch.tensor([3, 2, 3, 0], dtype=draft_dtype)
+    query_start_loc = torch.tensor([0, 4, 7, 11], dtype=torch.int32)
+    last_token_indices, next_token_ids, num_rejected = _async_draft_seed_eager(
+        next_tokens, num_draft, query_start_loc, 3, {}
+    )
+    assert last_token_indices.dtype == torch.int64
+    assert next_token_ids.dtype == num_rejected.dtype == torch.int32
+    assert last_token_indices.tolist() == [2, 4, 10, 10]
+    assert next_token_ids.tolist() == [7, 8, 12, 12]
+    assert num_rejected.tolist() == [1, 2, 0, 0]
+
+
+@pytest.mark.parametrize(
+    "width,num_reqs,qsl_len",
+    [
+        (1, 1, 2),
+        (4, 4, 5),  # full batch
+        (8, 3, 9),  # padded tail
+        (8, 5, 6),  # query_start_loc shorter than the request bucket
+    ],
+)
+@pytest.mark.parametrize("draft_dtype", [torch.int32, torch.int64])
+def test_async_draft_seed_traced_matches_eager(width, num_reqs, qsl_len, draft_dtype):
+    """The fullgraph-traced draft seed matches the eager path in values and
+    dtypes."""
+    next_tokens, num_draft, query_start_loc = _async_seed_inputs(
+        width, num_reqs, qsl_len, draft_dtype
+    )
+    expected = _async_draft_seed_eager(
+        next_tokens, num_draft, query_start_loc, num_reqs, {}
+    )
+    traced = torch.compile(_async_draft_seed_impl, backend="eager", fullgraph=True)
+    actual = traced(
+        next_tokens,
+        num_draft,
+        query_start_loc,
+        torch.tensor(num_reqs, dtype=torch.int64),
+    )
+    for a, e in zip(actual, expected, strict=True):
+        assert a.dtype == e.dtype
+        assert torch.equal(a, e)
+
+
+def test_async_draft_seed_eager_applies_overrides():
+    """Partial-prefill overrides replace the seed token, and the padded tail
+    repeats the overridden last row."""
+    next_tokens, num_draft, query_start_loc = _async_seed_inputs(8, 3, 9, torch.int64)
+    base = _async_draft_seed_eager(next_tokens, num_draft, query_start_loc, 3, {})
+    _, next_token_ids, _ = _async_draft_seed_eager(
+        next_tokens, num_draft, query_start_loc, 3, {0: 7, 2: 9}
+    )
+    assert next_token_ids.tolist() == [7, int(base[1][1])] + [9] * 6
+
+
+@pytest.mark.parametrize(
+    "device_type,overrides,fused",
+    [
+        ("tpu", {}, True),
+        ("tpu", {1: 5}, False),  # partial-prefill override
+        ("cpu", {}, False),  # the tpu backend cannot trace CPU tensors
+    ],
+)
+def test_use_fused_async_draft_seed(device_type, overrides, fused):
+    next_tokens = SimpleNamespace(device=SimpleNamespace(type=device_type))
+    assert _use_fused_async_draft_seed(next_tokens, overrides) is fused
