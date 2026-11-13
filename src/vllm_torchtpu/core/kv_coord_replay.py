@@ -75,7 +75,7 @@ import textwrap
 from collections import defaultdict
 from operator import attrgetter, is_, itemgetter
 
-from vllm.logger import init_logger
+from vllm_torchtpu.logger import init_logger
 
 from vllm_torchtpu import envs
 
