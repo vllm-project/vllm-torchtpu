@@ -205,7 +205,7 @@ from vllm_torchtpu.spec_decode.adaptive_verification import (
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
-from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer, _static_shape_args
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,
@@ -375,6 +375,9 @@ def _spec_logprob_row_tokens(
     return out[:num_rows, None]
 
 
+# The input ids reaching async substitution can carry the forward's
+# mark_dynamic stamp, which outranks dynamic=False; strip it before dispatch.
+@_static_shape_args
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,
