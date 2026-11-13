@@ -187,6 +187,7 @@ def test_get_kv_cache_spec_sparse_mla_packed_rope(monkeypatch, packed_rope):
     runner.shared_kv_cache_layers = {}
     runner.runner_only_attn_layers = set()
     runner.speculative_config = None
+    runner.pcp_manager = None
     runner.kv_cache_manager = KVCacheManager(runner)
     runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(runner)
     mock_mla = MagicMock(spec=MLAAttention)
@@ -263,6 +264,7 @@ class TestKVCacheManager:
         self.runner.runner_only_attn_layers = set()
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
+        self.runner.pcp_manager = None
         # Slots per request in the mamba pool (1 without spec decode).
         self.runner._mamba_slot_stride = 1
 
