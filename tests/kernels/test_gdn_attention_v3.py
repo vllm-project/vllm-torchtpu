@@ -695,7 +695,7 @@ class GDNChunkedComputeTest(parameterized.TestCase):
             ("ratio_1", 2, 2, 16),
             ("ratio_2", 2, 4, 16),
             ("ratio_4", 2, 8, 16),
-            ("ratio_8", 2, 16, 16),
+            ("even_v_per_kq_paired", 2, 16, 16),
             ("odd_v_per_kq_unpaired", 2, 6, 16),
             ("partial_chunk_zero_trailing_beta", 2, 16, 11),
         )
@@ -748,7 +748,7 @@ class GDNChunkedComputeTest(parameterized.TestCase):
         np.testing.assert_allclose(state, ref_state[0], rtol=1e-5, atol=1e-5)
 
     def test_pack_unpack_v_head_pairs_roundtrip(self):
-        """Packing and unpacking Qwen 3.8 V-head pairs along lanes is exact."""
+        """Packing and unpacking 8-KQ / 64-V head pairs along lanes is exact."""
         n_kq, n_v, d_k, d_v = 8, 64, 128, 128
         v_per_kq = n_v // n_kq
         x = jax.random.normal(jax.random.key(53), (n_v, d_k, d_v))
