@@ -933,6 +933,174 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, make_ctx(mamba_ckpt_window=3), 4)
         assert walk_counts == [3, 4]
 
+    _METADATA_FIELDS = (
+        "input_positions",
+        "block_tables",
+        "seq_lens",
+        "query_start_loc",
+        "request_distribution",
+        "mamba_state_indices",
+        "mamba_slot_read_offsets",
+        "mamba_ckpt_indices",
+        "mamba_request_distribution",
+        "mamba_prefill_ckpt_offsets",
+        "mamba_prefill_ckpt_indices",
+        "pcp_metadata",
+    )
+
+    def _assert_same_metadata(self, got, ref):
+        assert got.keys() == ref.keys()
+        for name in ref:
+            a, b = got[name], ref[name]
+            for f in self._METADATA_FIELDS:
+                x, y = getattr(a, f), getattr(b, f)
+                assert (x is None) == (y is None), (name, f)
+                if x is not None:
+                    assert torch.equal(x, y), (name, f)
+            assert a.sequence_layout_kind == b.sequence_layout_kind
+
+    def _make_staged_walk_setup(self, unified):
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        runner = self._make_runner_mock(num_groups=3, max_num_blocks_per_req=6)
+        runner._unified_kv_layout = unified
+        runner._block_table_stage_cpu = None
+        runner._fast_metadata_plan = None
+        runner._build_attention_metadata_staged = (
+            TPUModelRunner._build_attention_metadata_staged.__get__(runner)
+        )
+        attn = self._make_builder(runner, kv_cache_group_id=0)
+        mambas = [
+            self._make_mamba_builder(runner, kv_cache_group_id=gid) for gid in (1, 2)
+        ]
+        groups = self._make_attn_groups(runner, [attn] + mambas)
+        for i, (group,) in enumerate(groups):
+            group.layer_names = [f"layer.{i}.a", f"layer.{i}.b"]
+
+        def make_ctx(stage=True):
+            c = AttentionMetadataBuilderContext(
+                num_reqs=4,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.tensor([0, 17, 33, 49], dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+                mamba_state_indices=None if unified else torch.arange(4),
+                mamba_slot_read_offsets=torch.zeros(8, dtype=torch.int32),
+                mamba_ckpt_window=3 if unified else 1,
+                mamba_request_distribution=torch.tensor([4, 4, 4]),
+                unified_mamba_state_indices=[] if unified else None,
+            )
+            runner._attn_metadata_builder_ctx = c
+            if stage:
+                stage_block_table_uploads(runner, c, 4)
+            return c
+
+        def unstaged_reference():
+            # build()'s general (unstaged) path, one call per group.
+            c = make_ctx(stage=False)
+            ref = {}
+            for (group,) in groups:
+                built = group.metadata_builders[0].build(
+                    common_prefix_len=0, common_attn_metadata=self._make_cm(4)
+                )
+                for name in group.layer_names:
+                    ref[name] = built
+            return c, ref
+
+        return runner, groups, make_ctx, unstaged_reference
+
+    @pytest.mark.parametrize("unified", [False, True])
+    def test_fast_staged_build_matches_builder_walk(self, unified):
+        """The inlined staged walk returns the same metadata per layer, and the
+        same unified-pool state list, as build()'s unstaged path per group."""
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        runner, _, make_ctx, unstaged_reference = self._make_staged_walk_setup(unified)
+        c_ref, ref = unstaged_reference()
+        c_fast = make_ctx()
+        fast = TPUModelRunner._build_attention_metadata_staged(runner, c_fast)
+        assert fast is not None
+        self._assert_same_metadata(fast, ref)
+        if unified:
+            assert len(c_fast.unified_mamba_state_indices) == 2
+            for x, y in zip(
+                c_fast.unified_mamba_state_indices, c_ref.unified_mamba_state_indices
+            ):
+                assert torch.equal(x, y)
+
+    @pytest.mark.parametrize(
+        "drop",
+        ["table_attn", "table_mamba", "products_one", "products_all", "prefill"],
+    )
+    @pytest.mark.parametrize("unified", [False, True])
+    def test_fast_staged_build_falls_back_on_partial_staging(self, unified, drop):
+        """A ctx the inlined walk cannot fully serve (a missing staged table,
+        missing unified mamba products, or prefill checkpoints) returns None
+        without touching `unified_mamba_state_indices`."""
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        runner, _, make_ctx, _ = self._make_staged_walk_setup(unified)
+        c = make_ctx()
+        assert c.staged_block_tables is not None
+        if drop == "table_attn":
+            c.staged_block_tables.pop(0)
+        elif drop == "table_mamba":
+            c.staged_block_tables.pop(2)
+        elif drop == "prefill":
+            c.mamba_prefill_ckpt_offsets = torch.zeros(4, dtype=torch.int32)
+        elif not unified:
+            pytest.skip("staged mamba products exist only on the unified pool")
+        elif drop == "products_one":
+            assert c.staged_mamba_products is not None
+            c.staged_mamba_products.pop(2)
+        else:
+            c.staged_mamba_products = None
+        assert TPUModelRunner._build_attention_metadata_staged(runner, c) is None
+        if unified:
+            assert c.unified_mamba_state_indices == []
+
+    @pytest.mark.parametrize("partial", [False, True])
+    @pytest.mark.parametrize("unified", [False, True])
+    def test_build_attention_metadata_takes_staged_walk(
+        self, monkeypatch, unified, partial
+    ):
+        """`_build_attention_metadata` stages the uploads and serves a fully
+        staged ctx from the inlined walk with no build() call; a ctx left
+        partially staged goes through build() for every group. Both match
+        build()'s unstaged path."""
+        import vllm_torchtpu.runner.tpu_runner as tpu_runner_mod
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        runner, groups, make_ctx, unstaged_reference = self._make_staged_walk_setup(
+            unified
+        )
+        _, ref = unstaged_reference()
+        calls = []
+        for (group,) in groups:
+            builder = group.metadata_builders[0]
+
+            def spy(*args, _orig=builder.build, **kwargs):
+                calls.append(1)
+                return _orig(*args, **kwargs)
+
+            monkeypatch.setattr(builder, "build", spy)
+        if partial:
+
+            def stage_partial(runner_, ctx_, n):
+                stage_block_table_uploads(runner_, ctx_, n)
+                ctx_.staged_block_tables.pop(1)
+
+            monkeypatch.setattr(
+                tpu_runner_mod, "stage_block_table_uploads", stage_partial
+            )
+        make_ctx(stage=False)
+        got, _ = TPUModelRunner._build_attention_metadata(
+            runner, num_reqs=4, num_reqs_padded=4
+        )
+        assert len(calls) == (len(groups) if partial else 0)
+        self._assert_same_metadata(got, ref)
+
 
 class TestPrefillCheckpointIds:
     """Tests for per-group internal prefill checkpoint block ID gathering."""

@@ -447,6 +447,70 @@ def zeros_h2d_source(
     return buf
 
 
+def staged_metadata_eligible(runner, ctx, kv_cache_group_id, is_mamba) -> bool:
+    """Whether a group's metadata comes straight from the staged walk's
+    outputs (`staged_group_metadata`). False when the group needs `build()`'s
+    general path: no staged table, internal prefill checkpoints, PCP, or a
+    unified-pool mamba group without staged walk products."""
+    staged = ctx.staged_block_tables
+    if staged is None or kv_cache_group_id not in staged:
+        return False
+    if ctx.mamba_prefill_ckpt_offsets is not None or runner.pcp_manager is not None:
+        return False
+    if is_mamba and ctx.mamba_state_indices is None and runner._unified_kv_layout:
+        products = ctx.staged_mamba_products
+        return products is not None and kv_cache_group_id in products
+    return True
+
+
+def staged_group_metadata(
+    runner, ctx, kv_cache_group_id, is_mamba, input_positions
+) -> AttentionMetadata:
+    """One group's metadata from the staged walk's outputs (the staged table
+    and, for unified-pool mamba groups, the walk's state and checkpoint
+    indices). The single source for `build()`'s staged branch and the
+    runner's inlined staged walk; callers check `staged_metadata_eligible`
+    first."""
+    descriptor = ctx.sequence_layout_descriptor
+    shared = dict(
+        input_positions=input_positions,
+        block_tables=ctx.staged_block_tables[kv_cache_group_id],
+        seq_lens=ctx.seq_lens,
+        query_start_loc=ctx.query_start_loc,
+        request_distribution=ctx.request_distribution,
+        sequence_layout_kind=descriptor.kind.value,
+        sequence_layout_protocol=descriptor.protocol,
+        sequence_layout_version=descriptor.version,
+    )
+    if not is_mamba:
+        return AttentionMetadata(**shared)
+    mamba_ckpt_indices = None
+    if ctx.mamba_state_indices is not None:
+        # Default compact-mamba path: per-request slot ids from the compact
+        # slot pool.
+        mamba_state_indices = ctx.mamba_state_indices
+    elif runner._unified_kv_layout:
+        # Derived in the single `_staged_walk_products_compiled` program
+        # alongside the staged tables; no prefill checkpoint ids here (see
+        # `staged_metadata_eligible`).
+        mamba_state_indices, mamba_ckpt_indices, _ = ctx.staged_mamba_products[
+            kv_cache_group_id
+        ]
+        if ctx.unified_mamba_state_indices is not None:
+            # Spec decode: expose this group's state blocks for the
+            # post-sampling read-offset scatter.
+            ctx.unified_mamba_state_indices.append(mamba_state_indices)
+    else:
+        mamba_state_indices = None
+    return AttentionMetadata(
+        mamba_state_indices=mamba_state_indices,
+        mamba_slot_read_offsets=ctx.mamba_slot_read_offsets,
+        mamba_ckpt_indices=mamba_ckpt_indices,
+        mamba_request_distribution=ctx.mamba_request_distribution,
+        **shared,
+    )
+
+
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
     """Single shared metadata builder for every TPU attention group."""
 
@@ -587,6 +651,16 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 if ctx.position_ids_override is not None
                 else runner.position_ids
             )
+            if staged_metadata_eligible(
+                runner, ctx, self.kv_cache_group_id, self.is_mamba_group
+            ):
+                return staged_group_metadata(
+                    runner,
+                    ctx,
+                    self.kv_cache_group_id,
+                    self.is_mamba_group,
+                    input_positions,
+                )
         elif ctx.position_ids_override is not None:
             block_tables_dev = torch.zeros(
                 (target_num_reqs * target_num_blocks,), dtype=torch.int32
