@@ -14,6 +14,12 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
+class _UniformTiles:
+    # Metadata-only view used after the uniform-boundary guard has passed.
+    def __init__(self, bq):
+        self.bq = bq
+
+
 def _fill_query_tiles(starts, tiles, total_tokens, bq):
     batch = starts.shape[0] - 1
 
@@ -49,6 +55,8 @@ def build_query_tiles(
 
 
 def _tile_field(tiles, tile, column):
+    if isinstance(tiles, _UniformTiles):
+        return (tile, tile * tiles.bq, tiles.bq)[column]
     if len(tiles.shape) == 1:
         return tiles[tile * 3 + column]
     return tiles[tile, column]
@@ -91,7 +99,29 @@ class _PageCopy:
         self._copy(self.sources[0]).wait()
 
 
-def _csa2_kernel(
+def _swa_window_compact(
+    tile, tiles, positions, pages, bounds, *, page_size, non_causal
+):
+    request, start, count = (
+        _tile_field(tiles, tile, 0),
+        _tile_field(tiles, tile, 1),
+        _tile_field(tiles, tile, 2),
+    )
+    active = True if isinstance(tiles, _UniformTiles) else request < pages.shape[1]
+    request = (
+        request
+        if isinstance(tiles, _UniformTiles)
+        else jnp.minimum(request, pages.shape[1] - 1)
+    )
+    position = positions[start]
+    left = bounds[request * 2] if non_causal else jnp.maximum(0, position - 127)
+    right = bounds[request * 2 + 1] if non_causal else position + count
+    anchor = left // page_size * page_size
+    left = jnp.maximum(left, pages[1, request])
+    return position, left, jnp.where(active, right, left), anchor
+
+
+def _csa2_kernel_impl(
     # Scalar prefetch
     plan_ref,  # [B+1], request boundaries
     positions_ref,
@@ -111,6 +141,8 @@ def _csa2_kernel(
     non_causal: bool,
     query_offset: int,
     owners: str,
+    uniform_tiles: bool,
+    accumulators,
 ) -> None:
     """Persistent attention with one steady tile body and rotating buffers.
 
@@ -148,17 +180,20 @@ def _csa2_kernel(
     ) = scratch
     tokens, heads = positions_ref.shape[0], q_hbm.shape[1]
     bq = q_buf.shape[1]
-    batch = pages_ref.shape[0]
+    batch = pages_ref.shape[1]
     rows_per_token = 2 if swa_hbm[0].dtype == jnp.int32 else 1
     cache_page_size = swa_hbm[0].shape[1] // rows_per_token
     page_size = swa_buf.shape[-2] // rows_per_token
     num_pages = 256 // page_size
     tile_capacity = tile_scratch.shape[0] // 3
-    fixed_tiles = batch == 1 and tokens % bq == 0
+    fixed_tiles = uniform_tiles or (batch == 1 and tokens % bq == 0)
     resident_metadata = rope_buf is None
     has_main = kv_hbm is not None
     tiles_ref = tile_scratch
-    if fixed_tiles:
+    if uniform_tiles:
+        count = tokens // bq
+        tiles_ref = _UniformTiles(bq)
+    elif fixed_tiles:
         count = tokens // bq
 
         def tile_body(tile, unused):
@@ -174,16 +209,6 @@ def _csa2_kernel(
         if bq == 1:
             count = tokens
     mxu_heads = pl.cdiv(heads, 16) * 16
-    accumulators = tuple(
-        tuple(
-            jax.empty_ref(
-                jax.ShapeDtypeStruct((mxu_heads, 256), jnp.float32),
-                memory_space=pltpu.ACC(mxu),
-            )
-            for _ in range(2 * bq)
-        )
-        for mxu in range(2)
-    )
 
     def safe_tile(tile):
         if isinstance(tile, int):
@@ -193,6 +218,8 @@ def _csa2_kernel(
 
     def rows(tile, offset=0):
         tile = safe_tile(tile)
+        if uniform_tiles:
+            return pl.ds(offset + tile * bq, bq)
         start = jnp.minimum(_tile_field(tiles_ref, tile, 1), tokens - bq)
         return pl.ds(offset + start, bq)
 
@@ -221,8 +248,12 @@ def _csa2_kernel(
     def swa_copies(tile, bank):
         tile = safe_tile(tile)
         request, left, right, anchor = 0, 0, 256, 0
-        request = jnp.minimum(_tile_field(tiles_ref, tile, 0), batch - 1)
-        _, left, right, anchor = swa_window(
+        request = (
+            tile
+            if uniform_tiles
+            else jnp.minimum(_tile_field(tiles_ref, tile, 0), batch - 1)
+        )
+        _, left, right, anchor = _swa_window_compact(
             tile,
             tiles_ref,
             positions_ref,
@@ -234,9 +265,9 @@ def _csa2_kernel(
         copies = []
         for block in range(num_pages):
             position = anchor + block * page_size
-            column = (position - pages_ref[request, 0]) // cache_page_size
+            column = (position - pages_ref[0, request]) // cache_page_size
             physical = pages_ref[
-                request, jnp.clip(column, 0, pages_ref.shape[1] - 3) + 2
+                jnp.clip(column, 0, pages_ref.shape[0] - 3) + 2, request
             ]
             # prepare() zeroes rows outside the window, so each copy only
             # needs an in-bounds address in the bank that holds the page.
@@ -285,8 +316,8 @@ def _csa2_kernel(
         if values.dtype == jnp.int32:
             values = pltpu.bitcast(values.reshape(128, 512), jnp.bfloat16)
         values = values.reshape(256, 512)
-        active = _tile_field(tiles_ref, tile, 0) < batch
-        _, left, right, anchor = swa_window(
+        active = True if uniform_tiles else _tile_field(tiles_ref, tile, 0) < batch
+        _, left, right, anchor = _swa_window_compact(
             tile,
             tiles_ref,
             positions_ref,
@@ -312,7 +343,7 @@ def _csa2_kernel(
             rope_hbm.at[rows(tile)] if resident_metadata else rope_saved.at[bank]
         )
         start = _tile_field(tiles_ref, tile, 1)
-        row_offset = start - jnp.minimum(start, tokens - bq)
+        row_offset = 0 if uniform_tiles else start - jnp.minimum(start, tokens - bq)
         # Drain every PV result to VMEM before any of its vector work.
         for i in range(bq):
             pv_raw[i] = jnp.concatenate(
@@ -338,9 +369,13 @@ def _csa2_kernel(
                 tail * rotations[i, 0][None, :] + partner * rotations[i, 1][None, :]
             )
             valid = (
-                (_tile_field(tiles_ref, tile, 0) < batch)
-                & (i >= row_offset)
-                & (i < row_offset + _tile_field(tiles_ref, tile, 2))
+                True
+                if uniform_tiles
+                else (
+                    (_tile_field(tiles_ref, tile, 0) < batch)
+                    & (i >= row_offset)
+                    & (i < row_offset + _tile_field(tiles_ref, tile, 2))
+                )
             )
             target[i, :, :384] = jnp.where(valid, output[:, :384], 0).astype(
                 jnp.bfloat16
@@ -371,7 +406,7 @@ def _csa2_kernel(
         log2_e = math.log2(math.e)
         current_tile = safe_tile(tile)
         t0 = _tile_field(tiles_ref, current_tile, 1)
-        position_start, left, right, anchor = swa_window(
+        position_start, left, right, anchor = _swa_window_compact(
             current_tile,
             tiles_ref,
             positions_ref,
@@ -380,7 +415,9 @@ def _csa2_kernel(
             page_size=page_size,
             non_causal=non_causal,
         )
-        read_start = jnp.minimum(t0, positions_ref.shape[0] - bq)
+        read_start = (
+            t0 if uniform_tiles else jnp.minimum(t0, positions_ref.shape[0] - bq)
+        )
         row_offset = t0 - read_start
         position_start -= row_offset
         t0 = read_start
@@ -634,8 +671,8 @@ def _csa2_kernel(
     def _():
         start(4, 0)
 
-    def step(tile, *, steady, last=False, bank=None):
-        sb = tile & 3
+    def step(tile, *, steady, last=False, bank=None, input_bank=None):
+        sb = tile & 3 if input_bank is None else input_bank
         bank = tile & 1 if bank is None else bank
         for copy in input_copies(tile, sb):
             copy.wait()
@@ -672,24 +709,27 @@ def _csa2_kernel(
         else:
             pl.when(tile + 4 < count)(lambda: start(tile + 4, sb))
 
-    # Steady pairs give each tile a static output bank; an odd steady tile
-    # left over joins the drain loop with the prefetched tail.
+    # Four-tile groups give each input and output buffer a static bank.
     end = max(count - 4, 1) if isinstance(count, int) else jnp.maximum(count - 4, 1)
 
-    def pair(k, unused):
-        for j in range(2):
-            step(1 + 2 * k + j, steady=True, bank=1 - j)
+    def quartet(k, unused):
+        for j in range(4):
+            step(1 + 4 * k + j, steady=True, bank=(1 + j) & 1, input_bank=(1 + j) & 3)
 
-    pairs = (end - 1) // 2
-    lax.fori_loop(0, pairs, pair, None)
-    end = 1 + 2 * pairs
-    lax.fori_loop(
-        end,
-        jnp.maximum(count - 1, end),
-        lambda tile, _: step(tile, steady=False),
-        None,
-        unroll=False,
-    )
+    quartets = (end - 1) // 4
+    lax.fori_loop(0, quartets, quartet, None)
+    end = 1 + 4 * quartets
+    if uniform_tiles:
+        for tile in range(end, count - 1):
+            step(tile, steady=False)
+    else:
+        lax.fori_loop(
+            end,
+            jnp.maximum(count - 1, end),
+            lambda tile, _: step(tile, steady=False),
+            None,
+            unroll=False,
+        )
 
     # Every staged RHS must be consumed before the kernel returns.
     @pl.when(count > 1)
@@ -708,6 +748,75 @@ def _csa2_kernel(
         output_copy(count - 2, (count - 2) % 2).wait()
 
     output_copy(count - 1, (count - 1) % 2).wait()
+
+
+def _csa2_kernel(
+    plan_ref,
+    positions_ref,
+    lengths_ref,
+    pages_ref,
+    bounds_ref,
+    q_hbm,
+    kv_hbm,
+    scales_hbm,
+    swa_hbm,
+    sink_ref,
+    rope_hbm,
+    *refs,
+    scale: float,
+    non_causal: bool,
+    query_offset: int,
+    owners: str,
+) -> None:
+    """Use the uniform tile pipeline only after checking every request boundary."""
+    q_buf = refs[4 if owners == "aliased" else 2 if owners == "new" else 1]
+    bq, heads = q_buf.shape[1], q_hbm.shape[1]
+    batch, tokens = pages_ref.shape[1], positions_ref.shape[0]
+    mxu_heads = pl.cdiv(heads, 16) * 16
+    accumulators = tuple(
+        tuple(
+            jax.empty_ref(
+                jax.ShapeDtypeStruct((mxu_heads, 256), jnp.float32),
+                memory_space=pltpu.ACC(mxu),
+            )
+            for _ in range(2 * bq)
+        )
+        for mxu in range(2)
+    )
+
+    def run(uniform):
+        _csa2_kernel_impl(
+            plan_ref,
+            positions_ref,
+            lengths_ref,
+            pages_ref,
+            bounds_ref,
+            q_hbm,
+            kv_hbm,
+            scales_hbm,
+            swa_hbm,
+            sink_ref,
+            rope_hbm,
+            *refs,
+            scale=scale,
+            non_causal=non_causal,
+            query_offset=query_offset,
+            owners=owners,
+            uniform_tiles=uniform,
+            accumulators=accumulators,
+        )
+
+    if tokens != batch * bq:
+        run(False)
+        return
+
+    def check_boundary(request, uniform):
+        return uniform & (plan_ref[request] == request * bq)
+
+    uniform = jnp.bool_(True)
+    for request in range(batch + 1):
+        uniform = check_boundary(request, uniform)
+    lax.cond(uniform, lambda: run(True), lambda: run(False))
 
 
 @functools.partial(
@@ -864,8 +973,8 @@ def csa2(
         starts,
         positions,
         main_lengths,
-        swa_metadata,
-        bounds,
+        swa_metadata.T,
+        bounds.reshape(-1),
     )
     # Reserve three quarters of VMEM for four Q/KV buffers, decoded KV,
     # probabilities and compiler temporaries. Large batches stream metadata.
