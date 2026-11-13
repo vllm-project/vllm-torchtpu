@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import codecs
 import itertools
+import json
 import logging
 import os
 import threading
@@ -231,7 +232,10 @@ async def _post_with_retries(
 
 def _render_endpoint_for_api(api: str) -> str | None:
     # Upstream vLLM does not expose a /render endpoint; tokenization occurs
-    # directly within the prefill engine.
+    # directly within the prefill engine. PROXY_ENABLE_RENDER=1 opts back in
+    # for servers that still have it (a 404 falls through to raw-text prefill).
+    if api == "/v1/completions" and os.environ.get("PROXY_ENABLE_RENDER", "0") == "1":
+        return "/v1/completions/render"
     return None
 
 
@@ -328,6 +332,10 @@ async def lifespan(app: FastAPI):
                 "host": host,
                 "port": port,
                 "id": i,
+                "inflight": 0,
+                "last_seq": 0,
+                "dp_inflight": [0] * max(0, int(global_args.prefiller_dp_size)),
+                "dp_rr": itertools.count(),
             }
         )
 
@@ -342,6 +350,10 @@ async def lifespan(app: FastAPI):
                 "host": host,
                 "port": port,
                 "id": i,
+                "inflight": 0,
+                "last_seq": 0,
+                "dp_inflight": [0] * max(0, int(global_args.decoder_dp_size)),
+                "dp_rr": itertools.count(),
             }
         )
 
@@ -352,6 +364,7 @@ async def lifespan(app: FastAPI):
         global_args.decode_routing,
         _proxy_latency_interval(),
     )
+    app.state.client_seq = itertools.count(1)
 
     print(
         f"Initialized {len(app.state.prefill_clients)} prefill clients "
@@ -405,6 +418,13 @@ def parse_args():
         help="How a request picks its decode instance once prefill returns: "
         "round_robin, or least_loaded (fewest requests in flight here).",
     )
+    # Pin each prefill/decode request to a DP rank (X-data-parallel-rank),
+    # least in-flight first with round-robin tie-breaking. The server's internal
+    # DP load balancer can leave ranks uneven, and the DP-coordinated step pads
+    # every rank to the busiest rank's token bucket. 0 keeps server-side balancing.
+    # A client-supplied X-data-parallel-rank header always wins over this.
+    parser.add_argument("--prefiller-dp-size", type=int, default=0)
+    parser.add_argument("--decoder-dp-size", type=int, default=0)
 
     args = parser.parse_args()
 
@@ -424,20 +444,30 @@ def parse_args():
     return args
 
 
-def get_next_client(app, service_type: str):
+def get_next_client(app, service_type: str, requested_dp_rank: int | None = None):
     """
-    Get the next client in round-robin fashion.
+    Get the next client using least-in-flight with round-robin tie-breaking
+    (or deterministic rank pinning when requested_dp_rank is provided across
+    multiple prefill instances).
 
     Args:
         app: The FastAPI app instance
-        service_type: 'prefill'
+        service_type: 'prefill' (decode instances are picked by
+            `app.state.decode_router`)
+        requested_dp_rank: optional client-requested rank, pins the prefill
+            instance when there are several
 
     Returns:
         The next client to use
     """
     if service_type == "prefill":
-        client_idx = next(app.state.prefill_iterator)
-        return app.state.prefill_clients[client_idx]
+        clients = app.state.prefill_clients
+        if len(clients) > 1 and requested_dp_rank is not None:
+            chosen = clients[int(requested_dp_rank) % len(clients)]
+        else:
+            chosen = min(clients, key=lambda c: (c.get("inflight", 0), c.get("last_seq", 0)))
+        chosen["last_seq"] = next(app.state.client_seq)
+        return chosen
     else:
         raise ValueError(f"Unknown service type: {service_type}")
 
@@ -448,6 +478,7 @@ async def send_request_to_prefill(
     req_data: dict,
     request_id: str,
     forwarded: dict | None = None,
+    requested_dp_rank: int | None = None,
 ):
     """
     Send a request to a service using a client from the pool.
@@ -458,18 +489,42 @@ async def send_request_to_prefill(
     req_data["max_tokens"] = 1
     if "max_completion_tokens" in req_data:
         req_data["max_completion_tokens"] = 1
+    if "min_tokens" in req_data and req_data["min_tokens"] is not None:
+        req_data["min_tokens"] = min(int(req_data["min_tokens"]), 1)
     if "stream_options" in req_data:
         del req_data["stream_options"]
+    if "tools" in req_data and req_data.get("tools"):
+        req_data["tool_choice"] = "none"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
         **(forwarded or {}),
     }
-
-    return await _post_with_retries(
-        client_info, endpoint, req_data, headers, request_id, phase="PREFILL"
-    )
+    # --prefiller-dp-size pinning; a client-forwarded X-data-parallel-rank
+    # header already names the rank and takes precedence.
+    inflight = client_info.get("dp_inflight") or []
+    dp_rank = None
+    if "X-data-parallel-rank" in (forwarded or {}):
+        pass
+    elif requested_dp_rank is not None:
+        if inflight:
+            dp_rank = int(requested_dp_rank) % len(inflight)
+            inflight[dp_rank] += 1
+            headers["X-data-parallel-rank"] = str(dp_rank)
+    elif inflight:
+        rr = next(client_info["dp_rr"])
+        n_dp = len(inflight)
+        dp_rank = min(range(n_dp), key=lambda r: (inflight[r], (r - rr) % n_dp))
+        inflight[dp_rank] += 1
+        headers["X-data-parallel-rank"] = str(dp_rank)
+    try:
+        return await _post_with_retries(
+            client_info, endpoint, req_data, headers, request_id, phase="PREFILL"
+        )
+    finally:
+        if dp_rank is not None:
+            inflight[dp_rank] -= 1
 
 
 async def render_completion_prompt(
@@ -511,7 +566,29 @@ async def stream_from_decode(
         "X-Request-Id": request_id,
         **(forwarded or {}),
     }
+    # --decoder-dp-size pinning; a client-forwarded X-data-parallel-rank
+    # header already names the rank and takes precedence.
+    inflight = client_info.get("dp_inflight") or []
+    dp_rank = None
+    if inflight and "X-data-parallel-rank" not in (forwarded or {}):
+        rr = next(client_info["dp_rr"])
+        n_dp = len(inflight)
+        dp_rank = min(range(n_dp), key=lambda r: (inflight[r], (r - rr) % n_dp))
+        inflight[dp_rank] += 1
+        headers["X-data-parallel-rank"] = str(dp_rank)
+    try:
+        async for chunk in _stream_from_decode_once(
+            client_info, endpoint, req_data, request_id, headers
+        ):
+            yield chunk
+    finally:
+        if dp_rank is not None:
+            inflight[dp_rank] -= 1
 
+
+async def _stream_from_decode_once(
+    client_info: dict, endpoint: str, req_data: dict, request_id: str, headers: dict
+):
     for attempt in range(_MAX_ATTEMPTS):
         yielded_any = False
         try:
@@ -522,6 +599,13 @@ async def stream_from_decode(
                     # Streaming responses are not read on entry, so pull the
                     # body first or the raised error carries no vLLM detail.
                     await response.aread()
+                    print(
+                        f"[DECODE-HTTP-{response.status_code}] req_id={request_id} "
+                        f"prompt_len_hint={len(json.dumps(req_data.get('messages', ''))) if isinstance(req_data, dict) else -1} "
+                        f"max_tokens={req_data.get('max_tokens') if isinstance(req_data, dict) else None} "
+                        f"body={response.text[:600]!r}",
+                        flush=True,
+                    )
                 response.raise_for_status()
                 encoder = _AsciiSafeStreamEncoder()
                 async for chunk in response.aiter_bytes():
@@ -561,6 +645,8 @@ async def _handle_completions(api: str, request: Request):
     try:
         t_request_recv_perf = time.perf_counter()
         req_data = await request.json()
+        requested_dp_rank = req_data.pop("dp_rank", None)
+        req_data.pop("rid", None)
         request_id = str(uuid.uuid4())
         # vLLM sends a request carrying X-data-parallel-rank to that DP rank of
         # the engine. Passed to both hops, so that a client can hold a request
@@ -573,27 +659,57 @@ async def _handle_completions(api: str, request: Request):
             flush=True,
         )
 
-        # Get the next prefill client in round-robin fashion
-        prefill_client_info = get_next_client(request.app, "prefill")
-        render_endpoint = _render_endpoint_for_api(api)
-        if render_endpoint is not None:
-            render_response = await render_completion_prompt(
-                prefill_client_info, render_endpoint, req_data, request_id, forwarded
+        # Get the next prefill client (least-inflight or pinned by requested_dp_rank)
+        prefill_client_info = get_next_client(
+            request.app, "prefill", requested_dp_rank=requested_dp_rank
+        )
+        prefill_client_info["inflight"] = prefill_client_info.get("inflight", 0) + 1
+        try:
+            prompt_val = req_data.get("prompt")
+            already_token_ids = (
+                isinstance(prompt_val, list)
+                and bool(prompt_val)
+                and (
+                    isinstance(prompt_val[0], int)
+                    or (
+                        isinstance(prompt_val[0], list)
+                        and bool(prompt_val[0])
+                        and isinstance(prompt_val[0][0], int)
+                    )
+                )
             )
-            req_data = _replace_prompt_with_rendered_token_ids(
-                req_data, render_response.json()
-            )
+            render_endpoint = None if already_token_ids else _render_endpoint_for_api(api)
+            if render_endpoint is not None:
+                try:
+                    render_response = await render_completion_prompt(
+                        prefill_client_info, render_endpoint, req_data, request_id, forwarded
+                    )
+                    req_data = _replace_prompt_with_rendered_token_ids(
+                        req_data, render_response.json()
+                    )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code != 404:
+                        raise
 
-        # Send request to prefill service
-        t_prefill_send = time.time()
-        t_prefill_send_perf = time.perf_counter()
-        print(
-            f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
-            flush=True,
-        )
-        response = await send_request_to_prefill(
-            prefill_client_info, api, req_data, request_id, forwarded
-        )
+            # Send request to prefill service
+            t_prefill_send = time.time()
+            t_prefill_send_perf = time.perf_counter()
+            print(
+                f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
+                flush=True,
+            )
+            response = await send_request_to_prefill(
+                prefill_client_info,
+                api,
+                req_data,
+                request_id,
+                forwarded,
+                requested_dp_rank=requested_dp_rank,
+            )
+        finally:
+            prefill_client_info["inflight"] = max(
+                0, prefill_client_info.get("inflight", 1) - 1
+            )
         t_prefill_recv = time.time()
         t_prefill_recv_perf = time.perf_counter()
         prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
@@ -715,6 +831,57 @@ async def models():
     return JSONResponse(status_code=response.status_code, content=response.json())
 
 
+@app.post("/flush_cache")
+@app.post("/reset_prefix_cache")
+async def reset_prefix_cache(request: Request):
+    """Forward cache reset to all prefill and decode instances."""
+    results = []
+    for role, clients in (
+        ("prefill", request.app.state.prefill_clients),
+        ("decode", request.app.state.decode_clients),
+    ):
+        for c in clients:
+            try:
+                resp = await c["client"].post("/reset_prefix_cache")
+                results.append(
+                    {
+                        "role": role,
+                        "status_code": resp.status_code,
+                        "body": resp.json() if resp.status_code == 200 else resp.text,
+                    }
+                )
+            except Exception as exc:
+                results.append({"role": role, "error": str(exc)})
+    return {"status": "ok", "results": results}
+
+
+@app.post("/tokenize")
+async def handle_tokenize(request: Request):
+    req_data = await request.json()
+    c = get_next_client(request.app, "prefill")
+    resp = await c["client"].post("/tokenize", json=req_data)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@app.post("/detokenize")
+async def handle_detokenize(request: Request):
+    req_data = await request.json()
+    c = get_next_client(request.app, "prefill")
+    resp = await c["client"].post("/detokenize", json=req_data)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@app.get("/version")
+async def handle_version(request: Request):
+    c = request.app.state.prefill_clients[0]
+    resp = await c["client"].get("/version")
+    resp.raise_for_status()
+    return resp.json()
+
+
+@app.get("/health")
 @app.get("/healthcheck")
 async def healthcheck():
     """Simple endpoint to check if the server is running."""
