@@ -136,6 +136,8 @@ def _runner(fused, synthetic, vocab, input_batch, apply_top_k):
         _sampler_topk_candidates=lambda start, end, grammar: 0,
         _sampler_applies_topk_topp=lambda: True,
         _sampler_applies_top_k=lambda: apply_top_k,
+        _fold_read_offsets=None,
+        _folded_row_offsets=None,
     )
     for name in (
         "_sample_spec_verify_fused",
@@ -211,10 +213,13 @@ def test_fused_sampler_enabled():
         fused_spec_verify.fused_sampler_enabled(SimpleNamespace(**{attr: 1}))
 
 
+@pytest.mark.parametrize("hybrid", [False, True])
 @pytest.mark.parametrize("blocks", [0, 2])
-def test_precompile_warms_every_fused_variant(monkeypatch, blocks):
+def test_precompile_warms_every_fused_variant(monkeypatch, blocks, hybrid):
     """_precompile_fused_spec_verify runs the fused graph at each variant
-    _sample_spec_verify_fused can pick, on inputs of the served dtypes."""
+    _sample_spec_verify_fused can pick, on inputs of the served dtypes; on
+    hybrid models it warms the read-offset variant too, and the plain one
+    stays warm for chunks with no mamba groups."""
     from vllm_torchtpu.runner import tpu_runner
 
     num_tokens, num_reqs, vocab = 16, 2, 256
@@ -234,12 +239,32 @@ def test_precompile_warms_every_fused_variant(monkeypatch, blocks):
         assert out.shape == (num_reqs, K + 1)
         return out
 
+    seen_ro = []
+    fused_ro_fn = fused_spec_verify.spec_verify_sample_fused_read_offsets
+
+    def recording_ro(*args, **kwargs):
+        seen_ro.append(
+            (
+                kwargs["apply_topk_topp"],
+                kwargs["apply_top_k"],
+                kwargs["topk_candidates"],
+            )
+        )
+        tokens, row_offsets = fused_ro_fn(*args, **kwargs)
+        assert tokens.shape == (num_reqs, K + 1)
+        assert row_offsets.shape == (num_reqs,)
+        return tokens, row_offsets
+
     monkeypatch.setattr(fused_spec_verify, "spec_verify_sample_fused", recording)
+    monkeypatch.setattr(
+        fused_spec_verify, "spec_verify_sample_fused_read_offsets", recording_ro
+    )
     runner = SimpleNamespace(
         rejection_sampler=RejectionSampler(_spec_config(True)),
         speculative_config=SimpleNamespace(num_speculative_tokens=K),
         vocab_size=vocab,
         _topk_candidate_blocks=lambda: blocks,
+        _fused_verify_folds_read_offsets=lambda: hybrid,
     )
     with torch.compiler.set_stance("force_eager"):
         TPUModelRunner._precompile_fused_spec_verify(
@@ -259,3 +284,66 @@ def test_precompile_warms_every_fused_variant(monkeypatch, blocks):
         want.append((True, True, blocks))
     want.append((True, False, 0))  # top-p only
     assert seen == want
+    assert seen_ro == (want if hybrid else [])
+
+
+def test_fused_verify_folds_read_offsets_only_with_a_tpu_buffer():
+    """Serving and warmup share one fold predicate: a read-offset buffer on
+    the TPU. No buffer (non-hybrid) or an off-TPU buffer keeps the plain
+    verify plus the separate read-offset update."""
+    runner = SimpleNamespace(mamba_slot_read_offsets=None)
+    assert not TPUModelRunner._fused_verify_folds_read_offsets(runner)
+    runner.mamba_slot_read_offsets = torch.zeros(8, dtype=torch.int32)
+    assert not TPUModelRunner._fused_verify_folds_read_offsets(runner)
+
+
+def test_fused_verify_also_returns_the_read_offsets():
+    """With a mamba read-offset buffer, the fused verify also returns each
+    row's offset (num_accepted - 1; 0 past num_reqs), and the tokens are the
+    same as the unfused verify's."""
+    vocab, num_reqs, padded = 4096, 13, 16
+    logits, md, input_batch = _case(3, num_reqs, padded, vocab, torch.float32, 0)
+    args = (True, vocab, input_batch, False)
+    want = _verify(_runner(False, *args), logits, md, num_reqs, 3)
+    runner = _runner(True, *args)
+    runner.device = torch.device("cpu")
+    runner._fold_read_offsets = ([torch.arange(padded, dtype=torch.int32)], num_reqs)
+    got = _verify(runner, logits, md, num_reqs, 3)
+    assert torch.equal(got, want)
+    num_valid = (want != -1).sum(dim=1)
+    expected = torch.where(
+        torch.arange(want.shape[0]) < num_reqs, (num_valid - 1).clamp(min=0), 0
+    ).to(torch.int32)
+    assert torch.equal(runner._folded_row_offsets, expected)
+
+
+@pytest.mark.parametrize("num_groups", [1, 2])
+@pytest.mark.parametrize("rows,width", [(4, 4), (6, 4), (3, 4)])
+def test_scatter_folded_read_offsets_matches_the_separate_update(
+    num_groups, rows, width
+):
+    from vllm_torchtpu.runner import tpu_runner
+
+    num_blocks = 32
+    groups = [
+        torch.arange(width, dtype=torch.int32) + 1 + g * width
+        for g in range(num_groups)
+    ]
+    tokens = torch.full((rows, K + 1), -1, dtype=torch.int32)
+    for r in range(rows):
+        tokens[r, : (r % (K + 1)) + 1] = 7
+    num_reqs = min(rows, width) - 1
+    want = torch.full((num_blocks,), 9, dtype=torch.int32)
+    tpu_runner._update_read_offsets_impl(
+        want, groups, tokens, torch.tensor(num_reqs, dtype=torch.int64)
+    )
+    num_valid = (tokens != -1).sum(dim=1)
+    row_offsets = torch.where(
+        torch.arange(rows) < num_reqs, (num_valid - 1).clamp(min=0), 0
+    ).to(torch.int32)
+    runner = SimpleNamespace(
+        mamba_slot_read_offsets=torch.full((num_blocks,), 9, dtype=torch.int32)
+    )
+    offsets = TPUModelRunner._scatter_folded_read_offsets(runner, groups, row_offsets)
+    assert torch.equal(runner.mamba_slot_read_offsets, want)
+    assert offsets.shape == (width,)

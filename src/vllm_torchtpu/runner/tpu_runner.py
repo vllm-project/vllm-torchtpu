@@ -960,6 +960,12 @@ class TPUModelRunner(GPUModelRunner):
         # `initialize_kv_cache` once the mamba pool size is known. See
         # `AttentionMetadata.mamba_slot_read_offsets`.
         self.mamba_slot_read_offsets: torch.Tensor | None = None
+        # Set per verify chunk in `sample_tokens` when the fused non-greedy
+        # verify also computes the read offsets: (mamba index groups,
+        # num_reqs) in, the verify's per-row offsets out (see
+        # `_sample_spec_verify_fused`).
+        self._fold_read_offsets: tuple[list[torch.Tensor], int] | None = None
+        self._folded_row_offsets: torch.Tensor | None = None
         # req_ids whose current state storage has an initialized read offset;
         # see `_reset_read_offsets_for_new_requests`.
         self._mamba_offset_seeded: set[str] = set()
@@ -5058,6 +5064,43 @@ class TPUModelRunner(GPUModelRunner):
             self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
         return offsets
 
+    def _fused_verify_folds_read_offsets(self) -> bool:
+        """Whether the fused non-greedy verify takes the variant that also
+        returns the mamba read offsets: the one predicate serving
+        (`sample_tokens`) and warmup (`_precompile_fused_spec_verify`) use."""
+        return (
+            self.mamba_slot_read_offsets is not None
+            and self.mamba_slot_read_offsets.device.type == "tpu"
+        )
+
+    def _scatter_folded_read_offsets(
+        self, indices_per_group: list[torch.Tensor], row_offsets: torch.Tensor
+    ) -> torch.Tensor:
+        """Scatter the per-row read offsets the fused verify computed
+        (`spec_verify_sample_fused_read_offsets`) into the slot buffer, as
+        `_update_mamba_slot_read_offsets` would from the verify tokens.
+
+        Rows are padded or cut to the groups' width (padded rows' slots are the
+        null block). Eager: a compiled program mutating the slot buffer would
+        add its own mutation epilogue. Returns the offsets, one per batch
+        position."""
+        assert self.mamba_slot_read_offsets is not None
+        groups = list(indices_per_group)
+        width = groups[0].shape[0]
+        rows = row_offsets.shape[0]
+        offsets = (
+            row_offsets[:width]
+            if rows >= width
+            else torch.nn.functional.pad(row_offsets, (0, width - rows))
+        ).to(self.mamba_slot_read_offsets.dtype)
+        if len(groups) == 1:
+            self.mamba_slot_read_offsets.index_put_((groups[0].long(),), offsets)
+        else:
+            self.mamba_slot_read_offsets.index_put_(
+                (torch.cat(groups, dim=0).long(),), offsets.repeat(len(groups))
+            )
+        return offsets
+
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
 
@@ -5530,6 +5573,35 @@ class TPUModelRunner(GPUModelRunner):
         bonus_u = draw((num_reqs, vocab))
         accept_u = draw(md.draft_token_ids.shape)
         recover_u = draw((num_tokens, vocab))
+        fold = self._fold_read_offsets
+        if fold is not None:
+            next_tokens, self._folded_row_offsets = (
+                fused_spec_verify.spec_verify_sample_fused_read_offsets(
+                    logits,
+                    md.bonus_logits_indices,
+                    md.target_logits_indices,
+                    md.draft_token_ids,
+                    md.draft_lengths,
+                    md.segment_ids,
+                    md.group_indices,
+                    req_temperatures,
+                    req_top_k,
+                    req_top_p,
+                    bonus_u,
+                    accept_u,
+                    recover_u,
+                    self.rejection_sampler.synthetic_conditional_rates,
+                    self.rejection_sampler.synthetic_mode,
+                    self.speculative_config.num_speculative_tokens,
+                    topk_candidates=topk_candidates,
+                    apply_topk_topp=self._sampler_applies_topk_topp(),
+                    apply_top_k=self._sampler_applies_top_k(),
+                    num_reqs=torch.tensor(
+                        fold[1], dtype=torch.int64, device=self.device
+                    ),
+                )
+            )
+            return next_tokens
         return fused_spec_verify.spec_verify_sample_fused(
             logits,
             md.bonus_logits_indices,
@@ -5634,6 +5706,14 @@ class TPUModelRunner(GPUModelRunner):
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
+                    # A fused non-greedy verify also computes the read offsets
+                    # (see _sample_spec_verify_fused); the scatter stays here.
+                    self._fold_read_offsets = (
+                        (mamba_indices, num_reqs)
+                        if mamba_indices and self._fused_verify_folds_read_offsets()
+                        else None
+                    )
+                    self._folded_row_offsets = None
                     with self._stage_timing.stage("sample"):
                         next_tokens = self._sample_spec_verify_chunk(
                             logits,
@@ -5650,9 +5730,18 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
-                    read_offsets = self._update_mamba_slot_read_offsets(
-                        mamba_indices, next_tokens, num_reqs
-                    )
+                    if self._folded_row_offsets is not None:
+                        # Only set when `_fold_read_offsets` carried the groups.
+                        assert mamba_indices is not None
+                        read_offsets = self._scatter_folded_read_offsets(
+                            mamba_indices, self._folded_row_offsets
+                        )
+                    else:
+                        read_offsets = self._update_mamba_slot_read_offsets(
+                            mamba_indices, next_tokens, num_reqs
+                        )
+                    self._fold_read_offsets = None
+                    self._folded_row_offsets = None
                     spec_boundary_state.copy_states(self, boundary_plan, read_offsets)
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
@@ -7562,6 +7651,33 @@ class TPUModelRunner(GPUModelRunner):
                 apply_top_k=apply_top_k,
             )
             synchronize_tensors(out)
+            if self._fused_verify_folds_read_offsets():
+                # Hybrid models also take the variant that returns the read
+                # offsets (see _sample_spec_verify_fused); the plain variant
+                # above stays warm for chunks with no mamba groups.
+                out = fused_spec_verify.spec_verify_sample_fused_read_offsets(
+                    dummy_logits,
+                    bonus_logits_indices,
+                    target_logits_indices,
+                    draft_token_ids,
+                    draft_lengths,
+                    segment_ids,
+                    group_indices,
+                    temps,
+                    top_k,
+                    top_p,
+                    bonus_u,
+                    warm_accept_u,
+                    warm_recover_u,
+                    self.rejection_sampler.synthetic_conditional_rates,
+                    self.rejection_sampler.synthetic_mode,
+                    self.speculative_config.num_speculative_tokens,
+                    topk_candidates=topk_candidates,
+                    apply_topk_topp=apply_topk_topp,
+                    apply_top_k=apply_top_k,
+                    num_reqs=torch.tensor(1, dtype=torch.int64, device=device),
+                )
+                synchronize_tensors(out)
 
     def _precompile_top_token_verify(
         self,
