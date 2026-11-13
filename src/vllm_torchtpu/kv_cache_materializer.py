@@ -13,13 +13,14 @@
 # limitations under the License.
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 import torch
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
@@ -148,17 +149,57 @@ def _pool_attention_geometry(
     )
     if not has_mamba:
         return None
-    for group_list in attn_groups:
-        for group in group_list:
+    candidates = [
+        group
+        for group_list in attn_groups
+        for group in group_list
+        if isinstance(group.kv_cache_spec, AttentionSpec)
+        and not isinstance(group.kv_cache_spec, EncoderOnlyAttentionSpec)
+    ]
+    if not candidates:
+        return None
+
+    def token_split(spec) -> bool:
+        # A token-split full-attention spec (e.g. KV decode context parallelism
+        # over rank pairs): each rank stores `block_size // tokens_per_state`
+        # rows of a block.
+        return (
+            isinstance(spec, FullAttentionSpec)
+            and isinstance(spec.tokens_per_state, int)
+            and spec.tokens_per_state > 1
+        )
+
+    first = candidates[0]
+    if token_split(first.kv_cache_spec):
+        # Describe the page by a one-row-per-token spec if there is one (for
+        # example an unsplit draft group), else by the split spec's stored
+        # rows, preferring a non-MLA group.
+        for group in candidates:
             spec = group.kv_cache_spec
-            if isinstance(spec, AttentionSpec) and not isinstance(
-                spec, EncoderOnlyAttentionSpec
-            ):
-                kernel_block_size = kernel_block_size_by_gid.get(
-                    group.kv_cache_group_id, spec.block_size
-                )
-                return spec, group.backend, kernel_block_size
-    return None
+            if isinstance(spec, FullAttentionSpec) and spec.tokens_per_state == 1:
+                first = group
+                break
+        else:
+            first = next(
+                (
+                    g
+                    for g in candidates
+                    if not isinstance(g.kv_cache_spec, MLAAttentionSpec)
+                ),
+                first,
+            )
+            spec = first.kv_cache_spec
+            rows = spec.block_size // spec.tokens_per_state
+            return (
+                replace(spec, block_size=rows, tokens_per_state=1),
+                first.backend,
+                rows,
+            )
+    spec = first.kv_cache_spec
+    kernel_block_size = kernel_block_size_by_gid.get(
+        first.kv_cache_group_id, spec.block_size
+    )
+    return spec, first.backend, kernel_block_size
 
 
 def layer_to_pool_index(kv_cache_config: KVCacheConfig) -> dict[str, int]:
