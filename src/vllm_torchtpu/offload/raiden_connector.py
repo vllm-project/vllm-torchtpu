@@ -283,6 +283,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     # TPU_RAIDEN_LRU_REFRESH == 2: refresh a finished request's resident chain.
     _lru_refresh_on_finish = False
     _offload_stats = False
+    # TPU_RAIDEN_FLUSH_REAL_REUSE / TPU_RAIDEN_LOSS_TRACE; `_fresh_block_ids`
+    # collects the blocks the pool hands out between two connector metas.
+    _flush_real_reuse = False
+    _loss_trace = False
+    _fresh_block_ids: set[int] | None = None
 
     def __init__(
         self,
@@ -322,6 +327,19 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 lru_refresh >= 2,
                 self._offload_stats,
             )
+        self._flush_real_reuse = bool(tpu_envs.TPU_RAIDEN_FLUSH_REAL_REUSE)
+        self._loss_trace = bool(tpu_envs.TPU_RAIDEN_LOSS_TRACE)
+        self._traced_req_ids: set[str] = set()
+        if self._loss_trace:
+            self._raiden_manager.enable_loss_trace()
+        if self._flush_real_reuse or self._loss_trace:
+            logger.info(
+                "TPURaidenOffloadingConnector: TPU_RAIDEN_FLUSH_REAL_REUSE=%s "
+                "(flush stores only for blocks the pool hands out fresh, not "
+                "prefix hits), TPU_RAIDEN_LOSS_TRACE=%s",
+                self._flush_real_reuse,
+                self._loss_trace,
+            )
 
     def attach_block_pool(self, block_pool) -> None:
         """`EvictionAwareConnector`: the scheduler's block pool, whose free
@@ -340,6 +358,51 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 else WriteBackPolicy.window_blocks
             ),
         )
+        if self._flush_real_reuse and not getattr(
+            block_pool, "_tpu_raiden_fresh_watch", False
+        ):
+            fresh: set[int] = set()
+            pool_get_new_blocks = block_pool.get_new_blocks
+
+            def get_new_blocks(num_blocks: int) -> list:
+                blocks = pool_get_new_blocks(num_blocks)
+                fresh.update(b.block_id for b in blocks)
+                return blocks
+
+            block_pool.get_new_blocks = get_new_blocks
+            block_pool._tpu_raiden_fresh_watch = True
+            self._fresh_block_ids = fresh
+
+    def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
+        """TPU_RAIDEN_FLUSH_REAL_REUSE: the blocks whose pending stores must be
+        flushed this step are the blocks the pool handed out fresh (their
+        contents are about to be overwritten), not every block a scheduled
+        request lists: a new request's prefix-hit blocks keep their contents,
+        and flushing on them cancels a parked store of the very chain that is
+        being reused, or drains a launched one synchronously."""
+        super()._update_req_states(scheduler_output)
+        fresh = self._fresh_block_ids
+        if fresh is None:
+            return
+        allocated = self._current_batch_allocated_block_ids
+        if self._offload_stats and self._block_id_to_pending_jobs:
+            pending = self._block_id_to_pending_jobs
+            real = {j for b in fresh if b in pending for j in pending[b]}
+            hit_only = {
+                j for b in allocated - fresh if b in pending for j in pending[b]
+            } - real
+            for job_id in hit_only:
+                parked = self._fence_pending.get(job_id)
+                if parked is not None:
+                    self.wb_counters["hitflush_skipped_parked"] += 1
+                    self.wb_counters["hitflush_skipped_parked_keys"] += len(
+                        parked.keys
+                    )
+                elif self._raiden_manager.is_job_launched(job_id):
+                    self.wb_counters["hitflush_skipped_launched"] += 1
+        # Every fresh block, including any the scheduler output does not list.
+        self._current_batch_allocated_block_ids = set(fresh)
+        fresh.clear()
 
     def _wb_unregister(self, req_id: str) -> None:
         for bid in self._wb_blocks.pop(req_id, ()):
@@ -452,6 +515,23 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 mgr_stats.get("store_keys_cancelled", 0),
                 mgr_stats.get("refreshed_entries", 0),
             )
+            logger.info(
+                "Raiden offload flush stats: drains %d calls %d jobs %.1f ms | "
+                "hit-only flushes skipped: parked %d (%d keys) launched %d | "
+                "lookups missing >=8k tokens: %s",
+                c["drain_calls"],
+                c["drain_jobs"],
+                c["drain_us"] / 1e3,
+                c["hitflush_skipped_parked"],
+                c["hitflush_skipped_parked_keys"],
+                c["hitflush_skipped_launched"],
+                " ".join(
+                    f"{k[len('miss8k_'):]}={c[k]}/{c['miss8k_tok_' + k[len('miss8k_'):]]}"
+                    for k in sorted(c)
+                    if k.startswith("miss8k_") and not k.startswith("miss8k_tok_")
+                )
+                or "-",
+            )
             if mgr_stats:
                 mgr_stats.clear()
         held = c["held_requests"]
@@ -559,7 +639,16 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 )
             elif manager.is_job_launched(job_id):
                 launched_flush_ids.add(job_id)
-        drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
+        drained: list = []
+        if launched_flush_ids:
+            drain_start = time.perf_counter()
+            drained = manager.drain_jobs(launched_flush_ids)
+            if self._offload_stats:
+                self.wb_counters["drain_calls"] += 1
+                self.wb_counters["drain_jobs"] += len(launched_flush_ids)
+                self.wb_counters["drain_us"] += int(
+                    (time.perf_counter() - drain_start) * 1e6
+                )
 
         # Collect completed/drained jobs for the worker echo channel.
         for finished_job in list(drained) + manager.poll_finished_jobs():
@@ -667,7 +756,48 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         )
         if self._offload_stats and result[0] is not None:
             self._count_stale_head(request, num_computed_tokens, result[0])
+        if self._loss_trace and result[0] is not None:
+            self._trace_miss(request, num_computed_tokens, result[0])
         return result
+
+    _LOSS_TRACE_MIN_TOKENS = 8192
+
+    def _trace_miss(
+        self, request: Request, num_computed_tokens: int, num_hit_tokens: int
+    ) -> None:
+        """TPU_RAIDEN_LOSS_TRACE: once per request whose local + host hit stops
+        >= 8k tokens short of its prompt, log why the first missing key is
+        not on the host (never offered, store cancelled, evicted, ...)."""
+        req_id = request.request_id
+        if req_id in self._traced_req_ids:
+            return
+        self._traced_req_ids.add(req_id)
+        stop = num_computed_tokens + num_hit_tokens
+        missing = request.num_prompt_tokens - stop
+        if missing < self._LOSS_TRACE_MIN_TOKENS:
+            return
+        found = self._prefix_offload_keys(request, stop)
+        if found is None or not found[1]:
+            return
+        event, age, refreshed, stored = self._raiden_manager.explain_missing(
+            found[1][0]
+        )
+        c = self.wb_counters
+        c["miss8k_" + event] += 1
+        c["miss8k_tok_" + event] += missing
+        logger.info(
+            "Raiden loss trace: req %s prompt %d local %d host %d missing %d: "
+            "first missing key %s %.0fs ago (refreshed %.0fs, stored %.0fs ago)",
+            req_id,
+            request.num_prompt_tokens,
+            num_computed_tokens,
+            num_hit_tokens,
+            missing,
+            event,
+            age,
+            refreshed,
+            stored,
+        )
 
     def _count_stale_head(
         self, request: Request, num_computed_tokens: int, num_hit_tokens: int
@@ -691,6 +821,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             )
 
     def request_finished(self, request: Request, *args, **kwargs):
+        traced = getattr(self, "_traced_req_ids", None)
+        if traced:
+            traced.discard(request.request_id)
         if self._lru_refresh_on_finish:
             req_status = self._req_status.get(request.request_id)
             if req_status is not None:
