@@ -1496,10 +1496,12 @@ def _block_sparse_gqa_prefill(
             raise ValueError(
                 f"block_bits {block_bits.shape} != {(nblocks, words, part_width)}"
             )
-    if envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL and block_bits is not None:
-        block_bits_native = block_bits
-    elif envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
-        block_bits_native = _selection_bitset(
+    if envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
+        # A precomputed bitset (the union walk's SparseCore bitset) takes the
+        # place of _selection_bitset; the tile metadata and the page table are
+        # derived from it below either way (as before bf9c348d8, which left
+        # them unset on this path: UnboundLocalError on `table`).
+        block_bits_native = block_bits if block_bits is not None else _selection_bitset(
             blocks,
             lengths,
             ratio=ratio,
