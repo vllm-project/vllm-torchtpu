@@ -88,6 +88,7 @@ def _ring_outputs(
     fills: list[int] | None = None,
     arp: bool = False,
     ar0: bool = False,
+    scaled: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, collectives.CommParams]:
     """Run 2 layers x 2 alternating slots of `allreduce` + `add_residual`.
 
@@ -98,10 +99,11 @@ def _ring_outputs(
     trace time) and zeroes a spare buffer. With `arp`, slot 1 is the ARPIPE
     deferred all-reduce: primed, its other half added before every slot-0
     all-reduce (as a layer's input projection would) and after the last
-    step. With `ar0`, slot 0 is the AR0S
-    all-reduce: its payload is packed and sent from `ar0_spec`'s column-group
-    hooks (fed the partial's columns, as an output projection would) and
-    finished by `ar0_finish`.
+    step. With `ar0`, slot 0 is the AR0S all-reduce: its payload is packed
+    and sent from `ar0_spec`'s column-group hooks (fed the partial's columns,
+    as an output projection would) and finished by `ar0_finish`. `scaled`
+    multiplies slot 0's partial by a per-lane output scale (inside the hooks
+    under `ar0`, read from `scr['sm']` as a module's `out_s` would be).
     """
     devs = jax.devices("cpu")
     assert len(devs) >= R, f"Expected >= {R} CPU devices, found {len(devs)}"
@@ -116,6 +118,7 @@ def _ring_outputs(
     scratch = {
         "res": pltpu.VMEM((ex.MB, H), F32),
         "spare": pltpu.VMEM((8, 128), F32),
+        "sm": pltpu.VMEM((2, 1, H), F32),
         **collectives.ring_scratch(cp),
         **collectives.stage_scratch(cp),
     }
@@ -138,9 +141,14 @@ def _ring_outputs(
         scr["res"][...] = jnp.zeros((ex.MB, H), F32)
         if arp:
             ar.arp_prime()
+        lane = lax.broadcasted_iota(I32, (1, H), 1)
+        scale = 1.0 + lax.rem(lane, 7).astype(F32) * 0.125  # exact in f32
+        scr["sm"][0] = scale
         for step_idx in range(4):
             slot = step_idx % 2
             src = x0_ref[...] if slot == 0 else x1_ref[...]
+            if scaled and slot == 0 and not ar0:
+                src = src * scale
             fill = None
             if fills is not None:
 
@@ -158,7 +166,7 @@ def _ring_outputs(
             if arp:  # slot 0: the deferred half (layer 0: the primed zeros)
                 ar.arp_round2_add()
             if ar0:  # slot 0
-                spec = ar.ar0_spec(0, first)
+                spec = ar.ar0_spec(0, first, 0, 0 if scaled else None)
                 spec.pre()
                 for cols, hook in zip(spec.cols, spec.hooks):
                     hook([x0_ref[:, pl.ds(c0, cw)] for c0, cw in cols])
@@ -445,11 +453,14 @@ def _check_ar0_bit_identical() -> None:
         for war, H, B in ((1, 1024, 4), (0, 4096, 3)):
             tiles = dataclasses.replace(_TINY_TILES, war=war, **kw)
             plain = dataclasses.replace(tiles, ar0s=False, arpipe=False)
-            base, host, _ = _ring_outputs(plain, H=H, B=B, seed=21)
-            out, _, cp = _ring_outputs(tiles, H=H, B=B, seed=21, arp=arp, ar0=True)
-            assert cp.AR0S and cp.A0_CW == 512, (kw, cp)
-            np.testing.assert_array_equal(out, base)
-            _assert_close_to_host_sum(out, host)
+            for scaled in (False, True):
+                kw_run = dict(H=H, B=B, seed=21, scaled=scaled)
+                base, host, _ = _ring_outputs(plain, **kw_run)
+                out, _, cp = _ring_outputs(tiles, arp=arp, ar0=True, **kw_run)
+                assert cp.AR0S and cp.A0_CW == 512, (kw, cp)
+                np.testing.assert_array_equal(out, base)
+                if not scaled:
+                    _assert_close_to_host_sum(out, host)
 
 
 def test_ar0s_bit_identical_to_plain_all_reduce():
