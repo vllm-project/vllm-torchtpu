@@ -44,6 +44,7 @@ def test_torus_wraparound_and_mesh_packing() -> None:
 
 def test_spec_cited_chip_and_unloaded_hop_latency() -> None:
     """Verify chip spec fields match documented citations and unloaded hops."""
+    # Chip spec defaults imported directly from constants for exact equality check.
     expected_link_bw = DEFAULT_ICI_LINK_BW
     expected_ici_bw = DEFAULT_ICI_BW
     expected_hop_latency = DEFAULT_ICI_HOP_LATENCY_S
@@ -57,15 +58,20 @@ def test_spec_cited_chip_and_unloaded_hop_latency() -> None:
     assert chip.ici_link_bw == expected_link_bw
     assert chip.ici_bw == expected_ici_bw
     assert chip.ici_hop_latency_s == expected_hop_latency
+    # 2 phases * (2 hops * latency + (payload * (group - 1) / group) / link_bw)
     transfer_bytes = 16.0 * 7.0 / 8.0
     expected_phase_time = 2.0 * expected_hop_latency + transfer_bytes / expected_link_bw
     assert torus_collective_s(
         "ar", 16.0, (2, 2, 2, 1), chip, TOPOLOGIES["2x2x1"]
-    ) == pytest.approx(2.0 * expected_phase_time, rel=1e-12)
+    ) == pytest.approx(
+        2.0 * expected_phase_time,
+        rel=1e-12,
+    )
 
 
 def test_torus_collective_adds_hop_latency_to_bandwidth_phase() -> None:
     """Verify torus_collective_s adds per-phase hop latency to wire transfer time."""
+    # Derived from constants: 100 GB/s link bandwidth and 1.0 us hop latency.
     expected_link_bw = DEFAULT_ICI_LINK_BW
     expected_hop_latency = DEFAULT_ICI_HOP_LATENCY_S
     payload_bytes = 64.0 * 1024.0 * 1024.0
@@ -89,11 +95,56 @@ def test_torus_collective_adds_hop_latency_to_bandwidth_phase() -> None:
         torus_collective_s("ar", 1024.0, (2, 1, 1, 1), replace(chip, ici_bw=-1.0))
         == 0.0
     )
-    high_ici_bw = 500000000000.0
+    # Synthetic high-ICI test configuration with 500 GB/s per core.
+    high_ici_bw = 500.0e9
     high_ici = replace(chip, ici_bw=high_ici_bw)
     assert rf_collectives.collective_cut_bound_s(
         "ar", 1024.0, (2, 1, 1, 1), high_ici
     ) <= torus_collective_s("ar", 1024.0, (2, 1, 1, 1), high_ici)
+
+
+def test_collective_bound_at_or_below_feasible_schedule() -> None:
+    """Verify 2x2x1 collective cut bound stays below feasible schedules."""
+    payload_bytes = 64.0 * 1024.0 * 1024.0
+    chip = CHIPS["tpu7x"]
+    topo = TOPOLOGIES["2x2x1"]
+    submesh = submesh_for_group(8, topo, 2)
+    feasible_s = (
+        payload_bytes / chip.d2d_bw
+        + payload_bytes / chip.ici_link_bw
+        + payload_bytes / chip.d2d_bw
+    )
+    # Cut bound across 2 external links: payload / (2 * link_bw)
+    cut_s = payload_bytes / (2.0 * chip.ici_link_bw)
+    bound_s = rf_collectives.collective_cut_bound_s(
+        "ar", payload_bytes, submesh, chip, topo
+    )
+    est_s = torus_collective_s("ar", payload_bytes, submesh, chip, topo)
+    # Expected analytical bound derived from 64 MiB / (2 * 100 GB/s).
+    assert bound_s == pytest.approx(
+        (64.0 * 1024.0 * 1024.0) / (2.0 * DEFAULT_ICI_LINK_BW), rel=1e-12
+    )
+    assert bound_s == pytest.approx(cut_s, rel=1e-12)
+    assert bound_s <= feasible_s
+    assert feasible_s <= est_s
+
+
+def test_collective_cut_bound_rs_symmetric_with_ag() -> None:
+    """Verify Reduce-Scatter cut bound matches All-Gather cut traffic on multichip."""
+    payload_bytes = 64.0 * 1024.0 * 1024.0
+    chip = CHIPS["tpu7x"]
+    topo = TOPOLOGIES["2x2x1"]
+    submesh = (2, 2, 2, 1)
+    ag_s = rf_collectives.collective_cut_bound_s(
+        "ag", payload_bytes, submesh, chip, topo
+    )
+    rs_s = rf_collectives.collective_cut_bound_s(
+        "rs", payload_bytes, submesh, chip, topo
+    )
+    assert rs_s == pytest.approx(ag_s, rel=1e-12)
+    # Reduce-Scatter exports 6/8 of the payload across 2 links of link_bw.
+    expected_rs_s = (payload_bytes * 6.0 / 8.0) / (2.0 * chip.ici_link_bw)
+    assert rs_s == pytest.approx(expected_rs_s, rel=1e-12)
 
 
 def test_collective_make_uses_typed_config() -> None:
