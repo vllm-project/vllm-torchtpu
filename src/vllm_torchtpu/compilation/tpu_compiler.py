@@ -148,6 +148,14 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
 
 _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
+    # Hugging Face Hub local cache and auth tokens; consumed by offline config
+    # loaders and never affect the compiled graph.
+    "HF_HUB_CACHE",
+    "HF_HOME",
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
     # compiled model or custom-kernel lowering.
     "DP_SCHED_ENABLED",
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
