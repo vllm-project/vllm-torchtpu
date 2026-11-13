@@ -1293,11 +1293,6 @@
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `KVConnectorBase_V1` has no attribute `get_block_ids_with_load_errors_group_index`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
       "concise_description": "No attribute `tpu` in module `torch`"
     },
     {
