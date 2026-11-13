@@ -934,6 +934,7 @@ def test_b7_deferred_minors(monkeypatch: pytest.MonkeyPatch) -> None:
 
     class _FakeCtx:
         ex = ex_f
+        me = jnp.int32(0)  # the TP rank (`lax.axis_index("tp")`); DCP reads it
         pos_ref = jnp.array([-1, -1, 5, 6], dtype=jnp.int32)
         ST = {
             "page_table": jnp.array([[3, 4], [5, 6]], dtype=jnp.int32),
