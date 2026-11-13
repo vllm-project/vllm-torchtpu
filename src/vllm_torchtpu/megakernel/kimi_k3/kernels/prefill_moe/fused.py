@@ -1371,6 +1371,104 @@ class _TokenCombine:
             )
 
 
+def _single_tile_columns(
+    step, finish, metadata, ng, rows, weights, *, columns, sublane,
+    rows_buf, weight_buf, scale_buf, sems, run,
+):
+    """Down columns ``range(*columns)`` over one expert tile per step, fed by
+    hand: ``step(x, w, g, n)`` for every tile ``g < ng`` of column ``n``, then
+    ``finish(n)``.
+
+    ``x`` holds tile g's rows of ``rows`` from its first route's ``sublane``
+    boundary on, fetched one step ahead. ``w`` is the column block of tile
+    g's expert in ``weights``: an expert's tiles are consecutive steps
+    (fill_metadata), so its block is fetched once for all of them, during
+    the previous expert's tiles, into the other of the two buffers that
+    ``weight_buf``/``scale_buf`` hold; ``run`` holds the buffer in use.
+    """
+    group, offsets = metadata.gm_id_to_group_id, metadata.gm_id_to_m_offset
+    first_column, end_column = columns
+    width = weight_buf.shape[-1]
+
+    def rows_copy(g, slot):
+        first = offsets[g] // sublane
+        count = (pl.cdiv(offsets[g + 1], sublane) - first) * sublane
+        copy = pltpu.make_async_copy(
+            rows.at[pl.ds(first * sublane, count)],
+            rows_buf.at[slot, pl.ds(0, count)],
+            sems.at[0, slot],
+        )
+        return count, copy
+
+    def weight_copies(g, n, slot):
+        expert, cols = group[g], pl.ds(n * width, width)
+        return (
+            pltpu.make_async_copy(
+                weights.weight.at[expert, :, cols], weight_buf.at[slot], sems.at[1, slot]
+            ),
+            pltpu.make_async_copy(
+                weights.scale.at[expert, :, cols], scale_buf.at[slot], sems.at[2, slot]
+            ),
+        )
+
+    def start_rows(g, slot):
+        count, copy = rows_copy(g, slot)
+        pl.when(count > 0)(copy.start)
+
+    def run_end(g):
+        """The first tile after the run of tiles of tile ``g``'s expert."""
+
+        def same(h):
+            return (h < ng) & (group[jnp.minimum(h, ng - 1)] == group[g])
+
+        return lax.while_loop(same, lambda h: h + 1, g + 1)
+
+    start_rows(0, 0)
+    for copy in weight_copies(0, first_column, 0):
+        copy.start()
+    run[0] = 1  # the first tile turns to buffer 0
+
+    @pl.loop(first_column, end_column)
+    def column(n):
+        @pl.loop(0, ng)
+        def tile(g):
+            slot = ((n - first_column) * ng + g) % 2
+            last = g == ng - 1
+
+            @pl.when(~last | (n + 1 < end_column))
+            def prefetch_rows():
+                start_rows(jnp.where(last, 0, g + 1), 1 - slot)
+
+            @pl.when((g == 0) | (group[jnp.maximum(g - 1, 0)] != group[g]))
+            @_scoped("m_expert_block")
+            def first_of_expert():
+                current = 1 - run[0]
+                run[0] = current
+                for copy in weight_copies(g, n, current):
+                    copy.wait()
+                end = run_end(g)
+                follows = end < ng
+
+                @pl.when(follows | (n + 1 < end_column))
+                def prefetch_weights():
+                    for copy in weight_copies(
+                        jnp.where(follows, end, 0),
+                        jnp.where(follows, n, n + 1),
+                        1 - current,
+                    ):
+                        copy.start()
+
+            count, copy = rows_copy(g, slot)
+            pl.when(count > 0)(copy.wait)
+            current = run[0]
+            w = k.WeightsRef(
+                weight=weight_buf.at[current], scale=scale_buf.at[current], bias=None
+            )
+            step(rows_buf.at[slot], w, g, n)
+
+        finish(n)
+
+
 def _routed_experts(
     latent,
     gu_weights,
@@ -1600,12 +1698,12 @@ def _routed_experts(
 
         def inner(
             x, w, metadata, *, first=False, subtotal_vmem=None, tile=None, column=None,
-            poll=True,
+            poll=True, poll_round=None,
         ):
-            """One expert tile of a down column: the pipeline's grid step, or
-            ``tile`` of a paired step, of the first column or of ``column``.
-            ``poll`` (a static or traced bool) runs the reduce ring's progress
-            before the tile."""
+            """One expert tile of a down column: the first column's pipeline step,
+            or ``tile`` of ``column``. ``poll`` (a static or traced bool) runs the
+            reduce ring's progress before the tile, alternating its stream groups
+            by ``poll_round`` (default: the tile)."""
             g = pl.program_id(1) if tile is None else tile
             n = 0 if first else column
             if not first:
@@ -1614,7 +1712,7 @@ def _routed_experts(
                 def ring_poll():
                     advance(
                         jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem,
-                        poll_round=g if tile is None else g // 2,
+                        poll_round=g if poll_round is None else poll_round,
                     )
 
                 if poll is True:
@@ -1846,7 +1944,8 @@ def _routed_experts(
                 def remaining(xa, xb, wa, wb, metadata):
                     h = pl.program_id(1)
                     inner(
-                        xa, wa, metadata, subtotal_vmem=subtotal_vmem, tile=2 * h, column=n
+                        xa, wa, metadata, subtotal_vmem=subtotal_vmem, tile=2 * h,
+                        column=n, poll_round=h,
                     )
 
                     @pl.when(2 * h + 1 < ng)
@@ -1865,33 +1964,42 @@ def _routed_experts(
                     out_specs=(),
                 )(rows, rows, w, w, scratches=(metadata,))
 
-            # One pipeline per column, followed by the column's finish, so that
-            # the pipeline's step loop holds only the per-tile work.
-            @pl.loop(1, width // tn)
-            def column(n):
-                def at_column(spec):
-                    index_map = spec.index_map
-                    return dataclasses.replace(
-                        spec, index_map=lambda _, g, k: index_map(n, g, k)
+            if tokens == 16384:
+                # The 16K token sums leave no room for a second tile's blocks.
+                def step(x, w, g, n):
+                    inner(
+                        x, w, metadata, subtotal_vmem=subtotal_vmem, tile=g, column=n
                     )
 
-                column_ws = jax.tree.map(
-                    at_column, ws, is_leaf=lambda v: isinstance(v, pl.BlockSpec)
+                block = cfg.rhs_cfgs.quant_block_size
+                pl.run_scoped(
+                    functools.partial(
+                        _single_tile_columns, step,
+                        lambda n: finish_column(n, subtotal_vmem), metadata, ng,
+                        middle, w, columns=(1, width // tn), sublane=sub,
+                    ),
+                    rows_buf=pltpu.VMEM((2, tm, mid_width), x.dtype),
+                    weight_buf=pltpu.VMEM((2, mid_width, tn), w.weight.dtype),
+                    scale_buf=pltpu.VMEM((2, mid_width // block, tn), w.scale.dtype),
+                    sems=pltpu.SemaphoreType.DMA((3, 2)),
+                    run=pltpu.SMEM((1,), jnp.int32),
                 )
-                if tokens == 16384:
-                    # The 16K token sums leave no room for a second tile's blocks.
-                    def remaining(x, w, metadata):
-                        inner(x, w, metadata, subtotal_vmem=subtotal_vmem, column=n)
+            else:
+                # One pipeline per column, followed by the column's finish, so
+                # that the pipeline's step loop holds only the per-tile work.
+                @pl.loop(1, width // tn)
+                def column(n):
+                    def at_column(spec):
+                        index_map = spec.index_map
+                        return dataclasses.replace(
+                            spec, index_map=lambda _, g, k: index_map(n, g, k)
+                        )
 
-                    pltpu.emit_pipeline(
-                        remaining,
-                        grid=(1, ng, 1),
-                        in_specs=(xs, column_ws),
-                        out_specs=(),
-                    )(rows, w, scratches=(metadata,))
-                else:
+                    column_ws = jax.tree.map(
+                        at_column, ws, is_leaf=lambda v: isinstance(v, pl.BlockSpec)
+                    )
                     paired_tiles(n, column_ws)
-                finish_column(n, subtotal_vmem)
+                    finish_column(n, subtotal_vmem)
 
             with _phase("m_ring_final_drain"):
                 advance(jnp.int32(32), width // tn - 1, subtotal_vmem, drain=True)

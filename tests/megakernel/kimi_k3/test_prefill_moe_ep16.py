@@ -2,6 +2,7 @@
 """EP16/TP2 fused prefill MoE on CPU: the loader's interleaved gate/up tile,
 the stepped down reduction and the single-launch 16K geometry."""
 
+import functools
 import types
 
 import jax
@@ -303,3 +304,86 @@ def test_token_combine_emit_copies_the_column_and_restarts_the_sums(half, width)
     restarted = np.asarray(restarted)
     assert not restarted[:tokens].any()
     np.testing.assert_array_equal(restarted[tokens:], sums[tokens:])
+
+
+def _tiles(counts, tile, sublane):
+    """fill_metadata's tiles of expert-major routes: group ids and offsets."""
+    groups, offsets, start = [], [0], 0
+    for expert, count in enumerate(counts):
+        cur, end = start, start + count
+        while cur < end:
+            cur += min(tile - cur % sublane, end - cur)
+            groups.append(expert)
+            offsets.append(cur)
+        start = end
+    return np.asarray(groups, np.int32), np.asarray(offsets, np.int32)
+
+
+def test_single_tile_columns_feed_every_tile_its_rows_and_expert_block():
+    tile, sublane, depth, width, columns = 32, 8, 64, 128, (1, 3)
+    counts = [5, 0, 40, 7, 33, 1]
+    groups, offsets = _tiles(counts, tile, sublane)
+    ng, experts = len(groups), len(counts)
+    rng = np.random.default_rng(4)
+    rows = rng.standard_normal((sum(counts) + tile, 128)).astype(np.float32)
+    weight = rng.standard_normal((experts, depth, 3 * width)).astype(np.float32)
+    scale = rng.integers(0, 255, (experts, depth // 32, 3 * width)).astype(np.uint8)
+    steps = (columns[1] - columns[0]) * ng
+
+    def kernel(groups_ref, offsets_ref, rows_hbm, weight_hbm, scale_hbm, seen, used):
+        metadata = kernels.MetadataRef(
+            gm_id_to_group_id=groups_ref, gm_id_to_m_offset=offsets_ref
+        )
+
+        def step(x, w, g, n):
+            index = (n - columns[0]) * ng + g
+            seen[index] = x[...]
+            used[index] = w.weight[...] + w.scale[...][:1].astype(jnp.float32)
+
+        pl.run_scoped(
+            functools.partial(
+                fused._single_tile_columns,
+                step,
+                lambda n: None,
+                metadata,
+                ng,
+                rows_hbm,
+                kernels.WeightsRef(weight=weight_hbm, scale=scale_hbm, bias=None),
+                columns=columns,
+                sublane=sublane,
+            ),
+            rows_buf=pltpu.VMEM((2, tile, 128), jnp.float32),
+            weight_buf=pltpu.VMEM((2, depth, width), jnp.float32),
+            scale_buf=pltpu.VMEM((2, depth // 32, width), jnp.uint8),
+            sems=pltpu.SemaphoreType.DMA((3, 2)),
+            run=pltpu.SMEM((1,), jnp.int32),
+        )
+
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    # DMAs land at their waits and races are reported: a tile reading a
+    # buffer before its copy was waited for, or while the next copy into it
+    # runs, sees the wrong data.
+    seen, used = pl.pallas_call(
+        kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct((steps, tile, 128), jnp.float32),
+            jax.ShapeDtypeStruct((steps, depth, width), jnp.float32),
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2, in_specs=[hbm] * 3, out_specs=(vmem, vmem)
+        ),
+        interpret=pltpu.InterpretParams(
+            dma_execution_mode="on_wait", detect_races=True, uninitialized_memory="nan"
+        ),
+    )(jnp.asarray(groups), jnp.asarray(offsets), rows, weight, scale)
+    seen, used = np.asarray(seen), np.asarray(used)
+    for n in range(*columns):
+        cols = slice(n * width, (n + 1) * width)
+        for g in range(ng):
+            index = (n - columns[0]) * ng + g
+            first = offsets[g] // sublane * sublane
+            count = -(-offsets[g + 1] // sublane) * sublane - first
+            np.testing.assert_array_equal(seen[index, :count], rows[first:][:count])
+            block = weight[groups[g], :, cols] + scale[groups[g], :1, cols]
+            np.testing.assert_array_equal(used[index], block)
