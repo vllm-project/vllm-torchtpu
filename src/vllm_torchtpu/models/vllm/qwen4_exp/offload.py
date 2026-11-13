@@ -126,3 +126,33 @@ def pool_regions(kv_cache_config) -> int:
     page = max(g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups)
     tensors = kv_cache_config.kv_cache_tensors
     return tensors[0].size // (kv_cache_config.num_blocks * page) if tensors else 0
+
+
+def merged_key_geometry(vllm_config, kv_cache_config) -> tuple[int, int] | None:
+    """``(page_bytes, key_stride)`` of a merged-key pool, else None.
+
+    QWEN4_EXP_MERGE_COMPRESSED_K: each raw region holds ``num_blocks`` pages,
+    then a key region with one ``key_stride``-byte block of keys per block ID
+    (``merged_key_span`` pages' worth of a layer's keys, at
+    ``num_blocks * page + id * key_stride``; ``pd_manifest`` exposes the same
+    pool). Host offload moves a main-KV block's key block with its page.
+    """
+    from .pool_layout import pooled_cache_specs
+
+    layout, _ = pooled_cache_specs(vllm_config)
+    if not layout.merged_compressed:
+        return None
+    if layout.split_compressed:
+        raise ValueError(
+            "Qwen4Exp host offload does not move keys split by page owner "
+            "(QWEN4_EXP_PCP_SPLIT_COMPRESSED_K)"
+        )
+    pages = {g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups}
+    if pages != {layout.page_bytes}:
+        raise ValueError(
+            f"Qwen4Exp merged keys expect {layout.page_bytes}-byte pages, got {sorted(pages)}"
+        )
+    key_stride = (
+        layout.merged_key_span * layout.page_bytes // layout.compressed_columns_per_page
+    )
+    return layout.page_bytes, key_stride
