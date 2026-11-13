@@ -214,6 +214,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 0
 
 
 def env_with_choices(
@@ -1310,6 +1311,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # Number of tokens in the padded compile_sizes bucket at or above which the
+    # residual-stream RMSNorms (hidden size at least 4096 and a multiple of 128)
+    # run as one Pallas pass (kernels/fused_add_rmsnorm). Buckets that are not
+    # a multiple of 256 keep vLLM's path. 0, the default, keeps vLLM's RMSNorm:
+    # no lm_eval has been run with the kernel. Same residual; y differs from the
+    # native provider by at most 2 bf16 ulp.
+    "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS": env_nonnegative_int(
+        "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS", 0
     ),
 }
 
