@@ -789,7 +789,9 @@ class Qwen4ExpBackbone(nn.Module):
         if sequence_parallel:
             sp.check_divisible(num_tokens)
             if sp.microbatch_groups() > 1:
-                sp_microbatch = sp.MicroBatchPlan(num_tokens, sp.microbatch_groups())
+                sp_microbatch = sp.MicroBatchPlan(
+                    num_tokens, sp.microbatch_groups(), sp.fold_align_grid()
+                )
                 sp.check_divisible(num_tokens, sp_microbatch.groups)
             hidden = sp.shard(hidden)
         rows = hidden.shape[0]
@@ -1595,6 +1597,14 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             sp.block_microbatch(
                 f"up to {decode_rows} decode/verify rows do not fit in the first "
                 f"half ({first_half} rows) of the smallest sequence-parallel bucket"
+            )
+        prefix_rows = sp.fold_prefix_rows(sp.fold_align_grid())
+        if prefix_rows > first_half:
+            # VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN: half B's GDN call takes the
+            # last rows of half A in front of its own.
+            sp.block_microbatch(
+                f"half B's {prefix_rows} GDN prefix rows exceed the first half "
+                f"({first_half} rows) of the smallest sequence-parallel bucket"
             )
         if not sp.microbatch_enabled():
             return rows

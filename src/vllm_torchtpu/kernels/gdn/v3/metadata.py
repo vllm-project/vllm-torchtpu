@@ -113,6 +113,7 @@ def compute_per_seq_metadata(
     prerolled: bool = False,
     prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
     tile_sized: bool = False,
+    state_rows: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing single sequence per tile.
 
@@ -133,6 +134,16 @@ def compute_per_seq_metadata(
     a multiple of `cfg.chunk_size`: the tile ending there is marked as a last
     tile with that block as its destination, and the next tile still resumes
     from the carry. Offset or block 0 means none.
+
+    `state_rows` is `[max_seqs]`, indexed like `seq_lens` (never prerolled):
+    sequence `s` writes its final state (checkpoint 0) after its first
+    `state_rows[s]` query tokens instead of after its last one, when that is
+    fewer than its query tokens. It must then be a multiple of
+    `cfg.chunk_size`: the tile ending there is the sequence's last tile and
+    the tiles after it compute outputs but write no state (0: no tile writes
+    it). Micro-batched sequence-parallel halves use it so that a request
+    crossing into the next half leaves the state at a tile boundary of its
+    own tile grid (VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN).
     """
     max_seqs = seq_lens.size
     max_tokens = per_seq_tile_slots(cfg, max_seqs, tile_sized)
@@ -194,6 +205,13 @@ def compute_per_seq_metadata(
     has_initial_state = (seq_lens - query_lens) > 0
     p_id_is_first_tile = p_id_to_t_id == 0
     p_id_is_last_tile = p_id_to_t_id == (s_idx_to_num_tiles[p_id_to_s_idx] - 1)
+    if state_rows is not None:
+        rows = jnp.roll(state_rows.astype(jnp.int32), shift=-start_seq)
+        tile_rows = rows[p_id_to_s_idx]
+        cut = tile_rows < query_lens[p_id_to_s_idx]
+        p_id_is_last_tile = jnp.where(
+            cut, (p_id_to_t_id + 1) * cfg.chunk_size == tile_rows, p_id_is_last_tile
+        )
     p_id_to_state_override = None
     if prefill_ckpt is not None:
         ckpt_offsets, ckpt_blocks = (
