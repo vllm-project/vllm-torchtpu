@@ -14,12 +14,15 @@
 """Tile selection, metadata bounds and the fused 1-dot recurrence of the
 Qwen3.5 GDN v3 copy."""
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.gdn.v3 import config as main_config
 from vllm_torchtpu.kernels.gdn.v3 import metadata as main_metadata
 from vllm_torchtpu.models.qwen3_5.kernels.gdn import (
@@ -132,6 +135,38 @@ def test_a_caller_chunk_is_capped_at_the_vmem_fit():
         # An explicit override wins, capped at the sequence count.
         (dict(default_tile=4, dyn_tile=16, num_spec_tokens=3, override=1), 1),
         (dict(default_tile=4, dyn_tile=4, num_spec_tokens=0, override=64), 40),
+        # ... and at both VMEM ceilings, while a smaller override stands.
+        (
+            dict(
+                default_tile=4,
+                dyn_tile=2,
+                num_spec_tokens=3,
+                spec_tile_cap=2,
+                override=4,
+            ),
+            2,
+        ),
+        (
+            dict(
+                default_tile=4,
+                dyn_tile=2,
+                num_spec_tokens=3,
+                vmem_tile_cap=2,
+                override=4,
+            ),
+            2,
+        ),
+        (
+            dict(
+                default_tile=4,
+                dyn_tile=None,
+                num_spec_tokens=3,
+                spec_tile_cap=2,
+                vmem_tile_cap=2,
+                override=1,
+            ),
+            1,
+        ),
         # KDA verify windows stay at one sequence, override or not.
         (dict(default_tile=4, dyn_tile=None, num_spec_tokens=3, is_kda=True), 1),
     ],
@@ -146,6 +181,95 @@ def test_select_decode_tile_size(kwargs, expected):
     )
     args.update(kwargs)
     assert tiling.select_decode_tile_size(**args) == expected
+
+
+def _call_kernels(n_kq, n_v, window, num_seqs, num_tokens, state_dtype, **kwargs):
+    """Kernel names of one fused_conv1d_gdn call (decode and prefill/mixed),
+    traced from shapes only."""
+    dim = 2 * n_kq * D_K + n_v * D_V
+    num_slots = num_seqs * window + 1
+
+    def sds(shape, dtype):
+        return jax.ShapeDtypeStruct(shape, dtype)
+
+    inputs = dict(
+        qkv=sds((num_tokens, dim), BF16),
+        b=sds((num_tokens, n_v), BF16),
+        a=sds((num_tokens, n_v), BF16),
+        states=(
+            sds((num_slots, KERNEL_SIZE - 1, dim), F32),
+            sds((num_slots, n_v, D_K, D_V), state_dtype),
+        ),
+        conv_weight=sds((dim, 1, KERNEL_SIZE), BF16),
+        a_log=sds((n_v,), F32),
+        dt_bias=sds((n_v,), F32),
+        query_start_loc=sds((num_seqs + 1,), jnp.int32),
+        state_indices=sds((num_seqs,), jnp.int32),
+        distribution=sds((3,), jnp.int32),
+        seq_lens=sds((num_seqs,), jnp.int32),
+    )
+    if window > 1:
+        inputs["read_offsets"] = sds((num_seqs,), jnp.int32)
+    jaxpr = jax.make_jaxpr(
+        lambda x: wrapper.fused_conv1d_gdn.__wrapped__(
+            **x,
+            conv_bias=None,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=D_K,
+            d_v=D_V,
+            kernel_size=KERNEL_SIZE,
+            num_spec_tokens=window - 1,
+            **kwargs,
+        )
+    )(inputs)
+    names = re.findall(r"fused_conv1d_gdn_(\w+?_b\d+_c\d+(?:_w\d+)?)", str(jaxpr))
+    return tuple(sorted(set(names)))
+
+
+# (label, n_kq, n_v, window, sequences, tokens, SSM state, override, kernels)
+# under dynamic tiling, as the IX legs run the copy. The first is the
+# k_gdn_copy TPU case (64 verify windows, 250 tokens): its override T = 4 needed
+# 61.56 MiB of scoped VMEM against the 57.60 MiB limit, so the override now
+# stops at the ceilings' T = 2. The rest are the validation entries' shapes
+# (max-num-seqs sequences, a compiled token bucket), unchanged by the cap: the
+# DP4 x TP2 decode with its layout tile 1 and with the tiler's pick, the f32
+# state of the gates' off arm, the TP8 + DCP4 decodes at 16, 8, 3 and 1
+# sequences, and the PP8 x TP1 prefill leg with MTP 1. The last case is an
+# override of 16 at TP8, where the VMEM fit (8) is below spec_tile_cap (10).
+_CALLS = [
+    ("k_gdn_copy_tp2_t4_c64", 8, 32, 4, 64, 250, BF16, 4, ("b2_c4_w4", "c128")),
+    ("dp4tp2_layout_tile", 8, 32, 4, 28, 112, BF16, 1, ("b1_c4_w4", "c112")),
+    ("dp4tp2_pick", 8, 32, 4, 28, 112, BF16, 0, ("b2_c4_w4", "c112")),
+    ("dp4tp2_f32_state", 8, 32, 4, 28, 112, F32, 1, ("b1_c4_w4", "c112")),
+    ("tp8_dcp4_c16", 2, 8, 4, 16, 64, BF16, 0, ("b4_c4_w4", "c64")),
+    ("tp8_dcp4_c8", 2, 8, 4, 8, 32, BF16, 0, ("b4_c4_w4", "c32")),
+    ("tp8_dcp4_c3", 2, 8, 4, 3, 16, BF16, 0, ("b2_c4_w4", "c16")),
+    ("tp8_dcp4_c1", 2, 8, 4, 1, 4, BF16, 0, ("b1_c4_w4", "c4")),
+    ("pp8_tp1_mtp1_prefill", 16, 64, 2, 32, 8192, BF16, 0, ("b2_c2_w2", "c64")),
+    ("tp8_override16", 2, 8, 4, 16, 64, BF16, 16, ("b8_c4_w4", "c64")),
+]
+
+
+@pytest.mark.parametrize(
+    ("n_kq", "n_v", "window", "num_seqs", "num_tokens", "state", "override", "tiles"),
+    [c[1:] for c in _CALLS],
+    ids=[c[0] for c in _CALLS],
+)
+def test_decode_tile_per_call(
+    monkeypatch, n_kq, n_v, window, num_seqs, num_tokens, state, override, tiles
+):
+    monkeypatch.setattr(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", True)
+    batched, mixed = tiles
+    assert _call_kernels(
+        n_kq,
+        n_v,
+        window,
+        num_seqs,
+        num_tokens,
+        state,
+        decode_tile_override=override,
+    ) == (f"batched_{batched}", f"per_seq_b1_{mixed}")
 
 
 def _cfg(mode, tile_size, window_size=1, batch_size=256, **kwargs):
