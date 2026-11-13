@@ -194,6 +194,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_COMPRESSED_DCP_PACKED_GATHER: bool = False
     VLLM_TPU_QSA_DCP_MERGE_SCORES: bool = False
     VLLM_TPU_RPA_SCHEDULE_HBM: bool = False
+    VLLM_TPU_QSA_UNION_LEAN_GLUE: bool = False
+    VLLM_TPU_QSA_INDEXER_META_SELECT: bool = False
     VLLM_TPU_QSA_DCP_MERGE: str = ""
     VLLM_TPU_QSA_DCP_MERGE_CHECK: bool = False
     VLLM_TPU_QSA_DCP_LOCAL_QGATE: bool = False
@@ -1087,6 +1089,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the schedule kernel. Untyped, XLA may place them in VMEM and then
     # copy each one to HBM before the attention kernel reads it.
     "VLLM_TPU_RPA_SCHEDULE_HBM": env_bool("VLLM_TPU_RPA_SCHEDULE_HBM"),
+    # With VLLM_TPU_QSA_DECODE_RPA_UNION: the union RPA call's inputs and
+    # outputs are built at the step's size when one call covers the step (up to
+    # UNION_REQUESTS * max_query_len rows), so the f32 query, LSE buffer and
+    # placeholder KV are not padded to that many rows; and the call reads the
+    # selection words as [tiles * bkv / 128, 1, 128], the union kernel's flat
+    # output without a relayout. Same results.
+    "VLLM_TPU_QSA_UNION_LEAN_GLUE": env_bool("VLLM_TPU_QSA_UNION_LEAN_GLUE"),
+    # The indexer kernel's step metadata is selected (empty pass: zeros) rather
+    # than computed in a conditional, whose small outputs XLA places in VMEM
+    # and then copies to HBM before every StreamIdxTC call. Same integers.
+    "VLLM_TPU_QSA_INDEXER_META_SELECT": env_bool("VLLM_TPU_QSA_INDEXER_META_SELECT"),
     # With VLLM_TPU_QSA_MAIN_KV_DCP: how the group merges its partial attention
     # outputs. Unset: all-gather every rank's f32 partial and LSE, each rank
     # combines its heads. "rs" / "rs_bf16": all-gather the LSE only, scale the

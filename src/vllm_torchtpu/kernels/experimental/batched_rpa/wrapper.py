@@ -517,6 +517,7 @@ def calculate_block_sizes(
         "kv_skip_group",
         "read_only_cache",
         "schedule_in_hbm",
+        "selection_word_rows",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -568,6 +569,7 @@ def ragged_paged_attention(
     selection_bits: jax.Array | None = None,
     read_only_cache: bool = False,
     schedule_in_hbm: bool = False,
+    selection_word_rows: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -664,6 +666,11 @@ def ragged_paged_attention(
             so XLA keeps them where the attention kernel reads them instead of
             placing them in VMEM and copying each one to HBM. Same schedule.
             Defaults to False.
+        selection_word_rows: With selection_bits, the kernel reads the words
+            as [max_num_seqs * tiles, bkv // 128, 1, 128], which has the flat
+            int32 layout of selection_bits, so XLA passes them without the
+            relayout to [..., bkv // 128, 128]. Same words and results.
+            Defaults to False.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -755,6 +762,7 @@ def ragged_paged_attention(
         compact_kv_schedule=compact_kv_schedule,
         kv_skip_group=kv_skip_group,
         selection_mask=selection_bits is not None,
+        selection_word_rows=selection_word_rows and selection_bits is not None,
         read_only_cache=read_only_cache,
     )
     if read_only_cache and not skip_kv_update:
@@ -917,6 +925,7 @@ def ragged_paged_attention(
                     kv_slot=None,
                     kv_skip_group=0,
                     selection_mask=False,
+                    selection_word_rows=False,
                     read_only_cache=False,
                 ),
             ),
@@ -935,7 +944,10 @@ def ragged_paged_attention(
                     f"multiple of {num_lanes} and divide {tokens} tokens"
                 )
             selection_hbm = selection_bits.reshape(
-                max_num_seqs * (tokens // bkv), bkv // num_lanes, num_lanes
+                max_num_seqs * (tokens // bkv),
+                bkv // num_lanes,
+                *((1,) if selection_word_rows else ()),
+                num_lanes,
             )
         result = kernel.rpa_kernel(
             cu_q_lens,

@@ -534,10 +534,18 @@ def union_decode_attention(
         starts = jnp.concatenate([starts, jnp.broadcast_to(starts[-1:], (pad,))])
         pages, sel, meta = (jnp.pad(x, ((0, pad), (0, 0))) for x in (pages, sel, meta))
     call_rows = UNION_REQUESTS * max_query_len
+    # VLLM_TPU_QSA_UNION_LEAN_GLUE: when one call covers the step, it runs over
+    # the step's own rows, so its query, output and LSE buffers have the step's
+    # size and call row r is step row r. A row before starts[0] belongs to no
+    # request; union_row_live masks whatever the kernel leaves in it.
+    lean = bool(envs.VLLM_TPU_QSA_UNION_LEAN_GLUE)
+    whole = lean and chunks == 1 and len(q) <= call_rows
+    if whole:
+        call_rows = len(q)
     # Rows past the last call's slice are padding, so a slice never clamps.
     query = jnp.pad(
         q.astype(jnp.float32),
-        ((0, call_rows), (0, 0), (0, cache.shape[-1] - q.shape[-1])),
+        ((0, 0 if whole else call_rows), (0, 0), (0, cache.shape[-1] - q.shape[-1])),
     )
     dummy_k = jnp.zeros((call_rows, 1, query.shape[-1]), cache.dtype)
     virtual_cache = cache.reshape(-1, ratio, *cache.shape[2:])
@@ -548,14 +556,14 @@ def union_decode_attention(
         batch_size=envs.VLLM_TPU_QSA_DECODE_RPA_LANES,
     )
     skip = envs.VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY
-    out = jnp.zeros(query.shape, jnp.float32)
-    lse = jnp.full(query.shape[:2], -jnp.inf, jnp.float32)
+    out = None if whole else jnp.zeros(query.shape, jnp.float32)
+    lse = None if whole else jnp.full(query.shape[:2], -jnp.inf, jnp.float32)
     for c in range(chunks):
         first = c * UNION_REQUESTS
         part = slice(first, first + UNION_REQUESTS)
-        row0 = starts[first]
+        row0 = 0 if whole else starts[first]
         out_c, virtual_cache, lse_c = wrapper.ragged_paged_attention(
-            jax.lax.dynamic_slice_in_dim(query, row0, call_rows),
+            query if whole else jax.lax.dynamic_slice_in_dim(query, row0, call_rows),
             dummy_k,
             dummy_k,
             virtual_cache,
@@ -588,7 +596,11 @@ def union_decode_attention(
             selection_bits=sel[part],
             **({"read_only_cache": True} if read_only else {}),
             schedule_in_hbm=envs.VLLM_TPU_RPA_SCHEDULE_HBM,
+            **({"selection_word_rows": True} if lean else {}),
         )
+        if whole:
+            out, lse = out_c, lse_c.astype(jnp.float32)
+            continue
         # Later calls start at their own first row, so each row keeps the
         # value its own call wrote.
         out = jax.lax.dynamic_update_slice_in_dim(out, out_c, row0, 0)
