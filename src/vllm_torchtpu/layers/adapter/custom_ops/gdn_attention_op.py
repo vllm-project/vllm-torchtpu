@@ -207,7 +207,7 @@ def gdn_attention_pooled_core_tpu(
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
     step_metadata: tuple[jax.Array, ...] | None = None,
-    prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
+    prefill_ckpt: tuple[jax.Array, ...] | None = None,
     packed_metadata: jax.Array | None = None,
     metadata_only: bool = False,
     packed_size: int = 0,
@@ -436,14 +436,27 @@ class GdnStepMetadataCache:
         return value
 
 
-def _half_step(sp_half, attn_metadata, state_indices, distribution, slot_read_offsets):
+def _half_step(
+    sp_half,
+    attn_metadata,
+    state_indices,
+    distribution,
+    slot_read_offsets,
+    ckpt_offsets=None,
+):
     """A GDN group's metadata for one token half of a micro-batched
     sequence-parallel step: ``(memo key, query_start_loc, seq_lens,
-    distribution, slot_read_offsets)``.
+    distribution, slot_read_offsets)``. The memo key is the
+    ``sequence_parallel.GdnHalf``.
 
     Requests continued from an earlier half read checkpoint 0, where that half
     wrote their final state: their entry of the per-block read offsets (indexed
     by the same state ids as the op's gather) becomes 0.
+
+    ``ckpt_offsets``: the step's internal prefill checkpoint offsets
+    (VLLM_TPU_MAMBA_TAIL_FOLD with VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN); the half
+    then also carries its checkpoint offsets, state rows and prefix rows
+    (``sequence_parallel.gdn_fold_halves``).
     """
     plan, g = sp_half
     half = plan.gdn(
@@ -452,6 +465,7 @@ def _half_step(sp_half, attn_metadata, state_indices, distribution, slot_read_of
         attn_metadata.seq_lens,
         distribution,
         g,
+        ckpt_offsets,
     )
     if half.resume_from_carry is not None and slot_read_offsets is not None:
         ids = state_indices.long()
@@ -518,6 +532,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.gdn_pooled_ckpt_op = (
             self._build_pooled_gdn_op(block_major=self._bm_kernel, prefill_ckpt=True)
             if envs.VLLM_TPU_MAMBA_TAIL_FOLD
+            else None
+        )
+        # VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN: the token halves of a
+        # micro-batched sequence-parallel step under the fold.
+        self.gdn_pooled_ckpt_rows_op = (
+            self._build_pooled_gdn_op(
+                block_major=self._bm_kernel,
+                prefill_ckpt=True,
+                prefill_state_rows=True,
+            )
+            if envs.VLLM_TPU_MAMBA_TAIL_FOLD and envs.VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN
             else None
         )
         # Block-major state ids are per layer (pool_index), so only the
@@ -886,10 +911,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         block_major: bool = False,
         hoisted: bool = False,
         prefill_ckpt: bool = False,
+        prefill_state_rows: bool = False,
         kernel_metadata: str | None = None,
     ):
         """The pooled GDN op. ``prefill_ckpt``: the variant taking internal
-        prefill checkpoint offsets and blocks (VLLM_TPU_MAMBA_TAIL_FOLD).
+        prefill checkpoint offsets and blocks (VLLM_TPU_MAMBA_TAIL_FOLD);
+        ``prefill_state_rows`` also takes each sequence's state rows, for
+        micro-batched sequence-parallel halves
+        (VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN, ``fused_conv1d_gdn``).
         ``kernel_metadata`` (VLLM_TPU_GDN_STEP_KERNEL_METADATA): ``"step"``
         builds the op returning the step's packed kernel metadata;
         ``"layer"`` the layer op taking it as a last operand."""
@@ -1110,6 +1139,43 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 prefill_ckpt=(ckpt_offsets, ckpt_blocks),
             )
 
+        def wrapped_ckpt_rows_fn(
+            mixed_qkv: jax.Array,
+            b: jax.Array,
+            a: jax.Array,
+            recurrent_state: jax.Array,
+            conv_weight: jax.Array,
+            conv_bias: jax.Array | None,
+            A_log: jax.Array,
+            dt_bias: jax.Array,
+            state_indices: jax.Array,
+            query_start_loc: jax.Array,
+            distribution: jax.Array,
+            seq_lens: jax.Array,
+            slot_read_offsets: jax.Array | None,
+            ckpt_indices: jax.Array | None,
+            ckpt_offsets: jax.Array,
+            ckpt_blocks: jax.Array,
+            state_rows: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return run(
+                mixed_qkv,
+                b,
+                a,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                distribution,
+                seq_lens,
+                slot_read_offsets,
+                ckpt_indices,
+                prefill_ckpt=(ckpt_offsets, ckpt_blocks, state_rows),
+            )
+
         def wrapped_kmeta_fn(
             mixed_qkv: jax.Array,
             b: jax.Array,
@@ -1208,6 +1274,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 op_name,
                 wrapped_hoisted_fn
                 if hoisted
+                else wrapped_ckpt_rows_fn
+                if prefill_state_rows
                 else wrapped_ckpt_fn
                 if prefill_ckpt
                 else wrapped_kmeta_fn
@@ -1232,6 +1300,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             kind = "gdn_attention_pooled_bm" if block_major else "gdn_attention_pooled"
             if prefill_ckpt:
                 kind += "_ckpt"
+            if prefill_state_rows:
+                assert prefill_ckpt
+                kind += "_rows"
         gdn_jax_op = _get_shared_gdn_op(
             kind,
             (
@@ -1278,10 +1349,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # Hoisted: `slot_read_offsets` / `ckpt_indices` are the step's
             # read offsets / int32 checkpoint ids, followed by the rolled
             # per-sequence inputs (see gdn_step_metadata). Checkpoint variant:
-            # followed by the checkpoint offsets and blocks.
+            # followed by the checkpoint offsets and blocks (and state rows).
             assert len(step_metadata) == (
                 5
                 if hoisted
+                else 3
+                if prefill_state_rows
                 else 2
                 if prefill_ckpt
                 else 1
@@ -1683,6 +1756,19 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 query_start_loc = attn_metadata.query_start_loc
                 seq_lens = attn_metadata.seq_lens
                 step_key: Any = attn_metadata
+                prefill_ckpt = getattr(attn_metadata, "mamba_prefill_ckpt", None)
+                # VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN: halves aligned to the
+                # requests' GDN tile grids (sequence_parallel.gdn_fold_halves).
+                fold_half = (
+                    sp_half is not None
+                    and prefill_ckpt is not None
+                    and sp_half[0].fold_grid > 0
+                )
+                if prefill_ckpt is not None and sp_half is not None and not fold_half:
+                    raise NotImplementedError(
+                        "VLLM_TPU_MAMBA_TAIL_FOLD with SP micro-batches needs "
+                        "VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN"
+                    )
                 if sp_half is not None:
                     (
                         step_key,
@@ -1696,15 +1782,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         state_indices,
                         request_distribution,
                         slot_read_offsets,
+                        prefill_ckpt[0] if fold_half else None,
                     )
                 ckpt_indices = mamba_ckpt_of(attn_metadata)
                 step_metadata: tuple[torch.Tensor, ...] = ()
                 pooled_op = self.gdn_pooled_op
-                prefill_ckpt = getattr(attn_metadata, "mamba_prefill_ckpt", None)
-                if prefill_ckpt is not None and sp_half is not None:
-                    raise NotImplementedError(
-                        "VLLM_TPU_MAMBA_TAIL_FOLD with SP micro-batches"
-                    )
+                prefix_rows = 0
                 if prefill_ckpt is not None:
                     assert self.gdn_pooled_ckpt_op is not None, (
                         "mamba_prefill_ckpt without VLLM_TPU_MAMBA_TAIL_FOLD"
@@ -1722,6 +1805,22 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     )
                     step_metadata = (ckpt_offsets, ckpt_blocks)
                     pooled_op = self.gdn_pooled_ckpt_op
+                    if fold_half:
+                        assert sp_half is not None
+                        rows_op = getattr(self, "gdn_pooled_ckpt_rows_op", None)
+                        assert rows_op is not None, (
+                            "SP micro-batch halves under VLLM_TPU_MAMBA_TAIL_FOLD "
+                            "without VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN"
+                        )
+                        step_metadata = (
+                            step_key.ckpt_offsets,
+                            ckpt_blocks,
+                            step_key.state_rows,
+                        )
+                        pooled_op = rows_op
+                        prefix_rows = step_key.prefix_rows
+                        plan, g = sp_half
+                        mixed_qkv, b, a = plan.fold_inputs(self, g, mixed_qkv, b, a)
                 elif (
                     gdn_step_metadata_cache is not None
                     and self.gdn_pooled_kmeta_op is not None
@@ -1796,6 +1895,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     ckpt_indices,
                     *step_metadata,
                 )
+                if prefix_rows:
+                    # Half A's rows in front of half B's call (recomputed).
+                    core_attn_out = core_attn_out.narrow(0, prefix_rows, num_tokens)
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError("GDN op returned an incompatible output shape.")
             else:

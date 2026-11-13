@@ -30,6 +30,12 @@ and the reduce-scatter of a half's partial output yields this rank's rows of
 it, so a layer can run its attention side half by half
 (``Qwen4ExpDecoderLayer``) while every row-wise op between attention blocks
 stays as it is. ``shard``, ``gather`` and ``reduce`` follow this layout.
+
+Under VLLM_TPU_MAMBA_TAIL_FOLD the halves also need
+VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN (``gdn_fold_halves``): GDN tiles, and the
+internal prefill checkpoints at their ends, lie on a grid from each request's
+first query token, so the request crossing T/2 restarts in half B at the last
+tile boundary of its own grid before T/2, from the state half A leaves there.
 """
 
 import math
@@ -284,9 +290,10 @@ def microbatch_enabled() -> bool:
     Off under VLLM_TPU_SP_MICROBATCH_OVERLAP_FORCE_OFF, while LIBTPU_INIT_ARGS
     offloads neither the all-gather nor the reduce-scatter to the SparseCore
     (the TensorCore would run the collectives itself, so the halves only add
-    launches), under VLLM_TPU_MAMBA_TAIL_FOLD (a prefill checkpoint offset is
-    a whole number of GDN tiles from the request's first query token, which
-    the second half's start is not), and when the model said so
+    launches), under VLLM_TPU_MAMBA_TAIL_FOLD unless
+    VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN (a prefill checkpoint offset is a whole
+    number of GDN tiles from the request's first query token, which the second
+    half's start is not; ``gdn_fold_halves``), and when the model said so
     (``block_microbatch``). A static decision, made on the first call (the
     model makes it at construction): every trace sees the same one and logs
     nothing.
@@ -313,11 +320,12 @@ def _decide_microbatch() -> bool:
             "TensorCore to overlap)."
         )
         return False
-    if envs.VLLM_TPU_MAMBA_TAIL_FOLD:
+    if envs.VLLM_TPU_MAMBA_TAIL_FOLD and not envs.VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN:
         logger.warning_once(
             "VLLM_TPU_SP_MICROBATCH_OVERLAP is ignored under "
             "VLLM_TPU_MAMBA_TAIL_FOLD (prefill checkpoints would not land on "
-            "GDN tile boundaries of the second half)."
+            "GDN tile boundaries of the second half; "
+            "VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN=1 aligns them)."
         )
         return False
     if _microbatch_blocked is not None:
@@ -332,6 +340,28 @@ def _decide_microbatch() -> bool:
         *sparse_core_collective_offload(),
     )
     return True
+
+
+def fold_align_grid() -> int:
+    """Row grid on which half B restarts the request crossing into it
+    (``gdn_fold_halves``), or 0 when the halves need no alignment.
+
+    VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN under VLLM_TPU_MAMBA_TAIL_FOLD: the
+    largest GDN prefill tile (``mamba_tail_fold.gdn_max_prefill_tile``),
+    which every tile the kernel picks divides, as do the fold's checkpoint
+    offsets.
+    """
+    if not (envs.VLLM_TPU_MAMBA_TAIL_FOLD and envs.VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN):
+        return 0
+    from vllm_torchtpu.core.mamba_tail_fold import gdn_max_prefill_tile
+
+    return gdn_max_prefill_tile()
+
+
+def fold_prefix_rows(grid: int) -> int:
+    """Rows of half A that half B's GDN call takes in front of its own under
+    VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN (``gdn_fold_halves``)."""
+    return 2 * grid
 
 
 def microbatch_groups() -> int:
@@ -403,13 +433,22 @@ class MicroBatchPlan:
     ``pooled_qsa.token_shard_step``). Half B runs after half A in program
     order and reads A's cache writes: QSA's keys and GDN's recurrent and conv
     state, which the A call wrote as a chunk boundary.
+
+    ``fold_grid`` > 0 (VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN): GDN groups whose
+    step carries internal prefill checkpoints take ``gdn_fold_halves``, and
+    each GDN layer hands half B the last ``prefix_rows`` rows of its half A
+    inputs (``fold_inputs``).
     """
 
-    def __init__(self, num_tokens, groups: int = MICROBATCH_GROUPS):
+    def __init__(self, num_tokens, groups: int = MICROBATCH_GROUPS, fold_grid: int = 0):
         self.groups = groups
         self.rows = num_tokens // groups
+        self.fold_grid = fold_grid
+        self.prefix_rows = fold_prefix_rows(fold_grid)
+        assert not fold_grid or groups == 2, "fold alignment splits in two halves"
         self._qsa: list = []
         self._gdn: list = []
+        self._tails: list = []
 
     def positions(self, positions: torch.Tensor, g: int) -> torch.Tensor:
         return positions.narrow(0, g * self.rows, self.rows)
@@ -432,31 +471,95 @@ class MicroBatchPlan:
         self._qsa.append(((query_start_loc, context_lens), value))
         return value[g]
 
-    def gdn(self, attn_metadata, query_start_loc, seq_lens, distribution, g: int):
+    def gdn(
+        self,
+        attn_metadata,
+        query_start_loc,
+        seq_lens,
+        distribution,
+        g: int,
+        ckpt_offsets=None,
+    ):
         """Half ``g`` of a GDN group's metadata, a ``GdnHalf``. Memoized per
         metadata object, so the layers of one KV-cache group share the
-        tensors (and VLLM_TPU_GDN_HOIST_METADATA's memo, keyed on the half)."""
+        tensors (and VLLM_TPU_GDN_HOIST_METADATA's memo, keyed on the half).
+
+        ``ckpt_offsets``: the step's internal prefill checkpoint offsets
+        (VLLM_TPU_MAMBA_TAIL_FOLD); needs ``fold_grid`` and selects
+        ``gdn_fold_halves``."""
         for key, value in self._gdn:
             if key is attn_metadata:
                 return value[g]
-        value = [
-            gdn_half(query_start_loc, seq_lens, distribution, h, self.rows)
-            for h in range(self.groups)
-        ]
+        if ckpt_offsets is not None:
+            assert self.fold_grid > 0, "fold checkpoints need aligned halves"
+            value = gdn_fold_halves(
+                query_start_loc,
+                seq_lens,
+                distribution,
+                ckpt_offsets,
+                self.rows,
+                self.fold_grid,
+            )
+        else:
+            value = [
+                gdn_half(query_start_loc, seq_lens, distribution, h, self.rows)
+                for h in range(self.groups)
+            ]
         self._gdn.append((attn_metadata, value))
         return value[g]
+
+    def fold_inputs(self, layer, g: int, *inputs: torch.Tensor):
+        """A GDN layer's core inputs for half ``g`` under ``gdn_fold_halves``.
+
+        Half A's are returned as they are, and their last ``prefix_rows`` rows
+        kept for the layer's half B call, which gets them in front of its own.
+        """
+        if g == 0:
+            self._tails = [
+                (key, value) for key, value in self._tails if key is not layer
+            ]
+            self._tails.append(
+                (
+                    layer,
+                    tuple(
+                        x.narrow(0, x.shape[0] - self.prefix_rows, self.prefix_rows)
+                        for x in inputs
+                    ),
+                )
+            )
+            return inputs
+        for key, tails in self._tails:
+            if key is layer:
+                return tuple(torch.cat([t, x]) for t, x in zip(tails, inputs))
+        raise RuntimeError("half B of a GDN layer ran before its half A")
 
 
 class GdnHalf:
     """A GDN core call's metadata for one token half (see ``gdn_half``)."""
 
-    def __init__(self, query_start_loc, seq_lens, distribution, resume_from_carry):
+    def __init__(
+        self,
+        query_start_loc,
+        seq_lens,
+        distribution,
+        resume_from_carry,
+        ckpt_offsets=None,
+        state_rows=None,
+        prefix_rows: int = 0,
+    ):
         self.query_start_loc = query_start_loc
         self.seq_lens = seq_lens
         self.distribution = distribution
         # bool [num_seqs] or None: sequences whose state an earlier half of
         # this step wrote, so they read checkpoint 0.
         self.resume_from_carry = resume_from_carry
+        # ``gdn_fold_halves`` only (else None / 0): internal prefill
+        # checkpoint offsets relative to the half, each sequence's state rows
+        # (``fused_conv1d_gdn``), and the rows of half A in front of the call's
+        # inputs.
+        self.ckpt_offsets = ckpt_offsets
+        self.state_rows = state_rows
+        self.prefix_rows = prefix_rows
 
 
 def half_starts(starts: torch.Tensor, base, rows) -> torch.Tensor:
@@ -501,3 +604,79 @@ def gdn_half(starts, seq_lens, distribution, g: int, rows):
     later = torch.cat([torch.zeros_like(distribution[:1]), distribution[1:]])
     resume = (before > 0) & (sub_lengths > 0)
     return GdnHalf(sub, half_seq_lens, later, resume)
+
+
+def gdn_fold_halves(starts, seq_lens, distribution, ckpt_offsets, rows, grid: int):
+    """Both halves' GDN metadata under VLLM_TPU_MAMBA_TAIL_FOLD
+    (VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN): ``[GdnHalf A, GdnHalf B]``.
+
+    A request's PER_SEQ tiles cover its query rows from the first one on, and
+    an internal prefill checkpoint is written at the end of a tile. The
+    request crossing row ``rows`` (T/2) at row ``r`` would start half B off
+    that grid. Instead it restarts in half B at ``b``, the last multiple of
+    ``grid`` rows from ``r`` at or before T/2 (one ``grid`` earlier when a
+    checkpoint lies exactly at ``b``):
+
+    - Half A runs its rows as ``gdn_half`` does, but the crossing request
+      writes its state after its first ``b - r`` rows (``state_rows``; no
+      write when ``b == r``, so its initial state stays where it is) and
+      drops a checkpoint at or past ``b`` (``ckpt_offsets``). Its tiles up to
+      ``b`` and the partial one after are the whole step's tiles, cut short;
+      rows of a partial tile do not depend on the rows after them.
+    - Half B's call takes rows ``[T/2 - P, T)`` (``P = prefix_rows``, the
+      layer prepends A's last rows): the crossing request starts at ``b``, so
+      every tile of it is a tile of the whole step, resuming from checkpoint
+      0 where A left the state at ``b`` (or from its own initial state when
+      ``b == r``). Its rows before T/2 are recomputed and dropped. Later
+      requests and their checkpoints keep their rows.
+
+    So outputs, checkpoints and final states equal the whole step's, tile by
+    tile. ``grid`` must be a multiple of every GDN prefill tile and divide
+    every checkpoint offset (``fold_align_grid``).
+    """
+    prefix = fold_prefix_rows(grid)
+    begins, ends = starts[:-1], starts[1:]
+    lengths = ends - begins
+    offsets = ckpt_offsets.to(starts.dtype)
+    zero = torch.zeros_like(begins)
+    crossing = (begins < rows) & (ends > rows)
+    r = torch.where(crossing, begins, zero).sum().to(starts.dtype)
+    o = torch.where(crossing, offsets, zero).sum().to(starts.dtype)
+    b = rows - (rows - r) % grid
+    b = torch.where((o > 0) & (r + o == b), b - grid, b)
+    b = torch.where(crossing.any(), b, torch.zeros_like(b) + rows)
+
+    # Half A: [0, T/2).
+    sub_a = half_starts(starts, 0, rows)
+    len_a = sub_a[1:] - sub_a[:-1]
+    seq_a = seq_lens - (lengths - len_a).to(seq_lens.dtype)
+    cut = b - r
+    half_a = GdnHalf(
+        sub_a,
+        seq_a,
+        distribution,
+        None,
+        ckpt_offsets=torch.where(crossing & (offsets >= cut), zero, offsets),
+        state_rows=torch.where(crossing, cut.expand_as(len_a), len_a),
+    )
+
+    # Half B: [T/2 - P, T), the crossing request from b.
+    base = rows - prefix
+    sub_b = torch.maximum(starts - base, (b - base).expand_as(starts)).clamp_max(
+        rows + prefix
+    )
+    len_b = sub_b[1:] - sub_b[:-1]
+    before = torch.minimum((base + sub_b[:-1] - begins).clamp_min(0), lengths)
+    later = torch.cat([torch.zeros_like(distribution[:1]), distribution[1:]])
+    half_b = GdnHalf(
+        sub_b.to(starts.dtype),
+        seq_lens,
+        later,
+        (len_b > 0) & (before > 0),
+        ckpt_offsets=torch.where(
+            (len_b > 0) & (offsets > before), offsets - before, zero
+        ),
+        state_rows=len_b,
+        prefix_rows=prefix,
+    )
+    return [half_a, half_b]

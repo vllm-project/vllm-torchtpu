@@ -879,7 +879,7 @@ def run_jax_gdn_attention_pooled_local(
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
-    prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
+    prefill_ckpt: tuple[jnp.ndarray, ...] | None = None,
     packed_metadata: jnp.ndarray | None = None,
     metadata_only: bool = False,
     packed_size: int = 0,
@@ -1024,7 +1024,7 @@ def run_jax_gdn_attention_pooled(
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
     step_metadata: tuple[jnp.ndarray, ...] | None = None,
-    prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
+    prefill_ckpt: tuple[jnp.ndarray, ...] | None = None,
     packed_metadata: jnp.ndarray | None = None,
     metadata_only: bool = False,
     packed_size: int = 0,
@@ -1067,7 +1067,8 @@ def run_jax_gdn_attention_pooled(
         prefill_ckpt: Optional `(offsets, blocks)`, int32 `(num_seqs,)` each:
           internal prefill checkpoints (VLLM_TPU_MAMBA_TAIL_FOLD). Sequence
           `s` also writes its state after `offsets[s]` query tokens to pool
-          block `blocks[s]`; 0 means none.
+          block `blocks[s]`; 0 means none. An optional third array holds
+          per-sequence state rows (`fused_conv1d_gdn`).
 
     Returns:
         A tuple containing:
@@ -1160,15 +1161,14 @@ def run_jax_gdn_attention_pooled(
             return inner_fn(*rest, packed_metadata=packed)
 
     if prefill_ckpt is not None:
-        # Two more replicated per-sequence inputs, appended after whichever
-        # optional inputs precede them.
-        in_specs = in_specs + (P(None), P(None))
+        # Two (three with state rows) more replicated per-sequence inputs,
+        # appended after whichever optional inputs precede them.
+        num_ckpt = len(prefill_ckpt)
+        in_specs = in_specs + (P(None),) * num_ckpt
 
         def local_fn(*args):
-            *rest, ckpt_offsets, ckpt_blocks = args
-            return p_run_jax_gdn_attention_pooled_local(
-                *rest, prefill_ckpt=(ckpt_offsets, ckpt_blocks)
-            )
+            rest, ckpt = args[:-num_ckpt], args[-num_ckpt:]
+            return p_run_jax_gdn_attention_pooled_local(*rest, prefill_ckpt=tuple(ckpt))
 
     mapped_fn = jax.shard_map(
         local_fn,

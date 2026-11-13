@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PREFILL_SP_PAD_HC: bool = False
     VLLM_TPU_SP_MICROBATCH_OVERLAP: bool = False
     VLLM_TPU_SP_MICROBATCH_OVERLAP_FORCE_OFF: bool = False
+    VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -1607,6 +1608,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SP_MICROBATCH_OVERLAP_FORCE_OFF": env_bool(
         "VLLM_TPU_SP_MICROBATCH_OVERLAP_FORCE_OFF"
     ),
+    # Let VLLM_TPU_SP_MICROBATCH_OVERLAP run under VLLM_TPU_MAMBA_TAIL_FOLD: half B
+    # restarts the request that crosses the half boundary at the last GDN tile
+    # boundary (on its own tile grid) before it, from the state half A writes
+    # there, and recomputes the few rows of A it needs. Tiles, internal prefill
+    # checkpoints and states then match the whole step's.
+    "VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN": env_bool("VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN"),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
