@@ -33,7 +33,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
 
-MAX_ROWS = 256
+MAX_ROWS = 8192
 I32 = jnp.int32
 
 
@@ -109,7 +109,7 @@ def fill_and_wrap(qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref,
         sc["tb_has_init"][s] = ((seq_lens_ref[s] - q_len) > 0).astype(I32)
         return carry
 
-    lax.fori_loop(0, max_seqs, body_b, jnp.int32(0))
+    lax.fori_loop(0, jnp.where(end_b > 0, max_seqs, 0), body_b, jnp.int32(0))
     sc["tb_num_tiles"][0] = pl.cdiv(end_b, cfg_b.tile_size)
 
     chunk = cfg_p.chunk_size

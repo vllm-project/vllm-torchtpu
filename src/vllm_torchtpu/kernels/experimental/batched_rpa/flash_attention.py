@@ -75,13 +75,18 @@ def flash_attention_qk_softmax(
     qk_masked = []
 
     int_ty = cfgs.serve.int_ty
+    base_kv_iota = lax.broadcasted_iota(int_ty, (k_heads, tq, s), 2)
+    if tq <= cfgs.aligned_num_q_heads_per_kv_head:
+        base_q_offset = lax.full((k_heads, tq, s), bq_start, int_ty)
+    else:
+        base_q_offset = (lax.broadcasted_iota(jnp.int32,
+                                              (k_heads, tq, s), 1) //
+                         cfgs.aligned_num_q_heads_per_kv_head +
+                         bq_start).astype(int_ty)
 
     for b_idx in range(cfgs.block.batch_size):
-        kv_idx_b = (lax.broadcasted_iota(int_ty, (k_heads, tq, s), 2) +
-                    processed_kv_len[b_idx])
-        q_idx_b = (lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1) //
-                   cfgs.aligned_num_q_heads_per_kv_head +
-                   bq_start).astype(int_ty) + processed_q_len[b_idx]
+        kv_idx_b = base_kv_iota + processed_kv_len[b_idx]
+        q_idx_b = base_q_offset + processed_q_len[b_idx]
 
         eff_kv_len_b = effective_kv_len[b_idx]
         mask_b = q_idx_b < eff_kv_len_b

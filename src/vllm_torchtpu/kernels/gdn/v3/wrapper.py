@@ -332,20 +332,23 @@ def outer_kernel_tables_in_kernel(
     meta_b, meta_p = _tik.fill_and_wrap(qsl_ref, seq_lens_ref, state_ref,
                                         read_ref, dist_ref, sc, cfg_b, cfg_p,
                                         max_seqs)
-    outer_kernel(meta_b,
-                 qkv_ref,
-                 b_ref,
-                 a_ref,
-                 source_ref,
-                 source_ref,
-                 None,
-                 weights_ref,
-                 out_ref,
-                 None,
-                 None,
-                 None,
-                 None,
-                 cfg=cfg_b)
+
+    @pl.when(meta_b.num_tiles[...] > 0)
+    def _():
+        outer_kernel(meta_b,
+                     qkv_ref,
+                     b_ref,
+                     a_ref,
+                     source_ref,
+                     source_ref,
+                     None,
+                     weights_ref,
+                     out_ref,
+                     None,
+                     None,
+                     None,
+                     None,
+                     cfg=cfg_b)
 
     @pl.when(meta_p.num_tiles[...] > 0)
     def _():

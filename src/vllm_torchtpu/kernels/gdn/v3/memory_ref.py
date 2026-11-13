@@ -153,6 +153,8 @@ class BaseBufferedRef(pltpu.BufferedRef):
             buffer_count=buffer_count,
             grid_rank=1,
             use_lookahead=use_lookahead,
+            priority=fields.pop("priority", 0),
+            strict_ordering=fields.pop("strict_ordering", False),
         )
         return cls(
             cfg=cfg,
@@ -184,7 +186,10 @@ class InBufferedRef(BaseBufferedRef):
                 src_ref.at[pl.ds(r_base, dma_size)],
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 sem,
-            ).start()
+            ).start(
+                priority=self.priority,
+                strict_ordering=self.strict_ordering,
+            )
 
     def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -202,7 +207,7 @@ class InBufferedRef(BaseBufferedRef):
             vmem_ref.at[0, pl.ds(0, dma_size)],
             vmem_ref.at[0, pl.ds(0, dma_size)],
             sem,
-        ).wait()
+        ).wait(strict_ordering=self.strict_ordering)
 
 
 @jax.tree_util.register_dataclass
@@ -224,7 +229,10 @@ class OutBufferedRef(BaseBufferedRef):
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 dst_ref.at[pl.ds(r_base, dma_size)],
                 sem,
-            ).start()
+            ).start(
+                priority=self.priority,
+                strict_ordering=self.strict_ordering,
+            )
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -242,7 +250,7 @@ class OutBufferedRef(BaseBufferedRef):
             vmem_ref.at[0, pl.ds(0, dma_size)],
             vmem_ref.at[0, pl.ds(0, dma_size)],
             sem,
-        ).wait()
+        ).wait(strict_ordering=self.strict_ordering)
 
 
 @jax.tree_util.register_dataclass
@@ -310,7 +318,10 @@ class StateBufferedRef(BaseBufferedRef):
                 self._src_slice(src_ref, state_idx, dma_size),
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 sem,
-            ).start()
+            ).start(
+                priority=self.priority,
+                strict_ordering=self.strict_ordering,
+            )
 
     def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -333,7 +344,8 @@ class StateBufferedRef(BaseBufferedRef):
         # nominally exceed the window row; it is never executed, only used
         # to wait for the same number of bytes `copy_in` issued.
         wait_ref = self._wait_slice(vmem_ref, dma_size)
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        pltpu.make_async_copy(wait_ref, wait_ref,
+                              sem).wait(strict_ordering=self.strict_ordering)
 
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -359,7 +371,10 @@ class StateBufferedRef(BaseBufferedRef):
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 self._src_slice(dst_ref, state_idx, dma_size),
                 sem,
-            ).start()
+            ).start(
+                priority=self.priority,
+                strict_ordering=self.strict_ordering,
+            )
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -380,7 +395,8 @@ class StateBufferedRef(BaseBufferedRef):
         # nominally exceed the window row; it is never executed, only used
         # to wait for the same number of bytes `copy_out` issued.
         wait_ref = self._wait_slice(vmem_ref, dma_size)
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        pltpu.make_async_copy(wait_ref, wait_ref,
+                              sem).wait(strict_ordering=self.strict_ordering)
 
 
 @jax.tree_util.register_dataclass
@@ -464,7 +480,10 @@ class ExternalStateBufferedRef(StateBufferedRef):
                 self._region_slice(src_ref, state_idx, nblocks),
                 vmem_ref.at[idx, 0, pl.ds(0, nblocks)],
                 sem,
-            ).start()
+            ).start(
+                priority=self.priority,
+                strict_ordering=self.strict_ordering,
+            )
 
     def _unit(self) -> int:
         return self.region.nblocks
@@ -495,7 +514,10 @@ class ExternalStateBufferedRef(StateBufferedRef):
                 vmem_ref.at[idx, 0, pl.ds(0, dma_size)],
                 self.compact_output_ref.at[s_idx, pl.ds(0, dma_size)],
                 sem,
-            ).start()
+            ).start(
+                priority=self.priority,
+                strict_ordering=self.strict_ordering,
+            )
 
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         if self.compact_output_ref is not None:
@@ -525,7 +547,10 @@ class ExternalStateBufferedRef(StateBufferedRef):
                     vmem_ref.at[idx, t, pl.ds(0, nblocks)],
                     self._region_slice(dst_ref, state_idx, nblocks),
                     sem,
-                ).start()
+                ).start(
+                    priority=self.priority,
+                    strict_ordering=self.strict_ordering,
+                )
 
     def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -550,7 +575,8 @@ class ExternalStateBufferedRef(StateBufferedRef):
         # may nominally exceed the window row; it is never executed, only
         # used to wait for the same number of bytes `copy_in` issued.
         wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        pltpu.make_async_copy(wait_ref, wait_ref,
+                              sem).wait(strict_ordering=self.strict_ordering)
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -571,7 +597,8 @@ class ExternalStateBufferedRef(StateBufferedRef):
         # many region tiles along the window dim of one sequence row (the
         # descriptor may nominally exceed it, see wait_in's NOTE).
         wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        pltpu.make_async_copy(wait_ref, wait_ref,
+                              sem).wait(strict_ordering=self.strict_ordering)
 
 
 def create_allocs(
@@ -638,7 +665,9 @@ def create_allocs(
         cfg=cfg,
         metadata_ref=metadata_ref,
     )
-    qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
+    qkv_alloc = in_buffered_partial(spec=qkv_spec,
+                                    dtype_or_type=qkv_ref,
+                                    priority=1)
     b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
     a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
 
@@ -669,6 +698,7 @@ def create_allocs(
             use_lookahead=pipeline_mode.use_lookahead,
             cfg=cfg,
             metadata_ref=metadata_ref,
+            priority=1,
         )
         conv_alloc = state_buffered_partial(
             spec=block_spec_partial(block_shape=conv_shape),
@@ -704,6 +734,7 @@ def create_allocs(
             cfg=cfg,
             metadata_ref=metadata_ref,
             stride=plan.stride,
+            priority=1,
         )
         conv_alloc = state_buffered_partial(
             spec=block_spec_partial(block_shape=conv_shape),

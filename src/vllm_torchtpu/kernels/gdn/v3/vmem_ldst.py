@@ -262,12 +262,20 @@ def load_and_select_states(
             # pl.when traces the body here, so `idx` is this iteration's.
             @pl.when(is_first_tile)
             def _():
-                carry_conv_scratch_ref[idx] = jnp.where(
-                    has_initial_state,
-                    _load_conv_state(conv_state_slot_ref, cfg, idx), 0)
-                carry_recurrent_scratch_ref[idx] = jnp.where(
-                    has_initial_state,
-                    _load_recurrent_state(recurrent_slot_ref, cfg, idx), 0)
+
+                @pl.when(has_initial_state)
+                def _():
+                    carry_conv_scratch_ref[idx] = _load_conv_state(
+                        conv_state_slot_ref, cfg, idx)
+                    carry_recurrent_scratch_ref[idx] = _load_recurrent_state(
+                        recurrent_slot_ref, cfg, idx)
+
+                @pl.when(jnp.logical_not(has_initial_state))
+                def _():
+                    carry_conv_scratch_ref[idx] = jnp.zeros_like(
+                        carry_conv_scratch_ref[idx])
+                    carry_recurrent_scratch_ref[idx] = jnp.zeros_like(
+                        carry_recurrent_scratch_ref[idx])
 
             prev_conv_state = carry_conv_scratch_ref[idx]
             prev_recurrent_state = carry_recurrent_scratch_ref[idx]
