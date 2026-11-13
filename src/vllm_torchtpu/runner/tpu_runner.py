@@ -4760,6 +4760,18 @@ class TPUModelRunner(GPUModelRunner):
             return self.sample_tokens(None)
         return None
 
+    def _prompt_logprobs_unsupported_reason(self) -> str | None:
+        """Why this runner cannot compute prompt logprobs, with the fix; None if
+        it can. Read from the PCP manager when USE_TPU_PCP_MANAGER replaces the
+        sequence layout planner."""
+        return prompt_logprobs.unsupported_reason(
+            dp_vocab_logits=self._dp_vocab_logits,
+            selected_logits_hidden_states=(
+                self.get_pcp_planner().uses_selected_logits_hidden_states
+            ),
+            lora=self.lora_config is not None,
+        )
+
     def _prompt_logprobs_chunk(
         self,
         scheduler_output: "SchedulerOutput",
@@ -6014,13 +6026,7 @@ class TPUModelRunner(GPUModelRunner):
             self._dp_vocab_logits
             and self.get_pcp_planner().uses_selected_logits_hidden_states
         ), "TPU_DP_VOCAB_PARALLEL does not support selected logits hidden states"
-        self._prompt_logprobs_unsupported = prompt_logprobs.unsupported_reason(
-            dp_vocab_logits=self._dp_vocab_logits,
-            selected_logits_hidden_states=(
-                self.sequence_layout_planner.uses_selected_logits_hidden_states
-            ),
-            lora=self.lora_config is not None,
-        )
+        self._prompt_logprobs_unsupported = self._prompt_logprobs_unsupported_reason()
         if self.is_pooling_model:
             self._resolve_static_pooler()
         if self.parallel_config.pipeline_parallel_size > 1:
