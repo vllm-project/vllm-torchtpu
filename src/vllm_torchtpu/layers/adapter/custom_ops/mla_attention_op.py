@@ -307,6 +307,30 @@ def _resolve_indexer_kv_cache_mode(
     return "pallas", kv_layout
 
 
+def _indexer_lane_split_takes(
+    num_tokens: int,
+    num_lanes: int,
+    dcp_size: int,
+    *,
+    enabled: bool,
+    hist_merge: bool,
+    a2a_merge: bool,
+    a2a_min_tokens: int,
+    min_tokens: int,
+) -> bool:
+    """Whether this static bucket takes TPU_DCP_INDEXER_LANE_SPLIT. The token
+    split gates on it too, so the two never disagree on a bucket."""
+    return (
+        enabled
+        and num_lanes > 1
+        and _dcp_indexer_a2a_for_bucket(num_tokens, True, a2a_min_tokens)
+        and (hist_merge or a2a_merge)
+        and num_tokens > fp8_skinny.MAX_M
+        and num_tokens >= min_tokens
+        and num_tokens % (num_lanes * dcp_size) == 0
+    )
+
+
 def _dcp_indexer_a2a_for_bucket(
     num_tokens: int, enabled: bool, min_tokens: int
 ) -> bool:
@@ -849,6 +873,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
         lane_split_env = envs.TPU_DCP_INDEXER_LANE_SPLIT
         lane_split_min_tokens = envs.TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS
+        chunk_gather = envs.TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER
         small_bucket = (
             envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
             envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
@@ -950,15 +975,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 )
             # The histogram merge, if on, replaces the all-to-all one.
             large = _dcp_indexer_a2a_for_bucket(q.shape[0], True, a2a_min_tokens)
-            lane_split = (
-                lane_split_env
-                and lane_ids_arg is not None
-                and num_lanes > 1
-                and large
-                and (hist_merge or a2a_merge)
-                and q.shape[0] > fp8_skinny.MAX_M
-                and q.shape[0] >= lane_split_min_tokens
-                and q.shape[0] % (num_lanes * dcp_size) == 0
+            lane_split = lane_ids_arg is not None and _indexer_lane_split_takes(
+                q.shape[0],
+                num_lanes,
+                dcp_size,
+                enabled=lane_split_env,
+                hist_merge=hist_merge,
+                a2a_merge=a2a_merge,
+                a2a_min_tokens=a2a_min_tokens,
+                min_tokens=lane_split_min_tokens,
             )
             if lane_local and not (lane_split and hist_merge):
                 raise ValueError(
@@ -1000,6 +1025,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 shared_meta=shared_meta,
                 lane_split=lane_split,
                 lane_local=lane_local,
+                chunk_gather=chunk_gather,
                 **overlap,
             )
             if qb_overlap:
@@ -2400,6 +2426,16 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             logger.warning_once(
                 "TPU_DCP_MLA_TOKEN_SPLIT: q_b takes a prequantized input; off"
             )
+            # Drop what the load built for it, so no HBM stays on a dead path.
+            for name in (
+                "W_UK_T_ts",
+                "W_UK_T_ts_scale",
+                "W_UV_ts",
+                "W_UV_ts_scale",
+                "sparse_mla_dcp_ts_op",
+                "ts_lane_a2a_op",
+            ):
+                setattr(self.mla_attn, name, None)
             return
         if self.mla_attn.W_UK_T_ts is None:
             return
@@ -2423,7 +2459,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
     ) -> bool:
         """TPU_DCP_MLA_TOKEN_SPLIT for this bucket, fixed at trace time: the
         backbone is traced once per bucket; the MTP drafter never splits."""
-        if not getattr(self, "token_split", False):
+        if not getattr(self, "token_split", False) or not self.is_sparse:
             return False
         if prefill_group is not None or llama_4_scaling is not None:
             return False
@@ -2431,8 +2467,18 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             return False
         if vllm_compilation_backends.model_tag != "backbone":
             return False
-        return num_tokens > envs.bucket_gate_edge(
-            envs.TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS
+        if num_tokens <= envs.bucket_gate_edge(envs.TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS):
+            return False
+        # Only where the indexer's lane split (hist merge) gives lane-local rows.
+        return _indexer_lane_split_takes(
+            num_tokens,
+            self.ts_lanes,
+            self.dcp_group_size,
+            enabled=envs.TPU_DCP_INDEXER_LANE_SPLIT,
+            hist_merge=envs.TPU_DCP_INDEXER_HIST_MERGE,
+            a2a_merge=False,
+            a2a_min_tokens=envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS,
+            min_tokens=envs.TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS,
         )
 
     def permute_rope_to_half_split(self) -> None:

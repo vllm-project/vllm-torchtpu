@@ -1029,11 +1029,9 @@ def test_lane_split_matches_the_unsplit_result_on_a_lane_mesh(merge, layout):
 
 @pytest.mark.multichip
 @pytest.mark.parametrize("layout", sorted(_LANE_SPLIT_LAYOUTS))
-def test_lane_split_chunk_gather_matches_the_unsplit_result(layout, monkeypatch):
+def test_lane_split_chunk_gather_matches_the_unsplit_result(layout):
     """TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER: per-chunk lane all-gathers (4
     chunks a lane) must reassemble the unsplit answer exactly."""
-    from vllm_torchtpu import envs
-
     _need_devices(8)
     _require_sparsecore()
     dcp = 4
@@ -1058,14 +1056,14 @@ def test_lane_split_chunk_gather_matches_the_unsplit_result(layout, monkeypatch)
     lane_kwargs = dict(kwargs, mesh=mesh, hist_merge=True, chunk_tokens=Q_LEN // 8)
 
     def run(lane_ids, lane_split, chunk_gather):
-        monkeypatch.setattr(
-            envs, "TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER", chunk_gather
-        )
-        jax.clear_caches()
         ids = _per_device_ids(mesh, [[lane] for lane in lane_ids for _ in range(dcp)])
         return np.asarray(
             streamindex_topk_dcp(
-                *lane_args, **lane_kwargs, dcp_lane_ids=ids, lane_split=lane_split
+                *lane_args,
+                **lane_kwargs,
+                dcp_lane_ids=ids,
+                lane_split=lane_split,
+                chunk_gather=chunk_gather,
             )
         )
 

@@ -1526,13 +1526,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Split each large bucket's query tokens over the DCP lanes (tp // dcp > 1),
     # which hold replicas of one KV shard; a lane all-gather restores them.
     "TPU_DCP_INDEXER_LANE_SPLIT": env_bool("TPU_DCP_INDEXER_LANE_SPLIT", default=False),
-    # Smallest padded token bucket that takes TPU_DCP_INDEXER_LANE_SPLIT.
-    # With the hist merge, all-gather each top-k chunk over the lanes as soon as
-    # it is done, overlapping the later chunks' scoring, instead of once at the
-    # end. Same result.
+    # With the hist merge, all-gather each top-k chunk's rows over the lanes
+    # instead of once at the end; the gathers then fill the wait on the last
+    # chunk's SparseCore top-k. Same result.
     "TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER": env_bool(
         "TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER", default=False
     ),
+    # Smallest padded token bucket that takes TPU_DCP_INDEXER_LANE_SPLIT.
     "TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS": env_nonnegative_int(
         "TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS", 512
     ),

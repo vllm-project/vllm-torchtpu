@@ -27,6 +27,11 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_PP_CHUNK_SLACK` | `0.1` | Slack ratio for dynamic pipeline-parallel chunk sizing. |
 | `TPU_PCP_TOPOLOGY_AWARE_MESH` | `True` | Orders Prefill Context Parallel (`PCP`) ranks along adjacent ICI torus neighbors to minimize ring hop count. |
 | `TPU_DCP_MLA_TOPK_CAP` | `-1` (auto: `512` at DCP >= 8, else off) | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
+| `TPU_DCP_INDEXER_LANE_SPLIT` | `False` | At TP > DCP, splits a large prefill bucket's indexer query tokens over the DCP lanes (which hold replicas of one KV shard) instead of scoring every token on every lane; a lane all-gather restores the top-k. Needs the hist or all-to-all indexer merge and `TPU_DCP_RANK_OPERAND`. |
+| `TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS` | `512` | Smallest padded token bucket that takes `TPU_DCP_INDEXER_LANE_SPLIT`. |
+| `TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER` | `False` | With the lane split and the hist merge, all-gathers each top-k chunk's rows over the lanes instead of once at the end. Same result. |
+| `TPU_DCP_MLA_TOKEN_SPLIT` | `False` | At TP > DCP, backbone prefill buckets split their sparse MLA query tokens over the DCP lanes instead of the heads (each lane attends its tokens with every head), so the per-token KV gather is not repeated on every lane. Needs the indexer lane split with the hist merge, `TPU_DCP_RANK_OPERAND` and query replication; exclusive with `TPU_DCP_MLA_OPROJ_ALL_REDUCE`. Costs one 64-head q_b, W_UK_T and W_UV per layer of HBM. |
+| `TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS` | `1024` | Smallest padded token bucket that takes `TPU_DCP_MLA_TOKEN_SPLIT`. |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`32`). |
 | `TPU_DCP_MERGE_CHUNKED` | `0` | Splits the Decode Context Parallelism reduce-scatter LSE merge of backbone buckets of at least `TPU_DCP_MERGE_CHUNKED_MIN_TOKENS` (`1024`) tokens into this many token chunks, so each chunk's reduce-scatter overlaps the next chunk's compute (`0`/`1` disables). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
