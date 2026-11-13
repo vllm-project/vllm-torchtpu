@@ -1,0 +1,317 @@
+{
+  "schema": "advisor.validation.v1",
+  "description": "Synthetic roofline soundness envelope fixtures across Qwen3.5-397B, Qwen3.8-2.4T-A95B, and Qwen3-30B-A3B (verifies lower-bound soundness and single-pass directional ordering without hardware dependencies)",
+  "points": [
+    {
+      "id": "qwen35_397b_pp8_prefill_8k",
+      "model": "qwen3.5-397b",
+      "chip": "tpu7x",
+      "scope": "layer_group",
+      "fixture_step_us": 75000.0,
+      "measured_spread_us": 1000.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.5-397B PP8 x TP1 x EP1 8K causal chunk prefill stage at 95K effective context synthetic envelope fixture",
+      "workload": {
+        "phase": "prefill",
+        "batch": 1,
+        "isl": 8192,
+        "chunk_size": 8192,
+        "context": 95232,
+        "pp": 8,
+        "tp": 1,
+        "ep": 1,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen35_397b_tp8_verify_r4",
+      "model": "qwen3.5-397b",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "fixture_step_us": 2500.0,
+      "measured_spread_us": 100.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.5-397B TP8 x DCP4 x EP8 60-layer speculative verify step with 3 draft tokens with 4 active rows synthetic envelope fixture",
+      "workload": {
+        "phase": "verify",
+        "spec_tokens": 3,
+        "batch": 1,
+        "isl": 512,
+        "context": 512,
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen35_397b_tp8_verify_r8",
+      "model": "qwen3.5-397b",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "fixture_step_us": 3500.0,
+      "measured_spread_us": 100.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.5-397B TP8 x DCP4 x EP8 60-layer speculative verify step with 3 draft tokens with 8 active rows synthetic envelope fixture",
+      "workload": {
+        "phase": "verify",
+        "spec_tokens": 3,
+        "batch": 2,
+        "isl": 512,
+        "context": 512,
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen35_397b_tp8_verify_r16",
+      "model": "qwen3.5-397b",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "fixture_step_us": 7000.0,
+      "measured_spread_us": 150.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.5-397B TP8 x DCP4 x EP8 60-layer speculative verify step with 3 draft tokens with 16 active rows synthetic envelope fixture",
+      "workload": {
+        "phase": "verify",
+        "spec_tokens": 3,
+        "batch": 4,
+        "isl": 512,
+        "context": 512,
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen35_397b_tp8_verify_r32",
+      "model": "qwen3.5-397b",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "fixture_step_us": 10500.0,
+      "measured_spread_us": 200.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.5-397B TP8 x DCP4 x EP8 60-layer speculative verify step with 3 draft tokens with 32 active rows synthetic envelope fixture",
+      "workload": {
+        "phase": "verify",
+        "spec_tokens": 3,
+        "batch": 8,
+        "isl": 512,
+        "context": 512,
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_mk_b4",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "fixture_step_us": 7000.0,
+      "measured_spread_us": 100.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 4 synthetic envelope fixture",
+      "workload": {
+        "phase": "decode",
+        "batch": 4,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_mk_b8",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "fixture_step_us": 8000.0,
+      "measured_spread_us": 100.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 8 synthetic envelope fixture",
+      "workload": {
+        "phase": "decode",
+        "batch": 8,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_mk_b16",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "fixture_step_us": 9500.0,
+      "measured_spread_us": 150.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 16 synthetic envelope fixture",
+      "workload": {
+        "phase": "decode",
+        "batch": 16,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_mk_b32",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "fixture_step_us": 12500.0,
+      "measured_spread_us": 150.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 32 synthetic envelope fixture",
+      "workload": {
+        "phase": "decode",
+        "batch": 32,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_mk_b64",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "fixture_step_us": 17000.0,
+      "measured_spread_us": 200.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 64 synthetic envelope fixture",
+      "workload": {
+        "phase": "decode",
+        "batch": 64,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_mk_b256",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "fixture_step_us": 35000.0,
+      "measured_spread_us": 250.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 256 synthetic envelope fixture",
+      "workload": {
+        "phase": "decode",
+        "batch": 256,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_per_op_b64",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "per_op",
+      "fixture_step_us": 35000.0,
+      "measured_spread_us": 250.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer per-operator decode baseline at batch 64 synthetic envelope fixture",
+      "workload": {
+        "phase": "decode",
+        "batch": 64,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_per_op_b256",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "per_op",
+      "fixture_step_us": 60000.0,
+      "measured_spread_us": 300.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer per-operator decode baseline at batch 256 synthetic envelope fixture",
+      "workload": {
+        "phase": "decode",
+        "batch": 256,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen3_30b_a3b_tp8_ep8_decode_b16",
+      "model": "Qwen/Qwen3-30B-A3B-FP8",
+      "chip": "tpu7x",
+      "scope": "per_op",
+      "fixture_step_us": 7500.0,
+      "measured_spread_us": 200.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3-30B-A3B-FP8 TP8 x EP8 48-layer per-operator decode synthetic envelope fixture at batch 16",
+      "workload": {
+        "phase": "decode",
+        "batch": 16,
+        "isl": 64,
+        "osl": 24,
+        "context": 88,
+        "tp": 8,
+        "ep": 8
+      }
+    },
+    {
+      "id": "qwen3_30b_a3b_tp8_ep8_prefill_4k",
+      "model": "Qwen/Qwen3-30B-A3B-FP8",
+      "chip": "tpu7x",
+      "scope": "per_op",
+      "fixture_step_us": 42800.0,
+      "measured_spread_us": 300.0,
+      "provenance_kind": "synthetic_envelope_fixture",
+      "workload_description": "Qwen3-30B-A3B-FP8 TP8 x EP8 48-layer per-operator 4K prefill synthetic envelope fixture at batch 1; envelope keeps its headroom over the floor after all-reduce transfer moved to one ICI link",
+      "workload": {
+        "phase": "prefill",
+        "batch": 1,
+        "isl": 4096,
+        "chunk_size": 4096,
+        "context": 4096,
+        "tp": 8,
+        "ep": 8
+      }
+    }
+  ]
+}
