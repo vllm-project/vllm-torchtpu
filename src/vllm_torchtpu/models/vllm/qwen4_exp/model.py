@@ -779,9 +779,9 @@ class Qwen4ExpBackbone(nn.Module):
                 ple_raw_embeddings = ple.lookup_for_model(
                     ple_inputs, query_start_loc[-1:]
                 )
-        hidden = (
-            self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
-        )
+        hidden = inputs_embeds
+        if hidden is None and not (sequence_parallel and self._sp_embed_rs()):
+            hidden = self.embed_tokens(input_ids)
         num_tokens = input_ids.shape[0]
         sp_pad = self.sp_pad_rows if sequence_parallel else 0
         # VLLM_TPU_SP_MICROBATCH_OVERLAP: the step's token halves.
@@ -793,7 +793,9 @@ class Qwen4ExpBackbone(nn.Module):
                     num_tokens, sp.microbatch_groups(), sp.fold_align_grid()
                 )
                 sp.check_divisible(num_tokens, sp_microbatch.groups)
-            hidden = sp.shard(hidden)
+            hidden = (
+                self._sp_embed_shard(input_ids) if hidden is None else sp.shard(hidden)
+            )
         rows = hidden.shape[0]
         hidden = sp.pad_shard(hidden.repeat(1, self.hc_count), sp_pad)
         # One step-metadata memo for every GDN layer of this forward.
@@ -849,6 +851,44 @@ class Qwen4ExpBackbone(nn.Module):
         return ple.lookup_for_model(
             PLEInputs(input_ids, query_start_loc, ngram_context), query_start_loc[-1:]
         )
+
+    def _sp_embed_rs(self) -> bool:
+        """VLLM_TPU_QWEN4_EXP_SP_EMBED_RS, where the embedding layout allows it: a
+        BF16 vocab-parallel table over the TP group whose forward would mask
+        and all-reduce (the layout ``_sp_embed_shard`` reproduces)."""
+        emb = self.embed_tokens
+        return bool(
+            envs.VLLM_TPU_QWEN4_EXP_SP_EMBED_RS
+            and getattr(emb, "tp_size", 1) > 1
+            # The pinned vLLM's VocabParallelEmbedding has no `reduce_results`
+            # field; its forward always all-reduces (see _merged_head_embed).
+            and getattr(emb, "reduce_results", True) is True
+            and getattr(emb, "parallel_group", None) is None
+            and not getattr(emb, "use_fused_embedding", False)
+            and emb.weight.dtype == torch.bfloat16
+        )
+
+    def _sp_embed_shard(self, input_ids):
+        """This rank's rows of the token embedding on a sequence-parallel step.
+
+        The vocab-parallel lookup is masked exactly as the embedding's forward
+        masks it, then reduce-scattered to the rank's rows (in the layout of
+        ``sp.shard``, token halves included) instead of all-reduced whole and
+        sliced. Each element has exactly one non-zero owner, so the sum is the
+        owner's value in any order: bitwise equal, at half the collective bytes.
+        """
+        emb = self.embed_tokens
+        masked, mask = get_masked_input_and_mask(
+            input_ids,
+            emb.shard_indices.org_vocab_start_index,
+            emb.shard_indices.org_vocab_end_index,
+            emb.shard_indices.num_org_vocab_padding,
+            emb.shard_indices.added_vocab_start_index,
+            emb.shard_indices.added_vocab_end_index,
+        )
+        part = emb.quant_method.embedding(emb, masked.long())
+        part = part.masked_fill(mask.unsqueeze(-1), 0)
+        return sp.reduce(part, True)
 
     def _merged_head_embed(self, input_ids, ids64, query_start_loc, ngram_context, groups):
         """VLLM_TPU_MK_PLE_TRIM: the token embedding and the resident PLE raw rows of

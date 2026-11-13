@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SP_MICROBATCH_OVERLAP: bool = False
     VLLM_TPU_SP_MICROBATCH_OVERLAP_FORCE_OFF: bool = False
     VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN: bool = False
+    VLLM_TPU_QWEN4_EXP_SP_EMBED_RS: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -1614,6 +1615,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # there, and recomputes the few rows of A it needs. Tiles, internal prefill
     # checkpoints and states then match the whole step's.
     "VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN": env_bool("VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN"),
+    # Sequence-parallel qwen4_exp steps: reduce-scatter the vocab-parallel token
+    # embedding straight to this rank's rows instead of all-reducing the whole
+    # step and keeping 1/TP of it. Every element has one non-zero owner, so the
+    # rows are bitwise the same; half the collective bytes.
+    "VLLM_TPU_QWEN4_EXP_SP_EMBED_RS": env_bool("VLLM_TPU_QWEN4_EXP_SP_EMBED_RS"),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
