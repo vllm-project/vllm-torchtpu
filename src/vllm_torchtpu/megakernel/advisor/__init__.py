@@ -30,6 +30,7 @@ from . import (
     support,
     verdict,
     vmem,
+    workbench_engine,
 )
 from .calibrate import CalibrateOptions, calibrate_trace
 from .chips import (
@@ -144,6 +145,7 @@ from .vmem import (
     fit_vmem_budget_bytes,
     validate_advise_inputs,
 )
+from .workbench_engine import render_workbench_engine_js
 
 __all__ = [
     "AdvisorReport",
@@ -241,6 +243,7 @@ __all__ = [
     "recommend_parallelism",
     "regimes",
     "render_advisor_html",
+    "render_workbench_engine_js",
     "render_regime_dot_plot_svg",
     "report",
     "resolve_chip_spec",
@@ -258,6 +261,7 @@ __all__ = [
     "validate_workload",
     "verdict",
     "vmem",
+    "workbench_engine",
     "write_advisor_html",
     "write_bucket_schedule",
 ]
