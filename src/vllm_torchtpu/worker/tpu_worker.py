@@ -857,6 +857,11 @@ class TPUWorker(WorkerBase):
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
         _release_free_host_heap()
+        from vllm_torchtpu.worker import cpu_pinning
+
+        policy = cpu_pinning.policy_for(self.model_config.architecture)
+        if policy is not None:
+            cpu_pinning.apply(self.rank, self.local_rank, *policy)
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
