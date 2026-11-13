@@ -19,6 +19,7 @@ with optional native FP8 KV cache dequantization in VMEM.
 """
 
 import math
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -252,7 +253,7 @@ def flash_attention_pv(
     step: jax.Array,
     is_last_k: SmemWrapper,  # [steps, B]
     cfgs: configs.RpaConfigs,
-    v_scale: jax.Array | None = None,  # [B, KV, S]
+    v_scale: jax.Array | float | None = None,  # [B, KV, S]
 ):
     """Flash attention kernel."""
     b, k_heads, tq, s = p.shape
@@ -262,7 +263,7 @@ def flash_attention_pv(
     # here for per-token and per-tensor scaling, unlike the qk matmul.
     if cfgs.serve.per_token_scale:
         assert v_scale is not None
-        v_sc = v_scale[:, :, jnp.newaxis, :]
+        v_sc = cast("jax.Array", v_scale)[:, :, jnp.newaxis, :]
         # We can scale p or v, and because p will be smaller especially for decode
         # workflows, we scale p to save some time.
         p = p.astype(v_sc.dtype) * v_sc

@@ -497,7 +497,10 @@ def flush_to_hbm(
     _compute_waits(schedule, 0, num_active_steps, cfgs=cfgs)
 
     # Never write past the HBM schedule (bounds checks are off downstream).
-    @pl.when(hbm_offset < cfgs.max_schedule_size_multiplier * cfgs.max_steps_ub)
+    @pl.when(
+        cast("jax.Array | int", hbm_offset)
+        < cfgs.max_schedule_size_multiplier * cfgs.max_steps_ub
+    )
     def _write():
         _write_schedule_to_hbm(
             schedule,
