@@ -485,6 +485,7 @@ def select_decode_tile_size(
     is_kda: bool,
     override: int = 0,
     num_seqs: int | None = None,
+    vmem_tile_cap: int | None = None,
 ) -> int:
     """Final BATCHED-mode tile T for fused_conv1d_gdn.
 
@@ -500,11 +501,17 @@ def select_decode_tile_size(
         no VMEM fit of its own, and the dynamic tile on verify windows.
       is_kda: Whether the call runs KDA rather than GDN.
       override: The caller's explicit decode tile (fused_conv1d_gdn
-        decode_tile_override); > 0 forces T, except for KDA verify windows,
-        which must stay at one sequence.
+        decode_tile_override); > 0 replaces the pick, except for KDA verify
+        windows, which must stay at one sequence. It is capped at the batch,
+        the sequence count, spec_tile_cap and vmem_tile_cap, so it can ask
+        for a smaller tile than the pick but never for one past the VMEM
+        ceilings.
       num_seqs: Optional upper bound on the number of sequences. Because
         compute_batched_seq_metadata pads its SMEM arrays to a multiple of T,
         T does not need to divide num_seqs.
+      vmem_tile_cap: calculate_decode_tile_size(...) for this call (GDN), the
+        largest candidate tile whose VMEM estimate fits; None when there is
+        no estimate (KDA). The dynamic tile is already under it.
     """
     tile = default_tile if dyn_tile is None else dyn_tile
     tile = min(tile, batch_size)
@@ -525,5 +532,11 @@ def select_decode_tile_size(
             if (num_seqs is None or num_seqs <= 0)
             else min(batch_size, num_seqs)
         )
+        # The override replaces the pick, not the VMEM ceilings: at TP2 with
+        # verify windows of 4 and a bf16 state, T = 4 needs 61.6 MiB of scoped
+        # VMEM against a 57.6 MiB limit, and both ceilings give T = 2.
+        cap = min(cap, spec_tile_cap)
+        if vmem_tile_cap is not None:
+            cap = min(cap, vmem_tile_cap)
         tile = max(1, min(override, cap))
     return max(1, tile)

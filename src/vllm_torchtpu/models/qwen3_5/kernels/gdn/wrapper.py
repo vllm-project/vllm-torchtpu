@@ -591,7 +591,9 @@ def fused_conv1d_gdn(
         decode_tile_override: When positive, the decode tile T, in place of
             the dynamic or static pick (capped at the batch and the sequence
             count). Callers set it for a layout whose measured best tile the
-            tiler does not pick.
+            tiler does not pick. It is also capped at the decode VMEM
+            ceilings (tiling.select_decode_tile_size), so it can choose a
+            smaller tile but not one that overflows VMEM.
 
     Returns:
         new_states: The updated state cache, aliased in place, with the same
@@ -720,6 +722,7 @@ def fused_conv1d_gdn(
 
     dynamic_tiling = envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda
     dyn_decode_tile: int | None = None
+    decode_vmem_fit: int | None = None
     if not is_kda:
         # GDN caps the prefill/mixed chunk at its VMEM fit in both modes. The
         # flag selects the decode tile: the tiler's pick, or decode_tile_size
@@ -746,6 +749,22 @@ def fused_conv1d_gdn(
         )
         if dynamic_tiling:
             dyn_decode_tile = fit_decode_tile
+        # The decode tile's VMEM ceiling in both modes (the dynamic pick is
+        # already under it); select_decode_tile_size caps an override at it.
+        decode_vmem_fit = tiling.calculate_decode_tile_size(
+            batch_size=max(1, min(padded_batch_size, num_seqs)),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            conv_state_dim_size=dim,
+            act_out_dtype=act_out_dtype,
+            recurrent_state_dtype=recurrent_dtype,
+            num_lanes=num_lanes,
+            vmem_capacity_limit_bytes=decode_vmem_limit_bytes,
+            kernel_size=kernel_size,
+            window_size=window_size,
+        )
         if qkv_2d and mixed_tile_size % 8:
             # The bf16 qkv layout runs only on multiple-of-8 chunks, and the
             # VMEM fit can cap the chunk below the one checked above.
@@ -773,6 +792,7 @@ def fused_conv1d_gdn(
         batch_size=batch_size,
         num_spec_tokens=num_spec_tokens,
         spec_tile_cap=spec_tile_cap,
+        vmem_tile_cap=decode_vmem_fit,
         is_kda=is_kda,
         override=decode_tile_override,
         num_seqs=num_seqs,
