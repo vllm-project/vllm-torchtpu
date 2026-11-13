@@ -3,6 +3,7 @@
 
 import functools
 import math
+import os
 
 import jax
 import jax.numpy as jnp
@@ -439,6 +440,15 @@ def _kernel(
     # sums (rows, 128), reduced across lanes once per query block.
     lane_ref = refs[7] if lane_sum else None
     bf16_mass = "bf16mass" in lane_sum
+    # Local attribution arms (test only, LANE_SUM path): "nomax" = fixed
+    # stabilizer 0, no row max, no rescale, no subtract (wrong by design);
+    # "frozenm" = per-row stabilizer sm*|q|*KNORM set once per block (a
+    # Cauchy-Schwarz upper bound of the row max), subtract kept, no row max,
+    # no rescale, no branch.
+    smattr = os.environ.get("VLLM_TPU_QSA_SMATTR", "")
+    smattr_knorm = float(os.environ.get("VLLM_TPU_QSA_SMATTR_KNORM", "0"))
+    assert smattr in ("", "nomax", "frozenm"), smattr
+    assert not smattr or lane_sum, "SMATTR arms need LANE_SUM"
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
     # FP32 input window while preserving the existing FP32 QK accumulation.
@@ -553,6 +563,16 @@ def _kernel(
         accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
     else:
         init_state()
+    if smattr == "frozenm":
+        for query_tile_index in range(num_query_tiles):
+            start = query_tile_index * query_tile
+            for head in range(kv_heads):
+                rows_q = q[head, :, start : start + query_tile].reshape(
+                    query_tile * q_heads_per_kv, head_dim
+                )
+                max_ref[query_tile_index, head, :] = (
+                    jnp.sqrt(jnp.sum(rows_q * rows_q, axis=1)) * smattr_knorm
+                )
 
     def lazy_update(query_tile_index, head, score, value, tile_visible):
         """Online softmax step with a block-scalar stabilizer.
@@ -715,6 +735,26 @@ def _kernel(
                 )
                 if lazy_pass:
                     lazy_update(query_tile_index, head, score, value, tile_visible)
+                    continue
+                if smattr:
+                    prob = jnp.exp(score if smattr == "nomax" else score - m[:, None])
+                    mass_terms = prob
+                    if bf16_mass:
+                        prob = prob.astype(jnp.bfloat16)
+                        mass_terms = prob.astype(jnp.float32)
+                    weighted = lax.dot(
+                        prob,
+                        value,
+                        dimension_numbers=(([1], [0]), ([], [])),
+                        preferred_element_type=jnp.float32,
+                    )
+                    lanes = mass_terms[:, :128]
+                    for offset in range(128, kv_tile, 128):
+                        lanes = lanes + mass_terms[:, offset : offset + 128]
+                    lane_ref[query_tile_index, head] = (
+                        lane_ref[query_tile_index, head] + lanes
+                    )
+                    accumulator_ref[query_tile_index, head, :, :] = acc + weighted
                     continue
                 next_m = jnp.maximum(m, jnp.max(score, axis=1))
                 finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
