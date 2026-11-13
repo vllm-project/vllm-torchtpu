@@ -132,23 +132,29 @@ class GDNConfig:
 
     @property
     def triangular_block_size(self) -> int:
-        """Diagonal block size B for the chunked triangular solve / inverse."""
-        # Within-block forward substitution issues head_groups * B / 2 broadcasts
-        # per token. At 1 head group (<= 8 heads), B = 16 is optimal.
-        # - KDA (`chunked_kda_per_seq`) also tiles Aqk and L into O(1 / B^2)
-        #   sub-block matmuls per token, so scale B^2 inversely with head_groups
-        #   (head_groups * B**2 <= 16**2).
-        # - GDN (`solve_triangular_rhs`) updates the whole [B, n] block per
-        #   substitution step, so a block narrower than one 8-sublane tile costs
-        #   the same VALU work as B = 8 while issuing more between-block matmuls
-        #   and padding every solved block to 8 sublanes in VMEM. B = 8 is the
-        #   floor; B = 16 only pays when a single head group leaves VALU idle.
+        """Diagonal block size B for the chunked GDN / KDA triangular solve.
+
+        In KDA, the diagonal sub-blocks are evaluated on the VPU/XLU with exact
+        pairwise gate differences and the off-diagonal ones as MXU GEMMs, so B
+        trades the two units off against each other: raising B moves work from
+        MXU to XLU. More value heads already means more XLU work, hence the
+        smaller KDA blocks there.
+        """
         head_groups = pl.cdiv(self.num_v_heads, 8)
         if self.is_kda:
+            # KDA's row-by-row in-block substitution issues head_groups * B / 2
+            # broadcasts per token, and KDA also tiles Aqk and L into O(1 / B^2)
+            # sub-block matmuls per token, so scale B^2 inversely with
+            # head_groups (head_groups * B**2 <= 16**2; B = 16 at 1 head group).
             for b in (16, 8, 4):
                 if head_groups * b * b <= 256:
                     return b
             return 2
+        # GDN (`solve_triangular_rhs`) updates the whole [B, n] block per
+        # substitution step, so a block narrower than one 8-sublane tile costs
+        # the same VALU work as B = 8 while issuing more between-block matmuls
+        # and padding every solved block to 8 sublanes in VMEM. B = 8 is the
+        # floor; B = 16 only pays when a single head group leaves VALU idle.
         return 16 if head_groups <= 1 else 8
 
     @property
