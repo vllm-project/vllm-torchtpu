@@ -25,6 +25,8 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `DP_SCHED_ENABLED` | `False` | Enables TPU data-parallel request scheduling optimizations. |
 | `TPU_PP_DYNAMIC_CHUNKS` | `True` | Dynamically sizes microbatch chunks in Pipeline Parallelism (`--pipeline-parallel-size`). |
 | `TPU_PP_CHUNK_SLACK` | `0.1` | Slack ratio for dynamic pipeline-parallel chunk sizing. |
+| `TPU_PREFIX_AWARE_TIER_WARMTH` | `False` | With `PrefixAwareScheduler` and `TPURaidenOffloadingConnector`, also counts the whole chunks the CPU offload tier holds right past a request's HBM prefix hit as cached, so a session evicted from HBM but kept by the tier is not ranked as fully uncached. |
+| `TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS` | `256` | Most offload-tier chunks the `TPU_PREFIX_AWARE_TIER_WARMTH` probe checks per request (`256` is 1M tokens at 4096 tokens/chunk); the rest of a longer prompt ranks as uncached. Must be > 0. |
 | `TPU_PCP_TOPOLOGY_AWARE_MESH` | `True` | Orders Prefill Context Parallel (`PCP`) ranks along adjacent ICI torus neighbors to minimize ring hop count. |
 | `TPU_DCP_MLA_TOPK_CAP` | `-1` (auto: `512` at DCP >= 8, else off) | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`32`). |
