@@ -435,6 +435,13 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             )
         else:
             op, requant_block = _prebuild_w4a8(layer, activation_str, configured_block)
+        if op is not None and getattr(layer, "_rx_plan", None) is not None:
+            # USE_MOE_FUSED_EP_KERNEL may be set while this layer stays on the
+            # GMM path (op None); an admitted fused EP layer would need the
+            # physical expert map, which it does not take.
+            raise NotImplementedError(
+                "VLLM_TPU_MOE_REDUNDANT_EXPERTS with an admitted fused EP MoE layer"
+            )
         weights, mode = _prepare_moe_weights(
             layer, w13_scale_f, w2_scale_f, requant_block
         )

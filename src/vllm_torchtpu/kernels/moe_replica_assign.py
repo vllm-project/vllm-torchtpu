@@ -20,13 +20,14 @@ slots (``layers/adapter/moe_redundant.py``) some experts have a second copy on
 another rank. This kernel assigns every expert the step touches to one copy:
 
 1. experts with one copy go to it, counting one unit of load on its rank;
-2. experts with several copies then go, in expert order, to the copy whose
-   rank has the least load so far (ties: the native copy).
+2. experts with several copies then go, in order of first appearance among
+   the routes, to the copy whose rank has the least load so far (ties: the
+   native copy).
 
 Every token routed to an expert uses the same copy, so no weights are read
 twice. The assignment is a function of the routed ids alone, identical on
-every rank. It runs on the scalar core: a handful of scalar loops over at most
-``T * top_k`` routes and ``E`` experts, with everything in SMEM.
+every rank. It runs on the scalar core: scalar loops over the ``T * top_k``
+routes and the experts they touch, with everything in SMEM.
 """
 
 from __future__ import annotations
@@ -47,32 +48,31 @@ _UNHIT = -1
 _HIT = -2
 
 
-def _kernel(ids_ref, copies_ref, out_ref, choice_ref, load_ref, *, n, e, c, ep, slots):
-    def clear(i, _):
-        choice_ref[i] = _UNHIT
-        return 0
-
-    lax.fori_loop(0, e, clear, 0)
+def _kernel(ids_ref, copies_ref, init_ref, out_ref, hit_ref, load_ref, *, n, c, ep, slots):
+    # init_ref arrives as all -1 (_UNHIT), so no clearing loop over E; every
+    # loop below runs over the routes or the experts they touch only.
+    choice_ref = init_ref
     for r in range(ep):
         load_ref[r] = 0
 
-    def mark(i, _):
+    def mark(i, cnt):
         x = ids_ref[i]
+        new = jnp.logical_and(x >= 0, choice_ref[jnp.maximum(x, 0)] == _UNHIT)
 
-        @pl.when(x >= 0)
+        @pl.when(new)
         def _():
             choice_ref[x] = _HIT
+            hit_ref[cnt] = x
 
-        return 0
+        return cnt + new.astype(jnp.int32)
 
-    lax.fori_loop(0, n, mark, 0)
+    cnt = lax.fori_loop(0, n, mark, jnp.int32(0), unroll=8)
 
-    def fixed(x, _):
+    def fixed(j, _):
+        x = hit_ref[j]
         native = copies_ref[x * c]
-        single = copies_ref[x * c + 1] < 0
-        take = jnp.logical_and(choice_ref[x] == _HIT, single)
 
-        @pl.when(take)
+        @pl.when(copies_ref[x * c + 1] < 0)
         def _():
             r = native // slots
             load_ref[r] = load_ref[r] + 1
@@ -80,9 +80,11 @@ def _kernel(ids_ref, copies_ref, out_ref, choice_ref, load_ref, *, n, e, c, ep, 
 
         return 0
 
-    lax.fori_loop(0, e, fixed, 0)
+    lax.fori_loop(0, cnt, fixed, 0)
 
-    def flexible(x, _):
+    def flexible(j, _):
+        x = hit_ref[j]
+
         @pl.when(choice_ref[x] == _HIT)
         def _():
             best = copies_ref[x * c]
@@ -100,14 +102,14 @@ def _kernel(ids_ref, copies_ref, out_ref, choice_ref, load_ref, *, n, e, c, ep, 
 
         return 0
 
-    lax.fori_loop(0, e, flexible, 0)
+    lax.fori_loop(0, cnt, flexible, 0)
 
     def write(i, _):
         x = ids_ref[i]
         out_ref[i] = jnp.where(x >= 0, choice_ref[jnp.maximum(x, 0)], -1)
         return 0
 
-    lax.fori_loop(0, n, write, 0)
+    lax.fori_loop(0, n, write, 0, unroll=8)
 
 
 def _reference(ids, copies, *, ep, slots):
@@ -121,9 +123,16 @@ def _reference(ids, copies, *, ep, slots):
         jnp.logical_and(hit, single).astype(jnp.int32)
     )
     choice = jnp.where(jnp.logical_and(hit, single), native, _UNHIT)
+    # Experts in order of first appearance among the routes (as the kernel).
+    pos = jnp.arange(ids.shape[0], dtype=jnp.int32)
+    first = jnp.full((num_experts,), ids.shape[0], jnp.int32).at[
+        jnp.maximum(ids, 0)
+    ].min(jnp.where(valid, pos, ids.shape[0]))
+    order = jnp.argsort(first, stable=True)
 
-    def flexible(x, carry):
+    def flexible(j, carry):
         load, choice = carry
+        x = order[j]
         todo = jnp.logical_and(hit[x], jnp.logical_not(single[x]))
         best = native[x]
         best_load = load[best // slots]
@@ -172,17 +181,17 @@ def replica_assign(
         return _reference(ids.reshape(-1), copies, ep=ep, slots=slots).reshape(
             num_tokens, topk
         )
-    kernel = functools.partial(_kernel, n=n, e=num_experts, c=c, ep=ep, slots=slots)
+    kernel = functools.partial(_kernel, n=n, c=c, ep=ep, slots=slots)
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     out = pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((n,), jnp.int32),
-        in_specs=[smem, smem],
+        in_specs=[smem, smem, smem],
         out_specs=smem,
         scratch_shapes=[
-            pltpu.SMEM((num_experts,), jnp.int32),
+            pltpu.SMEM((min(n, num_experts),), jnp.int32),
             pltpu.SMEM((ep,), jnp.int32),
         ],
         interpret=interpret,
-    )(ids.reshape(-1), copies.reshape(-1))
+    )(ids.reshape(-1), copies.reshape(-1), jnp.full((num_experts,), _UNHIT, jnp.int32))
     return out.reshape(num_tokens, topk)
