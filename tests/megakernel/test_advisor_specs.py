@@ -24,6 +24,7 @@ from unittest import mock
 
 import pytest
 
+from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import (
     chips,
     constants,
@@ -34,6 +35,19 @@ from vllm_torchtpu.megakernel.advisor import (
 from vllm_torchtpu.megakernel.core import errors
 
 SOURCE_PREFIXES = ("FACT:", "DERIVED:", "ASSUMED:", "CHOSEN:")
+EXPECTED_VECTOR_REGISTERS_PER_CORE = 64
+EXPECTED_VECTOR_REGISTER_BYTES = 4096
+EXPECTED_VECTOR_LOADS_PER_CYCLE = 3
+EXPECTED_VECTOR_STORES_PER_CYCLE = 2
+EXPECTED_VECTOR_PORT_OPS_PER_CYCLE = 4
+EXPECTED_CLOCK_HZ = 2.2e9
+PUBLIC_SCALING_BOOK_TPU_CHAPTER_URL = "jax-ml.github.io/scaling-book/tpus"
+CHIP_WITHOUT_VECTOR_REGISTER_FIGURES = "v6e"
+UNSET_SOURCE_PREFIX = "CHOSEN: 0 (unset)"
+EXPECTED_VECTOR_LOAD_CAP_TEXT = (
+    "Vector register load cap: 3 x 4,096 B x 2.2e9 Hz = 27.03 TB/s per core. "
+    "It is above the HBM rate, so it does not bind while weights stream from HBM."
+)
 
 DEEPSEEK_V3_CFG: dict[str, object] = {
     "model_type": "deepseek_v3",
@@ -674,3 +688,49 @@ def test_quantization_peak_flops_and_hf_subchannel_parsing() -> None:
     assert p_subchannel.weight_block_k == expected_block_k
     assert p_subchannel.act_dtype == "bf16"
     assert p_subchannel.weight_dtype == "fp8"
+
+
+def test_vector_register_constants_are_public_values() -> None:
+    """Verify TPU 7x vector register fields, provenance, and derived load cap."""
+    chip_spec = chips.resolve_chip_spec("tpu7x")
+    assert chip_spec.vector_registers_per_core == EXPECTED_VECTOR_REGISTERS_PER_CORE
+    assert chip_spec.vector_register_bytes == EXPECTED_VECTOR_REGISTER_BYTES
+    assert chip_spec.vector_loads_per_cycle == EXPECTED_VECTOR_LOADS_PER_CYCLE
+    assert chip_spec.vector_stores_per_cycle == EXPECTED_VECTOR_STORES_PER_CYCLE
+    assert chip_spec.vector_port_ops_per_cycle == EXPECTED_VECTOR_PORT_OPS_PER_CYCLE
+    assert chip_spec.clock_hz == EXPECTED_CLOCK_HZ
+
+    new_field_names = (
+        "vector_registers_per_core",
+        "vector_register_bytes",
+        "vector_loads_per_cycle",
+        "vector_stores_per_cycle",
+        "vector_port_ops_per_cycle",
+        "clock_hz",
+    )
+    assert chip_spec.sources is not None
+    for field_name in new_field_names:
+        assert field_name in chip_spec.sources
+        field_source_text = chip_spec.sources[field_name]
+        assert PUBLIC_SCALING_BOOK_TPU_CHAPTER_URL in field_source_text
+
+    calculated_cap = (
+        chip_spec.vector_loads_per_cycle
+        * chip_spec.vector_register_bytes
+        * chip_spec.clock_hz
+    )
+    assert chip_spec.vector_load_cap_bytes_per_s == calculated_cap
+    assert chip_spec.vector_load_cap_bytes_per_s > chip_spec.hbm_bw_bytes_per_s
+
+    sweep = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    table_text = advisor.format_regime_table(sweep)
+    html_text = advisor.render_advisor_html(sweep)
+    assert EXPECTED_VECTOR_LOAD_CAP_TEXT in table_text
+    assert EXPECTED_VECTOR_LOAD_CAP_TEXT in html_text
+
+    unset_chip_spec = chips.resolve_chip_spec(CHIP_WITHOUT_VECTOR_REGISTER_FIGURES)
+    assert not unset_chip_spec.vector_load_cap_bytes_per_s
+    assert not advisor.report.vector_register_load_cap_line(unset_chip_spec)
+    assert unset_chip_spec.sources is not None
+    for field_name in new_field_names:
+        assert unset_chip_spec.sources[field_name].startswith(UNSET_SOURCE_PREFIX)
