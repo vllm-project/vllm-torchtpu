@@ -3183,13 +3183,18 @@ def moe(
 
     def routed_gather_storage():
         """Where the routed all-gather collects the lanes' reduced tokens
-        [8, lane payload, 128]. With a separate send buffer (above B32) it is
-        that buffer: lane ``l``'s block there held this rank's shard for ``l``,
-        which ``l`` has received before it gathers, while the local reduction
-        buffer may still hold shards a slower lane is reducing."""
+        [8, lane payload, 128], apart from the shards a slower lane may still
+        be reducing (``expert_local_reduction_vmem[:, :lane_payload]``). With a
+        separate send buffer (above B32) it is that buffer: lane ``l``'s block
+        there held this rank's shard for ``l``, which ``l`` has received before
+        it gathers. Otherwise each lane entry, eight lane payloads long, has
+        room after its shard: the gather takes the 8-row aligned rows past it
+        (in this rank's own entry, send blocks of lanes already served)."""
         if routed_send_vmem is not None:
             return routed_send_storage().reshape(8, lane_payload, 128)
-        return expert_local_reduction_vmem
+        gather_offset = -(-lane_payload // 8) * 8
+        assert gather_offset + lane_payload <= expert_local_reduction_vmem.shape[1]
+        return expert_local_reduction_vmem.at[:, pl.ds(gather_offset, lane_payload), :]
 
     def routed_gather_copy(offset):
         view = routed_gather_storage().at[rank % 8, :lane_payload, :]
