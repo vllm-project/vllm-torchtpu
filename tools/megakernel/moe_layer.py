@@ -7,6 +7,9 @@ reference of the layer.
 ``expert_plan``) of every token of a launch, from one of:
 
 * ``uniform[:SEED]``: 16 distinct experts per token, uniform and independent;
+* ``capacity:R[:CHIP]``: R of the launch's routes on one chip (by default chip
+  0; R near or past the fused op's compact route capacity), evenly over its 56
+  experts, the rest evenly over the other chips' experts;
 * per-expert route counts (a served window's, or ``counts:FILE``), assigned
   exactly: the routes are laid out expert-major, experts in a random order,
   and route ``i`` goes to token ``perm[i % tokens]``, so every token gets 16
@@ -74,14 +77,17 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 @dataclasses.dataclass(frozen=True)
 class Case:
     """One routing: ``label`` names it in logs and records; ``counts`` (per
-    physical slot) or ``seed`` (``uniform``) fixes every token's experts; the
-    served ``window``/``layer`` it replays, if any."""
+    physical slot), ``capacity`` routes on ``chip`` (sized by the launch) or
+    ``seed`` (``uniform``) fixes every token's experts; the served
+    ``window``/``layer`` it replays, if any."""
 
     label: str
     counts: np.ndarray | None = None
     seed: int = 0
     window: int | None = None
     layer: int | None = None
+    capacity: int | None = None
+    chip: int = 0
 
     def tokens(self, launch: int, length: int | None) -> int:
         """The routed (valid) tokens of a ``launch``-token launch: a counted
@@ -101,14 +107,36 @@ class Case:
         return tokens
 
     def fits(self, launch: int) -> bool:
-        """Whether a counted case's tokens fit a ``launch``-token launch."""
+        """Whether the case's routes fit a ``launch``-token launch."""
+        if self.capacity is not None:
+            return self.capacity <= TOP_K * launch
         return self.counts is None or int(self.counts.sum()) <= TOP_K * launch
 
     def sets(self, tokens: int) -> np.ndarray:
         """[tokens, 16] distinct experts per token."""
+        if self.capacity is not None:
+            counts = capacity_counts(self.capacity, tokens, self.chip)
+            return sets_from_counts(counts, seed_of(self.label))
         if self.counts is None:
             return uniform_sets(tokens, self.seed)
         return sets_from_counts(self.counts, seed_of(self.label))
+
+
+def capacity_counts(routes: int, tokens: int, chip: int) -> np.ndarray:
+    """Per-slot counts of ``tokens`` tokens with ``routes`` of their routes on
+    ``chip``, evenly over its experts, and the rest evenly over the others."""
+    if not 0 <= chip < CHIPS or not 0 <= routes <= TOP_K * tokens:
+        raise ValueError(f"capacity: {routes} routes of {tokens} tokens on chip {chip}")
+
+    def even(total, experts):
+        return total // experts + (np.arange(experts) < total % experts)
+
+    counts = np.empty(EXPERTS, np.int64)
+    mine = np.arange(LOCAL * chip, LOCAL * (chip + 1))
+    others = np.setdiff1d(np.arange(EXPERTS), mine)
+    counts[mine] = even(routes, LOCAL)
+    counts[others] = even(TOP_K * tokens - routes, len(others))
+    return counts
 
 
 def uniform_sets(tokens: int, seed: int) -> np.ndarray:
@@ -153,6 +181,7 @@ def parse(
       logical expert at each physical slot);
     * ``sweep:N``: ``routes_file``'s cases nearest to ``N`` busiest-chip
       GU-padded row loads evenly spaced over its range (16K tiling);
+    * ``capacity:R[:CHIP]``: R routes on one chip (:func:`capacity_counts`);
     * ``counts:FILE``: an ``.npy`` of per-physical-slot counts, [896] or
       [K, 896] (K cases).
     """
@@ -170,13 +199,18 @@ def parse(
                 cases.append(served.case(int(window), int(layer), order))
             else:
                 cases.extend(served.sweep(int(rest), order))
+        elif kind == "capacity":
+            routes, _, chip = rest.partition(":")
+            cases.append(Case(spec, capacity=int(routes), chip=int(chip or 0)))
         elif kind == "counts":
             counts = np.load(rest)
             for k, row in enumerate(np.atleast_2d(counts)):
                 label = spec if counts.ndim == 1 else f"{spec}#{k}"
                 cases.append(Case(label, counts=row.astype(np.int64)))
         else:
-            raise ValueError(f"--routes {spec!r}: uniform, serving, sweep or counts")
+            raise ValueError(
+                f"--routes {spec!r}: uniform, serving, sweep, capacity or counts"
+            )
     if not cases:
         raise ValueError("--routes names no case")
     unique: dict[str, Case] = {}
@@ -229,6 +263,85 @@ class ServedRoutes:
         return [cases[i] for i in sorted(picks, key=lambda i: loads[i])]
 
 
+# ----------------------------------------------------------------- layout
+
+
+@dataclasses.dataclass(frozen=True)
+class Layout:
+    """How the device holds a layer's families: the four expert families with
+    ``experts`` layers (8: a prefill-role bank, 92: the aggregate's), the
+    others with ``dense`` layers, and the MoE ``slot`` the op runs. The
+    layer's weights sit at :attr:`expert_index` (the kernel's index for the
+    slot) and at ``slot``; every other entry is zero."""
+
+    experts: int
+    dense: int
+    slot: int
+
+    @property
+    def expert_index(self) -> int:
+        from vllm_torchtpu.megakernel.kimi_k3.kernels import prefill_megakernel as k
+
+        if self.experts == 1:  # expert_family_slot's single-layer bank
+            return 0
+        return int(k.expert_family_slot(self.experts, self.slot))
+
+    def problem(self) -> str:
+        """Why the op cannot run at ``slot``, or an empty string."""
+        if min(self.experts, self.dense) < 1 or self.slot < 0:
+            return "--family-layers and --dense-layers are at least 1, --slot >= 0"
+        if self.slot >= self.dense:
+            return f"--slot {self.slot} is past the {self.dense} dense layers"
+        if not 0 <= self.expert_index < self.experts:
+            return f"--slot {self.slot} maps past the {self.experts} expert layers"
+        return ""
+
+    def entries(self, names) -> dict[str, tuple[int, int]]:
+        """Each family's (layers, index of the layer's entry)."""
+        experts = {"expert_gu", "expert_gus", "expert_down", "expert_ds"}
+        return {
+            name: (self.experts, self.expert_index)
+            if name in experts
+            else (self.dense, self.slot)
+            for name in names
+        }
+
+
+def overlay_programs(log: str) -> list[dict[str, int | str]]:
+    """The overlay layout of every program compiled in a libtpu log written
+    with ``--vmodule=overlay_partitioner=1,overlay=1``: its input bundle count,
+    the regular/jumbo/hlo overlay sizes and the partitions of each kind."""
+    import re
+
+    programs: list[dict[str, int | str]] = []
+    for line in log.splitlines():
+        if match := re.search(
+            r"OverlayProgram\(\), input program bundle count: (\d+)", line
+        ):
+            programs.append({"bundles": int(match[1]), "sizes": "", "partitions": 0})
+        elif programs and (
+            match := re.search(r"regular/jumbo/hlo overlay size (\d+/\d+/\d+)", line)
+        ):
+            programs[-1]["sizes"] = match[1]
+        elif programs and (
+            match := re.search(r"OverlayPartition \d+: .*kind=(\d+)", line)
+        ):
+            kind = f"kind{match[1]}"
+            programs[-1][kind] = int(programs[-1].get(kind, 0)) + 1
+            programs[-1]["partitions"] = int(programs[-1]["partitions"]) + 1
+    return programs
+
+
+def held_family(value: np.ndarray, layers: int, index: int) -> np.ndarray:
+    """``value`` ([1, ...]) as entry ``index`` of ``layers`` zeroed entries
+    (numpy's zeros: pages stay untouched until something reads them)."""
+    if layers == 1:
+        return value
+    held = np.zeros((layers, *value.shape[1:]), value.dtype)
+    held[index] = value[0]
+    return held
+
+
 # ----------------------------------------------------------------- load
 
 
@@ -278,14 +391,21 @@ def case_loads(
     consecutive token ranges: one part, or a compound window's 8K/4K/2K
     launches): per metric, the sum over parts of the busiest chip, and the
     mean chip's routed and GU rows; ``chip`` is the busiest chip by GU rows
-    of the largest part."""
-    summary: dict[str, float | int] = {}
+    of the largest part; ``overflow`` whether a part's busiest chip holds
+    more routes than the op's compact capacity."""
+    from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_moe import fused
+
+    summary: dict[str, float | int] = {"overflow": False}
     begin = 0
     for tokens in parts:
         part = sets[begin : min(begin + tokens, length)]
         begin += tokens
         counts = np.bincount(part.reshape(-1), minlength=EXPERTS)
         loads = launch_loads(counts, tokens)
+        # A chip past the compact route capacity sends the launch to its
+        # uncapped path (fused._layer_kernel).
+        overflow = loads["routed"].max() > fused._route_capacity(tokens)
+        summary["overflow"] = bool(summary["overflow"] or overflow)
         if "chip" not in summary:
             summary["chip"] = int(np.argmax(loads["gu_rows"]))
         for name, value in busiest(loads).items():

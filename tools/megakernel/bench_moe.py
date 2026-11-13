@@ -5,9 +5,16 @@ Times one MoE layer's fused op on the 32-rank ``k3_sp`` mesh: the serving
 prefill's residual mixture + RMSNorm + MoE
 (``make_indexed_mixture_moe_sp_ring``, ``--op mixture``) or the plain MoE
 (``make_indexed_moe_sp_ring``, ``--op plain``), with only MoE layer
-``--layer``'s weights resident (``rank_loader.read_moe_layer``: every family
-with a layer axis of one, so the op runs at slot 0), for every ``--windows``
-launch size and ``--routes`` routing case (``moe_layer``).
+``--layer``'s weights read (``rank_loader.read_moe_layer``), for every
+``--windows`` launch size and ``--routes`` routing case (``moe_layer``).
+
+By default every family holds that layer alone and the op runs at slot 0.
+``--family-layers N`` / ``--dense-layers M`` / ``--slot S`` lay the families
+out as serving holds them: the four expert families with N layers and the
+others with M, zero but for the layer's weights at the index the kernel takes
+for slot S (``prefill_megakernel.expert_family_slot``: the prefill role's 3/8/1
+expert banks, the aggregate's 92-layer families), so the op sees serving's
+shapes and byte offsets.
 
 Each case's inputs make the kernel's router select the case's experts: every
 residual block and the prefix of a row are the same BF16 residual, so the
@@ -31,7 +38,11 @@ comparison of two runs:
 
 A counted case runs at the windows that hold its tokens (a served 16K
 window's counts only at 16384). ``--trace DIR``: rank 0 saves an xprof trace
-of each case's last repeat.
+of each case's last repeat. The log also gives each family's byte range of
+the layer's entry, and, when libtpu logs the overlay partitioner
+(``[libtpu:--vmodule=overlay_partitioner=1,overlay=1]`` with
+``TPU_STDERR_LOG_LEVEL=0``), the overlays of the window's compile, read from
+this process's file descriptor 2 during its first launch.
 """
 
 from __future__ import annotations
@@ -39,8 +50,10 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import statistics
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -75,6 +88,26 @@ def add_arguments(sub, profile: bool = False) -> None:
         "--layer", type=int, default=47, help="the MoE layer (0..91) whose weights run"
     )
     moe.add_argument("--op", choices=("mixture", "plain"), default="mixture")
+    moe.add_argument(
+        "--family-layers",
+        type=int,
+        default=1,
+        help="layers of the four expert families (8: a prefill-role bank, 92: "
+        "the aggregate's families); zero but for the layer's weights",
+    )
+    moe.add_argument(
+        "--dense-layers",
+        type=int,
+        default=0,
+        help="layers of the router, latent and shared families (default: "
+        "--slot + 1); zero but for the layer's weights at --slot",
+    )
+    moe.add_argument(
+        "--slot",
+        type=int,
+        default=-1,
+        help="the MoE slot the op runs (default: --family-layers - 1)",
+    )
     moe.add_argument("--launches", type=int, default=32, help="launches per repeat")
     moe.add_argument("--repeats", type=int, default=5)
     moe.add_argument(
@@ -184,11 +217,82 @@ def _tag(window: int, label: str) -> str:
     return f"w{window}_" + "".join(c if c.isalnum() else "_" for c in label)
 
 
+def _device_i32(value: int):
+    """A replicated [1] int32 operand on the device."""
+    import torch
+
+    return torch.tensor([value], dtype=torch.int32).to("tpu")
+
+
+class _StderrTee:
+    """Inside the block, everything written to file descriptor 2 (libtpu's
+    log as well) still reaches it and is also kept, for :meth:`text`."""
+
+    def __init__(self, active: bool) -> None:
+        self.active, self.chunks = active, []
+
+    def __enter__(self) -> _StderrTee:
+        if not self.active:
+            return self
+        sys.stderr.flush()
+        self.saved = os.dup(2)
+        read, write = os.pipe()
+        os.dup2(write, 2)
+        os.close(write)
+
+        def pump():
+            while data := os.read(read, 1 << 16):
+                os.write(self.saved, data)
+                self.chunks.append(data)
+            os.close(read)
+
+        self.pump = threading.Thread(target=pump, daemon=True)
+        self.pump.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if not self.active:
+            return
+        sys.stderr.flush()
+        os.dup2(self.saved, 2)  # closes the pipe's write end: the pump drains
+        self.pump.join()
+        os.close(self.saved)
+
+    def text(self) -> str:
+        return b"".join(self.chunks).decode(errors="replace")
+
+
+def _overlay_line(window: int, log: str) -> tuple[str, list]:
+    """A log line on the overlays of the programs compiled in ``log``."""
+    from tools.megakernel import moe_layer
+
+    programs = moe_layer.overlay_programs(log)
+    if not programs:
+        return (
+            f"w{window}: no overlay records in this compile (a cached executable, "
+            "or libtpu without --vmodule=overlay_partitioner=1,overlay=1 and "
+            "TPU_STDERR_LOG_LEVEL=0)",
+            programs,
+        )
+    largest = max(programs, key=lambda p: p["bundles"])
+    kinds = " ".join(
+        f"{k} {v}" for k, v in sorted(largest.items()) if k.startswith("kind")
+    )
+    return (
+        f"w{window}: compiled {len(programs)} overlaid program(s); the largest has "
+        f"{largest['bundles']} bundles, overlay sizes (regular/jumbo/hlo) "
+        f"{largest['sizes']}, {largest['partitions']} partitions ({kinds})",
+        programs,
+    )
+
+
 class _Layer:
     """MoE layer ``layer``'s weights for this rank: on the host (routing,
-    reference) and resident on the device."""
+    reference) and resident on the device as ``layout`` holds them."""
 
-    def __init__(self, presharded: str, rank: int, layer: int, zero_bias: bool) -> None:
+    def __init__(
+        self, presharded: str, rank: int, layer: int, zero_bias: bool, layout
+    ) -> None:
         from torch_tpu._internal.sync import synchronize
 
         from tools.megakernel import moe_layer
@@ -205,11 +309,23 @@ class _Layer:
         )
         if zero_bias:
             self.host["router_bias"] = np.zeros_like(self.host["router_bias"])
-        self.families = [bridge.upload(self.host[name]) for name in k.MOE_FAMILIES]
+        self.families, self.device_bytes = [], 0
+        for name in k.MOE_FAMILIES:
+            if name in rank_loader.EXPERT_FAMILIES:
+                held = moe_layer.held_family(
+                    self.host[name], layout.experts, layout.expert_index
+                )
+            else:
+                held = moe_layer.held_family(self.host[name], layout.dense, layout.slot)
+            self.families.append(bridge.upload(held))
+            self.device_bytes += held.nbytes
+            # torch_tpu compiles a tensor's pending work into the next op
+            # taking it; settled operands keep every launch on one graph.
+            synchronize(self.families[-1:], wait=True)
+            del held
         self.mixture = [bridge.upload(self.host[n]) for n in ("mlp_res", "ffn_norm")]
-        # torch_tpu compiles a tensor's pending work into the next op taking
-        # it; settled operands keep every launch on one compiled graph.
-        synchronize(self.families + self.mixture, wait=True)
+        self.slot = _device_i32(layout.slot)
+        synchronize(self.mixture + [self.slot], wait=True)
         self.resident_s = time.perf_counter() - started
         self.router = self.host["router"][0].astype(np.float32)
         self.bias = self.host["router_bias"][0, 0].astype(np.float32)
@@ -218,6 +334,17 @@ class _Layer:
 
     def gib(self) -> float:
         return sum(value.nbytes for value in self.host.values()) / 2**30
+
+    def offsets(self, layout) -> dict[str, tuple[int, int, int]]:
+        """Per family on the device: the byte range of the layer's entry and
+        the family's bytes."""
+        from vllm_torchtpu.megakernel.kimi_k3.kernels import prefill_megakernel as k
+
+        result = {}
+        for name, (layers, index) in layout.entries(k.MOE_FAMILIES).items():
+            entry = self.host[name][0].nbytes
+            result[name] = (index * entry, (index + 1) * entry, layers * entry)
+        return result
 
 
 @dataclasses.dataclass
@@ -308,14 +435,12 @@ def _build_op(mesh, window: int, mixture: bool, counting: bool):
 def _operands(inputs: _Inputs, layer: _Layer, mixture: bool, active):
     """The op's operands for a case, settled on the device."""
     import ml_dtypes
-    import torch
     from torch_tpu._internal.sync import synchronize
 
     from vllm_torchtpu.megakernel import bridge
 
     residual = inputs.residual.astype(ml_dtypes.bfloat16)
-    length = torch.tensor([inputs.length], dtype=torch.int32).to("tpu")
-    slot = torch.zeros(1, dtype=torch.int32).to("tpu")
+    length, slot = _device_i32(inputs.length), layer.slot
     if mixture:
         blocks = np.broadcast_to(residual, (8, *residual.shape))
         operands = (
@@ -397,9 +522,9 @@ def _time(op, operands, args, tag: str) -> tuple[list[float], tuple]:
 
 
 def _reference(inputs: _Inputs, layer: _Layer, window: int, rank: int, args):
-    """Rank 0's first ``--reference-rows`` rows as the host reference computes
-    them, and the residual rows they add to, on rank 0 (every rank computes
-    its chip's routed part); ``(None, None)`` elsewhere."""
+    """Mesh position 0's first ``--reference-rows`` rows as the host reference
+    computes them, and the residual rows they add to, on that rank (every rank
+    computes its chip's routed part); None elsewhere."""
     from tools.megakernel import moe_layer
     from vllm_torchtpu.megakernel.kimi_k3.kernels import prefill_megakernel as k
 
@@ -437,11 +562,10 @@ def _reference(inputs: _Inputs, layer: _Layer, window: int, rank: int, args):
         )
 
     out = _on_every_rank("reference", finish if rank == 0 else lambda: None)
-    return (out, residual) if rank == 0 else (None, None)
+    return (out, residual) if rank == 0 else None
 
 
 def run(args, records: harness.Records) -> None:
-    import torch
     from torch_tpu._internal.sync import synchronize
 
     from tools.megakernel import moe_layer
@@ -461,6 +585,10 @@ def run(args, records: harness.Records) -> None:
         harness.fail(f"--layer {args.layer}: a MoE layer is 0..91")
     if args.launches < 1 or args.repeats < 1 or args.reference_rows < 1:
         harness.fail("--launches, --repeats and --reference-rows are at least 1")
+    slot = args.family_layers - 1 if args.slot < 0 else args.slot
+    layout = moe_layer.Layout(args.family_layers, args.dense_layers or slot + 1, slot)
+    if layout.problem():
+        harness.fail(layout.problem())
     mixture = args.op == "mixture"
     counting = config.active().prefill_route_counts
     mesh, rank = bridge.kernel_mesh(AXIS, 32)
@@ -477,22 +605,36 @@ def run(args, records: harness.Records) -> None:
         rank,
         args.layer,
         args.zero_router_bias,
+        layout,
     )
+    logger = harness.rank() == 0  # the process whose lines the log keeps
     harness.log(
         f"MoE layer {args.layer}: {layer.gib():.2f} GiB per rank read in "
-        f"{layer.read_s:.1f} s, resident after {layer.resident_s:.1f} s; router "
-        "bias spans {:.4f}..{:.4f}".format(*layer.bias_span)
+        f"{layer.read_s:.1f} s; families resident as {layout.experts} expert / "
+        f"{layout.dense} dense layers ({layer.device_bytes / 2**30:.1f} GiB per "
+        f"rank; slot {layout.slot}, expert index {layout.expert_index}) after "
+        f"{layer.resident_s:.1f} s; router bias spans "
+        "{:.4f}..{:.4f}".format(*layer.bias_span)
         + (" (run with zeros)" if args.zero_router_bias else "")
         + f"; {len(cases)} routing cases x windows {windows}"
     )
-    active = torch.tensor([_active_blocks(args.layer)], dtype=torch.int32).to("tpu")
+    offsets = layer.offsets(layout)
+    harness.log(
+        "the layer's entry in each family (GiB from the family's start, of its "
+        "size): "
+        + ", ".join(
+            f"{name} [{a / 2**30:.3f}, {b / 2**30:.3f}) of {c / 2**30:.3f}"
+            for name, (a, b, c) in offsets.items()
+        )
+    )
+    active = _device_i32(_active_blocks(args.layer))
     synchronize([active], wait=True)
     mode = "back to back" if args.spaced is None else f"spaced {args.spaced:g} ms"
     saved: dict[str, np.ndarray] = {}
     for window in windows:
         op = _build_op(mesh, window, mixture, counting)
         parts = fused._COMPOUND_PARTS.get(window, (window,))
-        compile_s = None
+        compile_s, overlays = None, None
         for case in cases:
             tag = _tag(window, case.label)
             if not case.fits(window):
@@ -507,12 +649,16 @@ def run(args, records: harness.Records) -> None:
             operands = _operands(inputs, layer, mixture, active)
             harness.sync()
             began = time.perf_counter()
-            first = _launch(op, operands, 1)
+            with _StderrTee(compile_s is None and logger) as compile_log:
+                first = _launch(op, operands, 1)
             if compile_s is None:
                 compile_s = time.perf_counter() - began
                 harness.log(
                     f"w{window}: first launch (compile + run) {compile_s:.1f} s"
                 )
+                if logger:
+                    line, overlays = _overlay_line(window, compile_log.text())
+                    harness.log(line)
             first_bits = _bits(first[0])
             routes_error = _routes_error(first[1], inputs, rank) if counting else ""
             _fail_on(_gather(routes_error), f"{tag}: the op routed elsewhere")
@@ -520,8 +666,15 @@ def run(args, records: harness.Records) -> None:
             times, out = _time(op, operands, args, tag)
             bits = _bits(out[0])
             values = _float(bits).astype(np.float64)
+            reference = (
+                _reference(inputs, layer, window, rank, args)
+                if args.reference
+                else None
+            )
+            # Mesh position 0's rows (the reference's) reach the logging process.
             summary = _gather(
                 {
+                    "position": rank,
                     "digest": hashlib.sha256(bits.tobytes()).hexdigest(),
                     "same": bool(np.array_equal(bits, first_bits)),
                     "sum": float(values.sum()),
@@ -530,8 +683,14 @@ def run(args, records: harness.Records) -> None:
                     "scaled": inputs.scaled,
                     "inputs": inputs.digest(),
                     "sample": bits[:SAMPLE_ROWS] if args.save_output else None,
+                    "rows": bits if rank == 0 and args.save_output else None,
+                    "reference": reference if rank == 0 else None,
+                    "own": bits[: len(reference[0])]
+                    if rank == 0 and reference
+                    else None,
                 }
             )
+            summary.sort(key=lambda s: s["position"])
             digest = hashlib.sha256(
                 "".join(s["digest"] for s in summary).encode()
             ).hexdigest()[:16]
@@ -543,13 +702,10 @@ def run(args, records: harness.Records) -> None:
             magnitude = sum(s["abs"] for s in summary)
             margin = min(s["margin"] for s in summary)
             scaled = sum(s["scaled"] for s in summary)
-            reference, residual = (None, None)
             accuracy = {}
             if args.reference:
-                reference, residual = _reference(inputs, layer, window, rank, args)
-                if rank == 0:
-                    rows = len(reference)
-                    accuracy = moe_layer.error(_float(bits[:rows]), reference, residual)
+                want, residual = summary[0]["reference"]
+                accuracy = moe_layer.error(_float(summary[0]["own"]), want, residual)
             us = statistics.median(times)
             served = (
                 f" (served window {case.window} layer {case.layer})"
@@ -562,9 +718,10 @@ def run(args, records: harness.Records) -> None:
                 f"{[round(t, 1) for t in times]}) | busiest chip: routed "
                 f"{loads['routed']}, GU rows {loads['gu_rows']}, visits "
                 f"{loads['visits']}, down rows {loads['down_rows']} (mean chip GU "
-                f"{loads['mean_gu_rows']:.0f}) | margin {margin:.4f} | inputs "
-                f"{inputs_digest} | digest {digest} sum {checksum:.6e} abs "
-                f"{magnitude:.6e}"
+                f"{loads['mean_gu_rows']:.0f})"
+                + (" OVER THE COMPACT ROUTE CAPACITY" if loads["overflow"] else "")
+                + f" | margin {margin:.4f} | inputs {inputs_digest} | digest "
+                f"{digest} sum {checksum:.6e} abs {magnitude:.6e}"
                 + ("" if same else " | LAST LAUNCH DIFFERS FROM THE FIRST")
                 + (
                     " | vs reference: max rel {max_rel:.3e} rms rel {rms_rel:.3e} "
@@ -581,6 +738,12 @@ def run(args, records: harness.Records) -> None:
                 served_window=case.window,
                 served_layer=case.layer,
                 layer=args.layer,
+                family_layers=layout.experts,
+                dense_layers=layout.dense,
+                slot=layout.slot,
+                expert_index=layout.expert_index,
+                offsets=offsets,
+                overlays=overlays,
                 length=inputs.length,
                 mode=mode,
                 launches=args.launches,
@@ -594,6 +757,7 @@ def run(args, records: harness.Records) -> None:
                 busiest_down_rows=loads["down_rows"],
                 mean_routed=round(loads["mean_routed"], 1),
                 mean_gu_rows=round(loads["mean_gu_rows"], 1),
+                over_capacity=loads["overflow"],
                 margin=round(margin, 5),
                 scaled_rows=scaled,
                 inputs_digest=inputs_digest,
@@ -605,11 +769,12 @@ def run(args, records: harness.Records) -> None:
                 zero_router_bias=args.zero_router_bias,
                 reference={n: round(v, 6) for n, v in accuracy.items()} or None,
             )
-            if args.save_output and rank == 0:
-                saved[f"{tag}/rank0"] = bits
+            if args.save_output and logger:
+                saved[f"{tag}/rank0"] = summary[0]["rows"]
                 saved[f"{tag}/sample"] = np.stack([s["sample"] for s in summary])
-                if reference is not None:
-                    saved[f"{tag}/reference"] = _bf16_bits(reference)
+                if args.reference:
+                    want, residual = summary[0]["reference"]
+                    saved[f"{tag}/reference"] = _bf16_bits(want)
                     saved[f"{tag}/prefix"] = _bf16_bits(residual)
                 meta = dict(
                     window=window,
@@ -621,7 +786,7 @@ def run(args, records: harness.Records) -> None:
                 )
                 saved[f"{tag}/meta"] = np.array(json.dumps(meta))
             del out, operands
-    if args.save_output and rank == 0:
+    if args.save_output and logger:
         np.savez(args.save_output, **saved)
         harness.log(f"outputs saved to {args.save_output}")
 

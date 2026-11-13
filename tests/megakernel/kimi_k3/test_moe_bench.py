@@ -259,6 +259,77 @@ def test_compound_launch_loads_sum_their_parts():
     assert loads["gu_rows"] == big["gu_rows"].max() + small["gu_rows"].max()
 
 
+@pytest.mark.parametrize(
+    ("layout", "index"),
+    [
+        ((1, 1, 0), 0),  # the bench's default: the layer alone at slot 0
+        ((3, 92, 2), 2),  # the prefill role's first bank (MoE layers 0..2)
+        ((8, 92, 47), 4),  # a regular bank: layers 43..50
+        ((1, 92, 91), 0),  # the final bank
+        ((92, 92, 91), 91),  # the aggregate's families
+        ((14, 14, 13), 13),
+    ],
+)
+def test_layouts_index_the_layer_as_the_kernel_does(layout, index):
+    assert ml.Layout(*layout).expert_index == index
+    assert ml.Layout(*layout).problem() == ""
+    value = np.arange(6, dtype=np.uint32).reshape(1, 2, 3) + 1
+    held = ml.held_family(value, layout[0], index)
+    assert held.shape == (layout[0], 2, 3)
+    np.testing.assert_array_equal(held[index], value[0])
+    assert held.sum() == value.sum()
+
+
+def test_layouts_refuse_slots_outside_their_families():
+    assert "dense layers" in ml.Layout(92, 1, 5).problem()
+    assert "expert layers" in ml.Layout(13, 14, 13).problem()
+
+
+def test_layout_entries_place_experts_by_bank_and_the_rest_by_slot():
+    entries = ml.Layout(8, 92, 47).entries(("router", "expert_gu", "expert_ds"))
+    assert entries == {"router": (92, 47), "expert_gu": (8, 4), "expert_ds": (8, 4)}
+
+
+@pytest.mark.parametrize(("routes", "over"), [(65000, False), (70000, True)])
+def test_capacity_cases_put_their_routes_on_one_chip(routes, over):
+    (case,) = ml.parse(f"capacity:{routes}:3", order=np.tile(np.arange(896), (92, 1)))
+    assert case.fits(16384) and not case.fits(routes // 16 - 1)
+    sets = case.sets(case.tokens(16384, None))
+    counts = np.bincount(sets.ravel(), minlength=896)
+    assert counts[56 * 3 : 56 * 4].sum() == routes and counts.sum() == 16 * 16384
+    assert counts.max() - counts[56 * 3 : 56 * 4].min() <= 1  # even on the chip
+    assert all(len(set(row)) == 16 for row in sets[:4096].tolist())
+    loads = ml.case_loads(sets, 16384, (16384,))
+    assert loads["routed"] == routes and loads["overflow"] is over
+    assert fused._route_capacity(16384) == 65536
+
+
+_OVERLAY_LOG = """\
+I1113 overlay.cc:7142] OverlayProgram(), input program bundle count: 1297546
+I1113 overlay.cc:7218] OverlayProgram(), continuation_program_info, offset: 1297546
+I1113 overlay_partitioner.cc:1419] Partitions:
+I1113 overlay_partitioner.cc:1419] OverlayPartitioner (regular/jumbo/hlo overlay \
+size 16264/16264/48792, prefix size 9, trampoline size 13):
+I1113 overlay_partitioner.cc:1419] OverlayPartition 7: [0, 16100):16100, kind=0
+I1113 overlay_partitioner.cc:1419] OverlayPartition 8: [16100, 30000):13900, kind=1
+I1113 overlay_partitioner.cc:1419] OverlayPartition 9: [30000, 46000):16000, kind=0
+I1113 overlay.cc:7142] OverlayProgram(), input program bundle count: 412
+"""
+
+
+def test_overlay_programs_read_the_compile_log():
+    first, second = ml.overlay_programs(_OVERLAY_LOG)
+    assert first == {
+        "bundles": 1297546,
+        "sizes": "16264/16264/48792",
+        "partitions": 3,
+        "kind0": 2,
+        "kind1": 1,
+    }
+    assert second == {"bundles": 412, "sizes": "", "partitions": 0}
+    assert ml.overlay_programs("no compile here") == []
+
+
 # ----------------------------------------------------------------- inputs
 
 
