@@ -706,72 +706,75 @@ def _latent_ready_progress(
     rows = payload.shape[0]
 
     def sweep():
-        begin = 0
-        for stream in range(12):
-            size = rows // 12 + (stream < rows % 12)
-            start = begin
-            begin += size
-            base = (stream % 6) * 34
+        # One rolled loop per stream size keeps a poll's code small: a launch
+        # polls between its shared-expert products.
+        common, extra = divmod(rows, 12)
+        for first, last, size in ((0, extra, common + 1), (extra, 12, common)):
             # TPUv7 DMA semaphore accounting: one unit per 32 logical bytes.
             units = size * 2 * 1792 * 2 // 32
-            step = state[1 + stream]
 
-            @pl.when(state[13 + stream] == 0)
-            def receive(*, step=step, stream=stream, units=units, base=base, start=start, size=size):
-                bank = (step - 1) & 1
-                ready = (pl.semaphore_read(send.at[stream]) >= units) & (
-                    pl.semaphore_read(recv.at[bank, stream]) >= units
-                )
+            @pl.loop(first, last)
+            def each(stream, *, size=size, units=units):
+                start = stream * common + jnp.minimum(stream, extra)
+                base = jnp.where(stream < 6, stream, stream - 6) * 34
+                step = state[1 + stream]
 
-                @pl.when(ready)
-                def consume():
-                    incoming = output.at[pl.ds(meta[base + 2 + step] + start, size), :, :]
-                    # wait_send only consumes its completion count; the HBM view
-                    # has the same logical transfer size as the initial VMEM source.
-                    transfer = pltpu.make_async_remote_copy(
-                        incoming,
-                        incoming,
-                        send.at[stream],
-                        recv.at[bank, stream],
-                        device_id=meta[base],
-                        device_id_type=pl.DeviceIdType.LOGICAL,
+                @pl.when(state[13 + stream] == 0)
+                def receive():
+                    bank = (step - 1) & 1
+                    ready = (pl.semaphore_read(send.at[stream]) >= units) & (
+                        pl.semaphore_read(recv.at[bank, stream]) >= units
                     )
-                    transfer.wait_send()
-                    transfer.wait_recv()
 
-                    @pl.when(step < 30)
-                    def credit():
-                        pl.semaphore_signal(
-                            credits.at[stream], 1, device_id=meta[base + 1], device_id_type=pl.DeviceIdType.LOGICAL
+                    @pl.when(ready)
+                    def consume():
+                        incoming = output.at[pl.ds(meta[base + 2 + step] + start, size), :, :]
+                        # wait_send only consumes its completion count; the HBM view
+                        # has the same logical transfer size as the initial VMEM source.
+                        transfer = pltpu.make_async_remote_copy(
+                            incoming,
+                            incoming,
+                            send.at[stream],
+                            recv.at[bank, stream],
+                            device_id=meta[base],
+                            device_id_type=pl.DeviceIdType.LOGICAL,
                         )
+                        transfer.wait_send()
+                        transfer.wait_recv()
 
-                    state[13 + stream] = jnp.where(step == 31, 2, 1)
+                        @pl.when(step < 30)
+                        def credit():
+                            pl.semaphore_signal(
+                                credits.at[stream], 1, device_id=meta[base + 1], device_id_type=pl.DeviceIdType.LOGICAL
+                            )
 
-                    @pl.when(step == 31)
-                    def complete():
-                        state[0] = state[0] - 1
+                        state[13 + stream] = jnp.where(step == 31, 2, 1)
 
-            @pl.when(state[13 + stream] == 1)
-            def forward(*, step=step, stream=stream, base=base, start=start, size=size):
-                available = (step < 2) | (pl.semaphore_read(credits.at[stream]) >= 1)
+                        @pl.when(step == 31)
+                        def complete():
+                            state[0] = state[0] - 1
 
-                @pl.when(available)
-                def issue():
-                    @pl.when(step >= 2)
-                    def acquire():
-                        pl.semaphore_wait(credits.at[stream], 1)
+                @pl.when(state[13 + stream] == 1)
+                def forward():
+                    available = (step < 2) | (pl.semaphore_read(credits.at[stream]) >= 1)
 
-                    source = output.at[pl.ds(meta[base + 2 + step] + start, size), :, :]
-                    pltpu.make_async_remote_copy(
-                        source,
-                        source,
-                        send.at[stream],
-                        recv.at[step & 1, stream],
-                        device_id=meta[base],
-                        device_id_type=pl.DeviceIdType.LOGICAL,
-                    ).start()
-                    state[1 + stream] = step + 1
-                    state[13 + stream] = 0
+                    @pl.when(available)
+                    def issue():
+                        @pl.when(step >= 2)
+                        def acquire():
+                            pl.semaphore_wait(credits.at[stream], 1)
+
+                        source = output.at[pl.ds(meta[base + 2 + step] + start, size), :, :]
+                        pltpu.make_async_remote_copy(
+                            source,
+                            source,
+                            send.at[stream],
+                            recv.at[step & 1, stream],
+                            device_id=meta[base],
+                            device_id_type=pl.DeviceIdType.LOGICAL,
+                        ).start()
+                        state[1 + stream] = step + 1
+                        state[13 + stream] = 0
 
     if drain:
 
