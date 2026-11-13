@@ -78,6 +78,7 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_vllm_bucket_filter", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_all_ranges", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_prefix_isolation", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_config_hash_ignore_diagnostics", _ACTIVE),
