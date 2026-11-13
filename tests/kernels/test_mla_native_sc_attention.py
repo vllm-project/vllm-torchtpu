@@ -694,6 +694,473 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
             )
 
+    def _split_q_lse_case(self, query_tokens, seq_q, rng):
+        """A DCP-shaped problem: 64 heads, per-row live counts incl. empty rows.
+
+        Returns the problem, the glued top-k (a rank owning none of a row's
+        top-k is handed key 0, as `sparse_mla_attention_dcp` does), `owns`,
+        `counts`, the page table, cu_q_lens and the distribution.
+        """
+        topk = 2048
+        problem = _build_problem(
+            rng, k_scale=0.75, query_tokens=query_tokens, topk=topk, num_heads=64
+        )
+        # 0 = the rank owns none of the row (lse = -inf contract); 513+ rows
+        # overflow the 512 cap into later windows.
+        pool = np.array(
+            [
+                0,
+                1,
+                63,
+                64,
+                127,
+                128,
+                129,
+                255,
+                256,
+                257,
+                511,
+                512,
+                513,
+                700,
+                1024,
+                1025,
+                2048,
+                0,
+                130,
+            ]
+        )
+        counts = np.resize(pool, query_tokens)
+        rng.shuffle(counts)
+        counts[0] = 0  # an empty row in every bucket
+        counts[1] = 1025  # and an overflow row
+        live = np.arange(topk)[None, :] < counts[:, None]
+        topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        owns = jnp.any(topk_idx >= 0, axis=-1)
+        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+        num_seqs = len(seq_q)
+        page_table = jnp.concatenate(
+            [problem["page_table"]]
+            + [
+                jnp.asarray(rng.permutation(problem["page_table"].shape[0]), jnp.int32)
+                for _ in range(num_seqs - 1)
+            ]
+        )
+        cu_q_lens = jnp.asarray(np.concatenate([[0], np.cumsum(seq_q)]), jnp.int32)
+        num_decode = sum(1 for n in seq_q if n == 4)
+        distribution = jnp.array([num_decode, num_decode, num_seqs], jnp.int32)
+        return problem, topk_idx, owns, counts, page_table, cu_q_lens, distribution
+
+    @parameterized.parameters(
+        (16, (4,)), (16, (4, 4)), (16, (4, 4, 4, 1)), (32, (4, 4, 4, 4, 4))
+    )
+    def test_mask_in_kernel_and_fused_prep_bit_identical(self, query_tokens, seq_q):
+        """TPU_DCP_MLA_MASK_IN_KERNEL / TPU_DCP_MLA_FUSED_PREP (decode buckets).
+
+        `lse_mask_empty` takes the raw top-k (no dummy key, no owns mask) and
+        `fused_window_prep` builds the window indices + gather live bound in
+        one call. Both must match the production DCP glue bit for bit on every
+        owning real row, and keep the empty-row contract (lse == -inf, out
+        finite) by themselves.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261010)
+        problem, topk_glued, owns, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        topk_raw = jnp.where(owns[:, None], topk_glued, -1)
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+
+        def run(topk_in, **kw):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=512,
+                small_chunk_batch_size=4,
+                # TPU_DCP_MLA_SMALL_CHUNK_TOKENS=32: the 32 bucket on the
+                # decode path too.
+                small_chunk_tokens=32,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                **kw,
+            )
+            return out[..., :NOPE_DIM], lse
+
+        ref, ref_lse = run(topk_glued)
+        ref_lse = jnp.where(owns[:, None], ref_lse, -jnp.inf)
+        own = np.asarray(owns)[:real_tokens]
+        self.assertTrue((~own).any() and own.any())
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        for fused in (False, True):
+            out, lse = jax.block_until_ready(
+                run(topk_raw, lse_mask_empty=True, fused_window_prep=fused)
+            )
+            arm = f"fused={fused}"
+            np.testing.assert_array_equal(
+                bits(out)[:real_tokens][own], bits(ref)[:real_tokens][own], err_msg=arm
+            )
+            np.testing.assert_array_equal(
+                np.asarray(lse)[:real_tokens][own].view(np.uint32),
+                np.asarray(ref_lse)[:real_tokens][own].view(np.uint32),
+                err_msg=arm,
+            )
+            self.assertTrue(np.all(np.asarray(lse)[:real_tokens][~own] == -np.inf), arm)
+            self.assertTrue(
+                np.isfinite(np.asarray(out, np.float32)[:real_tokens]).all(), arm
+            )
+        # Positive control: one moved live entry of the overflow row moves it.
+        row = int(np.argmax(counts[:real_tokens]))
+        moved = topk_raw.at[row, 0].set((topk_raw[row, 0] + 1) % 8192)
+        bad, _ = jax.block_until_ready(
+            run(moved, lse_mask_empty=True, fused_window_prep=True)
+        )
+        self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
+
+    @parameterized.product(
+        (
+            {"query_tokens": 64, "seq_q": (4, 4, 49)},
+            {"query_tokens": 512, "seq_q": (4, 4, 300)},
+            {"query_tokens": 1024, "seq_q": (4, 4, 1000)},
+        ),
+        overflow=(False, True),
+    )
+    def test_mixed_live_gather_bit_identical(self, query_tokens, seq_q, overflow):
+        """TPU_DCP_MLA_MIXED_LIVE (+ _WIDTHS): mixed buckets gather and attend
+        only each grid step's live atom blocks (and size the body to them);
+        every owning real row matches the token-major path bit for bit."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261011 + query_tokens + int(overflow))
+        problem, topk_glued, owns, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        if not overflow:
+            # DCP16-like ownership: ~128 live rows per token, no overflow, so
+            # the live-group layout is taken on every chunk.
+            counts = np.clip(rng.normal(128, 30, size=query_tokens), 0, 400).astype(int)
+            counts[0] = 0
+            live = np.arange(2048)[None, :] < counts[:, None]
+            topk_glued = jnp.where(jnp.asarray(live), problem["topk"], -1)
+            owns = jnp.any(topk_glued >= 0, axis=-1)
+            topk_glued = topk_glued.at[:, 0].set(
+                jnp.where(owns, topk_glued[:, 0], jnp.int32(0))
+            )
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+
+        def run(topk_in, **kw):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=512,
+                small_chunk_batch_size=4,
+                small_chunk_tokens=32,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                **kw,
+            )
+            return out[..., :NOPE_DIM], lse
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        ref, ref_lse = jax.block_until_ready(run(topk_glued))
+        own = np.asarray(owns)[:real_tokens]
+        for kw in (
+            {"mixed_live_gather": True},
+            {"mixed_live_gather": True, "mixed_live_widths": (256,)},
+            {"mixed_live_gather": True, "mixed_live_widths": (128, 256)},
+        ):
+            out, lse = jax.block_until_ready(run(topk_glued, **kw))
+            np.testing.assert_array_equal(
+                bits(out)[:real_tokens][own],
+                bits(ref)[:real_tokens][own],
+                err_msg=str(kw),
+            )
+            np.testing.assert_array_equal(
+                np.asarray(lse)[:real_tokens][own].view(np.uint32),
+                np.asarray(ref_lse)[:real_tokens][own].view(np.uint32),
+                err_msg=str(kw),
+            )
+        # Positive control: one moved live entry of the longest row moves it.
+        row = int(np.argmax(np.where(own, counts[:real_tokens], -1)))
+        moved = topk_glued.at[row, 0].set((topk_glued[row, 0] + 1) % 8192)
+        bad, _ = jax.block_until_ready(run(moved, mixed_live_gather=True))
+        self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
+
+    @parameterized.parameters((512, 300), (1024, 1000), (1024, 77))
+    def test_capped_window_live_matches_reference(self, num_tokens, real):
+        """`prepare_capped_window_live`: per chunk, window 0 is a permutation of
+        `prepare_capped_window_indices`'s (16-token x 64-slot) blocks with
+        group g's live blocks at off(g) + a; windows >= 1 are unchanged."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("Mosaic kernel requires a TPU")
+        rng = np.random.default_rng(num_tokens + real)
+        page_size, total_pages, pps, topk, cap, chunk, bz = (
+            256,
+            2085,
+            256,
+            2048,
+            512,
+            256,
+            16,
+        )
+        page_table = jnp.asarray(rng.integers(0, total_pages, size=8 * pps), jnp.int32)
+        cu_q_lens = jnp.asarray([0] + [real] * 8, jnp.int32)
+        token_end = jnp.int32(real)
+        for counts in (
+            rng.integers(1, 300, size=num_tokens),
+            np.r_[rng.integers(1, 300, size=num_tokens - 1), 1500],
+        ):
+            counts[real - 1] = max(counts[real - 1], 1)
+            logical = rng.integers(0, pps * page_size, size=(num_tokens, topk))
+            topk_idx = jnp.asarray(
+                np.where(np.arange(topk)[None] < counts[:, None], logical, -1),
+                jnp.int32,
+            )
+            kv = jnp.sum(topk_idx != -1, axis=-1)
+            lw = sparse_mla.capped_live_windows(
+                kv,
+                token_end,
+                chunk_size=chunk,
+                kernel_batch_size=bz,
+                topk_cap=cap,
+                num_windows=topk // cap,
+            )
+            tab, num_live = sparse_mla.live_group_table(
+                kv,
+                token_end,
+                chunk_size=chunk,
+                kernel_batch_size=bz,
+                topk_cap=cap,
+                num_windows=topk // cap,
+            )
+            rows = sparse_mla.prepare_capped_window_live(
+                topk_idx,
+                page_table,
+                cu_q_lens,
+                lw,
+                tab,
+                chunk_size=chunk,
+                kernel_batch_size=bz,
+                topk_cap=cap,
+                page_size=page_size,
+                total_num_pages=total_pages,
+            )
+            want = sparse_mla.prepare_capped_window_indices(
+                topk_idx,
+                page_table,
+                cu_q_lens,
+                lw,
+                chunk_size=chunk,
+                topk_cap=cap,
+                page_size=page_size,
+                total_num_pages=total_pages,
+            )
+            lw, tab, num_live = int(lw), np.asarray(tab), np.asarray(num_live)
+            nc, gpc, ng = num_tokens // chunk, chunk // bz, num_tokens // bz
+            got = np.asarray(rows).reshape(nc, 4, chunk * cap)
+            ref = np.asarray(want).reshape(nc, 4, chunk, cap)
+            for c in range(nc):
+                np.testing.assert_array_equal(
+                    got[c, 1:lw].reshape(-1), ref[c, 1:lw].reshape(-1)
+                )
+                blocks = got[c, 0].reshape(gpc * 8, bz * 64)
+                ref_blocks = ref[c, 0].reshape(gpc, bz, 8, 64).transpose(0, 2, 1, 3)
+                ref_blocks = ref_blocks.reshape(gpc * 8, bz * 64)
+                self.assertEqual(
+                    sorted(map(bytes, blocks)), sorted(map(bytes, ref_blocks))
+                )
+                for tb in range(gpc):
+                    g = c * gpc + tb
+                    a_live, off = int(tab[g]), int(tab[ng + g])
+                    for a in range(a_live):
+                        np.testing.assert_array_equal(
+                            blocks[off + a], ref_blocks[tb * 8 + a]
+                        )
+                if lw == 1:
+                    self.assertEqual(
+                        num_live[c], tab[c * gpc : (c + 1) * gpc].sum() * bz * 64
+                    )
+
+    @parameterized.parameters((16, 4, 1), (32, 4, 1), (32, 16, 16))
+    def test_fused_window_prep_matches_reference(self, num_tokens, bz, atoms):
+        """`prepare_capped_window_fused` rows == `prepare_capped_window_indices`
+        on every live window, and the live vector in its trailing tile == the
+        gather's own bound."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("Mosaic kernel requires a TPU")
+        from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
+
+        rng = np.random.default_rng(num_tokens)
+        page_size, total_pages, pps, topk, cap = 256, 2085, 256, 2048, 512
+        page_table = jnp.asarray(rng.integers(0, total_pages, size=8 * pps), jnp.int32)
+        cu_q_lens = jnp.asarray(np.minimum(np.arange(9) * 4, num_tokens - 3), jnp.int32)
+        token_end = int(cu_q_lens[-1])
+        for counts in (
+            rng.integers(0, 300, size=num_tokens),
+            np.r_[rng.integers(0, 300, size=num_tokens - 1), 1500],
+        ):
+            logical = rng.integers(0, pps * page_size, size=(num_tokens, topk))
+            topk_idx = jnp.asarray(
+                np.where(np.arange(topk)[None] < counts[:, None], logical, -1),
+                jnp.int32,
+            )
+            rows = sparse_mla.prepare_capped_window_fused(
+                topk_idx,
+                page_table,
+                cu_q_lens,
+                jnp.int32(token_end),
+                topk_cap=cap,
+                page_size=page_size,
+                total_num_pages=total_pages,
+                kernel_batch_size=bz,
+                gather_atoms=atoms,
+            )
+            grid = -(-token_end // bz) * bz
+            lw = int(
+                min(max(1, max(-(-max(int(c), 1) // cap) for c in counts[:grid])), 4)
+            )
+            want = sparse_mla.prepare_capped_window_indices(
+                topk_idx,
+                page_table,
+                cu_q_lens,
+                jnp.int32(lw),
+                chunk_size=num_tokens,
+                topk_cap=cap,
+                page_size=page_size,
+                total_num_pages=total_pages,
+            )
+            window_rows = 4 * num_tokens * cap // 128
+            self.assertEqual(
+                rows.shape, (window_rows + sparse_mla.FUSED_PREP_META_ROWS, 128)
+            )
+            got = np.asarray(rows)[:window_rows].reshape(4, num_tokens, cap)[:lw]
+            np.testing.assert_array_equal(
+                got, np.asarray(want).reshape(4, num_tokens, cap)[:lw]
+            )
+            _, _, a, occ, nb = native_sc_gather.live_vec_geometry(
+                num_tokens * topk, atoms
+            )
+            num_live = (lw - 1) * num_tokens * cap + grid * cap
+            live_b = min(-(-num_live // occ), nb)
+            live_vec = np.asarray(rows).reshape(-1)[num_tokens * topk :][:32]
+            np.testing.assert_array_equal(
+                live_vec, [live_b] * 16 + [-(-live_b // 32)] * 16
+            )
+
+    def test_kv_write_in_gather_matches_writing_first(self):
+        """`kv_write` on the fused-prep decode path (TPU_MLA_KV_WRITE_IN_GATHER):
+        output, lse and both caches equal writing the step's rows into the
+        caches first and then attending. Each written row is one a token
+        attends, so a write the gather does not see changes the output."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        from vllm_torchtpu.kernels.mla import kv_cache_utils
+        from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
+        from vllm_torchtpu.layers.core import attention_interface
+
+        query_tokens, seq_q = 16, (4, 4, 4, 1)
+        rng = np.random.default_rng(20261111)
+        problem, topk_glued, owns, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        topk_raw = jnp.where(owns[:, None], topk_glued, -1)
+        nope, rope = problem["sparsecore_nope"], problem["sparsecore_rope"]
+        rope_bytes = 4 * rope.size // (nope.size // 128)
+        # Slot 0 of every token with a live entry, each physical row once;
+        # the other tokens are rows this rank does not own.
+        dst = np.full(query_tokens, kv_cache_utils.SKIP_ROW, np.int64)
+        for t in np.flatnonzero(counts > 0):
+            row = int(problem["physical_topk"][t, 0])
+            if row not in dst:
+                dst[t] = row
+        owned = dst >= 0
+        self.assertTrue(owned.any() and (~owned).any())
+        kv_c = jnp.asarray(rng.integers(0, 0x7E, (query_tokens, NOPE_DIM), np.uint8))
+        k_pe = jnp.asarray(rng.integers(0, 0x7E, (query_tokens, ROPE_DIM), np.uint8))
+        want_nope = (
+            nope.reshape(-1, 128)
+            .at[dst[owned]]
+            .set(kv_cache_utils.pack_tokens(kv_c, NOPE_DIM)[owned])
+            .reshape(nope.shape)
+        )
+        want_rope = (
+            rope.reshape(-1, rope_bytes // 4)
+            .at[dst[owned]]
+            .set(kv_cache_utils.pack_tokens(k_pe, rope_bytes)[owned])
+            .reshape(rope.shape)
+        )
+        kv_write = native_sc_gather.pack_write_rows(
+            jnp.asarray(dst, jnp.int32),
+            attention_interface._pack_lane_dense(kv_c, NOPE_DIM),
+            attention_interface._pack_lane_dense(k_pe, rope_bytes),
+        )
+        common = dict(
+            sm_scale=0.125,
+            k_scale=0.75,
+            return_lse=True,
+            cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+            gather_and_attention_chunk_size=256,
+            topk_cap=512,
+            small_chunk_batch_size=4,
+            small_chunk_tokens=32,
+            q_pe=problem["q"][..., NOPE_DIM:],
+            lse_lane_dense=True,
+            lse_mask_empty=True,
+            fused_window_prep=True,
+        )
+        args = (topk_raw, page_table, cu_q_lens, distribution)
+        q_nope = problem["q"][..., :NOPE_DIM]
+        got = jax.block_until_ready(
+            sparse_mla.sparse_ragged_paged_attention(
+                q_nope, nope, rope, *args, kv_write=kv_write, **common
+            )
+        )
+        want = jax.block_until_ready(
+            sparse_mla.sparse_ragged_paged_attention(
+                q_nope, want_nope, want_rope, *args, **common
+            )
+        )
+        real = int(sum(seq_q))
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(got[0], jnp.uint16))[:real],
+            np.asarray(jax.lax.bitcast_convert_type(want[0], jnp.uint16))[:real],
+        )
+        np.testing.assert_array_equal(
+            np.asarray(got[1])[:real].view(np.uint32),
+            np.asarray(want[1])[:real].view(np.uint32),
+        )
+        np.testing.assert_array_equal(np.asarray(got[2]), np.asarray(want_nope))
+        np.testing.assert_array_equal(np.asarray(got[3]), np.asarray(want_rope))
+
     def test_topk_cap_validation(self):
         q = jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16)
         nope = jnp.zeros((16, 256, 128), jnp.uint32)
