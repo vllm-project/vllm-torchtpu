@@ -52,16 +52,22 @@ out = fused_moe_decode(
 ### Serving
 
 `layers/adapter/fused_moe_decode.py` arms eligible layers once after load. That
-includes the MTP drafter. An armed layer runs this kernel for steps of up to
-`FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` tokens (default 256). Larger steps run the
-regular GMM MoE, the shared expert and one all-reduce, inside the same exported
-program.
+includes the MTP drafter (or runs without one). An armed layer runs this kernel
+for steps of up to `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` tokens (default 256).
+Larger steps run the regular GMM MoE, the shared expert and one all-reduce,
+inside the same exported program. `FUSED_MOE_DECODE_KERNEL_FOLD` (`off`, `xla`,
+or `kernel`; default `off`) folds the routing prologue into the kernel (`xla`
+keeps the shared-gate dot + sigmoid in XLA and is bitwise identical to `off`;
+`kernel` computes the gate inside the kernel as well).
 
-Two shared-expert conventions are served: Qwen3.5's gated shared expert, and
-GLM-5.2's ungated `DeepseekV2MLP` with `routed_scaling_factor` 2.5. For the
-latter, arming sets the runner's factor to 1.0 because the op applies it.
-Every EP rank must arm the same layers, so arming compares across ranks and
-raises at load on any mismatch.
+Two shared-expert conventions are served: Qwen3.5 / Qwen3.8-Flash's gated
+shared expert (`sigmoid(x @ w_g)`), and GLM-5.2's ungated `DeepseekV2MLP` with
+`routed_scaling_factor` 2.5. The shared expert's `gate_up` / `down` weights may
+be per-channel FP8 or unquantized K-major BF16 (Qwen3.8-Flash; zero-padded to a
+128-multiple intermediate at arming). For `routed_scaling_factor != 1.0`,
+arming sets the runner's factor to 1.0 because the op applies it. Every EP rank
+must arm the same layers, so arming compares across ranks and raises at load on
+any mismatch.
 
 ## When to use it
 
@@ -72,13 +78,17 @@ Use it when all of these hold:
 - Attention is TP (every rank sees every token, output all-reduced), or DP with
   `scatter_rows=True` (see below).
 - The MoE is TP-sharded, or EP with `ep_size == mesh size`.
-- Weights are FP8 with per-channel scales, the activation is SiLU, and there
-  are no expert biases.
-- The shared expert has a sigmoid gate (Qwen3.5) or is an ungated
+- Routed weights are FP8 with per-channel scales, the activation is SiLU, and
+  there are no expert biases.
+- The shared expert is FP8 per-channel or unquantized BF16, and either has a
+  bias-free sigmoid gate (Qwen3.5 / Qwen3.8-Flash) or is an ungated
   `DeepseekV2MLP` (GLM-5.2). The activation dtype is not FP16 when
   `routed_scaling_factor` is not 1, and there are no routed input/output
   transforms.
-- `i`, `i_s` and `H / n_ranks` are multiples of 128, and `i_s <= i`.
+- `H` is a multiple of 512 (the kernel pads the `H / n_ranks` all-reduce chunk
+  to whole 128-element lanes itself), routed `i` is a multiple of 128, FP8
+  `i_s` is a multiple of 128 (BF16 `i_s` is zero-padded to 128 by the adapter),
+  and the padded `i_s <= i`.
 - Experts of any size. Those whose 3 whole-expert slots do not fit VMEM
   (GLM-5.2 EP16) stream in blocks; see Design.
 
