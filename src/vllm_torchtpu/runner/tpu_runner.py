@@ -7681,7 +7681,7 @@ class TPUModelRunner(GPUModelRunner):
                 for num_tokens in self._backbone_token_paddings():
                     logger.info("  -- num_tokens: %d", num_tokens)
                     if buckets.needs_retrace(num_tokens):
-                        shape_variants.retrace(self.model, self.vllm_config)
+                        shape_variants.retrace(self.model, self.vllm_config, num_tokens)
                     self._backbone_dummy_runs(num_tokens)
                 if buckets.refused:
                     # A refusal that no trace picked up leaves a raising
