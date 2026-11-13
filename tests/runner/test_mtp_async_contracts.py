@@ -446,3 +446,144 @@ def test_dynamic_schedule_verifies_leading_drafts(device, num_spec_tokens_to_sch
     )
     expected = [100, 101, 102, 103][: 1 + num_spec_tokens_to_schedule]
     assert replaced.tolist() == expected
+
+
+@pytest.mark.parametrize("num_groups", [1, 2])
+@pytest.mark.parametrize(
+    "width,rows,num_reqs",
+    [(4, 2, 2), (4, 4, 4), (4, 6, 3)],
+)
+def test_update_read_offsets_compiled_matches_eager(
+    device, num_groups, width, rows, num_reqs
+):
+    """_update_read_offsets_compiled scatters identical offsets to the CPU
+    reference across 1 vs 2 groups, rows < / == / > width, and padded tails."""
+    from vllm_torchtpu.runner import tpu_runner
+    from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+
+    num_blocks = 24
+    raw_slots = [[2, 5, 8, 11], [14, 17, 19, 22]]
+    groups_cpu = [
+        torch.tensor(
+            [raw_slots[g][i] if i < num_reqs else 0 for i in range(width)],
+            dtype=torch.int32,
+        )
+        for g in range(num_groups)
+    ]
+    token_rows = [
+        [10, 11, 12, 13],
+        [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+        [30, 31, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+        [40, 41, 42, INVALID_TOKEN_ID],
+        [50, 51, 52, 53],
+        [INVALID_TOKEN_ID] * 4,
+    ]
+    next_tokens_cpu = torch.tensor(token_rows[:rows], dtype=torch.int32)
+
+    expected = torch.full((num_blocks,), 7, dtype=torch.int32)
+    expected[0] = 0
+    tpu_runner._update_read_offsets_impl(
+        expected,
+        groups_cpu,
+        next_tokens_cpu,
+        torch.tensor(num_reqs, dtype=torch.int64),
+    )
+
+    actual = torch.full((num_blocks,), 7, dtype=torch.int32, device=device)
+    actual[0] = 0
+    assert tpu_runner._use_fused_read_offset_update(actual, next_tokens_cpu)
+    assert not tpu_runner._use_fused_read_offset_update(actual, None)
+    tpu_runner._update_read_offsets_compiled(
+        actual,
+        [g.to(device) for g in groups_cpu],
+        next_tokens_cpu.to(device),
+        torch.tensor(num_reqs, dtype=torch.int64, device=device),
+    )
+    assert actual.cpu().tolist() == expected.tolist()
+
+
+@pytest.mark.parametrize("draft_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("width,num_reqs,qsl_len", [(4, 4, 5), (8, 3, 9), (8, 5, 6)])
+def test_async_draft_seed_compiled_matches_eager(
+    device, width, num_reqs, qsl_len, draft_dtype
+):
+    """_async_draft_seed_compiled on TPU matches the CPU eager path, and the
+    dispatch picks it only for override-free chunks on TPU."""
+    from vllm_torchtpu.spec_decode import eagle3
+
+    k = 3
+    next_tokens = torch.tensor(
+        [
+            [
+                100 + 10 * i + j if j < i % (k + 2) else eagle3.INVALID_TOKEN_ID
+                for j in range(k + 1)
+            ]
+            for i in range(width)
+        ],
+        dtype=torch.int32,
+    )
+    num_draft = torch.tensor([i % (k + 1) for i in range(width + 2)], dtype=draft_dtype)
+    query_start_loc = torch.arange(qsl_len, dtype=torch.int32) * (k + 1)
+    expected = eagle3._async_draft_seed_eager(
+        next_tokens, num_draft, query_start_loc, num_reqs, {}
+    )
+
+    next_tokens_dev = next_tokens.to(device)
+    assert eagle3._use_fused_async_draft_seed(next_tokens_dev, {})
+    assert not eagle3._use_fused_async_draft_seed(next_tokens_dev, {0: 7})
+    actual = eagle3._async_draft_seed_compiled(
+        next_tokens_dev,
+        num_draft.to(device),
+        query_start_loc.to(device),
+        torch.tensor(num_reqs, dtype=torch.int64, device=device),
+    )
+    for a, e in zip(actual, expected, strict=True):
+        assert a.dtype == e.dtype
+        assert a.cpu().tolist() == e.tolist()
+
+
+@pytest.mark.parametrize("bucketed", [False, True])
+def test_spec_tail_matches_per_chunk_assembly(bucketed):
+    """The one-chunk fused tail returns the same source (padded to the bound),
+    rejected counts, indices and draft counts as the per-chunk fallback plus
+    the pad in sample_tokens."""
+    k, num_reqs, rows, max_reqs = 3, 3, 4, 8
+    runner_fallback = object.__new__(TPUModelRunner)
+    runner_fallback.device = torch.device("cpu")
+    runner_fallback.speculative_config = SimpleNamespace(num_speculative_tokens=k)
+    runner_fallback.drafter = SimpleNamespace(bucketed_drafts=bucketed)
+
+    runner = object.__new__(TPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.max_num_reqs = max_reqs
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=k)
+    runner.drafter = SimpleNamespace(bucketed_drafts=bucketed)
+
+    next_tokens = torch.tensor(
+        [[11, 12, -1, -1], [21, -1, -1, -1], [31, 32, 33, 34], [-1, -1, -1, -1]],
+        dtype=torch.int32,
+    )
+    drafts = (
+        torch.arange(100, 100 + (rows if bucketed else num_reqs) * k)
+        .reshape(-1, k)
+        .to(torch.int32)
+    )
+    state = SimpleNamespace(
+        num_reqs_list=[num_reqs],
+        spec_decode_metadata_list=[
+            SimpleNamespace(
+                draft_lengths=torch.tensor([3, 3, 3, 0], dtype=torch.int32),
+                draft_lengths_cpu=np.array([3, 3, 3, 0]),
+            )
+        ],
+    )
+    drafts_in = [drafts] if bucketed else drafts
+    ref = runner_fallback._assemble_async_spec_substitution(
+        drafts_in, [next_tokens], state
+    )
+    got = runner._assemble_async_spec_substitution(drafts_in, [next_tokens], state)
+    bound = max_reqs * (1 + k)
+    ref_src = torch.nn.functional.pad(ref[0][0], (0, bound - ref[0][0].shape[0]))
+    assert torch.equal(got[0][0], ref_src)
+    assert torch.equal(got[2], ref[2])
+    assert got[1] == ref[1] and got[3] == ref[3]

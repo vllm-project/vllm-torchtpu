@@ -106,6 +106,36 @@ def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     }
 
 
+def test_spec_warmup_num_output_tokens_keeps_in_flight_placeholders():
+    """An async spec step appends 1 + K placeholders that the next step's
+    `_modify_prev_results` rolls back from `num_tokens_no_spec`. Upstream
+    `_update_states` truncates output_token_ids (and rewinds
+    num_tokens_no_spec) when the scheduler reports fewer outputs, so the
+    warmup must report the runner's own count, never a smaller one."""
+    K, P = 7, 4
+    # Prefill sampled one token, then decode step 0 left 1 + K placeholders.
+    output_token_ids = [11] + [0] * (1 + K)
+    requests = {"r0": SimpleNamespace(output_token_ids=output_token_ids)}
+    (reported,) = tpu_runner._spec_warmup_num_output_tokens(requests, ["r0"])
+    assert reported == len(output_token_ids)
+
+    def rollback_slice(num_output_tokens: int, accepted: int) -> range:
+        """Index math of _update_states then _modify_prev_results."""
+        num_tokens_no_spec = P + len(output_token_ids)
+        if num_output_tokens < len(output_token_ids):
+            num_tokens_no_spec = P + num_output_tokens
+        start = num_tokens_no_spec - (1 + K)
+        return range(start, start + accepted)
+
+    # The old warmup count (t + 1 = 2 at decode step 1) starts the roll-back
+    # before the request's first token: slice(-2, 0) of token_ids_cpu is empty.
+    old = rollback_slice(2, accepted=2)
+    assert old.start < 0
+    assert reported >= 2
+    new = rollback_slice(reported, accepted=2)
+    assert list(new) == [P + 1, P + 2]
+
+
 @pytest.mark.parametrize("dcp_size,expected_blocks", [(1, 65), (8, 9)])
 def test_spec_warmup_request_counts_blocks_in_block_table_units(
     dcp_size, expected_blocks
@@ -2322,6 +2352,91 @@ class TestMambaSlotReadOffsets:
         runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]), 1)
         assert int(runner.mamba_slot_read_offsets.sum()) == 0
 
+    @pytest.mark.parametrize("num_groups", [1, 2])
+    @pytest.mark.parametrize(
+        "width,rows,num_reqs",
+        [
+            (4, 2, 2),  # rows < width, num_reqs < width
+            (4, 3, 2),  # rows < width, extra row past num_reqs
+            (4, 4, 4),  # rows == width, full batch
+            (4, 6, 3),  # rows > width, num_reqs < width
+        ],
+    )
+    def test_update_read_offsets_impl_matches_eager(
+        self, num_groups, width, rows, num_reqs
+    ):
+        """Fused _update_read_offsets_impl matches the eager scatter across
+        1 vs 2 groups, rows < / == / > width, and num_reqs < width."""
+        num_blocks = 24
+        # Distinct active slots per group; positions >= num_reqs use slot 0.
+        raw_slots = [[2, 5, 8, 11], [14, 17, 19, 22]]
+        groups = []
+        for g in range(num_groups):
+            slots = [raw_slots[g][i] if i < num_reqs else 0 for i in range(width)]
+            groups.append(torch.tensor(slots, dtype=torch.int32))
+
+        token_rows = [
+            [10, 11, 12, 13],  # 4 valid -> offset 3
+            [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],  # -> 0
+            [30, 31, INVALID_TOKEN_ID, INVALID_TOKEN_ID],  # -> 1
+            [40, 41, 42, INVALID_TOKEN_ID],  # -> 2
+            [50, 51, 52, 53],  # truncated when rows > width
+            [INVALID_TOKEN_ID] * 4,
+        ]
+        next_tokens = torch.tensor(token_rows[:rows], dtype=torch.int32)
+
+        runner = self._make_runner(num_blocks=num_blocks)
+        runner.mamba_slot_read_offsets.fill_(7)
+        runner.mamba_slot_read_offsets[0] = 0
+        runner._update_mamba_slot_read_offsets(groups, next_tokens, num_reqs)
+        expected = runner.mamba_slot_read_offsets.clone()
+
+        for fn in (
+            tpu_runner._update_read_offsets_impl,
+            torch.compile(
+                tpu_runner._update_read_offsets_impl, backend="eager", fullgraph=True
+            ),
+        ):
+            actual = torch.full((num_blocks,), 7, dtype=torch.int32)
+            actual[0] = 0
+            fn(
+                actual,
+                groups,
+                next_tokens,
+                torch.tensor(num_reqs, dtype=torch.int64),
+            )
+            assert torch.equal(actual, expected)
+
+    @pytest.mark.parametrize(
+        "device_type,has_next_tokens,fused",
+        [
+            ("tpu", True, True),
+            ("tpu", False, False),  # non-verify chunk: offsets all 0
+            ("cpu", True, False),  # the tpu backend cannot trace CPU tensors
+        ],
+    )
+    def test_use_fused_read_offset_update(self, device_type, has_next_tokens, fused):
+        read_offsets = SimpleNamespace(device=SimpleNamespace(type=device_type))
+        next_tokens = torch.tensor([[1, 2]]) if has_next_tokens else None
+        assert (
+            tpu_runner._use_fused_read_offset_update(read_offsets, next_tokens) is fused
+        )
+
+    def test_cpu_buffer_takes_eager_scatter(self, monkeypatch):
+        """A buffer the tpu backend cannot trace never reaches the compiled
+        program and still gets the verify offsets."""
+        compiled = MagicMock()
+        monkeypatch.setattr(tpu_runner, "_update_read_offsets_compiled", compiled)
+        runner = self._make_runner(num_blocks=8)
+        next_tokens = torch.tensor(
+            [[10, 11, INVALID_TOKEN_ID], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
+        )
+        runner._update_mamba_slot_read_offsets(
+            [torch.tensor([1, 4], dtype=torch.int32)], next_tokens, 2
+        )
+        compiled.assert_not_called()
+        assert runner.mamba_slot_read_offsets.tolist() == [0, 1, 0, 0, 0, 0, 0, 0]
+
 
 class TestReadOffsetsClearedOnReallocation:
     """A recycled slot/block must not carry a read offset into its next owner.
@@ -4094,3 +4209,120 @@ class TestLogitsAtDpVocabRows:
             TPUModelRunner._logits_at_dp_vocab_rows(
                 runner, torch.zeros(9, 2), torch.arange(9)
             )
+
+
+# A K=7 drafter at max_num_seqs 48: the served token
+# buckets, a 8192-token budget.
+SERVED_PADDINGS = [4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 384, 512]
+SERVED_PADDINGS += [1024, 2048, 3072, 4096, 8192]
+
+
+def _glue_runner(chunk_reqs: int = 48, max_seqs: int = 48, K: int = 7):
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=K),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs, async_scheduling=True),
+        _is_async_drafter=True,
+        max_num_reqs=max(max_seqs, tpu_runner.MIN_NUM_SEQS),
+        num_reqs_max_model_len=chunk_reqs,
+        num_reqs_most_model_len=None,
+        most_model_len=None,
+        num_tokens_paddings=SERVED_PADDINGS,
+        uses_mrope=False,
+        device=torch.device("cpu"),
+        _precompile_timed=lambda name: contextlib.nullcontext(),
+    )
+    for name in (
+        "_chunk_request_capacities",
+        "_async_spec_source_rows",
+        "_async_spec_glue_shapes",
+    ):
+        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+    return runner
+
+
+def _shapes(*tensors: torch.Tensor) -> tuple[tuple[int, ...], ...]:
+    return tuple(tuple(t.shape) for t in tensors)
+
+
+def test_async_spec_glue_precompile_covers_every_step(monkeypatch):
+    """Every step a served batch can take -- any verify request count next to
+    a prefill chunk landing in any token bucket -- hands the subtract and
+    extract glue a shape the precompile warmed. The real spec-decode warmup
+    pairs large token buckets with one request only (a serving run compiled
+    tt_jit_sub / tt_jit_index mid-serving)."""
+    runner = _glue_runner()
+    K = runner.speculative_config.num_speculative_tokens
+    pads = runner.num_tokens_paddings
+    warmed_subtract: set = set()
+    warmed_extract: set = set()
+
+    def record_subtract(*args):
+        warmed_subtract.add(_shapes(*args))
+        return args[0], args[1]
+
+    def record_extract(*args):
+        warmed_extract.add(_shapes(*args))
+        return args[1]
+
+    monkeypatch.setattr(tpu_runner, "_subtract_num_rejected_tokens", record_subtract)
+    monkeypatch.setattr(tpu_runner, "_extract_draft_token_ids", record_extract)
+    TPUModelRunner._precompile_async_spec_glue(runner)
+
+    manager_runner = MagicMock()
+    manager_runner.device = torch.device("cpu")
+    manager_runner.arange_np = np.arange(pads[-1] + 1, dtype=np.int32)
+    manager_runner.num_tokens_paddings = pads
+    manager_runner.input_ids_cpu = torch.zeros(pads[-1], dtype=torch.int32)
+    manager = SpeculativeDecodingManager(manager_runner)
+
+    rows = runner._async_spec_source_rows()
+    chunk_reqs = runner.num_reqs_max_model_len
+    counts = [11, 15, *range(20, 32), 34, 35, *range(38, 49), 1, 8, 33]
+    for num_verify in counts:
+        verify_tokens = num_verify * (1 + K)
+        # Decode-only, then a prefill chunk filling each larger token bucket.
+        totals = [verify_tokens] + [t for t in pads if t > verify_tokens]
+        for total in totals:
+            num_tokens = tpu_runner._get_padded_token_len(pads, total)
+            num_reqs = num_verify + (total > verify_tokens)
+            if num_reqs > runner.scheduler_config.max_num_seqs:
+                continue
+            md = manager.get_spec_decode_metadata(
+                num_draft_tokens=np.full(num_verify, K, dtype=np.int32),
+                cu_num_scheduled_tokens=np.cumsum(
+                    np.full(num_verify, 1 + K, dtype=np.int32)
+                ),
+                padded_num_reqs=tpu_runner._get_padded_num_reqs_with_upper_limit(
+                    num_reqs, runner.max_num_reqs
+                ),
+            )
+            logits_len = md.final_logits_indices.shape[0]
+            assert ((num_tokens,), (logits_len,), (logits_len,)) in warmed_extract, (
+                num_verify,
+                total,
+            )
+            assert (
+                (chunk_reqs,),
+                (num_tokens,),
+                (rows,),
+                (chunk_reqs,),
+                (num_tokens,),
+            ) in warmed_subtract, (num_verify, total)
+
+
+@pytest.mark.parametrize("chunk_reqs", [48, 33, 20, 9])
+def test_async_spec_source_rows_hold_every_chunk_split(chunk_reqs):
+    """The parked substitution source and rejected counts are padded to one
+    row count; it must hold every chunk split's padded rows, or a split step
+    parks an odd length and the next step compiles the glue mid-serving."""
+    runner = _glue_runner(chunk_reqs=chunk_reqs)
+    rows = runner._async_spec_source_rows()
+    max_seqs = runner.scheduler_config.max_num_seqs
+    for num_reqs in range(1, max_seqs + 1):
+        full, rest = divmod(num_reqs, chunk_reqs)
+        chunks = [chunk_reqs] * full + ([rest] if rest else [])
+        parked = sum(
+            tpu_runner._get_padded_num_reqs_with_upper_limit(n, runner.max_num_reqs)
+            for n in chunks
+        )
+        assert parked <= rows, (num_reqs, chunks)
