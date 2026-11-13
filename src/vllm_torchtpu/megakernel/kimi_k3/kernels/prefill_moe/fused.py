@@ -19,6 +19,7 @@ time, allowing independent vector/communication work between MXU panels
 without extra calls.
 """
 
+import contextlib
 import dataclasses
 import functools
 from typing import Any
@@ -40,6 +41,33 @@ _MIDDLE = 1536  # each rank's half of an expert's intermediate width
 # all of them up to 4K tokens; from 8K, a launch in which any EP group holds
 # more takes the uncapped fallback on every rank.
 _COMPACT_ROUTES = 65536
+# Named phase scopes for XProf custom-call tracing (KernelConfig.phase_scopes=True).
+PHASE_SCOPES = k._config().phase_scopes
+
+
+def _phase(name):
+    return jax.named_scope(name) if PHASE_SCOPES else contextlib.nullcontext()
+
+
+def _phase_start(name):
+    scope = _phase(name)
+    scope.__enter__()
+    return scope
+
+
+def _phase_end(scope):
+    scope.__exit__(None, None, None)
+
+
+def _scoped(name):
+    """Decorator form of _phase (pl.when and run_scoped bodies, helpers)."""
+    def wrap(function):
+        @functools.wraps(function)
+        def scoped(*args, **kwargs):
+            with _phase(name):
+                return function(*args, **kwargs)
+        return scoped
+    return wrap
 
 
 def _route_capacity(tokens):
@@ -371,6 +399,7 @@ def _route_gather_steps(payload, output, send, recv, *, rank):
         ).wait_recv()
 
 
+@_scoped("m_enter_mesh")
 def _enter_mesh():
     """Match collective lifetimes before any peer can write another's scratch."""
     barrier = pltpu.get_barrier_semaphore()
@@ -799,6 +828,7 @@ def _prologue(
 
         for h in range(passes):
             last = h == passes - 1
+            scope = _phase_start("m_input")
             if h:
                 if sources[h] is not None:
                     input_copy(h).start()
@@ -821,9 +851,13 @@ def _prologue(
             router_copy.wait()
             if not h:
                 bias_copy.wait()
+            _phase_end(scope)
+            scope = _phase_start("m_router")
             hx = own[...]
             logits = jnp.matmul(hx, router_v[...], preferred_element_type=jnp.float32)
             top = _Top16(logits, s["bias"][...])
+            _phase_end(scope)
+            scope = _phase_start("m_latent")
             routed = False
             if big:
                 latent_buffers = tuple(
@@ -886,6 +920,7 @@ def _prologue(
                         )
                         next(route_steps, None)
                         route_started = True
+            _phase_end(scope)
             if last:
                 for _ in route_steps:
                     pass
@@ -903,9 +938,11 @@ def _prologue(
                     s["latent_stores"],
                     rank=rank,
                 )
-            peer_input.wait_send()
-            peer_input.wait_recv()
+            with _phase("m_peer_wait"):
+                peer_input.wait_send()
+                peer_input.wait_recv()
 
+            scope = _phase_start("m_shared_gu")
             gu_copy(0, 0, gate_buffers, gate_sems).start()
             gu_copy(0, 3072, up_buffers, up_sems).start()
             if big:
@@ -937,6 +974,7 @@ def _prologue(
                     )
                     if big:
                         latent_progress()
+            _phase_end(scope)
 
             def shared_store(panel, h=h):
                 bank = panel % 2
@@ -958,6 +996,7 @@ def _prologue(
                 ).astype(jnp.bfloat16)
                 shared_store(panel).start()
 
+            scope = _phase_start("m_shared_down")
             down_copy(0).start()
             pending = None
             for panel in range(28):
@@ -991,16 +1030,21 @@ def _prologue(
             finish_reduction(pending)
             for panel in (26, 27):
                 shared_store(panel).wait()
+            _phase_end(scope)
         if big:
-            for _ in metadata_steps:
-                latent_progress()
+            with _phase("m_metadata_tail"):
+                for _ in metadata_steps:
+                    latent_progress()
             # Start compact VMEM-to-SMEM transfers while the latent rings finish.
             metadata_ready()
-            latent_progress(drain=True)
+            with _phase("m_latent_drain"):
+                latent_progress(drain=True)
         else:
-            latent_progress(drain=True)
-            for _ in metadata_steps:
-                pass
+            with _phase("m_latent_drain"):
+                latent_progress(drain=True)
+            with _phase("m_metadata_tail"):
+                for _ in metadata_steps:
+                    pass
 
     ring_count = passes if big else 1
     scratch = dict(
@@ -1182,6 +1226,7 @@ def _routed_experts(
         )
         # Six directed rings: [target, source, 32 local-contribution row bases].
         # One initialization per layer call, reused across all four columns.
+        scope = _phase_start("m_expert_setup")
         rank = lax.axis_index("k3_sp")
         positions = [tables[f, 0, rank] for f in range(3)]
         peers = []
@@ -1222,8 +1267,10 @@ def _routed_experts(
         ng = jnp.maximum(active_ng, 1)
         (xs, ws), _ = k.generate_block_specs(metadata, cfg)
         state[0] = 0
+        _phase_end(scope)
 
         @functools.partial(pl.run_scoped, ready=pltpu.SemaphoreType.REGULAR)
+        @_scoped("m_ring_enter")
         def initialized(ready):
             for peer in peers:
                 pl.semaphore_signal(ready, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH)
@@ -1238,6 +1285,7 @@ def _routed_experts(
                 streams=regions, buffers=2, state=state, ring_meta=ring_meta, drain=drain, poll_round=poll_round, sparse_poll=(ng >= 72),
             )
 
+        @_scoped("m_emit_subtotals")
         def emit_subtotals(subtotal_vmem):
             @pl.loop(0, tokens // store_tile)
             def block(b):
@@ -1345,9 +1393,11 @@ def _routed_experts(
             if not first:
 
                 @pl.when(g == 0)
+                @_scoped("m_clear")
                 def clear():
                     sums[...] = jnp.zeros(sums.shape, jnp.float32)
 
+                @_scoped("m_ring_poll")
                 def ring_poll():
                     advance(
                         jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem,
@@ -1402,6 +1452,7 @@ def _routed_experts(
                 )
 
             @pl.when(g > 0)
+            @_scoped("m_consume_tail")
             def previous_tail():
                 consume(
                     previous_g,
@@ -1412,13 +1463,16 @@ def _routed_experts(
 
             @pl.when(g == ng - 1)
             def finish():
-                consume(g, current, loop_unroll=first_tail_unroll if first else unroll)
+                with _phase("m_consume_last"):
+                    consume(g, current, loop_unroll=first_tail_unroll if first else unroll)
                 if not first:
-                    advance(jnp.int32(32), n - 1, subtotal_vmem, drain=True)
+                    with _phase("m_ring_drain"):
+                        advance(jnp.int32(32), n - 1, subtotal_vmem, drain=True)
                     emit_subtotals(subtotal_vmem)
                     state[0] = 0
 
                     @pl.when(n == width // tn - 1)
+                    @_scoped("m_ring_final_drain")
                     def last():
                         advance(jnp.int32(32), n, subtotal_vmem, drain=True)
 
@@ -1432,6 +1486,7 @@ def _routed_experts(
             act_sems=pltpu.SemaphoreType.DMA((2,)),
             row_weights=pltpu.VMEM((2, tm, 128), jnp.float32),
         )
+        @_scoped("m_first_column")
         def first_column(gu_partial, acts, act_sems, row_weights):
             def buffering(spec):
                 return dataclasses.replace(
@@ -1448,6 +1503,7 @@ def _routed_experts(
                 begin = raw_start // sub * sub
                 return (raw_start, raw_start - begin, raw_end - raw_start)
 
+            @_scoped("m_act_gather")
             def start(g, bank):
                 raw_start, first, n_active = active_bounds(g)
                 unroll = 8 if tokens < 8192 else 16
@@ -1486,6 +1542,7 @@ def _routed_experts(
                 bank = g % 2
 
                 @pl.when(g == 0)
+                @_scoped("m_first_init")
                 def initialize_accumulation():
                     # emit_pipeline has already prefetched the first weights.
                     # The <=4K probability DMA can overlap metadata and prefetch;
@@ -1505,6 +1562,7 @@ def _routed_experts(
                     _, first, n_active = active_bounds(g)
 
                     @pl.when(n_active > 0)
+                    @_scoped("m_act_wait")
                     def wait_active():
                         active = acts.at[bank, pl.ds(first, n_active)]
                         pltpu.make_async_copy(
@@ -1540,6 +1598,7 @@ def _routed_experts(
         @functools.partial(
             pl.run_scoped, subtotal_vmem=pltpu.VMEM((tokens, tn), x.dtype)
         )
+        @_scoped("m_remaining_columns")
         def remaining_columns(subtotal_vmem):
             emit_subtotals(subtotal_vmem)
             state[0] = 0
@@ -1771,6 +1830,7 @@ def _gu_inner(lhs, rhs, output, partial, metadata, row_weights, *, cfgs, overlap
 
     def product(bucket_index):
         rows = cfgs.tiles.bucket_base * (bucket_index + 1)
+        scope = _phase_start(f"m_gu_bm{rows}")
         row = lax.broadcasted_iota(jnp.int32, (rows, lanes), 0)
         live = (first <= row) & (row < last)
         weights = row_weights[:rows, :1]
@@ -1788,6 +1848,7 @@ def _gu_inner(lhs, rhs, output, partial, metadata, row_weights, *, cfgs, overlap
         partial[...] = jnp.where(
             last % cfgs.dims.size_lhs_sublane == 0, zeros, output[last_row]
         )
+        _phase_end(scope)
 
     # The 256-row tile shares the 128-row product to bound instruction size.
     first_bucket = 1 if cfgs.tiles.tile_m == 256 else 0
@@ -1818,6 +1879,7 @@ def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work, group):
     # GU already masks inactive rows; consume() visits only live routes.
     def product(bucket_index):
         rows = cfgs.tiles.bucket_base * (bucket_index + 1)
+        scope = _phase_start(f"m_down_bm{rows}")
         value = _expert_product(
             lhs, rhs, cfgs=cfgs, bucket_rows=rows, overlap_work=overlap_work
         )
@@ -1834,6 +1896,7 @@ def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work, group):
             output[:rows] = value.astype(output.dtype).reshape(
                 rows, 2, cfgs.tiles.tile_n // 2
             )
+        _phase_end(scope)
 
     branches = [
         functools.partial(product, bucket_index=i)
@@ -2112,6 +2175,7 @@ def _epilogue(control, reduced, norm_weight, up_weight, prefix, output):
     vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
 
     def body(s):
+        scope = _phase_start("m_epi_norm")
         copy = pltpu.make_async_copy(norm_weight, s["norm"], s["norm_sem"])
         copy.start()
         copy.wait()
@@ -2159,6 +2223,8 @@ def _epilogue(control, reduced, norm_weight, up_weight, prefix, output):
             s["normalized"][block_rows, :] = (
                 (routed * inverse) * s["norm"][...]
             ).astype(jnp.bfloat16)
+        _phase_end(scope)
+        scope = _phase_start("m_epi_up")
         for panel in range(14):
             bank = panel % 3
             weight_copy(panel).wait()
@@ -2181,6 +2247,7 @@ def _epilogue(control, reduced, norm_weight, up_weight, prefix, output):
             output_copy(panel).start()
         for panel in (11, 12, 13):
             output_copy(panel).wait()
+        _phase_end(scope)
 
     pl.run_scoped(
         body,
@@ -2360,10 +2427,13 @@ def _layer_kernel(
                 probability_copy(probs_v).start()
 
             if mixture is not None:
+                scope = _phase_start("m_mixture")
                 parity = jax.lax.axis_index("k3_sp") % 2
                 mixture(0, own=pair.at[pl.ds(parity * part, part), :])
                 for h in range(1, passes):
                     mixture(h, hbm=sources[h])
+                _phase_end(scope)
+            scope = _phase_start("m_prologue")
             _prologue(
                 tables,
                 control,
@@ -2384,6 +2454,8 @@ def _layer_kernel(
                 counts_ready=counts_ready,
                 metadata_ready=metadata_ready,
             )
+            _phase_end(scope)
+            scope = _phase_start("m_metadata_wait")
             count_copy().wait()
             if route_counts is not None:
                 for e in range(local_experts):
@@ -2408,6 +2480,7 @@ def _layer_kernel(
             indices.wait()
             if compact:
                 probability_copy(probs_v).wait()
+            _phase_end(scope)
 
         pair = vmem((2 * part, hidden_size), jnp.bfloat16)
         if compact:
@@ -2428,6 +2501,7 @@ def _layer_kernel(
                 probability_copy(s["probs_v"]).wait()
 
         def routed_and_epilogue(reduced):
+            scope = _phase_start("m_experts")
             _routed_experts(
                 latent,
                 expert_gu,
@@ -2445,7 +2519,9 @@ def _layer_kernel(
                 tokens=tokens,
                 probabilities_ready=probabilities_ready,
             )
-            _epilogue(control, reduced, norm, latent_up, prefix, output)
+            _phase_end(scope)
+            with _phase("m_epilogue"):
+                _epilogue(control, reduced, norm, latent_up, prefix, output)
 
         def fast():
             # The reduced rows' VMEM is not held through the prologue.
