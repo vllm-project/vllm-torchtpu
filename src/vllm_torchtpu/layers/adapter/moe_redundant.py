@@ -63,6 +63,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+import jax
 import torch
 
 from vllm_torchtpu import envs
@@ -620,19 +621,19 @@ def to_physical(
 _assign_op = None
 
 
+def _assign_jax(ids: jax.Array, copies: jax.Array, ep: int, slots: int) -> jax.Array:
+    """jax_op body (arrays, then statics; annotations resolved by jax_op)."""
+    from vllm_torchtpu.kernels.moe_replica_assign import replica_assign
+
+    return replica_assign(ids, copies, ep=ep, slots=slots)
+
+
 def _get_assign_op():
     global _assign_op
     if _assign_op is None:
         from torch_tpu._internal import pallas
 
-        from vllm_torchtpu.kernels.moe_replica_assign import replica_assign
-
-        import jax
-
-        def assign(ids: jax.Array, copies: jax.Array, ep: int, slots: int) -> jax.Array:
-            return replica_assign(ids, copies, ep=ep, slots=slots)
-
-        op = pallas.jax_op("pallas::moe_replica_assign", assign)
+        op = pallas.jax_op("pallas::moe_replica_assign", _assign_jax)
         op.register_fake(
             lambda ids, copies, ep, slots: torch.empty_like(ids, dtype=torch.int32)
         )
