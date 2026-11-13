@@ -260,7 +260,12 @@ has run; the rest of the TPU checklist is at the end.
   raw id but emitted in swapped order. Raw dumps of both sides were kept
   for 9 of the 17; for the rest the evidence is the per-pass hash pattern.
   The 2 that don't compile are TP configurations, failing identically on
-  both trees (see the `compiler_stats` note).
+  both trees (see the `compiler_stats` note). A second run on this branch
+  after the mk-dev merge, against the base with the same merge, compares
+  the debug order graphs as line sets, pairs small fusions by their raw
+  ids, and sets the expert slots to 0 for the TP configurations so that
+  they compile: all 34 configurations pass, with the megakernel identical
+  and the top-level program differing only in location line numbers.
 - **The profile reproduces candidate4's schedule.** Its tile rule was compared
   with candidate4's own `default_tiles` at the real geometry over the 4..64
   verify buckets, EP and TP (only the fused-bucket ring depths and `hx`
