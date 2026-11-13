@@ -50,6 +50,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu.distributed.dp_world import unified_dp_world
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -229,8 +230,8 @@ class TPUWorker(WorkerBase):
             dp_rank = binding.dp_rank
 
             # TorchTPU uses independent per-engine tpu_dist worlds unless EP
-            # needs a unified DP*TP world for expert collectives.
-            if pc.enable_expert_parallel:
+            # (or a model, see distributed/dp_world) needs a unified DP*TP world.
+            if unified_dp_world(pc):
                 pc.data_parallel_size = dp_size
                 pc.data_parallel_rank = dp_rank
                 if pc.data_parallel_rank_local is None:
@@ -252,7 +253,7 @@ class TPUWorker(WorkerBase):
             os.environ["MASTER_ADDR"] = str(master_addr)
             os.environ["MASTER_PORT"] = str(master_port)
 
-            if pc.enable_expert_parallel:
+            if unified_dp_world(pc):
                 # Setting data_parallel_size above puts
                 # init_distributed_environment() on its DP path, where it
                 # discards the rank and the init method it was handed and
