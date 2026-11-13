@@ -31,6 +31,8 @@ from vllm_torchtpu.models.qwen3_5.kernels.gdn import config
 
 def granule_view(ref: jax.Ref, leading_shape: tuple[int, ...]) -> jax.Ref:
     num_lanes = pltpu.get_tpu_info().num_lanes
+    # jax's Ref stub lacks the bitcast that Pallas TPU refs have at runtime.
+    # pyrefly: ignore[missing-attribute]
     return ref.bitcast(jnp.uint32).reshape(*leading_shape, -1, 1, num_lanes)
 
 
@@ -163,6 +165,8 @@ class BaseBufferedRef(pltpu.BufferedRef):
     metadata_ref: MetadataRef = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
+    # Takes the GDN config and metadata ref that pltpu.BufferedRef.create lacks.
+    # pyrefly: ignore[bad-override]
     def create(
         cls,
         spec: pl.BlockSpec,
@@ -615,6 +619,9 @@ def create_allocs(
         offset=cfg.recurrent_hbm_offset,
     )
 
+    # jax types BufferedRef.input/output as returning BufferedRef; they build
+    # an instance of the subclass they are called on.
+    # pyrefly: ignore[bad-return]
     return (
         qkv_alloc,
         b_alloc,
