@@ -6124,6 +6124,33 @@ class TPUModelRunner(GPUModelRunner):
             )
             token_padding.set_padding_state(self._token_padding_state)
 
+        if (
+            envs.TPU_FUSED_ADD_RMSNORM_QUANT
+            and envs.TPU_FUSED_ADD_RMSNORM_MIN_TOKENS == 0
+        ):
+            logger.warning_once(
+                "TPU_FUSED_ADD_RMSNORM_QUANT=1 has no effect: it pairs only norms "
+                "that run the Pallas RMSNorm, and TPU_FUSED_ADD_RMSNORM_MIN_TOKENS=0 "
+                "keeps vLLM's RMSNorm. Set TPU_FUSED_ADD_RMSNORM_MIN_TOKENS > 0."
+            )
+        if (
+            envs.TPU_FUSED_ADD_RMSNORM_MIN_TOKENS > 0
+            and envs.TPU_FUSED_ADD_RMSNORM_QUANT
+        ):
+            from vllm_torchtpu.layers.adapter.rmsnorm import arm_prequant
+
+            n_pairs = arm_prequant(self.model)
+            logger.info(
+                "TPU_FUSED_ADD_RMSNORM_QUANT: %d norm -> fp8 linear pairs", n_pairs
+            )
+            if n_pairs == 0:
+                logger.warning_once(
+                    "TPU_FUSED_ADD_RMSNORM_QUANT=1 has no effect: no decoder layer "
+                    "has a Pallas-eligible norm in front of a per-channel FP8 "
+                    "fused_qkv_a_proj or dense gate_up_proj that quantizes its "
+                    "input at the norm's row counts."
+                )
+
         # Last: arming needs the drafter's MTP layer and the padding mask.
         if envs.USE_MOE_TP_DECODE_KERNEL:
             from vllm_torchtpu.layers.adapter.moe_tp_decode import arm
