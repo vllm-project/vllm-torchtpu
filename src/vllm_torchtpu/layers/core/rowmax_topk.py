@@ -16,6 +16,8 @@
 The same algorithm as the Pallas kernel in ``kernels/router_topk.py``: ``k``
 passes of (row max -> lowest matching column -> mask that column out). Used
 off-TPU, and as the numerics oracle the kernel tests compare against.
+``rank_topk`` gives the same result from dense ranks; the TPU bridge
+(``layers/adapter/router_topk.py``) runs it for a decode step's few rows.
 """
 
 import torch
@@ -57,5 +59,31 @@ def rowmax_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tenso
     ids = torch.cat(indices, dim=-1)
     # No score above the sentinel means no real maximum: keep the row
     # poisonous so the caller's renormalization propagates it.
+    weights = torch.where(weights[..., :1] <= NEG, torch.nan, weights)
+    return weights, ids
+
+
+def rank_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """`rowmax_topk`'s result from each score's rank in one pass.
+
+    A score's rank is the number of scores ahead of it in the selection
+    order (larger, or equal at a lower expert id); the k picks are the ranks
+    ``0 .. k-1``. Two dense compare-reduce passes over ``[rows, n, n]``
+    replace k dependent max-and-mask steps, for the few rows of a decode
+    step.
+    """
+    n = scores.shape[-1]
+    if k > n:
+        raise ValueError(f"topk k={k} exceeds the expert count {n}")
+    iota = torch.arange(n, device=scores.device, dtype=torch.int32)
+    cur = torch.where(scores > NEG, scores, NEG)
+    mine, other = cur.unsqueeze(-1), cur.unsqueeze(-2)
+    lower = iota.view(1, n) < iota.view(n, 1)  # [mine, other]: other's id is lower
+    ahead = (other > mine) | ((other == mine) & lower)
+    rank = ahead.sum(dim=-1, dtype=torch.int32)
+    slot = torch.arange(k, device=scores.device, dtype=torch.int32).view(k, 1)
+    hit = rank.unsqueeze(-2) == slot  # [..., k, n]: one hit per slot
+    ids = torch.where(hit, iota, 0).sum(dim=-1, dtype=torch.int32)
+    weights = torch.where(hit, cur.unsqueeze(-2), 0.0).sum(dim=-1)
     weights = torch.where(weights[..., :1] <= NEG, torch.nan, weights)
     return weights, ids

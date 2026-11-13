@@ -14,7 +14,8 @@
 """Torch bridge for the sort-free MoE router top-k.
 
 On TPU the selection runs as the Pallas kernel in ``kernels/router_topk.py``,
-elsewhere as the identical plain-torch algorithm in
+except for a decode step's few rows, which take the dense rank form
+(``rank_topk``); elsewhere it runs as the identical plain-torch algorithm in
 ``layers/core/rowmax_topk.py``.
 """
 
@@ -22,7 +23,12 @@ import torch
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.router_topk import router_topk
-from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
+from vllm_torchtpu.layers.core.rowmax_topk import rank_topk, rowmax_topk
+
+# Up to this many [rows, experts, experts] compares (a decode step's rows:
+# 64 at 128 experts), the dense rank top-k fuses into two XLA ops, cheaper
+# than a kernel call. Measured at 8 and 24 rows x 128 experts.
+_RANK_TOPK_MAX_ELEMS = 1 << 20
 
 
 def _fake_router_topk(scores: torch.Tensor, topk: int):
@@ -47,4 +53,7 @@ def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.
         raise ValueError(
             f"router top-k kernel expects [rows, experts], got {scores.shape}"
         )
+    rows, experts = scores.shape
+    if rows * experts * experts <= _RANK_TOPK_MAX_ELEMS:
+        return rank_topk(scores.float(), topk)
     return _op(scores.float(), topk)

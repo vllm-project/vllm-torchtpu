@@ -21,7 +21,7 @@ the only freedom either path has -- torch_tpu emits ``is_stable=false``.
 import pytest
 import torch
 
-from vllm_torchtpu.layers.core.rowmax_topk import NEG, rowmax_topk
+from vllm_torchtpu.layers.core.rowmax_topk import NEG, rank_topk, rowmax_topk
 
 EXPERTS = 512
 TOPK = 10
@@ -298,3 +298,27 @@ def test_renormalized_weights_match_the_sort_path():
     ref_v, _ = torch.topk(scores, TOPK, dim=-1)
     got_v, _ = rowmax_topk(scores, TOPK)
     assert torch.equal(renorm(got_v), renorm(ref_v))
+
+
+@pytest.mark.parametrize(
+    "rows,experts,k", [(8, 128, 4), (32, 128, 4), (5, 256, 8), (16, 512, 10)]
+)
+@pytest.mark.parametrize("fill", ["normal", "ties", "sentinels", "nan"])
+def test_rank_topk_is_rowmax_topk(rows, experts, k, fill):
+    """The dense rank form returns the max-and-mask form's values and ids,
+    bit for bit, on ties, clamped scores and all-invalid rows."""
+    torch.manual_seed(rows + experts + k)
+    scores = torch.randn(rows, experts)
+    if fill == "ties":
+        scores = torch.randint(-3, 3, (rows, experts)).float()
+    elif fill == "sentinels":
+        scores[0] = float("-inf")
+        scores[1, :5] = -3.3e38
+    elif fill == "nan":
+        scores[0] = float("nan")
+        scores[2, ::3] = float("nan")
+    want_v, want_i = rowmax_topk(scores, k)
+    got_v, got_i = rank_topk(scores, k)
+    assert got_i.dtype == torch.int32 and got_v.dtype == want_v.dtype
+    assert torch.equal(got_i, want_i)
+    torch.testing.assert_close(got_v, want_v, rtol=0, atol=0, equal_nan=True)
