@@ -66,6 +66,14 @@ from vllm_torchtpu.kernels.experimental.small_collectives import (
     all_reduce,
     reduce_scatter,
 )
+from vllm_torchtpu.kernels.experimental.small_collectives.all_reduce_placement import (
+    cores_of,
+    d2d_direct_meta,
+    d2d_direct_patterns,
+    ordered_patterns,
+    small_all_reduce_d2d_direct,
+    small_all_reduce_ordered,
+)
 from vllm_torchtpu.kernels.experimental.small_collectives.common import LANES
 from vllm_torchtpu.kernels.quantized_matmul import fp8_oproj_all_reduce
 from vllm_torchtpu.layers.adapter import token_padding
@@ -113,7 +121,7 @@ _DP_COMBINE = False
 _MM_AR_OP = None
 
 
-def _build_all_reduce(mesh, psum_above: int | None = None):
+def _build_all_reduce(mesh, psum_above: int | None = None, placement_spec=None):
     """The all-reduce op over ``mesh``. With ``psum_above``, a block of more
     rows than that is summed by XLA's all-reduce instead of the kernel: the
     block's rows are concrete when JAX exports each bucket, so the choice
@@ -124,6 +132,27 @@ def _build_all_reduce(mesh, psum_above: int | None = None):
     def body(block, rank):
         if psum_above is not None and block.shape[0] > psum_above:
             return jax.lax.psum(block, EP_AXIS_NAME)
+
+        if (
+            placement_spec is not None
+            and block.size * block.dtype.itemsize > all_reduce.ONE_SHOT_MAX_BYTES
+        ):
+            mode_name, exact_partials, patterns = placement_spec
+            if mode_name == "d2d_direct":
+                return small_all_reduce_d2d_direct(
+                    block,
+                    rank,
+                    num_cores=n,
+                    axis=EP_AXIS_NAME,
+                    ordered=True,
+                    exact_partials=exact_partials,
+                    patterns=patterns,
+                )
+            elif mode_name == "ordered":
+                return small_all_reduce_ordered(
+                    block, rank, num_cores=n, axis=EP_AXIS_NAME, patterns=patterns
+                )
+
         return all_reduce.small_all_reduce(
             block, num_cores=n, axis=EP_AXIS_NAME, rank=rank
         )
@@ -237,6 +266,57 @@ def _build_reduce_scatter(mesh):
     )
 
 
+def _resolve_placement_spec(cores, mode: str):
+    mode = mode.strip().lower()
+    if not mode or mode in ("0", "off"):
+        return None
+    if mode not in ("1", "f32", "bf16", "ordered"):
+        raise ValueError(f"Unknown TPU_SMALL_ALL_REDUCE_PLACEMENT mode: {mode}")
+    if len(cores) < 4 or len(cores) % 2 != 0:
+        logger.warning(
+            f"TPU_SMALL_ALL_REDUCE_PLACEMENT={mode} disabled: mesh has {len(cores)} "
+            "cores, not a regular dual-die topology"
+        )
+        return None
+    try:
+        if mode in ("1", "f32"):
+            patterns = d2d_direct_patterns(d2d_direct_meta(cores, ordered=True))
+            return ("d2d_direct", True, patterns)
+        elif mode == "bf16":
+            patterns = d2d_direct_patterns(d2d_direct_meta(cores, ordered=True))
+            return ("d2d_direct", False, patterns)
+        elif mode == "ordered":
+            patterns = ordered_patterns(cores)
+            return ("ordered", False, patterns)
+    except ValueError as e:
+        logger.warning(f"TPU_SMALL_ALL_REDUCE_PLACEMENT={mode} disabled: {e}")
+        return None
+    if len(cores) < 4 or len(cores) % 2 != 0:
+        logger.warning(
+            f"TPU_SMALL_ALL_REDUCE_PLACEMENT={mode} disabled: mesh has {len(cores)} cores, not a regular dual-die topology"
+        )
+        return None
+    try:
+        if mode in ("1", "f32"):
+            patterns = d2d_direct_patterns(d2d_direct_meta(cores, ordered=True))
+            return ("d2d_direct", True, patterns)
+        elif mode == "bf16":
+            patterns = d2d_direct_patterns(d2d_direct_meta(cores, ordered=True))
+            return ("d2d_direct", False, patterns)
+        elif mode == "ordered":
+            patterns = ordered_patterns(cores)
+            return ("ordered", False, patterns)
+        else:
+            raise ValueError(f"Unknown TPU_SMALL_ALL_REDUCE_PLACEMENT mode: {mode}")
+    except ValueError as e:
+        logger.warning(f"TPU_SMALL_ALL_REDUCE_PLACEMENT={mode} disabled: {e}")
+        return None
+
+
+def _mesh_cores(mesh, axis):
+    return cores_of(mesh.devices.flatten())
+
+
 def prebuild() -> None:
     """Build the ops and this core's rank tensor, outside any traced region:
     the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE."""
@@ -262,9 +342,16 @@ def prebuild() -> None:
     assert ep_group is not None  # build_ep_mesh() returned a mesh over it
     _MESH_RANKS = tuple(int(r) for r in ep_group.ranks)
     _RANK = torch.tensor([ep_mesh_index()], dtype=torch.int32, device="tpu")
-    _AR_OP = _build_all_reduce(mesh)
+
+    placement_spec = _resolve_placement_spec(
+        _mesh_cores(mesh, EP_AXIS_NAME), envs.TPU_SMALL_ALL_REDUCE_PLACEMENT
+    )
+
+    _AR_OP = _build_all_reduce(mesh, placement_spec=placement_spec)
     if envs.TPU_SMALL_ALL_REDUCE_DRAFT:
-        _AR_SIZED_OP = _build_all_reduce(mesh, psum_above=max_rows())
+        _AR_SIZED_OP = _build_all_reduce(
+            mesh, psum_above=max_rows(), placement_spec=placement_spec
+        )
     _RS_OP = _build_reduce_scatter(mesh)
     if envs.TPU_SMALL_ALL_REDUCE_VALID_ROWS:
         from jax.experimental.pallas import tpu as pltpu
@@ -281,7 +368,8 @@ def prebuild() -> None:
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
         "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
-        "dp_combine=%s | outside_warmup=%s | valid_rows=%s | fused_oproj_ar=%s",
+        "dp_combine=%s | outside_warmup=%s | valid_rows=%s | fused_oproj_ar=%s | "
+        "placement=%s",
         _CORES,
         max_rows(),
         COMBINE_MAX_ROWS,
@@ -295,6 +383,7 @@ def prebuild() -> None:
         if _AR_VALID_OP is not None
         else "off",
         _MM_AR_OP is not None,
+        placement_spec[0] if placement_spec is not None else "off",
     )
 
 
