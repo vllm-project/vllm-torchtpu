@@ -41,78 +41,45 @@ def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:
 # NOTE: Fork of recurrent_scan_v2.py but applied various optimizations.
 def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     """Compute invert matrix of a given triauglar matrix."""
-
-    # NOTE: if chunk_size=1, compiler will perform DCE.
+    del block_size
     out_dtype = t.dtype
     chunk = t.shape[-1]
-    block_size = min(block_size, chunk)
-    if chunk % block_size:
-        raise ValueError(
-            f"Chunk size {chunk} must be divisible by block size {block_size}")
-    num_blocks = chunk // block_size
-    sub_block = min(8, block_size)
+    t_f32 = t.astype(jnp.float32)
+    iota_r = jax.lax.broadcasted_iota(jnp.int32, t.shape, 1)
+    iota_c = jax.lax.broadcasted_iota(jnp.int32, t.shape, 2)
+    xor_lower = jnp.where(iota_r > iota_c, iota_r ^ iota_c, 0)
 
-    def _forward_sub_strip(t_mat, b_mat, n_rows):
-        x_list = []
-        for i in range(n_rows):
-            b_i = b_mat[:, i, :]
-            if i == 0:
-                x_i = b_i
-            else:
-                stacked_x = jnp.stack(x_list, axis=1)
-                all_prev_t = t_mat[:, i, :i]
-                prev_sum = jnp.sum(all_prev_t[..., None] * stacked_x, axis=1)
-                x_i = b_i - prev_sum
-            x_list.append(x_i)
-        return jnp.stack(x_list, axis=1)
-
-    def local_forward_sub(t_mat, b_mat):
-        if block_size <= sub_block:
-            return _forward_sub_strip(t_mat, b_mat, block_size)
-        x_top = _forward_sub_strip(t_mat[:, :sub_block, :sub_block],
-                                   b_mat[:, :sub_block, :], sub_block)
-        b_bot = b_mat[:, sub_block:, :] - jax.lax.dot(
-            t_mat[:, sub_block:, :sub_block],
-            x_top,
-            dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+    inv = jnp.where(
+        xor_lower == 1,
+        -t_f32,
+        jnp.where(iota_r == iota_c, 1.0, 0.0),
+    )
+    dot_dims = (((2, ), (1, )), ((0, ), (0, )))
+    shift = 1
+    while (1 << shift) < chunk:
+        t_sub = jnp.where((xor_lower >> shift) == 1, t_f32, 0.0)
+        inv = inv - jax.lax.dot(
+            inv,
+            jax.lax.dot(
+                t_sub,
+                inv,
+                dimension_numbers=dot_dims,
+                preferred_element_type=jnp.float32,
+            ),
+            dimension_numbers=dot_dims,
             preferred_element_type=jnp.float32,
         )
-        x_bot = _forward_sub_strip(t_mat[:, sub_block:, sub_block:], b_bot,
-                                   block_size - sub_block)
-        return jnp.concatenate([x_top, x_bot], axis=1)
+        shift += 1
 
-    x_blocks = []
-    iota_c = jax.lax.broadcasted_iota(jnp.int32,
-                                      (t.shape[0], block_size, chunk), 2)
-    for i in range(num_blocks):
-        start, end = i * block_size, (i + 1) * block_size
-        iota_r_block = jax.lax.broadcasted_iota(
-            jnp.int32, (t.shape[0], block_size, chunk), 1) + start
-        e_block = jnp.where(iota_r_block == iota_c, 1.0, 0.0)
-
-        if i == 0:
-            target_b = e_block
-        else:
-            interaction_t = t[:, start:end, :start]
-            solved_x = jnp.concatenate(x_blocks, axis=1)
-            prev_sum = jax.lax.dot(
-                interaction_t,
-                solved_x,
-                dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
-                preferred_element_type=jnp.float32,
-            )
-            target_b = e_block - prev_sum
-
-        # NOTE: Utilize fp32 to minimize cost of sublane rolling.
-        local_t = t[:, start:end, start:end].astype(jnp.float32)
-        x_block = local_forward_sub(local_t, target_b)
-        x_blocks.append(x_block.astype(out_dtype))
-
-    return jnp.concatenate(x_blocks, axis=1)
+    return inv.astype(out_dtype)
 
 
-def fused_transpose_broadcast(x: jax.Array, src_dim: int,
-                              dst_dim: int) -> jax.Array:
+def fused_transpose_broadcast(
+    x: jax.Array,
+    src_dim: int,
+    dst_dim: int,
+    dst_size: int | None = None,
+) -> jax.Array:
     """Perform 1D transpose where results are broadcasted along src_dim."""
     assert x.shape[dst_dim] == 1
 
@@ -120,7 +87,7 @@ def fused_transpose_broadcast(x: jax.Array, src_dim: int,
     mask_dtype = get_mask_dtype(dtype)
     mask_shape = list(x.shape)
     mask_size = mask_shape[src_dim]
-    mask_shape[dst_dim] = mask_size
+    mask_shape[dst_dim] = mask_size if dst_size is None else dst_size
     src_mask = jax.lax.broadcasted_iota(mask_dtype, mask_shape, src_dim)
     dst_mask = jax.lax.broadcasted_iota(mask_dtype, mask_shape, dst_dim)
     mask = src_mask == dst_mask
@@ -138,21 +105,29 @@ def chunked_gdn_per_seq(
 ) -> tuple[jax.Array, jax.Array]:
     """Perform chunked GDN over input [num_heads, chunk, head_dim]."""
 
-    # Compute cumulative sum of decay.
-    # [1, 1, num_v_heads]
-    g_cum_sum_list = [gating_log[:, :1]]
-    for row in range(1, cfg.chunk_size):
-        g_cum_sum_list.append(g_cum_sum_list[-1] + gating_log[:, row:row + 1])
-    # [1, chunk, num_v_heads]
-    g_cum_sum_log = jnp.concat(g_cum_sum_list, axis=1)
+    # Compute cumulative sum of decay via logarithmic tree scan.
+    # [1, chunk, aligned_num_v_heads]
+    g_cum_sum_log = gating_log
+    step = 1
+    while step < cfg.chunk_size:
+        g_cum_sum_log = jnp.concat(
+            [
+                g_cum_sum_log[:, :step],
+                g_cum_sum_log[:, step:] + g_cum_sum_log[:, :-step],
+            ],
+            axis=1,
+        )
+        step <<= 1
 
     # [num_v_heads, chunk, 1]
     g_cum_sum_log = fused_transpose_broadcast(g_cum_sum_log,
                                               src_dim=2,
-                                              dst_dim=0)
-    g_cum_sum_log = g_cum_sum_log[:cfg.num_v_heads]
-    beta = fused_transpose_broadcast(beta, src_dim=2, dst_dim=0)
-    beta_large = beta[:cfg.num_v_heads]
+                                              dst_dim=0,
+                                              dst_size=cfg.num_v_heads)
+    beta_large = fused_transpose_broadcast(beta,
+                                           src_dim=2,
+                                           dst_dim=0,
+                                           dst_size=cfg.num_v_heads)
 
     # [num_v_heads, 1, chunk]
     g_cum_sum_log_t = fused_transpose_broadcast(g_cum_sum_log,
@@ -171,11 +146,8 @@ def chunked_gdn_per_seq(
     iota_r = jax.lax.broadcasted_iota(mask_dtype, g_cum_sum_diff_log.shape, 1)
     iota_c = jax.lax.broadcasted_iota(mask_dtype, g_cum_sum_diff_log.shape, 2)
     identity_mask = iota_r == iota_c
-    strictly_lower_mask = iota_r > iota_c
     lower_mask = iota_r >= iota_c
     gating_map = jnp.where(lower_mask, jnp.exp(g_cum_sum_diff_log), 0)
-    # [num_v_heads, chunk, chunk]
-    gating_map_masked = jnp.where(strictly_lower_mask, gating_map, 0)
 
     # Compute symmetric K @ K^T on num_kq_heads before GQA repeat (4x fewer MXU matmuls).
     # [num_kq_heads, chunk, chunk]
@@ -187,15 +159,13 @@ def chunked_gdn_per_seq(
     ).astype(cfg.dtypes.compute)
     # [num_v_heads, chunk, chunk]
     beta_k_k_t = jnp.repeat(k_k_t, cfg.v_per_kq_head, axis=0) * beta_large
-    gating_beta_k_k_t = gating_map_masked * beta_k_k_t
-    t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
+    t = jnp.where(identity_mask, 1, gating_map * beta_k_k_t)
 
     # [num_v_heads, chunk, chunk]
     t_inv = invert_triangular_matrix(t)
 
     # NOTE: Repeat along non lane/sublane dim is free; deferring past
     # invert_triangular_matrix reduces live VREG pressure across the solve.
-    q_repeat = jnp.repeat(q_large, cfg.v_per_kq_head, axis=0)
     k_repeat = jnp.repeat(k_large, cfg.v_per_kq_head, axis=0)
 
     # [num_v_heads, chunk, v_head_dim]
@@ -217,6 +187,7 @@ def chunked_gdn_per_seq(
     # [num_v_heads, chunk, v_head_dim]
     u, w = jnp.split(merged_uw, [cfg.v_head_dim], axis=-1)
 
+    q_repeat = jnp.repeat(q_large, cfg.v_per_kq_head, axis=0)
     # [num_v_heads, chunk, kq_head_dim]
     q_large_gating = q_repeat * gating_forward
     # NOTE: Concatenate lhs with same rhs to leverage weight
@@ -467,9 +438,7 @@ def recurrent_gdn(
     dt_bias = dt_bias.reshape(1, 1, 1, 1, -1).astype(cfg.dtypes.compute)
 
     # [seqs, num_kq_heads, chunk, 1, kq_head_dim]
-    q_compact = l2_norm(q_compact)
-    q_scale = cfg.kq_head_dim**-0.5
-    q_compact *= q_scale
+    q_compact = l2_norm(q_compact, scale=cfg.kq_head_dim**-0.5)
     k_compact = l2_norm(k_compact)
     k_compact_t = fused_transpose_broadcast(k_compact, src_dim=4, dst_dim=3)
 
@@ -483,10 +452,14 @@ def recurrent_gdn(
     gating_log = jnp.where(mask, gating_log, 0)
     gating_log = jnp.exp(gating_log)
 
-    beta = fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)
-    beta = beta[:, :cfg.num_v_heads]
-    gating_log = fused_transpose_broadcast(gating_log, src_dim=4, dst_dim=1)
-    gating_log = gating_log[:, :cfg.num_v_heads]
+    beta = fused_transpose_broadcast(beta,
+                                     src_dim=4,
+                                     dst_dim=1,
+                                     dst_size=cfg.num_v_heads)
+    gating_log = fused_transpose_broadcast(gating_log,
+                                           src_dim=4,
+                                           dst_dim=1,
+                                           dst_size=cfg.num_v_heads)
 
     out_list = []
     new_state_list = []

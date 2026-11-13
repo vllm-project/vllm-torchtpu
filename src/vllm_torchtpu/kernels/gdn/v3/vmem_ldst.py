@@ -44,6 +44,14 @@ def load_strided_heads(vmem_ref: jax.Ref,
     lanes_per_head = head_dim // num_lanes
 
     flat_ref = vmem_ref.reshape(-1, num_lanes)
+    if lanes_per_head == 1:
+        return jnp.stack(
+            [
+                flat_ref[lane_offset + head::lanes_per_col]
+                for head in range(num_heads)
+            ],
+            axis=0,
+        )
     head_list = []
     for head in range(num_heads):
         head_lanes = [
@@ -87,6 +95,8 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     new_shape = vmem_ref.shape[:-2] + (col_size, )
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
+    if col_size <= num_lanes:
+        return vmem_ref[...].reshape(new_shape)
 
     vreg_list = []
     vmem_ref = vmem_ref.reshape(-1, col_size)
@@ -125,13 +135,9 @@ def load_state_region(slot_ref: jax.Ref, region: config.StateRegion,
     Returns:
         The logical state of ``shape`` in ``region.view_dtype``.
     """
-    parts = [
-        typed_ldst.load_typed(slot_ref.at[j],
-                              view_dtype=region.view_dtype,
-                              lane_split=region.lane_split)
-        for j in range(region.nblocks)
-    ]
-    arr = parts[0] if region.nblocks == 1 else jnp.concat(parts, axis=0)
+    arr = typed_ldst.load_typed(slot_ref,
+                                view_dtype=region.view_dtype,
+                                lane_split=region.lane_split)
     arr = arr[:region.rows_used]
     if region.rows_perm is not None:
         # Static row gather from the stored order to the logical order;
@@ -160,10 +166,7 @@ def store_state_region(slot_ref: jax.Ref, region: config.StateRegion,
     capacity = region.nblocks * rows_pb
     if region.rows_used < capacity:
         arr = jnp.pad(arr, ((0, capacity - region.rows_used), (0, 0)))
-    for j in range(region.nblocks):
-        typed_ldst.store_typed(slot_ref.at[j],
-                               arr[j * rows_pb:(j + 1) * rows_pb],
-                               lane_split=region.lane_split)
+    typed_ldst.store_typed(slot_ref, arr, lane_split=region.lane_split)
 
 
 def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig,
@@ -262,12 +265,20 @@ def load_and_select_states(
             # pl.when traces the body here, so `idx` is this iteration's.
             @pl.when(is_first_tile)
             def _():
-                carry_conv_scratch_ref[idx] = jnp.where(
-                    has_initial_state,
-                    _load_conv_state(conv_state_slot_ref, cfg, idx), 0)
-                carry_recurrent_scratch_ref[idx] = jnp.where(
-                    has_initial_state,
-                    _load_recurrent_state(recurrent_slot_ref, cfg, idx), 0)
+
+                @pl.when(has_initial_state)
+                def _():
+                    carry_conv_scratch_ref[idx] = _load_conv_state(
+                        conv_state_slot_ref, cfg, idx)
+                    carry_recurrent_scratch_ref[idx] = _load_recurrent_state(
+                        recurrent_slot_ref, cfg, idx)
+
+                @pl.when(jnp.logical_not(has_initial_state))
+                def _():
+                    carry_conv_scratch_ref[idx] = jnp.zeros_like(
+                        carry_conv_scratch_ref[idx])
+                    carry_recurrent_scratch_ref[idx] = jnp.zeros_like(
+                        carry_recurrent_scratch_ref[idx])
 
             prev_conv_state = carry_conv_scratch_ref[idx]
             prev_recurrent_state = carry_recurrent_scratch_ref[idx]
