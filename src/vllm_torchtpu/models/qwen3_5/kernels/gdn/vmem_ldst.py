@@ -43,6 +43,8 @@ def load_strided_heads(
     lanes_per_col = vmem_ref.shape[-1] // num_lanes
     lanes_per_head = head_dim // num_lanes
 
+    # jax's Ref stub lacks the reshape that Pallas TPU refs have at runtime.
+    # pyrefly: ignore[missing-attribute]
     flat_ref = vmem_ref.reshape(-1, num_lanes)
     head_list = []
     for head in range(num_heads):
@@ -88,6 +90,8 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     num_lanes = tpu_info.num_lanes
 
     vreg_list = []
+    # jax's Ref stub lacks the reshape that Pallas TPU refs have at runtime.
+    # pyrefly: ignore[missing-attribute]
     vmem_ref = vmem_ref.reshape(-1, col_size)
     for col_start in range(0, col_size, num_lanes):
         col_end = min(col_start + num_lanes, col_size)
