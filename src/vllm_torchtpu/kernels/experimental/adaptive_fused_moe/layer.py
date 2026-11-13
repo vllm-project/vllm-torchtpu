@@ -489,6 +489,17 @@ def adaptive_fused_moe(
             denom = topk_weights.sum(axis=-1, keepdims=True)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
         topk_weights = jnp.where(row_routes, topk_weights, 0.0)
+        skip_unrouted = envs.MOE_ADAPTIVE_SKIP_UNROUTED
+        if skip_unrouted:
+            # MOE_ADAPTIVE_SKIP_UNROUTED: a row that routes nowhere (token
+            # padding, NaN-masked by the adapter; split fill, -inf) takes the
+            # out-of-range expert id `e_total` on every slot instead of expert
+            # 0. The histograms compare against `arange(e_total)` and the slab
+            # row of an id no shard owns is the off-shard drop row, so such a
+            # row is neither counted, pushed, gathered nor computed. Without
+            # this, padding rows all land on one expert per layer and the
+            # whole step waits for it (~1.4 ms/layer at ~65% padding).
+            topk_idx = jnp.where(row_routes, topk_idx, jnp.asarray(e_total, topk_idx.dtype))
         # A count of the masked rows would be the other half of this: an
         # incident today is degraded output against a completely clean log.
         # It is not added here because the only in-trace channel for it,
@@ -644,6 +655,10 @@ def adaptive_fused_moe(
         combined = _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
         )
+        if skip_unrouted:
+            # An unrouted row's slots point at no arrival of its own; its
+            # output is defined as zero (the real rows are untouched).
+            combined = jnp.where(row_routes, combined, jnp.zeros((), combined.dtype))
         return token_layout.restore(combined, ax)
 
     # The biases ride the same expert-axis sharding as the weights they
