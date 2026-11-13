@@ -396,3 +396,11 @@ def test_prepare_skips_graphs_traced_once_for_every_bucket(monkeypatch):
     assert not hasattr(layer, "_rx_plan")
     monkeypatch.setattr(rx, "_model_tag", lambda: "backbone")
     assert rx.prepare(layer) == 2
+
+
+def test_assign_op_signature_resolves():
+    """jax_op reads the body's type hints (module-level names only)."""
+    import typing
+
+    hints = typing.get_type_hints(rx._assign_jax)
+    assert hints["ep"] is int and hints["slots"] is int
