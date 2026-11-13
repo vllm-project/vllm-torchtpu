@@ -169,15 +169,30 @@ class _ArrayRef:
             self._buf[self._norm(idx)] = arr
 
 
-@pytest.mark.parametrize("tokens", [512, 2048, 4096, 8192])
+@pytest.mark.parametrize(
+    ("tokens", "hot"),
+    [(512, 0), (2048, 0), (4096, 0), (8192, 0), (16384, 0), (16384, 0.19)],
+)
 @pytest.mark.parametrize("local_experts", [56])
-def test_metadata_steps_ep16(tokens, local_experts):
+def test_metadata_steps_ep16(monkeypatch, tokens, hot, local_experts):
+    """Counts, group maximum and the expert-major/token-major local routes.
+
+    ``hot`` moves that fraction of the routes onto group 0, which brings its
+    ranks' local routes close to the 16K compact capacity.
+    """
     import jax
     from jax.experimental import pallas as pl
 
+    # The eager path below runs outside a kernel, where pltpu.roll (jnp.roll
+    # semantics; test_compact_chunk checks the kernel's) has no CPU rule.
+    monkeypatch.setattr(fused.pltpu, "roll", jnp.roll)
     rows = tokens // 32
     rng = np.random.default_rng(1030 + local_experts + tokens)
     ids_by_rank = rng.integers(0, 896, size=(32, rows, 16), dtype=np.int32)
+    if hot:
+        moved = rng.random(ids_by_rank.shape) < hot
+        group0 = rng.integers(0, local_experts, size=ids_by_rank.shape)
+        ids_by_rank = np.where(moved, group0, ids_by_rank).astype(np.int32)
     probs_by_rank = rng.uniform(0.01, 1.0, size=(32, rows, 16)).astype(np.float32)
     probs_by_rank[-1, -5:, :] = 0.0
     ids_all = ids_by_rank.reshape(tokens, 16)
@@ -246,7 +261,7 @@ def test_metadata_steps_ep16(tokens, local_experts):
                 wire, jnp.array([rank], dtype=jnp.int32)
             )
         else:
-            keys_buf = np.zeros((rows * 4, 128), dtype=np.int32)
+            keys_buf = np.zeros((fused._sort_rows(tokens), 128), dtype=np.int32)
             probs_buf = np.zeros((tokens // 8, 128), dtype=np.float32)
             tids_buf = np.zeros((tokens // 8, 128), dtype=np.int32)
             counts_buf = np.zeros((local_experts,), dtype=np.int32)
@@ -272,6 +287,7 @@ def test_metadata_steps_ep16(tokens, local_experts):
         expected_counts = hist_896[first_exp : first_exp + local_experts]
         np.testing.assert_array_equal(np.asarray(counts_out), expected_counts)
         total_local = int(expected_counts.sum())
+        assert total_local <= fused._route_capacity(tokens)
         expected_routes = []
         for e in range(first_exp, first_exp + local_experts):
             tok_idx, slot_idx = np.where((ids_all == e) & live_mask)
@@ -287,6 +303,68 @@ def test_metadata_steps_ep16(tokens, local_experts):
             np.asarray(probs_out).reshape(-1)[:total_local],
             np.array([p for _, p in expected_routes], dtype=np.float32),
         )
+
+
+@pytest.mark.parametrize("offset", [0, 129, 4095, 65535 - 2047, 70000])
+def test_compact_chunk_appends_the_valid_routes_in_order(offset):
+    """The chunk compaction and append, run as a kernel (pltpu.roll's own
+    interpret rule): valid entries keep their row-major order from route
+    ``offset`` on, earlier slots keep their contents, later window slots get
+    the empty key, and an offset past the capacity stays inside the buffer."""
+    import jax
+    from jax.experimental import pallas as pl
+
+    limit = fused._route_capacity(16384) // 128
+    rows = fused._sort_rows(16384)
+
+    def kern(keys_in, values_in, valid_in, offset_ref, keys, values, count):
+        keys[...] = jnp.full(keys.shape, -1, jnp.int32)
+        values[...] = jnp.full(values.shape, -1.0, jnp.float32)
+        packed, probs, filled, n = fused._compact_chunk(
+            keys_in[...], values_in[...], valid_in[...] != 0
+        )
+        fused._append_chunk(
+            keys, values, packed, probs, filled, offset_ref[0], limit=limit
+        )
+        count[...] = jnp.full(count.shape, n, jnp.int32)
+
+    fn = jax.jit(
+        pl.pallas_call(
+            kern,
+            out_shape=(
+                jax.ShapeDtypeStruct((rows, 128), jnp.int32),
+                jax.ShapeDtypeStruct((rows, 128), jnp.float32),
+                jax.ShapeDtypeStruct((8, 128), jnp.int32),
+            ),
+            interpret=True,
+        )
+    )
+    rng = np.random.default_rng(offset)
+    for density in (0.0, 0.004, 1 / 16, 0.5, 1.0):
+        keys_in = rng.integers(0, 2**24, size=(16, 128), dtype=np.int32)
+        values_in = rng.standard_normal((16, 128)).astype(np.float32)
+        valid = rng.random((16, 128)) < density
+        keys, values, count = map(
+            np.asarray,
+            fn(
+                keys_in,
+                values_in,
+                valid.astype(np.int32),
+                jnp.array([offset], jnp.int32),
+            ),
+        )
+        n = int(valid.sum())
+        assert int(count[0, 0]) == n
+        start = min(offset // 128, limit) * 128 + offset % 128
+        flat_keys, flat_values = keys.reshape(-1), values.reshape(-1)
+        window_end = min(offset // 128, limit) * 128 + 17 * 128
+        np.testing.assert_array_equal(flat_keys[:start], -1)
+        np.testing.assert_array_equal(flat_keys[start : start + n], keys_in[valid])
+        np.testing.assert_array_equal(flat_values[start : start + n], values_in[valid])
+        np.testing.assert_array_equal(
+            flat_keys[start + n : window_end], fused._EMPTY_ROUTE
+        )
+        np.testing.assert_array_equal(flat_keys[window_end:], -1)
 
 
 def test_mla_projections_head_major_matches_transposed_masked():

@@ -75,6 +75,95 @@ def _route_capacity(tokens):
     return min(tokens * 16, _COMPACT_ROUTES)
 
 
+def _sorts_local_routes(tokens):
+    """Whether a ``tokens`` launch sorts only its local routes: one whose
+    overflow is redone by smaller launches consumes nothing but the compact
+    prefix of the sorted routes."""
+    return tokens in _OVERFLOW_PARTS
+
+
+def _sort_rows(tokens):
+    """Rows (128 route keys each) of a ``tokens`` launch's sort buffer."""
+    if _sorts_local_routes(tokens):
+        # The compact capacity plus one chunk's spill past its last route.
+        return _route_capacity(tokens) // 128 + 24
+    return tokens // 8
+
+
+_EMPTY_ROUTE = 2**31 - 1  # a sort key above every route's
+
+
+def _compact_chunk(keys, values, valid):
+    """Move the valid entries of a chunk to its front in row-major order.
+
+    Each valid entry moves left by the number of invalid entries before it,
+    one power of two per step, lowest first; entries keep their order at every
+    step, so no two ever meet. Returns the keys, the values, which leading
+    slots are filled and how many.
+    """
+    rows, lanes = keys.shape
+    row = jax.lax.broadcasted_iota(jnp.int32, keys.shape, 0)
+    lane = jax.lax.broadcasted_iota(jnp.int32, keys.shape, 1)
+    flags = valid.astype(jnp.int32)
+    inclusive = flags
+    for distance in (1 << bit for bit in range(lanes.bit_length() - 1)):
+        rolled = pltpu.roll(inclusive, distance, 1)
+        inclusive = inclusive + jnp.where(lane >= distance, rolled, 0)
+    row_total = jnp.broadcast_to(inclusive[:, lanes - 1 :], keys.shape)
+    through_row = row_total
+    for distance in (1 << bit for bit in range(rows.bit_length() - 1)):
+        rolled = pltpu.roll(through_row, distance, 0)
+        through_row = through_row + jnp.where(row >= distance, rolled, 0)
+    position = row * lanes + lane
+    before = through_row - row_total + inclusive - flags
+    empty = -(2**31)  # a shift with no bit below 31 set
+    shift = jnp.where(valid, position - before, empty)
+
+    def ahead(x, step):
+        """``x`` at ``position + step`` (wrapping around the chunk)."""
+        if step < lanes:
+            same_row = pltpu.roll(x, lanes - step, 1)
+            next_row = pltpu.roll(same_row, rows - 1, 0)
+            return jnp.where(lane < lanes - step, same_row, next_row)
+        return pltpu.roll(x, rows - step // lanes, 0)
+
+    for bit in range((rows * lanes - 1).bit_length()):
+        step = 1 << bit
+        incoming = ahead(shift, step)
+        move = (position + step < rows * lanes) & ((incoming >> bit) & 1 == 1)
+        stay = (shift >= 0) & ((shift >> bit) & 1 == 0)
+        keys = jnp.where(move, ahead(keys, step), keys)
+        values = jnp.where(move, ahead(values, step), values)
+        shift = jnp.where(move, incoming, jnp.where(stay, shift, empty))
+    return keys, values, shift >= 0, through_row[rows - 1, 0]
+
+
+def _append_chunk(keys, values, chunk_keys, chunk_values, filled, offset, *, limit):
+    """Store a compacted chunk's filled slots from route ``offset`` on.
+
+    ``keys`` and ``values`` hold 128 routes per row. The chunk's rows land in
+    the 17-row window from row ``offset // 128`` (clamped to ``limit``); the
+    window's slots after the chunk's last route get the empty key.
+    """
+    rows, lanes = chunk_keys.shape
+    first_row = jnp.minimum(offset // lanes, limit)
+    first_lane = offset % lanes
+    chunk_keys = jnp.where(filled, chunk_keys, _EMPTY_ROUTE)
+    lane = jax.lax.broadcasted_iota(jnp.int32, (rows + 1, lanes), 1)
+    for ref, chunk, fill in (
+        (keys, chunk_keys, _EMPTY_ROUTE),
+        (values, chunk_values, 0),
+    ):
+        rotated = pltpu.roll(chunk, first_lane, 1)
+        head = ref[pl.ds(first_row, 1), :]
+        tail = jnp.full((1, lanes), fill, chunk.dtype)
+        ref[pl.ds(first_row, rows + 1), :] = jnp.where(
+            lane >= first_lane,
+            jnp.concatenate((rotated, tail), axis=0),
+            jnp.concatenate((head, rotated), axis=0),
+        )
+
+
 def _sort_route_steps(keys, probabilities, token_ids=None, *, size, bits=0):
     """Yield after each 4096-route window of the in-place bitonic network.
 
@@ -248,14 +337,25 @@ def _metadata_steps(
     compact-capacity decision uniform before any conditional collective runs.
     ``tallies`` ([local experts + groups, 8, 128] int32) accumulates the counts
     lane-wise; each is reduced once after the last chunk.
+
+    A launch that sorts only its local routes (``_sorts_local_routes``)
+    compacts each chunk's local routes onto the end of the previous ones and
+    sorts the compact capacity; any other sorts every route. Both orders put
+    the local routes first, expert-major/token-major.
     """
     ep_groups = 896 // local_experts
     expert_tp = 32 // ep_groups
     bits = (tokens * 16 - 1).bit_length()
     shape = (128, 16) if tokens < 4096 else (16, 128)
+    local_only = _sorts_local_routes(tokens)
+    capacity = _route_capacity(tokens)
+    assert not local_only or (shape == (16, 128) and keys.shape[0] == _sort_rows(tokens))
     lanes = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
     rows = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
     tallies[...] = jnp.zeros(tallies.shape, jnp.int32)
+    if local_only:
+        keys[...] = jnp.full(keys.shape, _EMPTY_ROUTE, jnp.int32)
+        filled_routes = jnp.int32(0)
 
     def tally(index, hits):
         hits = hits.astype(jnp.int32)
@@ -282,8 +382,18 @@ def _metadata_steps(
         local = jnp.where(valid, local, local_experts)
         original_position = chunk * 2048 + rows * shape[1] + lanes
         packed = (local << bits) | original_position
-        keys[pl.ds(chunk * 16, 16), :] = packed.reshape(16, 128)
-        probabilities[pl.ds(chunk * 16, 16), :] = probs.reshape(16, 128)
+        if local_only:
+            chunk_keys, chunk_probs, filled, count = _compact_chunk(
+                packed, probs, valid
+            )
+            _append_chunk(
+                keys, probabilities, chunk_keys, chunk_probs, filled,
+                filled_routes, limit=capacity // 128,
+            )
+            filled_routes = filled_routes + count
+        else:
+            keys[pl.ds(chunk * 16, 16), :] = packed.reshape(16, 128)
+            probabilities[pl.ds(chunk * 16, 16), :] = probs.reshape(16, 128)
         # Count routes on the packed 16x128 layout.
         local_flat = local.reshape(16, 128)
         for expert in range(local_experts):
@@ -311,7 +421,11 @@ def _metadata_steps(
         maximum[...] = largest[None]
     counts_ready()
     yield from _sort_route_steps(
-        keys, probabilities, token_ids, size=tokens * 16, bits=bits
+        keys,
+        probabilities,
+        token_ids,
+        size=capacity if local_only else tokens * 16,
+        bits=bits,
     )
 
 
@@ -780,9 +894,16 @@ def _prologue(
                     local_experts=counts.shape[0],
                 )
 
-        def metadata_progress():
-            for _ in range((2 if rows <= 128 else 5) * passes):
+        def metadata_progress(steps):
+            for _ in range(steps):
                 next(metadata_steps, None)
+
+        gu_steps = down_steps = (2 if rows <= 128 else 5) * passes
+        if _sorts_local_routes(rows * 32):
+            # The compaction (one step per 128 tokens) goes between the last
+            # pass's 24 GU products, the sort's steps between its 56 down
+            # products, which have half their MXU work to hide under.
+            gu_steps, down_steps = -(-rows // 4 // 24), 2
 
         rings = []  # big: each pass's 256-row latent ring, progressed together
 
@@ -888,7 +1009,7 @@ def _prologue(
                     if rows <= 128 and stage is None:
                         start_metadata()
                 if rows <= 128 and metadata_started:
-                    metadata_progress()
+                    metadata_progress(gu_steps)
                 if big:
                     fragment = product.astype(jnp.bfloat16)
                     if col < 1792:
@@ -975,7 +1096,7 @@ def _prologue(
                     up = jnp.matmul(
                         lhs, up_buffers[bank][...], preferred_element_type=jnp.float32
                     )
-                    metadata_progress()
+                    metadata_progress(gu_steps)
                     activated = (4.0 * jnp.tanh(gate / 4.0)) * (
                         1.0 / (1.0 + jnp.exp(-gate))
                     )
@@ -1021,7 +1142,7 @@ def _prologue(
                         s["down_buffers"][bank][...],
                         preferred_element_type=jnp.float32,
                     )
-                    metadata_progress()
+                    metadata_progress(down_steps)
                     s["partial"][bank][pl.ds(row, part), :] = product
                     if row == part:
                         if pending is not None:
@@ -1075,7 +1196,7 @@ def _prologue(
         route_wire=vmem((rows * 8, 128), jnp.int32),
         route_send=dma((5,)),
         route_recv=dma((5,)),
-        keys=vmem((rows * 4, 128), jnp.int32),
+        keys=vmem((_sort_rows(rows * 32), 128), jnp.int32),
         tallies=vmem((counts.shape[0] + 896 // counts.shape[0], 8, 128), jnp.int32),
         latent_payload=vmem((passes, part, 2, 1792), jnp.bfloat16)
         if big
@@ -2476,7 +2597,7 @@ def _layer_kernel(
                 maximum_copy().wait()
             if tokens < 8192:
                 metadata_ready()
-            if maximum is not None:
+            if fallback_ids is not None:
 
                 @pl.when(s["maximum"][0] > capacity)
                 def export_overflow():
@@ -2562,7 +2683,7 @@ def _layer_kernel(
             max_sem=dma if maximum is not None else None,
             index_sem=dma,
             prob_sem=dma,
-            export_sem=dma if maximum is not None else None,
+            export_sem=dma if fallback_ids is not None else None,
         ),
     )
 
@@ -2623,16 +2744,20 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
     ]
     output_specs = [hbm] * 3
     can_overflow = seq_len * 16 > _route_capacity(seq_len)
-    if can_overflow:
-        # Below 8K every route fits the compact capacity, so omit the
-        # overflow outputs there.
+    # Below 8K every route fits the compact capacity, so omit the overflow
+    # outputs there. A launch that is redone on overflow exports only the
+    # route maximum; the uncapped fallback also reads the sorted routes.
+    exports = can_overflow and not _sorts_local_routes(seq_len)
+    if exports:
         workspace_shapes += [
             (shape, jnp.int32),
             (shape, jnp.float32),
             ((local_experts,), jnp.int32),
-            ((1,), jnp.int32),
         ]
-        output_specs += [hbm] * 3 + [pl.BlockSpec()]
+        output_specs += [hbm] * 3
+    if can_overflow:
+        workspace_shapes += [((1,), jnp.int32)]
+        output_specs += [pl.BlockSpec()]
     counting = k._config().prefill_route_counts
     if counting:
         workspace_shapes += [((local_experts,), jnp.int32)]
@@ -2647,11 +2772,12 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
             ffn_norm_ref = refs.pop(16)
             mlp_res_ref = refs.pop(15)
             mix_refs = (blocks_ref, mlp_res_ref, ffn_norm_ref)
+        named = {}
         if counting:
-            return _layer_kernel(
-                *refs[:-1], route_counts=refs[-1], mixture_refs=mix_refs
-            )
-        return _layer_kernel(*refs, mixture_refs=mix_refs)
+            named["route_counts"] = refs.pop()
+        if can_overflow and not exports:
+            named["maximum"] = refs.pop()
+        return _layer_kernel(*refs, mixture_refs=mix_refs, **named)
 
     num_hbm_inputs = 15 if with_mixture else 13
     kernel_name = (
@@ -2715,13 +2841,14 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
         if not can_overflow:
             return (outputs[0][None], routes) if counting else outputs[0][None]
         # Without the compact path's epilogue, the output holds the shared rows.
-        final, latent, _, ids, probs, counts, maximum = outputs
+        final, latent, maximum = outputs[0], outputs[1], outputs[-1]
         shared = final
 
         def overflow():
             if fallback is not None:
                 redone = fallback(*args)
                 return (redone[0] if counting else redone)[0]
+            ids, probs, counts = outputs[3:6]
             reduced = routed_experts_prepared(
                 latent,
                 ids.reshape(-1),
