@@ -15,14 +15,25 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
+import jax
+import jax.numpy as jnp
 import pytest
 
+from vllm_torchtpu.megakernel.core import pool
 from vllm_torchtpu.megakernel.core.decls import KVCacheDecl, RecurrentCacheDecl
 from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
+from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.core.ops import BF16, F32, FP8
-from vllm_torchtpu.megakernel.core.pool import PoolLayout, derive_pool_layout
+from vllm_torchtpu.megakernel.core.pool import (
+    CacheExec,
+    PoolBackend,
+    PoolLayout,
+    check_step_pool_metadata,
+    derive_pool_layout,
+    make_pool_backend,
+)
 from vllm_torchtpu.megakernel.core.pool.layout import (
     VALIDATED_CONV_PAGES_PER_SLOT,
     VALIDATED_REC_PAGES_PER_SLOT,
@@ -180,3 +191,239 @@ def test_derive_rejects_invalid_declarations():
     for bad_r in (None, 0, -2):
         with pytest.raises(MegakernelConfigError, match="requires explicit R > 0"):
             PoolLayout.from_cache_decls([rec, kv], R=bad_r)
+
+
+def test_derive_conv_dtype_override():
+    """`conv_dtype` overrides the declared conv storage dtype; nothing else moves."""
+    kv = KVCacheDecl(hd=256, kvh=1, page_size=128)
+    rec = RecurrentCacheDecl(kh=16, vh=64, KD=128, VD=128, conv_taps=3, conv_dtype=BF16)
+    seq = [rec, rec, rec, kv] * 2
+    base = derive_pool_layout(seq, R=8)
+    f32 = derive_pool_layout(seq, R=8, conv_dtype=F32)
+    assert base.conv_dtype == BF16 and f32.conv_dtype == F32
+    assert PoolLayout.from_cache_decls(seq, R=8, conv_dtype=F32) == f32
+    assert f32 == PoolLayout(**{**base.__dict__, "conv_dtype": F32})
+    f32.validate()
+
+
+def test_pool_backend_with_layout_preserves_callbacks_and_flags():
+    """`PoolBackend.with_layout` preserves `check`, `rec_chunk`, `supports_fused_io`,
+    and `supports_pool_gather` when rebuilding over a new `PoolLayout`."""
+    seen: list[ExecSpec] = []
+    lay_bf16 = PoolLayout(
+        num_pools=2, slots_per_pool=1, hd=256, kvh=1, kh=2, vh=4, KD=128, VD=128
+    )
+    lay_f32 = replace(lay_bf16, conv_dtype=F32)
+
+    pb = make_pool_backend(
+        lay_bf16,
+        check=seen.append,
+        rec_chunk=32,
+        supports_fused_io=True,
+        supports_pool_gather=False,
+    )
+    rebuilt = pb.with_layout(lay_f32)
+    assert rebuilt.layout == lay_f32
+    assert rebuilt.supports_fused_io is True
+    assert rebuilt.supports_pool_gather is False
+
+    ex = ExecSpec(
+        R=1,
+        B=2,
+        T=1,
+        ctx=256,
+        interpret=True,
+        cache=CacheExec(paged_kv=True, num_pages=64),
+    )
+    pt, ckpt, roff, _ = pool.allocate_test_layout(lay_f32, ex)
+    raw = tuple(
+        jnp.zeros((64, *lay_f32.kv_page_shape), dtype=FP8)
+        for _ in range(lay_f32.num_pools)
+    )
+    rebuilt.gather_states(ex, raw, ckpt[0], roff[0], "all")
+    assert seen == [ex]
+
+    bare = PoolBackend(layout=lay_bf16, kernel_names=("g", "s"))
+    with pytest.raises(ValueError, match="not built by make_pool_backend"):
+        bare.with_layout(lay_f32)
+
+
+def test_check_step_pool_metadata_all_error_paths_and_jit():
+    """Cover valid input, every `ValueError` branch in `check_step_pool_metadata`,
+    and traced execution under `jax.jit` with `force_under_jit=True`."""
+    lay = PoolLayout(
+        num_pools=2, slots_per_pool=2, hd=256, kvh=1, kh=2, vh=4, KD=128, VD=128
+    )
+    ex = ExecSpec(
+        R=1,
+        B=4,
+        T=2,
+        ctx=256,
+        interpret=True,
+        cache=CacheExec(paged_kv=True, num_pages=128),
+    )
+    pt, ckpt, roff, _ = pool.allocate_test_layout(lay, ex)
+    pos = jnp.asarray([10, 11, 20, 21], dtype=jnp.int32)
+
+    # 1. Valid input passes eagerly
+    check_step_pool_metadata(lay, ex, pt, pos, ckpt_indices=ckpt, read_offsets=roff)
+
+    # 2. Out-of-range pos (< 0 or >= cols * page_size)
+    with pytest.raises(ValueError, match="maps to logical page"):
+        check_step_pool_metadata(
+            lay,
+            ex,
+            pt,
+            pos.at[0].set(-1),
+            ckpt_indices=ckpt,
+            read_offsets=roff,
+        )
+    with pytest.raises(ValueError, match="maps to logical page"):
+        check_step_pool_metadata(
+            lay,
+            ex,
+            pt,
+            pos.at[0].set(pt.shape[1] * lay.page_size),
+            ckpt_indices=ckpt,
+            read_offsets=roff,
+        )
+
+    # 3. Invalid KV write page (<= 0 or >= num_pages)
+    with pytest.raises(ValueError, match="KV write page .* outside valid range"):
+        check_step_pool_metadata(
+            lay,
+            ex,
+            pt.at[0, 0].set(0),
+            pos,
+            ckpt_indices=ckpt,
+            read_offsets=roff,
+        )
+
+    # 4. Duplicate KV write page across active sequences
+    with pytest.raises(ValueError, match="duplicate KV write page"):
+        check_step_pool_metadata(
+            lay,
+            ex,
+            pt.at[1, 0].set(pt[0, 0]),
+            pos,
+            ckpt_indices=ckpt,
+            read_offsets=roff,
+        )
+
+    # 5. Duplicate KV write (page, lane) within a sequence
+    with pytest.raises(ValueError, match="duplicate KV write .* within sequence"):
+        check_step_pool_metadata(
+            lay,
+            ex,
+            pt,
+            jnp.asarray([10, 10, 20, 21], dtype=jnp.int32),
+            ckpt_indices=ckpt,
+            read_offsets=roff,
+        )
+
+    # 6. Invalid prior KV read page in active_kv_pages (pos on page 1, page 0 invalid)
+    with pytest.raises(ValueError, match="logical page 0 has invalid KV page"):
+        check_step_pool_metadata(
+            lay,
+            ex,
+            pt.at[0, 0].set(0),
+            jnp.asarray([130, 131, 20, 21], dtype=jnp.int32),
+            ckpt_indices=ckpt,
+            read_offsets=roff,
+        )
+
+    # 7. ckpt_indices K < T
+    with pytest.raises(ValueError, match="ckpt_indices K=1 < T=2"):
+        check_step_pool_metadata(lay, ex, pt, pos, ckpt_indices=ckpt[..., :1])
+
+    # 8. Non-distinct or non-positive checkpoint write slots for T > 1
+    with pytest.raises(ValueError, match="distinct positive checkpoint write slots"):
+        check_step_pool_metadata(
+            lay,
+            ex,
+            pt,
+            pos,
+            ckpt_indices=ckpt.at[0, 0, 1].set(ckpt[0, 0, 0]),
+        )
+
+    # 9. Out-of-range checkpoint write slot (for T=1)
+    ex_t1 = replace(ex, B=2, T=1)
+    pt1, ckpt1, roff1, _ = pool.allocate_test_layout(lay, ex_t1)
+    pos1 = jnp.asarray([10, 20], dtype=jnp.int32)
+    with pytest.raises(ValueError, match="checkpoint write slot .* outside"):
+        check_step_pool_metadata(
+            lay,
+            ex_t1,
+            pt1,
+            pos1,
+            ckpt_indices=ckpt1.at[0, 0, -1].set(999),
+        )
+
+    # 10. Duplicate checkpoint write slot pages across sub-layers or sequences
+    with pytest.raises(ValueError, match="duplicate checkpoint write slot pages"):
+        check_step_pool_metadata(
+            lay,
+            ex,
+            pt,
+            pos,
+            ckpt_indices=ckpt.at[0, 1, 0].set(ckpt[0, 0, 0]),
+        )
+
+    # 11. read_offset >= K and out-of-range checkpoint read slot
+    with pytest.raises(ValueError, match="read_offset 5 >= K="):
+        check_step_pool_metadata(
+            lay,
+            ex,
+            pt,
+            pos,
+            ckpt_indices=ckpt,
+            read_offsets=roff.at[0, 0].set(5),
+        )
+    extra_slot = jnp.full((lay.slots_per_pool, ex.NS, 1), 999, dtype=jnp.int32)
+    ckpt_with_bad_read = jnp.concatenate([extra_slot, ckpt], axis=-1)
+    with pytest.raises(ValueError, match="checkpoint read slot 999 .* outside"):
+        check_step_pool_metadata(
+            lay,
+            ex,
+            pt,
+            pos,
+            ckpt_indices=ckpt_with_bad_read,
+            read_offsets=jnp.zeros_like(roff),
+        )
+
+    # 12. Checkpoint slot pages overlapping active KV pages
+    ckpt_page0 = int(lay.page_base(int(ckpt[0, 0, 0]), 0, 3))
+    with pytest.raises(ValueError, match="overlap active KV pages"):
+        check_step_pool_metadata(
+            lay,
+            ex,
+            pt.at[0, 0].set(ckpt_page0),
+            pos,
+            ckpt_indices=ckpt,
+            read_offsets=roff,
+        )
+
+    # 13. Traced call under jax.jit with force_under_jit=True runs the callback
+    @jax.jit
+    def _traced_check(pt_arg, pos_arg, ck_arg, ro_arg):
+        check_step_pool_metadata(
+            lay,
+            ex,
+            pt_arg,
+            pos_arg,
+            ckpt_indices=ck_arg,
+            read_offsets=ro_arg,
+            force_under_jit=True,
+        )
+        return pos_arg + 1
+
+    out = _traced_check(pt, pos, ckpt, roff)
+    out.block_until_ready()
+    with pytest.raises(
+        (ValueError, RuntimeError, jax.errors.JaxRuntimeError),
+        match="duplicate KV write",
+    ):
+        bad_out = _traced_check(
+            pt, jnp.asarray([10, 10, 20, 21], dtype=jnp.int32), ckpt, roff
+        )
+        bad_out.block_until_ready()

@@ -137,16 +137,16 @@ class _LatencySeries:
     __slots__ = ("cap", "count", "samples", "sum_ms")
 
     def __init__(self, cap: int = 4000) -> None:
-        self.cap, self.count, self.sum_ms = int(cap), 0, 0.0
+        self.cap, self.count, self.sum_ms = cap, 0, 0.0
         self.samples: list[float] = []
 
     def add(self, dt_ms: float) -> None:
-        v, idx = float(dt_ms), self.count
-        self.count, self.sum_ms = idx + 1, self.sum_ms + v
+        idx = self.count
+        self.count, self.sum_ms = idx + 1, self.sum_ms + dt_ms
         if len(self.samples) < self.cap:
-            self.samples.append(v)
+            self.samples.append(dt_ms)
         else:
-            self.samples[idx % self.cap] = v
+            self.samples[idx % self.cap] = dt_ms
 
     def summary(self) -> list[int | float]:
         if self.count == 0:
@@ -163,7 +163,7 @@ class MKABCalibrator:
     def __init__(
         self, enabled: bool = False, period_s: float = 60.0, cap: int = 4000
     ) -> None:
-        self.enabled, self.period_s, self.cap = bool(enabled), float(period_s), int(cap)
+        self.enabled, self.period_s, self.cap = enabled, period_s, cap
         self.counts: dict[str, int] = {}
         self.last_decision: tuple[str, str] = ("stock_early", "stock")
         self._window: dict[str, dict[str, _LatencySeries]] = {}
@@ -196,7 +196,7 @@ class MKABCalibrator:
         if not self.enabled:
             return None
         key, arm = self.last_decision
-        rec_key = f"{key}_p{int(padded_tokens)}" if padded_tokens is not None else key
+        rec_key = f"{key}_p{padded_tokens}" if padded_tokens is not None else key
         for store in (self._window, self._cumulative):
             b_map = store.setdefault(rec_key, {})
             if arm not in b_map:
@@ -223,8 +223,8 @@ class MKABCalibrator:
             }
             if "mk" in arms and "stock" in arms:
                 mk_s, st_s = entry["mk"], entry["stock"]
-                entry["d_mean_ms"] = round(float(mk_s[1]) - float(st_s[1]), 3)
-                entry["d_p50_ms"] = round(float(mk_s[3]) - float(st_s[3]), 3)
+                entry["d_mean_ms"] = round(mk_s[1] - st_s[1], 3)
+                entry["d_p50_ms"] = round(mk_s[3] - st_s[3], 3)
             out[k] = entry
         return json.dumps(out, separators=(",", ":"))
 
@@ -243,7 +243,7 @@ class StepMixTracker:
     """
 
     def __init__(self, period_s: float = 60.0) -> None:
-        self.period_s, self.counts, self.t0 = float(period_s), {}, time.monotonic()
+        self.period_s, self.counts, self.t0 = period_s, {}, time.monotonic()
 
     def reset(self) -> None:
         self.counts, self.t0 = {}, time.monotonic()
@@ -255,7 +255,7 @@ class StepMixTracker:
         actual_run, mix_key = (
             ab_calibrator.choose(key, run)[:2]
             if ab_calibrator is not None
-            else (bool(run), key)
+            else (run, key)
         )
         self.counts[mix_key] = self.counts.get(mix_key, 0) + 1
         now = time.monotonic()

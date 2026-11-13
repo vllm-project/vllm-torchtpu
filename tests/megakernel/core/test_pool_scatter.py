@@ -236,7 +236,7 @@ def test_scatter_direct_conv_window_traces_for_24_lane_rows(T: int):
     jaxpr = jax.make_jaxpr(
         lambda *a: pool.scatter_pool_states(lay, ex, *a, ckpt_indices=ckpt)
     )(*args)
-    assert "qwen3_5_scatter_pool_states" in str(jaxpr)
+    assert "name=scatter_pool_states" in str(jaxpr)
 
 
 @pytest.mark.parametrize("R,kh,vh", [(1, 8, 8), (4, 32, 32)])
@@ -502,3 +502,125 @@ def test_scatter_input_validation_and_pos_debug_check():
         lambda *a: pool.scatter_pool_states(lay, ex_bc, *a, ckpt_indices=ckpt)
     )(raw_r0, pos, pt, knew, vnew, conv, rec)
     assert "disable_bounds_checks=False" in str(jaxpr)
+
+
+@pytest.mark.parametrize("T", [1, 2])
+@pytest.mark.parametrize(
+    "bad_case", ["neg_pos", "pos_past_cols", "page_past_num_pages"]
+)
+def test_scatter_routes_invalid_active_tokens_to_null_page_zero(T: int, bad_case: str):
+    """Out-of-range active tokens route `lp` and `kp` to null page `0` without
+    touching any non-reserved page (`lay.reserved_pages .. NUM_PAGES - 1`)."""
+    lay = _layout(0, num_pools=2)
+    ex = _exec(R=1, B=2 * T, T=T)
+    st = _random_states(lay, ex, seed=401 + T)
+    pt, ckpt, roff = _tables(lay, ex, 3)
+    raw_pools = pool.states_to_pool(lay, ex, st, pt, ckpt, roff)
+
+    # Sequence 0 token 0 has an invalid position or page; other tokens are valid.
+    pos_list = [10 + 129 * (s % 2) + t for s in range(ex.NS) for t in range(T)]
+    pt_mod = pt
+    if bad_case == "neg_pos":
+        pos_list[0] = -5
+    elif bad_case == "pos_past_cols":
+        pos_list[0] = pt.shape[1] * lay.page_size + 7
+    else:
+        assert bad_case == "page_past_num_pages"
+        lp0 = pos_list[0] // lay.page_size
+        pt_mod = pt.at[0, lp0].set(NUM_PAGES + 5)
+    pos = jnp.asarray(pos_list, dtype=jnp.int32)
+
+    k = jax.random.split(jax.random.key(420 + T), 2)
+    knew = (jax.random.normal(k[0], (lay.num_pools, ex.MR, lay.hd)) * 0.5).astype(FP8)
+    vnew = (jax.random.normal(k[1], (lay.num_pools, ex.MR, lay.hd)) * 0.5).astype(FP8)
+
+    # Run with only sequence 0 active and all its tokens invalid so sequence 0
+    # writes strictly to null page 0.
+    pos_seq0_bad = pos.at[:T].set(pos[0])
+    mask_seq0 = jnp.asarray([1, 0], dtype=jnp.int32)
+    with pl.enable_debug_checks(False):
+        out_pools = pool.scatter_pool_states(
+            lay,
+            ex,
+            raw_pools,
+            pos_seq0_bad,
+            pt_mod,
+            knew,
+            vnew,
+            active_seqs=mask_seq0,
+        )
+    for raw_before, raw_after in zip(raw_pools, out_pools):
+        np.testing.assert_array_equal(
+            _bytes(raw_after[lay.reserved_pages :]),
+            _bytes(raw_before[lay.reserved_pages :]),
+        )
+
+
+@pytest.mark.parametrize("T", [1, 2])
+def test_ckpt_slot_null_page_routing_scatter_and_gather(T: int):
+    """Under `jax.jit` with `pl.enable_debug_checks(False)` on a recurrent layout,
+    out-of-range checkpoint slots ((a) `T=1` with `pb + pps > num_pages`, and
+    (b) `T=2` with consecutive 3D slots past `num_pages` and `pps * T > reserved_pages`)
+    route to null page `0` without touching `[reserved_pages, num_pages)` on scatter
+    or reading past the pool on gather."""
+    lay = _layout(1, num_pools=2)
+    assert lay.pages_per_slot == lay.reserved_pages
+    if T > 1:
+        assert lay.pages_per_slot * T > lay.reserved_pages
+    ex = _exec(R=1, B=2 * T, T=T)
+    st = _random_states(lay, ex, seed=501 + T)
+    pt, ckpt, roff = _tables(lay, ex, 3)
+    raw_pools = tuple(
+        r.at[: lay.reserved_pages].set(jnp.zeros_like(r[: lay.reserved_pages]))
+        for r in pool.states_to_pool(lay, ex, st, pt, ckpt, roff)
+    )
+
+    # Sequence 0 has consecutive 3D slots starting at NUM_PAGES (pb + pps > NUM_PAGES);
+    # sequence 1 is inactive.
+    bad_slots = NUM_PAGES + jnp.arange(T, dtype=jnp.int32)
+    ckpt_bad = ckpt.at[:, 0, :].set(bad_slots[None, :])
+    assert (
+        int(lay.page_base(int(ckpt_bad[0, 0, 0]), 0, 3)) + lay.pages_per_slot
+        > NUM_PAGES
+    )
+    pos_neg = jnp.full((ex.B,), -1, dtype=jnp.int32)
+    mask_seq0 = jnp.asarray([1, 0], dtype=jnp.int32)
+
+    k = jax.random.split(jax.random.key(520 + T), 4)
+    knew = (jax.random.normal(k[0], (lay.num_pools, ex.MR, lay.hd)) * 0.5).astype(FP8)
+    vnew = (jax.random.normal(k[1], (lay.num_pools, ex.MR, lay.hd)) * 0.5).astype(FP8)
+    ngdn, vh, qkv = lay.num_recurrent_layers, lay.vh_per_rank(1), lay.qkv_per_rank(1)
+    conv = _bf16_f32(k[2], (ngdn, ex.NS, 8, qkv)) + 1.0
+    rec = (
+        jax.random.normal(k[3], (ngdn, ex.B * vh, lay.KD, lay.VD)) * 0.5 + 1.0
+    ).astype(jnp.bfloat16)
+
+    scatter_jit = jax.jit(
+        lambda r, p, pt_i, kn, vn, cv, rc, ck, m: pool.scatter_pool_states(
+            lay, ex, r, p, pt_i, kn, vn, cv, rc, ck, active_seqs=m
+        )
+    )
+    gather_jit = jax.jit(
+        lambda r, ck, ro, m: pool.gather_gdn_states(lay, ex, r, ck, ro, active_seqs=m)
+    )
+    with pl.enable_debug_checks(False):
+        out_pools = scatter_jit(
+            raw_pools, pos_neg, pt, knew, vnew, conv, rec, ckpt_bad, mask_seq0
+        )
+        for raw_before, raw_after in zip(raw_pools, out_pools):
+            np.testing.assert_array_equal(
+                _bytes(raw_after[lay.reserved_pages :]),
+                _bytes(raw_before[lay.reserved_pages :]),
+            )
+            assert not np.array_equal(
+                _bytes(raw_after[: lay.reserved_pages]),
+                _bytes(raw_before[: lay.reserved_pages]),
+            )
+
+        roff_zero = jnp.zeros((lay.slots_per_pool, ex.NS), dtype=jnp.int32)
+        ckpt_page0 = ckpt_bad.at[:, 0, 0].set(0)
+        conv_bad, rec_bad = gather_jit(out_pools, ckpt_bad, roff_zero, mask_seq0)
+        conv_p0, rec_p0 = gather_jit(out_pools, ckpt_page0, roff_zero, mask_seq0)
+        np.testing.assert_array_equal(np.asarray(conv_bad), np.asarray(conv_p0))
+        np.testing.assert_array_equal(np.asarray(rec_bad), np.asarray(rec_p0))
+        assert np.any(np.asarray(rec_bad) != 0)

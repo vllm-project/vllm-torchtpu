@@ -193,7 +193,8 @@ def plan(
     """Derive weight tile sizes, stream schedules, smalls layout, and metadata.
 
     Pure function of `model_spec` and `ex` (`ex.resolve_tiles(g)`): never fits
-    tiles or queries device budgets.
+    ring depths to VMEM capacity, allocates scratch buffers, or queries device
+    budgets.
     """
     active_modules = model_spec.all_modules()
     active_names = {m.name for m in active_modules}
@@ -305,6 +306,12 @@ def plan(
 
         for buf_name, req_w in m.shared_widths(g, ex).items():
             shared_widths[buf_name] = max(shared_widths.get(buf_name, 0), req_w)
+
+    if (static_kinds and tiles.nbd <= 1) or (dynamic_kinds and tiles.nbe <= 1):
+        raise MegakernelConfigError(
+            f"Weight stream ring depth must be >= 2 (got nbd={tiles.nbd}, "
+            f"nbe={tiles.nbe})"
+        )
 
     tk = {
         k: k_tile(K, N, dt, tiles.ebank if k in dynamic_kinds else tiles.bank)
