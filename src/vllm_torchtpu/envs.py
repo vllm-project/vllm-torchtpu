@@ -386,6 +386,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SUBST_EXTRACT_FUSED: bool = False
     VLLM_TPU_EXTRACT_DRAFTS_COMPILED: bool = False
     VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD: bool = False
+    VLLM_TPU_WARM_SERVING_THREADS: bool = False
+    VLLM_TPU_SAMPLING_COPIES_WHOLE: bool = False
     VLLM_TPU_VERIFY_RO_INGRAPH: bool = False
     VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
     VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD: bool = False
@@ -2414,6 +2416,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD": env_bool(
         "VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD"
     ),
+    # Run every precompile pass (_precompile_timed) at serving's torch thread
+    # count. Dynamo guards on torch.get_num_threads(), and the passes run from
+    # initialize_kv_cache (substitute_placeholder_token, mamba seed copies)
+    # come before compile_or_warm_up_model drops the threads to 1, so each
+    # warmed shape compiled again on its first served step (c32 steady: 10
+    # _substitute_placeholder_token recompiles of ~70 ms on every rank).
+    "VLLM_TPU_WARM_SERVING_THREADS": env_bool("VLLM_TPU_WARM_SERVING_THREADS"),
+    # Upstream InputBatch refreshes its device sampling tensors (temperature,
+    # top_p, ...) with `dev[:num_reqs].copy_(cpu[:num_reqs])` on every batch
+    # change. On TPU that slice write is an eager copy__as_strided_inverse
+    # program per num_reqs, compiled mid-serve as the batch reaches new sizes
+    # (c32: 26 x ~28 ms in steady). Copy the whole 1-D buffer instead (one
+    # shape, warmed) and keep returning the [:num_reqs] view. Same values in
+    # every slot a reader sees; the TPU sampler reads none of these tensors.
+    "VLLM_TPU_SAMPLING_COPIES_WHOLE": env_bool("VLLM_TPU_SAMPLING_COPIES_WHOLE"),
     # With VLLM_TPU_VERIFY_ONE_DRAW (and VERIFY_FUSED_READ_OFFSETS off): the
     # post-verify mamba read-offset scatter runs inside the verify program
     # (one program instead of two). Same values.

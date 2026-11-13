@@ -818,6 +818,88 @@ def _extract_drafts_compiled(*args):
 _extract_drafts_fn = None
 
 
+def _serving_num_threads() -> int:
+    """Torch intra-op thread count serving runs at: what vLLM's
+    `set_torch_threads_for_runtime` (called from compile_or_warm_up_model)
+    leaves, i.e. 1 unless OMP_NUM_THREADS was set outside vLLM."""
+    try:
+        from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
+    except ImportError:
+        OMP_NUM_THREADS_SET_BY_VLLM = "VLLM_OMP_NUM_THREADS_SET_BY_VLLM"
+    if (
+        os.environ.get("OMP_NUM_THREADS") is not None
+        and os.environ.get(OMP_NUM_THREADS_SET_BY_VLLM) != "1"
+    ):
+        return torch.get_num_threads()
+    return 1
+
+
+@contextlib.contextmanager
+def _serving_torch_threads():
+    """VLLM_TPU_WARM_SERVING_THREADS: run a precompile pass at serving's torch
+    thread count. Dynamo guards on `torch.get_num_threads()` (GLOBAL_STATE), and
+    the passes run from initialize_kv_cache (substitute_placeholder_token,
+    mamba seed copies) come before compile_or_warm_up_model drops the threads
+    to 1: every shape they warm compiled again on its first served step."""
+    if not envs.VLLM_TPU_WARM_SERVING_THREADS:
+        yield
+        return
+    saved = torch.get_num_threads()
+    target = _serving_num_threads()
+    if target == saved:
+        yield
+        return
+    torch.set_num_threads(target)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(saved)
+
+
+def _copy_slice_whole(
+    from_tensor: torch.Tensor, to_tensor: torch.Tensor, length: int
+) -> torch.Tensor:
+    """VLLM_TPU_SAMPLING_COPIES_WHOLE: `vllm.v1.utils.copy_slice` (used by
+    InputBatch._make_sampling_metadata) copying the whole 1-D device buffer.
+
+    Upstream writes `to_tensor[:length]`, a slice write that TorchTPU runs as an
+    eager copy__as_strided_inverse program per `length` (the live request
+    count), so each new batch size compiled one mid-serve. The whole buffer is
+    one shape. The returned `[:length]` view holds the same values as
+    upstream's; only slots past `length`, which no reader indexes, change."""
+    if (
+        to_tensor.dim() != 1
+        or from_tensor.shape != to_tensor.shape
+        or from_tensor.dtype != to_tensor.dtype
+    ):
+        return to_tensor[:length].copy_(from_tensor[:length], non_blocking=True)
+    to_tensor.copy_(from_tensor, non_blocking=True)
+    return to_tensor[:length]
+
+
+# InputBatch's (device, pinned CPU) 1-D sampling buffer pairs that
+# `_make_sampling_metadata` refreshes with copy_slice.
+_SAMPLING_COPY_PAIRS = (
+    ("temperature", "temperature_cpu_tensor"),
+    ("top_p", "top_p_cpu_tensor"),
+    ("top_k", "top_k_cpu_tensor"),
+    ("frequency_penalties", "frequency_penalties_cpu_tensor"),
+    ("presence_penalties", "presence_penalties_cpu_tensor"),
+    ("repetition_penalties", "repetition_penalties_cpu_tensor"),
+)
+
+
+def _install_sampling_copies_whole() -> bool:
+    """Point `vllm.v1.worker.gpu_input_batch.copy_slice` at `_copy_slice_whole`.
+    Returns False if upstream no longer imports copy_slice there."""
+    from vllm.v1.worker import gpu_input_batch
+
+    if not hasattr(gpu_input_batch, "copy_slice"):
+        return False
+    gpu_input_batch.copy_slice = _copy_slice_whole
+    return True
+
+
 def _extract_drafts_shapes(
     num_tokens_paddings: list[int], max_logits_len: int
 ) -> list[tuple[int, int]]:
@@ -1395,6 +1477,17 @@ class TPUModelRunner(GPUModelRunner):
         self._fast_token_substitution: bool = bool(
             envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
         )
+        if envs.VLLM_TPU_SAMPLING_COPIES_WHOLE:
+            if _install_sampling_copies_whole():
+                logger.info(
+                    "VLLM_TPU_SAMPLING_COPIES_WHOLE: InputBatch refreshes its "
+                    "device sampling buffers whole (one shape per buffer)"
+                )
+            else:
+                logger.warning(
+                    "VLLM_TPU_SAMPLING_COPIES_WHOLE: gpu_input_batch has no "
+                    "copy_slice; not applied"
+                )
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req
@@ -7742,7 +7835,8 @@ class TPUModelRunner(GPUModelRunner):
         """Common boilerplate for each AOT bucket precompile pass."""
         logger.info("Compiling %s with different input shapes.", name)
         start = time.perf_counter()
-        yield
+        with _serving_torch_threads():
+            yield
         logger.info("Compilation finished in %.2f [secs].", time.perf_counter() - start)
         self._update_num_xla_graphs(name)
 
@@ -8553,6 +8647,7 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_spec_boundary_pairs()
             self._precompile_subtract_rejected()
             self._precompile_extract_drafts()
+            self._precompile_sampling_copies()
             self._precompile_spec_tail()
             model_adapter = getattr(self, "model_adapter", None)
             precompile_inputs = getattr(model_adapter, "precompile_fused_inputs", None)
@@ -8960,6 +9055,29 @@ class TPUModelRunner(GPUModelRunner):
                         torch.zeros(logits_len, dtype=torch.int32).to(self.device),
                     )
                 )
+
+    def _precompile_sampling_copies(self) -> None:
+        """VLLM_TPU_SAMPLING_COPIES_WHOLE: run InputBatch's whole-buffer
+        sampling refresh once per buffer, so its single shape compiles here and
+        not on the first served batch change. It copies the CPU buffers'
+        current values, exactly what the next refresh copies anyway."""
+        if not envs.VLLM_TPU_SAMPLING_COPIES_WHOLE:
+            return
+        input_batch = getattr(self, "input_batch", None)
+        pairs = [
+            (getattr(input_batch, dev, None), getattr(input_batch, cpu, None))
+            for dev, cpu in _SAMPLING_COPY_PAIRS
+        ]
+        pairs = [
+            (d, c)
+            for d, c in pairs
+            if isinstance(d, torch.Tensor) and isinstance(c, torch.Tensor)
+        ]
+        if not pairs:
+            return
+        with self._precompile_timed("whole sampling-buffer copies"), torch.no_grad():
+            for dev, cpu in pairs:
+                synchronize_tensors(_copy_slice_whole(cpu, dev, dev.shape[0]))
 
     def _precompile_spec_tail(self) -> None:
         """VLLM_TPU_SPEC_TAIL_COMPILED: compile the one-chunk spec tail for
