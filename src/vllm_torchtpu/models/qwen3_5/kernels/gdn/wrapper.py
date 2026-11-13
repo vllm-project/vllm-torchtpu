@@ -901,6 +901,9 @@ def fused_conv1d_gdn(
                 vmem_limit_bytes=vmem_limit_bytes,
             ),
             name=cfg.get_kernel_name(),
+            # jax types metadata values as str; pallas_call serializes the
+            # config's int and float values to JSON as well.
+            # pyrefly: ignore[bad-argument-type]
             metadata=cfg.get_metadata(),
         )(
             metadata_obj,

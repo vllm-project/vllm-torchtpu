@@ -727,6 +727,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
             # Torchtpu native jax_op. The pcp_streaming wrapper adds only
             # kernel_reload's dispatcher, which GDN does not use.
+            # torch_tpu types the partition specs as tuples of axis names, but
+            # takes the jax PartitionSpecs passed here.
+            # pyrefly: ignore[no-matching-overload]
             gdn_jax_op = pallas.jax_op(
                 op_name,
                 wrapped_fn,
