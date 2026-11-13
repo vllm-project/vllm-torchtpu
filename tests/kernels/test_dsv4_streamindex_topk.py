@@ -1477,3 +1477,40 @@ if __name__ == "__main__":
     from absl import app
 
     app.run(main)
+
+
+# fmt: off
+@pytest.mark.parametrize(
+    "T_list, short_end, chunk_tokens",
+    [
+        pytest.param((1, 1, 4, 4, 4, 4, 110), 6, None, id="verify_then_prefill"),
+        pytest.param((1, 1, 4, 4, 4, 4, 110), 6, 32, id="verify_then_prefill_chunked"),
+        pytest.param((1, 1, 126), 2, None, id="empty_short_pass"),
+        pytest.param((4,) * 8, 8, None, id="empty_long_pass"),
+    ],
+)
+# fmt: on
+def test_short_mixed_pass_matches_single_mixed_pass(T_list, short_end, chunk_tokens):
+    """`short_seq_end` (VLLM_TPU_QSA_PREFILL_INDEXER_SHORT_BQ) is exact.
+
+    The leading short requests run in their own mixed pass with a smaller query
+    block of the same 32-token blocked layout; indices and score bits must be
+    identical to the single mixed pass.
+    """
+    S_list = (512,) * len(T_list)
+    inputs = _chunk_inputs(T_list, _fragmented_pages(len(T_list)), 128, 4, 128)
+    common = (inputs, T_list, S_list, 128, 1)
+    base = _chunk_call_kwargs(*common, 64, 2, _HAS, chunk_tokens, return_scores=True)
+    split = dict(
+        _chunk_call_kwargs(*common, (64, 32, 64), 2, _HAS, chunk_tokens,
+                           return_scores=True),
+        short_seq_end=jnp.int32(short_end),
+    )
+    b_idx, b_scores = (np.array(x) for x in streamindex_topk(**base))
+    s_idx, s_scores = (np.array(x) for x in streamindex_topk(**split))
+    ob, os_ = np.argsort(b_idx, axis=-1), np.argsort(s_idx, axis=-1)
+    np.testing.assert_array_equal(
+        np.take_along_axis(s_idx, os_, axis=-1), np.take_along_axis(b_idx, ob, axis=-1))
+    np.testing.assert_array_equal(
+        np.take_along_axis(s_scores, os_, axis=-1).view(np.int32),
+        np.take_along_axis(b_scores, ob, axis=-1).view(np.int32))

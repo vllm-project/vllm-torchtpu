@@ -200,6 +200,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SORTED_SEARCH_MASK: bool = False
     VLLM_TPU_QSA_PREFILL_INDEXER_BQ: int = 128
     VLLM_TPU_QSA_PREFILL_INDEXER_BKV: int = 256
+    VLLM_TPU_QSA_PREFILL_INDEXER_SHORT_BQ: int = 0
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
     VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES: int = 0
     VLLM_TPU_SHAPE_TUNED: bool = False
@@ -946,6 +947,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TPU_QSA_PREFILL_INDEXER_BKV": env_nonnegative_int(
         "VLLM_TPU_QSA_PREFILL_INDEXER_BKV", 256
+    ),
+    # Qwen4-exp ragged prefill indexer: queries per block of an extra mixed
+    # pass over the leading short requests (1..16 tokens: decode and MTP verify
+    # rows) of a mixed step. 0 (default) = off: each such request then fills a
+    # whole PREFILL_INDEXER_BQ block (128 rows for a 4-row verify request). Must
+    # be a multiple of 32, so the blocked prefill layout (32-token blocks, same
+    # head reduction) is the long pass's: exact, per-row scores do not depend on
+    # the number of token blocks per query block.
+    "VLLM_TPU_QSA_PREFILL_INDEXER_SHORT_BQ": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_INDEXER_SHORT_BQ", 0
     ),
     "VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY": env_bool(
         "VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY", default=False

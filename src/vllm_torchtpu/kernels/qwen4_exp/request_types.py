@@ -34,3 +34,16 @@ def short_request_prefix_tokens(
     short = (lengths >= 1) & (lengths <= max_request_tokens) & (starts[1:] <= capacity)
     count = jnp.sum(jnp.cumprod(short.astype(jnp.int32)))
     return starts[count] - starts[0]
+
+
+def short_request_prefix(
+    starts: jax.Array, max_request_tokens: int = SHORT_REQUEST_MAX_TOKENS
+) -> jax.Array:
+    """Count the leading requests with 1..max_request_tokens tokens.
+
+    A superset of ``decode_prefix``: decode rows and speculative verify rows
+    (1 + num_speculative_tokens) come first in the runner's ordering.
+    """
+    lengths = jnp.diff(starts)
+    short = (lengths >= 1) & (lengths <= max_request_tokens)
+    return jnp.sum(jnp.cumprod(short.astype(jnp.int32)))

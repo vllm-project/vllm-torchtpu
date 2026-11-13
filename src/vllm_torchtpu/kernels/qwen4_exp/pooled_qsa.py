@@ -44,7 +44,10 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa_state import (
     read_ring_and_tags,
     write_ring_and_tags,
 )
-from vllm_torchtpu.kernels.qwen4_exp.request_types import decode_prefix
+from vllm_torchtpu.kernels.qwen4_exp.request_types import (
+    decode_prefix,
+    short_request_prefix,
+)
 from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
     get_main_kv_dma_batch,
 )
@@ -1386,6 +1389,20 @@ def _select_blocks(
             prefill_bkv, prefill_bq, chunk = tuned
             if chunk and len(query) % chunk == 0:
                 chunk_tokens = None if chunk == len(query) else chunk
+        # VLLM_TPU_QSA_PREFILL_INDEXER_SHORT_BQ: the leading short requests
+        # (MTP verify rows) get their own mixed pass with a small query block
+        # instead of one padded PREFILL_INDEXER_BQ block each.
+        short_bq = envs.VLLM_TPU_QSA_PREFILL_INDEXER_SHORT_BQ
+        short_kw = {}
+        if short_bq:
+            if short_bq % 32:
+                raise ValueError(
+                    "VLLM_TPU_QSA_PREFILL_INDEXER_SHORT_BQ must be a multiple of 32, "
+                    f"got {short_bq}"
+                )
+            if short_bq < prefill_bq:
+                short_kw = dict(short_seq_end=short_request_prefix(starts))
+        query_blocks = (1, short_bq if short_kw else prefill_bq, prefill_bq)
         # The scalar-prefetched kernel-page table holds every request slot's
         # whole row (slots x max_model_len / 128 pages). Past the SMEM budget
         # (e.g. 96 slots at 262144 tokens: 768 KiB) hand StreamIndex the
@@ -1412,10 +1429,11 @@ def _select_blocks(
             k=block_topk,
             compression_ratio=ratio,
             num_kv_pages_per_block=(prefill_bkv // rows,) * 3,
-            num_queries_per_block=(1,) + (prefill_bq,) * 2,
+            num_queries_per_block=query_blocks,
             decode_req_batch_size=8,
             enable_early_exit=True,
             chunk_tokens=chunk_tokens,
+            **short_kw,
             components=qsa_indexing(ratio - 1, table_expansion=expansion),
             # VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: as the decode flag, for
             # the prefill chunks' rows (short contexts early in a prompt).

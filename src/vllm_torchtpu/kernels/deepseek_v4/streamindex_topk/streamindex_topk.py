@@ -1217,8 +1217,15 @@ def streamindex_topk(
     decode_passes: bool = True,
     hoist_step_metadata: bool = False,
     tile_aligned_scores: bool = False,
+    short_seq_end: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
+
+    ``short_seq_end`` (traced scalar) splits the mixed pass in two: sequences
+    ``[distribution[1], short_seq_end)`` run with the prefill-case tiles
+    (``num_queries_per_block[1]`` etc.), the rest with the mixed-case tiles.
+    Callers pass the end of the leading short (MTP verify) requests so they do
+    not each fill a whole large query block. None keeps one mixed pass.
 
     ``tile_aligned_scores=True`` rounds each token's score rows up to a whole
     (8, 128) int32 tile. The HBM scores are then the row-major flat array the
@@ -1559,8 +1566,18 @@ def streamindex_topk(
             seq_batch_size=1,
             case=MlaCase.MIXED,
         )
+        mixed_passes = (mixed,)
+        if short_seq_end is not None:
+            short = dict(
+                mixed,
+                num_kv_pages_per_block=num_kv_pages_per_blocks[1],
+                num_queries_per_block=num_queries_per_blocks[1],
+                buffer_count=buffer_counts[1],
+                end_seq_idx=short_seq_end,
+            )
+            mixed_passes = (short, dict(mixed, start_seq_idx=short_seq_end))
         if not decode_passes:
-            return (mixed,)
+            return mixed_passes
         decode_cfg = dict(
             num_kv_pages_per_block=num_kv_pages_per_blocks[0],
             num_queries_per_block=num_queries_per_blocks[0],
@@ -1589,7 +1606,7 @@ def streamindex_topk(
                 seq_batch_size=1,
                 **decode_cfg,
             ),
-            mixed,
+            *mixed_passes,
         )
 
     def _pass_metadata(spec, chunk_starts, chunk_tokens):
