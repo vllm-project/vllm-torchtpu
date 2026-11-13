@@ -927,6 +927,22 @@ class TpuPlatform(Platform):
                     "has no head_dim==64 variant. Use --kv-cache-dtype fp8 or "
                     "auto for this model."
                 )
+            # CLAUDE COMMENT: the unified KV pool stores hybrid models' GDN
+            # state in rows exactly one attention token wide and needs that
+            # width in whole 512-byte granules (gdn_pool_layout.GRANULE_BYTES).
+            # A per-token FP4 row is head_dim / 2 plus the scale bytes, padded
+            # (320 bytes for Qwen3.5 at TP=8), so it does not fit. The
+            # compact-mamba layout keeps GDN state out of the attention pages.
+            if (
+                vllm_config.model_config is not None
+                and vllm_config.model_config.is_hybrid
+                and unified_kv_layout_enabled(vllm_config)
+            ):
+                raise NotImplementedError(
+                    "--kv-cache-dtype nvfp4 does not fit the unified KV pool of "
+                    "hybrid models. Set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0 and "
+                    "pass --no-enable-prefix-caching --block-size 256."
+                )
             supported = [VllmKVCacheLayout.LBHNC.name]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
         # The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND.
