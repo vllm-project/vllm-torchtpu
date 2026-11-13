@@ -456,7 +456,11 @@ def _dense_panels(lhs, weights, buffers, semaphores, *, columns):
 
 
 def _latent_half_pair_panels(lhs, weights, buffers, semaphores):
-    """Pair matching 256-column fragments of the two 1792-wide halves."""
+    """Pair matching 256-column fragments of the two 1792-wide halves.
+
+    ``lhs`` is a list of row-block refs; each panel's product yields one value
+    per block, so the weights stream once for all of them.
+    """
 
     def source_column(panel):
         return (panel // 2) * 256 + (panel % 2) * 1792
@@ -477,9 +481,12 @@ def _latent_half_pair_panels(lhs, weights, buffers, semaphores):
             if panel + 2 + j < 14:
                 copy(panel + 2 + j).start()
         products = [
-            jnp.matmul(
-                lhs, buffers[(panel + j) % 4][...], preferred_element_type=jnp.float32
-            )
+            [
+                jnp.matmul(
+                    rows[...], buffers[(panel + j) % 4][...], preferred_element_type=jnp.float32
+                )
+                for rows in lhs
+            ]
             for j in range(2)
         ]
         for j, product in enumerate(products):
@@ -866,9 +873,10 @@ def _prologue(
         gate_sems, up_sems = s["gu_sems"][:2], s["gu_sems"][2:]
 
         def input_copy(h):
-            return pltpu.make_async_copy(sources[h], own(h), s["input_sem"])
+            return pltpu.make_async_copy(sources[h], own(h), s["input_sems"][h])
 
-        # The router's VMEM doubles as the panel buffers: each pass reloads it.
+        # The router's VMEM doubles as the panel buffers, which overwrite it once
+        # every pass's router product is taken.
         router_copy = pltpu.make_async_copy(router, router_v, s["gu_sems"][0])
         bias_copy = pltpu.make_async_copy(bias, s["bias"], s["gu_sems"][1])
         if sources[0] is not None:
@@ -971,31 +979,34 @@ def _prologue(
                 device_id_type=pl.DeviceIdType.LOGICAL,
             )
 
-        def front(h):
-            """Pass ``h``'s rows to the peer, router/Top16, latent projection
-            and latent ring; after the last pass, the route exchange."""
+        def front():
+            """Every pass's rows to the peer, router/Top16 and latent
+            projection, the latent weights streamed once for all passes; then
+            the latent ring and the route exchange."""
             nonlocal route_steps, route_started, latent_steps
-            last = h == passes - 1
             scope = _phase_start("m_input")
-            if h:
+            for h in range(1, passes):
                 if sources[h] is not None:
                     input_copy(h).start()
-                router_copy.start()
-            pl.semaphore_signal(
-                s["peer_credit"], 1, device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL
-            )
-            if sources[h] is not None:
-                input_copy(h).wait()
-            pl.semaphore_wait(s["peer_credit"], 1)
-            peer_input(h).start()
+            for h in range(passes):
+                pl.semaphore_signal(
+                    s["peer_credit"], 1, device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL
+                )
+                if sources[h] is not None:
+                    input_copy(h).wait()
+                pl.semaphore_wait(s["peer_credit"], 1)
+                peer_input(h).start()
             router_copy.wait()
-            if not h:
-                bias_copy.wait()
+            bias_copy.wait()
             _phase_end(scope)
             scope = _phase_start("m_router")
-            hx = own(h)[...]
-            logits = jnp.matmul(hx, router_v[...], preferred_element_type=jnp.float32)
-            top = _Top16(logits, s["bias"][...])
+            tops = [
+                _Top16(
+                    jnp.matmul(own(h)[...], router_v[...], preferred_element_type=jnp.float32),
+                    s["bias"][...],
+                )
+                for h in range(passes)
+            ]
             _phase_end(scope)
             scope = _phase_start("m_latent")
             routed = False
@@ -1004,69 +1015,76 @@ def _prologue(
                     s["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4)
                 )
                 latent_products = _latent_half_pair_panels(
-                    hx, latent_weight, latent_buffers, s["gu_sems"]
+                    [own(h) for h in range(passes)],
+                    latent_weight,
+                    latent_buffers,
+                    s["gu_sems"],
                 )
             else:
-                latent_products = _dense_panels(
-                    hx, latent_weight, gate_buffers, gate_sems, columns=3584
+                latent_products = (
+                    (col, [product])
+                    for col, product in _dense_panels(
+                        own(0)[...], latent_weight, gate_buffers, gate_sems, columns=3584
+                    )
                 )
-            first_half = None
-            for col, product in latent_products:
+            first_half = [None] * passes
+            for col, products in latent_products:
                 if route_started:
                     stage = next(route_steps, None)
                     if rows <= 128 and stage is None:
                         start_metadata()
                 if rows <= 128 and metadata_started:
                     metadata_progress(gu_steps)
-                if big:
-                    fragment = product.astype(jnp.bfloat16)
-                    if col < 1792:
-                        first_half = fragment
+                for h, product in enumerate(products):
+                    if big:
+                        fragment = product.astype(jnp.bfloat16)
+                        if col < 1792:
+                            first_half[h] = fragment
+                        else:
+                            # Assemble both halves before writing their packed words.
+                            assert first_half[h] is not None
+                            paired = jnp.concatenate((first_half[h], fragment), axis=1)
+                            s["latent_payload"][
+                                pl.ds(h * part, part), :, pl.ds(col - 1792, 256)
+                            ] = paired.reshape(part, 2, 256)
                     else:
-                        # Assemble both halves before writing their packed words.
-                        assert first_half is not None
-                        paired = jnp.concatenate((first_half, fragment), axis=1)
-                        s["latent_payload"][
-                            pl.ds(h * part, part), :, pl.ds(col - 1792, 256)
-                        ] = paired.reshape(part, 2, 256)
-                else:
-                    s["latent"][:, pl.ds(col, 256)] = product.astype(jnp.bfloat16)
-                for _ in range(min(2, 16 - top.index)):
-                    top.step()
-                if top.index == 16 and not routed:
+                        s["latent"][:, pl.ds(col, 256)] = product.astype(jnp.bfloat16)
+                for top in tops:
+                    for _ in range(min(2, 16 - top.index)):
+                        top.step()
+                if tops[0].index == 16 and not routed:
                     routed = True
-                    ids, probs = top.finish(valid[h * part : (h + 1) * part])
-                    bits = jax.lax.bitcast_convert_type(probs, jnp.int32)
-                    if rows < 128:
-                        wire = jnp.concatenate((ids, bits), axis=1)
-                        s["route_payload"][...] = wire.reshape(rows // 4, 128)
-                    else:
-                        # Expert IDs then probability bits, token-major (the
-                        # pass's tokens are rows h * part / 8 of each plane).
-                        span = part // 8
-                        s["route_payload"][pl.ds(h * span, span), :] = ids.reshape(
-                            span, 128
-                        )
-                        s["route_payload"][pl.ds(rows // 8 + h * span, span), :] = (
-                            bits.reshape(span, 128)
-                        )
-                    if last:
-                        route_steps = _route_gather_steps(
-                            s["route_payload"],
-                            s["route_wire"],
-                            s["route_send"],
-                            s["route_recv"],
-                            rank=rank,
-                        )
-                        next(route_steps, None)
-                        route_started = True
+                    for h, top in enumerate(tops):
+                        ids, probs = top.finish(valid[h * part : (h + 1) * part])
+                        bits = jax.lax.bitcast_convert_type(probs, jnp.int32)
+                        if rows < 128:
+                            wire = jnp.concatenate((ids, bits), axis=1)
+                            s["route_payload"][...] = wire.reshape(rows // 4, 128)
+                        else:
+                            # Expert IDs then probability bits, token-major (the
+                            # pass's tokens are rows h * part / 8 of each plane).
+                            span = part // 8
+                            s["route_payload"][pl.ds(h * span, span), :] = (
+                                ids.reshape(span, 128)
+                            )
+                            s["route_payload"][
+                                pl.ds(rows // 8 + h * span, span), :
+                            ] = bits.reshape(span, 128)
+                    route_steps = _route_gather_steps(
+                        s["route_payload"],
+                        s["route_wire"],
+                        s["route_send"],
+                        s["route_recv"],
+                        rank=rank,
+                    )
+                    next(route_steps, None)
+                    route_started = True
             _phase_end(scope)
-            if big and last:
+            if big:
                 ring()
-            if last:
-                for _ in route_steps:
-                    pass
-                start_metadata()
+            for _ in route_steps:
+                pass
+            start_metadata()
             if not big:
                 s["latent_payload"][...] = s["latent"][...].reshape(rows, 2, 1792)
                 latent_steps = _latent_gather_steps(
@@ -1178,8 +1196,7 @@ def _prologue(
 
         # The latent ring of every pass's rows starts before the first shared
         # expert.
-        for h in range(passes):
-            front(h)
+        front()
         for h in range(passes):
             back(h)
 
@@ -1206,7 +1223,10 @@ def _prologue(
         else (),
         gu_sems=tuple(dma for _ in range(4)),
         bias=vmem((1, 896), jnp.float32),
-        input_sem=dma if any(source is not None for source in sources) else None,
+        # Every pass's input load may be in flight at once.
+        input_sems=tuple(dma for _ in range(passes))
+        if any(source is not None for source in sources)
+        else None,
         peer_send=tuple(dma for _ in range(passes)),
         peer_recv=tuple(dma for _ in range(passes)),
         peer_credit=pltpu.SemaphoreType.REGULAR,
