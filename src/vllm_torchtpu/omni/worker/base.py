@@ -19,18 +19,13 @@ from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
 
 class OmniTPUWorkerBase(TPUWorker):
-    """Base worker for every Omni stage on TPU.
+    """Base TPU worker for vLLM-Omni stages, counterpart of ``OmniGPUWorkerBase``.
 
-    Mirrors vLLM-Omni's ``OmniGPUWorkerBase``, the surface the orchestrator
-    drives through ``collective_rpc`` beyond the plain vLLM worker: sleep and
-    wake handshakes and the encoder-availability query. None of them is
-    implemented on TPU yet; each raises so an orchestrator feature that relies
-    on it fails at the call site instead of being ignored.
-
-    Per-stage memory accounting for stages that share one device, which the
-    GPU base folds into ``determine_available_memory``, is not implemented
-    either: ``TPUWorker.determine_available_memory`` assumes the stage owns its
-    chips, which holds for the device pinning the Omni TPU platform applies.
+    Extends ``TPUWorker`` with the vLLM-Omni orchestrator ``collective_rpc``
+    interface (``handle_sleep_task``, ``handle_wake_task``, and
+    ``encoder_loaded``) while inheriting TPU device initialization, model
+    loading, XLA compilation, and HBM KV-cache profiling
+    (``determine_available_memory``) from ``TPUWorker``.
     """
 
     def handle_sleep_task(self, task: Any) -> Any:
