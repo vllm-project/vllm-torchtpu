@@ -429,14 +429,26 @@ def _merge_exchanged_partials(
     one exchange: an all-to-all brings this rank every rank's partial and LSE
     of its own heads, which it weights and sums itself, as the reduce-scatter
     would (each rank's weighted term rounded to the output dtype first, when
-    `TPU_DCP_RS_OUT_PRECISION`). The two all-to-alls are independent, so
-    neither waits on the other's arrival, where the reduce-scatter waited on
-    the LSE gather."""
+    `TPU_DCP_RS_OUT_PRECISION`). The partial crosses in f32 (exact for bf16)
+    with its LSE as trailing rows of each head, so the exchange is one
+    collective, where the reduce-scatter waited on an LSE gather."""
     world = int(group.world_size)
     num_heads, num_tokens, head_dim = out.shape
     local = num_heads // world
-    outs = _all_to_all(out, group).view(world, local, num_tokens, head_dim)
-    lses = _all_to_all(lse.to(torch.float32), group).view(world, local, num_tokens)
+    lse_rows = -(-num_tokens // head_dim)
+    lse_pad = lse_rows * head_dim - num_tokens
+    payload = torch.cat(
+        [
+            out.to(torch.float32),
+            torch.nn.functional.pad(lse.to(torch.float32), (0, lse_pad)).view(
+                num_heads, lse_rows, head_dim
+            ),
+        ],
+        dim=1,
+    )
+    got = _all_to_all(payload, group).view(world, local, -1, head_dim)
+    outs = got[:, :, :num_tokens]
+    lses = got[:, :, num_tokens:].reshape(world, local, -1)[..., :num_tokens]
     weight = torch.exp(lses - torch.logsumexp(lses, dim=0)).unsqueeze(-1)
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
     weighted = torch.where(

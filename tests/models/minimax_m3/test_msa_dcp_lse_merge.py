@@ -97,7 +97,7 @@ def _merge_every_rank(out, lse, monkeypatch, max_tokens):
 
 
 @pytest.mark.parametrize("world", [2, 4, 8])
-@pytest.mark.parametrize("tokens", [8, 13, 24])
+@pytest.mark.parametrize("tokens", [8, 13, 24, 128])
 def test_exchange_merge_is_the_reduce_scatter_merge(world, tokens, monkeypatch):
     out, lse = _partials(np.random.default_rng(world * 100 + tokens), world, tokens)
     scattered = _merge_every_rank(out, lse, monkeypatch, max_tokens=0)
