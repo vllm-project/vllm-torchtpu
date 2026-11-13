@@ -36,6 +36,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -206,7 +207,7 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if not hasattr(layer, "weight_scale"):
+        if layer.weight.dtype != torch.float8_e4m3fn:
             return VllmUnquantizedLinearMethod().apply(layer, x, bias)
         # The scale is a power of two, so this rounds once, like x @ bf16(W).
         return torch.matmul(x, layer.weight.to(x.dtype)) * layer.weight_scale
@@ -249,6 +250,9 @@ class MiniMaxM3Nvfp4MoEMethod(VllmNvfp4MoEMethod):
 class MiniMaxM3QuantConfig(VllmNvfp4Config):
     """TPU config for the checkpoint's ``quant_method: mxfp8`` block."""
 
+    # Whether bias-free MXFP8 linears stay e4m3 (set by from_config).
+    fp8_linears: bool = False
+
     @classmethod
     def get_name(cls) -> str:
         return QUANT_METHOD
@@ -280,7 +284,9 @@ class MiniMaxM3QuantConfig(VllmNvfp4Config):
             group_size=_NVFP4_GROUP,
         )
         # The draft checkpoint names its modules under the dspark prefix.
-        quant_config.fp8_linears = not any(name.startswith(old) for name in ignored)
+        quant_config.fp8_linears = envs.TPU_MINIMAX_M3_FP8_LINEARS and not any(
+            name.startswith(old) for name in ignored
+        )
         return quant_config
 
     def _get_checkpoint_quant_method(
@@ -290,7 +296,7 @@ class MiniMaxM3QuantConfig(VllmNvfp4Config):
         if isinstance(layer, LinearBase):
             if excluded:
                 return VllmUnquantizedLinearMethod()
-            return MiniMaxM3Mxfp8LinearMethod(getattr(self, "fp8_linears", False))
+            return MiniMaxM3Mxfp8LinearMethod(self.fp8_linears)
         if isinstance(layer, RoutedExperts):
             if excluded:
                 return VllmUnquantizedFusedMoEMethod(self.get_moe_config(layer))

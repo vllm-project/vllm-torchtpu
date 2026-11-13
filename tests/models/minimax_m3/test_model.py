@@ -43,6 +43,7 @@ from vllm_torchtpu.models.minimax_m3.quant import (
     MiniMaxM3Nvfp4MoEMethod,
     MiniMaxM3QuantConfig,
     dequantize_mxfp8,
+    requantize_mxfp8_per_channel,
 )
 
 HIDDEN = 64
@@ -318,7 +319,7 @@ def tiny_model(request, monkeypatch):
     return model, vllm_config
 
 
-def test_checkpoint_loads_and_mxfp8_dequantizes(tiny_model, monkeypatch) -> None:
+def test_checkpoint_loads_and_mxfp8_requantizes(tiny_model, monkeypatch) -> None:
     model, vllm_config = tiny_model
     ckpt = _checkpoint()
     attn = model.model.layers[0].self_attn
@@ -364,7 +365,8 @@ def test_checkpoint_loads_and_mxfp8_dequantizes(tiny_model, monkeypatch) -> None
         ),
     )
 
-    # Linears: the fused qkv holds [q | k | v | index_q | index_k] dequantized.
+    # Linears: the fused qkv holds [q | k | v | index_q | index_k] as e4m3
+    # with a power-of-two scale per output channel.
     attn.qkv_proj.quant_method.process_weights_after_loading(attn.qkv_proj)
     p = f"{_LM}.layers.0.self_attn"
     expected = torch.cat(
@@ -375,8 +377,47 @@ def test_checkpoint_loads_and_mxfp8_dequantizes(tiny_model, monkeypatch) -> None
             for proj in ("q_proj", "k_proj", "v_proj", "index_q_proj", "index_k_proj")
         ]
     )
-    torch.testing.assert_close(attn.qkv_proj.weight, expected.T)
-    assert not hasattr(attn.qkv_proj, "weight_scale")
+    weight, scale = attn.qkv_proj.weight, attn.qkv_proj.weight_scale
+    assert weight.dtype == torch.float8_e4m3fn
+    # Exact except elements the block shift takes below e4m3's normal range.
+    subnormal_step = 2.0**-9 * scale.float().max().item()
+    torch.testing.assert_close(
+        weight.float() * scale.float(), expected.T.float(), rtol=0, atol=subnormal_step
+    )
     x = torch.randn(3, HIDDEN, dtype=torch.bfloat16)
     out, _ = attn.qkv_proj(x)
-    torch.testing.assert_close(out, x @ expected.T)
+    torch.testing.assert_close(out, x @ expected.T, rtol=2e-2, atol=2e-2)
+
+
+def test_mxfp8_linears_stay_e4m3_only_for_the_target() -> None:
+    target = MiniMaxM3QuantConfig.from_config(_quant_dict())
+    draft_dict = _quant_dict()
+    draft_dict["ignored_layers"] = [
+        *draft_dict["ignored_layers"],
+        "language_model.model.dspark.fc",
+    ]
+    draft = MiniMaxM3QuantConfig.from_config(draft_dict)
+    assert target.fp8_linears and not draft.fp8_linears
+
+
+def test_requantize_mxfp8_per_channel() -> None:
+    torch.manual_seed(0)
+    weight = (torch.randn(64, 128) * 4).to(torch.float8_e4m3fn)
+    # One block scale per channel: no shift, so the requantization is exact.
+    flat = torch.randint(110, 125, (64, 1), dtype=torch.uint8).expand(64, 4)
+    w8, channel_scale, changed = requantize_mxfp8_per_channel(weight, flat)
+    assert changed == 0
+    torch.testing.assert_close(
+        w8.float().T * channel_scale[:, None],
+        dequantize_mxfp8(weight, flat).float(),
+        rtol=0,
+        atol=0,
+    )
+    # Mixed block scales: only sub-normal underflow differs, by under one step.
+    mixed = torch.randint(110, 125, (64, 4), dtype=torch.uint8)
+    w8, channel_scale, _ = requantize_mxfp8_per_channel(weight, mixed)
+    step = (2.0**-9 * channel_scale)[:, None]
+    err = (w8.float().T * channel_scale[:, None]) - dequantize_mxfp8(
+        weight, mixed
+    ).float()
+    assert bool((err.abs() <= step).all())

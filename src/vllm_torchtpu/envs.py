@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    TPU_MINIMAX_M3_FP8_LINEARS: bool = True
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
@@ -704,6 +705,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
+    # MiniMax-M3 target-model MXFP8 linears run on e4m3 weights with a
+    # per-channel power-of-two scale (models/minimax_m3/quant.py); 0 restores
+    # the exact bf16 dequantization.
+    "TPU_MINIMAX_M3_FP8_LINEARS": lambda: os.getenv(
+        "TPU_MINIMAX_M3_FP8_LINEARS", "1"
+    ).lower()
+    not in ("0", "false"),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
