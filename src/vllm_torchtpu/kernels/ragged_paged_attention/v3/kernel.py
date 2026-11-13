@@ -20,6 +20,7 @@ during inference.
 """
 
 import functools
+import math
 from enum import Enum
 from typing import Any, cast
 
@@ -1723,10 +1724,7 @@ def ragged_paged_attention(
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
         mask_value = cast(float, jnp.finfo(out_dtype).min)
 
-    if vmem_limit_bytes is None:
-        # TODO(jevinjiang, jacobplatin): change this to use
-        # `get_vmem_estimate_bytes` when VREG spilling is fixed.
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+    vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
 
     static_validate_inputs(
         q,
@@ -1832,6 +1830,28 @@ def ragged_paged_attention(
             out_dtype,
         )
 
+        if vmem_limit_bytes is None:
+            # Twice the scratch covers Mosaic temporaries and VREG spills (too
+            # little fails at compile), and at least 16 MiB. Claiming all of
+            # VMEM evicts what XLA prefetched across the call: every layer's
+            # o_proj weight then streams from HBM at 1.9 of 2.9 TB/s.
+            scratch_bytes = sum(
+                buf.dtype.itemsize * math.prod(buf.shape)
+                for buf in (
+                    bkv_double_buf,
+                    bq_double_buf,
+                    bo_double_buf,
+                    l_scratch,
+                    m_scratch,
+                    acc_scratch,
+                )
+            )
+            launch_vmem_limit = min(
+                vmem_capacity_bytes, max(16 * 1024 * 1024, 2 * scratch_bytes)
+            )
+        else:
+            launch_vmem_limit = vmem_limit_bytes
+
         scratch_shapes = [
             bkv_double_buf,  # (bkv_x2_ref) Double buffering for kv block.
             bq_double_buf,  # (bq_x2_ref) Double buffering for q block.
@@ -1892,7 +1912,7 @@ def ragged_paged_attention(
                 # TODO(jevinjiang): since each sequence depends on the previous
                 # one, we need some extra work to support Megacore mode.
                 dimension_semantics=("arbitrary",),
-                vmem_limit_bytes=vmem_limit_bytes,
+                vmem_limit_bytes=launch_vmem_limit,
                 # Paged attention invokes multiple small DMAs for each pages
                 # instead of a single large DMA. Therefore, the overhead of bounds
                 # checking becomes too significant so we disable it.
