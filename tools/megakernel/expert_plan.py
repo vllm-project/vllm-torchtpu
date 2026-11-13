@@ -90,7 +90,9 @@ def parse_run(spec: str) -> tuple[Path, float, str, tuple[int, int] | None]:
     directory, which may itself contain colons)."""
     parts = spec.split(":")
     options = []
-    while len(parts) > 1 and parts[-1].partition("=")[0] in _OPTIONS:
+    while len(parts) > 1 and re.fullmatch(r"[a-z_]+=.*", parts[-1]):
+        if parts[-1].partition("=")[0] not in _OPTIONS:
+            raise SystemExit(f"--counts {spec}: unknown option {parts[-1]!r}")
         options.insert(0, parts.pop())
     weight, plan, windows = 1.0, "", None
     for option in options:
