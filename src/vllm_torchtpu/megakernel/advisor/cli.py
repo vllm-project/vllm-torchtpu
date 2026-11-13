@@ -47,9 +47,12 @@ from .regimes import (
     recommend_parallelism,
 )
 from .report import (
+    build_bucket_schedule,
     format_advisor_summary,
+    format_layer_group_search,
     format_regime_table,
     write_advisor_html,
+    write_bucket_schedule,
 )
 from .specs import (
     DispatchRegime,
@@ -58,7 +61,7 @@ from .specs import (
     Phase,
     WorkloadSpec,
 )
-from .verdict import advise
+from .verdict import advise, search_layer_groups
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -88,18 +91,18 @@ def _emit_json(payload: dict[str, object], dest: str) -> None:
 
 def _add_source_args(parser: argparse.ArgumentParser) -> None:
     """Register model and chip source selection flags."""
-    m_grp = parser.add_mutually_exclusive_group(required=True)
-    m_grp.add_argument(
+    model_group = parser.add_mutually_exclusive_group(required=True)
+    model_group.add_argument(
         "--model",
         type=str,
         help="Built-in deployment preset name, HF repo ID, or local directory.",
     )
-    m_grp.add_argument(
+    model_group.add_argument(
         "--config",
         type=Path,
         help="Path to HuggingFace config.json or repo directory.",
     )
-    m_grp.add_argument(
+    model_group.add_argument(
         "--hf-repo",
         type=str,
         help="HuggingFace repository ID.",
@@ -302,6 +305,11 @@ def _add_output_args(parser: argparse.ArgumentParser) -> None:
         help="Evaluate the full 12-regime matrix across batch and phase.",
     )
     parser.add_argument(
+        "--search-layer-groups",
+        action="store_true",
+        help="Compare equal-split, per-layer, and listed layer_group partitions.",
+    )
+    parser.add_argument(
         "--html",
         type=Path,
         help="Write self-contained HTML regime report to disk.",
@@ -327,6 +335,15 @@ def _add_output_args(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         dest="deployment_preset",
         help="Ignore deployment presets during regime sweep.",
+    )
+    parser.add_argument(
+        "--bucket-schedule",
+        type=str,
+        default=None,
+        help=(
+            "Write advisory advisor.bucket_schedule.v1 JSON schedule to this path "
+            "(or '-' for stdout)"
+        ),
     )
 
 
@@ -467,6 +484,16 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
     """Validate CLI scalar bounds before running recommendations or sweeps."""
     _validate_cli_ints(args)
     _validate_cli_floats(args)
+    if args.bucket_schedule == "-":
+        if args.json == "-":
+            msg = "Cannot output both --bucket-schedule and --json to stdout ('-')."
+            raise errors.MegakernelConfigError(msg)
+        if args.regime_sweep:
+            msg = (
+                "Cannot output --bucket-schedule to stdout ('-') when --regime-sweep "
+                "text table is requested."
+            )
+            raise errors.MegakernelConfigError(msg)
 
 
 def _resolve_cli_measurements(
@@ -493,7 +520,7 @@ def _run_sweep_command(
     measurements_val: str | None,
 ) -> int:
     """Execute `--regime-sweep` / `--html` and emit stdout/HTML/JSON outputs."""
-    base_wl = WorkloadSpec(
+    base_workload = WorkloadSpec(
         tp=args.tp or 1,
         ep=args.ep or 1,
         dp=args.dp,
@@ -511,7 +538,7 @@ def _run_sweep_command(
         dispatch_regime=args.dispatch_regime,
     )
     opts = RegimeSweepOptions(
-        base_workload=base_wl,
+        base_workload=base_workload,
         tp=args.tp,
         ep=args.ep,
         dp=args.dp,
@@ -524,6 +551,11 @@ def _run_sweep_command(
     sweep = advise_regimes(profile, chip_spec, options=opts)
     if args.html:
         write_advisor_html(sweep, args.html)
+    if args.bucket_schedule is not None:
+        if args.bucket_schedule == "-":
+            _emit_json(build_bucket_schedule(sweep).to_dict(), "-")
+        else:
+            write_bucket_schedule(sweep, args.bucket_schedule)
     if args.json is not None:
         _emit_json(sweep.to_dict(), args.json)
     elif args.regime_sweep:
@@ -596,15 +628,25 @@ def _run_main_command(args: argparse.Namespace) -> int:
     profile, chip_spec = _resolve_cli_model_and_chip(args)
     measurements_val = _resolve_cli_measurements(args.measurements, chip_spec.name)
 
-    if args.regime_sweep or args.html:
+    if args.regime_sweep or args.html or args.bucket_schedule:
         return _run_sweep_command(args, profile, chip_spec, measurements_val)
 
     tp, ep, dp, pp, dcp = _resolve_cli_mesh(args)
     if tp is None:
-        rec = recommend_parallelism(profile, chip_spec, dp=dp, pp=pp)
-        tp = rec.tp
+        recommendation = recommend_parallelism(
+            profile,
+            chip_spec,
+            dp=dp,
+            pp=pp,
+            dcp=dcp or 0,
+            pcp=args.pcp,
+            phase=args.phase,
+        )
+        tp = recommendation.tp
         if ep is None:
-            ep = rec.ep
+            ep = recommendation.ep
+        if dcp is None:
+            dcp = recommendation.dcp
 
     layout = ParallelLayout(
         tp=1 if tp is None else tp,
@@ -622,6 +664,15 @@ def _run_main_command(args: argparse.Namespace) -> int:
         else (1 if args.phase == "prefill" else RECOMMEND_DEFAULT_BATCH)
     )
     workload = _build_single_workload(args, batch=batch_val, layout=layout)
+    if args.search_layer_groups:
+        search_res = search_layer_groups(
+            profile, workload, chip_spec, measurements=measurements_val
+        )
+        if args.json is not None:
+            _emit_json(search_res.to_dict(), args.json)
+        else:
+            sys.stdout.write(format_layer_group_search(search_res) + "\n")
+        return 0
     report = advise(
         profile,
         workload,
