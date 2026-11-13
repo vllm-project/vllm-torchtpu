@@ -19,6 +19,13 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+# The scalar-prefetched half mask ``[cap, 2]`` lives in SMEM, where a 2-D int32
+# array is padded to 128 words per row: 512 B per writer. Up to this capacity
+# (8192-token steps: cap ~1.1K, ~0.56 MiB) it stays 2-D; above it (12288 /
+# 16384-token steps under QWEN4_EXP_MAX_STEP_TOKENS) the two half bits are
+# packed into one int32 per writer so the prefetch fits the 1 MiB SMEM.
+MASK_2D_MAX_CAP = 1536
+
 
 def writer_capacity(tokens: int, requests: int, ratio: int) -> int:
     """Upper bound on the pairs one step writes.
@@ -62,6 +69,14 @@ def write_runs(view, pair, write, mask, values, requests, ratio):
     run_len = jnp.where(jnp.arange(cap) < num_runs, run_end - run_off, 0)
     run_pair = pairs[run_off]
     counts = jnp.stack([jnp.sum(partial).astype(jnp.int32), num_runs])
+    packed = cap > MASK_2D_MAX_CAP
+    if packed:
+        # bit 0: first BF16 half, bit 1: second half.
+        mask_arg = halves[:, 0].astype(jnp.int32) | (
+            halves[:, 1].astype(jnp.int32) << 1
+        )
+    else:
+        mask_arg = halves.astype(jnp.int32)
     sizes = tuple(1 << b for b in range(cap.bit_length() - 1, -1, -1))
 
     def kernel(
@@ -94,7 +109,11 @@ def write_runs(view, pair, write, mask, values, requests, ratio):
             copy.wait()
             tmp_bf = tmp.bitcast(jnp.bfloat16) if view.dtype != jnp.bfloat16 else tmp
             half = jnp.broadcast_to(jnp.arange(2)[:, None], (2, width))
-            keep = jnp.where(half == 0, mask_ref[i, 0], mask_ref[i, 1]) != 0
+            if packed:
+                bits = mask_ref[i]
+                keep = jnp.where(half == 0, bits & 1, (bits >> 1) & 1) != 0
+            else:
+                keep = jnp.where(half == 0, mask_ref[i, 0], mask_ref[i, 1]) != 0
             staged_bf[i] = jnp.where(keep, rows_ref[i], tmp_bf[...])
             return carry
 
@@ -154,7 +173,7 @@ def write_runs(view, pair, write, mask, values, requests, ratio):
         name="qwen4_exp_compressed_kv_run_write",
     )(
         pairs,
-        halves.astype(jnp.int32),
+        mask_arg,
         partial_list.astype(jnp.int32),
         run_off.astype(jnp.int32),
         run_pair.astype(jnp.int32),
