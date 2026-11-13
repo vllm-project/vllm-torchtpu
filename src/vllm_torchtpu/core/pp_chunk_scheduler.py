@@ -48,7 +48,7 @@ off by default, so a pipeline that sets none of them is scheduled as before.
 
 import math
 import time
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -73,6 +73,9 @@ from vllm_torchtpu.core.prefix_aware_scheduler import (
     trim_resend_token_ids,
 )
 from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 
 logger = init_logger(__name__)
 
@@ -113,30 +116,32 @@ def _prefill_end(request: Any) -> int:
 class TpuPipelineChunkScheduler(Scheduler):
     # The prefix-aware admission (option prefix_aware) borrows these from
     # PrefixAwareScheduler; none of them calls super().
+    # The ones this class calls are typed Any: their self parameter is a
+    # PrefixAwareScheduler, which this class is not.
     _MEMO_LOG_CAP = PrefixAwareScheduler._MEMO_LOG_CAP
     _MEMO_VERIFY_REUSES = PrefixAwareScheduler._MEMO_VERIFY_REUSES
     _PAW_SORT_LOG_INTERVAL_S = PrefixAwareScheduler._PAW_SORT_LOG_INTERVAL_S
     _PAW_SORT_WINDOW = PrefixAwareScheduler._PAW_SORT_WINDOW
     WINDOW = PrefixAwareScheduler.WINDOW
-    _enable_memo_xstep = PrefixAwareScheduler._enable_memo_xstep
-    _memo_trim_log = PrefixAwareScheduler._memo_trim_log
+    _enable_memo_xstep: Any = PrefixAwareScheduler._enable_memo_xstep
+    _memo_trim_log: Any = PrefixAwareScheduler._memo_trim_log
     _memo_still_exact = PrefixAwareScheduler._memo_still_exact
-    _memo_get = PrefixAwareScheduler._memo_get
+    _memo_get: Any = PrefixAwareScheduler._memo_get
     _memo_compute = PrefixAwareScheduler._memo_compute
-    _get_prefix_cache_epoch = PrefixAwareScheduler._get_prefix_cache_epoch
-    _get_block_size = PrefixAwareScheduler._get_block_size
+    _get_prefix_cache_epoch: Any = PrefixAwareScheduler._get_prefix_cache_epoch
+    _get_block_size: Any = PrefixAwareScheduler._get_block_size
     _get_num_free_blocks = PrefixAwareScheduler._get_num_free_blocks
-    _prefix_warmth = PrefixAwareScheduler._prefix_warmth
-    _external_warmth = PrefixAwareScheduler._external_warmth
-    _get_paw_aging_rate = PrefixAwareScheduler._get_paw_aging_rate
+    _prefix_warmth: Any = PrefixAwareScheduler._prefix_warmth
+    _external_warmth: Any = PrefixAwareScheduler._external_warmth
+    _get_paw_aging_rate: Any = PrefixAwareScheduler._get_paw_aging_rate
     _now = PrefixAwareScheduler._now
-    _init_paw_sort = PrefixAwareScheduler._init_paw_sort
-    _sort_waiting_queue = PrefixAwareScheduler._sort_waiting_queue
-    _select_waiting_queue_for_scheduling = (
+    _init_paw_sort: Any = PrefixAwareScheduler._init_paw_sort
+    _sort_waiting_queue: Any = PrefixAwareScheduler._sort_waiting_queue
+    _select_waiting_queue_for_scheduling: Any = (
         PrefixAwareScheduler._select_waiting_queue_for_scheduling
     )
     _promote_warmest = PrefixAwareScheduler._promote_warmest
-    _maybe_pack_prompt_ids = PrefixAwareScheduler._maybe_pack_prompt_ids
+    _maybe_pack_prompt_ids: Any = PrefixAwareScheduler._maybe_pack_prompt_ids
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -342,7 +347,7 @@ class TpuPipelineChunkScheduler(Scheduler):
 
     def _get_local_prefix_cache_hit(
         self, request: Any, max_cache_hit_length: int | None = None
-    ) -> tuple[object, int, int, bool]:
+    ) -> tuple["KVCacheBlocks", int, int, bool]:
         if not getattr(self, "_prefix_aware", False):
             return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
         connector = getattr(self, "connector", None)
