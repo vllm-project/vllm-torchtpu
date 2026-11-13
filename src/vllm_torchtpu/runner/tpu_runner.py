@@ -837,6 +837,15 @@ def _pad_rejected_rows(num_rejected: torch.Tensor, rows: int) -> torch.Tensor:
     return torch.nn.functional.pad(num_rejected, (0, rows - n))
 
 
+# The pad as its own compiled program per row count: run eagerly, torch-tpu's
+# deferred fusion merges it with per-step-varying neighbours, so warmup's eager
+# pad never matched serving's and it compiled mid-serve (j-07c68dc0: 109
+# compiles, ~30 ms each).
+_pad_rejected_rows_compiled = _static_shape_args(
+    torch.compile(_pad_rejected_rows, backend="tpu", fullgraph=True, dynamic=False)
+)
+
+
 def _spec_tail(next_tokens, drafts, draft_lengths, rows, num_reqs, bound):
     """One async-spec step's substitution source, padded to `bound`, and its
     per-request rejected count: `assemble_spec_next_tokens`,
@@ -4242,7 +4251,9 @@ class TPUModelRunner(GPUModelRunner):
                 # previous step's batch, and each new pair compiled the eager
                 # correction mid-serve (45-95 ms on every rank). Padded rows
                 # leave one shape per bucket, precompiled below.
-                num_rejected = _pad_rejected_rows(num_rejected, self.max_num_reqs)
+                num_rejected = _pad_rejected_rows_compiled(
+                    num_rejected, self.max_num_reqs
+                )
                 subtract_shape = (num_rejected.shape[0], *subtract_shape[1:])
             subtract = (
                 _subtract_num_rejected_tokens_compiled
@@ -8855,7 +8866,7 @@ class TPUModelRunner(GPUModelRunner):
                 # The row pad itself is an eager op, one program per row count.
                 for n in range(1, self.max_num_reqs):
                     synchronize_tensors(
-                        _pad_rejected_rows(
+                        _pad_rejected_rows_compiled(
                             torch.zeros(n, dtype=torch.int32).to(self.device),
                             self.max_num_reqs,
                         )
