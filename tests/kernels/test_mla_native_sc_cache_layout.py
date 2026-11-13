@@ -82,6 +82,42 @@ class NativeScCacheLayoutTest(absltest.TestCase):
             packed.view(np.uint8).reshape(2, 128, 4), expected
         )
 
+    def test_pack_rope_packed_supports_aligned_widths_and_rejects_invalid_shapes(
+        self,
+    ):
+        rng = np.random.default_rng(19)
+        nope = np.zeros((3, 256, 4, 128), np.uint8)
+        packed_nope = native_sc_cache_layout.pack_nope(nope)
+
+        rope_64 = rng.integers(0, 256, (3, 256, 64), np.uint8)
+        packed_64 = native_sc_cache_layout.pack_rope_packed(rope_64)
+        self.assertEqual(packed_64.shape, (3, 32, 128))
+        self.assertEqual(
+            native_sc_cache_layout.source_bytes_per_token(packed_nope, packed_64),
+            (512, 64),
+        )
+        self.assertEqual(
+            native_sc_cache_layout.flatten_rope_rows(packed_64, rope_words=16).shape,
+            (768, 16),
+        )
+
+        rope_128 = rng.integers(0, 256, (3, 256, 128), np.uint8)
+        packed_128 = native_sc_cache_layout.pack_rope_packed(rope_128)
+        self.assertEqual(packed_128.shape, (3, 64, 128))
+        np.testing.assert_array_equal(
+            packed_128,
+            native_sc_cache_layout.pack_rope_banded(rope_128.reshape(3, 64, 4, 128)),
+        )
+
+        for bad_shape in ((3, 256, 0), (3, 256, 30), (3, 256, 96), (3, 5, 64)):
+            with self.subTest(bad_shape=bad_shape), self.assertRaises(ValueError):
+                native_sc_cache_layout.pack_rope_packed(np.zeros(bad_shape, np.uint8))
+
+        with self.assertRaises(ValueError):
+            native_sc_cache_layout.source_bytes_per_token(
+                packed_nope, np.zeros((2, 32, 128), np.uint32)
+            )
+
 
 if __name__ == "__main__":
     absltest.main()

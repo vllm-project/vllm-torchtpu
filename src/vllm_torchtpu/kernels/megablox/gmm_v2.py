@@ -333,7 +333,9 @@ class IndexMaps:
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         return (group_id, k_id, n_id)
 
-    def rhs_bias_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
+    def rhs_per_channel_index_map(
+        self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array
+    ):
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         return (group_id, 0, n_id)
 
@@ -384,7 +386,7 @@ def generate_block_specs(
     if cfgs.rhs_cfgs.has_bias:
         rhs_bias_block_spec = pl.BlockSpec(
             (None, 1, cfgs.tiles.tile_n),
-            index_map.rhs_bias_index_map,
+            index_map.rhs_per_channel_index_map,
         )
     if cfgs.rhs_cfgs.has_scale:
         scale_shape = (None, cfgs.num_quant_blocks_per_tile_k, cfgs.tiles.tile_n)
@@ -396,7 +398,7 @@ def generate_block_specs(
         )
     if cfgs.rhs_cfgs.has_global_scale:
         rhs_global_scale_spec = pl.BlockSpec(
-            (None, 1, cfgs.tiles.tile_n), index_map.rhs_bias_index_map
+            (None, 1, cfgs.tiles.tile_n), index_map.rhs_per_channel_index_map
         )
 
     rhs_block_spec = WeightsRef(
@@ -1424,7 +1426,11 @@ def gmm_v2(
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = rhs_global_scale_spec = None
     if cfgs.rhs_cfgs.has_compact_scale and rhs_global_scale is None:
-        raise ValueError("Compact E4M3 scales require rhs_global_scale")
+        assert rhs_scale is not None
+        raise ValueError(
+            f"Compact E4M3 scales (dtype {rhs_scale.dtype}, shape {rhs_scale.shape}) "
+            "require rhs_global_scale"
+        )
     if rhs_global_scale is not None:
         if (
             rhs_scale is None
@@ -1435,10 +1441,23 @@ def gmm_v2(
             or rhs_global_scale.shape != (dims.size_group, 1, dims.size_n)
             or not rhs_dequantize_in_fp32
         ):
+            scale_desc = (
+                "none"
+                if rhs_scale is None
+                else f"dtype {rhs_scale.dtype}, shape {rhs_scale.shape}"
+            )
             raise ValueError(
-                "Global scales require E4M3 block scales "
-                "(FP8 or compact uint8), FP32 "
-                "[E,1,N] global scales, and FP32 dequantization"
+                "Global scales require E4M3 block scales (FP8 or compact uint8), "
+                f"FP32 [{dims.size_group}, 1, {dims.size_n}] global scales, and FP32 "
+                f"dequantization; got block scales {scale_desc}, global scales dtype "
+                f"{rhs_global_scale.dtype}, shape {rhs_global_scale.shape}, and "
+                f"rhs_dequantize_in_fp32={rhs_dequantize_in_fp32}"
+            )
+        if not cfgs.rhs_cfgs.should_dequantize_before_matmul:
+            raise NotImplementedError(
+                "Global scales need the weights dequantized before the matmul, but "
+                f"quant block size {cfgs.rhs_cfgs.quant_block_size} is not below the "
+                f"MXU column size {pltpu.get_tpu_info().mxu_column_size}"
             )
         rhs_global_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_scale is not None:

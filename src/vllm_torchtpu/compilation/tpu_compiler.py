@@ -83,11 +83,12 @@ class TpuCompilationHandle:
 
 _tpu_backend = TpuBackend()
 
-# How long a rank waits for the rank of its host that compiles a bucket, and
-# how often it looks. The wait is bounded only for a peer that never saves the
-# artifact (its serialize() failed); the rank then compiles the bucket itself.
-PEER_WAIT_S = 3600.0
-_PEER_POLL_S = 5.0
+# How often a rank looks for the artifact of the rank of its host that compiles
+# a bucket. How long it waits is TPU_PRECOMPILE_PEER_WAIT_S (default 600 s):
+# the wait is bounded for a peer that never saves the artifact (its serialize()
+# failed, it crashed, or it does not exist); the rank then compiles the bucket
+# itself, so a timeout costs one redundant compile rather than a stalled start.
+_PEER_POLL_S = 0.5
 # get_attr tensors up to this size are hashed by value; bigger ones, which are
 # weights rather than constants, by dtype and shape.
 _FINGERPRINT_MAX_NUMEL = 1 << 16
@@ -176,6 +177,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # compiled model or custom-kernel lowering.
     "DP_SCHED_ENABLED",
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
+    "VLLM_TPU_SRPT_ATTN_WORK_CAP",
+    "VLLM_TPU_SRPT_ATTN_TILE_TOKENS",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
@@ -192,6 +195,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PARALLEL_PRECOMPILE",
     "TPU_PRECOMPILE_BIGGEST_FIRST",
     "TPU_PRECOMPILE_PEER_REPLAY",
+    "TPU_PRECOMPILE_PEER_WAIT_S",
+    "TPU_PRECOMPILE_TRACE_FIRST",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
@@ -229,6 +234,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Engine-side timing of the pipeline pushes; the workers' programs are
     # the same either way.
     "TPU_PP_LAZY_PUSH",
+    # The hand-off between pipeline stages and its depth: it runs outside
+    # the compiled forwards, which take the same inputs either way.
+    "TPU_PP_HANDOFF",
+    "TPU_PP_RING_DEPTH",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the
@@ -261,6 +270,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # `import torch_tpu` (via libtpu.configure_library_path()) sets this to
+    # <site-packages>/libtpu/libtpu.so, so the raw path would change the key
+    # with the venv prefix or mount path. get_libtpu_cache_key() already
+    # identifies the loaded build without its path.
+    "TPU_LIBRARY_PATH",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -402,6 +416,9 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
 
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
+    # Deferred: tpu_info imports Pallas, which this module otherwise avoids.
+    from vllm_torchtpu.tpu_info import get_libtpu_cache_key
+
     cache_config = vllm_config.cache_config
     scheduler_config = vllm_config.scheduler_config
     spec = vllm_config.speculative_config
@@ -410,7 +427,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "torch_tpu": importlib_metadata.version("torch-tpu"),
         "jax": importlib_metadata.version("jax"),
         "jaxlib": importlib_metadata.version("jaxlib"),
-        "libtpu": importlib_metadata.version("libtpu"),
+        "libtpu": get_libtpu_cache_key(),
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
         "parallel": {
@@ -610,6 +627,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         `fingerprint` is `_graph_fingerprint(graph)` taken before the backend
         ran, as a peer replaying this artifact computes it.
         """
+        tmp_path = f"{path}.{os.getpid()}.tmp"
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             payload = TpuCompilationHandle(
@@ -622,7 +640,8 @@ class TpuCompilerAdaptor(CompilerInterface):
             # Write-then-rename: a crash or a full disk partway through
             # pickling a 400 MB entry would otherwise leave a truncated file
             # that the next run reads back as a corrupt artifact.
-            tmp_path = f"{path}.tmp"
+            # The temp name is PID-unique, like _link_artifact's: two writers
+            # of the same path must not interleave into one temp file.
             with open(tmp_path, "wb") as f:
                 pickle.dump(payload, f)
             os.replace(tmp_path, path)
@@ -632,6 +651,8 @@ class TpuCompilerAdaptor(CompilerInterface):
             # Non-fatal by design: a failed save costs a recompile next run,
             # which is strictly better than persisting something unloadable.
             logger.warning("[TpuCompilerAdaptor] Failed to save artifact: %s", e)
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
             return False
 
     def _replay(

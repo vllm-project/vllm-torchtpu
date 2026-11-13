@@ -40,6 +40,7 @@ from typing import Any
 import portpicker
 
 from vllm_torchtpu.experimental.export import weight_mapper
+from vllm_torchtpu.experimental.export.trace import trace
 
 # vLLM picks its platform when imported, so CPU workers start with this env.
 CPU_ENV = {"VLLM_TARGET_DEVICE": "cpu", "JAX_PLATFORMS": "cpu", "PJRT_DEVICE": "CPU"}
@@ -303,6 +304,7 @@ def init_jax(rank: int, world_size: int, coordinator: str | None) -> None:
         )
 
 
+@trace("export.save_checkpoint")
 def save_model_checkpoint(
     tensors: Mapping[str, Any], artifact_dir: str, data_dir: str
 ) -> None:

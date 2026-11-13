@@ -3592,6 +3592,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         )
         runner = SimpleNamespace(
             _pp_wave=None,
+            _dp_step_other_decode=False,
             execute_model_state=SimpleNamespace(
                 scheduler_output=scheduler_output,
                 draft_chunks=[],
@@ -3629,6 +3630,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _is_async_drafter=False,
             _is_dspark_pd_producer=False,
             _fence_spec_kv_under_token_copy=False,
+            _min_tokens_batch_state=lambda: {},
             is_pooling_model=False,
             drafter=SimpleNamespace(),
             spec_decode_manager=SimpleNamespace(

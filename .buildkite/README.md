@@ -29,7 +29,7 @@ post-merge build of such a PR does the same: `bootstrap.sh` reads the merged
 PR's labels from GitHub. Keep TPU steps of the `tests` lane inside that group.
 
 Releases and nightly images are published by the `vllm-torchtpu-release`
-pipeline in the TPU Release cluster; [`release/README.md`](release/README.md)
+pipeline in the TPU Release cluster; [`release/README.md`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/release/README.md)
 has how to cut a release. Its nightly step runs
 `scripts/publish_nightly_images.sh` on `main`, pushing the `ci`, `dev` and
 `prod` images to GAR as `nightly-YYYYMMDD` and `latest`, and the `dev` image to
