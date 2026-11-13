@@ -21,7 +21,9 @@ from jax.experimental.pallas import tpu as pltpu
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
+    can_use_dense_expert_fp4,
     dense_expert_moe,
+    dense_expert_moe_fp4,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     get_packing_factor,
@@ -787,22 +789,32 @@ def fused_moe_func(
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
-    if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        w1_bias,
-        w2_bias,
-        activation=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    ):
-        logger.info_once("Selected experimental dense-expert decode MoE")
-        return dense_expert_moe(
-            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
-        )
+    if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD:
+        dense_args = (hidden_states, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias)
+        if can_use_dense_expert(
+            *dense_args,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+        ):
+            logger.info_once("Selected experimental dense-expert decode MoE")
+            return dense_expert_moe(
+                hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+            )
+        if can_use_dense_expert_fp4(
+            *dense_args, activation=activation, rhs_quant_dtype=rhs_quant_dtype
+        ):
+            logger.info_once("Selected experimental FP4 dense-expert decode MoE")
+            return dense_expert_moe_fp4(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                activation=activation,
+            )
 
     (
         x,
