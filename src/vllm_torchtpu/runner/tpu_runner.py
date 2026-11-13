@@ -219,6 +219,7 @@ from vllm_torchtpu.spec_decode.adaptive_verification import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.spec_decode.proposer_registry import select_draft_proposer
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,
@@ -1500,7 +1501,10 @@ class TPUModelRunner(GPUModelRunner):
             elif self.speculative_config.method == "dspark":
                 self.drafter = DSparkProposer(self, self.vllm_config)
             elif self.speculative_config.use_eagle():
-                self.drafter = Eagle3Proposer(self, self.vllm_config)
+                # A model directory may supply its own proposer for its draft
+                # architecture; none registered builds the shared one.
+                factory = select_draft_proposer(self.vllm_config) or Eagle3Proposer
+                self.drafter = factory(self, self.vllm_config)
             else:
                 raise NotImplementedError(
                     "Unsupported speculative decoding method: "
