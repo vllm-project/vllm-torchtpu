@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`ops.msa.merge_head_partials`: the decode-step exchange merge gives the
-reduce-scatter merge's result bit for bit, on every rank."""
+"""The MSA DCP decode-step collectives (`ops.msa`): the exchange merge gives
+the reduce-scatter merge's result, and the joint query + candidate gather the
+two separate gathers', bit for bit on every rank."""
 
 import concurrent.futures
 import threading
@@ -133,3 +134,35 @@ def test_positive_control_a_misrouted_partial_is_caught(monkeypatch):
     with concurrent.futures.ThreadPoolExecutor(2) as pool:
         exchanged = list(pool.map(run, range(2)))
     assert not torch.equal(exchanged[0], scattered[0])
+
+
+@pytest.mark.parametrize("world", [2, 8])
+def test_queries_cross_with_the_candidates_unchanged(world):
+    """One gather of queries + candidates gives both separate gathers'
+    results bit for bit, including -inf scores and -1 block ids."""
+    rng = np.random.default_rng(world)
+    tokens, heads, head_dim, width = 8, 8, 128, 32
+    q = torch.from_numpy(
+        rng.standard_normal((world, tokens, heads, head_dim)).astype(np.float32)
+    ).to(torch.bfloat16)
+    candidates = torch.from_numpy(
+        rng.standard_normal((world, tokens, width)).astype(np.float32)
+    )
+    candidates[:, :, 10:16] = float("-inf")
+    candidates[:, :, 26:] = -1.0
+    hub = _Hub(world)
+
+    def run(rank):
+        group = _Group(hub, rank, world)
+        together = msa.gather_queries_with_candidates(q[rank], candidates[rank], group)
+        apart = (
+            msa.gather_query_heads(q[rank], group),
+            group.all_gather(candidates[rank].unsqueeze(0), dim=0),
+        )
+        return together, apart
+
+    with concurrent.futures.ThreadPoolExecutor(world) as pool:
+        for (q_all, cands), (q_ref, cands_ref) in pool.map(run, range(world)):
+            assert q_all.dtype == torch.bfloat16
+            torch.testing.assert_close(q_all, q_ref, rtol=0, atol=0)
+            torch.testing.assert_close(cands, cands_ref, rtol=0, atol=0)

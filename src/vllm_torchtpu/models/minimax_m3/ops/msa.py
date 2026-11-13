@@ -390,9 +390,35 @@ def gather_query_heads(q: torch.Tensor, group: Any) -> torch.Tensor:
     return group.all_gather(q.contiguous(), dim=1)
 
 
+def gather_queries_with_candidates(
+    q: torch.Tensor, candidates: torch.Tensor, group: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`gather_query_heads` of ``q [T, Hq, D]`` and every rank's
+    ``candidates [T, C]`` f32 (``[dcp, T, C]``) from one all-gather: the
+    queries cross in f32, exact for bf16, beside the candidates. For
+    decode-sized steps, where a gather's cost is its latency, not its bytes,
+    and the attention op needs both at once."""
+    num_tokens, num_heads, head_dim = q.shape
+    width = num_heads * head_dim
+    payload = torch.cat(
+        [q.reshape(num_tokens, width).to(torch.float32), candidates], dim=1
+    )
+    gathered = group.all_gather(payload.unsqueeze(0), dim=0)
+    dcp = gathered.shape[0]
+    q_all = (
+        gathered[..., :width]
+        .to(q.dtype)
+        .view(dcp, num_tokens, num_heads, head_dim)
+        .transpose(0, 1)
+        .reshape(num_tokens, dcp * num_heads, head_dim)
+    )
+    return q_all, gathered[..., width:]
+
+
 # Decode-sized steps (8-token verify rows of up to 16 requests): their
 # partials are a few KiB per head, so moving them costs no more than
-# reduce-scattering them, and the exchange needs no LSE gather first.
+# reduce-scattering them, and the exchange needs no LSE gather first; their
+# queries likewise cross with the candidates (`gather_queries_with_candidates`).
 EXCHANGE_MERGE_MAX_TOKENS = 128
 
 
@@ -654,7 +680,11 @@ def get_msa_dcp_op(
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
-        if kv_heads == 1:
+        # A decode step's queries cross with the candidates, after scoring.
+        with_candidates = kv_heads == 1 and q.shape[0] <= EXCHANGE_MERGE_MAX_TOKENS
+        if with_candidates:
+            q_all = None
+        elif kv_heads == 1:
             q_all = gather_query_heads(q, group)
         else:
             q_all, k, v, index_q = gather_group_heads(
@@ -675,7 +705,10 @@ def get_msa_dcp_op(
         )
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
-        candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+        if with_candidates:
+            q_all, candidates = gather_queries_with_candidates(q, candidates, group)
+        else:
+            candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
         out, lse = attend_op(
             q_all,
             kv_cache,
@@ -852,8 +885,11 @@ def _get_msa_dcp_fp4_op(
                 metadata.query_start_loc,
                 metadata.request_distribution,
             )
-        q_all = gather_query_heads(q, group)
-        candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+        if q.shape[0] <= EXCHANGE_MERGE_MAX_TOKENS:
+            q_all, candidates = gather_queries_with_candidates(q, candidates, group)
+        else:
+            q_all = gather_query_heads(q, group)
+            candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
         out, lse = attend_op(
             q_all,
             kv_cache,
