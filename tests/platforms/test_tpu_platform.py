@@ -1592,3 +1592,24 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
     with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()
+
+
+def test_model_directory_kv_connector_is_registered_by_name(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    from vllm_torchtpu.platforms import tpu_platform
+
+    monkeypatch.setattr(tpu_platform, "_MODEL_KV_CONNECTORS", {})
+    monkeypatch.setattr(tpu_platform, "_tpu_kv_connectors_registered", False)
+    calls = []
+    monkeypatch.setattr(
+        KVConnectorFactory,
+        "register_connector",
+        classmethod(lambda cls, name, path, cname: calls.append((name, path))),
+    )
+    tpu_platform.register_tpu_kv_connector("FooConnector", "pkg.foo")
+    tpu_platform.register_tpu_kv_connector("FooConnector", "pkg.foo")  # same: ok
+    with pytest.raises(ValueError):
+        tpu_platform.register_tpu_kv_connector("FooConnector", "pkg.other")
+    tpu_platform._register_tpu_kv_connectors()
+    assert ("FooConnector", "pkg.foo") in calls
