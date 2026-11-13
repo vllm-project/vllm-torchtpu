@@ -17,6 +17,7 @@ EP MoE v3."""
 import enum
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 
 from .layout import FP4_PER_WORD, SUBLANES
@@ -62,7 +63,7 @@ class WeightForm(NamedTuple):
     token quantization block within the supported weight-format combinations."""
 
     name: WeightFormat
-    weight_dtype: object
+    weight_dtype: jax.typing.DTypeLike
     scale_layout: str
 
     @property
