@@ -4033,7 +4033,7 @@ class TPUModelRunner(GPUModelRunner):
                 req_id = req_ids_all[i]
                 assert req_id is not None
                 num_tokens = num_scheduled_map[req_id]
-                if not use_max_model_len and num_tokens > most_model_len:
+                if not use_max_model_len and num_tokens > cast(int, most_model_len):
                     use_max_model_len = True
                 num_scheduled_tokens_per_req.append(num_tokens)
             if use_max_model_len:
@@ -4873,7 +4873,7 @@ class TPUModelRunner(GPUModelRunner):
                 assert req_id is not None
                 num_tokens = num_scheduled_map[req_id]
                 num_scheduled_tokens.append(num_tokens)
-                if not use_max_model_len and num_tokens > most_model_len:
+                if not use_max_model_len and num_tokens > cast(int, most_model_len):
                     use_max_model_len = True
                     if not needs_all_tokens:
                         break
