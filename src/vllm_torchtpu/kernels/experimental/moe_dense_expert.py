@@ -330,7 +330,10 @@ def _down_cols(h, lanes):
 
 
 def _select_fp4_expert_buffers(m, h, i, experts, bk1, bk2, vmem_capacity_bytes):
-    """Choose up to four slots within 80% of VMEM, or 0 if two do not fit."""
+    """Choose up to four slots within 80% of VMEM, or 0 if two do not fit.
+
+    Two slots are the minimum: the software pipeline holds the expert being
+    finished and the next one at once."""
     fixed_bytes = m * h * (2 + 2 + 4) + m * pl.cdiv(experts, 128) * 128 * 4
     budget = vmem_capacity_bytes * 4 // 5
     slots = (budget - fixed_bytes) // _fp4_expert_bytes(h, i, bk1, bk2)
@@ -413,13 +416,10 @@ def _kernel_fp4(
     act_fn = _FP4_ACTIVATIONS[activation]
     down_cols = _down_cols(h, pltpu.get_tpu_info().num_lanes)
 
-    def compute(e, slot):
-        coeff = jnp.sum(
-            jnp.where(expert_columns == e, coeff_ref[...], 0), axis=1, keepdims=True
-        )
-        # gmm_v2's decode arithmetic: per K block an FP8-fed matmul into f32,
-        # scaled per output column and summed in f32; bf16 between the two
-        # projections and at the down projection's output.
+    # gmm_v2's decode arithmetic: per K block an FP8-fed matmul into f32,
+    # scaled per output column and summed in f32; bf16 between the two
+    # projections and at the down projection's output.
+    def gate_up(slot):
         acc = jnp.zeros((m, 2 * i), jnp.float32)
         for b in range(h // bk1):
             rhs = w1_ref[slot, b * bk1 : (b + 1) * bk1, :].astype(_FP8)
@@ -429,6 +429,12 @@ def _kernel_fp4(
                 preferred_element_type=jnp.float32,
             )
             acc += part * s1_ref[slot, b]
+        return acc
+
+    def finish(e, slot, acc):
+        coeff = jnp.sum(
+            jnp.where(expert_columns == e, coeff_ref[...], 0), axis=1, keepdims=True
+        )
         act = act_fn(acc[:, :i], acc[:, i:]).astype(jnp.bfloat16)
         for n in range(0, h, down_cols):
             acc2 = jnp.zeros((m, down_cols), jnp.float32)
@@ -466,26 +472,36 @@ def _kernel_fp4(
 
     @pl.when(count > 0)
     def run_experts():
-        for initial in range(num_buffers - 1):
+        # Experts [step, step + num_buffers) are in flight; a slot is refilled
+        # only after the expert in it has finished.
+        for initial in range(num_buffers):
 
             @pl.when(count > initial)
             def prime(*, initial=initial):
                 for copy in transfers(jnp.int32(initial)):
                     copy.start()
 
-        def expert_body(step, _):
-            for copy in transfers(step):
-                copy.wait()
+        for copy in transfers(jnp.int32(0)):
+            copy.wait()
 
-            @pl.when(step + num_buffers - 1 < count)
-            def prefetch():
-                for copy in transfers(step + num_buffers - 1):
+        # Software pipeline: expert step + 1's gate_up runs beside expert
+        # step's activation and down projection, so the MXU keeps streaming
+        # weights while the activation runs.
+        def expert_body(step, acc):
+            for copy in transfers(step + 1):
+                copy.wait()
+            acc_next = gate_up((step + 1) % num_buffers)
+            finish(active_ids_ref[step], step % num_buffers, acc)
+
+            @pl.when(step + num_buffers < count)
+            def refill():
+                for copy in transfers(step + num_buffers):
                     copy.start()
 
-            compute(active_ids_ref[step], step % num_buffers)
-            return None
+            return acc_next
 
-        lax.fori_loop(0, count, expert_body, None)
+        acc = lax.fori_loop(0, count - 1, expert_body, gate_up(0))
+        finish(active_ids_ref[count - 1], (count - 1) % num_buffers, acc)
 
     out_ref[...] = owner_ref[...].astype(jnp.bfloat16)
 
