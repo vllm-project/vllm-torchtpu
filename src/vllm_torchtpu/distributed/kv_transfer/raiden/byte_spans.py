@@ -667,8 +667,14 @@ def lower_dsv4_row_spans(
     live_bytes_per_block: int,
     row_bytes: int,
     block_ids: Sequence[int],
+    whole_tail_page: bool = False,
 ) -> PoolSpanRegistration:
-    """Lower one DeepSeek-V4 cache class to round-robin per-page byte spans."""
+    """Lower one DeepSeek-V4 cache class to round-robin per-page byte spans.
+
+    ``whole_tail_page`` ships the request's last page whole instead of the
+    row prefix its tokens cover. Pages that are not token-major need it
+    (DeepSeek-V4.1's seq-along-lane indexer keeps every token in every row).
+    """
     if not tag:
         raise ValueError("pool tag must not be empty")
     if num_tokens <= 0:
@@ -700,13 +706,13 @@ def lower_dsv4_row_spans(
     tail_tokens = num_tokens - (num_pages - 1) * page_tokens
     # The SAL indexer cache puts tokens along the lane axis and spreads each
     # token's head-dim + scale across all 33 rows, so a partial page still
-    # needs every row.
-    tail_rows = (
-        rows_per_page
-        if tag.startswith("dsv4.idx")
-        else -(-tail_tokens * rows_per_page // page_tokens)
-    )
-    tail_bytes = tail_rows * row_bytes
+    # needs every row. Callers may also force a whole tail page explicitly
+    # (``whole_tail_page``) for any other non-token-major page layout.
+    if whole_tail_page or tag.startswith("dsv4.idx"):
+        tail_bytes = live_bytes_per_block
+    else:
+        tail_rows = -(-tail_tokens * rows_per_page // page_tokens)
+        tail_bytes = tail_rows * row_bytes
     spans = tuple(
         PoolByteSpan(
             src_block_ordinal=page,

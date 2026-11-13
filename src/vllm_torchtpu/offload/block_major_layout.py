@@ -41,6 +41,11 @@ The contract feeds three primary consumers:
 
 from __future__ import annotations
 
+try:
+    import jax
+except ImportError:
+    pass
+
 import hashlib
 import json
 import math
