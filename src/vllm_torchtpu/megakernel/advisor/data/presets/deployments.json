@@ -1,0 +1,126 @@
+{
+  "schema": "advisor.presets.deployments.v1",
+  "deployments": {
+    "glm-5.2": {
+      "source": "GLM-5.2 colocated serving layout: TP16 x DCP8 decode with 3 draft tokens, TP16 x EP16 x DCP16 decode at high concurrency, and TP16 prefill on the same server",
+      "decode": {
+        "tp": 16,
+        "dcp": 8,
+        "spec_tokens": 3
+      },
+      "prefill": {
+        "tp": 16
+      },
+      "saturation": {
+        "tp": 16,
+        "ep": 16,
+        "dcp": 16
+      }
+    },
+    "kimi-k3": {
+      "source": "Kimi-K3 serving layout: TP32 x EP32 x DCP32 decode with a speculative drafter and 8-row verify, TP16 x DP2 x EP32 x DCP16 decode at high concurrency, and TP32 x EP16 x PCP32 prefill in 13 compiled calls per window",
+      "decode": {
+        "tp": 32,
+        "ep": 32,
+        "dcp": 32,
+        "spec_tokens": 7,
+        "megakernel": {
+          "source": "Decode megakernel on TP32 x EP32 x DCP32: one call serves up to 128 rows and runs each expert on its own grouped rows",
+          "scopes": [
+            "whole_step"
+          ],
+          "ranks": 32,
+          "max_rows": 128,
+          "phases": [
+            "decode",
+            "verify"
+          ],
+          "moe_layout": "grouped"
+        }
+      },
+      "prefill": {
+        "tp": 32,
+        "ep": 16,
+        "pcp": 32,
+        "layer_groups": [
+          4,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          1
+        ]
+      },
+      "prefill_windows": [
+        512,
+        1024,
+        2048,
+        4096,
+        8192
+      ],
+      "saturation": {
+        "tp": 16,
+        "ep": 32,
+        "dp": 2,
+        "dcp": 16,
+        "megakernel": {
+          "source": "Decode megakernel on TP16 x DP2 x EP32 x DCP16: one call covers both attention replicas, serves up to 128 rows, and runs each expert on its own grouped rows",
+          "scopes": [
+            "whole_step"
+          ],
+          "ranks": 16,
+          "max_rows": 128,
+          "phases": [
+            "decode",
+            "verify"
+          ],
+          "attention_dp_in_call": true,
+          "moe_layout": "grouped"
+        }
+      }
+    },
+    "qwen3.5-397b": {
+      "source": "Qwen3.5-397B disaggregated serving layout: TP8 x EP8 x DCP4 decode with 3 draft tokens, PP8 prefill, and TP2 x DP4 x EP8 decode at high concurrency",
+      "decode": {
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "spec_tokens": 3,
+        "megakernel": {
+          "source": "Decode megakernel on TP8 x EP8 x DCP4: one call serves up to 112 rows, split calls serve up to 800 rows per step, and each expert runs on a masked batch",
+          "scopes": [
+            "whole_step"
+          ],
+          "ranks": 8,
+          "max_rows": 112,
+          "max_total_rows": 800,
+          "phases": [
+            "decode",
+            "verify"
+          ],
+          "moe_layout": "masked"
+        }
+      },
+      "prefill": {
+        "tp": 1,
+        "ep": 1,
+        "pp": 8
+      },
+      "saturation": {
+        "tp": 2,
+        "ep": 8,
+        "dp": 4
+      },
+      "prefill_windows": [
+        2176
+      ]
+    }
+  }
+}
