@@ -25,6 +25,9 @@ role's: the decode program holds the EP16 experts and the prefill steps on
 them, in serial two-sequence windows (with ``--set decode_expert_parallel=16``).
 
 ``--trace DIR`` (both): rank 0 saves an xprof trace of each case's last repeat.
+
+**MoE** (``bench moe``) times one MoE layer's fused op alone, per routing
+case (``bench_moe``).
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ from contextlib import contextmanager
 
 import numpy as np
 
-from tools.megakernel import harness, k3
+from tools.megakernel import bench_moe, harness, k3
 
 
 def add_arguments(parser, profile: bool = False) -> None:
@@ -128,6 +131,7 @@ def add_arguments(parser, profile: bool = False) -> None:
             role.add_argument(
                 "--llo", default="", help="directory for the compiled LLO of every op"
             )
+    bench_moe.add_arguments(sub, profile)
 
 
 def _prompt_tokens(rng, corpus, size):
@@ -180,7 +184,8 @@ def _trace(directory: str, tag: str, last: bool):
 
 
 def run(args, records: harness.Records) -> None:
-    (run_decode if args.role == "decode" else run_prefill)(args, records)
+    runners = {"decode": run_decode, "prefill": run_prefill, "moe": bench_moe.run}
+    runners[args.role](args, records)
 
 
 def run_decode(args, records: harness.Records) -> None:

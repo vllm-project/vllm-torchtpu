@@ -9,6 +9,8 @@ Commands (Kimi-K3; see each module's docstring):
     bench decode --batches 1,8,16 --contexts 1152,32768 [--dspark [CKPT]] \\
         [--mix 1152x4,131072x4]
     bench prefill --prompts 8192x1,2048x4,3000x1@32768
+    bench moe --windows 16384,8192 --routes uniform,serving:94:47 \\
+        --routes-file ROUTES.npz   one MoE layer's fused op per routing case
     check spec                  DSpark against plain decode, batch transitions,
                                 seeded sampling
     check handoff               prefill -> pools -> decode against a decode-only replay
