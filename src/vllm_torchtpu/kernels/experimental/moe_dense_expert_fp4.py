@@ -77,7 +77,24 @@ def can_use_dense_expert_fp4(hidden, w1, w2, s1, s2, *, activation) -> bool:
         return False
     if s1.dtype != jnp.float32 or s2.dtype != jnp.float32:
         return False
-    return pltpu.get_tpu_info().is_matmul_supported(jnp.bfloat16, jnp.float8_e4m3fn)
+    try:
+        info = pltpu.get_tpu_info()
+    except ValueError:  # not a TPU (e.g. a CPU host)
+        return False
+    return (
+        info.is_matmul_supported(jnp.bfloat16, jnp.float8_e4m3fn)
+        and _vmem_bytes(m, h, i) <= info.vmem_capacity_bytes * 4 // 5
+    )
+
+
+def _vmem_bytes(m: int, h: int, i: int) -> int:
+    """Scratch of one call: the weight ring, its scales (the size-1 axis padded
+    to an 8-row f32 tile) and the token-sized buffers."""
+    c = _chunk(i)
+    weights = 3 * h * c // 2
+    scales = (2 * (h // _QUANT_BLOCK) * c + (c // _QUANT_BLOCK) * h) * 8 * 4
+    mp = m + (-m % 16)
+    return _NUM_BUFFERS * (weights + scales) + mp * h * (2 + 4 + 4 + 2)
 
 
 def _kernel(
@@ -175,6 +192,7 @@ def _kernel(
                 )
                 * su_ref[slot, b]
             )
+        # apply_act_fn takes [gate | up] lane-interleaved (its dispatch is reused).
         act = apply_act_fn(interleave_lane(gate, up), activation).astype(x.dtype)
         down = jnp.zeros((x.shape[0], h), jnp.float32)
         for k in range(0, chunk, _QUANT_BLOCK):
@@ -240,7 +258,9 @@ def dense_expert_moe_fp4(
 ):
     """Local routed contribution of fp4 experts, [tokens, hidden] bf16, as
     fused_moe_func's GMM path returns it. IDs outside this rank must be -1.
-    Callers check can_use_dense_expert_fp4 first."""
+    Callers check can_use_dense_expert_fp4 first. Non-finite hidden states and
+    weights are zeroed, as the GMM path's one-hot permute (which serves these
+    token counts) does."""
     m, h = hidden.shape
     experts, i, _ = w2.shape
     chunk = _chunk(i)

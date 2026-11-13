@@ -73,7 +73,7 @@ def test_dense_fp4_matches_gmm_path(monkeypatch, m, i):
     assert kernel.can_use_dense_expert_fp4(*args[:5], activation="swigluoai")
     jax.clear_caches()
     out = np.asarray(_moe(*args, e, topk), np.float32)
-    np.testing.assert_allclose(out, ref, rtol=0, atol=2e-2 * np.abs(ref).max())
+    np.testing.assert_allclose(out, ref, rtol=0, atol=5e-3 * np.abs(ref).max())
 
 
 def test_dense_fp4_no_local_route_returns_zeros():
