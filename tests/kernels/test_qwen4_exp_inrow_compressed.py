@@ -118,11 +118,13 @@ def _read_keys(pool, page, rows, variant):
                 keys, _ = InRowKeyReader().read(c_ref, 32, W)
                 o_ref[...] = keys
 
+            # A [32, 4, W] window, as StreamIndex hands the reader one
+            # sequence's KV block.
+            window = jax.lax.dynamic_index_in_dim(cache, page * per_page + k, keepdims=False)
             out.append(pl.pallas_call(
                 kernel,
                 out_shape=jax.ShapeDtypeStruct((32, W), jnp.bfloat16),
-                in_specs=[pl.BlockSpec((None, 32, 4, W), lambda i=page * per_page + k: (i, 0, 0, 0))],
-            )(cache))
+            )(window))
         return jnp.concatenate(out)[:rows]
     finally:
         os.environ.pop("VLLM_TPU_QSA_INROW_READ", None)

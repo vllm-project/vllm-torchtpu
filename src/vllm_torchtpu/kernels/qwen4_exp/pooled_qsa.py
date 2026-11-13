@@ -505,6 +505,10 @@ MERGED_SPAN_CODES = 8
 INROW_SLOT_BASE = 1 << 20
 
 
+# Tokens per run-writer call for in-row keys (``write_compressed``).
+INROW_RUN_WRITE_TOKENS = 4096
+
+
 def inrow_compressed_slot(span: int) -> int:
     """``compressed_slot`` of a layer whose keys ride its own main-KV rows.
 
@@ -882,10 +886,20 @@ def write_compressed(
     ):
         from vllm_torchtpu.kernels.qwen4_exp.compressed_write import write_runs
 
-        return write_runs(
-            view, pair, write, mask, values, len(context), ratio,
-            keys_per_row=1 if is_inrow(slot) else 2,
-        ).reshape(pool.shape)
+        if is_inrow(slot):
+            # One writer row per `ratio` tokens doubles the run writer's
+            # prefetched operands: write in windows that keep them in SMEM.
+            window = INROW_RUN_WRITE_TOKENS
+            for t0 in range(0, len(keys), window):
+                part = slice(t0, t0 + window)
+                view = write_runs(
+                    view, pair[part], write[part], mask[part], values[part],
+                    len(context), ratio, keys_per_row=1,
+                )
+            return view.reshape(pool.shape)
+        return write_runs(view, pair, write, mask, values, len(context), ratio).reshape(
+            pool.shape
+        )
     tile = 128
     if len(keys) >= tile and len(keys) % tile == 0:
         # A complete ratio-4 prefill page contains sixteen adjacent carrier
