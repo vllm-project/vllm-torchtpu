@@ -559,19 +559,30 @@ def _run_worker(result_dir: Path) -> None:
         traced_fingerprint = _graph_fingerprint(gm_traced)
         assert traced_fingerprint is not None
 
+        from vllm_torchtpu import envs, patch_registry
+        from vllm_torchtpu.compilation import executable_reload
+
+        patch_registry.apply("worker_init")
+
         def _compile_and_run(
             cache_root: Path,
             wait_for_leader: bool,
             forbid_backend: bool = False,
-        ) -> tuple[float, Path, bool, str]:
+            *,
+            scale: float = 1.0,
+            bias: float = 1.0,
+            reload_executable: bool = False,
+        ) -> tuple[float, Path, bool, str, bool]:
             compiler = TpuCompilerAdaptor()
             compiler.initialize_cache(
                 cache_dir=str(cache_root / f"rank_{rank}_0" / "backbone")
             )
             backend_called = False
+            released = False
             exe_fp = ""
             orig_run_backend = compiler._run_backend
             orig_deserialize = tpu_compiler._deserialize_entry
+            orig_release = executable_reload.release_entry_executables
 
             def _tracked_run_backend(graph, example_inputs):
                 nonlocal backend_called, exe_fp
@@ -590,6 +601,11 @@ def _run_worker(result_dir: Path) -> None:
                 exe_fp = entry.compiled_fw.result.fingerprint()
                 return orig_deserialize(entry)
 
+            def _tracked_release(entry):
+                nonlocal released
+                released = True
+                orig_release(entry)
+
             compiler._run_backend = _tracked_run_backend  # type: ignore[method-assign]
             saved_handles: list[Any] = []
 
@@ -603,6 +619,11 @@ def _run_worker(result_dir: Path) -> None:
                     ctx,
                     patch.object(
                         tpu_compiler, "_deserialize_entry", _tracked_deserialize
+                    ),
+                    patch.object(
+                        executable_reload,
+                        "release_entry_executables",
+                        _tracked_release,
                     ),
                 ):
                     fn, handle = compiler.compile(
@@ -620,20 +641,34 @@ def _run_worker(result_dir: Path) -> None:
             def _compiled_step(x: torch.Tensor) -> torch.Tensor:
                 reduced = torch.ops._c10d_functional.all_reduce(x, "sum", pg_name)
                 waited = torch.ops._c10d_functional.wait_tensor(reduced)
-                return waited + 1.0
+                return waited * scale + bias
 
-            x_tpu = torch.full(
-                (ROWS, HIDDEN), float(rank + 1), dtype=torch.float32, device=device
+            vars(envs).pop("VLLM_TPU_RELOAD_COMPILED_EXECUTABLE", None)
+            os.environ["VLLM_TPU_RELOAD_COMPILED_EXECUTABLE"] = (
+                "1" if reload_executable else "0"
             )
-            out = _compiled_step(x_tpu).cpu()
+            try:
+                x_tpu = torch.full(
+                    (ROWS, HIDDEN), float(rank + 1), dtype=torch.float32, device=device
+                )
+                out = _compiled_step(x_tpu).cpu()
+            finally:
+                vars(envs).pop("VLLM_TPU_RELOAD_COMPILED_EXECUTABLE", None)
+                os.environ.pop("VLLM_TPU_RELOAD_COMPILED_EXECUTABLE", None)
             assert len(saved_handles) == 1
             _, saved_path, _ = saved_handles[0]
-            return float(out[0, 0].item()), Path(saved_path), backend_called, exe_fp
+            return (
+                float(out[0, 0].item()),
+                Path(saved_path),
+                backend_called,
+                exe_fp,
+                released,
+            )
 
         # 1. Independent compilation per TP subgroup: rank 0 compiles subgroup 0
         # ([0, 1, 2, 3]) and rank 4 compiles subgroup 1 ([4, 5, 6, 7]) in separate
         # cache roots.
-        indep_val, indep_path, indep_compiled, exe_fingerprint = _compile_and_run(
+        indep_val, indep_path, indep_compiled, exe_fingerprint, _ = _compile_and_run(
             result_dir / f"independent_{subgroup}",
             wait_for_leader=(rank % SUBGROUP_SIZE != 0),
         )
@@ -653,13 +688,55 @@ def _run_worker(result_dir: Path) -> None:
         # compiles while ranks 1..3 and subgroup 1 (ranks 4..7) replay rank 0's
         # artifact.
         torch._dynamo.reset()
-        shared_val, shared_path, shared_compiled, _ = _compile_and_run(
+        shared_val, shared_path, shared_compiled, _, _ = _compile_and_run(
             result_dir / "shared",
             wait_for_leader=(rank != 0),
             forbid_backend=(rank != 0),
         )
         rank0_shared_path = (
             result_dir / "shared" / "rank_0_0" / "backbone" / "all_reduce_bucket"
+        )
+
+        # 3. VLLM_TPU_RELOAD_COMPILED_EXECUTABLE=1 with shared peer replay and
+        # Tier-2 enabled: rank 0 runs CompileAndLoad, releases its leaves,
+        # reloads from the saved artifact, and ranks 1..7 peer-replay it.
+        torch._dynamo.reset()
+        (
+            reload_shared_val,
+            reload_shared_path,
+            reload_shared_compiled,
+            _,
+            reload_shared_released,
+        ) = _compile_and_run(
+            result_dir / "reload_shared",
+            wait_for_leader=(rank != 0),
+            forbid_backend=(rank != 0),
+            scale=2.0,
+            bias=3.0,
+            reload_executable=True,
+        )
+        rank0_reload_shared_path = (
+            result_dir / "reload_shared" / "rank_0_0" / "backbone" / "all_reduce_bucket"
+        )
+
+        # 4. VLLM_TPU_RELOAD_COMPILED_EXECUTABLE=1 across independent subgroup
+        # roots with Tier-2 enabled: one subgroup leader runs CompileAndLoad and
+        # reloads, the other subgroup leader hits Tier-2 (`compiled_now=False`,
+        # no redundant reload), and non-leader ranks peer-replay.
+        torch._dynamo.reset()
+        (
+            reload_indep_val,
+            _,
+            reload_indep_compiled,
+            _,
+            reload_indep_released,
+        ) = _compile_and_run(
+            result_dir / f"reload_independent_{subgroup}",
+            wait_for_leader=(rank % SUBGROUP_SIZE != 0),
+            forbid_backend=(rank % SUBGROUP_SIZE != 0),
+            scale=3.0,
+            bias=5.0,
+            reload_executable=True,
         )
 
         result.update(
@@ -679,6 +756,15 @@ def _run_worker(result_dir: Path) -> None:
                 "shared_samefile_as_rank0": os.path.samefile(
                     shared_path, rank0_shared_path
                 ),
+                "reload_shared_compiled": reload_shared_compiled,
+                "reload_shared_released": reload_shared_released,
+                "reload_shared_val": reload_shared_val,
+                "reload_shared_samefile_as_rank0": os.path.samefile(
+                    reload_shared_path, rank0_reload_shared_path
+                ),
+                "reload_indep_compiled": reload_indep_compiled,
+                "reload_indep_released": reload_indep_released,
+                "reload_indep_val": reload_indep_val,
             }
         )
     except Exception:
@@ -809,6 +895,55 @@ def test_all_reduce_across_tp_subgroups_compiles_matching_artifacts_on_tpu(tmp_p
     expected_vals = [11.0] * SUBGROUP_SIZE + [27.0] * SUBGROUP_SIZE
     assert [r["indep_val"] for r in results] == expected_vals
     assert [r["shared_val"] for r in results] == expected_vals
+
+    # Phase 3: VLLM_TPU_RELOAD_COMPILED_EXECUTABLE=1 with shared peer replay.
+    assert [r["reload_shared_compiled"] for r in results] == [
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+    ]
+    assert [r["reload_shared_released"] for r in results] == [
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+    ]
+    assert all(r["reload_shared_samefile_as_rank0"] for r in results)
+    assert [r["reload_shared_val"] for r in results] == (
+        [23.0] * SUBGROUP_SIZE + [55.0] * SUBGROUP_SIZE
+    )
+
+    # Phase 4: VLLM_TPU_RELOAD_COMPILED_EXECUTABLE=1 across independent subgroup
+    # roots with Tier-2 enabled: one leader runs CompileAndLoad + reload, the
+    # other leader hits Tier-2 without reloading, and non-leaders peer-replay.
+    assert [r["reload_indep_compiled"] for r in results] == [
+        True,
+        False,
+        False,
+        False,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert (
+        int(results[0]["reload_indep_released"])
+        + int(results[SUBGROUP_SIZE]["reload_indep_released"])
+        == 1
+    )
+    assert not any(results[r]["reload_indep_released"] for r in (1, 2, 3, 5, 6, 7))
+    assert [r["reload_indep_val"] for r in results] == (
+        [35.0] * SUBGROUP_SIZE + [83.0] * SUBGROUP_SIZE
+    )
 
 
 def _main() -> None:

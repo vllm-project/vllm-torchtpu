@@ -344,6 +344,57 @@ def _validate_peer_replay_config() -> None:
         )
 
 
+def _validate_executable_reload_config(vllm_config: "VllmConfig") -> None:
+    """Warn at startup on settings degraded by VLLM_TPU_RELOAD_COMPILED_EXECUTABLE.
+
+    Clearing torch_tpu's Tier-1 CompilationCache after each newly compiled
+    bucket perturbs `per_entry_stats` telemetry and evicts earlier eager
+    (`DEFER_AND_FUSE`) programs, which reload from Tier-2/Tier-3 on their next
+    use or recompile when both caches are off.
+    """
+    if not envs.VLLM_TPU_RELOAD_COMPILED_EXECUTABLE:
+        return
+    if envs.VLLM_XLA_CHECK_RECOMPILATION:
+        logger.warning_once(
+            "VLLM_TPU_RELOAD_COMPILED_EXECUTABLE=1 clears torch_tpu's "
+            "in-memory Tier-1 CompilationCache after each newly compiled "
+            "bucket, which resets VLLM_XLA_CHECK_RECOMPILATION's cached-graph "
+            "count and causes evicted eager programs reloaded on later steps "
+            "to re-enter Tier-1 with read_count=1 and be reported as new "
+            "graphs. Unset one of the two variables if you need accurate "
+            "runtime recompilation reports."
+        )
+    tier2 = envs.TORCH_TPU_TIER2_COMPILATION_CACHE
+    tier3 = envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT
+    pc = vllm_config.parallel_config
+    dp_slice_size = int(os.environ.get("TORCH_TPU_DP_SIZE", "1") or 1)
+    effective_world_size = int(
+        max(
+            pc.world_size_across_dp,
+            pc.prefill_context_parallel_size,
+            dp_slice_size,
+        )
+        * max(1, pc.nnodes)
+    )
+    tier2_enabled = tier2 != "disabled" and bool(
+        tier2 or tier3 or effective_world_size > 1
+    )
+    if not tier2_enabled:
+        logger.warning_once(
+            "VLLM_TPU_RELOAD_COMPILED_EXECUTABLE=1 is enabled while both "
+            "torch_tpu's Tier-2 (TORCH_TPU_TIER2_COMPILATION_CACHE=%r) and "
+            "Tier-3 (TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT=%r) caches are "
+            "disabled. Clearing Tier-1 after each newly compiled bucket evicts "
+            "earlier eager programs, which will recompile on their next use "
+            "(potentially during serving). Set "
+            "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT (or "
+            "TORCH_TPU_TIER2_COMPILATION_CACHE=<name>, not 'disabled') to "
+            "serve those reloads from cache instead.",
+            tier2,
+            tier3,
+        )
+
+
 def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
     """Fail fast on phased-profiling settings that would silently do nothing.
 
@@ -1218,6 +1269,7 @@ class TpuPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+        _validate_executable_reload_config(vllm_config)
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         if multihost_backend != "ray" and parallel_config.nnodes > 1:
