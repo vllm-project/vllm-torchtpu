@@ -1134,8 +1134,9 @@ def _prologue(
                     s["middle"][pl.ds(row, part), pl.ds(panel * 256, 256)] = (
                         activated.astype(jnp.bfloat16)
                     )
-                    if big:
-                        latent_progress()
+                # One poll per panel: every poll also breaks the MXU stream.
+                if big:
+                    latent_progress()
             _phase_end(scope)
 
             def shared_store(panel, h=h):
@@ -1187,7 +1188,6 @@ def _prologue(
                         )
                         transfer.start()
                         pending = transfer, bank, panel
-                    if big or row == part:
                         latent_progress()
             finish_reduction(pending)
             for panel in (26, 27):
