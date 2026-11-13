@@ -933,6 +933,94 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, make_ctx(mamba_ckpt_window=3), 4)
         assert walk_counts == [3, 4]
 
+    @pytest.mark.parametrize("unified", [False, True])
+    def test_fast_staged_build_matches_builder_walk(self, unified):
+        """The inlined staged walk returns the same metadata per layer, and the
+        same unified-pool state list, as one build() call per group, while
+        returning None when a group lacks staged products."""
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        runner = self._make_runner_mock(num_groups=3, max_num_blocks_per_req=6)
+        runner._unified_kv_layout = unified
+        runner._block_table_stage_cpu = None
+        attn = self._make_builder(runner, kv_cache_group_id=0)
+        mambas = [
+            self._make_mamba_builder(runner, kv_cache_group_id=gid) for gid in (1, 2)
+        ]
+        groups = self._make_attn_groups(runner, [attn] + mambas)
+        for i, (group,) in enumerate(groups):
+            group.layer_names = [f"layer.{i}.a", f"layer.{i}.b"]
+
+        def ctx():
+            c = AttentionMetadataBuilderContext(
+                num_reqs=4,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.tensor([0, 17, 33, 49], dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+                mamba_state_indices=None if unified else torch.arange(4),
+                mamba_slot_read_offsets=torch.zeros(8, dtype=torch.int32),
+                mamba_ckpt_window=3 if unified else 1,
+                mamba_request_distribution=torch.tensor([4, 4, 4]),
+                unified_mamba_state_indices=[] if unified else None,
+            )
+            runner._attn_metadata_builder_ctx = c
+            stage_block_table_uploads(runner, c, 4)
+            return c
+
+        c_ref = ctx()
+        ref = {}
+        for (group,) in groups:
+            built = group.metadata_builders[0].build(
+                common_prefix_len=0, common_attn_metadata=self._make_cm(4)
+            )
+            for name in group.layer_names:
+                ref[name] = built
+        c_fast = ctx()
+        fast = TPUModelRunner._build_attention_metadata_staged(runner, c_fast)
+        assert fast is not None and fast.keys() == ref.keys()
+        for name in ref:
+            a, b = fast[name], ref[name]
+            for f in (
+                "input_positions",
+                "block_tables",
+                "seq_lens",
+                "query_start_loc",
+                "request_distribution",
+                "mamba_state_indices",
+                "mamba_slot_read_offsets",
+                "mamba_ckpt_indices",
+                "mamba_request_distribution",
+            ):
+                x, y = getattr(a, f), getattr(b, f)
+                assert (x is None) == (y is None), (name, f)
+                if x is not None:
+                    assert torch.equal(x, y), (name, f)
+            assert a.sequence_layout_kind == b.sequence_layout_kind
+        if unified:
+            assert len(c_fast.unified_mamba_state_indices) == 2
+            for x, y in zip(
+                c_fast.unified_mamba_state_indices, c_ref.unified_mamba_state_indices
+            ):
+                assert torch.equal(x, y)
+
+        # Negative control: missing staged group table falls back cleanly.
+        c_partial = ctx()
+        assert c_partial.staged_block_tables is not None
+        c_partial.staged_block_tables.pop(1)
+        assert (
+            TPUModelRunner._build_attention_metadata_staged(runner, c_partial) is None
+        )
+        if unified:
+            c_no_prod = ctx()
+            c_no_prod.staged_mamba_products = None
+            assert (
+                TPUModelRunner._build_attention_metadata_staged(runner, c_no_prod)
+                is None
+            )
+            assert c_no_prod.unified_mamba_state_indices == []
+
 
 class TestPrefillCheckpointIds:
     """Tests for per-group internal prefill checkpoint block ID gathering."""
