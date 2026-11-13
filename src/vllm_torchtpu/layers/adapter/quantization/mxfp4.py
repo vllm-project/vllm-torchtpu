@@ -65,7 +65,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config, Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
-from vllm_torchtpu import envs, expert_placement
+from vllm_torchtpu import envs, expert_placement, model_plan
 from vllm_torchtpu.layers.adapter import expert_load, moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -520,14 +520,15 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         routed layer's is the shared expert's; the runner checks it again
         against the shared module before every call.
         """
-        if (
-            envs.MOE_FUSED_EP_KERNEL_IMPL != "push"
-            or not envs.MOE_FUSED_EP_PUSH_SHARED_EXPERT
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_ep_kernel_impl
+
+        if fused_ep_kernel_impl() != "push" or not model_plan.param(
+            "moe_kernel", "shared_expert", False
         ):
             return None
         limit = getattr(layer, "swiglu_limit", None)
         if limit is None:
-            raise ValueError("MOE_FUSED_EP_PUSH_SHARED_EXPERT needs a swiglu limit")
+            raise ValueError("moe_kernel.shared_expert needs a swiglu limit")
         return float(limit)
 
     def _resolve_tpu_activation(self, layer) -> str:

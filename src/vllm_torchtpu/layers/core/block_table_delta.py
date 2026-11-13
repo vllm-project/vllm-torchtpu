@@ -39,20 +39,20 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import model_plan
 
 # Changed entries one delta upload carries. Larger walks take the full path.
 # 128 requests crossing a block boundary together in every one of 51 groups is
 # 6528 entries.
 DELTA_CAPACITY = 8192
-# With TPU_BLOCK_TABLE_DELTA_BUCKETS, an upload is padded only to the first of
-# these that holds it: a steady decode step changes tens of entries, and the
+# With a model plan's decode_step.block_table_delta_buckets, an upload is
+# padded only to the first of these that holds it: a steady decode step changes tens of entries, and the
 # scatter's cost follows its padded length.
 DELTA_BUCKETS = (64, 512, DELTA_CAPACITY)
 
 
 def _delta_capacity(count: int) -> int:
-    if not envs.TPU_BLOCK_TABLE_DELTA_BUCKETS:
+    if not model_plan.param("decode_step", "block_table_delta_buckets", False):
         return DELTA_CAPACITY
     return next(size for size in DELTA_BUCKETS if size >= count)
 
@@ -330,7 +330,9 @@ class BlockTableDeltaStager:
         """Compile the scatter for this layout during dummy runs (no-op update)."""
         device = staged_dev.device
         sizes = (
-            DELTA_BUCKETS if envs.TPU_BLOCK_TABLE_DELTA_BUCKETS else (DELTA_CAPACITY,)
+            DELTA_BUCKETS
+            if model_plan.param("decode_step", "block_table_delta_buckets", False)
+            else (DELTA_CAPACITY,)
         )
         for size in sizes:
             zero = self._zero_update.get((device, size))

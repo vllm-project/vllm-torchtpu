@@ -70,7 +70,7 @@ def test_early_prep_is_bitwise_identical(tokens):
 
 
 @pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU7x mHC kernel")
-def test_t240_matches_unfused_fallback_within_rounding(monkeypatch):
+def test_t240_matches_unfused_fallback_within_rounding(model_plan_params):
     from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
         deepseek_v41_mhc_op as op,
     )
@@ -82,9 +82,9 @@ def test_t240_matches_unfused_fallback_within_rounding(monkeypatch):
         return op._post_pre_rms_jax(*args, *consts)
 
     args = (x, flat, post, comb, weight, scale, base, pre, norm)
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", "0")
+    model_plan_params({"mhc": {"shifted_t16": False}})
     ref = jax.jit(layer)(*args)
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", "1")
+    model_plan_params({"mhc": {"shifted_t16": True}})
     got = jax.jit(layer)(*args)
     # residual, value: one BF16 rounding step; gates: FP32 reassociation.
     for r, g, rtol in zip(ref, got, (2.0**-7, 1e-4, 1e-4, 2.0**-6, 1e-4)):

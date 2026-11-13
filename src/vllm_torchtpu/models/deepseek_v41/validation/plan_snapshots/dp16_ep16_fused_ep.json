@@ -1,0 +1,12 @@
+{
+  "ced": "tuned",
+  "csa2_attention": "tuned",
+  "decode_step": "tuned",
+  "dspark_draft": "tuned",
+  "engram": "tuned",
+  "expert_layout": "checkpoint",
+  "host_gc": "tuned",
+  "indexer": "tuned",
+  "mhc": "tuned",
+  "moe_kernel": "fused_ep_v2"
+}

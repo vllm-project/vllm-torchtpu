@@ -19,7 +19,7 @@ def _starts(rng, requests, tokens, first=0):
 
 @pytest.mark.parametrize("seed", range(4))
 @pytest.mark.parametrize("requests,tokens", [(48, 288), (48, 240), (1, 7), (5, 64)])
-def test_torch_lookups_match(monkeypatch, seed, requests, tokens):
+def test_torch_lookups_match(model_plan_params, seed, requests, tokens):
     rng = np.random.default_rng(seed)
     starts = torch.tensor(_starts(rng, requests, tokens), dtype=torch.int32)
     rows = torch.arange(tokens)
@@ -27,7 +27,7 @@ def test_torch_lookups_match(monkeypatch, seed, requests, tokens):
     table = torch.tensor(rng.integers(-1000, 1000, requests + 1), dtype=torch.int32)
     out = {}
     for flag in ("0", "1"):
-        monkeypatch.setenv("TPU_ONEHOT_TABLE_LOOKUP", flag)
+        model_plan_params({"decode_step": {"onehot_table_lookup": flag == "1"}})
         out[flag] = (
             table_lookup.bucketize_right(rows, starts[1:]),
             table_lookup.take(table, index),

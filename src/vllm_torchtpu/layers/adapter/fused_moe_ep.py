@@ -52,7 +52,7 @@ from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu import expert_placement
+from vllm_torchtpu import expert_placement, model_plan
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
@@ -124,7 +124,7 @@ _RANK_BUFFER: Any = None
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
 # Set beside the op when it was built with the layer's shared expert inside
-# (MOE_FUSED_EP_PUSH_SHARED_EXPERT): the swiglu limit it closed over.
+# (moe_kernel.shared_expert): the swiglu limit it closed over.
 FUSED_MOE_EP_SHARED_LIMIT_ATTR = "_fused_moe_ep_shared_limit"
 
 # Set on a DSpark draft layer's routed experts (the object prebuild receives)
@@ -184,6 +184,22 @@ def fused_moe_ep_supported(owner: Any) -> bool:
     return getattr(owner, FUSED_MOE_EP_OP_ATTR, None) is not None
 
 
+# moe_kernel plan keys that are not keywords of fused_ep_moe_push.
+_PUSH_PLAN_NON_KWARGS = frozenset({"impl", "shared_expert"})
+
+
+def fused_ep_kernel_impl() -> str | None:
+    """The fused EP kernel build: a model plan's moe_kernel.impl, else the env."""
+    impl = model_plan.param("moe_kernel", "impl", None)
+    return impl if impl is not None else envs.MOE_FUSED_EP_KERNEL_IMPL
+
+
+def _push_plan_kwargs() -> dict:
+    plan = model_plan.active()
+    params = plan.params.get("moe_kernel", {}) if plan is not None else {}
+    return {k: v for k, v in params.items() if k not in _PUSH_PLAN_NON_KWARGS}
+
+
 def _build_op(
     mesh,
     topk: int,
@@ -228,32 +244,19 @@ def _build_op(
 
     moe_layer = fused_ep_moe_v2
     impl_kw = {}
-    if envs.MOE_FUSED_EP_KERNEL_IMPL == "push":
+    impl = fused_ep_kernel_impl()
+    if impl == "push":
         # Same operands and admission as v2; only the dispatch differs. The
-        # push build's own knobs are read here, never inside kernels/.
+        # push build's knobs come from the model plan's moe_kernel variant
+        # (each key a keyword of fused_ep_moe_push); unset keys keep the
+        # kernel's defaults. Never read inside kernels/.
         from vllm_torchtpu.kernels.experimental.push_fused_moe import (
             fused_ep_moe_push as moe_layer,
         )
 
-        impl_kw = dict(
-            sc_prepush=envs.MOE_FUSED_EP_PUSH_SC_PREPUSH,
-            tc_exchange=envs.MOE_FUSED_EP_PUSH_TC_EXCHANGE,
-            height_rungs_override=envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE,
-            tail_barrier=envs.MOE_FUSED_EP_PUSH_TAIL_BARRIER,
-            onehot_slots=envs.MOE_FUSED_EP_PUSH_ONEHOT_SLOTS,
-            hbm_staging=envs.MOE_FUSED_EP_PUSH_HBM_STAGING,
-            dispatch_ahead=envs.MOE_FUSED_EP_PUSH_DISPATCH_AHEAD,
-            matmul_scale_repeat=envs.MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT,
-            exchange_row_gather=envs.MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER,
-            bf16_sort_counts=envs.MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS,
-            slim_prepush_barrier=envs.MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER,
-            fused_dispatch_meta=envs.MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META,
-            table_kernel=envs.MOE_FUSED_EP_PUSH_TABLE_KERNEL,
-            exchange_tables=envs.MOE_FUSED_EP_PUSH_EXCHANGE_TABLES,
-            kernel_plan_tables=envs.MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES,
-            light_prepush=envs.MOE_FUSED_EP_PUSH_LIGHT_PREPUSH,
-            single_barrier=envs.MOE_FUSED_EP_PUSH_SINGLE_BARRIER,
-            early_scale_scatter=envs.MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER,
+        impl_kw = dict(_push_plan_kwargs())
+        impl_kw.setdefault(
+            "height_rungs_override", envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE
         )
         if dspark_draft and envs.TPU_DSPARK_DRAFT_MOE_TUNING:
             impl_kw.update(sc_prepush=1, height_rungs_override=2)
@@ -278,7 +281,7 @@ def _build_op(
         has_expert_slot,
         has_expert_load,
         row_score_bias,
-        envs.MOE_FUSED_EP_KERNEL_IMPL,
+        impl,
         tuple(sorted(impl_kw.items())),
         has_expert_slot,
         shared_limit,
@@ -296,8 +299,8 @@ def _build_op(
         scoring_fn=scoring_fn, routed_scaling_factor=routed_scaling_factor
     )
 
-    if shared_limit is not None and envs.MOE_FUSED_EP_KERNEL_IMPL != "push":
-        raise ValueError("MOE_FUSED_EP_PUSH_SHARED_EXPERT needs the push kernel")
+    if shared_limit is not None and impl != "push":
+        raise ValueError("moe_kernel.shared_expert needs the push kernel")
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
         if shared_limit is not None:

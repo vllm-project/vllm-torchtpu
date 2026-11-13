@@ -294,8 +294,9 @@ utilization 0.85, with FP8 KV/indexer, block size 256 (SWA pages stay 64
 tokens) and max model length 98816.
 
 Both hosts use `TPU_DEEPSEEK_V41_ENGRAM_HBM=first`, Engram `cpu_offload=true`
-and `dp_shared_memory=false`, `MOE_FUSED_EP_KERNEL_IMPL=push`,
-`MOE_FUSED_EP_PUSH_SC_PREPUSH=2`, `MOE_FUSED_EP_PUSH_TC_EXCHANGE=1`, and
+and `dp_shared_memory=false`, the model plan profile `dsv41-dp16-c768`
+(`MODEL_PLAN_PROFILE`: push MoE with `sc_prepush=2`, `tc_exchange=True` and the
+DP16 C768 static layout; see `models/deepseek_v41/experimental/profiles.py`), and
 `TPU_MOE_EPLB_DYNAMIC=1`. This uses push dispatch from #2519 and dynamic
 EPLB from #2523. The recipe retains
 `MOE_FUSED_EP_PREPROCESS_BACKEND=topology` so the serve script enables

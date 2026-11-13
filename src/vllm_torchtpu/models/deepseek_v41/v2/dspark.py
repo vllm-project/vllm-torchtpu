@@ -27,11 +27,11 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.fused_moe_ep import mark_dspark_draft_moe
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.deepseek_v41 import plan as dsv41_plan
 
 from ..common.mhc import (
     collapse,
@@ -410,7 +410,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         ):
             return None
         self._decode_samples = initialize_samples()
-        if envs.TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS:
+        if dsv41_plan.param("dspark_draft", "pallas_logits"):
             self._decode_logits = initialize_logits_head()
         return self._sample_decode
 

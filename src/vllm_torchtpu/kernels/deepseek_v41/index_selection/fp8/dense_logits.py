@@ -12,8 +12,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu import envs
-
 from .cache import PAGE_RECORDS, PAGE_ROWS, PackedFP8Layout
 from .common import (
     QueryTile,
@@ -415,6 +413,7 @@ def _kernel(static, offsets, lengths, query_start, inputs, *refs):
         "query_size",
         "query_count",
         "reuse_keys",
+        "issue_depth",
     )
 )
 def fp8_paged_mqa_logits(
@@ -432,6 +431,7 @@ def fp8_paged_mqa_logits(
     query_start: jax.Array | int = 0,
     query_count: int | None = None,
     reuse_keys: bool = False,
+    issue_depth: int | None = None,
 ) -> jax.Array:
     """Return FP32 scores for the query window, with invalid positions set to -inf.
 
@@ -450,6 +450,7 @@ def fp8_paged_mqa_logits(
         query_count: Output rows; defaults to the full query batch.
         reuse_keys: Keep a single complete K tile resident across query groups
             belonging to the same request. Multi-tile outputs retain prefetching.
+        issue_depth: Key-tile DMAs kept in flight; None keeps the config's own.
     """
     tokens, heads, dim = q.shape
     tokens = tokens if query_count is None else query_count
@@ -463,12 +464,11 @@ def fp8_paged_mqa_logits(
         )
     tile, config = paged_mqa_query_tile(query_size, heads), PACKED_FP8_MQA_CONFIG
     key_tile = paged_mqa_key_tile(max_model_len, layout.page_size, config.key_tile)
-    depth = envs.TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH
     config = replace(
         config,
         query_tile=tile,
         key_tile=key_tile,
-        issue_depth=depth or config.issue_depth,
+        issue_depth=issue_depth or config.issue_depth,
     )
     width = pl.cdiv(max_model_len, key_tile) * key_tile
     if tokens == 0 or width == 0:

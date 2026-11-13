@@ -13,6 +13,8 @@ from vllm_torchtpu.logger import init_logger
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+    from vllm_torchtpu.model_plan import ResolvedPlan
+
 logger = init_logger(__name__)
 
 
@@ -130,9 +132,10 @@ def validate_environment(policy: DeepseekV41Config) -> None:
             "deepseek_v41.expert_layout instead"
         )
     if policy.moe == MoEBackend.FUSED_EP_W4A8:
-        if envs.MOE_FUSED_EP_KERNEL_IMPL not in (None, "v2", "push"):
+        if envs.MOE_FUSED_EP_KERNEL_IMPL is not None:
             raise ValueError(
-                "DSV41 fused_ep_w4a8 uses v2 or push; remove MOE_FUSED_EP_KERNEL_IMPL"
+                "DSV41 selects the fused EP MoE kernel through the model plan "
+                "(slot moe_kernel); remove MOE_FUSED_EP_KERNEL_IMPL"
             )
         if envs.MOE_REQUANTIZE_BLOCK_SIZE not in (None, 0, 512):
             raise ValueError(
@@ -168,8 +171,35 @@ def validate_environment(policy: DeepseekV41Config) -> None:
             )
 
 
+def _resolve_model_plan(
+    config: "VllmConfig", policy: DeepseekV41Config
+) -> tuple[DeepseekV41Config, "ResolvedPlan"]:
+    """Resolve the plan and fold its expert layout into the typed policy."""
+    from vllm_torchtpu.models.deepseek_v41 import plan as dsv41_plan
+
+    dsv41_plan.reject_removed_env()
+    resolved = dsv41_plan.resolve_plan(
+        dsv41_plan.plan_context(config, policy.moe.value),
+        dsv41_plan.requested_profile(config),
+    )
+    layout = resolved.params["expert_layout"]["layout"]
+    if layout is not None:
+        if policy.expert_layout not in (None, layout):
+            raise ValueError(
+                f"deepseek_v41.expert_layout={policy.expert_layout} conflicts with "
+                f"model_plan profile {resolved.profile} (expert_layout={layout})"
+            )
+        policy = replace(policy, expert_layout=layout)
+    return policy, resolved
+
+
 def verify_and_update_config(config: "VllmConfig") -> None:
-    policy = DeepseekV41Config.from_vllm_config(config)
+    from vllm_torchtpu import env_override
+    from vllm_torchtpu.models.deepseek_v41 import plan as dsv41_plan
+
+    policy, resolved = _resolve_model_plan(
+        config, DeepseekV41Config.from_vllm_config(config)
+    )
     if config.engram_config is None:
         from vllm.config import EngramConfig
 
@@ -220,7 +250,9 @@ def verify_and_update_config(config: "VllmConfig") -> None:
                 "TPU_MOE_HIERARCHICAL_EP"
             )
         # Resolve and parse now, so a bad name or table fails at configuration
-        # rather than inside a worker's weight load.
+        # rather than inside a worker's weight load. The layout is read from the
+        # published policy, which may carry the model plan's layout.
+        policy.publish(config)
         expert_placement.static_placement(config)
     if policy.execution == ExecutionMode.CED:
         if parallel.prefill_context_parallel_size != 1:
@@ -232,6 +264,11 @@ def verify_and_update_config(config: "VllmConfig") -> None:
             raise ValueError("CED with prefix caching requires --swa-bounded-replay")
     validate_environment(policy)
     policy.publish(config)
+    if resolved.params["decode_step"]["inline_deduplicated_calls"]:
+        # Read by libtpu at load, so it goes into the environment the engine
+        # and worker processes this config spawns inherit.
+        env_override.add_libtpu_flag("--xla_tpu_enable_deduplicated_calls=false")
+    dsv41_plan.publish(config, resolved)
 
 
 def engram_cpu_offload(config: "VllmConfig") -> bool:

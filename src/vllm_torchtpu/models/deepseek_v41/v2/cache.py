@@ -8,9 +8,9 @@ import jax
 import torch
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 from vllm_torchtpu.kernels.deepseek_v41.tile_scatter import tile_scatter
+from vllm_torchtpu.models.deepseek_v41 import plan as dsv41_plan
 
 ROW_BYTES = ROW_WORDS * 4
 # CSA2 reads and publishes BF16 SWA in 64-token word-pool pages (64 KiB).
@@ -970,7 +970,7 @@ def write_cache_slots(cache, slots, values):
     """`write_cache` for int32 ``slots`` already holding -1 where invalid."""
     assert slots.dtype == torch.int32 and cache.device.type != "cpu"
     assert _write_op is not None and _write_tiles_op is not None
-    op = _write_tiles_op if envs.TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER else _write_op
+    op = _write_tiles_op if dsv41_plan.param("engram", "tile_scatter") else _write_op
     cache.copy_(op(cache, slots, values))
 
 

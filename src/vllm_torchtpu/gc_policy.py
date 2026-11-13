@@ -117,7 +117,7 @@ def _make(mode: str, collect_every: int, name: str) -> StepGCPolicy | None:
     if mode == "default":
         return None
     if mode != "freeze":
-        raise ValueError(f"Unknown TPU_GC_POLICY: {mode}")
+        raise ValueError(f"Unknown host_gc policy: {mode}")
     return StepGCPolicy(collect_every, name)
 
 
@@ -170,8 +170,18 @@ def install_trace(name: str) -> None:
     )
 
 
+def _plan_settings() -> tuple[str, int]:
+    """The active model plan's host_gc mode and cadence; CPython's own without one."""
+    from vllm_torchtpu import model_plan
+
+    return (
+        model_plan.param("host_gc", "policy", "default"),
+        model_plan.param("host_gc", "collect_every", 0),
+    )
+
+
 def install(mode: str, collect_every: int) -> StepGCPolicy | None:
-    """Create the policy named by ``TPU_GC_POLICY``, or none for 'default'."""
+    """Create the policy named by the plan's host_gc.policy, or none for 'default'."""
     global _POLICY
     _POLICY = _make(mode, collect_every, "runner")
     return _POLICY
@@ -182,7 +192,7 @@ def arm_after_warmup() -> None:
 
     if envs.TPU_GC_TRACE:
         install_trace("runner")
-    policy = install(envs.TPU_GC_POLICY, envs.TPU_GC_COLLECT_EVERY)
+    policy = install(*_plan_settings())
     if policy is not None:
         policy.arm()
 
@@ -200,7 +210,6 @@ def install_engine_core() -> None:
     (``_has_global_unfinished_reqs``, called once per iteration on every rank);
     any other engine core collects on its own iteration count.
     """
-    global _ENGINE_POLICY
     from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 
     from vllm_torchtpu import envs
@@ -209,10 +218,19 @@ def install_engine_core() -> None:
         install_trace("engine core")
     if getattr(EngineCoreProc._process_engine_step, "_tpu_gc_policy", False):
         return
-    policy = _make(envs.TPU_GC_POLICY, envs.TPU_GC_COLLECT_EVERY, "engine core")
-    if policy is None:
-        return
-    _ENGINE_POLICY = policy
+    original_step = EngineCoreProc._process_engine_step
+    state: dict = {}
+
+    def engine_policy(core) -> StepGCPolicy | None:
+        # The engine core is spawned with its config; the model plan in it
+        # decides the policy, so it is read on the first step, not at import.
+        if "policy" not in state:
+            global _ENGINE_POLICY
+            from vllm_torchtpu import model_plan
+
+            model_plan.activate_from_config(core.vllm_config)
+            state["policy"] = _ENGINE_POLICY = _make(*_plan_settings(), "engine core")
+        return state["policy"]
 
     sync = getattr(DPEngineCoreProc, "_has_global_unfinished_reqs", None)
     has_lockstep = sync is not None
@@ -223,14 +241,14 @@ def install_engine_core() -> None:
             "their own iterations and may collect on different steps"
         )
 
-    original_step = EngineCoreProc._process_engine_step
-
     @functools.wraps(original_step)
     def process_engine_step(self, *args, **kwargs):
-        if not policy.armed:
-            policy.arm()
-        if not (has_lockstep and isinstance(self, DPEngineCoreProc)):
-            policy.step()
+        policy = engine_policy(self)
+        if policy is not None:
+            if not policy.armed:
+                policy.arm()
+            if not (has_lockstep and isinstance(self, DPEngineCoreProc)):
+                policy.step()
         return original_step(self, *args, **kwargs)
 
     _mark_installed(process_engine_step)
@@ -241,7 +259,9 @@ def install_engine_core() -> None:
         @functools.wraps(sync)
         def has_global_unfinished_reqs(self, *args, **kwargs):
             running = sync(self, *args, **kwargs)
-            policy.lockstep(self.step_counter, running)
+            policy = engine_policy(self)
+            if policy is not None:
+                policy.lockstep(self.step_counter, running)
             return running
 
         _mark_installed(has_global_unfinished_reqs)

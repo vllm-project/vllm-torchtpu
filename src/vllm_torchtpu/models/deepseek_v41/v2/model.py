@@ -24,6 +24,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op im
 )
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.deepseek_v41 import plan as dsv41_plan
 from vllm_torchtpu.utils import synchronize_tensors
 
 from ..common.mhc import (
@@ -425,7 +426,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
     @cached_property
     def _window_starts_upload(self) -> dict:
-        """Last window-starts upload (TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS)."""
+        """Last window-starts upload (model plan decode_step.reuse_window_starts)."""
         return {}
 
     @cached_property
@@ -507,11 +508,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         )
 
     def _fuses_engram_prep(self, input_ids, swa_metadata) -> bool:
-        """TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP: slot write and hash in one op."""
+        """Model plan engram.fused_prep: slot write and hash in one op."""
         engram_hash = self.engram_hash
         return (
-            envs.TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP
-            and envs.TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE
+            dsv41_plan.param("engram", "fused_prep")
+            and dsv41_plan.param("engram", "int32_slot_write")
             and engram_hash.use_slot_cache
             and engram_hash.fuses_dead_masks(input_ids)
             and swa_metadata.seq_lens.shape[0] > 0
@@ -611,7 +612,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                         else upstream.image_sentinel_mask(lookback_token_ids),
                         (
                             engram_cache_slots
-                            if envs.TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE
+                            if dsv41_plan.param("engram", "int32_slot_write")
                             and positions.device.type != "cpu"
                             else _cache_slots
                         )(
@@ -851,7 +852,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 first,
                 positions,
                 self._window_starts_upload
-                if envs.TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS
+                if dsv41_plan.param("decode_step", "reuse_window_starts")
                 else None,
             )
         offload_engram = self._has_cpu_offloaded_engram()
@@ -986,7 +987,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         else:
             num_tokens = positions.shape[0]
             if (
-                envs.TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY
+                dsv41_plan.param("ced", "identity_replay")
                 and plan.padded_num_tokens == num_tokens
                 and plan.indices == tuple(range(num_tokens))
             ):

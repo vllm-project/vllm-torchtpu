@@ -10,7 +10,7 @@ single vector fusion. Both forms are exact for integer tables.
 
 import torch
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import model_plan
 
 
 def take(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
@@ -19,7 +19,7 @@ def take(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     Negative indices wrap once and the result is clamped into range, as the
     lowered gather does.
     """
-    if not envs.TPU_ONEHOT_TABLE_LOOKUP:
+    if not model_plan.param("decode_step", "onehot_table_lookup", False):
         return table[index]
     size = table.shape[0]
     index = torch.where(index < 0, index + size, index).clamp(0, size - 1)
@@ -35,7 +35,7 @@ def bucketize_right(
 
     ``boundaries`` sorted.
     """
-    if not envs.TPU_ONEHOT_TABLE_LOOKUP:
+    if not model_plan.param("decode_step", "onehot_table_lookup", False):
         return torch.bucketize(values, boundaries, right=True, out_int32=out_int32)
     dtype = torch.int32 if out_int32 else torch.int64
     return (boundaries <= values.unsqueeze(-1)).sum(-1, dtype=dtype)

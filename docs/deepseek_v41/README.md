@@ -31,6 +31,13 @@ enum has no TPU fused-EP entry. Leave `--moe-backend=auto` for this model.
 | `deepseek_v41.moe` | `gmm`, `fused_ep_w4a8` | `gmm` |
 | `deepseek_v41.expert_layout` | a shipped layout name, a path or a `gs://` URI | unset (the checkpoint's contiguous expert blocks) |
 | `engram_config.cpu_offload` | `false`, `true` | `false` (legacy TPU default) |
+| `model_plan.profile` | a profile in `models/deepseek_v41/experimental/profiles.py`, e.g. `dsv41-dp16-c768` | unset (the SUPPORTED default plan) |
+
+Kernel and glue implementations are chosen per slot by the model plan, not by
+environment variables: `plans.py` gives customers the SUPPORTED default, and
+`model_plan.profile` selects a benchmark recipe that pins every slot. The
+slots, variants, profiles and rules are in
+[`src/vllm_torchtpu/models/deepseek_v41/README.md`](../../src/vllm_torchtpu/models/deepseek_v41/README.md).
 
 `fused_ep_w4a8` explicitly selects FP4 weights with FP8 activations; selecting
 it is a numeric choice, not a layout optimization. It requires EP and supported

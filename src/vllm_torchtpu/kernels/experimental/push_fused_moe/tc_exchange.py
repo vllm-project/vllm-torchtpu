@@ -13,7 +13,7 @@
 # limitations under the License.
 """Routing-exchange all-gather as a TensorCore Pallas remote-DMA kernel.
 
-MOE_FUSED_EP_PUSH_TC_EXCHANGE=1 replaces the layer's routing-exchange
+A model plan with moe_kernel.tc_exchange replaces the layer's routing-exchange
 `lax.all_gather` (the i32 [ep, W] gather of the packed routing), which XLA
 offloads to the SparseCore and serializes behind other SparseCore work, with
 one small TensorCore kernel: every shard writes its row into row `me` of

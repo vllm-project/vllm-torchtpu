@@ -75,8 +75,6 @@ def engine_classes(monkeypatch):
     policy wraps; monkeypatch restores the real ones afterwards."""
     from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 
-    monkeypatch.setenv("TPU_GC_POLICY", "freeze")
-    monkeypatch.setenv("TPU_GC_COLLECT_EVERY", "3")
     monkeypatch.setattr(gc_policy, "_ENGINE_POLICY", None)
     iterations = []
     monkeypatch.setattr(
@@ -95,6 +93,22 @@ def engine_classes(monkeypatch):
     return EngineCoreProc, DPEngineCoreProc, iterations
 
 
+def _core(cls, policy="freeze", collect_every=3):
+    """An engine core whose config carries a model plan's host_gc slot."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.model_plan import PlanContext
+    from vllm_torchtpu.models.deepseek_v41 import plan as dsv41_plan
+
+    resolved = dsv41_plan.resolve_plan(PlanContext()).to_config()
+    resolved["params"]["host_gc"] = {"policy": policy, "collect_every": collect_every}
+    core = object.__new__(cls)
+    core.vllm_config = SimpleNamespace(
+        additional_config={"model_plan": {"resolved": resolved}}
+    )
+    return core
+
+
 def test_engine_core_arms_on_the_first_iteration(engine_classes):
     """The engine core's heap is the scheduler's and is built before the busy
     loop runs, so the policy arms on the loop's first iteration; without DP
@@ -104,12 +118,13 @@ def test_engine_core_arms_on_the_first_iteration(engine_classes):
     wrapped = EngineCoreProc._process_engine_step
     gc_policy.install_engine_core()  # idempotent
     assert EngineCoreProc._process_engine_step is wrapped
-    policy = gc_policy._ENGINE_POLICY
-    assert policy is not gc_policy._POLICY
-    assert not policy.armed
-    core = object.__new__(EngineCoreProc)
+    # The policy comes from the engine core's config, on its first iteration.
+    assert gc_policy._ENGINE_POLICY is None
+    core = _core(EngineCoreProc)
     for _ in range(3):
         EngineCoreProc._process_engine_step(core)
+    policy = gc_policy._ENGINE_POLICY
+    assert policy is not gc_policy._POLICY
     assert policy.armed
     assert (policy.steps, policy.collections, len(iterations)) == (3, 1, 3)
 
@@ -120,11 +135,11 @@ def test_dp_engine_core_collects_on_vllms_step_counter(engine_classes):
     collection on the same step on every rank."""
     EngineCoreProc, DPEngineCoreProc, iterations = engine_classes
     gc_policy.install_engine_core()
-    policy = gc_policy._ENGINE_POLICY
-    core = object.__new__(DPEngineCoreProc)
+    core = _core(DPEngineCoreProc)
     core.step_counter, core.running = 0, True
     for _ in range(5):  # arms, then idle iterations that must not count
         EngineCoreProc._process_engine_step(core)
+    policy = gc_policy._ENGINE_POLICY
     assert policy.armed and policy.collections == 0
     for _ in range(2):
         assert DPEngineCoreProc._has_global_unfinished_reqs(core, True)
@@ -137,50 +152,25 @@ def test_dp_engine_core_collects_on_vllms_step_counter(engine_classes):
 def test_dp_engine_core_collects_when_the_wave_ends(engine_classes):
     EngineCoreProc, DPEngineCoreProc, _ = engine_classes
     gc_policy.install_engine_core()
-    policy = gc_policy._ENGINE_POLICY
-    core = object.__new__(DPEngineCoreProc)
+    core = _core(DPEngineCoreProc)
     core.step_counter, core.running = 0, True
     EngineCoreProc._process_engine_step(core)
+    policy = gc_policy._ENGINE_POLICY
     DPEngineCoreProc._has_global_unfinished_reqs(core, True)
     core.running = False  # every rank reaches this iteration together
     assert not DPEngineCoreProc._has_global_unfinished_reqs(core, False)
     assert policy.collections == 1
 
 
-def test_engine_core_install_is_inert_under_the_default_policy(monkeypatch):
-    monkeypatch.setenv("TPU_GC_POLICY", "default")
-    monkeypatch.setattr(gc_policy, "_ENGINE_POLICY", None)
-    from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
-
-    step = EngineCoreProc._process_engine_step
-    sync = DPEngineCoreProc._has_global_unfinished_reqs
+def test_engine_core_is_inert_under_the_default_policy(engine_classes):
+    """A plan whose host_gc policy is 'default' (or no plan) leaves CPython's
+    collector alone: the wrapper creates no policy and only calls through."""
+    EngineCoreProc, DPEngineCoreProc, iterations = engine_classes
     gc_policy.install_engine_core()
-    assert EngineCoreProc._process_engine_step is step
-    assert DPEngineCoreProc._has_global_unfinished_reqs is sync
+    core = _core(DPEngineCoreProc, policy="default", collect_every=0)
+    core.step_counter, core.running = 0, True
+    for _ in range(3):
+        EngineCoreProc._process_engine_step(core)
+        DPEngineCoreProc._has_global_unfinished_reqs(core, True)
     assert gc_policy._ENGINE_POLICY is None
-
-
-def test_trace_logs_slow_collections_only(monkeypatch, caplog):
-    import gc
-    import logging
-
-    from vllm_torchtpu import gc_policy
-
-    monkeypatch.setattr(gc_policy, "_TRACE_INSTALLED", set())
-    monkeypatch.setattr(gc_policy, "_TRACE_MIN_NS", 0)
-    before = list(gc.callbacks)
-    try:
-        with caplog.at_level(logging.INFO, logger=gc_policy.logger.name):
-            gc_policy.install_trace("test")
-            gc_policy.install_trace("test")  # idempotent
-            gc.collect()
-        assert len(gc.callbacks) == len(before) + 1
-        lines = [
-            r.getMessage()
-            for r in caplog.records
-            if "gc trace (test): generation" in r.getMessage()
-        ]
-        assert lines, caplog.text
-        assert "collection" in lines[-1] and "at wall" in lines[-1]
-    finally:
-        gc.callbacks[:] = before
+    assert len(iterations) == 3

@@ -75,9 +75,11 @@ class TPUWorker(WorkerBase):
         devices=None,
         ip: str = "localhost",
     ):
-        from vllm_torchtpu import patch_registry
+        from vllm_torchtpu import model_plan, patch_registry
 
         patch_registry.apply("worker_init")
+        # The model plan resolved at configuration rides the config copy.
+        model_plan.activate_from_config(vllm_config)
         # This process creates the worker's reply ring to the engine.
         from vllm_torchtpu.distributed.pp_push import widen_message_rings
 

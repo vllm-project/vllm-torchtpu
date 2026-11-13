@@ -41,6 +41,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.tuned import (
     paged_mqa_key_tile,
     topk_reconstruction_threshold,
 )
+from vllm_torchtpu.models.deepseek_v41 import plan as dsv41_plan
 
 from . import indexer_select
 from .indexer_select import (
@@ -579,6 +580,8 @@ def _select_fp8_indexer_jax(
     )
     pool = banks[0] if len(banks) == 1 else banks
 
+    issue_depth = dsv41_plan.param("indexer", "issue_depth")
+
     def score(start, rows, inputs, *, pipelined, group=None):
         """Scores of `rows` queries from `start`; decode tiles share the inputs."""
         shared = pipelined and prefill_chunk_rows is None
@@ -606,6 +609,7 @@ def _select_fp8_indexer_jax(
             query_start=start if shared else 0,
             query_count=rows,
             reuse_keys=prefill_chunk_rows is not None and capacity == key_tile,
+            issue_depth=issue_depth,
         )
         if group is None:
             return scores

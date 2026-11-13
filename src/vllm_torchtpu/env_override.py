@@ -197,19 +197,29 @@ if _sc_offload_bytes is not None:
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
 
-# --xla_tpu_enable_deduplicated_calls=false: at DP16 C768 the decode step's
-# 20-layer decoder program calls ~244 shared functions per layer, more code than
-# the instruction region holds, so every layer waits on code loads (~1 ms/step).
-if envs.TPU_INLINE_DEDUPLICATED_CALLS and not _user_has_flag(
-    "--xla_tpu_enable_deduplicated_calls"
-):
-    _libtpu_extra_args.append("--xla_tpu_enable_deduplicated_calls=false")
-
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)
     if _existing_libtpu_args:
         _assembled = _assembled + " " + _existing_libtpu_args
     os.environ["LIBTPU_INIT_ARGS"] = _assembled
+
+
+def add_libtpu_flag(flag: str) -> None:
+    """Add a model plan's libtpu flag for the processes this one spawns.
+
+    libtpu reads LIBTPU_INIT_ARGS once, when it loads in a worker, so a flag a
+    model plan selects at configuration (before the engine and its workers are
+    spawned) is added to the environment they inherit. A flag the user already
+    passed, with any value, wins. Example: DeepSeek-V4.1's decode_step slot adds
+    --xla_tpu_enable_deduplicated_calls=false; at DP16 C768 its 20-layer decoder
+    program calls ~244 shared functions per layer, more code than the
+    instruction region holds, so every layer waits on code loads (~1 ms/step).
+    """
+    name = flag.split("=", 1)[0]
+    current = os.environ.get("LIBTPU_INIT_ARGS", "")
+    if any(t == name or t.startswith(name + "=") for t in current.split()):
+        return
+    os.environ["LIBTPU_INIT_ARGS"] = f"{current} {flag}".strip()
 
 
 def _patch_jax_pallas_fori_lowering() -> None:

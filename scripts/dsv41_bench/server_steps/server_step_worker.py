@@ -50,24 +50,21 @@ SCENARIOS["decode_dp16"] = Scenario(
 def require_dp16_recipe() -> None:
     """Check push and the expert placement (dynamic EPLB or a static layout)
     in every worker before measuring decode."""
+    from vllm_torchtpu import model_plan
     from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
-    from vllm_torchtpu.envs import (
-        MOE_FUSED_EP_KERNEL_IMPL,
-        MOE_FUSED_EP_PUSH_SC_PREPUSH,
-        MOE_FUSED_EP_PUSH_TC_EXCHANGE,
-        TPU_MOE_EPLB_DYNAMIC,
-    )
+    from vllm_torchtpu.envs import TPU_MOE_EPLB_DYNAMIC
 
     mesh = build_ep_mesh()
     if mesh is None or mesh.size != 16:
         raise ValueError("DP16 decode CI requires an EP16 mesh")
-    if (
-        MOE_FUSED_EP_KERNEL_IMPL,
-        MOE_FUSED_EP_PUSH_SC_PREPUSH,
-        MOE_FUSED_EP_PUSH_TC_EXCHANGE,
-    ) != ("push", 2, True):
+    moe = tuple(
+        model_plan.param("moe_kernel", key, None)
+        for key in ("impl", "sc_prepush", "tc_exchange")
+    )
+    if moe != ("push", 2, True):
         raise ValueError(
-            "DP16 decode CI requires push with SC_PREPUSH=2, TC_EXCHANGE=1"
+            "DP16 decode CI requires push MoE from the model plan with "
+            "sc_prepush=2 and tc_exchange=True (profile dsv41-dp16-c768)"
         )
     if not TPU_MOE_EPLB_DYNAMIC:
         from vllm_torchtpu.expert_placement import configured_value

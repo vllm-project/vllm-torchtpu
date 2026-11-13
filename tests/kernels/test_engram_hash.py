@@ -228,8 +228,10 @@ def _with_sentinels(rng, data):
 
 
 @pytest.mark.parametrize("use_cache", [False, True])
-def test_masks_from_ids_match_given_masks(tables, monkeypatch, use_cache):
-    # TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: forward without masks writes the
+def test_masks_from_ids_match_given_masks(
+    tables, monkeypatch, model_plan_params, use_cache
+):
+    # engram.masks_in_hash: forward without masks writes the
     # same slot-cache values and returns the same hashes as with the eager masks.
     from vllm_torchtpu.models.deepseek_v41.common import engram as common
 
@@ -237,7 +239,7 @@ def test_masks_from_ids_match_given_masks(tables, monkeypatch, use_cache):
     data = _with_sentinels(rng, _inputs(rng, 48, 6, 0, use_cache))
     monkeypatch.setattr(common, "_fused_hash_op", lambda: _direct_op)
     monkeypatch.setattr(NgramHashState, "uses_fused_hash", lambda self, ids: True)
-    monkeypatch.setattr(common.envs, "TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH", True)
+    model_plan_params({"engram": {"masks_in_hash": True}})
     outputs = []
     for given in (True, False):
         state = _state(tables, data, use_cache)

@@ -79,7 +79,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, expert_relayout, gc_policy, utils
+from vllm_torchtpu import envs, expert_relayout, gc_policy, model_plan, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -2781,7 +2781,9 @@ class TPUModelRunner(GPUModelRunner):
         ):
             chunk_padded_num_reqs = nt_chunk.shape[0] if bucketed else num_reqs
             num_rejected = None
-            if md is not None and envs.TPU_FUSED_SPEC_NEXT_INPUTS:
+            if md is not None and model_plan.param(
+                "decode_step", "fused_spec_next_inputs", False
+            ):
                 src, num_rejected = spec_chunk_next_inputs(
                     nt_chunk,
                     drafts_chunk,
@@ -2815,7 +2817,10 @@ class TPUModelRunner(GPUModelRunner):
                 next_token_indices[req_offset + r] = padded_req_offset + r
             req_offset += num_reqs
             padded_req_offset += chunk_padded_num_reqs
-        if envs.TPU_FUSED_SPEC_NEXT_INPUTS and len(num_rejected_chunks) == 1:
+        if (
+            model_plan.param("decode_step", "fused_spec_next_inputs", False)
+            and len(num_rejected_chunks) == 1
+        ):
             spec_num_rejected = num_rejected_chunks[0]
         else:
             spec_num_rejected = (
@@ -3147,7 +3152,7 @@ class TPUModelRunner(GPUModelRunner):
 
             subtract = (
                 subtract_num_rejected_tokens_fused
-                if envs.TPU_FUSED_SPEC_NEXT_INPUTS
+                if model_plan.param("decode_step", "fused_spec_next_inputs", False)
                 else subtract_num_rejected_tokens
             )
 

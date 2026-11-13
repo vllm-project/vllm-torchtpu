@@ -18,7 +18,6 @@ import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.attention_preprocessing import (
     compress_rope as compress_kernel,
 )
@@ -26,6 +25,7 @@ from vllm_torchtpu.kernels.attention_preprocessing import qa_rope as qa_kernel
 from vllm_torchtpu.kernels.attention_preprocessing import qb_rope as qb_kernel
 from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
 from vllm_torchtpu.kernels.experimental import decode_preparation
+from vllm_torchtpu.models.deepseek_v41 import plan as dsv41_plan
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_pallas_op_mesh
 
 _HEAD_DIM = 512
@@ -82,7 +82,7 @@ def _tag(eps: float) -> str:
 
 def rope_rows() -> Any:
     """``(cos_sin_cache, positions) -> [T, rotary_dim]`` FP32 rows, clamped."""
-    blocked = envs.TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER
+    blocked = dsv41_plan.param("csa2_attention", "blocked_rope_gather")
     return _get(
         "rope_rows_blocked" if blocked else "rope_rows",
         lambda: (
@@ -173,7 +173,7 @@ def _qb(
         weight,
         weight_scale,
         rope_rows,
-        exact_rows=envs.TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS,
+        exact_rows=dsv41_plan.param("csa2_attention", "qb_rope_exact_rows"),
     )
 
 

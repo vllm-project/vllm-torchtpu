@@ -9,7 +9,6 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
 from vllm_torchtpu.kernels.deepseek_v41 import output_projection
@@ -24,6 +23,7 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
     csa2_pipeline,
 )
 from vllm_torchtpu.kernels.mla.paged_swa import swa_word_pages, write_swa_word_pool
+from vllm_torchtpu.models.deepseek_v41 import plan as dsv41_plan
 
 if TYPE_CHECKING:
     from .cache import PagedCacheRows
@@ -77,7 +77,7 @@ def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
     table = rope_gather.by_row_blocks(
         lambda rows: cos_sin[rows],
         positions,
-        envs.TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER,
+        dsv41_plan.param("csa2_attention", "blocked_rope_gather"),
     ).astype(jnp.float32)
     cos = jnp.concatenate(
         (jnp.ones((positions.shape[0], 64)), jnp.repeat(table[:, :32], 2, axis=1)),
@@ -187,7 +187,7 @@ def _gather_attend(
         pages,
         main_starts,
         page_size=main_page_size,
-        onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
+        onehot_requests=dsv41_plan.param("decode_step", "onehot_table_lookup"),
     )
     output, words, scales = csa2_pipeline(
         q,
@@ -206,7 +206,7 @@ def _gather_attend(
         bq=bq,
         scale=scale,
         compress_ratio=ratio,
-        deep_gather=envs.TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER,
+        deep_gather=dsv41_plan.param("csa2_attention", "deep_gather"),
     )
     return output, words, scales, counts
 
@@ -239,7 +239,7 @@ def _metadata(
         page_stride=page_stride,
         row_offset=row_offset,
         non_causal=non_causal,
-        onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
+        onehot_requests=dsv41_plan.param("decode_step", "onehot_table_lookup"),
     )
 
 

@@ -32,6 +32,7 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
 from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import register_row_slice
+from vllm_torchtpu.models.deepseek_v41 import plan as dsv41_plan
 
 from ..config import engram_cpu_offload
 from .host_exchange import start_exchange_rows
@@ -120,7 +121,7 @@ class NgramHashState(upstream.NgramHashState):
         if self.use_slot_cache:
             assert self._cache is not None and slot_mapping is not None
             if (
-                envs.TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE
+                dsv41_plan.param("engram", "int32_slot_write")
                 and input_ids.device.type != "cpu"
             ):
                 self.write_token_ids(self._cache, slot_mapping, input_ids, dead_mask)
@@ -169,12 +170,12 @@ class NgramHashState(upstream.NgramHashState):
 
     def uses_fused_hash(self, input_ids: torch.Tensor) -> bool:
         return (
-            envs.TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH and input_ids.device.type != "cpu"
+            dsv41_plan.param("engram", "fused_hash") and input_ids.device.type != "cpu"
         )
 
     def fuses_dead_masks(self, input_ids: torch.Tensor) -> bool:
         """Whether ``forward`` takes None dead masks (ENGRAM_MASKS_IN_HASH)."""
-        return envs.TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH and self.uses_fused_hash(
+        return dsv41_plan.param("engram", "masks_in_hash") and self.uses_fused_hash(
             input_ids
         )
 
@@ -232,7 +233,7 @@ class NgramHashState(upstream.NgramHashState):
             pad_id,
             upstream.DEAD_ID,
             IMAGE_SENTINEL_BASE_ID,
-            bool(envs.TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER),
+            bool(dsv41_plan.param("engram", "tile_scatter")),
         )
         self._cache.copy_(cache)
         return hashes, keep

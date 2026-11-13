@@ -29,7 +29,6 @@ from vllm.config import CompilationMode
 from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
 
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
-from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.deepseek_v41.v2.ced import DecoderReplayPlan
 from vllm_torchtpu.models.deepseek_v41.v2.host_engram import (
     HOST_ENGRAM_KEY,
@@ -49,6 +48,7 @@ from vllm_torchtpu.models.deepseek_v41.v2.model import (
     _StageBase,
     _use_sequence_parallel,
 )
+from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 # ==============================================================================
@@ -950,9 +950,7 @@ class TestModelForward:
         model = self._create_model(ced_enabled=False)
         model.full_stage = MagicMock(return_value=torch.zeros((4, 64)))
         ids, positions = torch.tensor([1, 2, 3, 4]), torch.tensor([0, 1, 2, 3])
-        with patch(
-            "vllm_torchtpu.models.deepseek_v41.v2.model.torch.tensor"
-        ) as upload:
+        with patch("vllm_torchtpu.models.deepseek_v41.v2.model.torch.tensor") as upload:
             res = model.forward(ids, positions)
         upload.assert_not_called()
         assert res.shape == (4, 64)
@@ -1070,14 +1068,12 @@ class TestModelForward:
 
     @pytest.mark.parametrize("identity_switch", [False, True])
     def test_forward_ced_identity_replay_matches_gather_and_scatter(
-        self, monkeypatch, identity_switch
+        self, monkeypatch, model_plan_params, identity_switch
     ) -> None:
         # A plan that replays every row in place: with the switch the stages
         # exchange the tensors directly, without it they gather and scatter by
         # the identity. Both must return the same values and decoder inputs.
-        monkeypatch.setenv(
-            "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY", "1" if identity_switch else "0"
-        )
+        model_plan_params({"ced": {"identity_replay": identity_switch}})
         model = self._create_model(ced_enabled=True, sp_enabled=False)
         hidden = torch.arange(4 * 64, dtype=torch.float32).reshape(4, 64)
         pre_mix = -hidden
@@ -1590,15 +1586,9 @@ class TestModelInitAndWeights:
         )
         cfg_sp_err._test_use_sequence_parallel = True
         with (
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
@@ -1609,9 +1599,7 @@ class TestModelInitAndWeights:
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_init,
             ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model._use_sequence_parallel",
                 return_value=True,
@@ -1629,15 +1617,9 @@ class TestModelInitAndWeights:
         )
         cfg_sp_ok._test_use_sequence_parallel = True
         with (
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
@@ -1648,9 +1630,7 @@ class TestModelInitAndWeights:
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_init,
             ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model._use_sequence_parallel",
                 return_value=True,
@@ -1665,15 +1645,9 @@ class TestModelInitAndWeights:
         )
         with (
             patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_CED", True),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
@@ -1684,9 +1658,7 @@ class TestModelInitAndWeights:
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_init,
             ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model._use_sequence_parallel",
                 return_value=False,
@@ -1711,15 +1683,9 @@ class TestModelInitAndWeights:
 
         with (
             patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_CED", True),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
@@ -1730,9 +1696,7 @@ class TestModelInitAndWeights:
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_bad_sources,
             ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model._use_sequence_parallel",
                 return_value=False,
@@ -1752,15 +1716,9 @@ class TestModelInitAndWeights:
 
         with (
             patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_CED", True),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
@@ -1771,9 +1729,7 @@ class TestModelInitAndWeights:
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_dec_engram,
             ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model._use_sequence_parallel",
                 return_value=False,
@@ -1787,15 +1743,9 @@ class TestModelInitAndWeights:
         # 5. Happy path CED=1 setup
         with (
             patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_CED", True),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
@@ -1806,9 +1756,7 @@ class TestModelInitAndWeights:
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_init,
             ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model._use_sequence_parallel",
                 return_value=False,
@@ -1830,15 +1778,9 @@ class TestModelInitAndWeights:
 
         with (
             patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_CED", False),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"
-            ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_cache_ops"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_delayed_mhc"),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.initialize_mhc_post"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
@@ -1849,9 +1791,7 @@ class TestModelInitAndWeights:
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_no_compressor,
             ),
-            patch(
-                "vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"
-            ),
+            patch("vllm_torchtpu.models.deepseek_v41.v2.model.compact_rope_caches"),
             patch(
                 "vllm_torchtpu.models.deepseek_v41.v2.model._use_sequence_parallel",
                 return_value=False,

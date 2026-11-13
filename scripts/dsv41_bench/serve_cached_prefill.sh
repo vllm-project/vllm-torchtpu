@@ -9,6 +9,13 @@ dp=${DP:-8}
 chunk=${CHUNK:-2048}
 max_seqs=${MAX_SEQS:-1}
 engram_config=${ENGRAM_CONFIG:-'{"cpu_offload":true}'}
+# A DeepSeek-V4.1 model plan profile (models/deepseek_v41/experimental/profiles.py),
+# e.g. dsv41-dp16-c768; empty serves the SUPPORTED default plan.
+if [[ -n "${MODEL_PLAN_PROFILE:-}" ]]; then
+  additional_config='{"deepseek_v41":{"execution":"ced","moe":"fused_ep_w4a8"},"model_plan":{"profile":"'"$MODEL_PLAN_PROFILE"'"}}'
+else
+  additional_config='{"deepseek_v41":{"execution":"ced","moe":"fused_ep_w4a8"}}'
+fi
 export TPU_RECLAIM_COMPILE_MEMORY="${TPU_RECLAIM_COMPILE_MEMORY:-1}"
 export OMP_NUM_THREADS=1 NEW_MODEL_DESIGN=1 MODEL_IMPL_TYPE=vllm VLLM_TARGET_DEVICE=tpu
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_USE_AOT_COMPILE=0
@@ -49,7 +56,7 @@ exec vllm serve "$model" \
   --async-scheduling --enable-prefix-caching --kv-cache-dtype fp8 \
   --attention-config '{"indexer_kv_dtype":"fp8"}' \
   --engram-config "$engram_config" \
-  --additional-config '{"deepseek_v41":{"execution":"ced","moe":"fused_ep_w4a8"}}' \
+  --additional-config "$additional_config" \
   --block-size 256 \
   --max-num-batched-tokens "$chunk" --max-num-seqs "$max_seqs" \
   "${server_args[@]}" \

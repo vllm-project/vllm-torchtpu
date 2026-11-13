@@ -50,7 +50,7 @@ class VllmMoERunner(MoERunner):
         super().__init__(*args, **kwargs)
         self._take_over_moe_quant_config_init()
         # The shared expert module itself, for a fused EP op that computes it
-        # (MOE_FUSED_EP_PUSH_SHARED_EXPERT). Not registered as a submodule:
+        # (model plan moe_kernel.shared_expert). Not registered as a submodule:
         # the model already owns it, under its own parameter names.
         bound = inspect.signature(MoERunner.__init__).bind(self, *args, **kwargs)
         object.__setattr__(

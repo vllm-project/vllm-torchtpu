@@ -246,12 +246,14 @@ def test_capacity_overflow_falls_back_to_full(builders, monkeypatch):
 
 
 @pytest.mark.parametrize("buckets", [False, True])
-def test_bucketed_delta_matches_full_upload(builders, monkeypatch, buckets):
+def test_bucketed_delta_matches_full_upload(
+    builders, monkeypatch, model_plan_params, buckets
+):
     # With buckets a small delta is padded to 64 entries, a larger one to 512;
     # either way every walk hands out exactly the full-upload tables.
     monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
     monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "0")
-    monkeypatch.setenv("TPU_BLOCK_TABLE_DELTA_BUCKETS", "1" if buckets else "0")
+    model_plan_params({"decode_step": {"block_table_delta_buckets": buckets}})
     sizes = []
     apply = btd.apply_block_table_delta
 

@@ -104,12 +104,12 @@ def test_synchronized_profile_writes_to_requested_directory(
         (None, "push", 2, True, True, "EP16 mesh"),
         (8, "push", 2, True, True, "EP16 mesh"),
         (16, "v2", 2, True, True, "requires push"),
-        (16, "push", 1, True, True, "SC_PREPUSH=2"),
-        (16, "push", 2, False, True, "TC_EXCHANGE=1"),
+        (16, "push", 1, True, True, "sc_prepush=2"),
+        (16, "push", 2, False, True, "tc_exchange=True"),
     ],
 )
 def test_dp16_ci_requires_push_and_dynamic_eplb_without_split_topology(
-    monkeypatch, mesh_size, impl, prepush, exchange, eplb, error
+    monkeypatch, model_plan_params, mesh_size, impl, prepush, exchange, eplb, error
 ):
     from server_step_worker import require_dp16_recipe
 
@@ -120,14 +120,10 @@ def test_dp16_ci_requires_push_and_dynamic_eplb_without_split_topology(
         SimpleNamespace(build_ep_mesh=lambda: mesh),
     )
     monkeypatch.setitem(
-        sys.modules,
-        "vllm_torchtpu.envs",
-        SimpleNamespace(
-            MOE_FUSED_EP_KERNEL_IMPL=impl,
-            MOE_FUSED_EP_PUSH_SC_PREPUSH=prepush,
-            MOE_FUSED_EP_PUSH_TC_EXCHANGE=exchange,
-            TPU_MOE_EPLB_DYNAMIC=eplb,
-        ),
+        sys.modules, "vllm_torchtpu.envs", SimpleNamespace(TPU_MOE_EPLB_DYNAMIC=eplb)
+    )
+    model_plan_params(
+        {"moe_kernel": {"impl": impl, "sc_prepush": prepush, "tc_exchange": exchange}}
     )
     # Push works without #2646: no topology preprocessing is required.
     monkeypatch.setitem(

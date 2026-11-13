@@ -55,9 +55,7 @@ def write_hosts(root):
                     "cache_mode": "disabled",
                     "engram_hbm": "first",
                     "engram_dp_shared_memory": False,
-                    "moe_kernel": "push",
-                    "moe_push_sc_prepush": 2,
-                    "moe_push_tc_exchange": True,
+                    "model_plan_profile": "dsv41-dp16-c768",
                     "moe_eplb_dynamic": True,
                     "moe_preprocess": "topology",
                     "allocator": "glibc",
@@ -122,9 +120,7 @@ def test_peer_failure_cannot_publish_valid_metrics(tmp_path, invalid):
 @pytest.mark.parametrize(
     "key,value",
     [
-        ("moe_kernel", "v2"),
-        ("moe_push_sc_prepush", 1),
-        ("moe_push_tc_exchange", False),
+        ("model_plan_profile", ""),
         ("moe_eplb_dynamic", False),
     ],
 )

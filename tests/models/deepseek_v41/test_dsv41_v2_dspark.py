@@ -12,8 +12,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_torchtpu import envs
-from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.deepseek_v41.v2 import (
     attention_kernels as v2_kernels,
 )
@@ -23,6 +21,7 @@ from vllm_torchtpu.models.deepseek_v41.v2 import (
 from vllm_torchtpu.models.deepseek_v41.v2 import (
     model as v2_model,
 )
+from vllm_torchtpu.models.vllm import register_models
 
 
 def test_dspark_model_registration():
@@ -33,8 +32,7 @@ def test_dspark_model_registration():
         calls = {call.args[0]: call.args[1] for call in mock_reg.call_args_list}
         assert "DSparkV41DraftModel" in calls
         assert calls["DSparkV41DraftModel"] == (
-            "vllm_torchtpu.models.deepseek_v41.v2.dspark:"
-            "DSparkDeepseekV41ForCausalLM"
+            "vllm_torchtpu.models.deepseek_v41.v2.dspark:DSparkDeepseekV41ForCausalLM"
         )
 
 
@@ -770,10 +768,12 @@ def test_dspark_load_weights(monkeypatch: pytest.MonkeyPatch):
     assert draft_lm2.model.confidence_head is not None
 
 
-def test_decode_sampler_uses_pallas_logits_head_when_enabled(monkeypatch):
+def test_decode_sampler_uses_pallas_logits_head_when_enabled(
+    monkeypatch, model_plan_params
+):
     from vllm_torchtpu.models.deepseek_v41.v2 import dspark_sampling
 
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", "1")
+    model_plan_params({"dspark_draft": {"pallas_logits": True}})
     model = v2_dspark.DSparkDeepseekV41ForCausalLM.__new__(
         v2_dspark.DSparkDeepseekV41ForCausalLM
     )
@@ -812,11 +812,13 @@ def test_decode_sampler_uses_pallas_logits_head_when_enabled(monkeypatch):
     assert sample.call_args.args[0] is logits
 
 
-def test_decode_sampler_uses_standard_logits_without_copying_lm_weight(monkeypatch):
+def test_decode_sampler_uses_standard_logits_without_copying_lm_weight(
+    monkeypatch, model_plan_params
+):
     from vllm_torchtpu.models.deepseek_v41.v2 import dspark_sampling
 
     # This test is about the XLA logits path; the Pallas head is on by default.
-    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", False)
+    model_plan_params({"dspark_draft": {"pallas_logits": False}})
 
     model = v2_dspark.DSparkDeepseekV41ForCausalLM.__new__(
         v2_dspark.DSparkDeepseekV41ForCausalLM

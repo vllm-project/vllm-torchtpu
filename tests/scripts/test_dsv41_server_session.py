@@ -225,9 +225,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
         monkeypatch.setenv(key, str(tmp_path / "persistent-cache"))
     if scenario == "decode_dp16":
         monkeypatch.setenv("HOST", "0.0.0.0")
-        monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v2")
-        monkeypatch.setenv("MOE_FUSED_EP_PUSH_SC_PREPUSH", "1")
-        monkeypatch.setenv("MOE_FUSED_EP_PUSH_TC_EXCHANGE", "0")
+        monkeypatch.setenv("MODEL_PLAN_PROFILE", "")
         monkeypatch.setenv("TPU_MOE_EPLB_DYNAMIC", "0")
     compiler_roots = []
     starts, clients, stopped, audits = [], [], [], []
@@ -247,9 +245,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
             assert env["HEADLESS"] == "0"
             assert env["HOST"] == "127.0.0.1"
             assert env["TPU_DEEPSEEK_V41_ENGRAM_HBM"] == "first"
-            assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "push"
-            assert env["MOE_FUSED_EP_PUSH_SC_PREPUSH"] == "2"
-            assert env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1"
+            assert env["MODEL_PLAN_PROFILE"] == "dsv41-dp16-c768"
             assert env["TPU_MOE_EPLB_DYNAMIC"] == "1"
             assert env["MOE_FUSED_EP_PREPROCESS_BACKEND"] == "topology"
             assert env["MAX_SEQS"] == "48"
@@ -304,9 +300,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
     manifest = json.loads((tmp_path / "results/manifest.json").read_text())
     assert manifest["cache_mode"] == "disabled"
     if scenario == "decode_dp16":
-        assert manifest["moe_kernel"] == "push"
-        assert manifest["moe_push_sc_prepush"] == 2
-        assert manifest["moe_push_tc_exchange"] is True
+        assert manifest["model_plan_profile"] == "dsv41-dp16-c768"
         assert manifest["moe_eplb_dynamic"] is True
         assert manifest["packages"]["tpu-sync-torch"] == "1"
     assert manifest["serialization"] == "enabled"
@@ -385,9 +379,7 @@ def test_dp16_worker_waits_for_shutdown_and_never_runs_client(
         commands.append(command)
         assert env["HEADLESS"] == "1" and env["DP"] == "16"
         assert env["HOST"] == "127.0.0.1"
-        assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "push"
-        assert env["MOE_FUSED_EP_PUSH_SC_PREPUSH"] == "2"
-        assert env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1"
+        assert env["MODEL_PLAN_PROFILE"] == "dsv41-dp16-c768"
         assert env["TPU_MOE_EPLB_DYNAMIC"] == "1"
         assert command[command.index("--data-parallel-start-rank") + 1] == "8"
         return server

@@ -85,6 +85,29 @@ def _reset_warning_once():
 
 
 @pytest.fixture
+def model_plan_params(monkeypatch):
+    """Activate a model plan for one test: ``activate({"slot": {"key": v}})``.
+
+    The plan starts from DeepSeek-V4.1's SUPPORTED plan and overlays the given
+    slot parameters, so model code and shared code read the same values a
+    served config would publish.
+    """
+    from vllm_torchtpu import model_plan
+    from vllm_torchtpu.model_plan import PlanContext
+    from vllm_torchtpu.models.deepseek_v41 import plan as dsv41_plan
+
+    def activate(overrides: dict) -> None:
+        base = dsv41_plan.resolve_plan(PlanContext()).to_config()
+        for slot, values in overrides.items():
+            base["params"].setdefault(slot, {}).update(values)
+        monkeypatch.setattr(
+            model_plan, "_ACTIVE", model_plan.ResolvedPlan.from_config(base)
+        )
+
+    return activate
+
+
+@pytest.fixture
 def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""
     from vllm.config import VllmConfig, set_current_vllm_config

@@ -8,8 +8,8 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41.mhc import shifted_post_pre_rms
+from vllm_torchtpu.models.deepseek_v41 import plan as dsv41_plan
 
 _post_pre_rms_op = None
 
@@ -34,7 +34,7 @@ def _post_pre_rms_jax(
     tokens, mult = pre.shape
     dim = flat.shape[1] // mult
     if not shifted_post_pre_rms.is_supported_shape(tokens, mult, dim) or (
-        tokens % 32 and not envs.TPU_DEEPSEEK_V41_MHC_SHIFTED_T16
+        tokens % 32 and not dsv41_plan.param("mhc", "shifted_t16")
     ):
         from vllm_torchtpu.models.deepseek_v41.common.mhc import (
             delayed_post_pre_flat_jax,
@@ -82,8 +82,8 @@ def _post_pre_rms_jax(
 
 
 def _gate_layout() -> dict:
-    layout: dict = {"early_prep": envs.TPU_DEEPSEEK_V41_MHC_EARLY_PREP}
-    if envs.TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES:
+    layout: dict = {"early_prep": dsv41_plan.param("mhc", "early_prep")}
+    if dsv41_plan.param("mhc", "resident_gates"):
         layout["unpadded_gates"] = True
         layout["gate_input_mode"] = shifted_post_pre_rms.GateInputMode.COMPILER
     return layout

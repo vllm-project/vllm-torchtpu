@@ -1116,7 +1116,6 @@ def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required, monkeypa
 
     # The subject is the REQUIRED policy's error; the in-op shared expert
     # (on by default on this measurement branch) adds its own prebuild step.
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SHARED_EXPERT", False)
 
     method = object.__new__(VllmDeepseekV4Mxfp4MoEMethod)
     method.fused_ep = required
@@ -1362,10 +1361,12 @@ def test_placed_hash_layer_arms_with_hash_ids_slot_table_and_load():
 
 
 @pytest.mark.parametrize("impl", ["push", "v2"])
-def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
-    """MOE_FUSED_EP_KERNEL_IMPL=push builds the op around fused_ep_moe_push,
-    with its knobs read from envs here (never inside kernels/) and passed as
-    arguments; v2 gets none of them."""
+def test_build_op_picks_the_push_layer_and_passes_its_knobs(
+    monkeypatch, model_plan_params, impl
+):
+    """A plan whose moe_kernel.impl is push builds the op around
+    fused_ep_moe_push, with the variant's knobs passed as arguments (never read
+    inside kernels/); v2 gets none of them."""
     from unittest.mock import Mock
 
     from vllm_torchtpu.kernels.experimental import push_fused_moe
@@ -1383,22 +1384,25 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
     push_kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
     monkeypatch.setattr(v2, "fused_ep_moe_v2", v2_kernel)
     monkeypatch.setattr(push_fused_moe, "fused_ep_moe_push", push_kernel)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_KERNEL_IMPL", impl)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SC_PREPUSH", 3)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TC_EXCHANGE", True)
+    knobs = {
+        "sc_prepush": 3,
+        "tc_exchange": True,
+        "tail_barrier": False,
+        "onehot_slots": True,
+        "hbm_staging": True,
+        "dispatch_ahead": 25,
+        "matmul_scale_repeat": True,
+        "exchange_row_gather": True,
+        "bf16_sort_counts": True,
+        "slim_prepush_barrier": True,
+        "fused_dispatch_meta": True,
+        "table_kernel": True,
+        "exchange_tables": True,
+        "kernel_plan_tables": True,
+    }
+    moe_kernel = {"impl": "push", **knobs} if impl == "push" else {"impl": "v2"}
+    model_plan_params({"moe_kernel": moe_kernel})
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", 4)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TAIL_BARRIER", False)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS", True)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_HBM_STAGING", True)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD", 25)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT", True)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER", True)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS", True)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER", True)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META", True)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TABLE_KERNEL", True)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES", True)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES", True)
     bridge._build_op(None, 2, True, "silu", None, False)
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     operands = (
@@ -1492,15 +1496,14 @@ def test_shared_expert_operands_reach_the_push_layer(monkeypatch):
 )
 @pytest.mark.parametrize("enabled", [False, True])
 def test_mxfp4_prebuild_only_fuses_shared_expert_for_push(
-    monkeypatch, impl, shared_limit, enabled
+    monkeypatch, model_plan_params, impl, shared_limit, enabled
 ):
     """V2 serving keeps its standalone shared expert with the push flag enabled."""
     from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
         VllmDeepseekV4Mxfp4MoEMethod,
     )
 
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_KERNEL_IMPL", impl)
-    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SHARED_EXPERT", enabled)
+    model_plan_params({"moe_kernel": {"impl": impl, "shared_expert": enabled}})
     method = object.__new__(VllmDeepseekV4Mxfp4MoEMethod)
     method.fused_ep = True
     layer = _layer(renormalize=True, swiglu_limit=10.0)
