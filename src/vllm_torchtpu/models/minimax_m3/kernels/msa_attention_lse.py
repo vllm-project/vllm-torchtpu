@@ -173,16 +173,19 @@ def _fp4_scales(scale_ref, k_row, v_row):
     return jnp.where(jnp.isfinite(sk), sk, 0.0), jnp.where(jnp.isfinite(sv), sv, 0.0)
 
 
-def _page_cache(pages: jax.Array, num_tiles: int, cache_size: int) -> jax.Array:
+def _page_cache(
+    pages: jax.Array, num_tiles: int, cache_size: int, tile_pages: int = 0
+) -> jax.Array:
     """A call's unions (`msa_attention._work_list`: `num_tiles` rows, ``-1``
     padded) -> ``[unions' cache slots | distinct keys (cache_size) | count |
     fits]``: each union entry's slot among the call's distinct page keys
     (``-1`` for padding; the key itself when they do not all fit), the first
     `cache_size` distinct keys ascending, their count, and whether they all
-    fit. Only the first `PAGE_CACHE_TILE_PAGES` of each union are sorted (a
-    call with a wider union streams). Sorts only, no gather or scatter."""
+    fit. Only the first `tile_pages` (default `PAGE_CACHE_TILE_PAGES`) of
+    each union are sorted (a call with a wider union streams). Sorts only, no
+    gather or scatter."""
     rows = pages.reshape(num_tiles, -1)
-    width = min(PAGE_CACHE_TILE_PAGES, rows.shape[1])
+    width = min(tile_pages or PAGE_CACHE_TILE_PAGES, rows.shape[1])
     head = rows[:, :width].reshape(-1)
     key = jnp.where(head < 0, msa_attention._NO_PAGE, head)
     position = jnp.arange(key.shape[0], dtype=jnp.int32)
@@ -1175,6 +1178,47 @@ def _proof(flag: str, detail: str) -> None:
         print(f"{flag}=1: {detail}", flush=True)  # workers may log nowhere
 
 
+# 4-bit prefill calls with a page cache pick their tiles per call from the
+# width of their selections (`adaptive_prefill`).
+ADAPTIVE_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE"
+
+
+def adaptive_prefill() -> tuple[int, int, int] | None:
+    """``envs.TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE`` = "<threshold>:<block_q>:
+    <tile_pages>" as ints, or None (unset). Read when the calling program is
+    traced, through `envs` (part of the compile-cache key)."""
+    from vllm_torchtpu import envs
+
+    spec = envs.TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE.strip()
+    if not spec:
+        return None
+    parts = [int(x) for x in spec.replace("/", ":").split(":")]
+    if len(parts) != 3 or min(parts) <= 0:
+        raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: want <threshold>:<block_q>:<tile_pages>")
+    return parts[0], parts[1], parts[2]
+
+
+def wide_selection(selected: jax.Array, block_q: int, threshold: int) -> jax.Array:
+    """Whether ``selected [T, G, K]`` (page keys, ``-1`` padded) holds more
+    than `threshold` distinct pages per `block_q`-token tile of a KV head on
+    average, over the tiles that hold any page: a bool scalar.
+
+    The union width sets what a tile costs: a wide union pays for its rows
+    over more pages (smaller tiles narrow it), a narrow one for the fixed
+    cost per tile (larger tiles amortize it). Counted by comparing each key
+    with the tile's earlier keys: no sort."""
+    num_tokens, num_heads, topk = selected.shape
+    pad = -num_tokens % block_q
+    keys = jnp.pad(selected, ((0, pad), (0, 0), (0, 0)), constant_values=-1)
+    keys = keys.transpose(1, 0, 2).reshape(num_heads, -1, block_q * topk)
+    width = keys.shape[-1]
+    earlier = jnp.arange(width)[None, :] < jnp.arange(width)[:, None]
+    seen = jnp.any((keys[..., :, None] == keys[..., None, :]) & earlier, axis=-1)
+    distinct = jnp.sum((keys >= 0) & ~seen, dtype=jnp.int32)
+    tiles = jnp.sum(jnp.any(keys >= 0, axis=-1), dtype=jnp.int32)
+    return distinct > threshold * tiles
+
+
 # Decode work list by `_packed_work_kernel` instead of XLA (8-token tiles).
 WORK_LIST_KERNEL_ENV = "TPU_MINIMAX_M3_MSA_DECODE_WORK_LIST_KERNEL"
 # Every KV head of a decode batch in one kernel call (`_one_call_heads`).
@@ -1203,6 +1247,7 @@ def _chunked_call(
     page_cache_slots=0,
     page_cache_bf16=False,
     row_split=1,
+    page_cache_tile_pages=0,
 ):
     """`_attention_call` per KV head and chunk of at most
     `MAX_TOKENS_PER_CALL` tokens (the work list lives in SMEM).
@@ -1283,7 +1328,10 @@ def _chunked_call(
         ) * pages_per_step
         table = jax.vmap(
             functools.partial(
-                _page_cache, num_tiles=step // block_q, cache_size=cache_size
+                _page_cache,
+                num_tiles=step // block_q,
+                cache_size=cache_size,
+                tile_pages=page_cache_tile_pages,
             )
         )(packed[:, :union_len])
         packed = jnp.concatenate(
@@ -1426,6 +1474,7 @@ def _check_rows(kv_cache, head_dim, head=None):
         "page_cache_slots",
         "page_cache_bf16",
         "row_split",
+        "page_cache_tile_pages",
     ),
 )
 def msa_sparse_attention_lse(
@@ -1449,6 +1498,7 @@ def msa_sparse_attention_lse(
     page_cache_slots: int = 0,
     page_cache_bf16: bool = False,
     row_split: int = 1,
+    page_cache_tile_pages: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
     by `page_table`) returning ``(out [T, H, D], lse [T, H] f32)``.
@@ -1486,6 +1536,7 @@ def msa_sparse_attention_lse(
         page_cache_slots=page_cache_slots,
         page_cache_bf16=page_cache_bf16,
         row_split=row_split,
+        page_cache_tile_pages=page_cache_tile_pages,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
@@ -1504,6 +1555,7 @@ def msa_sparse_attention_lse(
         "page_cache_slots",
         "page_cache_bf16",
         "row_split",
+        "page_cache_tile_pages",
     ),
 )
 def msa_sparse_attention_lse_heads(
@@ -1524,6 +1576,7 @@ def msa_sparse_attention_lse_heads(
     page_cache_slots: int = 0,
     page_cache_bf16: bool = False,
     row_split: int = 1,
+    page_cache_tile_pages: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_sparse_attention_lse` for every KV head of the cache rows at once.
 
@@ -1570,6 +1623,7 @@ def msa_sparse_attention_lse_heads(
         page_cache_slots=page_cache_slots,
         page_cache_bf16=page_cache_bf16,
         row_split=row_split,
+        page_cache_tile_pages=page_cache_tile_pages,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]

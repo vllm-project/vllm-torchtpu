@@ -835,6 +835,45 @@ def msa_attend_dcp(
             common["page_cache_slots"] = msa_attention_lse.PREFILL_PAGE_CACHE_SLOTS
             common["page_cache_bf16"] = msa_attention_lse.PREFILL_PAGE_CACHE_BF16
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
+    adaptive = (
+        msa_attention_lse.adaptive_prefill()
+        if scale_cache is not None
+        and num_tokens >= _MIN_CANDIDATE_TOKENS
+        and common.get("page_cache_slots")
+        else None
+    )
+    if adaptive is not None:
+        # Two kernel configurations in the program; each call runs one, by
+        # how wide its selections are (the other's outputs are not computed).
+        threshold, wide_block_q, wide_tile_pages = adaptive
+        msa_attention_lse._proof(
+            msa_attention_lse.ADAPTIVE_ENV,
+            f"MSA prefill tiles per call: > {threshold} pages per "
+            f"{common['block_q']}-token tile -> block_q {wide_block_q}, "
+            f"tile pages {wide_tile_pages}",
+        )
+        wide = dict(common, block_q=wide_block_q, page_cache_tile_pages=wide_tile_pages)
+
+        def attend(kw):
+            def run(operands):
+                q_, kv_, keys_, sc_, *args_ = operands
+                if num_heads == 1:
+                    return msa_attention_lse.msa_sparse_attention_lse(
+                        q_, kv_, keys_[:, 0], *args_, head=0, head_major=True,
+                        **kw, **msa._fp4_attention_kwargs(sc_),
+                    )
+                return msa_attention_lse.msa_sparse_attention_lse_heads(
+                    q_, kv_, keys_, *args_, head_major=True, **kw, scale_cache=sc_
+                )
+
+            return run
+
+        return jax.lax.cond(
+            msa_attention_lse.wide_selection(keys, common["block_q"], threshold),
+            attend(wide),
+            attend(common),
+            (q, kv_cache, keys, scale_cache, *args),
+        )
     if scale_cache is not None:
         if num_heads == 1:
             return msa_attention_lse.msa_sparse_attention_lse(
