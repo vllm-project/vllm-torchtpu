@@ -205,11 +205,14 @@ def _counting_sort_positions(
     fall out of the same histogram, which is exactly `group_sizes`.
     """
     m = sort_keys.shape[0]
-    block = min(_COUNTING_SORT_BLOCKS[0], m)
-    for size in _COUNTING_SORT_BLOCKS:
-        if size <= block and m % size == 0:
-            block = size
-            break
+    if m < _COUNTING_SORT_BLOCKS[-1]:
+        block = _COUNTING_SORT_BLOCKS[-1]
+    else:
+        block = min(_COUNTING_SORT_BLOCKS[0], m)
+        for size in _COUNTING_SORT_BLOCKS:
+            if size <= block and m % size == 0:
+                block = size
+                break
     pad = -m % block
     eff_buckets = num_buckets + 1 if (has_invalid or pad > 0) else num_buckets
     if eff_buckets > block:
