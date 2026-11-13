@@ -27,7 +27,11 @@ this build claims (``additional_config_sections``).
   shape and device it was measured on (Qwen3.5-397B-A17B on TPU7x) and not on
   a ``kv_producer`` (prefill) leg. Every other engine stays on
   ``gpu_memory_utilization``, as on main.
-- ``prefix_match_unit``: 128 tokens on a ``kv_producer`` leg.
+- ``prefix_match_unit``: 128 tokens, only where it was measured: a
+  ``kv_producer`` (prefill) leg without prefill or decode context parallelism
+  (the IX points' PP8 prefill legs), for the same checkpoint shape and device
+  as the budget. Every other engine keeps the unit unset, as on main, so a PCP
+  prefill leg resolves its hash block size from its KV cache groups as on main.
 """
 
 from __future__ import annotations
@@ -118,8 +122,25 @@ def _apply_prefix_match_unit(vllm_config: VllmConfig) -> None:
     if kv_cfg is None or kv_cfg.kv_role != "kv_producer":
         return
     cache_config = vllm_config.cache_config
-    if cache_config.prefix_match_unit is None:
-        cache_config.prefix_match_unit = 128
+    if cache_config.prefix_match_unit is not None:
+        return
+    # The IX prefill legs ran PP8 without context parallelism. With the unit
+    # unset, a PCP or DCP leg resolves its hash block size from its KV cache
+    # groups (the platform's PCP and DCP block-size patches); the 128-token
+    # unit was never measured there, nor on another checkpoint shape or device.
+    parallel_config = vllm_config.parallel_config
+    pcp = int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+    dcp = int(getattr(parallel_config, "decode_context_parallel_size", 1) or 1)
+    if pcp != 1 or dcp != 1 or not _is_calibrated(vllm_config.model_config):
+        logger.info(
+            "Qwen3.5 prefix_match_unit left unset on the prefill leg (pcp=%d, "
+            "dcp=%d): the 128-token unit is for Qwen3.5-397B-A17B prefill "
+            "legs without context parallelism on TPU7x.",
+            pcp,
+            dcp,
+        )
+        return
+    cache_config.prefix_match_unit = 128
 
 
 def _apply_kv_budget(vllm_config: VllmConfig) -> None:
