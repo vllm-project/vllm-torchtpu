@@ -38,6 +38,7 @@ from the Qwen3.5 PrefixAwareScheduler's decode prefetch.
 """
 
 import time
+from typing import TYPE_CHECKING
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -52,7 +53,12 @@ logger = init_logger(__name__)
 _NO_ROOM = 1 << 40
 
 
-class _KvPrefetchMixin:
+# Type the mixin against the Scheduler it extends; at runtime it stays a
+# plain mixin so the MRO is the same for both subclasses.
+_SchedulerBase = Scheduler if TYPE_CHECKING else object
+
+
+class _KvPrefetchMixin(_SchedulerBase):
     """Overrides for vLLM's Scheduler; see the module docstring."""
 
     _LOG_INTERVAL_S = 60.0

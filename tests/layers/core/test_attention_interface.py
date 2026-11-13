@@ -283,6 +283,71 @@ class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
             )
 
 
+class MergePiecesMinTokensTest(parameterized.TestCase):
+    """The V-space merge's chunks in the 1024-token bucket come from their own
+    kernel buffers: a chunk sliced out of one buffer is a T(16,128) copy its
+    matmul reads ~2x slower (48 us copy + 2x47 us per layer vs 2x25)."""
+
+    def _env(self, **values):
+        env = {k: v for k, v in os.environ.items() if k not in values}
+        env.update({k: v for k, v in values.items() if v is not None})
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    SERVED = dict(
+        TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS="2048",
+        TPU_DCP_MLA_UV_BEFORE_MERGE="1",
+        TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS="1024",
+        TPU_DCP_MERGE_RS_BF16="0",
+        TPU_DCP_LSE_MERGE_A2A="1",
+        TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS="32",
+    )
+
+    def _edge(self, num_tokens=1024, **values):
+        with self._env(**{**self.SERVED, **values}):
+            return envs.bucket_gate_edge(
+                attention_interface.merge_pieces_min_tokens(num_tokens)
+            )
+
+    def test_vspace_lowers_to_the_uv_gate(self):
+        edge = self._edge(TPU_DCP_MERGE_VSPACE_FUSED="1")
+        self.assertGreater(1024, edge)  # the 1024-token bucket now takes pieces
+        self.assertLessEqual(512, edge)  # the 512-token bucket (unchunked) does not
+
+    @parameterized.parameters(
+        dict(TPU_DCP_MERGE_VSPACE_FUSED="0"),
+        dict(TPU_DCP_MERGE_VSPACE_FUSED="1", TPU_DCP_MLA_UV_BEFORE_MERGE="0"),
+        # Buckets `vspace_fused_applies` rejects keep the latent merge's gate.
+        dict(TPU_DCP_MERGE_VSPACE_FUSED="1", TPU_DCP_MERGE_RS_BF16="2"),
+        dict(TPU_DCP_MERGE_VSPACE_FUSED="1", TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS="1024"),
+    )
+    def test_latent_merge_keeps_its_gate(self, **values):
+        edge = self._edge(**values)
+        self.assertLessEqual(1024, edge)
+        self.assertGreater(2048, edge)
+
+    def test_a2a_gate_is_per_bucket(self):
+        edge = self._edge(
+            num_tokens=2048,
+            TPU_DCP_MERGE_VSPACE_FUSED="1",
+            TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS="1024",
+        )
+        self.assertGreater(1024, edge)
+
+    def test_never_raises_the_pieces_gate(self):
+        edge = self._edge(
+            TPU_DCP_MERGE_VSPACE_FUSED="1",
+            TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS="512",
+            TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS="2048",
+        )
+        self.assertEqual(edge, envs.bucket_gate_edge(512))
+
+    def test_uv_gate_zero_is_every_bucket(self):
+        edge = self._edge(
+            TPU_DCP_MERGE_VSPACE_FUSED="1", TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS="0"
+        )
+        self.assertEqual(edge, 0)
+
+
 class DcpMlaTopkCapTest(parameterized.TestCase):
     """The capped sparse-MLA defaults #1510 shipped for GLM-5.2 AgentX: a
     512 cap (from DCP16 there; from DCP8 since the trial-4 E2E served DCP8

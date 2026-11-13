@@ -62,7 +62,7 @@ from __future__ import annotations
 import os
 import time
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
@@ -93,7 +93,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
 )
 from vllm.v1.core.kv_cache_utils import get_block_hash, get_group_id
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
@@ -115,6 +115,9 @@ from vllm_torchtpu.offload.raiden_store import (
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        SchedulerOffloadConfig,
+    )
     from vllm.v1.core.block_pool import BlockPool
 
 logger = init_logger(__name__)
@@ -246,6 +249,48 @@ class _LazyOffload:
     last_log: float = 0.0
 
 
+# TODO(vllm-project/vllm#52735): Remove TPU_OFFLOAD_KEEP_EAGLE_TAIL and
+# keep_unannotated_eagle_tail once the pinned vLLM includes
+# vllm-project/vllm#52771.
+def keep_unannotated_eagle_tail(
+    config: SchedulerOffloadConfig,
+    kv_cache_groups: Sequence[KVCacheGroupSpec],
+) -> tuple[SchedulerOffloadConfig, tuple[int, ...]]:
+    """Clears the drafter flag vLLM sets on unannotated offload groups.
+
+    Returns ``(config, cleared_group_ids)``. The pinned vLLM
+    (``SchedulerOffloadConfig.from_spec``) flags every KV cache group as an
+    EAGLE/MTP drafter group when speculative decoding is on and no group is
+    annotated as one. A tier lookup then pops the last chunk of each flagged
+    group's hit as a "volatile draft tail", and drops a one-chunk hit
+    entirely. GLM-5.2's MTP layer shares the target's single group, so every
+    tier hit recomputes one whole chunk (4096 tokens under DCP16). vLLM main
+    treats an unannotated group as a regular group (vllm-project/vllm#52771):
+    drafter KV served one chunk stale can only lower speculative acceptance,
+    because the target verifies every draft. On a P/D prefill leg the chunk is
+    not even stale: lazy offload stores only whole blocks written by prefills,
+    and a prefilled chunk's last draft input is the next prompt token.
+
+    Annotated drafter groups keep their flag.
+    """
+    groups = config.kv_group_configs
+    annotated = {
+        idx for idx, group in enumerate(kv_cache_groups) if group.is_eagle_group
+    }
+    cleared = tuple(
+        group.group_idx
+        for group in groups
+        if group.is_eagle_group and group.group_idx not in annotated
+    )
+    if not cleared:
+        return config, ()
+    new_groups = tuple(
+        group._replace(is_eagle_group=False) if group.group_idx in cleared else group
+        for group in groups
+    )
+    return config._replace(kv_group_configs=new_groups), cleared
+
+
 class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     """Scheduler for the store-backed offload path.
 
@@ -263,6 +308,21 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         kv_cache_config: KVCacheConfig,
     ):
         super().__init__(spec, vllm_config, kv_cache_config)
+        if tpu_envs.TPU_OFFLOAD_KEEP_EAGLE_TAIL:
+            # Before any request: each RequestOffloadState copies self.config.
+            self.config, cleared = keep_unannotated_eagle_tail(
+                self.config, kv_cache_config.kv_cache_groups
+            )
+            logger.info(
+                "TPU_OFFLOAD_KEEP_EAGLE_TAIL: offload tier hits keep their last "
+                "chunk for KV cache groups %s; drafter groups left flagged: %s",
+                list(cleared),
+                [
+                    group.group_idx
+                    for group in self.config.kv_group_configs
+                    if group.is_eagle_group
+                ],
+            )
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
