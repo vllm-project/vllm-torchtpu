@@ -35,7 +35,10 @@ import torch
 
 # Test files that need no chip, by path from the repo root. A session of
 # nothing but these runs with JAX pinned to the CPU.
-HOST_ONLY_TEST_FILES: tuple[str, ...] = ()
+HOST_ONLY_TEST_FILES: tuple[str, ...] = (
+    "tests/distributed/test_sharded_jax_op.py",
+    "tests/layers/adapter/test_small_all_reduce_op.py",
+)
 
 
 def _needs_no_chip(item):
