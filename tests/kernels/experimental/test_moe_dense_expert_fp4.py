@@ -26,19 +26,23 @@ pytestmark = pytest.mark.tpu_test
 E, H, INTER, BLOCK, TOPK = 8, 2048, 256, 128, 4
 
 
+def _weights(h):
+    k = jax.random.split(jax.random.key(7), 4)
+    fp4 = jnp.float4_e2m1fn
+    w1 = jax.random.normal(k[0], (E, h, 2 * INTER), jnp.bfloat16).astype(fp4)
+    w2 = jax.random.normal(k[1], (E, INTER, h), jnp.bfloat16).astype(fp4)
+    s1 = jax.random.uniform(
+        k[2], (E, h // BLOCK, 1, 2 * INTER), jnp.float32, 0.004, 0.008
+    )
+    s2 = jax.random.uniform(k[3], (E, INTER // BLOCK, 1, h), jnp.float32, 0.004, 0.008)
+    return w1, w2, s1, s2
+
+
 @pytest.fixture(scope="module")
 def tensors():
     if jax.default_backend() != "tpu":
         pytest.skip("requires TPU")
-    k = jax.random.split(jax.random.key(7), 4)
-    fp4 = jnp.float4_e2m1fn
-    w1 = jax.random.normal(k[0], (E, H, 2 * INTER), jnp.bfloat16).astype(fp4)
-    w2 = jax.random.normal(k[1], (E, INTER, H), jnp.bfloat16).astype(fp4)
-    s1 = jax.random.uniform(
-        k[2], (E, H // BLOCK, 1, 2 * INTER), jnp.float32, 0.004, 0.008
-    )
-    s2 = jax.random.uniform(k[3], (E, INTER // BLOCK, 1, H), jnp.float32, 0.004, 0.008)
-    return w1, w2, s1, s2
+    return _weights(H)
 
 
 def _routing(m, valid, case):
@@ -58,7 +62,7 @@ def _routing(m, valid, case):
 
 def _run(tensors, monkeypatch, m, valid, case, activation, ep):
     w1, w2, s1, s2 = tensors
-    x = jax.random.normal(jax.random.key(m), (m, H), jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(m), (m, w1.shape[1]), jnp.bfloat16)
     ids, weights = _routing(m, valid, case)
     kwargs = dict(topk=TOPK, activation=activation, skip_padded_tokens=True)
     if ep:
@@ -91,13 +95,40 @@ def _run(tensors, monkeypatch, m, valid, case, activation, ep):
 @pytest.mark.parametrize(("m", "valid"), [(8, 8), (16, 9), (24, 24), (64, 32)])
 @pytest.mark.parametrize("ep", [False, True])
 def test_matches_gmm_path(tensors, monkeypatch, m, valid, case, activation, ep):
-    actual, expected = _run(tensors, monkeypatch, m, valid, case, activation, ep)
-    assert np.isfinite(actual).all()
-    np.testing.assert_array_equal(actual[valid:], 0)
     # Same weights and per-block arithmetic as gmm_v2; only the order of the
     # top-k weighted sum and its rounding differ.
+    actual, expected = _run(tensors, monkeypatch, m, valid, case, activation, ep)
+    _check(actual, expected, valid)
+
+
+def _check(actual, expected, valid):
+    assert np.isfinite(actual).all()
+    np.testing.assert_array_equal(actual[valid:], 0)
     rel = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
     assert rel < 0.008, rel
+
+
+def test_hidden_with_several_down_chunks(monkeypatch):
+    """Hidden 3072 runs two 1536-column down-projection chunks."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    assert kernel._down_cols(3072, 128) == 1536
+    actual, expected = _run(
+        _weights(3072), monkeypatch, 16, 9, "mixed", "swigluoai", False
+    )
+    _check(actual, expected, 9)
+
+
+@pytest.mark.parametrize("num_buffers", [2, 3])
+def test_short_rings(tensors, monkeypatch, num_buffers):
+    """The software pipeline with fewer ring slots than active experts."""
+    monkeypatch.setattr(kernel, "_MAX_FP4_EXPERT_BUFFERS", num_buffers)
+    kernel.dense_expert_moe_fp4.clear_cache()
+    try:
+        actual, expected = _run(tensors, monkeypatch, 24, 24, "mixed", "silu", False)
+    finally:
+        kernel.dense_expert_moe_fp4.clear_cache()
+    _check(actual, expected, 24)
 
 
 def test_zero_routes_return_zero(tensors, monkeypatch):

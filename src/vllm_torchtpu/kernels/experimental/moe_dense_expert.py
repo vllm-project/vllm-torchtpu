@@ -317,9 +317,10 @@ _MAX_FP4_EXPERT_BUFFERS = 4
 
 
 def _fp4_expert_bytes(h, i, bk1, bk2):
-    """VMEM of one FP4 expert slot. A [blocks, 1, N] f32 scale pads its unit
-    sublane dimension to a full 8-row tile."""
-    return h * i + 4 * 8 * (h // bk1 * 2 * i + i // bk2 * h)
+    """VMEM of one FP4 expert slot: w1 [h, 2i] and w2 [i, h] at half a byte,
+    and the scales, whose [blocks, 1, N] f32 tiles pad the unit sublane
+    dimension to 8 rows."""
+    return 3 * h * i // 2 + 4 * 8 * (h // bk1 * 2 * i + i // bk2 * h)
 
 
 def _down_cols(h, lanes):
@@ -335,6 +336,8 @@ def _select_fp4_expert_buffers(m, h, i, experts, bk1, bk2, vmem_capacity_bytes):
     Two slots are the minimum: the software pipeline holds the expert being
     finished and the next one at once."""
     fixed_bytes = m * h * (2 + 2 + 4) + m * pl.cdiv(experts, 128) * 128 * 4
+    # The pipeline keeps two experts' [m, 2i] f32 gate_up accumulators live.
+    fixed_bytes += 2 * m * 2 * i * 4
     budget = vmem_capacity_bytes * 4 // 5
     slots = (budget - fixed_bytes) // _fp4_expert_bytes(h, i, bk1, bk2)
     return min(_MAX_FP4_EXPERT_BUFFERS, slots) if slots >= 2 else 0
