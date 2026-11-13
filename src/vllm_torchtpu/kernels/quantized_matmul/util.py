@@ -124,6 +124,45 @@ def xla_quantized_matmul(
     return out.astype(x.dtype)
 
 
+def xla_prequantized_matmul(
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+    out_dtype: jnp.dtype = jnp.bfloat16,
+) -> jax.Array:
+    """``xla_quantized_matmul`` on an activation that is already quantized.
+
+    Use it when an earlier op has computed ``quantize_tensor(x, w_q.dtype)``,
+    for example a norm kernel that also writes its output in fp8. The result
+    is then bit for bit ``xla_quantized_matmul(x, w_q, w_scale)`` when
+    ``out_dtype`` is the dtype of ``x``.
+
+    Args:
+        x_q: Quantized activation. [m, k]
+        x_scale: Per-row f32 scale of ``x_q``. [m, 1]
+        w_q: Quantized weight. [k, n]
+        w_scale: Per-channel weight scale. [n]
+        out_dtype: Dtype of the result.
+
+    Returns:
+        ``(x_q @ w_q) * x_scale * w_scale`` with f32 accumulation (int32 for
+        an integer ``w_q``), in ``out_dtype``. [m, n]
+    """
+    acc_dtype = jnp.float32
+    if jnp.issubdtype(w_q.dtype, jnp.integer):
+        acc_dtype = jnp.int32
+    out = jax.lax.dot_general(
+        x_q,
+        w_q,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=acc_dtype,
+    ).astype(jnp.float32)
+    out *= x_scale
+    out *= jnp.expand_dims(w_scale, 0)
+    return out.astype(out_dtype)
+
+
 def xla_quantized_batched_matmul(
     x: jax.Array,
     w_q: jax.Array,
