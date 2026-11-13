@@ -157,9 +157,72 @@ def _float32_bsearch(
     return _monotonic_int32_to_float32(result)
 
 
+# bf16 fast path.
+#
+# When the searched values are bfloat16, every order statistic / threshold the
+# float32 bit search can land on is itself a bfloat16 value: the predicates are
+# step functions whose steps sit exactly on the (bf16) data values. Searching
+# the 16-bit bf16 total order therefore returns the *same* threshold as the
+# 32-bit float32 search, with half the full-vocab reduction passes. (The
+# thresholds are still materialized as float32 so every comparison against the
+# data is the same f32 comparison the 32-bit search performs.)
+#
+# bf16 "keys" are int32 in [0, 0xFFFF] ordered like the bf16 total order:
+#   key in [0x8000, 0xFFFF] -> bf16 bits key - 0x8000   (+0.0 ... +NaN)
+#   key in [0x0000, 0x7FFF] -> bf16 bits 0xFFFF - key   (-NaN ... -0.0)
+_BF16_KEY_NEG_INF = 0x007F  # key of bf16 -inf (bits 0xFF80)
+_BF16_KEY_POS_INF = 0xFF80  # key of bf16 +inf (bits 0x7F80)
+_FLOAT32_LOWEST = -torch.finfo(torch.float32).max
+
+
+def _bf16_key_to_float32(key: torch.Tensor) -> torch.Tensor:
+    """Maps int32 bf16 keys (see above) to the float32 they represent."""
+    positive = key >= 0x8000
+    # Multiplication instead of shifts; both products stay within int32.
+    pos_bits = torch.clamp(key - 0x8000, min=0) * 65536
+    neg_bits = (torch.clamp(0x7FFF - key, min=0) * 65536) | torch.full_like(
+        key, -(1 << 31))
+    return torch.where(positive, pos_bits, neg_bits).view(torch.float32)
+
+
+def _bf16_kth_largest(values: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """k-th largest (with multiplicity) bf16 value per row, as float32.
+
+    Greedy MSB-first search over the 16-bit bf16 key space for the largest
+    threshold t with count(values >= t) >= k. NaN keys are clamped onto the
+    infinities so the predicate stays monotone. Returns -inf when a row has
+    fewer than k non-NaN values.
+
+    Args:
+      values: bf16[batch..., vocab_size].
+      k: [batch...] integer tensor.
+
+    Returns:
+      f32[batch..., 1].
+    """
+    current = torch.zeros(values.shape[:-1],
+                          dtype=torch.int32,
+                          device=values.device)
+    for i in range(16):
+        candidate = current | (1 << (15 - i))
+        threshold = _bf16_key_to_float32(
+            torch.clamp(candidate, _BF16_KEY_NEG_INF,
+                        _BF16_KEY_POS_INF)).unsqueeze(-1)
+        # int32 count: an int64 sum is emulated with two u32 reductions plus a
+        # carry chain on TPU, for a count that is bounded by the vocab size.
+        count_ge = torch.sum((values >= threshold).to(torch.int32),
+                             dim=-1,
+                             dtype=torch.int32)
+        current = torch.where(count_ge >= k, candidate, current)
+    return _bf16_key_to_float32(
+        torch.clamp(current, _BF16_KEY_NEG_INF,
+                    _BF16_KEY_POS_INF)).unsqueeze(-1)
+
+
 def topk_mask(logits: torch.Tensor,
               k: torch.Tensor,
-              replace_val: float = MASKED_LOGIT_VALUE) -> torch.Tensor:
+              replace_val: float = MASKED_LOGIT_VALUE,
+              unscaled_logits: torch.Tensor | None = None) -> torch.Tensor:
     """Sets everything to replace_val, except the top k values per batch element.
 
     Sharding considerations: this function does 32 reductions over the
@@ -177,21 +240,51 @@ def topk_mask(logits: torch.Tensor,
       k: Number of values to keep per batch element. In presence of ties, more
         than k values might be returned. [batch..., 1]
       replace_val: For the masked values of logits, what to overwrite them with.
+      unscaled_logits: Optional bf16 tensor such that `logits` is a monotonic
+        non-decreasing elementwise function of it (e.g. the logits before a
+        positive temperature division). The k-th order statistic is then
+        searched on `unscaled_logits`, which avoids re-materializing `logits`
+        in every search pass; the resulting mask is identical because a
+        monotonic map commutes with order statistics.
 
     Returns:
       masked version of logits. [batch..., vocab_size]
     """
     k = k.squeeze(-1)
+    replace_tensor = torch.full_like(logits, replace_val)
+
+    if logits.dtype == torch.bfloat16 and (unscaled_logits is None
+                                           or unscaled_logits.dtype
+                                           == torch.bfloat16):
+        # 16-pass bf16 search; returns the same cutoff as the 32-pass float32
+        # search below (see the bf16 fast path notes above).
+        if unscaled_logits is None:
+            cutoff = _bf16_kth_largest(logits, k)
+        else:
+            kth = _bf16_kth_largest(unscaled_logits, k)
+            # f(kth) for the monotonic map f with logits = f(unscaled_logits),
+            # evaluated by the very same elementwise computation that produced
+            # `logits`: the minimum of f over {x >= kth} is f(kth).
+            cutoff = torch.amin(torch.where(
+                unscaled_logits >= kth, logits,
+                torch.full_like(logits, float("inf"))),
+                                dim=-1,
+                                keepdim=True).to(torch.float32)
+        # Rows with fewer than k finite values keep every finite value, exactly
+        # like the float32 search (which bottoms out at -float32_max).
+        cutoff = torch.clamp(cutoff, min=_FLOAT32_LOWEST)
+        return torch.where(logits >= cutoff, logits, replace_tensor)
 
     def predicate(threshold: torch.Tensor) -> torch.Tensor:
         # Search negated logits so the predicate is monotonic increasing.
         neg_threshold = (-threshold).unsqueeze(-1)
-        count_gt = torch.sum((logits > neg_threshold).to(torch.int32), dim=-1)
+        count_gt = torch.sum((logits > neg_threshold).to(torch.int32),
+                             dim=-1,
+                             dtype=torch.int32)
         return count_gt >= k
 
     cutoff = -_float32_bsearch(logits.shape[:-1], predicate, logits.device)
     cutoff = cutoff.unsqueeze(-1)
-    replace_tensor = torch.full_like(logits, replace_val)
     return torch.where(logits >= cutoff, logits, replace_tensor)
 
 
@@ -227,23 +320,51 @@ def topp_mask(logits: torch.Tensor,
     zero_val = torch.zeros_like(probs)
     replace_tensor = torch.full_like(logits, replace_val)
 
-    def predicate(threshold: torch.Tensor) -> torch.Tensor:
-        threshold = threshold.unsqueeze(-1)
-        probability_mass = torch.sum(
+    def probability_mass(threshold: torch.Tensor) -> torch.Tensor:
+        return torch.sum(
             torch.where(probs >= threshold, probs, zero_val),
             dim=-1,
         )
-        return probability_mass < p
+
+    if probs.dtype == torch.bfloat16:
+        # bf16 probabilities are non-negative and < 2, so the float32 search's
+        # answer (the largest t with mass(probs >= t) >= p) is a bf16 value in
+        # [0, 2): bf16 bit patterns [0, 0x3FFF]. A 14-pass greedy search over
+        # those patterns yields the same threshold (or, in the degenerate
+        # cases, one that selects the same set: t = +0 keeps every probability
+        # like t = -inf does, and t ~= 1.99 keeps none like t = float32_max).
+        current = torch.zeros(probs.shape[:-1],
+                              dtype=torch.int32,
+                              device=probs.device)
+        for i in range(14):
+            candidate = current | (1 << (13 - i))
+            threshold = (candidate * 65536).view(torch.float32).unsqueeze(-1)
+            current = torch.where(
+                probability_mass(threshold) < p, current, candidate)
+        threshold = (current * 65536).view(torch.float32).unsqueeze(-1)
+        return torch.where(probs >= threshold, logits, replace_tensor)
+
+    def predicate(threshold: torch.Tensor) -> torch.Tensor:
+        return probability_mass(threshold.unsqueeze(-1)) < p
 
     threshold = _float32_bsearch(logits.shape[:-1], predicate, logits.device)
     threshold = threshold.unsqueeze(-1)
     return torch.where(probs >= threshold, logits, replace_tensor)
 
 
-def apply_top_k_top_p(logits: torch.Tensor, top_k: torch.Tensor,
-                      top_p: torch.Tensor) -> torch.Tensor:
+def apply_top_k_top_p(
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        unscaled_logits: torch.Tensor | None = None) -> torch.Tensor:
+    """Top-k then top-p masking.
+
+    `unscaled_logits`, if given, must be such that `logits` is a monotonic
+    non-decreasing elementwise function of it on every row whose result is
+    used (see `topk_mask`).
+    """
     should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
-    topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
+    topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE, unscaled_logits)
     masked_logits = torch.where(should_apply_topk, topk_masked, logits)
 
     should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
