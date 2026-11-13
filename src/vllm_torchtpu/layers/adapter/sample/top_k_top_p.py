@@ -300,13 +300,36 @@ def apply_top_k_top_p_candidates(
     rows, vocab_size = logits.shape
     blocks = logits.reshape(rows, vocab_size // CANDIDATE_BLOCK, CANDIDATE_BLOCK)
     block_max = blocks.amax(dim=-1)
-    block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
+    block_ids = select_candidate_blocks(block_max, num_blocks)
     candidates = torch.gather(
         blocks, 1, block_ids.unsqueeze(-1).expand(-1, -1, CANDIDATE_BLOCK)
     ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
+    cutoff = candidate_cutoff(candidates, top_k, top_p)
+    return mask_below_cutoff(logits, cutoff, top_k)
+
+
+def select_candidate_blocks(block_max: torch.Tensor, num_blocks: int) -> torch.Tensor:
+    """The candidate block ids of each row of block maxima [batch, blocks]:
+    the `num_blocks` largest, in torch.topk(sorted=False) order and tie rule.
+    Every candidate path picks its blocks here, so they all agree."""
+    return torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
+
+
+def candidate_cutoff(
+    candidates: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
+) -> torch.Tensor:
+    """The smallest candidate `apply_top_k_top_p` keeps. [batch, 1]"""
     kept = apply_top_k_top_p(candidates, top_k, top_p) > MASKED_LOGIT_VALUE
     inf = torch.full_like(candidates, float("inf"))
-    cutoff = torch.where(kept, candidates, inf).amin(dim=-1, keepdim=True)
+    return torch.where(kept, candidates, inf).amin(dim=-1, keepdim=True)
+
+
+def mask_below_cutoff(
+    logits: torch.Tensor, cutoff: torch.Tensor, top_k: torch.Tensor
+) -> torch.Tensor:
+    """`apply_top_k_top_p_candidates`'s output from its cutoff: logits below
+    the cutoff become MASKED_LOGIT_VALUE; rows with top_k <= 0 are kept.
+    Elementwise per column, so a vocab slice gives the slice of the row."""
     masked = torch.where(
         logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
     )
@@ -380,18 +403,31 @@ def top_k_top_p_candidate_logits(
     rows, vocab_size = logits.shape
     blocks = logits.reshape(rows, vocab_size // CANDIDATE_BLOCK, CANDIDATE_BLOCK)
     block_max = scale(blocks.amax(dim=-1))
-    block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
+    block_ids = select_candidate_blocks(block_max, num_blocks)
     candidates = scale(
         torch.gather(
             blocks, 1, block_ids.unsqueeze(-1).expand(-1, -1, CANDIDATE_BLOCK)
         ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
     )
-    kept = apply_top_k_top_p(candidates, top_k, top_p) > MASKED_LOGIT_VALUE
-    inf = torch.full_like(candidates, float("inf"))
-    cutoff = torch.where(kept, candidates, inf).amin(dim=-1, keepdim=True)
+    return masked_candidate_logits(block_ids, candidates, top_k, top_p)
+
+
+def masked_candidate_logits(
+    block_ids: torch.Tensor,
+    candidates: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The tail of `top_k_top_p_candidate_logits` from the picked blocks
+    [batch, num_blocks] and their scaled logits [batch, num_blocks * 128]:
+    (candidate vocab ids, masked scaled candidate logits)."""
+    rows = candidates.shape[0]
+    cutoff = candidate_cutoff(candidates, top_k, top_p)
     masked_value = torch.full_like(candidates, MASKED_LOGIT_VALUE)
     masked = torch.where(candidates >= cutoff, candidates, masked_value)
     masked = torch.where(top_k > 0, masked, candidates)
-    lane = torch.arange(CANDIDATE_BLOCK, device=logits.device, dtype=block_ids.dtype)
+    lane = torch.arange(
+        CANDIDATE_BLOCK, device=candidates.device, dtype=block_ids.dtype
+    )
     ids = (block_ids.unsqueeze(-1) * CANDIDATE_BLOCK + lane).reshape(rows, -1)
     return ids, masked

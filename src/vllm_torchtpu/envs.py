@@ -376,6 +376,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DRAFT_CARRY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_READ_OFFSETS: bool = False
     VLLM_TPU_VERIFY_ONE_DRAW: bool = False
+    VLLM_TPU_VERIFY_SHARD_CANDIDATES: bool = False
     VLLM_TPU_SUBST_FRESH_IDS: bool = False
     VLLM_TPU_ZERO_PADDED_SEQ_LENS: bool = False
     VLLM_TPU_DRAFT_ROWS_FRESH: bool = False
@@ -2400,6 +2401,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # warmup logs whether it bit-equals the three draws on this backend
     # ("VERIFY_ONE_DRAW stream check"); if not, same distribution, other stream.
     "VLLM_TPU_VERIFY_ONE_DRAW": env_bool("VLLM_TPU_VERIFY_ONE_DRAW"),
+    # With VLLM_TPU_VERIFY_FUSED, TPU_SAMPLER_TOPK_CANDIDATES and
+    # VLLM_TPU_SAMPLER_CANDIDATES_ONLY: a non-greedy verify step keeps each
+    # rank's LM-head vocab shard (no [rows, vocab] all-gather) and the verify
+    # program exchanges block maxima, the candidate blocks and the bonus
+    # argmax pairs instead (layers/adapter/sample/shard_candidates.py). Same
+    # tokens bit for bit, same uniform draws. Steps with logprobs, grammar or
+    # a top_k outside the candidates rule gather the full logits as before.
+    "VLLM_TPU_VERIFY_SHARD_CANDIDATES": env_bool("VLLM_TPU_VERIFY_SHARD_CANDIDATES"),
     # With VLLM_TPU_DRAFT_SEED_FUSED: the fused seed also emits step 0's
     # draft_rows and the loop's padded rejected counts (no eager pads).
     "VLLM_TPU_DRAFT_SEED_EXTRAS": env_bool("VLLM_TPU_DRAFT_SEED_EXTRAS"),

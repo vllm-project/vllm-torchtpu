@@ -124,6 +124,11 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     _random_rejection_sample_impl,
     candidate_rejection_output,
 )
+from vllm_torchtpu.layers.adapter.sample.shard_candidates import (
+    ShardCandidateLogits,
+    tp_all_gather,
+    verify_shard_candidates,
+)
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
     apply_top_k_top_p,
@@ -608,6 +613,155 @@ def _verify_one_draw_ro_impl(
 
 _verify_one_draw_ro_compiled = _static_shape_args(
     _tpu_compile(_verify_one_draw_ro_impl)
+)
+
+
+def _verify_shard_impl(
+    local_logits: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    bonus_u: torch.Tensor,
+    accept_u: torch.Tensor,
+    recover_u: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    max_draft_tokens: int,
+    synthetic_mode: bool,
+    topk_candidates: int,
+    tp_rank: int,
+    tp_size: int,
+    num_reqs: torch.Tensor | None = None,
+    all_gather=None,
+):
+    """VLLM_TPU_VERIFY_SHARD_CANDIDATES: `_verify_fused_impl(...,
+    topk_candidates, candidates_only=True)` from this rank's vocab shard of
+    the logits (`shard_candidates.verify_shard_candidates`), bit for bit, on
+    the same uniforms. Same outputs, incl. the num_reqs row offsets."""
+    next_tokens = verify_shard_candidates(
+        local_logits,
+        bonus_logits_indices,
+        target_logits_indices,
+        temperatures,
+        top_k,
+        top_p,
+        bonus_u,
+        accept_u,
+        recover_u,
+        draft_token_ids,
+        draft_lengths,
+        segment_ids,
+        group_indices,
+        synthetic_conditional_rates,
+        max_draft_tokens,
+        synthetic_mode,
+        topk_candidates,
+        tp_rank,
+        tp_size,
+        all_gather,
+    )
+    if num_reqs is None:
+        return next_tokens
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    valid = torch.arange(next_tokens.shape[0], device=next_tokens.device) < num_reqs
+    row_offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0)
+    return next_tokens, row_offsets
+
+
+_verify_shard_compiled = _static_shape_args(_tpu_compile(_verify_shard_impl))
+
+
+def _gather_vocab_shards_impl(local_logits: torch.Tensor) -> torch.Tensor:
+    """The full [rows, vocab] logits from every rank's vocab shard
+    (VLLM_TPU_VERIFY_FUSED_CHECK on the shard verify only)."""
+    return tp_all_gather(local_logits, -1)
+
+
+_gather_vocab_shards_compiled = _static_shape_args(
+    _tpu_compile(_gather_vocab_shards_impl)
+)
+
+
+def _verify_shard_one_draw_impl(
+    local_logits: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    u: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    max_draft_tokens: int,
+    synthetic_mode: bool,
+    topk_candidates: int,
+    tp_rank: int,
+    tp_size: int,
+    num_reqs: torch.Tensor | None = None,
+    all_gather=None,
+):
+    """`_verify_shard_impl` on one flat draw (VLLM_TPU_VERIFY_ONE_DRAW), split
+    as `_verify_fused_one_draw_impl` splits it, at the full vocab width."""
+    bonus_u, accept_u, recover_u = _split_verify_uniforms(
+        u,
+        bonus_logits_indices.shape[0],
+        local_logits.shape[-1] * tp_size,
+        tuple(draft_token_ids.shape),
+        target_logits_indices.shape[0],
+    )
+    return _verify_shard_impl(
+        local_logits,
+        bonus_logits_indices,
+        target_logits_indices,
+        temperatures,
+        top_k,
+        top_p,
+        bonus_u,
+        accept_u,
+        recover_u,
+        draft_token_ids,
+        draft_lengths,
+        segment_ids,
+        group_indices,
+        synthetic_conditional_rates,
+        max_draft_tokens,
+        synthetic_mode,
+        topk_candidates,
+        tp_rank,
+        tp_size,
+        num_reqs,
+        all_gather,
+    )
+
+
+_verify_shard_one_draw_compiled = _static_shape_args(
+    _tpu_compile(_verify_shard_one_draw_impl)
+)
+
+
+def _verify_shard_one_draw_ro_impl(
+    read_offsets: torch.Tensor,
+    groups: list[torch.Tensor],
+    ro_num_reqs: torch.Tensor,
+    *args,
+):
+    """`_verify_one_draw_ro_impl` (VLLM_TPU_VERIFY_RO_INGRAPH) on the shard
+    verify."""
+    out = _verify_shard_one_draw_impl(*args)
+    _update_read_offsets_impl(read_offsets, groups, out, ro_num_reqs)
+    return out
+
+
+_verify_shard_one_draw_ro_compiled = _static_shape_args(
+    _tpu_compile(_verify_shard_one_draw_ro_impl)
 )
 
 
@@ -1591,6 +1745,8 @@ class TPUModelRunner(GPUModelRunner):
         # bounds (int32, device); None keeps the gathered-logits path.
         self._candidate_head: torch.nn.Module | None = None
         self._candidate_bounds: torch.Tensor | None = None
+        # VLLM_TPU_VERIFY_SHARD_CANDIDATES: (tp_rank, tp_size) once armed.
+        self._shard_candidates: tuple[int, int] | None = None
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
@@ -5092,6 +5248,11 @@ class TPUModelRunner(GPUModelRunner):
         candidate_logits = not top_tokens and self._samples_candidates(
             scheduler_output
         )
+        shard_logits = (
+            not top_tokens
+            and not candidate_logits
+            and self._samples_shard_candidates(scheduler_output)
+        )
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
@@ -5381,6 +5542,15 @@ class TPUModelRunner(GPUModelRunner):
                                 hidden_states, logits_indices
                             )
                         )
+                    elif shard_logits and spec_decode_metadata is not None:
+                        # This rank's vocab shard only; the exact shard verify
+                        # exchanges block maxima and candidate blocks
+                        # (VLLM_TPU_VERIFY_SHARD_CANDIDATES).
+                        logits = ShardCandidateLogits(
+                            self.compute_selected_local_logits(
+                                hidden_states, logits_indices
+                            )
+                        )
                     else:
                         logits = self.compute_selected_logits(
                             hidden_states, logits_indices
@@ -5391,6 +5561,12 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 elif candidate_logits and spec_decode_metadata is not None:
                     logits = VocabShardLogits(
+                        self.compute_local_logits_from_hidden_states(
+                            sample_hidden_states
+                        )
+                    )
+                elif shard_logits and spec_decode_metadata is not None:
+                    logits = ShardCandidateLogits(
                         self.compute_local_logits_from_hidden_states(
                             sample_hidden_states
                         )
@@ -5819,6 +5995,15 @@ class TPUModelRunner(GPUModelRunner):
             return self._sample_spec_verify_candidates(
                 logits.local, md, cur_start_idx, cur_end_idx, sampling_generator
             )
+        if isinstance(logits, ShardCandidateLogits):
+            return self._sample_spec_verify_fused(
+                logits.local,
+                md,
+                cur_start_idx,
+                cur_end_idx,
+                sampling_generator,
+                shard=True,
+            )
         if top_tokens:
             assert self.rejection_sampler is not None
             assert self.speculative_config is not None
@@ -5957,22 +6142,36 @@ class TPUModelRunner(GPUModelRunner):
         cur_start_idx: int,
         cur_end_idx: int,
         sampling_generator: torch.Generator | None,
+        shard: bool = False,
     ) -> torch.Tensor:
         """`_sample_spec_verify_chunk`'s non-greedy branch as one program
         (`_verify_fused_impl`). The three uniform draws stay eager, with the
         shapes, dtype and order of the separate path, so the random stream
-        and the selected tokens are the same."""
+        and the selected tokens are the same.
+
+        With ``shard`` (VLLM_TPU_VERIFY_SHARD_CANDIDATES), ``logits`` is this
+        rank's vocab shard and the program is the shard verify
+        (`_verify_shard_impl`): same draws (full vocab width), same tokens."""
         assert md.draft_token_ids is not None
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
         padded_num_reqs = md.bonus_logits_indices.shape[0]
-        vocab = logits.shape[-1]
+        vocab = self.vocab_size if shard else logits.shape[-1]
         temps, top_k, top_p = self._padded_sampling_params(
             cur_start_idx, cur_end_idx, padded_num_reqs, logits.dtype, logits.device
         )
         topk_candidates = self._sampler_topk_candidates(
             cur_start_idx, cur_end_idx, None
         )
+        if shard and (
+            self._shard_candidates is None
+            or not self._sampler_candidates_only(topk_candidates)
+        ):
+            raise RuntimeError(
+                "VLLM_TPU_VERIFY_SHARD_CANDIDATES: a shard-logits chunk left "
+                "the top-k candidates path; the step gate and "
+                "_sampler_topk_candidates disagree."
+            )
         host_phases.mark("vfy_params")
         one_draw = envs.VLLM_TPU_VERIFY_ONE_DRAW
         flat_u = None
@@ -6046,16 +6245,26 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates,
             self._sampler_candidates_only(topk_candidates),
         )
+        one_draw_fn = _verify_fused_one_draw_compiled
+        separate_fn = _verify_fused_compiled
+        one_draw_ro_fn = _verify_one_draw_ro_compiled
+        if shard:
+            # candidates_only (True) gives way to the TP layout.
+            assert self._shard_candidates is not None
+            args = (*args[:-1], *self._shard_candidates)
+            one_draw_fn = _verify_shard_one_draw_compiled
+            separate_fn = _verify_shard_compiled
+            one_draw_ro_fn = _verify_shard_one_draw_ro_compiled
         if flat_u is not None:
             call_args = (*args[:6], flat_u, *args[9:])
 
             def verify(*extra):
-                return _verify_fused_one_draw_compiled(*call_args, *extra)
+                return one_draw_fn(*call_args, *extra)
 
         else:
 
             def verify(*extra):
-                return _verify_fused_compiled(*args, *extra)
+                return separate_fn(*args, *extra)
 
         ro_groups, ro_num_reqs = self._fused_read_offsets
         fold_ro = (
@@ -6075,7 +6284,7 @@ class TPUModelRunner(GPUModelRunner):
             and self.mamba_slot_read_offsets.device.type == "tpu"
         )
         if ingraph_ro:
-            out = _verify_one_draw_ro_compiled(
+            out = one_draw_ro_fn(
                 self.mamba_slot_read_offsets,
                 list(ro_groups),
                 self._num_reqs_tensor(ro_num_reqs),
@@ -6129,10 +6338,18 @@ class TPUModelRunner(GPUModelRunner):
         else:
             out = verify()
         if self._verify_fused_checks_left > 0:
-            self._check_verify_fused(out, args)
+            ref = None
+            if shard:
+                # Reference: the fused program (what the shard verify claims
+                # to equal bit for bit) on the logits gathered for the check.
+                args = (_gather_vocab_shards_compiled(logits), *args[1:-2], True)
+                ref = _verify_fused_compiled(*args)
+            self._check_verify_fused(out, args, ref)
         return out
 
-    def _check_verify_fused(self, fused: torch.Tensor, args: tuple) -> None:
+    def _check_verify_fused(
+        self, fused: torch.Tensor, args: tuple, ref: torch.Tensor | None = None
+    ) -> None:
         """VLLM_TPU_VERIFY_FUSED_CHECK: rerun the separate programs on the
         same inputs and uniforms, count mismatching positions on device, and
         log the running counts every 500 checks. The first
@@ -6140,7 +6357,8 @@ class TPUModelRunner(GPUModelRunner):
         only (a positive control that must be caught); the rest must be
         clean. The reference always runs the full-vocab rejection sampler, so
         with VLLM_TPU_SAMPLER_CANDIDATES_ONLY the check also proves the
-        candidates-only path."""
+        candidates-only path. A given ``ref`` (the shard verify's check: the
+        fused program on the gathered logits) replaces the rerun."""
         (
             logits,
             bonus_idx,
@@ -6161,35 +6379,36 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates,
             _candidates_only,
         ) = args
-        assert self.rejection_sampler is not None
-        bonus_logits, target_logits = self.spec_gather_bonus_and_target_logits(
-            logits, bonus_idx, target_idx
-        )
-        bonus = self.sample_from_logits_func(
-            bonus_logits,
-            temps,
-            bonus_u,
-            top_k,
-            top_p,
-            all_greedy=False,
-            topk_candidates=topk_candidates,
-        ).view(-1)
-        ref = self.rejection_sampler(
-            draft_token_ids=draft_token_ids,
-            num_draft_tokens=draft_lengths,
-            target_logits=target_logits,
-            bonus_token_ids=bonus,
-            segment_ids=segment_ids,
-            group_indices=group_indices,
-            max_draft_tokens=max_draft_tokens,
-            temperatures=temps[segment_ids],
-            top_k=top_k[segment_ids],
-            top_p=top_p[segment_ids],
-            accept_u=accept_u,
-            recover_u=recover_u,
-            do_sampling=True,
-            topk_candidates=topk_candidates,
-        )
+        if ref is None:
+            assert self.rejection_sampler is not None
+            bonus_logits, target_logits = self.spec_gather_bonus_and_target_logits(
+                logits, bonus_idx, target_idx
+            )
+            bonus = self.sample_from_logits_func(
+                bonus_logits,
+                temps,
+                bonus_u,
+                top_k,
+                top_p,
+                all_greedy=False,
+                topk_candidates=topk_candidates,
+            ).view(-1)
+            ref = self.rejection_sampler(
+                draft_token_ids=draft_token_ids,
+                num_draft_tokens=draft_lengths,
+                target_logits=target_logits,
+                bonus_token_ids=bonus,
+                segment_ids=segment_ids,
+                group_indices=group_indices,
+                max_draft_tokens=max_draft_tokens,
+                temperatures=temps[segment_ids],
+                top_k=top_k[segment_ids],
+                top_p=top_p[segment_ids],
+                accept_u=accept_u,
+                recover_u=recover_u,
+                do_sampling=True,
+                topk_candidates=topk_candidates,
+            )
         faulted = (
             self._verify_fused_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
         )
@@ -6945,6 +7164,12 @@ class TPUModelRunner(GPUModelRunner):
             and not self.is_pooling_model
         ):
             self._init_candidate_sampling()
+        if (
+            envs.VLLM_TPU_VERIFY_SHARD_CANDIDATES
+            and self._pp_is_last
+            and not self.is_pooling_model
+        ):
+            self._init_shard_candidates()
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -7723,7 +7948,7 @@ class TPUModelRunner(GPUModelRunner):
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
-                    if self._candidate_bounds is not None:
+                    if self._candidate_head is not None:
                         out = self.compute_selected_local_logits(dummy_hidden, indices)
                         synchronize_tensors(out)
                     logger.info(
@@ -7759,7 +7984,7 @@ class TPUModelRunner(GPUModelRunner):
                         ).to(self.device)
                         out = self.compute_selected_logits(dummy_hidden, indices)
                         synchronize_tensors(out)
-                        if self._candidate_bounds is not None:
+                        if self._candidate_head is not None:
                             out = self.compute_selected_local_logits(
                                 dummy_hidden, indices
                             )
@@ -7778,7 +8003,7 @@ class TPUModelRunner(GPUModelRunner):
                 ).to(self.device)
                 out = self.compute_logits_from_hidden_states(dummy_hidden)
                 synchronize_tensors(out)
-                if self._candidate_bounds is not None:
+                if self._candidate_head is not None:
                     out = self.compute_local_logits_from_hidden_states(dummy_hidden)
                     synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
@@ -8286,10 +8511,28 @@ class TPUModelRunner(GPUModelRunner):
                 topk_candidates,
                 self._sampler_candidates_only(topk_candidates),
             )
+            # VLLM_TPU_VERIFY_SHARD_CANDIDATES: the same programs on this
+            # rank's vocab shard, where the candidates path runs.
+            shard_args = None
+            if self._shard_candidates is not None and topk_candidates > 0:
+                width = dummy_logits.shape[-1] // self._shard_candidates[1]
+                local = torch.zeros(
+                    (dummy_logits.shape[0], width), dtype=dummy_logits.dtype
+                ).to(self.device)
+                shard_args = (local, *args[1:-1], *self._shard_candidates)
+            shard_fn = (
+                _verify_shard_one_draw_compiled
+                if envs.VLLM_TPU_VERIFY_ONE_DRAW
+                else _verify_shard_compiled
+            )
             if fold_ro:
                 synchronize_tensors(fn(*args, self._num_reqs_tensor(1)))
+                if shard_args is not None:
+                    synchronize_tensors(shard_fn(*shard_args, self._num_reqs_tensor(1)))
                 continue
             synchronize_tensors(fn(*args))
+            if shard_args is not None:
+                synchronize_tensors(shard_fn(*shard_args))
             if (
                 envs.VLLM_TPU_VERIFY_RO_INGRAPH
                 and envs.VLLM_TPU_VERIFY_ONE_DRAW
@@ -8311,6 +8554,12 @@ class TPUModelRunner(GPUModelRunner):
                             scratch, groups, self._num_reqs_tensor(1), *args
                         )
                     )
+                    if shard_args is not None:
+                        synchronize_tensors(
+                            _verify_shard_one_draw_ro_compiled(
+                                scratch, groups, self._num_reqs_tensor(1), *shard_args
+                            )
+                        )
         if envs.VLLM_TPU_VERIFY_ONE_DRAW and not getattr(
             self, "_verify_one_draw_stream_checked", False
         ):
@@ -10140,6 +10389,107 @@ class TPUModelRunner(GPUModelRunner):
                 "vocab-shard candidates"
             )
         return ok
+
+    def _init_shard_candidates(self) -> None:
+        """Arms VLLM_TPU_VERIFY_SHARD_CANDIDATES: the exact shard-local verify
+        (`shard_candidates.verify_shard_candidates`) needs the fused verify
+        with top-k candidates and candidates-only target rows, and an LM head
+        whose vocab shards are contiguous equal slices of the whole (unpadded,
+        unscaled) vocabulary."""
+        reason = None
+        owner = None
+        if self._candidate_bounds is not None:
+            reason = "VLLM_TPU_CANDIDATE_SAMPLING is on"
+        elif self.speculative_config is None:
+            reason = "no speculative decoding"
+        elif self.lora_config is not None:
+            reason = "LoRA"
+        elif not envs.VLLM_TPU_VERIFY_FUSED:
+            reason = "VLLM_TPU_VERIFY_FUSED is off"
+        elif not envs.VLLM_TPU_SAMPLER_CANDIDATES_ONLY:
+            reason = "VLLM_TPU_SAMPLER_CANDIDATES_ONLY is off"
+        elif self._topk_candidate_blocks() == 0:
+            reason = "TPU_SAMPLER_TOPK_CANDIDATES is off or does not fit the vocab"
+        else:
+            try:
+                owner = greedy_top_tokens.resolve_head_owner(
+                    self.model, self._dp_lockstep_enabled()
+                )
+            except NotImplementedError as e:
+                reason = str(e)
+        head = None
+        if owner is not None:
+            head = owner.lm_head
+            processor = owner.logits_processor
+            si = head.shard_indices
+            width = head.num_embeddings_per_partition
+            vocab = head.org_vocab_size
+            if head.tp_size < 2:
+                reason = "TP size 1"
+            elif si.org_vocab_start_index != head.tp_rank * width:
+                reason = f"vocab shard {si.org_vocab_start_index} not at rank x {width}"
+            elif (
+                width * head.tp_size != vocab
+                or head.num_embeddings != vocab
+                or vocab != self.vocab_size
+                or si.org_vocab_end_index != si.org_vocab_start_index + width
+            ):
+                reason = "padded or added vocabulary, or unequal vocab shards"
+            elif (
+                getattr(processor, "logits_as_input", False)
+                or processor.scale != 1.0
+                or getattr(processor, "soft_cap", None) is not None
+                or getattr(head, "bias", None) is not None
+                or getattr(processor, "head_dtype", None)
+                not in (None, self._hidden_states_dtype)
+            ):
+                reason = "logits processor scale / soft cap / bias / head dtype"
+        if reason is not None:
+            logger.info("VLLM_TPU_VERIFY_SHARD_CANDIDATES: off (%s)", reason)
+            return
+        assert head is not None
+        self._candidate_head = head
+        self._shard_candidates = (int(head.tp_rank), int(head.tp_size))
+        logger.info(
+            "VLLM_TPU_VERIFY_SHARD_CANDIDATES: on | vocab %d over %d shards of "
+            "%d, %d candidate blocks, top_k <= %d",
+            head.org_vocab_size,
+            head.tp_size,
+            head.num_embeddings_per_partition,
+            self._topk_candidate_blocks(),
+            self._topk_candidate_blocks() // 2,
+        )
+
+    def _samples_shard_candidates(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether this step's verify chunks run the shard-local verify: armed,
+        not all greedy, nothing reads the full logits (logprobs, grammar), and
+        every request keeps 1 <= top_k <= blocks // 2, the rule under which
+        `_sampler_topk_candidates` picks the candidates path. Otherwise the
+        step gathers the full logits as before (logged once)."""
+        if self._shard_candidates is None or self.input_batch.all_greedy:
+            return False
+        blocks = self._topk_candidate_blocks()
+        n = self.input_batch.num_reqs
+        top_k = self.input_batch.top_k_cpu_tensor[:n]
+        reason = None
+        if self.input_batch.max_num_logprobs is not None:
+            reason = "logprobs"
+        elif scheduler_output.has_structured_output_requests:
+            reason = "structured output"
+        elif not bool(((top_k >= 1) & (top_k <= blocks // 2)).all()):
+            reason = f"a request's top_k outside [1, {blocks // 2}]"
+        if reason is not None:
+            logger.info_once(
+                "VLLM_TPU_VERIFY_SHARD_CANDIDATES: a step fell back to the "
+                "gathered logits (%s)",
+                reason,
+            )
+            return False
+        logger.info_once(
+            "VLLM_TPU_VERIFY_SHARD_CANDIDATES: a verify step ran on the "
+            "vocab-shard logits"
+        )
+        return True
 
     def _local_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's [rows, vocab shard] logits: the LM head projection that

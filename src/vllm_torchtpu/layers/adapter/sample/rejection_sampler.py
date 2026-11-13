@@ -13,6 +13,7 @@
 # limitations under the License.
 """Torch-based rejection sampler for speculative decoding on TPU."""
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -451,23 +452,12 @@ def _random_rejection_sample_impl(
     candidates_only: bool = False,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
-    total_tokens = draft_token_ids.shape[0]
-    batch_size = num_draft_tokens.shape[0]
-    device = draft_token_ids.device
-
     draft_token_ids = draft_token_ids.to(torch.int64)
-    valid_draft_token_ids = draft_token_ids >= 0
-    is_greedy = temperatures.squeeze(-1) == 0
     if candidates_only and topk_candidates > 0:
         target_dist = _candidate_target_dist
     else:
         target_dist = _full_vocab_target_dist
-    (
-        target_logits_argmax,
-        target_token_probs,
-        recovered_token_ids,
-        has_recovery_mass,
-    ) = target_dist(
+    dist = target_dist(
         draft_token_ids,
         target_logits,
         temperatures,
@@ -476,6 +466,50 @@ def _random_rejection_sample_impl(
         recover_u,
         topk_candidates,
     )
+    return rejection_from_target_dist(
+        draft_token_ids,
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        temperatures,
+        accept_u,
+        synthetic_conditional_rates,
+        synthetic_mode,
+        dist,
+    )
+
+
+def rejection_from_target_dist(
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    temperatures: torch.Tensor,
+    accept_u: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+    dist: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """The rest of `_random_rejection_sample_impl` from the target-side
+    quantities `dist` = (target argmax, p(draft), recovered token, has
+    recovery mass) of `_full_vocab_target_dist` / `_candidate_target_dist`."""
+    total_tokens = draft_token_ids.shape[0]
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
+
+    draft_token_ids = draft_token_ids.to(torch.int64)
+    valid_draft_token_ids = draft_token_ids >= 0
+    is_greedy = temperatures.squeeze(-1) == 0
+    (
+        target_logits_argmax,
+        target_token_probs,
+        recovered_token_ids,
+        has_recovery_mass,
+    ) = dist
     if synthetic_mode:
         assert synthetic_conditional_rates is not None
         conditional_rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
@@ -680,17 +714,39 @@ def _candidate_target_dist(
     the same terms in a different order, so probabilities can differ in the
     last bit. The target argmax is the exact first full-row argmax.
     """
-    valid_draft_token_ids = draft_token_ids >= 0
-    safe_draft_token_ids = draft_token_ids.clamp(min=0)
     target_logits_argmax = blocked_argmax(target_logits).to(torch.int32)
-    denominators = temperatures.to(torch.float32) + TEMPERATURE_EPS
     ids, masked_logits = top_k_top_p_candidate_logits(
         target_logits,
-        lambda x: x.to(torch.float32) / denominators,
+        candidate_target_scale(temperatures),
         top_k,
         top_p,
         topk_candidates,
     )
+    return candidate_dist_from_candidates(
+        draft_token_ids, target_logits_argmax, ids, masked_logits, recover_u
+    )
+
+
+def candidate_target_scale(
+    temperatures: torch.Tensor,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """`_candidate_target_dist`'s temperature scaling (float32, +eps)."""
+    denominators = temperatures.to(torch.float32) + TEMPERATURE_EPS
+    return lambda x: x.to(torch.float32) / denominators
+
+
+def candidate_dist_from_candidates(
+    draft_token_ids: torch.Tensor,
+    target_logits_argmax: torch.Tensor,
+    ids: torch.Tensor,
+    masked_logits: torch.Tensor,
+    recover_u: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The tail of `_candidate_target_dist` from the target argmax [T] int32,
+    the candidate ids and masked scaled logits [T, C] and the full-vocab
+    recovery uniforms [T, V] (read at the candidate ids only)."""
+    valid_draft_token_ids = draft_token_ids >= 0
+    safe_draft_token_ids = draft_token_ids.clamp(min=0)
     target_probs = torch.softmax(masked_logits, dim=-1)
     zero = torch.zeros_like(target_probs)
     is_draft = ids == safe_draft_token_ids.unsqueeze(-1)
