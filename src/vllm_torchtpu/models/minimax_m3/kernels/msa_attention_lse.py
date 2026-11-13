@@ -29,7 +29,6 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import tight_vmem
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
@@ -199,45 +198,6 @@ def _page_cache(pages: jax.Array, num_tiles: int, cache_size: int) -> jax.Array:
         constant_values=msa_attention._NO_PAGE,
     )
     _, slot = jax.lax.sort((position, slot), num_keys=1)
-    slot = jnp.where(head < 0, -1, slot).reshape(num_tiles, width)
-    slot = jnp.pad(slot, ((0, 0), (0, rows.shape[1] - width)), constant_values=-1)
-    fits = (num_distinct <= cache_size) & jnp.all(rows[:, width:] < 0)
-    return jnp.concatenate(
-        [
-            jnp.where(fits, slot.reshape(-1), pages),
-            jnp.where(distinct == msa_attention._NO_PAGE, 0, distinct),
-            jnp.minimum(num_distinct, cache_size)[None],
-            fits.astype(jnp.int32)[None],
-        ]
-    ).astype(jnp.int32)
-
-
-def _page_cache_one_sort(
-    pages: jax.Array, num_tiles: int, cache_size: int
-) -> jax.Array:
-    """`_page_cache` with one sort instead of three: the distinct keys are a
-    compaction of the sorted keys (a scatter to their slots) and the slots go
-    back to union order by the inverse permutation (a scatter to the sorted
-    positions). Same table bit for bit."""
-    rows = pages.reshape(num_tiles, -1)
-    width = min(PAGE_CACHE_TILE_PAGES, rows.shape[1])
-    head = rows[:, :width].reshape(-1)
-    n = head.shape[0]
-    key = jnp.where(head < 0, msa_attention._NO_PAGE, head)
-    position = jnp.arange(n, dtype=jnp.int32)
-    key, position = jax.lax.sort((key, position), num_keys=1)
-    new = jnp.concatenate([key[:1] != msa_attention._NO_PAGE, key[1:] != key[:-1]])
-    new = new & (key != msa_attention._NO_PAGE)
-    slot = jnp.cumsum(new, dtype=jnp.int32) - 1
-    num_distinct = slot[-1] + 1
-    # Entry `cache_size` collects every non-new key and is dropped.
-    to = jnp.where(new & (slot < cache_size), slot, cache_size)
-    distinct = (
-        jnp.full((cache_size + 1,), msa_attention._NO_PAGE, jnp.int32)
-        .at[to]
-        .set(key, unique_indices=False)[:cache_size]
-    )
-    slot = jnp.zeros((n,), jnp.int32).at[position].set(slot, unique_indices=True)
     slot = jnp.where(head < 0, -1, slot).reshape(num_tiles, width)
     slot = jnp.pad(slot, ((0, 0), (0, rows.shape[1] - width)), constant_values=-1)
     fits = (num_distinct <= cache_size) & jnp.all(rows[:, width:] < 0)
@@ -1321,15 +1281,10 @@ def _chunked_call(
         union_len = (step // block_q) * msa_attention._groups_per_tile(
             block_q, selected.shape[2], pages_per_step
         ) * pages_per_step
-        build = _page_cache
-        if envs.TPU_MINIMAX_M3_MSA_PAGE_CACHE_ONE_SORT:
-            logger.info_once(
-                "TPU_MINIMAX_M3_MSA_PAGE_CACHE_ONE_SORT=1: MSA prefill page "
-                "cache table built with one sort"
-            )
-            build = _page_cache_one_sort
         table = jax.vmap(
-            functools.partial(build, num_tiles=step // block_q, cache_size=cache_size)
+            functools.partial(
+                _page_cache, num_tiles=step // block_q, cache_size=cache_size
+            )
         )(packed[:, :union_len])
         packed = jnp.concatenate(
             [table[:, :union_len], packed[:, union_len:], table[:, union_len:]], axis=1
