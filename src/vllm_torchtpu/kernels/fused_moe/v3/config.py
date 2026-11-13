@@ -19,6 +19,7 @@ tile (`bd`), and VMEM double-buffering parameters.
 
 import dataclasses
 
+import jax
 import jax.numpy as jnp
 
 from .device import VMEM_FRACTION
@@ -217,7 +218,7 @@ class Config:
     intermediate: str = "fp8"
     elementwise_dtype: str = "bfloat16"
     combine_dtype: str = "float32"
-    row_scale_dtype: object = jnp.float32
+    row_scale_dtype: jax.typing.DTypeLike = jnp.float32
     bounds_checks: bool = False
     gather_block_rows: int = GATHER_BLOCK_ROWS_DEFAULT
     gather_ring: int = GATHER_RING_DEFAULT
