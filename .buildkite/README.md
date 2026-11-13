@@ -18,6 +18,44 @@ releases the `wait` once the retry passes and runs the uploader step. The
 `oncall-fix` label raises job and Kueue workload priority without changing the
 suite.
 
+By default, the TPU tests run only on TPU v7x. To also run them on TPU v6e,
+start a build with the environment variable `CI_TPU_GENERATIONS=all` (set it
+in the Buildkite UI or API). The build then runs every test twice, once on
+each chip, and shows the two sets side by side. A build you start from the UI
+or API can instead set `CI_TPU_GENERATIONS=v6e` or `CI_TPU_GENERATIONS=v7x` to
+run one chip alone, for example to look into v6e failures without also using
+v7x machines. Every other build, and any release, tag or integration build,
+accepts only `all` (or no value), and any other value is rejected.
+
+`CI_TPU_GENERATIONS` chooses the chips for the `tests`, `integration` and
+`perf` lanes only. A build with `NIGHTLY=1` also runs the nightly model and
+feature tests for both chips (the "TPU v6e nightly Tests" and "TPU v7x nightly
+Tests" groups) and the nightly report, whatever `CI_TPU_GENERATIONS` is set
+to.
+
+In the Buildkite UI, each step's name starts with the chip it runs on
+(`v6e ...` or `v7x ...`).
+
+When adding a TPU step to `pipeline_tests.yml`, `pipeline_integration.yml` or
+`pipeline_perf.yml`:
+
+- start its `label` with `${TPU_GENERATION:-v7x}` and its `key`, if it has one,
+  with `${TPU_KEY_PREFIX:-}`, so the v6e and v7x copies of the step get
+  different names;
+- if it can only run on v7x, add `"${TPU_GENERATION:-v7x}" == "v7x"` to its
+  `if`.
+
+`tests/scripts/test_bootstrap.py` fails if a step is missing the label prefix
+or the key prefix.
+
+The `integration` lane, `pipeline_integration.yml`, goes up the same way, once
+per generation in `TPU_GENERATION_FILES`, with the same names: its eight-core
+steps take a v6e 2x4 slice where v7x's take a 2x2x1.
+Steps that run only on v7x as written - those that go through
+`run_multihost.sh`, whose topology and JobSets assume 4-chip v7x hosts, and
+those that set `TPU_ACCELERATOR_TYPE=tpu7x` - carry an `if` comparing
+`TPU_GENERATION` with `v7x`, so v6e's upload leaves them out.
+
 `pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the
 PR has the `run-perf-eval` label (or `run-full-ci`, which sets `NIGHTLY=1` and
@@ -30,6 +68,21 @@ builds (`releases/vX.Y.Z` branches and release tags) select the `full` suite wit
 `NIGHTLY` that is only the steps not gated on it. The schedules keep clear of
 the hours the nightly's perf steps take. The integration pipeline also runs the
 lane, because its LKG promotion waits on two of its steps.
+
+Like the other lanes, the perf lane goes up once for each chip the build runs.
+A v6e 2x4 slice holds 256 GB of HBM to a v7x-8's 768 GB, so v6e runs only
+what fits and needs neither fp4 nor `run_multihost.sh`: the General suite's
+shared configs, qwen3-0.6b, and the nightly general suite. The two General
+suite configs that need more (deepseek-v2, ~470 GB in bf16, and the native-fp4
+qwen3-30b-a3b-nvfp4) have a step of their own, and that step and every other
+one v6e cannot run carry an `if` comparing `TPU_GENERATION` with `v7x`. The
+steps set `TPU_ACCELERATOR_TYPE` from the generation: the server reads the chip
+from it, the results upload names the device after it, and `run_eval_flow.sh`
+gates on that chip's perf baselines in
+`scripts/vllm/benchmarking/baselines/perf/<chip>/`. All of those are v7x's for
+now, so v6e reports its numbers without the perf gate until a v6e baseline
+lands for a config; the accuracy gate, whose baselines are shared, still
+applies.
 
 A PR labeled `skip-tpu-ci` (it still needs `ready`) uploads only the `cpu` lane
 and the image build (skipping the `-omni` image and every TPU lane), so what

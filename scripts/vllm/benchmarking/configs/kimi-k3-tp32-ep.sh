@@ -20,7 +20,7 @@
 # metric; the default 5% perf tolerance applies. The baseline was adjusted
 # down after PR #561 put K3 on the unified KV pool, whose pooled KDA path is
 # expected to be slower until it is optimized (see the _source note in
-# baselines/perf/kimi-k3-tp32-ep.baseline.json and issue #991).
+# baselines/perf/v7x/kimi-k3-tp32-ep.baseline.json and issue #991).
 # Serve flags select the tuned MLA path for this model on this topology. The v2
 # MLA tuning table carries an entry for K3 at TP32 keyed on (max_num_tokens,
 # q_heads, kv_dtype, page_size_per_kv_packing, max_num_seqs, pages_per_seq), and

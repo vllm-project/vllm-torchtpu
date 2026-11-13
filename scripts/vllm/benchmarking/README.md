@@ -54,8 +54,10 @@ live server: once for performance, and once for each accuracy task.
 
 ### Performance (`--mode perf`)
 
-Compares the benchmark JSON to `baselines/perf/<config>.baseline.json`, with a
-5% tolerance. Gated metrics:
+Compares the benchmark JSON to `baselines/perf/<chip>/<config>.baseline.json`
+(`<chip>` is `v7x` or `v6e`, read from `TPU_ACCELERATOR_TYPE`), with a 5%
+tolerance. A chip with no baseline for the config reports its numbers without
+the gate. Gated metrics:
 
 - Median TPOT
 - Total token throughput
@@ -72,7 +74,7 @@ it.
 python3 scripts/vllm/benchmarking/check_regression.py \
   --mode perf \
   --results-dir <DIR> \
-  --baseline scripts/vllm/benchmarking/baselines/perf/<config>.baseline.json
+  --baseline scripts/vllm/benchmarking/baselines/perf/<chip>/<config>.baseline.json
 ```
 
 ### Accuracy (`--mode eval`)
