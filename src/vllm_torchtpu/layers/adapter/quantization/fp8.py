@@ -1262,6 +1262,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             )
         if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
             op = self._moe_lowtok_scores_op
+            assert op is not None
             return moe_lowtok_scores.apply(op, layer, x, router_logits)
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
@@ -1324,6 +1325,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         *,
         use_fused_kernel: bool = True,
     ) -> torch.Tensor:
+        layer = cast("TpuRoutedExperts", layer)
         from vllm.distributed.parallel_state import get_ep_group
 
         from vllm_torchtpu.layers.adapter import (
@@ -1392,12 +1394,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del input_ids
+        layer = cast("TpuRoutedExperts", layer)
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
             retain_fused_ep_graph_inputs,
         )
 
         if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
             op = self._moe_lowtok_scores_op
+            assert op is not None
             out = moe_lowtok_scores.apply(op, layer, x, router_logits)
             return retain_fused_ep_graph_inputs(out)
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
