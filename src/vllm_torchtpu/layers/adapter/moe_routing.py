@@ -175,6 +175,21 @@ def route(
     hook -- and any future routing-path change -- lives in exactly one place.
     """
     topk = layer.moe_config.experts_per_token
+    topk_weights, topk_ids = _select_routing(
+        layer, hidden_states, router_logits, topk, input_ids
+    )
+    if layer.capture_fn is not None:
+        layer.capture_fn(topk_ids)
+    return topk_weights, topk_ids
+
+
+def _select_routing(
+    layer,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk: int,
+    input_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
         return simulated
