@@ -19,4 +19,6 @@ plugin load in every process, before vLLM selects a model.
 
 
 def register() -> None:
-    """Nothing to register yet: the model entry fills this in."""
+    from vllm_torchtpu.models.minimax_m3.experimental import register as _register
+
+    _register()
