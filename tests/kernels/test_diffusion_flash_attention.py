@@ -72,7 +72,7 @@ def _check(out, ref, max_rel=3e-2, mean_rel=1e-2):
         # Wan 720p single-device cross-attention: the largest query block,
         # sized by the VMEM cap.
         (1, 75600, 512, 1, 1, 128, True),
-        # Narrow heads use the transposing layout.
+        # Non-lane-aligned head_dim and fixed-m paths use the transposing layout.
         (1, 2304, 2304, 2, 2, 64, True),
         (1, 4133, 4133, 24, 24, 128, True),
         (1, 69632, 512, 1, 1, 128, False),
