@@ -171,8 +171,8 @@ class _FakeGDNStream:
         self._w_in_ref = w_in_ref
         self.sp = SimpleNamespace(lay=lay)
 
-    def dmatmul(self, kind: str, x_vmem: Any, n_cols: int) -> Any:
-        assert kind == "lin_in"
+    def dmatmul(self, kind: str, x_vmem: Any, n_cols: int, *, hook: Any = None) -> Any:
+        assert kind == "lin_in" and hook is None  # no ARPIPE `hook` here
         return x_vmem[...].astype(F32) @ self._w_in_ref[0, :, :n_cols].astype(F32)
 
 

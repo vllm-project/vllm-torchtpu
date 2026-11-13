@@ -113,7 +113,8 @@ class _FakeMoEStream:
     def expert_stream(self) -> Any:
         return contextlib.nullcontext()
 
-    def segment(self, *, lazy: bool = False) -> Any:
+    def segment(self, *, lazy: bool = False, defer_flush: bool = False) -> Any:
+        assert not defer_flush  # the deferred refill options stay off here
         del lazy
         return contextlib.nullcontext()
 

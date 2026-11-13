@@ -95,7 +95,11 @@ class _FakeStream:
         self._scr = scr
         self.interpret = interpret
 
-    def dmatmul(self, kind: str, x: Any, n: int) -> Any:
+    def dmatmul(
+        self, kind: str, x: Any, n: int, *, hook: Any = None, split: Any = None
+    ) -> Any:
+        # The layer-schedule inputs (ARPIPE `hook`, AR0S `split`) stay off here.
+        assert hook is None and split is None
         del n
         x_val = x[...]
         w_val = self._w[kind][0]

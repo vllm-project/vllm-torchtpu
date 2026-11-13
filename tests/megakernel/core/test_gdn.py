@@ -100,7 +100,11 @@ class _FakeGDNStream:
         del lazy
         return contextlib.nullcontext()
 
-    def dmatmul(self, kind: str, x_ref: Any, n_dim: int) -> Any:
+    def dmatmul(
+        self, kind: str, x_ref: Any, n_dim: int, *, hook: Any = None, split: Any = None
+    ) -> Any:
+        # The layer-schedule inputs (ARPIPE `hook`, AR0S `split`) stay off here.
+        assert hook is None and split is None
         tk = self.sp.tk[kind]
         nt = self.sp.nt[kind]
         x = x_ref[...]

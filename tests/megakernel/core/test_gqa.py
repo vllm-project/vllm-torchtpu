@@ -116,7 +116,11 @@ class _FakeGQAStream:
     def mm(self, a: Any, b: Any, dims: Any = (((1,), (0,)), ((), ()))) -> Any:
         return lax.dot_general(a, b.astype(BF16), dims, preferred_element_type=F32)
 
-    def dmatmul(self, kind: str, x_ref: Any, n_dim: int) -> Any:
+    def dmatmul(
+        self, kind: str, x_ref: Any, n_dim: int, *, hook: Any = None, split: Any = None
+    ) -> Any:
+        # The layer-schedule inputs (ARPIPE `hook`, AR0S `split`) stay off here.
+        assert hook is None and split is None
         tk = self.sp.tk[kind]
         nt = self.sp.nt[kind]
         x = x_ref[...]
