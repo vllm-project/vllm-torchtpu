@@ -19,12 +19,12 @@ FLUX.1-dev, FLUX.2-klein-4B) with pixel-statistics sanity checks.
 All tests run in-memory without PNG writes.
 """
 
-import numpy as np
 import pytest
 from PIL import Image
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from tests_omni.conftest import OmniRunner
+from tests_omni.omni_test_utils import compute_distribution_metrics
 
 pytestmark = [
     pytest.mark.nightly,
@@ -36,17 +36,6 @@ pytestmark = [
 def _extract_image(output) -> Image.Image:
     """Extract PIL Image from Omni generate output."""
     return output.images[0]
-
-
-def compute_distribution_metrics(img: Image.Image) -> dict[str, float]:
-    """Calculate scalar distribution moments and percentiles from output pixels."""
-    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-    return {
-        "mean": float(np.mean(arr)),
-        "p10": float(np.percentile(arr, 10)),
-        "p90": float(np.percentile(arr, 90)),
-        "var": float(np.var(arr)),
-    }
 
 
 class TestFluxNightlyOnTpu:
