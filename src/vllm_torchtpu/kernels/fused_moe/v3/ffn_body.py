@@ -15,7 +15,9 @@
 Fused EP MoE v3."""
 
 import dataclasses
+from typing import cast
 
+import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
@@ -86,7 +88,8 @@ class Build:
     @property
     def rows_bf16(self):
         """bf16 token rows (Config.token_rows): the up matmul runs in bf16."""
-        return jnp.dtype(self.token_dtype) == jnp.dtype(jnp.bfloat16)
+        token_dtype = cast("jax.typing.DTypeLike", self.token_dtype)
+        return jnp.dtype(token_dtype) == jnp.dtype(jnp.bfloat16)
 
     @property
     def n_stream_blocks(self):
