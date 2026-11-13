@@ -525,3 +525,16 @@ def test_mixture_tile_divides_all_serving_windows():
             tile=128,
             eps=1e-5,
         )
+
+
+def test_route_count_snapshot_settings_leave_the_kernel_key():
+    # The snapshot directory differs per host (each writes its own ranks'
+    # files): it must not change the compiled programs' export keys.
+    from vllm_torchtpu.megakernel.kimi_k3 import config
+
+    base = config.KernelConfig(prefill_route_counts=True)
+    per_host = base.replace(
+        prefill_route_counts_dir="/out/host1", prefill_route_counts_every=1
+    )
+    assert per_host.key() == base.key()
+    assert base.key() != config.KernelConfig().key()

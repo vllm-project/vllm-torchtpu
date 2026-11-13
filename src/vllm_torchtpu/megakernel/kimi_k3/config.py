@@ -16,6 +16,11 @@ from typing import Any
 from vllm_torchtpu.megakernel.config import set_active_kernel_config
 
 
+def _host_side(default: Any) -> Any:
+    """A field the host-side code reads and no compiled kernel depends on."""
+    return dataclasses.field(default=default, metadata={"host_side": True})
+
+
 @dataclasses.dataclass(frozen=True)
 class KernelConfig:
     # Decode context parallel attention.
@@ -77,8 +82,8 @@ class KernelConfig:
     # every prefill_route_counts_every windows under prefill_route_counts_dir
     # (default: $CDK_OUTPUT_DIR/prefill_route_counts).
     prefill_route_counts: bool = False
-    prefill_route_counts_every: int = 200
-    prefill_route_counts_dir: str = ""
+    prefill_route_counts_every: int = _host_side(200)
+    prefill_route_counts_dir: str = _host_side("")
     # EP16 expert placement, shared by the prefill and the aggregate's decode
     # (empty: the pre-shard's): an npz whose ``order`` [92, 896] is the logical
     # expert at each physical slot (chip c: slots 56c..56c+55, hottest first);
@@ -88,8 +93,8 @@ class KernelConfig:
     # random-token, id-sweep and real-text prefills.
     expert_plan: str = "plan_ep16_real_hotfirst.npz"
     # Weight loading.
-    read_streams: int = 4
-    load_inflight_gb: float = 16.0
+    read_streams: int = _host_side(4)
+    load_inflight_gb: float = _host_side(16.0)
     # Named XProf trace scopes around the decode's phases (profiling only).
     phase_scopes: bool = False
 
@@ -106,8 +111,15 @@ class KernelConfig:
             )
 
     def key(self) -> str:
-        """A stable digest of every field, for caches of compiled kernels."""
-        blob = json.dumps(dataclasses.asdict(self), sort_keys=True, default=list)
+        """A stable digest of the fields that shape the compiled kernels, for
+        their caches (host-side fields, which may differ per host, are left
+        out)."""
+        shaping = {
+            field.name: getattr(self, field.name)
+            for field in dataclasses.fields(self)
+            if not field.metadata.get("host_side")
+        }
+        blob = json.dumps(shaping, sort_keys=True, default=list)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
     def replace(self, **fields: Any) -> "KernelConfig":
