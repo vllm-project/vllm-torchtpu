@@ -590,6 +590,10 @@ def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
 
 
 def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
+    from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "2")
+    monkeypatch.setenv(OMP_NUM_THREADS_SET_BY_VLLM, "1")
     events = []
     config = object()
     monkeypatch.setattr(
@@ -597,20 +601,31 @@ def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
     )
     monkeypatch.setattr(
         "vllm_torchtpu.worker.tpu_worker._release_free_host_heap",
-        lambda: events.append("release"),
+        lambda: events.append(("release", torch.get_num_threads())),
     )
     worker = SimpleNamespace(
         model_config=config,
-        model_runner=SimpleNamespace(load_model=lambda: events.append("load")),
+        model_runner=SimpleNamespace(
+            load_model=lambda: events.append(("load", torch.get_num_threads()))
+        ),
     )
-    TPUWorker.load_model(worker)
-    assert events == [("model_load", {"model_config": config}), "load", "release"]
+    previous_threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(2)
+        TPUWorker.load_model(worker)
+        assert events == [
+            ("model_load", {"model_config": config}),
+            ("load", 2),
+            ("release", 2),
+        ]
+        assert torch.get_num_threads() == 1
+    finally:
+        torch.set_num_threads(previous_threads)
 
 
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
-@pytest.mark.parametrize("speculative", [False, True])
-def test_warmup_restores_runtime_threads_without_overriding_user_choice(
-    monkeypatch, managed_by_vllm, runtime_threads, speculative
+def test_warmup_runs_at_runtime_threads_without_overriding_user_choice(
+    monkeypatch, managed_by_vllm, runtime_threads
 ):
     from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
 
@@ -628,7 +643,6 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
     worker = SimpleNamespace(
         model_runner=SimpleNamespace(capture_model=capture_model),
         compilation_config=SimpleNamespace(compilation_time=0.0),
-        speculative_config=object() if speculative else None,
     )
     previous_threads = torch.get_num_threads()
     try:
@@ -642,14 +656,33 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
             result = TPUWorker.compile_or_warm_up_model(worker)
         freeze.assert_called_once_with()
         gc_debug.assert_called_once_with()
-        # Speculative decoding warms up at the serving thread count; other
-        # models keep the startup count during warm-up.
-        assert warmup_threads == [runtime_threads if speculative else 2]
+        # Warm-up traces are recorded at the serving thread count so Dynamo's
+        # GLOBAL_STATE guard matches at runtime.
+        assert warmup_threads == [runtime_threads]
         assert torch.get_num_threads() == runtime_threads
         assert result.language_model == worker.compilation_config.compilation_time
         assert result.encoder == 0.0
     finally:
         torch.set_num_threads(previous_threads)
+
+
+def test_execute_dummy_batch_runs_under_no_grad():
+    grad_states = []
+
+    def _run_dp_idle_pairing(_bucket, _num_chunks):
+        grad_states.append(torch.is_grad_enabled())
+
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            _dp_coordinated_step=lambda *_args: (16, 1),
+            _run_dp_idle_pairing=_run_dp_idle_pairing,
+        )
+    )
+    with torch.enable_grad():
+        assert torch.is_grad_enabled()
+        TPUWorker.execute_dummy_batch(worker)
+        assert torch.is_grad_enabled()
+    assert grad_states == [False]
 
 
 def test_real_patch_entrypoints_in_spawned_processes():

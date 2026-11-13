@@ -4004,6 +4004,56 @@ def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
     )
 
 
+def test_precompile_timed_runs_under_no_grad():
+    """_precompile_timed must run under torch.no_grad() so Dynamo GLOBAL_STATE
+    (grad_mode) guards recorded during capture_model() match serving."""
+    runner = SimpleNamespace(_update_num_xla_graphs=lambda _name: None)
+    with torch.enable_grad():
+        assert torch.is_grad_enabled()
+        with TPUModelRunner._precompile_timed(runner, "test_pass"):
+            assert not torch.is_grad_enabled()
+        assert torch.is_grad_enabled()
+
+
+def test_precompile_timed_and_no_grad_share_dynamo_guard():
+    """A graph traced inside _precompile_timed must reuse the same Dynamo frame
+    when invoked under @torch.no_grad() without triggering a GLOBAL_STATE miss."""
+    from torch._dynamo.testing import CompileCounter
+
+    counter = CompileCounter()
+    compiled_add = torch.compile(lambda x: x + 1, backend=counter, fullgraph=True)
+    runner = SimpleNamespace(_update_num_xla_graphs=lambda _name: None)
+    x = torch.zeros(4)
+
+    with torch.enable_grad():
+        with TPUModelRunner._precompile_timed(runner, "test_pass"):
+            compiled_add(x)
+
+        @torch.no_grad()
+        def serve_step():
+            return compiled_add(x)
+
+        serve_step()
+
+    assert counter.frame_count == 1
+
+
+def test_sample_tokens_runs_under_no_grad():
+    grad_states = []
+    runner = SimpleNamespace(
+        execute_model_state=None,
+        _pp_is_last=False,
+        _sample_tokens_pp_intermediate_stage=lambda: grad_states.append(
+            torch.is_grad_enabled()
+        ),
+    )
+    with torch.enable_grad():
+        assert torch.is_grad_enabled()
+        TPUModelRunner.sample_tokens(runner, None)
+        assert torch.is_grad_enabled()
+    assert grad_states == [False]
+
+
 class TestLogitsAtDpVocabRows:
     """TPU_DP_VOCAB_PARALLEL: every logits batch reaches the compiled logits
     program at the step's DP-wide request bucket, padded and sliced outside

@@ -2591,7 +2591,7 @@ class TPUModelRunner(GPUModelRunner):
             return
         pool_sets = self._dense_kv_copy_pool_sets()
         # At most one CoW pair per newly scheduled request per step.
-        with self._precompile_timed("dense KV CoW copies"), torch.no_grad():
+        with self._precompile_timed("dense KV CoW copies"):
             for split, pools in pool_sets.items():
                 synchronize_tensors(pools)
                 limit = self._bucket_len(self.max_num_reqs * split)
@@ -5268,6 +5268,7 @@ class TPUModelRunner(GPUModelRunner):
             apply_topk_topp=self._sampler_applies_topk_topp(),
         )
 
+    @torch.no_grad()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -6832,7 +6833,8 @@ class TPUModelRunner(GPUModelRunner):
         """Common boilerplate for each AOT bucket precompile pass."""
         logger.info("Compiling %s with different input shapes.", name)
         start = time.perf_counter()
-        yield
+        with torch.no_grad():
+            yield
         logger.info("Compilation finished in %.2f [secs].", time.perf_counter() - start)
         self._update_num_xla_graphs(name)
 
@@ -7357,8 +7359,7 @@ class TPUModelRunner(GPUModelRunner):
         bucket grid.
 
         Uses the runtime buckets (num_tokens_paddings x num_reqs_paddings) with
-        the logits precompile's pruning, and runs under no_grad like
-        execute_model so the Dynamo guards match at serve time.
+        the logits precompile's pruning.
         """
         if not self.is_pooling_model or not self._pp_is_last:
             return
@@ -7367,7 +7368,7 @@ class TPUModelRunner(GPUModelRunner):
             logger.info("Skipping pooler precompile: %s", self._static_pooler_reason)
             return
         hsize = self.model_config.get_hidden_size()
-        with self._precompile_timed("static pooler"), torch.no_grad():
+        with self._precompile_timed("static pooler"):
             dummy_hidden = None
             for num_tokens, num_reqs in iter_pooler_precompile_grid(
                 self.num_tokens_paddings, self.num_reqs_paddings, self.max_num_reqs
@@ -7781,9 +7782,7 @@ class TPUModelRunner(GPUModelRunner):
                 tuple(id(r) for r in self.kv_cache_raw_tensors),
                 self.kv_cache_raw_tensors,
             )
-        # Serving calls the program under execute_model's no_grad, and dynamo
-        # guards on grad mode: compile it the same way.
-        with self._precompile_timed("mamba state seed copies"), torch.no_grad():
+        with self._precompile_timed("mamba state seed copies"):
             num_groups = max(
                 1,
                 len(self._mamba_copy_plan),
