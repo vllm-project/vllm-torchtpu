@@ -390,6 +390,42 @@ def gather_query_heads(q: torch.Tensor, group: Any) -> torch.Tensor:
     return group.all_gather(q.contiguous(), dim=1)
 
 
+# Decode-sized steps (8-token verify rows of up to 16 requests): their
+# partials are a few KiB per head, so moving them costs no more than
+# reduce-scattering them, and the exchange needs no LSE gather first.
+EXCHANGE_MERGE_MAX_TOKENS = 128
+
+
+def _merge_exchanged_partials(
+    out: torch.Tensor, lse: torch.Tensor, group: Any
+) -> torch.Tensor:
+    """`merge_head_partials`' reduce-scatter result ``[H / DCP, T, D]`` from
+    one exchange: an all-to-all brings this rank every rank's partial and LSE
+    of its own heads, which it weights and sums itself, as the reduce-scatter
+    would (each rank's weighted term rounded to the output dtype first, when
+    `TPU_DCP_RS_OUT_PRECISION`). The two all-to-alls are independent, so
+    neither waits on the other's arrival, where the reduce-scatter waited on
+    the LSE gather."""
+    world = int(group.world_size)
+    num_heads, num_tokens, head_dim = out.shape
+    local = num_heads // world
+    outs = _all_to_all(out, group).view(world, local, num_tokens, head_dim)
+    lses = _all_to_all(lse.to(torch.float32), group).view(world, local, num_tokens)
+    weight = torch.exp(lses - torch.logsumexp(lses, dim=0)).unsqueeze(-1)
+    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+    weighted = torch.where(
+        weight > 0, outs.to(torch.float32) * weight, torch.zeros_like(weight)
+    )
+    if envs.TPU_DCP_RS_OUT_PRECISION:
+        weighted = weighted.to(out.dtype)
+    # f32 adds, not a sum: the compiler can lower a multiply-then-sum to a dot
+    # that rounds its f32 operands to bf16 (`merge_lse_partials_all_to_all`).
+    merged = weighted[0].to(torch.float32)
+    for r in range(1, world):
+        merged = merged + weighted[r].to(torch.float32)
+    return merged.to(out.dtype)
+
+
 def merge_head_partials(
     out: torch.Tensor,
     lse: torch.Tensor,
@@ -402,8 +438,13 @@ def merge_head_partials(
     share is transposed back to ``[T, H / DCP, D]`` (and, with a 4-bit
     cache's `hadamard`, unrotated: the rotation is linear, so the merged sum
     unrotates as its terms would, up to bf16 rounding order). The MSA merge
-    always reduce-scatters: `TPU_DCP_LSE_MERGE_A2A` (the MLA merge's
-    all-to-all for small steps) does not apply here."""
+    reduce-scatters on steps above `EXCHANGE_MERGE_MAX_TOKENS` tokens; smaller
+    ones exchange the raw partials instead (`_merge_exchanged_partials`)."""
+    if out.shape[1] <= EXCHANGE_MERGE_MAX_TOKENS:
+        merged = _merge_exchanged_partials(out, lse, group)
+        if hadamard is not None:
+            merged = _rotate_heads(merged, hadamard)
+        return merged.transpose(0, 1)
     # The LSEs cross the all-gather token-major ([T, H], as the MLA merge
     # sends them): gathered head-major they took 2x as long (c48 / c64
     # twins, j-fe812c28, j-c5c4bdfc).
