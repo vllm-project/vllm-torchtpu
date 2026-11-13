@@ -167,9 +167,8 @@ def chunked_gdn_per_seq(
     # [num_v_heads, chunk, chunk]
     t_inv = invert_triangular_matrix(t, block_size=cfg.triangular_block_size)
 
-    # State-first KQ-head-factored projection: contract unscaled [K; Q] against
-    # state_prev before the triangular solve, so the solve has a single
-    # 128-column right-hand side and W is never formed.
+    # Contract unscaled [K; Q] against state_prev before the triangular solve so
+    # the solve operates on the single v_head_dim-wide residual v_diff.
     # [num_kq_heads, 2 * chunk, kq_head_dim]
     merged_kq = jnp.concat([k_large, q_large], axis=1)
     # [num_v_heads, 2 * chunk, kq_head_dim]
