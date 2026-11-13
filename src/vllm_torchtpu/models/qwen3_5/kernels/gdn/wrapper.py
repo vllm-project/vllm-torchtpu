@@ -759,6 +759,9 @@ def fused_conv1d_gdn(
                 vmem_limit_bytes=vmem_limit_bytes,
             ),
             name=cfg.get_kernel_name(),
+            # jax types metadata values as str; pallas_call serializes the
+            # config's int and float values to JSON as well.
+            # pyrefly: ignore[bad-argument-type]
             metadata=cfg.get_metadata(),
         )(
             metadata_obj,
@@ -781,6 +784,9 @@ def fused_conv1d_gdn(
     if not batched_only:
         out_act, out_states = call_kernel(out_states, out_act, config.GDNMode.PER_SEQ)
 
+    # One of the two calls above always runs (batched_only and prefill_only are
+    # exclusive), which pyrefly cannot tell.
+    # pyrefly: ignore[missing-attribute]
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
     if conv_state_shape is not None:
