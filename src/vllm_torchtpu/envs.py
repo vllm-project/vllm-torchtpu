@@ -225,6 +225,9 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_MSA_PREFILL_FP4_TRANSPOSED: bool = False
+    TPU_MINIMAX_M3_INDEXER_LARGE_TOKEN_MAJOR: bool = False
+    TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_PACKED_SORT: bool = False
 
 
 def env_with_choices(
@@ -1390,6 +1393,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of two (`models.minimax_m3.dcp_pack`). 0 keeps two gathers.
     "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 prefill-sized MSA attention calls on 4-bit caches score
+    # transposed, ``s^T [keys, rows]`` (`msa_attention_lse._kernel`
+    # `attend_t`): the query tile stays latched in the MXU across the
+    # group's pages instead of one weight push per 256 keys. Row sums
+    # round in another order: not bitwise, equally accurate.
+    "TPU_MINIMAX_M3_MSA_PREFILL_FP4_TRANSPOSED": env_bool(
+        "TPU_MINIMAX_M3_MSA_PREFILL_FP4_TRANSPOSED", False
+    ),
+    # MiniMax M3 indexer: the prefill (large) tile class writes token-major
+    # scores like the decode class, so both classes go back to token order by
+    # one row gather instead of a relayout of the transposed scores
+    # (`msa_indexer.block_scores`). Bit-identical.
+    "TPU_MINIMAX_M3_INDEXER_LARGE_TOKEN_MAJOR": env_bool(
+        "TPU_MINIMAX_M3_INDEXER_LARGE_TOKEN_MAJOR", False
+    ),
+    # MiniMax M3 MSA prefill page cache (`msa_attention_lse._page_cache`):
+    # sort page keys and positions packed into one int32 key per entry
+    # instead of multi-operand sorts. Bit-identical.
+    "TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_PACKED_SORT": env_bool(
+        "TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_PACKED_SORT", False
     ),
 }
 

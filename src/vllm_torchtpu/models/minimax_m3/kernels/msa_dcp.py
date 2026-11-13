@@ -834,6 +834,8 @@ def msa_attend_dcp(
         if scale_cache is not None:
             common["page_cache_slots"] = msa_attention_lse.PREFILL_PAGE_CACHE_SLOTS
             common["page_cache_bf16"] = msa_attention_lse.PREFILL_PAGE_CACHE_BF16
+            if msa_attention_lse.PREFILL_FP4_TRANSPOSED:
+                common["fp4_transposed"] = True
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
     if scale_cache is not None:
         if num_heads == 1:

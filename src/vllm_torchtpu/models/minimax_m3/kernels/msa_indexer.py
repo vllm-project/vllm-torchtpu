@@ -38,6 +38,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
@@ -94,6 +95,21 @@ logger = init_logger(__name__)
 # Not bit-identical to the bf16 queries: the query rounds to 3 mantissa bits.
 INDEXER_V2_ENV = "TPU_MINIMAX_M3_INDEXER_V2"
 _FP8_Q_MAX = 256.0
+
+
+# TPU_MINIMAX_M3_INDEXER_LARGE_TOKEN_MAJOR=1: the large (prefill) tile class
+# writes its scores token-major, ``[tiles * Bq, P]``, as the decode class
+# does, so `block_scores` takes each token's row from either class by a row
+# gather. The transposed ``[P, tiles * Bq]`` layout needs a column gather:
+# a relayout of both classes' padded scores (in a served c48 2,048-token
+# mixed step ~85 us per layer: a pad / concatenate, a SparseCore data-format
+# transpose and the gather, j-fafd206d). Bit-identical.
+LARGE_TOKEN_MAJOR = bool(envs.TPU_MINIMAX_M3_INDEXER_LARGE_TOKEN_MAJOR)
+if LARGE_TOKEN_MAJOR:
+    logger.info(
+        "TPU_MINIMAX_M3_INDEXER_LARGE_TOKEN_MAJOR=1: MSA indexer prefill tiles write "
+        "token-major scores (row gather back to token order)."
+    )
 
 
 def fp8_queries_enabled() -> bool:
@@ -438,6 +454,10 @@ def _kernel_v3(
     chunk = _v3_chunk(pages_per_step, block_q, page_size)
     pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
     step, num_steps = pl.program_id(0), pl.num_programs(0)
+    # Token-major blocks are at least 128 lanes: a group of fewer pages
+    # writes its lane share (group % lane_groups) of a block that
+    # consecutive groups of the tile share.
+    lane_groups = o_ref.shape[1] // pages_per_step if transposed else 1
     # The pages as 32-bit words: a dense VMEM layout, so each key vreg is one
     # load (a packed [S / p, p, D] page tiles VMEM in (p, D) tiles).
     words = cache_ref.bitcast(jnp.uint32).reshape(cache_ref.shape[0], rows, head_dim)
@@ -513,6 +533,19 @@ def _kernel_v3(
     issue_chunks = min(_DMA_ISSUE_CHUNKS, num_chunks)
     per_pair = -(-pages_per_step // (issue_chunks * (chunk // 2)))
 
+    def store_token_major(m_t, first, chunk):
+        """``[Bq, chunk]`` maxima into the token-major block at the group's
+        lane share."""
+        if lane_groups == 1:
+            o_ref[:, pl.ds(first, chunk)] = m_t
+            return
+        share = (work_ref[step] & _GROUP_MASK) % lane_groups
+        for i in range(lane_groups):
+
+            @pl.when(share == i)
+            def _(i=i):
+                o_ref[:, pl.ds(i * pages_per_step + first, chunk)] = m_t
+
     def score_chunk(slot, first, share):
         """Score pages ``[first, first + chunk)``, issuing the ahead group's
         descriptors `share` among the first page pairs (`start`)."""
@@ -540,7 +573,7 @@ def _kernel_v3(
             if row_scale is not None:
                 m = m * row_scale
             if transposed:
-                o_ref[:, pl.ds(first, chunk)] = m
+                store_token_major(m, first, chunk)
             else:
                 o_ref[pl.ds(first, chunk), :] = m.T
             return
@@ -583,7 +616,7 @@ def _kernel_v3(
         if row_scale is not None:
             m = m * row_scale.T
         if transposed:
-            o_ref[:, pl.ds(first, chunk)] = m.T
+            store_token_major(m.T, first, chunk)
         else:
             o_ref[pl.ds(first, chunk), :] = m
 
@@ -794,9 +827,20 @@ def _class_scores(
                 f"token-major scores need kernel v3, got {kernel}"
             )
         out_shape = jax.ShapeDtypeStruct(out_shape.shape[::-1], jnp.float32)
+        # Lane-aligned blocks: groups of fewer than 128 pages share one.
+        lanes = max(pages_per_step, 128)
+        if lanes % pages_per_step or padded_pages % lanes:
+            raise NotImplementedError(
+                f"token-major scores need 128-lane blocks of whole groups, got "
+                f"{pages_per_step} pages per group, {padded_pages} pages"
+            )
+        lane_groups = lanes // pages_per_step
         out_specs = pl.BlockSpec(
-            (block_q, pages_per_step),
-            lambda w, work, *_: (work[w] >> _TILE_SHIFT, work[w] & _GROUP_MASK),
+            (block_q, lanes),
+            lambda w, work, *_: (
+                work[w] >> _TILE_SHIFT,
+                (work[w] & _GROUP_MASK) // lane_groups,
+            ),
         )
     params = pltpu.CompilerParams(
         dimension_semantics=("arbitrary",), disable_bounds_checks=kernel == "v3"
@@ -886,6 +930,7 @@ class _ClassPlan(NamedTuple):
     max_large: int
     is_large: jax.Array
     token_major: bool
+    large_token_major: bool = False
 
 
 def is_prefill_step(num_tokens: int, max_num_seqs: int) -> bool:
@@ -990,6 +1035,18 @@ def class_plan(
         kernel=small_kernel,
         token_major=token_major,
     )
+    pages_per_seq = block_tables.shape[0] // max_num_seqs
+    large_pages = -(-pages_per_seq // pages_per_step) * pages_per_step
+    # Token-major large tiles (`LARGE_TOKEN_MAJOR`): both classes token-major,
+    # in 128-lane blocks of whole page groups.
+    lanes = max(pages_per_step, 128)
+    large_token_major = (
+        LARGE_TOKEN_MAJOR
+        and token_major
+        and large_kernel == "v3"
+        and lanes % pages_per_step == 0
+        and large_pages % lanes == 0
+    )
     large = functools.partial(
         score,
         is_large,
@@ -1002,20 +1059,21 @@ def class_plan(
         + 1,
         pages_per_step=pages_per_step,
         kernel=large_kernel,
+        token_major=large_token_major,
         # fp8 queries on the prefill tiles only: the decode tiles are bound by
         # the key stream into the MXU, not its rate, and gain nothing.
         fp8_q=fp8_q,
     )
-    pages_per_seq = block_tables.shape[0] // max_num_seqs
     return _ClassPlan(
         small=small,
         large=large,
         small_block_q=tile,
         large_block_q=large_block_q,
-        large_pages=-(-pages_per_seq // pages_per_step) * pages_per_step,
+        large_pages=large_pages,
         max_large=max_large,
         is_large=is_large,
         token_major=token_major,
+        large_token_major=large_token_major,
     )
 
 
@@ -1114,6 +1172,24 @@ def block_scores(
     if max_large == 0:
         return small_only()[:, None, :]
 
+    def with_large_token_major():
+        large, large_col, *_ = plan.large()
+        tok = jnp.arange(num_tokens, dtype=jnp.int32)
+        seq = jnp.minimum(
+            jnp.searchsorted(
+                cu_q_lens[1:], tok, side="right", method="compare_all"
+            ).astype(jnp.int32),
+            max_num_seqs - 1,
+        )
+        small_p, large_p = (
+            jnp.pad(x, ((0, 0), (0, pages - x.shape[1]))) for x in (small, large)
+        )
+        # Row gathers of each class and a select: no transpose of either
+        # class's scores.
+        return jnp.where(
+            lookup(is_large, seq)[:, None], large_p[large_col], small_p[small_col]
+        )
+
     def with_large():
         large, large_col, *_ = plan.large()
         small_t = small.T if token_major else small
@@ -1132,6 +1208,8 @@ def block_scores(
         )
         return jnp.concatenate([small_t, large], axis=1)[:, col].T
 
+    if plan.large_token_major:
+        with_large = with_large_token_major  # noqa: F811
     if is_prefill_step(num_tokens, max_num_seqs):
         # More rows than a batch of decode requests: a prefill step. A
         # conditional would wait for the gather (offloaded to the SparseCore)
