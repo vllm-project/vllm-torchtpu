@@ -31,21 +31,10 @@ CPU; the kernel itself is covered by
 `tests/kernels/test_dsv4_streamindex_topk.py`.
 """
 
-import contextlib
-from types import SimpleNamespace
-from unittest.mock import patch
-
 import pytest
 import torch
-import vllm.model_executor.custom_op as custom_op_mod
-import vllm.model_executor.layers.linear as linear_mod
-import vllm.model_executor.models.deepseek_v2 as deepseek_v2
-import vllm.model_executor.parameter as parameter_mod
-from vllm.config import CacheConfig, DeviceConfig, VllmConfig, set_current_vllm_config
-from vllm.config.compilation import CompilationConfig, CompilationMode
-from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
-from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache, Indexer
 
+from tests.layers.adapter.indexer_test_utils import build_indexer, make_rope
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
 
 # Small stand-in for the DeepSeek-V3.2 indexer config. `head_dim` is kept at
@@ -59,22 +48,6 @@ HIDDEN_SIZE = 64
 TOPK = 8
 MAX_MODEL_LEN = 256
 FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
-
-
-class _StubIndexerCache(DeepseekV32IndexerCache):
-    """Stands in for `DeepseekV32IndexerCache` (needs a real KV cache config).
-
-    Subclasses the real cache so `VllmTPUIndexer.rebind` can retype it --
-    `__class__` assignment requires a compatible instance layout -- but skips
-    its `__init__`, which registers into `static_forward_context`.
-    """
-
-    def __init__(self, head_dim, dtype, prefix, cache_config):
-        torch.nn.Module.__init__(self)
-        self.head_dim = head_dim
-        self.dtype = dtype
-        self.prefix = prefix
-        self.cache_config = cache_config
 
 
 class _RecordingIndexerOp:
@@ -97,61 +70,21 @@ class _RecordingIndexerOp:
         return self.calls[-1]
 
 
-@contextlib.contextmanager
-def _default_dtype(dtype):
-    previous = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(previous)
-
-
 def _build_indexer(dtype=torch.float32, n_head=N_HEAD, buffer_tokens=32):
-    """A `VllmTPUIndexer` with the TPU-only collaborators stubbed out.
-
-    The linear layers query the TP group at construction time, so TP rank/size
-    are pinned to a single rank instead of standing up a distributed group.
-    """
-    config = SimpleNamespace(
-        index_topk=TOPK,
-        index_n_heads=n_head,
-        index_head_dim=HEAD_DIM,
-        qk_rope_head_dim=ROPE_DIM,
+    """A `VllmTPUIndexer` on `_RecordingIndexerOp`, with the TPU-only
+    collaborators stubbed out."""
+    return build_indexer(
+        sparse_attn_indexer=_RecordingIndexerOp,
+        dtype=dtype,
+        n_head=n_head,
+        head_dim=HEAD_DIM,
+        rope_dim=ROPE_DIM,
+        hidden_size=HIDDEN_SIZE,
+        q_lora_rank=Q_LORA_RANK,
+        topk=TOPK,
+        max_model_len=MAX_MODEL_LEN,
+        buffer_tokens=buffer_tokens,
     )
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=MAX_MODEL_LEN),
-        # VllmConfig resolves this to 5 for a max_model_len up to 256K.
-        attention_config=SimpleNamespace(sparse_mla_prefill_workspace_factor=5),
-    )
-    topk_indices_buffer = torch.full((buffer_tokens, TOPK), -1, dtype=torch.int32)
-
-    # `VllmTPUIndexer` has no `__init__`: it is a retype of an in-tree `Indexer`
-    # that `DeepseekV2MLAAttention` has already built. So build the in-tree
-    # layer -- stubbing the collaborators where *it* looks them up -- and then
-    # rebind, exactly as `VllmTPUMultiHeadLatentAttentionWrapper` does.
-    with (
-        patch.object(deepseek_v2, "DeepseekV32IndexerCache", _StubIndexerCache),
-        patch.object(deepseek_v2, "SparseAttnIndexer", _RecordingIndexerOp),
-        patch.object(linear_mod, "get_tensor_model_parallel_rank", lambda: 0),
-        patch.object(linear_mod, "get_tensor_model_parallel_world_size", lambda: 1),
-        patch.object(parameter_mod, "get_tensor_model_parallel_rank", lambda: 0),
-        patch.object(parameter_mod, "get_tensor_model_parallel_world_size", lambda: 1),
-        _default_dtype(dtype),
-        # The in-tree layers read the current config while being built.
-        set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))),
-    ):
-        indexer = Indexer(
-            vllm_config=vllm_config,
-            config=config,
-            hidden_size=HIDDEN_SIZE,
-            q_lora_rank=Q_LORA_RANK,
-            quant_config=None,
-            cache_config=CacheConfig(),
-            topk_indices_buffer=topk_indices_buffer,
-            prefix="model.layers.0.self_attn.indexer",
-        )
-        return mla_attention_op.VllmTPUIndexer.rebind(indexer)
 
 
 def _randomize(layer, seed=0):
@@ -170,26 +103,10 @@ def _randomize(layer, seed=0):
 
 
 def _make_rope(dtype=torch.float32):
-    """A real NeoX `RotaryEmbedding`, as `get_rope` would build for the indexer.
-
-    `CustomOp.__init__` resolves its forward at construction time and needs a
-    current vLLM config for that; a bare CompilationConfig is enough and binds
-    `forward_native` (the TPU dispatch target is `forward_native` too).
-    """
-    compilation_config = CompilationConfig(
-        mode=CompilationMode.NONE, custom_ops=["none"]
+    """A real NeoX `RotaryEmbedding`, as `get_rope` would build for the indexer."""
+    return make_rope(
+        rope_dim=ROPE_DIM, max_position_embeddings=MAX_MODEL_LEN, dtype=dtype
     )
-    with patch.object(
-        custom_op_mod, "get_cached_compilation_config", lambda: compilation_config
-    ):
-        return RotaryEmbedding(
-            head_size=ROPE_DIM,
-            rotary_dim=ROPE_DIM,
-            max_position_embeddings=MAX_MODEL_LEN,
-            base=10000.0,
-            is_neox_style=True,
-            dtype=dtype,
-        )
 
 
 def _inputs(num_tokens, dtype=torch.float32, seed=1):
