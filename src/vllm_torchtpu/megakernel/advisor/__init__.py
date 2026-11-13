@@ -15,15 +15,25 @@
 
 from __future__ import annotations
 
-from . import chips, constants, models, specs
+from . import (
+    chips,
+    constants,
+    models,
+    roofline,
+    spec_bridge,
+    specs,
+    support,
+    verdict,
+    vmem,
+)
 from .chips import (
     BUILTIN_CHIP_SPECS,
+    ChipSpec,
+    FieldSource,
     REQUIRED_CHIP_SPEC_KEYS,
     SUPPORTED_CHIPS,
     TPU6E_TOPOLOGIES,
     TPU7X_TOPOLOGIES,
-    ChipSpec,
-    FieldSource,
     UnsupportedChipError,
     build_builtin_chip_spec,
     detect_tpu_from_sysfs,
@@ -57,8 +67,11 @@ from .models import (
     resolve_model_profile,
     supports_hf_config,
 )
+from .roofline import validate_workload
+from .spec_bridge import advise_from_spec
 from .specs import (
     SUPPORTED_ONCHIP_FAMILIES,
+    AdvisorReport,
     CollectiveCall,
     DispatchRegime,
     EfficiencySpec,
@@ -73,17 +86,34 @@ from .specs import (
     ProvenanceMetric,
     ProvenanceTag,
     RingPlan,
+    ScopeEstimate,
     SupportStatus,
     WorkloadSpec,
     default_double_buffer_ring_plan,
     load_measurements,
 )
+from .support import CORE_LIMITS, CoreLimits, evaluate_support
+from .verdict import (
+    advise,
+    compare_parallelism_candidates,
+    compute_scope_raw_step_us,
+    search_layer_groups,
+)
+from .vmem import (
+    compute_all_reduce_transfer_cost,
+    compute_per_token_vmem_bytes,
+    fit_vmem_budget_bytes,
+    validate_advise_inputs,
+)
 
 __all__ = [
+    "AdvisorReport",
     "BUILTIN_CHIP_SPECS",
+    "CORE_LIMITS",
     "ChipSpec",
     "CollectiveCall",
     "CollectiveStepKind",
+    "CoreLimits",
     "DEPLOYMENT_PRESETS",
     "DEPLOYMENT_PRESET_SOURCES",
     "DeclaredCollectiveStep",
@@ -115,17 +145,26 @@ __all__ = [
     "SUPPORTED_CHIPS",
     "SUPPORTED_MODEL_TYPES",
     "SUPPORTED_ONCHIP_FAMILIES",
+    "ScopeEstimate",
     "SupportStatus",
     "TPU6E_TOPOLOGIES",
     "TPU7X_TOPOLOGIES",
     "UnsupportedArchitectureError",
     "UnsupportedChipError",
     "WorkloadSpec",
+    "advise",
+    "advise_from_spec",
     "build_builtin_chip_spec",
     "chips",
+    "compare_parallelism_candidates",
+    "compute_all_reduce_transfer_cost",
+    "compute_per_token_vmem_bytes",
+    "compute_scope_raw_step_us",
     "constants",
     "default_double_buffer_ring_plan",
     "detect_tpu_from_sysfs",
+    "evaluate_support",
+    "fit_vmem_budget_bytes",
     "load_chip_spec_file",
     "load_measurements",
     "load_public_calibration",
@@ -138,6 +177,14 @@ __all__ = [
     "resolve_chip_spec",
     "resolve_hf_snapshot_config",
     "resolve_model_profile",
+    "roofline",
+    "search_layer_groups",
+    "spec_bridge",
     "specs",
+    "support",
     "supports_hf_config",
+    "validate_advise_inputs",
+    "validate_workload",
+    "verdict",
+    "vmem",
 ]
