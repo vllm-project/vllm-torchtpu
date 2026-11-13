@@ -107,10 +107,10 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
         case "silu":
             return jax.nn.silu(acc_gate) * acc_up
         case "silu_bf16":
-            # Reproduce the bfloat16 roundings of standalone SiluAndMul (vLLM
-            # GPU path / TpuGroupedExperts); bfloat16 is intentional because the
-            # platform forces bfloat16 model activations, and only SiLU is
-            # targeted here.
+            # Reproduce standalone SiluAndMul (vLLM GPU path / TpuGroupedExperts)
+            # bfloat16 roundings (bfloat16 and targeting only SiLU are
+            # intentional): round gate/up to bfloat16, evaluate silu in float32,
+            # and round silu(gate) back to bfloat16 before multiplying.
             gate_bf16 = acc_gate.astype(jnp.bfloat16)
             up_bf16 = acc_up.astype(jnp.bfloat16)
             silu_bf16 = jax.nn.silu(gate_bf16.astype(jnp.float32)).astype(jnp.bfloat16)

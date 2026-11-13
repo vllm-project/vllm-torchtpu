@@ -851,13 +851,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_TOPK_WEIGHTS_FLOAT32": env_bool(
         "TPU_MOE_TOPK_WEIGHTS_FLOAT32", default=False
     ),
-    # Round fused SwiGLU (silu) intermediate gate, up, and silu(gate) values to
-    # bfloat16 in fused_moe_gmm's gmm_v2 kernel to reproduce standalone
-    # SiluAndMul (vLLM GPU path / TpuGroupedExperts) rounding in RL and
-    # distillation workloads. Off by default to preserve existing serving
-    # numerics until full-model accuracy evaluations across supported SiLU MoE
-    # checkpoints validate making it the default (at which point this flag is
-    # removed).
+    # Round fused SwiGLU (silu) intermediates to bfloat16 in fused_moe_gmm's
+    # gmm_v2 kernel to match standalone SiluAndMul rounding in RL/distillation
+    # workloads (default off until validated across SiLU MoE models).
     "TPU_MOE_SILU_BF16": env_bool("TPU_MOE_SILU_BF16", default=False),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
