@@ -85,7 +85,8 @@ def _sorts_local_routes(tokens):
 def _sort_rows(tokens):
     """Rows (128 route keys each) of a ``tokens`` launch's sort buffer."""
     if _sorts_local_routes(tokens):
-        # The compact capacity plus one chunk's spill past its last route.
+        # The compact capacity plus the last append's 17-row window, in
+        # whole 8-row tiles.
         return _route_capacity(tokens) // 128 + 24
     return tokens // 8
 
@@ -905,7 +906,7 @@ def _prologue(
             # The compaction (one step per 128 tokens) goes between the passes'
             # 24 GU products each, the sort's steps between their 56 down
             # products, which have half their MXU work to hide under.
-            gu_steps, down_steps = -(-rows // 4 // (24 * passes)), 1
+            gu_steps, down_steps = pl.cdiv(rows // 4, 24 * passes), 1
 
         rings = []  # big: the latent ring of every pass's rows, once started
 

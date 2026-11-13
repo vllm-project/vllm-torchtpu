@@ -171,14 +171,24 @@ class _ArrayRef:
 
 @pytest.mark.parametrize(
     ("tokens", "hot"),
-    [(512, 0), (2048, 0), (4096, 0), (8192, 0), (16384, 0), (16384, 0.19)],
+    [
+        (512, 0),
+        (2048, 0),
+        (4096, 0),
+        (8192, 0),
+        (16384, 0),
+        (16384, 0.19),
+        (16384, 0.25),
+    ],
 )
 @pytest.mark.parametrize("local_experts", [56])
 def test_metadata_steps_ep16(monkeypatch, tokens, hot, local_experts):
     """Counts, group maximum and the expert-major/token-major local routes.
 
     ``hot`` moves that fraction of the routes onto group 0, which brings its
-    ranks' local routes close to the 16K compact capacity.
+    ranks' local routes close to (0.19) or past (0.25) the 16K compact
+    capacity; past it the launch is redone, and only its counts and maximum
+    must hold.
     """
     import jax
     from jax.experimental import pallas as pl
@@ -287,7 +297,9 @@ def test_metadata_steps_ep16(monkeypatch, tokens, hot, local_experts):
         expected_counts = hist_896[first_exp : first_exp + local_experts]
         np.testing.assert_array_equal(np.asarray(counts_out), expected_counts)
         total_local = int(expected_counts.sum())
-        assert total_local <= fused._route_capacity(tokens)
+        if total_local > fused._route_capacity(tokens):
+            assert expected_max_group == total_local and hot
+            continue
         expected_routes = []
         for e in range(first_exp, first_exp + local_experts):
             tok_idx, slot_idx = np.where((ids_all == e) & live_mask)
