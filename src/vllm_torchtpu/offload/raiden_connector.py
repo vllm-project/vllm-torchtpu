@@ -286,6 +286,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     # TPU_RAIDEN_FLUSH_REAL_REUSE / TPU_RAIDEN_LOSS_TRACE; `_fresh_block_ids`
     # collects the blocks the pool hands out between two connector metas.
     _flush_real_reuse = False
+    _wb_drop_covered = False
     _loss_trace = False
     _fresh_block_ids: set[int] | None = None
 
@@ -329,15 +330,19 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             )
         self._flush_real_reuse = bool(tpu_envs.TPU_RAIDEN_FLUSH_REAL_REUSE)
         self._loss_trace = bool(tpu_envs.TPU_RAIDEN_LOSS_TRACE)
+        self._wb_drop_covered = bool(tpu_envs.TPU_RAIDEN_WB_DROP_COVERED)
         self._traced_req_ids: set[str] = set()
         if self._loss_trace:
             self._raiden_manager.enable_loss_trace()
-        if self._flush_real_reuse or self._loss_trace:
+        if self._flush_real_reuse or self._loss_trace or self._wb_drop_covered:
             logger.info(
                 "TPURaidenOffloadingConnector: TPU_RAIDEN_FLUSH_REAL_REUSE=%s "
                 "(flush stores only for blocks the pool hands out fresh, not "
-                "prefix hits), TPU_RAIDEN_LOSS_TRACE=%s",
+                "prefix hits), TPU_RAIDEN_WB_DROP_COVERED=%s (write-back drops "
+                "a held request only on reallocation or full prefix-hit "
+                "cover), TPU_RAIDEN_LOSS_TRACE=%s",
                 self._flush_real_reuse,
+                self._wb_drop_covered,
                 self._loss_trace,
             )
 
@@ -358,7 +363,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 else WriteBackPolicy.window_blocks
             ),
         )
-        if self._flush_real_reuse and not getattr(
+        if (self._flush_real_reuse or self._wb_drop_covered) and not getattr(
             block_pool, "_tpu_raiden_fresh_watch", False
         ):
             fresh: set[int] = set()
@@ -383,6 +388,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         super()._update_req_states(scheduler_output)
         fresh = self._fresh_block_ids
         if fresh is None:
+            return
+        if not self._flush_real_reuse:
+            fresh.clear()
             return
         allocated = self._current_batch_allocated_block_ids
         if self._offload_stats and self._block_id_to_pending_jobs:
@@ -518,6 +526,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             logger.info(
                 "Raiden offload flush stats: drains %d calls %d jobs %.1f ms | "
                 "hit-only flushes skipped: parked %d (%d keys) launched %d | "
+                "write-back covered drops %d, partial hits kept %d | "
                 "lookups missing >=8k tokens: %s",
                 c["drain_calls"],
                 c["drain_jobs"],
@@ -525,6 +534,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 c["hitflush_skipped_parked"],
                 c["hitflush_skipped_parked_keys"],
                 c["hitflush_skipped_launched"],
+                c["drop_covered"],
+                c["kept_partial_hit"],
                 " ".join(
                     f"{k[len('miss8k_'):]}={c[k]}/{c['miss8k_tok_' + k[len('miss8k_'):]]}"
                     for k in sorted(c)
@@ -556,8 +567,33 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             hits = _prefix_hit_block_ids(scheduler_output, self.config)
             self.wb_counters["drop_blocks_hit"] += len(reused & hits)
             self.wb_counters["drop_blocks_fresh"] += len(reused - hits)
-        for req_id in {r for bid in reused for r in self._wb_owners.get(bid, ())}:
-            self._wb_drop(req_id)
+        fresh = self._fresh_block_ids if self._wb_drop_covered else None
+        if fresh is None:
+            for req_id in {r for bid in reused for r in self._wb_owners.get(bid, ())}:
+                self._wb_drop(req_id)
+        else:
+            # Reallocated blocks lose their contents: drop their holders. A
+            # prefix hit keeps the contents: drop a holder only when this
+            # step's hits cover all of its blocks (its successor now holds the
+            # whole chain); a partial hit (a sibling sharing the prefix) keeps
+            # it held. Hit blocks stay registered, so their later reallocation
+            # still drops the holder before its store could read them.
+            realloc = reused & fresh
+            hit = reused - fresh
+            owners_of = lambda bids: {  # noqa: E731
+                r for bid in bids for r in self._wb_owners.get(bid, ())
+            }
+            for req_id in owners_of(realloc):
+                self._wb_drop(req_id)
+            for req_id in owners_of(hit):
+                blocks = self._wb_blocks.get(req_id)
+                if blocks is None:
+                    continue
+                if blocks <= allocated:
+                    self.wb_counters["drop_covered"] += 1
+                    self._wb_drop(req_id)
+                else:
+                    self.wb_counters["kept_partial_hit"] += 1
         flush = self._wb_near_eviction()
         for req_id in flush:
             self._wb_unregister(req_id)

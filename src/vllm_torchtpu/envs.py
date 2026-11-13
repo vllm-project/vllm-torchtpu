@@ -208,6 +208,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_OFFLOAD_STATS: bool = False
     TPU_RAIDEN_FLUSH_REAL_REUSE: bool = False
     TPU_RAIDEN_LOSS_TRACE: bool = False
+    TPU_RAIDEN_WB_DROP_COVERED: bool = False
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -1318,6 +1319,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and, for each request whose host lookup stops >= 8k tokens short of its
     # prompt, log why the first missing key is missing; time store drains.
     "TPU_RAIDEN_LOSS_TRACE": env_bool("TPU_RAIDEN_LOSS_TRACE", default=False),
+    # Write-back: a held (finished, not yet stored) request is dropped
+    # unstored only when the pool reallocates one of its blocks or one step's
+    # prefix hits cover all of its blocks (the conversation's next turn now
+    # holds the chain), not on any prefix hit. A subagent hitting a parent's
+    # shared prefix no longer drops the parent's chain. Scheduler-side.
+    "TPU_RAIDEN_WB_DROP_COVERED": env_bool(
+        "TPU_RAIDEN_WB_DROP_COVERED", default=False
+    ),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
