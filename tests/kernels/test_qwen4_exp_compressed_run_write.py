@@ -60,3 +60,31 @@ def test_capacity_bounds_the_writers():
     for tokens, requests in ((8192, 33), (32, 8), (8, 8)):
         cap = compressed_write.writer_capacity(tokens, requests, 4)
         assert cap >= tokens // 8 + 2 * requests and cap % 8 == 0
+
+
+@pytest.mark.parametrize("layout", ["fp8_paired_slot1_packed_k", "bf16_whole_rows"])
+@pytest.mark.parametrize("case", ["prefill_mixed", "ragged", "verify"])
+def test_packed_mask_matches_write_compressed(
+    interpret,  # noqa: F811
+    monkeypatch,
+    case,
+    layout,
+):
+    # Force the one-int32-per-writer half mask (the >8192-token step layout).
+    dtype, options = LAYOUTS[layout]
+    query_lens, contexts = CASES[case]
+    args = make_step(np.random.default_rng(7), query_lens, contexts, dtype)
+    options = {**options, "max_query_len": max(query_lens)}
+    expected = written(monkeypatch, False, args, options)
+    monkeypatch.setattr(compressed_write, "MASK_2D_MAX_CAP", 0)
+    got = written(monkeypatch, True, args, options)
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_mask_layout_fits_smem():
+    # 2-D int32 SMEM rows pad to 128 words; the 2-D mask must stay < 1 MiB and
+    # 8192-token steps (32 requests, ratio 4) must keep the 2-D layout.
+    cap_8k = compressed_write.writer_capacity(8192, 32, 4)
+    cap_16k = compressed_write.writer_capacity(16384, 32, 4)
+    assert cap_8k <= compressed_write.MASK_2D_MAX_CAP < cap_16k
+    assert compressed_write.MASK_2D_MAX_CAP * 128 * 4 < (1 << 20) - (64 << 10)
