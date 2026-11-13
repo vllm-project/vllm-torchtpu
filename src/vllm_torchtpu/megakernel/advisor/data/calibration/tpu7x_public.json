@@ -1,0 +1,37 @@
+{
+  "schema": "advisor.measurements.v1",
+  "source": {
+    "kind": "architectural_prior",
+    "file": "tpu7x_reference_priors",
+    "chip": "tpu7x",
+    "phase": "decode",
+    "model": "synthetic_60l_moe",
+    "tp": 8,
+    "ep": 8,
+    "ranks": 8
+  },
+  "collectives": [
+    {
+      "op": "all-gather",
+      "group_size": 8,
+      "bytes": 0,
+      "latency_us": 3.0,
+      "n": 0
+    },
+    {
+      "op": "all-reduce",
+      "group_size": 8,
+      "bytes": 0,
+      "latency_us": 3.0,
+      "n": 0
+    }
+  ],
+  "launch_gap_us": {
+    "p50": 1.0,
+    "p90": 1.5,
+    "n": 0,
+    "step_idle_gap_us": 120.0,
+    "num_layers_norm": 60,
+    "unit": "us_per_sublayer_boundary"
+  }
+}
