@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
+from vllm_torchtpu.models.minimax_m3 import norm_rope
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_dcp_op,
@@ -241,9 +242,18 @@ def norm_rope_heads(
     )
     eps = q_norm.variance_epsilon
     assert all(n.variance_epsilon == eps for n in norms)
-    x = ir.ops.rms_norm(x, weight, eps)
-    x, _ = rotary_emb(positions, x.reshape(num_tokens, -1), None)
-    x = x.view(num_tokens, -1, head_dim)
+    if norm_rope.applies(num_tokens, qkv, rotary_emb):
+        # The norms' rsqrt as `ir_ops.rms_norm` computes it; the apply and the
+        # rope run in one Pallas pass over qkv (same values).
+        variance = x.to(torch.float32).pow(2).mean(dim=-1)
+        r = torch.rsqrt(variance + eps)
+        x = norm_rope.fused_norm_rope(
+            qkv, positions, r, weight, nq, nkv, head_dim, rotary_emb
+        )
+    else:
+        x = ir.ops.rms_norm(x, weight, eps)
+        x, _ = rotary_emb(positions, x.reshape(num_tokens, -1), None)
+        x = x.view(num_tokens, -1, head_dim)
     q, k, index_q, index_k = x.split([nq, nkv, nkv, 1], dim=1)
     return (
         q.reshape(num_tokens, -1),

@@ -225,6 +225,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS: int = 0
 
 
 def env_with_choices(
@@ -1390,6 +1391,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of two (`models.minimax_m3.dcp_pack`). 0 keeps two gathers.
     "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 steps of at least this many tokens apply the per-head q / k /
+    # index norms and the partial RoPE in one Pallas pass
+    # (`models.minimax_m3.kernels.norm_rope`) instead of five XLA passes. The
+    # norms' rsqrt stays in XLA, so the values are the same. 0 = off.
+    "TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_FUSED_NORM_ROPE_MIN_TOKENS", 0
     ),
 }
 
