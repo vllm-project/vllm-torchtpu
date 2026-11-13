@@ -82,9 +82,16 @@ def load_counts(
     return counts
 
 
+_OPTIONS = ("weight", "plan", "windows")
+
+
 def parse_run(spec: str) -> tuple[Path, float, str, tuple[int, int] | None]:
-    """``DIR[:weight=W][:plan=NPZ][:windows=A-B]``."""
-    directory, *options = spec.split(":")
+    """``DIR[:weight=W][:plan=NPZ][:windows=A-B]`` (options trail the
+    directory, which may itself contain colons)."""
+    parts = spec.split(":")
+    options = []
+    while len(parts) > 1 and parts[-1].partition("=")[0] in _OPTIONS:
+        options.insert(0, parts.pop())
     weight, plan, windows = 1.0, "", None
     for option in options:
         key, _, value = option.partition("=")
@@ -92,12 +99,12 @@ def parse_run(spec: str) -> tuple[Path, float, str, tuple[int, int] | None]:
             weight = float(value)
         elif key == "plan":
             plan = value
-        elif key == "windows":
+        else:
             first, _, last = value.partition("-")
             windows = (int(first), int(last))
-        else:
-            raise SystemExit(f"--counts {spec}: unknown option {key!r}")
-    return Path(directory), weight, plan, windows
+            if not 1 <= windows[0] <= windows[1]:
+                raise SystemExit(f"--counts {spec}: windows A-B needs 1 <= A <= B")
+    return Path(":".join(parts)), weight, plan, windows
 
 
 def _place_layer(loads: np.ndarray, max_swaps: int) -> list[np.ndarray]:
