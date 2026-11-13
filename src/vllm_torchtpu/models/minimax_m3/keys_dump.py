@@ -36,7 +36,7 @@ MAX_DUMPS = int(os.environ.get("MINIMAX_MSA_DUMP_MAX", "40"))
 # Save every STRIDE-th served prefill forward, to sample the whole run.
 STRIDE = int(os.environ.get("MINIMAX_MSA_DUMP_STRIDE", "10"))
 DUMP_RANKS = tuple(
-    int(r) for r in os.environ.get("MINIMAX_MSA_DUMP_RANKS", "0,3").split(",")
+    int(r) for r in os.environ.get("MINIMAX_MSA_DUMP_RANKS", "0,3").replace("/", ",").split(",")
 )
 SMALL_BATCH_TOKENS = 1024  # msa_attention.SMALL_BATCH_TOKENS
 
