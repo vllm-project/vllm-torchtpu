@@ -972,6 +972,8 @@ _LANE_SPLIT_LAYOUTS = {
     "cut": ([100, Q_LEN - 100], [KV_LEN, KV_LEN - 1000]),
     "edge": ([Q_LEN // 2, Q_LEN // 2], [KV_LEN - 7, KV_LEN]),
     "mixed": ([4, 4, 4, Q_LEN - 12], [KV_LEN - 5, 9000, KV_LEN, KV_LEN - 300]),
+    # Lane 0 gets a near-empty-context request, lane 1 a full one.
+    "skew": ([Q_LEN // 2, Q_LEN // 2], [Q_LEN // 2, KV_LEN]),
 }
 
 
@@ -1023,3 +1025,52 @@ def test_lane_split_matches_the_unsplit_result_on_a_lane_mesh(merge, layout):
     # Positive control: swapped lane ids score each other's halves, which the
     # all-gather then puts back in the wrong order.
     assert (run((1, 0), True) != want).any()
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("layout", sorted(_LANE_SPLIT_LAYOUTS))
+def test_lane_split_chunk_gather_matches_the_unsplit_result(layout, monkeypatch):
+    """TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER: per-chunk lane all-gathers (4
+    chunks a lane) must reassemble the unsplit answer exactly."""
+    from vllm_torchtpu import envs
+
+    _need_devices(8)
+    _require_sparsecore()
+    dcp = 4
+    _, args, kwargs = _dcp_case(dcp, 61)
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()[:8]).reshape(2, dcp), ("lane", DCP_AXIS_NAME)
+    )
+    shards = jax.device_put(
+        np.asarray(args[2]), jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))
+    )
+    q_lens, seq_lens = _LANE_SPLIT_LAYOUTS[layout]
+    n = len(q_lens)
+    lane_args = (
+        args[0],
+        args[1],
+        shards,
+        jnp.array(seq_lens, jnp.int32),
+        jnp.tile(args[4], n),
+        jnp.array(np.concatenate([[0], np.cumsum(q_lens)]), jnp.int32),
+        jnp.array([0, 0, n], jnp.int32),
+    )
+    lane_kwargs = dict(kwargs, mesh=mesh, hist_merge=True, chunk_tokens=Q_LEN // 8)
+
+    def run(lane_ids, lane_split, chunk_gather):
+        monkeypatch.setattr(
+            envs, "TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER", chunk_gather
+        )
+        jax.clear_caches()
+        ids = _per_device_ids(mesh, [[lane] for lane in lane_ids for _ in range(dcp)])
+        return np.asarray(
+            streamindex_topk_dcp(
+                *lane_args, **lane_kwargs, dcp_lane_ids=ids, lane_split=lane_split
+            )
+        )
+
+    want = run((0, 1), False, False)
+    np.testing.assert_array_equal(run((0, 1), True, True), want)
+    assert (want >= 0).any()
+    # Positive control: swapped lane ids put the chunks back in the wrong order.
+    assert (run((1, 0), True, True) != want).any()

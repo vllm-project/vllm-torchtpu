@@ -1286,6 +1286,7 @@ def _effective_row_lengths(
         "enable_early_exit",
         "kv_layout",
         "chunk_tokens",
+        "lane_gather_axis",
         "cp_size",
         "interleave_size",
         "return_scores",
@@ -1319,6 +1320,7 @@ def streamindex_topk(
     enable_early_exit: bool = False,
     kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_tokens: int | None = None,
+    lane_gather_axis: str | None = None,
     cp_size: int = 1,
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
@@ -1369,6 +1371,9 @@ def streamindex_topk(
       kv_layout: memory layout of `cache_kv`. `SEQ_ALONG_LANE` removes the lane
         padding that per-token quantization forces on `HEAD_ALONG_SUBLANE` and is
         therefore substantially faster whenever the kernel is HBM bound.
+      lane_gather_axis: all-gather each chunk's top-k over this mesh axis as soon
+        as it is done, so the gathers overlap the later chunks' scoring, and
+        return every lane's rows, lane-major (TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER).
       chunk_tokens: size, in tokens, of each piece to cut the flat token axis
         into. Each piece scores into its own buffer and runs its own SparseCore
         top-k, and consecutive pieces share an XLA scheduling group so chunk i's
@@ -1896,6 +1901,7 @@ def streamindex_topk(
         passes = tuple((spec, _meta(spec)) for spec in _pass_specs(decode_batch_end))
         topk_idxs = []
         topk_scores_list = []
+        lane_parts = []
         tied = ()
         for m in range(num_chunks):
             # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
@@ -1994,11 +2000,21 @@ def streamindex_topk(
                     return_scores=False,
                 )
             topk_idxs.append(chunk_topk_idxs)
+            if lane_gather_axis is not None:
+                lane_parts.append(
+                    lax.all_gather(
+                        chunk_topk_idxs[:, :k], lane_gather_axis, axis=0, tiled=False
+                    )
+                )
 
+        extra = (tied,) if final_sc_tie else ()
+        if lane_gather_axis is not None:
+            # [chunk, lane, row, k] -> every lane's rows, lane-major.
+            out = jnp.stack(lane_parts).transpose(1, 0, 2, 3).reshape(-1, k)
+            return (out, *extra) if extra else out
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
         out = out[:max_num_tokens, :k]
 
-        extra = (tied,) if final_sc_tie else ()
         if cp_size == 1 and not return_scores:
             return (out, *extra) if extra else out
 
@@ -2037,6 +2053,8 @@ def streamindex_topk(
 
     if not enable_early_exit:
         return _common_path(None)
+    if lane_gather_axis is not None:
+        raise ValueError("lane_gather_axis needs enable_early_exit=False")
     if final_sc_tie:
         raise ValueError("final_sc_tie needs enable_early_exit=False")
     return jax.lax.cond(
@@ -2338,6 +2356,12 @@ def streamindex_topk_dcp(
 
     if lane_split and pin:
         raise ValueError("lane_split cannot pin the overlap work to the local top-k.")
+    from vllm_torchtpu import envs as _lane_envs
+
+    # The hist merge's chunks already hold this rank's share of the top-k.
+    chunk_gather = (
+        lane_split and hist_merge and _lane_envs.TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER
+    )
 
     def _local(
         q,
@@ -2414,6 +2438,7 @@ def streamindex_topk_dcp(
             decode_pack=decode_pack,
             shared_meta=shared_meta,
             dcp_axis_name=dcp_axis_name if hist_merge else None,
+            lane_gather_axis=lane_axis if chunk_gather else None,
         )
         scores = None
         if pin:
@@ -2441,7 +2466,7 @@ def streamindex_topk_dcp(
                 scores, ov = lax.optimization_barrier((scores, ov))
 
         def _ret(topk, merge_pinned=False):
-            if lane_split:
+            if lane_split and not chunk_gather:
                 topk = lax.all_gather(topk, lane_axis, axis=0, tiled=True)
             if overlap_fn is None:
                 return topk

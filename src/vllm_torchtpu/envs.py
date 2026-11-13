@@ -177,6 +177,7 @@ if TYPE_CHECKING:
     TPU_DCP_INDEXER_HIST_MERGE: bool = True
     TPU_DCP_INDEXER_LANE_SPLIT: bool = False
     TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS: int = 512
+    TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = 4
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
@@ -1481,6 +1482,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # which hold replicas of one KV shard; a lane all-gather restores them.
     "TPU_DCP_INDEXER_LANE_SPLIT": env_bool("TPU_DCP_INDEXER_LANE_SPLIT", default=False),
     # Smallest padded token bucket that takes TPU_DCP_INDEXER_LANE_SPLIT.
+    # With the hist merge, all-gather each top-k chunk over the lanes as soon as
+    # it is done, overlapping the later chunks' scoring, instead of once at the
+    # end. Same result.
+    "TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER": env_bool(
+        "TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER", default=False
+    ),
     "TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS": env_nonnegative_int(
         "TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS", 512
     ),
