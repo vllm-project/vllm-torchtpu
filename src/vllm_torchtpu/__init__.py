@@ -515,10 +515,38 @@ def _patch_vllm_compile_all_ranges() -> None:
 
             compile_entry(backend, range_entry)
 
+    def compile_rank_dependent(pairs, local_rank: int) -> None:
+        """A rank-dependent graph's artifacts are salted with the rank (see
+        graph_fingerprint), so no peer replays them: every rank compiles every
+        range itself, then the ranks agree, so one rank failing alone (say, a
+        single-rank VMEM OOM) fails all of them instead of leaving its peers
+        running an SPMD program it never joins."""
+        from vllm_torchtpu.compilation.tpu_compiler import agree_all_ranks
+
+        ok = True
+        try:
+            compile_rotated(pairs, local_rank)
+        except Exception:
+            ok = False
+            agree_all_ranks(False)
+            raise
+        if not agree_all_ranks(ok):
+            raise RuntimeError(
+                "Compiling a rank-dependent graph failed on another rank; "
+                "see that rank's log."
+            )
+
     def compile_ranges(pairs) -> None:
         local_rank = int(os.environ["LOCAL_RANK"])
         if not envs.TPU_PRECOMPILE_PEER_REPLAY:
             compile_rotated(pairs, local_rank)
+            return
+        from vllm_torchtpu.compilation.graph_fingerprint import (
+            graph_is_rank_dependent,
+        )
+
+        if any(graph_is_rank_dependent(b.graph) for b, _ in pairs):
+            compile_rank_dependent(pairs, local_rank)
             return
         # Peers hand a compiled range over through vLLM's compile cache
         # (TpuCompilerAdaptor saves and replays the cache artifact), so with

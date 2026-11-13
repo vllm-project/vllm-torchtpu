@@ -406,3 +406,34 @@ def test_deferred_falls_back_when_cache_disabled_or_host_unknown(
     calls_nocache, _, _ = _compile_deferred(monkeypatch, 1, disable_cache=True)
     assert all(wait == 0.0 for _, wait in calls_nocache[:9])
     assert sorted(end for end, _ in calls_nocache[:9]) == SIZES
+
+
+# --- rank-dependent graphs: their artifacts are rank-salted, no peer replays them ---
+
+
+def test_rank_dependent_graph_compiles_every_range_without_waiting(
+    compile_all_ranges, monkeypatch
+):
+    from vllm_torchtpu.compilation import graph_fingerprint
+
+    monkeypatch.setattr(graph_fingerprint, "graph_is_rank_dependent", lambda g: True)
+    agreed = []
+    monkeypatch.setattr(
+        tpu_compiler, "agree_all_ranks", lambda ok: agreed.append(ok) or ok
+    )
+    for rank in range(8):
+        calls = _compile(compile_all_ranges, monkeypatch, rank)
+        assert all(wait == 0.0 for _, wait in calls)
+        assert sorted(end for end, _ in calls) == SIZES
+    assert agreed == [True] * 8
+
+
+def test_rank_dependent_failure_on_another_rank_fails_here(
+    compile_all_ranges, monkeypatch
+):
+    from vllm_torchtpu.compilation import graph_fingerprint
+
+    monkeypatch.setattr(graph_fingerprint, "graph_is_rank_dependent", lambda g: True)
+    monkeypatch.setattr(tpu_compiler, "agree_all_ranks", lambda ok: False)
+    with pytest.raises(RuntimeError, match="another rank"):
+        _compile(compile_all_ranges, monkeypatch, 0)
