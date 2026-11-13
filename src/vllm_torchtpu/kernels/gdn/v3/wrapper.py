@@ -120,7 +120,7 @@ def inner_kernel(
         cfg=cfg,
     )
 
-    conv_state_out_slot_ref[...] = new_conv_state
+    conv_state_out_slot_ref[...] = new_conv_state.astype(conv_state_out_slot_ref.dtype)
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
@@ -326,6 +326,8 @@ def outer_kernel(
         "conv_dtype",
         "attention_mode",
         "gate_lower_bound",
+        "kernel_act_dtype",
+        "kernel_conv_weight_dtype",
     ),
 )
 def fused_conv1d_gdn(
@@ -358,6 +360,8 @@ def fused_conv1d_gdn(
     prefill_only: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
+    kernel_act_dtype: jnp.dtype = jnp.float32.dtype,
+    kernel_conv_weight_dtype: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
@@ -422,6 +426,9 @@ def fused_conv1d_gdn(
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
+        kernel_act_dtype: Dtype qkv, b and a are cast to before the kernel.
+        kernel_conv_weight_dtype: Dtype conv_weight and conv_bias are cast to
+            before the kernel.
         decode_tile_size: Tile size along sequence dimension for decode sequences.
             Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
@@ -433,6 +440,11 @@ def fused_conv1d_gdn(
         out: Fused output tensor.
     """
     # TODO(kyuyeunk): Support bf16
+    if jnp.dtype(kernel_act_dtype) != jnp.float32:
+        raise ValueError(
+            f"kernel_act_dtype must be float32; got {jnp.dtype(kernel_act_dtype).name}."
+        )
+
     act_out_dtype = qkv.dtype
 
     is_shared = isinstance(states, jax.Array)
@@ -457,9 +469,9 @@ def fused_conv1d_gdn(
             f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
         )
 
-    qkv = qkv.astype(jnp.float32)
-    b = b.astype(jnp.float32)
-    a = a.astype(jnp.float32)
+    qkv = qkv.astype(kernel_act_dtype)
+    b = b.astype(kernel_act_dtype)
+    a = a.astype(kernel_act_dtype)
 
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
@@ -601,8 +613,9 @@ def fused_conv1d_gdn(
     # Step 3: Weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
     # loading stage.
-    conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
-    conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
+    conv_weight = conv_weight.swapaxes(0, 2).astype(kernel_conv_weight_dtype)
+    if conv_bias is not None:
+        conv_bias = conv_bias.astype(kernel_conv_weight_dtype)
 
     # Step 4: Wrap inputs for the kernel.
     conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight, bias=conv_bias)

@@ -95,7 +95,8 @@ steps:
             .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
               qwen3-coder-30b-tp8-ep \
               qwen3.5-35b-fp8-dp8-ep \
-              qwen3.5-35b-fp8-dp4-tp2-ep
+              qwen3.5-35b-fp8-dp4-tp2-ep \
+              qwen3.5-35b-fp8-tp8-ep
 
       - label: "Perf/Eval: Nightly qwen3-coder-480b-fp8-tp8-ep (TPU v7x-8)"
         <<: *perf_step

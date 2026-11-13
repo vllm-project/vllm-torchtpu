@@ -16,6 +16,17 @@
 Each token selects one slot of the stacked LoRA weights, or -1 for none.
 Rather than gathering each token's weights, the ops compute every slot and
 keep the selected one with a one-hot mask.
+
+Cost: T is the number of tokens, L is max_loras and r is max_lora_rank,
+and an adapter of lower rank is zero-padded to r. Every LoRA layer reads
+all L slots of A and B and multiplies every token by each of them,
+whichever adapters the batch uses. For one slice with input width d and
+output width out, the two ops do 2 * T * L * r * (d + out) FLOPs and read
+L * r * (d + out) weights, against 2 * T * d * out FLOPs and d * out
+weights for the base layer. A merged layer such as QKV pays this once per
+slice, each over the full input; the embedding layer runs only the expand.
+With d = out = 4096 and max_loras = 16, that adds 12.5% to the base layer
+at max_lora_rank = 16 and 50% at max_lora_rank = 64.
 """
 
 import torch
@@ -45,9 +56,10 @@ def bgmv_shrink(
     Returns:
         [T, r] in the dtype of x.
     """
-    assert x.dtype == lora_a_stacked.dtype, (
+    torch._assert(
+        x.dtype == lora_a_stacked.dtype,
         f"LoRA weights are {lora_a_stacked.dtype} but activations are "
-        f"{x.dtype}; lora_dtype must match the model dtype"
+        f"{x.dtype}; lora_dtype must match the model dtype",
     )
     a = lora_a_stacked.squeeze(1)
     # Masks after projecting, on the rank side, so the intermediate is
@@ -74,9 +86,10 @@ def bgmv_expand(
     Returns:
         [T, out], the LoRA delta alone; the caller adds it to the base output.
     """
-    assert buf.dtype == lora_b_stacked.dtype, (
+    torch._assert(
+        buf.dtype == lora_b_stacked.dtype,
         f"LoRA weights are {lora_b_stacked.dtype} but activations are "
-        f"{buf.dtype}; lora_dtype must match the model dtype"
+        f"{buf.dtype}; lora_dtype must match the model dtype",
     )
     b = lora_b_stacked.squeeze(1)
     # Masks before projecting, on the rank side, so the intermediate is

@@ -228,13 +228,7 @@ class Config:
         The chunk is the largest divisor of ``col_size`` whose gather double-buffer
         still fits comfortably in SparseCore VMEM.
         """
-        match self.tpu_info.generation:
-            case 6:
-                target_bytes = int(256 * 1024 * 0.95)
-            case 7:
-                target_bytes = int(512 * 1024 * 0.95)
-            case _:
-                target_bytes = int(128 * 1024 * 0.95)
+        target_bytes = int(self.sc_info.vmem_capacity_bytes * 0.95)
 
         # uint32 gather buffer, double-buffered by emit_pipeline.
         num_simd_lanes = self.sc_info.num_lanes
