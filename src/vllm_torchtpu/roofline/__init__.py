@@ -11,12 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Analytical TPU serving roofline, step floor, and mesh solver."""
+"""Analytical TPU serving roofline, step floor, mesh solver, and CLI emitter."""
 
 from __future__ import annotations
 
 from .chips import CHIPS, TOPOLOGIES, ChipOverrides, ChipSpec, SliceTopology
 from .collectives import Collective, CollectiveConfig, torus_collective_s
+from .emit import (
+    CeilingRow,
+    LaunchPayload,
+    emit_ceiling_rows,
+    emit_launch_args,
+    format_parallelism,
+    pool_cli_args,
+)
 from .geometry import ModelGeometry, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .memory import HbmBreakdown, KvFitInput, SeqKvLayout, hbm_footprint_per_core_bytes
@@ -37,6 +45,7 @@ from .step import FloorOptions, SpecShape, StepFloor, spec_cycle_floor, step_flo
 __all__ = [
     "CHIPS",
     "TOPOLOGIES",
+    "CeilingRow",
     "ChipOverrides",
     "ChipSpec",
     "Collective",
@@ -46,6 +55,7 @@ __all__ = [
     "FloorOptions",
     "HbmBreakdown",
     "KvFitInput",
+    "LaunchPayload",
     "ModelGeometry",
     "ModuleCost",
     "Parallel",
@@ -63,11 +73,15 @@ __all__ = [
     "TrafficScenario",
     "build_example_scenario",
     "dtypes_from_hf_config",
+    "emit_ceiling_rows",
+    "emit_launch_args",
+    "format_parallelism",
     "from_hf_config",
     "hbm_footprint_per_core_bytes",
     "load_hf_config",
     "pass_costs",
     "plan",
+    "pool_cli_args",
     "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",
