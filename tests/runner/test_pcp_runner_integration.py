@@ -124,6 +124,14 @@ def _make_runner(
     runner._wait_input_staging_fence = types.MethodType(
         TPUModelRunner._wait_input_staging_fence, runner
     )
+    # _dummy_run records one itself (see _fake_tpu_events).
+    runner._unfenced_h2d_sources = []
+    runner._fenced_h2d_sources = []
+    runner._free_h2d_sources = {}
+    runner._registered_h2d_sources = set()
+    runner._record_input_staging_fence = types.MethodType(
+        TPUModelRunner._record_input_staging_fence, runner
+    )
     runner._cached_query_start_loc = None
     runner._cached_logits_indices = None
     runner._cached_request_distribution = None
@@ -393,7 +401,17 @@ def test_prepare_inputs_routes_reordered_verify_per_chunk(bucket, chunk_size, hy
         start = end
 
 
+def _fake_tpu_events(monkeypatch):
+    """Stand in for `torch.tpu.Event` so a CPU test can record the staging fence."""
+    event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=lambda: event), raising=False
+    )
+
+
 def _run_dummy_run(monkeypatch, runner, *, num_tokens=256, dp_lockstep=False):
+    _fake_tpu_events(monkeypatch)
+
     def capture_forward_context(attn_metadata, *_args, **_kwargs):
         runner._captured_dummy_attn_metadata = attn_metadata
         return contextlib.nullcontext()
