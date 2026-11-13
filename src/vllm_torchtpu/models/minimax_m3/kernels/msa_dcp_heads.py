@@ -53,6 +53,13 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 # max_model_len 256K), which a step's query gather and merge exceed from
 # about 2K tokens (~0.16 us per token at c64 DCP 8, j-0a66fa2e).
 HEAD_PARALLEL_MIN_TOKENS = 2048
+# Tiles and pages per kernel step of the head-parallel calls (8 query heads
+# each, every rank's pages): wide groups amortize the kernel's per-step cost
+# (`msa_attention.PREFILL_BLOCK_Q_4BIT`). Standalone 8192-token call, 8 query
+# heads over all pages: 3.91 -> 2.49 ms at served-c48-like dispersion, 2.40 ->
+# 1.90 ms at lower (16-token tiles of 16 pages before; j-f7057d29).
+_BLOCK_Q = 8
+_PAGES_PER_STEP = 64
 
 
 def merge_partials(
@@ -462,8 +469,8 @@ def _head_parallel_attend(
         attend = functools.partial(
             msa_attention_lse.msa_sparse_attention_lse,
             sm_scale=sm_scale,
-            block_q=msa_attention.DEFAULT_BLOCK_Q,
-            pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+            block_q=_BLOCK_Q,
+            pages_per_step=_PAGES_PER_STEP,
             head=0,
             scale_cache=sc,
             k_scale_row=0,

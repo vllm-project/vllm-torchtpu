@@ -30,10 +30,11 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 
 # Page counts a kernel step may run at besides the full group (`_kernel`).
-# 24 serves 32-page groups: a step costs per score column, filled or not, and
-# a 17-24-page remainder is common there (standalone 4-bit 8-token tiles at
-# served-c48-like dispersion: 2.00 -> 1.83 ms, j-492a1bb9).
-_STEP_WIDTHS = (4, 8, 16, 24)
+# 24 serves 32-page groups (32, 48: 64-page ones): a step costs per score
+# column, filled or not, and a 17-24-page remainder is common there
+# (standalone 4-bit 8-token tiles at served-c48-like dispersion: 2.00 -> 1.83
+# ms, j-492a1bb9).
+_STEP_WIDTHS = (4, 8, 16, 24, 32, 48)
 # Tiles per grid step: a step runs the groups of this many tiles in a loop.
 # One step per group paid a per-step cost worth ~2-3% of the call (pool48
 # selections, 1-2 groups a tile; bench j-caec1354).
@@ -117,11 +118,18 @@ def _kernel(
         local_page_ref=local_page_ref,
         local_limit_ref=local_limit_ref,
     ):
+        store_out = None
         if tiles_per_step > 1:
             tile = msa_attention._meta_tile(work_meta_ref[w], groups_per_tile)
             bq = q_ref.shape[1] // tiles_per_step
-            rows = pl.ds(pl.multiple_of(tile % tiles_per_step * bq, bq), bq)
+            start = tile % tiles_per_step * bq
+            rows = pl.ds(pl.multiple_of(start, bq), bq)
             q_ref = q_ref.at[:, rows, :]
+            packed = _merged_store_rows(bq, o_ref.shape[0], o_ref.dtype)
+            if packed > 1:
+                store_out = functools.partial(
+                    _store_unaligned_rows, o_ref, start, bq, packed
+                )
             o_ref = o_ref.at[:, rows, :]
             selected_ref = selected_ref.at[rows, :]
             local_page_ref = local_page_ref.at[rows, :]
@@ -208,8 +216,15 @@ def _kernel(
             l_ref[...] = jnp.zeros_like(l_ref)
             acc_ref[...] = jnp.zeros_like(acc_ref)
 
+        def put(out):  # [H * Bq, D] or [H, Bq, D]
+            out = out.reshape(num_heads, block_q, head_dim)
+            if store_out is None:
+                o_ref[...] = out.astype(o_ref.dtype)
+            else:
+                store_out(out)
+
         def write(out, lse):
-            o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
+            put(out)
             lse_ref[...] = lse.T.reshape(lse_ref.shape)  # lane-dense row
 
         def finish(m, denom, acc):
@@ -290,8 +305,7 @@ def _kernel(
 
         def finish_t(m, denom, acc_t):
             """`finish` for `attend_t`'s lane-vector state."""
-            out = (acc_t * (1.0 / jnp.maximum(denom, 1.0))).T
-            o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
+            put((acc_t * (1.0 / jnp.maximum(denom, 1.0))).T)
             lse_ref[...] = (m * _LN_2 + jnp.log(denom)).reshape(lse_ref.shape)
 
         def attend(width, single):
@@ -391,7 +405,7 @@ def _kernel(
         # Slots past the group's pages hold stale bytes: their limits are 0, so
         # their scores are masked and their value rows zeroed.
         # Run at the narrowest width holding the group's pages (`_STEP_WIDTHS`;
-        # groups are 16 or 32 pages by call). A step costs per score column,
+        # groups are 16, 32 or 64 pages by call). A step costs per score column,
         # filled or not (~2.3 us at 16 pages, ~1.1 us at 4, twin standalone
         # j-952e8a64), plus ~0.7 us whatever its width (j-aec3278d).
         single = first & last
@@ -419,6 +433,32 @@ def _kernel(
 
     b = pl.program_id(0)
     jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
+
+
+def _merged_store_rows(block_q: int, num_heads: int, dtype) -> int:
+    """The packed output window (`_store_unaligned_rows`) a tile's output is
+    merged into, or 1 for a plain store: a window is the output dtype's
+    sublane tile (16 rows for bf16). Blocks of 16 heads lower their 8-row
+    stores (decode tiles); 8 heads did not (c64 head-parallel, j-d318070b)."""
+    rows = 8 * 4 // jnp.dtype(dtype).itemsize
+    return rows if block_q % rows and num_heads % rows else 1
+
+
+def _store_unaligned_rows(o_ref, start, rows, packed, out):
+    """Writes ``out [H, rows, D]`` (f32) to rows ``start ..`` of ``o_ref``
+    when `rows` is not a multiple of the output's packed sublane tile
+    (`packed`): a store at a run-time offset inside a packed tile does not
+    lower (Mosaic E2003), so the tile holding the rows is read, merged and
+    written whole. Tiles of a grid step run in order, so the rest of the
+    packed tile holds an earlier tile's rows or rows a later one writes."""
+    base = pl.multiple_of(start // packed * packed, packed)
+    window = o_ref.at[:, pl.ds(base, packed), :]
+    copies = jnp.concatenate([out.astype(jnp.float32)] * (packed // rows), axis=1)
+    row = jax.lax.broadcasted_iota(jnp.int32, copies.shape, 1) + base
+    mine = (row >= start) & (row < start + rows)
+    window[...] = jnp.where(mine, copies, window[...].astype(jnp.float32)).astype(
+        o_ref.dtype
+    )
 
 
 def _attention_call(
@@ -597,12 +637,18 @@ def _attention_call(
     )
 
 
-def _tiles_per_step(num_tiles: int) -> int:
-    """The most tiles (up to `TILES_PER_STEP`) a grid step can take evenly."""
-    return next(n for n in range(TILES_PER_STEP, 0, -1) if num_tiles % n == 0)
+def _tiles_per_step(num_tiles: int, rows: int = 1, align: int = 1) -> int:
+    """The most tiles (up to `TILES_PER_STEP`) a grid step can take evenly;
+    with `align`, only counts whose `rows`-row tiles fill whole `align`-row
+    output windows (`_store_unaligned_rows`), or one tile."""
+    return next(
+        n
+        for n in range(TILES_PER_STEP, 0, -1)
+        if num_tiles % n == 0 and (n == 1 or n * rows % align == 0)
+    )
 
 
-def _packed_work(selected, block_q, pages_per_step):
+def _packed_work(selected, block_q, pages_per_step, align=1):
     """`msa_attention._work_list` of each call's ``selected [C, T, K]`` as
     one int32 row per call, ``[unions | meta words | counts | step
     starts]``, and the tiles each grid step takes: a call then takes one
@@ -615,7 +661,7 @@ def _packed_work(selected, block_q, pages_per_step):
         )
     )(selected)
     num_tiles = selected.shape[1] // block_q
-    tiles_per_step = _tiles_per_step(num_tiles)
+    tiles_per_step = _tiles_per_step(num_tiles, block_q, align)
     groups_per_tile = msa_attention._groups_per_tile(
         block_q, selected.shape[2], pages_per_step
     )
@@ -696,6 +742,7 @@ def _chunked_call(
         selected.reshape(num_heads * num_chunks, step, selected.shape[2]),
         block_q,
         pages_per_step,
+        align=_merged_store_rows(block_q, num_q_heads // num_heads, q.dtype),
     )
 
     def head_chunk(i, out):

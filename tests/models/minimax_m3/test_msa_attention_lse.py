@@ -358,13 +358,20 @@ def test_lse_wide_groups(block_q, pages_per_step, dtype, monkeypatch):
     _check(got, want)
 
 
-@pytest.mark.parametrize("block_q,pages_per_step", [(8, 32), (8, 64)])
-def test_fp4_lse_wide_groups(block_q, pages_per_step, monkeypatch):
+@pytest.mark.parametrize(
+    "block_q,pages_per_step,q_per_kv,num_tokens",
+    [(8, 32, 16, 64), (8, 64, 16, 64), (8, 64, 8, 64), (8, 64, 8, 48)],
+)
+def test_fp4_lse_wide_groups(
+    block_q, pages_per_step, q_per_kv, num_tokens, monkeypatch
+):
     """4-bit pages and their scale pages in 32-page groups (the 4-bit prefill
-    calls) and 64-page ones (the kernel's general support for wide groups)."""
+    calls) and 64-page ones of 8 query heads (the head-parallel calls, whose
+    8-row output stores merge into 16-row tiles: 48 tokens take 2 tiles a
+    grid step, where 3 would leave a half window)."""
+    monkeypatch.setitem(globals(), "Q_PER_KV", q_per_kv)
     monkeypatch.setitem(globals(), "PAGES", 96)
     monkeypatch.setitem(globals(), "TOPK", 16)
-    num_tokens = 64
     rng = np.random.default_rng(7 + pages_per_step)
     q, _, _, table, keys, local_key, local_limit = _inputs(
         rng, num_tokens, num_tokens - 2, 1, jnp.bfloat16
