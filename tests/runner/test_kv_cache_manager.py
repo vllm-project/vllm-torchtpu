@@ -2744,3 +2744,62 @@ def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
     kv_cache_specs = KVCacheManager(stub).get_kv_cache_spec()
     assert kv_cache_specs["target.0"].is_draft is False
     assert kv_cache_specs["draft.0"].is_draft is True
+
+
+def test_deepseek_v41_flash_kv_cache_allocator():
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    from vllm_torchtpu.runner.kv_cache_deepseek_v41_flash import (
+        DeepseekV41FlashKVCacheAllocator,
+    )
+
+    def mla(head_size: int) -> MLAAttentionSpec:
+        return MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=head_size,
+            dtype=torch.uint8,
+            tokens_per_state=2,
+            alignment=None,
+        )
+
+    specs = {
+        "m.layers.0.attn": mla(640),
+        "m.layers.0.attn.indexer.k_cache": mla(132),
+        "m.layers.0.attn.swa_cache": SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=640,
+            dtype=torch.uint8,
+            sliding_window=128,
+            alignment=None,
+        ),
+    }
+    groups = [
+        SimpleNamespace(
+            layer_names=["m.layers.0.attn", "m.layers.0.attn.indexer.k_cache"]
+        ),
+        SimpleNamespace(layer_names=["m.layers.0.attn.swa_cache"]),
+    ]
+    runner = MagicMock(
+        shared_kv_cache_layers={},
+        device="cpu",
+        most_model_len=None,
+        max_model_len=1024,
+        max_num_reqs=8,
+        max_num_tokens=1024,
+        **{"cache_config.block_size": 256},
+    )
+    kv_caches: dict = {}
+    DeepseekV41FlashKVCacheAllocator(runner)._initialize_ds_v4_kv_cache(
+        SimpleNamespace(kv_cache_groups=groups), specs.__getitem__, kv_caches, 3
+    )
+    nope, rope = kv_caches["m.layers.0.attn"]
+    assert tuple(nope.shape) == (3, 128, 128)
+    assert tuple(rope.shape) == (3, 32, 128)
+    assert tuple(kv_caches["m.layers.0.attn.indexer.k_cache"].shape) == (3, 33, 4, 128)
+    assert DeepseekV41FlashKVCacheAllocator.aux_partition_sizes(6855, 64) == (128, 768)
+    assert DeepseekV41FlashKVCacheAllocator.aux_partition_sizes(54840, 512) == (
+        1152,
+        2816,
+    )

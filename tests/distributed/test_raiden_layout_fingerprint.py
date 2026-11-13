@@ -18,7 +18,12 @@ import pytest
 from vllm_torchtpu.distributed.kv_transfer.raiden import layout_fingerprint as rlf
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
-from .raiden_test_utils import FakeTensor, dsv4_materialization, glm_named_kv_caches
+from .raiden_test_utils import (
+    FakeTensor,
+    dsv4_materialization,
+    dsv41_materialization,
+    glm_named_kv_caches,
+)
 
 
 def _manifest(*, page_tokens=4096):
@@ -527,3 +532,32 @@ def test_glm_stage_without_indexer_fingerprints_like_every_layer():
     assert stage_fp == full_fp
     assert set(full_payload["layouts"]) == {"mla.nope", "mla.rope"}
     assert fingerprint(full)[0] != full_fp
+
+
+def test_dsv41_fingerprint_has_one_page_shape_per_tag():
+    named, groups = dsv41_materialization()
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    )
+    fingerprint, payload = rlf.measured_dsv4_layout_fingerprint(
+        manifest, layout_getter=_glm_layout_getter, package_version=_glm_versions
+    )
+    layouts = payload["layouts"]
+    assert layouts["dsv4.idx.s33x4x1024.g0"] == {
+        "page_shape": [33, 4, 1024],
+        "row_bytes": 4096,
+        "minor_to_major": [3, 2, 1, 0],
+        "tiles": [[4, 128], [4, 1]],
+        "element_size_in_bits": 8,
+    }
+    assert layouts["dsv4.swa.s512x1x128.g1"]["page_shape"] == [512, 1, 128]
+    # Both peers build the same manifest from the same allocator, so the
+    # fingerprint is reproducible.
+    again, _ = rlf.measured_dsv4_layout_fingerprint(
+        rpm.build_dsv4_pool_manifest(
+            named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+        ),
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+    assert again == fingerprint

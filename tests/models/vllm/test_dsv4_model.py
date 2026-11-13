@@ -299,3 +299,447 @@ def test_tagged_forward_captures_and_keeps_main_output(tiny_fc):
     # reuses its reconstruction: one post-op call per tag, none extra.
     torch.testing.assert_close(hidden, baseline)
     assert tiny_fc.model.mhc_post_op.calls == len(tags)
+
+
+@pytest.mark.cpu_test
+def test_dsv4_mlp_and_moe_prequant_forwarding(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.deepseek_v4 import layers as layers_mod
+    from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
+    from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
+
+    prequant_calls = []
+
+    def fake_prequant(x_q, x_s, w_q, w_s):
+        prequant_calls.append((x_q, x_s, w_q, w_s))
+        return (x_q.float() * x_s) @ w_q.float() * w_s
+
+    monkeypatch.setattr(layers_mod, "quantized_matmul_prequant", fake_prequant)
+    monkeypatch.setattr(envs, "VLLM_DSV41_FUSED_SEAM_QUANT", True)
+
+    mlp = DeepseekV4MLP.__new__(DeepseekV4MLP)
+    nn.Module.__init__(mlp)
+    mlp._prequant = [None, None]
+    mlp.gate_up_proj = nn.Module()
+    mlp.gate_up_proj.weight = nn.Parameter(torch.ones(8, 8))
+    mlp.gate_up_proj.weight_scale = nn.Parameter(torch.full((8,), 0.5))
+    mlp.gate_up_proj.bias = None
+    mlp.act_fn = lambda g: g[:, :4] * g[:, 4:]
+    mlp.down_proj = lambda a: (a @ torch.ones(4, 8), None)
+
+    assert mlp.can_accept_prequant_hidden(token_sharded=False) is True
+    assert mlp.can_accept_prequant_hidden(token_sharded=True) is False
+
+    x = torch.ones(3, 8)
+    x_fp8 = torch.full((3, 8), 2.0)
+    x_scale = torch.full((3, 1), 0.25)
+
+    # 1. Direct prequant call on DeepseekV4MLP
+    out_direct = mlp(x, hidden_states_fp8=x_fp8, hidden_states_scale=x_scale)
+    assert len(prequant_calls) == 1
+    assert mlp._prequant == [None, None]
+    assert out_direct.shape == (3, 8)
+
+    # 2. Staged prequant forwarding via DeepseekV4MoE -> shared_experts
+    moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
+    nn.Module.__init__(moe)
+    moe.tp_size = 1
+    moe.shared_experts = mlp
+    moe.gate = SimpleNamespace(tid2eid=None)
+    moe.experts = lambda **kw: mlp(kw["hidden_states"])
+    moe.experts.moe_config = SimpleNamespace(skip_final_all_reduce=False)
+
+    assert moe.can_accept_prequant_hidden(token_sharded=False) is True
+    assert moe.can_accept_prequant_hidden(token_sharded=True) is False
+
+    out_moe = moe(x, hidden_states_fp8=x_fp8, hidden_states_scale=x_scale)
+    assert len(prequant_calls) == 2
+    assert mlp._prequant == [None, None]
+    torch.testing.assert_close(out_moe, out_direct)
+
+
+@pytest.mark.cpu_test
+def test_dsv41_attention_qkv_prequant_and_compressor_token_sharded(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+        deepseek_v41_flash_compressor as comp_mod,
+    )
+    from vllm_torchtpu.models.vllm.deepseek_v41 import attention as attn_mod
+
+    prequant_calls = []
+
+    def fake_prequant(x_q, x_s, w_q, w_s):
+        prequant_calls.append((x_q, x_s, w_q, w_s))
+        return (x_q.float() * x_s) @ w_q.float() * w_s
+
+    monkeypatch.setattr(comp_mod, "quantized_matmul_prequant", fake_prequant)
+    monkeypatch.setattr(envs, "VLLM_DSV41_FUSED_SEAM_QUANT", True)
+
+    idx = comp_mod.VllmDeepseekV41Indexer.__new__(
+        comp_mod.VllmDeepseekV41Indexer
+    )
+    nn.Module.__init__(idx)
+    idx.wq_b = nn.Module()
+    idx.wq_b.weight = nn.Parameter(torch.ones(8, 16))
+    idx.wq_b.weight_scale = nn.Parameter(torch.full((16,), 0.5))
+    idx.wq_b.bias = None
+    assert idx.can_accept_prequant_query() is True
+
+    q_fp8 = torch.full((4, 8), 2.0)
+    q_s = torch.full((4, 128), 0.25)
+    out_idx = idx._apply_wq_b(None, q_fp8, q_s)
+    assert len(prequant_calls) == 1
+    assert prequant_calls[0][1].shape == (4, 1)
+    assert out_idx.shape == (4, 16)
+
+    monkeypatch.setattr(
+        attn_mod, "get_tensor_model_parallel_world_size", lambda: 8
+    )
+    attn = attn_mod.VllmDeepseekV41MLAAttention.__new__(
+        attn_mod.VllmDeepseekV41MLAAttention
+    )
+    nn.Module.__init__(attn)
+    attn.fused_wqa_wkv = nn.Module()
+    attn.fused_wqa_wkv.weight = nn.Parameter(torch.ones(16, 8))
+    attn.fused_wqa_wkv.weight_scale = nn.Parameter(torch.ones(8))
+    attn.fused_wqa_wkv.bias = None
+    attn.compressor = nn.Module()
+    attn.indexer = SimpleNamespace(use_tp_indexer=lambda n: n % 8 == 0)
+    attn._ced_global_from_encoder = False
+
+    # Token-sharded prequant is accepted even on compressor layers (0 & 20).
+    assert attn.can_accept_prequant_hidden(64, token_sharded=True) is True
+    assert attn.can_accept_prequant_hidden(60, token_sharded=True) is False
+
+    qr_kv = torch.zeros((4, 2048), dtype=torch.bfloat16)
+    q_w = torch.ones((1536,), dtype=torch.bfloat16)
+    kv_w = torch.ones((512,), dtype=torch.bfloat16)
+    pos = torch.arange(4, dtype=torch.int32)
+    cs = torch.zeros((16, 64), dtype=torch.float32)
+    f_q_fp8, f_q_s, f_kv = attn_mod._fake_qkv_norm_rope_quant(
+        qr_kv, q_w, kv_w, pos, cs
+    )
+    assert f_q_fp8.shape == (4, 1536) and f_q_fp8.dtype == torch.float8_e4m3fn
+    assert f_q_s.shape == (4, 128) and f_q_s.dtype == torch.float32
+    assert f_kv.shape == (4, 512) and f_kv.dtype == torch.bfloat16
+
+    f_qkv = attn_mod._fake_qkv_norm_rope(qr_kv, q_w, kv_w, pos, cs)
+    assert f_qkv.shape == (4, 2048) and f_qkv.dtype == torch.bfloat16
+    f_qkv2, f_q_fp8_2, f_q_s_2 = attn_mod._fake_qkv_norm_rope_and_quant(
+        qr_kv, q_w, kv_w, pos, cs
+    )
+    assert f_qkv2.shape == (4, 2048) and f_qkv2.dtype == torch.bfloat16
+    assert f_q_fp8_2.shape == (4, 1536) and f_q_fp8_2.dtype == torch.float8_e4m3fn
+    assert f_q_s_2.shape == (4, 128) and f_q_s_2.dtype == torch.float32
+
+    wq_b = torch.zeros((1536, 4096), dtype=torch.float8_e4m3fn)
+    wq_b_s = torch.ones((4096,), dtype=torch.float32)
+    f_q = attn_mod._fake_wq_b_q_rope_prequant(
+        f_q_fp8, f_q_s, pos, cs, wq_b, wq_b_s, head_dim=512
+    )
+    assert f_q.shape == (4, 8, 512) and f_q.dtype == torch.bfloat16
+
+    gathered = []
+    monkeypatch.setattr(
+        comp_mod,
+        "tp_all_gather",
+        lambda x, dim=0: (gathered.append(x.shape), x.repeat(2, 1))[1],
+    )
+    comp = comp_mod.VllmDeepseekV41Compressor.__new__(
+        comp_mod.VllmDeepseekV41Compressor
+    )
+    nn.Module.__init__(comp)
+    comp.has_gate = False
+    comp.fused_wkv_wgate = lambda h: h[:, :4]
+    comp.norm = lambda z: z * 2.0
+    lat = comp(torch.ones((2, 8)), torch.arange(4))
+    assert gathered == [torch.Size([2, 4])]
+    assert lat.shape == (4, 4)
+
+
+@pytest.mark.cpu_test
+def test_dsv4_moe_token_sharded_local_gate_and_packed_all_gather(monkeypatch):
+    from vllm_torchtpu.layers.adapter import moe_routing
+    from vllm_torchtpu.models.vllm.deepseek_v4 import moe as moe_mod
+    from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
+
+    gathered_shapes = []
+    monkeypatch.setattr(
+        moe_mod,
+        "tp_all_gather",
+        lambda x, dim=0: (gathered_shapes.append(x.shape), x.repeat(2, 1))[1],
+    )
+    monkeypatch.setattr(
+        moe_mod,
+        "tp_reduce_scatter",
+        lambda x, dim=0: x[: x.shape[0] // 2],
+    )
+
+    routed_experts = SimpleNamespace(
+        _precomputed_topk=[None, None],
+        moe_config=SimpleNamespace(experts_per_token=2),
+        custom_routing_function=None,
+        renormalize=True,
+        scoring_func="sqrtsoftplus",
+        use_grouped_topk=False,
+        e_score_correction_bias=None,
+        routed_scaling_factor=1.0,
+    )
+
+    gate_calls = []
+
+    class _StubGate:
+        tid2eid = None
+        _skip_forward = [False]
+
+        def __call__(self, x):
+            if self._skip_forward[0]:
+                return x[:, :1], None
+            gate_calls.append(x.shape)
+            return torch.arange(
+                x.shape[0] * 4, dtype=torch.float32
+            ).reshape(x.shape[0], 4), None
+
+    class _StubExperts:
+        is_monolithic = True
+        do_naive_dispatch_combine = False
+        moe_config = SimpleNamespace(skip_final_all_reduce=True)
+
+        def __init__(self, gate, re):
+            self.gate = gate
+            self.routed_experts = re
+
+        def __call__(self, *, hidden_states, router_logits, input_ids=None):
+            del router_logits
+            logits, _ = self.gate(hidden_states)
+            assert logits.shape == (hidden_states.shape[0], 4)
+            tw, tid = moe_routing.route(
+                self.routed_experts, hidden_states, logits, input_ids=input_ids
+            )
+            assert tw.shape == (hidden_states.shape[0], 2)
+            assert tid.shape == (hidden_states.shape[0], 2)
+            assert tid.dtype == torch.int32
+            return hidden_states * tw[:, :1].to(hidden_states.dtype)
+
+    moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
+    nn.Module.__init__(moe)
+    moe.tp_size = 2
+    moe.hidden_size = 8
+    moe.n_routed_experts = 4
+    moe.shared_experts = None
+    moe.gate = _StubGate()
+    moe.experts = _StubExperts(moe.gate, routed_experts)
+
+    x_local = torch.ones((3, 8), dtype=torch.bfloat16)
+    out = moe(
+        x_local,
+        return_token_sharded=True,
+        input_is_token_sharded=True,
+    )
+    assert gate_calls == [torch.Size([6, 8])]
+    assert gathered_shapes == [torch.Size([3, 8])]
+    assert out.shape == (3, 8)
+
+
+@pytest.mark.cpu_test
+def test_dsv4_moe_token_sharded_local_shared_experts_and_prequant(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import moe_routing
+    from vllm_torchtpu.models.vllm.deepseek_v4 import layers as layers_mod
+    from vllm_torchtpu.models.vllm.deepseek_v4 import moe as moe_mod
+    from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
+    from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
+
+    monkeypatch.setattr(envs, "VLLM_DSV41_FUSED_SEAM_QUANT", True)
+    monkeypatch.setattr(
+        layers_mod, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
+        layers_mod,
+        "tp_all_gather",
+        lambda x, dim=0: torch.cat([x, x + 1], dim=dim),
+    )
+
+    mlp = DeepseekV4MLP.__new__(DeepseekV4MLP)
+    nn.Module.__init__(mlp)
+    mlp._prequant = [None, None]
+    mlp.act_fn = lambda g: g[:, :4] * g[:, 4:]
+    mlp.gate_up_proj = nn.Module()
+    mlp.gate_up_proj.disable_tp = False
+    mlp.gate_up_proj.input_size = 8
+    mlp.gate_up_proj.weight = nn.Parameter(
+        torch.ones((8, 4), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    mlp.gate_up_proj.weight_scale = nn.Parameter(
+        torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32),
+        requires_grad=False,
+    )
+    mlp.gate_up_proj.bias = None
+    mlp.down_proj = nn.Module()
+    mlp.down_proj.output_size = 8
+    mlp.down_proj.weight = nn.Parameter(
+        torch.full((2, 8), 2.0, dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    mlp.down_proj.weight_scale = nn.Parameter(
+        torch.ones((8,), dtype=torch.float32), requires_grad=False
+    )
+    mlp.down_proj.bias = None
+
+    mlp.process_weights_after_loading()
+    assert mlp.has_tp_local_weights() is True
+    assert mlp.can_accept_prequant_hidden(token_sharded=True) is True
+    assert mlp._tp_gate_up_w.shape == (8, 8)
+    assert mlp._tp_gate_up_s.shape == (8,)
+    # Verify gate (w1) and up (w3) halves are gathered separately:
+    torch.testing.assert_close(
+        mlp._tp_gate_up_s,
+        torch.tensor([1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0]),
+    )
+    assert mlp._tp_down_w.shape == (4, 8)
+    assert mlp._tp_down_s.shape == (8,)
+    torch.testing.assert_close(mlp._tp_down_s, torch.full((8,), 2.0))
+    # Shard 0 had scale 1.0 and weight 2.0 (0x40) -> rescaled to 1.0 under max scale 2.0;
+    # Shard 1 had scale 2.0 and weight 2.25 (0x41) -> rescaled to 2.25 under max scale 2.0.
+    torch.testing.assert_close(
+        mlp._tp_down_w[:2].float(), torch.full((2, 8), 1.0)
+    )
+    torch.testing.assert_close(
+        mlp._tp_down_w[2:].float(), torch.full((2, 8), 2.25)
+    )
+
+    prequant_calls = []
+    down_calls = []
+    monkeypatch.setattr(
+        layers_mod,
+        "quantized_matmul_prequant",
+        lambda xq, xs, wq, ws: (
+            prequant_calls.append((xq.shape, xs.shape, wq.shape, ws.shape)),
+            torch.ones(
+                (xq.shape[0], wq.shape[1]),
+                dtype=torch.bfloat16,
+                device=xq.device,
+            ),
+        )[1],
+    )
+    monkeypatch.setattr(
+        layers_mod,
+        "quantized_matmul",
+        lambda act, wq, ws: (
+            down_calls.append((act.shape, wq.shape, ws.shape)),
+            torch.full(
+                (act.shape[0], wq.shape[1]),
+                2.0,
+                dtype=act.dtype,
+                device=act.device,
+            ),
+        )[1],
+    )
+
+    monkeypatch.setattr(
+        moe_mod,
+        "tp_all_gather",
+        lambda x, dim=0: x.repeat(2, 1),
+    )
+    monkeypatch.setattr(
+        moe_mod,
+        "tp_reduce_scatter",
+        lambda x, dim=0: x[: x.shape[0] // 2],
+    )
+
+    routed_experts = SimpleNamespace(
+        moe_config=SimpleNamespace(experts_per_token=2),
+        custom_routing_function=None,
+        renormalize=True,
+        scoring_func="sqrtsoftplus",
+        use_grouped_topk=False,
+        e_score_correction_bias=None,
+        routed_scaling_factor=1.0,
+    )
+
+    class _StubGate:
+        tid2eid = None
+
+        def __call__(self, x):
+            return torch.ones((x.shape[0], 4), dtype=torch.float32), None
+
+    class _StubExperts:
+        is_monolithic = True
+        do_naive_dispatch_combine = False
+        moe_config = SimpleNamespace(skip_final_all_reduce=True)
+        _skip_shared = [False]
+
+        def __init__(self, gate, re, sh):
+            self.gate = gate
+            self.routed_experts = re
+            self._sh = sh
+            self.shared_ran_on_full = False
+
+        def __call__(self, *, hidden_states, router_logits, input_ids=None):
+            del router_logits
+            if not self._skip_shared[0]:
+                self.shared_ran_on_full = True
+                _ = self._sh(hidden_states)
+            logits, _ = self.gate(hidden_states)
+            tw, _ = moe_routing.route(
+                self.routed_experts, hidden_states, logits, input_ids=input_ids
+            )
+            return torch.ones_like(hidden_states) * tw[:, :1].to(
+                hidden_states.dtype
+            )
+
+    moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
+    nn.Module.__init__(moe)
+    moe.tp_size = 2
+    moe.hidden_size = 8
+    moe.n_routed_experts = 4
+    moe.shared_experts = mlp
+    moe.gate = _StubGate()
+    moe.experts = _StubExperts(moe.gate, routed_experts, mlp)
+    assert moe.can_accept_prequant_hidden(token_sharded=True) is True
+
+    x_local = torch.ones((3, 8), dtype=torch.bfloat16)
+    x_fp8 = torch.ones((3, 8), dtype=torch.float8_e4m3fn)
+    x_scale = torch.ones((3, 1), dtype=torch.float32)
+    out = moe(
+        x_local,
+        return_token_sharded=True,
+        hidden_states_fp8=x_fp8,
+        hidden_states_scale=x_scale,
+        input_is_token_sharded=True,
+    )
+    assert moe.experts.shared_ran_on_full is False
+    assert moe.experts._skip_shared == [False]
+    assert prequant_calls == [
+        (
+            torch.Size([3, 8]),
+            torch.Size([3, 1]),
+            torch.Size([8, 8]),
+            torch.Size([8]),
+        )
+    ]
+    assert down_calls == [
+        (torch.Size([3, 4]), torch.Size([4, 8]), torch.Size([8]))
+    ]
+    assert out.shape == (3, 8)
+    # Routed out is 0.5 (since 2 equal topk weights renormalize to 0.5 each),
+    # and local shared_experts out is 2.0 -> sum is 2.5.
+    torch.testing.assert_close(out, torch.full((3, 8), 2.5, dtype=torch.bfloat16))
+
+    # Standalone dense DeepseekV4MLP forward with token_sharded=True dispatches
+    # directly to forward_tp_local without tp_all_gather / tp_reduce_scatter.
+    out_mlp_sharded = mlp(
+        x_local,
+        hidden_states_fp8=x_fp8,
+        hidden_states_scale=x_scale,
+        return_token_sharded=True,
+        input_is_token_sharded=True,
+    )
+    torch.testing.assert_close(
+        out_mlp_sharded, torch.full((3, 8), 2.0, dtype=torch.bfloat16)
+    )
+    assert len(prequant_calls) == 2
+
+    # When skip_final_all_reduce is False, MoE cannot run local shared_experts,
+    # so can_accept_prequant_hidden(token_sharded=True) returns False.
+    moe.experts.moe_config.skip_final_all_reduce = False
+    assert moe.can_accept_prequant_hidden(token_sharded=True) is False
