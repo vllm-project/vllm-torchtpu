@@ -76,6 +76,7 @@ See `raiden_connector.py` for connector wiring, device fencing, and echo channel
 
 from __future__ import annotations
 
+import collections
 import enum
 import hashlib
 import math
@@ -485,6 +486,12 @@ class RaidenOffloadingManager(OffloadingManager):
     (`poll_finished_jobs`).
     """
 
+    # TPU_RAIDEN_LRU_REFRESH >= 1: `prepare_store` refreshes the resident keys
+    # it skips. Class-level so instances built without __init__ (tests) work.
+    _lru_refresh_on_store: bool = False
+    # TPU_RAIDEN_OFFLOAD_STATS counters (always counted; logged when on).
+    _stats: collections.Counter | None = None
+
     def __init__(
         self,
         *,
@@ -628,6 +635,8 @@ class RaidenOffloadingManager(OffloadingManager):
         # holds nothing for the key. Every other store/skip/touch decision
         # probes the directory itself.
         self._inflight_store_keys: set[OffloadKey] = set()
+        self._lru_refresh_on_store = envs.TPU_RAIDEN_LRU_REFRESH >= 1
+        self._stats = collections.Counter()
 
         # Per request: keys whose load failed (could not pin, or the transfer
         # failed). That request's lookups answer MISS for them so it
@@ -887,6 +896,43 @@ class RaidenOffloadingManager(OffloadingManager):
             if held:
                 self._store.release(held)
 
+    def refresh_resident(self, keys: Sequence[OffloadKey]) -> int:
+        """Move the host-resident leading run of `keys` to the LRU's MRU end.
+
+        One pinned lookup over the chain's sub-hashes (it stops at the first
+        one that is not resident, which is also where a prefix lookup would
+        stop), then one release in reverse, so the chain head is released
+        last and is the last of the chain to be evicted: without it the head,
+        stored first and then served from HBM where the host is never asked,
+        ages out first and strands the rest of the chain behind a miss.
+        Entries a store or load holds keep their pins (the lookup's pin is
+        handed straight back); storage-tier and peer entries hold no pin and
+        are not released, as in `touch`. Returns the entries refreshed.
+        """
+        if not keys:
+            return 0
+        host = (self._block_status.HOST, self._block_status.HOST_AND_HBM)
+        held: list[bytes] = []
+        stop = False
+        for sub_hash, block in self._store.lookup(self._expand_keys(list(keys))):
+            # The lookup pinned every local hit; give back the ones past the
+            # host run (an in-flight save's HBM entry) right away, unrefreshed.
+            if stop or block.status not in host:
+                stop = True
+                if block.status not in (
+                    self._block_status.REMOTE,
+                    self._block_status.SHARED_STORAGE,
+                ):
+                    self._store.release([sub_hash])
+                continue
+            held.append(sub_hash)
+        if held:
+            self._store.release(held[::-1])
+        stats = self._stats
+        if stats is not None:
+            stats["refreshed_entries"] += len(held)
+        return len(held)
+
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
         sub_hashes = self._expand_keys(keys)
@@ -1001,6 +1047,7 @@ class RaidenOffloadingManager(OffloadingManager):
             self._block_status.HOST_AND_HBM,
             self._block_status.REMOTE,
         )
+        resident_keys: list[OffloadKey] = []
         for key in keys:
             if key in self._inflight_store_keys:
                 continue
@@ -1009,8 +1056,21 @@ class RaidenOffloadingManager(OffloadingManager):
             if len(matches) == len(sub_hashes) and all(
                 block.status in resident_statuses for _, block in matches
             ):
+                if all(
+                    block.status != self._block_status.REMOTE for _, block in matches
+                ):
+                    resident_keys.append(key)
                 continue
             keys_to_store.append(key)
+        stats = self._stats
+        if stats is not None:
+            stats["store_keys_offered"] += len(keys)
+            stats["store_keys_resident"] += len(resident_keys)
+            stats["store_keys_new"] += len(keys_to_store)
+        if self._lru_refresh_on_store and resident_keys:
+            # The store skips these, and nothing else refreshes them while HBM
+            # serves the chain; this flush is the last look before HBM evicts it.
+            self.refresh_resident(resident_keys)
         if len(keys_to_store) > self._capacity_keys:
             return None
         # Atomic admission happens at job-submit time via insert; in-flight
@@ -1380,6 +1440,9 @@ class RaidenOffloadingManager(OffloadingManager):
     def on_store_job_cancelled(self, keys: list[OffloadKey]) -> None:
         """A fence-pending (never admitted) store job was cancelled."""
         self._inflight_store_keys.difference_update(keys)
+        if self._stats is not None:
+            self._stats["store_jobs_cancelled"] += 1
+            self._stats["store_keys_cancelled"] += len(keys)
 
     def is_job_launched(self, job_id: int) -> bool:
         """Whether a job has been admitted+launched and is not yet terminal."""
@@ -1405,6 +1468,8 @@ class RaidenOffloadingManager(OffloadingManager):
             self._store.release(held)
         if admission.op == AdmissionOp.STORE:
             self._inflight_store_keys.difference_update(admission.keys)
+            if self._stats is not None:
+                self._stats["store_jobs_ok" if success else "store_jobs_failed"] += 1
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id, op=AdmissionOp.STORE, success=success

@@ -204,6 +204,8 @@ if TYPE_CHECKING:
     EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK: bool = False
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
+    TPU_RAIDEN_LRU_REFRESH: int = 0
+    TPU_RAIDEN_OFFLOAD_STATS: bool = False
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -1288,6 +1290,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # How many times an offload save whose transfer failed is retried.
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES": env_int("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
+    # Raiden host-pool LRU refresh of chains a request already finds resident.
+    # The store skips a resident key without touching it, and a key served
+    # from HBM is never looked up on the host, so the head of a long-lived
+    # prefix ages out of the host LRU first and makes the whole chain
+    # unreachable. 0: off. 1: refresh resident keys a store skips (the
+    # flush that runs right before HBM evicts the chain). 2: also refresh
+    # the finished request's resident leading chain (vLLM's CPU offload
+    # manager touches at request finish). Scheduler-side, host-only.
+    "TPU_RAIDEN_LRU_REFRESH": env_int("TPU_RAIDEN_LRU_REFRESH", 0),
+    # Periodic Raiden offload counters (stores offered/skipped/stored,
+    # refreshed entries, cancelled stores, write-back drops by cause, host
+    # lookups that miss a chain head while a later key is resident).
+    "TPU_RAIDEN_OFFLOAD_STATS": env_bool("TPU_RAIDEN_OFFLOAD_STATS", default=False),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
