@@ -670,11 +670,20 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
 
 class GDNChunkedComputeTest(parameterized.TestCase):
     @parameterized.named_parameters(
-        dict(testcase_name="qwen3_8_paired", n_kq=2, n_v=16),
-        dict(testcase_name="odd_v_per_kq_unpaired", n_kq=2, n_v=6),
+        dict(testcase_name="ratio_1", n_kq=4, n_v=4, partial_chunk=False),
+        dict(testcase_name="ratio_2", n_kq=4, n_v=8, partial_chunk=False),
+        dict(testcase_name="ratio_4", n_kq=2, n_v=8, partial_chunk=False),
+        dict(testcase_name="even_v_per_kq_paired", n_kq=2, n_v=16, partial_chunk=False),
+        dict(testcase_name="odd_v_per_kq_unpaired", n_kq=2, n_v=6, partial_chunk=False),
+        dict(
+            testcase_name="partial_chunk_zero_trailing_beta",
+            n_kq=2,
+            n_v=16,
+            partial_chunk=True,
+        ),
     )
     def test_chunked_gdn_per_seq_shared_kq_heads_matches_recurrent_ref(
-        self, n_kq: int, n_v: int
+        self, n_kq: int, n_v: int, partial_chunk: bool
     ):
         chunk, d = 16, 128
         k0, k1, k2, k3, k4, k5 = jax.random.split(jax.random.key(41), 6)
@@ -683,6 +692,10 @@ class GDNChunkedComputeTest(parameterized.TestCase):
         v = jax.random.normal(k2, (n_v, chunk, d))
         gating_log = -jnp.abs(jax.random.normal(k3, (1, chunk, n_v))) * 0.1
         beta = jax.nn.sigmoid(jax.random.normal(k4, (1, chunk, n_v)))
+        if partial_chunk:
+            valid_tokens = chunk - 5
+            gating_log = gating_log.at[:, valid_tokens:, :].set(0.0)
+            beta = beta.at[:, valid_tokens:, :].set(0.0)
         state_prev = jax.random.normal(k5, (n_v, d, d))
         f32 = jnp.dtype(jnp.float32)
         cfg = config.GDNConfig(
@@ -717,7 +730,7 @@ class GDNChunkedComputeTest(parameterized.TestCase):
         np.testing.assert_allclose(state, ref_state[0], rtol=1e-5, atol=1e-5)
 
     def test_pack_unpack_v_head_pairs_roundtrip(self):
-        """Packing and unpacking Qwen 3.8 V-head pairs along lanes is exact."""
+        """Packing and unpacking 8-KQ / 64-V head pairs along lanes is exact."""
         n_kq, n_v, d_k, d_v = 8, 64, 128, 128
         v_per_kq = n_v // n_kq
         x = jax.random.normal(jax.random.key(53), (n_v, d_k, d_v))

@@ -141,7 +141,7 @@ def _dot_kq_with_v_heads(
     axis, so that each matmul fills 2 * v_head_dim MXU columns.
     """
     v_per_kq_head = v_operand.shape[0] // kq_operand.shape[0]
-    pair_v_heads = v_per_kq_head % 2 == 0
+    pair_v_heads = v_per_kq_head % 2 == 0 and v_operand.shape[-1] % 128 == 0
     kq_repeats = v_per_kq_head // 2 if pair_v_heads else v_per_kq_head
     kq_operand = jnp.repeat(kq_operand, kq_repeats, axis=0)
     if pair_v_heads:
@@ -218,9 +218,8 @@ def chunked_gdn_per_seq(
     # the solve below takes L directly, so T is never materialized.
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
 
-    # State-first KQ-head-factored projection: contract unscaled [K; Q] against
-    # state_prev before the triangular solve, so the solve has a single
-    # 128-column right-hand side and W is never formed.
+    # Contract unscaled [K; Q] against state_prev before the triangular solve so
+    # the solve operates on the single v_head_dim-wide residual v_diff.
     # [num_kq_heads, 2 * chunk, kq_head_dim]
     merged_kq = jnp.concat([k_large, q_large], axis=1)
     # [num_v_heads, 2 * chunk, v_head_dim]
