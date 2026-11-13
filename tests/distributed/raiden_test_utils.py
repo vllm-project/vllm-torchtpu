@@ -320,3 +320,80 @@ def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
         _dsv4_group([hca_state], hca_spec),
     ]
     return named, groups
+
+
+def dsv41_materialization(*, num_blocks=16, page_tokens=1024, swa_page_tokens=128):
+    """A DeepSeek-V4.1-Flash materialization, as the decode allocator lays it out.
+
+    `DeepseekV41FlashKVCacheAllocator._initialize_ds_v4_kv_cache` with the
+    checkpoint's `compress_ratios` (layers 2-19 at 2, 20-36 at 1) and
+    `kv_source_layer_ids` [2, 8, 14, 20], no DSpark drafter:
+      * one MLA group paging at 1024 tokens: four CSA layers, NoPE
+        `int32[nb, T, 128]` + RoPE `int32[nb, T / 4, 128]` with T = 512 for
+        ratio 2 and 1024 for ratio 1, plus each layer's seq-along-lane
+        indexer `uint8[nb, 33, 4, T]`.
+      * three SWA groups paging at 128 tokens. Layers overlay the CSA NoPE
+        hosts of the smallest page first (the three ratio-2 layers), then
+        `int32[nb, 2 * 128, 128]` overflow arrays.
+      * one compressor-state group with its own `int32[nb, 512, 128]` arrays.
+
+    Returns `(named_kv_caches, kv_cache_groups)`.
+    """
+
+    def words(rows):
+        return FakeTensor((num_blocks, rows, 128), 4, dtype="torch.int32")
+
+    kv_sources = {2: 2, 8: 2, 14: 2, 20: 1}  # layer -> compress ratio
+    csa_names = [f"model.layers.{i}.self_attn.attn" for i in kv_sources]
+    idx_names = [f"{name}.indexer.k_cache" for name in csa_names]
+
+    named = {}
+    specs = {}
+    nope_hosts = []
+    for (layer, ratio), name, idx_name in zip(kv_sources.items(), csa_names, idx_names):
+        states = page_tokens // ratio
+        nope = words(states)
+        named[name] = (nope, words(states // 4))
+        named[idx_name] = FakeTensor(
+            (num_blocks, 33, 4, states), 1, dtype="torch.uint8"
+        )
+        spec = FakeDsv4Spec(num_states=states, tokens_per_state=ratio)
+        specs[name] = specs[idx_name] = spec
+        if ratio == 2:
+            nope_hosts.append(nope)
+
+    swa_sizes = (5, 4, 4)  # positions 0-2 sit on NoPE hosts, 3+ on overflow
+    swa_groups = []
+    overflow = []
+    layer = 0
+    for size in swa_sizes:
+        names = []
+        for position in range(size):
+            name = f"model.layers.{layer}.self_attn.swa_cache"
+            layer += 1
+            if position < len(nope_hosts):
+                named[name] = nope_hosts[position]
+            else:
+                while len(overflow) <= position - len(nope_hosts):
+                    overflow.append(words(2 * swa_page_tokens))
+                named[name] = overflow[position - len(nope_hosts)]
+            names.append(name)
+        swa_groups.append(names)
+    swa_spec = FakeDsv4Spec(
+        num_states=swa_page_tokens, tokens_per_state=1, sliding_window=128
+    )
+
+    state_names = [f"{name}.compressor.state_cache" for name in csa_names[:3]]
+    for name in state_names:
+        named[name] = words(512)
+    state_spec = FakeDsv4Spec(num_states=64, tokens_per_state=1, sliding_window=8)
+
+    groups = [
+        FakeKVCacheGroup(
+            csa_names + idx_names,
+            FakeUniformTypeSpecs({name: specs[name] for name in csa_names + idx_names}),
+        ),
+        *(_dsv4_group(names, swa_spec) for names in swa_groups),
+        _dsv4_group(state_names, state_spec),
+    ]
+    return named, groups

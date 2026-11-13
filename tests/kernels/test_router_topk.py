@@ -24,7 +24,12 @@ import pytest
 import torch
 from jax import lax
 
-from vllm_torchtpu.kernels.router_topk import MAX_BLOCK_ROWS, select
+from vllm_torchtpu.kernels.router_topk import (
+    MAX_BLOCK_ROWS,
+    select,
+    select_with_bias,
+    select_with_raw,
+)
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 EXPERTS = 512
@@ -164,3 +169,59 @@ def test_kernel_ties_and_nan_match_the_reference():
 def test_grid_rounds_up_over_the_tuned_block(rows, grid):
     block = min(MAX_BLOCK_ROWS, rows)
     assert -(-rows // block) == grid
+
+
+@pytest.mark.parametrize("rows", [8, 250, 512, 1000, 1024, 2048, 4096])
+def test_select_with_raw_and_bias_match_torch_reference(rows):
+    rng = np.random.default_rng(rows + 123)
+    raw = rng.random((rows, 384), dtype=np.float32)
+    bias = (rng.random((1, 384), dtype=np.float32) - 0.5) * 0.2
+    biased = raw + bias
+
+    kw_raw, ki_raw = select_with_raw(
+        jnp.asarray(biased), jnp.asarray(raw), 6, interpret=True
+    )
+    kw_bias, ki_bias = select_with_bias(
+        jnp.asarray(raw), jnp.asarray(bias), 6, interpret=True
+    )
+    _, ri = rowmax_topk(torch.from_numpy(biased), 6)
+    rw = np.take_along_axis(raw, ri.numpy(), axis=-1)
+
+    np.testing.assert_array_equal(np.asarray(ki_raw), ri.numpy())
+    np.testing.assert_array_equal(np.asarray(kw_raw), rw)
+    np.testing.assert_array_equal(np.asarray(ki_bias), ri.numpy())
+    np.testing.assert_array_equal(np.asarray(kw_bias), rw)
+
+
+@pytest.mark.parametrize("rows", [8, 256, 512, 1024, 2048])
+@pytest.mark.parametrize("scoring_fn", ["sqrtsoftplus", "sigmoid", "softmax"])
+def test_fused_router_with_bias_matches_torch_reference(rows, scoring_fn):
+    import torch.nn.functional as F
+
+    rng = np.random.default_rng(rows + 456)
+    logits = rng.standard_normal((rows, 384), dtype=np.float32) * 1.5
+    bias = (rng.random((1, 384), dtype=np.float32) - 0.5) * 0.2
+    scale = 2.5
+
+    logits_t = torch.from_numpy(logits)
+    if scoring_fn == "sqrtsoftplus":
+        scores_t = torch.sqrt(F.softplus(logits_t))
+    elif scoring_fn == "sigmoid":
+        scores_t = logits_t.sigmoid()
+    else:
+        scores_t = logits_t.softmax(dim=-1)
+    bias_t = torch.from_numpy(bias)
+    rw_t, ri_t = rowmax_topk(scores_t + bias_t, 6, raw_scores=scores_t)
+    rw_t = (rw_t / torch.clamp(rw_t.sum(dim=-1, keepdim=True), min=1e-20)) * scale
+
+    kw, ki = select_with_bias(
+        jnp.asarray(logits),
+        jnp.asarray(bias),
+        6,
+        interpret=True,
+        scoring_fn=scoring_fn,
+        renormalize=True,
+        routed_scaling_factor=scale,
+    )
+    np.testing.assert_array_equal(np.asarray(ki), ri_t.numpy())
+    np.testing.assert_allclose(np.asarray(kw), rw_t.numpy(), rtol=1e-5, atol=1e-6)

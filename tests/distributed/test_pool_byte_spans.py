@@ -802,3 +802,20 @@ def test_glm_row_spans_validation_failures():
             assert message in str(exc), (overrides, exc)
         else:
             raise AssertionError(f"accepted invalid input: {overrides}")
+
+
+def test_dsv4_row_spans_ship_whole_tail_pages_when_asked():
+    # DeepSeek-V4.1's seq-along-lane indexer keeps every token on every row,
+    # so no row prefix is a token prefix: the tail page goes whole.
+    idx = dict(page_tokens=1024, live_bytes_per_block=33 * 4 * 1024, row_bytes=4096)
+    registration = _dsv4_row_spans(
+        idx, tag="dsv4.idx.s33x4x1024.g0", num_tokens=1500, block_ids=[1, 2],
+        whole_tail_page=True,
+    )
+    assert [span.size_bytes for span in registration.spans] == [
+        idx["live_bytes_per_block"]
+    ] * 2
+    trimmed = _dsv4_row_spans(
+        idx, tag="dsv4.idx.s33x4x1024.g0", num_tokens=1500, block_ids=[1, 2]
+    )
+    assert trimmed.spans[-1].size_bytes < idx["live_bytes_per_block"]

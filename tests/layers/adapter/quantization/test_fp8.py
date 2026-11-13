@@ -1168,6 +1168,100 @@ class TestFp8LinearRuntimeQuant:
 
 
 @pytest.mark.tpu_test
+class TestDeepseekV41FlashFp8Linear:
+    """DeepSeek-V4.1-Flash's 32x32 ue8m0 block-scaled linear layers."""
+
+    @staticmethod
+    def _layer(device, out_dim, in_dim, scale_inv):
+        layer = torch.nn.Module()
+        layer.logical_widths = None
+        layer.weight = torch.nn.Parameter(
+            torch.ones(out_dim, in_dim, device=device, dtype=torch.bfloat16).to(
+                torch.float8_e4m3fn
+            ),
+            requires_grad=False,
+        )
+        layer.weight_scale_inv = torch.nn.Parameter(scale_inv, requires_grad=False)
+        return layer
+
+    def test_ue8m0_scales_match_fp32_scales(self, device):
+        from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
+            VllmDeepseekV41FlashFp8LinearMethod,
+        )
+
+        exponents = torch.tensor([[127, 128], [129, 130]], device=device)
+        ue8m0 = exponents.to(torch.uint8).view(torch.float8_e8m0fnu)
+        fp32 = torch.tensor([[1.0, 2.0], [4.0, 8.0]], device=device)
+        layer = self._layer(device, 64, 64, ue8m0)
+        ref = self._layer(device, 64, 64, fp32)
+
+        quant = FakeQuant(weight_block_size=[32, 32])
+        VllmDeepseekV41FlashFp8LinearMethod(quant).process_weights_after_loading(layer)
+        VllmFp8LinearMethodTPU(quant).process_weights_after_loading(ref)
+
+        assert torch.equal(layer.weight.float(), ref.weight.float())
+        assert torch.equal(layer.weight_scale, ref.weight_scale)
+
+    @pytest.mark.parametrize(
+        ("block", "is_v41"), [([32, 32], True), ([128, 128], False)]
+    )
+    def test_dispatch_by_layout(self, monkeypatch, block, is_v41):
+        from vllm.model_executor.layers.linear import LinearBase
+
+        from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
+            VllmDeepseekV4Fp8Config,
+            VllmDeepseekV41FlashFp8LinearMethod,
+        )
+
+        monkeypatch.setattr(
+            VllmDeepseekV4Fp8Config, "is_scale_e8m0", property(lambda self: True)
+        )
+        # get_quant_method only needs the isinstance check and the sizes.
+        layer = LinearBase.__new__(LinearBase)
+        torch.nn.Module.__init__(layer)
+        layer.output_size, layer.input_size = 256, 256
+        cfg = VllmDeepseekV4Fp8Config.from_config(
+            {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": block,
+            }
+        )
+        method = cfg.get_quant_method(layer, prefix="model.layers.0.attn.wq_a")
+        assert isinstance(method, VllmFp8LinearMethodTPU)
+        assert isinstance(method, VllmDeepseekV41FlashFp8LinearMethod) is is_v41
+
+    @pytest.mark.parametrize(
+        ("prefix", "out_dim", "in_dim", "blockwise"),
+        [
+            ("attn.wq_a", 256, 256, True),
+            ("attn.wo_a", 256, 256, False),
+            ("attn.wq_a", 256, 160, False),
+            ("attn.wq_a", 96, 256, False),
+        ],
+    )
+    def test_per_channel_fallbacks(
+        self, device, monkeypatch, prefix, out_dim, in_dim, blockwise
+    ):
+        from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
+            VllmDeepseekV41FlashFp8LinearMethod,
+        )
+
+        monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")
+        monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "128")
+        scale_inv = torch.ones(out_dim // 32, in_dim // 32, device=device)
+        layer = self._layer(device, out_dim, in_dim, scale_inv)
+
+        method = VllmDeepseekV41FlashFp8LinearMethod(
+            FakeQuant(weight_block_size=[32, 32]), prefix=prefix
+        )
+        method.process_weights_after_loading(layer)
+
+        expected = (1, in_dim // 128, 1, out_dim) if blockwise else (out_dim,)
+        assert layer.weight_scale.shape == expected
+
+
+@pytest.mark.tpu_test
 class TestFp8WeightTranspose:
     """Tests for weight transpose in MoE processing."""
 

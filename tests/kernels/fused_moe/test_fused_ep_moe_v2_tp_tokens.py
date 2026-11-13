@@ -397,3 +397,103 @@ def test_split_stages_with_replicas_are_bit_exact(single_host_mesh, groups, rows
         )
     )(rank, (q_g, weights, payload), *inputs)
     np.testing.assert_array_equal(np.asarray(split), np.asarray(fused))
+
+
+def test_precomputed_routing_distinct_rows_all_quarters():
+    """Distinct per-rank rows (0..16383) under precomputed_routing compute all tokens."""
+
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import _build_op
+
+    devs = jax.local_devices()
+    if len(devs) < 2 or devs[0].platform != "tpu":
+        pytest.skip("requires at least two local TPU TensorCores")
+    ep = 2
+    mesh = Mesh(np.asarray(devs[:ep]), (AXIS,))
+    T, H, inter, E, K, QB = 16384, 512, 256, 8, 4, 256
+    key = jax.random.PRNGKey(20261012)
+    kx, k1, k2, k1s, k2s, kid, kw = jax.random.split(key, 7)
+
+    x_np = (np.asarray(jax.random.normal(kx, (T, H), jnp.float32)) * 0.5).astype(
+        np.float32
+    )
+    w1 = jax.lax.bitcast_convert_type(
+        jax.random.randint(k1, (E, H, inter), 0, 255, dtype=jnp.uint8),
+        jnp.float4_e2m1fn,
+    ).reshape(E, H, 2 * inter)
+    w2 = jax.lax.bitcast_convert_type(
+        jax.random.randint(k2, (E, inter, H // 2), 0, 255, dtype=jnp.uint8),
+        jnp.float4_e2m1fn,
+    ).reshape(E, inter, H)
+    w1s = (
+        jnp.abs(jax.random.normal(k1s, (E, H // QB, 2 * inter), jnp.float32)) * 0.02
+        + 0.01
+    )
+    w2s = (
+        jnp.abs(jax.random.normal(k2s, (E, inter // QB, H), jnp.float32)) * 0.02 + 0.01
+    )
+    ids = jnp.argsort(jax.random.uniform(kid, (T, E)), axis=-1)[:, :K].astype(jnp.int32)
+    tw = jnp.abs(jax.random.normal(kw, (T, K), jnp.float32)) + 0.1
+    tw = tw / jnp.sum(tw, axis=-1, keepdims=True)
+    rank = jnp.arange(ep, dtype=jnp.int32).reshape(ep, 1)
+
+    sh = lambda a: jax.device_put(  # noqa: E731
+        a, NamedSharding(mesh, P(AXIS, *([None] * (a.ndim - 1))))
+    )
+    x_bf16 = jnp.asarray(x_np, dtype=jnp.bfloat16)
+    args = tuple(sh(a) for a in (x_bf16, w1, w2, w1s, w2s, ids, tw, rank))
+
+    ref = np.asarray(
+        jax.block_until_ready(
+            fused_ep_moe_v2(
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+                None,
+                rank=args[7],
+                topk=K,
+                renormalize=False,
+                mesh=mesh,
+                capacity=128,
+                weight_format=WeightFormat.FP4,
+                rhs_qb=QB,
+                act_fn="silu",
+                sharded_plan=True,
+                hash_topk_ids=args[5],
+                topk_weights_override=args[6],
+                routed_scaling_factor=1.0,
+                token_replica_groups=None,
+                subchannel_fp8=False,
+                requantize_mid=True,
+                wire_bf16=False,
+            )
+        ).astype(jnp.float32)
+    )
+    # Build via _build_op with precomputed_routing=True even with non-None groups
+    os.environ["VLLM_DSV41_MOE_V2_SUBCHANNEL_FP8"] = "0"
+    built_op = _build_op(
+        mesh,
+        K,
+        False,
+        "silu",
+        None,
+        True,
+        "fp4",
+        QB,
+        "softmax",
+        False,
+        1.0,
+        False,
+        True,
+        token_replica_groups=((0, 1),),
+    )
+    out = np.asarray(jax.block_until_ready(built_op._jax_fn(*args)).astype(jnp.float32))
+    q = T // 4
+    for i in range(4):
+        sl = slice(i * q, (i + 1) * q)
+        rel = float(
+            np.linalg.norm(out[sl] - ref[sl])
+            / max(float(np.linalg.norm(ref[sl])), 1e-30)
+        )
+        assert rel == 0.0, f"Quarter {i} ([{sl.start}:{sl.stop}]) rel_diff={rel}"

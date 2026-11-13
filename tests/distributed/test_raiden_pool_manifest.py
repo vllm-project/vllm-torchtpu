@@ -28,9 +28,12 @@ from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from .raiden_test_utils import (
     FakeTensor,
     dsv4_materialization,
+    dsv41_materialization,
     glm_named_kv_caches,
     kimi_pool_manifest,
 )
+
+pytestmark = pytest.mark.cpu_test
 
 
 def _fa_group(layer_names, *, block_size, num_kv_heads, head_size):
@@ -1298,6 +1301,104 @@ def test_dsv4_state_cache_name_resolves_its_compressed_kv_layer():
     )
     with pytest.raises(rpm.ManifestError, match="cannot be derived"):
         rpm.dsv4_compressed_kv_layer_name("model.layers.3.self_attn.attn")
+
+
+def test_dsv4_v40_pools_keep_token_major_tail_regions():
+    named, groups = dsv4_materialization()
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    )
+    assert {pool.regions[0].name for pool in manifest.pools} == {
+        rpm.DSV4_REGION_ROWS
+    }
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4.1 (CSA at ratio 1/2, seq-along-lane indexer, SWA overflow hosts).
+# ---------------------------------------------------------------------------
+
+
+def _dsv41_manifest(**kwargs):
+    named, groups = dsv41_materialization(**kwargs)
+    return rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    )
+
+
+def test_dsv41_manifest_splits_each_role_by_page_shape():
+    manifest = _dsv41_manifest()
+
+    assert manifest.binding == rpm.BINDING_PRIVATE_TYPED
+    assert manifest.tag_counts() == {
+        # Ratio 2 pages 512 states per 1024 tokens, ratio 1 pages 1024.
+        "dsv4.csa.nope.s512x1x128.g0": 3,
+        "dsv4.csa.nope.s1024x1x128.g0": 1,
+        "dsv4.csa.rope.s128x1x128.g0": 3,
+        "dsv4.csa.rope.s256x1x128.g0": 1,
+        "dsv4.idx.s33x4x512.g0": 3,
+        "dsv4.idx.s33x4x1024.g0": 1,
+        # SWA overlays the three ratio-2 NoPE hosts, then 256-row overflow.
+        "dsv4.swa.s512x1x128.g1": 3,
+        "dsv4.swa.s256x1x128.g1": 2,
+        "dsv4.swa.s512x1x128.g2": 3,
+        "dsv4.swa.s256x1x128.g2": 1,
+        "dsv4.swa.s512x1x128.g3": 3,
+        "dsv4.swa.s256x1x128.g3": 1,
+        # Every state array has one shape, so its tag is not split.
+        "dsv4.state.csa.g4": 3,
+    }
+    geometry = manifest.geometry_by_tag()
+    assert geometry["dsv4.idx.s33x4x512.g0"]["live_bytes_per_block"] == 33 * 4 * 512
+    assert geometry["dsv4.csa.rope.s256x1x128.g0"]["live_bytes_per_block"] == (
+        256 * 512
+    )
+
+
+def test_dsv41_swa_group_on_one_host_shape_keeps_its_plain_tag():
+    # Drop the overflow layers of group 1: its three layers all sit on NoPE
+    # hosts, so there is nothing to split.
+    named, groups = dsv41_materialization()
+    swa_group = groups[1]
+    for name in swa_group.layer_names[3:]:
+        del named[name]
+        del swa_group.kv_cache_spec.kv_cache_specs[name]
+    del swa_group.layer_names[3:]
+
+    counts = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    ).tag_counts()
+
+    assert counts["dsv4.swa.g1"] == 3
+    assert "dsv4.swa.s512x1x128.g1" not in counts
+
+
+def test_dsv41_pools_ship_whole_tail_pages():
+    manifest = _dsv41_manifest()
+    assert {pool.regions[0].name for pool in manifest.pools} == {
+        rpm.DSV4_REGION_PAGES
+    }
+
+
+def test_dsv41_ratio_one_csa_is_not_mistaken_for_hca():
+    """V4.0's HCA also reports tokens_per_state 1; the (nope, rope) pair is
+    what makes a V4.1 ratio-1 layer CSA."""
+    manifest = _dsv41_manifest()
+    layer20 = {
+        pool.tag for pool in manifest.pools
+        if pool.layer_name == "model.layers.20.self_attn.attn"
+    }
+    assert layer20 == {"dsv4.csa.nope.s1024x1x128.g0", "dsv4.csa.rope.s256x1x128.g0"}
+
+
+def test_dsv41_manifest_rejects_an_indexer_in_neither_layout():
+    named, groups = dsv41_materialization()
+    named["model.layers.2.self_attn.attn.indexer.k_cache"] = FakeTensor(
+        (16, 33, 4, 384), 1, dtype="torch.uint8"
+    )
+    with pytest.raises(rpm.ManifestError, match="seq-along-lane"):
+        rpm.build_dsv4_pool_manifest(
+            named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+        )
 
 
 def test_glm_manifest_per_layer_tags():
