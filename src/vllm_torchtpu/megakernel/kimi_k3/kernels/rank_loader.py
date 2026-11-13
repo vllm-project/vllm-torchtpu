@@ -453,11 +453,12 @@ def _planned_router(family: np.ndarray, order: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(np.take_along_axis(family, order[:, None, :], axis=-1))
 
 
-def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers):
+def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers, only=None):
     """``RankDir.regrouped_expert_parts`` for EP16/TP2 with a placement plan:
     chip ``rank // 2`` holds, per layer, the experts ``order[l, 56 c:56 c + 56]``
     (from any EP8 group's pre-shard), half the intermediate (quarters
-    2 (rank % 2) and 2 (rank % 2) + 1)."""
+    2 (rank % 2) and 2 (rank % 2) + 1). ``only``: just that layer, from the one
+    file holding it."""
     spec = rank_dir.spec(name)
     shape = tuple(spec["shape"])  # [layers, 112, ...] per quarter
     dtype = _dtype(spec["dtype"])
@@ -473,23 +474,27 @@ def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers):
     count = len(spec["files"])
     nbytes = int(np.prod((56,) + shape[2:])) * dtype.itemsize * len(quarters)
     for index, (filename, (lo, hi)) in enumerate(zip(spec["files"], spec["layer_ranges"])):
-        def reader(filename=filename, lo=lo, hi=hi):
+        first, stop = (lo, hi) if only is None else (only, only + 1)
+        if not lo <= first < stop <= hi:
+            continue
+
+        def reader(filename=filename, lo=lo, first=first, stop=stop):
             # One contiguous read per (layer, expert, quarter), many in flight:
             # memmap page faults over network storage are far slower.
             expert_bytes = int(np.prod(shape[2:])) * dtype.itemsize
-            raw = {q: np.empty((hi - lo, 56, *shape[2:]), dtype) for q in quarters}
+            raw = {q: np.empty((stop - first, 56, *shape[2:]), dtype) for q in quarters}
             jobs = []
-            for layer in range(lo, hi):
+            for layer in range(first, stop):
                 experts = order[layer, 56 * chip:56 * chip + 56]
                 for slot, expert in enumerate(experts):
                     group, index = int(expert) // 112, int(expert) % 112
                     for q in quarters:
                         offset = ((layer - lo) * shape[1] + index) * expert_bytes
-                        jobs.append((source(group, q).path / filename, offset, raw[q][layer - lo, slot]))
+                        jobs.append((source(group, q).path / filename, offset, raw[q][layer - first, slot]))
             with ThreadPoolExecutor(32) as pool:
                 list(pool.map(lambda job: read_into(job[0], job[1], job[2], streams=1), jobs))
             return _join_quarters(name, [raw[q] for q in quarters])
-        yield f"{name}@{index}/{count}", (hi - lo) * nbytes, reader
+        yield f"{name}@{index}/{count}", (stop - first) * nbytes, reader
 
 
 def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 93,
@@ -569,6 +574,48 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
                 family = _planned_router(family, plan)
             yield "moe", name, family
         del families
+
+
+def read_moe_layer(presharded, rank: int, layer: int, *, layers: int = 93) -> dict[str, np.ndarray]:
+    """MoE layer ``layer`` of the prefill's weights for ``rank``, read on its
+    own (the single-layer MoE bench): each fused MoE family
+    (``prefill_megakernel.MOE_FAMILIES``) as :func:`iter_prefill_rank` lays it
+    out, with a layer axis of one, and the layer's residual mixture weights
+    ``mlp_res`` [1, hidden] FP32 and ``ffn_norm`` [1, hidden] (model layer
+    ``layer + 1``). Without an ``expert_plan`` the identity placement reads the
+    same experts as :meth:`RankDir.regrouped_expert_parts`."""
+    rank_dir = RankDir(presharded, rank, layers)
+    plan = expert_plan(layers)
+    if plan is None:
+        plan = np.tile(np.arange(896), (layers - 1, 1))
+    cache = Path(presharded) / "prefill-sp-cache"
+    layout = json.loads((cache / "layout.json").read_text())
+    if layout.get("layers") != layers:
+        raise ValueError(f"unexpected projection cache {cache}")
+
+    def one(path, spec, index):
+        """Entry ``index`` of a family stored whole at ``spec['offset']``."""
+        shape, dtype = tuple(spec["shape"]), _dtype(spec["dtype"])
+        offset = spec.get("offset", 0) + index * int(np.prod(shape[1:])) * dtype.itemsize
+        return read_array(path, offset, (1, *shape[1:]), dtype)
+
+    dense = rank_dir.path / "dense.bin"
+    parity = rank % 2
+    jobs = {name: (lambda n=name: one(dense, rank_dir.spec(n), layer)) for name in PREFILL_MOE_DENSE}
+    jobs.update({name: (lambda n=name: one(dense, rank_dir.spec(n), layer + 1)[0]) for name in ("mlp_res", "ffn_norm")})
+    for name, source in (("latent_down", "latent_down"), ("latent_up", "latent_up"),
+                         ("shared_gu", f"shared_gu_{parity}"), ("shared_down", f"shared_down_{parity}")):
+        spec = layout["families"][source]
+        jobs[name] = lambda s=spec: one(cache / s["file"], s, layer)
+    for name in EXPERT_FAMILIES:
+        ((_, _, reader),) = _planned_expert_parts(presharded, rank_dir, name, rank, plan, layers, only=layer)
+        jobs[name] = reader
+    with ThreadPoolExecutor(8) as pool:
+        futures = {name: pool.submit(job) for name, job in jobs.items()}
+        weights = {name: future.result() for name, future in futures.items()}
+    for name in ("router", "router_bias"):
+        weights[name] = _planned_router(weights[name], plan[layer:layer + 1])
+    return weights
 
 
 def to_device(mesh, iterator_for_rank, *, axis=None, ranks_in_flight: int = 8):
