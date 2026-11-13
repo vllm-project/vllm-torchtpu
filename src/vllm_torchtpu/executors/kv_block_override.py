@@ -28,6 +28,8 @@ its workers (multiproc and Ray multi-host); build 155 failed on the Ray
 path's own copy of this logic, which still demanded exact agreement.
 """
 
+from typing import Any, cast
+
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -88,9 +90,9 @@ def reconcile_num_gpu_blocks_override(
             "sizes the pool from its own measured free HBM, so a "
             "spread this large means the workers do not have "
             "comparable HBM budgets -- check the per-worker "
-            "'Compact-mamba KV cache:' lines in "
-            "tpu_runner._maybe_set_compact_mamba_num_blocks_"
-            f"override for the outlier. Per-worker values: "
+            "'Compact-mamba KV cache:' lines "
+            "(KVCacheManager.size_compact_mamba_kv_cache) "
+            f"for the outlier. Per-worker values: "
             f"{sorted(overrides)}"
         )
     logger.info(
@@ -105,3 +107,28 @@ def reconcile_num_gpu_blocks_override(
         lo,
     )
     return lo
+
+
+def adopt_worker_num_gpu_blocks_override(executor: Any) -> None:
+    """Copy the workers' agreed `num_gpu_blocks_override` to the engine config.
+
+    The workers' hybrid KV sizing sets the override on their own cache_config:
+    the uniform layout in `get_kv_cache_spec` (the workers then skip their
+    profile run), the compact-mamba layout in `determine_available_memory`,
+    after the profile run. Workers are separate processes, so every executor
+    must copy the value to the engine-side config after both calls, or vLLM
+    derives its own block count, which does not match the per-layer TPU
+    allocation. A no-op once the engine has a value (the user's
+    --num-gpu-blocks-override, or one copied by the first call). Shared so
+    the executors cannot drift apart again.
+    """
+    cache_config = executor.vllm_config.cache_config
+    if cache_config.num_gpu_blocks_override is not None:
+        return
+    pc = executor.vllm_config.parallel_config
+    agreed = reconcile_num_gpu_blocks_override(
+        cast(list, executor.collective_rpc("get_num_gpu_blocks_override")),
+        workers_per_stage=pc.world_size // pc.pipeline_parallel_size,
+    )
+    if agreed is not None:
+        cache_config.num_gpu_blocks_override = agreed

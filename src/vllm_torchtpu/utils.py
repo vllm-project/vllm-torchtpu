@@ -72,21 +72,40 @@ def get_dp_size(parallel_config) -> int:
     )
 
 
+def min_over_group(value: int, cpu_group: Any) -> int:
+    """Return the minimum of `value` over the ranks of a gloo `cpu_group`."""
+    t = torch.tensor([value], dtype=torch.int64, device="cpu")
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=cpu_group)
+    return int(t.item())
+
+
+def dp_engines_in_lockstep(parallel_config) -> bool:
+    """Whether EP couples the DP engines. Their MoE combine reduces partial
+    expert outputs across engines, so every engine must enter the same
+    collectives with matching token buckets each step; uncoupled DP engines
+    stay independently schedulable."""
+    return get_dp_size(parallel_config) > 1 and parallel_config.enable_expert_parallel
+
+
+def ep_rank(
+    *, dp_rank: int, tp_rank: int, tp_size: int, pcp_rank: int = 0, pcp_size: int = 1
+) -> int:
+    """vLLM's EP rank of a DP x PCP x TP rank: the EP group spans all three,
+    DP-major."""
+    return (dp_rank * pcp_size + pcp_rank) * tp_size + tp_rank
+
+
 def min_across_ep_dp(parallel_config, value: int) -> int:
     """Return the minimum of `value` across the DP engines coupled by EP.
 
     EP-coupled engines must compile identical programs, so a value baked into
     them (such as the KV cache size) has to agree; uncoupled engines keep theirs.
     """
-    if get_dp_size(parallel_config) == 1 or not parallel_config.enable_expert_parallel:
+    if not dp_engines_in_lockstep(parallel_config):
         return value
     from vllm.distributed.parallel_state import get_dp_group
 
-    t = torch.tensor([value], dtype=torch.int64, device="cpu")
-    torch.distributed.all_reduce(
-        t, op=torch.distributed.ReduceOp.MIN, group=get_dp_group().cpu_group
-    )
-    return int(t.item())
+    return min_over_group(value, get_dp_group().cpu_group)
 
 
 def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
@@ -120,8 +139,19 @@ def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
     return usage
 
 
+def local_device_kind() -> str:
+    """The `device_kind` of this process's first local JAX device (e.g.
+    `"TPU7x"`, or `"cpu"` off TPU). No collective."""
+    devices = jax.local_devices()
+    if not devices:
+        raise RuntimeError(
+            "No local JAX devices in this process; can't read the device kind"
+        )
+    return str(devices[0].device_kind)
+
+
 def get_device_name(num_devices: int | None = None):
-    kind = jax.devices()[0].device_kind
+    kind = local_device_kind()
     if "TPU" not in kind:
         raise RuntimeError("Expected TPU devices")
     suffix = ""
@@ -211,7 +241,7 @@ class HbmReserves(NamedTuple):
       kv_connector:    what the KV connector allocates, such as the offload
                        H2D staging pool.
       lora_slot_write: what an adapter swap holds while it runs.
-      pp_handoff:      what the pipeline ring hand-off's buffers take.
+      pp_handoff:      what the buffered pipeline hand-off's buffers take.
     """
 
     kv_connector: int

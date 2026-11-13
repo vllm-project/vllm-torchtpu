@@ -90,6 +90,7 @@ from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
 )
+from vllm_torchtpu.layers.adapter.pcp_kv_gather import is_pcp_kv_gather_metadata
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
     attention_bundled,
@@ -98,6 +99,7 @@ from vllm_torchtpu.layers.core.attention_interface import (
     ragged_paged_attention_batched,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.layers.core.quantization import quantize_kv
 from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
@@ -208,6 +210,41 @@ def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
     min_page_size = cdiv(local_max_model_len, max_num_page_per_req)
     min_page_size = 1 << (min_page_size - 1).bit_length()
     return min_page_size
+
+
+def kv_page_head_padding(
+    pool_page: tuple[int, ...],
+    native_page: tuple[int, ...],
+    pool_head_dim: int,
+    head_size: int,
+) -> int:
+    """How far to pad q/k/v so they match the head width of the KV page.
+
+    A layer writing its own native page needs no padding: the RPA kernels align
+    head_dim themselves, and the head_dim=64 page packs K and V along its last
+    axis, so that axis is twice the head width. Only a page defined by another
+    spec, such as a draft layer sharing the target's unified pool, needs q/k/v
+    padded out to the page width.
+
+    `native_page` comes from `PallasAttentionBackend.get_kv_cache_shape`, the
+    head-along-sublane layout. A SEQ_ALONG_LANE pool (`VLLM_KV_CACHE_LAYOUT=HND`)
+    never matches it, so those layers keep the width rule they had before.
+
+    Args:
+        pool_page: Trailing `(heads, packing, head_dim)` axes of the allocated
+            KV pool, after the block and page-size axes.
+        native_page: The same trailing axes that
+            `PallasAttentionBackend.get_kv_cache_shape` would allocate for this
+            layer on its own pool.
+        pool_head_dim: Effective head width of `pool_page`.
+        head_size: Unpadded head size of this attention layer.
+
+    Returns:
+        Elements of zero-padding to append along the head dimension of q/k/v.
+    """
+    if pool_page == native_page or pool_head_dim <= head_size:
+        return 0
+    return pool_head_dim - head_size
 
 
 def _reshape_packed_kv_cache(kv_cache: jax.Array, shape: tuple[int, ...]) -> jax.Array:
@@ -698,17 +735,21 @@ class PallasAttentionBackend(AttentionBackend):
         return 1024 * 1024 // 2 // pages_per_req // 4
 
     # TPU has limited SREGs (scalar registers), if page_size is too small, we
-    # can spill SREGs easily which leads to bad performance. The strategy we
-    # apply here is trying to split max-model-len to 16 pages which make the
-    # spill less likely. Meanwhile we make sure the page size is in [16, 256].
+    # can spill SREGs easily which leads to bad performance. Up to 8192 tokens
+    # we split max-model-len into 16 pages to make the spill less likely, and
+    # keep the page size in [16, 256].
     @staticmethod
     def get_page_size(vllm_config: VllmConfig) -> int:
-        # TODO: This is a temporary fix for vmem OOM.
-        # For long model length, we use 16 page-size to avoid too much
-        # VMEM spill. A more robust solution should be implemented to
-        # handle VREG spills.
+        # Longer contexts use 128-token pages. KV offload moves one page of one
+        # layer per transfer, so smaller pages multiply the transfer count. The
+        # RPA kernels size their VMEM blocks in tokens (bkv_sz) and only align
+        # them to the page size, so the page size does not set VMEM use. 128 is
+        # the smallest page the CUSTOM backend supports, which keeps both
+        # backends on the same page size and prefix-cache granularity.
+        # TpuPlatform.update_block_size_for_backend still raises the page size
+        # to get_min_page_size when the block table would not fit in SMEM.
         if vllm_config.model_config.max_model_len > 8192:
-            return 16
+            return 128
         page_size = next_power_of_2(vllm_config.model_config.max_model_len) // 16
         if page_size <= 16:
             return 16
@@ -1517,8 +1558,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pool_head_dim = kv_cache.shape[-3] * kv_cache.shape[-2]
         else:
             pool_head_dim = kv_cache.shape[-1]
-        if pool_head_dim > self.head_size:
-            pad_size = pool_head_dim - self.head_size
+        # A layer writing its own native page is never padded, even when the
+        # page is wider than head_size (the head_dim=64 page packs K and V along
+        # its last axis). Only a page defined by another spec is padded.
+        native_page = PallasAttentionBackend.get_kv_cache_shape(
+            1, 1, self.num_kv_heads, self.head_size, kv_cache.dtype
+        )[2:]
+        pad_size = kv_page_head_padding(
+            tuple(kv_cache.shape[-3:]), native_page, pool_head_dim, self.head_size
+        )
+        if pad_size:
             query = torch.nn.functional.pad(query, (0, pad_size))
             key = torch.nn.functional.pad(key, (0, pad_size))
             value = torch.nn.functional.pad(value, (0, pad_size))
@@ -2005,16 +2054,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 "not replicated and both share a dtype (dcp=%d).",
                 self.dcp_size,
             )
+        pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+        self.pcp_kv_gather = envs.USE_TPU_PCP_MANAGER and self.dcp_size > 1
+        self.pcp_size = pcp_size if self.pcp_kv_gather else 1
         if self.dcp_size > 1:
-            # The indexer refuses pcp>1 and dcp>1 together (see
-            # `VllmTPUSparseAttnIndexer.__init__`)
-            pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
-            if isinstance(pcp_size, int) and pcp_size > 1:
-                raise NotImplementedError(
-                    f"pcp_size={pcp_size} and dcp_size={self.dcp_size} are "
-                    "both >1; sparse MLA has one KV-position interleave, "
-                    "not two."
-                )
             if self.dcp_interleave_size % kv_cache_utils.WORD_BYTES:
                 raise ValueError(
                     "DCP sparse MLA needs --cp-kv-cache-interleave-size to be "
@@ -2374,6 +2417,245 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_dcp_impl
 
+    def _build_pcp_write_split_op(self, layer: Any):
+        """Write the split prefill rows; see `sparse_mla_pcp_write_split`."""
+        from vllm_torchtpu.layers.core.attention_interface import (
+            sparse_mla_pcp_write_split,
+        )
+
+        mesh = self._dcp_mesh
+        assert mesh is not None
+        dcp_size = self.dcp_size
+        pcp_size = self.pcp_size
+        interleave_size = self.dcp_interleave_size
+
+        def pcp_write_split_core(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            restore_idx: jax.Array,
+            split_seq_lens: jax.Array,
+            split_block_tables: jax.Array,
+            split_query_start_loc: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
+            return sparse_mla_pcp_write_split(
+                kv_cache_nope,
+                kv_cache_rope,
+                kv_c_normed,
+                k_pe,
+                restore_idx,
+                split_seq_lens,
+                split_block_tables,
+                split_query_start_loc,
+                mesh,
+                nope_spec,
+                rope_spec,
+                dcp_size=dcp_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+            )
+
+        sharded = P(DCP_AXIS_NAME)
+        replicated = P()
+        op_name = f"pallas::pcp_write_split_{layer.layer_name.replace('.', '_')}"
+        jax_op = pcp_streaming_jax_op(
+            op_name,
+            pcp_write_split_core,
+            donate_argnums=(0, 1),
+            mesh=mesh,
+            input_partition_specs=(
+                sharded,  # kv_cache_nope
+                sharded,  # kv_cache_rope
+                sharded,  # kv_c_normed: local rows
+                sharded,  # k_pe
+                replicated,  # restore_idx
+                replicated,  # split_seq_lens
+                replicated,  # split_block_tables
+                replicated,  # split_query_start_loc
+            ),
+            output_partition_specs=(sharded, sharded),
+        )
+
+        def _fake(kv_cache_nope, kv_cache_rope, *rest, **kwargs):
+            del rest, kwargs
+            return torch.empty_like(kv_cache_nope), torch.empty_like(kv_cache_rope)
+
+        jax_op.register_fake(_fake)
+
+        def pcp_write_split_impl(
+            kv_cache: tuple[torch.Tensor, torch.Tensor], *args: torch.Tensor
+        ) -> None:
+            nope_cache, rope_cache = kv_cache
+            new_nope, new_rope = jax_op(nope_cache, rope_cache, *args)
+            nope_cache.copy_(new_nope)
+            rope_cache.copy_(new_rope)
+
+        return pcp_write_split_impl
+
+    def _build_pcp_prefill_op(self, layer: Any):
+        """Split-prefill attention; see `sparse_mla_attention_pcp_prefill`."""
+        from vllm_torchtpu.layers.core.attention_interface import (
+            sparse_mla_attention_pcp_prefill,
+        )
+
+        mesh = self._dcp_mesh
+        assert mesh is not None
+        dcp_size = self.dcp_size
+        interleave_size = self.dcp_interleave_size
+        chunk_tokens = envs.TPU_PCP_KV_CHUNK_TOKENS
+        k_scale = None
+        if layer.kv_cache_quantized_dtype is not None:
+            _, k_scale, _ = self._get_kv_scales(layer)
+
+        def pcp_prefill_core(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            topk_indices: jax.Array,
+            split_block_tables: jax.Array,
+            ws_req: jax.Array,
+            ws_vpage: jax.Array,
+            ws_page_offset: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            num_split_reqs: jax.Array,
+            ws_used_pages: jax.Array,
+        ) -> jax.Array:
+            nope_spec, rope_spec = layer.mla_kv_spec
+            return sparse_mla_attention_pcp_prefill(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                topk_indices,
+                split_block_tables,
+                ws_req,
+                ws_vpage,
+                ws_page_offset,
+                query_start_loc,
+                request_distribution,
+                num_split_reqs,
+                ws_used_pages,
+                mesh,
+                nope_spec,
+                rope_spec,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+                chunk_pages=pcp_chunk_pages(
+                    chunk_tokens, nope_spec.page_size, dcp_size
+                ),
+            )
+
+        sharded = P(DCP_AXIS_NAME)
+        replicated = P()
+        op_name = f"pallas::pcp_prefill_mla_{layer.layer_name.replace('.', '_')}"
+        jax_op = pcp_streaming_jax_op(
+            op_name,
+            pcp_prefill_core,
+            donate_argnums=None,
+            mesh=mesh,
+            input_partition_specs=(
+                sharded,  # kv_cache_nope
+                sharded,  # kv_cache_rope
+                sharded,  # ql_nope: this rank's local rows, TP head slice
+                sharded,  # q_pe
+                sharded,  # topk_indices: local rows, global positions
+                replicated,  # split_block_tables: [num_split_seqs, pages]
+                replicated,  # ws_req
+                replicated,  # ws_vpage
+                sharded,  # ws_page_offset: per local segment
+                sharded,  # query_start_loc: local
+                sharded,  # request_distribution: local
+                replicated,  # num_split_reqs
+                replicated,  # ws_used_pages
+            ),
+            output_partition_specs=(sharded,),  # output
+        )
+
+        def _fake(kv_cache_nope, kv_cache_rope, ql_nope, *rest, **kwargs):
+            del kv_cache_nope, kv_cache_rope, rest, kwargs
+            return torch.empty_like(ql_nope)
+
+        jax_op.register_fake(_fake)
+
+        def pcp_prefill_impl(
+            kv_cache: tuple[torch.Tensor, torch.Tensor], *args: torch.Tensor
+        ) -> torch.Tensor:
+            nope_cache, rope_cache = kv_cache
+            return jax_op(nope_cache, rope_cache, *args)
+
+        return pcp_prefill_impl
+
+    def _forward_pcp_kv_gather(
+        self,
+        layer: Any,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        topk_indices: torch.Tensor,
+        md: Any,
+    ) -> torch.Tensor:
+        """PCP manager sparse MLA; see `pcp_kv_gather.py`.
+
+        `topk_indices` holds rank-local DCP cache indices for the decode rows
+        and global positions for the split prefill rows.
+        """
+        from vllm_torchtpu.layers.adapter import pcp_kv_gather as kvg
+
+        assert getattr(layer, "pcp_prefill_op", None) is not None, (
+            "PCP ops were never built; `process_weights_after_loading` must run first."
+        )
+        pcp = md.pcp_metadata
+        assert pcp is not None
+        # All cache writes precede all cache reads, so XLA never copies the
+        # cache: split rows, then the decode op (writes, then reads), then the
+        # read-only split prefill op.
+        layer.pcp_write_split_op(
+            kv_cache,
+            kv_c_normed,
+            k_pe,
+            pcp.hidden_restore_idx,
+            pcp.split_seq_lens,
+            pcp.split_block_tables,
+            pcp.split_query_start_loc,
+        )
+        partial, lse = layer.sparse_mla_dcp_op(
+            kv_cache,
+            all_gather_heads(kvg.take_decode_rows(ql_nope, md), spans_pcp=True),
+            all_gather_heads(kvg.take_decode_rows(q_pe, md), spans_pcp=True),
+            kvg.take_decode_rows(kv_c_normed, md),
+            kvg.take_decode_rows(k_pe, md),
+            kvg.take_decode_rows(topk_indices, md),
+            pcp.rep_seq_lens,
+            pcp.rep_block_tables,
+            pcp.rep_query_start_loc,
+            pcp.rep_request_distribution,
+        )
+        decode_out = merge_lse_partials_scatter_heads(partial, lse, spans_pcp=True)
+
+        prefill_out = layer.pcp_prefill_op(
+            kv_cache,
+            ql_nope,
+            q_pe,
+            topk_indices,
+            pcp.split_block_tables.view(pcp.split_seq_lens.shape[0], -1),
+            pcp.ws_req,
+            pcp.ws_vpage,
+            pcp.ws_page_offset,
+            md.query_start_loc,
+            md.request_distribution,
+            pcp.num_split_reqs,
+            pcp.ws_used_pages,
+        )
+        return kvg.merge_decode_rows(prefill_out, decode_out, md)
+
     def forward(
         self,
         layer: Any,
@@ -2465,7 +2747,19 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 "sparse MLA layers use a native (nope, rope) split "
                 f"cache; got {type(kv_cache)}"
             )
-            if self.dcp_size > 1:
+            if self.pcp_kv_gather and is_pcp_kv_gather_metadata(attn_metadata):
+                local_topk_indices = topk_indices[: ql_nope_flat.shape[0]]
+                outputs = self._forward_pcp_kv_gather(
+                    layer,
+                    kv_cache,
+                    ql_nope_flat,
+                    q_pe_flat,
+                    kv_c_normed_flat,
+                    k_pe_flat,
+                    local_topk_indices,
+                    attn_metadata,
+                )
+            elif self.dcp_size > 1:
                 assert getattr(layer, "sparse_mla_dcp_op", None) is not None, (
                     "DCP sparse MLA op was never built; "
                     "`process_weights_after_loading` must run first."
@@ -2484,11 +2778,16 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     and all_gather_heads is _cp_mla_attention.all_gather_heads
                 ):
                     ql_nope_dcp, q_pe_dcp = all_gather_q_nope_pe_heads(
-                        ql_nope_flat, q_pe_flat, layer.kv_lora_rank
+                        ql_nope_flat,
+                        q_pe_flat,
+                        layer.kv_lora_rank,
+                        spans_pcp=self.pcp_kv_gather,
                     )
                 else:
-                    ql_nope_dcp = all_gather_heads(ql_nope_flat)
-                    q_pe_dcp = all_gather_heads(q_pe_flat)
+                    ql_nope_dcp = all_gather_heads(
+                        ql_nope_flat, spans_pcp=self.pcp_kv_gather
+                    )
+                    q_pe_dcp = all_gather_heads(q_pe_flat, spans_pcp=self.pcp_kv_gather)
                 # `topk_indices` here is not global positions: the DCP indexer
                 # already resolved each token's global top-k into this rank's
                 # own local cache indices, `-1` where it owns nothing.
@@ -2519,6 +2818,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     partial,
                     lse,
                     is_backbone=vllm_compilation_backends.model_tag == "backbone",
+                    spans_pcp=self.pcp_kv_gather,
                 )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
@@ -2613,6 +2913,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         slot_mapping: torch.Tensor,
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
+        skip_scale: bool = False,
     ) -> None:
         """Structural no-op. KV cache updates occur in-place during
         ragged paged attention kernel run."""

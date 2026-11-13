@@ -718,6 +718,7 @@ def test_mla_requires_declared_g_proj():
 def test_mla_weight_layout_is_restored_on_error(layout):
     attention = VllmMLAAttention.__new__(VllmMLAAttention)
     torch.nn.Module.__init__(attention)
+    attention.dcp_q_replicate = False
     attention.kv_b_proj = torch.nn.Module()
     weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     parameter_name = "weight_packed" if layout == "packed" else "weight"
@@ -742,6 +743,80 @@ def test_mla_weight_layout_is_restored_on_error(layout):
     ):
         attention.process_weights_after_loading(torch.float32)
     torch.testing.assert_close(getattr(attention.kv_b_proj, parameter_name), weight)
+
+
+@pytest.mark.parametrize("with_scale", [False, True])
+def test_qrep_gather_replaces_the_parameter_upstream_registers(with_scale):
+    """Under qrep, upstream MLAAttention.process_weights_after_loading leaves
+    W_UK_T_dcp_qrep registered as a Parameter; the TPU gather must replace it
+    with one, since a module refuses a plain tensor under that name."""
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.dcp_q_replicate = True
+    w_uk_t = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    attention.W_UK_T = torch.nn.Parameter(w_uk_t, requires_grad=False)
+    if with_scale:
+        attention.W_UK_T_scale = torch.nn.Parameter(
+            torch.ones(2, 1, 4), requires_grad=False
+        )
+    # What upstream's replace_parameter leaves behind.
+    attention.W_UK_T_dcp_qrep = torch.nn.Parameter(
+        torch.zeros(4, 3, 4), requires_grad=False
+    )
+    group = SimpleNamespace(
+        world_size=2, all_gather=lambda t, dim: torch.cat([t, t + 100], dim=dim)
+    )
+    with patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op.get_dcp_group",
+        return_value=group,
+    ):
+        attention._gather_dcp_qrep_weights()
+    assert isinstance(attention.W_UK_T_dcp_qrep, torch.nn.Parameter)
+    torch.testing.assert_close(
+        attention.W_UK_T_dcp_qrep, torch.cat([w_uk_t, w_uk_t + 100])
+    )
+    if with_scale:
+        assert isinstance(attention.W_UK_T_dcp_qrep_scale, torch.nn.Parameter)
+        assert attention.W_UK_T_dcp_qrep_scale.shape == (4, 1, 4)
+    else:
+        assert attention.W_UK_T_dcp_qrep_scale is None
+
+
+def test_no_qrep_leaves_no_replicated_weights():
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.dcp_q_replicate = False
+    attention._gather_dcp_qrep_weights()
+    assert attention.W_UK_T_dcp_qrep is None
+    assert attention.W_UK_T_dcp_qrep_scale is None
+
+
+def test_upstream_weight_processing_runs_without_qrep():
+    """Upstream would gather W_UK_T across DCP as well; it must see the flag
+    off, and the flag must come back whether or not upstream raises."""
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.kv_b_proj = torch.nn.Module()
+    attention.kv_b_proj.register_parameter(
+        "weight", torch.nn.Parameter(torch.zeros(2, 3))
+    )
+    attention.dcp_q_replicate = True
+    seen = []
+
+    def upstream_process(act_dtype):
+        seen.append(attention.dcp_q_replicate)
+        raise RuntimeError("stop after upstream")
+
+    with (
+        patch(
+            "vllm.model_executor.layers.attention.mla_attention.MLAAttention.process_weights_after_loading",
+            side_effect=upstream_process,
+        ),
+        pytest.raises(RuntimeError, match="stop after upstream"),
+    ):
+        attention.process_weights_after_loading(torch.float32)
+    assert seen == [False]
+    assert attention.dcp_q_replicate is True
 
 
 def test_mla_flipped_projection_requires_weight():
@@ -987,7 +1062,7 @@ def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
         )
     )
 
-    def _explode(*_args):
+    def _explode(*_args, **_kw):
         raise AssertionError("qrep must not all-gather the query heads")
 
     monkeypatch.setattr(attention_adapter, "all_gather_heads", _explode)
@@ -1037,7 +1112,7 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     monkeypatch.setattr(
         attention_adapter,
         "all_gather_heads",
-        lambda t: (gathered.append(t), t.repeat(1, dcp_size, 1))[1],
+        lambda t, **_kw: (gathered.append(t), t.repeat(1, dcp_size, 1))[1],
     )
     monkeypatch.setattr(
         attention_adapter,
@@ -1064,7 +1139,7 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     monkeypatch.setattr(
         attention_adapter,
         "all_gather_q_nope_pe_heads",
-        lambda nope, pe, rank: (
+        lambda nope, pe, rank, **_kw: (
             fused_calls.append((nope, pe, rank)),
             (nope.repeat(1, dcp_size, 1), pe.repeat(1, dcp_size, 1)),
         )[1],
@@ -1086,7 +1161,7 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     monkeypatch.setattr(
         attention_adapter,
         "all_gather_heads",
-        lambda t: (unfused_calls.append(t), t.repeat(1, dcp_size, 1))[1],
+        lambda t, **_kw: (unfused_calls.append(t), t.repeat(1, dcp_size, 1))[1],
     )
     impl.forward(
         layer=layer,
@@ -1526,6 +1601,46 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
             kv_layout=KVLayout.SEQ_ALONG_LANE,
             **common_kw,
         )
+
+
+def test_indexer_kv_layout_pcp_manager(monkeypatch, caplog):
+    """USE_TPU_PCP_MANAGER downgrades default 'sal' to HAS with a one-time
+    warning and rejects explicit 'sal': its split prefills gather the indexer
+    K cache as packed rows."""
+    import importlib
+    import logging
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
+
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(st_mod, "_INDEXER_KV_LAYOUT_FALLBACK_LOGGED", set())
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", False)
+
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", False)
+    assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
+
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", True)
+    caplog.clear()
+    assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+    assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+    warnings = [
+        r.message for r in caplog.records if "USE_TPU_PCP_MANAGER=1" in r.message
+    ]
+    assert len(warnings) == 1
+
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    with pytest.raises(ValueError, match="USE_TPU_PCP_MANAGER=1"):
+        st_mod.indexer_kv_layout(256)
+    for explicit_mode in ("has", "xla"):
+        monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", explicit_mode)
+        monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", explicit_mode)
+        assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
 
 
 def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, caplog):

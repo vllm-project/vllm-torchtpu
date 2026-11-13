@@ -202,9 +202,8 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
             pass
 
     connector = OptInConnector()
-    wave = MagicMock()
-    wave.step.return_value = contextlib.nullcontext()
-    wave.start_forward.return_value = IntermediateTensors(
+    handoff = MagicMock()
+    handoff.start_forward.return_value = IntermediateTensors(
         {"hidden_states": torch.zeros(2, 2), "residual": torch.zeros(2, 2)}
     )
 
@@ -233,7 +232,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     valid_tokens_per_chunk = [2, 1]
 
     runner = SimpleNamespace(
-        _pp_wave=None if pp_is_last else wave,
+        _pp_handoff=None if pp_is_last else handoff,
         _dp_step_other_decode=False,
         _pp_is_first=True,
         _pp_is_last=pp_is_last,
@@ -288,17 +287,19 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _kv_cache_bundle=None,
         _stage_timing=MagicMock(),
         is_pooling_model=False,
+        pcp_manager=None,
         sequence_layout_planner=SimpleNamespace(
             maybe_select_logits_hidden_states=lambda hs, _plan, _idx: hs[:1]
         ),
         compute_logits_from_hidden_states=lambda _hs: torch.zeros(1, 8),
         _attn_metadata_builder_ctx=SimpleNamespace(
-            mamba_state_indices=None, unified_mamba_state_indices=None
+            mamba_state_indices=None, unified_mamba_state_indices=None, seq_lens=None
         ),
         mamba_slot_read_offsets=None,
         speculative_config=None,
         _fence_spec_kv_under_token_copy=False,
         _is_dspark_pd_producer=False,
+        _adaptive_verification=None,
         _get_sampling_generator=lambda: None,
         _greedy_sample=lambda _logits: torch.tensor([7]),
         _update_mamba_slot_read_offsets=lambda *_args: None,
@@ -329,11 +330,14 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     runner.forward_model = MagicMock(side_effect=[(out, None) for out in chunk_outputs])
     for name in (
         "_any_decode",
+        "_readmit_trimmed_drafts",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
+        "_build_kv_connector_output",
         "_sample_tokens_pp_intermediate_stage",
         "sample_tokens",
         "execute_model",
+        "_maybe_select_logits_hidden_states",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 

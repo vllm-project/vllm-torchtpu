@@ -174,8 +174,10 @@ def _select_committed_mamba_blocks(
 ) -> list[int]:
     """Select each Mamba group's last committed state checkpoint.
 
-    The final ``K`` entries are speculative, so the committed checkpoint is
-    the ``-(K + 1)`` entry for a group with speculative depth ``K``.
+    The final K entries are speculative, so the committed prompt-end state sits
+    at -(K + 1) for speculative depth K. Any internal prefill checkpoint block
+    reserved by the step sits earlier at -(K + 2) and is excluded because it
+    stores an intermediate prefix state rather than the prompt-end state.
     """
     required_blocks = num_speculative_blocks + 1
     committed_blocks: list[int] = []
@@ -3611,6 +3613,28 @@ class TPURaidenConnectorWorker:
 
         return KVCacheManager(**kwargs)
 
+    def _raiden_transfer_streams(self) -> int:
+        """TCP streams the producer's transport opens per (pool, peer) push.
+
+        TPU_RAIDEN_TRANSFER_STREAMS decouples the stream fan-out from the
+        source rank count (TPU_RAIDEN_TRANSFER_PARALLELISM); unset or 0
+        keeps the historical one-stream-per-rank coupling, and a larger
+        value is clamped to the rank count, matching the source store's
+        planner default."""
+        parallelism = self._raiden_transfer_parallelism()
+        streams = int(tpu_envs.TPU_RAIDEN_TRANSFER_STREAMS)
+        if streams <= 0:
+            return parallelism
+        if streams > parallelism:
+            logger.warning(
+                "TPU_RAIDEN_TRANSFER_STREAMS=%d exceeds the transfer "
+                "parallelism %d; clamping",
+                streams,
+                parallelism,
+            )
+            return parallelism
+        return streams
+
     def _raiden_transfer_parallelism(self) -> int:
         parallelism = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
         if parallelism <= 0:
@@ -3997,12 +4021,12 @@ class TPURaidenConnectorWorker:
             )
         if tp_size == 1 and pcp_size == 1 and dp_size == 1 and pp_size in (2, 4, 8):
             return f"pp{pp_size}_decode"
-        if pcp_size != 1 or tp_size not in (1, 2) or dp_size not in (2, 4, 8, 16):
+        if pcp_size != 1 or tp_size not in (1, 2, 4) or dp_size not in (2, 4, 8, 16):
             raise ValueError(
                 "Raiden Qwen3.5 admission topology dp{N}_decode or "
-                "dp{N}tp2_decode requires kv_consumer with "
+                "dp{N}tp{2,4}_decode requires kv_consumer with "
                 "prefill_context_parallel_size=1, tensor_parallel_size in "
-                "(1, 2), data_parallel_size in (2, 4, 8, 16); got "
+                "(1, 2, 4), data_parallel_size in (2, 4, 8, 16); got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}"
@@ -6106,49 +6130,59 @@ class TPURaidenConnectorWorker:
                     )
                 self._stage3_pending_submits[destination_req_id] = pending
                 return
-            cancelled_registration = (
-                str(exc)
-                == (
-                    "Remote Controller Server execution failed: Request block "
-                    "registration was cancelled for "
-                    f"req_id={source_req_id}, uuid={uuid}"
-                )
-                and destination_req_id not in self._stage3_controller_accepted
+            # A pre-arm reply proves nothing about destination blocks that an
+            # earlier attempt left accepted or uncertain.
+            never_accepted = (
+                destination_req_id not in self._stage3_controller_accepted
                 and destination_req_id not in self._stage3_pending_controller_failures
             )
-            unsent_connection_failure = (
-                str(exc)
-                == (
-                    "Control RPC connection failed before sending request to "
-                    f"{pending.req_meta.src_controller_address.strip()}"
-                )
-                and destination_req_id not in self._stage3_controller_accepted
-                and destination_req_id not in self._stage3_pending_controller_failures
+            cancelled_registration = never_accepted and str(exc) == (
+                "Remote Controller Server execution failed: Request block "
+                "registration was cancelled for "
+                f"req_id={source_req_id}, uuid={uuid}"
+            )
+            unsent_connection_failure = never_accepted and str(exc) == (
+                "Control RPC connection failed before sending request to "
+                f"{pending.req_meta.src_controller_address.strip()}"
+            )
+            # The source controller compares both sides' layout fingerprints
+            # while it plans the transfer, before it arms any receiver.
+            layout_mismatch = never_accepted and str(exc) == (
+                "Remote Controller Server execution failed: Layout "
+                "fingerprint mismatch between source and destination"
             )
             if (
                 missing_registration
                 or cancelled_registration
                 or unsent_connection_failure
+                or layout_mismatch
             ):
-                # These registration lookup replies precede receiver arming
-                # for this submission, and an exact pre-send connection
-                # failure never reached the source. Match the connection
-                # failure exactly: nested worker errors or a prior uncertain
-                # attempt cannot prove that destination blocks are safe to
-                # release. Unlike a missing registration, cancellation and
-                # connection failure must not be retried against the same
-                # source here. A scheduler-finished request also resolves its
-                # delayed free.
+                # These registration lookup replies and the layout comparison
+                # precede receiver arming for this submission, and an exact
+                # pre-send connection failure never reached the source. Match
+                # the replies exactly: nested worker errors or a prior
+                # uncertain attempt cannot prove that destination blocks are
+                # safe to release. Unlike a missing registration, the others
+                # must not be retried against the same source here. A
+                # scheduler-finished request also resolves its delayed free.
                 self._record_stage3_load_failure(
                     destination_req_id, pending.local_blocks
                 )
+                hint = (
+                    " (prefill and decode registered different KV layouts; "
+                    "compare layout_fingerprint in each side's 'Raiden work "
+                    "unit registered' log line)"
+                    if layout_mismatch
+                    else ""
+                )
                 logger.error(
                     "Stage-3 controller transfer failed before receiver "
-                    "arming req_id=%s destination_req_id=%s uuid=%d: %s",
+                    "arming req_id=%s destination_req_id=%s uuid=%d: %s%s",
                     source_req_id,
                     destination_req_id,
                     uuid,
                     exc,
+                    hint,
                 )
                 return
             # Generic RPC rejection can occur after receiver arming.
@@ -6959,7 +6993,7 @@ class TPURaidenConnectorWorker:
             manager_kwargs.update(
                 listener_port=0,
                 parallelism=(
-                    self._raiden_transfer_parallelism() if self.is_producer else 1
+                    self._raiden_transfer_streams() if self.is_producer else 1
                 ),
             )
             if _reshard_store_mode():

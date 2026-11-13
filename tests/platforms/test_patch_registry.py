@@ -235,8 +235,6 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_abort_on_preemption",
         "_patch_vllm_raiden_pd_completion",
         "_patch_vllm_same_step_prefix_hits",
-        "patch_disable_eagle_block_drop",
-        "_patch_dflash_drafting_slot_budget",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
     assert stages["platform_activation"] == (
@@ -250,10 +248,6 @@ def test_manifest_preserves_lifecycle_dependencies():
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
     assert "patch_chat_template_namespace_aliases" in stages["platform_activation"]
-    for names in (stages["platform_activation"], stages["worker_init"]):
-        assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
-            "_patch_vllm_config_triton_tpu"
-        )
 
 
 def test_plugin_import_sets_environment_before_jax():

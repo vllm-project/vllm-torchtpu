@@ -16,6 +16,7 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import importlib.util
 import os
 import time
 from typing import TYPE_CHECKING, Protocol, Union, cast
@@ -31,6 +32,7 @@ from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs, patch_registry
+from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
@@ -207,7 +209,6 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
     ),
     ("vllm.model_executor.layers.fused_moe.router.grouped_topk_router", "grouped_topk"),
     ("vllm.v1.sample.ops.logprobs", "batched_count_greater_than"),
-    ("vllm.v1.sample.ops.topk_topp_sampler", "compiled_random_sample"),
     ("vllm.utils.deep_gemm", "per_block_cast_to_fp8"),
 ]
 
@@ -494,11 +495,16 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
+        "TPU_DP_VOCAB_PARALLEL",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        # Every EP rank must hold the same placement: a rank that served
+        # without it would route to experts its peers no longer hold.
+        "TPU_EXPERT_PLACEMENT",
         "VLLM_TPU_INDEXER_KV_CACHE_MODE",
         "TPU_DCP_INDEXER_A2A_MERGE",
         "TPU_DCP_INDEXER_A2A_MIN_TOKENS",
+        "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS",
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
@@ -782,6 +788,55 @@ class TpuPlatform(Platform):
         return {}
 
     @classmethod
+    def external_env_var_prefixes(cls) -> tuple[str, ...]:
+        """Prefixes owned by a reader that has no registry to check against."""
+        # vLLM-Omni reads its VLLM_OMNI_* knobs directly and has no registry.
+        # Its stages call EngineArgs.create_engine_config with this class as
+        # vLLM's current_platform (OmniTpuPlatform is only
+        # current_omni_platform), so the prefix must be known here.
+        if importlib.util.find_spec("vllm_omni") is not None:
+            return ("VLLM_OMNI_",)
+        return ()
+
+    @classmethod
+    def known_env_var_names(cls) -> set[str]:
+        """Names this package reads or writes. Subclasses may extend it."""
+        from vllm_torchtpu.env_validation import PACKAGE_WRITTEN_ENV_VARS
+
+        return (
+            set(envs.environment_variables)
+            | set(cls.additional_env_vars)
+            | PACKAGE_WRITTEN_ENV_VARS
+        )
+
+    @classmethod
+    def validate_environ(cls, hard_fail: bool) -> None:
+        """Reports set env vars that neither vLLM nor this package reads.
+
+        Replaces vLLM's check, which flags every VLLM_* name missing from
+        vLLM's registry, including this package's VLLM_TPU_* knobs.
+        EngineArgs calls it once, in the front-end process; hard_fail is
+        vLLM's --fail-on-environ-validation.
+        """
+        from vllm_torchtpu.env_validation import find_unread_env_vars
+
+        unread = find_unread_env_vars(
+            os.environ,
+            cls.known_env_var_names(),
+            vllm_envs.environment_variables,
+            cls.external_env_var_prefixes(),
+        )
+        if not unread:
+            return
+        message = (
+            "Environment variables that nothing reads (unset them, or fix the "
+            "name): " + ", ".join(str(u) for u in unread)
+        )
+        if hard_fail:
+            raise ValueError(message)
+        logger.warning(message)
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         assert "sharding" not in cast(dict, vllm_config.additional_config), (
             "Legacy additional_config['sharding'] is no longer supported. "
@@ -799,6 +854,9 @@ class TpuPlatform(Platform):
             "platform_activation", model_config=vllm_config.model_config
         )
         _register_tpu_kv_connectors()
+        # Apply before VllmConfig is pickled so EngineCore and all workers see
+        # the same setting.
+        apply_eagle_block_drop_override(vllm_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
@@ -876,13 +934,12 @@ class TpuPlatform(Platform):
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
             # get the hand-off's engine side here; engine-core processes
             # install it again on their side.
-            from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_handoff
+            from vllm_torchtpu.distributed.pp_engine import (
+                patch_executor_for_pp_buffered,
+            )
 
-            patch_executor_for_pp_handoff(vllm_config)
+            patch_executor_for_pp_buffered(vllm_config)
             _configure_pipeline_chunks(vllm_config)
-            from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
-
-            patch_engine_core_for_lazy_push(vllm_config)
 
         from vllm.config import CompilationMode
 
@@ -1004,6 +1061,14 @@ class TpuPlatform(Platform):
         cache_config = vllm_config.cache_config
 
         is_hybrid = model_config.is_hybrid if model_config is not None else False
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and (
+            speculative_config.rejection_sample_method not in ("standard", "synthetic")
+        ):
+            raise NotImplementedError(
+                "TPU supports rejection_sample_method 'standard' and 'synthetic' "
+                f"(got {speculative_config.rejection_sample_method!r})."
+            )
         is_attention_free = (
             model_config.is_attention_free if model_config is not None else False
         )
@@ -1160,33 +1225,17 @@ class TpuPlatform(Platform):
 
                 parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
-            if parallel_config.data_parallel_size > 1:
-                if pcp_size > 1:
-                    raise NotImplementedError(
-                        "Prefill context parallelism is not supported "
-                        "together with multihost data parallelism."
-                    )
-                if not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
-                    raise NotImplementedError(
-                        "Multihost data parallelism requires the Ray V2 "
-                        "executor. Set VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1."
-                    )
-            if vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
-                from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
-                    RayDistributedExecutorV2,
+            if parallel_config.data_parallel_size > 1 and pcp_size > 1:
+                raise NotImplementedError(
+                    "Prefill context parallelism is not supported "
+                    "together with multihost data parallelism."
                 )
+            from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
+                RayDistributedExecutorV2,
+            )
 
-                parallel_config.distributed_executor_backend = RayDistributedExecutorV2
-                logger.info(
-                    "Force using RayDistributedExecutorV2 for TPU on multihost."
-                )
-            else:
-                from vllm_torchtpu.executors.ray_distributed_executor import (
-                    RayDistributedExecutor,
-                )
-
-                parallel_config.distributed_executor_backend = RayDistributedExecutor
-                logger.info("Force using RayDistributedExecutor for TPU on multihost.")
+            parallel_config.distributed_executor_backend = RayDistributedExecutorV2
+            logger.info("Force using RayDistributedExecutorV2 for TPU on multihost.")
         else:
             logger.warning(
                 "Unknown TPU multihost backend: %s. Using uniproc_executor.",
@@ -1375,6 +1424,16 @@ class TpuPlatform(Platform):
     def support_hybrid_kv_cache(cls) -> bool:
         return True
 
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config: VllmConfig) -> None:
+        # Unconditional: the manager is only used for the specs the runner
+        # emits where it owns the GDN state slots (core/runner_slot_mamba.py).
+        from vllm_torchtpu.core.runner_slot_mamba import (
+            register_runner_slot_mamba_spec,
+        )
+
+        register_runner_slot_mamba_spec()
+
 
 def _get_exponential_token_paddings(
     min_token_size: int, max_token_size: int
@@ -1439,17 +1498,18 @@ def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[i
 
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
-    """Install the time-budget scheduler for a pipeline and the engine-core
-    hook that times the stages. Off when the env disables it, when the DP
-    scheduler or another scheduler is configured, or when chunked prefill is
-    disabled."""
+    """Install the pipeline chunk scheduler and the engine-core hook that
+    collects its chunk limits from the stages. Off when both
+    TPU_PP_LONE_PROMPT_CHUNKS and TPU_PP_EQUAL_COST_CHUNKS are off, when the
+    DP scheduler or another scheduler is configured, or when chunked prefill
+    is disabled."""
     from vllm_torchtpu.core.pp_chunk_scheduler import (
         SCHEDULER_CLS,
         patch_engine_core_for_pp_chunks,
     )
 
     scheduler_config = vllm_config.scheduler_config
-    if not envs.TPU_PP_DYNAMIC_CHUNKS:
+    if not (envs.TPU_PP_LONE_PROMPT_CHUNKS or envs.TPU_PP_EQUAL_COST_CHUNKS):
         return
     if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
         logger.warning(
@@ -1463,7 +1523,7 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     if not scheduler_config.enable_chunked_prefill:
         logger.warning("Pipeline chunk sizing is off: chunked prefill is disabled.")
         return
-    if envs.TPU_PP_CHUNK_SLACK < 0:
+    if envs.TPU_PP_EQUAL_COST_CHUNKS and envs.TPU_PP_CHUNK_SLACK < 0:
         raise ValueError(
             f"TPU_PP_CHUNK_SLACK must not be negative: {envs.TPU_PP_CHUNK_SLACK}"
         )

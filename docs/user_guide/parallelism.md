@@ -18,7 +18,7 @@
 | **Tensor Parallelism (TP)** | `--tensor-parallel-size N` | Shard attention heads and dense MLP projections within a high-bandwidth ICI domain. | All-reduce / Reduce-scatter across `TP` ranks per layer. |
 | **Data Parallelism (DP)** | `--data-parallel-size N` | Replicate attention layers across independent engines while sharing a global Expert Parallel MoE mesh (`TP * DP` experts). | Zero attention collective overhead when `TP=1`; All-to-All across `TP * DP` for MoE layers when `--enable-expert-parallel` is enabled. |
 | **Expert Parallelism (EP)** | `--enable-expert-parallel` | Shard Mixture-of-Experts (MoE) routed experts across the `TP * DP` device mesh instead of slicing each expert's weights. | Uses Pallas SparseCore / GMM ragged dispatch and combine collectives across the EP mesh (`src/vllm_torchtpu/distributed/ep_mesh.py`). |
-| **Pipeline Parallelism (PP)** | `--pipeline-parallel-size N` | Partition transformer layers sequentially across stages (`PP` stages). | Point-to-point activation transfers with dynamic microbatch chunking (`TPU_PP_DYNAMIC_CHUNKS=1`). |
+| **Pipeline Parallelism (PP)** | `--pipeline-parallel-size N` | Partition transformer layers sequentially across stages (`PP` stages). | Point-to-point activation transfers with dynamic microbatch chunking (`TPU_PP_LONE_PROMPT_CHUNKS`, `TPU_PP_EQUAL_COST_CHUNKS`). |
 | **Prefill Context Parallelism (PCP)** | `--prefill-context-parallel-size N` | Split long prefill sequences across `PCP` ranks to parallelize prefill compute and reduce time-to-first-token (TTFT). | Topology-aware ring/mesh assignment (`TPU_PCP_TOPOLOGY_AWARE_MESH=1`) minimizing ICI hop count between consecutive PCP ranks. |
 | **Decode Context Parallelism (DCP)** | `--decode-context-parallel-size N` | Shard the KV cache along the sequence dimension across `DCP` ranks for long-context decode. | Online LSE (log-sum-exp) attention merge across `DCP` ranks (`TPU_DCP_LSE_MERGE_A2A`). |
 
@@ -79,6 +79,7 @@ On multi-chip and multi-host slices, `vllm-torchtpu` provides specialized MoE ex
 | `USE_MOE_SPARSE_CORE` | `1` | Offloads MoE token routing/gather-reduce collectives to TPU SparseCores. |
 | `USE_MOE_FUSED_EP_KERNEL` | `0` | Enables the fused Expert-Parallel Pallas kernel (`v1` or `v2` via `MOE_FUSED_EP_KERNEL_IMPL`). |
 | `TPU_MOE_HIERARCHICAL_EP` | `0` | Enables two-level (intra-chip / inter-chip) hierarchical EP token dispatch on dual-core TPU v7x topologies. |
+| `TPU_EXPERT_PLACEMENT` | `""` | Static expert placement: a JSON table (local path or `gs://` URI) giving, per MoE layer, which experts each EP rank holds, as a permutation that evens out their load. Applied at weight load; works with every MoE kernel. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `0` | Keeps activations sequence-parallel entering MoE layers to replace all-reduce with reduce-scatter + all-gather. |
 | `TPU_LATENT_PROJ_INTRA_CHIP_TP` | `0` | Shards MLA latent projections across the 2 cores of each physical TPU v7x chip even when `TP=1`. |
 
@@ -95,9 +96,9 @@ vllm serve meta-llama/Llama-3.1-70B-Instruct \
   --max-model-len 8192
 ```
 
-By default, `TPU_PP_DYNAMIC_CHUNKS=1` dynamically sizes microbatch chunks to keep pipeline bubbles minimal without recompiling static token buckets.
+Two chunking policies, both on by default, keep pipeline bubbles small; each has its own switch. `TPU_PP_LONE_PROMPT_CHUNKS` spreads prefill work that cannot fill every stage (for example, a lone prompt) over the stages in smaller steps. `TPU_PP_EQUAL_COST_CHUNKS` sizes prefill chunks so every step takes about the same time, from step costs each stage times at startup. Shortened steps pad to extra token buckets compiled at startup.
 
-The stages hand activations on in lockstep by default (`TPU_PP_HANDOFF=wave`): one collective per forward on every stage, so each round lasts as long as the slowest forward in flight. `TPU_PP_HANDOFF=ring` sends each forward's output point to point to the next stage as soon as it is done, which keeps the stages busy when prompts of different lengths are in flight. Under the ring the engine keeps half as many steps again in flight as the pipeline has stages (twelve for eight stages), so stage 0 has a forward queued while the engine core schedules the next step; the wave keeps vLLM's one step per stage. It needs libtpu 0.0.50 or later with torch_tpu 0.2.0 or later; the start-up self-test fails fast otherwise. `TPU_PP_RING_DEPTH` (default `2`) caps the forwards a stage queues for sending: each device holds up to that many outgoing buffers and up to 7 landing buffers for receives posted ahead of their forwards, each `--max-num-batched-tokens` x hidden size in the model dtype, and that memory is reserved before the KV cache is sized.
+The stages hand activations on point to point: each forward's output goes to the next stage as soon as it is done, which keeps the stages busy when prompts of different lengths are in flight. The engine keeps half as many steps again in flight as the pipeline has stages (twelve for eight stages), so stage 0 has a forward queued while the engine core schedules the next step. The hand-off needs libtpu 0.0.50 or later with torch_tpu 0.2.0 or later; the start-up self-test fails fast otherwise. `TPU_PP_HANDOFF_DEPTH` (default `2`) caps the forwards a stage queues for sending: each device holds up to that many outgoing buffers and up to 7 landing buffers for receives posted ahead of their forwards, each `--max-num-batched-tokens` x hidden size in the model dtype, and that memory is reserved before the KV cache is sized.
 
 A pipeline stage may also span a prefill context-parallel group (`--prefill-context-parallel-size`), splitting each chunk's attention across the stage's cores (MoE models then require `--enable-expert-parallel`). On dual-core TPU v7x hosts, a two-core stage must not bind the two cores of a single physical chip: set `VLLM_TPU_DEVICE_ORDER` to the device each local rank binds (for example, `0,2,1,3,4,6,5,7` for four two-core stages on one host).
 
@@ -118,3 +119,29 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
   --kv-cache-dtype fp8 \
   --max-model-len 65536
 ```
+
+### PCP with PCP manager
+
+Set `USE_TPU_PCP_MANAGER=1` to combine `PCP` and `DCP` on sparse MLA models. Each prefill in a step is split over the `PCP` ranks: rank `r` holds chunks `r` and `2P-1-r` of the prompt to balance causal attention. For attention, every rank gathers those prefills' KV from the `DCP`-sharded cache into a workspace. Decode requests are replicated on every `PCP` rank and run the regular `DCP` decode path.
+
+```bash
+USE_TPU_PCP_MANAGER=1 vllm serve zai-org/GLM-5.2-FP8 \
+  --tensor-parallel-size 2 \
+  --prefill-context-parallel-size 4 \
+  --decode-context-parallel-size 8 \
+  --cp-kv-cache-interleave-size 4 \
+  --enable-expert-parallel
+```
+
+Requirements:
+
+- A sparse MLA model.
+- `--decode-context-parallel-size` equal to `--prefill-context-parallel-size` x `--tensor-parallel-size`.
+- `--cp-kv-cache-interleave-size` a multiple of `4` (vLLM defaults to `1`).
+- Experimental features. Do not support speculative decoding, LoRA, pipeline parallelism, data parallelism, multimodal inputs, pooling models, and KV connectors (`--kv-transfer-config`, including disaggregated serving and KV offloading) right now.
+- MoE models also need `--enable-expert-parallel`.
+
+Sizing:
+
+- `TPU_PCP_KV_WORKSPACE_TOKENS` (default `1048576`): if the prefills in a step need more context tokens than this, the runner runs the step as several forwards. Must be at least `--max-model-len`. A prefill forward allocates a temporary workspace of this many tokens, reused across layers: about 0.6 GB for the MLA latents and 0.27 GB for the indexer K at the default. KV cache sizing does not reserve it yet, so leave room for it in `--gpu-memory-utilization`.
+- `TPU_PCP_KV_CHUNK_TOKENS` (default `65536`): context tokens moved by each all-gather.
