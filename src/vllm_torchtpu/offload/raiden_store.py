@@ -85,7 +85,7 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -491,6 +491,10 @@ class RaidenOffloadingManager(OffloadingManager):
     _lru_refresh_on_store: bool = False
     # TPU_RAIDEN_OFFLOAD_STATS counters (always counted; logged when on).
     _stats: collections.Counter | None = None
+    # TPU_RAIDEN_LOSS_TRACE: key -> (last event, monotonic time); None when off.
+    _key_events: dict | None = None
+    _key_refreshed: dict | None = None
+    _key_stored_at: dict | None = None
 
     def __init__(
         self,
@@ -928,6 +932,10 @@ class RaidenOffloadingManager(OffloadingManager):
             held.append(sub_hash)
         if held:
             self._store.release(held[::-1])
+            if self._key_refreshed is not None:
+                now = time.monotonic()
+                for key in list(keys)[: len(held) // max(self._device_block_size_factor, 1)]:
+                    self._key_refreshed[key] = now
         stats = self._stats
         if stats is not None:
             stats["refreshed_entries"] += len(held)
@@ -1028,6 +1036,44 @@ class RaidenOffloadingManager(OffloadingManager):
             host_block_ids=[host_block_of.get(sub_hash, -1) for sub_hash in sub_hashes],
         )
 
+    _KEY_TRACE_CAP = 4_000_000
+
+    def enable_loss_trace(self) -> None:
+        """Remember each key's last store-side event (TPU_RAIDEN_LOSS_TRACE)."""
+        self._key_events = {}
+        self._key_refreshed = {}
+        self._key_stored_at = {}
+
+    def _trace(self, keys: Iterable[OffloadKey], event: str) -> None:
+        events = self._key_events
+        if events is None:
+            return
+        now = time.monotonic()
+        stored_at = self._key_stored_at
+        for key in keys:
+            if key in events or len(events) < self._KEY_TRACE_CAP:
+                events[key] = (event, now)
+                if event == "stored" and stored_at is not None:
+                    stored_at[key] = now
+
+    def explain_missing(
+        self, key: OffloadKey
+    ) -> tuple[str, float, float, float]:
+        """(last event, seconds since it, seconds since the last refresh,
+        seconds since the last successful store), each -1 when unknown, for a
+        key a host lookup did not find; "never" for a key no store offered."""
+        events = self._key_events or {}
+        now = time.monotonic()
+        event, at = events.get(key, ("never", None))
+        refreshed = (self._key_refreshed or {}).get(key)
+        stored = (self._key_stored_at or {}).get(key)
+        return (
+            event,
+            -1.0 if at is None else now - at,
+            -1.0 if refreshed is None else now - refreshed,
+            -1.0 if stored is None else now - stored,
+        )
+
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
         # The Raiden directory is the sole authority on what is stored: probe
         # it per key, so a key whose entries were displaced from the LRU is
@@ -1077,6 +1123,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # tracking here only stops duplicate admission of the same key from a
         # concurrent request.
         self._inflight_store_keys.update(keys_to_store)
+        self._trace(keys_to_store, "offered")
         return PrepareStoreOutput(
             keys_to_store=keys_to_store,
             store_spec=RaidenLoadStoreSpec(keys_to_store),
@@ -1110,6 +1157,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 if parsed is None:
                     continue
                 key, sub_idx = parsed
+                self._trace((key,), "evicted")
                 sub_indices = self._evicted_sub_hashes.setdefault(key, set())
                 if not sub_indices:
                     # Report eviction on the first sub-block loss: the logical
@@ -1203,6 +1251,7 @@ class RaidenOffloadingManager(OffloadingManager):
         }
         if held_keys:
             self._inflight_store_keys.difference_update(held_keys)
+            self._trace(held_keys, "skipped_live_load")
             kept = [
                 (key, block_id)
                 for key, block_id in zip(keys, device_block_ids)
@@ -1440,6 +1489,7 @@ class RaidenOffloadingManager(OffloadingManager):
     def on_store_job_cancelled(self, keys: list[OffloadKey]) -> None:
         """A fence-pending (never admitted) store job was cancelled."""
         self._inflight_store_keys.difference_update(keys)
+        self._trace(keys, "cancelled")
         if self._stats is not None:
             self._stats["store_jobs_cancelled"] += 1
             self._stats["store_keys_cancelled"] += len(keys)
@@ -1468,6 +1518,7 @@ class RaidenOffloadingManager(OffloadingManager):
             self._store.release(held)
         if admission.op == AdmissionOp.STORE:
             self._inflight_store_keys.difference_update(admission.keys)
+            self._trace(admission.keys, "stored" if success else "store_failed")
             if self._stats is not None:
                 self._stats["store_jobs_ok" if success else "store_jobs_failed"] += 1
             self._finished.append(

@@ -206,6 +206,8 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     TPU_RAIDEN_LRU_REFRESH: int = 0
     TPU_RAIDEN_OFFLOAD_STATS: bool = False
+    TPU_RAIDEN_FLUSH_REAL_REUSE: bool = False
+    TPU_RAIDEN_LOSS_TRACE: bool = False
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -1303,6 +1305,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # refreshed entries, cancelled stores, write-back drops by cause, host
     # lookups that miss a chain head while a later key is resident).
     "TPU_RAIDEN_OFFLOAD_STATS": env_bool("TPU_RAIDEN_OFFLOAD_STATS", default=False),
+    # Flush (cancel a fence-pending / drain a launched) offload store only for
+    # blocks the block pool really handed out fresh this step. vLLM's offload
+    # scheduler counts a new request's prefix-HIT blocks as allocated too, so a
+    # prefix hit on a chain whose store is still parked cancels the whole store
+    # (the chain never reaches the host) or drains it synchronously. A hit
+    # block keeps its contents, so reading it later is safe. Scheduler-side.
+    "TPU_RAIDEN_FLUSH_REAL_REUSE": env_bool(
+        "TPU_RAIDEN_FLUSH_REAL_REUSE", default=False
+    ),
+    # Diagnostics: remember each offload key's last store/cancel/evict event
+    # and, for each request whose host lookup stops >= 8k tokens short of its
+    # prompt, log why the first missing key is missing; time store drains.
+    "TPU_RAIDEN_LOSS_TRACE": env_bool("TPU_RAIDEN_LOSS_TRACE", default=False),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
