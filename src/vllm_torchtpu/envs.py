@@ -384,6 +384,8 @@ if TYPE_CHECKING:
     VLLM_TPU_DRAFT_ROWS_FRESH: bool = False
     VLLM_TPU_DRAFT_CARRY_ROWS_FRESH: bool = False
     VLLM_TPU_SUBST_EXTRACT_FUSED: bool = False
+    VLLM_TPU_EXTRACT_DRAFTS_COMPILED: bool = False
+    VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD: bool = False
     VLLM_TPU_VERIFY_RO_INGRAPH: bool = False
     VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
     VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD: bool = False
@@ -2401,6 +2403,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # also gathers the verified draft tokens (extract_draft_token_ids), one
     # program instead of two. Same values.
     "VLLM_TPU_SUBST_EXTRACT_FUSED": env_bool("VLLM_TPU_SUBST_EXTRACT_FUSED"),
+    # Async spec decode: gather the verified drafts (extract_draft_token_ids)
+    # with one static-shape compiled program per (token bucket, padded logits
+    # length), all warmed before serving. Eager, the gather compiled each new
+    # pair mid-serve (64 compiles of ~48 ms in a 30 min c32 window). Same values.
+    "VLLM_TPU_EXTRACT_DRAFTS_COMPILED": env_bool("VLLM_TPU_EXTRACT_DRAFTS_COMPILED"),
+    # Warm the compiled rejected-count correction and its row pad under no_grad,
+    # as execute_model serves them: dynamo guards on grad mode, so warmed with
+    # grad on, every shape compiled again on its first served step.
+    "VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD": env_bool(
+        "VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD"
+    ),
     # With VLLM_TPU_VERIFY_ONE_DRAW (and VERIFY_FUSED_READ_OFFSETS off): the
     # post-verify mamba read-offset scatter runs inside the verify program
     # (one program instead of two). Same values.
