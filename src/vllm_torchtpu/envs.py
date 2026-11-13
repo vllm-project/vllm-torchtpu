@@ -31,6 +31,11 @@ if TYPE_CHECKING:
     USE_TPU_PCP_MANAGER: bool = False
     TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
     TPU_PCP_KV_CHUNK_TOKENS: int = 65536
+    TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
+    TPU_DCP_MLA_FUSED_PREP: bool = False
+    TPU_MLA_KV_WRITE_IN_GATHER: bool = False
+    TPU_DCP_MLA_MIXED_LIVE: bool = False
+    TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = ""
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -184,6 +189,8 @@ if TYPE_CHECKING:
     KDA_FWD_MB: int | None = None
     TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
+    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
+    TPU_FUSED_OPROJ_AR: bool = False
     SPEC_WARMUP: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
@@ -206,6 +213,7 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    TPU_MTP_EH_PROJ_TP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -213,6 +221,9 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 0
+    TPU_FUSED_ADD_RMSNORM_QUANT: bool = False
+    TPU_FP8_LINEAR_PALLAS_SITES: str = ""
 
 
 def env_with_choices(
@@ -482,6 +493,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
     # PCP manager: context tokens gathered per all-gather chunk.
     "TPU_PCP_KV_CHUNK_TOKENS": env_int("TPU_PCP_KV_CHUNK_TOKENS", 65536),
+    # DCP sparse MLA, decode buckets (<= 32 tokens): the kernel writes lse
+    # -inf and output 0 for a token whose top-k this rank does not own, so no
+    # dummy key or owns mask is needed. Same merge result.
+    "TPU_DCP_MLA_MASK_IN_KERNEL": env_bool("TPU_DCP_MLA_MASK_IN_KERNEL", default=False),
+    # With TPU_DCP_MLA_MASK_IN_KERNEL, decode buckets: build the capped window
+    # indices and the SparseCore gather's live bound in one Pallas call.
+    # Same gathered rows.
+    "TPU_DCP_MLA_FUSED_PREP": env_bool("TPU_DCP_MLA_FUSED_PREP", default=False),
+    # With TPU_DCP_MLA_FUSED_PREP, decode buckets: the SparseCore gather that
+    # feeds the attention kernel writes the step's KV rows into both caches
+    # before it gathers, instead of a separate cache writer. Same bytes.
+    "TPU_MLA_KV_WRITE_IN_GATHER": env_bool("TPU_MLA_KV_WRITE_IN_GATHER", default=False),
+    # DCP sparse MLA, buckets of more than 32 tokens: gather and attend only
+    # the 64-row blocks of the first top-k window that hold live rows of each
+    # attention grid step. Same outputs.
+    "TPU_DCP_MLA_MIXED_LIVE": env_bool("TPU_DCP_MLA_MIXED_LIVE", default=False),
+    # With TPU_DCP_MLA_MIXED_LIVE: ascending row widths below the top-k cap,
+    # multiples of 128 (e.g. "256,384"). A grid step whose live rows fit a
+    # width runs its attention body on that many rows. Same outputs.
+    "TPU_DCP_MLA_MIXED_LIVE_WIDTHS": env_str("TPU_DCP_MLA_MIXED_LIVE_WIDTHS", ""),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
     # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must
@@ -1249,6 +1280,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": env_nonnegative_int_or_auto(
         "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"
     ),
+    # TP all-reduces of compiled steps whose padded token bucket (compile_sizes)
+    # has at most this many bf16 rows run as a Pallas kernel
+    # (kernels/experimental/small_collectives) instead of XLA's. 0, the
+    # default, keeps XLA's for every all-reduce. Needs expert parallelism and a
+    # TP group equal to the expert-parallel group. The crossover against XLA
+    # depends on the core count and the hidden size.
+    "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
+    ),
+    # With TPU_SMALL_ALL_REDUCE_MAX_ROWS > 0 and self_attn.o_proj in
+    # TPU_FP8_LINEAR_PALLAS_SITES: attention's output projection at decode (at
+    # most 16 rows) runs its FP8 matmul and its TP all-reduce as one Pallas
+    # kernel, so the all-reduce barrier hides under the weight stream. The output
+    # is bitwise that of fp8_skinny followed by the small all-reduce, for blocks of
+    # at most TPU_SMALL_ALL_REDUCE_MAX_ROWS rows. Without the two settings above,
+    # or with a TP group that is not the whole mesh, it has no effect and the
+    # server logs a warning at load.
+    "TPU_FUSED_OPROJ_AR": env_bool("TPU_FUSED_OPROJ_AR"),
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
@@ -1260,6 +1309,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # DeepSeek / GLM-5.2 MTP draft: split the replicated eh_proj (2H -> H) by
+    # output column over TP and all-gather the result, so each rank reads 1/tp
+    # of the weight. Each output element is the same dot product.
+    "TPU_MTP_EH_PROJ_TP": env_bool("TPU_MTP_EH_PROJ_TP"),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has
@@ -1301,6 +1354,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
+    # Number of tokens in the padded compile_sizes bucket at or above which the
+    # residual-stream RMSNorms (hidden size at least 4096 and a multiple of 128)
+    # run as one Pallas pass (kernels/fused_add_rmsnorm). Buckets that are not
+    # a multiple of 256 keep vLLM's path. 0, the default, keeps vLLM's RMSNorm:
+    # no lm_eval has been run with the kernel. Same residual; y differs from the
+    # native provider by at most 2 bf16 ulp.
+    "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS": env_nonnegative_int(
+        "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS", 0
+    ),
+    # With TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: the Pallas norm in front of a
+    # per-channel FP8 linear (MLA fused_qkv_a_proj, dense gate_up_proj) also
+    # writes that linear's per-row fp8 input and scale, so the linear skips its
+    # own quantization. Bit-identical. No effect when
+    # TPU_FUSED_ADD_RMSNORM_MIN_TOKENS is 0: the runner logs a warning.
+    "TPU_FUSED_ADD_RMSNORM_QUANT": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT"),
+    # Comma-separated layer-prefix suffixes, matched on a "." boundary, for
+    # example "self_attn.o_proj". A per-channel FP8 dense linear whose prefix
+    # matches, and whose weight shape is in fp8_skinny.TUNED, runs calls of at
+    # most 16 rows as the weight-streaming Pallas kernel
+    # (kernels/quantized_matmul/fp8_skinny.py) and other calls on XLA. Empty, the
+    # default, keeps XLA for every linear. The kernel accumulates in float32, so
+    # its outputs differ slightly from XLA's fp8 x fp8 dot. A matched layer whose
+    # width is not a multiple of 128 also keeps a zero-padded copy of its weight
+    # for the kernel (for a [6144, 2624] FP8 weight, 16.5 MB more per layer).
+    # The copy is a device buffer of its own (fresh_buffer). Its per-step cost
+    # is not measured in that form. Measured on TPU v7x with the copy stored as a
+    # float8 view of a uint8 buffer, it costs more device time per step than the
+    # kernel saves, so measure a padded site before listing it. List only
+    # linears whose weight XLA reads from HBM during the call: for a weight that
+    # XLA already prefetches into VMEM, the kernel is not measured to be faster.
+    "TPU_FP8_LINEAR_PALLAS_SITES": env_str("TPU_FP8_LINEAR_PALLAS_SITES", ""),
 }
 
 
