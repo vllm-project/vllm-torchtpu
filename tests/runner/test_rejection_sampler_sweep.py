@@ -83,9 +83,9 @@ def _sweep(monkeypatch, flag, rank=3):
     runner, calls = _runner()
     TPUModelRunner._precompile_rejection_sampler(runner)  # type: ignore[arg-type]
     # Each warmup shape runs the greedy verify path and the non-greedy one with
-    # and without top-k/top-p.
-    assert calls[::3] == calls[1::3] == calls[2::3]
-    return calls[::3]
+    # and without top-k/top-p and with top-p only.
+    assert calls[::4] == calls[1::4] == calls[2::4] == calls[3::4]
+    return calls[::4]
 
 
 # The reachable (padded_logits_length, padded_num_reqs) pairs for these
@@ -230,12 +230,12 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
         # Drop the recording backend's entries so later tests compile afresh.
         torch._dynamo.reset()
 
-    # Each shape compiles the random path with and without top-k/top-p, plus
-    # the top-k candidate variant when that path is on.
+    # Each shape compiles the random path with and without top-k/top-p and
+    # with top-p only, plus the top-k candidate variant when that path is on.
     shapes = len(sampler_graphs["_greedy_rejection_sample_with_segment"])
     assert shapes > 0
     assert len(sampler_graphs["_random_rejection_sample_with_segment"]) == shapes * (
-        3 if optional_paths else 2
+        4 if optional_paths else 3
     )
     # The optional paths ran only when enabled.
     assert bool(token_graphs) == optional_paths
