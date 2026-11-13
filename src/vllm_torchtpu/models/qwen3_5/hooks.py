@@ -82,6 +82,13 @@ def _chip_family() -> str | None:
     return None if chip_version is None else chip_version.value
 
 
+def has_calibrated_shape(model_config) -> bool:
+    """Whether the checkpoint has the shape the IX points ran
+    (Qwen3.5-397B-A17B's text config), whatever the device."""
+    text = getattr(model_config, "hf_text_config", None)
+    return all(getattr(text, k, None) == v for k, v in _CALIBRATED_SHAPE.items())
+
+
 def _is_calibrated(model_config) -> bool:
     """Whether the defaults were measured for this checkpoint and device:
     the calibrated checkpoint shape on a TPU7x device. Any other shape, a
