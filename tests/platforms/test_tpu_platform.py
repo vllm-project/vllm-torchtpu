@@ -709,6 +709,7 @@ class TestTpuPlatform:
         # v4 / v5p, but each chip contributes two devices, so a given mesh is
         # reached at twice the world size. Both spellings of the device name
         # have to select this map.
+        assert get_tpu_multihost_topology(8, device_name="TPU v7x") == "2,2,1,2"
         assert get_tpu_multihost_topology(16, device_name="TPU v7") == "2,2,2,2"
         assert get_tpu_multihost_topology(32, device_name="TPU7x") == "2,2,4,2"
         assert get_tpu_multihost_topology(64, device_name="TPU v7x") == "2,4,4,2"
@@ -743,6 +744,15 @@ class TestTpuPlatform:
         # Test ValueError on unsupported device counts
         with pytest.raises(ValueError, match="Cannot find topology for 10 devices"):
             get_tpu_multihost_topology(10, device_name="TPU v6e")
+
+    def test_get_tpu_multihost_topology_v7x_8_devices(self, monkeypatch):
+        monkeypatch.delenv("TORCH_TPU_TOPOLOGY", raising=False)
+        monkeypatch.setattr(TpuPlatform, "get_device_name", lambda: "TPU v7")
+        assert get_tpu_multihost_topology(8) == "2,2,1,2"
+        assert get_tpu_multihost_topology(8, device_name="TPU7x") == "2,2,1,2"
+
+        monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "1,4,1,2")
+        assert get_tpu_multihost_topology(8) == "1,4,1,2"
 
     @pytest.mark.parametrize(
         "raw_kind,expected_name",

@@ -96,6 +96,8 @@ TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
 # both cores of a chip as separate devices (8 devices per host). Same meshes
 # as above, addressed by twice as many devices.
 TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP = {
+    # Single 2x2x1 v7x host (4 chips x 2 cores).
+    8: "2,2,1,2",
     16: "2,2,2,2",
     32: "2,2,4,2",
     64: "2,4,4,2",

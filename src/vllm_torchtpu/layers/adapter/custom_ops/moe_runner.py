@@ -23,7 +23,13 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
+from vllm_torchtpu.layers.adapter.moe_tp_decode import (
+    bind_routed_experts_runner,
+    moe_tp_decode_supported,
+)
+from vllm_torchtpu.layers.adapter.moe_tp_decode_nvfp4 import (
+    moe_tp_decode_nvfp4_supported,
+)
 
 # Taken once at import, outside any trace: the MoE forward is traced by
 # torch.compile, and reading the upstream property from inside the trace does
@@ -46,6 +52,7 @@ class VllmMoERunner(MoERunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        bind_routed_experts_runner(self)
         self._take_over_moe_quant_config_init()
 
     def _take_over_moe_quant_config_init(self) -> None:
@@ -106,6 +113,7 @@ class VllmMoERunner(MoERunner):
         # routed in its op.
         if (
             moe_tp_decode_supported(self._quant_method)
+            or moe_tp_decode_nvfp4_supported(self._quant_method)
             or getattr(self, "_fused_moe_decode_armed", False)
         ) and not getattr(self.moe_config, "skip_final_all_reduce", False):
             return True

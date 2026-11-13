@@ -102,6 +102,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Matches moe_tp_decode_nvfp4's 512-column w13 quantization block (_Q_BLOCK).
+_TP_DECODE_NVFP4_Q_BLOCK = 512
+
 
 def _to_kernel_scale(scale_f32: torch.Tensor) -> torch.Tensor:
     """[*, out, num_blocks] fp32 -> [*, num_blocks, 1, out] fp32 (gmm_v2 rhs
@@ -163,20 +166,25 @@ def _requant_moe_w4a8(
     )
 
 
-def _prepare_moe_weights(layer, w13_scale_f, w2_scale_f, requant_block):
+def _prepare_moe_weights(
+    layer, w13_scale_f, w2_scale_f, requant_block, *, clamp_per_matrix: bool = False
+):
     """Prepare a candidate weight set without replacing checkpoint tensors."""
     w13, w2 = layer.w13_weight.data, layer.w2_weight.data
     if requant_block:
         requant_block = int(requant_block)
         hidden, inter = w13.shape[-1] * 2, w2.shape[-1] * 2
-        if hidden % requant_block == 0 and inter % requant_block == 0:
-            w13, s13 = requant_load_kmajor_fp4(
-                fresh_buffer(w13), w13_scale_f, requant_block
-            )
-            w2, s2 = requant_load_kmajor_fp4(
-                fresh_buffer(w2), w2_scale_f, requant_block
-            )
-            return (w13, w2, s13, s2), f"FP4 (jax requant block-{requant_block})"
+        b13 = min(requant_block, hidden) if clamp_per_matrix else requant_block
+        b2 = min(requant_block, inter) if clamp_per_matrix else requant_block
+        if (
+            hidden % b13 == 0
+            and inter % b2 == 0
+            and (not clamp_per_matrix or (b13 % 16 == 0 and b2 % 16 == 0))
+        ):
+            w13, s13 = requant_load_kmajor_fp4(fresh_buffer(w13), w13_scale_f, b13)
+            w2, s2 = requant_load_kmajor_fp4(fresh_buffer(w2), w2_scale_f, b2)
+            blk = f"{b13}" if b13 == b2 else f"{b13}/{b2}"
+            return (w13, w2, s13, s2), f"FP4 (jax requant block-{blk})"
         # Pad each gate/up half and w2's contracting dimension together.
         w13, s13, w2, s2 = _requant_moe_w4a8(
             w13, w13_scale_f, w2, w2_scale_f, requant_block
@@ -414,8 +422,37 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             )
         else:
             op, requant_block = _prebuild_w4a8(layer, activation_str, configured_block)
+        tp_decode_nvfp4 = False
+        if envs.USE_MOE_TP_DECODE_NVFP4_KERNEL and op is None:
+            from vllm_torchtpu.layers.adapter.moe_tp_decode_nvfp4 import (
+                precheck_admission,
+            )
+
+            candidate_block = (
+                _TP_DECODE_NVFP4_Q_BLOCK
+                if requant_block is None
+                else int(requant_block)
+            )
+            refusal = precheck_admission(
+                layer,
+                requant_block=candidate_block,
+                clamp_per_matrix=True,
+            )
+            if refusal is None:
+                tp_decode_nvfp4 = True
+                requant_block = candidate_block
+            else:
+                logger.warning_once(
+                    "moe_tp_decode_nvfp4: retaining GMM NVFP4 MoE weight recipe "
+                    "(refused before load-time requantization: %s)",
+                    refusal,
+                )
         weights, mode = _prepare_moe_weights(
-            layer, w13_scale_f, w2_scale_f, requant_block
+            layer,
+            w13_scale_f,
+            w2_scale_f,
+            requant_block,
+            clamp_per_matrix=tp_decode_nvfp4,
         )
         if op is not None:
             validate_prepared = (
@@ -544,6 +581,14 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 router_logits,
                 score_bias_operand(layer),
             )
+        if envs.USE_MOE_TP_DECODE_NVFP4_KERNEL:
+            from vllm_torchtpu.layers.adapter.moe_tp_decode_nvfp4 import (
+                moe_tp_decode_nvfp4_forward,
+                moe_tp_decode_nvfp4_supported,
+            )
+
+            if moe_tp_decode_nvfp4_supported(self):
+                return moe_tp_decode_nvfp4_forward(self, layer, x, router_logits)
 
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
