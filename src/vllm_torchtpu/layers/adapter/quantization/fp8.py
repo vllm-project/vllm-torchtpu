@@ -79,6 +79,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
+from vllm_torchtpu.kernels.quantized_matmul.fp8_skinny import TUNED, padded_n
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -86,9 +87,16 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_N_ATTR,
+    FP8_PALLAS_SCALE,
+    FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
+    PREQUANT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    get_fp8_linear_pallas_op,
+    prequantized_matmul,
     quantized_matmul,
+    quantized_matmul_pallas,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -1347,6 +1355,95 @@ def _wrap_block_scale_weight_loader(weight_loader: Callable) -> Callable:
     return _wrapped
 
 
+def _fp8_linear_pallas_selected(prefix: str) -> bool:
+    """Whether the layer prefix ends with a site of TPU_FP8_LINEAR_PALLAS_SITES.
+
+    A site matches the whole prefix or its end after a ".". Example: the site
+    "self_attn.o_proj" matches "model.layers.3.self_attn.o_proj" and not
+    "model.layers.3.self_attn.xo_proj". An empty setting matches no prefix.
+    """
+    if not prefix:
+        return False
+    for site in envs.TPU_FP8_LINEAR_PALLAS_SITES.split(","):
+        site = site.strip()
+        if site and (prefix == site or prefix.endswith("." + site)):
+            return True
+    return False
+
+
+def _set_fp8_pallas_copy(layer: torch.nn.Module) -> None:
+    """(Re)builds the kernel's zero-padded copy of a flipped `[n_in, n_out]` weight.
+
+    The copy is K-major `[n_in, padded_n(n_out)]`, for example 2624 -> 2688
+    columns, with zero weights and unit scales in the padded columns. It moves raw
+    bytes, so the device needs no FP8-specific pad support. The weight copy is
+    built as a float8 view of a uint8 buffer, and both copies are filled through
+    slices. `fresh_buffer` gives each a device buffer of its own shape and dtype,
+    so torch_tpu does not re-materialize them before every forward.
+
+    The original weight stays for the XLA path of calls with more than 16 rows,
+    which is fast only on the original layout: measured on TPU v7x at M=4096,
+    the XLA matmul takes 14% longer on the padded N-major form and 78% longer on
+    the padded K-major form.
+    """
+    weight, scale = layer.weight.data, layer.weight_scale.data
+    n_in, n_out = weight.shape
+    n_pad = padded_n(n_out)
+    raw = torch.zeros(n_in, n_pad, dtype=torch.uint8, device=weight.device)
+    raw[:, :n_out].copy_(weight.contiguous().view(torch.uint8))
+    pad_scale = torch.ones(n_pad, dtype=scale.dtype, device=scale.device)
+    pad_scale[:n_out].copy_(scale)
+    for name, t in (
+        (FP8_PALLAS_WEIGHT, fresh_buffer(raw.view(weight.dtype))),
+        (FP8_PALLAS_SCALE, fresh_buffer(pad_scale)),
+    ):
+        if hasattr(layer, name):
+            replace_parameter(layer, name, torch.nn.Parameter(t, requires_grad=False))
+        else:
+            layer.register_parameter(name, torch.nn.Parameter(t, requires_grad=False))
+
+
+def _fp8_linear_pallas_refusal(
+    keep_vllm_layout: bool,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    n_in: int,
+    n_out: int,
+) -> str | None:
+    """Returns why the weight-streaming kernel cannot take a layer, or None.
+
+    Args:
+      keep_vllm_layout: Whether the layer keeps vLLM's `[n_out, n_in]` weight
+        layout instead of the K-major `[n_in, n_out]` layout the kernel reads.
+      weight: The layer's runtime weight.
+      weight_scale: The layer's runtime weight scale.
+      n_in: Input features of the layer.
+      n_out: Output features of the layer.
+
+    Returns:
+      None when the weight is FP8 E4M3 in K-major layout, the scale holds one
+      value per output column, and `(n_in, padded_n(n_out))` is in
+      `fp8_skinny.TUNED`. Otherwise a short reason for the load-time warning,
+      for example "the weight shape [2048, 4096] (width padded to 128) is not in
+      fp8_skinny.TUNED".
+    """
+    if keep_vllm_layout:
+        return "the layer keeps vLLM's [n_out, n_in] weight layout"
+    if weight_scale.ndim != 1 or weight_scale.shape[0] != n_out:
+        return (
+            f"the weight scale {tuple(weight_scale.shape)} is not one value per "
+            f"output column ({n_out})"
+        )
+    if weight.dtype != torch.float8_e4m3fn:
+        return f"the weight dtype {weight.dtype} is not float8_e4m3fn"
+    if (n_in, padded_n(n_out)) not in TUNED:  # measured shapes only
+        return (
+            f"the weight shape [{n_in}, {padded_n(n_out)}] (width padded to 128) "
+            "is not in fp8_skinny.TUNED"
+        )
+    return None
+
+
 @register_weight_loader_v2_supported_method
 class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     """
@@ -1614,6 +1711,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # Layers whose weight is read raw by code expecting vLLM's
         # [n_out, n_in] keep that layout; `apply` below contracts accordingly.
         if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            if hasattr(layer, FP8_PALLAS_WEIGHT):
+                _set_fp8_pallas_copy(layer)  # keep the kernel copy in step on reload
             return  # already flipped; reload paths re-enter this hook
         # Prevent transposing for embedding lookup, keep [vocab_size, hidden_size].
         is_embedding = isinstance(layer, VocabParallelEmbedding) and not isinstance(
@@ -1638,6 +1737,41 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
+
+        # TPU_FP8_LINEAR_PALLAS_SITES: calls of at most 16 rows of a selected
+        # per-channel FP8 layer go to the weight-streaming kernel
+        # (kernels/quantized_matmul/fp8_skinny.py). A selected layer that the
+        # kernel cannot take stays on XLA with a warning.
+        pallas_prefix = getattr(layer, "prefix", "") or self.prefix
+        if _fp8_linear_pallas_selected(pallas_prefix):
+            refusal = _fp8_linear_pallas_refusal(
+                keep_vllm_layout, weight, weight_scale, ckpt_n_in, ckpt_n_out
+            )
+            if refusal is not None:
+                logger.warning_once(
+                    "TPU_FP8_LINEAR_PALLAS_SITES selects %s, but the layer stays "
+                    "on XLA: %s.",
+                    pallas_prefix,
+                    refusal,
+                )
+            else:
+                if self.w8a16_max_rows > 0:
+                    # The kernel path always quantizes the activation to FP8.
+                    logger.warning_once(
+                        "TPU_FP8_LINEAR_PALLAS_SITES selects %s, so W8A16 "
+                        "(TPU_FP8_LINEAR_W8A16_MAX_ROWS or the linear config's "
+                        "w8a16_max_rows, here %d) does not apply to this layer: "
+                        "its calls quantize the activation to FP8.",
+                        pallas_prefix,
+                        self.w8a16_max_rows,
+                    )
+                setattr(layer, FP8_PALLAS_N_ATTR, ckpt_n_out)
+                padded_copy = padded_n(ckpt_n_out) != ckpt_n_out
+                if padded_copy:
+                    _set_fp8_pallas_copy(layer)
+                get_fp8_linear_pallas_op(
+                    padded_copy
+                )  # build now: Dynamo cannot trace its Lock
         # Derive weight_block_size explicitly from weight_scale layout when
         # requant_block_size is unspecified.
         # Setting (1, weight.shape[1]) vs (weight.shape[0], 1) guarantees downstream
@@ -1658,7 +1792,14 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             layer.weight_block_size = requant_block_size
 
         if layer.weight.device.type == "tpu":
-            synchronize_tensors([layer.weight, layer.weight_scale])
+            synchronize_tensors(
+                [layer.weight, layer.weight_scale]
+                + [
+                    getattr(layer, n)
+                    for n in (FP8_PALLAS_WEIGHT, FP8_PALLAS_SCALE)
+                    if hasattr(layer, n)
+                ]
+            )
 
         if self.online_fp8:
             layer._tpu_online_fp8_processed = True
@@ -1683,7 +1824,24 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
-        if isinstance(layer, VocabParallelEmbedding):
+        slot = getattr(layer, PREQUANT_ATTR, None)
+        prequant = None if slot is None else slot.value
+        if prequant is not None:
+            # TPU_FUSED_ADD_RMSNORM_QUANT: the norm that produced `x` also
+            # emitted its per-row fp8 quant (bit-identical to the one below).
+            slot.value = None
+            x_q, x_scale = prequant
+            out = prequantized_matmul(x_q, x_scale, weight, layer.weight_scale)
+            out = out.reshape(*x.shape[:-1], out.shape[-1])
+        elif getattr(layer, FP8_PALLAS_N_ATTR, None) is not None:
+            out = quantized_matmul_pallas(
+                x,
+                weight,
+                layer.weight_scale,
+                getattr(layer, FP8_PALLAS_WEIGHT, None),
+                getattr(layer, FP8_PALLAS_SCALE, None),
+            )
+        elif isinstance(layer, VocabParallelEmbedding):
             # Prevent the quantization of activations to FP8 (W8A16).
             out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
         else:

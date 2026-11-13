@@ -23,7 +23,11 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    xla_prequantized_matmul,
+    xla_quantized_matmul,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -51,6 +55,35 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 # (`dummy_loader`, `reload/layerwise`), where a second flip would transpose
 # back and silently corrupt the values.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
+
+# TPU_FUSED_ADD_RMSNORM_QUANT: a per-channel FP8 linear paired with the
+# residual-stream norm in front of it holds a PrequantSlot under this attribute;
+# the norm holds the same slot. The norm's forward puts
+# `(x_q [m, k], x_scale f32 [m, 1])` in it and `apply` takes and clears it.
+PREQUANT_ATTR = "_tpu_prequant_slot"
+
+
+class PrequantSlot:
+    """A plain object shared by a norm and its linear, so the norm never holds
+    the linear module: Dynamo would otherwise reach the linear's weights
+    through the norm on one side of the token-count branch, and the two traces
+    would lift the same buffers under different names (no bucket handover)."""
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = None
+
+
+# TPU_FP8_LINEAR_PALLAS_SITES: set on a linear layer whose calls of at most 16
+# rows go to the weight-streaming kernel. The value is the layer's output width;
+# readers only test that it is not None.
+# A layer whose width is not a lane multiple also carries a zero-padded K-major
+# copy of its weight for the kernel, as these two parameters (the M > 16 XLA path
+# keeps the original weight: it is fast only on that layout).
+FP8_PALLAS_N_ATTR = "_tpu_fp8_pallas_n_out"
+FP8_PALLAS_WEIGHT = "weight_pallas"
+FP8_PALLAS_SCALE = "weight_scale_pallas"
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
@@ -183,6 +216,140 @@ def quantized_matmul(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows)
     return out_2d.reshape(orig_out_shape)
+
+
+_prequantized_matmul_op: Callable | None = None
+
+
+def _prequantized_matmul_jax(
+    x_q: jax.Array, x_scale: jax.Array, w_q: jax.Array, w_s: jax.Array
+) -> jax.Array:
+    return xla_prequantized_matmul(x_q, x_scale, w_q, w_s, jnp.bfloat16)
+
+
+def get_prequantized_matmul_op() -> Callable:
+    """TPU_FUSED_ADD_RMSNORM_QUANT consumer op (build outside Dynamo)."""
+    global _prequantized_matmul_op
+    if _prequantized_matmul_op is not None:
+        return _prequantized_matmul_op
+    with _quantized_matmul_kernel_op_lock:
+        if _prequantized_matmul_op is not None:
+            return _prequantized_matmul_op
+        op = pallas.jax_op("pallas::prequantized_matmul", _prequantized_matmul_jax)
+
+        def _fake(x_q, x_scale, w_q, w_s):
+            del x_scale, w_s
+            return torch.empty(
+                x_q.shape[0], w_q.shape[1], dtype=torch.bfloat16, device=x_q.device
+            )
+
+        op.register_fake(_fake)
+        _prequantized_matmul_op = op
+        return op
+
+
+def prequantized_matmul(
+    x_q: torch.Tensor, x_scale: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor:
+    """Per-channel FP8 linear on an activation quantized upstream:
+    bit for bit ``quantized_matmul(x, w_q, w_s)`` when ``(x_q, x_scale)`` is
+    ``quantize_tensor(x)`` (bf16 out). ``w_q`` is (k, n), ``w_s`` [n].
+
+    Runs inside the compiled forward, so it only reads the op that
+    ``get_prequantized_matmul_op`` built at arming (rmsnorm.arm_prequant):
+    Dynamo cannot trace the lock or the lazy construction."""
+    op = _prequantized_matmul_op
+    if op is None:
+        raise RuntimeError(
+            "prequantized_matmul op not built: call get_prequantized_matmul_op() "
+            "at load (rmsnorm.arm_prequant does)"
+        )
+    return op(x_q, x_scale, w_q, w_s)
+
+
+def _fp8_linear_pallas_jax(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w_k: jax.Array | None = None,
+    s_k: jax.Array | None = None,
+) -> jax.Array:
+    """`TPU_FP8_LINEAR_PALLAS_SITES` path: at most 16 rows go to the weight-streaming
+    Pallas kernel, every other shape to `xla_quantized_matmul` on `(w_q, w_s)`.
+
+    `(w_k, s_k)`, when given, is the kernel's zero-padded `[n_in, n_pad]` copy of a
+    weight whose width is not a lane multiple; the kernel output is cut back to it.
+    """
+    n_out = w_q.shape[1]
+    kw, ks = (w_q, w_s) if w_k is None else (w_k, s_k)
+    if fp8_skinny.supports(x.shape[0], kw, ks):
+        return fp8_skinny.fp8_skinny_matmul(x, kw, ks, n_logical=n_out)
+    return xla_quantized_matmul(x, w_q, w_s)
+
+
+_fp8_linear_pallas_ops: dict[bool, Callable] = {}
+
+
+def get_fp8_linear_pallas_op(padded_copy: bool) -> Callable:
+    """The cached torch op; build it outside Dynamo (load time), it takes a Lock."""
+    op = _fp8_linear_pallas_ops.get(padded_copy)
+    if op is not None:
+        return op
+    with _quantized_matmul_kernel_op_lock:
+        op = _fp8_linear_pallas_ops.get(padded_copy)
+        if op is not None:
+            return op
+        name = "pallas::fp8_linear_pallas" + ("_padded" if padded_copy else "")
+        op = pallas.jax_op(name, _fp8_linear_pallas_jax)
+
+        def _fake(x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, *rest):
+            del w_s, rest
+            return torch.empty(x.shape[0], w_q.shape[1], dtype=x.dtype, device=x.device)
+
+        op.register_fake(_fake)
+        _fp8_linear_pallas_ops[padded_copy] = op
+        return op
+
+
+def quantized_matmul_pallas(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w_kernel: torch.Tensor | None = None,
+    s_kernel: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Runs a per-channel FP8 linear on the weight-streaming kernel or on XLA.
+
+    This is the torch entry point of `TPU_FP8_LINEAR_PALLAS_SITES`. Unlike
+    `quantized_matmul`, it takes no block-wise scale and no W8A16 row limit.
+
+    Args:
+      x: Activation `[..., k]`.
+      w_q: FP8 E4M3 weight in K-major `[k, n]` layout.
+      w_s: Float32 scale `[n]`, one value per output column.
+      w_kernel: Optional zero-padded copy `[k, padded_n(n)]` of `w_q` for the
+        kernel, for a width `n` that is not a multiple of 128.
+      s_kernel: Scales `[padded_n(n)]` of `w_kernel`, 1.0 in the padded columns.
+
+    Returns:
+      `[..., n]` in `x.dtype`. A call whose `x` has at most 16 rows after
+      flattening, on a weight shape that `fp8_skinny.supports()` accepts, runs
+      `fp8_skinny`. Other calls run `xla_quantized_matmul` on `(w_q, w_s)`.
+
+    Raises:
+      ValueError: If the last dimension of `x` is not `k`.
+    """
+    if x.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
+    x_2d = x.reshape(-1, x.shape[-1])
+    if w_kernel is None:
+        out_2d = get_fp8_linear_pallas_op(False)(x_2d, w_q, w_s)
+    else:
+        out_2d = get_fp8_linear_pallas_op(True)(x_2d, w_q, w_s, w_kernel, s_kernel)
+    return out_2d.reshape(*x.shape[:-1], w_q.shape[1])
 
 
 def _quantized_matmul_fp4_jax(
