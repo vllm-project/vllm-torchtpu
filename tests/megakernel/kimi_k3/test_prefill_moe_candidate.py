@@ -230,7 +230,7 @@ def test_metadata_steps_ep16(monkeypatch, tokens, hot, local_experts):
         for g in range(896 // local_experts)
     )
 
-    tallies_shape = (local_experts + 896 // local_experts, 8, 128)
+    tallies_shape = fused._tally_shape(local_experts)
     if tokens == 512:
         wire = jnp.asarray(wire_np)
 

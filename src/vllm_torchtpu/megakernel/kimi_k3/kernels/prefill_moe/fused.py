@@ -91,6 +91,13 @@ def _sort_rows(tokens):
     return tokens // 8
 
 
+def _tally_shape(local_experts):
+    """The route-count tallies of ``_metadata_steps``: per half chunk, the
+    expert words then the EP-group words, four byte fields each."""
+    words = pl.cdiv(local_experts, 4) + pl.cdiv(896 // local_experts, 4)
+    return (2, words, 8, 128)
+
+
 _EMPTY_ROUTE = 2**31 - 1  # a sort key above every route's
 
 
@@ -336,8 +343,10 @@ def _metadata_steps(
     The all-gathered wire contains 16 expert IDs followed by 16 probability bit
     patterns per token. Every rank counts all expert groups at 8K, making the
     compact-capacity decision uniform before any conditional collective runs.
-    ``tallies`` ([local experts + groups, 8, 128] int32) accumulates the counts
-    lane-wise; each is reduced once after the last chunk.
+    ``tallies`` (``_tally_shape``) counts lane-wise in byte fields, four
+    experts (or groups) to an int32 word of each half chunk: a field gains at
+    most one route per chunk and a launch has fewer than 256 chunks, so none
+    carries over. Each count is reduced once after the last chunk.
 
     A launch that sorts only its local routes (``_sorts_local_routes``)
     compacts each chunk's local routes onto the end of the previous ones and
@@ -353,14 +362,31 @@ def _metadata_steps(
     assert not local_only or (shape == (16, 128) and keys.shape[0] == _sort_rows(tokens))
     lanes = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
     rows = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
+    expert_words, group_words = pl.cdiv(local_experts, 4), pl.cdiv(ep_groups, 4)
+    assert tokens // 128 < 256 and tallies.shape == _tally_shape(local_experts)
     tallies[...] = jnp.zeros(tallies.shape, jnp.int32)
     if local_only:
         keys[...] = jnp.full(keys.shape, _EMPTY_ROUTE, jnp.int32)
         filled_routes = jnp.int32(0)
 
-    def tally(index, hits):
-        hits = hits.astype(jnp.int32)
-        tallies[index] += hits[:8] + hits[8:]
+    def tally(first, words, index):
+        """Count each lane's route at its ``index`` ([16, 128]) in the byte
+        fields of ``words`` words from ``first``; an index past the last field
+        counts nowhere."""
+        for half in range(2):
+            value = index[8 * half : 8 * half + 8]
+            word, field = value >> 2, 1 << ((value & 3) << 3)
+            for w in range(words):
+                tallies[half, first + w] += jnp.where(word == w, field, 0)
+
+    def totals(first, count):
+        index = jnp.arange(count, dtype=jnp.int32)
+        result = jnp.zeros((count,), jnp.int32)
+        for i in range(count):
+            word, shift = first + i // 4, 8 * (i % 4)
+            fields = sum((tallies[half, word] >> shift) & 255 for half in range(2))
+            result = jnp.where(index == i, jnp.sum(fields), result)
+        return result
 
     for chunk in range(tokens // 128):
         if tokens < 4096:
@@ -396,30 +422,15 @@ def _metadata_steps(
             keys[pl.ds(chunk * 16, 16), :] = packed.reshape(16, 128)
             probabilities[pl.ds(chunk * 16, 16), :] = probs.reshape(16, 128)
         # Count routes on the packed 16x128 layout.
-        local_flat = local.reshape(16, 128)
-        for expert in range(local_experts):
-            tally(expert, local_flat == expert)
+        tally(0, expert_words, local.reshape(16, 128))
         if maximum is not None:
-            # Group g holds the live routes below (g + 1) * local_experts less
-            # those below g * local_experts.
-            ids_flat = ids.reshape(16, 128)
-            live_flat = probs.reshape(16, 128) != 0
-            for group in range(ep_groups):
-                below = live_flat & (ids_flat < (group + 1) * local_experts)
-                tally(local_experts + group, below)
+            live = probs.reshape(16, 128) != 0
+            groups = ids.reshape(16, 128) // local_experts
+            tally(expert_words, group_words, jnp.where(live, groups, 4 * group_words))
         yield
-    expert_index = jnp.arange(local_experts, dtype=jnp.int32)
-    total_counts = jnp.zeros((local_experts,), jnp.int32)
-    for expert in range(local_experts):
-        count = jnp.sum(tallies[expert])
-        total_counts = jnp.where(expert_index == expert, count, total_counts)
-    counts[...] = total_counts
+    counts[...] = totals(0, local_experts)
     if maximum is not None:
-        cumulative = [jnp.sum(tallies[local_experts + g]) for g in range(ep_groups)]
-        largest = cumulative[0]
-        for group in range(1, ep_groups):
-            largest = jnp.maximum(largest, cumulative[group] - cumulative[group - 1])
-        maximum[...] = largest[None]
+        maximum[...] = jnp.max(totals(expert_words, ep_groups))[None]
     counts_ready()
     yield from _sort_route_steps(
         keys,
@@ -1236,7 +1247,7 @@ def _prologue(
         route_send=dma((5,)),
         route_recv=dma((5,)),
         keys=vmem((_sort_rows(rows * 32), 128), jnp.int32),
-        tallies=vmem((counts.shape[0] + 896 // counts.shape[0], 8, 128), jnp.int32),
+        tallies=vmem(_tally_shape(counts.shape[0]), jnp.int32),
         latent_payload=vmem((rows, 2, 1792), jnp.bfloat16),
         latent_recv=vmem((2, rows, 2, 1792), jnp.bfloat16) if not big else None,
         latent_state=pltpu.SMEM((25,), jnp.int32) if big else None,
