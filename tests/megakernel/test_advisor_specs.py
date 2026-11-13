@@ -568,6 +568,34 @@ def test_vector_register_constants_are_public_values() -> None:
         assert unset_chip_spec.sources[field_name].startswith(UNSET_SOURCE_PREFIX)
 
 
+def test_phase_grid_has_prefill_columns_on_prefill_role() -> None:
+    """Verify the phase map seed carries the deployment roles and the prefill grid."""
+    deployment = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
+    seed = workbench_phase.build_phase_grid_seed("kimi-k3")
+    assert seed["prefill_token_grid"] == list(constants.PHASE_PREFILL_TOKEN_GRID)
+    roles = seed["roles"]
+    assert isinstance(roles, dict)
+    for role_name, layout in (
+        ("decode", deployment.decode),
+        ("prefill", deployment.prefill),
+    ):
+        role = roles[role_name]
+        for axis in ("tp", "ep", "dp", "pp", "dcp", "pcp"):
+            assert role[axis] == getattr(layout, axis)
+        assert role["layer_groups"] == list(layout.layer_groups)
+        assert role["label"] == layout.label()
+    # The roles differ, so a prefill column cannot pass on the decode layout.
+    assert roles["decode"] != roles["prefill"]
+
+    model_without_deployment = next(
+        name for name in advisor.MODEL_PRESETS if name not in advisor.DEPLOYMENT_PRESETS
+    )
+    plain_seed = workbench_phase.build_phase_grid_seed(model_without_deployment)
+    assert plain_seed["roles"] == {}
+    assert plain_seed["prefill_token_grid"] == []
+    assert plain_seed["t_grid"] == seed["t_grid"]
+
+
 def test_kimi_k3_declares_eight_expert_owner_groups() -> None:
     """Verify Kimi-K3 decode and saturation presets declare 8 expert owner groups."""
     kimi_preset = advisor.DEPLOYMENT_PRESETS["kimi-k3"]

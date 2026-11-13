@@ -20,7 +20,6 @@ from . import (
     calibrate,
     chips,
     cli,
-    constants,
     models,
     regimes,
     report,
@@ -32,16 +31,17 @@ from . import (
     vmem,
     workbench,
     workbench_engine,
+    workbench_phase,
 )
 from .calibrate import CalibrateOptions, calibrate_trace
 from .chips import (
     BUILTIN_CHIP_SPECS,
+    ChipSpec,
+    FieldSource,
     REQUIRED_CHIP_SPEC_KEYS,
     SUPPORTED_CHIPS,
     TPU6E_TOPOLOGIES,
     TPU7X_TOPOLOGIES,
-    ChipSpec,
-    FieldSource,
     UnsupportedChipError,
     build_builtin_chip_spec,
     detect_tpu_from_sysfs,
@@ -146,12 +146,11 @@ from .vmem import (
     fit_vmem_budget_bytes,
     validate_advise_inputs,
 )
-from .workbench import (
-    render_workbench_body,
-    render_workbench_css,
-    render_workbench_script,
-)
 from .workbench_engine import render_workbench_engine_js
+from .workbench_phase import (
+    render_phase_extension_js,
+    render_phase_stage_tab_button,
+)
 
 __all__ = [
     "AdvisorReport",
@@ -224,7 +223,6 @@ __all__ = [
     "compute_all_reduce_transfer_cost",
     "compute_per_token_vmem_bytes",
     "compute_scope_raw_step_us",
-    "constants",
     "declared_collectives",
     "default_double_buffer_ring_plan",
     "derive_decoding_sequences",
@@ -249,8 +247,10 @@ __all__ = [
     "recommend_parallelism",
     "regimes",
     "render_advisor_html",
-    "render_workbench_engine_js",
+    "render_phase_extension_js",
+    "render_phase_stage_tab_button",
     "render_regime_dot_plot_svg",
+    "render_workbench_engine_js",
     "report",
     "resolve_chip_spec",
     "resolve_declared_expert_mode",
@@ -269,9 +269,7 @@ __all__ = [
     "vmem",
     "workbench",
     "workbench_engine",
-    "render_workbench_body",
-    "render_workbench_css",
-    "render_workbench_script",
+    "workbench_phase",
     "write_advisor_html",
     "write_bucket_schedule",
 ]
