@@ -90,6 +90,11 @@ if TYPE_CHECKING:
     TPU_GREEDY_TOP_TOKENS: bool = False
     TPU_DP_VOCAB_PARALLEL: bool = False
     DP_SCHED_ENABLED: bool = False
+    VLLM_TPU_DP_PLACEMENT: str = ""
+    VLLM_TPU_DP_RELEASE_THRESHOLD: int = 0
+    VLLM_TPU_DP_RELEASE_DEADLINE_MS: int = 5000
+    VLLM_TPU_DP_RELEASE_IDLE_TRIGGER: bool = True
+    VLLM_TPU_DP_RELEASE_QUIET_MS: int = 0
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -800,6 +805,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DP_VOCAB_PARALLEL": env_bool("TPU_DP_VOCAB_PARALLEL"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # VLLM_TPU_DP_PLACEMENT=release: the API server's data-parallel router holds new
+    # requests and releases them as a group, one per engine, so the engines
+    # run their prefill steps together (core/dp_placement.py). A group is
+    # released at VLLM_TPU_DP_RELEASE_THRESHOLD held requests (0 = the engine
+    # count), when the oldest has waited VLLM_TPU_DP_RELEASE_DEADLINE_MS, when an
+    # engine is idle (VLLM_TPU_DP_RELEASE_IDLE_TRIGGER), or after
+    # VLLM_TPU_DP_RELEASE_QUIET_MS without an arrival (0 = off). Unset or empty
+    # leaves vLLM's router unchanged.
+    "VLLM_TPU_DP_PLACEMENT": env_with_choices(
+        "VLLM_TPU_DP_PLACEMENT", "", ["", "release"]
+    ),
+    "VLLM_TPU_DP_RELEASE_THRESHOLD": env_nonnegative_int(
+        "VLLM_TPU_DP_RELEASE_THRESHOLD", 0
+    ),
+    "VLLM_TPU_DP_RELEASE_DEADLINE_MS": env_nonnegative_int(
+        "VLLM_TPU_DP_RELEASE_DEADLINE_MS", 5000
+    ),
+    "VLLM_TPU_DP_RELEASE_IDLE_TRIGGER": env_bool(
+        "VLLM_TPU_DP_RELEASE_IDLE_TRIGGER", default=True
+    ),
+    "VLLM_TPU_DP_RELEASE_QUIET_MS": env_nonnegative_int(
+        "VLLM_TPU_DP_RELEASE_QUIET_MS", 0
+    ),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
