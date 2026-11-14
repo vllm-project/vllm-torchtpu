@@ -35,7 +35,7 @@ from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+DEFAULT_VMEM_LIMIT_BYTES = 60 * 1024 * 1024
 
 
 # TODO(chengjiyao): refactor this hd64 variant and the original kernel to make

@@ -24,7 +24,7 @@ SUBLANE = 16
 # Explicit scoped-VMEM budget, repo convention (mla/v1, deepseek_v4 and
 # fused_moe use the same constant). Never rely on the backend default —
 # it varies by Mosaic version.
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+DEFAULT_VMEM_LIMIT_BYTES = 60 * 1024 * 1024
 
 
 def round_up(x: int, multiple: int) -> int:
