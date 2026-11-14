@@ -52,6 +52,7 @@ per word.
 """
 
 import functools
+import inspect
 from typing import Any
 
 import jax
@@ -1190,6 +1191,100 @@ def _block_op(
     op = pallas.jax_op(name, _block)
     op.register_fake(lambda q, *args: torch.empty_like(q))
     return op
+
+
+@functools.cache
+def write_layers_op(
+    dcp: int,
+    head_ranks: int,
+    k_scale: float | None,
+    v_scale: float | None,
+    num_layers: int,
+):
+    """`write_kv` of ``num_layers`` draft layers in one op:
+    ``(kv_cache_0, .., kv_cache_{L-1}, keys [L, T, 1, D], values, seq_lens,
+    block_tables, query_start_loc, dcp_rank) -> new caches``. The layers share
+    the token layout, slots and write runs, which XLA then computes once
+    instead of once per layer. Build it outside a compiled forward (see
+    `build_ops`)."""
+    from torch_tpu._internal import pallas
+
+    def _write_layers(*args: jax.Array) -> tuple[jax.Array, ...]:
+        caches = args[:num_layers]
+        keys, values, seq_lens, block_tables, query_start_loc, dcp_rank = args[
+            num_layers:
+        ]
+        return tuple(
+            write_kv(
+                cache,
+                keys[i],
+                values[i],
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                dcp=dcp,
+                head_ranks=head_ranks,
+                rank=dcp_rank[0],
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            for i, cache in enumerate(caches)
+        )
+
+    names = [f"kv_cache_{i}" for i in range(num_layers)] + [
+        "keys",
+        "values",
+        "seq_lens",
+        "block_tables",
+        "query_start_loc",
+        "dcp_rank",
+    ]
+    # jax_op reads the arguments (all arrays) from the signature.
+    _write_layers.__signature__ = inspect.Signature(
+        [
+            inspect.Parameter(
+                n, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=jax.Array
+            )
+            for n in names
+        ],
+        return_annotation=tuple[(jax.Array,) * num_layers],
+    )
+    name = (
+        f"pallas::dcp_draft_write_l{num_layers}_d{dcp}_h{head_ranks}"
+        f"_k{k_scale}_v{v_scale}"
+    )
+    op = pallas.jax_op(
+        name.replace(".", "p"), _write_layers, donate_argnums=tuple(range(num_layers))
+    )
+    op.register_fake(
+        lambda *args: tuple(torch.empty_like(c) for c in args[:num_layers])
+    )
+    return op
+
+
+def write_layers_with_dcp(
+    *,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    kv_caches: list[torch.Tensor],
+    attn_metadata: Any,
+    dcp_rank: torch.Tensor,
+    op: Any,
+) -> None:
+    """`write_with_dcp` of every draft layer (``keys`` ``[L, T, 1, D]``) at
+    once, for layers sharing one attention metadata."""
+    assert keys.shape[2] == 1, keys.shape
+    new_caches = op(
+        *kv_caches,
+        keys,
+        values,
+        attn_metadata.seq_lens,
+        attn_metadata.block_tables,
+        attn_metadata.query_start_loc,
+        dcp_rank,
+    )
+    for cache, new_cache in zip(kv_caches, new_caches, strict=True):
+        cache.copy_(new_cache)
 
 
 def write_with_dcp(
