@@ -300,15 +300,19 @@ class RpaSchedule:
     def in_specs(self):
         """Returns a Pytree of input BlockSpecs."""
 
-        # Since we use maximum upper bound when allocating scheduler data,
-        # it is not feasible to use scalar prefetch and fetch entire scheduler
-        # data into the kernel. Instead, we stored it to HBM first and perform
-        # dynamic sized DMA inside the kernel using actual number of steps.
-        # Only the step count (`actual_steps`) is an SMEM operand.
-        specs = jax.tree.map(lambda x: pl.BlockSpec(memory_space=pltpu.HBM),
-                             self)
-        return dataclasses.replace(
-            specs, actual_steps=pl.BlockSpec(memory_space=pltpu.SMEM))
+        def wrapper(x):
+            if x is None:
+                return None
+            if getattr(x, "size", None) == 1:
+                return pl.BlockSpec(memory_space=pltpu.SMEM)
+            else:
+                # Since we use maximum upper bound when allocating scheduler data,
+                # it is not feasible to use scalar prefetch and fetch entire scheduler
+                # data into the kernel. Instead, we stored it to HBM first and perform
+                # dynamic sized DMA inside the kernel using actual number of steps.
+                return pl.BlockSpec(memory_space=pltpu.HBM)
+
+        return jax.tree.map(wrapper, self)
 
     def out_specs(self):
         """Returns a Pytree of output BlockSpecs."""
