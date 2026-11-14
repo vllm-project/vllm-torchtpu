@@ -146,7 +146,23 @@ fi
 mkdir -p "$RESULTS_DIR"
 
 BASELINE_CONFIG="${BASELINE_CONFIG:-$CONFIG_NAME}"
-PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$BASELINE_CONFIG.baseline.json"
+# Perf baselines are per chip, baselines/perf/<chip>/<config>.baseline.json: a
+# chip with none for the config reports its numbers without the perf gate, and
+# is gated from the commit that adds one. The chip is tpu_info's reading of
+# TPU_ACCELERATOR_TYPE (GKE's "tpu7x-8", a step's "tpu7x" or "v6e", or the GCE
+# metadata when unset), named like the directories: v7x, v6e. Eval baselines
+# are shared across chips, so the accuracy gate applies on every chip.
+TPU_CHIP=$(python3 -c '
+from vllm_torchtpu.tpu_info import get_chip_version
+v = get_chip_version().value
+print("TPU_CHIP=" + (v if v.startswith("v") else "v" + v))
+' 2>/dev/null | sed -n 's/^TPU_CHIP=//p' | tail -n 1) || TPU_CHIP=""
+if [ -z "$TPU_CHIP" ]; then
+    echo "WARNING: could not read the TPU chip from vllm_torchtpu; using v7x's perf baselines"
+    TPU_CHIP="v7x"
+fi
+PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$TPU_CHIP/$BASELINE_CONFIG.baseline.json"
+echo "Perf baseline for $TPU_CHIP: $PERF_BASELINE$([ -f "$PERF_BASELINE" ] || echo ' (none: reporting without the perf gate)')"
 
 PERF_LOG="$RESULTS_DIR/regression_check.md"
 
