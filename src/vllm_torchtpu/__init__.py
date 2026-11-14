@@ -648,8 +648,11 @@ def _patch_vllm_compile_all_ranges() -> None:
         )
 
         if os.environ.get("VLLM_TPU_PEER_REPLAY_CLAIMS", "0") in ("1", "true"):
-            if compile_claimed(self):
-                return
+            # Without claims, fall back to the rotated order, which never waits
+            # on a peer: the static deal below can hang a pipeline leg.
+            if not compile_claimed(self):
+                compile_rotated(self, local_rank)
+            return
 
         ranks = ranks_per_host()
         # Unknown: assume a full host, but do not wait on owners that may not
