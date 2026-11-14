@@ -1106,6 +1106,166 @@ def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
         )
 
 
+# The single-slot schedule at a batch whose experts each fit one tile, where
+# the slabs stream in column chunks: 256 * 4 / 32 = 32 rows an expert, and
+# at least two chunks per slab on each matmul.
+CHUNKED = dict(hidden=3584, inter=1024, e_total=32, topk=4, tokens=256)
+
+
+def test_fp4_chunked_stream_agrees_with_the_prefetch_schedule(at_prefetch_depth):
+    """Column-chunk refills compute what whole-slab prefetch computes, bit for
+    bit: they move only where each DMA starts and is waited."""
+    assert kernel.stream_chunk(2 * CHUNKED["inter"]) > 0
+    assert CHUNKED["hidden"] // kernel.stream_chunk(CHUNKED["hidden"]) == 2
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        46,
+        hidden=CHUNKED["hidden"],
+        inter=CHUNKED["inter"],
+        e_total=CHUNKED["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        47,
+        tokens=CHUNKED["tokens"],
+        hidden=CHUNKED["hidden"],
+        e_total=CHUNKED["e_total"],
+    )
+    common = dict(
+        topk=CHUNKED["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+        sharded_plan=True,
+    )
+    outs = {}
+    for depth in (2, 0):
+        at_prefetch_depth(depth)
+        outs[depth] = np.asarray(
+            fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+        )
+    ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=CHUNKED["topk"])
+    assert _relative_l2(outs[0], ref) < FP8_RELATIVE_BOUND
+    np.testing.assert_array_equal(outs[0], outs[2])
+
+
+# The chunk-streamed path is chosen on the EXPECTED rows per expert, so one
+# skewed expert can still run several tiles on it. Two chunks per slab on
+# both matmuls, and MIXED_EXPERT_ROWS puts a two-tile expert between one-tile
+# ones on every shard. Hidden 3584 streams in 1792-column chunks, 4096 in
+# 2048-column ones.
+CHUNKED_MIXED = dict(inter=2048, e_total=32, topk=4)
+
+
+@pytest.mark.parametrize(
+    "width,chunk",
+    [
+        (6144, 2048),  # DeepSeek-V4 gate/up
+        (7168, 1792),  # DeepSeek-V4 down
+        (8192, 2048),  # Qwen3.8 down
+        (5120, 1280),
+        (1024, 1024),
+        (256 * 13, 0),  # no whole chunk from 1024 to 2048 columns
+        (768, 0),  # narrower than any chunk
+    ],
+)
+def test_stream_chunk_is_the_widest_dividing_width(width, chunk):
+    """The stream chunk is the widest whole number of the reader's output
+    chunk that divides the slab, within the chunk bounds, or 0 for none."""
+    assert kernel.stream_chunk(width) == chunk
+
+
+@pytest.mark.parametrize("hidden", [3584, 4096])
+@pytest.mark.parametrize("second_scale_slot", [True, False])
+def test_fp4_chunked_stream_holds_a_multi_tile_expert(
+    at_prefetch_depth, monkeypatch, second_scale_slot, hidden
+):
+    """A multi-tile expert on the chunk-streamed path reads its slab on every
+    tile: chunks are waited on its first tile and refilled after its last, so
+    the outputs match whole-slab prefetch bit for bit.
+
+    Without room for a second scale slot, the scales start after the tile
+    loop instead of at the visit's head; that schedule must match too.
+    """
+    assert (2 * CHUNKED_MIXED["inter"]) // kernel.stream_chunk(
+        2 * CHUNKED_MIXED["inter"]
+    ) == 2
+    assert hidden // kernel.stream_chunk(hidden) == 2
+    assert max(MIXED_EXPERT_ROWS) > CAPACITY
+    # Only the chunk-streamed build sizes a second scale slot, so a call for
+    # one shows the depth-zero build took that path rather than the old one.
+    scale_slots = []
+    real_estimate = host.vmem_estimate_bytes
+
+    def estimate(*args, **kwargs):
+        scale_slots.append(kwargs.get("scale_slots"))
+        if kwargs.get("scale_slots") == 2 and not second_scale_slot:
+            # Over any budget, so the build keeps a single scale slot. Only
+            # production shapes run out of room; this small one always fits.
+            return float("inf")
+        return real_estimate(*args, **kwargs)
+
+    monkeypatch.setattr(host, "vmem_estimate_bytes", estimate)
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        49,
+        hidden=hidden,
+        inter=CHUNKED_MIXED["inter"],
+        e_total=CHUNKED_MIXED["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        50,
+        tokens=MIXED_TOKENS,
+        hidden=hidden,
+        e_total=CHUNKED_MIXED["e_total"],
+    )
+    hash_ids = _make_ids_with_expert_rows(
+        mesh,
+        51,
+        rows_per_local=MIXED_EXPERT_ROWS,
+        tokens=MIXED_TOKENS,
+        topk=CHUNKED_MIXED["topk"],
+        e_total=CHUNKED_MIXED["e_total"],
+    )
+    common = dict(
+        hash_topk_ids=hash_ids,
+        topk=CHUNKED_MIXED["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+        sharded_plan=True,
+    )
+    outs = {}
+    for depth in (2, 0):
+        at_prefetch_depth(depth)
+        scale_slots.clear()
+        outs[depth] = np.asarray(
+            fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+        )
+        assert (2 in scale_slots) == (depth == 0), (depth, scale_slots)
+    ref = _dense_reference(
+        mesh,
+        x,
+        *decoded,
+        None,
+        None,
+        gating,
+        topk=CHUNKED_MIXED["topk"],
+        hash_ids=hash_ids,
+    )
+    assert _relative_l2(outs[0], ref) < FP8_RELATIVE_BOUND
+    np.testing.assert_array_equal(outs[0], outs[2])
+
+
 # --------------------------------------------------------------------------- #
 # The tile-height ladder.
 #
