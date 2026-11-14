@@ -91,6 +91,19 @@ BOUND_STAB_SHIFT = 60.0
 BOUND_STAB_GUARD = -55.0  # rerun when lse - stabilizer < this (log mass)
 
 
+def bound_stab_enabled(env_value: str, config_value) -> bool:
+    """VLLM_TPU_QSA_PREFILL_BOUND_STAB ("1" / "0") over the additional-config
+    key qwen4_exp.qsa_prefill_bound_stab; neither set: off."""
+    env_value = (env_value or "").strip()
+    if env_value:
+        if env_value not in ("0", "1"):
+            raise ValueError(
+                f"VLLM_TPU_QSA_PREFILL_BOUND_STAB must be 0 or 1, got {env_value!r}"
+            )
+        return env_value == "1"
+    return bool(config_value)
+
+
 def note_key_norm_bound(bound: float) -> None:
     """Raise the process-wide key norm bound to ``bound`` (max over layers)."""
     global _KEY_NORM_BOUND
@@ -1654,7 +1667,7 @@ def _block_sparse_gqa_prefill(
     if key_norm_bound is not None:
         logger.info_once(
             "QSA sparse DCP prefill bound stabilizer on: key norm bound %.4f, "
-            "margin %.2f, shift %.0f (additional-config qsa_prefill_bound_stab)",
+            "margin %.2f, shift %.0f (VLLM_TPU_QSA_PREFILL_BOUND_STAB / qsa_prefill_bound_stab)",
             key_norm_bound,
             BOUND_STAB_MARGIN,
             BOUND_STAB_SHIFT,
