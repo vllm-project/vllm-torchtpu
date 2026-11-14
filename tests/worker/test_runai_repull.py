@@ -176,3 +176,121 @@ def test_noop_for_mock_model_config():
     cfg = MagicMock()
     ensure_runai_aux_files(cfg)
     cfg.maybe_pull_model_tokenizer_for_runai.assert_not_called()
+
+
+def test_acquire_runai_lock_is_reentrant_within_thread():
+    from vllm_torchtpu.worker import runai_repull as rr
+
+    lock_calls = []
+
+    class DummyLock:
+        def __enter__(self):
+            if lock_calls:
+                raise RuntimeError("non-reentrant lock acquired twice!")
+            lock_calls.append("acquired")
+            return self
+
+        def __exit__(self, *exc):
+            lock_calls.pop()
+
+    with patch.object(rr, "get_lock", side_effect=lambda u: DummyLock()):
+        with rr.acquire_runai_lock(MODEL_URI):
+            assert lock_calls == ["acquired"]
+            # Nested acquisition on the same URI must not call get_lock again.
+            with rr.acquire_runai_lock(MODEL_URI):
+                assert lock_calls == ["acquired"]
+        assert lock_calls == []
+
+
+def test_patch_runai_pull_once_deduplicates_and_reenters_cleanly(
+    cache_root, monkeypatch
+):
+    import sys
+    from types import ModuleType
+
+    from vllm_torchtpu import runai_pull_patches as rpp
+    from vllm_torchtpu.worker import runai_repull as rr
+
+    downloads = []
+
+    class FakeObjectStorageModel:
+        def __init__(self, url: str):
+            self.dir = os.path.join(str(cache_root), url.rsplit("/", 1)[1])
+            os.makedirs(self.dir, exist_ok=True)
+
+        def pull_files(self, model_path="", allow_pattern=None, ignore_pattern=None):
+            downloads.append((model_path, allow_pattern, ignore_pattern))
+            with open(os.path.join(self.dir, "config.json"), "w") as f:
+                f.write("{}")
+
+    class FakeVllmModelConfig:
+        def __init__(self, model, tokenizer=None):
+            self.model = model
+            self.tokenizer = tokenizer or model
+            self.model_weights = None
+
+        def maybe_pull_model_tokenizer_for_runai(self, model, tokenizer):
+            if self.model_weights:
+                return
+            osm = FakeObjectStorageModel(model)
+            osm.pull_files(model, allow_pattern=["*.json"])
+            if model == tokenizer:
+                osm.pull_files(model, ignore_pattern=["*.safetensors"])
+            self.model_weights = model
+            self.model = osm.dir
+            self.tokenizer = osm.dir
+
+    fake_runai_utils = ModuleType("vllm.transformers_utils.runai_utils")
+    fake_runai_utils.ObjectStorageModel = FakeObjectStorageModel
+    fake_runai_utils.is_runai_obj_uri = lambda s: s.startswith("gs://")
+
+    fake_trans_utils = ModuleType("vllm.transformers_utils.utils")
+    fake_trans_utils.maybe_model_redirect = lambda m: m
+
+    fake_model_mod = ModuleType("vllm.config.model")
+    fake_model_mod.ModelConfig = FakeVllmModelConfig
+    fake_model_mod.maybe_model_redirect = fake_trans_utils.maybe_model_redirect
+
+    monkeypatch.setitem(
+        sys.modules, "vllm.transformers_utils.runai_utils", fake_runai_utils
+    )
+    monkeypatch.setitem(sys.modules, "vllm.transformers_utils.utils", fake_trans_utils)
+    monkeypatch.setitem(sys.modules, "vllm.config.model", fake_model_mod)
+
+    lock_acquires = 0
+
+    class StrictLock:
+        def __enter__(self):
+            nonlocal lock_acquires
+            if lock_acquires > 0:
+                raise RuntimeError("Deadlock: lock acquired twice in process!")
+            lock_acquires += 1
+            return self
+
+        def __exit__(self, *exc):
+            nonlocal lock_acquires
+            lock_acquires -= 1
+
+    monkeypatch.setattr(rr, "get_lock", lambda u: StrictLock())
+
+    rpp.patch_runai_pull_once()
+
+    # First API server process pulls both rounds and writes COMPLETE_SENTINEL.
+    cfg1 = FakeVllmModelConfig(MODEL_URI)
+    cfg1.maybe_pull_model_tokenizer_for_runai(MODEL_URI, MODEL_URI)
+    assert len(downloads) == 2
+    assert os.path.exists(os.path.join(cfg1.model, COMPLETE_SENTINEL))
+
+    # Second API server sees sentinel and skips both network downloads.
+    cfg2 = FakeVllmModelConfig(MODEL_URI)
+    cfg2.maybe_pull_model_tokenizer_for_runai(MODEL_URI, MODEL_URI)
+    assert len(downloads) == 2
+    assert cfg2.model == cfg1.model
+
+    # Worker rank calling ensure_runai_aux_files on unpopulated dir re-enters
+    # patched maybe_pull_model_tokenizer_for_runai without deadlocking.
+    new_uri = "gs://bucket/models/kimi/k3_worker"
+    worker_cfg = FakeVllmModelConfig(new_uri)
+    ensure_runai_aux_files(worker_cfg)
+    assert len(downloads) == 4
+    assert os.path.exists(os.path.join(worker_cfg.model, COMPLETE_SENTINEL))
