@@ -10,6 +10,7 @@ from collections.abc import Callable, Sequence
 
 import jax
 import torch
+from jax import core as jax_core
 from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
@@ -39,10 +40,10 @@ PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS = (
 
 
 def _torch_placeholder_with_sharding(
-        aval: jax.core.ShapedArray | None,
+        aval: jax_core.ShapedArray | None,
         sharding: jax.sharding.NamedSharding | None,
         mesh: jax.sharding.Mesh | None) -> torch.Tensor | None:
-    if not isinstance(aval, jax.core.ShapedArray):
+    if not isinstance(aval, jax_core.ShapedArray):
         return aval
     torch_dtype = pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype)
     if torch_dtype is None:

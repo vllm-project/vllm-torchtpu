@@ -7178,12 +7178,22 @@ class TPUModelRunner(GPUModelRunner):
             return torch.argmax(logits, dim=-1, keepdim=True)
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
-        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
-        u_clamped = torch.clamp(u,
-                                min=torch.finfo(u.dtype).tiny,
-                                max=1.0 - torch.finfo(u.dtype).eps)
+        # Every row whose sample is used (temperature > SAMPLING_EPS > 0) has
+        # scaled_logits = monotonic(logits), so the top-k order statistic is
+        # searched on the raw logits: no per-pass temperature division.
+        masked_logits = apply_top_k_top_p(scaled_logits,
+                                          top_k,
+                                          top_p,
+                                          unscaled_logits=logits)
+        # Clamp and compute Gumbel noise in float32 using the uniform sample's
+        # dtype bounds so log(-log(u)) stays finite without intermediate bf16
+        # casts.
+        u_finfo = torch.finfo(u.dtype)
+        u_clamped = torch.clamp(u.to(torch.float32),
+                                min=u_finfo.tiny,
+                                max=1.0 - u_finfo.eps)
         gumbel_noise = -torch.log(-torch.log(u_clamped))
-        noisy_logits = masked_logits + gumbel_noise
+        noisy_logits = masked_logits + gumbel_noise.to(logits.dtype)
         final_logits = torch.where(is_greedy, logits, noisy_logits)
         return torch.argmax(final_logits, dim=-1, keepdim=True)
 

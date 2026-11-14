@@ -134,6 +134,15 @@ def _fetch_tpu_type_from_metadata() -> str | None:
     return None
 
 
+def _detect_tpu_type() -> str | None:
+    tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
+    if not tpu_type:
+        tpu_type = _fetch_tpu_type_from_metadata()
+    if not tpu_type:
+        return None
+    return tpu_type.strip().lower()
+
+
 def _resolve_sc_offload_threshold_bytes() -> tuple[int | None, str | None]:
     # Returns (threshold bytes, chip family). The family is given only when
     # the threshold was looked up from it ("auto").
@@ -159,30 +168,56 @@ def _resolve_sc_offload_threshold_bytes() -> tuple[int | None, str | None]:
             return None, None
         return (value if value > 0 else None), None
 
-    tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
-    if not tpu_type:
-        tpu_type = _fetch_tpu_type_from_metadata()
+    tpu_type = _detect_tpu_type()
     if not tpu_type:
         return None, None
-    tpu_type = tpu_type.strip().lower()
     for prefix, size in _TPU_VMEM_BYTES_PER_TENSOR_CORE.items():
         if tpu_type.startswith(prefix):
             return size, prefix
     return None, None
 
 
+_detected_tpu = _detect_tpu_type()
+_is_tpu7x = bool(
+    _detected_tpu
+    and _detected_tpu.startswith(_SC_ALL_REDUCE_OFFLOAD_OFF_FAMILIES))
+_qwen35_35b_tuned_defaults = (_is_tpu7x and os.environ.get(
+    "VLLM_TPU_QWEN35_35B_TUNED_DEFAULTS", "0") == "1")
+if _qwen35_35b_tuned_defaults:
+    # Opt-in high-throughput serving defaults tuned for Qwen3.5-35B on TPU v7x
+    # (matching scripts/vllm/benchmark/inferencex/qwen3.5/server.sh, with
+    # TPU_SP_FP8_GATHER=0 for unquantized SP gather):
+    os.environ.setdefault("TPU_SP_MIN_ROWS", "257")
+    os.environ.setdefault("TPU_SP_FP8_GATHER", "0")
+    os.environ.setdefault("USE_MOE_FUSED_EP_KERNEL", "1")
+    os.environ.setdefault("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "33")
+    os.environ.setdefault("TPU_MOE_LOWTOK_MAX_TOKENS", "256")
+    os.environ.setdefault("TPU_MOE_LOWTOK_FROM_SCORES", "1")
+    os.environ.setdefault("TPU_MOE_LOWTOK_SCORES_STRICT", "1")
+    os.environ.setdefault("TPU_GDN_FUSED_NORM_QUANT", "1")
+    os.environ.setdefault("TPU_FUSED_QK_NORM_ROPE", "1")
+    os.environ.setdefault("USE_MOE_COUNTING_SORT", "1")
+    os.environ.setdefault("TPU_NORM_WEIGHT_HOIST", "1")
+    os.environ.setdefault("TPU_GREEDY_TOP_TOKENS", "1")
+    os.environ.setdefault("TPU_GDN_TABLES_IN_KERNEL", "1")
+    os.environ.setdefault("TPU_GATED_NORM_TILE", "256")
+    os.environ.setdefault("TPU_TOKEN_BUCKET_STEP", "512")
+    os.environ.setdefault("TPU_SMALL_ALL_REDUCE_MAX_ROWS", "64")
+    os.environ.setdefault("USE_MOE_SPARSE_CORE", "1")
+    os.environ.setdefault("RAGGED_GATHER_REDUCE_VERSION", "v3")
+
 _existing_libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
+_libtpu_extra_args: list[str] = []
 
 
 def _user_has_flag(flag_name: str) -> bool:
-    # Tokenized startswith("<flag>=") check so a hypothetical longer flag
-    # that embeds ours as a prefix doesn't false-positive.
+    # Tokenized startswith("<flag>=") check across both the user's original
+    # LIBTPU_INIT_ARGS and flags already staged in _libtpu_extra_args so a
+    # longer flag prefix doesn't false-positive and no flag is appended twice.
     return any(
         token.startswith(flag_name + "=") or token == flag_name
-        for token in _existing_libtpu_args.split())
+        for token in (*_existing_libtpu_args.split(), *_libtpu_extra_args))
 
-
-_libtpu_extra_args: list[str] = []
 
 # --xla_tpu_use_dynamic_smem_negotiation: let libtpu size SMEM to fit the
 # batched RPA attention kernel's scheduling metadata (default budget is too
@@ -193,16 +228,11 @@ if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
 # --xla_tpu_sparse_core_{all_reduce,all_gather}_offload_min_size_in_bytes:
 # raise the SC-offload threshold to the per-tensor-core VMEM capacity so
 # typical per-layer AR/AG collectives run on TensorCore instead of being
-# offloaded to SparseCore. The chip family is detected from
-# TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above;
-# each flag is added only if the user hasn't supplied it explicitly.
-#
-# On TPU7x with that auto threshold, also disable SparseCore all-reduce
-# offload via --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false
-# so XLA's AsyncCollectiveCreator keeps its 4 KiB async threshold for
-# TensorCore all-reduce instead of inheriting the 64 MiB SC threshold. An
-# explicit SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES (a threshold for the SC
-# offload to use) leaves the offload on, as does any other chip family.
+# offloaded to SparseCore. Also disable SparseCore all-reduce offload via
+# --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false on TPU7x
+# with the auto threshold so XLA's AsyncCollectiveCreator keeps its 4 KiB
+# async threshold for TensorCore all-reduce instead of inheriting the 64 MiB
+# SC threshold.
 _sc_offload_bytes, _sc_offload_family = _resolve_sc_offload_threshold_bytes()
 if _sc_offload_bytes is not None:
     if (_sc_offload_family in _SC_ALL_REDUCE_OFFLOAD_OFF_FAMILIES
@@ -210,12 +240,32 @@ if _sc_offload_bytes is not None:
                 "--xla_tpu_enable_sparse_core_collective_offload_all_reduce")):
         _libtpu_extra_args.append(
             "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false")
-    for _flag_name in (
-            "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
-            "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+    _ag_min_bytes = (262144 if
+                     (_qwen35_35b_tuned_defaults and _sc_offload_family
+                      in _SC_ALL_REDUCE_OFFLOAD_OFF_FAMILIES) else
+                     _sc_offload_bytes)
+    for _flag_name, _flag_bytes in (
+        ("--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
+         _sc_offload_bytes),
+        ("--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+         _ag_min_bytes),
     ):
         if not _user_has_flag(_flag_name):
-            _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
+            _libtpu_extra_args.append(f"{_flag_name}={_flag_bytes}")
+
+if _qwen35_35b_tuned_defaults:
+    for _flag_name, _flag_val in (
+        ("--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter",
+         "true"),
+        ("--xla_enable_async_all_gather", "true"),
+        ("--xla_tpu_enable_sparse_core_collective_offload_all_gather", "true"),
+        ("--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+         "262144"),
+        ("--xla_tpu_enable_sparse_core_collective_offload_all_reduce",
+         "false"),
+    ):
+        if not _user_has_flag(_flag_name):
+            _libtpu_extra_args.append(f"{_flag_name}={_flag_val}")
 
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)
