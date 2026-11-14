@@ -243,6 +243,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
+    TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
 
 
 def env_with_choices(
@@ -1518,6 +1519,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keeps one configuration.
     "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE", ""
+    ),
+    # MiniMax M3 head-parallel DCP prefill attention (`msa_dcp_heads`, steps of
+    # at least 2,048 tokens at DCP 8) kernel config, "<block_q>:<pages per
+    # step>:<step widths, '/'-separated>:<page cache slots>", e.g.
+    # "16:16:2/4/6/8/12:512". Empty keeps msa_dcp_heads' defaults (block_q
+    # 8, 64 pages per step, the kernel's widths, no page cache); the
+    # TPU_MINIMAX_M3_MSA_PREFILL_* flags apply only to `msa_attend_dcp`.
+    "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG": env_str(
+        "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG", ""
     ),
 }
 
