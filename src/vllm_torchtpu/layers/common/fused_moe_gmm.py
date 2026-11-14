@@ -253,12 +253,12 @@ def prepare_routed_gmm_inputs(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
-    For non-EP runs `topk_indices_local` is always non-negative, so the
-    valid-mask path computed below is a no-op (jnp.where on an all-True
-    mask). For EP, the caller applies the expert-map remap upstream
-    (inside this JIT) and marks non-local entries with a negative id which
-    the mask filters out. Always running the masked branch keeps a single
-    code path.
+    For non-EP runs `topk_indices_local` is always non-negative, so without
+    skip_padded_tokens every route is valid: the mask is all True and the
+    expert ids are sorted as they are, with no bucket for invalid routes.
+    For EP, the caller applies the expert-map remap upstream (inside this
+    JIT) and marks non-local entries with a negative id which the mask
+    filters out.
     """
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
