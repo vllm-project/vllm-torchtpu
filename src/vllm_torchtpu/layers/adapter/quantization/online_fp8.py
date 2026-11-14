@@ -11,7 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Load-time configurable FP8 for selected unquantized TPU Linear layers."""
+"""Load-time configurable FP8 for selected unquantized TPU Linear and MoE layers.
+
+Configured via ``additional_config["tpu_online_fp8"]`` on ``fp8`` and
+``modelopt_fp4`` checkpoints only (``attach_online_fp8`` rejects other
+quantization configs such as ``compressed-tensors`` and ``deepseek_v4_fp8``).
+``targets`` may name unquantized ``LinearBase`` layers (``per_channel``,
+``per_tensor``, or ``per_block``) and checkpoint-excluded ``RoutedExperts``
+MoE modules (``per_channel`` only, e.g.
+``"targets": ["model.layers.78.mlp.experts"]`` for an MTP drafter layer).
+"""
 
 from __future__ import annotations
 
@@ -22,6 +31,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.config import VllmConfig
+from vllm.lora.layers import BaseLayerWithLoRA
+from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
@@ -32,7 +44,10 @@ from vllm_torchtpu.logger import init_logger
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
-    from vllm_torchtpu.layers.adapter.quantization.configs import TpuLinear
+    from vllm_torchtpu.layers.adapter.quantization.configs import (
+        TpuLinear,
+        TpuRoutedExperts,
+    )
 
 
 logger = init_logger(__name__)
@@ -138,7 +153,12 @@ class OnlineFp8Policy:
 def attach_online_fp8[QuantConfigT: QuantizationConfig | None](
     config: QuantConfigT, vllm_config: VllmConfig
 ) -> QuantConfigT:
-    """Keep the checkpoint config intact; attach independent per-model state."""
+    """Keep the checkpoint config intact; attach independent per-model state.
+
+    Only ``fp8`` and ``modelopt_fp4`` configs accept ``tpu_online_fp8``; other
+    configs (such as ``compressed-tensors`` and ``deepseek_v4_fp8``) raise
+    ``ValueError``.
+    """
     policy = OnlineFp8Policy.from_dict(
         cast("dict[str, Any]", vllm_config.additional_config).get("tpu_online_fp8")
     )
@@ -162,7 +182,9 @@ def map_online_fp8(config: VllmQuantConfig, mapper: WeightsMapper) -> None:
 
 
 def validate_online_fp8(
-    model: torch.nn.Module, config: QuantizationConfig | None
+    model: torch.nn.Module,
+    config: QuantizationConfig | None,
+    draft_model: torch.nn.Module | None = None,
 ) -> None:
     """Audit once after loading, before compilation or accepting requests."""
     if not isinstance(config, VllmQuantConfig):
@@ -170,62 +192,117 @@ def validate_online_fp8(
     policy = config.online_fp8_policy
     if policy is None:
         return
-    validated = set()
-    for name, layer in model.named_modules():
-        prefix = getattr(layer, "prefix", name)
-        selected, aliases = policy.select(prefix, config.packed_modules_mapping)
-        if not selected:
-            continue
-        method = getattr(layer, "quant_method", None)
-        if not getattr(method, "online_fp8", False):
-            raise ValueError(
-                f"Online FP8 target {prefix} bypassed quantization "
-                "dispatch or is an unsupported module"
+    validated: set[str] = set()
+    linear_count = 0
+    moe_count = 0
+    seen_ids: set[int] = set()
+    roots = (model,) if draft_model is None else (model, draft_model)
+    for root in roots:
+        for name, layer in root.named_modules():
+            layer_id = id(layer)
+            if layer_id in seen_ids:
+                continue
+            seen_ids.add(layer_id)
+            if isinstance(layer, (MoERunner, BaseLayerWithLoRA)):
+                continue
+            if isinstance(layer, RoutedExperts):
+                prefix = layer.layer_name
+            else:
+                prefix = getattr(layer, "prefix", name)
+            selected, aliases = policy.select(prefix, config.packed_modules_mapping)
+            if not selected:
+                continue
+            method = getattr(layer, "quant_method", None)
+            if not getattr(method, "online_fp8", False):
+                raise ValueError(
+                    f"Online FP8 target {prefix} bypassed quantization "
+                    "dispatch or is an unsupported module"
+                )
+            if not getattr(layer, "_tpu_online_fp8_processed", False):
+                raise ValueError(f"Online FP8 target {prefix} was not processed")
+            if isinstance(layer, RoutedExperts):
+                moe_layer = cast("TpuRoutedExperts", layer)
+                w13 = moe_layer.w13_weight
+                w2 = moe_layer.w2_weight
+                s13 = getattr(moe_layer, "w13_weight_scale_inv", None)
+                s2 = getattr(moe_layer, "w2_weight_scale_inv", None)
+                if (
+                    policy.weight_scheme != "per_channel"
+                    or w13.ndim != 3
+                    or w2.ndim != 3
+                    or w13.dtype != torch.float8_e4m3fn
+                    or w2.dtype != torch.float8_e4m3fn
+                    or s13 is None
+                    or s2 is None
+                    or s13.dtype != torch.float32
+                    or s2.dtype != torch.float32
+                    or s13.shape != (w13.shape[0], 1, 1, w13.shape[2])
+                    or s2.shape != (w2.shape[0], 1, 1, w2.shape[2])
+                ):
+                    raise ValueError(f"Invalid online FP8 runtime format for {prefix}")
+                validated.add(prefix)
+                moe_count += 1
+                logger.info(
+                    "TPU online FP8: %s",
+                    json.dumps(
+                        {
+                            "module": prefix,
+                            "checkpoint_aliases": aliases,
+                            "checkpoint_dtype": "bfloat16",
+                            "runtime_dtype": "float8_e4m3fn",
+                            "w13_weight_shape": list(w13.shape),
+                            "w2_weight_shape": list(w2.shape),
+                            "w13_scale_shape": list(s13.shape),
+                            "w2_scale_shape": list(s2.shape),
+                            "weight_scheme": policy.weight_scheme,
+                            "converted": True,
+                        }
+                    ),
+                )
+                continue
+            lin_layer = cast("TpuLinear", layer)
+            weight, scale = lin_layer.weight, lin_layer.weight_scale
+            keep_layout = getattr(lin_layer, KEEP_VLLM_LAYOUT_ATTR, False)
+            n_out = weight.shape[0] if keep_layout else weight.shape[1]
+            k_in = weight.shape[1] if keep_layout else weight.shape[0]
+            if policy.weight_scheme == "per_tensor":
+                expected_shape = (1,)
+                expected_block = (n_out, k_in)
+            elif policy.weight_scheme == "per_block":
+                assert policy.weight_block_size is not None
+                block_n, block_k = policy.weight_block_size
+                if n_out % block_n or k_in % block_k:
+                    raise ValueError(f"Invalid online FP8 block size for {prefix}")
+                expected_shape = (1, k_in // block_k, 1, n_out)
+                expected_block = (block_n, block_k)
+            else:
+                expected_shape = (n_out,)
+                expected_block = (1, k_in)
+            if (
+                weight.dtype != torch.float8_e4m3fn
+                or scale.dtype != torch.float32
+                or scale.shape != expected_shape
+                or lin_layer.weight_block_size != expected_block
+            ):
+                raise ValueError(f"Invalid online FP8 runtime format for {prefix}")
+            validated.add(prefix)
+            linear_count += 1
+            logger.info(
+                "TPU online FP8: %s",
+                json.dumps(
+                    {
+                        "module": prefix,
+                        "checkpoint_aliases": aliases,
+                        "checkpoint_dtype": "bfloat16",
+                        "runtime_dtype": "float8_e4m3fn",
+                        "weight_shape": list(weight.shape),
+                        "scale_shape": list(scale.shape),
+                        "weight_scheme": policy.weight_scheme,
+                        "weight_block_size": list(expected_block),
+                        "converted": True,
+                    }
+                ),
             )
-        if not getattr(layer, "_tpu_online_fp8_processed", False):
-            raise ValueError(f"Online FP8 target {prefix} was not processed")
-        layer = cast("TpuLinear", layer)
-        weight, scale = layer.weight, layer.weight_scale
-        keep_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
-        n_out = weight.shape[0] if keep_layout else weight.shape[1]
-        k_in = weight.shape[1] if keep_layout else weight.shape[0]
-        if policy.weight_scheme == "per_tensor":
-            expected_shape = (1,)
-            expected_block = (n_out, k_in)
-        elif policy.weight_scheme == "per_block":
-            assert policy.weight_block_size is not None
-            block_n, block_k = policy.weight_block_size
-            if n_out % block_n or k_in % block_k:
-                raise ValueError(f"Invalid online FP8 block size for {prefix}")
-            expected_shape = (1, k_in // block_k, 1, n_out)
-            expected_block = (block_n, block_k)
-        else:
-            expected_shape = (n_out,)
-            expected_block = (1, k_in)
-        if (
-            weight.dtype != torch.float8_e4m3fn
-            or scale.dtype != torch.float32
-            or scale.shape != expected_shape
-            or layer.weight_block_size != expected_block
-        ):
-            raise ValueError(f"Invalid online FP8 runtime format for {prefix}")
-        validated.add(prefix)
-        logger.info(
-            "TPU online FP8: %s",
-            json.dumps(
-                {
-                    "module": prefix,
-                    "checkpoint_aliases": aliases,
-                    "checkpoint_dtype": "bfloat16",
-                    "runtime_dtype": "float8_e4m3fn",
-                    "weight_shape": list(weight.shape),
-                    "scale_shape": list(scale.shape),
-                    "weight_scheme": policy.weight_scheme,
-                    "weight_block_size": list(expected_block),
-                    "converted": True,
-                }
-            ),
-        )
     unmatched = set(policy.targets) - policy.matched
     missing = set(policy.selected) - validated
     if unmatched or missing or not validated:
@@ -235,7 +312,12 @@ def validate_online_fp8(
             f"unprocessed modules={sorted(missing)}, "
             f"converted={len(validated)}"
         )
-    logger.info("TPU online FP8 validated %d runtime Linear layers", len(validated))
+    logger.info(
+        "TPU online FP8 validated %d runtime layers (%d Linear, %d MoE)",
+        len(validated),
+        linear_count,
+        moe_count,
+    )
 
 
 def quantize_online_fp8(
