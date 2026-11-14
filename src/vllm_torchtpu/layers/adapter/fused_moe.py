@@ -22,6 +22,7 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.megablox.gmm_v2 import clamped_silu_activation
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
@@ -46,6 +47,15 @@ def _resolve_activation_name(activation: Any) -> str:
 def get_fused_moe_activation(activation, moe_config) -> str:
     """Encode vLLM's activation config for the Pallas GMM kernel."""
     activation = _resolve_activation_name(activation)
+    if activation == "silu":
+        # vLLM clamps gate (above) and up (both ways) to swiglu_limit before
+        # the SiLU-and-mul; "silu" alone would drop it. A limit of 0 means no
+        # clamp here: the models normalise 0 to None, and vLLM's torch and
+        # pad-aware Triton paths skip the clamp for it.
+        limit = moe_config.swiglu_limit
+        if limit is not None and limit > 0:
+            return clamped_silu_activation(limit)
+        return activation
     if activation != "situ":
         return activation
 

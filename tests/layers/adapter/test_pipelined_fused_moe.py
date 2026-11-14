@@ -47,6 +47,7 @@ def _make_mock_moe_config():
         experts_per_token=8,
         moe_parallel_config=SimpleNamespace(use_ep=False),
         group_size=32,
+        swiglu_limit=None,
     )
 
 
