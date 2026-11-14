@@ -173,6 +173,43 @@ def _fp4_scales(scale_ref, k_row, v_row):
     return jnp.where(jnp.isfinite(sk), sk, 0.0), jnp.where(jnp.isfinite(sv), sv, 0.0)
 
 
+def _page_cache_scatter(
+    pages: jax.Array, num_tiles: int, cache_size: int, num_keys: int
+) -> jax.Array:
+    """`_page_cache` from a presence table over the `num_keys` page keys
+    (every key is a `page_table` index): a key's slot is the number of
+    present keys below it, so the slots and the ascending distinct keys are
+    the sorted version's, with one scatter, a cumsum and a gather in place of
+    three sorts of the call's union entries."""
+    rows = pages.reshape(num_tiles, -1)
+    width = min(PAGE_CACHE_TILE_PAGES, rows.shape[1])
+    head = rows[:, :width].reshape(-1)
+    valid = head >= 0
+    present = (
+        jnp.zeros((num_keys + 1,), jnp.int32)
+        .at[jnp.where(valid, head, num_keys)]
+        .set(1, mode="drop")[:num_keys]
+    )
+    rank = jnp.cumsum(present, dtype=jnp.int32)
+    num_distinct = rank[-1]
+    slot = jnp.where(valid, rank[jnp.maximum(head, 0)] - 1, -1)
+    (distinct,) = jnp.nonzero(present, size=cache_size, fill_value=0)
+    slot = jnp.pad(
+        slot.reshape(num_tiles, width),
+        ((0, 0), (0, rows.shape[1] - width)),
+        constant_values=-1,
+    )
+    fits = (num_distinct <= cache_size) & jnp.all(rows[:, width:] < 0)
+    return jnp.concatenate(
+        [
+            jnp.where(fits, slot.reshape(-1), pages),
+            distinct.astype(jnp.int32),
+            jnp.minimum(num_distinct, cache_size)[None],
+            fits.astype(jnp.int32)[None],
+        ]
+    ).astype(jnp.int32)
+
+
 def _page_cache(pages: jax.Array, num_tiles: int, cache_size: int) -> jax.Array:
     """A call's unions (`msa_attention._work_list`: `num_tiles` rows, ``-1``
     padded) -> ``[unions' cache slots | distinct keys (cache_size) | count |
@@ -240,6 +277,7 @@ def _kernel(
     bf16_cache: bool = False,
     row_split: int = 1,
     tiles_per_head: int = 0,
+    mask_bcast: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -606,7 +644,8 @@ def _kernel(
             for part in range(row_split):
                 heads = slice(part * part_heads, (part + 1) * part_heads)
                 rows_at = pl.ds(part * part_rows, part_rows)
-                mask = jnp.concatenate([token_mask] * part_heads, axis=0)
+                if not mask_bcast:
+                    mask = jnp.concatenate([token_mask] * part_heads, axis=0)
                 q = q_ref[heads].reshape(part_rows, head_dim)
                 if not fp4:
                     q = (q.astype(jnp.float32) * scale).astype(q.dtype)
@@ -615,7 +654,12 @@ def _kernel(
                 )
                 if fp4:  # x = int4 * scale: K scales the score columns, V scales p
                     s = s * k_scale
-                s = jnp.where(mask, s, -jnp.inf)
+                if mask_bcast:
+                    s = jnp.where(
+                        token_mask[None], s.reshape(part_heads, block_q, -1), -jnp.inf
+                    ).reshape(part_rows, -1)
+                else:
+                    s = jnp.where(mask, s, -jnp.inf)
 
                 # The running max starts at a finite floor (`_MASK_VALUE`), so a
                 # row with no visible slot gets p = exp2(-inf) = 0, not exp2(nan).
@@ -743,6 +787,14 @@ def _attention_call(
     num_q_heads, num_tokens, head_dim = q.shape
     num_heads = q_per_head
     _, rows_per_page, packing, _ = kv_cache.shape
+    from vllm_torchtpu import envs
+
+    # Bq a sublane-tile multiple keeps the [Hg, Bq, keys] view free.
+    mask_bcast = bool(
+        envs.TPU_MINIMAX_M3_MSA_MASK_BCAST and scale_rows is not None and block_q % 8 == 0
+    )
+    if mask_bcast:
+        _proof("TPU_MINIMAX_M3_MSA_MASK_BCAST", "MSA 4-bit scores masked per token, broadcast over heads")
     # One KV head's [K | V] slice of each row.
     row_width = 2 * head_dim
     topk = selected.shape[2]
@@ -876,6 +928,7 @@ def _attention_call(
             bf16_cache=bf16_cache,
             row_split=row_split,
             tiles_per_head=tiles_per_head,
+            mask_bcast=mask_bcast,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -1281,11 +1334,24 @@ def _chunked_call(
         union_len = (step // block_q) * msa_attention._groups_per_tile(
             block_q, selected.shape[2], pages_per_step
         ) * pages_per_step
-        table = jax.vmap(
-            functools.partial(
+        from vllm_torchtpu import envs
+
+        if envs.TPU_MINIMAX_M3_MSA_PAGE_CACHE_SCATTER:
+            _proof(
+                "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SCATTER",
+                "MSA prefill page cache keys by a presence table, no sorts",
+            )
+            build = functools.partial(
+                _page_cache_scatter,
+                num_tiles=step // block_q,
+                cache_size=cache_size,
+                num_keys=page_table.shape[0],
+            )
+        else:
+            build = functools.partial(
                 _page_cache, num_tiles=step // block_q, cache_size=cache_size
             )
-        )(packed[:, :union_len])
+        table = jax.vmap(build)(packed[:, :union_len])
         packed = jnp.concatenate(
             [table[:, :union_len], packed[:, union_len:], table[:, union_len:]], axis=1
         )
