@@ -71,6 +71,25 @@ _MIN_CANDIDATE_TOKENS = 1024
 # 108.4 -> 116.7 ms per step, c64 DCP8 b57 147.8 -> 191.1 ms; j-82660a13 vs
 # j-8a29ceb0, j-c0fd0e40 vs j-11d1908c).
 DCP_SMALL_BATCH_TOKENS = 128
+# Batches of more than `msa_attention.SMALL_BATCH_TOKENS` tokens (prefill
+# chunks; also a decode batch that large, whose tiles span requests and gain
+# little) use 32-token tiles. A call costs a fixed amount per tile plus an
+# amount per page of its union, and a prefill chunk's neighbouring tokens
+# select mostly the same pages, so a 32-token tile halves the tile count for a
+# union little larger than a 16-token tile's. Kernel device time of an
+# 8,192-token chunk, one rank's share at DCP 2 (bench xprof j-c23f7a66):
+# 775 -> 534 us at 16-token unions of ~9 pages, 1249 -> 1295 us at ~17; twin
+# mixed-c8k step 95.9 -> 87.7 ms of this kernel (j-ac0e37b6 vs j-97301bc2).
+DCP_PREFILL_BLOCK_Q = 32
+
+
+def _attention_block_q(num_tokens: int) -> int:
+    """Query tile of `msa_attend_dcp` for a batch of `num_tokens`."""
+    if num_tokens <= DCP_SMALL_BATCH_TOKENS:
+        return msa_attention.SMALL_BATCH_BLOCK_Q
+    if num_tokens <= msa_attention.SMALL_BATCH_TOKENS:
+        return msa_attention.DEFAULT_BLOCK_Q
+    return DCP_PREFILL_BLOCK_Q
 
 
 def rank_array(rank: int | jax.Array) -> jax.Array:
@@ -845,11 +864,7 @@ def msa_attend_dcp(
     keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
     common = dict(
         sm_scale=sm_scale,
-        block_q=(
-            msa_attention.SMALL_BATCH_BLOCK_Q
-            if num_tokens <= DCP_SMALL_BATCH_TOKENS
-            else msa_attention.DEFAULT_BLOCK_Q
-        ),
+        block_q=_attention_block_q(num_tokens),
         pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
         interpret=interpret,
     )

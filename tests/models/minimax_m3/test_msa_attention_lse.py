@@ -95,6 +95,7 @@ def _check(got, want):
         (150, 140, 16, 64, False, 16),  # several kernel calls (the chunk loop)
         (150, 140, 16, 64, True, 16),  # the prefill (sorted) work list
         (150, 140, 16, 64, True, 5),  # groups per tile padded to a power of two
+        (150, 140, 32, 64, True, 16),  # 32-token (prefill) tiles
     ],
 )
 def test_lse_matches_dense_reference(
@@ -149,7 +150,8 @@ def _head_major_call(fn, q, *args, head_major, **kwargs):
 
 @pytest.mark.parametrize("head_major", [False, True])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
-def test_lse_heads_matches_dense_reference(dtype, head_major, monkeypatch):
+@pytest.mark.parametrize("block_q", [16, 32])
+def test_lse_heads_matches_dense_reference(dtype, head_major, block_q, monkeypatch):
     """Every KV head of multi-head cache rows, over several kernel calls."""
     monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", 32)
     num_kv_heads, num_tokens = 2, 70
@@ -166,6 +168,7 @@ def test_lse_heads_matches_dense_reference(dtype, head_major, monkeypatch):
         jnp.asarray(local_limit),
         jnp.asarray(table),
         sm_scale=SCALE,
+        block_q=block_q,
         interpret=True,
         head_major=head_major,
     )
@@ -260,7 +263,10 @@ def _fp4_cache(rng, num_kv_heads):
 
 @pytest.mark.parametrize("head_major", [False, True])
 @pytest.mark.parametrize("num_kv_heads", [1, 2])
-def test_fp4_lse_matches_dense_reference(num_kv_heads, head_major, monkeypatch):
+@pytest.mark.parametrize("block_q", [16, 32])
+def test_fp4_lse_matches_dense_reference(
+    num_kv_heads, head_major, block_q, monkeypatch
+):
     """4-bit pages and their scale pages, copied by the kernel beside each
     page: single-head calls (static scale rows) and every head at once
     (rows of the cache-row head). Scale pages nobody selects hold NaN."""
@@ -278,7 +284,9 @@ def test_fp4_lse_matches_dense_reference(num_kv_heads, head_major, monkeypatch):
     local_key = np.where(local_key >= 0, local_key % 10, -1)
     kv, scales, rows = _fp4_cache(rng, num_kv_heads)
     scales[table[10:]] = np.nan
-    common = dict(sm_scale=SCALE, scale_cache=jnp.asarray(scales), interpret=True)
+    common = dict(
+        sm_scale=SCALE, scale_cache=jnp.asarray(scales), block_q=block_q, interpret=True
+    )
     args = (jnp.asarray(local_key), jnp.asarray(local_limit), jnp.asarray(table))
     common["head_major"] = head_major
     if num_kv_heads == 1:
