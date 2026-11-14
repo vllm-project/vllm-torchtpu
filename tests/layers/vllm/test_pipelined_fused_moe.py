@@ -403,6 +403,13 @@ class TestMoEForwardPrecisionBranches:
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
         assert bound.arguments["w1"] is layer.w13_weight
+        # Both branches get the layer's own arguments and nothing else, so
+        # every MoE layer runs the same fused MoE kernel.
+        assert set(call_kwargs) == {
+            "hidden_states", "w1", "w2", "w1_scale", "w2_scale", "w1_bias",
+            "w2_bias", "topk_weights", "topk_ids", "experts_start", "topk",
+            "activation"
+        }
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_mxfp4_apply_monolithic_dispatches_with_exact_kwargs(

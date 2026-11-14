@@ -848,11 +848,14 @@ def zero_out_end(
     dims: Dimensions,
 ):
     out_dma = out_ref.reshape(-1, dims.size_lhs_sublane, out_ref.shape[-1])
-    pltpu.make_async_copy(
+    # The wait hints are forwarded only by a Pallas build whose DMA wait
+    # takes them.
+    pallas_compat.make_async_copy(
         src_ref=out_dma.at[pl.ds(0, zero_size)],
         dst_ref=out_dma.at[pl.ds(0, zero_size)],
         sem=semaphore_ref.at[0],
-    ).wait()
+        wait_threshold=None,
+    ).wait(strict_ordering=False, wait_threshold=None)
 
 
 def kernel_main(
@@ -937,8 +940,8 @@ def kernel_main(
             up=rhs_spec,
         )
 
-    # Execute the inner kernel. `priority` is forwarded only by a Pallas
-    # build whose emit_pipeline takes it.
+    # Execute the inner kernel.
+    # `priority` is forwarded only by a Pallas build whose emit_pipeline takes it.
     pipeline_fn = pallas_compat.emit_pipeline(
         functools.partial(inner_kernel, cfgs=cfgs),
         grid=(num_n, num_gm, num_k),

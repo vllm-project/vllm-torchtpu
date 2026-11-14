@@ -99,6 +99,8 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         setattr(layer, WEIGHT_FLIPPED_ATTR, True)
         if layer.weight.device.type == "tpu":
             synchronize_tensors([layer.weight])
+        from vllm_torchtpu.layers.vllm import small_all_reduce_op
+        small_all_reduce_op.prebuild()
 
     def apply(
         self,
@@ -289,6 +291,8 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin,
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(
             layer, device=layer.w13_weight.device)
+        from vllm_torchtpu.layers.vllm import small_all_reduce_op
+        small_all_reduce_op.prebuild()
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
