@@ -201,6 +201,48 @@ def _patch_vllm_aot_compile_cache_key() -> None:
     logger.info("Applied TPU patch: include compiler hash in AOT cache key.")
 
 
+def _patch_skip_unread_aot_autograd_save() -> None:
+    """Skip torch's AOTAutogradCache save for entries nothing can read back.
+
+    When torch computes no cache key of its own, torch_tpu stores the entry
+    for a graph it compiles under ``torchtpu_<hash>``, which torch's lookup
+    never computes, and the entry embeds an absolute timestamp, so every
+    start writes new files into the compile cache directory. The save still
+    runs for a remote cache, and when bundling is on and the entry names a
+    precompile backend, the cases where torch reads the entry back.
+    """
+    from torch._functorch._aot_autograd import autograd_cache
+
+    cache = autograd_cache.AOTAutogradCache
+    original = cache.__dict__["save"]
+    original_fn = getattr(original, "__func__", original)
+    # The marker is on the function: torch_tpu re-wraps whatever function it
+    # finds here in a new staticmethod when it restores the method.
+    if getattr(original_fn, "_tpu_skip_unread", False):
+        return
+
+    def save(key, entry, remote):
+        if (
+            str(key).startswith("torchtpu_")
+            and not remote
+            and not (
+                autograd_cache.should_bundle_autograd_cache()
+                and entry.sanitized_aot_config.precompile_backend_id is not None
+            )
+        ):
+            logger.info_once(
+                "AOTAutogradCache: skipping saves under torchtpu_* keys; torch "
+                "never reads them back."
+            )
+            logger.debug("Skipped AOTAutogradCache.save for unread key %s", key)
+            return
+        original_fn(key, entry, remote)
+
+    save.__dict__["_tpu_skip_unread"] = True
+    cache.save = staticmethod(save)
+    logger.info("Applied TPU patch: skip AOTAutogradCache saves nothing can read back.")
+
+
 def _patch_vllm_config_hash_ignore_diagnostics() -> None:
     """Keep diagnostics-only ``additional_config`` keys out of cache keys.
 
