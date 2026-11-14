@@ -19,6 +19,7 @@ import argparse
 import json
 import sys
 from dataclasses import asdict, replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .chips import CHIPS
@@ -43,6 +44,7 @@ from .emit import (
 from .geometry import from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import Dtypes, Parallel, StepShape
+from .report import write_html
 from .serving import ServingRequest, plan
 from .solver import (
     EXAMPLE_SCENARIOS,
@@ -143,6 +145,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_solve = sub.add_parser("solve")
     _add_scenario_args(p_solve)
+    p_solve.add_argument(
+        "--html",
+        type=Path,
+        default=None,
+        help="Write an offline HTML report to PATH.",
+    )
 
     p_emit = sub.add_parser("emit")
     _add_scenario_args(p_emit)
@@ -277,6 +285,14 @@ def _dispatch_solve(
         return _dispatch_ceiling(args, splan)
     if args.cmd == "emit":
         return _dispatch_emit(args, splan, dt_auto)
+    if args.html is not None:
+        payload_html = build_solve_payload(
+            splan,
+            chip=CHIPS[args.chip],
+            dtypes=dt_auto,
+            model=src,
+        )
+        write_html(payload_html, args.html)
     if args.json:
         payload = build_solve_payload(
             splan,
