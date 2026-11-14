@@ -526,6 +526,47 @@ def test_gmm_fp4_block_matches_reference(batch_size, group_sizes, block_size):
 
 
 @pytest.mark.tpu_test
+def test_gmm_fp4_fp8_w8a8_matches_reference(monkeypatch):
+    """TPU_GMM_FP8_W8A8 prefill buffer: fp8 x fp8 within e4m3 rounding."""
+    _require_tpu()
+
+    in_size, out_size, num_groups, block_size = 1024, 512, 16, 128
+    group_sizes = jnp.asarray(
+        [300, 0, 17, 64, 1, 250, 0, 0, 512, 3, 0, 90, 0, 200, 0, 40], jnp.int32
+    )
+    batch_size = 4096  # above FP8_DECODE_MAX_M: the prefill tiling
+    key = jax.random.key(0)
+    lhs_key, rhs_key, scale_key = jax.random.split(key, 3)
+    lhs = jax.random.normal(lhs_key, (batch_size, in_size), jnp.bfloat16)
+    rhs_fp4 = jax.random.normal(
+        rhs_key, (num_groups, in_size, out_size), jnp.float32
+    ).astype(jnp.float4_e2m1fn)
+    rhs_scale = jax.random.uniform(
+        scale_key, (num_groups, in_size // block_size, 1, out_size), jnp.float32, 0.5, 2
+    )
+    num_rows = int(group_sizes.sum())
+
+    def run(w8a8: str) -> np.ndarray:
+        monkeypatch.setenv("TPU_GMM_FP8_W8A8", w8a8)
+        jax.clear_caches()  # the knob is read at trace time
+        out = gmm_v2(
+            lhs, rhs_fp4, group_sizes, rhs_scale=rhs_scale, maybe_quantize_lhs=False
+        )
+        return np.asarray(out[:num_rows].astype(jnp.float32))
+
+    expected = reference_gmm(lhs, rhs_fp4, group_sizes, rhs_scale=rhs_scale)
+    expected = np.asarray(expected[:num_rows].astype(jnp.float32))
+    bf16_err = np.abs(run("0") - expected).mean()
+    actual = run("1")
+    assert np.isfinite(actual).all()
+    # The fp8 path ran: its rounding exceeds the bf16 path's.
+    assert np.abs(actual - expected).mean() > 2 * bf16_err
+    # e4m3 keeps 3 mantissa bits: ~4% relative error per operand.
+    assert np.abs(actual - expected).mean() < 0.1 * np.abs(expected).mean()
+    np.testing.assert_allclose(actual, expected, atol=0.15 * np.abs(expected).max())
+
+
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "size_m, decode",
     # MiniMax-M3.1 routed experts under EP8: c4 b4 .. c64 decode, 8k prefill.

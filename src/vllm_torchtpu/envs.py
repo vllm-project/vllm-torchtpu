@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MINIMAX_M3_FP8_LINEARS: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
+    TPU_GMM_FP8_W8A8: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
@@ -719,6 +720,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_FP4_MAX_TOKENS": env_nonnegative_int(
         "TPU_MOE_DENSE_FP4_MAX_TOKENS", 16
     ),
+    # Prefill-sized gmm_v2 calls with fp4 experts (per-128-K-block scales) run
+    # fp8 x fp8: the rhs tile requantized to e4m3 with per-column scales, the
+    # lhs rows to e4m3 with per-row scales (kernels/megablox/gmm_v2.py
+    # uses_fp8_w8a8). ~1.6x faster at 8k-token chunks, ~6% output error vs 0.4%.
+    "TPU_GMM_FP8_W8A8": env_bool("TPU_GMM_FP8_W8A8", default=False),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
