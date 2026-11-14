@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for the local-routing fused MoE GMM wrapper."""
 
+import functools
 import types
 from unittest.mock import patch
 
@@ -24,6 +25,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
+from vllm_torchtpu.kernels.stable_order_and_inverse import (
+    stable_order_and_inverse_128,
+)
 from vllm_torchtpu.layers.core import fused_moe_gmm
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -1427,3 +1431,139 @@ def test_prepare_routed_counting_sort_env_gate_restores_sorts(
     assert num_sorts == expected_sorts, (
         f"Expected {expected_sorts} comparison sort ops, got {num_sorts}"
     )
+
+
+def test_joint_routing_128_env_defaults_off(monkeypatch):
+    getter = envs.environment_variables["TPU_MOE_JOINT_ROUTING_128"]
+    monkeypatch.delenv("TPU_MOE_JOINT_ROUTING_128", raising=False)
+    assert getter() is False
+    monkeypatch.setenv("TPU_MOE_JOINT_ROUTING_128", "1")
+    assert getter() is True
+
+
+def _joint_routing_inputs(
+    num_tokens,
+    topk,
+    local_num_experts,
+    *,
+    ids_dtype=jnp.int32,
+    use_ep=False,
+    skip_padded_tokens=False,
+):
+    rng = np.random.default_rng(num_tokens * topk + local_num_experts)
+    ids = rng.integers(0, local_num_experts, size=(num_tokens, topk))
+    # Tied keys across tokens, the first and last local expert, and (under EP)
+    # non-local routes marked with a negative id.
+    ids[1::2] = ids[: num_tokens // 2]
+    ids.ravel()[:2] = [0, local_num_experts - 1]
+    if use_ep:
+        ids[rng.random(ids.shape) < 0.3] = -1
+    weights = rng.random((num_tokens, topk), dtype=np.float32)
+    if skip_padded_tokens:
+        weights[-2:] = 0.0
+    hidden_states = jnp.asarray(
+        rng.standard_normal((num_tokens, 16)), dtype=jnp.bfloat16
+    )
+    return hidden_states, jnp.asarray(ids, dtype=ids_dtype), jnp.asarray(weights)
+
+
+def _prepare_with_joint_routing(monkeypatch, joint_routing, inputs, **kwargs):
+    monkeypatch.setattr(fused_moe_gmm, "_JOINT_ROUTING_128", joint_routing)
+    outputs = prepare_routed_gmm_inputs(*inputs, **kwargs)
+    jaxpr = jax.make_jaxpr(lambda *a: prepare_routed_gmm_inputs(*a, **kwargs))(*inputs)
+    return outputs, jaxpr.jaxpr
+
+
+@pytest.mark.parametrize("skip_padded_tokens", [False, True])
+@pytest.mark.parametrize("use_sparse_core", [False, True])
+@pytest.mark.parametrize(("num_tokens", "topk"), [(16, 8), (32, 4), (128, 1)])
+def test_prepare_routed_joint_routing_replaces_single_sort_at_128_rows(
+    monkeypatch, num_tokens, topk, use_sparse_core, skip_padded_tokens
+):
+    """At 128 routed rows over 256 local experts the counting sort declines
+    (257 buckets > 128 rows) and the packed single sort runs. The joint kernel
+    takes its place, leaves no comparison sort, and returns the same six
+    outputs bit for bit, the sixth being the sorted token ids."""
+    monkeypatch.setattr(fused_moe_gmm, "_SINGLE_SORT", True)
+    monkeypatch.setattr(fused_moe_gmm, "_COUNTING_SORT", True)
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "stable_order_and_inverse_128",
+        functools.partial(stable_order_and_inverse_128, interpret=True),
+    )
+    inputs = _joint_routing_inputs(
+        num_tokens, topk, 256, skip_padded_tokens=skip_padded_tokens
+    )
+    kwargs = dict(
+        local_num_experts=256,
+        topk=topk,
+        use_ep=False,
+        use_sparse_core=use_sparse_core,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+    single_sort, single_sort_jaxpr = _prepare_with_joint_routing(
+        monkeypatch, False, inputs, **kwargs
+    )
+    joint, joint_jaxpr = _prepare_with_joint_routing(
+        monkeypatch, True, inputs, **kwargs
+    )
+
+    for got, want in zip(joint, single_sort):
+        assert got.dtype == want.dtype
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    ids = np.asarray(inputs[1]).ravel()
+    valid = ids >= 0
+    if skip_padded_tokens:
+        valid &= np.asarray(inputs[2]).ravel() != 0
+    order = np.argsort(np.where(valid, ids, 256), kind="stable")
+    np.testing.assert_array_equal(np.asarray(joint[2])[order], np.arange(128))
+    np.testing.assert_array_equal(np.asarray(joint[5]), order // topk)
+    assert _count_primitive(single_sort_jaxpr, "sort") == 1
+    assert _count_primitive(joint_jaxpr, "sort") == 0
+    assert _count_primitive(joint_jaxpr, "pallas_call") == 1
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "local_num_experts", "use_ep", "ids_dtype", "x64", "single_sort"),
+    [
+        # 57 buckets fit one 128-row block: the counting sort keeps precedence.
+        (16, 56, False, jnp.int32, False, True),
+        # Expert parallelism keeps the packed single sort.
+        (16, 256, True, jnp.int32, False, True),
+        # 120 and 136 routed rows are not the kernel's fixed size.
+        (15, 256, False, jnp.int32, False, True),
+        (17, 256, False, jnp.int32, False, True),
+        # Non-int32 sort keys, and int32 ones with x64 enabled.
+        (16, 200, False, jnp.int16, False, True),
+        (16, 256, False, jnp.int32, True, True),
+        # TPU_MOE_SINGLE_SORT=0 keeps the three-sort form.
+        (16, 256, False, jnp.int32, False, False),
+    ],
+)
+def test_prepare_routed_joint_routing_leaves_other_paths_unchanged(
+    monkeypatch, num_tokens, local_num_experts, use_ep, ids_dtype, x64, single_sort
+):
+    """Where the joint kernel does not apply, enabling it changes nothing:
+    the same program, the same outputs, and no Pallas call."""
+    monkeypatch.setattr(fused_moe_gmm, "_SINGLE_SORT", single_sort)
+    monkeypatch.setattr(fused_moe_gmm, "_COUNTING_SORT", True)
+    kwargs = dict(
+        local_num_experts=local_num_experts,
+        topk=8,
+        use_ep=use_ep,
+        use_sparse_core=False,
+    )
+    with jax.enable_x64(x64):
+        inputs = _joint_routing_inputs(
+            num_tokens, 8, local_num_experts, ids_dtype=ids_dtype, use_ep=use_ep
+        )
+        off, off_jaxpr = _prepare_with_joint_routing(
+            monkeypatch, False, inputs, **kwargs
+        )
+        on, on_jaxpr = _prepare_with_joint_routing(monkeypatch, True, inputs, **kwargs)
+
+    for got, want in zip(on, off):
+        assert got.dtype == want.dtype
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    assert str(on_jaxpr) == str(off_jaxpr)
+    assert _count_primitive(on_jaxpr, "pallas_call") == 0

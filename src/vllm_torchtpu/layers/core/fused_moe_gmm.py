@@ -42,6 +42,9 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 from vllm_torchtpu.kernels.sparse_core.support import get_sparse_core_info
+from vllm_torchtpu.kernels.stable_order_and_inverse import (
+    stable_order_and_inverse_128,
+)
 from vllm_torchtpu.logger import init_logger
 
 
@@ -78,6 +81,11 @@ _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # non-ragged paths (EP one-hot permute and non-EP TP). Off, those paths run
 # the packed single sort or the three-sort form; ragged permute is unaffected.
 _COUNTING_SORT = envs.TPU_MOE_COUNTING_SORT
+# Fixed at import: at exactly 128 routed rows, build the packed single sort's
+# results with one fixed-size Pallas kernel instead (non-EP, int32 keys, x64
+# off). It only stands in for the single sort, which the counting sort and
+# TPU_MOE_SINGLE_SORT still gate.
+_JOINT_ROUTING_128 = envs.TPU_MOE_JOINT_ROUTING_128
 # Routed-row cap for the one-hot EP permute and non-EP paths. Up to here the
 # counting sort (or, where it declines, the packed single sort) replaces the
 # three-sort form; above it the three sorts stay. Past this point the single
@@ -421,7 +429,20 @@ def prepare_routed_gmm_inputs(
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
-        if single_sort:
+        if (
+            single_sort
+            and _JOINT_ROUTING_128
+            and not use_ep
+            and sort_keys.shape == (128,)
+            and sort_keys.dtype == jnp.int32
+            and not jax.config.x64_enabled
+        ):
+            logger.info_once("MoE permutation runs as one 128-route Pallas kernel.")
+            sorted_indices, argsort_revert_indices = stable_order_and_inverse_128(
+                sort_keys
+            )
+            token_indices_sorted = sorted_indices // topk
+        elif single_sort:
             logger.info_once("MoE permutation runs as one packed sort.")
             sorted_indices, argsort_revert_indices, token_indices_sorted = (
                 _single_sort_permutation(sort_keys, topk, flat_bits)

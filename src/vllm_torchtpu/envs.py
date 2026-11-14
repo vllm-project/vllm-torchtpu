@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
+    TPU_MOE_JOINT_ROUTING_128: bool = False
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -758,6 +759,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counting sort either way. A stand-down knob in case a libtpu release
     # miscompiles the rank contraction again.
     "TPU_MOE_COUNTING_SORT": env_bool("TPU_MOE_COUNTING_SORT", True),
+    # Opt in to building the packed single sort's results (stable order, its
+    # inverse and the sorted token ids) with one fixed-size Pallas kernel when
+    # there are exactly 128 routed rows. Only replaces the packed single sort:
+    # applies where TPU_MOE_SINGLE_SORT would run (so the counting sort keeps
+    # precedence, and TPU_MOE_SINGLE_SORT=0 also turns this off), on non-EP
+    # paths with int32 sort keys and JAX x64 off. The outputs are bit-identical.
+    "TPU_MOE_JOINT_ROUTING_128": env_bool("TPU_MOE_JOINT_ROUTING_128"),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
