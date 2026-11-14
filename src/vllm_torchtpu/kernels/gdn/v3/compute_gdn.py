@@ -134,6 +134,7 @@ def chunked_gdn_per_seq(
 
     # [num_v_heads, 1, chunk]
     g_cum_sum_log_t = fused_transpose_broadcast(g_cum_sum_log, src_dim=1, dst_dim=2)
+    beta_t = fused_transpose_broadcast(beta_large, src_dim=1, dst_dim=2)
     # [num_v_heads, chunk, chunk]
     g_cum_sum_diff_log = g_cum_sum_log - g_cum_sum_log_t
     gating_map = jnp.exp(g_cum_sum_diff_log)
@@ -153,31 +154,30 @@ def chunked_gdn_per_seq(
     # [num_v_heads, chunk, chunk]
     gating_map_masked = jnp.where(strictly_lower_mask, gating_map, 0)
 
-    # [num_v_heads, chunk, kq_head_dim]
-    k_beta_repeat = k_repeat * beta_large
-
-    # [num_v_heads, chunk, chunk]
-    beta_k_k_t = jax.lax.dot(
-        k_beta_repeat,
-        k_repeat,
+    # Contract K @ K^T once per KQ head before repeating across V heads.
+    # [num_kq_heads, chunk, chunk]
+    k_k_t = jax.lax.dot(
+        k_large,
+        k_large,
         dimension_numbers=(((2,), (2,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     ).astype(cfg.dtypes.compute)
+
+    # [num_v_heads, chunk, chunk]
+    beta_k_k_t = jnp.repeat(k_k_t, cfg.v_per_kq_head, axis=0) * beta_t
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
     t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
 
     # [num_v_heads, chunk, chunk]
     t_inv = invert_triangular_matrix(t, block_size=cfg.triangular_block_size)
 
-    # [num_v_heads, chunk, v_head_dim]
-    v_beta_large = v_large * beta_large
-    # [num_v_heads, chunk, kv_head_dim]
-    k_beta_gating = k_beta_repeat * gating_forward
+    # [num_v_heads, chunk, kq_head_dim]
+    k_gating = k_repeat * gating_forward
     # NOTE: If v_head_dim < mxu size, concatenating them will help increase mxu
     # utilization. Also, if v_head_dim is multiple of lane size, concat / split
     # along lane dim is free - making this optimization strictly beneficial.
     # [num_v_heads, chunk, v_head_dim + kq_head_dim]
-    merged_v_k = jnp.concat([v_beta_large, k_beta_gating], axis=-1)
+    merged_v_k = jnp.concat([v_large, k_gating], axis=-1)
     merged_uw = jax.lax.dot(
         t_inv,
         merged_v_k,
@@ -207,7 +207,7 @@ def chunked_gdn_per_seq(
     ws = ws.astype(cfg.dtypes.compute)
 
     # [num_v_heads, chunk, v_head_dim]
-    u_ws = u - ws
+    u_ws = (u - ws) * beta_large
 
     # [num_v_heads, chunk, kq_head_dim]
     k_repeat_gating = k_repeat * gating_backward
