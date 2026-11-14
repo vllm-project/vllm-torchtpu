@@ -457,8 +457,12 @@ def sharded_ragged_paged_attention(
                 pages_per_seq,
                 case=case,
             )
-            bkv = min(bs["bkv_sz"], cap_tokens)
-            bkv_csz = min(bs["bkv_csz"], bkv)
+            bkv_csz = bs["bkv_csz"]
+            if cap_tokens < bkv_csz:
+                bkv_csz = cap_tokens
+                bkv = cap_tokens
+            else:
+                bkv = min(bs["bkv_sz"], (cap_tokens // bkv_csz) * bkv_csz)
             return (bs["bq_sz"], bkv, bs["bq_csz"], bkv_csz)
 
         block_kwargs["d_block_sizes"] = _capped(rpa_default.RpaCase.DECODE)
