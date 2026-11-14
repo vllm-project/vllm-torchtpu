@@ -29,6 +29,10 @@ Each DCP rank stores a shard of the KV cache, so it can only produce a
      output and its log-sum-exp.
   3. `merge_lse_partials_scatter_heads` folds the partials into the exact
      whole-context result and narrows the head axis back to this rank's own.
+
+When DCP spans TP x PCP (the PCP manager), only TP ranks hold distinct heads:
+heads are gathered and scattered over TP, partials also summed over PCP, and
+the log-sum-exp weights still span the whole DCP group.
 """
 
 from __future__ import annotations
@@ -38,11 +42,21 @@ from typing import Any
 import torch
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.dcp import get_dcp_group
-from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
+from vllm_torchtpu.distributed.collectives import all_to_all
+from vllm_torchtpu.distributed.dcp import get_dcp_group, get_tp_group_or_none
+from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs, weight_by_lse
+from vllm_torchtpu.distributed.pcp import get_pcp_group
 
 
-def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
+def _get_head_group(spans_pcp: bool) -> Any | None:
+    """The group whose ranks hold distinct query head slices: TP when DCP
+    spans TP x PCP (the PCP manager), else DCP."""
+    # From the caller, not the group sizes: looking a group up can fail an
+    # assert, which `torch.compile` cannot trace.
+    return get_tp_group_or_none() if spans_pcp else get_dcp_group()
+
+
+def all_gather_heads(q: torch.Tensor, spans_pcp: bool = False) -> torch.Tensor:
     """Widen a rank's query head slice to the whole DCP group's heads.
 
     DCP doesn't add a new parallel dimension—it borrows from TP. It
@@ -51,12 +65,14 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
 
     Args:
       q: `[num_tokens, tp_local_num_heads, dim]`, this rank's head slice.
+      spans_pcp: DCP spans TP x PCP (the PCP manager); gather over TP.
 
     Returns:
       `[num_tokens, tp_local_num_heads * dcp_size, dim]`, identical
-      on every rank. Returned unchanged without a DCP group.
+      on every rank (over TP only when DCP spans TP x PCP). Returned
+      unchanged without a DCP group.
     """
-    group = get_dcp_group()
+    group = _get_head_group(spans_pcp)
     if group is None or int(group.world_size) == 1:
         return q
     return group.all_gather(q.contiguous(), dim=1)
@@ -66,9 +82,11 @@ def all_gather_q_nope_pe_heads(
     ql_nope: torch.Tensor,
     q_pe: torch.Tensor,
     kv_lora_rank: int,
+    spans_pcp: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused all-gather of `(ql_nope, q_pe)` across DCP ranks in a single call."""
-    group = get_dcp_group()
+    """Fused all-gather of `(ql_nope, q_pe)` across DCP ranks in a single call
+    (over TP only when DCP spans TP x PCP)."""
+    group = _get_head_group(spans_pcp)
     if group is None or int(group.world_size) == 1:
         return ql_nope, q_pe
     q_dcp = group.all_gather(torch.cat([ql_nope, q_pe], dim=-1), dim=1)
@@ -79,7 +97,10 @@ def all_gather_q_nope_pe_heads(
 
 
 def merge_lse_partials_scatter_heads(
-    output: torch.Tensor, lse: torch.Tensor, is_backbone: bool = True
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    is_backbone: bool = True,
+    spans_pcp: bool = False,
 ) -> torch.Tensor:
     """Combine this rank's partial attention output with its peers'.
 
@@ -110,6 +131,8 @@ def merge_lse_partials_scatter_heads(
         comparison is fixed at trace time. Pass False from the MTP drafter,
         which is traced once for every bucket: it always takes the
         reduce-scatter, exactly as with TPU_DCP_LSE_MERGE_A2A unset.
+      spans_pcp: DCP spans TP x PCP (the PCP manager): scatter heads over
+        TP and sum the partials over PCP.
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
@@ -128,24 +151,27 @@ def merge_lse_partials_scatter_heads(
     # drafter never compares it.
     if (
         envs.TPU_DCP_LSE_MERGE_A2A
+        and not spans_pcp
         and is_backbone
         and output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 
     rs_dtype = output.dtype if envs.TPU_DCP_RS_OUT_PRECISION and is_backbone else None
-    return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
+    if not spans_pcp:
+        return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
 
-
-def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
-    """Block `d` of `x`'s leading axis goes to rank `d`; block `r` of the
-    result came from rank `r`."""
-    from torch.distributed import _functional_collectives as funcol
-
-    out = funcol.all_to_all_single(x.contiguous(), None, None, group.device_group)
-    if isinstance(out, funcol.AsyncCollectiveTensor):
-        return funcol.wait_tensor(out)
-    return out
+    else:
+        # dcp = pcp x tp
+        weighted, _ = weight_by_lse(output, lse, group)
+        if rs_dtype is not None:
+            weighted = weighted.to(rs_dtype)
+        tp_group = get_tp_group_or_none()
+        if tp_group is not None and int(tp_group.world_size) > 1:
+            weighted = tp_group.reduce_scatter(weighted.contiguous(), dim=1)
+        pcp_group = get_pcp_group()
+        assert pcp_group is not None
+        return pcp_group.all_reduce(weighted.contiguous()).to(output.dtype)
 
 
 def merge_lse_partials_all_to_all(
@@ -162,8 +188,8 @@ def merge_lse_partials_all_to_all(
     # Destination-major: [world, T, local, V] and [world, T, local].
     o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
-    o_recv = _all_to_all(o_send, group)
-    l_recv = _all_to_all(l_send, group)
+    o_recv = all_to_all(o_send, group)
+    l_recv = all_to_all(l_send, group)
     return _merge_received(o_recv, l_recv).to(output.dtype)
 
 

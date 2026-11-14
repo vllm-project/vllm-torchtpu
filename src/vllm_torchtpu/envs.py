@@ -28,6 +28,9 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
+    USE_TPU_PCP_MANAGER: bool = False
+    TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
+    TPU_PCP_KV_CHUNK_TOKENS: int = 65536
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -85,6 +88,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
+    TPU_DP_VOCAB_PARALLEL: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -109,15 +113,15 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_LINEAR: bool = False
-    TPU_PP_DYNAMIC_CHUNKS: bool = True
+    TPU_PP_LONE_PROMPT_CHUNKS: bool = True
+    TPU_PP_EQUAL_COST_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
-    TPU_PP_LAZY_PUSH: bool = False
-    TPU_PP_HANDOFF: str = "wave"
-    TPU_PP_RING_DEPTH: int = 2
+    TPU_PP_HANDOFF_DEPTH: int = 2
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -472,6 +476,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
+    # Run PCP through `runner/pcp/manager.py` (PCP x DCP KV gather).
+    "USE_TPU_PCP_MANAGER": env_bool("USE_TPU_PCP_MANAGER", default=False),
+    # PCP manager: max context tokens one forward's prefills may gather.
+    "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
+    # PCP manager: context tokens gathered per all-gather chunk.
+    "TPU_PCP_KV_CHUNK_TOKENS": env_int("TPU_PCP_KV_CHUNK_TOKENS", 65536),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
     # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must
@@ -782,6 +792,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    # Shard the input embedding and lm_head over every DP x TP rank (the EP
+    # group) instead of the TP group. Needs DP with EP (lockstep DP engines);
+    # ignored with PP, context parallelism, speculative decoding, LoRA, pooling
+    # or multimodal models, or TPU_GREEDY_TOP_TOKENS. See
+    # layers/adapter/dp_vocab_parallel.py.
+    "TPU_DP_VOCAB_PARALLEL": env_bool("TPU_DP_VOCAB_PARALLEL"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.
@@ -868,6 +884,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ascending device-id order, so the SparseCore gather gets its
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
+    # A static expert placement for expert parallelism: a JSON table naming,
+    # per MoE layer, which global experts each EP rank holds and in what slot
+    # order -- a permutation, experts / ranks to a rank
+    # (layers/adapter/expert_placement.py). Applied at weight load, to the
+    # experts and the router alike, so every MoE kernel serves it unchanged. A
+    # local path or a gs:// URI. Empty: the checkpoint's contiguous blocks.
+    "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", ""),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the
@@ -900,24 +923,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Add linear token buckets above a quarter of the token budget, for
     # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings).
     "TPU_TOKEN_BUCKET_LINEAR": env_bool("TPU_TOKEN_BUCKET_LINEAR"),
+    # Pipeline parallelism: while the pending prefill work cannot fill every
+    # stage with a full step, spread it over the stages in smaller steps
+    # (core/pp_chunks.py).
+    "TPU_PP_LONE_PROMPT_CHUNKS": env_bool("TPU_PP_LONE_PROMPT_CHUNKS", default=True),
     # Pipeline parallelism: size prefill chunks by a per-step time budget
-    # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
-    "TPU_PP_DYNAMIC_CHUNKS": env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),
-    # Fraction above the time of a full prefix-free step that a step may
-    # take before its chunks are shortened.
+    # fit to forwards each stage times at startup, instead of a token budget
+    # (core/pp_chunks.py).
+    "TPU_PP_EQUAL_COST_CHUNKS": env_bool("TPU_PP_EQUAL_COST_CHUNKS", default=True),
+    # With TPU_PP_EQUAL_COST_CHUNKS: fraction above the time of a full
+    # prefix-free step that a step may take before its chunks are shortened.
     "TPU_PP_CHUNK_SLACK": lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
-    # Pipeline parallelism over more than two stages: the engine core pushes
-    # the pipeline only when stage 0 would otherwise idle and drops empty
-    # steps, so requests share the pipeline (core/pp_lazy_step.py).
-    "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
-    # How pipeline stages hand activations on: "wave" runs one collective
-    # launch on every stage per forward (distributed/pp_wave.py), "ring"
-    # sends each forward's output point to point (distributed/pp_ring.py).
-    # Goes once the ring replaces the wave.
-    "TPU_PP_HANDOFF": env_with_choices("TPU_PP_HANDOFF", "wave", ["wave", "ring"]),
-    # With TPU_PP_HANDOFF=ring: the forwards a stage may queue for sending
-    # to the next stage before end_forward waits for room.
-    "TPU_PP_RING_DEPTH": env_int("TPU_PP_RING_DEPTH", 2),
+    # Pipeline parallelism: the forwards a stage may queue for sending to the
+    # next stage before end_forward waits for room (distributed/pp_buffered.py).
+    "TPU_PP_HANDOFF_DEPTH": env_int("TPU_PP_HANDOFF_DEPTH", 2),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,

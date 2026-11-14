@@ -107,13 +107,16 @@ FORWARD=(
   NIGHTLY CREATED_BY
   # The P/D benchmark loads its results into BigQuery when this is set.
   BQ_UPLOAD
+  # run_eval_flow.sh posts the step's benchmark to the Performance tab of
+  # ci.vllm.ai when this is set, labelled with the image and the slice's chips.
+  UPLOAD_TO_VLLM_CI SHAPE WORKLOAD_IMAGE
   # Carries the -m filter into bktec's collection step; see the sharded steps
   # in pipeline_tests.yml.
   PYTEST_ADDOPTS
   # Unset on purpose: naming an unset variable is how the launcher is asked to
   # supply it from its env_secrets registry. HF_TOKEN is not here - every pod
   # inherits that one from the fleet pod defaults.
-  BUILDKITE_ANALYTICS_TOKEN
+  BUILDKITE_ANALYTICS_TOKEN INGEST_BEARER_TOKEN
   # What a slice's pods are asked to run; read by multihost_entry.sh.
   MULTIHOST_ARGS_B64
   # Names the directory whose contents the pod uploads as artifacts.

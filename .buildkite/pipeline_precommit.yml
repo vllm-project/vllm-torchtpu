@@ -1,0 +1,33 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The repo's static checks (.pre-commit-config.yaml) on the checkout itself: no
+# CI image, so it runs alongside the image build. bootstrap.py adds this lane to
+# merge-queue builds and, once CI_PR_PUSH_CPU_ONLY=1, to PR and /ci builds, so
+# the required Buildkite status covers what the pre-commit workflow checks and
+# no required check depends on a GitHub Actions run.
+
+steps:
+  - label: ":white_check_mark: pre-commit"
+    key: "pre_commit"
+    agents:
+      queue: cpu
+    timeout_in_minutes: 20
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 2
+    commands:
+      - python3 -m pip install -q --break-system-packages --user pre-commit
+      - python3 -m pre_commit run --all-files --show-diff-on-failure

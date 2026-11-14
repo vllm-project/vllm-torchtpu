@@ -484,7 +484,7 @@ def lower_torch_mtp_draft_to_mlir(
         _torch_mtp_entry,
         all_specs,
         donate_argnums=donate_argnums,
-        module_name=f"mtp_draft{'_debug' if taps else ''}_bucket{bucket_size}",
+        module_name=f"draft{'_debug' if taps else ''}_bucket{bucket_size}",
     )
     return set_aliasing_outputs(
         mlir_text, {arg: i for i, arg in enumerate(donate_argnums)}

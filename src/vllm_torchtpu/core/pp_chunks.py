@@ -11,14 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sizing prefill chunks so every pipeline step costs about the same time.
+"""Sizing prefill chunks for the pipeline chunk scheduler.
 
-The stages of a pipeline advance in lockstep (``distributed/pp_wave.py``), so
-a wave lasts as long as the slowest step in flight. Steps of equal token
-count are not steps of equal time: a chunk attends to every token before it,
-so a chunk late in a long prompt costs more than a first chunk. The
-scheduler therefore gives each step a time budget and sizes prefill chunks
-against it instead of filling a token budget.
+A step moves through the pipeline one stage at a time, each stage running
+its forward once the previous one hands it on (``distributed/pp_buffered.py``).
+Two independent policies size the steps:
+
+- Lone-prompt chunking (``TPU_PP_LONE_PROMPT_CHUNKS``): while the pending
+  prefill work cannot fill every stage with a full step, a step is held to
+  that work spread over the stages (`step_limit`), so a lone prompt runs as
+  one small step per stage instead of trailing itself through the pipeline
+  one full step at a time.
+- Equal-cost chunking (``TPU_PP_EQUAL_COST_CHUNKS``): a stage hands a step on
+  only once its forward is done, so a costly step holds up every step behind
+  it. Steps of equal token count are not steps of equal time: a chunk attends
+  to every token before it, so a chunk late in a long prompt costs more than
+  a first chunk. The scheduler gives each step a time budget and sizes
+  prefill chunks against it instead of filling a token budget
+  (`StepCostModel`). With both policies on, the cost model also picks how
+  far a lone prompt is spread.
 
 Step time on one stage is modelled as
 
@@ -67,6 +78,20 @@ def chunk_granularity(block_size: int, max_tokens: int, block_aligned: bool) -> 
     if block_aligned and block_size <= max_tokens:
         granule = -(-granule // block_size) * block_size
     return granule
+
+
+def step_limit(pending: int, pp_size: int, granularity: int, step: int) -> int | None:
+    """Token bucket a step is held to while ``pending`` prefill tokens cannot
+    fill all ``pp_size`` stages with full steps of ``step`` tokens: the
+    pending work spread over the stages, rounded up to a whole
+    ``granularity`` and at most a full step. None when no work is pending or
+    the spread fills a full step."""
+    if pending <= 0:
+        return None
+    share = -(-pending // pp_size)
+    if share >= step:
+        return None
+    return min(-(-share // granularity) * granularity, step)
 
 
 def chunk_buckets(max_tokens: int, granularity: int) -> list[int]:

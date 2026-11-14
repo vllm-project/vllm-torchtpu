@@ -127,12 +127,29 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-480b-fp8-tp8-ep-full
 
+      # Dense FLASH_ATTN model above 8K context with Raiden KV offload: the only
+      # lane on the default backend's long-context page size, where 16-token
+      # pages made offload reloads up to 8x more transfers.
+      - label: "Perf: Nightly qwen3-32b-tp8-offload-prefix (TPU v7x-8)"
+        <<: *perf_step
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-32b-tp8-offload-prefix
+
       # Qwen3.5-397B parallelism sweep: three layouts. Quality is independent
       # of parallelism, so the evals run only on the tp1-dp8 layout.
       - label: "Perf/Eval: Nightly qwen3.5-397b-fp8-tp1-dp8-ep (TPU v7x-8)"
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
+          UPLOAD_TO_VLLM_CI: "1"
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
@@ -147,6 +164,7 @@ steps:
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
+          UPLOAD_TO_VLLM_CI: "1"
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
@@ -177,6 +195,7 @@ steps:
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
+          UPLOAD_TO_VLLM_CI: "1"
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"

@@ -51,6 +51,13 @@ pushes when `CI_PR_PUSH_CPU_ONLY=1` select `pr+cpu-only` (stage 0 only, no TPU).
 Merge-queue and `/ci` builds ignore PR labels. Once `CI_PR_PUSH_CPU_ONLY=1`,
 PR pushes and post-merge builds ignore them too.
 
+Merge-queue builds, and after cutover PR and `/ci` builds, also run `pre-commit`
+on the checkout (`pipeline_precommit.yml`, a `cpu` step next to the image build;
+docs-only changes run only it). The Buildkite status then covers the static
+checks, so the required checks can be Buildkite and `DCO` alone. Those are apps
+that report however a PR entered the queue, whereas a GitHub Actions check
+doesn't run when the `/ci` workflow's own token enqueued the PR.
+
 Releases and nightly images are published by the `vllm-torchtpu-release`
 pipeline in the TPU Release cluster; [`release/README.md`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/release/README.md)
 has how to cut a release. Its nightly step runs

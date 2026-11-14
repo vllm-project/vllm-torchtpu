@@ -40,6 +40,23 @@ class ShapeDtypeStruct:
 
 
 @dataclasses.dataclass(frozen=True)
+class KvCacheGroup:
+    """Attention layers that share one page table and one retention rule.
+
+    Attributes:
+        name: The group's name; its page table is the `{name}_block_tables` input.
+        layer_names: The group's layers; layer `j` keeps its KV in state tensor `j`.
+        window: For a sliding-window group, the positions a query reads, itself
+            included (a query at position `p` reads keys from `p - window + 1`);
+            None for a group that keeps every block.
+    """
+
+    name: str
+    layer_names: tuple[str, ...]
+    window: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class ModelExportConfig:
     """General model export configuration."""
 

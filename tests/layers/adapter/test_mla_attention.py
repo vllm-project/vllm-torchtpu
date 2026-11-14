@@ -1062,7 +1062,7 @@ def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
         )
     )
 
-    def _explode(*_args):
+    def _explode(*_args, **_kw):
         raise AssertionError("qrep must not all-gather the query heads")
 
     monkeypatch.setattr(attention_adapter, "all_gather_heads", _explode)
@@ -1112,7 +1112,7 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     monkeypatch.setattr(
         attention_adapter,
         "all_gather_heads",
-        lambda t: (gathered.append(t), t.repeat(1, dcp_size, 1))[1],
+        lambda t, **_kw: (gathered.append(t), t.repeat(1, dcp_size, 1))[1],
     )
     monkeypatch.setattr(
         attention_adapter,
@@ -1139,7 +1139,7 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     monkeypatch.setattr(
         attention_adapter,
         "all_gather_q_nope_pe_heads",
-        lambda nope, pe, rank: (
+        lambda nope, pe, rank, **_kw: (
             fused_calls.append((nope, pe, rank)),
             (nope.repeat(1, dcp_size, 1), pe.repeat(1, dcp_size, 1)),
         )[1],
@@ -1161,7 +1161,7 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     monkeypatch.setattr(
         attention_adapter,
         "all_gather_heads",
-        lambda t: (unfused_calls.append(t), t.repeat(1, dcp_size, 1))[1],
+        lambda t, **_kw: (unfused_calls.append(t), t.repeat(1, dcp_size, 1))[1],
     )
     impl.forward(
         layer=layer,
@@ -1601,6 +1601,46 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
             kv_layout=KVLayout.SEQ_ALONG_LANE,
             **common_kw,
         )
+
+
+def test_indexer_kv_layout_pcp_manager(monkeypatch, caplog):
+    """USE_TPU_PCP_MANAGER downgrades default 'sal' to HAS with a one-time
+    warning and rejects explicit 'sal': its split prefills gather the indexer
+    K cache as packed rows."""
+    import importlib
+    import logging
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
+
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(st_mod, "_INDEXER_KV_LAYOUT_FALLBACK_LOGGED", set())
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", False)
+
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", False)
+    assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
+
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", True)
+    caplog.clear()
+    assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+    assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+    warnings = [
+        r.message for r in caplog.records if "USE_TPU_PCP_MANAGER=1" in r.message
+    ]
+    assert len(warnings) == 1
+
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    with pytest.raises(ValueError, match="USE_TPU_PCP_MANAGER=1"):
+        st_mod.indexer_kv_layout(256)
+    for explicit_mode in ("has", "xla"):
+        monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", explicit_mode)
+        monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", explicit_mode)
+        assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
 
 
 def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, caplog):
