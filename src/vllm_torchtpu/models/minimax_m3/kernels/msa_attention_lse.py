@@ -135,18 +135,32 @@ def _kernel(
             src = kv_hbm_ref.at[
                 pl.ds(page, 1), :, :, pl.ds(head_ref[0] * row_width, row_width)
             ]
-            copies = [
-                pltpu.make_async_copy(src, buf_ref.at[half, g], sem_ref.at[half, g])
-            ]
+            copies = [pltpu.make_async_copy(src, buf_ref.at[half, g], sem_ref.at[half])]
             if fp4:
                 copies.append(
                     pltpu.make_async_copy(
                         scale_hbm_ref.at[pl.ds(page, 1)],
                         scale_buf_ref.at[half, g],
-                        scale_sem_ref.at[half, g],
+                        scale_sem_ref.at[half],
                     )
                 )
             return copies
+
+        def wait_pages(n):
+            """Wait for `n` pages' copies into slot `half`: descriptors of `n`
+            pages' bytes on the slot's semaphore (the sources, the cache's first
+            `n` pages, only size them; a cache holds far more than a group)."""
+            pltpu.make_async_copy(
+                kv_hbm_ref.at[pl.ds(0, n), :, :, pl.ds(0, row_width)],
+                buf_ref.at[half, pl.ds(0, n), 0],
+                sem_ref.at[half],
+            ).wait()
+            if fp4:
+                pltpu.make_async_copy(
+                    scale_hbm_ref.at[pl.ds(0, n)],
+                    scale_buf_ref.at[half, pl.ds(0, n), 0],
+                    scale_sem_ref.at[half],
+                ).wait()
 
         def start_group(group, half):
             base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
@@ -169,12 +183,12 @@ def _kernel(
         def _next():
             start_group(w + ring - 1, (w + ring - 1) % ring)
 
-        def wait(g, carry):
-            for copy in page_copies(half, g, 0):  # the source only sizes the wait
-                copy.wait()
-            return carry
-
-        jax.lax.fori_loop(0, count, wait, 0)
+        # The slot's semaphore counts its pages' bytes, so one wait per set bit
+        # of `count` waits for them all (not one serial wait per page).
+        n = 1
+        while n <= pages_per_step:
+            pl.when((count & n) != 0)(functools.partial(wait_pages, n))
+            n *= 2
 
         kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
 
@@ -475,7 +489,7 @@ def _attention_call(
     scale_scratch = (
         (
             pltpu.VMEM((ring, pages_per_step, 1) + scale_cache.shape[1:], jnp.float32),
-            pltpu.SemaphoreType.DMA((ring, pages_per_step)),
+            pltpu.SemaphoreType.DMA((ring,)),
         )
         if fp4
         else ()
@@ -519,7 +533,7 @@ def _attention_call(
                 (ring, pages_per_step, 1, rows_per_page, packing, row_width),
                 kv_cache.dtype,
             ),
-            pltpu.SemaphoreType.DMA((ring, pages_per_step)),
+            pltpu.SemaphoreType.DMA((ring,)),
             *scale_scratch,
         ],
     )
