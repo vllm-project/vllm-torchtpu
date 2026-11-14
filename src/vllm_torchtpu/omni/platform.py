@@ -22,7 +22,10 @@ from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 from vllm_torchtpu.env_override import set_libtpu_flag_default
-from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
+from vllm_torchtpu.omni.patches import (
+    apply_omni_tpu_patches,
+    apply_omni_worker_patches,
+)
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 logger = init_logger(__name__)
@@ -111,6 +114,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def set_device(cls, device: torch.device | int) -> None:
+        apply_omni_worker_patches()
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
         if world_size > 1:
             cls._worker_world_size = world_size

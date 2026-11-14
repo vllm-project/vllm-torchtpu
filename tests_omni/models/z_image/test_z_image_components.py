@@ -20,10 +20,11 @@ Tested Z-Image Components:
 2. TpuSDPAImpl / TpuFlashAttentionImpl (vllm_torchtpu): diffusion attention
    parity at Z-Image head geometry (30 heads x 128 head_dim) against float64
    CPU ground truth.
-3. _sp_plan["unified_prepare"] auto_pad=False canary and
+3. _sp_plan["unified_prepare"] auto_pad=True canary and
    OmniTpuPlatform.init_diffusion_model_runner_runtime on DiffusionParallelConfig.
 """
 
+import dataclasses
 import math
 from types import SimpleNamespace
 
@@ -167,25 +168,48 @@ class TestZImageComponentsOnTpu:
             max_abs=max_abs,
         )
 
-    def test_z_image_unified_prepare_auto_pad_canary(self):
-        """Canary: upstream must keep ``auto_pad=False`` on ``unified_prepare``.
+    def test_z_image_unified_prepare_auto_pad_canary(self, monkeypatch):
+        """Verify ``_patch_z_image_transformer_block_flush`` enables ``auto_pad``.
 
-        ``patchify_and_embed`` already pads image and caption sequences to
-        ``SEQ_MULTI_OF=32``, so ``auto_pad`` is a no-op numerically. It is not a
-        no-op for scheduling: ``auto_pad=True`` marks local sequence lengths as
-        equal, ``UlyssesParallelAttention`` then skips its per-layer sync, and
-        the resulting run of async ``all_to_all_single`` collectives in one lazy
-        PJRT graph deadlocks at ``ulysses_degree=8`` on TPU. If upstream flips
-        this flag, the multi-chip path needs re-validation before bumping the pin.
+        Once ``apply_omni_model_specific_patches()`` installs per-block async
+        flushing, ``unified_prepare``'s SP plan is updated to ``auto_pad=True``
+        so ``UlyssesParallelAttention`` skips its per-layer host sync.
         """
+        from vllm_omni.diffusion.models.z_image.z_image_transformer import (
+            ZImageTransformerBlock,
+        )
+
+        from vllm_torchtpu.omni.patches import _patch_z_image_transformer_block_flush
+
+        orig_unified_prepare = ZImageTransformer2DModel._sp_plan["unified_prepare"]
+        assert isinstance(orig_unified_prepare, dict)
+        assert orig_unified_prepare, "unified_prepare SP plan unexpectedly empty"
+        reset_unified_prepare = {
+            idx: dataclasses.replace(sp_input, auto_pad=False)
+            for idx, sp_input in orig_unified_prepare.items()
+        }
+        monkeypatch.setattr(
+            ZImageTransformer2DModel,
+            "_sp_plan",
+            {
+                **ZImageTransformer2DModel._sp_plan,
+                "unified_prepare": reset_unified_prepare,
+            },
+        )
+        for sp_input in ZImageTransformer2DModel._sp_plan["unified_prepare"].values():
+            assert sp_input.auto_pad is False
+        monkeypatch.setattr(
+            ZImageTransformer2DModel, "forward", ZImageTransformer2DModel.forward
+        )
+        monkeypatch.setattr(
+            ZImageTransformerBlock, "forward", ZImageTransformerBlock.forward
+        )
+        _patch_z_image_transformer_block_flush()
         unified_prepare_plan = ZImageTransformer2DModel._sp_plan["unified_prepare"]
         assert isinstance(unified_prepare_plan, dict)
         assert unified_prepare_plan, "unified_prepare SP plan unexpectedly empty"
-        for idx, sp_input in unified_prepare_plan.items():
-            assert sp_input.auto_pad is False, (
-                f"_sp_plan['unified_prepare'][{idx}].auto_pad changed upstream; "
-                "re-validate Z-Image ulysses_degree=8 on TPU before accepting."
-            )
+        for sp_input in unified_prepare_plan.values():
+            assert sp_input.auto_pad is True
 
     @pytest.mark.parametrize(
         ("ulysses_degree", "expected_mode"),
