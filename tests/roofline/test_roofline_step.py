@@ -15,7 +15,12 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 import pytest
 
@@ -41,7 +46,9 @@ from vllm_torchtpu.roofline import (
 )
 from vllm_torchtpu.roofline import constants as rf_constants
 from vllm_torchtpu.roofline.collectives import submesh_for_group
+from vllm_torchtpu.roofline.hf_loader import load_hf_config
 from vllm_torchtpu.roofline.modules import experts_touched
+from vllm_torchtpu.roofline.partition import partition_pp_layers
 
 QWEN35_CFG: dict[str, object] = {
     "text_config": {
@@ -70,7 +77,7 @@ QWEN35_CFG: dict[str, object] = {
 DOC_DTYPES = Dtypes(kv=2.0, w_aux=1.0)
 EXAMPLE_FP8_DTYPES = Dtypes()
 EXAMPLE_ACCEPT_LEN = 3.0
-EXAMPLE_COLLECTIVE_LATENCY_S = 1e-05
+EXAMPLE_COLLECTIVE_LATENCY_S = 10e-6
 WIDE_GEOM = ModelGeometry(
     hidden=8192,
     num_layers=4,
@@ -106,7 +113,7 @@ def test_hard_floor_is_max_of_resources() -> None:
     )
     assert sf.hard_floor_s == pytest.approx(sf.resource_bound_s, rel=1e-12)
     assert sf.binding == "hbm"
-    assert sf.hbm_s == pytest.approx(3859025920 / 3700000000000.0, rel=1e-12)
+    assert sf.hbm_s == pytest.approx(3_859_025_920 / 3.7e12, rel=1e-12)
     sf_unpad = step_floor(
         geom,
         replace(CHIPS["tpu7x"], mxu_m_tile=1),
@@ -114,9 +121,10 @@ def test_hard_floor_is_max_of_resources() -> None:
         StepShape(batch=1, rows_per_seq=1, context=90036),
         FloorOptions(dt=DOC_DTYPES),
     )
-    assert sf_unpad.matmul_s == pytest.approx(6.91932419228308e-06, rel=1e-09)
-    assert sf.matmul_s == pytest.approx(0.00021617862158358742, rel=1e-09)
-    tiny_mm = ChipSpec("tiny_mm", 100, 1e18, 1000000.0, 1000000.0, 100)
+    assert sf_unpad.matmul_s == pytest.approx(6.91932419228308e-06, rel=1e-9)
+    assert sf.matmul_s == pytest.approx(0.00021617862158358742, rel=1e-9)
+
+    tiny_mm = ChipSpec("tiny_mm", 100, 1e18, 1e6, 1e6, 100)
     sf_mm = step_floor(
         geom,
         tiny_mm,
@@ -155,7 +163,7 @@ def test_spec_rows_and_tokens_per_step() -> None:
         FloorOptions(dt=DOC_DTYPES),
     )
     assert sum(m.hbm_bytes for m in cyc.modules) == pytest.approx(
-        7741562248.75, abs=1.0
+        7_741_562_248.75, abs=1.0
     )
 
 
@@ -164,9 +172,13 @@ def test_chain_term_binds_with_latency() -> None:
     geom = from_hf_config(QWEN35_CFG)
     shape = StepShape(batch=1, rows_per_seq=4, context=0)
     sf0 = step_floor(
-        geom, CHIPS["tpu7x"], Parallel(tp=8), shape, FloorOptions(dt=EXAMPLE_FP8_DTYPES)
+        geom,
+        CHIPS["tpu7x"],
+        Parallel(tp=8),
+        shape,
+        FloorOptions(dt=EXAMPLE_FP8_DTYPES),
     )
-    assert sf0.chain_s == pytest.approx(0.00090253728, rel=1e-06)
+    assert sf0.chain_s == pytest.approx(0.00090253728, rel=1e-6)
     assert sf0.binding == "hbm"
     sf1 = step_floor(
         geom,
@@ -174,18 +186,19 @@ def test_chain_term_binds_with_latency() -> None:
         Parallel(tp=8),
         shape,
         FloorOptions(
-            dt=EXAMPLE_FP8_DTYPES, collective_latency_s=EXAMPLE_COLLECTIVE_LATENCY_S
+            dt=EXAMPLE_FP8_DTYPES,
+            collective_latency_s=EXAMPLE_COLLECTIVE_LATENCY_S,
         ),
     )
     expected_hops = sum(
         c.hops for m in sf0.modules for c in m.collectives if c.group > 1
     )
     assert sf1.chain_s == pytest.approx(
-        sf0.chain_s + expected_hops * EXAMPLE_COLLECTIVE_LATENCY_S, rel=1e-06
+        sf0.chain_s + expected_hops * EXAMPLE_COLLECTIVE_LATENCY_S, rel=1e-6
     )
     assert sf1.hard_floor_s == sf0.hard_floor_s
     assert sf1.serial_estimate_s == pytest.approx(
-        sf0.serial_estimate_s + expected_hops * EXAMPLE_COLLECTIVE_LATENCY_S, rel=1e-06
+        sf0.serial_estimate_s + expected_hops * EXAMPLE_COLLECTIVE_LATENCY_S, rel=1e-6
     )
 
 
@@ -204,6 +217,7 @@ def test_hf_config_quantization_dtypes_and_10_families() -> None:
     assert dt_fp8.w_dense == pytest.approx(1.0 + 4.0 / (128.0 * 128.0))
     assert dt_fp8.lm_head == pytest.approx(2.0)
     assert dt_fp8.w_aux == pytest.approx(2.0)
+    # Block-scaled FP8 (1.000244 B < 2.0 B) routes linears to fp8_flops.
     fp8_mods = {
         m.name: m
         for m in pass_costs(
@@ -226,9 +240,11 @@ def test_hf_config_quantization_dtypes_and_10_families() -> None:
             Dtypes(w_dense=1.0, w_expert=1.0, w_aux=2.0, act="a8"),
         )
     }
-    min_fp8_flops = 800000000000.0
+    min_fp8_flops = 8.0e11
     assert fp8_mods["gqa"].fp8_flops == pytest.approx(exact_1b_mods["gqa"].fp8_flops)
     assert fp8_mods["gqa"].fp8_flops > min_fp8_flops
+
+    # linear_attn.in_proj_ba keeps dense FP8; lm_head stays bf16 unless enabled.
     dt_lin_ign = rf.dtypes_from_hf_config(
         {
             "torch_dtype": "bfloat16",
@@ -253,6 +269,7 @@ def test_hf_config_quantization_dtypes_and_10_families() -> None:
         }
     )
     assert dt_lm_q.lm_head == pytest.approx(1.0 + 4.0 / (128.0 * 128.0))
+
     dt_modelopt = rf.dtypes_from_hf_config(
         {
             "torch_dtype": "bfloat16",
@@ -260,6 +277,7 @@ def test_hf_config_quantization_dtypes_and_10_families() -> None:
         }
     )
     assert dt_modelopt.w_expert == pytest.approx(0.5625)
+
     dt_nvfp4 = rf.dtypes_from_hf_config(
         {
             "torch_dtype": "bfloat16",
@@ -267,6 +285,7 @@ def test_hf_config_quantization_dtypes_and_10_families() -> None:
         }
     )
     assert dt_nvfp4.w_expert == pytest.approx(0.5625)
+
     dt_mxfp4 = rf.dtypes_from_hf_config(
         {
             "torch_dtype": "bfloat16",
@@ -278,6 +297,7 @@ def test_hf_config_quantization_dtypes_and_10_families() -> None:
     )
     assert dt_mxfp4.w_expert == pytest.approx(0.53125)
     assert dt_mxfp4.w_dense == pytest.approx(2.0)
+
     ten_family_cfg = {
         "hidden_size": 2048,
         "num_hidden_layers": 6,
@@ -331,6 +351,7 @@ def test_hf_config_quantization_dtypes_and_10_families() -> None:
         FloorOptions(dt=EXAMPLE_FP8_DTYPES),
     )
     assert any(m.name == "draft_fc" for m in cyc.modules)
+
     with pytest.raises(ValueError, match="Unknown layer_type"):
         from_hf_config(
             {
@@ -347,6 +368,7 @@ def test_pcp_dcp_mutual_exclusion_and_mixed_step() -> None:
     """Verify PCP/DCP exclusion and cost calculation for mixed steps."""
     with pytest.raises(ValueError, match="mutually exclusive"):
         Parallel(tp=8, kv_split=4, pcp=2)
+
     geom = from_hf_config(QWEN35_CFG)
     chip = CHIPS["tpu7x"]
     par_p1 = Parallel(tp=8, moe="ep", pcp=1)
@@ -431,12 +453,17 @@ def test_pcp_dcp_mutual_exclusion_and_mixed_step() -> None:
         ),
         opts_fp8,
     )
-    assert sf_hit_u.matmul_s < sf_miss_u.matmul_s * 0.2
-    assert sf_pcp_u.matmul_s < sf_miss_u.matmul_s * 0.4
+    assert sf_hit_u.matmul_s < sf_miss_u.matmul_s * 0.20
+    assert sf_pcp_u.matmul_s < sf_miss_u.matmul_s * 0.40
     assert sf_hit.matmul_s < sf_miss.matmul_s
     assert sf_pcp.matmul_s < sf_miss.matmul_s
+
     sf_dec = step_floor(
-        geom, chip, par_p1, StepShape(batch=16, rows_per_seq=1, context=8192), opts_fp8
+        geom,
+        chip,
+        par_p1,
+        StepShape(batch=16, rows_per_seq=1, context=8192),
+        opts_fp8,
     )
     sf_mix = step_floor(
         geom,
@@ -450,10 +477,17 @@ def test_pcp_dcp_mutual_exclusion_and_mixed_step() -> None:
 
 def test_slice_topology_wraparound_and_d2d_ar_floor() -> None:
     """Verify slice topology torus hop counts, wraparound, and D2D all-reduce floors."""
-    assert set(TOPOLOGIES) == {"2x2x1", "2x2x2", "2x2x4", "2x4x4", "4x4x4"}
+    assert set(TOPOLOGIES) == {
+        "2x2x1",
+        "2x2x2",
+        "2x2x4",
+        "2x4x4",
+        "4x4x4",
+    }
     assert not TOPOLOGIES["2x2x4"].has_torus_wraparound
     assert not TOPOLOGIES["2x4x4"].has_torus_wraparound
     assert TOPOLOGIES["4x4x4"].has_torus_wraparound
+
     chip = CHIPS["tpu7x"]
     t_d2d = torus_collective_s("ar", 32 * 1024, (2, 1, 1, 1), chip, TOPOLOGIES["2x2x1"])
     t_host = torus_collective_s(
@@ -463,6 +497,8 @@ def test_slice_topology_wraparound_and_d2d_ar_floor() -> None:
         "ar", 32 * 1024, (2, 1, 1, 4), chip, TOPOLOGIES["2x2x4"]
     )
     assert 0.0 < t_d2d < t_host < t_strided
+
+    # Identical 8-rank submesh (2, 1, 1, 4): wrapped 4x4x4 gets 2 lanes vs 1.
     open_z4 = torus_collective_s(
         "ar", 64 * 1024 * 1024, (2, 1, 1, 4), chip, TOPOLOGIES["2x2x4"]
     )
@@ -470,6 +506,8 @@ def test_slice_topology_wraparound_and_d2d_ar_floor() -> None:
         "ar", 64 * 1024 * 1024, (2, 1, 1, 4), chip, TOPOLOGIES["4x4x4"]
     )
     assert wrap_z4 < open_z4
+
+    # EP128 on 4x4x4 with TP8 submesh (2, 4, 1, 1) packs EP against (2, 4, 4, 4).
     par_ep128 = Parallel(
         tp=8, dp=16, moe="ep", ep=128, moe_dispatch="ag_ep", mesh_axes=(2, 4, 1, 1)
     )
@@ -494,7 +532,7 @@ def test_slice_topology_wraparound_and_d2d_ar_floor() -> None:
         if c.group > 1
     )
     assert exp_chain_128 > 0.0
-    assert sf_128.chain_s == pytest.approx(exp_chain_128, rel=1e-06)
+    assert sf_128.chain_s == pytest.approx(exp_chain_128, rel=1e-6)
     assert submesh_for_group(128, TOPOLOGIES["4x4x4"], 2, (2, 4, 1, 1)) == (2, 4, 4, 4)
     with pytest.raises(ValueError, match="exceeds topology"):
         submesh_for_group(64, TOPOLOGIES["2x2x2"], 2)
@@ -525,7 +563,7 @@ def test_spec_cycle_verify_writes_state_once() -> None:
     gdn_cyc = next(m for m in cyc.modules if m.name == "gdn")
     gdn_once = next(m for m in ver_once.modules if m.name == "gdn")
     gdn_k1 = next(m for m in ver_k1.modules if m.name == "gdn")
-    assert gdn_cyc.hbm_bytes == pytest.approx(gdn_once.hbm_bytes, abs=1e-06)
+    assert gdn_cyc.hbm_bytes == pytest.approx(gdn_once.hbm_bytes, abs=1e-6)
     assert gdn_cyc.hbm_bytes < gdn_k1.hbm_bytes
 
 
@@ -588,6 +626,7 @@ def test_mla_and_ple_missing_field_validations() -> None:
             StepShape(batch=1, rows_per_seq=1),
             EXAMPLE_FP8_DTYPES,
         )
+
     bad_ple = ModelGeometry(
         hidden=4096,
         num_layers=2,
@@ -625,12 +664,14 @@ def test_hf_loader_dtype_validations() -> None:
     expected_fp32_state = 4.0
     with pytest.raises(ValueError, match="dtype"):
         rf.dtypes_from_hf_config({"hidden_size": 4096})
+
     dt_q_default = rf.dtypes_from_hf_config(
         {"quantization_config": {"quant_method": "fp8"}}
     )
     assert dt_q_default.w_dense == expected_w_dense
     assert dt_q_default.lm_head == expected_lm_head
     assert dt_q_default.state == pytest.approx(expected_fp32_state)
+
     dt_awq = rf.dtypes_from_hf_config(
         {
             "dtype": "bfloat16",
@@ -644,15 +685,24 @@ def test_hf_loader_dtype_validations() -> None:
     )
     assert dt_awq.act == "a16"
     assert dt_awq.state == pytest.approx(expected_fp32_state)
+
     with pytest.raises(ValueError, match="Unknown base dtype"):
         rf.dtypes_from_hf_config({"dtype": "unknown_type"})
+
     with pytest.raises(ValueError, match="group_size"):
         rf.dtypes_from_hf_config(
-            {"dtype": "bfloat16", "quantization_config": {"bits": 4}}
+            {
+                "dtype": "bfloat16",
+                "quantization_config": {"bits": 4},
+            }
         )
+
     with pytest.raises(ValueError, match="scale_bytes"):
         rf.dtypes_from_hf_config(
-            {"dtype": "bfloat16", "quantization_config": {"bits": 4, "group_size": 32}}
+            {
+                "dtype": "bfloat16",
+                "quantization_config": {"bits": 4, "group_size": 32},
+            }
         )
 
 
@@ -668,8 +718,8 @@ def test_serving_plan_dp_chip_normalization() -> None:
         ServingRequest(context=512, concurrencies=[1]),
     )
     c1 = rows_dp2[0]
-    expected = 1 * 1.0 / (c1.hard_floor_ms / 1000.0) / 1.0
-    assert c1.output_tput_ceil_per_chip == pytest.approx(expected, rel=1e-06)
+    expected = (1 * 1.0) / (c1.hard_floor_ms / 1e3) / 1.0
+    assert c1.output_tput_ceil_per_chip == pytest.approx(expected, rel=1e-6)
 
 
 def test_topology_none_uses_torus_collective_schedule() -> None:
@@ -691,7 +741,7 @@ def test_topology_none_uses_torus_collective_schedule() -> None:
         for c in m.collectives
         if c.group > 1
     )
-    assert sf_none.chain_s == pytest.approx(expected_chain_s, rel=1e-09)
+    assert sf_none.chain_s == pytest.approx(expected_chain_s, rel=1e-9)
 
 
 def test_block_parallel_and_multilayer_mtp_draft_cost() -> None:
@@ -716,6 +766,7 @@ def test_block_parallel_and_multilayer_mtp_draft_cost() -> None:
     exp_mtp_inter = 6144
     assert geom_bp.block_parallel == exp_block_parallel
     assert geom_bp.mtp_inter == exp_mtp_inter
+
     par = Parallel(tp=8)
     dt = Dtypes()
     opts_dt = FloorOptions(dt=dt)
@@ -726,23 +777,34 @@ def test_block_parallel_and_multilayer_mtp_draft_cost() -> None:
         sum(m.n_collectives for m in mods_seq) - sum(m.n_collectives for m in mods_bp)
         == exp_coll_diff
     )
+
     spec = SpecShape(batch=4, context=2048, k=2)
     cyc_dense_mtp = spec_cycle_floor(geom_bp, CHIPS["tpu7x"], par, spec, opts_dt)
     cyc_moe_mtp = spec_cycle_floor(
-        replace(geom_bp, mtp_inter=0), CHIPS["tpu7x"], par, spec, opts_dt
+        replace(geom_bp, mtp_inter=0),
+        CHIPS["tpu7x"],
+        par,
+        spec,
+        opts_dt,
     )
     assert any(m.name == "draft_mlp" for m in cyc_dense_mtp.modules)
     assert not any(m.name == "draft_moe" for m in cyc_dense_mtp.modules)
     assert any(m.name == "draft_moe" for m in cyc_moe_mtp.modules)
+
     cyc_mtp1 = spec_cycle_floor(
-        replace(geom_bp, mtp_layers=1), CHIPS["tpu7x"], par, spec, opts_dt
+        replace(geom_bp, mtp_layers=1),
+        CHIPS["tpu7x"],
+        par,
+        spec,
+        opts_dt,
     )
     draft_mlp_2 = next(m for m in cyc_dense_mtp.modules if m.name == "draft_mlp")
     draft_mlp_1 = next(m for m in cyc_mtp1.modules if m.name == "draft_mlp")
     draft_fc_2 = next(m for m in cyc_dense_mtp.modules if m.name == "draft_fc")
     draft_fc_1 = next(m for m in cyc_mtp1.modules if m.name == "draft_fc")
-    assert draft_mlp_2.hbm_bytes == pytest.approx(draft_mlp_1.hbm_bytes, rel=1e-09)
-    assert draft_fc_2.hbm_bytes == pytest.approx(draft_fc_1.hbm_bytes, rel=1e-09)
+    assert draft_mlp_2.hbm_bytes == pytest.approx(draft_mlp_1.hbm_bytes, rel=1e-9)
+    assert draft_fc_2.hbm_bytes == pytest.approx(draft_fc_1.hbm_bytes, rel=1e-9)
+
     seq_layout = SeqKvLayout(1, 1024)
     bd_mtp2 = rf.hbm_breakdown_per_core_bytes(geom_bp, dt, par, seq_layout)
     bd_mtp1 = rf.hbm_breakdown_per_core_bytes(
@@ -751,13 +813,245 @@ def test_block_parallel_and_multilayer_mtp_draft_cost() -> None:
     bd_mtp0 = rf.hbm_breakdown_per_core_bytes(
         replace(geom_bp, mtp_layers=0), dt, par, seq_layout
     )
-    assert bd_mtp2.weights - bd_mtp0.weights == pytest.approx(
-        2.0 * (bd_mtp1.weights - bd_mtp0.weights), rel=1e-09
+    assert (bd_mtp2.weights - bd_mtp0.weights) == pytest.approx(
+        2.0 * (bd_mtp1.weights - bd_mtp0.weights), rel=1e-9
     )
+
     bd_moe = rf.hbm_breakdown_per_core_bytes(
         replace(geom_bp, mtp_inter=0), dt, par, seq_layout
     )
     assert bd_mtp2.weights < bd_moe.weights
+
+
+def test_bound_never_exceeds_estimate_across_families() -> None:
+    """Verify cut/unpadded bounds stay <= step resource times and estimates."""
+    chip = CHIPS["tpu7x"]
+    chip_hi = replace(chip, ici_hop_latency_s=100.0e-6)
+    mla_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 16,
+        "layer_types": ["mla"] * 16,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "q_lora_rank": 1024,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "intermediate_size": 8192,
+        "vocab_size": 32000,
+    }
+    dense_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "intermediate_size": 12288,
+        "vocab_size": 32000,
+    }
+    cases = (
+        (
+            from_hf_config(QWEN35_CFG),
+            Parallel(tp=8, moe="ep", moe_dispatch="ag_ep"),
+            StepShape(batch=8, rows_per_seq=1, context=8192),
+            rf.dtypes_from_hf_config(QWEN35_CFG),
+        ),
+        (
+            from_hf_config(dense_cfg),
+            Parallel(tp=8),
+            StepShape(batch=8, rows_per_seq=1, context=4096),
+            Dtypes(),
+        ),
+        (
+            from_hf_config(mla_cfg),
+            Parallel(tp=8),
+            StepShape(batch=8, rows_per_seq=1, context=4096),
+            Dtypes(kv=1.0),
+        ),
+    )
+    topo = TOPOLOGIES["2x2x1"]
+    for geom, par, shape, dt in cases:
+        sf = step_floor(geom, chip, par, shape, FloorOptions(dt=dt, topology=topo))
+        sf_hi = step_floor(
+            geom, chip_hi, par, shape, FloorOptions(dt=dt, topology=topo)
+        )
+        assert sf.hbm_bound_s <= sf.hbm_s + 1e-12
+        assert sf.matmul_bound_s <= sf.matmul_s + 1e-12
+        assert sf.coll_bound_s <= sf.chain_s + 1e-12
+        assert sf.hard_floor_s == pytest.approx(
+            max(sf.hbm_bound_s, sf.matmul_bound_s, sf.vpu_bound_s, sf.coll_bound_s),
+            rel=1e-12,
+        )
+        assert sf.hard_floor_s <= sf.serial_estimate_s + 1e-12
+        assert sf_hi.hard_floor_s >= sf.hard_floor_s - 1e-12
+        if sf.lat_s > 0.0:
+            assert sf_hi.latency_assumed_s > sf.latency_assumed_s
+
+
+def test_single_expert_routing_cannot_beat_bound() -> None:
+    """Verify best-case single-expert routing time at batch 8 is >= hard_floor_s."""
+    geom = from_hf_config(QWEN35_CFG)
+    chip = CHIPS["tpu7x"]
+    dt = rf.dtypes_from_hf_config(QWEN35_CFG)
+    shape = StepShape(batch=8, rows_per_seq=1, context=90036)
+    sf = step_floor(
+        geom,
+        chip,
+        Parallel(tp=8),
+        shape,
+        FloorOptions(dt=dt, topology=TOPOLOGIES["2x2x1"]),
+    )
+    single_expert_hbm_s = sum(m.strict_hbm_bytes for m in sf.modules) / chip.hbm_bw
+    assert single_expert_hbm_s == pytest.approx(0.004269709145945946, rel=1e-9)
+    assert single_expert_hbm_s >= sf.hard_floor_s - 1e-15
+    # Concentrated top-10 routing at batch=8 pads each active expert
+    # to 32 FP8 LHS rows (4x).
+    expected_matmul_bound_s = (
+        sum(m.strict_fp8_flops for m in sf.modules) / chip.fp8_flops
+        + sum(m.strict_bf16_flops for m in sf.modules) / chip.bf16_flops
+    )
+    assert sf.matmul_bound_s == pytest.approx(expected_matmul_bound_s, rel=1e-9)
+    unpadded_matmul_bound_s = 6.861009232900433e-05
+    assert sf.matmul_bound_s > unpadded_matmul_bound_s
+
+
+def test_bound_never_exceeds_estimate_without_topology() -> None:
+    """Verify topology=None keeps chain_s and serial_estimate_s above cut bounds."""
+    chip = CHIPS["tpu7x"]
+    par = Parallel(tp=8, ar_algo="two_shot")
+    shape = StepShape(batch=28, rows_per_seq=4, context=0)
+    dense_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 60,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "intermediate_size": 12288,
+        "vocab_size": 32000,
+    }
+    for cfg in (dense_cfg, QWEN35_CFG):
+        sf = step_floor(
+            from_hf_config(cfg), chip, par, shape, FloorOptions(dt=Dtypes())
+        )
+        assert sf.coll_bound_s <= sf.chain_s
+        assert sf.hard_floor_s <= sf.serial_estimate_s
+
+
+def test_hf_loader_weight_only_and_local_path_fail_closed(
+    tmp_path: Path,
+) -> None:
+    """Verify weight-only quant defaults to a16 and missing local paths fail fast."""
+    dt_ct_w8 = rf.dtypes_from_hf_config(
+        {
+            "torch_dtype": "bfloat16",
+            "quantization_config": {
+                "quant_method": "compressed-tensors",
+                "config_groups": {
+                    "group_0": {
+                        "weights": {"num_bits": 8, "type": "int"},
+                        "input_activations": None,
+                    }
+                },
+            },
+        }
+    )
+    assert dt_ct_w8.act == "a16"
+    missing_json = tmp_path / "missing" / "config.json"
+    with pytest.raises(FileNotFoundError, match="Could not resolve HF config path"):
+        rf.load_hf_config(str(missing_json), offline=False)
+
+
+def test_partition_pp_layers_rejects_infeasible_disagg_hybrid() -> None:
+    """Verify disagg PP partitioning rejects hybrid models with too few full layers."""
+    hybrid_end_cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 6,
+        "layer_types": [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "full_attention",
+        ],
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "linear_num_key_heads": 8,
+        "linear_num_value_heads": 16,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "intermediate_size": 4096,
+        "vocab_size": 32000,
+    }
+    geom = from_hf_config(hybrid_end_cfg)
+    with pytest.raises(ValueError, match="full-attention"):
+        partition_pp_layers(geom, Dtypes(), Parallel(tp=1, pp=3), disagg=True)
+
+
+def test_load_hf_config_offline_hub_cache_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify load_hf_config resolves from local HF_HUB_CACHE offline snapshot."""
+    snapshot_dir = (
+        tmp_path / "models--TestOrg--TestModel" / "snapshots" / "test_snapshot_hash"
+    )
+    snapshot_dir.mkdir(parents=True)
+    cfg_file = snapshot_dir / "config.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "model_type": "qwen2",
+                "hidden_size": 2048,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 16,
+                "intermediate_size": 5632,
+                "num_hidden_layers": 28,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    loaded = load_hf_config("TestOrg/TestModel", offline=True)
+    assert loaded["model_type"] == "qwen2"
+    expected_hidden_size = 2048
+    assert loaded["hidden_size"] == expected_hidden_size
+
+
+def test_load_hf_config_rejects_multi_segment_relative_path() -> None:
+    """Verify load_hf_config rejects relative paths with != 2 segments as repo IDs."""
+    with pytest.raises(FileNotFoundError):
+        load_hf_config("foo/bar/baz")
+    with pytest.raises(FileNotFoundError):
+        load_hf_config("single_segment")
+    with pytest.raises(FileNotFoundError):
+        load_hf_config("./relative/path/config.json")
+
+
+def test_serving_plan_divides_by_ranks_per_chip() -> None:
+    """Verify serving.plan normalizes chip count by parallel.ranks_per_chip."""
+    geom = from_hf_config(QWEN35_CFG)
+    chip = CHIPS["tpu7x"]
+    req = ServingRequest(context=512, concurrencies=[1])
+    rows_r1 = plan(
+        geom,
+        chip,
+        Parallel(tp=2, dp=2, ranks_per_chip=1),
+        Dtypes(),
+        req,
+    )
+    rows_r2 = plan(
+        geom,
+        chip,
+        Parallel(tp=2, dp=2, ranks_per_chip=2),
+        Dtypes(),
+        req,
+    )
+    assert rows_r2[0].output_tput_ceil_per_chip == pytest.approx(
+        rows_r1[0].output_tput_ceil_per_chip * 2.0, rel=1e-6
+    )
 
 
 def test_coll_bound_is_the_cut_bound_sum() -> None:
@@ -853,3 +1147,18 @@ def test_strict_counts_ignore_kernel_row_tile() -> None:
         values = [getattr(floors_dense[tile], field_name) for tile in (1, 256, 512)]
         assert values[0] == pytest.approx(values[1], rel=1e-12)
         assert values[1] == pytest.approx(values[2], rel=1e-12)
+
+
+def test_vpu_floor_and_lhs_row_tiles_bound_step() -> None:
+    """Verify vpu_bound_s and padded LHS row tiles bound the step floor."""
+    geom = from_hf_config(QWEN35_CFG)
+    chip = CHIPS["tpu7x"]
+    par = Parallel(tp=8)
+    shape = StepShape(batch=1, rows_per_seq=1, context=0)
+    sf = step_floor(geom, chip, par, shape, FloorOptions(dt=EXAMPLE_FP8_DTYPES))
+    assert sf.vpu_s > 0.0
+    assert sf.vpu_bound_s > 0.0
+    assert sf.hard_floor_s >= sf.vpu_bound_s - 1e-12
+    moe_mod = next(m for m in sf.modules if m.name == "moe")
+    assert moe_mod.strict_fp8_flops > 0.0
+    assert moe_mod.strict_vpu_flops > 0.0
