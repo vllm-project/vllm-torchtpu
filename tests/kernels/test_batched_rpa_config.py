@@ -226,6 +226,6 @@ def test_calculate_block_sizes_shrinks_bq_when_page_aligned_bkv_does_not_fit():
             model_cfg, serve_cfg, 64 * 1024 * 1024
         )
     assert prefill_blocks.bkv_sz == 512
-    assert prefill_blocks.bq_sz == 256
+    assert prefill_blocks.bq_sz == 128
     assert prefill_blocks.batch_size == 1
     assert decode_blocks.bkv_sz % 512 == 0

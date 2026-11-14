@@ -384,9 +384,12 @@ def calculate_block_sizes(
         # intra-page offset, so bkv_sz must be a page multiple in every layout.
         # TODO(kyuyeunk): Reduce granularity to lane size for SEQ_ALONG_LANE.
         bkv_default = utils.align_to(bkv_default, serve_cfgs.page_size)
+        # Page alignment can raise bkv_sz above the MXU width. bq has no page
+        # constraint, so scale it down to keep the QK tile at MXU x MXU.
+        bq_default = max(1, mxu_column_size * mxu_column_size // bkv_default)
         bkv_sz = bkv_stride = bkv_default
         if fixed_bq_sz is None:
-            bq_sz = bq_stride = bkv_sz
+            bq_sz = bq_stride = bq_default
         else:
             bq_sz = fixed_bq_sz
             bq_stride = 0
@@ -409,14 +412,6 @@ def calculate_block_sizes(
         # zero, it will trigger infinite loop at the next while loop.
         if batch_size == 0:
             raise ValueError("Cannot find batch size that fits within VMEM limit.")
-
-        if fixed_bq_sz is None:
-            while (
-                bq_sz > mxu_column_size
-                and calculate_vmem_usage(batch_size, bq_sz, bkv_sz)
-                > capped_vmem_limit_bytes
-            ):
-                bq_sz = max(mxu_column_size, bq_sz - mxu_column_size)
 
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
