@@ -60,7 +60,7 @@ def _routing(m, valid, case):
     return jnp.asarray(ids, jnp.int32), jnp.asarray(weights, jnp.bfloat16)
 
 
-def _run(tensors, monkeypatch, m, valid, case, activation, ep):
+def _run(tensors, monkeypatch, m, valid, case, activation, ep, kernel_name=None):
     w1, w2, s1, s2 = tensors
     x = jax.random.normal(jax.random.key(m), (m, w1.shape[1]), jnp.bfloat16)
     ids, weights = _routing(m, valid, case)
@@ -81,10 +81,8 @@ def _run(tensors, monkeypatch, m, valid, case, activation, ep):
     wrapper.fused_moe_func.clear_cache()
     try:
         actual = np.asarray(wrapper.fused_moe_func(*args, **kwargs), np.float32)
-        assert (
-            "dense_expert_moe_fp4-e_"
-            in wrapper.fused_moe_func.lower(*args, **kwargs).as_text()
-        )
+        hlo = wrapper.fused_moe_func.lower(*args, **kwargs).as_text()
+        assert (kernel_name or "dense_expert_moe_fp4-e_") in hlo
     finally:
         wrapper.fused_moe_func.clear_cache()
     return actual, expected
@@ -125,7 +123,16 @@ def test_short_rings(tensors, monkeypatch, num_buffers):
     monkeypatch.setattr(kernel, "_MAX_FP4_EXPERT_BUFFERS", num_buffers)
     kernel.dense_expert_moe_fp4.clear_cache()
     try:
-        actual, expected = _run(tensors, monkeypatch, 24, 24, "mixed", "silu", False)
+        actual, expected = _run(
+            tensors,
+            monkeypatch,
+            24,
+            24,
+            "mixed",
+            "silu",
+            False,
+            kernel_name=f"-buffers_{num_buffers}",
+        )
     finally:
         kernel.dense_expert_moe_fp4.clear_cache()
     _check(actual, expected, 24)

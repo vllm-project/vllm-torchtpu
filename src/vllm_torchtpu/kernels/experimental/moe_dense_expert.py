@@ -335,7 +335,8 @@ def _select_fp4_expert_buffers(m, h, i, experts, bk1, bk2, vmem_capacity_bytes):
 
     Two slots are the minimum: the software pipeline holds the expert being
     finished and the next one at once."""
-    fixed_bytes = m * h * (2 + 2 + 4) + m * pl.cdiv(experts, 128) * 128 * 4
+    # Rows in, padded rows, out (bf16) and the f32 accumulator; the route table.
+    fixed_bytes = m * h * (2 + 2 + 2 + 4) + m * pl.cdiv(experts, 128) * 128 * 4
     # The pipeline keeps two experts' [m, 2i] f32 gate_up accumulators live.
     fixed_bytes += 2 * m * 2 * i * 4
     budget = vmem_capacity_bytes * 4 // 5
@@ -389,9 +390,11 @@ def can_use_dense_expert_fp4(
 
 
 def _kernel_fp4(
-    active_ref,
+    ids_smem,
+    wts_smem,
     x_ref,
-    coeff_ref,
+    ids_ref,
+    wts_ref,
     w1_hbm,
     w2_hbm,
     s1_hbm,
@@ -401,7 +404,10 @@ def _kernel_fp4(
     w2_ref,
     s1_ref,
     s2_ref,
+    xp_ref,
+    coeff_ref,
     owner_ref,
+    seen_ref,
     active_ids_ref,
     sem_ref,
     *,
@@ -414,8 +420,20 @@ def _kernel_fp4(
     bk2,
     activation,
 ):
+    num_tokens, topk = ids_ref.shape
     owner_ref[...] = jnp.zeros((m, h), jnp.float32)
+    # The route table [m, experts] and the rows padded to m are built here, so
+    # no XLA op runs between the router and this kernel.
+    xp_ref[...] = jnp.zeros((m, h), jnp.bfloat16)
+    xp_ref[:num_tokens] = x_ref[...]
     expert_columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
+    route_columns = lax.broadcasted_iota(jnp.int32, (num_tokens, coeff_ref.shape[1]), 1)
+    ids, wts = ids_ref[...], wts_ref[...]
+    table = jnp.zeros((num_tokens, coeff_ref.shape[1]), jnp.float32)
+    for r in range(topk):
+        table += jnp.where(route_columns == ids[:, r : r + 1], wts[:, r : r + 1], 0.0)
+    coeff_ref[...] = jnp.zeros(coeff_ref.shape, jnp.float32)
+    coeff_ref[:num_tokens] = table
     act_fn = _FP4_ACTIVATIONS[activation]
     down_cols = _down_cols(h, pltpu.get_tpu_info().num_lanes)
 
@@ -427,7 +445,7 @@ def _kernel_fp4(
         for b in range(h // bk1):
             rhs = w1_ref[slot, b * bk1 : (b + 1) * bk1, :].astype(_FP8)
             part = jnp.matmul(
-                x_ref[:, b * bk1 : (b + 1) * bk1],
+                xp_ref[:, b * bk1 : (b + 1) * bk1],
                 rhs,
                 preferred_element_type=jnp.float32,
             )
@@ -455,14 +473,29 @@ def _kernel_fp4(
             # Zero routing must suppress even non-finite unused expert outputs.
             owner_ref[:, n : n + down_cols] += jnp.where(coeff != 0, down * coeff, 0)
 
-    def compact(e, count):
-        @pl.when(active_ref[e] != 0)
+    # Active experts in route order: one pass over the routes (at most
+    # tokens x top-k), not over every expert.
+    def clear(e, carry):
+        seen_ref[e] = 0
+        return carry
+
+    lax.fori_loop(0, experts, clear, 0, unroll=8)
+
+    def scan(j, count):
+        e = ids_smem[j]
+        # The range test keeps an out-of-contract id from indexing past SMEM
+        # or DMAing past the weights.
+        new = jnp.logical_and(jnp.logical_and(e >= 0, e < experts), wts_smem[j] != 0)
+        new = jnp.logical_and(new, seen_ref[jnp.clip(e, 0, experts - 1)] == 0)
+
+        @pl.when(new)
         def record():
+            seen_ref[e] = 1
             active_ids_ref[count] = e
 
-        return count + (active_ref[e] != 0).astype(jnp.int32)
+        return count + new.astype(jnp.int32)
 
-    count = lax.fori_loop(0, experts, compact, jnp.int32(0))
+    count = lax.fori_loop(0, num_tokens * topk, scan, jnp.int32(0))
 
     def transfers(step):
         e, slot = active_ids_ref[step], step % num_buffers
@@ -506,7 +539,7 @@ def _kernel_fp4(
         acc = lax.fori_loop(0, count - 1, expert_body, gate_up(0))
         finish(active_ids_ref[count - 1], (count - 1) % num_buffers, acc)
 
-    out_ref[...] = owner_ref[...].astype(jnp.bfloat16)
+    out_ref[...] = owner_ref[:num_tokens].astype(jnp.bfloat16)
 
 
 @functools.partial(jax.jit, static_argnames=("activation",))
@@ -515,28 +548,23 @@ def dense_expert_moe_fp4(
 ):
     """Local routed contribution of FP4 experts, [tokens, hidden] bf16 as GMM.
 
-    IDs outside this rank must be -1. Callers must first check
-    can_use_dense_expert_fp4. Shared experts and collectives stay outside.
+    IDs must lie in [-1, experts): -1 marks a route to another rank. Callers
+    must first check can_use_dense_expert_fp4. Shared experts and collectives
+    stay outside.
     """
     num_tokens, h = hidden.shape
     experts, i, _ = w2.shape
     bk1, bk2 = h // s1.shape[1], i // s2.shape[1]
-    # bf16 rows tile by 16; padded rows carry no route and stay zero.
+    # bf16 rows tile by 16; the kernel pads the rows, which carry no route.
     m = pl.cdiv(num_tokens, 16) * 16
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     num_buffers = _select_fp4_expert_buffers(
         m, h, i, experts, bk1, bk2, vmem_capacity_bytes
     )
-    expert_ids = jnp.arange(experts, dtype=jnp.int32)[None, :]
     weights = topk_weights.astype(jnp.float32)
-    coeff = jnp.zeros((num_tokens, experts), jnp.float32)
-    for route in range(local_ids.shape[1]):
-        selected = local_ids[:, route : route + 1] == expert_ids
-        coeff = coeff + selected.astype(jnp.float32) * weights[:, route : route + 1]
-    active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
-    coeff = jnp.pad(coeff, ((0, m - num_tokens), (0, (-experts) % 128)))
-    hidden = jnp.pad(hidden, ((0, m - num_tokens), (0, 0)))
-    out = pl.pallas_call(
+    # The routes go to SMEM as 2 x tokens x top-k words: 256 KiB at 8192
+    # tokens x top-8, within SMEM at any decode-sized token threshold.
+    return pl.pallas_call(
         functools.partial(
             _kernel_fp4,
             m=m,
@@ -548,10 +576,11 @@ def dense_expert_moe_fp4(
             bk2=bk2,
             activation=activation,
         ),
-        out_shape=jax.ShapeDtypeStruct((m, h), jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, h), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=2,
             in_specs=[
+                pl.BlockSpec(memory_space=pltpu.VMEM),
                 pl.BlockSpec(memory_space=pltpu.VMEM),
                 pl.BlockSpec(memory_space=pltpu.VMEM),
                 *[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
@@ -562,15 +591,28 @@ def dense_expert_moe_fp4(
                 pltpu.VMEM((num_buffers, i, h), _FP4),
                 pltpu.VMEM((num_buffers, h // bk1, 1, 2 * i), jnp.float32),
                 pltpu.VMEM((num_buffers, i // bk2, 1, h), jnp.float32),
+                pltpu.VMEM((m, h), jnp.bfloat16),
+                pltpu.VMEM((m, pl.cdiv(experts, 128) * 128), jnp.float32),
                 pltpu.VMEM((m, h), jnp.float32),
+                pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((num_buffers, 4)),
             ],
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_capacity_bytes),
         name=(
-            f"dense_expert_moe_fp4-e_{experts}-m_{m}-h_{h}-i_{i}-bk_{bk1}_{bk2}"
+            f"dense_expert_moe_fp4-e_{experts}-t_{num_tokens}-m_{m}-h_{h}-i_{i}"
+            f"-bk_{bk1}_{bk2}"
             f"-act_{activation}-buffers_{num_buffers}"
         ),
-    )(active, hidden, coeff, w1, w2, s1, s2)
-    return out[:num_tokens]
+    )(
+        local_ids.reshape(-1),
+        weights.reshape(-1),
+        hidden,
+        local_ids,
+        weights,
+        w1,
+        w2,
+        s1,
+        s2,
+    )
