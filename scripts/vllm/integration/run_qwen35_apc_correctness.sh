@@ -79,7 +79,8 @@ python3 "$HERE/smoke_prefix_cache_correctness.py" \
 # holding that same prompt's state and a missing restore stays invisible. This
 # interleaves two prefixes so the slot always carries the wrong one.
 python3 "$HERE/smoke_mamba_state_contamination.py" \
-  --host localhost --port "$PORT" --model "$MODEL"
+  --host localhost --port "$PORT" --model "$MODEL" \
+  --logprob-atol "${PREFIX_E2E_DIVERGENCE_LOGPROB_ATOL:-1e-2}"
 
 # A run that never hit the cache would pass both smokes vacuously.
 hits=$(curl -sf "localhost:$PORT/metrics" |
