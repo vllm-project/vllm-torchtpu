@@ -1199,7 +1199,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
         if self._has_active_pooled_pcp_state(kv_cache):
             assert kv_cache is not None
@@ -1212,9 +1211,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 attn_metadata,
             )
 
-        # ============================================================
-        # Part 1: Input Projection
-        # ============================================================
+        mixed_qkv, z, b, a = self._project_inputs(hidden_states)
+        return self.forward_projected(mixed_qkv, z, b, a)
+
+    def _project_inputs(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Part 1, the input projection: (mixed_qkv, z, b, a)."""
         if hasattr(self, "in_proj_qkv"):
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
@@ -1237,6 +1240,22 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
             a = a.contiguous()
+        return mixed_qkv, z, b, a
+
+    def forward_projected(
+        self,
+        mixed_qkv: torch.Tensor,
+        z: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+    ) -> torch.Tensor:
+        """Parts 2 and 3, given _project_inputs' outputs."""
+        num_tokens = mixed_qkv.size(0)
+        kv_cache = self.kv_cache
+        if self._has_active_pooled_pcp_state(kv_cache):
+            raise NotImplementedError(
+                "forward_projected does not support pooled PCP; use forward."
+            )
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)

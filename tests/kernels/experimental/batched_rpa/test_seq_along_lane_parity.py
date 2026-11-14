@@ -213,3 +213,90 @@ def test_return_lse_preserves_gqa_heads(kv_layout, q_heads_per_kv):
     np.testing.assert_allclose(
         np.asarray(lse, np.float32), expected_lse, atol=4e-2, rtol=1e-2
     )
+
+
+@pytest.mark.parametrize("kv_layout", list(configs.KVLayout))
+@pytest.mark.parametrize("q_heads_per_kv", [3, 10])
+def test_prepared_inputs_and_raw_output_match_default(kv_layout, q_heads_per_kv):
+    """prepared_inputs + return_raw_output reproduce the default call exactly."""
+    rng = np.random.default_rng(0)
+    q_lens = (1, 3, 2)
+    starts = np.cumsum((0, *q_lens)).astype(np.int32)
+    num_kv_heads, head_dim, page_size = 2, 128, 128
+    num_q_heads = num_kv_heads * q_heads_per_kv
+    num_tokens = sum(q_lens)
+
+    def random_array(shape, dtype):
+        return jnp.asarray(rng.normal(0, 0.5, shape), dtype)
+
+    query = random_array((num_tokens, num_q_heads, head_dim), jnp.bfloat16)
+    key = random_array((num_tokens, num_kv_heads, head_dim), jnp.float8_e4m3fn)
+    value = random_array((num_tokens, num_kv_heads, head_dim), jnp.float8_e4m3fn)
+    shape = wrapper.get_kv_cache_shape(
+        6, page_size, num_kv_heads, head_dim, key.dtype, kv_layout=kv_layout
+    )
+
+    def run(**kwargs):
+        return wrapper.ragged_paged_attention(
+            query,
+            key,
+            value,
+            jnp.zeros(shape, key.dtype),
+            jnp.asarray(q_lens, jnp.int32),
+            jnp.array([4, 0, 2, 5, 1, 3], jnp.int32),
+            jnp.asarray(starts),
+            jnp.array([1, 1, 3], jnp.int32),
+            sm_scale=head_dim**-0.5,
+            kv_layout=kv_layout,
+            **kwargs,
+        )
+
+    out, cache = run()
+    prepared = wrapper.prepare_inputs(
+        query,
+        key,
+        value,
+        query.dtype,
+        key.dtype,
+        kv_layout=kv_layout,
+        page_size=page_size,
+    )
+    raw, raw_cache = run(prepared_inputs=prepared, return_raw_output=True)
+
+    q_packing = 2  # bf16
+    aligned = -(-q_heads_per_kv // q_packing) * q_packing
+    assert raw.shape == (
+        num_kv_heads,
+        num_tokens,
+        aligned // q_packing,
+        q_packing,
+        head_dim,
+    )
+    got = wrapper.prepare_outputs(raw)[:, :, :q_heads_per_kv, :head_dim]
+    got = got.swapaxes(0, 1).reshape(query.shape)
+    np.testing.assert_array_equal(
+        np.asarray(got, np.float32), np.asarray(out, np.float32)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(raw_cache, np.float32), np.asarray(cache, np.float32)
+    )
+
+
+def test_prepared_inputs_rejects_dynamic_scales():
+    """Dynamic KV scales are applied by prepare_inputs, not alongside it."""
+    q = jnp.zeros((1, 2, 128), jnp.bfloat16)
+    kv = jnp.zeros((1, 1, 128), jnp.float8_e4m3fn)
+    shape = wrapper.get_kv_cache_shape(1, 128, 1, 128, kv.dtype)
+    with pytest.raises(ValueError, match="dynamic_k_scale"):
+        wrapper.ragged_paged_attention(
+            q,
+            kv,
+            kv,
+            jnp.zeros(shape, kv.dtype),
+            jnp.array([1], jnp.int32),
+            jnp.array([0], jnp.int32),
+            jnp.array([0, 1], jnp.int32),
+            jnp.array([1, 1, 1], jnp.int32),
+            prepared_inputs=(q, kv),
+            dynamic_k_scale=jnp.ones((1, 1), jnp.float32),
+        )

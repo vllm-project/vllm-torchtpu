@@ -509,6 +509,7 @@ def calculate_block_sizes(
         "attention_scope",
         "return_lse",
         "mask_invalid_v",
+        "return_raw_output",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -552,6 +553,8 @@ def ragged_paged_attention(
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
     mask_invalid_v: bool | None = None,
+    prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
+    return_raw_output: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -613,9 +616,19 @@ def ragged_paged_attention(
             matmul so NaNs in unused VMEM or shared new-KV pages cannot propagate via
             0.0 * NaN. Defaults to None (True for SEQ_ALONG_LANE, False for
             HEAD_ALONG_SUBLANE).
+        prepared_inputs: (q_hbm, new_kv_hbm), exactly as prepare_inputs returns
+            them for the same arguments. If set, queries/keys/values are used
+            only for their shapes and dtypes, and dynamic_k_scale /
+            dynamic_v_scale must be None (prepare_inputs applies them).
+        return_raw_output: If True, return the kernel's output buffer as is,
+            without prepare_outputs, slicing or reshaping.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
+            With return_raw_output=True, the kernel's buffer instead:
+            [num_kv_heads, max_num_tokens, q_per_kv // q_packing, q_packing,
+            head_dim], with q_per_kv and head_dim padded; the pad heads and
+            lanes are not meaningful.
         new_kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
             kv_packing, head_dim]. Result of new kv cache where k & vs are
             concatenated along num kv heads dim.
@@ -630,6 +643,13 @@ def ragged_paged_attention(
         raise ValueError("Specifying chunk prefill size is not supported.")
     if debug_mode:
         raise ValueError("Debug mode is not supported.")
+    if prepared_inputs is not None and (
+        dynamic_k_scale is not None or dynamic_v_scale is not None
+    ):
+        raise ValueError(
+            "prepared_inputs already has the KV scales applied by prepare_inputs;"
+            " dynamic_k_scale / dynamic_v_scale must be None."
+        )
 
     # update_kv_cache (as passed by tpu-inference) overrides skip_kv_update when
     # set; update_kv_cache=False (KV-share) is the same as skip_kv_update=True.
@@ -701,17 +721,20 @@ def ragged_paged_attention(
         mask_invalid_v=mask_invalid_v,
     )
 
-    q_hbm, new_kv_hbm = prepare_inputs(
-        queries,
-        keys,
-        values,
-        queries.dtype,
-        kv_cache.dtype,
-        k_scale_tensor,
-        v_scale_tensor,
-        kv_layout=kv_layout,
-        page_size=page_size,
-    )
+    if prepared_inputs is None:
+        q_hbm, new_kv_hbm = prepare_inputs(
+            queries,
+            keys,
+            values,
+            queries.dtype,
+            kv_cache.dtype,
+            k_scale_tensor,
+            v_scale_tensor,
+            kv_layout=kv_layout,
+            page_size=page_size,
+        )
+    else:
+        q_hbm, new_kv_hbm = prepared_inputs
 
     default_decode, default_prefill = calculate_block_sizes(
         model_cfgs,
@@ -838,14 +861,17 @@ def ragged_paged_attention(
         configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
     )
 
-    # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
-    o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
-    # after: [kv_heads, max_tokens, q_per_kv, d]
-
-    # slice back to original shape if padded
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
-    o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
-    o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
+    if return_raw_output:
+        o_hbm = o_hbm_alias_q_hbm
+    else:
+        # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
+        o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
+        # after: [kv_heads, max_tokens, q_per_kv, d]
+
+        # slice back to original shape if padded
+        o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
+        o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
 
     if not return_lse:
         return o_hbm, kv_cache
