@@ -43,6 +43,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
+    sequence_parallel_moe,
 )
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
     get_cpu_weight_loader_hook,
@@ -400,6 +401,7 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
             "rhs_quant_dtype": getattr(layer, "_rhs_quant_dtype", jnp.int4),
         }
         if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
+            with sequence_parallel_moe(layer):
+                return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)

@@ -93,6 +93,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
+    sequence_parallel_moe,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
@@ -1192,11 +1193,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         )
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
-            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-                topk_ids,
-                topk_weights,
-                is_local_tensor=owns_collectives,
-            )
+            with sequence_parallel_moe(layer):
+                topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                    topk_ids,
+                    topk_weights,
+                    is_local_tensor=owns_collectives,
+                )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
@@ -1215,7 +1217,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "activation": activation_str,
         }
         if owns_collectives:
-            return pipelined_fused_moe_gmm(**kwargs)
+            with sequence_parallel_moe(layer):
+                return pipelined_fused_moe_gmm(**kwargs)
 
         from vllm_torchtpu.layers.adapter.fused_moe_decode import (
             fused_moe_decode,

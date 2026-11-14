@@ -86,6 +86,7 @@ from vllm_torchtpu.layers.adapter.linear_common import quantized_matmul_fp4
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
+    sequence_parallel_moe,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
@@ -574,7 +575,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             "activation": activation_str,
         }
         if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
+            with sequence_parallel_moe(layer):
+                return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
 
