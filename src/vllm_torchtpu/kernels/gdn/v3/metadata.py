@@ -38,7 +38,12 @@ def compute_batched_seq_metadata(
     """
 
     max_seqs = seq_lens.size
-    all_seqs = jnp.arange(max_seqs)
+    # Each tile reads `cfg.seq_tile_size` entries of the per-tile tables, so
+    # the last tile reads up to cdiv(end_seq, tile) * tile - 1, past
+    # max_seqs - 1 when max_seqs is not a multiple of the tile. Pad those
+    # tables to whole tiles; a pad entry is empty (no rows, no state copy).
+    num_entries = pl.cdiv(max_seqs, cfg.seq_tile_size) * cfg.seq_tile_size
+    all_seqs = jnp.arange(num_entries)
 
     # NOTE: Only supports use case where query_lens[i] <= cfg.window_size where
     # i < end_seq. This must be guaranteed by the function caller.
@@ -47,6 +52,7 @@ def compute_batched_seq_metadata(
     is_valid_seqs = jnp.where(all_seqs < end_seq, True, False)
     has_initial_state = (seq_lens - query_lens) > 0
     all_valid_seqs = jnp.where(is_valid_seqs, all_seqs, 0)
+    query_lens = jnp.pad(query_lens, (0, num_entries - max_seqs))
 
     return memory_ref.MetadataRef.create(
         cfgs=cfg,

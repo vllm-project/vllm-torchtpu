@@ -68,10 +68,13 @@ class _ScalarRef:
 TABLE_NAMES = ("s_idx", "r_base", "r_size", "first", "last")
 
 
-def scratch_shapes(max_seqs: int, max_tokens: int) -> dict[str, Any]:
+def scratch_shapes(max_seqs: int, max_tokens: int,
+                   seq_tile_size: int) -> dict[str, Any]:
     """SMEM scratch for both passes' tables: the batched pass indexes its
-    tables by sequence (one tile entry per sequence), the per-sequence pass by
+    tables by sequence (one tile entry per sequence, padded to whole tiles of
+    `seq_tile_size`, which is what each tile reads), the per-sequence pass by
     tile (up to one per token)."""
+    num_b = pl.cdiv(max_seqs, seq_tile_size) * seq_tile_size
     d = {
         "tb_num_tiles": pltpu.SMEM((1, ), I32),
         "tp_num_tiles": pltpu.SMEM((1, ), I32),
@@ -81,7 +84,7 @@ def scratch_shapes(max_seqs: int, max_tokens: int) -> dict[str, Any]:
         "tp_read": pltpu.SMEM((max_seqs, ), I32)
     }
     for n in TABLE_NAMES:
-        d[f"tb_{n}"] = pltpu.SMEM((max_seqs, ), I32)
+        d[f"tb_{n}"] = pltpu.SMEM((num_b, ), I32)
         d[f"tp_{n}"] = pltpu.SMEM((max_tokens, ), I32)
     return d
 
@@ -110,6 +113,11 @@ def fill_and_wrap(qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref,
         return carry
 
     lax.fori_loop(0, jnp.where(end_b > 0, max_seqs, 0), body_b, jnp.int32(0))
+    # The last tile reads whole tiles of entries: the pad past max_seqs is
+    # empty (no rows, no state copy).
+    for s in range(max_seqs, sc["tb_s_idx"].shape[0]):
+        for n in TABLE_NAMES:
+            sc[f"tb_{n}"][s] = jnp.int32(0)
     sc["tb_num_tiles"][0] = pl.cdiv(end_b, cfg_b.tile_size)
 
     chunk = cfg_p.chunk_size

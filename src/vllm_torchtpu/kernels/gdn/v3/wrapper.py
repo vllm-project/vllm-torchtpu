@@ -774,7 +774,9 @@ def fused_conv1d_gdn(
         out_shape = cfg_b.get_out_shape()
         max_seqs = int(state_indices.shape[0])
         in_act = jnp.zeros_like(out_shape)
-        scratch = dict(_tik.scratch_shapes(max_seqs, padded_batch_size))
+        scratch = dict(
+            _tik.scratch_shapes(max_seqs, padded_batch_size,
+                                cfg_b.seq_tile_size))
         scratch.update(cfg_p.get_scratch_shape_dict())
         names = tuple(scratch)
         n_raw = 5

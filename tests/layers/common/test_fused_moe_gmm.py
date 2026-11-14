@@ -726,6 +726,48 @@ def _routing_reference(topk_indices,
             np.argsort(order, kind="stable").astype(np.int32))
 
 
+def _spy_counting_sort(monkeypatch):
+    """Record each call of the counting sort (which path routing took)."""
+    calls = []
+    counting_sort = fused_moe_gmm._counting_sort_positions
+
+    def spy(*args, **kwargs):
+        calls.append(args)
+        return counting_sort(*args, **kwargs)
+
+    monkeypatch.setattr(fused_moe_gmm, "_counting_sort_positions", spy)
+    return calls
+
+
+def _prepare_routed_small(seed=0):
+    num_tokens, topk, local_num_experts = 100, 8, 16
+    rng = np.random.default_rng(seed)
+    ids = rng.integers(-1, local_num_experts, size=(num_tokens, topk))
+    return fused_moe_gmm.prepare_routed_gmm_inputs(
+        jnp.ones((num_tokens, 4), jnp.float32),
+        jnp.asarray(ids, jnp.int32),
+        jnp.full((num_tokens, topk), 0.5, jnp.float32),
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=False)
+
+
+@pytest.mark.parametrize("value,expected", [(None, False), ("", False),
+                                            ("0", False), ("false", False),
+                                            ("1", True), ("true", True)])
+def test_routing_counting_sort_follows_the_flag(monkeypatch, value, expected):
+    """The routing reads USE_MOE_COUNTING_SORT through envs: off unless the
+    variable enables it, so an unset, empty or "0" variable keeps argsort."""
+    if value is None:
+        monkeypatch.delenv("USE_MOE_COUNTING_SORT", raising=False)
+    else:
+        monkeypatch.setenv("USE_MOE_COUNTING_SORT", value)
+    calls = _spy_counting_sort(monkeypatch)
+    _prepare_routed_small()
+    assert bool(calls) is expected
+
+
 # M = 800 exercises the block padding (800 % 512), which lands in the sentinel
 # bucket this caller discards.
 @pytest.mark.parametrize("counting_sort", [True, False])
@@ -734,6 +776,7 @@ def _routing_reference(topk_indices,
 def test_prepare_routed_metadata_matches_stable_sort(structure, counting_sort,
                                                      monkeypatch):
     monkeypatch.setattr(envs, "USE_MOE_COUNTING_SORT", counting_sort)
+    counting_sort_calls = _spy_counting_sort(monkeypatch)
     num_tokens, topk, local_num_experts, hidden = 100, 8, 16, 4
     rng = np.random.default_rng(0)
     if structure == "mixed":
@@ -760,6 +803,8 @@ def test_prepare_routed_metadata_matches_stable_sort(structure, counting_sort,
         use_ep=True,
         use_sparse_core=False)
 
+    # The path under test is the one the flag selects.
+    assert bool(counting_sort_calls) is counting_sort
     want_tokens, want_group_sizes, want_revert = _routing_reference(
         topk_indices, topk_weights, local_num_experts)
     np.testing.assert_array_equal(
