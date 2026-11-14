@@ -17,8 +17,10 @@ case packs into.
 
 ``--fixed-prompts`` makes repeat k's prompts the same token slices in every
 case, and each case records its first sampled tokens per repeat (with a
-checksum of every pool on rank 0), so two trees or two window sizes compare on
-the same text; ``--chain-prefix`` first computes a case's cached prefix in
+checksum of every pool on rank 0, and ``pool_digests``: every pool's digest of
+the blocks the step wrote, gathered from all ranks in an order independent of
+placement, ``pool_digest``), so two trees or two window sizes compare on the
+same text; ``--chain-prefix`` first computes a case's cached prefix in
 ``--chain-step`` token steps of its own, so the timed step reads real KV.
 ``--aggregate`` times the aggregate engine's prefill instead of the prefill
 role's: the decode program holds the EP16 experts and the prefill steps on
@@ -39,7 +41,7 @@ from contextlib import contextmanager
 
 import numpy as np
 
-from tools.megakernel import bench_moe, harness, k3
+from tools.megakernel import bench_moe, harness, k3, pool_digest
 
 
 def add_arguments(parser, profile: bool = False) -> None:
@@ -181,6 +183,51 @@ def _trace(directory: str, tag: str, last: bool):
     finally:
         profiler.stop_trace()
         harness.log(f"trace of {tag}: {path}")
+
+
+def _pool_digest(pools, tables, spans, prefiller) -> dict:
+    """``pool_digest.combine`` of the blocks a step wrote for requests
+    ``tables`` / ``spans`` (token ranges), gathered from every rank."""
+    import torch
+
+    from vllm_torchtpu.megakernel import bridge
+    from vllm_torchtpu.megakernel.kimi_k3 import pools as k3_pools
+
+    for tensor in pools.tensors:  # the step's writes, run on their own first
+        bridge.materialize(tensor)
+    mla, kda, mla_group = pool_digest.layers_of(
+        pools.tensors, pools.caches, pools.groups
+    )
+    state_rows = k3_pools.TOTAL_STATE_ROWS
+    if prefiller.ring is not None:  # the step also writes the draft rows
+        state_rows = k3_pools.DRAFT_ROW0 + k3_pools.DRAFT_ROWS
+    block = pools.tensors[0][0]
+    block_bytes = block.numel() * block.element_size()
+    held = pool_digest.regions(
+        tables,
+        spans,
+        mla=mla,
+        kda=kda,
+        mla_group=mla_group,
+        page=k3.PAGE,
+        dcp=k3.DCP,
+        cp_rank=prefiller.cp_rank,
+        page_bytes=block_bytes,
+        state_bytes=state_rows * block_bytes // pools.tensors[0].shape[1],
+    )
+
+    def read(pool, blocks):
+        ids = torch.tensor(blocks, dtype=torch.int32).to("tpu")
+        data = pools.tensors[pool].index_select(0, ids).cpu().view(torch.uint8)
+        return data.numpy().reshape(len(blocks), block_bytes)
+
+    gathered: list = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, pool_digest.units(held, read))
+    expected = pool_digest.expected_keys(
+        spans, mla=mla, kda=kda, page=k3.PAGE, dcp=k3.DCP
+    )
+    # Every rank combines the same units: a mismatch raises on all of them.
+    return pool_digest.combine(gathered, expected, len(pools.tensors))
 
 
 def run(args, records: harness.Records) -> None:
@@ -423,7 +470,7 @@ def run_prefill(args, records: harness.Records) -> None:
                 prefiller.program.capacity,
             )
         )
-        times, first_tokens = [], []
+        times, first_tokens, pool_digests = [], [], []
         for repeat in range(args.repeats + 1):  # the first is a warm-up of this shape
             if args.fixed_prompts:
                 seeds = [args.prompt_seed + 16 * repeat + r for r in range(count)]
@@ -480,6 +527,19 @@ def run_prefill(args, records: harness.Records) -> None:
                     f"fingerprint {tag} repeat {repeat}: tokens "
                     f"{first_tokens[-1]} pools {sums}"
                 )
+            if args.fixed_prompts:
+                spans = [(prefix, prefix + length)] * count
+                digest = _pool_digest(pools, tables[:count], spans, prefiller)
+                pool_digests.append(
+                    {
+                        "all": digest["all"],
+                        "pools": [[h[:16], s] for h, s in digest["pools"]],
+                    }
+                )
+                harness.log(
+                    f"pool digest {tag} repeat {repeat}: all {digest['all'][:16]} "
+                    "pools " + " ".join(h[:8] for h, _ in digest["pools"])
+                )
             if repeat:
                 times.append(elapsed)
         ms = statistics.median(times)
@@ -500,4 +560,5 @@ def run_prefill(args, records: harness.Records) -> None:
             tokens_per_s=round(rate, 1),
             repeats=[round(t, 2) for t in times],
             first_tokens=first_tokens,
+            **({"pool_digests": pool_digests} if args.fixed_prompts else {}),
         )
