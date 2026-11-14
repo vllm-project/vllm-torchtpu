@@ -21,24 +21,60 @@ from typing import Any
 
 from vllm_torchtpu import envs
 
+# Attribute set by `VllmGatedDeltaNetAttention.process_weights_after_loading`
+# on `conv1d` when `conv1d.weight` has been transposed to `[kernel_size, 1, dim]`.
+CONV_WEIGHT_TRANSPOSED_ATTR = "_tpu_conv_weight_transposed"
+# Attribute on a loaded target model holding its MTP draft module, if any.
+MTP_DRAFT_ATTR = "_export_mtp_draft"
+
 
 def _resolve_submod_and_param(
     weight_name: str, model: Any = None
 ) -> tuple[Any, Any, str, str]:
     """Resolves `(submod, param_or_buf, mod_path, attr)` from `model`."""
+    wrapper = model
+    if model is not None and not callable(getattr(model, "get_submodule", None)):
+        model = getattr(model, "model", None)
     if model is None or not weight_name:
         return None, None, "", weight_name
     mod_path, attr = (
         weight_name.rsplit(".", 1) if "." in weight_name else ("", weight_name)
     )
     submod = None
-    if mod_path:
-        for cand_mod_path in (mod_path, mod_path.removeprefix("model.")):
-            with contextlib.suppress(Exception):
-                submod = model.get_submodule(cand_mod_path)
-                if submod is not None:
-                    break
-    else:
+    inner_model = getattr(model, "model", None)
+    candidate_roots = [
+        root
+        for root in (model, inner_model)
+        if root is not None and callable(getattr(root, "get_submodule", None))
+    ]
+    if mod_path and candidate_roots:
+        for root in candidate_roots:
+            for candidate_path in (mod_path, mod_path.removeprefix("model.")):
+                with contextlib.suppress(Exception):
+                    submod = root.get_submodule(candidate_path)
+                    if submod is not None:
+                        break
+            if submod is not None:
+                break
+        if submod is None and (mod_path == "mtp" or mod_path.startswith("mtp.")):
+            draft = (
+                getattr(model, MTP_DRAFT_ATTR, None)
+                or getattr(inner_model, MTP_DRAFT_ATTR, None)
+                or getattr(wrapper, MTP_DRAFT_ATTR, None)
+                or getattr(wrapper, "_mtp_draft", None)
+            )
+            draft_get_submodule = getattr(draft, "get_submodule", None)
+            if callable(draft_get_submodule):
+                suffix = mod_path.removeprefix("mtp").lstrip(".")
+                draft_candidates = (
+                    (f"model.{suffix}", suffix) if suffix else ("model", "")
+                )
+                for candidate_path in draft_candidates:
+                    with contextlib.suppress(Exception):
+                        submod = draft_get_submodule(candidate_path)
+                        if submod is not None:
+                            break
+    elif not mod_path:
         submod = model
     param_obj = getattr(submod, attr, None) if submod is not None else None
     return submod, param_obj, mod_path, attr
@@ -73,8 +109,24 @@ def infer_weight_sharding(
 
     rank = len(shape)
     submod, param_obj, _, attr = _resolve_submod_and_param(weight_name, model)
+    conv_weight_transposed = bool(
+        getattr(submod, CONV_WEIGHT_TRANSPOSED_ATTR, False)
+        or getattr(param_obj, CONV_WEIGHT_TRANSPOSED_ATTR, False)
+    )
+    submodule_class_names = (
+        {cls.__name__ for cls in type(submod).__mro__} if submod is not None else set()
+    )
+    is_tp_replicated_submodule = submod is not None and (
+        bool(getattr(submod, "disable_tp", False))
+        or "ReplicatedLinear" in submodule_class_names
+    )
     submod_tp = int(getattr(submod, "tp_size", 0) or 0) if submod is not None else 0
-    tp_size = max(submod_tp, int(tp_size_hint or 1))
+    tp_size = (
+        1 if is_tp_replicated_submodule else max(submod_tp, int(tp_size_hint or 1))
+    )
+
+    if conv_weight_transposed and rank == 3 and attr == "weight":
+        return [None, None, "tp"] if tp_size > 1 else [None, None, None]
 
     if rank == 0:
         if any(
@@ -226,11 +278,20 @@ def infer_weight_sharding(
             return [None, None, "tp"]
         if "experts." in weight_name and "down_proj" in weight_name:
             return [None, "tp", None]
-        if (
-            ".conv1d.weight" in weight_name
-            or ".w_uk_t" in weight_name
-            or ".w_uv" in weight_name
-        ):
+        if ".conv1d.weight" in weight_name:
+            if submod is None and envs.TPU_GDN_PREPACK_CONV_WEIGHT:
+                if model is None:
+                    raise NotImplementedError(
+                        "Pass `model` to `infer_weight_sharding` when exporting "
+                        "with `TPU_GDN_PREPACK_CONV_WEIGHT=1` at TP > 1 so PCP "
+                        "layers that keep `[dim, 1, kernel_size]` are distinguished."
+                    )
+                raise ValueError(
+                    f"Could not resolve submodule for {weight_name!r} on "
+                    f"{type(model).__name__} when `TPU_GDN_PREPACK_CONV_WEIGHT=1`."
+                )
+            return ["tp", None, None]
+        if ".w_uk_t" in weight_name or ".w_uv" in weight_name:
             return ["tp", None, None]
         return [None, None, None]
 

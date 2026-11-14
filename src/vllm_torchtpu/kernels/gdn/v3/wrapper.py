@@ -329,6 +329,7 @@ def outer_kernel(
         "gate_lower_bound",
         "kernel_act_dtype",
         "kernel_conv_weight_dtype",
+        "conv_weight_transposed",
     ),
 )
 def fused_conv1d_gdn(
@@ -336,7 +337,7 @@ def fused_conv1d_gdn(
     b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
     states: jax.Array | tuple[jax.Array, jax.Array],
-    conv_weight: jax.Array,  # [kernel_size - 1, dim_size]
+    conv_weight: jax.Array,  # [dim_size, 1, kernel_size] or [kernel_size, 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
     a_log: jax.Array,  # [n_v]
     dt_bias: jax.Array,  # [n_v] for GDN, [n_v, d_k] for KDA
@@ -365,6 +366,7 @@ def fused_conv1d_gdn(
     compute_precision: jnp.dtype = jnp.float32.dtype,
     kernel_act_dtype: jnp.dtype = jnp.float32.dtype,
     kernel_conv_weight_dtype: jnp.dtype = jnp.float32.dtype,
+    conv_weight_transposed: bool = False,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
@@ -385,7 +387,9 @@ def fused_conv1d_gdn(
             d_k, d_v]. The first slot is a null block used for padded or invalid
             tokens. It may contain garbage data if it is a first invocation of a
             sequence. None when `state_source` carries the states.
-        conv_weight: Convolution weight tensor of shape [kernel_size - 1, dim_size].
+        conv_weight: Convolution weight tensor of shape [dim_size, 1, kernel_size]
+            when `conv_weight_transposed` is False, or [kernel_size, 1, dim_size]
+            when `conv_weight_transposed` is True.
         conv_bias: Optional convolution bias tensor of shape [dim_size].
         a_log: a_log tensor of shape [n_v].
         dt_bias: dt_bias tensor of shape [n_v]; [n_v, d_k] under KDA, whose
@@ -440,6 +444,9 @@ def fused_conv1d_gdn(
         kernel_act_dtype: Dtype qkv, b and a are cast to before the kernel.
         kernel_conv_weight_dtype: Dtype conv_weight and conv_bias are cast to
             before the kernel.
+        conv_weight_transposed: When True, `conv_weight` is already in
+            `[kernel_size, 1, dim_size]` layout so the per-step `swapaxes(0, 2)`
+            is skipped.
         decode_tile_size: Tile size along sequence dimension for decode sequences.
             Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
@@ -505,7 +512,13 @@ def fused_conv1d_gdn(
 
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
-    assert conv_weight.shape == (dim, 1, kernel_size)
+    expected_conv_weight_shape = (
+        (kernel_size, 1, dim) if conv_weight_transposed else (dim, 1, kernel_size)
+    )
+    assert conv_weight.shape == expected_conv_weight_shape, (
+        f"Expected conv_weight shape {expected_conv_weight_shape} "
+        f"(conv_weight_transposed={conv_weight_transposed}), got {conv_weight.shape}"
+    )
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
     assert query_start_loc.shape == (num_seqs + 1,)
@@ -631,11 +644,21 @@ def fused_conv1d_gdn(
         states = (states[0].reshape(-1, kernel_size - 1, 1, dim), rec_state)
 
     # Step 3: Weights pre-processing.
-    # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
-    # loading stage.
-    conv_weight = conv_weight.swapaxes(0, 2).astype(kernel_conv_weight_dtype)
-    if conv_bias is not None:
-        conv_bias = conv_bias.astype(kernel_conv_weight_dtype)
+    expected_conv_weight_dtype = jnp.dtype(kernel_conv_weight_dtype)
+    if conv_weight_transposed:
+        assert jnp.dtype(conv_weight.dtype) == expected_conv_weight_dtype, (
+            f"Expected prepacked conv_weight dtype {expected_conv_weight_dtype}, "
+            f"got {jnp.dtype(conv_weight.dtype)}"
+        )
+        if conv_bias is not None:
+            assert jnp.dtype(conv_bias.dtype) == expected_conv_weight_dtype, (
+                f"Expected prepacked conv_bias dtype {expected_conv_weight_dtype}, "
+                f"got {jnp.dtype(conv_bias.dtype)}"
+            )
+    else:
+        conv_weight = conv_weight.swapaxes(0, 2).astype(kernel_conv_weight_dtype)
+        if conv_bias is not None:
+            conv_bias = conv_bias.astype(kernel_conv_weight_dtype)
 
     # Step 4: Wrap inputs for the kernel.
     conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight, bias=conv_bias)
