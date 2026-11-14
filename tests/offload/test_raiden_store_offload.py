@@ -1553,17 +1553,37 @@ class TestSchedulerUpstreamContract(unittest.TestCase):
             OffloadingConnectorScheduler,
         )
 
+        from vllm_torchtpu import _patch_vllm_offload_fine_prefix_alignment
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
-        for name in (
-            "get_num_new_matched_tokens",
-            "_lookup",
-            "update_state_after_alloc",
-            "_build_store_jobs",
+        # Compare against the class as the engine runs it. The TPU patch stages
+        # wrap upstream's _lookup, and an earlier test in this process may have
+        # applied them already; both attributes are restored on exit.
+        with (
+            patch.object(
+                OffloadingConnectorScheduler,
+                "_lookup",
+                OffloadingConnectorScheduler._lookup,
+            ),
+            patch.object(
+                OffloadingConnectorScheduler,
+                "_tpu_fine_prefix_alignment",
+                False,
+                create=True,
+            ),
         ):
-            ours = inspect.signature(getattr(TPURaidenOffloadingScheduler, name))
-            upstream = inspect.signature(getattr(OffloadingConnectorScheduler, name))
-            self.assertEqual(list(ours.parameters), list(upstream.parameters), name)
+            _patch_vllm_offload_fine_prefix_alignment()
+            for name in (
+                "get_num_new_matched_tokens",
+                "_lookup",
+                "update_state_after_alloc",
+                "_build_store_jobs",
+            ):
+                ours = inspect.signature(getattr(TPURaidenOffloadingScheduler, name))
+                upstream = inspect.signature(
+                    getattr(OffloadingConnectorScheduler, name)
+                )
+                self.assertEqual(list(ours.parameters), list(upstream.parameters), name)
         # _lookup and _touch build partial-tail keys with the request context.
         params = inspect.signature(OffloadingConnectorScheduler._make_boundary_key)
         self.assertIn("req_context", params.parameters)
