@@ -234,6 +234,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     runner = SimpleNamespace(
         _pp_handoff=None if pp_is_last else handoff,
         _dp_step_other_decode=False,
+        _thinking_budget=None,
         _pp_is_first=True,
         _pp_is_last=pp_is_last,
         _pp_pending_scheduler_output=None,
@@ -332,6 +333,8 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     for name in (
         "_any_decode",
         "_readmit_trimmed_drafts",
+        "_sample_chunk_logits",
+        "_sample_plain_chunk",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
         "_build_kv_connector_output",

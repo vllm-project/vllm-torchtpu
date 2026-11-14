@@ -1490,6 +1490,7 @@ class TestTPURunner:
         self.runner.supports_mm_inputs = False
         self.runner.vllm_config.compilation_config.compile_sizes = [16, 2048]
         self.runner._make_buffer = GPUModelRunner._make_buffer.__get__(self.runner)
+        self.runner.input_batch = SimpleNamespace(thinking_budget_state_holder=None)
 
         with (
             patch.object(GPUModelRunner, "__init__", return_value=None),
@@ -3693,6 +3694,9 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
+    spec_runner._sample_chunk_logits = TPUModelRunner._sample_chunk_logits.__get__(
+        spec_runner
+    )
     spec_runner.rejection_sampler = MagicMock(side_effect=fake_rejection_sampler)
     spec_runner.rejection_sampler.synthetic_mode = False
     md = SimpleNamespace(
@@ -3770,6 +3774,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _fence_spec_kv_under_token_copy=False,
             _min_tokens_batch_state=lambda: {},
             _adaptive_verification=None,
+            _thinking_budget=None,
             is_pooling_model=False,
             drafter=SimpleNamespace(),
             spec_decode_manager=SimpleNamespace(
@@ -3786,6 +3791,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         )
         runner._stage_timing.take_samples.return_value = ([], [])
         for name in (
+            "_sample_chunk_logits",
+            "_sample_plain_chunk",
             "maybe_wait_for_kv_save",
             "get_finished_kv_transfers",
             "_build_kv_connector_output",

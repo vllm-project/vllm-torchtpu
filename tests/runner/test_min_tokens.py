@@ -612,6 +612,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
         _pp_handoff=None,
         _dp_step_other_decode=False,
         _min_tokens=min_tokens.MinTokensTracker(),
+        _thinking_budget=None,
         speculative_config=None,
         scheduler_config=SimpleNamespace(async_scheduling=False),
         _is_async_drafter=False,
@@ -633,6 +634,8 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             num_computed_tokens=0, num_tokens=1, output_token_ids=[0] * num_output
         )
     for name in (
+        "_sample_chunk_logits",
+        "_sample_plain_chunk",
         "_mask_min_tokens",
         "_min_tokens_batch_state",
         "_settle_draft_placeholders_for_min_tokens",
