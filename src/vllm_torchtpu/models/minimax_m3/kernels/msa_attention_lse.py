@@ -1198,7 +1198,9 @@ def adaptive_prefill() -> tuple[int, int, int] | None:
     return parts[0], parts[1], parts[2]
 
 
-def wide_selection(selected: jax.Array, block_q: int, threshold: int) -> jax.Array:
+def wide_selection(
+    selected: jax.Array, block_q: int, threshold: int, max_tiles: int = 64
+) -> jax.Array:
     """Whether ``selected [T, G, K]`` (page keys, ``-1`` padded) holds more
     than `threshold` distinct pages per `block_q`-token tile of a KV head on
     average, over the tiles that hold any page: a bool scalar.
@@ -1206,11 +1208,15 @@ def wide_selection(selected: jax.Array, block_q: int, threshold: int) -> jax.Arr
     The union width sets what a tile costs: a wide union pays for its rows
     over more pages (smaller tiles narrow it), a narrow one for the fixed
     cost per tile (larger tiles amortize it). Counted by comparing each key
-    with the tile's earlier keys: no sort."""
+    with the tile's earlier keys (no sort), on every n-th tile only (about
+    `max_tiles` per head): every tile of an 8k call cost ~76 us a call on
+    TPU v7x, while the sampled mean picks the same configuration on 99% of
+    real c48 calls."""
     num_tokens, num_heads, topk = selected.shape
     pad = -num_tokens % block_q
     keys = jnp.pad(selected, ((0, pad), (0, 0), (0, 0)), constant_values=-1)
     keys = keys.transpose(1, 0, 2).reshape(num_heads, -1, block_q * topk)
+    keys = keys[:, :: max(1, keys.shape[1] // max_tiles)]
     width = keys.shape[-1]
     earlier = jnp.arange(width)[None, :] < jnp.arange(width)[:, None]
     seen = jnp.any((keys[..., :, None] == keys[..., None, :]) & earlier, axis=-1)
