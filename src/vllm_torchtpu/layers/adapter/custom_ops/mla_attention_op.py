@@ -617,11 +617,13 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                     k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1]))
                 )
 
-                # Insert this step's K rows into the KV cache.
+                # Insert this step's K rows into the KV cache. `compare_all`
+                # avoids the while loop of gathers the default `scan` method
+                # lowers to (see `kv_cache_utils._row_positions`).
                 tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-                seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                    jnp.int32
-                )
+                seq_id = jnp.searchsorted(
+                    cu_q_lens[1:], tok, side="right", method="compare_all"
+                ).astype(jnp.int32)
                 q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
                 pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
                 page = jnp.where(

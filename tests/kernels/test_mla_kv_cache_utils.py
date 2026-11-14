@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
+from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SKIP_ROW,
     WORD_BYTES,
@@ -814,3 +815,47 @@ class PackedRopeTest(parameterized.TestCase):
         # The attention body bitcasts each row to four tokens' uint8 rows.
         tokens_u8 = unpack4(got["packed"]).reshape(-1, 128)
         np.testing.assert_array_equal(tokens_u8, expected_u8)
+
+
+class RowPositionsTest(parameterized.TestCase):
+    """`_row_positions`, shared by the plain and DCP writers."""
+
+    @parameterized.named_parameters(
+        ("decode_padded", (1, 1, 1, 1), 8),
+        ("empty_before_and_between", (0, 5, 0, 3, 0, 7), 16),
+        ("empty_tail", (4, 0, 0, 0), 4),
+        ("unpadded", (2, 3, 1), 6),
+        ("prefill_bucket", (1500, 2000, 596), 4096),
+    )
+    def test_matches_a_numpy_reference(self, q_lens, num_tokens):
+        rng = np.random.default_rng(len(q_lens) * 1000 + num_tokens)
+        q_lens = np.asarray(q_lens, np.int32)
+        cu = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+        seq_lens = (q_lens + rng.integers(0, 300, q_lens.shape)).astype(np.int32)
+
+        tok, seq_id, pos, valid = kv_cache_utils._row_positions(
+            num_tokens, jnp.asarray(seq_lens), jnp.asarray(cu)
+        )
+
+        want_tok = np.arange(num_tokens, dtype=np.int32)
+        # Padded rows clamp to the last sequence; callers mask them by `valid`.
+        want_seq = np.minimum(
+            np.searchsorted(cu[1:], want_tok, side="right"), len(q_lens) - 1
+        )
+        want_pos = seq_lens[want_seq] - q_lens[want_seq] + (want_tok - cu[want_seq])
+        np.testing.assert_array_equal(tok, want_tok)
+        np.testing.assert_array_equal(seq_id, want_seq)
+        np.testing.assert_array_equal(pos, want_pos)
+        np.testing.assert_array_equal(valid, want_tok < cu[-1])
+
+    def test_lowers_without_a_while_loop(self):
+        # `jnp.searchsorted`'s default `scan` method lowers to an HLO while loop
+        # of gathers, which ran once per layer per step on the prefill hot path.
+        hlo = (
+            jax.jit(
+                lambda seq_lens, cu: kv_cache_utils._row_positions(4096, seq_lens, cu)
+            )
+            .lower(jnp.zeros((64,), jnp.int32), jnp.zeros((65,), jnp.int32))
+            .as_text()
+        )
+        self.assertNotIn("while", hlo)

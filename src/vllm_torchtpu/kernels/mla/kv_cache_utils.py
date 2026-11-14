@@ -267,7 +267,13 @@ def _row_positions(
     """
     num_seqs = seq_lens.shape[0]
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_id = jnp.searchsorted(query_start_loc[1:], tok, side="right").astype(jnp.int32)
+    # `compare_all` is a [num_tokens, num_seqs] compare-and-sum, a few vector
+    # ops. The default `scan` method lowers to a while loop of small gathers;
+    # on a GLM-5.2 DCP16 prefill profile that loop was ~1.8K fusions and
+    # ~6.8 ms per 4096-token step across the backbone. Same result either way.
+    seq_id = jnp.searchsorted(
+        query_start_loc[1:], tok, side="right", method="compare_all"
+    ).astype(jnp.int32)
     valid = tok < query_start_loc[-1]
 
     seq_id = jnp.minimum(seq_id, num_seqs - 1)
