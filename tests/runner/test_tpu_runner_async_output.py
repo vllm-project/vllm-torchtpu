@@ -23,6 +23,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
+    assemble_spec_chunk,
     assemble_spec_next_tokens,
     compute_num_rejected,
     extract_draft_token_ids,
@@ -158,6 +159,48 @@ def test_compute_num_rejected_variable_draft(device):
     out = compute_num_rejected(next_tokens, num_draft)
 
     assert out.tolist() == [0, 1]
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("draft_rows", [2, 4, 8])
+def test_assemble_spec_chunk_matches_eager_helpers(device, draft_rows):
+    # A bucketed chunk of 4 rows (3 real requests), K=3; the drafter's row
+    # bucket may be smaller or larger than the chunk's and is fitted to it.
+    next_tokens = torch.tensor(
+        [[10, 11, 12, 99], [20, 21, -1, -1], [30, -1, -1, -1], [7, 7, 7, 7]],
+        dtype=torch.int64,
+        device=device,
+    )
+    drafts = torch.arange(draft_rows * 3, dtype=torch.int64, device=device).view(
+        draft_rows, 3
+    )
+    num_draft = torch.tensor([3, 3, 1], dtype=torch.int32, device=device)
+
+    src, num_rejected = assemble_spec_chunk(next_tokens, drafts, num_draft, 4)
+
+    fitted = torch.zeros(4, 3, dtype=torch.int64, device=device)
+    fitted[: min(4, draft_rows)] = drafts[:4]
+    padded_num_draft = torch.tensor([3, 3, 1, 0], dtype=torch.int32, device=device)
+    assert torch.equal(src, assemble_spec_next_tokens(next_tokens, fitted))
+    assert torch.equal(
+        num_rejected, compute_num_rejected(next_tokens, padded_num_draft)
+    )
+    assert num_rejected.dtype == torch.int32
+
+
+@pytest.mark.tpu_test
+def test_assemble_spec_chunk_exact_rows_and_no_drafts(device):
+    # Exact-count (non-bucketed) chunk of 2 requests that verified no drafts.
+    next_tokens = torch.tensor(
+        [[5, -1], [6, -1], [0, -1]], dtype=torch.int32, device=device
+    )
+    drafts = torch.tensor([[1], [2], [9]], dtype=torch.int32, device=device)
+
+    src, num_rejected = assemble_spec_chunk(next_tokens, drafts, None, 2)
+
+    assert src.tolist() == [5, 1, 6, 2]
+    assert num_rejected.tolist() == [0, 0]
+    assert num_rejected.dtype == torch.int32
 
 
 # Spec-decode logprobs. A verify chunk of 3 real requests padded to 4, K=3:

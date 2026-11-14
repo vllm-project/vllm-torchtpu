@@ -23,6 +23,8 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+from vllm_torchtpu.spec_decode.utils import fit_rows
+
 INVALID_TOKEN_ID = -1
 
 
@@ -261,6 +263,36 @@ def assemble_spec_next_tokens(
     return src.reshape(-1)  # [num_reqs * (1 + K)]
 
 
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def assemble_spec_chunk(
+    next_tokens: torch.Tensor,
+    drafts: torch.Tensor,
+    num_draft: torch.Tensor | None,
+    rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One chunk's async-spec substitution source and rejected counts, as one
+    device program.
+
+    Run eagerly, `assemble_spec_next_tokens` and `compute_num_rejected` each
+    materialize as their own program on every spec step. Returns
+    ``(src [rows * (1 + K)], num_rejected [rows])``; ``num_draft`` None (a
+    chunk that verified no drafts) gives zero rejections.
+
+    Args:
+        next_tokens: rejection output ``[>=rows, K+1]``.
+        drafts: proposer output, fitted to ``rows`` rows (sliced or padded).
+        num_draft: ``[n]`` scheduled draft count per request, fitted to ``rows``.
+        rows: the chunk's source row count (a bucket or the exact count).
+    """
+    src = assemble_spec_next_tokens(next_tokens, fit_rows(drafts, rows), rows)
+    if num_draft is None:
+        num_rejected = torch.zeros(rows, dtype=torch.int32, device=next_tokens.device)
+    else:
+        num_rejected = compute_num_rejected(next_tokens, fit_rows(num_draft, rows))
+    return src, num_rejected
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def subtract_num_rejected_tokens(
     seq_lens: torch.Tensor,
     positions: torch.Tensor,
@@ -273,7 +305,8 @@ def subtract_num_rejected_tokens(
     In async spec decode the host advances ``num_computed_tokens`` optimistically,
     assuming *every* speculative draft was accepted. The real acceptance is only known
     on-device, so this subtracts the actual per-request rejection count here —
-    on-device, before the verify forward.
+    on-device, before the verify forward. Compiled so both corrections run as
+    one device program rather than one eager program per output.
 
     Args:
         seq_lens: ``[num_reqs]`` optimistic sequence lengths.

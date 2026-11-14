@@ -359,6 +359,18 @@ def _spec_logprob_row_tokens(
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _leading_tokens(
+    next_tokens: torch.Tensor, num_tokens: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """The first `num_tokens` of `next_tokens` as a fresh `dtype` buffer.
+
+    Eagerly, the cast is one program and the slice view handed to the forward
+    is re-materialized as another; compiled, both are one.
+    """
+    return next_tokens.flatten()[:num_tokens].to(dtype)
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,
     token_in_tpu_cur_input_indices: torch.Tensor,
@@ -2512,11 +2524,9 @@ class TPUModelRunner(GPUModelRunner):
                     np.arange(len(input_ids), dtype=np.int32),
                 )
             ):
-                next_tpu = self._pre_async_results.next_tokens_tpu.flatten().to(
-                    input_ids.dtype
-                )
-                if len(next_tpu) >= len(input_ids):
-                    return next_tpu[: len(input_ids)]
+                next_tpu = self._pre_async_results.next_tokens_tpu
+                if next_tpu.numel() >= len(input_ids):
+                    return _leading_tokens(next_tpu, len(input_ids), input_ids.dtype)
 
             # Fast path 2: Cache persistent device indices to eliminate per-step
             # H2D uploads
@@ -2929,10 +2939,7 @@ class TPUModelRunner(GPUModelRunner):
         Returns ``(next_tokens_tpu_chunks, next_token_indices,
         spec_decode_num_rejected_tokens, num_draft_per_req)``.
         """
-        from vllm_torchtpu.runner.tpu_runner_async_output import (
-            assemble_spec_next_tokens,
-            compute_num_rejected,
-        )
+        from vllm_torchtpu.runner.tpu_runner_async_output import assemble_spec_chunk
 
         assert drafts is not None, (
             "async spec substitution requires the eagle3 drafts proposed "
@@ -2959,34 +2966,30 @@ class TPUModelRunner(GPUModelRunner):
             drafts_per_chunk,
         ):
             chunk_padded_num_reqs = nt_chunk.shape[0] if bucketed else num_reqs
-            drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
-            src = assemble_spec_next_tokens(
-                nt_chunk, drafts_chunk, None if bucketed else num_reqs
+            # A chunk without md verified no drafts: zero rejections, so no
+            # rejection correction or speculative output-placeholder rollback.
+            src, num_rejected = assemble_spec_chunk(
+                nt_chunk,
+                drafts_chunk,
+                md.draft_lengths if md is not None else None,
+                chunk_padded_num_reqs,
             )
             if md is not None:
-                num_rejected_chunks.append(
-                    compute_num_rejected(
-                        nt_chunk, fit_rows(md.draft_lengths, chunk_padded_num_reqs)
-                    )
-                )
                 for r in range(num_reqs):
                     num_draft_per_req[req_offset + r] = int(md.draft_lengths_cpu[r])
-            else:
-                # No drafts were verified this step, so there is no rejection
-                # correction or speculative output-placeholder rollback.
-                num_rejected_chunks.append(
-                    torch.zeros(
-                        chunk_padded_num_reqs, dtype=torch.int32, device=nt_chunk.device
-                    )
-                )
             next_tokens_tpu_chunks.append(src)
+            num_rejected_chunks.append(num_rejected)
             for r in range(num_reqs):
                 next_token_indices[req_offset + r] = padded_req_offset + r
             req_offset += num_reqs
             padded_req_offset += chunk_padded_num_reqs
-        spec_num_rejected = (
-            torch.cat(num_rejected_chunks) if num_rejected_chunks else None
-        )
+        # torch.cat copies even a single tensor: one more program per step.
+        if len(num_rejected_chunks) == 1:
+            spec_num_rejected = num_rejected_chunks[0]
+        else:
+            spec_num_rejected = (
+                torch.cat(num_rejected_chunks) if num_rejected_chunks else None
+            )
         return (
             next_tokens_tpu_chunks,
             next_token_indices,
