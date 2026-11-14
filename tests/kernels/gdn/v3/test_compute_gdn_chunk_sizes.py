@@ -13,12 +13,13 @@
 # limitations under the License.
 """Chunked GDN v3 compute at any chunk size and value-head count.
 
-`fused_conv1d_gdn` clamps `mixed_tile_size` to the token count, so a prefill
-of e.g. 24 tokens runs the chunked path with `chunk_size == 24`. A blocked
-forward substitution in `invert_triangular_matrix` only covers whole blocks,
-which breaks the chunked solve whenever the block size does not divide the
-chunk. These tests run the pure-jnp compute on CPU (exact fp32 matmuls)
-against a float64 reference, so they need no TPU.
+`fused_conv1d_gdn` clamps `mixed_tile_size` to the token count (and rounds
+tiles above 16 rows down to a multiple of 16), so a prefill of e.g. 9 tokens
+runs the chunked path with `chunk_size == 9`. `invert_triangular_matrix` and
+`chunked_gdn` must therefore work at any chunk size, which these tests check
+up to 128 rows, including sizes that are not a multiple of 16. They run the
+pure-jnp compute on CPU (exact fp32 matmuls) against a float64 reference, so
+they need no TPU.
 """
 
 import jax
@@ -27,6 +28,8 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config
+
+pytestmark = pytest.mark.cpu_test
 
 # Powers of two are controls; 128 is the largest dynamic-tiling mixed tile.
 _CHUNK_SIZES = [8, 16, 20, 24, 31, 32, 40, 42, 48, 64, 128]
