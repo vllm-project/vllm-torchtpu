@@ -162,16 +162,26 @@ def chunked_gdn_per_seq(
     k_beta_repeat = k_repeat * beta_large
 
     # [num_v_heads, chunk, chunk]
-    # (beta k) k^T = diag(beta) (k k^T): one dot per kq head, the rows
-    # scaled per value head.
-    kk_t = jax.lax.dot(
-        k_large,
-        k_large,
-        dimension_numbers=(((2,), (2,)), ((0,), (0,))),
-        preferred_element_type=jnp.float32,
-    )
-    beta_k_k_t = jnp.repeat(kk_t.astype(cfg.dtypes.compute), cfg.v_per_kq_head, axis=0)
-    beta_k_k_t = (beta_k_k_t * beta_large).astype(cfg.dtypes.compute)
+    if cfg.shared_kkt:
+        # (beta k) k^T = diag(beta) (k k^T): one dot per kq head, the rows
+        # scaled per value head.
+        kk_t = jax.lax.dot(
+            k_large,
+            k_large,
+            dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+            preferred_element_type=jnp.float32,
+        )
+        beta_k_k_t = jnp.repeat(
+            kk_t.astype(cfg.dtypes.compute), cfg.v_per_kq_head, axis=0
+        )
+        beta_k_k_t = (beta_k_k_t * beta_large).astype(cfg.dtypes.compute)
+    else:
+        beta_k_k_t = jax.lax.dot(
+            k_beta_repeat,
+            k_repeat,
+            dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+            preferred_element_type=jnp.float32,
+        ).astype(cfg.dtypes.compute)
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
     t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
 

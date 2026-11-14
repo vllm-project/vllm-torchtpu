@@ -26,6 +26,17 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+# Shapes (kq heads, value heads, kq head dim, value head dim per rank) at which
+# the chunked prefill computes (beta k) k^T as diag(beta) (k k^T), one dot per
+# kq head (`compute_gdn.chunked_gdn_per_seq`). That form reassociates the beta
+# product, so its results differ from main's in the last bits. It was measured
+# only on the Qwen3.5-397B prefill legs (TP1: 16 kq and 64 value heads of 128),
+# so every other shape keeps main's (beta k) k^T and computes what main
+# computes.
+SHARED_KKT_SHAPES: frozenset[tuple[int, int, int, int]] = frozenset(
+    {(16, 64, 128, 128)}
+)
+
 
 class AttentionMode(enum.StrEnum):
     # Gated Delta Net: one scalar gate per value head.
@@ -162,6 +173,18 @@ class GDNConfig:
             return 2
         # GDN: between-block updates scale as 1 / B.
         return max(2, min(16, 16 // head_groups))
+
+    @property
+    def shared_kkt(self) -> bool:
+        """Whether the chunked prefill takes the shared (beta k) k^T
+        (`SHARED_KKT_SHAPES`)."""
+        shape = (
+            self.num_kq_heads,
+            self.num_v_heads,
+            self.kq_head_dim,
+            self.v_head_dim,
+        )
+        return shape in SHARED_KKT_SHAPES
 
     @property
     def use_recurrent(self) -> bool:
