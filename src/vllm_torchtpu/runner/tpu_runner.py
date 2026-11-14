@@ -162,7 +162,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import (
-    chunk_processors,
     greedy_top_tokens,
     prompt_logprobs,
     spec_boundary_state,
@@ -263,6 +262,17 @@ class ExecuteModelState:
     prompt_logprobs_chunks: list[prompt_logprobs.PromptLogprobsChunk] = field(
         default_factory=list
     )
+
+
+@dataclass(frozen=True)
+class _ChunkSamplingParams:
+    """A sampled chunk's padded ``[rows, 1]`` sampling params. The rejection
+    sampler reuses them to verify the chunk's drafts."""
+
+    temperatures: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+    topk_candidates: int
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -5180,6 +5190,45 @@ class TPUModelRunner(GPUModelRunner):
             return logits
         return min_tokens_mask.apply_stop_table(logits, *table)
 
+    def _sample_chunk_logits(
+        self,
+        logits: torch.Tensor,
+        *,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        all_greedy: bool,
+        grammar_output: "GrammarOutput | None",
+        sampling_generator: torch.Generator | None,
+    ) -> tuple[torch.Tensor, _ChunkSamplingParams | None]:
+        """Samples one token per row of a chunk's ``[rows, vocab]`` logits.
+
+        Returns the ``[rows, 1]`` token IDs and, for a sampled (not all-greedy)
+        chunk, the padded sampling params that drew them.
+        """
+        if all_greedy:
+            return self._greedy_sample(logits), None
+        temperatures, top_k, top_p = self._build_padded_sampling_params(
+            cur_start_idx, cur_end_idx, logits
+        )
+        params = _ChunkSamplingParams(
+            temperatures,
+            top_k,
+            top_p,
+            self._sampler_topk_candidates(cur_start_idx, cur_end_idx, grammar_output),
+        )
+        u = torch.rand_like(logits, dtype=torch.float32, generator=sampling_generator)
+        token_ids = self.sample_from_logits_func(
+            logits,
+            temperatures,
+            u,
+            top_k,
+            top_p,
+            all_greedy=False,
+            topk_candidates=params.topk_candidates,
+            apply_topk_topp=self._sampler_applies_topk_topp(),
+        )
+        return token_ids, params
+
     def _sample_plain_chunk(
         self,
         logits: torch.Tensor,
@@ -5193,30 +5242,17 @@ class TPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         is_spec_step: bool,
         min_toks: min_tokens_mask.MinTokensState,
-        processors: Sequence[chunk_processors.PlainChunkProcessor] = (),
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Mask and sample a plain chunk ``[cur_start_idx, cur_end_idx)``.
 
         ``is_spec_step`` marks a draft-less chunk inside a speculative step,
         whose grammar rows follow ``scheduled_spec_decode_tokens``. With
         ``top_tokens``, ``logits`` holds each row's greedy token instead.
-        ``processors`` run after the ``min_tokens`` mask, in order.
 
-        Returns ``(selected_token_ids, logprob_logits)``. As in upstream vLLM
-        (``apply_grammar_bitmask`` before ``Sampler.raw_logprobs``, then the
-        logits processors), ``logprob_logits`` is taken after the grammar mask
-        and before the ``PlainChunkProcessor`` hooks run.
+        Returns ``(selected_token_ids, logprob_logits)``. Logprobs come from the
+        logits before the min_tokens mask, as vLLM's default raw_logprobs mode
+        precedes its logits processors (the TPU runner has no logprobs_mode).
         """
-        chunk_procs: list[chunk_processors.PlainChunkProcessor] = []
-        if min_toks and not top_tokens:
-            rows = min_tokens_mask.plain_rows(min_toks, cur_start_idx, cur_end_idx)
-            chunk_procs.append(
-                chunk_processors.StatelessPlainChunkProcessor(
-                    lambda lg: self._mask_min_tokens(lg, rows, min_toks)
-                )
-            )
-        chunk_procs.extend(processors)
-
         if grammar_output is not None:
             if is_spec_step:
                 _, logits = self.structured_decoding_manager.mask_spec_logits(
@@ -5233,41 +5269,26 @@ class TPUModelRunner(GPUModelRunner):
                     logits, grammar_output, cur_start_idx, cur_end_idx
                 )
         logprob_logits = logits
-        if not top_tokens:
-            for proc in chunk_procs:
-                logits = proc.mask_logits(logits)
-
+        min_tokens_rows = min_tokens_mask.plain_rows(
+            min_toks, cur_start_idx, cur_end_idx
+        )
+        if min_tokens_rows:
+            # _greedy_top_tokens_this_step keeps a step with a request below
+            # min_tokens on the full logits.
+            assert not top_tokens
+            logits = self._mask_min_tokens(logits, min_tokens_rows, min_toks)
         with self._stage_timing.stage("sample"):
             if top_tokens:
                 selected = logits
-                for proc in chunk_procs:
-                    selected = proc.override_top_tokens(selected)
             else:
-                if all_greedy:
-                    selected = self._greedy_sample(logits)
-                else:
-                    temperatures_tpu, top_k_tpu, top_p_tpu = (
-                        self._build_padded_sampling_params(
-                            cur_start_idx, cur_end_idx, logits
-                        )
-                    )
-                    u = torch.rand_like(
-                        logits, dtype=torch.float32, generator=sampling_generator
-                    )
-                    selected = self.sample_from_logits_func(
-                        logits,
-                        temperatures_tpu,
-                        u,
-                        top_k_tpu,
-                        top_p_tpu,
-                        all_greedy=False,
-                        topk_candidates=self._sampler_topk_candidates(
-                            cur_start_idx, cur_end_idx, grammar_output
-                        ),
-                        apply_topk_topp=self._sampler_applies_topk_topp(),
-                    )
-                for proc in chunk_procs:
-                    proc.on_sampled(selected)
+                selected, _ = self._sample_chunk_logits(
+                    logits,
+                    cur_start_idx=cur_start_idx,
+                    cur_end_idx=cur_end_idx,
+                    all_greedy=all_greedy,
+                    grammar_output=grammar_output,
+                    sampling_generator=sampling_generator,
+                )
         return selected, logprob_logits
 
     def _sample_spec_verify_chunk(
@@ -5282,38 +5303,24 @@ class TPUModelRunner(GPUModelRunner):
         sampling_generator: torch.Generator | None,
         top_tokens: bool = False,
         min_toks: min_tokens_mask.MinTokensState | None = None,
-        processors: Sequence[chunk_processors.SpecChunkProcessor] = (),
     ) -> torch.Tensor:
         """Bonus-token sampling + draft rejection for one spec-verify chunk.
 
         Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
         selected tokens for the chunk. With ``top_tokens``, ``logits`` holds
         each row's greedy token instead (no request is below min_tokens then).
-        ``processors`` prepare the target/bonus rows and drafts before the
-        rejection sampler runs and ``finish`` on its output.
         """
         assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
-        max_draft_tokens = self.speculative_config.num_speculative_tokens
         draft_token_ids = md.draft_token_ids
         target_logits: torch.Tensor | None = None
         target_argmax: torch.Tensor | None = None
-        req_temperatures = req_top_k = req_top_p = None
-        topk_candidates = 0
+        params: _ChunkSamplingParams | None = None
         if top_tokens:
             bonus_token_ids, target_argmax = self.spec_bonus_and_target_tokens(
                 logits, md.bonus_logits_indices, md.target_logits_indices
             )
-            for proc in processors:
-                target_argmax, bonus_token_ids, draft_token_ids = proc.prepare_tokens(
-                    target_argmax,
-                    bonus_token_ids,
-                    draft_token_ids,
-                    md.segment_ids,
-                    md.group_indices,
-                    max_draft_tokens,
-                )
         else:
             min_toks = min_toks or {}
             min_tokens_rows = None
@@ -5335,7 +5342,7 @@ class TPUModelRunner(GPUModelRunner):
                     min_tokens_rows = min_tokens_mask.verify_rows(
                         min_toks, cur_start_idx, draft_lengths.tolist()
                     )
-            if all_greedy and grammar_output is None and not processors:
+            if all_greedy and grammar_output is None:
                 bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                     logits, md.bonus_logits_indices, md.target_logits_indices
                 )
@@ -5373,43 +5380,19 @@ class TPUModelRunner(GPUModelRunner):
                     bonus_logits = self._mask_min_tokens(
                         bonus_logits, bonus_rows, min_toks
                     )
-                for proc in processors:
-                    target_logits, bonus_logits, draft_token_ids = proc.prepare_logits(
-                        target_logits,
-                        bonus_logits,
-                        draft_token_ids,
-                        md.segment_ids,
-                        md.group_indices,
-                        max_draft_tokens,
-                    )
-                if all_greedy:
-                    bonus_token_ids = self._greedy_sample(bonus_logits).view(-1)
-                else:
-                    req_temperatures, req_top_k, req_top_p = (
-                        self._build_padded_sampling_params(
-                            cur_start_idx, cur_end_idx, bonus_logits
-                        )
-                    )
-                    topk_candidates = self._sampler_topk_candidates(
-                        cur_start_idx, cur_end_idx, grammar_output
-                    )
-                    bonus_u = torch.rand_like(
-                        bonus_logits, dtype=torch.float32, generator=sampling_generator
-                    )
-                    bonus_token_ids = self.sample_from_logits_func(
-                        bonus_logits,
-                        req_temperatures,
-                        bonus_u,
-                        req_top_k,
-                        req_top_p,
-                        all_greedy=False,
-                        topk_candidates=topk_candidates,
-                        apply_topk_topp=self._sampler_applies_topk_topp(),
-                    ).view(-1)
+                bonus_token_ids, params = self._sample_chunk_logits(
+                    bonus_logits,
+                    cur_start_idx=cur_start_idx,
+                    cur_end_idx=cur_end_idx,
+                    all_greedy=all_greedy,
+                    grammar_output=grammar_output,
+                    sampling_generator=sampling_generator,
+                )
+                bonus_token_ids = bonus_token_ids.view(-1)
         # Greedy chunks (and the top-tokens path, whose steps are all greedy)
         # draw acceptance noise only for synthetic acceptance; sampled chunks
         # also draw the recovery noise and verify on their sampling params.
-        do_sampling = not top_tokens and not all_greedy
+        do_sampling = params is not None
         accept_u = None
         if self.rejection_sampler.synthetic_mode or do_sampling:
             accept_u = torch.rand(
@@ -5418,35 +5401,37 @@ class TPUModelRunner(GPUModelRunner):
                 device=logits.device,
                 generator=sampling_generator,
             )
-        recover_u = None
+        temperatures = top_k = top_p = recover_u = None
+        topk_candidates = 0
+        apply_topk_topp = True
         if do_sampling:
-            assert target_logits is not None and req_temperatures is not None
+            assert params is not None and target_logits is not None
+            temperatures = params.temperatures[md.segment_ids]
+            top_k = params.top_k[md.segment_ids]
+            top_p = params.top_p[md.segment_ids]
+            topk_candidates = params.topk_candidates
+            apply_topk_topp = self._sampler_applies_topk_topp()
             recover_u = torch.rand_like(
                 target_logits, dtype=torch.float32, generator=sampling_generator
             )
-        out = self.rejection_sampler(
+        return self.rejection_sampler(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=md.draft_lengths,
             target_logits=target_logits,
             bonus_token_ids=bonus_token_ids,
             segment_ids=md.segment_ids,
             group_indices=md.group_indices,
-            max_draft_tokens=max_draft_tokens,
-            temperatures=(
-                None if req_temperatures is None else req_temperatures[md.segment_ids]
-            ),
-            top_k=None if req_top_k is None else req_top_k[md.segment_ids],
-            top_p=None if req_top_p is None else req_top_p[md.segment_ids],
+            max_draft_tokens=self.speculative_config.num_speculative_tokens,
+            temperatures=temperatures,
+            top_k=top_k,
+            top_p=top_p,
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=do_sampling,
             topk_candidates=topk_candidates,
             target_argmax=target_argmax,
-            apply_topk_topp=self._sampler_applies_topk_topp() if do_sampling else True,
+            apply_topk_topp=apply_topk_topp,
         )
-        for proc in processors:
-            proc.finish(out, max_draft_tokens)
-        return out
 
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -5513,27 +5498,10 @@ class TPUModelRunner(GPUModelRunner):
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
-        # Partial-prefill requests discard their sampled token. They are known
-        # before sampling, for per-chunk processors; their generators are
-        # rewound after sampling, below.
-        discard_sampled_tokens_req_indices: list[int] = []
-        req_ids = cast(list[str], self.input_batch.req_ids[: self.input_batch.num_reqs])
-        request_seq_lens = []
-        for i, req_id in enumerate(req_ids):
-            assert req_id is not None
-            req_state = self.requests[req_id]
-            seq_len = (
-                req_state.num_computed_tokens
-                + scheduler_output.num_scheduled_tokens[req_id]
-            )
-            if seq_len < req_state.num_tokens:
-                # Record the index of the request that should not be sampled,
-                # so that we could clear the sampled tokens before returning.
-                discard_sampled_tokens_req_indices.append(i)
-            else:
-                request_seq_lens.append((i, req_state, seq_len, req_id))
-
         if self.is_pooling_model:
+            req_ids = cast(
+                list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
+            )
             self._update_num_xla_graphs("pooling_step")
         elif is_spec_step:
             cur_start_idx = 0
@@ -5625,6 +5593,9 @@ class TPUModelRunner(GPUModelRunner):
                 cur_start_idx = cur_end_idx
         else:
             cur_start_idx = 0
+            req_ids = cast(
+                list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
+            )
             all_greedy = self.input_batch.all_greedy
             for logits, num_reqs, mamba_indices in zip(
                 state.logits_list, state.num_reqs_list, mamba_idx_list
@@ -5706,13 +5677,30 @@ class TPUModelRunner(GPUModelRunner):
             )
             logprobs = logprobs_lists
 
-        # Ignore the sampled token from the partial request.
-        # Rewind the generator state as if the token was not sampled.
-        for i in discard_sampled_tokens_req_indices:
-            generator = self.input_batch.generators.get(i)
-            if generator is not None:
-                # This relies on cuda-specific torch-internal impl details
-                generator.set_offset(generator.get_offset() - 4)
+        discard_sampled_tokens_req_indices = []
+        num_reqs = self.input_batch.num_reqs
+        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+
+        request_seq_lens = []
+        for i, req_id in enumerate(req_ids):
+            assert req_id is not None
+            req_state = self.requests[req_id]
+            seq_len = (
+                req_state.num_computed_tokens
+                + scheduler_output.num_scheduled_tokens[req_id]
+            )
+            # Ignore the sampled token from the partial request.
+            # Rewind the generator state as if the token was not sampled.
+            if seq_len < req_state.num_tokens:
+                generator = self.input_batch.generators.get(i)
+                if generator is not None:
+                    # This relies on cuda-specific torch-internal impl details
+                    generator.set_offset(generator.get_offset() - 4)
+                # Record the index of the request that should not be sampled,
+                # so that we could clear the sampled tokens before returning.
+                discard_sampled_tokens_req_indices.append(i)
+            else:
+                request_seq_lens.append((i, req_state, seq_len, req_id))
 
         next_tokens_tpu = None
         copy_state = None

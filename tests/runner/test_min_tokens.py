@@ -633,6 +633,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             num_computed_tokens=0, num_tokens=1, output_token_ids=[0] * num_output
         )
     for name in (
+        "_sample_chunk_logits",
         "_sample_plain_chunk",
         "_mask_min_tokens",
         "_min_tokens_batch_state",

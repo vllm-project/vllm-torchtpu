@@ -3693,6 +3693,9 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
+    spec_runner._sample_chunk_logits = TPUModelRunner._sample_chunk_logits.__get__(
+        spec_runner
+    )
     spec_runner.rejection_sampler = MagicMock(side_effect=fake_rejection_sampler)
     spec_runner.rejection_sampler.synthetic_mode = False
     md = SimpleNamespace(
@@ -3786,6 +3789,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         )
         runner._stage_timing.take_samples.return_value = ([], [])
         for name in (
+            "_sample_chunk_logits",
             "_sample_plain_chunk",
             "maybe_wait_for_kv_save",
             "get_finished_kv_transfers",
