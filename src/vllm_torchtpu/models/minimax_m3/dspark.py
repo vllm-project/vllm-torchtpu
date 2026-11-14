@@ -345,6 +345,10 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         self.register_buffer("markov_w2_shard", None, persistent=False)
         self.register_buffer("vocab_shard_start", None, persistent=False)
         self.register_buffer("vocab_shard_pad_mask", None, persistent=False)
+        # `pallas_markov_argmax.MarkovChainOp`: the whole greedy chain in one
+        # kernel, set with the vocab shard when it builds.
+        self.markov_chain_kernel = None
+        self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
 
     def _vocab_parallel_markov_blocker(self) -> str | None:
         """Why the shard argmax cannot reproduce the gathered argmax, or None."""
@@ -412,11 +416,21 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
             )
             return False
         shard = self.lm_head.shard_indices
+        start, end = shard.org_vocab_start_index, shard.org_vocab_end_index
         self._set_markov_vocab_shard(
-            shard.org_vocab_start_index,
-            shard.org_vocab_end_index,
-            self.lm_head.num_embeddings_per_partition,
+            start, end, self.lm_head.num_embeddings_per_partition
         )
+        markov_w1 = self.model.markov_head.markov_w1.weight
+        if (
+            self.draft_id_to_target_id is None
+            and self._markov_cast_dtype is None
+            and markov_w1.dtype == self.markov_w2_shard.dtype == torch.bfloat16
+        ):
+            from vllm_torchtpu.distributed import pallas_markov_argmax
+
+            self.markov_chain_kernel = pallas_markov_argmax.build(
+                markov_w1, self.markov_w2_shard, start, end - start, self._max_num_seqs
+            )
         return True
 
     def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
