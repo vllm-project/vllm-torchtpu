@@ -75,6 +75,49 @@ if early_q_gather_enabled():
     )
 
 
+HP_PREFILL_CONFIG_ENV = "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG"
+_hp_config_logged = False
+
+
+def hp_prefill_kernel_kwargs() -> dict:
+    """Kernel config of the head-parallel prefill attention from
+    TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG ("<block_q>:<pages per step>:
+    <widths w/w/...>:<page cache slots>"); empty -> the kernel defaults."""
+    global _hp_config_logged
+    from vllm_torchtpu import envs
+
+    spec = envs.TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG
+    if not spec:
+        return dict(
+            block_q=msa_attention.DEFAULT_BLOCK_Q,
+            pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+        )
+    parts = spec.split(":")
+    if len(parts) != 4:
+        raise ValueError(f"{HP_PREFILL_CONFIG_ENV}={spec!r}: want bq:pps:widths:slots")
+    block_q, pages_per_step, widths, slots = parts
+    kw = dict(
+        block_q=int(block_q or msa_attention.DEFAULT_BLOCK_Q),
+        pages_per_step=int(pages_per_step or msa_attention.DEFAULT_PAGES_PER_STEP),
+    )
+    if widths:
+        kw["step_widths"] = tuple(sorted(int(w) for w in widths.split("/")))
+    if int(slots or 0):
+        kw["page_cache_slots"] = int(slots)
+        kw["page_cache_bf16"] = msa_attention_lse.PREFILL_PAGE_CACHE_BF16
+    if not _hp_config_logged:
+        _hp_config_logged = True
+        init_logger(__name__).warning(
+            "%s=%s: head-parallel MSA prefill attention kernel %s "
+            "(page cache tile pages %d).",
+            HP_PREFILL_CONFIG_ENV,
+            spec,
+            kw,
+            msa_attention_lse.PAGE_CACHE_TILE_PAGES,
+        )
+    return kw
+
+
 def uses_dcp_attention(
     num_tokens: int,
     max_num_seqs: int,
@@ -341,8 +384,7 @@ def _head_parallel_attend(
         attend = functools.partial(
             msa_attention_lse.msa_sparse_attention_lse,
             sm_scale=sm_scale,
-            block_q=msa_attention.DEFAULT_BLOCK_Q,
-            pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+            **hp_prefill_kernel_kwargs(),
             head=0,
             scale_cache=sc,
             k_scale_row=0,

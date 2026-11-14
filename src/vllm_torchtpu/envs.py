@@ -230,6 +230,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
 
 
 def env_with_choices(
@@ -1429,6 +1430,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of two (`models.minimax_m3.dcp_pack`). 0 keeps two gathers.
     "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 head-parallel DCP prefill attention (`msa_dcp_heads`, steps of
+    # at least 2,048 tokens at DCP 8) kernel config, "<block_q>:<pages per
+    # step>:<step widths, '/'-separated>:<page cache slots>", e.g.
+    # "16:16:2/4/6/8/12:512". Empty keeps the kernel defaults (block_q 16,
+    # 16 pages per step, widths 4/8, no page cache); the
+    # TPU_MINIMAX_M3_MSA_PREFILL_* flags apply only to `msa_attend_dcp`.
+    "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG": env_str(
+        "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG", ""
     ),
 }
 
