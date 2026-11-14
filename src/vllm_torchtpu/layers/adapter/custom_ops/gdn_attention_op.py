@@ -567,6 +567,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 conv_state_dtype,
             )
         conv_state_dtype = torch.float32
+        if envs.TPU_GDN_SSM_STATE_QUANT and not self._pcp_streaming_enabled():
+            # Quantized SSM state packs values + FP32 block-16 scales into
+            # 32-bit words sized by `get_state_shape`.
+            temporal_state_dtype = torch.float32
         return conv_state_dtype, temporal_state_dtype
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
@@ -595,6 +599,18 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             conv_dim_axis=0 if is_conv_state_dim_first() else -1,
         )
         conv_state_shape = conv_state_shape[:-1] + (1, conv_state_shape[-1])
+        if envs.TPU_GDN_SSM_STATE_QUANT and not self._pcp_streaming_enabled():
+            from vllm_torchtpu.gdn_pool_layout import gdn_ssm_quant_u32_rows
+
+            u32_rows = gdn_ssm_quant_u32_rows(
+                self.head_k_dim, envs.TPU_GDN_SSM_STATE_QUANT
+            )
+            if u32_rows is not None:
+                temporal_state_shape = (
+                    temporal_state_shape[0],
+                    u32_rows,
+                    temporal_state_shape[2],
+                )
         return conv_state_shape, temporal_state_shape
 
     @staticmethod
