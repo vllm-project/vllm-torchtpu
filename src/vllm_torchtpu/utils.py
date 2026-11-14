@@ -65,11 +65,30 @@ def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
         return tp_size
 
 
+# Under the batch-1 rule (runner.host_trims) get_dp_size answers from a
+# per-config cache: it is asked many times per decode step (DP-lockstep checks
+# in the runner and drafter), and TORCH_TPU_DP_SIZE and data_parallel_size are
+# fixed for the life of the process.
+_DP_SIZE_CACHE = [False]
+_dp_size_cache: list = [None, 0]  # [parallel_config, dp_size]
+
+
+def cache_dp_size(enabled: bool) -> None:
+    """Turn get_dp_size's per-config cache on or off (``runner.host_trims``)."""
+    _DP_SIZE_CACHE[0] = bool(enabled)
+    _dp_size_cache[0], _dp_size_cache[1] = None, 0
+
+
 def get_dp_size(parallel_config) -> int:
-    return (
+    if _DP_SIZE_CACHE[0] and _dp_size_cache[0] is parallel_config:
+        return _dp_size_cache[1]
+    v = (
         int(os.environ.get("TORCH_TPU_DP_SIZE", "0"))
         or parallel_config.data_parallel_size
     )
+    if _DP_SIZE_CACHE[0]:
+        _dp_size_cache[0], _dp_size_cache[1] = parallel_config, v
+    return v
 
 
 def min_over_group(value: int, cpu_group: Any) -> int:

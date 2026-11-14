@@ -768,6 +768,8 @@ class TpuPlatform(Platform):
     def get_compile_backend(cls) -> str:
         return "vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor"
 
+    _dp_tokens_tpu_cache: dict[tuple[int, ...], torch.Tensor] = {}
+
     @classmethod
     def set_additional_forward_context(cls, *args, **kwargs) -> dict:
         """Move DP metadata onto the TPU for DP+EP.
@@ -779,7 +781,12 @@ class TpuPlatform(Platform):
         if dp_metadata is not None:
             t = dp_metadata.num_tokens_across_dp_cpu
             if t.device.type == "cpu":
-                tpu_t = t.to("tpu")
+                key = (int(t.item()),) if t.numel() == 1 else tuple(t.tolist())
+                tpu_t = cls._dp_tokens_tpu_cache.get(key)
+                if tpu_t is None or tpu_t.dtype != t.dtype:
+                    tpu_t = t.to("tpu")
+                    if len(cls._dp_tokens_tpu_cache) < 512:
+                        cls._dp_tokens_tpu_cache[key] = tpu_t
                 try:
                     dp_metadata.num_tokens_across_dp_cpu = tpu_t
                 except Exception:
@@ -844,6 +851,12 @@ class TpuPlatform(Platform):
         )
         _validate_phased_profiling_config(vllm_config)
         _validate_peer_replay_config()
+        # API-server patches from additional_config["tpu_frontend"] (all off by
+        # default). This runs in every process that builds the engine config,
+        # including each API server, before the renderer exists.
+        from vllm_torchtpu import frontend_options
+
+        frontend_options.install(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
@@ -1554,10 +1567,13 @@ def _get_token_paddings(
     return paddings
 
 
-def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
-    # Each rank receives size // tp rows; require 8-token alignment or
+def _is_sequence_parallel_bucket(size: int, tp: int, min_rows: int) -> bool:
+    # A bucket below min_rows runs replicated, so any size serves. From there
+    # each rank receives size // tp rows; require 8-token alignment or
     # validated power-of-two decode sizes (2, 4) with at least 2 rows per rank
     # to avoid single-token shape specialization in Dynamo.
+    if size < min_rows:
+        return True
     rows, rem = divmod(size, tp)
     return rem == 0 and (rows % 8 == 0 or rows in (2, 4))
 
@@ -1565,8 +1581,10 @@ def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
 def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
     """Validate architecture and filter compile buckets for sequence-parallel MoE.
 
-    Keeps compile sizes where each tensor-parallel rank receives an 8-token aligned
-    shard or a validated power-of-two decode shard (2, 4 rows).
+    Keeps compile sizes below sequence_parallel.min_rows(), which run
+    replicated, and from there on those where each tensor-parallel rank
+    receives an 8-token aligned shard or a validated power-of-two decode shard
+    (2, 4 rows).
     """
     parallel_config = vllm_config.parallel_config
     if not parallel_config.use_sequence_parallel_moe:
@@ -1601,8 +1619,12 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
     cc = vllm_config.compilation_config
     if cc.compile_sizes is None:
         return
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    # The engine's layout, not this process's groups: none exist yet here.
+    min_rows = sequence_parallel.min_rows(parallel_config)
     original = [int(s) for s in cc.compile_sizes]
-    kept = [s for s in original if _is_sequence_parallel_bucket(s, tp)]
+    kept = [s for s in original if _is_sequence_parallel_bucket(s, tp, min_rows)]
     if not kept:
         raise ValueError(
             f"TPU_MOE_SEQUENCE_PARALLEL=1 left no valid compile sizes "

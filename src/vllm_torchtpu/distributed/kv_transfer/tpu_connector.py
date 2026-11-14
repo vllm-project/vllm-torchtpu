@@ -110,6 +110,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     derive_gdn_head_geometry,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import host_trims
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -592,7 +593,20 @@ def stage3_fa_raiden_id_fields(
     }
 
 
+# Under the batch-1 rule (runner.host_trims) the per-step connector hot path
+# asks these process-constant env predicates several times per decode step;
+# cache each one's first answer for the life of the process.
+_env_predicate_cache: dict[str, bool] = {}
+
+
 def _use_raiden_stage3_transport() -> bool:
+    if host_trims.ENABLED:
+        v = _env_predicate_cache.get("stage3")
+        if v is None:
+            v = _env_predicate_cache["stage3"] = (
+                str(tpu_envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() == "raiden"
+            )
+        return v
     return str(tpu_envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() == "raiden"
 
 
@@ -705,6 +719,11 @@ def _resolved_reshard_controller_address(dp_rank: int) -> str:
 
 
 def _use_raiden_glm_admission() -> bool:
+    if host_trims.ENABLED:
+        v = _env_predicate_cache.get("glm")
+        if v is None:
+            v = _env_predicate_cache["glm"] = bool(tpu_envs.use_raiden_glm_admission())
+        return v
     return tpu_envs.use_raiden_glm_admission()
 
 

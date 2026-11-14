@@ -42,6 +42,9 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.runner import fast_forward_context as _ffc
+from vllm_torchtpu.runner import host_trims
+from vllm_torchtpu.runner.fast_forward_context import fast_set_forward_context
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
@@ -655,7 +658,7 @@ class Eagle3Proposer:
         num_tokens = input_ids.shape[0]
         with (
             set_model_tag("eagle_head"),
-            set_forward_context(
+            (fast_set_forward_context if _ffc.enabled() else set_forward_context)(
                 attn_metadata,
                 self.draft_vllm_config,
                 num_tokens=num_tokens,
@@ -674,7 +677,10 @@ class Eagle3Proposer:
                 self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
                 seq_lens.copy_(seq_lens_step1)
                 self._mtp_fused_loop_warm = True
-            return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+            out = self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+        if host_trims.AOT_SKIP_GUARDS:
+            host_trims.maybe_skip_aot_guards(self._mtp_fused_loop)
+        return out
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
@@ -2111,7 +2117,7 @@ class Eagle3Proposer:
         model = self._draft_model_for_step(step_idx)
         with (
             set_model_tag("eagle_head"),
-            set_forward_context(
+            (fast_set_forward_context if _ffc.enabled() else set_forward_context)(
                 attn_metadata,
                 self.draft_vllm_config,
                 num_tokens=num_tokens,
@@ -2133,6 +2139,8 @@ class Eagle3Proposer:
                 model(**kwargs)
                 self._mtp_loop_model_warm = True
             out = model(**kwargs)
+        if host_trims.AOT_SKIP_GUARDS:
+            host_trims.maybe_skip_aot_guards(model)
 
         return self._unwrap_model_out(out)
 

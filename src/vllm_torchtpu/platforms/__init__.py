@@ -60,6 +60,22 @@ def register_tpu_platform() -> str:
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"
 
 
+def _install_qx_fastcall() -> None:
+    """Installs the torch.compile hook that additional_config["tpu_compile"]
+    arms. It does nothing until the worker applies those options (all off by
+    default; see compilation/compile_options.py)."""
+    from vllm_torchtpu._qx_fastcall import install
+
+    install()
+
+
+# Every vLLM process imports this module to resolve its platform, and every
+# import of the TPU platform runs it first, so the hook is in place before the
+# platform, worker, runner and kernel modules apply their module-level
+# torch.compile(backend="tpu") decorators. It imports torch, which the package
+# import must not.
+_install_qx_fastcall()
+
 import vllm  # noqa: E402,F401  # isort: skip
 
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform  # noqa: E402
