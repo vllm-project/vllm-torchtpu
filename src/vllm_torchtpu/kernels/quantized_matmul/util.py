@@ -22,6 +22,19 @@ from jax._src import dtypes
 
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import TunedValue
 
+# Quantize with the reciprocal of the scale (multiply by 1 / scale instead of
+# dividing by it); quantize_array then also maps an all-zero row's scale to 1
+# and clips FP8 values to the dtype's range before the cast. Off by default:
+# main's numerics. A model rule turns it on for every quantize in the process,
+# read when a kernel is traced (set_reciprocal_scale).
+RECIPROCAL_SCALE: bool = False
+
+
+def set_reciprocal_scale(enabled: bool) -> None:
+    """Quantize with the reciprocal scale (True) or by division (False)."""
+    global RECIPROCAL_SCALE
+    RECIPROCAL_SCALE = bool(enabled)
+
 
 def unfold_args(
     conditions: tuple[jax.Array | bool, ...],
@@ -310,9 +323,16 @@ def quantize_block(data, axis, target_dtype):
     dtype_max, dtype_min = get_max_min(target_dtype)
     scale = abs_max / dtype_max
     scale = jnp.where(scale == 0, 1.0, scale)
+    if not RECIPROCAL_SCALE:
+        if jnp.issubdtype(target_dtype, jnp.floating):
+            data_q = (data / scale).clip(dtype_min, dtype_max).astype(target_dtype)
+        else:
+            data_q = jnp.round(data / scale).astype(target_dtype)
+        return data_q, scale
+    inv_scale = jnp.float32(1.0) / scale
 
     if jnp.issubdtype(target_dtype, jnp.floating):
-        data_q = (data / scale).clip(dtype_min, dtype_max).astype(target_dtype)
+        data_q = jnp.clip(data * inv_scale, dtype_min, dtype_max).astype(target_dtype)
     else:
-        data_q = jnp.round(data / scale).astype(target_dtype)
+        data_q = jnp.round(data * inv_scale).astype(target_dtype)
     return data_q, scale

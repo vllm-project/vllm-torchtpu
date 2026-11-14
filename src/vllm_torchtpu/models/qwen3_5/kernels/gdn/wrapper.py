@@ -1,0 +1,950 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Copied from src/vllm_torchtpu/kernels/gdn/v3/wrapper.py at vllm-torchtpu main
+# c350823af74ba9cdf728daad64df7dd5bcf84e8e. This copy carries the Qwen3.5 GDN v3
+# changes and serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
+# layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
+# Upstream v3 changes are not picked up automatically.
+
+import functools
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.qwen3_5.kernels.gdn import (
+    compute_conv1d,
+    compute_gdn,
+    compute_kda,
+    config,
+    memory_ref,
+    metadata,
+    tiling,
+    vmem_ldst,
+)
+
+logger = init_logger(__name__)
+
+
+def inner_kernel(
+    # Inputs.
+    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size] or 2D bf16 rows
+    b_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
+    a_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
+    conv_state_in_slot_ref: jax.Ref,  # [seq, 1, prev_kernel_size, 1, dim_size]
+    recurrent_in_slot_ref: jax.Ref,  # [seq, 1, num_v_heads, kq_head, v_head]
+    # Outputs.
+    out_slot_ref: jax.Ref,  # [seq, chunk, num_v_heads, v_head]
+    conv_state_out_slot_ref: jax.Ref,  # [seq, window, prev_kernel_size, 1, dim]
+    recurrent_out_slot_ref: jax.Ref,  # [seq, window, num_v_heads, kq, v]
+    # Scratches.
+    metadata_ref: memory_ref.MetadataRef,
+    weights_ref: memory_ref.WeightRefs,
+    carry_conv_scratch_ref: jax.Ref | None,
+    carry_recurrent_scratch_ref: jax.Ref | None,
+    act_scratch_ref: jax.Ref | None = None,
+    *,
+    cfg: config.GDNConfig,
+    p_id: jax.Array | None = None,
+):
+    """Orchestrates computation of Conv1D and GDN for a single tile.
+
+    This kernel acts as a facade adhering to strict separation of concerns. It
+    operates VMEM reference without knowledge on DMA logic. Furthermore, the
+    kernel invokes vmem_ldst to pre-processes data needed for compute and
+    invokes compute_conv1d and compute_gdn for actual compute.
+
+    Args:
+        qkv_slot_ref: qkv VMEM ref that stores data loaded from HBM.
+        b_slot_ref: b VMEM ref that stores data loaded from HBM.
+        a_slot_ref: a VMEM ref that stores data loaded from HBM.
+        conv_state_in_slot_ref: Convolution state VMEM ref loaded from HBM.
+        recurrent_in_slot_ref: Recurrent state VMEM ref loaded from HBM.
+        out_slot_ref: Output VMEM ref that will be used for VMEM to HBM write.
+        conv_state_out_slot_ref: Convolution state VMEM ref written to HBM.
+        recurrent_out_slot_ref: Recurrent state VMEM ref written to HBM.
+        metadata_ref: Metadata reference containing grid and sequence mappings.
+        weights_ref: Weight references for Conv1D and GDN in VMEM.
+        carry_conv_scratch_ref: Optional VMEM scratch reference for inter-tile
+            convolution carry.
+        carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
+            recurrent state carry.
+        act_scratch_ref: Optional VMEM scratch reference for post-conv1d f32
+            activations when qkv_slot_ref is bfloat16.
+        cfg: GDN configuration object.
+        p_id: Optional explicit tile index. Communication-fused outer kernels
+            pass their global compute-tile index because their surrounding
+            pipeline owns the Pallas program id.
+    """
+
+    if p_id is None:
+        p_id = pl.program_id(0)
+
+    # 2D bf16 qkv: shift each sequence's rows out of their 16-row aligned DMA
+    # window into the f32 scratch. This runs before load_and_select_states so
+    # the unpack's bf16 load and f32 cast are dead before the selected states
+    # become live. Ordered after it, the unpack temporaries add to the VMEM
+    # peak: 4.0 MiB more for the per_seq b1 c64 kernel at dim 12288 on TPU7x.
+    qkv_work_ref = qkv_slot_ref
+    if qkv_slot_ref.ndim == 3:
+        assert act_scratch_ref is not None
+        aligned_chunk = pl.cdiv(cfg.chunk_size, 16) * 16
+        for idx in range(cfg.seq_tile_size):
+            r_base = metadata_ref.p_id_to_r_base[p_id, idx]
+            r_prefix = jax.lax.rem(r_base, 16)
+            for prefix in range(16):
+
+                @pl.when(r_prefix == prefix)
+                def _unpack(idx=idx, prefix=prefix):
+                    load_rows = pl.cdiv(prefix + aligned_chunk, 16) * 16
+                    dense_qkv = qkv_slot_ref[idx, :load_rows, :]
+                    act_scratch_ref[idx, :aligned_chunk, 0, :] = dense_qkv[
+                        prefix : prefix + aligned_chunk, :
+                    ].astype(jnp.float32)
+
+        qkv_work_ref = (
+            act_scratch_ref
+            if aligned_chunk == cfg.chunk_size
+            else act_scratch_ref.at[:, : cfg.chunk_size]
+        )
+
+    # Prepare states.
+    real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
+        metadata_ref=metadata_ref,
+        p_id=p_id,
+        conv_state_in_slot_ref=conv_state_in_slot_ref,
+        recurrent_in_slot_ref=recurrent_in_slot_ref,
+        carry_conv_scratch_ref=carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
+        cfg=cfg,
+    )
+
+    # Step 1: Conv1D.
+    # NOTE: Conv1D requires performing sliding window where inputs are slided
+    # across rows. If typical 2D layout was used, multiple rows are stored in a
+    # single register which necessitate costly shuffling for every sliding.
+    # Therefore, it is extremely important to leverage compact layout that
+    # ensures 1 register only stores data from 1 row.
+    if qkv_slot_ref.ndim == 3:
+        qkv_in_compact = qkv_work_ref[...]
+    else:
+        qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
+    qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
+
+    # Prepare conv1d weights.
+    conv_weight = weights_ref.conv.weight[...].astype(jnp.float32)
+    conv_bias = None
+    if weights_ref.conv.bias is not None:
+        conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
+
+    lazy_state = (
+        cfg.mode == config.GDNMode.PER_SEQ
+        and not cfg.use_recurrent
+        and carry_conv_scratch_ref is not None
+        and cfg.window_size == 1
+        and cfg.seq_tile_size == 1
+    )
+    if lazy_state:
+        assert carry_conv_scratch_ref is not None
+        qkv_out_compact = compute_conv1d.causal_conv1d_out(
+            qkv_in_compact, conv_weight, conv_bias, cfg
+        )
+        _lazy_conv_state(
+            lhs=qkv_in_compact[0],
+            real_sizes=real_sizes,
+            conv_state_out_slot_ref=conv_state_out_slot_ref,
+            carry_conv_scratch_ref=carry_conv_scratch_ref,
+            cfg=cfg,
+        )
+    else:
+        qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
+            real_sizes=real_sizes,
+            lhs=qkv_in_compact,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            cfg=cfg,
+        )
+
+        conv_state_out_slot_ref[...] = new_conv_state.astype(
+            conv_state_out_slot_ref.dtype
+        )
+        if carry_conv_scratch_ref is not None:
+            # The next tile resumes from the state after this tile's last
+            # token, which is the final checkpoint.
+            carry_conv_scratch_ref[...] = new_conv_state[:, -1]
+
+    # Apply activation function.
+    qkv_out_compact = jax.nn.silu(qkv_out_compact)
+
+    # Step 2: GDN.
+
+    # Prepare gdn weights.
+    if cfg.is_kda:
+        # KDA reshapes these per (head, channel) rather than padding out to
+        # a lane multiple over heads.
+        a_log = weights_ref.gdn.a_log[...]
+        dt_bias = weights_ref.gdn.dt_bias[...]
+    else:
+        padding_size = cfg.aligned_num_v_heads - cfg.num_v_heads
+        a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
+        dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
+
+    # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
+    # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
+    # Passing refs into gdn.py breaks strict separation of concerns.
+    if cfg.use_recurrent:
+        recurrent_fn = (
+            compute_kda.recurrent_kda if cfg.is_kda else compute_gdn.recurrent_gdn
+        )
+        q_compact, k_compact, v_compact, b_compact, a_compact = (
+            vmem_ldst.load_activation_as_compact(
+                qkv_vreg=qkv_out_compact,
+                qkv_vmem_ref=qkv_work_ref,
+                b_vmem_ref=b_slot_ref,
+                a_vmem_ref=a_slot_ref,
+                cfgs=cfg,
+            )
+        )
+
+        out, new_recurrent_state = recurrent_fn(
+            q_compact=q_compact,
+            k_compact=k_compact,
+            v_compact=v_compact,
+            b_compact=b_compact,
+            a_compact=a_compact,
+            state_prev=prev_recurrent,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            cfg=cfg,
+            real_sizes=real_sizes,
+        )
+
+    else:
+        chunked_fn = compute_kda.chunked_kda if cfg.is_kda else compute_gdn.chunked_gdn
+        q_large, k_large, v_large, b_large, a_large = (
+            vmem_ldst.load_activation_as_large(
+                qkv_vreg=qkv_out_compact,
+                qkv_vmem_ref=qkv_work_ref,
+                b_vmem_ref=b_slot_ref,
+                a_vmem_ref=a_slot_ref,
+                cfgs=cfg,
+            )
+        )
+
+        out, new_recurrent_state = chunked_fn(
+            q_large=q_large,
+            k_large=k_large,
+            v_large=v_large,
+            b_large=b_large,
+            a_large=a_large,
+            state_prev=prev_recurrent,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            cfg=cfg,
+            real_sizes=real_sizes,
+        )
+
+    # Store output and recurrent to vmem.
+    out_slot_ref[...] = out.astype(out_slot_ref.dtype)
+    # Round to the state dtype, then pack into the uint32 window.
+    recurrent_out_slot_ref[...] = pltpu.bitcast(
+        new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
+    )
+
+    if carry_recurrent_scratch_ref is not None:
+        carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
+
+
+def _store_conv_state_tile(conv_state_out_slot_ref: jax.Ref, state3: jax.Array) -> None:
+    """Stores one PER_SEQ tile's conv state ([prev_kernel_size, 1, dim]) into
+    window position 0 of slot 0."""
+    conv_state_out_slot_ref[0, 0] = state3.astype(conv_state_out_slot_ref.dtype)
+
+
+def _lazy_conv_state(
+    *,
+    lhs: jax.Array,  # [prev_kernel_size + chunk, 1, dim] f32
+    real_sizes: jax.Array,  # [1]
+    conv_state_out_slot_ref: jax.Ref,
+    carry_conv_scratch_ref: jax.Ref,
+    cfg: config.GDNConfig,
+) -> None:
+    """Conv state of a PER_SEQ chunked tile from its compact rows: the static
+    tail on a full tile, the per-row masked select on a partial tile.
+
+    A partial tile is not always its sequence's last. An internal prefill
+    checkpoint ends a tile at its checkpoint row, and PCP splits tiles at
+    rank-slot boundaries, so a tile can be partial with more of its sequence
+    still to come. The next tile takes its conv lookback from
+    `carry_conv_scratch_ref`, so a partial tile carries the rows that end at
+    its last real token (`lazy_conv_carry_rows`), never the static tail past
+    it. Every tile leaves its final conv state in window position 0, as the
+    eager path does: the output ref also copies that position to a prefill
+    checkpoint block when the tile ends at one.
+    """
+    chunk, kprev = cfg.chunk_size, cfg.prev_kernel_size
+    rs = real_sizes[0]
+    tail = lhs[chunk : chunk + kprev]
+    carry_conv_scratch_ref[0] = tail
+
+    @pl.when(rs == chunk)
+    def _full():
+        _store_conv_state_tile(conv_state_out_slot_ref, tail)
+
+    @pl.when(rs < chunk)
+    def _partial():
+        rows = lazy_conv_carry_rows(lhs, rs, cfg)
+        carry_conv_scratch_ref[0] = rows
+        _store_conv_state_tile(conv_state_out_slot_ref, rows)
+
+
+def lazy_conv_carry_rows(
+    lhs: jax.Array, real_size: jax.Array, cfg: config.GDNConfig
+) -> jax.Array:
+    """Conv rows a lazily converted tile hands to the next tile of its
+    sequence: rows [real_size, real_size + prev_kernel_size) of `lhs`, the
+    inputs ending at the tile's last real token. Equals the static tail on a
+    full tile."""
+    return compute_conv1d.conv_state_rows(lhs, real_size, cfg)
+
+
+def outer_kernel(
+    # Inputs.
+    metadata_ref: memory_ref.MetadataRef,
+    qkv_ref: jax.Array,
+    b_ref: jax.Array,
+    a_ref: jax.Array,
+    states_ref: jax.Array | tuple[jax.Array, jax.Array],
+    _: jax.Array,
+    weights_ref: memory_ref.WeightRefs,
+    # Outputs.
+    out_ref: jax.Array,
+    states_out_ref: jax.Array | tuple[jax.Array, jax.Array],
+    # Scratches.
+    carry_conv_scratch_ref: jax.Array | None,
+    carry_recurrent_scratch_ref: jax.Array | None,
+    act_scratch_ref: jax.Array | None = None,
+    *,
+    cfg: config.GDNConfig,
+):
+    """Setup memory allocations and emit pipeline for running inner_kernel."""
+    if cfg.is_shared:
+        # One pool row holds both regions; they are told apart by their
+        # granule offset, which `create_allocs` derives from this ref.
+        assert not isinstance(states_ref, tuple)
+        assert not isinstance(states_out_ref, tuple)
+        conv_state_ref = recurrent_state_ref = states_ref
+        conv_state_out_ref = recurrent_state_out_ref = states_out_ref
+    else:
+        assert len(states_ref) == 2
+        assert len(states_out_ref) == 2
+        conv_state_ref, recurrent_state_ref = states_ref
+        conv_state_out_ref, recurrent_state_out_ref = states_out_ref
+
+    (
+        qkv_alloc,
+        b_alloc,
+        a_alloc,
+        conv_in_alloc,
+        recurrent_in_alloc,
+        out_alloc,
+        conv_out_alloc,
+        recurrent_out_alloc,
+    ) = memory_ref.create_allocs(
+        metadata_ref=metadata_ref,
+        qkv_ref=qkv_ref,
+        b_ref=b_ref,
+        a_ref=a_ref,
+        out_ref=out_ref,
+        conv_state_ref=conv_state_ref,
+        recurrent_state_ref=recurrent_state_ref,
+        cfg=cfg,
+    )
+    num_tiles = metadata_ref.num_tiles[...]
+    body = functools.partial(inner_kernel, cfg=cfg)
+    scratches = (
+        metadata_ref,
+        weights_ref,
+        carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref,
+        act_scratch_ref,
+    )
+    state_allocs = (conv_in_alloc, recurrent_in_alloc)
+    out_allocs = (out_alloc, conv_out_alloc, recurrent_out_alloc)
+    state_out_args = (conv_state_out_ref, recurrent_state_out_ref)
+
+    pipeline_func = pltpu.emit_pipeline(
+        body=body,
+        grid=(num_tiles,),
+        in_specs=(
+            qkv_alloc.spec,
+            b_alloc.spec,
+            a_alloc.spec,
+            *(alloc.spec for alloc in state_allocs),
+        ),
+        out_specs=tuple(alloc.spec for alloc in out_allocs),
+    )
+
+    @pl.with_scoped(
+        allocations=(
+            qkv_alloc,
+            b_alloc,
+            a_alloc,
+            *state_allocs,
+            *out_allocs,
+        ),
+    )
+    def _run(allocations):
+        pipeline_func(
+            qkv_ref,
+            b_ref,
+            a_ref,
+            conv_state_ref,
+            recurrent_state_ref,
+            out_ref,
+            *state_out_args,
+            scratches=scratches,
+            allocations=allocations,
+        )
+
+    _run()
+
+
+@jax.jit(
+    donate_argnames=("states",),
+    static_argnames=(
+        "n_kq",
+        "n_v",
+        "d_k",
+        "d_v",
+        "kernel_size",
+        "num_spec_tokens",
+        "decode_tile_size",
+        "mixed_tile_size",
+        "batched_only",
+        "prefill_only",
+        "zero_initialize_out",
+        "compute_precision",
+        "recurrent_dtype",
+        "conv_dtype",
+        "attention_mode",
+        "gate_lower_bound",
+        "kernel_act_dtype",
+        "kernel_conv_weight_dtype",
+        "bf16_qkv_mode",
+    ),
+)
+def fused_conv1d_gdn(
+    qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
+    b: jax.Array,  # [batch_size, n_v]
+    a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
+    states: jax.Array | tuple[jax.Array, jax.Array],
+    conv_weight: jax.Array,  # [kernel_size - 1, dim_size]
+    conv_bias: jax.Array | None,  # [dim_size]
+    a_log: jax.Array,  # [n_v]
+    dt_bias: jax.Array,  # [n_v] for GDN, [n_v, d_k] for KDA
+    query_start_loc: jax.Array,  # [num_seqs + 1]
+    state_indices: jax.Array,  # [num_seqs]
+    distribution: jax.Array,  # [3]
+    seq_lens: jax.Array,  # [num_seqs]
+    read_offsets: jax.Array | None = None,  # [num_seqs]
+    ckpt_indices: jax.Array | None = None,  # [num_seqs, num_spec_tokens + 1]
+    prefill_ckpt_offsets: jax.Array | None = None,  # [num_seqs]
+    prefill_ckpt_indices: jax.Array | None = None,  # [num_seqs]
+    *,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    attention_mode: config.AttentionMode = config.AttentionMode.GDN,
+    gate_lower_bound: float | None = None,
+    recurrent_dtype: jnp.dtype | None = None,
+    conv_dtype: jnp.dtype | None = None,
+    num_spec_tokens: int = 0,
+    batched_only: bool = False,
+    prefill_only: bool = False,
+    zero_initialize_out: bool = True,
+    compute_precision: jnp.dtype = jnp.float32.dtype,
+    kernel_act_dtype: jnp.dtype = jnp.float32.dtype,
+    kernel_conv_weight_dtype: jnp.dtype = jnp.float32.dtype,
+    # TODO(kyuyeunk): Calculate tile size based on input dimensions.
+    decode_tile_size: int = 4,
+    mixed_tile_size: int = 64,
+    bf16_qkv_mode: int = 2,
+) -> tuple[jax.Array | tuple[jax.Array, jax.Array], jax.Array]:
+    """Perform conv1d and gdn in a single fused kernel.
+
+    Args:
+        qkv: Mixed query, key, value input tensor of shape [batch_size, dim_size],
+            where `dim_size = n_kq * d_k * 2 + n_v * d_v`.
+        b: b tensor (for beta) of shape [batch_size, n_v].
+        a: a tensor (for g) of shape [batch_size, n_v].
+        conv_state: Convolution state cache tensor of shape [num_seqs + 1,
+            kernel_size - 1, dim_size] containing the last (kernel_size - 1) tokens
+            from the last sequence invocation. The first slot is a null block used for
+            padded or invalid tokens. It may contain garbage data if it is a first
+            invocation of a sequence. None when `state_source` carries the states.
+        recurrent_state: Recurrent state cache tensor of shape [num_seqs + 1, n_v,
+            d_k, d_v]. The first slot is a null block used for padded or invalid
+            tokens. It may contain garbage data if it is a first invocation of a
+            sequence. None when `state_source` carries the states.
+        conv_weight: Convolution weight tensor of shape [kernel_size - 1, dim_size].
+        conv_bias: Optional convolution bias tensor of shape [dim_size].
+        a_log: a_log tensor of shape [n_v].
+        dt_bias: dt_bias tensor of shape [n_v]; [n_v, d_k] under KDA, whose
+            gate is per-channel. Kept 2D rather than flattened because the
+            KDA path reshapes it to broadcast over (head, channel), and
+            Mosaic rejects that shape cast from a flat vector
+            ("infer-vector-layout: unsupported shape cast").
+        query_start_loc: Start locations of sequences of shape [num_seqs + 1].
+        state_indices: Indices mapping sequences to state cache slots of shape
+            [num_seqs]. With speculative decoding these are the *base* slots
+            of per-request groups of `num_spec_tokens + 1` consecutive slots.
+        distribution: Tensor of shape [3] int32 — [decode_end, prefill_end,
+            mixed_end]. With `num_spec_tokens > 0`, the first segment holds
+            speculative verify windows of up to `num_spec_tokens + 1` tokens
+            rather than 1-token decodes.
+        seq_lens: Sequence lengths for each sequence of shape [num_seqs].
+        read_offsets: Optional [num_seqs] int32 — per-sequence state read
+            offset (num_accepted - 1 from the last verify step). Windowed
+            sequences read their initial state from
+            `state_indices[s] + read_offsets[s]` and write one checkpoint
+            per window position to `state_indices[s] + t`. Required when
+            `num_spec_tokens > 0`.
+        prefill_ckpt_offsets: Optional [num_seqs] int32. Query token offset
+            of each sequence's internal prefill checkpoint (0 for none). When
+            0 < offset < query_len and prefill_ckpt_indices is non-negative,
+            the state after the first offset query tokens is also written,
+            encoded like the final state, to block prefill_ckpt_indices[s].
+            Must be passed together with prefill_ckpt_indices.
+        prefill_ckpt_indices: Optional [num_seqs] int32. Destination state
+            block of each sequence's prefill checkpoint (-1 for none).
+        n_kq: Number of key/query heads.
+        n_v: Number of value heads.
+        d_k: Key/query dimension.
+        d_v: Value dimension.
+        kernel_size: Convolution kernel size.
+        attention_mode: `GDN` for the per-head scalar gate, `KDA` for the
+            per-channel one. Selects which compute path runs.
+        gate_lower_bound: KDA only, and must be negative. `None` gives the
+            unbounded gate `-exp(A_log) * softplus(g + dt_bias)`
+            (Kimi-Linear-48B); a float gives the bounded
+            `gate_lower_bound * sigmoid(exp(A_log) * (g + dt_bias))` (every K3
+            variant, at -5.0). Different functions of the same weights, so a
+            mismatch with the model's KDA config silently changes the decay.
+        num_spec_tokens: Number of speculative draft tokens (0 gives the
+            plain 1-token-per-sequence decode path).
+        batched_only: Run only the leading decode/verify segment.
+        prefill_only: Run only PER_SEQ, leaving decode/verify checkpoints
+            untouched. Mutually exclusive with batched_only.
+        zero_initialize_out: Whether to zero-initialize the output buffer before
+            executing non-batched sequences.
+        compute_precision: Computation precision dtype.
+        kernel_act_dtype: Dtype qkv, b and a are cast to before the kernel.
+        kernel_conv_weight_dtype: Dtype conv_weight and conv_bias are cast to
+            before the kernel.
+        decode_tile_size: Tile size along sequence dimension for decode sequences.
+            Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
+        mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
+            sequences. Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
+        bf16_qkv_mode: How a bf16 qkv reaches the kernel: 0 casts it to
+            `kernel_act_dtype` rows, 2 streams the 2D [T, dim] bf16 rows in
+            16-row aligned DMAs. Mode 2 needs dim a multiple of 2 * num_lanes,
+            at least 16 tokens and a multiple-of-8 mixed chunk, and falls back
+            to 0 otherwise.
+
+    Returns:
+        new_states: The updated state cache, aliased in place, with the same
+            structure as `states`.
+        out: Fused output tensor.
+    """
+    # TODO(kyuyeunk): Support bf16
+    if jnp.dtype(kernel_act_dtype) != jnp.float32:
+        raise ValueError(
+            f"kernel_act_dtype must be float32; got {jnp.dtype(kernel_act_dtype).name}."
+        )
+
+    act_out_dtype = qkv.dtype
+
+    is_shared = isinstance(states, jax.Array)
+    if is_shared:
+        state_packing = 4 // states.dtype.itemsize
+        # Ensure compact layout is used.
+        assert states.shape[-2] == state_packing
+        assert conv_dtype is not None
+        assert recurrent_dtype is not None
+    else:
+        assert len(states) == 2
+        recurrent_dtype = states[1].dtype
+        conv_dtype = states[0].dtype
+    # Conv1D reads the compact layout, which needs fp32. The recurrent state
+    # may be bf16: it is upcast once on load and rounded once on store.
+    if jnp.dtype(conv_dtype) != jnp.float32 or jnp.dtype(recurrent_dtype) not in (
+        jnp.dtype(jnp.float32),
+        jnp.dtype(jnp.bfloat16),
+    ):
+        raise NotImplementedError(
+            "GDN v3 needs an fp32 conv state and an fp32 or bf16 recurrent "
+            f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
+        )
+
+    if bf16_qkv_mode not in (0, 2):
+        raise ValueError(f"bf16_qkv_mode must be 0 or 2; got {bf16_qkv_mode}.")
+    b = b.astype(kernel_act_dtype)
+    a = a.astype(kernel_act_dtype)
+
+    # Step 1: Validate inputs.
+    is_kda = attention_mode == config.AttentionMode.KDA
+    if gate_lower_bound is not None:
+        if not is_kda:
+            raise ValueError(
+                "gate_lower_bound only applies to KDA; got "
+                f"attention_mode={attention_mode}."
+            )
+        # The chunked solve needs every causal exponent g_r - g_t to stay
+        # non-positive, which `gate_lower_bound * sigmoid(.)` only satisfies
+        # for a negative bound.
+        if gate_lower_bound >= 0:
+            raise ValueError(
+                "gate_lower_bound must be negative (it bounds a log-decay); "
+                f"got {gate_lower_bound}. A non-negative bound makes the gate "
+                "increase along the chunk, which this kernel does not "
+                "support."
+            )
+
+    num_seqs = state_indices.size
+    batch_size, dim = qkv.shape
+    assert conv_weight.shape == (dim, 1, kernel_size)
+    if conv_bias is not None:
+        assert conv_bias.shape == (dim,)
+    assert query_start_loc.shape == (num_seqs + 1,)
+    assert state_indices.shape == (num_seqs,)
+    assert distribution.shape == (3,)
+    if num_spec_tokens > 0:
+        assert read_offsets is not None, (
+            "read_offsets is required when num_spec_tokens > 0"
+        )
+    if read_offsets is None:
+        read_offsets = jnp.zeros_like(state_indices)
+    assert read_offsets.shape == (num_seqs,)
+    if ckpt_indices is not None:
+        # One source block per checkpoint (vLLM's ssm_state_indices scheme):
+        # checkpoint t of sequence s lives at block ckpt_indices[s, t], so
+        # the pool block only ever has to hold a single state.
+        assert ckpt_indices.shape == (num_seqs, num_spec_tokens + 1)
+    else:
+        # Iniitalize the ckpt_indices to default value.
+        spec_offset = jnp.arange(num_spec_tokens + 1).reshape(1, -1)
+        ckpt_indices = state_indices.reshape(-1, 1) + spec_offset
+    assert (prefill_ckpt_offsets is None) == (prefill_ckpt_indices is None), (
+        "prefill_ckpt_offsets and prefill_ckpt_indices go together"
+    )
+    if prefill_ckpt_offsets is not None:
+        assert prefill_ckpt_indices is not None
+        assert prefill_ckpt_offsets.shape == (num_seqs,), prefill_ckpt_offsets.shape
+        assert prefill_ckpt_indices.shape == (num_seqs,), prefill_ckpt_indices.shape
+        prefill_ckpt_offsets = prefill_ckpt_offsets.astype(jnp.int32)
+        prefill_ckpt_indices = prefill_ckpt_indices.astype(jnp.int32)
+
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    decode_tile_size = min(decode_tile_size, batch_size)
+    mixed_tile_size = min(mixed_tile_size, batch_size)
+    if (
+        bf16_qkv_mode == 2
+        and qkv.dtype == jnp.bfloat16
+        and dim % (2 * num_lanes) == 0
+        and batch_size >= 16
+        and mixed_tile_size % 8 == 0
+    ):
+        qkv_2d = True
+    else:
+        bf16_qkv_mode = 0
+        qkv_2d = False
+        qkv = qkv.astype(kernel_act_dtype)
+    act_in_dtype = qkv.dtype
+    assert a.dtype == b.dtype == jnp.dtype(kernel_act_dtype)
+
+    packing = 16 if qkv_2d else (4 // act_in_dtype.itemsize)
+    padded_batch_size = pl.cdiv(batch_size, packing) * packing
+    aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
+    window_size = num_spec_tokens + 1
+    decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+
+    # KDA stays on static tiles until the VMEM estimate models its gate.
+    if envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda:
+        decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
+            batch_size=batch_size,
+            num_seqs=num_seqs,
+            padded_batch_size=padded_batch_size,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            conv_state_dim_size=dim if is_shared else states[0].shape[-1],
+            act_out_dtype=act_out_dtype,
+            recurrent_state_dtype=recurrent_dtype,
+            num_lanes=num_lanes,
+            decode_vmem_limit_bytes=decode_vmem_limit_bytes,
+            mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+            window_size=window_size,
+            qkv_2d=qkv_2d,
+        )
+        if qkv_2d and mixed_tile_size % 8:
+            # The bf16 qkv layout runs only on multiple-of-8 chunks, and the
+            # VMEM fit can cap the chunk below the one checked above.
+            # padded_batch_size stays a multiple of 16, which f32 rows accept.
+            bf16_qkv_mode = 0
+            qkv_2d = False
+            qkv = qkv.astype(kernel_act_dtype)
+            act_in_dtype = qkv.dtype
+        logger.info_once(
+            "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
+            num_seqs,
+            batch_size,
+            window_size,
+            decode_tile_size,
+            mixed_tile_size,
+        )
+    else:
+        # Each sequence holds 1 input state slot plus `window` output
+        # checkpoint slots per buffer in VMEM, at every window size. Shrink
+        # the tile so the double-buffered windows fit in roughly half the
+        # scoped-VMEM budget.
+        window = num_spec_tokens + 1
+        num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
+        state_positions = 1 + window
+        recurrent_bytes_per_seq = (
+            state_positions * n_v * d_k * d_v * jnp.dtype(recurrent_dtype).itemsize
+        )
+        bytes_per_seq = (
+            # Recurrent checkpoints — the dominant term.
+            recurrent_bytes_per_seq
+            # Conv checkpoints (fp32).
+            + state_positions * (kernel_size - 1) * dim * 4
+            # qkv (fp32), b/a (fp32), out (act_out).
+            + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
+        )
+        spec_tile_budget = (decode_vmem_limit_bytes // 2) // num_buffers
+        decode_tile_size = max(
+            1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
+        )
+
+    if num_spec_tokens > 0 and is_kda:
+        # KDA verify keeps one sequence per tile until multi-sequence KDA
+        # verify tiles are sized by a KDA-aware VMEM estimate.
+        decode_tile_size = 1
+
+    batch_padding_size = padded_batch_size - batch_size
+    num_v_padding_size = aligned_num_v_heads - n_v
+    # KDA's gate carries d_k channels per value head, so it pads out to a
+    # lane multiple of n_v * d_k rather than of n_v.
+    gate_dim = n_v * d_k if is_kda else n_v
+    gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
+    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
+    a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
+
+    if not qkv_2d:
+        qkv = qkv.reshape(padded_batch_size, 1, -1)
+    b = b.reshape(padded_batch_size, 1, -1)
+    a = a.reshape(padded_batch_size, 1, -1)
+
+    # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
+    conv_state_shape = None
+    recurrent_state_shape = None
+    if not is_shared:
+        conv_state_shape = states[0].shape
+        rec_state = states[1]
+        if jnp.dtype(recurrent_dtype) == jnp.bfloat16:
+            recurrent_state_shape = rec_state.shape
+            rec_state = rec_state.reshape(-1, n_v * (d_k // 2), 2, d_v)
+        states = (states[0].reshape(-1, kernel_size - 1, 1, dim), rec_state)
+
+    # Step 3: Weights pre-processing.
+    # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
+    # loading stage.
+    conv_weight = conv_weight.swapaxes(0, 2).astype(kernel_conv_weight_dtype)
+    if conv_bias is not None:
+        conv_bias = conv_bias.astype(kernel_conv_weight_dtype)
+
+    # Step 4: Wrap inputs for the kernel.
+    conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight, bias=conv_bias)
+    gdn_weights = memory_ref.GDNWeightsRef(a_log=a_log, dt_bias=dt_bias)
+    weights = memory_ref.WeightRefs(conv=conv_weights, gdn=gdn_weights)
+
+    # Step 5: Create specs.
+    smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
+
+    def call_kernel(
+        in_states: jax.Array | tuple[jax.Array, jax.Array],
+        in_act: jax.Array | None,
+        mode: config.GDNMode,
+    ) -> tuple[jax.Array, jax.Array | tuple[jax.Array, jax.Array]]:
+        if mode == config.GDNMode.PER_SEQ:
+            tile_size = mixed_tile_size
+            # Prefill / mixed sequences keep a single state checkpoint.
+            window_size = 1
+        else:
+            tile_size = decode_tile_size
+            window_size = num_spec_tokens + 1
+
+        cfg = config.GDNConfig(
+            mode=mode,
+            batch_size=padded_batch_size,
+            kernel_size=kernel_size,
+            tile_size=tile_size,
+            window_size=window_size,
+            dim_size=dim,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=d_k,
+            v_head_dim=d_v,
+            attention_mode=attention_mode,
+            gate_lower_bound=gate_lower_bound,
+            dtypes=config.Dtypes(
+                act_in=act_in_dtype,
+                act_out=act_out_dtype,
+                compute=compute_precision,
+                recurrent_state=recurrent_dtype,
+                conv_state=conv_dtype,
+            ),
+            is_shared=is_shared,
+            qkv_2d=qkv_2d,
+        )
+
+        # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
+        # but will be CSEed by compiler.
+        if mode != config.GDNMode.PER_SEQ:
+            metadata_obj = metadata.compute_batched_seq_metadata(
+                cfg=cfg,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                state_indices=state_indices,
+                read_offsets=read_offsets,
+                end_seq=distribution[0],
+                ckpt_indices=ckpt_indices,
+            )
+        else:
+            metadata_obj = metadata.compute_per_seq_metadata(
+                cfg=cfg,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                state_indices=state_indices,
+                read_offsets=read_offsets,
+                start_seq=distribution[0],
+                end_seq=distribution[-1],
+                ckpt_indices=ckpt_indices,
+                prefill_ckpt_offsets=prefill_ckpt_offsets,
+                prefill_ckpt_indices=prefill_ckpt_indices,
+            )
+
+        metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
+        state_spec = jax.tree.map(lambda _: hbm_spec, in_states)
+        scratch_shapes = cfg.get_scratch_shape_dict()
+
+        # Step 7: Handle case where write needs to be done in existing out.
+        input_output_aliases = {}
+        state_pos = len(metadata_obj) + 3
+        # This ensures the logic can support both unified and non-unified pool.
+        num_states = len(jax.tree.leaves(in_states))
+        for i in range(num_states):
+            input_output_aliases[state_pos + i] = 1 + i
+        act_pos = state_pos + num_states
+
+        in_out_spec = None
+        out_shape = cfg.get_out_shape()
+        if in_act is None and zero_initialize_out:
+            in_act = jnp.zeros_like(out_shape)
+        if in_act is not None:
+            out_shape = in_act
+            in_out_spec = hbm_spec
+            input_output_aliases[act_pos] = 0
+
+        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+
+        return pl.pallas_call(
+            functools.partial(outer_kernel, cfg=cfg),
+            out_shape=(out_shape, in_states),
+            in_specs=(
+                metadata_spec,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                state_spec,
+                in_out_spec,
+                weights_spec,
+            ),
+            out_specs=(hbm_spec, state_spec),
+            scratch_shapes=scratch_shapes,
+            input_output_aliases=input_output_aliases,
+            compiler_params=pltpu.CompilerParams(
+                disable_bounds_checks=True,
+                vmem_limit_bytes=vmem_limit_bytes,
+            ),
+            name=cfg.get_kernel_name(),
+            # jax types metadata values as str; pallas_call serializes the
+            # config's int and float values to JSON as well.
+            # pyrefly: ignore[bad-argument-type]
+            metadata=cfg.get_metadata(),
+        )(
+            metadata_obj,
+            qkv,
+            b,
+            a,
+            in_states,
+            in_act,
+            weights,
+        )
+
+    # The first segment holds verify windows of up to `num_spec_tokens + 1`
+    # tokens, or plain 1-token decodes without speculative decoding.
+    if batched_only and prefill_only:
+        raise ValueError("batched_only and prefill_only are mutually exclusive")
+
+    out_act, out_states = None, states
+    if not prefill_only:
+        out_act, out_states = call_kernel(states, None, config.GDNMode.BATCHED)
+    if not batched_only:
+        if out_act is not None:
+            # Skip the PER_SEQ call when the batch has no prefill or mixed
+            # sequence (decode-only steps).
+            out_act, out_states = jax.lax.cond(
+                distribution[0] < distribution[2],
+                lambda act_states: call_kernel(
+                    act_states[1], act_states[0], config.GDNMode.PER_SEQ
+                ),
+                lambda act_states: act_states,
+                (out_act, out_states),
+            )
+        else:
+            out_act, out_states = call_kernel(
+                out_states, out_act, config.GDNMode.PER_SEQ
+            )
+
+    assert out_act is not None
+    out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+    # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
+    if conv_state_shape is not None:
+        out_states = (out_states[0].reshape(conv_state_shape), out_states[1])
+    if recurrent_state_shape is not None:
+        out_states = (out_states[0], out_states[1].reshape(recurrent_state_shape))
+    return out_states, out_act
