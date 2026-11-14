@@ -509,17 +509,17 @@ def _flash_attention_kernel_single_batch_single_step(
     m = jnp.max(s, axis=1)[:, None]
     p = jnp.exp(s - m)
     l = jnp.sum(p, axis=1)[:, None]
-    p /= l
 
     if m_ref is not None:
         m_ref[batch_idx] = lax.broadcast_in_dim(m, m_ref.shape[2:], range(2))
     if l_ref is not None:
         l_ref[batch_idx] = lax.broadcast_in_dim(l, l_ref.shape[2:], range(2))
 
+    # Round P before normalizing, like the multi-step path: the row max of
+    # exp(s - m) is exactly 1.0 in bf16, and only the fp32 output divides by l.
     v = v_tile_ref[batch_idx]
-    o_tile_ref[batch_idx] = jax.lax.dot(
-        p.astype(v.dtype), v, preferred_element_type=jnp.float32
-    ).astype(o_tile_ref.dtype)
+    o = jax.lax.dot(p.astype(v.dtype), v, preferred_element_type=jnp.float32)
+    o_tile_ref[batch_idx] = (o / l).astype(o_tile_ref.dtype)
 
 
 def _bytes(x: jax.Array | jax.ShapeDtypeStruct) -> int:
