@@ -37,6 +37,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     gmm_v2,
     gmm_v2_mlp,
     interleave_lane,
+    lane_pack,
     situ_and_mul,
 )
 
@@ -670,4 +671,59 @@ def test_gmm_v2_mlp_matches_two_gmms(batch_size, group_sizes):
     np.testing.assert_array_equal(
         np.asarray(actual[:num_rows].astype(jnp.float32)),
         np.asarray(expected[:num_rows].astype(jnp.float32)),
+    )
+
+
+def test_lane_pack_puts_both_halves_of_a_row_in_its_words():
+    x = jnp.asarray(np.random.default_rng(0).standard_normal((8, 512)), jnp.bfloat16)
+    bits = np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16)).astype(np.uint32)
+    np.testing.assert_array_equal(
+        np.asarray(lane_pack(x)), (bits[:, :256] << 16) | bits[:, 256:]
+    )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("num_tokens, real_tokens", [(1024, 1024), (1024, 700)])
+def test_gmm_v2_gathered_lhs_matches_gathered_rows(num_tokens, real_tokens):
+    """lhs_rows must give the gmm of the gathered rows, bit for bit."""
+    _require_tpu()
+    hidden, inter, num_groups, topk, block_size = 1024, 256, 16, 4, 128
+    rng = np.random.default_rng(0)
+    fp4_values = np.asarray(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.5, -1, -1.5, -2, -3, -4, -6], np.float32
+    )
+    w1 = jnp.asarray(rng.choice(fp4_values, (num_groups, hidden, 2 * inter))).astype(
+        jnp.float4_e2m1fn
+    )
+    s1 = jnp.asarray(
+        rng.uniform(0.5, 2, (num_groups, hidden // block_size, 1, 2 * inter)),
+        jnp.float32,
+    )
+    ids = np.stack(
+        [rng.choice(num_groups, topk, replace=False) for _ in range(num_tokens)]
+    )
+    valid = np.zeros((num_tokens, topk), bool)
+    valid[:real_tokens] = True
+    order = np.argsort(np.where(valid, ids, num_groups).reshape(-1), kind="stable")
+    rows = jnp.asarray(order // topk, jnp.int32)
+    group_sizes = jnp.asarray(np.bincount(ids[valid], minlength=num_groups), jnp.int32)
+    tokens = jnp.asarray(rng.standard_normal((num_tokens, hidden)), jnp.bfloat16)
+
+    def run(lhs, **kwargs):
+        return gmm_v2(
+            lhs,
+            w1,
+            group_sizes,
+            rhs_scale=s1,
+            zero_initialize=False,
+            fuse_act="swigluoai",
+            maybe_quantize_lhs=False,
+            **kwargs,
+        )
+
+    gathered = jax.jit(lambda t, r: run(t, lhs_rows=r))(tokens, rows)
+    expected = jax.jit(lambda t, r: run(t[r]))(tokens, rows)
+    computed = int(group_sizes.sum())
+    np.testing.assert_array_equal(
+        np.asarray(gathered[:computed]), np.asarray(expected[:computed])
     )

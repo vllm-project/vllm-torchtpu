@@ -609,6 +609,45 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
 
 
 @pytest.mark.tpu_test
+def test_fused_moe_gathered_gate_up_matches_dispatched_rows(monkeypatch):
+    _require_tpu()
+    num_tokens, hidden, inter, num_experts, topk = 1024, 1024, 256, 16, 4
+    keys = jax.random.split(jax.random.key(0), 5)
+    hidden_states = jax.random.normal(keys[0], (num_tokens, hidden), jnp.bfloat16)
+    w1 = jax.random.normal(keys[1], (num_experts, hidden, 2 * inter), jnp.bfloat16)
+    w2 = jax.random.normal(keys[2], (num_experts, inter, hidden), jnp.bfloat16)
+    topk_ids = jax.random.randint(keys[3], (num_tokens, topk), 0, num_experts)
+    topk_weights = jax.random.uniform(keys[4], (num_tokens, topk), jnp.float32)
+    # Padded tokens: zero weights, skipped by skip_padded_tokens.
+    topk_weights = topk_weights.at[-100:].set(0).astype(jnp.bfloat16)
+
+    def run():
+        return fused_moe_func(
+            hidden_states,
+            w1 / 32,
+            w2 / 32,
+            None,
+            None,
+            None,
+            None,
+            topk_weights,
+            topk_ids.astype(jnp.int32),
+            topk=topk,
+            activation="silu",
+            use_ep=False,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=512,
+            skip_padded_tokens=True,
+        )
+
+    gathered = run()
+    monkeypatch.setattr(fused_moe_gmm, "can_gather_lhs", lambda *a, **k: False)
+    fused_moe_func.clear_cache()
+    dispatched = run()
+    np.testing.assert_array_equal(np.asarray(gathered), np.asarray(dispatched))
+
+
+@pytest.mark.tpu_test
 def test_fused_moe_local_routing_matches_reference():
     _require_tpu()
 

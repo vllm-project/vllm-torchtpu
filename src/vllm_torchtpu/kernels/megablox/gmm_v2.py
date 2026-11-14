@@ -242,6 +242,41 @@ class MetadataRef:
 
 
 @dataclasses.dataclass(frozen=True)
+class LhsGather:
+    """The lhs rows of a gathered-lhs gmm (gmm_v2's ``lhs_rows``).
+
+    Row r of the logical lhs is token ``rows_ref[r]`` of ``tokens_ref``, the
+    [tokens, size_k // 2] uint32 lane-packed token matrix (lane_pack). Each gm
+    tile DMAs its rows into one slot of ``buf_ref`` while the previous tile
+    computes from the other.
+    """
+
+    tokens_ref: Any  # HBM uint32[num_tokens, size_k // 2]
+    rows_ref: Any  # SMEM int32[size_m]
+    buf_ref: Any  # VMEM uint32[2, tile_m // 8, 8, size_k // 2]
+    sems: Any  # DMA[2]
+
+
+def lane_pack(x: jax.Array) -> jax.Array:
+    """bf16 [m, k] -> uint32 [m, k // 2]: column c in the high half of word c,
+    column c + k // 2 in the low half, so one row is whole 32-bit words."""
+    half = x.shape[-1] // 2
+
+    def bits(cols):
+        return jax.lax.bitcast_convert_type(cols, jnp.uint16).astype(jnp.uint32)
+
+    return jnp.left_shift(bits(x[:, :half]), 16) | bits(x[:, half:])
+
+
+def _lane_unpack(words: jax.Array) -> jax.Array:
+    """Inverse of lane_pack on a VMEM value: uint32 [m, k // 2] -> bf16 [m, k]."""
+    words = pltpu.bitcast(words, jnp.int32)
+    hi = pltpu.bitcast(jnp.bitwise_and(words, -65536), jnp.float32)
+    lo = pltpu.bitcast(jnp.left_shift(words, 16), jnp.float32)
+    return jnp.concatenate([hi, lo], axis=1).astype(jnp.bfloat16)
+
+
+@dataclasses.dataclass(frozen=True)
 class TileSizes:
     tile_m: int
     tile_k: int
@@ -457,7 +492,7 @@ def generate_block_specs(
 
 def inner_kernel(
     # In
-    tiled_lhs_ref: jax.Array,
+    tiled_lhs_ref: jax.Array | None,  # None with a gathered lhs
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_k]
     tiled_rhs_ref: RhsRef,  # [tile_k, tile_n]
     # Out
@@ -469,6 +504,7 @@ def inner_kernel(
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
+    gather: LhsGather | None = None,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -498,12 +534,73 @@ def inner_kernel(
     m_start_local = m_start - m_offset
     m_end_local = m_end - m_offset
 
+    if gather is not None:
+        # One grid step per gm tile (run_gmm_pipeline checks a single n and k
+        # tile): the next tile's rows go out before this one's compute.
+        slot = gm_id % 2
+        sublane = cfgs.dims.size_lhs_sublane
+        # A tile fetches rows [m_offset, m_offset + its row count rounded up
+        # to whole 32-bit sublane tiles): the extra rows sit in the padded
+        # row table, belong to other groups and are masked like them.
+        word_tile = pltpu.get_tpu_info().num_sublanes
+
+        def tile_rows(tile):
+            start = metadata_ref.gm_id_to_m_offset[tile]
+            end = metadata_ref.gm_id_to_m_offset[tile + 1]
+            offset = start - start % sublane
+            count = pl.cdiv(end - offset, word_tile) * word_tile
+            return offset, pl.multiple_of(count, word_tile)
+
+        def issue_rows(tile, tile_slot):
+            offset, count = tile_rows(tile)
+
+            # Tile-row views: the index arithmetic of a row's address is a
+            # shift and a mask instead of a general tiled offset.
+            tokens = gather.tokens_ref.reshape(
+                -1, word_tile, gather.tokens_ref.shape[-1]
+            )
+            shift = word_tile.bit_length() - 1
+
+            def rows(j, carry):
+                for i in range(word_tile):
+                    token = gather.rows_ref[offset + j * word_tile + i]
+                    pltpu.make_async_copy(
+                        tokens.at[
+                            jnp.right_shift(token, shift),
+                            pl.ds(jnp.bitwise_and(token, word_tile - 1), 1),
+                        ],
+                        gather.buf_ref.at[tile_slot, j, pl.ds(i, 1)],
+                        gather.sems.at[tile_slot],
+                    ).start()
+                return carry
+
+            lax.fori_loop(0, count // word_tile, rows, 0)
+
+        @pl.when(gm_id == 0)
+        def _():
+            issue_rows(0, 0)
+
+        @pl.when(gm_id + 1 < pl.num_programs(1))
+        def _():
+            issue_rows(gm_id + 1, 1 - slot)
+
+        # The tile's row DMAs signal one semaphore with their bytes.
+        rows = gather.buf_ref.at[slot, pl.ds(0, tile_rows(gm_id)[1] // word_tile)]
+        pltpu.make_async_copy(rows, rows, gather.sems.at[slot]).wait()
+
     def _matmul(is_first_k_step: bool, is_last_k_step: bool, bucket_m: int):
         tpu_info = pltpu.get_tpu_info()
         mxu_size = tpu_info.mxu_column_size
 
         # Step 1: Input pre-processing.
-        tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
+        if gather is not None:
+            # Rows of the tile the DMAs did not write belong to other groups
+            # and are masked from the output below.
+            words = gather.buf_ref[slot, : bucket_m // word_tile]
+            tiled_lhs = _lane_unpack(words.reshape(bucket_m, words.shape[-1]))
+        else:
+            assert tiled_lhs_ref is not None
+            tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
         tiled_rhs = tiled_rhs_ref.get_weight()
 
         # This should only be taken in the case where we don't requantize
@@ -913,6 +1010,7 @@ def kernel_main(
     semaphore_ref: jax.Array | None,  # [1]
     *,
     cfgs: GmmConfigs,
+    lhs_rows_ref: jax.Array | None = None,  # int32[size_m]
 ):
     """Entry point for GMM kernel.
 
@@ -968,10 +1066,24 @@ def kernel_main(
         metadata_ref,
         num_gm,
         cfgs=cfgs,
+        lhs_rows_ref=lhs_rows_ref,
     )
 
     if cfgs.zero_init:
         zero_out_end(out_ref, cast(jax.Array, semaphore_ref), zero_size, dims=cfgs.dims)
+
+
+def kernel_main_gathered(
+    lhs_group_sizes_ref, group_offset_ref, lhs_rows_ref, *refs, cfgs
+):
+    """kernel_main for gmm_v2's gathered lhs: lhs_rows is a third scalar prefetch."""
+    kernel_main(
+        lhs_group_sizes_ref,
+        group_offset_ref,
+        *refs,
+        cfgs=cfgs,
+        lhs_rows_ref=lhs_rows_ref,
+    )
 
 
 def run_gmm_pipeline(
@@ -986,8 +1098,12 @@ def run_gmm_pipeline(
     cfgs: GmmConfigs,
     rhs_weight_window: jax.Array | None = None,
     last_step_hook: Callable[[], None] | None = None,
+    lhs_rows_ref: jax.Array | None = None,
 ):
     """Runs the grouped matmul over the gm tiles that fill_metadata laid out.
+
+    lhs_rows_ref: gathered lhs (gmm_v2's lhs_rows); lhs_ref is then the
+    lane-packed token matrix, and the rows are DMA'd per tile (LhsGather).
 
     last_step_hook runs at the start of the last grid step, when the pipeline
     fetches nothing more (kernel_mlp issues the next gmm's first DMA there).
@@ -1016,7 +1132,12 @@ def run_gmm_pipeline(
 
     # Bounded slice requires second last dim to be aligned to the sublane size.
     # rhs_ref uses static tiling thus reshape is not needed.
-    lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
+    # A gathered lhs (the lane-packed tokens) is read by row DMAs, not blocks.
+    lhs_in = (
+        lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
+        if lhs_rows_ref is None
+        else lhs_ref
+    )
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
     grid = (num_n, num_gm, num_k)
@@ -1031,6 +1152,32 @@ def run_gmm_pipeline(
             )
             pl.when(is_last)(last_step_hook)
             inner_body(*refs)
+
+    if lhs_rows_ref is not None:
+        assert rhs_weight_window is None and last_step_hook is None
+        assert num_n == 1 and num_k == 1, "a gathered lhs needs one n and one k tile"
+
+        word_tile = pltpu.get_tpu_info().num_sublanes
+
+        def gathered(buf_ref, sems):
+            gather = LhsGather(lhs_ref, lhs_rows_ref, buf_ref, sems)
+
+            def gathered_body(rhs, out, *scratch):
+                inner_kernel(None, rhs, out, *scratch, cfgs=cfgs, gather=gather)
+
+            pltpu.emit_pipeline(
+                gathered_body, grid=grid, in_specs=(rhs_spec,), out_specs=out_spec
+            )(rhs_ref, out_in, scratches=scratches)
+
+        pl.run_scoped(
+            gathered,
+            pltpu.VMEM(
+                (2, cfgs.tiles.tile_m // word_tile, word_tile, cfgs.dims.size_k // 2),
+                jnp.uint32,
+            ),
+            pltpu.SemaphoreType.DMA((2,)),
+        )
+        return
 
     if rhs_weight_window is None:
         pltpu.emit_pipeline(
@@ -1546,6 +1693,66 @@ def make_gmm_configs(
     )
 
 
+def can_gather_lhs(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    rhs_scale: jax.Array | None,
+    group_sizes: jax.Array,
+    num_rows: int,
+    *,
+    fuse_act: str | None,
+    maybe_quantize_lhs: bool,
+) -> bool:
+    """Whether gmm_v2 takes ``num_rows`` rows of ``lhs`` as ``lhs_rows``: a bf16
+    lhs of whole lane-packed words and sublane tiles, unquantized, and one n
+    and one k tile."""
+    tpu_info = pltpu.get_tpu_info()
+    rows = align_to(num_rows, _get_lhs_sublane_size(lhs.dtype, num_rows))
+    if (
+        lhs.ndim != 2
+        or lhs.dtype != jnp.bfloat16
+        or lhs.shape[0] % tpu_info.num_sublanes
+        or lhs.shape[1] % (2 * tpu_info.num_lanes)
+        or get_packing_factor(rhs.dtype, None) != 1
+        # The row table is scalar-prefetched beside the gm metadata; half of
+        # SMEM is budgeted for it.
+        or rows * 4 > tpu_info.smem_capacity_bytes // 2
+    ):
+        return False
+    cfgs = make_gmm_configs(
+        jax.ShapeDtypeStruct((rows, lhs.shape[1]), lhs.dtype),
+        rhs,
+        rhs_scale,
+        None,
+        group_sizes,
+        jax.ShapeDtypeStruct((1,), jnp.int32),
+        tile_info=calculate_tiling,
+        vmem_limit_bytes=int(tpu_info.vmem_capacity_bytes * 0.9),
+        out_dtype=None,
+        acc_dtype=None,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        zero_initialize=False,
+        fuse_act=fuse_act,
+    )
+    tiles = cfgs.tiles
+    vmem = gmm_vmem_estimate(
+        tiles.tile_m,
+        tiles.tile_n,
+        tiles.tile_k,
+        lhs_cfgs=cfgs.lhs_cfgs,
+        rhs_cfgs=cfgs.rhs_cfgs,
+        fuse_act=fuse_act,
+    )
+    return (
+        not cfgs.lhs_cfgs.should_quantize
+        and tiles.tile_k >= cfgs.dims.size_k
+        and tiles.tile_n >= cfgs.out_size_n
+        # The rows unpack through f32 before the bf16 lhs is formed.
+        and vmem + tiles.tile_m * cfgs.dims.size_k * 4
+        <= int(tpu_info.vmem_capacity_bytes * 0.9)
+    )
+
+
 def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
     cfgs_dict = dataclasses.asdict(cfgs)
     ret = {}
@@ -1606,6 +1813,7 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
+    lhs_rows: jax.Array | None = None,  # int32[size_m]
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1631,6 +1839,10 @@ def gmm_v2(
         fuse_act: Activation function to fuse with GMM, None if no fusion.
         rhs_quant_dtype: Quantized dtype encoded by a pre-packed RHS carrier.
             Packed along k-axis
+        lhs_rows: Optional. Gathers the lhs: row r is lhs[lhs_rows[r]], DMA'd
+            per tile from the lane-packed tokens, so the [size_m, size_k]
+            routed rows are never written out. Needs a bf16 lhs and one n and
+            one k tile.
 
     Returns:
         Output of shape [size_m, size_n].
@@ -1641,10 +1853,23 @@ def gmm_v2(
     # The kernel reshapes lhs by its sublane block, so pad the rows up to it.
     # The extra rows sit past every group, so they add no work, and they are
     # sliced back off the output below.
+    tokens = None
+    if lhs_rows is not None:
+        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        assert lhs.dtype == jnp.bfloat16, lhs.dtype
+        # Whole lane-packed words per row and whole sublane tiles of tokens
+        # (the row DMAs address tokens by tile row and sublane).
+        assert lhs.shape[1] % (2 * pltpu.get_tpu_info().num_lanes) == 0, lhs.shape
+        assert lhs.shape[0] % num_sublanes == 0, lhs.shape
+        tokens = lane_pack(lhs)
+        lhs = jax.ShapeDtypeStruct((lhs_rows.shape[0], lhs.shape[1]), lhs.dtype)
     size_m = lhs.shape[0]
     size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
     padded_size_m = align_to(size_m, size_lhs_sublane)
-    if padded_size_m != size_m:
+    if lhs_rows is not None:
+        lhs_rows = jnp.pad(lhs_rows.astype(jnp.int32), (0, padded_size_m - size_m))
+        lhs = jax.ShapeDtypeStruct((padded_size_m, lhs.shape[1]), lhs.dtype)
+    elif padded_size_m != size_m:
         lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
 
     if group_offset is None:
@@ -1715,6 +1940,35 @@ def gmm_v2(
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+
+    if lhs_rows is not None:
+        # The rows and the lane-packed tokens stand in for the lhs operand.
+        return pl.pallas_call(
+            functools.partial(kernel_main_gathered, cfgs=cfgs),
+            out_shape=out_init,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=3,
+                in_specs=[
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                    WeightsRef(
+                        weight=pl.BlockSpec(memory_space=pltpu.HBM),
+                        scale=rhs_scale_spec,
+                        bias=rhs_bias_spec,
+                    ),
+                ],
+                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+                scratch_shapes=scratch_shapes,
+            ),
+            compiler_params=pltpu.CompilerParams(
+                vmem_limit_bytes=vmem_limit_bytes,
+                disable_bounds_checks=True,
+            ),
+            name=get_scope_name(cfgs) + "-gathered",
+            cost_estimate=get_cost_estimate(cfgs),
+            metadata=get_metadata(cfgs),
+        )(group_sizes, group_offset, lhs_rows, tokens, rhs_weights)[
+            :size_m, : cfgs.out_size_n
+        ]
 
     return pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),

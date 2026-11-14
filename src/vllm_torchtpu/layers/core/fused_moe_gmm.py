@@ -26,6 +26,8 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     dense_expert_moe_fp4,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    FP8_DECODE_MAX_M,
+    can_gather_lhs,
     get_packing_factor,
     gmm_v2,
     gmm_v2_mlp,
@@ -539,8 +541,14 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    tokens: jax.Array | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
+
+    ``tokens`` (the unpermuted [num_tokens, hidden] rows) lets a non-EP
+    prefill gate/up GMM read its rows from them by ``token_indices_sorted``
+    instead of from the dispatched ``x`` (gmm_v2's lhs_rows), so ``x`` is
+    never materialized.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
@@ -551,7 +559,50 @@ def moe_gmm(
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
-    if (
+    gather_gate_up = (
+        tokens is not None
+        and not use_ep
+        # Decode-sized buffers keep the dispatched rows and decode tiles.
+        and x.shape[0] > FP8_DECODE_MAX_M
+        and w1_bias is None
+        # What lets the gathered call below leave out rhs_quant_dtype;
+        # can_gather_lhs cannot see a packed carrier's logical dtype.
+        and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
+        and can_gather_lhs(
+            tokens,
+            w1,
+            w1_scale,
+            group_sizes,
+            x.shape[0],
+            fuse_act=activation,
+            maybe_quantize_lhs=not _is_fp4_weight(w1),
+        )
+    )
+    if gather_gate_up:
+        gmm1_res = gmm_v2(
+            tokens,
+            w1,
+            group_sizes,
+            rhs_scale=w1_scale,
+            group_offset=group_offset,
+            zero_initialize=False,
+            fuse_act=activation,
+            maybe_quantize_lhs=not _is_fp4_weight(w1),
+            lhs_rows=token_indices_sorted,
+        )
+        packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+        gmm2_res = gmm_wrapper(
+            gmm1_res[:, : w2.shape[1] * packing_factor],
+            w2,
+            w2_scale,
+            w2_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            preferred_element_type=x.dtype,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    elif (
         _is_fp4_weight(w1)
         and _is_fp4_weight(w2)
         and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
@@ -863,7 +914,8 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
     )
-    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    pad = ((0, 0), (0, padded_hidden_size - hidden_size))
+    x = jnp.pad(x, pad)
     x = moe_gmm(
         x,
         w1,
@@ -884,5 +936,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        tokens=None if use_ep else jnp.pad(hidden_states, pad),
     )
     return x[:num_tokens, :hidden_size]
