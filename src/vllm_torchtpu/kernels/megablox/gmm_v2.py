@@ -25,6 +25,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
+
 # Util.
 
 
@@ -328,6 +330,39 @@ def fp8_rhs_feed_dtype(
     return None
 
 
+def requantize_fp8_colscale(
+    w: jax.Array,  # fp4 [tile_k, tile_n]
+    block_scale: jax.Array,  # f32 [tile_k // qbs, 1, tile_n]
+    qbs: int,
+    work_dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array]:
+    """Re-expresses per-K-block scaled fp4 as e4m3 with one scale per column.
+
+    Returns (w8, col_scale [1, tile_n] f32) with w8 * col_scale ~= w * block_scale,
+    so the tile is a single full-depth fp8 matmul scaled once at the end,
+    without the per-block f32 accumulate of the per-block fp8 feed.
+    """
+    fp8 = jnp.float8_e4m3fn
+    w_max = float(jnp.finfo(w.dtype).max)
+    col_max = jnp.max(block_scale, axis=0)  # [1, tile_n]
+    col_scale = col_max * (w_max / float(jnp.finfo(fp8).max))
+    ratio = (block_scale / jnp.where(col_scale == 0, 1.0, col_scale)).astype(
+        work_dtype
+    )
+    num_blocks, tile_n = block_scale.shape[0], w.shape[1]
+    w_blocks = w.astype(work_dtype).reshape(num_blocks, qbs, tile_n) * ratio
+    return w_blocks.reshape(-1, tile_n).astype(fp8), col_scale
+
+
+def quantize_rows_fp8(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Per-row e4m3 quantization: returns (x8, row_scale [m, 1] f32)."""
+    fp8 = jnp.float8_e4m3fn
+    amax = jnp.max(jnp.abs(x), axis=1, keepdims=True).astype(jnp.float32)
+    row_scale = amax / float(jnp.finfo(fp8).max)
+    inv = jnp.where(row_scale == 0, 0.0, 1.0 / row_scale).astype(x.dtype)
+    return (x * inv).astype(fp8), row_scale
+
+
 @dataclasses.dataclass(frozen=True)
 class GmmConfigs:
     tiles: TileSizes
@@ -348,6 +383,20 @@ class GmmConfigs:
         if bucket_m > FP8_RHS_MAX_BUCKET_M:
             return None
         return fp8_rhs_feed_dtype(self.lhs_cfgs, self.rhs_cfgs)
+
+    def uses_fp8_w8a8(self, bucket_m: int) -> bool:
+        """Whether this prefill bucket runs fp8 x fp8 (TPU_GMM_FP8_W8A8):
+        rhs requantized per column, lhs per row. Large-m tiles bind on the
+        MXU's lhs stream, which fp8 halves (fp8 rhs alone does not help)."""
+        return (
+            envs.TPU_GMM_FP8_W8A8
+            and bucket_m > FP8_RHS_MAX_BUCKET_M
+            and self.dims.size_m > FP8_DECODE_MAX_M
+            and fp8_rhs_feed_dtype(self.lhs_cfgs, self.rhs_cfgs) is not None
+            and pltpu.get_tpu_info().is_matmul_supported(
+                jnp.float8_e4m3fn.dtype, jnp.float8_e4m3fn.dtype
+            )
+        )
 
     @property
     def out_size_n(self) -> int:
@@ -527,7 +576,19 @@ def inner_kernel(
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
         dequant_after = cfgs.rhs_cfgs.should_dequantize_after_matmul
         fp8_rhs = cfgs.fp8_rhs_dtype(bucket_m)
-        if fp8_rhs is not None:
+        col_scale = row_scale = None
+        if fp8_rhs is None and cfgs.uses_fp8_w8a8(bucket_m):
+            tiled_rhs, col_scale = requantize_fp8_colscale(
+                tiled_rhs, tiled_rhs_ref.get_scale(), rhs_qbs, cfgs.lhs_cfgs.dtype
+            )
+            valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
+            if is_last_k_step and valid_k != 0:
+                # Columns past size_k are stale VMEM; keep them out of the amax.
+                col = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape, 1)
+                tiled_lhs = jnp.where(col < valid_k, tiled_lhs, 0)
+            tiled_lhs, row_scale = quantize_rows_fp8(tiled_lhs)
+            rhs_qbs = cfgs.tiles.tile_k
+        elif fp8_rhs is not None:
             # Skinny m: the MXU weight push binds, and fp8 halves it.
             tiled_rhs = tiled_rhs.astype(fp8_rhs)
             dequant_after = True
@@ -574,6 +635,8 @@ def inner_kernel(
                         block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
                     acc_n += block_acc
+                if col_scale is not None:
+                    acc_n *= col_scale[:, start_n:end_n] * row_scale
                 acc_list.append(acc_n)
         else:
             # Quantized matmul path.
