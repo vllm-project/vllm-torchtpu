@@ -27,40 +27,42 @@ Both the standard server-side profiler and the [phased profiler](phased.md)
 resolve per-session options through
 [`src/vllm_torchtpu/tracing/options.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/tracing/options.py).
 
-You can override standard tracer levels:
+You can override standard tracer levels, advanced/kernel/SparseCore TPU
+`experimental_options`, and firmware event flags dynamically at `/start_profile`
+time without restarting `vllm serve`:
 
-- `host_tracer_level`
-- `device_tracer_level`
-- `python_tracer_level`
+| Category | Option (`profiler_kwargs` key) | Env Var Default | Values / Description |
+|---|---|---|---|
+| **Standard Tracer** | `host_tracer_level` | `HOST_TRACER_LEVEL` (`2`) | `0` (disabled), `1` (user `TraceMe`), `2` (XLA + user `TraceMe`), `3` (verbose low-level XLA). |
+| **Standard Tracer** | `device_tracer_level` | `DEVICE_TRACER_LEVEL` (`1`) | `0` (disabled), `1` (enable TPU hardware execution tracing). |
+| **Standard Tracer** | `python_tracer_level` | `PYTHON_TRACER_LEVEL` (`1`) | `0` (disabled), `1` (enable Python function call tracing). |
+| **Kernel & SparseCore** | `tpu_trace_mode` | `TPU_TRACE_MODE` (`"TRACE_COMPUTE"`) | `"TRACE_ONLY_STEP"`, `"TRACE_ONLY_HOST"`, `"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_SYNC"`. |
+| **Kernel & SparseCore** | `tpu_num_sparse_cores_to_trace` | `TPU_NUM_SPARSE_CORES_TO_TRACE` (`1`) | Integer count of SparseCores to trace per chip. |
+| **Kernel & SparseCore** | `tpu_num_sparse_core_tiles_to_trace` | `TPU_NUM_SPARSE_CORE_TILES_TO_TRACE` (`1`) | Integer count of SparseCore tiles (`spmem`) to trace. |
+| **Firmware Events** | `e2e_enable_fw_throttle_event` | *(unset / `false`)* | `true` / `false` — capture firmware throttling events in XPlane. |
+| **Firmware Events** | `e2e_enable_fw_power_level_event` | *(unset / `false`)* | `true` / `false` — capture firmware power-level transition events. |
+| **Firmware Events** | `e2e_enable_fw_thermal_event` | *(unset / `false`)* | `true` / `false` — capture firmware thermal events. |
 
-and pass advanced TPU `experimental_options`, such as:
-
-- `tpu_trace_mode`
-- `tpu_num_sparse_cores_to_trace`
-- `tpu_num_sparse_core_tiles_to_trace`
-
-or firmware event flags like:
-
-- `e2e_enable_fw_throttle_event`
-- `e2e_enable_fw_power_level_event`
-- `e2e_enable_fw_thermal_event`
-
-dynamically at `/start_profile` time without restarting `vllm serve`:
-
-- **Online serving (`POST /start_profile`)** — pass a JSON payload (or query
-  parameters). `profile_prefix` names the output subdirectory under
-  `torch_profiler_dir`, and all other keys are forwarded via `profiler_kwargs`:
+- **Online serving (`POST /start_profile`)** — pass a JSON body matching vLLM's
+  `StartProfileRequest` schema (`profile_prefix`, `delay_iterations`,
+  `max_iterations`, and `profiler_kwargs`). `profile_prefix` names the output
+  subdirectory under `torch_profiler_dir`, and per-session TPU profiler flags
+  are nested inside `profiler_kwargs`:
 
 ```bash
 curl -X POST http://localhost:8000/start_profile \
   -H "Content-Type: application/json" \
   -d '{
     "profile_prefix": "fw_events_run",
-    "host_tracer_level": 3,
-    "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
-    "e2e_enable_fw_throttle_event": true,
-    "e2e_enable_fw_power_level_event": true,
-    "e2e_enable_fw_thermal_event": true
+    "profiler_kwargs": {
+      "host_tracer_level": 3,
+      "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+      "tpu_num_sparse_cores_to_trace": 2,
+      "tpu_num_sparse_core_tiles_to_trace": 2,
+      "e2e_enable_fw_throttle_event": true,
+      "e2e_enable_fw_power_level_event": true,
+      "e2e_enable_fw_thermal_event": true
+    }
   }'
 ```
 
@@ -73,6 +75,8 @@ llm.start_profile(
     profiler_kwargs={
         "host_tracer_level": 3,
         "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+        "tpu_num_sparse_cores_to_trace": 2,
+        "tpu_num_sparse_core_tiles_to_trace": 2,
         "e2e_enable_fw_throttle_event": True,
         "e2e_enable_fw_power_level_event": True,
         "e2e_enable_fw_thermal_event": True,
@@ -80,11 +84,15 @@ llm.start_profile(
 )
 ```
 
-- **Legacy string format (`profile_prefix`)** — semicolon-delimited `key:value`
-  pairs in `profile_prefix` (e.g.,
-  `"host_tracer_level:3;e2e_enable_fw_throttle_event:true"`) remain supported
-  and are merged with any options supplied in `profiler_kwargs` (with
-  `profiler_kwargs` taking precedence on key collisions).
+- **Legacy string format (`profile_prefix`)** — upstream vLLM validates that the
+  top-level `profile_prefix` contains only `[a-zA-Z0-9._-]` characters to
+  prevent path traversal, so per-session options on `/start_profile` and
+  `LLM.start_profile` should be passed via `profiler_kwargs`. For backward
+  compatibility with direct worker calls or `profiler_kwargs["profile_prefix"]`,
+  semicolon-delimited `key:value` strings (e.g.,
+  `"host_tracer_level:3;e2e_enable_fw_throttle_event:true"`) remain supported in
+  `resolve_profile_dir_and_opts` and are merged with `profiler_kwargs` (with
+  explicit `profiler_kwargs` keys taking precedence).
 
 Those are two separate steps, and the rest of these guides keep them distinct:
 
