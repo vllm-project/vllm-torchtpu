@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
 from diffusers.pipelines.ltx2.vocoder import UpSample1d
 from vllm_omni.diffusion import ipc
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
@@ -45,6 +46,7 @@ from vllm_torchtpu.omni.attention import (
 )
 from vllm_torchtpu.omni.patches import (
     _BWE_FILTER_CPU_RESTORE_PATCHED,
+    _CONV_OUT_LANE_PADDING_PATCHED,
     _D2H_STREAM_PATCHED,
     _SDPA_FALLBACK_PATCHED,
     _SPLIT_ROPE_PATCHED,
@@ -54,6 +56,7 @@ from vllm_torchtpu.omni.patches import (
     _patch_ltx2_split_rope,
     _patch_ltx2_vocoder_cpu_init,
     _patch_sdpa_fallback_dispatch,
+    _patch_wan_vae_conv_out_lane_padding,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
 )
@@ -78,6 +81,7 @@ _UPSTREAM_SDPA_FORWARD = SDPAImpl.forward
 _UPSTREAM_ROPE_FORWARD = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward
 _UPSTREAM_APPLY_SPLIT_ROTARY_EMB = ltx2_transformer.apply_split_rotary_emb
 _UPSTREAM_RESTORE_BWE_FILTER = ltx2_runtime._restore_ltx_bwe_resampler_filter
+_UPSTREAM_WAN_CONV_FORWARD = WanCausalConv3d._conv_forward
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -592,6 +596,79 @@ def test_sdpa_fallback_routes_to_tpu_sdpa(monkeypatch):
     _patch_sdpa_fallback_dispatch()
     assert infos == []
     assert SDPAImpl.forward is TpuSDPAImpl.forward
+
+
+def _assert_conv_close(out: torch.Tensor, ref: torch.Tensor) -> None:
+    # A 128-channel conv reduces in a different order than a 3-channel one, so
+    # the two agree to fp32 rounding (which scales with the output), not bit
+    # for bit.
+    scale = ref.abs().max().item()
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5 * scale)
+
+
+@pytest.mark.parametrize("out_channels", [3, 12])
+@pytest.mark.parametrize("cached_frames", [None, 1, 2])
+@pytest.mark.parametrize("frames", [2, 3])
+def test_wan_vae_conv_out_lane_padding(
+    monkeypatch, out_channels, cached_frames, frames
+):
+    monkeypatch.setattr(WanCausalConv3d, "_conv_forward", _UPSTREAM_WAN_CONV_FORWARD)
+    torch.manual_seed(0)
+    conv = WanCausalConv3d(96, out_channels, kernel_size=3, padding=1)
+    x = torch.randn(1, 96, frames, 8, 8)
+    cache_x = None
+    if cached_frames is not None:
+        # The decoder passes the last frames of the previous chunk.
+        cache_x = torch.randn(1, 96, cached_frames, 8, 8)
+    with torch.no_grad():
+        ref = conv(x, cache_x=cache_x)
+
+    _patch_wan_vae_conv_out_lane_padding()
+    assert getattr(WanCausalConv3d._conv_forward, _CONV_OUT_LANE_PADDING_PATCHED)
+    with torch.no_grad():
+        out = conv(x, cache_x=cache_x)
+
+    assert out.shape == ref.shape
+    if out_channels == 3:
+        _assert_conv_close(out, ref)
+        assert conv._tpu_padded_weight.shape[0] == 128
+    else:
+        # Other convs (Wan 2.2's 12-channel conv_out included) run unchanged.
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
+        assert "_tpu_padded_weight" not in vars(conv)
+
+
+def test_wan_vae_conv_out_lane_padding_weight_cache(monkeypatch):
+    monkeypatch.setattr(WanCausalConv3d, "_conv_forward", _UPSTREAM_WAN_CONV_FORWARD)
+    _patch_wan_vae_conv_out_lane_padding()
+    patched = WanCausalConv3d._conv_forward
+    assert patched is not _UPSTREAM_WAN_CONV_FORWARD
+
+    # Installing again returns at the flag check, before the info log.
+    infos = []
+    monkeypatch.setattr("vllm_torchtpu.omni.patches.logger.info", infos.append)
+    _patch_wan_vae_conv_out_lane_padding()
+    assert infos == []
+    assert WanCausalConv3d._conv_forward is patched
+
+    conv = WanCausalConv3d(96, 3, kernel_size=3, padding=1)
+    x = torch.randn(1, 96, 2, 8, 8)
+    with torch.no_grad():
+        conv(x)
+        # The padded weight is built once per weight tensor, not per call ...
+        first = conv._tpu_padded_weight
+        conv(x)
+        assert conv._tpu_padded_weight is first
+
+        # ... and rebuilt when the weight changes.
+        conv.weight = torch.nn.Parameter(torch.randn_like(conv.weight))
+        out = conv(x)
+        assert conv._tpu_padded_weight is not first
+        # Upstream's causal padding of a cache-free call, then the plain conv.
+        ref = torch.nn.functional.conv3d(
+            torch.nn.functional.pad(x, conv._padding), conv.weight, conv.bias
+        )
+        _assert_conv_close(out, ref)
 
 
 @pytest.fixture

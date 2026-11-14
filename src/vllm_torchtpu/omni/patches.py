@@ -84,6 +84,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_wan_vae_conv_out_lane_padding()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -645,3 +646,58 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_CONV_OUT_LANE_PADDING_PATCHED = "_tpu_conv_out_lane_padding_patched"
+
+# TPU vector lane width: the padded conv_out produces this many output channels.
+_TPU_LANE_WIDTH = 128
+
+
+def _patch_wan_vae_conv_out_lane_padding() -> None:
+    # TODO: Remove once TPU conv3d lowers 3-channel outputs at full lane bandwidth.
+    #
+    # The patch overrides only WanCausalConv3d._conv_forward, which upstream
+    # WanCausalConv3d.forward reaches through nn.Conv3d.forward after its
+    # causal padding and cache_x handling, so those stay upstream's code.
+    # 3-channel convs (the decoder conv_out) run with weight and bias
+    # zero-padded to _TPU_LANE_WIDTH output channels, and the extra channels
+    # are sliced off. Other convs call the original _conv_forward unchanged.
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+
+    orig_conv_forward = WanCausalConv3d._conv_forward
+    if getattr(orig_conv_forward, _CONV_OUT_LANE_PADDING_PATCHED, False):
+        return
+
+    def _lane_dense_conv_forward(
+        self: Any,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.out_channels != 3:
+            return orig_conv_forward(self, input, weight, bias)
+        weight_src = (weight.data_ptr(), weight.dtype)
+        if self._tpu_padded_weight_src != weight_src:
+            pad_rows = _TPU_LANE_WIDTH - weight.shape[0]
+            self._tpu_padded_weight = torch.cat(
+                [weight, weight.new_zeros((pad_rows, *weight.shape[1:]))], dim=0
+            )
+            self._tpu_padded_bias = (
+                None
+                if bias is None
+                else torch.cat([bias, bias.new_zeros(pad_rows)], dim=0)
+            )
+            self._tpu_padded_weight_src = weight_src
+        out = orig_conv_forward(
+            self, input, self._tpu_padded_weight, self._tpu_padded_bias
+        )
+        return out[:, : self.out_channels]
+
+    setattr(_lane_dense_conv_forward, _CONV_OUT_LANE_PADDING_PATCHED, True)
+    # Known initial value for the per-module cache key; instances shadow it.
+    WanCausalConv3d._tpu_padded_weight_src = None
+    WanCausalConv3d._conv_forward = _lane_dense_conv_forward
+    logger.info(
+        "Applied TPU patch: lane-dense output padding for the Wan VAE conv_out."
+    )
