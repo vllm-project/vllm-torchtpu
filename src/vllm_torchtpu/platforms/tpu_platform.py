@@ -33,6 +33,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
+from vllm_torchtpu.distributed.dp_world import unified_dp_world
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
@@ -214,6 +215,10 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 
 _dynamic_compile_unwrapped = False
 _tpu_kv_connectors_registered = False
+# KV connectors that model directories add (`register_tpu_kv_connector`):
+# name -> module path. They are registered by name with the shared ones and
+# admitted by check_and_update_config.
+_MODEL_KV_CONNECTORS: dict[str, str] = {}
 
 
 def _configure_torchtpu_eager_mode() -> None:
@@ -417,6 +422,19 @@ def _validate_lora_config(vllm_config: "VllmConfig") -> None:
         )
 
 
+def register_tpu_kv_connector(name: str, module_path: str) -> None:
+    """Let a model directory serve its own KV connector class `name`.
+
+    Call it from the model directory's `register()`, which runs at plugin load
+    before any config is checked. The class must be `module_path`.`name`.
+    """
+    registered = _MODEL_KV_CONNECTORS.setdefault(name, module_path)
+    if registered != module_path:
+        raise ValueError(
+            f"TPU KV connector {name!r} is already registered from {registered}."
+        )
+
+
 def _register_tpu_kv_connectors() -> None:
     """Register TPU-specific KV connectors in vLLM's factory name registry.
 
@@ -447,6 +465,7 @@ def _register_tpu_kv_connectors() -> None:
             "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
         ),
         ("TPURaidenOffloadingConnector", "vllm_torchtpu.offload.raiden_connector"),
+        *sorted(_MODEL_KV_CONNECTORS.items()),
     ):
         KVConnectorFactory.register_connector(name, module_path, name)
 
@@ -1167,8 +1186,9 @@ class TpuPlatform(Platform):
                 os.environ.setdefault(
                     "TORCH_TPU_DP_MASTER_PORT", str(portpicker.pick_unused_port())
                 )
-                if parallel_config.enable_expert_parallel:
-                    # EP's expert-combine collective genuinely spans every
+                if unified_dp_world(parallel_config):
+                    # EP's expert-combine collective (or a model's own cross-DP
+                    # collective, see distributed/dp_world) spans every
                     # DP*TP worker, so torch_tpu needs one shared slice
                     # across all of them; the worker spawn shim exposes a
                     # DP-adjusted chip ordinal to TorchTPU for physical
@@ -1275,6 +1295,7 @@ class TpuPlatform(Platform):
                 "TPURaidenConnector",
                 "TPUMultiConnector",
                 "TPURaidenOffloadingConnector",
+                *_MODEL_KV_CONNECTORS,
             }
             assert kv_transfer_config.kv_connector in _TPU_SUPPORTED_KV_CONNECTORS, (
                 f"TPU only supports the following KV connectors: "

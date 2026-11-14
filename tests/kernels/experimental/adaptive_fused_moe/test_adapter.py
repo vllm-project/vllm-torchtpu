@@ -249,3 +249,82 @@ def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(monkeypatch
     gate = SimpleNamespace(astype=lambda _: "gate")
     functions[-1](1, 2, 3, 4, 5, gate, 6)
     assert kernel.call_args.kwargs["token_replica_groups"] == groups
+
+
+def test_prebuild_sequence_parallel_override(context, monkeypatch):
+    discover = Mock(return_value=((0,), (1,)))
+    monkeypatch.setattr(bridge, "ep_token_replica_groups", discover)
+    prebuild(layer(), sequence_parallel=True)
+    discover.assert_called_once_with(is_sequence_parallel=True)
+
+
+@pytest.mark.parametrize(
+    "opted,layer_sp,built",
+    [(False, False, False), (True, False, True), (True, True, False)],
+)
+def test_sequence_parallel_variant_only_for_opted_in_layers(
+    context, monkeypatch, opted, layer_sp, built
+):
+    discover = Mock(return_value=((0,), (1,)))
+    monkeypatch.setattr(bridge, "ep_token_replica_groups", discover)
+    value = layer()
+    value.moe_config.moe_parallel_config.is_sequence_parallel = layer_sp
+    if opted:
+        setattr(value, bridge.SEQUENCE_PARALLEL_VARIANT_ATTR, True)
+    owner = SimpleNamespace()
+    bridge.prebuild_sequence_parallel_variant(
+        owner, value, topk=2, renormalize=True, activation="silu"
+    )
+    assert hasattr(owner, bridge.FUSED_MOE_EP_SP_OP_ATTR) is built
+    if built:
+        discover.assert_called_once_with(is_sequence_parallel=True)
+
+
+def test_run_reads_the_named_op(monkeypatch):
+    calls = []
+    owner = SimpleNamespace(
+        **{bridge.FUSED_MOE_EP_SP_OP_ATTR: lambda *a: calls.append("sp") or "out"}
+    )
+    with pytest.raises(RuntimeError):
+        bridge.run_adaptive_fused_moe(owner, *([None] * 6))
+    w = torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn)
+    scale = torch.empty((1, 1, 1, 1))
+    assert (
+        bridge.run_adaptive_fused_moe(
+            owner, None, w, w, scale, scale, None, attr=bridge.FUSED_MOE_EP_SP_OP_ATTR
+        )
+        == "out"
+    )
+    assert calls == ["sp"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_channel_scales_2d_cache(enabled):
+    module = torch.nn.Module()
+    if enabled:
+        setattr(module, bridge.CHANNEL_SCALE_2D_OPT_IN_ATTR, True)
+    s1 = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 1, 1, 8)
+    s2 = torch.arange(4 * 6, dtype=torch.float32).reshape(4, 1, 1, 6)
+
+    assert bridge.cache_channel_scales_2d(module, s1, s2) is enabled
+    w1, w2 = bridge.runtime_channel_scales(module, s1, s2)
+    if not enabled:
+        assert w1 is s1 and w2 is s2
+        return
+    assert w1.shape == (4, 8) and w2.shape == (4, 6)
+    assert torch.equal(w1, s1.reshape(4, 8)) and torch.equal(w2, s2.reshape(4, 6))
+    # Own storage, not a view of the 4-D GMM scales.
+    assert w1.untyped_storage().data_ptr() != s1.untyped_storage().data_ptr()
+    # Registered as non-persistent buffers: graph inputs, absent from the
+    # checkpoint state dict.
+    assert dict(module.named_buffers())["w13_channel_scale_2d"] is w1
+    assert "w13_channel_scale_2d" not in module.state_dict()
+
+
+def test_channel_scales_2d_refuses_block_scales():
+    module = torch.nn.Module()
+    setattr(module, bridge.CHANNEL_SCALE_2D_OPT_IN_ATTR, True)
+    s1 = torch.zeros(4, 2, 1, 8)
+    s2 = torch.zeros(4, 1, 1, 6)
+    assert not bridge.cache_channel_scales_2d(module, s1, s2)
+    assert bridge.runtime_channel_scales(module, s1, s2) == (s1, s2)

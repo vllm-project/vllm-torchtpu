@@ -459,6 +459,19 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 storage = tensor.untyped_storage()
                 pool_storages.setdefault(storage.data_ptr(), (storage, tensor.device))
 
+        from vllm_torchtpu.offload.model_owned_pool import model_owned_pool
+
+        owned = model_owned_pool(getattr(self, "_vllm_config", None))
+        if owned is not None and owned.regions is not None:
+            # A model-owned pool can span several raw regions; every one of
+            # them must be registered.
+            expected = owned.regions(self.connector_worker.kv_cache_config)
+            assert len(pool_storages) == expected, (
+                "model-owned KV pool registers every region: found "
+                f"{len(pool_storages)} distinct storages, the KV cache config "
+                f"plans {expected}"
+            )
+
         pool_tensors: list[CanonicalKVCacheTensor] = []
         for storage, device in pool_storages.values():
             storage_bytes = storage.nbytes()
