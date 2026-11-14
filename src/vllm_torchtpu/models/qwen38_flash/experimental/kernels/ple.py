@@ -1,0 +1,210 @@
+# SPDX-License-Identifier: Apache-2.0
+# Provenance: copied from src/vllm_torchtpu/kernels/qwen4_exp/ple.py
+#   at 5f174122e1fcfe4e45d5578b4b89dfb34f3e29d3.
+#   Owned by models/qwen38_flash from this copy on.
+"""Compact embedding lookup and request-owned dilated convolution."""
+
+import math
+
+import jax
+import jax.numpy as jnp
+
+from .. import settings
+
+
+def compact_rows(table, ids, *, head_dim: int):
+    """Gather rows from 128-element storage segments without row padding.
+
+    The segment width is a TPU vector layout choice. The number of rows per
+    complete storage group follows from the configured head dimension. Form
+    segment indices by groups to avoid overflowing int32 in ``id*head_dim``.
+    """
+    segment_width = table.shape[-1]
+    alignment = math.gcd(head_dim, segment_width)
+    rows_per_group = segment_width // alignment
+    segments_per_group = head_dim // alignment
+    ids = ids.astype(jnp.int32)
+    in_group = ids % rows_per_group
+    element_offset = in_group * head_dim
+    segment = (
+        ids // rows_per_group
+    ) * segments_per_group + element_offset // segment_width
+    segment_count = math.ceil((head_dim + segment_width - alignment) / segment_width)
+    parts = table[segment[..., None] + jnp.arange(segment_count)].reshape(
+        ids.shape + (segment_count * segment_width,)
+    )
+    offset = element_offset % segment_width
+    rows = parts[..., :head_dim]
+    for start in range(alignment, segment_width, alignment):
+        rows = jnp.where(
+            (offset == start)[..., None], parts[..., start : start + head_dim], rows
+        )
+    return rows
+
+
+def _bf16(x):
+    # Keep source BF16 rounding boundaries even when XLA can fuse neighbors.
+    return jax.lax.optimization_barrier(x.astype(jnp.bfloat16))
+
+
+def resident_lookup_raw(
+    table, ids, vocab_start, *, local_rows: int, head_dim: int, chunk_tokens: int = 8
+):
+    """Owner-masked integer bits [T,heads*head_dim]: INT8/FP8 or INT16/BF16.
+
+    Gather ``chunk_tokens`` tokens at a time (a multiple of 8; steps shorter
+    than a chunk use one chunk of their own size): unbounded full-table
+    gathers failed in the original FP8 lowering probes. Pad/crop only the
+    queries, keeping the persistent table unchanged.
+
+    ``vocab_start`` (an int or an int32 array of one element) is this shard's
+    first row. As an array it is an operand rather than a constant, so every
+    TP rank compiles the same program and can replay another rank's.
+    """
+    token_count, heads = ids.shape
+    embedding_dim = heads * head_dim
+    carrier = jnp.int16 if table.dtype == jnp.int16 else jnp.int8
+    if token_count == 0:
+        return jnp.zeros((0, embedding_dim), carrier)
+    assert chunk_tokens % 8 == 0, chunk_tokens
+    chunk = min(chunk_tokens, -(-token_count // 8) * 8)
+    padded = jnp.pad(
+        ids.astype(jnp.int32), ((0, (-token_count) % chunk), (0, 0)), constant_values=-1
+    )
+    start = jnp.asarray(vocab_start, jnp.int32).reshape(())
+
+    def gather(chunk):
+        owned = (chunk >= start) & (chunk < start + local_rows)
+        local = jnp.where(owned, chunk - start, 0)
+        bits = compact_rows(table, local, head_dim=head_dim)
+        bits = jnp.where(owned[..., None], bits, jnp.zeros((), table.dtype))
+        return jax.lax.bitcast_convert_type(bits, carrier)
+
+    result = jax.lax.map(gather, padded.reshape(-1, chunk, heads))
+    return result.reshape(-1, embedding_dim)[:token_count]
+
+
+def decode_embeddings(raw_embeddings, scale):
+    if raw_embeddings.dtype == jnp.int16:
+        return jax.lax.bitcast_convert_type(raw_embeddings, jnp.bfloat16)
+    values = jax.lax.bitcast_convert_type(raw_embeddings, jnp.float8_e4m3fn)
+    # FP8 E4M3 values are exactly representable in BF16, so the widening
+    # needs no rounding barrier of its own (bit-identical).
+    return _bf16(values.astype(jnp.bfloat16) * scale.astype(jnp.bfloat16))
+
+
+def resident_lookup(
+    table, ids, scale, *, vocab_start: int, local_rows: int, head_dim: int
+):
+    """Local numerical entry sharing exactly the production raw lookup."""
+    return decode_embeddings(
+        resident_lookup_raw(
+            table,
+            ids,
+            vocab_start,
+            local_rows=local_rows,
+            head_dim=head_dim,
+        ),
+        scale,
+    )
+
+
+def short_conv(
+    x,
+    weight,
+    history,
+    query_start_loc,
+    state_indices,
+    has_initial_states,
+    *,
+    dilation: int,
+    request_owned_history: bool = False,
+):
+    """Configured dilated convolution with BF16 history [slots,state_len,C].
+
+    Starts and slot indices are int32. The step metadata builder owns
+    monotone starts in [0,T] and unique in-range slots; -1 denotes padded
+    requests. Empty requests leave their slots untouched. Scratch is
+    O(T*C + R*state_len*C), never R times the largest request length. History stores
+    normalized gated values, not convolution results.
+
+    Request-owned history uses identity slots for active requests. Its caller
+    masks idle writes, so updated rows can be returned without a slot scatter.
+    """
+    token_count, channels = x.shape
+    requests = state_indices.shape[0]
+    if token_count == 0 or requests == 0:
+        return jnp.zeros_like(x), history
+    starts = query_start_loc.astype(jnp.int32)
+    slots = state_indices.astype(jnp.int32)
+    t = jnp.arange(token_count, dtype=jnp.int32)
+    req = jnp.minimum(jnp.sum(t[:, None] >= starts[None, 1:], axis=1), requests - 1)
+    relative = t - starts[req]
+    valid = (t < starts[-1]) & (slots[req] >= 0)
+    safe_slots = jnp.clip(slots, 0, history.shape[0] - 1)
+    state_len = history.shape[1]
+    # VLLM_TPU_PLE_CONV_HISTORY_FAST: request-owned history starts at packed
+    # position zero, so taps read history only for each request's first rows.
+    fast_history = request_owned_history and settings.VLLM_TPU_PLE_CONV_HISTORY_FAST
+    accum = jnp.zeros((token_count, channels), jnp.float32)
+    for tap in range(weight.shape[-1]):
+        distance = state_len - tap * dilation
+        position = relative - distance
+        current = x[jnp.clip(t - distance, 0, token_count - 1)]
+        if fast_history and distance == 0:
+            # Packed positions are nonnegative, so distance 0 reads no history.
+            value = current
+        elif (
+            fast_history
+            and state_len
+            and distance > 0
+            and requests * distance < token_count
+        ):
+            # History supplies only rows with relative < distance: gather
+            # O(R*distance*C) elements instead of one history row per token.
+            # Inactive scatter destinations are out of bounds and dropped.
+            offsets = jnp.arange(distance, dtype=jnp.int32)
+            past = history[safe_slots[:, None], state_len - distance + offsets]
+            past = jnp.where(has_initial_states[:, None, None], past, 0)
+            destinations = starts[:-1, None] + offsets
+            lengths = starts[1:] - starts[:-1]
+            active = (offsets < lengths[:, None]) & (slots[:, None] >= 0)
+            destinations = jnp.where(active, destinations, token_count)
+            value = jnp.where((position >= 0)[:, None], current, 0)
+            value = value.at[destinations.reshape(-1)].set(
+                past.reshape(-1, channels), mode="drop"
+            )
+        else:
+            # A one-tap convolution has no historical state and only distance 0.
+            past = (
+                history[
+                    safe_slots[req], jnp.clip(position + state_len, 0, state_len - 1)
+                ]
+                if state_len
+                else jnp.zeros_like(x)
+            )
+            past = jnp.where(has_initial_states[req, None], past, 0)
+            value = jnp.where((position >= 0)[:, None], current, past)
+        accum = accum + value.astype(jnp.float32) * weight[:, tap].astype(jnp.float32)
+    pre = _bf16(accum)
+    output = _bf16(jax.nn.silu(pre.astype(jnp.float32)))
+    output = jnp.where(valid[:, None], output, 0)
+
+    if state_len == 0:
+        return output, history
+
+    lengths = starts[1:] - starts[:-1]
+    positions = lengths[:, None] - state_len + jnp.arange(state_len)[None, :]
+    past = history[
+        safe_slots[:, None], jnp.clip(positions + state_len, 0, state_len - 1)
+    ]
+    past = jnp.where(has_initial_states[:, None, None], past, 0)
+    current = x[jnp.clip(starts[:-1, None] + positions, 0, token_count - 1)]
+    updated = jnp.where((positions >= 0)[..., None], current, past)
+    if request_owned_history:
+        return output, updated
+    # Scatter padding out of bounds with drop, so it cannot alias an active
+    # slot (including when starts has repeated trailing entries).
+    destinations = jnp.where((lengths > 0) & (slots >= 0), slots, history.shape[0])
+    history = history.at[destinations].set(updated, mode="drop")
+    return output, history
