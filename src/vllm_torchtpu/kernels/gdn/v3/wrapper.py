@@ -22,7 +22,8 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.gdn.v3 import (compute_conv1d, compute_gdn,
                                           compute_kda, config, memory_ref,
                                           metadata, vmem_ldst)
-from vllm_torchtpu.kernels.gdn.v3 import tables_in_kernel as _tik
+
+from vllm_torchtpu.kernels.gdn.v3 import tables_in_kernel as _tik  # isort: skip
 
 
 def inner_kernel(
@@ -299,14 +300,29 @@ def outer_kernel(
             allocations=allocations,
         )
 
-    _run()
+    @pl.when(num_tiles > 0)
+    def _():
+        _run()
 
 
 def outer_kernel_tables_in_kernel(
-    qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref,
-    qkv_ref, b_ref, a_ref, source_ref, _in_act, weights_ref,
-    out_ref, _source_out_ref,
-    *scratch, cfg_b: config.GDNConfig, cfg_p: config.GDNConfig, max_seqs: int,
+    qsl_ref,
+    seq_lens_ref,
+    state_ref,
+    read_ref,
+    dist_ref,
+    qkv_ref,
+    b_ref,
+    a_ref,
+    source_ref,
+    _in_act,
+    weights_ref,
+    out_ref,
+    _source_out_ref,
+    *scratch,
+    cfg_b: config.GDNConfig,
+    cfg_p: config.GDNConfig,
+    max_seqs: int,
     scratch_names: tuple[str, ...],
 ):
     """Both passes in one call, the routing tables built at entry from the raw
@@ -315,18 +331,43 @@ def outer_kernel_tables_in_kernel(
     sc = dict(zip(scratch_names, scratch))
     carry_conv = sc.pop("carry_conv_scratch_ref")
     carry_rec = sc.pop("carry_recurrent_scratch_ref")
-    meta_b, meta_p = _tik.fill_and_wrap(
-        qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref, sc, cfg_b,
-        cfg_p, max_seqs)
-    outer_kernel(meta_b, qkv_ref, b_ref, a_ref, source_ref, source_ref,
-                 None, weights_ref, out_ref, None, None, None, None,
-                 cfg=cfg_b)
+    meta_b, meta_p = _tik.fill_and_wrap(qsl_ref, seq_lens_ref, state_ref,
+                                        read_ref, dist_ref, sc, cfg_b, cfg_p,
+                                        max_seqs)
+
+    @pl.when(meta_b.num_tiles[...] > 0)
+    def _():
+        outer_kernel(meta_b,
+                     qkv_ref,
+                     b_ref,
+                     a_ref,
+                     source_ref,
+                     source_ref,
+                     None,
+                     weights_ref,
+                     out_ref,
+                     None,
+                     None,
+                     None,
+                     None,
+                     cfg=cfg_b)
 
     @pl.when(meta_p.num_tiles[...] > 0)
     def _():
-        outer_kernel(meta_p, qkv_ref, b_ref, a_ref, source_ref, source_ref,
-                     None, weights_ref, out_ref, None, None, carry_conv,
-                     carry_rec, cfg=cfg_p)
+        outer_kernel(meta_p,
+                     qkv_ref,
+                     b_ref,
+                     a_ref,
+                     source_ref,
+                     source_ref,
+                     None,
+                     weights_ref,
+                     out_ref,
+                     None,
+                     None,
+                     carry_conv,
+                     carry_rec,
+                     cfg=cfg_p)
 
 
 @jax.jit(
@@ -741,8 +782,10 @@ def fused_conv1d_gdn(
         n_raw = 5
         input_output_aliases = {n_raw + 3: 1, n_raw + 4: 0}
         return pl.pallas_call(
-            functools.partial(outer_kernel_tables_in_kernel, cfg_b=cfg_b,
-                              cfg_p=cfg_p, max_seqs=max_seqs,
+            functools.partial(outer_kernel_tables_in_kernel,
+                              cfg_b=cfg_b,
+                              cfg_p=cfg_p,
+                              max_seqs=max_seqs,
                               scratch_names=names),
             out_shape=(in_act, in_source),
             in_specs=(smem_spec, smem_spec, smem_spec, smem_spec, smem_spec,
@@ -759,8 +802,9 @@ def fused_conv1d_gdn(
             name=cfg_b.get_kernel_name() + "_tables_in",
             metadata=cfg_b.get_metadata(),
         )(query_start_loc.astype(jnp.int32), seq_lens.astype(jnp.int32),
-          state_indices.astype(jnp.int32), read_offsets, distribution.astype(jnp.int32),
-          qkv, b, a, in_source, in_act, weights)
+          state_indices.astype(jnp.int32), read_offsets,
+          distribution.astype(jnp.int32), qkv, b, a, in_source, in_act,
+          weights)
 
     if pooled:
         # the forms are static arguments (part of the jit cache key); no

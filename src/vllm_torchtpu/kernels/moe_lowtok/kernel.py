@@ -290,8 +290,7 @@ def _stream(gid_s,
                                     preferred_element_type=jnp.float32)
             o = o * a_s * s2_buf[slot]
             # the routing weight is the mask: zero for rows the expert does not serve
-            w = jnp.sum(jnp.where(lane == gid_of(expert), wtab_ref[...],
-                                  0.0),
+            w = jnp.sum(jnp.where(lane == gid_of(expert), wtab_ref[...], 0.0),
                         axis=1,
                         keepdims=True)  # [rows, 1]
             acc[...] += w * o
@@ -717,24 +716,28 @@ def moe_lowtok_scores(x,
         if slot is None:
             slot = slot_table(gid.reshape(-1), n_experts)
         slot = jnp.asarray(slot, jnp.int32).reshape(1, LANES)
-        o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(n_experts, nc)
+        o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(
+            n_experts, nc)
         tab = jnp.full((length, ), -1, jnp.int32)
         tab = tab.at[0].set(rk[0]).at[o_gid:o_gid + n_experts].set(gid[0])
-        tab = tab.at[o_hot:o_hot + nc].set(hot[0]).at[o_hprim:o_hprim + nc].set(hprim[0])
-        tab = tab.at[o_hcopy:o_hcopy + nc].set(hcopy[0]).at[o_slot:o_slot + LANES].set(slot[0])
+        tab = tab.at[o_hot:o_hot + nc].set(hot[0]).at[o_hprim:o_hprim +
+                                                      nc].set(hprim[0])
+        tab = tab.at[o_hcopy:o_hcopy + nc].set(hcopy[0]).at[o_slot:o_slot +
+                                                            LANES].set(slot[0])
     else:
         if hot1h is None:
             raise ValueError("packed tables need the one-hot table hot1h")
         nc = int(hot1h.shape[-1])
-        o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(n_experts, nc)
+        o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(
+            n_experts, nc)
         tab = jnp.asarray(tables, jnp.int32)
         if tab.shape != (length, ):
             raise ValueError(
-                f"packed tables for {n_experts} slots and {nc} hot entries are [{length}], got {tab.shape}")
+                f"packed tables for {n_experts} slots and {nc} hot entries are [{length}], got {tab.shape}"
+            )
     if nc % LANE:
         raise ValueError(
-            f"the hot table's length {nc} must be a multiple of the lane tile"
-        )
+            f"the hot table's length {nc} must be a multiple of the lane tile")
     hot1h = jnp.asarray(hot1h, jnp.bfloat16).reshape(LANES, nc)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
@@ -809,10 +812,12 @@ def pack_tables(rank, gid, hot, hprim, hcopy, slot):
                          for t in (hot, hprim, hcopy))
     slot = np.asarray(slot, np.int32).reshape(-1)
     if slot.size != LANES:
-        raise ValueError(f"the slot table is {LANES} lanes wide, got {slot.size}")
+        raise ValueError(
+            f"the slot table is {LANES} lanes wide, got {slot.size}")
     if not (hprim.size == hot.size == hcopy.size):
         raise ValueError("hot, hprim and hcopy must be the same length")
-    o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(gid.size, hot.size)
+    o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(
+        gid.size, hot.size)
     tab = np.full((length, ), -1, np.int32)
     tab[0] = int(rank)
     tab[o_gid:o_gid + gid.size] = gid

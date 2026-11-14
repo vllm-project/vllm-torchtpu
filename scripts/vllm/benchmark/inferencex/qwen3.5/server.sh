@@ -29,6 +29,7 @@ CONC="${CONC:-64}"
 MODEL="${MODEL:-Qwen/Qwen3.5-397B-A17B-FP8}"
 # The point's own settings (layout, slots, budget, release group, decode batch, placement) come from the point
 # table, for a standalone launch as for a sweep; anything already set in the environment wins.
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/points.sh"
 apply_point_defaults "$ISL" "$OSL" "$CONC"
 SHARDING="${SHARDING:-DP8_EP}"
