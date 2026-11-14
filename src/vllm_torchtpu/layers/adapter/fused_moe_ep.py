@@ -181,6 +181,7 @@ def _build_op(
     *,
     token_replica_groups=None,
     sorted_gather=None,
+    wire_fp4=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -203,6 +204,7 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         None if sorted_gather is None else sorted_gather[1],
+        wire_fp4,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -244,6 +246,7 @@ def _build_op(
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
+            wire_fp4=wire_fp4,
             **bias_kw,
             **routing_kw,
         )
@@ -925,7 +928,13 @@ def prebuild_fused_moe_ep(
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return None
 
+    from vllm_torchtpu.kernels.fused_moe.v2.host import can_use_fp4_combine_wire
+
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
+    wire_fp4 = bool(
+        envs.MOE_FUSED_EP_COMBINE_WIRE_FP4
+        and can_use_fp4_combine_wire(hidden, weight_format)
+    )
     token_replica_groups = ep_token_replica_groups(
         is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
     )
@@ -946,12 +955,13 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         token_replica_groups=token_replica_groups,
         sorted_gather=sorted_gather,
+        wire_fp4=wire_fp4,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
-        "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
-        "token_replica_groups=%s",
+        "wire_fp4=%s act=%s scoring=%s score_bias=%s hash_routing=%s "
+        "routed_scale=%s token_replica_groups=%s",
         hidden,
         inter,
         local_experts,
@@ -962,6 +972,7 @@ def prebuild_fused_moe_ep(
         sharded_plan,
         weight_format,
         rhs_qb,
+        wire_fp4,
         activation,
         scoring_fn,
         has_score_bias,

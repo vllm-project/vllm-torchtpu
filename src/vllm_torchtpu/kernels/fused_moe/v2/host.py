@@ -28,6 +28,7 @@ from jax.experimental.pallas import tpu as pltpu
 FP8_MAX = 448.0
 FP8 = jnp.float8_e4m3fn
 # Storage only: there is no four-bit MXU, so each block is widened to e4m3.
+FP4_MAX = 6.0
 FP4 = jnp.float4_e2m1fn
 # Default scale block along the contraction axis for a block-scaled weight.
 QB4 = 512
@@ -36,6 +37,28 @@ QB4 = 512
 # word the same way.
 PACK4 = 8
 BF16 = jnp.bfloat16
+
+_HADAMARD_128_SIGNS: tuple[tuple[float, ...], ...] | None = None
+
+
+def hadamard_128_bf16(*, inverse: bool = False) -> jax.Array:
+    """128x128 Sylvester Walsh-Hadamard matrix in bfloat16 with exact dyadic split.
+
+    Splitting 1/128 = (1/8) * (1/16) keeps every matrix entry an exact power of
+    two in bfloat16 (+/-0.125 forward, +/-0.0625 inverse), so H_fwd @ H_inv = I
+    holds with zero mantissa rounding error.
+    """
+    global _HADAMARD_128_SIGNS
+    if _HADAMARD_128_SIGNS is None:
+        # Sylvester H_{2^k}[i, j] = (-1)^popcount(i & j).
+        _HADAMARD_128_SIGNS = tuple(
+            tuple((-1.0 if ((i & j).bit_count() & 1) else 1.0) for j in range(128))
+            for i in range(128)
+        )
+    scale = 0.0625 if inverse else 0.125
+    return jnp.asarray(_HADAMARD_128_SIGNS, dtype=jnp.bfloat16) * jnp.bfloat16(scale)
+
+
 # Storage only, the same way four-bit weights are: TPU v7, the generation
 # this kernel is validated on, takes no integer input on the matrix unit
 # (earlier generations do), so an integer weight is widened to
@@ -1351,6 +1374,15 @@ def check_u32_sublane_tile(info=None):
         )
 
 
+def can_use_fp4_combine_wire(hidden: int, weight_format) -> bool:
+    """Whether a shape supports 32-bit-sublane-aligned 4-bit combine transport."""
+    return (
+        WeightFormat(weight_format) == WeightFormat.FP4
+        and hidden > 0
+        and hidden % (U32_SUBLANE_TILE * PACK4 * HIDDEN_LANE_BLOCK) == 0
+    )
+
+
 def vmem_scratch_arrays(
     g_local,
     capacity,
@@ -1362,6 +1394,7 @@ def vmem_scratch_arrays(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    wire_fp4=False,
 ):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
@@ -1435,6 +1468,19 @@ def vmem_scratch_arrays(
         if form.quantized_activations
         else []
     )
+    out_vm_entry = (
+        (
+            "out_vm",
+            (OUT_PARITIES, tile_m, lane_blocks // PACK4, HIDDEN_LANE_BLOCK),
+            jnp.uint32,
+        )
+        if wire_fp4
+        else (
+            "out_vm",
+            (OUT_PARITIES, tile_m, lane_blocks, HIDDEN_LANE_BLOCK),
+            form.wire_dtype,
+        )
+    )
     return [
         # The indirect form keeps each token row as one lane-block row.
         # Parity-deep for the same reason ls_vm is.
@@ -1446,17 +1492,19 @@ def vmem_scratch_arrays(
         *weights,
         *biases,
         *act_scale,
-        (
-            "out_vm",
-            (OUT_PARITIES, tile_m, lane_blocks, HIDDEN_LANE_BLOCK),
-            form.wire_dtype,
-        ),
+        out_vm_entry,
         ("oscl_vm", (OUT_PARITIES, 1, capacity), jnp.float32),
     ]
 
 
 def vmem_tile_body_arrays(
-    capacity, hidden, inter, *, weight_format=WeightFormat.FP8, rhs_qb=QB4
+    capacity,
+    hidden,
+    inter,
+    *,
+    weight_format=WeightFormat.FP8,
+    rhs_qb=QB4,
+    wire_fp4=False,
 ):
     """What one tile body keeps live, as (name, shape, dtype).
 
@@ -1500,7 +1548,9 @@ def vmem_tile_body_arrays(
     # An eight-bit wire quantizes the down projection into a fresh array
     # while down_bf16, the bf16 source it reduces over, is still live. A
     # sixteen-bit wire ships down_bf16 itself and materializes nothing.
-    if form.wire_dtype is FP8:
+    if wire_fp4:
+        arrays.append(("wire_rows", (tile_m, hidden // PACK4), jnp.uint32))
+    elif form.wire_dtype is FP8:
         arrays.append(("wire_rows", (tile_m, hidden), FP8))
     if weight_format == WeightFormat.FP4:
         arrays.append(
@@ -1532,6 +1582,7 @@ def vmem_estimate_bytes(
     has_w1_bias=False,
     has_w2_bias=False,
     info=None,
+    wire_fp4=False,
 ):
     """VMEM one built kernel occupies, from the arrays it declares.
 
@@ -1557,9 +1608,15 @@ def vmem_estimate_bytes(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        wire_fp4=wire_fp4,
     )
     arrays += vmem_tile_body_arrays(
-        capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb
+        capacity,
+        hidden,
+        inter,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
+        wire_fp4=wire_fp4,
     )
     return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
 
@@ -1596,6 +1653,7 @@ def fit_weight_slots(
     has_w2_bias=False,
     info=None,
     limit=None,
+    wire_fp4=False,
 ):
     """The deepest prefetch schedule this shape's VMEM leaves room for.
 
@@ -1638,6 +1696,7 @@ def fit_weight_slots(
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
                 info=info,
+                wire_fp4=wire_fp4,
             ),
             limit,
         )

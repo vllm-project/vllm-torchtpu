@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
+    MOE_FUSED_EP_COMBINE_WIRE_FP4: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -896,6 +897,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ascending device-id order, so the SparseCore gather gets its
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
+    # Opt in to Hadamard-rotated 4-bit (e2m1, 0.5 B/elem) RDMA combine wire in
+    # fused EP MoE v2 when hidden is a multiple of 8192 and weights are FP4.
+    "MOE_FUSED_EP_COMBINE_WIRE_FP4": env_bool("MOE_FUSED_EP_COMBINE_WIRE_FP4"),
     # A static expert placement for expert parallelism: a JSON table naming,
     # per MoE layer, which global experts each EP rank holds and in what slot
     # order -- a permutation, experts / ranks to a rank
