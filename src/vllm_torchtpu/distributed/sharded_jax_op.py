@@ -21,14 +21,12 @@ genuinely sharded therefore gets tensors sized for the global array instead of
 this rank's shard -- for an EP MoE at 2048 tokens a rank, an output claiming
 16384 rows.
 
-``pcp_streaming_rpa``'s adapter solved that by reimplementing ``__call__``, and
-that copy has since fallen behind -- stock has gained an eager wrapper-tensor
-branch and MLIR-fingerprint-based kernel caching that it does not have. So
-instead of forking the method, this derives it from the installed one and
-changes the single line that builds the output placeholders. If upstream
-reworks that line the derivation no-ops and the caller falls back to stock,
-which is wrong only in the way described above and fails loudly on a shape
-mismatch rather than silently.
+``torch_tpu==0.2.0``'s ``JaxCallable`` takes ``output_partition_specs`` and
+sizes each output with ``torch_placeholder(..., partition_spec=spec)``, but it
+expects one spec per output leaf: given a bare ``PartitionSpec`` it zips the
+spec's own entries against the outputs and fails. So this flattens the
+caller's ``output_partition_specs`` to that per-leaf list and hands it to the
+stock class.
 """
 
 import inspect
@@ -39,17 +37,6 @@ import jax
 import torch
 from jax.sharding import NamedSharding, PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
-
-from vllm_torchtpu.logger import init_logger
-
-logger = init_logger(__name__)
-
-_STOCK_PLACEHOLDER_LINE = """      output_shapes = [
-          torch_placeholder(aval, mesh=self.mesh) for aval in lowered.out_avals
-      ]"""
-_SHARDED_PLACEHOLDER_LINE = (
-    """      output_shapes = _sharded_output_placeholders(lowered, self.mesh)"""
-)
 
 
 def _sharded_output_placeholders(lowered, mesh):
@@ -94,42 +81,20 @@ def _placeholder(aval, spec, mesh):
     return torch.empty(shape, dtype=torch_dtype, device="tpu")
 
 
-def _build_sharded_callable_cls():
-    """A ``JaxCallable`` whose ``__call__`` is the installed one, minus the
-    assumption that a sharded output is replicated.
+def _is_spec_leaf(spec: Any) -> bool:
+    return spec is None or isinstance(spec, PartitionSpec)
 
-    The method source is recompiled inside a throwaway class so its original
-    indentation -- and therefore the needle below -- survives verbatim.
+
+def _flat_output_partition_specs(
+    output_partition_specs: Any,
+) -> list[PartitionSpec | None]:
+    """One spec per output leaf, in ``lowered.out_avals`` order.
+
+    ``JaxCallable`` zips its ``output_partition_specs`` with the flattened
+    outputs, so a bare ``PartitionSpec`` has to become a one-element list.
+    ``None`` leaves are kept so the positions stay aligned.
     """
-    src = inspect.getsource(pallas_impl.JaxCallable.__call__)
-    if _STOCK_PLACEHOLDER_LINE not in src:
-        logger.warning(
-            "torch_tpu's JaxCallable.__call__ no longer builds its output "
-            "placeholders the way this adapter expects; sharded outputs will "
-            "be sized globally. Sharded multi-device ops will fail on a shape "
-            "mismatch until this is re-derived."
-        )
-        return pallas_impl.JaxCallable
-    patched = "class _Holder:\n" + src.replace(
-        _STOCK_PLACEHOLDER_LINE, _SHARDED_PLACEHOLDER_LINE, 1
-    )
-    namespace: dict = {}
-    exec(  # noqa: S102 - deriving from the installed source is the point
-        compile(patched, pallas_impl.__file__, "exec"),
-        {
-            **pallas_impl.__dict__,
-            "_sharded_output_placeholders": _sharded_output_placeholders,
-        },
-        namespace,
-    )
-    return type(
-        "_ShardedJaxCallable",
-        (pallas_impl.JaxCallable,),
-        {"__call__": namespace["_Holder"].__call__},
-    )
-
-
-_SHARDED_CALLABLE_CLS = None
+    return jax.tree.leaves(output_partition_specs, is_leaf=_is_spec_leaf)
 
 
 def sharded_jax_op(
@@ -155,9 +120,6 @@ def sharded_jax_op(
     ``guard_int``s every symbolic input dimension of an op with that schema, so
     a caller under ``torch.compile`` loses its dynamic batch dimension.
     """
-    global _SHARDED_CALLABLE_CLS
-    if _SHARDED_CALLABLE_CLS is None:
-        _SHARDED_CALLABLE_CLS = _build_sharded_callable_cls()
     if "::" not in name or len(name.split("::")) != 2:
         raise ValueError(f"Op name {name} must be 'namespace::op', with one '::'.")
 
@@ -191,12 +153,16 @@ def sharded_jax_op(
             "output_partition_specs": str(output_partition_specs),
         },
     )
-    wrapped_fn = _SHARDED_CALLABLE_CLS(
+    wrapped_fn = pallas_impl.JaxCallable(
         name=name,
         jit_fn=jit_fn,
         trace_key=trace_key,
         mesh=mesh,
         input_partition_specs=input_partition_specs,
+        # Annotated as tuple[tuple[str, ...], ...], but each entry is handed to
+        # torch_placeholder(partition_spec=...), which takes a PartitionSpec.
+        # pyrefly: ignore[bad-argument-type]
+        output_partition_specs=_flat_output_partition_specs(output_partition_specs),
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
     )
