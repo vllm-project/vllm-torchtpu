@@ -258,3 +258,23 @@ def test_swap_with_row_crosses_bits():
             np.asarray(got_extra)[halves[1][rank]].view(np.uint32),
             extra[halves[1][peer]].view(np.uint32),
         )
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+def test_weigh_partials_matches_xla(dtype):
+    """`msa_dcp_heads.weigh_partials` weighs as the XLA formula does (up to
+    one rounding of the result)."""
+    rng = np.random.default_rng(4)
+    out = jnp.asarray(rng.standard_normal((64, 96, 128)), jnp.bfloat16)
+    lses = rng.standard_normal((DCP, 96, 64)).astype(np.float32) * 4
+    lses[:, 3, 5] = -np.inf  # a token no rank attended for head 5
+    lses[2, 7, 1] = -np.inf
+    lses = jnp.asarray(lses)
+    lse = lses[3]
+    got = msa_dcp_heads.weigh_partials(out, lse, lses, dtype, interpret=True)
+    weight = jnp.exp(lse - jax.nn.logsumexp(lses, axis=0)).T[..., None]
+    want = jnp.where(weight > 0, out.astype(jnp.float32) * weight, 0.0).astype(dtype)
+    tol = 1e-5 if dtype == jnp.float32 else 1e-2
+    np.testing.assert_allclose(
+        np.asarray(got, np.float32), np.asarray(want, np.float32), rtol=tol, atol=1e-6
+    )

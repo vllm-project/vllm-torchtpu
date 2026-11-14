@@ -63,20 +63,69 @@ _PAGES_PER_STEP = 64
 
 
 def merge_partials(
-    out: jax.Array, lse: jax.Array, axis: str, *, rs_out_precision: bool
+    out: jax.Array,
+    lse: jax.Array,
+    axis: str,
+    *,
+    rs_out_precision: bool,
+    interpret: bool = False,
 ) -> jax.Array:
     """`ops.msa.merge_head_partials` inside the SPMD program: head-major
     partials ``out [H, T, D]``, ``lse [H, T]`` -> this rank's heads,
     unrotated, ``[T, H / dcp, D]``."""
     lse = lse.astype(jnp.float32).T  # token-major across the gather
     lses = jax.lax.all_gather(lse, axis, axis=0)
-    weight = jnp.exp(lse - jax.nn.logsumexp(lses, axis=0)).T[..., None]
-    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-    weighted = jnp.where(weight > 0, out.astype(jnp.float32) * weight, 0.0)
-    if rs_out_precision:
-        weighted = weighted.astype(out.dtype)
+    weighted = weigh_partials(
+        out,
+        lse,
+        lses,
+        out.dtype if rs_out_precision else jnp.float32,
+        interpret=interpret,
+    )
     merged = jax.lax.psum_scatter(weighted, axis, scatter_dimension=0, tiled=True)
     return msa_fp4.unrotate_output(merged.astype(out.dtype)).transpose(1, 0, 2)
+
+
+_WEIGH_BLOCK_TOKENS = 64
+
+
+def _weigh_kernel(out_ref, lse_ref, lses_ref, o_ref):
+    lses = lses_ref[...]  # [dcp, Bt, H]
+    peak = jnp.max(lses, axis=0)
+    peak = jnp.where(jnp.isinf(peak), 0.0, peak)
+    total = peak + jnp.log(jnp.sum(jnp.exp(lses - peak[None]), axis=0))
+    weight = jnp.exp(lse_ref[...] - total)  # [Bt, H]
+    for h in range(out_ref.shape[0]):
+        w = weight[:, h : h + 1]
+        # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+        o_ref[h] = jnp.where(w > 0, out_ref[h].astype(jnp.float32) * w, 0.0).astype(
+            o_ref.dtype
+        )
+
+
+def weigh_partials(out, lse, lses, dtype, *, interpret=False):
+    """Each head-major partial ``out [H, T, D]`` weighted by its share of the
+    ranks' log-sum-exp, ``exp(lse - logsumexp(lses))`` (``lse [T, H]`` this
+    rank's, ``lses [dcp, T, H]`` every rank's, f32), as `dtype`: one pass
+    over the partials in place of XLA's f32 weighting of every head (~16 us
+    per layer at c64 b50, j-5b748468)."""
+    num_heads, num_tokens, head_dim = out.shape
+    dcp = lses.shape[0]
+    block = max(1, min(num_tokens, _WEIGH_BLOCK_TOKENS))
+    return pl.pallas_call(
+        _weigh_kernel,
+        grid=(pl.cdiv(num_tokens, block),),
+        in_specs=[
+            pl.BlockSpec((num_heads, block, head_dim), lambda i: (0, i, 0)),
+            pl.BlockSpec((block, num_heads), lambda i: (i, 0)),
+            pl.BlockSpec((dcp, block, num_heads), lambda i: (0, i, 0)),
+        ],
+        out_specs=pl.BlockSpec((num_heads, block, head_dim), lambda i: (0, i, 0)),
+        out_shape=jax.ShapeDtypeStruct(out.shape, dtype),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_weigh_partials",
+    )(out, lse, lses)
 
 
 def _dcp_attend(
@@ -114,7 +163,9 @@ def _dcp_attend(
         scale_cache=scale_cache,
         interpret=interpret,
     )
-    return merge_partials(out, lse, axis, rs_out_precision=rs_out_precision)
+    return merge_partials(
+        out, lse, axis, rs_out_precision=rs_out_precision, interpret=interpret
+    )
 
 
 def _per_token(seq_id: jax.Array, table: jax.Array) -> jax.Array:
