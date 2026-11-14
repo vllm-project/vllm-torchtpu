@@ -549,8 +549,22 @@ def fused_conv1d_gdn(
     window_size = num_spec_tokens + 1
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
-    # KDA stays on static tiles until the VMEM estimate models its gate.
-    if envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda:
+    if envs.TPU_ENABLE_GDN_DYNAMIC_TILING:
+        # Cap heuristic VMEM budgets at the 64 MiB capacity where tile timings
+        # were calibrated so chips with larger VMEM do not select untimed tiles.
+        validated_vmem_bytes = 64 * 1024 * 1024
+        tiling_decode_limit = min(
+            decode_vmem_limit_bytes,
+            config.GDNConfig.get_vmem_limit_bytes(
+                window_size, vmem_capacity_bytes=validated_vmem_bytes
+            ),
+        )
+        tiling_mixed_limit = min(
+            config.GDNConfig.get_vmem_limit_bytes(),
+            config.GDNConfig.get_vmem_limit_bytes(
+                1, vmem_capacity_bytes=validated_vmem_bytes
+            ),
+        )
         decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
             batch_size=batch_size,
             num_seqs=num_seqs,
@@ -564,12 +578,14 @@ def fused_conv1d_gdn(
             act_out_dtype=act_out_dtype,
             recurrent_state_dtype=recurrent_dtype,
             num_lanes=num_lanes,
-            decode_vmem_limit_bytes=decode_vmem_limit_bytes,
-            mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+            decode_vmem_limit_bytes=tiling_decode_limit,
+            mixed_vmem_limit_bytes=tiling_mixed_limit,
             window_size=window_size,
+            attention_mode=attention_mode,
         )
         logger.info_once(
-            "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
+            "%s dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
+            attention_mode.value.upper(),
             num_seqs,
             batch_size,
             window_size,
@@ -599,11 +615,12 @@ def fused_conv1d_gdn(
         decode_tile_size = max(
             1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
         )
-
-    if num_spec_tokens > 0 and is_kda:
-        # KDA verify keeps one sequence per tile until multi-sequence KDA
-        # verify tiles are sized by a KDA-aware VMEM estimate.
-        decode_tile_size = 1
+        if num_spec_tokens > 0 and is_kda:
+            # Static fallback keeps one sequence per KDA verify tile when
+            # TPU_ENABLE_GDN_DYNAMIC_TILING is off.
+            decode_tile_size = 1
+        mixed_tile_size = max(1, mixed_tile_size)
+        mixed_tile_size = 1 << (mixed_tile_size.bit_length() - 1)
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
