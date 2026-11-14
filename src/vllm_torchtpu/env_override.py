@@ -108,6 +108,11 @@ _TPU_VMEM_BYTES_PER_TENSOR_CORE = {
     "v7x": 67108864,
 }
 
+# Chip families on which the auto threshold above also turns SparseCore
+# all-reduce offload off (see below): the TPU7x serving regime it was tuned
+# on.
+_SC_ALL_REDUCE_OFFLOAD_OFF_FAMILIES = ("tpu7x", "v7x")
+
 
 def _fetch_tpu_type_from_metadata() -> str | None:
     # Inline the GCE metadata probe instead of delegating to
@@ -129,7 +134,9 @@ def _fetch_tpu_type_from_metadata() -> str | None:
     return None
 
 
-def _resolve_sc_offload_threshold_bytes() -> int | None:
+def _resolve_sc_offload_threshold_bytes() -> tuple[int | None, str | None]:
+    # Returns (threshold bytes, chip family). The family is given only when
+    # the threshold was looked up from it ("auto").
     # SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES:
     #   "auto" (default): look up per-family constant
     #   "<integer>":      use that byte value
@@ -149,19 +156,19 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
                 "ignoring (SC-offload flag not set).",
                 file=sys.stderr,
             )
-            return None
-        return value if value > 0 else None
+            return None, None
+        return (value if value > 0 else None), None
 
     tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
     if not tpu_type:
         tpu_type = _fetch_tpu_type_from_metadata()
     if not tpu_type:
-        return None
+        return None, None
     tpu_type = tpu_type.strip().lower()
     for prefix, size in _TPU_VMEM_BYTES_PER_TENSOR_CORE.items():
         if tpu_type.startswith(prefix):
-            return size
-    return None
+            return size, prefix
+    return None, None
 
 
 _existing_libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
@@ -189,8 +196,20 @@ if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
 # offloaded to SparseCore. The chip family is detected from
 # TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above;
 # each flag is added only if the user hasn't supplied it explicitly.
-_sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
+#
+# On TPU7x with that auto threshold, also disable SparseCore all-reduce
+# offload via --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false
+# so XLA's AsyncCollectiveCreator keeps its 4 KiB async threshold for
+# TensorCore all-reduce instead of inheriting the 64 MiB SC threshold. An
+# explicit SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES (a threshold for the SC
+# offload to use) leaves the offload on, as does any other chip family.
+_sc_offload_bytes, _sc_offload_family = _resolve_sc_offload_threshold_bytes()
 if _sc_offload_bytes is not None:
+    if (_sc_offload_family in _SC_ALL_REDUCE_OFFLOAD_OFF_FAMILIES
+            and not _user_has_flag(
+                "--xla_tpu_enable_sparse_core_collective_offload_all_reduce")):
+        _libtpu_extra_args.append(
+            "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false")
     for _flag_name in (
             "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
             "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",

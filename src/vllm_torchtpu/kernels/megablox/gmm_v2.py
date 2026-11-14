@@ -848,11 +848,43 @@ def zero_out_end(
     dims: Dimensions,
 ):
     out_dma = out_ref.reshape(-1, dims.size_lhs_sublane, out_ref.shape[-1])
-    pltpu.make_async_copy(
+    # The wait hints are forwarded only by a Pallas build whose DMA wait
+    # takes them.
+    pallas_compat.make_async_copy(
         src_ref=out_dma.at[pl.ds(0, zero_size)],
         dst_ref=out_dma.at[pl.ds(0, zero_size)],
         sem=semaphore_ref.at[0],
-    ).wait()
+        wait_threshold=None,
+    ).wait(strict_ordering=False, wait_threshold=None)
+
+
+def kernel_main_call_done(
+    lhs_group_sizes_ref: jax.Array,
+    group_offset_ref: jax.Array,
+    lhs_ref: jax.Array,
+    rhs_ref: WeightsRef,
+    out_ref: jax.Array,
+    partial_out_ref: jax.Array,
+    acc_ref: jax.Array,
+    metadata_ref: MetadataRef,
+    zero_ref: jax.Array | None,
+    semaphore_ref: jax.Array | None,
+    *,
+    cfgs: GmmConfigs,
+):
+    return kernel_main(
+        lhs_group_sizes_ref,
+        group_offset_ref,
+        lhs_ref,
+        rhs_ref,
+        out_ref,
+        partial_out_ref,
+        acc_ref,
+        metadata_ref,
+        zero_ref,
+        semaphore_ref,
+        cfgs=cfgs,
+    )
 
 
 def kernel_main(
@@ -937,8 +969,8 @@ def kernel_main(
             up=rhs_spec,
         )
 
-    # Execute the inner kernel. `priority` is forwarded only by a Pallas
-    # build whose emit_pipeline takes it.
+    # Execute the inner kernel.
+    # `priority` is forwarded only by a Pallas build whose emit_pipeline takes it.
     pipeline_fn = pallas_compat.emit_pipeline(
         functools.partial(inner_kernel, cfgs=cfgs),
         grid=(num_n, num_gm, num_k),
@@ -1301,6 +1333,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
     "zero_initialize",
     "fuse_act",
     "rhs_quant_dtype",
+    "scope_name",
 ])
 def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
@@ -1320,6 +1353,7 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
+    scope_name: str | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1443,8 +1477,10 @@ def gmm_v2(
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
+    entry_fn = (kernel_main_call_done if
+                (scope_name and "call_done" in scope_name) else kernel_main)
     return pl.pallas_call(
-        functools.partial(kernel_main, cfgs=cfgs),
+        functools.partial(entry_fn, cfgs=cfgs),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
@@ -1463,7 +1499,7 @@ def gmm_v2(
             vmem_limit_bytes=vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
-        name=get_scope_name(cfgs),
+        name=scope_name or get_scope_name(cfgs),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
     )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, :cfgs.out_size_n]

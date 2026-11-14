@@ -164,7 +164,8 @@ def gmm_wrapper(lhs,
                 zero_initialize=False,
                 fuse_act=None,
                 preferred_element_type=None,
-                rhs_quant_dtype=None):
+                rhs_quant_dtype=None,
+                scope_name=None):
     is_fp4_weight = _is_fp4_weight(rhs)
     return gmm_v2(
         lhs=lhs,
@@ -178,6 +179,7 @@ def gmm_wrapper(lhs,
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
         rhs_quant_dtype=rhs_quant_dtype,
+        scope_name=scope_name,
     )
 
 
@@ -253,12 +255,12 @@ def prepare_routed_gmm_inputs(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
-    For non-EP runs `topk_indices_local` is always non-negative, so without
-    skip_padded_tokens every route is valid: the mask is all True and the
-    expert ids are sorted as they are, with no bucket for invalid routes.
-    For EP, the caller applies the expert-map remap upstream (inside this
-    JIT) and marks non-local entries with a negative id which the mask
-    filters out.
+    For non-EP runs `topk_indices_local` is always non-negative, so the
+    valid-mask path computed below is a no-op (jnp.where on an all-True
+    mask). For EP, the caller applies the expert-map remap upstream
+    (inside this JIT) and marks non-local entries with a negative id which
+    the mask filters out. Always running the masked branch keeps a single
+    code path.
     """
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
@@ -366,6 +368,7 @@ def moe_gmm(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    layer_tag: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -385,6 +388,7 @@ def moe_gmm(
         zero_initialize=False,
         fuse_act=activation,
         rhs_quant_dtype=rhs_quant_dtype,
+        scope_name="all-reduce.219.cloned" if layer_tag else None,
     )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     gmm1_res = gmm1_res[:, :w2.shape[1] * packing_factor]
@@ -392,15 +396,18 @@ def moe_gmm(
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
-    gmm2_res = gmm_wrapper(gmm1_res,
-                           w2,
-                           w2_scale,
-                           w2_bias,
-                           group_sizes,
-                           group_offset,
-                           zero_initialize=False,
-                           preferred_element_type=x.dtype,
-                           rhs_quant_dtype=rhs_quant_dtype)
+    gmm2_res = gmm_wrapper(
+        gmm1_res,
+        w2,
+        w2_scale,
+        w2_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        preferred_element_type=x.dtype,
+        rhs_quant_dtype=rhs_quant_dtype,
+        scope_name="gmm_v2_call_done_tag" if layer_tag else None,
+    )
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
@@ -490,6 +497,7 @@ def _local_expert_routing(topk_ids, topk_weights, experts_start,
         "rhs_quant_dtype",
         "skip_padded_tokens",
         "num_primary_experts",
+        "layer_tag",
     ),
 )
 def fused_moe_func(
@@ -511,6 +519,7 @@ def fused_moe_func(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
     num_primary_experts: int | None = None,
+    layer_tag: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -619,5 +628,6 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        layer_tag=layer_tag,
     )
     return x[:num_tokens, :hidden_size]
