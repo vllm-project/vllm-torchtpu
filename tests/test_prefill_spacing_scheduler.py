@@ -173,7 +173,7 @@ def _tpot_scheduler(model_config, monkeypatch, target_ms, long_s=0.1):
     scheduler._step_s = {"long": long_s, "decode": 0.04}
     _decoding_and_long(scheduler, hasher)
     scheduler.tpot_target_s = target_ms / 1e3
-    return scheduler, clock
+    return scheduler, clock, hasher
 
 
 # "dec" has 256 tokens left at >= 1 token per 0.04 s step: 10.24 s projected,
@@ -189,14 +189,14 @@ def _tpot_scheduler(model_config, monkeypatch, target_ms, long_s=0.1):
 def test_tpot_target_defers_prefill_only_for_a_decoder_short_of_slack(
     model_config, monkeypatch, target_ms, held
 ):
-    scheduler, _ = _tpot_scheduler(model_config, monkeypatch, target_ms)
+    scheduler, _, _ = _tpot_scheduler(model_config, monkeypatch, target_ms)
     scheduled = set(scheduler.schedule().num_scheduled_tokens)
     assert scheduled == ({"dec"} if held else {"dec", "long"})
 
 
 def test_tpot_target_defers_prefill_at_most_max_hold(model_config, monkeypatch):
     # 3 s of slack, a 4.96 s longer long-chunk step: held until max_hold_s.
-    scheduler, clock = _tpot_scheduler(
+    scheduler, clock, _ = _tpot_scheduler(
         model_config, monkeypatch, target_ms=(10.24 + 3.0) / 255 * 1e3, long_s=5.0
     )
     scheduler.max_hold_s = 1.0
@@ -205,3 +205,41 @@ def test_tpot_target_defers_prefill_at_most_max_hold(model_config, monkeypatch):
         assert set(scheduler.schedule().num_scheduled_tokens) == {"dec"}
     clock.t = 101.2
     assert "long" in scheduler.schedule().num_scheduled_tokens
+
+
+@pytest.mark.parametrize(
+    ("bin_s", "scheduled"),
+    [
+        # A 512-token step is 0.03 s longer than decode: fits the 0.037 s slack,
+        # so the short prompt runs whole; the long chunk (cut by the budget) not.
+        ({512: 0.07}, {"dec", "short"}),
+        # 0.05 s longer: does not fit, the step stays decode-only.
+        ({512: 0.09}, {"dec"}),
+        # No short step timed yet: decode-only, as without pricing.
+        ({}, {"dec"}),
+    ],
+)
+def test_priced_hold_runs_only_whole_prefills_that_fit_the_slack(
+    model_config, monkeypatch, bin_s, scheduled
+):
+    scheduler, _, hasher = _tpot_scheduler(model_config, monkeypatch, target_ms=40.3)
+    scheduler.priced = True
+    scheduler._bin_s = dict(bin_s)
+    scheduler.add_request(_request("short", 16, hasher, seed=3))
+    assert set(scheduler.schedule().num_scheduled_tokens) == scheduled
+
+
+def test_short_prefill_steps_are_timed_by_token_bin(model_config, monkeypatch):
+    scheduler, hasher = _scheduler(model_config)
+    monkeypatch.setattr(AsyncScheduler, "update_from_output", lambda *args: {})
+    scheduler.add_request(_request("a", 300, hasher, seed=1))
+    first = scheduler.schedule()
+    assert scheduler._pending_bins[id(first)] == 512
+    scheduler.add_request(_request("b", 300, hasher, seed=2))
+    second = scheduler.schedule()  # "b" prefilled, queued behind the first
+    assert scheduler._pending_bins[id(second)] == 512
+    clock = iter([10.0, 10.25])
+    monkeypatch.setattr(pss.time, "monotonic", lambda: next(clock))
+    scheduler.update_from_output(first, None)  # t=10.0: not timed (no previous)
+    scheduler.update_from_output(second, None)  # t=10.25
+    assert scheduler._bin_s == {512: pytest.approx(0.25)}

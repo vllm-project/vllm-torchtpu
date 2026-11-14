@@ -44,7 +44,10 @@ warmest-first admission, each step this scheduler:
   priced as a long-chunk step: the next step may admit a long one. Unlike the
   fixed debt, prefill then runs as soon as every such request can afford the
   step. At most ``VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S`` of steps in a row are
-  deferred this way.
+  deferred this way. With ``VLLM_TPU_PREFILL_TPOT_PRICED`` such a step is not
+  decode-only when a shorter step fits: it runs, shortest first, the whole
+  remaining prefills that fit the largest prefill-token bin whose measured
+  step time stays within every decoding request's slack (no chunk is cut).
 
 Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.prefill_spacing_scheduler.PrefillSpacingScheduler``.
@@ -76,6 +79,9 @@ _LOG_EVERY = 10000
 _TOKENS_PER_STEP_EMA = 0.05
 
 _LONG, _PREFILL, _DECODE = "long", "prefill", "decode"
+# Prefill tokens per step a deferred step may still carry (priced TPOT hold),
+# each timed by its own moving average.
+_FIT_BINS = (512, 1024, 2048, 4096)
 
 
 class PrefillSpacingScheduler(PrefixAwareScheduler):
@@ -88,6 +94,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self.max_starved_steps = envs.VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS
         self.tpot_target_s = envs.VLLM_TPU_PREFILL_TPOT_TARGET_MS / 1e3
         self.max_hold_s = envs.VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S
+        self.priced = envs.VLLM_TPU_PREFILL_TPOT_PRICED
         # Decoding request id -> when it was first scheduled to decode, and
         # its output tokens at the previous step (TPOT projection).
         self._decode_t0: dict[str, float] = {}
@@ -95,6 +102,15 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self._tokens_per_step = 1.0
         # Start of the current run of steps deferred by the TPOT target.
         self._held_since: float | None = None
+        # Smallest positive TPOT slack of a decoding request at the last check.
+        self._slack_s = float("inf")
+        # Priced hold: step time by prefill-token bin, the prefill tokens this
+        # step may carry (None: no limit) and how many it has taken.
+        self._bin_s: dict[int, float] = {}
+        self._pending_bins: dict[int, int] = {}
+        self._fit_cap: int | None = None
+        self._fit_used = 0
+        self._fit_steps = 0
         # Decode-only seconds owed to the decoding requests.
         self._debt_s = 0.0
         self._step_s: dict[str, float] = {}
@@ -165,8 +181,13 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         if not decoding:
             self._debt_s = 0.0
         spacing = self.spacing_frac > 0 and decoding and self._debt_s > 0
-        if self.tpot_target_s > 0:
-            spacing = self._hold_for_tpot(decoders, queue) or spacing
+        self._fit_cap = None
+        if self.tpot_target_s > 0 and self._hold_for_tpot(decoders, queue):
+            fit = 0 if spacing or throttle_prefills else self._fit_tokens()
+            if fit:
+                self._fit_cap, self._fit_used = fit, 0
+                self._fit_steps += 1
+            spacing = not fit
         defer = throttle_prefills or spacing
         prefilling = [r for r in self.running if r.is_prefill_chunk]
         self._reserve = {} if defer else self._plan_reserve(prefilling)
@@ -229,9 +250,9 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
     def _short_of_slack(self, decoders: list[Request], now: float) -> bool:
         decode_s = self._step_s.get(_DECODE)
         long_s = self._step_s.get(_LONG)
+        self._slack_s = float("inf")
         if decode_s is None or long_s is None:
             return False
-        extra_s = long_s - decode_s
         for r in decoders:
             t0 = self._decode_t0.get(r.request_id)
             if t0 is None or r.max_tokens <= 1:
@@ -243,9 +264,19 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             slack_s = self.tpot_target_s * (r.max_tokens - 1) - projected_s
             # A request already past the target is not protected: holding
             # prefill for it cannot bring it back under.
-            if 0 < slack_s < extra_s:
-                return True
-        return False
+            if slack_s > 0:
+                self._slack_s = min(self._slack_s, slack_s)
+        return self._slack_s < long_s - decode_s
+
+    def _fit_tokens(self) -> int:
+        """Largest prefill-token bin whose measured step fits the slack."""
+        decode_s = self._step_s[_DECODE]
+        fit = 0
+        for tokens in _FIT_BINS:
+            step_s = self._bin_s.get(tokens)
+            if step_s is not None and step_s - decode_s < self._slack_s:
+                fit = tokens
+        return fit
 
     def _plan_reserve(self, prefilling: list[Request]) -> dict[str, int]:
         """Order RUNNING and size each prefill chunk's reserve for the
@@ -283,6 +314,16 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         num_new_tokens = super()._reserve_prefill_lookahead(
             request, num_computed_tokens, num_new_tokens
         )
+        if (
+            self._in_schedule
+            and self._fit_cap is not None
+            and num_computed_tokens < request.num_prompt_tokens
+        ):
+            # Priced hold: whole remaining prefills only, up to the cap.
+            left = request.num_tokens - num_computed_tokens
+            if num_new_tokens < left or self._fit_used + left > self._fit_cap:
+                num_new_tokens = 0
+            self._fit_used += num_new_tokens
         if running:
             self._running_tokens += num_new_tokens
         return num_new_tokens
@@ -301,19 +342,27 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
     def _account(self, output: SchedulerOutput, decoding: bool, spacing: bool) -> None:
         """Charge the step to the decode-only debt and remember its kind."""
         kind = None
+        prefill_tokens = 0
         for req_id, n in output.num_scheduled_tokens.items():
             r = self.requests[req_id]
             # num_computed_tokens already includes this step's tokens.
             computed = r.num_computed_tokens - n
             if computed < r.num_prompt_tokens:
+                prefill_tokens += n
                 if r.num_prompt_tokens - computed >= self.long_prompt_tokens:
                     kind = _LONG
-                    break
-                kind = _PREFILL
+                elif kind != _LONG:
+                    kind = _PREFILL
             elif kind is None:
                 kind = _DECODE
         if kind is None:
             return
+        if kind == _PREFILL and prefill_tokens <= _FIT_BINS[-1]:
+            if len(self._pending_bins) >= _MAX_PENDING_STEPS:
+                self._pending_bins.clear()
+            self._pending_bins[id(output)] = next(
+                b for b in _FIT_BINS if prefill_tokens <= b
+            )
         if not decoding:
             self._debt_s = 0.0
         elif kind == _LONG:
@@ -328,11 +377,14 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self._long_steps += kind == _LONG
         if self._steps % _LOG_EVERY == 0:
             logger.info(
-                "PrefillSpacingScheduler: steps=%d long=%d spacing=%d step_s=%s",
+                "PrefillSpacingScheduler: steps=%d long=%d spacing=%d fit=%d "
+                "step_s=%s bin_s=%s",
                 self._steps,
                 self._long_steps,
                 self._spacing_steps,
+                self._fit_steps,
                 {k: round(v, 4) for k, v in self._step_s.items()},
+                {k: round(v, 4) for k, v in self._bin_s.items()},
             )
 
     def update_from_output(
@@ -345,15 +397,22 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         # Timed only from an output that already had the next step queued.
         now = time.monotonic()
         kind = self._pending_kinds.pop(id(scheduler_output), None)
+        fit_bin = self._pending_bins.pop(id(scheduler_output), None)
         if kind is not None and self._last_output_t is not None:
             dt = now - self._last_output_t
-            avg = self._step_s.get(kind)
-            if avg is None:
-                self._step_s[kind] = dt
-            elif dt < _MAX_STEP_RATIO * avg:
-                self._step_s[kind] = avg + _STEP_TIME_EMA * (dt - avg)
+            self._time_step(self._step_s, kind, dt)
+            if fit_bin is not None:
+                self._time_step(self._bin_s, fit_bin, dt)
         self._last_output_t = now if self._pending_kinds else None
         return super().update_from_output(scheduler_output, model_runner_output)
+
+    @staticmethod
+    def _time_step(averages: dict, key, dt: float) -> None:
+        avg = averages.get(key)
+        if avg is None:
+            averages[key] = dt
+        elif dt < _MAX_STEP_RATIO * avg:
+            averages[key] = avg + _STEP_TIME_EMA * (dt - avg)
 
     @staticmethod
     def _remaining(request: Request) -> int:

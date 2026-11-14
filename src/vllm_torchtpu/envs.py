@@ -227,6 +227,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_SPACING_MIN_TOKENS: int = 8192
     VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
+    VLLM_TPU_PREFILL_TPOT_PRICED: bool = False
 
 
 def env_with_choices(
@@ -1397,6 +1398,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S": env_nonnegative_float(
         "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S", 10.0
     ),
+    # PrefillSpacingScheduler: while the TPOT target defers prefill, still run
+    # the shortest waiting or running prefills that finish within a short step
+    # whose measured time fits every decoding request's slack.
+    "VLLM_TPU_PREFILL_TPOT_PRICED": env_bool("VLLM_TPU_PREFILL_TPOT_PRICED"),
 }
 
 
