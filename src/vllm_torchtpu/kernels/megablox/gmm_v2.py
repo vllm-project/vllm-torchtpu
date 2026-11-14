@@ -436,7 +436,15 @@ def inner_kernel(
     m_start_local = m_start - m_offset
     m_end_local = m_end - m_offset
 
-    def _matmul(is_first_k_step: bool, is_last_k_step: bool, bucket_m: int):
+    # k steps of a tile: with one, its only step is first and last statically;
+    # with more, which step runs is a runtime predicate, so each row bucket
+    # traces one matmul body whatever the step (bounded program size).
+    num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
+    k_id = pl.program_id(2)
+    is_first_k_step = True if num_k == 1 else k_id == 0
+    is_last_k_step = True if num_k == 1 else k_id == num_k - 1
+
+    def _matmul(bucket_m: int):
         tpu_info = pltpu.get_tpu_info()
         mxu_size = tpu_info.mxu_column_size
 
@@ -462,8 +470,9 @@ def inner_kernel(
             rhs_qbs = cfgs.tiles.tile_k
 
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
-        if is_last_k_step and valid_k != 0:
-            mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
+        if valid_k != 0:
+            limit = jnp.where(is_last_k_step, valid_k, cfgs.tiles.tile_k)
+            mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < limit
             tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
         # Step 2: Matmul.
@@ -562,22 +571,22 @@ def inner_kernel(
         acc = jnp.concatenate(acc_list, axis=1)
 
         # Step 3: Output post-processing.
-        if not is_first_k_step:
-            acc = jnp.pad(acc, ((cfgs.tiles.tile_m - bucket_m, 0), (0, 0)))
-            acc += acc_ref[...]
+        if num_k > 1:
+            acc += jnp.where(is_first_k_step, 0, acc_ref[:bucket_m])
         acc_m = acc.shape[0]
 
-        if is_last_k_step:
+        def epilogue():
+            out = acc
             if cfgs.rhs_cfgs.has_bias:
                 tiled_rhs_bias = tiled_rhs_ref.get_bias()
-                acc += tiled_rhs_bias.astype(acc.dtype)
+                out += tiled_rhs_bias.astype(out.dtype)
 
-            acc = apply_act_fn(acc, cfgs.fuse_act)
+            out = apply_act_fn(out, cfgs.fuse_act)
 
             # Mask out rows that does not belong to the current group.
-            iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
+            iota = lax.broadcasted_iota(jnp.int32, out.shape, 0)
             mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
-            acc_masked = jnp.where(mask, acc, 0)
+            acc_masked = jnp.where(mask, out, 0)
 
             # Write the final output to the output ref.
             tiled_out_2d_ref = tiled_out_ref.reshape(-1, cfgs.tiles.tile_n)
@@ -609,42 +618,20 @@ def inner_kernel(
                 partial_out_zeros,
                 tiled_out_ref[last_row],
             )
+
+        if num_k == 1:
+            epilogue()
         else:
-            acc_ref[:acc_m] = acc
+            pl.when(is_last_k_step)(epilogue)
+
+            @pl.when(jnp.logical_not(is_last_k_step))
+            def _():
+                acc_ref[:acc_m] = acc
 
     def run_matmul_step(bucket_idx: int):
         bucket_m = cfgs.tiles.bucket_base * (bucket_idx + 1)
-
-        @jax.named_scope(f"bm{bucket_m}_first_last")
-        def matmul_first_last():
-            _matmul(is_first_k_step=True, is_last_k_step=True, bucket_m=bucket_m)
-
-        @jax.named_scope(f"bm{bucket_m}_first")
-        def matmul_first():
-            _matmul(is_first_k_step=True, is_last_k_step=False, bucket_m=bucket_m)
-
-        @jax.named_scope(f"bm{bucket_m}_mid")
-        def matmul_mid():
-            _matmul(is_first_k_step=False, is_last_k_step=False, bucket_m=bucket_m)
-
-        @jax.named_scope(f"bm{bucket_m}_last")
-        def matmul_last():
-            _matmul(is_first_k_step=False, is_last_k_step=True, bucket_m=bucket_m)
-
-        num_k = pl.num_programs(2)
-        k_id = pl.program_id(2)
-        is_first_k_step = k_id == 0
-        is_last_k_step = k_id == (num_k - 1)
-
-        if bucket_m == cfgs.tiles.tile_m:
-            lax.cond(
-                is_first_k_step,
-                lambda: lax.cond(is_last_k_step, matmul_first_last, matmul_first),
-                lambda: lax.cond(is_last_k_step, matmul_last, matmul_mid),
-            )
-        else:
-            # partial m is only invoked at last matmul.
-            lax.cond(is_first_k_step, matmul_first_last, matmul_last)
+        with jax.named_scope(f"bm{bucket_m}"):
+            _matmul(bucket_m)
 
     branches = []
     for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
