@@ -543,6 +543,61 @@ def _kernel_v3(
             )
 
 
+class TileEpilogue(NamedTuple):
+    """What a token-major v3 call (`_class_scores`) does with each tile's
+    scores in place of writing them out: after the tile's last page group,
+    ``fn(scores, tile_row0, tile_seq, *prefetch_refs, out_ref)`` runs on the
+    tile's ``[block_q, P]`` f32 scores in VMEM (columns past the request's
+    pages hold stale values), with `prefetch` as extra scalar-prefetch
+    operands, and writes the call's one output, `out_shape`, which stays in
+    VMEM across the grid: ``init(out_ref)`` fills it at the first step and
+    ``fn`` writes the rows of its tile."""
+
+    fn: Callable
+    init: Callable
+    prefetch: tuple
+    out_shape: jax.ShapeDtypeStruct
+
+
+def _kernel_v3_epilogue(
+    work_ref,
+    tile_seq_ref,
+    block_tables_ref,
+    seq_pages_ref,
+    *refs,
+    epilogue,
+):
+    """`_kernel_v3` (token-major) scoring into a VMEM row buffer of the
+    tile's scores, then `TileEpilogue.fn` at the tile's last work item."""
+    num_prefetch = len(epilogue.prefetch)
+    extra = refs[:num_prefetch]
+    q_ref, cache_ref, out_ref, buf, sems, rows = refs[num_prefetch:]
+    pages_per_step = buf.shape[1]
+    step, num_steps = pl.program_id(0), pl.num_programs(0)
+    pl.when(step == 0)(functools.partial(epilogue.init, out_ref))
+    entry = work_ref[step]
+    tile = entry >> _TILE_SHIFT
+    col0 = pl.multiple_of((entry & _GROUP_MASK) * pages_per_step, pages_per_step)
+    _kernel_v3(
+        work_ref,
+        tile_seq_ref,
+        block_tables_ref,
+        seq_pages_ref,
+        q_ref,
+        cache_ref,
+        rows.at[:, pl.ds(col0, pages_per_step)],
+        buf,
+        sems,
+        transposed=True,
+    )
+    following = work_ref[jnp.minimum(step + 1, num_steps - 1)] >> _TILE_SHIFT
+
+    @pl.when((step == num_steps - 1) | (following != tile))
+    def _():
+        info = tile_seq_ref[tile]
+        epilogue.fn(rows, info >> _ROW_SHIFT, info & _SEQ_MASK, *extra, out_ref)
+
+
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
 
@@ -614,12 +669,14 @@ def _class_scores(
     scale_cache=None,
     scale_row=None,
     q_pad=None,
+    epilogue=None,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
     them as ``[tiles * block_q, P]`` instead, so a token's scores are one row.
     The query rows are padded by ``q_pad >= block_q`` rows (default
-    `block_q`): classes sharing it share one padded copy."""
+    `block_q`): classes sharing it share one padded copy. With a
+    `TileEpilogue` (token-major only), returns its output instead."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = _page_tokens(rows_per_page, index_cache.dtype)
@@ -740,6 +797,47 @@ def _class_scores(
                 f"pages_per_step must be an even divisor or a multiple of it, "
                 f"got {pages_per_step}"
             )
+        ring = [
+            pltpu.VMEM(
+                (_RING_SLOTS, pages_per_step, rows_per_page, head_dim), jnp.uint32
+            ),
+            pltpu.SemaphoreType.DMA((_RING_SLOTS,)),
+        ]
+        if epilogue is not None:
+            if not token_major:
+                raise NotImplementedError("a tile epilogue needs token-major scores")
+            num_extra = len(epilogue.prefetch)
+            return pl.pallas_call(
+                functools.partial(_kernel_v3_epilogue, epilogue=epilogue),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=4 + num_extra,
+                    grid=grid_spec.grid,
+                    in_specs=[
+                        grid_spec.in_specs[0],
+                        pl.BlockSpec(memory_space=pl.ANY),
+                    ],
+                    out_specs=pl.BlockSpec(
+                        epilogue.out_shape.shape,
+                        lambda *_: (0,) * len(epilogue.out_shape.shape),
+                    ),
+                    scratch_shapes=[
+                        *ring,
+                        pltpu.VMEM((block_q, padded_pages), jnp.float32),
+                    ],
+                ),
+                out_shape=epilogue.out_shape,
+                compiler_params=params,
+                interpret=interpret,
+                name="minimax_m3_msa_block_scores",
+            )(
+                work,
+                tile_info,
+                block_tables,
+                seq_pages,
+                *epilogue.prefetch,
+                q_rows,
+                index_cache,
+            )
         scores_t = pl.pallas_call(
             functools.partial(_kernel_v3, transposed=token_major),
             grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -747,13 +845,7 @@ def _class_scores(
                 grid=grid_spec.grid,
                 in_specs=[grid_spec.in_specs[0], pl.BlockSpec(memory_space=pl.ANY)],
                 out_specs=out_specs,
-                scratch_shapes=[
-                    pltpu.VMEM(
-                        (_RING_SLOTS, pages_per_step, rows_per_page, head_dim),
-                        jnp.uint32,
-                    ),
-                    pltpu.SemaphoreType.DMA((_RING_SLOTS,)),
-                ],
+                scratch_shapes=ring,
             ),
             out_shape=out_shape,
             compiler_params=params,

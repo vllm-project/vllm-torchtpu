@@ -128,6 +128,78 @@ def local_seq_lens(
     return jnp.maximum(blocks - rank + dcp - 1, 0) // dcp * block_size
 
 
+def _pick_candidates(
+    s,
+    num_visible,
+    rank,
+    score_out_ref,
+    block_out_ref,
+    *,
+    topk,
+    init_blocks,
+    local_blocks,
+    dcp,
+):
+    """This rank's top-k of each row of block scores ``s [rows, width]``
+    (column ``c`` is block ``c * dcp + rank``) into ``score_out_ref`` /
+    ``block_out_ref [rows, topk]``: `msa_select`'s order (forced blocks first,
+    then score, ties to the lower block) over the blocks below each row's
+    ``num_visible [rows, 1]``; missing picks are ``(-inf, -1)``."""
+    rows, width = s.shape
+    cols = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
+    blocks = cols * dcp + rank
+    visible = blocks < num_visible
+    s = jnp.where(visible, s, _NEG_INF)
+    s = jnp.where(
+        visible & (blocks >= num_visible - local_blocks),
+        msa_select._FORCED_LOCAL_SCORE,
+        s,
+    )
+    s = jnp.where(visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s)
+    # f32 column ids (exact below 2**24): an int32 min across lanes lowers
+    # to two f32 cross-lane reductions (high and low halves).
+    col_ids = cols.astype(jnp.float32)
+
+    def picks(s, all_ties):
+        """`topk` picks of (best score, its first column). With
+        `all_ties`, a pick masks every column holding its score, so the
+        next pick's max need not wait for this one's first-column min
+        (each cross-lane reduction is ~141 cycles in the LLO); that is
+        exact while no finite score repeats. Returns the picks and each
+        pick's count of columns at its finite score."""
+        picked_scores, picked_blocks, ties = [], [], []
+        for _ in range(topk):
+            best_score = jnp.max(s, axis=1, keepdims=True)
+            hit = s == best_score
+            best = jnp.min(jnp.where(hit, col_ids, float(width)), axis=1, keepdims=True)
+            picked_scores.append(best_score)
+            picked_blocks.append(
+                jnp.where(
+                    best_score > _NEG_INF, best.astype(jnp.int32) * dcp + rank, -1
+                )
+            )
+            if all_ties:
+                ties.append(
+                    jnp.sum(
+                        jnp.where(hit & (best_score > _NEG_INF), 1.0, 0.0),
+                        axis=1,
+                        keepdims=True,
+                    )
+                )
+            s = jnp.where(hit if all_ties else col_ids == best, _NEG_INF, s)
+        score_out_ref[...] = jnp.concatenate(picked_scores, axis=1)
+        block_out_ref[...] = jnp.concatenate(picked_blocks, axis=1)
+        return ties
+
+    ties = picks(s, all_ties=True)
+
+    # A repeated finite score (forced init blocks, equal block maxima)
+    # takes its columns one at a time: redo the picks exactly.
+    @pl.when(jnp.max(functools.reduce(jnp.maximum, ties)) > 1)
+    def _():
+        picks(s, all_ties=False)
+
+
 def _candidates_kernel(
     rank_ref,
     widths_ref,
@@ -144,76 +216,28 @@ def _candidates_kernel(
     widths,
 ):
     """`msa_select._kernel` over this rank's columns (column ``c`` is block
-    ``c * dcp + rank``), also returning the picked scores. The rank is read
-    from SMEM so that every rank runs the same program.
+    ``c * dcp + rank``), also returning the picked scores (`_pick_candidates`).
+    The rank is read from SMEM so that every rank runs the same program.
 
     Row block ``i`` scans only its first ``widths_ref[i]`` columns (one of
     the static `widths`, covering every block its rows see): the scores span
     the whole max-model-len width, mostly past every row's context (c4
     prefill twin, j-3c651507: ~240 of 1,024 columns visible)."""
-    rank = rank_ref[0]
     width_now = widths_ref[pl.program_id(0)]
-    rows = scores_ref.shape[0]
     num_visible = pos_ref[...] // block_size + 1
 
     def select(width):
-        s = scores_ref[:, :width]
-        cols = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
-        blocks = cols * dcp + rank
-        visible = blocks < num_visible
-        s = jnp.where(visible, s, _NEG_INF)
-        s = jnp.where(
-            visible & (blocks >= num_visible - local_blocks),
-            msa_select._FORCED_LOCAL_SCORE,
-            s,
+        _pick_candidates(
+            scores_ref[:, :width],
+            num_visible,
+            rank_ref[0],
+            score_out_ref,
+            block_out_ref,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            dcp=dcp,
         )
-        s = jnp.where(
-            visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
-        )
-        # f32 column ids (exact below 2**24): an int32 min across lanes lowers
-        # to two f32 cross-lane reductions (high and low halves).
-        col_ids = cols.astype(jnp.float32)
-
-        def picks(s, all_ties):
-            """`topk` picks of (best score, its first column). With
-            `all_ties`, a pick masks every column holding its score, so the
-            next pick's max need not wait for this one's first-column min
-            (each cross-lane reduction is ~141 cycles in the LLO); that is
-            exact while no finite score repeats. Returns the picks and each
-            pick's count of columns at its finite score."""
-            picked_scores, picked_blocks, ties = [], [], []
-            for _ in range(topk):
-                best_score = jnp.max(s, axis=1, keepdims=True)
-                hit = s == best_score
-                best = jnp.min(
-                    jnp.where(hit, col_ids, float(width)), axis=1, keepdims=True
-                )
-                picked_scores.append(best_score)
-                picked_blocks.append(
-                    jnp.where(
-                        best_score > _NEG_INF, best.astype(jnp.int32) * dcp + rank, -1
-                    )
-                )
-                if all_ties:
-                    ties.append(
-                        jnp.sum(
-                            jnp.where(hit & (best_score > _NEG_INF), 1.0, 0.0),
-                            axis=1,
-                            keepdims=True,
-                        )
-                    )
-                s = jnp.where(hit if all_ties else col_ids == best, _NEG_INF, s)
-            score_out_ref[...] = jnp.concatenate(picked_scores, axis=1)
-            block_out_ref[...] = jnp.concatenate(picked_blocks, axis=1)
-            return ties
-
-        ties = picks(s, all_ties=True)
-
-        # A repeated finite score (forced init blocks, equal block maxima)
-        # takes its columns one at a time: redo the picks exactly.
-        @pl.when(jnp.max(functools.reduce(jnp.maximum, ties)) > 1)
-        def _():
-            picks(s, all_ties=False)
 
     for width in widths:
         pl.when(width_now == width)(functools.partial(select, width))
@@ -455,6 +479,124 @@ def local_candidates(
     if transposed:
         picked_scores, picked_blocks = picked_scores.T, picked_blocks.T
     return picked_scores[:num_tokens], picked_blocks[:num_tokens]
+
+
+def _tile_candidates(
+    scores_ref,
+    tile_row0,
+    tile_seq,
+    rank_ref,
+    cu_q_lens_ref,
+    seq_lens_ref,
+    out_ref,
+    *,
+    block_size,
+    topk,
+    init_blocks,
+    local_blocks,
+    dcp,
+):
+    """`msa_indexer.TileEpilogue` of `decode_candidates`: the tile's rows'
+    `_pick_candidates`, packed (`pack_candidates`) into their token rows of
+    ``out_ref [T, 2 * topk]``; rows of the tile outside its request keep
+    what they hold."""
+    block_q = scores_ref.shape[0]
+    start = cu_q_lens_ref[tile_seq]
+    end = cu_q_lens_ref[tile_seq + 1]
+    token = tile_row0 + jax.lax.broadcasted_iota(jnp.int32, (block_q, 1), 0)
+    pos = (
+        seq_lens_ref[tile_seq] - (end - start) + (token - start)
+    )  # `msa.token_positions`
+    picked = [
+        pltpu.VMEM((block_q, topk), jnp.float32),
+        pltpu.VMEM((block_q, topk), jnp.int32),
+    ]
+
+    def pick(score_ref, block_ref):
+        _pick_candidates(
+            scores_ref[...],
+            pos // block_size + 1,
+            rank_ref[0],
+            score_ref,
+            block_ref,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            dcp=dcp,
+        )
+        rows = out_ref.at[
+            pl.ds(pl.multiple_of(tile_row0, msa_indexer._ROW_ALIGN), block_q)
+        ]
+        packed = pack_candidates(score_ref[...], block_ref[...])
+        rows[...] = jnp.where((token >= start) & (token < end), packed, rows[...])
+
+    pl.run_scoped(pick, *picked)
+
+
+def _no_candidates(out_ref):
+    """Packed ``(-inf, -1)`` in every row (rows no tile writes: padding)."""
+    topk = out_ref.shape[1] // 2
+    lane = jax.lax.broadcasted_iota(jnp.int32, out_ref.shape, 1)
+    out_ref[...] = jnp.where(lane < topk, _NEG_INF, -1.0)
+
+
+def decode_candidates(
+    index_q: jax.Array,
+    index_cache: jax.Array,
+    seq_lens: jax.Array,
+    local_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array,
+    *,
+    block_size: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    rank: jax.Array,
+    dcp: int,
+    interpret: bool,
+) -> jax.Array | None:
+    """`pack_candidates` of a decode step's local top-k ``[T, 2 * topk]``
+    from one kernel: the block-score kernel picks each query tile's
+    candidates (`_tile_candidates`) from its scores in VMEM and writes them
+    to the tile's token rows, instead of writing ``[tiles * Bq, P]`` scores
+    that an XLA row gather (0.74 us per layer, c4 twin j-7ecb84bb) and a
+    candidates kernel (1.28 us) then read. ``None`` for a step the plain
+    path must take: requests longer than one small tile class, or scores
+    not token-major (`msa_indexer.class_plan`)."""
+    num_tokens = index_q.shape[0]
+    plan = msa_indexer.class_plan(
+        index_q,
+        index_cache,
+        local_lens,
+        block_tables,
+        cu_q_lens,
+        num_seqs,
+        **msa.block_score_options(),
+        interpret=interpret,
+    )
+    if plan.max_large or not plan.token_major:
+        return None
+    width = 2 * topk
+    # A tile starts at its request's first row rounded down to the row
+    # alignment and spans `small_block_q` rows, which can reach this far.
+    align = msa_indexer._ROW_ALIGN
+    rows = -(-num_tokens // align) * align + plan.small_block_q - align
+    epilogue = msa_indexer.TileEpilogue(
+        functools.partial(
+            _tile_candidates,
+            block_size=block_size,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            dcp=dcp,
+        ),
+        _no_candidates,
+        (rank_array(rank), cu_q_lens, seq_lens),
+        jax.ShapeDtypeStruct((rows, width), jnp.float32),
+    )
+    return plan.small(epilogue=epilogue)[:num_tokens]
 
 
 def pack_candidates(scores: jax.Array, blocks: jax.Array) -> jax.Array:
@@ -778,6 +920,25 @@ def msa_write_and_candidates_dcp(
         if fp4:
             return kv_cache, index_cache, scale_cache, packed
         return kv_cache, index_cache, packed
+    if num_heads == 1 and not fp4:
+        packed = decode_candidates(
+            index_q,
+            index_cache,
+            seq_lens,
+            local_lens,
+            block_tables,
+            cu_q_lens,
+            distribution[2],
+            block_size=block_size,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            rank=rank,
+            dcp=dcp,
+            interpret=interpret,
+        )
+        if packed is not None:
+            return kv_cache, index_cache, packed
     if num_heads == 1:
         scores = msa._block_scores(
             index_q,
