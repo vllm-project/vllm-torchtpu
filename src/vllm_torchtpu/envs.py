@@ -221,6 +221,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MEGAKERNEL: str = ""
     VLLM_TPU_EXPERIMENTAL_USE_RUST: bool = False
     VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY: str = ""
+    VLLM_TPU_OMNI_SPLIT_SPLASH: bool = False
 
 
 def env_with_choices(
@@ -1356,6 +1357,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": env_str(
         "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", default=""
     ),
+    # vLLM-Omni: enable LSE-merged Split-Splash attention in TpuSDPAImpl for
+    # key-prefix-masked joint [text, image] diffusion sequences (and route
+    # unmasked bf16 TpuSDPAImpl calls to flash_attention_bshd).
+    "VLLM_TPU_OMNI_SPLIT_SPLASH": env_bool("VLLM_TPU_OMNI_SPLIT_SPLASH", False),
 }
 
 

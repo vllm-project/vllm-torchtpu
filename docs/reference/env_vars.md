@@ -115,6 +115,7 @@ Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `VLLM_TPU_OMNI_SPLIT_SPLASH` | `False` | Opt-in (`vLLM-Omni`). Dispatches key-prefix-masked joint `[text, image]` diffusion attention (such as `QwenImageCrossAttention`) to LSE-merged Pallas Split-Splash in `TpuSDPAImpl`, and routes unmasked bf16 `TpuSDPAImpl` calls to `flash_attention_bshd`. |
 
 ---
 

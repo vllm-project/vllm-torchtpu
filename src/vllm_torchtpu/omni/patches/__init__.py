@@ -26,11 +26,13 @@ until Omni patches are unified with patch_registry.py (tracked in #1862); see
 qwen3omni_thinker.py.
 """
 
+import functools
 from functools import cache as run_once
 from typing import Any
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -88,6 +90,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_qwen_image_prefix_mask()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -426,8 +429,15 @@ def _patch_sdpa_fallback_dispatch() -> None:
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 
-    from vllm_torchtpu.omni.attention import TpuSDPAImpl
+    from vllm_torchtpu.omni.attention import (
+        TpuSDPAImpl,
+        _flash_attention_op,
+        _get_split_splash_op,
+    )
 
+    if envs.VLLM_TPU_OMNI_SPLIT_SPLASH and not torch.compiler.is_compiling():
+        _get_split_splash_op()
+        _flash_attention_op()
     if getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False):
         return
     # The flag lands on TpuSDPAImpl.forward, the function shared by both classes.
@@ -649,3 +659,141 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_QWEN_IMAGE_PREFIX_MASK_PATCHED = "_tpu_qwen_image_prefix_mask_patched"
+
+
+def _patch_qwen_image_prefix_mask() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni's QwenImageCrossAttention passes the known
+    # text prefix length in AttentionMetadata.extra (or avoids constructing a
+    # joint key mask when hidden_states_mask is None).
+    #
+    # Source: adapted from QwenImageCrossAttention.forward in
+    #   vllm_omni/diffusion/models/qwen_image/qwen_image_transformer.py
+    #   (lines 849-947 at vllm-omni v0.33.0rc1).
+    # Problem: QwenImagePipeline always passes encoder_hidden_states_mask, so
+    #   QwenImageCrossAttention concatenates [encoder_hidden_states_mask, 1s]
+    #   into AttentionMetadata(attn_mask=joint_mask) without recording where
+    #   the text prefix ends. TpuFlashAttentionImpl then falls back to PyTorch
+    #   SDPA on the full (S_txt + S_img) sequence.
+    # Fix: When VLLM_TPU_OMNI_SPLIT_SPLASH=1, non-SP calls with
+    #   hidden_states_mask is None and encoder_hidden_states_mask is not None
+    #   record extra={"prefix_mask_len": seq_len_txt} on AttentionMetadata so
+    #   TpuSDPAImpl can safely split at seq_len_txt without host mask checks.
+    # -------------------------------------------------------------------------
+    if not envs.VLLM_TPU_OMNI_SPLIT_SPLASH:
+        return
+
+    from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
+
+    attn_cls = qwen_image_transformer.QwenImageCrossAttention
+    if getattr(attn_cls.forward, _QWEN_IMAGE_PREFIX_MASK_PATCHED, False):
+        return
+
+    orig_forward = attn_cls.forward
+    attn_cls._tpu_orig_forward = orig_forward
+
+    @functools.wraps(orig_forward)
+    def _prefix_masked_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        vid_freqs: torch.Tensor,
+        txt_freqs: torch.Tensor,
+        hidden_states_mask: torch.Tensor | None = None,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
+        qk_norm_rope_table: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sp_active = (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+        )
+        if (
+            sp_active
+            or self.reference_precision
+            or hidden_states_mask is not None
+            or encoder_hidden_states_mask is None
+            or qk_norm_rope_table is not None
+        ):
+            return orig_forward(
+                self,
+                hidden_states,
+                encoder_hidden_states,
+                vid_freqs,
+                txt_freqs,
+                hidden_states_mask=hidden_states_mask,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                qk_norm_rope_table=qk_norm_rope_table,
+            )
+
+        img_qkv, _ = self.to_qkv(hidden_states)
+        q_size = self.query_num_heads * self.head_dim
+        kv_size = self.kv_num_heads * self.head_dim
+        img_query, img_key, img_value = img_qkv.split(
+            [q_size, kv_size, kv_size], dim=-1
+        )
+
+        txt_qkv, _ = self.add_kv_proj(encoder_hidden_states)
+        add_q_size = self.add_query_num_heads * self.head_dim
+        add_kv_size = self.add_kv_num_heads * self.head_dim
+        txt_query, txt_key, txt_value = txt_qkv.split(
+            [add_q_size, add_kv_size, add_kv_size], dim=-1
+        )
+
+        img_query = img_query.unflatten(-1, (self.query_num_heads, self.head_dim))
+        img_key = img_key.unflatten(-1, (self.kv_num_heads, self.head_dim))
+        img_value = img_value.unflatten(-1, (self.kv_num_heads, self.head_dim))
+
+        txt_query = txt_query.unflatten(-1, (self.add_query_num_heads, self.head_dim))
+        txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
+        txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
+
+        seq_len_txt = encoder_hidden_states.shape[1]
+        img_query, img_key = qwen_image_transformer._qwen_image_qk_norm_rope(
+            img_query,
+            img_key,
+            self.norm_q,
+            self.norm_k,
+            vid_freqs,
+            self.rope,
+            self.eps,
+            use_fused=self.qk_norm,
+        )
+        txt_query, txt_key = qwen_image_transformer._qwen_image_qk_norm_rope(
+            txt_query,
+            txt_key,
+            self.norm_added_q,
+            self.norm_added_k,
+            txt_freqs,
+            self.rope,
+            self.eps,
+        )
+        joint_query = torch.cat([txt_query, img_query], dim=1)
+        joint_key = torch.cat([txt_key, img_key], dim=1)
+        joint_value = torch.cat([txt_value, img_value], dim=1)
+
+        img_mask = torch.ones(
+            hidden_states.shape[:2],
+            dtype=torch.bool,
+            device=hidden_states.device,
+        )
+        joint_mask = torch.cat(
+            [encoder_hidden_states_mask.to(dtype=torch.bool), img_mask], dim=1
+        )
+        attn_metadata = qwen_image_transformer.AttentionMetadata(
+            attn_mask=joint_mask,
+            extra={"prefix_mask_len": seq_len_txt},
+        )
+        joint_hidden_states = self.attn(
+            joint_query, joint_key, joint_value, attn_metadata
+        )
+        joint_hidden_states = joint_hidden_states.flatten(2, 3).to(joint_query.dtype)
+        img_attn_output = self.to_out(joint_hidden_states[:, seq_len_txt:, :])
+        txt_attn_output = self.to_add_out(joint_hidden_states[:, :seq_len_txt, :])
+        return img_attn_output, txt_attn_output
+
+    setattr(_prefix_masked_forward, _QWEN_IMAGE_PREFIX_MASK_PATCHED, True)
+    attn_cls.forward = _prefix_masked_forward
+    logger.info("Applied TPU patch: QwenImageCrossAttention prefix_mask_len metadata.")
