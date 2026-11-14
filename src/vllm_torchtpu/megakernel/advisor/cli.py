@@ -25,13 +25,14 @@ from typing import TYPE_CHECKING, get_args
 from vllm_torchtpu.megakernel.core import errors
 
 from .calibrate import CalibrateOptions, calibrate_trace
-from .chips import ChipSpec, resolve_chip_spec
+from .chips import ChipSpec, public_calibration_path, resolve_chip_spec
 from .constants import (
     DEFAULT_CHIP,
     DEFAULT_PHASE,
     DEFAULT_PREFILL_ISL,
     INVALID_CONFIG_EXIT_CODE,
     MIN_VMEM_MIB,
+    PUBLIC_MEASUREMENT_ALIASES,
     RECOMMEND_DEFAULT_BATCH,
     VALID_DMA_BUFFERS,
 )
@@ -468,10 +469,28 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
     _validate_cli_floats(args)
 
 
+def _resolve_cli_measurements(
+    raw_measurements: str | None,
+    chip_name: str,
+) -> str | None:
+    """Resolve `bundled`/`auto` measurement aliases to packaged calibration paths."""
+    if raw_measurements in PUBLIC_MEASUREMENT_ALIASES:
+        bundled_path = public_calibration_path(chip_name)
+        if bundled_path is None:
+            msg = (
+                "No bundled architectural priors available for chip "
+                f"'{chip_name}'. Specify a custom path to --measurements."
+            )
+            raise errors.MegakernelConfigError(msg)
+        return str(bundled_path)
+    return raw_measurements
+
+
 def _run_sweep_command(
     args: argparse.Namespace,
     profile: ModelProfile,
     chip_spec: ChipSpec,
+    measurements_val: str | None,
 ) -> int:
     """Execute `--regime-sweep` / `--html` and emit stdout/HTML/JSON outputs."""
     base_wl = WorkloadSpec(
@@ -500,7 +519,7 @@ def _run_sweep_command(
         dcp=args.dcp,
         pcp=args.pcp,
         deployment_preset=args.deployment_preset,
-        measurements=args.measurements,
+        measurements=measurements_val,
     )
     sweep = advise_regimes(profile, chip_spec, options=opts)
     if args.html:
@@ -575,9 +594,10 @@ def _run_main_command(args: argparse.Namespace) -> int:
         raise errors.MegakernelConfigError(msg)
 
     profile, chip_spec = _resolve_cli_model_and_chip(args)
+    measurements_val = _resolve_cli_measurements(args.measurements, chip_spec.name)
 
     if args.regime_sweep or args.html:
-        return _run_sweep_command(args, profile, chip_spec)
+        return _run_sweep_command(args, profile, chip_spec, measurements_val)
 
     tp, ep, dp, pp, dcp = _resolve_cli_mesh(args)
     if tp is None:
@@ -606,7 +626,7 @@ def _run_main_command(args: argparse.Namespace) -> int:
         profile,
         workload,
         chip_spec,
-        measurements=args.measurements,
+        measurements=measurements_val,
     )
     exit_code = (
         INVALID_CONFIG_EXIT_CODE if report.verdict.startswith("invalid_config(") else 0
@@ -626,6 +646,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if argv_list and argv_list[0] == "calibrate":
         return _run_calibrate_cli(argv_list[1:])
+    if argv_list and argv_list[0] == "estimate":
+        argv_list = argv_list[1:]
     parser = build_arg_parser()
     args = parser.parse_args(argv_list)
     _validate_cli_args(args)
