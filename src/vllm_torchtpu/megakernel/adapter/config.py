@@ -424,7 +424,7 @@ def import_plugin(ref: PluginRef) -> tuple[TpuMonoSpec, ModuleType]:
             f"megakernel plugin {ref.module}:{ref.attr} is not a TpuMonoSpec "
             f"(got {type(plugin).__name__})"
         )
-    if int(plugin.api_version) != API_VERSION:
+    if plugin.api_version != API_VERSION:
         raise MegakernelConfigError(
             f"megakernel plugin {ref.module}:{ref.attr} targets api_version "
             f"{plugin.api_version}; this adapter supports {API_VERSION}"
