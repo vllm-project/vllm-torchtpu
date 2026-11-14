@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Core Pallas kernel implementations for Batched Ragged Paged Attention.
+
+Orchestrates asynchronous VMEM DMA pipelines for paged KV cache gather, online
+softmax accumulation, and output writeback across decode and mixed batches.
+"""
+
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import cast
 
@@ -224,6 +231,9 @@ class StitchMetadata:
     bkv_sz_frm_cache: list[jax.Array]
     bkv_sz_frm_new: list[jax.Array]
     new_kv_len_start: list[jax.Array]
+    # CACHE_ONLY: rank-local end of the attended KV, relative to the block. The
+    # stitch stops there.
+    local_k_end: list[jax.Array] | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -280,10 +290,14 @@ def fetch_stitch_metadata(
     bkv_sz_frm_cache_list = []
     bkv_sz_frm_new_list = []
     new_kv_len_start_list = []
+    local_k_end_list = (
+        [] if cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY else None
+    )
 
     for b_idx in range(cfgs.batch_size):
         s_idx = schedule_ref.s_idx[step, b_idx]
         is_valid = s_idx != -1
+        s_idx = jnp.maximum(s_idx, 0)  # padded lanes (-1): no SMEM read at -1
         k_idx = schedule_ref.k_idx[step, b_idx]
         k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
         kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[s_idx], 0)
@@ -303,11 +317,14 @@ def fetch_stitch_metadata(
         bkv_sz_frm_cache_list.append(bkv_sz_frm_cache)
         bkv_sz_frm_new_list.append(jnp.minimum(kv_left, cfgs.bkv_sz) - bkv_sz_frm_cache)
         new_kv_len_start_list.append(q_end - kv_left_frm_new)
+        if local_k_end_list is not None:
+            local_k_end_list.append(kv_cache_len_val - k_id)
 
     return StitchMetadata(
         bkv_sz_frm_cache=bkv_sz_frm_cache_list,
         bkv_sz_frm_new=bkv_sz_frm_new_list,
         new_kv_len_start=new_kv_len_start_list,
+        local_k_end=local_k_end_list,
     )
 
 
@@ -345,6 +362,7 @@ def fetch_compute_metadata(
     for b_idx in range(cfgs.batch_size):
         s_idx = schedule_ref.s_idx[step, b_idx]
         is_valid = s_idx != -1
+        s_idx = jnp.maximum(s_idx, 0)  # padded lanes (-1): no SMEM read at -1
         q_idx = schedule_ref.q_idx[step, b_idx]
         k_idx = schedule_ref.k_idx[step, b_idx]
         k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
@@ -372,6 +390,7 @@ def generate_mask(
     shape: tuple[int, int, int, int],
     *,
     bq_start: int,
+    stitch_meta: StitchMetadata,
     step_meta: ComputeMetadata,
     cfgs: configs.RpaConfigs,
 ) -> jax.Array:
@@ -396,7 +415,10 @@ def generate_mask(
         # Step 2
         #   offset = causal_offset - bq_start
         offset = step_meta.causal_offset[b_idx] - bq_start
-        mask_b = q_kv_diff >= offset
+        n_valid = (
+            stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
+        )
+        mask_b = jnp.logical_and(q_kv_diff >= offset, kv_iota < n_valid)
         if (sliding_window := cfgs.model.sliding_window) is not None:
             mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
 
@@ -408,6 +430,101 @@ def generate_mask(
         masks.append(mask_b)
 
     return masks
+
+
+def _mask_unattended_v(
+    v: jax.Array,
+    v_scale: jax.Array | float | None,
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> tuple[jax.Array, jax.Array | float | None]:
+    """Zeroes unattended rows of V and v_scale to prevent FP8 NaNs in PV matmul."""
+    seq_along_lane = cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+    # Emit the sequence-axis iota directly at the 3D V tile shape so
+    # HEAD_ALONG_SUBLANE (sequence on sublane axis 1) does not lower through an
+    # unsupported 1D->3D vector.shape_cast in Mosaic's infer-vector-layout pass.
+    v_iota = lax.broadcasted_iota(jnp.int32, v.shape[1:], 2 if seq_along_lane else 1)
+    has_per_token_v_scale = (
+        isinstance(v_scale, jax.Array) and cfgs.serve.per_token_scale
+    )
+    sc_iota = (
+        lax.broadcasted_iota(jnp.int32, v_scale.shape[1:], 1)
+        if has_per_token_v_scale
+        else None
+    )
+
+    masked_v = []
+    masked_v_scale: list[jax.Array] = []
+
+    for b in range(cfgs.batch_size):
+        n_valid = stitch_meta.bkv_sz_frm_cache[b] + stitch_meta.bkv_sz_frm_new[b]
+        keep_v = v_iota < n_valid
+        if step_meta.local_k_start is not None:
+            keep_v = jnp.logical_and(keep_v, v_iota >= step_meta.local_k_start[b])
+        if step_meta.local_k_end is not None:
+            keep_v = jnp.logical_and(keep_v, v_iota < step_meta.local_k_end[b])
+
+        v_b = v[b]
+        masked_v.append(jnp.where(keep_v, v_b, jnp.zeros_like(v_b)))
+
+        if has_per_token_v_scale:
+            assert isinstance(v_scale, jax.Array) and sc_iota is not None
+            keep_sc = sc_iota < n_valid
+            if step_meta.local_k_start is not None:
+                keep_sc = jnp.logical_and(
+                    keep_sc, sc_iota >= step_meta.local_k_start[b]
+                )
+            if step_meta.local_k_end is not None:
+                keep_sc = jnp.logical_and(keep_sc, sc_iota < step_meta.local_k_end[b])
+            masked_v_scale.append(
+                jnp.where(keep_sc, v_scale[b], jnp.zeros_like(v_scale[b]))
+            )
+
+    new_v = jnp.stack(masked_v, axis=0)
+    new_v_scale = (
+        jnp.stack(masked_v_scale, axis=0) if has_per_token_v_scale else v_scale
+    )
+    return new_v, new_v_scale
+
+
+def block_fully_visible(
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
+    cfgs: configs.RpaConfigs,
+) -> jax.Array | None:
+    """Scalar: True iff `generate_mask` would be all-True for every batch entry.
+
+    Returns None when the fast path is statically unavailable. The causal test
+    `q_kv_diff >= causal_offset - bq_start` holds for the whole tile iff it
+    holds at the smallest `q_kv_diff` (1 - bkv_sz) of the first q chunk
+    (bq_start=0), i.e. the block's last key is at or before the first query row.
+    The block must also hold `bkv_sz` valid keys, since `generate_mask` masks
+    keys past the lane's KV end. This covers ~98% of blocks for a chunk over a
+    long cached context.
+    """
+    if not flash_attention.vpu_diet_enabled():
+        return None
+    if cfgs.mode != configs.RpaCase.MIXED or cfgs.model.sliding_window is not None:
+        return None
+    full = None
+    for b_idx in range(cfgs.batch_size):
+        n_valid = (
+            stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
+        )
+        full_b = jnp.logical_and(
+            step_meta.causal_offset[b_idx] <= 1 - cfgs.bkv_sz,
+            n_valid >= cfgs.bkv_sz,
+        )
+        if step_meta.local_k_start is not None:
+            full_b = jnp.logical_and(full_b, step_meta.local_k_start[b_idx] <= 0)
+        if step_meta.local_k_end is not None:
+            full_b = jnp.logical_and(
+                full_b, step_meta.local_k_end[b_idx] >= cfgs.bkv_sz
+            )
+        full = full_b if full is None else jnp.logical_and(full, full_b)
+    return full
 
 
 def rpa_body(
@@ -475,6 +592,11 @@ def rpa_body(
                     stitch_meta.new_kv_len_start[b_idx],
                     stitch_meta.bkv_sz_frm_new[b_idx],
                     cfgs=cfgs,
+                    local_k_end=(
+                        stitch_meta.local_k_end[b_idx]
+                        if stitch_meta.local_k_end is not None
+                        else None
+                    ),
                 )
                 stitch_results.append(res)
             for b_idx in range(cfgs.batch_size):
@@ -499,6 +621,59 @@ def rpa_body(
         cfgs=cfgs,
     )
 
+    run_step = functools.partial(
+        _rpa_step,
+        q_vref,
+        kv_in_vref,
+        o_vref,
+        lse_o_vref,
+        schedule_ref,
+        m_scratch_ref,
+        l_scratch_ref,
+        acc_scratch_ref,
+        step=step,
+        stitch_meta=stitch_meta,
+        step_meta=step_meta,
+        cfgs=cfgs,
+    )
+    full = block_fully_visible(stitch_meta, step_meta, cfgs)
+    if full is None:
+        run_step(apply_mask=True)
+        return
+
+    @pl.when(full)
+    def _unmasked():
+        run_step(apply_mask=False)
+
+    @pl.when(jnp.logical_not(full))
+    def _masked():
+        run_step(apply_mask=True)
+
+
+def _rpa_step(
+    # Inputs.
+    q_vref: jax.Ref,
+    kv_in_vref: jax.Ref,
+    # Outputs
+    o_vref: jax.Ref,
+    lse_o_vref: jax.Ref | None,
+    # Scratches.
+    schedule_ref: schedule.RpaSchedule,
+    m_scratch_ref: jax.Ref,
+    l_scratch_ref: jax.Ref,
+    acc_scratch_ref: jax.Ref,
+    *,
+    step: jax.Array,
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
+    apply_mask: bool,
+    cfgs: configs.RpaConfigs,
+):
+    """Runs one step's attention over the stitched KV block.
+
+    `apply_mask=False` skips the QK mask, for a block `block_fully_visible`
+    proved fully visible.
+    """
     # Step 2b: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
@@ -615,6 +790,16 @@ def rpa_body(
 
     k, v, k_scale, v_scale = get_scale_factors(k, v, cfgs=cfgs)
 
+    # Zero V and v_scale rows that no query of the lane attends to. Score
+    # masking only zeroes their softmax weights, but 0 * NaN = NaN in the PV
+    # matmul, and those rows can hold anything: page tails past the (rank-local)
+    # KV length, lanes with no sequence, or unfetched VMEM. In the unified
+    # hybrid pool a recycled page's tail still holds Mamba state bytes, many of
+    # which decode to fp8 NaN. With `mask_invalid_v` the loads above already
+    # zeroed exactly these rows (`_compute_valid_kv_mask`, same predicate).
+    if not cfgs.serve.mask_invalid_v:
+        v, v_scale = _mask_unattended_v(v, v_scale, stitch_meta, step_meta, cfgs=cfgs)
+
     # Step 3: Perform compute.
     m_val = m_scratch_ref[...]
     l_val = l_scratch_ref[...]
@@ -631,17 +816,20 @@ def rpa_body(
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
 
-        custom_mask = generate_mask(
-            shape=(
-                cfgs.batch_size,
-                cfgs.model.num_kv_heads,
-                q_end - q_start,
-                cfgs.bkv_sz,
-            ),
-            bq_start=bq_start,
-            step_meta=step_meta,
-            cfgs=cfgs,
-        )
+        custom_mask = None
+        if apply_mask:
+            custom_mask = generate_mask(
+                shape=(
+                    cfgs.batch_size,
+                    cfgs.model.num_kv_heads,
+                    q_end - q_start,
+                    cfgs.bkv_sz,
+                ),
+                bq_start=bq_start,
+                stitch_meta=stitch_meta,
+                step_meta=step_meta,
+                cfgs=cfgs,
+            )
 
         p, alpha_list, m_next, l_next, m_carry, l_carry = (
             flash_attention.flash_attention_qk_softmax(
@@ -928,109 +1116,115 @@ def rpa_kernel(
             # we initiallize scratch memory with non-zero values. Even if the scratch
             # memory is storing kv cache from previous step, as long as the data is
             # not NaNs, there will be no numeric concerns.
-
-            scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
+            #
+            # Every step zeroes the V rows its lanes do not attend to
+            # (`mask_invalid_v` or `_mask_unattended_v`), and NaNs in
+            # unattended K only reach masked scores, which `jnp.where` replaces.
+            # So the KV buffers (~27 MB of VMEM for decode, a fixed few us per
+            # call) are not zeroed.
 
             q_alloc, kv_cache_alloc, o_alloc, lse_alloc = final_allocs
 
-            num_lanes = pltpu.get_tpu_info().num_lanes
-            q_ref_flat = q_alloc.window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-            kv_ref_flat = kv_cache_alloc.window_ref.bitcast(jnp.uint32).reshape(
-                -1, num_lanes
-            )
+            @pl.when(actual_steps > 0)
+            def _active():
+                scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
 
-            # Explicitly zero out scratches and Q/KV buffers.
-            for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
-                ref[...] = jnp.zeros_like(ref)
-
-            def execute_schedule_chunk(start_step, num_steps):
-                # All reads are aligned to 128 and some extra steps are copied in the
-                # process.
-                aligned_start_step = (start_step // 128) * 128
-                prefix_steps = start_step - aligned_start_step
-
-                flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
-                flat_smem = jax.tree_util.tree_leaves(schedule_ref)
-                dma_list = []
-                for h, s in zip(flat_hbm, flat_smem):
-                    if jax.typeof(h).memory_space == pltpu.HBM:
-                        element_size = s.shape[0] // cfgs.max_steps_ub
-                        read_size = element_size * (num_steps + prefix_steps)
-                        read_size = utils.align_to(read_size, 1024)
-                        read_size = jnp.minimum(read_size, s.shape[0])
-
-                        src_off = element_size * aligned_start_step
-                        src_off = pl.multiple_of(src_off, 128)
-
-                        copy = pltpu.make_async_copy(
-                            h.at[pl.ds(src_off, read_size)],
-                            s.at[pl.ds(0, read_size)],
-                            dma_sem.at[0],
-                        )
-                        copy.start()
-                        dma_list.append(copy)
-                jax.tree.map(lambda x: x.wait(), dma_list)
-
-                total_steps = num_steps + prefix_steps
-                kv_bound = kv_cache_alloc.bind(
-                    src_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
-                    dst_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
+                num_lanes = pltpu.get_tpu_info().num_lanes
+                q_ref_flat = q_alloc.window_ref.bitcast(jnp.uint32).reshape(
+                    -1, num_lanes
                 )
-                q_bound = q_alloc.bind(src_ref=(q_hbm_ref, schedule_ref))
-                o_bound = o_alloc.bind(dst_ref=(o_hbm_ref, schedule_ref))
-                lse_bound = (
-                    lse_alloc.bind(dst_ref=(lse_hbm_ref, schedule_ref))
-                    if return_lse
-                    else None
-                )
+                # Explicitly zero out scratches and the Q buffer.
+                for ref in (scratches[1], scratches[2], q_ref_flat):
+                    ref[...] = jnp.zeros_like(ref)
 
-                def compute_fn(
-                    step,
-                    slot,
-                    total_steps,
-                    out_slot,
-                    start_next_fetch,
-                    start_kv_writeback,
-                ):
-                    del total_steps
-                    rpa_body(
-                        step,
-                        slot,
-                        q_alloc.window_ref.at[slot],
-                        kv_cache_alloc.window_ref.at[slot],
-                        o_alloc.window_ref.at[out_slot],
-                        lse_alloc.window_ref.at[out_slot] if return_lse else None,
-                        schedule_ref,
-                        scratches[0],
-                        scratches[1],
-                        scratches[2],
-                        cu_q_lens_ref=cu_q_lens_ref,
-                        q_offsets_ref=q_offsets_ref,
-                        kv_cache_lens_ref=kv_cache_lens_ref,
-                        kv_new_lens_ref=kv_new_lens_ref,
-                        cfgs=cfgs,
-                        start_next_fetch=start_next_fetch,
-                        start_kv_writeback=start_kv_writeback,
+                def execute_schedule_chunk(start_step, num_steps):
+                    # All reads are aligned to 128 and some extra steps are copied
+                    # in the process.
+                    aligned_start_step = (start_step // 128) * 128
+                    prefix_steps = start_step - aligned_start_step
+
+                    flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
+                    flat_smem = jax.tree_util.tree_leaves(schedule_ref)
+                    dma_list = []
+                    for h, s in zip(flat_hbm, flat_smem):
+                        if jax.typeof(h).memory_space == pltpu.HBM:
+                            element_size = s.shape[0] // cfgs.max_steps_ub
+                            read_size = element_size * (num_steps + prefix_steps)
+                            read_size = utils.align_to(read_size, 1024)
+                            read_size = jnp.minimum(read_size, s.shape[0])
+
+                            src_off = element_size * aligned_start_step
+                            src_off = pl.multiple_of(src_off, 128)
+
+                            copy = pltpu.make_async_copy(
+                                h.at[pl.ds(src_off, read_size)],
+                                s.at[pl.ds(0, read_size)],
+                                dma_sem.at[0],
+                            )
+                            copy.start()
+                            dma_list.append(copy)
+                    jax.tree.map(lambda x: x.wait(), dma_list)
+
+                    total_steps = num_steps + prefix_steps
+                    kv_bound = kv_cache_alloc.bind(
+                        src_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
+                        dst_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
+                    )
+                    q_bound = q_alloc.bind(src_ref=(q_hbm_ref, schedule_ref))
+                    o_bound = o_alloc.bind(dst_ref=(o_hbm_ref, schedule_ref))
+                    lse_bound = (
+                        lse_alloc.bind(dst_ref=(lse_hbm_ref, schedule_ref))
+                        if return_lse
+                        else None
                     )
 
-                pipeline.run_manual_triple_buffer(
-                    total_steps,
-                    compute_fn,
-                    q_bound,
-                    o_bound,
-                    kv_bound,
-                    lse_bref=lse_bound,
-                )
+                    def compute_fn(
+                        step,
+                        slot,
+                        total_steps,
+                        out_slot,
+                        start_next_fetch,
+                        start_kv_writeback,
+                    ):
+                        del total_steps
+                        rpa_body(
+                            step,
+                            slot,
+                            q_alloc.window_ref.at[slot],
+                            kv_cache_alloc.window_ref.at[slot],
+                            o_alloc.window_ref.at[out_slot],
+                            lse_alloc.window_ref.at[out_slot] if return_lse else None,
+                            schedule_ref,
+                            scratches[0],
+                            scratches[1],
+                            scratches[2],
+                            cu_q_lens_ref=cu_q_lens_ref,
+                            q_offsets_ref=q_offsets_ref,
+                            kv_cache_lens_ref=kv_cache_lens_ref,
+                            kv_new_lens_ref=kv_new_lens_ref,
+                            cfgs=cfgs,
+                            start_next_fetch=start_next_fetch,
+                            start_kv_writeback=start_kv_writeback,
+                        )
 
-            @pl.loop(0, num_safe_step_iterations)
-            def loop_body(step_idx):
-                start = step_idx * cfgs.max_steps_ub
-                rem = actual_steps % cfgs.max_steps_ub
-                last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
-                is_last_step = step_idx == num_safe_step_iterations - 1
-                size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
+                    pipeline.run_manual_triple_buffer(
+                        total_steps,
+                        compute_fn,
+                        q_bound,
+                        o_bound,
+                        kv_bound,
+                        lse_bref=lse_bound,
+                    )
 
-                execute_schedule_chunk(start, size)
+                @pl.loop(0, num_safe_step_iterations)
+                def loop_body(step_idx):
+                    start = step_idx * cfgs.max_steps_ub
+                    rem = actual_steps % cfgs.max_steps_ub
+                    last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
+                    is_last_step = step_idx == num_safe_step_iterations - 1
+                    size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
+
+                    execute_schedule_chunk(start, size)
 
         _run()
 

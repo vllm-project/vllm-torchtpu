@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Work-distribution scheduler for Batched Ragged Paged Attention.
+
+Partitions ragged query tokens and KV page ranges across TPU TensorCores and
+pipeline stages to balance MXU compute and HBM->VMEM DMA bandwidth.
+"""
+
 import dataclasses
 import functools
 from abc import ABC, abstractmethod
@@ -369,10 +375,13 @@ def _write_schedule_to_hbm(
     flat_smem = jax.tree_util.tree_leaves(schedule_smem)
     dma_list = []
     for h, s in zip(flat_hbm, flat_smem):
+        if s.shape[0] == 0:
+            continue
         element_size = s.shape[0] // cfgs.max_steps_ub
         if h.shape[0] > 1:
             write_size = num_steps * element_size
             write_size = utils.align_to(write_size, 128)
+            write_size = jnp.minimum(write_size, s.shape[0])
             output_offset = hbm_offset_aligned * element_size
         else:
             write_size = h.shape[0]
@@ -477,6 +486,7 @@ def flush_to_hbm(
     cfgs: configs.RpaConfigs,
 ):
     last_step = utils.align_to(count, cfgs.batch_size)
+    num_active_steps = last_step // cfgs.batch_size
 
     @pl.loop(count, last_step)
     @jax.named_scope("mask_out_steps")
@@ -484,15 +494,22 @@ def flush_to_hbm(
         step, b_idx = divmod(idx, cfgs.batch_size)
         _mask_out_steps(step, b_idx=b_idx, schedule_smem=schedule)
 
-    _compute_waits(schedule, 0, last_step // cfgs.batch_size, cfgs=cfgs)
-    _write_schedule_to_hbm(
-        schedule,
-        schedule_hbm_ref,
-        hbm_offset,
-        cfgs.max_steps_ub,
-        dma_sem,
-        cfgs=cfgs,
+    _compute_waits(schedule, 0, num_active_steps, cfgs=cfgs)
+
+    # Never write past the HBM schedule (bounds checks are off downstream).
+    @pl.when(
+        cast("jax.Array | int", hbm_offset)
+        < cfgs.max_schedule_size_multiplier * cfgs.max_steps_ub
     )
+    def _write():
+        _write_schedule_to_hbm(
+            schedule,
+            schedule_hbm_ref,
+            hbm_offset,
+            num_active_steps,
+            dma_sem,
+            cfgs=cfgs,
+        )
 
     return hbm_offset + cfgs.max_steps_ub, 0
 
@@ -936,17 +953,34 @@ def rpa_metadata_schedule_kernel(
     )
     count = loop_carry.count
     hbm_offset = loop_carry.hbm_offset
-    steps = pl.cdiv(count, cfgs.batch_size) + hbm_offset
+    # Steps past the HBM schedule were dropped (flush_to_hbm); every chunk
+    # below it is full, so rpa_kernel reads exactly what was written.
+    capacity = cfgs.max_schedule_size_multiplier * cfgs.max_steps_ub
+    steps = jnp.minimum(pl.cdiv(count, cfgs.batch_size) + hbm_offset, capacity)
     schedule_ref.actual_steps[0] = steps
-    # Step 3: Mask out unvisited steps.
-    flush_to_hbm(
-        count,
-        schedule_ref,
-        schedule_hbm_ref,
-        hbm_offset,
-        dma_sem,
-        cfgs=cfgs,
-    )
+    overflow = hbm_offset >= capacity
+
+    # Step 3: Mask out unvisited steps and flush remaining schedule to HBM.
+    @pl.when((count > 0) & jnp.logical_not(overflow))
+    def _flush_rem():
+        flush_to_hbm(
+            count,
+            schedule_ref,
+            schedule_hbm_ref,
+            hbm_offset,
+            dma_sem,
+            cfgs=cfgs,
+        )
+
+    @pl.when((count == 0) | overflow)
+    def _flush_empty():
+        copy = pltpu.make_async_copy(
+            schedule_ref.actual_steps.at[pl.ds(0, 1)],
+            schedule_hbm_ref.actual_steps.at[pl.ds(0, 1)],
+            dma_sem.at[0],
+        )
+        copy.start()
+        copy.wait()
 
 
 def generate_rpa_metadata(
