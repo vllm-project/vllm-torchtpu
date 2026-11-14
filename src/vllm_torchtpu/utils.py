@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import collections
 import importlib
+import itertools
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -33,6 +36,28 @@ TPU_SECOND_LAST_MINOR = 8
 
 _megacore = False
 logger = init_logger(__name__)
+
+
+# Custom ops shared by every layer with the same kernel config. A JaxCallable
+# caches its jax.export per instance, so one op per layer re-exported (and
+# re-lowered) the identical kernel for every layer at every compile bucket.
+_shared_jax_ops: dict[tuple, Any] = {}
+_shared_jax_op_ids: collections.defaultdict[str, itertools.count] = (
+    collections.defaultdict(itertools.count)
+)
+
+
+def get_shared_jax_op(kind: str, key: tuple, build: Callable[[str], Any]) -> Any:
+    """Return ``build("pallas::<kind>_<n>")`` for ``(kind, key)``, built once.
+
+    ``kind`` and ``key`` together must cover every value that the op's kernel
+    and fake capture. ``n`` counts per ``kind``.
+    """
+    op = _shared_jax_ops.get((kind, key))
+    if op is None:
+        op = build(f"pallas::{kind}_{next(_shared_jax_op_ids[kind])}")
+        _shared_jax_ops[(kind, key)] = op
+    return op
 
 
 def align_to(unpadded_dim, pad_multiple):
