@@ -13,7 +13,8 @@
 # limitations under the License.
 """Small-batch MoE with the router in the kernel, for the FP8 MoE method.
 
-On a Qwen3.5 model's expert-parallel MoE layers (`enabled`), a layer whose
+On the expert-parallel MoE layers of the Qwen3.5 checkpoint, device and
+expert-parallel size it was measured at (`enabled`, `max_tokens`), a layer whose
 routing is a plain softmax top-k with renormalized weights hands its router
 scores to `pallas::moe_lowtok_scores_k{k}` (or
 `pallas::moe_lowtok_scores_copies_k{k}_r{r}_o{o}` when placed by a
@@ -90,9 +91,8 @@ def _struct(t: torch.Tensor | None) -> jax.ShapeDtypeStruct | None:
 
 
 # Largest step, in rows per MoE call across the node, the few-token kernel
-# serves, keyed on the expert-parallel size; other sizes use the default. EP8
-# is the Qwen3.5 decode layout.
-DEFAULT_MAX_TOKENS = 256
+# serves, keyed on the expert-parallel size. EP8 is the Qwen3.5 decode layout
+# the kernel was measured at; at any other size it is not armed.
 MAX_TOKENS_BY_EP: dict[int, int] = {8: 448}
 assert max(MAX_TOKENS_BY_EP.values()) <= MOE_LOWTOK_MAX_TOKENS
 # The cap this process armed the kernel with (0: not armed), for the JAX op
@@ -101,22 +101,25 @@ _ARMED_MAX_TOKENS = 0
 
 
 def max_tokens(ep_size: int) -> int:
-    """The row cap for an expert-parallel size."""
-    return MAX_TOKENS_BY_EP.get(int(ep_size), DEFAULT_MAX_TOKENS)
+    """The row cap for an expert-parallel size; 0 (not armed) at a size the
+    kernel was not measured at."""
+    return MAX_TOKENS_BY_EP.get(int(ep_size), 0)
 
 
 def enabled(vllm_config: Any) -> bool:
-    """Whether the few-token kernel serves this engine's MoE layers: a Qwen3.5
-    model with expert parallelism. Other models keep the default MoE path
-    until the kernel is validated on them."""
-    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+    """Whether the few-token kernel serves this engine's MoE layers: expert
+    parallelism on the checkpoint and device the kernel was measured on
+    (``qwen3_5.hooks.is_measured_target``: Qwen3.5-397B-A17B on TPU7x). Every
+    other model, other Qwen3.5 checkpoints included, keeps the default MoE
+    path, which is main's."""
+    from vllm_torchtpu.models.qwen3_5 import hooks as qwen3_5_hooks
 
     model_config = getattr(vllm_config, "model_config", None)
     parallel_config = getattr(vllm_config, "parallel_config", None)
     return bool(
         model_config is not None
-        and qwen3_5_settings.is_qwen3_5(model_config)
         and getattr(parallel_config, "enable_expert_parallel", False)
+        and qwen3_5_hooks.is_measured_target(model_config)
     )
 
 
@@ -455,6 +458,9 @@ def prebuild(
     if not enabled(get_current_vllm_config_or_none()):
         return None
     cap = max_tokens(int(layer.moe_config.ep_size))
+    if not cap:
+        # Not measured at this expert-parallel size: the default MoE path.
+        return None
     if _ARMED_MAX_TOKENS not in (0, cap):
         raise ValueError(
             f"moe_lowtok: MoE layers of one model have row caps {_ARMED_MAX_TOKENS} "
