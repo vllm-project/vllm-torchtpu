@@ -25,6 +25,7 @@ from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
@@ -41,7 +42,7 @@ from vllm.models.deepseek_v4.attention import (
     DeepseekV4IndexerCache,
 )
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
-from vllm.v1.attention.backend import AttentionLayer, AttentionType
+from vllm.v1.attention.backend import AttentionLayer, AttentionType, MultipleOf
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (
@@ -55,6 +56,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 from vllm.v1.worker.utils import (
     AttentionGroup,
     add_kv_sharing_layers_to_kv_cache_groups,
@@ -81,8 +83,11 @@ from vllm_torchtpu.kv_cache_materializer import (
 from vllm_torchtpu.kv_cache_spec_normalizer import normalize_kv_cache_specs_for_tpu
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
+    PallasAttentionBackendImpl,
+    PallasBatchedRPAAttentionBackend,
     PallasMLAttentionBackend,
     VllmTPUDeepseekV32IndexerBackend,
+    get_tpu_min_page_size,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
@@ -91,10 +96,10 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
+from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
-    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
     class _TpuKVCacheBackend(Protocol):
@@ -116,6 +121,11 @@ if TYPE_CHECKING:
             head_size: int,
             cache_dtype_str: str | torch.dtype = "auto",
         ) -> int: ...
+
+        @staticmethod
+        def get_supported_kernel_block_sizes(
+            kv_cache_spec: KVCacheSpec | None = None,
+        ) -> list[int | MultipleOf]: ...
 
         @staticmethod
         def get_name() -> str: ...
@@ -258,6 +268,19 @@ _COMPACT_MAMBA_FIT_HINT = (
     "run, lowering `max_num_batched_tokens` also shrinks the activations it "
     "measured."
 )
+
+_MAX_LOGGED_TRANSITIONS = 8
+_TRUNCATED_TRANSITIONS_PREVIEW = 4
+
+
+@dataclasses.dataclass(frozen=True)
+class _SubpagePackingPlan:
+    """Resolved inputs shared across pure-attention sub-page packing regimes."""
+
+    native_bytes_by_name: dict[str, int]
+    backend_cls: type[_TpuKVCacheBackend]
+    block_size: int
+    uniform_page_bytes: int
 
 
 class KVCacheManager:
@@ -536,10 +559,333 @@ class KVCacheManager:
             and not self.runner._unified_kv_layout
         ):
             assert backend_cls is not None
+            kv_cache_spec = self._pack_attention_subpages(
+                kv_cache_spec,
+                cast("type[_TpuKVCacheBackend]", backend_cls),
+                block_size,
+            )
             kv_cache_spec = self._pad_native_attention_regions(
                 kv_cache_spec, cast("type[_TpuKVCacheBackend]", backend_cls)
             )
         return kv_cache_spec
+
+    @staticmethod
+    def _format_spec_transitions(transitions: dict[str, str]) -> str:
+        if len(transitions) <= _MAX_LOGGED_TRANSITIONS:
+            return repr(transitions)
+        shown = dict(list(transitions.items())[:_TRUNCATED_TRANSITIONS_PREVIEW])
+        rem = len(transitions) - _TRUNCATED_TRANSITIONS_PREVIEW
+        return f"{shown!r} (+{rem} more layers)"
+
+    def _plan_subpage_packing(
+        self,
+        kv_cache_specs: dict[str, KVCacheSpec],
+        backend_cls: type[_TpuKVCacheBackend],
+        block_size: int,
+    ) -> _SubpagePackingPlan | None:
+        """Return a `_SubpagePackingPlan` when sub-page packing applies."""
+        if not (
+            isinstance(backend_cls, type)
+            and issubclass(backend_cls, PallasBatchedRPAAttentionBackend)
+        ):
+            logger.debug(
+                "KV sub-page packing skipped: backend %s is not PallasBatchedRPA.",
+                getattr(backend_cls, "__name__", backend_cls),
+            )
+            return None
+
+        uniform_page_bytes = self.runner._hybrid_uniform_page_size_bytes
+        parallel_config = self.runner.vllm_config.parallel_config
+        skip_checks: tuple[tuple[bool, str], ...] = (
+            (not uniform_page_bytes, "uniform page size not active"),
+            (block_size <= 0, f"invalid block_size={block_size}"),
+            (not kv_cache_specs, "empty kv_cache_specs"),
+            (bool(self.runner._unified_kv_layout), "unified KV layout enabled"),
+            (bool(envs.VLLM_TPU_BLOCK_MAJOR_KV), "VLLM_TPU_BLOCK_MAJOR_KV enabled"),
+            (
+                self.runner.speculative_config is not None,
+                "speculative decoding enabled",
+            ),
+            (
+                self.runner.vllm_config.kv_transfer_config is not None,
+                "kv_transfer_config enabled",
+            ),
+            (
+                parallel_config.prefill_context_parallel_size > 1,
+                "prefill context parallelism > 1",
+            ),
+            (
+                parallel_config.decode_context_parallel_size > 1,
+                "decode context parallelism > 1",
+            ),
+        )
+        for cond, reason in skip_checks:
+            if cond:
+                logger.debug("KV sub-page packing skipped: %s.", reason)
+                return None
+        assert uniform_page_bytes is not None
+
+        # Both packing regimes have only been benchmarked on `TPU_7X`. Other
+        # TPU generations keep the padded `max(attn_page_sizes)` layout.
+        chip_version = get_chip_version()
+        if chip_version != pltpu.ChipVersion.TPU_7X:
+            logger.debug(
+                "KV sub-page packing skipped: chip %s is not TPU_7X.", chip_version
+            )
+            return None
+
+        with set_current_vllm_config(self.runner.vllm_config):
+            resolved_layout = self.runner.cache_config.get_resolved_kv_cache_layout()
+        if resolved_layout in (VllmKVCacheLayout.LBHNC, VllmKVCacheLayout.BLHNC):
+            logger.debug(
+                "KV sub-page packing skipped: KV layout %s is not token-major.",
+                resolved_layout,
+            )
+            return None
+
+        if not all(
+            isinstance(s, AttentionSpec) and not isinstance(s, MLAAttentionSpec)
+            for s in kv_cache_specs.values()
+        ):
+            logger.debug(
+                "KV sub-page packing skipped: non-standard or MLA specs present."
+            )
+            return None
+
+        native_bytes_by_name: dict[str, int] = {}
+        for name, spec in kv_cache_specs.items():
+            assert isinstance(spec, AttentionSpec)
+            if spec.block_size != block_size:
+                logger.debug(
+                    "KV sub-page packing skipped: layer %s block_size=%d != %d.",
+                    name,
+                    spec.block_size,
+                    block_size,
+                )
+                return None
+            nb = backend_cls.get_kv_cache_page_size_bytes(
+                block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+            )
+            if nb <= 0 or uniform_page_bytes % nb != 0:
+                logger.debug(
+                    "KV sub-page packing skipped: layer %s native page %d bytes "
+                    "does not divide uniform page %d bytes.",
+                    name,
+                    nb,
+                    uniform_page_bytes,
+                )
+                return None
+            native_bytes_by_name[name] = nb
+
+        if len(set(native_bytes_by_name.values())) <= 1:
+            logger.debug(
+                "KV sub-page packing skipped: all layers share native page size."
+            )
+            return None
+
+        return _SubpagePackingPlan(
+            native_bytes_by_name=native_bytes_by_name,
+            backend_cls=backend_cls,
+            block_size=block_size,
+            uniform_page_bytes=uniform_page_bytes,
+        )
+
+    def _try_shrink_swa_specs(
+        self,
+        kv_cache_specs: dict[str, KVCacheSpec],
+        plan: _SubpagePackingPlan,
+    ) -> dict[str, KVCacheSpec] | None:
+        """Shrink oversized `SlidingWindowSpec` manager `block_size`.
+
+        For example, shrinking SWA `256 -> 128` against full-attention `256` runs
+        all attention kernels on 128-token pages (`FullAttentionSpec` via
+        `subpage_split=2`) while keeping `scheduler_block_size = lcm(128, 256) = 256`.
+        """
+        # Never override an explicit `--block-size` passed by the user.
+        if self.runner.cache_config.user_specified_block_size:
+            logger.debug("KV SWA page shrink skipped: user_specified_block_size=True.")
+            return None
+
+        min_native_bytes = min(plan.native_bytes_by_name.values())
+        larger_specs = [
+            kv_cache_specs[name]
+            for name, nb in plan.native_bytes_by_name.items()
+            if nb > min_native_bytes
+        ]
+        if not (
+            bool(larger_specs)
+            and all(isinstance(s, SlidingWindowSpec) for s in larger_specs)
+            and min_native_bytes < plan.uniform_page_bytes
+            and plan.uniform_page_bytes % min_native_bytes == 0
+        ):
+            logger.debug(
+                "KV SWA page shrink skipped: oversized specs are not exclusively "
+                "divisible SlidingWindowSpec layers."
+            )
+            return None
+
+        with set_current_vllm_config(self.runner.vllm_config):
+            supported = plan.backend_cls.get_supported_kernel_block_sizes()
+        # `get_tpu_min_page_size` enforces the SMEM block-table capacity bound
+        # (`1024 * 1024 // 2 // max_num_seqs // 4` pages per request against
+        # `max_model_len`), rejecting `new_bs` at long contexts where shrinking
+        # `kernel_block_size` would exceed the SMEM request cap.
+        min_tpu_page = get_tpu_min_page_size(self.runner.vllm_config)
+
+        def _is_supported_bs(bs: int) -> bool:
+            if bs < min_tpu_page:
+                return False
+            for entry in supported:
+                if isinstance(entry, int) and bs == entry:
+                    return True
+                if isinstance(entry, MultipleOf) and bs > 0 and bs % entry.base == 0:
+                    return True
+            return False
+
+        shrunk_specs: dict[str, KVCacheSpec] = {}
+        transitions: dict[str, str] = {}
+        for name, spec in kv_cache_specs.items():
+            assert isinstance(spec, AttentionSpec)
+            nb = plan.native_bytes_by_name[name]
+            if nb % min_native_bytes != 0 or plan.block_size % (nb // min_native_bytes):
+                logger.debug(
+                    "KV SWA page shrink skipped: layer %s cannot shrink evenly.", name
+                )
+                return None
+            shrink = nb // min_native_bytes
+            new_bs = plan.block_size // shrink
+            if not _is_supported_bs(new_bs):
+                logger.debug(
+                    "KV SWA page shrink skipped: block_size=%d unsupported "
+                    "(min_tpu_page=%d).",
+                    new_bs,
+                    min_tpu_page,
+                )
+                return None
+            new_nb = plan.backend_cls.get_kv_cache_page_size_bytes(
+                new_bs, spec.num_kv_heads, spec.head_size, spec.dtype
+            )
+            if new_nb != min_native_bytes:
+                logger.debug(
+                    "KV SWA page shrink skipped: layer %s shrunk page %d != %d.",
+                    name,
+                    new_nb,
+                    min_native_bytes,
+                )
+                return None
+            if shrink > 1:
+                transitions[name] = f"{plan.block_size}->{new_bs}"
+            shrunk_specs[name] = dataclasses.replace(
+                spec,
+                block_size=new_bs,
+                page_size_padded=min_native_bytes,
+            )
+
+        if not transitions or not can_share_attention_cache(
+            list(shrunk_specs.values()), plan.backend_cls
+        ):
+            logger.debug(
+                "KV SWA page shrink skipped: shrunk specs cannot share 4D pool."
+            )
+            return None
+
+        shrunk_attn_specs = [cast(AttentionSpec, s) for s in shrunk_specs.values()]
+        min_bs = min(s.block_size for s in shrunk_attn_specs)
+        scheduler_bs = math.lcm(*(s.block_size for s in shrunk_attn_specs))
+        # Idempotent across repeated `get_kv_cache_spec()` calls because
+        # `_update_attention_page_size_padded` recomputes both fields from
+        # `backend_cls` at `block_size` before calling `_pack_attention_subpages`.
+        self.runner._hybrid_uniform_page_size_bytes = min_native_bytes
+        self.runner.cache_config.mamba_page_size_padded = min_native_bytes
+        logger.info_once(
+            "Pure-attention HMA sub-page packing (kernel page size shrink): "
+            "shrunk %d/%d layer specs %s (kernel_block_size=%d across all "
+            "attention groups, scheduler_block_size=%d, "
+            "uniform_page_size_bytes=%d).",
+            len(transitions),
+            len(shrunk_specs),
+            self._format_spec_transitions(transitions),
+            min_bs,
+            scheduler_bs,
+            min_native_bytes,
+        )
+        return shrunk_specs
+
+    def _scale_up_smaller_specs(
+        self,
+        kv_cache_specs: dict[str, KVCacheSpec],
+        plan: _SubpagePackingPlan,
+    ) -> dict[str, KVCacheSpec] | None:
+        """Scale smaller-page specs' manager `block_size` up by `split` sub-pages.
+
+        Keeps `kernel_block_size = plan.block_size` unchanged while
+        `KernelBlockTable` expands each manager block into `split` consecutive
+        native sub-pages in the shared 4D pool (widening `scheduler_block_size`
+        to `block_size * max_split`).
+        """
+        packed_specs: dict[str, KVCacheSpec] = {}
+        transitions: dict[str, str] = {}
+        for name, spec in kv_cache_specs.items():
+            assert isinstance(spec, AttentionSpec)
+            native_bytes = plan.native_bytes_by_name[name]
+            split = plan.uniform_page_bytes // native_bytes
+            if split > 1:
+                new_bs = plan.block_size * split
+                transitions[name] = f"{plan.block_size}->{new_bs} (split={split})"
+                packed_specs[name] = dataclasses.replace(
+                    spec,
+                    block_size=new_bs,
+                    page_size_padded=plan.uniform_page_bytes,
+                )
+            else:
+                packed_specs[name] = spec
+
+        if not transitions or not can_share_attention_cache(
+            list(packed_specs.values()), plan.backend_cls
+        ):
+            logger.debug(
+                "KV sub-page scale-up skipped: scaled specs cannot share 4D pool."
+            )
+            return None
+
+        scheduler_bs = math.lcm(
+            *(cast(AttentionSpec, s).block_size for s in packed_specs.values())
+        )
+        logger.info_once(
+            "Pure-attention HMA sub-page packing (scale-up): scaled %d/%d "
+            "layer specs %s (kernel_block_size=%d, scheduler_block_size=%d, "
+            "uniform_page_size_bytes=%d).",
+            len(transitions),
+            len(packed_specs),
+            self._format_spec_transitions(transitions),
+            plan.block_size,
+            scheduler_bs,
+            plan.uniform_page_bytes,
+        )
+        return packed_specs
+
+    def _pack_attention_subpages(
+        self,
+        kv_cache_specs: dict[str, KVCacheSpec],
+        backend_cls: type[_TpuKVCacheBackend],
+        block_size: int,
+    ) -> dict[str, KVCacheSpec]:
+        """Eliminate unindexed sub-page padding in shared 4D pure-attention pools.
+
+        Tries SWA kernel-page shrink first when `block_size` is auto-selected
+        and SMEM bounds allow it (e.g. `256 -> 128`), and otherwise falls back
+        to scaling smaller-page manager `block_size` up by `split` sub-pages.
+        """
+        plan = self._plan_subpage_packing(kv_cache_specs, backend_cls, block_size)
+        if plan is None:
+            return kv_cache_specs
+
+        shrunk = self._try_shrink_swa_specs(kv_cache_specs, plan)
+        if shrunk is not None:
+            return shrunk
+
+        scaled = self._scale_up_smaller_specs(kv_cache_specs, plan)
+        return scaled if scaled is not None else kv_cache_specs
 
     def _pad_native_attention_regions(
         self,
@@ -1545,11 +1891,52 @@ class KVCacheManager:
                     "KV cache groups > 1."
                 )
 
-        block_sizes = [
-            group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
-        ]
+        # DSv4's packed layout and cache overlays are handled entirely in
+        # `_initialize_ds_v4_kv_cache`, so the loop below stays DSv4-free.
+        # TODO(patemotter): replace per-model flags (`_unified_kv_layout`,
+        # `_is_ds_v4`) with per-layout allocation dispatch around a shared tail.
+        _is_ds_v4 = any(
+            is_cache_for_ds_v4(module)
+            for module in self.runner.vllm_config.compilation_config.static_forward_context.values()  # noqa: E501
+        )
+        use_block_major = bool(envs.VLLM_TPU_BLOCK_MAJOR_KV)
+        group_specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
+        if (
+            group_specs
+            and not kv_cache_config.has_mamba_layers
+            and not _is_ds_v4
+            and not use_block_major
+            and all(
+                isinstance(s, AttentionSpec) and not isinstance(s, MLAAttentionSpec)
+                for s in group_specs
+            )
+            and len({cast(AttentionSpec, s).block_size for s in group_specs}) > 1
+            and backend_cls is not None
+            and can_share_attention_cache(group_specs, backend_cls)
+        ):
+            min_attn_block_size = min(
+                cast(AttentionSpec, s).block_size for s in group_specs
+            )
+            kernel_block_sizes = [min_attn_block_size for _ in group_specs]
+        else:
+            kernel_block_sizes = [
+                group.kv_cache_spec.block_size
+                for group in kv_cache_config.kv_cache_groups
+            ]
+        layer_kbs_and_split: dict[str, tuple[int, int]] = {}
+        split_by_layer: dict[str, int] = {}
+        for group, kbs in zip(kv_cache_config.kv_cache_groups, kernel_block_sizes):
+            is_attn = isinstance(group.kv_cache_spec, AttentionSpec)
+            split = group.kv_cache_spec.block_size // kbs if is_attn else 1
+            for layer_name in group.layer_names:
+                layer_kbs_and_split[layer_name] = (kbs, split)
+                if is_attn:
+                    split_by_layer[layer_name] = split
+        for layer_name, target_layer_name in self.runner.shared_kv_cache_layers.items():
+            if target_layer_name in split_by_layer:
+                split_by_layer[layer_name] = split_by_layer[target_layer_name]
 
-        self.runner.may_reinitialize_input_batch(kv_cache_config, block_sizes)
+        self.runner.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
 
         # Populate self.attn_groups directly with a single shared TPU builder
         # per group; bypasses parent's initialize_attn_backend (per-backend
@@ -1557,6 +1944,9 @@ class KVCacheManager:
         # checks) — all GPU-relevant and unused on TPU.
         self.runner.attn_groups = []
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            if isinstance(group.kv_cache_spec, FullAttentionSpec):
+                self.runner._attention_kernel_block_size = kernel_block_sizes[gid]
+                self.runner._attention_kv_cache_group_id = gid
             builder = AttentionMetadataBuilder(
                 group.kv_cache_spec,
                 group.layer_names,
@@ -1609,15 +1999,6 @@ class KVCacheManager:
                 return spec.kv_cache_specs[layer_name]
             return spec
 
-        # DSv4's packed layout and cache overlays are handled entirely in
-        # `_initialize_ds_v4_kv_cache`, so the loop below stays DSv4-free.
-        # TODO(patemotter): replace per-model flags (`_unified_kv_layout`,
-        # `_is_ds_v4`) with per-layout allocation dispatch around a shared tail.
-        _is_ds_v4 = any(
-            is_cache_for_ds_v4(module)
-            for module in self.runner.vllm_config.compilation_config.static_forward_context.values()  # noqa: E501
-        )
-
         # ---- Block-major KV Cache Initialization (VLLM_TPU_BLOCK_MAJOR_KV) ----
         # Bundles all attention layer fragments into a single contiguous array in HBM:
         #   [num_blocks, num_layers, page_size, K2/p, p, head_dim]
@@ -1635,7 +2016,6 @@ class KVCacheManager:
         self.runner._kv_cache_bundle = None
         self.runner._kv_cache_bundle_layer_index = {}
         bundle_view_by_name: dict[str, torch.Tensor] = {}
-        use_block_major = bool(envs.VLLM_TPU_BLOCK_MAJOR_KV)
         if use_block_major:
             unsupported = None
             if self.runner.use_spmd:
@@ -1913,9 +2293,12 @@ class KVCacheManager:
                         kv_caches[layer_name] = bundle_view_by_name[layer_name]
                     else:
                         assert backend_cls is not None
+                        kbs, subpage_split = layer_kbs_and_split.get(
+                            layer_name, (kv_cache_spec.block_size, 1)
+                        )
                         kv_cache_shape = backend_cls.get_kv_cache_shape(
-                            num_blocks,
-                            kv_cache_spec.block_size,
+                            num_blocks * subpage_split,
+                            kbs,
                             kv_cache_spec.num_kv_heads,
                             kv_cache_spec.head_size,
                             kv_cache_spec.dtype,
@@ -1963,10 +2346,6 @@ class KVCacheManager:
         # Pre-build and cache bundled RPA kernels across all attention layers before
         # torch.compile tracing.
         if self.runner._kv_cache_bundle is not None:
-            from vllm_torchtpu.layers.adapter.attention import (
-                PallasAttentionBackendImpl,
-            )
-
             layers = get_layers_from_vllm_config(self.runner.vllm_config, Attention)
             # Only enter wrapper context when eligible attention layers are present.
             eligible = [
@@ -2041,6 +2420,16 @@ class KVCacheManager:
             self.runner.mamba_slot_read_offsets = torch.zeros(
                 allocated_mamba_num_blocks, dtype=torch.int32
             ).to(self.runner.device)
+
+        # Bind sub-page split factors (including cross-layer KV-sharing aliases)
+        # before pre-building custom attention ops.
+        static_ctx = self.runner.vllm_config.compilation_config.static_forward_context
+        for layer_name, split in split_by_layer.items():
+            attn_mod = static_ctx.get(layer_name)
+            if isinstance(attn_mod, Attention) and isinstance(
+                attn_mod.impl, PallasAttentionBackendImpl
+            ):
+                attn_mod.impl.set_subpage_split(split)
 
         # Precompile after KV cache allocation so XLA's buffer assignment sees
         # the same HBM pressure as runtime.
