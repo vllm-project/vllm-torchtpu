@@ -45,7 +45,8 @@ warmest-first admission, each step this scheduler:
   fixed debt, prefill then runs as soon as every such request can afford the
   step. At most ``VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S`` of steps in a row are
   deferred this way. With ``VLLM_TPU_PREFILL_TPOT_PRICED`` such a step is not
-  decode-only when a shorter step fits: it runs, shortest first, the whole
+  decode-only when a shorter step fits: it runs, in the scheduler's order
+  (running chunks, then the waiting window, each shortest first), the whole
   remaining prefills that fit the largest prefill-token bin whose measured
   step time stays within every decoding request's slack (no chunk is cut).
 
@@ -182,8 +183,9 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             self._debt_s = 0.0
         spacing = self.spacing_frac > 0 and decoding and self._debt_s > 0
         self._fit_cap = None
+        defer_debt = spacing or throttle_prefills
         if self.tpot_target_s > 0 and self._hold_for_tpot(decoders, queue):
-            fit = 0 if spacing or throttle_prefills else self._fit_tokens()
+            fit = self._fit_tokens() if self.priced and not defer_debt else 0
             if fit:
                 self._fit_cap, self._fit_used = fit, 0
                 self._fit_steps += 1
@@ -357,7 +359,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
                 kind = _DECODE
         if kind is None:
             return
-        if kind == _PREFILL and prefill_tokens <= _FIT_BINS[-1]:
+        if self.priced and kind == _PREFILL and prefill_tokens <= _FIT_BINS[-1]:
             if len(self._pending_bins) >= _MAX_PENDING_STEPS:
                 self._pending_bins.clear()
             self._pending_bins[id(output)] = next(

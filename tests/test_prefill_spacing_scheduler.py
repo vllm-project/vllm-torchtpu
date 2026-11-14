@@ -219,11 +219,14 @@ def test_tpot_target_defers_prefill_at_most_max_hold(model_config, monkeypatch):
         ({}, {"dec"}),
     ],
 )
+@pytest.mark.parametrize("priced", [True, False])
 def test_priced_hold_runs_only_whole_prefills_that_fit_the_slack(
-    model_config, monkeypatch, bin_s, scheduled
+    model_config, monkeypatch, bin_s, scheduled, priced
 ):
     scheduler, _, hasher = _tpot_scheduler(model_config, monkeypatch, target_ms=40.3)
-    scheduler.priced = True
+    scheduler.priced = priced
+    if not priced:  # flag off: decode-only whatever the bins say
+        scheduled = {"dec"}
     scheduler._bin_s = dict(bin_s)
     scheduler.add_request(_request("short", 16, hasher, seed=3))
     assert set(scheduler.schedule().num_scheduled_tokens) == scheduled
@@ -231,6 +234,7 @@ def test_priced_hold_runs_only_whole_prefills_that_fit_the_slack(
 
 def test_short_prefill_steps_are_timed_by_token_bin(model_config, monkeypatch):
     scheduler, hasher = _scheduler(model_config)
+    scheduler.priced = True
     monkeypatch.setattr(AsyncScheduler, "update_from_output", lambda *args: {})
     scheduler.add_request(_request("a", 300, hasher, seed=1))
     first = scheduler.schedule()

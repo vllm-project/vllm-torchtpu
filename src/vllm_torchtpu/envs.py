@@ -1399,8 +1399,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S", 10.0
     ),
     # PrefillSpacingScheduler: while the TPOT target defers prefill, still run
-    # the shortest waiting or running prefills that finish within a short step
-    # whose measured time fits every decoding request's slack.
+    # whole remaining prefills up to the largest prefill-token bin (512-4096)
+    # whose measured step time fits every decoding request's slack.
     "VLLM_TPU_PREFILL_TPOT_PRICED": env_bool("VLLM_TPU_PREFILL_TPOT_PRICED"),
 }
 
