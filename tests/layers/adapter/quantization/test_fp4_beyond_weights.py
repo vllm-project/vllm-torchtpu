@@ -268,8 +268,9 @@ def _has_tpu() -> bool:
         return False
 
 
-@pytest.mark.skipif(not _has_tpu(), reason="Requires TPU device")
 def test_tpu_device_fp4_linear_w4a8_b256(monkeypatch):
+    if not _has_tpu():
+        pytest.skip("Requires TPU device")
     monkeypatch.setenv("REQUANTIZE_WEIGHT_DTYPE", "fp4")
     monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")
     monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "256")
