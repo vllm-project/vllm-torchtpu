@@ -97,13 +97,44 @@ def _wrap(cls, attr: str, name=None) -> None:
         except Exception:  # noqa: BLE001 - a name must never break startup
             n = f"{cls.__name__}.{attr}"
         _emit("start", n)
+        stacks = n == "loader.load_weights" and _stack_dumps_start()
         try:
             return fn(self, *args, **kwargs)
         finally:
+            if stacks:
+                _stack_dumps_stop()
             _emit("end", n)
 
     traced._startup_traced = True  # type: ignore[attr-defined]
     setattr(cls, attr, traced)
+
+
+def _stack_dumps_start() -> bool:
+    """VLLM_TPU_STARTUP_STACKS=<seconds>: on local ranks 0 and 1, dump every
+    thread's Python stack to stderr every <seconds> while weights load, to see
+    what a straggling rank is doing that its peers are not."""
+    try:
+        interval = float(os.environ.get("VLLM_TPU_STARTUP_STACKS", "0") or 0)
+    except ValueError:
+        return False
+    if interval <= 0 or os.environ.get("LOCAL_RANK", "0") not in ("0", "1"):
+        return False
+    import faulthandler
+    import sys
+
+    print(
+        f"startup-stacks: rank {os.environ.get('LOCAL_RANK')} dumping every {interval}s",
+        file=sys.stderr,
+        flush=True,
+    )
+    faulthandler.dump_traceback_later(interval, repeat=True, file=sys.stderr)
+    return True
+
+
+def _stack_dumps_stop() -> None:
+    import faulthandler
+
+    faulthandler.cancel_dump_traceback_later()
 
 
 def _range_name(prefix: str, compile_range) -> str:

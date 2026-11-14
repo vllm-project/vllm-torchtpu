@@ -167,10 +167,19 @@ def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
     """
     try:
         h = hashlib.sha256()
+        # VLLM_TPU_FINGERPRINT_DUMP=<dir>: local ranks 0 and 1 also write what
+        # went into the hash (each module's code and a digest per constant),
+        # so two ranks' dumps of one range diff to what makes them differ.
+        dump_dir = os.path.expandvars(os.environ.get("VLLM_TPU_FINGERPRINT_DUMP", ""))
+        if dump_dir and os.environ.get("LOCAL_RANK", "0") not in ("0", "1"):
+            dump_dir = ""
+        dump: list[str] = []
         for name, module in graph.named_modules():
             if not isinstance(module, fx.GraphModule):
                 continue
             h.update(f"{name}\n{module.code}{_rank_salt(module.code)}".encode())
+            if dump_dir:
+                dump.append(f"### module {name!r} salt={_rank_salt(module.code)!r}\n{module.code}")
             for node in module.graph.nodes:
                 if node.op != "get_attr":
                     continue
@@ -180,12 +189,35 @@ def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
                 h.update(str(node.target).encode())
                 if not isinstance(value, torch.Tensor):
                     h.update(type(value).__qualname__.encode())
+                    if dump_dir:
+                        dump.append(f"### const {node.target} {type(value).__qualname__}")
                     continue
                 h.update(f"{value.dtype}{tuple(value.shape)}".encode())
+                digest = "large"
                 if value.numel() <= _FINGERPRINT_MAX_NUMEL:
                     flat = value.detach().to("cpu").contiguous().reshape(-1)
-                    h.update(flat.view(torch.uint8).numpy().tobytes())
-        return h.hexdigest()
+                    raw = flat.view(torch.uint8).numpy().tobytes()
+                    h.update(raw)
+                    if dump_dir:
+                        digest = hashlib.sha256(raw).hexdigest()[:16]
+                        if flat.numel() <= 64:
+                            digest += f" values={flat.tolist()}"
+                if dump_dir:
+                    dump.append(f"### const {node.target} {value.dtype}{tuple(value.shape)} {digest}")
+        fingerprint = h.hexdigest()
+        if dump_dir:
+            try:
+                os.makedirs(dump_dir, exist_ok=True)
+                path = os.path.join(
+                    dump_dir,
+                    f"rank{os.environ.get('LOCAL_RANK', '0')}-{fingerprint[:16]}.txt",
+                )
+                if not os.path.exists(path):
+                    with open(path, "w") as f:
+                        f.write("\n".join(dump))
+            except Exception as e:  # noqa: BLE001 - diagnostics only
+                logger.warning("[TpuCompilerAdaptor] fingerprint dump failed: %s", e)
+        return fingerprint
     except Exception as e:
         logger.warning("[TpuCompilerAdaptor] Could not fingerprint graph: %s", e)
         return None
