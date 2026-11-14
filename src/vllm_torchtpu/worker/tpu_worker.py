@@ -910,6 +910,11 @@ class TPUWorker(WorkerBase):
     def get_num_gpu_blocks_override(self) -> int | None:
         return self.vllm_config.cache_config.num_gpu_blocks_override
 
+    def get_kv_block_budget_bytes(self) -> int | None:
+        """KV budget bytes behind one block of `get_num_gpu_blocks_override`,
+        so the executor can tolerate a spread by bytes (kv_block_override)."""
+        return self.model_runner.kv_cache_manager.compact_mamba_budget_bytes_per_block()
+
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.model_runner.get_kv_prewarm_shapes()
 

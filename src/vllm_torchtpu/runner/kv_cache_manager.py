@@ -245,6 +245,12 @@ class _CompactMambaSizing:
             * self.unpadded_mamba_page_size_bytes
         )
 
+    @property
+    def budget_bytes_per_attn_block(self) -> int:
+        """KV budget bytes one attention block costs: a page in each
+        attention group of each of the `group_size` layer regions."""
+        return self.group_size * self.num_attn_groups * self.attn_page_size_bytes
+
     def attn_blocks_that_fit(self, avail: int) -> int:
         """Attention blocks per layer that fit in `avail` next to the mamba
         slots; zero or negative when none do."""
@@ -1123,6 +1129,12 @@ class KVCacheManager:
         attn_num_blocks = self._compact_mamba_attn_num_blocks(sizing, avail)
         self.runner.cache_config.num_gpu_blocks_override = attn_num_blocks
         self._log_compact_mamba_split(attn_num_blocks, sizing, avail)
+
+    def compact_mamba_budget_bytes_per_block(self) -> int | None:
+        """KV budget bytes per attention block of the compact-mamba sizing,
+        or None unless this worker sizes its pool after the profile run."""
+        sizing = self._compact_mamba_sizing
+        return None if sizing is None else sizing.budget_bytes_per_attn_block
 
     @staticmethod
     def _log_compact_mamba_split(

@@ -23,6 +23,16 @@ Accept whichever tolerance is larger, so the check still catches a worker
 that genuinely disagrees about the budget, and pin the MINIMUM so no worker
 is asked for more blocks than it measured.
 
+Some spreads are a fixed number of bytes rather than jitter, and no block
+tolerance fits them across block sizes and pool sizes. Under
+TPU_PRECOMPILE_PEER_REPLAY only a bucket's owner compiles it, and the compile
+leaves the owner holding more HBM after the profile run than the ranks that
+replay its artifact: a fixed amount, which is more blocks the smaller a block
+is. So when the workers report what one block costs in their budget, a
+spread up to `_NUM_BLOCKS_OVERRIDE_BYTES_TOL` bytes is accepted too. A worker
+short by more than that, e.g. one sharing its chip with a leftover process,
+still fails start-up.
+
 Shared by every executor that collects `get_num_gpu_blocks_override` from
 its workers (multiproc and Ray multi-host); build 155 failed on the Ray
 path's own copy of this logic, which still demanded exact agreement.
@@ -36,15 +46,23 @@ logger = init_logger(__name__)
 
 _NUM_BLOCKS_OVERRIDE_TOL = 4
 _NUM_BLOCKS_OVERRIDE_REL_TOL = 0.005
+_NUM_BLOCKS_OVERRIDE_BYTES_TOL = 1 << 30
 
 
 def reconcile_num_gpu_blocks_override(
-    worker_overrides: list[int | None], workers_per_stage: int | None = None
+    worker_overrides: list[int | None],
+    workers_per_stage: int | None = None,
+    block_bytes: list[int | None] | None = None,
 ) -> int | None:
     """Return the agreed block-count override, or None if no worker set one.
 
-    Raises ValueError when the spread across workers exceeds both the
-    absolute and the relative tolerance -- that is a sizing bug, not jitter.
+    Raises ValueError when the spread across workers exceeds every tolerance
+    -- the absolute, the relative and, given `block_bytes`, the byte one --
+    as that is a sizing bug, not jitter.
+
+    `block_bytes` holds, per worker and in the same order, the KV budget
+    bytes one block costs on it, or None where unknown. The byte tolerance
+    uses the largest, i.e. the fewest blocks.
 
     `workers_per_stage` splits `worker_overrides` (in rank order) into
     pipeline stages. Stages hold different layers and so measure different
@@ -57,7 +75,10 @@ def reconcile_num_gpu_blocks_override(
     if workers_per_stage and 0 < workers_per_stage < len(worker_overrides):
         stage_values = [
             reconcile_num_gpu_blocks_override(
-                worker_overrides[start : start + workers_per_stage]
+                worker_overrides[start : start + workers_per_stage],
+                block_bytes=None
+                if block_bytes is None
+                else block_bytes[start : start + workers_per_stage],
             )
             for start in range(0, len(worker_overrides), workers_per_stage)
         ]
@@ -82,11 +103,20 @@ def reconcile_num_gpu_blocks_override(
 
     lo, hi = min(overrides), max(overrides)
     tol = max(_NUM_BLOCKS_OVERRIDE_TOL, int(lo * _NUM_BLOCKS_OVERRIDE_REL_TOL))
+    known_bytes = [b for b in block_bytes or [] if b]
+    bytes_note = ""
+    if known_bytes:
+        per_block = max(known_bytes)
+        tol = max(tol, _NUM_BLOCKS_OVERRIDE_BYTES_TOL // per_block)
+        bytes_note = (
+            f", {(hi - lo) * per_block / (1 << 30):.2f} GiB at {per_block} B "
+            f"per block against {_NUM_BLOCKS_OVERRIDE_BYTES_TOL / (1 << 30):.2f} GiB"
+        )
     if hi - lo > tol:
         raise ValueError(
             "[kv-sizing] workers disagree on the compact-mamba "
             f"attention block count by {hi - lo} blocks "
-            f"(min={lo}, max={hi}, tolerance={tol}). Each worker "
+            f"(min={lo}, max={hi}, tolerance={tol}{bytes_note}). Each worker "
             "sizes the pool from its own measured free HBM, so a "
             "spread this large means the workers do not have "
             "comparable HBM budgets -- check the per-worker "
@@ -129,6 +159,7 @@ def adopt_worker_num_gpu_blocks_override(executor: Any) -> None:
     agreed = reconcile_num_gpu_blocks_override(
         cast(list, executor.collective_rpc("get_num_gpu_blocks_override")),
         workers_per_stage=pc.world_size // pc.pipeline_parallel_size,
+        block_bytes=cast(list, executor.collective_rpc("get_kv_block_budget_bytes")),
     )
     if agreed is not None:
         cache_config.num_gpu_blocks_override = agreed

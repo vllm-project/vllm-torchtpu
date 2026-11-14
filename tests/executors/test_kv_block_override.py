@@ -19,6 +19,10 @@ Kimi-Linear-48B at TP=8) live there. This file pins the decision rule itself:
 
     tol = max(4, int(lo * 0.005))        accept when hi - lo <= tol, return lo
 
+and, when the workers report the KV budget bytes one block costs,
+
+    tol = max(tol, 1 GiB // max(block_bytes))
+
 The two tolerances swap over at lo=1000, and which one wins is the whole point
 of the function, so the boundary is worth a test that does not depend on any
 executor plumbing.
@@ -27,6 +31,7 @@ executor plumbing.
 import pytest
 
 from vllm_torchtpu.executors.kv_block_override import (
+    _NUM_BLOCKS_OVERRIDE_BYTES_TOL,
     _NUM_BLOCKS_OVERRIDE_REL_TOL,
     _NUM_BLOCKS_OVERRIDE_TOL,
     reconcile_num_gpu_blocks_override,
@@ -123,6 +128,7 @@ def test_tolerance_constants_match_the_documented_rule():
     either is retuned, the expected values in this file must be recomputed."""
     assert _NUM_BLOCKS_OVERRIDE_TOL == 4
     assert _NUM_BLOCKS_OVERRIDE_REL_TOL == 0.005
+    assert _NUM_BLOCKS_OVERRIDE_BYTES_TOL == 1 << 30
 
 
 # ---------------------------------------------------------------------------
@@ -152,3 +158,80 @@ def test_error_lists_the_per_worker_values_sorted():
         reconcile_num_gpu_blocks_override([6456, 8000, 6457, None])
 
     assert "[6456, 6457, 8000]" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Byte tolerance: a spread of a fixed number of bytes (the peer-replay
+# compile left on the bucket's owner) is accepted whatever the block size.
+# ---------------------------------------------------------------------------
+
+_MIB = 1 << 20
+
+
+def test_byte_tolerance_accepts_a_spread_past_the_block_tolerances():
+    """463 blocks is past the 0.5% tolerance (247) but, at 1.5 MiB per block,
+    0.68 GiB: inside 1 GiB, whose 682 blocks become the tolerance."""
+    overrides = [49883] * 7 + [49420]
+    with pytest.raises(ValueError):
+        reconcile_num_gpu_blocks_override(overrides)
+    assert (
+        reconcile_num_gpu_blocks_override(overrides, block_bytes=[3 * _MIB // 2] * 8)
+        == 49420
+    )
+
+
+def test_byte_tolerance_boundary():
+    """At 1 MiB per block the byte tolerance is exactly 1024 blocks."""
+    block_bytes = [_MIB, _MIB]
+    assert (
+        reconcile_num_gpu_blocks_override([10_000, 11_024], block_bytes=block_bytes)
+        == 10_000
+    )
+    with pytest.raises(ValueError) as exc:
+        reconcile_num_gpu_blocks_override([10_000, 11_025], block_bytes=block_bytes)
+    assert "tolerance=1024" in str(exc.value)
+    assert "1.00 GiB at 1048576 B per block" in str(exc.value)
+
+
+def test_a_worker_short_by_more_than_the_byte_tolerance_still_fails():
+    """A leftover process holding 2 GiB on one chip is not peer-replay
+    residue: start-up still fails and names the outlier."""
+    with pytest.raises(ValueError) as exc:
+        reconcile_num_gpu_blocks_override(
+            [50_000, 50_000, 48_000], block_bytes=[_MIB] * 3
+        )
+    assert "[48000, 50000, 50000]" in str(exc.value)
+
+
+def test_byte_tolerance_uses_the_largest_block_cost():
+    """Workers of one stage report the same cost; if they did not, the
+    fewest blocks (the largest cost) set the tolerance."""
+    with pytest.raises(ValueError):
+        reconcile_num_gpu_blocks_override(
+            [10_000, 11_000], block_bytes=[_MIB // 2, 2 * _MIB]
+        )
+
+
+def test_unknown_block_cost_keeps_the_block_tolerances():
+    """Workers that size no compact-mamba pool report None: the absolute and
+    relative tolerances alone apply, as before."""
+    with pytest.raises(ValueError):
+        reconcile_num_gpu_blocks_override([1000, 1006], block_bytes=[None, None])
+
+
+def test_byte_tolerance_is_per_pipeline_stage():
+    """Each stage is checked with its own workers' block costs."""
+    assert (
+        reconcile_num_gpu_blocks_override(
+            [10_000, 10_900, 20_000, 20_000],
+            workers_per_stage=2,
+            block_bytes=[_MIB, _MIB, None, None],
+        )
+        == 10_000
+    )
+    with pytest.raises(ValueError):
+        reconcile_num_gpu_blocks_override(
+            [20_000, 20_000, 10_000, 10_900],
+            workers_per_stage=2,
+            block_bytes=[_MIB, _MIB, None, None],
+        )
