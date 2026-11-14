@@ -132,7 +132,6 @@ def test_interleaved_gate_up_tile_matches_separate_projections():
             cfgs=cfgs,
             bucket_rows=rows,
             overlap_work=lambda _: None,
-            fold=rank_loader.GATE_UP_E5M2_FOLD,
         )
     ]
     actual = np.concatenate([np.asarray(p) for p in panels], axis=1)
@@ -169,97 +168,84 @@ def test_down_tile_reduces_in_768_row_steps(width):
     np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-4, atol=1e-2)
 
 
-@pytest.mark.parametrize("fold", [0, rank_loader.GATE_UP_E5M2_FOLD])
-def test_e5m2_weights_are_the_mxfp4_values_over_the_window(fold):
-    # Every code at both ends of the window and between: the E5M2 cast is the
-    # MXFP4 value times 2 ** fold, bit for bit.
-    low, high = rank_loader.E5M2_BLOCK_EXPONENTS
-    exponents = np.arange(127 + low - fold, 127 + high - fold + 1, dtype=np.uint8)
-    codes = np.tile(np.arange(16), (32 * exponents.size, 8))  # [rows, 128]
-    columns = np.broadcast_to(exponents[:, None], (exponents.size, 128))
-    values = FP4_VALUES[codes] * np.repeat(
-        2.0 ** (columns.astype(np.float32) - 127), 32, 0
+def _e5m2_call(lhs, weights, exponents):
+    """``_e5m2_product`` of ``lhs`` and MXFP4 ``weights``/``exponents`` over all
+    their columns, in interpret mode."""
+    k, cols = weights.shape
+
+    def kernel(lhs_ref, weight_ref, scale_ref, out_ref, steps):
+        rhs = kernels.WeightsRef(weight=weight_ref, scale=scale_ref, bias=None)
+        cfgs = _cfgs(tile_m=128, tile_k=k, fuse_act=None)
+        out_ref[...] = fused._e5m2_product(
+            lhs_ref[...], rhs, cfgs, pl.ds(0, cols), steps
+        )
+
+    return np.asarray(
+        pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((lhs.shape[0], cols), jnp.float32),
+            scratch_shapes=[pltpu.VMEM((k // 32, cols), jnp.uint32)],
+            interpret=True,
+        )(jnp.asarray(lhs), jnp.asarray(weights), jnp.asarray(exponents))
     )
-    rhs = kernels.WeightsRef(
-        weight=_Ref(FP4_VALUES[codes].astype(ml_dtypes.float4_e2m1fn)),
-        scale=_Ref(np.ascontiguousarray(columns)),
-        bias=None,
-    )
-    rows = codes.shape[0]
-    cast = fused._dequantized(
-        rhs,
-        _cfgs(tile_m=256, tile_k=rows, fuse_act=None),
-        pl.ds(0, rows),
-        pl.ds(0, 128),
-        fold,
-        jnp.float8_e5m2,
-    )
-    assert cast.dtype == jnp.float8_e5m2
-    np.testing.assert_array_equal(np.asarray(cast, np.float32), values * 2.0**fold)
 
 
-def test_folded_gate_up_products_equal_unfolded():
-    # The fold scales weights and products by powers of two: FP32 results match
-    # bit for bit (CPU dots; the MXU check is the device's).
-    rng = np.random.default_rng(4)
-    k, mid, rows = 512, 512, 128
-    weights, exponents, _ = _mxfp4(rng, k, 2 * mid)
-    lhs = rng.standard_normal((rows, k)).astype(ml_dtypes.bfloat16)
-    rhs = kernels.WeightsRef(weight=_Ref(weights), scale=_Ref(exponents), bias=None)
-    cfgs = _cfgs(tile_m=128, tile_k=k, fuse_act="situ:4:25")
-    folded, plain = (
-        [
-            np.asarray(value)
-            for _, value in fused._product_panels(
-                _Ref(lhs),
-                rhs,
-                cfgs=cfgs,
-                bucket_rows=rows,
-                overlap_work=lambda _: None,
-                fold=fold,
-            )
-        ]
-        for fold in (rank_loader.GATE_UP_E5M2_FOLD, 0)
-    )
-    for a, b in zip(folded, plain, strict=True):
-        np.testing.assert_array_equal(a, b)
+def test_e5m2_weights_hold_the_mxfp4_values_over_the_column_span():
+    # Every code in blocks 0..13 exponents above their column's smallest (and a
+    # constant column): the identity's product reads the weights back. Nonzero
+    # values exact; a zero code is 0 at its column's smallest exponent and
+    # +-2^(e - 142) above it.
+    span = rank_loader.E5M2_COLUMN_SPAN
+    blocks = span + 1
+    # Every code twice per block of every column.
+    codes = (np.arange(32 * blocks)[:, None] + np.arange(256)) % 16
+    rng = np.random.default_rng(3)
+    exponents = (110 + rng.integers(0, span + 1, size=(blocks, 256))).astype(np.uint8)
+    exponents[:, 0] = 110 + np.arange(blocks)  # the whole span
+    exponents[:, 1] = 117  # one exponent
+    exponents[0, 2], exponents[1:, 2] = 240, 240 - span  # far from the others
+    power = np.repeat(2.0 ** (exponents.astype(np.float64) - 127), 32, 0)
+    expected = FP4_VALUES[codes] * power
+    above = np.repeat(exponents > exponents.min(axis=0), 32, 0)
+    zero = FP4_VALUES[codes] == 0
+    sign = np.where(codes == 8, -1.0, 1.0)
+    expected = np.where(zero & above, sign * power * 2.0**-15, expected)
+    identity = np.eye(codes.shape[0], dtype=ml_dtypes.float8_e4m3fn)
+    weights = FP4_VALUES[codes].astype(ml_dtypes.float4_e2m1fn)
+    actual = _e5m2_call(identity, weights, exponents)
+    np.testing.assert_array_equal(actual, expected.astype(np.float32))
 
 
-def _gate_up_window():
-    """The gate/up E8M0 exponents the E5M2 cast holds, smallest and largest."""
-    low, high = rank_loader.E5M2_BLOCK_EXPONENTS
-    fold = rank_loader.GATE_UP_E5M2_FOLD
-    return 127 + low - fold, 127 + high - fold
-
-
-def test_ep16_expert_readers_reject_gate_up_scales_outside_the_e5m2_window():
-    first, last = _gate_up_window()
-    inside = np.array([[first, last]], np.uint8)
+def test_ep16_expert_readers_reject_gate_up_columns_spanning_more_than_e5m2_holds():
+    span = rank_loader.E5M2_COLUMN_SPAN
+    # [blocks, columns]: each column within the span, the columns far apart.
+    inside = np.array([[110, 1, 200], [110 + span, 1, 200 - span]], np.uint8)
     for key, value in (
         ("expert_gus@0/1", inside),
-        ("expert_ds@0/1", np.array([[1, 254]], np.uint8)),
-        ("expert_gus@0/2", np.zeros((1, 1), np.float32)),  # not E8M0 bytes
+        ("expert_ds@0/1", np.array([[1], [254]], np.uint8)),
+        ("expert_gus@0/2", np.zeros((2, 1), np.float32)),  # not E8M0 bytes
     ):
         _, _, reader = rank_loader._e5m2_checked((key, value.nbytes, lambda v=value: v))
         np.testing.assert_array_equal(reader(), value)
-    for value in (inside - 1, inside + 1):
-        job = ("expert_gus@1/4", value.nbytes, lambda v=value: v)
-        with pytest.raises(ValueError, match="E5M2 window"):
-            rank_loader._e5m2_checked(job)[2]()
+    outside = inside.copy()
+    outside[1, 0] += 1
+    job = ("expert_gus@1/4", outside.nbytes, lambda v=outside: v)
+    with pytest.raises(ValueError, match="span more"):
+        rank_loader._e5m2_checked(job)[2]()
 
 
 @pytest.mark.parametrize(("name", "columns"), [("expert_gus", 512), ("expert_ds", 4)])
 def test_regrouped_expert_scales_are_checked_as_read(tmp_path, name, columns):
-    # A two-quarter pre-shard of uint8 E8M0 scales, one byte below the gate/up
-    # window: the gate/up read fails, the down read passes.
-    first, _ = _gate_up_window()
+    # A two-quarter pre-shard of uint8 E8M0 scales, one block of one column a
+    # span plus one above the rest: the gate/up read fails, the down read passes.
+    first, over = 120, 120 + rank_loader.E5M2_COLUMN_SPAN + 1
     shape = (2, 112, 2, columns)
     dirs = []
     for rank in range(2):
         directory = tmp_path / f"rank{rank:02d}"
         directory.mkdir()
         scales = np.full(shape, first, np.uint8)
-        scales[1, 3, 0, 0] = first - 1 if rank == 1 else first
+        scales[1, 3, 0, 0] = over if rank == 1 else first
         scales.tofile(directory / f"{name}.bin")
         spec = {"files": [f"{name}.bin"], "layer_ranges": [[0, 2]]}
         spec.update(shape=list(shape), dtype="uint8")
@@ -268,9 +254,9 @@ def test_regrouped_expert_scales_are_checked_as_read(tmp_path, name, columns):
         dirs.append(rank_loader.RankDir(tmp_path, rank, 3))
     ((_, _, read),) = dirs[0].regrouped_expert_parts(name, dirs, 0, 2)
     if name == "expert_ds":
-        assert read().min() == first - 1
+        assert read().max() == over
         return
-    with pytest.raises(ValueError, match="E5M2 window"):
+    with pytest.raises(ValueError, match="span more"):
         read()
 
 
@@ -339,32 +325,42 @@ def test_uncapped_consumer_reads_the_slabs_as_their_bf16_values():
 
 
 def test_e4m3_gate_up_tile_stays_within_the_bound_of_the_float64_product():
-    # The e4m3 latent rows x exact E5M2 weights, rescaled per row: products
-    # within 3.5% RMS of float64 BF16-latent x MXFP4-value products, rows within
-    # cosine 0.999, all finite.
+    # The e4m3 latent rows x E5M2 weights, rescaled per row and column (the GU
+    # path in interpret mode): products within 3.5% RMS of float64 BF16-latent x
+    # MXFP4-value products, rows within cosine 0.999, all finite.
     rng = np.random.default_rng(7)
     k, mid, rows = 3584, 256, 128
     latent = _latent_rows(rng, rows)
     latent[3] = latent[4]  # keep every row's product nonzero
-    weights, exponents, values = _mxfp4(rng, k, 2 * mid)
-    _, decoded, inverse = (np.asarray(x) for x in _slab_round_trip(latent))
-    fold = rank_loader.GATE_UP_E5M2_FOLD
-    rhs = kernels.WeightsRef(weight=_Ref(weights), scale=_Ref(exponents), bias=None)
-    cfgs = _cfgs(tile_m=128, tile_k=k, fuse_act="situ:4:25")
-    actual = np.concatenate(
-        [
-            np.asarray(value)
-            for _, value in fused._product_panels(
-                _Ref(decoded),
-                rhs,
-                cfgs=cfgs,
-                bucket_rows=rows,
-                overlap_work=lambda _: None,
-                fold=fold,
-                rescale=jnp.asarray(inverse[:, :1] * 2.0**-fold),
-            )
-        ],
-        axis=1,
+    weights, exponents, values = _mxfp4(rng, k, 2 * mid, exponent_range=(110, 124))
+    slab = np.asarray(_slab_round_trip(latent)[0])
+
+    def kernel(slab_ref, weight_ref, scale_ref, out_ref, rows_ref, inverse_ref, steps):
+        lhs = fused._SlabRows(slab_ref, rows_ref, inverse_ref)
+        lhs.decode(rows)
+        rhs = kernels.WeightsRef(weight=weight_ref, scale=scale_ref, bias=None)
+        for panel, value in fused._product_panels(
+            lhs,
+            rhs,
+            cfgs=_cfgs(tile_m=128, tile_k=k, fuse_act="situ:4:25"),
+            bucket_rows=rows,
+            overlap_work=lambda _: None,
+            rescale=lhs.inverse[:rows, :1],
+            steps=steps,
+        ):
+            out_ref[:, pl.ds(panel * 256, 256)] = value
+
+    actual = np.asarray(
+        pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((rows, 2 * mid), jnp.float32),
+            scratch_shapes=[
+                pltpu.VMEM((rows, k), jnp.float8_e4m3fn),
+                pltpu.VMEM((rows, 128), jnp.float32),
+                pltpu.VMEM((2, k // 32, 256), jnp.uint32),
+            ],
+            interpret=True,
+        )(jnp.asarray(slab), jnp.asarray(weights), jnp.asarray(exponents))
     )
     expected = latent.astype(np.float64) @ values.astype(np.float64)
     assert np.all(np.isfinite(actual))

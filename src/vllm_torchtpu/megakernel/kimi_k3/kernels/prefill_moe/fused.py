@@ -32,8 +32,6 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from .. import prefill_megakernel as k
-from ..helpers import e8m0_scale
-from ..rank_loader import GATE_UP_E5M2_FOLD
 
 # Token-combine rows per load/store batch between expert MXU panels (a wider
 # batch spills there) and in the combine loops, where a batch amortizes the
@@ -1863,9 +1861,14 @@ def _routed_experts(
             row_weights=pltpu.VMEM((2, tm, 128), jnp.float32),
             act_rows=pltpu.VMEM((tm, 3584), latent.dtype),
             act_scales=pltpu.VMEM((tm, 128), jnp.float32),
+            gu_steps=pltpu.VMEM(
+                (2, 3584 // 32, pltpu.get_tpu_info().mxu_column_size), jnp.uint32
+            ),
         )
         @_scoped("m_first_column")
-        def first_column(gu_partial, acts, act_sems, row_weights, act_rows, act_scales):
+        def first_column(
+            gu_partial, acts, act_sems, row_weights, act_rows, act_scales, gu_steps
+        ):
             def buffering(spec):
                 return dataclasses.replace(
                     spec, pipeline_mode=pl.Buffered(buffer_count=2)
@@ -1958,6 +1961,7 @@ def _routed_experts(
                         gu_partial,
                         metadata,
                         row_weights.at[bank],
+                        gu_steps,
                         cfgs=gu_cfg,
                         overlap_work=lambda panel: gu_work(g, panel),
                     )
@@ -2082,34 +2086,60 @@ def _interleaved_gate_up_specs(specs, width):
 _DOWN_K_STEP = 768  # rows of the 256-row down tile's weights dequantized at once
 
 
-def _dequantized(rhs, cfgs, rows, cols, fold=0, dtype=jnp.bfloat16):
-    """Weights of ``rhs`` rows ``rows`` and columns ``cols`` (slices), times
-    ``2 ** fold``, in ``dtype``.
-
-    The FP8 gate/up products take E5M2 weights: an MXFP4 value times a power of
-    two inside the window of ``rank_loader.E5M2_BLOCK_EXPONENTS`` is an E5M2
-    value, so the cast is exact.
-    """
+def _dequantized(rhs, cfgs, rows, cols):
+    """BF16 weights of ``rhs`` rows ``rows`` and columns ``cols`` (slices)."""
     block = cfgs.rhs_cfgs.quant_block_size
     part = dataclasses.replace(
         rhs,
         weight=rhs.weight.at[rows, cols],
         scale=rhs.scale.at[pl.ds(rows.start // block, rows.size // block), cols],
     )
-    weights = part.get_weight().astype(jnp.bfloat16)
-    if fold:
-        exponents = part.scale[...]
-        assert exponents.dtype == jnp.uint8
-        powers = e8m0_scale(exponents.astype(jnp.uint32) + fold)[:, None, :]
-        scales = jnp.broadcast_to(powers, (exponents.shape[0], block, exponents.shape[1]))
-    else:
-        scales = part.get_scale(replicate_size=block)
+    weights = part.get_weight().astype(cfgs.lhs_cfgs.dtype)
+    scales = part.get_scale(replicate_size=block).astype(cfgs.lhs_cfgs.dtype)
     shape = weights.shape
-    values = weights.reshape(shape[0] // block, block, shape[1]) * scales.astype(jnp.bfloat16)
-    return values.reshape(shape).astype(dtype)
+    return (weights.reshape(shape[0] // block, block, shape[1]) * scales).reshape(shape)
 
 
-def _product_panels(lhs, rhs, *, cfgs, bucket_rows, overlap_work, fold=0, rescale=None):
+def _e5m2_product(activations, rhs, cfgs, cols, steps):
+    """FP32 product of E4M3 ``activations`` and the MXFP4 weights of ``rhs``
+    columns ``cols`` (a slice), over the whole reduction.
+
+    The weights reach the MXU as E5M2: each code's exact E5M2 cast with its
+    exponent field raised by its block's E8M0 exponent less its column's
+    smallest (one 32-bit add per four codes of a block row, the blocks' steps
+    staged in the VMEM scratch ``steps`` [blocks, cols]), which keeps nonzero
+    values exact while ``rank_loader.E5M2_COLUMN_SPAN`` bounds the difference;
+    the product is scaled back per column. A zero code becomes +-2^(e - 142)
+    for a block exponent e above its column's smallest: 2^-14 of the block's
+    smallest nonzero magnitude.
+    """
+    block = cfgs.rhs_cfgs.quant_block_size
+    size_k = activations.shape[-1]
+    blocks = size_k // block
+    assert steps.shape == (blocks, cols.size)
+    exponents = rhs.scale.at[pl.ds(0, blocks), cols][...].astype(jnp.int32)
+    low = jnp.min(exponents, axis=0, keepdims=True)
+    steps[...] = (((exponents - low) << 2) * 0x01010101).astype(jnp.uint32)
+    codes = rhs.weight.at[pl.ds(0, size_k), cols][...].astype(jnp.float8_e5m2)
+    # The bitcast packs four rows of a 32-row 8-bit tile into each word, so
+    # with 32-row blocks a word's codes share their block's step whatever the
+    # row order; Mosaic broadcasts the step row with a stride-0 load.
+    assert block == 32
+    shape = (block // 4, cols.size)
+    raised = pltpu.bitcast(codes, jnp.uint32) + jnp.concatenate(
+        [jnp.broadcast_to(steps[pl.ds(b, 1), :], shape) for b in range(blocks)]
+    )
+    total = jnp.matmul(
+        activations,
+        pltpu.bitcast(raised, jnp.float8_e5m2),
+        preferred_element_type=jnp.float32,
+    )
+    return total * lax.bitcast_convert_type(low << 23, jnp.float32)
+
+
+def _product_panels(
+    lhs, rhs, *, cfgs, bucket_rows, overlap_work, rescale=None, steps=None
+):
     """Yield ``(panel, FP32 product)`` per MXU column panel of one expert tile.
 
     Both routed projections cover their complete reduction dimension in one
@@ -2118,25 +2148,27 @@ def _product_panels(lhs, rhs, *, cfgs, bucket_rows, overlap_work, fold=0, rescal
     1536 rows in 768-row steps, each dequantized whole, and accumulates in
     FP32. The callback consumes rows of the previous expert tile between the
     last step's MXU panels; it must not read this product's result. E4M3
-    activations take E5M2 weights cast times ``2 ** fold`` (``_dequantized``),
-    BF16 ones BF16 weights; products are multiplied by ``rescale`` (default
-    ``2 ** -fold``; [rows, 1] for per-row scales).
+    activations take E5M2 weights per panel (``_e5m2_product``), the panels
+    alternating between the two halves of ``steps`` so that one panel's
+    conversion need not wait for the previous panel's products, which are
+    multiplied by ``rescale`` ([rows, 1]).
     """
     assert cfgs.dims.size_k == cfgs.tiles.tile_k
     assert not cfgs.rhs_cfgs.has_bias
     columns = pltpu.get_tpu_info().mxu_column_size
     size_k = cfgs.tiles.tile_k
     activations = lhs.reshape(-1, size_k)[:bucket_rows]
-    dtype = jnp.float8_e5m2 if activations.dtype == jnp.float8_e4m3fn else jnp.bfloat16
-    assert dtype == jnp.bfloat16 or fold, "E5M2 weights need the window's fold"
+    fp8 = activations.dtype == jnp.float8_e4m3fn
+    assert fp8 == (rescale is not None) == (steps is not None), "E4M3 needs scales, steps"
     width = rhs.weight.shape[-1]
     panels = [(first, min(columns, width - first)) for first in range(0, width, columns)]
     if cfgs.tiles.tile_m == 256 and cfgs.fuse_act is None:
+        assert not fp8
         k_step = min(size_k, _DOWN_K_STEP)
         accumulators = [None] * len(panels)
         for k0 in range(0, size_k, k_step):
             rows = pl.ds(k0, k_step)
-            weights = _dequantized(rhs, cfgs, rows, pl.ds(0, width), fold, dtype)
+            weights = _dequantized(rhs, cfgs, rows, pl.ds(0, width))
             last_step = k0 + k_step == size_k
             for index, (first, panel_width) in enumerate(panels):
                 product = jnp.matmul(
@@ -2149,31 +2181,29 @@ def _product_panels(lhs, rhs, *, cfgs, bucket_rows, overlap_work, fold=0, rescal
                 total = accumulators[index]
                 accumulators[index] = product if total is None else total + product
         for index, accumulator in enumerate(accumulators):
-            yield index, _unfolded(accumulator, fold, rescale)
+            yield index, accumulator
         return
     whole = None
-    if cfgs.tiles.tile_m != 256:
-        whole = _dequantized(rhs, cfgs, pl.ds(0, size_k), pl.ds(0, width), fold, dtype)
+    if cfgs.tiles.tile_m != 256 and not fp8:
+        whole = _dequantized(rhs, cfgs, pl.ds(0, size_k), pl.ds(0, width))
     for index, (first, panel_width) in enumerate(panels):
-        if whole is None:
-            panel_weights = _dequantized(
-                rhs, cfgs, pl.ds(0, size_k), pl.ds(first, panel_width), fold, dtype
-            )
+        if fp8:
+            assert steps is not None
+            panel = pl.ds(first, panel_width)
+            product = _e5m2_product(activations, rhs, cfgs, panel, steps.at[index % 2])
+            product = product * rescale
         else:
-            panel_weights = whole[:, first:first + panel_width]
-        product = jnp.matmul(
-            activations, panel_weights, preferred_element_type=jnp.float32
-        ).astype(cfgs.acc_dtype)
+            if whole is None:
+                panel_weights = _dequantized(
+                    rhs, cfgs, pl.ds(0, size_k), pl.ds(first, panel_width)
+                )
+            else:
+                panel_weights = whole[:, first:first + panel_width]
+            product = jnp.matmul(
+                activations, panel_weights, preferred_element_type=jnp.float32
+            ).astype(cfgs.acc_dtype)
         overlap_work(index)
-        yield index, _unfolded(product, fold, rescale)
-
-
-def _unfolded(product, fold, rescale=None):
-    """``product`` of weights cast times ``2 ** fold`` times ``rescale``, or
-    scaled back by ``2 ** -fold`` (exact)."""
-    if rescale is not None:
-        return product * rescale
-    return product * (2.0**-fold) if fold else product
+        yield index, product
 
 
 def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
@@ -2184,7 +2214,9 @@ def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
     return jnp.concatenate([product for _, product in panels], axis=1)
 
 
-def _gu_inner(lhs, rhs, output, partial, metadata, row_weights, *, cfgs, overlap_work):
+def _gu_inner(
+    lhs, rhs, output, partial, metadata, row_weights, steps, *, cfgs, overlap_work
+):
     """GU/SiTU with the production row buckets and adjacent-expert carry.
 
     Each 256-column weight panel holds a gate and an up 128-column chunk
@@ -2210,15 +2242,14 @@ def _gu_inner(lhs, rhs, output, partial, metadata, row_weights, *, cfgs, overlap
         weights = row_weights[:rows, :1]
         rows_out = output.reshape(-1, cfgs.tiles.tile_n)
         lhs.decode(rows)
-        rescale = lhs.inverse[:rows, :1] * (2.0**-GATE_UP_E5M2_FOLD)
         for panel, value in _product_panels(
             lhs,
             rhs,
             cfgs=cfgs,
             bucket_rows=rows,
             overlap_work=overlap_work,
-            fold=GATE_UP_E5M2_FOLD,
-            rescale=rescale,
+            rescale=lhs.inverse[:rows, :1],
+            steps=steps,
         ):
             value = k.apply_act_fn(value, cfgs.fuse_act) * weights
             rows_out[:rows, pl.ds(panel * lanes, lanes)] = jnp.where(

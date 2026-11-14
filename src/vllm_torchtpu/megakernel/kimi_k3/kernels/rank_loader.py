@@ -52,26 +52,22 @@ PREFILL_SHARED = (PREFILL_IO + PREFILL_COMMON
                   + tuple(n for n in PREFILL_KDA if n != "k_o")
                   + tuple(n for n in PREFILL_MLA if n != "m_o")
                   + PREFILL_MOE_DENSE + EXPERT_FAMILIES)
-# The prefill MoE multiplies with its MXFP4 gate/up weights cast to E5M2. E5M2's
-# normal range holds an MXFP4 value (magnitudes 0.5 to 6, one mantissa bit)
-# times 2^s exactly for block exponents s in E5M2_BLOCK_EXPONENTS; the weights
-# are cast scaled by 2^GATE_UP_E5M2_FOLD (their FP32 products scaled back),
-# which moves the window down by as much. The EP16/TP2 expert readers (the
-# prefill's families) refuse gate/up scales outside it.
-E5M2_BLOCK_EXPONENTS = (-13, 13)
-GATE_UP_E5M2_FOLD = 11
+# The prefill MoE multiplies with its MXFP4 gate/up weights as E5M2 values
+# times 2^(e - low), e a block's E8M0 exponent and low its column's smallest.
+# E5M2 holds an MXFP4 value (magnitudes 0.5 to 6, one mantissa bit) times 2^d
+# exactly for 0 <= d <= E5M2_COLUMN_SPAN (6 * 2^13 is below its largest finite
+# value). The EP16/TP2 expert readers (the prefill's families) refuse gate/up
+# scales whose columns span more.
+E5M2_COLUMN_SPAN = 13
 
 
 def e5m2_exact(exponents: np.ndarray) -> bool:
-    """Whether gate/up E8M0 ``exponents`` cast with the fold stay in the window."""
-    low, high = E5M2_BLOCK_EXPONENTS
-    return bool(
-        exponents.size == 0
-        or (
-            exponents.min() >= 127 + low - GATE_UP_E5M2_FOLD
-            and exponents.max() <= 127 + high - GATE_UP_E5M2_FOLD
-        )
-    )
+    """Whether every column of gate/up E8M0 ``exponents`` [..., blocks, columns]
+    spans at most ``E5M2_COLUMN_SPAN`` over its blocks."""
+    if exponents.size == 0:
+        return True
+    span = exponents.max(axis=-2).astype(np.int32) - exponents.min(axis=-2)
+    return bool(span.max() <= E5M2_COLUMN_SPAN)
 
 
 def _dtype(name: str) -> np.dtype:
@@ -328,8 +324,9 @@ def _ep16_expert_jobs(presharded, rank_dir: RankDir, rank: int, layers: int, ord
 
 
 def _e5m2_checked(job):
-    """An expert job whose reader raises on gate/up E8M0 (uint8) scales outside
-    the E5M2 window; other families, and other dtypes, pass as they are."""
+    """An expert job whose reader raises on gate/up E8M0 (uint8) scales whose
+    columns span more than the E5M2 cast holds; other families, and other
+    dtypes, pass as they are."""
     key, nbytes, reader = job
     if key.partition("@")[0] != "expert_gus":
         return job
@@ -337,7 +334,7 @@ def _e5m2_checked(job):
     def checked():
         value = reader()
         if value.dtype == np.uint8 and not e5m2_exact(value):
-            raise ValueError(f"{key}: E8M0 scales outside the prefill MoE's E5M2 window")
+            raise ValueError(f"{key}: E8M0 scale columns span more than the prefill MoE's E5M2 cast")
         return value
 
     return key, nbytes, checked
