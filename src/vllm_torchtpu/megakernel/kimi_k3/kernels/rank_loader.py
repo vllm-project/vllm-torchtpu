@@ -56,9 +56,22 @@ PREFILL_SHARED = (PREFILL_IO + PREFILL_COMMON
 # normal range holds an MXFP4 value (magnitudes 0.5 to 6, one mantissa bit)
 # times 2^s exactly for block exponents s in E5M2_BLOCK_EXPONENTS; the weights
 # are cast scaled by 2^GATE_UP_E5M2_FOLD (their FP32 products scaled back),
-# which moves the window down by as much.
+# which moves the window down by as much. The EP16/TP2 expert readers (the
+# prefill's families) refuse gate/up scales outside it.
 E5M2_BLOCK_EXPONENTS = (-13, 13)
 GATE_UP_E5M2_FOLD = 11
+
+
+def e5m2_exact(exponents: np.ndarray) -> bool:
+    """Whether gate/up E8M0 ``exponents`` cast with the fold stay in the window."""
+    low, high = E5M2_BLOCK_EXPONENTS
+    return bool(
+        exponents.size == 0
+        or (
+            exponents.min() >= 127 + low - GATE_UP_E5M2_FOLD
+            and exponents.max() <= 127 + high - GATE_UP_E5M2_FOLD
+        )
+    )
 
 
 def _dtype(name: str) -> np.dtype:
@@ -193,7 +206,7 @@ class RankDir:
                     array = np.memmap(rank_dir.path / filename, dtype, "r", shape=(hi - lo, *shape[1:]))
                     quarters.append(np.array(array[:, part * experts:(part + 1) * experts]))
                 return _join_quarters(name, quarters)
-            yield f"{name}@{index}/{count}", (hi - lo) * nbytes, reader
+            yield _e5m2_checked((f"{name}@{index}/{count}", (hi - lo) * nbytes, reader))
 
     def read_expert_family(self, name) -> np.ndarray:
         """One expert family ``[92, ...]`` from its files, one reader per file."""
@@ -312,6 +325,22 @@ def _ep16_expert_jobs(presharded, rank_dir: RankDir, rank: int, layers: int, ord
     quarter_dirs = [RankDir(presharded, 4 * (rank // 4) + q, layers) for q in quarters]
     for name in names:
         yield from rank_dir.regrouped_expert_parts(name, quarter_dirs, (rank // 2) % 2, 2)
+
+
+def _e5m2_checked(job):
+    """An expert job whose reader raises on gate/up E8M0 (uint8) scales outside
+    the E5M2 window; other families, and other dtypes, pass as they are."""
+    key, nbytes, reader = job
+    if key.partition("@")[0] != "expert_gus":
+        return job
+
+    def checked():
+        value = reader()
+        if value.dtype == np.uint8 and not e5m2_exact(value):
+            raise ValueError(f"{key}: E8M0 scales outside the prefill MoE's E5M2 window")
+        return value
+
+    return key, nbytes, checked
 
 
 def _host_joined(jobs):
@@ -501,7 +530,7 @@ def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers, only=
             with ThreadPoolExecutor(32) as pool:
                 list(pool.map(lambda job: read_into(job[0], job[1], job[2], streams=1), jobs))
             return _join_quarters(name, [raw[q] for q in quarters])
-        yield f"{name}@{index}/{count}", (stop - first) * nbytes, reader
+        yield _e5m2_checked((f"{name}@{index}/{count}", (stop - first) * nbytes, reader))
 
 
 def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 93,

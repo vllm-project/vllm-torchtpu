@@ -3,6 +3,7 @@
 the stepped down reduction and the single-launch 16K geometry."""
 
 import functools
+import json
 import types
 
 import jax
@@ -222,6 +223,55 @@ def test_folded_gate_up_products_equal_unfolded():
     )
     for a, b in zip(folded, plain, strict=True):
         np.testing.assert_array_equal(a, b)
+
+
+def _gate_up_window():
+    """The gate/up E8M0 exponents the E5M2 cast holds, smallest and largest."""
+    low, high = rank_loader.E5M2_BLOCK_EXPONENTS
+    fold = rank_loader.GATE_UP_E5M2_FOLD
+    return 127 + low - fold, 127 + high - fold
+
+
+def test_ep16_expert_readers_reject_gate_up_scales_outside_the_e5m2_window():
+    first, last = _gate_up_window()
+    inside = np.array([[first, last]], np.uint8)
+    for key, value in (
+        ("expert_gus@0/1", inside),
+        ("expert_ds@0/1", np.array([[1, 254]], np.uint8)),
+        ("expert_gus@0/2", np.zeros((1, 1), np.float32)),  # not E8M0 bytes
+    ):
+        _, _, reader = rank_loader._e5m2_checked((key, value.nbytes, lambda v=value: v))
+        np.testing.assert_array_equal(reader(), value)
+    for value in (inside - 1, inside + 1):
+        job = ("expert_gus@1/4", value.nbytes, lambda v=value: v)
+        with pytest.raises(ValueError, match="E5M2 window"):
+            rank_loader._e5m2_checked(job)[2]()
+
+
+@pytest.mark.parametrize(("name", "columns"), [("expert_gus", 512), ("expert_ds", 4)])
+def test_regrouped_expert_scales_are_checked_as_read(tmp_path, name, columns):
+    # A two-quarter pre-shard of uint8 E8M0 scales, one byte below the gate/up
+    # window: the gate/up read fails, the down read passes.
+    first, _ = _gate_up_window()
+    shape = (2, 112, 2, columns)
+    dirs = []
+    for rank in range(2):
+        directory = tmp_path / f"rank{rank:02d}"
+        directory.mkdir()
+        scales = np.full(shape, first, np.uint8)
+        scales[1, 3, 0, 0] = first - 1 if rank == 1 else first
+        scales.tofile(directory / f"{name}.bin")
+        spec = {"files": [f"{name}.bin"], "layer_ranges": [[0, 2]]}
+        spec.update(shape=list(shape), dtype="uint8")
+        index = {"rank": rank, "layers": 3, "families": {name: spec}}
+        (directory / "index.json").write_text(json.dumps(index))
+        dirs.append(rank_loader.RankDir(tmp_path, rank, 3))
+    ((_, _, read),) = dirs[0].regrouped_expert_parts(name, dirs, 0, 2)
+    if name == "expert_ds":
+        assert read().min() == first - 1
+        return
+    with pytest.raises(ValueError, match="E5M2 window"):
+        read()
 
 
 def _latent_rows(rng, rows):
