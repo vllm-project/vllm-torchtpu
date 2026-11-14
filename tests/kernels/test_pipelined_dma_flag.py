@@ -17,6 +17,8 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 # Provide lightweight stubs for optional heavy runtime dependencies if not present
 for mod_name in ("torch", "vllm", "vllm.utils"):
     if mod_name not in sys.modules:
@@ -128,7 +130,11 @@ def test_kv_cache_update_builds_block_specs_and_traces():
     slices = jnp.zeros((3, 4), dtype=jnp.int32)
     num_slices = jnp.array([2], dtype=jnp.int32)
 
-    for pipelined_dma in (False, True):
+    # Trace the unjitted body so every eval_shape reaches pallas_call: a hit in
+    # the jit trace cache skips the Python body and the spy. Each setting runs
+    # twice to keep the test independent of what was traced before it.
+    unwrapped_update = inspect.unwrap(ragged_kv_cache_update.kv_cache_update)
+    for pipelined_dma in (False, True, False, True):
         with patch.object(
             ragged_kv_cache_update.pl,
             "pallas_call",
@@ -136,7 +142,7 @@ def test_kv_cache_update_builds_block_specs_and_traces():
         ) as spy_pallas_call:
             out_shape = jax.eval_shape(
                 functools.partial(
-                    ragged_kv_cache_update.kv_cache_update,
+                    unwrapped_update,
                     num_slices_per_block=4,
                     pipelined_dma=pipelined_dma,
                 ),
@@ -157,6 +163,125 @@ def test_kv_cache_update_builds_block_specs_and_traces():
             assert [spec.memory_space for spec in grid_spec.out_specs] == [pl.ANY]
 
 
+@pytest.mark.parametrize("pipelined_dma", [False, True])
+@pytest.mark.parametrize(
+    "num_slices_per_block, expected_num_slices_per_block", [(4, 4), (None, 8)]
+)
+def test_kv_cache_update_honors_explicit_vmem_limit_bytes(
+    pipelined_dma, num_slices_per_block, expected_num_slices_per_block
+):
+    """An explicit vmem_limit_bytes reaches CompilerParams and sizes the block."""
+    import jax.numpy as jnp
+
+    page_size, num_combined_kv_heads, head_dim = 8, 2, 128
+    new_kv = jnp.zeros((16, num_combined_kv_heads, head_dim), dtype=jnp.bfloat16)
+    kv_cache = jnp.zeros((64, num_combined_kv_heads, head_dim), dtype=jnp.bfloat16)
+    slices = jnp.zeros((3, 8), dtype=jnp.int32)
+    num_slices = jnp.array([2], dtype=jnp.int32)
+    page_size_bytes = page_size * num_combined_kv_heads * head_dim * 2
+    # The 1 MiB reserve plus 8 pages: auto sizing picks 8 instead of the
+    # default budget's 64.
+    vmem_limit_bytes = 1024 * 1024 + 8 * page_size_bytes
+
+    traced = ragged_kv_cache_update.kv_cache_update.trace(
+        new_kv,
+        slices,
+        kv_cache,
+        num_slices,
+        page_size=page_size,
+        num_slices_per_block=num_slices_per_block,
+        vmem_limit_bytes=vmem_limit_bytes,
+        pipelined_dma=pipelined_dma,
+    )
+
+    (pallas_eqn,) = [
+        eqn for eqn in traced.jaxpr.eqns if eqn.primitive.name == "pallas_call"
+    ]
+    assert pallas_eqn.params["compiler_params"].vmem_limit_bytes == vmem_limit_bytes
+    scratch_ref = pallas_eqn.params["jaxpr"].invars[-2].aval
+    assert scratch_ref.shape == (
+        expected_num_slices_per_block,
+        page_size,
+        num_combined_kv_heads,
+        head_dim,
+    )
+
+
+def _make_kv_cache_update_case(dtype, num_slices_per_block, seed=0):
+    """Random slices on distinct pages, with garbage in the padded columns."""
+    import jax.numpy as jnp
+    import numpy as np
+
+    page_size, num_combined_kv_heads, head_dim = 8, 2, 128
+    num_pages, num_slices = 8, 5
+    rng = np.random.default_rng(seed)
+    lens = rng.integers(1, page_size + 1, size=num_slices)
+    pages = rng.permutation(num_pages)[:num_slices]
+    kv_cache_starts = [
+        p * page_size + rng.integers(0, page_size - n + 1) for p, n in zip(pages, lens)
+    ]
+    new_kv_starts = np.cumsum(lens) - lens
+    num_blocks = -(-num_slices // num_slices_per_block)
+    slices = np.full((3, num_blocks * num_slices_per_block), 7, dtype=np.int32)
+    slices[:, :num_slices] = [kv_cache_starts, new_kv_starts, lens]
+
+    def rand(n):
+        shape = (n, num_combined_kv_heads, head_dim)
+        if jnp.issubdtype(dtype, jnp.integer):
+            return rng.integers(-128, 128, size=shape).astype(dtype)
+        return np.asarray(jnp.asarray(rng.standard_normal(shape), dtype))
+
+    new_kv = rand(int(lens.sum()) + 3)
+    kv_cache = rand(num_pages * page_size)
+    expected = kv_cache.copy()
+    for kv_start, new_start, n in zip(kv_cache_starts, new_kv_starts, lens):
+        expected[kv_start : kv_start + n] = new_kv[new_start : new_start + n]
+    return new_kv, slices, kv_cache, np.array([num_slices], np.int32), expected
+
+
+@pytest.mark.parametrize("dma_execution_mode", ["on_wait", "eager"])
+@pytest.mark.parametrize("pipelined_dma", [False, True])
+@pytest.mark.parametrize(
+    "dtype, num_slices_per_block",
+    [("float32", 1), ("bfloat16", 3), ("int8", 4)],
+)
+def test_kv_cache_update_matches_reference_in_interpret_mode(
+    dtype, num_slices_per_block, pipelined_dma, dma_execution_mode
+):
+    """kv_cache_update writes exactly the sliced tokens, without DMA races."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental.pallas import tpu as pltpu
+
+    new_kv, slices, kv_cache, num_slices, expected = _make_kv_cache_update_case(
+        jnp.dtype(dtype), num_slices_per_block
+    )
+    interpret_state = sys.modules[pltpu.reset_tpu_interpret_mode_state.__module__]
+    pltpu.reset_tpu_interpret_mode_state()
+    with pltpu.force_tpu_interpret_mode(
+        pltpu.InterpretParams(
+            detect_races=True,
+            uninitialized_memory="nan",
+            out_of_bounds_reads="raise",
+            dma_execution_mode=dma_execution_mode,
+        )
+    ):
+        out = ragged_kv_cache_update.kv_cache_update(
+            jnp.asarray(new_kv),
+            jnp.asarray(slices),
+            jnp.asarray(kv_cache),
+            jnp.asarray(num_slices),
+            page_size=8,
+            num_slices_per_block=num_slices_per_block,
+            pipelined_dma=pipelined_dma,
+        )
+        out = jax.block_until_ready(out)
+
+    np.testing.assert_array_equal(np.asarray(out), expected)
+    assert not interpret_state.races.races_found
+
+
 def test_kernel_v3_prepare_inputs_outputs_wiring():
     """Verify kernel.py prepare_inputs/prepare_outputs wiring to env flag."""
     sig_in = inspect.signature(kernel.prepare_inputs)
@@ -169,34 +294,47 @@ def test_kernel_v3_prepare_inputs_outputs_wiring():
 
 
 def test_kernel_v3_prepare_inputs_outputs_execution():
-    """Verify prepare_inputs and prepare_outputs shape behavior under env toggle."""
-    import jax.numpy as jnp
+    """Verify prepare_inputs/prepare_outputs layouts and round trip under the flag."""
+    import jax
+    import numpy as np
 
     max_tokens = 16
     q_heads = 8
     kv_heads = 2
     head_dim = 128
-    q = jnp.zeros((max_tokens, q_heads, head_dim))
-    k = jnp.zeros((max_tokens, kv_heads, head_dim))
-    v = jnp.zeros((max_tokens, kv_heads, head_dim))
+    q, k, v = (
+        jax.random.normal(key, (max_tokens, heads, head_dim))
+        for key, heads in zip(
+            jax.random.split(jax.random.key(0), 3), (q_heads, kv_heads, kv_heads)
+        )
+    )
+    token_major_q = q.reshape(max_tokens, kv_heads, 4, 1, head_dim)
+    kv_head_major_q = token_major_q.swapaxes(0, 1)
 
     # Default / False: returns [kv_heads, max_tokens, q_heads_per_kv_head, 1, head_dim]
     with patch.dict(os.environ, {}, clear=True):
-        q_out, _ = kernel.prepare_inputs(q, k, v)
+        q_out, legacy_kv = kernel.prepare_inputs(q, k, v)
         assert q_out.shape == (2, 16, 4, 1, 128)
+        np.testing.assert_array_equal(q_out, kv_head_major_q)
         out = kernel.prepare_outputs(q_out, 4, 128)
         assert out.shape == (16, 8, 128)
+        np.testing.assert_array_equal(out, q)
 
     # Flag enabled: returns [max_tokens, kv_heads, q_heads_per_kv_head, 1, head_dim]
     with patch.dict(os.environ, {"USE_RPA_PIPELINED_DMA_STAGING": "1"}, clear=True):
-        q_out, _ = kernel.prepare_inputs(q, k, v)
+        q_out, kv = kernel.prepare_inputs(q, k, v)
         assert q_out.shape == (16, 2, 4, 1, 128)
+        np.testing.assert_array_equal(q_out, token_major_q)
+        np.testing.assert_array_equal(kv, legacy_kv)
         out = kernel.prepare_outputs(q_out, 4, 128)
         assert out.shape == (16, 8, 128)
+        np.testing.assert_array_equal(out, q)
 
     # Explicit override False when flag is True
     with patch.dict(os.environ, {"USE_RPA_PIPELINED_DMA_STAGING": "1"}, clear=True):
         q_out, _ = kernel.prepare_inputs(q, k, v, fuse_non_tiling_axis_swap=False)
         assert q_out.shape == (2, 16, 4, 1, 128)
+        np.testing.assert_array_equal(q_out, kv_head_major_q)
         out = kernel.prepare_outputs(q_out, 4, 128, fuse_non_tiling_axis_swap=False)
         assert out.shape == (16, 8, 128)
+        np.testing.assert_array_equal(out, q)

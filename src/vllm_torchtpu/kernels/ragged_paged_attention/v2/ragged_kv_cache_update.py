@@ -330,6 +330,7 @@ def _get_num_slices_per_kv_cache_update_block(
         "num_slices_per_block",
         "mesh",
         "kv_cache_pspec",
+        "vmem_limit_bytes",
         "pipelined_dma",
     ],
     donate_argnames="kv_cache",
