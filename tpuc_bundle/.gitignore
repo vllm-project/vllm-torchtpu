@@ -1,0 +1,4 @@
+# Large build outputs (staged from the google3 bundle / built in the container).
+lib/*.so
+lib/*.tmp.*
+runfiles/
