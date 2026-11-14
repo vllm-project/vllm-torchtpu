@@ -182,6 +182,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
+    valid_token_lists,
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
@@ -2650,6 +2651,18 @@ class TPUModelRunner(GPUModelRunner):
         if not self._mamba_tail_fold:
             return None
         assert self._mamba_state_block_size is not None
+        if envs.VLLM_TPU_PREFILL_CKPT_DECODE_SKIP and num_reqs > 0:
+            # A checkpoint needs start + unit <= position < end, i.e. more than
+            # one fold unit scheduled (both prefill_checkpoints cases), so a
+            # step with no such request (every decode step) exports none.
+            unit = self.__dict__.get("_prefill_ckpt_unit")
+            if unit is None:
+                unit = fold_unit(self._mamba_state_block_size)
+                self._prefill_ckpt_unit = unit
+            scheduled = num_scheduled_tokens_per_req[:num_reqs]
+            if int(scheduled.max()) <= unit:
+                WORKER_COUNTER.add(0, int(np.count_nonzero(scheduled > 1)))
+                return self._mamba_prefill_ckpt_zero(target_num_reqs)
         offsets, columns = prefill_checkpoints(
             self.input_batch.num_computed_tokens_cpu[
                 start_index : start_index + num_reqs
@@ -3656,6 +3669,8 @@ class TPUModelRunner(GPUModelRunner):
 
         if max_gen_len == 1:
             valid_sampled_token_ids = pre_next_tokens_cpu.tolist()
+        elif envs.VLLM_TPU_HOST_TOKEN_LISTS:
+            valid_sampled_token_ids = valid_token_lists(pre_next_tokens_cpu)
         else:
             valid_mask = pre_next_tokens_cpu != INVALID_TOKEN_ID
             gen_lens = valid_mask.sum(dim=1).tolist()

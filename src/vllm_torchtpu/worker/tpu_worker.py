@@ -808,6 +808,11 @@ class TPUWorker(WorkerBase):
             from vllm_torchtpu.worker import cpu_pinning
 
             cpu_pinning.apply(self.rank, self.local_rank)
+        if envs.VLLM_TPU_ENVS_FREEZE:
+            # Last: the environment is final once warmup is over.
+            envs.freeze_reads()
+            if self.rank == 0:
+                logger.info("VLLM_TPU_ENVS_FREEZE: env reads are kept after warmup")
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
