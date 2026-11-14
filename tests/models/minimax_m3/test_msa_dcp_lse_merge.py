@@ -115,6 +115,36 @@ def test_exchange_merge_is_the_reduce_scatter_merge(world, tokens, monkeypatch):
         assert (exchanged[rank][3] == 0).all()
 
 
+def _kernel_payload(out, lse):
+    """The attention kernel's exchange rows of ``(out, lse)``
+    (`msa_attention_lse._kernel` with `payload`): ``[out | lse]`` per row."""
+    lanes = lse.unsqueeze(-1).expand(*out.shape)
+    return torch.cat([out.to(torch.float32), lanes], dim=-1)
+
+
+@pytest.mark.parametrize("world", [2, 8])
+@pytest.mark.parametrize("tokens", [8, 13, 64])
+def test_payload_merge_is_the_exchange_merge(world, tokens, monkeypatch):
+    out, lse = _partials(np.random.default_rng(world * 10 + tokens), world, tokens)
+    exchanged = _merge_every_rank(out, lse, monkeypatch, max_tokens=tokens)
+    hub = _Hub(world)
+
+    def run(rank):
+        payload = _kernel_payload(out[rank], lse[rank])
+        merged = msa._merge_exchanged_payload(
+            payload, _Group(hub, rank, world), out.dtype
+        )
+        return merged.transpose(0, 1)
+
+    with concurrent.futures.ThreadPoolExecutor(world) as pool:
+        from_payload = list(pool.map(run, range(world)))
+    for rank in range(world):
+        assert from_payload[rank].dtype == torch.bfloat16
+        torch.testing.assert_close(
+            from_payload[rank], exchanged[rank], rtol=0, atol=0, equal_nan=True
+        )
+
+
 def test_positive_control_a_misrouted_partial_is_caught(monkeypatch):
     """The comparison fails when a rank merges another rank's heads."""
     out, lse = _partials(np.random.default_rng(5), 2, 8)

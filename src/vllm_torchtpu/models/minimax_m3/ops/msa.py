@@ -372,6 +372,15 @@ def _head_major_attend_fake(q, *args):
     )
 
 
+def _attend_payload_fake(q, *args):
+    """Shape of a DCP attend op's exchange rows ``[H, T, 2D]`` f32 for
+    token-major ``q [T, H, D]`` (`msa_dcp.msa_attend_dcp` with `payload`)."""
+    num_tokens, num_heads, head_dim = q.shape
+    return torch.empty(
+        (num_heads, num_tokens, 2 * head_dim), dtype=torch.float32, device=q.device
+    )
+
+
 def _rotate_heads(x: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
     """``x @ H / n`` over the head dim, for the bf16 Sylvester ``hadamard``:
     `msa_fp4.rotate_queries` (and, ``H`` being symmetric,
@@ -416,15 +425,16 @@ def gather_queries_with_candidates(
 
 
 # Decode steps (8-token verify rows of up to 8 requests) move their attention
-# partials (f32, with the LSEs as extra rows: 4.5 KiB per head at 8 tokens) by
-# one all-to-all instead of an LSE gather and a reduce-scatter, and their
-# queries with the candidates (`gather_queries_with_candidates`): the
-# collectives' latency, not their bytes, is the cost there. Measured at DCP 2
-# up to 48 tokens; the cap is the default of the MLA merge's all-to-all cap
-# (`TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS`, measured there), past which the
-# reduce-scatter, which sums in the network, wins. Only the backbone, traced
-# per token bucket, runs the MSA op (the DSpark drafter's layers are not
-# MSA), so the branch on the token count is fixed per traced bucket.
+# partials (f32, with each row's LSE in the lanes after it: 8 KiB per head at
+# 8 tokens, `_merge_exchanged_payload`) by one all-to-all instead of an LSE
+# gather and a reduce-scatter, and their queries with the candidates
+# (`gather_queries_with_candidates`): the collectives' latency, not their
+# bytes, is the cost there. Measured at DCP 2 up to 48 tokens; the cap is the
+# default of the MLA merge's all-to-all cap (`TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS`,
+# measured there), past which the reduce-scatter, which sums in the network,
+# wins. Only the backbone, traced per token bucket, runs the MSA op (the DSpark
+# drafter's layers are not MSA), so the branch on the token count is fixed per
+# traced bucket.
 EXCHANGE_MERGE_MAX_TOKENS = 64
 
 
@@ -460,20 +470,42 @@ def _merge_exchanged_partials(
     )
     outs = got[:, :, :num_tokens]
     lses = got[:, :, num_tokens:].reshape(world, local, lse_rows * head_dim)
-    lses = lses[..., :num_tokens]
+    return _merge_exchanged(outs, lses[..., :num_tokens], out.dtype)
+
+
+def _merge_exchanged_payload(
+    payload: torch.Tensor, group: Any, dtype: torch.dtype
+) -> torch.Tensor:
+    """`_merge_exchanged_partials` of the attention kernel's own exchange rows
+    ``[H, T, 2D]`` f32, ``[out | lse]`` per row (`msa_dcp.msa_attend_dcp`
+    with `payload`), with the same result: the kernel writes what the
+    partials' concatenation would send, so no op runs before the exchange."""
+    world = int(group.world_size)
+    num_heads, num_tokens, width = payload.shape
+    head_dim = width // 2
+    got = _all_to_all(payload, group).view(world, num_heads // world, num_tokens, width)
+    return _merge_exchanged(got[..., :head_dim], got[..., head_dim], dtype)
+
+
+def _merge_exchanged(
+    outs: torch.Tensor, lses: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    """Every rank's partials of this rank's heads, ``outs [DCP, H / DCP, T,
+    D]`` and ``lses [DCP, H / DCP, T]`` f32, merged to ``[H / DCP, T, D]``."""
+    world = outs.shape[0]
     weight = torch.exp(lses - torch.logsumexp(lses, dim=0)).unsqueeze(-1)
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
     weighted = torch.where(
         weight > 0, outs.to(torch.float32) * weight, torch.zeros_like(weight)
     )
     if envs.TPU_DCP_RS_OUT_PRECISION:
-        weighted = weighted.to(out.dtype)
+        weighted = weighted.to(dtype)
     # f32 adds, not a sum: the compiler can lower a multiply-then-sum to a dot
     # that rounds its f32 operands to bf16 (`merge_lse_partials_all_to_all`).
     merged = weighted[0].to(torch.float32)
     for r in range(1, world):
         merged = merged + weighted[r].to(torch.float32)
-    return merged.to(out.dtype)
+    return merged.to(dtype)
 
 
 def merge_head_partials(
@@ -676,6 +708,35 @@ def get_msa_dcp_op(
         f"pallas::minimax_m3_msa_dcp_attend_{suffix}", _attend_jax
     )
 
+    def _attend_payload_jax(
+        q: jax.Array,
+        kv_cache: jax.Array,
+        candidates: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        dcp_rank: jax.Array,
+    ) -> jax.Array:
+        return msa_dcp.msa_attend_dcp(
+            q,
+            kv_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            sm_scale=sm_scale,
+            topk=topk,
+            rank=dcp_rank,
+            dcp=dcp,
+            payload=True,
+        )
+
+    # A decode step's attention writes its exchange rows itself
+    # (`_merge_exchanged_payload`).
+    attend_payload_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_attend_payload_{suffix}", _attend_payload_jax
+    )
+
     def _score_fake(k, v, index_q, index_k, kv_cache, index_cache, *args):
         return (
             torch.empty_like(kv_cache),
@@ -689,6 +750,7 @@ def get_msa_dcp_op(
 
     score_op.register_fake(_score_fake)
     attend_op.register_fake(_head_major_attend_fake)
+    attend_payload_op.register_fake(_attend_payload_fake)
 
     def op(
         q: torch.Tensor,
@@ -731,8 +793,17 @@ def get_msa_dcp_op(
         index_cache.copy_(new_index_cache)
         if with_candidates:
             q_all, candidates = gather_queries_with_candidates(q, candidates, group)
-        else:
-            candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+            payload = attend_payload_op(
+                q_all,
+                kv_cache,
+                candidates,
+                metadata.seq_lens,
+                metadata.block_tables,
+                metadata.query_start_loc,
+                dcp_rank,
+            )
+            return _merge_exchanged_payload(payload, group, q.dtype).transpose(0, 1)
+        candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
         out, lse = attend_op(
             q_all,
             kv_cache,

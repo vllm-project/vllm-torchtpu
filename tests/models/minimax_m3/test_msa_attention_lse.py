@@ -144,6 +144,42 @@ def test_lse_matches_dense_reference(
     _check(got, want)
 
 
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
+@pytest.mark.parametrize(
+    "num_tokens,num_real,block_q,pages_per_step",
+    [(8, 8, 8, 16), (24, 21, 8, 64), (37, 35, 16, 32)],
+)
+def test_payload_rows_are_the_head_major_results(
+    num_tokens, num_real, block_q, pages_per_step, dtype
+):
+    """`payload` rows hold the head-major output (rounded to the query dtype)
+    and the lse in every lane after it, bit for bit."""
+    rng = np.random.default_rng(num_tokens + block_q)
+    q, _, kv, table, keys, local_key, local_limit = _inputs(
+        rng, num_tokens, num_real, 1, dtype
+    )
+    args = (q, kv, jnp.asarray(keys[:, 0]), jnp.asarray(local_key))
+    args += (jnp.asarray(local_limit), jnp.asarray(table))
+    kwargs = dict(
+        sm_scale=SCALE,
+        block_q=block_q,
+        pages_per_step=pages_per_step,
+        head_major=True,
+        interpret=True,
+    )
+    out, lse = msa_sparse_attention_lse(*args, **kwargs)
+    rows = np.asarray(msa_sparse_attention_lse(*args, payload=True, **kwargs))
+    assert rows.shape == (Q_PER_KV, num_tokens, 2 * HEAD_DIM)
+    np.testing.assert_array_equal(
+        rows[..., :HEAD_DIM], np.asarray(out.astype(jnp.float32))
+    )
+    lanes = np.broadcast_to(np.asarray(lse)[..., None], rows[..., HEAD_DIM:].shape)
+    np.testing.assert_array_equal(rows[..., HEAD_DIM:], lanes)
+    assert np.isfinite(lanes).any()
+    if num_real < num_tokens:  # padding rows: zero output, lse -inf
+        assert np.isinf(lanes[:, num_real:]).all()
+
+
 def _head_major_call(fn, q, *args, head_major, **kwargs):
     """`fn`'s token-major results, or its head-major ones transposed back."""
     if not head_major:

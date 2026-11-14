@@ -827,7 +827,8 @@ def msa_attend_dcp(
     dcp: int,
     scale_cache: jax.Array | None = None,
     interpret: bool = False,
-) -> tuple[jax.Array, jax.Array]:
+    payload: bool = False,
+) -> tuple[jax.Array, jax.Array] | jax.Array:
     """Second half of the DCP forward: attend over the selected blocks this
     rank holds.
 
@@ -841,7 +842,10 @@ def msa_attend_dcp(
     ``candidates [dcp, T, G * 2 * topk]`` every rank's candidates. Returns
     the partial head-major, as the kernel writes it, ``(out [G * Hg, T, D],
     lse [G * Hg, T] f32)``: the LSE merge reduce-scatters heads along the
-    leading axis (`ops.msa.merge_head_partials`).
+    leading axis (`ops.msa.merge_head_partials`). With `payload` (one KV head,
+    8/16-bit caches), one ``[Hg, T, 2D]`` f32 array of rows ``[out | lse]``
+    instead, which a decode step's merge exchanges as is
+    (`msa_attention_lse.msa_sparse_attention_lse`).
     """
     num_tokens = q.shape[0]
     rank = rank_array(rank)[0]
@@ -869,6 +873,8 @@ def msa_attend_dcp(
         interpret=interpret,
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
+    if payload and scale_cache is not None:
+        raise NotImplementedError("payload rows need an 8/16-bit cache")
     if scale_cache is not None:
         if num_heads == 1:
             return msa_attention_lse.msa_sparse_attention_lse(
@@ -887,8 +893,17 @@ def msa_attend_dcp(
         )
     if num_heads == 1:
         return msa_attention_lse.msa_sparse_attention_lse(
-            q, kv_cache, keys[:, 0], *args, head=0, head_major=True, **common
+            q,
+            kv_cache,
+            keys[:, 0],
+            *args,
+            head=0,
+            head_major=True,
+            payload=payload,
+            **common,
         )
+    if payload:
+        raise NotImplementedError(f"payload rows need one KV head, got {num_heads}")
     # One kernel for all the group's KV heads (the head is a kernel input).
     return msa_attention_lse.msa_sparse_attention_lse_heads(
         q, kv_cache, keys, *args, head_major=True, **common
