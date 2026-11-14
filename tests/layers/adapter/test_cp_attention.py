@@ -182,6 +182,51 @@ def test_dcp_kernel_default_layout_reuses_explicit_nhd(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "kv_layout,expected_mask_invalid_v",
+    [
+        (KVLayout.SEQ_ALONG_LANE, True),
+        (KVLayout.HEAD_ALONG_SUBLANE, False),
+    ],
+)
+def test_dcp_pass_forwards_mask_invalid_v_only_for_seq_along_lane(
+    monkeypatch, kv_layout, expected_mask_invalid_v
+):
+    import jax.numpy as jnp
+
+    captured: dict[str, object] = {}
+
+    def fake_rpa(**kwargs):
+        captured.update(kwargs)
+        q = kwargs["queries"]
+        return q, kwargs["kv_cache"], jnp.zeros(q.shape[:2], dtype=jnp.float32)
+
+    monkeypatch.setattr(
+        cp_attention._batched_rpa_wrapper, "ragged_paged_attention", fake_rpa
+    )
+    cp_attention._pallas_rpa_kernel_dcp(
+        jnp.zeros((1,)),
+        jnp.zeros((2, 4, 128)),
+        jnp.zeros((2, 1, 128)),
+        jnp.zeros((2, 1, 128)),
+        jnp.zeros((2,), dtype=jnp.int32),
+        jnp.zeros((2,), dtype=jnp.int32),
+        jnp.arange(3, dtype=jnp.int32),
+        jnp.array([2, 2, 2], dtype=jnp.int32),
+        None,
+        None,
+        None,
+        sliding_window=None,
+        sm_scale=0.125,
+        soft_cap=None,
+        cp_group_size=2,
+        cp_rank_val=0,
+        attention_scope=AttentionScope.CACHE_ONLY,
+        kv_layout=kv_layout,
+    )
+    assert captured["mask_invalid_v"] is expected_mask_invalid_v
+
+
+@pytest.mark.parametrize(
     "cls,head_size",
     [
         (attention.PallasAttentionBackendImpl, 256),

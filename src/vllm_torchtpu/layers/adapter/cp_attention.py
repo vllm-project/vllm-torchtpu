@@ -134,6 +134,7 @@ def _pallas_rpa_kernel_dcp(
         decode_query_size=decode_query_size,
         return_lse=True,
         kv_layout=kv_layout,
+        mask_invalid_v=kv_layout == _batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
     )
     return new_kv_cache, output, lse
 
