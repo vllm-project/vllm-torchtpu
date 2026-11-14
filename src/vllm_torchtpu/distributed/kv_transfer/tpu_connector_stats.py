@@ -334,16 +334,16 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         base_labels = list(labelnames) if labelnames is not None else []
         # Dynamically load TPU Raiden C++ metric schema descriptors
         metric_defs = {}
-        try:
-            # Without this call, get_metric_metadata won't return the correct
-            # metrics definitions
-            dist_utils.configure_raiden_telemetry()
-            telemetry = dist_utils.get_raiden_telemetry_module()
-            descriptors = []
-            if telemetry is not None and hasattr(telemetry, "get_metric_metadata"):
+        # Without this call, get_metric_metadata won't return the correct
+        # metrics definitions
+        dist_utils.configure_raiden_telemetry()
+        telemetry = dist_utils.get_raiden_telemetry_module()
+        descriptors = []
+        if telemetry is not None and hasattr(telemetry, "get_metric_metadata"):
+            try:
                 descriptors = telemetry.get_metric_metadata()
-        except Exception as e:
-            logger.warning("Failed to load TPU Raiden telemetry descriptors: %s", e)
+            except Exception as e:
+                logger.warning("Failed to load TPU Raiden telemetry descriptors: %s", e)
 
         for desc in descriptors:
             # Construct prometheus metric objects based on the definition.
