@@ -224,6 +224,7 @@ def test_forward_routes_pcp_decode_metadata_to_streaming_kernel(
         ({"sinks": torch.zeros(2)}, "attention sinks"),
         ({"logits_soft_cap": 30.0}, "logits soft cap"),
         ({"kv_sharing_target_layer_name": "shared"}, "skip_kv_update"),
+        ({"use_causal_mask": False}, "non-causal attention"),
     ],
 )
 def test_forward_rejects_unsupported_pcp_streaming_features(
@@ -582,6 +583,20 @@ def test_pcp_hnd_layout_requires_custom_backend_and_fp8(hnd_vllm_config_context)
         _batched_impl()._validate_pcp_streaming_support(False)
 
     _batched_impl(kv_cache_dtype="fp8_e4m3")._validate_pcp_streaming_support(False)
+
+
+def test_pcp_streaming_rejects_non_causal_layers():
+    # The streaming kernel takes no causal flag, so a non-causal layer (e.g. a
+    # DFlash draft) would silently run causal attention.
+    impl = PallasAttentionBackendImpl.__new__(PallasAttentionBackendImpl)
+    impl.kv_layout = KVLayout.HEAD_ALONG_SUBLANE
+    impl.sinks = None
+    impl.logits_soft_cap = None
+    impl.use_causal_mask = False
+    with pytest.raises(NotImplementedError, match="non-causal attention"):
+        impl._validate_pcp_streaming_support(skip_kv_update=False)
+    impl.use_causal_mask = True
+    impl._validate_pcp_streaming_support(skip_kv_update=False)
 
 
 def test_adapter_make_streaming_kernel_has_eight_tensor_signature_and_calls_wrapper(
