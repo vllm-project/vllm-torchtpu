@@ -18,13 +18,14 @@ from unittest.mock import MagicMock, patch
 import jax.numpy as jnp
 import pytest
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils, wrapper
 
 
 def _create_mock_tpu_info(
     generation: int,
     chip_version: str = "v8i",
     num_lanes: int = 128,
+    num_sublanes: int = 8,
     mxu_column_size: int = 128,
     vmem_capacity_bytes: int = 64 * 1024 * 1024,
     fp8_ops_per_second: int = 2,
@@ -34,6 +35,7 @@ def _create_mock_tpu_info(
     mock.generation = generation
     mock.chip_version = chip_version
     mock.num_lanes = num_lanes
+    mock.num_sublanes = num_sublanes
     mock.mxu_column_size = mxu_column_size
     mock.vmem_capacity_bytes = vmem_capacity_bytes
     mock.fp8_ops_per_second = fp8_ops_per_second
@@ -82,3 +84,148 @@ def test_calculate_block_sizes_generation(
         )
         assert decode_blocks.bq_sz >= decode_blocks.bq_c_sz >= expected_bq_c_min
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
+
+
+# The cached-KV DMA schedule fetches block k from pages k * bkv_p with no
+# intra-page offset, so bkv_sz must be a page multiple in every layout.
+@pytest.mark.parametrize(
+    "kv_layout",
+    [configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE],
+)
+@pytest.mark.parametrize(
+    "kv_dtype,num_kv_heads",
+    [
+        (jnp.bfloat16, 1),
+        (jnp.bfloat16, 2),
+        (jnp.float8_e4m3fn, 1),
+        (jnp.float8_e4m3fn, 2),
+    ],
+)
+@pytest.mark.parametrize("page_size", [16, 128, 512])
+def test_calculate_block_sizes_bkv_is_page_multiple(
+    kv_layout, kv_dtype, num_kv_heads, page_size
+):
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=6 * num_kv_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=8,
+        page_size=page_size,
+        total_q_tokens=512,
+        num_page_indices=8 * 17,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=kv_dtype,
+        dtype_out=jnp.bfloat16,
+        kv_layout=kv_layout,
+    )
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        decode_blocks, prefill_blocks = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, 64 * 1024 * 1024
+        )
+    for blocks in (decode_blocks, prefill_blocks):
+        assert blocks.bkv_sz >= page_size
+        assert blocks.bkv_sz % page_size == 0, (
+            f"{kv_layout=} {kv_dtype=} {num_kv_heads=} {page_size=}:"
+            f" bkv_sz={blocks.bkv_sz} is not a page multiple"
+        )
+
+
+@pytest.mark.parametrize(
+    "kv_layout,expected_error",
+    [
+        (configs.KVLayout.HEAD_ALONG_SUBLANE, ValueError),
+        (configs.KVLayout.SEQ_ALONG_LANE, NotImplementedError),
+    ],
+)
+def test_validate_inputs_rejects_unaligned_bkv_sz(kv_layout, expected_error):
+    page_size, head_dim, num_kv_heads, num_seqs, num_pages = 512, 128, 2, 8, 4
+    dtype = jnp.bfloat16
+    packing = utils.get_dtype_packing(dtype)
+    cfgs = configs.RpaConfigs(
+        block=configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=768, batch_size=8),
+        model=configs.ModelConfigs(
+            num_q_heads=6 * num_kv_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            mask_value=-1e9,
+        ),
+        serve=configs.ServingConfigs(
+            num_seqs=num_seqs,
+            page_size=page_size,
+            total_q_tokens=num_seqs,
+            num_page_indices=num_seqs * num_pages,
+            dtype_q=dtype,
+            dtype_kv=dtype,
+            dtype_out=dtype,
+            kv_layout=kv_layout,
+        ),
+        mode=configs.RpaCase.DECODE,
+        vmem_limit_bytes=64 * 1024 * 1024,
+    )
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            kv_cache_shape = (
+                num_pages,
+                num_kv_heads * 2,
+                cfgs.aligned_kv_head_dim // packing,
+                packing,
+                page_size,
+            )
+        else:
+            kv_cache_shape = (
+                num_pages,
+                page_size,
+                cfgs.aligned_num_kv_heads_x2 // packing,
+                packing,
+                cfgs.aligned_kv_head_dim,
+            )
+        with pytest.raises(expected_error, match="multiple of"):
+            cfgs.validate_inputs(
+                q=jnp.zeros((num_seqs, 6 * num_kv_heads, head_dim), dtype),
+                k=jnp.zeros((num_seqs, num_kv_heads, head_dim), dtype),
+                v=jnp.zeros((num_seqs, num_kv_heads, head_dim), dtype),
+                kv_cache=jnp.zeros(kv_cache_shape, dtype),
+                kv_lens=jnp.zeros((num_seqs,), jnp.int32),
+                page_indices=jnp.zeros((num_seqs * num_pages,), jnp.int32),
+                cu_q_lens=jnp.zeros((num_seqs + 1,), jnp.int32),
+                distribution=jnp.zeros((3,), jnp.int32),
+            )
+
+
+def test_calculate_block_sizes_shrinks_bq_when_page_aligned_bkv_does_not_fit():
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=32,
+        num_kv_heads=32,
+        head_dim=128,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=8,
+        page_size=512,
+        total_q_tokens=512,
+        num_page_indices=8 * 17,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.bfloat16,
+        dtype_out=jnp.bfloat16,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+    )
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        decode_blocks, prefill_blocks = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, 64 * 1024 * 1024
+        )
+    assert prefill_blocks.bkv_sz == 512
+    assert prefill_blocks.bq_sz == 128
+    assert prefill_blocks.batch_size == 1
+    assert decode_blocks.bkv_sz % 512 == 0
