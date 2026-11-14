@@ -300,7 +300,8 @@ def prepare_routed_gmm_inputs(
     if argsort_revert_indices is not None and (
             max_key_bits + max(1, (num_tokens_local - 1).bit_length()) >= 31):
         argsort_revert_indices, bucket_counts = None, None
-    if argsort_revert_indices is not None:
+    used_counting_sort = argsort_revert_indices is not None
+    if used_counting_sort:
         group_sizes_local = bucket_counts
 
         token_bits = (num_tokens_local - 1).bit_length()
@@ -329,9 +330,19 @@ def prepare_routed_gmm_inputs(
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster
             # for small batch size
-            onehot = jax.nn.one_hot(token_indices_sorted,
-                                    num_tokens_local,
-                                    dtype=hidden_states_local.dtype)
+            if (used_counting_sort
+                    and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() != "on"):
+                revert_indices = argsort_revert_indices.reshape(
+                    num_tokens_local, topk)
+                onehot = jax.nn.one_hot(
+                    revert_indices,
+                    argsort_revert_indices.size,
+                    dtype=hidden_states_local.dtype,
+                ).sum(axis=1).T
+            else:
+                onehot = jax.nn.one_hot(token_indices_sorted,
+                                        num_tokens_local,
+                                        dtype=hidden_states_local.dtype)
             x = onehot @ hidden_states_local
         else:
             # Materialize the valid local expert prefix through SparseCore
@@ -415,28 +426,28 @@ def moe_gmm(
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
-            # `argsort_revert_indices` is the inverse of the sort, so scattering
-            # through it is the gather by the (unmaterialised) forward one.
-            topk_weights_sorted = jnp.zeros_like(topk_weights_flat).at[
-                argsort_revert_indices].set(topk_weights_flat)
-            valid_count = group_sizes.sum(dtype=jnp.int32)[None]
-            if (envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on" and
-                    can_use_blockwise_onehot_unpermute(gmm2_res,
-                                                       token_indices_sorted,
-                                                       topk_weights_sorted,
-                                                       valid_count,
-                                                       num_tokens=num_tokens)):
-                logger.info_once(
-                    "Selected owner_output blockwise one-hot unpermute: "
-                    "routes=%d hidden=%d tokens=%d", gmm2_res.shape[0],
-                    gmm2_res.shape[1], num_tokens)
-                return blockwise_onehot_unpermute(
-                    gmm2_res,
-                    token_indices_sorted,
-                    topk_weights_sorted,
-                    valid_count,
-                    num_tokens=num_tokens,
-                ).astype(x.dtype)
+            if envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on":
+                # `argsort_revert_indices` is the inverse of the sort, so scattering
+                # through it is the gather by the (unmaterialised) forward one.
+                topk_weights_sorted = jnp.zeros_like(topk_weights_flat).at[
+                    argsort_revert_indices].set(topk_weights_flat)
+                valid_count = group_sizes.sum(dtype=jnp.int32)[None]
+                if can_use_blockwise_onehot_unpermute(gmm2_res,
+                                                      token_indices_sorted,
+                                                      topk_weights_sorted,
+                                                      valid_count,
+                                                      num_tokens=num_tokens):
+                    logger.info_once(
+                        "Selected owner_output blockwise one-hot unpermute: "
+                        "routes=%d hidden=%d tokens=%d", gmm2_res.shape[0],
+                        gmm2_res.shape[1], num_tokens)
+                    return blockwise_onehot_unpermute(
+                        gmm2_res,
+                        token_indices_sorted,
+                        topk_weights_sorted,
+                        valid_count,
+                        num_tokens=num_tokens,
+                    ).astype(x.dtype)
             if skip_padded_tokens:
                 # Zero out the GMM output rows of padded tokens that
                 # skipped the GMM computation, otherwise those
