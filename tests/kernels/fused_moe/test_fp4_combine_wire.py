@@ -264,3 +264,34 @@ def test_pallas_combine_kernel_fp4_wire_matches_xla_reference():
     )
 
     np.testing.assert_allclose(np.asarray(got), np.asarray(ref), rtol=1e-2, atol=2e-2)
+
+
+@pytest.mark.tpu_test
+def test_pallas_rowquant_fp4_hadamard_captures_no_constants():
+    """rowquant_fp4_hadamard lowers inside pallas_call without captured arrays."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU backend for Mosaic Pallas kernel")
+
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    x = jax.random.normal(jax.random.PRNGKey(3), (16, 256), dtype=jnp.bfloat16)
+
+    def _body(x_ref, q_ref, s_ref):
+        q, s = kernel.rowquant_fp4_hadamard(x_ref[...])
+        q_ref[...] = pltpu.bitcast(q, jnp.uint32)
+        s_ref[...] = jnp.broadcast_to(s, (16, 128))
+
+    packed, scales = pl.pallas_call(
+        _body,
+        out_shape=(
+            jax.ShapeDtypeStruct((16, 32), jnp.uint32),
+            jax.ShapeDtypeStruct((16, 128), jnp.float32),
+        ),
+    )(x)
+    q_ref_xla, s_ref_xla = kernel.rowquant_fp4_hadamard(x)
+    np.testing.assert_allclose(
+        np.asarray(scales[:, :1]), np.asarray(s_ref_xla), rtol=1e-3, atol=1e-4
+    )
+    assert packed.shape == (16, 32)
+    assert q_ref_xla.shape == (16, 256)

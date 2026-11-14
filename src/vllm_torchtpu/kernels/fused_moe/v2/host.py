@@ -38,25 +38,21 @@ QB4 = 512
 PACK4 = 8
 BF16 = jnp.bfloat16
 
-_HADAMARD_128_SIGNS: tuple[tuple[float, ...], ...] | None = None
-
 
 def hadamard_128_bf16(*, inverse: bool = False) -> jax.Array:
     """128x128 Sylvester Walsh-Hadamard matrix in bfloat16 with exact dyadic split.
 
     Splitting 1/128 = (1/8) * (1/16) keeps every matrix entry an exact power of
     two in bfloat16 (+/-0.125 forward, +/-0.0625 inverse), so H_fwd @ H_inv = I
-    holds with zero mantissa rounding error.
+    holds with zero mantissa rounding error. Synthesized from `broadcasted_iota`
+    and `population_count` so Pallas kernels build it in registers without
+    capturing a non-scalar constant array.
     """
-    global _HADAMARD_128_SIGNS
-    if _HADAMARD_128_SIGNS is None:
-        # Sylvester H_{2^k}[i, j] = (-1)^popcount(i & j).
-        _HADAMARD_128_SIGNS = tuple(
-            tuple((-1.0 if ((i & j).bit_count() & 1) else 1.0) for j in range(128))
-            for i in range(128)
-        )
-    scale = 0.0625 if inverse else 0.125
-    return jnp.asarray(_HADAMARD_128_SIGNS, dtype=jnp.bfloat16) * jnp.bfloat16(scale)
+    ii = jax.lax.broadcasted_iota(jnp.int32, (128, 128), 0)
+    jj = jax.lax.broadcasted_iota(jnp.int32, (128, 128), 1)
+    odd = (jax.lax.population_count(ii & jj) & jnp.int32(1)) != 0
+    val = jnp.bfloat16(0.0625 if inverse else 0.125)
+    return jnp.where(odd, -val, val)
 
 
 # Storage only, the same way four-bit weights are: TPU v7, the generation
