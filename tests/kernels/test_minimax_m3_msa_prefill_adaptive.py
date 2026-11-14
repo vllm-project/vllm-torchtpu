@@ -16,13 +16,14 @@ S, D, HG, TOPK = 128, 128, 16, 16
 PAGES = 64  # pages per sequence; the call's tokens sit in the last one
 
 
-def _wide_reference(sel, block_q, threshold):
+def _wide_reference(sel, block_q, threshold, max_tiles=64):
     t, g, k = sel.shape
     pad = -t % block_q
     sel = np.concatenate([sel, np.full((pad, g, k), -1, sel.dtype)])
+    stride = max(1, (t + pad) // block_q // max_tiles)
     distinct = tiles = 0
     for h in range(g):
-        for t0 in range(0, t + pad, block_q):
+        for t0 in range(0, t + pad, block_q * stride):
             keys = sel[t0 : t0 + block_q, h].reshape(-1)
             keys = keys[keys >= 0]
             distinct += len(np.unique(keys))
@@ -40,6 +41,9 @@ def test_wide_selection_matches_reference(seed):
         for threshold in (4, 10, 16, 24):
             got = bool(lse_mod.wide_selection(jnp.asarray(sel), block_q, threshold))
             assert got == _wide_reference(sel, block_q, threshold)
+            for max_tiles in (2, 3):  # sampled tiles
+                got = lse_mod.wide_selection(jnp.asarray(sel), block_q, threshold, max_tiles)
+                assert bool(got) == _wide_reference(sel, block_q, threshold, max_tiles)
 
 
 def _inputs(num_heads, union, seed):
