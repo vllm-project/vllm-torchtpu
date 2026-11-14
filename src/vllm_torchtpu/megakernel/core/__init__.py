@@ -35,7 +35,11 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         spec,
     )
     from .collectives import AllReduceRing
-    from .dma import pool_alias
+    from .dma import (
+        pool_alias,
+        vmem,
+    )
+    from .dma.vmem import fit_default_tiles, fitted_plan
     from .errors import (
         MegakernelConfigError,
         MegakernelLayoutError,
@@ -180,7 +184,10 @@ _LAZY: dict[str, str] = {
     "SwitchSlot": ".spec",
     "VLLMAlias": ".spec",
     "WeightDecl": ".spec",
+    "fit_default_tiles": ".dma.vmem",
+    "fitted_plan": ".dma.vmem",
     "pool_alias": ".dma",
+    "vmem": ".dma",
 }
 
 __all__ = [
@@ -233,6 +240,8 @@ __all__ = [
     "encode_ecopy",
     "errors",
     "exec_spec",
+    "fit_default_tiles",
+    "fitted_plan",
     "get_profile",
     "kv_to_raw_page",
     "list_profiles",
@@ -253,6 +262,7 @@ __all__ = [
     "round_up",
     "spec",
     "ssm_to_raw_pages",
+    "vmem",
     "with_cache",
 ]
 
