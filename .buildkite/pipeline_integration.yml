@@ -168,6 +168,22 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_pp_disagg_offload.sh
 
+      - label: "Presubmit: qwen35-raiden-pcp4-dp4-disagg-correctness"
+        key: "presubmit_qwen35_raiden_pcp4_dp4_disagg_correctness"
+        if: "build.pull_request.id != null"
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          RUN_ROOT: "/perf_eval_results/qwen35_raiden_pcp4_dp4_disagg_ci"
+        timeout_in_minutes: 45
+        commands:
+          - >-
+            bash .buildkite/scripts/run_in_docker.sh
+            bash
+            ./scripts/vllm/integration/run_qwen35_raiden_pcp4_dp4_correctness.sh
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Integration: compilation-cache-e2e"
         key: "integration_compilation_cache_e2e"
         env:

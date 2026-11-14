@@ -23,6 +23,9 @@
 # without that exchange generation derails from the second token.
 set -u
 
+# Ensure KV_TRANSPORT is defined to avoid failures with `set -u`.
+: "${KV_TRANSPORT:=raiden}"
+
 MODEL="Qwen/Qwen3.5-35B-A3B-FP8"
 PORT=8000
 EXPECTED="87 87 87 87 87 87 87 87"
