@@ -102,6 +102,7 @@ steps:
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
+          UPLOAD_TO_VLLM_CI: "1"
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
@@ -118,6 +119,7 @@ steps:
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
+          UPLOAD_TO_VLLM_CI: "1"
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
@@ -178,6 +180,7 @@ steps:
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
+          UPLOAD_TO_VLLM_CI: "1"
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
@@ -209,6 +212,7 @@ steps:
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
+          UPLOAD_TO_VLLM_CI: "1"
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
@@ -235,6 +239,7 @@ steps:
         agents:
           queue: "kube"
         env:
+          UPLOAD_TO_VLLM_CI: "1"
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "14400"
           BENCHMARK_WARMUP_RUNS: "1"

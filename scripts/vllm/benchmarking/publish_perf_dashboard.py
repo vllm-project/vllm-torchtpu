@@ -24,6 +24,10 @@ throughput divided by the number of chips, which the dashboard labels
 The dashboard keys a series by device, `tp` and concurrency, so `tp` is the
 layout's tensor parallelism and `dp` rides along: the layouts of one model
 on one slice stay separate series.
+
+The slice comes from the TPU pod itself: GKE gives every TPU pod, single- or
+multi-host, TPU_TOPOLOGY (chips, e.g. "2x2x2") and TPU_HOST_BOUNDS (hosts,
+e.g. "1,1,2"), so a step needs no SHAPE just for this.
 """
 
 import argparse
@@ -40,6 +44,25 @@ TOKEN_ENV = "INGEST_BEARER_TOKEN"
 RESULT_FILENAME_RE = re.compile(r"^isl(\d+)_osl(\d+)_c(\d+)\.json$")
 
 
+def _product(dims: str, sep: str) -> int:
+    n = 1
+    for d in dims.split(sep):
+        n *= int(d)
+    return n
+
+
+def slice_from_env(env=os.environ) -> tuple[int, int]:
+    """(chips, hosts) of the slice this pod belongs to, from GKE's TPU env."""
+    topology = env.get("TPU_TOPOLOGY", "").strip()
+    if not re.fullmatch(r"\d+(x\d+)*", topology):
+        raise ValueError(f"TPU_TOPOLOGY is not AxB[xC]: {topology!r}")
+    host_bounds = env.get("TPU_HOST_BOUNDS", "").strip()
+    hosts = (
+        _product(host_bounds, ",") if re.fullmatch(r"\d+(,\d+)*", host_bounds) else 1
+    )
+    return _product(topology, "x"), hosts
+
+
 def to_row(
     raw: dict,
     config: dict,
@@ -49,6 +72,7 @@ def to_row(
     conc: int,
     device: str,
     chips: int,
+    hosts: int = 1,
     image: str,
 ) -> dict:
     tp = int(config["tensor_parallelism"])
@@ -69,7 +93,7 @@ def to_row(
         "disagg": "false",
         "isl": isl,
         "osl": osl,
-        "is_multinode": "false",
+        "is_multinode": "true" if hosts > 1 else "false",
         "tp": tp,
         "dp": dp,
         "ep": tp * dp if config.get("enable_ep") else 1,
@@ -129,7 +153,14 @@ def main() -> int:
     )
     parser.add_argument("--device", required=True, help="Device tag, e.g. tpu7x")
     parser.add_argument(
-        "--chips", type=int, required=True, help="Chips in the slice the run used"
+        "--chips",
+        type=int,
+        help="Chips in the slice the run used (default: from TPU_TOPOLOGY)",
+    )
+    parser.add_argument(
+        "--hosts",
+        type=int,
+        help="Hosts in the slice (default: from TPU_HOST_BOUNDS, else 1)",
     )
     parser.add_argument("--image", required=True, help="Image the run used")
     parser.add_argument(
@@ -140,10 +171,23 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    chips, hosts = args.chips, args.hosts
+    if chips is None:
+        try:
+            chips, env_hosts = slice_from_env()
+        except ValueError as e:
+            print(f"ERROR: pass --chips or run in a TPU pod: {e}", file=sys.stderr)
+            return 1
+        hosts = hosts or env_hosts
+    hosts = hosts or 1
+    # GKE's TPU_ACCELERATOR_TYPE is "tpu7x-16"; the dashboard device is the
+    # generation alone, as a step's forwarded "tpu7x" already is.
+    device = args.device.split("-")[0]
+
     rows = []
     for results_dir in args.results_dirs:
         dir_rows = collect_rows(
-            results_dir, device=args.device, chips=args.chips, image=args.image
+            results_dir, device=device, chips=chips, hosts=hosts, image=args.image
         )
         print(f"{results_dir}: {len(dir_rows)} result(s)")
         rows += dir_rows
