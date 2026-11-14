@@ -178,3 +178,54 @@ def test_debug_marks_do_not_change_outputs(interpret, monkeypatch):
     marked = attend(case, 0, 1)
     for a, b in zip(marked, plain):
         np.testing.assert_array_equal(bits(a), bits(b))
+
+
+@pytest.mark.parametrize(
+    "env_value,config_value,want",
+    [
+        ("", False, False),
+        ("", True, True),
+        ("1", False, True),
+        ("0", True, False),
+        ("1", True, True),
+        ("0", False, False),
+    ],
+)
+def test_env_takes_precedence_over_additional_config(env_value, config_value, want):
+    assert bsp.bound_stab_enabled(env_value, config_value) is want
+
+
+def test_bad_env_value_rejected():
+    with pytest.raises(ValueError):
+        bsp.bound_stab_enabled("yes", False)
+
+
+@pytest.mark.parametrize(
+    "env_value,config_value,noted",
+    [("0", True, False), ("1", False, True), ("", True, True), ("", False, False)],
+)
+def test_layer_notes_bound_per_precedence(monkeypatch, env_value, config_value, noted):
+    """The QSA layer's finalize hook reads the env first, then the config key."""
+    import types
+
+    import torch
+    import vllm.config
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import qsa
+
+    monkeypatch.setattr(bsp, "_KEY_NORM_BOUND", None)
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_BOUND_STAB", env_value)
+    cfg = types.SimpleNamespace(
+        additional_config={"qwen4_exp": {"qsa_prefill_bound_stab": config_value}}
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: cfg)
+    layer = types.SimpleNamespace(
+        k_norm=types.SimpleNamespace(weight=torch.full((DIM,), 0.5)),
+        head_dim=DIM,
+        prefix="layers.3.self_attn",
+    )
+    qsa.Qwen4ExpQSA._note_key_norm_bound(layer)
+    if noted:
+        assert bsp.key_norm_bound() == pytest.approx(16 * 1.5)
+    else:
+        assert bsp.key_norm_bound() is None
