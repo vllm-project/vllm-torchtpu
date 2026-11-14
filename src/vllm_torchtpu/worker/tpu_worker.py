@@ -92,6 +92,21 @@ def _release_free_host_heap() -> None:
         logger.info("Released free host heap via glibc malloc_trim.")
 
 
+def _release_jax_caches() -> None:
+    """Drop JAX's trace and lowering caches after warm-up (TPU_RELEASE_JAX_CACHES).
+
+    Every bucket is compiled by now and the Pallas kernels live inside those
+    programs, so the cached jaxprs are only needed if a kernel is traced again,
+    which then re-traces it once.
+    """
+    import jax
+
+    jax.clear_caches()
+    logger.info_once(
+        "TPU_RELEASE_JAX_CACHES=1: dropped JAX trace/lowering caches after warm-up."
+    )
+
+
 class TPUWorker(WorkerBase):
     def __init__(
         self,
@@ -826,6 +841,8 @@ class TPUWorker(WorkerBase):
                     host_heap_report.experiments(self.rank, _release_free_host_heap)
             except Exception as e:  # noqa: BLE001
                 logger.warning("TPU_HOST_HEAP_REPORT diagnostics failed: %r", e)
+        if envs.TPU_RELEASE_JAX_CACHES:
+            _release_jax_caches()
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
