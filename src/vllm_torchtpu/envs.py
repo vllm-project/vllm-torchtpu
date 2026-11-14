@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MINIMAX_M3_FP8_LINEARS: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
+    TPU_MOE_DENSE_FP4_SHARED: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
@@ -724,6 +725,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_FP4_MAX_TOKENS": env_nonnegative_int(
         "TPU_MOE_DENSE_FP4_MAX_TOKENS", 16
     ),
+    # Eligible MoE layers hand their shared expert to the routed experts' op
+    # (layers/adapter/dense_fp4_shared.py): the dense fp4 kernel evaluates it
+    # in the same call, other steps add it with XLA inside the op. Armed once
+    # after load.
+    "TPU_MOE_DENSE_FP4_SHARED": env_bool("TPU_MOE_DENSE_FP4_SHARED", default=False),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
