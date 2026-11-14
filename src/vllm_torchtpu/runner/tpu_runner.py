@@ -300,8 +300,47 @@ def _rollback_offsets_migrate_impl(
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
 
 
+def _update_read_offsets_impl(
+    read_offsets: torch.Tensor,
+    groups: list[torch.Tensor],
+    next_tokens: torch.Tensor,
+    num_reqs: torch.Tensor,
+) -> torch.Tensor:
+    """Post-verify read-offset scatter for every mamba group in one program.
+    Each of `groups` is a [width] slot tensor; `next_tokens` the rejection
+    sampler output ([>= num_reqs, K+1], INVALID_TOKEN_ID-padded); `num_reqs`
+    a 0-d tensor, so it enters as a value, not a shape. Rows past it take
+    offset 0 (their slots are the null block). Returns the offsets, one per
+    batch position."""
+    width = groups[0].shape[0]
+    rows = next_tokens.shape[0]
+    if rows >= width:
+        next_tokens = next_tokens[:width]
+    else:
+        next_tokens = torch.nn.functional.pad(
+            next_tokens, (0, 0, 0, width - rows), value=INVALID_TOKEN_ID
+        )
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    valid = torch.arange(width, device=read_offsets.device) < num_reqs
+    offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0).to(read_offsets.dtype)
+    indices = torch.cat(groups, dim=0).long()
+    read_offsets.index_put_((indices,), offsets.repeat(len(groups)))
+    return offsets
+
+
+def _use_fused_read_offset_update(
+    read_offsets: torch.Tensor, next_tokens: torch.Tensor | None
+) -> bool:
+    """Verify chunks take `_update_read_offsets_compiled`; non-verify chunks
+    (`next_tokens is None`, offsets all 0) take the eager scatter. Serving
+    buffers are always on TPU; the device check only routes the CPU unit tests,
+    which the tpu backend cannot trace, to the eager path."""
+    return next_tokens is not None and read_offsets.device.type == "tpu"
+
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
+_update_read_offsets_compiled = _tpu_compile(_update_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
 
@@ -1463,6 +1502,7 @@ class TPUModelRunner(GPUModelRunner):
         # see rows in that segment; see static_verify_q_len for why.
         self._static_verify_q_len: int | None = static_verify_q_len(self.vllm_config)
         self._num_static_verify_reqs = 0
+        self._num_reqs_device: dict[int, torch.Tensor] = {}
         # Drafting and verification happen where sampling happens, on the
         # last pipeline stage; the other stages keep the config for the KV
         # cache spec and the scheduler, and nothing else.
@@ -3950,6 +3990,19 @@ class TPUModelRunner(GPUModelRunner):
                 release_cb()
             self._fenced_h2d_sources.clear()
 
+    def _upload_keyed(
+        self, slot: str, host: torch.Tensor, values: bytes
+    ) -> torch.Tensor:
+        """`_upload_unless_unchanged` with the caller's value key (for dtypes
+        numpy cannot view)."""
+        key = (host.dtype, tuple(host.shape), values)
+        prev = self._h2d_reuse.get(slot)
+        if prev is not None and prev[0] == key:
+            return prev[1]
+        dev = host.to(self.device, non_blocking=True)
+        self._h2d_reuse[slot] = (key, dev, host)
+        return dev
+
     def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
         """`host.to(self.device)`, reusing `slot`'s previous upload when the
         values have not changed.
@@ -4972,6 +5025,14 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self.mamba_slot_read_offsets is None or not indices_per_group:
             return None
+        if _use_fused_read_offset_update(self.mamba_slot_read_offsets, next_tokens):
+            assert next_tokens is not None
+            return _update_read_offsets_compiled(
+                self.mamba_slot_read_offsets,
+                list(indices_per_group),
+                next_tokens,
+                self._num_reqs_tensor(num_reqs),
+            )
         offsets = torch.zeros(
             indices_per_group[0].shape[0],
             dtype=torch.int32,
@@ -4993,6 +5054,18 @@ class TPUModelRunner(GPUModelRunner):
             all_offsets = offsets.repeat(len(indices_per_group))
             self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
         return offsets
+
+    def _num_reqs_tensor(self, num_reqs: int) -> torch.Tensor:
+        """A cached 0-d int64 device tensor holding `num_reqs` (read-only), so
+        the per-step read-offset update does not upload a fresh scalar."""
+        # Lazily created: runners built without __init__ (tests, partial
+        # construction) have no cache yet.
+        cache = self.__dict__.setdefault("_num_reqs_device", {})
+        t = cache.get(num_reqs)
+        if t is None:
+            t = torch.tensor(num_reqs, dtype=torch.int64, device=self.device)
+            cache[num_reqs] = t
+        return t
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -9050,11 +9123,22 @@ class TPUModelRunner(GPUModelRunner):
         cur_end_idx: int,
         logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._padded_sampling_params(
+            cur_start_idx, cur_end_idx, logits.shape[0], logits.dtype, logits.device
+        )
+
+    def _padded_sampling_params(
+        self,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        padded_num_reqs: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
-        padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
-        temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
+        temps_cpu = torch.ones(padded_num_reqs, dtype=dtype)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
         top_p_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
 
@@ -9073,10 +9157,23 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
         )
 
+        if device == self.device:
+            # Requests' sampling parameters rarely change between steps: reuse
+            # the previous uploads while the values match (keyed in float32,
+            # as numpy has no bfloat16).
+            return (
+                self._upload_keyed(
+                    "sampling_temps",
+                    temps_cpu.unsqueeze(1),
+                    temps_cpu.float().numpy().tobytes(),
+                ),
+                self._upload_unless_unchanged("sampling_top_k", top_k_cpu.unsqueeze(1)),
+                self._upload_unless_unchanged("sampling_top_p", top_p_cpu.unsqueeze(1)),
+            )
         return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+            temps_cpu.unsqueeze(1).to(device, non_blocking=True),
+            top_k_cpu.unsqueeze(1).to(device, non_blocking=True),
+            top_p_cpu.unsqueeze(1).to(device, non_blocking=True),
         )
 
     def _topk_candidate_blocks(self) -> int:
