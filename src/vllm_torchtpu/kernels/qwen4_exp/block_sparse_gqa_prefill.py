@@ -1647,9 +1647,16 @@ def _block_sparse_gqa_prefill(
     lazy = lazy_softmax_features() if dcp and not vpu and not bf16_mxu else ()
     if lazy and kv_tile % 128:
         lazy = ()
+    # VLLM_TPU_QSA_BOUND_STAB_ALL (test only): also run the replicated (non-DCP)
+    # call with LANE_SUM + the bound stabilizer, to compare like with like.
+    bound_all = bool(os.environ.get("VLLM_TPU_QSA_BOUND_STAB_ALL")) and bound_stab
     lane_sum = (
         lane_sum_features()
-        if dcp and not vpu and not bf16_mxu and not lazy and kv_tile % 128 == 0
+        if (dcp or bound_all)
+        and not vpu
+        and not bf16_mxu
+        and not lazy
+        and kv_tile % 128 == 0
         else ()
     )
     if lane_sum:
@@ -2057,6 +2064,13 @@ def block_sparse_gqa_attention(
             tick = lax.cond(rerun, functools.partial(_mark_kernel, 999), _no_mark, None)
             output = (output[0], output[1] + tick * 0.0)
         output = lax.cond(rerun, lambda o: routed({}), lambda o: o, output)
+    elif (
+        bound is not None
+        and dcp is None
+        and os.environ.get("VLLM_TPU_QSA_BOUND_STAB_ALL")
+        and not os.environ.get("VLLM_TPU_QSA_SMATTR")
+    ):
+        output = routed({"bound_stab": True})  # test only: no lse, no guard
     else:
         output = routed({})
     if mask_in_padding:
