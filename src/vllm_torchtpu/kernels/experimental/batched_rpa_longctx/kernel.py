@@ -21,6 +21,7 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu.kernels import pallas_compat
 # yapf: disable
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (
     bref_override, configs, flash_attention, schedule, stitch_utils, utils)
@@ -501,6 +502,8 @@ def create_allocs(
         buffer_count=cfgs.n_buffer,
         use_lookahead=True,
         cfgs=cfgs,
+        priority=1,
+        strict_ordering=False,
     )
     q_alloc = bref_override.BatchingQRef.input(
         spec=q_spec,
@@ -508,6 +511,8 @@ def create_allocs(
         buffer_count=cfgs.n_buffer,
         use_lookahead=True,
         cfgs=cfgs,
+        priority=1,
+        strict_ordering=False,
     )
     o_alloc = bref_override.BatchingORef.output(
         spec=o_spec,
@@ -515,6 +520,8 @@ def create_allocs(
         buffer_count=2,
         use_lookahead=False,
         cfgs=cfgs,
+        priority=0,
+        strict_ordering=False,
     )
     lse_alloc = None
     if cfgs.serve.return_lse:
@@ -530,6 +537,8 @@ def create_allocs(
             buffer_count=2,
             use_lookahead=False,
             cfgs=cfgs,
+            priority=0,
+            strict_ordering=False,
         )
     return q_alloc, kv_cache_alloc, o_alloc, lse_alloc
 
@@ -699,14 +708,14 @@ def rpa_kernel(
                         src_off = element_size * aligned_start_step
                         src_off = pl.multiple_of(src_off, 128)
 
-                        copy = pltpu.make_async_copy(
+                        copy = pallas_compat.make_async_copy(
                             h.at[pl.ds(src_off, read_size)],
                             s.at[pl.ds(0, read_size)],
                             dma_sem.at[0],
                         )
-                        copy.start()
+                        copy.start(priority=1, strict_ordering=False)
                         dma_list.append(copy)
-                jax.tree.map(lambda x: x.wait(), dma_list)
+                jax.tree.map(lambda x: x.wait(strict_ordering=False), dma_list)
 
                 pipeline_func = pltpu.emit_pipeline(
                     body=functools.partial(

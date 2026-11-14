@@ -24,6 +24,7 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import pallas_compat
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
                                                                     utils)
 
@@ -371,15 +372,16 @@ def _write_schedule_to_hbm(
             write_size = h.shape[0]
             output_offset = 0
 
-        copy = pltpu.make_async_copy(
+        copy = pallas_compat.make_async_copy(
             s.at[pl.ds(0, write_size)],
             h.at[pl.ds(output_offset, write_size)],
             dma_sem.at[0],
         )
         dma_list.append(copy)
 
-    jax.tree.map(lambda x: x.start(), dma_list)
-    jax.tree.map(lambda x: x.wait(), dma_list)
+    jax.tree.map(lambda x: x.start(priority=1, strict_ordering=False),
+                 dma_list)
+    jax.tree.map(lambda x: x.wait(strict_ordering=False), dma_list)
 
 
 def _compute_waits(
