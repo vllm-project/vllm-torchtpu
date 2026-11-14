@@ -41,6 +41,9 @@ queries of the group's heads along with the query heads.
 """
 
 import functools
+import math
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -481,14 +484,27 @@ def local_candidates(
     return picked_scores[:num_tokens], picked_blocks[:num_tokens]
 
 
+class _Write(NamedTuple):
+    """A decode step's new KV and index-key rows, which the block-score
+    kernel writes (`decode_candidates`): each cache's rows in the slot width
+    (`msa_write.slot_rows`), and the
+    token runs (`msa_write.token_runs`) with each run's request and this
+    rank's page column."""
+
+    kv_cache: jax.Array
+    index_cache: jax.Array
+    kv_words: jax.Array
+    index_words: jax.Array
+    kv_spec: Any
+    index_spec: Any
+    runs: tuple  # (count [1], page, lo, hi, tok0, seq, column), each [R] but count
+
+
 def _tile_candidates(
+    refs,
     scores_ref,
     tile_row0,
     tile_seq,
-    rank_ref,
-    cu_q_lens_ref,
-    seq_lens_ref,
-    out_ref,
     *,
     block_size,
     topk,
@@ -496,10 +512,12 @@ def _tile_candidates(
     local_blocks,
     dcp,
 ):
-    """`msa_indexer.TileEpilogue` of `decode_candidates`: the tile's rows'
+    """`msa_indexer.TileEpilogue.fn` of `decode_candidates`: the tile's rows'
     `_pick_candidates`, packed (`pack_candidates`) into their token rows of
-    ``out_ref [T, 2 * topk]``; rows of the tile outside its request keep
-    what they hold."""
+    the first output ``[rows, 2 * topk]``; rows of the tile outside its
+    request keep what they hold."""
+    rank_ref, cu_q_lens_ref, seq_lens_ref = refs.prefetch[:3]
+    out_ref = refs.outputs[0]
     block_q = scores_ref.shape[0]
     start = cu_q_lens_ref[tile_seq]
     end = cu_q_lens_ref[tile_seq + 1]
@@ -507,10 +525,6 @@ def _tile_candidates(
     pos = (
         seq_lens_ref[tile_seq] - (end - start) + (token - start)
     )  # `msa.token_positions`
-    picked = [
-        pltpu.VMEM((block_q, topk), jnp.float32),
-        pltpu.VMEM((block_q, topk), jnp.int32),
-    ]
 
     def pick(score_ref, block_ref):
         _pick_candidates(
@@ -524,20 +538,234 @@ def _tile_candidates(
             local_blocks=local_blocks,
             dcp=dcp,
         )
-        rows = out_ref.at[
-            pl.ds(pl.multiple_of(tile_row0, msa_indexer._ROW_ALIGN), block_q)
-        ]
+        row0 = pl.multiple_of(tile_row0, msa_indexer.TILE_ROW_ALIGN)
+        rows = out_ref.at[pl.ds(row0, block_q)]
         packed = pack_candidates(score_ref[...], block_ref[...])
         rows[...] = jnp.where((token >= start) & (token < end), packed, rows[...])
 
-    pl.run_scoped(pick, *picked)
+    pl.run_scoped(
+        pick,
+        pltpu.VMEM((block_q, topk), jnp.float32),
+        pltpu.VMEM((block_q, topk), jnp.int32),
+    )
 
 
-def _no_candidates(out_ref):
-    """Packed ``(-inf, -1)`` in every row (rows no tile writes: padding)."""
+def _no_candidates(refs):
+    """Packed ``(-inf, -1)`` in every row of the candidates (rows no tile
+    writes: padding)."""
+    out_ref = refs.outputs[0]
     topk = out_ref.shape[1] // 2
     lane = jax.lax.broadcasted_iota(jnp.int32, out_ref.shape, 1)
     out_ref[...] = jnp.where(lane < topk, _NEG_INF, -1.0)
+
+
+class _WriteRefs(NamedTuple):
+    num_runs: Any
+    page: Any
+    lo: Any
+    hi: Any
+    tok0: Any
+    seq: Any
+    column: Any
+    kv_words: Any
+    index_words: Any
+    kv_out: Any
+    index_out: Any
+    kv_window: Any
+    index_window: Any
+    kv_staging: Any
+    index_staging: Any
+    kv_pages: Any
+    window_sem: Any
+    kv_in_sem: Any
+    kv_out_sem: Any
+    index_sem: Any
+    flags: Any  # SMEM [3]: windows landed, KV pages merged, index pages in flight
+
+
+def _write_refs(refs) -> _WriteRefs:
+    return _WriteRefs(
+        *refs.prefetch[3:10],
+        *refs.inputs[:2],
+        *refs.outputs[1:3],
+        *refs.scratch,
+    )
+
+
+def _placement(w, r, page_size):
+    """Run `r`'s window (`msa_write.run_placement`)."""
+    return msa_write.run_placement(
+        w.tok0[r], w.lo[r], w.kv_words.shape[0], page_size, w.kv_window.shape[1]
+    )
+
+
+def _window_copies(w, r, page_size):
+    start, _ = _placement(w, r, page_size)
+    rows = pl.ds(start, w.kv_window.shape[1])
+    return [
+        pltpu.make_async_copy(
+            w.kv_words.at[rows], w.kv_window.at[r], w.window_sem.at[0]
+        ),
+        pltpu.make_async_copy(
+            w.index_words.at[rows], w.index_window.at[r], w.window_sem.at[0]
+        ),
+    ]
+
+
+def _kv_page_copy(w, r, out):
+    page = w.kv_out.at[w.page[r]]
+    return pltpu.make_async_copy(
+        w.kv_pages.at[r] if out else page,
+        page if out else w.kv_pages.at[r],
+        w.kv_out_sem.at[0] if out else w.kv_in_sem.at[0],
+    )
+
+
+def _for_runs(w, body):
+    jax.lax.fori_loop(0, w.num_runs[0], lambda r, c: (body(r), c)[1], 0)
+
+
+def _write_start(refs, *, page_size):
+    """`init` hook: no candidates in any row yet (`_no_candidates`), and
+    every run's row windows and KV page in flight."""
+    _no_candidates(refs)
+    w = _write_refs(refs)
+    w.flags[0] = 0
+    w.flags[1] = 0
+    w.flags[2] = 0
+
+    def start(r):
+        for c in _window_copies(w, r, page_size):
+            c.start()
+        _kv_page_copy(w, r, out=False).start()
+
+    _for_runs(w, start)
+
+
+def _wait_windows(w, page_size):
+    @pl.when(w.flags[0] == 0)
+    def _():
+        _for_runs(w, lambda r: [c.wait() for c in _window_copies(w, r, page_size)])
+        w.flags[0] = 1
+
+
+def _write_patch(refs, pages_ref, *, page_size, index_spec):
+    """`patch` hook: the step's request's new index keys into its ring copy
+    of their page, then that page back to the cache (`msa_write.merge_rows`;
+    a request scored by several tiles is patched and written by each, with
+    the same bytes)."""
+    w = _write_refs(refs)
+    pps = refs.pages_per_step
+    _wait_windows(w, page_size)
+
+    def patch(r):
+        @pl.when((w.seq[r] == refs.seq) & (w.column[r] // pps == refs.group))
+        def _():
+            g = w.column[r] % pps
+            _, row0 = _placement(w, r, page_size)
+            words = msa_write.merge_rows(
+                index_spec,
+                w.index_window[r],
+                w.index_staging,
+                pages_ref[g],
+                w.lo[r],
+                w.hi[r],
+                row0,
+                page_size,
+            )
+            pages_ref[g] = words
+            _index_page_copy(w, pages_ref, g, r).start()
+            w.flags[2] = w.flags[2] + 1
+
+    _for_runs(w, patch)
+
+
+def _index_page_copy(w, pages_ref, g, r):
+    out = w.index_out.bitcast(jnp.uint32)
+    out = out.reshape(out.shape[0], out.shape[1], out.shape[3])
+    return pltpu.make_async_copy(pages_ref.at[g], out.at[w.page[r]], w.index_sem.at[0])
+
+
+def _write_step_end(refs, *, page_size, kv_spec):
+    """`step_end` hook: this step's index pages written before their ring
+    slot is reused; at the first step the KV pages merged and in flight back;
+    at the last step every KV page written."""
+    w = _write_refs(refs)
+    out = w.index_out.bitcast(jnp.uint32)
+    out = out.reshape(out.shape[0], out.shape[1], out.shape[3])
+    one_page = pltpu.make_async_copy(
+        out.at[0], out.at[0], w.index_sem.at[0]
+    )  # to wait on
+
+    def wait_index(i, c):
+        one_page.wait()
+        return c
+
+    jax.lax.fori_loop(0, w.flags[2], wait_index, 0)
+    w.flags[2] = 0
+
+    @pl.when(w.flags[1] == 0)
+    def _():
+        _wait_windows(w, page_size)
+
+        def merge(r):
+            _kv_page_copy(w, r, out=False).wait()
+            _, row0 = _placement(w, r, page_size)
+            words = w.kv_pages.bitcast(jnp.uint32)
+            words[r, :, 0, :] = msa_write.merge_rows(
+                kv_spec,
+                w.kv_window[r],
+                w.kv_staging,
+                words[r, :, 0, :],
+                w.lo[r],
+                w.hi[r],
+                row0,
+                page_size,
+            )
+            _kv_page_copy(w, r, out=True).start()
+
+        _for_runs(w, merge)
+        w.flags[1] = 1
+
+    @pl.when(refs.step == refs.num_steps - 1)
+    def _():
+        _for_runs(w, lambda r: _kv_page_copy(w, r, out=True).wait())
+
+
+# Most VMEM `decode_candidates` gives its write buffers (every run's KV page
+# and row windows at once); a step with more runs takes the plain path. A
+# decode step of 16 8-token requests at DCP 2 (c16) needs ~3 MiB of fp8.
+FUSED_WRITE_VMEM_BYTES = 16 << 20
+
+
+def _decode_write(
+    kv_cache, index_cache, k, v, index_k, pages, pos, seq_id, *, max_num_seqs, dcp
+) -> _Write:
+    """`_Write` of a step's ``k`` / ``v`` / ``index_k`` rows at ``pages``
+    (this rank's page of each token, `owner_pages`) and positions ``pos``,
+    as `msa.write_caches` would write them."""
+    num_tokens = pages.shape[0]
+    kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
+    block_size = msa.page_size(kv_cache)
+    max_runs = msa_write.max_write_runs(num_tokens, max_num_seqs, block_size)
+    runs = msa_write.token_runs(pages, pos % block_size, kv_cache.shape[0], max_runs)
+    count, _, _, _, tok0 = runs
+    first = jnp.minimum(tok0, num_tokens - 1)
+    words = []
+    specs = []
+    for cache, rows in ((kv_cache, kv_rows), (index_cache, index_k)):
+        w, spec = msa_write.slot_rows(
+            msa_write.Rows(cache, msa._cache_rows(cache, rows))
+        )
+        words.append(w)
+        specs.append(spec)
+    return _Write(
+        kv_cache,
+        index_cache,
+        *words,
+        *specs,
+        (count[None], *runs[1:], seq_id[first], pos[first] // block_size // dcp),
+    )
 
 
 def decode_candidates(
@@ -556,15 +784,24 @@ def decode_candidates(
     rank: jax.Array,
     dcp: int,
     interpret: bool,
-) -> jax.Array | None:
+    write: Callable[[], _Write],
+) -> tuple[jax.Array, jax.Array, jax.Array] | None:
     """`pack_candidates` of a decode step's local top-k ``[T, 2 * topk]``
     from one kernel: the block-score kernel picks each query tile's
     candidates (`_tile_candidates`) from its scores in VMEM and writes them
     to the tile's token rows, instead of writing ``[tiles * Bq, P]`` scores
     that an XLA row gather (0.74 us per layer, c4 twin j-7ecb84bb) and a
-    candidates kernel (1.28 us) then read. ``None`` for a step the plain
-    path must take: requests longer than one small tile class, or scores
-    not token-major (`msa_indexer.class_plan`)."""
+    candidates kernel (1.28 us) then read; and it writes the step's new KV
+    and index rows (`write`; a `msa_write.write_runs` call of their own,
+    2.2 us per layer on the writing rank of that twin): each run's KV page
+    is read at the first step and merged and written back after it, and its
+    index-key page is merged into the ring copy that is about to be scored
+    and written back from there. Returns ``(candidates, kv_cache,
+    index_cache)``, or ``None`` for a step the plain path must take:
+    requests longer than one small tile class, scores not token-major
+    (`msa_indexer.class_plan`), or runs whose buffers (each run's KV page
+    and row windows are in VMEM at once) would pass
+    `FUSED_WRITE_VMEM_BYTES`. `write` builds the step's rows."""
     num_tokens = index_q.shape[0]
     plan = msa_indexer.class_plan(
         index_q,
@@ -581,22 +818,62 @@ def decode_candidates(
     width = 2 * topk
     # A tile starts at its request's first row rounded down to the row
     # alignment and spans `small_block_q` rows, which can reach this far.
-    align = msa_indexer._ROW_ALIGN
+    align = msa_indexer.TILE_ROW_ALIGN
     rows = -(-num_tokens // align) * align + plan.small_block_q - align
-    epilogue = msa_indexer.TileEpilogue(
-        functools.partial(
-            _tile_candidates,
-            block_size=block_size,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-            dcp=dcp,
-        ),
-        _no_candidates,
-        (rank_array(rank), cu_q_lens, seq_lens),
-        jax.ShapeDtypeStruct((rows, width), jnp.float32),
+    candidates = jax.ShapeDtypeStruct((rows, width), jnp.float32)
+    pick = functools.partial(
+        _tile_candidates,
+        block_size=block_size,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        dcp=dcp,
     )
-    return plan.small(epilogue=epilogue)[:num_tokens]
+    prefetch = (rank_array(rank), cu_q_lens, seq_lens)
+    write = write()
+    kv, index = write.kv_cache, write.index_cache
+    page_size = msa.page_size(kv)
+    max_runs = write.runs[1].shape[0]
+    window = msa_write.window_rows(page_size)
+    buffers = [
+        ((max_runs, window, write.kv_words.shape[1]), write.kv_words.dtype),
+        ((max_runs, window, write.index_words.shape[1]), write.index_words.dtype),
+        (msa_write.staging_shape(write.kv_words.shape[1], page_size), jnp.uint32),
+        (msa_write.staging_shape(write.index_words.shape[1], page_size), jnp.uint32),
+        ((max_runs, *kv.shape[1:]), kv.dtype),
+    ]
+    scratch_bytes = sum(
+        math.prod(shape) * jnp.dtype(t).itemsize for shape, t in buffers
+    )
+    if scratch_bytes > FUSED_WRITE_VMEM_BYTES:
+        return None
+    epilogue = msa_indexer.TileEpilogue(
+        pick,
+        functools.partial(_write_start, page_size=page_size),
+        prefetch + write.runs,
+        (
+            candidates,
+            jax.ShapeDtypeStruct(kv.shape, kv.dtype),
+            jax.ShapeDtypeStruct(index.shape, index.dtype),
+        ),
+        inputs=(write.kv_words, write.index_words, kv),
+        aliases=((2, 1),),
+        scratch=(
+            *(pltpu.VMEM(shape, dtype) for shape, dtype in buffers),
+            *(pltpu.SemaphoreType.DMA((1,)) for _ in range(4)),
+            pltpu.SMEM((3,), jnp.int32),
+        ),
+        scratch_bytes=scratch_bytes,
+        cache_output=2,
+        patch=functools.partial(
+            _write_patch, page_size=page_size, index_spec=write.index_spec
+        ),
+        step_end=functools.partial(
+            _write_step_end, page_size=page_size, kv_spec=write.kv_spec
+        ),
+    )
+    cands, kv, index = plan.small(epilogue=epilogue)
+    return cands[:num_tokens], kv, index
 
 
 def pack_candidates(scores: jax.Array, blocks: jax.Array) -> jax.Array:
@@ -868,6 +1145,44 @@ def msa_write_and_candidates_dcp(
     )
     fp4 = scale_cache is not None
     scale_row = msa_fp4.index_scale_row(num_heads) if fp4 else None
+    local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
+    if (
+        not fp4
+        and num_heads == 1
+        and not msa_indexer.is_prefill_step(num_tokens, max_num_seqs)
+    ):
+        fused = decode_candidates(
+            index_q,
+            index_cache,
+            seq_lens,
+            local_lens,
+            block_tables,
+            cu_q_lens,
+            distribution[2],
+            block_size=block_size,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            rank=rank,
+            dcp=dcp,
+            interpret=interpret,
+            write=functools.partial(
+                _decode_write,
+                kv_cache,
+                index_cache,
+                k,
+                v,
+                index_k,
+                pages,
+                pos,
+                seq_id,
+                max_num_seqs=max_num_seqs,
+                dcp=dcp,
+            ),
+        )
+        if fused is not None:
+            packed, kv_cache, index_cache = fused
+            return kv_cache, index_cache, packed
     if fp4:
         kv_cache, index_cache, scale_cache = msa.write_fp4(
             kv_cache,
@@ -891,7 +1206,6 @@ def msa_write_and_candidates_dcp(
             max_num_seqs=max_num_seqs,
             interpret=interpret,
         )
-    local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
     candidates = functools.partial(
         local_candidates,
         block_size=block_size,
@@ -920,25 +1234,6 @@ def msa_write_and_candidates_dcp(
         if fp4:
             return kv_cache, index_cache, scale_cache, packed
         return kv_cache, index_cache, packed
-    if num_heads == 1 and not fp4:
-        packed = decode_candidates(
-            index_q,
-            index_cache,
-            seq_lens,
-            local_lens,
-            block_tables,
-            cu_q_lens,
-            distribution[2],
-            block_size=block_size,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-            rank=rank,
-            dcp=dcp,
-            interpret=interpret,
-        )
-        if packed is not None:
-            return kv_cache, index_cache, packed
     if num_heads == 1:
         scores = msa._block_scores(
             index_q,

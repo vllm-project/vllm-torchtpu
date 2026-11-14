@@ -29,8 +29,9 @@ groups are lane-aligned either way and come out token-major.
 """
 
 import functools
+import math
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -69,6 +70,8 @@ _ROW_SHIFT = 10
 _SEQ_MASK = (1 << _ROW_SHIFT) - 1
 # f32 query rows are read at element offsets that are multiples of the sublane tile.
 _ROW_ALIGN = 8
+# Tiles start at a multiple of this many rows (`_tiles`).
+TILE_ROW_ALIGN = _ROW_ALIGN
 _GROUP_MASK = (1 << _TILE_SHIFT) - 1
 
 
@@ -360,6 +363,7 @@ def _kernel_v3(
     sems,  # DMA semaphores [R], one per ring slot
     *,
     transposed=False,
+    patch=None,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -376,6 +380,9 @@ def _kernel_v3(
 
     A folded 4-bit page (`msa_fp4.scales_in_page`) is ``S / 8`` word rows of
     int4 keys and one row of f32 slot scales (`_chunk_maxima_t`).
+
+    `patch(pages_ref)`, if given, runs on a step's ``[G, S / p, D]`` ring
+    slot once its pages have landed, before they are scored.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -522,6 +529,8 @@ def _kernel_v3(
         request's last page (their scores are never read) and only issue
         their share of the ahead group's descriptors."""
         wait_pages(live, slot)
+        if patch is not None:
+            patch(buf.at[slot])
         for c in range(num_chunks):
             pages = range(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
@@ -543,20 +552,49 @@ def _kernel_v3(
             )
 
 
+class EpilogueRefs(NamedTuple):
+    """The refs a `TileEpilogue`'s hooks see."""
+
+    work: Any  # scalar prefetch of `_kernel_v3`
+    tile_info: Any
+    block_tables: Any
+    seq_pages: Any
+    prefetch: tuple  # TileEpilogue.prefetch, in SMEM
+    inputs: tuple  # TileEpilogue.inputs, in HBM
+    outputs: tuple  # TileEpilogue.out_shapes: the first in VMEM, the rest in HBM
+    scratch: tuple  # TileEpilogue.scratch
+    pages_per_step: int
+    step: Any  # this grid step, and the grid's size (traced)
+    num_steps: Any
+    seq: Any  # the request and page group of this step's work item (traced)
+    group: Any
+
+
 class TileEpilogue(NamedTuple):
     """What a token-major v3 call (`_class_scores`) does with each tile's
-    scores in place of writing them out: after the tile's last page group,
-    ``fn(scores, tile_row0, tile_seq, *prefetch_refs, out_ref)`` runs on the
-    tile's ``[block_q, P]`` f32 scores in VMEM (columns past the request's
-    pages hold stale values), with `prefetch` as extra scalar-prefetch
-    operands, and writes the call's one output, `out_shape`, which stays in
-    VMEM across the grid: ``init(out_ref)`` fills it at the first step and
-    ``fn`` writes the rows of its tile."""
+    scores in place of writing them out. After the tile's last page group,
+    ``fn(refs, scores_ref, tile_row0, tile_seq)`` runs on the tile's
+    ``[block_q, P]`` f32 scores in VMEM (columns past the request's pages
+    hold stale values) and writes the tile's rows of the first of
+    `out_shapes`, which stays in VMEM across the grid and which ``init(refs)``
+    fills at the first step, before any page is scored. The other outputs
+    stay in HBM, aliased to `inputs` by `aliases` (``(input, output)``
+    positions in those tuples) and, if `cache_output` names one, to the index
+    cache the call scores. ``patch(refs, pages_ref)`` runs on each step's
+    ring slot of pages before they are scored (`_kernel_v3`), and
+    ``step_end(refs)`` after each step's scoring."""
 
     fn: Callable
     init: Callable
     prefetch: tuple
-    out_shape: jax.ShapeDtypeStruct
+    out_shapes: tuple
+    inputs: tuple = ()
+    aliases: tuple = ()
+    scratch: tuple = ()
+    scratch_bytes: int = 0  # VMEM of `scratch`, for the call's VMEM limit
+    cache_output: int | None = None
+    patch: Callable | None = None
+    step_end: Callable | None = None
 
 
 def _kernel_v3_epilogue(
@@ -568,15 +606,34 @@ def _kernel_v3_epilogue(
     epilogue,
 ):
     """`_kernel_v3` (token-major) scoring into a VMEM row buffer of the
-    tile's scores, then `TileEpilogue.fn` at the tile's last work item."""
-    num_prefetch = len(epilogue.prefetch)
-    extra = refs[:num_prefetch]
-    q_ref, cache_ref, out_ref, buf, sems, rows = refs[num_prefetch:]
+    tile's scores, with `TileEpilogue`'s hooks."""
+    sizes = [len(epilogue.prefetch), 2, len(epilogue.inputs)]
+    sizes += [len(epilogue.out_shapes), 3, len(epilogue.scratch)]
+    groups, i = [], 0
+    for n in sizes:
+        groups.append(refs[i : i + n])
+        i += n
+    prefetch, (q_ref, cache_ref), inputs, outputs, (buf, sems, rows), scratch = groups
     pages_per_step = buf.shape[1]
     step, num_steps = pl.program_id(0), pl.num_programs(0)
-    pl.when(step == 0)(functools.partial(epilogue.init, out_ref))
     entry = work_ref[step]
     tile = entry >> _TILE_SHIFT
+    ctx = EpilogueRefs(
+        work_ref,
+        tile_seq_ref,
+        block_tables_ref,
+        seq_pages_ref,
+        prefetch,
+        inputs,
+        outputs,
+        scratch,
+        pages_per_step,
+        step,
+        num_steps,
+        tile_seq_ref[tile] & _SEQ_MASK,
+        entry & _GROUP_MASK,
+    )
+    pl.when(step == 0)(functools.partial(epilogue.init, ctx))
     col0 = pl.multiple_of((entry & _GROUP_MASK) * pages_per_step, pages_per_step)
     _kernel_v3(
         work_ref,
@@ -589,13 +646,18 @@ def _kernel_v3_epilogue(
         buf,
         sems,
         transposed=True,
+        patch=None
+        if epilogue.patch is None
+        else functools.partial(epilogue.patch, ctx),
     )
+    if epilogue.step_end is not None:
+        epilogue.step_end(ctx)
     following = work_ref[jnp.minimum(step + 1, num_steps - 1)] >> _TILE_SHIFT
 
     @pl.when((step == num_steps - 1) | (following != tile))
     def _():
         info = tile_seq_ref[tile]
-        epilogue.fn(rows, info >> _ROW_SHIFT, info & _SEQ_MASK, *extra, out_ref)
+        epilogue.fn(ctx, rows, info >> _ROW_SHIFT, info & _SEQ_MASK)
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
@@ -806,27 +868,41 @@ def _class_scores(
         if epilogue is not None:
             if not token_major:
                 raise NotImplementedError("a tile epilogue needs token-major scores")
-            num_extra = len(epilogue.prefetch)
-            return pl.pallas_call(
+            first, *rest = epilogue.out_shapes
+            num_in = 6 + len(epilogue.prefetch)  # inputs before the epilogue's
+            ring_bytes = _RING_SLOTS * pages_per_step * rows_per_page * head_dim * 4
+            need = ring_bytes + 4 * block_q * (padded_pages + 2 * head_dim)
+            need += 4 * math.prod(first.shape) + epilogue.scratch_bytes
+            any_spec = pl.BlockSpec(memory_space=pl.ANY)
+            out = pl.pallas_call(
                 functools.partial(_kernel_v3_epilogue, epilogue=epilogue),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
-                    num_scalar_prefetch=4 + num_extra,
+                    num_scalar_prefetch=4 + len(epilogue.prefetch),
                     grid=grid_spec.grid,
-                    in_specs=[
-                        grid_spec.in_specs[0],
-                        pl.BlockSpec(memory_space=pl.ANY),
+                    in_specs=[grid_spec.in_specs[0], any_spec]
+                    + [any_spec] * len(epilogue.inputs),
+                    out_specs=[
+                        pl.BlockSpec(first.shape, lambda *_: (0,) * len(first.shape)),
+                        *[any_spec] * len(rest),
                     ],
-                    out_specs=pl.BlockSpec(
-                        epilogue.out_shape.shape,
-                        lambda *_: (0,) * len(epilogue.out_shape.shape),
-                    ),
                     scratch_shapes=[
                         *ring,
                         pltpu.VMEM((block_q, padded_pages), jnp.float32),
+                        *epilogue.scratch,
                     ],
                 ),
-                out_shape=epilogue.out_shape,
-                compiler_params=params,
+                out_shape=list(epilogue.out_shapes),
+                input_output_aliases={num_in + i: o for i, o in epilogue.aliases}
+                | (
+                    {}
+                    if epilogue.cache_output is None
+                    else {num_in - 1: epilogue.cache_output}
+                ),
+                compiler_params=pltpu.CompilerParams(
+                    dimension_semantics=("arbitrary",),
+                    disable_bounds_checks=True,
+                    vmem_limit_bytes=max(32 << 20, need + (16 << 20)),
+                ),
                 interpret=interpret,
                 name="minimax_m3_msa_block_scores",
             )(
@@ -837,7 +913,9 @@ def _class_scores(
                 *epilogue.prefetch,
                 q_rows,
                 index_cache,
+                *epilogue.inputs,
             )
+            return out
         scores_t = pl.pallas_call(
             functools.partial(_kernel_v3, transposed=token_major),
             grid_spec=pltpu.PrefetchScalarGridSpec(
