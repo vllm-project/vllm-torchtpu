@@ -1,25 +1,30 @@
 """The configuration checker must reject failed launcher dry runs."""
 import os
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
 BASH = os.environ.get("BASH_EXECUTABLE") or shutil.which("bash")
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash is required")
-CHECKER = Path(os.environ.get(
-    "CHECK_POINTS_SCRIPT",
-    str(Path(__file__).resolve().parents[2]
-        / "scripts/vllm/benchmark/inferencex/qwen3.5/check_points.sh")))
+CHECKER = Path(
+    os.environ.get(
+        "CHECK_POINTS_SCRIPT",
+        str(
+            Path(__file__).resolve().parents[2] /
+            "scripts/vllm/benchmark/inferencex/qwen3.5/check_points.sh")))
 
 
-def run_check(tmp_path, sweep, server, *points):
+def run_check(tmp_path, sweep, server, *points, pass_default_point=True):
     for name, text in (("check_points.sh", CHECKER.read_text()),
                        ("sweep.sh", sweep), ("server.sh", server)):
         (tmp_path / name).write_text(text, encoding="utf-8", newline="\n")
-    return subprocess.run([BASH, "check_points.sh", *(points or ("32",))],
-                          cwd=tmp_path, capture_output=True, text=True,
+    args = points or (("32", ) if pass_default_point else ())
+    return subprocess.run([BASH, "check_points.sh", *args],
+                          cwd=tmp_path,
+                          capture_output=True,
+                          text=True,
                           timeout=20)
 
 
@@ -29,6 +34,17 @@ SETTINGS = "echo SHARDING=TP8_EP\n"
 def test_matching_successful_launchers_pass(tmp_path):
     result = run_check(tmp_path, SETTINGS, SETTINGS)
     assert result.returncode == 0, result.stderr
+
+
+def test_default_concurrencies_without_arguments(tmp_path):
+    result = run_check(tmp_path, SETTINGS, SETTINGS, pass_default_point=False)
+    assert result.returncode == 0, result.stderr
+    concurrencies = [
+        line.split(" ", 1)[0] for line in result.stdout.splitlines()
+    ]
+    assert concurrencies == [
+        "4", "8", "16", "32", "64", "128", "256", "512", "1024"
+    ]
 
 
 @pytest.mark.parametrize("sweep,server", [

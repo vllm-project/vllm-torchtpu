@@ -1267,7 +1267,8 @@ def _get_token_paddings(min_token_size: int,
     stepped = _stepped_token_paddings(step, step_from,
                                       min(step_to, max_token_size))
     extra = [
-        size for size in (extra_bucket_sizes or []) if 0 < size <= max_token_size
+        size for size in (extra_bucket_sizes or [])
+        if 0 < size <= max_token_size
     ]
     if stepped or extra:
         paddings = sorted(set(paddings) | set(stepped) | set(extra))

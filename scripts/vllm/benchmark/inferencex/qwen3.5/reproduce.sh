@@ -60,6 +60,7 @@ if [ -n "${CLIENT:-}" ]; then
   echo "ERROR: reproduce.sh uses bench.sh; unset CLIENT to reproduce the serving sweep" >&2
   exit 1
 fi
+# shellcheck disable=SC1091
 source "$RECIPE/check_client.sh"
 prepare_inferencex_client || exit 1
 echo "--- tree: $(git -C "$ROOT" rev-parse HEAD) ($(git -C "$ROOT" status --porcelain | wc -l) local changes) ---"

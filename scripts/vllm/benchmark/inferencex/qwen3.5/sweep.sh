@@ -19,6 +19,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ "${DRY_RUN:-0}" != "1" ] && [ "${CLIENT:-$SCRIPT_DIR/bench.sh}" = "$SCRIPT_DIR/bench.sh" ]; then
+  # shellcheck disable=SC1091
   source "$SCRIPT_DIR/check_client.sh"
   prepare_inferencex_client || exit 1
 fi
@@ -32,6 +33,7 @@ read -r -a CONCS <<< "${CONCS:-4 8 16 32 64 128 256 512 1024}"
 # Per-point sharding, followed by DP8 slots, global token budget and
 # release group.
 # The points live in points.sh, shared with server.sh.
+# shellcheck disable=SC1091
 source "${SCRIPT_DIR}/points.sh"
 
 sweep_status=0
