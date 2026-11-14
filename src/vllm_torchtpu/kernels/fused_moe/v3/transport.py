@@ -56,6 +56,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import pallas_compat
+
 from . import layout
 from .layout import (COLLECTIVE_ID_TRANSPORT, LANES, MESH_AXIS, ROW_BLOCK,
                      SUBLANES, device_coords)
@@ -217,13 +219,14 @@ class Exchange:
 
     def remote_copy(self, rows, sem, peer, src=None):
         """gathered rows [rows] to the same rows on `peer` (or from `src`)."""
-        return pltpu.make_async_remote_copy(
+        return pallas_compat.make_async_remote_copy(
             src_ref=self.gathered_rows.at[rows] if src is None else src,
             dst_ref=self.gathered_rows.at[rows],
             send_sem=self.send_sem,
             recv_sem=sem,
             device_id=device_coords(peer, self.mesh_axes),
-            device_id_type=pl.DeviceIdType.MESH)
+            device_id_type=pl.DeviceIdType.MESH,
+            strict_ordering=False)
 
     def wait_landed(self, rows, sem):
         """Wait for `rows` of the gathered rows to land on `sem`. Under the
@@ -234,8 +237,10 @@ class Exchange:
         of mesh axes ... 0D mesh"). Other callers use the remote
         descriptor's receive wait."""
         if layout.SHARD_INDEX_OPERAND:
-            pltpu.make_async_copy(self.gathered_rows.at[rows],
-                                  self.gathered_rows.at[rows], sem).wait()
+            pallas_compat.make_async_copy(self.gathered_rows.at[rows],
+                                          self.gathered_rows.at[rows],
+                                          sem,
+                                          strict_ordering=False).wait()
         else:
             self.remote_copy(rows, sem, self.mate).wait_recv()
 
@@ -532,35 +537,39 @@ def start_transport(rows,
         all_shards_barrier(num_shards, mesh_axes)
 
         def fetch_rows(i):
-            return pltpu.make_async_copy(
+            return pallas_compat.make_async_copy(
                 rows_hbm.at[pl.ds(i * tile, rows_of(i))],
-                rows_vmem.at[i % 2,
-                             pl.ds(0, rows_of(i))], row_fetch_sems.at[i % 2])
+                rows_vmem.at[i % 2, pl.ds(0, rows_of(i))],
+                row_fetch_sems.at[i % 2],
+                strict_ordering=False)
 
         def write_gathered_rows(i):
-            return pltpu.make_async_copy(
+            return pallas_compat.make_async_copy(
                 quantized_vmem.at[i % 2, pl.ds(0, rows_of(i))],
                 gathered_rows.at[pl.ds(shard * tokens + i * tile, rows_of(i))],
-                gathered_rows_write_sems.at[i % 2])
+                gathered_rows_write_sems.at[i % 2],
+                strict_ordering=False)
 
         def share_with_mate(i):
-            return pltpu.make_async_remote_copy(
+            return pallas_compat.make_async_remote_copy(
                 src_ref=quantized_vmem.at[i % 2, pl.ds(0, rows_of(i))],
                 dst_ref=gathered_rows.at[pl.ds(shard * tokens + i * tile,
                                                rows_of(i))],
                 send_sem=mate_send_sems.at[i % 2],
                 recv_sem=receive_sems.at[MATE_TILE_SEMAPHORE],
                 device_id=device_coords(exchange.mate, mesh_axes),
-                device_id_type=pl.DeviceIdType.MESH)
+                device_id_type=pl.DeviceIdType.MESH,
+                strict_ordering=False)
 
         def send_message(peer):
-            return pltpu.make_async_remote_copy(
+            return pallas_compat.make_async_remote_copy(
                 src_ref=message_in,
                 dst_ref=routing_messages.at[shard],
                 send_sem=message_send_sem,
                 recv_sem=message_receive_sem,
                 device_id=device_coords(peer, mesh_axes),
-                device_id_type=pl.DeviceIdType.MESH)
+                device_id_type=pl.DeviceIdType.MESH,
+                strict_ordering=False)
 
         fetch_rows(0).start()
         for i in range(n_tiles):
@@ -598,9 +607,11 @@ def start_transport(rows,
                 row = scale_base + plane * n_tiles + i
                 message_in[row:row + 1, :] = pltpu.bitcast(
                     column.T[0:1, :], jnp.int32)
-        local_message = pltpu.make_async_copy(message_in,
-                                              routing_messages.at[shard],
-                                              message_local_sem)
+        local_message = pallas_compat.make_async_copy(
+            message_in,
+            routing_messages.at[shard],
+            message_local_sem,
+            strict_ordering=False)
         local_message.start()
         for i in range(1, num_shards):
             send_message((shard + i) & (num_shards - 1)).start()
@@ -610,20 +621,22 @@ def start_transport(rows,
                 share_with_mate(i).wait_send()
         for i in range(n_tiles if num_shards > 1 else 0):
             if layout.SHARD_INDEX_OPERAND:
-                pltpu.make_async_copy(
+                pallas_compat.make_async_copy(
                     gathered_rows.at[pl.ds(shard * tokens + i * tile,
                                            rows_of(i))],
                     gathered_rows.at[pl.ds(shard * tokens + i * tile,
                                            rows_of(i))],
-                    receive_sems.at[MATE_TILE_SEMAPHORE]).wait()
+                    receive_sems.at[MATE_TILE_SEMAPHORE],
+                    strict_ordering=False).wait()
             else:
                 share_with_mate(i).wait_recv()
         issue_first_round(exchange)
         for _ in range(1, num_shards):
             if layout.SHARD_INDEX_OPERAND:
-                pltpu.make_async_copy(routing_messages.at[shard],
-                                      routing_messages.at[shard],
-                                      message_receive_sem).wait()
+                pallas_compat.make_async_copy(routing_messages.at[shard],
+                                              routing_messages.at[shard],
+                                              message_receive_sem,
+                                              strict_ordering=False).wait()
             else:
                 send_message(shard ^ 1).wait_recv()
         for _ in range(1, num_shards):

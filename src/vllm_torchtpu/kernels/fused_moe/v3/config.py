@@ -70,7 +70,7 @@ COMBINE_TOKENS_PER_TILE_DEFAULT = 128
 COMBINE_UNROLL_DEFAULT = 32
 # Columns of the intermediate the FFN kernel activates and requantizes per
 # pass, so the live bf16 intermediate stays small.
-ACTIVATION_COLUMNS_PER_PASS_DEFAULT = 512
+ACTIVATION_COLUMNS_PER_PASS_DEFAULT = 1024
 # The fewest words of a row table the shard-tables kernel zeroes per grid
 # step.
 TABLES_ZERO_WORDS_DEFAULT = 8192
