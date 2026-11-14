@@ -1,4 +1,3 @@
-# ruff: noqa: F401
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,18 +17,16 @@ Uses direct remote VMEM RDMA copies and hardware barrier semaphores to minimize
 collective latency on decode-sized token tensors.
 """
 
-import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.small_collectives.common import (
-    LANES, barrier, barrier_peers, call, push, split_rank, sum_slots,
+    LANES, barrier, call, normalize_rank_of_core, push, split_rank, sum_slots,
     wait_bytes_of)
 
 # A barrier group distinct from the all-reduce kernel's.
 COLLECTIVE_ID = 7
-GATHER_COLLECTIVE_ID = 9
 # Each block's rows are padded to this multiple: Mosaic refuses a row slice
 # of the input that is not aligned to the sublane tile.
 SUBLANES = 8
@@ -42,42 +39,51 @@ def reference(blocks, core):
     return jnp.sum(mine.astype(jnp.float32), axis=0).astype(blocks.dtype)
 
 
-def small_reduce_scatter(x,
-                         *,
-                         num_cores,
-                         axis,
-                         rank=None,
-                         form=None,
-                         collective_id=COLLECTIVE_ID):
-    """Block r of ``x`` summed onto core r of mesh axis ``axis``, inside a
-    shard_map over that axis; ``rank`` as in ``small_all_reduce``."""
+def small_reduce_scatter(
+    x,
+    *,
+    num_cores,
+    axis,
+    rank=None,
+    rank_of_core=None,
+    form=None,
+    collective_id=COLLECTIVE_ID,
+):
+    """Block ``order[c]`` of ``x`` summed onto mesh core ``c`` of axis ``axis``
+    (default ``order = 0..num_cores - 1``), inside a shard_map over that axis."""
     total, hidden = x.shape
     n = num_cores
     if hidden % LANES:
         raise ValueError(f"hidden {hidden} is not a multiple of {LANES} lanes")
     if total % n:
         raise ValueError(f"{total} rows do not split over {n} cores")
+    order = normalize_rank_of_core(rank_of_core, n)
     rows = total // n
     padded = -(-rows // SUBLANES) * SUBLANES
-    impl = (_hier_reduce_scatter if
-            (form or
-             ("hier" if n == 8 else "flat")) == "hier" else _reduce_scatter)
+    resolved_form = form or ("hier" if n == 8 else "flat")
+    if resolved_form not in ("hier", "flat"):
+        raise ValueError(f"unknown form {form!r}; expected 'hier' or 'flat'")
+    if resolved_form == "hier" and n != 8:
+        raise ValueError(f"form='hier' requires num_cores=8, got {n}")
+    impl = _hier_reduce_scatter if resolved_form == "hier" else _reduce_scatter
     if padded == rows:
-        return impl(x, n, axis, rank, collective_id)
+        return impl(x, n, axis, rank, order, collective_id)
     x = jnp.pad(x.reshape(n, rows, hidden),
                 ((0, 0), (0, padded - rows), (0, 0)))
-    out = impl(x.reshape(n * padded, hidden), n, axis, rank, collective_id)
+    out = impl(x.reshape(n * padded, hidden), n, axis, rank, order,
+               collective_id)
     return out[:rows]
 
 
-def _hier_reduce_scatter(x, n, axis, rank, collective_id):
+def _hier_reduce_scatter(x, n, axis, rank, order, collective_id):
     """2-stage topology-aware Reduce-Scatter on 8 cores (4 chips x 2 cores/chip):
-    Stage 1 (Intra-chip): Core `me` pushes the 4 blocks belonging to `partner = me ^ 1`'s
-      subcore parity (`r = 2*c + (1 - subcore)` for c in 0..3) to `s1_recv` on `partner`,
-      and sums its own 4 parity blocks (`r = 2*c + subcore`) with `s1_recv` into `chip_blocks`.
+    Stage 1 (Intra-chip): Core `me` pushes the 4 blocks belonging to
+      `partner = me ^ 1`'s subcore parity (`order[2*c + (1 - subcore)]`) to
+      `s1_recv` on `partner`, and sums its own 4 parity blocks
+      (`order[2*c + subcore]`) with `s1_recv` into `chip_blocks`.
     Stage 2 (Inter-chip): Core `me` pushes `chip_blocks[c]` for `c != chip` to
-      `(c << 1) | subcore` (3 inter-chip DMAs vs 6 in flat reduce-scatter) and sums the 4
-      chip blocks into `o_ref`.
+      `(c << 1) | subcore` (3 inter-chip DMAs vs 6 in flat reduce-scatter) and
+      sums the 4 chip blocks into `o_ref`.
     """
     total, hidden = x.shape
     rows = total // n
@@ -106,7 +112,7 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
         def _():
             for c in range(4):
                 push(
-                    x_ref.at[pl.ds((2 * c + 1) * rows, rows)],
+                    x_ref.at[pl.ds(order[2 * c + 1] * rows, rows)],
                     s1_recv.at[c],
                     send1,
                     recv1,
@@ -119,7 +125,7 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
         def _():
             for c in range(4):
                 push(
-                    x_ref.at[pl.ds((2 * c) * rows, rows)],
+                    x_ref.at[pl.ds(order[2 * c] * rows, rows)],
                     s1_recv.at[c],
                     send1,
                     recv1,
@@ -133,18 +139,18 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
         @pl.when(subcore == 0)
         def _():
             for c in range(4):
-                chip_blocks[c] = (x_ref[pl.ds(
-                    (2 * c) * rows, rows), :].astype(jnp.float32) +
-                                  s1_recv[c].astype(jnp.float32)).astype(
-                                      x_ref.dtype)
+                chip_blocks[c] = (
+                    x_ref[pl.ds(order[2 * c] * rows, rows), :].astype(
+                        jnp.float32) + s1_recv[c].astype(jnp.float32)).astype(
+                            x_ref.dtype)
 
         @pl.when(subcore == 1)
         def _():
             for c in range(4):
-                chip_blocks[c] = (x_ref[pl.ds(
-                    (2 * c + 1) * rows, rows), :].astype(jnp.float32) +
-                                  s1_recv[c].astype(jnp.float32)).astype(
-                                      x_ref.dtype)
+                chip_blocks[c] = (
+                    x_ref[pl.ds(order[2 * c + 1] * rows, rows), :].astype(
+                        jnp.float32) + s1_recv[c].astype(jnp.float32)).astype(
+                            x_ref.dtype)
 
         # Stage 2: Push chip_blocks[c] to peer `(c << 1) | subcore` for c != chip
         for c in range(4):
@@ -185,7 +191,7 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
     )
 
 
-def _reduce_scatter(x, n, axis, rank, collective_id):
+def _reduce_scatter(x, n, axis, rank, order, collective_id):
     total, hidden = x.shape
     rows = total // n
     dict_ids = rank is not None
@@ -194,26 +200,28 @@ def _reduce_scatter(x, n, axis, rank, collective_id):
         me, (x_ref, o_ref, slices, send_sem,
              recv_sem) = split_rank(refs, dict_ids, axis)
         barrier(n, axis, dict_ids)
-        # block r into slot `me` of core r's slices
-        for r in range(n):
+        # block order[c] into slot `me` of core c's slices
+        for c in range(n):
+            r = order[c]
 
-            @pl.when(jnp.int32(r) != me)
-            def _(r=r):
+            @pl.when(jnp.int32(c) != me)
+            def _(c=c, r=r):
                 push(
                     x_ref.at[pl.ds(r * rows, rows)],
                     slices.at[me],
                     send_sem,
                     recv_sem,
-                    r,
+                    c,
                     axis,
                     dict_ids,
                 )
 
         # my own block: a static row slice picked by a scalar compare
-        for r in range(n):
+        for c in range(n):
+            r = order[c]
 
-            @pl.when(jnp.int32(r) == me)
-            def _(r=r):
+            @pl.when(jnp.int32(c) == me)
+            def _(c=c, r=r):
                 slices[pl.ds(me, 1)] = x_ref[pl.ds(r * rows, rows), :][None]
 
         wait_bytes_of(slices.at[pl.ds(0, n - 1)], recv_sem)
@@ -227,152 +235,3 @@ def _reduce_scatter(x, n, axis, rank, collective_id):
     ]
     return call(kernel, x, rows, rank, scratch, collective_id,
                 f"small_reduce_scatter_r{rows}")
-
-
-def small_all_gather_pair(
-    x,
-    logits,
-    *,
-    num_cores,
-    axis="d",
-    rank=None,
-    my_rank=None,
-    dict_ids=None,
-    collective_id=GATHER_COLLECTIVE_ID,
-):
-    """Fused all-gather of (x, logits) across `num_cores` cores in rank order.
-
-    Each core provides `x` [rows, hidden] and `logits` [rows, num_experts] for
-    its own rank `my_rank` (or mesh index if `my_rank` is None), and receives
-    ([num_cores * rows, hidden], [num_cores * rows, num_experts]) with block r
-    holding rank r's rows.
-    """
-    rows, hidden = x.shape
-    l_rows, num_experts = logits.shape
-    if rows != l_rows:
-        raise ValueError(f"row mismatch: x has {rows}, logits has {l_rows}")
-    if hidden % LANES:
-        raise ValueError(f"hidden {hidden} is not a multiple of {LANES} lanes")
-    if num_experts % LANES:
-        raise ValueError(
-            f"num_experts {num_experts} is not a multiple of {LANES} lanes")
-    n = num_cores
-    if n == 1:
-        return x, logits
-    if dict_ids is None:
-        dict_ids = rank is not None
-
-    if rows % SUBLANES:
-        padded_rows = pl.cdiv(rows, SUBLANES) * SUBLANES
-        x_pad = jnp.pad(x, ((0, padded_rows - rows), (0, 0)))
-        logits_pad = jnp.pad(logits, ((0, padded_rows - rows), (0, 0)))
-        out_x, out_logits = small_all_gather_pair(
-            x_pad,
-            logits_pad,
-            num_cores=n,
-            axis=axis,
-            rank=rank,
-            my_rank=my_rank,
-            dict_ids=dict_ids,
-            collective_id=collective_id,
-        )
-        out_x = out_x.reshape(n, padded_rows,
-                              hidden)[:, :rows, :].reshape(n * rows, hidden)
-        out_logits = out_logits.reshape(n, padded_rows,
-                                        num_experts)[:, :rows, :].reshape(
-                                            n * rows, num_experts)
-        return out_x, out_logits
-
-    permuted = my_rank is not None
-
-    def kernel(*refs):
-        me, refs = split_rank(refs, rank is not None, axis)
-        if permuted:
-            my_rank_ref, *refs = refs
-            mine = my_rank_ref[0]
-        else:
-            mine = me
-        (
-            x_ref,
-            logits_ref,
-            o_x_ref,
-            o_logits_ref,
-            x_slices,
-            logits_slices,
-            send_x_sem,
-            recv_x_sem,
-            send_logits_sem,
-            recv_logits_sem,
-        ) = refs
-        barrier(n, axis, dict_ids)
-        for r in range(n):
-
-            @pl.when(jnp.int32(r) == mine)
-            def _(r=r):
-                for j in range(n):
-
-                    @pl.when(jnp.int32(j) != me)
-                    def _(j=j):
-                        push(
-                            x_ref,
-                            x_slices.at[r],
-                            send_x_sem,
-                            recv_x_sem,
-                            j,
-                            axis,
-                            dict_ids,
-                        )
-                        push(
-                            logits_ref,
-                            logits_slices.at[r],
-                            send_logits_sem,
-                            recv_logits_sem,
-                            j,
-                            axis,
-                            dict_ids,
-                        )
-
-                x_slices[pl.ds(r, 1)] = x_ref[...][None]
-                logits_slices[pl.ds(r, 1)] = logits_ref[...][None]
-
-        wait_bytes_of(x_slices.at[pl.ds(0, n - 1)], recv_x_sem)
-        wait_bytes_of(logits_slices.at[pl.ds(0, n - 1)], recv_logits_sem)
-        for r in range(n):
-            o_x_ref[r] = x_slices[r]
-            o_logits_ref[r] = logits_slices[r]
-        wait_bytes_of(x_slices.at[pl.ds(0, n - 1)], send_x_sem)
-        wait_bytes_of(logits_slices.at[pl.ds(0, n - 1)], send_logits_sem)
-
-    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
-    in_specs = []
-    args = []
-    if rank is not None:
-        in_specs.append(smem)
-        args.append(rank.astype(jnp.int32))
-    if permuted:
-        in_specs.append(smem)
-        args.append(my_rank.astype(jnp.int32))
-    in_specs.extend([pl.BlockSpec(), pl.BlockSpec()])
-    args.extend([x, logits])
-
-    scratch = [
-        pltpu.VMEM((n, rows, hidden), x.dtype),
-        pltpu.VMEM((n, rows, num_experts), logits.dtype),
-        pltpu.SemaphoreType.DMA,
-        pltpu.SemaphoreType.DMA,
-        pltpu.SemaphoreType.DMA,
-        pltpu.SemaphoreType.DMA,
-    ]
-    out_x, out_logits = pl.pallas_call(
-        kernel,
-        out_shape=(
-            jax.ShapeDtypeStruct((n, rows, hidden), x.dtype),
-            jax.ShapeDtypeStruct((n, rows, num_experts), logits.dtype),
-        ),
-        in_specs=in_specs,
-        scratch_shapes=scratch,
-        compiler_params=pltpu.CompilerParams(collective_id=collective_id),
-        name=f"small_all_gather_pair_r{rows}",
-    )(*args)
-    return out_x.reshape(n * rows,
-                         hidden), out_logits.reshape(n * rows, num_experts)

@@ -256,6 +256,46 @@ def test_combine_goes_through_the_small_collective_bridge(
     group.reduce_scatter.assert_called_once_with(x, dim=0)
 
 
+def test_dispatch_router_logits_uses_fused_dp_dispatch_when_eligible(
+        monkeypatch, communicator):
+    group = Mock(world_size=8)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    hidden = torch.zeros(1, 4096, dtype=torch.bfloat16)
+    logits = torch.zeros(1, 512, dtype=torch.float32)
+    expected = (
+        torch.ones(8, 4096, dtype=torch.bfloat16),
+        torch.ones(8, 512, dtype=torch.float32),
+    )
+    dp_dispatch = Mock(return_value=expected)
+    monkeypatch.setattr(comm.small_all_reduce_op, "dp_dispatch_or",
+                        dp_dispatch)
+
+    got = communicator.dispatch_router_logits(hidden, logits)
+    assert got is expected
+    assert dp_dispatch.call_count == 1
+    assert dp_dispatch.call_args.args[:2] == (hidden, logits)
+    group.all_gather.assert_not_called()
+
+
+def test_dispatch_router_logits_sliced_sp_bypasses_dp_dispatch_bridge(
+        monkeypatch, communicator):
+    ep_group = Mock(world_size=8)
+    ep_group.all_gather.side_effect = lambda x, dim: torch.cat([x, x], dim=dim)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    monkeypatch.setattr(comm.sequence_parallel, "_ACTIVE", True)
+    dp_dispatch = Mock()
+    monkeypatch.setattr(comm.small_all_reduce_op, "dp_dispatch_or",
+                        dp_dispatch)
+
+    hidden = torch.zeros(8, 4096, dtype=torch.bfloat16)
+    logits = torch.zeros(8, 512, dtype=torch.float32)
+    got_h, got_lg = communicator.dispatch_router_logits(
+        hidden, logits, is_sequence_parallel=True)
+    assert got_h.shape == (16, 4096) and got_lg.shape == (16, 512)
+    assert ep_group.all_gather.call_count == 2
+    dp_dispatch.assert_not_called()
+
+
 def _replicated_dp4(monkeypatch):
     ep_group = Mock(world_size=8)
     dp_group = Mock(world_size=4)
@@ -330,22 +370,3 @@ def test_packed_router_gather_only_on_replicated_dp_same_dtype(
         dp_group.all_gather.assert_not_called()
     else:
         assert dp_group.all_gather.call_count == 2
-
-
-def test_dispatch_router_logits_uses_fused_dp_dispatch_when_eligible(
-        monkeypatch, communicator):
-    group = Mock(world_size=8)
-    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
-    hidden = torch.zeros(1, 4096, dtype=torch.bfloat16)
-    logits = torch.zeros(1, 512, dtype=torch.float32)
-    expected = (
-        torch.ones(8, 4096, dtype=torch.bfloat16),
-        torch.ones(8, 512, dtype=torch.float32),
-    )
-    dp_dispatch = Mock(return_value=expected)
-    monkeypatch.setattr(comm.small_all_reduce_op, "dp_dispatch", dp_dispatch)
-
-    got = communicator.dispatch_router_logits(hidden, logits)
-    assert got is expected
-    dp_dispatch.assert_called_once_with(hidden, logits)
-    group.all_gather.assert_not_called()

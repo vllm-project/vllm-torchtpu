@@ -26,6 +26,9 @@ import sympy
 import torch
 import vllm
 from torch import fx, nn
+from torch._dynamo.source import (LocalSource, TensorProperty,
+                                  TensorPropertySource)
+from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 from torch.utils._sympy.value_ranges import ValueRanges
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (CompilationConfig, CompilationMode, DeviceConfig,
@@ -36,10 +39,12 @@ import vllm_torchtpu
 import vllm_torchtpu.env_override
 from vllm_torchtpu.compilation import shape_variants, tpu_compiler
 from vllm_torchtpu.compilation.shape_variants import unsupported_reason
+from vllm_torchtpu.layers.adapter import small_all_reduce_op
 
 if not hasattr(vllm,
                "__version__"):  # namespace-package quirk in the CPU image
     import importlib.metadata
+
     vllm.__version__ = importlib.metadata.version("vllm")
 
 HIDDEN = 8
@@ -52,6 +57,23 @@ _lib.impl("wave", lambda x: x + 1.0, "CPU")
 torch.library.register_fake("tpu_shape_variants_test::wave",
                             lambda x: torch.empty_like(x))
 WAVE = torch.ops.tpu_shape_variants_test.wave
+# Stands in for the small-collective kernels: same operands, opaque to Dynamo.
+_lib.define("small_collective(Tensor x, Tensor rank) -> Tensor")
+_lib.impl("small_collective", lambda x, rank: x.clone(), "CPU")
+torch.library.register_fake("tpu_shape_variants_test::small_collective",
+                            lambda x, rank: torch.empty_like(x))
+_lib.define(
+    "small_collective_pair(Tensor x, Tensor logits, Tensor rank) -> (Tensor, Tensor)"
+)
+_lib.impl(
+    "small_collective_pair",
+    lambda x, logits, rank: (x.clone(), logits.clone()),
+    "CPU",
+)
+torch.library.register_fake(
+    "tpu_shape_variants_test::small_collective_pair",
+    lambda x, logits, rank: (torch.empty_like(x), torch.empty_like(logits)),
+)
 
 
 @support_torch_compile(dynamic_arg_dims={"x": 0})
@@ -88,6 +110,53 @@ class FlatModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return WAVE(x)
+
+
+def _small_collective_input(x: torch.Tensor) -> torch.Tensor:
+    # The bridge takes bf16 rows whose width is a whole number of lane tiles.
+    return x.to(torch.bfloat16).repeat(1, 128 // HIDDEN)
+
+
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class SmallAllReduceModel(nn.Module):
+    """A TP all-reduce through the small-collective bridge (rows <= MAX_ROWS take
+    the kernel), with ``wave`` as vLLM's all-reduce."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = small_all_reduce_op.all_reduce_or(_small_collective_input(x),
+                                              (0, ), WAVE)
+        return y.float()[:, :HIDDEN]
+
+
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class SmallCombineModel(nn.Module):
+    """The same for the DP combine, with ``wave`` as vLLM's reduce-scatter."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = small_all_reduce_op.dp_combine_or(_small_collective_input(x), WAVE)
+        return y.float()[:, :HIDDEN]
+
+
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class SmallDispatchModel(nn.Module):
+    """The same for the DP dispatch pair, with ``wave`` standing in for XLA's
+    all-gather."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        inp = _small_collective_input(x)
+        logits = inp.float()
+        y, lg = small_all_reduce_op.dp_dispatch_or(inp, logits, lambda h, r:
+                                                   (WAVE(h), r))
+        return (y.float() + lg)[:, :HIDDEN]
 
 
 @dataclasses.dataclass
@@ -159,8 +228,10 @@ def count_starts() -> Starts:
     from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 
     counts = Starts()
-    load, compile_ = (decorators._try_load_aot_compiled_fn,
-                      TorchCompileWithNoGuardsWrapper.aot_compile)
+    load, compile_ = (
+        decorators._try_load_aot_compiled_fn,
+        TorchCompileWithNoGuardsWrapper.aot_compile,
+    )
 
     def counted_load(model, path):
         found = load(model, path)
@@ -187,9 +258,11 @@ def make_config(splitting_ops=None) -> VllmConfig:
     try:
         config = VllmConfig(
             device_config=DeviceConfig(device="cpu"),
-            scheduler_config=SchedulerConfig(max_num_batched_tokens=MAX_TOKENS,
-                                             max_model_len=MAX_TOKENS,
-                                             is_encoder_decoder=False),
+            scheduler_config=SchedulerConfig(
+                max_num_batched_tokens=MAX_TOKENS,
+                max_model_len=MAX_TOKENS,
+                is_encoder_decoder=False,
+            ),
             compilation_config=CompilationConfig(
                 mode=CompilationMode.VLLM_COMPILE,
                 backend="",  # defers to TpuPlatform.get_compile_backend()
@@ -213,10 +286,12 @@ def make_config(splitting_ops=None) -> VllmConfig:
 
 def prepare(cache_root: str, splitting_ops=None):
     """What the pipeline needs, set up inside the child process."""
-    os.environ.update(VLLM_CACHE_ROOT=cache_root,
-                      VLLM_DISABLE_COMPILE_CACHE="0",
-                      VLLM_USE_AOT_COMPILE="1",
-                      VLLM_USE_MEGA_AOT_ARTIFACT="0")
+    os.environ.update(
+        VLLM_CACHE_ROOT=cache_root,
+        VLLM_DISABLE_COMPILE_CACHE="0",
+        VLLM_USE_AOT_COMPILE="1",
+        VLLM_USE_MEGA_AOT_ARTIFACT="0",
+    )
     # The cache keys hash a ModelConfig these tests do not build.
     tpu_compiler.compute_tpu_compilation_hash = lambda config: "test"
     # TpuPlatform.check_and_update_config() installs this, and these tests skip
@@ -397,9 +472,12 @@ def _split_graph_is_refused(cache_root):
     config, _ = prepare(cache_root,
                         splitting_ops=["tpu_shape_variants_test::wave"])
     model = build(WaveModel, config)
-    with pytest.raises(shape_variants.ShapeSpecializationError,
-                       match="cannot be handed over"):
+    try:
         warm(model, config)
+    except Exception as exc:
+        assert "TPU_KERNEL_ITER_MODE" in str(exc)
+    else:
+        raise AssertionError("a split graph handed a bucket over anyway")
 
 
 def test_split_graph_cannot_hand_buckets_between_traces(tmp_path):
@@ -413,8 +491,10 @@ def _warm_start_reuses_the_cache(cache_root):
     assert backend.compiled == [(16, 1), (2048, 1), (4096, 2)]
     assert (starts.traced, starts.loaded) == (2, 0)  # one trace per group
 
-    # Reloading must preserve the bucket boundary. The first graph must
-    # refuse 4096 rather than adopt an executable with incompatible buffers.
+    # Second start, same cache dir: nothing is compiled, and the ladder still
+    # splits at the same bucket -- the first graph must refuse 4096 on the load
+    # path too, or it would adopt an executable it cannot call (on TPU:
+    # "Donation requested for invalid buffer").
     torch._dynamo.reset()
     backend.compiled.clear()
     model = build(WaveModel, config)
@@ -459,9 +539,8 @@ def test_a_refused_bucket_nobody_retraced_raises(tmp_path):
 
 def test_warmup_scope_survives_a_failure():
     """A failed warmup must not leave the session pinned for the next one."""
-    with pytest.raises(RuntimeError):
-        with shape_variants.warmup():
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), shape_variants.warmup():
+        raise RuntimeError("boom")
     assert shape_variants._session is None
 
 
@@ -474,41 +553,15 @@ def test_a_guard_the_range_cannot_express_still_refuses():
     symbol = sympy.Symbol("s0", positive=True, integer=True)
     env = SimpleNamespace(
         var_to_range={symbol: ValueRanges(2, 8192)},
-        guards=[SimpleNamespace(expr=sympy.Eq(sympy.Mod(symbol, 3), 0))])
+        guards=[SimpleNamespace(expr=sympy.Eq(sympy.Mod(symbol, 3), 0))],
+    )
 
     assert unsupported_reason(env, 2049) is None  # 2049 % 3 == 0, holds
     assert unsupported_reason(env, 2048) is not None  # provably violated
 
 
-def test_signature_delta_names_the_few_inputs_that_differ():
-    """Report only inputs that differ between traces."""
-    shared = [("torch.bfloat16", (4096, ))] * 1245
-    cached = tuple(shared + [("torch.int32", ())] * 60 + [("torch.bool",
-                                                           (256, ))])
-    current = tuple(shared + [("torch.int32", (8, )), ("torch.int32", (1, 1))])
-
-    delta = shape_variants._signature_delta(cached, current)
-
-    assert "1306 inputs vs 1247" in delta
-    assert "60x ('torch.int32', ())" in delta
-    assert "1x ('torch.bool', (256,))" in delta
-    assert "1x ('torch.int32', (8,))" in delta
-    assert "('torch.bfloat16', (4096,))" not in delta  # unchanged inputs
-
-
-def test_signature_delta_when_only_the_order_differs():
-    """Ignore ordering when reporting signature differences."""
-    a = (("torch.int32", ()), ("torch.bool", (4, )))
-    b = (("torch.bool", (4, )), ("torch.int32", ()))
-
-    assert a != b
-    assert shape_variants._signature_delta(
-        a, b) == ("2 inputs vs 2. Only in the earlier trace: nothing. "
-                  "Only in this one: nothing")
-
-
 def test_env_override_keeps_the_mega_artifact_off():
-    """Disable the mega artifact because its load path requires Inductor."""
+    """It is inductor-only on the load side; see the commit for why."""
     with patch.dict(os.environ, clear=False) as env:
         env.pop("VLLM_USE_MEGA_AOT_ARTIFACT", None)
         importlib.reload(vllm_torchtpu.env_override)
@@ -517,6 +570,17 @@ def test_env_override_keeps_the_mega_artifact_off():
         # The write only means something while vLLM still reads this name.
         assert "VLLM_USE_MEGA_AOT_ARTIFACT" in vllm.envs.environment_variables
         assert vllm.envs.VLLM_USE_MEGA_AOT_ARTIFACT is False
+
+
+@pytest.mark.parametrize("field", ["guards", "expr"])
+def test_missing_guard_field_cannot_accept_a_bucket(field):
+    symbol = sympy.Symbol("s0", integer=True)
+    guard = SimpleNamespace(expr=sympy.Eq(sympy.Mod(symbol, 3), 0))
+    env = SimpleNamespace(var_to_range={symbol: ValueRanges(2, 8192)},
+                          guards=[guard])
+    delattr(env if field == "guards" else guard, field)
+    with pytest.raises(AttributeError, match=field):
+        unsupported_reason(env, 2048)
 
 
 def _stub_graph(order, metas=None):
@@ -528,49 +592,82 @@ def _stub_graph(order, metas=None):
             "dp_metadata": torch.empty(3, dtype=torch.int32),
         }
     graph = fx.Graph()
-    outs = []
+    nodes = []
     for name in order:
         node = graph.placeholder(name)
         node.meta["val"] = metas[name]
-        outs.append(node)
-    graph.output(tuple(outs))
+        nodes.append(node)
+    graph.output(tuple(nodes))
     return fx.GraphModule(nn.Module(), graph)
 
 
+STORED_ORDER = ["hidden_states", "gate_weight", "dp_metadata"]
+
+
 def test_handover_reorders_a_permuted_input_list():
-    """Reorder equivalent inputs during executable handoff."""
     session = shape_variants.BucketExecutables()
     received = []
-    session.put("dir", "key",
-                _stub_graph(["hidden_states", "gate_weight", "dp_metadata"]),
-                lambda *args: received.append(args))
+    session.put("dir", "key", _stub_graph(STORED_ORDER),
+                lambda *a: received.append(a))
 
     runnable = session.get(
         "dir", "key",
         _stub_graph(["hidden_states", "dp_metadata", "gate_weight"]))
-
-    hidden = torch.zeros(4, HIDDEN, dtype=torch.bfloat16)
-    gate = torch.zeros(HIDDEN, 2, dtype=torch.bfloat16)
-    meta = torch.zeros(3, dtype=torch.int32)
-    runnable(hidden, meta, gate)  # the new trace's order
-    assert received == [(hidden, gate, meta)]  # the executable's order
+    runnable("hidden", "meta", "gate")  # this trace's order
+    assert received == [("hidden", "gate", "meta")]  # the executable's order
 
 
-def test_handover_without_permutation_returns_the_runnable_itself():
-    """An identical input list must not pay the reordering shim."""
+def test_handover_of_an_identical_input_list_returns_the_runnable():
     session = shape_variants.BucketExecutables()
     compiled = lambda *args: args  # noqa: E731
-    order = ["hidden_states", "gate_weight", "dp_metadata"]
-    session.put("dir", "key", _stub_graph(order), compiled)
-    assert session.get("dir", "key", _stub_graph(order)) is compiled
+    session.put("dir", "key", _stub_graph(STORED_ORDER), compiled)
+    assert session.get("dir", "key", _stub_graph(STORED_ORDER)) is compiled
 
 
-def test_handover_still_refuses_a_changed_input():
-    """A name whose dtype/shape moved is a real difference, not a shuffle."""
+def test_handover_reorders_equal_type_inputs_by_name():
+    metas = {
+        "gate_weight": torch.empty(1, dtype=torch.int32),
+        "dp_metadata": torch.empty(1, dtype=torch.int32),
+    }
     session = shape_variants.BucketExecutables()
-    session.put("dir", "key",
-                _stub_graph(["hidden_states", "gate_weight", "dp_metadata"]),
-                lambda *args: args)
+    received = []
+    session.put("dir", "key", _stub_graph(list(metas), metas),
+                lambda *a: received.append(a))
+    runnable = session.get("dir", "key",
+                           _stub_graph(["dp_metadata", "gate_weight"], metas))
+    runnable("metadata", "weight")
+    assert received == [("weight", "metadata")]
+
+
+def test_handover_of_renamed_inputs_matches_by_position():
+    renamed = {
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "gate": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+        "meta": torch.empty(3, dtype=torch.int32),
+    }
+    session = shape_variants.BucketExecutables()
+    compiled = lambda *args: args  # noqa: E731
+    session.put("dir", "key", _stub_graph(STORED_ORDER), compiled)
+    assert session.get("dir", "key", _stub_graph(list(renamed),
+                                                 renamed)) is compiled
+
+
+def test_handover_of_renamed_inputs_refuses_a_positional_mismatch():
+    renamed = {
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "meta": torch.empty(3, dtype=torch.int32),
+        "gate": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+    }
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", _stub_graph(STORED_ORDER), lambda *a: a)
+    with pytest.raises(shape_variants.ShapeSpecializationError,
+                       match="TPU_KERNEL_ITER_MODE"):
+        session.get("dir", "key", _stub_graph(list(renamed), renamed))
+
+
+def test_handover_refuses_an_input_whose_shape_changed():
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", _stub_graph(STORED_ORDER), lambda *a: a)
     changed = {
         "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
         "gate_weight": torch.empty(HIDDEN, 4, dtype=torch.bfloat16),  # wider
@@ -579,41 +676,159 @@ def test_handover_still_refuses_a_changed_input():
     with pytest.raises(shape_variants.ShapeSpecializationError,
                        match="gate_weight"):
         session.get(
-            "dir", "key",
+            "dir",
+            "key",
             _stub_graph(["hidden_states", "dp_metadata", "gate_weight"],
-                        changed))
+                        changed),
+        )
 
 
-def test_handover_still_refuses_a_different_input_set():
-    """An input only one trace has cannot be matched by any reordering."""
+@pytest.mark.parametrize(
+    "order",
+    [
+        ["hidden_states", "router_bias", "dp_metadata"],  # a different input
+        ["hidden_states", "gate_weight"],  # a missing input
+    ],
+)
+def test_handover_refuses_a_different_input_set(order):
     session = shape_variants.BucketExecutables()
-    session.put("dir", "key",
-                _stub_graph(["hidden_states", "gate_weight", "dp_metadata"]),
-                lambda *args: args)
-    other = {
+    session.put("dir", "key", _stub_graph(STORED_ORDER), lambda *a: a)
+    metas = {
         "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "gate_weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
         "router_bias": torch.empty(2, dtype=torch.bfloat16),
         "dp_metadata": torch.empty(3, dtype=torch.int32),
     }
     with pytest.raises(shape_variants.ShapeSpecializationError,
                        match="TPU_KERNEL_ITER_MODE"):
-        session.get(
-            "dir", "key",
-            _stub_graph(["hidden_states", "router_bias", "dp_metadata"],
-                        other))
+        session.get("dir", "key", _stub_graph(order, metas))
 
 
-def test_handover_reorders_equal_type_inputs_by_name():
-    """Equal dtype/shape inputs still need their name-derived permutation."""
-    metas = {
-        "gate_weight": torch.empty(1, dtype=torch.int32),
-        "dp_metadata": torch.empty(1, dtype=torch.int32),
+def test_signature_delta_names_only_the_inputs_that_differ():
+    shared = [("torch.bfloat16", (4096, ))] * 1245
+    stored = tuple(shared + [("torch.int32", ())] * 60 + [("torch.bool",
+                                                           (256, ))])
+    current = tuple(shared + [("torch.int32", (8, )), ("torch.int32", (1, 1))])
+
+    delta = shape_variants._signature_delta(stored, current)
+
+    assert "1306 inputs vs 1247" in delta
+    assert "60x ('torch.int32', ())" in delta
+    assert "1x ('torch.bool', (256,))" in delta
+    assert "1x ('torch.int32', (8,))" in delta
+    assert "torch.bfloat16" not in delta  # the 1245 both traces take
+
+
+def test_signature_delta_ignores_order():
+    a = (("torch.int32", ()), ("torch.bool", (4, )))
+    assert shape_variants._signature_delta(a, a[::-1]) == (
+        "2 inputs vs 2. Only in the earlier trace: nothing. Only in this one: nothing"
+    )
+
+
+def _token_symint(shape_env, source, hint=4):
+    symbol = shape_env.create_symbol(hint,
+                                     source,
+                                     dynamic_dim=DimDynamic.DYNAMIC)
+    return shape_env.create_symintnode(symbol, hint=hint, source=source)
+
+
+def _int_graph(order, metas, sources=()):
+    """A GraphModule with the given placeholders, int ones among them;
+    ``sources`` maps a name to the Dynamo source it was read from."""
+    graph = fx.Graph()
+    for name in order:
+        node = graph.placeholder(name)
+        node.meta["val"] = metas[name]
+        if name in sources:
+            node.meta["grapharg"] = SimpleNamespace(source=sources[name])
+    graph.output(tuple(graph.nodes))
+    return fx.GraphModule(nn.Module(), graph)
+
+
+POSITIONS_SIZE = TensorPropertySource(LocalSource("positions"),
+                                      TensorProperty.SIZE, 0)
+HIDDEN_SIZE = TensorPropertySource(LocalSource("hidden"), TensorProperty.SIZE,
+                                   0)
+
+
+def _int_metas():
+    env = ShapeEnv()
+    return {
+        "s_pos": _token_symint(env, POSITIONS_SIZE),
+        "s_hid": _token_symint(env, HIDDEN_SIZE),
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
     }
+
+
+def test_input_delta_names_the_int_input_one_trace_dropped():
+    metas = _int_metas()
+    sources = {"s_pos": POSITIONS_SIZE, "s_hid": HIDDEN_SIZE}
+    stored = _int_graph(["s_pos", "s_hid", "hidden", "weight"], metas, sources)
+    current = _int_graph(["s_pos", "hidden", "weight"], metas, sources)
     session = shape_variants.BucketExecutables()
-    received = []
-    session.put("dir", "key", _stub_graph(list(metas), metas),
-                lambda *args: received.append(args))
-    runnable = session.get("dir", "key",
-                           _stub_graph(["dp_metadata", "gate_weight"], metas))
-    runnable("metadata", "weight")
-    assert received == [("weight", "metadata")]
+    session.put("dir", "key", stored, lambda *a: a)
+
+    with pytest.raises(shape_variants.ShapeSpecializationError) as info:
+        session.get("dir", "key", current)
+
+    message = str(info.value)
+    assert "4 inputs vs 3" in message
+    assert "Named, earlier trace: s_hid SymInt" in message
+    assert "from L['hidden'].size()[0]" in message
+    assert "in this trace" in message  # what the current ShapeEnv knows of it
+    assert "s_pos" not in message.split("Named")[1]  # both traces take it
+
+
+def _arm_small_collectives():
+    small_all_reduce_op._AR_OP = torch.ops.tpu_shape_variants_test.small_collective
+    small_all_reduce_op._RS_OP = torch.ops.tpu_shape_variants_test.small_collective
+    small_all_reduce_op._AG_OP = (
+        torch.ops.tpu_shape_variants_test.small_collective_pair)
+    small_all_reduce_op._RANK = torch.tensor([0], dtype=torch.int32)
+    small_all_reduce_op._CORES = 1
+    small_all_reduce_op._MESH_RANKS = (0, )
+    small_all_reduce_op._DP_COMBINE = True
+
+
+def _small_collective_fork_hands_buckets_over(cache_root, model_name, retain):
+    config, backend = prepare(cache_root)
+    _arm_small_collectives()
+    saved_retain = small_all_reduce_op.retain
+    try:
+        if not retain:
+            small_all_reduce_op.retain = lambda out, rank=None: out
+        model = build(globals()[model_name], config)
+        if not retain:
+            # Positive control: the fallback trace lifts no rank buffer, so the
+            # bucket the kernel trace compiled cannot be handed to it.
+            with pytest.raises(Exception, match="token-count branch"):
+                warm(model, config)
+            return
+        assert warm(model, config) == 1
+        # 16 rows took the kernel, 2048 and 4096 vLLM's collective (one wave op).
+        assert backend.compiled == [(16, 0), (2048, 1), (4096, 1)]
+        CALLS.clear()
+        for num_tokens in BUCKETS:
+            assert run(model, config, num_tokens).shape[0] == num_tokens
+        assert CALLS == [(16, 0), (2048, 1), (4096, 1)]
+    finally:
+        small_all_reduce_op.retain = saved_retain
+
+
+@pytest.mark.parametrize("retain", [True, False], ids=["retain", "no_retain"])
+@pytest.mark.parametrize(
+    "model_name",
+    ["SmallAllReduceModel", "SmallCombineModel", "SmallDispatchModel"],
+)
+def test_small_collective_row_fork_hands_buckets_over(tmp_path, model_name,
+                                                      retain):
+    """Both sides of the small-collective row fork lift the rank buffer."""
+    in_child(
+        partial(
+            _small_collective_fork_hands_buckets_over,
+            str(tmp_path),
+            model_name,
+            retain,
+        ))
