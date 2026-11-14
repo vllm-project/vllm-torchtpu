@@ -67,6 +67,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant_op
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
@@ -378,6 +379,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
     _checkpoint_alignment: int | None = None
+    # Set by `gated_norm_quant_op.install` (the Qwen3.5 rule in the runner).
+    fused_norm_quant: bool = False
 
     # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
@@ -1143,6 +1146,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         core_attn_out = core_attn_out.view(
             num_tokens, local_num_v_heads, self.head_v_dim
         )
+        if self.fused_norm_quant:
+            return gated_norm_quant_op.output_projection(self, core_attn_out, z)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
@@ -1198,6 +1203,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
@@ -1212,20 +1218,40 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 attn_metadata,
             )
 
+        def _project(layer, x, pq):
+            if pq is None:
+                out, _ = layer(x)
+                return out
+            apply_pq = getattr(layer.quant_method, "apply_prequant", None)
+            bias = (
+                None
+                if getattr(layer, "skip_bias_add", False)
+                else getattr(layer, "bias", None)
+            )
+            if apply_pq is None:
+                if bias is None:
+                    out, _ = layer(pq[0].to(torch.bfloat16))
+                    return (out.to(torch.float32) * pq[1]).to(out.dtype)
+                rows = (pq[0].to(torch.float32) * pq[1]).to(torch.bfloat16)
+                out, _ = layer(rows)
+                return out
+            return apply_pq(layer, pq[0], pq[1], bias)
+
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
         if hasattr(self, "in_proj_qkv"):
-            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
-            z, _ = self.in_proj_z(hidden_states)
-            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            mixed_qkv = _project(self.in_proj_qkv, hidden_states, prequant)
+            ba = _project(self.in_proj_ba, hidden_states, prequant)
+            z = _project(self.in_proj_z, hidden_states, prequant)
+            if not self.fused_norm_quant:
+                z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
             a = a.contiguous()
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            mixed_qkvz = _project(self.in_proj_qkvz, hidden_states, prequant)
+            ba = _project(self.in_proj_ba, hidden_states, prequant)
 
             # Every checkpoint loader produces [q, k, v, z] and [b, a].
             qkv_size = self.tp_head_geometry.local_conv_dim(
@@ -1233,7 +1259,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
             z_size = self.value_dim // self.tp_size
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            if not self.fused_norm_quant:
+                z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
             a = a.contiguous()
