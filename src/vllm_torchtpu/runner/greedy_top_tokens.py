@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING, cast
 import torch
 from vllm.lora.layers import LogitsProcessorWithLoRA
 
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter.dp_vocab_parallel import DP_VOCAB_ATTR
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -81,13 +83,23 @@ def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Mo
             "TPU_GREEDY_TOP_TOKENS: the argmax reduction needs a positive "
             f"logit scale, got {processor.scale}; unset TPU_GREEDY_TOP_TOKENS."
         )
-    if dp_lockstep and head.tp_size > 1:
-        # An idle engine issues the full-logits collective in lockstep with
-        # its busy peers, which would be waiting in the pair exchange.
+    if dp_lockstep and head.tp_size > 1 and not getattr(head, DP_VOCAB_ATTR, False):
+        # Without TPU_DP_VOCAB_PARALLEL, chunks are not padded to a DP-wide
+        # request row count, so busy and idle engines would enter TP
+        # collectives at different shapes.
+        if envs.TPU_DP_VOCAB_PARALLEL:
+            raise NotImplementedError(
+                "TPU_GREEDY_TOP_TOKENS with expert-parallel data parallelism and a "
+                "tensor-parallel LM head needs an LM head sharded over DP, but "
+                "TPU_DP_VOCAB_PARALLEL=1 fell back to tensor parallelism (see the "
+                "earlier 'Ignoring TPU_DP_VOCAB_PARALLEL' warning); unset "
+                "TPU_GREEDY_TOP_TOKENS or use tensor parallelism alone."
+            )
         raise NotImplementedError(
             "TPU_GREEDY_TOP_TOKENS with expert-parallel data parallelism and a "
-            "tensor-parallel LM head is not supported; unset "
-            "TPU_GREEDY_TOP_TOKENS or use tensor parallelism alone."
+            "tensor-parallel LM head requires TPU_DP_VOCAB_PARALLEL=1; unset "
+            "TPU_GREEDY_TOP_TOKENS, enable TPU_DP_VOCAB_PARALLEL, or use tensor "
+            "parallelism alone."
         )
     return module
 
