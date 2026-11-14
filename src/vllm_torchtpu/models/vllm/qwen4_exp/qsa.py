@@ -852,7 +852,11 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         ):
             return
         k_norm = getattr(self, "k_norm", None)
-        if k_norm is None:
+        # Only main-KV DCP layers reach the bound-stabilized kernel. The MTP
+        # draft's keys are far longer (its k_norm reaches |1 + w| ~ 7.3, about
+        # 3.4x the target layers'), so it never raises the shared bound; if it
+        # runs DCP (VLLM_TPU_QSA_MTP_KV_DCP) the wrapper's high guard re-runs it.
+        if k_norm is None or self.main_kv_dcp <= 1 or "mtp" in self.prefix:
             return
 
         weight = k_norm.weight.detach().to("cpu", torch.float32)

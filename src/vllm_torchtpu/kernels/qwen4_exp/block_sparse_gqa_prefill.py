@@ -89,6 +89,7 @@ _KEY_NORM_BOUND = None
 BOUND_STAB_MARGIN = 1.1
 BOUND_STAB_SHIFT = 60.0
 BOUND_STAB_GUARD = -55.0  # rerun when lse - stabilizer < this (log mass)
+BOUND_STAB_GUARD_HIGH = 65.0  # rerun when lse - stabilizer > this (bound violated)
 
 
 def bound_stab_enabled(env_value: str, config_value) -> bool:
@@ -2037,7 +2038,13 @@ def block_sparse_gqa_attention(
         has_key = live_rows & jnp.any(owned, axis=1)[:, None]
         low = live_rows & jnp.isfinite(lse) & (lse - stab < BOUND_STAB_GUARD)
         lost = has_key & jnp.isneginf(lse)
-        rerun = jnp.any(low | lost)
+        # A layer whose keys exceed the bound (not one that noted it) can only
+        # push probabilities up: e^65 x 448 x 37888 < FP32 max, so rows under
+        # the high guard cannot have overflowed; rows above it re-run.
+        high = live_rows & (
+            jnp.isnan(lse) | jnp.isposinf(lse) | (lse - stab > BOUND_STAB_GUARD_HIGH)
+        )
+        rerun = jnp.any(low | lost | high)
         marks = os.environ.get("VLLM_TPU_QSA_BOUND_STAB_MARKS", "")
         if marks:
             # Debug (xprof-visible, no host callback): per threshold t, a
