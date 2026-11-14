@@ -234,6 +234,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     runner = SimpleNamespace(
         _pp_handoff=None if pp_is_last else handoff,
         _dp_step_other_decode=False,
+        _thinking_budget=None,
         _pp_is_first=True,
         _pp_is_last=pp_is_last,
         _pp_pending_scheduler_output=None,

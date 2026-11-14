@@ -75,6 +75,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         _pp_handoff=None,
         _dp_step_other_decode=False,
         num_prompt_logprobs={},
+        _thinking_budget=None,
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],
