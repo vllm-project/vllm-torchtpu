@@ -31,6 +31,8 @@ import time
 ENV = "VLLM_TPU_STARTUP_TRACE"
 
 _installed: set[str] = set()
+# Cleared when worker.compile_or_warm_up_model returns (see _wrap).
+_active = [True]
 
 
 def enabled() -> bool:
@@ -92,6 +94,10 @@ def _wrap(cls, attr: str, name=None) -> None:
 
     @functools.wraps(fn)
     def traced(self, *args, **kwargs):
+        # Startup only: once compile_or_warm_up_model has returned, the wrapped
+        # methods that also run per step (compiles, sampler calls) stay silent.
+        if not _active[0]:
+            return fn(self, *args, **kwargs)
         try:
             n = label(self, args, kwargs) if callable(label) else label
         except Exception:  # noqa: BLE001 - a name must never break startup
@@ -104,6 +110,8 @@ def _wrap(cls, attr: str, name=None) -> None:
             if stacks:
                 _stack_dumps_stop()
             _emit("end", n)
+            if n == "worker.compile_or_warm_up_model":
+                _active[0] = False
 
     traced._startup_traced = True  # type: ignore[attr-defined]
     setattr(cls, attr, traced)
@@ -173,8 +181,42 @@ def install_runner(cls) -> None:
             and callable(vars(cls)[attr])
         ):
             _wrap(cls, attr, attr.lstrip("_"))
+    # The compiled spec-verify preludes the rejection-sampler precompile warms
+    # per (padded_logits_length, num_reqs) bucket, named by their logits shape.
+    for attr in (
+        "spec_bonus_and_target_logits",
+        "spec_bonus_and_target_tokens",
+        "spec_gather_bonus_and_target_logits",
+    ):
+        _wrap(cls, attr, lambda s, a, k, _n=attr: _shape_name(_n, a))
+    try:
+        from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+            RejectionSampler,
+        )
+
+        _wrap(
+            RejectionSampler,
+            "__call__",
+            lambda s, a, k: "rejection_sampler"
+            + ("-sampling" if k.get("do_sampling") else "-greedy")
+            + ("-topk" if k.get("topk_candidates") is not None else "")
+            + _shape_suffix(k.get("draft_token_ids")),
+        )
+    except Exception:  # noqa: BLE001
+        pass
     install_loaders()
     install_compiler()
+
+
+def _shape_suffix(t) -> str:
+    try:
+        return "-" + "x".join(str(int(d)) for d in t.shape)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _shape_name(name: str, args) -> str:
+    return name + (_shape_suffix(args[0]) if args else "")
 
 
 def install_loaders() -> None:
