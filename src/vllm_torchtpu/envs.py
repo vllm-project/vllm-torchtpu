@@ -231,6 +231,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
+    TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
+    TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
 
 
 def env_with_choices(
@@ -1439,6 +1441,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_MINIMAX_M3_MSA_PREFILL_* flags apply only to `msa_attend_dcp`.
     "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG": env_str(
         "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG", ""
+    ),
+    # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
+    # how its sorts run. Empty keeps three stable sorts (two of two operands);
+    # "unstable" drops the stability; "packed" sorts one packed int32 operand
+    # per sort, unstable; "packed_search" also finds the distinct keys by a
+    # binary search instead of the second sort. Same table bit for bit.
+    "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT": env_str(
+        "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT", ""
+    ),
+    # MiniMax M3 MSA prefill page cache: narrower table widths below
+    # TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_TILE_PAGES, '/'-separated (e.g.
+    # "64/128"). Each layer's calls sort the narrowest width that holds their
+    # widest tile union (one branch of the same program). Same table bit for
+    # bit. Empty always sorts TILE_PAGES entries per tile.
+    "TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS": env_str(
+        "TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS", ""
     ),
 }
 

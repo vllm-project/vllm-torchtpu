@@ -173,42 +173,157 @@ def _fp4_scales(scale_ref, k_row, v_row):
     return jnp.where(jnp.isfinite(sk), sk, 0.0), jnp.where(jnp.isfinite(sv), sv, 0.0)
 
 
-def _page_cache(pages: jax.Array, num_tiles: int, cache_size: int) -> jax.Array:
+def _packed_sort_fits(n: int, cache_size: int, key_bound: int) -> bool:
+    """Whether `_page_cache`'s packed sorts of `n` entries fit 31 bits."""
+    pos_bits = max(1, (n - 1).bit_length())
+    slot_bits = (cache_size + 1).bit_length()
+    return (key_bound + 1) << pos_bits < 1 << 31 and pos_bits + slot_bits <= 31
+
+
+def _page_cache(
+    pages: jax.Array,
+    num_tiles: int,
+    cache_size: int,
+    width: int = 0,
+    mode: str = "",
+    key_bound: int = 0,
+) -> jax.Array:
     """A call's unions (`msa_attention._work_list`: `num_tiles` rows, ``-1``
     padded) -> ``[unions' cache slots | distinct keys (cache_size) | count |
     fits]``: each union entry's slot among the call's distinct page keys
     (``-1`` for padding; the key itself when they do not all fit), the first
     `cache_size` distinct keys ascending, their count, and whether they all
-    fit. Only the first `PAGE_CACHE_TILE_PAGES` of each union are sorted (a
-    call with a wider union streams). Sorts only, no gather or scatter."""
+    fit. Only the first `width` (default `PAGE_CACHE_TILE_PAGES`) of each
+    union are sorted (a call with a wider union streams). Sorts only, no
+    gather or scatter.
+
+    `mode` (TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT) changes only how the sorts
+    run: "unstable" drops their stability (equal keys get equal slots in any
+    order); "packed" sorts one int32 per entry, the key (``< key_bound``,
+    padding as ``key_bound``) above the entry position and the position above
+    ``slot + 1`` (clamped at ``cache_size + 1``: past it the call streams and
+    the slots are not used); "packed_search" finds the distinct keys by a
+    binary search of the slot counts instead of a sort. Callers check
+    `_packed_sort_fits` for the packed modes. The table is the same bit for
+    bit."""
     rows = pages.reshape(num_tiles, -1)
-    width = min(PAGE_CACHE_TILE_PAGES, rows.shape[1])
+    width = min(width or PAGE_CACHE_TILE_PAGES, rows.shape[1])
     head = rows[:, :width].reshape(-1)
-    key = jnp.where(head < 0, msa_attention._NO_PAGE, head)
-    position = jnp.arange(key.shape[0], dtype=jnp.int32)
-    key, position = jax.lax.sort((key, position), num_keys=1)
-    new = jnp.concatenate([key[:1] != msa_attention._NO_PAGE, key[1:] != key[:-1]])
-    new = new & (key != msa_attention._NO_PAGE)
+    if mode in ("packed", "packed_search"):
+        n = head.shape[0]
+        pos_bits = max(1, (n - 1).bit_length())
+        slot_bits = (cache_size + 1).bit_length()
+        no_page = key_bound
+        key = jnp.where(head < 0, no_page, head)
+        position = jnp.arange(n, dtype=jnp.int32)
+        packed = jax.lax.sort((key << pos_bits) | position, is_stable=False)
+        key = packed >> pos_bits
+        position = packed & ((1 << pos_bits) - 1)
+    else:
+        no_page = msa_attention._NO_PAGE
+        key = jnp.where(head < 0, no_page, head)
+        position = jnp.arange(key.shape[0], dtype=jnp.int32)
+        key, position = jax.lax.sort(
+            (key, position), num_keys=1, is_stable=mode != "unstable"
+        )
+    new = jnp.concatenate([key[:1] != no_page, key[1:] != key[:-1]])
+    new = new & (key != no_page)
     slot = jnp.cumsum(new, dtype=jnp.int32) - 1
     num_distinct = slot[-1] + 1
-    distinct = jnp.sort(jnp.where(new, key, msa_attention._NO_PAGE))[:cache_size]
-    distinct = jnp.pad(
-        distinct,
-        (0, cache_size - distinct.shape[0]),
-        constant_values=msa_attention._NO_PAGE,
-    )
-    _, slot = jax.lax.sort((position, slot), num_keys=1)
+    if mode == "packed_search":
+        # Slot counts ascend: the j-th distinct key is the first entry whose
+        # slot reaches j.
+        nth = jnp.arange(cache_size, dtype=jnp.int32)
+        at = jnp.searchsorted(slot, nth, side="left", method="scan")
+        distinct = jnp.where(
+            nth < num_distinct, key[jnp.minimum(at, key.shape[0] - 1)], no_page
+        )
+    else:
+        distinct = jax.lax.sort(
+            jnp.where(new, key, no_page), is_stable=mode == ""
+        )[:cache_size]
+        distinct = jnp.pad(
+            distinct,
+            (0, cache_size - distinct.shape[0]),
+            constant_values=no_page,
+        )
+    if mode in ("packed", "packed_search"):
+        by_position = jax.lax.sort(
+            (position << slot_bits) | jnp.minimum(slot + 1, cache_size + 1),
+            is_stable=False,
+        )
+        slot = (by_position & ((1 << slot_bits) - 1)) - 1
+    else:
+        _, slot = jax.lax.sort(
+            (position, slot), num_keys=1, is_stable=mode != "unstable"
+        )
     slot = jnp.where(head < 0, -1, slot).reshape(num_tiles, width)
     slot = jnp.pad(slot, ((0, 0), (0, rows.shape[1] - width)), constant_values=-1)
     fits = (num_distinct <= cache_size) & jnp.all(rows[:, width:] < 0)
     return jnp.concatenate(
         [
             jnp.where(fits, slot.reshape(-1), pages),
-            jnp.where(distinct == msa_attention._NO_PAGE, 0, distinct),
+            jnp.where(distinct == no_page, 0, distinct),
             jnp.minimum(num_distinct, cache_size)[None],
             fits.astype(jnp.int32)[None],
         ]
     ).astype(jnp.int32)
+
+
+def _page_cache_tables(
+    unions: jax.Array, num_tiles: int, cache_size: int, key_bound: int
+) -> jax.Array:
+    """`_page_cache` of each call's unions ``[calls, union entries]``, with
+    the sort mode of TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT and, with
+    TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS, the narrowest table width that holds
+    every call's widest tile union (a `lax.switch` in the same program; a
+    union never passes the width its branch sorts, so every branch's table
+    is the full width's)."""
+    from vllm_torchtpu import envs
+
+    full = min(PAGE_CACHE_TILE_PAGES, unions.shape[1] // num_tiles)
+    mode = envs.TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT.strip().lower()
+    if mode not in ("", "unstable", "packed", "packed_search"):
+        raise ValueError(f"TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT={mode!r}")
+    spec = envs.TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS.replace(",", "/")
+    widths = sorted({int(w) for w in spec.split("/") if w.strip()})
+    widths = [w for w in widths if 0 < w < full] + [full]
+    if mode in ("packed", "packed_search") and not _packed_sort_fits(
+        num_tiles * full, cache_size, key_bound
+    ):
+        mode = "unstable"
+    if mode:
+        _proof(
+            "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT",
+            f"MSA prefill page cache table sorts {mode}",
+        )
+    if len(widths) > 1:
+        _proof(
+            "TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS",
+            f"MSA prefill page cache table widths {widths} by widest union",
+        )
+
+    def build(w):
+        return jax.vmap(
+            functools.partial(
+                _page_cache,
+                num_tiles=num_tiles,
+                cache_size=cache_size,
+                width=w,
+                mode=mode,
+                key_bound=key_bound,
+            )
+        )
+
+    if len(widths) == 1:
+        return build(full)(unions)
+    rows = unions.reshape(unions.shape[0], num_tiles, -1)
+    # Unions are -1 past their pages: a width holds every union when nothing
+    # past it is a page.
+    branch = sum(
+        jnp.any(rows[:, :, w:] >= 0).astype(jnp.int32) for w in widths[:-1]
+    )
+    return jax.lax.switch(branch, [build(w) for w in widths], unions)
 
 
 def _kernel(
@@ -1281,11 +1396,12 @@ def _chunked_call(
         union_len = (step // block_q) * msa_attention._groups_per_tile(
             block_q, selected.shape[2], pages_per_step
         ) * pages_per_step
-        table = jax.vmap(
-            functools.partial(
-                _page_cache, num_tiles=step // block_q, cache_size=cache_size
-            )
-        )(packed[:, :union_len])
+        table = _page_cache_tables(
+            packed[:, :union_len],
+            num_tiles=step // block_q,
+            cache_size=cache_size,
+            key_bound=page_table.shape[0],
+        )
         packed = jnp.concatenate(
             [table[:, :union_len], packed[:, union_len:], table[:, union_len:]], axis=1
         )
