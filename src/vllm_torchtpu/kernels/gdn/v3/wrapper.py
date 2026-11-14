@@ -332,7 +332,7 @@ def outer_kernel(
     ),
 )
 def fused_conv1d_gdn(
-    qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
+    qkv: jax.Array,  # [batch_size, dim_size] or prepacked [batch_size, 1, dim_size]
     b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
     states: jax.Array | tuple[jax.Array, jax.Array],
@@ -372,8 +372,10 @@ def fused_conv1d_gdn(
     """Perform conv1d and gdn in a single fused kernel.
 
     Args:
-        qkv: Mixed query, key, value input tensor of shape [batch_size, dim_size],
-            where `dim_size = n_kq * d_k * 2 + n_v * d_v`.
+        qkv: Mixed query, key, value input tensor of shape `[batch_size, dim_size]`
+            or prepacked `float32[batch_size, 1, dim_size]`, where
+            `dim_size = n_kq * d_k * 2 + n_v * d_v`. When 3D `float32` `qkv` is
+            supplied, the output activation dtype matches `b.dtype`.
         b: b tensor (for beta) of shape [batch_size, n_v].
         a: a tensor (for g) of shape [batch_size, n_v].
         conv_state: Convolution state cache tensor of shape [num_seqs + 1,
@@ -456,7 +458,23 @@ def fused_conv1d_gdn(
             f"kernel_act_dtype must be float32; got {jnp.dtype(kernel_act_dtype).name}."
         )
 
-    act_out_dtype = qkv.dtype
+    if qkv.ndim == 3:
+        if qkv.shape[1] != 1 or jnp.dtype(qkv.dtype) != jnp.dtype(kernel_act_dtype):
+            raise ValueError(
+                "3D prepacked qkv must have shape [batch_size, 1, dim_size] and "
+                f"dtype {jnp.dtype(kernel_act_dtype).name}; got shape={qkv.shape}, "
+                f"dtype={qkv.dtype}."
+            )
+        act_out_dtype = b.dtype
+        prepacked_qkv = True
+    elif qkv.ndim == 2:
+        act_out_dtype = qkv.dtype
+        prepacked_qkv = False
+    else:
+        raise ValueError(
+            "qkv must be 2D [batch_size, dim] or 3D [batch_size, 1, dim]; "
+            f"got {qkv.shape}."
+        )
 
     is_shared = isinstance(states, jax.Array)
     if is_shared:
@@ -480,7 +498,8 @@ def fused_conv1d_gdn(
             f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
         )
 
-    qkv = qkv.astype(kernel_act_dtype)
+    if not prepacked_qkv:
+        qkv = qkv.astype(kernel_act_dtype)
     b = b.astype(kernel_act_dtype)
     a = a.astype(kernel_act_dtype)
 
@@ -504,7 +523,8 @@ def fused_conv1d_gdn(
             )
 
     num_seqs = state_indices.size
-    batch_size, dim = qkv.shape
+    batch_size = qkv.shape[0]
+    dim = qkv.shape[-1]
     assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
@@ -611,11 +631,14 @@ def fused_conv1d_gdn(
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    if not prepacked_qkv:
+        qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+        qkv = qkv.reshape(padded_batch_size, 1, -1)
+    else:
+        assert batch_padding_size == 0
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
     b = b.reshape(padded_batch_size, 1, -1)
     a = a.reshape(padded_batch_size, 1, -1)
 

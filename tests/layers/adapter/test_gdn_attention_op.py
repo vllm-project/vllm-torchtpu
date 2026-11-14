@@ -1938,3 +1938,250 @@ def test_flipped_qkvz_fp8_block_weight_is_the_kept_one_transposed(
     assert kept_weight.shape == weight.shape
     torch.testing.assert_close(flipped_weight, kept_weight.T, rtol=0, atol=0)
     torch.testing.assert_close(flipped_scale, kept_scale, rtol=0, atol=0)
+
+
+def test_pack_qkvz_op_registration_sharing_and_mesh_none(
+    make_gdn_attention, monkeypatch
+):
+    """TPU_GDN_PACK_QKVZ builds and shares one op per geometry, stays None when
+    off, and tolerates mesh=None during CPU/checkpoint export."""
+    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "tpu7x-8")
+    gdn_attention_op.get_chip_version.cache_clear()
+
+    # Flag off: no pack op registered.
+    monkeypatch.delenv("TPU_GDN_PACK_QKVZ", raising=False)
+    attn_off, vllm_config = make_gdn_attention(1, 0)
+    assert attn_off.gdn_pack_qkvz_op is None
+
+    # Flag on: registered once and reused across layers with matching geometry,
+    # and fake registrations return float32 3D qkv + bf16 3D z / core_attn_out.
+    registered_fakes = {}
+
+    def capture_jax_op(name, fn, **_kwargs):
+        op = MagicMock(name=name, side_effect=fn)
+
+        def register_fake(fake_fn):
+            registered_fakes[name] = fake_fn
+
+        op.register_fake.side_effect = register_fake
+        return op
+
+    monkeypatch.setenv("TPU_GDN_PACK_QKVZ", "1")
+    monkeypatch.setattr(gdn_attention_op.pallas, "jax_op", capture_jax_op)
+    gdn_attention_op._shared_gdn_ops.clear()
+
+    attn_1, _ = make_gdn_attention(1, 0)
+    attn_2, _ = make_gdn_attention(1, 0)
+    assert attn_1.gdn_pack_qkvz_op is not None
+    assert attn_1.gdn_pack_qkvz_op is attn_2.gdn_pack_qkvz_op
+
+    pack_fakes = [
+        fn for name, fn in registered_fakes.items() if "gdn_split_pack_qkvz" in name
+    ]
+    assert len(pack_fakes) == 1
+    qkv_size = attn_1.tp_head_geometry.local_conv_dim(
+        attn_1.head_k_dim, attn_1.head_v_dim
+    )
+    z_size = attn_1.value_dim // attn_1.tp_size
+    fake_qkv, fake_z = pack_fakes[0](
+        torch.empty((16, qkv_size + z_size), dtype=torch.bfloat16)
+    )
+    assert fake_qkv.shape == (16, 1, qkv_size)
+    assert fake_qkv.dtype == torch.float32
+    assert fake_z.shape == (16, attn_1.num_v_heads, attn_1.head_v_dim)
+    assert fake_z.dtype == torch.bfloat16
+
+    pooled_fakes = [fn for name, fn in registered_fakes.items() if "pooled" in name]
+    assert len(pooled_fakes) >= 1
+    _, fake_pooled_out = pooled_fakes[0](
+        fake_qkv,
+        torch.empty((16, attn_1.num_v_heads), dtype=torch.bfloat16),
+        torch.empty((16, attn_1.num_v_heads), dtype=torch.bfloat16),
+        torch.empty((4, 2, 128, 128), dtype=torch.float32),
+    )
+    assert fake_pooled_out.dtype == torch.bfloat16
+
+    regular_fakes = [
+        fn
+        for name, fn in registered_fakes.items()
+        if "pooled" not in name
+        and "pcp" not in name
+        and "gdn_split_pack_qkvz" not in name
+    ]
+    assert len(regular_fakes) >= 1
+    _, _, fake_reg_out = regular_fakes[0](
+        fake_qkv,
+        torch.empty((16, attn_1.num_v_heads), dtype=torch.bfloat16),
+        torch.empty((16, attn_1.num_v_heads), dtype=torch.bfloat16),
+        torch.empty((4, 3, qkv_size), dtype=torch.float32),
+        torch.empty((4, attn_1.num_v_heads, 128, 128), dtype=torch.float32),
+    )
+    assert fake_reg_out.dtype == torch.bfloat16
+
+    # CPU/checkpoint export passes mesh=None; construction must succeed.
+    with (
+        torch.device("cpu"),
+        set_current_vllm_config(vllm_config),
+        set_vllm_model_wrapper_context(mesh=None, vllm_config=vllm_config),
+    ):
+        attn_export = VllmGatedDeltaNetAttention(
+            config=vllm_config.model_config.hf_text_config,
+            vllm_config=vllm_config,
+            prefix="model.layers.1.linear_attn",
+            gqa_interleaved_layout=False,
+        )
+    assert attn_export.gdn_pack_qkvz_op is attn_1.gdn_pack_qkvz_op
+
+
+def test_pack_qkvz_forward_profile_pooled_split_and_mtp_guard(
+    make_gdn_attention, monkeypatch
+):
+    """Forward routes aligned steps through gdn_pack_qkvz_op during profile_run,
+    pooled kv_cache, and 2-tensor kv_cache, and falls back on unaligned rows,
+    PCP streaming, or compiled modules outside shape_variants warmup."""
+    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "tpu7x-8")
+    monkeypatch.setenv("TPU_GDN_PACK_QKVZ", "1")
+    gdn_attention_op.get_chip_version.cache_clear()
+
+    attn, _ = make_gdn_attention(1, 0)
+    for sub in (attn.in_proj_qkvz, attn.in_proj_ba, attn.out_proj):
+        sub.quant_method.process_weights_after_loading(sub)
+    qkv_size = attn.tp_head_geometry.local_conv_dim(attn.head_k_dim, attn.head_v_dim)
+    local_n_v = attn.num_v_heads // attn.tp_size
+    pack_calls = []
+    seen_qkv = []
+
+    def real_split_pack(mixed_qkvz: torch.Tensor):
+        pack_calls.append(tuple(mixed_qkvz.shape))
+        qkv = mixed_qkvz[:, :qkv_size].to(torch.float32).unsqueeze(1).contiguous()
+        z = (
+            mixed_qkvz[:, qkv_size:]
+            .clone()
+            .reshape(mixed_qkvz.size(0), local_n_v, attn.head_v_dim)
+        )
+        return qkv, z
+
+    def stub_core(mixed_qkv: torch.Tensor, b: torch.Tensor, *_args):
+        seen_qkv.append((tuple(mixed_qkv.shape), mixed_qkv.dtype))
+        return torch.zeros(
+            (mixed_qkv.size(0), local_n_v, attn.head_v_dim),
+            dtype=b.dtype,
+            device=b.device,
+        )
+
+    attn.gdn_pack_qkvz_op = real_split_pack
+    attn.gdn_pooled_op = stub_core
+    attn.gdn_op = stub_core
+
+    hidden_16 = torch.randn((16, 128), dtype=torch.bfloat16)
+
+    # 1. profile_run (kv_cache=None): runs pack_op for HBM accounting and returns bf16.
+    attn.kv_cache = None
+    out_prof = attn.forward(hidden_16)
+    assert out_prof.dtype == torch.bfloat16
+    assert len(pack_calls) == 1
+    assert seen_qkv == []
+
+    # 2. Unified pool (len(kv_cache) == 1) on aligned 16 rows.
+    metadata = SimpleNamespace(
+        mamba_state_indices=torch.tensor([1, 2], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 8, 16], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 2, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([8, 8], dtype=torch.int32),
+        mamba_prefill_ckpt_offsets=None,
+        mamba_prefill_ckpt_indices=None,
+    )
+    fwd_ctx = SimpleNamespace(attn_metadata={attn.prefix: metadata})
+    monkeypatch.setattr(gdn_attention_op, "get_forward_context", lambda: fwd_ctx)
+    attn.kv_cache = (torch.ones((4, 2, 128, 128), dtype=torch.float32),)
+    pack_calls.clear()
+    seen_qkv.clear()
+    out_pooled = attn.forward(hidden_16)
+    assert out_pooled.shape == (16, 128)
+    assert len(pack_calls) == 1
+    assert seen_qkv == [((16, 1, qkv_size), torch.float32)]
+
+    # 3. Split state (len(kv_cache) == 2) on aligned 16 rows vs unaligned 4 rows.
+    attn.kv_cache = (
+        torch.ones((4, 3, qkv_size), dtype=torch.float32),
+        torch.ones((4, local_n_v, 128, 128), dtype=torch.float32),
+    )
+    pack_calls.clear()
+    seen_qkv.clear()
+    attn.forward(hidden_16)
+    assert len(pack_calls) == 1
+    assert seen_qkv == [((16, 1, qkv_size), torch.float32)]
+
+    pack_calls.clear()
+    seen_qkv.clear()
+    attn.forward(torch.randn((4, 128), dtype=torch.bfloat16))
+    assert pack_calls == []
+    assert seen_qkv == [((4, qkv_size), torch.bfloat16)]
+
+    # 4. Compiled outside shape_variants warmup (e.g. MTP): skips pack_op.
+    @torch.library.custom_op("test_pack_qkvz::pack", mutates_args=())
+    def custom_pack(mixed_qkvz: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pack_calls.append(tuple(mixed_qkvz.shape))
+        qkv = mixed_qkvz[:, :qkv_size].to(torch.float32).unsqueeze(1).contiguous()
+        z = (
+            mixed_qkvz[:, qkv_size:]
+            .clone()
+            .reshape(mixed_qkvz.size(0), local_n_v, attn.head_v_dim)
+        )
+        return qkv, z
+
+    @custom_pack.register_fake
+    def _(mixed_qkvz: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty(
+                (mixed_qkvz.size(0), 1, qkv_size),
+                dtype=torch.float32,
+                device=mixed_qkvz.device,
+            ),
+            torch.empty(
+                (mixed_qkvz.size(0), local_n_v, attn.head_v_dim),
+                dtype=mixed_qkvz.dtype,
+                device=mixed_qkvz.device,
+            ),
+        )
+
+    @torch.library.custom_op("test_pack_qkvz::core", mutates_args=())
+    def custom_core(mixed_qkv: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        seen_qkv.append((tuple(mixed_qkv.shape), mixed_qkv.dtype))
+        return torch.zeros(
+            (mixed_qkv.size(0), local_n_v, attn.head_v_dim),
+            dtype=b.dtype,
+            device=b.device,
+        )
+
+    @custom_core.register_fake
+    def _(mixed_qkv: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.empty(
+            (mixed_qkv.size(0), local_n_v, attn.head_v_dim),
+            dtype=b.dtype,
+            device=b.device,
+        )
+
+    attn.gdn_pack_qkvz_op = custom_pack
+    attn.gdn_op = lambda mixed_qkv, b, *_args: custom_core(mixed_qkv, b)
+
+    pack_calls.clear()
+    seen_qkv.clear()
+    compiled_outside_warmup = torch.compile(
+        attn.forward, backend="eager", fullgraph=True
+    )
+    out_compiled = compiled_outside_warmup(hidden_16)
+    assert out_compiled.shape == (16, 128)
+    assert pack_calls == []
+    assert seen_qkv == [((16, qkv_size), torch.bfloat16)]
+
+    # 5. Inside shape_variants warmup: traces fullgraph with pack_op.
+    pack_calls.clear()
+    seen_qkv.clear()
+    monkeypatch.setattr(gdn_attention_op.shape_variants, "aot_cache_tag", lambda: "b16")
+    torch._dynamo.reset()
+    compiled_in_warmup = torch.compile(attn.forward, backend="eager", fullgraph=True)
+    out_warmup = compiled_in_warmup(hidden_16)
+    assert out_warmup.shape == (16, 128)
+    assert len(pack_calls) == 1
+    assert seen_qkv == [((16, 1, qkv_size), torch.float32)]

@@ -36,6 +36,7 @@ from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 _GDN_TP_AXIS_NAME = "tp"
+_MODEL_AXIS = "model"
 
 
 def _gdn_tp_axis_name(mesh: jax.sharding.Mesh) -> str | None:
@@ -114,8 +115,11 @@ def run_jax_gdn_attention(
           - new_recurrent_state: `(num_blocks, n_v, d_k, d_v)`
         - The output tensor of shape `(num_tokens, n_v * d_v)`.
     """
+    qkv_spec = (
+        P(None, None, _MODEL_AXIS) if j_mixed_qkv.ndim == 3 else P(None, _MODEL_AXIS)
+    )
     in_specs = (
-        P(None, "model"),  # j_mixed_qkv
+        qkv_spec,  # j_mixed_qkv
         P(None, "model"),  # j_b
         P(None, "model"),  # j_a
         (
@@ -960,8 +964,11 @@ def run_jax_gdn_attention_pooled(
         - The output tensor of shape `(num_tokens, n_v * d_v)`.
     """
     pool_spec = P(*([None] * recurrent_state.ndim))  # attention-shaped pool
+    qkv_spec = (
+        P(None, None, _MODEL_AXIS) if j_mixed_qkv.ndim == 3 else P(None, _MODEL_AXIS)
+    )
     in_specs = (
-        P(None, "model"),  # j_mixed_qkv
+        qkv_spec,  # j_mixed_qkv
         P(None, "model"),  # j_b
         P(None, "model"),  # j_a
         pool_spec,  # recurrent_state (attention-shaped pool)
