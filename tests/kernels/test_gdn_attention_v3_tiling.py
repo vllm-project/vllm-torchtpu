@@ -46,10 +46,18 @@ def test_triangular_inverse_preserves_every_row(chunk):
 
 
 @pytest.mark.parametrize("chunk", [17, 20, 31, 33])
-def test_triangular_inverse_rejects_incomplete_blocks(chunk):
-    with pytest.raises(ValueError, match="must be divisible by block size 16"):
-        compute_gdn.invert_triangular_matrix(
-            jnp.eye(chunk, dtype=jnp.float32)[None])
+def test_triangular_inverse_handles_non_multiple_blocks(chunk):
+    rng = np.random.default_rng(chunk)
+    lower = rng.normal(scale=0.02, size=(2, chunk, chunk)).astype(np.float32)
+    matrix = np.tril(lower, -1) + np.eye(chunk, dtype=np.float32)
+
+    actual = compute_gdn.invert_triangular_matrix(jnp.asarray(matrix))
+
+    assert actual.shape == matrix.shape
+    np.testing.assert_allclose(actual,
+                               np.linalg.inv(matrix),
+                               rtol=2e-5,
+                               atol=2e-6)
 
 
 @pytest.mark.parametrize(

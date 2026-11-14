@@ -413,8 +413,8 @@ def _warm_start_reuses_the_cache(cache_root):
     assert backend.compiled == [(16, 1), (2048, 1), (4096, 2)]
     assert (starts.traced, starts.loaded) == (2, 0)  # one trace per group
 
-        # Reloading must preserve the bucket boundary. The first graph must
-        # refuse 4096 rather than adopt an executable with incompatible buffers.
+    # Reloading must preserve the bucket boundary. The first graph must
+    # refuse 4096 rather than adopt an executable with incompatible buffers.
     torch._dynamo.reset()
     backend.compiled.clear()
     model = build(WaveModel, config)

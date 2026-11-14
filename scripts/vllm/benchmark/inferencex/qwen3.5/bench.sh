@@ -16,6 +16,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/check_client.sh"
 prepare_inferencex_client || exit 1
 

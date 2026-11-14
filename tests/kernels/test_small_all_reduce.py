@@ -6,7 +6,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.collectives import small_all_reduce as sar
 
@@ -32,8 +33,9 @@ def _blocks(rows, hidden, seed):
 
 def _run(mesh, blocks, rank_operand, form=None):
     n, rows, hidden = blocks.shape
-    x = jax.device_put(jnp.asarray(blocks).reshape(n * rows, hidden),
-                       NamedSharding(mesh, P(AXIS)))
+    x = jax.device_put(
+        jnp.asarray(blocks).reshape(n * rows, hidden),
+        NamedSharding(mesh, P(AXIS)))
     rank = jax.device_put(jnp.arange(n, dtype=jnp.int32),
                           NamedSharding(mesh, P(AXIS)))
 
@@ -86,8 +88,9 @@ def test_other_widths(hidden):
 def test_agrees_with_psum_within_its_rounding():
     mesh = _mesh()
     blocks = _blocks(16, 4096, seed=7)
-    x = jax.device_put(jnp.asarray(blocks).reshape(N * 16, 4096),
-                       NamedSharding(mesh, P(AXIS)))
+    x = jax.device_put(
+        jnp.asarray(blocks).reshape(N * 16, 4096),
+        NamedSharding(mesh, P(AXIS)))
     psum = jax.jit(
         jax.shard_map(lambda x: jax.lax.psum(x, AXIS),
                       mesh=mesh,

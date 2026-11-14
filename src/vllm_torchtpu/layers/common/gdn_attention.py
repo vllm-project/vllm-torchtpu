@@ -25,8 +25,6 @@ from jax.experimental.layout import Layout, with_layout_constraint
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.logger import init_logger
-
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,
                                            pooled_gdn_conv_state_bytes,
@@ -36,6 +34,7 @@ from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.layers.common.utils import \
     reorder_concatenated_tensor_for_sharding
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 logger = init_logger(__name__)
@@ -821,7 +820,8 @@ def run_jax_gdn_attention_pooled_local(
     """
 
     # the conv weight in the layer's layout [dim, 1, kernel] or the kernel's [kernel, 1, dim] (made once after loading)
-    conv_dim = conv_weight.shape[-1] if conv_weight.shape[0] == kernel_size else conv_weight.shape[0]
+    conv_dim = conv_weight.shape[-1] if conv_weight.shape[
+        0] == kernel_size else conv_weight.shape[0]
     # Fused conv+GDN kernel: both state regions stream directly
     # between the pool and the kernel's double-buffered pipeline (one
     # contiguous DMA per slot per region) — no external gather/scatter

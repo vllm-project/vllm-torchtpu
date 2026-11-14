@@ -21,8 +21,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import (compute_conv1d, compute_gdn,
                                           compute_kda, config, memory_ref,
-                                          metadata, vmem_ldst)
+                                          metadata)
 from vllm_torchtpu.kernels.gdn.v3 import tables_in_kernel as _tik
+from vllm_torchtpu.kernels.gdn.v3 import vmem_ldst
 
 
 def inner_kernel(
@@ -105,6 +106,10 @@ def inner_kernel(
         cfg=cfg,
     )
 
+    if carry_conv_scratch_ref is not None:
+        # The next tile resumes from the state after this tile's last token,
+        # which is the final checkpoint.
+        carry_conv_scratch_ref[...] = new_conv_state[:, -1]
     if cfg.state_plan is None:
         conv_state_slot_ref[...] = new_conv_state
     else:
@@ -114,18 +119,18 @@ def inner_kernel(
         for idx in range(cfg.seq_tile_size):
 
             for t in range(cfg.window_size):
+                src_conv = (carry_conv_scratch_ref[idx]
+                            if carry_conv_scratch_ref is not None
+                            and cfg.window_size == 1 else new_conv_state[idx,
+                                                                         t])
                 args = (conv_state_slot_ref.at[idx, t], cfg.state_plan.conv,
-                        new_conv_state[idx, t])
+                        src_conv)
                 if carry_conv_scratch_ref is None:
                     vmem_ldst.store_state_region(*args)
                 else:
                     # copy_out only DMAs the tile that ends a sequence.
                     pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
                         functools.partial(vmem_ldst.store_state_region, *args))
-    if carry_conv_scratch_ref is not None:
-        # The next tile resumes from the state after this tile's last token,
-        # which is the final checkpoint.
-        carry_conv_scratch_ref[...] = new_conv_state[:, -1]
 
     # Apply activation function.
     qkv_out_compact = jax.nn.silu(qkv_out_compact)
@@ -197,6 +202,8 @@ def inner_kernel(
 
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
+    if carry_recurrent_scratch_ref is not None:
+        carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
     if cfg.state_plan is None:
         recurrent_slot_ref[...] = new_recurrent_state.astype(
             recurrent_slot_ref.dtype)
@@ -204,16 +211,17 @@ def inner_kernel(
         for idx in range(cfg.seq_tile_size):
 
             for t in range(cfg.window_size):
+                src_recurrent = (carry_recurrent_scratch_ref[idx]
+                                 if carry_recurrent_scratch_ref is not None
+                                 and cfg.window_size == 1 else
+                                 new_recurrent_state[idx, t])
                 args = (recurrent_slot_ref.at[idx, t],
-                        cfg.state_plan.recurrent, new_recurrent_state[idx, t])
+                        cfg.state_plan.recurrent, src_recurrent)
                 if carry_recurrent_scratch_ref is None:
                     vmem_ldst.store_state_region(*args)
                 else:
                     pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
                         functools.partial(vmem_ldst.store_state_region, *args))
-
-    if carry_recurrent_scratch_ref is not None:
-        carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
 
 
 def outer_kernel(
@@ -299,14 +307,29 @@ def outer_kernel(
             allocations=allocations,
         )
 
-    _run()
+    @pl.when(num_tiles > 0)
+    def _():
+        _run()
 
 
 def outer_kernel_tables_in_kernel(
-    qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref,
-    qkv_ref, b_ref, a_ref, source_ref, _in_act, weights_ref,
-    out_ref, _source_out_ref,
-    *scratch, cfg_b: config.GDNConfig, cfg_p: config.GDNConfig, max_seqs: int,
+    qsl_ref,
+    seq_lens_ref,
+    state_ref,
+    read_ref,
+    dist_ref,
+    qkv_ref,
+    b_ref,
+    a_ref,
+    source_ref,
+    _in_act,
+    weights_ref,
+    out_ref,
+    _source_out_ref,
+    *scratch,
+    cfg_b: config.GDNConfig,
+    cfg_p: config.GDNConfig,
+    max_seqs: int,
     scratch_names: tuple[str, ...],
 ):
     """Both passes in one call, the routing tables built at entry from the raw
@@ -315,18 +338,43 @@ def outer_kernel_tables_in_kernel(
     sc = dict(zip(scratch_names, scratch))
     carry_conv = sc.pop("carry_conv_scratch_ref")
     carry_rec = sc.pop("carry_recurrent_scratch_ref")
-    meta_b, meta_p = _tik.fill_and_wrap(
-        qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref, sc, cfg_b,
-        cfg_p, max_seqs)
-    outer_kernel(meta_b, qkv_ref, b_ref, a_ref, source_ref, source_ref,
-                 None, weights_ref, out_ref, None, None, None, None,
-                 cfg=cfg_b)
+    meta_b, meta_p = _tik.fill_and_wrap(qsl_ref, seq_lens_ref, state_ref,
+                                        read_ref, dist_ref, sc, cfg_b, cfg_p,
+                                        max_seqs)
+
+    @pl.when(meta_b.num_tiles[...] > 0)
+    def _():
+        outer_kernel(meta_b,
+                     qkv_ref,
+                     b_ref,
+                     a_ref,
+                     source_ref,
+                     source_ref,
+                     None,
+                     weights_ref,
+                     out_ref,
+                     None,
+                     None,
+                     None,
+                     None,
+                     cfg=cfg_b)
 
     @pl.when(meta_p.num_tiles[...] > 0)
     def _():
-        outer_kernel(meta_p, qkv_ref, b_ref, a_ref, source_ref, source_ref,
-                     None, weights_ref, out_ref, None, None, carry_conv,
-                     carry_rec, cfg=cfg_p)
+        outer_kernel(meta_p,
+                     qkv_ref,
+                     b_ref,
+                     a_ref,
+                     source_ref,
+                     source_ref,
+                     None,
+                     weights_ref,
+                     out_ref,
+                     None,
+                     None,
+                     carry_conv,
+                     carry_rec,
+                     cfg=cfg_p)
 
 
 @jax.jit(
@@ -481,9 +529,7 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    qkv = qkv.astype(jnp.float32)
-    b = b.astype(jnp.float32)
-    a = a.astype(jnp.float32)
+    assert a.dtype == b.dtype == qkv.dtype
 
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
@@ -531,8 +577,7 @@ def fused_conv1d_gdn(
                                       1), (ckpt_indices.shape, num_seqs,
                                            num_spec_tokens)
         ckpt_indices = ckpt_indices.astype(jnp.int32)
-    act_in_dtype = qkv.dtype
-    assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
+    act_in_dtype = jnp.dtype(jnp.float32)
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
@@ -574,13 +619,16 @@ def fused_conv1d_gdn(
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
-    b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
-    a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
+    if batch_padding_size:
+        qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    if batch_padding_size or num_v_padding_size:
+        b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
+    if batch_padding_size or gate_padding_size:
+        a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
-    b = b.reshape(padded_batch_size, 1, -1)
-    a = a.reshape(padded_batch_size, 1, -1)
+    qkv = qkv.reshape(padded_batch_size, 1, -1).astype(jnp.float32)
+    b = b.reshape(padded_batch_size, 1, -1).astype(jnp.float32)
+    a = a.reshape(padded_batch_size, 1, -1).astype(jnp.float32)
 
     # Step 3: States and weights pre-processing.
     if not pooled:
@@ -741,8 +789,10 @@ def fused_conv1d_gdn(
         n_raw = 5
         input_output_aliases = {n_raw + 3: 1, n_raw + 4: 0}
         return pl.pallas_call(
-            functools.partial(outer_kernel_tables_in_kernel, cfg_b=cfg_b,
-                              cfg_p=cfg_p, max_seqs=max_seqs,
+            functools.partial(outer_kernel_tables_in_kernel,
+                              cfg_b=cfg_b,
+                              cfg_p=cfg_p,
+                              max_seqs=max_seqs,
                               scratch_names=names),
             out_shape=(in_act, in_source),
             in_specs=(smem_spec, smem_spec, smem_spec, smem_spec, smem_spec,
@@ -759,8 +809,9 @@ def fused_conv1d_gdn(
             name=cfg_b.get_kernel_name() + "_tables_in",
             metadata=cfg_b.get_metadata(),
         )(query_start_loc.astype(jnp.int32), seq_lens.astype(jnp.int32),
-          state_indices.astype(jnp.int32), read_offsets, distribution.astype(jnp.int32),
-          qkv, b, a, in_source, in_act, weights)
+          state_indices.astype(jnp.int32), read_offsets,
+          distribution.astype(jnp.int32), qkv, b, a, in_source, in_act,
+          weights)
 
     if pooled:
         # the forms are static arguments (part of the jit cache key); no
