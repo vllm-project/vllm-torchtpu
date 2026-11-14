@@ -145,6 +145,13 @@ PATCHES = (
         "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",
         _ACTIVE,
     ),
+    # Logs the engine's parallel config from the API server's lifespan
+    # startup. Returns False in processes that have no launcher module
+    # (workers, engine core) so it is retried, not consumed.
+    Patch(
+        "vllm_torchtpu.observability.placement_hook:_patch_api_server_placement_hook",
+        _ACTIVE,
+    ),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
