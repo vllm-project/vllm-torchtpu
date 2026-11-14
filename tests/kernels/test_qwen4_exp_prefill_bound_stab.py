@@ -41,8 +41,8 @@ def interpret(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_LANE_SUM", "1")
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_LEAN", True)
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_LEAN_WRAPPER", True)
-    monkeypatch.delenv("VLLM_TPU_QSA_SMATTR", raising=False)
     monkeypatch.setattr(bsp, "_KEY_NORM_BOUND", None)
+    monkeypatch.setattr(bsp, "_TRACE_BOUND", [None])
 
 
 def make_case(rng, pieces, budget):
@@ -101,7 +101,7 @@ def kernel_only(case, rank, offset):
             kv_tile=PAGE, k_scale=K_SCALE, v_scale=V_SCALE, bf16_io=True,
             kv_head_offset=offset, query_tile=256, return_lse=True,
             dcp_rank=jnp.asarray([rank], jnp.int32), dcp_world=D, ascending=True,
-            bound_stab=True,
+            bound_stab=True, key_norm_bound=bsp.key_norm_bound(),
         )
     )(query, cache)
 
@@ -168,16 +168,6 @@ def test_note_key_norm_bound_keeps_max(monkeypatch):
     assert bsp.key_norm_bound() == 20.0
     with pytest.raises(ValueError):
         bsp.note_key_norm_bound(float("nan"))
-
-
-def test_debug_marks_do_not_change_outputs(interpret, monkeypatch):
-    case = make_case(np.random.default_rng(6), CASES["single"], 24)
-    bsp.note_key_norm_bound(case[-1])
-    plain = attend(case, 0, 1)
-    monkeypatch.setenv("VLLM_TPU_QSA_BOUND_STAB_MARKS", "0,20,40")
-    marked = attend(case, 0, 1)
-    for a, b in zip(marked, plain):
-        np.testing.assert_array_equal(bits(a), bits(b))
 
 
 @pytest.mark.parametrize(
@@ -313,3 +303,62 @@ def test_replicated_guard_reruns_online(interpret, monkeypatch):
 # DCP-vs-replicated agreement with the bound on both routes needs the paired
 # DCP / replicated pool layouts of the dcp2 harness: gate_bs.py arm "bound"
 # (TPU, j-03d65bf7: pre-gate 12/12 at 5-6e-6, gated 2 ulp).
+
+
+def attend_with_layer_bound(case, offset, weight):
+    """The QSA step's order in one trace: register the layer bound, then attend."""
+    query, blocks, lengths, table, cache, starts, _ = case
+    gate = jnp.zeros_like(query)
+    jax.clear_caches()
+
+    def step(q, c, w):
+        bsp.trace_key_norm_bound(w, DIM)
+        return bsp.block_sparse_gqa_attention(
+            q, gate, blocks, lengths, table, c, starts, kv_heads=1, ratio=RATIO,
+            k_scale=K_SCALE, v_scale=V_SCALE, query_block=256, kv_tile=PAGE,
+            query_tile=256, kv_head_offset=offset, return_lse=True,
+        )[:2]
+
+    return jax.jit(step)(query, cache, weight)
+
+
+def test_layer_bound_is_used_over_process_bound(interpret, monkeypatch):
+    """The registered layer bound, not the process bound, drives the kernel
+    and the guard. With an unusable process bound (100x too large: every row
+    under the low guard, so the call re-runs online, bitwise flag-off) the
+    layer's own correct bound runs the bound kernel with no re-run. The same
+    holds in the MTP direction (layer keys longer than the target bound)."""
+    case = make_case(np.random.default_rng(11), CASES["single"], 24)
+    want = attend_replicated(case, 0)  # online, flag off
+    bsp.note_key_norm_bound(case[-1] * 100)
+    fallback = attend_replicated(case, 0)
+    for a, b in zip(fallback, want):
+        np.testing.assert_array_equal(bits(a), bits(b))
+    weight = jnp.full((DIM,), case[-1] / np.sqrt(DIM) - 1.0, jnp.float32)
+    got = attend_with_layer_bound(case, 0, weight)
+    out_w, out_g = np.asarray(want[0]), np.asarray(got[0])
+    assert not np.array_equal(out_w, out_g)  # the bound kernel ran, no re-run
+    scale = np.maximum(np.abs(out_w).max(-1, keepdims=True), 1e-30)
+    assert float((np.abs(out_g - out_w) / scale).max()) < 8e-3
+    fin = np.isfinite(np.asarray(want[1]))
+    np.testing.assert_allclose(np.asarray(got[1])[fin], np.asarray(want[1])[fin], atol=4e-3)
+
+
+def test_stale_layer_bound_falls_back_to_process_bound(interpret, monkeypatch):
+    """A bound registered in a finished trace is dropped, not used."""
+    case = make_case(np.random.default_rng(12), CASES["single"], 24)
+    bsp.note_key_norm_bound(case[-1])
+    plain = attend_replicated(case, 0)
+    jax.jit(lambda w: (bsp.trace_key_norm_bound(w, DIM), w)[1])(jnp.zeros((DIM,)))
+    assert bsp._TRACE_BOUND[0] is not None
+    again = attend_replicated(case, 0)
+    for a, b in zip(again, plain):
+        np.testing.assert_array_equal(bits(a), bits(b))
+    assert bsp._TRACE_BOUND[0] is None
+
+
+def test_no_registration_when_off(monkeypatch):
+    monkeypatch.setattr(bsp, "_KEY_NORM_BOUND", None)
+    monkeypatch.setattr(bsp, "_TRACE_BOUND", [None])
+    bsp.trace_key_norm_bound(jnp.zeros((DIM,)), DIM)
+    assert bsp._TRACE_BOUND[0] is None

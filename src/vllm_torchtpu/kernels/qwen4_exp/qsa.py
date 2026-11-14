@@ -79,6 +79,11 @@ def produce_kv(key, value, nk, positions, trig, norm_eps, rotary_dim):
     key = key.reshape(len(key), key.shape[1] // head_dim, head_dim)
     value = value.reshape(len(value), value.shape[1] // head_dim, head_dim)
     key = main_rope(gemma_norm(key, nk, norm_eps), positions, trig, rotary_dim)
+    # VLLM_TPU_QSA_PREFILL_BOUND_STAB: this layer's key norm bound for the
+    # prefill attention traced next (no-op when the bound stabilizer is off).
+    from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as bsp
+
+    bsp.trace_key_norm_bound(nk, head_dim)
     return key, value
 
 

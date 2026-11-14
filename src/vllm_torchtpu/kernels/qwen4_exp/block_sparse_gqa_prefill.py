@@ -118,6 +118,56 @@ def key_norm_bound():
     return _KEY_NORM_BOUND
 
 
+# Per-layer bound: the QSA step (``qsa.produce_kv``) registers sqrt(D) *
+# max|1 + w_k| of the layer it is tracing, a traced scalar of that same
+# trace, and the prefill attention it then calls reads it. Layers whose keys
+# are longer than the target layers' (the MTP draft) get their own bound
+# instead of the high guard's online re-run.
+_TRACE_BOUND = [None]
+
+
+def trace_key_norm_bound(k_norm_weight, head_dim):
+    """Register this trace's layer bound from its k_norm weight (no-op when off)."""
+    if _KEY_NORM_BOUND is None:
+        return
+    weight = jnp.asarray(k_norm_weight).astype(jnp.float32)
+    _TRACE_BOUND[0] = math.sqrt(head_dim) * jnp.max(jnp.abs(1 + weight))
+
+
+def layer_key_norm_bound():
+    """The registered layer bound when it belongs to the current trace, else
+    the process-wide bound (a stale tracer from another trace is dropped)."""
+    bound = _TRACE_BOUND[0]
+    if bound is None:
+        return _KEY_NORM_BOUND
+    if _visible_in_current_trace(bound):
+        return bound
+    _TRACE_BOUND[0] = None
+    return _KEY_NORM_BOUND
+
+
+def _visible_in_current_trace(value) -> bool:
+    """True when ``value`` is a concrete array, or a tracer of the current
+    trace or of one it nests in (so a nested jit / shard_map may close over
+    it). Unknown JAX internals count as not visible (the caller then uses the
+    process-wide bound, which is always valid)."""
+    if not isinstance(value, jax.core.Tracer):
+        return True
+    try:
+        from jax._src import core as jax_core
+
+        trace = jax_core.trace_ctx.trace
+        for _ in range(64):
+            if trace is None:
+                return False
+            if value._trace is trace:
+                return True
+            trace = getattr(trace, "parent_trace", None)
+    except Exception:  # noqa: BLE001 - JAX internals moved: stay safe
+        return False
+    return False
+
+
 def bound_stabilizer(query, *, k_scale, bound):
     """The rows' stabilizer as the kernel forms it, [T, heads] f32 (``query``
     as passed to the kernel; ``k_scale`` folds into both q and the bound)."""
@@ -472,7 +522,7 @@ def _kernel(
     page_copies: bool = False,
     lazy: tuple = (),
     lane_sum: tuple = (),
-    key_norm_bound: float | None = None,
+    bound_stab: bool = False,
 ):
     # DCP: a fourth scalar operand holds this rank; its KV tiles are its owned
     # page-sized blocks only (local tile t is global block t * dcp_world + rank).
@@ -482,6 +532,10 @@ def _kernel(
     # length; KV tiles ending at or before it need no causal/written guard.
     min_length_ref = refs[0] if vpu else None
     refs = refs[1:] if vpu else refs
+    # Bound stabilizer: the next scalar operand is this layer's key norm
+    # bound (FP32 bits in an int32 slot).
+    bound_ref = refs[0] if bound_stab else None
+    refs = refs[1:] if bound_stab else refs
     query_ref, bitset_ref, lengths_ref, cache_ref, output_ref = refs[:5]
     refs = refs[5:]
     lse_ref = refs[0] if return_lse else None
@@ -495,18 +549,8 @@ def _kernel(
     # sums (rows, 128), reduced across lanes once per query block.
     lane_ref = refs[7] if lane_sum else None
     bf16_mass = "bf16mass" in lane_sum
-    # Local attribution arms (test only, LANE_SUM path): "nomax" = fixed
-    # stabilizer 0, no row max, no rescale, no subtract (wrong by design);
-    # "frozenm" = per-row stabilizer sm*|q|*KNORM set once per block (a
-    # Cauchy-Schwarz upper bound of the row max), subtract kept, no row max,
-    # no rescale, no branch.
-    smattr = os.environ.get("VLLM_TPU_QSA_SMATTR", "")
-    smattr_knorm = float(os.environ.get("VLLM_TPU_QSA_SMATTR_KNORM", "0"))
-    assert smattr in ("", "nomax", "frozenm"), smattr
-    assert not smattr or lane_sum, "SMATTR arms need LANE_SUM"
-    if key_norm_bound is not None:
-        assert lane_sum and not smattr and not lazy and not bf16_mxu
-        smattr = "bound"
+    if bound_stab:
+        assert lane_sum and not lazy and not bf16_mxu
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
     # FP32 input window while preserving the existing FP32 QK accumulation.
@@ -621,12 +665,10 @@ def _kernel(
         accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
     else:
         init_state()
-    if smattr in ("frozenm", "bound"):
+    if bound_stab:
         # q already carries sm * k_scale; cached keys are k / k_scale.
-        if smattr == "bound":
-            scale, shift = key_norm_bound * BOUND_STAB_MARGIN / k_scale, BOUND_STAB_SHIFT
-        else:
-            scale, shift = smattr_knorm, 0.0
+        bound = lax.bitcast_convert_type(bound_ref[0], jnp.float32)
+        scale, shift = bound * (BOUND_STAB_MARGIN / k_scale), BOUND_STAB_SHIFT
         for query_tile_index in range(num_query_tiles):
             start = query_tile_index * query_tile
             for head in range(kv_heads):
@@ -799,8 +841,8 @@ def _kernel(
                 if lazy_pass:
                     lazy_update(query_tile_index, head, score, value, tile_visible)
                     continue
-                if smattr:
-                    prob = jnp.exp(score if smattr == "nomax" else score - m[:, None])
+                if bound_stab:
+                    prob = jnp.exp(score - m[:, None])
                     mass_terms = prob
                     if bf16_mass:
                         prob = prob.astype(jnp.bfloat16)
@@ -1303,6 +1345,7 @@ def block_sparse_gqa_prefill(
     block_bits=None,
     ascending: bool = False,
     bound_stab: bool = False,
+    key_norm_bound=None,
 ):
     """``_block_sparse_gqa_prefill``, optionally on a bounded page-table prefix.
 
@@ -1334,6 +1377,7 @@ def block_sparse_gqa_prefill(
             **({"block_bits": block_bits} if block_bits is not None else {}),
             **({"ascending": True} if ascending else {}),
             **({"bound_stab": True} if bound_stab else {}),
+            **({"key_norm_bound": key_norm_bound} if key_norm_bound is not None else {}),
         )
 
     # A precomputed bitset (the union walk's shared fallback) is laid out over
@@ -1379,6 +1423,7 @@ def _block_sparse_gqa_prefill(
     block_bits=None,
     ascending: bool = False,
     bound_stab: bool = False,
+    key_norm_bound=None,
 ):
     """Run exact selected-group attention with query-block KV reuse.
 
@@ -1651,7 +1696,7 @@ def _block_sparse_gqa_prefill(
     # both prefill routes round the same probabilities.
     lane_sum = (
         lane_sum_features()
-        if (dcp or (bound_stab and _KEY_NORM_BOUND is not None))
+        if (dcp or (bound_stab and key_norm_bound is not None))
         and not vpu
         and not bf16_mxu
         and not lazy
@@ -1665,17 +1710,13 @@ def _block_sparse_gqa_prefill(
             ",".join(lane_sum),
             envs.VLLM_TPU_QSA_PREFILL_LANE_SUM,
         )
-    key_norm_bound = (
-        _KEY_NORM_BOUND
-        if bound_stab and lane_sum and _KEY_NORM_BOUND is not None
-        and not os.environ.get("VLLM_TPU_QSA_SMATTR")
-        else None
-    )
-    if key_norm_bound is not None:
+    use_bound = bool(bound_stab and lane_sum and key_norm_bound is not None)
+    if use_bound:
         logger.info_once(
-            "QSA sparse DCP prefill bound stabilizer on: key norm bound %.4f, "
-            "margin %.2f, shift %.0f (VLLM_TPU_QSA_PREFILL_BOUND_STAB / qsa_prefill_bound_stab)",
-            key_norm_bound,
+            "QSA sparse prefill bound stabilizer on: per-layer key norm bound "
+            "(process max %s), margin %.2f, shift %.0f "
+            "(VLLM_TPU_QSA_PREFILL_BOUND_STAB / qsa_prefill_bound_stab)",
+            _KEY_NORM_BOUND,
             BOUND_STAB_MARGIN,
             BOUND_STAB_SHIFT,
         )
@@ -1716,10 +1757,10 @@ def _block_sparse_gqa_prefill(
             **({"page_copies": True} if page_copies else {}),
             **({"lazy": lazy} if lazy else {}),
             **({"lane_sum": lane_sum} if lane_sum else {}),
-            **({"key_norm_bound": key_norm_bound} if key_norm_bound is not None else {}),
+            **({"bound_stab": True} if use_bound else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3 + int(dcp) + int(bool(vpu)),
+            num_scalar_prefetch=3 + int(dcp) + int(bool(vpu)) + int(use_bound),
             grid=(nblocks,),
             in_specs=[
                 pl.BlockSpec(
@@ -1805,6 +1846,15 @@ def _block_sparse_gqa_prefill(
         active_counts,
         *([jnp.asarray(dcp_rank, jnp.int32).reshape(1)] if dcp else []),
         *([min_lengths] if vpu else []),
+        *(
+            [
+                lax.bitcast_convert_type(
+                    jnp.asarray(key_norm_bound, jnp.float32).reshape(1), jnp.int32
+                )
+            ]
+            if use_bound
+            else []
+        ),
         query.astype(jnp.bfloat16 if bf16_io else jnp.float32),
         block_bits_native,
         lengths[:, None],
@@ -1857,22 +1907,6 @@ def _aligned_sources(starts, offsets, real, rows, max_tokens):
 
 
 
-def _mark_body(x_ref, o_ref):
-    o_ref[...] = x_ref[...] + 1.0
-
-
-def _mark_kernel(threshold, _):
-    """A named no-op kernel: its xprof count is the debug signal."""
-    out = pl.pallas_call(
-        _mark_body,
-        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
-        name=f"qsa_bound_stab_mark_{threshold}",
-    )(jnp.zeros((8, 128), jnp.float32))
-    return out[0, 0]
-
-
-def _no_mark(_):
-    return jnp.float32(0.0)
 
 
 def block_sparse_gqa_attention(
@@ -2019,15 +2053,19 @@ def block_sparse_gqa_attention(
             branches[0](None) if len(branches) == 1 else lax.switch(route, branches, None)
         )
 
-    bound = _KEY_NORM_BOUND
-    if bound is not None and not os.environ.get("VLLM_TPU_QSA_SMATTR"):
+    if _KEY_NORM_BOUND is not None:
+        # This layer's bound when the QSA step registered one in this trace
+        # (``trace_key_norm_bound``), else the process-wide target bound.
+        bound = layer_key_norm_bound()
         # VLLM_TPU_QSA_PREFILL_BOUND_STAB (see BOUND_STAB_*): the
         # bound-stabilized kernel on both prefill routes (DCP and replicated),
         # always with lse for the guard. The call re-runs with the online
         # softmax when any row's mass leaves the full-precision range (log
         # mass under BOUND_STAB_GUARD or over BOUND_STAB_GUARD_HIGH, or not
         # finite), or a row with a visible key got none.
-        out_b, lse = routed({"bound_stab": True, "return_lse": True})
+        out_b, lse = routed(
+            {"bound_stab": True, "return_lse": True, "key_norm_bound": bound}
+        )
         stab = bound_stabilizer(query, k_scale=k_scale, bound=bound)
         live_rows = (lengths > 0)[:, None]
         if dcp is not None:
@@ -2047,17 +2085,6 @@ def block_sparse_gqa_attention(
             jnp.isnan(lse) | jnp.isposinf(lse) | (lse - stab > BOUND_STAB_GUARD_HIGH)
         )
         rerun = jnp.any(low | lost | high)
-        marks = os.environ.get("VLLM_TPU_QSA_BOUND_STAB_MARKS", "")
-        if marks:
-            # Debug (xprof-visible, no host callback): per threshold t, a
-            # tiny named kernel runs when some row has lse - stabilizer < -t,
-            # i.e. its gap below the bound exceeds about t + shift nats.
-            for t in (int(x) for x in marks.replace(":", ",").split(",") if x):
-                hit = jnp.any(live_rows & jnp.isfinite(lse) & (lse - stab < -t))
-                tick = lax.cond(hit, functools.partial(_mark_kernel, t), _no_mark, None)
-                lse = lse + tick * 0.0
-            tick = lax.cond(rerun, functools.partial(_mark_kernel, 999), _no_mark, None)
-            lse = lse + tick * 0.0
         # Without return_lse the kernel writes bf16(out): the same values.
         output = (out_b, lse) if return_lse else out_b.astype(jnp.bfloat16)
         output = lax.cond(rerun, lambda o: routed({}), lambda o: o, output)
