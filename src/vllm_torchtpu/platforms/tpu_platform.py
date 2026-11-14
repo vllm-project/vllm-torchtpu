@@ -853,6 +853,13 @@ class TpuPlatform(Platform):
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )
+        from vllm_torchtpu.spec_decode.gaad import (
+            patch_vllm_grammar_jump_decoding,
+            patch_vllm_speculative_config_gaad,
+        )
+
+        patch_vllm_speculative_config_gaad()
+        patch_vllm_grammar_jump_decoding()
         _register_tpu_kv_connectors()
         # Apply before VllmConfig is pickled so EngineCore and all workers see
         # the same setting.

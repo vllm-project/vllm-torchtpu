@@ -83,7 +83,7 @@ class StructuredDecodingManager:
             # Use min here is because needed can exceed max_num_batched_tokens
             # (which is the largest bucket), and target_logits rows never exceed
             # the largest bucket.
-            
+
             max_target_rows = _get_padded_token_len(paddings, min(needed, paddings[-1]))
             max_device_rows = max(max_device_rows, max_target_rows)
             self.target_grammar_bitmask_cpu = torch.zeros(
@@ -163,7 +163,7 @@ class StructuredDecodingManager:
 
         num_local = len(local_indices)
         all_rows_structured = num_local == padded_num_reqs
-        
+
         # Standard path: handles all structured batches (all-structured,
         # mixed, or permuted).
         if not all_rows_structured:
@@ -193,6 +193,7 @@ class StructuredDecodingManager:
         draft_lengths_cpu: np.ndarray | None,
         cur_start_idx: int,
         cur_end_idx: int,
+        scheduled_spec_decode_flags: Mapping[str, Sequence[int]] | None = None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -218,12 +219,13 @@ class StructuredDecodingManager:
         bitmask = grammar_output.grammar_bitmask
         req_ids = grammar_output.structured_output_request_ids
         mask_stride = self._mask_stride(bitmask, req_ids)
-        
+
         local_indices = []
         mask_rows = []
         draft_counts = []
+        req_flags_list: list[Sequence[int] | None] = []
         total_structured_drafts = 0
-        
+
         for grammar_idx, req_id in enumerate(req_ids):
             mask_row = grammar_idx * mask_stride
             num_drafts = len(scheduled_spec_decode_tokens.get(req_id, ()))
@@ -243,10 +245,24 @@ class StructuredDecodingManager:
                             f"but runner recorded {draft_lengths_cpu[local_idx]} "
                             "drafts."
                         )
+                req_flags = (
+                    scheduled_spec_decode_flags.get(req_id)
+                    if scheduled_spec_decode_flags is not None
+                    else None
+                )
                 local_indices.append(local_idx)
                 mask_rows.append(mask_row)
                 draft_counts.append(num_drafts)
-                total_structured_drafts += num_drafts
+                req_flags_list.append(req_flags)
+                if num_drafts:
+                    if req_flags is None:
+                        total_structured_drafts += num_drafts
+                    else:
+                        total_structured_drafts += sum(
+                            1
+                            for s in range(num_drafts)
+                            if (req_flags[s] if s < len(req_flags) else 1) == 1
+                        )
 
         # Fast path 1: No structured requests in this chunk.
         if not local_indices:
@@ -288,19 +304,31 @@ class StructuredDecodingManager:
             target_row_starts = np.zeros(len(draft_lengths_cpu) + 1, dtype=np.int64)
             np.cumsum(draft_lengths_cpu, out=target_row_starts[1:])
 
-        for local_index, mask_row_i, num_drafts in zip(
-            local_indices, mask_rows, draft_counts
+        for local_index, mask_row_i, num_drafts, req_flags in zip(
+            local_indices, mask_rows, draft_counts, req_flags_list
         ):
-            if num_drafts:
+            if num_drafts and total_structured_drafts > 0:
                 assert target_row_starts is not None
                 row = int(target_row_starts[local_index])
-                self.target_grammar_bitmask_np[row : row + num_drafts] = bitmask[
-                    mask_row_i : mask_row_i + num_drafts
-                ]
-                if not all_target_structured:
-                    self.require_structured_out_target_np[
-                        row : row + num_drafts
-                    ] = True
+                if req_flags is None:
+                    self.target_grammar_bitmask_np[row : row + num_drafts] = bitmask[
+                        mask_row_i : mask_row_i + num_drafts
+                    ]
+                    if not all_target_structured:
+                        self.require_structured_out_target_np[
+                            row : row + num_drafts
+                        ] = True
+                else:
+                    for slot_idx in range(num_drafts):
+                        flag = req_flags[slot_idx] if slot_idx < len(req_flags) else 1
+                        if flag == 1:  # DRAFT_FLAG_MODEL
+                            self.target_grammar_bitmask_np[row + slot_idx] = bitmask[
+                                mask_row_i + slot_idx
+                            ]
+                            if not all_target_structured:
+                                self.require_structured_out_target_np[
+                                    row + slot_idx
+                                ] = True
             # Bonus row.
             self.grammar_bitmask_np[local_index] = bitmask[mask_row_i + num_drafts]
             if not all_bonus_structured:
@@ -378,6 +406,7 @@ class StructuredDecodingManager:
         draft_lengths_cpu: np.ndarray | None,
         cur_start_idx: int,
         cur_end_idx: int,
+        scheduled_spec_decode_flags: Mapping[str, Sequence[int]] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Applies the grammar bitmask to both bonus and target(if not None).
 
@@ -404,6 +433,7 @@ class StructuredDecodingManager:
                     draft_lengths_cpu,
                     cur_start_idx,
                     cur_end_idx,
+                    scheduled_spec_decode_flags=scheduled_spec_decode_flags,
                 )
             )
         with TraceAnnotation(
