@@ -30,7 +30,7 @@ from vllm_torchtpu import envs
 
 # The layout constants this kernel is built against, and the host module
 # whose accounting decides what it may declare.
-from vllm_torchtpu.kernels.fused_moe.v2 import host, tuned_block_sizes
+from vllm_torchtpu.kernels.fused_moe.v2 import host, plan_kernel, tuned_block_sizes
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     FP4,
     FP8,
@@ -110,6 +110,33 @@ N_PREFETCH = (
     + N_COUNT_TABLES
     + N_RANK_TABLES
 )
+# With packed_tables the routing tables are one prefetch operand: the routing
+# plan kernel's packed output, then the count table and the rank.
+N_PACKED_PREFETCH = 1 + N_COUNT_TABLES + N_RANK_TABLES
+
+
+class _PackedTable:
+    """One [G, ep] table of the plan kernel's packed output, read table[g, d]."""
+
+    def __init__(self, ref, first_lane):
+        self.ref = ref
+        self.first_lane = first_lane
+
+    def __getitem__(self, index):
+        g, d = index
+        return self.ref[g, self.first_lane + d]
+
+
+class _PackedColumn:
+    """One [G] table of the plan kernel's packed output, read table[g]."""
+
+    def __init__(self, ref, lane):
+        self.ref = ref
+        self.lane = lane
+
+    def __getitem__(self, g):
+        return self.ref[g, self.lane]
+
 # The HBM operands, in the order the kernel body unpacks them. Only these
 # two are on every build: the rest -- the activation row scale, the two
 # weight scale tables, the two expert bias tables -- are there where the
@@ -597,8 +624,13 @@ def _build_fused_ep_moe_kernel(
     has_w2_bias=False,
     pad_scale_rows=False,
     logical_intermediate_size=None,
+    packed_tables=False,
 ):
     """Build the pallas_call and the function that invokes it.
+
+    packed_tables: the routing tables arrive as the routing plan kernel's
+    packed [G, 128] output (plan_kernel.py) and its [N_COUNTS, 128] count
+    table, two scalar-memory copies at the kernel's head instead of eight.
 
     `pad_scale_rows` takes the four-bit scale tables as [G, rows, N] with
     rows = host.fp4_scale_rows(K, rhs_qb, padded=True): K / rhs_qb blocks
@@ -926,15 +958,31 @@ def _build_fused_ep_moe_kernel(
         #     tests/kernels/fused_moe/test_fused_ep_moe_v2_tables.py; that test
         #     is what keeps this derivation honest if recv_base ever changes to
         #     track true lengths.
-        (commit_start_sm, commit_len_sm, contrib_off_sm, push_dst_sm) = (
-            next(it) for _ in range(N_TRANSPORT_TABLES)
-        )
-        # Row-unit push tables, from shard_push_tables_in_rows.
-        (true_rows_sm,) = (next(it) for _ in range(N_PUSH_TABLES))
-        # (rows, base) i32 [G] row-unit tables from shard_expert_slabs.
-        (expert_rows_sm, expert_base_sm) = (next(it) for _ in range(N_SLAB_TABLES))
-        # visit_sm[visit_i] is the real expert at compacted step visit_i.
-        visit_sm = next(it)
+        if packed_tables:
+            packed_sm = next(it)
+            (
+                commit_start_sm,
+                commit_len_sm,
+                contrib_off_sm,
+                push_dst_sm,
+                true_rows_sm,
+            ) = (
+                _PackedTable(packed_sm, k * ep)
+                for k in range(plan_kernel.PACKED_TABLES)
+            )
+            expert_rows_sm = _PackedColumn(packed_sm, plan_kernel.PACKED_ROWS_LANE)
+            expert_base_sm = _PackedColumn(packed_sm, plan_kernel.PACKED_BASE_LANE)
+            visit_sm = _PackedColumn(packed_sm, plan_kernel.PACKED_VISIT_LANE)
+        else:
+            (commit_start_sm, commit_len_sm, contrib_off_sm, push_dst_sm) = (
+                next(it) for _ in range(N_TRANSPORT_TABLES)
+            )
+            # Row-unit push tables, from shard_push_tables_in_rows.
+            (true_rows_sm,) = (next(it) for _ in range(N_PUSH_TABLES))
+            # (rows, base) i32 [G] row-unit tables from shard_expert_slabs.
+            (expert_rows_sm, expert_base_sm) = (next(it) for _ in range(N_SLAB_TABLES))
+            # visit_sm[visit_i] is the real expert at compacted step visit_i.
+            visit_sm = next(it)
         # The five counts, each still spread over the expert-parallel axis.
         counts_sm = next(it)
         # This shard's expert-parallel index, as data rather than
@@ -2385,7 +2433,7 @@ def _build_fused_ep_moe_kernel(
         return pl.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=N_PREFETCH,
+                num_scalar_prefetch=N_PACKED_PREFETCH if packed_tables else N_PREFETCH,
                 in_specs=[hbm] * n_inputs,
                 out_specs=[hbm] * len(out_shape),
                 scratch_shapes=tuple(scratch),
@@ -2471,11 +2519,18 @@ def _build_fused_ep_moe_kernel(
         )
         biases = tuple(b.astype(jnp.float32) for b in (w1b, w2b) if b is not None)
         call = make_call(recv_rows)
+        slab_tables = (
+            ()
+            if packed_tables
+            else (
+                expert_rows.astype(jnp.int32),
+                expert_base.astype(jnp.int32),
+                visit.astype(jnp.int32),
+            )
+        )
         res = call(
             *tables,
-            expert_rows.astype(jnp.int32),
-            expert_base.astype(jnp.int32),
-            visit.astype(jnp.int32),
+            *slab_tables,
             counts.astype(jnp.int32),
             rank.astype(jnp.int32),
             token_gather.astype(jnp.int32),

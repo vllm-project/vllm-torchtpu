@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_PREPROCESS_BACKEND: str = "native"
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
+    MOE_FUSED_EP_V2_PLAN_KERNEL: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_MOE_EPLB_DYNAMIC: bool = False
     TPU_MOE_EPLB_MODE: str = "decode_only"
@@ -1049,6 +1050,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MOE_FUSED_EP_PREPROCESS_BACKEND", "native", ["native", "topology"]
     ),
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # Build fused EP MoE v2's routing plan in one Pallas kernel
+    # (fused_moe/v2/plan_kernel.py) instead of the XLA plan, where the shape
+    # fits it (the decode buckets, with the sharded plan); the expert kernel
+    # then reads the plan kernel's packed tables.
+    "MOE_FUSED_EP_V2_PLAN_KERNEL": env_bool("MOE_FUSED_EP_V2_PLAN_KERNEL"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the
