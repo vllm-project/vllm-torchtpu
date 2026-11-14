@@ -52,9 +52,11 @@ def shard_argmax_pair(
     return torch.stack([local_max.float(), global_idx], dim=-1)
 
 
-def reduce_shard_argmax_pairs(gathered: torch.Tensor, tp_size: int) -> torch.Tensor:
-    """Global argmax ids (int64 ``[rows]``) from the rank-major all-gather of
-    every rank's ``shard_argmax_pair`` (``[rows, 2 * tp_size]``)."""
+def reduce_shard_argmax_pairs(
+    gathered: torch.Tensor, tp_size: int, dtype: torch.dtype = torch.int64
+) -> torch.Tensor:
+    """Global argmax ids (``dtype`` ``[rows]``) from the rank-major all-gather
+    of every rank's ``shard_argmax_pair`` (``[rows, 2 * tp_size]``)."""
     pairs = gathered.view(gathered.shape[0], tp_size, 2)
     scores, ids = pairs[..., 0], pairs[..., 1]
     # torch.argmax over the ranks, as masked reductions (one fusion, no
@@ -65,4 +67,4 @@ def reduce_shard_argmax_pairs(gathered: torch.Tensor, tp_size: int) -> torch.Ten
     first_nan = torch.where(nan, rank, tp_size).amin(dim=-1, keepdim=True)
     first_max = torch.where(scores == best, rank, tp_size).amin(dim=-1, keepdim=True)
     winner = torch.where(first_nan < tp_size, first_nan, first_max)
-    return torch.where(rank == winner, ids, 0.0).sum(dim=-1).to(torch.int64)
+    return torch.where(rank == winner, ids, 0.0).sum(dim=-1).to(dtype)

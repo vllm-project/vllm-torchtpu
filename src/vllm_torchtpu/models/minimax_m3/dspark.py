@@ -498,10 +498,14 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         self, logits_shard: torch.Tensor, markov_embed: torch.Tensor
     ) -> torch.Tensor:
         """Draft-vocab ids equal to ``(compute_draft_logits + markov_bias)
-        .argmax(-1)``, exchanging one (max, id) pair per rank and row."""
+        .argmax(-1)``, exchanging one (max, id) pair per rank and row. int32,
+        as the step's other token ids: the TPU emulates int64 ops on the
+        Markov loop's serial chain."""
         pair = self.markov_shard_pair(logits_shard, markov_embed)
         gathered = tensor_model_parallel_all_gather(pair, dim=-1)
-        return reduce_shard_argmax_pairs(gathered, self.lm_head.tp_size)
+        return reduce_shard_argmax_pairs(
+            gathered, self.lm_head.tp_size, dtype=torch.int32
+        )
 
     def tpu_precompute_and_store_context_kv(
         self,
