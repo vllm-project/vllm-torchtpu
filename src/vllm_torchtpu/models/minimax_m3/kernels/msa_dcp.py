@@ -151,19 +151,50 @@ def _candidates_kernel(
         s = jnp.where(
             visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
         )
-        picked_scores, picked_blocks = [], []
-        for _ in range(topk):
-            best_score = jnp.max(s, axis=1, keepdims=True)
-            best = jnp.min(
-                jnp.where(s == best_score, cols, width), axis=1, keepdims=True
-            )
-            picked_scores.append(best_score)
-            picked_blocks.append(
-                jnp.where(best_score > _NEG_INF, best * dcp + rank, -1)
-            )
-            s = jnp.where(cols == best, _NEG_INF, s)
-        score_out_ref[...] = jnp.concatenate(picked_scores, axis=1)
-        block_out_ref[...] = jnp.concatenate(picked_blocks, axis=1)
+        # f32 column ids (exact below 2**24): an int32 min across lanes lowers
+        # to two f32 cross-lane reductions (high and low halves).
+        col_ids = cols.astype(jnp.float32)
+
+        def picks(s, all_ties):
+            """`topk` picks of (best score, its first column). With
+            `all_ties`, a pick masks every column holding its score, so the
+            next pick's max need not wait for this one's first-column min
+            (each cross-lane reduction is ~141 cycles in the LLO); that is
+            exact while no finite score repeats. Returns the picks and each
+            pick's count of columns at its finite score."""
+            picked_scores, picked_blocks, ties = [], [], []
+            for _ in range(topk):
+                best_score = jnp.max(s, axis=1, keepdims=True)
+                hit = s == best_score
+                best = jnp.min(
+                    jnp.where(hit, col_ids, float(width)), axis=1, keepdims=True
+                )
+                picked_scores.append(best_score)
+                picked_blocks.append(
+                    jnp.where(
+                        best_score > _NEG_INF, best.astype(jnp.int32) * dcp + rank, -1
+                    )
+                )
+                if all_ties:
+                    ties.append(
+                        jnp.sum(
+                            jnp.where(hit & (best_score > _NEG_INF), 1.0, 0.0),
+                            axis=1,
+                            keepdims=True,
+                        )
+                    )
+                s = jnp.where(hit if all_ties else col_ids == best, _NEG_INF, s)
+            score_out_ref[...] = jnp.concatenate(picked_scores, axis=1)
+            block_out_ref[...] = jnp.concatenate(picked_blocks, axis=1)
+            return ties
+
+        ties = picks(s, all_ties=True)
+
+        # A repeated finite score (forced init blocks, equal block maxima)
+        # takes its columns one at a time: redo the picks exactly.
+        @pl.when(jnp.max(functools.reduce(jnp.maximum, ties)) > 1)
+        def _():
+            picks(s, all_ties=False)
 
     for width in widths:
         pl.when(width_now == width)(functools.partial(select, width))

@@ -49,6 +49,7 @@ def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
     return out_s, out_b
 
 
+@pytest.mark.parametrize("ties", [True, False])
 @pytest.mark.parametrize("pretransposed", [False, True])
 @pytest.mark.parametrize("pick_widths", [True, False])
 @pytest.mark.parametrize(
@@ -71,13 +72,17 @@ def test_candidates_match_reference(
     local_blocks,
     pick_widths,
     pretransposed,
+    ties,
     monkeypatch,
 ):
     if pick_widths:  # per-row-block widths, as for a prefill batch
         monkeypatch.setattr(msa_dcp, "_MIN_CANDIDATE_TOKENS", 0)
     rng = np.random.default_rng(num_tokens + num_cols)
-    # Few distinct values so ties are common.
-    scores = rng.integers(0, 6, (num_tokens, num_cols)).astype(np.float32)
+    if ties:  # few distinct values, so ties are common
+        scores = rng.integers(0, 6, (num_tokens, num_cols)).astype(np.float32)
+    else:  # distinct finite scores: no pick needs its tied columns one at a time
+        scores = rng.permutation(num_tokens * num_cols).astype(np.float32)
+        scores = scores.reshape(num_tokens, num_cols)
     pos = np.sort(rng.integers(0, max_pos, num_tokens)).astype(np.int32)
     got_s, got_b = local_candidates(
         # [P, T] as the large tile class scores, or [T, 1, P]
