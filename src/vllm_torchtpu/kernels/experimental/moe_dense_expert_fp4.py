@@ -18,12 +18,13 @@ The decode-sized counterpart of moe_dense_expert for fp4 experts with fp32
 `chunk` intermediate columns (its gate, up and down slices), through a ring of
 VMEM buffers; every token is evaluated in its original order and the weighted
 expert outputs accumulate in fp32 VMEM. This replaces the routing sort, the
-one-hot permute, the grouped GEMM and the combine with one call. The fp4
-weights feed the MXU as fp8 (exact) against bf16 activations, and each 128-row
-block scale is applied to the block's partial product, as gmm_v2's decode
-tiles do. Rounding follows the GMM path: the activation is rounded to bf16
-before the down projection, each expert's output to bf16 before its routing
-weight is applied.
+one-hot permute, the grouped GEMM and the combine with one call; the routing
+coefficients and the set of nonempty experts are derived in the kernel from the
+raw top-k ids and weights. The fp4 weights feed the MXU as fp8 (exact) against
+bf16 activations, and each 128-row block scale is applied to the block's
+partial product, as gmm_v2's decode tiles do. Rounding follows the GMM path:
+the activation is rounded to bf16 before the down projection, each expert's
+output to bf16 before its routing weight is applied.
 """
 
 import functools
@@ -39,11 +40,16 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
 _QUANT_BLOCK = 128
 _NUM_BUFFERS = 3
 _ACTIVATIONS = ("silu", "swigluoai")
+# Rows of the in-kernel token buffer: bf16 MXU operands pack 16 sublanes.
+_ROW_ALIGN = 16
+# VMEM for the kernel's small operands.
+_VMEM_HEADROOM = 1 << 20
 
 
-def _chunk(i: int) -> int:
-    for c in (1024, 512, 384, 256, 128):
-        if i % c == 0:
+def _chunk(m: int, h: int, i: int, vmem_capacity: int) -> int:
+    """The widest unit of intermediate columns whose buffers fit in VMEM, or 0."""
+    for c in (1024, 768, 512, 384, 256, 128):
+        if i % c == 0 and _vmem_bytes(m, h, c) <= vmem_capacity - _VMEM_HEADROOM:
             return c
     return 0
 
@@ -65,7 +71,6 @@ def can_use_dense_expert_fp4(hidden, w1, w2, s1, s2, *, activation) -> bool:
         or w1.shape != (e, h, 2 * i)
         or min(m, h, i, e) <= 0
         or h % _QUANT_BLOCK
-        or _chunk(i) == 0
     ):
         return False
     if s1.shape != (e, h // _QUANT_BLOCK, 1, 2 * i) or s2.shape != (
@@ -81,26 +86,28 @@ def can_use_dense_expert_fp4(hidden, w1, w2, s1, s2, *, activation) -> bool:
         info = pltpu.get_tpu_info()
     except ValueError:  # not a TPU (e.g. a CPU host)
         return False
-    return (
-        info.is_matmul_supported(jnp.bfloat16, jnp.float8_e4m3fn)
-        and _vmem_bytes(m, h, i) <= info.vmem_capacity_bytes * 4 // 5
+    return info.is_matmul_supported(jnp.bfloat16, jnp.float8_e4m3fn) and bool(
+        _chunk(m, h, i, info.vmem_capacity_bytes)
     )
 
 
-def _vmem_bytes(m: int, h: int, i: int) -> int:
-    """Scratch of one call: the weight ring, its scales (the size-1 axis padded
-    to an 8-row f32 tile) and the token-sized buffers."""
-    c = _chunk(i)
-    weights = 3 * h * c // 2
-    scales = (2 * (h // _QUANT_BLOCK) * c + (c // _QUANT_BLOCK) * h) * 8 * 4
-    mp = m + (-m % 16)
-    return _NUM_BUFFERS * (weights + scales) + mp * h * (2 + 4 + 4 + 2)
+def _vmem_bytes(m: int, h: int, chunk: int) -> int:
+    """VMEM of one call: the weight ring (VMEM holds fp4 one byte per
+    element), its scales, the token-sized scratch and the compiler's
+    token-sized temporaries (~16 bytes per element, measured with tpu7x AOT
+    compiles at 16 and 64 rows)."""
+    weights = 3 * h * chunk
+    scales = (2 * (h // _QUANT_BLOCK) * chunk + (chunk // _QUANT_BLOCK) * h) * 4
+    mp = m + (-m % _ROW_ALIGN)
+    tokens = mp * h * (2 + 4 + 4 + 2 + 16)
+    return _NUM_BUFFERS * (weights + scales) + tokens
 
 
 def _kernel(
-    active_ref,  # SMEM [E] (scalar prefetch)
+    ids_smem,  # SMEM [m * topk] local expert ids, -1 off this rank (prefetch)
     x_ref,  # VMEM [m, h] bf16
-    coeff_ref,  # VMEM [m, E_pad] f32
+    ids_ref,  # VMEM [m, topk] int32: ids_smem as rows
+    tw_ref,  # VMEM [m, topk] f32 routing weights
     w1_hbm,  # [E, h, 2i] fp4
     w2_hbm,  # [E, i, h] fp4
     s1_hbm,  # [E, h / 128, 1, 2i] f32
@@ -112,8 +119,11 @@ def _kernel(
     sg_ref,
     su_ref,
     sd_ref,
-    expert_acc_ref,  # VMEM [m, h] f32: the current expert's down projection
-    acc_ref,  # VMEM [m, h] f32: the routing-weighted sum
+    x_pad_ref,  # VMEM [mp, h] bf16: the tokens, padded with zero rows
+    coeff_ref,  # VMEM [mp, E_pad] f32: each token's weight per local expert
+    expert_acc_ref,  # VMEM [mp, h] f32: the current expert's down projection
+    acc_ref,  # VMEM [mp, h] f32: the routing-weighted sum
+    active_ref,  # SMEM [E]: nonzero for an expert some token routes to
     active_ids_ref,  # SMEM [E]
     sem_ref,
     *,
@@ -124,9 +134,27 @@ def _kernel(
     activation,
 ):
     fp8 = jnp.float8_e4m3fn
+    f32 = jnp.float32
+    m = x_ref.shape[0]
+    mp = acc_ref.shape[0]
     num_chunks = i // chunk
-    acc_ref[...] = jnp.zeros_like(acc_ref)
-    expert_columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
+
+    def clear(e, carry):
+        active_ref[e] = 0
+        return carry
+
+    lax.fori_loop(0, experts, clear, 0)
+
+    def mark(r, carry):
+        e = ids_smem[r]
+
+        @pl.when((e >= 0) & (e < experts))
+        def local():
+            active_ref[e] = 1
+
+        return carry
+
+    lax.fori_loop(0, ids_smem.shape[0], mark, 0)
 
     def compact(e, count):
         @pl.when(active_ref[e] != 0)
@@ -167,12 +195,40 @@ def _kernel(
             ),
         ]
 
+    for initial in range(_NUM_BUFFERS - 1):
+
+        @pl.when(units > initial)
+        def prime(*, initial=initial):
+            for copy in transfers(jnp.int32(initial)):
+                copy.start()
+
+    # Token-side setup overlaps the first weight copies.
+    def pad_rows(v):
+        if mp == m:
+            return v
+        return jnp.concatenate([v, jnp.zeros((mp - m, v.shape[1]), v.dtype)], 0)
+
+    x = pad_rows(x_ref[...].astype(f32))
+    tw = tw_ref[...]
+    # Zero routing must suppress even a non-finite routing weight.
+    tw = jnp.where(jnp.isfinite(tw), tw, 0)
+    ids = ids_ref[...]
+    expert_columns = lax.broadcasted_iota(jnp.int32, (m, coeff_ref.shape[1]), 1)
+    coeff = jnp.zeros((m, coeff_ref.shape[1]), f32)
+    for route in range(ids.shape[1]):
+        coeff += jnp.where(
+            ids[:, route : route + 1] == expert_columns, tw[:, route : route + 1], 0
+        )
+    coeff_ref[...] = pad_rows(coeff)
+    acc_ref[...] = jnp.zeros_like(acc_ref)
+    x_pad_ref[...] = jnp.where(jnp.isfinite(x), x, 0).astype(jnp.bfloat16)
+
     def compute(unit):
         slot = unit % _NUM_BUFFERS
         c = unit % num_chunks
-        x = x_ref[...]
-        gate = jnp.zeros((x.shape[0], chunk), jnp.float32)
-        up = jnp.zeros((x.shape[0], chunk), jnp.float32)
+        x = x_pad_ref[...]
+        gate = jnp.zeros((x.shape[0], chunk), f32)
+        up = jnp.zeros((x.shape[0], chunk), f32)
         for k in range(0, h, _QUANT_BLOCK):
             b = k // _QUANT_BLOCK
             xk = x[:, k : k + _QUANT_BLOCK]
@@ -180,7 +236,7 @@ def _kernel(
                 jnp.matmul(
                     xk,
                     wg_ref[slot, k : k + _QUANT_BLOCK, :].astype(fp8),
-                    preferred_element_type=jnp.float32,
+                    preferred_element_type=f32,
                 )
                 * sg_ref[slot, b]
             )
@@ -188,20 +244,20 @@ def _kernel(
                 jnp.matmul(
                     xk,
                     wu_ref[slot, k : k + _QUANT_BLOCK, :].astype(fp8),
-                    preferred_element_type=jnp.float32,
+                    preferred_element_type=f32,
                 )
                 * su_ref[slot, b]
             )
         # apply_act_fn takes [gate | up] lane-interleaved (its dispatch is reused).
         act = apply_act_fn(interleave_lane(gate, up), activation).astype(x.dtype)
-        down = jnp.zeros((x.shape[0], h), jnp.float32)
+        down = jnp.zeros((x.shape[0], h), f32)
         for k in range(0, chunk, _QUANT_BLOCK):
             b = k // _QUANT_BLOCK
             down += (
                 jnp.matmul(
                     act[:, k : k + _QUANT_BLOCK],
                     wd_ref[slot, k : k + _QUANT_BLOCK, :].astype(fp8),
-                    preferred_element_type=jnp.float32,
+                    preferred_element_type=f32,
                 )
                 * sd_ref[slot, b]
             )
@@ -217,44 +273,42 @@ def _kernel(
         @pl.when(c == num_chunks - 1)
         def finish():
             e = active_ids_ref[unit // num_chunks]
+            columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
             coeff = jnp.sum(
-                jnp.where(expert_columns == e, coeff_ref[...], 0),
-                axis=1,
-                keepdims=True,
+                jnp.where(columns == e, coeff_ref[...], 0), axis=1, keepdims=True
             )
-            out_e = expert_acc_ref[...].astype(out_ref.dtype).astype(jnp.float32)
+            out_e = expert_acc_ref[...].astype(out_ref.dtype).astype(f32)
             # Zero routing must suppress even a non-finite unused output.
             acc_ref[...] += jnp.where(coeff != 0, out_e * coeff, 0)
 
-    @pl.when(units > 0)
-    def run():
-        for initial in range(_NUM_BUFFERS - 1):
+    def body(unit, carry):
+        for copy in transfers(unit):
+            copy.wait()
 
-            @pl.when(units > initial)
-            def prime(*, initial=initial):
-                for copy in transfers(jnp.int32(initial)):
-                    copy.start()
+        @pl.when(unit + _NUM_BUFFERS - 1 < units)
+        def prefetch():
+            for copy in transfers(unit + _NUM_BUFFERS - 1):
+                copy.start()
 
-        def body(unit, carry):
-            for copy in transfers(unit):
-                copy.wait()
+        compute(unit)
+        return carry
 
-            @pl.when(unit + _NUM_BUFFERS - 1 < units)
-            def prefetch():
-                for copy in transfers(unit + _NUM_BUFFERS - 1):
-                    copy.start()
+    lax.fori_loop(0, units, body, 0)
 
-            compute(unit)
-            return carry
-
-        lax.fori_loop(0, units, body, 0)
-
-    out_ref[...] = acc_ref[...].astype(out_ref.dtype)
+    out_ref[...] = acc_ref[:m, :].astype(out_ref.dtype)
 
 
 @functools.partial(jax.jit, static_argnames=("activation",))
 def dense_expert_moe_fp4(
-    hidden, w1, w2, s1, s2, topk_weights, local_ids, *, activation="swigluoai"
+    hidden,
+    w1,
+    w2,
+    s1,
+    s2,
+    topk_weights,
+    local_ids,
+    *,
+    activation="swigluoai",
 ):
     """Local routed contribution of fp4 experts, [tokens, hidden] bf16, as
     fused_moe_func's GMM path returns it. IDs outside this rank must be -1.
@@ -263,22 +317,20 @@ def dense_expert_moe_fp4(
     token counts) does."""
     m, h = hidden.shape
     experts, i, _ = w2.shape
-    chunk = _chunk(i)
-    sublane = 16
-    pad = -m % sublane
-    x = jnp.where(jnp.isfinite(hidden), hidden, 0)
-    expert_ids = jnp.arange(experts, dtype=jnp.int32)[None, :]
-    weights = topk_weights.astype(jnp.float32)
-    weights = jnp.where(jnp.isfinite(weights), weights, 0)
-    coeff = jnp.zeros((m, experts), jnp.float32)
-    for route in range(local_ids.shape[1]):
-        selected = local_ids[:, route : route + 1] == expert_ids
-        coeff = coeff + selected.astype(jnp.float32) * weights[:, route : route + 1]
-    active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
-    lanes = pltpu.get_tpu_info().num_lanes
-    coeff = jnp.pad(coeff, ((0, pad), (0, (-experts) % lanes)))
-    x = jnp.pad(x, ((0, pad), (0, 0)))
-    mp = m + pad
+    info = pltpu.get_tpu_info()
+    chunk = _chunk(m, h, i, info.vmem_capacity_bytes)
+    # Whole f32 sublane tiles of tokens; the kernel pads to _ROW_ALIGN itself.
+    pad = -m % 8
+    if pad:
+        hidden = jnp.pad(hidden, ((0, pad), (0, 0)))
+        local_ids = jnp.pad(local_ids, ((0, pad), (0, 0)), constant_values=-1)
+        topk_weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
+    mk = m + pad
+    mp = mk + (-mk % _ROW_ALIGN)
+    local_ids = local_ids.astype(jnp.int32)
+    lanes = info.num_lanes
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     out = pl.pallas_call(
         functools.partial(
             _kernel,
@@ -288,15 +340,11 @@ def dense_expert_moe_fp4(
             experts=experts,
             activation=activation,
         ),
-        out_shape=jax.ShapeDtypeStruct((mp, h), jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((mk, h), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[
-                pl.BlockSpec(memory_space=pltpu.VMEM),
-                pl.BlockSpec(memory_space=pltpu.VMEM),
-                *[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
-            ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+            in_specs=[vmem, vmem, vmem, *[hbm] * 4],
+            out_specs=vmem,
             scratch_shapes=[
                 pltpu.VMEM((_NUM_BUFFERS, h, chunk), w1.dtype),
                 pltpu.VMEM((_NUM_BUFFERS, h, chunk), w1.dtype),
@@ -304,20 +352,22 @@ def dense_expert_moe_fp4(
                 pltpu.VMEM((_NUM_BUFFERS, h // _QUANT_BLOCK, 1, chunk), jnp.float32),
                 pltpu.VMEM((_NUM_BUFFERS, h // _QUANT_BLOCK, 1, chunk), jnp.float32),
                 pltpu.VMEM((_NUM_BUFFERS, chunk // _QUANT_BLOCK, 1, h), jnp.float32),
+                pltpu.VMEM((mp, h), jnp.bfloat16),
+                pltpu.VMEM((mp, experts + (-experts) % lanes), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.float32),
+                pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((_NUM_BUFFERS, 6)),
             ],
         ),
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes
-        ),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=info.vmem_capacity_bytes),
         name=f"dense_expert_moe_fp4-e_{experts}-m_{mp}-h_{h}-i_{i}-c_{chunk}",
     )(
-        active,
-        x,
-        coeff,
+        local_ids.reshape(-1),
+        hidden,
+        local_ids,
+        topk_weights.astype(jnp.float32),
         w1,
         w2,
         # 4-D as the GMM path holds them: a reshape that drops the size-1
@@ -325,4 +375,4 @@ def dense_expert_moe_fp4(
         s1,
         s2,
     )
-    return out[:m]
+    return out[:m] if pad else out
