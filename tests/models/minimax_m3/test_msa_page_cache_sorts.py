@@ -111,3 +111,32 @@ def test_attention_bits(monkeypatch, slots):
     for other in outs[1:]:
         for a, b in zip(outs[0], other):
             np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+@pytest.mark.parametrize("tile_pages", [64, 160])
+def test_tables_per_call_tile_pages(monkeypatch, tile_pages):
+    """A per-call width (TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE's wide calls)
+    sorts the same table in every mode as the default sort at that width."""
+    monkeypatch.setattr(msa_attention_lse, "PAGE_CACHE_TILE_PAGES", 32)
+    tiles, cache, num_keys = 8, 512, 2000
+    rng = np.random.default_rng(tile_pages)
+    unions = _unions(rng, 4, tiles, 256, num_keys, 120)
+
+    def tables(mode, widths):
+        monkeypatch.setenv(SORT, mode)
+        monkeypatch.setenv(WIDTHS, widths)
+        return np.asarray(
+            jax.jit(
+                lambda u: msa_attention_lse._page_cache_tables(
+                    u, tiles, cache, num_keys, tile_pages=tile_pages
+                )
+            )(unions)
+        )
+
+    ref = np.asarray(
+        jax.vmap(
+            lambda u: msa_attention_lse._page_cache(u, tiles, cache, width=tile_pages)
+        )(unions)
+    )
+    for mode, widths in (("", ""),) + COMBOS:
+        np.testing.assert_array_equal(tables(mode, widths), ref, err_msg=f"{mode} {widths}")

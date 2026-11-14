@@ -271,17 +271,22 @@ def _page_cache(
 
 
 def _page_cache_tables(
-    unions: jax.Array, num_tiles: int, cache_size: int, key_bound: int
+    unions: jax.Array,
+    num_tiles: int,
+    cache_size: int,
+    key_bound: int,
+    tile_pages: int = 0,
 ) -> jax.Array:
-    """`_page_cache` of each call's unions ``[calls, union entries]``, with
-    the sort mode of TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT and, with
+    """`_page_cache` of each call's unions ``[calls, union entries]``, the
+    first `tile_pages` (default `PAGE_CACHE_TILE_PAGES`) of each tile union
+    sorted, with the sort mode of TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT and, with
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS, the narrowest table width that holds
     every call's widest tile union (a `lax.switch` in the same program; a
     union never passes the width its branch sorts, so every branch's table
     is the full width's)."""
     from vllm_torchtpu import envs
 
-    full = min(PAGE_CACHE_TILE_PAGES, unions.shape[1] // num_tiles)
+    full = min(tile_pages or PAGE_CACHE_TILE_PAGES, unions.shape[1] // num_tiles)
     mode = envs.TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT.strip().lower()
     if mode not in ("", "unstable", "packed", "packed_search"):
         raise ValueError(f"TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT={mode!r}")
@@ -1290,6 +1295,53 @@ def _proof(flag: str, detail: str) -> None:
         print(f"{flag}=1: {detail}", flush=True)  # workers may log nowhere
 
 
+# 4-bit prefill calls with a page cache pick their tiles per call from the
+# width of their selections (`adaptive_prefill`).
+ADAPTIVE_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE"
+
+
+def adaptive_prefill() -> tuple[int, int, int] | None:
+    """``envs.TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE`` = "<threshold>:<block_q>:
+    <tile_pages>" as ints, or None (unset). Read when the calling program is
+    traced, through `envs` (part of the compile-cache key)."""
+    from vllm_torchtpu import envs
+
+    spec = envs.TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE.strip()
+    if not spec:
+        return None
+    parts = [int(x) for x in spec.replace("/", ":").split(":")]
+    if len(parts) != 3 or min(parts) <= 0:
+        raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: want <threshold>:<block_q>:<tile_pages>")
+    return parts[0], parts[1], parts[2]
+
+
+def wide_selection(
+    selected: jax.Array, block_q: int, threshold: int, max_tiles: int = 64
+) -> jax.Array:
+    """Whether ``selected [T, G, K]`` (page keys, ``-1`` padded) holds more
+    than `threshold` distinct pages per `block_q`-token tile of a KV head on
+    average, over the tiles that hold any page: a bool scalar.
+
+    The union width sets what a tile costs: a wide union pays for its rows
+    over more pages (smaller tiles narrow it), a narrow one for the fixed
+    cost per tile (larger tiles amortize it). Counted by comparing each key
+    with the tile's earlier keys (no sort), on every n-th tile only (about
+    `max_tiles` per head): every tile of an 8k call cost ~76 us a call on
+    TPU v7x, while the sampled mean picks the same configuration on 99% of
+    real c48 calls."""
+    num_tokens, num_heads, topk = selected.shape
+    pad = -num_tokens % block_q
+    keys = jnp.pad(selected, ((0, pad), (0, 0), (0, 0)), constant_values=-1)
+    keys = keys.transpose(1, 0, 2).reshape(num_heads, -1, block_q * topk)
+    keys = keys[:, :: max(1, keys.shape[1] // max_tiles)]
+    width = keys.shape[-1]
+    earlier = jnp.arange(width)[None, :] < jnp.arange(width)[:, None]
+    seen = jnp.any((keys[..., :, None] == keys[..., None, :]) & earlier, axis=-1)
+    distinct = jnp.sum((keys >= 0) & ~seen, dtype=jnp.int32)
+    tiles = jnp.sum(jnp.any(keys >= 0, axis=-1), dtype=jnp.int32)
+    return distinct > threshold * tiles
+
+
 # Decode work list by `_packed_work_kernel` instead of XLA (8-token tiles).
 WORK_LIST_KERNEL_ENV = "TPU_MINIMAX_M3_MSA_DECODE_WORK_LIST_KERNEL"
 # Every KV head of a decode batch in one kernel call (`_one_call_heads`).
@@ -1318,6 +1370,7 @@ def _chunked_call(
     page_cache_slots=0,
     page_cache_bf16=False,
     row_split=1,
+    page_cache_tile_pages=0,
 ):
     """`_attention_call` per KV head and chunk of at most
     `MAX_TOKENS_PER_CALL` tokens (the work list lives in SMEM).
@@ -1401,6 +1454,7 @@ def _chunked_call(
             num_tiles=step // block_q,
             cache_size=cache_size,
             key_bound=page_table.shape[0],
+            tile_pages=page_cache_tile_pages,
         )
         packed = jnp.concatenate(
             [table[:, :union_len], packed[:, union_len:], table[:, union_len:]], axis=1
@@ -1542,6 +1596,7 @@ def _check_rows(kv_cache, head_dim, head=None):
         "page_cache_slots",
         "page_cache_bf16",
         "row_split",
+        "page_cache_tile_pages",
     ),
 )
 def msa_sparse_attention_lse(
@@ -1565,6 +1620,7 @@ def msa_sparse_attention_lse(
     page_cache_slots: int = 0,
     page_cache_bf16: bool = False,
     row_split: int = 1,
+    page_cache_tile_pages: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
     by `page_table`) returning ``(out [T, H, D], lse [T, H] f32)``.
@@ -1602,6 +1658,7 @@ def msa_sparse_attention_lse(
         page_cache_slots=page_cache_slots,
         page_cache_bf16=page_cache_bf16,
         row_split=row_split,
+        page_cache_tile_pages=page_cache_tile_pages,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
@@ -1620,6 +1677,7 @@ def msa_sparse_attention_lse(
         "page_cache_slots",
         "page_cache_bf16",
         "row_split",
+        "page_cache_tile_pages",
     ),
 )
 def msa_sparse_attention_lse_heads(
@@ -1640,6 +1698,7 @@ def msa_sparse_attention_lse_heads(
     page_cache_slots: int = 0,
     page_cache_bf16: bool = False,
     row_split: int = 1,
+    page_cache_tile_pages: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_sparse_attention_lse` for every KV head of the cache rows at once.
 
@@ -1686,6 +1745,7 @@ def msa_sparse_attention_lse_heads(
         page_cache_slots=page_cache_slots,
         page_cache_bf16=page_cache_bf16,
         row_split=row_split,
+        page_cache_tile_pages=page_cache_tile_pages,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]

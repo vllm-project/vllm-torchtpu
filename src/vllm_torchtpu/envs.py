@@ -233,6 +233,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
+    TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
 
 
 def env_with_choices(
@@ -1457,6 +1458,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bit. Empty always sorts TILE_PAGES entries per tile.
     "TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS": env_str(
         "TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS", ""
+    ),
+    # MiniMax M3 4-bit MSA prefill attention with a page cache:
+    # "<threshold>:<block_q>:<tile_pages>" runs a call whose selections hold
+    # more than <threshold> distinct pages per query tile on average with
+    # <block_q>-token tiles and <tile_pages> cached union pages, other calls
+    # with the configured tiles (`msa_attention_lse.adaptive_prefill`). Empty
+    # keeps one configuration.
+    "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE": env_str(
+        "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE", ""
     ),
 }
 
