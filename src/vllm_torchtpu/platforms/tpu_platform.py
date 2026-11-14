@@ -33,6 +33,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
+from vllm_torchtpu.distributed.dp_world import unified_dp_world
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
@@ -1167,8 +1168,9 @@ class TpuPlatform(Platform):
                 os.environ.setdefault(
                     "TORCH_TPU_DP_MASTER_PORT", str(portpicker.pick_unused_port())
                 )
-                if parallel_config.enable_expert_parallel:
-                    # EP's expert-combine collective genuinely spans every
+                if unified_dp_world(parallel_config):
+                    # EP's expert-combine collective (or a model's own cross-DP
+                    # collective, see distributed/dp_world) spans every
                     # DP*TP worker, so torch_tpu needs one shared slice
                     # across all of them; the worker spawn shim exposes a
                     # DP-adjusted chip ordinal to TorchTPU for physical
