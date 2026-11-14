@@ -75,8 +75,25 @@ IN_POD='
   exit $rc
 '
 
+# On a TPU host, prove the chip comes up before running the command. A pod on a
+# node with a broken TPU runtime otherwise has every TPU test wait out the PJRT
+# init deadline and fail one by one - one shard took 4.5 hours to do that. The
+# probe builds its PJRT client in a child process that exits before "$@" starts,
+# so nothing holds the process-exclusive chips; see tpu_preflight.py. Guarded on
+# the file because a step may run an image of its own, built without it.
+if [[ "$shape" != "cpu" ]]; then
+  # shellcheck disable=SC2016
+  IN_POD='
+  if [ -f .buildkite/kubernetes/tpu_preflight.py ]; then
+    python3 .buildkite/kubernetes/tpu_preflight.py || exit 1
+  fi'"$IN_POD"
+fi
+
+# The launcher the pod is submitted through; a test may stand in its own.
+launcher="${KUBE_LAUNCHER:-/opt/launcher/launch}"
+
 # shellcheck disable=SC2154  # env_args comes from common.sh
-exec /opt/launcher/launch \
+exec "$launcher" \
   "${hardware[@]}" \
   "${env_args[@]}" \
   -- bash -c "$IN_POD" -- "$@"
