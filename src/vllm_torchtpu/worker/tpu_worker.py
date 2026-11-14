@@ -55,6 +55,8 @@ from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker import worker_options
+from vllm_torchtpu.worker.numa_bind import bind_to_chip_numa_node
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -195,6 +197,16 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def _maybe_bind_numa(self, native_local_rank: int, dp_size: int) -> None:
+        """Bind this worker to its chip's NUMA node when
+        ``tpu_worker.numa_bind`` is on. The host's workers are this engine's
+        local ranks times its host-local DP engines."""
+        if not worker_options.get(self.vllm_config).numa_bind:
+            return
+        pc = self.parallel_config
+        dp_size_local = (pc.data_parallel_size_local or dp_size) if dp_size > 1 else 1
+        bind_to_chip_numa_node(native_local_rank, pc.local_world_size * dp_size_local)
+
     def init_device(self):
         # vLLM's MultiprocExecutor passes per-engine rank/local_rank as
         # constructor args. Native vLLM DP keeps those values local to the DP
@@ -224,6 +236,8 @@ class TPUWorker(WorkerBase):
         # takes these at construction time.
         self.profile_rank = binding.rank
         self.profile_world_size = binding.world_size
+        # Before the runtime starts, so its threads and buffers follow.
+        self._maybe_bind_numa(binding.native_local_rank, dp_size)
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
@@ -438,6 +452,18 @@ class TPUWorker(WorkerBase):
         tpu_platform = cast(TpuPlatform, current_platform)
         dist_backend = tpu_platform.get_worker_distributed_backend(dist_world_size)
 
+        # Gloo CPU groups wait 30 min by default. Under model-store contention
+        # a rank can still be streaming weights after that while its peers sit
+        # in a CPU collective (the draft load barrier on prefill, the
+        # all_gather_object of build_ep_mesh on decode), and the waiters die
+        # with "Timed out waiting 1800000ms". vLLM's
+        # --cpu-distributed-timeout-seconds sets the timeout of every CPU
+        # collective: vLLM's own groups read it, and the world group gets it
+        # here.
+        cpu_timeout = self.parallel_config.cpu_distributed_timeout
+        init_kwargs: dict[str, Any] = {}
+        if cpu_timeout is not None:
+            init_kwargs["timeout"] = cpu_timeout
         with set_current_vllm_config(self.vllm_config):
             init_distributed_environment(
                 world_size=init_world,
@@ -445,6 +471,7 @@ class TPUWorker(WorkerBase):
                 local_rank=local_rank_for_init,
                 distributed_init_method=dist_init_method,
                 backend=dist_backend,
+                **init_kwargs,
             )
         # The PCP group keeps its natural rank order. Reordering it used to be
         # how the ring was chosen, on the understanding that the ring followed
