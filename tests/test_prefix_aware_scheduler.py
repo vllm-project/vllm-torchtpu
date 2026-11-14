@@ -16,10 +16,19 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 
-from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
+from vllm_torchtpu.core.pp_chunk_scheduler import (
+    DYNAMIC_CHUNK_SCHEDULER_CLASSES,
+    PREFIX_AWARE_PP_SCHEDULER_CLS,
+    TpuPipelineChunkScheduler,
+)
+from vllm_torchtpu.core.prefix_aware_scheduler import (
+    PrefixAwarePipelineChunkScheduler,
+    PrefixAwareScheduler,
+)
 
 
 def _make_request(
@@ -47,8 +56,11 @@ def _make_scheduler(
     window: int = 64,
     enable_caching: bool = True,
     raise_on_lookup: bool = False,
-) -> PrefixAwareScheduler:
-    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    cls: type[PrefixAwareScheduler | PrefixAwarePipelineChunkScheduler] = (
+        PrefixAwareScheduler
+    ),
+) -> PrefixAwareScheduler | PrefixAwarePipelineChunkScheduler:
+    s = cls.__new__(cls)
     q = FCFSRequestQueue()
     for r in requests:
         q.add_request(r)
@@ -84,11 +96,25 @@ def test_default_knobs():
     assert PrefixAwareScheduler.WINDOW == 64
 
 
-def test_promotes_warmest_within_window():
+def test_pipeline_chunk_variant_is_a_dynamic_chunk_scheduler():
+    cls = PrefixAwarePipelineChunkScheduler
+    assert issubclass(cls, TpuPipelineChunkScheduler)
+    assert f"{cls.__module__}.{cls.__qualname__}" == PREFIX_AWARE_PP_SCHEDULER_CLS
+    assert PREFIX_AWARE_PP_SCHEDULER_CLS in DYNAMIC_CHUNK_SCHEDULER_CLASSES
+
+
+@pytest.mark.parametrize(
+    "cls,base",
+    [
+        (PrefixAwareScheduler, AsyncScheduler),
+        (PrefixAwarePipelineChunkScheduler, TpuPipelineChunkScheduler),
+    ],
+)
+def test_promotes_warmest_within_window(cls, base):
     now = time.time()
     r_cold = _make_request("cold", num_tokens=1000, arrival_time=now - 10)
     r_warm = _make_request("warm", num_tokens=1000, arrival_time=now - 5)
-    s = _make_scheduler([r_cold, r_warm], {"cold": 0, "warm": 800})
+    s = _make_scheduler([r_cold, r_warm], {"cold": 0, "warm": 800}, cls=cls)
 
     expected = object()
 
@@ -97,7 +123,8 @@ def test_promotes_warmest_within_window():
         assert [r.request_id for r in s.waiting] == ["warm", "cold"]
         return expected
 
-    with patch.object(AsyncScheduler, "schedule", side_effect=schedule):
+    # The base class's schedule runs after the promotion.
+    with patch.object(base, "schedule", side_effect=schedule):
         assert s.schedule(throttle_prefills=True) is expected
 
 
