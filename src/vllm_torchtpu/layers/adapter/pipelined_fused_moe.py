@@ -106,9 +106,7 @@ def enable_pipelined_collective_and_compute() -> bool:
 enable_pipeline_collective_and_compute = enable_pipelined_collective_and_compute
 
 
-def _quantized_all_gather(
-    collective_group, hidden_states: torch.Tensor
-) -> torch.Tensor:
+def quantized_all_gather(collective_group, hidden_states: torch.Tensor) -> torch.Tensor:
     """All-gather activations in fp8, restored on arrival."""
     out_dtype = hidden_states.dtype
     quantized, scale = quantize_tensor(
@@ -258,9 +256,7 @@ def pipelined_fused_moe_gmm(
             # parallel_size > 1 only when collective_group is set.
             assert collective_group is not None
             if quantize_ag:
-                ag_hidden_states = _quantized_all_gather(
-                    collective_group, hidden_states
-                )
+                ag_hidden_states = quantized_all_gather(collective_group, hidden_states)
             else:
                 ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
             ag_topk_weights = (
@@ -328,7 +324,7 @@ def pipelined_fused_moe_gmm(
 
     def _all_gather_hs(hs_slice):
         if quantize_ag:
-            return _quantized_all_gather(collective_group, hs_slice)
+            return quantized_all_gather(collective_group, hs_slice)
         return collective_group.all_gather(hs_slice, dim=0)
 
     # Prime pipeline with initial all-gather for chunk 0
