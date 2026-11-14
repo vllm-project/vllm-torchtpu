@@ -18,42 +18,24 @@ import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 
+from vllm_torchtpu.kernels import pallas_compat
+
 
 def align_to(a, b):
     """Returns 'a' aligned to 'b'."""
     return pl.cdiv(a, b) * b
 
 
-def _resolve_enqueue_dma():
-    """Returns the Pallas TPU issue-point DMA handle (`tpu.enqueue_dma`).
-
-    `enqueue_dma(src, dst, sem, *, priority, strict_ordering)` enqueues the DMA
-    at the call site and returns its descriptor, so completion can be awaited
-    later. It lives in `jax._src.pallas.mosaic.primitives` (next to
-    `make_async_copy`); stacks that predate it get the equivalent descriptor
-    `start`, which lowers to the same `tpu.enqueue_dma`.
-    """
-    handle = getattr(pltpu, "enqueue_dma", None)
-    if handle is None:
-        from jax._src.pallas.mosaic import primitives as tpu_primitives
-        handle = getattr(tpu_primitives, "enqueue_dma", None)
-    if handle is not None:
-        return handle
-
-    def _enqueue_dma(src_ref,
-                     dst_ref,
-                     sem,
-                     *,
-                     priority: int = 0,
-                     strict_ordering: bool = False):
-        copy = pltpu.make_async_copy(src_ref, dst_ref, sem)
-        copy.start(priority=priority, strict_ordering=strict_ordering)
-        return copy
-
-    return _enqueue_dma
-
-
-enqueue_dma = _resolve_enqueue_dma()
+def enqueue_dma(src_ref,
+                dst_ref,
+                sem,
+                *,
+                priority: int = 0,
+                strict_ordering: bool = False):
+    """Enqueues an async DMA copy at the call site and returns its descriptor."""
+    copy = pallas_compat.make_async_copy(src_ref, dst_ref, sem)
+    copy.start(priority=priority, strict_ordering=strict_ordering)
+    return copy
 
 
 def cp_local_cache_len(global_kv_cache_len, cp_group_size, cp_rank, page_size):

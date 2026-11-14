@@ -394,6 +394,7 @@ def calculate_block_sizes(
         "decode_block_sizes",
         "prefill_block_sizes",
         "vmem_limit_bytes",
+        "decode_batch_size",
         "debug_mode",
         "out_dtype",
         "use_causal_mask",
@@ -441,7 +442,6 @@ def ragged_paged_attention(
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
-    **unused_kwargs,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
     Args:

@@ -843,22 +843,29 @@ def test_prepare_routed_metadata_skip_padded_tokens():
     assert int(np.asarray(group_sizes).sum()) == num_tokens // 2 * topk
 
 
-# Each block the divisor can pick (512; 256 at 1280; 128 at 640), both sides of
-# padding, and below it; no sentinel here, so the totals pin the padding too.
+# Each block the divisor can pick (512; 256 at 1280; 128 at 640 and for rows
+# padded up to 128), both sides of padding, and below it; no sentinel here, so
+# the totals pin the padding too.
 @pytest.mark.parametrize("num_rows",
                          [1, 51, 511, 512, 513, 640, 800, 1024, 1025, 1280])
+@pytest.mark.parametrize("num_buckets", [9, 128])
 # Concentrated keys drive the within-block rank past 2**8: the fp32 pin.
 @pytest.mark.parametrize("spread", [True, False])
-def test_counting_sort_positions_matches_stable_argsort(num_rows, spread):
-    num_buckets = 9
+def test_counting_sort_positions_matches_stable_argsort(
+        num_rows, num_buckets, spread):
     rng = np.random.default_rng(num_rows)
     keys = (rng.integers(0, num_buckets, size=num_rows)
             if spread else np.zeros(num_rows, dtype=np.int64))
     pos, counts = fused_moe_gmm._counting_sort_positions(
         jnp.asarray(keys, jnp.int32), num_buckets)
-    if num_rows < num_buckets:
-        # The rank matmul requires at least as many rows as buckets.
-        # Otherwise the caller must use argsort.
+    block = 128 if num_rows < 128 else next(
+        (s for s in fused_moe_gmm._COUNTING_SORT_BLOCKS
+         if s <= min(512, num_rows) and num_rows % s == 0),
+        min(512, num_rows),
+    )
+    if num_buckets + 1 > block:
+        # The rank matmul requires eff_buckets <= block; otherwise the caller
+        # falls back to argsort.
         assert pos is None and counts is None
         return
     want = np.argsort(np.argsort(keys, kind="stable"), kind="stable")

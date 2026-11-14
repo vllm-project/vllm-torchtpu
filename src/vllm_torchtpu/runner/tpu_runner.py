@@ -7185,10 +7185,13 @@ class TPUModelRunner(GPUModelRunner):
                                           top_k,
                                           top_p,
                                           unscaled_logits=logits)
-        # Compute Gumbel noise directly in float32 without intermediate
-        # bf16 conversions that emit thousands of zero-padded vpack.i instructions.
-        u_f32 = u.to(torch.float32)
-        u_clamped = torch.clamp(u_f32, min=1.17549435e-38, max=0.9921875)
+        # Clamp and compute Gumbel noise in float32 using the uniform sample's
+        # dtype bounds so log(-log(u)) stays finite without intermediate bf16
+        # casts.
+        u_finfo = torch.finfo(u.dtype)
+        u_clamped = torch.clamp(u.to(torch.float32),
+                                min=u_finfo.tiny,
+                                max=1.0 - u_finfo.eps)
         gumbel_noise = -torch.log(-torch.log(u_clamped))
         noisy_logits = masked_logits + gumbel_noise.to(logits.dtype)
         final_logits = torch.where(is_greedy, logits, noisy_logits)

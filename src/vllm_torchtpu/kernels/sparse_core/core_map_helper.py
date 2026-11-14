@@ -79,8 +79,6 @@ def _dependent_empty_custom_call_lower(ctx, *deps, shape, dtype, out_sharding):
 mlir.register_lowering(_dependent_empty_p, _dependent_empty_lower)
 mlir.register_lowering(_dependent_empty_p, _dependent_empty_custom_call_lower,
                        "tpu")
-mlir.register_lowering(_dependent_empty_p, _dependent_empty_custom_call_lower,
-                       "gpu")
 
 
 def _empty_out_ref(out_type, deps=()):

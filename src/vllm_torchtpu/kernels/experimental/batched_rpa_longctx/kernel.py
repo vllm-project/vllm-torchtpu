@@ -21,6 +21,7 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu.kernels import pallas_compat
 # yapf: disable
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (
     bref_override, configs, flash_attention, schedule, stitch_utils, utils)
@@ -495,9 +496,7 @@ def rpa_body(
 
 # Rows (of 128 lanes) written per iteration by the rolled VMEM fills below. A
 # (512, 128) 32-bit block is 64 vregs, i.e. 64 vector stores per iteration,
-# which keeps the store slot saturated while the loop body stays tiny (the
-# previous fully unrolled `ref[...] = 0` emitted one store per vreg of the
-# whole multi-buffered window: >10k bundles for the decode configuration).
+# which keeps the store slot saturated while the loop body stays small.
 _FILL_ROWS_PER_ITER = 512
 
 
@@ -808,7 +807,7 @@ def rpa_kernel(
                         src_off = pl.multiple_of(src_off, 128)
 
                         dma_list.append(
-                            pltpu.make_async_copy(
+                            pallas_compat.make_async_copy(
                                 h.at[pl.ds(src_off, read_size)],
                                 s.at[pl.ds(0, read_size)],
                                 dma_sem.at[0],
@@ -840,13 +839,13 @@ def rpa_kernel(
                 # subsequent iterations cannot recover (0 * NaN = NaN).
 
                 # Initialize KV cache to zeros.
-                # When perfomring p * v, we perform causal masking on lhs (p) by
-                # zeroing out columns that should not be processed for a given
-                # row. Even if we don't perform masking on rows of rhs (v), the
-                # output is still correct since reuslt of multiplication will be
-                # zero thanks zero on lhs. However, this assumption does not
-                # hold if a row of rhs has NaNs. To avoid this, we initiallize
-                # scratch memory with non-zero values. Even if the scratch
+                # When performing p * v, we perform causal masking on lhs (p)
+                # by zeroing out columns that should not be processed for a
+                # given row. Even if we don't perform masking on rows of rhs
+                # (v), the output is still correct since result of
+                # multiplication will be zero thanks to zero on lhs. However,
+                # this assumption does not hold if a row of rhs has NaNs. To
+                # avoid this, we initialize scratch memory with non-NaN values. Even if the scratch
                 # memory is storing kv cache from previous step, as long as the
                 # data is not NaNs, there will be no numeric concerns.
                 #
