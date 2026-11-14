@@ -250,6 +250,16 @@ class DSparkProposer(DFlashProposer):
             padded_num_reqs, block_size
         )
         prev = ids_3d[:, 0]
+        chain_kernel = getattr(self.draft_model, "markov_chain_kernel", None)
+        if (
+            vocab_parallel
+            and chain_kernel is not None
+            and not self.use_confidence_head
+            and chain_kernel.fits(block_size - sample_start, padded_num_reqs)
+        ):
+            # The whole chain in one kernel (`pallas_markov_argmax`); drafts
+            # are target ids (the kernel's draft model has no d2t map).
+            return chain_kernel(slot_logits, prev), hidden
         draft_tokens = []
         markov_embeds = []
         for i in range(sample_start, block_size):
