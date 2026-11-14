@@ -98,7 +98,14 @@ def strided_store(ref, start, sz, step, val):
         ref[pl.ds(start + i, sz // step, step)] = val_slice
 
 
-def convert_to_target_bitwidth(val, target_bitwidth: int, kv_dtype: jnp.dtype):
+def convert_to_target_bitwidth(
+    val,
+    target_bitwidth: int,
+    kv_dtype: jnp.dtype,
+    *,
+    load_k: bool = True,
+    load_v: bool = True,
+):
     """Converts a value to a target bitwidth."""
     # If we want to convert 32-bits into 32//N number of N-bits value, naive
     # approach would be to perform 32//N number of 32-bits to N-bits conversion.
@@ -117,26 +124,43 @@ def convert_to_target_bitwidth(val, target_bitwidth: int, kv_dtype: jnp.dtype):
     next_bitwidth = curr_bitwidth // 2
     next_dtype = jnp.dtype(f"uint{next_bitwidth}")
 
-    left = val.astype(next_dtype)
-
-    # Bitwise shift is only supported in uint32.
-    val_u32 = pltpu.bitcast(val, jnp.uint32)
-    val_u32_shifted = val_u32 >> next_bitwidth
-    # Convert back to original dtype.
-    val_shifted = pltpu.bitcast(val_u32_shifted, curr_dtype)
-    right = val_shifted.astype(next_dtype)
-
     if next_bitwidth == target_bitwidth:
-        k = pltpu.bitcast(left, kv_dtype)
-        v = pltpu.bitcast(right, kv_dtype)
+        if load_k:
+            left = val.astype(next_dtype)
+            k = pltpu.bitcast(left, kv_dtype)
+        else:
+            k = None
+        if load_v:
+            # Bitwise shift is only supported in uint32.
+            val_u32 = pltpu.bitcast(val, jnp.uint32)
+            val_u32_shifted = val_u32 >> next_bitwidth
+            # Convert back to original dtype.
+            val_shifted = pltpu.bitcast(val_u32_shifted, curr_dtype)
+            right = val_shifted.astype(next_dtype)
+            v = pltpu.bitcast(right, kv_dtype)
+        else:
+            v = None
         return [(k, v)]
     else:
-        left_out = convert_to_target_bitwidth(left,
-                                              target_bitwidth=target_bitwidth,
-                                              kv_dtype=kv_dtype)
-        right_out = convert_to_target_bitwidth(right,
-                                               target_bitwidth=target_bitwidth,
-                                               kv_dtype=kv_dtype)
+        left = val.astype(next_dtype)
+        val_u32 = pltpu.bitcast(val, jnp.uint32)
+        val_u32_shifted = val_u32 >> next_bitwidth
+        val_shifted = pltpu.bitcast(val_u32_shifted, curr_dtype)
+        right = val_shifted.astype(next_dtype)
+        left_out = convert_to_target_bitwidth(
+            left,
+            target_bitwidth=target_bitwidth,
+            kv_dtype=kv_dtype,
+            load_k=load_k,
+            load_v=load_v,
+        )
+        right_out = convert_to_target_bitwidth(
+            right,
+            target_bitwidth=target_bitwidth,
+            kv_dtype=kv_dtype,
+            load_k=load_k,
+            load_v=load_v,
+        )
         return left_out + right_out
 
 
