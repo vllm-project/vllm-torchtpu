@@ -250,8 +250,8 @@ def _check(rank, world, group, cp_mla):
 
     # Positive control: rotate the send blocks by one rank, so rank d merges
     # the heads meant for rank d-1. The same check must now fail.
-    real = cp_mla._all_to_all
-    cp_mla._all_to_all = lambda x, g: real(torch.roll(x, 1, dims=0), g)
+    real = cp_mla.all_to_all
+    cp_mla.all_to_all = lambda x, g: real(torch.roll(x, 1, dims=0), g)
     try:
         for arm in ("a2a",):
             _set_arm(cp_mla, arm)
@@ -264,7 +264,7 @@ def _check(rank, world, group, cp_mla):
                     traceback.print_exc()
                     report[f"control_rotated/{arm}/{how}"] = {"error": repr(exc)[:400]}
     finally:
-        cp_mla._all_to_all = real
+        cp_mla.all_to_all = real
     return report
 
 

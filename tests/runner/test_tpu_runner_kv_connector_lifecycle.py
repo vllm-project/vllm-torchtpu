@@ -72,8 +72,9 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     )
     async_source = ([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
     runner = SimpleNamespace(
-        _pp_wave=None,
+        _pp_handoff=None,
         _dp_step_other_decode=False,
+        num_prompt_logprobs={},
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],
@@ -81,9 +82,11 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
             num_reqs_list=[1],
             spec_decode_metadata_list=[object() if verify else None],
             mamba_state_indices_list=None,
+            mamba_boundary_plans=None,
             pooler_output_list=[],
             top_tokens=False,
             kv_save_nan_check=None,
+            prompt_logprobs_chunks=[],
         ),
         input_batch=SimpleNamespace(
             max_num_logprobs=None,
@@ -128,7 +131,11 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     )
     runner._stage_timing.take_samples.return_value = ([], [])
     runner._async_drafter = runner.drafter
-    for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+    for name in (
+        "maybe_wait_for_kv_save",
+        "get_finished_kv_transfers",
+        "_build_kv_connector_output",
+    ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner
 

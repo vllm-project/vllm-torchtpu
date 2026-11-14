@@ -370,6 +370,30 @@ class MMEncoderManager(EncoderCudaGraphManager):
             )
         return local_outputs
 
+    def _dp_gather(
+        self,
+        local_outputs: list[torch.Tensor],
+        per_item_out_tokens: list[int],
+        image_rank_assignment: list[int],
+        images_per_rank: list[int],
+        max_output_tokens_per_rank: int,
+    ) -> list[torch.Tensor]:
+        """Gather encoder DP outputs at the same point on every TP rank.
+
+        Each rank encodes a different share of the images, and upstream's
+        gather leaves its input and output deferred, so ranks can execute the
+        all-gather at different points among their collectives.
+        ``_gather_dp_outputs`` materializes the input before the all-gather
+        and the output right after it.
+        """
+        return self._gather_dp_outputs(
+            local_outputs,
+            per_item_out_tokens,
+            image_rank_assignment,
+            images_per_rank,
+            max_output_tokens_per_rank,
+        )
+
     def _gather_dp_outputs(
         self,
         local_outputs: list[torch.Tensor],
@@ -380,6 +404,10 @@ class MMEncoderManager(EncoderCudaGraphManager):
     ) -> list[torch.Tensor]:
         from vllm.distributed.parallel_state import get_tp_group
 
+        # Each new all-gather size compiles on every rank; budgets bound the sizes.
+        max_tokens = (
+            self._find_smallest_fitting_budget_given_tokens(max_tokens) or max_tokens
+        )
         padded = torch.zeros(
             (max_tokens, self.config.out_hidden_size),
             device=self.device,
@@ -408,6 +436,9 @@ class MMEncoderManager(EncoderCudaGraphManager):
         for path, templates in self.budget_templates.items():
             for budget in templates:
                 self._capture_budget_graph(budget, path=path)
+        if self.use_dp:
+            for budget in self.token_budgets:
+                self._gather_dp_outputs([], [], [], [], budget)
 
 
 def maybe_create_mm_encoder_manager(

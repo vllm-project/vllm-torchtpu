@@ -72,6 +72,11 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     should_quantize_on_load,
 )
+from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+    VllmFp8Config,
+    VllmFp8LinearMethodTPU,
+    VllmFp8MoEMethodTPU,
+)
 from vllm_torchtpu.layers.core.quant_methods import UNQUANTIZED, get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -197,11 +202,6 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             # Skip kv_b_proj: MLAAttention slices W_UK_T/W_UV from unquantized
             # kv_b_proj.weight and quantizes them separately after loading.
             if should_quantize_on_load(prefix) and "kv_b_proj" not in prefix.split("."):
-                from vllm_torchtpu.layers.adapter.quantization.fp8 import (
-                    VllmFp8Config,
-                    VllmFp8LinearMethodTPU,
-                )
-
                 fp8_config = VllmFp8Config(
                     is_checkpoint_fp8_serialized=False,
                     activation_scheme="dynamic",
@@ -223,6 +223,19 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         if isinstance(layer, RoutedExperts):
             # For MoE layers, use our custom TPU implementation
             moe_config = self.get_moe_config(layer)
+            if should_quantize_on_load(prefix):
+                if moe_config.has_bias:
+                    raise NotImplementedError(
+                        f"QUANTIZE_ON_LOAD_PREFIXES matched {prefix}, but FP8 MoE "
+                        "on-load quantization does not support expert bias"
+                    )
+                # BF16 experts are quantized to the MOE_REQUANTIZE_* format
+                # (per-channel FP8 by default) after loading.
+                fp8_config = VllmFp8Config(
+                    is_checkpoint_fp8_serialized=False,
+                    activation_scheme="dynamic",
+                )
+                return VllmFp8MoEMethodTPU(fp8_config, moe_config)
             return VllmUnquantizedFusedMoEMethod(moe_config)
 
         if isinstance(layer, Attention):

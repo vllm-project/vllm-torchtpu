@@ -53,6 +53,7 @@ docs/
 !.buildkite/release/
 !.buildkite/pipeline_*.yml
 .github/
+!.github/scripts/
 mkdocs.yml
 .readthedocs.yaml
 .pre-commit-config.yaml

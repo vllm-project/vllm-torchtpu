@@ -115,6 +115,18 @@ Example build using the standard helper script:
 
 The `ci` and `dev` targets carry [vllm-router](https://github.com/vllm-project/router) at `/usr/local/bin/vllm-router`, built from the commit in the `VLLM_ROUTER_COMMIT` build arg. The disaggregated benchmark clients start it in prefill/decode mode when a serve config sets `AGENTX_PROXY=router`; the default stays the toy proxy in `examples/disagg`.
 
+## vllm-rs and numactl
+
+Every target has `numactl`, which `--numa-bind` uses to launch each worker.
+
+vLLM's Rust frontend, `vllm-rs`, is compiled into the image only with `--vllm-rs` (build arg `BUILD_VLLM_RS=true`), since the compile takes minutes. It is built from the vLLM commit the image installs, sits at `/usr/local/bin/vllm-rs`, and is linked inside the `vllm` package, where vLLM looks for it by default, so `VLLM_USE_RUST_FRONTEND=1` alone makes `vllm serve` use it:
+
+```bash
+./docker/build_image.sh --target dev --vllm-rs -t dev:latest
+```
+
+An image built with `--vllm-source` drops it, as the binary matches the pinned vLLM rather than the source tree.
+
 ## Useful build arguments
 
 The Dockerfile also supports a few build arguments that may be useful in advanced workflows:

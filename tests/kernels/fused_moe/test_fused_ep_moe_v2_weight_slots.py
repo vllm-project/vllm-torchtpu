@@ -152,7 +152,9 @@ LADDER_ARGS = (TILE_M, ROWS_ALLOC, 8, 8)
     [
         (None, tuple(range(128, 513, 128))),
         ("0", tuple(range(128, 513, 128))),
-        ("2", (256, 512)),
+        # Two rungs: the short one at the expected per-expert load,
+        # 1024 / (8 * 8) = 16 rows (+2 sd), floored at LOW_RUNG_MIN.
+        ("2", (32, 512)),
         ("8", tuple(range(64, 513, 64))),
         ("1", (TILE_M,)),
         ("3", (TILE_M,)),
@@ -180,3 +182,17 @@ def test_the_height_ladder_override(monkeypatch, override, want):
     # never the short one.
     assert rungs[-1] == TILE_M
     assert all(step % host.ROWBLK == 0 for step in rungs)
+
+
+@pytest.mark.parametrize(
+    "t_local,want",
+    [(32, (32, 128)), (64, (32, 128)), (128, (48, 128)), (256, (64, 128))],
+)
+def test_two_rung_ladder_tracks_the_expected_expert_load(monkeypatch, t_local, want):
+    """At the DeepSeek-V4-Pro EP16 shape (24 local experts, top-6) the short
+    rung follows the expected rows per expert, and falls back to the half tile
+    once that is no shorter."""
+    monkeypatch.setenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "2")
+    ep, g_local, topk, tile_m = 16, 24, 6, 128
+    rows_alloc = host.ragged_stride_bound(t_local * ep, topk, ep * g_local, tile_m)
+    assert kernel.tile_height_rungs(tile_m, rows_alloc, g_local, ep) == want

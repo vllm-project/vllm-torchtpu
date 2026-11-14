@@ -17,6 +17,7 @@ result row to the shard that owns its token, so the layer needs no dense
 combine reduce-scatter."""
 
 import functools
+import math
 import threading
 from typing import cast
 
@@ -65,6 +66,10 @@ FP4_OUTPUT_CHUNK = 256
 # top rung is always tile_m, so a full tile is unchanged. Overridable per
 # process by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time.
 HEIGHT_RUNGS = 4
+# The two-rung ladder's short rung: a multiple of this many rows, and no
+# shorter than LOW_RUNG_MIN (the shortest height measured on the fp4 path).
+LOW_RUNG_ALIGN = 16
+LOW_RUNG_MIN = 32
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -155,6 +160,10 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     of every routed row landing on one shard, so `ep` shards' worth of it is
     what a shard's `g_local` experts actually expect to hold.
 
+    A two-rung ladder puts its short rung at the expected per-expert load
+    (mean plus two standard deviations of a uniform routing, rounded up to
+    LOW_RUNG_ALIGN rows and at least LOW_RUNG_MIN) when that is below the
+    half-tile, since at decode almost every expert is a single short tile.
     """
     rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE or HEIGHT_RUNGS
     step = tile_m // rungs
@@ -165,6 +174,12 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
         or rows_alloc > ep * g_local * tile_m
     ):
         return (tile_m,)
+    if rungs == 2:
+        mean = rows_alloc / (ep * g_local)
+        low = -(-int(math.ceil(mean + 2 * math.sqrt(mean))) // LOW_RUNG_ALIGN)
+        low = max(low * LOW_RUNG_ALIGN, LOW_RUNG_MIN)
+        if low < step and low % ROWBLK == 0:
+            return (low, tile_m)
     return tuple(range(step, tile_m + 1, step))
 
 
@@ -1234,37 +1249,56 @@ def _build_fused_ep_moe_kernel(
             def _():
                 _rows_wait(send_scl_sems.at[parity], cscl_hbm, subs)
 
-        def prime_expert(e, lhs_slot, wslot, window_started):
-            """Prime expert ``e``'s metadata and first activation tile.
+        def n_groups_of(e):
+            """Index-window groups expert ``e``'s routed rows span."""
+            tiles = -(-expert_rows_sm[e] // tile_m)
+            return -(-tiles // gather_tiles)
 
-            ``wslot`` is the scalar-memory slot this expert's group-zero index
-            window lives in -- a global alternation rather than a per-expert
-            one, so the previous expert can start it a tile early; that early
-            start is what ``window_started`` reports, and then only the wait
-            is owed. The window is a bare HBM round trip, and issued here it
-            is the one arrival at an expert's head with nothing behind it.
+        def issue_rows_ahead(e, visit_j, wslot):
+            """After expert ``e`` (visit ``visit_j``) has its first tile's rows
+            in flight: start the window its rows no longer need -- its second
+            group's, or, for a single-group expert, the next visit's first.
+
+            Either way it lands in the other scalar slot, which the previous
+            expert's last group held and whose rows have all been issued.
+            """
+            other = jnp.int32(1) - wslot
+
+            @pl.when(expert_rows_sm[e] > gather_payload_rows)
+            def _():
+                issue_gather_window(expert_base_sm[e] + gather_payload_rows, other)
+
+            @pl.when(jnp.logical_and(n_groups_of(e) == 1, visit_j + 1 < n_visit))
+            def _():
+                issue_gather_window(expert_base_sm[visit_sm[visit_j + 1]], other)
+
+        def prime_expert(e):
+            """Prime the first visited expert ``e``'s first activation tile.
+
+            Its group-zero index window goes in scalar slot 0 and its rows in
+            lhs slot 0. Index windows alternate slots across the whole visit
+            list, so every later expert's first window and first tile are
+            issued under the previous expert's compute instead; this is the
+            one arrival with nothing in front of it.
             """
             rows = expert_rows_sm[e]
             slab_base = expert_base_sm[e]
-
-            @pl.when(jnp.logical_not(window_started))
-            def _():
-                issue_gather_window(slab_base, wslot)
-
+            wslot = jnp.int32(0)
+            issue_gather_window(slab_base, wslot)
             wait_gather_window(slab_base, wslot)
             _, shift = gather_dma_coords(slab_base)
             lhs_issue_tile(
-                slab_base, jnp.minimum(rows, tile_m) // ROWBLK, lhs_slot, wslot, shift
+                slab_base,
+                jnp.minimum(rows, tile_m) // ROWBLK,
+                jnp.int32(0),
+                wslot,
+                shift,
             )
-
-            # Keep group one in flight while tile zero computes. Later group
-            # boundaries refill the just-retired alternate slot in the same
-            # way, so at most two fixed windows are ever resident.
-            @pl.when(rows > gather_payload_rows)
-            def _():
-                issue_gather_window(
-                    slab_base + gather_payload_rows, jnp.int32(1) - wslot
-                )
+            # Keep group one (or the next visit's window) in flight while tile
+            # zero computes. Later group boundaries refill the just-retired
+            # alternate slot in the same way, so at most two fixed windows are
+            # ever resident.
+            issue_rows_ahead(e, jnp.int32(0), wslot)
 
         def expert_tiles(e, visit_i, carry):
             """One expert step: a fori_loop over its [tile_m, H] tiles."""
@@ -1502,17 +1536,30 @@ def _build_fused_ep_moe_kernel(
 
                     # The next group's window was issued when the previous
                     # group became current. Wait only at the boundary, then
-                    # reuse the retired slot for the following group before
-                    # issuing this activation tile.
+                    # reuse the retired slot for the following group -- or,
+                    # once the last group is current, for the next visit's
+                    # first -- before issuing this activation tile.
                     @pl.when(next_within == 0)
                     def _():
                         wait_gather_window(next_group_base, next_group_slot)
                         following = next_group + 1
+                        has_following = following * gather_tiles < n_tiles
 
-                        @pl.when(following * gather_tiles < n_tiles)
+                        @pl.when(has_following)
                         def _():
                             issue_gather_window(
                                 slab_base + following * gather_payload_rows,
+                                jnp.int32(1) - next_group_slot,
+                            )
+
+                        @pl.when(
+                            jnp.logical_and(
+                                jnp.logical_not(has_following), visit_i + 1 < n_visit
+                            )
+                        )
+                        def _():
+                            issue_gather_window(
+                                expert_base_sm[visit_sm[visit_i + 1]],
                                 jnp.int32(1) - next_group_slot,
                             )
 
@@ -1526,14 +1573,24 @@ def _build_fused_ep_moe_kernel(
                         next_shift + next_within * tile_m,
                     )
 
-                # The next expert's index window, a tile early. This is the
-                # only arrival the kernel waits for with nothing issued
-                # behind it, so a tile of compute is what it costs to hide.
+                # The next visit's index window went out when this expert's
+                # last group became current, so the next visit's first tile
+                # is issued here, under this tile's compute, rather than at
+                # the visit boundary with nothing to hide it behind.
                 @pl.when(jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_visit))
                 def _():
-                    issue_gather_window(
-                        expert_base_sm[visit_sm[visit_i + 1]], next_wslot
+                    nxt = visit_sm[visit_i + 1]
+                    nbase = expert_base_sm[nxt]
+                    wait_gather_window(nbase, next_wslot)
+                    _, nshift = gather_dma_coords(nbase)
+                    lhs_issue_tile(
+                        nbase,
+                        jnp.minimum(expert_rows_sm[nxt], tile_m) // ROWBLK,
+                        other_parity,
+                        next_wslot,
+                        nshift,
                     )
+                    issue_rows_ahead(nxt, visit_i + 1, next_wslot)
 
                 def compute_tile(height):
                     """Run the FFN on the tile's leading `height` rows.
@@ -1722,22 +1779,6 @@ def _build_fused_ep_moe_kernel(
                         w2s_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
                     w2_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
 
-            # Cross-expert lookahead: prime the next visited expert's first
-            # activation tile before this expert's commit drain and push. Its
-            # index window went out on the last tile, so this is the wait and
-            # not the round trip. Empty experts are absent from the visit list.
-            tiles_done = carry[0]
-
-            @pl.when(visit_i + 1 < n_visit)
-            def _():
-                nxt = visit_sm[visit_i + 1]
-                prime_expert(
-                    nxt,
-                    lax.rem(tiles_done, jnp.int32(OUT_PARITIES)),
-                    next_wslot,
-                    jnp.bool_(True),
-                )
-
             return carry[:-1] + (next_wslot,)
 
         def drain_commits(carried):
@@ -1767,7 +1808,7 @@ def _build_fused_ep_moe_kernel(
 
         @pl.when(n_visit > 0)
         def _():
-            prime_expert(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.bool_(False))
+            prime_expert(visit_sm[0])
 
         def push_expert(e):
             """Push expert e's remote regions and hop its own-dest region."""
