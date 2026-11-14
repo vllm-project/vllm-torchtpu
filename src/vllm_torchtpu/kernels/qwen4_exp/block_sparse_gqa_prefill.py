@@ -1836,86 +1836,23 @@ def _aligned_sources(starts, offsets, real, rows, max_tokens):
 
 
 
-# --- Debug probe (local, test only): VLLM_TPU_QSA_BOUND_STAB_PROBE=1 -------------
-# Measures, on served DCP prefill calls, how far the d' stabilizer
-# M = sm * k_scale * |q_row| * Kmax sits above each row's true max, using the
-# kernel's own lse: rowmax <= lse <= rowmax + log(n_visible), so
-# M - lse <= gap <= M - lse + log(n_visible). Kmax = max key norm over this
-# rank's whole cache slot (the conservative running-max proxy). Host-side
-# accumulation, one summary line every N calls. Never changes outputs.
-_PROBE_EDGES = None
-_PROBE_STATE = {"calls": 0}
+
+def _mark_body(x_ref, o_ref):
+    o_ref[...] = x_ref[...] + 1.0
 
 
-def _probe_host(hist_lo, hist_hi, stats, kmax4):
-    import json
-    import numpy as np
-
-    st = _PROBE_STATE
-    st["calls"] += 1
-    for key, val in (("hist_lo", hist_lo), ("hist_hi", hist_hi)):
-        val = np.asarray(val, np.int64)
-        st[key] = st.get(key, 0) + val
-    stats = np.asarray(stats, np.float64)
-    # rows, min gap_lo, max gap_lo, max gap_hi, max M, max lse, rows gap_hi>60, rows gap_hi>80
-    agg = st.get("stats")
-    if agg is None:
-        st["stats"] = stats.copy()
-    else:
-        agg[0] += stats[0]
-        agg[1] = min(agg[1], stats[1])
-        agg[2:6] = np.maximum(agg[2:6], stats[2:6])
-        agg[6:] += stats[6:]
-    st["kmax4"] = np.maximum(st.get("kmax4", 0), np.asarray(kmax4, np.float64))
-    every = int(os.environ.get("VLLM_TPU_QSA_BOUND_STAB_PROBE_EVERY", "96"))
-    if st["calls"] % every == 0:
-        a = st["stats"]
-        line = {
-            "calls": st["calls"], "rows": int(a[0]), "gap_lo_min": a[1],
-            "gap_lo_max": a[2], "gap_hi_max": a[3], "M_max": a[4], "lse_max": a[5],
-            "rows_gap_hi_gt60": int(a[6]), "rows_gap_hi_gt80": int(a[7]),
-            "kmax_slots": [round(float(x), 3) for x in st["kmax4"]],
-            "hist_lo_from_-20_step1": st["hist_lo"].tolist(),
-            "hist_hi_from_-20_step1": st["hist_hi"].tolist(),
-        }
-        logger.warning("QSA_BOUND_STAB_PROBE %s", json.dumps(line))
+def _mark_kernel(threshold, _):
+    """A named no-op kernel: its xprof count is the debug signal."""
+    out = pl.pallas_call(
+        _mark_body,
+        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+        name=f"qsa_bound_stab_mark_{threshold}",
+    )(jnp.zeros((8, 128), jnp.float32))
+    return out[0, 0]
 
 
-def _bound_stab_probe(query, cache, lse, lengths, blocks, *, ratio, k_scale,
-                      kv_head_offset, dcp_rank):
-    head_dim = query.shape[-1]
-    sm = head_dim**-0.5
-    keys = cache.astype(jnp.float32)  # [pages, page, 1, 4, D] (fp8 slots K0 V0 K1 V1)
-    sq = jnp.sum(jnp.square(jnp.where(jnp.isfinite(keys), keys, 0.0)), axis=-1)
-    kmax4 = jnp.sqrt(jnp.max(sq, axis=(0, 1, 2)))  # per slot
-    kmax = kmax4[2 * kv_head_offset]
-    qn = jnp.sqrt(jnp.sum(jnp.square(query.astype(jnp.float32)), axis=-1))  # [T, H]
-    m = sm * k_scale * qn * kmax
-    selected = jnp.sum(blocks >= 0, axis=1).astype(jnp.float32) * ratio
-    nvis = jnp.maximum(selected, 1.0)[:, None]
-    ok = jnp.isfinite(lse) & (lengths > 0)[:, None]
-    lo = m - lse
-    hi = lo + jnp.log(nvis)
-    big = jnp.float32(1e30)
-    bins = jnp.arange(-20, 201, dtype=jnp.float32)
-
-    def hist(x):
-        idx = jnp.clip(jnp.floor(x) + 20, 0, 220).astype(jnp.int32)
-        idx = jnp.where(ok, idx, 221)
-        return jnp.zeros((222,), jnp.int32).at[idx.reshape(-1)].add(1)[:221]
-
-    del bins
-    stats = jnp.stack([
-        jnp.sum(ok).astype(jnp.float32),
-        jnp.min(jnp.where(ok, lo, big)),
-        jnp.max(jnp.where(ok, lo, -big)),
-        jnp.max(jnp.where(ok, hi, -big)),
-        jnp.max(jnp.where(ok, m, -big)),
-        jnp.max(jnp.where(ok, lse, -big)),
-        jnp.sum(ok & (hi > 60)).astype(jnp.float32),
-        jnp.sum(ok & (hi > 80)).astype(jnp.float32),
-    ])
-    jax.debug.callback(_probe_host, hist(lo), hist(hi), stats, kmax4)
+def _no_mark(_):
+    return jnp.float32(0.0)
 
 
 def block_sparse_gqa_attention(
@@ -2088,16 +2025,20 @@ def block_sparse_gqa_attention(
         low = live_rows & jnp.isfinite(lse) & (lse - stab < BOUND_STAB_GUARD)
         lost = has_key & jnp.isneginf(lse)
         rerun = jnp.any(low | lost)
+        marks = os.environ.get("VLLM_TPU_QSA_BOUND_STAB_MARKS", "")
+        if marks:
+            # Debug (xprof-visible, no host callback): per threshold t, a
+            # tiny named kernel runs when some row has lse - stabilizer < -t,
+            # i.e. its gap below the bound exceeds about t + shift nats.
+            for t in (int(x) for x in marks.split(",") if x):
+                hit = jnp.any(live_rows & jnp.isfinite(lse) & (lse - stab < -t))
+                tick = lax.cond(hit, functools.partial(_mark_kernel, t), _no_mark, None)
+                output = (output[0], output[1] + tick * 0.0)
+            tick = lax.cond(rerun, functools.partial(_mark_kernel, 999), _no_mark, None)
+            output = (output[0], output[1] + tick * 0.0)
         output = lax.cond(rerun, lambda o: routed({}), lambda o: o, output)
     else:
         output = routed({})
-    if return_lse and dcp is not None and os.environ.get(
-        "VLLM_TPU_QSA_BOUND_STAB_PROBE"
-    ):
-        _bound_stab_probe(
-            query, cache, output[1], lengths, blocks, ratio=ratio, k_scale=k_scale,
-            kv_head_offset=kv_head_offset, dcp_rank=dcp[0],
-        )
     if mask_in_padding:
         out, lse = output
         return out, lse, cache

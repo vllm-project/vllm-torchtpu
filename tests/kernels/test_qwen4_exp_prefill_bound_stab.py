@@ -168,3 +168,13 @@ def test_note_key_norm_bound_keeps_max(monkeypatch):
     assert bsp.key_norm_bound() == 20.0
     with pytest.raises(ValueError):
         bsp.note_key_norm_bound(float("nan"))
+
+
+def test_debug_marks_do_not_change_outputs(interpret, monkeypatch):
+    case = make_case(np.random.default_rng(6), CASES["single"], 24)
+    bsp.note_key_norm_bound(case[-1])
+    plain = attend(case, 0, 1)
+    monkeypatch.setenv("VLLM_TPU_QSA_BOUND_STAB_MARKS", "0,20,40")
+    marked = attend(case, 0, 1)
+    for a, b in zip(marked, plain):
+        np.testing.assert_array_equal(bits(a), bits(b))
