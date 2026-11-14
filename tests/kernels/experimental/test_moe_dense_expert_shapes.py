@@ -28,6 +28,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.experimental import moe_dense_expert as kernel
+from vllm_torchtpu.kernels.experimental import moe_dense_expert_fp4
 from vllm_torchtpu.kernels.megablox import gmm_v2
 
 
@@ -377,3 +378,9 @@ def test_dense_expert_threshold_rejects_invalid_value(monkeypatch, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=name):
         envs.environment_variables[name]()
+
+
+@pytest.mark.parametrize("m, expected", [(8, 1024), (32, 1024), (64, 768)])
+def test_fp4_chunk_fits_minimax_m3_ep8_buffers_in_tpu7x_vmem(m, expected):
+    # tpu7x AOT compiles fit each of these; 64 rows run out of VMEM at 1024.
+    assert moe_dense_expert_fp4._chunk(m, 6144, 3072, 64 << 20) == expected
