@@ -300,10 +300,11 @@ def _make_sample_runner(
 ) -> SimpleNamespace:
     """Stand-in ``TPUModelRunner`` for ``sample_tokens`` and its chunk samplers.
 
-    Binds the real sampling methods (``_sample_plain_chunk``,
-    ``_sample_spec_verify_chunk``, min_tokens, async output, verify gathers)
-    to a CPU ``SimpleNamespace`` with real ``MinTokensTracker`` and
-    ``ThinkingBudgetTracker`` instances fed from ``requests``.
+    Binds the real sampling methods (``_sample_chunk_logits``,
+    ``_sample_plain_chunk``, ``_sample_spec_verify_chunk``, min_tokens, async
+    output, verify gathers) to a CPU ``SimpleNamespace`` with real
+    ``MinTokensTracker`` and ``ThinkingBudgetTracker`` instances fed from
+    ``requests``.
     """
     tracker = ThinkingBudgetTracker(
         reasoning_cfg, max_num_reqs=max_num_reqs, device=torch.device("cpu")
@@ -346,8 +347,8 @@ def _make_sample_runner(
             token_ids_cpu=np.zeros((max(len(req_ids), 1), 64), dtype=np.int32),
         ),
         requests=requests,
+        num_prompt_logprobs={},
         _pre_async_results=None,
-        _pp_wave=None,
         _dp_step_other_decode=False,
         _min_tokens=min_tracker,
         _thinking_budget=tracker,
@@ -403,6 +404,7 @@ def _make_sample_runner(
         TPUModelRunner._scheduled_draft_counts,
         TPUModelRunner._assemble_async_spec_substitution,
         TPUModelRunner._assemble_async_prefill_bootstrap,
+        TPUModelRunner._sample_chunk_logits,
         TPUModelRunner._sample_plain_chunk,
         TPUModelRunner._sample_spec_verify_chunk,
         TPUModelRunner.spec_bonus_and_target_logits,
