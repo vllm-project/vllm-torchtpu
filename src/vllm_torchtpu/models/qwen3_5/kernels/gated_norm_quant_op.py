@@ -13,9 +13,9 @@
 # limitations under the License.
 """GDN output projection with the gated norm and fp8 quantization fused.
 
-On a Qwen3.5 engine the runner calls :func:`install_if_supported` after
-loading (a Qwen3.5 rule). :func:`install` checks every gated-delta-net layer
-and marks it, and the layer's output
+Where the kernel was measured the runner calls :func:`install_if_supported`
+after loading (a Qwen3.5 rule, ``measured``). :func:`install` checks every
+gated-delta-net layer and marks it, and the layer's output
 projection runs :func:`output_projection`: one kernel produces the out-proj's
 fp8 rows and scales from the GDN output and the gate, and the fp8 matmul runs
 on them, instead of ``RMSNormGated`` followed by the fp8 linear.
@@ -24,7 +24,7 @@ Custom-op registration and shape guards for fused post-GDN RMSNormGated +
 FP8 quantization.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import cast
 
 import jax
@@ -170,14 +170,17 @@ def install(model: torch.nn.Module) -> int:
     return len(layers)
 
 
-def install_if_supported(model: torch.nn.Module) -> int:
+def install_if_supported(
+    model: torch.nn.Module, value_heads: Collection[int] | None = None
+) -> int:
     """:func:`install` when every gated-delta-net layer can take the fused
     path, else nothing; the number of layers routed.
 
     The Qwen3.5 rule's entry point. A model without GDN layers (a pipeline
-    stage or a draft without them) or with a layer the kernel cannot serve
-    (for example a BF16 or block-scaled out_proj) keeps the
-    ``RMSNormGated`` + linear path.
+    stage or a draft without them), with a layer the kernel cannot serve
+    (for example a BF16 or block-scaled out_proj), or, when ``value_heads``
+    is given, with a layer whose value heads per device are not in it keeps
+    the ``RMSNormGated`` + linear path.
     """
     layers = [
         module
@@ -188,6 +191,10 @@ def install_if_supported(model: torch.nn.Module) -> int:
         return 0
     for layer in layers:
         reason = unsupported_reason(layer)
+        if reason is None and value_heads is not None:
+            heads = layer.num_v_heads // layer.tp_size
+            if heads not in value_heads:
+                reason = f"{heads} value heads per device were not measured"
         if reason is not None:
             logger.info(
                 "[GDN] Fused gated norm + FP8 quantization not used: %s: %s.",

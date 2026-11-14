@@ -159,7 +159,6 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
-from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -661,15 +660,21 @@ _PP_CARRIED_FILL: dict[str, int] = {_TOPK_INDICES: -1}
 def _install_gdn_fused_norm_quant(
     model: torch.nn.Module, model_config: ModelConfig | None
 ) -> int:
-    """Qwen3.5 rule: route the GDN output projections of a loaded Qwen3.5
-    model through the fused gated norm + FP8 quantization kernel, where every
-    GDN layer allows it. Other models are untouched. Returns the number of
-    layers routed."""
-    if not qwen3_5_settings.is_qwen3_5(model_config):
+    """Qwen3.5 rule: route the GDN output projections of a loaded model
+    through the fused gated norm + FP8 quantization kernel where it was
+    measured (``measured.is_measured_model``: Qwen3.5-397B-A17B on TPU7x, at
+    the GDN value heads per device of its legs) and every GDN layer allows it.
+    Other models, other Qwen3.5 checkpoints and other devices are untouched.
+    Returns the number of layers routed."""
+    from vllm_torchtpu.models.qwen3_5.kernels import measured
+
+    if not measured.is_measured_model(model_config):
         return 0
     from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant_op
 
-    return gated_norm_quant_op.install_if_supported(model)
+    return gated_norm_quant_op.install_if_supported(
+        model, value_heads=measured.GDN_VALUE_HEADS
+    )
 
 
 def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:

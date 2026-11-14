@@ -36,6 +36,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
+from vllm_torchtpu.models.qwen3_5 import hooks
 from vllm_torchtpu.models.qwen3_5.kernels import fused_qk_norm_rope as fused
 
 pytestmark = pytest.mark.cpu_test
@@ -106,7 +107,7 @@ def _custom_ops_native():
     )
 
 
-def _layer(fused_qk_norm_rope=True, is_neox_style=True):
+def _layer(fused_qk_norm_rope=True, is_neox_style=True, heads=HEADS, kv_heads=KV_HEADS):
     """The attributes `_project_qkv_gate` reads, on real norm and rope modules."""
     generator = torch.Generator().manual_seed(0)
     with _custom_ops_native():
@@ -126,11 +127,11 @@ def _layer(fused_qk_norm_rope=True, is_neox_style=True):
         attn_output_gate=True,
         use_fused_qk_norm_rope_gate=False,
         fused_qk_norm_rope=fused_qk_norm_rope,
-        num_heads=HEADS,
-        num_kv_heads=KV_HEADS,
+        num_heads=heads,
+        num_kv_heads=kv_heads,
         head_dim=HEAD_DIM,
-        q_size=HEADS * HEAD_DIM,
-        kv_size=KV_HEADS * HEAD_DIM,
+        q_size=heads * HEAD_DIM,
+        kv_size=kv_heads * HEAD_DIM,
         q_norm=q_norm,
         k_norm=k_norm,
         rotary_emb=rotary_emb,
@@ -169,6 +170,29 @@ def test_fused_projection_reads_the_hoisted_norm_weight():
     (args,) = _HostOp.calls
     assert args[2] is hoisted
     torch.testing.assert_close(args[3], layer.k_norm.weight.float() + 1.0)
+
+
+def test_the_norm_weights_loaded_after_construction_reach_the_kernel():
+    """A layer arms the fused path when it is built, before the loader fills
+    its norm weights: the kernel must get (1 + w) of the loaded weights, not
+    of the initial ones, without the model patch's hoist."""
+    layer = _layer(fused_qk_norm_rope=False)
+    for norm in (layer.q_norm, layer.k_norm):
+        norm.weight.data.zero_()  # GemmaRMSNorm's initial weight
+    with set_current_vllm_config(_vllm_config(16, 0)):
+        assert fused._prebuild(layer, model_config=None)
+    generator = torch.Generator().manual_seed(7)
+    loaded = [0.1 * torch.randn(HEAD_DIM, generator=generator) for _ in range(2)]
+    for norm, weight in zip((layer.q_norm, layer.k_norm), loaded):
+        norm.weight.data.copy_(weight)  # what weight loading does
+    qkv, positions = _inputs(8)
+    got = fused.project_qkv_gate(layer, qkv, positions)
+    (args,) = _HostOp.calls
+    for arg, weight in zip(args[2:4], loaded):
+        torch.testing.assert_close(arg, weight.float() + 1.0, atol=0, rtol=0)
+    want = Qwen3NextAttention._project_qkv_gate(layer, qkv, positions)
+    for name, a, b in zip(("q", "k", "v", "gate"), got, want):
+        torch.testing.assert_close(a, b, atol=3e-2, rtol=3e-2, msg=name)
 
 
 @pytest.fixture
@@ -233,34 +257,104 @@ def restore_attention(monkeypatch):
     )
 
 
+QWEN35 = ["Qwen3_5MoeForConditionalGeneration"]
+# The text config of the checkpoint the kernel was measured on
+# (Qwen3.5-397B-A17B), and of main's CI model (Qwen3.5-35B-A3B).
+SHAPE_397B = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
+SHAPE_35B = {"num_experts": 256, "hidden_size": 2048, "num_hidden_layers": 40}
+
+
+def _model_config(architectures, shape=None):
+    text = SimpleNamespace(**(shape or {}))
+    return SimpleNamespace(architectures=architectures, hf_text_config=text)
+
+
 @pytest.mark.parametrize(
-    "architectures, installs",
+    "case, chip, installs",
     [
-        (None, False),
+        ("none", "7x", False),
         # A stand-in without architectures, as the patch registry's tests pass.
-        ("no-architectures", False),
-        (["Qwen3NextForCausalLM"], False),
-        (["Qwen3_5MoeForConditionalGeneration"], True),
+        ("no-architectures", "7x", False),
+        ("qwen3-next", "7x", False),
+        ("35b", "7x", False),
+        ("397b", "7x", True),
+        ("397b", "v6e", False),
+        ("397b", None, False),
+        ("397b-hidden-2048", "7x", False),
     ],
 )
-def test_the_rule_installs_the_patch_for_qwen3_5_only(
-    restore_attention, architectures, installs
+def test_the_rule_installs_the_patch_where_it_was_measured_only(
+    restore_attention, monkeypatch, case, chip, installs
 ):
+    """Only Qwen3.5-397B-A17B on TPU7x, the engine the kernel was measured
+    on, installs the fused path. Main's CI model (35B), the 397B on another
+    or an unknown device, and any other model keep vLLM's own attention
+    methods, so they compute what main computes."""
+    monkeypatch.setattr(hooks, "_chip_family", lambda: chip)
     original_init = Qwen3NextAttention.__init__
     original_project = Qwen3NextAttention._project_qkv_gate
-    if architectures == "no-architectures":
-        model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="llama"))
-    else:
-        model_config = (
-            None
-            if architectures is None
-            else SimpleNamespace(architectures=architectures)
-        )
+    model_config = {
+        "none": None,
+        "no-architectures": SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="llama")
+        ),
+        "qwen3-next": _model_config(["Qwen3NextForCausalLM"], SHAPE_397B),
+        "35b": _model_config(QWEN35, SHAPE_35B),
+        "397b": _model_config(QWEN35, SHAPE_397B),
+        "397b-hidden-2048": _model_config(QWEN35, {**SHAPE_397B, "hidden_size": 2048}),
+    }[case]
     result = fused.maybe_install_qk_norm_rope_patch(model_config)
     # False keeps the patch eligible for the next lifecycle stage.
     assert result is (None if installs else False)
     assert (Qwen3NextAttention._project_qkv_gate is not original_project) is installs
     assert (Qwen3NextAttention.__init__ is not original_init) is installs
+
+
+def test_main_ci_model_computes_mains_projection_bit_for_bit(
+    restore_attention, monkeypatch
+):
+    """With the rule off (Qwen3.5-35B-A3B), the attention's projection is
+    vLLM's own method, so its outputs equal main's exactly."""
+    monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
+    original_project = Qwen3NextAttention._project_qkv_gate
+    assert (
+        fused.maybe_install_qk_norm_rope_patch(_model_config(QWEN35, SHAPE_35B))
+        is False
+    )
+    layer = _layer(fused_qk_norm_rope=False)
+    qkv, positions = _inputs(13)
+    got = Qwen3NextAttention._project_qkv_gate(layer, qkv, positions)
+    want = original_project(layer, qkv, positions)
+    assert not _HostOp.calls
+    for a, b in zip(got, want):
+        assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize(
+    "heads, kv_heads, arms",
+    [
+        # Qwen3.5-397B-A17B at TP1 (prefill legs), TP2 and TP8 (decode legs).
+        (32, 2, True),
+        (16, 1, True),
+        (4, 1, True),
+        # The 397B at TP4, and Qwen3.5-35B-A3B at TP1 and TP2: not measured.
+        (8, 1, False),
+        (16, 2, False),
+    ],
+)
+def test_prebuild_arms_the_measured_head_counts_only(
+    monkeypatch, heads, kv_heads, arms
+):
+    warnings = []
+    monkeypatch.setattr(
+        fused.logger, "warning_once", lambda msg, *args: warnings.append(msg % args)
+    )
+    layer = _layer(fused_qk_norm_rope=False, heads=heads, kv_heads=kv_heads)
+    with set_current_vllm_config(_vllm_config(16, 0)):
+        assert fused._prebuild(layer, model_config=None) is arms
+    assert bool(fused._ops) is arms
+    if not arms:
+        assert "were not measured" in warnings[0]
 
 
 def test_install_wraps_the_attention_once(restore_attention):
