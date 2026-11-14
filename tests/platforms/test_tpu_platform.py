@@ -1250,11 +1250,20 @@ def test_qwen_wrappers_are_installed_once_across_model_loads(
     originals = [getattr(target, name) for target, name in targets]
     for (target, name), original in zip(targets, originals):
         monkeypatch.setattr(target, name, original)
+    from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
+
+    monkeypatch.setattr(
+        Qwen3_VisionTransformer, "forward", Qwen3_VisionTransformer.forward
+    )
     other_model = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="llama"), model="llama"
+        hf_config=SimpleNamespace(model_type="llama"),
+        model="llama",
+        enforce_eager=False,
     )
     qwen_model = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="qwen3_vl"), model="Qwen/Qwen3-VL-4B"
+        hf_config=SimpleNamespace(model_type="qwen3_vl"),
+        model="Qwen/Qwen3-VL-4B",
+        enforce_eager=False,
     )
     reg.apply("platform_activation", model_config=other_model)
     assert [getattr(target, name) for target, name in targets] == originals
@@ -1324,7 +1333,9 @@ def test_qwen_import_failure_leaves_targets_unchanged(monkeypatch):
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", unavailable)
-    config = SimpleNamespace(hf_config=None, model="Qwen/Qwen3-VL-4B")
+    config = SimpleNamespace(
+        hf_config=None, model="Qwen/Qwen3-VL-4B", enforce_eager=False
+    )
     assert qwen3_vl_patch.maybe_patch_qwen3_vl(config) is None
     assert torch.cumsum is original_cumsum
 

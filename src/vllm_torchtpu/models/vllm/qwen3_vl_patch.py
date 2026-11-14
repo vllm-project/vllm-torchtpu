@@ -18,10 +18,12 @@ import functools
 import inspect
 import sys
 import threading
-from typing import TYPE_CHECKING, Optional
+import weakref
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -391,9 +393,17 @@ def maybe_patch_qwen3_vl(model_config: Optional["ModelConfig"] = None) -> bool |
        - torch.repeat_interleave & torch.cumsum: Evaluates integer/bool TPU tensors
          on CPU scoped strictly to vision-encoder execution instead of
          process-wide mutation.
+    4. Qwen3_VisionTransformer.forward (opt-in via VLLM_TPU_QWEN3_VL_COMPILE_VIT):
+       - Moves encoder metadata tensors (including `cu_seqlens`) to TPU and compiles
+         the ViT blocks and mergers loop into a single `torch.compile` graph when
+         `enforce_eager` is disabled.
     """
     if not _is_qwen3_vl_model(model_config):
         return False
+    assert model_config is not None
+
+    if envs.VLLM_TPU_QWEN3_VL_COMPILE_VIT and not model_config.enforce_eager:
+        _patch_qwen3_vl_vllm_vit_compile()
 
     modeling = None
     try:
@@ -415,3 +425,132 @@ def maybe_patch_qwen3_vl(model_config: Optional["ModelConfig"] = None) -> bool |
     _patch_qwen3_vl_vision_attention(modeling)
     _patch_qwen3_vl_vision_transformer(modeling)
     return None
+
+
+def _run_qwen3_vit_blocks_and_merger(
+    vit: Any,
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    rotary_pos_emb_cos: torch.Tensor,
+    rotary_pos_emb_sin: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    sequence_lengths: torch.Tensor | None,
+) -> torch.Tensor:
+    """Execute Qwen3_VisionTransformer blocks, deepstack mergers, and final merger."""
+    deepstack_feature_lists = []
+    deepstack_indexes = vit.deepstack_visual_indexes
+    for layer_num, blk in enumerate(vit.blocks):
+        hidden_states = blk(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
+        )
+        if layer_num in deepstack_indexes:
+            idx = deepstack_indexes.index(layer_num)
+            deepstack_feature_lists.append(
+                vit.deepstack_merger_list[idx](hidden_states)
+            )
+    hidden_states = vit.merger(hidden_states)
+    return torch.cat([hidden_states] + deepstack_feature_lists, dim=1)
+
+
+_COMPILED_VIT_FNS: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
+
+
+def _patch_qwen3_vl_vllm_vit_compile() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once upstream vLLM's Qwen3_VisionTransformer supports
+    # @support_torch_compile(is_encoder=True) natively on TPU with bucketed
+    # warmup and moves cu_seqlens to device before the compiled ViT blocks.
+    #
+    # Source: adapted from Qwen3_VisionTransformer.forward in
+    #   vllm/model_executor/models/qwen3_vl.py (lines 862-905 at vLLM v0.33.0).
+    # Problem: Qwen3_VisionTransformer executes all ViT blocks and mergers
+    #   eagerly with host-side cu_seqlens.
+    # Fix: When VLLM_TPU_QWEN3_VL_COMPILE_VIT=1, move cu_seqlens to TPU and
+    #   compile the blocks and mergers loop with backend="tpu", dynamic=False.
+    # -------------------------------------------------------------------------
+    try:
+        from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
+    except ImportError as exc:
+        logger.warning_once(
+            "VLLM_TPU_QWEN3_VL_COMPILE_VIT=1 is set, but "
+            "vllm.model_executor.models.qwen3_vl could not be imported; "
+            "skipping ViT compile patch (%s).",
+            exc,
+        )
+        return
+
+    orig_forward = Qwen3_VisionTransformer.forward
+    if getattr(orig_forward, "_tpu_vit_compile_patch", False):
+        return
+
+    @functools.wraps(orig_forward)
+    def patched_forward(
+        self: Any,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor | list[list[int]],
+        *,
+        encoder_metadata: dict[str, Any] | None = None,
+    ) -> torch.Tensor:
+        if self.device.type != "tpu":
+            return orig_forward(self, x, grid_thw, encoder_metadata=encoder_metadata)
+
+        hidden_states = self.input_norm(
+            x.to(device=self.device, non_blocking=True), self.dtype
+        )
+        hidden_states = self.patch_embed(hidden_states)
+
+        if encoder_metadata is None:
+            grid_thw_list = (
+                grid_thw if isinstance(grid_thw, list) else grid_thw.tolist()
+            )
+            metadata: dict[str, Any] = self.prepare_encoder_metadata(grid_thw_list)
+        else:
+            metadata = encoder_metadata
+
+        dev = hidden_states.device
+        pos_embeds = metadata["pos_embeds"].to(dev)
+        hidden_states = (hidden_states + pos_embeds).unsqueeze(1)
+        cu_seqlens = metadata["cu_seqlens"].to(dev)
+        cos = metadata["rotary_pos_emb_cos"].to(dev)
+        sin = metadata["rotary_pos_emb_sin"].to(dev)
+        seq_lens: torch.Tensor | None = metadata.get("sequence_lengths")
+        if seq_lens is not None and seq_lens.device != dev:
+            seq_lens = seq_lens.to(dev)
+
+        if torch.compiler.is_compiling():
+            return _run_qwen3_vit_blocks_and_merger(
+                self,
+                hidden_states,
+                cu_seqlens,
+                cos,
+                sin,
+                metadata["max_seqlen"],
+                seq_lens,
+            )
+
+        compiled_fn = _COMPILED_VIT_FNS.get(self)
+        if compiled_fn is None:
+            compiled_fn = torch.compile(
+                functools.partial(_run_qwen3_vit_blocks_and_merger, self),
+                backend="tpu",
+                dynamic=False,
+            )
+            _COMPILED_VIT_FNS[self] = compiled_fn
+
+        return compiled_fn(
+            hidden_states,
+            cu_seqlens,
+            cos,
+            sin,
+            metadata["max_seqlen"],
+            seq_lens,
+        )
+
+    patched_forward._tpu_vit_compile_patch = True  # pyrefly: ignore[missing-attribute]
+    Qwen3_VisionTransformer.forward = patched_forward  # type: ignore[method-assign]
+    logger.info("Applied TPU patch: compiled Qwen3_VisionTransformer blocks+merger.")

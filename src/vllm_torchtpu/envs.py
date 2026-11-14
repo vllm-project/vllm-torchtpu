@@ -1301,6 +1301,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
+    # Qwen3-VL: opt-in torch.compile(backend="tpu", dynamic=False) for
+    # vLLM's Qwen3_VisionTransformer blocks and mergers, moving cu_seqlens to
+    # TPU before entering the compiled region. Default off until ViT shapes are
+    # bucketed and warmed up during capture_model() (note: even with
+    # cudagraph_mm_encoder enabled, eager fallbacks on graph misses or
+    # over-budget items will still lazily compile new ViT shapes).
+    "VLLM_TPU_QWEN3_VL_COMPILE_VIT": env_bool("VLLM_TPU_QWEN3_VL_COMPILE_VIT", False),
 }
 
 
