@@ -564,6 +564,42 @@ def test_calculate_tiling_fp4_decode_tiles(size_m, decode):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize(
+    "size_m, size_k, size_n, fuse_act, tile_m",
+    # MiniMax-M3.1 routed experts under TP8 (128 experts, width 384): 8k and 4k
+    # prefill chunks, gate/up and down.
+    [
+        (32768, 6144, 768, "swigluoai", 512),
+        (32768, 384, 6144, None, 512),
+        (16384, 6144, 768, "swigluoai", 256),
+        (16384, 384, 6144, None, 256),
+    ],
+)
+def test_calculate_tiling_doubles_tile_m_for_large_dequantized_groups(
+    size_m, size_k, size_n, fuse_act, tile_m
+):
+    _require_tpu()
+    dims = Dimensions(
+        size_m=size_m,
+        size_k=size_k,
+        size_n=size_n,
+        size_group=128,
+        size_lhs_group=128,
+        size_lhs_sublane=16,
+    )
+    lhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16)
+    rhs_cfgs = InputConfigs(
+        quant_dtype=jnp.float4_e2m1fn,
+        quant_block_size=128,
+        dtype=jnp.float4_e2m1fn,
+        has_scale=True,
+    )
+    vmem_limit = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit, fuse_act)
+    assert (tiles.tile_m, tiles.bucket_base) == (tile_m, 64)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
     "batch_size, group_sizes",
     [
         (32, [0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 20, 0, 0, 1, 0, 0]),

@@ -1279,6 +1279,17 @@ def calculate_tiling(
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
     max_num_buckets = 4
+    if (
+        rhs_cfgs.should_dequantize_before_matmul
+        # MoE groups only: dense linears (one group) keep their tiling.
+        and dims.size_group > 1
+        and dims.size_m >= dims.size_group * max_num_buckets * tile_m
+    ):
+        # Every tile visit dequantizes its group's rhs block again, and groups
+        # of a tile's rows or more take two visits or more: doubling the rows
+        # a visit holds halves that work, at the cost of twice the unrolled
+        # bucket bodies (gmm_v2_mlp keeps decode tiles, so never carries two).
+        max_num_buckets = 8
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
