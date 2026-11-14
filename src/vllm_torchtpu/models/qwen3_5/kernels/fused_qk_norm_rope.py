@@ -13,14 +13,16 @@
 # limitations under the License.
 """Fused gated q split + QK RMS norm + RoPE for ``Qwen3NextAttention``.
 
-vLLM fuses these on CUDA only. On a Qwen3.5 engine (the rule in
-:func:`maybe_install_qk_norm_rope_patch`), token buckets in
+vLLM fuses these on CUDA only. Where the kernel was measured (the rule in
+:func:`maybe_install_qk_norm_rope_patch` and the per-device head counts in
+:func:`_unsupported_reason`, both from ``measured``), token buckets in
 ``[MIN_ROWS, MAX_ROWS]`` run the ``qk_norm_rope_gate`` kernel, which tiles
 large row counts in VMEM, instead of the eager split, per-head norms and
 rope; buckets outside that range run the JAX reference inside the same custom
 op so the FX trace carries no Python row fork and works for both ``backbone``
 and ``eagle_head`` graphs. Other models that use ``Qwen3NextAttention``
-(Qwen3-Next) keep vLLM's eager path.
+(Qwen3-Next, and every Qwen3.5 checkpoint or device the kernel was not
+measured on) keep vLLM's eager path.
 """
 
 import functools
@@ -33,7 +35,7 @@ from torch_tpu._internal import pallas
 from vllm.config import ModelConfig, VllmConfig, get_current_vllm_config
 
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+from vllm_torchtpu.models.qwen3_5.kernels import measured
 from vllm_torchtpu.models.qwen3_5.kernels.qk_norm_rope_gate import (
     qk_norm_rope_gate,
 )
@@ -53,8 +55,8 @@ MAX_ROWS = 16384
 # Marks the wrapper install_qk_norm_rope_patch puts on Qwen3NextAttention.
 _INSTALLED_ATTR = "_tpu_fused_qk_norm_rope"
 
-# The (1 + w) buffer kept on each GemmaRMSNorm. The Qwen3.5 model patch's norm
-# weight hoist fills it when present; otherwise _weight_plus_one computes it.
+# The (1 + w) buffer the Qwen3.5 model patch's norm weight hoist keeps on each
+# GemmaRMSNorm after loading; without it _weight_plus_one computes (1 + w).
 _HOISTED_WEIGHT_ATTR = "_tpu_weight_plus_one"
 
 _ops: dict[tuple[int, int, int, int, float], Callable] = {}
@@ -116,11 +118,14 @@ def _build_op(key: tuple[int, int, int, int, float]) -> None:
 
 
 def _weight_plus_one(norm: torch.nn.Module) -> torch.Tensor:
+    """The norm's (1 + w): the hoisted buffer when the model patch set one
+    after loading, else computed from the current weight. Never cached here:
+    the layer is built before its weights load, so a value taken then holds
+    the initial weight, not the checkpoint's."""
     hoisted = getattr(norm, _HOISTED_WEIGHT_ATTR, None)
-    if hoisted is None:
-        hoisted = cast(torch.Tensor, norm.weight).float() + 1.0
-        setattr(norm, _HOISTED_WEIGHT_ATTR, hoisted)
-    return hoisted
+    if hoisted is not None:
+        return hoisted
+    return cast(torch.Tensor, norm.weight).float() + 1.0
 
 
 def _unsupported_reason(layer: torch.nn.Module, model_config) -> str | None:
@@ -132,6 +137,12 @@ def _unsupported_reason(layer: torch.nn.Module, model_config) -> str | None:
         return "the rope is not NeoX style"
     if mm_config is not None and not mm_config.language_model_only:
         return "multimodal positions need M-RoPE; serve with --language-model-only"
+    heads = (layer.num_heads, layer.num_kv_heads)
+    if heads not in measured.ATTENTION_HEADS:
+        return (
+            f"{heads[0]} query and {heads[1]} kv heads per device were not "
+            "measured (only the Qwen3.5-397B-A17B legs at TP1, TP2 and TP8)"
+        )
     return None
 
 
@@ -163,8 +174,6 @@ def _prebuild(layer: torch.nn.Module, model_config) -> bool:
         return False
     rot = layer.rotary_emb.rotary_dim
     assert 0 < rot <= layer.head_dim and rot % 2 == 0, (rot, layer.head_dim)
-    _weight_plus_one(layer.q_norm)
-    _weight_plus_one(layer.k_norm)
     _build_op(_op_key(layer))
     _log_armed_rows(get_current_vllm_config())
     return True
@@ -196,7 +205,7 @@ def install_qk_norm_rope_patch() -> None:
 
     Idempotent. Each layer arms the fused path at construction
     (:func:`_prebuild`) and keeps vLLM's eager path when the kernel cannot
-    compute it.
+    compute it or was not measured at its head counts.
     """
     from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
@@ -222,19 +231,20 @@ def install_qk_norm_rope_patch() -> None:
 
 
 def maybe_install_qk_norm_rope_patch(model_config: ModelConfig | None) -> bool | None:
-    """Qwen3.5 rule: a Qwen3.5 engine runs the fused q/k norm + rope.
+    """Qwen3.5 rule: the engine the kernel was measured on
+    (``measured.is_measured_model``: Qwen3.5-397B-A17B on TPU7x) runs the fused
+    q/k norm + rope.
 
     Registered as a model-specific patch (``patch_registry``). Returns False
-    until a Qwen3.5 model config is available, so other models, including
-    Qwen3-Next, which shares ``Qwen3NextAttention``, never install it. The
+    until such a model config is available, so other models, including
+    Qwen3-Next, which shares ``Qwen3NextAttention``, and every other Qwen3.5
+    checkpoint or device, never install it and keep vLLM's eager path. The
     patch is class-wide, so the MTP draft's attention, built after the
     target's config is seen, takes the fused path too. A config without
     architectures (the stand-ins callers hand the patch registry) is not a
     Qwen3.5 config.
     """
-    if getattr(model_config, "architectures", None) is None:
-        return False
-    if not qwen3_5_settings.is_qwen3_5(model_config):
+    if not measured.is_measured_model(model_config):
         return False
     install_qk_norm_rope_patch()
     logger.info("Applied TPU patch: Qwen3.5 fused q/k norm + rope.")
