@@ -24,18 +24,11 @@ READY_TIMEOUT="${READY_TIMEOUT:-5400}"   # 90 min (covers a cold compile)
 # "ISL:OSL" pairs to sweep, and the concurrencies to run for each.
 # Both are overridable via env so per-point jobs can each own a slice.
 read -r -a WORKLOADS <<< "${WORKLOADS:-8192:1024}"
-read -r -a CONCS <<< "${CONCS:-4 8 16 32 64 128 256}"
-# Sharding per swept point, keyed by "ISL,OSL,CONC" (every point listed).
-# Low concurrency runs TP8_EP, higher concurrency runs DP4TP2_EP.
-declare -A SHARDING_TABLE=(
-  [8192,1024,4]=TP8_EP
-  [8192,1024,8]=TP8_EP
-  [8192,1024,16]=TP8_EP
-  [8192,1024,32]=DP4TP2_EP
-  [8192,1024,64]=DP4TP2_EP
-  [8192,1024,128]=DP4TP2_EP
-  [8192,1024,256]=DP4TP2_EP
-)
+read -r -a CONCS <<< "${CONCS:-4 8 16 32 64 128 256 512 1024}"
+# Per-point sharding, followed by DP8 slots, global token budget and
+# release group.
+# The points live in points.sh, shared with server.sh.
+source "${SCRIPT_DIR}/points.sh"
 
 VLLM_PROCS='vllm serve|VLLM::'
 
@@ -63,9 +56,18 @@ stop_server() {
 }
 
 start_server() {
+  # server.sh applies the point's settings from points.sh, except any the
+  # caller already set in the environment. An override passes its own.
+  local point_env=(ISL="$ISL" OSL="$OSL" CONC="$CONC")
+  if [ -n "${SHARDING_OVERRIDE:-}" ] || [ -n "${POINT_OVERRIDE:-}" ]; then
+    local sharding seqs budget group
+    read -r sharding seqs budget group <<< "$1"
+    point_env+=(SHARDING="$sharding")
+    [ -n "${seqs:-}" ] && point_env+=(MAX_NUM_SEQS="$seqs" GLOBAL_MAX_NUM_BATCHED_TOKENS="$budget" VLLM_TPU_DP_RELEASE_THRESHOLD="$group")
+  fi
   SERVER_LOG="/tmp/qwen3.5_sweep_server_isl${ISL}_osl${OSL}_conc${CONC}_$(date +%m%d-%H%M).log"
-  echo "--- starting server SHARDING=$1 ISL=$ISL OSL=$OSL CONC=$CONC (log: $SERVER_LOG) ---"
-  SHARDING="$1" bash "${SCRIPT_DIR}/server.sh" > >(tee -a "$SERVER_LOG") 2>&1 &
+  echo "--- starting server ${point_env[*]} (log: $SERVER_LOG) ---"
+  env "${point_env[@]}" bash "${SCRIPT_DIR}/server.sh" > >(tee -a "$SERVER_LOG") 2>&1 &
   SERVER_PID=$!
   local waited=0
   until grep -q "Application startup complete" "$SERVER_LOG" 2>/dev/null; do
@@ -82,12 +84,13 @@ for wl in "${WORKLOADS[@]}"; do
   export ISL="${wl%%:*}" OSL="${wl#*:}"
   for CONC in "${CONCS[@]}"; do
     export CONC
-    sharding="${SHARDING_OVERRIDE:-${SHARDING_TABLE[$ISL,$OSL,$CONC]:-}}"
-    [ -n "$sharding" ] || { echo "ERROR: no sharding in SHARDING_TABLE for ISL=$ISL OSL=$OSL CONC=$CONC" >&2; exit 1; }
+    # SHARDING_OVERRIDE keeps its meaning: one sharding for every point.
+    point="${POINT_OVERRIDE:-${SHARDING_OVERRIDE:-${POINT_TABLE[$ISL,$OSL,$CONC]:-}}}"
+    [ -n "$point" ] || { echo "ERROR: no settings in POINT_TABLE for ISL=$ISL OSL=$OSL CONC=$CONC" >&2; exit 1; }
     stop_server
     started=0
     for attempt in 1 2; do
-      if start_server "$sharding"; then started=1; break; fi
+      if start_server "$point"; then started=1; break; fi
       echo "--- start attempt $attempt failed; cleaning up and retrying ---" >&2
       TPU_RELEASE_WAIT=60 stop_server
     done
@@ -95,7 +98,7 @@ for wl in "${WORKLOADS[@]}"; do
       echo "ERROR: server would not start for ISL=$ISL OSL=$OSL CONC=$CONC; skipping point" >&2
       continue
     fi
-    echo "########## ISL=$ISL OSL=$OSL CONC=$CONC SHARDING=$sharding ##########"
+    echo "########## ISL=$ISL OSL=$OSL CONC=$CONC POINT=$point ##########"
     BENCH_LOG="/tmp/qwen3.5_sweep_bench_isl${ISL}_osl${OSL}_conc${CONC}_$(date +%m%d-%H%M).log"
     echo "--- benchmark (log: $BENCH_LOG) ---"
     bash "${SCRIPT_DIR}/bench.sh" 2>&1 | tee -a "$BENCH_LOG"
