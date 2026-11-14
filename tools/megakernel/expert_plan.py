@@ -87,7 +87,7 @@ _OPTIONS = ("weight", "plan", "windows")
 
 def parse_run(spec: str) -> tuple[Path, float, str, tuple[int, int] | None]:
     """``DIR[:weight=W][:plan=NPZ][:windows=A-B]`` (options trail the
-    directory, which may itself contain colons)."""
+    directory, which may itself contain colons; a ``plan`` path may not)."""
     parts = spec.split(":")
     options = []
     while len(parts) > 1 and re.fullmatch(r"[a-z_]+=.*", parts[-1]):

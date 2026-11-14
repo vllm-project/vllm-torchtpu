@@ -1389,9 +1389,7 @@ class KimiPrefiller:
         # multiple of 4096), and a rank's share of them: 1/32 plus a page of
         # rounding slack per sequence, in multiples of 1024.
         capacity = max(windows[-1], -(-config.max_model_len // 4096) * 4096)
-        self.slots = min(
-            config.max_num_seqs, SERIAL_SLOTS if serial else SLOTS
-        )
+        self.slots = min(config.max_num_seqs, SERIAL_SLOTS if serial else SLOTS)
         self.cp_capacity = (
             -(-(capacity // DCP_SIZE + self.slots * self.page_tokens) // 1024) * 1024
         )

@@ -531,7 +531,8 @@ class DecodeOps:
 
     @staticmethod
     def _run(op: Any, rows: int, *args: Any) -> Any:
-        """``op(*args)`` for a ``rows``-row step, with XLA's deduplicated calls off
+        """``op(*args)`` for a ``rows``-row step; at the plain-decode batch
+        buckets (1 to 128 rows) with XLA's deduplicated calls off
         (``KernelConfig.decode_no_hlo_calls``)."""
         options = DecodeOps._compiler_options(rows)
         if options:
