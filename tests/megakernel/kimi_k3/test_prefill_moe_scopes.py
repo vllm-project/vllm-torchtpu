@@ -40,6 +40,7 @@ _PHASES = {
     "m_input",
     "m_router",
     "m_latent",
+    "m_latent_encode",
     "m_peer_wait",
     "m_shared_gu",
     "m_shared_down",
@@ -199,7 +200,7 @@ def _traced_routed_experts(mesh, window):
         out_specs=P("k3_sp"),
         check_vma=False,
     )
-    latent = rank((window, 2, 1792), jnp.bfloat16)
+    latent = rank((window, 4, fused._SLAB_LANES), jnp.float8_e4m3fn)
     return jax.jit(op).trace(tables, latent, *weights).jaxpr.jaxpr
 
 
@@ -222,3 +223,42 @@ def test_remaining_column_tile_loops_hold_no_column_finish(monkeypatch, window):
     assert "m_ring_poll" in tiles
     finish = {"m_consume_last", "m_ring_drain", "m_emit_subtotals"}
     assert not tiles & (finish | {"m_ring_final_drain"})
+
+
+def test_uncapped_fallback_reads_the_latent_slabs_as_bf16_rows(monkeypatch):
+    """At 8K an overflowing launch reruns the routed experts uncapped; the
+    consumer gets the E4M3 latent slabs decoded to BF16 [tokens, 2, 1792]."""
+    from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_moe import layer
+
+    seen = []
+
+    def consumer(latent, *args, **kwargs):
+        seen.append((latent.shape, latent.dtype))
+        return jnp.zeros((latent.shape[0] // 32, 3584), jnp.float32)
+
+    monkeypatch.setattr(layer, "routed_experts_prepared", consumer)
+    devices = topologies.get_topology_desc("tpu7x:2x2x4", platform="tpu").devices
+    mesh = Mesh(np.array(sorted(devices, key=lambda d: d.id)), ("k3_sp",))
+
+    def shard(shape, dtype, spec=None):
+        spec = P("k3_sp") if spec is None else spec
+        return jax.ShapeDtypeStruct(shape, dtype, sharding=NamedSharding(mesh, spec))
+
+    window, scalar = 8192, shard((1,), jnp.int32, P())
+    rows = window // 32
+    families = {
+        name: shard((32, 1, *shape), dtype)
+        for name, (shape, dtype) in _FAMILIES.items()
+    }
+    args = (
+        shard((32, rows, 7168), jnp.bfloat16),
+        shard((32, 8, rows, 7168), jnp.bfloat16),
+        shard((32, 1, 7168), jnp.float32),
+        shard((32, 1, 7168), jnp.bfloat16),
+        scalar,
+        families,
+        scalar,
+        scalar,
+    )
+    fused.make_indexed_mixture_moe_sp_ring(mesh, seq_len=window).trace(*args)
+    assert seen == [((window, 2, 1792), jnp.bfloat16)]

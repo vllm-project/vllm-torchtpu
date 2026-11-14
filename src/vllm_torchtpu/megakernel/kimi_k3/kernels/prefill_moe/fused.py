@@ -32,6 +32,8 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from .. import prefill_megakernel as k
+from ..helpers import e8m0_scale
+from ..rank_loader import GATE_UP_E5M2_FOLD
 
 # Token-combine rows per load/store batch between expert MXU panels (a wider
 # batch spills there) and in the combine loops, where a batch amortizes the
@@ -727,6 +729,7 @@ def _latent_ready_progress(
     The final drain completes every stream before routed experts read HBM.
     """
     rows = payload.shape[0]
+    row_bytes = payload.shape[1] * payload.shape[2] * jnp.dtype(payload.dtype).itemsize
 
     def sweep():
         # One rolled loop per stream size keeps a poll's code small: a launch
@@ -734,7 +737,7 @@ def _latent_ready_progress(
         common, extra = divmod(rows, 12)
         for first, last, size in ((0, extra, common + 1), (extra, 12, common)):
             # TPUv7 DMA semaphore accounting: one unit per 32 logical bytes.
-            units = size * 2 * 1792 * 2 // 32
+            units = size * row_bytes // 32
 
             @pl.loop(first, last)
             def each(stream, *, size=size, units=units):
@@ -813,6 +816,72 @@ def _latent_ready_progress(
         @pl.when(state[0] != 0)
         def progress():
             sweep()
+
+
+# Latent rows travel as E4M3 slabs [4, _SLAB_LANES] per token: the row's
+# values in lanes 0:_SLAB_VALUES of the four sub-rows (one 32-bit word per lane,
+# so a token is one contiguous DMA) and its FP32 inverse scale in the word at
+# lane _SLAB_VALUES.
+_SLAB_LANES = 1024
+_SLAB_VALUES = 896  # four sub-rows of 896: the 3584-wide latent
+
+
+def _encode_latent(latent, slab):
+    """BF16 latent rows ``latent`` [rows, 3584] as E4M3 slabs into ``slab``.
+
+    A row is scaled by 2^(7 - e), e the exponent of its largest magnitude: its
+    values stay below 256, inside E4M3's range (largest normal 448), and its
+    inverse scale is a power of two, so undoing it is exact.
+    """
+    rows = latent.shape[0]
+    chunk = min(rows, 32)
+
+    @pl.loop(0, rows // chunk)
+    def block(b):
+        part = pl.ds(pl.multiple_of(b * chunk, chunk), chunk)
+        values = latent[part, :].astype(jnp.float32)
+        largest = jnp.max(jnp.abs(values), axis=1, keepdims=True)
+        exponent = (lax.bitcast_convert_type(largest, jnp.int32) >> 23) - 127
+        exponent = jnp.clip(exponent, -100, 120)  # zero rows: finite scales
+        scale = lax.bitcast_convert_type((134 - exponent) << 23, jnp.float32)
+        inverse = lax.bitcast_convert_type((exponent + 120) << 23, jnp.uint32)
+        quantized = (values * scale).astype(jnp.float8_e4m3fn)
+        slab[part, :, pl.ds(0, _SLAB_VALUES)] = quantized.reshape(chunk, 4, _SLAB_VALUES)
+        words = pltpu.bitcast(jnp.broadcast_to(inverse, (chunk, 128)), jnp.float8_e4m3fn)
+        slab[part, :, pl.ds(_SLAB_VALUES, 128)] = words.reshape(chunk, 4, 128)
+
+
+def _decode_latent(slab, rows, inverse):
+    """E4M3 slabs ``slab`` [n, 4, _SLAB_LANES] as rows into ``rows`` [n, 3584]
+    and their inverse scales, lane-broadcast, into ``inverse`` [n, 128]."""
+    n = slab.shape[0]
+    rows[...] = slab[:, :, pl.ds(0, _SLAB_VALUES)].reshape(n, 4 * _SLAB_VALUES)
+    words = slab[:, :, pl.ds(_SLAB_VALUES, 128)].reshape(4 * n, 128)
+    scales = lax.bitcast_convert_type(pltpu.bitcast(words, jnp.uint32)[:, :1], jnp.float32)
+    inverse[...] = jnp.broadcast_to(scales, (n, 128))
+
+
+def _latent_bf16(slab):
+    """E4M3 latent slabs [tokens, 4, _SLAB_LANES] (an HBM array) as the BF16
+    rows [tokens, 2, 1792] the uncapped consumer reads, decoded in VMEM."""
+    tokens = slab.shape[0]
+    block = min(tokens, 256)
+
+    def kernel(slab_ref, rows_ref):
+        values = slab_ref[:, :, pl.ds(0, _SLAB_VALUES)].reshape(block, 4 * _SLAB_VALUES)
+        words = slab_ref[:, :, pl.ds(_SLAB_VALUES, 128)].reshape(4 * block, 128)
+        inverse = lax.bitcast_convert_type(pltpu.bitcast(words, jnp.uint32)[:, :1], jnp.float32)
+        rows = (values.astype(jnp.float32) * inverse).astype(jnp.bfloat16)
+        rows_ref[...] = rows.reshape(block, 2, 1792)
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((tokens, 2, 1792), jnp.bfloat16),
+        grid=(tokens // block,),
+        in_specs=[pl.BlockSpec((block, 4, _SLAB_LANES), lambda i: (i, 0, 0))],
+        out_specs=pl.BlockSpec((block, 2, 1792), lambda i: (i, 0, 0)),
+        name="latent_slab_rows",
+    )(slab)
 
 
 def _stripe_validity(rows, length, rank):
@@ -935,7 +1004,7 @@ def _prologue(
 
         def ring():
             refs = (
-                s["latent_payload"],
+                s["latent_slab"],
                 s["latent_send_sems"],
                 s["latent_recv_sems"],
                 s["latent_credits"],
@@ -1042,7 +1111,6 @@ def _prologue(
                         own(0)[...], latent_weight, gate_buffers, gate_sems, columns=3584
                     )
                 )
-            first_half = [None] * passes
             for col, products in latent_products:
                 if route_started:
                     stage = next(route_steps, None)
@@ -1051,19 +1119,9 @@ def _prologue(
                 if rows <= 128 and metadata_started:
                     metadata_progress(gu_steps)
                 for h, product in enumerate(products):
-                    if big:
-                        fragment = product.astype(jnp.bfloat16)
-                        if col < 1792:
-                            first_half[h] = fragment
-                        else:
-                            # Assemble both halves before writing their packed words.
-                            assert first_half[h] is not None
-                            paired = jnp.concatenate((first_half[h], fragment), axis=1)
-                            s["latent_payload"][
-                                pl.ds(h * part, part), :, pl.ds(col - 1792, 256)
-                            ] = paired.reshape(part, 2, 256)
-                    else:
-                        s["latent"][:, pl.ds(col, 256)] = product.astype(jnp.bfloat16)
+                    s["latent"][pl.ds(h * part, part), pl.ds(col, 256)] = product.astype(
+                        jnp.bfloat16
+                    )
                 for top in tops:
                     for _ in range(min(2, 16 - top.index)):
                         top.step()
@@ -1095,16 +1153,17 @@ def _prologue(
                     next(route_steps, None)
                     route_started = True
             _phase_end(scope)
+            with _phase("m_latent_encode"):
+                _encode_latent(s["latent"], s["latent_slab"])
             if big:
                 ring()
             for _ in route_steps:
                 pass
             start_metadata()
             if not big:
-                s["latent_payload"][...] = s["latent"][...].reshape(rows, 2, 1792)
                 latent_steps = _latent_gather_steps(
                     tables,
-                    s["latent_payload"],
+                    s["latent_slab"],
                     s["latent_recv"],
                     latent_hbm,
                     s["latent_send_sems"],
@@ -1245,15 +1304,15 @@ def _prologue(
         peer_send=tuple(dma for _ in range(passes)),
         peer_recv=tuple(dma for _ in range(passes)),
         peer_credit=pltpu.SemaphoreType.REGULAR,
-        latent=vmem((rows, 3584), jnp.bfloat16) if not big else None,
+        latent=vmem((rows, 3584), jnp.bfloat16),
         route_payload=vmem((rows // 4, 128), jnp.int32),
         route_wire=vmem((rows * 8, 128), jnp.int32),
         route_send=dma((5,)),
         route_recv=dma((5,)),
         keys=vmem((_sort_rows(rows * 32), 128), jnp.int32),
         tallies=vmem(_tally_shape(counts.shape[0]), jnp.int32),
-        latent_payload=vmem((rows, 2, 1792), jnp.bfloat16),
-        latent_recv=vmem((2, rows, 2, 1792), jnp.bfloat16) if not big else None,
+        latent_slab=vmem((rows, 4, _SLAB_LANES), jnp.float8_e4m3fn),
+        latent_recv=vmem((2, rows, 4, _SLAB_LANES), jnp.float8_e4m3fn) if not big else None,
         latent_state=pltpu.SMEM((25,), jnp.int32) if big else None,
         latent_meta=pltpu.SMEM((6 * 34,), jnp.int32) if big else None,
         latent_send_sems=dma((12,)),
@@ -1507,7 +1566,8 @@ def _routed_experts(
     first_down_unroll = 2 if tokens < 8192 else 8
     first_tail_unroll = 8
     ring_dtype = jnp.bfloat16
-    x = jax.ShapeDtypeStruct((_route_capacity(tokens), mid_width), latent.dtype)
+    assert latent.shape[1:] == (4, _SLAB_LANES) and latent.dtype == jnp.float8_e4m3fn
+    x = jax.ShapeDtypeStruct((_route_capacity(tokens), mid_width), jnp.bfloat16)
     rows, width = x.shape[0], rhs.shape[-1]
     assert middle.shape == x.shape
     tm, tn, localrows = (tile, columns, tokens // 32)
@@ -1539,7 +1599,7 @@ def _routed_experts(
     streams = len(regions)
     store_tile = 128
     gu_cfg = k.make_gmm_configs(
-        jax.ShapeDtypeStruct((rows, 3584), latent.dtype),
+        jax.ShapeDtypeStruct((rows, 3584), jnp.bfloat16),
         jax.ShapeDtypeStruct(gu_weights.shape[1:], gu_weights.dtype),
         jax.ShapeDtypeStruct(gu_scales.shape[1:], gu_scales.dtype),
         None,
@@ -1798,12 +1858,14 @@ def _routed_experts(
         @functools.partial(
             pl.run_scoped,
             gu_partial=pltpu.VMEM((sub, mid_width), gu_cfg.out_dtype),
-            acts=pltpu.VMEM((2, tm, 2, 1792), latent.dtype),
+            acts=pltpu.VMEM((2, tm, 4, _SLAB_LANES), latent.dtype),
             act_sems=pltpu.SemaphoreType.DMA((2,)),
             row_weights=pltpu.VMEM((2, tm, 128), jnp.float32),
+            act_rows=pltpu.VMEM((tm, 3584), latent.dtype),
+            act_scales=pltpu.VMEM((tm, 128), jnp.float32),
         )
         @_scoped("m_first_column")
-        def first_column(gu_partial, acts, act_sems, row_weights):
+        def first_column(gu_partial, acts, act_sems, row_weights, act_rows, act_scales):
             def buffering(spec):
                 return dataclasses.replace(
                     spec, pipeline_mode=pl.Buffered(buffer_count=2)
@@ -1890,7 +1952,7 @@ def _routed_experts(
                         start(g + 1, 1 - bank)
 
                     _gu_inner(
-                        _PackedRows(acts.at[bank]),
+                        _SlabRows(acts.at[bank], act_rows, act_scales),
                         gw,
                         gy,
                         gu_partial,
@@ -1981,18 +2043,25 @@ def _routed_experts(
     )
 
 
-class _PackedRows:
-    """Load only the static row bucket selected by the production GMM."""
+class _SlabRows:
+    """A visit's E4M3 latent slabs ``slab`` [tm, 4, _SLAB_LANES] as the GMM's
+    [rows, 3584] activations: ``decode(rows)`` unpacks a row bucket once into
+    ``rows`` and its inverse scales into ``inverse`` (``_decode_latent``), which
+    the gate/up products are multiplied by."""
 
-    def __init__(self, ref):
-        self.ref = ref
+    def __init__(self, slab, rows, inverse):
+        self.slab, self.rows, self.inverse = slab, rows, inverse
+
+    def decode(self, rows):
+        part = pl.ds(0, rows)
+        _decode_latent(self.slab.at[part], self.rows.at[part], self.inverse.at[part])
 
     def reshape(self, rows, width):
-        assert rows == -1 and width == 2 * self.ref.shape[-1]
+        assert rows == -1 and width == self.rows.shape[-1]
         return self
 
     def __getitem__(self, rows):
-        return self.ref[rows].reshape(-1, 2 * self.ref.shape[-1])
+        return self.rows[rows]
 
 
 def _interleaved_gate_up_specs(specs, width):
@@ -2013,21 +2082,34 @@ def _interleaved_gate_up_specs(specs, width):
 _DOWN_K_STEP = 768  # rows of the 256-row down tile's weights dequantized at once
 
 
-def _dequantized(rhs, cfgs, rows, cols):
-    """BF16 weights of ``rhs`` rows ``rows`` and columns ``cols`` (slices)."""
+def _dequantized(rhs, cfgs, rows, cols, fold=0, dtype=jnp.bfloat16):
+    """Weights of ``rhs`` rows ``rows`` and columns ``cols`` (slices), times
+    ``2 ** fold``, in ``dtype``.
+
+    The FP8 gate/up products take E5M2 weights: an MXFP4 value times a power of
+    two inside the window of ``rank_loader.E5M2_BLOCK_EXPONENTS`` is an E5M2
+    value, so the cast is exact.
+    """
     block = cfgs.rhs_cfgs.quant_block_size
     part = dataclasses.replace(
         rhs,
         weight=rhs.weight.at[rows, cols],
         scale=rhs.scale.at[pl.ds(rows.start // block, rows.size // block), cols],
     )
-    weights = part.get_weight().astype(cfgs.lhs_cfgs.dtype)
-    scales = part.get_scale(replicate_size=block).astype(cfgs.lhs_cfgs.dtype)
+    weights = part.get_weight().astype(jnp.bfloat16)
+    if fold:
+        exponents = part.scale[...]
+        assert exponents.dtype == jnp.uint8
+        powers = e8m0_scale(exponents.astype(jnp.uint32) + fold)[:, None, :]
+        scales = jnp.broadcast_to(powers, (exponents.shape[0], block, exponents.shape[1]))
+    else:
+        scales = part.get_scale(replicate_size=block)
     shape = weights.shape
-    return (weights.reshape(shape[0] // block, block, shape[1]) * scales).reshape(shape)
+    values = weights.reshape(shape[0] // block, block, shape[1]) * scales.astype(jnp.bfloat16)
+    return values.reshape(shape).astype(dtype)
 
 
-def _product_panels(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
+def _product_panels(lhs, rhs, *, cfgs, bucket_rows, overlap_work, fold=0, rescale=None):
     """Yield ``(panel, FP32 product)`` per MXU column panel of one expert tile.
 
     Both routed projections cover their complete reduction dimension in one
@@ -2035,13 +2117,18 @@ def _product_panels(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
     gate/up tile dequantizes per panel; the 256-row down tile reduces its
     1536 rows in 768-row steps, each dequantized whole, and accumulates in
     FP32. The callback consumes rows of the previous expert tile between the
-    last step's MXU panels; it must not read this product's result.
+    last step's MXU panels; it must not read this product's result. E4M3
+    activations take E5M2 weights cast times ``2 ** fold`` (``_dequantized``),
+    BF16 ones BF16 weights; products are multiplied by ``rescale`` (default
+    ``2 ** -fold``; [rows, 1] for per-row scales).
     """
     assert cfgs.dims.size_k == cfgs.tiles.tile_k
     assert not cfgs.rhs_cfgs.has_bias
     columns = pltpu.get_tpu_info().mxu_column_size
     size_k = cfgs.tiles.tile_k
     activations = lhs.reshape(-1, size_k)[:bucket_rows]
+    dtype = jnp.float8_e5m2 if activations.dtype == jnp.float8_e4m3fn else jnp.bfloat16
+    assert dtype == jnp.bfloat16 or fold, "E5M2 weights need the window's fold"
     width = rhs.weight.shape[-1]
     panels = [(first, min(columns, width - first)) for first in range(0, width, columns)]
     if cfgs.tiles.tile_m == 256 and cfgs.fuse_act is None:
@@ -2049,7 +2136,7 @@ def _product_panels(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
         accumulators = [None] * len(panels)
         for k0 in range(0, size_k, k_step):
             rows = pl.ds(k0, k_step)
-            weights = _dequantized(rhs, cfgs, rows, pl.ds(0, width))
+            weights = _dequantized(rhs, cfgs, rows, pl.ds(0, width), fold, dtype)
             last_step = k0 + k_step == size_k
             for index, (first, panel_width) in enumerate(panels):
                 product = jnp.matmul(
@@ -2062,15 +2149,15 @@ def _product_panels(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
                 total = accumulators[index]
                 accumulators[index] = product if total is None else total + product
         for index, accumulator in enumerate(accumulators):
-            yield index, accumulator
+            yield index, _unfolded(accumulator, fold, rescale)
         return
     whole = None
     if cfgs.tiles.tile_m != 256:
-        whole = _dequantized(rhs, cfgs, pl.ds(0, size_k), pl.ds(0, width))
+        whole = _dequantized(rhs, cfgs, pl.ds(0, size_k), pl.ds(0, width), fold, dtype)
     for index, (first, panel_width) in enumerate(panels):
         if whole is None:
             panel_weights = _dequantized(
-                rhs, cfgs, pl.ds(0, size_k), pl.ds(first, panel_width)
+                rhs, cfgs, pl.ds(0, size_k), pl.ds(first, panel_width), fold, dtype
             )
         else:
             panel_weights = whole[:, first:first + panel_width]
@@ -2078,7 +2165,15 @@ def _product_panels(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
             activations, panel_weights, preferred_element_type=jnp.float32
         ).astype(cfgs.acc_dtype)
         overlap_work(index)
-        yield index, product
+        yield index, _unfolded(product, fold, rescale)
+
+
+def _unfolded(product, fold, rescale=None):
+    """``product`` of weights cast times ``2 ** fold`` times ``rescale``, or
+    scaled back by ``2 ** -fold`` (exact)."""
+    if rescale is not None:
+        return product * rescale
+    return product * (2.0**-fold) if fold else product
 
 
 def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
@@ -2114,8 +2209,16 @@ def _gu_inner(lhs, rhs, output, partial, metadata, row_weights, *, cfgs, overlap
         live = (first <= row) & (row < last)
         weights = row_weights[:rows, :1]
         rows_out = output.reshape(-1, cfgs.tiles.tile_n)
+        lhs.decode(rows)
+        rescale = lhs.inverse[:rows, :1] * (2.0**-GATE_UP_E5M2_FOLD)
         for panel, value in _product_panels(
-            lhs, rhs, cfgs=cfgs, bucket_rows=rows, overlap_work=overlap_work
+            lhs,
+            rhs,
+            cfgs=cfgs,
+            bucket_rows=rows,
+            overlap_work=overlap_work,
+            fold=GATE_UP_E5M2_FOLD,
+            rescale=rescale,
         ):
             value = k.apply_act_fn(value, cfgs.fuse_act) * weights
             rows_out[:rows, pl.ds(panel * lanes, lanes)] = jnp.where(
@@ -2876,7 +2979,7 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
     bf16 = jnp.bfloat16
     workspace_shapes = [
         ((rows, 7168), bf16),
-        ((seq_len, 2, 1792), bf16),
+        ((seq_len, 4, _SLAB_LANES), jnp.float8_e4m3fn),
         ((_route_capacity(seq_len), _MIDDLE), bf16),
     ]
     output_specs = [hbm] * 3
@@ -2987,7 +3090,7 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
                 return (redone[0] if counting else redone)[0]
             ids, probs, counts = outputs[3:6]
             reduced = routed_experts_prepared(
-                latent,
+                _latent_bf16(latent),
                 ids.reshape(-1),
                 probs.reshape(-1),
                 counts,
@@ -3099,7 +3202,7 @@ def _compound_local(
         p_shape = (p_tok // 8, 128)
         workspace_shapes = [
             ((window_rows, 7168), bf16),
-            ((p_tok, 2, 1792), bf16),
+            ((p_tok, 4, _SLAB_LANES), jnp.float8_e4m3fn),
             ((_route_capacity(p_tok), _MIDDLE), bf16),
         ]
         output_specs = [hbm] * 3
@@ -3221,7 +3324,7 @@ def _compound_local(
             _, latent, _, ids, probs, counts, maximum = parts_out[idx]
             shared = final[r_off : r_off + p_rows]
             reduced = routed_experts_prepared(
-                latent,
+                _latent_bf16(latent),
                 ids.reshape(-1),
                 probs.reshape(-1),
                 counts,

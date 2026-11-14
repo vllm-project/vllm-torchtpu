@@ -52,6 +52,13 @@ PREFILL_SHARED = (PREFILL_IO + PREFILL_COMMON
                   + tuple(n for n in PREFILL_KDA if n != "k_o")
                   + tuple(n for n in PREFILL_MLA if n != "m_o")
                   + PREFILL_MOE_DENSE + EXPERT_FAMILIES)
+# The prefill MoE multiplies with its MXFP4 gate/up weights cast to E5M2. E5M2's
+# normal range holds an MXFP4 value (magnitudes 0.5 to 6, one mantissa bit)
+# times 2^s exactly for block exponents s in E5M2_BLOCK_EXPONENTS; the weights
+# are cast scaled by 2^GATE_UP_E5M2_FOLD (their FP32 products scaled back),
+# which moves the window down by as much.
+E5M2_BLOCK_EXPONENTS = (-13, 13)
+GATE_UP_E5M2_FOLD = 11
 
 
 def _dtype(name: str) -> np.dtype:

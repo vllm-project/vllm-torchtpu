@@ -69,11 +69,11 @@ def tpu_info(monkeypatch):
     monkeypatch.setattr(kernels.pltpu, "get_tpu_info", lambda: info)
 
 
-def _mxfp4(rng, rows, cols):
+def _mxfp4(rng, rows, cols, exponent_range=(122, 130)):
     """Random MXFP4 weights: FP4 codes [rows, cols] and E8M0 exponents per 32
     rows, with their dequantized FP32 value."""
     codes = rng.integers(0, 16, size=(rows, cols))
-    exponents = rng.integers(122, 130, size=(rows // 32, cols)).astype(np.uint8)
+    exponents = rng.integers(*exponent_range, size=(rows // 32, cols)).astype(np.uint8)
     values = FP4_VALUES[codes] * np.repeat(
         2.0 ** (exponents.astype(np.float32) - 127), 32, 0
     )
@@ -126,7 +126,12 @@ def test_interleaved_gate_up_tile_matches_separate_projections():
     panels = [
         kernels.apply_act_fn(value, cfgs.fuse_act)
         for _, value in fused._product_panels(
-            _Ref(lhs), rhs, cfgs=cfgs, bucket_rows=rows, overlap_work=lambda _: None
+            _Ref(lhs),
+            rhs,
+            cfgs=cfgs,
+            bucket_rows=rows,
+            overlap_work=lambda _: None,
+            fold=rank_loader.GATE_UP_E5M2_FOLD,
         )
     ]
     actual = np.concatenate([np.asarray(p) for p in panels], axis=1)
@@ -161,6 +166,164 @@ def test_down_tile_reduces_in_768_row_steps(width):
         np.float32
     )
     np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-4, atol=1e-2)
+
+
+@pytest.mark.parametrize("fold", [0, rank_loader.GATE_UP_E5M2_FOLD])
+def test_e5m2_weights_are_the_mxfp4_values_over_the_window(fold):
+    # Every code at both ends of the window and between: the E5M2 cast is the
+    # MXFP4 value times 2 ** fold, bit for bit.
+    low, high = rank_loader.E5M2_BLOCK_EXPONENTS
+    exponents = np.arange(127 + low - fold, 127 + high - fold + 1, dtype=np.uint8)
+    codes = np.tile(np.arange(16), (32 * exponents.size, 8))  # [rows, 128]
+    columns = np.broadcast_to(exponents[:, None], (exponents.size, 128))
+    values = FP4_VALUES[codes] * np.repeat(
+        2.0 ** (columns.astype(np.float32) - 127), 32, 0
+    )
+    rhs = kernels.WeightsRef(
+        weight=_Ref(FP4_VALUES[codes].astype(ml_dtypes.float4_e2m1fn)),
+        scale=_Ref(np.ascontiguousarray(columns)),
+        bias=None,
+    )
+    rows = codes.shape[0]
+    cast = fused._dequantized(
+        rhs,
+        _cfgs(tile_m=256, tile_k=rows, fuse_act=None),
+        pl.ds(0, rows),
+        pl.ds(0, 128),
+        fold,
+        jnp.float8_e5m2,
+    )
+    assert cast.dtype == jnp.float8_e5m2
+    np.testing.assert_array_equal(np.asarray(cast, np.float32), values * 2.0**fold)
+
+
+def test_folded_gate_up_products_equal_unfolded():
+    # The fold scales weights and products by powers of two: FP32 results match
+    # bit for bit (CPU dots; the MXU check is the device's).
+    rng = np.random.default_rng(4)
+    k, mid, rows = 512, 512, 128
+    weights, exponents, _ = _mxfp4(rng, k, 2 * mid)
+    lhs = rng.standard_normal((rows, k)).astype(ml_dtypes.bfloat16)
+    rhs = kernels.WeightsRef(weight=_Ref(weights), scale=_Ref(exponents), bias=None)
+    cfgs = _cfgs(tile_m=128, tile_k=k, fuse_act="situ:4:25")
+    folded, plain = (
+        [
+            np.asarray(value)
+            for _, value in fused._product_panels(
+                _Ref(lhs),
+                rhs,
+                cfgs=cfgs,
+                bucket_rows=rows,
+                overlap_work=lambda _: None,
+                fold=fold,
+            )
+        ]
+        for fold in (rank_loader.GATE_UP_E5M2_FOLD, 0)
+    )
+    for a, b in zip(folded, plain, strict=True):
+        np.testing.assert_array_equal(a, b)
+
+
+def _latent_rows(rng, rows):
+    """BF16 latent rows over a wide spread of magnitudes, one of them zero."""
+    scales = 2.0 ** rng.integers(-12, 8, size=(rows, 1))
+    latent = (rng.standard_normal((rows, 3584)) * scales).astype(ml_dtypes.bfloat16)
+    latent[3] = 0
+    return latent
+
+
+def _slab_round_trip(latent):
+    """``_encode_latent`` then ``_decode_latent`` in interpret mode."""
+    rows = latent.shape[0]
+
+    def kernel(latent_ref, slab_ref, rows_ref, inverse_ref):
+        fused._encode_latent(latent_ref, slab_ref)
+        fused._decode_latent(slab_ref, rows_ref, inverse_ref)
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct((rows, 4, fused._SLAB_LANES), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((rows, 3584), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((rows, 128), jnp.float32),
+        ),
+        interpret=True,
+    )(jnp.asarray(latent))
+
+
+def test_latent_slabs_round_trip_with_power_of_two_row_scales():
+    rng = np.random.default_rng(5)
+    latent = _latent_rows(rng, 64)
+    slab, rows, inverse = (np.asarray(x) for x in _slab_round_trip(latent))
+    values = latent.astype(np.float32)
+    largest = np.abs(values).max(axis=1, keepdims=True)
+    exponent = np.clip(np.floor(np.log2(np.where(largest > 0, largest, 1))), -100, 120)
+    exponent[largest == 0] = -100
+    expected = (values * 2.0 ** (7 - exponent)).astype(ml_dtypes.float8_e4m3fn)
+    np.testing.assert_array_equal(rows.view(np.uint8), expected.view(np.uint8))
+    np.testing.assert_array_equal(
+        inverse, np.broadcast_to(2.0 ** (exponent - 7), (64, 128))
+    )
+    # The slab holds each row's four 896-wide sub-rows, one word per lane.
+    np.testing.assert_array_equal(
+        slab[:, :, :896].reshape(64, 3584).view(np.uint8), expected.view(np.uint8)
+    )
+    restored = rows.astype(np.float32) * inverse[:, :1]
+    assert np.all(np.abs(restored) < 448 * inverse[:, :1])  # never saturated
+    error = np.abs(restored - values)
+    # E4M3 rounding: half a mantissa step (2^-4 relative) for normal values,
+    # half the subnormal step (2^-10 of the row scale's unit) below.
+    bound = np.maximum(np.abs(values) * 2.0**-4, inverse[:, :1] * 2.0**-10)
+    assert np.all(error <= bound)
+
+
+def test_uncapped_consumer_reads_the_slabs_as_their_bf16_values():
+    rng = np.random.default_rng(6)
+    latent = _latent_rows(rng, 32)
+    slab, rows, inverse = (np.asarray(x) for x in _slab_round_trip(latent))
+    with pltpu.force_tpu_interpret_mode():
+        decoded = np.asarray(fused._latent_bf16(jnp.asarray(slab)))
+    expected = (rows.astype(np.float32) * inverse[:, :1]).astype(ml_dtypes.bfloat16)
+    assert decoded.shape == (32, 2, 1792)
+    np.testing.assert_array_equal(decoded.reshape(32, 3584), expected)
+
+
+def test_e4m3_gate_up_tile_stays_within_the_bound_of_the_float64_product():
+    # The e4m3 latent rows x exact E5M2 weights, rescaled per row: products
+    # within 3.5% RMS of float64 BF16-latent x MXFP4-value products, rows within
+    # cosine 0.999, all finite.
+    rng = np.random.default_rng(7)
+    k, mid, rows = 3584, 256, 128
+    latent = _latent_rows(rng, rows)
+    latent[3] = latent[4]  # keep every row's product nonzero
+    weights, exponents, values = _mxfp4(rng, k, 2 * mid)
+    _, decoded, inverse = (np.asarray(x) for x in _slab_round_trip(latent))
+    fold = rank_loader.GATE_UP_E5M2_FOLD
+    rhs = kernels.WeightsRef(weight=_Ref(weights), scale=_Ref(exponents), bias=None)
+    cfgs = _cfgs(tile_m=128, tile_k=k, fuse_act="situ:4:25")
+    actual = np.concatenate(
+        [
+            np.asarray(value)
+            for _, value in fused._product_panels(
+                _Ref(decoded),
+                rhs,
+                cfgs=cfgs,
+                bucket_rows=rows,
+                overlap_work=lambda _: None,
+                fold=fold,
+                rescale=jnp.asarray(inverse[:, :1] * 2.0**-fold),
+            )
+        ],
+        axis=1,
+    )
+    expected = latent.astype(np.float64) @ values.astype(np.float64)
+    assert np.all(np.isfinite(actual))
+    diff = actual - expected
+    assert np.sqrt(np.mean(diff**2)) <= 0.035 * np.sqrt(np.mean(expected**2))
+    cosine = np.sum(actual * expected, 1) / (
+        np.linalg.norm(actual, axis=1) * np.linalg.norm(expected, axis=1)
+    )
+    assert cosine.min() >= 0.999
 
 
 def test_route_capacity_and_single_launch_16k():
