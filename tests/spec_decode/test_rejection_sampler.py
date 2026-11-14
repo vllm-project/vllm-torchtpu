@@ -1211,3 +1211,92 @@ def test_rejection_sampler_greedy_path_ignores_draft_probs(device):
     assert torch.equal(output, expected)
     log.warning_once.assert_called_once()
     assert "ignored" in log.warning_once.call_args.args[0]
+
+
+def test_fused_verify_and_sample_candidates(device):
+    """Fused candidate-space bonus sampling + rejection sampling matches full-vocab."""
+    vocab_size = 512
+    num_blocks = 2  # 2 * 128 = 256 candidates
+    num_cand = num_blocks * 128
+    batch_size = 2
+    max_draft_tokens = 2
+    total_tokens = 4
+
+    logits = torch.full((6, vocab_size), -100.0, dtype=torch.bfloat16, device=device)
+    # Row 0 (req 0 draft 0): token 10 dominates -> draft 10 accepted
+    logits[0, 10] = 20.0
+    # Row 1 (req 0 draft 1): token 20 dominates -> draft 99 rejected, recover 20
+    logits[1, 20] = 20.0
+    # Row 2 (req 0 bonus): token 30 dominates -> bonus 30
+    logits[2, 30] = 20.0
+    # Row 3 (req 1 draft 0): token 150 dominates -> draft 150 accepted
+    logits[3, 150] = 20.0
+    # Row 4 (req 1 draft 1): token 160 dominates -> draft 160 accepted
+    logits[4, 160] = 20.0
+    # Row 5 (req 1 bonus): token 170 dominates -> bonus 170
+    logits[5, 170] = 20.0
+
+    draft_token_ids = torch.tensor([10, 99, 150, 160], dtype=torch.int32, device=device)
+    num_draft_tokens = torch.tensor([2, 2], dtype=torch.int32, device=device)
+    bonus_logits_indices = torch.tensor([2, 5], dtype=torch.int32, device=device)
+    target_logits_indices = torch.tensor([0, 1, 3, 4], dtype=torch.int32, device=device)
+    segment_ids = torch.tensor([0, 0, 1, 1], dtype=torch.int64, device=device)
+    group_indices = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=device)
+
+    req_temperatures = torch.ones((batch_size, 1), dtype=torch.bfloat16, device=device)
+    req_top_k = torch.full((batch_size, 1), 4, dtype=torch.int32, device=device)
+    req_top_p = torch.ones((batch_size, 1), dtype=torch.float32, device=device)
+    accept_u = torch.full((total_tokens,), 0.5, dtype=torch.float32, device=device)
+    u_all = torch.full(
+        (batch_size + total_tokens, num_cand), 0.5, dtype=torch.float32, device=device
+    )
+
+    sampler = RejectionSampler()
+    out = sampler.fused_verify_and_sample_candidates(
+        logits=logits,
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        bonus_logits_indices=bonus_logits_indices,
+        target_logits_indices=target_logits_indices,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=max_draft_tokens,
+        req_temperatures=req_temperatures,
+        req_top_k=req_top_k,
+        req_top_p=req_top_p,
+        accept_u=accept_u,
+        u_all=u_all,
+        topk_candidates=num_blocks,
+    )
+    expected = torch.tensor(
+        [[10, 20, PLACEHOLDER_TOKEN_ID], [150, 160, 170]],
+        dtype=torch.int32,
+        device=device,
+    )
+    assert torch.equal(out.cpu(), expected.cpu())
+
+    # Pre-extracted packed candidates (topk_candidates=0) must produce the exact
+    # same result when passed [rows, 2 * num_cand] float32 [cand_logits, cand_ids].
+    from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+        extract_topk_candidates,
+    )
+
+    cand_logits, cand_ids = extract_topk_candidates(logits, num_blocks)
+    packed_candidates = torch.cat([cand_logits, cand_ids.to(torch.float32)], dim=-1)
+    out_packed = sampler.fused_verify_and_sample_candidates(
+        logits=packed_candidates,
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        bonus_logits_indices=bonus_logits_indices,
+        target_logits_indices=target_logits_indices,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=max_draft_tokens,
+        req_temperatures=req_temperatures.to(torch.float32),
+        req_top_k=req_top_k,
+        req_top_p=req_top_p,
+        accept_u=accept_u,
+        u_all=u_all,
+        topk_candidates=0,
+    )
+    assert torch.equal(out_packed.cpu(), expected.cpu())

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 import jax
+import numpy as np
 import torch
 from vllm.distributed import get_pcp_group
 from vllm.utils.math_utils import cdiv
@@ -201,6 +202,18 @@ class AttentionMetadataBuilderContext:
     # the single `_staged_walk_products_compiled` program; None -> per-group
     # fallback.
     staged_mamba_products: dict | None = None
+    # Optional host-side bound `(seq_lens_hi_np[:num_reqs], max_rejected)` (or
+    # `(..., sub_mask)`) on active requests' sequence lengths so
+    # `stage_block_table_uploads` can reuse cached per-group block tables and
+    # mamba state/checkpoint indices whenever every active request's state
+    # block column `(seq_len - 1) // block_size` is invariant across
+    # `[seq_lens_hi - max_rejected, seq_lens_hi]`.
+    mamba_seq_lens_bounds: tuple[Any, ...] | None = None
+    # The walk's mamba group state indices stacked as one [G, num_reqs]
+    # tensor (more than one group), and the ids of the per-group tensors it
+    # was stacked from, for the runner's read-offset reset to reuse.
+    _stacked_mamba_groups: Any = None
+    _stacked_mamba_groups_ids: tuple[int, ...] | None = None
 
 
 def _gather_prefill_ckpt_ids(
@@ -284,7 +297,8 @@ def _staged_walk_products(
                         prefill_ckpt_spec_blocks,
                     )
                 )
-    return tuple(outs) + tuple(states) + tuple(ckpts) + tuple(prefill_ckpts)
+    stacked = (torch.stack(states, dim=0),) if len(states) > 1 else ()
+    return tuple(outs) + tuple(states) + tuple(ckpts) + tuple(prefill_ckpts) + stacked
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -305,7 +319,8 @@ def _staged_walk_products_compiled(
       group's speculative block count when it declares prefill checkpoints and
       None otherwise. Both geoms are static per padding bucket.
     - Returns: tables + states + (ckpts if ckpt_window > 1) + (prefill_ckpts
-      for declaring groups if prefill_ckpt_offsets is given).
+      for declaring groups if prefill_ckpt_offsets is given) + (the states
+      stacked as one `[G, num_reqs]` tensor when G > 1).
 
     Issued for every staged walk, dummy runs included, so warmup and lockstep
     ranks dispatch the same program sequence.
@@ -491,44 +506,52 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         """
         runner = self.runner
         block_table_obj = runner.input_batch.block_table[self.kv_cache_group_id]
+        max_blocks = block_table_obj.max_num_blocks_per_req
         if ctx.use_max_model_len:
-            target_num_blocks = block_table_obj.max_num_blocks_per_req
-        else:
-            assert runner.most_model_len is not None
-            spec = self.kv_cache_spec
-            first_spec = (
-                spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+            return block_table_obj, max_blocks
+        most_model_len = runner.most_model_len
+        assert most_model_len is not None
+        # Only a mamba group's width depends on the checkpoint window.
+        window = ctx.mamba_ckpt_window if self.is_mamba_group else 1
+        geom_key = (most_model_len, max_blocks, window)
+        if getattr(self, "_cached_geom_key", None) == geom_key:
+            return block_table_obj, self._cached_target_num_blocks
+
+        spec = self.kv_cache_spec
+        first_spec = (
+            spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+        )
+        if isinstance(first_spec, AttentionSpec):
+            target_num_blocks = attention_block_table_width(
+                block_table_obj,
+                self.kv_cache_spec,
+                self.vllm_config,
+                most_model_len,
             )
-            if isinstance(first_spec, AttentionSpec):
-                target_num_blocks = attention_block_table_width(
-                    block_table_obj,
-                    self.kv_cache_spec,
-                    self.vllm_config,
-                    runner.most_model_len,
-                )
-            else:
-                target_num_blocks = cdiv(runner.most_model_len, self.target_block_size)
-            if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
-                # Speculative decoding: the manager appends
-                # `num_speculative_blocks` (= window - 1) checkpoint blocks
-                # after the request's positional state block, so a mamba row
-                # is that much wider than the positional part alone. This
-                # mirrors `MambaSpec.max_num_blocks_per_req`, which the
-                # use_max_model_len branch above already gets for free.
-                # Without it the row stops short of the checkpoint group and
-                # `in_row` below silently redirects checkpoints to the null
-                # block, costing rollback accuracy with no error.
-                target_num_blocks = min(
-                    target_num_blocks + ctx.mamba_ckpt_window - 1,
-                    block_table_obj.max_num_blocks_per_req,
-                )
+        else:
+            target_num_blocks = cdiv(most_model_len, self.target_block_size)
+        if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
+            # Speculative decoding: the manager appends
+            # `num_speculative_blocks` (= window - 1) checkpoint blocks
+            # after the request's positional state block, so a mamba row
+            # is that much wider than the positional part alone. This
+            # mirrors `MambaSpec.max_num_blocks_per_req`, which the
+            # use_max_model_len branch above already gets for free.
+            # Without it the row stops short of the checkpoint group and
+            # `in_row` below silently redirects checkpoints to the null
+            # block, costing rollback accuracy with no error.
+            target_num_blocks = min(
+                target_num_blocks + ctx.mamba_ckpt_window - 1,
+                max_blocks,
+            )
+        self._cached_geom_key = geom_key
+        self._cached_target_num_blocks = target_num_blocks
         return block_table_obj, target_num_blocks
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         runner = self.runner
         ctx = runner._attn_metadata_builder_ctx
         target_num_reqs = common_attn_metadata.num_reqs
-        block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
 
         # `position_ids` is only used for the dummy run in dummy runs, where we
         # want to use fixed position IDs instead of copying from the CPU tensor
@@ -538,6 +561,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             if ctx.staged_block_tables is not None
             else None
         )
+        block_table_obj = None
+        target_num_blocks = 0
         if staged is not None:
             # The walk pre-uploaded every group's table in one batched
             # transfer; see `stage_block_table_uploads`.
@@ -548,11 +573,13 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 else runner.position_ids
             )
         elif ctx.position_ids_override is not None:
+            block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
             block_tables_dev = torch.zeros(
                 (target_num_reqs * target_num_blocks,), dtype=torch.int32
             ).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
+            block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
             # Per-call buffer: a later chunk or draft walk must not overwrite a
             # table whose upload is still in flight (see `stage_h2d_upload`).
             flat = zeros_h2d_source(runner, target_num_reqs * target_num_blocks)
@@ -600,6 +627,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                     mamba_prefill_ckpt_indices,
                 ) = staged_products
             else:
+                if target_num_blocks <= 0:
+                    _, target_num_blocks = self._block_table_geometry(ctx)
                 block_tables_2d = block_tables_dev.reshape(
                     target_num_reqs, target_num_blocks
                 )
@@ -685,6 +714,100 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         )
 
 
+def _stage_unless_unchanged(runner: Any, slot: str, host: torch.Tensor) -> torch.Tensor:
+    """`stage_h2d_upload(runner, host)`, reusing `slot`'s previous upload when
+    the values have not changed.
+
+    The same reuse as `TPUModelRunner._upload_unless_unchanged`, sharing its
+    `_h2d_reuse` entries, but a changed upload goes through `stage_h2d_upload`
+    so `host` stays alive until the input-staging fence (a walk's per-call
+    buffer can be refilled by a later chunk or draft walk otherwise). The key
+    is a copy of the values, so recycling `host` afterwards cannot change it.
+    An unchanged `host` never starts a transfer, so a buffer from
+    `zeros_h2d_source` goes straight back to the free list.
+    """
+    key = (host.dtype, tuple(host.shape), host.numpy().tobytes())
+    prev = runner._h2d_reuse.get(slot)
+    if prev is not None and prev[0] == key:
+        if id(host) in runner._registered_h2d_sources:
+            runner._free_h2d_sources.setdefault((host.numel(), host.dtype), []).append(
+                host
+            )
+        return prev[1]
+    dev = stage_h2d_upload(runner, host)
+    runner._h2d_reuse[slot] = (key, dev, host)
+    return dev
+
+
+def _stage_products_key(
+    ctx: AttentionMetadataBuilderContext,
+    staged_dev: torch.Tensor,
+    num_reqs_padded: int,
+    table_geom: list[tuple[int, int, int]],
+    entries: list[tuple[int, Any, int]],
+    mamba_geom: list[tuple[int, int, int, int | None]],
+) -> tuple | None:
+    """Cache key for `_staged_walk_products`, or None when it must run.
+
+    The products depend on `seq_lens` only through each request's state block
+    column `(seq_len - 1) // block_size` (and `seq_len > 0`). When the runner
+    bounds every active request's length to `[hi - max_rejected, hi]` and that
+    column is the same at both ends for every mamba group, the products of an
+    earlier walk over the same upload are still exact. Steps that carry
+    prefill checkpoint offsets always recompute.
+    """
+    if (
+        not mamba_geom
+        or ctx.position_ids_override is not None
+        or ctx.mamba_seq_lens_bounds is None
+        or ctx.mamba_prefill_ckpt_offsets is not None
+    ):
+        return None
+    bounds = ctx.mamba_seq_lens_bounds
+    if len(bounds) == 3:
+        sl_np, max_rej, sub_mask = bounds
+    else:
+        sl_np, max_rej = bounds
+        sub_mask = None
+    n = int(ctx.num_reqs)
+    if sl_np.shape[0] != n:
+        return None
+    high = sl_np - 1
+    if max_rej > 0:
+        if sub_mask is not None:
+            low = np.where(sub_mask, sl_np - max_rej - 1, high)
+        else:
+            low = sl_np - max_rej - 1
+    else:
+        low = high
+    if not np.all(low >= 0):
+        return None
+    per_group_q: list[bytes] = []
+    seen_t_bs: dict[tuple[int, int], bytes] = {}
+    for _, t, bs, _ in mamba_geom:
+        t_bs = (t, bs)
+        if t_bs in seen_t_bs:
+            per_group_q.append(seen_t_bs[t_bs])
+            continue
+        q_low = np.minimum(low // bs, t - 1)
+        q_high = np.minimum(high // bs, t - 1)
+        if not np.array_equal(q_low, q_high):
+            return None
+        q_bytes = q_low.tobytes()
+        seen_t_bs[t_bs] = q_bytes
+        per_group_q.append(q_bytes)
+    return (
+        id(staged_dev),
+        num_reqs_padded,
+        n,
+        tuple(table_geom),
+        tuple(gid for gid, _, _ in entries),
+        int(ctx.mamba_ckpt_window),
+        tuple(mamba_geom),
+        tuple(per_group_q),
+    )
+
+
 def stage_block_table_uploads(
     runner: Any,
     ctx: AttentionMetadataBuilderContext,
@@ -742,7 +865,12 @@ def stage_block_table_uploads(
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed buffer: same staged layout, null blocks.
 
-    staged_dev = stage_h2d_upload(runner, flat)
+    # Re-uploads only when the staged rows change (a page boundary, requests
+    # joining, finishing, being preempted or reordered, spec tokens being
+    # rejected); comparing contents covers every cause. An unchanged upload
+    # reuses the previous device tensor, which also lets the products cache
+    # below key on its identity.
+    staged_dev = _stage_unless_unchanged(runner, "staged_block_tables", flat)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
@@ -781,25 +909,62 @@ def stage_block_table_uploads(
         ctx.staged_block_tables = {gid: staged_dev[:length]}
         return
 
-    walk = (
-        _staged_walk_products_compiled
-        if staged_dev.device.type == "tpu"
-        else _staged_walk_products
+    bt_views_key = None
+    if not mamba_geom:
+        bt_views_key = (
+            id(staged_dev),
+            tuple(table_geom),
+            tuple(gid for gid, _, _ in entries),
+        )
+        if getattr(runner, "_cached_staged_block_tables_key", None) == bt_views_key:
+            ctx.staged_block_tables = runner._cached_staged_block_tables
+            return
+
+    products_key = _stage_products_key(
+        ctx, staged_dev, num_reqs_padded, table_geom, entries, mamba_geom
     )
-    products = walk(
-        staged_dev,
-        ctx.seq_lens,
-        tuple(table_geom),
-        tuple(mamba_geom),
-        ctx.mamba_ckpt_window,
-        ctx.mamba_prefill_ckpt_offsets,
-    )
+    cache_dict = getattr(runner, "_stage_products_cache", None)
+    if not isinstance(cache_dict, dict):
+        cache_dict = None
+    cached = None
+    if products_key is not None and cache_dict is not None:
+        hit = cache_dict.get(products_key)
+        if hit is not None:
+            cached = hit[1]
+
+    if cached is not None:
+        products = cached
+    else:
+        walk = (
+            _staged_walk_products_compiled
+            if staged_dev.device.type == "tpu"
+            else _staged_walk_products
+        )
+        products = walk(
+            staged_dev,
+            ctx.seq_lens,
+            tuple(table_geom),
+            tuple(mamba_geom),
+            ctx.mamba_ckpt_window,
+            ctx.mamba_prefill_ckpt_offsets,
+        )
+        if products_key is not None and staged_dev.device.type == "tpu":
+            if cache_dict is None:
+                cache_dict = {}
+                runner._stage_products_cache = cache_dict
+            elif len(cache_dict) >= 8:
+                cache_dict.clear()
+            cache_dict[products_key] = (staged_dev, products)
 
     n_tables = len(entries)
     n_mamba = len(mamba_geom)
     ctx.staged_block_tables = {
         gid: products[i] for i, (gid, _, _) in enumerate(entries)
     }
+    if not mamba_geom:
+        runner._cached_staged_block_tables_key = bt_views_key
+        runner._cached_staged_block_tables_dev = staged_dev
+        runner._cached_staged_block_tables = ctx.staged_block_tables
     if n_mamba:
         states = products[n_tables : n_tables + n_mamba]
         rest = products[n_tables + n_mamba :]
@@ -823,3 +988,8 @@ def stage_block_table_uploads(
                 ckpts[j],
                 prefill_ckpt,
             )
+        stacked_states = products[-1] if n_mamba > 1 else states[0]
+        stacked_ids = tuple(id(s) for s in states)
+        if gids is None:
+            ctx._stacked_mamba_groups = stacked_states
+            ctx._stacked_mamba_groups_ids = stacked_ids

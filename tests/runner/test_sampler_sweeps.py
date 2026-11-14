@@ -50,6 +50,8 @@ def _runner(seen):
         _precompile_timed=lambda name: contextlib.nullcontext(),
         _dummy_logits=logits,
         _topk_candidate_blocks=lambda: 0,
+        # The packed top-k candidate warmup is off.
+        _greedy_head_owner=None,
         sample_from_logits_func=lambda logits, *args, **kwargs: logits,
         gather_logprobs=lambda logits, ids: SimpleNamespace(logprobs=logits),
         structured_decoding_manager=manager,
