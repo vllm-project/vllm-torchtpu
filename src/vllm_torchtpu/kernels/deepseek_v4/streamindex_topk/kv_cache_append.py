@@ -824,6 +824,12 @@ def scatter_rows(
 
     wave = min(num_tokens, _MAX_WAVE)
     if layout == KVLayout.SEQ_ALONG_LANE:
+        # Sort by destination row so each 128-row SAL granule is written in one run.
+        writable = (dst_rows >= 0) & (dst_rows < cache_kv.shape[0] * page_size)
+        order = jnp.argsort(
+            jnp.where(writable, dst_rows, jnp.iinfo(jnp.int32).max), stable=True
+        )
+        dst_rows, src = dst_rows[order], src[order]
         k_in, kernel, scratch_shapes = _sal_launch(
             cache_kv,
             src if short_run_fast_path else _format_rows(src, cache_kv, layout),
