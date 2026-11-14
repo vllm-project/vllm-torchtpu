@@ -649,10 +649,13 @@ def _patch_vllm_compile_all_ranges() -> None:
 def _patch_sequence_parallel_moe_admission() -> None:
     """Gate vLLM's sequence-parallel MoE on TPU.
 
-    Off by default. With TPU_MOE_SEQUENCE_PARALLEL=1, admit it at DP1
-    when EP is on and TP > 1. The GPU all2all-backend and DP > 1 conjuncts do
-    not apply on TPU. EP is required: without it the row-parallel expert sum
-    is never reduced.
+    Off by default. With TPU_MOE_SEQUENCE_PARALLEL=1, admit it when EP is on
+    and TP > 1, at any data-parallel size: the EP group spans the dp x tp
+    ranks, so a sequence-parallel step's dispatch and combine over it see
+    every replica's rows once, and the fused EP kernel's all-to-all covers
+    the same mesh. The GPU all2all-backend and DP > 1 conjuncts do not apply
+    on TPU. EP is required: without it the row-parallel expert sum is never
+    reduced.
     """
     from vllm.config.parallel import ParallelConfig
 
@@ -661,16 +664,19 @@ def _patch_sequence_parallel_moe_admission() -> None:
 
     if envs.TPU_MOE_SEQUENCE_PARALLEL:
         ParallelConfig.use_sequence_parallel_moe = property(
-            lambda self: self.enable_expert_parallel
-            and self.tensor_parallel_size > 1
-            and self.data_parallel_size == 1
+            lambda self: self.enable_expert_parallel and self.tensor_parallel_size > 1
         )
     else:
         ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
     ParallelConfig._tpu_no_sp_moe_patch = True
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
     logger.info(
         "Applied TPU patch: sequence-parallel MoE %s.",
-        "admitted" if envs.TPU_MOE_SEQUENCE_PARALLEL else "disabled",
+        "admitted (a step below its layout's row threshold runs replicated; "
+        f"the default threshold is {sequence_parallel.DEFAULT_MIN_ROWS} rows)"
+        if envs.TPU_MOE_SEQUENCE_PARALLEL
+        else "disabled",
     )
 
 
@@ -1692,15 +1698,14 @@ def _patch_vllm_compile_prefix_isolation() -> None:
     breaks that, and one layer's executable can be reused by another (XLA
     e0102). Keying on self.prefix is a no-op for shape-uniform models.
     """
-    import itertools
-
     from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 
     original_init = TorchCompileWithNoGuardsWrapper.__init__
     if getattr(original_init, "_tpu_compile_prefix_isolation_patch", False):
         return
 
-    counter = itertools.count()
+    # Instances built so far in this process, per class without self.prefix.
+    instances_per_class: dict[str, int] = {}
 
     def patched_init(self, compile_prefix: str = "", is_encoder: bool = False) -> None:
         if not compile_prefix and not is_encoder:
@@ -1708,13 +1713,17 @@ def _patch_vllm_compile_prefix_isolation() -> None:
             if prefix:
                 compile_prefix = prefix
             else:
-                # No self.prefix: fall back to a counter. Stable within a
-                # process but not across restarts, so the cache won't persist.
-                compile_prefix = f"_tpu_instance_{next(counter)}"
-                logger.warning(
-                    "compile_prefix isolation: %s has no self.prefix; using "
-                    "non-deterministic fallback %s (its on-disk compile "
-                    "cache will not persist across restarts).",
+                # The class name plus the instance's index within its class.
+                # Instances of one class are built in a fixed order, so a
+                # restart that builds the same model gets the same names and
+                # reads the same cache dirs.
+                cls_name = f"{type(self).__module__}.{type(self).__qualname__}"
+                index = instances_per_class.get(cls_name, 0)
+                instances_per_class[cls_name] = index + 1
+                compile_prefix = f"{cls_name}_{index}"
+                logger.info(
+                    "compile_prefix isolation: %s has no self.prefix; caching "
+                    "it under %s (class name and instance index).",
                     type(self).__name__,
                     compile_prefix,
                 )
@@ -1724,7 +1733,7 @@ def _patch_vllm_compile_prefix_isolation() -> None:
     TorchCompileWithNoGuardsWrapper.__init__ = patched_init
     logger.info(
         "Applied TPU patch: per-instance compile-artifact cache isolation "
-        "(compile_prefix keyed off self.prefix)."
+        "(compile_prefix keyed off self.prefix, else class name and index)."
     )
 
 
