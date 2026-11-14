@@ -87,6 +87,39 @@ def test_apply_act_fn_dispatches_situ(monkeypatch, linear_beta):
     _assert_allclose(actual, expected)
 
 
+def test_apply_act_fn_silu_bf16_rounds_intermediates_to_bfloat16(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(num_lanes=1),
+    )
+    gate = jnp.asarray([-1.2345679, 0.33333334, 2.7182817], dtype=jnp.float32)
+    up = jnp.asarray([1.1111112, -0.7654321, 3.1415927], dtype=jnp.float32)
+    interleaved = interleave_lane(gate, up)
+
+    actual_silu = apply_act_fn(interleaved, "silu")
+    actual_silu_bf16 = apply_act_fn(interleaved, "silu_bf16")
+
+    assert actual_silu.dtype == jnp.float32
+    assert actual_silu_bf16.dtype == jnp.float32
+    _assert_allclose(actual_silu, jax.nn.silu(gate) * up)
+    assert not np.array_equal(np.asarray(actual_silu_bf16), np.asarray(actual_silu))
+
+    # Pre-rounding gate and up to bfloat16 must not change the silu_bf16 result,
+    # and the output values must all be exact bfloat16 numbers cast to float32.
+    pre_rounded = interleave_lane(
+        gate.astype(jnp.bfloat16).astype(jnp.float32),
+        up.astype(jnp.bfloat16).astype(jnp.float32),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual_silu_bf16),
+        np.asarray(apply_act_fn(pre_rounded, "silu_bf16")),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual_silu_bf16),
+        np.asarray(actual_silu_bf16.astype(jnp.bfloat16).astype(jnp.float32)),
+    )
+
+
 def get_group_sizes(batch_size: int, num_groups: int) -> jax.Array:
     distribution = jax.random.uniform(
         jax.random.key(0), (num_groups - 1,), dtype=jnp.float32
@@ -256,7 +289,7 @@ def test_gmm_weight_quantized_matches_reference(weight_dtype, block_size):
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("fuse_act", ["silu", "swigluoai"])
+@pytest.mark.parametrize("fuse_act", ["silu", "silu_bf16", "swigluoai"])
 def test_gmm_fused_activation_matches_reference(fuse_act):
     _require_tpu()
 
@@ -313,6 +346,64 @@ def test_gmm_fused_activation_matches_reference(fuse_act):
 
     assert actual.shape == (batch_size, final_out_size)
     _assert_allclose(actual, expected, atol=4.0, rtol=2.0)
+
+
+@pytest.mark.tpu_test
+def test_gmm_fused_silu_bf16_matches_unfused_silu_and_mul():
+    _require_tpu()
+
+    batch_size = 128
+    in_size = 512
+    out_size = 512
+    num_groups = 16
+    key = jax.random.key(0)
+    lhs_key, rhs_key, bias_key = jax.random.split(key, 3)
+
+    lhs = jax.random.uniform(lhs_key, (batch_size, in_size), jnp.bfloat16, -1.0, 1.0)
+    rhs = jax.random.uniform(
+        rhs_key, (num_groups, in_size, out_size), jnp.bfloat16, -0.1, 0.1
+    )
+    rhs_bias = jax.random.uniform(
+        bias_key, (num_groups, 1, out_size), jnp.bfloat16, -0.1, 0.1
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    unfused_gate_up = gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_bias=rhs_bias,
+        maybe_quantize_lhs=False,
+    )
+    gate, up = jnp.split(unfused_gate_up, 2, axis=-1)
+    expected_standalone = (
+        jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16) * up
+    )
+
+    actual_silu_bf16 = gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_bias=rhs_bias,
+        maybe_quantize_lhs=False,
+        fuse_act="silu_bf16",
+    )
+    actual_silu = gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_bias=rhs_bias,
+        maybe_quantize_lhs=False,
+        fuse_act="silu",
+    )
+
+    assert actual_silu_bf16.dtype == jnp.bfloat16
+    _assert_allclose(actual_silu_bf16, expected_standalone, atol=1e-2, rtol=1e-2)
+    expected_fp32 = expected_standalone.astype(jnp.float32)
+    bf16_abs_diff = jnp.abs(actual_silu_bf16.astype(jnp.float32) - expected_fp32)
+    fp32_abs_diff = jnp.abs(actual_silu.astype(jnp.float32) - expected_fp32)
+    assert float(jnp.max(fp32_abs_diff)) > 1e-2
+    assert float(jnp.mean(bf16_abs_diff)) < float(jnp.mean(fp32_abs_diff)) * 0.1
 
 
 @pytest.mark.tpu_test

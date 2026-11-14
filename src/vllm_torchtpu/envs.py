@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
+    TPU_MOE_SILU_BF16: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -850,6 +851,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_TOPK_WEIGHTS_FLOAT32": env_bool(
         "TPU_MOE_TOPK_WEIGHTS_FLOAT32", default=False
     ),
+    # Round fused SwiGLU (silu) intermediates to bfloat16 in fused_moe_gmm's
+    # gmm_v2 kernel to match standalone SiluAndMul rounding in RL/distillation
+    # workloads (default off until validated across SiLU MoE models).
+    "TPU_MOE_SILU_BF16": env_bool("TPU_MOE_SILU_BF16", default=False),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's
