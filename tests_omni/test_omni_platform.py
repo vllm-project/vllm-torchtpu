@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib
+import inspect
 import os
+import pkgutil
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -23,16 +27,28 @@ from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
+from vllm_omni.diffusion.models import wan2_2
 from vllm_omni.diffusion.models.ltx2 import (
     ltx2_components,
     ltx2_runtime,
     ltx2_transformer,
 )
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
+from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
+    FlowUniPCMultistepScheduler,
+)
+from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
+    WanS2VTransformer3DModel,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     ColumnParallelGELU,
     WanSelfAttention,
+    WanTransformer3DModel,
 )
+from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import (
+    WanVACETransformer3DModel,
+)
+from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
 from vllm_torchtpu.omni import patches, register_omni_tpu_platform
@@ -46,14 +62,18 @@ from vllm_torchtpu.omni.attention import (
 from vllm_torchtpu.omni.patches import (
     _BWE_FILTER_CPU_RESTORE_PATCHED,
     _D2H_STREAM_PATCHED,
+    _HOST_SCHEDULE_PATCHED,
     _SDPA_FALLBACK_PATCHED,
     _SPLIT_ROPE_PATCHED,
     _VOCODER_CPU_INIT_PATCHED,
+    _WAN_HOST_SCHEDULE_PIPELINE_MODULES,
     _patch_diffusion_startup_warmup_sync,
     _patch_diffusion_worker_d2h_stream,
     _patch_ltx2_split_rope,
     _patch_ltx2_vocoder_cpu_init,
     _patch_sdpa_fallback_dispatch,
+    _patch_wan_host_resident_schedule,
+    _wrap_fresh_timestep,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
 )
@@ -78,6 +98,7 @@ _UPSTREAM_SDPA_FORWARD = SDPAImpl.forward
 _UPSTREAM_ROPE_FORWARD = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward
 _UPSTREAM_APPLY_SPLIT_ROTARY_EMB = ltx2_transformer.apply_split_rotary_emb
 _UPSTREAM_RESTORE_BWE_FILTER = ltx2_runtime._restore_ltx_bwe_resampler_filter
+_UPSTREAM_FLOW_UNIPC_SET_TIMESTEPS = FlowUniPCMultistepScheduler.set_timesteps
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -273,6 +294,248 @@ def test_wan_ffn_gelu_fence(monkeypatch):
     torch.testing.assert_close(ffn(x), want * 2, rtol=0, atol=0)
     assert len(fenced) == 1
     torch.testing.assert_close(fenced[0], want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [WanTransformer3DModel, WanVACETransformer3DModel, WanS2VTransformer3DModel],
+    ids=["wan", "vace", "s2v"],
+)
+def test_wan_timestep_host_schedule_transfer(monkeypatch, cls):
+    # A timestep from a host-resident schedule is moved to the hidden-states
+    # device as a plain transfer; no copy-and-sync program is queued.
+    calls = []
+    monkeypatch.setattr(
+        cls,
+        "forward",
+        lambda self, hidden_states, timestep, *args, **kwargs: calls.append(
+            (hidden_states, timestep, args, kwargs)
+        ),
+    )
+    synced = []
+    monkeypatch.setattr(
+        "vllm_torchtpu.utils.synchronize_tensors",
+        lambda t, wait=True: synced.append((t, wait)),
+    )
+    _wrap_fresh_timestep(cls)
+
+    x_meta = torch.zeros(2, 4, device="meta")
+    host_t = torch.arange(6)[3].expand(2)
+    cls.forward(object(), hidden_states=x_meta, timestep=host_t, return_dict=False)
+    cls.forward(object(), x_meta, host_t, "ctx")
+    assert len(calls) == 2
+    assert calls[0][1].device.type == "meta" and calls[0][1].shape == (2,)
+    assert calls[0][3]["return_dict"] is False
+    assert calls[1][1].device.type == "meta" and calls[1][2] == ("ctx",)
+    assert synced == []
+
+    # Same-device view still clones and flushes asynchronously.
+    calls.clear()
+    x_cpu = torch.zeros(2, 4)
+    view_t = torch.arange(6.0)[3].expand(2)
+    cls.forward(object(), hidden_states=x_cpu, timestep=view_t)
+    got_t = calls[0][1]
+    assert got_t._base is None and got_t.data_ptr() != view_t.data_ptr()
+    torch.testing.assert_close(got_t, view_t)
+    assert len(synced) == 1 and synced[0] == (got_t, False)
+
+
+def _reset_wan_host_schedule(monkeypatch):
+    monkeypatch.setattr(
+        FlowUniPCMultistepScheduler,
+        "set_timesteps",
+        _UPSTREAM_FLOW_UNIPC_SET_TIMESTEPS,
+    )
+    for module_name in _WAN_HOST_SCHEDULE_PIPELINE_MODULES:
+        monkeypatch.setattr(
+            importlib.import_module(module_name),
+            "FlowUniPCMultistepScheduler",
+            FlowUniPCMultistepScheduler,
+        )
+
+
+def _pipeline_mro_model_modules(pipeline_cls: type) -> list:
+    return [
+        sys.modules[base.__module__]
+        for base in pipeline_cls.__mro__
+        if base.__module__.startswith("vllm_omni.diffusion.models.")
+    ]
+
+
+def _build_pipeline_unipc_schedulers(pipeline_cls: type) -> list:
+    schedulers = []
+    for mod in _pipeline_mro_model_modules(pipeline_cls):
+        if hasattr(mod, "build_wan_scheduler"):
+            schedulers.append(mod.build_wan_scheduler("unipc", 5.0))
+        if hasattr(mod, "FlowUniPCMultistepScheduler"):
+            schedulers.append(
+                mod.FlowUniPCMultistepScheduler(
+                    num_train_timesteps=1000,
+                    shift=1.0,
+                    prediction_type="flow_prediction",
+                )
+            )
+    return schedulers
+
+
+def test_flow_unipc_schedule_stays_on_host(monkeypatch):
+    # The Wan UniPC schedule is created on the host whatever device the Wan
+    # pipeline asks for, while FlowUniPCMultistepScheduler instances created
+    # outside the Wan pipelines keep upstream device behaviour.
+    _reset_wan_host_schedule(monkeypatch)
+    _patch_wan_host_resident_schedule()
+    target_modules = [
+        importlib.import_module(name) for name in _WAN_HOST_SCHEDULE_PIPELINE_MODULES
+    ]
+    patched_cls = target_modules[0].FlowUniPCMultistepScheduler
+    assert getattr(patched_cls, _HOST_SCHEDULE_PATCHED, False)
+    assert getattr(patched_cls.set_timesteps, _HOST_SCHEDULE_PATCHED, False)
+    for mod in target_modules:
+        assert mod.FlowUniPCMultistepScheduler is patched_cls
+    assert (
+        FlowUniPCMultistepScheduler.set_timesteps is _UPSTREAM_FLOW_UNIPC_SET_TIMESTEPS
+    )
+    infos = []
+    monkeypatch.setattr("vllm_torchtpu.omni.patches.logger.info", infos.append)
+    _patch_wan_host_resident_schedule()
+    assert infos == []
+    assert target_modules[0].FlowUniPCMultistepScheduler is patched_cls
+
+    want_scheduler = FlowUniPCMultistepScheduler(
+        num_train_timesteps=1000,
+        shift=1.0,
+        prediction_type="flow_prediction",
+    )
+    _UPSTREAM_FLOW_UNIPC_SET_TIMESTEPS(want_scheduler, 4, device="cpu", shift=5.0)
+
+    schedulers = []
+    for model_arch, (mod_folder, mod_relname, cls_name) in _DIFFUSION_MODELS.items():
+        if "wan" not in model_arch.lower() and "wan" not in mod_folder.lower():
+            continue
+        mod = importlib.import_module(
+            f"vllm_omni.diffusion.models.{mod_folder}.{mod_relname}"
+        )
+        schedulers.extend(_build_pipeline_unipc_schedulers(getattr(mod, cls_name)))
+    assert schedulers
+
+    for scheduler in schedulers:
+        assert isinstance(scheduler, FlowUniPCMultistepScheduler)
+        assert type(scheduler) is patched_cls
+        scheduler.set_timesteps(4, device="meta", shift=5.0)
+        assert scheduler.timesteps.device.type == "cpu"
+        assert scheduler.num_inference_steps == 4
+        assert torch.equal(scheduler.timesteps, want_scheduler.timesteps)
+        assert torch.equal(scheduler.sigmas, want_scheduler.sigmas)
+
+        scheduler.set_timesteps(num_inference_steps=3, device=torch.device("meta"))
+        assert scheduler.timesteps.device.type == "cpu"
+        assert len(scheduler.timesteps) == 3
+
+        scheduler.set_timesteps(3, "meta")
+        assert scheduler.timesteps.device.type == "cpu"
+        assert scheduler.index_for_timestep(scheduler.timesteps[1]) == 1
+
+    # A scheduler instance created outside the Wan pipeline keeps upstream
+    # device behaviour.
+    outside_scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=3.0)
+    outside_scheduler.set_timesteps(4, device="meta", shift=5.0)
+    assert outside_scheduler.timesteps.device.type == "meta"
+    assert outside_scheduler.num_inference_steps == 4
+
+
+def test_flow_unipc_schedule_stays_on_host_registry_scope(monkeypatch):
+    # Walk vllm-omni's diffusion pipeline registry in both directions so every
+    # Wan pipeline using FlowUniPCMultistepScheduler gets the host-schedule
+    # subclass and no non-Wan pipeline gets it.
+    _reset_wan_host_schedule(monkeypatch)
+
+    wan_folders = set()
+    importable = {}
+    for model_arch, (mod_folder, mod_relname, _) in _DIFFUSION_MODELS.items():
+        is_wan = "wan" in model_arch.lower() or "wan" in mod_folder.lower()
+        if is_wan:
+            wan_folders.add(mod_folder)
+        try:
+            importable[model_arch] = importlib.import_module(
+                f"vllm_omni.diffusion.models.{mod_folder}.{mod_relname}"
+            )
+        except ImportError:
+            # Some non-Wan pipelines need optional or newer dependencies
+            # (e.g. a transformers symbol) that the test image may lack.
+            # Every Wan pipeline must still import.
+            if is_wan:
+                raise
+    for _, submod_name, _ in pkgutil.walk_packages(
+        wan2_2.__path__, f"{wan2_2.__name__}."
+    ):
+        importlib.import_module(submod_name)
+
+    wan_unipc_modules = set()
+    non_wan_unipc_modules = set()
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None or not mod_name.startswith("vllm_omni.diffusion.models."):
+            continue
+        if mod_name.startswith("vllm_omni.diffusion.models.schedulers"):
+            continue
+        sched_cls = getattr(mod, "FlowUniPCMultistepScheduler", None)
+        if not (
+            isinstance(sched_cls, type)
+            and issubclass(sched_cls, FlowUniPCMultistepScheduler)
+        ):
+            continue
+        assert sched_cls is FlowUniPCMultistepScheduler, mod_name
+        if mod_name.split(".")[3] in wan_folders:
+            wan_unipc_modules.add(mod_name)
+        else:
+            non_wan_unipc_modules.add(mod_name)
+
+    assert len(_WAN_HOST_SCHEDULE_PIPELINE_MODULES) == len(
+        set(_WAN_HOST_SCHEDULE_PIPELINE_MODULES)
+    )
+    assert wan_unipc_modules == set(_WAN_HOST_SCHEDULE_PIPELINE_MODULES)
+    assert non_wan_unipc_modules
+
+    _patch_wan_host_resident_schedule()
+    patched_cls = importlib.import_module(
+        _WAN_HOST_SCHEDULE_PIPELINE_MODULES[0]
+    ).FlowUniPCMultistepScheduler
+    assert issubclass(patched_cls, FlowUniPCMultistepScheduler)
+    assert patched_cls is not FlowUniPCMultistepScheduler
+
+    for mod_name in wan_unipc_modules:
+        assert sys.modules[mod_name].FlowUniPCMultistepScheduler is patched_cls
+    for mod_name in non_wan_unipc_modules:
+        assert (
+            sys.modules[mod_name].FlowUniPCMultistepScheduler
+            is FlowUniPCMultistepScheduler
+        )
+
+    wan_unipc_pipelines = set()
+    for model_arch, (mod_folder, _, cls_name) in _DIFFUSION_MODELS.items():
+        mod = importable.get(model_arch)
+        if mod is None:
+            continue
+        pipeline_cls = getattr(mod, cls_name)
+        mro_mods = _pipeline_mro_model_modules(pipeline_cls)
+        if mod_folder in wan_folders:
+            for mro_mod in mro_mods:
+                if "FlowUniPCMultistepScheduler" in inspect.getsource(mro_mod):
+                    assert (
+                        getattr(mro_mod, "FlowUniPCMultistepScheduler", None)
+                        is patched_cls
+                    ), (model_arch, mro_mod.__name__)
+            built = _build_pipeline_unipc_schedulers(pipeline_cls)
+            if built:
+                wan_unipc_pipelines.add(model_arch)
+                assert all(type(s) is patched_cls for s in built), model_arch
+        else:
+            for mro_mod in mro_mods:
+                assert (
+                    getattr(mro_mod, "FlowUniPCMultistepScheduler", None)
+                    is not patched_cls
+                ), model_arch
+                assert not hasattr(mro_mod, "build_wan_scheduler"), model_arch
+    assert wan_unipc_pipelines
 
 
 def test_device_control_env_var():
