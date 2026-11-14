@@ -362,3 +362,54 @@ def test_no_registration_when_off(monkeypatch):
     monkeypatch.setattr(bsp, "_TRACE_BOUND", [None])
     bsp.trace_key_norm_bound(jnp.zeros((DIM,)), DIM)
     assert bsp._TRACE_BOUND[0] is None
+
+
+@pytest.mark.parametrize("vpu", ["1", "2", "mask"])
+def test_bound_route_off_when_kernel_cannot_use_it(interpret, monkeypatch, vpu):
+    """VLLM_TPU_QSA_PREFILL_VPU disables LANE_SUM, so the kernel cannot use the
+    bound: the wrapper then runs the flag-off call (no guard, no cond, no
+    forced lse), bit for bit, on both routes."""
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_VPU", vpu)
+    case = make_case(np.random.default_rng(13), CASES["single"], 24)
+    want_dcp, want_rep = attend(case, 0, 1), attend_replicated(case, 1, gated=True)
+    bsp.note_key_norm_bound(case[-1])
+    assert not bsp.bound_kernel_eligible(
+        ratio=RATIO, query_block=256, query_tile=256, kv_tile=PAGE, dcp=True,
+        cache_dtype=jnp.float8_e4m3fn,
+    )
+    got_dcp, got_rep = attend(case, 0, 1), attend_replicated(case, 1, gated=True)
+    for a, b in zip(got_dcp, want_dcp):
+        np.testing.assert_array_equal(bits(a), bits(b))
+    np.testing.assert_array_equal(
+        bits(got_rep[0].astype(jnp.float32)), bits(want_rep[0].astype(jnp.float32))
+    )
+    query, blocks, lengths, table, cache, starts, _ = case
+
+    def traced():
+        jax.clear_caches()
+        return str(jax.make_jaxpr(
+            lambda q, c: bsp.block_sparse_gqa_attention(
+                q, jnp.zeros_like(q), blocks, lengths, table, c, starts, kv_heads=1,
+                ratio=RATIO, k_scale=K_SCALE, v_scale=V_SCALE, query_block=256,
+                kv_tile=PAGE, query_tile=256, kv_head_offset=1,
+                dcp=(jnp.asarray([0], jnp.int32), D), return_lse=True, ascending=True,
+            )[:2]
+        )(query, cache))
+
+    with_bound = traced()
+    monkeypatch.setattr(bsp, "_KEY_NORM_BOUND", None)
+    # Same program as flag off: no guard, no extra cond, no second call.
+    assert with_bound == traced()
+
+
+def test_bound_route_on_when_eligible(interpret, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_VPU", "")
+    assert bsp.bound_kernel_eligible(
+        ratio=RATIO, query_block=256, query_tile=256, kv_tile=PAGE, dcp=True,
+        cache_dtype=jnp.float8_e4m3fn,
+    )
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_LANE_SUM", "")
+    assert not bsp.bound_kernel_eligible(
+        ratio=RATIO, query_block=256, query_tile=256, kv_tile=PAGE, dcp=True,
+        cache_dtype=jnp.float8_e4m3fn,
+    )

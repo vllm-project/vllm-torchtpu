@@ -195,6 +195,28 @@ def default_query_tile(query_block):
     return min(query_block, 256)
 
 
+def bound_kernel_eligible(*, ratio, query_block, query_tile, kv_tile, dcp, cache_dtype):
+    """Whether ``_block_sparse_gqa_prefill`` (BF16 io) runs the LANE_SUM
+    kernel, the only one that can use the bound stabilizer. Mirrors its
+    feature gates: no reduced-VPU path, no BF16_MXU split, no lazy softmax,
+    128-aligned KV tiles, LANE_SUM requested."""
+    if not lane_sum_features() or kv_tile % 128:
+        return False
+    query_tile = query_tile or default_query_tile(query_block)
+    if ratio * 32 == 128 and vpu_features():
+        return False  # any VPU feature set (even "mask" alone) disables LANE_SUM
+    bf16_mxu = (
+        envs.VLLM_TPU_QSA_PREFILL_BF16_MXU
+        and query_tile % 16 == 0
+        and cache_dtype in (jnp.float8_e4m3fn, jnp.bfloat16)
+    )
+    if bf16_mxu:
+        return False
+    if dcp and lazy_softmax_features():
+        return False
+    return True
+
+
 def _compact_active(active):
     """Indices of true entries along the last axis, zero filled.
 
@@ -2053,7 +2075,14 @@ def block_sparse_gqa_attention(
             branches[0](None) if len(branches) == 1 else lax.switch(route, branches, None)
         )
 
-    if _KEY_NORM_BOUND is not None:
+    if _KEY_NORM_BOUND is not None and bound_kernel_eligible(
+        ratio=ratio,
+        query_block=query_block,
+        query_tile=query_tile,
+        kv_tile=kv_tile,
+        dcp=dcp is not None,
+        cache_dtype=cache.dtype,
+    ):
         # This layer's bound when the QSA step registered one in this trace
         # (``trace_key_norm_bound``), else the process-wide target bound.
         bound = layer_key_norm_bound()
