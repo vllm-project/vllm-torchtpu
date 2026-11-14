@@ -26,6 +26,8 @@ from vllm_torchtpu.kernels.diffusion_attention.kernel import (
     LOG2_E,
     fixed_m_operands,
     flash_attention_bshd,
+    residual_flash_attention_bhsd,
+    residual_reference_bhsd,
 )
 
 pytestmark = pytest.mark.tpu_test
@@ -181,6 +183,47 @@ def test_fixed_m_gate_boundary_accuracy(monkeypatch):
 
 def _bf16(x):
     return np.asarray(jnp.asarray(x, jnp.float32).astype(jnp.bfloat16), np.float64)
+
+
+@pytest.mark.parametrize(
+    "seq_len,heads,kv_heads,blocks",
+    [
+        # GQA; autotuned blocks leave a partial last Q and KV block.
+        (4133, 4, 2, None),
+        # Block-size override path: 37-row partial last Q block, KV block and
+        # KV compute sub-block.
+        (4133, 4, 2, {"block_q": 1024, "block_kv": 1024, "block_kv_compute": 512}),
+        # A measured ring shard (its v7x override when run on v7x), with GQA.
+        (18900, 2, 1, None),
+    ],
+)
+def test_residual_mode_matches_reference(monkeypatch, seq_len, heads, kv_heads, blocks):
+    """emit_residuals=True returns f32 unnormalized o and the m / l residuals."""
+    import vllm_torchtpu.kernels.diffusion_attention.kernel as kernel_mod
+
+    if blocks is not None:
+        key = (bs.detect_spec().generation, seq_len, seq_len)
+        monkeypatch.setitem(kernel_mod._RING_MEASURED_BLOCK_OVERRIDES, key, blocks)
+    q, k, v = (
+        jnp.swapaxes(x, 1, 2)
+        for x in _inputs(1, seq_len, seq_len, heads, kv_heads, 128, seed=3)
+    )
+    scale = 1.0 / math.sqrt(128)
+    o_un, m, l_sum = jax.jit(
+        lambda q, k, v: residual_flash_attention_bhsd(q, k, v, scale=scale)
+    )(q, k, v)
+    ref_o_un, ref_m, ref_l_sum = residual_reference_bhsd(q, k, v, scale=scale)
+
+    assert o_un.dtype == m.dtype == l_sum.dtype == jnp.float32
+    assert o_un.shape == ref_o_un.shape == (1, heads, seq_len, 128)
+    assert m.shape == ref_m.shape == (1, heads, seq_len, 1)
+    assert l_sum.shape == ref_l_sum.shape == (1, heads, seq_len, 1)
+    np.testing.assert_allclose(np.asarray(m), np.asarray(ref_m), rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(
+        np.asarray(l_sum), np.asarray(ref_l_sum), rtol=5e-3, atol=1e-3
+    )
+    _check(o_un, ref_o_un)
+    _check(o_un / l_sum, ref_o_un / ref_l_sum)
 
 
 @pytest.mark.parametrize("fixed_m", [True, False])

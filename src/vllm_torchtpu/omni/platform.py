@@ -13,7 +13,9 @@
 # limitations under the License.
 """TPU platform plugin for vllm-omni."""
 
+import functools
 import os
+from typing import Any
 
 import torch
 from torch_tpu._internal.utils import hardware
@@ -25,6 +27,8 @@ from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 logger = init_logger(__name__)
+
+_DIFFUSION_INIT_DEVICE_WRAPPED = "_tpu_diffusion_init_device_wrapped"
 
 
 class OmniTpuPlatform(OmniPlatform, TpuPlatform):
@@ -38,6 +42,8 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     # Diffusion worker world size recorded by set_device (see dist_backend).
     _worker_world_size: int = 1
+    # Diffusion worker ring attention degree recorded before set_device.
+    _diffusion_ring_degree: int = 1
 
     @property
     def dist_backend(self) -> str:
@@ -97,6 +103,39 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
     @classmethod
     def supports_talker_mtp_graph_capture(cls) -> bool:
         return False
+
+    @classmethod
+    def get_diffusion_worker_cls(cls) -> str:
+        worker_cls: str = super().get_diffusion_worker_cls()
+        # Import lazily: diffusion_worker.py resolves current_omni_platform at
+        # module import time while DiffusionWorker is not yet defined.
+        from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+        if not getattr(
+            DiffusionWorker.init_device, _DIFFUSION_INIT_DEVICE_WRAPPED, False
+        ):
+            orig_init_device = DiffusionWorker.init_device
+
+            @functools.wraps(orig_init_device)
+            def _tpu_init_device(self: Any) -> None:
+                parallel_config = getattr(
+                    getattr(self, "od_config", None), "parallel_config", None
+                )
+                raw_ring_degree = getattr(parallel_config, "ring_degree", 1)
+                OmniTpuPlatform._diffusion_ring_degree = max(
+                    1, int(raw_ring_degree or 1)
+                )
+                if OmniTpuPlatform._diffusion_ring_degree > 1:
+                    from vllm_torchtpu.omni.patches import (
+                        _patch_parallel_state_device_order,
+                    )
+
+                    _patch_parallel_state_device_order()
+                orig_init_device(self)
+
+            setattr(_tpu_init_device, _DIFFUSION_INIT_DEVICE_WRAPPED, True)
+            DiffusionWorker.init_device = _tpu_init_device
+        return worker_cls
 
     @classmethod
     def set_device(cls, device: torch.device | int) -> None:
