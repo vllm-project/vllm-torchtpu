@@ -425,7 +425,7 @@ def test_update_states_tracks_new_requests_and_forgets_finished_ones():
     scheduler_output = SimpleNamespace(
         finished_req_ids={"old"},
         preempted_req_ids=None,
-        scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=set()),
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[], resumed_req_ids=set()),
         kv_cache_block_copies=None,
         scheduled_new_reqs=[new_req],
     )
@@ -456,7 +456,9 @@ def test_update_states_keeps_preempted_and_resumed_requests():
         scheduler_output = SimpleNamespace(
             finished_req_ids=set(),
             preempted_req_ids=preempted,
-            scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=resumed),
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=sorted(resumed), resumed_req_ids=resumed
+            ),
             kv_cache_block_copies=None,
             scheduled_new_reqs=[],
         )
@@ -591,6 +593,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             mamba_boundary_plans=None,
             pooler_output_list=[],
             top_tokens=False,
+            topk_candidates_packed=False,
             kv_save_nan_check=None,
             prompt_logprobs_chunks=[],
         ),

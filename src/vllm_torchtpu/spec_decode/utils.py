@@ -27,6 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.utils import PPMissingLayer
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
     SequenceLayoutPlan,
@@ -48,6 +49,48 @@ _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = AllSequenceLayoutPlanner().prepare_dummy(
     num_reqs=0,
     kv_cache_initialized=False,
 )
+
+
+def qwen3_5_mtp(vllm_config: Any) -> bool:
+    """A Qwen3.5 target with an MTP draft.
+
+    Main keeps the greedy top tokens, fast token substitution and the fused
+    MTP draft loop opt-in (TPU_GREEDY_TOP_TOKENS,
+    VLLM_TPU_FAST_TOKEN_SUBSTITUTION, VLLM_TPU_FUSED_DRAFT_LOOP). This
+    configuration runs them by rule: the Qwen3.5 PD deployments ran all three
+    on every leg.
+    """
+    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+
+    spec = getattr(vllm_config, "speculative_config", None)
+    return (
+        spec is not None
+        and getattr(spec, "method", None) == "mtp"
+        and qwen3_5_settings.is_qwen3_5(getattr(vllm_config, "model_config", None))
+    )
+
+
+def greedy_top_tokens_enabled(vllm_config: Any) -> bool:
+    """TPU_GREEDY_TOP_TOKENS, or the Qwen3.5 MTP rule. Greedy steps (all
+    requests greedy, no logprobs, no grammar) then take the vocab-parallel
+    argmax; the tokens are those of the full-logits argmax."""
+    return bool(envs.TPU_GREEDY_TOP_TOKENS) or qwen3_5_mtp(vllm_config)
+
+
+def fast_token_substitution_enabled(vllm_config: Any) -> bool:
+    """VLLM_TPU_FAST_TOKEN_SUBSTITUTION, or the Qwen3.5 MTP rule."""
+    return bool(envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION) or qwen3_5_mtp(vllm_config)
+
+
+def fused_draft_loop_enabled(
+    vllm_config: Any, *, draft_kv_shared: bool, dp_lockstep: bool
+) -> bool:
+    """VLLM_TPU_FUSED_DRAFT_LOOP, or the Qwen3.5 MTP rule: on unless the
+    draft shares the target's KV cache or EP-DP runs in lockstep (main lists
+    both as unsupported by the fused loop)."""
+    if envs.VLLM_TPU_FUSED_DRAFT_LOOP:
+        return True
+    return qwen3_5_mtp(vllm_config) and not draft_kv_shared and not dp_lockstep
 
 
 def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:
@@ -401,7 +444,16 @@ def maybe_share_lm_head(
         )
         share_lm_head = True
 
-    if share_lm_head:
+    from vllm_torchtpu.runner import greedy_top_tokens
+
+    if not share_lm_head:
+        greedy_top_tokens.release_draft_bf16_head(target_lm_head)
+    else:
+        # The target's head may be quantized in place (W8A8 FP8, the Qwen3.5
+        # quantize_target_lm_head setting); the draft then takes the BF16 twin
+        # kept for it, so it computes at the checkpoint's precision.
+        bf16_head = greedy_top_tokens.draft_bf16_head_of(target_lm_head)
+        draft_lm_head = target_lm_head if bf16_head is None else bf16_head
         if tp_layout_matches:
             logger.info(
                 "Sharing the target's lm_head with the draft using the same TP layout."
@@ -414,7 +466,7 @@ def maybe_share_lm_head(
             shared_heads = list(iter_mtp_shared_heads(draft_model))
             for shared_head in shared_heads:
                 del shared_head.head
-                shared_head.head = target_lm_head
+                shared_head.head = draft_lm_head
             if shared_heads:
                 logger.info(
                     "Shared the target's lm_head with %d MTP "
@@ -423,19 +475,30 @@ def maybe_share_lm_head(
                 )
 
             if hasattr(draft_model, "lm_head"):
-                draft_model.lm_head = target_lm_head
+                draft_model.lm_head = draft_lm_head
             elif hasattr(draft_model, "model") and hasattr(
                 draft_model.model, "lm_head"
             ):
-                draft_model.model.lm_head = target_lm_head
+                draft_model.model.lm_head = draft_lm_head
             elif not shared_heads:
-                draft_model.lm_head = target_lm_head
+                draft_model.lm_head = draft_lm_head
         elif materialize_if_mismatched:
             logger.info(
                 "Populating draft's own lm_head with a host-gathered, "
                 "per-worker replicated copy of the target lm_head."
             )
-            populate_draft_lm_head_from_target(draft_model, target_lm_head)
+            populate_draft_lm_head_from_target(
+                draft_model, cast("VocabParallelEmbedding", draft_lm_head)
+            )
+        if tp_layout_matches or materialize_if_mismatched:
+            logger.info(
+                "Draft lm_head precision: %s (target lm_head: %s; %s).",
+                greedy_top_tokens.head_precision(draft_lm_head),
+                greedy_top_tokens.head_precision(target_lm_head),
+                "the draft's own BF16 copy of the checkpoint head"
+                if bf16_head is not None
+                else "the draft shares the target's head module",
+            )
 
     # We must override _gather_logits for replicated draft models even if we don't share
     # the lm_head, because the draft model's logits_processor will still try to gather

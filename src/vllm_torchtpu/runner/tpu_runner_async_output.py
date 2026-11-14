@@ -24,6 +24,8 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+from vllm_torchtpu.spec_decode.eagle3 import _static_shape_args
+
 INVALID_TOKEN_ID = -1
 
 
@@ -92,6 +94,7 @@ class AsyncTPUCopyState:
     chunks_tpu: list[torch.Tensor] | None = None
     completed: bool = False
     _sampled_token_ids_cpu: torch.Tensor | None = None
+    _sampled_token_ids_list: list[list[int]] | None = None
     # Spec-decode step with logprobs requested: per-chunk logprobs, copied
     # with the tokens and filtered to the accepted rows in `get_output`.
     spec_logprobs: list[SpecLogprobsChunk] | None = None
@@ -157,6 +160,16 @@ class AsyncTPUCopyState:
                 self._sampled_token_ids_cpu = torch.cat(trimmed, dim=0)
         return self._sampled_token_ids_cpu
 
+    @property
+    def sampled_token_ids_list(self) -> list[list[int]]:
+        """Return the unpadded CPU token rows as nested Python lists (cached)."""
+        if self._sampled_token_ids_list is None:
+            t = self.sampled_token_ids_cpu
+            if t.dim() == 1:
+                t = t.unsqueeze(-1)
+            self._sampled_token_ids_list = t.tolist()
+        return self._sampled_token_ids_list
+
 
 @dataclass
 class AsyncPreResults:
@@ -210,17 +223,18 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             selected_token_ids = selected_token_ids.unsqueeze(-1)
 
         max_gen_len = selected_token_ids.shape[-1]
+        raw_rows = self.copy_state.sampled_token_ids_list
         if max_gen_len == 1:
-            valid_sampled_token_ids = selected_token_ids.tolist()
+            valid_sampled_token_ids = [row[:] for row in raw_rows]
             for i in self.discard_sampled_tokens_req_indices:
                 valid_sampled_token_ids[i].clear()
         else:
-            valid_mask = selected_token_ids != INVALID_TOKEN_ID
-            gen_lens = valid_mask.sum(dim=1).tolist()
+            invalid = INVALID_TOKEN_ID
             valid_sampled_token_ids = [
-                seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)
+                [tok for tok in row if tok != invalid] for row in raw_rows
             ]
             if self.copy_state.spec_logprobs:
+                gen_lens = [len(row) for row in valid_sampled_token_ids]
                 self._model_runner_output.logprobs = spec_logprobs_lists(
                     self.copy_state.spec_logprobs, gen_lens
                 )
@@ -320,6 +334,116 @@ def extract_draft_token_ids(
     return input_ids[logits_indices[target_logits_indices + 1]]
 
 
+def subtract_and_substitute_placeholder_token(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused rejected-draft subtraction and placeholder token substitution."""
+    seq_lens, positions = subtract_num_rejected_tokens(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+    )
+    token_in_tpu_cur_input_indices = substitution_indices[0]
+    token_in_tpu_pre_next_tokens_indices = substitution_indices[1]
+    mask = token_in_tpu_pre_next_tokens_indices > -1
+    safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
+    new_token_values = next_tokens_tpu[safe_idx].to(input_ids.dtype)
+    original_values = input_ids[token_in_tpu_cur_input_indices]
+    update_values = torch.where(mask, new_token_values, original_values)
+    input_ids = input_ids.scatter(0, token_in_tpu_cur_input_indices, update_values)
+    return seq_lens, positions, input_ids
+
+
+def subtract_and_substitute_draft_token_ids(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused rejected-draft subtraction, placeholder token substitution, and
+    draft token extraction in a single compiled TPU graph.
+    """
+    seq_lens, positions, input_ids = subtract_and_substitute_placeholder_token(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+        input_ids,
+        substitution_indices,
+        next_tokens_tpu,
+    )
+    draft_token_ids = extract_draft_token_ids(
+        input_ids, logits_indices, target_logits_indices
+    )
+    return seq_lens, positions, input_ids, draft_token_ids
+
+
+def carry_subtract_and_substitute_draft_token_ids(
+    seq_lens_prev: torch.Tensor,
+    positions_prev: torch.Tensor,
+    step_delta: int,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids_prev: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Steady-state form of `subtract_and_substitute_draft_token_ids` that needs
+    no host upload of seq_lens / positions / input_ids.
+
+    Inputs are the previous step's corrected device tensors. In steady async
+    spec decode (same requests, same 1+K tokens each, the host's optimistic
+    counts advanced by exactly `step_delta` minus the previous step's rejected
+    count, which the runner checks on the host before taking this path), the
+    host's next optimistic values equal `prev + step_delta` on every slot the
+    subtraction touches (index >= 0); the other slots (padding) keep their
+    values, which the host also left unchanged. Every real input slot is
+    substituted from `next_tokens_tpu`, so `input_ids_prev` only supplies the
+    (zero) padding. The result is bit-identical to uploading the host values
+    and calling `subtract_and_substitute_draft_token_ids`.
+    """
+    zero_s = seq_lens_prev.new_zeros(())
+    seq_lens = seq_lens_prev + torch.where(
+        seq_lens_subtract_indices >= 0, zero_s + step_delta, zero_s
+    )
+    zero_p = positions_prev.new_zeros(())
+    pos_add = torch.where(positions_subtract_indices >= 0, zero_p + step_delta, zero_p)
+    if positions_prev.ndim == 2:
+        pos_add = pos_add.unsqueeze(0)
+    positions = positions_prev + pos_add
+    return subtract_and_substitute_draft_token_ids(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+        input_ids_prev,
+        substitution_indices,
+        next_tokens_tpu,
+        logits_indices,
+        target_logits_indices,
+    )
+
+
 def compute_num_rejected(
     next_tokens: torch.Tensor, num_draft: torch.Tensor
 ) -> torch.Tensor:
@@ -333,3 +457,233 @@ def compute_num_rejected(
     num_reqs = num_draft.shape[0]
     num_valid = (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1)
     return (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_subtract_num_rejected_tokens(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return subtract_num_rejected_tokens(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+    )
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_extract_draft_token_ids(
+    input_ids: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> torch.Tensor:
+    return extract_draft_token_ids(input_ids, logits_indices, target_logits_indices)
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_pad_non_spec_next_tokens(
+    selected: torch.Tensor,
+    k: int,
+) -> torch.Tensor:
+    col0 = selected.reshape(-1, 1).to(torch.int32)
+    return torch.nn.functional.pad(col0, (0, k), value=INVALID_TOKEN_ID)
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_subtract_and_substitute_placeholder_token(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return subtract_and_substitute_placeholder_token(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+        input_ids,
+        substitution_indices,
+        next_tokens_tpu,
+    )
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_carry_subtract_and_substitute_draft_token_ids(
+    seq_lens_prev: torch.Tensor,
+    positions_prev: torch.Tensor,
+    step_delta: int,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids_prev: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return carry_subtract_and_substitute_draft_token_ids(
+        seq_lens_prev,
+        positions_prev,
+        step_delta,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+        input_ids_prev,
+        substitution_indices,
+        next_tokens_tpu,
+        logits_indices,
+        target_logits_indices,
+    )
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_subtract_and_substitute_draft_token_ids(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return subtract_and_substitute_draft_token_ids(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+        input_ids,
+        substitution_indices,
+        next_tokens_tpu,
+        logits_indices,
+        target_logits_indices,
+    )
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_assemble_spec_and_rejected(
+    next_tokens: torch.Tensor,
+    drafts: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    bound: int,
+    max_num_reqs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused bucketed on-device substitution source assembly + num_rejected.
+
+    Operates on bucketed ``next_tokens`` ``[B, K+1]``, ``drafts`` ``[D, K]``
+    (with ``D >= B``), and ``draft_lengths`` ``[B]`` (padded tail rows are 0),
+    returning ``(src_padded [bound], num_rejected_padded [max_num_reqs])`` in a
+    single compiled graph.
+    """
+    B = next_tokens.shape[0]
+    drafts_b = (
+        torch.nn.functional.pad(drafts, (0, 0, 0, B - drafts.shape[0]))
+        if drafts.shape[0] < B
+        else drafts[:B]
+    )
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    last_valid_col = num_valid.clamp(min=1) - 1
+    bonus = next_tokens.gather(1, last_valid_col.unsqueeze(1))
+    src = torch.cat([bonus.to(drafts_b.dtype), drafts_b], dim=1).reshape(-1)
+    if src.shape[0] < bound:
+        src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+    num_rejected = (draft_lengths - num_valid + 1).clamp(min=0).to(torch.int32)
+    if max_num_reqs > B:
+        num_rejected = torch.nn.functional.pad(num_rejected, (0, max_num_reqs - B))
+    return src, num_rejected
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_assemble_two_chunks_spec_and_rejected(
+    nt0: torch.Tensor,
+    drafts0: torch.Tensor,
+    dl0: torch.Tensor,
+    nt1: torch.Tensor,
+    drafts1: torch.Tensor,
+    dl1: torch.Tensor,
+    bound: int,
+    max_num_reqs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused 2-chunk bucketed substitution source assembly + num_rejected.
+
+    Packs chunk 0 at request indices ``[0 .. B0 - 1]`` and chunk 1 at bucketed
+    offset ``[B0 .. B0 + B1 - 1]`` so neither chunk slices by unbucketed
+    ``num_reqs``. Requires ``B0 + B1 <= max_num_reqs``.
+    """
+    B0 = nt0.shape[0]
+    d0 = (
+        torch.nn.functional.pad(drafts0, (0, 0, 0, B0 - drafts0.shape[0]))
+        if drafts0.shape[0] < B0
+        else drafts0[:B0]
+    )
+    nv0 = (nt0 != INVALID_TOKEN_ID).sum(dim=1)
+    lvc0 = nv0.clamp(min=1) - 1
+    bonus0 = nt0.gather(1, lvc0.unsqueeze(1))
+    src0 = torch.cat([bonus0.to(d0.dtype), d0], dim=1).reshape(-1)
+    rej0 = (dl0 - nv0 + 1).clamp(min=0).to(torch.int32)
+
+    B1 = nt1.shape[0]
+    d1 = (
+        torch.nn.functional.pad(drafts1, (0, 0, 0, B1 - drafts1.shape[0]))
+        if drafts1.shape[0] < B1
+        else drafts1[:B1]
+    )
+    nv1 = (nt1 != INVALID_TOKEN_ID).sum(dim=1)
+    lvc1 = nv1.clamp(min=1) - 1
+    bonus1 = nt1.gather(1, lvc1.unsqueeze(1))
+    src1 = torch.cat([bonus1.to(d1.dtype), d1], dim=1).reshape(-1)
+    rej1 = (dl1 - nv1 + 1).clamp(min=0).to(torch.int32)
+
+    src = torch.cat([src0, src1], dim=0)
+    if src.shape[0] < bound:
+        src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+    rej = torch.cat([rej0, rej1], dim=0)
+    if rej.shape[0] < max_num_reqs:
+        rej = torch.nn.functional.pad(rej, (0, max_num_reqs - rej.shape[0]))
+    return src, rej
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_assemble_prefill_bootstrap(
+    selected_tokens: torch.Tensor,
+    padded_drafts: torch.Tensor,
+    bound: int,
+) -> torch.Tensor:
+    """Bucketed on-device substitution source assembly for async prefill bootstrap.
+
+    Packs ``selected_tokens`` ``[B, 1]`` and ``padded_drafts`` ``[D, K]`` (with
+    ``D >= B``) into ``src_padded [bound]`` in a single compiled graph.
+    """
+    B = selected_tokens.shape[0]
+    drafts_b = (
+        torch.nn.functional.pad(padded_drafts, (0, 0, 0, B - padded_drafts.shape[0]))
+        if padded_drafts.shape[0] < B
+        else padded_drafts[:B]
+    )
+    bonus = selected_tokens.reshape(B, 1).to(drafts_b.dtype)
+    src = torch.cat([bonus, drafts_b], dim=1).reshape(-1)
+    if src.shape[0] < bound:
+        src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+    return src

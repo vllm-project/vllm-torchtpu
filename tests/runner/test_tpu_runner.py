@@ -106,6 +106,91 @@ def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     }
 
 
+def _spec_warmup_runner(spec, config, captured, *, async_scheduling):
+    runner = SimpleNamespace(
+        max_model_len=40960,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=async_scheduling, max_num_seqs=8
+        ),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=config,
+        execute_model=lambda so: captured.append(so),
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
+    )
+    return runner
+
+
+@pytest.mark.parametrize("async_scheduling,stride", [(True, 4), (False, 1)])
+def test_spec_warmup_nct_stride_follows_the_scheduler(async_scheduling, stride):
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=async_scheduling, max_num_seqs=8
+        ),
+    )
+    assert TPUModelRunner._spec_warmup_nct_stride(runner) == stride
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_spec_warmup_one_token_prompt_never_steps_before_the_prompt(
+    async_scheduling,
+):
+    spec = FullAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+    )
+    captured = []
+    runner = _spec_warmup_runner(
+        spec, config, captured, async_scheduling=async_scheduling
+    )
+
+    P = 1
+    assert TPUModelRunner._warmup_one_spec_request(runner, P, idx=0)
+
+    ncts = [so.scheduled_cached_reqs.num_computed_tokens[0] for so in captured[1:]]
+    K = runner.speculative_config.num_speculative_tokens
+    if async_scheduling:
+        # The worker subtracts the previous step's rejected drafts (at most
+        # K) from these optimistic counts; the first decode step has none.
+        assert ncts == [1 + t * (1 + K) for t in range(len(ncts))]
+        assert min(n - K for n in ncts[1:]) >= 1
+    else:
+        assert ncts == [1 + t for t in range(len(ncts))]
+
+
+def test_spec_warmup_batch_steps_and_blocks_follow_the_scheduler():
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+    )
+    captured = []
+    runner = _spec_warmup_runner(spec, config, captured, async_scheduling=True)
+    runner.max_num_reqs = 8
+    runner.max_num_tokens = 64
+    P, R = 4, 2
+
+    TPUModelRunner._warmup_spec_batch(runner, R, P, mixed=True)
+
+    K = runner.speculative_config.num_speculative_tokens
+    cached = [so for so in captured if so.scheduled_cached_reqs.req_ids]
+    assert cached, "no decode steps ran"
+    ncts = [so.scheduled_cached_reqs.num_computed_tokens[0] for so in cached]
+    assert ncts == [P + t * (1 + K) for t in range(len(ncts))]
+    # Each synthetic request's blocks cover the last position its steps write.
+    (block_ids,) = captured[0].scheduled_new_reqs[0].block_ids
+    assert len(block_ids) * spec.block_size >= ncts[-1] + 1 + K
+
+
 @pytest.mark.parametrize("dcp_size,expected_blocks", [(1, 65), (8, 9)])
 def test_spec_warmup_request_counts_blocks_in_block_table_units(
     dcp_size, expected_blocks
@@ -117,19 +202,7 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
         parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size)
     )
     captured = []
-    runner = SimpleNamespace(
-        max_model_len=40960,
-        speculative_config=SimpleNamespace(num_speculative_tokens=3),
-        kv_cache_config=SimpleNamespace(
-            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
-        ),
-        vllm_config=config,
-        execute_model=lambda so: captured.append(so),
-        sample_tokens=lambda _: None,
-        take_draft_token_ids=lambda: None,
-        _warmup_spec_decode_cleanup=lambda rids: True,
-        requests=_warmup_requests(),
-    )
+    runner = _spec_warmup_runner(spec, config, captured, async_scheduling=False)
 
     assert TPUModelRunner._warmup_one_spec_request(runner, 8192, idx=0)
 
@@ -2035,6 +2108,33 @@ class TestReorderBatchForRpa:
         assert runner._reorder_batch_for_rpa(sched) == (1, 2)
         assert runner._num_static_verify_reqs == 0
 
+    def test_ordered_batches_recount_static_verify_windows(self):
+        """Already-ordered batches skip the partition passes; the static
+        verify count must still be this step's, not the previous step's."""
+        runner = self._make_runner()
+        runner._static_verify_q_len = 4
+        self._batch(runner, ["dc", "full", "short", "full2"])
+        sched = self._sched(
+            {"dc": 1, "full": 4, "short": 2, "full2": 4},
+            spec_reqs=("full", "short", "full2"),
+        )
+        assert runner._reorder_batch_for_rpa(sched) == (1, 4)
+        assert runner._num_static_verify_reqs == 2
+        ids = runner.input_batch.req_ids
+        assert set(ids[1:3]) == {"full", "full2"} and ids[3] == "short"
+        # Ordered verify step whose full-length windows already lead.
+        self._batch(runner, ["dc", "full", "full2"])
+        sched = self._sched(
+            {"dc": 1, "full": 4, "full2": 4}, spec_reqs=("full", "full2")
+        )
+        assert runner._reorder_batch_for_rpa(sched) == (1, 3)
+        assert runner._num_static_verify_reqs == 2
+        # Ordered step without verify windows.
+        self._batch(runner, ["d1", "d2", "pf"])
+        sched = self._sched({"d1": 1, "d2": 1, "pf": 8})
+        assert runner._reorder_batch_for_rpa(sched) == (2, 2)
+        assert runner._num_static_verify_reqs == 0
+
     def test_masked_dense_orders_by_kv_length(self):
         runner = self._make_runner(groups_requests=True)
         self._batch(
@@ -2322,6 +2422,20 @@ class TestMambaSlotReadOffsets:
         runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]), 1)
         assert int(runner.mamba_slot_read_offsets.sum()) == 0
 
+    def test_bucketed_next_tokens_shorter_than_state_indices_padded_in_graph(self):
+        """When next_tokens has shape [padded_num_reqs, K+1] while state_indices
+        has shape [target_num_reqs] (B < width), _update_read_offsets_verify_impl
+        pads offsets in-graph and leaves null-tail slots at 0."""
+        runner = self._make_runner(num_blocks=16)
+        state_indices = torch.tensor([1, 4, 0, 0], dtype=torch.int32)
+        next_tokens = torch.tensor(
+            [[10, 11, 12], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
+        )
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 2)
+        assert int(runner.mamba_slot_read_offsets[1]) == 2
+        assert int(runner.mamba_slot_read_offsets[4]) == 0
+        assert int(runner.mamba_slot_read_offsets[0]) == 0
+
 
 class TestReadOffsetsClearedOnReallocation:
     """A recycled slot/block must not carry a read offset into its next owner.
@@ -2441,6 +2555,82 @@ class TestReadOffsetsClearedOnReallocation:
         runner._reset_read_offsets_for_new_requests(0, 2)
         assert len(calls) == (5 if lockstep else 3)
         assert int(runner.mamba_slot_read_offsets[5]) == 0
+
+    def test_continuing_batch_uses_keep_zero_dev_without_mutating_keep_dev(self):
+        """Under EP-DP lockstep a batch with no new request still launches the
+        reset, through the persistent all-False keep_zero_dev mask, without
+        copying keep_cpu into keep_dev. (Without lockstep it is skipped.)"""
+        runner = self._make_runner(lockstep=True)
+        self._set_batch(runner, ["a", "b"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        _, keep_dev, keep_zero_dev, _ = runner._read_offset_reset_scratch(
+            2, torch.device("cpu")
+        )
+        assert list(keep_dev) == [True, True]
+        assert list(keep_zero_dev) == [False, False]
+        runner.mamba_slot_read_offsets[5] = 2
+        runner.mamba_slot_read_offsets[6] = 1
+        # Next step with the same requests: keep_dev is not overwritten because
+        # keep_zero_dev is passed directly, and live offsets remain intact.
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert list(keep_dev) == [True, True]
+        assert list(keep_zero_dev) == [False, False]
+        assert int(runner.mamba_slot_read_offsets[5]) == 2
+        assert int(runner.mamba_slot_read_offsets[6]) == 1
+
+    def test_continuing_batch_skips_reset_kernel_when_not_lockstep(self, monkeypatch):
+        import vllm_torchtpu.runner.tpu_runner as tr_mod
+
+        calls = []
+        orig_reset = tr_mod._reset_read_offsets
+        monkeypatch.setattr(
+            tr_mod,
+            "_reset_read_offsets",
+            lambda *a, **k: (calls.append(a), orig_reset(*a, **k))[1],
+        )
+        runner = self._make_runner()
+        runner._dp_lockstep_enabled = lambda: False
+        self._set_batch(runner, ["a", "b"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == 1
+
+        # Second step with the same requests: no new requests and not in
+        # lockstep, so _reset_read_offsets is skipped completely while
+        # ctx._stacked_mamba_groups is still populated for post-verify reuse.
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == 1
+        assert isinstance(
+            runner._attn_metadata_builder_ctx._stacked_mamba_groups, torch.Tensor
+        )
+
+    def test_reuses_pre_stacked_mamba_groups_from_ctx(self, monkeypatch):
+        import vllm_torchtpu.runner.tpu_runner as tr_mod
+
+        stack_calls = []
+        monkeypatch.setattr(
+            tr_mod,
+            "_stack_or_single_mamba_groups",
+            lambda groups: (
+                stack_calls.append(groups),
+                torch.stack(groups, dim=0),
+            )[1],
+        )
+        runner = self._make_runner()
+        g0 = torch.tensor([5, 6], dtype=torch.int32)
+        g1 = torch.tensor([1, 2], dtype=torch.int32)
+        pre_stacked = torch.stack([g0, g1], dim=0)
+        runner.input_batch.req_ids = ["a", "b"]
+        runner.input_batch.req_id_to_index = {"a": 0, "b": 1}
+        runner.requests = {"a": None, "b": None}
+        ctx = SimpleNamespace(
+            mamba_state_indices=None,
+            unified_mamba_state_indices=[g0, g1],
+            _stacked_mamba_groups=pre_stacked,
+            _stacked_mamba_groups_ids=(id(g0), id(g1)),
+        )
+        runner._attn_metadata_builder_ctx = ctx
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert stack_calls == []
 
 
 class TestUnifiedReadOffsetMigration:
@@ -2832,6 +3022,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         _fenced_h2d_sources=[],
         _free_h2d_sources={},
         _registered_h2d_sources=set(),
+        _h2d_reuse={},
         _token_padding_state=None,
         pcp_manager=None,
         sequence_layout_planner=SimpleNamespace(
@@ -3067,9 +3258,11 @@ class TestInputStagingFence:
             TPUModelRunner._dummy_run(
                 runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=dp_lockstep
             )
-            # Only this run's staged table is still held, by its own fence.
+            # At most this run's staged table is still held, by its own fence.
+            # A run whose staged table equals the previous upload reuses that
+            # device tensor and stages nothing, so buffers never accumulate.
             assert runner._unfenced_h2d_sources == []
-            assert len(runner._fenced_h2d_sources) == 1
+            assert len(runner._fenced_h2d_sources) <= 1
             assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
         assert len(_FakeTpuEvent.instances) == 3
         assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
@@ -3520,7 +3713,13 @@ def test_flush_keeps_zero_token_async_results_until_waited():
     copy_state = FakeCopyState()
     weakref.finalize(copy_state, events.append, "freed")
     runner = SimpleNamespace(
-        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-prefill"]),
+        input_batch=SimpleNamespace(
+            num_reqs=1,
+            req_ids=["req-prefill"],
+            req_id_to_index={"req-prefill": 0},
+            num_tokens_no_spec=np.zeros(1, dtype=np.int32),
+            token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
+        ),
         _pre_async_results=AsyncPreResults(
             req_ids=["req-prefill"],
             next_tokens_tpu=torch.tensor([7], dtype=torch.int32),
@@ -3667,6 +3866,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             device=torch.device("cpu"),
             _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
             _topk_candidate_blocks=lambda: 0,
+            # The packed top-k candidate warmup is off.
+            _greedy_head_owner=None,
             _precompile_timed=lambda _name: contextlib.nullcontext(),
             sample_from_logits_func=fake_sample_from_logits,
             speculative_config=speculative_config,
@@ -3739,6 +3940,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
                 mamba_boundary_plans=None,
                 pooler_output_list=[],
                 top_tokens=False,
+                topk_candidates_packed=False,
                 kv_save_nan_check=None,
                 prompt_logprobs_chunks=[],
             ),
@@ -4094,3 +4296,106 @@ class TestLogitsAtDpVocabRows:
             TPUModelRunner._logits_at_dp_vocab_rows(
                 runner, torch.zeros(9, 2), torch.arange(9)
             )
+
+
+def test_stage_timing_disabled_skips_thread_and_events():
+    from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
+
+    timing = RunnerStageTiming(0, enabled=False)
+    assert timing._enabled is False
+    with timing.stage("main_forward"):
+        pass
+    with timing.host_stage("prep"):
+        pass
+    assert not timing._pending
+    assert timing.take_samples() == ([], [])
+
+
+def test_dp_num_tokens_across_dp_caches_cpu_tensors():
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner._dp_lockstep_enabled = lambda: False
+    runner.parallel_config = SimpleNamespace(
+        data_parallel_size=1,
+        use_sequence_parallel_moe=True,
+    )
+    t1 = runner._dp_num_tokens_across_dp(64)
+    t2 = runner._dp_num_tokens_across_dp(64)
+    t3 = runner._dp_num_tokens_across_dp(16)
+    assert t1 is not None
+    assert t1 is t2
+    assert t1.tolist() == [64]
+    assert t3 is not None and t3.tolist() == [16]
+
+    runner.parallel_config.use_sequence_parallel_moe = False
+    assert runner._dp_num_tokens_across_dp(64) is None
+
+
+def test_kv_transfer_uses_stage_timing():
+    cfg_none = SimpleNamespace(kv_transfer_config=None)
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_none) is False
+
+    cfg_offload = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="TPURaidenOffloadingConnector",
+            kv_connector_extra_config={},
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_offload) is False
+
+    cfg_raiden = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="TPURaidenConnector",
+            kv_connector_extra_config={},
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_raiden) is True
+
+    cfg_multi_with_tpu = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="TPUMultiConnector",
+            kv_connector_extra_config={
+                "connectors": [
+                    {"kv_connector": "TPURaidenOffloadingConnector"},
+                    {"kv_connector": "TPUConnector"},
+                ]
+            },
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_multi_with_tpu) is True
+
+
+def test_update_states_clears_prev_draft_len_of_scheduled_cached_requests():
+    """The base runner's async draft correction reads prev_num_draft_len of
+    every scheduled cached request; one scheduled without drafts after
+    drafting in the previous step must be cleared too."""
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    runner = object.__new__(TPUModelRunner)
+    states = {
+        rid: SimpleNamespace(prev_num_draft_len=3)
+        for rid in ("drafting", "budget_cut", "unscheduled")
+    }
+    from vllm_torchtpu.runner.min_tokens import MinTokensTracker
+
+    runner.requests = states
+    runner._min_tokens = MinTokensTracker()
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    runner.scheduler_config = SimpleNamespace(async_scheduling=True)
+    runner._pre_async_results = None
+    runner._install_spec_token_room_guard = lambda: None
+    runner._mamba_state_pos = {}
+    runner._mamba_offset_seeded = set()
+    runner._mamba_slot_by_req_id = {}
+    runner._free_mamba_slots = []
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs.req_ids = ["drafting", "budget_cut"]
+    output.scheduled_spec_decode_tokens = {"drafting": [-1, -1, -1]}
+    seen: dict[str, int] = {}
+
+    def base_update(_output):
+        seen.update({rid: s.prev_num_draft_len for rid, s in states.items()})
+
+    with patch.object(GPUModelRunner, "_update_states", side_effect=base_update):
+        runner._update_states(output)
+
+    assert seen == {"drafting": 0, "budget_cut": 0, "unscheduled": 3}

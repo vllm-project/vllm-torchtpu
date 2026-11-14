@@ -273,12 +273,16 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
     "vllm_torchtpu/kernels",
+    # The Qwen3.5 kernels and their custom-op bridges.
+    "vllm_torchtpu/models/qwen3_5/kernels",
     "vllm_torchtpu/layers/core",
     "vllm_torchtpu/layers/adapter/attention.py",
     "vllm_torchtpu/layers/adapter/cp_attention.py",
     "vllm_torchtpu/layers/adapter/pcp_kv_gather.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
+    # Small fused-kernel bridges, behind torch custom-op boundaries.
+    "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate
@@ -312,6 +316,11 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    # Registers the pallas::*_fused_max jax ops (behind a torch custom-op
+    # boundary) that get_top_tokens runs inside the AOT-cached fused MTP
+    # draft loop (spec_decode/mtp_fused_loop.py).
+    "vllm_torchtpu/runner/greedy_top_tokens.py",
+    "vllm_torchtpu/models/vllm/qwen3_next_patch.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
@@ -511,6 +520,27 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
 def _single_size(compile_range: Range) -> int | None:
     """The token bucket a compile range pins, or None for a size range."""
     return compile_range.start if compile_range.is_single_size() else None
+
+
+def _inline_int_placeholders(graph: fx.GraphModule, example_inputs: list[Any]) -> None:
+    """Bake a single-size compile's concrete ints into `graph` in place.
+
+    aot_autograd turns every int input back into a SymInt while a ShapeEnv is
+    live, so size arithmetic on the token count (`s // tp * tp` from the
+    sequence-parallel chunk and all-gather) reaches `torch.empty` symbolic and
+    fx_to_mlir rejects it. The placeholders stay, so the calling convention
+    and graph_signature are unchanged; only their uses see the constant.
+    """
+    inlined = False
+    for node, value in zip(shape_variants._placeholder_nodes(graph), example_inputs):
+        if type(value) is int and node.users:
+            # torch.fx types replace_with as a Node, but substitutes any
+            # argument value into the users' args; here it is the int.
+            # pyrefly: ignore[bad-argument-type]
+            node.replace_all_uses_with(value)
+            inlined = True
+    if inlined:
+        graph.recompile()
 
 
 class TpuCompilerAdaptor(CompilerInterface):
@@ -871,6 +901,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         # and vLLM keeps its own reference to `graph`. Only the output node
         # moves, so the placeholder signature is unaffected.
         graph = copy.deepcopy(graph)
+        if size is not None:
+            _inline_int_placeholders(graph, example_inputs)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         caching = (
@@ -996,9 +1028,12 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         logger.info("[TpuCompilerAdaptor] Loading compiled artifact from %s", path)
 
-        # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
-        # artifact is checked against is shaped the way it was when saved.
+        # Same deepcopy, int inlining and output-tuple rewrite as `compile`, so
+        # the graph the artifact is checked against is shaped the way it was
+        # when saved, and the fallback compile below sees static sizes too.
         graph = copy.deepcopy(graph)
+        if size is not None:
+            _inline_int_placeholders(graph, example_inputs)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)

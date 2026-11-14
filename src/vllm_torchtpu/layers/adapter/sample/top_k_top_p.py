@@ -21,6 +21,11 @@ from collections.abc import Callable, Sequence
 
 import torch
 
+try:
+    from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
+except ImportError:  # no torch_tpu (host-side unit tests)
+    rowmax_select = None
+
 MASKED_LOGIT_VALUE = -1e12
 # 128 matches the native TPU (8, 128) vector tile / 128-element lane width
 # and evenly divides standard padded vocabs (e.g. 248,320 = 1,940 * 128;
@@ -163,7 +168,10 @@ def _float32_bsearch(
 
 
 def topk_mask(
-    logits: torch.Tensor, k: torch.Tensor, replace_val: float = MASKED_LOGIT_VALUE
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    replace_val: float = MASKED_LOGIT_VALUE,
+    max_k: int = 0,
 ) -> torch.Tensor:
     """Sets everything to replace_val, except the top k values per batch element.
 
@@ -182,11 +190,24 @@ def topk_mask(
       k: Number of values to keep per batch element. In presence of ties, more
         than k values might be returned. [batch..., 1]
       replace_val: For the masked values of logits, what to overwrite them with.
+      max_k: Optional upper bound on active ``k`` values (``1 <= k <= max_k``).
+        When ``0 < max_k <= vocab_size``, uses a single ``torch.topk`` of size
+        ``max_k`` instead of 32 binary-search reductions.
 
     Returns:
       masked version of logits. [batch..., vocab_size]
     """
     k = k.squeeze(-1)
+    if 0 < max_k <= logits.shape[-1]:
+        if rowmax_select is not None and logits.device.type == "tpu":
+            # Values descending, duplicates included, like torch.topk's.
+            top_vals = rowmax_select(logits.float(), max_k)[0].to(logits.dtype)
+        else:
+            top_vals = torch.topk(logits, k=max_k, dim=-1, sorted=True).values
+        idx = (k.clamp(min=1, max=max_k) - 1).to(torch.int64).unsqueeze(-1)
+        cutoff = torch.gather(top_vals, -1, idx)
+        replace_tensor = torch.full_like(logits, replace_val)
+        return torch.where(logits >= cutoff, logits, replace_tensor)
 
     def predicate(threshold: torch.Tensor) -> torch.Tensor:
         # Search negated logits so the predicate is monotonic increasing.
@@ -250,16 +271,41 @@ def apply_top_k_top_p(
     top_k: torch.Tensor,
     top_p: torch.Tensor,
     topk_candidates: int = 0,
+    max_k: int = 0,
 ) -> torch.Tensor:
     if topk_candidates > 0:
         return apply_top_k_top_p_candidates(logits, top_k, top_p, topk_candidates)
     should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
-    topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
+    topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE, max_k=max_k)
     masked_logits = torch.where(should_apply_topk, topk_masked, logits)
 
     should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
     topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
     return torch.where(should_apply_topp, topp_masked, masked_logits)
+
+
+def extract_topk_candidates(
+    logits: torch.Tensor,
+    num_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract the `num_blocks` blocks of CANDIDATE_BLOCK logits with largest maxima.
+
+    Returns ``(cand_logits, cand_token_ids)`` of shape
+    ``[rows, num_blocks * CANDIDATE_BLOCK]``, where ``cand_token_ids`` holds
+    int32 full-vocab indices in ``[0, vocab_size)``.
+    """
+    rows, vocab_size = logits.shape
+    blocks = logits.reshape(rows, vocab_size // CANDIDATE_BLOCK, CANDIDATE_BLOCK)
+    block_max = blocks.amax(dim=-1)
+    block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
+    cand_logits = torch.gather(
+        blocks, 1, block_ids.unsqueeze(-1).expand(-1, -1, CANDIDATE_BLOCK)
+    ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
+    intra = torch.arange(CANDIDATE_BLOCK, device=logits.device, dtype=torch.int32)
+    cand_token_ids = (
+        block_ids.to(torch.int32).unsqueeze(-1) * CANDIDATE_BLOCK + intra
+    ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
+    return cand_logits, cand_token_ids
 
 
 def apply_top_k_top_p_candidates(
@@ -304,7 +350,10 @@ def apply_top_k_top_p_candidates(
     candidates = torch.gather(
         blocks, 1, block_ids.unsqueeze(-1).expand(-1, -1, CANDIDATE_BLOCK)
     ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
-    kept = apply_top_k_top_p(candidates, top_k, top_p) > MASKED_LOGIT_VALUE
+    kept = (
+        apply_top_k_top_p(candidates, top_k, top_p, max_k=num_blocks)
+        > MASKED_LOGIT_VALUE
+    )
     inf = torch.full_like(candidates, float("inf"))
     cutoff = torch.where(kept, candidates, inf).amin(dim=-1, keepdim=True)
     masked = torch.where(

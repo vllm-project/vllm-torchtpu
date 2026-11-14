@@ -41,7 +41,10 @@ def _make_proposer(
     draft_tp: int | None = 1, target_tp: int = 1, method: str = "eagle3"
 ) -> Eagle3Proposer:
     speculative_config = SimpleNamespace(
-        draft_tensor_parallel_size=draft_tp, method=method, draft_model_config=None
+        draft_tensor_parallel_size=draft_tp,
+        method=method,
+        draft_model_config=None,
+        num_speculative_tokens=1,
     )
     parallel_config = SimpleNamespace(
         tensor_parallel_size=target_tp, pipeline_parallel_size=1
@@ -54,6 +57,18 @@ def _make_proposer(
             _pcp_enabled=False, _mtp_enabled=method == "mtp", _mtp_prefill_only=False
         ),
         vllm_config=vllm_config,
+    )
+
+
+def _staged_runner(**fields):
+    """A runner stand-in with main's input-staging registry: the draft input
+    prep uploads through stage_h2d_upload, which reads it, and the real runner
+    creates it in __init__."""
+    return SimpleNamespace(
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+        _free_h2d_sources={},
+        **fields,
     )
 
 
@@ -319,7 +334,7 @@ class _CarryAggregationAfterGatherPlan:
 @pytest.mark.tpu_test
 def test_prepare_draft_inputs(device):
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -371,7 +386,7 @@ def test_prepare_draft_inputs_chunk_offset(device):
     """A non-zero start_index must slice the batch-level sampled tokens and
     rejection counts by the chunk's offset."""
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1", "r2", "r3"]),
         device=device,
         requests={},
@@ -422,7 +437,7 @@ def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
     """The seed scatter stays in request-major coordinates; only the final
     draft input and gather values cross the chunk-local PCP layout boundary."""
     proposer = _make_proposer(draft_tp=1, method="mtp")
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -491,7 +506,7 @@ def test_prepare_draft_inputs_all_layout_keeps_device_seed_gathers(device, monke
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
     proposer = _make_proposer(draft_tp=1, method="mtp")
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -602,7 +617,7 @@ def test_prepare_draft_inputs_async_device(device):
     (last_token_indices) and the rejected count from the on-device rejection
     output — matching the host path fed the equivalent num_rejected."""
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -672,7 +687,7 @@ def test_prepare_draft_inputs_async_device_keeps_padded_width(device, discard):
     A last request still in partial prefill seeds from its known next prompt
     token, and the padding rows repeat that token, not its sampled one."""
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={
@@ -730,6 +745,152 @@ def test_prepare_draft_inputs_async_device_keeps_padded_width(device, discard):
     assert dev_rej.shape[0] == 4
     assert dev_rej.cpu().tolist() == [1, 3, 0, 0]
     assert host_rej.tolist() == [1, 3]
+
+
+@pytest.mark.tpu_test
+def test_prepare_draft_inputs_async_device_bucketed(device):
+    """Bucketed async device prep pads num_rejected to knr and repeats the last
+    valid request across the loop bucket p without recompiling across num_reqs."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner = _staged_runner(
+        input_batch=SimpleNamespace(req_ids=[f"r{i}" for i in range(8)]),
+        device=device,
+        requests={},
+        num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
+    )
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={})
+
+    knr = 8
+    T = 16
+    num_reqs = 2
+    qsl_np = np.array([0, 4, 8, 8, 8, 8, 8, 8, 8], dtype=np.int32)
+    dl_np = np.array([3, 3, 0, 0], dtype=np.int32)
+
+    def make_bucketed_chunk():
+        return _make_chunk(
+            input_ids=torch.arange(T, dtype=torch.int32, device=device),
+            position_ids=torch.arange(T, dtype=torch.int32, device=device),
+            query_start_loc_np=qsl_np[: num_reqs + 1].copy(),
+            start_index=0,
+            num_reqs=num_reqs,
+            device=device,
+            draft_lengths=torch.from_numpy(dl_np).to(device),
+            attn_ctx=SimpleNamespace(
+                query_start_loc=torch.from_numpy(qsl_np).to(device)
+            ),
+        )
+
+    next_tokens = torch.tensor(
+        [
+            [91, 92, 201, -1],
+            [202, -1, -1, -1],
+            [-1, -1, -1, -1],
+            [-1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    dev_ids, _, dev_last, dev_rej = proposer._prepare_draft_inputs(
+        make_bucketed_chunk(),
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=scheduler_output,
+        next_tokens_device=next_tokens,
+    )
+    host_ids, _, host_last, host_rej = proposer._prepare_draft_inputs(
+        make_bucketed_chunk(),
+        sampled_token_ids=[[201], [202]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=np.array([1, 3], dtype=np.int32),
+        scheduler_output=scheduler_output,
+    )
+    assert torch.equal(dev_ids.cpu(), host_ids.cpu())
+    assert torch.equal(dev_last.cpu(), host_last.cpu())
+    assert dev_rej.shape[0] == knr
+    assert dev_rej.cpu()[:num_reqs].tolist() == host_rej.tolist() == [1, 3]
+    assert dev_rej.cpu()[num_reqs:].tolist() == [0] * (knr - num_reqs)
+
+
+@pytest.mark.tpu_test
+def test_prepare_draft_inputs_async_device_with_discard(device):
+    """Mixed chunked-prefill + decode step where discard_sampled_tokens_req_indices
+    is non-empty (partial prefill request): async device prep overrides the
+    discarded request's seed token on-device via ov_tokens while staying on the
+    bucketed _draft_async_prepare_inputs path."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=[f"r{i}" for i in range(8)]),
+        device=device,
+        requests={
+            "r0": SimpleNamespace(num_computed_tokens=10, get_token_id=lambda sl: 999),
+            "r1": SimpleNamespace(num_computed_tokens=100, get_token_id=lambda sl: 555),
+        },
+        num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
+        # The runner's input-staging fence (stage_h2d_upload).
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+        _free_h2d_sources={},
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"r0": 4, "r1": 8},
+        scheduled_spec_decode_tokens={"r0": [1, 2, 3], "r1": []},
+    )
+
+    knr = 8
+    T = 16
+    num_reqs = 2
+    qsl_np = np.array([0, 4, 12, 12, 12, 12, 12, 12, 12], dtype=np.int32)
+    dl_np = np.array([3, 0, 0, 0], dtype=np.int32)
+
+    def make_mixed_chunk():
+        return _make_chunk(
+            input_ids=torch.arange(T, dtype=torch.int32, device=device),
+            position_ids=torch.arange(T, dtype=torch.int32, device=device),
+            query_start_loc_np=qsl_np[: num_reqs + 1].copy(),
+            start_index=0,
+            num_reqs=num_reqs,
+            device=device,
+            draft_lengths=torch.from_numpy(dl_np).to(device),
+            attn_ctx=SimpleNamespace(
+                query_start_loc=torch.from_numpy(qsl_np).to(device)
+            ),
+        )
+
+    next_tokens = torch.tensor(
+        [
+            [91, 92, 201, -1],
+            [777, -1, -1, -1],
+            [-1, -1, -1, -1],
+            [-1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    dev_ids, _, dev_last, dev_rej = proposer._prepare_draft_inputs(
+        make_mixed_chunk(),
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[1],
+        num_rejected_tokens_np=None,
+        scheduler_output=scheduler_output,
+        next_tokens_device=next_tokens,
+    )
+    host_ids, _, host_last, host_rej = proposer._prepare_draft_inputs(
+        make_mixed_chunk(),
+        sampled_token_ids=[[201], [777]],
+        discard_sampled_tokens_req_indices=[1],
+        num_rejected_tokens_np=np.array([1, 0], dtype=np.int32),
+        scheduler_output=scheduler_output,
+    )
+    assert torch.equal(dev_ids.cpu(), host_ids.cpu())
+    assert torch.equal(dev_last.cpu(), host_last.cpu())
+    assert dev_rej.shape[0] == knr
+    assert dev_rej.cpu()[:num_reqs].tolist() == host_rej.tolist() == [1, 0]
+    assert dev_rej.cpu()[num_reqs:].tolist() == [0] * (knr - num_reqs)
+    # Request 1's last position (qsl_end[1] - 1 = 11) must hold the override token 555.
+    assert int(dev_ids.cpu()[11]) == 555
 
 
 @pytest.mark.tpu_test
@@ -979,10 +1140,17 @@ def test_propose_empty_batch():
     )
 
 
-def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
+def _lockstep_draft_trace(
+    monkeypatch, method, K, num_chunks, num_real, *, step0_gather=False
+):
     """The draft programs one EP-DP lockstep rank emits in a step whose
     coordinated chunk bound is `num_chunks`: propose() with `num_real` real
-    chunks, or the idle-rank replay when it has none."""
+    chunks, or the idle-rank replay when it has none.
+
+    `step0_gather` installs the MTP step-0 post-attention gather on the draft,
+    with the separate loop-step program it gets when the fused loop is off,
+    and stubs `_forward_draft` on the class, since an instance stub turns the
+    gather off."""
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
     monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
@@ -1015,8 +1183,15 @@ def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
         trace.append(("combine", [tuple(a.shape) for a in aux]))
         return aux[0]
 
-    def forward(*, step_idx, num_tokens_padded, **_):
-        trace.append(("forward", step_idx, num_tokens_padded))
+    def forward(*, step_idx, num_tokens_padded, step0_gather_indices=None, **_):
+        trace.append(
+            (
+                "forward",
+                step_idx,
+                num_tokens_padded,
+                None if step0_gather_indices is None else step0_gather_indices.shape,
+            )
+        )
         hidden = torch.zeros((num_tokens_padded, 8))
         return hidden, hidden
 
@@ -1025,9 +1200,20 @@ def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
         return torch.zeros(hidden.shape[0], dtype=torch.int32)
 
     proposer._draft_combine_hidden_states = combine
-    proposer._forward_draft = forward
+    if step0_gather:
+        import vllm_torchtpu.models.vllm.qwen3_next_patch as qwen3_next_patch
+
+        monkeypatch.setattr(
+            qwen3_next_patch, "is_step0_post_attn_gather_installed", lambda _m: True
+        )
+        monkeypatch.setattr(
+            Eagle3Proposer, "_forward_draft", lambda _self, **kw: forward(**kw)
+        )
+        proposer._mtp_loop_model = object()
+    else:
+        proposer._forward_draft = forward
     proposer._draft_propose_token = propose_token
-    proposer._draft_gather_carries = lambda h, pos, lh, _idx: (
+    proposer._draft_gather_carries = lambda h, pos, lh, _idx, *_: (
         h[:reqs],
         pos[:reqs],
         lh[:reqs],
@@ -1081,6 +1267,81 @@ def test_dp_lockstep_draft_trace_independent_of_real_chunk_count(
     for num_real in range(num_chunks):
         padded = _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real)
         assert padded == full, f"{num_real} of {num_chunks} chunks real"
+
+
+@pytest.mark.parametrize("K", [1, 2, 3])
+@pytest.mark.parametrize("num_chunks", [1, 2, 3])
+def test_dp_lockstep_draft_trace_matches_with_mtp_step0_gather(
+    monkeypatch, K, num_chunks
+):
+    """An MTP draft with the step-0 post-attention gather installed still
+    emits one draft program sequence per lockstep step, however many chunks
+    are real: a real chunk's step 0 runs the plain forward over the
+    coordinated bucket, as the padding chunks and the idle-rank replay do,
+    and its MoE never runs over the gathered loop-bucket rows."""
+    full = _lockstep_draft_trace(
+        monkeypatch, "mtp", K, num_chunks, num_chunks, step0_gather=True
+    )
+    assert all(entry[3] is None for entry in full if entry[0] == "forward")
+    for num_real in range(num_chunks):
+        padded = _lockstep_draft_trace(
+            monkeypatch, "mtp", K, num_chunks, num_real, step0_gather=True
+        )
+        assert padded == full, f"{num_real} of {num_chunks} chunks real"
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
+def test_mtp_step0_post_attn_gather_off_under_dp_lockstep(monkeypatch, lockstep):
+    """An installed step-0 gather runs on a MoE MTP draft unless EP-DP
+    lockstep pads its draft steps."""
+    import vllm_torchtpu.models.vllm.qwen3_next_patch as qwen3_next_patch
+
+    monkeypatch.setattr(
+        qwen3_next_patch, "is_step0_post_attn_gather_installed", lambda _m: True
+    )
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_has_moe_cache = True
+    proposer.draft_model = SimpleNamespace()
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: lockstep)
+    chunk = SimpleNamespace(
+        sequence_layout_plan=SimpleNamespace(kind=SequenceLayoutKind.ALL)
+    )
+    assert proposer._use_mtp_step0_post_attn_gather(chunk) is (not lockstep)
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
+def test_load_model_skips_step0_gather_loop_model_under_dp_lockstep(
+    monkeypatch, lockstep
+):
+    """load_model builds the step-0 gather's loop-step program only where the
+    gather can run, so under EP-DP lockstep steps 1..K-1 run the draft."""
+    monkeypatch.setenv("VLLM_TPU_FUSED_DRAFT_LOOP", "0")
+    proposer = _make_proposer(draft_tp=1, target_tp=1, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 2
+    proposer.runner._dp_lockstep_enabled = lambda: lockstep
+    proposer._draft_has_moe_cache = True
+    draft, target = _make_vocab_models()
+
+    def load_draft_model(_target):
+        proposer.draft_model = draft
+
+    proposer._load_draft_model = load_draft_model
+    monkeypatch.setattr(
+        spec_decode_utils, "gather_sharded_weight", _fake_gather_sharded_weight
+    )
+    built = []
+    monkeypatch.setattr(
+        Eagle3Proposer,
+        "_build_mtp_step0_gather_loop_model",
+        lambda _self: built.append(True),
+    )
+
+    with mock.patch(
+        "vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config", return_value={}
+    ):
+        proposer.load_model(target)
+
+    assert built == ([] if lockstep else [True])
 
 
 def test_loop_bucket_follows_dp_step_max_reqs_under_sharded_lockstep():
@@ -1555,7 +1816,17 @@ def test_build_draft_attn_metadata_reuses_target_metadata(device):
     md0 = proposer._build_draft_attn_metadata(
         chunk, step_idx=0, seq_lens_delta=0, num_rejected_np=None
     )
-    assert md0 == {"draft.attn.0": shared, "draft.attn.1": shared}
+    assert set(md0) == {"draft.attn.0", "draft.attn.1"}
+    assert md0["draft.attn.0"] is md0["draft.attn.1"]
+    step0_md = md0["draft.attn.0"]
+    # Step 0 uses the target's tensors. On TPU only request_distribution is
+    # swapped for a base copy of the same values (_with_base_request_distribution).
+    assert step0_md.block_tables is shared.block_tables
+    assert step0_md.seq_lens is shared.seq_lens
+    assert step0_md.query_start_loc is shared.query_start_loc
+    assert torch.equal(
+        step0_md.request_distribution.cpu(), shared.request_distribution.cpu()
+    )
 
     loop_input_deltas = []
     loop_step_attn_inputs = proposer._loop_step_attn_inputs
@@ -2858,3 +3129,618 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     assert seen["names"] == expected
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
+
+
+def test_draft_async_prepare_inputs_padding_rows_report_no_rejections():
+    """Rows past the last real request (pad_req_idx[-1]) report no rejected
+    drafts, whatever their next-token and draft_lengths rows hold: the
+    sampler's padded request width can exceed num_reqs, and a stale row must
+    not shorten the draft's seq_lens."""
+    proposer = _make_proposer(draft_tp=1)
+    invalid = -1
+    # Two real requests and two padding rows (B = knr = 4). The padding rows
+    # look like fully rejected requests: no valid token, three drafts.
+    next_tokens = torch.tensor(
+        [
+            [11, 12, invalid, invalid],
+            [21, invalid, invalid, invalid],
+            [invalid] * 4,
+            [invalid] * 4,
+        ],
+        dtype=torch.int32,
+    )
+    draft_lengths = torch.tensor([3, 3, 3, 3], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 4, 8, 8, 8], dtype=torch.int32)
+    input_ids = torch.arange(8, dtype=torch.int32)
+    pad_req_idx = torch.tensor([0, 1, 1, 1], dtype=torch.int64)
+
+    _, _, num_rejected = (
+        Eagle3Proposer._draft_async_prepare_inputs.__wrapped__.__wrapped__(
+            proposer,
+            input_ids,
+            next_tokens,
+            draft_lengths,
+            query_start_loc,
+            pad_req_idx,
+        )
+    )
+
+    # Request 0 accepted one of its three drafts, request 1 none.
+    assert num_rejected.tolist() == [2, 3, 0, 0]
+
+
+@pytest.mark.parametrize("advance_pos", [True, False])
+def test_draft_post_step0_fused_matches_unfused_carries_and_step1_inputs(advance_pos):
+    """_draft_post_step0_fused must produce identical hidden_carry, pos_step1,
+    and seq_lens_step1 to the unfused sequence, and _MtpFusedLoop must propose
+    tok0 from hidden_carry."""
+    from vllm_torchtpu.spec_decode.mtp_fused_loop import _MtpFusedLoop
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_kv_shared = not advance_pos
+    proposer._draft_greedy_head_owner = None
+    proposer.draft_model = SimpleNamespace(
+        draft_id_to_target_id=None,
+        compute_logits=lambda h: h,
+    )
+
+    hidden = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    positions = torch.tensor([10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32)
+    idx = torch.tensor([2, 4, 0, 0], dtype=torch.int64)
+    base_seq_lens = torch.tensor([13, 22, 0, 0], dtype=torch.int32)
+    rejected = torch.tensor([1, 0, 0, 0], dtype=torch.int32)
+
+    h_ref, p_ref, lh_ref = Eagle3Proposer._draft_gather_carries.__wrapped__.__wrapped__(
+        proposer, hidden, positions, hidden, idx
+    )
+    tok0_ref = Eagle3Proposer._draft_propose_token.__wrapped__.__wrapped__(
+        proposer, lh_ref
+    )
+    pos1_ref = (
+        Eagle3Proposer._draft_add_delta.__wrapped__.__wrapped__(proposer, p_ref, 1)
+        if advance_pos
+        else p_ref
+    )
+    seq1_ref = Eagle3Proposer._draft_loop_seq_lens.__wrapped__.__wrapped__(
+        proposer, base_seq_lens, rejected, 1 if advance_pos else 0
+    )
+
+    h_f, pos1_f, seq1_f = (
+        Eagle3Proposer._draft_post_step0_fused.__wrapped__.__wrapped__(
+            proposer,
+            hidden,
+            positions,
+            idx,
+            base_seq_lens,
+            rejected,
+        )
+    )
+    assert torch.equal(h_f, h_ref)
+    assert torch.equal(pos1_f, pos1_ref)
+    assert torch.equal(seq1_f, seq1_ref)
+
+    class _DummyMtp(torch.nn.Module):
+        def forward(
+            self,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            spec_step_idx=0,
+        ):
+            return hidden_states + 1.0
+
+        def compute_logits(self, h):
+            return h
+
+    loop_mod = _MtpFusedLoop(
+        vllm_config=SimpleNamespace(),
+        prefix="mtp_fused_loop_k3",
+        mtp=_DummyMtp(),
+        num_steps=2,
+        greedy_head_owner=None,
+        propose_step0=True,
+    )
+    stacked = loop_mod(None, pos1_f.clone(), h_f.clone(), seq1_f.clone())
+    assert stacked.shape == (4, 3)
+    assert torch.equal(stacked[:, 0], tok0_ref)
+
+    # When step0 post-attn gather outputs [max_loop_p, H], _MtpFusedLoop slices
+    # hidden_states[:positions.shape[-1]] internally and produces identical tokens.
+    h_padded = torch.cat([h_f.clone(), torch.full((12, 4), 99.0)], dim=0)
+    stacked_from_padded = loop_mod(None, pos1_f.clone(), h_padded, seq1_f.clone())
+    assert torch.equal(stacked_from_padded, stacked)
+
+    # _draft_async_prepare_inputs with positions and base_seq_lens returns
+    # identical pos_step1 and seq_lens_step1 without needing _draft_post_step0_fused.
+    input_ids = torch.arange(8, dtype=torch.int32)
+    next_tokens = torch.tensor(
+        [[101, 102, 103, -1], [201, 202, 203, 204]], dtype=torch.int32
+    )
+    draft_lengths = torch.tensor([3, 3], dtype=torch.int32)
+    qsl = torch.tensor([0, 4, 5, 5, 5], dtype=torch.int32)
+    pad_req_idx = torch.tensor([0, 1, 1, 1], dtype=torch.int64)
+    _, rej_a, s0_gi_a, pos1_a, seq1_a = (
+        Eagle3Proposer._draft_async_prepare_inputs.__wrapped__.__wrapped__(
+            proposer,
+            input_ids,
+            next_tokens,
+            draft_lengths,
+            qsl,
+            pad_req_idx,
+            None,
+            16,
+            positions,
+            base_seq_lens,
+        )
+    )
+    _, pos1_gi, seq1_gi = (
+        Eagle3Proposer._draft_post_step0_fused.__wrapped__.__wrapped__(
+            proposer,
+            hidden,
+            positions,
+            s0_gi_a[:4],
+            base_seq_lens,
+            rej_a,
+        )
+    )
+    assert torch.equal(rej_a, rejected)
+    assert s0_gi_a.shape == (16,)
+    assert torch.equal(pos1_a, pos1_gi)
+    assert torch.equal(seq1_a, seq1_gi)
+
+    from vllm_torchtpu.compilation import shape_variants
+    from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+        _step0_effective_gather_indices,
+        step0_post_attn_gather_context,
+    )
+
+    with step0_post_attn_gather_context(s0_gi_a):
+        assert _step0_effective_gather_indices(torch.zeros((3, 4))).shape == (16,)
+        with shape_variants.warmup():
+            assert _step0_effective_gather_indices(torch.zeros((3, 4))).shape == (4,)
+            assert _step0_effective_gather_indices(torch.zeros((3, 8))).shape == (8,)
+            assert _step0_effective_gather_indices(torch.zeros((3, 12))).shape == (16,)
+
+    # Without propose_step0 (main's form) the program takes step 0's token
+    # and returns steps 1..K-1 one tensor each: the same tokens.
+    steps_mod = _MtpFusedLoop(
+        vllm_config=SimpleNamespace(),
+        prefix="mtp_fused_loop_k3",
+        mtp=_DummyMtp(),
+        num_steps=2,
+    )
+    steps = steps_mod(tok0_ref, pos1_f.clone(), h_f.clone(), seq1_f.clone())
+    assert isinstance(steps, tuple) and len(steps) == 2
+    assert torch.equal(torch.stack(steps, dim=1), stacked[:, 1:])
+
+
+@pytest.mark.tpu_test
+def test_prepare_draft_inputs_device_seed_pure_partial_prefill_uses_bucketed_fast_path(
+    device, monkeypatch
+):
+    """When every request in a chunk is a partial prefill (all indices in
+    discard_sampled_tokens_req_indices), _prepare_draft_inputs must build
+    bucket-padded last_token_indices and next_token_ids directly on CPU without
+    slicing or mutating device_seed."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
+        device=device,
+        requests={
+            "r0": SimpleNamespace(
+                num_computed_tokens=0,
+                get_token_id=lambda idx: [10, 11, 12, 13][idx],
+            ),
+            "r1": SimpleNamespace(
+                num_computed_tokens=0,
+                get_token_id=lambda idx: [20, 21, 22][idx],
+            ),
+        },
+        num_tokens_paddings=[4, 8, 16],
+        num_reqs_paddings=[2, 4, 8],
+        _dp_lockstep_enabled=lambda: False,
+        # The runner's input-staging fence (stage_h2d_upload).
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+        _free_h2d_sources={},
+    )
+    chunk = _make_chunk(
+        input_ids=torch.tensor(
+            [10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32, device=device
+        ),
+        position_ids=torch.tensor(
+            [0, 1, 2, 0, 1, 0, 0, 0], dtype=torch.int32, device=device
+        ),
+        query_start_loc_np=np.array([0, 3, 5], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        device=device,
+    )
+    seed_calls = []
+    orig_seed = Eagle3Proposer._draft_seed_input_ids.__wrapped__.__wrapped__
+    monkeypatch.setattr(
+        proposer,
+        "_draft_seed_input_ids",
+        lambda ids, lti, nxt: (
+            seed_calls.append((tuple(lti.shape), tuple(nxt.shape))),
+            orig_seed(proposer, ids, lti, nxt),
+        )[1],
+    )
+
+    class _ExplodingSeed:
+        def __getitem__(self, _idx):
+            raise AssertionError(
+                "device_seed must not be sliced on pure partial prefill"
+            )
+
+    draft_ids, _, last_idx, rej = proposer._prepare_draft_inputs(
+        chunk=chunk,
+        sampled_token_ids=[[], []],
+        discard_sampled_tokens_req_indices=[0, 1],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={"r0": 3, "r1": 2}),
+        device_seed=_ExplodingSeed(),
+    )
+    assert seed_calls == [((4,), (4,))]
+    assert tuple(last_idx.shape) == (4,)
+    assert draft_ids[:5].tolist() == [11, 12, 13, 21, 22]
+    assert rej.tolist() == [0, 0]
+
+
+@pytest.mark.parametrize(
+    ("draft_sp", "num_tokens", "gather", "expect_sliced"),
+    [
+        (False, 8, False, False),  # draft not admitted to sequence-parallel MoE
+        (True, 8, False, True),  # at or above min_rows: rows sliced over TP
+        (True, 2, False, False),  # below min_rows: rows replicated
+        (True, 8, True, False),  # MTP step-0 post-attention gather: replicated
+    ],
+)
+def test_forward_draft_records_sequence_parallel_row_form(
+    monkeypatch, draft_sp, num_tokens, gather, expect_sliced
+):
+    """The MTP drafter runs under sequence-parallel MoE (main #1562), so every
+    draft forward records its row form with sequence_parallel.set_active
+    before the compiled call, by the same rule as the model's own row gating,
+    and writes the padding mask for that form. A mismatch would all-reduce
+    sliced rows in the MoE combine."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    proposer, _ = _forward_draft_harness(monkeypatch)
+    proposer._draft_sequence_parallel = draft_sp
+    monkeypatch.setattr(e3.sequence_parallel, "min_rows", lambda: 4)
+    active = []
+    monkeypatch.setattr(e3.sequence_parallel, "set_active", active.append)
+    padding = []
+
+    def token_padding_update(n, num_valid_tokens=None, rows_sliced=None):
+        padding.append((n, rows_sliced))
+
+    proposer.runner._token_padding_update = token_padding_update
+    log = []
+    proposer.draft_model = _RecordingProgram("draft", log)
+    kwargs = {}
+    if gather:
+        kwargs["step0_gather_indices"] = torch.zeros(2, dtype=torch.int64)
+    proposer._forward_draft(
+        chunk=SimpleNamespace(num_reqs=2),
+        input_ids=torch.zeros(num_tokens, dtype=torch.int32),
+        positions=torch.zeros(num_tokens, dtype=torch.int32),
+        target_hidden_states=torch.zeros((num_tokens, 2)),
+        step_idx=0,
+        seq_lens_delta=0,
+        num_rejected_np=None,
+        **kwargs,
+    )
+
+    assert active == [expect_sliced]
+    assert padding == [(2 if gather else num_tokens, expect_sliced)]
+    assert log == [("draft", 0)]
+
+
+@pytest.mark.parametrize(("draft_sp", "expect_sliced"), [(False, False), (True, True)])
+def test_run_mtp_fused_loop_records_row_form_and_proposes_step0(
+    monkeypatch, draft_sp, expect_sliced
+):
+    """The fused loop runs every step at the chunk's loop bucket, so it
+    records one row form for the program, and it is handed step 0's hidden
+    carry with no token (the program proposes step 0's token itself)."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    proposer, _ = _forward_draft_harness(monkeypatch)
+    proposer._draft_sequence_parallel = draft_sp
+    proposer.runner.max_num_reqs = 8
+    proposer._loop_bucket = lambda _num_reqs: 8
+    monkeypatch.setattr(e3.sequence_parallel, "min_rows", lambda: 8)
+    active = []
+    monkeypatch.setattr(e3.sequence_parallel, "set_active", active.append)
+    seq_lens = torch.tensor([5, 9, 0, 0], dtype=torch.int32)
+    md = SimpleNamespace(seq_lens=seq_lens)
+    proposer._build_draft_attn_metadata = lambda **_kwargs: {"a": md, "b": md}
+    calls = []
+
+    def fused_loop(input_ids, positions, hidden_states, seq_lens_arg):
+        calls.append((input_ids, hidden_states.shape, seq_lens_arg))
+        return torch.zeros((hidden_states.shape[0], 3), dtype=torch.int32)
+
+    proposer._mtp_fused_loop = fused_loop
+    proposer._mtp_fused_loop_warm = True
+
+    out = proposer._run_mtp_fused_loop(
+        chunk=SimpleNamespace(num_reqs=2),
+        positions=torch.zeros(8, dtype=torch.int32),
+        hidden_states=torch.zeros((8, 4)),
+        num_rejected_np=None,
+        num_rejected_dev=None,
+        loop_query_start_loc=torch.zeros(9, dtype=torch.int32),
+        loop_request_distribution=torch.zeros(3, dtype=torch.int32),
+    )
+
+    assert out.shape == (8, 3)
+    assert active == [expect_sliced]
+    assert len(calls) == 1
+    input_ids, hidden_shape, seq_lens_arg = calls[0]
+    assert input_ids is None
+    assert hidden_shape == (8, 4)
+    assert seq_lens_arg is seq_lens
+
+
+def _check_prep_emits_padded_step0_gather_indices(
+    proposer, device, seed_source, pad_len
+):
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
+        device=device,
+        requests={},
+        num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
+        # The runner's input-staging fence (stage_h2d_upload).
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+        _free_h2d_sources={},
+    )
+    chunk = _make_chunk(
+        input_ids=torch.arange(8, dtype=torch.int32, device=device),
+        position_ids=torch.arange(8, dtype=torch.int32, device=device),
+        query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        device=device,
+        draft_lengths=torch.tensor([3, 3], dtype=torch.int32, device=device),
+        attn_ctx=SimpleNamespace(
+            query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32, device=device)
+        ),
+    )
+    if seed_source == "host":
+        kwargs = dict(
+            sampled_token_ids=[[201], [202]],
+            num_rejected_tokens_np=np.array([1, 3], dtype=np.int32),
+        )
+    elif seed_source == "device_seed":
+        kwargs = dict(
+            sampled_token_ids=None,
+            num_rejected_tokens_np=None,
+            device_seed=torch.tensor([201, 202], dtype=torch.int32, device=device),
+        )
+    else:
+        kwargs = dict(
+            sampled_token_ids=None,
+            num_rejected_tokens_np=None,
+            next_tokens_device=torch.tensor(
+                [[91, 92, 201, -1], [202, -1, -1, -1]], dtype=torch.int32, device=device
+            ),
+        )
+    proposer._step0_pad_len = pad_len
+    proposer._last_step0_gather_indices = None
+
+    _, _, gather_indices, _ = proposer._prepare_draft_inputs(
+        chunk,
+        discard_sampled_tokens_req_indices=[],
+        scheduler_output=SimpleNamespace(
+            num_scheduled_tokens={}, scheduled_spec_decode_tokens={}
+        ),
+        **kwargs,
+    )
+
+    step0 = proposer._last_step0_gather_indices
+    assert step0 is not None and step0.shape == (pad_len,)
+    torch.testing.assert_close(
+        step0.cpu(), _maybe_pad_dim0(gather_indices, pad_len).cpu()
+    )
+    if pad_len == gather_indices.shape[0] and seed_source != "next_tokens_device":
+        # No second upload when the loop bucket is the chunk's own bucket.
+        assert step0 is gather_indices
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("seed_source", ["host", "device_seed", "next_tokens_device"])
+@pytest.mark.parametrize("pad_len", [16, 32])
+def test_prepare_draft_inputs_emits_padded_step0_gather_indices(
+    device, seed_source, pad_len
+):
+    """Asked for them (`_step0_pad_len`), the prep also leaves the MTP step-0
+    gather indices padded to the loop bucket: its gather indices zero-padded,
+    as propose() would pad them itself, from the same program or upload."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    _check_prep_emits_padded_step0_gather_indices(
+        proposer, device, seed_source, pad_len
+    )
+
+
+@pytest.mark.parametrize("seed_source", ["host", "device_seed"])
+@pytest.mark.parametrize("pad_len", [16, 32])
+def test_prepare_draft_inputs_emits_padded_step0_gather_indices_cpu(
+    seed_source, pad_len
+):
+    """The host-built step-0 indices, on CPU: the compiled seed scatter (TPU
+    backend) is stubbed; it does not touch the gather indices."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_seed_input_ids = lambda input_ids, *_: input_ids
+    _check_prep_emits_padded_step0_gather_indices(
+        proposer, torch.device("cpu"), seed_source, pad_len
+    )
+
+
+def test_propose_takes_step0_gather_indices_from_the_prep():
+    """propose() decides the MTP step-0 post-attn gather before the prep, from
+    the fused-loop decision, has the prep emit the indices padded to the loop
+    bucket, and hands exactly those to the step-0 forward (ALL layout)."""
+    device = torch.device("cpu")
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 1
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=2, req_ids=["r0", "r1"]),
+        device=device,
+        requests={},
+        num_tokens_paddings=[16, 32],
+        max_num_reqs=20,
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    chunk = _make_chunk(
+        input_ids=torch.zeros(3, dtype=torch.int32, device=device),
+        position_ids=torch.zeros(3, dtype=torch.int32, device=device),
+        query_start_loc_np=np.array([0, 1, 2], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        hidden=1,
+        device=device,
+        hidden_states=torch.zeros((3, 1), device=device),
+        attn_ctx=SimpleNamespace(use_max_model_len=True),
+    )
+    proposer.draft_chunks = [chunk]
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(use_aux_hidden_state=False)
+    )
+    decisions = []
+
+    def use_step0_gather(_chunk, *, can_use_post_step0_fused):
+        decisions.append(can_use_post_step0_fused)
+        return True
+
+    proposer._use_mtp_step0_post_attn_gather = use_step0_gather
+    padded = torch.arange(32, dtype=torch.int64, device=device)
+
+    def prepare(*_args, **_kwargs):
+        assert proposer._step0_pad_len == 32  # the loop bucket of max_num_reqs
+        proposer._last_step0_gather_indices = padded
+        return (
+            torch.zeros(3, dtype=torch.int32, device=device),
+            chunk.position_ids,
+            torch.tensor([0, 2], dtype=torch.int64, device=device),
+            np.zeros(2, dtype=np.int32),
+        )
+
+    proposer._prepare_draft_inputs = prepare
+    forwarded = {}
+
+    def forward_draft(**kwargs):
+        forwarded.update(kwargs)
+        return (
+            torch.tensor([[7.0], [20.0]], device=device),
+            torch.zeros((2, 1), device=device),
+        )
+
+    proposer._forward_draft = forward_draft
+    proposer._draft_gather_carries = lambda hidden, positions, last_hidden, *_: (
+        hidden,
+        positions[:2],
+        last_hidden,
+    )
+    proposer._draft_propose_token = lambda last_hidden: last_hidden[:, 0].to(
+        torch.int32
+    )
+
+    drafts = proposer.propose(
+        sampled_token_ids=[[101], [202]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+    )
+
+    # K=1 runs no fused loop.
+    assert decisions == [False]
+    assert forwarded["step0_gather_indices"] is padded
+    assert proposer._step0_pad_len == 0
+    assert proposer._last_step0_gather_indices is None
+    assert drafts == [[7], [20]]
+
+
+def _seed_precompile_pairs(monkeypatch, *, lockstep, dp_step_max_reqs):
+    """Run _precompile_draft_seed with its compiled programs replaced by
+    recorders, and return the (request bucket, loop bucket) pairs it warms the
+    async draft-input prep at. Loop buckets: 1-2 requests -> 2, 3-4 -> 4,
+    5-8 -> 8."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner = SimpleNamespace(
+        num_tokens_paddings=[2, 4, 8, 16, 32],
+        num_reqs_paddings=[2, 4, 8],
+        max_num_reqs=8,
+        num_reqs_max_model_len=8,
+        most_model_len=None,
+        uses_mrope=False,
+        device=torch.device("cpu"),
+        # No step has run at warm-up; _dp_coordinated_step has not set it.
+        _dp_step_max_reqs=dp_step_max_reqs,
+        _precompile_timed=lambda name: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(proposer, "_dp_lockstep_sharded", lambda: lockstep)
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
+    pairs = set()
+
+    def async_prep(ids, next_tokens, draft_lengths, qsl, pad_req_idx, *rest):
+        pairs.add((next_tokens.shape[0], pad_req_idx.shape[0]))
+        return ()
+
+    monkeypatch.setattr(proposer, "_draft_async_prepare_inputs", async_prep)
+    for name in (
+        "_draft_seed_input_ids",
+        "_draft_loop_seq_lens",
+        "_draft_add_delta",
+        "_draft_stack_tokens",
+    ):
+        monkeypatch.setattr(proposer, name, lambda *a, **k: ())
+    proposer._precompile_draft_seed()
+    return pairs
+
+
+@pytest.mark.parametrize("dp_step_max_reqs", [0, 1])
+def test_seed_precompile_under_lockstep_warms_every_reachable_loop_bucket(
+    monkeypatch, dp_step_max_reqs
+):
+    """Under EP-DP lockstep a chunk's loop bucket follows the step's DP-wide
+    largest chunk, so a chunk of r requests can take the bucket of any count
+    from r to max_num_reqs. The warm-up runs before any step has set that
+    bound, so it must list those buckets rather than ask _loop_bucket, whose
+    per-step assert would refuse 2 requests against a bound of 1."""
+    pairs = _seed_precompile_pairs(
+        monkeypatch, lockstep=True, dp_step_max_reqs=dp_step_max_reqs
+    )
+    assert pairs == {(2, 2), (2, 4), (2, 8), (4, 4), (4, 8), (8, 8)}
+
+
+def test_seed_precompile_off_lockstep_warms_each_count_at_its_loop_bucket(
+    monkeypatch,
+):
+    pairs = _seed_precompile_pairs(monkeypatch, lockstep=False, dp_step_max_reqs=0)
+    assert pairs == {(2, 2), (4, 4), (8, 8)}
+
+
+def test_max_loop_bucket_is_static_under_lockstep():
+    """The largest loop bucket does not depend on one step's DP bound, while
+    _loop_bucket keeps main's per-step assert."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner = SimpleNamespace(
+        num_tokens_paddings=[2, 4, 8, 16, 32],
+        num_reqs_paddings=[2, 4, 8],
+        max_num_reqs=8,
+        _dp_step_max_reqs=1,
+    )
+    proposer._dp_lockstep_sharded = lambda: True
+    assert proposer._max_loop_bucket() == 8
+    with pytest.raises(AssertionError, match="DP-coordinated per-chunk bound is 1"):
+        proposer._loop_bucket(2)

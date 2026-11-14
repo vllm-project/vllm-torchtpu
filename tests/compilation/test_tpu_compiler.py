@@ -1028,3 +1028,119 @@ def test_deserialize_entry_does_not_copy_the_entry():
             raise AssertionError("replay must not deepcopy the entry")
 
     assert _deserialize_entry(Entry())(2, 3, 7) == 12
+
+
+def _sp_chunk_graph(size: int, tp: int = 8, hidden: int = 16):
+    """A Dynamo-style graph doing sequence-parallel size arithmetic.
+
+    Each rank takes `s // tp` rows, then an all-gather writes them into a
+    `torch.empty` of `s // tp * tp` rows that is narrowed back to `s`, as
+    vLLM's `_all_gather_out_place` does (a copy_ stands in for the collective).
+    Nothing ties `s` to a concrete tensor dim, so the buffer size is static
+    only if `s` itself is.
+    """
+    import operator
+
+    import torch
+    from torch import fx
+    from torch._dynamo.source import ConstantSource
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    shape_env = ShapeEnv()
+    s_val = shape_env.create_symintnode(
+        shape_env.create_symbol(size, ConstantSource("s72")), hint=size
+    )
+    with FakeTensorMode(shape_env=shape_env):
+        x_val = torch.empty(s_val, hidden)
+
+    g = fx.Graph()
+    s = g.placeholder("s72")
+    s.meta["example_value"] = s_val
+    x = g.placeholder("l_hidden_states_")
+    x.meta["example_value"] = x_val
+    rows = g.call_function(operator.floordiv, (s, tp))
+    shards = g.call_method("reshape", (x, tp, rows, hidden))
+    shard = g.call_function(operator.getitem, (shards, 0))
+    total = g.call_function(operator.mul, (rows, tp))
+    buf = g.call_function(torch.empty, ([total, hidden],), {"dtype": torch.float32})
+    gathered = g.call_method("copy_", (buf, g.call_method("repeat", (shard, tp, 1))))
+    g.output(g.call_method("narrow", (gathered, 0, 0, s)))
+    return fx.GraphModule(torch.nn.Module(), g)
+
+
+def _static_tpu_backend(graph, example_inputs):
+    """TpuBackend's aot_autograd setup, refusing symbolic sizes as fx_to_mlir
+    does ("SymIntArrayRef expected to contain only concrete integers")."""
+    from torch._dynamo.backends.common import aot_autograd
+    from torch._functorch.aot_autograd import make_boxed_func
+    from torch._functorch.partitioners import min_cut_rematerialization_partition
+    from torch.fx.experimental.symbolic_shapes import free_symbols
+
+    def fw_compiler(fw_graph, _inputs):
+        for node in fw_graph.graph.nodes:
+            if node.op == "call_function":
+                assert not free_symbols(node.meta.get("val")), node.format_node()
+        return make_boxed_func(fw_graph.forward)
+
+    return aot_autograd(
+        fw_compiler=fw_compiler,
+        partition_fn=min_cut_rematerialization_partition,
+        keep_inference_input_mutations=False,
+    )(graph, example_inputs)
+
+
+class TestSingleSizeCompile:
+    @pytest.mark.parametrize("entry_point", ["compile", "load"])
+    def test_token_count_reaches_the_backend_as_a_constant(
+        self, monkeypatch, tmp_path, entry_point
+    ):
+        """vLLM hands a single-size compile concrete ints, but aot_autograd
+        turns int inputs back into SymInts. `load` recompiles the same way
+        when its artifact is missing."""
+        import torch
+        from vllm.compilation.piecewise_backend import create_concrete_args
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", _static_tpu_backend)
+        size = 512
+        graph = _sp_chunk_graph(size)
+        args = create_concrete_args(graph, size)
+        compiler = tpu_compiler.TpuCompilerAdaptor()
+        if entry_point == "compile":
+            fn, _ = compiler.compile(graph, args, {}, Range(size, size))
+        else:
+            handle = ("key", str(tmp_path / "missing"), False)
+            fn = compiler.load(handle, graph, args, 0, Range(size, size))
+
+        x = torch.randn(size, 16)
+        torch.testing.assert_close(fn(size, x), graph(size, x))
+        # Only the compiled copy is rewritten; vLLM keeps its own graph.
+        assert len(next(iter(graph.graph.nodes)).users) == 2
+
+
+class TestShapeVariantsWarmupBypass:
+    def test_in_warmup_guard_and_sp_row_check(self, monkeypatch):
+        """A trace outside shape_variants.warmup() takes the caller's
+        sequence-parallel decision; inside it, the trace compares its own
+        token count with the SP row minimum."""
+        import torch
+
+        from vllm_torchtpu.compilation import shape_variants
+        from vllm_torchtpu.models.vllm import qwen3_next_patch as patch_mod
+
+        assert not shape_variants.in_warmup()
+        with shape_variants.warmup():
+            assert shape_variants.in_warmup()
+        assert not shape_variants.in_warmup()
+
+        monkeypatch.setattr(patch_mod.sequence_parallel, "is_active", lambda: True)
+        monkeypatch.setattr(patch_mod.sequence_parallel, "min_rows", lambda: 512)
+        assert not patch_mod._rows_are_sequence_parallel(4)
+        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+        assert patch_mod._rows_are_sequence_parallel(4)
+        with shape_variants.warmup():
+            assert not patch_mod._rows_are_sequence_parallel(4)
+            assert patch_mod._rows_are_sequence_parallel(512)

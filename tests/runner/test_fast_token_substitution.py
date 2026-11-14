@@ -51,6 +51,8 @@ def test_substitution_disabled_by_default():
         _pre_async_results=SimpleNamespace(
             next_tokens_tpu=torch.tensor([101, 102, 103, 104], dtype=torch.int64)
         ),
+        _registered_h2d_sources=set(),
+        _unfenced_h2d_sources=[],
     )
     input_ids = torch.tensor([-1, -1, -1, -1], dtype=torch.int32)
     cur_indices = np.array([0, 1, 2, 3], dtype=np.int32)
@@ -91,21 +93,48 @@ def test_substitution_enabled_fast_path():
         assert torch.equal(out, torch.tensor([201, 202, 203, 204], dtype=torch.int32))
 
 
+def test_spec_verify_step_skips_the_fast_slice():
+    """A spec-verify step (spec_decode_metadata set) goes through the
+    substitution kernel even when the fast slice would apply: the verify path
+    needs the substituted ids (and, on TPU, the fused draft-token extract), not
+    a slice view of the previous step's tokens."""
+    runner = SimpleNamespace(
+        _fast_token_substitution=True,
+        device=torch.device("cpu"),
+        _pre_async_results=SimpleNamespace(
+            next_tokens_tpu=torch.tensor([201, 202, 203, 204], dtype=torch.int64)
+        ),
+    )
+    input_ids = torch.tensor([-1, -1, -1, -1], dtype=torch.int32)
+    indices = np.array([0, 1, 2, 3], dtype=np.int32)
+    metadata = SimpleNamespace(
+        final_logits_indices=torch.arange(4, dtype=torch.int32),
+        target_logits_indices=torch.arange(4, dtype=torch.int32),
+    )
+
+    with patch(
+        "vllm_torchtpu.runner.tpu_runner._substitute_placeholder_token"
+    ) as mock_kernel:
+        mock_kernel.return_value = torch.tensor([201, 202, 203, 204], dtype=torch.int32)
+        TPUModelRunner._apply_async_token_substitution(
+            runner, input_ids, indices, indices.copy(), spec_decode_metadata=metadata
+        )
+        assert mock_kernel.called
+
+
 def test_substitute_placeholder_token_rejects_mismatched_lengths():
-    """The length check names all three lengths."""
+    """The shape check names the index rows' shape and the input length."""
     with (
         torch.compiler.set_stance("force_eager"),
         pytest.raises(
             AssertionError,
-            match=r"placeholder substitution inputs must share one length: "
-            r"input_ids\.shape\[0\]=4, "
-            r"token_in_tpu_cur_input_indices\.shape\[0\]=3, "
-            r"token_in_tpu_pre_next_tokens_indices\.shape\[0\]=4",
+            match=r"placeholder substitution indices must be \[2, len\(input_ids\)\]: "
+            r"substitution_indices\.shape=\(2, 3\), "
+            r"input_ids\.shape\[0\]=4",
         ),
     ):
         _substitute_placeholder_token(
             torch.zeros(4, dtype=torch.int32),
-            torch.zeros(3, dtype=torch.int32),
-            torch.zeros(4, dtype=torch.int32),
+            torch.zeros((2, 3), dtype=torch.int32),
             torch.zeros(2, dtype=torch.int32),
         )

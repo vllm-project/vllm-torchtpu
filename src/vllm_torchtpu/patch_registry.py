@@ -157,6 +157,7 @@ PATCHES = (
     Patch(
         "vllm_torchtpu.models.vllm.qwen3_next_patch:maybe_patch_qwen3_next",
         ("platform_activation", "model_load"),
+        model_config=True,
     ),
     Patch(
         "vllm_torchtpu.models.vllm.qwen2_patch:maybe_patch_qwen2",
@@ -165,6 +166,12 @@ PATCHES = (
     ),
     Patch(
         "vllm_torchtpu.models.vllm.qwen3_5_patch:maybe_patch_qwen3_5_attn_moe_overlap",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.models.qwen3_5.kernels.fused_qk_norm_rope:"
+        "maybe_install_qk_norm_rope_patch",
         ("platform_activation", "model_load"),
         model_config=True,
     ),

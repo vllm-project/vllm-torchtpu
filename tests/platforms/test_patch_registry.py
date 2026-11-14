@@ -245,6 +245,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen3_next",
         "maybe_patch_qwen2",
         "maybe_patch_qwen3_5_attn_moe_overlap",
+        "maybe_install_qk_norm_rope_patch",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
 
@@ -387,11 +388,11 @@ def test_sequence_parallel_moe_admission(monkeypatch):
     )
     assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_tp1)
 
-    # EP=True, TP=8, DP=2 -> False
+    # EP=True, TP=8, DP=2 -> True (attention data parallelism over EP ranks)
     cfg_dp2 = Mock(
         enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=2
     )
-    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_dp2)
+    assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_dp2)
 
     # EP=True, TP=8, DP=1 -> True
     cfg_sp = Mock(

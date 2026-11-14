@@ -389,3 +389,61 @@ def test_spec_decode_metadata_cache_miss_on_changed_inputs(device):
             f"{f} differs from uncached build"
         )
     assert np.array_equal(m2.draft_lengths_cpu, nd2)
+
+
+@pytest.mark.tpu_test
+def test_spec_decode_metadata_deferred_draft_token_ids_and_lru_cache(device):
+    input_ids = torch.arange(1, 21, dtype=torch.int32)
+    manager = _fresh_metadata_manager(device, input_ids)
+    nd1 = np.array([3, 2], dtype=np.int32)
+    cu1 = np.array([4, 7], dtype=np.int32)
+    nd2 = np.array([2, 2], dtype=np.int32)
+    cu2 = np.array([3, 6], dtype=np.int32)
+
+    m1 = manager.get_spec_decode_metadata(nd1, cu1, 4)
+    manager.get_spec_decode_metadata(nd2, cu2, 4)
+
+    # Alternating back to (nd1, cu1) misses the one-entry cache, hits
+    # _meta_lru_cache and reuses the index tensors. With deferral the drafts
+    # are not uploaded: their host copy is kept for the caller instead.
+    m1_cached = manager.get_spec_decode_metadata(
+        nd1, cu1, 4, defer_draft_token_ids=True
+    )
+    for f in (
+        "draft_lengths",
+        "target_logits_indices",
+        "bonus_logits_indices",
+        "final_logits_indices",
+        "segment_ids",
+        "group_indices",
+    ):
+        assert getattr(m1_cached, f) is getattr(m1, f), f"{f} not reused from LRU"
+    assert m1_cached.draft_lengths_cpu is m1.draft_lengths_cpu
+    assert m1_cached.draft_token_ids is None
+    assert m1_cached.deferred_draft_token_ids_cpu is not None
+    assert np.array_equal(
+        m1_cached.deferred_draft_token_ids_cpu, m1.draft_token_ids.cpu().numpy()
+    )
+    assert m1_cached.max_draft_input_index == m1.max_draft_input_index
+
+
+def test_metadata_uploads_are_released_at_the_runner_fence():
+    """The manager's temporary uploads go through the runner's input-staging
+    fence (stage_h2d_upload), which releases each source once the fence is
+    waited on, instead of a keepalive list that nothing clears."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.runner import speculative_decoding_manager as sdm
+
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+        _free_h2d_sources={},
+    )
+    host = torch.arange(4, dtype=torch.int32)
+    out = sdm._h2d_temp(runner, host)
+
+    assert torch.equal(out, host)
+    assert [entry[0] for entry in runner._unfenced_h2d_sources] == [host]
+    assert not hasattr(runner, "_h2d_keepalive")
