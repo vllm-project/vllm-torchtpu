@@ -57,6 +57,13 @@ if TYPE_CHECKING:
         _tpu_fused_w13_scale: torch.Tensor
         _tpu_fused_w2_scale: torch.Tensor
         _rhs_quant_dtype: Any
+        _gmm_primary_experts: int | None
+        _lowtok_owned: int
+        _lowtok_has_copies: bool
+        _lowtok_tables: torch.Tensor
+        _lowtok_prim: torch.Tensor
+        _lowtok_copy: torch.Tensor
+        _lowtok_hot1h: torch.Tensor
 
     class TpuLinear(LinearBase):
         """Typing-only view of a LinearBase layer with the parameters and

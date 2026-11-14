@@ -42,6 +42,25 @@ post-processing it. A layer qualifies when its MoE runner computes the router
 logits from a gate it holds and selects among single experts rather than
 groups of them (DeepSeek-V4, GLM-5 and Qwen3-MoE, for example).
 
+Copy slots (optional). A table may also give every rank `copies_per_rank`
+more slots after its primaries, each holding a redundant copy of another
+rank's expert:
+
+    {"experts": 512, "shards": 8, "copies_per_rank": 4,
+     "layers": {"0": [[...64 primaries..., ...4 copies...], ...8 ranks...]},
+     "copy_order": {"0": [463, 367, ...the layer's copied experts...]}}
+
+The first experts / shards ids of every rank are the permutation above,
+checked exactly as without copies; the router, the slot numbering and every
+kernel but the few-token MoE kernel see only those primaries. A copied expert
+has one copy, on a rank that does not hold it as a primary. `copy_order`
+lists each layer's copied experts hottest first (the few-token kernel's
+preference); without it the copy slots are taken in rank order. Copy slots
+change how many experts a rank holds, which vLLM fixes when it allocates the
+layer's weights, before `apply` runs, so a table with copies also installs
+`install_copy_slot_hook`. A table without the two keys is the permutation
+table above, parsed and applied exactly as before.
+
 Every MoE kernel then sees an ordinary layer whose experts sit in contiguous
 blocks, so no kernel and no compiled program changes. The router computes the
 same scores in slot order, so tokens select the same experts with the same
@@ -56,7 +75,7 @@ import functools
 import json
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -81,6 +100,10 @@ _GCS_READ_TIMEOUT_S = 120
 EXPERT_ORDER_ATTR = "_tpu_expert_order"
 # Set on a placed RoutedExperts layer once its router is in slot order.
 ROUTER_RENUMBERED_ATTR = "_tpu_router_renumbered"
+# Set on a RoutedExperts layer whose weights carry redundant expert copies after
+# the rank's primary experts: the number of primary slots. Unset, every slot is
+# a primary (main's permutation tables never set it).
+PRIMARY_EXPERTS_ATTR = "_tpu_primary_experts"
 
 # Layer index -> the EP rank whose slots this process's expert map holds, for
 # every layer whose expert map follows the placement. The fetch-time filter
@@ -98,14 +121,60 @@ class Placement:
     experts: int
     shards: int
     layers: dict[int, tuple[tuple[int, ...], ...]]
+    # Copy slots after every rank's primaries, and per layer the copied
+    # experts hottest first (absent: the copy slots in rank order).
+    copies_per_rank: int = 0
+    copy_order: dict[int, tuple[int, ...]] = field(default_factory=dict)
+
+    @property
+    def per_rank(self) -> int:
+        """Primary slots per rank: experts / shards."""
+        return self.experts // self.shards
+
+    @property
+    def slots_per_rank(self) -> int:
+        """Every slot a rank holds: its primaries, then its copies."""
+        return self.per_rank + self.copies_per_rank
 
     def ranks(self, layer: int) -> tuple[tuple[int, ...], ...] | None:
-        """Per rank, the global experts it holds in slot order; None if unlisted."""
+        """Per rank, the global experts it holds in slot order (primaries, then
+        copies); None if unlisted."""
         return self.layers.get(layer)
 
     def slot_order(self, layer: int) -> tuple[int, ...]:
-        """Entry s: the expert in slot s, r * (experts / shards) + j."""
-        return tuple(e for held in self.layers[layer] for e in held)
+        """Entry s: the primary expert in slot s, r * (experts / shards) + j."""
+        n = self.per_rank
+        return tuple(e for held in self.layers[layer] for e in held[:n])
+
+    def virtual_ids(self, layer: int) -> dict[int, int]:
+        """Global expert -> its primary slot r * (experts / shards) + j, the id
+        the renumbered router gives it."""
+        return {e: s for s, e in enumerate(self.slot_order(layer))}
+
+    def holder_tables(
+        self, layer: int, rank: int
+    ) -> tuple[list[int], list[int], list[int]]:
+        """For the few-token kernel, in primary (router) ids: rank `rank`'s slot
+        -> id table (primaries, then its copies), and per id the rank of its
+        primary and of its copy (-1 without one)."""
+        vid = self.virtual_ids(layer)
+        n = self.per_rank
+        prim = [v // n for v in range(self.experts)]
+        copy = [-1] * self.experts
+        for r, held in enumerate(self.layers[layer]):
+            for e in held[n:]:
+                copy[vid[e]] = r
+        gid = [vid[e] for e in self.layers[layer][rank]]
+        return gid, prim, copy
+
+    def hot_order(self, layer: int) -> list[int]:
+        """The layer's copied experts in primary ids, hottest first: the
+        table's copy_order, else the copy slots in rank order."""
+        vid = self.virtual_ids(layer)
+        if layer in self.copy_order:
+            return [vid[e] for e in self.copy_order[layer]]
+        n = self.per_rank
+        return [vid[e] for held in self.layers[layer] for e in held[n:]]
 
     def slot_table(self, layer: int) -> list[int]:
         """Entry e: the slot holding expert e."""
@@ -131,6 +200,12 @@ def parse(table: dict, source: str = "<dict>") -> Placement:
             f"{shards} ranks"
         )
     per_rank = experts // shards
+    copies = table.get("copies_per_rank", 0)
+    if type(copies) is not int or copies < 0:
+        raise ValueError(
+            f"expert placement {source}: copies_per_rank must be a non-negative "
+            f"integer, not {copies!r}"
+        )
     layers = {}
     for key, ranks in table["layers"].items():
         try:
@@ -145,19 +220,85 @@ def parse(table: dict, source: str = "<dict>") -> Placement:
             raise ValueError(
                 f"expert placement {source}: layer {layer} is listed twice"
             )
-        if len(ranks) != shards or any(len(held) != per_rank for held in ranks):
+        slots = per_rank + copies
+        if len(ranks) != shards or any(len(held) != slots for held in ranks):
             raise ValueError(
                 f"expert placement {source}: layer {key} must list {shards} "
-                f"ranks of {per_rank} experts each"
+                f"ranks of {slots} experts each"
             )
         ranks = tuple(tuple(int(e) for e in held) for held in ranks)
-        if sorted(e for held in ranks for e in held) != list(range(experts)):
+        if sorted(e for held in ranks for e in held[:per_rank]) != list(range(experts)):
             raise ValueError(
                 f"expert placement {source}: layer {key} must hold each of the "
                 f"{experts} experts exactly once"
             )
+        if copies:
+            _check_copies(source, key, ranks, experts, per_rank)
         layers[layer] = ranks
-    return Placement(experts=experts, shards=shards, layers=layers)
+    copy_order = _parse_copy_order(source, table.get("copy_order"), layers, per_rank)
+    return Placement(
+        experts=experts,
+        shards=shards,
+        layers=layers,
+        copies_per_rank=copies,
+        copy_order=copy_order,
+    )
+
+
+def _check_copies(source, key, ranks, experts, per_rank) -> None:
+    """Every copy slot holds an in-range expert that its rank does not hold as
+    a primary, and each copied expert has exactly one copy."""
+    copied = []
+    for r, held in enumerate(ranks):
+        own = set(held[:per_rank])
+        for e in held[per_rank:]:
+            if not 0 <= e < experts:
+                raise ValueError(
+                    f"expert placement {source}: layer {key} rank {r} copies "
+                    f"expert {e}, outside 0..{experts - 1}"
+                )
+            if e in own:
+                raise ValueError(
+                    f"expert placement {source}: layer {key} rank {r} copies "
+                    f"its own primary expert {e}"
+                )
+            copied.append(e)
+    if len(copied) != len(set(copied)):
+        raise ValueError(
+            f"expert placement {source}: layer {key} copies an expert twice; "
+            "each copied expert has one copy"
+        )
+
+
+def _parse_copy_order(source, raw, layers, per_rank) -> dict[int, tuple[int, ...]]:
+    """`copy_order`: per listed layer, exactly its copied experts."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"expert placement {source}: copy_order must be an object")
+    order = {}
+    for key, experts in raw.items():
+        try:
+            layer = int(key)
+        except ValueError:
+            raise ValueError(
+                f"expert placement {source}: copy_order key {key!r} is not a "
+                "layer index"
+            ) from None
+        if layer not in layers:
+            raise ValueError(
+                f"expert placement {source}: copy_order lists layer {key}, "
+                "which the table does not place"
+            )
+        experts = tuple(int(e) for e in experts)
+        copied = sorted(e for held in layers[layer] for e in held[per_rank:])
+        if sorted(experts) != copied:
+            raise ValueError(
+                f"expert placement {source}: copy_order for layer {key} must "
+                "list exactly the layer's copied experts"
+            )
+        order[layer] = experts
+    return order
 
 
 def _read(uri: str) -> str:
@@ -256,6 +397,52 @@ def has_applied_layers() -> bool:
     return bool(_APPLIED_LAYERS)
 
 
+def _require() -> Placement:
+    placement = current()
+    if placement is None:
+        raise RuntimeError("no expert placement: TPU_EXPERT_PLACEMENT is unset")
+    return placement
+
+
+# The table's facts by the names the few-token MoE kernel and the MoE methods
+# ask for them; all but has_copies and placed need a table.
+def has_copies() -> bool:
+    """Whether the table gives the ranks copy slots after their primaries."""
+    placement = current()
+    return placement is not None and placement.copies_per_rank > 0
+
+
+def placed(name: str) -> bool:
+    """Whether the table places the layer a prefix or tensor name belongs to."""
+    return placed_ranks(name) is not None
+
+
+def shards() -> int:
+    return _require().shards
+
+
+def global_count() -> int:
+    return _require().experts
+
+
+def owned() -> int:
+    """Primary slots per rank, the slots the router and the other kernels see."""
+    return _require().per_rank
+
+
+def slots() -> int:
+    """Every slot a rank holds, primaries then copies."""
+    return _require().slots_per_rank
+
+
+def holder_tables(layer: int, rank: int) -> tuple[list[int], list[int], list[int]]:
+    return _require().holder_tables(layer, rank)
+
+
+def hot_order(layer: int) -> list[int]:
+    return _require().hot_order(layer)
+
+
 def fetch_filter_ids(name: str) -> frozenset[int] | None:
     """The experts the fetch-time filter keeps for this tensor's layer.
 
@@ -336,7 +523,9 @@ def apply(runner) -> bool:
     rank = manager.ep_rank
     held = ranks[rank]
     if len(held) != manager.local_num_experts:
-        # A permutation keeps every rank's expert count, so only the map moves.
+        # A permutation keeps every rank's expert count, so only the map moves;
+        # copy slots add to it, which install_copy_slot_hook gave the layer
+        # before its weights were allocated.
         raise ValueError(
             f"expert placement: {name} holds {manager.local_num_experts} "
             f"experts on rank {rank}, the placement {len(held)}"
@@ -354,6 +543,10 @@ def apply(runner) -> bool:
     manager._expert_map = expert_map.to(device)
     layer.update_expert_map_info()
     setattr(layer, EXPERT_ORDER_ATTR, placement.slot_order(layer_idx))
+    if placement.copies_per_rank:
+        # The copies follow the primaries; every kernel but the few-token one
+        # serves the primaries alone.
+        setattr(layer, PRIMARY_EXPERTS_ATTR, placement.per_rank)
     _APPLIED_LAYERS[layer_idx] = rank
     logger.info_once(
         "Expert placement %s applied: rank %d of %d, %d placed layers",
@@ -363,6 +556,110 @@ def apply(runner) -> bool:
         len(placement.layers),
     )
     return True
+
+
+# The layer prefix FusedMoEFactory is building, for the map manager it creates.
+_FACTORY_PREFIX = ""
+
+
+def install_copy_slot_hook() -> bool:
+    """Size a copies table's MoE layers before vLLM allocates their weights.
+
+    A table with copy slots gives every rank `slots_per_rank` slots, its
+    primaries and then its copies, which is more than the checkpoint's
+    experts / shards. vLLM allocates a MoE layer's expert weights inside
+    `FusedMoEFactory`, sized by `ExpertMapManager.local_num_experts`, before
+    the TPU MoE runner (where `apply` runs) exists, and vLLM 0.33 has no
+    extension point that sees the layer's name before that allocation. So,
+    for a table with copies only, this wraps the factory (by every name it is
+    already bound to) to remember the layer's prefix, and
+    `ExpertMapManager._calculate_expert_maps` to give a placed layer the
+    table's slot count and its expert map of primaries and copies. A
+    permutation-only table, or no table, installs nothing: `apply` serves it
+    exactly as before. Returns whether the hook is installed.
+    """
+    placement = current()
+    if placement is None or not placement.copies_per_rank:
+        return False
+    import inspect
+    import sys
+
+    from vllm.model_executor.layers import fused_moe as fused_pkg
+    from vllm.model_executor.layers.fused_moe import expert_map_manager as emm
+    from vllm.model_executor.layers.fused_moe import layer as fused_layer
+
+    if getattr(fused_layer, "_tpu_copy_slot_hook", False):
+        return True
+    original_factory = fused_layer.FusedMoEFactory
+    original_calc = emm.ExpertMapManager._calculate_expert_maps
+    signature = inspect.signature(original_factory)
+
+    def FusedMoEFactory(*args, **kwargs):
+        global _FACTORY_PREFIX
+        bound = signature.bind_partial(*args, **kwargs)
+        _FACTORY_PREFIX = str(bound.arguments.get("prefix", "") or "")
+        try:
+            return original_factory(*args, **kwargs)
+        finally:
+            _FACTORY_PREFIX = ""
+
+    def _calculate_expert_maps(self) -> None:
+        original_calc(self)
+        _size_copy_slots(self, _FACTORY_PREFIX)
+
+    fused_layer.FusedMoEFactory = FusedMoEFactory
+    fused_pkg.FusedMoEFactory = FusedMoEFactory
+    name = "FusedMoEFactory"  # rebound in every model module that imported it
+    for module in list(sys.modules.values()):
+        if getattr(module, name, None) is original_factory:
+            setattr(module, name, FusedMoEFactory)
+    emm.ExpertMapManager._calculate_expert_maps = _calculate_expert_maps
+    # vLLM's module does not declare this marker; the hook adds it at runtime.
+    # pyrefly: ignore[missing-attribute]
+    fused_layer._tpu_copy_slot_hook = True
+    logger.info(
+        "Expert placement %s has %d copy slots per rank: MoE layers it places "
+        "are sized to %d slots before their weights are allocated.",
+        envs.TPU_EXPERT_PLACEMENT,
+        placement.copies_per_rank,
+        placement.slots_per_rank,
+    )
+    return True
+
+
+def patch_copy_slot_hook() -> None:
+    """The patch registry's entry: install the hook when the table has copies
+    (a no-op otherwise, at every stage)."""
+    install_copy_slot_hook()
+
+
+def _size_copy_slots(manager, prefix: str) -> None:
+    """A placed layer's slot count and expert map (primaries, then copies),
+    set where vLLM computes them; other layers keep vLLM's."""
+    placement = current()
+    if placement is None or not prefix or not manager.use_ep:
+        return
+    ranks = placed_ranks(prefix)
+    if ranks is None:
+        return
+    if manager.ep_size != placement.shards or (
+        manager.global_num_experts != placement.experts
+    ):
+        raise ValueError(
+            f"expert placement {envs.TPU_EXPERT_PLACEMENT} is for "
+            f"{placement.shards} ranks x {placement.experts} experts; {prefix} "
+            f"has {manager.ep_size} x {manager.global_num_experts}"
+        )
+    held = ranks[manager.ep_rank]
+    device = (
+        manager._expert_map.device
+        if manager._expert_map is not None
+        else torch.device("cpu")
+    )
+    expert_map = torch.full((placement.experts,), -1, dtype=torch.int32)
+    expert_map[list(held)] = torch.arange(len(held), dtype=torch.int32)
+    manager._expert_map = expert_map.to(device)
+    manager._local_num_experts = len(held) + manager.num_fused_shared_experts
 
 
 @functools.cache

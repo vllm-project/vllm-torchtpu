@@ -1,0 +1,284 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The Qwen3.5 config hook: TPU serving defaults for Qwen3.5 engines.
+
+``TPUQwen35MoeConfig`` is registered in vLLM's ``MODELS_CONFIG_MAP`` for the
+architectures in ``settings.ARCHITECTURES``, so vLLM calls it from
+``VllmConfig.__post_init__`` (before the platform's
+``check_and_update_config``) for those models only. It keeps vLLM's own
+Qwen3.5 checks, validates ``additional_config["qwen3_5"]``, and applies
+the TPU defaults below. Each default fills a value only when the user left it
+unset, so an explicit command-line value always wins. It also refuses a
+``qwen3_5`` or ``tpu_*`` section of ``additional_config`` that no reader in
+this build claims (``additional_config_sections``).
+
+- ``kv_cache_memory_bytes``: a calibrated budget, only for the checkpoint
+  shape and device it was measured on (Qwen3.5-397B-A17B on TPU7x) and not on
+  a ``kv_producer`` (prefill) leg. Every other engine stays on
+  ``gpu_memory_utilization``, as on main.
+- ``prefix_match_unit``: 128 tokens, only where it was measured: a
+  ``kv_producer`` (prefill) leg without prefill or decode context parallelism
+  (the IX points' PP8 prefill legs), for the same checkpoint shape and device
+  as the budget. Every other engine keeps the unit unset, as on main, so a PCP
+  prefill leg resolves its hash block size from its KV cache groups as on main.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from vllm.model_executor.models.config import Qwen3_5ForConditionalGenerationConfig
+
+from vllm_torchtpu import additional_config_sections
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.qwen3_5 import settings
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
+logger = init_logger(__name__)
+
+
+# Baseline expert-slot count per EP rank (64 primary + 16 replicated slots)
+# used as the reference point when computing per-rank HBM KV capacity credit.
+_QWEN35_SAFE_KV_SLOTS = 80
+
+# The budget was measured for this checkpoint shape (Qwen3.5-397B-A17B's text
+# config) on TPU7x devices, the per-device HBM the IX record jobs ran on.
+_CALIBRATED_SHAPE = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
+_CALIBRATED_CHIP = "7x"
+
+
+def _chip_family() -> str | None:
+    """The TPU chip family from the accelerator type ("7x" for tpu7x-8), or
+    None when it cannot be read. Never claims the chips."""
+    try:
+        from vllm_torchtpu import tpu_info
+
+        accelerator_type = tpu_info.get_tpu_type()
+    except Exception:  # noqa: BLE001 - an unknown device is not calibrated
+        return None
+    if not accelerator_type:
+        return None
+    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
+    return {"v7x": "7x"}.get(name, name)
+
+
+def _is_calibrated(model_config) -> bool:
+    """Whether the KV budget below was measured for this engine: the
+    calibrated checkpoint shape on a TPU7x device. Any other shape, a smaller
+    device or an unknown device keeps main's ``gpu_memory_utilization``."""
+    text = getattr(model_config, "hf_text_config", None)
+    for key, value in _CALIBRATED_SHAPE.items():
+        if getattr(text, key, None) != value:
+            return False
+    return _chip_family() == _CALIBRATED_CHIP
+
+
+def _expert_slots_and_layers(model_config, parallel_config) -> tuple[int, int]:
+    """(slots, layers): the expert slots each EP rank holds and the MoE layers
+    that hold them. With a placement table (TPU_EXPERT_PLACEMENT), its slots
+    per rank (primaries and copy slots) over its placed layers; without one,
+    num_experts / EP in every layer."""
+    from vllm_torchtpu.layers.adapter import expert_placement
+
+    placement = expert_placement.current()
+    if placement is not None:
+        return placement.slots_per_rank, len(placement.layers)
+    text = model_config.hf_text_config
+    ep = int(parallel_config.tensor_parallel_size) * int(
+        parallel_config.data_parallel_size
+    )
+    return int(text.num_experts) // max(ep, 1), int(text.num_hidden_layers)
+
+
+def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
+    """(credit, slots): HBM bytes per device freed (positive) or taken
+    (negative) by the expert placement holding fewer (more) slots per rank
+    than the placement the Qwen3.5 safe_kv budgets were measured with: one FP8
+    expert (gate|up and down, 3 x hidden x moe_intermediate bytes) per slot
+    per placed MoE layer; and the slot count (for logging)."""
+    try:
+        text = model_config.hf_text_config
+        hidden = int(text.hidden_size)
+        inter = int(text.moe_intermediate_size)
+        slots, layers = _expert_slots_and_layers(model_config, parallel_config)
+        copies = _copy_slots_per_rank()
+    except Exception as e:  # noqa: BLE001 - never block startup on the credit
+        logger.warning("expert-slot KV credit unavailable (%s); using 0.", e)
+        return 0, "?"
+    # A table with copies also budgets the drafter's MoE layer for its copy
+    # slots, as the measured budgets did.
+    slot_layers = (_QWEN35_SAFE_KV_SLOTS - slots) * layers - copies
+    return slot_layers * 3 * hidden * inter, slots
+
+
+def _copy_slots_per_rank() -> int:
+    """The placement table's copy slots per rank, 0 without a table."""
+    from vllm_torchtpu.layers.adapter import expert_placement
+
+    placement = expert_placement.current()
+    return placement.copies_per_rank if placement is not None else 0
+
+
+def _apply_prefix_match_unit(vllm_config: VllmConfig) -> None:
+    # Only a prefill (kv_producer) leg: its prefix hits can then land on any
+    # 128-token boundary inside its large blocks (2176 tokens at the IX
+    # points). A decode leg and a mixed engine keep vLLM's default.
+    kv_cfg = vllm_config.kv_transfer_config
+    if kv_cfg is None or kv_cfg.kv_role != "kv_producer":
+        return
+    cache_config = vllm_config.cache_config
+    if cache_config.prefix_match_unit is not None:
+        return
+    # The IX prefill legs ran PP8 without context parallelism. With the unit
+    # unset, a PCP or DCP leg resolves its hash block size from its KV cache
+    # groups (the platform's PCP and DCP block-size patches); the 128-token
+    # unit was never measured there, nor on another checkpoint shape or device.
+    parallel_config = vllm_config.parallel_config
+    pcp = int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+    dcp = int(getattr(parallel_config, "decode_context_parallel_size", 1) or 1)
+    if pcp != 1 or dcp != 1 or not _is_calibrated(vllm_config.model_config):
+        logger.info(
+            "Qwen3.5 prefix_match_unit left unset on the prefill leg (pcp=%d, "
+            "dcp=%d): the 128-token unit is for Qwen3.5-397B-A17B prefill "
+            "legs without context parallelism on TPU7x.",
+            pcp,
+            dcp,
+        )
+        return
+    cache_config.prefix_match_unit = 128
+
+
+def _apply_kv_budget(vllm_config: VllmConfig) -> None:
+    cache_config = vllm_config.cache_config
+    scheduler_config = vllm_config.scheduler_config
+    parallel_config = vllm_config.parallel_config
+    dcp_size = int(getattr(parallel_config, "decode_context_parallel_size", 1) or 1)
+    # Calibrated for 80 expert slots per rank (64 primary + 16 replicated slots)
+    # while reserving ~2.5 GiB of HBM headroom for runtime activations
+    # and program-load scratch buffers under DCP=1 and DCP>1.
+    if dcp_size == 1 and scheduler_config.max_num_seqs > 16:
+        safe_kv = 32_500_000_000
+    else:
+        safe_kv = 33_500_000_000
+    credit, slots = _expert_slot_kv_credit(vllm_config.model_config, parallel_config)
+    safe_kv += credit
+    # Apply the shape-calibrated HBM KV memory budget unless the caller
+    # passed --kv-cache-memory-bytes.
+    requested = cache_config.kv_cache_memory_bytes
+    keep = requested is not None
+    # The budget is calibrated for a mixed engine. A disagg prefill leg
+    # (PCP shards, prefill-sized activations) OOMs at it, so leave that
+    # leg on gpu_memory_utilization.
+    kv_cfg = vllm_config.kv_transfer_config
+    if kv_cfg is not None and kv_cfg.kv_role == "kv_producer":
+        logger.info(
+            "Qwen3.5-397B kv_cache_memory_bytes left to the prefill "
+            "leg (requested %s; mixed-engine auto would be %d).",
+            requested,
+            safe_kv,
+        )
+        keep = True
+    elif not keep and not _is_calibrated(vllm_config.model_config):
+        logger.info(
+            "Qwen3.5 kv_cache_memory_bytes left to gpu_memory_utilization: the "
+            "calibrated budget is for Qwen3.5-397B-A17B on TPU7x (chip %s).",
+            _chip_family(),
+        )
+        keep = True
+    elif keep or requested != safe_kv:
+        logger.warning(
+            "Qwen3.5-397B kv_cache_memory_bytes %s: requested %s, "
+            "auto %d (slots=%s, dcp=%d, seqs=%d).",
+            "kept (explicit)" if keep else "set to auto",
+            requested,
+            safe_kv,
+            slots,
+            dcp_size,
+            scheduler_config.max_num_seqs,
+        )
+    if not keep:
+        cache_config.kv_cache_memory_bytes = safe_kv
+
+
+def is_measured_target(model_config) -> bool:
+    """Whether this engine serves the checkpoint and device the Qwen3.5 PD
+    stack's kernel levers were measured on: a Qwen3.5 architecture
+    (``settings.is_qwen3_5``) with the calibrated checkpoint shape on TPU7x
+    (``_is_calibrated``, Qwen3.5-397B-A17B). The kernel numerics below and the
+    few-token MoE kernel (``moe_lowtok_scores.enabled``) apply only there.
+
+    Any other Qwen3.5 checkpoint (main's CI model, Qwen3.5-35B-A3B, among
+    them) or device keeps main's arithmetic and code: those levers change the
+    last bits of the forward pass, which is not a free choice where they were
+    not measured. A config without ``architectures`` (the stand-ins callers
+    hand the patch registry) is not a target either."""
+    if getattr(model_config, "architectures", None) is None:
+        return False
+    if not settings.is_qwen3_5(model_config):
+        return False
+    if _is_calibrated(model_config):
+        return True
+    logger.info_once(
+        "Qwen3.5 kernel levers (reciprocal-scale quantize, tuned and streamed "
+        "FP8 MoE grouped matmul, few-token MoE kernel) left at main's "
+        "arithmetic: they were measured for Qwen3.5-397B-A17B on TPU7x only."
+    )
+    return False
+
+
+def apply_kernel_numerics(model_config) -> bool | None:
+    """Qwen3.5's kernel numerics and code paths where they were measured
+    (``is_measured_target``), in every process that loads the model.
+
+    The Qwen3.5 PD stack was tuned and evaluated with the quantize helpers'
+    reciprocal scale (kernels/quantized_matmul/util.RECIPROCAL_SCALE), the
+    grouped matmul's hand-streamed whole-expert slabs
+    (kernels/megablox/gmm_v2.RHS_STREAM), and its tuned FP8 MoE tiling and
+    rhs-scale hoist (gmm_v2.TUNED_FP8_MOE), all off by default; turn them on
+    before the model's kernels are traced. Other models keep main's arithmetic
+    and code. Returns False while no model config is available, so the patch
+    registry tries again at model load.
+    """
+    if model_config is None:
+        return False
+    if is_measured_target(model_config):
+        from vllm_torchtpu.kernels.megablox import gmm_v2
+        from vllm_torchtpu.kernels.quantized_matmul import util
+
+        util.set_reciprocal_scale(True)
+        gmm_v2.set_rhs_stream(True)
+        gmm_v2.set_tuned_fp8_moe(True)
+    return None
+
+
+def apply_serving_defaults(vllm_config: VllmConfig) -> None:
+    """Fill the Qwen3.5 TPU serving defaults the user did not set."""
+    _apply_prefix_match_unit(vllm_config)
+    _apply_kv_budget(vllm_config)
+
+
+class TPUQwen35MoeConfig(Qwen3_5ForConditionalGenerationConfig):
+    """vLLM's Qwen3.5 checks, the Qwen3.5 settings, and the TPU defaults."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: VllmConfig) -> None:
+        Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        # Fails at engine start on a qwen3_5 or tpu_* section this build does
+        # not read, so a deployment never runs silently without it.
+        additional_config_sections.check(vllm_config.additional_config)
+        # Fails at engine start on an unknown setting or a wrongly typed value.
+        settings.get(vllm_config)
+        apply_serving_defaults(vllm_config)
