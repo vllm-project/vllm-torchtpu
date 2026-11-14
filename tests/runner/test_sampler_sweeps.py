@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The sampler-side precompile sweeps (sample_from_logits, gather_logprobs and
-structured_decoding's num_reqs sweep): shape order with and without
-TPU_PARALLEL_PRECOMPILE, and why rotating them is safe."""
+"""The sampler-side precompile sweeps (sample_from_logits, gather_logprobs,
+repetition_penalty and structured_decoding's num_reqs sweep): shape order with
+and without TPU_PARALLEL_PRECOMPILE, and why rotating them is safe."""
 
 import contextlib
 import types
@@ -24,7 +24,7 @@ import torch
 
 from tests.runner.precompile_sweep_checks import ops_outside_aten as _ops_outside_aten
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import CANDIDATE_BLOCK
-from vllm_torchtpu.runner import tpu_runner
+from vllm_torchtpu.runner import repetition_penalty, tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.structured_decoding import StructuredDecodingManager
 
@@ -54,10 +54,14 @@ def _runner(seen):
         gather_logprobs=lambda logits, ids: SimpleNamespace(logprobs=logits),
         structured_decoding_manager=manager,
         speculative_config=None,
+        scheduler_config=SimpleNamespace(async_scheduling=False),
     )
     # The real helper; without a speculative config it yields no verify rows.
     runner._verify_logits_paddings = types.MethodType(
         TPUModelRunner._verify_logits_paddings, runner
+    )
+    runner._repetition_penalty_supported = types.MethodType(
+        TPUModelRunner._repetition_penalty_supported, runner
     )
     return runner
 
@@ -66,11 +70,15 @@ SWEEPS = [
     TPUModelRunner._precompile_sample_from_logits,
     TPUModelRunner._precompile_gather_logprobs,
     TPUModelRunner._precompile_structured_decoding,
+    TPUModelRunner._precompile_repetition_penalty,
 ]
 
 
 def _sweep(monkeypatch, sweep, flag, rank=3):
     monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda out: None)
+    monkeypatch.setattr(
+        repetition_penalty, "apply_repetition_penalty", lambda logits, *_args: logits
+    )
     monkeypatch.setenv("LOCAL_RANK", str(rank))
     # Through the environment, as test_rejection_sampler_sweep does: envs reads
     # it lazily, and undoing a setattr on envs would leave a module attribute
@@ -175,5 +183,11 @@ def test_rotated_sweeps_hold_no_collective():
         torch.zeros(n, vocab // 32, dtype=torch.int32),
         logits,
         torch.arange(32, dtype=torch.int32),
+    )
+    graphs += _trace(
+        repetition_penalty.apply_repetition_penalty,
+        logits,
+        torch.zeros(n, repetition_penalty.num_bitmask_words(vocab), dtype=torch.int32),
+        torch.ones(n, 1),
     )
     assert [op for gm in graphs for op in _ops_outside_aten(gm)] == []
