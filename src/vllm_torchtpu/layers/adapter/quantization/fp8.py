@@ -782,6 +782,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
+    # Token-sharded variant for layers whose model runs sequence-parallel
+    # steps (adaptive_moe.prebuild_sequence_parallel_variant).
+    _adaptive_fused_moe_op_sp: torch.library.CustomOpDef | None = None
 
     def __init__(
         self,
@@ -1076,6 +1079,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 renormalize=layer.renormalize,
                 activation=activation_str,
             )
+            adaptive_moe.prebuild_sequence_parallel_variant(
+                self,
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                activation=activation_str,
+            )
+            adaptive_moe.cache_channel_scales_2d(
+                layer, layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+            )
             return
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
@@ -1131,13 +1144,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
         # so ownership and the path that exercises it cannot disagree.
         if self._use_adaptive_fused_moe:
+            w1_scale, w2_scale = adaptive_moe.runtime_channel_scales(
+                layer, layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+            )
             return adaptive_moe.run_adaptive_fused_moe(
                 self,
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
+                w1_scale,
+                w2_scale,
                 router_logits,
             )
 
