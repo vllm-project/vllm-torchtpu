@@ -864,6 +864,7 @@ def _latent_bf16(slab):
     rows [tokens, 2, 1792] the uncapped consumer reads, decoded in VMEM."""
     tokens = slab.shape[0]
     block = min(tokens, 256)
+    assert tokens % block == 0, "latent_slab_rows decodes whole 256-row blocks"
 
     def kernel(slab_ref, rows_ref):
         values = slab_ref[:, :, pl.ds(0, _SLAB_VALUES)].reshape(block, 4 * _SLAB_VALUES)
