@@ -57,19 +57,10 @@ from transformers import (
     UMT5Config,
     UMT5EncoderModel,
 )
-from vllm.config import VllmConfig
-from vllm.utils.network_utils import get_open_port
 from vllm.utils.torch_utils import set_default_torch_dtype
-from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
     DistributedAutoencoderKLWan,
 )
-from vllm_omni.diffusion.distributed.parallel_state import (
-    destroy_distributed_env,
-    init_distributed_environment,
-    initialize_model_parallel,
-)
-from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_wan_weights_with_optional_gate,
@@ -131,29 +122,6 @@ UMT5_MAX_REL_L2 = (3.6e-3, 7.0e-3)
 UMT5_MAX_ABS = (1.7e-2, 4.4e-2)
 CLIP_MAX_REL_L2 = (3.0e-3, 5.6e-3)
 CLIP_MAX_ABS = (1.8e-2, 6.2e-2)
-
-
-@pytest.fixture(scope="module")
-def omni_ctx():
-    """Single-rank diffusion parallel groups plus a default forward context."""
-    owns_dist_env = not torch.distributed.is_initialized()
-    if owns_dist_env:
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
-            backend="gloo",
-        )
-        initialize_model_parallel(tensor_parallel_size=1, pipeline_parallel_size=1)
-    # vLLM CustomOps (Conv3dLayer, QKVParallelLinear) need a current VllmConfig
-    # at construction time; set_forward_context installs it when provided.
-    with set_forward_context(
-        vllm_config=VllmConfig(), omni_diffusion_config=OmniDiffusionConfig()
-    ):
-        yield
-    if owns_dist_env:
-        destroy_distributed_env()
 
 
 def _build_omni_transformer(config: dict) -> torch.nn.Module:
