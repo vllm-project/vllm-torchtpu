@@ -29,11 +29,15 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.spec_decode import utils as spec_decode_utils
 from vllm_torchtpu.spec_decode.eagle3 import (
+    INVALID_TOKEN_ID,
     DraftChunkInputs,
     Eagle3Proposer,
+    _async_draft_seed_eager,
+    _async_draft_seed_impl,
     _force_draft_tp1,
     _maybe_pad_dim0,
     _static_shape_args,
+    _use_fused_async_draft_seed,
 )
 
 
@@ -305,6 +309,12 @@ def _rank0_pcp_plan() -> SequenceLayoutPlan:
 
 
 class _CarryAggregationAfterGatherPlan:
+    # A non-default (PCP) layout: only those aggregate the gathered carries.
+    descriptor = SequenceLayoutDescriptor(
+        kind=SequenceLayoutKind.PARTIAL,
+        protocol=PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
+    )
+
     def __init__(self, events):
         self._events = events
 
@@ -576,8 +586,11 @@ def test_propose_delegates_carry_aggregation_after_gather():
 
     def record_gather(hidden, positions, last_hidden, gather_indices):
         events.append("gather")
-        assert gather_indices.cpu().tolist() == [0, 2]
-        return (hidden[:2], positions[:2], last_hidden[gather_indices])
+        # propose() passes the raw PCP-localized indices; the compiled gather
+        # clamps -1 (a row this rank does not own) itself.
+        assert gather_indices.cpu().tolist() == [-1, 2]
+        safe = gather_indices.clamp_min(0)
+        return (hidden[:2], positions[:2], last_hidden[safe])
 
     proposer._draft_gather_carries = record_gather
 
@@ -969,6 +982,156 @@ def test_propose_without_aux_hidden_state(device):
     # (single-element, but distinct-valued) aux_hidden_states concatenation.
     assert len(combine_calls) == 1
     assert torch.equal(combine_calls[0], plain_hidden)
+
+
+def _draft_rows_proposer(monkeypatch, enabled=True, **runner):
+    monkeypatch.setenv("VLLM_TPU_MTP_DRAFT_ROWS", "1" if enabled else "0")
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.draft_model = SimpleNamespace(supports_draft_rows=True)
+    proposer.runner = SimpleNamespace(
+        _pcp_enabled=runner.get("pcp", False),
+        _dp_lockstep_enabled=lambda: runner.get("lockstep", False),
+    )
+    proposer._share_mtp_indices = runner.get("share", False)
+    return proposer
+
+
+@pytest.mark.parametrize(
+    "enabled,supported,runner,expected",
+    [
+        (False, True, {}, False),
+        (True, True, {}, True),
+        (True, False, {}, False),
+        (True, True, {"share": True}, False),
+        (True, True, {"pcp": True}, False),
+        (True, True, {"lockstep": True}, False),
+    ],
+)
+def test_resolve_draft_rows(monkeypatch, enabled, supported, runner, expected):
+    proposer = _draft_rows_proposer(monkeypatch, enabled, **runner)
+    proposer.draft_model.supports_draft_rows = supported
+    assert proposer._resolve_draft_rows() is expected
+
+
+def test_propose_with_draft_rows_uses_row_outputs_as_carries():
+    """Step 0 receives last_token_indices as draft_rows and its per-row
+    outputs become the carries; positions are still gathered per token."""
+    import torch._dynamo
+
+    device = torch.device("cpu")
+    torch._dynamo.reset()
+    hidden_size, vocab = 8, 32
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 2
+    proposer._draft_rows = True
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=2),
+        max_num_reqs=16,
+        num_reqs_max_model_len=16,
+        num_reqs_most_model_len=16,
+        num_tokens_paddings=[16],
+        device=device,
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    chunk = _make_chunk(
+        input_ids=torch.zeros(16, dtype=torch.int32, device=device),
+        position_ids=torch.zeros(16, dtype=torch.int32, device=device),
+        query_start_loc_np=np.array([0, 3, 7], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        hidden=hidden_size,
+        device=device,
+        attn_ctx=SimpleNamespace(use_max_model_len=True),
+        hidden_states=torch.zeros(16, hidden_size, device=device),
+    )
+    proposer.draft_chunks = [chunk]
+
+    class _Draft:
+        def compute_logits(self, hidden):
+            # Token = the row's first hidden value.
+            return torch.nn.functional.one_hot(
+                hidden[:, 0].long() % vocab, vocab
+            ).float()
+
+    proposer.draft_model = _Draft()
+    # The compiled helpers need the TPU backend; run their bodies eagerly.
+    proposer._draft_gather_positions = lambda pos, idx: pos.index_select(0, idx)
+    proposer._draft_propose_token = lambda hidden: (
+        proposer.draft_model.compute_logits(hidden).argmax(-1).to(torch.int32)
+    )
+    last = torch.tensor([2, 6, 6, 6], device=device)
+    positions = torch.arange(100, 116, dtype=torch.int32, device=device)
+
+    def _prepare(chunk, *_args, **_kwargs):
+        return (
+            torch.zeros(16, dtype=torch.int32, device=device),
+            positions,
+            last,
+            np.zeros(2, dtype=np.int32),
+        )
+
+    proposer._prepare_draft_inputs = _prepare
+    calls = []
+
+    def _forward_draft(*, input_ids, positions, step_idx, draft_rows=None, **_):
+        calls.append((step_idx, draft_rows, positions.clone()))
+        n = input_ids.shape[0] if draft_rows is None else len(draft_rows)
+        if step_idx == 0:
+            # Padded with -1 to the chunk's request capacity so the traced
+            # program's shape does not depend on the padded request count.
+            assert n == 16
+            value = torch.zeros(16, device=device)
+            value[:2] = torch.tensor([11.0, 22.0], device=device)
+        else:
+            value = torch.full((n,), 5.0 + step_idx, device=device)
+        hidden = value[:, None].expand(n, hidden_size).contiguous()
+        return hidden, hidden
+
+    proposer._forward_draft = _forward_draft
+    drafts = proposer.propose(
+        sampled_token_ids=[[0], [0]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+    )
+    assert drafts == [[11, 6], [22, 6]]
+    assert calls[0][0] == 0 and torch.equal(calls[0][1][:4], last)
+    assert (calls[0][1][4:] == -1).all()
+    # The loop step starts from the gathered step-0 positions, plus one.
+    assert calls[1][1] is None
+    assert calls[1][2][:2].tolist() == [103, 107]
+
+
+@pytest.mark.parametrize(
+    "use_max_model_len, capacity, p", [(True, 16, 4), (False, 8, 16), (True, 4, 4)]
+)
+def test_draft_rows_fixed_length_per_chunk(use_max_model_len, capacity, p):
+    """draft_rows always has the chunk's request capacity as its length
+    (whatever the padded request count p), so every token bucket's compiled
+    draft program sees one static draft_rows shape; outputs go back to p."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.runner = SimpleNamespace(
+        max_num_reqs=32,
+        num_reqs_max_model_len=capacity if use_max_model_len else 32,
+        num_reqs_most_model_len=32 if use_max_model_len else capacity,
+    )
+    chunk = SimpleNamespace(
+        attn_ctx=SimpleNamespace(use_max_model_len=use_max_model_len)
+    )
+    num_rows = proposer._draft_rows_len(chunk)
+    assert num_rows == capacity
+    last = torch.arange(p, dtype=torch.int64) * 3
+    rows = proposer._padded_draft_rows(last, num_rows)
+    assert rows.shape == (capacity,)
+    n = min(p, capacity)
+    assert torch.equal(rows[:n], last[:n])
+    assert (rows[n:] == -1).all()
+    out = torch.arange(capacity * 2, dtype=torch.float32).view(capacity, 2)
+    fitted = proposer._fit_draft_rows_output(out, p)
+    assert fitted.shape == (p, 2)
+    assert torch.equal(fitted[:n], out[:n])
+    assert (fitted[n:] == 0).all()
 
 
 def test_propose_empty_batch():
@@ -2858,3 +3021,97 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     assert seen["names"] == expected
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
+
+
+def _async_seed_inputs(width, num_reqs, qsl_len, draft_dtype):
+    """Rejection-sampler output for K=3 with every accept count 0..3, draft
+    counts of 0..3 per row, and a query_start_loc of `qsl_len` entries."""
+    k = 3
+    rows = []
+    for i in range(width):
+        num_valid = i % (k + 2)  # 0 (all-invalid padding row) .. k+1
+        rows.append(
+            [
+                100 + 10 * i + j if j < num_valid else INVALID_TOKEN_ID
+                for j in range(k + 1)
+            ]
+        )
+    next_tokens = torch.tensor(rows, dtype=torch.int32)
+    num_draft = torch.tensor([i % (k + 1) for i in range(width + 2)], dtype=draft_dtype)
+    query_start_loc = torch.arange(qsl_len, dtype=torch.int32) * (k + 1)
+    return next_tokens, num_draft, query_start_loc
+
+
+@pytest.mark.parametrize("draft_dtype", [torch.int32, torch.int64])
+def test_async_draft_seed_values(draft_dtype):
+    """Hand-computed seed for K=3: accepted prefix 3/1/4 tokens with 3/2/3
+    drafts, one padding row, and a query_start_loc shorter than the bucket."""
+    next_tokens = torch.tensor(
+        [[5, 6, 7, -1], [8, -1, -1, -1], [9, 10, 11, 12], [-1, -1, -1, -1]],
+        dtype=torch.int32,
+    )
+    num_draft = torch.tensor([3, 2, 3, 0], dtype=draft_dtype)
+    query_start_loc = torch.tensor([0, 4, 7, 11], dtype=torch.int32)
+    last_token_indices, next_token_ids, num_rejected = _async_draft_seed_eager(
+        next_tokens, num_draft, query_start_loc, 3, {}
+    )
+    assert last_token_indices.dtype == torch.int64
+    assert next_token_ids.dtype == num_rejected.dtype == torch.int32
+    assert last_token_indices.tolist() == [2, 4, 10, 10]
+    assert next_token_ids.tolist() == [7, 8, 12, 12]
+    assert num_rejected.tolist() == [1, 2, 0, 0]
+
+
+@pytest.mark.parametrize(
+    "width,num_reqs,qsl_len",
+    [
+        (1, 1, 2),
+        (4, 4, 5),  # full batch
+        (8, 3, 9),  # padded tail
+        (8, 5, 6),  # query_start_loc shorter than the request bucket
+    ],
+)
+@pytest.mark.parametrize("draft_dtype", [torch.int32, torch.int64])
+def test_async_draft_seed_traced_matches_eager(width, num_reqs, qsl_len, draft_dtype):
+    """The fullgraph-traced draft seed matches the eager path in values and
+    dtypes."""
+    next_tokens, num_draft, query_start_loc = _async_seed_inputs(
+        width, num_reqs, qsl_len, draft_dtype
+    )
+    expected = _async_draft_seed_eager(
+        next_tokens, num_draft, query_start_loc, num_reqs, {}
+    )
+    traced = torch.compile(_async_draft_seed_impl, backend="eager", fullgraph=True)
+    actual = traced(
+        next_tokens,
+        num_draft,
+        query_start_loc,
+        torch.tensor(num_reqs, dtype=torch.int64),
+    )
+    for a, e in zip(actual, expected, strict=True):
+        assert a.dtype == e.dtype
+        assert torch.equal(a, e)
+
+
+def test_async_draft_seed_eager_applies_overrides():
+    """Partial-prefill overrides replace the seed token, and the padded tail
+    repeats the overridden last row."""
+    next_tokens, num_draft, query_start_loc = _async_seed_inputs(8, 3, 9, torch.int64)
+    base = _async_draft_seed_eager(next_tokens, num_draft, query_start_loc, 3, {})
+    _, next_token_ids, _ = _async_draft_seed_eager(
+        next_tokens, num_draft, query_start_loc, 3, {0: 7, 2: 9}
+    )
+    assert next_token_ids.tolist() == [7, int(base[1][1])] + [9] * 6
+
+
+@pytest.mark.parametrize(
+    "device_type,overrides,fused",
+    [
+        ("tpu", {}, True),
+        ("tpu", {1: 5}, False),  # partial-prefill override
+        ("cpu", {}, False),  # the tpu backend cannot trace CPU tensors
+    ],
+)
+def test_use_fused_async_draft_seed(device_type, overrides, fused):
+    next_tokens = SimpleNamespace(device=SimpleNamespace(type=device_type))
+    assert _use_fused_async_draft_seed(next_tokens, overrides) is fused

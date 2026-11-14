@@ -300,8 +300,47 @@ def _rollback_offsets_migrate_impl(
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
 
 
+def _update_read_offsets_impl(
+    read_offsets: torch.Tensor,
+    groups: list[torch.Tensor],
+    next_tokens: torch.Tensor,
+    num_reqs: torch.Tensor,
+) -> torch.Tensor:
+    """Post-verify read-offset scatter for every mamba group in one program.
+    Each of `groups` is a [width] slot tensor; `next_tokens` the rejection
+    sampler output ([>= num_reqs, K+1], INVALID_TOKEN_ID-padded); `num_reqs`
+    a 0-d tensor, so it enters as a value, not a shape. Rows past it take
+    offset 0 (their slots are the null block). Returns the offsets, one per
+    batch position."""
+    width = groups[0].shape[0]
+    rows = next_tokens.shape[0]
+    if rows >= width:
+        next_tokens = next_tokens[:width]
+    else:
+        next_tokens = torch.nn.functional.pad(
+            next_tokens, (0, 0, 0, width - rows), value=INVALID_TOKEN_ID
+        )
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    valid = torch.arange(width, device=read_offsets.device) < num_reqs
+    offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0).to(read_offsets.dtype)
+    indices = torch.cat(groups, dim=0).long()
+    read_offsets.index_put_((indices,), offsets.repeat(len(groups)))
+    return offsets
+
+
+def _use_fused_read_offset_update(
+    read_offsets: torch.Tensor, next_tokens: torch.Tensor | None
+) -> bool:
+    """Verify chunks take `_update_read_offsets_compiled`; non-verify chunks
+    (`next_tokens is None`, offsets all 0) take the eager scatter. Serving
+    buffers are always on TPU; the device check only routes the CPU unit tests,
+    which the tpu backend cannot trace, to the eager path."""
+    return next_tokens is not None and read_offsets.device.type == "tpu"
+
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
+_update_read_offsets_compiled = _tpu_compile(_update_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
 
@@ -4972,6 +5011,14 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self.mamba_slot_read_offsets is None or not indices_per_group:
             return None
+        if _use_fused_read_offset_update(self.mamba_slot_read_offsets, next_tokens):
+            assert next_tokens is not None
+            return _update_read_offsets_compiled(
+                self.mamba_slot_read_offsets,
+                list(indices_per_group),
+                next_tokens,
+                torch.tensor(num_reqs, dtype=torch.int64, device=self.device),
+            )
         offsets = torch.zeros(
             indices_per_group[0].shape[0],
             dtype=torch.int32,
@@ -5701,7 +5748,17 @@ class TPUModelRunner(GPUModelRunner):
                     spec_logprobs=spec_logprobs_chunks,
                 )
 
-        if self.scheduler_config.async_scheduling:
+        # The previous step's sampled-token copy completes only behind this
+        # step's forward, so waiting on it here holds the draft's host-side
+        # preparation and launch until the forward finishes. Nothing the
+        # draft reads depends on the rollback it feeds (the draft seeds on
+        # device; host tokens are read for partial prefills only, i.e. from
+        # the prompt), so wait after the launch instead. With a KV connector
+        # keep the early wait: the save below relies on it.
+        defer_prev_wait = (
+            self.scheduler_config.async_scheduling and not has_kv_transfer_group()
+        )
+        if self.scheduler_config.async_scheduling and not defer_prev_wait:
             self._modify_prev_results()
 
         # Unified eagle3 draft propose -- ONE call serving both sync and async
@@ -5771,6 +5828,9 @@ class TPUModelRunner(GPUModelRunner):
                     )
         if self._adaptive_verification is not None:
             self._record_draft_confidences()
+
+        if defer_prev_wait:
+            self._modify_prev_results()
 
         if self._is_dspark_pd_producer:
             assert isinstance(self.drafter, DFlashProposer)

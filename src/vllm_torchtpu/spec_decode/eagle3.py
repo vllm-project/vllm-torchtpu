@@ -37,6 +37,9 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
 )
+from vllm_torchtpu.layers.core.sequence_layout import (
+    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -123,6 +126,91 @@ def _maybe_pad_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
     if target_len <= n:
         return t
     return torch.nn.functional.pad(t, (0, target_len - n))
+
+
+def _async_draft_seed_impl(
+    next_tokens: torch.Tensor,
+    num_draft: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_reqs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Async draft seed from the on-device rejection-sampler output, as one
+    program per request-padding bucket instead of ~15 eager ones.
+
+    `next_tokens` is `[width, K+1]` (accepted prefix + bonus, padded with
+    INVALID_TOKEN_ID); `num_draft` the per-row draft counts (>= width rows);
+    `query_start_loc` the chunk's query starts, whose ends may cover fewer
+    than `width` rows (the rows past them take the last end); `num_reqs` a
+    0-d int64 tensor, so it enters as a value, not a shape. Returns
+    `(last_token_indices int64, next_token_ids int32, num_rejected int32)`,
+    all `[width]`; padding rows repeat the last real request's seed position
+    and token and report no rejections.
+    """
+    width = next_tokens.shape[0]
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1)
+    next_token_ids = (
+        next_tokens.gather(1, (num_valid - 1).unsqueeze(1)).squeeze(1).to(torch.int32)
+    )
+    num_draft = num_draft[:width].to(torch.int64)
+    accepted_drafts = torch.minimum((num_valid - 1).clamp(min=0), num_draft)
+    num_rejected = (num_draft - accepted_drafts).to(torch.int32)
+    qsl_end = query_start_loc[1 : width + 1].to(torch.int64)
+    if qsl_end.shape[0] < width:
+        qsl_end = torch.cat([qsl_end, qsl_end[-1:].expand(width - qsl_end.shape[0])])
+    last_token_indices = qsl_end - 1 - num_rejected.to(torch.int64)
+    valid = torch.arange(width, device=next_tokens.device) < num_reqs
+    last = (num_reqs - 1).view(1)
+    last_token_indices = torch.where(
+        valid, last_token_indices, last_token_indices.index_select(0, last)
+    )
+    next_token_ids = torch.where(
+        valid, next_token_ids, next_token_ids.index_select(0, last)
+    )
+    num_rejected = torch.where(valid, num_rejected, torch.zeros_like(num_rejected))
+    return last_token_indices, next_token_ids, num_rejected
+
+
+_async_draft_seed_compiled = _static_shape_args(
+    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(_async_draft_seed_impl)
+)
+
+
+def _async_draft_seed_eager(
+    next_tokens: torch.Tensor,
+    num_draft: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_reqs: int,
+    overrides: dict[int, int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`_async_draft_seed_impl` run eagerly, then `overrides` applied: row ->
+    seed token for partial-prefill requests, which have no sampled token.
+    Padding rows repeat the last real request's token, so they take its
+    override too."""
+    num_reqs_t = torch.tensor(num_reqs, dtype=torch.int64, device=next_tokens.device)
+    last_token_indices, next_token_ids, num_rejected = _async_draft_seed_impl(
+        next_tokens, num_draft, query_start_loc, num_reqs_t
+    )
+    if overrides:
+        rows = list(overrides)
+        if num_reqs - 1 in overrides:
+            rows += range(num_reqs, next_token_ids.shape[0])
+        values = [overrides[min(r, num_reqs - 1)] for r in rows]
+        next_token_ids[
+            torch.tensor(rows, dtype=torch.long, device=next_token_ids.device)
+        ] = torch.tensor(
+            values, dtype=next_token_ids.dtype, device=next_token_ids.device
+        )
+    return last_token_indices, next_token_ids, num_rejected
+
+
+def _use_fused_async_draft_seed(
+    next_tokens: torch.Tensor, overrides: dict[int, int]
+) -> bool:
+    """`_async_draft_seed_compiled` serves chunks on TPU without partial-prefill
+    overrides; chunks with overrides take `_async_draft_seed_eager`. Serving
+    tensors are always on TPU; the device check only routes the CPU unit tests,
+    which the tpu backend cannot trace, to the eager path."""
+    return not overrides and next_tokens.device.type == "tpu"
 
 
 if TYPE_CHECKING:
@@ -281,6 +369,9 @@ class Eagle3Proposer:
         # load_model; None means the per-step loop.
         self._mtp_fused_loop: torch.nn.Module | None = None
         self._mtp_fused_loop_warm = False
+        # Draft step 0 evaluated at each request's last token only
+        # (VLLM_TPU_MTP_DRAFT_ROWS). Resolved in load_model.
+        self._draft_rows = False
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -352,6 +443,7 @@ class Eagle3Proposer:
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()
+        self._draft_rows = self._resolve_draft_rows()
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
@@ -367,6 +459,84 @@ class Eagle3Proposer:
                 "advance per draft step, which cross-model KV sharing "
                 "freezes; the combination is unvalidated."
             )
+
+    def _draft_rows_len(self, chunk: DraftChunkInputs) -> int:
+        """Draft step 0's fixed `draft_rows` length: the chunk's request
+        capacity, the length of the seq_lens its attention metadata carries.
+
+        Qwen4ExpMTP keeps `draft_rows` static (not in its dynamic_arg_dims),
+        so every token bucket's compiled program takes it at this one length.
+        Matching the metadata's request rows keeps pooled_qsa_rows on its
+        row-wise decode path (len(rows) <= len(context)).
+        """
+        runner = self.runner
+        if chunk.attn_ctx.use_max_model_len:
+            capacity = runner.num_reqs_max_model_len
+        else:
+            capacity = runner.num_reqs_most_model_len
+        assert capacity is not None
+        return int(capacity)
+
+    def _padded_draft_rows(
+        self, last_token_indices: torch.Tensor, num_rows: int
+    ) -> torch.Tensor:
+        """Draft step 0's row selection at the fixed length `num_rows`.
+
+        The draft's compiled program is picked by the step's token bucket
+        alone, while the padded request count p varies within a bucket, so
+        `draft_rows` must not follow p (RuntimeProgramInputMismatch). The
+        first chunk.num_reqs <= num_rows entries are real; past them
+        last_token_indices holds filler, so truncate or pad with -1 (no row).
+        """
+        rows = last_token_indices[:num_rows]
+        pad = num_rows - rows.shape[0]
+        if pad > 0:
+            rows = torch.nn.functional.pad(rows, (0, pad), value=-1)
+        return rows
+
+    @staticmethod
+    def _fit_draft_rows_output(out: torch.Tensor, rows: int) -> torch.Tensor:
+        """The draft's [num_rows, ...] row output resized to the p carry rows
+        (rows past the chunk's real requests are padding either way)."""
+        if out.shape[0] >= rows:
+            return out[:rows]
+        return torch.nn.functional.pad(out, (0, 0, 0, rows - out.shape[0]))
+
+    def _resolve_draft_rows(self) -> bool:
+        """Whether draft step 0 runs at each request's last token only.
+
+        Step 0 consumes every token of the target's step, but only the rows
+        at `last_token_indices` feed a draft token and the loop carries; the
+        rest exist to write the draft layer's KV and indexer caches, which
+        later draft steps read. A draft declaring `supports_draft_rows`
+        writes those caches for all tokens and evaluates the layer at the
+        given rows. Excluded: IndexShare (its saved top-k rows are per
+        token), context parallelism (rows are rank-local) and EP-DP lockstep
+        (padding chunks replay full-width step-0 collectives).
+        """
+        if not envs.VLLM_TPU_MTP_DRAFT_ROWS:
+            return False
+        if self.speculative_config.method != "mtp" or not getattr(
+            self.draft_model, "supports_draft_rows", False
+        ):
+            logger.warning_once(
+                "VLLM_TPU_MTP_DRAFT_ROWS is set but this draft does not "
+                "support row-selected step 0; ignoring it."
+            )
+            return False
+        runner = self.runner
+        if (
+            self._share_mtp_indices
+            or getattr(runner, "_pcp_enabled", False)
+            or runner._dp_lockstep_enabled()
+        ):
+            logger.warning_once(
+                "VLLM_TPU_MTP_DRAFT_ROWS is unsupported with IndexShare, "
+                "context parallelism or EP-DP lockstep; ignoring it."
+            )
+            return False
+        logger.info("MTP draft step 0 runs at each request's last token only.")
+        return True
 
     def _validate_mtp_layer_count(self) -> None:
         """One nextn layer only: the proposer's per-step wiring assumes it.
@@ -1129,6 +1299,16 @@ class Eagle3Proposer:
         ).argmax(dim=-1)
         return (draft_id + d2t[draft_id]).to(torch.int32)
 
+    def _device_constant(self, key, build) -> torch.Tensor:
+        """A small read-only device tensor that depends only on `key` (e.g.
+        the request count), uploaded once instead of every step."""
+        cache = self.__dict__.setdefault("_device_constants", {})
+        t = cache.get(key)
+        if t is None:
+            t = build().to(self.runner.device)
+            cache[key] = t
+        return t
+
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_gather_carries(
@@ -1143,6 +1323,7 @@ class Eagle3Proposer:
         # indexing), these three gathers are eager ops the DEFER_AND_FUSE path
         # fuses with the step's seq_lens/positions arithmetic into a per-context
         # program. index_select is value-identical to hidden[indices].
+        indices = indices.clamp_min(0)
         pos_carry = (
             torch.index_select(positions, 1, indices)
             if positions.ndim == 2
@@ -1153,6 +1334,18 @@ class Eagle3Proposer:
             pos_carry,
             torch.index_select(last_hidden, 0, indices),
         )
+
+    @_static_shape_args
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _draft_gather_positions(
+        self, positions: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        # The position carry of _draft_gather_carries, for a row-selected
+        # step 0 whose hidden outputs are already per request. Clamped here
+        # like the other gathers: a PCP-localized index is -1 for a row this
+        # rank does not own.
+        indices = indices.clamp_min(0)
+        return torch.index_select(positions, positions.ndim - 1, indices)
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -1314,28 +1507,51 @@ class Eagle3Proposer:
                 seq_lens_delta=0,
                 num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
+                draft_rows=(
+                    self._padded_draft_rows(
+                        last_token_indices, self._draft_rows_len(chunk)
+                    )
+                    if self._draft_rows
+                    else None
+                ),
             )
+            if self._draft_rows:
+                # Back from the fixed draft_rows length to the p carry rows.
+                rows = last_token_indices.shape[0]
+                last_hidden = self._fit_draft_rows_output(last_hidden, rows)
+                hidden = self._fit_draft_rows_output(hidden, rows)
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
-            owner_mask = last_token_indices.ge(0)
-            safe_gather_indices = last_token_indices.clamp_min(0)
+            # The gathers clamp their indices themselves: a PCP-localized
+            # index is -1 for a row this rank does not own, and -1 would wrap
+            # to the buffer's last row. (Kept inside the compiled gathers so
+            # the clamp is not its own eager program every step.)
             if self._share_mtp_indices:
-                # Clamped, not raw: a PCP-localized index is -1 for a row this
-                # rank does not own, and -1 would wrap to the buffer's last row.
                 saved_topk_per_chunk.append(
-                    self._mtp_compact_and_save(safe_gather_indices)
+                    self._mtp_compact_and_save(last_token_indices.clamp_min(0))
                 )
-            hidden_carry, positions_carry, last_hidden_carry = (
-                self._draft_gather_carries(
-                    hidden, positions, last_hidden, safe_gather_indices
+            if self._draft_rows:
+                # The draft already returned one row per last token.
+                hidden_carry, last_hidden_carry = hidden, last_hidden
+                positions_carry = self._draft_gather_positions(
+                    positions, last_token_indices
                 )
-            )
-            last_hidden_carry = (
-                chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
-                    last_hidden_carry, owner_mask
+            else:
+                hidden_carry, positions_carry, last_hidden_carry = (
+                    self._draft_gather_carries(
+                        hidden, positions, last_hidden, last_token_indices
+                    )
                 )
-            )
+            if (
+                chunk.sequence_layout_plan.descriptor
+                != DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+            ):
+                last_hidden_carry = (
+                    chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
+                        last_hidden_carry, last_token_indices.ge(0)
+                    )
+                )
             hidden_carry_per_chunk.append(hidden_carry)
             positions_carry_per_chunk.append(positions_carry)
             with set_model_tag("eagle_head"):
@@ -1418,11 +1634,19 @@ class Eagle3Proposer:
                     else runner.num_reqs_most_model_len
                 )
                 assert knr is not None
-                qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
-                loop_qsl_per_chunk.append(torch.from_numpy(qsl_np).to(runner.device))
+                n = c.num_reqs
+                loop_qsl_per_chunk.append(
+                    self._device_constant(
+                        ("loop_qsl", knr, n),
+                        lambda knr=knr, n=n: torch.from_numpy(
+                            np.minimum(np.arange(knr + 1, dtype=np.int32), n)
+                        ),
+                    )
+                )
                 loop_reqdist_per_chunk.append(
-                    torch.tensor(
-                        [c.num_reqs] * 3, dtype=torch.int32, device=runner.device
+                    self._device_constant(
+                        ("loop_reqdist", n),
+                        lambda n=n: torch.tensor([n] * 3, dtype=torch.int32),
                     )
                 )
 
@@ -1598,68 +1822,52 @@ class Eagle3Proposer:
             # on num_reqs; the rows past num_reqs are masked below.
             width = next_tokens_device.shape[0]
             nt = next_tokens_device
-            num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1)
-            last_valid_col = num_valid - 1
-            next_token_ids = (
-                nt.gather(1, last_valid_col.unsqueeze(1)).squeeze(1).to(torch.int32)
-            )
-            # Anchor the seed position at qsl_end-1 (like the sync path) using
-            # the REAL per-request draft count.
-            # num_draft is read on-device from the chunk's draft_lengths snapshot
-            # draft_lengths is None for a chunk with no spec metadata.
+            # Partial-prefill (discard) requests have no sampled token; seed
+            # them from the host request state (same value as the sync path).
+            overrides: dict[int, int] = {}
+            for i in range(num_reqs):
+                if start + i in discard_set:
+                    req_state = runner.requests[req_ids[i]]
+                    seq_len = (
+                        req_state.num_computed_tokens
+                        + scheduler_output.num_scheduled_tokens[req_ids[i]]
+                    )
+                    overrides[i] = req_state.get_token_id(seq_len)
+            # num_draft is read on-device from the chunk's draft_lengths
+            # snapshot; draft_lengths is None for a chunk with no spec metadata.
             if chunk.draft_lengths is not None:
-                num_draft_dev = chunk.draft_lengths[:width].to(torch.int64)
+                num_draft = chunk.draft_lengths
             else:
                 num_draft_np = np.zeros(width, dtype=np.int64)
                 num_draft_np[:num_reqs] = [
                     len(scheduler_output.scheduled_spec_decode_tokens.get(rid, ()))
                     for rid in req_ids
                 ]
-                num_draft_dev = torch.from_numpy(num_draft_np).to(runner.device)
-            accepted_drafts = torch.minimum((num_valid - 1).clamp(min=0), num_draft_dev)
-            num_rejected_out = (num_draft_dev - accepted_drafts).to(torch.int32)
+                num_draft = torch.from_numpy(num_draft_np).to(runner.device)
             # qsl_end already lives on-device in the chunk's attn context (the
-            # same tensor _build_draft_attn_metadata reads at step_idx=0); slice
-            # it instead of a fresh H2D of query_start_loc_np. The upload is
+            # same tensor _build_draft_attn_metadata reads at step_idx=0); it is
             # sized by the chunk's request cap, which can sit below the
-            # request-padding bucket; the rows past it take the last end.
-            qsl_end = chunk.attn_ctx.query_start_loc[1 : width + 1].to(torch.int64)
-            if qsl_end.shape[0] < width:
-                qsl_end = torch.cat(
-                    [qsl_end, qsl_end[-1:].expand(width - qsl_end.shape[0])]
-                )
-            last_token_indices = qsl_end - 1 - num_rejected_out.to(torch.int64)
-            # Partial-prefill (discard) requests have no sampled token; seed
-            # them from the host request state (same value as the sync path).
-            ov_i = [i for i in range(num_reqs) if start + i in discard_set]
-            if ov_i:
-                ov_v = []
-                for i in ov_i:
-                    req_state = runner.requests[req_ids[i]]
-                    seq_len = (
-                        req_state.num_computed_tokens
-                        + scheduler_output.num_scheduled_tokens[req_ids[i]]
+            # request-padding bucket. Inputs go in unsliced: slicing inside the
+            # compiled program keeps the views from materializing as their own
+            # eager programs.
+            query_start_loc = chunk.attn_ctx.query_start_loc
+            if _use_fused_async_draft_seed(nt, overrides):
+                last_token_indices, next_token_ids, num_rejected_out = (
+                    _async_draft_seed_compiled(
+                        nt,
+                        num_draft,
+                        query_start_loc,
+                        self._device_constant(
+                            ("num_reqs", num_reqs),
+                            lambda: torch.tensor(num_reqs, dtype=torch.int64),
+                        ),
                     )
-                    ov_v.append(req_state.get_token_id(seq_len))
-                next_token_ids[
-                    torch.tensor(ov_i, dtype=torch.long, device=runner.device)
-                ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
-            if width > num_reqs:
-                # Padding rows repeat the last real request's seed position and
-                # token (after its partial-prefill override, so the duplicate
-                # scatter writes the same value), and report no rejections.
-                # num_reqs enters as a value, not a shape.
-                n_dev = torch.tensor(num_reqs, dtype=torch.int64, device=runner.device)
-                valid = torch.arange(width, device=runner.device) < n_dev
-                last = (n_dev - 1).view(1)
-                last_token_indices = torch.where(
-                    valid, last_token_indices, last_token_indices.index_select(0, last)
                 )
-                next_token_ids = torch.where(
-                    valid, next_token_ids, next_token_ids.index_select(0, last)
-                )
-                num_rejected_out = torch.where(
-                    valid, num_rejected_out, torch.zeros_like(num_rejected_out)
+            else:
+                last_token_indices, next_token_ids, num_rejected_out = (
+                    _async_draft_seed_eager(
+                        nt, num_draft, query_start_loc, num_reqs, overrides
+                    )
                 )
         elif device_seed is not None:
             # On-device prefill bootstrap: seed from the device sampled tokens
@@ -2086,6 +2294,7 @@ class Eagle3Proposer:
         num_rejected_dev: torch.Tensor | None = None,
         loop_query_start_loc: torch.Tensor | None = None,
         loop_request_distribution: torch.Tensor | None = None,
+        draft_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         attn_metadata = self._build_draft_attn_metadata(
             chunk=chunk,
@@ -2107,6 +2316,8 @@ class Eagle3Proposer:
         }
         if self.speculative_config.method == "mtp":
             kwargs["spec_step_idx"] = step_idx
+        if draft_rows is not None:
+            kwargs["draft_rows"] = draft_rows
 
         model = self._draft_model_for_step(step_idx)
         with (
