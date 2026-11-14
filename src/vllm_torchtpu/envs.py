@@ -213,6 +213,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_OMNI_COMPILE: str = "0"
+    VLLM_TPU_OMNI_COMPILE_SPMD_SAFE: bool = False
 
 
 def env_with_choices(
@@ -1300,6 +1302,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # Opt-in DiT torch.compile with the torch_tpu "tpu" dynamo backend:
+    # "0" (default, eager), "regional" (each repeated block), or "full"
+    # (whole DiT).
+    "VLLM_TPU_OMNI_COMPILE": env_with_choices(
+        "VLLM_TPU_OMNI_COMPILE",
+        "0",
+        ["0", "regional", "full"],
+        case_sensitive=False,
+    ),
+    # Run each regionally compiled DiT block as one torch_tpu SPMD-safe region
+    # so its sequence-parallel collectives stay inside the compiled program.
+    "VLLM_TPU_OMNI_COMPILE_SPMD_SAFE": env_bool(
+        "VLLM_TPU_OMNI_COMPILE_SPMD_SAFE", False
     ),
 }
 
