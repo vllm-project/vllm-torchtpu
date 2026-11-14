@@ -427,6 +427,60 @@ class TestSeamSkipsInvalidSlots:
                                    b16(before[conv_kb, CONV_NTOK:])), mgr
 
 
+# (query lengths, seq_lens, distribution, token rows); slots beyond the
+# listed sequences are empty. The decode tile is 4: "mixed" (3 slots) and
+# "partial_tile_decode" (6 slots) end on a partial batched tile.
+_FORM_CASES = {
+    "decode": ([1, 1, 1, 1], [9, 9, 9, 9], [4, 4, 4], 4),
+    "prefill": ([20, 12], [20, 30], [0, 2, 2], 32),
+    "mixed": ([1, 1, 18], [9, 9, 18], [2, 3, 3], 20),
+    "partial_tile_decode": ([1, 1, 1, 1, 1, 0], [9, 9, 9, 9, 9, 0], [5, 5,
+                                                                     5], 8),
+}
+
+
+class TestPooledFormsAgree:
+    """The "tables" entry (routing tables built inside the kernel) computes
+    exactly what "two_calls" (XLA tables, two calls) does."""
+
+    @pytest.mark.parametrize("case", list(_FORM_CASES))
+    def test_tables_matches_two_calls(self, case):
+        q_lens, seq_lens, distribution, num_rows = _FORM_CASES[case]
+        n = len(q_lens)
+        idx = jnp.arange(1, n + 1, dtype=jnp.int32)
+        keys = iter(jax.random.split(jax.random.key(17), 2))
+        pool = _write_states(
+            _garbage_pool(18, num_mgr=n + 1),
+            jax.random.normal(next(keys), (n, N_V, D_K, D_V)),
+            jax.random.normal(next(keys),
+                              (n, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16),
+            idx)
+        kwargs = _rand_inputs(19, num_rows) | dict(
+            query_start_loc=jnp.asarray(
+                np.concatenate([[0], np.cumsum(q_lens)]), dtype=jnp.int32),
+            distribution=jnp.array(distribution, dtype=jnp.int32),
+            seq_lens=jnp.array(seq_lens, dtype=jnp.int32),
+        )
+
+        def run(form):
+            return wrapper.fused_conv1d_gdn(conv_state=None,
+                                            recurrent_state=None,
+                                            state_indices=idx,
+                                            state_source=jnp.copy(pool),
+                                            state_plan=_plan(pool),
+                                            gdn_form=form,
+                                            **kwargs)
+
+        pool_two_calls, out_two_calls = run("two_calls")
+        pool_tables, out_tables = run("tables")
+        num_tokens = int(np.sum(q_lens))
+        np.testing.assert_array_equal(
+            np.asarray(out_tables)[:num_tokens],
+            np.asarray(out_two_calls)[:num_tokens])
+        assert jnp.array_equal(pool_tables.view(jnp.int16),
+                               pool_two_calls.view(jnp.int16))
+
+
 def _write_states_split(pool, ssm, conv, idx, split):
     """`_write_states` on an arbitrary-split pool (checkpoint 0's layout)."""
     n = idx.shape[0]
