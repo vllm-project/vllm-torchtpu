@@ -75,6 +75,20 @@ _TPU_TILE_ROWS = 8
 _TPU_TILE_COLUMNS = 128
 
 
+def is_supported_by_fused_qkvz_pcp(
+    comm_chunk_size: int,
+    local_num_tokens: int,
+    hidden_dtype: jnp.dtype = jnp.bfloat16,
+) -> bool:
+    """Whether ``comm_chunk_size`` and ``local_num_tokens`` fit fused QKVZ PCP."""
+    dma_row_alignment = _TPU_TILE_ROWS * (4 // jnp.dtype(hidden_dtype).itemsize)
+    return (
+        comm_chunk_size > 0
+        and comm_chunk_size % dma_row_alignment == 0
+        and local_num_tokens % (2 * comm_chunk_size) == 0
+    )
+
+
 def _qkv_receive_group_stride(
     comm_chunk_size: int,
     tile_size: int,
@@ -1517,7 +1531,7 @@ def fused_qkvz_projection_pcp_gdn(
         )
     if comm_chunk_size <= 0:
         raise ValueError("comm_chunk_size must be positive.")
-    dma_row_alignment = 8 * (4 // hidden_states.dtype.itemsize)
+    dma_row_alignment = _TPU_TILE_ROWS * (4 // hidden_states.dtype.itemsize)
     if comm_chunk_size % dma_row_alignment != 0:
         raise ValueError(
             "comm_chunk_size must align to the TPU VMEM row tile: "

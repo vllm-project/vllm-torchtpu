@@ -1295,6 +1295,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
+    recurrent_state_dtype: jnp.dtype = jnp.float32,
+    prefill_ckpt_offsets: jnp.ndarray | None = None,
+    prefill_ckpt_indices: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN PCP prefill over the unified block pool.
 
@@ -1302,6 +1305,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     token-shard -> head-shard exchange, but the state lives in the
     rank-local attention-shaped pool instead of dense state tensors.
     """
+    assert (prefill_ckpt_offsets is None) == (prefill_ckpt_indices is None)
     pcp_axis = "pcp"
     if pcp_axis not in mesh.axis_names:
         raise NotImplementedError("GDN pooled PCP prefill requires a pcp mesh axis.")
@@ -1322,6 +1326,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     # logical array stacked on axis 0, so the shard_map body receives
     # exactly this rank's pool.
     pool_spec = P(pcp_tp_state_axis)
+    prefill_ckpt_spec = replicated_spec if prefill_ckpt_offsets is not None else None
     in_specs = (
         token_spec,  # j_mixed_qkv
         token_spec,  # j_b
@@ -1335,6 +1340,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
         replicated_spec,  # state_indices
         replicated_spec,  # distribution
         replicated_spec,  # seq_lens
+        prefill_ckpt_spec,  # prefill checkpoint offsets
+        prefill_ckpt_spec,  # prefill checkpoint block ids
     )
     output_spec = P(pcp_axis, tp_axis, None)
     out_specs = (pool_spec, output_spec)
@@ -1352,6 +1359,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
         state_indices_,
         distribution_,
         seq_lens_,
+        prefill_ckpt_offsets_,
+        prefill_ckpt_indices_,
     ):
         interleaved_qkv = _reorder_gdn_qkv_for_pcp(
             local_qkv,
@@ -1455,12 +1464,15 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
             state_indices_,
             distribution_,
             seq_lens_,
+            prefill_ckpt_offsets=prefill_ckpt_offsets_,
+            prefill_ckpt_indices=prefill_ckpt_indices_,
             n_kq=local_n_kq,
             n_v=local_n_v,
             d_k=d_k,
             d_v=d_v,
             kernel_size=kernel_size,
             pool_block_tokens=pool_block_tokens,
+            recurrent_state_dtype=recurrent_state_dtype,
         )
 
         seq_output_shard = seq_output_shard.reshape(
@@ -1504,4 +1516,6 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
         state_indices,
         distribution,
         seq_lens,
+        prefill_ckpt_offsets,
+        prefill_ckpt_indices,
     )

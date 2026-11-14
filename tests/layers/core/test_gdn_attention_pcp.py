@@ -29,6 +29,12 @@ from kernels.gdn.v3.gdn_pool_state_utils import (
     write_states,
 )
 
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused.pcp_wrapper import (
+    is_supported_by_fused_qkvz_pcp,
+)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
+    PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
     build_pcp_rank_major_token_order as _build_pcp_rank_major_token_order,
 )
@@ -1281,10 +1287,24 @@ _PREFILL_CKPT_PRODUCTION_POOL = _PrefillCkptPoolConfig(
             _PREFILL_CKPT_PRODUCTION_POOL,
             id="production-first-tile-shadow-after-request",
         ),
+        pytest.param(
+            (100, 300, 40),
+            (16, 192, 0),
+            (2048, 3072, 5),
+            dataclasses.replace(
+                _PREFILL_CKPT_NHD_POOL,
+                n_v=16,
+                interleave_size=4,
+                pool_block_tokens=640,
+                page_shape=(128, 1, 4, 128),
+                recurrent_state_dtype=jnp.bfloat16,
+            ),
+            id="sub16-unfused-unaligned-continuations",
+        ),
     ],
 )
 @pytest.mark.multichip
-def test_pooled_pcp_prefill_fused_projection_writes_prefill_checkpoint(
+def test_pooled_pcp_prefill_writes_prefill_checkpoint(
     lengths, ckpt_offsets, request_absolute_starts, pool_config, monkeypatch
 ):
     """The checkpoint block matches a reference run truncated at the row."""
@@ -1556,10 +1576,7 @@ def test_pooled_pcp_prefill_fused_projection_writes_prefill_checkpoint(
         NamedSharding(mesh, P("pcp")),
     )
 
-    new_pool, pcp_output, _ = run_jax_gdn_attention_pooled_pcp_prefill_projection(
-        shard_tokens(pack_tokens(hidden)),
-        replicate(qkvz_weight),
-        None,
+    common_tail = (
         shard_tokens(pack_tokens(b)),
         shard_tokens(pack_tokens(a)),
         pool,
@@ -1571,6 +1588,8 @@ def test_pooled_pcp_prefill_fused_projection_writes_prefill_checkpoint(
         replicate(query_start_loc),
         replicate(distribution),
         replicate(seq_lens),
+    )
+    common_kwargs = dict(
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -1584,6 +1603,20 @@ def test_pooled_pcp_prefill_fused_projection_writes_prefill_checkpoint(
         prefill_ckpt_offsets=replicate(jnp.asarray(ckpt_offsets)),
         prefill_ckpt_indices=replicate(ckpt_indices),
     )
+    if not is_supported_by_fused_qkvz_pcp(
+        interleave_size, PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
+    ):
+        new_pool, pcp_output = run_jax_gdn_attention_pooled_pcp_prefill(
+            shard_tokens(pack_tokens(mixed_qkv)), *common_tail, **common_kwargs
+        )
+    else:
+        new_pool, pcp_output, _ = run_jax_gdn_attention_pooled_pcp_prefill_projection(
+            shard_tokens(pack_tokens(hidden)),
+            replicate(qkvz_weight),
+            None,
+            *common_tail,
+            **common_kwargs,
+        )
 
     # A shadow tile must leave the real tile's output and carry untouched,
     # and an export must leave the next request's incoming state untouched.

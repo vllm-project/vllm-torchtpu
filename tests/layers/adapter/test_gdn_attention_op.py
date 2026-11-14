@@ -1576,46 +1576,95 @@ def test_fused_pooled_pcp_forward_remaps_state_ids_for_the_block_major_pool(
         assert passed_ids is ckpt_ids
 
 
+@pytest.mark.parametrize("builder_kind", ["pooled", "unfused_pcp"])
 @pytest.mark.parametrize(
     "block_major, suffix, kernel_pool_shape",
     [(True, "_bm", (4 * 12, 2, 3)), (False, "", (4, 12, 2, 3))],
 )
 def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
-    block_major, suffix, kernel_pool_shape
+    builder_kind, block_major, suffix, kernel_pool_shape
 ):
     attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
+    attn.get_state_dtype = lambda: (torch.float32, torch.bfloat16)
     captured = {}
 
-    def fake_jax_op(name, wrapped_fn, **_kwargs):
-        captured["name"] = name
-        captured["wrapped_fn"] = wrapped_fn
-        return MagicMock()
+    def fake_jax_op(name, wrapped_fn, **op_kwargs):
+        captured["name"], captured["wrapped_fn"] = name, wrapped_fn
+        captured["op_kwargs"] = op_kwargs
+        captured["mock_op"] = MagicMock(
+            return_value=(torch.full((4, 12, 2, 3), 5.0), torch.ones(2, 64, 128))
+        )
+        return captured["mock_op"]
 
-    def fake_core(mixed_qkv, _b, _a, pool, *_args, **_kwargs):
-        captured["kernel_pool_shape"] = tuple(pool.shape)
+    def fake_core(mixed_qkv, _b, _a, pool, *args, **kwargs):
+        captured.update(kernel_pool_shape=tuple(pool.shape), args=args, kwargs=kwargs)
         return pool, mixed_qkv
 
     pool = torch.zeros(4, 12, 2, 3)
+    meta = tuple(MagicMock() for _ in range(4))
+    ckpt = (MagicMock(), MagicMock())
+    core_fn = (
+        "gdn_attention_pooled_core_tpu"
+        if builder_kind == "pooled"
+        else "run_jax_gdn_attention_pooled_pcp_prefill"
+    )
+    mod = "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op"
     with (
-        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
-        patch(
-            "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.pallas.jax_op",
-            side_effect=fake_jax_op,
+        set_vllm_model_wrapper_context(
+            mesh=_mesh(), vllm_config=_vllm_config(pcp_size=4, interleave_size=4)
         ),
         patch(
-            "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-            "gdn_attention_pooled_core_tpu",
-            side_effect=fake_core,
+            f"{mod}.get_or_create_pcp_mesh",
+            return_value=SimpleNamespace(shape={"pcp": 4, "tp": 1}),
         ),
+        patch(f"{mod}.get_pcp_world_size", return_value=4),
+        patch(f"{mod}.pallas.jax_op", side_effect=fake_jax_op),
+        patch(f"{mod}.{core_fn}", side_effect=fake_core),
     ):
-        attn._build_pooled_gdn_op(block_major=block_major)
+        impl = (
+            attn._build_pooled_gdn_op(block_major=block_major)
+            if builder_kind == "pooled"
+            else attn._build_pooled_pcp_gdn_op(block_major=block_major, fused=False)
+        )
         new_pool, _ = captured["wrapped_fn"](
-            *([MagicMock()] * 3), pool, *([MagicMock()] * 8)
+            *([MagicMock()] * 3),
+            pool,
+            *([MagicMock()] * 4),
+            *meta,
+            prefill_ckpt_offsets=ckpt[0],
+            prefill_ckpt_indices=ckpt[1],
         )
 
-    assert re.fullmatch(rf"pallas::gdn_attention_pooled{suffix}_\d+", captured["name"])
     assert captured["kernel_pool_shape"] == kernel_pool_shape
     assert tuple(new_pool.shape) == tuple(pool.shape)
+    assert captured["kwargs"]["recurrent_state_dtype"] == jnp.bfloat16
+    assert captured["args"][4:8] == meta
+    if builder_kind == "pooled":
+        assert re.fullmatch(
+            rf"pallas::gdn_attention_pooled{suffix}_\d+", captured["name"]
+        )
+        assert captured["args"][-2:] == ckpt
+    else:
+        assert (
+            captured["name"] == "pallas::gdn_attention_pooled_pcp_"
+            f"language_model_model_layers_0_linear_attn{suffix}"
+        )
+        assert (
+            captured["kwargs"]["prefill_ckpt_offsets"],
+            captured["kwargs"]["prefill_ckpt_indices"],
+        ) == ckpt
+        assert captured["op_kwargs"]["donate_argnums"] == (3,)
+        assert len(captured["op_kwargs"]["input_partition_specs"]) == 14
+        fake_fn = captured["mock_op"].register_fake.call_args.args[0]
+        fake_pool, fake_out = fake_fn(
+            torch.zeros((2, 64)), torch.zeros(1), torch.zeros(1), pool
+        )
+        assert fake_pool.shape == pool.shape
+        assert fake_out.shape == (2, 64, 128)
+        live_pool = pool.clone()
+        impl(*([MagicMock()] * 3), live_pool, *([MagicMock()] * 4), *meta, *ckpt)
+        assert captured["mock_op"].call_args.args[8:14] == (*meta, *ckpt)
+        assert torch.all(live_pool == 5.0)
 
 
 # --- internal prefill checkpoints ---------------------------------------------
@@ -1835,20 +1884,22 @@ def _set_qkvz_kernel_layout(monkeypatch, flag):
 
 
 @pytest.mark.parametrize(
-    "flag, pcp_enabled, keeps_layout",
+    "flag, pcp_enabled, fused_supported, keeps_layout",
     [
-        (None, False, True),
-        (None, True, True),
-        ("1", False, False),
-        ("1", True, True),
+        (None, False, False, True),
+        (None, True, False, True),
+        (None, True, True, True),
+        ("1", False, False, False),
+        ("1", True, False, False),
+        ("1", True, True, True),
     ],
 )
-def test_qkvz_layout_follows_the_flag_except_under_pcp(
-    make_gdn_attention, monkeypatch, flag, pcp_enabled, keeps_layout
+def test_qkvz_layout_follows_the_flag_except_under_fused_pooled_pcp(
+    make_gdn_attention, monkeypatch, flag, pcp_enabled, fused_supported, keeps_layout
 ):
     """in_proj_qkvz keeps vLLM's [n_out, n_in] layout by default. With
     TPU_GDN_QKVZ_KERNEL_LAYOUT it flips to (k, n) like every other linear,
-    except under PCP, whose pooled op reads the weight raw."""
+    except under fused pooled PCP, whose kernel reads the weight raw."""
     from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 
     _set_qkvz_kernel_layout(monkeypatch, flag)
@@ -1856,6 +1907,11 @@ def test_qkvz_layout_follows_the_flag_except_under_pcp(
         VllmGatedDeltaNetAttention,
         "_pcp_streaming_enabled",
         staticmethod(lambda: pcp_enabled),
+    )
+    monkeypatch.setattr(
+        VllmGatedDeltaNetAttention,
+        "_fused_pooled_pcp_supported",
+        lambda _self, _cfg: fused_supported,
     )
     warning_once = MagicMock()
     monkeypatch.setattr(gdn_attention_op.logger, "warning_once", warning_once)
@@ -1868,7 +1924,7 @@ def test_qkvz_layout_follows_the_flag_except_under_pcp(
     warned = any(
         "TPU_GDN_QKVZ_KERNEL_LAYOUT" in c.args[0] for c in warning_once.call_args_list
     )
-    assert warned is (flag is not None and pcp_enabled)
+    assert warned is (flag is not None and pcp_enabled and fused_supported)
 
 
 def test_flipped_qkvz_projection_matches_the_kept_one(make_gdn_attention, monkeypatch):
@@ -1938,3 +1994,142 @@ def test_flipped_qkvz_fp8_block_weight_is_the_kept_one_transposed(
     assert kept_weight.shape == weight.shape
     torch.testing.assert_close(flipped_weight, kept_weight.T, rtol=0, atol=0)
     torch.testing.assert_close(flipped_scale, kept_scale, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("pcp_size", "interleave_size", "has_qkvz", "expect_fused"),
+    [
+        (1, 1, True, False),
+        (4, 8, True, False),
+        (4, 16, True, True),
+        (4, 256, True, True),
+        (4, 512, True, False),
+        (4, 16, False, False),
+    ],
+)
+def test_init_gates_fused_vs_unfused_pooled_pcp_by_interleave(
+    monkeypatch,
+    pcp_size: int,
+    interleave_size: int,
+    has_qkvz: bool,
+    expect_fused: bool,
+):
+    _set_qkvz_kernel_layout(monkeypatch, "1")
+    warning_once = MagicMock()
+    monkeypatch.setattr(gdn_attention_op.logger, "warning_once", warning_once)
+    built_op = MagicMock()
+
+    def fake_super_init(self):
+        setattr(self, "in_proj_qkvz" if has_qkvz else "in_proj_qkv", SimpleNamespace())
+
+    expect_unfused = pcp_size > 1 and has_qkvz and not expect_fused
+    with (
+        patch.object(VllmGatedDeltaNetAttention, "_create_conv1d"),
+        set_vllm_model_wrapper_context(
+            mesh=_mesh(),
+            vllm_config=_vllm_config(
+                pcp_size=pcp_size, interleave_size=interleave_size
+            ),
+        ),
+        patch.object(
+            gdn_attention_op.QwenGatedDeltaNetAttention, "__init__", fake_super_init
+        ),
+        patch.object(
+            VllmGatedDeltaNetAttention, "_build_gdn_op", return_value=MagicMock()
+        ),
+        patch.object(
+            VllmGatedDeltaNetAttention, "_build_pooled_gdn_op", return_value=MagicMock()
+        ),
+        patch.object(
+            VllmGatedDeltaNetAttention,
+            "_build_pooled_pcp_gdn_op",
+            return_value=built_op,
+        ) as mock_build_pcp,
+    ):
+        attn = VllmGatedDeltaNetAttention()
+
+    if has_qkvz:
+        assert (
+            hasattr(attn.in_proj_qkvz, gdn_attention_op.KEEP_VLLM_LAYOUT_ATTR)
+            is expect_fused
+        )
+    assert attn.gdn_pooled_pcp_op is (built_op if expect_fused else None)
+    assert attn.gdn_pooled_pcp_unfused_op is (built_op if expect_unfused else None)
+    if expect_fused:
+        mock_build_pcp.assert_called_once_with(block_major=False)
+    elif expect_unfused:
+        mock_build_pcp.assert_called_once_with(block_major=False, fused=False)
+    else:
+        mock_build_pcp.assert_not_called()
+    warned_unfused = any("unfused" in c.args[0] for c in warning_once.call_args_list)
+    assert warned_unfused is expect_unfused
+
+
+@pytest.mark.parametrize("num_spec", [0, 1])
+@pytest.mark.parametrize("with_checkpoints", [False, True])
+@patch("vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context")
+def test_forward_dispatches_unfused_pooled_pcp_prefill(
+    mock_get_forward_context, num_spec: int, with_checkpoints: bool
+):
+    attn = _pooled_forward_attn((torch.zeros(4, 12, 2),))
+    attn.num_spec = num_spec
+    attn._pcp_streaming_configured = True
+    attn.gdn_pooled_pcp_op = None
+    attn.gdn_pooled_pcp_unfused_op = MagicMock(return_value=torch.full((2, 4, 16), 3.0))
+    attn._bm_kernel = True
+    attn.set_block_major_pool(_BM_POOL_INDEX, _BM_LAYOUT)
+    offsets = torch.tensor([0, 3072], dtype=torch.int32) if with_checkpoints else None
+    ids = torch.tensor([-1, 2], dtype=torch.int32) if with_checkpoints else None
+    metadata = _pooled_metadata(offsets, ids)
+    metadata.sequence_layout_kind = SequenceLayoutKind.PARTIAL.value
+    metadata.sequence_layout_protocol = "pcp_streaming"
+    mock_get_forward_context.return_value = SimpleNamespace(
+        attn_metadata={"test_layer": metadata}
+    )
+
+    out = attn.forward(torch.zeros(2, 64))
+
+    attn.gdn_pooled_op.assert_not_called()
+    args = attn.gdn_pooled_pcp_unfused_op.call_args.args
+    assert args[8].tolist() == [10, 4]
+    assert args[9:12] == (
+        metadata.query_start_loc,
+        metadata.request_distribution,
+        metadata.seq_lens,
+    )
+    if with_checkpoints:
+        assert args[12] is offsets and args[13].tolist() == [-1, 7]
+    else:
+        assert args[12:14] == (None, None)
+    assert torch.all(out == 3.0)
+
+
+@pytest.mark.parametrize(
+    ("streaming_meta", "exc_type", "match"),
+    [
+        (False, RuntimeError, "PCP streaming sequence layout"),
+        (True, NotImplementedError, "combined in_proj_qkvz"),
+    ],
+)
+@patch("vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context")
+def test_pooled_forward_rejects_unsupported_pcp_states(
+    mock_get_forward_context,
+    streaming_meta: bool,
+    exc_type: type[Exception],
+    match: str,
+):
+    attn = _pooled_forward_attn((torch.zeros(4, 12, 2),))
+    attn._pcp_streaming_configured = True
+    attn.gdn_pooled_pcp_op = None
+    attn.gdn_pooled_pcp_unfused_op = None
+    metadata = _pooled_metadata(None, None)
+    if streaming_meta:
+        metadata.sequence_layout_kind = SequenceLayoutKind.PARTIAL.value
+        metadata.sequence_layout_protocol = "pcp_streaming"
+    mock_get_forward_context.return_value = SimpleNamespace(
+        attn_metadata={"test_layer": metadata}
+    )
+
+    with pytest.raises(exc_type, match=match):
+        attn.forward(torch.randn(2, 64))
+    attn.gdn_pooled_op.assert_not_called()

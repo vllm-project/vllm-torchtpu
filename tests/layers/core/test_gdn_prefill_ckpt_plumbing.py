@@ -162,72 +162,105 @@ def test_pooled_local_hands_checkpoint_operands_to_the_kernel(monkeypatch):
     assert seen["kwargs"]["prefill_ckpt_indices"] is ids
 
 
+@pytest.mark.parametrize("fused", [True, False])
 @pytest.mark.parametrize("with_checkpoints", [False, True])
-def test_pcp_projection_wrapper_hands_checkpoint_operands_to_the_kernel(
-    monkeypatch, with_checkpoints
+def test_pcp_wrapper_hands_checkpoint_operands_to_the_kernel(
+    monkeypatch, fused, with_checkpoints
 ):
+    """CPU argument-plumbing check; real checkpoint writeback is covered by the
+    multichip TPU `test_pooled_pcp_prefill_writes_prefill_checkpoint`."""
     seen = {}
 
-    def fake_kernel(*args, **kwargs):
-        seen["offsets_is_none"] = kwargs["prefill_ckpt_offsets"] is None
-        seen["ids_is_none"] = kwargs["prefill_ckpt_indices"] is None
-        pool = args[5]
-        out = jnp.zeros((NUM_TOKENS, 2, 4), jnp.float32)
-        if not with_checkpoints:
-            return pool, out, out
-        tag = (
-            kwargs["prefill_ckpt_offsets"].sum()
-            + 1000 * kwargs["prefill_ckpt_indices"].sum()
+    def fake_entry(*args, **kwargs):
+        seen.update(
+            offsets_is_none=kwargs["prefill_ckpt_offsets"] is None,
+            ids_is_none=kwargs["prefill_ckpt_indices"] is None,
+            recurrent_state_dtype=kwargs["recurrent_state_dtype"],
         )
-        return pool, out + tag, out
+        pool = args[5 if fused else 3]
+        out = jnp.zeros((NUM_TOKENS, 2, 4) if fused else (NUM_TOKENS, 8), jnp.float32)
+        if with_checkpoints:
+            out += (
+                kwargs["prefill_ckpt_offsets"].sum()
+                + 1000 * kwargs["prefill_ckpt_indices"].sum()
+            )
+        return (pool, out, out) if fused else (pool, out)
 
-    monkeypatch.setattr(
-        gdn_attention.gdn_pcp_fused_wrapper,
-        "fused_qkvz_projection_pcp_gdn",
-        fake_kernel,
-    )
-    # The ragged-exchange layout check reads the chip; present a validated one.
-    monkeypatch.setattr(
-        gdn_attention.pltpu,
-        "get_tpu_info",
-        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
-    )
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("pcp", "tp"))
-    ckpt_kwargs = {}
-    if with_checkpoints:
-        ckpt_kwargs = dict(
+    ckpt_kwargs = (
+        dict(
             prefill_ckpt_offsets=jnp.array([0, 0, 3072, 0], jnp.int32),
             prefill_ckpt_indices=jnp.array([-1, -1, 5, -1], jnp.int32),
         )
-
-    _, output, _ = gdn_attention.run_jax_gdn_attention_pooled_pcp_prefill_projection(
-        jnp.zeros((NUM_TOKENS, 8), jnp.bfloat16),
-        jnp.zeros((32, 8), jnp.bfloat16),
-        None,
-        jnp.zeros((NUM_TOKENS, 2), jnp.bfloat16),
-        jnp.zeros((NUM_TOKENS, 2), jnp.bfloat16),
-        jnp.zeros((6, 4, 2, 8), jnp.bfloat16),
-        jnp.zeros((24, 1, 4), jnp.bfloat16),
-        None,
-        jnp.zeros((2,), jnp.float32),
-        jnp.zeros((2,), jnp.float32),
-        jnp.array([1, 2, 3, 0], jnp.int32),
-        jnp.array([0, 1, 2, 8, 8], jnp.int32),
-        jnp.array([0, 0, 3], jnp.int32),
-        jnp.array([10, 20, 8191, 0], jnp.int32),
-        n_kq=2,
-        n_v=2,
-        d_k=4,
-        d_v=4,
-        kernel_size=4,
-        pool_block_tokens=4,
-        pcp_size=1,
-        interleave_size=4,
-        mesh=mesh,
-        **ckpt_kwargs,
+        if with_checkpoints
+        else {}
     )
+    if fused:
+        monkeypatch.setattr(
+            gdn_attention.gdn_pcp_fused_wrapper,
+            "fused_qkvz_projection_pcp_gdn",
+            fake_entry,
+        )
+        monkeypatch.setattr(
+            gdn_attention.pltpu,
+            "get_tpu_info",
+            lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+        )
+        _, output, _ = (
+            gdn_attention.run_jax_gdn_attention_pooled_pcp_prefill_projection(
+                jnp.zeros((NUM_TOKENS, 8), jnp.bfloat16),
+                jnp.zeros((32, 8), jnp.bfloat16),
+                None,
+                jnp.zeros((NUM_TOKENS, 2), jnp.bfloat16),
+                jnp.zeros((NUM_TOKENS, 2), jnp.bfloat16),
+                jnp.zeros((6, 4, 2, 8), jnp.bfloat16),
+                jnp.zeros((24, 1, 4), jnp.bfloat16),
+                None,
+                jnp.zeros((2,), jnp.float32),
+                jnp.zeros((2,), jnp.float32),
+                jnp.array([1, 2, 3, 0], jnp.int32),
+                jnp.array([0, 1, 2, 8, 8], jnp.int32),
+                jnp.array([0, 0, 3], jnp.int32),
+                jnp.array([10, 20, 8191, 0], jnp.int32),
+                n_kq=2,
+                n_v=2,
+                d_k=4,
+                d_v=4,
+                kernel_size=4,
+                pool_block_tokens=4,
+                pcp_size=1,
+                interleave_size=4,
+                mesh=mesh,
+                recurrent_state_dtype=jnp.bfloat16,
+                **ckpt_kwargs,
+            )
+        )
+    else:
+        monkeypatch.setattr(
+            gdn_attention, "run_jax_gdn_attention_pooled_local", fake_entry
+        )
+        monkeypatch.setattr(
+            gdn_attention,
+            "_ragged_exchange_pcp_token_shards_for_head_shards",
+            lambda tensor, *_args: tensor,
+        )
+        _, output = gdn_attention.run_jax_gdn_attention_pooled_pcp_prefill(
+            **_pooled_inputs(),
+            n_kq=1,
+            n_v=2,
+            d_k=4,
+            d_v=4,
+            kernel_size=4,
+            pool_block_tokens=4,
+            pcp_size=1,
+            interleave_size=4,
+            mesh=mesh,
+            recurrent_state_dtype=jnp.bfloat16,
+            **ckpt_kwargs,
+        )
 
     assert seen["offsets_is_none"] is not with_checkpoints
     assert seen["ids_is_none"] is not with_checkpoints
+    assert seen["recurrent_state_dtype"] == jnp.bfloat16
     if with_checkpoints:
         assert float(output[0, 0, 0]) == 3072 + 1000 * 2
