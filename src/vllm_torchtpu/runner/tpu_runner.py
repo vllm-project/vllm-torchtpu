@@ -7336,9 +7336,26 @@ class TPUModelRunner(GPUModelRunner):
             min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
         )
         with self._precompile_timed("rejection_sampler"):
+            # The (padded_logits_length, padded_num_reqs) buckets, in the order the
+            # nested sweep visits them.
+            buckets = []
             for num_tokens in self.num_tokens_paddings:
                 if num_tokens > max_logits_len:
                     break
+                for num_reqs in self.num_reqs_paddings:
+                    if not self._spec_verify_bucket_reachable(num_tokens, num_reqs):
+                        continue
+                    buckets.append((num_tokens, num_reqs))
+                    if num_reqs >= min(num_tokens, self.max_num_reqs):
+                        break
+            # VLLM_TPU_PRECOMPILE_ROTATE_SPEC_VERIFY=1: each local rank starts the
+            # sweep at a different bucket. Every rank compiles every bucket's graphs
+            # here, in lockstep by default; rotated, a rank's later buckets are
+            # mostly ones a peer has already put in the host's Tier-2 compile
+            # cache. The warmups are rank-local (no collectives), so the order is
+            # free; the set of buckets is unchanged.
+            buckets = rotate_for_local_rank(buckets)
+            for num_tokens, num_reqs in buckets:
                 # padded_logits_length-shaped inputs; dtypes mirror
                 # get_spec_decode_metadata so the graph is byte-identical.
                 dummy_logits = torch.zeros(
@@ -7355,69 +7372,83 @@ class TPUModelRunner(GPUModelRunner):
                 group_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
                     self.device
                 )
-                for num_reqs in self.num_reqs_paddings:
-                    if not self._spec_verify_bucket_reachable(num_tokens, num_reqs):
-                        continue
-                    # padded_num_reqs-shaped inputs.
-                    draft_lengths = torch.zeros(num_reqs, dtype=torch.int32).to(
-                        self.device
-                    )
-                    bonus_logits_indices = torch.zeros(num_reqs, dtype=torch.int32).to(
-                        self.device
-                    )
-                    warm_accept_u = torch.zeros(num_tokens, dtype=torch.float32).to(
-                        self.device
-                    )
-                    # --- greedy verify path (do_sampling=False) ---
-                    bonus_token_ids, target_logits_warm = (
-                        self.spec_bonus_and_target_logits(
-                            dummy_logits, bonus_logits_indices, target_logits_indices
-                        )
-                    )
-                    out = self.rejection_sampler(
-                        draft_token_ids=draft_token_ids,
-                        num_draft_tokens=draft_lengths,
-                        target_logits=target_logits_warm,
-                        bonus_token_ids=bonus_token_ids,
-                        segment_ids=segment_ids,
-                        group_indices=group_indices,
-                        max_draft_tokens=k,
-                        accept_u=(
-                            warm_accept_u
-                            if self.rejection_sampler.synthetic_mode
-                            else None
-                        ),
-                    )
-                    synchronize_tensors(out)
-                    if self._greedy_head_owner is not None:
-                        self._precompile_top_token_verify(
-                            num_tokens,
-                            draft_token_ids,
-                            target_logits_indices,
-                            segment_ids,
-                            group_indices,
-                            draft_lengths,
-                            bonus_logits_indices,
-                            warm_accept_u,
-                        )
-                    # --- non-greedy verify path (do_sampling=True) ---
-                    _, target_logits_ng = self.spec_gather_bonus_and_target_logits(
+                # padded_num_reqs-shaped inputs.
+                draft_lengths = torch.zeros(num_reqs, dtype=torch.int32).to(
+                    self.device
+                )
+                bonus_logits_indices = torch.zeros(num_reqs, dtype=torch.int32).to(
+                    self.device
+                )
+                warm_accept_u = torch.zeros(num_tokens, dtype=torch.float32).to(
+                    self.device
+                )
+                # --- greedy verify path (do_sampling=False) ---
+                bonus_token_ids, target_logits_warm = (
+                    self.spec_bonus_and_target_logits(
                         dummy_logits, bonus_logits_indices, target_logits_indices
                     )
-                    warm_temps = torch.zeros(
-                        (num_tokens, 1),
-                        dtype=self._hidden_states_dtype,
-                    ).to(self.device)
-                    warm_top_k = torch.zeros((num_tokens, 1), dtype=torch.int32).to(
-                        self.device
+                )
+                out = self.rejection_sampler(
+                    draft_token_ids=draft_token_ids,
+                    num_draft_tokens=draft_lengths,
+                    target_logits=target_logits_warm,
+                    bonus_token_ids=bonus_token_ids,
+                    segment_ids=segment_ids,
+                    group_indices=group_indices,
+                    max_draft_tokens=k,
+                    accept_u=(
+                        warm_accept_u
+                        if self.rejection_sampler.synthetic_mode
+                        else None
+                    ),
+                )
+                synchronize_tensors(out)
+                if self._greedy_head_owner is not None:
+                    self._precompile_top_token_verify(
+                        num_tokens,
+                        draft_token_ids,
+                        target_logits_indices,
+                        segment_ids,
+                        group_indices,
+                        draft_lengths,
+                        bonus_logits_indices,
+                        warm_accept_u,
                     )
-                    warm_top_p = torch.ones((num_tokens, 1), dtype=torch.float32).to(
-                        self.device
-                    )
-                    warm_recover_u = torch.zeros(
-                        (num_tokens, self.vocab_size),
-                        dtype=torch.float32,
-                    ).to(self.device)
+                # --- non-greedy verify path (do_sampling=True) ---
+                _, target_logits_ng = self.spec_gather_bonus_and_target_logits(
+                    dummy_logits, bonus_logits_indices, target_logits_indices
+                )
+                warm_temps = torch.zeros(
+                    (num_tokens, 1),
+                    dtype=self._hidden_states_dtype,
+                ).to(self.device)
+                warm_top_k = torch.zeros((num_tokens, 1), dtype=torch.int32).to(
+                    self.device
+                )
+                warm_top_p = torch.ones((num_tokens, 1), dtype=torch.float32).to(
+                    self.device
+                )
+                warm_recover_u = torch.zeros(
+                    (num_tokens, self.vocab_size),
+                    dtype=torch.float32,
+                ).to(self.device)
+                out = self.rejection_sampler(
+                    draft_token_ids=draft_token_ids,
+                    num_draft_tokens=draft_lengths,
+                    target_logits=target_logits_ng,
+                    bonus_token_ids=bonus_token_ids,
+                    segment_ids=segment_ids,
+                    group_indices=group_indices,
+                    max_draft_tokens=k,
+                    temperatures=warm_temps,
+                    top_k=warm_top_k,
+                    top_p=warm_top_p,
+                    accept_u=warm_accept_u,
+                    recover_u=warm_recover_u,
+                    do_sampling=True,
+                )
+                synchronize_tensors(out)
+                if blocks := self._topk_candidate_blocks():
                     out = self.rejection_sampler(
                         draft_token_ids=draft_token_ids,
                         num_draft_tokens=draft_lengths,
@@ -7432,57 +7463,38 @@ class TPUModelRunner(GPUModelRunner):
                         accept_u=warm_accept_u,
                         recover_u=warm_recover_u,
                         do_sampling=True,
+                        topk_candidates=blocks,
                     )
                     synchronize_tensors(out)
-                    if blocks := self._topk_candidate_blocks():
-                        out = self.rejection_sampler(
-                            draft_token_ids=draft_token_ids,
-                            num_draft_tokens=draft_lengths,
-                            target_logits=target_logits_ng,
-                            bonus_token_ids=bonus_token_ids,
-                            segment_ids=segment_ids,
-                            group_indices=group_indices,
-                            max_draft_tokens=k,
-                            temperatures=warm_temps,
-                            top_k=warm_top_k,
-                            top_p=warm_top_p,
-                            accept_u=warm_accept_u,
-                            recover_u=warm_recover_u,
-                            do_sampling=True,
-                            topk_candidates=blocks,
-                        )
-                        synchronize_tensors(out)
-                    if envs.VLLM_TPU_VERIFY_FUSED:
-                        self._precompile_verify_fused(
-                            dummy_logits,
-                            bonus_logits_indices,
-                            target_logits_indices,
-                            draft_token_ids,
-                            draft_lengths,
-                            segment_ids,
-                            group_indices,
-                            warm_accept_u,
-                            warm_recover_u,
-                        )
-                    if self._shard_head_owner is not None:
-                        self._precompile_verify_candidates(
-                            num_tokens,
-                            bonus_logits_indices,
-                            target_logits_indices,
-                            draft_token_ids,
-                            draft_lengths,
-                            segment_ids,
-                            group_indices,
-                            warm_accept_u,
-                            dummy_logits,
-                        )
-                    logger.info(
-                        "  -- padded_logits_length: %d, num_seqs: %d",
-                        num_tokens,
-                        num_reqs,
+                if envs.VLLM_TPU_VERIFY_FUSED:
+                    self._precompile_verify_fused(
+                        dummy_logits,
+                        bonus_logits_indices,
+                        target_logits_indices,
+                        draft_token_ids,
+                        draft_lengths,
+                        segment_ids,
+                        group_indices,
+                        warm_accept_u,
+                        warm_recover_u,
                     )
-                    if num_reqs >= min(num_tokens, self.max_num_reqs):
-                        break
+                if self._shard_head_owner is not None:
+                    self._precompile_verify_candidates(
+                        num_tokens,
+                        bonus_logits_indices,
+                        target_logits_indices,
+                        draft_token_ids,
+                        draft_lengths,
+                        segment_ids,
+                        group_indices,
+                        warm_accept_u,
+                        dummy_logits,
+                    )
+                logger.info(
+                    "  -- padded_logits_length: %d, num_seqs: %d",
+                    num_tokens,
+                    num_reqs,
+                )
 
     def _precompile_verify_fused(
         self,
@@ -9395,3 +9407,25 @@ def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
 from vllm_torchtpu import startup_trace as _startup_trace  # noqa: E402
 
 _startup_trace.install_runner(TPUModelRunner)
+
+
+def rotate_for_local_rank(items: list) -> list:
+    """``items`` started at this local rank's eighth, with
+    VLLM_TPU_PRECOMPILE_ROTATE_SPEC_VERIFY=1; unchanged otherwise.
+
+    For rank-local precompile sweeps whose graphs are identical on every rank:
+    the ranks of a host then compile different entries first and find most of
+    the rest in the host's shared Tier-2 cache, instead of all compiling the
+    same entry at the same time.
+    """
+    if os.environ.get("VLLM_TPU_PRECOMPILE_ROTATE_SPEC_VERIFY", "0") not in ("1", "true"):
+        return items
+    try:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "8")) or 8
+    except ValueError:
+        return items
+    if not items:
+        return items
+    shift = (local_rank % local_world) * len(items) // local_world
+    return items[shift:] + items[:shift]
