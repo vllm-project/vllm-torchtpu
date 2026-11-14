@@ -125,9 +125,14 @@ class TpuOmniTorchProfilerWrapper(OmniTorchProfilerWrapper):
         capture_dir = profiler_trace.rank_capture_dir(run_root, rank)
         os.makedirs(capture_dir, exist_ok=True)
 
-        _, standard_opts, advanced_opts = resolve_profile_dir_and_opts(capture_dir)
+        profiler_kwargs = getattr(self, "_profiler_kwargs", None)
+        _, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
+            capture_dir, profiler_kwargs=profiler_kwargs
+        )
 
-        if not self._tpu_python_tracer:
+        if not self._tpu_python_tracer and (
+            not profiler_kwargs or "python_tracer_level" not in profiler_kwargs
+        ):
             standard_opts["python_tracer_level"] = 0
 
         cfg = self.profiler_config
