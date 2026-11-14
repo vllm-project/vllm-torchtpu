@@ -509,6 +509,108 @@ def _patch_vllm_compile_all_ranges() -> None:
 
             compile_entry(self, range_entry)
 
+    def compile_claimed(self) -> bool:
+        """VLLM_TPU_PEER_REPLAY_CLAIMS=1: list scheduling over the host's ranks.
+
+        Each rank repeatedly claims the biggest range nobody has claimed (an
+        O_EXCL file named by range under a directory named by this subgraph's
+        fingerprint) and compiles it; once every range is claimed, it replays
+        the ranges its peers claimed. Only ranks tracing the same graph share
+        a claim directory, so nobody waits on another process group's (or
+        pipeline stage's) artifact, and no collective is needed, so ranks that
+        trace different numbers of subgraphs cannot deadlock. A static deal
+        gave local rank 0 the biggest range of every trace plus the smallest:
+        230 s of its own compiles and 123 s waiting while peers idled
+        (j-a822771a-613e-4e8d-a790). False if the subgraph cannot be claimed
+        (no fingerprint or cache dir): the caller then deals statically.
+
+        Claims live under <cache hash>/peer_claims/<engine pid>, the workers'
+        common parent, so a later engine never sees an earlier one's claims.
+        """
+        import time
+
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            PEER_WAIT_S,
+            _graph_fingerprint,
+            replay_only_from,
+            wait_for_peer_artifact,
+        )
+
+        try:
+            cache_dir = self.vllm_backend.compiler_manager.compiler.cache_dir
+        except AttributeError:
+            cache_dir = None
+        fingerprint = _graph_fingerprint(self.graph)
+        if not cache_dir or fingerprint is None:
+            return False
+        rank_dir, prefix = os.path.split(os.path.normpath(cache_dir))
+        claim_dir = os.path.join(
+            os.path.dirname(rank_dir),
+            "peer_claims",
+            str(os.getppid()),
+            prefix,
+            fingerprint[:24],
+        )
+        os.makedirs(claim_dir, exist_ok=True)
+        try:
+            import torch.distributed as dist
+
+            me = dist.get_rank() if dist.is_initialized() else int(
+                os.environ.get("RANK", "0")
+            )
+        except Exception:  # noqa: BLE001
+            me = int(os.environ.get("RANK", "0"))
+
+        def claim_path(entry) -> str:
+            r = entry.compile_range
+            return os.path.join(claim_dir, f"{r.start}_{r.end}")
+
+        pending = [e for e in self.range_entries.values() if not e.compiled]
+        pending.sort(key=lambda e: e.compile_range.end, reverse=True)
+        claimed_by_peer = []
+        own = 0
+        while pending:
+            entry = pending.pop(0)
+            if entry.compiled:
+                continue
+            try:
+                fd = os.open(claim_path(entry), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                claimed_by_peer.append(entry)
+                continue
+            with os.fdopen(fd, "w") as f:
+                f.write(str(me))
+            own += 1
+            with replay_only_from({me}):
+                compile_entry(self, entry)
+        # Every remaining range is a peer's: replay it once its owner saves it.
+        for entry in sorted(claimed_by_peer, key=lambda e: e.compile_range.end):
+            if entry.compiled:
+                continue
+            owner = -1
+            # The claimant writes its rank right after creating the file.
+            for _ in range(50):
+                try:
+                    with open(claim_path(entry)) as f:
+                        owner = int(f.read().strip() or -1)
+                except (OSError, ValueError):
+                    owner = -1
+                if owner >= 0:
+                    break
+                time.sleep(0.1)
+            allowed = {owner} if owner >= 0 else None
+            with replay_only_from(allowed), wait_for_peer_artifact(
+                PEER_WAIT_S if owner >= 0 else 0.0
+            ):
+                compile_entry(self, entry)
+        logger.info(
+            "Peer replay claims: compiled %d, replayed or rebuilt %d (%s)",
+            own,
+            len(claimed_by_peer),
+            claim_dir,
+        )
+        return True
+
     def compile_all_ranges(self) -> None:
         """Compile all range entries for this piecewise subgraph up front."""
         assert self.graph is not None, (
@@ -544,6 +646,10 @@ def _patch_vllm_compile_all_ranges() -> None:
             PEER_WAIT_S,
             wait_for_peer_artifact,
         )
+
+        if os.environ.get("VLLM_TPU_PEER_REPLAY_CLAIMS", "0") in ("1", "true"):
+            if compile_claimed(self):
+                return
 
         ranks = ranks_per_host()
         # Unknown: assume a full host, but do not wait on owners that may not
