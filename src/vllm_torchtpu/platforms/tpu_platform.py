@@ -502,6 +502,7 @@ class TpuPlatform(Platform):
         # without it would route to experts its peers no longer hold.
         "TPU_EXPERT_PLACEMENT",
         "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+        "VLLM_TPU_RELOAD_COMPILED_EXECUTABLE",
         "TPU_DCP_INDEXER_A2A_MERGE",
         "TPU_DCP_INDEXER_A2A_MIN_TOKENS",
         "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS",

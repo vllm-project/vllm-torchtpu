@@ -580,10 +580,10 @@ def _run_worker(result_dir: Path) -> None:
                         f"rank {rank} invoked _run_backend instead of replaying peer"
                     )
                 backend_called = True
-                compiled_fn, entry = orig_run_backend(graph, example_inputs)
+                compiled_fn, entry, recompiled = orig_run_backend(graph, example_inputs)
                 if entry is not None:
                     exe_fp = entry.compiled_fw.result.fingerprint()
-                return compiled_fn, entry
+                return compiled_fn, entry, recompiled
 
             def _tracked_deserialize(entry):
                 nonlocal exe_fp

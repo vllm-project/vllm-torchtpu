@@ -13,6 +13,8 @@
 # limitations under the License.
 """Shared pytest configuration for all tests."""
 
+import contextlib
+import logging
 import os
 import sys
 
@@ -82,6 +84,41 @@ def _reset_warning_once():
     vllm.logger._print_warning_once.cache_clear()
     yield
     vllm.logger._print_warning_once.cache_clear()
+
+
+@pytest.fixture
+def captured_report():
+    """Context manager collecting the INFO+ lines logged under a logger.
+
+    Deliberately not pytest's `caplog`: vLLM's dictConfig sets
+    `propagate=False` on the `vllm` logger, so these records never reach the
+    root logger where `caplog` installs its handler.
+    """
+    # Importing vllm.logger runs that dictConfig; run it before attaching the
+    # handler, or a module's first lazy `logger._resolve()` would remove it.
+    import vllm.logger  # noqa: F401
+
+    @contextlib.contextmanager
+    def capture(logger_name: str = "vllm"):
+        messages: list[str] = []
+        handler = logging.Handler(logging.INFO)
+        handler.emit = lambda record: messages.append(record.getMessage())
+        logger = logging.getLogger(logger_name)
+        old_level = logger.level
+        # Another test may have raised the level or called logging.disable();
+        # either drops the record before any handler runs.
+        old_disable = logging.root.manager.disable
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logging.disable(logging.NOTSET)
+        try:
+            yield messages
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+            logging.disable(old_disable)
+
+    return capture
 
 
 @pytest.fixture

@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_PRECOMPILE_PEER_WAIT_S: float = 600.0
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
+    VLLM_TPU_RELOAD_COMPILED_EXECUTABLE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
@@ -965,6 +966,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before the next group is even traced, so the groups run one after
     # another and most ranks wait. Needs TPU_PARALLEL_PRECOMPILE.
     "TPU_PRECOMPILE_TRACE_FIRST": env_bool("TPU_PRECOMPILE_TRACE_FIRST", default=False),
+    # Temporary opt-in workaround: reloads each newly compiled PJRT executable
+    # from its serialized artifact to free compile-only host DRAM, until
+    # torch_tpu / libtpu release that metadata natively. Mechanism:
+    # `TpuCompilerAdaptor._reload_compiled` and `compilation/torch_tpu_release.py`.
+    "VLLM_TPU_RELOAD_COMPILED_EXECUTABLE": env_bool(
+        "VLLM_TPU_RELOAD_COMPILED_EXECUTABLE", default=False
+    ),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
