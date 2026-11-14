@@ -17,7 +17,9 @@ vLLM's Qwen3.5 decoder layer and model inherit these forwards from the
 Qwen3Next classes, so the patch replaces them there.
 
 What `maybe_patch_qwen3_next` installs depends on the model (a Qwen3.5 rule):
-- A Qwen3.5 MoE target (`models/qwen3_5/settings.ARCHITECTURES`) gets the FP8
+- A Qwen3.5 MoE target, the model and device the patch was measured on (a
+  `models/qwen3_5/settings.ARCHITECTURES` model with Qwen3.5-397B-A17B's
+  checkpoint shape on TPU7x, `models/qwen3_5/kernels/measured`), gets the FP8
   fusions below with their post-load setup, the patched forwards (the MTP
   step-0 post-attention gather needs them even without sequence
   parallelism), and, under TPU_MOE_SEQUENCE_PARALLEL=1, row gating
@@ -112,6 +114,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+from vllm_torchtpu.models.qwen3_5.kernels import measured
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
@@ -1610,12 +1613,24 @@ def patched_mtp_forward(
 
 
 def _is_qwen3_5_target(model_config: Any) -> bool:
-    """``settings.is_qwen3_5`` for a config that names its architectures. A
-    config without the attribute (the stand-ins callers hand the patch
-    registry) is not a Qwen3.5 target and gets main's behaviour."""
+    """Whether the engine serves the model this patch was measured on: a
+    Qwen3.5 architecture (``settings.is_qwen3_5``) with Qwen3.5-397B-A17B's
+    checkpoint shape on TPU7x (``measured.is_measured_checkpoint``). Every
+    other Qwen3.5 checkpoint (main's CI model, Qwen3.5-35B-A3B, among them) or
+    device is not a target and gets main's behaviour, as does a config without
+    ``architectures`` (the stand-ins callers hand the patch registry)."""
     if getattr(model_config, "architectures", None) is None:
         return False
-    return qwen3_5_settings.is_qwen3_5(model_config)
+    if not qwen3_5_settings.is_qwen3_5(model_config):
+        return False
+    if measured.is_measured_checkpoint(model_config):
+        return True
+    logger.info_once(
+        "Qwen3.5 model patch (FP8 fusions, fused pre- and post-attention norms, "
+        "row-gated sequence-parallel forward) not used: it was measured for "
+        "Qwen3.5-397B-A17B on TPU7x only; this engine keeps main's forwards."
+    )
+    return False
 
 
 def _with_rank_tensor(original_init: Callable) -> Callable:
