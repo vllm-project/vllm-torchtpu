@@ -180,16 +180,16 @@
 /tests/models/qwen38_flash/ @DRZDONG @caojx-google
 
 # Megakernel (root package and shared test setup)
-/src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
-/tests/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
+/src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
+/tests/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
 
 # Megakernel core (framework-free JAX/Pallas)
-/src/vllm_torchtpu/megakernel/core/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
-/tests/megakernel/core/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
+/src/vllm_torchtpu/megakernel/core/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
+/tests/megakernel/core/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
 
 # Megakernel adapter (PyTorch/vLLM bridge)
-/src/vllm_torchtpu/megakernel/adapter/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li
-/tests/megakernel/adapter/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li
+/src/vllm_torchtpu/megakernel/adapter/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li @mshrihari3
+/tests/megakernel/adapter/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li @mshrihari3
 
 # Speculative Decoding
 /src/vllm_torchtpu/spec_decode/ @Lumosis @junyanxu @gxd3 @jyj0w0 @maxwillzq

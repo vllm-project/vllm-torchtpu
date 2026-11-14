@@ -186,3 +186,19 @@ def test_prompt_logprobs_are_skipped_where_unsupported(flag, fix):
     runner = _runner(_prompt_logprobs_unsupported=reason, compute_selected_logits=None)
 
     assert _run_steps(runner, [[{"a": 7, "c": 4}]]) == [{}]
+
+
+def test_prompt_logprobs_are_unsupported_with_the_pcp_manager():
+    """USE_TPU_PCP_MANAGER leaves no sequence layout planner; the reason comes
+    from the PCP manager, which selects the logits rows itself."""
+    runner = SimpleNamespace(
+        pcp_manager=SimpleNamespace(uses_selected_logits_hidden_states=True),
+        sequence_layout_planner=None,
+        _dp_vocab_logits=False,
+        lora_config=None,
+    )
+    runner.get_pcp_planner = functools.partial(TPUModelRunner.get_pcp_planner, runner)
+
+    reason = TPUModelRunner._prompt_logprobs_unsupported_reason(runner)
+
+    assert reason is not None and "prefill context parallelism" in reason
