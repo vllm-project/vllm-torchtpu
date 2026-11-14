@@ -1998,7 +1998,10 @@ def test_sp_prefill_trace_accepts_dynamic_token_dimension():
     nn.Module.__init__(model)
     model.sp_prefill = True
     model.sp_group = SimpleNamespace(
-        rank_in_group=0, world_size=32, all_gather=group.all_gather
+        rank_in_group=0,
+        world_size=32,
+        local_rows=lambda x: x.reshape(32, -1, x.shape[-1])[0],
+        all_gather=group.all_gather,
     )
     model.aux_hidden_state_layers = ()
     model.attn_res_block_size = 12
@@ -2478,7 +2481,10 @@ def test_sp_prefill_divisible_shapes_preserve_token_ownership(
         return hidden + 1
 
     model.sp_group = SimpleNamespace(
-        world_size=32, rank_in_group=rank, all_gather=gather
+        world_size=32,
+        rank_in_group=rank,
+        local_rows=lambda x: x.reshape(32, -1, x.shape[-1])[rank],
+        all_gather=gather,
     )
     model.layers = nn.ModuleList([Layer()])
     actual = model.forward(None, positions, inputs_embeds=hidden)
