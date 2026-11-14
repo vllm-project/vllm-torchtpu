@@ -1011,6 +1011,219 @@ class TestTpuCompilerCache:
         assert os.path.samefile(path, os.path.join(a.cache_dir, key))
 
 
+class TestTpuArtifactStore:
+    """TPU_ARTIFACT_STORE: a bucket compiled under one vLLM cache directory is
+    replayed under another, as long as what decides the program is the same."""
+
+    @staticmethod
+    def _setup(tmp_path, monkeypatch, store="1"):
+        import torch
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        monkeypatch.setenv("TPU_ARTIFACT_STORE", store)
+        monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "0")
+        compiled, replayed = [], []
+
+        class Compiled:
+            def __call__(self, *args):
+                return ("compiled",)
+
+            def serialize(self):
+                return f"entry-{len(compiled)}"
+
+        def fake_backend(graph, example_inputs):
+            compiled.append(graph)
+            return Compiled()
+
+        def fake_deserialize(entry):
+            replayed.append(entry)
+            return lambda *args: (entry,)
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
+        monkeypatch.setattr(tpu_compiler, "_deserialize_entry", fake_deserialize)
+        root = tmp_path / "vllm"
+
+        def compile(
+            vllm_hash="hashA",
+            tpu_hash="tpu1",
+            graph=None,
+            inputs=None,
+            key="artifact_compile_range_8_8_subgraph_0",
+            config_hash="cfg1",
+            rank="rank_0_0",
+        ):
+            from vllm.config.utils import Range
+
+            from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+            compiler = TpuCompilerAdaptor()
+            compiler.initialize_cache(
+                cache_dir=str(
+                    root / "torch_compile_cache" / vllm_hash / rank / "backbone"
+                )
+            )
+            compiler._tpu_hash = tpu_hash
+            compiler._config_hash = config_hash
+            if graph is None:
+                graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+            if inputs is None:
+                inputs = [torch.zeros(8, 4)]
+            fn, handle = compiler.compile(
+                graph, inputs, {}, Range(start=8, end=8), key=key
+            )
+            return compiler, fn, handle
+
+        return compile, compiled, replayed, root / "tpu_artifact_store"
+
+    def test_a_new_vllm_cache_dir_replays_from_the_store(self, tmp_path, monkeypatch):
+        compile, compiled, replayed, store = self._setup(tmp_path, monkeypatch)
+        _, _, first = compile(vllm_hash="hashA")
+        compiler, fn, handle = compile(vllm_hash="hashB")
+
+        assert len(compiled) == 1
+        assert replayed == ["entry-1"]
+        assert fn() == "entry-1"
+        # vLLM's new directory gets the artifact too, as the same file.
+        assert os.path.samefile(handle[1], first[1])
+        assert len(os.listdir(store)) == 1
+        assert os.path.samefile(os.path.join(store, os.listdir(store)[0]), first[1])
+
+    @pytest.mark.parametrize(
+        "change",
+        ["tpu_hash", "config_hash", "graph", "inputs", "key"],
+    )
+    def test_anything_that_decides_the_program_misses_the_store(
+        self, tmp_path, monkeypatch, change
+    ):
+        import torch
+
+        compile, compiled, replayed, _ = self._setup(tmp_path, monkeypatch)
+        compile(vllm_hash="hashA")
+        changed = {
+            "tpu_hash": {"tpu_hash": "tpu2"},
+            "graph": {"graph": torch.fx.symbolic_trace(lambda x: x * 3 + 1)},
+            "inputs": {"inputs": [torch.zeros(16, 4)]},
+            "key": {"key": "artifact_compile_range_16_16_subgraph_0"},
+            # Same graph and inputs, a config value a custom op bakes in
+            # (e.g. another attention soft cap or KV scale), or another
+            # parallel layout: vLLM's config hash differs.
+            "config_hash": {"config_hash": "cfg2"},
+        }[change]
+        compile(vllm_hash="hashB", **changed)
+
+        assert len(compiled) == 2
+        assert replayed == []
+
+    def test_store_off_compiles_under_a_new_vllm_cache_dir(self, tmp_path, monkeypatch):
+        compile, compiled, replayed, store = self._setup(
+            tmp_path, monkeypatch, store="0"
+        )
+        compile(vllm_hash="hashA")
+        compile(vllm_hash="hashB")
+
+        assert len(compiled) == 2
+        assert replayed == []
+        assert not store.exists()
+
+    def test_no_store_without_the_tpu_hash(self, tmp_path, monkeypatch):
+        """compute_hash has not run, so the key would miss what lies behind
+        custom ops: do not use the store at all."""
+        compile, compiled, _, store = self._setup(tmp_path, monkeypatch)
+        compile(vllm_hash="hashA", tpu_hash=None)
+        compile(vllm_hash="hashB", tpu_hash=None)
+
+        assert len(compiled) == 2
+        assert not store.exists()
+
+    def test_no_store_without_the_config_hash(self, tmp_path, monkeypatch):
+        compile, compiled, _, store = self._setup(tmp_path, monkeypatch)
+        compile(vllm_hash="hashA", config_hash=None)
+        compile(vllm_hash="hashB", config_hash=None)
+
+        assert len(compiled) == 2
+        assert not store.exists()
+
+    def test_compute_hash_records_vllms_config_hash(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        monkeypatch.setattr(
+            tpu_compiler, "compute_tpu_compilation_hash", lambda config: "tpu1"
+        )
+        compiler = tpu_compiler.TpuCompilerAdaptor()
+        assert compiler.compute_hash(SimpleNamespace(compute_hash=lambda: "cfg1")) == (
+            "tpu1"
+        )
+
+        assert compiler._tpu_hash == "tpu1"
+        assert compiler._config_hash == "cfg1"
+
+    def test_a_peer_replayed_bucket_is_linked_into_the_store(
+        self, tmp_path, monkeypatch
+    ):
+        """With peer replay on, a bucket replayed from another rank's artifact
+        also lands in the store, so a later vLLM cache dir replays it too."""
+        compile, compiled, replayed, store = self._setup(
+            tmp_path, monkeypatch, store="0"
+        )
+        # The owner saves its artifact with the graph fingerprint, as under
+        # peer replay; the store is still off.
+        monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
+        _, _, peer = compile(vllm_hash="hashA", rank="rank_1_0")
+        assert not store.exists()
+
+        monkeypatch.setenv("TPU_ARTIFACT_STORE", "1")
+        compile(vllm_hash="hashA", rank="rank_0_0")
+        assert len(compiled) == 1
+        assert replayed == ["entry-1"]
+        (entry,) = os.listdir(store)
+        assert os.path.samefile(os.path.join(store, entry), peer[1])
+
+        compile(vllm_hash="hashB", rank="rank_0_0")
+        assert len(compiled) == 1
+        assert replayed == ["entry-1", "entry-1"]
+
+    def test_link_artifact_uses_a_unique_temp_name(self, tmp_path, monkeypatch):
+        """Two ranks with one PID (on two hosts sharing a cache root) must not
+        share a temp file: the copy fallback would write through a link."""
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        src = tmp_path / "src"
+        src.write_bytes(b"artifact")
+        temps = []
+        real_link = os.link
+
+        def link(a, b):
+            temps.append(b)
+            real_link(a, b)
+
+        monkeypatch.setattr(os, "link", link)
+        dst = tmp_path / "store" / "entry"
+        assert TpuCompilerAdaptor._link_artifact(str(src), str(dst))
+        dst.unlink()
+        assert TpuCompilerAdaptor._link_artifact(str(src), str(dst))
+
+        assert len(set(temps)) == 2
+        assert dst.read_bytes() == b"artifact"
+        assert os.listdir(dst.parent) == ["entry"]
+
+    def test_relinking_the_same_file_leaves_no_temp_file(self, tmp_path):
+        """rename(2) onto a link of the same file is a no-op that keeps both
+        names, so relinking must not leave its temp file behind."""
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        src = tmp_path / "src"
+        src.write_bytes(b"artifact")
+        dst = tmp_path / "store" / "entry"
+        for _ in range(3):
+            assert TpuCompilerAdaptor._link_artifact(str(src), str(dst))
+
+        assert os.path.samefile(src, dst)
+        assert os.listdir(dst.parent) == ["entry"]
+
+
 def test_deserialize_entry_does_not_copy_the_entry():
     """Replay rebuilds the runnable from the entry itself: a deepcopy would load
     a second TPU executable."""
