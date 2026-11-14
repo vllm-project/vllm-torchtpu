@@ -385,7 +385,7 @@ def _process_fp8_linear_weights(
         logger.info_once(
             "FP4 linear requantization skipped for shape=%s (keep_vllm_layout=%s, "
             "block=%s); falling back to per-channel float8_e4m3fn.",
-            list(weight_f.shape),
+            tuple(weight_f.shape),
             keep_vllm_layout,
             requant_block_size,
         )
@@ -1464,7 +1464,15 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             else envs.TPU_FP8_LINEAR_W8A16_MAX_ROWS
         )
 
-        if quant_config.is_checkpoint_fp8_serialized:
+        desired_dtype = (
+            self.linear_config.requant_weight_dtype
+            if self.linear_config is not None
+            else envs.REQUANTIZE_WEIGHT_DTYPE
+        )
+        if quant_config.is_checkpoint_fp8_serialized or desired_dtype in (
+            "fp4",
+            "float4_e2m1fn_x2",
+        ):
             self._linear_quant_config = _get_linear_quant_config(self.linear_config)
         else:
             # Load-time quantization has its own fixed per-channel contract.
@@ -1676,7 +1684,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                         "FP4 linear on-load quantization skipped for shape=%s "
                         "(keep_vllm_layout=%s, block=%s); falling back to "
                         "per-channel float8_e4m3fn.",
-                        list(weight_f.shape),
+                        tuple(weight_f.shape),
                         keep_vllm_layout,
                         requant_block_size,
                     )

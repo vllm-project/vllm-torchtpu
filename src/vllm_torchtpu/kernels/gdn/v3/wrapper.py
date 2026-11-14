@@ -358,6 +358,7 @@ def outer_kernel(
         "gate_lower_bound",
         "kernel_act_dtype",
         "kernel_conv_weight_dtype",
+        "ssm_state_quant",
     ),
 )
 def fused_conv1d_gdn(

@@ -195,6 +195,7 @@ def test_nvfp4_moe_fp8_all_gather_gate(monkeypatch):
     moe_cfg = MagicMock()
     moe_cfg.experts_per_token = 2
     method = VllmNvfp4MoEMethod(cfg, moe_cfg)
+    method._tpu_activation_str = "silu"
     assert method.supports_internal_mk is True
 
     with (
