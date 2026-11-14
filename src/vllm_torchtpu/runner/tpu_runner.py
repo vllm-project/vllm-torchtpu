@@ -4216,9 +4216,9 @@ class TPUModelRunner(GPUModelRunner):
                     kwargs = batches[0][2]
         except (KeyError, TypeError, ValueError) as exc:
             input_error = str(exc)
-        synchronize_tensors()
+        synchronize_tensors(wait=False)
         outputs = manager.execute_dp_coordinated(kwargs, input_error=input_error)
-        synchronize_tensors()
+        synchronize_tensors(wait=False)
         if scheduler_output is not None:
             for mm_hash, output in zip(mm_hashes, outputs, strict=True):
                 self._cache_encoder_output(
@@ -4348,10 +4348,10 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 has_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
                 if has_encoder_inputs:
-                    synchronize_tensors()
+                    synchronize_tensors(wait=False)
                 self._execute_mm_encoder(scheduler_output)
                 if has_encoder_inputs:
-                    synchronize_tensors()
+                    synchronize_tensors(wait=False)
 
         # Profile the current batch composition (prefill vs decode) if phased profiling
         # is enabled.
