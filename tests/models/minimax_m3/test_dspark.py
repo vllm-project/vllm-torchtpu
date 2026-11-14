@@ -491,6 +491,10 @@ def test_tiny_drafter_loads(tiny_draft) -> None:
     torch.testing.assert_close(
         model.model.layers[1].self_attn.qkv_proj.weight, expected.T
     )
+    # Only the MLP linears stay e4m3 (`MiniMaxM3QuantConfig.is_draft`).
+    mlp = model.model.layers[1].mlp
+    assert mlp.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+    assert mlp.down_proj.weight.dtype == torch.float8_e4m3fn
 
 
 def test_tiny_drafter_forward_matches_reference(tiny_draft) -> None:

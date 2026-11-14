@@ -389,7 +389,7 @@ def test_checkpoint_loads_and_mxfp8_requantizes(tiny_model, monkeypatch) -> None
     torch.testing.assert_close(out, x @ expected.T, rtol=2e-2, atol=2e-2)
 
 
-def test_mxfp8_linears_stay_e4m3_only_for_the_target() -> None:
+def test_mxfp8_linears_stay_e4m3_for_target_and_draft(monkeypatch) -> None:
     target = MiniMaxM3QuantConfig.from_config(_quant_dict())
     draft_dict = _quant_dict()
     draft_dict["ignored_layers"] = [
@@ -397,7 +397,10 @@ def test_mxfp8_linears_stay_e4m3_only_for_the_target() -> None:
         "language_model.model.dspark.fc",
     ]
     draft = MiniMaxM3QuantConfig.from_config(draft_dict)
-    assert target.fp8_linears and not draft.fp8_linears
+    assert target.fp8_linears and draft.fp8_linears
+    monkeypatch.setenv("TPU_MINIMAX_M3_FP8_DRAFT_LINEARS", "0")
+    assert MiniMaxM3QuantConfig.from_config(_quant_dict()).fp8_linears
+    assert not MiniMaxM3QuantConfig.from_config(draft_dict).fp8_linears
 
 
 def test_requantize_mxfp8_per_channel() -> None:

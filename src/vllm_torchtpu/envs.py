@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_MIN_TOKENS: int = 4096
     TPU_MINIMAX_M3_SP_FP8_GATHER: bool = False
     TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER: bool = False
+    TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SHARED: bool = False
     TPU_MOE_DUAL_LAYOUT_MAX_TOKENS: int = 0
@@ -720,6 +721,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-channel power-of-two scale (models/minimax_m3/quant.py); 0 restores
     # the exact bf16 dequantization.
     "TPU_MINIMAX_M3_FP8_LINEARS": env_bool("TPU_MINIMAX_M3_FP8_LINEARS", default=True),
+    # The DSpark draft's MXFP8 layer linears follow TPU_MINIMAX_M3_FP8_LINEARS;
+    # 0 keeps them bf16 (the drafter streams them every decode step).
+    "TPU_MINIMAX_M3_FP8_DRAFT_LINEARS": env_bool(
+        "TPU_MINIMAX_M3_FP8_DRAFT_LINEARS", default=True
+    ),
     # MiniMax-M3 sequence parallelism on steps of at least
     # TPU_MINIMAX_M3_SP_MIN_TOKENS tokens (and a multiple of TP; 0 = never)
     # (models/minimax_m3/model.py). "attn": MoE layers reduce-scatter the
