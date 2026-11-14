@@ -73,6 +73,7 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
+| `TPU_SHARDED_RESIDUAL` | `None` | Opt-in (`"fp8"` or `"bf16"`). Token-shards the Gemma 4 dense decoder residual stream across `TP` ranks (`TP > 1`) on padded token buckets `>= 1024`, replacing `o_proj` / `down_proj` all-reduces with reduce-scatters and all-gathering either pre-quantized FP8 rows and scales (`"fp8"`) or normed bf16 activations (`"bf16"`) before `qkv_proj` and `gate_up_proj`. Smaller buckets stay on replicated all-reduce. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
