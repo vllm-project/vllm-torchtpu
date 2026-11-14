@@ -509,6 +509,8 @@ def _patch_vllm_compile_all_ranges() -> None:
 
             compile_entry(self, range_entry)
 
+    _claim_calls = [0]
+
     def compile_claimed(self) -> bool:
         """VLLM_TPU_PEER_REPLAY_CLAIMS=1: list scheduling over the host's ranks.
 
@@ -544,12 +546,19 @@ def _patch_vllm_compile_all_ranges() -> None:
         if not cache_dir or fingerprint is None:
             return False
         rank_dir, prefix = os.path.split(os.path.normpath(cache_dir))
+        # One claim dir per compile_all_ranges call: a later trace of a subgraph
+        # can have the same code (fingerprint) as an earlier one, and must not
+        # see that trace's claims (j-3adcdb72-d241-4af7-a564: a rank waited an
+        # hour on its own earlier claim). Ranks tracing one graph make these
+        # calls in the same order, so they still meet in the same dir.
+        _claim_calls[0] += 1
         claim_dir = os.path.join(
             os.path.dirname(rank_dir),
             "peer_claims",
             str(os.getppid()),
             prefix,
             fingerprint[:24],
+            str(_claim_calls[0]),
         )
         os.makedirs(claim_dir, exist_ok=True)
         try:
@@ -598,9 +607,17 @@ def _patch_vllm_compile_all_ranges() -> None:
                 if owner >= 0:
                     break
                 time.sleep(0.1)
+            if owner == me:
+                # Never wait on this rank's own claim: compile it here.
+                with replay_only_from({me}):
+                    compile_entry(self, entry)
+                continue
             allowed = {owner} if owner >= 0 else None
+            # Bounded: an owner compiles a few ranges, not an hour of them; past
+            # this the range is compiled here rather than waited on.
+            claim_wait = float(os.environ.get("VLLM_TPU_PEER_CLAIM_WAIT_S", "600"))
             with replay_only_from(allowed), wait_for_peer_artifact(
-                PEER_WAIT_S if owner >= 0 else 0.0
+                min(PEER_WAIT_S, claim_wait) if owner >= 0 else 0.0
             ):
                 compile_entry(self, entry)
         logger.info(
