@@ -18,17 +18,15 @@ from functools import partial
 
 import pytest
 import torch
+import torch._dynamo.utils
 from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
+from torch.compiler._cache import CacheArtifactManager
 
-import vllm_torchtpu
 from vllm_torchtpu import patch_registry
-
-
-def test_patch_registered_for_platform_and_worker_init():
-    target = "vllm_torchtpu:_patch_torchtpu_skip_unread_aot_autograd_save"
-    matches = [p for p in patch_registry.PATCHES if p.target == target]
-    assert len(matches) == 1
-    assert set(matches[0].stages) == {"platform_activation", "worker_init"}
+from vllm_torchtpu.compilation.aot_autograd_save_patch import (
+    patch_torchtpu_skip_unread_aot_autograd_save,
+)
+from vllm_torchtpu.tpu_info import get_num_chips
 
 
 def test_skip_torchtpu_save_filters_only_synthetic_keys(monkeypatch):
@@ -39,10 +37,10 @@ def test_skip_torchtpu_save_filters_only_synthetic_keys(monkeypatch):
 
     monkeypatch.setattr(AOTAutogradCache, "save", staticmethod(fake_orig_save))
 
-    vllm_torchtpu._patch_torchtpu_skip_unread_aot_autograd_save()
+    patch_torchtpu_skip_unread_aot_autograd_save()
     first_patched = AOTAutogradCache.save
     # Idempotent when applied again at a second lifecycle boundary.
-    vllm_torchtpu._patch_torchtpu_skip_unread_aot_autograd_save()
+    patch_torchtpu_skip_unread_aot_autograd_save()
     assert AOTAutogradCache.save is first_patched
 
     AOTAutogradCache.save("torchtpu_deadbeef", "synthetic_entry", remote=False)
@@ -52,19 +50,17 @@ def test_skip_torchtpu_save_filters_only_synthetic_keys(monkeypatch):
     assert saved_calls == [("inductor_real_key", "real_entry", True)]
 
 
-def _verify_skip_save_on_tpu(root: str) -> None:
-    if not os.path.exists("/dev/vfio"):
+def _verify_skip_save_on_tpu(root: str, inductor_dir: str) -> None:
+    if get_num_chips() == 0:
         pytest.skip("TPU hardware required")
-    os.environ["TORCH_TPU_TIER2_COMPILATION_CACHE"] = "disabled"
-    os.environ.pop("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", None)
-    inductor_dir = os.path.join(root, "inductor")
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_dir
-    os.environ["TORCHINDUCTOR_AUTOGRAD_CACHE"] = "0"
 
     from vllm.config.utils import Range
 
     from vllm_torchtpu.compilation import tpu_compiler
     from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+    expected_aot_dir = os.path.join(inductor_dir, "aotautograd")
+    assert AOTAutogradCache._get_tmp_dir() == expected_aot_dir
 
     patch_registry.apply("worker_init")
 
@@ -75,10 +71,13 @@ def _verify_skip_save_on_tpu(root: str) -> None:
 
     x = torch.arange(8, dtype=torch.float32, device="tpu")
     assert torch.equal(helper(x).cpu(), torch.arange(8, dtype=torch.float32) + 3.0)
-    assert not os.path.exists(os.path.join(inductor_dir, "aotautograd"))
+    assert not os.path.exists(expected_aot_dir)
+    assert torch._dynamo.utils.counters["aot_autograd"]["autograd_cache_saved"] == 0
+    assert CacheArtifactManager.serialize() is None
 
-    # 2. TpuCompilerAdaptor.compile writes no aotautograd file and preserves
-    #    identity between entry.compiled_fw.result and the closure's artifact.
+    # 2. TpuCompilerAdaptor.compile writes no aotautograd file, preserves
+    #    identity between entry.compiled_fw.result and the closure's artifact,
+    #    and saves an artifact that replays cleanly through `compiler.load`.
     real_backend = tpu_compiler._tpu_backend
     checked = 0
 
@@ -111,7 +110,7 @@ def _verify_skip_save_on_tpu(root: str) -> None:
             graph, example_inputs, {}, Range(start=8, end=8), key="b8"
         )
         assert fn is not None and handle is not None
-        return fn
+        return compiler.load(handle, graph, example_inputs, 0, Range(start=8, end=8))
 
     @torch.compile(backend=adaptor_backend, fullgraph=True, dynamic=False)
     def step(y: torch.Tensor) -> torch.Tensor:
@@ -119,14 +118,22 @@ def _verify_skip_save_on_tpu(root: str) -> None:
 
     assert torch.equal(step(x).cpu(), torch.arange(8, dtype=torch.float32) * 2.0)
     assert checked == 1
-    assert not os.path.exists(os.path.join(inductor_dir, "aotautograd"))
+    assert not os.path.exists(expected_aot_dir)
+    assert torch._dynamo.utils.counters["aot_autograd"]["autograd_cache_saved"] == 0
+    assert CacheArtifactManager.serialize() is None
 
 
 @pytest.mark.tpu_test
 @pytest.mark.spawns_tpu_workers
-def test_skip_torchtpu_aot_autograd_save_on_tpu(tmp_path):
+def test_skip_torchtpu_aot_autograd_save_on_tpu(tmp_path, monkeypatch):
     from tests.distributed.tpu_test_utils import run_in_isolated_process
 
+    inductor_dir = str(tmp_path / "inductor")
+    monkeypatch.setenv("TORCH_TPU_TIER2_COMPILATION_CACHE", "disabled")
+    monkeypatch.delenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", raising=False)
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", inductor_dir)
+    monkeypatch.setenv("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
+
     run_in_isolated_process(
-        partial(_verify_skip_save_on_tpu, str(tmp_path)), timeout=180
+        partial(_verify_skip_save_on_tpu, str(tmp_path), inductor_dir), timeout=180
     )
