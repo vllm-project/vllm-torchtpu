@@ -288,3 +288,12 @@ def test_step_limit_clamps_to_the_full_step():
     # 14000 tokens a stage round up to 17408 with 4352-token granules, past
     # the 16K step.
     assert step_limit(8 * 14000, 8, 4352, 16384) == 16384
+
+
+def test_effective_tokens_scales_by_quadratic_attention_slope():
+    model = _model()
+    assert model.effective_tokens(0, 16384) == 0.0
+    cold = model.effective_tokens(4096, 0)
+    warm = model.effective_tokens(4096, 131072)
+    assert cold > 4096
+    assert warm > 2.0 * cold

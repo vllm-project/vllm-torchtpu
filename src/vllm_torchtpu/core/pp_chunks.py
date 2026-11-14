@@ -241,6 +241,20 @@ class StepCostModel:
             token_pairs + token_squares / 2
         )
 
+    def effective_tokens(self, tokens: int, prefix: int) -> float:
+        """Linear-equivalent token cost of ``tokens`` new tokens behind
+        ``prefix`` cached tokens under the stage's attention slope."""
+        if tokens <= 0:
+            return 0.0
+        top = self.buckets[-1]
+        linear_per_tok = self.linear_ms[top] / top if top > 0 else 0.0
+        if linear_per_tok <= 0.0 or self.attn_ms_per_token_pair <= 0.0:
+            return float(tokens)
+        attn_pairs = float(tokens) * max(prefix, 0) + float(tokens) * tokens / 2.0
+        return (
+            float(tokens) + (self.attn_ms_per_token_pair / linear_per_tok) * attn_pairs
+        )
+
     def chunk(
         self,
         prefix: int,

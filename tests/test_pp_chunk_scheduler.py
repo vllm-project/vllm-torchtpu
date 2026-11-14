@@ -48,10 +48,13 @@ def _scheduler(
     schedule=None,
     lone_prompt=True,
     equal_cost=True,
+    **options,
 ) -> TpuPipelineChunkScheduler:
     """A scheduler as the engine hook leaves it: with ``cost``, after
     ``install_cost_model``; with only ``granularity``, after
-    ``install_chunk_limits``."""
+    ``install_chunk_limits``. Built without __init__; ``options`` sets option
+    attributes such as ``_quadratic_cost=True`` (all off otherwise, as on an
+    engine that sets no tpu_pp_scheduler option)."""
     scheduler = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
     scheduler._lone_prompt = lone_prompt
     scheduler._equal_cost = equal_cost
@@ -78,6 +81,10 @@ def _scheduler(
     scheduler._seeded = set()
     scheduler._clips = 0
     scheduler._waits = 0
+    scheduler._retention = None
+    scheduler.kv_cache_manager = SimpleNamespace()
+    for name, value in options.items():
+        setattr(scheduler, name, value)
     return scheduler
 
 
@@ -548,3 +555,131 @@ def test_an_unclipped_mtp_prompt_runs_whole_with_internal_checkpoints(
     assert scheduler._mamba_block_aligned_split(request, 8191) == chunk
     assert scheduler._clips == 0
     assert scheduler._step_prefill_tokens == chunk
+
+
+class _Retention:
+    """Records the retention calls and clips every chunk at ``stop``."""
+
+    enabled = True
+
+    def __init__(self, stop=None, fail=False):
+        self.stop = stop
+        self.fail = fail
+        self.calls: list[tuple] = []
+
+    def pin_running(self, running):
+        self.calls.append(("pin", tuple(r.request_id for r in running)))
+        if self.fail:
+            raise RuntimeError("pin")
+
+    def begin_step(self):
+        self.calls.append(("begin",))
+
+    def prepare_prefill_split(self, request, start, num_new_tokens):
+        self.calls.append(("prepare", request.request_id, start, num_new_tokens))
+
+    def adjust_prefill_split(self, request, start, aligned):
+        self.calls.append(("adjust", request.request_id, start, aligned))
+        if self.stop is not None and start < self.stop < start + aligned:
+            return self.stop - start
+        return aligned
+
+    def snapshot_attention_blocks(self, request):
+        self.calls.append(("snapshot", request.request_id))
+        return ["attn"]
+
+    def on_request_freed(self, request, attn_blocks):
+        self.calls.append(("freed", request.request_id, attn_blocks))
+
+
+def test_retention_stops_apply_after_the_time_budget_clip():
+    # The clip leaves 4096 of 16384; retention stops the chunk 1024 in.
+    scheduler = _scheduler(cost=_model(), step_limit=4096)
+    scheduler._retention = _Retention(stop=1024)
+    request = _request(0, 65536)
+    got = scheduler._mamba_block_aligned_split(request, 16384)
+    assert got == 1024
+    assert scheduler._retention.calls == [
+        ("prepare", "r", 0, 4096),
+        ("adjust", "r", 0, 4096),
+    ]
+    assert scheduler._step_tokens == 1024
+    assert scheduler._step_prefill_tokens == 1024
+
+
+def test_retention_runs_after_the_mamba_alignment():
+    scheduler = _scheduler(mamba_split=True, cost=_model(), step_limit=4096)
+    scheduler._retention = _Retention()
+    request = _request(0, 65536)
+    with patch.object(Scheduler, "_mamba_block_aligned_split", return_value=3840):
+        assert scheduler._mamba_block_aligned_split(request, 16384) == 3840
+    assert scheduler._retention.calls[-1] == ("adjust", "r", 0, 3840)
+
+
+def test_a_failing_retention_hook_disables_retention():
+    scheduler = _scheduler(running=[_decode("d")])
+    scheduler._retention = _Retention(fail=True)
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._retention is None
+
+
+def test_schedule_pins_the_running_requests():
+    scheduler = _scheduler(running=[_decode("d")])
+    retention = _Retention()
+    scheduler._retention = retention
+    output = SimpleNamespace(
+        total_num_scheduled_tokens=1, num_scheduled_tokens={"d": 1}
+    )
+    with patch.object(Scheduler, "schedule", return_value=output):
+        assert scheduler.schedule() is output
+    assert retention.calls[:2] == [("pin", ("d",)), ("begin",)]
+
+
+def test_freeing_a_request_snapshots_its_attention_blocks_first():
+    scheduler = _scheduler()
+    retention = _Retention()
+    scheduler._retention = retention
+    request = _request(100, 100, "f")
+    with patch.object(Scheduler, "_free_request_blocks", return_value=None) as base:
+        scheduler._free_request_blocks(request)
+    base.assert_called_once_with(request)
+    assert retention.calls == [("snapshot", "f"), ("freed", "f", ["attn"])]
+
+
+def test_a_finished_connector_request_is_pinned():
+    scheduler = _scheduler()
+    retention = _Retention()
+    scheduler._retention = retention
+    request = _request(100, 100, "c")
+    with patch.object(Scheduler, "_connector_finished", return_value=(True, None)):
+        assert scheduler._connector_finished(request) == (True, None)
+    with patch.object(Scheduler, "_connector_finished", return_value=(False, None)):
+        scheduler._connector_finished(request)
+    assert retention.calls == [("pin", ("c",))]
+
+
+def test_a_padded_last_prompt_token_is_cut_back_to_the_prompt_end():
+    scheduler = _scheduler(cost=_model())
+    request = _request(0, 2 * 2176 + 1)
+    got = scheduler._mamba_block_aligned_split(
+        request, 2, num_new_local_computed_tokens=2 * 2176
+    )
+    assert got == 1
+
+
+def test_running_srpf_orders_by_quadratic_effective_cost():
+    model = _model()
+    # r_deep has fewer raw remaining tokens (3800) than r_shallow (4096),
+    # but r_deep is behind a 160K prefix so its quadratic prefill cost is
+    # much higher than r_shallow at prefix 0.
+    r_deep = _request(163840, 163840 + 3800, "deep")
+    r_shallow = _request(0, 4096, "shallow")
+    scheduler = _scheduler(
+        cost=model, running=[r_deep, r_shallow], _quadratic_cost=True
+    )
+    scheduler._srpf_running = True
+    scheduler._paw_aging_tok_per_s = 0.0
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert [r.request_id for r in scheduler.running] == ["shallow", "deep"]

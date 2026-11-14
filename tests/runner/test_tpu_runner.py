@@ -2158,7 +2158,7 @@ class TestInitializeAttentionKernelsThreshold:
     local RPA kernel are pinned to 1, which pulls the shared threshold down
     to 1."""
 
-    def _make_runner(self, widths, draft_names=(), draft_tp=2):
+    def _make_runner(self, widths, draft_names=(), draft_tp=2, target_tp=8, pp=1):
         from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 
         runner = MagicMock(spec=TPUModelRunner)
@@ -2166,6 +2166,9 @@ class TestInitializeAttentionKernelsThreshold:
         runner.model = None
         runner.mesh = MagicMock()
         runner.vllm_config = MagicMock()
+        runner.parallel_config = SimpleNamespace(
+            tensor_parallel_size=target_tp, pipeline_parallel_size=pp
+        )
         runner.reorder_batch_threshold = 1
         runner.drafter = SimpleNamespace(_draft_attn_layer_names=set(draft_names))
         runner.speculative_config = SimpleNamespace(draft_tensor_parallel_size=draft_tp)
@@ -2212,6 +2215,32 @@ class TestInitializeAttentionKernelsThreshold:
         # a 1-wide draft must hold the threshold at 1: K+1-token verify windows
         # must not reach its DECODE stage.
         assert runner.reorder_batch_threshold == 1
+
+    def test_draft_on_a_tp1_pipeline_stage_keeps_the_target_kernel(self):
+        """On a pipeline stage with a tp=1 target the draft is not replicated
+        relative to the target: it keeps the target's kernel, which reads the
+        pool's KV layout, and its verify width."""
+        runner, layers = self._make_runner(
+            {"target": 4, "draft": 4},
+            draft_names=("draft",),
+            draft_tp=1,
+            target_tp=1,
+            pp=8,
+        )
+        self._run(runner, layers)
+        assert layers["draft"].impl.decode_query_size == 4
+        assert "_kernel_entry" not in vars(layers["draft"].impl)
+        assert runner.reorder_batch_threshold == 4
+
+    def test_draft_on_a_single_stage_tp1_target_keeps_the_local_kernel(self):
+        """Without a pipeline a tp=1 draft under a tp=1 target keeps the
+        local kernel and its 1-wide tile, as before."""
+        runner, layers = self._make_runner(
+            {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=1, target_tp=1
+        )
+        self._run(runner, layers)
+        assert layers["draft"].impl.decode_query_size == 1
+        assert "_kernel_entry" in vars(layers["draft"].impl)
 
     def test_sharded_draft_keeps_verify_width(self):
         """Regression: pinning a sharded draft to 1 while the threshold stayed
