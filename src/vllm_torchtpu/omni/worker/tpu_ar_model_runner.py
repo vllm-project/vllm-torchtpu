@@ -13,7 +13,7 @@
 # limitations under the License.
 """TPU model runner for autoregressive vLLM-Omni stages."""
 
-from typing import Any, Protocol, cast
+from typing import Any
 
 import torch
 from vllm.sequence import IntermediateTensors
@@ -33,12 +33,6 @@ from vllm_torchtpu.omni.worker.tpu_model_runner import OmniTPUModelRunner
 # vLLM-Omni models set them in ``__init__``: the Qwen3-Omni thinker sets both
 # to False, the talker sets both to True.
 _UNSUPPORTED_HOOK_FLAGS = ("has_preprocess", "has_postprocess")
-
-
-class _OmniStageModel(Protocol):
-    """The part of a vLLM-Omni stage model ``forward_model`` relies on."""
-
-    def make_omni_output(self, model_outputs: Any, **kwargs: Any) -> OmniOutput: ...
 
 
 class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
@@ -137,5 +131,6 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
         if isinstance(out, (list, tuple)) and len(out) == 1:
             out = out[0]
         if not isinstance(out, OmniOutput):
-            out = cast(_OmniStageModel, self.model).make_omni_output(out)
+            # pyrefly: ignore[not-callable]
+            out = self.model.make_omni_output(out)
         return out.text_hidden_states, None

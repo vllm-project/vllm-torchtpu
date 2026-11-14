@@ -56,6 +56,32 @@ def test_worker_base_refuses_unimplemented_orchestrator_hooks(method, args):
         getattr(worker, method)(*args)
 
 
+def _fake_worker_base_init(
+    self,
+    vllm_config,
+    local_rank,
+    rank,
+    distributed_init_method,
+    is_driver_worker=False,
+):
+    self.vllm_config = vllm_config
+    self.model_config = vllm_config.model_config
+    self.cache_config = vllm_config.cache_config
+    self.parallel_config = vllm_config.parallel_config
+    self.compilation_config = vllm_config.compilation_config
+    self.local_rank = local_rank
+    self.rank = rank
+    self.distributed_init_method = distributed_init_method
+    self.is_driver_worker = is_driver_worker
+
+
+def _fake_runner_init(self, vllm_config, device, **kwargs):
+    self.vllm_config = vllm_config
+    self.model_config = vllm_config.model_config
+    self.speculative_config = vllm_config.speculative_config
+    self.device = device
+
+
 def test_tpu_ar_worker_init_device_builds_ar_model_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -79,30 +105,6 @@ def test_tpu_ar_worker_init_device_builds_ar_model_runner(
         speculative_config=None,
         additional_config={},
     )
-
-    def _fake_worker_base_init(
-        self,
-        vllm_config,
-        local_rank,
-        rank,
-        distributed_init_method,
-        is_driver_worker=False,
-    ):
-        self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.cache_config = vllm_config.cache_config
-        self.parallel_config = vllm_config.parallel_config
-        self.compilation_config = vllm_config.compilation_config
-        self.local_rank = local_rank
-        self.rank = rank
-        self.distributed_init_method = distributed_init_method
-        self.is_driver_worker = is_driver_worker
-
-    def _fake_runner_init(self, vllm_config, device, **kwargs):
-        self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.speculative_config = vllm_config.speculative_config
-        self.device = device
 
     monkeypatch.setattr("vllm_torchtpu.patch_registry.apply", lambda *_, **__: None)
     monkeypatch.setattr(

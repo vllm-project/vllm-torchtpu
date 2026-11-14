@@ -47,9 +47,16 @@ AUDIO_CONFIG = Qwen3OmniMoeAudioEncoderConfig(
     downsample_hidden_size=32,
 )
 
-# 800 frames (8 s) is the exact 100-frame multiple the patch fixes; 801 takes
-# the partial-window branch across two attention segments.
-PARITY_LENGTHS = [800, 801]
+# 79 frames (< 100) exercises a single sub-window clip; 800 frames (8 s) is the
+# exact 100-frame multiple the patch fixes; 801 takes the partial-window branch
+# across two attention segments; [800, 801] exercises multi-clip batching in a
+# single forward call.
+PARITY_CLIP_LENGTHS = [
+    pytest.param([79], id="79"),
+    pytest.param([800], id="800"),
+    pytest.param([801], id="801"),
+    pytest.param([800, 801], id="800_801"),
+]
 
 # (max relative L2, max abs) vs float32 HF CPU reference (~2.5x measured on TPU v6e).
 ATTN_LIMITS = (1.0e-2, 3.0e-3)
@@ -131,8 +138,6 @@ def test_audio_encoder_layer_matches_cpu_reference(encoders) -> None:
     max_seqlen = 104
 
     ref_attn = ref.layers[0].self_attn(hidden, cu_seqlens_cpu, max_seqlen=max_seqlen)
-    if isinstance(ref_attn, tuple):
-        ref_attn = ref_attn[0]
     tpu_attn = tpu.layers[0].self_attn(
         hidden.to(device="tpu", dtype=torch.bfloat16),
         cu_seqlens_tpu,
@@ -161,31 +166,29 @@ def test_audio_encoder_layer_matches_cpu_reference(encoders) -> None:
     )
 
 
-@pytest.mark.parametrize("n_frames", PARITY_LENGTHS)
+@pytest.mark.parametrize("clip_lengths", PARITY_CLIP_LENGTHS)
 @torch.no_grad()
-def test_audio_encoder_matches_cpu_reference(encoders, n_frames: int) -> None:
+def test_audio_encoder_matches_cpu_reference(encoders, clip_lengths: list[int]) -> None:
     tpu, ref, _ = encoders
-    features = _make_mel_features(n_frames)
-    ref_lens = torch.tensor([n_frames], dtype=torch.long)
+    features = torch.cat([_make_mel_features(n) for n in clip_lengths], dim=1)
+    ref_lens = torch.tensor(clip_lengths, dtype=torch.long)
     reference = ref(features, ref_lens).last_hidden_state
 
-    feature_lens = torch.tensor([n_frames], dtype=torch.long, device="tpu")
+    feature_lens = torch.tensor(clip_lengths, dtype=torch.long, device="tpu")
     aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
     out = tpu(
         features.to(device="tpu", dtype=torch.bfloat16),
         feature_lens,
         aftercnn_lens,
     )
+    expected_tokens = int(_get_feat_extract_output_lengths(ref_lens).sum())
     assert feature_lens.device.type == "tpu"
     assert out.device.type == "tpu"
-    assert out.shape == (
-        int(_get_feat_extract_output_lengths(n_frames)),
-        AUDIO_CONFIG.output_dim,
-    )
+    assert out.shape == (expected_tokens, AUDIO_CONFIG.output_dim)
     assert_parity(
         out,
         reference,
-        name=f"audio encoder ({n_frames} frames)",
+        name=f"audio encoder ({clip_lengths} frames)",
         max_rel_l2=END_TO_END_LIMITS[0],
         max_abs=END_TO_END_LIMITS[1],
     )
