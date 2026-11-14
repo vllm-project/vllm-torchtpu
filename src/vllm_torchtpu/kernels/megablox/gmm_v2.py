@@ -1040,7 +1040,14 @@ def calculate_tiling(
 
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
-    max_num_buckets = 4
+    large_group_cutoff = 64
+    capped_buckets = 2
+    default_buckets = 4
+    is_sparse_large_group = (
+        dims.size_group > large_group_cutoff
+        and dims.size_m // max(dims.size_group, 1) < large_group_cutoff
+    )
+    max_num_buckets = capped_buckets if is_sparse_large_group else default_buckets
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
