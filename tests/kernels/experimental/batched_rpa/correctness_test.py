@@ -449,6 +449,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             keep[nan_rows] = False
             output, expected = output[keep], expected[keep]
             self.assertTrue(jnp.isfinite(output).all().item())
+        self.assertFalse(
+            jnp.any(jnp.isnan(output)).item(),
+            "output contains NaNs",
+        )
         self.assertAllClose(output, expected, atol=tol, rtol=tol)
         self.assertTrue(
             _assert_cache_equal(updated_kv_cache, expected_kv_cache).item(),
@@ -946,6 +950,112 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             dtype,
             num_pages,
             soft_cap=soft_cap,
+        )
+
+    @parameterized.product(
+        dist=[(1, 1, 1), (0, 0, 1)],
+    )
+    def test_ragged_paged_attention_static_skip_mixed(self, dist):
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        rng = np.random.default_rng(1234)
+        dtype = jnp.bfloat16
+        num_q_heads, num_kv_heads = 8, 1
+        head_dim = 128
+        page_size = 128
+        num_pages = 32
+        max_num_seq = 8
+        pages_per_seq = 8
+        q_len, kv_len = 4, 260
+
+        q = jnp.array(
+            rng.random((4, num_q_heads, head_dim), dtype=np.float32), dtype=dtype
+        )
+        k = jnp.array(
+            rng.random((4, num_kv_heads, head_dim), dtype=np.float32), dtype=dtype
+        )
+        v = jnp.array(
+            rng.random((4, num_kv_heads, head_dim), dtype=np.float32), dtype=dtype
+        )
+        kv_packing = utils.get_dtype_packing(dtype)
+        num_kv_heads_x2 = utils.align_to(num_kv_heads * 2, kv_packing)
+        kv_cache = jnp.array(
+            rng.random(
+                (
+                    num_pages,
+                    page_size,
+                    num_kv_heads_x2 // kv_packing,
+                    kv_packing,
+                    head_dim,
+                ),
+                dtype=np.float32,
+            ),
+            dtype=dtype,
+        )
+        kv_lens = jnp.zeros((max_num_seq,), dtype=jnp.int32).at[0].set(kv_len)
+        page_indices = jnp.arange(max_num_seq * pages_per_seq, dtype=jnp.int32)
+        cu_q_lens = jnp.zeros((max_num_seq + 1,), dtype=jnp.int32).at[1:].set(q_len)
+        distribution = jnp.array(dist, dtype=jnp.int32)
+
+        expected, expected_kvc = ref_ragged_paged_attention(
+            q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution
+        )
+        actual, actual_kvc = wrapper.ragged_paged_attention(
+            q,
+            k,
+            v,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+            decode_query_size=4,
+        )
+        self.assertAllClose(actual, expected, atol=0.2, rtol=0.2)
+        self.assertTrue(_assert_cache_equal(actual_kvc, expected_kvc).item())
+
+    @parameterized.product(
+        kv_layout=[
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+            configs.KVLayout.SEQ_ALONG_LANE,
+        ],
+        dtype=[jnp.float32, jnp.bfloat16],
+        test_case=["decode", "partial_query_block"],
+    )
+    def test_ragged_paged_attention_unattended_nan_in_v(
+        self,
+        kv_layout: configs.KVLayout,
+        dtype: Any,
+        test_case: str,
+    ):
+        """Regression test for unattended V masking with NaNs.
+
+        Verifies that NaNs in unattended KV page tails and unused batch slots
+        do not poison attention output with NaNs via 0.0 * NaN = NaN.
+        Covers both pure decode and partial query blocks (q_len < bq_sz).
+        """
+        num_heads = (16, 2)
+        head_dim = 128
+        page_size = 128 if kv_layout == configs.KVLayout.SEQ_ALONG_LANE else 16
+        num_pages = 100
+
+        seq_lens = (
+            [(1, 10), (1, 25), (1, 80)]
+            if test_case == "decode"
+            else [(37, 50)]  # Partial query block where q_len < bq_sz (e.g. 37 < 64)
+        )
+
+        self._test_ragged_paged_attention(
+            seq_lens,
+            num_heads,
+            head_dim,
+            page_size,
+            dtype,
+            dtype,
+            num_pages,
+            kv_layout=kv_layout,
+            bkv_sz=128,
         )
 
     @parameterized.product(

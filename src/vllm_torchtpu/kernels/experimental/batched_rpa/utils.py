@@ -94,9 +94,10 @@ def strided_store(ref, start, sz, step, val):
     """Stores data to HBM with strided access, handling 128-lane alignment."""
     assert get_dtype_packing(ref.dtype) == 1
     assert ref.dtype == val.dtype
-    assert ref.shape == val.shape
-    assert ref.ndim == 2
+    assert ref.ndim == 2 and val.ndim == 2
     rows, cols = ref.shape
+    assert val.shape == (sz // step, cols)
+    assert start + sz <= rows
     num_lanes = pltpu.get_tpu_info().num_lanes
     assert cols % num_lanes == 0
     folds = cols // num_lanes

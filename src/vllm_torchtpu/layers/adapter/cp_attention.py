@@ -35,6 +35,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     wrapper as _batched_rpa_wrapper,
 )
+from vllm_torchtpu.layers.adapter import native_fp8_scope
 from vllm_torchtpu.utils import synchronize_tensors
 
 # ---------------------------------------------------------------------------
@@ -100,6 +101,8 @@ def _pallas_rpa_kernel_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF,
+    tuned_tiles: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One DCP pass (CACHE_ONLY or NEW_TOKENS_ONLY). Returns (new_kv_cache,
     output, lse). decode_query_size widens the DECODE bucket so speculative
@@ -134,6 +137,8 @@ def _pallas_rpa_kernel_dcp(
         decode_query_size=decode_query_size,
         return_lse=True,
         kv_layout=kv_layout,
+        tuned_tiles=tuned_tiles,
+        **native_fp8_scope.kernel_kwargs(attention_modes),
     )
     return new_kv_cache, output, lse
 
@@ -199,6 +204,8 @@ def build_dcp_kernels(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF,
+    tuned_tiles: bool = False,
 ) -> tuple:
     """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops.
 
@@ -222,6 +229,8 @@ def build_dcp_kernels(
         cp_rank,
         kv_layout,
         decode_query_size,
+        attention_modes,
+        tuned_tiles,
     )
     cache_key = ("dcp_cache", *base_key)
     new_key = ("dcp_new", *base_key)
@@ -242,6 +251,8 @@ def build_dcp_kernels(
             attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
+            attention_modes=attention_modes,
+            tuned_tiles=tuned_tiles,
         )
         cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn
@@ -258,6 +269,8 @@ def build_dcp_kernels(
             attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
+            attention_modes=attention_modes,
+            tuned_tiles=tuned_tiles,
         )
         cached_new = _DCP_KERNEL_REGISTRY[new_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_new_{_alloc_instance_id()}", fn
@@ -289,6 +302,8 @@ def forward_with_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF,
+    tuned_tiles: bool = False,
 ) -> torch.Tensor:
     """Two-pass DCP attention forward.
     1. CACHE_ONLY: query is all-gathered by heads to attend every rank's KV
@@ -297,6 +312,9 @@ def forward_with_dcp(
         full local K/V for this step), so this rank's own heads attend
             directly; no gather/combine needed.
 
+    `attention_modes` and `tuned_tiles` must be the layer's, as given to
+    `build_dcp_kernels` when its kernels were prebuilt: the lookup below then
+    finds those ops instead of building new ones while torch.compile traces.
     """
     dcp_group = get_dcp_group()
     if dcp_group is None:
@@ -317,6 +335,8 @@ def forward_with_dcp(
         cp_rank=dcp_rank,
         kv_layout=kv_layout,
         decode_query_size=decode_query_size,
+        attention_modes=attention_modes,
+        tuned_tiles=tuned_tiles,
     )
 
     query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)

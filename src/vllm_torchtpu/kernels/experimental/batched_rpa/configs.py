@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Hardware-tuned block size configurations for Batched Ragged Paged Attention (RPA).
+
+Defines query (`B_q`) and KV page (`B_kv`) tiling parameters across batch sizes,
+head dimensions, and KV cache data types on TPU.
+"""
+
 import dataclasses
 import enum
 import math
@@ -22,6 +28,13 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
+
+
+def _get_tpu_info() -> pltpu.TpuInfo:
+    try:
+        return pltpu.get_tpu_info()
+    except ValueError:
+        return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -174,6 +187,26 @@ class ServingConfigs:
     return_lse: bool = False
     skip_kv_update: bool = False
     mask_invalid_v: bool | None = None
+    # Run the DECODE kernel's matmuls natively in the fp8 KV dtype instead of
+    # dequantizing K / V: "qk" quantizes q per (token, head) row, "pv"
+    # quantizes the softmax weights per row, "qkpv" does both. A "2" after
+    # either ("qk2", "pv2", "qk2pv2") splits that operand into fp8 high and
+    # residual halves stacked along the matmul rows (~bf16 accuracy for 2x
+    # LHS rows). An "s" after either ("qks", "pvs") takes the static scale
+    # the prefill path uses instead of a per-row one: "qks" casts q as is,
+    # "pvs" casts the softmax weights times P_SCALE. Empty: off.
+    native_fp8: str = ""
+    # The same for the PREFILL and MIXED kernels: "qk", "pv", "qkpv", each
+    # optionally with "s" for a static operand scale instead of a per-row
+    # one. "qks" casts q to fp8 as is (q after q_norm and RoPE sits well
+    # inside the e4m3 range); "pvs" casts the softmax weights times a fixed
+    # power of two (flash_attention.P_SCALE) and divides it out with l.
+    native_fp8_prefill: str = ""
+    # Run the DECODE softmax in base 2: log2(e) is folded into the score
+    # scale and the exponentials are exp2. Equal in exact arithmetic; q (or
+    # the scores) takes one extra rounding of the folded scale, so results
+    # differ from the base-e path in the last bits.
+    decode_exp2: bool = False
 
     def __post_init__(self):
         if self.mask_invalid_v is None:
@@ -182,6 +215,31 @@ class ServingConfigs:
                 "mask_invalid_v",
                 self.kv_layout == KVLayout.SEQ_ALONG_LANE,
             )
+
+    def native_fp8_split(self, which: str) -> bool:
+        """Whether the native fp8 `which` operand is split into hi/lo halves."""
+        return f"{which}2" in self.native_fp8
+
+    def native_fp8_static(self, which: str) -> bool:
+        """Whether the decode `which` operand takes the static fp8 scale."""
+        return f"{which}s" in self.native_fp8
+
+    def native_fp8_prefill_static(self, which: str) -> bool:
+        """Whether the prefill `which` operand takes the static fp8 scale."""
+        return f"{which}s" in self.native_fp8_prefill
+
+    def native_fp8_enabled(self, which: str, *, prefill: bool = False) -> bool:
+        """Whether the native fp8 `which` ("qk" or "pv") matmul is enabled."""
+        if which not in (self.native_fp8_prefill if prefill else self.native_fp8):
+            return False
+        is_fp8_kv = jnp.dtype(self.dtype_kv) in (
+            jnp.dtype(jnp.float8_e4m3fn),
+            jnp.dtype(jnp.float8_e5m2),
+        )
+        # The static-q-scale path already runs QK in the KV dtype.
+        if which == "qk" and self.scale_q is not None:
+            return False
+        return is_fp8_kv
 
     @property
     def max_decode_bkv_p_new(self) -> int:
@@ -274,8 +332,9 @@ class RpaConfigs:
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
 
+        tpu_info = _get_tpu_info()
         smem_limit_bytes = (
-            pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024
+            tpu_info.smem_capacity_bytes - 32 * 1024
         ) * self.serve.smem_fraction_limit_for_schedule_generation
         available_bytes = smem_limit_bytes - fixed_bytes
 
@@ -295,7 +354,7 @@ class RpaConfigs:
 
         max_steps_ub = available_bytes // bytes_per_step
 
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = tpu_info.num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
         return int(max_steps_ub)
 
@@ -350,14 +409,15 @@ class RpaConfigs:
 
     @property
     def aligned_q_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = _get_tpu_info().num_lanes
         return utils.align_to(self.model.head_dim, num_lanes)
 
     # Actual head dimension used for compute, does not include scale factors.
     @property
     def compute_kv_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        tpu_info = _get_tpu_info()
+        num_lanes = tpu_info.num_lanes
+        num_sublanes = tpu_info.num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return utils.align_to(self.model.head_dim, num_sublanes * kv_packing)
@@ -367,8 +427,9 @@ class RpaConfigs:
     # per_token_scale is enabled.
     @property
     def aligned_kv_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        tpu_info = _get_tpu_info()
+        num_lanes = tpu_info.num_lanes
+        num_sublanes = tpu_info.num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
@@ -464,7 +525,7 @@ class RpaConfigs:
         the sublane dim, where single tokens are addressable.
         """
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            return pltpu.get_tpu_info().num_lanes
+            return _get_tpu_info().num_lanes
         return 1
 
     @property
@@ -509,7 +570,7 @@ class RpaConfigs:
 
     @property
     def lm_scratch_shape(self):
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = _get_tpu_info().num_lanes
         return (
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
@@ -518,7 +579,7 @@ class RpaConfigs:
 
     @property
     def lse_vmem_shape(self):
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = _get_tpu_info().num_lanes
         q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // self.serve.packing_q
         return (
             self.block.batch_size,
@@ -539,8 +600,17 @@ class RpaConfigs:
 
     @property
     def max_schedule_size_multiplier(self) -> int:
-        # By default, setting an upper bound of ~5x the SMEM capacity on schedule.
-        return self.serve.max_schedule_size_multiplier
+        """HBM schedule size in chunks of max_steps_ub steps: the serving
+        value, raised (up to 128) to this shape's worst case of (q-block,
+        KV-block) pairs. Past it the schedule kernel drops steps rather than
+        write out of bounds (see rpa_metadata_schedule_kernel)."""
+        q_blocks = self.serve.num_seqs  # DECODE: q_len <= bq per sequence
+        if self.mode != RpaCase.DECODE:
+            q_blocks += self.serve.total_q_tokens // self.bq_sz
+        kv_tokens = self.serve.pages_per_seq * self.serve.page_size
+        steps = pl.cdiv(q_blocks * pl.cdiv(kv_tokens, self.bkv_sz), self.batch_size)
+        need = min(pl.cdiv(steps, self.max_steps_ub), 128)
+        return max(self.serve.max_schedule_size_multiplier, need)
 
     def validate_inputs(
         self,
