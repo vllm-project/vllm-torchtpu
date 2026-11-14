@@ -3,17 +3,53 @@
 
 import hashlib
 import json
+import os
+import threading
 from collections.abc import Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import torch
 
 
+def _sha256(tensor: torch.Tensor) -> str:
+    # A uint8 view also supports BF16 and FP8 without conversion or a
+    # second tensor-sized allocation.
+    raw = memoryview(tensor.detach().reshape(-1).view(torch.uint8).numpy())
+    try:
+        return hashlib.sha256(raw).hexdigest()
+    finally:
+        del raw
+
+
 class LoadedWeightIdentity:
+    """Per-tensor ``(dtype, shape, sha256)`` of what this rank loaded.
+
+    Hashing every loaded byte is ~1.7 GB/s on one core, ~46 s of a TP8/EP8
+    decode rank's ~76 GB load when done inline in the loading thread. With
+    VLLM_TPU_PD_IDENTITY_HASH_THREADS=N > 0 the digests are computed on N
+    threads (hashlib releases the GIL, so they scale) while loading goes on;
+    at most VLLM_TPU_PD_IDENTITY_HASH_INFLIGHT_MB of tensors (default 4096) are
+    held for hashing at once. The records, and so the identity, are the same.
+    """
+
     def __init__(self) -> None:
         self._records: dict[str, tuple[str, tuple[int, ...], str]] = {}
+        self._names: set[str] = set()
+        threads = int(os.environ.get("VLLM_TPU_PD_IDENTITY_HASH_THREADS", "0") or 0)
+        self._pool = ThreadPoolExecutor(threads, "pd-identity") if threads > 0 else None
+        self._pending: dict[str, tuple[str, tuple[int, ...], Future]] = {}
+        budget = int(os.environ.get("VLLM_TPU_PD_IDENTITY_HASH_INFLIGHT_MB", "4096"))
+        self._budget = max(budget, 1) << 20
+        self._inflight = 0
+        self._cv = threading.Condition()
+
+    def _release(self, nbytes: int) -> None:
+        with self._cv:
+            self._inflight -= nbytes
+            self._cv.notify_all()
 
     def observe_tensor(self, name: str, tensor: torch.Tensor) -> None:
-        if name in self._records:
+        if name in self._names:
             raise ValueError(f"Duplicate PD checkpoint tensor: {name}")
         if (
             tensor.device.type != "cpu"
@@ -22,16 +58,33 @@ class LoadedWeightIdentity:
             or tensor.is_neg()
         ):
             raise ValueError("PD identity requires contiguous CPU checkpoint tensors")
-        # A uint8 view also supports BF16 and FP8 without conversion or a
-        # second tensor-sized allocation. Keep no reference after loading.
-        raw = memoryview(tensor.detach().reshape(-1).view(torch.uint8).numpy())
-        digest = hashlib.sha256(raw).hexdigest()
-        self._records[name] = (
-            str(tensor.dtype),
-            tuple(tensor.shape),
-            digest,
-        )
-        del raw
+        self._names.add(name)
+        meta = (str(tensor.dtype), tuple(tensor.shape))
+        if self._pool is None:
+            self._records[name] = (*meta, _sha256(tensor))
+            return
+        nbytes = tensor.numel() * tensor.element_size()
+        with self._cv:
+            # A tensor larger than the budget still goes once nothing else waits.
+            while self._inflight and self._inflight + nbytes > self._budget:
+                self._cv.wait()
+            self._inflight += nbytes
+
+        def work(t=tensor, n=nbytes):
+            try:
+                return _sha256(t)
+            finally:
+                self._release(n)
+
+        self._pending[name] = (*meta, self._pool.submit(work))
+
+    def _drain(self) -> None:
+        for name, (dtype, shape, fut) in self._pending.items():
+            self._records[name] = (dtype, shape, fut.result())
+        self._pending.clear()
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
 
     def observe(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -42,9 +95,11 @@ class LoadedWeightIdentity:
 
     def records(self) -> dict[str, tuple[str, tuple[int, ...], str]]:
         """Per-tensor ``(dtype, shape, sha256)`` records of what this rank loaded."""
+        self._drain()
         return dict(self._records)
 
     def finish(self, *, name_fragment: str | None = None) -> str:
+        self._drain()
         return merged_identity([self._records], name_fragment=name_fragment)
 
 
