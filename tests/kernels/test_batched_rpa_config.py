@@ -199,3 +199,33 @@ def test_validate_inputs_rejects_unaligned_bkv_sz(kv_layout, expected_error):
                 cu_q_lens=jnp.zeros((num_seqs + 1,), jnp.int32),
                 distribution=jnp.zeros((3,), jnp.int32),
             )
+
+
+def test_calculate_block_sizes_shrinks_bq_when_page_aligned_bkv_does_not_fit():
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=32,
+        num_kv_heads=32,
+        head_dim=128,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=8,
+        page_size=512,
+        total_q_tokens=512,
+        num_page_indices=8 * 17,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.bfloat16,
+        dtype_out=jnp.bfloat16,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+    )
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        decode_blocks, prefill_blocks = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, 64 * 1024 * 1024
+        )
+    assert prefill_blocks.bkv_sz == 512
+    assert prefill_blocks.bq_sz == 256
+    assert prefill_blocks.batch_size == 1
+    assert decode_blocks.bkv_sz % 512 == 0

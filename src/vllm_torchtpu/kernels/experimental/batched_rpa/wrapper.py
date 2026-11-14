@@ -410,6 +410,14 @@ def calculate_block_sizes(
         if batch_size == 0:
             raise ValueError("Cannot find batch size that fits within VMEM limit.")
 
+        if fixed_bq_sz is None:
+            while (
+                bq_sz > mxu_column_size
+                and calculate_vmem_usage(batch_size, bq_sz, bkv_sz)
+                > capped_vmem_limit_bytes
+            ):
+                bq_sz = max(mxu_column_size, bq_sz - mxu_column_size)
+
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
         while (
