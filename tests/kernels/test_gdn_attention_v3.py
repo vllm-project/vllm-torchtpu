@@ -26,6 +26,12 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
+    compute_gdn as pcp_compute_gdn,
+)
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
+    config as pcp_config,
+)
 from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config, tiling, wrapper
 
 
@@ -668,26 +674,38 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
             )
 
 
+_CHUNKED_IMPLS = (
+    ("v3", compute_gdn, config),
+    ("pcp_fused", pcp_compute_gdn, pcp_config),
+)
+
+
 class GDNChunkedComputeTest(parameterized.TestCase):
     @parameterized.named_parameters(
-        dict(testcase_name="ratio_1", n_kq=2, n_v=2, valid_len=16),
-        dict(testcase_name="ratio_2", n_kq=2, n_v=4, valid_len=16),
-        dict(testcase_name="ratio_4", n_kq=2, n_v=8, valid_len=16),
-        dict(testcase_name="ratio_8", n_kq=2, n_v=16, valid_len=16),
         dict(
-            testcase_name="partial_chunk_zero_trailing_beta",
-            n_kq=2,
-            n_v=16,
-            valid_len=11,
-        ),
+            testcase_name=f"{impl_name}_{case_name}",
+            compute_mod=compute_mod,
+            config_mod=config_mod,
+            n_kq=n_kq,
+            n_v=n_v,
+            valid_len=valid_len,
+        )
+        for impl_name, compute_mod, config_mod in _CHUNKED_IMPLS
+        for case_name, n_kq, n_v, valid_len in (
+            ("ratio_1", 2, 2, 16),
+            ("ratio_2", 2, 4, 16),
+            ("ratio_4", 2, 8, 16),
+            ("ratio_8", 2, 16, 16),
+            ("partial_chunk_zero_trailing_beta", 2, 16, 11),
+        )
     )
     def test_chunked_gdn_per_seq_shared_kq_heads_matches_recurrent_ref(
-        self, n_kq: int, n_v: int, valid_len: int
+        self, compute_mod, config_mod, n_kq: int, n_v: int, valid_len: int
     ):
         chunk, d = 16, 128
         k0, k1, k2, k3, k4, k5 = jax.random.split(jax.random.key(41), 6)
-        q = compute_gdn.l2_norm(jax.random.normal(k0, (n_kq, chunk, d))) * (d**-0.5)
-        k = compute_gdn.l2_norm(jax.random.normal(k1, (n_kq, chunk, d)))
+        q = compute_mod.l2_norm(jax.random.normal(k0, (n_kq, chunk, d))) * (d**-0.5)
+        k = compute_mod.l2_norm(jax.random.normal(k1, (n_kq, chunk, d)))
         v = jax.random.normal(k2, (n_v, chunk, d))
         gating_log = -jnp.abs(jax.random.normal(k3, (1, chunk, n_v))) * 0.1
         beta = jax.nn.sigmoid(jax.random.normal(k4, (1, chunk, n_v)))
@@ -697,9 +715,9 @@ class GDNChunkedComputeTest(parameterized.TestCase):
             beta = jnp.where(valid_mask, beta, 0.0)
         state_prev = jax.random.normal(k5, (n_v, d, d))
         f32 = jnp.dtype(jnp.float32)
-        cfg = config.GDNConfig(
-            mode=config.GDNMode.PER_SEQ,
-            dtypes=config.Dtypes(f32, f32, f32, f32, f32),
+        cfg = config_mod.GDNConfig(
+            mode=config_mod.GDNMode.PER_SEQ,
+            dtypes=config_mod.Dtypes(f32, f32, f32, f32, f32),
             batch_size=chunk,
             dim_size=(2 * n_kq + n_v) * d,
             kernel_size=4,
@@ -711,10 +729,10 @@ class GDNChunkedComputeTest(parameterized.TestCase):
         )
 
         with jax.default_matmul_precision("float32"):
-            out, state = compute_gdn.chunked_gdn_per_seq(
+            out, state = compute_mod.chunked_gdn_per_seq(
                 q, k, v, gating_log, beta, state_prev, cfg
             )
-            ref_out, ref_state = compute_gdn.recurrent_gdn_per_seq(
+            ref_out, ref_state = compute_mod.recurrent_gdn_per_seq(
                 q[:, :, None],
                 k[:, :, None],
                 k[:, :, :, None],
