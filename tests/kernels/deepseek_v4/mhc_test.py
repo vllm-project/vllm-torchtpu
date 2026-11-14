@@ -590,5 +590,52 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         )
 
 
+@pytest.mark.tpu_test
+class MhcSingleStreamTpuTest(parameterized.TestCase):
+    def test_pre_and_fused(self):
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import (
+            fused_post_pre_kernel,
+            pre_kernel,
+        )
+
+        rng = np.random.default_rng(15)
+        _, fn, hc_scale, hc_base = _make_pre_inputs(rng, 17, 7168)
+        fn, sc, hb = jnp.asarray(fn), jnp.asarray(hc_scale), jnp.asarray(hc_base)
+        x1 = jnp.asarray(rng.standard_normal((17, 7168), np.float32)).astype(
+            jnp.bfloat16
+        )
+        sub = jnp.asarray(rng.standard_normal((17, 7168), np.float32)).astype(
+            jnp.bfloat16
+        )
+        rep = jnp.repeat(x1[:, None, :], HC_MULT, axis=1)
+        gates = (RMS_EPS, HC_PRE_EPS, HC_SINKHORN_EPS, HC_POST_MULT_VALUE, 20)
+
+        def check(got, want, kinds):
+            for g, w, kind in zip(got, want, kinds):
+                g, w = _to_np(g), _to_np(w)
+                if kind == "exact":
+                    np.testing.assert_array_equal(g, w)
+                else:
+                    rtol, atol = (
+                        (1e-5, 1e-7) if kind == "f32" else (BF16_RTOL, BF16_ATOL)
+                    )
+                    np.testing.assert_allclose(g, w, rtol=rtol, atol=atol)
+
+        want = pre_kernel.mhc_pre(rep, fn, sc, hb, *gates)
+        check(
+            pre_kernel.mhc_pre_single_stream(x1, fn, sc, hb, *gates),
+            want,
+            ("f32", "f32", "bf16"),
+        )
+        args = (want[0], want[1], fn, sc, hb, *gates)
+        check(
+            fused_post_pre_kernel.mhc_fused_post_pre(sub, x1, *args),
+            fused_post_pre_kernel.mhc_fused_post_pre(sub, rep, *args),
+            ("exact", "f32", "f32", "bf16"),
+        )
+
+
 if __name__ == "__main__":
     absltest.main()

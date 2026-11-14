@@ -286,8 +286,7 @@ class DSparkDeepseekV4Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        # Expand to hc_mult copies for hyper-connections ([T,H] -> [T,hc,H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        hidden_states = inputs_embeds
 
         residual = post_mix = res_mix = None
         for layer in self.layers:
