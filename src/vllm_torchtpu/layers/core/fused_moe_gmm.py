@@ -30,6 +30,10 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     gmm_v2,
     gmm_v2_mlp,
 )
+from vllm_torchtpu.kernels.megablox.moe_gather_reduce import (
+    can_use_gather_reduce,
+    gather_reduce,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -596,10 +600,11 @@ def moe_gmm(
             preferred_element_type=x.dtype,
             rhs_quant_dtype=rhs_quant_dtype,
         )
-    # The destination-major kernel packs source indices into 20 bits and
-    # processes 16-lane SparseCore tiles.
+    # The local combine kernels: the TensorCore gather-reduce, else the
+    # destination-major SparseCore kernel (source indices packed into 20 bits,
+    # 16-lane SparseCore tiles).
     use_local_ragged_combine = (
-        # Local SparseCore path; route-pair metadata needs at least two routes.
+        # The kernel routing path; route-pair metadata needs at least two routes.
         use_sparse_core
         and not use_ep
         and topk >= 2
@@ -618,6 +623,23 @@ def moe_gmm(
         except ValueError:
             # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
             tpu_info = None
+        # The TensorCore gather-reduce where it fits; at the shapes it was
+        # measured on it beats the SparseCore kernel below by 2.2-3.1x. Both
+        # keep v3's cutoff (two BF16 buffers use at least 60% of VMEM).
+        if (
+            tpu_info is not None
+            and gmm2_res.size * 4 >= tpu_info.vmem_capacity_bytes * 0.6
+            and can_use_gather_reduce(
+                gmm2_res, argsort_revert_indices.size, topk, tpu_info
+            )
+        ):
+            return gather_reduce(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                reduce_group_size=topk,
+            ).astype(x.dtype)
         sc_info = get_sparse_core_info(tpu_info)
         # Lane-aligned width, 16-lane SparseCore, and v3's own cutoff (two
         # BF16 buffers use at least 60% of VMEM).

@@ -134,10 +134,10 @@ def test_fused_moe_gmm_get_topk_weights_dtype(monkeypatch):
         (False, True, 0, jnp.bfloat16, 4096, 10, 682, None, 16, None),
         (False, True, 0, jnp.bfloat16, 4096, 10, 683, None, 16, "v3"),
         (False, True, 0, jnp.bfloat16, 4096, 10, 1025, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 3, 512, 4096, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 3, 512, 4096, 16, "tc"),
         (False, True, 0, jnp.bfloat16, 4096, 2, 1024, None, 16, None),
         (False, True, 0, jnp.bfloat16, 4096, 2, 1024, 2457, 16, None),
-        (False, True, 0, jnp.bfloat16, 4096, 2, 1024, 2458, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 2, 1024, 2458, 16, "tc"),
         (False, True, 0, jnp.float32, 4096, 10, 2048, None, 16, None),
         (False, True, 20480, jnp.bfloat16, 4096, 10, 2048, None, 16, None),
         (False, True, 20481, jnp.bfloat16, 4096, 10, 2048, None, 16, None),
@@ -145,9 +145,9 @@ def test_fused_moe_gmm_get_topk_weights_dtype(monkeypatch):
         (True, False, 0, jnp.bfloat16, 4, 2, 2, None, 16, None),
         (False, True, 0, jnp.float16, 4096, 10, 2048, None, 16, None),
         (False, True, 0, jnp.bfloat16, 512, 10, 1024, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 2048, 10, 1023, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 2048, 10, 1024, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 2048, 10, 1100, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 2048, 10, 1023, None, 16, "tc"),
+        (False, True, 0, jnp.bfloat16, 2048, 10, 1024, None, 16, "tc"),
+        (False, True, 0, jnp.bfloat16, 2048, 10, 1100, None, 16, "tc"),
         (False, True, 0, jnp.bfloat16, 2880, 4, 2048, None, 16, None),
         (False, True, 0, jnp.bfloat16, 4608, 10, 2048, None, 16, "v3"),
         (False, True, 0, jnp.bfloat16, 5120, 10, 255, None, 16, None),
@@ -156,9 +156,11 @@ def test_fused_moe_gmm_get_topk_weights_dtype(monkeypatch):
         (False, True, 0, jnp.bfloat16, 7168, 10, 2048, None, 16, "v3"),
         (False, True, 0, jnp.bfloat16, 4096, 1, 2048, None, 16, None),
         (False, True, 0, jnp.bfloat16, 4096, 1, 4096, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 4096, 2, 2048, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 3, 2048, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 4, 2048, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 2, 2048, None, 16, "tc"),
+        (False, True, 0, jnp.bfloat16, 4096, 3, 2048, None, 16, "tc"),
+        (False, True, 0, jnp.bfloat16, 4096, 4, 2048, None, 16, "tc"),
+        (False, True, 2048, jnp.bfloat16, 6144, 4, 8192, None, 16, "tc"),
+        (False, True, 2048, jnp.bfloat16, 6144, 4, 8192, None, None, "tc"),
         (False, True, 0, jnp.bfloat16, 4096, 8, 2048, None, 16, None),
         (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, None, None),
         (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, 8, None),
@@ -203,6 +205,8 @@ def test_fused_moe_gmm_get_topk_weights_dtype(monkeypatch):
         "topk-2",
         "topk-3",
         "topk-4",
+        "topk-4-width-6144-tokens-8192",
+        "topk-4-width-6144-tokens-8192-no-sc",
         "topk-8",
         "no-sc",
         "sc-lanes-8",
@@ -244,6 +248,7 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
             sparse_core=sc_info,
             num_lanes=128,
             vmem_capacity_bytes=64 << 20,
+            smem_capacity_bytes=1 << 20,
         )
 
     monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", get_tpu_info)
@@ -268,6 +273,11 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
         fused_moe_gmm,
         "ragged_gather_reduce_v3",
         lambda *args, **kwargs: fake_combine("v3", *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "gather_reduce",
+        lambda *args, **kwargs: fake_combine("tc", *args, **kwargs),
     )
 
     def run(source):
@@ -326,24 +336,26 @@ def _require_tpu() -> None:
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize(
-    "num_tokens,topk,hidden,uses_v3",
+    "num_tokens,topk,hidden,path",
     [
-        (64, 10, 4096, False),
-        (256, 3, 4096, False),
-        (512, 8, 4096, False),
-        (511, 10, 4096, False),
-        (512, 10, 4096, True),
-        (544, 10, 4096, False),
-        (704, 10, 4096, True),
-        (1024, 2, 4096, False),
-        (1024, 3, 4096, True),
-        (2047, 2, 4096, True),
-        (2047, 3, 4096, True),
-        (2048, 10, 4096, True),
-        (1023, 10, 2048, False),
-        (1024, 10, 2048, True),
-        (256, 10, 5120, True),
-        (300, 10, 5120, False),
+        (64, 10, 4096, None),
+        (256, 3, 4096, None),
+        (512, 8, 4096, None),
+        (511, 10, 4096, None),
+        (512, 10, 4096, "v3"),
+        (544, 10, 4096, None),
+        (704, 10, 4096, "v3"),
+        (1024, 2, 4096, None),
+        (1024, 3, 4096, "tc"),
+        (2047, 2, 4096, "tc"),
+        # An odd routed-row count has no whole bf16 row pair to gather.
+        (2047, 3, 4096, "v3"),
+        (2048, 10, 4096, "v3"),
+        (1023, 10, 2048, "tc"),
+        (1024, 10, 2048, "tc"),
+        (256, 10, 5120, "v3"),
+        (300, 10, 5120, None),
+        (2048, 4, 6144, "tc"),
     ],
     ids=[
         "t64-k10",
@@ -362,10 +374,11 @@ def _require_tpu() -> None:
         "t1024-k10-h2048",
         "t256-k10-h5120",
         "t300-k10-h5120",
+        "t2048-k4-h6144",
     ],
 )
 def test_moe_gmm_non_ep_prefill_ragged_combine_matches_reference(
-    monkeypatch, masked, num_tokens, topk, hidden, uses_v3
+    monkeypatch, masked, num_tokens, topk, hidden, path
 ):
     _require_tpu()
     num_routes = num_tokens * topk
@@ -392,16 +405,24 @@ def test_moe_gmm_non_ep_prefill_ragged_combine_matches_reference(
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
     calls = []
 
-    combine_v3 = fused_moe_gmm.ragged_gather_reduce_v3
+    def checked(name, combine):
+        def run(*args, **kwargs):
+            calls.append((name, kwargs["reduce_group_size"]))
+            return combine(*args, **kwargs)
 
-    def checked_combine(*args, **kwargs):
-        calls.append(kwargs["reduce_group_size"])
-        return combine_v3(*args, **kwargs)
+        return run
 
     def unexpected_ep_combine(*args, **kwargs):
         pytest.fail("Non-EP prefill used the EP-configured combine")
 
-    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3", checked_combine)
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "ragged_gather_reduce_v3",
+        checked("v3", fused_moe_gmm.ragged_gather_reduce_v3),
+    )
+    monkeypatch.setattr(
+        fused_moe_gmm, "gather_reduce", checked("tc", fused_moe_gmm.gather_reduce)
+    )
     monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce", unexpected_ep_combine)
     actual = moe_gmm(
         x=jnp.zeros((num_routes, 1), jnp.bfloat16),
@@ -423,7 +444,7 @@ def test_moe_gmm_non_ep_prefill_ragged_combine_matches_reference(
         use_sparse_core=True,
         onehot_moe_permute_threshold=512,
     )
-    assert calls == ([topk] if uses_v3 else [])
+    assert calls == ([(path, topk)] if path else [])
     assert actual.dtype == jnp.bfloat16
     assert np.isfinite(np.asarray(actual)).all()
     np.testing.assert_array_equal(actual, expected)
