@@ -23,6 +23,22 @@ def register_omni_tpu_platform() -> str | None:
     return "vllm_torchtpu.omni.platform.OmniTpuPlatform"
 
 
+def register_omni_general_plugins() -> None:
+    """Plugin entry point for vllm_omni.general_plugins.
+
+    vLLM-Omni runs its general plugins in every process before it builds a
+    diffusion engine or worker. Returns early unless
+    register_omni_tpu_platform() finds TPU chips (get_num_chips() > 0); safe
+    to call more than once.
+    """
+    if register_omni_tpu_platform() is None:
+        return
+    from vllm_torchtpu.omni.patches import apply_omni_general_plugin_patches
+
+    apply_omni_general_plugin_patches()
+
+
 __all__ = [
+    "register_omni_general_plugins",
     "register_omni_tpu_platform",
 ]
