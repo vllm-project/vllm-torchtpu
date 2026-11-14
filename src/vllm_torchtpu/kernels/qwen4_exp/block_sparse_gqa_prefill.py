@@ -1647,12 +1647,11 @@ def _block_sparse_gqa_prefill(
     lazy = lazy_softmax_features() if dcp and not vpu and not bf16_mxu else ()
     if lazy and kv_tile % 128:
         lazy = ()
-    # VLLM_TPU_QSA_BOUND_STAB_ALL (test only): also run the replicated (non-DCP)
-    # call with LANE_SUM + the bound stabilizer, to compare like with like.
-    bound_all = bool(os.environ.get("VLLM_TPU_QSA_BOUND_STAB_ALL")) and bound_stab
+    # The bound stabilizer runs on the LANE_SUM path, DCP or replicated, so
+    # both prefill routes round the same probabilities.
     lane_sum = (
         lane_sum_features()
-        if (dcp or bound_all)
+        if (dcp or (bound_stab and _KEY_NORM_BOUND is not None))
         and not vpu
         and not bf16_mxu
         and not lazy
@@ -1928,8 +1927,7 @@ def block_sparse_gqa_attention(
             k_scale=k_scale,
             v_scale=v_scale,
             bf16_io=True,
-            **offset,
-            **extra,
+            **{**offset, **extra},
         )
 
     padded = ((real + query_block - 1) // query_block) * query_block
@@ -1987,11 +1985,10 @@ def block_sparse_gqa_attention(
             k_scale=k_scale,
             v_scale=v_scale,
             bf16_io=True,
-            **offset,
-            **extra,
+            **{**offset, **extra},
         )
         back = jnp.minimum(slots, max_tokens - 1)
-        if return_lse:
+        if extra.get("return_lse", return_lse):
             out, lse = output[0][back], output[1][back]
             if mask_in_padding:
                 # Tokens past the step's rows read the last aligned row, which
@@ -2023,26 +2020,24 @@ def block_sparse_gqa_attention(
         )
 
     bound = _KEY_NORM_BOUND
-    if (
-        bound is not None
-        and return_lse
-        and dcp is not None
-        and not os.environ.get("VLLM_TPU_QSA_SMATTR")
-    ):
-        # additional-config qsa_prefill_bound_stab (see BOUND_STAB_*): the
-        # bound-stabilized kernel, re-run with the online softmax when any
-        # row's mass falls out of the full-precision range (log mass under
-        # BOUND_STAB_GUARD), or a row that owns a selected key got none.
-        output = routed({"bound_stab": True})
+    if bound is not None and not os.environ.get("VLLM_TPU_QSA_SMATTR"):
+        # VLLM_TPU_QSA_PREFILL_BOUND_STAB (see BOUND_STAB_*): the
+        # bound-stabilized kernel on both prefill routes (DCP and replicated),
+        # always with lse for the guard. The call re-runs with the online
+        # softmax when any row's mass leaves the full-precision range (log
+        # mass under BOUND_STAB_GUARD or over BOUND_STAB_GUARD_HIGH, or not
+        # finite), or a row with a visible key got none.
+        out_b, lse = routed({"bound_stab": True, "return_lse": True})
         stab = bound_stabilizer(query, k_scale=k_scale, bound=bound)
-        lse = output[1]
         live_rows = (lengths > 0)[:, None]
-        world = dcp[1]
-        group = jnp.where(blocks >= 0, blocks, 0)
-        owned = (blocks >= 0) & (
-            (group * ratio // cache.shape[1]) % world == dcp[0][0]
-        )
-        has_key = live_rows & jnp.any(owned, axis=1)[:, None]
+        if dcp is not None:
+            group = jnp.where(blocks >= 0, blocks, 0)
+            visible = (blocks >= 0) & (
+                (group * ratio // cache.shape[1]) % dcp[1] == dcp[0][0]
+            )
+        else:
+            visible = blocks >= 0
+        has_key = live_rows & jnp.any(visible, axis=1)[:, None]
         low = live_rows & jnp.isfinite(lse) & (lse - stab < BOUND_STAB_GUARD)
         lost = has_key & jnp.isneginf(lse)
         # A layer whose keys exceed the bound (not one that noted it) can only
@@ -2060,17 +2055,12 @@ def block_sparse_gqa_attention(
             for t in (int(x) for x in marks.replace(":", ",").split(",") if x):
                 hit = jnp.any(live_rows & jnp.isfinite(lse) & (lse - stab < -t))
                 tick = lax.cond(hit, functools.partial(_mark_kernel, t), _no_mark, None)
-                output = (output[0], output[1] + tick * 0.0)
+                lse = lse + tick * 0.0
             tick = lax.cond(rerun, functools.partial(_mark_kernel, 999), _no_mark, None)
-            output = (output[0], output[1] + tick * 0.0)
+            lse = lse + tick * 0.0
+        # Without return_lse the kernel writes bf16(out): the same values.
+        output = (out_b, lse) if return_lse else out_b.astype(jnp.bfloat16)
         output = lax.cond(rerun, lambda o: routed({}), lambda o: o, output)
-    elif (
-        bound is not None
-        and dcp is None
-        and os.environ.get("VLLM_TPU_QSA_BOUND_STAB_ALL")
-        and not os.environ.get("VLLM_TPU_QSA_SMATTR")
-    ):
-        output = routed({"bound_stab": True})  # test only: no lse, no guard
     else:
         output = routed({})
     if mask_in_padding:
