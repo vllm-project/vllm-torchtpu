@@ -160,7 +160,7 @@ def test_platform_accepts_registered_and_written_names(
     monkeypatch.setenv("VLLM_TPU_USING_PATHWAYS", "0")
     monkeypatch.setenv("TORCH_TPU_TIER2_COMPILATION_CACHE", "tpu_tier2_cache")
     # No registry has it; only PACKAGE_WRITTEN_ENV_VARS keeps it from the exact
-    # VLLM_* check (omni/patches.py writes it). Pin the external prefixes to ()
+    # VLLM_* check (omni/patches writes it). Pin the external prefixes to ()
     # so that VLLM_OMNI_ does not hide it where vllm_omni is installed.
     monkeypatch.setattr(
         TpuPlatform, "external_env_var_prefixes", classmethod(lambda cls: ())

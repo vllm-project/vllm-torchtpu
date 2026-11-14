@@ -86,8 +86,11 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import (
     WanVACETransformer3DModel,
 )
 
-from tests_omni.omni_test_utils import assert_all_loaded, assert_parity
-from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
+from tests_omni.omni_test_utils import (
+    apply_diffusion_model_patches,
+    assert_all_loaded,
+    assert_parity,
+)
 from vllm_torchtpu.omni.rope import can_fuse_qk_norm_rope
 
 pytestmark = [pytest.mark.omni]
@@ -136,6 +139,7 @@ CLIP_MAX_ABS = (1.8e-2, 6.2e-2)
 @pytest.fixture(scope="module")
 def omni_ctx():
     """Single-rank diffusion parallel groups plus a default forward context."""
+    apply_diffusion_model_patches("WanPipeline")
     owns_dist_env = not torch.distributed.is_initialized()
     if owns_dist_env:
         init_distributed_environment(
@@ -240,7 +244,7 @@ ROPE_FREQS_MAX_ABS = 2.5e-6
 
 
 def test_wan_rotary_embedding_pair_swap_bit_exact_on_tpu() -> None:
-    apply_omni_model_specific_patches()
+    apply_diffusion_model_patches("WanPipeline")
 
     torch.manual_seed(42)
     rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
@@ -260,7 +264,7 @@ def test_wan_self_attention_fused_matches_unpatched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify fused q/k RMSNorm + RoPE on the real WanSelfAttention on TPU."""
-    apply_omni_model_specific_patches()
+    apply_diffusion_model_patches("WanPipeline")
 
     torch.manual_seed(42)
     for target in (
@@ -634,7 +638,7 @@ class TestWanFreshTimestepPatch:
     ) -> None:
         """Keyword only: the wrapper names timestep, and the pipelines call
         forward by keyword."""
-        from vllm_torchtpu.omni import patches
+        from vllm_torchtpu.omni.patches import wan
 
         calls = []
         monkeypatch.setattr(
@@ -649,7 +653,7 @@ class TestWanFreshTimestepPatch:
             "vllm_torchtpu.utils.synchronize_tensors",
             lambda t, wait=True: synced.append((t, wait)),
         )
-        patches._wrap_fresh_timestep(cls)
+        wan._wrap_fresh_timestep(cls)
 
         # What the pipelines pass: t.expand(batch), a view into the schedule.
         view = torch.arange(6.0)[3].expand(2)

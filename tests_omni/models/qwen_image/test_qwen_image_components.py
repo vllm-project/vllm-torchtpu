@@ -32,9 +32,8 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenEmbedRope,
 )
 
-from tests_omni.omni_test_utils import assert_parity
+from tests_omni.omni_test_utils import apply_diffusion_model_patches, assert_parity
 from vllm_torchtpu.omni.attention import TpuSDPAImpl
-from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
 pytestmark = [pytest.mark.omni]
 
@@ -90,7 +89,7 @@ class TestQwenEmbedRopeOnTpu:
     def test_qwen_image_rope_txt_freqs_under_inference_mode_on_tpu(
         self, rope_cls: type[torch.nn.Module]
     ) -> None:
-        apply_omni_model_specific_patches()
+        apply_diffusion_model_patches("QwenImagePipeline")
 
         with torch.device("tpu"):
             tpu_embedder = rope_cls(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
