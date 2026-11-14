@@ -285,7 +285,7 @@ def test_pallas_rowquant_fp4_hadamard_captures_no_constants():
     packed, scales = pl.pallas_call(
         _body,
         out_shape=(
-            jax.ShapeDtypeStruct((16, 32), jnp.uint32),
+            jax.ShapeDtypeStruct((2, 256), jnp.uint32),
             jax.ShapeDtypeStruct((16, 128), jnp.float32),
         ),
     )(x)
@@ -293,5 +293,5 @@ def test_pallas_rowquant_fp4_hadamard_captures_no_constants():
     np.testing.assert_allclose(
         np.asarray(scales[:, :1]), np.asarray(s_ref_xla), rtol=1e-3, atol=1e-4
     )
-    assert packed.shape == (16, 32)
+    assert packed.shape == (2, 256)
     assert q_ref_xla.shape == (16, 256)
