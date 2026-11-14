@@ -100,6 +100,7 @@ from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
 )
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
+    attach_forward_metrics,
 )
 from vllm_torchtpu.distributed.pp_buffered import (
     PPBuffered,
@@ -168,6 +169,8 @@ from vllm_torchtpu.runner import (
 )
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.forward_metrics import ForwardBatch
+from vllm_torchtpu.runner.forward_timing import ForwardTiming
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -1236,6 +1239,7 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._forward_timing = ForwardTiming(profiler_rank)
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -1360,6 +1364,7 @@ class TPUModelRunner(GPUModelRunner):
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
             self._stage_timing.take_samples()
+            self._forward_timing.take_forward_samples()
             return None, None, set(), None, set(), None, None
         kv_connector = get_kv_transfer_group()
         # get_transfer_results, not get_finished: only it carries
@@ -1386,6 +1391,11 @@ class TPUModelRunner(GPUModelRunner):
         # KVConnectorModelRunnerMixin._get_kv_connector_output.
         worker_meta = kv_connector.build_connector_worker_meta()
         kv_connector_stats = kv_connector.get_kv_connector_stats()
+        kv_connector_stats = attach_forward_metrics(
+            kv_connector,
+            kv_connector_stats,
+            self._forward_timing.take_forward_samples(),
+        )
         cpu_samples, device_samples = self._stage_timing.take_samples()
         if cpu_samples or device_samples:
             # Preserve connector-owned stats; discard timings without a TPU sink.
@@ -4576,6 +4586,16 @@ class TPUModelRunner(GPUModelRunner):
                     f"max={trace_kwargs['max_kv_len']}"
                 )
 
+            layout_plan = self._last_sequence_layout_plan
+            assert layout_plan is not None, "Real forward requires a layout plan"
+            forward_batch = ForwardBatch(
+                bucket=num_tokens_padded,
+                capacity=layout_plan.global_padded_num_tokens,
+                request_tokens=tuple(
+                    scheduler_output.num_scheduled_tokens[req_id]
+                    for req_id in self.input_batch.req_ids[start_index:end_index]
+                ),
+            )
             with (
                 TraceAnnotation(
                     name=trace_name,
@@ -4596,6 +4616,7 @@ class TPUModelRunner(GPUModelRunner):
                     kv_cache_bundle=self._kv_cache_bundle,
                 ),
                 self._stage_timing.stage("main_forward"),
+                self._forward_timing.stage(forward_batch),
             ):
                 hidden_states, aux_hidden_states = self.forward_model(
                     input_ids=input_ids,
