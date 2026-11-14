@@ -565,7 +565,7 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
 
 
 # The attribute of a loaded target model holding its MTP draft, if it has one.
-MTP_DRAFT_ATTR = "_export_mtp_draft"
+MTP_DRAFT_ATTR = weight_mapper.MTP_DRAFT_ATTR
 
 
 def _load_mtp_draft(vllm_config: Any, target: nn.Module) -> nn.Module | None:

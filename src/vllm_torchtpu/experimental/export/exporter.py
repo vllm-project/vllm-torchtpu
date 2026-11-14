@@ -276,6 +276,7 @@ def _tensor_layouts(
             weight_mapper.infer_weight_sharding(
                 name,
                 local,
+                model=model,
                 explicit_sharding=getattr(spec, "sharding", None),
                 tp_size_hint=tp_size,
             ),
