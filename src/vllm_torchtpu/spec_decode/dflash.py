@@ -327,6 +327,11 @@ class DFlashProposer:
                             uniform_blocks=True,
                         )
                     attn_impl.initialize_kernel(attn_obj)
+            prepare_kv_write = getattr(
+                self.draft_model.model, "prepare_draft_kv_write", None
+            )
+            if callable(prepare_kv_write):
+                prepare_kv_write()
 
     def _shards_draft_kv_over_dcp(self, attn_impl: PallasAttentionBackendImpl) -> bool:
         """Whether this draft layer keeps its KV DCP-sharded like the target's
