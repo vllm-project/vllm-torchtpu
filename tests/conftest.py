@@ -15,6 +15,7 @@
 
 import os
 import sys
+from types import SimpleNamespace
 
 # Keep TP collectives compiled in-graph (no graph break) for fullgraph TP.
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
@@ -246,6 +247,33 @@ def device(request):
         except Exception as e:
             pytest.fail(f"TPU requested but failed to initialize: {e}")
     return torch.device("cpu")
+
+
+@pytest.fixture
+def h2d_uploads(monkeypatch):
+    """Counts host-to-device uploads, the `Tensor.to(device, non_blocking=True)`
+    calls, in `.count`. Each one returns a fresh copy, as a real transfer does,
+    so an upload never aliases the host tensor it came from (a CPU
+    `.to("cpu")` would).
+
+    Defined here rather than in a subdirectory conftest because tests under
+    tests/runner and tests/layers both use it (see dist_ctx).
+    """
+    counter = SimpleNamespace(count=0)
+    real_to = torch.Tensor.to
+
+    def to(tensor, *args, **kwargs):
+        if (
+            kwargs.get("non_blocking")
+            and args
+            and isinstance(args[0], (torch.device, str))
+        ):
+            counter.count += 1
+            return real_to(tensor, *args, **kwargs).clone()
+        return real_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", to)
+    return counter
 
 
 def pytest_collection_finish(session):
