@@ -837,18 +837,23 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self._note_key_norm_bound()
 
     def _note_key_norm_bound(self):
-        """additional-config ``qwen4_exp.qsa_prefill_bound_stab``: hand the DCP
+        """VLLM_TPU_QSA_PREFILL_BOUND_STAB (or, unset, additional-config
+        ``qwen4_exp.qsa_prefill_bound_stab``): hand the DCP
         block-sparse prefill this layer's key norm bound sqrt(D) * max|1 + w_k|
         (keys leave GemmaRMSNorm, then RoPE, a rotation)."""
         from vllm.config import get_current_vllm_config
 
+        from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as bsp
+
         options = get_current_vllm_config().additional_config.get("qwen4_exp", {})
-        if not options.get("qsa_prefill_bound_stab", False):
+        if not bsp.bound_stab_enabled(
+            envs.VLLM_TPU_QSA_PREFILL_BOUND_STAB,
+            options.get("qsa_prefill_bound_stab", False),
+        ):
             return
         k_norm = getattr(self, "k_norm", None)
         if k_norm is None:
             return
-        from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as bsp
 
         weight = k_norm.weight.detach().to("cpu", torch.float32)
         bound = math.sqrt(self.head_dim) * float((1 + weight).abs().max())

@@ -134,6 +134,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_VPU: str = ""
     VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX: str = ""
     VLLM_TPU_QSA_PREFILL_LANE_SUM: str = ""
+    VLLM_TPU_QSA_PREFILL_BOUND_STAB: str = ""
     VLLM_TPU_QSA_PREFILL_PAGE_COPIES: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_WALK: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT: int = 32768
@@ -1049,6 +1050,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # consistent with the numerator); "1,f32mass" sums the FP32 probabilities
     # (today's numerics, f32 reassociation only).
     "VLLM_TPU_QSA_PREFILL_LANE_SUM": env_str("VLLM_TPU_QSA_PREFILL_LANE_SUM", ""),
+    # qwen4_exp QSA DCP sparse prefill (LANE_SUM path): per-row stabilizer from
+    # the k_norm key-length bound instead of the online row max (no rescale in
+    # the KV loop; online re-run when a row leaves the precise range). "1" on,
+    # "0" off, unset: additional-config qwen4_exp.qsa_prefill_bound_stab
+    # (default off). The env takes precedence.
+    "VLLM_TPU_QSA_PREFILL_BOUND_STAB": env_str("VLLM_TPU_QSA_PREFILL_BOUND_STAB", ""),
     # qwen4_exp QSA sparse prefill: fetch each KV tile with one DMA per
     # page-sized run instead of one per 128-row selection segment, when KV
     # tiles and pages nest (TP8: 1024-row tiles over 512-row pages; DCP: one
