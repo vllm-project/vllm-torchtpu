@@ -81,6 +81,8 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_sequence_parallel_moe_admission", _ACTIVE),
     Patch("vllm_torchtpu:_patch_expert_map_host_lookup", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_explicit_pcp_collectives", _ACTIVE),
+    # Model layers.
+    Patch("vllm_torchtpu:_patch_qwen3_next_fused_qk_norm_rope_gate", _ACTIVE),
     # KV cache, scheduling, and offloading.
     Patch("vllm_torchtpu:_patch_vllm_compact_mamba_streaming_input", _ACTIVE),
     Patch(
