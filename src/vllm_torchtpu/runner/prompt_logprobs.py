@@ -67,13 +67,10 @@ class PromptLogprobsChunk:
 
 
 def unsupported_reason(
-    *, dp_vocab_logits: bool, selected_logits_hidden_states: bool, lora: bool
+    *, selected_logits_hidden_states: bool, lora: bool
 ) -> str | None:
     """Why the runner cannot compute prompt logprobs, with the fix; None if it
     can."""
-    if dp_vocab_logits:
-        # Every DP engine would have to run the same logits programs.
-        return "TPU_DP_VOCAB_PARALLEL=1 (unset it)"
     if selected_logits_hidden_states:
         # Each rank selects its own logits rows; the prompt rows are not local.
         return (
@@ -83,6 +80,18 @@ def unsupported_reason(
         # The LoRA logits mapping has one adapter slot per request, not per row.
         return "LoRA (serve without --enable-lora)"
     return None
+
+
+def max_logits_calls(num_rows: int, rows_per_call: int, num_chunks: int) -> int:
+    """At most how many logits calls score `num_rows` prompt rows spread over
+    `num_chunks` forward chunks, each chunk's rows in calls of `rows_per_call`.
+
+    The sum of the chunks' ceil(rows / rows_per_call) is at most
+    ceil(num_rows / rows_per_call) + num_chunks - 1.
+    """
+    if num_rows == 0:
+        return 0
+    return -(-num_rows // rows_per_call) + num_chunks - 1
 
 
 def plan_chunk(

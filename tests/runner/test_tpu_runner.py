@@ -84,6 +84,8 @@ def _warmup_requests():
 
 
 def test_idle_dp_rank_encodes_before_decoder_pairing():
+    """Encoder, target forwards, the prompt-logprob logits calls, then draft
+    forwards: the order busy engines run them in."""
     order = []
     runner = SimpleNamespace(
         _is_dspark_pd_producer=False,
@@ -94,10 +96,18 @@ def test_idle_dp_rank_encodes_before_decoder_pairing():
         _async_drafter=SimpleNamespace(
             run_dp_dummy_draft=lambda chunks: order.append(("draft", chunks))
         ),
+        _dp_prompt_logprob_calls=lambda bucket, chunks: 3,
+        _dp_prompt_logprob_dummies=lambda n, bucket: order.append(("logits", n)),
     )
     TPUModelRunner._run_dp_idle_pairing(runner, 8, 2)
     assert runner._dp_target_bucket == 8
-    assert order == ["encoder", ("decoder", 8), ("decoder", 8), ("draft", 2)]
+    assert order == [
+        "encoder",
+        ("decoder", 8),
+        ("decoder", 8),
+        ("logits", 3),
+        ("draft", 2),
+    ]
 
 
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
@@ -828,6 +838,8 @@ def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
             _async_drafter=MagicMock(),
             speculative_config=_spec(),
             drafter=None,
+            _dp_prompt_logprob_calls=lambda bucket, chunks: 0,
+            _dp_prompt_logprob_dummies=lambda num_calls, bucket: None,
         )
 
     middle = runner(False)
