@@ -125,6 +125,12 @@ def _connector_option(extra_config: Mapping[str, Any], key: str, default: Any) -
         before a request with a host-tier hit is deferred to a later step.
       fence_after_draft (bool, default false): record a step's store fences
         one get_finished() call later, after the draft model's KV writes.
+      host_tier_recency (bool, default false): the scheduler refreshes a
+        request's host-tier keys on every lookup and store (``_touch``),
+        probes partial tails only above the local hit, offers FullAttention
+        chunks for storing from chunk 0 again, and launches fence-acknowledged
+        stores largest first. Unset, the scheduler runs upstream's lookup,
+        allocation and store paths.
     """
     value = extra_config.get(key, default)
     if isinstance(default, bool):
@@ -239,6 +245,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     via RaidenOffloadingManager.
     """
 
+    # Option host_tier_recency (see _connector_option); off unless configured.
+    _host_tier_recency: bool = False
+
     def __init__(
         self,
         spec: TPURaidenStoreOffloadingSpec,
@@ -258,6 +267,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._pending_failed_jobs: list[Any] = []
         self._max_async_load_reqs: int = _connector_option(
             spec.extra_config, "max_async_loads", 0
+        )
+        self._host_tier_recency = _connector_option(
+            spec.extra_config, "host_tier_recency", False
         )
 
     def _complete_jobs_directly(
@@ -482,8 +494,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         A partial-tail boundary at or below the local HBM hit
         (``_tpu_local_hit_tokens``, which keeps the sub-block tail the
         scheduler strips before asking the connector) loads nothing HBM does
-        not already hold.
+        not already hold. Without host_tier_recency, upstream's lookup runs.
         """
+        if not self._host_tier_recency:
+            return super()._lookup(req_status, max_num_new_tokens)
         complete_hit = self._lookup_complete_chunks(req_status, max_num_new_tokens)
         req_status.partial_tail_boundary = None
         if complete_hit is None or not self.config.supports_partial_tail:
@@ -548,8 +562,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         num_computed_tokens: int,
         max_num_new_tokens: int | None = None,
     ) -> tuple[int | None, bool]:
+        recency = self._host_tier_recency
         if (
-            num_computed_tokens > 0
+            recency
+            and num_computed_tokens > 0
             and self.config.kv_group_configs
             and num_computed_tokens % self.config.kv_group_configs[0].tokens_per_chunk
             != 0
@@ -586,6 +602,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         num_hit_tokens, load_async = super().get_num_new_matched_tokens(
             request, num_computed_tokens, max_num_new_tokens
         )
+        if not recency:
+            return num_hit_tokens, load_async
         req_status = self._req_status.get(request.request_id)
         if req_status is not None and not req_status.transfer_jobs:
             # Upstream leaves cache recency to the manager, and the Raiden
@@ -622,6 +640,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self, request: Request, blocks: Any, num_external_tokens: int
     ) -> None:
         super().update_state_after_alloc(request, blocks, num_external_tokens)
+        if not self._host_tier_recency:
+            return
         req_status = self._req_status.get(request.request_id)
         if req_status is not None:
             for group_config, group_state in zip(
@@ -639,6 +659,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self, scheduler_output: SchedulerOutput
     ) -> dict[int, TransferJob]:
         store_jobs = super()._build_store_jobs(scheduler_output)
+        if not self._host_tier_recency:
+            return store_jobs
         # Every request that offloads this step refreshes its keys, as each
         # lookup does in get_num_new_matched_tokens.
         for req_id in dict.fromkeys(job.req_id for job in store_jobs.values()):
@@ -738,7 +760,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 if parked.acks == self.config.num_workers:
                     del self._fence_pending[job_id]
                     ready_jobs.append((job_id, parked))
-            ready_jobs.sort(key=lambda item: (-len(item[1].keys), item[0]))
+            if self._host_tier_recency:
+                ready_jobs.sort(key=lambda item: (-len(item[1].keys), item[0]))
             for job_id, parked in ready_jobs:
                 self._raiden_manager.submit_store_job(
                     job_id, parked.keys, parked.device_block_ids
