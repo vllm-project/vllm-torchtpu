@@ -40,8 +40,19 @@ SLOTS = {"slots3": 3, "slots1": 1, "kv_only": 0}
 _TINY_TILES = Tiles(bank=512 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32)
 
 
-def _unfold(x: jax.Array, R: int) -> jax.Array:
-    return x.reshape((R, x.shape[0] // R) + x.shape[1:])
+def _unfold(x: jax.Array, R: int) -> tuple[jax.Array, ...]:
+    if R == 1:
+        return (x,)
+    u8 = np.asarray(x).view(np.uint8).reshape((R, x.shape[0] // R) + x.shape[1:])
+    return tuple(jnp.asarray(u8[r].view(jnp.dtype(FP8))) for r in range(R))
+
+
+def _set_rank0(r: jax.Array, o: jax.Array, R: int) -> jax.Array:
+    if R == 1:
+        return o
+    u8 = np.asarray(r).view(np.uint8).reshape((R, r.shape[0] // R) + r.shape[1:]).copy()
+    u8[0] = np.asarray(o).view(np.uint8)
+    return jnp.asarray(u8.reshape(r.shape).view(jnp.dtype(FP8)))
 
 
 @pytest.fixture(autouse=True)
@@ -175,9 +186,7 @@ def _check_scatter(
         rec,
         ckpt_in if lay.has_recurrent else None,
     )
-    out_pools = tuple(
-        _unfold(r, R).at[0].set(o).reshape(r.shape) for r, o in zip(raw_pools, out_r0)
-    )
+    out_pools = tuple(_set_rank0(r, o, R) for r, o in zip(raw_pools, out_r0))
     out = pool.pool_to_states(lay, ex, out_pools, pt, ckpt)
 
     for key, val in before.items():
@@ -624,3 +633,91 @@ def test_ckpt_slot_null_page_routing_scatter_and_gather(T: int):
         np.testing.assert_array_equal(np.asarray(conv_bad), np.asarray(conv_p0))
         np.testing.assert_array_equal(np.asarray(rec_bad), np.asarray(rec_p0))
         assert np.any(np.asarray(rec_bad) != 0)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("T", [1, 2])
+@pytest.mark.parametrize(
+    "slots,num_pools", [(1, 1), (3, 2)], ids=["slots1_pool1", "slots3_pool2"]
+)
+def test_scatter_and_gather_preserve_0xff_bytes_on_tpu(
+    slots: int, num_pools: int, T: int
+):
+    """On TPU (`interpret=False`), finite bf16 `rec`/`conv` values with `0xFF`
+    bytes (e.g. `0x3cff`, `0xbcff`) survive split `scatter_pool_states` ->
+    `gather_gdn_states` byte-for-byte, and `_check_scatter(interpret=False)`
+    passes on `_layout(1, num_pools=1)` and `_layout(3)` at `T=1` and `T=2`."""
+    try:
+        tpu_devs = jax.devices("tpu")
+    except RuntimeError:
+        tpu_devs = []
+    if not tpu_devs:
+        pytest.skip("Requires TPU device")
+    lay = _layout(slots, num_pools=num_pools)
+    ex = replace(_exec(R=1, B=2 * T, T=T), interpret=False)
+    with jax.default_device(tpu_devs[0]):
+        for ckpt_ndim in (3, 2):
+            _check_scatter(lay, ex, ckpt_ndim, seed=31 + T)
+        _check_scatter(
+            lay, replace(_exec(R=2, B=2 * T, T=T), interpret=False), 3, seed=31 + T
+        )
+
+        pt, ckpt, _ = _tables(lay, ex, 3)
+        raw_pools = tuple(
+            jnp.zeros((NUM_PAGES, *lay.kv_page_shape), FP8) for _ in range(num_pools)
+        )
+        pos = jnp.arange(ex.B, dtype=jnp.int32)
+        knew = jnp.zeros((num_pools, ex.MR, lay.hd), FP8)
+        vnew = jnp.zeros((num_pools, ex.MR, lay.hd), FP8)
+        ngdn, vh, qkv = (
+            lay.num_recurrent_layers,
+            lay.vh_per_rank(1),
+            lay.qkv_per_rank(1),
+        )
+        # Finite bf16 patterns whose low byte is 0xFF (`0x3cff` = +0.03112793,
+        # `0xbcff` = -0.03112793, `0x3dff` = +0.12451172, `0xbdff` = -0.12451172),
+        # tiled across even and odd `kd` rows so both 16-bit halves of every
+        # packed u32 word in `rec` and `conv` contain `0xFF` bytes.
+        pat_u16 = np.array([0x3CFF, 0xBCFF, 0x3DFF, 0xBDFF], dtype=np.uint16)
+        rec_shape = (ngdn, ex.B * vh, lay.KD, lay.VD)
+        rec_u16 = np.resize(pat_u16, rec_shape)
+        rec = jnp.asarray(rec_u16.view(jnp.dtype(jnp.bfloat16)))
+        conv_shape = (
+            (ngdn, 8 * ((3 * ex.B + 7) // 8), qkv)
+            if T == 1
+            else (ngdn, ex.NS, 8 * ((3 + T + 7) // 8), qkv)
+        )
+        conv_u16 = np.resize(pat_u16, conv_shape)
+        conv = jnp.asarray(conv_u16.view(jnp.dtype(jnp.bfloat16)).astype(np.float32))
+
+        out_pools = jax.jit(
+            lambda r, p, pt_i, kn, vn, cv, rc, ck: pool.scatter_pool_states(
+                lay, ex, r, p, pt_i, kn, vn, cv, rc, ck, interpret=False
+            )
+        )(raw_pools, pos, pt, knew, vnew, conv, rec, ckpt)
+        assert int(np.sum(_bytes(out_pools[0]) == 0xFF)) > 0
+
+        for k in range(T):
+            roff_k = jnp.full((lay.slots_per_pool, ex.NS), k, dtype=jnp.int32)
+            conv_got, rec_got = jax.jit(
+                lambda r, ck, ro: pool.gather_gdn_states(
+                    lay, ex, r, ck, ro, interpret=False
+                )
+            )(out_pools, ckpt, roff_k)
+            rec_exp = (
+                np.asarray(rec)
+                .reshape(ngdn, ex.NS, T, vh, lay.KD, lay.VD)[:, :, k]
+                .reshape(ngdn, ex.NS * vh, lay.KD, lay.VD)
+            )
+            np.testing.assert_array_equal(_bytes(rec_got), rec_exp.view(np.uint8))
+            conv_np = np.asarray(conv)
+            for s in range(ex.NS):
+                if T == 1:
+                    exp_taps = conv_np[:, [j * ex.B + s for j in range(3)]]
+                    got_taps = np.asarray(conv_got)[:, [j * ex.B + s for j in range(3)]]
+                else:
+                    exp_taps = conv_np[:, s, 1 + k : 4 + k]
+                    got_taps = np.asarray(conv_got)[:, s, :3]
+                np.testing.assert_array_equal(
+                    got_taps.view(np.uint8), exp_taps.view(np.uint8)
+                )
