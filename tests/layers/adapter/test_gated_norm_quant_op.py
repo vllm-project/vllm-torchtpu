@@ -195,6 +195,29 @@ def test_install_if_supported_routes_a_supported_model(make_gdn_attention, host_
     assert attention.fused_norm_quant
 
 
+@pytest.mark.parametrize("measured", [True, False])
+def test_install_if_supported_routes_the_measured_value_heads_only(
+    make_gdn_attention, host_ops, measured
+):
+    """With ``value_heads`` (the runner passes the 397B legs' counts), a layer
+    whose value heads per device are not listed keeps RMSNormGated + linear,
+    whose output is main's, unchanged."""
+    attention = _loaded_gdn(make_gdn_attention, host_ops)
+    heads = attention.num_v_heads // attention.tp_size
+    core, z = _gdn_outputs(attention)
+    normed = rearrange(attention.norm(core, z), "... h d -> ... (h d)")
+    want, _ = attention.out_proj(normed)
+    routed = gated_norm_quant_op.install_if_supported(
+        torch.nn.ModuleList([attention]),
+        value_heads={heads} if measured else {heads + 1},
+    )
+    assert routed == int(measured)
+    assert attention.fused_norm_quant is measured
+    if not measured:
+        got = attention._apply_output_projection(core, z, core.shape[0])
+        assert torch.equal(got, want)
+
+
 def test_install_if_supported_skips_a_model_without_gdn(host_ops):
     assert gated_norm_quant_op.install_if_supported(torch.nn.Linear(2, 2)) == 0
 
