@@ -29,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
+from vllm_torchtpu.utils import synchronize_tensors
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
@@ -306,6 +307,40 @@ def allocate_raw_kv_cache_tensors(
     return layer_to_raw, raw_tensors, layout
 
 
+class DeviceKVCacheAllocator:
+    """Creates zero-filled KV cache arrays directly on the device.
+
+    No array is filled on the host and copied over: a host tensor staged
+    through `.to()` costs about twice the cache size in host RAM per worker,
+    and for a large cache the host fill and copy are nearly all of the
+    allocation time. torch_tpu defers the device zero fill until first use,
+    so call `synchronize` once after the last allocation, before a compiled
+    program receives the arrays: PJRT donates only buffers with no pending
+    write.
+
+    The zero fill is part of the contract. Kernels load cache slots that no
+    token has written yet, and some need them to be finite: paths in the MLA
+    kernels (`kernels/mla/v2`, `kernels/deepseek_v4`) mask only the scores
+    of invalid entries, and 0 * NaN is NaN. Fresh device memory can hold any
+    bits, while zero bits are finite in every cache dtype.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.arrays: list[torch.Tensor] = []
+
+    def allocate(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        """Returns a new zero-filled array that `synchronize` covers."""
+        array = torch.zeros(shape, dtype=dtype, device=self.device)
+        self.arrays.append(array)
+        return array
+
+    def synchronize(self) -> None:
+        """Waits for the zero fill of every array allocated so far."""
+        if self.arrays:
+            synchronize_tensors(self.arrays)
+
+
 def make_attention_cache_tensor(
     *,
     spec: AttentionSpec,
@@ -359,7 +394,7 @@ def materialize_shared_attention_cache(
     tensor_size: int,
     num_blocks: int,
     attn_backend: Any,
-    device: torch.device,
+    allocator: DeviceKVCacheAllocator,
 ) -> torch.Tensor:
     """Allocate one tensor for attention groups sharing scheduler pages."""
     if not layer_specs:
@@ -401,7 +436,7 @@ def materialize_shared_attention_cache(
             packing,
             page_elements // (spec.block_size * packing),
         )
-    return torch.zeros(pool_shape, dtype=spec.dtype, device=device)
+    return allocator.allocate(pool_shape, spec.dtype)
 
 
 def _can_allocate_attention_cache_directly(
