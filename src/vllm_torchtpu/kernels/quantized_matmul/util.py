@@ -55,12 +55,16 @@ def quantize_tensor(
         x_flat = x.reshape(-1, k_dim)
         n_dim = x_flat.shape[0]
         x_reshaped = x_flat.reshape(n_dim, -1, block_size)
-        x_q, scale = quantize_block(x_reshaped, axis=-1, target_dtype=dtype)
+        x_q, scale = quantize_block(
+            x_reshaped, axis=-1, target_dtype=dtype, fence_reduction=True
+        )
 
         x_q = x_q.reshape(orig_shape)
 
         return x_q, scale.transpose(1, 2, 0).astype(jnp.float32)
-    data_q, scale = quantize_block(x, axis=dim, target_dtype=dtype)
+    data_q, scale = quantize_block(
+        x, axis=dim, target_dtype=dtype, fence_reduction=True
+    )
     return data_q, scale.astype(jnp.float32)
 
 
@@ -300,8 +304,19 @@ def get_max_min(target_dtype):
         return jnp.iinfo(target_dtype).max, jnp.iinfo(target_dtype).min
 
 
-def quantize_block(data, axis, target_dtype):
-    """Calculates scale and quantizes a block of data."""
+def quantize_block(data, axis, target_dtype, fence_reduction: bool = False):
+    """Calculates scale and quantizes a block of data.
+
+    Args:
+        data: Block to quantize.
+        axis: Axis to reduce over when computing the scale.
+        target_dtype: Quantized dtype.
+        fence_reduction: Insert an `optimization_barrier` between the scale
+            reduction and the elementwise quantization. Only set this from
+            XLA-compiled callers: Pallas TPU (Mosaic) lowering does not
+            implement `optimization_barrier`, so kernels that call this
+            function inside a `pallas_call` must leave it `False`.
+    """
     abs_max = jnp.max(
         jnp.abs(data),
         axis=axis,
@@ -310,6 +325,11 @@ def quantize_block(data, axis, target_dtype):
     dtype_max, dtype_min = get_max_min(target_dtype)
     scale = abs_max / dtype_max
     scale = jnp.where(scale == 0, 1.0, scale)
+    if fence_reduction:
+        # Keep XLA from hoisting `convert(data, f32)` above upstream
+        # reshapes/transposes of `data`; without the fence those relayouts
+        # run on f32 (4 bytes/elem) instead of bf16 (2 bytes/elem).
+        data, scale = jax.lax.optimization_barrier((data, scale))
 
     if jnp.issubdtype(target_dtype, jnp.floating):
         data_q = (data / scale).clip(dtype_min, dtype_max).astype(target_dtype)
