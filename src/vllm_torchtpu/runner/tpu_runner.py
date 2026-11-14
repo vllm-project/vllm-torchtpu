@@ -41,6 +41,7 @@ from jax.sharding import Mesh
 from packaging import version
 from vllm.config import (
     CUDAGraphMode,
+    ModelConfig,
     ParallelConfig,
     VllmConfig,
     get_layers_from_vllm_config,
@@ -116,6 +117,8 @@ from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
     expert_placement,
+    sequence_parallel,
+    small_all_reduce_op,
     token_padding,
 )
 from vllm_torchtpu.layers.adapter.attention import (
@@ -156,6 +159,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
+from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -659,6 +663,20 @@ _TOPK_BUFFER_ATTRIBUTE = "topk_indices_buffer"
 # Hand-off tensors that carry indices.
 # -1 is "no token", so such a row attends to nothing.
 _PP_CARRIED_FILL: dict[str, int] = {_TOPK_INDICES: -1}
+
+
+def _install_gdn_fused_norm_quant(
+    model: torch.nn.Module, model_config: ModelConfig | None
+) -> int:
+    """Qwen3.5 rule: route the GDN output projections of a loaded Qwen3.5
+    model through the fused gated norm + FP8 quantization kernel, where every
+    GDN layer allows it. Other models are untouched. Returns the number of
+    layers routed."""
+    if not qwen3_5_settings.is_qwen3_5(model_config):
+        return 0
+    from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant_op
+
+    return gated_norm_quant_op.install_if_supported(model)
 
 
 def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
@@ -6029,6 +6047,7 @@ class TPUModelRunner(GPUModelRunner):
         self._prompt_logprobs_unsupported = self._prompt_logprobs_unsupported_reason()
         if self.is_pooling_model:
             self._resolve_static_pooler()
+        _install_gdn_fused_norm_quant(model, self.model_config)
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
@@ -6180,6 +6199,7 @@ class TPUModelRunner(GPUModelRunner):
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
+        small_all_reduce_op.prebuild(self.vllm_config)
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.adapter.linear_common import (
@@ -6541,12 +6561,11 @@ class TPUModelRunner(GPUModelRunner):
                 layer_name: attn_metadata for layer_name in self._attn_layer_names
             }
 
-        padding_state = getattr(self, "_token_padding_state", None)
-        if padding_state is not None:
-            # Every row of a warmup step is padding; a profile step's real
-            # tokens are its requests' query tokens.
-            padding_state.update(
-                sum(profile_query_lens) if profiling else 0, num_tokens
+        # Every row of a warmup step is padding; a profile step's real
+        # tokens are its requests' query tokens.
+        if getattr(self, "_token_padding_state", None) is not None:
+            self._token_padding_update(
+                num_tokens, sum(profile_query_lens) if profiling else 0
             )
         self._record_input_staging_fence()
         intermediate_tensors = None
@@ -8919,18 +8938,50 @@ class TPUModelRunner(GPUModelRunner):
                 )
         self._refresh_smem_request_caps(kv_cache_config)
 
-    def _token_padding_update(self, num_tokens_padded: int) -> None:
-        """Record which of this step's token rows are padding."""
+    def _token_padding_update(
+        self,
+        num_tokens_padded: int,
+        num_valid_tokens: int | None = None,
+        rows_sliced: bool | None = None,
+    ) -> None:
+        """Record which of this step's token rows are padding.
+
+        `rows_sliced` says whether the forward about to run slices its rows
+        over TP (each rank owns `num_tokens_padded // tp` rows), in which case
+        the mask is this rank's slice; otherwise every rank holds all
+        `num_tokens_padded` rows and the mask covers them all. None takes the
+        decision the target forward makes, `sequence_parallel.step_rows_are_sliced`:
+        sliced only when the step is sequence-parallel and the model follows
+        each step's form. A model that does not (main's forwards) gets the full
+        mask, as on main, because its MoE paths read the mask over all of the
+        step's rows: writing the per-rank slice for a forward that reads every
+        row marks real rows of other ranks as padding, and the MoE then drops
+        their experts.
+        """
         padding_state = getattr(self, "_token_padding_state", None)
         if padding_state is None:
             return
-        plan = self._last_sequence_layout_plan
-        if plan is not None and plan.kind is SequenceLayoutKind.ALL:
-            num_valid_tokens = min(plan.local_num_tokens, num_tokens_padded)
+        if num_valid_tokens is not None:
+            valid_tokens = min(num_valid_tokens, num_tokens_padded)
         else:
-            # Padding-mask support is currently limited to the ALL layout.
-            num_valid_tokens = num_tokens_padded
-        padding_state.update(num_valid_tokens, num_tokens_padded)
+            plan = self._last_sequence_layout_plan
+            if plan is not None and plan.kind is SequenceLayoutKind.ALL:
+                valid_tokens = min(plan.local_num_tokens, num_tokens_padded)
+            else:
+                # Padding-mask support is currently limited to the ALL layout.
+                valid_tokens = num_tokens_padded
+        tp_size = self.parallel_config.tensor_parallel_size
+        if rows_sliced is None:
+            rows_sliced = sequence_parallel.step_rows_are_sliced(num_tokens_padded)
+        if rows_sliced and tp_size > 1:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            chunk = num_tokens_padded // tp_size
+            tp_rank = get_tensor_model_parallel_rank()
+            rank_valid = max(0, min(chunk, valid_tokens - tp_rank * chunk))
+            padding_state.update(rank_valid, chunk)
+        else:
+            padding_state.update(valid_tokens, num_tokens_padded)
 
     def forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
@@ -8938,6 +8989,9 @@ class TPUModelRunner(GPUModelRunner):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
         kwargs = {}
+        sequence_parallel.set_active(
+            sequence_parallel.step_is_sequence_parallel(positions.shape[-1])
+        )
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
         out = self.model(
