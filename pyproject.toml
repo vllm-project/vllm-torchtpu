@@ -81,6 +81,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Media decoding and waveform resampling for multimodal inputs.
+multimodal = [
+    "av",
+    "scipy",
+    "soundfile",
+    "torchaudio==2.11.0",
+]
+
 # These are required for running any benchmarking
 # See more information at scripts/vllm/benchmarking/README.md
 benchmarking = [
@@ -280,9 +288,11 @@ ignore-missing-imports = [
     "numpy", "numpy.*",
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
+    "PIL", "PIL.*",
     "portpicker", "portpicker.*",
     "prometheus_client", "prometheus_client.*",
     "ray", "ray.*",
+    "regex", "regex.*",
     "requests", "requests.*",
     "sympy", "sympy.*",
     "torch", "torch.*",
