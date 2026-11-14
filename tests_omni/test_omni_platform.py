@@ -60,7 +60,7 @@ from vllm_torchtpu.omni.patches import (
 )
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 from vllm_torchtpu.omni.rope import (
-    _pair_swap_matrix,
+    _rope_matrices,
     apply_rotary_pair_swap,
     can_fuse_qk_norm_rope,
     rotary_embedding_wan_forward,
@@ -325,6 +325,9 @@ def test_dist_backend_after_world_size_pop(monkeypatch):
         "_prepare_singlehost_tpu_env",
         staticmethod(lambda world_size: None),
     )
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.platform.apply_omni_worker_patches", lambda: None
+    )
     monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
     with patch("torch.empty"), patch("torch.device"):
         OmniTpuPlatform.set_device(None)
@@ -348,6 +351,9 @@ def test_set_device_warns_on_pinned_multi_rank_stage(monkeypatch, chips, warns):
         OmniTpuPlatform,
         "_prepare_singlehost_tpu_env",
         staticmethod(lambda world_size: None),
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.platform.apply_omni_worker_patches", lambda: None
     )
     monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
     with (
@@ -456,10 +462,20 @@ def test_safe_pack_tensor_if_large(monkeypatch, nbytes):
     assert res is cpu_tensor
 
 
-def test_omni_tpu_patches_configuration():
+def test_omni_tpu_patches_configuration(monkeypatch):
     # Call the undecorated body so the run-once cache is left alone, and
-    # restore the process-global state it edits (env var).
+    # restore the process-global state it edits (env var and patched targets).
+    from diffusers.image_processor import VaeImageProcessor
+    from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+
     orig = torch.nn.functional.interpolate
+    monkeypatch.setattr(
+        torch.nn.functional, "group_norm", torch.nn.functional.group_norm
+    )
+    monkeypatch.setattr(
+        FlowMatchEulerDiscreteScheduler, "step", FlowMatchEulerDiscreteScheduler.step
+    )
+    monkeypatch.setattr(VaeImageProcessor, "postprocess", VaeImageProcessor.postprocess)
     with patch.dict(os.environ):
         os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
         apply_omni_tpu_patches.__wrapped__()
@@ -493,7 +509,7 @@ def _rms_norm(x, w, eps):
 def _reference_qk_norm_rope(qkv, wq, wk, cos, sin, eps, head_dim):
     # Semantics of the fused kernel: (T, 3C) in, repeated-pair tables.
     dim = qkv.shape[1] // 3
-    swap = _pair_swap_matrix(head_dim, qkv.dtype, qkv.device)
+    swap = _rope_matrices(head_dim, True, qkv.dtype, qkv.device)[0]
     outs = []
     for j, w in ((0, wq), (1, wk)):
         y = _rms_norm(qkv[:, j * dim : (j + 1) * dim], w, eps)
@@ -1008,3 +1024,468 @@ def test_ulysses_head_counts_matches_upstream_z_image():
         .default
     )
     assert n_heads_default == _ULYSSES_HEAD_COUNTS["ZImagePipeline"]
+
+
+def test_diffusion_worker_load_model_trims_torch_threads(monkeypatch):
+    from vllm.utils import torch_utils
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    from vllm_torchtpu.omni.patches import _patch_diffusion_worker_runtime_threads
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        torch_utils,
+        "set_torch_threads_for_runtime",
+        lambda: calls.append("trimmed"),
+    )
+    monkeypatch.setattr(
+        DiffusionWorker,
+        "load_model",
+        lambda self, *args, **kwargs: calls.append("loaded") or "ok",
+    )
+    _patch_diffusion_worker_runtime_threads()
+    patched = DiffusionWorker.load_model
+    _patch_diffusion_worker_runtime_threads()
+    assert DiffusionWorker.load_model is patched
+
+    res = DiffusionWorker.load_model(object())
+    assert res == "ok"
+    assert calls == ["loaded", "trimmed"]
+
+
+def test_z_image_transformer_block_compile_and_flush(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.z_image import z_image_transformer
+
+    from vllm_torchtpu.omni.patches import _patch_z_image_transformer_block_flush
+
+    model_cls = z_image_transformer.ZImageTransformer2DModel
+    block_cls = z_image_transformer.ZImageTransformerBlock
+    monkeypatch.setattr(model_cls, "_sp_plan", dict(model_cls._sp_plan))
+    monkeypatch.setattr(model_cls, "forward", model_cls.forward)
+    monkeypatch.setattr(block_cls, "forward", lambda self, x: x + 1)
+
+    compile_calls: list[tuple[tuple, dict]] = []
+
+    def _fake_compile(fn, *args, **kwargs):
+        compile_calls.append((args, kwargs))
+        return lambda *cargs, **ckwargs: fn(*cargs, **ckwargs) + 10
+
+    monkeypatch.setattr(torch, "compile", _fake_compile)
+    _patch_z_image_transformer_block_flush()
+    patched = block_cls.forward
+    _patch_z_image_transformer_block_flush()
+    assert block_cls.forward is patched
+
+    # CPU tensor bypasses torch.compile and runs eager.
+    assert block_cls.forward(SimpleNamespace(layer_id=0), torch.tensor(1.0)) == 2.0
+    assert compile_calls == []
+
+    # Simulated TPU tensor triggers torch.compile(backend="tpu", dynamic=False).
+    flushes: list[tuple[object, bool]] = []
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.patches.synchronize_tensors",
+        lambda t=None, wait=True: flushes.append((t, wait)),
+    )
+
+    class _FakeTpuTensor(torch.Tensor):
+        @property
+        def device(self):
+            return SimpleNamespace(type="tpu")
+
+    fake_x = torch.tensor(1.0).as_subclass(_FakeTpuTensor)
+    out = block_cls.forward(SimpleNamespace(layer_id=0), fake_x)
+    assert float(out) == 12.0
+    assert compile_calls == [((), {"backend": "tpu", "dynamic": False})]
+    assert len(flushes) == 2  # pre-layer_id=0 flush + post-block flush
+    assert all(wait is False for _, wait in flushes)
+
+    # ZImageTransformer2DModel.forward: sp=1 uses _TpuCompiledZImageLayers and
+    # restores self.layers in finally; sp_active=True restores sp_plan_hooks_applied.
+    orig_layers = [lambda x, *a: x + 1]
+    fc = SimpleNamespace(sp_plan_hooks_applied=False)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.forward_context.is_forward_context_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.forward_context.get_forward_context",
+        lambda: fc,
+    )
+
+    class _FakeModel:
+        def __init__(self, hooks):
+            self.unified_prepare = SimpleNamespace(
+                _hook_registry=SimpleNamespace(_hooks=hooks)
+            )
+            self.layers = orig_layers
+
+    seen_layers: list[object] = []
+
+    def _fake_model_forward(self, x, *args):
+        seen_layers.append(self.layers)
+        t = x[0]
+        return self.layers[0](t, t, t, t, t)
+
+    monkeypatch.setattr(model_cls, "forward", _fake_model_forward)
+    monkeypatch.delattr(block_cls.forward, "_tpu_zimage_block_patched", raising=False)
+    monkeypatch.delattr(model_cls.forward, "_tpu_zimage_model_patched", raising=False)
+    # Test _TpuCompiledZImageLayers via _model_forward (unpatched block).
+    monkeypatch.setattr(block_cls, "forward", lambda self, x, *a: x + 1)
+    _patch_z_image_transformer_block_flush()
+
+    m_sp1 = _FakeModel(hooks={})
+    res_sp1 = model_cls.forward(m_sp1, [fake_x])
+    assert float(res_sp1) == 12.0
+    assert m_sp1.layers is orig_layers
+    assert len(seen_layers[0]) == 1
+
+    m_sp8 = _FakeModel(hooks={"h": object()})
+    res_sp8 = model_cls.forward(m_sp8, [fake_x])
+    assert fc.sp_plan_hooks_applied is True
+    assert seen_layers[1] is orig_layers
+    assert float(res_sp8) == 2.0
+
+
+def test_tpu_group_norm_parity_and_idempotency(monkeypatch):
+    from vllm_torchtpu.omni.patches import _patch_group_norm_tpu, _tpu_group_norm
+
+    monkeypatch.setattr(
+        torch.nn.functional, "group_norm", torch.nn.functional.group_norm
+    )
+    torch.manual_seed(0)
+    x = torch.randn(2, 16, 8, 8, dtype=torch.bfloat16)
+    w = torch.randn(16, dtype=torch.bfloat16)
+    b = torch.randn(16, dtype=torch.bfloat16)
+    ref = torch.nn.functional.group_norm(x.float(), 4, w.float(), b.float(), 1e-5).to(
+        x.dtype
+    )
+    got = _tpu_group_norm(x, 4, w, b, 1e-5)
+    torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    _patch_group_norm_tpu()
+    patched = torch.nn.functional.group_norm
+    _patch_group_norm_tpu()
+    assert torch.nn.functional.group_norm is patched
+
+    from types import SimpleNamespace
+
+    class _FakeTpuTensor(torch.Tensor):
+        @property
+        def device(self):
+            return SimpleNamespace(type="tpu")
+
+    got_patched = torch.nn.functional.group_norm(
+        x.as_subclass(_FakeTpuTensor), 4, w, b, 1e-5
+    )
+    torch.testing.assert_close(
+        got_patched.as_subclass(torch.Tensor), ref, rtol=2e-2, atol=2e-2
+    )
+
+
+def test_flow_match_scheduler_step_flush_and_step0_index(monkeypatch):
+    from types import SimpleNamespace
+
+    from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+
+    from vllm_torchtpu.omni.patches import _patch_flow_match_scheduler_step_flush
+
+    class _FakeTpuTensor(torch.Tensor):
+        @property
+        def device(self):
+            return SimpleNamespace(type="tpu")
+
+    flushes: list[object] = []
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.patches.synchronize_tensors",
+        lambda t=None, wait=True: flushes.append(t),
+    )
+    monkeypatch.setattr(
+        FlowMatchEulerDiscreteScheduler,
+        "step",
+        lambda self, model_output, timestep, sample, **kw: (sample + 1,),
+    )
+    _patch_flow_match_scheduler_step_flush()
+    patched = FlowMatchEulerDiscreteScheduler.step
+    _patch_flow_match_scheduler_step_flush()
+    assert FlowMatchEulerDiscreteScheduler.step is patched
+
+    sched = SimpleNamespace(
+        _step_index=None,
+        _begin_index=None,
+        num_inference_steps=2,
+        timesteps=torch.tensor([1000.0, 500.0]),
+    )
+    t_tpu = torch.tensor(1000.0).as_subclass(_FakeTpuTensor)
+    sample_tpu = torch.tensor(2.0).as_subclass(_FakeTpuTensor)
+    out = FlowMatchEulerDiscreteScheduler.step(sched, sample_tpu, t_tpu, sample_tpu)
+    assert sched._step_index == 0
+    assert len(flushes) == 1 and flushes[0] is out[0]
+
+
+@pytest.mark.parametrize("interleaved", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_tpu_apply_rotary_matches_reference(
+    interleaved: bool, dtype: torch.dtype, monkeypatch
+):
+    from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+
+    from vllm_torchtpu.omni.patches import _patch_rotary_embedding_tpu
+    from vllm_torchtpu.omni.rope import tpu_apply_rotary
+
+    monkeypatch.setattr(
+        RotaryEmbedding, "forward_native", RotaryEmbedding.forward_native
+    )
+
+    torch.manual_seed(0)
+    seq, heads, head_dim = 16, 4, 32
+    x = torch.randn(1, seq, heads, head_dim, dtype=dtype)
+    cos = torch.randn(seq, head_dim // 2, dtype=dtype)
+    sin = torch.randn(seq, head_dim // 2, dtype=dtype)
+
+    rope = RotaryEmbedding(is_neox_style=not interleaved)
+    ref = rope.forward_native(x, cos, sin)
+    got = tpu_apply_rotary(x, cos, sin, interleaved=interleaved)
+    torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+    _patch_rotary_embedding_tpu()
+    patched = RotaryEmbedding.forward_native
+    _patch_rotary_embedding_tpu()
+    assert RotaryEmbedding.forward_native is patched
+
+
+@pytest.mark.parametrize("is_neox_style", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_rotary_embedding_forward_native_patch_tpu(
+    is_neox_style: bool, dtype: torch.dtype, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+
+    from vllm_torchtpu.omni import rope as omni_rope
+    from vllm_torchtpu.omni.patches import _patch_rotary_embedding_tpu
+
+    class _FakeTpuTensor(torch.Tensor):
+        @property
+        def device(self):
+            return SimpleNamespace(type="tpu")
+
+    orig_rope_matrices = omni_rope._rope_matrices
+    matmul_calls = 0
+
+    def _tracked_matrices(hd, il, dt, dev):
+        nonlocal matmul_calls
+        matmul_calls += 1
+        return orig_rope_matrices(hd, il, dt, torch.device("cpu"))
+
+    monkeypatch.setattr(omni_rope, "_rope_matrices", _tracked_matrices)
+    orig_forward_native = RotaryEmbedding.forward_native
+    orig_calls = 0
+
+    def _tracked_orig(self, x, cos, sin):
+        nonlocal orig_calls
+        orig_calls += 1
+        return orig_forward_native(
+            self,
+            x.as_subclass(torch.Tensor),
+            cos.as_subclass(torch.Tensor),
+            sin.as_subclass(torch.Tensor),
+        )
+
+    monkeypatch.setattr(RotaryEmbedding, "forward_native", _tracked_orig)
+    _patch_rotary_embedding_tpu()
+
+    torch.manual_seed(0)
+    seq, heads, head_dim = 16, 4, 32
+    x = torch.randn(1, seq, heads, head_dim, dtype=dtype)
+    cos = torch.randn(seq, head_dim // 2, dtype=dtype)
+    sin = torch.randn(seq, head_dim // 2, dtype=dtype)
+
+    rope = RotaryEmbedding(is_neox_style=is_neox_style)
+    ref = orig_forward_native(rope, x, cos, sin)
+    got = RotaryEmbedding.forward_native(
+        rope,
+        x.as_subclass(_FakeTpuTensor),
+        cos.as_subclass(_FakeTpuTensor),
+        sin.as_subclass(_FakeTpuTensor),
+    )
+    torch.testing.assert_close(got.as_subclass(torch.Tensor), ref, rtol=0, atol=0)
+    if dtype == torch.bfloat16:
+        assert matmul_calls == 1 and orig_calls == 0
+    else:
+        assert matmul_calls == 0 and orig_calls == 1
+
+
+def test_tpu_prompt_encoder_build_mask():
+    from vllm_torchtpu.omni.patches import _TpuCompiledPromptEncoder
+
+    mask = _TpuCompiledPromptEncoder.build_mask(
+        torch.tensor([[1, 1, 0, 0], [0, 1, 1, 1]])
+    )
+    assert mask.shape == (2, 1, 4, 4) and mask.dtype == torch.bool
+    causal = torch.ones(4, 4, dtype=torch.bool).tril()
+    assert torch.equal(
+        mask[0, 0],
+        causal & torch.tensor([True, True, False, False])
+        | torch.eye(4, dtype=torch.bool),
+    )
+    assert mask[1, 0, 0].tolist() == [True, False, False, False]
+    assert torch.equal(
+        mask[1, 0, 1:], causal[1:] & torch.tensor([False, True, True, True])
+    )
+
+
+def test_z_image_prompt_encoder_patch(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
+
+    from vllm_torchtpu.omni import patches as omni_patches
+
+    calls: list[tuple] = []
+    hidden = torch.arange(2 * 5 * 3, dtype=torch.float32).view(2, 5, 3)
+
+    class _Tokenizer:
+        def __init__(self, masks):
+            self._masks = masks
+
+        def apply_chat_template(self, messages, **kwargs):
+            calls.append(("template", messages[0]["content"], kwargs))
+            return "<chat>" + messages[0]["content"]
+
+        def __call__(self, prompts, **kwargs):
+            calls.append(("tokenize", list(prompts), kwargs))
+            ids = MagicMock()
+            ids.to.return_value = "ids_on_tpu"
+            return SimpleNamespace(input_ids=ids, attention_mask=self._masks)
+
+    class _FakePipe:
+        def __init__(self, masks):
+            self.tokenizer = _Tokenizer(masks)
+            self.text_encoder = object()
+            self._execution_device = SimpleNamespace(type="tpu")
+
+        def _encode_prompt(
+            self, prompt, device=None, prompt_embeds=None, max_sequence_length=512
+        ):
+            calls.append(("orig", prompt, device, prompt_embeds, max_sequence_length))
+            return "orig_result"
+
+    class _Encoder:
+        fail = False
+
+        def __init__(self, text_encoder):
+            calls.append(("build", text_encoder))
+
+        def __call__(self, input_ids, attention_mask):
+            calls.append(("encode", input_ids, attention_mask))
+            if _Encoder.fail:
+                raise RuntimeError("boom")
+            return hidden
+
+    monkeypatch.setattr(ZImagePipeline, "_encode_prompt", _FakePipe._encode_prompt)
+    monkeypatch.setattr(omni_patches, "_TpuCompiledPromptEncoder", _Encoder)
+    monkeypatch.setattr(omni_patches, "_is_tpu_device", lambda dev: dev.type == "tpu")
+
+    omni_patches._patch_z_image_prompt_encoder_tpu()
+    patched = ZImagePipeline._encode_prompt
+    omni_patches._patch_z_image_prompt_encoder_tpu()
+    assert ZImagePipeline._encode_prompt is patched
+
+    masks = torch.tensor([[1, 1, 1, 0, 0], [1, 0, 1, 0, 0]])
+    pipe = _FakePipe(masks)
+    out = ZImagePipeline._encode_prompt(pipe, ["a dog", "a cat"], max_sequence_length=5)
+    assert len(out) == 2
+    assert torch.equal(out[0], hidden[0, :3])
+    assert torch.equal(out[1], hidden[1][[0, 2]])
+    assert calls[0] == ("build", pipe.text_encoder)
+    assert calls[4] == ("encode", "ids_on_tpu", masks)
+
+    # Non-TPU devices and precomputed embeddings go straight to upstream.
+    calls.clear()
+    assert (
+        ZImagePipeline._encode_prompt(pipe, "x", device=torch.device("cpu"))
+        == "orig_result"
+    )
+    assert (
+        ZImagePipeline._encode_prompt(pipe, "x", prompt_embeds=["e"]) == "orig_result"
+    )
+    assert [c[0] for c in calls] == ["orig", "orig"]
+
+    # A failing compiled encoder fails fast rather than falling back silently.
+    _Encoder.fail = True
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            ZImagePipeline._encode_prompt(pipe, "y", max_sequence_length=5)
+    finally:
+        _Encoder.fail = False
+
+
+def test_tpu_compiled_prompt_encoder_forward(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.omni.patches import _TpuCompiledPromptEncoder
+
+    compile_calls: list[tuple] = []
+    monkeypatch.setattr(
+        torch, "compile", lambda fn, **kw: compile_calls.append((fn, kw)) or fn
+    )
+    called_layers: list[int] = []
+
+    def _make_layer(idx: int):
+        def _layer(hidden, attention_mask, position_ids, position_embeddings):
+            called_layers.append(idx)
+            return (hidden + 1.0,) if idx == 0 else hidden + 2.0
+
+        return _layer
+
+    decoder = SimpleNamespace(
+        embed_tokens=lambda ids: ids.float().unsqueeze(-1).expand(-1, -1, 4),
+        rotary_emb=lambda h, pos: (pos, pos),
+        layers=[_make_layer(0), _make_layer(1), _make_layer(2)],
+    )
+    encoder = _TpuCompiledPromptEncoder(SimpleNamespace(get_decoder=lambda: decoder))
+    assert len(compile_calls) == 1
+    assert compile_calls[0][1] == {"backend": "tpu", "dynamic": False}
+
+    ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+    mask = torch.tensor([[1, 1, 0], [1, 1, 1]])
+    out = encoder(ids, mask)
+    assert called_layers == [0, 1]  # last layer (idx=2) skipped for hidden_states[-2]
+    torch.testing.assert_close(out, ids.float().unsqueeze(-1).expand(-1, -1, 4) + 3.0)
+
+
+def test_tpu_pt_images_to_pil(monkeypatch):
+    import numpy as np
+    from diffusers.image_processor import VaeImageProcessor
+
+    from vllm_torchtpu.omni.patches import (
+        _patch_vae_image_processor_pil_output,
+        _pt_images_to_pil,
+    )
+
+    monkeypatch.setattr(VaeImageProcessor, "postprocess", VaeImageProcessor.postprocess)
+    torch.manual_seed(0)
+    proc = VaeImageProcessor(do_normalize=True)
+    img_t = torch.rand(1, 3, 16, 16) * 2.0 - 1.0
+    ref_post = proc.numpy_to_pil(proc.pt_to_numpy(proc.denormalize(img_t)))
+
+    _patch_vae_image_processor_pil_output()
+    img_01 = torch.rand(1, 3, 16, 16)
+    got_pil = _pt_images_to_pil(img_01)
+    ref_pil = VaeImageProcessor.numpy_to_pil(VaeImageProcessor.pt_to_numpy(img_01))
+    assert np.array_equal(np.asarray(got_pil[0]), np.asarray(ref_pil[0]))
+
+    # 1-channel grayscale (mode="L") check
+    gray_01 = torch.rand(1, 1, 16, 16)
+    got_gray = _pt_images_to_pil(gray_01)
+    ref_gray = VaeImageProcessor.numpy_to_pil(VaeImageProcessor.pt_to_numpy(gray_01))
+    assert got_gray[0].mode == "L"
+    assert np.array_equal(np.asarray(got_gray[0]), np.asarray(ref_gray[0]))
+
+    got_post = proc.postprocess(img_t, output_type="pil")
+    assert np.array_equal(np.asarray(got_post[0]), np.asarray(ref_post[0]))
+    got_pt = proc.postprocess(img_t, output_type="pt")
+    torch.testing.assert_close(got_pt, proc.denormalize(img_t))
