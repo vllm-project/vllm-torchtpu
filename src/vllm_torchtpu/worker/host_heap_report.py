@@ -99,11 +99,11 @@ def report(tag: str, rank: int) -> None:
 
 
 def _buffer_nbytes(o: Any) -> int:
-    if isinstance(o, bytes | bytearray):
-        return len(o)
-    if isinstance(o, str):
-        return len(o)  # approx for ascii
-    if isinstance(o, memoryview):
+    # type() rather than isinstance(): a dead weakref proxy raises on the latter.
+    t = type(o)
+    if t is bytes or t is bytearray or t is str:
+        return len(o)  # str: approx for ascii
+    if t is memoryview:
         return o.nbytes
     return 0
 
@@ -118,29 +118,22 @@ def census(tag: str, rank: int, top: int = 25) -> None:
     big: dict[int, tuple[int, str, str]] = {}
     cpu_storages: dict[int, tuple[int, str]] = {}
     for o in objs:
-        t = type(o)
-        tn = f"{t.__module__}.{t.__qualname__}"
-        count[tn] += 1
         try:
+            t = type(o)
+            tn = f"{t.__module__}.{t.__qualname__}"
+            count[tn] += 1
             size[tn] += sys.getsizeof(o)
-        except Exception:
-            pass
-        if isinstance(o, torch.Tensor):
-            try:
+            if issubclass(t, torch.Tensor):
                 if o.device.type == "cpu":
                     st = o.untyped_storage()
                     cpu_storages[st.data_ptr()] = (st.nbytes(), tn)
-            except Exception:
-                pass
-            continue
-        try:
-            refs = gc.get_referents(o)
+                continue
+            for r in gc.get_referents(o):
+                nb = _buffer_nbytes(r)
+                if nb >= (1 << 20) and id(r) not in big:
+                    big[id(r)] = (nb, type(r).__name__, tn)
         except Exception:
             continue
-        for r in refs:
-            nb = _buffer_nbytes(r)
-            if nb >= (1 << 20) and id(r) not in big:
-                big[id(r)] = (nb, type(r).__name__, tn)
     n_obj = len(objs)
     del objs
     total_shallow = sum(size.values()) / _GIB
@@ -191,8 +184,10 @@ def experiments(rank: int, release) -> None:
     dropped = 0
     for o in gc.get_objects():
         try:
-            d = getattr(o, "__dict__", None)
-            if d is not None and callable(o) and "serialize" in d:
+            if type(o).__name__ != "function":
+                continue
+            d = o.__dict__
+            if "serialize" in d:
                 del d["serialize"]
                 dropped += 1
         except Exception:

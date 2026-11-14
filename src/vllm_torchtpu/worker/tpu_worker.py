@@ -818,10 +818,14 @@ class TPUWorker(WorkerBase):
         CacheArtifactManager.clear()
         if heap_report:
             host_heap_report.report("artifacts-cleared", self.rank)
-            if heap_report >= 2 and self.rank in (0, 1):
-                host_heap_report.census("warm", self.rank)
-            if heap_report >= 3:
-                host_heap_report.experiments(self.rank, _release_free_host_heap)
+            # Diagnostics must never stop the engine from starting.
+            try:
+                if heap_report >= 2 and self.rank in (0, 1):
+                    host_heap_report.census("warm", self.rank)
+                if heap_report >= 3:
+                    host_heap_report.experiments(self.rank, _release_free_host_heap)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("TPU_HOST_HEAP_REPORT diagnostics failed: %r", e)
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
