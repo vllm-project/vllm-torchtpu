@@ -125,6 +125,18 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         x_2d = x.reshape(-1, x.shape[-1])
         return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
 
+    def apply_prequant(
+        self,
+        layer: torch.nn.Module,
+        x_q: torch.Tensor,
+        x_s: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply linear method when inputs are prequantized (FP8 rows + scales).
+        Dequantizes to layer weight dtype before dense multiplication."""
+        x = (x_q.to(torch.float32) * x_s).to(layer.weight.dtype)
+        return self.apply(layer, x, bias)
+
 
 @register_quantization_config(get_tpu_quant_method(UNQUANTIZED))
 class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):

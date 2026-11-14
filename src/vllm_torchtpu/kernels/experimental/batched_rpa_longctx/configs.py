@@ -22,6 +22,10 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import utils
 
+# Words of the scheduler's `actual_steps` field. More than one word keeps the
+# SMEM operand out of XLA's effective-scalar caller stub (see schedule.py).
+ACTUAL_STEPS_WORDS = 2
+
 
 @dataclasses.dataclass(frozen=True)
 class BlockSizes:
@@ -206,7 +210,7 @@ class RpaConfigs:
                         )  # page_indices
         fixed_bytes += 3  # distribution
         fixed_bytes += self.block.batch_size  # lane_lengths
-        fixed_bytes += 1  # actual_steps
+        fixed_bytes += ACTUAL_STEPS_WORDS  # actual_steps
 
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
