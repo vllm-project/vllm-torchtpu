@@ -9429,3 +9429,9 @@ def rotate_for_local_rank(items: list) -> list:
         return items
     shift = (local_rank % local_world) * len(items) // local_world
     return items[shift:] + items[:shift]
+
+
+# VLLM_TPU_SHARED_BACKEND_CACHE: share plain backend="tpu" compiles across ranks (see tpu_compiler).
+from vllm_torchtpu.compilation import tpu_compiler as _tpu_compiler  # noqa: E402
+
+_tpu_compiler.install_shared_backend_cache()
