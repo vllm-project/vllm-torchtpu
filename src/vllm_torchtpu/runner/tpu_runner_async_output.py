@@ -328,3 +328,24 @@ def compute_num_rejected(
     num_reqs = num_draft.shape[0]
     num_valid = (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1)
     return (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def spec_chunk_sources(
+    next_tokens: torch.Tensor, drafts: torch.Tensor, draft_lengths: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A bucketed verify chunk's substitution source
+    (`assemble_spec_next_tokens`) and rejected counts (`compute_num_rejected`),
+    the drafts and draft lengths fitted to its ``next_tokens`` rows, as one
+    program: run eagerly, each op was a program of its own."""
+    from vllm_torchtpu.spec_decode.utils import fit_rows
+
+    rows = next_tokens.shape[0]
+    source = assemble_spec_next_tokens(next_tokens, fit_rows(drafts, rows))
+    return source, compute_num_rejected(next_tokens, fit_rows(draft_lengths, rows))
+
+
+# `subtract_num_rejected_tokens` as one program (eagerly: three).
+subtract_num_rejected_tokens_compiled = torch.compile(
+    subtract_num_rejected_tokens, backend="tpu", fullgraph=True, dynamic=False
+)
