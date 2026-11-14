@@ -39,8 +39,9 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
 
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
-from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
-    fused_reverse_rope_wo_a_projection,
+from vllm_torchtpu.kernels.deepseek_v4.o_projection_fused import output_projection
+from vllm_torchtpu.kernels.deepseek_v4.o_projection_gather import (
+    fused as fused_o_projection,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
     BATCH_AXIS,
@@ -58,11 +59,14 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer imp
     static_verify_q_len,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.deepseek_v4.stable_graph_inputs import (
+    stable_weight_inputs,
+)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
     get_vllm_model_wrapper_context,
 )
-from vllm_torchtpu.utils import fresh_buffer
+from vllm_torchtpu.utils import fresh_buffer, get_device_name
 
 logger = init_logger(__name__)
 
@@ -96,6 +100,32 @@ def _rope_jax(
     return rope_kernel.rope(x, positions, cos_sin_cache)
 
 
+def _o_proj_decode_jax(
+    x: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    wo_a: jax.Array,
+    wo_a_scale: jax.Array,
+    wo_b: jax.Array,
+    wo_b_scale: jax.Array,
+) -> jax.Array:
+    logger.info(
+        "[output_projection] compiling resident B1 kernel x=%s wa=%s wb=%s",
+        x.shape,
+        wo_a.shape,
+        wo_b.shape,
+    )
+    return output_projection(
+        x, positions, cos_sin_cache, wo_a, wo_a_scale, wo_b, wo_b_scale
+    )
+
+
+def _fake_o_proj_decode(
+    x, positions, cos_sin_cache, wo_a, wo_a_scale, wo_b, wo_b_scale
+):
+    return torch.empty((x.shape[0], wo_b.shape[-1]), dtype=x.dtype, device=x.device)
+
+
 def _o_proj_jax(
     x: jax.Array,
     positions: jax.Array,
@@ -106,15 +136,13 @@ def _o_proj_jax(
     head_dim: int,
 ) -> jax.Array:
     """Inverse RoPE fused into the per-group `wo_a` projection."""
-    return fused_reverse_rope_wo_a_projection(
+    return fused_o_projection(
         x,
         positions,
         cos_sin_cache,
         wo_a,
-        wo_a_scale.reshape(-1),
+        wo_a_scale,
         head_dim=head_dim,
-        inverse=True,
-        quantize_activations=True,
     )
 
 
@@ -778,27 +806,71 @@ class VllmDeepseekV4MLAAttention(
         object.__setattr__(self, "_o_proj_op_instance", op)
         return op
 
+    @property
+    def o_proj_decode_op(self):
+        op = self.__dict__.get("_o_proj_decode_op_instance")
+        if op is not None:
+            return op
+        op_name = "pallas::deepseek_v4_output_projection_resident"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                _o_proj_decode_jax,
+                mesh=get_pallas_op_mesh(),
+                input_partition_specs=(
+                    P(None, "model", None),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                ),
+            )
+            op.register_fake(_fake_o_proj_decode)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_o_proj_decode_op_instance", op)
+        return op
+
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
-        """Store `wo_a` in the layout the fused o-projection kernel wants,
-        which is (self.n_local_heads * self.head_dim // self.n_local_groups,
-                  self.n_local_groups * self.o_lora_rank).
-        """
+        """Retain prefill weights and prepare a byte-preserving decode layout."""
         del act_dtype
         weight = cast(torch.Tensor, self.wo_a.weight)
         transposed = (
             self.n_local_heads * self.head_dim // self.n_local_groups,
             self.n_local_groups * self.o_lora_rank,
         )
-        if tuple(weight.shape) == transposed:
-            # Already done -- a reload path can run this hook twice.
-            return
-        assert tuple(weight.shape) == transposed[::-1], (
-            f"{self.prefix}.wo_a: expected the linear to hold "
-            f"{list(transposed[::-1])}, got {list(weight.shape)}."
+        if tuple(weight.shape) != transposed:
+            assert tuple(weight.shape) == transposed[::-1]
+            out = fresh_buffer(weight.data.t())
+            self.wo_a.weight = torch.nn.Parameter(out, requires_grad=False)
+        enabled = (
+            get_device_name() == "TPU v7"
+            and get_tensor_model_parallel_world_size() == 1
+            and transposed == (4096, 8192)
+            and tuple(self.wo_b.weight.shape) == (8192, 4096)
+            and self.wo_a.weight.dtype == torch.float8_e4m3fn
+            and self.wo_b.weight.dtype == torch.float8_e4m3fn
+            and tuple(self.wo_a.weight_scale.shape) == (8192,)
+            and tuple(self.wo_b.weight_scale.shape) == (4096,)
+            and self.rotary_emb.cos_sin_cache.shape[-1] == 64
         )
-
-        out = fresh_buffer(weight.data.t())
-        self.wo_a.weight = torch.nn.Parameter(out, requires_grad=False)
+        self._resident_output_enabled = enabled
+        if enabled:
+            packed = (
+                self.wo_a.weight.detach()
+                .reshape(4096, 8, 1024)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            self.register_buffer("wo_a_decode_packed", packed, persistent=False)
+            logger.info(
+                "[output_projection] prepared %s packed=%s extra_bytes=%d",
+                self.prefix,
+                tuple(packed.shape),
+                packed.numel() * packed.element_size(),
+            )
 
     def _assert_o_proj_supported(self) -> None:
         """Check what the fused `wo_a` kernel requires.
@@ -864,6 +936,18 @@ class VllmDeepseekV4MLAAttention(
             f"in place and needs [t, {self.n_local_heads}, {self.head_dim}], "
             f"got {list(o.shape)}."
         )
+        if self._resident_output_enabled:
+            o = stable_weight_inputs(o, self.wo_a.weight, self.wo_a_decode_packed)
+        if self._resident_output_enabled and o.shape[0] == 1:
+            return self.o_proj_decode_op(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a_decode_packed,
+                self.wo_a.weight_scale,
+                self.wo_b.weight,
+                self.wo_b.weight_scale,
+            )
         z = self.o_proj_op(
             o,
             positions,
