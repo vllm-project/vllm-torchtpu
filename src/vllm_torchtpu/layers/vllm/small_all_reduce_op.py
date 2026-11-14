@@ -134,6 +134,10 @@ def prebuild() -> bool:
     """Build the op and this core's rank tensor, outside any traced region.
     Returns whether the path is armed; logs the decision once."""
     global _OP, _RANK, _CORES, _TP_IS_MESH
+    if envs.TPU_SMALL_ALL_REDUCE:
+        from vllm_torchtpu.layers.adapter import \
+            small_all_reduce_op as adapter_sar
+        adapter_sar.prebuild()
     if _OP is not None:
         return True
     cap = envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS
@@ -246,6 +250,10 @@ def retain_dp_combine_inputs(out: torch.Tensor) -> torch.Tensor:
     result is dead (a zero on the positions in a layer that does not use
     them) leaves the trace with its buffer. Same form as the fused-EP route's
     own retain: the output plus a zero computed from each buffer."""
+    if envs.TPU_SMALL_ALL_REDUCE:
+        from vllm_torchtpu.layers.adapter import \
+            small_all_reduce_op as adapter_sar
+        out = adapter_sar.retain(out)
     if _RS_OP is None or _RANK is None or not _DP_COMBINE:
         # not this deployment's combine (the tensor-parallel line): nothing to
         # keep in step, and a read here would lift buffers the other route
