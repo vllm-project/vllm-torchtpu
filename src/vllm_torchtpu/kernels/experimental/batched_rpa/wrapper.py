@@ -39,6 +39,7 @@ def prepare_inputs(
     v_scale: jax.Array | None = None,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     page_size: int = 128,
+    skip_kv_update: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     total_q_tokens, actual_num_q_heads, actual_q_head_dim = q.shape
     _, actual_num_kv_heads, actual_kv_head_dim = k.shape
@@ -70,31 +71,27 @@ def prepare_inputs(
         aligned_kv_head_dim = utils.align_to(actual_kv_head_dim, num_lanes)
 
     # queries: (T, H, D) -> (T, H_kv, G, D)
-    o_hbm_alias_q_hbm = (
-        jnp.pad(
-            q.reshape(
-                total_q_tokens,
-                actual_num_kv_heads,
-                num_q_heads_per_kv_head,
-                actual_q_head_dim,
-            ),
-            (
-                (0, 0),
-                (0, 0),
-                (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
-                (0, aligned_q_head_dim - actual_q_head_dim),
-            ),
+    q_reshaped = q.reshape(
+        total_q_tokens,
+        actual_num_kv_heads,
+        num_q_heads_per_kv_head,
+        actual_q_head_dim,
+    )
+    pad_q_g = aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head
+    pad_q_d = aligned_q_head_dim - actual_q_head_dim
+    if pad_q_g > 0 or pad_q_d > 0:
+        q_reshaped = jnp.pad(
+            q_reshaped,
+            ((0, 0), (0, 0), (0, pad_q_g), (0, pad_q_d)),
             constant_values=0,
         )
-        .reshape(
-            total_q_tokens,
-            actual_num_kv_heads,
-            aligned_num_q_heads_per_kv_head // q_packing,
-            q_packing,
-            aligned_q_head_dim,
-        )
-        .swapaxes(0, 1)
-    )
+    o_hbm_alias_q_hbm = q_reshaped.reshape(
+        total_q_tokens,
+        actual_num_kv_heads,
+        aligned_num_q_heads_per_kv_head // q_packing,
+        q_packing,
+        aligned_q_head_dim,
+    ).swapaxes(0, 1)
 
     # Pad keys and values head_dim
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
@@ -127,43 +124,63 @@ def prepare_inputs(
         num_lanes = pltpu.get_tpu_info().num_lanes
         align_tokens = max(num_lanes, page_size)
         padded_total_tokens = utils.align_to(total_q_tokens, align_tokens)
-        new_kv_hbm = (
-            jnp.pad(
-                jnp.concatenate([k, v], axis=-1).reshape(
-                    total_q_tokens, actual_num_kv_heads_x2, actual_kv_head_dim
-                ),
+        if skip_kv_update:
+            new_kv_hbm = jnp.zeros(
                 (
-                    (0, padded_total_tokens - total_q_tokens),
-                    (0, 0),
-                    (0, aligned_kv_head_dim - actual_kv_head_dim),
+                    actual_num_kv_heads_x2,
+                    aligned_kv_head_dim // kv_packing,
+                    kv_packing,
+                    padded_total_tokens,
                 ),
-                constant_values=0,
+                dtype=kv_dtype,
             )
-            .reshape(
+        else:
+            kv_interleaved = jnp.stack([k, v], axis=2).reshape(
+                total_q_tokens, actual_num_kv_heads_x2, actual_kv_head_dim
+            )
+            pad_t = padded_total_tokens - total_q_tokens
+            pad_d = aligned_kv_head_dim - actual_kv_head_dim
+            if pad_t > 0 or pad_d > 0:
+                kv_interleaved = jnp.pad(
+                    kv_interleaved,
+                    ((0, pad_t), (0, 0), (0, pad_d)),
+                    constant_values=0,
+                )
+            new_kv_hbm = kv_interleaved.reshape(
                 padded_total_tokens,
                 actual_num_kv_heads_x2,
                 aligned_kv_head_dim // kv_packing,
                 kv_packing,
-            )
-            .transpose(1, 2, 3, 0)
-        )
+            ).transpose(1, 2, 3, 0)
     else:
-        new_kv_hbm = jnp.pad(
-            jnp.concatenate([k, v], axis=-1).reshape(
+        if skip_kv_update:
+            new_kv_hbm = jnp.zeros(
+                (
+                    total_q_tokens,
+                    num_kv_heads_x2_aligned // kv_packing,
+                    kv_packing,
+                    aligned_kv_head_dim,
+                ),
+                dtype=kv_dtype,
+            )
+        else:
+            kv_interleaved = jnp.stack([k, v], axis=2).reshape(
                 total_q_tokens, actual_num_kv_heads_x2, actual_kv_head_dim
-            ),
-            (
-                (0, 0),
-                (0, num_kv_heads_x2_aligned - actual_num_kv_heads_x2),
-                (0, aligned_kv_head_dim - actual_kv_head_dim),
-            ),
-            constant_values=0,
-        ).reshape(
-            total_q_tokens,
-            num_kv_heads_x2_aligned // kv_packing,
-            kv_packing,
-            aligned_kv_head_dim,
-        )
+            )
+            pad_h = num_kv_heads_x2_aligned - actual_num_kv_heads_x2
+            pad_d = aligned_kv_head_dim - actual_kv_head_dim
+            if pad_h > 0 or pad_d > 0:
+                kv_interleaved = jnp.pad(
+                    kv_interleaved,
+                    ((0, 0), (0, pad_h), (0, pad_d)),
+                    constant_values=0,
+                )
+            new_kv_hbm = kv_interleaved.reshape(
+                total_q_tokens,
+                num_kv_heads_x2_aligned // kv_packing,
+                kv_packing,
+                aligned_kv_head_dim,
+            )
     return o_hbm_alias_q_hbm, new_kv_hbm
 
 
@@ -711,6 +728,7 @@ def ragged_paged_attention(
         v_scale_tensor,
         kv_layout=kv_layout,
         page_size=page_size,
+        skip_kv_update=skip_kv_update,
     )
 
     default_decode, default_prefill = calculate_block_sizes(
