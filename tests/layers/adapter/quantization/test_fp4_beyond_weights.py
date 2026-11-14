@@ -298,3 +298,32 @@ def test_tpu_device_fp4_linear_w4a8_b256(monkeypatch):
         y_ref.float().flatten(), y_fp4.float().flatten(), dim=0
     ).item()
     assert cos > 0.985
+
+
+def test_tpu_device_fp4_linear_qkvz_large_shape_vmem(monkeypatch):
+    """Regression test for m=2048, k=8192, n={8192, 18432} scoped-VMEM budget."""
+    if not _has_tpu():
+        pytest.skip("Requires TPU device")
+    monkeypatch.setenv("REQUANTIZE_WEIGHT_DTYPE", "fp4")
+    monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")
+    monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "256")
+    monkeypatch.delenv("REQUANTIZE_FP4_PREFIXES", raising=False)
+
+    x = torch.randn((2048, 8192), dtype=torch.bfloat16, device="tpu") * 0.1
+    cfg = VllmFp8Config(is_checkpoint_fp8_serialized=True, activation_scheme="static")
+    for n_out in (8192, 18432):
+        layer = _make_linear(n_in=8192, n_out=n_out)
+        layer.weight = torch.nn.Parameter(
+            torch.ones((n_out, 8192), dtype=torch.float8_e4m3fn, device="tpu"),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.tensor([0.02], dtype=torch.float32, device="tpu"),
+            requires_grad=False,
+        )
+        method = VllmFp8LinearMethodTPU(
+            cfg, prefix="model.layers.0.linear_attn.in_proj_qkvz"
+        )
+        method.process_weights_after_loading(layer)
+        out = method.apply(layer, x)
+        assert tuple(out.shape) == (2048, n_out)
