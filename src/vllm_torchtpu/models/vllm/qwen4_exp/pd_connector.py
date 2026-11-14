@@ -1497,3 +1497,9 @@ class QwenPagePlan:
                     raise ValueError("Qwen PD groups overlap a physical carrier page")
                 occupied.add(key)
         return pages
+
+
+# VLLM_TPU_STARTUP_TRACE=1: Perfetto slices for the startup path (see startup_trace).
+from vllm_torchtpu import startup_trace as _startup_trace  # noqa: E402
+
+_startup_trace.install_pd_worker(Qwen4ExpRaidenWorker)
