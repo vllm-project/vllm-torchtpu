@@ -475,7 +475,9 @@ def gather_group_kv(
         # Decode-sized steps: the lane-dense rows below cost +4.4 us per
         # decode layer at c64 (twin j-899e03a2).
         rows = torch.cat([k, v, index_q], dim=1)  # [T, 3, D]
-        mine = torch.index_select(rows.view(reps, part, 3, head_dim), 0, dcp_rank % reps)
+        mine = torch.index_select(
+            rows.view(reps, part, 3, head_dim), 0, dcp_rank % reps
+        )
         parts = group.all_gather(mine.contiguous(), dim=0)  # [dcp, part, 3, D]
         per_head = (
             parts.view(dcp // reps, reps, part, 3, head_dim)

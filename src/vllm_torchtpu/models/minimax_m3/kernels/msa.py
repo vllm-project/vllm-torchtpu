@@ -29,6 +29,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_attention,
     msa_fp4,
     msa_indexer,
+    msa_quantize,
     msa_select,
     msa_write,
 )
@@ -168,11 +169,18 @@ def write_fp4(
     (`msa_fp4.scales_in_page`).
     """
     num_tokens, num_heads, _ = k.shape
-    k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
-    v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
+    if (
+        num_heads > 1
+        and num_tokens >= msa_quantize.MIN_TOKENS
+        and k.dtype == jnp.bfloat16
+    ):
+        kv_rows, scales = msa_quantize.quantize_kv_rows(k, v, interpret=interpret)
+    else:
+        k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
+        v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
+        kv_rows = jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1)
+        scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1)
     i_nib, i_scale = msa_fp4.quantize(msa_fp4.rotate_keys(index_k))
-    kv_rows = jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1)
-    scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1)  # [T, 2G]
     kv_cache, index_cache, scale_cache = write_caches(
         [
             msa_write.Rows(kv_cache, kv_rows, 4),

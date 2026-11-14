@@ -145,7 +145,9 @@ def _spmd(q, kvs, scs, cands, meta, **kw):
     )
     ranks = jnp.arange(DCP, dtype=jnp.int32)
     out = f(ranks, *(jnp.concatenate(a) for a in (q, kvs, scs, cands)), *meta)
-    return [o.reshape(-1, HL, HEAD_DIM) for o in np.split(np.asarray(out, np.float32), DCP)]
+    return [
+        o.reshape(-1, HL, HEAD_DIM) for o in np.split(np.asarray(out, np.float32), DCP)
+    ]
 
 
 @pytest.mark.parametrize(

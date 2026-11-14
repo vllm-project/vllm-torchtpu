@@ -22,7 +22,12 @@ import pytest
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from tests.models.minimax_m3.packing import CACHE_DTYPES, PACKING, pack
-from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_fp4, msa_write
+from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa,
+    msa_fp4,
+    msa_quantize,
+    msa_write,
+)
 
 PAGE = 128
 NUM_PAGES = 12
@@ -307,3 +312,28 @@ def test_small_pages_match_xla_scatter():
     np.testing.assert_array_equal(
         np.asarray(got.astype(jnp.float32)), np.asarray(expected.astype(jnp.float32))
     )
+
+
+@pytest.mark.parametrize("num_tokens,heads", [(512, 4), (1000, 4), (512, 2)])
+def test_quantize_kv_rows_matches_xla(num_tokens, heads):
+    """`msa_quantize.quantize_kv_rows` equals the XLA rotate + quantize +
+    interleave of `msa.write_fp4`, bit for bit (interpret mode), all-zero
+    rows included."""
+    rng = np.random.default_rng(num_tokens)
+    shape = (num_tokens, heads, 128)
+    k = (
+        jnp.asarray(
+            rng.standard_normal(shape) * rng.uniform(0, 3, (num_tokens, heads, 1)),
+            jnp.bfloat16,
+        )
+        .at[3]
+        .set(0)
+    )
+    v = jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
+    rows, scales = msa_quantize.quantize_kv_rows(k, v, interpret=True)
+    k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
+    v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
+    want_rows = jnp.concatenate([k_nib, v_nib], -1).reshape(num_tokens, -1)
+    want_scales = jnp.stack([k_scale, v_scale], -1).reshape(num_tokens, -1)
+    np.testing.assert_array_equal(np.asarray(rows), np.asarray(want_rows))
+    np.testing.assert_array_equal(np.asarray(scales), np.asarray(want_scales))
