@@ -407,6 +407,9 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_METADATA_BUILD: bool = False
     VLLM_TPU_STEADY_DECODE_METADATA: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
+    VLLM_TPU_ENVS_FREEZE: bool = False
+    VLLM_TPU_HOST_TOKEN_LISTS: bool = False
+    VLLM_TPU_PREFILL_CKPT_DECODE_SKIP: bool = False
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
     VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
     VLLM_TPU_STAGED_WALK_STACKED: bool = False
@@ -2540,6 +2543,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Freshly AOT-compiled models skip the per-call Dynamo guard check when
     # vLLM does not evaluate guards (as it already does for cached artifacts).
     "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),
+    # After warmup, each worker keeps the first value it reads of every
+    # variable in this module as a module attribute (freeze_reads), so a read
+    # on the step path is a dict hit instead of os.getenv plus parsing
+    # (~1.3 us per read, dozens of reads per decode step). Nothing sets these
+    # variables after warmup, so every read returns what it returned before.
+    "VLLM_TPU_ENVS_FREEZE": env_bool("VLLM_TPU_ENVS_FREEZE"),
+    # The previous step's sampled tokens become per-request host lists in
+    # plain Python (_modify_prev_results, and get_output on the output rank)
+    # instead of torch CPU ops: the same lists, ~30 us less per call.
+    "VLLM_TPU_HOST_TOKEN_LISTS": env_bool("VLLM_TPU_HOST_TOKEN_LISTS"),
+    # VLLM_TPU_MAMBA_TAIL_FOLD: skip the prefill checkpoint arithmetic when no
+    # request schedules more than one fold unit of tokens (every decode step);
+    # no checkpoint is possible then, so the result is the same zero tensor.
+    "VLLM_TPU_PREFILL_CKPT_DECODE_SKIP": env_bool(
+        "VLLM_TPU_PREFILL_CKPT_DECODE_SKIP"
+    ),
     # Host-path pieces (q38f-int: default off, toggled per arm).
     # Record stage-timing device events only when a KV connector consumes them.
     "VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK": env_bool(
@@ -2719,6 +2738,31 @@ def enable_envs_cache() -> None:
     # Cache all environment variables
     for key in environment_variables:
         __getattr__(key)
+
+
+def freeze_reads() -> None:
+    """VLLM_TPU_ENVS_FREEZE: from now on, the first read of a variable stores
+    its value as a module attribute, so later reads never reach __getattr__.
+
+    Values are computed lazily, on the same read that computed them before:
+    a variable that is never read is never parsed, and a malformed value
+    raises where it raised before. Call it once the process has finished
+    setting its environment (a worker after warmup).
+    """
+    global __getattr__
+    if getattr(__getattr__, "_tpu_frozen", False):
+        return
+    module = sys.modules[__name__]
+
+    def _getattr_and_keep(name: str) -> Any:
+        if name in environment_variables:
+            value = environment_variables[name]()
+            setattr(module, name, value)
+            return value
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    _getattr_and_keep._tpu_frozen = True  # type: ignore[attr-defined]
+    __getattr__ = _getattr_and_keep
 
 
 def __dir__() -> list[str]:
