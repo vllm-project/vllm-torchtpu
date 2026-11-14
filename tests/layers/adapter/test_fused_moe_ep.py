@@ -136,6 +136,20 @@ def test_native_replica_groups_reach_prebuilt_op():
     assert seen[0]["token_replica_groups"] == groups
 
 
+@pytest.mark.parametrize("second_minor", [False, True])
+def test_scale_layout_reaches_prebuilt_op(second_minor):
+    seen = []
+    assert (
+        _prebuild(
+            _layer(),
+            scales_expert_second_minor=second_minor,
+            build_op=lambda *args, **kw: seen.append(kw) or "op",
+        )
+        == "op"
+    )
+    assert seen[0]["scales_expert_second_minor"] is second_minor
+
+
 @pytest.mark.parametrize("sharded_plan", [False, True])
 @pytest.mark.parametrize(
     "scoring_fn,has_bias,scale",
@@ -180,9 +194,10 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         dict(scoring_fn="sigmoid" if scoring_fn == "softmax" else "softmax"),
         dict(has_score_bias=not has_bias),
         dict(routed_scaling_factor=scale + 1.0),
+        dict(scales_expert_second_minor=True),
     ):
         assert bridge._build_op(*args, **(options | changed)) is not replicated
-    assert len(closures) == 5
+    assert len(closures) == 6
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     bias = jnp.arange(4, dtype=jnp.bfloat16)
     operands = (
@@ -202,6 +217,7 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
     assert forwarded["scoring_fn"] == scoring_fn
     assert forwarded["routed_scaling_factor"] == scale
     assert forwarded["sharded_plan"] is sharded_plan
+    assert forwarded["scales_expert_second_minor"] is False
     if has_bias:
         np.testing.assert_array_equal(forwarded["score_bias"], bias)
         assert forwarded["score_bias"].dtype == jnp.float32
