@@ -476,7 +476,25 @@ class TestTpuPlatform:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
+    @pytest.mark.parametrize("layout", ["HND", "NHD"])
+    @pytest.mark.parametrize(
+        "head_size,text_cfg_kwargs,refused_under_hnd",
+        [
+            (64, {}, True),
+            (128, {}, False),
+            (256, {"global_head_dim": 64}, True),
+            (
+                256,
+                {
+                    "per_layer_config": [
+                        SimpleNamespace(head_dim=256),
+                        SimpleNamespace(head_dim=64),
+                    ]
+                },
+                True,
+            ),
+        ],
+    )
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
@@ -487,17 +505,22 @@ class TestTpuPlatform:
         mock_apply_patches,
         vllm_config,
         monkeypatch,
+        layout,
         head_size,
-        refused,
+        text_cfg_kwargs,
+        refused_under_hnd,
     ):
         """The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND."""
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
         vllm_config.attention_config.backend = AttentionBackendEnum.CUSTOM
         vllm_config.model_config.get_head_size = lambda: head_size
+        vllm_config.model_config.hf_text_config = (
+            SimpleNamespace(**text_cfg_kwargs) if text_cfg_kwargs else None
+        )
 
-        if refused:
+        if layout == "HND" and refused_under_hnd:
             with pytest.raises(NotImplementedError, match="head_dim==64"):
                 TpuPlatform.check_and_update_config(vllm_config)
         else:

@@ -170,7 +170,20 @@ def test_shared_pool_traces_without_vllm_config(monkeypatch, layout, dtype, head
     assert get_current_vllm_config_or_none() is None
 
     packing = 4 // dtype.itemsize
-    pool_shape = (4, 128, packing, 2 * math.prod(native_shape[1:]) // (128 * packing))
+    if layout == "HND" and head_dim != 64:
+        pool_shape = (
+            4,
+            2 * math.prod(native_shape[1:]) // (packing * 128),
+            packing,
+            128,
+        )
+    else:
+        pool_shape = (
+            4,
+            128,
+            packing,
+            2 * math.prod(native_shape[1:]) // (128 * packing),
+        )
 
     def attention(kv_cache, query, key, value, metadata, mesh, **kwargs):
         assert kv_cache.shape == native_shape
@@ -610,3 +623,87 @@ def test_default_layout_accepts_a_layout_blind_kernel_entry(nhd, monkeypatch):
     impl._kernel_op_prefix = "pallas::rpa_kernel_local"
     bound = _build_rpa_kernel(impl, monkeypatch)
     assert "kv_layout" not in bound.keywords
+
+
+@pytest.mark.parametrize("block_size", [128, 256])
+def test_shared_pool_seq_along_lane_keeps_minor_lane_axis_for_bitcast(
+    monkeypatch, block_size
+):
+    """Mixed-head-dim shared pools under SEQ_ALONG_LANE must keep
+    `(packing, block_size)` on the trailing axes so `_reshape_packed_kv_cache`
+    takes the direct `.reshape` fast path instead of transposing the pool."""
+    import jax
+    import jax.numpy as jnp
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+    from vllm_torchtpu.kv_cache_materializer import materialize_shared_attention_cache
+    from vllm_torchtpu.layers.adapter.attention import _reshape_packed_kv_cache
+
+    with _layout_env(monkeypatch, "HND"):
+        swa_bytes = page_bytes(BATCHED, 2, 256, FP8, block_size=block_size)
+        glob_bytes = page_bytes(BATCHED, 1, 512, FP8, block_size=block_size)
+        assert swa_bytes == glob_bytes
+        swa_native = BATCHED.get_kv_cache_shape(8, block_size, 2, 256, FP8)
+        glob_native = BATCHED.get_kv_cache_shape(8, block_size, 1, 512, FP8)
+        pool = materialize_shared_attention_cache(
+            layer_specs=[
+                (
+                    "layers.0.self_attn",
+                    SlidingWindowSpec(
+                        block_size=block_size,
+                        num_kv_heads=2,
+                        head_size=256,
+                        dtype=FP8,
+                        sliding_window=1024,
+                        page_size_padded=swa_bytes,
+                    ),
+                ),
+                (
+                    "layers.5.self_attn",
+                    FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=512,
+                        dtype=FP8,
+                        page_size_padded=glob_bytes,
+                    ),
+                ),
+            ],
+            tensor_size=8 * swa_bytes,
+            num_blocks=8,
+            attn_backend=BATCHED,
+            device=torch.device("cpu"),
+            seq_along_lane=True,
+        )
+
+    assert pool.shape == (8, swa_bytes // (4 * block_size), 4, block_size)
+    packed_shape = (pool.shape[0], pool.shape[1], 1, 4, pool.shape[3])
+    for native in (swa_native, glob_native):
+        jaxpr = jax.make_jaxpr(
+            lambda x, n=native: _reshape_packed_kv_cache(
+                _reshape_packed_kv_cache(x.reshape(packed_shape), n),
+                packed_shape,
+            ).reshape(pool.shape)
+        )(jax.ShapeDtypeStruct(pool.shape, jnp.float8_e4m3fn))
+        primitives = [eqn.primitive.name for eqn in jaxpr.jaxpr.eqns]
+        assert "transpose" not in primitives, primitives
+
+
+def test_shared_pool_uses_seq_along_lane_rejects_mixed_hd64():
+    from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
+
+    from vllm_torchtpu.layers.adapter.attention import shared_pool_uses_seq_along_lane
+
+    assert shared_pool_uses_seq_along_lane(BATCHED, VllmKVCacheLayout.LBHNC, [256, 512])
+    assert not shared_pool_uses_seq_along_lane(
+        BATCHED, VllmKVCacheLayout.LBNHC, [256, 512]
+    )
+    assert not shared_pool_uses_seq_along_lane(
+        BASE, VllmKVCacheLayout.LBHNC, [256, 512]
+    )
+    assert not shared_pool_uses_seq_along_lane(BATCHED, VllmKVCacheLayout.LBHNC, [64])
+    with pytest.raises(NotImplementedError, match="head_dim==64"):
+        shared_pool_uses_seq_along_lane(BATCHED, VllmKVCacheLayout.LBHNC, [64, 128])
+    assert not shared_pool_uses_seq_along_lane(
+        BATCHED, VllmKVCacheLayout.LBNHC, [64, 128]
+    )

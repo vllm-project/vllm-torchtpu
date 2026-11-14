@@ -83,6 +83,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasMLAttentionBackend,
     VllmTPUDeepseekV32IndexerBackend,
+    shared_pool_uses_seq_along_lane,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
@@ -521,24 +522,27 @@ class KVCacheManager:
                         "has its own KVCacheSpec."
                     )
 
-        kv_cache_spec = normalize_kv_cache_specs_for_tpu(
-            kv_cache_spec,
-            self.runner.kv_cache_dtype,
-            enable_unified_kv_layout=self.runner._unified_kv_layout,
-            exempt_layers=ds_v4_layers | sparse_mla_layers,
-            attention_backend=cast("type[PallasAttentionBackend] | None", backend_cls),
-        )
-        if (
-            hma_enabled
-            and has_attention
-            and not has_mamba
-            and not ds_v4_layers
-            and not self.runner._unified_kv_layout
-        ):
-            assert backend_cls is not None
-            kv_cache_spec = self._pad_native_attention_regions(
-                kv_cache_spec, cast("type[_TpuKVCacheBackend]", backend_cls)
+        with set_current_vllm_config(self.runner.vllm_config):
+            kv_cache_spec = normalize_kv_cache_specs_for_tpu(
+                kv_cache_spec,
+                self.runner.kv_cache_dtype,
+                enable_unified_kv_layout=self.runner._unified_kv_layout,
+                exempt_layers=ds_v4_layers | sparse_mla_layers,
+                attention_backend=cast(
+                    "type[PallasAttentionBackend] | None", backend_cls
+                ),
             )
+            if (
+                hma_enabled
+                and has_attention
+                and not has_mamba
+                and not ds_v4_layers
+                and not self.runner._unified_kv_layout
+            ):
+                assert backend_cls is not None
+                kv_cache_spec = self._pad_native_attention_regions(
+                    kv_cache_spec, cast("type[_TpuKVCacheBackend]", backend_cls)
+                )
         return kv_cache_spec
 
     def _pad_native_attention_regions(
@@ -1349,14 +1353,15 @@ class KVCacheManager:
         block_major = unified_block_major_enabled(self.runner.vllm_config)
         if block_major:
             self._check_block_major_pool_supported()
-        materialized = materialize_kv_cache_tensors(
-            kv_cache_config=kv_cache_config,
-            attn_groups=self.runner.attn_groups,
-            kernel_block_sizes=kernel_block_sizes,
-            device=self.runner.device,
-            cache_dtype=self.runner.kv_cache_dtype,
-            block_major=block_major,
-        )
+        with set_current_vllm_config(self.runner.vllm_config):
+            materialized = materialize_kv_cache_tensors(
+                kv_cache_config=kv_cache_config,
+                attn_groups=self.runner.attn_groups,
+                kernel_block_sizes=kernel_block_sizes,
+                device=self.runner.device,
+                cache_dtype=self.runner.kv_cache_dtype,
+                block_major=block_major,
+            )
         kv_caches = materialized.kv_caches
         self.runner.kv_cache_raw_tensors = materialized.raw_tensors
         self.runner.bm_pool_layout = materialized.bm_pool_layout
@@ -1777,39 +1782,51 @@ class KVCacheManager:
 
         shared_attention_caches: dict[tuple[int, int], torch.Tensor] = {}
         if share_attention_regions and not use_block_major and not _is_ds_v4:
-            region_specs: dict[tuple[int, int], list[tuple[str, KVCacheSpec]]] = {}
-            for tensor in kv_cache_config.kv_cache_tensors:
-                for index, name in enumerate(tensor.layers):
-                    region = (
-                        tensor.offset + index * tensor.layer_stride,
-                        tensor.block_stride,
-                    )
-                    region_specs.setdefault(region, []).append(
-                        (name, _per_layer_spec(name))
-                    )
-            for region, layer_specs in region_specs.items():
-                attention_specs = [
-                    (name, spec)
-                    for name, spec in layer_specs
-                    if isinstance(spec, AttentionSpec)
-                    and not isinstance(spec, MLAAttentionSpec)
-                ]
-                if (
-                    len(attention_specs) <= 1
-                    or len(attention_specs) != len(layer_specs)
-                    or attention_specs[0][1].page_size_bytes != region[1]
-                    or not can_share_attention_cache(
-                        [spec for _, spec in attention_specs], backend_cls
-                    )
-                ):
-                    continue
-                shared_attention_caches[region] = materialize_shared_attention_cache(
-                    layer_specs=attention_specs,
-                    tensor_size=kv_cache_config.num_blocks * region[1],
-                    num_blocks=kv_cache_config.num_blocks,
-                    attn_backend=backend_cls,
-                    device=self.runner.device,
+            with set_current_vllm_config(self.runner.vllm_config):
+                resolved_layout = (
+                    self.runner.cache_config.get_resolved_kv_cache_layout()
                 )
+                region_specs: dict[tuple[int, int], list[tuple[str, KVCacheSpec]]] = {}
+                for tensor in kv_cache_config.kv_cache_tensors:
+                    for index, name in enumerate(tensor.layers):
+                        region = (
+                            tensor.offset + index * tensor.layer_stride,
+                            tensor.block_stride,
+                        )
+                        region_specs.setdefault(region, []).append(
+                            (name, _per_layer_spec(name))
+                        )
+                for region, layer_specs in region_specs.items():
+                    attention_specs = [
+                        (name, spec)
+                        for name, spec in layer_specs
+                        if isinstance(spec, AttentionSpec)
+                        and not isinstance(spec, MLAAttentionSpec)
+                    ]
+                    if (
+                        len(attention_specs) <= 1
+                        or len(attention_specs) != len(layer_specs)
+                        or attention_specs[0][1].page_size_bytes != region[1]
+                        or not can_share_attention_cache(
+                            [spec for _, spec in attention_specs], backend_cls
+                        )
+                    ):
+                        continue
+                    seq_along_lane = shared_pool_uses_seq_along_lane(
+                        backend_cls,
+                        resolved_layout,
+                        [ls.head_size for _, ls in attention_specs],
+                    )
+                    shared_attention_caches[region] = (
+                        materialize_shared_attention_cache(
+                            layer_specs=attention_specs,
+                            tensor_size=kv_cache_config.num_blocks * region[1],
+                            num_blocks=kv_cache_config.num_blocks,
+                            attn_backend=backend_cls,
+                            device=self.runner.device,
+                            seq_along_lane=seq_along_lane,
+                        )
+                    )
             device_caches.extend(shared_attention_caches.values())
 
         for kv_cache_tensor in [] if _is_ds_v4 else kv_cache_config.kv_cache_tensors:
@@ -1913,13 +1930,14 @@ class KVCacheManager:
                         kv_caches[layer_name] = bundle_view_by_name[layer_name]
                     else:
                         assert backend_cls is not None
-                        kv_cache_shape = backend_cls.get_kv_cache_shape(
-                            num_blocks,
-                            kv_cache_spec.block_size,
-                            kv_cache_spec.num_kv_heads,
-                            kv_cache_spec.head_size,
-                            kv_cache_spec.dtype,
-                        )
+                        with set_current_vllm_config(self.runner.vllm_config):
+                            kv_cache_shape = backend_cls.get_kv_cache_shape(
+                                num_blocks,
+                                kv_cache_spec.block_size,
+                                kv_cache_spec.num_kv_heads,
+                                kv_cache_spec.head_size,
+                                kv_cache_spec.dtype,
+                            )
                         dtype = kv_cache_spec.dtype
                         kv_caches[layer_name] = allocate_attention_region(
                             region, [(tuple(kv_cache_shape), dtype)]
