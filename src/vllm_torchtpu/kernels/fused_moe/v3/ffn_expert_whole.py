@@ -17,7 +17,8 @@ slots, each tile computed, staged and committed as it lands."""
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels import pallas_compat
 
 from . import ffn
 from . import ffn_body as body
@@ -26,14 +27,20 @@ from .layout import LANES, ROW_BLOCK
 
 def w1_copy(ctx, expert, slot):
     """The async copy of an expert's first weight into a slot."""
-    return pltpu.make_async_copy(ctx.operands.w1.at[expert],
-                                 ctx.scratch.w1.at[slot], ctx.sems.w1.at[slot])
+    return pallas_compat.make_async_copy(ctx.operands.w1.at[expert],
+                                         ctx.scratch.w1.at[slot],
+                                         ctx.sems.w1.at[slot],
+                                         priority=ctx.b.weight_dma_priority,
+                                         strict_ordering=False)
 
 
 def w2_copy(ctx, expert, slot):
     """The async copy of an expert's second weight into a slot."""
-    return pltpu.make_async_copy(ctx.operands.w2.at[expert],
-                                 ctx.scratch.w2.at[slot], ctx.sems.w2.at[slot])
+    return pallas_compat.make_async_copy(ctx.operands.w2.at[expert],
+                                         ctx.scratch.w2.at[slot],
+                                         ctx.sems.w2.at[slot],
+                                         priority=ctx.b.weight_dma_priority,
+                                         strict_ordering=False)
 
 
 def first_refills(ctx):
@@ -46,8 +53,8 @@ def first_refills(ctx):
         @pl.when(jnp.int32(i) < ctx.n_visit)
         def _(i=i):
             expert = ctx.tables.visit_order[i]
-            w1_copy(ctx, expert, i).start(priority=ctx.b.weight_dma_priority)
-            w2_copy(ctx, expert, i).start(priority=ctx.b.weight_dma_priority)
+            w1_copy(ctx, expert, i).start()
+            w2_copy(ctx, expert, i).start()
 
 
 def start_tile_window(ctx, row_base, window_ref, sem):
@@ -67,16 +74,20 @@ def issue_tile_rows(ctx, row_base, live_blocks, slot, window_ref, sem):
     b = ctx.b
     if b.sorted_rows:
         rows = live_blocks * ROW_BLOCK
-        pltpu.make_async_copy(ctx.operands.tokens.at[pl.ds(row_base, rows)],
-                              ctx.scratch.rows.at[slot, pl.ds(0, rows)],
-                              ctx.sems.rows.at[slot]).start()
+        pallas_compat.make_async_copy(ctx.operands.tokens.at[pl.ds(
+            row_base, rows)],
+                                      ctx.scratch.rows.at[slot,
+                                                          pl.ds(0, rows)],
+                                      ctx.sems.rows.at[slot],
+                                      strict_ordering=False).start()
         for plane in range(b.scale_planes):
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 ctx.operands.token_scales.at[plane,
                                              pl.ds(row_base //
                                                    LANES, b.window_rows)],
                 ctx.scratch.row_scales.at[slot, plane],
-                ctx.sems.rows.at[slot]).start()
+                ctx.sems.rows.at[slot],
+                strict_ordering=False).start()
         return
     body.wait_token_window(window_ref, sem)
     offset = body.window_offset(ctx, row_base, window_ref)
@@ -107,12 +118,16 @@ def wait_tile_rows(ctx, live_rows, slot):
     waits are exact under any landing order; the second counts every
     plane's window)."""
     scratch, sems = ctx.scratch, ctx.sems
-    pltpu.make_async_copy(scratch.rows.at[slot, pl.ds(0, live_rows)],
-                          scratch.rows.at[slot, pl.ds(0, live_rows)],
-                          sems.rows.at[slot]).wait()
-    pltpu.make_async_copy(scratch.row_scales.at[slot],
-                          scratch.row_scales.at[slot],
-                          sems.rows.at[slot]).wait()
+    pallas_compat.make_async_copy(scratch.rows.at[slot,
+                                                  pl.ds(0, live_rows)],
+                                  scratch.rows.at[slot,
+                                                  pl.ds(0, live_rows)],
+                                  sems.rows.at[slot],
+                                  strict_ordering=False).wait()
+    pallas_compat.make_async_copy(scratch.row_scales.at[slot],
+                                  scratch.row_scales.at[slot],
+                                  sems.rows.at[slot],
+                                  strict_ordering=False).wait()
 
 
 def issue_first_tiles(ctx, expert, slot_of):
@@ -224,10 +239,8 @@ def expert_step(ctx, expert, visit_i, carry):
         refill_slot = lax.rem(visit_i + b.weight_prefetch,
                               jnp.int32(b.weight_slots))
         ahead = tables.visit_order[visit_i + b.weight_prefetch]
-        w1_copy(ctx, ahead,
-                refill_slot).start(priority=ctx.b.weight_dma_priority)
-        w2_copy(ctx, ahead,
-                refill_slot).start(priority=ctx.b.weight_dma_priority)
+        w1_copy(ctx, ahead, refill_slot).start()
+        w2_copy(ctx, ahead, refill_slot).start()
 
     rows = tables.expert_rows[expert]
     expert_first_row = tables.expert_base[expert]

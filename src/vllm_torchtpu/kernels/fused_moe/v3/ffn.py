@@ -166,9 +166,14 @@ def intermediate_rows(acc1,
         slice_amax = jnp.max(jnp.abs(chunk), axis=-1, keepdims=True)
         amax = slice_amax if amax is None else jnp.maximum(amax, slice_amax)
     scale, inverse, scalable = row_scale(amax)
-    quantized = jnp.concatenate(
-        [apply_row_scale(chunk, inverse, scalable, dtype) for chunk in chunks],
-        axis=-1)
+    if len(chunks) == 1:
+        quantized = apply_row_scale(chunks[0], inverse, scalable, dtype)
+    else:
+        quantized = jnp.concatenate([
+            apply_row_scale(chunk, inverse, scalable, dtype)
+            for chunk in chunks
+        ],
+                                    axis=-1)
     return quantized, scale
 
 
