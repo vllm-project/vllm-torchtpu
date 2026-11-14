@@ -1588,7 +1588,7 @@ class TestSchedulerUpstreamContract(unittest.TestCase):
         params = inspect.signature(OffloadingConnectorScheduler._make_boundary_key)
         self.assertIn("req_context", params.parameters)
 
-    def _sched(self):
+    def _sched(self, recency=True):
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
         sched = object.__new__(TPURaidenOffloadingScheduler)
@@ -1599,8 +1599,48 @@ class TestSchedulerUpstreamContract(unittest.TestCase):
         sched._jobs = {}
         sched._req_status = {}
         sched._max_async_load_reqs = 0
+        if recency:
+            sched._host_tier_recency = True
         sched._touch = MagicMock()
         return sched
+
+    def test_matched_tokens_without_recency_is_upstreams_answer(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        # host_tier_recency unset: upstream answers every lookup, including
+        # one from a GPU hit that ends inside a chunk (6 of 4-token chunks),
+        # and nothing is touched.
+        sched = self._sched(recency=False)
+        req = SimpleNamespace(request_id="r1")
+        sched._req_status["r1"] = SimpleNamespace(transfer_jobs=set())
+        for computed in (4, 6):
+            with patch.object(
+                OffloadingConnectorScheduler,
+                "get_num_new_matched_tokens",
+                return_value=(8, True),
+            ) as base:
+                result = sched.get_num_new_matched_tokens(
+                    req, computed, max_num_new_tokens=8
+                )
+            self.assertEqual(result, (8, True))
+            base.assert_called_once_with(req, computed, 8)
+        sched._touch.assert_not_called()
+
+    def test_store_jobs_without_recency_touch_nothing(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        sched = self._sched(recency=False)
+        sched._req_status = {"r1": object()}
+        jobs = {1: SimpleNamespace(req_id="r1")}
+        with patch.object(
+            OffloadingConnectorScheduler, "_build_store_jobs", return_value=jobs
+        ):
+            self.assertIs(sched._build_store_jobs(MagicMock()), jobs)
+        sched._touch.assert_not_called()
 
     def test_matched_tokens_forwards_the_load_cap_and_refreshes_recency(self):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
@@ -1696,13 +1736,16 @@ class TestSchedulerUpstreamContract(unittest.TestCase):
 
 class TestHostTierRecency(unittest.TestCase):
     """The touch order, the FullAttention re-offer and the store order that
-    keep an active conversation's host-tier keys ahead of inactive ones."""
+    keep an active conversation's host-tier keys ahead of inactive ones,
+    under the host_tier_recency option; unset, the upstream paths run."""
 
     @staticmethod
-    def _sched():
+    def _sched(recency=True):
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
         sched = object.__new__(TPURaidenOffloadingScheduler)
+        if recency:
+            sched._host_tier_recency = True
         sched.config = SimpleNamespace(
             kv_group_configs=(
                 SimpleNamespace(
@@ -1752,17 +1795,54 @@ class TestHostTierRecency(unittest.TestCase):
             OffloadingConnectorScheduler,
         )
 
-        sched = self._sched()
-        fa = SimpleNamespace(next_stored_chunk_idx=5)
-        state = SimpleNamespace(next_stored_chunk_idx=5)
-        sched._req_status = {"r1": SimpleNamespace(group_states=(fa, state))}
-        with patch.object(OffloadingConnectorScheduler, "update_state_after_alloc"):
-            sched.update_state_after_alloc(SimpleNamespace(request_id="r1"), None, 0)
-        self.assertEqual(
-            (fa.next_stored_chunk_idx, state.next_stored_chunk_idx), (0, 5)
+        for recency, expected in ((True, (0, 5)), (False, (5, 5))):
+            sched = self._sched(recency)
+            fa = SimpleNamespace(next_stored_chunk_idx=5)
+            state = SimpleNamespace(next_stored_chunk_idx=5)
+            sched._req_status = {"r1": SimpleNamespace(group_states=(fa, state))}
+            with patch.object(
+                OffloadingConnectorScheduler, "update_state_after_alloc"
+            ) as base:
+                sched.update_state_after_alloc(
+                    SimpleNamespace(request_id="r1"), None, 0
+                )
+            base.assert_called_once()
+            self.assertEqual(
+                (fa.next_stored_chunk_idx, state.next_stored_chunk_idx),
+                expected,
+                f"host_tier_recency={recency}",
+            )
+
+    def test_lookup_without_recency_is_upstreams(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
         )
 
+        req_status = SimpleNamespace(partial_tail_boundary=None)
+        for recency, expected in ((False, 3), (True, 0)):
+            sched = self._sched(recency)
+            sched.config.supports_partial_tail = False
+            sched._lookup_complete_chunks = MagicMock(return_value=0)
+            # The class attribute as the engine runs it may be the TPU
+            # fine-prefix wrapper; either way the override must defer to it.
+            with patch.object(
+                OffloadingConnectorScheduler, "_lookup", return_value=3
+            ) as base:
+                self.assertEqual(sched._lookup(req_status, 8), expected)
+            if recency:
+                base.assert_not_called()
+                sched._lookup_complete_chunks.assert_called_once_with(req_status, 8)
+            else:
+                base.assert_called_once_with(req_status, 8)
+                sched._lookup_complete_chunks.assert_not_called()
+
     def test_fence_acknowledged_stores_launch_largest_first(self):
+        # With the option; unset, they launch in acknowledgement order.
+        self.assertEqual(self._launch_order(recency=True), [2, 3, 1])
+        self.assertEqual(self._launch_order(recency=False), [1, 2, 3])
+
+    @staticmethod
+    def _launch_order(recency):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
             OffloadingConnectorScheduler,
         )
@@ -1774,6 +1854,8 @@ class TestHostTierRecency(unittest.TestCase):
         )
 
         sched = object.__new__(TPURaidenOffloadingScheduler)
+        if recency:
+            sched._host_tier_recency = True
         sched.config = SimpleNamespace(num_workers=1)
         sched._raiden_manager = MagicMock()
         sched._fence_pending = {
@@ -1788,14 +1870,13 @@ class TestHostTierRecency(unittest.TestCase):
         )
         with patch.object(OffloadingConnectorScheduler, "update_connector_output"):
             sched.update_connector_output(output)
-        launched = [
+        return [
             c.args[0] for c in sched._raiden_manager.submit_store_job.call_args_list
         ]
-        self.assertEqual(launched, [2, 3, 1])
 
 
 class TestOffloadConnectorOptions(unittest.TestCase):
-    """max_async_loads and fence_after_draft are opt-in
+    """max_async_loads, fence_after_draft and host_tier_recency are opt-in
     kv_connector_extra_config options: unset, the connector behaves as before."""
 
     def test_option_defaults_and_types(self):
@@ -1805,19 +1886,15 @@ class TestOffloadConnectorOptions(unittest.TestCase):
         self.assertEqual(
             _connector_option({"max_async_loads": 16}, "max_async_loads", 0), 16
         )
-        self.assertIs(_connector_option({}, "fence_after_draft", False), False)
-        self.assertIs(
-            _connector_option({"fence_after_draft": True}, "fence_after_draft", False),
-            True,
-        )
+        for name in ("fence_after_draft", "host_tier_recency"):
+            self.assertIs(_connector_option({}, name, False), False)
+            self.assertIs(_connector_option({name: True}, name, False), True)
+            for bad in ("1", 1, None):
+                with self.assertRaises(ValueError):
+                    _connector_option({name: bad}, name, False)
         for bad in ("16", True, -1, 1.5):
             with self.assertRaises(ValueError):
                 _connector_option({"max_async_loads": bad}, "max_async_loads", 0)
-        for bad in ("1", 1, None):
-            with self.assertRaises(ValueError):
-                _connector_option(
-                    {"fence_after_draft": bad}, "fence_after_draft", False
-                )
 
     def _capped(self, cap):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
@@ -1866,8 +1943,13 @@ class TestOffloadConnectorOptions(unittest.TestCase):
             capped = TPURaidenOffloadingScheduler(
                 SimpleNamespace(extra_config={"max_async_loads": 16}), None, None
             )
+            recency = TPURaidenOffloadingScheduler(
+                SimpleNamespace(extra_config={"host_tier_recency": True}), None, None
+            )
         self.assertEqual(unset._max_async_load_reqs, 0)
         self.assertEqual(capped._max_async_load_reqs, 16)
+        self.assertIs(unset._host_tier_recency, False)
+        self.assertIs(recency._host_tier_recency, True)
 
     def test_worker_reads_fence_after_draft_off_by_default(self):
         from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
