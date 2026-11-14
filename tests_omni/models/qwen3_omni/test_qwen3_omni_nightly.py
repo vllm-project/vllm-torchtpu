@@ -62,20 +62,34 @@ def _build_8s_audio_prompt() -> dict[str, object]:
     }
 
 
+# Expected greedy (temperature=0.0) prefixes verified against HuggingFace
+# Qwen3OmniMoeThinkerForConditionalGeneration on CPU.
 @pytest.mark.parametrize(
-    "omni_runner,prompt",
+    ("omni_runner", "prompt", "expected_prefix"),
     [
-        pytest.param((MODEL, DEPLOY_CONFIG), TEXT_PROMPT, id="text"),
-        pytest.param((MODEL, DEPLOY_CONFIG), _build_8s_audio_prompt(), id="audio_8s"),
+        pytest.param(
+            (MODEL, DEPLOY_CONFIG),
+            TEXT_PROMPT,
+            "The capital of France is Paris.",
+            id="text",
+        ),
+        pytest.param(
+            (MODEL, DEPLOY_CONFIG),
+            _build_8s_audio_prompt(),
+            "This is a high-pitched, continuous, and steady electronic tone",
+            id="audio_8s",
+        ),
     ],
     indirect=["omni_runner"],
 )
 def test_qwen3_omni_thinker_only_tpu(
-    omni_runner: OmniRunner, prompt: str | dict[str, object]
+    omni_runner: OmniRunner,
+    prompt: str | dict[str, object],
+    expected_prefix: str,
 ) -> None:
     sampling_params = SamplingParams(temperature=0.0, max_tokens=16)
     outputs = list(omni_runner.generate(prompt, [sampling_params]))
     assert len(outputs) == 1
     assert outputs[0].final_output_type == "text"
     assert len(outputs[0].outputs) == 1
-    assert len(outputs[0].outputs[0].text.strip()) > 0
+    assert outputs[0].outputs[0].text.strip().startswith(expected_prefix)
