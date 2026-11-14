@@ -793,7 +793,11 @@ def _patch_vllm_offloading_config_build() -> None:
     def build_offloading_config_tpu(vllm_config, kv_cache_config):
         pcp = vllm_config.parallel_config.prefill_context_parallel_size
         dcp = vllm_config.parallel_config.decode_context_parallel_size
-        if pcp <= 1 and dcp > 1:
+        from vllm_torchtpu import envs as _envs
+
+        # The PCP manager keeps the KV cache DCP-sharded only (DCP = TP x PCP),
+        # so its pages span `dcp` ranks, not `dcp x pcp`.
+        if (pcp <= 1 or _envs.USE_TPU_PCP_MANAGER) and dcp > 1:
             return build_offloading_config_dcp(vllm_config, kv_cache_config, dcp)
         if pcp <= 1:
             return original_build(vllm_config, kv_cache_config)

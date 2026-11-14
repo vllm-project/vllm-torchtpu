@@ -341,6 +341,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         cp_size = int(parallel_config.decode_context_parallel_size or 1) * int(
             parallel_config.prefill_context_parallel_size or 1
         )
+        if tpu_envs.USE_TPU_PCP_MANAGER:
+            # PCP manager: KV stays DCP-sharded only (DCP = TP x PCP).
+            cp_size = int(parallel_config.decode_context_parallel_size or 1)
         unsupported = [
             group.group_idx
             for group in self.config.kv_group_configs
