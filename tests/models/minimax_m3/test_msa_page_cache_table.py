@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_MINIMAX_M3_MSA_PAGE_CACHE_SCATTER: the presence-table page cache
-table equals the sorted one, and the attention keeps its bits (interpret)."""
+"""TPU_MINIMAX_M3_MSA_PAGE_CACHE_TABLE (onehot / scatter): the page cache table
+equals the sorted one, and the attention keeps its bits; MASK_BCAST keeps them
+too (interpret)."""
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +22,7 @@ import pytest
 
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, msa_fp4
 
-ENV = "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SCATTER"
+ENV = "TPU_MINIMAX_M3_MSA_PAGE_CACHE_TABLE"
 
 
 def _unions(rng, tiles, width, num_keys, max_union):
@@ -48,8 +49,9 @@ def test_table_matches_sorted(monkeypatch, tiles, width, num_keys, max_union, ca
     for _ in range(3):
         pages = _unions(rng, tiles, width, num_keys, max_union)
         ref = msa_attention_lse._page_cache(pages, tiles, cache)
-        got = msa_attention_lse._page_cache_scatter(pages, tiles, cache, num_keys)
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+        for build in (msa_attention_lse._page_cache_scatter, msa_attention_lse._page_cache_onehot):
+            got = build(pages, tiles, cache, num_keys)
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
 
 
 @pytest.mark.parametrize("slots", [256, 8])
@@ -70,12 +72,13 @@ def test_attention_bits(monkeypatch, slots):
     kw = dict(sm_scale=D**-0.5, head=0, scale_cache=sc, head_major=True, interpret=True,
               page_cache_slots=slots, step_widths=(4, 8))
     outs = []
-    for flag in ("0", "1"):
+    for flag in ("sort", "onehot", "scatter"):
         monkeypatch.setenv(ENV, flag)
         jax.clear_caches()
         outs.append(msa_attention_lse.msa_sparse_attention_lse(*args, **kw))
-    for a, b in zip(*outs):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    for other in outs[1:]:
+        for a, b in zip(outs[0], other):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
 
 @pytest.mark.parametrize("block_q", [16, 8])

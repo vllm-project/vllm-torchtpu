@@ -231,7 +231,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
-    TPU_MINIMAX_M3_MSA_PAGE_CACHE_SCATTER: bool = False
+    TPU_MINIMAX_M3_MSA_PAGE_CACHE_TABLE: str = "sort"
     TPU_MINIMAX_M3_MSA_MASK_BCAST: bool = False
 
 
@@ -1442,12 +1442,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG": env_str(
         "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG", ""
     ),
-    # MiniMax M3 MSA prefill page cache (`msa_attention_lse._page_cache`):
-    # find each call's distinct page keys with a presence table over the page
-    # keys (scatter, cumsum, gather) instead of three sorts of the call's
-    # union entries. Same slots and keys bit for bit.
-    "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SCATTER": env_bool(
-        "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SCATTER", False
+    # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
+    # how a call's distinct page keys and each union entry's cache slot are
+    # found. "sort" (default): three sorts of the call's union entries;
+    # "onehot": compares of every entry against every page key, reduced (no
+    # sort, gather or scatter); "scatter": a presence table by scatter (slow
+    # on TPU, kept for comparison). Same slots and keys bit for bit.
+    "TPU_MINIMAX_M3_MSA_PAGE_CACHE_TABLE": env_with_choices(
+        "TPU_MINIMAX_M3_MSA_PAGE_CACHE_TABLE", "sort", ["sort", "onehot", "scatter"]
     ),
     # MiniMax M3 MSA 4-bit attention (`msa_attention_lse._kernel`): mask a
     # group's scores with the tiles' per-token mask broadcast over the query
