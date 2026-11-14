@@ -86,8 +86,10 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    ATTN_OUT_HEAD_LAYOUT_ATTR,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    attn_out_quantized_matmul,
     quantized_matmul,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -1679,11 +1681,22 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     ) -> torch.Tensor:
         layer = cast("TpuLinear", layer)
         weight = layer.weight
-        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+        keep_vllm_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        if keep_vllm_layout:
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
-        if isinstance(layer, VocabParallelEmbedding):
+        attn_out_layout = getattr(layer, ATTN_OUT_HEAD_LAYOUT_ATTR, None)
+        if attn_out_layout is not None and not keep_vllm_layout:
+            # o_proj: quantize the attention output in its native layout.
+            out = attn_out_quantized_matmul(
+                x,
+                weight,
+                layer.weight_scale,
+                attn_out_layout,
+                w8a16_max_rows=self.w8a16_max_rows,
+            )
+        elif isinstance(layer, VocabParallelEmbedding):
             # Prevent the quantization of activations to FP8 (W8A16).
             out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
         else:

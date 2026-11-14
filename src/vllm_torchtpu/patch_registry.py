@@ -122,6 +122,7 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
     Patch("vllm_torchtpu.model_loader_patches:patch_expert_placement_routers", _ACTIVE),
+    Patch("vllm_torchtpu.model_loader_patches:patch_attn_out_projection_tags", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),
     Patch(
         "vllm_torchtpu.layers.adapter.dp_vocab_parallel:register_logits_processor",
