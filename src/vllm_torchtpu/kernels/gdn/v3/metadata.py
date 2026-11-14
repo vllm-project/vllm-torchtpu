@@ -65,14 +65,25 @@ def compute_batched_seq_metadata(
     has_initial_state = (seq_lens - query_lens) > 0
     all_valid_seqs = jnp.where(is_valid_seqs, all_seqs, 0)
 
+    # SmemWrapper indexes p_id_to_* at p_id * cfg.seq_tile_size + idx across
+    # idx in [0, cfg.seq_tile_size), so pad the per-tile tables to full tiles.
+    padded_max_seqs = max(1, pl.cdiv(max_seqs, cfg.seq_tile_size)) * cfg.seq_tile_size
+    pad_seqs = padded_max_seqs - max_seqs
+    p_id_to_s_idx = jnp.pad(all_valid_seqs, (0, pad_seqs))
+    p_id_to_r_base = jnp.pad(query_start_loc[all_valid_seqs], (0, pad_seqs))
+    p_id_to_r_size = jnp.pad(jnp.where(is_valid_seqs, query_lens, 0), (0, pad_seqs))
+    p_id_is_first_tile = jnp.pad(is_valid_seqs, (0, pad_seqs))
+    p_id_is_last_tile = jnp.pad(is_valid_seqs, (0, pad_seqs))
+
+    clamped_end_seq = jnp.clip(end_seq, 0, max_seqs)
     return memory_ref.MetadataRef.create(
         cfgs=cfg,
-        num_tiles=pl.cdiv(end_seq, cfg.tile_size),
-        p_id_to_s_idx=all_valid_seqs,
-        p_id_to_r_base=query_start_loc[all_valid_seqs],
-        p_id_to_r_size=jnp.where(is_valid_seqs, query_lens, 0),
-        p_id_is_first_tile=is_valid_seqs,
-        p_id_is_last_tile=is_valid_seqs,
+        num_tiles=pl.cdiv(clamped_end_seq, cfg.seq_tile_size),
+        p_id_to_s_idx=p_id_to_s_idx,
+        p_id_to_r_base=p_id_to_r_base,
+        p_id_to_r_size=p_id_to_r_size,
+        p_id_is_first_tile=p_id_is_first_tile,
+        p_id_is_last_tile=p_id_is_last_tile,
         s_idx_has_initial_state=has_initial_state,
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
