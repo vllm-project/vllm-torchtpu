@@ -17,6 +17,22 @@ from vllm_torchtpu import envs
 INVALID_TOKEN_ID = -1
 
 
+def valid_token_lists(tokens_cpu: torch.Tensor) -> list[list[int]]:
+    """Per row of a 2-D CPU token tensor, its entries other than
+    INVALID_TOKEN_ID, in order, as Python ints.
+
+    The same lists as ``[seq.tolist() for seq in
+    tokens_cpu[tokens_cpu != INVALID_TOKEN_ID].split(gen_lens)]``, built in
+    plain Python: for the few rows of a decode step this is ~2.5 us where
+    the four torch CPU ops take ~33 us (VLLM_TPU_HOST_TOKEN_LISTS).
+    """
+    return [
+        [token for token in row if token != INVALID_TOKEN_ID]
+        for row in tokens_cpu.tolist()
+    ]
+
+
+
 @dataclass
 class SpecLogprobsChunk:
     """One chunk's logprobs in a spec-decode step, one row per logits row.
@@ -260,11 +276,16 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             for i in self.discard_sampled_tokens_req_indices:
                 valid_sampled_token_ids[i].clear()
         else:
-            valid_mask = selected_token_ids != INVALID_TOKEN_ID
-            gen_lens = valid_mask.sum(dim=1).tolist()
-            valid_sampled_token_ids = [
-                seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)
-            ]
+            if envs.VLLM_TPU_HOST_TOKEN_LISTS:
+                valid_sampled_token_ids = valid_token_lists(selected_token_ids)
+                gen_lens = [len(seq) for seq in valid_sampled_token_ids]
+            else:
+                valid_mask = selected_token_ids != INVALID_TOKEN_ID
+                gen_lens = valid_mask.sum(dim=1).tolist()
+                valid_sampled_token_ids = [
+                    seq.tolist()
+                    for seq in selected_token_ids[valid_mask].split(gen_lens)
+                ]
             if self.copy_state.spec_logprobs:
                 self._model_runner_output.logprobs = spec_logprobs_lists(
                     self.copy_state.spec_logprobs, gen_lens
