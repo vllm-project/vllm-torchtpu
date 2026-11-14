@@ -330,18 +330,31 @@ def _down_cols(h, lanes):
     )
 
 
-def _select_fp4_expert_buffers(m, h, i, experts, bk1, bk2, vmem_capacity_bytes):
-    """Choose up to four slots within 80% of VMEM, or 0 if two do not fit.
+def _fp4_vmem_plan(m, h, i, experts, bk1, bk2, vmem_capacity_bytes):
+    """(slots, vmem_limit_bytes): up to four slots within 80% of VMEM, or
+    (0, 0) if two do not fit.
 
     Two slots are the minimum: the software pipeline holds the expert being
-    finished and the next one at once."""
+    finished and the next one at once. The limit is the plan plus half for
+    compiler temporaries (deviceless tpu7x compiles of the MiniMax-M3.1 TP8
+    slice allocate 1.25-1.33x the plan), not all of VMEM, so XLA can keep
+    operands of the ops around the kernel (such as the shared expert's
+    weights) in VMEM while it runs."""
     # Rows in, padded rows, out (bf16) and the f32 accumulator; the route table.
     fixed_bytes = m * h * (2 + 2 + 2 + 4) + m * pl.cdiv(experts, 128) * 128 * 4
     # The pipeline keeps two experts' [m, 2i] f32 gate_up accumulators live.
     fixed_bytes += 2 * m * 2 * i * 4
-    budget = vmem_capacity_bytes * 4 // 5
-    slots = (budget - fixed_bytes) // _fp4_expert_bytes(h, i, bk1, bk2)
-    return min(_MAX_FP4_EXPERT_BUFFERS, slots) if slots >= 2 else 0
+    slot_bytes = _fp4_expert_bytes(h, i, bk1, bk2)
+    slots = (vmem_capacity_bytes * 4 // 5 - fixed_bytes) // slot_bytes
+    if slots < 2:
+        return 0, 0
+    slots = min(_MAX_FP4_EXPERT_BUFFERS, slots)
+    if slots < _MAX_FP4_EXPERT_BUFFERS:
+        # The margin was measured with full rings only; a shorter ring means
+        # VMEM is already the constraint, so give the kernel all of it.
+        return slots, vmem_capacity_bytes
+    need = fixed_bytes + slots * slot_bytes
+    return slots, min(vmem_capacity_bytes, need * 3 // 2)
 
 
 def can_use_dense_expert_fp4(
@@ -381,12 +394,7 @@ def can_use_dense_expert_fp4(
     if not tpu_info.is_matmul_supported(jnp.bfloat16, _FP8):
         return False
     m_pad = pl.cdiv(m, 16) * 16
-    return (
-        _select_fp4_expert_buffers(
-            m_pad, h, i, e, bk1, bk2, tpu_info.vmem_capacity_bytes
-        )
-        > 0
-    )
+    return _fp4_vmem_plan(m_pad, h, i, e, bk1, bk2, tpu_info.vmem_capacity_bytes)[0] > 0
 
 
 def _kernel_fp4(
@@ -558,7 +566,7 @@ def dense_expert_moe_fp4(
     # bf16 rows tile by 16; the kernel pads the rows, which carry no route.
     m = pl.cdiv(num_tokens, 16) * 16
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
-    num_buffers = _select_fp4_expert_buffers(
+    num_buffers, vmem_limit_bytes = _fp4_vmem_plan(
         m, h, i, experts, bk1, bk2, vmem_capacity_bytes
     )
     weights = topk_weights.astype(jnp.float32)
@@ -599,7 +607,7 @@ def dense_expert_moe_fp4(
                 pltpu.SemaphoreType.DMA((num_buffers, 4)),
             ],
         ),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_capacity_bytes),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit_bytes),
         name=(
             f"dense_expert_moe_fp4-e_{experts}-t_{num_tokens}-m_{m}-h_{h}-i_{i}"
             f"-bk_{bk1}_{bk2}"
@@ -611,8 +619,7 @@ def dense_expert_moe_fp4(
         hidden,
         local_ids,
         weights,
-        w1,
-        w2,
-        s1,
-        s2,
+        # The kernel DMAs only the touched experts: keep XLA from staging whole
+        # weight or scale tensors in the VMEM the kernel leaves free.
+        *(pltpu.with_memory_space_constraint(t, pltpu.HBM) for t in (w1, w2, s1, s2)),
     )
