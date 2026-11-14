@@ -780,20 +780,27 @@ def _class_scores(
             *([scale_cache] * (pages_per_step if fp4 else 0)),
         )
 
-    # Back to token order: token t of request r sits in r's tiles at its offset.
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq = jnp.minimum(
-        jnp.searchsorted(cu_q_lens[1:], tok, side="right", method="compare_all").astype(
-            jnp.int32
-        ),
-        max_num_seqs - 1,
+    col = _token_columns(
+        tok, cu_q_lens, first_tile, tile_start, block_q, max_tiles * block_q
     )
-    offset = tok - lookup(tile_start, seq)
-    col = (lookup(first_tile, seq) + offset // block_q) * block_q + offset % block_q
-    col = jnp.clip(col, 0, max_tiles * block_q - 1)
     return ClassScores(
         scores_t, col, tile_seq, tile_row0, num_tiles, first_tile, tile_start
     )
+
+
+def _token_columns(rows, cu_q_lens, first_tile, tile_start, block_q, num_cols):
+    """The score column of each query row in `rows`: row t of request r sits
+    in r's tiles at its offset."""
+    seq = jnp.minimum(
+        jnp.searchsorted(
+            cu_q_lens[1:], rows, side="right", method="compare_all"
+        ).astype(jnp.int32),
+        cu_q_lens.shape[0] - 2,
+    )
+    offset = rows - lookup(tile_start, seq)
+    col = (lookup(first_tile, seq) + offset // block_q) * block_q + offset % block_q
+    return jnp.clip(col, 0, num_cols - 1)
 
 
 class _ClassPlan(NamedTuple):
@@ -968,9 +975,14 @@ def block_scores(
     scale_cache: jax.Array | None = None,
     scale_row: int | None = None,
     transposed_tile_q: int = _SMALL_TILE_Q_TRANSPOSED,
+    row_index: jax.Array | None = None,
     interpret: bool = False,
 ) -> jax.Array:
-    """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
+    """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group),
+    or with `row_index` ``[R, 1, P]``: row ``i`` is query row
+    ``row_index[i]``'s, picked by the gather that collects the tile classes
+    (gathering the result again was another SparseCore offload and a
+    relayout, ~15 us per layer in the c64 decode twin, j-9a9fccc2).
 
     Requests of at most `block_q` query tokens (decode, short chunks) are
     scored in `block_q`-row tiles; longer prefill chunks in `large_block_q`-row
@@ -1016,9 +1028,29 @@ def block_scores(
     num_tokens = index_q.shape[0]
     max_num_seqs = seq_lens.shape[0]
     max_large, is_large, token_major = plan.max_large, plan.is_large, plan.token_major
-    small, small_col, *_ = plan.small()
+    scored = plan.small()
+    small = scored.scores
     # The classes may pad pages to different group multiples; pad to the wider.
     pages = max(small.shape[1 if token_major else 0], plan.large_pages)
+    query_rows = (
+        jnp.arange(num_tokens, dtype=jnp.int32) if row_index is None else row_index
+    )
+
+    def columns(scored, block_q, num_cols):
+        if row_index is None:
+            return scored.col
+        return _token_columns(
+            row_index,
+            cu_q_lens,
+            scored.first_tile,
+            scored.tile_start,
+            block_q,
+            num_cols,
+        )
+
+    small_col = columns(
+        scored, plan.small_block_q, small.shape[0 if token_major else 1]
+    )
 
     def small_only():
         rows = small[small_col] if token_major else small[:, small_col].T
@@ -1028,12 +1060,13 @@ def block_scores(
         return small_only()[:, None, :]
 
     def with_large():
-        large, large_col, *_ = plan.large()
+        large_scored = plan.large()
+        large = large_scored.scores
+        large_col = columns(large_scored, plan.large_block_q, large.shape[1])
         small_t = small.T if token_major else small
-        tok = jnp.arange(num_tokens, dtype=jnp.int32)
         seq = jnp.minimum(
             jnp.searchsorted(
-                cu_q_lens[1:], tok, side="right", method="compare_all"
+                cu_q_lens[1:], query_rows, side="right", method="compare_all"
             ).astype(jnp.int32),
             max_num_seqs - 1,
         )

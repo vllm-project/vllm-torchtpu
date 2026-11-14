@@ -319,6 +319,7 @@ def _block_scores(
     scale_cache=None,
     scale_row=None,
     index_heads=1,
+    row_index=None,
 ):
     """`index_q` must already be rotated for a 4-bit cache; its rows fold
     `index_heads` heads per token (`block_score_options`)."""
@@ -332,6 +333,7 @@ def _block_scores(
         **block_score_options(index_heads),
         scale_cache=scale_cache,
         scale_row=scale_row,
+        row_index=row_index,
         interpret=interpret,
     )
 
@@ -528,11 +530,17 @@ def partial_block_scores(
     rotated `index_q`.
 
     The heads are folded into each request's query rows (request ``s`` owns
-    rows ``[H * cu[s], H * cu[s + 1])`` in (head, token) order), so one
-    `block_scores` call reads the shard's pages once per query tile.
+    rows ``[H * cu[s], H * cu[s + 1])``), so one `block_scores` call reads
+    the shard's pages once per query tile. Row ``t * H + h`` is head ``h`` of
+    token ``t``, ``index_q`` as laid out: `block_scores` is blind to the row
+    order within a request (it masks no key by position), and the
+    (head, token) order of `fold_index_heads` took a scatter (~5 us per
+    layer in the c64 decode twin, j-9a9fccc2).
     """
-    num_heads = index_q.shape[1]
-    folded, rows = fold_index_heads(index_q, seq_lens, cu_q_lens)
+    num_tokens, num_heads, head_dim = index_q.shape
+    folded = index_q.reshape(num_tokens * num_heads, head_dim)
+    rows = jnp.arange(num_tokens * num_heads, dtype=jnp.int32)
+    rows = rows.reshape(num_tokens, num_heads).T
     # block_scores counts a request's pages from its length and the cache's
     # tokens per page; a shard page holds block_size / shards tokens, so give
     # it ceil(len / shards) tokens: ceil(ceil(L / S) / (B / S)) = ceil(L / B).
@@ -547,8 +555,9 @@ def partial_block_scores(
         scale_cache,
         scale_row,
         index_heads=num_heads,
+        row_index=rows.reshape(-1),
     )
-    return scores[rows, 0]
+    return scores[:, 0].reshape(*rows.shape, -1)
 
 
 def msa_write_and_score_sharded(
