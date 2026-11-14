@@ -33,16 +33,18 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
 from vllm_torchtpu.kernels.experimental.batched_rpa.utils import (
-    broadcast_minor,
     convert_to_target_bitwidth,
-    get_dtype_packing,
-    strided_load,
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     RuntimeScheduleField,
     TilePlanField,
     build_pcp_streaming_schedule_inputs_from_metadata_jax,
     query_row_positions,
+)
+from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
+    broadcast_minor,
+    get_dtype_packing,
+    strided_load,
 )
 
 AXIS = "pcp"
