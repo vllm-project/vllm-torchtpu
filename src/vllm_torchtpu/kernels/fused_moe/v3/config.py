@@ -78,11 +78,33 @@ TABLES_ZERO_WORDS_DEFAULT = 8192
 # in-order one the token row fetches use, 0 the same queue.
 WEIGHT_DMA_PRIORITY_DEFAULT = 1
 WEIGHT_DMA_PRIORITIES = (0, 1)
+# Qwen3.5-397B-A17B on TPU v7x: hidden=4096, inter=1024.
+# The default 3 weight slots / 2 prefetch causes memory bandwidth stalls
+# when compute per expert is faster than HBM weight refill. Expanding weight
+# slots to 4 and prefetch depth to 3 fits in TPU v7x VMEM (48 MiB / 62.72 MiB
+# budget) and provides 3 stages of overlap to hide HBM weight refills.
+# Expanding result slots to 4 provides double-buffering for both compute and
+# result commit drains. Disabling sorted_rows eliminates the 352 MiB
+# intermediate sort buffer allocation and exposed SparseCore sort overhead
+# (86k rows per layer in prefill), enabling in-kernel asynchronous DMA
+# streaming under pallas_transport.
+_QWEN3_5_397B_TUNED = {
+    "weight_slots": 4,
+    "weight_prefetch": 3,
+    "result_slots": 4,
+    "sorted_rows": False,
+}
+
 # Settings tuned per shape, keyed by (hidden, inter, experts per shard,
 # top_k): the fields tuned off the defaults for that shape and nothing else.
 # The layer consults it when the caller passes no Config; a caller's own
 # Config is taken as it is.
-TUNED_BY_SHAPE = {}
+TUNED_BY_SHAPE = {
+    (4096, 1024, 64, 10): _QWEN3_5_397B_TUNED,
+    (4096, 1024, 64, 8): _QWEN3_5_397B_TUNED,
+    (4096, 1024, 80, 10): _QWEN3_5_397B_TUNED,
+    (4096, 1024, 80, 8): _QWEN3_5_397B_TUNED,
+}
 
 
 @dataclasses.dataclass(frozen=True)

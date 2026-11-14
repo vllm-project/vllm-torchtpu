@@ -79,15 +79,6 @@ def _jax_private():
             "written") from e
 
 
-def _empty_output_ref(out_type):
-    new_ref, memory_space_type, _, _, out_shape_to_aval = _jax_private()
-    aval = out_shape_to_aval(out_type)
-    memory_space = (None if isinstance(aval.memory_space, memory_space_type)
-                    else aval.memory_space)
-    value = lax.empty(aval.shape, aval.dtype, out_sharding=aval.sharding)
-    return new_ref(value, memory_space=memory_space)
-
-
 def sparse_core_program(body,
                         *,
                         out_types,
@@ -99,19 +90,42 @@ def sparse_core_program(body,
     """Wraps `body(*operand_refs, *out_refs, *scratch_refs)` as a jitted
     function over the vector-subcore mesh, returning the outputs as a tuple
     in out_types order. With in_place_outputs, that many trailing operands
-    ARE the outputs: taken with their contents and updated in place."""
-    new_ref, _, tree_util, core_map, _ = _jax_private()
+    ARE the outputs: taken with their contents and updated in place.
+
+    Without in_place_outputs the outputs are the program's own results
+    (pl.kernel's out_type): XLA allocates each call its own output buffers.
+    Writing into refs over lax.empty instead hands the custom call an
+    AllocateBuffer operand that it aliases to its output; CSE merges the
+    identical AllocateBuffers of every layer into one, and copy insertion
+    then gives every other aliasing call a private copy of that
+    uninitialized buffer, a full-size HBM copy on the TensorCore per call
+    and layer. The kernel body, its refs' memory space (HBM) and what the
+    outputs hold are the same either way: rows a body does not write are
+    unspecified in both.
+    """
     assert in_place_outputs in (0, len(out_types)), (in_place_outputs,
                                                      out_types)
+    if not in_place_outputs:
+        program = pl.kernel(body,
+                            out_type=tuple(out_types),
+                            mesh=mesh,
+                            scratch_types=tuple(scratch_types),
+                            compiler_params=compiler_params,
+                            name=name)
+
+        @jax.jit
+        def run_direct(*operands):
+            return tuple(program(*operands))
+
+        return run_direct
+
+    new_ref, _, tree_util, core_map, _ = _jax_private()
 
     @jax.jit
     def run(*operands):
         n_in = len(operands) - in_place_outputs
         operand_refs = tree_util.tree_map(new_ref, operands[:n_in])
-        if in_place_outputs:
-            out_refs = [new_ref(v) for v in operands[n_in:]]
-        else:
-            out_refs = [_empty_output_ref(t) for t in out_types]
+        out_refs = [new_ref(v) for v in operands[n_in:]]
 
         @core_map(mesh,
                   scratch_shapes=scratch_types,

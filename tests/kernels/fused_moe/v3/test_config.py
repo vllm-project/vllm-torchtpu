@@ -79,18 +79,40 @@ class ConfigTest(parameterized.TestCase):
     def test_for_shape(self):
         # Without an entry the record is the defaults; with one, the entry's
         # fields sit on top of them and nothing else moves.
-        shape = dict(hidden=4096, inter=1024, experts_per_shard=64, top_k=10)
-        self.assertEqual(Config.for_shape(**shape), Config())
+        untuned = dict(hidden=2048, inter=512, experts_per_shard=64, top_k=10)
+        self.assertEqual(Config.for_shape(**untuned), Config())
+        # Unmeasured (experts_per_shard, top_k) with the same (hidden, inter)
+        # keeps the defaults.
+        self.assertEqual(
+            Config.for_shape(hidden=4096,
+                             inter=1024,
+                             experts_per_shard=32,
+                             top_k=4),
+            Config(),
+        )
+        qwen_expected = Config(weight_slots=4,
+                               weight_prefetch=3,
+                               result_slots=4,
+                               sorted_rows=False)
+        for experts_per_shard, top_k in ((64, 10), (64, 8), (80, 10), (80, 8)):
+            self.assertEqual(
+                Config.for_shape(hidden=4096,
+                                 inter=1024,
+                                 experts_per_shard=experts_per_shard,
+                                 top_k=top_k),
+                qwen_expected,
+                (experts_per_shard, top_k),
+            )
         from vllm_torchtpu.kernels.fused_moe.v3 import config as config_module
         saved = dict(config_module.TUNED_BY_SHAPE)
         try:
-            config_module.TUNED_BY_SHAPE[(4096, 1024, 64, 10)] = {
+            config_module.TUNED_BY_SHAPE[(2048, 512, 64, 10)] = {
                 "gather_ring": 4,
                 "combine_unroll": 16
             }
-            self.assertEqual(Config.for_shape(**shape),
+            self.assertEqual(Config.for_shape(**untuned),
                              Config(gather_ring=4, combine_unroll=16))
-            self.assertEqual(Config.for_shape(**dict(shape, top_k=8)),
+            self.assertEqual(Config.for_shape(**dict(untuned, top_k=8)),
                              Config())
         finally:
             config_module.TUNED_BY_SHAPE.clear()
