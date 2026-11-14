@@ -50,6 +50,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu.distributed.dp_world import unified_dp_world
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -229,8 +230,8 @@ class TPUWorker(WorkerBase):
             dp_rank = binding.dp_rank
 
             # TorchTPU uses independent per-engine tpu_dist worlds unless EP
-            # needs a unified DP*TP world for expert collectives.
-            if pc.enable_expert_parallel:
+            # (or a model, see distributed/dp_world) needs a unified DP*TP world.
+            if unified_dp_world(pc):
                 pc.data_parallel_size = dp_size
                 pc.data_parallel_rank = dp_rank
                 if pc.data_parallel_rank_local is None:
@@ -252,7 +253,7 @@ class TPUWorker(WorkerBase):
             os.environ["MASTER_ADDR"] = str(master_addr)
             os.environ["MASTER_PORT"] = str(master_port)
 
-            if pc.enable_expert_parallel:
+            if unified_dp_world(pc):
                 # Setting data_parallel_size above puts
                 # init_distributed_environment() on its DP path, where it
                 # discards the rank and the init method it was handed and
@@ -584,9 +585,15 @@ class TPUWorker(WorkerBase):
         # accounting misses those bytes, so subtract them from the KV-cache
         # budget.
         reserves = self.model_runner.post_profile_hbm_reserves()
-        available = utils.min_across_ep_dp(
-            self.parallel_config, budget.available - sum(reserves)
-        )
+        local_available = budget.available - sum(reserves)
+        # A model adapter that owns its cache can report the bytes that cache
+        # may take, e.g. after profiling on a scratch pool.
+        adapter = getattr(self.model_runner, "model_adapter", None)
+        adapter_budget = getattr(adapter, "kv_cache_memory_budget", None)
+        sized = adapter_budget() if callable(adapter_budget) else None
+        if isinstance(sized, int):
+            local_available = sized
+        available = utils.min_across_ep_dp(self.parallel_config, local_available)
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)

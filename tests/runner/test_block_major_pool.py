@@ -794,3 +794,24 @@ def test_bind_block_major_pool_layers_rejects_other_layer_types(monkeypatch):
     }
     with pytest.raises(NotImplementedError, match=ATTN[2].replace(".", r"\.")):
         _bind_layers(monkeypatch, layers)
+
+
+def test_bind_block_major_pool_layers_binds_any_self_binding_layer(monkeypatch):
+    """A model directory's own GDN copy is not a VllmGatedDeltaNetAttention;
+    implementing set_block_major_pool is enough."""
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+
+    class ModelOwnedGdn:
+        def __init__(self):
+            self.bound = None
+
+        def set_block_major_pool(self, index, layout):
+            self.bound = (index, layout)
+
+    gdn = ModelOwnedGdn()
+    layers = {
+        ATTN[2]: SimpleNamespace(impl=MagicMock(spec=PallasAttentionBackendImpl)),
+        MAMBA[1]: gdn,
+    }
+    layout = _bind_layers(monkeypatch, layers)
+    assert gdn.bound == (1, layout)
