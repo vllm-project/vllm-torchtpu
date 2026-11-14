@@ -1263,6 +1263,8 @@ def _patch_vllm_offload_fine_prefix_alignment() -> None:
     block (eviction frees whole blocks, tail first), so the offload tier holds
     nothing past it either; skip the lookup there instead of racing.
     """
+    import functools
+
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
         OffloadingConnectorScheduler,
     )
@@ -1271,6 +1273,7 @@ def _patch_vllm_offload_fine_prefix_alignment() -> None:
         return
     original_lookup = OffloadingConnectorScheduler._lookup
 
+    @functools.wraps(original_lookup)
     def _lookup(self, req_status, *args, **kwargs):
         local_tokens = req_status.num_locally_computed_tokens
         for group_config in self.config.kv_group_configs:
