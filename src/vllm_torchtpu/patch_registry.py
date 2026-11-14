@@ -113,6 +113,10 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch(
+        "vllm_torchtpu.model_loader_patches:patch_default_loader_sync_weight_writes",
+        _ACTIVE,
+    ),
+    Patch(
         "vllm_torchtpu.model_loader_patches:patch_runai_sharded_expert_streaming",
         _ACTIVE,
     ),

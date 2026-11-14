@@ -247,6 +247,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen3_5_attn_moe_overlap",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
+    assert "patch_default_loader_sync_weight_writes" in stages["worker_init"]
 
 
 def test_plugin_import_sets_environment_before_jax():
