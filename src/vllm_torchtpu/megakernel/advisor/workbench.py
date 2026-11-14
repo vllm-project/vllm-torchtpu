@@ -20,6 +20,10 @@ import html
 from .assets import load_asset
 from .constants import VALID_MESH_AXIS_VALUES
 from .workbench_engine import render_workbench_engine_js
+from .workbench_phase import (
+    render_phase_extension_js,
+    render_phase_stage_tab_button,
+)
 
 
 def _esc_attr(value: object) -> str:
@@ -79,7 +83,7 @@ def render_workbench_body(
     vmem_bounds_mib: tuple[float, float] = (62.0, 62.0),
 ) -> str:
     """Render the 3-pane Fusion Workbench HTML shell."""
-    tabs_html = ""
+    tabs_html = render_phase_stage_tab_button()
     vmem_init, vmem_max = vmem_bounds_mib
     m_e, c_e = _esc_attr(model_name), _esc_attr(chip_name)
     l_e, s_e = _esc_attr(layout_label), _esc_attr(mode_source)
@@ -224,7 +228,16 @@ def render_workbench_body(
   <div id="wb-deriv-drawer"></div></aside></main>"""
 
 
-def render_workbench_script(_model_name: str = "") -> str:
-    """Return ES2022 workbench script combining physics engine and SVG views."""
+def render_workbench_script(model_name: str) -> str:
+    """Return the ES2022 workbench script of one model's report.
+
+    It combines the physics engine and the SVG views. The model name selects
+    the deployment role layouts of the phase map.
+    """
     ui_js = load_asset("workbench.js")
-    return f"{render_workbench_engine_js()}\n{ui_js}\n  window.wbRenderAll();\n"
+    return (
+        f"{render_workbench_engine_js()}\n"
+        f"{ui_js}\n"
+        f"{render_phase_extension_js(model_name)}\n"
+        "  window.wbRenderAll();\n"
+    )
