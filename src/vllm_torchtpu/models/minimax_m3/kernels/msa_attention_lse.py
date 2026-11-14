@@ -210,46 +210,6 @@ def _page_cache_scatter(
     ).astype(jnp.int32)
 
 
-def _page_cache_onehot(
-    pages: jax.Array, num_tiles: int, cache_size: int, num_keys: int
-) -> jax.Array:
-    """`_page_cache` from compares of every sorted union entry against every
-    page key ``[0, num_keys)`` (each a `page_table` index), reduced along
-    either axis: key presence, then each entry's slot as the number of
-    present keys below its key, and the ascending distinct keys. No sort,
-    gather or scatter; the slots and keys are the sorted version's."""
-    rows = pages.reshape(num_tiles, -1)
-    width = min(PAGE_CACHE_TILE_PAGES, rows.shape[1])
-    head = rows[:, :width].reshape(-1)
-    keys = jnp.arange(num_keys, dtype=jnp.int32)
-    hit = head[:, None] == keys[None, :]  # padding (-1) hits no key
-    present = jnp.any(hit, axis=0)
-    rank = jnp.cumsum(present, dtype=jnp.int32)  # present keys up to each key
-    num_distinct = rank[-1]
-    slot = jnp.sum(jnp.where(hit, rank[None, :] - 1, 0), axis=1, dtype=jnp.int32)
-    slot = jnp.where(head >= 0, slot, -1)
-    nth = jnp.arange(cache_size, dtype=jnp.int32)[:, None]
-    distinct = jnp.sum(
-        jnp.where(present[None, :] & (rank[None, :] - 1 == nth), keys[None, :], 0),
-        axis=1,
-        dtype=jnp.int32,
-    )
-    slot = jnp.pad(
-        slot.reshape(num_tiles, width),
-        ((0, 0), (0, rows.shape[1] - width)),
-        constant_values=-1,
-    )
-    fits = (num_distinct <= cache_size) & jnp.all(rows[:, width:] < 0)
-    return jnp.concatenate(
-        [
-            jnp.where(fits, slot.reshape(-1), pages),
-            distinct,
-            jnp.minimum(num_distinct, cache_size)[None],
-            fits.astype(jnp.int32)[None],
-        ]
-    ).astype(jnp.int32)
-
-
 def _page_cache(pages: jax.Array, num_tiles: int, cache_size: int) -> jax.Array:
     """A call's unions (`msa_attention._work_list`: `num_tiles` rows, ``-1``
     padded) -> ``[unions' cache slots | distinct keys (cache_size) | count |
@@ -1376,14 +1336,13 @@ def _chunked_call(
         ) * pages_per_step
         from vllm_torchtpu import envs
 
-        mode = envs.TPU_MINIMAX_M3_MSA_PAGE_CACHE_TABLE
-        if mode != "sort":
+        if envs.TPU_MINIMAX_M3_MSA_PAGE_CACHE_SCATTER:
             _proof(
-                "TPU_MINIMAX_M3_MSA_PAGE_CACHE_TABLE",
-                f"MSA prefill page cache table by {mode}, no sorts",
+                "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SCATTER",
+                "MSA prefill page cache keys by a presence table, no sorts",
             )
             build = functools.partial(
-                _page_cache_onehot if mode == "onehot" else _page_cache_scatter,
+                _page_cache_scatter,
                 num_tiles=step // block_q,
                 cache_size=cache_size,
                 num_keys=page_table.shape[0],
