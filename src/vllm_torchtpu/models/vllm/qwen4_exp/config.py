@@ -900,14 +900,20 @@ def validate_config(cfg):
         raise ValueError(
             "Qwen4Exp TPU S1 requires context>=128 for full activation profiling"
         )
+    # kv_cache_memory_bytes skips the memory-profiling run. That run sizes the
+    # unified pool only under HBM sizing; a statically sized pool (PD, or
+    # QWEN4_EXP_POOL_SIZING=static) is fixed before it and its block count
+    # comes from num_gpu_blocks_override, so the profile is only a check there
+    # and a start can skip it by passing the budget a profiled start logged.
     if (
         (c.enable_prefix_caching and not pooled)
         or s.disable_hybrid_kv_cache_manager
         or cfg.lora_config is not None
-        or c.kv_cache_memory_bytes is not None
+        or (c.kv_cache_memory_bytes is not None and (not pooled or hbm_pool_sizing(cfg)))
     ):
         raise ValueError(
-            "Qwen4Exp TPU requires profiled hybrid caches, APC only with unified pool, "
+            "Qwen4Exp TPU requires profiled hybrid caches (kv_cache_memory_bytes only "
+            "with a statically sized unified pool), APC only with unified pool, "
             "and no LoRA"
         )
     if cfg.speculative_config is not None:
