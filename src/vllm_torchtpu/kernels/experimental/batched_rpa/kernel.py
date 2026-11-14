@@ -241,6 +241,7 @@ def _compute_valid_kv_mask(
     b_idx: int,
     stitch_meta: StitchMetadata,
     step_meta: ComputeMetadata,
+    cfgs: configs.RpaConfigs,
 ) -> jax.Array:
     """Builds a boolean mask for valid token slices before PV."""
     # PV reduces over the whole tile: zero probabilities do not isolate NaNs
@@ -248,6 +249,16 @@ def _compute_valid_kv_mask(
     valid = token < (
         stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
     )
+    if (
+        cfgs.serve.kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE
+        and (sliding_window := cfgs.model.sliding_window) is not None
+    ):
+        # The SWA DMA trim leaves pre-window VMEM slots un-copied, so they may
+        # hold stale data. causal_offset = k_id - q_base and the schedule's
+        # sw_start = q_base - sliding_window + 1, so the first copied local
+        # slot is -causal_offset - sliding_window + 1.
+        sw_local_start = -step_meta.causal_offset[b_idx] - sliding_window + 1
+        valid &= token >= sw_local_start
     if step_meta.local_k_start is not None:
         valid &= token >= step_meta.local_k_start[b_idx]
     if step_meta.local_k_end is not None:
@@ -533,7 +544,7 @@ def rpa_body(
         )
         for b_idx in range(cfgs.batch_size):
             valid = (
-                _compute_valid_kv_mask(token, b_idx, stitch_meta, step_meta)
+                _compute_valid_kv_mask(token, b_idx, stitch_meta, step_meta, cfgs)
                 if token is not None
                 else None
             )
@@ -583,7 +594,7 @@ def rpa_body(
             )
         for b_idx in range(cfgs.batch_size):
             valid = (
-                _compute_valid_kv_mask(token, b_idx, stitch_meta, step_meta)
+                _compute_valid_kv_mask(token, b_idx, stitch_meta, step_meta, cfgs)
                 if token is not None
                 else None
             )

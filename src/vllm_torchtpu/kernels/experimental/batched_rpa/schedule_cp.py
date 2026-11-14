@@ -112,7 +112,9 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
         kv_new_len,
         end_k_idx,
         p_offset,
+        sw_start: jax.typing.ArrayLike = 0,
     ) -> schedule.LoopCarry:
+        del sw_start
         cfgs = self.cfgs
         sched = self.schedule
         count = carry.count
@@ -148,26 +150,36 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                     local_page_i = jnp.minimum(
                         p_idx // cp_group_size, cfgs.serve.pages_per_seq - 1
                     )
-                    src_hbm_cp = self.page_indices_ref[p_offset + local_page_i]
+                    src_page_idx = self.page_indices_ref[p_offset + local_page_i]
                     dma_sz = jnp.where(p_idx % cp_group_size == self.rank, dma_sz, 0)
-                    sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm_cp
                 else:  # CACHE_ONLY
                     p_idx = jnp.minimum(kv_p_start + i, cfgs.serve.pages_per_seq - 1)
-                    src_hbm = self.page_indices_ref[p_offset + p_idx]
-                    sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-                sched.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-                sched.dma_kv_cache[step, target_lane, i, 2] = utils.align_to(
-                    dma_sz, cfgs.kv_token_align
+                    src_page_idx = self.page_indices_ref[p_offset + p_idx]
+                sched.set_dma_kv_cache_page(
+                    step,
+                    target_lane,
+                    i,
+                    src_page_idx=src_page_idx,
+                    dst_vmem=dst_vmem,
+                    size=utils.align_to(dma_sz, cfgs.kv_token_align),
                 )
             else:
                 p_idx = jnp.minimum(kv_p_start + i, cfgs.serve.pages_per_seq - 1)
                 src_hbm = self.page_indices_ref[p_offset + p_idx]
-                sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-                sched.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-                if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
-                    sched.dma_kv_cache[step, target_lane, i, 2] = 0
-                else:
-                    sched.dma_kv_cache[step, target_lane, i, 2] = dma_sz
+                size = (
+                    0
+                    if cfgs.serve.attention_scope
+                    == configs.AttentionScope.NEW_TOKENS_ONLY
+                    else dma_sz
+                )
+                sched.set_dma_kv_cache_tokens(
+                    step,
+                    target_lane,
+                    i,
+                    src_token_off=src_hbm << cfgs.serve.page_size_log2,
+                    dst_vmem=dst_vmem,
+                    size=size,
+                )
 
         kv_left_frm_new = kv_left - kv_left_frm_cache
         bkv_sz_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
