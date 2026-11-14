@@ -31,10 +31,12 @@ Per layer:
   and RMSNorm, the 32-rank all-gather of the window's unit-RMS rows (FP8),
   the chunked gated delta rule (``kda_prefill_tiled_body``, which applies
   the norm weight) and the output projection ring;
-* MLA, ``make_norm_gather_sp`` then ``make_mla_attention_layer_sp_ring``:
+* MLA, ``make_mla_input_sp`` then ``make_mla_attention_layer_sp_ring``:
   the projections, packed flash attention over the window, context-parallel
   attention over every rank's cached prefix pages (``CpPrefix``), the
-  projection ring;
+  projection ring; the window the output gate reads is gathered before the
+  layer, or by the attention kernel while it runs
+  (``KernelConfig.prefill_mla_flash_gather``);
 * MoE, ``make_indexed_moe_sp_ring``: the fused EP16/TP2 layer
   (``prefill_moe.fused``): sequence-parallel routing, packed latent/shared
   overlap, indexed gate/up and the fused down/reduce-scatter, one launch per
@@ -2391,6 +2393,7 @@ def mla_projections(
     gather_collective_id=45,
     head_major=False,
     length=None,
+    local_rows=False,
 ):
     """MLA Q/K/V projections for a token window (per-rank layout).
 
@@ -2401,10 +2404,16 @@ def mla_projections(
     ``return_latent`` also the compressed KV that vLLM's MLA cache stores,
     ``[T, 576]`` BF16: the normalized 512-lane latent then the 64 rope lanes
     (K3's MLA is NoPE; the rope lanes are used unrotated). It is the same on
-    every rank.
+    every rank. With ``local_rows``, ``hidden`` is the rank's sequence-parallel
+    rows ``[T / 32, hidden]``: their latents are gathered in token order
+    (``window_all_gather`` on ``gather_tables``) and output_gate is None,
+    since only the gathered window feeds it.
     """
     tokens = hidden.shape[0]
-    if sp_axis is None:
+    if local_rows:
+        rows, local = tokens, hidden
+        tokens = 32 * rows
+    elif sp_axis is None:
         rows, local = tokens, hidden
     else:
         # The low-rank projections are not head-split: each rank projects one
@@ -2433,7 +2442,19 @@ def mla_projections(
         * weights.key_value_normalization
     ).astype(jnp.bfloat16)
     rope = compressed[:, 512:576]
-    if sp_axis is not None:
+    if local_rows:
+        width = query_latent.shape[1]
+        # The rope lanes travel padded to a 128-lane block.
+        both = window_all_gather(
+            jnp.concatenate((query_latent, kv_latent, jnp.pad(rope, ((0, 0), (0, 64)))), axis=1),
+            gather_tables,
+            collective_id=gather_collective_id,
+        )
+        output_gate = None
+        query_latent = both[:, :width]
+        kv_latent = both[:, width : width + 512]
+        rope = both[:, width + 512 : width + 576]
+    elif sp_axis is not None:
         width = query_latent.shape[1]
         if gather_tables is not None and sp_axis == "k3_sp" and (width + 576) % 128 == 64:
             padded_rope = jnp.pad(rope, ((0, 0), (0, 64)))
@@ -3972,7 +3993,33 @@ def expand_prefix_pages(pages, order, key_value_up):
     return keys[None], values[None]
 
 
-def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile=TILE, arena=None, layer=0):
+def _flash_window_gather_kernel(*refs, flash, scalars, inputs):
+    """``flash`` (`_flash_kernel_packed` with ``scalars`` scalar and
+    ``inputs`` input refs) while the window all-gather of the rank's rows
+    (`_window_gather_step`) runs under it: ring step j of the S steps at
+    the start of grid step floor(j G / S) of the G, so each step's copies fly
+    while the attention runs up to the next one. The gather's refs follow
+    the flash's: the ring tables (scalar), the rank's rows ``[blocks,
+    stripe, width]`` (input), the window (output) and
+    `_window_gather_scratch`."""
+    tables_ref, rest = refs[scalars], refs[scalars + 1:]
+    rows_ref, out_ref, window_ref = rest[inputs:inputs + 3]
+    gathers = len(_window_gather_scratch(rows_ref.shape[2]))
+    flash_scratch, gather_scratch = rest[inputs + 3:-gathers], rest[-gathers:]
+    grid = pl.num_programs(0) * pl.num_programs(1)
+    index = pl.program_id(0) * pl.num_programs(1) + pl.program_id(1)
+    rank = jax.lax.axis_index("k3_sp")
+    pl.when(index == 0)(lambda: _ring_enter(tables_ref, rank))
+
+    @pl.loop((index * HALF_STEPS + grid - 1) // grid, ((index + 1) * HALF_STEPS + grid - 1) // grid)
+    def ring(step):
+        _window_gather_step(tables_ref, rows_ref, window_ref, *gather_scratch, step=step)
+
+    flash(*refs[:scalars], *rest[:inputs], out_ref, *flash_scratch)
+
+
+def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile=TILE, arena=None, layer=0,
+                             gather=None, collective_id=None):
     """Causal MLA over a packed window of ``count`` sequences, per head.
 
     Args:
@@ -3985,9 +4032,14 @@ def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile
         arena: Optional ``([L, 3, C, 256], [L, 3, 128, C])`` cached-prefix
             keys and transposed values, read in place from HBM.
         layer: The arena layer, a ``[1]`` or scalar int32.
+        gather: Optional ``(rows, tables)``: the rank's ``[T / 32, width]``
+            sequence-parallel rows, all-gathered in token order on the half
+            rings of ``tables`` while the attention runs
+            (`_flash_window_gather_kernel`, on barrier ``collective_id``).
 
     Returns:
-        ``[3, T, 128]`` BF16; padded rows are zero.
+        ``[3, T, 128]`` BF16; padded rows are zero. With ``gather``, also the
+        gathered ``[T, width]`` window.
     """
     if query.ndim != 3 or query.shape[2] != 256:
         raise ValueError("query must be [H,T,256]")
@@ -4026,30 +4078,54 @@ def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile
         operands += (arena_keys, arena_values)
         in_specs += (hbm, hbm)
     name = "kimi_mla_flash_prefill_packed" + ("_prefixed" if arena is not None else "")
-    return pl.pallas_call(
-        functools.partial(_flash_kernel_packed, tile=k_tile, q_tile=q_tile, count=count,
-                          prefixed=arena is not None, prefix_tile=p_tile),
-        out_shape=jax.ShapeDtypeStruct((heads, tokens, 128), jnp.bfloat16),
+    kernel = functools.partial(_flash_kernel_packed, tile=k_tile, q_tile=q_tile, count=count,
+                               prefixed=arena is not None, prefix_tile=p_tile)
+    out_shape = jax.ShapeDtypeStruct((heads, tokens, 128), jnp.bfloat16)
+    out_specs = pl.BlockSpec((1, q_tile, 128), lambda h, i, *_: (h, i, 0))
+    scratch = (
+        pltpu.VMEM((2, k_tile, 256), jnp.bfloat16),
+        pltpu.VMEM((2, 128, k_tile), jnp.bfloat16),
+        pltpu.SemaphoreType.DMA((2, 2)),
+    ) + ((
+        pltpu.VMEM((2, p_tile, 256), arena[0].dtype),
+        pltpu.VMEM((2, 128, p_tile), arena[1].dtype),
+        pltpu.SemaphoreType.DMA((2, 2)),
+    ) if arena is not None else ())
+    params = dict(dimension_semantics=("parallel", "parallel"), vmem_limit_bytes=64 * 1024**2)
+    if gather is not None:
+        rows, tables = gather
+        local_rows, width = rows.shape
+        stripe = window_stripe(local_rows)
+        if 32 * local_rows != tokens or collective_id is None:
+            raise ValueError("the gathered rows must make the window, under a collective_id")
+        kernel = functools.partial(_flash_window_gather_kernel, flash=kernel, scalars=len(scalars),
+                                   inputs=len(operands))
+        scalars += (jnp.asarray(tables, jnp.int32),)
+        operands += (rows.reshape(local_rows // stripe, stripe, width),)
+        in_specs += (hbm,)
+        out_shape = (out_shape, jax.ShapeDtypeStruct((local_rows // stripe, 32, stripe, width), rows.dtype))
+        out_specs = (out_specs, hbm)
+        scratch += _window_gather_scratch(width)
+        # The ring steps are tied to the grid order.
+        params.update(collective_id=collective_id, dimension_semantics=("arbitrary", "arbitrary"))
+        name += "_window_ag"
+    result = pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalars),
             grid=(heads, tokens // q_tile),
             in_specs=in_specs,
-            out_specs=pl.BlockSpec((1, q_tile, 128), lambda h, i, *_: (h, i, 0)),
-            scratch_shapes=(
-                pltpu.VMEM((2, k_tile, 256), jnp.bfloat16),
-                pltpu.VMEM((2, 128, k_tile), jnp.bfloat16),
-                pltpu.SemaphoreType.DMA((2, 2)),
-            ) + ((
-                pltpu.VMEM((2, p_tile, 256), arena[0].dtype),
-                pltpu.VMEM((2, 128, p_tile), arena[1].dtype),
-                pltpu.SemaphoreType.DMA((2, 2)),
-            ) if arena is not None else ()),
+            out_specs=out_specs,
+            scratch_shapes=scratch,
         ),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel"), vmem_limit_bytes=64 * 1024**2,
-        ),
+        compiler_params=pltpu.CompilerParams(**params),
         name=name,
     )(*scalars, *operands)
+    if gather is None:
+        return result
+    attended, window = result
+    return attended, window.reshape(tokens, width)
 
 
 def _tiles(tokens, capacity, tile):
@@ -4382,6 +4458,103 @@ def _rank_half_gather(local_arr, tables, *, collective_id):
     )(jnp.asarray(tables, jnp.int32), local_arr)
 
 
+def _window_gather_step(tables_ref, local_ref, window_ref, send_sems, recv_sems, own_sem, done, *,
+                        step):
+    """Step ``step`` (0..16) of the window all-gather of every SP block at
+    once on half rings: ``local_ref`` ``[blocks, stripe, width]`` holds the
+    rank's rows, which land in ``window_ref`` ``[blocks, 32, stripe, width]``
+    (the window in token order, ``sp_token_index``). As in
+    `_half_gather_step` the copies go HBM to the peer's HBM, here one strided
+    copy per stream and hop carrying an owner's stripe of every block, each
+    hop received on its own semaphore. The last step joins the local copy
+    and meets the ring neighbours, so no rank leaves the kernel while a
+    neighbour still writes to it."""
+    rank = jax.lax.axis_index("k3_sp")
+    positions = [tables_ref[f, 0, rank] for f in range(3)]
+
+    def owner(family, position):
+        return tables_ref[family, 2, tables_ref[family, 1, position % 32]]
+
+    def own():
+        return pltpu.make_async_copy(local_ref, window_ref.at[:, tables_ref[0, 2, rank]], own_sem)
+
+    pl.when(step == 0)(lambda: own().start())
+    for stream, (family, direction, col, width) in enumerate(_half_ring_streams(local_ref.shape[2])):
+        cols, hops, position = pl.ds(col, width), HALF_HOPS[direction], positions[family]
+        target = (tables_ref[family, 1, (position + direction) % 32],)
+
+        def send(index, source, family=family, direction=direction, cols=cols,
+                 position=position, target=target, stream=stream):
+            # The stripes of the owner ``index`` hops back (index 0: this rank).
+            rows = window_ref.at[:, owner(family, position - direction * index), :, cols]
+            return pltpu.make_async_remote_copy(
+                source if source is not None else rows, rows, send_sems.at[stream],
+                recv_sems.at[stream, index], device_id=target,
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+
+        own_cols = local_ref.at[:, :, cols]
+        pl.when(step == 0)(lambda send=send, own_cols=own_cols: send(0, own_cols).start())
+
+        @pl.when((step >= 1) & (step <= hops))
+        def arrived(send=send):
+            copy = send(step - 1, None)
+            copy.wait_recv()
+            copy.wait_send()
+
+        @pl.when((step >= 1) & (step < hops))
+        def forward(send=send):
+            send(step, None).start()
+
+    @pl.when(step == HALF_STEPS - 1)
+    def finish():
+        own().wait()
+        neighbours = [tables_ref[f, 1, (positions[f] + d) % 32] for f in range(3) for d in (-1, 1)]
+        for peer in neighbours:
+            pl.semaphore_signal(done, 1, device_id=(peer,), device_id_type=pl.DeviceIdType.MESH)
+        pl.semaphore_wait(done, len(neighbours))
+
+
+def _window_gather_scratch(width):
+    """`_window_gather_step`'s semaphores: send per stream, receive per
+    stream and hop, the local copy's, and the neighbours' meeting."""
+    streams = len(_half_ring_streams(width))
+    return (pltpu.SemaphoreType.DMA((streams,)), pltpu.SemaphoreType.DMA((streams, HALF_HOPS[1])),
+            pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.REGULAR)
+
+
+def _window_gather_kernel(tables_ref, local_ref, window_ref, *scratch):
+    step = pl.program_id(0)
+    rank = jax.lax.axis_index("k3_sp")
+    pl.when(step == 0)(lambda: _ring_enter(tables_ref, rank))
+    _window_gather_step(tables_ref, local_ref, window_ref, *scratch, step=step)
+
+
+def window_all_gather(local, tables, *, collective_id):
+    """All-gather a rank's SP rows ``[rows, width]`` (inside ``shard_map``)
+    into the window ``[32 rows, width]`` in token order, on the half rings
+    of ``tables`` (`_window_gather_step`)."""
+    rows, width = local.shape
+    stripe = window_stripe(rows)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    window = pl.pallas_call(
+        _window_gather_kernel,
+        out_shape=jax.ShapeDtypeStruct((rows // stripe, 32, stripe, width), local.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(HALF_STEPS,),
+            in_specs=(hbm,),
+            out_specs=hbm,
+            scratch_shapes=_window_gather_scratch(width),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=collective_id, vmem_limit_bytes=16 * 1024**2,
+        ),
+        name="kimi_prefill_window_ag",
+    )(jnp.asarray(tables, jnp.int32), local.reshape(rows // stripe, stripe, width))
+    return window.reshape(32 * rows, width)
+
+
 def _rank_half_reduce_kernel(
     tables_ref,
     partial_ref,
@@ -4604,7 +4777,7 @@ ProjectionWeights = namedtuple("ProjectionWeights", _PROJECTION_NAMES)  # pyrefl
 
 
 def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity, token_ranks=None,
-                                     collective_id=31, flash_tile=128):
+                                     collective_id=31, flash_tile=128, window_collective_id=39):
     """One MLA layer over a packed window of ``segments`` sequences.
 
     ``run(hidden, prefix, weights, segment_desc, length, arena)``:
@@ -4615,6 +4788,11 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
     new residual rows and the rank-leading ``[32, T, 576]`` compressed KV
     (identical on every rank). ``output_projection_repacked`` is [384,7168]
     per rank (``repack_attention_output_weights_for_rank``).
+
+    With ``KernelConfig.prefill_mla_flash_gather``, ``hidden`` is the rank's
+    normalized rows instead (``make_mixture_norm_sp``, ``[32, T / 32,
+    7168]``): only the output gate reads the whole window, so the attention
+    kernel gathers it while it runs (``window_collective_id``).
     """
     if not segments:
         raise ValueError("the MLA layer runs packed windows")
@@ -4625,9 +4803,11 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
         token_ranks = tuple(range(32))
     tables = ring_tables(list(mesh.devices.flat), token_ranks)
     gather_tables = ring_tables(list(mesh.devices.flat), tuple(range(32)))
+    flash_gather = _config().prefill_mla_flash_gather
+    hidden_spec = P("k3_sp") if flash_gather else P()
 
     def local_packed_cp(
-        full_hidden, weights, segment_desc, length, pool, ids, local, counts=None, order=None
+        hidden, weights, segment_desc, length, pool, ids, local, counts=None, order=None
     ):
         """One rank's view: this rank's 3 heads over every rank's prefix
         pages and the window."""
@@ -4635,15 +4815,18 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
         projections = ProjectionWeights(
             *(local_weights[name] for name in _PROJECTION_NAMES)
         )
+        if flash_gather:
+            hidden = hidden[0]
         query, new_key, new_value, output_gate, latent = mla_projections(
-            full_hidden,
+            hidden,
             projections,
             return_latent=True,
             query_scale=SCALE_LOG2,
             sp_axis="k3_sp",
-            gather_tables=gather_tables,
+            gather_tables=tables if flash_gather else gather_tables,
             head_major=True,
             length=length,
+            local_rows=flash_gather,
         )
         tokens = query.shape[1]
         pages, order = gathered_prefix_pages(
@@ -4651,9 +4834,16 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
             capacity=prefix_capacity, counts=counts, order=order,
         )
         arena = expand_prefix_pages(pages, order, projections.key_value_up_projection)
-        attended = mla_flash_prefill_packed(
-            query, new_key, new_value, length, segment_desc[:5 * segments], count=segments,
-            tile=flash_tile, arena=arena)
+        if flash_gather:
+            attended, window = mla_flash_prefill_packed(
+                query, new_key, new_value, length, segment_desc[:5 * segments], count=segments,
+                tile=flash_tile, arena=arena, gather=(hidden, tables),
+                collective_id=window_collective_id)
+            output_gate = _dot(window, projections.output_gate_projection).astype(jnp.bfloat16)
+        else:
+            attended = mla_flash_prefill_packed(
+                query, new_key, new_value, length, segment_desc[:5 * segments], count=segments,
+                tile=flash_tile, arena=arena)
         attended = attended.transpose(1, 0, 2).reshape(tokens, 384)
         gate = jax.nn.sigmoid(output_gate.astype(jnp.float32)).astype(jnp.bfloat16)
         return (attended * gate).astype(jnp.bfloat16)[None], latent[None]
@@ -4663,14 +4853,14 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
         if arena.counts is not None and arena.order is not None:
             gated, latent = jax.shard_map(
                 local_packed_cp, mesh=mesh,
-                in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp"), P(), P()),
+                in_specs=(hidden_spec, P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp"), P(), P()),
                 out_specs=(P("k3_sp"), P("k3_sp")),
                 check_vma=False,
             )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local, arena.counts, arena.order)
         else:
             gated, latent = jax.shard_map(
                 local_packed_cp, mesh=mesh,
-                in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp")),
+                in_specs=(hidden_spec, P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp")),
                 out_specs=(P("k3_sp"), P("k3_sp")),
                 check_vma=False,
             )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local)
@@ -4997,6 +5187,18 @@ def make_norm_gather_sp(mesh, *, seq_len, token_ranks=None,
         in_specs=(P("k3_sp"), P("k3_sp"), P("k3_sp"), P("k3_sp"), P()),
         out_specs=(P("k3_sp"), P()), check_vma=False,
     ))
+
+
+def make_mla_input_sp(mesh, *, seq_len):
+    """The MLA layer's first operand from the ranks' residual rows:
+    ``run(prefix, blocks, folded, norm, active)`` returns the gathered window
+    (``make_norm_gather_sp``) or, with ``KernelConfig.prefill_mla_flash_gather``,
+    the rank's normalized rows (``make_mixture_norm_sp``), whose window the
+    attention kernel gathers (``make_mla_attention_layer_sp_ring``)."""
+    if _config().prefill_mla_flash_gather:
+        return make_mixture_norm_sp(mesh, seq_len=seq_len)
+    norm_gather = make_norm_gather_sp(mesh, seq_len=seq_len, return_normalized=False)
+    return lambda *args: norm_gather(*args)[1]
 
 
 def _kda_layer_body(
@@ -5423,7 +5625,7 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
         raise ValueError("indexed four-layer group requires flat k3_sp TP32")
     check_window(seq_len, "indexed four-layer group")
     sharding = NamedSharding(mesh, P("k3_sp"))
-    norm_gather = make_norm_gather_sp(mesh, seq_len=seq_len, return_normalized=False)
+    mla_input = make_mla_input_sp(mesh, seq_len=seq_len)
     kda = make_norm_gather_kda_sp(mesh, seq_len=seq_len, segments=segments)
     kda_outputs = (3, 4, 6, 7)  # rec, hist, rec_at, hist_at in the KDA op's result
     mla = make_indexed_mla_layer_sp_ring(
@@ -5476,11 +5678,9 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
                                    for family, i in zip(kda_states, kda_outputs, strict=True))
             else:
                 slot = group[0]
-                _, gathered = norm_gather(
-                    prefix, blocks, attn_res, attn_norm, attn_active,
-                )
+                hidden = mla_input(prefix, blocks, attn_res, attn_norm, attn_active)
                 after_attention, *updates = mla(
-                    gathered, prefix, mla_families, segment_desc, length, scalar(slot), arena,
+                    hidden, prefix, mla_families, segment_desc, length, scalar(slot), arena,
                 )
                 mla_cache = tuple(
                     put_state(family, update, slot)
@@ -5681,7 +5881,7 @@ def make_final_mla_sp_indexed(
             sharding, sharding, (sharding,),
         ))
 
-    norm_gather = make_norm_gather_sp(mesh, seq_len=seq_len, return_normalized=False)
+    mla_input = make_mla_input_sp(mesh, seq_len=seq_len)
     mla = make_indexed_mla_layer_sp_ring(
         mesh, seq_len=seq_len, flash_tile=mla_flash_tile, segments=segments,
         prefix_capacity=prefix_capacity,
@@ -5695,11 +5895,9 @@ def make_final_mla_sp_indexed(
         attn_res = common["attn_res"][:, 92]
         attn_norm = common["attn_norm"][:, 92]
         active = jnp.asarray([8], jnp.int32)
-        _, gathered = norm_gather(
-            prefix, blocks, attn_res, attn_norm, active,
-        )
+        hidden = mla_input(prefix, blocks, attn_res, attn_norm, active)
         after_attention, *updates = mla(
-            gathered, prefix, mla_families, segment_desc, length,
+            hidden, prefix, mla_families, segment_desc, length,
             jnp.asarray([23], jnp.int32), arena,
         )
         mla_cache = tuple(
@@ -5764,7 +5962,7 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
         raise ValueError("indexed prefill stack needs depth 2..93")
     sharding = NamedSharding(mesh, P("k3_sp"))
     mixture = make_mixture_norm_sp(mesh, seq_len=seq_len)
-    norm_gather = make_norm_gather_sp(mesh, seq_len=seq_len, return_normalized=False)
+    mla_input = make_mla_input_sp(mesh, seq_len=seq_len)
     kda = make_norm_gather_kda_sp(mesh, seq_len=seq_len, segments=segments)
     mla = make_indexed_mla_layer_sp_ring(
         mesh, seq_len=seq_len, flash_tile=mla_flash_tile, segments=segments,
@@ -5841,11 +6039,9 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
             def mla_branch(state):
                 kda_states, mla_cache = state
                 slot = index // 4
-                _, gathered = norm_gather(
-                    prefix, blocks, attn_res, attn_norm, attn_active,
-                )
+                hidden = mla_input(prefix, blocks, attn_res, attn_norm, attn_active)
                 after, *updates = mla(
-                    gathered, prefix, mla_families, segment_desc, length, active(slot), arena,
+                    hidden, prefix, mla_families, segment_desc, length, active(slot), arena,
                 )
                 return (
                     after, kda_states,
