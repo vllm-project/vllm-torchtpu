@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MINIMAX_M3_FP8_LINEARS: bool = True
+    TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SHARED: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -719,6 +720,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-channel power-of-two scale (models/minimax_m3/quant.py); 0 restores
     # the exact bf16 dequantization.
     "TPU_MINIMAX_M3_FP8_LINEARS": env_bool("TPU_MINIMAX_M3_FP8_LINEARS", default=True),
+    # The DSpark draft's MXFP8 layer linears follow TPU_MINIMAX_M3_FP8_LINEARS;
+    # 0 keeps them bf16 (the drafter streams them every decode step).
+    "TPU_MINIMAX_M3_FP8_DRAFT_LINEARS": env_bool(
+        "TPU_MINIMAX_M3_FP8_DRAFT_LINEARS", default=True
+    ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/
     # moe_dense_expert_fp4.py) instead of sort + grouped GEMM + combine.
