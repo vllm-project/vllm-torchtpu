@@ -74,6 +74,7 @@ from .regimes import (
     recommend_parallelism,
 )
 from .report import (
+    build_bucket_schedule,
     format_advisor_summary,
     format_layer_group_search,
     format_regime_table,
@@ -81,13 +82,18 @@ from .report import (
     render_regime_dot_plot_svg,
     svg_text_width,
     write_advisor_html,
+    write_bucket_schedule,
 )
 from .roofline import validate_workload
 from .spec_bridge import advise_from_spec
 from .specs import (
+    BUCKET_CONSUMER_STATUS,
+    BUCKET_SCHEDULE_SCHEMA,
     SUPPORTED_ONCHIP_FAMILIES,
     AdvisorReport,
     AdvisorSweepReport,
+    BucketSchedulePayload,
+    BucketScheduleRule,
     DisaggHandoffSpec,
     DispatchRegime,
     EfficiencySpec,
@@ -124,6 +130,8 @@ from .vmem import (
 )
 
 __all__ = [
+    "BUCKET_CONSUMER_STATUS",
+    "BUCKET_SCHEDULE_SCHEMA",
     "BUILTIN_CHIP_SPECS",
     "CORE_LIMITS",
     "DEPLOYMENT_PRESETS",
@@ -140,6 +148,8 @@ __all__ = [
     "TPU7X_TOPOLOGIES",
     "AdvisorReport",
     "AdvisorSweepReport",
+    "BucketSchedulePayload",
+    "BucketScheduleRule",
     "ChipSpec",
     "CoreLimits",
     "DeploymentPreset",
@@ -172,6 +182,7 @@ __all__ = [
     "advise_regimes",
     "assets",
     "build_arg_parser",
+    "build_bucket_schedule",
     "calibrate",
     "calibrate_trace",
     "CalibrateOptions",
@@ -219,4 +230,5 @@ __all__ = [
     "verify_chip_spec_against_jax",
     "vmem",
     "write_advisor_html",
+    "write_bucket_schedule",
 ]

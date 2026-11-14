@@ -29,12 +29,19 @@ from .constants import (
     DECISION_TABLE_COLS,
     MEGAKERNEL_LABELS,
     MOE_MODE_SHORT_HINTS,
+    PHASE_SORT_ORDER,
     PROVENANCE_TAGS,
     SCOPE_HINTS,
     SCOPE_MARKS,
     SVG_GLYPH_EM,
     SVG_MIN_FONT_PX,
     SVG_TICKS,
+)
+from .specs import (
+    BUCKET_CONSUMER_STATUS,
+    BUCKET_SCHEDULE_SCHEMA,
+    BucketSchedulePayload,
+    BucketScheduleRule,
 )
 
 if TYPE_CHECKING:
@@ -1485,6 +1492,78 @@ def write_advisor_html(sweep: AdvisorSweepReport, path: str | Path) -> Path:
     return dest
 
 
+def build_bucket_schedule(sweep: AdvisorSweepReport) -> BucketSchedulePayload:
+    """Coalesce contiguous sweep regimes into an offline bucket-schedule payload."""
+    ordered = sorted(
+        sweep.regimes,
+        key=lambda reg: (
+            PHASE_SORT_ORDER.get(reg.phase, 99),
+            reg.layout,
+            reg.active_tokens,
+            reg.effective_context,
+        ),
+    )
+    rules: list[BucketScheduleRule] = []
+    for entry in ordered:
+        if (
+            rules
+            and rules[-1].phase == entry.phase
+            and rules[-1].layout == entry.layout
+            and rules[-1].recommended_scope == entry.recommended_scope
+            and rules[-1].recommended_moe_mode == entry.recommended_moe_mode
+        ):
+            prev = rules[-1]
+            rules[-1] = BucketScheduleRule(
+                phase=prev.phase,
+                layout=prev.layout,
+                min_active_tokens=prev.min_active_tokens,
+                max_active_tokens=max(prev.max_active_tokens, entry.active_tokens),
+                effective_context=max(prev.effective_context, entry.effective_context),
+                recommended_scope=prev.recommended_scope,
+                recommended_moe_mode=prev.recommended_moe_mode,
+                max_vmem_tokens=entry.max_vmem_tokens,
+                num_vmem_splits=entry.num_vmem_splits,
+                step_bound_us=entry.step_bound_us,
+                verdict=entry.verdict,
+            )
+        else:
+            rules.append(
+                BucketScheduleRule(
+                    phase=entry.phase,
+                    layout=entry.layout,
+                    min_active_tokens=entry.active_tokens,
+                    max_active_tokens=entry.active_tokens,
+                    effective_context=entry.effective_context,
+                    recommended_scope=entry.recommended_scope,
+                    recommended_moe_mode=entry.recommended_moe_mode,
+                    max_vmem_tokens=entry.max_vmem_tokens,
+                    num_vmem_splits=entry.num_vmem_splits,
+                    step_bound_us=entry.step_bound_us,
+                    verdict=entry.verdict,
+                )
+            )
+    return BucketSchedulePayload(
+        schema=BUCKET_SCHEDULE_SCHEMA,
+        consumer_status=BUCKET_CONSUMER_STATUS,
+        model=sweep.model,
+        chip=sweep.chip,
+        default_layout=sweep.parallelism.label(),
+        vmem_budget_mib=sweep.vmem_budget_mib,
+        max_vmem_tokens=sweep.max_vmem_tokens,
+        ridge_tokens=sweep.ridge_tokens,
+        buckets=tuple(rules),
+    )
+
+
+def write_bucket_schedule(sweep: AdvisorSweepReport, path: str | Path) -> Path:
+    """Write `advisor.bucket_schedule.v1` JSON schedule to disk."""
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    payload_json = json.dumps(build_bucket_schedule(sweep).to_dict(), indent=2) + "\n"
+    dest.write_text(payload_json, encoding="utf-8")
+    return dest
+
+
 def format_layer_group_search(search: LayerGroupSearchResult) -> str:
     """Format a terminal table for `search_layer_groups`."""
     header = (
@@ -1528,3 +1607,62 @@ def format_layer_group_search(search: LayerGroupSearchResult) -> str:
             f"[{search.gap_vs_per_op_pct:+.2f}%]{listed_clause})"
         )
     return "\n".join(lines)
+
+
+def _render_layer_group_search_card(
+    search: LayerGroupSearchResult | None,
+) -> str:
+    """Render an HTML card for `LayerGroupSearchResult` when present."""
+    if search is None or not search.candidates:
+        return ""
+    body_rows = []
+    for cand in search.candidates:
+        is_best = (
+            search.best is not None and cand.layer_groups == search.best.layer_groups
+        )
+        badge = " <strong>[best]</strong>" if is_best else ""
+        body_rows.append(
+            "<tr>"
+            f"<td>{_esc(cand.label)}{badge}</td>"
+            f'<td class="tabular">{cand.num_groups}</td>'
+            f"<td>{'yes' if cand.feasible else 'no'}</td>"
+            f'<td class="tabular">{cand.step_bound_us:.1f}</td>'
+            f'<td class="tabular">{cand.step_achievable_us:.1f}</td>'
+            f'<td class="tabular">{cand.step_upper_us:.1f}</td>'
+            "</tr>"
+        )
+    best_line = ""
+    if search.best is not None:
+        listed_txt = (
+            f"; gap vs listed grouping: {search.gap_vs_listed_us:+.1f} us "
+            f"({search.gap_vs_listed_pct:+.2f}%)"
+            if search.gap_vs_listed_us is not None
+            and search.gap_vs_listed_pct is not None
+            else ""
+        )
+        best_line = (
+            '<p class="kpi-sub">Lowest-bound feasible partition: '
+            f"<strong>{_esc(search.best.label)}</strong> "
+            f"({search.best.step_bound_us:.1f} us vs <code>per_op</code> "
+            f"{search.per_op_step_bound_us:.1f} us, "
+            f"{search.gap_vs_per_op_us:+.1f} us / "
+            f"{search.gap_vs_per_op_pct:+.2f}%{listed_txt}).</p>"
+        )
+    return (
+        '<div class="card" style="margin-top: 20px;">'
+        '<h2 style="font-size: 16px;">7. Layer-Group Partition Search '
+        f"({_esc(search.phase)} on {_esc(search.layout)}, "
+        f"{search.active_tokens} active tokens)</h2>"
+        f'<p class="kpi-sub">{_esc(search.note)}</p>'
+        f"{best_line}"
+        "<table><thead><tr>"
+        "<th>Partition</th>"
+        '<th class="tabular">Calls</th>'
+        "<th>Feasible</th>"
+        '<th class="tabular">Step Bound (us)</th>'
+        '<th class="tabular">Achievable (us)</th>'
+        '<th class="tabular">Upper Band (us)</th>'
+        "</tr></thead><tbody>"
+        f"{''.join(body_rows)}"
+        "</tbody></table></div>"
+    )
