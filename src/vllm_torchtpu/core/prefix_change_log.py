@@ -1,0 +1,250 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Prefix-cache change log for PrefixAwareScheduler's cross-step memo.
+
+Layered on top of the same-step prefix-hit patch in ``vllm_torchtpu/__init__``
+(which owns ``_tpu_unwritten_block_ids`` and clears it in
+``KVCacheManager.new_step_starts``) and kept out of that file on purpose:
+``vllm_torchtpu/__init__.py`` also defines a patched
+VocabParallelEmbedding.forward that Dynamo traces, so editing it would change
+vLLM's traced-file code hash and force a full recompile.
+
+``install_epoch`` adds ``pool._tpu_prefix_cache_epoch``, which moves on every
+prefix-cache mutation. The schedulers that memoise lookups install it when
+they are built, so an engine that runs neither keeps the same-step patch as it
+is.
+
+Once enabled on a BlockPool, every event that can change the answer of
+``BlockPool.get_cached_block(h, groups)`` appends ``(epoch, h)`` to
+``pool._tpu_prefix_change_log`` (``h`` = group-less block hash):
+
+* a key inserted (all keys of the block are logged: the block joining the
+  unwritten set flips the answer of every key whose first block it is);
+* a key removed (eviction / re-pointing);
+* the unwritten set cleared at ``KVCacheManager.new_step_starts`` (the epoch
+  moves by one and the plugin wrapper clears; we log the affected keys with
+  that epoch just before);
+* ``reset_prefix_cache`` drops the log and raises the log base epoch.
+"""
+
+import functools
+
+LOG = "_tpu_prefix_change_log"
+BASE = "_tpu_prefix_change_log_base"
+EPOCH = "_tpu_prefix_cache_epoch"
+UNWRITTEN = "_tpu_unwritten_block_ids"
+_MARK = "_tpu_prefix_change_log_patch"
+_EPOCH_MARK = "_tpu_prefix_cache_epoch_patch"
+
+
+def _log_block_keys(d, log, epoch, block, extra_key=None) -> None:
+    if extra_key is not None:
+        log.append((epoch, extra_key[:-4]))
+    key = getattr(block, "block_hash", None)
+    if key is not None and key is not extra_key:
+        log.append((epoch, key[:-4]))
+    by_block = d.get("cached_block_hashes_by_block")
+    if by_block:
+        for key in by_block.get(block.block_id, ()):
+            if key is not extra_key:
+                log.append((epoch, key[:-4]))
+
+
+def log_unwritten_clear(pool) -> None:
+    """Log keys whose answer flips when the unwritten set is cleared at
+    ``KVCacheManager.new_step_starts`` (where the epoch moves by exactly one)."""
+    d = pool.__dict__
+    log = d.get(LOG)
+    unwritten = d.get(UNWRITTEN)
+    if log is None or not unwritten:
+        return
+    epoch = d.get(EPOCH, 0) + 1
+    blocks = pool.blocks
+    for block_id in unwritten:
+        _log_block_keys(d, log, epoch, blocks[block_id])
+
+
+def install_epoch() -> None:
+    """Count prefix-cache mutations in ``pool._tpu_prefix_cache_epoch``.
+
+    The epoch moves on every event that can change a prefix-cache lookup: a
+    hash inserted, hashes evicted, a prefix-cache reset, and the unwritten set
+    cleared at the start of a step. Idempotent.
+    """
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    if getattr(BlockPool._remove_cached_block_hashes, _EPOCH_MARK, False):
+        return
+
+    original_insert_block_hash = BlockPool._insert_block_hash
+    original_remove_cached_block_hashes = BlockPool._remove_cached_block_hashes
+    original_reset_prefix_cache = BlockPool.reset_prefix_cache
+    original_new_step_starts = KVCacheManager.new_step_starts
+
+    @functools.wraps(original_insert_block_hash)
+    def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens):
+        original_insert_block_hash(self, block_hash_with_group_id, block, num_tokens)
+        d = self.__dict__
+        d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+
+    @functools.wraps(original_remove_cached_block_hashes)
+    def _remove_cached_block_hashes(self, *args, **kwargs):
+        evicted_hashes = original_remove_cached_block_hashes(self, *args, **kwargs)
+        if evicted_hashes:
+            d = self.__dict__
+            d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+        return evicted_hashes
+
+    @functools.wraps(original_reset_prefix_cache)
+    def reset_prefix_cache(self):
+        res = original_reset_prefix_cache(self)
+        d = self.__dict__
+        d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+        return res
+
+    # The same-step patch clears the unwritten set in new_step_starts; the
+    # epoch moves first, so a lookup made before the clear is not reused.
+    @functools.wraps(original_new_step_starts)
+    def new_step_starts(self, *args, **kwargs):
+        pool = self.block_pool
+        unwritten = pool.__dict__.get(UNWRITTEN)
+        if unwritten:
+            d = pool.__dict__
+            d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+        return original_new_step_starts(self, *args, **kwargs)
+
+    for wrapper in (
+        _insert_block_hash,
+        _remove_cached_block_hashes,
+        reset_prefix_cache,
+        new_step_starts,
+    ):
+        setattr(wrapper, _EPOCH_MARK, True)
+    BlockPool._insert_block_hash = _insert_block_hash
+    BlockPool._remove_cached_block_hashes = _remove_cached_block_hashes
+    BlockPool.reset_prefix_cache = reset_prefix_cache
+    KVCacheManager.new_step_starts = new_step_starts
+
+
+def epoch_installed() -> bool:
+    """Whether ``install_epoch`` has run in this process."""
+    from vllm.v1.core.block_pool import BlockPool
+
+    return bool(getattr(BlockPool._remove_cached_block_hashes, _EPOCH_MARK, False))
+
+
+def install() -> bool:
+    """Wrap BlockPool/KVCacheManager (idempotent). Requires the plugin's
+    same-step prefix-hit patch and ``install_epoch``; returns False (memo stays
+    per-step) without them."""
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    if getattr(BlockPool._insert_block_hash, _MARK, False):
+        return True
+    if not getattr(
+        BlockPool.get_cached_block, "_tpu_same_step_prefix_hit_patch", False
+    ):
+        return False
+    for fn in (
+        BlockPool._insert_block_hash,
+        BlockPool._remove_cached_block_hashes,
+        BlockPool.reset_prefix_cache,
+        KVCacheManager.new_step_starts,
+    ):
+        if not getattr(fn, _EPOCH_MARK, False):
+            return False
+
+    inner_insert = BlockPool._insert_block_hash
+    inner_remove = BlockPool._remove_cached_block_hashes
+    inner_reset = BlockPool.reset_prefix_cache
+    inner_new_step_starts = KVCacheManager.new_step_starts
+
+    @functools.wraps(inner_insert)
+    def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens):
+        inner_insert(self, block_hash_with_group_id, block, num_tokens)
+        d = self.__dict__
+        log = d.get(LOG)
+        if log is not None:
+            _log_block_keys(d, log, d.get(EPOCH, 0), block, block_hash_with_group_id)
+
+    @functools.wraps(inner_remove)
+    def _remove_cached_block_hashes(self, *args, **kwargs):
+        evicted = inner_remove(self, *args, **kwargs)
+        if evicted:
+            d = self.__dict__
+            log = d.get(LOG)
+            if log is not None:
+                epoch = d.get(EPOCH, 0)
+                for key in evicted:
+                    log.append((epoch, key[:-4]))
+        return evicted
+
+    @functools.wraps(inner_reset)
+    def reset_prefix_cache(self):
+        res = inner_reset(self)
+        d = self.__dict__
+        log = d.get(LOG)
+        if log is not None:
+            log.clear()
+            d[BASE] = d.get(EPOCH, 0)
+        return res
+
+    @functools.wraps(inner_new_step_starts)
+    def new_step_starts(self, *args, **kwargs):
+        log_unwritten_clear(self.block_pool)
+        return inner_new_step_starts(self, *args, **kwargs)
+
+    for wrapper in (
+        _insert_block_hash,
+        _remove_cached_block_hashes,
+        reset_prefix_cache,
+        new_step_starts,
+    ):
+        setattr(wrapper, _MARK, True)
+        setattr(wrapper, _EPOCH_MARK, True)
+    BlockPool._insert_block_hash = _insert_block_hash
+    BlockPool._remove_cached_block_hashes = _remove_cached_block_hashes
+    BlockPool.reset_prefix_cache = reset_prefix_cache
+    KVCacheManager.new_step_starts = new_step_starts
+    return True
+
+
+def enable(pool) -> None:
+    d = pool.__dict__
+    d.setdefault(LOG, [])
+    d.setdefault(BASE, d.get(EPOCH, 0))
+
+
+def record_probes(pool, fn, *args):
+    """Run ``fn(*args)`` while recording every hash passed to
+    ``pool.get_cached_block``; returns ``(result, frozenset(hashes))``.
+
+    Uses a temporary instance attribute, so the class-level lookup path pays
+    nothing when no memo computation is in flight."""
+    inner = pool.get_cached_block
+    rec = []
+
+    def get_cached_block(block_hash, kv_cache_group_ids):
+        rec.append(block_hash)
+        return inner(block_hash, kv_cache_group_ids)
+
+    d = pool.__dict__
+    d["get_cached_block"] = get_cached_block
+    try:
+        result = fn(*args)
+    finally:
+        d.pop("get_cached_block", None)
+    return result, frozenset(rec)
