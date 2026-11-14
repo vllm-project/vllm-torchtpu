@@ -236,6 +236,14 @@ def prebuild_fused_moe_kernel(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
     )
+    if use_ep:
+        # Every MoE method calls this at weight load. Arming builds the EP
+        # mesh, a collective Dynamo cannot trace.
+        from vllm_torchtpu.distributed.hier_reduce_scatter import (
+            prebuild_hier_reduce_scatter,
+        )
+
+        prebuild_hier_reduce_scatter()
 
 
 def fused_moe_gmm(

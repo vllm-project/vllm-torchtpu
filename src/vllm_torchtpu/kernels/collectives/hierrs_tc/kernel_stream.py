@@ -31,11 +31,32 @@ _SUB_TILE = 32
 _SLOTS = 3
 _ROW_BLOCK = 128  # 256 needs ~66 MiB of VMEM
 _VMEM_LIMIT_BYTES = 56 << 20
+# Scratch rows per hidden column, as reduce_scatter_stream_local declares them:
+# per slot, the (4, block) running sums and phase-1 landing buffer, and the
+# (2, 2, block / 2) step-0 and (2, block / 2) step-1 landing buffers.
+_SCRATCH_ROWS = _SLOTS * (2 * 4 * _ROW_BLOCK + 2 * 2 * (_ROW_BLOCK // 2) + _ROW_BLOCK)
+# VMEM the compiler needs beyond the declared scratch. On tpu7x, hidden 6656
+# (53.6 MiB of scratch) compiles and 7168 (57.75 MiB) runs out of VMEM.
+_VMEM_HEADROOM_BYTES = 2 << 20
 
 
-def supports_stream(rows: int) -> bool:
+def scratch_bytes(hidden: int, itemsize: int) -> int:
+    return _SCRATCH_ROWS * hidden * itemsize
+
+
+def supports_stream(rows: int, hidden: int, itemsize: int) -> bool:
+    """Whether `rows` x `hidden` per device fits the row-streaming kernel.
+
+    Its scratch grows with `hidden` (33 MiB at bf16 hidden 4096), so a wide
+    shape that would not fit in VMEM is left to the micro-batched kernel.
+    """
     chunk, rem = divmod(rows, _NUM_DEVICES)
-    return rem == 0 and chunk >= _ROW_BLOCK and chunk % _ROW_BLOCK == 0
+    return (
+        rem == 0
+        and chunk >= _ROW_BLOCK
+        and chunk % _ROW_BLOCK == 0
+        and scratch_bytes(hidden, itemsize) <= _VMEM_LIMIT_BYTES - _VMEM_HEADROOM_BYTES
+    )
 
 
 def _kernel(
@@ -273,7 +294,9 @@ def reduce_scatter_stream_local(
 ) -> jax.Array:
     """Mesh index i receives the sum of input row block `order[i]`."""
     rows_per_device, hidden = local_x.shape
-    assert supports_stream(rows_per_device), f"{rows_per_device} rows per device"
+    assert supports_stream(rows_per_device, hidden, local_x.dtype.itemsize), (
+        f"{rows_per_device} x {hidden} per device"
+    )
     chunk_rows = rows_per_device // _NUM_DEVICES
     block_rows = _ROW_BLOCK
     num_blocks = chunk_rows // block_rows

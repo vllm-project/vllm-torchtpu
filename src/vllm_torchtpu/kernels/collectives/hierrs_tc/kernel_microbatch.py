@@ -66,11 +66,13 @@ def hier_rs_kernel(
     *,
     config: Config,
     axis_name: str = "x",
+    # Mesh index i gets the sum of input row block order[i]; None is identity.
+    order: tuple[int, ...] | None = None,
     # Test-only (chip, num_copies): see _hold_chip_at_entry. None emits nothing.
     debug_entry_delay: tuple[int, int] | None = None,
 ):
     topo = Topology(axis_name)
-    locator = ChunkLocator(config, topo)
+    locator = ChunkLocator(config, topo, order)
     dma = DmaManager(
         config,
         topo,
