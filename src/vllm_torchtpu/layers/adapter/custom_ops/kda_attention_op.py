@@ -549,6 +549,14 @@ def _pooled_kda_core(
     conv_shard_heads: int | None = None,
     num_spec_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
+    if not num_spec_tokens:
+        # A batch of T tokens spans at most T live requests, which come first;
+        # the rest of the static slot table is null-slot padding that would
+        # otherwise be gathered and scattered on every step.
+        num_live = min(state_indices.shape[0], mixed_qkv.shape[0])
+        state_indices = state_indices[:num_live]
+        seq_lens = seq_lens[:num_live]
+        query_start_loc = query_start_loc[: num_live + 1]
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
     dense_offsets = None
@@ -617,6 +625,59 @@ def _pooled_kda_core(
             "KDA state regions exceed the pool block: "
             f"{layout.required_tokens} > {manager_rows}"
         )
+
+    if not num_spec_tokens and conv_shard_heads in (None, num_heads):
+        # The stored regions already are the kernel's compact state layout, so
+        # it reads and writes each live slot in the pool directly.
+        _check_kda_abi(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            jnp.empty((0, num_heads, head_dim, head_dim), jnp.float32),
+            a_log,
+            dt_bias,
+            norm_weight,
+            query_start_loc,
+            state_indices,
+            seq_lens,
+        )
+        new_pool, out = gdn_wrapper.fused_conv1d_gdn(
+            qkv=mixed_qkv,
+            # Raw: the kernel applies sigmoid to `b` and the gate activation
+            # to `a` itself.
+            b=beta,
+            a=raw_gate,
+            states=pool.reshape(-1, manager_rows, *pool.shape[2:]),
+            conv_weight=jnp.transpose(conv_weight.reshape(kernel_size, -1), (1, 0))[
+                :, None
+            ],
+            conv_bias=None,
+            a_log=a_log,
+            dt_bias=dt_bias.reshape(num_heads, head_dim),
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            n_kq=num_heads,
+            n_v=num_heads,
+            d_k=head_dim,
+            d_v=head_dim,
+            kernel_size=kernel_size,
+            attention_mode=gdn_config.AttentionMode.KDA,
+            gate_lower_bound=lower_bound,
+            recurrent_dtype=jnp.dtype(jnp.float32),
+            conv_dtype=conv_dtype,
+            conv_hbm_offset=layout.ssm_granules,
+        )
+        output = _gated_output_norm(
+            out.reshape(mixed_qkv.shape[0], num_heads, head_dim),
+            output_gate,
+            norm_weight,
+            eps,
+            mixed_qkv.dtype,
+        )
+        return output, new_pool.reshape(pool.shape)
 
     # SSM region [0, ssm_tokens): f32 view with one head_dim-wide lane group
     # per typed row, so the leading H * D rows are exactly the state.
@@ -745,9 +806,10 @@ def build_kimi_pooled_kda_op(
 
     Same torch-level contract as the dense dispatched op, except the two
     state caches are replaced by the single attention-shaped pool buffer.
-    The state regions are gathered out of the pool, run through the fused
-    conv1d + GDN v3 kernel (the only kernel the pooled path supports — the
-    unfused core is not available here), and scattered back.
+    The fused conv1d + GDN v3 kernel (the only kernel the pooled path supports
+    — the unfused core is not available here) reads and writes the regions in
+    the pool. Speculative windows and rank-blocked conv state are gathered out
+    of the pool and scattered back around it instead.
 
     The manager block size (``cache_config.block_size``) lets the op size
     the state regions against the manager block and derive the

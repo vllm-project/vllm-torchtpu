@@ -78,9 +78,13 @@ class GDNConfig:
     window_size: int = 1
     # Indicate the use of unified pool.
     is_shared: bool = False
+    # Conv region offset in granules, when the recurrent region is padded.
+    pool_conv_hbm_offset: int | None = None
 
     @property
     def conv_hbm_offset(self) -> int:
+        if self.pool_conv_hbm_offset is not None:
+            return self.pool_conv_hbm_offset
         if self.is_shared:
             # In Unified pool. Conv state is stored after recurrent state.
             # Offset is calculated via recurrent state size.
