@@ -231,8 +231,6 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
-    TPU_MINIMAX_M3_MSA_PAGE_CACHE_SCATTER: bool = False
-    TPU_MINIMAX_M3_MSA_MASK_BCAST: bool = False
 
 
 def env_with_choices(
@@ -1442,17 +1440,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG": env_str(
         "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG", ""
     ),
-    # MiniMax M3 MSA prefill page cache (`msa_attention_lse._page_cache`):
-    # find each call's distinct page keys with a presence table over the page
-    # keys (scatter, cumsum, gather) instead of three sorts of the call's
-    # union entries. Same slots and keys bit for bit.
-    "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SCATTER": env_bool(
-        "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SCATTER", False
-    ),
-    # MiniMax M3 MSA 4-bit attention (`msa_attention_lse._kernel`): mask a
-    # group's scores with the tiles' per-token mask broadcast over the query
-    # heads ([Hg, Bq, keys] view) instead of a Hg-fold copy. Same bits.
-    "TPU_MINIMAX_M3_MSA_MASK_BCAST": env_bool("TPU_MINIMAX_M3_MSA_MASK_BCAST", False),
 }
 
 
