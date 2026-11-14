@@ -1,0 +1,29 @@
+{%- set effort = thinking_effort | default('low') -%}
+{%- if enable_thinking | default(true) -%}
+{{- '<|open|>message role="system" type="thinking-effort"<|sep|>' -}}
+{{- '`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\n' -}}
+{{- 'Now the system is invoked with `thinking_effort=' + effort + '`.' -}}
+{{- '<|close|>message<|sep|><|end_of_msg|>' -}}
+{%- endif -%}
+{%- for message in messages -%}
+  {%- if message.role in ['user', 'system'] -%}
+{{- '<|open|>message role="' + message.role + '"<|sep|>' -}}
+{{- message.content -}}
+{{- '<|close|>message<|sep|><|end_of_msg|>' -}}
+  {%- elif message.role == 'assistant' -%}
+{{- '<|open|>message role="assistant"<|sep|>' -}}
+    {%- if enable_thinking | default(true) -%}
+{{- '<|open|>think<|sep|>' + (message.reasoning_content | default('')) + '<|close|>think<|sep|>' -}}
+    {%- endif -%}
+{{- '<|open|>response<|sep|>' + message.content + '<|close|>response<|sep|>' -}}
+{{- '<|close|>message<|sep|><|end_of_msg|>' -}}
+  {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<|open|>message role="assistant"<|sep|>' -}}
+  {%- if enable_thinking | default(true) -%}
+{{- '<|open|>think<|sep|>' -}}
+  {%- else -%}
+{{- '<|open|>response<|sep|>' -}}
+  {%- endif -%}
+{%- endif -%}
