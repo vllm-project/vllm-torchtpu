@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
+    FUSED_MOE_DECODE_KERNEL_FOLD: str = "off"
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
@@ -742,6 +743,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FUSED_MOE_DECODE_KERNEL": env_bool("FUSED_MOE_DECODE_KERNEL"),
     "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": env_int(
         "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
+    ),
+    # Run the fused MoE decode kernel's routing prologue (row padding, route
+    # weights to per-expert coefficients, active experts, shared-gate
+    # broadcast) inside the kernel instead of as ~8 XLA ops per layer (fold=True
+    # in fused_moe_decode_kernel.py). "xla" keeps the shared gate's dot +
+    # sigmoid in XLA and returns bitwise the same output as "off"; "kernel"
+    # also moves that dot + sigmoid into the kernel (broadcast MXU dot, so
+    # gate rounding is not guaranteed bitwise identical on TPU). "off": the
+    # unfolded call.
+    "FUSED_MOE_DECODE_KERNEL_FOLD": env_with_choices(
+        "FUSED_MOE_DECODE_KERNEL_FOLD", "off", ["off", "xla", "kernel"]
     ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three (up to 2,048 routed rows on non-ragged
