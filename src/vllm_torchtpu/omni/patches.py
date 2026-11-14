@@ -84,6 +84,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_ltx2_per_sample_timestep()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -645,3 +646,78 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_PER_SAMPLE_TIMESTEP_PATCHED = "_tpu_per_sample_timestep_patched"
+
+
+def _patch_ltx2_per_sample_timestep() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once vLLM-Omni's LTX-2 runtime stops
+    # expanding a timestep shared by all tokens to one value per token.
+    #
+    # LTXRuntime expands each sample's timestep to one value per video and
+    # audio token (for the sequence-parallel plan, which splits it with the
+    # video tokens). The transformer then embeds the same timestep once per
+    # token, and every block materializes its AdaLN scale/shift/gate tables
+    # per token ((1, 3520, 6, 4096) for the video self-attention and FFN
+    # alone at 704x1280x121 under Ulysses 4) plus relayout copies of them:
+    # ~80 ms of the ~470 ms of device time per step on a v7x core in a
+    # profile (58 ms per step end to end). The transformer also takes
+    # per-sample (1-D) timesteps, which the SP hook leaves unsplit; their
+    # (B, 1, ...) tables broadcast over the tokens. Conditioned requests
+    # still replace the video timestep with their per-token values.
+    #
+    # Opt-in (VLLM_TPU_OMNI_LTX2_PER_SAMPLE_TIMESTEP): the bf16 TPU output
+    # differs from the per-token path, and no on-device bf16 A/B yet shows
+    # the difference is rounding only.
+    #
+    # Wraps upstream LTXRuntime._denoise_timestep_kwargs and only narrows the
+    # timestep tensors it returns. A (B, S) timestep is collapsed to (B,)
+    # only when it is a broadcast view (stride 0 over tokens, as
+    # timestep_kwargs(expand_for_sequence_parallel=True) builds it), so every
+    # token of a sample is known to hold the same value.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
+
+    from vllm_torchtpu import envs
+
+    if not envs.VLLM_TPU_OMNI_LTX2_PER_SAMPLE_TIMESTEP:
+        return
+    orig_denoise_timestep_kwargs = LTXRuntime._denoise_timestep_kwargs
+    if getattr(orig_denoise_timestep_kwargs, _PER_SAMPLE_TIMESTEP_PATCHED, False):
+        return
+
+    def _per_sample_timestep_kwargs(
+        self: Any,
+        ts: torch.Tensor,
+        forward_ctx: Any,
+        denoise_ctx: Any,
+        *,
+        video_token_count: int,
+        audio_token_count: int,
+    ) -> dict[str, torch.Tensor]:
+        kwargs = orig_denoise_timestep_kwargs(
+            self,
+            ts,
+            forward_ctx,
+            denoise_ctx,
+            video_token_count=video_token_count,
+            audio_token_count=audio_token_count,
+        )
+        # Conditioned requests keep the upstream per-token layout;
+        # LTXConditioningMixin replaces the video timestep with per-token
+        # values anyway.
+        if denoise_ctx.conditioning_mask is not None:
+            return kwargs
+        for name in ("timestep", "audio_timestep"):
+            timestep = kwargs[name]
+            if timestep.ndim == 2 and (
+                timestep.shape[1] == 1 or timestep.stride(1) == 0
+            ):
+                kwargs[name] = timestep[:, 0]
+        return kwargs
+
+    setattr(_per_sample_timestep_kwargs, _PER_SAMPLE_TIMESTEP_PATCHED, True)
+    LTXRuntime._denoise_timestep_kwargs = _per_sample_timestep_kwargs
+    logger.info("Applied TPU patch: per-sample LTX-2 timestep.")

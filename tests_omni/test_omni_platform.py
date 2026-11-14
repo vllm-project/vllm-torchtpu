@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
 )
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.omni import patches, register_omni_tpu_platform
 from vllm_torchtpu.omni import rope as omni_rope
 from vllm_torchtpu.omni.attention import (
@@ -78,6 +79,7 @@ _UPSTREAM_SDPA_FORWARD = SDPAImpl.forward
 _UPSTREAM_ROPE_FORWARD = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward
 _UPSTREAM_APPLY_SPLIT_ROTARY_EMB = ltx2_transformer.apply_split_rotary_emb
 _UPSTREAM_RESTORE_BWE_FILTER = ltx2_runtime._restore_ltx_bwe_resampler_filter
+_UPSTREAM_DENOISE_TIMESTEP_KWARGS = ltx2_runtime.LTXRuntime._denoise_timestep_kwargs
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -945,3 +947,211 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
 def test_supports_talker_mtp_graph_capture_disabled():
     assert OmniTpuPlatform.supports_talker_mtp_graph_capture() is False
     assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False
+
+
+def _ltx2_denoise_ctx(conditioning_mask, batch=2, video_tokens=7, audio_tokens=3):
+    # The real vLLM-Omni denoise context, so a renamed conditioning_mask
+    # field fails here (TypeError) instead of passing with a stand-in.
+    from vllm_omni.diffusion.models.ltx2.ltx2_denoise import LTXDenoiseContext
+
+    return LTXDenoiseContext(
+        latents=torch.zeros(batch, video_tokens, 4),
+        audio_latents=torch.zeros(batch, audio_tokens, 4),
+        video_coords=torch.zeros(batch, 3, video_tokens, 2),
+        audio_coords=torch.zeros(batch, 1, audio_tokens, 2),
+        conditioning_mask=conditioning_mask,
+    )
+
+
+def _install_ltx2_per_sample_timestep(monkeypatch, *, enabled):
+    # Runs only this patch, on the real upstream LTXRuntime, with the knob
+    # set as given. monkeypatch restores the upstream method afterwards.
+    monkeypatch.setattr(
+        ltx2_runtime.LTXRuntime,
+        "_denoise_timestep_kwargs",
+        _UPSTREAM_DENOISE_TIMESTEP_KWARGS,
+    )
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_OMNI_LTX2_PER_SAMPLE_TIMESTEP", enabled, raising=False
+    )
+    patches._patch_ltx2_per_sample_timestep()
+
+
+class _LTX2SdpaAttention(torch.nn.Module):
+    """Plain SDPA in place of _LTX2ParallelAttention (no SP, no backend)."""
+
+    def __init__(self, *, softmax_scale, **kwargs):
+        super().__init__()
+        self.softmax_scale = softmax_scale
+
+    def forward(self, query, key, value, attn_metadata=None):
+        assert attn_metadata is None
+        out = torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            scale=self.softmax_scale,
+        )
+        return out.transpose(1, 2)
+
+
+def test_ltx2_per_sample_timestep_matches_per_token_fp32(monkeypatch):
+    # A tiny real LTX2VideoTransformer3DModel (2 blocks, small dims) gives
+    # the same fp32 video and audio output for upstream's per-token (B, S)
+    # timestep and the patch's per-sample (B,) timestep. Only the attention
+    # kernel is replaced (plain SDPA); it does not see the timestep.
+    import vllm.distributed.parallel_state as vllm_ps
+    import vllm.model_executor.layers.linear as vllm_linear
+    import vllm.model_executor.parameter as vllm_param
+
+    tp_group = SimpleNamespace(
+        world_size=1, rank_in_group=0, is_first_rank=True, is_last_rank=True
+    )
+    monkeypatch.setattr(vllm_ps, "get_tp_group", lambda: tp_group)
+    for module in (vllm_ps, vllm_param, vllm_linear, ltx2_transformer):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(ltx2_transformer, "_LTX2ParallelAttention", _LTX2SdpaAttention)
+
+    runtime_cls = ltx2_runtime.LTXRuntime
+    _install_ltx2_per_sample_timestep(monkeypatch, enabled=True)
+
+    torch.manual_seed(0)
+    heads, video_head_dim, audio_head_dim, caption = 2, 24, 12, 16
+    model = ltx2_transformer.LTX2VideoTransformer3DModel(
+        in_channels=8,
+        out_channels=8,
+        num_attention_heads=heads,
+        attention_head_dim=video_head_dim,
+        cross_attention_dim=heads * video_head_dim,
+        audio_in_channels=8,
+        audio_out_channels=8,
+        audio_num_attention_heads=heads,
+        audio_attention_head_dim=audio_head_dim,
+        audio_cross_attention_dim=heads * audio_head_dim,
+        num_layers=2,
+        caption_channels=caption,
+    ).eval()
+    with torch.no_grad():
+        for param in model.parameters():
+            param.normal_(0.0, 0.2)
+
+    batch, frames, height, width, audio_frames = 2, 2, 2, 3, 5
+    video_tokens = frames * height * width
+    runtime = runtime_cls.__new__(runtime_cls)
+    runtime.guidance_executor = ltx2_runtime.LTXGuidanceExecutor()
+    ctx = _ltx2_denoise_ctx(None, batch, video_tokens, audio_frames)
+    ts = torch.tensor([500.0, 250.0])
+    counts = {"video_token_count": video_tokens, "audio_token_count": audio_frames}
+    per_token = _UPSTREAM_DENOISE_TIMESTEP_KWARGS(runtime, ts, None, ctx, **counts)
+    per_sample = runtime._denoise_timestep_kwargs(ts, None, ctx, **counts)
+    assert per_token["timestep"].shape == (batch, video_tokens)
+    assert per_sample["timestep"].shape == (batch,)
+
+    inputs = {
+        "hidden_states": torch.randn(batch, video_tokens, 8),
+        "audio_hidden_states": torch.randn(batch, audio_frames, 8),
+        "encoder_hidden_states": torch.randn(batch, 4, caption),
+        "audio_encoder_hidden_states": torch.randn(batch, 4, caption),
+        "num_frames": frames,
+        "height": height,
+        "width": width,
+        "audio_num_frames": audio_frames,
+        "return_dict": False,
+    }
+    with torch.no_grad():
+        want = model(**inputs, **per_token)
+        got = model(**inputs, **per_sample)
+    assert len(got) == len(want) == 2
+    for got_out, want_out in zip(got, want, strict=True):
+        assert got_out.dtype == torch.float32
+        torch.testing.assert_close(got_out, want_out, rtol=1e-5, atol=1e-5)
+
+
+def test_ltx2_per_sample_timestep_patch_off_by_default(monkeypatch):
+    _install_ltx2_per_sample_timestep(monkeypatch, enabled=False)
+    runtime_cls = ltx2_runtime.LTXRuntime
+    assert runtime_cls._denoise_timestep_kwargs is _UPSTREAM_DENOISE_TIMESTEP_KWARGS
+
+    runtime = runtime_cls.__new__(runtime_cls)
+    runtime.guidance_executor = ltx2_runtime.LTXGuidanceExecutor()
+    ts = torch.tensor([500.0, 250.0])
+    counts = {"video_token_count": 7, "audio_token_count": 3}
+    kwargs = runtime._denoise_timestep_kwargs(
+        ts, None, _ltx2_denoise_ctx(None), **counts
+    )
+    assert kwargs["timestep"].shape == (2, 7)
+    assert kwargs["audio_timestep"].shape == (2, 3)
+
+
+def test_ltx2_per_sample_timestep_patch(monkeypatch):
+    _install_ltx2_per_sample_timestep(monkeypatch, enabled=True)
+    runtime_cls = ltx2_runtime.LTXRuntime
+    assert runtime_cls._denoise_timestep_kwargs is not _UPSTREAM_DENOISE_TIMESTEP_KWARGS
+
+    runtime = runtime_cls.__new__(runtime_cls)
+    runtime.guidance_executor = ltx2_runtime.LTXGuidanceExecutor()
+    ts = torch.tensor([500.0, 250.0])
+    counts = {"video_token_count": 7, "audio_token_count": 3}
+
+    unconditioned = _ltx2_denoise_ctx(None)
+    kwargs = runtime._denoise_timestep_kwargs(ts, None, unconditioned, **counts)
+    assert kwargs["timestep"].shape == (2,)
+    assert kwargs["audio_timestep"].shape == (2,)
+    torch.testing.assert_close(kwargs["timestep"], ts)
+    torch.testing.assert_close(kwargs["audio_timestep"], ts)
+    torch.testing.assert_close(kwargs["sigma"], ts)
+
+    conditioned = _ltx2_denoise_ctx(torch.ones(2, 7))
+    kwargs = runtime._denoise_timestep_kwargs(ts, None, conditioned, **counts)
+    assert kwargs["timestep"].shape == (2, 7)
+    assert kwargs["audio_timestep"].shape == (2, 3)
+    torch.testing.assert_close(kwargs["timestep"][:, 0], ts)
+
+    # Re-applying is a no-op and single-sample (B=1) stays 1-D.
+    installed = runtime_cls._denoise_timestep_kwargs
+    patches._patch_ltx2_per_sample_timestep()
+    assert runtime_cls._denoise_timestep_kwargs is installed
+    ts1 = torch.tensor([125.0])
+    kwargs1 = runtime._denoise_timestep_kwargs(ts1, None, unconditioned, **counts)
+    assert kwargs1["timestep"].shape == (1,) and kwargs1["audio_timestep"].shape == (1,)
+
+
+def test_ltx2_sp_plan_leaves_per_sample_timestep_unsplit(monkeypatch):
+    # The real LTX-2 SP plan run through the real SequenceParallelSplitHook
+    # on 2 Ulysses ranks (this process plays rank 1): a per-token (B, S)
+    # timestep is split with the video tokens, a per-sample (B,) timestep
+    # passes through unchanged, and audio_timestep is not in the plan.
+    from vllm_omni.diffusion.distributed import sp_sharding
+    from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
+    from vllm_omni.diffusion.hooks.sequence_parallel import (
+        ModuleForwardMetadata,
+        SequenceParallelSplitHook,
+    )
+
+    monkeypatch.setattr(sp_sharding, "get_sequence_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(sp_sharding, "get_sequence_parallel_rank", lambda: 1)
+
+    model_cls = ltx2_transformer.LTX2VideoTransformer3DModel
+    plan = model_cls._build_sp_plan("split")[""]
+    assert isinstance(plan["timestep"], SequenceParallelInput)
+    assert "audio_timestep" not in plan
+    hook = SequenceParallelSplitHook(
+        plan, SimpleNamespace(ulysses_degree=2, sequence_parallel_size=2)
+    )
+    hook.module_forward_metadata = ModuleForwardMetadata(_cls=model_cls)
+
+    batch, video_tokens, audio_tokens = 2, 8, 3
+    ts = torch.tensor([500.0, 250.0])
+    per_token = torch.arange(batch * video_tokens, dtype=torch.float32).reshape(
+        batch, video_tokens
+    )
+    audio = ts.reshape(-1, 1).expand(-1, audio_tokens)
+
+    _, split = hook.pre_forward(None, timestep=per_token, audio_timestep=audio)
+    torch.testing.assert_close(split["timestep"], per_token[:, video_tokens // 2 :])
+    assert split["audio_timestep"] is audio
+
+    _, kept = hook.pre_forward(None, timestep=ts, audio_timestep=ts)
+    assert kept["timestep"] is ts
+    assert kept["audio_timestep"] is ts
