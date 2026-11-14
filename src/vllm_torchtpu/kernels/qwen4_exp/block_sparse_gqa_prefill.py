@@ -2030,7 +2030,7 @@ def block_sparse_gqa_attention(
             # Debug (xprof-visible, no host callback): per threshold t, a
             # tiny named kernel runs when some row has lse - stabilizer < -t,
             # i.e. its gap below the bound exceeds about t + shift nats.
-            for t in (int(x) for x in marks.split(",") if x):
+            for t in (int(x) for x in marks.replace(":", ",").split(",") if x):
                 hit = jnp.any(live_rows & jnp.isfinite(lse) & (lse - stab < -t))
                 tick = lax.cond(hit, functools.partial(_mark_kernel, t), _no_mark, None)
                 output = (output[0], output[1] + tick * 0.0)
