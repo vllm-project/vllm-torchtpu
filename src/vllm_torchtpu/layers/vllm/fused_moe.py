@@ -140,7 +140,6 @@ def _build_fused_moe_custom_op(
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
     num_primary_experts: int | None = None,
-    layer_tag: bool = False,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -159,8 +158,7 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
-        num_primary_experts=num_primary_experts,
-        layer_tag=layer_tag)
+        num_primary_experts=num_primary_experts)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
@@ -172,7 +170,7 @@ def _build_fused_moe_custom_op(
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
     cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens,
-                 num_primary_experts, layer_tag)
+                 num_primary_experts)
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -185,7 +183,6 @@ def _get_fused_moe_custom_op(
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
     num_primary_experts: int | None = None,
-    layer_tag: bool = False,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
@@ -201,7 +198,7 @@ def _get_fused_moe_custom_op(
                 "num_primary_experts, which this quantisation method does not "
                 "supply")
     cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens,
-                 num_primary_experts, layer_tag)
+                 num_primary_experts)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -212,7 +209,6 @@ def _get_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         num_primary_experts=num_primary_experts,
-        layer_tag=layer_tag,
     )
 
 
@@ -224,7 +220,6 @@ def prebuild_fused_moe_kernel(
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
     num_primary_experts: int | None = None,
-    layer_tag: bool = False,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -234,7 +229,6 @@ def prebuild_fused_moe_kernel(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         num_primary_experts=num_primary_experts,
-        layer_tag=layer_tag,
     )
 
 
@@ -254,7 +248,6 @@ def fused_moe_gmm(
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
     num_primary_experts: int | None = None,
-    layer_tag: bool = False,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -278,7 +271,6 @@ def fused_moe_gmm(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         num_primary_experts=num_primary_experts,
-        layer_tag=layer_tag,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
