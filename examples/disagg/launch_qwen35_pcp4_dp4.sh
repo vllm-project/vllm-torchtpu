@@ -113,6 +113,12 @@ BLOCK_SIZE_PREFILL=4096
 BLOCK_SIZE_DECODE=4096
 NUM_GPU_BLOCKS_OVERRIDE_PREFILL=16
 NUM_GPU_BLOCKS_OVERRIDE_DECODE=72
+# Scoped VMEM reserved per kernel (--xla_tpu_scoped_vmem_limit_kib; the XLA
+# default is 32 MiB). Decode runs small steps and is faster with the default,
+# which leaves the compiler VMEM to prefetch weights and overlap the MoE
+# collectives; prefill keeps 64 MiB.
+PREFILL_SCOPED_VMEM_LIMIT_KIB="${PREFILL_SCOPED_VMEM_LIMIT_KIB:-65536}"
+DECODE_SCOPED_VMEM_LIMIT_KIB="${DECODE_SCOPED_VMEM_LIMIT_KIB:-32768}"
 
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.92}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
@@ -195,6 +201,8 @@ BLOCK_SIZE_PREFILL=${BLOCK_SIZE_PREFILL}
 BLOCK_SIZE_DECODE=${BLOCK_SIZE_DECODE}
 NUM_GPU_BLOCKS_OVERRIDE_PREFILL=${NUM_GPU_BLOCKS_OVERRIDE_PREFILL}
 NUM_GPU_BLOCKS_OVERRIDE_DECODE=${NUM_GPU_BLOCKS_OVERRIDE_DECODE}
+PREFILL_SCOPED_VMEM_LIMIT_KIB=${PREFILL_SCOPED_VMEM_LIMIT_KIB}
+DECODE_SCOPED_VMEM_LIMIT_KIB=${DECODE_SCOPED_VMEM_LIMIT_KIB}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS}
 DECODE_MAX_NUM_BATCHED_TOKENS=${DECODE_MAX_NUM_BATCHED_TOKENS}
@@ -215,7 +223,6 @@ export USE_MOE_SPARSE_CORE=1;
 export TPUMISC_HMA_CHECKSUM_TRACE=0;
 export XLA_PYTHON_CLIENT_PREALLOCATE=false VLLM_ALLOW_LONG_MAX_MODEL_LEN=1;
 unset VLLM_DISABLE_COMPILE_CACHE VLLM_CACHE_ROOT TORCHINDUCTOR_CACHE_DIR;
-export LIBTPU_INIT_ARGS="\${LIBTPU_INIT_ARGS:-} --xla_tpu_scoped_vmem_limit_kib=65536";
 export ONEHOT_MOE_PERMUTE_THRESHOLD=32768;
 export TPU_RAGGED_GATHER_REDUCE_IMPL=fallback TPU_RAGGED_GATHER_IMPL=fallback;
 export DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH=0;
@@ -243,9 +250,9 @@ prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --max-num-batched-tok
 
 decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --max-num-batched-tokens "${DECODE_MAX_NUM_BATCHED_TOKENS}" --compilation-config "${decode_compilation_config}" --block-size "${BLOCK_SIZE_DECODE}" --num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE_DECODE}" --tensor-parallel-size "${DECODE_TP}" --prefill-context-parallel-size 1 --data-parallel-size "${DECODE_DP}" --data-parallel-size-local "${DECODE_DP}" --kv-transfer-config "${d_kv}")
 
-prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:27000; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+prefill_cmd="${common_env}"$'\n'"export LIBTPU_INIT_ARGS=\"\${LIBTPU_INIT_ARGS:-} --xla_tpu_scoped_vmem_limit_kib=${PREFILL_SCOPED_VMEM_LIMIT_KIB}\"; export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:27000; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
 
-decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:28000; export TPU_KV_TRANSFER_PORT=9200; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${decode_sb_addresses}'; export TORCH_TPU_DP_MASTER_PORT='${DECODE_DP_MASTER_PORT}'; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
+decode_cmd="${common_env}"$'\n'"export LIBTPU_INIT_ARGS=\"\${LIBTPU_INIT_ARGS:-} --xla_tpu_scoped_vmem_limit_kib=${DECODE_SCOPED_VMEM_LIMIT_KIB}\"; export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:28000; export TPU_KV_TRANSFER_PORT=9200; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${decode_sb_addresses}'; export TORCH_TPU_DP_MASTER_PORT='${DECODE_DP_MASTER_PORT}'; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
 
 prefill_ctrl_cmd="${ctrl_common_env}"$'\n'"python ${script_dir}/run_raiden_controller.py --port 27000"
 
