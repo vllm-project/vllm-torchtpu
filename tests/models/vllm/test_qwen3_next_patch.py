@@ -35,6 +35,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
 )
+from vllm_torchtpu.models.qwen3_5 import hooks as qwen3_5_hooks
 from vllm_torchtpu.models.vllm import qwen3_next_patch as patch_mod
 from vllm_torchtpu.models.vllm.qwen3_5_mtp import UPSTREAM_PREDICTOR_FORWARD
 from vllm_torchtpu.models.vllm.qwen3_next_patch import (
@@ -118,9 +119,27 @@ def restore_forwards(monkeypatch):
     return monkeypatch
 
 
-# The model configs the Qwen3.5 rule tells apart.
-QWEN3_5 = SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"])
+# The model configs the Qwen3.5 rule tells apart. QWEN3_5 is the checkpoint
+# the patch was measured on (Qwen3.5-397B-A17B's text config, on TPU7x through
+# the autouse fixture below); QWEN3_5_35B is main's CI model.
+_SHAPE_397B = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
+_SHAPE_35B = {"num_experts": 256, "hidden_size": 2048, "num_hidden_layers": 40}
+QWEN3_5 = SimpleNamespace(
+    architectures=["Qwen3_5MoeForConditionalGeneration"],
+    hf_text_config=SimpleNamespace(**_SHAPE_397B),
+)
+QWEN3_5_35B = SimpleNamespace(
+    architectures=["Qwen3_5MoeForConditionalGeneration"],
+    hf_text_config=SimpleNamespace(**_SHAPE_35B),
+)
 QWEN3_NEXT = SimpleNamespace(architectures=["Qwen3NextForCausalLM"])
+
+
+@pytest.fixture(autouse=True)
+def _tpu7x(monkeypatch):
+    """The IX record jobs ran on TPU7x; a test that needs another device
+    overrides it."""
+    monkeypatch.setattr(qwen3_5_hooks, "_chip_family", lambda: "7x")
 
 
 @pytest.fixture
@@ -796,6 +815,67 @@ def test_other_models_keep_the_entry_chunk_forwards(
     )
     for layer_cls in (qwen3_next.Qwen3NextDecoderLayer, qwen3_5.Qwen3_5DecoderLayer):
         assert not getattr(layer_cls.__init__, "_tpu_sp_rank_init", False)
+
+
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.parametrize(
+    "case, chip",
+    [("35b", "7x"), ("397b", "v6e"), ("397b", None), ("397b-60-to-40-layers", "7x")],
+)
+def test_qwen3_5_off_the_measured_model_gets_mains_behaviour(
+    restore_forwards, v6_install, monkeypatch, sequence_parallel, case, chip
+):
+    """A Qwen3.5 checkpoint or device the patch was not measured on (main's CI
+    model, Qwen3.5-35B-A3B; the 397B on another or an unknown device; another
+    checkpoint shape) is not a target: no FP8 fusion, no row gating, no FP8
+    gather ops, both drafter forwards unchanged, and main's forwards (the
+    model-entry SP forwards only under TPU_MOE_SEQUENCE_PARALLEL=1)."""
+    monkeypatch.setattr(qwen3_5_hooks, "_chip_family", lambda: chip)
+    restore_forwards.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", sequence_parallel)
+    restore_forwards.setattr(patch_mod.sequence_parallel, "_FOLLOWS_STEP_FORM", False)
+    prebuild = MagicMock()
+    restore_forwards.setattr(patch_mod.linear_common, "prebuild_prequant_ops", prebuild)
+    restore_forwards.setattr(patch_mod, "_prebuild_norm_ops", prebuild)
+    model_config = {
+        "35b": QWEN3_5_35B,
+        "397b": QWEN3_5,
+        "397b-60-to-40-layers": SimpleNamespace(
+            architectures=QWEN3_5.architectures,
+            hf_text_config=SimpleNamespace(**{**_SHAPE_397B, "num_hidden_layers": 40}),
+        ),
+    }[case]
+    assert maybe_patch_qwen3_next(model_config) is None
+    v6_install.assert_not_called()
+    prebuild.assert_not_called()
+    assert not patch_mod.sequence_parallel.follows_step_form()
+    expected = (
+        (entry_chunk_decoder_layer_forward, entry_chunk_model_forward)
+        if sequence_parallel
+        else (UPSTREAM_DECODER_LAYER_FORWARD, UPSTREAM_MODEL_FORWARD)
+    )
+    assert (
+        qwen3_next.Qwen3NextDecoderLayer.forward,
+        qwen3_next.Qwen3NextModel.forward,
+    ) == expected
+    assert qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward is UPSTREAM_MTP_FORWARD
+    assert (
+        qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward is UNPATCHED_QWEN3_5_MTP_FORWARD
+    )
+    for layer_cls in (qwen3_next.Qwen3NextDecoderLayer, qwen3_5.Qwen3_5DecoderLayer):
+        assert not getattr(layer_cls.__init__, "_tpu_sp_rank_init", False)
+
+
+def test_main_ci_model_never_reads_the_device(
+    restore_forwards, v6_install, monkeypatch
+):
+    """The checkpoint shape is checked first, so a 35B engine never reads the
+    accelerator type."""
+    chip = MagicMock(return_value="7x")
+    monkeypatch.setattr(qwen3_5_hooks, "_chip_family", chip)
+    restore_forwards.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", False)
+    assert maybe_patch_qwen3_next(QWEN3_5_35B) is None
+    chip.assert_not_called()
+    v6_install.assert_not_called()
 
 
 @pytest.mark.parametrize("sequence_parallel", [True, False])
