@@ -48,20 +48,20 @@ def _make_linear(n_in: int = 256, n_out: int = 64) -> LinearBase:
 
 
 def _fake_quantize_fp4_kmajor(
-    w_kmajor_3d: torch.Tensor, block: int, pack: bool = False
+    w_kmajor_2d: torch.Tensor, block: int, pack: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert not pack
-    groups, k_dim, n_out = w_kmajor_3d.shape
+    k_dim, n_out = w_kmajor_2d.shape
     assert k_dim % block == 0 and n_out % 2 == 0
     w_q = torch.zeros(
-        (groups, k_dim, n_out // 2),
+        (k_dim, n_out // 2),
         dtype=torch.uint8,
-        device=w_kmajor_3d.device,
+        device=w_kmajor_2d.device,
     ).view(torch.float4_e2m1fn_x2)
     w_s = torch.ones(
-        (groups, k_dim // block, 1, n_out),
+        (k_dim // block, 1, n_out),
         dtype=torch.float32,
-        device=w_kmajor_3d.device,
+        device=w_kmajor_2d.device,
     )
     return w_q, w_s
 
@@ -215,3 +215,85 @@ def test_nvfp4_moe_fp8_all_gather_gate(monkeypatch):
         out = method.apply_monolithic(layer, torch.zeros((2, 16)), torch.zeros((2, 4)))
         assert out == "pipelined_fp8_ag"
         mock_pipe.assert_called_once()
+
+
+def test_requantize_fp4_prefixes_filter(monkeypatch):
+    monkeypatch.setenv("REQUANTIZE_WEIGHT_DTYPE", "fp4")
+    monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")
+    monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "256")
+    monkeypatch.setenv("REQUANTIZE_FP4_PREFIXES", "shared_expert.,lm_head")
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.quantization.fp8.quantize_native_fp4_kmajor",
+        _fake_quantize_fp4_kmajor,
+    )
+
+    fp8_cfg = VllmFp8Config(
+        is_checkpoint_fp8_serialized=True, activation_scheme="static"
+    )
+    gate_ba = _make_linear(n_in=512, n_out=128)
+    gate_ba.weight = torch.nn.Parameter(
+        torch.ones((128, 512), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    gate_ba.weight_scale = torch.nn.Parameter(
+        torch.tensor([0.25], dtype=torch.float32), requires_grad=False
+    )
+    method_ba = VllmFp8LinearMethodTPU(
+        fp8_cfg, prefix="model.layers.0.linear_attn.in_proj_ba"
+    )
+    method_ba.process_weights_after_loading(gate_ba)
+    assert gate_ba.weight.dtype == torch.float8_e4m3fn
+    assert tuple(gate_ba.weight.shape) == (512, 128)
+
+    onload_cfg = VllmFp8Config(
+        is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
+    )
+    shared = _make_linear(n_in=512, n_out=128)
+    shared.weight = torch.nn.Parameter(
+        torch.randn((128, 512), dtype=torch.bfloat16), requires_grad=False
+    )
+    method_shared = VllmFp8LinearMethodTPU(
+        onload_cfg, prefix="model.layers.0.mlp.shared_expert.gate_up_proj"
+    )
+    method_shared.process_weights_after_loading(shared)
+    assert shared.weight.dtype == torch.float4_e2m1fn_x2
+    assert tuple(shared.weight.shape) == (512, 64)
+
+
+def _has_tpu() -> bool:
+    try:
+        import jax
+
+        return any(d.platform == "tpu" for d in jax.devices())
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _has_tpu(), reason="Requires TPU device")
+def test_tpu_device_fp4_linear_w4a8_b256(monkeypatch):
+    monkeypatch.setenv("REQUANTIZE_WEIGHT_DTYPE", "fp4")
+    monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")
+    monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "256")
+    monkeypatch.delenv("REQUANTIZE_FP4_PREFIXES", raising=False)
+
+    torch.manual_seed(0)
+    w_ref = torch.randn((256, 1024), dtype=torch.bfloat16, device="tpu") * 0.05
+    x = torch.randn((16, 1024), dtype=torch.bfloat16, device="tpu")
+    y_ref = (x.float() @ w_ref.float().T).to(torch.bfloat16)
+
+    layer = _make_linear(n_in=1024, n_out=256)
+    layer.weight = torch.nn.Parameter(w_ref.clone(), requires_grad=False)
+    cfg = VllmFp8Config(is_checkpoint_fp8_serialized=False, activation_scheme="dynamic")
+    method = VllmFp8LinearMethodTPU(
+        cfg, prefix="model.layers.0.mlp.shared_expert.down_proj"
+    )
+    method.process_weights_after_loading(layer)
+    assert layer.weight.device.type == "tpu"
+    assert layer.weight.dtype == torch.float4_e2m1fn_x2
+    assert tuple(layer.weight.shape) == (1024, 128)
+    assert tuple(layer.weight_scale.shape) == (1, 4, 1, 256)
+
+    y_fp4 = method.apply(layer, x)
+    cos = torch.nn.functional.cosine_similarity(
+        y_ref.float().flatten(), y_fp4.float().flatten(), dim=0
+    ).item()
+    assert cos > 0.985

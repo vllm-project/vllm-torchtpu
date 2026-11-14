@@ -99,6 +99,7 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     VllmQuantLinearConfig,
+    should_requantize_fp4,
 )
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
     OnlineFp8Policy,
@@ -304,9 +305,9 @@ def _quantize_linear_kmajor_fp4(
     block_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize `[n_out, n_in]` float32 weight to K-major native FP4 + 4D scale."""
-    w_kmajor = fresh_buffer(weight_f_n_major.transpose(0, 1)).unsqueeze(0)
-    w_q_3d, w_s_4d = quantize_native_fp4_kmajor(w_kmajor, block=block_size, pack=False)
-    return w_q_3d.squeeze(0), w_s_4d
+    w_kmajor = fresh_buffer(weight_f_n_major.transpose(0, 1))
+    w_q_2d, w_s_3d = quantize_native_fp4_kmajor(w_kmajor, block=block_size, pack=False)
+    return w_q_2d, fresh_buffer(w_s_3d.unsqueeze(0))
 
 
 def _format_linear_scale_for_runtime(
@@ -1469,10 +1470,19 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             if self.linear_config is not None
             else envs.REQUANTIZE_WEIGHT_DTYPE
         )
-        if quant_config.is_checkpoint_fp8_serialized or desired_dtype in (
+        wants_fp4 = desired_dtype in (
             "fp4",
+            "float4_e2m1fn",
             "float4_e2m1fn_x2",
-        ):
+        )
+        if wants_fp4 and not should_requantize_fp4(prefix):
+            self._linear_quant_config = (
+                "float8_e4m3fn",
+                torch.float8_e4m3fn,
+                None,
+                False,
+            )
+        elif quant_config.is_checkpoint_fp8_serialized or wants_fp4:
             self._linear_quant_config = _get_linear_quant_config(self.linear_config)
         else:
             # Load-time quantization has its own fixed per-channel contract.
@@ -1721,8 +1731,11 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # The dequant/requant chain may leave views backed by buffers of a
         # different shape (e.g. a squeezed [n_out, 1] scale). Give the
         # persistent parameters buffers of their own shape so the matmul
-        # boundary needs no per-step `tt_jit_as_strided` program.
-        weight = fresh_buffer(weight)
+        # boundary needs no per-step `tt_jit_as_strided` program. Native FP4
+        # comes out of `quantize_native_fp4_kmajor` as a fresh 2-D device buffer
+        # and does not support `AtenAddOut` (`+ 0`) on TPU.
+        if not already_kmajor:
+            weight = fresh_buffer(weight)
         weight_scale = fresh_buffer(weight_scale)
 
         replace_parameter(
