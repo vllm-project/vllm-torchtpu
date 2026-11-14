@@ -87,6 +87,39 @@ def test_k3_tp32_fp8_8k_page256_mixed_tuned_params() -> None:
     assert tuned.vmem_limit_bytes == 52 * 1024 * 1024
 
 
+@pytest.mark.parametrize(
+    "page,pages_per_seq,max_num_seqs,decode_kv_pages,q_split,mixed_kv_pages",
+    [(4, 640, 32, 192, 8, 256), (85, 32, 8, 16, 2, 8), (85, 32, 32, 16, 2, 8)],
+)
+def test_k3_tp32_fp8_8k_layout_tuned_params(
+    page: int,
+    pages_per_seq: int,
+    max_num_seqs: int,
+    decode_kv_pages: int,
+    q_split: int,
+    mixed_kv_pages: int,
+) -> None:
+    mixed_key = replace(
+        _k3_tp32_fp8_8k_mixed_key(),
+        page_size_per_kv_packing=page,
+        max_num_seqs=max_num_seqs,
+        pages_per_seq=pages_per_seq,
+    )
+
+    mixed = get_tuned_params(mixed_key)
+    assert mixed.q_split == q_split
+    assert mixed.num_kv_pages_per_block == mixed_kv_pages
+
+    for max_num_tokens in (1, 32, 8192):
+        decode_key = replace(
+            mixed_key, case="batched_decode", max_num_tokens=max_num_tokens
+        )
+        assert decode_key not in tuned_params.tuned_params_mapping
+        decode = tuned_params.live_keyed_decode_params[decode_key]
+        assert decode.decode_batch_size == 2
+        assert decode.num_kv_pages_per_block == decode_kv_pages
+
+
 def test_k3_mixed_tuned_params_require_matching_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
