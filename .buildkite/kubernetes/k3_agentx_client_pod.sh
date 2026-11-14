@@ -125,7 +125,7 @@ while IFS='=' read -r _k _v; do
     printf -v "CFG_${_k}" '%s' "$_v"
 done <<< "$_cfg"
 unset _k _v
-# What fronts the pair: the toy proxy (examples/disagg) or vllm-router in
+# What fronts the pair: the toy proxy (tools/disagg) or vllm-router in
 # its prefill/decode mode (AGENTX_PROXY=router in the config; the image
 # carries the binary). Same two-hop protocol either way.
 case "$CFG_PROXY" in toy|router) ;; *) log "FATAL: $CONFIG sets AGENTX_PROXY='$CFG_PROXY'; expected toy or router"; exit 2 ;; esac
@@ -266,7 +266,7 @@ if [ "$CFG_PROXY" = router ]; then
     proxy_pid=$!
     proxy_health="health"
 else
-    python3 examples/disagg/toy_proxy_server.py \
+    python3 tools/disagg/toy_proxy_server.py \
         --host 0.0.0.0 --port "$PROXY_PORT" \
         --prefiller-hosts "$PREFILL_HOST" --prefiller-ports "$PORT" \
         --decoder-hosts "$DECODE_HOST" --decoder-ports "$PORT" \

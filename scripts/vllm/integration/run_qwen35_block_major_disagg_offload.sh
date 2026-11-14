@@ -18,7 +18,7 @@
 #
 # VLLM_TPU_BLOCK_MAJOR_KV=1 merges a hybrid model's per-region unified pools
 # into one (num_blocks, P * split, *page) allocation. The rig brings up the
-# qwen35-pcp4-dp4 P/D pair through examples/disagg/launch_qwen35_p4d2_v2_baseline.sh
+# qwen35-pcp4-dp4 P/D pair through tools/disagg/launch_qwen35_p4d2_v2_baseline.sh
 # with the layout on: PCP4/TP1 prefill, DP4/TP1 decode, TPUMultiConnector with
 # the Stage-3 TPURaidenConnector and TPURaidenOffloadingConnector on both
 # engines, toy proxy in front. Speculative decoding is off: the merged pool
@@ -115,7 +115,7 @@ trap cleanup EXIT
 mkdir -p "${RUN_DIR}/logs" || exit 1
 cd "${repo_root}" || exit 1
 
-bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh 2>&1 | tee "${RUN_DIR}/logs/launch.log"
+bash tools/disagg/launch_qwen35_p4d2_v2_baseline.sh 2>&1 | tee "${RUN_DIR}/logs/launch.log"
 [[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "the P/D pair did not come up (see ${RUN_DIR}/logs)"
 
 # The layout is invisible from the API; the engine logs are the only evidence

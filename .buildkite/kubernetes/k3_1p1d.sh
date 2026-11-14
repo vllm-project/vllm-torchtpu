@@ -317,7 +317,7 @@ for url in "http://127.0.0.1:${PORT}" "http://${DECODE_HOST}:${PORT}"; do
 done
 
 echo "--- Starting the proxy on port ${PROXY_PORT}"
-python3 examples/disagg/toy_proxy_server.py \
+python3 tools/disagg/toy_proxy_server.py \
   --host 0.0.0.0 --port "$PROXY_PORT" \
   --prefiller-hosts 127.0.0.1 --prefiller-ports "$PORT" \
   --decoder-hosts "$DECODE_HOST" --decoder-ports "$PORT" \

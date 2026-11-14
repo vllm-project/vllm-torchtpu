@@ -308,7 +308,7 @@ if [[ "${p_code}" != "200" || "${d_code}" != "200" ]]; then
 fi
 
 proxy_cmd=$(cat <<EOF
-python examples/disagg/toy_proxy_server.py --host '${SERVE_HOST}' --port '${PROXY_PORT}' --prefiller-hosts '${SERVE_HOST}' --prefiller-ports '${PREFILL_PORT}' --decoder-hosts '${SERVE_HOST}' --decoder-ports '${DECODE_PORT}'
+python tools/disagg/toy_proxy_server.py --host '${SERVE_HOST}' --port '${PROXY_PORT}' --prefiller-hosts '${SERVE_HOST}' --prefiller-ports '${PREFILL_PORT}' --decoder-hosts '${SERVE_HOST}' --decoder-ports '${DECODE_PORT}'
 EOF
 )
 printf '%s\n' "${proxy_cmd}" >"${RUN_DIR}/proxy_cmd.sh"

@@ -31,7 +31,7 @@ prefill_host=${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}
 decode_host=${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
 
 echo "Starting proxy server..."
-python3 /workspace/vllm-torchtpu/examples/disagg/toy_proxy_server.py \
+python3 /workspace/vllm-torchtpu/tools/disagg/toy_proxy_server.py \
   --host 0.0.0.0 \
   --port 10000 \
   --prefiller-host "$prefill_host" \

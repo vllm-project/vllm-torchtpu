@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the chat-template default in examples/offline_inference.py."""
+"""Unit tests for chat-template defaults in the offline example and CI runner."""
 
 import importlib.util
 from pathlib import Path
@@ -21,17 +21,15 @@ from unittest.mock import MagicMock
 import pytest
 
 
-def _load_offline_inference():
-    path = Path(__file__).resolve().parents[2] / "examples" / "offline_inference.py"
+@pytest.fixture(params=["examples", "tools"])
+def offline_inference(request):
+    path = Path(__file__).resolve().parents[2] / request.param / "offline_inference.py"
     spec = importlib.util.spec_from_file_location("offline_inference", path)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
-
-
-offline_inference = _load_offline_inference()
 
 
 def _make_fake_llm(tokenizer):
@@ -77,7 +75,7 @@ def _base_args(*, use_chat_template=None, chat_template_kwargs=None):
     ],
     ids=["default", "use-chat-template", "no-use-chat-template"],
 )
-def test_parser_use_chat_template_flag(monkeypatch, argv, expected):
+def test_parser_use_chat_template_flag(offline_inference, monkeypatch, argv, expected):
     # EngineArgs.add_cli_args builds a DeviceConfig, which needs the TPU torch
     # device; only the example's own flags matter here.
     monkeypatch.setattr(offline_inference.EngineArgs, "add_cli_args", lambda _: None)
@@ -117,7 +115,12 @@ def test_parser_use_chat_template_flag(monkeypatch, argv, expected):
     ],
 )
 def test_main_selects_chat_or_generate(
-    monkeypatch, use_chat_template, chat_template_kwargs, tokenizer, expect_chat
+    offline_inference,
+    monkeypatch,
+    use_chat_template,
+    chat_template_kwargs,
+    tokenizer,
+    expect_chat,
 ):
     llm = _make_fake_llm(tokenizer)
     monkeypatch.setattr(offline_inference, "LLM", lambda **_: llm)
@@ -147,7 +150,7 @@ def test_main_selects_chat_or_generate(
     ids=["explicit-true", "explicit-false", "kwargs-safeguard"],
 )
 def test_main_does_not_load_tokenizer_when_mode_already_known(
-    monkeypatch, use_chat_template, chat_template_kwargs
+    offline_inference, monkeypatch, use_chat_template, chat_template_kwargs
 ):
     llm = _make_fake_llm(SimpleNamespace(chat_template="<bos>{{ messages }}"))
     monkeypatch.setattr(offline_inference, "LLM", lambda **_: llm)

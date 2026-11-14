@@ -512,7 +512,7 @@ proxy_cmd=$(cat <<EOF
 ${activation_cmd}
 cd $(shell_quote "${TORCHTPU_VLLM_SRC}");
 export PYTHONPATH=$(shell_quote "${TORCHTPU_VLLM_SRC}/src:${TORCHTPU_VLLM_SRC}:${VLLM_SRC}"):\${PYTHONPATH:-};
-$(shell_quote "${python_bin}") examples/disagg/toy_proxy_server.py --host '${SERVE_HOST}' --port '${PROXY_PORT}' --prefiller-hosts '${SERVE_HOST}' --prefiller-ports '${PREFILL_PORT}' --decoder-hosts '${SERVE_HOST}' --decoder-ports '${DECODE_PORT}'
+$(shell_quote "${python_bin}") tools/disagg/toy_proxy_server.py --host '${SERVE_HOST}' --port '${PROXY_PORT}' --prefiller-hosts '${SERVE_HOST}' --prefiller-ports '${PREFILL_PORT}' --decoder-hosts '${SERVE_HOST}' --decoder-ports '${DECODE_PORT}'
 EOF
 )
 printf '%s\n' "${proxy_cmd}" >"${RUN_DIR}/proxy_cmd.sh"

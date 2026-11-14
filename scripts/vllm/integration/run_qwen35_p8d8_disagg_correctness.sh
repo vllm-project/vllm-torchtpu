@@ -169,7 +169,7 @@ cd "${repo_root}"
 case "${ROLE}" in
   prefill)
     echo "--- Launching role=prefill (PCP=${PREFILL_PCP}, PORT=${PREFILL_PORT})"
-    ROLE=prefill bash "${repo_root}/examples/disagg/launch_qwen35_disagg_multihost.sh" \
+    ROLE=prefill bash "${repo_root}/tools/disagg/launch_qwen35_disagg_multihost.sh" \
       2>&1 | tee "${RUN_DIR}/logs/launch_prefill.log"
     prefill_pid="$(cat "${RUN_DIR}/prefill.pid" 2>/dev/null || true)"
     if [[ -n "${prefill_pid}" ]]; then
@@ -182,7 +182,7 @@ case "${ROLE}" in
 
   decode)
     echo "--- Launching role=decode (DP=${DECODE_DP}, PORT=${DECODE_PORT})"
-    ROLE=decode bash "${repo_root}/examples/disagg/launch_qwen35_disagg_multihost.sh" \
+    ROLE=decode bash "${repo_root}/tools/disagg/launch_qwen35_disagg_multihost.sh" \
       2>&1 | tee "${RUN_DIR}/logs/launch_decode.log"
     decode_pid="$(cat "${RUN_DIR}/decode.pid" 2>/dev/null || true)"
     if [[ -n "${decode_pid}" ]]; then
@@ -196,13 +196,13 @@ case "${ROLE}" in
   head|runner|all)
     if [[ "${ROLE}" == "head" ]]; then
       echo "--- Launching head prefill server locally"
-      ROLE=prefill bash "${repo_root}/examples/disagg/launch_qwen35_disagg_multihost.sh" \
+      ROLE=prefill bash "${repo_root}/tools/disagg/launch_qwen35_disagg_multihost.sh" \
         2>&1 | tee "${RUN_DIR}/logs/launch_head_prefill.log"
       target_prefill_host="${PREFILL_HOST:-127.0.0.1}"
       target_decode_host="${DECODE_HOST}"
     elif [[ "${ROLE}" == "all" ]]; then
       echo "--- Launching prefill and decode servers locally"
-      ROLE=all PREFILL_HOST="127.0.0.1" DECODE_HOST="127.0.0.1" bash "${repo_root}/examples/disagg/launch_qwen35_disagg_multihost.sh" \
+      ROLE=all PREFILL_HOST="127.0.0.1" DECODE_HOST="127.0.0.1" bash "${repo_root}/tools/disagg/launch_qwen35_disagg_multihost.sh" \
         2>&1 | tee "${RUN_DIR}/logs/launch_all.log"
       target_prefill_host="127.0.0.1"
       target_decode_host="127.0.0.1"
@@ -240,7 +240,7 @@ case "${ROLE}" in
     echo "--- Starting toy proxy server on port ${PROXY_PORT}"
     proxy_cmd=(
       "${PYTHON_BIN}"
-      "${repo_root}/examples/disagg/toy_proxy_server.py"
+      "${repo_root}/tools/disagg/toy_proxy_server.py"
       --host "0.0.0.0"
       --port "${PROXY_PORT}"
       --prefiller-hosts "${target_prefill_host}"

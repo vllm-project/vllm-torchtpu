@@ -119,7 +119,7 @@ for experiment in "${EXPERIMENTS[@]}"; do
     echo "  Artifacts:   $output_dir"
 
     # Build command
-    cmd=(python3 examples/tpu_profiling.py
+    cmd=(python3 tools/tpu_profiling.py
         --model "$model"
         --batch-size "$batch_size"
         --input-len "$input_len"
