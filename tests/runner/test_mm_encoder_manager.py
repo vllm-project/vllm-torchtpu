@@ -120,6 +120,58 @@ def test_exact_shape_uses_input_without_overwriting_template(manager):
     )
 
 
+def test_exact_shape_input_is_detached_to_match_template_guards(manager):
+    source = torch.ones(4, 2, requires_grad=True)
+    result = manager._pad_to_template({"pixels": source}, 4, "global")
+    assert not result["pixels"].requires_grad
+    assert result["pixels"].data_ptr() == source.data_ptr()
+
+
+def test_templates_are_built_without_autograd(compile_mock):
+    # Templates derived from parameters (e.g. interpolated position
+    # embeddings) must not require grad, or replays built under no_grad miss
+    # every precompiled budget graph on Dynamo's requires_grad guard.
+    weight = torch.nn.Parameter(torch.ones(2))
+    model = Mock()
+    model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
+        capture_axes=(),
+        padding_logics={},
+        paths={
+            "default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False)
+        },
+    )
+    model.prepare_encoder_cudagraph_capture_inputs.side_effect = (
+        lambda budget, *args, path: SimpleNamespace(
+            values={"pos_embeds": weight.repeat(budget, 1)}
+        )
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            multimodal_config=SimpleNamespace(
+                get_limit_per_prompt=lambda _: 0, mm_encoder_tp_mode="weights"
+            ),
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mm_encoder=True,
+            encoder_cudagraph_token_budgets=[4],
+            encoder_cudagraph_max_vision_items_per_batch=2,
+            encoder_cudagraph_max_frames_per_batch=0,
+        ),
+    )
+    manager = mm.MMEncoderManager(config, torch.device("cpu"), model)
+    assert torch.is_grad_enabled()
+    assert not manager.budget_templates["default"][4]["pos_embeds"].requires_grad
+
+
+@pytest.mark.parametrize(
+    ("tokens", "slot"), [(1, 4), (4, 4), (5, 8), (8, 8), (9, 16), (17, 24)]
+)
+def test_gather_slot_is_padded_to_a_token_budget(manager, tokens, slot):
+    # budgets are [4, 8]; beyond the largest, the next multiple of it.
+    assert manager._gather_slot_tokens(tokens) == slot
+
+
 def test_custom_padding_is_selected_per_key_and_path(manager):
     def pad(dst, src):
         dst.fill_(-1)
@@ -348,16 +400,20 @@ def test_coordinated_encoder_dp_shards_and_gathers_empty_and_uneven_ranks(
         plans[:] = [local, (None, [8, 8], 12), (None, [], 0), (None, [], 0)]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", plans_gather)
-    gathered = torch.zeros(24, 2)
+    # The largest peer share (12 tokens) is past the largest budget (8), so
+    # each rank's slot is padded to the next multiple of it.
+    slot = manager._gather_slot_tokens(12)
+    assert slot == 16
+    gathered = torch.zeros(2 * slot, 2)
     for peer, assigned in enumerate(assignments):
-        offset = peer * 12
+        offset = peer * slot
         for index in assigned:
             gathered[offset : offset + counts[index]] = counts[index]
             offset += counts[index]
 
     def tensors_gather(padded, *, dim):
         assert dim == 0
-        torch.testing.assert_close(padded, gathered[rank * 12 : (rank + 1) * 12])
+        torch.testing.assert_close(padded, gathered[rank * slot : (rank + 1) * slot])
         assert mm.synchronize_tensors.call_args == call(padded, wait=True)
         return gathered
 
