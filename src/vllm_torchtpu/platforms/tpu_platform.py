@@ -1160,6 +1160,15 @@ class TpuPlatform(Platform):
                 # chip/PjRt binding no longer depends on torchrun-style
                 # RANK/LOCAL_RANK/WORLD_SIZE before vLLM distributed init.
                 os.environ["TORCH_TPU_DP_SIZE"] = str(dp_size)
+                # Single-host --data-parallel-multi-port-external-lb rank
+                # (opt-in, additional_config["tpu_multiport_dp"]): fixes the
+                # shared DP master port and slicebuilder list before the
+                # defaults below.
+                from vllm_torchtpu.distributed.tpu_multiport_dp import (
+                    prepare_multiport_dp_env,
+                )
+
+                multiport_dp = prepare_multiport_dp_env(vllm_config)
                 os.environ.setdefault(
                     "TORCH_TPU_DP_MASTER_ADDR",
                     parallel_config.data_parallel_master_ip or "localhost",
@@ -1183,7 +1192,7 @@ class TpuPlatform(Platform):
                     prepare_mp_multihost_dp_env,
                 )
 
-                if not prepare_mp_multihost_dp_env(
+                if multiport_dp or not prepare_mp_multihost_dp_env(
                     parallel_config, parallel_config.world_size_across_dp
                 ):
                     cls._prepare_singlehost_tpu_env(

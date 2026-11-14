@@ -49,13 +49,20 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_prefill_only_kv_len_threshold"
 )
 
-# Diagnostics-only knob: it steers profiling and never changes the compiled
-# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps it out of the
-# TPU compile cache key.
+# Launch topology of a single-host multi-port DP server
+# (distributed/tpu_multiport_dp.py): each engine compiles the same programs as
+# under internal-LB DP.
+MULTIPORT_DP_ADDITIONAL_CONFIG_KEY = "tpu_multiport_dp"
+
+# Knobs that never change the compiled graph (the profiling diagnostics above
+# and the multi-port launch topology), so
+# `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU
+# compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
     {
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+        MULTIPORT_DP_ADDITIONAL_CONFIG_KEY,
     }
 )
 
