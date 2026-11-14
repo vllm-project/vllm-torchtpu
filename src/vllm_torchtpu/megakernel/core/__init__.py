@@ -24,6 +24,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         dma,
         errors,
         exec_spec,
+        geometry,
         module,
         module_options,
         modules,
@@ -32,6 +33,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         pool,
         profile,
         profiles,
+        schedule,
         spec,
     )
     from .dma import pool_alias
@@ -44,6 +46,11 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         ExecSpec,
         Tiles,
         default_tiles,
+    )
+    from .geometry import (
+        FromHF,
+        LMHead,
+        ModelGeometry,
     )
     from .modules import (
         GDN,
@@ -88,6 +95,12 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         model_default_profile,
         register_profile,
     )
+    from .schedule import (
+        Every,
+        FromHFLayerTypes,
+        ResolvedSchedule,
+        Schedule,
+    )
     from .spec import (
         REQUIRED,
         CompareMode,
@@ -121,6 +134,7 @@ _SUBMODULES = frozenset(
         "dma",
         "errors",
         "exec_spec",
+        "geometry",
         "module",
         "module_options",
         "modules",
@@ -129,6 +143,7 @@ _SUBMODULES = frozenset(
         "pool",
         "profile",
         "profiles",
+        "schedule",
         "spec",
     }
 )
@@ -141,6 +156,13 @@ _LAZY: dict[str, str] = {
     "default_tiles": ".exec_spec",
     "GDN": ".modules",
     "GDNModule": ".modules",
+    "FromHF": ".geometry",
+    "LMHead": ".geometry",
+    "ModelGeometry": ".geometry",
+    "Every": ".schedule",
+    "FromHFLayerTypes": ".schedule",
+    "ResolvedSchedule": ".schedule",
+    "Schedule": ".schedule",
     "Embedding": ".modules",
     "EmbeddingModule": ".modules",
     "GDNLinInLayout": ".modules",
@@ -209,8 +231,11 @@ __all__ = [
     "DebugOptions",
     "Embedding",
     "EmbeddingModule",
+    "Every",
     "ExecSpec",
     "ExtraInput",
+    "FromHF",
+    "FromHFLayerTypes",
     "FrozenDict",
     "GDN",
     "GDNLinInLayout",
@@ -218,9 +243,11 @@ __all__ = [
     "GDNParams",
     "HFParamDecl",
     "KVCacheDecl",
+    "LMHead",
     "LayerType",
     "MegakernelConfigError",
     "MegakernelLayoutError",
+    "ModelGeometry",
     "ModelSpec",
     "Module",
     "ModuleBinding",
@@ -234,6 +261,8 @@ __all__ = [
     "Profile",
     "RecurrentCacheDecl",
     "ResolvedModuleGeometry",
+    "ResolvedSchedule",
+    "Schedule",
     "ScratchReq",
     "SmallField",
     "Spec",
@@ -255,6 +284,7 @@ __all__ = [
     "encode_ecopy",
     "errors",
     "exec_spec",
+    "geometry",
     "get_profile",
     "kv_to_raw_page",
     "list_profiles",
@@ -274,6 +304,7 @@ __all__ = [
     "raw_pages_to_ssm",
     "register_profile",
     "round_up",
+    "schedule",
     "spec",
     "ssm_to_raw_pages",
     "with_cache",
