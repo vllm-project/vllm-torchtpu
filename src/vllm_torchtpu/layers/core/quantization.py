@@ -39,6 +39,9 @@ from collections.abc import Sequence
 import jax.numpy as jnp
 import torch
 
+# Defined once in kernels/fp8_wire.py; re-exported for existing importers.
+from vllm_torchtpu.kernels.fp8_wire import FP8_E4M3_MAX as FP8_E4M3_MAX
+
 # MXFP4 block size as stored in checkpoints
 MXFP4_BLOCK_SIZE = 32
 
@@ -51,9 +54,6 @@ REQUANTIZED_BLOCK_SIZE = 512
 # for the uint8 form used throughout this module.
 E8M0_MIN_EXP = -127
 E8M0_MAX_EXP = 127
-
-# Same value as jnp.finfo(jnp.float8_e4m3fn).max (448.0).
-FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
 
 def dtype_max(dtype: jnp.dtype) -> float:

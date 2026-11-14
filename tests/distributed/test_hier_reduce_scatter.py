@@ -208,8 +208,8 @@ def arming(monkeypatch):
     monkeypatch.setattr(ep_mesh, "ep_rank_order", lambda: (0, 1, 6, 7, 2, 3, 4, 5))
     monkeypatch.setattr(ep_mesh, "get_ep_group", lambda: _Group())
 
-    def build(mesh, order, axis_name):
-        state.builds.append((mesh, order, axis_name))
+    def build(mesh, order, axis_name, **wire):
+        state.builds.append((mesh, order, axis_name, wire))
         return _Op()
 
     monkeypatch.setattr(hrs, "_build_op", build)
@@ -231,9 +231,39 @@ def test_prebuild_arms_once(arming):
     assert hrs.prebuild_hier_reduce_scatter() is True
     assert hrs.prebuild_hier_reduce_scatter() is True
     assert len(arming.builds) == 1
-    mesh, order, axis_name = arming.builds[0]
+    mesh, order, axis_name, wire = arming.builds[0]
     assert mesh is arming.mesh and order == (0, 1, 6, 7, 2, 3, 4, 5)
+    assert wire == dict(fp8_comm=False, fp8_static_scale=None)
     assert hrs._ARMED is not None and hrs._ARMED.ranks == RANKS
+
+
+def test_prebuild_arms_the_fp8_wire(arming, monkeypatch):
+    monkeypatch.setattr(hrs.envs, "TPU_MOE_EP_HIER_RS", "fp8", raising=False)
+    monkeypatch.setattr(
+        hrs.envs, "TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE", 16.0, raising=False
+    )
+    assert hrs.prebuild_hier_reduce_scatter() is True
+    assert arming.builds[0][3] == dict(fp8_comm=True, fp8_static_scale=16.0)
+
+
+@pytest.mark.parametrize("scale", [None, 0.0, -1.0])
+def test_prebuild_rejects_fp8_without_a_positive_static_scale(monkeypatch, scale):
+    monkeypatch.setattr(hrs, "_ARMED", None)
+    monkeypatch.setattr(hrs.envs, "TPU_MOE_EP_HIER_RS", "fp8", raising=False)
+    monkeypatch.setattr(
+        hrs.envs, "TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE", scale, raising=False
+    )
+    with pytest.raises(ValueError, match="TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE"):
+        hrs.prebuild_hier_reduce_scatter()
+
+
+def test_fp8_wire_without_a_static_scale_is_rejected():
+    from vllm_torchtpu.kernels.collectives.hierrs_tc import dispatch
+
+    with pytest.raises(ValueError, match="no dynamic FP8 scale"):
+        dispatch.make_reduce_scatter_fn(
+            None, tuple(range(8)), axis_name="x", fp8_comm=True
+        )
 
 
 def test_prebuild_refuses_unsupported_world(arming, monkeypatch):

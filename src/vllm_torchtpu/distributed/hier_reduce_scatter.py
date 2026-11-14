@@ -81,7 +81,14 @@ def _unordered_mesh_reason(mesh: Any) -> str | None:
     return None
 
 
-def _build_op(mesh: Any, order: tuple[int, ...], axis_name: str) -> Any:
+def _build_op(
+    mesh: Any,
+    order: tuple[int, ...],
+    axis_name: str,
+    *,
+    fp8_comm: bool = False,
+    fp8_static_scale: float | None = None,
+) -> Any:
     import jax
     from jax.sharding import PartitionSpec as P
     from torch_tpu._internal import pallas
@@ -90,7 +97,13 @@ def _build_op(mesh: Any, order: tuple[int, ...], axis_name: str) -> Any:
         make_reduce_scatter_fn,
     )
 
-    reduce_scatter = make_reduce_scatter_fn(mesh, order, axis_name=axis_name)
+    reduce_scatter = make_reduce_scatter_fn(
+        mesh,
+        order,
+        axis_name=axis_name,
+        fp8_comm=fp8_comm,
+        fp8_static_scale=fp8_static_scale,
+    )
 
     # torch_tpu reads the operand types from these annotations.
     def fn(x: jax.Array) -> jax.Array:
@@ -118,6 +131,19 @@ def prebuild_hier_reduce_scatter() -> bool:
     global _ARMED
     if _ARMED is not None or envs.TPU_MOE_EP_HIER_RS == "off":
         return _ARMED is not None
+    fp8 = envs.TPU_MOE_EP_HIER_RS == "fp8"
+    scale = envs.TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE
+    if scale is not None and scale <= 0:
+        raise ValueError(
+            f"TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE must be a positive number, got "
+            f"{scale}."
+        )
+    if fp8 and scale is None:
+        raise ValueError(
+            "TPU_MOE_EP_HIER_RS=fp8 needs TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE: the "
+            "row-streaming kernel has no dynamic scale. See "
+            "docs/reference/env_vars.md for how to choose it."
+        )
 
     from vllm_torchtpu.distributed.ep_mesh import (
         EP_AXIS_NAME,
@@ -144,12 +170,20 @@ def prebuild_hier_reduce_scatter() -> bool:
         return False
     assert mesh is not None and order is not None and ep is not None
 
-    op = _build_op(mesh, order, EP_AXIS_NAME)
+    op = _build_op(
+        mesh,
+        order,
+        EP_AXIS_NAME,
+        fp8_comm=fp8,
+        fp8_static_scale=scale if fp8 else None,
+    )
     _ARMED = _Armed(op=op, ranks=tuple(int(r) for r in ep.ranks))
     logger.info_once(
-        "MoE combine reduce-scatter runs on hierrs_tc: %d devices, ici_dtype=bf16, "
+        "MoE combine reduce-scatter runs on hierrs_tc: %d devices, ici_dtype=%s%s, "
         "rank at each mesh index=%s.",
         len(order),
+        envs.TPU_MOE_EP_HIER_RS,
+        f", static scale {scale}" if fp8 else "",
         order,
     )
     return True
