@@ -23,6 +23,13 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
+from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+    can_use_moe_lowtok,
+    moe_lowtok,
+)
+from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+    routing_table as moe_lowtok_routing_table,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -93,6 +100,32 @@ _COUNTING_SORT_BLOCK = 512
 # Ragged permute keeps the packed sort so SparseCore gather overlap is
 # unchanged, and past one block the scatter costs more than that sort.
 _COUNTING_SORT_SCATTER_MAX_ROWS = _COUNTING_SORT_BLOCK
+# The few-token kernel's row cap for routed ids, 0 while it is not armed: the
+# low-token MoE adapter sets it at weight load (set_lowtok_max_tokens), before
+# anything is traced.
+_MOE_LOWTOK_MAX_TOKENS = 0
+# The routing metadata construction of the non-EP path above the single-sort
+# row cap (prepare_routed_gmm_inputs' nonep_permute) that the grouped-matmul
+# MoE op is built with: "sorts" by default, so every model keeps the three
+# sorts; a model rule selects "two_sorts" before its kernels are built
+# (set_nonep_permute).
+NONEP_PERMUTE = "sorts"
+_NONEP_PERMUTES = ("sorts", "two_sorts")
+
+
+def set_nonep_permute(permute: str) -> None:
+    """Build the grouped-matmul MoE op with this non-EP routing metadata
+    construction ("sorts" or "two_sorts")."""
+    global NONEP_PERMUTE
+    if permute not in _NONEP_PERMUTES:
+        raise ValueError(f"unknown non-EP permute {permute!r}")
+    NONEP_PERMUTE = permute
+
+
+def set_lowtok_max_tokens(rows: int) -> None:
+    """Arm (rows > 0) or disarm (0) the few-token kernel for routed ids."""
+    global _MOE_LOWTOK_MAX_TOKENS
+    _MOE_LOWTOK_MAX_TOKENS = int(rows)
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -345,6 +378,7 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
+    nonep_permute: str = "sorts",
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -354,7 +388,14 @@ def prepare_routed_gmm_inputs(
     (inside this JIT) and marks non-local entries with a negative id which
     the mask filters out. Always running the masked branch keeps a single
     code path.
+
+    ``nonep_permute`` selects the metadata construction of the non-EP path
+    above the single-sort row cap: "sorts" (the forward permutation, its
+    inverse and a packed sort for the token ids) or "two_sorts" (the token
+    ids by division of the forward permutation).
     """
+    if nonep_permute not in _NONEP_PERMUTES:
+        raise ValueError(f"unknown non-EP permute {nonep_permute!r}")
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
     topk_weights_flat = topk_weights_local.flatten()
@@ -417,6 +458,16 @@ def prepare_routed_gmm_inputs(
         and (argsort_revert_indices is None or not packable)
         else None
     )
+    # The whole-expert path above the single-sort cap: one argsort for the
+    # forward permutation, then either a second argsort (its inverse) and a
+    # packed sort (the token ids), or the token ids by division.
+    if (
+        nonep_permute == "two_sorts"
+        and not use_ep
+        and sorted_indices is not None
+        and argsort_revert_indices is None
+    ):
+        token_indices_sorted = sorted_indices // topk
 
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
@@ -673,6 +724,8 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "num_primary_experts",
+        "nonep_permute",
     ),
 )
 def fused_moe_func(
@@ -693,6 +746,8 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    num_primary_experts: int | None = None,
+    nonep_permute: str = "sorts",
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -712,6 +767,17 @@ def fused_moe_func(
     weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
+
+    ``num_primary_experts`` bounds the shard's local interval when the weight
+    tensors hold more slots than the shard owns (an expert placement with copy
+    slots after the primaries, ``expert_placement``): without it the interval
+    is every local slot, and the next shard's first ids would be taken as
+    local and summed a second time. ``None`` (the default) is the full slot
+    count, the behaviour without a placement.
+
+    ``nonep_permute`` picks the routing metadata construction of the
+    whole-expert (non-EP) path (see ``prepare_routed_gmm_inputs``); the
+    default keeps the three sorts.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -746,11 +812,39 @@ def fused_moe_func(
         hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
         topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
 
+    owned = w1.shape[0]
     if use_ep and experts_start is not None:
+        owned = w1.shape[0] if num_primary_experts is None else num_primary_experts
+        if not 0 < owned <= w1.shape[0]:
+            raise ValueError("num_primary_experts must fit the local weight slots")
         local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
+        valid = (local_ids >= 0) & (local_ids < owned)
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    if (
+        _MOE_LOWTOK_MAX_TOKENS > 0
+        and use_ep
+        and experts_start is not None
+        and 0 < num_tokens <= _MOE_LOWTOK_MAX_TOKENS
+        and can_use_moe_lowtok(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    ):
+        logger.info_once(
+            "Selected experimental small-batch MoE (max tokens %d)",
+            _MOE_LOWTOK_MAX_TOKENS,
+        )
+        route = moe_lowtok_routing_table(topk_ids, topk_weights, owned)
+        return moe_lowtok(hidden_states, route, w1, w1_scale, w2, w2_scale)
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
@@ -768,7 +862,14 @@ def fused_moe_func(
     ):
         logger.info_once("Selected experimental dense-expert decode MoE")
         return dense_expert_moe(
-            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            num_primary_experts=owned,
         )
 
     (
@@ -782,12 +883,13 @@ def fused_moe_func(
         hidden_states,
         topk_ids,
         topk_weights,
-        local_num_experts=w1.shape[0],
+        local_num_experts=owned,
         topk=topk,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
+        nonep_permute=nonep_permute,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(

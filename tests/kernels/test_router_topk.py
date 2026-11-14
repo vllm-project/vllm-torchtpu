@@ -15,7 +15,7 @@
 
 ``interpret=True`` runs the kernel body on the host, so block splitting, the
 clamp and the tie rule are gated without a TPU. It does not gate Mosaic
-lowering.
+lowering, so the tie test also runs the compiled kernel on TPU (``tpu_test``).
 """
 
 import jax.numpy as jnp
@@ -147,6 +147,67 @@ def test_kernel_ties_and_nan_match_the_reference():
     assert np.isnan(kw[2]).all() and np.isnan(rw[2]).all()
     keep = [0, 1, 3]
     np.testing.assert_array_equal(kw[keep], rw[keep])
+
+
+TIE_TOPK = 8
+
+
+def _tied_scores(rows, experts, seed):
+    """Routing scores in [0, 1) whose first four rows hold the tie shapes.
+
+    Row 0 ties the top score between columns 7 and 3. Row 1 ties ranks
+    ``TIE_TOPK`` and ``TIE_TOPK + 1`` between the last column and column 5, so
+    the tie decides which expert is selected. Row 2 is a padded token, every
+    score equal. Row 3 ties twelve columns at the top, across the boundary.
+    The other rows are a float32 softmax of bf16 logits, where equal logits
+    give exactly equal scores.
+    """
+    rng = np.random.default_rng(seed)
+    logits = rng.standard_normal((rows, experts), dtype=np.float32) * 2.0
+    scores = torch.from_numpy(logits).to(torch.bfloat16).float().softmax(-1)
+    scores = scores.numpy().copy()
+    scores[:4] = rng.random((4, experts), dtype=np.float32) * 0.5
+    scores[0, [7, 3]] = 0.9
+    scores[1, 10 : 10 + TIE_TOPK - 1] = np.linspace(0.99, 0.7, TIE_TOPK - 1)
+    scores[1, [experts - 1, 5]] = 0.6
+    scores[2] = 1.0 / experts
+    scores[3, np.arange(12) * (experts // 12)] = 0.8
+    return scores
+
+
+def _lowest_column_topk(scores, k):
+    """Main's tie rule, independently: a stable sort keeps lower columns first."""
+    idx = np.argsort(-scores, axis=1, kind="stable")[:, :k].astype(np.int32)
+    return np.take_along_axis(scores, idx, axis=1), idx
+
+
+@pytest.mark.parametrize(
+    "interpret",
+    [
+        pytest.param(True, id="interpret"),
+        pytest.param(False, id="tpu", marks=pytest.mark.tpu_test),
+    ],
+)
+@pytest.mark.parametrize("experts", [128, 256])
+@pytest.mark.parametrize("rows", [16, 64])
+def test_ties_go_to_the_lowest_column(rows, experts, interpret):
+    """Tied scores select the lowest columns, compiled as well as interpreted.
+
+    The tie rule depends on how the index reduction lowers, which interpret
+    mode cannot show: one ``jnp.argmax`` per pass returned the lowest tied
+    column in interpret mode and the highest on TPU7x. The rows and expert
+    counts are decode-sized blocks of Qwen3-30B-A3B (128) and DeepSeek-V3
+    (256), top-8.
+    """
+    scores = _tied_scores(rows, experts, seed=rows * 1000 + experts)
+    rw, ri = _lowest_column_topk(scores, TIE_TOPK)
+    assert ri[0, :2].tolist() == [3, 7]
+    assert ri[1, TIE_TOPK - 1] == 5 and experts - 1 not in ri[1]
+    assert ri[2].tolist() == list(range(TIE_TOPK))
+    assert ri[3].tolist() == (np.arange(TIE_TOPK) * (experts // 12)).tolist()
+    kw, ki = select(jnp.asarray(scores), TIE_TOPK, interpret=interpret)
+    np.testing.assert_array_equal(np.asarray(ki), ri)
+    np.testing.assert_array_equal(np.asarray(kw), rw)
 
 
 @pytest.mark.parametrize(
