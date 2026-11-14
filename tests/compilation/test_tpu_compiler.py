@@ -52,7 +52,9 @@ class TestTpuCompilerCache:
                 prefix_match_unit=prefix_match_unit,
             ),
             model_config=SimpleNamespace(
-                max_model_len=4096, architecture="Qwen3_5MoeForCausalLM"
+                max_model_len=4096,
+                architecture="Qwen3_5MoeForCausalLM",
+                hf_config=None,
             ),
             scheduler_config=SimpleNamespace(
                 max_num_batched_tokens=2048,
@@ -64,6 +66,7 @@ class TestTpuCompilerCache:
                 prefill_context_parallel_size=1,
             ),
             speculative_config=None,
+            additional_config={},
         )
 
     def test_tpu_hash_covers_derived_shapes(self):
