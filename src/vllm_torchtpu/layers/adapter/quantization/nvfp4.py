@@ -184,6 +184,8 @@ def _prepare_moe_weights(layer, w13_scale_f, w2_scale_f, requant_block):
             w13, s13 = requant_load_kmajor_fp4(
                 fresh_buffer(w13), w13_scale_f, requant_block
             )
+            if w13.device.type == "tpu":
+                synchronize_tensors([w13, s13])
             w2, s2 = requant_load_kmajor_fp4(
                 fresh_buffer(w2), w2_scale_f, requant_block
             )
