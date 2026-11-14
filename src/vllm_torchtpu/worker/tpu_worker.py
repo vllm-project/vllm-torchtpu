@@ -92,6 +92,21 @@ def _release_free_host_heap() -> None:
         logger.info("Released free host heap via glibc malloc_trim.")
 
 
+def _release_jax_caches() -> None:
+    """Drop JAX's trace and lowering caches after warm-up (TPU_RELEASE_JAX_CACHES).
+
+    Every bucket is compiled by now and the Pallas kernels live inside those
+    programs, so the cached jaxprs are only needed if a kernel is traced again,
+    which then re-traces it once.
+    """
+    import jax
+
+    jax.clear_caches()
+    logger.info_once(
+        "TPU_RELEASE_JAX_CACHES=1: dropped JAX trace/lowering caches after warm-up."
+    )
+
+
 class TPUWorker(WorkerBase):
     def __init__(
         self,
@@ -789,6 +804,14 @@ class TPUWorker(WorkerBase):
         # allocator keeps their pages. Return them before initialize_from_config,
         # where a KV connector may allocate its host store.
         _release_free_host_heap()
+        if envs.TPU_HOST_HEAP_REPORT:
+            from vllm_torchtpu.worker import host_heap_report
+
+            logger.info(
+                "TPU_HOST_HEAP_REPORT=%d: host heap diagnostics on",
+                envs.TPU_HOST_HEAP_REPORT,
+            )
+            host_heap_report.report("loaded", self.rank)
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
@@ -800,15 +823,34 @@ class TPUWorker(WorkerBase):
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
+        heap_report = envs.TPU_HOST_HEAP_REPORT
+        if heap_report:
+            from vllm_torchtpu.worker import host_heap_report
+
+            host_heap_report.report("captured", self.rank)
         # torch records every compile artifact for save_cache_artifacts(), which
         # vLLM never calls; drop the record so its memory can be freed.
         CacheArtifactManager.clear()
+        if heap_report:
+            host_heap_report.report("artifacts-cleared", self.rank)
+            # Diagnostics must never stop the engine from starting.
+            try:
+                if heap_report >= 2 and self.rank in (0, 1):
+                    host_heap_report.census("warm", self.rank)
+                if heap_report >= 3:
+                    host_heap_report.experiments(self.rank, _release_free_host_heap)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("TPU_HOST_HEAP_REPORT diagnostics failed: %r", e)
+        if envs.TPU_RELEASE_JAX_CACHES:
+            _release_jax_caches()
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
         _release_free_host_heap()
+        if heap_report:
+            host_heap_report.report("released", self.rank)
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:

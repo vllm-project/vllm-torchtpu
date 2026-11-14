@@ -205,6 +205,8 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     TPU_RAIDEN_LRU_REFRESH: int = 0
+    TPU_HOST_HEAP_REPORT: int = 0
+    TPU_RELEASE_JAX_CACHES: bool = False
     TPU_RAIDEN_OFFLOAD_STATS: bool = False
     TPU_RAIDEN_FLUSH_REAL_REUSE: bool = False
     TPU_RAIDEN_LOSS_TRACE: bool = False
@@ -1306,6 +1308,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the finished request's resident leading chain (vLLM's CPU offload
     # manager touches at request finish). Scheduler-side, host-only.
     "TPU_RAIDEN_LRU_REFRESH": env_int("TPU_RAIDEN_LRU_REFRESH", 0),
+    # Host-heap diagnostics at worker start-up (worker/host_heap_report.py):
+    # 1 = RSS / tcmalloc / anon mappings, 2 = + Python heap census,
+    # 3 = + measure dropping start-up-only references. Host-only.
+    "TPU_HOST_HEAP_REPORT": env_int("TPU_HOST_HEAP_REPORT", 0),
+    # Drop JAX's tracing / lowering caches once warm-up has compiled every
+    # bucket. The Pallas kernels are already lowered into the compiled
+    # programs; the cached jaxprs only serve a re-trace. Frees ~0.9 GiB host
+    # per worker on MiniMax-M3.1 c48 (~7 GiB per host). Host-only.
+    "TPU_RELEASE_JAX_CACHES": env_bool("TPU_RELEASE_JAX_CACHES", default=False),
     # Periodic Raiden offload counters (stores offered/skipped/stored,
     # refreshed entries, cancelled stores, write-back drops by cause, host
     # lookups that miss a chain head while a later key is resident).
