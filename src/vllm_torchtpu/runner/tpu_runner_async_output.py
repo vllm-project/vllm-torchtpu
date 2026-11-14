@@ -24,6 +24,8 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+from vllm_torchtpu.spec_decode.eagle3 import _static_shape_args
+
 INVALID_TOKEN_ID = -1
 
 
@@ -92,6 +94,7 @@ class AsyncTPUCopyState:
     chunks_tpu: list[torch.Tensor] | None = None
     completed: bool = False
     _sampled_token_ids_cpu: torch.Tensor | None = None
+    _sampled_token_ids_list: list[list[int]] | None = None
     # Spec-decode step with logprobs requested: per-chunk logprobs, copied
     # with the tokens and filtered to the accepted rows in `get_output`.
     spec_logprobs: list[SpecLogprobsChunk] | None = None
@@ -157,6 +160,16 @@ class AsyncTPUCopyState:
                 self._sampled_token_ids_cpu = torch.cat(trimmed, dim=0)
         return self._sampled_token_ids_cpu
 
+    @property
+    def sampled_token_ids_list(self) -> list[list[int]]:
+        """Return the unpadded CPU token rows as nested Python lists (cached)."""
+        if self._sampled_token_ids_list is None:
+            t = self.sampled_token_ids_cpu
+            if t.dim() == 1:
+                t = t.unsqueeze(-1)
+            self._sampled_token_ids_list = t.tolist()
+        return self._sampled_token_ids_list
+
 
 @dataclass
 class AsyncPreResults:
@@ -210,17 +223,18 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             selected_token_ids = selected_token_ids.unsqueeze(-1)
 
         max_gen_len = selected_token_ids.shape[-1]
+        raw_rows = self.copy_state.sampled_token_ids_list
         if max_gen_len == 1:
-            valid_sampled_token_ids = selected_token_ids.tolist()
+            valid_sampled_token_ids = [row[:] for row in raw_rows]
             for i in self.discard_sampled_tokens_req_indices:
                 valid_sampled_token_ids[i].clear()
         else:
-            valid_mask = selected_token_ids != INVALID_TOKEN_ID
-            gen_lens = valid_mask.sum(dim=1).tolist()
+            invalid = INVALID_TOKEN_ID
             valid_sampled_token_ids = [
-                seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)
+                [tok for tok in row if tok != invalid] for row in raw_rows
             ]
             if self.copy_state.spec_logprobs:
+                gen_lens = [len(row) for row in valid_sampled_token_ids]
                 self._model_runner_output.logprobs = spec_logprobs_lists(
                     self.copy_state.spec_logprobs, gen_lens
                 )
@@ -333,3 +347,41 @@ def compute_num_rejected(
     num_reqs = num_draft.shape[0]
     num_valid = (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1)
     return (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_subtract_num_rejected_tokens(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return subtract_num_rejected_tokens(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+    )
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_extract_draft_token_ids(
+    input_ids: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> torch.Tensor:
+    return extract_draft_token_ids(input_ids, logits_indices, target_logits_indices)
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_pad_non_spec_next_tokens(
+    selected: torch.Tensor,
+    k: int,
+) -> torch.Tensor:
+    col0 = selected.reshape(-1, 1).to(torch.int32)
+    return torch.nn.functional.pad(col0, (0, k), value=INVALID_TOKEN_ID)
