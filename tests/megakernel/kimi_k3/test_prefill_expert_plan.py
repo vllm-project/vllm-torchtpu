@@ -117,3 +117,33 @@ def test_default_plan_is_valid():
     order = np.load(path)["order"]
     assert order.shape == (92, 896)
     assert all(sorted(row) == list(range(896)) for row in order.tolist())
+
+
+def test_planned_gate_up_reads_refuse_columns_spanning_more_than_e5m2_holds(tmp_path):
+    # uint8 E8M0 gate/up scales, one block of one column of pre-shard rank 4's
+    # expert 5 (chip 2's under the identity plan) a span plus one above the rest,
+    # in the second MoE layer: rank 4's read of that layer raises, the first
+    # layer's passes.
+    shape = (2, 112, 2, 512)
+    for rank in range(32):
+        directory = tmp_path / f"rank{rank:02d}"
+        directory.mkdir()
+        files = []
+        for index, (lo, hi) in enumerate(RANGES):
+            scales = np.full((hi - lo, *shape[1:]), 120, np.uint8)
+            if rank == 4 and index == 1:
+                scales[0, 5, 1, 7] = 120 + rl.E5M2_COLUMN_SPAN + 1
+            scales.tofile(directory / f"expert_gus_{index}.bin")
+            files.append(f"expert_gus_{index}.bin")
+        spec = {"shape": list(shape), "dtype": "uint8", "files": files}
+        spec["layer_ranges"] = [list(r) for r in RANGES]
+        index_json = {"rank": rank, "layers": LAYERS, "families": {"expert_gus": spec}}
+        (directory / "index.json").write_text(json.dumps(index_json))
+    order = np.tile(np.arange(896), (LAYERS - 1, 1))
+    rank_dir = rl.RankDir(str(tmp_path), 4, LAYERS)
+    (_, _, first), (_, _, second) = rl._planned_expert_parts(
+        str(tmp_path), rank_dir, "expert_gus", 4, order, LAYERS
+    )
+    assert first().max() == 120
+    with pytest.raises(ValueError, match="span more"):
+        second()
