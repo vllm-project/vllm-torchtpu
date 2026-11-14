@@ -163,3 +163,100 @@ def test_attend_and_merge_matches_dcp_reference(q_lens, ctx_lens, num_tokens, fp
         np.testing.assert_allclose(
             got[r][:num_real], np.asarray(want[r])[:num_real], rtol=2e-2, atol=2e-2
         )
+
+
+def _decode_plan(own, peer, seq_lens, cu, rank, pages_per_seq, pages_per_step):
+    """`msa_dcp._decode_plan_kernel` as a kernel of its own: ``(keys,
+    local_key, local_limit, work)``."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse
+
+    num_tokens = own.shape[0]
+    sections, length, tiles_per_step, groups_per_tile = (
+        msa_attention_lse.call_work_spec(
+            num_tokens, 2 * HL, jnp.bfloat16, TOPK, 8, pages_per_step
+        )
+    )
+    kernel = functools.partial(
+        msa_dcp._decode_plan_kernel, topk=TOPK, block_size=PAGE,
+        pages_per_seq=pages_per_seq, block_q=8,
+        work=dict(pages_per_step=pages_per_step, groups_per_tile=groups_per_tile,
+                  tiles_per_step=tiles_per_step, sections=sections),
+    )  # fmt: skip
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    i32 = jnp.int32
+    keys, local_key, local_limit, work = pl.pallas_call(
+        kernel,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)] + [vmem] * 4,
+        out_specs=[vmem] * 4,
+        out_shape=[
+            jax.ShapeDtypeStruct((num_tokens, TOPK), i32),
+            jax.ShapeDtypeStruct((num_tokens, 1), i32),
+            jax.ShapeDtypeStruct((num_tokens, 1), i32),
+            jax.ShapeDtypeStruct((1, length), i32),
+        ],
+        interpret=True,
+    )(jnp.asarray([rank], i32), own, peer, seq_lens[None], cu[None])
+    return keys, local_key, local_limit, work[0]
+
+
+@pytest.mark.parametrize("pages_per_step", [16, 32])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens,num_tokens",
+    [
+        ([8], [80000], 8),  # c4 b1
+        ([8, 8, 8], [3000, 129, 9000], 24),  # a request at a block edge
+        ([8, 8, 8, 8, 8, 5], [3000, 5000, 70, 300, 9000, 1], 48),  # padded tail
+    ],
+)
+def test_decode_plan_matches_xla(rank, q_lens, ctx_lens, num_tokens, pages_per_step):
+    """The decode plan's keys, local pages, limits and work list
+    (`msa_dcp._decode_plan_kernel`) equal the XLA path's
+    (`merge_candidates`, `token_positions`, `_packed_work`)."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_attention_lse
+
+    rng = np.random.default_rng(num_tokens + rank)
+    max_num_seqs, pages_per_seq = len(q_lens) + 2, 1024
+    seq_lens = np.zeros(max_num_seqs, np.int32)
+    seq_lens[: len(q_lens)] = np.array(ctx_lens) + np.array(q_lens)
+    cu = np.full(max_num_seqs + 1, sum(q_lens), np.int32)
+    cu[: len(q_lens) + 1] = np.concatenate([[0], np.cumsum(q_lens)])
+
+    def cands(parity):
+        # Distinct blocks of one rank's parity; tied scores; some missing.
+        blocks = np.stack(
+            [2 * rng.permutation(400)[:TOPK] + parity for _ in range(num_tokens)]
+        ).astype(np.float32)
+        scores = rng.integers(0, 6, (num_tokens, TOPK)).astype(np.float32)
+        gone = rng.random((num_tokens, TOPK)) < 0.15
+        scores[gone], blocks[gone] = -np.inf, -1
+        return jnp.asarray(np.concatenate([scores, blocks], axis=1))
+
+    own, peer = cands(rank), cands(1 - rank)
+    seq_lens, cu = jnp.asarray(seq_lens), jnp.asarray(cu)
+    got = _decode_plan(own, peer, seq_lens, cu, rank, pages_per_seq, pages_per_step)
+    selected = msa_dcp.merge_candidates(jnp.stack([own, peer]), TOPK)
+    seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu)
+    block = pos // PAGE
+    local_key = jnp.where(
+        valid & (block % DCP == rank), seq_id * pages_per_seq + block // DCP, -1
+    )
+    mine = (selected >= 0) & (selected % DCP == rank) & valid[:, None]
+    keys = jnp.where(mine, seq_id[:, None] * pages_per_seq + selected // DCP, -1)
+    work, _ = msa_attention_lse._packed_work(keys[None], 8, pages_per_step)
+    want = (keys, local_key[:, None], (pos % PAGE + 1)[:, None])
+    for g, w in zip(got[:3], want, strict=True):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+    # The same work list, its sections on 128-lane boundaries.
+    sections = msa_attention_lse.call_work_spec(
+        num_tokens, 2 * HL, jnp.bfloat16, TOPK, 8, pages_per_step
+    )[0]
+    at = 0
+    for start, n in sections:
+        np.testing.assert_array_equal(
+            np.asarray(got[3][start : start + n]), np.asarray(work[0, at : at + n])
+        )
+        at += n

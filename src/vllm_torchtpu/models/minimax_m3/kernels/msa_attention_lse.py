@@ -72,6 +72,7 @@ def _kernel(
     tiles_per_step: int = 1,
     groups_per_tile: int = 1,
     transposed: bool = False,
+    steps_per_call: int | None = None,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -99,7 +100,8 @@ def _kernel(
     Grid step ``b`` runs the groups ``block_start_ref[b] ..
     block_start_ref[b + 1] - 1`` of its `tiles_per_step` tiles in a loop
     (the last entry is the call's group count); the query, selection and
-    output blocks hold those tiles."""
+    output blocks hold those tiles. With `steps_per_call`, the grid runs
+    several calls' steps back to back and ``b`` counts within the call."""
     fp4 = fp4_rows is not None
     tail = refs[len(refs) - (9 if fp4 else 7) :]
     o_ref, lse_ref, m_ref, l_ref, acc_ref, buf_ref, sem_ref = tail[:7]
@@ -107,7 +109,8 @@ def _kernel(
     scale_buf_ref, scale_sem_ref = tail[7:] if fp4 else (None, None)
     pages_per_step = buf_ref.shape[1]
     ring = buf_ref.shape[0]  # prefetched groups + the running one
-    num_groups = block_start_ref[pl.num_programs(0)]
+    steps = pl.num_programs(0) if steps_per_call is None else steps_per_call
+    num_groups = block_start_ref[steps]
 
     def group(
         w,
@@ -432,6 +435,8 @@ def _kernel(
         return carry
 
     b = pl.program_id(0)
+    if steps_per_call is not None:
+        b = b % steps_per_call
     jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
 
 
@@ -480,6 +485,7 @@ def _attention_call(
     interpret,
     scale_cache=None,
     scale_rows=None,
+    calls=1,
 ):
     """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
     head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
@@ -488,44 +494,58 @@ def _attention_call(
     ``tile_offset`` (``int32[1]``): scalar-prefetch inputs, not statics, so
     one kernel serves every head and chunk, and no call slices its inputs.
 
-    ``work = (packed, num_groups)``: the call's `msa_attention._work_list`
-    as `_packed_work` packs it, and its group count.
+    ``work = (packed, tiles, tiles_per_step)``: the call's
+    `msa_attention._work_list` as `_packed_work` packs it.
 
     Writes those heads' and tokens' rows of ``(out [G * Hg, T, D], lse
     [G, T / Bq, 1, Hg * Bq])`` (a tile's lse a lane-dense row, ``h * Bq +
     t``): into `out` in place when given (an earlier call's
     result), else into new arrays whose other rows are unset. A 4-bit
     `kv_cache` takes its `scale_cache` and `scale_rows` (`_kernel`'s
-    `fp4_rows`)."""
+    `fp4_rows`).
+
+    ``calls > 1`` runs that many such calls in one grid, back to back:
+    ``head`` then holds each call's pair (``int32[2 * calls]``) and
+    ``packed`` each call's work list, end to end; `out` must be None."""
     num_q_heads, num_tokens, head_dim = q.shape
     num_heads = q_per_head
-    _, rows_per_page, packing, _ = kv_cache.shape
-    # One KV head's [K | V] slice of each row.
-    row_width = 2 * head_dim
     topk = selected.shape[2]
     packed, tiles, tiles_per_step = work
     groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
     num_steps = tiles // tiles_per_step
-    max_groups = tiles * groups_per_tile
-    union_len = max_groups * pages_per_step
+    sections, length = _work_layout(
+        tiles, groups_per_tile, pages_per_step, num_steps, aligned=False
+    )
+    if calls > 1 and out is not None:
+        raise ValueError("calls run in one grid write new outputs")
 
-    def kernel(packed_ref, *refs, **kwargs):
+    def kernel(packed_ref, page_table_ref, head_ref, *refs, **kwargs):
+        if calls > 1:
+            call = pl.program_id(0) // num_steps
+            base, head_ref = call * length, head_ref.at[pl.ds(2 * call, 2)]
+        else:  # static offsets: no address arithmetic on every work-list read
+            base = 0
+        unions, metas, counts, starts = (
+            packed_ref.at[pl.ds(base + at, n)] for at, n in sections
+        )
         return _kernel(
-            packed_ref.at[pl.ds(0, union_len)],
-            packed_ref.at[pl.ds(union_len, max_groups)],
-            packed_ref.at[pl.ds(union_len + max_groups, max_groups)],
+            unions,
+            metas,
+            counts,
+            page_table_ref,
+            head_ref,
             *refs,
-            block_start_ref=packed_ref.at[
-                pl.ds(union_len + 2 * max_groups, num_steps + 1)
-            ],
+            block_start_ref=starts,
+            steps_per_call=num_steps if calls > 1 else None,
             **kwargs,
         )
 
     def tile_block(b, packed, table, heads, offset):
-        return (offset[0] // tiles_per_step + b, 0)
+        return (offset[0] // tiles_per_step + (b % num_steps if calls > 1 else b), 0)
 
     def head_major_block(w, *prefetch):
-        return (prefetch[2][1], *tile_block(w, *prefetch))
+        call = w // num_steps if calls > 1 else 0
+        return (prefetch[2][2 * call + 1], *tile_block(w, *prefetch))
 
     def lse_block(w, *prefetch):
         return (*head_major_block(w, *prefetch), 0)
@@ -535,18 +555,9 @@ def _attention_call(
     fp4 = scale_rows is not None
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
     scale_inputs = (scale_cache,) if fp4 else ()
-    ring = 1 + (_FP4_PREFETCH if fp4 else 1)
-    scale_scratch = (
-        (
-            pltpu.VMEM((ring, pages_per_step, 1) + scale_cache.shape[1:], jnp.float32),
-            pltpu.SemaphoreType.DMA((ring, 1)),
-        )
-        if fp4
-        else ()
-    )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
-        grid=(num_steps,),
+        grid=(calls * num_steps,),
         in_specs=[
             pl.BlockSpec(
                 (num_heads, tiles_per_step * block_q, head_dim), head_major_block
@@ -564,28 +575,14 @@ def _attention_call(
             ),
             pl.BlockSpec((1, tiles_per_step, 1, num_heads * block_q), lse_block),
         ],
-        scratch_shapes=[
-            # m, l, acc: rows on sublanes for `attend`, lanes for `attend_t`.
-            *(
-                [
-                    pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
-                    pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
-                    pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
-                ]
-                if not transposed
-                else [
-                    pltpu.VMEM((1, num_heads * block_q), jnp.float32),
-                    pltpu.VMEM((1, num_heads * block_q), jnp.float32),
-                    pltpu.VMEM((head_dim, num_heads * block_q), jnp.float32),
-                ]
-            ),
-            pltpu.VMEM(
-                (ring, pages_per_step, 1, rows_per_page, packing, row_width),
-                kv_cache.dtype,
-            ),
-            pltpu.SemaphoreType.DMA((ring, 1)),
-            *scale_scratch,
-        ],
+        scratch_shapes=_kernel_scratch(
+            num_heads * block_q,
+            head_dim,
+            pages_per_step,
+            kv_cache,
+            scale_cache if fp4 else None,
+            transposed,
+        ),
     )
     num_inputs = 4 + 5 + len(scale_inputs)
     return pl.pallas_call(
@@ -637,6 +634,170 @@ def _attention_call(
     )
 
 
+def _kernel_scratch(rows, head_dim, pages_per_step, kv_cache, scale_cache, transposed):
+    """`_kernel`'s scratch: m, l, acc (rows on sublanes for `attend`, lanes
+    for `attend_t`), the page ring and its semaphores, and a 4-bit cache's
+    scale-page ring."""
+    _, rows_per_page, packing, _ = kv_cache.shape
+    ring = 1 + (_FP4_PREFETCH if scale_cache is not None else 1)
+    if transposed:
+        softmax = [(1, rows), (1, rows), (head_dim, rows)]
+    else:
+        softmax = [(rows, 1), (rows, 1), (rows, head_dim)]
+    scratch = [pltpu.VMEM(shape, jnp.float32) for shape in softmax]
+    scratch += [
+        pltpu.VMEM(
+            (ring, pages_per_step, 1, rows_per_page, packing, 2 * head_dim),
+            kv_cache.dtype,
+        ),
+        pltpu.SemaphoreType.DMA((ring, 1)),
+    ]
+    if scale_cache is not None:
+        scratch += [
+            pltpu.VMEM((ring, pages_per_step, 1) + scale_cache.shape[1:], jnp.float32),
+            pltpu.SemaphoreType.DMA((ring, 1)),
+        ]
+    return scratch
+
+
+def planned_attention(
+    q,
+    kv_cache,
+    page_table,
+    plan,
+    plan_scalars,
+    plan_inputs,
+    *,
+    topk,
+    sm_scale,
+    block_q,
+    pages_per_step,
+    interpret=False,
+    scale_cache=None,
+    scale_rows=None,
+):
+    """`msa_sparse_attention_lse` (one KV head, head-major q and results) of
+    a decode step whose selection, local pages and work list the kernel
+    computes itself in its first grid step: ``plan(plan_scalars_ref (SMEM),
+    *plan_input_refs, keys_ref [T, K], local_page_ref [T, 1], local_limit_ref
+    [T, 1], work_ref [1, length])`` (`msa_dcp._decode_plan_kernel`) writes
+    them into scratch, and the work list moves to SMEM there. One kernel in
+    place of a plan kernel and the attention kernel: each Pallas call costs
+    ~1 us plus ~0.2 us per operand (standalone bench j-97afc7d4). Returns
+    ``(out [H, T, D], lse [H, T])``."""
+    num_heads, num_tokens, head_dim = q.shape
+    num_tiles = num_tokens // block_q
+    sections, length, tiles_per_step, groups_per_tile = call_work_spec(
+        num_tokens, num_heads, q.dtype, topk, block_q, pages_per_step
+    )
+    rows = tiles_per_step * block_q
+    fp4 = scale_rows is not None
+    scale_inputs = (scale_cache,) if fp4 else ()
+
+    def kernel(table_ref, head_ref, offset_ref, scalars_ref, q_ref, *refs, **kwargs):
+        num_plan = len(plan_inputs)
+        plan_refs, refs = refs[:num_plan], refs[num_plan:]
+        refs, (keys, local_page, local_limit, work_v, work_s, sem) = (
+            refs[:-6],
+            refs[-6:],
+        )
+        b = pl.program_id(0)
+
+        @pl.when(b == 0)
+        def _plan():
+            plan(scalars_ref, *plan_refs, keys, local_page, local_limit, work_v)
+            copy = pltpu.make_async_copy(work_v.at[0], work_s, sem)
+            copy.start()
+            copy.wait()
+
+        unions, metas, counts, starts = (work_s.at[pl.ds(at, n)] for at, n in sections)
+        step = pl.ds(pl.multiple_of(b * rows, rows), rows)
+        return _kernel(
+            unions,
+            metas,
+            counts,
+            table_ref,
+            head_ref,
+            offset_ref,
+            q_ref,
+            keys.at[step],
+            local_page.at[step],
+            local_limit.at[step],
+            *refs,
+            block_start_ref=starts,
+            **kwargs,
+        )
+
+    def whole(x):
+        return pl.BlockSpec(x.shape, lambda b, *_: (0,) * x.ndim)
+
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=4,
+        grid=(num_tiles // tiles_per_step,),
+        in_specs=[
+            pl.BlockSpec((num_heads, rows, head_dim), lambda b, *_: (0, b, 0)),
+            *(whole(x) for x in plan_inputs),
+            pl.BlockSpec(memory_space=pl.ANY),
+            *(pl.BlockSpec(memory_space=pl.ANY) for _ in scale_inputs),
+        ],
+        out_specs=[
+            pl.BlockSpec((num_heads, rows, head_dim), lambda b, *_: (0, b, 0)),
+            pl.BlockSpec(
+                (1, tiles_per_step, 1, num_heads * block_q), lambda b, *_: (0, b, 0, 0)
+            ),
+        ],
+        scratch_shapes=_kernel_scratch(
+            num_heads * block_q,
+            head_dim,
+            pages_per_step,
+            kv_cache,
+            scale_cache if fp4 else None,
+            transposed=False,
+        )
+        + [
+            pltpu.VMEM((num_tokens, topk), jnp.int32),
+            pltpu.VMEM((num_tokens, 1), jnp.int32),
+            pltpu.VMEM((num_tokens, 1), jnp.int32),
+            pltpu.VMEM((1, length), jnp.int32),
+            pltpu.SMEM((length,), jnp.int32),
+            pltpu.SemaphoreType.DMA(()),
+        ],
+    )
+    out, lse = pl.pallas_call(
+        functools.partial(
+            kernel,
+            sm_scale=sm_scale,
+            tiles_per_step=tiles_per_step,
+            groups_per_tile=groups_per_tile,
+            **({"fp4_rows": scale_rows} if fp4 else {}),
+        ),
+        grid_spec=grid_spec,
+        out_shape=[
+            jax.ShapeDtypeStruct((num_heads, num_tokens, head_dim), q.dtype),
+            jax.ShapeDtypeStruct((1, num_tiles, 1, num_heads * block_q), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=msa_attention._VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+            disable_semaphore_checks=True,
+        ),
+        interpret=interpret,
+        name="minimax_m3_msa_planned_attention_lse",
+    )(
+        page_table,
+        jnp.zeros((2,), jnp.int32),
+        jnp.zeros((1,), jnp.int32),
+        plan_scalars,
+        q,
+        *plan_inputs,
+        kv_cache,
+        *scale_inputs,
+    )
+    lse = lse.reshape(num_tiles, num_heads, block_q).transpose(1, 0, 2)
+    return out, lse.reshape(num_heads, num_tokens)
+
+
 def _tiles_per_step(num_tiles: int, rows: int = 1, align: int = 1) -> int:
     """The most tiles (up to `TILES_PER_STEP`) a grid step can take evenly;
     with `align`, only counts whose `rows`-row tiles fill whole `align`-row
@@ -646,6 +807,47 @@ def _tiles_per_step(num_tiles: int, rows: int = 1, align: int = 1) -> int:
         for n in range(TILES_PER_STEP, 0, -1)
         if num_tiles % n == 0 and (n == 1 or n * rows % align == 0)
     )
+
+
+_LANES = 128
+
+
+def _work_layout(num_tiles, groups_per_tile, pages_per_step, num_steps, aligned):
+    """``((offset, length), ...)`` of a packed work list's sections,
+    ``[unions | meta words | counts | step starts]``, end to end or, when
+    `aligned`, each starting on a 128-lane boundary (so `store_work_list`
+    stores each whole), and the row's length."""
+    max_groups = num_tiles * groups_per_tile
+    sections, at = [], 0
+    for n in (max_groups * pages_per_step, max_groups, max_groups, num_steps + 1):
+        sections.append((at, n))
+        at += -(-n // _LANES) * _LANES if aligned else n
+    return tuple(sections), at
+
+
+def call_work_spec(num_tokens, num_q_heads, dtype, topk, block_q, pages_per_step):
+    """A one-head call's packed work list over ``num_tokens`` rows of
+    ``num_q_heads`` query heads, as `store_work_list` lays it out (aligned
+    sections): ``(sections, length, tiles_per_step, groups_per_tile)``."""
+    num_tiles = num_tokens // block_q
+    align = _merged_store_rows(block_q, num_q_heads, dtype)
+    tiles_per_step = _tiles_per_step(num_tiles, block_q, align)
+    groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+    sections, length = _work_layout(
+        num_tiles,
+        groups_per_tile,
+        pages_per_step,
+        num_tiles // tiles_per_step,
+        aligned=True,
+    )
+    return sections, length, tiles_per_step, groups_per_tile
+
+
+def fits_work_row(block_q, topk, pages_per_step) -> bool:
+    """Whether `store_work_list` can build a call's work list: a tile's keys
+    and its union row are one 128-lane row each."""
+    groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+    return block_q * topk == _LANES and groups_per_tile * pages_per_step == _LANES
 
 
 def _packed_work(selected, block_q, pages_per_step, align=1):
@@ -670,6 +872,108 @@ def _packed_work(selected, block_q, pages_per_step, align=1):
     bounds = jnp.arange(0, num_tiles + 1, tiles_per_step, dtype=jnp.int32)
     starts = jnp.sum(tile[:, None, :] < bounds[None, :, None], axis=2, dtype=jnp.int32)
     return jnp.concatenate([pages, meta, counts, starts], axis=1), tiles_per_step
+
+
+def _dense_unions(keys, num_tiles):
+    """`msa_attention._dense_unions` of each of the first `num_tiles` rows of
+    ``keys [rows, 128]`` (`_NO_PAGE` for no page), in VMEM."""
+    no_page = msa_attention._NO_PAGE
+    rows = keys.shape[0]
+    keys_t = keys.T  # [128, rows]: a tile's keys down the sublanes
+    iota = functools.partial(jax.lax.broadcasted_iota, jnp.int32)
+    sub, lane = iota((_LANES, _LANES), 0), iota((_LANES, _LANES), 1)
+    tile = iota((rows, _LANES), 0)
+    unions = jnp.full((rows, _LANES), no_page, jnp.int32)
+    for i in range(num_tiles):
+        x_r, x_c = keys[i : i + 1, :], keys_t[:, i : i + 1]
+        same = x_c == x_r  # [a, b]
+        seen_c = jnp.max(jnp.where(same & (lane < sub), 1, 0), axis=1, keepdims=True)
+        seen_r = jnp.max(jnp.where(same & (sub < lane), 1, 0), axis=0, keepdims=True)
+        first_c = (x_c != no_page) & (seen_c == 0)
+        first_r = (x_r != no_page) & (seen_r == 0)
+        # Each distinct page's slot in the ascending union.
+        place_c = jnp.sum(jnp.where(first_r & (x_r < x_c), 1, 0), axis=1, keepdims=True)
+        union = jnp.min(
+            jnp.where(first_c & (place_c == lane), x_c, no_page), axis=0, keepdims=True
+        )
+        unions = jnp.where(tile == i, union, unions)
+    return unions
+
+
+def store_work_list(
+    keys,
+    out_ref,
+    *,
+    num_tiles,
+    pages_per_step,
+    groups_per_tile,
+    tiles_per_step,
+    sections,
+):
+    """Inside a kernel: `_packed_work`'s row ``out_ref [1, length]`` for one
+    call of `num_tiles` tiles of 128 page keys each (``keys [rows, 128]``, a
+    tile per row, -1 for no page): the same values as
+    `msa_attention._work_list` (dense unions) and the step starts."""
+    no_page = msa_attention._NO_PAGE
+    rows = keys.shape[0]
+    iota = functools.partial(jax.lax.broadcasted_iota, jnp.int32)
+    tile_c, tile_r = iota((rows, 1), 0), iota((1, rows), 1)
+    unions = _dense_unions(jnp.where(keys < 0, no_page, keys), num_tiles)
+    present = jnp.where(unions != no_page, 1, 0)
+    pages_c = jnp.sum(present, axis=1, keepdims=True)
+    pages_r = jnp.sum(present.T, axis=0, keepdims=True)
+    unions = jnp.where(unions == no_page, -1, unions)
+    unions_at, _ = sections[0]
+    for i in range(num_tiles):
+        at = unions_at + i * _LANES
+        out_ref[:, at : at + _LANES] = unions[i : i + 1]
+
+    def groups_of(pages, real):
+        return jnp.where(real, jnp.maximum(-(-pages // pages_per_step), 1), 0)
+
+    real_c = tile_c < num_tiles
+    groups_c = groups_of(pages_c, real_c)
+    groups_r = groups_of(pages_r, tile_r < num_tiles)
+    ends_c = jnp.sum(
+        jnp.where(iota((rows, rows), 1) <= iota((rows, rows), 0), groups_r, 0),
+        axis=1,
+        keepdims=True,
+    )
+    total = jnp.sum(groups_r, axis=1, keepdims=True)  # [1, 1]
+    starts_c = ends_c - groups_c
+    big = jnp.iinfo(jnp.int32).max
+    first_at = jnp.where(real_c, starts_c, big)
+    end_at = jnp.where(real_c, ends_c, big)
+    (meta_at, max_groups), (counts_at, _), (steps_at, num_bounds) = sections[1:]
+    width = -(-max_groups // _LANES) * _LANES
+    w = iota((1, width), 1)
+    tile = jnp.sum(
+        jnp.where((tile_c >= 1) & (first_at <= w), 1, 0), axis=0, keepdims=True
+    )
+    start = jnp.max(jnp.where(first_at <= w, first_at, 0), axis=0, keepdims=True)
+    end = jnp.min(jnp.where(end_at > w, end_at, total), axis=0, keepdims=True)
+    tile_pages = jnp.max(
+        jnp.where((first_at <= w) & (end_at > w), pages_c, 0), axis=0, keepdims=True
+    )
+    group = jnp.clip(w - start, 0, groups_per_tile - 1)
+    count = jnp.clip(tile_pages - group * pages_per_step, 0, pages_per_step)
+    meta = (
+        ((tile * groups_per_tile + group) << msa_attention._ROW_SHIFT)
+        | jnp.where(w == start, msa_attention._FIRST_BIT, 0)
+        | jnp.where(w + 1 == end, msa_attention._LAST_BIT, 0)
+    )
+    in_list = w < max_groups
+    out_ref[:, meta_at : meta_at + width] = jnp.where(in_list, meta, 0)
+    out_ref[:, counts_at : counts_at + width] = jnp.where(in_list, count, 0)
+    # Step b starts at the groups of the tiles before its first one.
+    steps = -(-num_bounds // _LANES) * _LANES
+    bound = iota((1, steps), 1) * tiles_per_step
+    step_starts = jnp.sum(
+        jnp.where(real_c & (tile_c < bound), groups_c, 0), axis=0, keepdims=True
+    )
+    out_ref[:, steps_at : steps_at + steps] = jnp.where(
+        iota((1, steps), 1) < num_bounds, step_starts, 0
+    )
 
 
 def _chunked_call(
@@ -762,10 +1066,28 @@ def _chunked_call(
             (packed[i], step // block_q, tiles_per_step),
         )
 
-    out = head_chunk(0, None)
-    if num_heads * num_chunks > 1:
-        out = jax.lax.fori_loop(1, num_heads * num_chunks, head_chunk, out)
-    out, lse = out
+    if num_chunks == 1 and num_heads > 1:
+        # Every KV head's call in one grid (decode steps of several heads, DCP
+        # 8): no call's first pages wait unprefetched and no per-call slice.
+        heads = jnp.arange(num_heads, dtype=jnp.int32)
+        out, lse = call(
+            q,
+            kv_cache,
+            selected,
+            local_page,
+            local_limit,
+            page_table,
+            jnp.stack([first_head + heads, heads], axis=1).reshape(-1),
+            jnp.zeros((1,), jnp.int32),
+            None,
+            (packed.reshape(-1), step // block_q, tiles_per_step),
+            calls=num_heads,
+        )
+    else:
+        out = head_chunk(0, None)
+        if num_heads * num_chunks > 1:
+            out = jax.lax.fori_loop(1, num_heads * num_chunks, head_chunk, out)
+        out, lse = out
     # lse [head blocks, tiles, 1, Hg * Bq] -> [T, G * Hg] (or head-major)
     num_blocks, num_tiles = lse.shape[:2]
     if head_major:

@@ -231,75 +231,30 @@ def test_exchange_head_pages(live, lanes):
                 np.testing.assert_array_equal(got[rank, j, src, :n], want)
 
 
-def test_gather_by_permute_rank_order():
-    if len(jax.devices()) < DCP:
-        pytest.skip(
-            "needs 8 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)"
-        )
-    mesh = Mesh(np.asarray(jax.devices()[:DCP]), ("dcp",))
-    x = jnp.arange(DCP * 4, dtype=jnp.float32).reshape(DCP, 4)
-    f = jax.shard_map(
-        lambda r, x: msa_dcp.gather_by_permute(x[0], r[0], "dcp", DCP)[None],
-        mesh=mesh,
-        in_specs=(P("dcp"), P("dcp")),
-        out_specs=P("dcp"),
-        check_vma=False,
-    )
-    got = np.asarray(f(jnp.arange(DCP, dtype=jnp.int32), x))
-    for r in range(DCP):
-        np.testing.assert_array_equal(got[r], np.asarray(x))
-
-
-def test_all_to_all_by_permute_matches_all_to_all():
-    if len(jax.devices()) < DCP:
-        pytest.skip(
-            "needs 8 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)"
-        )
-    mesh = Mesh(np.asarray(jax.devices()[:DCP]), ("dcp",))
-    x = jnp.arange(DCP * DCP * 3, dtype=jnp.float32).reshape(DCP * DCP, 3)
-
-    def body(fn):
-        return jax.shard_map(
-            fn,
-            mesh=mesh,
-            in_specs=(P("dcp"), P("dcp")),
-            out_specs=P("dcp"),
-            check_vma=False,
-        )(jnp.arange(DCP, dtype=jnp.int32), x)
-
-    got = body(lambda r, x: msa_dcp.all_to_all_by_permute(x, r[0], "dcp", DCP))
-    want = body(lambda r, x: jax.lax.all_to_all(x, "dcp", 0, 0, tiled=True))
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-
-
-def test_exchange_partials_matches_all_to_all():
-    """The LSEs cross bit for bit (-inf and NaN included) beside the partials."""
+def test_swap_with_row_crosses_bits():
+    """A pair swaps 16-bit rows and a 32-bit extra bit for bit (-inf, NaN and
+    a subnormal included)."""
     if len(jax.devices()) < 2:
         pytest.skip("needs 2 devices")
     mesh = Mesh(np.asarray(jax.devices()[:2]), ("dcp",))
     rng = np.random.default_rng(0)
-    parts = jnp.asarray(rng.standard_normal((4, 8, 16, 128)), jnp.bfloat16)
-    lses = rng.standard_normal((4, 16, 8)).astype(np.float32)
-    lses[0, 0, 0], lses[1, 2, 3] = -np.inf, np.nan
-    lses = jnp.asarray(lses)
-
-    def run(fn):
-        return jax.shard_map(
-            fn,
-            mesh=mesh,
-            in_specs=(P("dcp"), P("dcp"), P("dcp")),
-            out_specs=(P("dcp"), P("dcp")),
-            check_vma=False,
-        )(jnp.arange(2, dtype=jnp.int32), parts, lses)
-
-    got = run(lambda r, p, s: msa_dcp._exchange_partials(p, s, r[0], "dcp", 2))
-    want = run(
-        lambda r, p, s: tuple(
-            jax.lax.all_to_all(x, "dcp", 0, 0, tiled=True) for x in (p, s)
-        )
-    )
-    for g, w in zip(got, want):
+    x = jnp.asarray(rng.standard_normal((2 * 8, 16, 128)), jnp.bfloat16)
+    extra = rng.standard_normal((2 * 16, 40)).astype(np.float32)
+    extra[0, 0], extra[17, 3], extra[5, 39] = -np.inf, np.nan, 1e-42
+    got_x, got_extra = jax.shard_map(
+        lambda a, b: msa_dcp._swap_with_row(a, jnp.asarray(b), "dcp"),
+        mesh=mesh,
+        in_specs=(P("dcp"), P("dcp")),
+        out_specs=(P("dcp"), P("dcp")),
+        check_vma=False,
+    )(x, jnp.asarray(extra))
+    halves = [slice(0, 8), slice(8, 16)], [slice(0, 16), slice(16, 32)]
+    for rank, peer in ((0, 1), (1, 0)):
         np.testing.assert_array_equal(
-            np.asarray(g).view(np.uint16 if g.dtype == jnp.bfloat16 else np.uint32),
-            np.asarray(w).view(np.uint16 if w.dtype == jnp.bfloat16 else np.uint32),
+            np.asarray(got_x)[halves[0][rank]].view(np.uint16),
+            np.asarray(x)[halves[0][peer]].view(np.uint16),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(got_extra)[halves[1][rank]].view(np.uint32),
+            extra[halves[1][peer]].view(np.uint32),
         )
