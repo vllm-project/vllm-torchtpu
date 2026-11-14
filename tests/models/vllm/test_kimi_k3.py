@@ -2633,3 +2633,161 @@ def test_kimi_k3_encoder_cudagraph_capture_rejects_budget_past_rope_table() -> N
         KimiK3ForConditionalGeneration.prepare_encoder_cudagraph_capture_inputs(
             stub, 1000, 1, 1, torch.device("cpu"), torch.float32
         )
+
+
+# Non-uniformly pruned checkpoints (e.g. nota-ai/Kimi-K3-Nota-Global-Pruned-50)
+# list each layer's routed expert count in `n_routed_experts_per_layer`; each MoE
+# layer is built with its own count, padded for expert parallelism.
+
+
+def _per_layer_config(counts: list[int]) -> KimiLinearConfig:
+    config = KimiLinearConfig(
+        hidden_size=16,
+        hidden_act="silu",
+        num_experts=max(counts),
+        num_experts_per_token=2,
+        num_shared_experts=0,
+        moe_intermediate_size=1024,
+    )
+    config.n_routed_experts_per_layer = counts
+    return config
+
+
+def _expert_parallel(monkeypatch: pytest.MonkeyPatch, tp: int, dp: int) -> None:
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True, tensor_parallel_size=tp, data_parallel_size=dp
+        )
+    )
+    monkeypatch.setattr(
+        kimi_moe, "get_current_vllm_config_or_none", lambda: vllm_config
+    )
+
+
+def test_per_layer_expert_counts_pad_to_the_expert_parallel_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _expert_parallel(monkeypatch, tp=4, dp=2)
+    config = _per_layer_config([0, 5, 16, 17])
+    assert [kimi_moe.layer_expert_counts(config, i) for i in (1, 2, 3)] == [
+        (5, 8),
+        (16, 16),
+        (17, 24),
+    ]
+    # A uniform checkpoint is built exactly as before, with no padding.
+    uniform = _per_layer_config([7])
+    del uniform.n_routed_experts_per_layer
+    assert kimi_moe.layer_expert_counts(uniform, 0) == (7, 7)
+
+
+def test_kimi_moe_builds_each_layer_with_its_padded_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeGate(nn.Module):
+        def __init__(self, *args, output_size: int, **kwargs) -> None:
+            super().__init__()
+            self.output_size = output_size
+
+    class FakeRunner(nn.Module):
+        def __init__(self, num_experts: int) -> None:
+            super().__init__()
+            self.routed_experts = nn.Module()
+            self.routed_experts.w13_weight = nn.Parameter(torch.ones(num_experts, 2))
+            self.routed_experts.w2_weight = nn.Parameter(torch.ones(num_experts, 2))
+            self.moe_config = SimpleNamespace()
+
+    fused_moe_args = {}
+
+    def fake_fused_moe(**kwargs):
+        fused_moe_args.update(kwargs)
+        return FakeRunner(kwargs["num_experts"])
+
+    _expert_parallel(monkeypatch, tp=8, dp=1)
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
+    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_fused_moe)
+    config = _per_layer_config([0, 9, 16])
+    padded = kimi_moe.KimiMoE(
+        config, quant_config=None, prefix="model.layers.1.block_sparse_moe"
+    )
+    assert (padded.num_experts_ckpt, padded.num_experts_padded) == (9, 16)
+    assert padded.gate.output_size == 16 and fused_moe_args["num_experts"] == 16
+    assert padded.gate.e_score_correction_bias.shape == (16,)
+    # Padding experts are never loaded, so their memory is zeroed.
+    assert not padded.experts.routed_experts.w13_weight.any()
+    exact = kimi_moe.KimiMoE(
+        config, quant_config=None, prefix="model.layers.2.block_sparse_moe"
+    )
+    assert (exact.num_experts_ckpt, exact.num_experts_padded) == (16, 16)
+    assert exact.experts.routed_experts.w13_weight.all()
+
+
+def test_router_weights_are_padded_so_padding_experts_are_never_routed() -> None:
+    n, n_pad, hidden = 9, 16, 4
+    prefix = "language_model.model.layers.1.block_sparse_moe"
+    weight, bias, expert = torch.randn(n, hidden), torch.randn(n), torch.randn(3, 3)
+    loaded = dict(
+        kimi_moe.pad_router_weights(
+            [
+                (f"{prefix}.gate.weight", weight),
+                (f"{prefix}.gate.e_score_correction_bias", bias),
+                (f"{prefix}.experts.0.w1.weight_packed", expert),
+                ("language_model.model.layers.2.block_sparse_moe.gate.weight", weight),
+            ],
+            {1: (n, n_pad)},
+        )
+    )
+    padded_weight = loaded[f"{prefix}.gate.weight"]
+    padded_bias = loaded[f"{prefix}.gate.e_score_correction_bias"]
+    assert padded_weight.shape == (n_pad, hidden) and padded_bias.shape == (n_pad,)
+    assert torch.equal(padded_weight[:n], weight) and torch.equal(padded_bias[:n], bias)
+    assert not padded_weight[n:].any()
+    # Selection uses sigmoid scores plus the correction bias: padding always loses.
+    scores = torch.sigmoid(torch.randn(1000, n_pad)) + padded_bias
+    assert bool((scores.topk(2, dim=-1).indices < n).all())
+    # Expert weights and layers without padding pass through untouched.
+    assert loaded[f"{prefix}.experts.0.w1.weight_packed"] is expert
+    assert (
+        loaded["language_model.model.layers.2.block_sparse_moe.gate.weight"] is weight
+    )
+
+
+def test_ep_weight_filter_reads_every_expert_a_rank_owns_in_any_layer() -> None:
+    from vllm.model_executor.model_loader.ep_weight_filter import (
+        compute_local_expert_ids,
+    )
+
+    counts, ep_size = [0, 5, 16, 17, 30], 8
+    for rank in range(ep_size):
+        ids = kimi_moe.per_layer_local_expert_ids(
+            compute_local_expert_ids, counts, ep_size, rank
+        )
+        for n in filter(None, counts):
+            n_pad = -(-n // ep_size) * ep_size
+            owned = set(
+                range(rank * n_pad // ep_size, (rank + 1) * n_pad // ep_size)
+            ) & set(range(n))
+            assert owned <= ids, (rank, n)
+        # still a filter: far fewer than every expert
+        assert len(ids) < max(counts)
+
+
+def test_ep_weight_filter_hook_installs_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.model_executor.model_loader import default_loader
+
+    calls = []
+
+    def stock(num_experts, ep_size, ep_rank, placement="linear"):
+        calls.append(num_experts)
+        per = num_experts // ep_size
+        return set(range(ep_rank * per, (ep_rank + 1) * per))
+
+    monkeypatch.setattr(default_loader, "compute_local_expert_ids", stock)
+    kimi_moe.install_per_layer_ep_weight_filter([0, 5, 16])
+    hooked = default_loader.compute_local_expert_ids
+    kimi_moe.install_per_layer_ep_weight_filter([0, 5, 16])
+    assert default_loader.compute_local_expert_ids is hooked
+    # rank 1 of 4: layer of 5 -> padded 8, owns 2-3; layer of 16 owns 4-7
+    assert hooked(16, 4, 1) == {2, 3, 4, 5, 6, 7}
+    assert sorted(calls) == [8, 16]
+    assert hooked(16, 1, 0) == stock(16, 1, 0)

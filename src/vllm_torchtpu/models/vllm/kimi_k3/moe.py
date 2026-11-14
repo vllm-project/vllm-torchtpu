@@ -15,7 +15,9 @@
 
 from __future__ import annotations
 
+import re
 import zlib
+from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -44,6 +46,100 @@ if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
         VllmCompressedTensorsW4ANMxfp4MoEMethod,
     )
+
+
+# Non-uniform expert pruning (e.g. nota-ai/Kimi-K3-Nota-Global-Pruned-50) keeps a
+# different number of routed experts in each layer, listed in the config's
+# `n_routed_experts_per_layer`. Each MoE layer is built with its own count, rounded
+# up to a multiple of the expert-parallel size so its experts split evenly across
+# ranks. Padding experts have zero weights and a router correction bias of
+# _PAD_BIAS, so routing never picks them.
+_PAD_BIAS = -1.0e4
+_ROUTER_RE = re.compile(
+    r"layers\.(\d+)\.block_sparse_moe\.gate\.(weight|e_score_correction_bias)$"
+)
+
+
+def layer_expert_counts(config: KimiLinearConfig, layer_idx: int) -> tuple[int, int]:
+    """Return a layer's routed expert count in the checkpoint and as built."""
+    per_layer = getattr(config, "n_routed_experts_per_layer", None)
+    if not per_layer:
+        n = int(config.num_experts)
+        return n, n  # a uniform checkpoint is built exactly as before
+    n = int(per_layer[layer_idx])
+    vllm_config = get_current_vllm_config_or_none()
+    par = vllm_config.parallel_config if vllm_config is not None else None
+    multiple = (
+        par.tensor_parallel_size * par.data_parallel_size
+        if par is not None and par.enable_expert_parallel
+        else 1
+    )
+    return n, -(-n // multiple) * multiple
+
+
+def per_layer_local_expert_ids(
+    compute: Callable[..., set[int] | None],
+    counts: Iterable[int],
+    ep_size: int,
+    ep_rank: int,
+    placement: str = "linear",
+) -> set[int] | None:
+    """Return the experts a rank reads from a checkpoint with per-layer counts.
+
+    `--enable-ep-weight-filter` gives each rank the experts that `compute` assigns
+    it out of one count for every layer. Here each layer is split by its own padded
+    count, so a rank owns a different range in each layer: it reads the union of
+    those ranges (about twice its share, instead of every expert).
+    """
+    ids: set[int] = set()
+    for n in {int(c) for c in counts if c}:
+        padded = -(-n // ep_size) * ep_size
+        local = compute(padded, ep_size, ep_rank, placement=placement)
+        if local is None:
+            return None
+        ids |= {i for i in local if i < n}
+    return ids
+
+
+def install_per_layer_ep_weight_filter(counts: list[int]) -> None:
+    """Make the loader's expert filter aware of per-layer counts (idempotent).
+
+    The counts are captured when the model is built: the loader computes the
+    filter later, outside the vLLM config context the layers are built in.
+    """
+    from vllm.model_executor.model_loader import default_loader
+
+    compute = default_loader.compute_local_expert_ids
+    if getattr(compute, "_kimi_per_layer", False):
+        return
+
+    def compute_local_expert_ids(
+        num_experts: int, ep_size: int, ep_rank: int, placement: str = "linear"
+    ) -> set[int] | None:
+        if ep_size <= 1:
+            return compute(num_experts, ep_size, ep_rank, placement=placement)
+        return per_layer_local_expert_ids(compute, counts, ep_size, ep_rank, placement)
+
+    compute_local_expert_ids._kimi_per_layer = True  # type: ignore[attr-defined]
+    default_loader.compute_local_expert_ids = compute_local_expert_ids
+
+
+def pad_router_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    padded: dict[int, tuple[int, int]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Pad router rows (zeros) and correction biases (_PAD_BIAS) to built counts."""
+    for name, tensor in weights:
+        m = _ROUTER_RE.search(name)
+        if m is not None and int(m.group(1)) in padded:
+            n, n_pad = padded[int(m.group(1))]
+            if n_pad > n and tensor.shape[0] == n:
+                fill = 0.0 if m.group(2) == "weight" else _PAD_BIAS
+                pad = torch.full(
+                    (n_pad - n, *tensor.shape[1:]), fill, dtype=tensor.dtype
+                )
+                tensor = torch.cat([tensor, pad], dim=0)
+        yield name, tensor
 
 
 class KimiRoutedOutputTransform(nn.Module):
@@ -79,6 +175,14 @@ class KimiMoE(nn.Module):
         assert config.moe_intermediate_size is not None
 
         self.prefix = prefix
+        layer_match = re.search(r"layers\.(\d+)\.", prefix)
+        self.layer_idx = int(layer_match.group(1)) if layer_match else -1
+        self.num_experts_ckpt, self.num_experts_padded = layer_expert_counts(
+            config, self.layer_idx
+        )
+        if getattr(config, "n_routed_experts_per_layer", None):
+            install_per_layer_ep_weight_filter(list(config.n_routed_experts_per_layer))
+        num_experts = self.num_experts_padded
         hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
         vllm_config = get_current_vllm_config_or_none()
@@ -95,14 +199,12 @@ class KimiMoE(nn.Module):
 
         self.gate = GateLinear(
             input_size=hidden_size,
-            output_size=config.num_experts,
+            output_size=num_experts,
             bias=False,
             out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
-        self.gate.e_score_correction_bias = nn.Parameter(
-            torch.zeros(config.num_experts)
-        )
+        self.gate.e_score_correction_bias = nn.Parameter(torch.zeros(num_experts))
 
         # Replicated by default; sharded across a chip's cores under
         # TPU_LATENT_PROJ_INTRA_CHIP_TP. These two are the model's largest
@@ -189,7 +291,7 @@ class KimiMoE(nn.Module):
         with hierarchical_moe_parallel_config():
             self.experts = FusedMoEFactory(
                 shared_experts=self.shared_experts,
-                num_experts=config.num_experts,
+                num_experts=num_experts,
                 top_k=config.num_experts_per_token,
                 hidden_size=expert_hidden_size,
                 intermediate_size=padded_intermediate_size,
@@ -214,6 +316,11 @@ class KimiMoE(nn.Module):
             self.experts.routed_experts.quant_method, "apply_with_routing"
         ):
             raise ValueError("K3 SP prefill requires the native MXFP4 MoE backend")
+        if self.num_experts_padded > self.num_experts_ckpt:
+            # Padding experts are never routed to; zero them so their memory
+            # holds no stray values.
+            for param in self.experts.routed_experts.parameters():
+                param.data.zero_()
         if padded_intermediate_size != config.moe_intermediate_size:
             routed_experts = self.experts.routed_experts
             w13_weight = getattr(routed_experts, "w13_weight", None)
