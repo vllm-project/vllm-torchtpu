@@ -706,6 +706,10 @@ def _patch_qwen3_next_sequence_parallel_by_rows() -> None:
             return original_attention_forward(self, positions, hidden_states)
         proj = self.qkv_proj
         bias = None if proj.skip_bias_add else proj.bias
+        if not hasattr(proj.quant_method, "apply_prequant"):
+            raise NotImplementedError(
+                f"{type(proj.quant_method).__name__} does not implement "
+                "apply_prequant")
         qkv = proj.quant_method.apply_prequant(proj, prequant[0], prequant[1],
                                                bias)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
@@ -845,6 +849,7 @@ def _patch_qwen3_next_sequence_parallel_by_rows() -> None:
     for layer_cls in layer_classes:
         if "__init__" in vars(layer_cls):
             layer_cls.__init__ = with_rank_buffer(layer_cls.__init__)
+        layer_cls.forward = forward
     cls.forward = forward
     cls._tpu_sp_by_rows_patch = True
     logger.info("Applied TPU patch: sequence parallelism by rows (>= %d).",

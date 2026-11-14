@@ -173,6 +173,7 @@ def calculate_block_sizes(
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
     decode_query_size: int = 1,
+    decode_batch_size: int | None = None,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
     """Calculate optimal block size for decode and prefill."""
 
@@ -370,7 +371,8 @@ def calculate_block_sizes(
     # Default to triple buffer as its almost always beneficial.
     n_buffer = 3
     # Fixed value based on experimental results.
-    decode_batch_size = 8
+    if decode_batch_size is None:
+        decode_batch_size = 8
     prefill_batch_size = 2
     decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer,
                                                decode_query_size)
@@ -392,6 +394,7 @@ def calculate_block_sizes(
         "decode_block_sizes",
         "prefill_block_sizes",
         "vmem_limit_bytes",
+        "decode_batch_size",
         "debug_mode",
         "out_dtype",
         "use_causal_mask",
@@ -428,6 +431,7 @@ def ragged_paged_attention(
     decode_block_sizes: configs.BlockSizes | None = None,
     prefill_block_sizes: configs.BlockSizes | None = None,
     vmem_limit_bytes: int | None = None,
+    decode_batch_size: int | None = None,
     debug_mode: bool = False,
     out_dtype: jnp.dtype | None = None,
     use_causal_mask: bool = True,
@@ -554,6 +558,7 @@ def ragged_paged_attention(
         serve_cfgs,
         vmem_limit_bytes,
         decode_query_size=decode_query_size,
+        decode_batch_size=decode_batch_size,
     )
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None

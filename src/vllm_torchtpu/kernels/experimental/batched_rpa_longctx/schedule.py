@@ -24,8 +24,12 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import pallas_compat
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
                                                                     utils)
+
+# Words of the `actual_steps` field; see RpaSchedule.create_shape_dtype.
+ACTUAL_STEPS_WORDS = configs.ACTUAL_STEPS_WORDS
 
 
 class FieldOffset:
@@ -214,7 +218,7 @@ class RpaSchedule:
     total_wait_q_in: SmemWrapper  # [steps]
     total_wait_o_out: SmemWrapper  # [steps]
     total_wait_lse_out: SmemWrapper  # [steps]
-    actual_steps: Any  # [1]
+    actual_steps: Any  # [ACTUAL_STEPS_WORDS]; [0] holds the step count.
 
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
@@ -256,7 +260,13 @@ class RpaSchedule:
             total_wait_q_in=steps_wrapper,
             total_wait_o_out=steps_wrapper,
             total_wait_lse_out=steps_wrapper,
-            actual_steps=jax.ShapeDtypeStruct((1, ), jnp.int32),
+            # Padded to ACTUAL_STEPS_WORDS (> 1) words so XLA's
+            # ShapeUtil::IsEffectiveScalar is False for this SMEM operand of
+            # rpa_kernel: it is then fetched by the kernel's batched SMEM operand
+            # DMA instead of a synchronous HBM->VMEM->vreg->v2sf->sreg caller
+            # stub (dma.simple + vwait + vld + vpush/spop) before every call.
+            actual_steps=jax.ShapeDtypeStruct((ACTUAL_STEPS_WORDS, ),
+                                              jnp.int32),
             cfgs=cfgs,
         )
 
@@ -292,7 +302,9 @@ class RpaSchedule:
         """Returns a Pytree of input BlockSpecs."""
 
         def wrapper(x):
-            if x.size == 1:
+            if x is None:
+                return None
+            if getattr(x, "size", None) == 1:
                 return pl.BlockSpec(memory_space=pltpu.SMEM)
             else:
                 # Since we use maximum upper bound when allocating scheduler data,
@@ -360,10 +372,11 @@ def _write_schedule_to_hbm(
     hbm_offset_aligned = pl.multiple_of(hbm_offset, 128)  # pytype: disable=bad-argument-type
     flat_hbm = jax.tree_util.tree_leaves(schedule_hbm)
     flat_smem = jax.tree_util.tree_leaves(schedule_smem)
+    actual_steps_hbm = schedule_hbm.actual_steps
     dma_list = []
     for h, s in zip(flat_hbm, flat_smem):
         element_size = s.shape[0] // cfgs.max_steps_ub
-        if h.shape[0] > 1:
+        if h is not actual_steps_hbm:
             write_size = num_steps * element_size
             write_size = utils.align_to(write_size, 128)
             output_offset = hbm_offset_aligned * element_size
@@ -371,15 +384,16 @@ def _write_schedule_to_hbm(
             write_size = h.shape[0]
             output_offset = 0
 
-        copy = pltpu.make_async_copy(
+        copy = pallas_compat.make_async_copy(
             s.at[pl.ds(0, write_size)],
             h.at[pl.ds(output_offset, write_size)],
             dma_sem.at[0],
         )
         dma_list.append(copy)
 
-    jax.tree.map(lambda x: x.start(), dma_list)
-    jax.tree.map(lambda x: x.wait(), dma_list)
+    jax.tree.map(lambda x: x.start(priority=1, strict_ordering=False),
+                 dma_list)
+    jax.tree.map(lambda x: x.wait(strict_ordering=False), dma_list)
 
 
 def _compute_waits(
@@ -494,7 +508,7 @@ def flush_to_hbm(
         schedule,
         schedule_hbm_ref,
         hbm_offset,
-        cfgs.max_steps_ub,
+        jnp.maximum(1, last_step // cfgs.batch_size),
         dma_sem,
         cfgs=cfgs,
     )
@@ -864,6 +878,8 @@ def rpa_metadata_schedule_kernel(
     hbm_offset = loop_carry.hbm_offset
     steps = pl.cdiv(count, cfgs.batch_size) + hbm_offset
     schedule_ref.actual_steps[0] = steps
+    for i in range(1, ACTUAL_STEPS_WORDS):
+        schedule_ref.actual_steps[i] = 0
     # Step 3: Mask out unvisited steps.
     flush_to_hbm(
         count,

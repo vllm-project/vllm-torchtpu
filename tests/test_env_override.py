@@ -123,6 +123,46 @@ def test_user_flag_wins(libtpu_flags):
 
 def test_chip_family_comes_only_from_tpu_type_or_metadata(libtpu_flags):
     """Other variables that name a chip (such as a benchmark harness's
-    target) are not read."""
-    flags = libtpu_flags({"HIEREVO_TARGET_NAME": "tpu7x"})
-    assert _sc_flags(flags) == {}
+    target) or generic topology variables are not read and never write
+    TPU_ACCELERATOR_TYPE."""
+    for env in (
+        {
+            "HIEREVO_TARGET_NAME": "tpu7x"
+        },
+        {
+            "TPU_NAME": "my-v7x-node"
+        },
+        {
+            "TORCH_TPU_TOPOLOGY": "2x2x1"
+        },
+        {
+            "BORG_TPUNETD_ARGS": "--foo"
+        },
+    ):
+        flags = libtpu_flags(env)
+        assert _sc_flags(flags) == {}
+
+
+def test_qwen35_35b_tuned_defaults_opt_in(monkeypatch, libtpu_flags):
+    """Qwen3.5-35B tuned defaults are off by default on TPU7x and enabled
+    only when VLLM_TPU_QWEN35_35B_TUNED_DEFAULTS=1, without duplicate flags."""
+    monkeypatch.setitem(
+        sys.modules,
+        "requests",
+        SimpleNamespace(
+            get=lambda *a, **kw: SimpleNamespace(status_code=404, text="")),
+    )
+    with mock.patch.dict(os.environ, {"TPU_ACCELERATOR_TYPE": "tpu7x-8"},
+                         clear=True):
+        importlib.reload(env_override)
+        assert "TPU_SP_MIN_ROWS" not in os.environ
+        assert "TPU_MOE_LOWTOK_SCORES_STRICT" not in os.environ
+
+    flags = libtpu_flags({
+        "TPU_ACCELERATOR_TYPE": "tpu7x-8",
+        "VLLM_TPU_QWEN35_35B_TUNED_DEFAULTS": "1",
+    })
+    flag_names = [name for name, _ in flags]
+    assert len(flag_names) == len(set(flag_names))
+    assert dict(flags)[_AG_MIN] == "262144"
+    assert dict(flags)[_AR_OFFLOAD] == "false"
