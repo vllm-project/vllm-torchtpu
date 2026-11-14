@@ -60,6 +60,11 @@ _TILE_M = 128
 _SMEM_OVERHEAD_BYTES = 236 * 1024
 FUSED_MOE_EP_OP_NAME = "pallas::adaptive_fused_moe"
 FUSED_MOE_EP_OP_ATTR = "_adaptive_fused_moe_op"
+# The token-sharded variant a model runs on its sequence-parallel steps,
+# prebuilt next to the layer's own op when the layer sets
+# SEQUENCE_PARALLEL_VARIANT_ATTR (see prebuild_sequence_parallel_variant).
+FUSED_MOE_EP_SP_OP_ATTR = "_adaptive_fused_moe_op_sp"
+SEQUENCE_PARALLEL_VARIANT_ATTR = "adaptive_moe_sequence_parallel_variant"
 _OPS: dict[tuple, torch.library.CustomOpDef] = {}
 _RANK_BUFFER: Any = None
 
@@ -86,8 +91,12 @@ def prebuild_adaptive_fused_moe(
     *,
     weights: PreparedWeights | None = None,
     rhs_qb: int | None = None,
+    sequence_parallel: bool | None = None,
 ) -> torch.library.CustomOpDef:
     """Build the selected experimental path, raising on every refusal.
+
+    ``sequence_parallel`` overrides the layer's MoE sequence parallelism:
+    True builds the variant whose rows are each rank's own tokens.
 
     Weights must already be in the K-major runtime layout. FP4 format and
     contraction block size are inferred from their dtype and scale shapes.
@@ -166,7 +175,11 @@ def prebuild_adaptive_fused_moe(
     _RANK_BUFFER = torch.tensor(
         [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
     )
-    groups = ep_token_replica_groups(is_sequence_parallel=parallel.is_sequence_parallel)
+    groups = ep_token_replica_groups(
+        is_sequence_parallel=parallel.is_sequence_parallel
+        if sequence_parallel is None
+        else sequence_parallel
+    )
     op = _build_op(
         mesh,
         topk,
@@ -518,9 +531,12 @@ def run_adaptive_fused_moe(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     router_logits: torch.Tensor,
+    attr: str = FUSED_MOE_EP_OP_ATTR,
 ) -> torch.Tensor:
-    """Execute a successfully prebuilt experimental op, or raise."""
-    op = getattr(owner, FUSED_MOE_EP_OP_ATTR, None)
+    """Execute a successfully prebuilt experimental op, or raise.
+
+    ``attr`` names the op on ``owner``; the default is the layer's own."""
+    op = getattr(owner, attr, None)
     if op is None:
         raise RuntimeError("adaptive fused MoE was not prebuilt for this layer")
     if w1.dtype == torch.float4_e2m1fn_x2:
@@ -550,4 +566,31 @@ def run_adaptive_fused_moe(
         _squeeze_channel_scale_checked(w2_scale),
         router_logits,
         _RANK_BUFFER,
+    )
+
+
+def prebuild_sequence_parallel_variant(
+    owner: Any, layer: RoutedExperts, topk: int, renormalize: bool, activation: str
+) -> None:
+    """Prebuild the token-sharded variant on ``owner`` if the layer opts in.
+
+    A model that runs some steps sequence-parallel (each rank holds its own
+    tokens) sets SEQUENCE_PARALLEL_VARIANT_ATTR on its MoE layers and calls
+    ``run_adaptive_fused_moe(..., attr=FUSED_MOE_EP_SP_OP_ATTR)`` on those
+    steps. Layers that are sequence-parallel already need no variant.
+    """
+    if not getattr(layer, SEQUENCE_PARALLEL_VARIANT_ATTR, False):
+        return
+    if layer.moe_config.moe_parallel_config.is_sequence_parallel:
+        return
+    setattr(
+        owner,
+        FUSED_MOE_EP_SP_OP_ATTR,
+        prebuild_adaptive_fused_moe(
+            layer,
+            topk=topk,
+            renormalize=renormalize,
+            activation=activation,
+            sequence_parallel=True,
+        ),
     )
