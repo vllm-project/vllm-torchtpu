@@ -16,7 +16,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.distributed.parallel_state import get_ep_group, get_tp_group
+from vllm.distributed.parallel_state import get_ep_group, get_pp_group, get_tp_group
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_torchtpu import envs
@@ -53,7 +53,7 @@ from .pd import (
     skipped_source_pages,
     suffix_pages,
 )
-from .pd_identity import canonical_rank_identity, merged_identity
+from .pd_identity import canonical_rank_identity, merged_identity, merged_records
 from .pd_manifest import build_transfer_manifest, measure_transfer_layout
 
 logger = init_logger(__name__)
@@ -950,6 +950,20 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         checkpoint = model.pd_loaded_weight_identity
         ple_checkpoint = model.pd_loaded_ple_identity
         weight_records = model.pd_loaded_weight_records
+        pp_group = get_pp_group() if parallel.pipeline_parallel_size > 1 else None
+        if weight_records is not None and pp_group is not None and pp_group.world_size > 1:
+            # A pipeline stage that streamed only its own layers (Exos
+            # EXOS_WEIGHT_LOAD_FILTER=pd) identifies the union the stages
+            # loaded: the digest a stage that streamed the whole checkpoint
+            # reports, since load_weights observes other stages' tensors too.
+            gathered_pp: list[Any] = [None] * pp_group.world_size
+            torch.distributed.all_gather_object(
+                gathered_pp, weight_records, group=pp_group.cpu_group
+            )
+            weight_records = merged_records(gathered_pp)
+            del gathered_pp
+            checkpoint = merged_identity([weight_records])
+            ple_checkpoint = merged_identity([weight_records], name_fragment=".ple.")
         if weight_records is not None and group.world_size > 1:
             # Under --enable-ep-weight-filter each rank loads only its own
             # experts: identify the union the group loaded, not each share.

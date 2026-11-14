@@ -53,12 +53,22 @@ def merged_identity(
 ) -> str:
     """Digest of the union of the tensors a group of ranks loaded.
 
-    With load-time filtering (``--enable-ep-weight-filter``) each rank reads
-    only the experts it owns, so per-rank digests differ even though the ranks
-    together consumed the whole checkpoint. Merging the per-tensor records
-    first gives the digest one rank that loaded every tensor would report, and
-    a tensor two ranks loaded with different bytes is still rejected.
+    With load-time filtering (``--enable-ep-weight-filter``, or a pipeline
+    stage that streams only its own layers) each rank reads only its share, so
+    per-rank digests differ even though the ranks together consumed the whole
+    checkpoint. Merging the per-tensor records first gives the digest one rank
+    that loaded every tensor would report, and a tensor two ranks loaded with
+    different bytes is still rejected.
     """
+    merged = merged_records(per_rank_records, name_fragment=name_fragment)
+    payload = json.dumps(merged, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def merged_records(
+    per_rank_records: Iterable[dict], *, name_fragment: str | None = None
+) -> dict[str, tuple[str, tuple[int, ...], str]]:
+    """Union of per-rank ``(dtype, shape, sha256)`` records (see merged_identity)."""
     merged: dict = {}
     loaded = False
     for records in per_rank_records:
@@ -74,8 +84,7 @@ def merged_identity(
     # still digests the empty set, as finish() always did.
     if not loaded:
         raise ValueError("PD identity requires successfully loaded checkpoint tensors")
-    payload = json.dumps(merged, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()
+    return merged
 
 
 def canonical_rank_identity(records: list[dict], *, world_size: int) -> dict:
