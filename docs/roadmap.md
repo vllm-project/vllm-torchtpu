@@ -41,6 +41,7 @@ For what is supported **today**, see [Supported Models & Features](user_guide/su
 | :--- | :--- | :--- |
 | **DeepSeek V4 Readiness** | Frontier Model Expansion | Deliver Day-0 functional support, kernel performance optimization, and official AgentX benchmark submissions for DeepSeek V4. |
 | **Smart Caching, Routing & Memory Tiers** | Advanced Serving | Roll out prefix-aware, cache-aware, and session-aware routing alongside dynamic length bucketing, llm-d TPU memory-tier routing, and ecosystem-driven KV-cache backends. |
+| **RL: verl & TorchTitan Integration, Low-Precision Rollouts, Numerical Parity & Shared KV Cache** | Reinforcement Learning | Efficient end-to-end RL integration with [verl](https://github.com/volcengine/verl) and [TorchTitan](https://github.com/pytorch/torchtitan); full FP8 and FP4 RL rollouts; trainer/sampler numerical parity (router replay, FP32 `lm_head`, FP32 router top-k) with a reproducible parity check benchmark; and a shared KV-cache pool for RL rollouts. |
 
 ---
 
