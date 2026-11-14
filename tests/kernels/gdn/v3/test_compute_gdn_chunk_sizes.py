@@ -199,9 +199,11 @@ def test_chunked_gdn_padding_leaves_newest_write_undecayed(chunk, real_size):
                                     a_log, dt_bias)
     _, expected_state = _gdn_reference(q, k, v, b, a, state, a_log, dt_bias,
                                        real_size, cfg.v_per_kq_head)
+    # fp32 rounding of the write itself is about 2e-7 of its peak. A loose
+    # tolerance such as 1e-4 hides the regrouped sum's error entirely.
     np.testing.assert_allclose(
         new_state[0, 0],
         expected_state,
-        rtol=1e-4,
-        atol=1e-4,
+        rtol=0,
+        atol=5e-7 * np.abs(expected_state).max(),
     )

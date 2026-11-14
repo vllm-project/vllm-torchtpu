@@ -127,19 +127,18 @@ def chunked_gdn_per_seq(
 ) -> tuple[jax.Array, jax.Array]:
     """Perform chunked GDN over input [num_heads, chunk, head_dim]."""
 
-    # Compute cumulative sum of decay via logarithmic tree prefix sum.
+    # Compute cumulative sum of decay.
+    # NOTE: Keep this a running sum. Rows past real_sizes add an exact 0, so
+    # the last row equals the last real row and the newest token's write is
+    # not decayed at all. A log-depth tree regroups the terms per row, so the
+    # last row is off by a few ulps of the summed decay, which made the state
+    # of a partial tile up to 20x less accurate.
+    # [1, 1, num_v_heads]
+    g_cum_sum_list = [gating_log[:, :1]]
+    for row in range(1, cfg.chunk_size):
+        g_cum_sum_list.append(g_cum_sum_list[-1] + gating_log[:, row:row + 1])
     # [1, chunk, num_v_heads]
-    g_cum_sum_log = gating_log
-    step = 1
-    while step < cfg.chunk_size:
-        g_cum_sum_log = jnp.concat(
-            [
-                g_cum_sum_log[:, :step],
-                g_cum_sum_log[:, step:] + g_cum_sum_log[:, :-step],
-            ],
-            axis=1,
-        )
-        step <<= 1
+    g_cum_sum_log = jnp.concat(g_cum_sum_list, axis=1)
 
     # [num_v_heads, chunk, 1]
     g_cum_sum_log = fused_transpose_broadcast(g_cum_sum_log,
