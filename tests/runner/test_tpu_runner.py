@@ -1512,6 +1512,7 @@ class TestTPURunner:
         self.runner.supports_mm_inputs = False
         self.runner.vllm_config.compilation_config.compile_sizes = [16, 2048]
         self.runner._make_buffer = GPUModelRunner._make_buffer.__get__(self.runner)
+        self.runner.input_batch = SimpleNamespace(thinking_budget_state_holder=None)
 
         with (
             patch.object(GPUModelRunner, "__init__", return_value=None),
