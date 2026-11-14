@@ -4,7 +4,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 status=0
-for c in ${@:-4 8 16 32 64 128 256 512 1024}; do
+if [ "$#" -eq 0 ]; then
+  set -- 4 8 16 32 64 128 256 512 1024
+fi
+for c in "$@"; do
   if ! sweep_raw=$(ISL=8192 OSL=1024 CONCS=$c DRY_RUN=1 bash "$HERE/sweep.sh" 2>&1); then
     printf 'ERROR: sweep dry run failed at concurrency %s:\n%s\n' "$c" "$sweep_raw" >&2
     status=1

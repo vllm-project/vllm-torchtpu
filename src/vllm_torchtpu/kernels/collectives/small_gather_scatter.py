@@ -25,8 +25,9 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.collectives.small_all_reduce import (
-    _barrier, _push, _split, _wait_bytes_of)
+from vllm_torchtpu.kernels.collectives.small_all_reduce import (_barrier,
+                                                                _push, _split,
+                                                                _wait_bytes_of)
 
 LANE = 128  # the lane tile: a block's width must sit on it
 # Distinct barrier groups from the all-reduce kernel's (5).
@@ -39,8 +40,8 @@ def _check(hidden):
 
 
 def _call(kernel, x, out_rows, hidden, rank, scratch, collective_id, name):
-    rank_specs = ([pl.BlockSpec(memory_space=pltpu.SMEM)]
-                  if rank is not None else [])
+    rank_specs = ([pl.BlockSpec(
+        memory_space=pltpu.SMEM)] if rank is not None else [])
     args = (() if rank is None else (rank.astype(jnp.int32), )) + (x, )
     return pl.pallas_call(
         kernel,
@@ -141,17 +142,16 @@ def small_reduce_scatter(x,
                      f"small_reduce_scatter_r{rows}")
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     rank_specs = [smem] if rank is not None else []
-    args = (() if rank is None else (rank.astype(jnp.int32), )) + (
-        my_rank.astype(jnp.int32), core_of_rank.astype(jnp.int32), x)
-    return pl.pallas_call(kernel,
-                          out_shape=jax.ShapeDtypeStruct((rows, hidden),
-                                                         x.dtype),
-                          in_specs=rank_specs + [smem, smem,
-                                                 pl.BlockSpec()],
-                          scratch_shapes=scratch,
-                          compiler_params=pltpu.CompilerParams(
-                              collective_id=collective_id),
-                          name=f"small_reduce_scatter_r{rows}_permuted")(*args)
+    args = (() if rank is None else
+            (rank.astype(jnp.int32), )) + (my_rank.astype(
+                jnp.int32), core_of_rank.astype(jnp.int32), x)
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((rows, hidden), x.dtype),
+        in_specs=rank_specs + [smem, smem, pl.BlockSpec()],
+        scratch_shapes=scratch,
+        compiler_params=pltpu.CompilerParams(collective_id=collective_id),
+        name=f"small_reduce_scatter_r{rows}_permuted")(*args)
 
 
 def reference_scatter(blocks, core):

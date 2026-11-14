@@ -33,7 +33,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
 
-MAX_ROWS = 256
+MAX_ROWS = 8192
 I32 = jnp.int32
 
 
@@ -72,17 +72,23 @@ def scratch_shapes(max_seqs: int, max_tokens: int) -> dict[str, Any]:
     """SMEM scratch for both passes' tables: the batched pass indexes its
     tables by sequence (one tile entry per sequence), the per-sequence pass by
     tile (up to one per token)."""
-    d = {"tb_num_tiles": pltpu.SMEM((1, ), I32), "tp_num_tiles": pltpu.SMEM((1, ), I32),
-         "tb_has_init": pltpu.SMEM((max_seqs, ), I32), "tp_has_init": pltpu.SMEM((max_seqs, ), I32),
-         "tp_state": pltpu.SMEM((max_seqs, ), I32), "tp_read": pltpu.SMEM((max_seqs, ), I32)}
+    d = {
+        "tb_num_tiles": pltpu.SMEM((1, ), I32),
+        "tp_num_tiles": pltpu.SMEM((1, ), I32),
+        "tb_has_init": pltpu.SMEM((max_seqs, ), I32),
+        "tp_has_init": pltpu.SMEM((max_seqs, ), I32),
+        "tp_state": pltpu.SMEM((max_seqs, ), I32),
+        "tp_read": pltpu.SMEM((max_seqs, ), I32)
+    }
     for n in TABLE_NAMES:
         d[f"tb_{n}"] = pltpu.SMEM((max_seqs, ), I32)
         d[f"tp_{n}"] = pltpu.SMEM((max_tokens, ), I32)
     return d
 
 
-def fill_and_wrap(qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref, sc: dict,
-                  cfg_b: config.GDNConfig, cfg_p: config.GDNConfig, max_seqs: int):
+def fill_and_wrap(qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref,
+                  sc: dict, cfg_b: config.GDNConfig, cfg_p: config.GDNConfig,
+                  max_seqs: int):
     """Fill the tables from the raw arrays and return the two MetadataRefs
     over them. `sc` maps the scratch names of `scratch_shapes` to refs.
     distribution = [decode_end, prefill_end, mixed_end]: the batched pass takes
@@ -103,7 +109,7 @@ def fill_and_wrap(qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref, sc: dict
         sc["tb_has_init"][s] = ((seq_lens_ref[s] - q_len) > 0).astype(I32)
         return carry
 
-    lax.fori_loop(0, max_seqs, body_b, jnp.int32(0))
+    lax.fori_loop(0, jnp.where(end_b > 0, max_seqs, 0), body_b, jnp.int32(0))
     sc["tb_num_tiles"][0] = pl.cdiv(end_b, cfg_b.tile_size)
 
     chunk = cfg_p.chunk_size
@@ -136,8 +142,10 @@ def fill_and_wrap(qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref, sc: dict
         return memory_ref.MetadataRef(
             num_tiles=_ScalarRef(sc[f"{prefix}_num_tiles"]),
             p_id_to_s_idx=memory_ref.SmemWrapper(sc[f"{prefix}_s_idx"], shape),
-            p_id_to_r_base=memory_ref.SmemWrapper(sc[f"{prefix}_r_base"], shape),
-            p_id_to_r_size=memory_ref.SmemWrapper(sc[f"{prefix}_r_size"], shape),
+            p_id_to_r_base=memory_ref.SmemWrapper(sc[f"{prefix}_r_base"],
+                                                  shape),
+            p_id_to_r_size=memory_ref.SmemWrapper(sc[f"{prefix}_r_size"],
+                                                  shape),
             p_id_is_first_tile=BoolSmemWrapper(sc[f"{prefix}_first"], shape),
             p_id_is_last_tile=BoolSmemWrapper(sc[f"{prefix}_last"], shape),
             s_idx_has_initial_state=_BoolRef(has_init),
@@ -147,5 +155,6 @@ def fill_and_wrap(qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref, sc: dict
         )
 
     meta_b = wrap("tb", cfg_b, sc["tb_has_init"], state_ref, read_ref)
-    meta_p = wrap("tp", cfg_p, sc["tp_has_init"], sc["tp_state"], sc["tp_read"])
+    meta_p = wrap("tp", cfg_p, sc["tp_has_init"], sc["tp_state"],
+                  sc["tp_read"])
     return meta_b, meta_p

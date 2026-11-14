@@ -49,9 +49,8 @@ def test_scores_entry_takes_the_served_layer(monkeypatch, scale_name):
     from vllm_torchtpu.layers.vllm.quantization import fp8
     monkeypatch.setattr(envs, "TPU_MOE_LOWTOK_FROM_SCORES", 1, raising=False)
     monkeypatch.setattr(envs, "TPU_MOE_LOWTOK_MAX_TOKENS", 32, raising=False)
-    monkeypatch.setattr(
-        envs, "TPU_MOE_SKIP_PADDED_TOKENS", 1,
-        raising=False)  # supported per-channel scale layout
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", 1,
+                        raising=False)  # supported per-channel scale layout
     scores_op.prebuild(10, 8, 64)
     with FakeTensorMode():
         layer = _layer(scale_name)
@@ -93,8 +92,8 @@ def _lowtok_inputs(gm):
     """The few-token tables among the placeholders, as the compile flow's hand-over check lists them."""
     return {
         n.name
-        for n in gm.graph.nodes
-        if n.op == "placeholder" and ("_lowtok_" in n.name or "experts_start" in n.name)
+        for n in gm.graph.nodes if n.op == "placeholder" and (
+            "_lowtok_" in n.name or "experts_start" in n.name)
     }
 
 
@@ -110,15 +109,21 @@ def test_both_sides_of_the_row_count_fork_lift_the_same_tables(monkeypatch):
     monkeypatch.setattr(envs, "TPU_MOE_LOWTOK_MAX_TOKENS", 32, raising=False)
     monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", 1, raising=False)
     scores_op.prebuild(10, 8, 64)
-    layer = _layer("weight_scale")  # real (empty) tensors: dynamo takes no fake inputs
+    layer = _layer(
+        "weight_scale")  # real (empty) tensors: dynamo takes no fake inputs
     x = torch.zeros(4, 4096, dtype=torch.bfloat16)
     logits = torch.zeros(4, 512, dtype=torch.bfloat16)
     ids = torch.zeros(4, 10, dtype=torch.int32)
-    below = _capture(lambda x, logits: fp8._lowtok_scores_output(layer, x, logits, "silu"), x, logits)
+    below = _capture(
+        lambda x, logits: fp8._lowtok_scores_output(layer, x, logits, "silu"),
+        x, logits)
     # the grouped route: the retain-read plus its own read of the experts_start buffer
-    above = _capture(lambda ids: fp8._lowtok_lift_tables(layer, ids) + layer._experts_start * 0, ids)
+    above = _capture(
+        lambda ids: fp8._lowtok_lift_tables(layer, ids) + layer._experts_start
+        * 0, ids)
     assert len(_lowtok_inputs(below)) == 5, _lowtok_inputs(below)
-    assert _lowtok_inputs(above) == _lowtok_inputs(below), (_lowtok_inputs(above), _lowtok_inputs(below))
+    assert _lowtok_inputs(above) == _lowtok_inputs(below), (
+        _lowtok_inputs(above), _lowtok_inputs(below))
 
 
 def test_the_traced_guard_has_no_logging():
@@ -205,7 +210,8 @@ def test_the_ids_hook_terms_are_stated_at_weight_loading(monkeypatch):
         layer, "silu") == "TPU_MOE_LOWTOK_MAX_TOKENS unset"
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dtype",
+                         [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("rows", [4, 256])
 def test_scores_entry_preserves_activation_dtype(monkeypatch, dtype, rows):
     from vllm_torchtpu import envs

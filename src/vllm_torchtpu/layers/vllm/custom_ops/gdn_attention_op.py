@@ -374,7 +374,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                               dtype=w.dtype,
                                               device=w.device).copy_(w)
 
-
     def get_state_shape(self, ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         conv_state_shape, temporal_state_shape = super().get_state_shape()
         conv_state_shape = conv_state_shape[:-1] + (1, conv_state_shape[-1])

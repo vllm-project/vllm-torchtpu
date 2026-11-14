@@ -186,11 +186,16 @@ class RpaConfigs:
         fixed_bytes += self.serve.num_seqs * self.serve.pages_per_seq  # page_indices
         fixed_bytes += 3  # distribution
         fixed_bytes += self.block.batch_size  # lane_lengths
-        fixed_bytes += 1  # actual_steps
+        fixed_bytes += 2  # actual_steps (padded to 2 words to avoid IsEffectiveScalar)
 
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
 
+        # The whole SMEM less a 32 KiB reserve. With total_q_tokens == 0
+        # this is the schedule capacity the runner admits steps against
+        # (wrapper.schedule_capacity), so a smaller budget refuses steps
+        # that fit. The workload bound below keeps calls with a small
+        # schedule (e.g. the decode buckets) well under it.
         smem_limit_bytes = pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024
         available_bytes = smem_limit_bytes - fixed_bytes
 
@@ -207,6 +212,25 @@ class RpaConfigs:
 
         num_lanes = pltpu.get_tpu_info().num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
+
+        if self.serve.total_q_tokens > 0:
+            max_k_blocks_per_q = max(
+                1,
+                pl.cdiv(
+                    self.serve.pages_per_seq * self.serve.page_size,
+                    self.block.bkv_sz,
+                ),
+            )
+            max_q_blocks = (
+                pl.cdiv(self.serve.total_q_tokens, self.block.bq_sz) +
+                self.serve.num_seqs)
+            workload_steps_ub = (pl.cdiv(max_q_blocks, self.block.batch_size) *
+                                 max_k_blocks_per_q + max_k_blocks_per_q +
+                                 self.block.n_buffer + 4)
+            max_steps_ub = min(
+                max_steps_ub,
+                utils.align_to(workload_steps_ub, num_lanes),
+            )
         return max_steps_ub
 
     @property
