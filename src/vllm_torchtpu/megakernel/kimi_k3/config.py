@@ -87,7 +87,7 @@ class KernelConfig:
     # Prefill MLA: the layer takes each rank's normalized rows and its attention
     # kernel all-gathers the window for the output gate while it runs, instead
     # of a norm-and-gather op before the layer.
-    prefill_mla_flash_gather: bool = False
+    prefill_mla_flash_gather: bool = True
     # Prefill MoE route counts (diagnostic): each fused MoE call also returns its
     # chip's 56 local expert counts; the prefiller saves cumulative snapshots
     # every prefill_route_counts_every windows under prefill_route_counts_dir

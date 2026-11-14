@@ -258,7 +258,7 @@ def test_mla_layer_gathering_under_the_attention_matches_the_gathered_window(
         with _interpret():
             return jax.jit(run)(*operands)
 
-    gathered = layer(KernelConfig())
+    gathered = layer(KernelConfig(prefill_mla_flash_gather=False))
     fused = layer(KernelConfig(prefill_mla_flash_gather=True))
     for before, after in zip(gathered, fused, strict=True):
         np.testing.assert_array_equal(np.asarray(after), np.asarray(before))
