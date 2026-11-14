@@ -75,8 +75,12 @@ if TYPE_CHECKING:
     TPU_RPA_DECODE_BATCH: int = 0
     TPU_MOE_LOWTOK_FROM_SCORES: int = 0
     TPU_MOE_LOWTOK_SCORES_STRICT: int = 0
-    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
+    TPU_SMALL_ALL_REDUCE: bool = True
+    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 128
     TPU_SMALL_ALL_REDUCE_FORM: str = ""
+    TPU_SMALL_ALL_REDUCE_TP: bool = False
+    TPU_SMALL_ALL_REDUCE_TP_FORM: str = ""
+    TPU_DP_PACKED_ROUTER_GATHER: bool = False
     TPU_WORKER_NUMA_BIND: bool = True
     TPU_SP_MIN_ROWS: int = 0
     TPU_SP_FP8_GATHER: int = 0
@@ -614,15 +618,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # refuse to boot when the scores entry's static terms fail on the loaded layer (the term is in the error)
     "TPU_MOE_LOWTOK_SCORES_STRICT":
     lambda: int(os.getenv("TPU_MOE_LOWTOK_SCORES_STRICT", "0")),
+    # Run small decode-step TP all-reduces, DP MoE dispatches and DP MoE
+    # combines as Pallas kernels (kernels/experimental/small_collectives)
+    # instead of XLA's.
+    "TPU_SMALL_ALL_REDUCE":
+    lambda: bool(int(os.getenv("TPU_SMALL_ALL_REDUCE", "1"))),
     # The decode step's all-reduces (the output projections' reduction, the
     # MoE combine) as the small all-reduce kernel for blocks of at most this
     # many rows (kernels/collectives/small_all_reduce.py); 0 keeps XLA's.
     "TPU_SMALL_ALL_REDUCE_MAX_ROWS":
-    lambda: int(os.getenv("TPU_SMALL_ALL_REDUCE_MAX_ROWS", "0")),
+    lambda: int(os.getenv("TPU_SMALL_ALL_REDUCE_MAX_ROWS", "128")),
     # The kernel's form: "oneshot", "twoshot", or empty for its own
     # choice by block size.
     "TPU_SMALL_ALL_REDUCE_FORM":
     lambda: os.getenv("TPU_SMALL_ALL_REDUCE_FORM", "").strip().lower(),
+    # With TPU_SMALL_ALL_REDUCE, also run the TP all-reduces of a layout whose
+    # TP group is a sub-group of the EP mesh (DP x TP engines) as the Pallas
+    # kernel over the TP pair; TPU_SMALL_ALL_REDUCE_TP_FORM picks the kernel
+    # form ("oneshot", "twoshot"; empty: the kernel's size rule).
+    "TPU_SMALL_ALL_REDUCE_TP":
+    lambda: bool(int(os.getenv("TPU_SMALL_ALL_REDUCE_TP", "0"))),
+    "TPU_SMALL_ALL_REDUCE_TP_FORM":
+    lambda: os.getenv("TPU_SMALL_ALL_REDUCE_TP_FORM", "").strip().lower(),
+    # A replicated sequence-parallel MoE step under DP>1 gathers the hidden rows
+    # and the router logits in one DP all-gather (packed along the last dim)
+    # instead of two. Lossless: the split returns the same values.
+    "TPU_DP_PACKED_ROUTER_GATHER":
+    lambda: bool(int(os.getenv("TPU_DP_PACKED_ROUTER_GATHER", "0"))),
     # Each worker binds itself to the socket of its own TPU chip (the node's
     # CPU set and preferred memory node, read from the device's numa_node in
     # sysfs) before the runtime comes up; 0 leaves placement to the scheduler.

@@ -24,6 +24,8 @@ The step's form is decided by the decoder layer from the step's row count,
 which is static per compiled graph, so the flag the communicator reads here
 is a trace-time constant.
 """
+from collections.abc import Sequence
+
 from vllm_torchtpu import envs
 
 _ACTIVE = False
@@ -58,3 +60,25 @@ def set_active(active: bool) -> None:
 
 def is_active() -> bool:
     return _ACTIVE
+
+
+def rows_are_sliced(is_sequence_parallel: bool) -> bool:
+    """Whether a MoE layer's rows are this rank's slice of the step."""
+    return is_sequence_parallel and _ACTIVE
+
+
+def rows_are_replicated(is_sequence_parallel: bool) -> bool:
+    """Whether a sequence-parallel MoE layer sees the step's rows replicated
+    on every rank (a step below min_rows)."""
+    return is_sequence_parallel and not _ACTIVE
+
+
+def check_buckets(compile_sizes: Sequence[int], tp_size: int) -> None:
+    """Raise unless every sequence-parallel bucket splits evenly over TP."""
+    threshold = min_rows()
+    uneven = [n for n in compile_sizes if n >= threshold and n % tp_size]
+    if uneven:
+        raise NotImplementedError(
+            f"TPU_SP_MIN_ROWS splits token buckets >= {threshold} "
+            f"over tensor_parallel_size={tp_size}; buckets {uneven} do not divide."
+        )
