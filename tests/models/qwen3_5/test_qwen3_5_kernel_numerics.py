@@ -35,7 +35,14 @@ def _mains_default(monkeypatch):
 
 
 def _model(arch):
-    return SimpleNamespace(architectures=[arch])
+    # The checkpoint shape the rule was measured on (Qwen3.5-397B-A17B).
+    text = SimpleNamespace(**hooks._CALIBRATED_SHAPE)
+    return SimpleNamespace(architectures=[arch], hf_text_config=text)
+
+
+@pytest.fixture(autouse=True)
+def _tpu7x(monkeypatch):
+    monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
 
 
 def test_qwen3_5_takes_the_reciprocal_scale_and_streamed_slabs():

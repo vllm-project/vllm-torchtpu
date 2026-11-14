@@ -213,17 +213,35 @@ def _apply_kv_budget(vllm_config: VllmConfig) -> None:
         cache_config.kv_cache_memory_bytes = safe_kv
 
 
-def _is_qwen3_5_target(model_config) -> bool:
-    """``settings.is_qwen3_5`` for a config that names its architectures. A
-    config without the attribute (the stand-ins callers hand the patch
-    registry) is not a Qwen3.5 target and gets main's behaviour."""
+def is_measured_target(model_config) -> bool:
+    """Whether this engine serves the checkpoint and device the Qwen3.5 PD
+    stack's kernel levers were measured on: a Qwen3.5 architecture
+    (``settings.is_qwen3_5``) with the calibrated checkpoint shape on TPU7x
+    (``_is_calibrated``, Qwen3.5-397B-A17B). The kernel numerics below and the
+    few-token MoE kernel (``moe_lowtok_scores.enabled``) apply only there.
+
+    Any other Qwen3.5 checkpoint (main's CI model, Qwen3.5-35B-A3B, among
+    them) or device keeps main's arithmetic and code: those levers change the
+    last bits of the forward pass, which is not a free choice where they were
+    not measured. A config without ``architectures`` (the stand-ins callers
+    hand the patch registry) is not a target either."""
     if getattr(model_config, "architectures", None) is None:
         return False
-    return settings.is_qwen3_5(model_config)
+    if not settings.is_qwen3_5(model_config):
+        return False
+    if _is_calibrated(model_config):
+        return True
+    logger.info_once(
+        "Qwen3.5 kernel levers (reciprocal-scale quantize, tuned and streamed "
+        "FP8 MoE grouped matmul, few-token MoE kernel) left at main's "
+        "arithmetic: they were measured for Qwen3.5-397B-A17B on TPU7x only."
+    )
+    return False
 
 
 def apply_kernel_numerics(model_config) -> bool | None:
-    """Qwen3.5's kernel numerics and code paths, in every process that loads it.
+    """Qwen3.5's kernel numerics and code paths where they were measured
+    (``is_measured_target``), in every process that loads the model.
 
     The Qwen3.5 PD stack was tuned and evaluated with the quantize helpers'
     reciprocal scale (kernels/quantized_matmul/util.RECIPROCAL_SCALE), the
@@ -236,7 +254,7 @@ def apply_kernel_numerics(model_config) -> bool | None:
     """
     if model_config is None:
         return False
-    if _is_qwen3_5_target(model_config):
+    if is_measured_target(model_config):
         from vllm_torchtpu.kernels.megablox import gmm_v2
         from vllm_torchtpu.kernels.quantized_matmul import util
 
