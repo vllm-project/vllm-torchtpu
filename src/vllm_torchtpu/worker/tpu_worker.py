@@ -55,6 +55,7 @@ from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker.numa_bind import bind_worker_to_chip_numa_node
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -224,6 +225,9 @@ class TPUWorker(WorkerBase):
         # takes these at construction time.
         self.profile_rank = binding.rank
         self.profile_world_size = binding.world_size
+        # Before the runtime starts, so its threads and buffers follow.
+        if envs.TPU_WORKER_NUMA_BIND:
+            bind_worker_to_chip_numa_node(binding.native_local_rank)
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
