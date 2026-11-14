@@ -49,9 +49,10 @@ Core mechanisms:
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
@@ -67,6 +68,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
+    TransferJob,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
@@ -77,6 +79,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
+from vllm.utils.math_utils import round_down
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import (
@@ -84,9 +87,11 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
+    LookupResult,
     OffloadKey,
 )
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
@@ -101,6 +106,44 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
 
 logger = init_logger(__name__)
+
+# How long poll_and_complete_transfers waits for a pending host-tier load when
+# a request is blocked on one (at least 5 ms when nothing else is running).
+_LOAD_WAIT_MS = 1.5
+
+
+def _connector_option(extra_config: Mapping[str, Any], key: str, default: Any) -> Any:
+    """Reads an opt-in option from this connector's kv_connector_extra_config.
+
+    An absent key returns ``default``, which keeps the connector's default
+    behaviour. The value must have the default's type exactly (a JSON boolean
+    for a bool, a non-negative JSON integer for an int), so a typo fails at
+    start-up instead of silently leaving the option off.
+
+    Options:
+      max_async_loads (int, default 0 = no cap): host-tier loads in flight
+        before a request with a host-tier hit is deferred to a later step.
+      fence_after_draft (bool, default false): record a step's store fences
+        one get_finished() call later, after the draft model's KV writes.
+      host_tier_recency (bool, default false): the scheduler refreshes a
+        request's host-tier keys on every lookup and store (``_touch``),
+        probes partial tails only above the local hit, offers FullAttention
+        chunks for storing from chunk 0 again, and launches fence-acknowledged
+        stores largest first. Unset, the scheduler runs upstream's lookup,
+        allocation and store paths.
+    """
+    value = extra_config.get(key, default)
+    if isinstance(default, bool):
+        ok = isinstance(value, bool)
+    else:
+        ok = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    if not ok:
+        raise ValueError(
+            f"kv_connector_extra_config[{key!r}] must be a "
+            f"{'boolean' if isinstance(default, bool) else 'non-negative integer'}, "
+            f"got {value!r}"
+        )
+    return value
 
 
 def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
@@ -202,6 +245,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     via RaidenOffloadingManager.
     """
 
+    # Option host_tier_recency (see _connector_option); off unless configured.
+    _host_tier_recency: bool = False
+
     def __init__(
         self,
         spec: TPURaidenStoreOffloadingSpec,
@@ -217,6 +263,118 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+        self._scheduler: Any = None
+        self._pending_failed_jobs: list[Any] = []
+        self._max_async_load_reqs: int = _connector_option(
+            spec.extra_config, "max_async_loads", 0
+        )
+        self._host_tier_recency = _connector_option(
+            spec.extra_config, "host_tier_recency", False
+        )
+
+    def _complete_jobs_directly(
+        self,
+        scheduler: Any,
+        finished_jobs: Iterable[Any],
+        extra_store_job_ids: Iterable[int] = (),
+    ) -> int:
+        """Complete finished Raiden store/load jobs directly on the scheduler
+        without a 2-step worker echo round-trip."""
+        completed_jobs: dict[int, int] = {}
+        load_req_ids: list[str] = []
+        num_workers = self.config.num_workers
+        for jid in extra_store_job_ids:
+            if jid in self._jobs:
+                completed_jobs[jid] = num_workers
+        for finished_job in finished_jobs:
+            if finished_job.failed_device_block_ids:
+                if not hasattr(self, "_pending_failed_jobs"):
+                    self._pending_failed_jobs = []
+                self._pending_failed_jobs.append(finished_job)
+                continue
+            if finished_job.job_id in self._jobs:
+                completed_jobs[finished_job.job_id] = num_workers
+            if finished_job.op == AdmissionOp.LOAD and finished_job.req_id is not None:
+                load_req_ids.append(finished_job.req_id)
+
+        finished_recving: set[str] = set()
+        for req_id in load_req_ids:
+            if req_id not in scheduler.requests:
+                continue
+            req_status = self._req_status.get(req_id)
+            has_other_loads = req_status is not None and any(
+                jid not in completed_jobs
+                and jid in self._jobs
+                and not self._jobs[jid].is_store
+                for jid in req_status.transfer_jobs
+            )
+            if not has_other_loads:
+                finished_recving.add(req_id)
+
+        if completed_jobs or finished_recving:
+            kv_out = KVConnectorOutput(
+                finished_recving=finished_recving,
+                kv_connector_worker_meta=RaidenOffloadingWorkerMetadata(
+                    # pyrefly: ignore[unexpected-keyword]
+                    completed_jobs=completed_jobs,
+                    fenced_jobs={},
+                ),
+            )
+            self.update_connector_output(kv_out)
+            if finished_recving:
+                scheduler._update_from_kv_xfer_finished(
+                    KVConnectorOutput(finished_recving=finished_recving)
+                )
+        return len(finished_recving)
+
+    def poll_and_complete_transfers(self, scheduler: Any) -> tuple[int, int, int, bool]:
+        """Poll Raiden C++ transfer completions at the start of ``schedule()``
+        so completed H2D loads promote ``WAITING_FOR_REMOTE_KVS`` requests in
+        the very next step instead of waiting 2 steps for the worker echo."""
+        self._scheduler = scheduler
+        t0_ns = time.perf_counter_ns()
+        manager = self._raiden_manager
+        initial_finished = manager.poll_finished_jobs()
+        early_reqs = (
+            self._complete_jobs_directly(scheduler, initial_finished)
+            if initial_finished
+            else 0
+        )
+        waited_reqs = 0
+        waited = False
+
+        has_pending_loads = any(not js.is_store for js in self._jobs.values())
+        if has_pending_loads and early_reqs == 0:
+            # A request parked on an async load holds its KV blocks, so the
+            # scheduler queues it in kv_holding_waiting.
+            has_waiting_remote = any(
+                r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                and r.request_id not in scheduler.finished_recving_kv_req_ids
+                for r in scheduler.kv_holding_waiting
+            )
+            if has_waiting_remote:
+                wait_ms = _LOAD_WAIT_MS
+                if wait_ms > 0.0:
+                    if not getattr(scheduler, "running", None):
+                        wait_ms = max(wait_ms, 5.0)
+                    deadline_ns = time.perf_counter_ns() + int(wait_ms * 1_000_000.0)
+                    waited = True
+                    while time.perf_counter_ns() < deadline_ns:
+                        time.sleep(0.0001)
+                        polled = manager.poll_finished_jobs()
+                        if polled:
+                            waited_reqs += self._complete_jobs_directly(
+                                scheduler, polled
+                            )
+                            if waited_reqs > 0 or not any(
+                                not js.is_store for js in self._jobs.values()
+                            ):
+                                break
+                        elif not manager.has_pending_work():
+                            break
+
+        elapsed_ns = time.perf_counter_ns() - t0_ns
+        return elapsed_ns, early_reqs, waited_reqs, waited
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -285,16 +443,36 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             elif manager.is_job_launched(job_id):
                 launched_flush_ids.add(job_id)
         drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
+        polled = manager.poll_finished_jobs()
 
-        # Collect completed/drained jobs for the worker echo channel.
-        for finished_job in list(drained) + manager.poll_finished_jobs():
-            if finished_job.op == AdmissionOp.STORE:
-                finished_store_ids.append(finished_job.job_id)
-            else:
-                assert finished_job.req_id is not None
-                finished_loads[finished_job.job_id] = finished_job.req_id
-                if not finished_job.success:
-                    failed_load_req_ids.add(finished_job.req_id)
+        sched_ref = getattr(self, "_scheduler", None)
+        if sched_ref is not None:
+            self._complete_jobs_directly(
+                sched_ref,
+                list(drained) + polled,
+                extra_store_job_ids=finished_store_ids,
+            )
+            finished_store_ids = []
+            pending_failed = getattr(self, "_pending_failed_jobs", None)
+            if pending_failed:
+                for failed_job in pending_failed:
+                    if failed_job.op == AdmissionOp.STORE:
+                        finished_store_ids.append(failed_job.job_id)
+                    else:
+                        assert failed_job.req_id is not None
+                        finished_loads[failed_job.job_id] = failed_job.req_id
+                        failed_load_req_ids.add(failed_job.req_id)
+                pending_failed.clear()
+        else:
+            # Collect completed/drained jobs for the worker echo channel.
+            for finished_job in list(drained) + polled:
+                if finished_job.op == AdmissionOp.STORE:
+                    finished_store_ids.append(finished_job.job_id)
+                else:
+                    assert finished_job.req_id is not None
+                    finished_loads[finished_job.job_id] = finished_job.req_id
+                    if not finished_job.success:
+                        failed_load_req_ids.add(finished_job.req_id)
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
@@ -308,9 +486,270 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             failed_load_req_ids=failed_load_req_ids,
         )
 
+    def _lookup(
+        self, req_status: Any, max_num_new_tokens: int | None = None
+    ) -> int | None:
+        """Upstream's lookup, with partial tails probed only above the local hit.
+
+        A partial-tail boundary at or below the local HBM hit
+        (``_tpu_local_hit_tokens``, which keeps the sub-block tail the
+        scheduler strips before asking the connector) loads nothing HBM does
+        not already hold. Without host_tier_recency, upstream's lookup runs.
+        """
+        if not self._host_tier_recency:
+            return super()._lookup(req_status, max_num_new_tokens)
+        complete_hit = self._lookup_complete_chunks(req_status, max_num_new_tokens)
+        req_status.partial_tail_boundary = None
+        if complete_hit is None or not self.config.supports_partial_tail:
+            return complete_hit
+
+        local_tokens = req_status.num_locally_computed_tokens
+        complete_boundary = local_tokens + complete_hit
+        tokens_per_hash = self.config.tokens_per_hash
+        block_end = complete_boundary + self._partial_tail_block_size
+        max_boundary = min(req_status.req.num_prompt_tokens - 1, block_end - 1)
+        if max_num_new_tokens is not None:
+            max_boundary = min(max_boundary, local_tokens + max_num_new_tokens)
+        if req_status.max_load_tokens is not None:
+            max_boundary = min(max_boundary, local_tokens + req_status.max_load_tokens)
+        max_boundary = round_down(max_boundary, tokens_per_hash)
+        min_boundary = complete_boundary
+        if complete_hit == 0:
+            local_hit = int(getattr(req_status.req, "_tpu_local_hit_tokens", 0) or 0)
+            if local_hit > min_boundary:
+                min_boundary = local_hit
+        if max_boundary <= min_boundary:
+            return complete_hit
+
+        pending = False
+        for boundary in range(max_boundary, min_boundary, -tokens_per_hash):
+            boundary_pending = False
+            boundary_missed = False
+            boundary_keys = []
+            for group_config in self.config.kv_group_configs:
+                key = self._make_boundary_key(
+                    req_status.req,
+                    group_config.group_idx,
+                    boundary,
+                    req_status.req_context,
+                )
+                boundary_keys.append(key)
+                result = self.manager.lookup(key, req_status.req_context)
+                if result is LookupResult.MISS:
+                    boundary_missed = True
+                    break
+                if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
+                    boundary_pending = True
+
+            pending |= boundary_pending
+            if not boundary_missed and not boundary_pending:
+                for group_config, key in zip(
+                    self.config.kv_group_configs, boundary_keys
+                ):
+                    self._events_tracker.record_partial_lookup(
+                        req_status.req, group_config, boundary, key
+                    )
+                req_status.partial_tail_boundary = boundary
+                return boundary - local_tokens
+
+        if pending and complete_hit == 0:
+            return None
+        return complete_hit
+
+    def get_num_new_matched_tokens(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        max_num_new_tokens: int | None = None,
+    ) -> tuple[int | None, bool]:
+        recency = self._host_tier_recency
+        if (
+            recency
+            and num_computed_tokens > 0
+            and self.config.kv_group_configs
+            and num_computed_tokens % self.config.kv_group_configs[0].tokens_per_chunk
+            != 0
+        ):
+            req_status = self._req_status.get(request.request_id)
+            if req_status is None:
+                self.on_new_request(request)
+                req_status = self._req_status.get(request.request_id)
+            if req_status is not None:
+                req_status.num_locally_computed_tokens = num_computed_tokens
+                req_status.update_offload_keys()
+                req_status.update_num_hit_chunks(num_computed_tokens)
+                self._touch(req_status)
+            return 0, False
+        max_loads = getattr(self, "_max_async_load_reqs", 0)
+        if max_loads > 0:
+            active_loads = sum(1 for js in self._jobs.values() if not js.is_store)
+            if active_loads >= max_loads:
+                req_status = self._req_status.get(request.request_id)
+                if req_status is None:
+                    self.on_new_request(request)
+                    req_status = self._req_status.get(request.request_id)
+                if req_status is not None and not req_status.transfer_jobs:
+                    req_status.update_offload_keys()
+                    orig_local = req_status.num_locally_computed_tokens
+                    orig_partial = req_status.partial_tail_boundary
+                    try:
+                        probe_hit = self._quiet_lookup(req_status, num_computed_tokens)
+                    finally:
+                        req_status.num_locally_computed_tokens = orig_local
+                        req_status.partial_tail_boundary = orig_partial
+                    if probe_hit is None or probe_hit > 0:
+                        return None, False
+        num_hit_tokens, load_async = super().get_num_new_matched_tokens(
+            request, num_computed_tokens, max_num_new_tokens
+        )
+        if not recency:
+            return num_hit_tokens, load_async
+        req_status = self._req_status.get(request.request_id)
+        if req_status is not None and not req_status.transfer_jobs:
+            # Upstream leaves cache recency to the manager, and the Raiden
+            # store learns it only through touch: refresh this request's keys
+            # on every lookup that ran (one deferred for in-flight transfers
+            # did not).
+            self._touch(req_status)
+        if not num_hit_tokens:
+            local_hit = int(getattr(request, "_tpu_local_hit_tokens", 0) or 0)
+            if local_hit > num_computed_tokens and req_status is not None:
+                req_status.num_locally_computed_tokens = local_hit
+                if (
+                    self.config.supports_partial_tail
+                    and local_hit % self._partial_tail_block_size != 0
+                    and local_hit % self.config.tokens_per_hash == 0
+                    and local_hit // self.config.tokens_per_hash - 1
+                    < len(request.block_hashes)
+                ):
+                    self.manager.touch(
+                        tuple(
+                            self._make_boundary_key(
+                                request,
+                                group.group_idx,
+                                local_hit,
+                                req_status.req_context,
+                            )
+                            for group in self.config.kv_group_configs
+                        ),
+                        req_status.req_context,
+                    )
+        return num_hit_tokens, load_async
+
+    def update_state_after_alloc(
+        self, request: Request, blocks: Any, num_external_tokens: int
+    ) -> None:
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        if not self._host_tier_recency:
+            return
+        req_status = self._req_status.get(request.request_id)
+        if req_status is not None:
+            for group_config, group_state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            ):
+                if group_config.sliding_window_size_in_chunks is None:
+                    # Keep next_stored_chunk_idx = 0 for FullAttention so
+                    # _build_store_jobs lets prepare_store probe 0..num_chunks
+                    # (skipping resident HOST/HOST_AND_HBM blocks in memory and
+                    # re-storing any HBM-resident prefix chunks displaced from
+                    # the host LRU).
+                    group_state.next_stored_chunk_idx = 0
+
+    def _build_store_jobs(
+        self, scheduler_output: SchedulerOutput
+    ) -> dict[int, TransferJob]:
+        store_jobs = super()._build_store_jobs(scheduler_output)
+        if not self._host_tier_recency:
+            return store_jobs
+        # Every request that offloads this step refreshes its keys, as each
+        # lookup does in get_num_new_matched_tokens.
+        for req_id in dict.fromkeys(job.req_id for job in store_jobs.values()):
+            req_status = self._req_status.get(req_id)
+            if req_status is not None:
+                self._touch(req_status)
+        return store_jobs
+
+    def _touch(self, req_status: Any) -> None:
+        """Refreshes the Raiden host LRU for one request's offloaded keys.
+
+        Keys touched later end nearer the MRU end, so the order below decides
+        what an active conversation loses first under host pressure.
+        """
+        local_tokens = int(getattr(req_status, "num_locally_computed_tokens", 0) or 0)
+        local_hit = int(getattr(req_status.req, "_tpu_local_hit_tokens", 0) or 0)
+        if local_hit > local_tokens:
+            local_tokens = local_hit
+        shared_boundary = int(getattr(req_status.req, "shared_prefix_boundary", 0) or 0)
+        # 1. Touch ALL FullAttention chunks in reverse order (tail -> chunk_0)
+        #    so the entire active conversation stays ahead of inactive
+        #    conversations AND chunk_0 (the prefix root) is the most recently
+        #    used entry and can never be evicted before the tail.
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            if group_config.sliding_window_size_in_chunks is not None:
+                continue
+            if group_state.offload_keys:
+                self.manager.touch(
+                    list(reversed(group_state.offload_keys)),
+                    req_status.req_context,
+                )
+
+        # 2. Touch Mamba / sliding-window boundary chunks AFTER FullAttention so
+        #    active recurrent boundary states stay at the MRU head of the host cache.
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            if group_config.sliding_window_size_in_chunks is None:
+                continue
+            chunks_to_skip = max(
+                0,
+                group_state.num_hit_chunks - group_config.sliding_window_size_in_chunks,
+            )
+            keys_to_touch = list(group_state.offload_keys[chunks_to_skip:])
+            if shared_boundary >= group_config.tokens_per_chunk:
+                fork_idx = (shared_boundary // group_config.tokens_per_chunk) - 1
+                if 0 <= fork_idx < chunks_to_skip and fork_idx < len(
+                    group_state.offload_keys
+                ):
+                    keys_to_touch.append(group_state.offload_keys[fork_idx])
+            if keys_to_touch:
+                self.manager.touch(keys_to_touch, req_status.req_context)
+
+        # 3. Touch partial-tail boundary keys LAST (both CPU-matched partial
+        #    tails and HBM-matched partial tails).
+        boundaries_to_touch: list[int] = []
+        if req_status.partial_tail_boundary is not None:
+            boundaries_to_touch.append(int(req_status.partial_tail_boundary))
+        if (
+            self.config.supports_partial_tail
+            and local_tokens > 0
+            and local_tokens % self._partial_tail_block_size != 0
+            and local_tokens % self.config.tokens_per_hash == 0
+            and local_tokens not in boundaries_to_touch
+        ):
+            boundaries_to_touch.append(local_tokens)
+        for boundary in boundaries_to_touch:
+            if boundary // self.config.tokens_per_hash - 1 < len(
+                req_status.req.block_hashes
+            ):
+                self.manager.touch(
+                    tuple(
+                        self._make_boundary_key(
+                            req_status.req,
+                            group.group_idx,
+                            boundary,
+                            req_status.req_context,
+                        )
+                        for group in self.config.kv_group_configs
+                    ),
+                    req_status.req_context,
+                )
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         meta = connector_output.kv_connector_worker_meta
         if isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.fenced_jobs:
+            ready_jobs: list[tuple[int, _ParkedStore]] = []
             for job_id, count in meta.fenced_jobs.items():
                 parked = self._fence_pending.get(job_id)
                 if parked is None:
@@ -320,14 +759,118 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 assert parked.acks <= self.config.num_workers
                 if parked.acks == self.config.num_workers:
                     del self._fence_pending[job_id]
-                    self._raiden_manager.submit_store_job(
-                        job_id, parked.keys, parked.device_block_ids
-                    )
+                    ready_jobs.append((job_id, parked))
+            if self._host_tier_recency:
+                ready_jobs.sort(key=lambda item: (-len(item[1].keys), item[0]))
+            for job_id, parked in ready_jobs:
+                self._raiden_manager.submit_store_job(
+                    job_id, parked.keys, parked.device_block_ids
+                )
         super().update_connector_output(connector_output)
+
+    def _quiet_lookup(self, req_status: Any, base_tokens: int) -> int | None:
+        """Probe ``self._lookup(req_status)`` starting from ``base_tokens``
+        without emitting duplicate lookup events."""
+        req_status.num_locally_computed_tokens = base_tokens
+        tracker = getattr(self, "_events_tracker", None)
+        orig_record = getattr(tracker, "record_lookup", None) if tracker else None
+        orig_partial = (
+            getattr(tracker, "record_partial_lookup", None) if tracker else None
+        )
+        try:
+            if tracker is not None:
+                tracker.record_lookup = lambda *a, **kw: None
+                tracker.record_partial_lookup = lambda *a, **kw: None
+            return self._lookup(req_status)
+        finally:
+            if tracker is not None:
+                if orig_record is not None:
+                    tracker.record_lookup = orig_record
+                if orig_partial is not None:
+                    tracker.record_partial_lookup = orig_partial
+
+    def resolve_divergent_local_hit_tokens(
+        self,
+        request: Request,
+        num_local: int,
+        num_reconciled: int,
+        block_size: int,
+    ) -> int | None:
+        """Return the block-aligned local FullAttention prefix length to retain
+        in HBM when HBM has a divergent hybrid hit (FullAttention > Mamba), or
+        None if Raiden CPU cannot advance past ``num_reconciled``."""
+        if getattr(request, "skip_reading_prefix_cache", False):
+            return None
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None:
+            self.on_new_request(request)
+            req_status = self._req_status.get(request.request_id)
+        if req_status is None:
+            return None
+        if req_status.transfer_jobs:
+            return (num_local // block_size) * block_size
+
+        req_status.update_offload_keys()
+        fa_aligned = (num_local // block_size) * block_size
+        reconciled_aligned = (num_reconciled // block_size) * block_size
+
+        # 1. Check if Raiden CPU has tokens strictly above fa_aligned
+        #    (e.g. a partial tail at fa_aligned + 128 or additional chunks).
+        ext_above = self._quiet_lookup(req_status, fa_aligned)
+        if ext_above is None:
+            return fa_aligned
+        if ext_above > 0 and fa_aligned + ext_above > num_reconciled:
+            return fa_aligned
+
+        # 2. Common case: FullAttention in HBM covers all full blocks of the
+        #    previous turn (or its partial tail), and Raiden CPU holds the
+        #    Mamba boundary in that final block [fa_aligned - block_size, fa_aligned].
+        #    Back off by 1 block so get_num_new_matched_tokens loads only the
+        #    final block (1 FA block + 1 Mamba block) while keeping the other
+        #    (fa_aligned // block_size - 1) FA blocks in HBM.
+        one_back = fa_aligned - block_size
+        if one_back >= reconciled_aligned and one_back >= 0:
+            ext_last = self._quiet_lookup(req_status, one_back)
+            if ext_last is None:
+                return one_back
+            if ext_last > 0 and one_back + ext_last > num_reconciled:
+                ext_end = one_back + ext_last
+                return min(fa_aligned, ((ext_end - 1) // block_size) * block_size)
+
+        # 3. General case: FullAttention in HBM extends past the latest Mamba
+        #    boundary stored in Raiden CPU (e.g. shared prefix from a longer
+        #    request). Scan downward from one_back - block_size to
+        #    reconciled_aligned to find the highest chunk where Raiden CPU can
+        #    supply both the Mamba boundary and its corresponding FA chunk.
+        min_chunk = max(0, reconciled_aligned // block_size)
+        max_chunk = (one_back // block_size) - 1
+        for chunk_idx in range(max_chunk, min_chunk - 1, -1):
+            base = chunk_idx * block_size
+            ext_hit = self._quiet_lookup(req_status, base)
+            if ext_hit is None:
+                return base
+            if ext_hit > 0 and base + ext_hit > num_reconciled:
+                ext_end = base + ext_hit
+                return min(fa_aligned, ((ext_end - 1) // block_size) * block_size)
+
+        return None
 
 
 class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
+
+    def resolve_divergent_local_hit_tokens(
+        self,
+        request: Request,
+        num_local: int,
+        num_reconciled: int,
+        block_size: int,
+    ) -> int | None:
+        if self.connector_scheduler is None:
+            return None
+        return self.connector_scheduler.resolve_divergent_local_hit_tokens(
+            request, num_local, num_reconciled, block_size
+        )
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
@@ -417,6 +960,22 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # In-flight fence events awaiting device retirement before acknowledging
             # store jobs, recorded as pairs of (fence_job_ids, event).
             self._pending_fences: list[tuple[set[int], torch.Event]] = []
+            # fence_after_draft: the runner calls get_finished() after the
+            # target forward but BEFORE the speculative (MTP/eagle) draft
+            # propose, which writes the draft layer's KV into the same pool
+            # blocks. Deferring the fence for a step's store jobs to the next
+            # get_finished() call orders it after every KV write of that step,
+            # draft included.
+            self._fence_after_draft: bool = _connector_option(
+                spec.extra_config, "fence_after_draft", False
+            )
+            self._deferred_fence_ids: set[int] = set()
+            if self._fence_after_draft:
+                logger.info(
+                    "TPURaidenOffloadingConnector: fence_after_draft: store "
+                    "fences are recorded one get_finished() call later so they "
+                    "order after the step's draft (MTP) KV writes"
+                )
 
     # -- scheduler-side hooks ----------------------------------------------
     def reset_cache(self) -> bool | None:
@@ -433,6 +992,11 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         if self.connector_scheduler is not None:
             return self.connector_scheduler.take_events()
         return []
+
+    def poll_and_complete_transfers(self, scheduler: Any) -> tuple[int, int, int, bool]:
+        if isinstance(self.connector_scheduler, TPURaidenOffloadingScheduler):
+            return self.connector_scheduler.poll_and_complete_transfers(scheduler)
+        return (0, 0, 0, False)
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(
@@ -519,7 +1083,14 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         meta = self._get_connector_metadata()
         assert isinstance(meta, RaidenOffloadingConnectorMetadata)
 
-        if meta.fence_job_ids:
+        fence_job_ids = set(meta.fence_job_ids)
+        if getattr(self, "_fence_after_draft", False):
+            fence_job_ids, self._deferred_fence_ids = (
+                self._deferred_fence_ids,
+                fence_job_ids,
+            )
+
+        if fence_job_ids:
             # Establish an asynchronous device fence before acknowledging store jobs:
             # 1. Dispatch any deferred pool writes so they precede the fence event.
             # 2. Record a stream event to track completion without host-side blocking.
@@ -527,9 +1098,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 "KV pool tensors must be registered before the save fence"
             )
             _enqueue_pool_writes(self._pool_sync_tensors)
-            self._pending_fences.append(
-                (set(meta.fence_job_ids), _record_fence_event())
-            )
+            self._pending_fences.append((fence_job_ids, _record_fence_event()))
 
         if self._pending_fences:
             # Non-blockingly drain retired events and acknowledge completed fences.

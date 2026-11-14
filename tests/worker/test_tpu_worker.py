@@ -815,3 +815,184 @@ def _run_spawn_probes():
 
 if __name__ == "__main__":
     _run_spawn_probes()
+
+
+class TestLatePollModelRunnerOutput:
+    """The late-poll wrapper adds landed loads to the step's output."""
+
+    def _output(self, kv_connector_output=None):
+        from vllm.v1.outputs import AsyncModelRunnerOutput
+
+        inner_output = SimpleNamespace(kv_connector_output=kv_connector_output)
+
+        class _Inner(AsyncModelRunnerOutput):
+            def get_output(self):
+                return inner_output
+
+            def get_kv_connector_output(self):
+                return inner_output.kv_connector_output
+
+        return _Inner()
+
+    def test_creates_connector_output_when_the_step_had_none(self):
+        from vllm_torchtpu.worker.tpu_worker import _LatePollModelRunnerOutput
+
+        wrapped = _LatePollModelRunnerOutput(self._output(), [lambda: {"r1"}])
+        out = wrapped.get_output()
+        assert out.kv_connector_output.finished_recving == {"r1"}
+
+    def test_merges_into_the_step_output(self):
+        from vllm.v1.outputs import KVConnectorOutput
+
+        from vllm_torchtpu.worker.tpu_worker import _LatePollModelRunnerOutput
+
+        kv = KVConnectorOutput(finished_recving={"r0"}, finished_sending={"s0"})
+        wrapped = _LatePollModelRunnerOutput(
+            self._output(kv), [lambda: {"r1"}, lambda: set()]
+        )
+        out = wrapped.get_output()
+        assert out.kv_connector_output.finished_recving == {"r0", "r1"}
+        assert out.kv_connector_output.finished_sending == {"s0"}
+
+    def test_nothing_landed_leaves_the_output_alone(self):
+        from vllm_torchtpu.worker.tpu_worker import _LatePollModelRunnerOutput
+
+        wrapped = _LatePollModelRunnerOutput(self._output(), [lambda: set()])
+        assert wrapped.get_output().kv_connector_output is None
+
+
+class TestDeferredNoForwardOutput:
+    """The zero-token step output waits for the dummy batch, then polls."""
+
+    def _worker(self):
+        worker = object.__new__(TPUWorker)
+        worker._dummy_batch_cv = __import__("threading").Condition()
+        worker._dummy_batch_count = 0
+        return worker
+
+    def test_polls_after_the_dummy_batch(self):
+        import threading
+
+        from vllm_torchtpu.worker.tpu_worker import _DeferredNoForwardOutput
+
+        worker = self._worker()
+        seen_count: list[int] = []
+
+        def poll():
+            seen_count.append(worker._dummy_batch_count)
+            return {"r1"}
+
+        out = _DeferredNoForwardOutput(
+            SimpleNamespace(kv_connector_output=None), worker, [poll], 0
+        )
+        out.timeout_s = 5.0
+        timer = threading.Timer(0.05, worker._note_dummy_batch_done)
+        timer.start()
+        result = out.get_output()
+        assert seen_count == [1]
+        assert result.kv_connector_output.finished_recving == {"r1"}
+
+    def test_timeout_bounds_the_wait(self):
+        import time
+
+        from vllm_torchtpu.worker.tpu_worker import _DeferredNoForwardOutput
+
+        worker = self._worker()
+        out = _DeferredNoForwardOutput(
+            SimpleNamespace(kv_connector_output=None), worker, [lambda: set()], 0
+        )
+        out.timeout_s = 0.02
+        t = time.monotonic()
+        result = out.get_output()
+        assert 0.015 <= time.monotonic() - t < 1.0
+        assert result.kv_connector_output is None
+
+
+class TestStage3LatePollers:
+    """Only a connector worker with the late_poll option on is polled late, so
+    with the option unset no step output is wrapped."""
+
+    @staticmethod
+    def _worker():
+        from vllm_torchtpu.worker.tpu_worker import TPUWorker
+
+        return object.__new__(TPUWorker)
+
+    def test_pollers_follow_the_connector_option(self, monkeypatch):
+        import vllm_torchtpu.worker.tpu_worker as tpu_worker_mod
+
+        on = SimpleNamespace(
+            connector_worker=SimpleNamespace(
+                late_poll_finished_recving=lambda: set(), late_poll_enabled=True
+            )
+        )
+        off = SimpleNamespace(
+            connector_worker=SimpleNamespace(
+                late_poll_finished_recving=lambda: set(), late_poll_enabled=False
+            )
+        )
+        connector = SimpleNamespace(_connectors=[off, on])
+        monkeypatch.setattr(tpu_worker_mod, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(tpu_worker_mod, "get_kv_transfer_group", lambda: connector)
+        worker = self._worker()
+        assert worker._stage3_late_pollers() == [
+            on.connector_worker.late_poll_finished_recving
+        ]
+
+    def test_sample_tokens_left_alone_without_the_option(self, monkeypatch):
+        from vllm.v1.outputs import AsyncModelRunnerOutput
+
+        import vllm_torchtpu.worker.tpu_worker as tpu_worker_mod
+
+        off = SimpleNamespace(
+            connector_worker=SimpleNamespace(
+                late_poll_finished_recving=lambda: {"r1"}, late_poll_enabled=False
+            )
+        )
+        monkeypatch.setattr(tpu_worker_mod, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(
+            tpu_worker_mod,
+            "get_kv_transfer_group",
+            lambda: SimpleNamespace(_connectors=[off]),
+        )
+
+        class _Out(AsyncModelRunnerOutput):
+            def get_output(self):
+                return SimpleNamespace(kv_connector_output=None)
+
+            def get_kv_connector_output(self):
+                return None
+
+        out = _Out()
+        worker = self._worker()
+        worker.model_runner = SimpleNamespace(sample_tokens=lambda g: out)
+        assert worker.sample_tokens(None) is out
+
+
+class TestLatePollSalvage:
+    """vLLM 0.33 salvages a failed step's connector output through
+    get_kv_connector_output(); the wrappers pass the wrapped one through."""
+
+    def test_wrappers_return_the_wrapped_connector_output(self):
+        from vllm.v1.outputs import AsyncModelRunnerOutput
+
+        from vllm_torchtpu.worker.tpu_worker import (
+            _DeferredNoForwardOutput,
+            _LatePollModelRunnerOutput,
+        )
+
+        kv = object()
+
+        class _Inner(AsyncModelRunnerOutput):
+            def get_output(self):
+                raise RuntimeError("step failed")
+
+            def get_kv_connector_output(self):
+                return kv
+
+        late = _LatePollModelRunnerOutput(_Inner(), [lambda: {"r1"}])
+        assert late.get_kv_connector_output() is kv
+        deferred = _DeferredNoForwardOutput(
+            SimpleNamespace(kv_connector_output=kv), object(), [lambda: {"r1"}], 0
+        )
+        assert deferred.get_kv_connector_output() is kv

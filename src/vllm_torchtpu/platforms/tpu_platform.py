@@ -34,6 +34,9 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.platforms.dcp_validation import (
+    validate_decode_context_parallel_config,
+)
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
@@ -930,6 +933,7 @@ class TpuPlatform(Platform):
                 "represented as a JAX mesh axis."
             )
         validate_pipeline_parallel_config(vllm_config)
+        validate_decode_context_parallel_config(vllm_config)
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
             # get the hand-off's engine side here; engine-core processes

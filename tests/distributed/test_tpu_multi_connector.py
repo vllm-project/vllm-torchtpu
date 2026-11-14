@@ -229,3 +229,92 @@ class TestTPUMultiConnectorDivergentHitWarning:
         )
 
         assert not log.warning.called
+
+
+class TestTPUMultiConnectorHybridHitForwarding:
+    """The prefix-hit hooks PrefixAwareScheduler calls on the connector."""
+
+    @staticmethod
+    def _multi(*children, producer_divergent_hits=True):
+        connector = object.__new__(TPUMultiConnector)
+        connector._connectors = list(children)
+        connector._producer_divergent_hits = producer_divergent_hits
+        return connector
+
+    def test_divergent_hits_claimed_when_any_child_supports_them(self):
+        producer = SimpleNamespace(supports_divergent_local_hybrid_hits=False)
+        offload = SimpleNamespace(supports_divergent_local_hybrid_hits=True)
+
+        assert self._multi(producer, offload).supports_divergent_local_hybrid_hits
+        assert not self._multi(producer).supports_divergent_local_hybrid_hits
+
+    def test_divergent_hit_resolved_by_first_child_with_an_answer(self):
+        disagg = SimpleNamespace()
+        declines = SimpleNamespace(resolve_divergent_local_hit_tokens=lambda *a: None)
+        offload = SimpleNamespace(
+            resolve_divergent_local_hit_tokens=MagicMock(return_value=256)
+        )
+
+        multi = self._multi(disagg, declines, offload)
+        assert multi.resolve_divergent_local_hit_tokens("req", 512, 128, 128) == 256
+        offload.resolve_divergent_local_hit_tokens.assert_called_once_with(
+            "req", 512, 128, 128
+        )
+        assert (
+            self._multi(disagg).resolve_divergent_local_hit_tokens("req", 512, 128, 128)
+            is None
+        )
+
+    def test_transfer_polls_are_summed_across_children(self):
+        scheduler = object()
+        first = SimpleNamespace(
+            poll_and_complete_transfers=MagicMock(return_value=(10, 1, 0, False))
+        )
+        second = SimpleNamespace(
+            poll_and_complete_transfers=MagicMock(return_value=(5, 0, 2, True))
+        )
+
+        multi = self._multi(first, SimpleNamespace(), second)
+        assert multi.poll_and_complete_transfers(scheduler) == (15, 1, 2, True)
+        first.poll_and_complete_transfers.assert_called_once_with(scheduler)
+        second.poll_and_complete_transfers.assert_called_once_with(scheduler)
+
+
+class TestProducerDivergentHitsOption:
+    """producer_divergent_hits is opt-in: unset, upstream's every-child rule
+    decides, which on a producer is False (the transfer child never loads)."""
+
+    @staticmethod
+    def _config(kv_role, option):
+        cfg = _make_vllm_config(kv_role, children=("_IncapableChild", "_CapableChild"))
+        if option is not None:
+            cfg.kv_transfer_config.kv_connector_extra_config[
+                "producer_divergent_hits"
+            ] = option
+        return cfg
+
+    @pytest.mark.parametrize(
+        ("kv_role", "option", "expected"),
+        [
+            ("kv_producer", None, False),
+            ("kv_producer", False, False),
+            ("kv_producer", True, True),
+            # On a consumer the option changes nothing: every child must agree.
+            ("kv_consumer", True, False),
+            ("kv_consumer", None, False),
+        ],
+    )
+    def test_capability(self, kv_role, option, expected):
+        connector = TPUMultiConnector(
+            self._config(kv_role, option), KVConnectorRole.SCHEDULER, MagicMock()
+        )
+        assert connector.supports_divergent_local_hybrid_hits is expected
+
+    @pytest.mark.parametrize("value", ["true", 1, "1"])
+    def test_option_must_be_a_json_boolean(self, value):
+        with pytest.raises(ValueError, match="producer_divergent_hits"):
+            TPUMultiConnector(
+                self._config("kv_producer", value),
+                KVConnectorRole.SCHEDULER,
+                MagicMock(),
+            )

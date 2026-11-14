@@ -16,8 +16,10 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import copy
 import ctypes
 import os
+import threading
 import time
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -46,6 +48,7 @@ from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import AsyncModelRunnerOutput, KVConnectorOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
@@ -94,6 +97,83 @@ def _release_free_host_heap() -> None:
         logger.info("Released free host heap via glibc malloc_trim.")
 
 
+class _DeferredNoForwardOutput(AsyncModelRunnerOutput):
+    """Holds a zero-token step's output until the DP dummy batch that
+    follows it has run, then adds the loads that landed meanwhile.
+
+    An engine whose only requests wait for remote KV schedules nothing, and
+    the DP engine loop runs a dummy batch before it reads that step's
+    output. Polled at the step's start, a load that lands during the dummy
+    batch waits for the next zero-token step; polled here, after the dummy
+    batch, it is scheduled one step earlier. The wait is bounded so a loop
+    that runs no dummy batch (every engine idle) is held at most
+    ``timeout_s``.
+    """
+
+    timeout_s = 0.05
+
+    def __init__(self, output, worker: "TPUWorker", pollers: list, generation: int):
+        self._output = output
+        self._worker = worker
+        self._pollers = pollers
+        self._generation = generation
+
+    def get_output(self):
+        self._worker._wait_for_dummy_batch_after(self._generation, self.timeout_s)
+        output = self._output
+        ready: set[str] = set()
+        for poll in self._pollers:
+            ready |= poll()
+        if ready:
+            kv_output = output.kv_connector_output
+            if kv_output is None:
+                output = copy.copy(output)
+                output.kv_connector_output = KVConnectorOutput(finished_recving=ready)
+            else:
+                kv_output.finished_recving = (
+                    set(kv_output.finished_recving or ()) | ready
+                )
+        return output
+
+    def get_kv_connector_output(self):
+        # Salvage path when get_output fails: the step's own connector output,
+        # without polling (records stay with the connector for its next poll).
+        return self._output.kv_connector_output
+
+
+class _LatePollModelRunnerOutput(AsyncModelRunnerOutput):
+    """Adds the loads that landed during the step to its output.
+
+    get_output blocks until the step's sampled tokens are on the host, which
+    is the end of the step; the connector poll runs then, so a load that
+    completed during the step is reported with this step instead of with
+    the next one's step-start poll.
+    """
+
+    def __init__(self, inner: AsyncModelRunnerOutput, pollers: list):
+        self._inner = inner
+        self._pollers = pollers
+
+    def get_output(self):
+        output = self._inner.get_output()
+        ready: set[str] = set()
+        for poll in self._pollers:
+            ready |= poll()
+        if ready:
+            kv_output = output.kv_connector_output
+            if kv_output is None:
+                output.kv_connector_output = KVConnectorOutput(finished_recving=ready)
+            else:
+                kv_output.finished_recving = (
+                    set(kv_output.finished_recving or ()) | ready
+                )
+        return output
+
+    def get_kv_connector_output(self):
+        # Salvage path when get_output fails: the wrapped output's, unpolled.
+        return self._inner.get_kv_connector_output()
+
+
 class TPUWorker(WorkerBase):
     def __init__(
         self,
@@ -120,6 +200,9 @@ class TPUWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+        # Counts DP dummy batches, for _DeferredNoForwardOutput.
+        self._dummy_batch_cv = threading.Condition()
+        self._dummy_batch_count = 0
 
         # Multi-host object-storage serve: ranks on hosts other than the API
         # server's receive a model_config.model rewritten to a local aux-file
@@ -679,10 +762,60 @@ class TPUWorker(WorkerBase):
         )
 
     def execute_model(self, scheduler_output):
-        return self.model_runner.execute_model(scheduler_output)
+        output = self.model_runner.execute_model(scheduler_output)
+        if (
+            output is not None
+            and scheduler_output.total_num_scheduled_tokens == 0
+            and self.scheduler_config.async_scheduling
+            and self.parallel_config.data_parallel_size > 1
+            and not isinstance(output, AsyncModelRunnerOutput)
+        ):
+            pollers = self._stage3_late_pollers()
+            if pollers:
+                with self._dummy_batch_cv:
+                    generation = self._dummy_batch_count
+                return _DeferredNoForwardOutput(output, self, pollers, generation)
+        return output
+
+    def _wait_for_dummy_batch_after(self, generation: int, timeout_s: float) -> None:
+        """Blocks until a dummy batch newer than ``generation`` has run, or
+        ``timeout_s`` has passed."""
+        deadline = time.monotonic() + timeout_s
+        with self._dummy_batch_cv:
+            while self._dummy_batch_count <= generation:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._dummy_batch_cv.wait(remaining):
+                    return
 
     def sample_tokens(self, grammar_output):
-        return self.model_runner.sample_tokens(grammar_output)
+        output = self.model_runner.sample_tokens(grammar_output)
+        if isinstance(output, AsyncModelRunnerOutput):
+            pollers = self._stage3_late_pollers()
+            if pollers:
+                return _LatePollModelRunnerOutput(output, pollers)
+        return output
+
+    def _stage3_late_pollers(self) -> list:
+        """Connector workers that report Stage-3 loads off the step.
+
+        Only a Raiden connector whose kv_connector_extra_config turns on
+        late_poll is listed, so with the option unset no step output is
+        wrapped.
+        """
+        pollers = getattr(self, "_stage3_late_poller_list", None)
+        if pollers is not None:
+            return pollers
+        pollers = []
+        if has_kv_transfer_group():
+            connector = get_kv_transfer_group()
+            children = getattr(connector, "_connectors", None) or [connector]
+            for child in children:
+                worker = getattr(child, "connector_worker", None)
+                fn = getattr(worker, "late_poll_finished_recving", None)
+                if callable(fn) and getattr(worker, "late_poll_enabled", False):
+                    pollers.append(fn)
+        self._stage3_late_poller_list = pollers
+        return pollers
 
     def profile_pipeline_chunks(self) -> dict:
         return self.model_runner.profile_pipeline_chunks()
@@ -707,10 +840,17 @@ class TPUWorker(WorkerBase):
                 runner.max_num_blocks_per_req,
                 use_max_model_len=True,
             )
+            self._note_dummy_batch_done()
             return
         # Single DP-EP pairing entry: all target dummy forwards, then all draft
         # dummy forwards, in the runner that owns the state.
         runner._run_dp_idle_pairing(bucket, target_num_chunks)
+        self._note_dummy_batch_done()
+
+    def _note_dummy_batch_done(self) -> None:
+        with self._dummy_batch_cv:
+            self._dummy_batch_count += 1
+            self._dummy_batch_cv.notify_all()
 
     def profile(
         self,

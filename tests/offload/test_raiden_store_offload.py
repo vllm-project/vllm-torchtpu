@@ -1265,6 +1265,51 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         self.assertEqual(meta.finished_load_jobs, {3: "r1"})
         self.assertEqual(meta.failed_load_req_ids, {"r1"})
 
+    def _attach_scheduler(self, sched):
+        scheduler = MagicMock()
+        scheduler.requests = {"r1": object()}
+        sched._scheduler = scheduler
+        sched._jobs = {}
+        sched._req_status = {}
+        sched._pending_failed_jobs = []
+        return scheduler
+
+    def _load_then_finish(self, success):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+            OffloadingConnectorScheduler,
+        )
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        seed_host_entries(store, _key(0))
+        manager.prepare_load([_key(0)], _ctx("r1"))
+        sched = self._make_scheduler(manager)
+        self._build_meta(
+            sched, self._stock_meta(load_jobs={3: self._load_job([_key(0)], [10])})
+        )
+        scheduler = self._attach_scheduler(sched)
+        store.complete_load(sub_hashes(_key(0)), success=success)
+        with patch.object(OffloadingConnectorScheduler, "update_connector_output"):
+            meta = self._build_meta(sched, self._stock_meta())
+        return meta, scheduler
+
+    def test_direct_completion_finishes_a_load_on_the_scheduler(self):
+        # With the scheduler attached by the schedule-start poll, a finished
+        # load completes on the scheduler at once instead of being echoed.
+        meta, scheduler = self._load_then_finish(success=True)
+        self.assertEqual(meta.finished_load_jobs, {})
+        self.assertEqual(meta.failed_load_req_ids, set())
+        (call,) = scheduler._update_from_kv_xfer_finished.call_args_list
+        self.assertEqual(call.args[0].finished_recving, {"r1"})
+
+    def test_direct_completion_reports_a_failed_load_by_request(self):
+        # A failed load is never completed directly: it travels through the
+        # worker echo and reaches the scheduler as a failed request.
+        meta, scheduler = self._load_then_finish(success=False)
+        self.assertEqual(meta.finished_load_jobs, {3: "r1"})
+        self.assertEqual(meta.failed_load_req_ids, {"r1"})
+        scheduler._update_from_kv_xfer_finished.assert_not_called()
+
     def test_flush_cancels_fence_pending_store(self):
         store = FakeKVCacheStore()
         manager = make_manager(store)
@@ -1496,6 +1541,458 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         self.assertEqual(job.src_spec.block_ids.tolist(), [1, 2])
 
 
+class TestSchedulerUpstreamContract(unittest.TestCase):
+    """The scheduler overrides against the upstream OffloadingConnectorScheduler
+    they extend: signatures the upstream callers use, the load cap they pass
+    through, recency refresh, and the queue a pending async load waits in."""
+
+    def test_overrides_keep_the_upstream_signatures(self):
+        import inspect
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        from vllm_torchtpu import _patch_vllm_offload_fine_prefix_alignment
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        # Compare against the class as the engine runs it. The TPU patch stages
+        # wrap upstream's _lookup, and an earlier test in this process may have
+        # applied them already; both attributes are restored on exit.
+        with (
+            patch.object(
+                OffloadingConnectorScheduler,
+                "_lookup",
+                OffloadingConnectorScheduler._lookup,
+            ),
+            patch.object(
+                OffloadingConnectorScheduler,
+                "_tpu_fine_prefix_alignment",
+                False,
+                create=True,
+            ),
+        ):
+            _patch_vllm_offload_fine_prefix_alignment()
+            for name in (
+                "get_num_new_matched_tokens",
+                "_lookup",
+                "update_state_after_alloc",
+                "_build_store_jobs",
+            ):
+                ours = inspect.signature(getattr(TPURaidenOffloadingScheduler, name))
+                upstream = inspect.signature(
+                    getattr(OffloadingConnectorScheduler, name)
+                )
+                self.assertEqual(list(ours.parameters), list(upstream.parameters), name)
+        # _lookup and _touch build partial-tail keys with the request context.
+        params = inspect.signature(OffloadingConnectorScheduler._make_boundary_key)
+        self.assertIn("req_context", params.parameters)
+
+    def _sched(self, recency=True):
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched.config = SimpleNamespace(
+            kv_group_configs=(SimpleNamespace(tokens_per_chunk=4),),
+            supports_partial_tail=False,
+        )
+        sched._jobs = {}
+        sched._req_status = {}
+        sched._max_async_load_reqs = 0
+        if recency:
+            sched._host_tier_recency = True
+        sched._touch = MagicMock()
+        return sched
+
+    def test_matched_tokens_without_recency_is_upstreams_answer(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        # host_tier_recency unset: upstream answers every lookup, including
+        # one from a GPU hit that ends inside a chunk (6 of 4-token chunks),
+        # and nothing is touched.
+        sched = self._sched(recency=False)
+        req = SimpleNamespace(request_id="r1")
+        sched._req_status["r1"] = SimpleNamespace(transfer_jobs=set())
+        for computed in (4, 6):
+            with patch.object(
+                OffloadingConnectorScheduler,
+                "get_num_new_matched_tokens",
+                return_value=(8, True),
+            ) as base:
+                result = sched.get_num_new_matched_tokens(
+                    req, computed, max_num_new_tokens=8
+                )
+            self.assertEqual(result, (8, True))
+            base.assert_called_once_with(req, computed, 8)
+        sched._touch.assert_not_called()
+
+    def test_store_jobs_without_recency_touch_nothing(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        sched = self._sched(recency=False)
+        sched._req_status = {"r1": object()}
+        jobs = {1: SimpleNamespace(req_id="r1")}
+        with patch.object(
+            OffloadingConnectorScheduler, "_build_store_jobs", return_value=jobs
+        ):
+            self.assertIs(sched._build_store_jobs(MagicMock()), jobs)
+        sched._touch.assert_not_called()
+
+    def test_matched_tokens_forwards_the_load_cap_and_refreshes_recency(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        sched = self._sched()
+        req = SimpleNamespace(request_id="r1")
+        req_status = SimpleNamespace(transfer_jobs=set())
+        sched._req_status["r1"] = req_status
+        with patch.object(
+            OffloadingConnectorScheduler,
+            "get_num_new_matched_tokens",
+            return_value=(8, True),
+        ) as base:
+            result = sched.get_num_new_matched_tokens(req, 4, max_num_new_tokens=8)
+        self.assertEqual(result, (8, True))
+        base.assert_called_once_with(req, 4, 8)
+        sched._touch.assert_called_once_with(req_status)
+
+    def test_matched_tokens_deferred_for_transfers_touches_nothing(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        sched = self._sched()
+        req = SimpleNamespace(request_id="r1")
+        sched._req_status["r1"] = SimpleNamespace(transfer_jobs={7})
+        with patch.object(
+            OffloadingConnectorScheduler,
+            "get_num_new_matched_tokens",
+            return_value=(None, False),
+        ):
+            self.assertEqual(sched.get_num_new_matched_tokens(req, 4), (None, False))
+        sched._touch.assert_not_called()
+
+    def test_store_jobs_refresh_each_offloading_request_once(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        sched = self._sched()
+        sched._req_status = {"r1": object(), "r2": object()}
+        jobs = {
+            1: SimpleNamespace(req_id="r1"),
+            2: SimpleNamespace(req_id="r2"),
+            3: SimpleNamespace(req_id="r1"),
+        }
+        with patch.object(
+            OffloadingConnectorScheduler, "_build_store_jobs", return_value=jobs
+        ):
+            self.assertIs(sched._build_store_jobs(MagicMock()), jobs)
+        self.assertEqual(
+            [c.args[0] for c in sched._touch.call_args_list],
+            [sched._req_status["r1"], sched._req_status["r2"]],
+        )
+
+    def _poll_sched(self, waiting):
+        from vllm.v1.request import RequestStatus
+
+        sched = self._sched()
+        sched._jobs = {5: SimpleNamespace(is_store=False)}
+        manager = MagicMock()
+        manager.poll_finished_jobs.return_value = []
+        manager.has_pending_work.return_value = True
+        sched._raiden_manager = manager
+        request = SimpleNamespace(
+            request_id="r1",
+            status=RequestStatus.WAITING_FOR_REMOTE_KVS
+            if waiting
+            else RequestStatus.WAITING,
+        )
+        scheduler = SimpleNamespace(
+            kv_holding_waiting=[request],
+            finished_recving_kv_req_ids=set(),
+            running=[object()],
+        )
+        return sched, scheduler
+
+    def test_poll_waits_for_a_load_parked_in_kv_holding_waiting(self):
+        from vllm_torchtpu.offload import raiden_connector
+
+        with patch.object(raiden_connector, "_LOAD_WAIT_MS", 0.5):
+            sched, scheduler = self._poll_sched(waiting=True)
+            _, early, waited_reqs, waited = sched.poll_and_complete_transfers(scheduler)
+            self.assertEqual((early, waited_reqs, waited), (0, 0, True))
+            self.assertIs(sched._scheduler, scheduler)
+
+            sched, scheduler = self._poll_sched(waiting=False)
+            _, _, _, waited = sched.poll_and_complete_transfers(scheduler)
+            self.assertFalse(waited)
+
+
+class TestHostTierRecency(unittest.TestCase):
+    """The touch order, the FullAttention re-offer and the store order that
+    keep an active conversation's host-tier keys ahead of inactive ones,
+    under the host_tier_recency option; unset, the upstream paths run."""
+
+    @staticmethod
+    def _sched(recency=True):
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        if recency:
+            sched._host_tier_recency = True
+        sched.config = SimpleNamespace(
+            kv_group_configs=(
+                SimpleNamespace(
+                    group_idx=0, sliding_window_size_in_chunks=None, tokens_per_chunk=4
+                ),
+                SimpleNamespace(
+                    group_idx=1, sliding_window_size_in_chunks=1, tokens_per_chunk=4
+                ),
+            ),
+            supports_partial_tail=True,
+            tokens_per_hash=2,
+        )
+        sched._partial_tail_block_size = 4
+        sched.manager = MagicMock()
+        sched._make_boundary_key = lambda req, group_idx, boundary, ctx: (
+            "tail",
+            group_idx,
+            boundary,
+        )
+        return sched
+
+    def test_touch_order_full_attention_tail_first_then_state_then_tails(self):
+        sched = self._sched()
+        req_status = SimpleNamespace(
+            num_locally_computed_tokens=6,
+            req=SimpleNamespace(block_hashes=[0] * 8, shared_prefix_boundary=0),
+            req_context="ctx",
+            partial_tail_boundary=None,
+            group_states=(
+                SimpleNamespace(offload_keys=["fa0", "fa1", "fa2"], num_hit_chunks=0),
+                SimpleNamespace(offload_keys=["s0", "s1", "s2"], num_hit_chunks=3),
+            ),
+        )
+        sched._touch(req_status)
+        touched = [list(c.args[0]) for c in sched.manager.touch.call_args_list]
+        self.assertEqual(
+            touched,
+            [
+                ["fa2", "fa1", "fa0"],
+                ["s2"],
+                [("tail", 0, 6), ("tail", 1, 6)],
+            ],
+        )
+
+    def test_full_attention_groups_are_offered_from_chunk_zero_again(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        for recency, expected in ((True, (0, 5)), (False, (5, 5))):
+            sched = self._sched(recency)
+            fa = SimpleNamespace(next_stored_chunk_idx=5)
+            state = SimpleNamespace(next_stored_chunk_idx=5)
+            sched._req_status = {"r1": SimpleNamespace(group_states=(fa, state))}
+            with patch.object(
+                OffloadingConnectorScheduler, "update_state_after_alloc"
+            ) as base:
+                sched.update_state_after_alloc(
+                    SimpleNamespace(request_id="r1"), None, 0
+                )
+            base.assert_called_once()
+            self.assertEqual(
+                (fa.next_stored_chunk_idx, state.next_stored_chunk_idx),
+                expected,
+                f"host_tier_recency={recency}",
+            )
+
+    def test_lookup_without_recency_is_upstreams(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        req_status = SimpleNamespace(partial_tail_boundary=None)
+        for recency, expected in ((False, 3), (True, 0)):
+            sched = self._sched(recency)
+            sched.config.supports_partial_tail = False
+            sched._lookup_complete_chunks = MagicMock(return_value=0)
+            # The class attribute as the engine runs it may be the TPU
+            # fine-prefix wrapper; either way the override must defer to it.
+            with patch.object(
+                OffloadingConnectorScheduler, "_lookup", return_value=3
+            ) as base:
+                self.assertEqual(sched._lookup(req_status, 8), expected)
+            if recency:
+                base.assert_not_called()
+                sched._lookup_complete_chunks.assert_called_once_with(req_status, 8)
+            else:
+                base.assert_called_once_with(req_status, 8)
+                sched._lookup_complete_chunks.assert_not_called()
+
+    def test_fence_acknowledged_stores_launch_largest_first(self):
+        # With the option; unset, they launch in acknowledgement order.
+        self.assertEqual(self._launch_order(recency=True), [2, 3, 1])
+        self.assertEqual(self._launch_order(recency=False), [1, 2, 3])
+
+    @staticmethod
+    def _launch_order(recency):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        from vllm_torchtpu.offload.raiden_connector import (
+            RaidenOffloadingWorkerMetadata,
+            TPURaidenOffloadingScheduler,
+            _ParkedStore,
+        )
+
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        if recency:
+            sched._host_tier_recency = True
+        sched.config = SimpleNamespace(num_workers=1)
+        sched._raiden_manager = MagicMock()
+        sched._fence_pending = {
+            1: _ParkedStore(keys=["a"], device_block_ids=[1]),
+            2: _ParkedStore(keys=["b", "c", "d"], device_block_ids=[2, 3, 4]),
+            3: _ParkedStore(keys=["e", "f"], device_block_ids=[5, 6]),
+        }
+        output = SimpleNamespace(
+            kv_connector_worker_meta=RaidenOffloadingWorkerMetadata(
+                fenced_jobs={1: 1, 2: 1, 3: 1}
+            )
+        )
+        with patch.object(OffloadingConnectorScheduler, "update_connector_output"):
+            sched.update_connector_output(output)
+        return [
+            c.args[0] for c in sched._raiden_manager.submit_store_job.call_args_list
+        ]
+
+
+class TestOffloadConnectorOptions(unittest.TestCase):
+    """max_async_loads, fence_after_draft and host_tier_recency are opt-in
+    kv_connector_extra_config options: unset, the connector behaves as before."""
+
+    def test_option_defaults_and_types(self):
+        from vllm_torchtpu.offload.raiden_connector import _connector_option
+
+        self.assertEqual(_connector_option({}, "max_async_loads", 0), 0)
+        self.assertEqual(
+            _connector_option({"max_async_loads": 16}, "max_async_loads", 0), 16
+        )
+        for name in ("fence_after_draft", "host_tier_recency"):
+            self.assertIs(_connector_option({}, name, False), False)
+            self.assertIs(_connector_option({name: True}, name, False), True)
+            for bad in ("1", 1, None):
+                with self.assertRaises(ValueError):
+                    _connector_option({name: bad}, name, False)
+        for bad in ("16", True, -1, 1.5):
+            with self.assertRaises(ValueError):
+                _connector_option({"max_async_loads": bad}, "max_async_loads", 0)
+
+    def _capped(self, cap):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched.config = SimpleNamespace(
+            kv_group_configs=(SimpleNamespace(tokens_per_chunk=4),),
+            supports_partial_tail=False,
+        )
+        # One host-tier load is already in flight.
+        sched._jobs = {9: SimpleNamespace(is_store=False)}
+        req_status = MagicMock(transfer_jobs=set(), partial_tail_boundary=None)
+        sched._req_status = {"r1": req_status}
+        sched._max_async_load_reqs = cap
+        sched._touch = MagicMock()
+        sched._quiet_lookup = MagicMock(return_value=8)
+        req = SimpleNamespace(request_id="r1")
+        with patch.object(
+            OffloadingConnectorScheduler,
+            "get_num_new_matched_tokens",
+            return_value=(8, True),
+        ) as base:
+            result = sched.get_num_new_matched_tokens(req, 4)
+        return result, base.called
+
+    def test_scheduler_reads_its_option_with_the_uncapped_default(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+        from vllm_torchtpu.offload.raiden_store import RaidenOffloadingManager
+
+        def fake_init(self, spec, vllm_config, kv_cache_config):
+            self.manager = object.__new__(RaidenOffloadingManager)
+            self.config = SimpleNamespace(sync_load_budget_bytes=0)
+
+        with patch.object(OffloadingConnectorScheduler, "__init__", fake_init):
+            unset = TPURaidenOffloadingScheduler(
+                SimpleNamespace(extra_config={}), None, None
+            )
+            capped = TPURaidenOffloadingScheduler(
+                SimpleNamespace(extra_config={"max_async_loads": 16}), None, None
+            )
+            recency = TPURaidenOffloadingScheduler(
+                SimpleNamespace(extra_config={"host_tier_recency": True}), None, None
+            )
+        self.assertEqual(unset._max_async_load_reqs, 0)
+        self.assertEqual(capped._max_async_load_reqs, 16)
+        self.assertIs(unset._host_tier_recency, False)
+        self.assertIs(recency._host_tier_recency, True)
+
+    def test_worker_reads_fence_after_draft_off_by_default(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorBase_V1,
+        )
+
+        from vllm_torchtpu.offload import raiden_connector
+
+        def worker_connector(extra_config):
+            spec = SimpleNamespace(extra_config=extra_config)
+            with (
+                patch.object(KVConnectorBase_V1, "__init__", lambda *args: None),
+                patch.object(
+                    raiden_connector.offloading_config_module,
+                    "build_offloading_config",
+                ),
+                patch.object(
+                    raiden_connector,
+                    "TPURaidenStoreOffloadingSpec",
+                    return_value=spec,
+                ),
+                patch.object(raiden_connector, "OffloadingConnectorWorker"),
+                # The connector pins RAIDEN_DISABLE_SINGLETON_WORKER in os.environ.
+                patch.dict(os.environ),
+            ):
+                return raiden_connector.TPURaidenOffloadingConnector(
+                    None, KVConnectorRole.WORKER, None
+                )
+
+        self.assertIs(worker_connector({})._fence_after_draft, False)
+        self.assertIs(
+            worker_connector({"fence_after_draft": True})._fence_after_draft, True
+        )
+
+    def test_no_cap_by_default(self):
+        self.assertEqual(self._capped(0), ((8, True), True))
+
+    def test_cap_defers_a_hit_while_loads_are_in_flight(self):
+        self.assertEqual(self._capped(1), ((None, False), False))
+        self.assertEqual(self._capped(2), ((8, True), True))
+
+
 class TestWorkerSideConnector(unittest.TestCase):
     def _make_worker_connector(self):
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
@@ -1557,6 +2054,32 @@ class TestWorkerSideConnector(unittest.TestCase):
             conn.get_finished(set())
         self.assertEqual(conn._fenced_jobs, {7: 1, 8: 1})
         self.assertEqual(conn._pending_fences, [])
+
+    def test_fence_after_draft_records_a_step_fence_one_call_later(self):
+        conn = self._make_worker_connector()
+        conn._pool_sync_tensors = [MagicMock()]
+        conn._fence_after_draft = True
+        conn._deferred_fence_ids = set()
+        recorded = []
+        with (
+            patch("vllm_torchtpu.offload.raiden_connector._enqueue_pool_writes"),
+            patch(
+                "vllm_torchtpu.offload.raiden_connector._record_fence_event",
+                side_effect=lambda: recorded.append(1) or object(),
+            ),
+            patch(
+                "vllm_torchtpu.offload.raiden_connector._event_is_retired",
+                return_value=False,
+            ),
+        ):
+            conn._connector_metadata = self._meta(fence_job_ids={7})
+            conn.get_finished(set())
+            # The step's fence waits for the next call (after the draft).
+            self.assertEqual(conn._pending_fences, [])
+            conn._connector_metadata = self._meta()
+            conn.get_finished(set())
+        self.assertEqual([ids for ids, _ in conn._pending_fences], [{7}])
+        self.assertEqual(len(recorded), 1)
 
     def test_event_retirement_propagates_execution_errors(self):
         from vllm_torchtpu.offload.raiden_connector import _event_is_retired
