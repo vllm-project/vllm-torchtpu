@@ -222,10 +222,51 @@ def test_layer_notes_bound_per_precedence(monkeypatch, env_value, config_value, 
     layer = types.SimpleNamespace(
         k_norm=types.SimpleNamespace(weight=torch.full((DIM,), 0.5)),
         head_dim=DIM,
-        prefix="layers.3.self_attn",
+        prefix="model.layers.3.self_attn",
+        main_kv_dcp=2,
     )
     qsa.Qwen4ExpQSA._note_key_norm_bound(layer)
     if noted:
         assert bsp.key_norm_bound() == pytest.approx(16 * 1.5)
     else:
         assert bsp.key_norm_bound() is None
+
+
+@pytest.mark.parametrize("prefix,dcp", [("mtp.layers.48.self_attn", 2), ("model.layers.3.self_attn", 1)])
+def test_mtp_and_non_dcp_layers_do_not_note(monkeypatch, prefix, dcp):
+    import types
+
+    import torch
+    import vllm.config
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import qsa
+
+    monkeypatch.setattr(bsp, "_KEY_NORM_BOUND", None)
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_BOUND_STAB", "1")
+    cfg = types.SimpleNamespace(additional_config={})
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: cfg)
+    layer = types.SimpleNamespace(
+        k_norm=types.SimpleNamespace(weight=torch.full((DIM,), 6.3)),
+        head_dim=DIM, prefix=prefix, main_kv_dcp=dcp,
+    )
+    qsa.Qwen4ExpQSA._note_key_norm_bound(layer)
+    assert bsp.key_norm_bound() is None
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_high_guard_reruns_when_keys_exceed_bound(interpret, monkeypatch, rank):
+    case = make_case(np.random.default_rng(7), CASES["single"], 24)
+    query = case[0] * 8  # scores far above what a 0.05-scaled bound allows
+    case = (query,) + case[1:]
+    want = attend(case, rank, 0)
+    bsp.note_key_norm_bound(case[-1] * 0.05)
+    _, lse_kernel = kernel_only(case, rank, 0)
+    stab = np.asarray(bsp.bound_stabilizer(query, k_scale=K_SCALE, bound=case[-1] * 0.05))
+    lse_kernel = np.asarray(lse_kernel)
+    fin = np.isfinite(np.asarray(want[1]))
+    # Positive control: the kernel alone sits above the high guard (or overflowed).
+    over = ~np.isfinite(lse_kernel[fin]) | (lse_kernel[fin] - stab[fin] > bsp.BOUND_STAB_GUARD_HIGH)
+    assert over.any()
+    got = attend(case, rank, 0)
+    for a, b in zip(got, want):
+        np.testing.assert_array_equal(bits(a), bits(b))
