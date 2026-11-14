@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import ipaddress
+import socket
 from typing import Any
 
 import torch.distributed.distributed_c10d as c10d
@@ -416,3 +418,144 @@ def _canonicalize_process_group_name(group_name: str, ordinal: int) -> str:
     if meta.kind == "c10d_pg":
         return f"c10d_pg:{ordinal}:size={meta.size}:strides={strides}"
     raise ValueError(f"Cannot resolve process group {group_name!r}")
+
+
+def normalize_ip(addr: str) -> str:
+    """Return canonical string form for IPv4/IPv6 literals, stripping scope IDs."""
+    raw = addr.strip().strip("[]").split("%", 1)[0]
+    try:
+        return str(ipaddress.ip_address(raw))
+    except ValueError:
+        return addr.strip()
+
+
+def lws_pod_hostname(leader_address: str, worker_index: int) -> str:
+    """Derive the DNS name for ``worker_index`` in an LWS replica group."""
+    leader_pod, sep, service_domain = leader_address.partition(".")
+    if not leader_pod or not sep or not service_domain:
+        raise ValueError(
+            "Invalid LWS_LEADER_ADDRESS: expected '<leader-pod>.<service-domain>', "
+            f"got {leader_address!r}."
+        )
+    if worker_index == 0:
+        return leader_address
+    return f"{leader_pod}-{worker_index}.{service_domain}"
+
+
+def resolve_lws_hosts_by_ip(
+    leader_address: str, num_hosts: int
+) -> dict[str, tuple[int, str]]:
+    """Resolve LWS pod DNS names to map normalized node IP -> (worker_index, fqdn)."""
+    lws_group_size = envs.LWS_GROUP_SIZE
+    if lws_group_size == 0:
+        raise ValueError("Invalid value '0' for LWS_GROUP_SIZE: must be >= 1.")
+    group_size = max(num_hosts, lws_group_size)
+    by_ip: dict[str, tuple[int, str]] = {}
+    for worker_index in range(group_size):
+        hostname = lws_pod_hostname(leader_address, worker_index)
+        try:
+            infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            logger.debug("Failed to resolve LWS pod DNS %s: %s", hostname, exc)
+            continue
+        for info in infos:
+            sockaddr = info[4]
+            if sockaddr and isinstance(sockaddr[0], str):
+                by_ip[normalize_ip(sockaddr[0])] = (worker_index, hostname)
+    return by_ip
+
+
+def _resolves_to_ip(hostname: str, target_ip: str) -> bool:
+    """Return True iff ``hostname`` is colon-free and resolves to ``target_ip``."""
+    if not hostname or ":" in hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    return any(
+        info[4]
+        and isinstance(info[4][0], str)
+        and normalize_ip(info[4][0]) == target_ip
+        for info in infos
+    )
+
+
+def _is_resolvable_hostname(hostname: str) -> bool:
+    """Return True iff ``hostname`` is colon-free and resolves in DNS."""
+    if not hostname or ":" in hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    return any(info[4] and isinstance(info[4][0], str) for info in infos)
+
+
+def resolve_slicebuilder_hosts(
+    host_order: list[str],
+    *,
+    ordered_by_worker_id: bool = False,
+    hostnames_by_ip: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Map each node IP in ``host_order`` to a colon-free slicebuilder host.
+
+    TorchTPU splits each ``<host>:<port>`` entry in
+    ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` on ``:`` and rejects entries with more
+    than one colon, so raw IPv6 literals fail validation. IPv4 entries pass
+    through unchanged; IPv6 entries match ``LWS_LEADER_ADDRESS`` pod DNS first
+    (by IP, or by verified worker index on multi-NIC ``hostNetwork`` pods where
+    Ray binds to a data-plane NIC while K8s DNS resolves to the pod NIC), then
+    verified node hostnames, and finally reverse DNS (``getnameinfo``).
+    """
+    if not any(":" in ip for ip in host_order):
+        return {ip: ip for ip in host_order}
+
+    leader_address = envs.LWS_LEADER_ADDRESS
+    lws_by_ip = (
+        resolve_lws_hosts_by_ip(leader_address, len(host_order))
+        if leader_address
+        else {}
+    )
+    resolved: dict[str, str] = {}
+    unresolved: list[str] = []
+
+    for worker_idx, ip in enumerate(host_order):
+        if ":" not in ip:
+            resolved[ip] = ip
+            continue
+        norm_ip = normalize_ip(ip)
+        match = lws_by_ip.get(norm_ip)
+        if match is not None:
+            resolved[ip] = match[1]
+            continue
+
+        if ordered_by_worker_id and leader_address:
+            candidate = lws_pod_hostname(leader_address, worker_idx)
+            if _is_resolvable_hostname(candidate):
+                resolved[ip] = candidate
+                continue
+
+        if hostnames_by_ip:
+            node_host = hostnames_by_ip.get(ip) or hostnames_by_ip.get(norm_ip) or ""
+            if node_host and _is_resolvable_hostname(node_host):
+                resolved[ip] = node_host
+                continue
+
+        try:
+            ptr_host = socket.getnameinfo((norm_ip, 0), socket.NI_NAMEREQD)[0]
+        except OSError:
+            ptr_host = ""
+        if ptr_host and _resolves_to_ip(ptr_host, norm_ip):
+            resolved[ip] = ptr_host
+            continue
+
+        unresolved.append(ip)
+
+    if unresolved:
+        raise RuntimeError(
+            "Failed to resolve IPv6 slicebuilder host address(es) "
+            f"{unresolved} to a forward-resolvable DNS hostname via "
+            f"LWS_LEADER_ADDRESS ({leader_address!r}) or reverse DNS."
+        )
+    return resolved

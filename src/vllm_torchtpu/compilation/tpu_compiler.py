@@ -170,6 +170,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_RAIDEN_RESHARD_PORT_BASE",
     "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE",
     "TPU_WORKER_ID",
+    "TPU_VISIBLE_DEVICE_PATHS",
+    # Pod/host orchestration identity under Kubernetes LeaderWorkerSet; varies
+    # across hosts and deployments without changing the compiled XLA program.
+    "LWS_WORKER_INDEX",
+    "LWS_GROUP_SIZE",
+    "LWS_LEADER_ADDRESS",
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
     "TPU_PARALLEL_PRECOMPILE",

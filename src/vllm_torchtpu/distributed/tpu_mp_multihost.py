@@ -69,6 +69,7 @@ import torch.distributed as dist
 from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.utils import resolve_slicebuilder_hosts
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -171,8 +172,9 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     # Same construction as ray_distributed_executor_v2.py: one address per chip,
     # ordered by (host, local_rank), spanning every host in the slice.
     base_port = envs.TORCH_TPU_BASE_PORT
+    sb_host_by_ip = resolve_slicebuilder_hosts(host_ips, ordered_by_worker_id=True)
     sb_addresses = [
-        f"{ip}:{base_port + local_rank}"
+        f"{sb_host_by_ip[ip]}:{base_port + local_rank}"
         for ip in host_ips
         for local_rank in range(local_world_size)
     ]
@@ -277,8 +279,9 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     world_size = parallel_config.world_size
     local_chip_count = world_size * dp_size_local
     base_port = envs.TORCH_TPU_BASE_PORT
+    sb_host_by_ip = resolve_slicebuilder_hosts(host_ips, ordered_by_worker_id=True)
     sb_addresses = [
-        f"{ip}:{base_port + local_slot}"
+        f"{sb_host_by_ip[ip]}:{base_port + local_slot}"
         for ip in host_ips
         for local_slot in range(local_chip_count)
     ]

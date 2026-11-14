@@ -38,7 +38,12 @@ from vllm.v1.executor.ray_utils import (
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
+from vllm_torchtpu.distributed.utils import (
+    normalize_ip,
+    resolve_lws_hosts_by_ip,
+    resolve_slicebuilder_hosts,
+    set_node_kv_ip_port,
+)
 from vllm_torchtpu.executors.kv_block_override import (
     adopt_worker_num_gpu_blocks_override,
 )
@@ -69,6 +74,19 @@ def get_tpu_bundles_for_indices(
 
 
 logger = init_logger(__name__)
+
+_TPU_WORKER_SPECIFIC_ENV_VARS: frozenset[str] = frozenset(
+    {
+        "TPU_VISIBLE_CHIPS",
+        "TPU_VISIBLE_DEVICES",
+        "TPU_VISIBLE_DEVICE_PATHS",
+        "CLOUD_TPU_TASK_ID",
+        "TPU_CHIPS_PER_HOST_BOUNDS",
+        "TPU_HOST_BOUNDS",
+        "TPU_WORKER_ID",
+        "LWS_WORKER_INDEX",
+    }
+)
 
 
 class RayDistributedExecutorV2(RayExecutorV2):
@@ -163,15 +181,31 @@ class RayDistributedExecutorV2(RayExecutorV2):
             else:
                 ordered_by = "ray.io/tpu-worker-id"
         else:
-            if len(hosts) > 1:
-                logger.warning(
-                    "RayDistributedExecutorV2 | Multi-host TPU detected (%d "
-                    "hosts) but 'ray.io/tpu-worker-id' label is missing on "
-                    "one or more nodes. Falling back to IP sorting, which may "
-                    "mismatch ICI hardware topology.",
-                    len(hosts),
+            lws_ordered = False
+            if len(hosts) > 1 and tpu_envs.LWS_LEADER_ADDRESS:
+                lws_by_ip = resolve_lws_hosts_by_ip(
+                    tpu_envs.LWS_LEADER_ADDRESS, len(hosts)
                 )
-            hosts.sort(key=lambda x: x[1])
+                if all(normalize_ip(ip) in lws_by_ip for _, ip, _ in hosts):
+                    lws_hosts = [
+                        (lws_by_ip[normalize_ip(ip)][0], ip, count)
+                        for _, ip, count in hosts
+                    ]
+                    lws_hosts.sort(key=lambda x: (x[0], x[1]))
+                    if [w_id for w_id, _, _ in lws_hosts] == list(range(len(hosts))):
+                        hosts = lws_hosts
+                        ordered_by = "LWS_LEADER_ADDRESS DNS"
+                        lws_ordered = True
+            if not lws_ordered:
+                if len(hosts) > 1:
+                    logger.warning(
+                        "RayDistributedExecutorV2 | Multi-host TPU detected (%d "
+                        "hosts) but 'ray.io/tpu-worker-id' label is missing on "
+                        "one or more nodes. Falling back to IP sorting, which may "
+                        "mismatch ICI hardware topology.",
+                        len(hosts),
+                    )
+                hosts.sort(key=lambda x: x[1])
 
         logger.info(
             "RayDistributedExecutorV2 | Resolved %d TPU slice hosts "
@@ -180,6 +214,15 @@ class RayDistributedExecutorV2(RayExecutorV2):
             ordered_by,
             [(w_id, ip) for w_id, ip, _ in hosts],
         )
+        self._hosts_ordered_by_worker_id = ordered_by in (
+            "ray.io/tpu-worker-id",
+            "LWS_LEADER_ADDRESS DNS",
+        )
+        self._node_hostnames_by_ip = {
+            str(n["NodeManagerAddress"]): str(n.get("NodeManagerHostname") or "")
+            for n in ray.nodes()
+            if n.get("Alive") and n.get("NodeManagerAddress")
+        }
 
         return [ip for _, ip, _ in hosts], {ip: count for _, ip, count in hosts}
 
@@ -284,7 +327,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
         # Collect driver env vars
         self.driver_env_vars = get_driver_env_vars(
-            worker_specific_vars=WORKER_SPECIFIC_ENV_VARS,
+            worker_specific_vars=WORKER_SPECIFIC_ENV_VARS
+            | _TPU_WORKER_SPECIFIC_ENV_VARS,
         )
 
         runtime_env = self._build_runtime_env()
@@ -385,8 +429,13 @@ class RayDistributedExecutorV2(RayExecutorV2):
             offset += chips_per_host[ip]
 
         base_port = tpu_envs.TORCH_TPU_BASE_PORT
+        sb_host_by_ip = resolve_slicebuilder_hosts(
+            host_order,
+            ordered_by_worker_id=getattr(self, "_hosts_ordered_by_worker_id", False),
+            hostnames_by_ip=getattr(self, "_node_hostnames_by_ip", None),
+        )
         sb_addresses = [
-            f"{ip}:{base_port + chip}"
+            f"{sb_host_by_ip[ip]}:{base_port + chip}"
             for ip in host_order
             for chip in range(chips_per_host[ip])
         ]
