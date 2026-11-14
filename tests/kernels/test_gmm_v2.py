@@ -25,10 +25,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    Dimensions,
+    InputConfigs,
     TileSizes,
     apply_act_fn,
+    calculate_tiling,
     gmm_v2,
     interleave_lane,
     situ_and_mul,
@@ -462,3 +466,133 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+@pytest.mark.tpu_test
+def test_gmm_v2_mxfp4_sparse_decode_fused_situ_matches_reference():
+    _require_tpu()
+
+    batch_size = 128
+    in_size = 1536
+    out_size = 1024
+    num_groups = 16
+    block_size = 32
+    num_blocks = in_size // block_size
+    fuse_act = "situ:4.0:25.0"
+    key = jax.random.key(7)
+    k_lhs, k_rhs, k_exp = jax.random.split(key, 3)
+
+    lhs = jax.random.uniform(k_lhs, (batch_size, in_size), jnp.bfloat16, -1.0, 1.0)
+    rhs_fp4 = jax.random.uniform(
+        k_rhs, (num_groups, in_size, out_size), jnp.float32, -3.0, 3.0
+    ).astype(jnp.float4_e2m1fn)
+    exp_int = jax.random.randint(
+        k_exp,
+        (num_groups, num_blocks, 1, out_size),
+        minval=-3,
+        maxval=2,
+        dtype=jnp.int32,
+    )
+    rhs_scale_e8m0 = jnp.exp2(exp_int.astype(jnp.float32)).astype(jnp.float8_e8m0fnu)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    scale_expanded = jnp.squeeze(
+        jnp.repeat(rhs_scale_e8m0.astype(jnp.bfloat16), block_size, axis=1), axis=2
+    )
+    rhs_dequant = rhs_fp4.astype(jnp.bfloat16) * scale_expanded
+    raw_expected = reference_gmm(lhs, rhs_dequant, group_sizes)
+    raw_gate, raw_up = jnp.split(raw_expected, 2, axis=-1)
+    expected = apply_act_fn(
+        interleave_lane(raw_gate, raw_up).astype(jnp.float32), fuse_act
+    ).astype(lhs.dtype)
+
+    actual = gmm_v2(
+        lhs,
+        rhs_fp4,
+        group_sizes,
+        rhs_scale=rhs_scale_e8m0,
+        maybe_quantize_lhs=False,
+        fuse_act=fuse_act,
+    )
+
+    assert actual.shape == (batch_size, out_size // 2)
+    _assert_allclose(actual, expected, atol=6e-2, rtol=6e-2)
+
+
+def test_calculate_tiling_scales_bucket_base_with_group_density(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    lhs_bf16 = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16)
+    lhs_fp8 = InputConfigs(
+        quant_dtype=jnp.float8_e4m3fn, quant_block_size=512, dtype=jnp.bfloat16
+    )
+    rhs_mxfp4 = InputConfigs(
+        quant_dtype=jnp.float4_e2m1fn,
+        quant_block_size=32,
+        dtype=jnp.float4_e2m1fn,
+        has_scale=True,
+    )
+    rhs_fp8 = InputConfigs(
+        quant_dtype=jnp.float8_e4m3fn,
+        quant_block_size=512,
+        dtype=jnp.float8_e4m3fn,
+        has_scale=True,
+    )
+    vmem_limit = 64 * 1024 * 1024
+
+    def _tiles_for(
+        size_m: int,
+        *,
+        size_group: int = 56,
+        size_lhs_group: int | None = None,
+        size_k: int = 3584,
+        size_n: int = 3072,
+        lhs_cfgs: InputConfigs = lhs_bf16,
+        rhs_cfgs: InputConfigs = rhs_mxfp4,
+        limit: int = vmem_limit,
+        fuse_act: str | None = "silu",
+    ) -> TileSizes:
+        dims = Dimensions(
+            size_m=size_m,
+            size_k=size_k,
+            size_n=size_n,
+            size_group=size_group,
+            size_lhs_group=size_lhs_group or size_group,
+            size_lhs_sublane=16,
+        )
+        return calculate_tiling(dims, lhs_cfgs, rhs_cfgs, limit, fuse_act=fuse_act)
+
+    # TPU v7x sparse decode batches (< 24 rows/group, bf16 LHS) use {16, 32, 48, 64}.
+    t_m64 = _tiles_for(64)
+    assert (t_m64.bucket_base, t_m64.tile_m) == (16, 64)
+    t_m1024 = _tiles_for(1024)
+    assert (t_m1024.bucket_base, t_m1024.tile_m) == (16, 64)
+    t_g96_m2048 = _tiles_for(2048, size_group=96)
+    assert (t_g96_m2048.bucket_base, t_g96_m2048.tile_m) == (16, 64)
+    # EP-sharded group_sizes (size_lhs_group=128 > size_group=16) uses size_lhs_group.
+    t_ep = _tiles_for(1024, size_group=16, size_lhs_group=128)
+    assert (t_ep.bucket_base, t_ep.tile_m) == (16, 64)
+
+    # Dense / prefill batches (>= 24 rows/group) keep the full 64-row bucket_base.
+    t_g56_m2048 = _tiles_for(2048, size_group=56)
+    assert (t_g56_m2048.bucket_base, t_g56_m2048.tile_m) == (64, 256)
+    t_prefill = _tiles_for(4096, size_group=56)
+    assert (t_prefill.bucket_base, t_prefill.tile_m) == (64, 256)
+
+    # W8A8 calls (lhs_cfgs.should_quantize=True) keep their 128-row bucket_base.
+    t_w8a8 = _tiles_for(512, size_group=64, lhs_cfgs=lhs_fp8, rhs_cfgs=rhs_fp8)
+    assert (t_w8a8.bucket_base, t_w8a8.tile_m) == (128, 512)
+
+    # Single-group calls (size_group == 1) keep the full unscaled bucket_base.
+    t_dense = _tiles_for(64, size_group=1)
+    assert (t_dense.bucket_base, t_dense.tile_m) == (64, 64)
+
+    # Unvalidated generations (e.g. v6e) keep the 64-row bucket_base.
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V6E, 1),
+    )
+    t_v6e = _tiles_for(1024)
+    assert (t_v6e.bucket_base, t_v6e.tile_m) == (64, 256)
