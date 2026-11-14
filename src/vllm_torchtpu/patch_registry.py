@@ -122,6 +122,9 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
     Patch("vllm_torchtpu.model_loader_patches:patch_expert_placement_routers", _ACTIVE),
+    Patch(
+        "vllm_torchtpu.layers.adapter.expert_placement:patch_copy_slot_hook", _ACTIVE
+    ),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),
     Patch(
         "vllm_torchtpu.layers.adapter.dp_vocab_parallel:register_logits_processor",
@@ -165,6 +168,11 @@ PATCHES = (
     ),
     Patch(
         "vllm_torchtpu.models.vllm.qwen3_5_patch:maybe_patch_qwen3_5_attn_moe_overlap",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.models.qwen3_5.hooks:apply_kernel_numerics",
         ("platform_activation", "model_load"),
         model_config=True,
     ),

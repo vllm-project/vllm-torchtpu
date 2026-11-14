@@ -113,9 +113,12 @@ def _build_fp8_linear_method(
     layer: LinearBase,
     weight_quant: QuantizationArgs,
     input_quant: QuantizationArgs | None,
+    prefix: str = "",
 ) -> VllmFp8LinearMethodTPU:
     fp8_config = _build_fp8_config(weight_quant, input_quant)
-    return VllmFp8LinearMethodTPU(fp8_config, fp8_config.get_linear_config(layer))
+    return VllmFp8LinearMethodTPU(
+        fp8_config, fp8_config.get_linear_config(layer), prefix=prefix
+    )
 
 
 def _raise_not_implemented(scheme_class: str) -> None:
@@ -228,7 +231,9 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 # for this is not implemented yet in vllm-torchtpu. Since this was an
                 # existing code, it has been moved here to ensure backward compatibility
                 if _is_weight_fp8(weight_quant):
-                    return _build_fp8_linear_method(layer, weight_quant, input_quant)
+                    return _build_fp8_linear_method(
+                        layer, weight_quant, input_quant, prefix=prefix
+                    )
 
                 # get_scheme will raise NotImplementedError since custom
                 # CompressedTensorsScheme subclasses (like W4A8, W8A8, NVFP4) have not
