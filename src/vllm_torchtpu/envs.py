@@ -136,6 +136,7 @@ if TYPE_CHECKING:
     TPU_DRAFT_BUCKET_STEP: int = 32
     TPU_SPEC_SYNTHETIC_ROW_SPLIT: bool = True
     TPU_DSPARK_MARKOV_KERNEL: bool = True
+    TPU_SAMPLER_TOP_P_KERNEL: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -1016,6 +1017,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (kernels/collectives/markov_argmax.py) instead of a per-step XLA loop
     # with an all-gather. 0 keeps the loop.
     "TPU_DSPARK_MARKOV_KERNEL": env_bool("TPU_DSPARK_MARKOV_KERNEL", default=True),
+    # Token recovery without top-k or draft probabilities (the synthetic
+    # verify's sampler) runs on a Pallas kernel holding each row as a dense
+    # [vocab / 128, 128] slab (kernels/top_p_sample.py). 0 keeps the XLA path.
+    "TPU_SAMPLER_TOP_P_KERNEL": env_bool("TPU_SAMPLER_TOP_P_KERNEL", default=True),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
