@@ -84,6 +84,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_ring_attention()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -645,3 +646,78 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_RING_ATTENTION_PATCHED = "_tpu_ring_attention_patched"
+
+
+def _patch_ring_attention() -> None:
+    """Route RingParallelAttention.run_attention to the TPU Pallas ring kernel."""
+    from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
+
+    from vllm_torchtpu.omni.attention import (
+        can_run_tpu_ring_attention,
+        check_ring_rank_layout,
+        tpu_ring_flash_attention,
+    )
+
+    if not getattr(RingParallelAttention.run_attention, _RING_ATTENTION_PATCHED, False):
+        orig_run = RingParallelAttention.run_attention
+
+        def _tpu_run_attention(
+            self: Any,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            attn_metadata: Any = None,
+            softmax_scale: float | None = None,
+            causal: bool = False,
+        ) -> torch.Tensor:
+            if not can_run_tpu_ring_attention(
+                self, query, key, value, attn_metadata, causal=causal
+            ):
+                details = (
+                    f"dtype={query.dtype}, causal={causal}, "
+                    f"attn_backend_pref={getattr(self, 'attn_backend_pref', None)}, "
+                    f"metadata={type(attn_metadata).__name__}"
+                )
+                if int(getattr(self._sp_group, "ring_world_size", 1)) > 1:
+                    # The upstream ring exchanges K/V with torch.distributed
+                    # P2P sends, which hang on TPU, so fail loudly instead.
+                    raise NotImplementedError(
+                        "Ring attention call does not fit the TPU Pallas ring "
+                        f"kernel ({details}), and vLLM-Omni's RingParallelAttention "
+                        "(torch.distributed P2P sends) is not supported on TPU."
+                    )
+                logger.warning_once(
+                    "Ring attention call does not fit the TPU Pallas ring kernel "
+                    "(%s); falling back to vLLM-Omni RingParallelAttention "
+                    "(ring_world_size is 1, so no K/V exchange).",
+                    details,
+                )
+                return orig_run(
+                    self,
+                    query,
+                    key,
+                    value,
+                    attn_metadata,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                )
+            sp_group = self._sp_group
+            ring_size = int(sp_group.ring_world_size)
+            uly_size = int(getattr(sp_group, "ulysses_world_size", 1))
+            check_ring_rank_layout(sp_group, ring_size, uly_size)
+            return tpu_ring_flash_attention(
+                query,
+                key,
+                value,
+                softmax_scale,
+                ring_size=ring_size,
+                uly_size=uly_size,
+            )
+
+        setattr(_tpu_run_attention, _RING_ATTENTION_PATCHED, True)
+        RingParallelAttention.run_attention = _tpu_run_attention
+
+    logger.info("Applied TPU patch: Pallas ring diffusion attention.")
