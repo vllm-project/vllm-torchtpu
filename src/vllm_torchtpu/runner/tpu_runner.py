@@ -1517,7 +1517,10 @@ class TPUModelRunner(GPUModelRunner):
             self.rejection_sampler = RejectionSampler(
                 self.speculative_config, self.device
             )
-            if self.speculative_config.method == "ngram":
+            if self.speculative_config.method == "gaad":
+                # GaaD is a model-free scheduler CPU proposer.
+                self.drafter = None
+            elif self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "dflash":
                 self.drafter = DFlashProposer(self, self.vllm_config)
@@ -2708,7 +2711,11 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(pools)
 
     def _prepare_async_token_substitution_indices(
-        self, start_index: int, num_reqs: int, num_scheduled_tokens_per_req: np.ndarray
+        self,
+        start_index: int,
+        num_reqs: int,
+        num_scheduled_tokens_per_req: np.ndarray,
+        scheduled_spec_decode_flags: dict[str, list[int]] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         if self._pre_async_results is None:
             return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
@@ -2741,7 +2748,17 @@ class TPUModelRunner(GPUModelRunner):
             # `[position*stride .. +n_sched-1]`. Non-spec (stride 1, n_sched 1)
             # reduces to the original single-slot mapping.
             src_start = self._pre_async_results.req_id_to_index_copy[req_id] * stride
+            req_flags = (
+                scheduled_spec_decode_flags.get(req_id)
+                if scheduled_spec_decode_flags
+                else None
+            )
             for j in range(n_sched):
+                # Preserve host-injected GaaD grammar (2) and empty (0) slots.
+                if j > 0 and req_flags is not None:
+                    d_idx = j - 1
+                    if d_idx < len(req_flags) and req_flags[d_idx] != 1:
+                        continue
                 request_major_index = acc_cur_len - n_sched + j
                 if pcp_plan is not None:
                     cur_input_index = pcp_plan.local_index_for_request_major_token(
@@ -3614,6 +3631,28 @@ class TPUModelRunner(GPUModelRunner):
                 out=self.input_ids_cpu[:total_num_scheduled_tokens],
             )
 
+        # Inject host-generated GaaD grammar jump tokens (flag == 2) into input_ids_cpu.
+        sched_flags = getattr(scheduler_output, "scheduled_spec_decode_flags", None)
+        sched_spec_tokens = getattr(
+            scheduler_output, "scheduled_spec_decode_tokens", None
+        )
+        if sched_flags and sched_spec_tokens:
+            req_offset = 0
+            for i in range(num_reqs):
+                req_id = self.input_batch.req_ids[start_index + i]
+                n_sched = int(num_scheduled_tokens_per_req[i])
+                flags = sched_flags.get(req_id) if req_id else None
+                spec_tokens = sched_spec_tokens.get(req_id) if req_id else None
+                if flags and spec_tokens:
+                    for d_idx, (flag, tok) in enumerate(zip(flags, spec_tokens)):
+                        if (
+                            flag == 2
+                            and tok >= 0
+                            and req_offset + 1 + d_idx < self.input_ids_cpu.shape[0]
+                        ):
+                            self.input_ids_cpu[req_offset + 1 + d_idx] = int(tok)
+                req_offset += n_sched
+
         # Prepare the attention metadata.
         self.query_start_loc_np[0] = 0
         np.cumsum(
@@ -3812,6 +3851,9 @@ class TPUModelRunner(GPUModelRunner):
                 dtype=np.int32,
             )
             if num_draft_tokens.any():
+                scheduled_flags = getattr(
+                    scheduler_output, "scheduled_spec_decode_flags", None
+                )
                 spec_decode_metadata = (
                     self.spec_decode_manager.get_spec_decode_metadata(
                         num_draft_tokens,
@@ -3822,6 +3864,8 @@ class TPUModelRunner(GPUModelRunner):
                         defer_draft_token_ids=bool(
                             self.scheduler_config.async_scheduling
                         ),
+                        scheduled_spec_decode_flags=scheduled_flags,
+                        start_index=start_index,
                     )
                 )
 
@@ -4024,7 +4068,12 @@ class TPUModelRunner(GPUModelRunner):
         # Prepare token substitution indices
         cur_input_indices, pre_next_tokens_indices = (
             self._prepare_async_token_substitution_indices(
-                start_index, num_reqs, num_scheduled_tokens_per_req
+                start_index,
+                num_reqs,
+                num_scheduled_tokens_per_req,
+                scheduled_spec_decode_flags=getattr(
+                    scheduler_output, "scheduled_spec_decode_flags", None
+                ),
             )
         )
 
@@ -5614,6 +5663,9 @@ class TPUModelRunner(GPUModelRunner):
                             md.draft_lengths_cpu,
                             cur_start_idx,
                             cur_end_idx,
+                            scheduled_spec_decode_flags=getattr(
+                                scheduler_output, "scheduled_spec_decode_flags", None
+                            ),
                         )
                     )
                     assert target_logits is not None
@@ -5657,6 +5709,21 @@ class TPUModelRunner(GPUModelRunner):
         # also draw the recovery noise and verify on their sampling params.
         do_sampling = params is not None
         accept_u = None
+        assert self.rejection_sampler is not None
+        if not md.has_model_drafts and md.draft_flags is not None:
+            next_tokens = self.rejection_sampler(
+                draft_token_ids=draft_token_ids,
+                num_draft_tokens=md.draft_lengths,
+                target_logits=None,
+                bonus_token_ids=bonus_token_ids,
+                segment_ids=md.segment_ids,
+                group_indices=md.group_indices,
+                max_draft_tokens=max_draft_tokens,
+                draft_flags=md.draft_flags,
+            )
+            for proc in processors:
+                proc.finish(next_tokens)
+            return next_tokens
         if self.rejection_sampler.synthetic_mode or do_sampling:
             accept_u = torch.rand(
                 draft_token_ids.shape,
@@ -5694,6 +5761,7 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates=topk_candidates,
             target_argmax=target_argmax,
             apply_topk_topp=apply_topk_topp,
+            draft_flags=md.draft_flags,
         )
         for proc in processors:
             proc.finish(next_tokens)
