@@ -22,9 +22,9 @@
 # - flash_attention_bshd() replaces attention(): (B, S, H, D) inputs and
 #   outputs, block sizes from autotune_block_sizes(), and fixed-m only
 #   when K/V spans more than one block. Lane-aligned heads are DMA'd as
-#   column blocks of the (B, S, H * D) activations (column_heads) when the
-#   head count is large or K/V fits one block, and transposed to (B, H, S, D)
-#   for smaller multi-block head counts (such as Ulysses-sharded attention).
+#   column blocks of the (B, S, H * D) activations (column_heads) when K/V
+#   fits one block (not use_fixed_m), and every multi-block fixed-m call
+#   transposes to (B, H, S, D).
 # - q and k reach the kernel unscaled and uncentred: the kernel multiplies
 #   its f32 scores by scale * log2(e) (score_scale), and fixed_m_operands()
 #   bounds raw-key scores via the centred key norm and key-mean norm so
@@ -588,29 +588,31 @@ def flash_attention_bshd(
     q = query.astype(jnp.bfloat16)
     k = key.astype(jnp.bfloat16)
     v = value.astype(jnp.bfloat16)
+    # When K/V spans multiple blocks (use_fixed_m=True), transposing to
+    # (B, H, S, D) makes every repeated Q/K/V tile DMA contiguous and runs
+    # fixed_m_operands on the faster seq-major axis; for single-block K/V,
+    # column blocks on (B, S, H * D) avoid the transpose.
+    use_column_heads = (
+        head_dim % spec.num_lanes == 0
+        and head_dim_v % spec.num_lanes == 0
+        and not use_fixed_m
+    )
+    if not use_column_heads:
+        q, k, v = (jnp.swapaxes(x, 1, 2) for x in (q, k, v))
     if use_fixed_m:
         mk_arr = fixed_m_operands(
             q.astype(jnp.float32) * score_scale,
             k,
             gate=FIXED_M_SAFE_BOUND,
-            seq_axis=1,
+            seq_axis=2,
         )
     else:
         mk_arr = jnp.zeros((2, 1), jnp.float32)  # unused placeholder
-    # When K/V spans multiple blocks and head count is small (e.g. Ulysses
-    # sharded heads), transposing to (B, H, S, D) makes every repeated Q/K/V
-    # tile DMA contiguous; for large head counts or single-block K/V, column
-    # blocks on (B, S, H * D) avoid the transpose.
-    if (
-        head_dim % spec.num_lanes == 0
-        and head_dim_v % spec.num_lanes == 0
-        and (not use_fixed_m or num_heads > 16)
-    ):
+    if use_column_heads:
         column_heads = (num_heads, num_kv_heads)
         q, k, v = (x.reshape(*x.shape[:2], -1) for x in (q, k, v))
     else:
         column_heads = None
-        q, k, v = (jnp.swapaxes(x, 1, 2) for x in (q, k, v))
 
     def _kernel_3d(q_3d, k_3d, v_3d):
         # mk_arr is closed over, so it stays unmapped under the vmap —
