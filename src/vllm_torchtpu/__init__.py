@@ -550,6 +550,29 @@ def _patch_vllm_compile_all_ranges() -> None:
         # exist; a range nobody saved yet is then compiled here.
         wait_s = PEER_WAIT_S if ranks is not None and local_rank < ranks else 0.0
         ranks = ranks or 8
+        # The owner slot this rank answers to, among `ranks` owners.
+        my_slot = local_rank
+        allowed: set[int] | None = None
+
+        # VLLM_TPU_PEER_REPLAY_GROUPS=1: deal the ranges only among the ranks
+        # that trace this rank's graph (same fingerprint), so every owner's
+        # artifact is one this rank can replay. Without it a DCP4 decode under
+        # TP8 deals half its ranges to the other DCP group's ranks, whose
+        # artifacts it must refuse, and compiles them again.
+        if os.environ.get("VLLM_TPU_PEER_REPLAY_GROUPS", "0") in ("1", "true"):
+            from vllm_torchtpu.compilation.tpu_compiler import replay_peer_group
+
+            peers = replay_peer_group(self.graph)
+            if peers:
+                locals_ = [lr for _, lr in peers]
+                if local_rank in locals_:
+                    ranks = len(peers)
+                    my_slot = locals_.index(local_rank)
+                    allowed = {r for r, _ in peers}
+                    wait_s = PEER_WAIT_S if ranks > 1 else 0.0
+                    logger.info(
+                        "Peer replay group: local ranks %s (%d owners)", locals_, ranks
+                    )
 
         # Biggest first, dealt out in a snake: local rank 0 starts on the
         # biggest range, which takes far longer than the others and so bounds
@@ -562,17 +585,20 @@ def _patch_vllm_compile_all_ranges() -> None:
         for i, range_entry in enumerate(entries):
             turn, slot = divmod(i, ranks)
             owner = slot if turn % 2 == 0 else ranks - 1 - slot
-            if owner == local_rank:
+            if owner == my_slot:
                 mine.append(range_entry)
             else:
                 # In the order the owners finish them: by turn, small first.
                 others.append((turn, range_entry.compile_range.end, range_entry))
 
-        for range_entry in mine:
-            compile_entry(self, range_entry)
-        with wait_for_peer_artifact(wait_s):
-            for _, _, range_entry in sorted(others, key=lambda o: o[:2]):
+        from vllm_torchtpu.compilation.tpu_compiler import replay_only_from
+
+        with replay_only_from(allowed):
+            for range_entry in mine:
                 compile_entry(self, range_entry)
+            with wait_for_peer_artifact(wait_s):
+                for _, _, range_entry in sorted(others, key=lambda o: o[:2]):
+                    compile_entry(self, range_entry)
 
     if envs.TPU_PARALLEL_PRECOMPILE:
         PiecewiseBackend.compile_all_ranges = compile_all_ranges

@@ -156,6 +156,54 @@ def wait_for_peer_artifact(timeout_s: float):
         _peer_wait.timeout_s = 0.0
 
 
+def replay_peer_group(graph: fx.GraphModule) -> list[tuple[int, int]] | None:
+    """The (global rank, local rank) pairs of this host whose `graph` has this
+    rank's fingerprint, in local-rank order: the ranks that can replay each
+    other's artifacts. A collective over the world CPU group, so every rank
+    must call it for the same subgraph; None if that is not possible.
+
+    Ranks in different process groups trace different code even with
+    rank-agnostic inputs, since a collective names its group in the graph
+    (a DCP4 decode under TP8 has two DCP groups, so two fingerprints). Dealing
+    ranges over all ranks of the host then makes about half the owners the
+    wrong group's, whose artifacts never match; dealing them within the group
+    makes every owner's artifact replayable.
+    """
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return None
+    try:
+        from vllm.distributed.parallel_state import get_world_group
+
+        group = get_world_group().cpu_group
+        fingerprint = _graph_fingerprint(graph)
+        if fingerprint is None:
+            return None
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        host = os.uname().nodename
+        mine = (dist.get_rank(), local_rank, host, fingerprint)
+        gathered: list[Any] = [None] * dist.get_world_size(group)
+        dist.all_gather_object(gathered, mine, group=group)
+    except Exception as e:  # noqa: BLE001 - grouping is an optimization only
+        logger.warning("[TpuCompilerAdaptor] peer grouping unavailable: %s", e)
+        return None
+    peers = sorted(
+        (r, lr) for r, lr, h, fp in gathered if h == host and fp == fingerprint
+    )
+    return sorted(peers, key=lambda p: p[1])
+
+
+@contextlib.contextmanager
+def replay_only_from(global_ranks: set[int] | None):
+    """Within this block, `compile` replays only artifacts saved by these ranks."""
+    _peer_wait.peer_ranks = global_ranks
+    try:
+        yield
+    finally:
+        _peer_wait.peer_ranks = None
+
+
 def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
     """Hash of the code of `graph` and its submodules and of their constants.
 
@@ -905,14 +953,32 @@ class TpuCompilerAdaptor(CompilerInterface):
         ranks do not trace the same program and waiting on would not help.
         """
         deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
-        paths = self._peer_paths(key)
+        allowed = getattr(_peer_wait, "peer_ranks", None)
+
+        def candidates() -> list[str]:
+            paths = self._peer_paths(key)
+            if allowed is None:
+                return paths
+            # replay_only_from: only ranks known to trace this rank's graph,
+            # so no other process group's artifact is unpickled and refused.
+            out = []
+            for p in paths:
+                m = re.search(r"rank_(\d+)_\d+", p)
+                if m is not None and int(m.group(1)) in allowed:
+                    out.append(p)
+            return out
+
+        paths = candidates()
         while not paths and time.monotonic() < deadline:
             time.sleep(_PEER_POLL_S)
-            paths = self._peer_paths(key)
-        if not paths:
-            return None
-        compiled_fn = self._replay(paths[0], graph, was_wrapped, fingerprint)
-        return None if compiled_fn is None else (compiled_fn, paths[0])
+            paths = candidates()
+        # Try each peer's artifact, not just the first: with peers in other
+        # process groups, the first path can be one this rank must refuse.
+        for path in paths:
+            compiled_fn = self._replay(path, graph, was_wrapped, fingerprint)
+            if compiled_fn is not None:
+                return compiled_fn, path
+        return None
 
     @staticmethod
     def _link_artifact(src: str, dst: str) -> bool:
