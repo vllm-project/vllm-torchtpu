@@ -1,0 +1,87 @@
+# DeepSeek-V4 Pro Fast Layer-Restricted Autotune Configuration
+# Combines Strategy 1 (Curated flags) and Strategy 2 (10-layer fast benchmark on CDK)
+
+execution_mode: "cdk"
+flag_list_file: "flags_dsv4_curated.txt"
+baseline_runs: 2
+artifact_dir: "artifacts/dsv4_fast_layers_autotune"
+
+model:
+  name: "deepseek-ai/DeepSeek-V4-Pro-0813"
+  model_path: "/models/DeepSeek-V4-Pro-0813"
+  port: 47903
+  health_endpoint: "/health"
+  startup_timeout_s: 3600
+  base_libtpu_init_args: >-
+    --xla_tpu_use_minor_sharding_for_major_trivial_input=true
+    --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false
+    --xla_tpu_ars_combiner_threshold_in_bytes=0
+    --xla_tpu_enable_async_collective_merger=false
+    --xla_enable_async_all_gather=true
+    --xla_tpu_enable_sparse_core_collective_offload_all_gather=true
+    --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=262144
+  server_env:
+    MOE_REQUANTIZE_WEIGHT_DTYPE: "fp4"
+    MOE_REQUANTIZE_BLOCK_SIZE: "512"
+    NEW_MODEL_DESIGN: "1"
+    MODEL_IMPL_TYPE: "vllm"
+    VLLM_PLUGINS: "torchtpu,torchtpu_layers"
+    TORCH_DIST_TIMEOUT: "1200"
+    VLLM_RPC_TIMEOUT: "1200000"
+    VLLM_SHM_BROADCAST_TIMEOUT_S: "1200"
+    VLLM_ENGINE_ITERATION_TIMEOUT_S: "1200"
+    VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+    VLLM_USE_AOT_COMPILE: "0"
+    VLLM_ENFORCE_EAGER: "0"
+    VLLM_NO_USAGE_STATS: "1"
+    TPU_ROPE_CACHE_ROW_MAJOR: "1"
+    TPU_MOE_HASH_TABLE_ROW_MAJOR: "1"
+    USE_MOE_FUSED_EP_KERNEL: "1"
+    MOE_FUSED_EP_ENABLE_W4A8: "1"
+    MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: "2"
+    TPU_MOE_SKIP_PADDED_TOKENS: "1"
+    RAGGED_GATHER_REDUCE_VERSION: "v3"
+    VLLM_DISABLE_COMPILE_CACHE: "1"
+    VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+    TORCHINDUCTOR_AUTOGRAD_CACHE: "0"
+    VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+    VLLM_TARGET_DEVICE: "tpu"
+  serve_args:
+    - "--served-model-name=deepseek-ai/DeepSeek-V4-Pro-0813"
+    - "--quantization=deepseek_v4_fp8"
+    - "--trust-remote-code"
+    - "--max-model-len=9216"
+    - "--max-num-batched-tokens=1024"
+    - "--max-num-seqs=256"
+    - "--kv-cache-dtype=fp8_e4m3"
+    - "--no-enable-prefix-caching"
+    - "--gpu-memory-utilization=0.40"
+    - "--tensor-parallel-size=1"
+    - "--data-parallel-size=16"
+    - "--enable-expert-parallel"
+    - "--enable-ep-weight-filter"
+    - "--safetensors-load-strategy=prefetch"
+    - "--async-scheduling"
+    - '--hf-overrides={"num_hidden_layers": 10}'
+
+benchmark:
+  type: "vllm_bench_serve"
+  target_metric: "total_token_throughput"
+  warmup_runs: 1
+  args:
+    dataset_name: "random"
+    backend: "vllm"
+    random_input_len: 8192
+    random_output_len: 1024
+    num_prompts: 2048
+    random_range_ratio: 0
+    ignore_eos: true
+    max_concurrency: 1024
+    trust_remote_code: true
+
+cdk:
+  recipe: "torchtpu-vllm-dsv4-pro-v7x-16-benchmark-10layers-baseline"
+  tags:
+    - "agent-jobs"
+    - "xla-autotune"
+    - "dsv4-10layers"
