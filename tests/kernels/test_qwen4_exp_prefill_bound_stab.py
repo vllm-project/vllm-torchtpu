@@ -232,8 +232,8 @@ def test_layer_notes_bound_per_precedence(monkeypatch, env_value, config_value, 
         assert bsp.key_norm_bound() is None
 
 
-@pytest.mark.parametrize("prefix,dcp", [("mtp.layers.48.self_attn", 2), ("model.layers.3.self_attn", 1)])
-def test_mtp_and_non_dcp_layers_do_not_note(monkeypatch, prefix, dcp):
+@pytest.mark.parametrize("prefix,dcp", [("mtp.layers.48.self_attn", 2), ("mtp.layers.48.self_attn", 1)])
+def test_mtp_layer_does_not_note(monkeypatch, prefix, dcp):
     import types
 
     import torch
@@ -270,3 +270,46 @@ def test_high_guard_reruns_when_keys_exceed_bound(interpret, monkeypatch, rank):
     got = attend(case, rank, 0)
     for a, b in zip(got, want):
         np.testing.assert_array_equal(bits(a), bits(b))
+
+
+def attend_replicated(case, offset, gated=False):
+    query, blocks, lengths, table, cache, starts, _ = case
+    gate = jnp.zeros_like(query)
+    jax.clear_caches()
+    return jax.jit(
+        lambda q, c: bsp.block_sparse_gqa_attention(
+            q, gate, blocks, lengths, table, c, starts, kv_heads=1, ratio=RATIO,
+            k_scale=K_SCALE, v_scale=V_SCALE, query_block=256, kv_tile=PAGE,
+            query_tile=256, kv_head_offset=offset,
+            **({} if gated else {"return_lse": True}),
+        )[: 1 if gated else 2]
+    )(query, cache)
+
+
+@pytest.mark.parametrize("gated", [False, True])
+def test_replicated_route_uses_the_bound(interpret, monkeypatch, gated):
+    """The non-DCP call (lse and gated forms) runs the bound stabilizer too."""
+    case = make_case(np.random.default_rng(8), CASES["two"], 24)
+    want = attend_replicated(case, 1, gated)
+    bsp.note_key_norm_bound(case[-1])
+    got = attend_replicated(case, 1, gated)
+    out_w, out_g = np.asarray(want[0], np.float32), np.asarray(got[0], np.float32)
+    assert not np.array_equal(out_w, out_g)  # a different rounding, so it ran
+    scale = np.maximum(np.abs(out_w).max(-1, keepdims=True), 1e-30)
+    assert float((np.abs(out_g - out_w) / scale).max()) < 1e-2
+    if not gated:
+        fin = np.isfinite(np.asarray(want[1]))
+        np.testing.assert_allclose(np.asarray(got[1])[fin], np.asarray(want[1])[fin], atol=4e-3)
+
+
+def test_replicated_guard_reruns_online(interpret, monkeypatch):
+    case = make_case(np.random.default_rng(9), CASES["single"], 24)
+    want = attend_replicated(case, 0, gated=True)
+    bsp.note_key_norm_bound(1e4)
+    got = attend_replicated(case, 0, gated=True)
+    np.testing.assert_array_equal(bits(got[0].astype(jnp.float32)), bits(want[0].astype(jnp.float32)))
+
+
+# DCP-vs-replicated agreement with the bound on both routes needs the paired
+# DCP / replicated pool layouts of the dcp2 harness: gate_bs.py arm "bound"
+# (TPU, j-03d65bf7: pre-gate 12/12 at 5-6e-6, gated 2 ulp).
