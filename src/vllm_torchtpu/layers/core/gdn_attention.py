@@ -25,6 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 from vllm import envs
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
     pcp_wrapper as gdn_pcp_fused_wrapper,
 )
@@ -886,6 +887,8 @@ def run_jax_gdn_attention_pooled_local(
         num_spec_tokens=num_spec_tokens,
         prefill_ckpt_offsets=prefill_ckpt_offsets,
         prefill_ckpt_indices=prefill_ckpt_indices,
+        decode_tile_size=tpu_envs.TPU_GDN_DECODE_TILE,
+        build_tables_in_kernel=tpu_envs.TPU_GDN_TABLES_IN_KERNEL,
     )
     return pool.reshape(pool_shape), output
 
