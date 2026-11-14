@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax._src import core as jax_core
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
@@ -1006,6 +1007,95 @@ def test_moe_gmm_onehot_combine_skip_padded_tokens_zeroes_nan(monkeypatch):
         })
 
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))
+
+
+@pytest.mark.parametrize("fill", [np.nan, np.inf])
+@pytest.mark.parametrize("use_ep, skip_padded_tokens", [(True, False),
+                                                        (False, True),
+                                                        (True, True)])
+def test_moe_gmm_plain_reduce_drops_uncomputed_rows(monkeypatch, use_ep,
+                                                    skip_padded_tokens, fill):
+    # Invalid routes (non-local experts under EP, padded tokens) sort past the
+    # valid prefix, whose gmm output rows are never written (NaN / Inf here).
+    # The plain reduce must drop those routes: a zero weight does not, since
+    # NaN * 0 and Inf * 0 are NaN.
+    kwargs = _small_moe_gmm_kwargs()
+    rows = kwargs["argsort_revert_indices"].size
+    num_tokens, topk, hidden = kwargs["num_tokens"], kwargs["topk"], 8
+    valid_rows = rows - 3
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
+                        lambda *args, **kwargs: 1)
+    gmm2 = (jax.random.normal(jax.random.key(2),
+                              (rows, hidden)) / 10).astype(jnp.bfloat16)
+    gmm2 = gmm2.at[valid_rows:].set(fill)
+    outputs = iter([jnp.ones((rows, hidden), dtype=jnp.bfloat16), gmm2])
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
+                        lambda *args, **kwargs: next(outputs))
+    revert = kwargs["argsort_revert_indices"]
+    valid = revert < valid_rows
+    weights = jnp.linspace(0.1, 0.8, rows, dtype=jnp.float32)
+
+    out = fused_moe_gmm.moe_gmm(
+        **{
+            **kwargs,
+            "topk_weights_flat": weights,
+            "valid_mask_flat": valid,
+            "group_sizes": jnp.array([valid_rows], dtype=jnp.int32),
+            "use_ep": use_ep,
+            "use_sparse_core": False,
+            "skip_padded_tokens": skip_padded_tokens,
+        })
+
+    routed = np.asarray(gmm2, np.float32)[np.asarray(revert)]
+    routed = routed.reshape(num_tokens, topk, hidden)
+    weighted = routed * np.asarray(weights).reshape(num_tokens, topk, 1)
+    mask = np.asarray(valid).reshape(num_tokens, topk, 1)
+    expected = np.where(mask, weighted, 0).sum(axis=1)
+    out = np.asarray(out, dtype=np.float32)
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out, expected, rtol=2e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize("use_ep, skip_padded_tokens, selects_rows",
+                         [(False, False, False), (True, False, True),
+                          (False, True, True)])
+def test_moe_gmm_plain_reduce_selects_rows_only_if_some_are_uncomputed(
+        monkeypatch, use_ep, skip_padded_tokens, selects_rows):
+    # Without EP or skip_padded_tokens every gathered row is computed, so the
+    # plain reduce masks the [tokens, topk] weights only; the select over the
+    # [tokens, topk, hidden] rows is kept for the paths with uncomputed rows.
+    kwargs = _small_moe_gmm_kwargs()
+    rows = kwargs["argsort_revert_indices"].size
+    num_tokens, topk, hidden = kwargs["num_tokens"], kwargs["topk"], 8
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
+                        lambda *args, **kwargs: 1)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
+                        lambda lhs, *args, **kwargs: lhs)
+
+    def run(x, topk_weights_flat, valid_mask_flat):
+        return fused_moe_gmm.moe_gmm(
+            **{
+                **kwargs,
+                "x": x,
+                "topk_weights_flat": topk_weights_flat,
+                "valid_mask_flat": valid_mask_flat,
+                "use_ep": use_ep,
+                "use_sparse_core": False,
+                "skip_padded_tokens": skip_padded_tokens,
+            })
+
+    def select_shapes(jaxpr):
+        for eqn in jaxpr.eqns:
+            if eqn.primitive.name == "select_n":
+                yield eqn.outvars[0].aval.shape
+            for sub in jax_core.jaxprs_in_params(eqn.params):
+                yield from select_shapes(sub)
+
+    x = jnp.ones((rows, hidden), jnp.bfloat16)
+    jaxpr = jax.make_jaxpr(run)(x, kwargs["topk_weights_flat"],
+                                kwargs["valid_mask_flat"])
+    selects = list(select_shapes(jaxpr.jaxpr))
+    assert ((num_tokens, topk, hidden) in selects) == selects_rows, selects
 
 
 def test_moe_gmm_onehot_combine_keeps_operand_dtype(monkeypatch):

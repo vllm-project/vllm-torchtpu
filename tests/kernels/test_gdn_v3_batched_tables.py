@@ -19,6 +19,7 @@ tile reads past the last sequence. Both table builders pad to whole tiles
 with empty entries (no rows, no state copy). The kernel test runs the dense
 entry in the Pallas TPU interpreter with out-of-bounds reads raising.
 """
+import dataclasses
 import functools
 from unittest import mock
 
@@ -26,6 +27,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax import lax
 from jax._src.pallas.mosaic import tpu_info
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -162,3 +164,70 @@ def test_dense_partial_last_tile_matches_whole_tiles(interpret_on_cpu,
     want = _run_dense_decode(8, num_decodes)
     for g, w in zip(got, want):
         np.testing.assert_array_equal(g, w)
+
+
+# The in-kernel batched-pass tables, read back after the fill.
+_TB_TABLES = (*(f"tb_{name}" for name in tables_in_kernel.TABLE_NAMES),
+              "tb_has_init", "tb_num_tiles")
+
+
+def _fill_in_kernel_tables(num_slots, num_decodes, tile):
+    """Run tables_in_kernel.fill_and_wrap on a decode step and return the
+    batched pass's tables."""
+    query_start_loc, seq_lens = _decode_step(num_slots, num_decodes)
+    shapes = tables_in_kernel.scratch_shapes(num_slots, 8, tile)
+    names = tuple(shapes)
+    cfg_b = _batched_cfg(tile)
+    cfg_p = dataclasses.replace(cfg_b, mode=config.GDNMode.PER_SEQ)
+
+    def kernel(qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref, *refs):
+        outs = refs[:len(_TB_TABLES)]
+        sc = dict(zip(names, refs[len(_TB_TABLES):]))
+        tables_in_kernel.fill_and_wrap(qsl_ref, seq_lens_ref, state_ref,
+                                       read_ref, dist_ref, sc, cfg_b, cfg_p,
+                                       num_slots)
+        for out, name in zip(outs, _TB_TABLES):
+
+            def copy(i, carry, out=out, table=sc[name]):
+                out[i] = table[i]
+                return carry
+
+            lax.fori_loop(0, out.shape[0], copy, 0)
+
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    tables = pl.pallas_call(
+        kernel,
+        out_shape=tuple(
+            jax.ShapeDtypeStruct(shapes[name].shape, jnp.int32)
+            for name in _TB_TABLES),
+        in_specs=(smem, ) * 5,
+        out_specs=(smem, ) * len(_TB_TABLES),
+        scratch_shapes=[shapes[name] for name in names],
+    )(query_start_loc, seq_lens, jnp.arange(1, num_slots + 1, dtype=jnp.int32),
+      jnp.zeros((num_slots, ), jnp.int32),
+      jnp.full((3, ), num_decodes, jnp.int32))
+    return dict(zip(_TB_TABLES, map(np.asarray, tables)))
+
+
+@pytest.mark.parametrize("num_slots, num_decodes, tile",
+                         PARTIAL_LAST_TILE + WHOLE_TILES)
+def test_in_kernel_tables_fill_reads_in_bounds(interpret_on_cpu, num_slots,
+                                               num_decodes, tile):
+    """The in-kernel fill covers every entry the live tiles read, and reads
+    the sequence arrays only in bounds when the last tile passes the last
+    slot (its entries there are the zero pad)."""
+    tables = _fill_in_kernel_tables(num_slots, num_decodes, tile)
+    num_tiles = pl.cdiv(num_decodes, tile)
+    num_read = num_tiles * tile
+    assert tables["tb_num_tiles"][0] == num_tiles
+    want = np.zeros((num_read, ), np.int32)
+    live = want.copy()
+    live[:num_decodes] = 1
+    seqs = want.copy()
+    seqs[:num_decodes] = np.arange(num_decodes)
+    for name, expected in (("s_idx", seqs), ("r_base", seqs), ("r_size", live),
+                           ("first", live), ("last", live)):
+        np.testing.assert_array_equal(tables[f"tb_{name}"][:num_read],
+                                      expected,
+                                      err_msg=name)
+    np.testing.assert_array_equal(tables["tb_has_init"][:num_decodes], 1)

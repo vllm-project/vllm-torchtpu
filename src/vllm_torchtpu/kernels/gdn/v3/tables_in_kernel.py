@@ -18,7 +18,7 @@ arrays, for decode-sized steps.
 the tables the pipeline reads (tile -> sequence, row base, row count, first
 and last tile flags, the per-sequence state slots) as XLA ops in the wrapper.
 This path fills the same tables with scalar loops in SMEM at kernel entry:
-a loop over the padded sequence count for the batched pass,
+a loop over the entries of the batched pass's live tiles,
 and a loop over the per-sequence range (empty on a decode step) for the other.
 The tables live in SMEM scratch, so the path serves steps whose tables fit:
 rows up to MAX_ROWS; larger steps keep the wrapper's XLA tables."""
@@ -112,13 +112,17 @@ def fill_and_wrap(qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref,
         sc["tb_has_init"][s] = ((seq_lens_ref[s] - q_len) > 0).astype(I32)
         return carry
 
-    lax.fori_loop(0, jnp.where(end_b > 0, max_seqs, 0), body_b, jnp.int32(0))
+    num_tiles_b = pl.cdiv(end_b, cfg_b.tile_size)
+    # Fill only the entries the live tiles read. Those past max_seqs have no
+    # sequence (and no qsl / seq_lens entry) to read: they are the pad below.
+    lax.fori_loop(0, jnp.minimum(num_tiles_b * cfg_b.tile_size, max_seqs),
+                  body_b, jnp.int32(0))
     # The last tile reads whole tiles of entries: the pad past max_seqs is
     # empty (no rows, no state copy).
     for s in range(max_seqs, sc["tb_s_idx"].shape[0]):
         for n in TABLE_NAMES:
             sc[f"tb_{n}"][s] = jnp.int32(0)
-    sc["tb_num_tiles"][0] = pl.cdiv(end_b, cfg_b.tile_size)
+    sc["tb_num_tiles"][0] = num_tiles_b
 
     chunk = cfg_p.chunk_size
     tile = cfg_p.tile_size
