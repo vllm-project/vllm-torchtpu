@@ -576,7 +576,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 
-        return fused_moe_gmm(**kwargs)
+        from vllm_torchtpu.layers.adapter.dense_fp4_shared import shared_operands
+
+        return fused_moe_gmm(**kwargs, shared=shared_operands(layer))
 
 
 class _NullInputQuantKernel:

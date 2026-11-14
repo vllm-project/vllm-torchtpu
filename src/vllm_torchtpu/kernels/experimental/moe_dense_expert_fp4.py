@@ -20,14 +20,21 @@ VMEM buffers; every token is evaluated in its original order and the weighted
 expert outputs accumulate in fp32 VMEM. This replaces the routing sort, the
 one-hot permute, the grouped GEMM and the combine with one call; the routing
 coefficients and the set of nonempty experts are derived in the kernel from the
-raw top-k ids and weights. The fp4 weights feed the MXU as fp8 (exact) against
-bf16 activations, and each 128-row block scale is applied to the block's
-partial product, as gmm_v2's decode tiles do. Rounding follows the GMM path:
-the activation is rounded to bf16 before the down projection, each expert's
-output to bf16 before its routing weight is applied.
+raw top-k ids and weights (an expert counts as nonempty when any id names it,
+even if its routing weights are zero). The fp4 weights feed the MXU as fp8
+(exact) against bf16 activations, and each 128-row block scale is applied to
+the block's partial product, as gmm_v2's decode tiles do. Rounding follows the
+GMM path: the activation is rounded to bf16 before the down projection, each
+expert's output to bf16 before its routing weight is applied.
+
+Optionally the call also evaluates an always-on shared expert (`SharedExpert`)
+and returns routed + shared: its e4m3 weights are copied into VMEM alongside
+the routed ring, so their DMA overlaps the routed experts' instead of following
+them as separate XLA matmuls.
 """
 
 import functools
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -42,19 +49,73 @@ _NUM_BUFFERS = 3
 _ACTIVATIONS = ("silu", "swigluoai")
 # Rows of the in-kernel token buffer: bf16 MXU operands pack 16 sublanes.
 _ROW_ALIGN = 16
+_SHARED_K_BLOCK = 128
+# MiniMax-M3's shared-expert SwiGLU-OAI clamp and sigmoid scale (1.702 in
+# bf16); dense_fp4_shared admits only shared experts with these values.
+_SWIGLU_LIMIT = 7.0
+_SWIGLU_ALPHA = 1.703125
 # VMEM for the kernel's small operands.
 _VMEM_HEADROOM = 1 << 20
 
 
-def _chunk(m: int, h: int, i: int, vmem_capacity: int) -> int:
+class SharedExpert(NamedTuple):
+    """A rank's slice of an always-on SwiGLU-OAI MLP with e4m3 K-major weights
+    and one f32 scale per output column, rounded as torch_tpu evaluates
+    MiniMax-M3's shared expert on bf16 tensors: each projection
+    ``bf16(bf16(x @ bf16(w)) * s)``, the activation per op
+    (`shared_activation`), and the bf16 sum with the routed output."""
+
+    w1: jax.Array  # [h, 2 * i_s] e4m3: [gate | up]
+    s1: jax.Array  # [1, 2 * i_s] f32
+    w2: jax.Array  # [i_s, h] e4m3
+    s2: jax.Array  # [1, h] f32
+
+
+def shared_activation(gate: jax.Array, up: jax.Array) -> jax.Array:
+    """SiluAndMulWithClamp(7, 1.702, 1) on bf16 values held in f32, rounded to
+    bf16 after every op as torch_tpu does (alpha too): bit-identical to the
+    torch path on tpu7x."""
+
+    def bf16(v):
+        return v.astype(jnp.bfloat16).astype(jnp.float32)
+
+    gate = jnp.minimum(gate, _SWIGLU_LIMIT)
+    up = jnp.clip(up, -_SWIGLU_LIMIT, _SWIGLU_LIMIT)
+    sig = bf16(jax.nn.sigmoid(bf16(_SWIGLU_ALPHA * gate)))
+    return bf16(bf16(gate * sig) * bf16(up + 1.0))
+
+
+def _chunk(m: int, h: int, i: int, i_s: int, vmem_capacity: int) -> int:
     """The widest unit of intermediate columns whose buffers fit in VMEM, or 0."""
     for c in (1024, 768, 512, 384, 256, 128):
-        if i % c == 0 and _vmem_bytes(m, h, c) <= vmem_capacity - _VMEM_HEADROOM:
+        if i % c == 0 and _vmem_bytes(m, h, c, i_s) <= vmem_capacity - _VMEM_HEADROOM:
             return c
     return 0
 
 
-def can_use_dense_expert_fp4(hidden, w1, w2, s1, s2, *, activation) -> bool:
+def _shared_ok(shared: SharedExpert | None, h: int, activation: str) -> bool:
+    if shared is None:
+        return True
+    fp8 = jnp.float8_e4m3fn
+    i_s = shared.w2.shape[0]
+    return (
+        activation == "swigluoai"
+        and i_s > 0
+        and i_s % _QUANT_BLOCK == 0
+        and shared.w1.shape == (h, 2 * i_s)
+        and shared.w2.shape == (i_s, h)
+        and shared.s1.shape == (1, 2 * i_s)
+        and shared.s2.shape == (1, h)
+        and shared.w1.dtype == fp8
+        and shared.w2.dtype == fp8
+        and shared.s1.dtype == jnp.float32
+        and shared.s2.dtype == jnp.float32
+    )
+
+
+def can_use_dense_expert_fp4(
+    hidden, w1, w2, s1, s2, *, activation, shared: SharedExpert | None = None
+) -> bool:
     """Layout and arithmetic support; the token threshold is the caller's."""
     if activation not in _ACTIVATIONS or hidden.ndim != 2:
         return False
@@ -71,6 +132,7 @@ def can_use_dense_expert_fp4(hidden, w1, w2, s1, s2, *, activation) -> bool:
         or w1.shape != (e, h, 2 * i)
         or min(m, h, i, e) <= 0
         or h % _QUANT_BLOCK
+        or not _shared_ok(shared, h, activation)
     ):
         return False
     if s1.shape != (e, h // _QUANT_BLOCK, 1, 2 * i) or s2.shape != (
@@ -86,21 +148,22 @@ def can_use_dense_expert_fp4(hidden, w1, w2, s1, s2, *, activation) -> bool:
         info = pltpu.get_tpu_info()
     except ValueError:  # not a TPU (e.g. a CPU host)
         return False
+    i_s = 0 if shared is None else shared.w2.shape[0]
     return info.is_matmul_supported(jnp.bfloat16, jnp.float8_e4m3fn) and bool(
-        _chunk(m, h, i, info.vmem_capacity_bytes)
+        _chunk(m, h, i, i_s, info.vmem_capacity_bytes)
     )
 
 
-def _vmem_bytes(m: int, h: int, chunk: int) -> int:
+def _vmem_bytes(m: int, h: int, chunk: int, i_s: int) -> int:
     """VMEM of one call: the weight ring (VMEM holds fp4 one byte per
-    element), its scales, the token-sized scratch and the compiler's
-    token-sized temporaries (~16 bytes per element, measured with tpu7x AOT
-    compiles at 16 and 64 rows)."""
+    element), its scales, the shared expert's weights, the token-sized scratch
+    and the compiler's token-sized temporaries (~16 bytes per element,
+    measured with tpu7x AOT compiles at 16 and 64 rows)."""
     weights = 3 * h * chunk
     scales = (2 * (h // _QUANT_BLOCK) * chunk + (chunk // _QUANT_BLOCK) * h) * 4
     mp = m + (-m % _ROW_ALIGN)
-    tokens = mp * h * (2 + 4 + 4 + 2 + 16)
-    return _NUM_BUFFERS * (weights + scales) + tokens
+    tokens = mp * h * (2 + 4 + 4 + 2 + (2 if i_s else 0) + 16)
+    return _NUM_BUFFERS * (weights + scales) + 3 * h * i_s + tokens
 
 
 def _kernel(
@@ -112,32 +175,52 @@ def _kernel(
     w2_hbm,  # [E, i, h] fp4
     s1_hbm,  # [E, h / 128, 1, 2i] f32
     s2_hbm,  # [E, i / 128, 1, h] f32
-    out_ref,  # VMEM [m, h] bf16
-    wg_ref,
-    wu_ref,
-    wd_ref,
-    sg_ref,
-    su_ref,
-    sd_ref,
-    x_pad_ref,  # VMEM [mp, h] bf16: the tokens, padded with zero rows
-    coeff_ref,  # VMEM [mp, E_pad] f32: each token's weight per local expert
-    expert_acc_ref,  # VMEM [mp, h] f32: the current expert's down projection
-    acc_ref,  # VMEM [mp, h] f32: the routing-weighted sum
-    active_ref,  # SMEM [E]: nonzero for an expert some token routes to
-    active_ids_ref,  # SMEM [E]
-    sem_ref,
-    *,
+    *refs,
     h,
     i,
     chunk,
     experts,
     activation,
+    i_s,
 ):
+    if i_s:
+        sw1_hbm, ss1_ref, sw2_hbm, ss2_ref, *refs = refs
+    (
+        out_ref,  # VMEM [m, h] bf16
+        wg_ref,
+        wu_ref,
+        wd_ref,
+        sg_ref,
+        su_ref,
+        sd_ref,
+        x_pad_ref,  # VMEM [mp, h] bf16: the tokens, padded with zero rows
+        coeff_ref,  # VMEM [mp, E_pad] f32: each token's weight per local expert
+        expert_acc_ref,  # VMEM [mp, h] f32: the current expert's down projection
+        acc_ref,  # VMEM [mp, h] f32: the routing-weighted sum
+        active_ref,  # SMEM [E]: nonzero for an expert some token routes to
+        active_ids_ref,  # SMEM [E]
+        sem_ref,
+        *shared_scratch,
+    ) = refs
     fp8 = jnp.float8_e4m3fn
     f32 = jnp.float32
     m = x_ref.shape[0]
     mp = acc_ref.shape[0]
     num_chunks = i // chunk
+
+    if i_s:
+        swg_ref, swu_ref, swd_ref, shared_out_ref, shared_sem = shared_scratch
+        shared_copies = [
+            pltpu.make_async_copy(
+                sw1_hbm.at[:, pl.ds(0, i_s)], swg_ref, shared_sem.at[0]
+            ),
+            pltpu.make_async_copy(
+                sw1_hbm.at[:, pl.ds(i_s, i_s)], swu_ref, shared_sem.at[1]
+            ),
+            pltpu.make_async_copy(sw2_hbm, swd_ref, shared_sem.at[2]),
+        ]
+        for copy in shared_copies:
+            copy.start()
 
     def clear(e, carry):
         active_ref[e] = 0
@@ -221,6 +304,33 @@ def _kernel(
         )
     coeff_ref[...] = pad_rows(coeff)
     acc_ref[...] = jnp.zeros_like(acc_ref)
+    if i_s:
+        # The shared expert sees the tokens as given, the routed experts with
+        # non-finite values zeroed (as the GMM path's one-hot permute does).
+        x_pad_ref[...] = x.astype(jnp.bfloat16)
+        for copy in shared_copies:
+            copy.wait()
+        xs = x_pad_ref[...]
+
+        def matmul(lhs, w_ref):
+            # K blocks keep the MXU operands' temporaries small.
+            y = jnp.zeros((mp, w_ref.shape[1]), f32)
+            for k in range(0, w_ref.shape[0], _SHARED_K_BLOCK):
+                y += jnp.matmul(
+                    lhs[:, k : k + _SHARED_K_BLOCK],
+                    w_ref[k : k + _SHARED_K_BLOCK, :],
+                    preferred_element_type=f32,
+                )
+            return y
+
+        def projection(lhs, w_ref, scale):
+            y = matmul(lhs, w_ref).astype(jnp.bfloat16).astype(f32) * scale
+            return y.astype(jnp.bfloat16)
+
+        gate = projection(xs, swg_ref, ss1_ref[:, :i_s]).astype(f32)
+        up = projection(xs, swu_ref, ss1_ref[:, i_s:]).astype(f32)
+        act = shared_activation(gate, up).astype(jnp.bfloat16)
+        shared_out_ref[...] = projection(act, swd_ref, ss2_ref[...])
     x_pad_ref[...] = jnp.where(jnp.isfinite(x), x, 0).astype(jnp.bfloat16)
 
     def compute(unit):
@@ -295,7 +405,11 @@ def _kernel(
 
     lax.fori_loop(0, units, body, 0)
 
-    out_ref[...] = acc_ref[:m, :].astype(out_ref.dtype)
+    out = acc_ref[:m, :]
+    if i_s:
+        routed = out.astype(out_ref.dtype).astype(f32)
+        out = routed + shared_out_ref[:m, :].astype(f32)
+    out_ref[...] = out.astype(out_ref.dtype)
 
 
 @functools.partial(jax.jit, static_argnames=("activation",))
@@ -309,16 +423,19 @@ def dense_expert_moe_fp4(
     local_ids,
     *,
     activation="swigluoai",
+    shared: SharedExpert | None = None,
 ):
     """Local routed contribution of fp4 experts, [tokens, hidden] bf16, as
-    fused_moe_func's GMM path returns it. IDs outside this rank must be -1.
-    Callers check can_use_dense_expert_fp4 first. Non-finite hidden states and
-    weights are zeroed, as the GMM path's one-hot permute (which serves these
-    token counts) does."""
+    fused_moe_func's GMM path returns it, plus the shared expert's output
+    when `shared` is given. IDs outside this rank must
+    be -1. Callers check can_use_dense_expert_fp4 first. Non-finite hidden
+    states and weights are zeroed for the routed experts, as the GMM path's
+    one-hot permute (which serves these token counts) does."""
     m, h = hidden.shape
     experts, i, _ = w2.shape
+    i_s = 0 if shared is None else shared.w2.shape[0]
     info = pltpu.get_tpu_info()
-    chunk = _chunk(m, h, i, info.vmem_capacity_bytes)
+    chunk = _chunk(m, h, i, i_s, info.vmem_capacity_bytes)
     # Whole f32 sublane tiles of tokens; the kernel pads to _ROW_ALIGN itself.
     pad = -m % 8
     if pad:
@@ -331,6 +448,17 @@ def dense_expert_moe_fp4(
     lanes = info.num_lanes
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    shared_operands, shared_specs, shared_scratch = (), [], []
+    if shared is not None:
+        shared_operands = tuple(shared)
+        shared_specs = [hbm, vmem, hbm, vmem]
+        shared_scratch = [
+            pltpu.VMEM((h, i_s), shared.w1.dtype),
+            pltpu.VMEM((h, i_s), shared.w1.dtype),
+            pltpu.VMEM((i_s, h), shared.w2.dtype),
+            pltpu.VMEM((mp, h), jnp.bfloat16),
+            pltpu.SemaphoreType.DMA((3,)),
+        ]
     out = pl.pallas_call(
         functools.partial(
             _kernel,
@@ -339,11 +467,12 @@ def dense_expert_moe_fp4(
             chunk=chunk,
             experts=experts,
             activation=activation,
+            i_s=i_s,
         ),
         out_shape=jax.ShapeDtypeStruct((mk, h), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[vmem, vmem, vmem, *[hbm] * 4],
+            in_specs=[vmem, vmem, vmem, *[hbm] * 4, *shared_specs],
             out_specs=vmem,
             scratch_shapes=[
                 pltpu.VMEM((_NUM_BUFFERS, h, chunk), w1.dtype),
@@ -359,10 +488,12 @@ def dense_expert_moe_fp4(
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((_NUM_BUFFERS, 6)),
+                *shared_scratch,
             ],
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=info.vmem_capacity_bytes),
-        name=f"dense_expert_moe_fp4-e_{experts}-m_{mp}-h_{h}-i_{i}-c_{chunk}",
+        name=f"dense_expert_moe_fp4-e_{experts}-m_{mp}-h_{h}-i_{i}-c_{chunk}"
+        + (f"-s_{i_s}" if i_s else ""),
     )(
         local_ids.reshape(-1),
         hidden,
@@ -374,5 +505,6 @@ def dense_expert_moe_fp4(
         # axis is a relayout copy of every scale on each call.
         s1,
         s2,
+        *shared_operands,
     )
     return out[:m] if pad else out

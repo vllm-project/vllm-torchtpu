@@ -380,7 +380,15 @@ def test_dense_expert_threshold_rejects_invalid_value(monkeypatch, value):
         envs.environment_variables[name]()
 
 
-@pytest.mark.parametrize("m, expected", [(8, 1024), (32, 1024), (64, 768)])
-def test_fp4_chunk_fits_minimax_m3_ep8_buffers_in_tpu7x_vmem(m, expected):
-    # tpu7x AOT compiles fit each of these; 64 rows run out of VMEM at 1024.
-    assert moe_dense_expert_fp4._chunk(m, 6144, 3072, 64 << 20) == expected
+@pytest.mark.parametrize(
+    "m, i_s, expected", [(8, 0, 1024), (32, 0, 1024), (64, 0, 768), (8, 384, 768)]
+)
+def test_fp4_chunk_fits_minimax_m3_ep8_buffers_in_tpu7x_vmem(m, i_s, expected):
+    # tpu7x AOT compiles fit each of these; 64 rows, and 8 rows with the
+    # shared expert, run out of VMEM at 1024.
+    assert moe_dense_expert_fp4._chunk(m, 6144, 3072, i_s, 64 << 20) == expected
+
+
+def test_fp4_shared_alpha_is_the_bf16_rounding_of_1_702():
+    alpha = moe_dense_expert_fp4._SWIGLU_ALPHA
+    assert alpha == float(jnp.bfloat16(1.702))

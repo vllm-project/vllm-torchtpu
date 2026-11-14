@@ -1,0 +1,149 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Hand a MoE layer's shared expert to the routed experts' op.
+
+vLLM's MoERunner computes the shared expert with its own linears and adds it to
+the routed output before the all-reduce. With ``TPU_MOE_DENSE_FP4_SHARED=1``
+an eligible layer (NVFP4 experts on the EP GMM path, a SwiGLU-OAI shared expert
+on per-channel e4m3 MiniMax-M3 linears) passes the shared expert's tensors to
+the routed op instead: the dense fp4 decode kernel evaluates it in the same
+call, overlapping its weight DMA with the routed experts', and at other token
+counts the op computes it with XLA (``fused_moe_gmm.shared_expert_mlp``). The
+runner is told it has no shared expert, so the all-reduce of the sum is
+unchanged.
+
+Arming happens once after load, when the shared linears hold their final
+K-major e4m3 layout.
+"""
+
+from typing import Any
+
+import torch
+
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import fresh_buffer
+
+logger = init_logger(__name__)
+
+# Non-persistent buffers of the routed layer, in SharedExpert's order.
+_SHARED_BUFFERS = ("_dfs_w1", "_dfs_s1", "_dfs_w2", "_dfs_s2")
+
+
+def shared_operands(layer: Any) -> tuple[torch.Tensor, ...] | None:
+    """The armed shared expert's tensors of a routed layer, else None."""
+    if getattr(layer, _SHARED_BUFFERS[0], None) is None:
+        return None
+    return tuple(getattr(layer, name) for name in _SHARED_BUFFERS)
+
+
+def _shared_tensors(runner) -> tuple[torch.Tensor, ...] | None:
+    """The shared expert's (w1, s1, w2, s2) in SharedExpert's layout, or None
+    when it is not a bias-free SwiGLU-OAI MLP on e4m3 per-channel linears."""
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+
+    from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP
+    from vllm_torchtpu.models.minimax_m3.quant import (
+        _KERNEL_SWIGLU,
+        MiniMaxM3Mxfp8LinearMethod,
+    )
+
+    mlp = getattr(getattr(runner, "_shared_experts", None), "_layer", None)
+    if type(mlp) is not MiniMaxM3MLP:
+        return None
+    act = mlp.act_fn
+    if not isinstance(act, SiluAndMulWithClamp) or (
+        (act.alpha, act.swiglu_limit, act.beta) != _KERNEL_SWIGLU
+    ):
+        return None
+    linears = (mlp.gate_up_proj, mlp.down_proj)
+    for linear in linears:
+        if (
+            not isinstance(linear.quant_method, MiniMaxM3Mxfp8LinearMethod)
+            or linear.weight.dtype != torch.float8_e4m3fn
+            or linear.weight_scale.dim() != 1
+            or getattr(linear, "bias", None) is not None
+        ):
+            return None
+    (w1, s1), (w2, s2) = ((m.weight.data, m.weight_scale.data) for m in linears)
+    h, two_i = w1.shape
+    if two_i % 2 or tuple(w2.shape) != (two_i // 2, h):
+        return None
+    # Weights as the parameters themselves (a view would be re-materialized on
+    # every call); the f32 [1, n] scales are buffers of their own.
+    return (
+        w1,
+        fresh_buffer(s1.float().reshape(1, -1)),
+        w2,
+        fresh_buffer(s2.float().reshape(1, -1)),
+    )
+
+
+def _admit(runner) -> tuple[torch.Tensor, ...] | None:
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+    from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+        enable_pipelined_collective_and_compute,
+    )
+    from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4MoEMethod
+
+    qm = runner._quant_method
+    cfg = runner.moe_config
+    if (
+        not isinstance(qm, VllmNvfp4MoEMethod)
+        or qm._tpu_activation_str != "swigluoai"
+        or qm._use_adaptive_fused_moe
+        or fused_moe_ep_supported(qm)
+        or enable_pipelined_collective_and_compute()
+        or getattr(runner.routed_experts, "_experts_start", None) is None
+        or getattr(cfg, "is_sequence_parallel", False)
+        or runner.routed_scaling_factor != 1.0
+        or runner.routed_input_transform is not None
+        or runner.routed_output_transform is not None
+        or runner.shared_expert_gate is not None
+    ):
+        return None
+    return _shared_tensors(runner)
+
+
+def arm_dense_fp4_shared(model: torch.nn.Module, what: str = "model") -> int:
+    """Arm every eligible MoE layer of `model`; returns how many were armed."""
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    from vllm_torchtpu.layers.adapter.fused_moe import prebuild_fused_moe_kernel
+
+    runners = [m for m in model.modules() if isinstance(m, MoERunner)]
+    armed = 0
+    for runner in runners:
+        shared = _admit(runner)
+        if shared is None:
+            continue
+        layer = runner.routed_experts
+        # A traced forward cannot build the op.
+        prebuild_fused_moe_kernel(
+            topk=runner.moe_config.experts_per_token,
+            activation=runner._quant_method._tpu_activation_str,
+            use_ep=True,
+            with_shared=True,
+        )
+        for name, tensor in zip(_SHARED_BUFFERS, shared):
+            layer.register_buffer(name, tensor, persistent=False)
+        runner._shared_experts = None
+        runner._forward_entry = runner._select_forward()
+        armed += 1
+    logger.info(
+        "Dense fp4 MoE carries the shared expert on %d of %d MoE layers of the %s",
+        armed,
+        len(runners),
+        what,
+    )
+    return armed

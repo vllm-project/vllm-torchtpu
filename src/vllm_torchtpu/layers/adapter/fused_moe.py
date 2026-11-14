@@ -18,10 +18,12 @@ import functools
 from collections.abc import Callable
 from typing import Any
 
+import jax
 import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import SharedExpert
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
@@ -31,7 +33,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 )
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool, bool], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -157,6 +159,7 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
+    with_shared: bool = False,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -172,7 +175,7 @@ def _build_fused_moe_custom_op(
     # Pass experts_start as a runtime tensor rather than static closure arg so every EP
     # rank compiles an identical program.
     # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
-    wrapped_fn = functools.partial(
+    routed_fn = functools.partial(
         fused_moe_func,
         topk=topk,
         activation=activation,
@@ -183,7 +186,66 @@ def _build_fused_moe_custom_op(
         skip_padded_tokens=skip_padded_tokens,
     )
 
-    fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
+    # torch_tpu takes only arrays and POD types as op arguments, so the op
+    # passes fused_moe_func's SharedExpert as its four tensors.
+    def routed(
+        hidden_states: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array | None,
+        w2_scale: jax.Array | None,
+        w1_bias: jax.Array | None,
+        w2_bias: jax.Array | None,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array | None,
+    ) -> jax.Array:
+        return routed_fn(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            topk_weights,
+            topk_ids,
+            experts_start,
+        )
+
+    def routed_and_shared(
+        hidden_states: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array | None,
+        w2_scale: jax.Array | None,
+        w1_bias: jax.Array | None,
+        w2_bias: jax.Array | None,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array | None,
+        shared_w1: jax.Array,
+        shared_s1: jax.Array,
+        shared_w2: jax.Array,
+        shared_s2: jax.Array,
+    ) -> jax.Array:
+        return routed_fn(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            topk_weights,
+            topk_ids,
+            experts_start,
+            shared=SharedExpert(shared_w1, shared_s1, shared_w2, shared_s2),
+        )
+
+    fused_moe_kernel_impl = pallas.jax_op(
+        op_name, routed_and_shared if with_shared else routed
+    )
 
     # We must overwrite the default fake implementation as vLLM uses dynamic
     # dimensions for the hidden_states.
@@ -192,7 +254,14 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        with_shared,
+    )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -204,10 +273,18 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    with_shared: bool = False,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        with_shared,
+    )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -217,6 +294,7 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        with_shared=with_shared,
     )
 
 
@@ -227,6 +305,7 @@ def prebuild_fused_moe_kernel(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    with_shared: bool = False,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -235,6 +314,7 @@ def prebuild_fused_moe_kernel(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        with_shared=with_shared,
     )
 
 
@@ -253,8 +333,12 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    shared: tuple[torch.Tensor, ...] | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
+
+    ``shared`` holds a shared expert's tensors in SharedExpert's order; its
+    output is then added to the routed output (fused_moe_func).
 
     ``experts_start`` is the first global expert id owned by this shard under
     linear EP placement (or ``None`` for non-EP) -- see
@@ -273,6 +357,7 @@ def fused_moe_gmm(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        with_shared=shared is not None,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
@@ -290,4 +375,5 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+        *(shared or ()),
     )
