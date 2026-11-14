@@ -67,11 +67,23 @@ STEP0_T, LOOP_T = 4, 1  # query rows per request: draft step 0 (verify rows), lo
 SKIP_IDLE = True
 
 
+def draft_kv_dcp() -> int:
+    """Main-KV DCP size of the MTP draft layer's pool (qsa.py: the draft splits its
+    main KV only with VLLM_TPU_QSA_MTP_KV_DCP; otherwise it keeps whole pages even
+    under VLLM_TPU_QSA_MAIN_KV_DCP=2). The draft kernel and its KV writes must use
+    this, not the target's ``main_kv_dcp()``."""
+    from vllm_torchtpu import envs
+
+    return main_kv_dcp() if envs.VLLM_TPU_QSA_MTP_KV_DCP else 1
+
+
 def draft_spec(g: Any, R: int, *, budget: int, max_groups: int, vocab_shard: int) -> Any:
     """The one-layer draft-step kernel spec (BF16 HC: the draft keeps its precision).
     With the served request loop, idle request slots are skipped (`skip_idle`: at one
     row per request a 16-row tile holds 16 request slots)."""
     opts = indexed_options()
+    dcp = draft_kv_dcp()
+    opts.update(dcp=dcp, compressed_dcp=bool(opts.get("compressed_dcp")) and dcp > 1)
     return wholestep_spec(
         g,
         R,
@@ -182,7 +194,7 @@ def build_draft_call(
         per_rank_inputs, mesh=mesh, in_specs=(tp,) + (rep,) * 7,
         out_specs=tuple(tp if n in hbm else rep for n in names), check_vma=False,
     )
-    dcp_size = main_kv_dcp()
+    dcp_size = draft_kv_dcp()
 
     def per_rank_writes(pool, kv, kr, ir, ring, main, comp, positions, starts, context, trig,
                         k_norm, ik_norm, *rank):
@@ -195,7 +207,7 @@ def build_draft_call(
             pool, rows, [(k_norm, ik_norm)], [(ring, main, comp)], [layer], positions, trig,
             starts, context, compress_ratio=4, norm_eps=norm_eps, rotary_dim=rotary_dim,
             max_query_len=T, num_requests=M // T, dcp=dcp,
-            compressed_dcp=dcp if compressed_dcp() else None,
+            compressed_dcp=dcp if dcp is not None and compressed_dcp() else None,
         )
 
     writes = jax.shard_map(
