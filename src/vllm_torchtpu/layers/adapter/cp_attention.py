@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """DCP (Decode Context Parallelism) attention: kernel building and forward
-orchestration, on top of batched_rpa's schedule_cp.CPMetadataComputer.
+orchestration, on top of batched_rpa's scheduler_cp.StripedFullScheduler.
 Process-group access lives in distributed/dcp.py.
 
 Each DCP rank stores a shard of the KV cache (interleaved by page_size).
@@ -33,44 +33,12 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as _batched_rpa_configs,
 )
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    scheduler_cp as _batched_rpa_scheduler_cp,
+)
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
     wrapper as _batched_rpa_wrapper,
 )
 from vllm_torchtpu.utils import synchronize_tensors
-
-# ---------------------------------------------------------------------------
-# LSE-weighted combination
-# ---------------------------------------------------------------------------
-
-
-def merge_attn_results(
-    out_a: torch.Tensor,
-    lse_a: torch.Tensor,
-    out_b: torch.Tensor,
-    lse_b: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Numerically stable LSE-weighted combination of two partial attentions.
-
-    Args:
-        out_a / out_b: [T, H, D]
-        lse_a / lse_b: [T, H]  (log-sum-exp in natural-log base)
-    Returns:
-        (combined_out [T, H, D], combined_lse [T, H])
-    """
-    m = torch.maximum(lse_a, lse_b)
-    m_finite = torch.isfinite(m)
-    m_safe = torch.where(m_finite, m, torch.zeros_like(m))
-    ea = torch.exp(lse_a - m_safe)
-    eb = torch.exp(lse_b - m_safe)
-    norm = ea + eb
-    out_a = torch.nan_to_num(out_a, nan=0.0, posinf=0.0, neginf=0.0)
-    out_b = torch.nan_to_num(out_b, nan=0.0, posinf=0.0, neginf=0.0)
-    norm_safe = torch.where(norm > 0, norm, torch.ones_like(norm))
-    out = (ea.unsqueeze(-1) * out_a + eb.unsqueeze(-1) * out_b) / norm_safe.unsqueeze(
-        -1
-    )
-    lse_out = torch.where(m_finite, m + torch.log(norm_safe), m)
-    return out, lse_out
-
 
 # ---------------------------------------------------------------------------
 # DCP kernel entry functions (for pallas.jax_op)
@@ -95,20 +63,17 @@ def _pallas_rpa_kernel_dcp(
     soft_cap: float | None = None,
     cp_group_size: int,
     cp_rank_val: int,
-    attention_scope: _batched_rpa_configs.AttentionScope,
     kv_layout: _batched_rpa_configs.KVLayout = (
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """One DCP pass (CACHE_ONLY or NEW_TOKENS_ONLY). Returns (new_kv_cache,
-    output, lse). decode_query_size widens the DECODE bucket so speculative
-    verify windows (K + 1 tokens) run there instead of in MIXED.
-    cp_group_size/cp_rank select schedule_cp.CPMetadataComputer
-    inside ragged_paged_attention, needed by both scopes: CACHE_ONLY to
-    compute this rank's local cache length, NEW_TOKENS_ONLY to land the
-    write on the right physical page of this rank's DCP-interleaved
-    kv_cache (its own write offset is otherwise global, not rank-local).
+    """The single DCP pass. Returns (new_kv_cache, output, lse).
+    decode_query_size widens the DECODE bucket so speculative verify windows
+    (K + 1 tokens) run there instead of in MIXED.
+    StripedFullScheduler attends this rank's page-striped share of both the
+    cached and the new tokens, and writes each new token only on the rank
+    that owns its page of the DCP-interleaved kv_cache.
     """
     import jax.numpy as jnp
 
@@ -128,9 +93,10 @@ def _pallas_rpa_kernel_dcp(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
-        cp_group_size=cp_group_size,
-        cp_rank=cp_rank_arr,
-        attention_scope=attention_scope,
+        scheduler=_batched_rpa_scheduler_cp.StripedFullScheduler(
+            cp_group_size=cp_group_size
+        ),
+        extra_scalars=(cp_rank_arr,),
         decode_query_size=decode_query_size,
         return_lse=True,
         kv_layout=kv_layout,
@@ -143,8 +109,7 @@ def _pallas_rpa_kernel_dcp(
 # ---------------------------------------------------------------------------
 
 # Class-level registry shared across all PallasAttentionBackendImpl instances.
-# Keyed by config tuple; values are the (cache_kernel_impl, new_kernel_impl)
-# pair so layers with identical configs share one set of compiled ops.
+# Keyed by config tuple so layers with identical configs share one compiled op.
 _DCP_KERNEL_REGISTRY: dict = {}
 _DCP_KERNEL_INSTANCE_COUNTER = 0
 
@@ -166,12 +131,10 @@ def _fake_dcp(kv_cache: torch.Tensor, query: torch.Tensor, *args, **kwargs):
 def _build_dcp_kernel_op(op_name: str, fn):
     """Wrap fn (a _pallas_rpa_kernel_dcp partial) as a callable kernel.
 
-    kv_cache (arg 0) is donated: CACHE_ONLY never mutates it, so its
-    returned new_kv_cache is identical to the input; NEW_TOKENS_ONLY writes
-    the new tokens into it. Either way donation lets XLA alias the output
-    onto the input pool instead of materializing a second, full-sized copy.
-    The kv_cache.copy_ below keeps the caller's tensor validly bound to
-    that (possibly aliased) result and compiles to a no-op for CACHE_ONLY.
+    kv_cache (arg 0) is donated: the kernel writes the new tokens into it,
+    and donation lets XLA alias the output onto the input pool instead of
+    materializing a second, full-sized copy. The kv_cache.copy_ below keeps
+    the caller's tensor validly bound to that (possibly aliased) result.
     """
     op = pallas.jax_op(
         op_name, fn, donate_argnums=(0,), mesh=None, input_partition_specs=None
@@ -186,7 +149,7 @@ def _build_dcp_kernel_op(op_name: str, fn):
     return kernel_impl
 
 
-def build_dcp_kernels(
+def build_dcp_kernel(
     sliding_window: int | None,
     sm_scale: float,
     logits_soft_cap: float | None,
@@ -199,11 +162,11 @@ def build_dcp_kernels(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
-) -> tuple:
-    """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops.
+):
+    """Build and cache the DCP jax_op.
 
     Returns:
-        (cache_kernel, new_kernel) where each is callable as
+        kernel callable as
         ``kernel(kv_cache, query, key, value, seq_lens, block_tables,
                  query_start_loc, request_distribution, q_scale, k_scale,
                  v_scale) -> (output [T,H,D], lse [T,H])``
@@ -211,7 +174,8 @@ def build_dcp_kernels(
     # The adapter uses batched_rpa's equivalent enum. Normalize here so both
     # entry points bind LONGCTX's enum and share ops for the same layout.
     kv_layout = _batched_rpa_configs.KVLayout(kv_layout)
-    base_key = (
+    key = (
+        "dcp",
         sliding_window,
         sm_scale,
         logits_soft_cap,
@@ -223,47 +187,25 @@ def build_dcp_kernels(
         kv_layout,
         decode_query_size,
     )
-    cache_key = ("dcp_cache", *base_key)
-    new_key = ("dcp_new", *base_key)
 
-    cached_cache = _DCP_KERNEL_REGISTRY.get(cache_key)
-    cached_new = _DCP_KERNEL_REGISTRY.get(new_key)
-    if cached_cache is not None and cached_new is not None:
-        return cached_cache, cached_new
+    cached = _DCP_KERNEL_REGISTRY.get(key)
+    if cached is not None:
+        return cached
 
-    if cached_cache is None:
-        fn = functools.partial(
-            _pallas_rpa_kernel_dcp,
-            sliding_window=sliding_window,
-            sm_scale=sm_scale,
-            soft_cap=logits_soft_cap,
-            cp_group_size=cp_group_size,
-            cp_rank_val=cp_rank,
-            attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
-            kv_layout=kv_layout,
-            decode_query_size=decode_query_size,
-        )
-        cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
-            f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn
-        )
-
-    if cached_new is None:
-        fn = functools.partial(
-            _pallas_rpa_kernel_dcp,
-            sliding_window=sliding_window,
-            sm_scale=sm_scale,
-            soft_cap=logits_soft_cap,
-            cp_group_size=cp_group_size,
-            cp_rank_val=cp_rank,
-            attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
-            kv_layout=kv_layout,
-            decode_query_size=decode_query_size,
-        )
-        cached_new = _DCP_KERNEL_REGISTRY[new_key] = _build_dcp_kernel_op(
-            f"pallas::rpa_dcp_new_{_alloc_instance_id()}", fn
-        )
-
-    return cached_cache, cached_new
+    fn = functools.partial(
+        _pallas_rpa_kernel_dcp,
+        sliding_window=sliding_window,
+        sm_scale=sm_scale,
+        soft_cap=logits_soft_cap,
+        cp_group_size=cp_group_size,
+        cp_rank_val=cp_rank,
+        kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
+    )
+    cached = _DCP_KERNEL_REGISTRY[key] = _build_dcp_kernel_op(
+        f"pallas::rpa_dcp_{_alloc_instance_id()}", fn
+    )
+    return cached
 
 
 # ---------------------------------------------------------------------------
@@ -290,13 +232,13 @@ def forward_with_dcp(
     ),
     decode_query_size: int = 1,
 ) -> torch.Tensor:
-    """Two-pass DCP attention forward.
-    1. CACHE_ONLY: query is all-gathered by heads to attend every rank's KV
-        shard, then partials are merged by `cp_lse_ag_out_rs` back to own heads.
-    2. NEW_TOKENS_ONLY: new tokens aren't DCP-sharded (every rank has the
-        full local K/V for this step), so this rank's own heads attend
-            directly; no gather/combine needed.
+    """Single-pass DCP attention forward.
 
+    The query is all-gathered by heads, and each rank attends every head
+    against its page-striped share of the cached and new KV in one kernel.
+    `cp_lse_ag_out_rs` then merges the partials back to this rank's heads. A
+    rank that holds none of a sequence's tokens returns lse = -inf for it,
+    which the merge weighs to zero.
     """
     dcp_group = get_dcp_group()
     if dcp_group is None:
@@ -306,7 +248,7 @@ def forward_with_dcp(
     k_scale = layer._k_scale_float if kv_cache_quantized_dtype else None
     v_scale = layer._v_scale_float if kv_cache_quantized_dtype else None
 
-    cache_kernel, new_kernel = build_dcp_kernels(
+    kernel = build_dcp_kernel(
         sliding_window=sliding_window,
         sm_scale=sm_scale,
         logits_soft_cap=logits_soft_cap,
@@ -333,16 +275,9 @@ def forward_with_dcp(
         v_scale,
     )
 
-    ctx_output, ctx_lse = cache_kernel(kv_cache, query_across_dcp, *shared_args)
+    partial_output, partial_lse = kernel(kv_cache, query_across_dcp, *shared_args)
 
-    ctx_output, ctx_lse = cp_lse_ag_out_rs(
-        ctx_output, ctx_lse, dcp_group, return_lse=True
-    )
-
-    new_output, new_lse = new_kernel(kv_cache, query, *shared_args)
-
-    output, _ = merge_attn_results(ctx_output, ctx_lse, new_output, new_lse)
-    output = output.to(new_output.dtype)  # f32 ctx_lse promotes the merge
+    output = cp_lse_ag_out_rs(partial_output, partial_lse, dcp_group)
 
     if not torch.compiler.is_compiling():
         synchronize_tensors(kv_cache, wait=False)
