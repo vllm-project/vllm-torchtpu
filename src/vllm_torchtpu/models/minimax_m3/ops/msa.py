@@ -464,21 +464,38 @@ def gather_group_kv(
     bytes of gathering every rank's rows and keeping one replica's (c64
     decode twin j-c4bfc418: 17.3 us per layer for ``bf16[4096, 3, 128]``)."""
     num_tokens, _, head_dim = k.shape
-    rows = torch.cat([k, v, index_q], dim=1)  # [T, 3, D]
     reps = kv_head_replicas
     if num_tokens % reps:
+        rows = torch.cat([k, v, index_q], dim=1)  # [T, 3, D]
         per_rank = group.all_gather(rows.contiguous(), dim=1)
         per_head = per_rank.view(num_tokens, dcp, 3, head_dim)[:, ::reps]
         return tuple(per_head[:, :, i].contiguous() for i in range(3))
     part = num_tokens // reps
-    mine = torch.index_select(rows.view(reps, part, 3, head_dim), 0, dcp_rank % reps)
-    parts = group.all_gather(mine.contiguous(), dim=0)  # [dcp, part, 3, D]
-    per_head = (
-        parts.view(dcp // reps, reps, part, 3, head_dim)
-        .permute(1, 2, 0, 3, 4)
-        .reshape(num_tokens, dcp // reps, 3, head_dim)
+    if num_tokens < msa_dcp_heads.HEAD_PARALLEL_MIN_TOKENS:
+        # Decode-sized steps: the lane-dense rows below cost +4.4 us per
+        # decode layer at c64 (twin j-899e03a2).
+        rows = torch.cat([k, v, index_q], dim=1)  # [T, 3, D]
+        mine = torch.index_select(rows.view(reps, part, 3, head_dim), 0, dcp_rank % reps)
+        parts = group.all_gather(mine.contiguous(), dim=0)  # [dcp, part, 3, D]
+        per_head = (
+            parts.view(dcp // reps, reps, part, 3, head_dim)
+            .permute(1, 2, 0, 3, 4)
+            .reshape(num_tokens, dcp // reps, 3, head_dim)
+        )
+        return tuple(per_head[:, :, i].contiguous() for i in range(3))
+    # Lane-dense [T, 3 * D] rows: re-laying gathered [T, 3, D] rows out per
+    # head cost ~88 us per layer at c64 (twin j-9a9fccc2), these ~0 (j-899e03a2).
+    rows = torch.cat([k, v, index_q], dim=-1).reshape(num_tokens, 3 * head_dim)
+    mine = torch.index_select(rows.view(reps, part, -1), 0, dcp_rank % reps)
+    parts = group.all_gather(mine.contiguous(), dim=0)  # [dcp, part, 3 * D]
+    return tuple(
+        parts[..., i * head_dim : (i + 1) * head_dim]
+        .reshape(dcp // reps, reps, part, head_dim)
+        .permute(1, 2, 0, 3)
+        .reshape(num_tokens, dcp // reps, head_dim)
+        .contiguous()
+        for i in range(3)
     )
-    return tuple(per_head[:, :, i].contiguous() for i in range(3))
 
 
 @functools.cache
@@ -1002,7 +1019,9 @@ def _get_msa_dcp_heads_op(
         # A sequence, one spec per output (a bare spec reads as its axes).
         output_partition_specs=(sharded,),
     )
-    op.register_fake(lambda dcp_rank, q, *args: torch.empty_like(q))
+    op.register_fake(
+        lambda dcp_rank, q, *args: q.new_empty((q.shape[0], q.shape[1] * q.shape[2]))
+    )
     return op
 
 

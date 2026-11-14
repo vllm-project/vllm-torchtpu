@@ -145,7 +145,7 @@ def _spmd(q, kvs, scs, cands, meta, **kw):
     )
     ranks = jnp.arange(DCP, dtype=jnp.int32)
     out = f(ranks, *(jnp.concatenate(a) for a in (q, kvs, scs, cands)), *meta)
-    return np.split(np.asarray(out, np.float32), DCP)
+    return [o.reshape(-1, HL, HEAD_DIM) for o in np.split(np.asarray(out, np.float32), DCP)]
 
 
 @pytest.mark.parametrize(
@@ -277,4 +277,16 @@ def test_weigh_partials_matches_xla(dtype):
     tol = 1e-5 if dtype == jnp.float32 else 1e-2
     np.testing.assert_allclose(
         np.asarray(got, np.float32), np.asarray(want, np.float32), rtol=tol, atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [512, 1500])
+def test_unrotate_to_rows_matches_unrotate_output(num_tokens):
+    """Bit for bit, including a partial last block of tokens."""
+    rng = np.random.default_rng(num_tokens)
+    x = jnp.asarray(rng.standard_normal((HL, num_tokens, HEAD_DIM)), jnp.bfloat16)
+    got = msa_dcp_heads.unrotate_to_rows(x, interpret=True)
+    want = msa_fp4.unrotate_output(x.transpose(1, 0, 2)).reshape(num_tokens, -1)
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
     )

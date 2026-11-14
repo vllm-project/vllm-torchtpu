@@ -168,6 +168,43 @@ def _dcp_attend(
     )
 
 
+# Tokens per grid step of `unrotate_to_rows`.
+_UNROTATE_BLOCK_TOKENS = 1024
+
+
+def unrotate_to_rows(x: jax.Array, *, interpret: bool = False) -> jax.Array:
+    """`msa_fp4.unrotate_output` of head-major ``x [H, T, D]`` (bf16), written
+    token-major ``[T, H * D]``, the layout the output projection reads: as
+    XLA ops the transpose, the dot and the reshape to rows each re-laid the
+    output out (~4 copies of it, ~43 us per layer at c64, twin j-9a9fccc2)."""
+    heads, num_tokens, head_dim = x.shape
+    if x.dtype != jnp.bfloat16:
+        out = msa_fp4.unrotate_output(x.transpose(1, 0, 2))
+        return out.reshape(num_tokens, heads * head_dim)
+    block_t = min(num_tokens, _UNROTATE_BLOCK_TOKENS)
+
+    def kernel(x_ref, h_ref, o_ref):
+        for h in range(heads):
+            y = jnp.dot(x_ref[h], h_ref[...], preferred_element_type=jnp.float32)
+            o_ref[:, h * head_dim : (h + 1) * head_dim] = (y * (1.0 / head_dim)).astype(
+                o_ref.dtype
+            )
+
+    return pl.pallas_call(
+        kernel,
+        grid=(pl.cdiv(num_tokens, block_t),),
+        in_specs=[
+            pl.BlockSpec((heads, block_t, head_dim), lambda i: (0, i, 0)),
+            pl.BlockSpec((head_dim, head_dim), lambda i: (0, 0)),
+        ],
+        out_specs=pl.BlockSpec((block_t, heads * head_dim), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, heads * head_dim), x.dtype),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_unrotate_rows",
+    )(x, jnp.asarray(msa_fp4.hadamard(head_dim).T, jnp.bfloat16))
+
+
 def _per_token(seq_id: jax.Array, table: jax.Array) -> jax.Array:
     """``table[seq_id]`` for a per-request table, by a one-hot over the
     requests: a gather of 8K tokens from a 64-entry table cost ~70 us."""
@@ -588,7 +625,7 @@ def attend_and_merge(
     head_parallel_min_tokens: int = HEAD_PARALLEL_MIN_TOKENS,
     interpret: bool = False,
 ) -> jax.Array:
-    """This rank's (``rank``, ``int32[1]``) attention output ``[T, Hl, D]``
+    """This rank's (``rank``, ``int32[1]``) attention output ``[T, Hl * D]``
     (unrotated) for its rotated query heads ``q [T, Hl, D]`` and its packed
     ``candidates [T, G * 2 * topk]`` (`msa_dcp.msa_write_and_candidates_dcp`);
     4-bit caches.
@@ -613,7 +650,7 @@ def attend_and_merge(
             cu_q_lens,
             rs_out_precision=rs_out_precision,
             **common,
-        )
+        ).reshape(num_tokens, -1)
     seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     live = (seq_idx < distribution[2]) & (q_lens > 0)
@@ -654,13 +691,14 @@ def attend_and_merge(
         kv_head_replicas=kv_head_replicas,
         **common,
     )
-    hp_out = msa_fp4.unrotate_output(hp_out.transpose(1, 0, 2))
+    hp_out = unrotate_to_rows(hp_out, interpret=interpret)
+    dcp_out = dcp_out.reshape(rows, -1)
     num_decode = cu_d[-1]
 
     def decode_prefix(out):
         # The runner orders decodes ahead of prefills: the decode rows are
         # then the step's first rows, one in-place update of `rows` rows.
-        head = jnp.where((p < num_decode)[:, None, None], dcp_out, out[:rows])
+        head = jnp.where((p < num_decode)[:, None], dcp_out, out[:rows])
         return jax.lax.dynamic_update_slice_in_dim(out, head, 0, 0)
 
     def scatter(out):
