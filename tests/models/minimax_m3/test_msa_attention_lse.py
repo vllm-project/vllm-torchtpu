@@ -19,7 +19,11 @@ import numpy as np
 import pytest
 
 from tests.models.minimax_m3.packing import CACHE_DTYPES, pack, rounded
-from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa_attention,
+    msa_attention_lse,
+    msa_fp4,
+)
 from vllm_torchtpu.models.minimax_m3.kernels.msa_attention_lse import (
     msa_sparse_attention_lse,
     msa_sparse_attention_lse_heads,
@@ -111,7 +115,7 @@ def test_lse_matches_dense_reference(
     if sorted_unions:
         monkeypatch.setattr(msa_attention, "_DENSE_WORK_LIST_ELEMS", 0)
     if tokens_per_call is not None:
-        monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", tokens_per_call)
+        monkeypatch.setattr(msa_attention_lse, "MAX_TOKENS_PER_CALL", tokens_per_call)
     rng = np.random.default_rng(num_tokens)
     q, kv_rows, kv, table, keys, local_key, local_limit = _inputs(
         rng, num_tokens, num_real, 1, dtype
@@ -153,7 +157,7 @@ def _head_major_call(fn, q, *args, head_major, **kwargs):
 @pytest.mark.parametrize("block_q", [16, 32])
 def test_lse_heads_matches_dense_reference(dtype, head_major, block_q, monkeypatch):
     """Every KV head of multi-head cache rows, over several kernel calls."""
-    monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", 32)
+    monkeypatch.setattr(msa_attention_lse, "MAX_TOKENS_PER_CALL", 32)
     num_kv_heads, num_tokens = 2, 70
     rng = np.random.default_rng(5)
     q, kv_rows, kv, table, keys, local_key, local_limit = _inputs(
@@ -270,7 +274,7 @@ def test_fp4_lse_matches_dense_reference(
     """4-bit pages and their scale pages, copied by the kernel beside each
     page: single-head calls (static scale rows) and every head at once
     (rows of the cache-row head). Scale pages nobody selects hold NaN."""
-    monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", 32)
+    monkeypatch.setattr(msa_attention_lse, "MAX_TOKENS_PER_CALL", 32)
     num_tokens = 70
     rng = np.random.default_rng(11 + num_kv_heads)
     q, _, _, table, keys, local_key, local_limit = _inputs(
@@ -313,3 +317,21 @@ def test_fp4_lse_matches_dense_reference(
         outs.append(o)
         lses.append(lse_h)
     _check(got, (np.concatenate(outs, axis=1), np.concatenate(lses, axis=1)))
+
+
+@pytest.mark.parametrize(
+    "page_table_words,tokens", [(16 * 1024, 8192), (128 * 1024, 4096)]
+)
+def test_tokens_per_call_fits_smem(page_table_words, tokens, monkeypatch):
+    """An 8,192-token chunk at 32-token tiles is one call beside a c16-sized
+    page table, and two even calls beside the runner's largest (half of SMEM)."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    limit = msa_attention_lse._tokens_per_call(32, 16, 16, page_table_words, False)
+    num_calls = -(-8192 // limit)
+    assert -(-8192 // num_calls // 32) * 32 == tokens

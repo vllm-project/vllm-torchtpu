@@ -228,7 +228,8 @@ def _head_parallel_attend(
     blocks = jnp.where(hp_req, seq_blocks, 0)
     seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
     page_table = jnp.arange(dcp * buffer_pages, dtype=jnp.int32)
-    # Rows per kernel call (the caller pads tokens to a block_q multiple).
+    # Rows per kernel call (the caller pads tokens to a block_q multiple); the
+    # lse kernel itself takes up to `msa_attention_lse._tokens_per_call`.
     window = min(num_tokens, msa_attention.MAX_TOKENS_PER_CALL)
     sel_block = jnp.maximum(selected, 0)
     own_block = pos // block_size

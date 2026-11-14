@@ -39,6 +39,13 @@ TILES_PER_STEP = 4
 # (a page and a scale page each) gain from 2 (bench j-caec1354: c64 shared
 # 2206 -> 2026, forced 2150 -> 2075 us per call), 8/16-bit ones do not.
 _FP4_PREFETCH = 2
+# Tokens per kernel call, at most, as SMEM allows (`_tokens_per_call`;
+# `msa_attention.MAX_TOKENS_PER_CALL` for the plain kernel). One call per
+# 8,192-token prefill chunk spares the head / chunk loop's per-call cost and
+# the copy of its output out of the loop (43 us per layer, twin j-67494143).
+MAX_TOKENS_PER_CALL = 8192
+# SMEM a call leaves to the kernel's own scalars besides its prefetched inputs.
+_SMEM_RESERVE_BYTES = 32 * 1024
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -617,6 +624,25 @@ def _packed_work(selected, block_q, pages_per_step):
     return jnp.concatenate([pages, meta, counts, starts], axis=1), tiles_per_step
 
 
+def _tokens_per_call(
+    block_q: int, topk: int, pages_per_step: int, page_table_words: int, interpret: bool
+) -> int:
+    """The most tokens per call, a multiple of `block_q` up to
+    `MAX_TOKENS_PER_CALL`, whose work list (`_packed_work`: unions, meta words
+    and counts per group, a step start per tile at most) fits the core's SMEM
+    beside the page table, the other scalar-prefetched input that grows. The
+    runner lets the page table take up to half of SMEM."""
+    limit = max(block_q, MAX_TOKENS_PER_CALL - MAX_TOKENS_PER_CALL % block_q)
+    if interpret:  # no SMEM
+        return limit
+    groups = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+    words_per_tile = groups * (pages_per_step + 2) + 1
+    free_words = (
+        pltpu.get_tpu_info().smem_capacity_bytes - _SMEM_RESERVE_BYTES
+    ) // 4 - page_table_words
+    return max(block_q, min(limit, free_words // words_per_tile * block_q))
+
+
 def _chunked_call(
     q,
     kv_cache,
@@ -635,7 +661,7 @@ def _chunked_call(
     head_major=False,
 ):
     """`_attention_call` per KV head and chunk of at most
-    `MAX_TOKENS_PER_CALL` tokens (the work list lives in SMEM).
+    `_tokens_per_call` tokens (the work list lives in SMEM), split evenly.
 
     With `head_major`, ``(out [G * Hg, T, D], lse [G * Hg, T])`` come back
     head-major, as the kernel writes them, with no transpose.
@@ -665,9 +691,11 @@ def _chunked_call(
         scale_cache=scale_cache,
         scale_rows=scale_rows,
     )
-    limit = msa_attention.MAX_TOKENS_PER_CALL
-    step = min(num_tokens, max(block_q, limit - limit % block_q))
-    num_chunks = -(-num_tokens // step)
+    limit = _tokens_per_call(
+        block_q, selected.shape[2], pages_per_step, page_table.size, interpret
+    )
+    num_chunks = -(-num_tokens // limit)
+    step = -(-num_tokens // num_chunks // block_q) * block_q
     pad = num_chunks * step - num_tokens
     q = jnp.pad(q, ((0, pad), (0, 0), (0, 0))).transpose(1, 0, 2)
     selected = jnp.pad(
