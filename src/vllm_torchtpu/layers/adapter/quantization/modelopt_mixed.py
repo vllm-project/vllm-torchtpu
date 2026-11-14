@@ -34,7 +34,7 @@ path that has not been written for it.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.model_executor.layers.attention import Attention
@@ -53,17 +53,22 @@ from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
     VllmFp8Config,
     VllmFp8LinearMethodTPU,
+    resolve_online_fp8,
 )
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
     VllmNvfp4Config,
     VllmNvfp4LinearMethod,
     VllmNvfp4MoEMethod,
 )
+from vllm_torchtpu.layers.adapter.quantization.online_fp8 import map_online_fp8
 from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
 from vllm_torchtpu.layers.core.quant_methods import (
     MODELOPT_MIXED,
     get_tpu_quant_method,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.models.utils import WeightsMapper
 
 # Both names store the same packed E2M1 weights and block scales. They differ
 # only in the activation precision the checkpoint was calibrated for, which the
@@ -96,7 +101,17 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
     def get_name(cls) -> QuantizationMethods:
         return MODELOPT_MIXED
 
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
+        super().apply_vllm_mapper(hf_to_vllm_mapper)
+        map_online_fp8(self, hf_to_vllm_mapper)
+
     def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> QuantizeMethodBase | None:
+        base_method = self._get_checkpoint_quant_method(layer, prefix)
+        return resolve_online_fp8(self, layer, prefix, base_method)
+
+    def _get_checkpoint_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
         if isinstance(layer, Attention):

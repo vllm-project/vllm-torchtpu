@@ -335,6 +335,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             enable_pipelined_collective_and_compute()
             or fused_moe_ep_supported(self)
             or adaptive_moe.adaptive_fused_moe_supported(self)
+            or envs.TPU_MOE_FP8_ALL_GATHER
         )
 
     def get_fused_moe_quant_config(self, layer):
@@ -573,7 +574,10 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
-        if enable_pipelined_collective_and_compute():
+        owns_collectives = (
+            enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER
+        )
+        if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
