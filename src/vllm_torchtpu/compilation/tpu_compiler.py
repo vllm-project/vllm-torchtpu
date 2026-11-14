@@ -754,8 +754,13 @@ class TpuCompilerAdaptor(CompilerInterface):
         from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
 
         config.reset_scheduling_group_ids()
-        with torch._guards.tracing(tracing_ctx):
-            compiled_fn = _tpu_backend(graph, example_inputs)
+        # The adaptor caches its own artifacts: bypass the shared backend cache.
+        _backend_bypass.on = True
+        try:
+            with torch._guards.tracing(tracing_ctx):
+                compiled_fn = _tpu_backend(graph, example_inputs)
+        finally:
+            _backend_bypass.on = False
 
         # Read `serialize` off the object TpuBackend returned, before any
         # wrapping: the unwrap below replaces it with a plain closure that does
@@ -1147,3 +1152,103 @@ class TpuCompilerAdaptor(CompilerInterface):
         if size is not None:
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn
+
+
+# --- Host-shared artifacts for plain backend="tpu" compiles -------------------
+
+_backend_bypass = threading.local()
+
+
+def install_shared_backend_cache() -> None:
+    """VLLM_TPU_SHARED_BACKEND_CACHE=<dir>: share plain `torch.compile(backend="tpu")`
+    compiles (the sampler / rejection-sampler / verify warmups) across the ranks
+    of a host, as peer replay shares the piecewise backbone's.
+
+    Those graphs reach TpuBackend directly, not through TpuCompilerAdaptor, so
+    every rank lowered and compiled every one of them (~19 s per rejection
+    sampler bucket on each of 8 ranks, in any order, j-a822771a-613e-4e8d-a790).
+    Here each compile is keyed by the graph's fingerprint, its example inputs'
+    shapes/dtypes/strides and the compile environment; the first rank to compile
+    a key saves TpuBackend's bundled entry under <dir>, and any rank meeting the
+    key later rebuilds the runnable from it instead of lowering and compiling.
+    With the sweep rotated per rank (VLLM_TPU_PRECOMPILE_ROTATE_SPEC_VERIFY) the
+    ranks then compile different buckets first and load the rest.
+
+    The scheduling-group counter is reset per compile, as `_run_backend` does
+    for the backbone, so a graph's program (and key) does not depend on what
+    the process compiled before. Rank-dependent graphs fingerprint per rank and
+    are never shared. Compiles that go through TpuCompilerAdaptor bypass this.
+    """
+    root = os.environ.get("VLLM_TPU_SHARED_BACKEND_CACHE", "")
+    if not root or getattr(TpuBackend, "_vllm_shared_cache", False):
+        return
+    root = os.path.expandvars(root)
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError as e:
+        logger.warning("[shared-backend-cache] disabled, cannot create %s: %s", root, e)
+        return
+    try:
+        base = json.dumps(
+            {
+                "torch": torch.__version__,
+                "torch_tpu": importlib_metadata.version("torch-tpu"),
+                "libtpu": importlib_metadata.version("libtpu"),
+                "env": _tpu_compile_env_factors(),
+            },
+            sort_keys=True,
+            default=str,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[shared-backend-cache] disabled: %s", e)
+        return
+    original = TpuBackend.__call__
+
+    def key_for(gm, example_inputs) -> str | None:
+        fingerprint = _graph_fingerprint(gm)
+        if fingerprint is None:
+            return None
+        sig = []
+        for t in example_inputs:
+            if isinstance(t, torch.Tensor):
+                sig.append((tuple(int(d) for d in t.shape), str(t.dtype), tuple(int(s) for s in t.stride())))
+            else:
+                sig.append(repr(t))
+        return hashlib.sha256(f"{base}|{fingerprint}|{sig}".encode()).hexdigest()[:40]
+
+    def call(self, gm, example_inputs, *args, **kwargs):
+        if getattr(_backend_bypass, "on", False):
+            return original(self, gm, example_inputs, *args, **kwargs)
+        try:
+            key = key_for(gm, example_inputs)
+        except Exception:  # noqa: BLE001 - sharing is an optimization only
+            key = None
+        path = os.path.join(root, f"{key}.pkl") if key else None
+        if path and os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    entry = pickle.load(f)
+                fn = _deserialize_entry(entry)
+                logger.debug("[shared-backend-cache] loaded %s", key)
+                return fn
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[shared-backend-cache] could not load %s: %s", path, e)
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        config.reset_scheduling_group_ids()
+        out = original(self, gm, example_inputs, *args, **kwargs)
+        serialize = getattr(out, "serialize", None)
+        if path and serialize is not None and not os.path.exists(path):
+            try:
+                entry = serialize()
+                tmp = f"{path}.{os.getpid()}.tmp"
+                with open(tmp, "wb") as f:
+                    pickle.dump(entry, f)
+                os.replace(tmp, path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[shared-backend-cache] could not save %s: %s", key, e)
+        return out
+
+    TpuBackend.__call__ = call
+    TpuBackend._vllm_shared_cache = True
+    logger.info("[shared-backend-cache] plain backend='tpu' compiles shared via %s", root)
