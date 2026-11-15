@@ -31,7 +31,9 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 )
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+# Keyed by (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens[,
+# padding_rows]).
+_fused_moe_kernel_cache: dict[tuple[Any, ...], Any] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -150,6 +152,26 @@ def _allocate_kernel_instance_id() -> int:
     return kernel_instance_id
 
 
+def _validate_padding_rows(
+    skip_padded_tokens: bool,
+    padding_rows: str | None,
+    *,
+    row_info: torch.Tensor | None = None,
+    check_row_info: bool = False,
+) -> None:
+    if padding_rows is not None:
+        if padding_rows != "count":
+            raise ValueError(
+                f"Unsupported padding_rows={padding_rows!r}; expected 'count' or None."
+            )
+        if not skip_padded_tokens:
+            raise ValueError("padding_rows='count' requires skip_padded_tokens=True.")
+        if check_row_info and row_info is None:
+            raise ValueError("padding_rows='count' requires row_info.")
+    elif check_row_info and row_info is not None:
+        raise ValueError("row_info must be None when padding_rows is None.")
+
+
 def _build_fused_moe_custom_op(
     *,
     topk: int,
@@ -157,7 +179,9 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
+    padding_rows: str | None = None,
 ):
+    _validate_padding_rows(skip_padded_tokens, padding_rows)
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
 
@@ -181,6 +205,7 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        padding_rows=padding_rows,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -192,7 +217,15 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key: tuple[Any, ...] = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+    )
+    if padding_rows is not None:
+        cache_key = (*cache_key, padding_rows)
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -204,10 +237,20 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    padding_rows: str | None = None,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    _validate_padding_rows(skip_padded_tokens, padding_rows)
+    cache_key: tuple[Any, ...] = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+    )
+    if padding_rows is not None:
+        cache_key = (*cache_key, padding_rows)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -217,6 +260,7 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        padding_rows=padding_rows,
     )
 
 
@@ -227,6 +271,7 @@ def prebuild_fused_moe_kernel(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    padding_rows: str | None = None,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -235,6 +280,7 @@ def prebuild_fused_moe_kernel(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        padding_rows=padding_rows,
     )
 
 
@@ -253,8 +299,14 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    padding_rows: str | None = None,
+    row_info: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
+
+    When ``padding_rows="count"`` (requires ``skip_padded_tokens=True`` and a
+    1-element int32 ``row_info`` tensor giving the valid prefix row count), the
+    kernel excludes padded rows by row index rather than zeroed routing weights.
 
     ``experts_start`` is the first global expert id owned by this shard under
     linear EP placement (or ``None`` for non-EP) -- see
@@ -266,13 +318,22 @@ def fused_moe_gmm(
     with an elementwise subtract and masks non-local experts. When present,
     the sparse-core parity path dispatches ragged gather/gather-reduce.
     """
+    resolved_skip = (
+        envs.TPU_MOE_SKIP_PADDED_TOKENS
+        if skip_padded_tokens is None
+        else skip_padded_tokens
+    )
+    _validate_padding_rows(
+        resolved_skip, padding_rows, row_info=row_info, check_row_info=True
+    )
     use_ep = experts_start is not None
     fused_moe = _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
+        skip_padded_tokens=resolved_skip,
+        padding_rows=padding_rows,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
@@ -290,4 +351,5 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+        *(() if padding_rows is None else (row_info,)),
     )

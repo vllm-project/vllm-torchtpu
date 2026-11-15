@@ -1,0 +1,196 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Row-count padding filter in prepare_routed_gmm_inputs (non-EP).
+
+When every real row carries non-zero routing weights, ``padding_rows="count"``
+builds the same routing layout as zeroing padded weights while leaving padded
+row weights untouched. When a real row carries a zero routing weight, the count
+filter keeps stock dispatch behavior for that real route while excluding padded
+rows by row index.
+"""
+
+import jax.numpy as jnp
+import numpy as np
+import pytest
+import torch
+
+from vllm_torchtpu.layers.adapter import fused_moe as fused_moe_adapter
+from vllm_torchtpu.layers.core.fused_moe_gmm import prepare_routed_gmm_inputs
+
+E, TOPK, H = 64, 8, 32
+
+
+def _inputs(t, seed):
+    rng = np.random.default_rng(seed)
+    ids = np.stack([rng.choice(E, TOPK, replace=False) for _ in range(t)]).astype(
+        np.int32
+    )
+    w = rng.random((t, TOPK)).astype(np.float32) + 0.1
+    x = rng.standard_normal((t, H)).astype(np.float32)
+    return jnp.asarray(x), jnp.asarray(ids), jnp.asarray(w)
+
+
+def _prep(x, ids, w, **kw):
+    out = prepare_routed_gmm_inputs(
+        x,
+        ids,
+        w,
+        local_num_experts=E,
+        topk=TOPK,
+        use_ep=False,
+        use_sparse_core=False,
+        **kw,
+    )
+    x_sorted, group_sizes, revert, w_flat, valid, tok_sorted = (
+        np.asarray(o) for o in out
+    )
+    return dict(
+        x=x_sorted,
+        group_sizes=group_sizes,
+        revert=revert,
+        valid=valid,
+        tok_sorted=tok_sorted,
+        weight_used=w_flat * valid,
+    )
+
+
+@pytest.mark.parametrize(
+    "t, n", [(16, 16), (16, 15), (16, 12), (16, 1), (16, 0), (32, 17)]
+)
+@pytest.mark.parametrize("seed", [0, 1])
+def test_count_filter_matches_zeroed_weights_with_nonzero_padded_gates(t, n, seed):
+    x, ids, w = _inputs(t, seed)
+    pad = jnp.arange(t) >= n
+    zeroed = jnp.where(pad[:, None], 0.0, w)
+    ref = _prep(x, ids, zeroed, skip_padded_tokens=True)
+    # Deliberately pass non-zero weights on padded rows to verify exclusion is
+    # driven by row_info count rather than weight zeroing.
+    count = _prep(
+        x,
+        ids,
+        w,
+        skip_padded_tokens=True,
+        padding_rows="count",
+        row_info=jnp.asarray([n], jnp.int32),
+    )
+    for k in ref:
+        np.testing.assert_array_equal(count[k], ref[k], err_msg=k)
+    assert int(count["group_sizes"].sum()) == n * TOPK
+
+
+def test_real_row_zero_gate_keeps_stock_dispatch():
+    """Mixed zero-gate and positive-gate real rows: count filter keeps stock's
+    valid_mask on real rows (differs from weight-zeroing) and drops padded rows.
+    """
+    t, n = 16, 12
+    x, ids, w = _inputs(t, seed=7)
+    w = w.at[0, 0].set(0.0).at[5, 3].set(0.0)
+    pad = jnp.arange(t) >= n
+
+    stock_real_only = _prep(x[:n], ids[:n], w[:n], skip_padded_tokens=False)
+    zeroed = _prep(x, ids, jnp.where(pad[:, None], 0.0, w), skip_padded_tokens=True)
+    count = _prep(
+        x,
+        ids,
+        w,
+        skip_padded_tokens=True,
+        padding_rows="count",
+        row_info=jnp.asarray([n], jnp.int32),
+    )
+
+    # Zeroing drops the two zero-gate real routes; count keeps them like stock.
+    assert int(zeroed["group_sizes"].sum()) == n * TOPK - 2
+    assert int(count["group_sizes"].sum()) == n * TOPK
+    np.testing.assert_array_equal(count["group_sizes"], stock_real_only["group_sizes"])
+    np.testing.assert_array_equal(
+        count["valid"].reshape(t, TOPK)[:n], np.ones((n, TOPK), dtype=bool)
+    )
+    np.testing.assert_array_equal(
+        count["valid"].reshape(t, TOPK)[n:], np.zeros((t - n, TOPK), dtype=bool)
+    )
+    np.testing.assert_array_equal(count["x"][: n * TOPK], stock_real_only["x"])
+    np.testing.assert_array_equal(
+        count["tok_sorted"][: n * TOPK], stock_real_only["tok_sorted"]
+    )
+    np.testing.assert_array_equal(
+        count["weight_used"].reshape(t, TOPK)[:n], np.asarray(w[:n])
+    )
+
+
+@pytest.mark.parametrize(
+    "skip, padding_rows, row_info_kind",
+    [
+        (False, "count", "count"),
+        (True, "count", None),
+        (False, None, "count"),
+        (True, "mask", "mask"),
+    ],
+)
+def test_prepare_rejects_invalid_padding_rows_combinations(
+    skip, padding_rows, row_info_kind
+):
+    x, ids, w = _inputs(16, seed=0)
+    if row_info_kind == "count":
+        row_info = jnp.asarray([4], jnp.int32)
+    elif row_info_kind == "mask":
+        row_info = jnp.zeros(16, dtype=bool)
+    else:
+        row_info = None
+    with pytest.raises(ValueError):
+        _prep(
+            x,
+            ids,
+            w,
+            skip_padded_tokens=skip,
+            padding_rows=padding_rows,
+            row_info=row_info,
+        )
+
+
+@pytest.mark.parametrize(
+    "skip, padding_rows, row_info_kind",
+    [
+        (False, "count", "count"),
+        (True, "count", None),
+        (False, None, "count"),
+        (True, "mask", "mask"),
+    ],
+)
+def test_adapter_rejects_invalid_padding_rows_combinations(
+    skip, padding_rows, row_info_kind
+):
+    if row_info_kind == "count":
+        row_info = torch.tensor([4], dtype=torch.int32)
+    elif row_info_kind == "mask":
+        row_info = torch.zeros(16, dtype=torch.bool)
+    else:
+        row_info = None
+    with pytest.raises(ValueError):
+        fused_moe_adapter.fused_moe_gmm(
+            hidden_states=torch.randn(4, 16, dtype=torch.bfloat16),
+            w1=torch.empty(0),
+            w2=torch.empty(0),
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=torch.ones(4, 2, dtype=torch.bfloat16) * 0.5,
+            topk_ids=torch.zeros(4, 2, dtype=torch.int32),
+            experts_start=None,
+            topk=2,
+            activation="silu",
+            skip_padded_tokens=skip,
+            padding_rows=padding_rows,
+            row_info=row_info,
+        )

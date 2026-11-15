@@ -513,6 +513,35 @@ class TestMoEForwardPrecisionBranches:
             f"and pipelined_fused_moe_gmm ({list(sig_pipelined.parameters.keys())})."
         )
 
+    @pytest.mark.parametrize(
+        "extra_kwargs",
+        [
+            {"padding_rows": "count", "row_info": torch.tensor([2], dtype=torch.int32)},
+            {"padding_rows": "count", "row_info": None},
+            {"padding_rows": None, "row_info": torch.tensor([2], dtype=torch.int32)},
+        ],
+    )
+    def test_pipelined_fused_moe_rejects_padding_rows_and_row_info(self, extra_kwargs):
+        """Non-None padding_rows/row_info must raise, never be silently ignored
+        or reused across chunked DP/PCP calls."""
+        with pytest.raises(NotImplementedError):
+            pipelined_fused_moe_gmm(
+                hidden_states=torch.randn(4, 64, dtype=torch.bfloat16),
+                w1=torch.empty(0),
+                w2=torch.empty(0),
+                w1_scale=None,
+                w2_scale=None,
+                w1_bias=None,
+                w2_bias=None,
+                topk_weights=torch.ones(4, 2, dtype=torch.bfloat16) * 0.5,
+                topk_ids=torch.zeros(4, 2, dtype=torch.int32),
+                experts_start=None,
+                topk=2,
+                activation="silu",
+                skip_padded_tokens=True,
+                **extra_kwargs,
+            )
+
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_fp8_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):
         """Verify FP8 apply_monolithic passes identical valid
