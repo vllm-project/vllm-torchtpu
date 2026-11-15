@@ -74,6 +74,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     runner = SimpleNamespace(
         _pp_handoff=None,
         _dp_step_other_decode=False,
+        num_prompt_logprobs={},
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],
@@ -86,6 +87,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
             top_tokens=False,
             topk_candidates_packed=False,
             kv_save_nan_check=None,
+            prompt_logprobs_chunks=[],
         ),
         input_batch=SimpleNamespace(
             max_num_logprobs=None,

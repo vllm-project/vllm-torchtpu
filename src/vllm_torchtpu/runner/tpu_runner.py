@@ -179,6 +179,7 @@ from vllm_torchtpu.runner import fast_forward_context as _ffc
 from vllm_torchtpu.runner import (
     greedy_top_tokens,
     host_trims,
+    prompt_logprobs,
     runner_options,
     spec_boundary_state,
 )
@@ -282,6 +283,9 @@ class ExecuteModelState:
     # ([rows, 2 * 32 * tp_size] float32), not full logits.
     topk_candidates_packed: bool = False
     kv_save_nan_check: KVSaveNanCheck | None = None
+    prompt_logprobs_chunks: list[prompt_logprobs.PromptLogprobsChunk] = field(
+        default_factory=list
+    )
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -1513,6 +1517,9 @@ class TPUModelRunner(GPUModelRunner):
             if most_model_len is not None
             else None
         )
+        # Why prompt logprobs cannot be computed, with the fix (None if they
+        # can); set at model load.
+        self._prompt_logprobs_unsupported: str | None = None
         # InputBatch needs to work with sampling tensors greater than padding
         # to avoid dynamic shapes. Also, avoid suboptimal alignment.
         self.max_num_reqs = max(self.max_num_reqs, MIN_NUM_SEQS)
@@ -5932,6 +5939,7 @@ class TPUModelRunner(GPUModelRunner):
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
         mamba_boundary_plans: list[spec_boundary_state.SpecBoundaryPlan | None] = []
         draft_chunks: list[DraftChunkInputs] = []
+        prompt_logprobs_chunks: list[prompt_logprobs.PromptLogprobsChunk] = []
         is_draft_model = self._is_async_drafter
         top_tokens = self._greedy_top_tokens_this_step()
         topk_candidates_packed = not top_tokens and self._topk_candidates_this_step()
@@ -6250,6 +6258,13 @@ class TPUModelRunner(GPUModelRunner):
                     logits = self.compute_logits_from_hidden_states(
                         sample_hidden_states
                     )
+                if self.num_prompt_logprobs:
+                    assert isinstance(hidden_states, torch.Tensor)
+                    prompt_chunk = self._prompt_logprobs_chunk(
+                        scheduler_output, hidden_states, start_index, num_reqs
+                    )
+                    if prompt_chunk is not None:
+                        prompt_logprobs_chunks.append(prompt_chunk)
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -6329,11 +6344,79 @@ class TPUModelRunner(GPUModelRunner):
             top_tokens=top_tokens,
             topk_candidates_packed=topk_candidates_packed,
             kv_save_nan_check=nan_check,
+            prompt_logprobs_chunks=prompt_logprobs_chunks,
         )
 
         if self.is_pooling_model:
             return self.sample_tokens(None)
         return None
+
+    def _prompt_logprobs_unsupported_reason(self) -> str | None:
+        """Why this runner cannot compute prompt logprobs, with the fix; None if
+        it can. Read from the PCP manager when USE_TPU_PCP_MANAGER replaces the
+        sequence layout planner."""
+        return prompt_logprobs.unsupported_reason(
+            dp_vocab_logits=self._dp_vocab_logits,
+            selected_logits_hidden_states=(
+                self.get_pcp_planner().uses_selected_logits_hidden_states
+            ),
+            lora=self.lora_config is not None,
+        )
+
+    def _prompt_logprobs_chunk(
+        self,
+        scheduler_output: "SchedulerOutput",
+        hidden_states: torch.Tensor,
+        start_index: int,
+        num_reqs: int,
+    ) -> prompt_logprobs.PromptLogprobsChunk | None:
+        """Score the prompt rows of this chunk's prompt-logprob requests.
+
+        The rows go through compute_selected_logits and gather_logprobs in
+        slices of at most the request bucket both precompile for this token
+        bucket, so a step with prompt logprobs compiles nothing new.
+        """
+        if self._prompt_logprobs_unsupported is not None:
+            # TODO: support them in these configurations. Skipping returns the
+            # request without prompt logprobs, as before they were computed,
+            # where raising here would stop the engine and every request in it.
+            logger.warning_once(
+                "prompt_logprobs (also set by echo=True) are not supported with "
+                "%s; those requests get no prompt logprobs.",
+                self._prompt_logprobs_unsupported,
+            )
+            return None
+        end_index = start_index + num_reqs
+        spans = prompt_logprobs.plan_chunk(
+            cast(list[str], self.input_batch.req_ids[start_index:end_index]),
+            self.query_start_loc_np[: num_reqs + 1],
+            self.input_batch.num_computed_tokens_cpu[start_index:end_index],
+            scheduler_output.num_scheduled_tokens,
+            self.requests,
+            self.num_prompt_logprobs,
+        )
+        if not spans:
+            return None
+        chunk = prompt_logprobs.PromptLogprobsChunk(spans)
+        rows, targets = prompt_logprobs.rows_and_targets(spans, self.requests)
+        max_slice = _get_padded_num_reqs_with_upper_limit(
+            min(hidden_states.shape[0], self.max_num_reqs), self.max_num_reqs
+        )
+        for lo in range(0, rows.shape[0], max_slice):
+            n = min(max_slice, rows.shape[0] - lo)
+            padded = _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs)
+            indices = np.zeros(padded, dtype=np.int32)
+            indices[:n] = rows[lo : lo + n]
+            target_ids = np.zeros((padded, 1), dtype=np.int64)
+            target_ids[:n, 0] = targets[lo : lo + n]
+            logits = self.compute_selected_logits(
+                hidden_states, torch.from_numpy(indices).to(self.device)
+            )
+            tensors = self.gather_logprobs(
+                logits, torch.from_numpy(target_ids).to(self.device)
+            )
+            chunk.slices.append((tensors, n))
+        return chunk
 
     def _pool_chunk(
         self,
@@ -7769,20 +7852,21 @@ class TPUModelRunner(GPUModelRunner):
             )
             if getattr(self, "_cached_output_req_ids_key", None) == req_ids_key:
                 req_id_to_index_snap = self._cached_req_id_to_index_snap
-                prompt_logprobs_dict = self._cached_prompt_logprobs_dict
             else:
                 req_id_to_index_snap = dict(self.input_batch.req_id_to_index)
-                prompt_logprobs_dict = {req_id: None for req_id in req_ids}
                 self._cached_output_req_ids_key = req_ids_key
                 self._cached_req_id_to_index_snap = req_id_to_index_snap
-                self._cached_prompt_logprobs_dict = prompt_logprobs_dict
             model_runner_output = ModelRunnerOutput(
                 req_ids=req_ids,
                 # Snapshot of the req_id_to_index for the VLLM scheduler.
                 req_id_to_index=req_id_to_index_snap,
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
                 logprobs=logprobs,
-                prompt_logprobs_dict=prompt_logprobs_dict,
+                prompt_logprobs_dict=prompt_logprobs.emit(
+                    state.prompt_logprobs_chunks,
+                    self.requests,
+                    self.num_prompt_logprobs,
+                ),
                 pooler_output=pooler_output,
                 kv_connector_output=kv_connector_output,
             )
@@ -7926,6 +8010,7 @@ class TPUModelRunner(GPUModelRunner):
             self._dp_vocab_logits
             and self.get_pcp_planner().uses_selected_logits_hidden_states
         ), "TPU_DP_VOCAB_PARALLEL does not support selected logits hidden states"
+        self._prompt_logprobs_unsupported = self._prompt_logprobs_unsupported_reason()
         if self.is_pooling_model:
             self._resolve_static_pooler()
         _install_gdn_fused_norm_quant(model, self.model_config)
