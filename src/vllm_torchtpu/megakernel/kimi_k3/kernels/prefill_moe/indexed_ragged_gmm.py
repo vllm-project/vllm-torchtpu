@@ -88,12 +88,16 @@ def indexed_gate_up(latent, indices, rhs, sizes, scales, layer):
         def start(g, bank):
             begin, nrows = bounds(g)
 
-            @pl.loop(0, nrows)
-            def row(i):
-                source = idx[begin + i]
-                pltpu.make_async_copy(
-                    x.at[pl.ds(source, 1)], acts.at[bank, pl.ds(i, 1)], sems.at[bank]
-                ).start()
+            # bounds() aligns both ends to sub, so each iteration issues sub row copies
+            @pl.loop(0, nrows // sub)
+            def chunk(j):
+                first = begin + j * sub
+                dst = acts.at[bank, pl.ds(j * sub, sub)]
+                for u in range(sub):
+                    source = idx[first + u]
+                    pltpu.make_async_copy(
+                        x.at[pl.ds(source, 1)], dst.at[pl.ds(u, 1)], sems.at[bank]
+                    ).start()
 
         def inner(w, y, partial, acc, metadata):
             g = pl.program_id(1)
