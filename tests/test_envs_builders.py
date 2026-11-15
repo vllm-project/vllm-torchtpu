@@ -28,6 +28,7 @@ from vllm_torchtpu.envs import (
     env_bool,
     env_float,
     env_int,
+    env_nonnegative_float,
     env_nonnegative_int,
     env_nonnegative_int_or_auto,
     env_str,
@@ -53,6 +54,7 @@ def _clear(monkeypatch):
         (env_int, 7),
         (env_nonnegative_int, 7),
         (env_float, 1.5),
+        (env_nonnegative_float, 1.5),
     ],
 )
 def test_unset_reads_as_the_default(builder, default):
@@ -66,6 +68,7 @@ def test_unset_reads_as_the_default(builder, default):
         (env_int, 7),
         (env_nonnegative_int, 7),
         (env_float, 1.5),
+        (env_nonnegative_float, 1.5),
     ],
 )
 @pytest.mark.parametrize("value", ["", "   "])
@@ -134,19 +137,31 @@ def test_int_rejects_non_integers(monkeypatch, value):
         env_int(VAR, 0)()
 
 
-def test_nonnegative_int_accepts_zero(monkeypatch):
-    """0 is meaningful for these knobs: every one of them spells auto-size."""
+@pytest.mark.parametrize("builder", [env_nonnegative_int, env_nonnegative_float])
+def test_nonnegative_accepts_zero(monkeypatch, builder):
+    """0 is meaningful for these knobs: auto-size for the int ones, "check
+    once, do not wait" for TPU_PRECOMPILE_PEER_WAIT_S."""
     monkeypatch.setenv(VAR, "0")
-    assert env_nonnegative_int(VAR, 4)() == 0
+    assert builder(VAR, 4)() == 0
 
 
-def test_nonnegative_int_rejects_negatives(monkeypatch):
-    """These feed ThreadPoolExecutor(max_workers=...) and slot counts. The
-    old helper clamped a negative to the default and logged a warning, which
-    left the process running a pool size nobody asked for."""
+@pytest.mark.parametrize("builder", [env_nonnegative_int, env_nonnegative_float])
+def test_nonnegative_rejects_negatives(monkeypatch, builder):
+    """These feed ThreadPoolExecutor(max_workers=...), slot counts and waits.
+    The old helper clamped a negative to the default and logged a warning,
+    which left the process running a pool size nobody asked for."""
     monkeypatch.setenv(VAR, "-1")
     with pytest.raises(ValueError, match="must be >= 0"):
-        env_nonnegative_int(VAR, 0)()
+        builder(VAR, 0)()
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_nonnegative_float_rejects_non_finite(monkeypatch, value):
+    """As a timeout, nan compares false against everything and inf never
+    expires; -inf is caught as negative."""
+    monkeypatch.setenv(VAR, value)
+    with pytest.raises(ValueError, match=VAR):
+        env_nonnegative_float(VAR, 1.0)()
 
 
 def test_float_parses_ints_too(monkeypatch):

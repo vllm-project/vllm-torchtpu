@@ -106,7 +106,7 @@ class PageBufferRef(_BufferedRef):
         sem = self.sem_recvs.at[slot]
         pid = grid_indices[0]
 
-        state_cache_ref, token_pages_ref = src_ref
+        state_cache_ref, token_pages_ref, kv_slot_mapping_ref = src_ref
 
         tile_n = self.cfgs.tile_sizes.tile_n
         pages_to_buffer_per_token = self.cfgs.pages_to_buffer_per_token
@@ -114,27 +114,35 @@ class PageBufferRef(_BufferedRef):
         page_buffer_ref = cast(jax.Ref, self.window_ref.at[slot])
         global_idx = pid * tile_n
 
-        @pl.loop(0, tile_n * pages_to_buffer_per_token, unroll=True)
-        def loop_body(idx):
-            n = idx // pages_to_buffer_per_token
-            p = idx % pages_to_buffer_per_token
+        # A token without an output record (kv slot < 0) needs no window: its
+        # pages are not fetched, and `wait_in` waits on exactly the same set.
+        for n in range(tile_n):
             idx_n = global_idx + n
 
-            # compress_norm_rope_store looks up each token's window pages,
-            # oldest first.
-            page = token_pages_ref[idx_n * pages_to_buffer_per_token + p]
-
-            src = state_cache_ref.at[page, :, :, :]
-            dest = page_buffer_ref.at[n, p, :, :, :]
-            pltpu.make_async_copy(src, dest, sem).start()
+            @pl.when(kv_slot_mapping_ref[idx_n] >= 0)
+            def _(n=n, idx_n=idx_n):
+                for p in range(pages_to_buffer_per_token):
+                    # compress_norm_rope_store looks up each token's window
+                    # pages, oldest first.
+                    page = token_pages_ref[idx_n * pages_to_buffer_per_token + p]
+                    src = state_cache_ref.at[page, :, :, :]
+                    dest = page_buffer_ref.at[n, p, :, :, :]
+                    pltpu.make_async_copy(src, dest, sem).start()
 
     def wait_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
+        _, _, kv_slot_mapping_ref = src_ref
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        pltpu.make_async_copy(vmem_ref, vmem_ref, sem).wait()
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
+        tile_n = self.cfgs.tile_sizes.tile_n
+        global_idx = grid_indices[0] * tile_n
+        for n in range(tile_n):
+
+            @pl.when(kv_slot_mapping_ref[global_idx + n] >= 0)
+            def _(n=n):
+                pltpu.make_async_copy(vmem_ref.at[n], vmem_ref.at[n], sem).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -517,6 +525,7 @@ def create_allocs_and_specs(
     page_buffer_args = (
         cache_ref if state_cache_ref is None else state_cache_ref,
         token_pages_ref,
+        kv_slot_mapping_ref,
     )
 
     # rope

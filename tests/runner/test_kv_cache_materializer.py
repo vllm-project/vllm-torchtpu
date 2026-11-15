@@ -556,7 +556,7 @@ def test_native_placements_preserve_pool_budget_and_aliases(hybrid):
     from types import SimpleNamespace
 
     from vllm.config import CacheConfig
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
 
     seed = make_hybrid_config() if hybrid else make_attention_only_config()
     attention = seed.kv_cache_groups[0].kv_cache_spec

@@ -205,7 +205,13 @@ def test_tpu_mean_pool_chunked_prefill_online_accumulation():
     total_tokens = 10
 
     # Request of 10 tokens split into chunks: [4, 4, 2]
-    all_hidden_states = torch.randn(total_tokens, dim, dtype=torch.float32)
+    # Fixed seed: the chunked sums below add in a different order than the
+    # reference sums, and allclose's default atol (1e-8) fails on an element
+    # that lands near zero -- about 1 in 100 unseeded runs.
+    generator = torch.Generator().manual_seed(0)
+    all_hidden_states = torch.randn(
+        total_tokens, dim, dtype=torch.float32, generator=generator
+    )
     expected_mean = all_hidden_states.mean(dim=0)
 
     req = MagicMock()

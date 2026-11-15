@@ -15,6 +15,9 @@
 
 from collections.abc import Callable
 
+from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import (
+    RoutingSimulatorRouter,
+)
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -22,6 +25,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
+from vllm_torchtpu.layers.adapter import expert_placement
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 
@@ -47,6 +51,15 @@ class VllmMoERunner(MoERunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._take_over_moe_quant_config_init()
+        if isinstance(self.router, RoutingSimulatorRouter):
+            # With VLLM_MOE_ROUTING_SIMULATION_STRATEGY set, the simulator
+            # replaces the logits before a monolithic kernel (or raises for
+            # strategies without monolithic support). The TPU MoE methods
+            # simulate routing themselves from the real logits (moe_routing).
+            self.router.prepare_monolithic_logits = lambda router_logits: router_logits
+        # Before the weights load, and whatever the quant method and kernel:
+        # a placed layer loads its experts in slot order.
+        expert_placement.apply(self)
 
     def _take_over_moe_quant_config_init(self) -> None:
         routed_experts = self.routed_experts

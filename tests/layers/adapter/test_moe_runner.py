@@ -18,6 +18,9 @@ from unittest.mock import patch
 import pytest
 import torch
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import (
+    RoutingSimulatorRouter,
+)
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as moe_runner_mod
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -150,3 +153,21 @@ def test_fused_output_is_reduced_under_torch_compile(fused_ep_kernel, armed, exp
         torch._dynamo.reset()
         compiled = torch.compile(reduce_unless_reduced, backend="eager", fullgraph=True)
         torch.testing.assert_close(compiled(x), x if expected else x * 2)
+
+
+def test_routing_simulation_keeps_real_logits_for_tpu_methods(monkeypatch):
+    """The TPU MoE methods simulate routing from the real router logits, so
+    vLLM's simulator must not replace (or reject) them first."""
+    router = RoutingSimulatorRouter.__new__(RoutingSimulatorRouter)
+
+    def base_init(self, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.router = router
+        self.routed_experts = SimpleNamespace(
+            _ensure_moe_quant_config_init=lambda: None
+        )
+
+    monkeypatch.setattr(MoERunner, "__init__", base_init)
+    runner = VllmMoERunner()
+    logits = torch.randn(3, 8)
+    assert runner.router.prepare_monolithic_logits(logits) is logits
