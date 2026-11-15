@@ -211,6 +211,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS: int = 0
+    VLLM_TPU_DETOK_PRIME_SUFFIX: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     TPU_GC_POLICY: str = "freeze"
@@ -1393,6 +1394,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS": env_nonnegative_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS", 0
     ),
+    # API server: prime each request's decode stream with the shortest prompt
+    # suffix of 4 to 23 tokens that decodes to whole characters, instead of
+    # the whole prompt (detok_prime_suffix.py). Same text out. A rollout
+    # switch: remove it and keep the patch on once serving runs confirm it.
+    "VLLM_TPU_DETOK_PRIME_SUFFIX": env_bool("VLLM_TPU_DETOK_PRIME_SUFFIX"),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:

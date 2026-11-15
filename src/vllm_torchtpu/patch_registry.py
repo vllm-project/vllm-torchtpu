@@ -131,6 +131,8 @@ PATCHES = (
     ),
     # API-server prompt tokenization (VLLM_TPU_SEGMENT_TOKENIZE).
     Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
+    # API-server first-token detokenization (VLLM_TPU_DETOK_PRIME_SUFFIX).
+    Patch("vllm_torchtpu.detok_prime_suffix:patch_detokenizer_prime_suffix", _ACTIVE),
     # Data-parallel engine choice (VLLM_TPU_DP_PROMPT_BACKLOG): the engine
     # core publishes pending prompt tokens, the API server's client routes.
     Patch("vllm_torchtpu.core.dp_prompt_backlog:install_if_enabled", _ENGINE),
