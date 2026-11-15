@@ -5340,6 +5340,65 @@ def _gather_attention_dp_rows(row, out, local, sends, recvs, shards):
         out[target_group * rows_per_pair : (target_group + 1) * rows_per_pair, :] = group_row
 
 
+# Hidden-row gathers that travel as FP8 (KernelConfig.fp8_wires).
+FP8_WIRES = frozenset(_config().fp8_wires)
+
+
+def _fp8_wire_size(rows, hidden):
+    """32-bit wire rows of ``rows`` FP8 hidden rows: the e4m3 bytes, four per
+    word, then one 8-row tile carrying the row scales."""
+    return rows * hidden // 512 + 8
+
+
+def _fp8_wire_slots(local, payload, minimum):
+    """(slot count, stride) of int32 FP8 wire slots tiling ``local`` exactly:
+    the most slots (a power of two, at least ``minimum``) whose 8-row aligned
+    stride still holds ``payload`` rows; None if ``minimum`` slots do not fit
+    (the gather then keeps its BF16 wires)."""
+    total = local.shape[0] * local.shape[1]
+
+    def fits(slots):
+        return total % slots == 0 and total // slots >= payload and (total // slots) % 8 == 0
+
+    if not fits(minimum):
+        return None
+    slots = minimum
+    while fits(2 * slots):
+        slots *= 2
+    return slots, total // slots
+
+
+def _fp8_wire_encode(value):
+    """[rows, hidden] -> int32 [_fp8_wire_size, 128]: each row scaled by its
+    absolute maximum / 448 and rounded to e4m3; row ``i``'s FP32 scale bits sit
+    in lane ``i`` of the tail tile."""
+    rows, hidden = value.shape
+    assert rows % 4 == 0 and rows <= 128 and hidden % 128 == 0
+    value = value.astype(jnp.float32)
+    maximum = jnp.max(jnp.abs(value), axis=1, keepdims=True)
+    scale = jnp.where(maximum > 0, maximum / 448.0, 1.0)
+    quantized = (value / scale).reshape(rows * hidden // 128, 128).astype(jnp.float8_e4m3fn)
+    words = tpu.bitcast(quantized, jnp.int32)
+    bits = jax.lax.bitcast_convert_type(scale, jnp.int32)
+    lanes = jax.lax.broadcasted_iota(jnp.int32, (rows, 128), 1)
+    sublanes = jax.lax.broadcasted_iota(jnp.int32, (rows, 128), 0)
+    tail = jnp.sum(jnp.where(lanes == sublanes, bits, 0), axis=0, keepdims=True)
+    return jnp.concatenate([words, jnp.broadcast_to(tail, (8, 128))], axis=0)
+
+
+def _fp8_wire_decode(words, rows, hidden):
+    """The BF16 rows of an ``_fp8_wire_encode`` wire (int32 value)."""
+    body = rows * hidden // 512
+    quantized = tpu.bitcast(words[:body], jnp.float8_e4m3fn)
+    value = quantized.astype(jnp.float32).reshape(rows, hidden)
+    lanes = jax.lax.broadcasted_iota(jnp.int32, (rows, 128), 1)
+    sublanes = jax.lax.broadcasted_iota(jnp.int32, (rows, 128), 0)
+    tail = jnp.broadcast_to(words[body : body + 1], (rows, 128))
+    bits = jnp.sum(jnp.where(lanes == sublanes, tail, 0), axis=1, keepdims=True)
+    scale = jax.lax.bitcast_convert_type(bits, jnp.float32)
+    return (value * scale).astype(jnp.bfloat16)
+
+
 def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
     """``_gather_attention_dp_rows`` and the local pair gather, overlapped.
 
@@ -5354,16 +5413,28 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
     group_size = 32 // shards
     group, pair = rank // group_size, (rank % 8) // 2
     rows, hidden = row.shape
-    payload = rows * hidden // 128
-    # A one-row wire (B8 DP2: 56 BF16 rows) starts its slot on a whole tile.
-    stride = -(-payload // 16) * 16
-    slot_count = 2 * local.shape[0] * local.shape[1] // stride
+    tiling = (_fp8_wire_slots(local, _fp8_wire_size(rows, hidden), 8 * shards)
+              if "t10" in FP8_WIRES and rows % 4 == 0 else None)
+    fp8 = tiling is not None
+    if fp8:
+        payload = _fp8_wire_size(rows, hidden)
+        slot_count, stride = tiling
+        wires = pool_alias.view(local, (slot_count, stride, 128), jnp.int32)
+    else:
+        payload = rows * hidden // 128
+        # A one-row wire (B8 DP2: 56 BF16 rows) starts its slot on a whole tile.
+        stride = -(-payload // 16) * 16
+        slot_count = 2 * local.shape[0] * local.shape[1] // stride
+        wires = pool_alias.view(local, (slot_count, stride, 128), jnp.bfloat16)
     base = slot_count // 2
     assert base >= 4 * shards
-    wires = pool_alias.view(local, (slot_count, stride, 128), jnp.bfloat16)
 
     def wire(o, k):
         return wires.at[base + 4 * o + k, pl.ds(0, payload)]
+
+    def received(slot):
+        value = wires[slot, pl.ds(0, payload)]
+        return _fp8_wire_decode(value, rows, hidden) if fp8 else value.reshape(rows, hidden)
 
     def send(source, o, k, semaphore):
         # Peer (o, k) sees this rank at the same relative position.
@@ -5375,7 +5446,7 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
         copy.start()
         return copy
 
-    wire(0, 0)[...] = row.reshape(payload, 128)
+    wire(0, 0)[...] = _fp8_wire_encode(row) if fp8 else row.reshape(payload, 128)
     if rows <= 2:
         # Short wires (DP2 B8/B16) go to every peer directly: one hop.
         direct = [send(wire(0, 0), o, k, 7 if o == 0 else 8)
@@ -5404,10 +5475,8 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
         for p in range(4):
             slot = base + 4 * (group ^ d) + (pair ^ p)
             first = (p * shards + d) * rows
-            out[first : first + rows, :] = wires[slot, pl.ds(0, payload)].reshape(rows, hidden)
-        owned_out[d * rows : (d + 1) * rows, :] = (
-            wires[base + 4 * (group ^ d), pl.ds(0, payload)].reshape(rows, hidden)
-        )
+            out[first : first + rows, :] = received(slot)
+        owned_out[d * rows : (d + 1) * rows, :] = received(base + 4 * (group ^ d))
 
 
 def _gather_latent_host(x,sends,recvs):
@@ -5570,13 +5639,20 @@ def _gather_sp8_local_rows(row, out, local, sends, recvs):
     rank = jax.lax.axis_index("tp")
     owner = rank % 8
     rows, hidden = row.shape
-    payload = rows * hidden // 128
-    assert rows == 8 and payload % 16 == 0
-    slots = 2 * local.shape[0] * local.shape[1] // payload
-    assert slots >= 32
-    wires = pool_alias.view(local, (slots, payload, 128), jnp.bfloat16)
+    tiling = _fp8_wire_slots(local, _fp8_wire_size(rows, hidden), 8) if "t0" in FP8_WIRES else None
+    fp8 = tiling is not None
+    if fp8:
+        payload = _fp8_wire_size(rows, hidden)
+        slots, stride = tiling
+        wires = pool_alias.view(local, (slots, stride, 128), jnp.int32).at[:, pl.ds(0, payload)]
+    else:
+        payload = rows * hidden // 128
+        slots = 2 * local.shape[0] * local.shape[1] // payload
+        wires = pool_alias.view(local, (slots, payload, 128), jnp.bfloat16)
+    assert rows == 8 and payload % (8 if fp8 else 16) == 0
+    assert slots >= (8 if fp8 else 32)
     source = wires.at[owner]
-    source[...] = row.reshape(payload, 128)
+    source[...] = _fp8_wire_encode(row) if fp8 else row.reshape(payload, 128)
     copies = []
     for offset in range(7, 0, -1):
         copy = tpu.make_async_remote_copy(
@@ -5587,10 +5663,12 @@ def _gather_sp8_local_rows(row, out, local, sends, recvs):
         copies.append(copy)
     for copy in copies:
         copy.wait()
+    def received(slot):
+        return _fp8_wire_decode(wires[slot], rows, hidden) if fp8 else wires[slot].reshape(rows, hidden)
+
     for pair in range(4):
         out[pair * 16:(pair + 1) * 16] = jnp.concatenate(
-            (wires[2 * pair].reshape(rows, hidden),
-             wires[2 * pair + 1].reshape(rows, hidden)), axis=0)
+            (received(2 * pair), received(2 * pair + 1)), axis=0)
 
 
 def _gather_sp8_dp_moe_rows(row, owned_out, out, local, sends, recvs):
@@ -5603,15 +5681,26 @@ def _gather_sp8_dp_moe_rows(row, owned_out, out, local, sends, recvs):
     rank = jax.lax.axis_index("tp")
     group, owner = rank // 16, rank % 8
     rows, hidden = row.shape
-    payload = rows * hidden // 128
-    assert rows == 8 and payload % 16 == 0
-    slots = 2 * local.shape[0] * local.shape[1] // payload
+    tiling = _fp8_wire_slots(local, _fp8_wire_size(rows, hidden), 32) if "t10" in FP8_WIRES else None
+    fp8 = tiling is not None
+    if fp8:
+        payload = _fp8_wire_size(rows, hidden)
+        slots, stride = tiling
+        wires = pool_alias.view(local, (slots, stride, 128), jnp.int32)
+    else:
+        payload = rows * hidden // 128
+        slots = 2 * local.shape[0] * local.shape[1] // payload
+        wires = pool_alias.view(local, (slots, payload, 128), jnp.bfloat16)
+    assert rows == 8 and payload % (8 if fp8 else 16) == 0
     base = slots // 2
     assert base >= 16
-    wires = pool_alias.view(local, (slots, payload, 128), jnp.bfloat16)
 
     def wire(o, k):
-        return wires.at[base + 8 * o + k]
+        return wires.at[base + 8 * o + k, pl.ds(0, payload)] if fp8 else wires.at[base + 8 * o + k]
+
+    def received(o, k):
+        value = wire(o, k)[...]
+        return _fp8_wire_decode(value, rows, hidden) if fp8 else value.reshape(rows, hidden)
 
     def send(source, o, k, semaphore, *, local_only=False):
         copy = tpu.make_async_remote_copy(
@@ -5621,7 +5710,7 @@ def _gather_sp8_dp_moe_rows(row, owned_out, out, local, sends, recvs):
         copy.start()
         return copy
 
-    wire(0, 0)[...] = row.reshape(payload, 128)
+    wire(0, 0)[...] = _fp8_wire_encode(row) if fp8 else row.reshape(payload, 128)
     local_copies = [send(wire(0, 0), 0, k, 7) for k in range(1, 8)]
     group_copy = send(wire(0, 0), 1, 0, 8)
     group_copy.wait_recv()
@@ -5631,19 +5720,19 @@ def _gather_sp8_dp_moe_rows(row, owned_out, out, local, sends, recvs):
         copy.wait()
     for d in range(2):
         for p in range(4):
-            even = wire(group ^ d, owner ^ (2 * p))[...].reshape(rows, hidden)
-            odd = wire(group ^ d, owner ^ (2 * p + 1))[...].reshape(rows, hidden)
+            even = received(group ^ d, owner ^ (2 * p))
+            odd = received(group ^ d, owner ^ (2 * p + 1))
             first = (2 * p + d) * 16
             out[first:first + 16] = jnp.concatenate((even, odd), axis=0)
-        own = wire(group ^ d, 0)[...].reshape(rows, hidden)
-        peer = wire(group ^ d, 1)[...].reshape(rows, hidden)
+        own = received(group ^ d, 0)
+        peer = received(group ^ d, 1)
         owned_out[d * 16:(d + 1) * 16] = jnp.where(
             owner % 2 == 0, jnp.concatenate((own, peer), axis=0),
             jnp.concatenate((peer, own), axis=0))
 
 
 def _gather_local_pair_rows(source, destination, sends, recvs, scratch=None, owners=4,
-                            *, packed=False):
+                            *, packed=False, fp8=False):
     """All-gather the token shards of the ``owners`` local row owners.
 
     Owner o (4: the local rank pairs; 8: the local ranks) holds rows
@@ -5656,6 +5745,39 @@ def _gather_local_pair_rows(source, destination, sends, recvs, scratch=None, own
     stride = 8 // owners
     owner = (rank % 8) // stride
     rows_per_owner = source.shape[0]
+    if (fp8 and rows_per_owner % 4 == 0 and scratch is not None
+            and _fp8_wire_size(rows_per_owner, source.shape[1]) <= scratch.shape[1]):
+        # FP8 wires (``_fp8_wire_encode``) through the transport scratch.
+        assert scratch is not None
+        hidden = source.shape[1]
+        payload_rows = _fp8_wire_size(rows_per_owner, hidden)
+        source_wire = scratch.at[owner].bitcast(jnp.int32).at[pl.ds(0, payload_rows), :]
+        source_wire[...] = _fp8_wire_encode(source[...])
+        copies = []
+        for offset in range(owners - 1, 0, -1):
+            copy = tpu.make_async_remote_copy(
+                source_wire,
+                source_wire,
+                sends.at[offset - 1],
+                recvs.at[offset - 1],
+                device_id=(rank ^ (stride * offset),),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            copy.start()
+            copies.append(copy)
+        for copy in copies:
+            copy.wait()
+        destination[...] = jnp.concatenate(
+            tuple(
+                _fp8_wire_decode(
+                    scratch.at[source_owner].bitcast(jnp.int32)[:payload_rows],
+                    rows_per_owner, hidden,
+                )
+                for source_owner in range(owners)
+            ),
+            axis=0,
+        )
+        return
     # One row, or a row count whose slice is not tile-aligned for a DMA
     # (3, 5, 6, 7 rows at B12..B28): send a flattened wire through the
     # transport scratch and assemble the destination from values.
@@ -7525,7 +7647,7 @@ def stack(
                             communication_workspace.send_semaphores,
                             communication_workspace.receive_semaphores,
                             communication_workspace.shared_local_reduction_vmem,
-                            packed=True)
+                            packed=True, fp8="t0" in FP8_WIRES)
             elif sequence_parallel_pre_attention and attention_dp > 1:
                 # The group's attention input: each local pair contributes its
                 # owned row 2p + d.
