@@ -25,6 +25,7 @@ from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.diffusion.models.ltx2 import (
     ltx2_components,
+    ltx2_conditioning,
     ltx2_denoise,
     ltx2_runtime,
     ltx2_transformer,
@@ -182,6 +183,65 @@ def test_ltx2_host_sigma_schedule_matches_upstream(official):
     for got, want in zip(host, reference, strict=True):
         assert got.device.type == "cpu"
         assert torch.equal(got, want)
+
+
+def test_ltx2_host_sigma_schedule_i2v_guidance_sigma():
+    from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+    mixin_cls = ltx2_conditioning.LTXI2VConditioningMixin
+    prepare = ltx2_denoise.prepare_scheduler_stage
+    run = ltx2_denoise.LTXDenoiseExecutor.run
+    sync = ltx2_runtime.LTXRuntime._synchronize_guidance_parallel_step_output
+    guidance_sigma = mixin_cls._video_guidance_model_sigma
+    upstream_guidance_sigma = getattr(guidance_sigma, "__wrapped__", guidance_sigma)
+
+    with (
+        patch.object(
+            ltx2_denoise,
+            "prepare_scheduler_stage",
+            getattr(prepare, "__wrapped__", prepare),
+        ),
+        patch.object(
+            ltx2_denoise.LTXDenoiseExecutor,
+            "run",
+            staticmethod(getattr(run, "__wrapped__", run)),
+        ),
+        patch.object(
+            ltx2_runtime.LTXRuntime,
+            "_synchronize_guidance_parallel_step_output",
+            getattr(sync, "__wrapped__", sync),
+        ),
+        patch.object(mixin_cls, "_video_guidance_model_sigma", upstream_guidance_sigma),
+    ):
+        patches._patch_ltx2_host_sigma_schedule()
+        patched = mixin_cls._video_guidance_model_sigma
+
+        pipeline = object.__new__(LTX2Pipeline)
+        sigma = torch.tensor(0.5, dtype=torch.float32, device="cpu")
+        mask = torch.empty((2, 8), dtype=torch.float32, device="meta")
+        out = mixin_cls._video_guidance_model_sigma(
+            pipeline, sigma, SimpleNamespace(conditioning_mask=mask)
+        )
+        assert out.device.type == "meta"
+        assert out.shape == (2, 8, 1)
+        assert sigma.device.type == "cpu"
+
+        cpu_mask = torch.tensor([[1.0, 0.0, 0.25, 0.0], [1.0, 1.0, 0.0, 0.5]])
+        cpu_ctx = SimpleNamespace(conditioning_mask=cpu_mask)
+        torch.testing.assert_close(
+            mixin_cls._video_guidance_model_sigma(pipeline, sigma, cpu_ctx),
+            upstream_guidance_sigma(pipeline, sigma, cpu_ctx),
+            rtol=0,
+            atol=0,
+        )
+
+        uncond = mixin_cls._video_guidance_model_sigma(
+            pipeline, sigma, SimpleNamespace(conditioning_mask=None)
+        )
+        assert uncond is sigma
+
+        patches._patch_ltx2_host_sigma_schedule()
+        assert mixin_cls._video_guidance_model_sigma is patched
 
 
 def test_vllm_platform_accepts_omni_knobs():

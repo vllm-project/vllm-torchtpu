@@ -23,6 +23,7 @@ patch_registry.py.
 """
 
 from functools import cache as run_once
+from functools import wraps
 from typing import Any
 
 import torch
@@ -665,25 +666,30 @@ def _patch_ltx2_host_sigma_schedule() -> None:
     # queue the next one. The loop also hands device views of the timesteps
     # to the transformer, and torch_tpu bakes each view's offset into the
     # graphs that read it. Building the schedule on the host makes those
-    # scalars free; each timestep reaches the device as its own buffer.
+    # scalars free; each timestep reaches the device as its own buffer, and
+    # conditioned I2V's 3-D guidance sigma is moved onto the conditioning
+    # mask's device.
     #
     # Under CFG parallelism LTXRuntime also synchronizes the device after
     # every step, against CUDA stream races between the guidance all-gather
     # and the next step. TPU collectives run in program order, so only the
     # .contiguous() half of that step is kept.
     # -------------------------------------------------------------------------
-    import functools
-
-    from vllm_omni.diffusion.models.ltx2 import ltx2_denoise, ltx2_runtime
+    from vllm_omni.diffusion.models.ltx2 import (
+        ltx2_conditioning,
+        ltx2_denoise,
+        ltx2_runtime,
+    )
 
     host = torch.device("cpu")
+    conditioning_cls = ltx2_conditioning.LTXI2VConditioningMixin
     executor_cls = ltx2_denoise.LTXDenoiseExecutor
     runtime_cls = ltx2_runtime.LTXRuntime
 
     orig_prepare = ltx2_denoise.prepare_scheduler_stage
     if not getattr(orig_prepare, _LTX2_HOST_SIGMA_PATCHED, False):
 
-        @functools.wraps(orig_prepare)
+        @wraps(orig_prepare)
         def _host_prepare_scheduler_stage(
             pipeline: Any, request_inputs: Any, **kwargs: Any
         ) -> Any:
@@ -696,7 +702,7 @@ def _patch_ltx2_host_sigma_schedule() -> None:
     orig_run = executor_cls.run
     if not getattr(orig_run, _LTX2_HOST_SIGMA_PATCHED, False):
 
-        @functools.wraps(orig_run)
+        @wraps(orig_run)
         def _device_timesteps_run(
             pipeline: Any, state: Any, timesteps: Any, step: Any
         ) -> Any:
@@ -709,6 +715,28 @@ def _patch_ltx2_host_sigma_schedule() -> None:
         setattr(_device_timesteps_run, _LTX2_HOST_SIGMA_PATCHED, True)
         executor_cls.run = staticmethod(_device_timesteps_run)
 
+    # Conditioned I2V reshapes sigma to 3-D before multiplying by
+    # conditioning_mask, which unlike a 0-D host scalar requires matching
+    # devices.
+    orig_guidance_sigma = conditioning_cls._video_guidance_model_sigma
+    if not getattr(orig_guidance_sigma, _LTX2_HOST_SIGMA_PATCHED, False):
+
+        @wraps(orig_guidance_sigma)
+        def _device_guidance_model_sigma(
+            self: Any, sigma: Any, denoise_ctx: Any
+        ) -> Any:
+            mask = denoise_ctx.conditioning_mask
+            if (
+                mask is not None
+                and isinstance(sigma, torch.Tensor)
+                and sigma.device != mask.device
+            ):
+                sigma = sigma.to(mask.device)
+            return orig_guidance_sigma(self, sigma, denoise_ctx)
+
+        setattr(_device_guidance_model_sigma, _LTX2_HOST_SIGMA_PATCHED, True)
+        conditioning_cls._video_guidance_model_sigma = _device_guidance_model_sigma
+
     # The replacement below copies the guidance_parallel_ready /
     # get_guidance_parallel_world_size() > 1 gate and the .contiguous() step
     # of vllm_omni.diffusion.models.ltx2.ltx2_runtime.LTXRuntime.
@@ -719,7 +747,7 @@ def _patch_ltx2_host_sigma_schedule() -> None:
     orig_sync = runtime_cls._synchronize_guidance_parallel_step_output
     if not getattr(orig_sync, _LTX2_HOST_SIGMA_PATCHED, False):
 
-        @functools.wraps(orig_sync)
+        @wraps(orig_sync)
         def _contiguous_guidance_step_output(
             self: Any,
             latents: tuple[torch.Tensor, ...],
@@ -736,4 +764,7 @@ def _patch_ltx2_host_sigma_schedule() -> None:
         runtime_cls._synchronize_guidance_parallel_step_output = (
             _contiguous_guidance_step_output
         )
-    logger.info("Applied TPU patch: host-resident LTX-2 sigma schedule.")
+    logger.info(
+        "Applied TPU patch: host-resident LTX-2 sigma schedule and skipped "
+        "per-step guidance-parallel synchronize."
+    )
