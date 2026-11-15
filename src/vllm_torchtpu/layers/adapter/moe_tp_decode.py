@@ -172,8 +172,8 @@ class _OpStatics:
     # TPU_MOE_TP_DECODE_PAD_ROWS: a token count between two kernel row counts
     # runs the kernel on the next one (see _kernel_rows). Same bits per row.
     pad_rows: bool = False
-    # Packed FP4 routed weights (MOE_REQUANTIZE_WEIGHT_DTYPE=fp4, gmm_v2 path)
-    # under TPU_PREFILL_SEQ_PARALLEL_EP: jnp.float4_e2m1fn, else None (FP8).
+    # Packed FP4 routed weights (MOE_REQUANTIZE_WEIGHT_DTYPE=fp4, gmm_v2 path):
+    # jnp.float4_e2m1fn, else None (FP8).
     rhs_quant_dtype: Any = None
 
 
@@ -353,14 +353,8 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
     topk = int(cfg.experts_per_token)
     rhs_quant_dtype = getattr(qm, "_rhs_quant_dtype", None)
     if rhs_quant_dtype is not None:
-        if not (
-            par.use_ep
-            and envs.TPU_PREFILL_SEQ_PARALLEL_EP
-            and layer.w13_weight.dtype == torch.uint8
-        ):
-            return (
-                "packed FP4 routed weights need EP and TPU_PREFILL_SEQ_PARALLEL_EP=1"
-            )
+        if not (par.use_ep and layer.w13_weight.dtype == torch.uint8):
+            return "packed FP4 routed weights need EP uint8 weights"
         rows = ()
     else:
         weights = (
@@ -577,7 +571,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
         n_valid = n - jnp.sum(is_pad.astype(jnp.int32))
         weights = (w13, w2, s13, s2, sw13, ss13, sw2, ss2)
         m = _kernel_rows(n, statics.pad_rows)
-        if m != n:
+        if statics.rhs_quant_dtype is None and m != n:
             # A decode bucket the kernel has no size for (4 and 8 from
             # TPU_TOKEN_BUCKET_EXTRA, below its smallest size; 48, between
             # sizes, with TPU_MOE_TP_DECODE_PAD_ROWS): run the kernel on `m`
@@ -606,7 +600,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                     ag_pairs=statics.ag_pairs,
                     exchange_pieces=statics.exchange_pieces,
                 )[:n]
-        if kernel.can_use_moe_tp_decode(
+        if statics.rhs_quant_dtype is None and kernel.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
         ):
             return kernel.moe_tp_decode(

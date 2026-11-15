@@ -1266,11 +1266,23 @@ def test_a_wrong_peer_table_moves_the_wrong_rows(mesh16, monkeypatch):
     assert np.abs(got - want).max() > 0.1 * np.abs(want).max()
 
 
-def test_packed_fp4_ep_admitted_only_under_seq_parallel_ep(harness, monkeypatch):
+def test_packed_fp4_ep_admitted_under_ep_only(harness, monkeypatch):
     import jax.numpy as jnp
+
+    tp_model = harness.model(dict(use_ep=False))
+    tp_layer = tp_model.layers[0].routed_experts
+    tp_layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((1, H // 2, 2 * INTER), dtype=torch.uint8), requires_grad=False
+    )
+    tp_layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, INTER // 2, H), dtype=torch.uint8), requires_grad=False
+    )
+    tp_layer.quant_method._rhs_quant_dtype = jnp.float4_e2m1fn
+    assert moe_tp_decode.arm(tp_model) == 0
 
     model = harness.model(dict(use_ep=True))
     runner = model.layers[0]
+    shared = runner.shared_experts._layer
     layer = runner.routed_experts
     layer.w13_weight = torch.nn.Parameter(
         torch.zeros((E, H // 2, 2 * INTER), dtype=torch.uint8), requires_grad=False
@@ -1281,9 +1293,78 @@ def test_packed_fp4_ep_admitted_only_under_seq_parallel_ep(harness, monkeypatch)
     layer.quant_method._rhs_quant_dtype = jnp.float4_e2m1fn
 
     monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP", False)
-    assert moe_tp_decode.arm(model) == 0
-
-    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP", True)
     assert moe_tp_decode.arm(model) == 1
     assert harness.statics[-1].rhs_quant_dtype == jnp.float4_e2m1fn
     assert harness.statics[-1].use_ep is True
+
+    x = torch.randn(8, H, dtype=torch.bfloat16)
+    out = runner(hidden_states=x, router_logits=x)
+    assert out.shape == (8, H)
+    assert len(harness.op_calls) == 1
+    assert harness.all_reduces == 0
+    assert shared.calls == 0
+
+
+def test_packed_fp4_ep_op_body_skips_fp8_kernel_at_small_and_bucket_rows(monkeypatch):
+    import functools
+
+    import jax.numpy as jnp
+
+    def fail_kernel(*args, **kwargs):
+        raise AssertionError("FP8 kernel must not be queried or called for packed FP4")
+
+    seen_dtypes = []
+
+    def fake_fused_moe(x, *args, rhs_quant_dtype=None, **kwargs):
+        seen_dtypes.append((x.shape[0], rhs_quant_dtype))
+        return jnp.ones_like(x)
+
+    monkeypatch.setattr(moe_tp_decode.kernel, "can_use_moe_tp_decode", fail_kernel)
+    monkeypatch.setattr(moe_tp_decode.kernel, "moe_tp_decode", fail_kernel)
+    monkeypatch.setattr(moe_tp_decode, "fused_moe_func", fake_fused_moe)
+    monkeypatch.setattr(
+        moe_tp_decode,
+        "xla_quantized_matmul",
+        lambda a, b, s: jnp.zeros((a.shape[0], b.shape[1]), dtype=a.dtype),
+    )
+    monkeypatch.setattr(moe_tp_decode.lax, "psum", lambda v, _axis: v)
+    # The router's top-k is a Pallas kernel: interpret mode on a CPU host.
+    monkeypatch.setattr(
+        moe_tp_decode,
+        "router_select",
+        functools.partial(moe_tp_decode.router_select, interpret=True),
+    )
+
+    st = moe_tp_decode._OpStatics(
+        topk=TOPK,
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_threshold=2048,
+        use_ep=True,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+    body = moe_tp_decode._op_body(st, 16, "tp")
+    for n in (4, 8, 64):
+        out = body(
+            jnp.ones((n, H), jnp.bfloat16),
+            jnp.ones((n, 16 * E), jnp.float32) * 0.5,
+            jnp.zeros((16 * E,), jnp.float32),
+            jnp.zeros((256,), jnp.bool_),
+            jnp.zeros((E, H // 2, 2 * INTER), jnp.uint8),
+            jnp.zeros((E, INTER // 2, H), jnp.uint8),
+            jnp.ones((E, 4, 1, 2 * INTER), jnp.float32),
+            jnp.ones((E, 1, 1, H), jnp.float32),
+            jnp.zeros((H, 2 * FS), jnp.float8_e4m3fn),
+            jnp.ones((2 * FS,), jnp.float32),
+            jnp.zeros((FS, H), jnp.float8_e4m3fn),
+            jnp.ones((H,), jnp.float32),
+            jnp.zeros((1, 1), jnp.int32),
+            jnp.zeros((1, 1), jnp.int32),
+        )
+        assert out.shape == (n, H)
+    assert seen_dtypes == [
+        (4, jnp.float4_e2m1fn),
+        (8, jnp.float4_e2m1fn),
+        (64, jnp.float4_e2m1fn),
+    ]
