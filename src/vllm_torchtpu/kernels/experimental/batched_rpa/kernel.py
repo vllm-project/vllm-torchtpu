@@ -33,6 +33,11 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 )
 
 
+# Tests set this to compile the main kernel with bounds checks, so a DMA past a
+# buffer halts the core instead of corrupting a neighbour.
+BOUNDS_CHECKS = False
+
+
 def strided_load_bkv(
     kv_in_vref: jax.Ref,
     b_idx: int,
@@ -235,6 +240,8 @@ class ComputeMetadata:
     causal_offset: list[jax.Array]
     local_k_start: list[jax.Array] | None = None
     local_k_end: list[jax.Array] | None = None
+    # Selection mask: index in its sequence of the lane's first query.
+    query_base: list[jax.Array] | None = None
 
 
 # The `pl.when` region in `rpa_body` is a basic block boundary, so splitting
@@ -316,6 +323,13 @@ def fetch_compute_metadata(
     Returns:
         The mask intervals for every batch element in this step.
     """
+    if cfgs.serve.selection_mask:
+        query_base = [
+            schedule_ref.q_idx[step, b_idx] * cfgs.bq_sz
+            for b_idx in range(cfgs.batch_size)
+        ]
+        return ComputeMetadata(causal_offset=[], query_base=query_base)
+
     causal_offset_list = []
     local_k_start_list = (
         []
@@ -350,6 +364,34 @@ def fetch_compute_metadata(
         local_k_start=local_k_start_list,
         local_k_end=local_k_end_list,
     )
+
+
+def generate_selection_mask(
+    shape: tuple[int, int, int, int],
+    *,
+    bq_start: int,
+    step_meta: ComputeMetadata,
+    sel_vref: jax.Ref,
+    cfgs: configs.RpaConfigs,
+) -> list[jax.Array]:
+    """Masks QK by the lane-tile's selection words: query j, key t when bit j
+    of word t is set."""
+    b, k_heads, tq, s = shape
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    assert step_meta.query_base is not None and s % num_lanes == 0
+    # The bit depends on the QK row only: build it as a column and let the
+    # AND broadcast it, so a lane costs one AND and one compare per vreg.
+    query = lax.broadcasted_iota(jnp.int32, (tq, 1), 0)
+    query //= cfgs.aligned_num_q_heads_per_kv_head
+    masks = []
+    for b_idx in range(b):
+        bit = jnp.left_shift(1, query + (step_meta.query_base[b_idx] + bq_start))
+        words = jnp.concatenate(
+            [sel_vref[b_idx, r : r + 1, :] for r in range(s // num_lanes)], axis=1
+        )
+        mask_b = (words & bit) != 0
+        masks.append(jnp.broadcast_to(mask_b[None], (k_heads, tq, s)))
+    return masks
 
 
 def generate_mask(
@@ -420,11 +462,17 @@ def rpa_body(
     # `pipeline.py`
     start_next_fetch: Callable[[], None],
     start_kv_writeback: Callable[[], None],
+    # This slot's selection words, with cfgs.serve.selection_mask.
+    sel_vref: jax.Ref | None = None,
 ):
     del slot
 
     # pyrefly: ignore[bad-assignment]
     kv_in_vref = pltpu.annotate(kv_in_vref, no_hazard_no_deps=True)
+    if sel_vref is not None:
+        # As for the KV window: the next tiles' word DMAs into other slots must
+        # not order this slot's mask loads behind them.
+        sel_vref = pltpu.annotate(sel_vref, no_hazard_no_deps=True)
 
     # Step 1: Fetch the metadata the stitch needs. Everything the mask needs is
     # deferred until after the fence below, so it does not gate the writeback.
@@ -586,17 +634,28 @@ def rpa_body(
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
 
-        custom_mask = generate_mask(
-            shape=(
-                cfgs.batch_size,
-                cfgs.model.num_kv_heads,
-                q_end - q_start,
-                cfgs.bkv_sz,
-            ),
-            bq_start=bq_start,
-            step_meta=step_meta,
-            cfgs=cfgs,
+        mask_shape = (
+            cfgs.batch_size,
+            cfgs.model.num_kv_heads,
+            q_end - q_start,
+            cfgs.bkv_sz,
         )
+        if cfgs.serve.selection_mask:
+            assert sel_vref is not None
+            custom_mask = generate_selection_mask(
+                mask_shape,
+                bq_start=bq_start,
+                step_meta=step_meta,
+                sel_vref=sel_vref,
+                cfgs=cfgs,
+            )
+        else:
+            custom_mask = generate_mask(
+                mask_shape,
+                bq_start=bq_start,
+                step_meta=step_meta,
+                cfgs=cfgs,
+            )
 
         p, alpha_list, m_next, l_next, m_carry, l_carry = (
             flash_attention.flash_attention_qk_softmax(
@@ -757,6 +816,10 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
     name += f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}"
     if cfgs.model.sliding_window:
         name += f"-sw{cfgs.model.sliding_window}"
+    if serve.selection_mask:
+        name += "-sel"
+    if serve.read_only_cache:
+        name += "-ro"
     return name
 
 
@@ -764,6 +827,11 @@ def get_kernel_metadata(
     cfgs: configs.RpaConfigs,
 ) -> dict[str, str | int | float]:
     cfgs_dict = dataclasses.asdict(cfgs)
+    # Kernels without these fields set keep the metadata, and so the compiled
+    # program and its cache key, they had before the fields.
+    for field in ("selection_mask", "read_only_cache"):
+        if not getattr(cfgs.serve, field):
+            del cfgs_dict["serve"][field]
     ret = {}
     for path, val in jax.tree_util.tree_leaves_with_path(cfgs_dict):
         key = jax.tree_util.keystr(path, simple=True, separator=".")
@@ -784,6 +852,7 @@ def rpa_kernel(
     new_kv_hbm: jax.Array,
     kv_cache_hbm: jax.Array,
     lse_hbm: jax.Array | None,
+    selection_hbm: jax.Array | None = None,
     *,
     cfgs: configs.RpaConfigs,
     computer_cls: type[schedule.BaseMetadataComputer] = schedule.BaseMetadataComputer,
@@ -811,6 +880,9 @@ def rpa_kernel(
             kv_packing, head_dim]. Stores existing kv cache data where k & vs are
             concatenated along num kv heads dim.
         lse_hbm: pre-allocated buffer for LSE output. None when return_lse=False.
+        selection_hbm: [max_num_seqs * tiles_per_seq, bkv_sz // 128, 128] int32
+            selection words, row ``s * tiles_per_seq + k`` for KV tile ``k`` of
+            sequence ``s``. Required exactly when ``cfgs.serve.selection_mask``.
         cfgs: Configuration of the kernel.
 
     Returns:
@@ -820,6 +892,16 @@ def rpa_kernel(
         lse_out: [max_num_tokens, num_q_heads] LSE values, or None.
     """
     return_lse = cfgs.serve.return_lse
+    selection = cfgs.serve.selection_mask
+    assert (selection_hbm is not None) == selection
+    tiles_per_seq = 0
+    if selection:
+        assert selection_hbm is not None
+        tiles_per_seq = selection_hbm.shape[0] // cfgs.serve.num_seqs
+        assert selection_hbm.shape == (
+            cfgs.serve.num_seqs * tiles_per_seq,
+            *cfgs.selection_vmem_shape[1:],
+        ), selection_hbm.shape
 
     def ragged_paged_attention_pipeline(
         # Scalar prefetch.
@@ -834,9 +916,10 @@ def rpa_kernel(
         new_kv_hbm_ref: jax.Ref,
         kv_cache_hbm_ref: jax.Ref,
         lse_hbm_ref: jax.Ref | None,
+        sel_hbm_ref: jax.Ref | None,
         # Outputs.
         o_hbm_ref: jax.Ref,
-        o_kv_cache_hbm_ref: jax.Ref,
+        o_kv_cache_hbm_ref: jax.Ref | None,
         o_lse_hbm_ref: jax.Ref | None = None,
     ):
         del o_kv_cache_hbm_ref
@@ -868,8 +951,17 @@ def rpa_kernel(
                     dtype=cfgs.serve.dtype_out,
                 ),  # acc
             ),
+            sel_scratch=(
+                pltpu.VMEM(
+                    (configs.NUM_INPUT_SLOTS, *cfgs.selection_vmem_shape),
+                    dtype=jnp.int32,
+                ),
+                pltpu.SemaphoreType.DMA((configs.NUM_INPUT_SLOTS,)),
+            )
+            if selection
+            else None,
         )
-        def _run(final_allocs, schedule_ref, dma_sem, scratches):
+        def _run(final_allocs, schedule_ref, dma_sem, scratches, sel_scratch):
             # Initialize Q to zeros to prevent NaN pollution.
             #
             # When a query block is partially filled, tail slots in uninitialized VMEM
@@ -952,6 +1044,16 @@ def rpa_kernel(
                     if return_lse
                     else None
                 )
+                sel_fetch = None
+                if selection:
+                    sel_fetch = bref_override.SelectionFetch(
+                        selection_hbm=sel_hbm_ref,
+                        schedule_ref=schedule_ref,
+                        window=sel_scratch[0],
+                        sems=sel_scratch[1],
+                        tiles_per_seq=tiles_per_seq,
+                        cfgs=cfgs,
+                    )
 
                 def compute_fn(
                     step,
@@ -980,6 +1082,7 @@ def rpa_kernel(
                         cfgs=cfgs,
                         start_next_fetch=start_next_fetch,
                         start_kv_writeback=start_kv_writeback,
+                        sel_vref=sel_scratch[0].at[slot] if selection else None,
                     )
 
                 pipeline.run_manual_triple_buffer(
@@ -989,6 +1092,7 @@ def rpa_kernel(
                     o_bound,
                     kv_bound,
                     lse_bref=lse_bound,
+                    sel_fetch=sel_fetch,
                 )
 
             @pl.loop(0, num_safe_step_iterations)
@@ -1013,16 +1117,21 @@ def rpa_kernel(
     num_scalar_prefetch = len(scalar_prefetches)
     num_active_scalers = len(scalar_prefetches)
 
-    out_shape = [q_hbm, kv_cache_hbm, lse_hbm if return_lse else None]
+    read_only = cfgs.serve.read_only_cache
+    out_shape = [
+        q_hbm,
+        None if read_only else kv_cache_hbm,
+        lse_hbm if return_lse else None,
+    ]
 
     schedule_leaves = len(jax.tree_util.tree_leaves(schedule_hbm))
-    input_output_aliases = {
-        num_active_scalers + schedule_leaves: 0,
-        num_active_scalers + schedule_leaves + 2: 1,
-    }
+    # Output indices count the non-None outputs: a read-only cache is no output.
+    input_output_aliases = {num_active_scalers + schedule_leaves: 0}
+    if not read_only:
+        input_output_aliases[num_active_scalers + schedule_leaves + 2] = 1
     if return_lse:
         input_output_aliases[num_active_scalers + schedule_leaves + 3] = (
-            2  # lse_hbm -> out[2]
+            1 if read_only else 2  # lse_hbm -> its output
         )
 
     return pl.pallas_call(
@@ -1036,16 +1145,18 @@ def rpa_kernel(
                 pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # kv_cache_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,
+                pl.BlockSpec(memory_space=pltpu.HBM) if selection else None,
             ],
             out_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
-                pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_kv_cache_hbm_ref
+                # aliased_kv_cache_hbm_ref
+                None if read_only else pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,
             ],
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=cfgs.vmem_limit_bytes,
-            disable_bounds_checks=True,
+            disable_bounds_checks=not BOUNDS_CHECKS,
             flags={
                 "XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True,
             },
@@ -1064,4 +1175,5 @@ def rpa_kernel(
         new_kv_hbm,
         kv_cache_hbm,
         lse_hbm if return_lse else None,
+        selection_hbm,
     )

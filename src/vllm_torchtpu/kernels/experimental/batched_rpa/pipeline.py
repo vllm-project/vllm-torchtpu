@@ -38,6 +38,7 @@ def run_manual_triple_buffer(
     o_bref: Any,
     kv_bref: Any,
     lse_bref: Any | None = None,
+    sel_fetch: Any | None = None,
 ) -> None:
     """Executes an explicit triple-buffered pipeline over `total_steps`.
 
@@ -57,11 +58,17 @@ def run_manual_triple_buffer(
       o_bref: Writeback-only ref for the attention output.
       kv_bref: Input/output ref for the KV cache.
       lse_bref: Optional writeback-only ref for the log-sum-exp values.
+      sel_fetch: Optional fetch of the selection words, issued and waited with
+        the KV of the same step.
     """
     with jax.named_scope("ep_initialize"):
         q_bref.copy_in(0, 0, total_steps)
+        if sel_fetch is not None:
+            sel_fetch.copy_in(0, 0, total_steps)
         kv_bref.copy_in(0, 0, total_steps)
         q_bref.copy_in(1, 1, total_steps)
+        if sel_fetch is not None:
+            sel_fetch.copy_in(1, 1, total_steps)
         kv_bref.copy_in(1, 1, total_steps)
 
     @pl.loop(0, total_steps)
@@ -76,6 +83,8 @@ def run_manual_triple_buffer(
         with jax.named_scope("wait_in_q_kv"):
             q_bref.wait_in(step, comp_slot, total_steps)
             kv_bref.wait_in(step, comp_slot, total_steps)
+            if sel_fetch is not None:
+                sel_fetch.wait_in(step, comp_slot, total_steps)
 
         with jax.named_scope("wait_out_o"):
             o_bref.wait_out(step - 2, wait_out_slot, total_steps)
@@ -86,6 +95,8 @@ def run_manual_triple_buffer(
 
             def start_next_fetch():
                 q_bref.copy_in(step + 2, comm_slot, total_steps)
+                if sel_fetch is not None:
+                    sel_fetch.copy_in(step + 2, comm_slot, total_steps)
                 kv_bref.copy_in(step + 2, comm_slot, total_steps)
 
             def start_kv_writeback():

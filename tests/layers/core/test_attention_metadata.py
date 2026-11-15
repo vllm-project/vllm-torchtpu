@@ -568,6 +568,83 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, ctx(num_reqs=1), 4)  # new window
         assert source.call_count == calls + 2
 
+    def _staging_ctx(self, runner, num_reqs=2):
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=num_reqs,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((4,), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        runner._attn_metadata_builder_ctx = ctx
+        return ctx
+
+    def _staging_runner(self):
+        runner = self._make_runner_mock(num_groups=2)
+        runner._block_table_stage_cpu = None
+        builders = [
+            self._make_builder(runner, kv_cache_group_id=gid) for gid in range(2)
+        ]
+        self._make_attn_groups(runner, builders)
+        return runner
+
+    @patch.dict(os.environ, {"VLLM_TPU_UNFENCED_UPLOAD_PRIVATE": "1"})
+    def test_unfenced_walk_leaves_the_shared_scratch_alone(self):
+        """A walk packing while the input staging fence is pending uses a
+        private host tensor: the shared scratch keeps the bytes the step's
+        own upload may still be reading, and the tables are the same."""
+        runner = self._staging_runner()
+        fenced = self._staging_ctx(runner)
+        stage_block_table_uploads(runner, fenced, 4)
+        scratch = runner._block_table_stage_cpu
+        before = scratch.clone()
+        expected = {g: t.clone() for g, t in fenced.staged_block_tables.items()}
+
+        runner._input_staging_fence = object()  # recorded, not yet waited
+        unfenced = self._staging_ctx(runner)
+        stage_block_table_uploads(runner, unfenced, 4)
+        assert runner._block_table_stage_cpu is scratch
+        assert torch.equal(scratch, before)
+        for gid, table in expected.items():
+            assert torch.equal(unfenced.staged_block_tables[gid], table)
+
+    def test_unfenced_walk_rewrites_the_shared_scratch_without_the_flag(self):
+        runner = self._staging_runner()
+        stage_block_table_uploads(runner, self._staging_ctx(runner), 4)
+        scratch = runner._block_table_stage_cpu
+        scratch.fill_(-7)
+
+        runner._input_staging_fence = object()
+        stage_block_table_uploads(runner, self._staging_ctx(runner), 4)
+        assert not torch.equal(scratch, torch.full_like(scratch, -7))
+
+    @patch.dict(os.environ, {"VLLM_TPU_BLOCK_TABLE_STAGE_CHECK": "1"})
+    def test_stage_check_counts_bad_readbacks_and_unfenced_packs(self):
+        runner = self._staging_runner()
+        stage_block_table_uploads(runner, self._staging_ctx(runner), 4)
+        stats = runner._block_table_stage_check_stats
+        assert stats == {
+            "checks": 0,
+            "bad_uploads": 0,
+            "bad_entries": 0,
+            "unfenced_packs": 0,
+        }
+
+        stage_block_table_uploads(runner, self._staging_ctx(runner), 4)
+        assert stats["checks"] == 1 and stats["bad_uploads"] == 0
+
+        # A device copy that differs from its host copy in two entries.
+        host, _ = runner._block_table_stage_check_last
+        torn = host.clone()
+        torn[:2] += 1
+        runner._block_table_stage_check_last = (host, torn)
+        runner._input_staging_fence = object()
+        stage_block_table_uploads(runner, self._staging_ctx(runner), 4)
+        assert stats["checks"] == 2
+        assert stats["bad_uploads"] == 1 and stats["bad_entries"] == 2
+        assert stats["unfenced_packs"] == 1
+
     @patch.dict(os.environ, {"VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "1"})
     def test_reused_upload_reuses_tables_and_rederives_mamba_indices(self):
         """A reused upload keeps the previous walk's table outputs but must

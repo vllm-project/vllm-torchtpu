@@ -10,8 +10,13 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import pool_adapters, typed_ldst
 from vllm_torchtpu.kernels.qwen4_exp.cache_regions import region_rows
+from vllm_torchtpu.kernels.qwen4_exp.history_rows import (
+    gather_history_rows,
+    history_row_kernel_enabled,
+)
 from vllm_torchtpu.kernels.qwen4_exp.ple import short_conv
 
 
@@ -27,8 +32,64 @@ def read_region(pool, ids, *, elements, dtype, tok0=0):
     return values.reshape(len(ids), rows * pool.shape[-1])[:, :elements]
 
 
-def write_region(pool, values, ids, *, tok0=0):
-    """Write unique positive manager IDs; idle/null IDs leave all bytes intact."""
+def _last_selected_row(selected):
+    """For each row, the last row at or before it where ``selected`` holds (0 if none).
+
+    As a block index this repeats the previous grid step's index on every
+    unselected row, and the Pallas pipeline neither fetches nor writes back a
+    block whose index is unchanged from the step before.
+    """
+    rows = jnp.arange(selected.shape[0], dtype=jnp.int32)
+    return jax.lax.cummax(jnp.where(selected, rows, 0))
+
+
+def read_selected_region(pool, ids, selected, *, elements, dtype):
+    """`read_region` that moves bytes only for the rows where ``selected`` holds.
+
+    Unselected rows of the result are not written: they hold whatever the
+    output buffer held, and callers must mask them. The selected rows are
+    byte-identical to `read_region`'s.
+    """
+    ntok, rows = region_rows(pool, elements, dtype)
+    count = ids.shape[0]
+    assert ntok <= pool.shape[1], "state region exceeds its manager page"
+    payload = tuple(pool.shape[2:-1])
+    lanes = pool.shape[-1]
+    owner = _last_selected_row(selected)
+    blocks = jnp.maximum(ids, 0)[owner]
+    pad = (0,) * (len(payload) + 1)
+
+    def kernel(blocks_ref, owner_ref, source, out):
+        @pl.when(owner_ref[pl.program_id(0)] == pl.program_id(0))
+        def load():
+            out[...] = typed_ldst.load_typed(source.at[0], view_dtype=dtype)[None]
+
+    values = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(count,),
+            in_specs=[
+                pl.BlockSpec(
+                    (1, ntok) + payload + (lanes,),
+                    lambda i, blocks, owner: (blocks[i], 0) + pad,
+                )
+            ],
+            out_specs=pl.BlockSpec(
+                (1, rows, lanes), lambda i, blocks, owner: (owner[i], 0, 0)
+            ),
+        ),
+        out_shape=jax.ShapeDtypeStruct((count, rows, lanes), dtype),
+    )(blocks, owner, pool)
+    return values.reshape(count, rows * lanes)[:, :elements]
+
+
+def write_region(pool, values, ids, *, tok0=0, skip_idle_source=False):
+    """Write unique positive manager IDs; idle/null IDs leave all bytes intact.
+
+    With ``skip_idle_source`` the value rows of idle IDs are not fetched
+    either: their source block index repeats the last written row's.
+    """
     count, elements = values.shape
     ntok, rows = region_rows(pool, elements, values.dtype)
     assert tok0 + ntok <= pool.shape[1], "state region exceeds its manager page"
@@ -38,7 +99,9 @@ def write_region(pool, values, ids, *, tok0=0):
     )
     payload = tuple(pool.shape[2:])
 
-    def kernel(indices, source, old, target):
+    def kernel(indices, *refs):
+        source, old, target = refs[-3:]
+
         @pl.when(indices[pl.program_id(0)] > 0)
         def store():
             def copy(encoded, semaphore):
@@ -53,20 +116,25 @@ def write_region(pool, values, ids, *, tok0=0):
                 copy, pltpu.VMEM((ntok,) + payload, pool.dtype), pltpu.SemaphoreType.DMA
             )
 
+    if skip_idle_source:
+        prefetch = (ids, _last_selected_row(ids > 0))
+        source_spec = pl.BlockSpec(
+            (1, rows, lanes), lambda i, indices, src: (src[i], 0, 0)
+        )
+    else:
+        prefetch = (ids,)
+        source_spec = pl.BlockSpec((1, rows, lanes), lambda i, indices: (i, 0, 0))
     return pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=len(prefetch),
             grid=(count,),
-            in_specs=[
-                pl.BlockSpec((1, rows, lanes), lambda i, indices: (i, 0, 0)),
-                pl.BlockSpec(memory_space=pltpu.HBM),
-            ],
+            in_specs=[source_spec, pl.BlockSpec(memory_space=pltpu.HBM)],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
-        input_output_aliases={2: 0},
-    )(ids, values, pool)
+        input_output_aliases={len(prefetch) + 1: 0},
+    )(*prefetch, values, pool)
 
 
 def pooled_short_conv(
@@ -119,7 +187,12 @@ def speculative_history_windows(
     steps = jnp.arange(window, dtype=jnp.int32)[:, None]
     # [window, state_len] chunk-relative source positions.
     positions = steps + 1 - state_len + jnp.arange(state_len, dtype=jnp.int32)[None]
-    past = history[:, jnp.clip(positions + state_len, 0, state_len - 1)]
+    clipped = jnp.clip(positions + state_len, 0, state_len - 1)
+    if history_row_kernel_enabled():
+        rows = jnp.arange(history.shape[0], dtype=jnp.int32)[:, None, None]
+        past = gather_history_rows(history, rows * state_len + clipped[None])
+    else:
+        past = history[:, clipped]
     past = jnp.where(initial[:, None, None, None], past, 0)
     current = x[
         jnp.clip(
@@ -154,14 +227,29 @@ def pooled_short_conv_speculative(
     so the next step resumes from whichever token was accepted last. Other
     requests (prefill/mixed) write their final history to ``ckpt_ids[r, 0]``,
     which is where a read offset of zero points.
+
+    Only the first ``min(R, T)`` request rows are read and written; see
+    `step_request_rows`. With VLLM_TPU_PLE_SKIP_IDLE_ROWS the history of
+    inactive rows is not read (every use of it is masked by ``active``) and
+    the checkpoint write fetches only the value rows it writes.
     """
     channels = x.shape[-1]
+    starts, ids, initial, read_ids, ckpt_ids, windowed = step_request_rows(
+        x.shape[0], starts, ids, initial, read_ids, ckpt_ids, windowed
+    )
     count, window = ckpt_ids.shape
-    history = read_region(
-        pool, read_ids, elements=state_len * channels, dtype=jnp.bfloat16
-    ).reshape(count, state_len, channels)
     lengths = starts[1:] - starts[:-1]
     active = (ids > 0) & (lengths > 0)
+    skip_idle = envs.VLLM_TPU_PLE_SKIP_IDLE_ROWS
+    if skip_idle:
+        history = read_selected_region(
+            pool, read_ids, active, elements=state_len * channels, dtype=jnp.bfloat16
+        )
+    else:
+        history = read_region(
+            pool, read_ids, elements=state_len * channels, dtype=jnp.bfloat16
+        )
+    history = history.reshape(count, state_len, channels)
     slots = jnp.where(active, jnp.arange(count, dtype=jnp.int32), -1)
     output, final = short_conv(
         x,
@@ -181,8 +269,32 @@ def pooled_short_conv_speculative(
         values, targets = request_checkpoints(
             x, history, final, starts, initial, active, ckpt_ids, windowed
         )
-    pool = write_region(pool, values, targets)
+    pool = write_region(pool, values, targets, skip_idle_source=skip_idle)
     return pool, output
+
+
+def step_request_rows(token_count, starts, ids, initial, read_ids, ckpt_ids, windowed):
+    """The per-request inputs cut to the rows a step of ``token_count`` tokens can use.
+
+    Every request with tokens has at least one, and the step metadata puts
+    them ahead of the padded rows, whose starts repeat the last one. So with
+    T tokens and R > T rows, rows T and later are empty (``starts[T] ==
+    starts[-1]``) and dropping them leaves every output and every non-null
+    checkpoint write unchanged, while the history read and the per-token
+    gathers address T rows instead of R. T is the static token bucket.
+    """
+    count = ckpt_ids.shape[0]
+    if not 0 < token_count < count:
+        return starts, ids, initial, read_ids, ckpt_ids, windowed
+    n = token_count
+    return (
+        starts[: n + 1],
+        ids[:n],
+        initial[:n],
+        read_ids[:n],
+        ckpt_ids[:n],
+        windowed[:n],
+    )
 
 
 def request_checkpoints(x, history, final, starts, initial, active, ckpt_ids, windowed):
@@ -220,7 +332,11 @@ def token_checkpoints(x, history, starts, initial, active, ckpt_ids, windowed):
     req = jnp.minimum(jnp.sum(t[:, None] >= starts[None, 1:], axis=1), count - 1)
     rel = t - starts[req]
     positions = rel[:, None] + 1 - state_len + jnp.arange(state_len, dtype=jnp.int32)[None]
-    past = history[req[:, None], jnp.clip(positions + state_len, 0, state_len - 1)]
+    clipped = jnp.clip(positions + state_len, 0, state_len - 1)
+    if history_row_kernel_enabled():
+        past = gather_history_rows(history, req[:, None] * state_len + clipped)
+    else:
+        past = history[req[:, None], clipped]
     past = jnp.where(initial[req][:, None, None], past, 0)
     current = x[jnp.clip(starts[req][:, None] + positions, 0, max(token_count - 1, 0))]
     values = jnp.where((positions >= 0)[..., None], current, past.astype(x.dtype))

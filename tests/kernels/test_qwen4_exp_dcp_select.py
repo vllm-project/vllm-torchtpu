@@ -2,7 +2,9 @@
 """VLLM_TPU_QSA_COMPRESSED_DCP: the pair's owned local top-k lists merged by
 merge_threshold / keep_mask give exactly the replicated top-k (raw-bit score
 order, lower group id on ties), including ties straddling slot k across ranks,
-+-0.0, rows with fewer than k groups, and empty rows."""
++-0.0, rows with fewer than k groups, and empty rows. With from_scores
+(VLLM_TPU_QSA_DCP_MERGE_SCORES) the boundary comes from the bits the top-k
+returns with its slots, and both outputs equal the gather's bit for bit."""
 
 import jax.numpy as jnp
 import numpy as np
@@ -42,6 +44,21 @@ def lax_like_topk(bits, k):
     return jnp.asarray(out)
 
 
+def lax_like_topk_scores(bits, k):
+    """``lax_like_topk`` plus the raw bits at each kept slot (-inf bits on -1)."""
+    slots = np.asarray(lax_like_topk(bits, k))
+    b = np.asarray(bits)
+    neg_inf = np.array(-np.inf, np.float32).view(np.int32)
+    picked = np.where(
+        slots >= 0, np.take_along_axis(b, np.maximum(slots, 0), axis=1), neg_inf
+    )
+    return jnp.asarray(slots), jnp.asarray(picked.astype(np.int32))
+
+
+def topk_for(from_scores):
+    return lax_like_topk_scores if from_scores else lax_like_topk
+
+
 def make_row(rng, n, kind):
     if kind == "random":
         return rng.standard_normal(n).astype(np.float32)
@@ -64,9 +81,7 @@ def local_topk(vals, n, rank, k):
     return v, p
 
 
-@pytest.mark.parametrize("kind", ["random", "ties", "flat"])
-@pytest.mark.parametrize("k", [8, 16])
-def test_union_of_kept_entries_is_the_replicated_topk(kind, k):
+def pair_lists(kind, k):
     rng = np.random.default_rng(k)
     rows = []
     for n in (0, 5, k - 1, k, k + 3, 3 * k, 60):  # empty, short and long rows
@@ -76,8 +91,20 @@ def test_union_of_kept_entries_is_the_replicated_topk(kind, k):
     for t, (n, vals) in enumerate(rows):
         for rank in range(2):
             vp[rank, t], pp[rank, t] = local_topk(vals, n, rank, k)
+    return rows, vp, pp
+
+
+@pytest.mark.parametrize("from_scores", [False, True])
+@pytest.mark.parametrize("kind", ["random", "ties", "flat"])
+@pytest.mark.parametrize("k", [8, 16])
+def test_union_of_kept_entries_is_the_replicated_topk(kind, k, from_scores):
+    rows, vp, pp = pair_lists(kind, k)
     thr_val, thr_pos = merge_threshold(
-        jnp.asarray(vp), jnp.asarray(pp), k, topk=lax_like_topk
+        jnp.asarray(vp),
+        jnp.asarray(pp),
+        k,
+        topk=topk_for(from_scores),
+        from_scores=from_scores,
     )
     for t, (n, vals) in enumerate(rows):
         kept = set()
@@ -90,11 +117,32 @@ def test_union_of_kept_entries_is_the_replicated_topk(kind, k):
         assert kept == replicated_topk(vals, n, k), (kind, k, n)
 
 
-def test_negative_zero_ranks_below_positive_zero():
+@pytest.mark.parametrize("kind", ["random", "ties", "flat"])
+@pytest.mark.parametrize("k", [8, 16])
+def test_scores_boundary_equals_the_gathered_one(kind, k):
+    _, vp, pp = pair_lists(kind, k)
+    gathered = merge_threshold(jnp.asarray(vp), jnp.asarray(pp), k, topk=lax_like_topk)
+    scored = merge_threshold(
+        jnp.asarray(vp), jnp.asarray(pp), k, topk=lax_like_topk_scores, from_scores=True
+    )
+    for a, b in zip(gathered, scored):
+        assert np.array_equal(
+            np.asarray(a).view(np.int32), np.asarray(b).view(np.int32)
+        )
+
+
+@pytest.mark.parametrize("from_scores", [False, True])
+def test_negative_zero_ranks_below_positive_zero(from_scores):
     k = 1
     vp = np.array([[[-0.0]], [[0.0]]], np.float32)
     pp = np.array([[[0]], [[B_GROUPS]]], np.int32)  # rank 0 has the lower id
-    thr_val, thr_pos = merge_threshold(jnp.asarray(vp), jnp.asarray(pp), k, topk=lax_like_topk)
+    thr_val, thr_pos = merge_threshold(
+        jnp.asarray(vp),
+        jnp.asarray(pp),
+        k,
+        topk=topk_for(from_scores),
+        from_scores=from_scores,
+    )
     keep0 = bool(np.asarray(keep_mask(jnp.asarray(vp[0]), jnp.asarray(pp[0]), thr_val, thr_pos))[0, 0])
     keep1 = bool(np.asarray(keep_mask(jnp.asarray(vp[1]), jnp.asarray(pp[1]), thr_val, thr_pos))[0, 0])
     assert (keep0, keep1) == (False, True)

@@ -50,7 +50,7 @@ def test_binds_before_the_shared_ops_exist(monkeypatch):
     target, draft = _models()
     assert draft.bind_shared_selection(target, TOKENS)
     sink = target.model.layers[2].self_attn._selection_sink  # the last QSA layer
-    assert sink.shape == (TOKENS, WIDTH) and sink.dtype == torch.int32
+    assert sink.shape == (TOKENS + 1, WIDTH) and sink.dtype == torch.int32
     assert not hasattr(target.model.layers[0].self_attn, "_selection_sink")
     attention = draft.model.layers[0].self_attn
     assert attention._selection_source is sink

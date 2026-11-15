@@ -125,3 +125,80 @@ def test_compressed_dcp_matches_replicated(interpret, rpa_stand_in, monkeypatch,
     if not ON_TPU:
         monkeypatch.setattr(dcp_select, "_sc_topk", lax_topk)
     print(case, check_compressed(**OP_CASES[case]))
+
+
+def _tied_scores(lengths):
+    # Four distinct values: most of a row's groups tie at the merge boundary,
+    # so its position (thr_pos) decides which of them are kept.
+    return jnp.floor(2 * _sin_scores(lengths))
+
+
+_sin_scores = _scores
+
+
+def check_local_merge(query_lens, contexts, *, main_slot=0, max_query_len=1, seed=0,
+                      exact=True):
+    """Per rank, ``local_merge`` (its own list against the pair's boundary)
+    attends exactly what the global merge attends: same pool, bit-identical
+    output and LSE; its ``selected`` is the global one's owned tokens.
+    ``exact=False`` (the reference attention, which sums the keys in list
+    order) allows float32 rounding in the output and LSE."""
+    layout, full, keep, qgate, s, m, seq, starts = make_step(seed, query_lens, contexts)
+    opts = dict(compress_ratio=RATIO, token_topk=TOPK, norm_eps=1e-6, rotary_dim=ROTARY,
+                k_scale=K_SCALE, v_scale=V_SCALE, main_slot=main_slot,
+                max_query_len=max_query_len)
+    pair_qgate = jnp.concatenate(qgate, axis=1)
+    selects = []
+    for r in range(D):
+        pool = poison_tail_rows(project_rank_pool(raw(full), layout, r, keep_pages=keep),
+                                layout, r, seq)
+        selects.append(pooled_qsa.pooled_qsa_compressed_dcp_select_step(
+            *_args(pair_qgate, s, from_raw(pool), m, layout.dcp_table), rank_operand(r),
+            dcp_size=D, **opts))
+    vals_pair = jnp.stack([x[6] for x in selects])
+    pos_pair = jnp.stack([x[7] for x in selects])
+    att = dict(kv_heads=1, compress_ratio=RATIO, token_topk=TOPK, k_scale=K_SCALE,
+               v_scale=V_SCALE, main_slot=main_slot, max_query_len=max_query_len)
+    tokens = int(starts[-1])
+    for r in range(D):
+        pool, q, gate, lengths, req, st, _, _ = selects[r]
+        operands = (q, gate, lengths, req, st, jnp.asarray(layout.dcp_table), m["context"],
+                    pool, vals_pair, pos_pair, rank_operand(r))
+        whole = pooled_qsa.pooled_qsa_compressed_dcp_attend_step(*operands, dcp_size=D, **att)
+        own = pooled_qsa.pooled_qsa_compressed_dcp_attend_step(
+            *operands, dcp_size=D, local_merge=True, **att)
+        np.testing.assert_array_equal(raw(own[0]), raw(whole[0]), f"rank {r} pool")
+        if exact:
+            np.testing.assert_array_equal(np.asarray(own[1]), np.asarray(whole[1]),
+                                          f"rank {r} out")
+            np.testing.assert_array_equal(np.asarray(own[2]), np.asarray(whole[2]),
+                                          f"rank {r} lse")
+        else:
+            np.testing.assert_allclose(np.asarray(own[1]), np.asarray(whole[1]), rtol=0,
+                                       atol=1e-5, err_msg=f"rank {r} out")
+            np.testing.assert_allclose(np.asarray(own[2]), np.asarray(whole[2]), rtol=0,
+                                       atol=1e-5, err_msg=f"rank {r} lse")
+        sel_whole, sel_own = np.asarray(whole[3])[:tokens], np.asarray(own[3])[:tokens]
+        for t in range(tokens):
+            def owned(row):
+                ids = row[row >= 0]
+                return sorted(ids[(ids // layout.page_size) % D == r].tolist())
+
+            assert owned(sel_own[t]) == owned(sel_whole[t]), (r, t)
+
+
+@pytest.mark.parametrize("scores", ["distinct", "tied"])
+@pytest.mark.parametrize("case", sorted(OP_CASES))
+def test_compressed_dcp_local_merge_attends_the_same(interpret, rpa_stand_in, monkeypatch,
+                                                     partial_kernels, case, scores, request):
+    import sys
+
+    monkeypatch.setattr(pooled_qsa, "select_blocks", stub_select_dcp)
+    if scores == "tied":
+        monkeypatch.setattr(sys.modules[__name__], "_scores", _tied_scores)
+    if not ON_TPU:
+        monkeypatch.setattr(dcp_select, "_sc_topk", lax_topk)
+    # The production RPA metadata sorts each rank's groups; the reference
+    # attention keeps the list order, which differs between the two merges.
+    exact = request.node.callspec.params["partial_kernels"] == "production"
+    check_local_merge(**OP_CASES[case], exact=exact)

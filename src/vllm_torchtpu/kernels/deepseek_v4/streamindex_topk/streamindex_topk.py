@@ -232,9 +232,28 @@ def kernel(
     per_token_scores = (
         components is not None and components.per_token_scores and bq_sz > 1
     )
+    dense_step = per_token_scores and components.dense_step
+    tail_skip = (
+        components.tail_skip
+        if components is not None
+        and seq_batch_size == 1
+        and kv_layout == KVLayout.HEAD_ALONG_SUBLANE
+        else 0
+    )
     seq_along_lane = kv_layout == KVLayout.SEQ_ALONG_LANE
 
     _, num_q_heads, head_dim = q_hbm_ref.shape
+    if dense_step and not (
+        num_q_heads == 4
+        and seq_batch_size == 1
+        and not seq_along_lane
+        and (bq_sz == 4 or bq_sz % 8 == 0)
+    ):
+        raise ValueError(
+            "dense_step scores 4 index heads, one sequence a tile, a 4-row or "
+            f"8k-row q block on HEAD_ALONG_SUBLANE keys; got {num_q_heads=}, "
+            f"{seq_batch_size=}, {bq_sz=}, {kv_layout=}"
+        )
 
     if seq_along_lane:
         # [total_num_pages, kv_sublane_groups, kv_packing, page_size] where the
@@ -367,6 +386,17 @@ def kernel(
             chunk_idx=chunk_idx,
         )
     else:
+        # A coalesced copy moves whole table entries: groups of whole entries.
+        expansion = table_expansion[0]
+        unit = (
+            expansion
+            if components is not None
+            and components.coalesce_entries
+            and expansion > 1
+            and bkv_p % expansion == 0
+            else 1
+        )
+        tail_group = -(-tail_skip // unit) * unit
         kv_alloc = bref_override.StreamIndexKVBufferedRef.input(
             spec=kv_spec,
             dtype_or_type=cache_kv_hbm_ref,
@@ -380,6 +410,12 @@ def kernel(
             chunk_idx=chunk_idx,
             table_expansion=table_expansion,
             coalesce_entries=components is not None and components.coalesce_entries,
+            lean_addresses=dense_step,
+            tail_skip=(
+                (tail_group, page_size, bkv_sz, shift_comp, cp_size, interleave_c)
+                if tail_skip
+                else None
+            ),
         )
     o_alloc = bref_override.StreamIndexOBufferedRef.output(
         spec=out_spec,
@@ -674,6 +710,87 @@ def kernel(
         )
         scores_vmem[...] = pltpu.bitcast(scores, jnp.int32)
 
+    # Rows of the head sums kept per lane tile: a 4-token block's sums are
+    # repeated in both halves of one vreg.
+    dense_sum_rows = 8 if bq_sz == 4 else bq_sz
+
+    def dense_step_body(
+        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, sum_ref
+    ):
+        """`step_body` of a per-token block on whole vregs, same scores.
+
+        Row h * bq + t of the cached head-major q block holds token t's head
+        h, so head h's products for the block's tokens form one [bq, bkv]
+        slab. The per-token decode expression sums the 4 heads as (h0 + h2) +
+        (h1 + h3): its sublane reduction adds rows 4 apart, then 2, then 1,
+        over the head rows padded with zeros. The slab sums pair the heads the
+        same way, so every score keeps its operation order. The padding zeros
+        also turn each -0.0 head term into +0.0 before any sum, which only
+        changes a sum that comes out -0.0; such sums are set to +0.0 here.
+        Token t's sums sit in row t of every 128-key lane tile; a
+        sublane-strided load from `sum_ref` gathers them into its
+        [num_sublanes_bkv, 128] score rows, where the masks run on dense
+        vregs.
+
+        Args:
+          q_hm_ref: [num_q_heads * bq, head_dim] q block, head-major.
+          sum_ref: [num_sublanes_bkv, dense_sum_rows, 128] f32 head sums.
+        """
+        p_id = pl.program_id(0)
+        seq_idx = seq_tile(p_id)
+        bq_idx = bq_block(p_id)
+        bkv_idx = bkv_block(p_id)
+        cp_rank = cp_rank_ref[0]
+
+        # A q block's steps run back to back, kv innermost; bkv_idx == 0 is
+        # the first step of each new block.
+        @pl.when(bkv_idx == 0)
+        def _():
+            q_hm_ref[...] = transpose_to_head_major(q_vmem[...], bq_sz)
+
+        w = weights_vmem[...].astype(jnp.float32)
+        w_col = jnp.concatenate(
+            [w[:, h : h + 1] for h in range(num_q_heads)], axis=0
+        )
+        keys = components.keys.read_block(bkv_vmem, 0, bkv_sz, head_dim)
+        st = jnp.einsum(
+            "nd,md->nm", q_hm_ref[...], keys, preferred_element_type=jnp.float32
+        )
+        prod = jnp.maximum(st, 0.0) * w_col
+        n = bq_sz
+        if n % 8 == 0:
+            sums = (prod[0:n] + prod[2 * n : 3 * n]) + (
+                prod[n : 2 * n] + prod[3 * n : 4 * n]
+            )
+        else:
+            # Rows 0-3 hold h0 + h2, rows 4-7 h1 + h3.
+            pair = prod[0:8] + prod[8:16]
+            sums = pair + pltpu.roll(pair, 4, 0)
+        for j in range(num_sublanes_bkv):
+            sum_ref[j] = sums[:, j * 128 : (j + 1) * 128]
+        flat = sum_ref.reshape(num_sublanes_bkv * dense_sum_rows, 128)
+
+        tile_shape = (num_sublanes_bkv, 128)
+        k_local = bkv_idx * bkv_sz + (
+            lax.broadcasted_iota(jnp.int32, tile_shape, 0) * 128
+            + lax.broadcasted_iota(jnp.int32, tile_shape, 1)
+        )
+        k_span = cp_local_to_global(k_local, cp_rank, cp_size, interleave_c)
+        s_l = seq_lens_ref[seq_idx]
+        valid = k_span < (s_l >> shift_comp)
+        q_s = cu_q_lens_ref[seq_idx]
+        q_l = cu_q_lens_ref[seq_idx + 1] - q_s
+        chunk_start = start_end_seq_idx_ref[2]
+        block_start = bq_idx * bq_sz + jnp.maximum(0, chunk_start - q_s)
+        for t in range(bq_sz):
+            q_pos = components.schedule.positions(s_l - q_l + block_start + t)
+            tok = flat[pl.ds(t, num_sublanes_bkv, stride=dense_sum_rows), :]
+            tok = jnp.where(tok == 0.0, 0.0, tok)
+            mask = jnp.logical_and(valid, k_span <= (q_pos >> shift_comp))
+            scores_vmem[t] = pltpu.bitcast(
+                jnp.where(mask, tok, -jnp.inf), jnp.int32
+            )
+
     def blocked_prefill_step(
         q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref
     ):
@@ -852,10 +969,14 @@ def kernel(
                 s_summed.reshape(bq_sz, num_sublanes_bkv, 128), jnp.int32
             )
 
-    def _run_all(q_hm_ref=None, wb_ref=None):
+    def _run_all(q_hm_ref=None, wb_ref=None, sum_ref=None):
         if prefill_cfg.enabled:
             body = functools.partial(
                 blocked_prefill_step, q_hm_ref=q_hm_ref, wb_ref=wb_ref
+            )
+        elif dense_step:
+            body = functools.partial(
+                dense_step_body, q_hm_ref=q_hm_ref, sum_ref=sum_ref
             )
         else:
             body = functools.partial(step_body, q_hm_ref=q_hm_ref)
@@ -873,7 +994,8 @@ def kernel(
             pipeline_fn(
                 (q_hbm_ref, *window_refs),
                 (indexer_weights_hbm_ref, *window_refs),
-                (cache_kv_hbm_ref, page_indices_ref, metadata_ref),
+                (cache_kv_hbm_ref, page_indices_ref, metadata_ref)
+                + ((seq_lens_ref, cp_rank_ref) if tail_skip else ()),
                 (scores_hbm_ref, *window_refs),
                 allocations=(q_buf, weights_buf, kv_buf, o_buf),
             )
@@ -894,6 +1016,14 @@ def kernel(
                     128,
                 ),
                 prefill_cfg.wb_dtype,
+            ),
+        )
+    elif dense_step:
+        pl.run_scoped(
+            _run_all,
+            pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),
+            sum_ref=pltpu.VMEM(
+                (num_sublanes_bkv, dense_sum_rows, 128), jnp.float32
             ),
         )
     elif seq_batch_size == 1 and bq_sz > 1 and not per_token_scores:
@@ -1181,6 +1311,9 @@ def _effective_row_lengths(
         "topk_backend",
         "decode_passes",
         "hoist_step_metadata",
+        "score_scheduling_group_id",
+        "topk_scheduling_group_id",
+        "score_sublane_align",
     ),
 )
 def streamindex_topk(
@@ -1213,8 +1346,17 @@ def streamindex_topk(
     topk_backend: TopKBackend = _DEFAULT_TOPK_BACKEND,
     decode_passes: bool = True,
     hoist_step_metadata: bool = False,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
+    score_scheduling_group_id: int | None = None,
+    topk_scheduling_group_id: int | None = None,
+    carry: Any = None,
+    score_sublane_align: int = 1,
+) -> Any:
     """StreamIndex Top-K retrieval.
+
+    ``score_sublane_align`` rounds each token's score row up to a multiple of
+    that many 128-lane sublanes (8 for int32 tiles), so the flat view the
+    SparseCore top-k reads is a bitcast of the kernel's output instead of a
+    relayout copy. The extra columns are never written or selected.
 
     ``hoist_step_metadata=True`` builds the step-level metadata (and the pass
     schedules of a single-chunk call) outside the early-exit ``lax.cond``, so
@@ -1286,16 +1428,38 @@ def streamindex_topk(
       topk_backend: Static selector for the score-bit buffers. The default keeps
         SparseCore selection and chunk overlap. A backend without overlap uses
         the same scoring chunks without cross-engine scheduling annotations.
+      score_scheduling_group_id: XLA scheduling group of the scoring kernels of
+        a single-chunk call without early exit, for pairing them with work on
+        another engine (an earlier call's SparseCore top-k).
+      topk_scheduling_group_id: XLA scheduling group of the top-k of a
+        single-chunk call without early exit, for TensorCore work the caller
+        runs while the SparseCore selects.
+      carry: Arrays passed through an optimization barrier together with the
+        scores, so an in-place update the caller applies to the returned
+        `carry` (e.g. a cache write into the buffer behind `cache_kv`) follows
+        every scoring read of `cache_kv` without a copy. Single-chunk calls
+        without early exit only.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
       when `cp_size == 1`), or `(indices, scores)` if `return_scores`. Unfilled
-      slots are `-1` with score `-inf`.
+      slots are `-1` with score `-inf`. With `carry`, `(that result, carry)`.
     """
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv`, keeping HBM transactions fused.
 
     kv_layout = KVLayout.parse(kv_layout)
+    pinned = (
+        score_scheduling_group_id is not None
+        or topk_scheduling_group_id is not None
+        or carry is not None
+    )
+    if pinned and enable_early_exit:
+        # The top-k would sit inside the lax.cond branch, where XLA cannot
+        # schedule the caller's ops, and `carry` cannot leave the branch.
+        raise ValueError(
+            "score/topk scheduling groups and carry need enable_early_exit=False."
+        )
 
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
@@ -1395,9 +1559,12 @@ def streamindex_topk(
                 f"bkv_sz ({page_size} * {bkv_p} = {bkv_sz}) must be a multiple of 128."
             )
 
-    num_sublanes_total = max(
-        align_to(pages_per_seq, bkv_p) * page_size // 128
-        for bkv_p in num_kv_pages_per_blocks
+    num_sublanes_total = align_to(
+        max(
+            align_to(pages_per_seq, bkv_p) * page_size // 128
+            for bkv_p in num_kv_pages_per_blocks
+        ),
+        score_sublane_align,
     )
 
     def _block_sizes(num_queries_per_block, bkv_p, static_q_len):
@@ -1679,6 +1846,13 @@ def streamindex_topk(
     chunk_starts = (
         (None,) if num_chunks == 1 else tuple(m * chunk_len for m in range(num_chunks))
     )
+    if pinned and num_chunks > 1:
+        raise ValueError(
+            "score/topk scheduling groups and carry cover single-chunk calls; "
+            "chunk_tokens pairs the chunks itself."
+        )
+    # `carry` after its optimization barrier with the scores.
+    carried = []
 
     def _passes(decode_batch_end):
         return tuple(
@@ -1724,6 +1898,10 @@ def streamindex_topk(
                 if m < num_chunks - 1 and topk_backend.overlaps_scoring
                 else None
             )
+            if num_chunks == 1:
+                # The caller's pairing (both None unless it asked).
+                tc_group = score_scheduling_group_id
+                sc_group = topk_scheduling_group_id
 
             start = m * chunk_len
             scores = _scores_for_chunk(
@@ -1734,6 +1912,19 @@ def streamindex_topk(
                 out_dtype,
                 tc_group,
             )
+            if carry is not None:
+                # Single chunk (checked above): these are the last scores, so
+                # the returned carry is ordered after every scoring kernel. The
+                # scores cross the barrier flat, the form the SparseCore reads
+                # (a bitcast of the kernel's output): in the [rows, positions]
+                # shape the barrier gives them a layout that costs two
+                # SparseCore relayouts per top-k. The top-k takes the barrier's
+                # scores output, so the barrier (and its ordering) stays live.
+                flat, carry_out = jax.lax.optimization_barrier(
+                    (scores.reshape(-1), carry)
+                )
+                scores = flat.reshape(scores.shape)
+                carried.append(carry_out)
             scores = scores.reshape(chunk_len, -1)
             if scores.shape[1] < k:
                 scores = jnp.pad(
@@ -1800,7 +1991,8 @@ def streamindex_topk(
         return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
 
     if not enable_early_exit:
-        return _common_path(None)
+        result = _common_path(None)
+        return result if carry is None else (result, carried[0])
     return jax.lax.cond(
         jnp.max(seq_lens) // compression_ratio <= k,
         _fast_path,

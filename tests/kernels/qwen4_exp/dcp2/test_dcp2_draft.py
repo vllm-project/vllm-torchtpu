@@ -117,3 +117,50 @@ def test_dcp_draft_matches_replicated_draft(interpret, rpa_stand_in, monkeypatch
     paired page's first slot (the target layers' layout)."""
     monkeypatch.setattr(pooled_qsa, "select_blocks", stub_select)
     print(case, variant, check_draft(variant, **DRAFT_CASES[case], main_slot=main_slot))
+
+
+@pytest.mark.parametrize("compressed_dcp", [False, True])
+@pytest.mark.parametrize("variant", ["shared", "shared_rows"])
+@pytest.mark.parametrize("case", sorted(DRAFT_CASES))
+def test_dcp_draft_without_indexer_writes(interpret, rpa_stand_in, monkeypatch,
+                                          partial_kernels, case, variant, compressed_dcp):
+    """VLLM_TPU_MTP_DRAFT_SKIP_INDEXER_WRITES: the shared-selection draft steps
+    with ``indexer_writes=False`` return the same attention partials and
+    selection, write the same main-KV bytes, and leave out only the
+    compressed-key, ring and tag writes."""
+    monkeypatch.setattr(pooled_qsa, "select_blocks", stub_select)
+    cfg = DRAFT_CASES[case]
+    layout, full, keep, qgate, s, m, seq, starts = make_step(
+        0, cfg["query_lens"], cfg["contexts"]
+    )
+    opts = dict(compress_ratio=RATIO, token_topk=TOPK, norm_eps=1e-6, rotary_dim=ROTARY,
+                k_scale=K_SCALE, v_scale=V_SCALE, max_query_len=cfg["max_query_len"])
+    rows = _last_rows(starts, len(qgate[0]))
+    target = pooled_qsa.pooled_qsa_step(*_args(qgate[0], s, full, m, layout.full_table),
+                                        **opts)[2]
+    if variant == "shared":
+        operands, step = (target,), pooled_qsa.pooled_qsa_shared_dcp_step
+    else:
+        operands = (rows, target[jnp.maximum(rows, 0)])
+        step = pooled_qsa.pooled_qsa_shared_rows_dcp_step
+    pair_qgate = jnp.concatenate(qgate, axis=1)
+    for r in range(D):
+        before = poison_tail_rows(project_rank_pool(raw(full), layout, r, keep_pages=keep),
+                                  layout, r, seq)
+
+        def run(**kw):
+            return step(*_args(pair_qgate, s, from_raw(before), m, layout.dcp_table),
+                        *operands, rank_operand(r), compressed_dcp=compressed_dcp,
+                        **opts, **kw)
+
+        want, got = run(), run(indexer_writes=False)
+        for i, what in ((1, "out"), (2, "lse"), (3, "selected")):
+            np.testing.assert_array_equal(
+                np.asarray(got[i]), np.asarray(want[i]), err_msg=f"rank {r} {what}"
+            )
+        with_writes, without = raw(want[0]), raw(got[0])
+        written = without != before
+        assert written.any(), f"rank {r}: no main-KV write"
+        np.testing.assert_array_equal(without[written], with_writes[written])
+        # What the full step writes beyond that is its indexer state.
+        assert ((with_writes != before) & ~written).any(), f"rank {r}"

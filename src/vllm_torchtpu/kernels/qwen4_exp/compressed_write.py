@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run-based compressed-key pool writer for prefill-sized steps.
+"""Compressed-key pool writers: run-based for prefill-sized steps, one
+program per step for decode-sized steps under compressed DCP (``write_pairs``).
 
 ``write_compressed`` writes one BF16 pair (an FP8 carrier row) per completed
 pair of compressed groups. Its tiled kernel runs one 128-token tile per grid
@@ -159,5 +160,95 @@ def write_runs(view, pair, write, mask, values, requests, ratio):
         run_len.astype(jnp.int32),
         counts,
         rows,
+        view,
+    )
+
+
+def write_pairs(view, pair, write, mask, values):
+    """``view`` with the writers applied by one program, no compaction.
+
+    Decode-sized steps (VLLM_TPU_QSA_COMPRESSED_WRITE=inflight): a rank owns
+    a few of the step's rows, almost all partial pairs. The program reads the
+    old carrier row of every partial writer with all DMAs in flight, merges
+    the new halves in VMEM, then stores every writer's row with all DMAs in
+    flight. ``write`` marks one writer per pair, so no two DMAs touch the same
+    row and every read lands before the first store.
+    """
+    tokens = len(pair)
+    packing, width = view.shape[1:]
+
+    def kernel(pair_ref, write_ref, mask_ref, values_ref, _old, out, staged, old, read_sem,
+               write_sem):
+        def bf16(ref):
+            return ref.bitcast(jnp.bfloat16) if view.dtype != jnp.bfloat16 else ref
+
+        staged_bf, old_bf = bf16(staged), bf16(old)
+        staged_bf[...] = values_ref[...]
+
+        def partial(t):
+            whole = (mask_ref[t, 0] != 0) & (mask_ref[t, 1] != 0)
+            return (write_ref[t] != 0) & ~whole
+
+        def start_read(t, reads):
+            @pl.when(partial(t))
+            def _():
+                pltpu.make_async_copy(out.at[pair_ref[t]], old.at[t], read_sem).start()
+
+            return reads + partial(t).astype(jnp.int32)
+
+        reads = jax.lax.fori_loop(0, tokens, start_read, jnp.int32(0), unroll=8)
+
+        def wait_read(_, carry):
+            pltpu.make_async_copy(out.at[0], old.at[0], read_sem).wait()
+            return carry
+
+        jax.lax.fori_loop(0, reads, wait_read, 0)
+
+        def merge_and_store(t, stores):
+            @pl.when(partial(t))
+            def _():
+                half = jnp.broadcast_to(jnp.arange(2)[:, None], (2, width))
+                keep = jnp.where(half == 0, mask_ref[t, 0], mask_ref[t, 1]) != 0
+                staged_bf[t] = jnp.where(keep, values_ref[t], old_bf[t])
+
+            @pl.when(write_ref[t] != 0)
+            def _():
+                pltpu.make_async_copy(staged.at[t], out.at[pair_ref[t]], write_sem).start()
+
+            return stores + (write_ref[t] != 0).astype(jnp.int32)
+
+        stores = jax.lax.fori_loop(0, tokens, merge_and_store, jnp.int32(0), unroll=8)
+
+        def wait_store(_, carry):
+            pltpu.make_async_copy(staged.at[0], out.at[0], write_sem).wait()
+            return carry
+
+        jax.lax.fori_loop(0, stores, wait_store, 0)
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(1,),
+            in_specs=[
+                pl.BlockSpec((tokens, 2, width), lambda i, *_: (0, 0, 0)),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((tokens, packing, width), view.dtype),
+                pltpu.VMEM((tokens, packing, width), view.dtype),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct(view.shape, view.dtype),
+        input_output_aliases={4: 0},
+        name="qwen4_exp_compressed_kv_pair_write",
+    )(
+        pair.astype(jnp.int32),
+        write.astype(jnp.int32),
+        mask.astype(jnp.int32),
+        values,
         view,
     )
