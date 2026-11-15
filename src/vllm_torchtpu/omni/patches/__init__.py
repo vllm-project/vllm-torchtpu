@@ -26,11 +26,19 @@ until Omni patches are unified with patch_registry.py (tracked in #1862); see
 qwen3omni_thinker.py.
 """
 
+import contextlib
+import functools
+import inspect
+import itertools
+import threading
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from functools import cache as run_once
 from typing import Any
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -88,6 +96,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_qwen_image_text_encoder_offload()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -649,3 +658,159 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_QWEN_IMAGE_TEXT_ENCODER_OFFLOAD_PATCHED = "_tpu_text_encoder_offload_patched"
+_TEXT_ENCODER_OFFLOAD_STATE_ATTR = "_tpu_text_encoder_offload_state"
+_TEXT_ENCODER_OFFLOAD_INIT_LOCK = threading.Lock()
+
+
+@dataclass
+class _TextEncoderOffloadState:
+    """Per-pipeline text encoder offload bookkeeping.
+
+    ``device`` is the TPU device the encoder was loaded on (None until it is
+    first seen there). ``depth`` counts open offload scopes so that the encoder
+    goes back to CPU once per request, after both true-CFG ``encode_prompt``
+    calls. ``lock`` serializes scopes on one pipeline instance.
+    """
+
+    device: torch.device | None = None
+    depth: int = 0
+    lock: threading.RLock = field(default_factory=threading.RLock)
+
+
+def _module_device(module: torch.nn.Module) -> torch.device | None:
+    """Return the device of the first parameter or buffer in ``module``."""
+    for tensor in itertools.chain(module.parameters(), module.buffers()):
+        return tensor.device
+    return None
+
+
+def _module_has_tpu_tensors(module: torch.nn.Module) -> bool:
+    """Return True if any parameter or buffer in ``module`` resides on TPU."""
+    return any(
+        tensor.device.type == "tpu"
+        for tensor in itertools.chain(module.parameters(), module.buffers())
+    )
+
+
+def _get_offload_state(pipeline: Any) -> _TextEncoderOffloadState:
+    state = getattr(pipeline, _TEXT_ENCODER_OFFLOAD_STATE_ATTR, None)
+    if state is not None:
+        return state
+    with _TEXT_ENCODER_OFFLOAD_INIT_LOCK:
+        state = getattr(pipeline, _TEXT_ENCODER_OFFLOAD_STATE_ATTR, None)
+        if state is None:
+            state = _TextEncoderOffloadState()
+            setattr(pipeline, _TEXT_ENCODER_OFFLOAD_STATE_ATTR, state)
+        return state
+
+
+@contextlib.contextmanager
+def _text_encoder_offload_scope(pipeline: Any, needs_encoder: bool) -> Iterator[None]:
+    """Keep ``pipeline.text_encoder`` on TPU inside the scope, CPU after it.
+
+    The encoder is moved to TPU only when ``needs_encoder`` is set and it is
+    not already there, and moved back to CPU when the outermost scope exits.
+    Encoders that were never on TPU are left alone.
+    """
+    text_encoder = pipeline.text_encoder
+    if text_encoder is None:
+        yield
+        return
+    state = _get_offload_state(pipeline)
+    with state.lock:
+        cur_device = _module_device(text_encoder)
+        if state.device is None and cur_device is not None and cur_device.type == "tpu":
+            state.device = cur_device
+        if state.device is None:
+            yield
+            return
+        state.depth += 1
+        failed = False
+        try:
+            if needs_encoder and (cur_device is None or cur_device.type != "tpu"):
+                text_encoder.to(state.device)
+            yield
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            state.depth -= 1
+            if state.depth == 0 and _module_has_tpu_tensors(text_encoder):
+                try:
+                    text_encoder.to("cpu")
+                    torch.accelerator.synchronize(state.device)
+                except Exception:
+                    if failed:
+                        logger.warning(
+                            "Failed to offload QwenImage text_encoder to CPU "
+                            "while unwinding an earlier error.",
+                            exc_info=True,
+                        )
+                    else:
+                        raise
+
+
+def _patch_qwen_image_text_encoder_offload() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni supports TPU-native CPU offloading without
+    # hanging in its CUDA-oriented offloader.
+    #
+    # Problem: On 32 GiB v6e TPUs, keeping QwenImagePipeline.text_encoder
+    #   resident on TPU after prompt encoding leaves too little HBM for VAE
+    #   decode at 1024x1024 (OOM on tt_jit_clamp).
+    # Fix: When VLLM_TPU_OMNI_TEXT_ENCODER_OFFLOAD=1, move text_encoder to CPU
+    #   once per request, after _prepare_generation_context has run both
+    #   true-CFG encode_prompt calls, and move it back to TPU only when an
+    #   encode_prompt call actually needs it (not for precomputed
+    #   prompt_embeds). Direct encode_prompt calls offload when they return.
+    # Scope: text-to-image QwenImagePipeline only; the Edit, EditPlus and
+    #   Layered pipelines are separate classes with their own encode_prompt.
+    # -------------------------------------------------------------------------
+    if not envs.VLLM_TPU_OMNI_TEXT_ENCODER_OFFLOAD:
+        return
+
+    from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import (
+        QwenImagePipeline,
+    )
+
+    if getattr(
+        QwenImagePipeline.encode_prompt,
+        _QWEN_IMAGE_TEXT_ENCODER_OFFLOAD_PATCHED,
+        False,
+    ):
+        return
+
+    orig_encode = QwenImagePipeline.encode_prompt
+    orig_prepare = QwenImagePipeline._prepare_generation_context
+    encode_sig = inspect.signature(orig_encode)
+
+    @functools.wraps(orig_encode)
+    def _encode_prompt_with_offload(self: Any, *args: Any, **kwargs: Any) -> Any:
+        bound = encode_sig.bind_partial(self, *args, **kwargs)
+        needs_encoder = bound.arguments.get("prompt_embeds") is None
+        with _text_encoder_offload_scope(self, needs_encoder=needs_encoder):
+            return orig_encode(self, *args, **kwargs)
+
+    @functools.wraps(orig_prepare)
+    def _prepare_generation_context_with_offload(
+        self: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        with _text_encoder_offload_scope(self, needs_encoder=False):
+            return orig_prepare(self, *args, **kwargs)
+
+    for wrapper in (
+        _encode_prompt_with_offload,
+        _prepare_generation_context_with_offload,
+    ):
+        setattr(wrapper, _QWEN_IMAGE_TEXT_ENCODER_OFFLOAD_PATCHED, True)
+    QwenImagePipeline.encode_prompt = _encode_prompt_with_offload
+    QwenImagePipeline._prepare_generation_context = (
+        _prepare_generation_context_with_offload
+    )
+    logger.info(
+        "Applied TPU patch: offload QwenImagePipeline.text_encoder to CPU "
+        "once per request."
+    )
