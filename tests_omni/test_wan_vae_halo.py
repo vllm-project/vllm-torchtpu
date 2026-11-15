@@ -138,11 +138,14 @@ def test_patch_idempotent_and_kill_switch_on_real_omni(wan_vae_modules, monkeypa
 
 
 def _record_warnings(monkeypatch) -> list[str]:
+    import vllm.logger
+
+    vllm.logger._print_warning_once.cache_clear()
     warnings: list[str] = []
     monkeypatch.setattr(
-        patches.logger,
+        patches.logger._resolve(),
         "warning",
-        lambda msg, *args: warnings.append(msg % args if args else msg),
+        lambda msg, *args, **kwargs: warnings.append(msg % args if args else msg),
     )
     return warnings
 

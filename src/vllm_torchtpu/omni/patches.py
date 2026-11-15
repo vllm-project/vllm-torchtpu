@@ -799,6 +799,10 @@ def _patch_wan_vae_halo_allgather() -> None:
     ):
         wan_spatial_shard._tpu_orig_all_gather_along_dim = orig_all_gather
 
+        # Copied from wan_spatial_shard.all_gather_along_dim in vllm-omni
+        # 0.32.0rc1 because synchronize_tensors(gathered, wait=False) must run
+        # between dist.all_gather and the rank != dst early return before
+        # non-dst ranks drop gathered.
         def _all_gather_along_dim(
             x: torch.Tensor,
             *,
@@ -838,9 +842,14 @@ def _patch_distributed_vae_host_metadata_collectives() -> None:
     )
 
     executor_cls = getattr(distributed_vae_executor, "DistributedVaeExecutor", None)
-    if executor_cls is None or hasattr(
-        executor_cls, "_tpu_orig_compute_global_padding_shape"
-    ):
+    if executor_cls is None:
+        logger.warning(
+            "Skipping TPU patch: vLLM-Omni distributed_vae_executor has no "
+            "DistributedVaeExecutor; update vllm_torchtpu.omni.patches."
+            "_patch_distributed_vae_host_metadata_collectives."
+        )
+        return
+    if hasattr(executor_cls, "_tpu_orig_compute_global_padding_shape"):
         return
     orig_compute = getattr(executor_cls, "_compute_global_padding_shape", None)
     orig_gather = getattr(executor_cls, "gather_tensors", None)
@@ -859,18 +868,14 @@ def _patch_distributed_vae_host_metadata_collectives() -> None:
     executor_cls._tpu_orig_compute_global_padding_shape = orig_compute
     executor_cls._tpu_orig_gather_tensors = orig_gather
     dist = distributed_vae_executor.dist
-    warned_no_host_group = False
 
     def _no_host_group(self: Any) -> bool:
-        nonlocal warned_no_host_group
         if getattr(self, "_error_group", None) is not None:
             return False
-        if not warned_no_host_group:
-            warned_no_host_group = True
-            logger.warning(
-                "DistributedVaeExecutor has no _error_group; keeping the "
-                "upstream device-group metadata collectives."
-            )
+        logger.warning_once(
+            "DistributedVaeExecutor has no _error_group; keeping the "
+            "upstream device-group metadata collectives."
+        )
         return True
 
     def _compute_global_padding_shape(
