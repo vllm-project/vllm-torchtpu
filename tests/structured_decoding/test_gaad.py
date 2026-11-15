@@ -236,3 +236,47 @@ def test_topup_scheduled_spec_decode_tokens_updates_num_invalid():
         - sched_out.num_invalid_spec_tokens["r1"]
         == 2
     )
+
+
+def test_extract_deterministic_jump_skips_when_validated_draft_terminates_fsm():
+    """Do not call find_jump_forward_string after validated_draft accepts stop token."""
+    stop_token = 99
+
+    class _TerminatingMatcher:
+        def __init__(self):
+            self.history: list[int] = []
+
+        def is_terminated(self) -> bool:
+            return stop_token in self.history
+
+        def accept_token(self, token: int) -> bool:
+            self.history.append(token)
+            return True
+
+        def rollback(self, count: int) -> None:
+            del self.history[-count:]
+
+        def find_jump_forward_string(self) -> str:
+            if self.is_terminated():
+                raise RuntimeError(
+                    "Check failed: (!IsStopTokenAccepted()) is false: "
+                    "GrammarMatcher has terminated after accepting the stop token"
+                )
+            return '","b":"'
+
+    matcher = _TerminatingMatcher()
+    grammar = SimpleNamespace(
+        matcher=matcher,
+        is_terminated=matcher.is_terminated,
+    )
+    tokenizer = _FakeTokenizer({'","b":"': [31, 32]})
+    bridge = FSMBridge(stats=JumpStats())
+
+    tokens, flags = bridge.extract_deterministic_jump(
+        grammar=grammar,
+        tokenizer=tokenizer,
+        validated_draft=[stop_token],
+        num_spec_tokens=3,
+    )
+    assert (tokens, flags) == ([], [])
+    assert matcher.history == []
