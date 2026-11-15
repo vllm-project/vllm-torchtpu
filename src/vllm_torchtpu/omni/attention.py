@@ -42,7 +42,7 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
-class RingCfgLaneMismatchError(ValueError, RuntimeError):
+class RingCfgLaneMismatchError(RuntimeError):
     """Raised when ring attention partners do not belong to the same CFG lane."""
 
 
@@ -53,6 +53,7 @@ def set_ring_cfg_validation_state(state: dict[str, Any] | None) -> None:
     """Records runtime CFG/ring group layout for same-CFG-lane validation."""
     global _RUNTIME_RING_CFG_STATE
     _RUNTIME_RING_CFG_STATE = state
+    _ring_ulysses_attention_op.cache_clear()
 
 
 def get_ring_cfg_validation_state() -> dict[str, Any] | None:
@@ -64,6 +65,7 @@ def clear_ring_cfg_validation_state() -> None:
     """Clears any cached runtime CFG/ring group layout state."""
     global _RUNTIME_RING_CFG_STATE
     _RUNTIME_RING_CFG_STATE = None
+    _ring_ulysses_attention_op.cache_clear()
 
 
 def ranks_ordered_by_device_id(device_ids_by_rank: Sequence[int]) -> list[int]:
@@ -262,10 +264,7 @@ def _get_device_ordered_pallas_mesh(
             f"Pallas mesh device IDs {device_ids} are not 0..{len(sorted_devices) - 1}"
         )
     devices_grid = np.array(sorted_devices, dtype=object).reshape(mesh_shape)
-    axis_types = getattr(raw_mesh, "_axis_types", None)
-    if axis_types is not None:
-        return jax.sharding.Mesh(devices_grid, axis_names, axis_types=axis_types)
-    return jax.sharding.Mesh(devices_grid, axis_names)
+    return jax.sharding.Mesh(devices_grid, axis_names, axis_types=raw_mesh.axis_types)
 
 
 class TpuSDPAImpl(SDPAImpl):
@@ -371,21 +370,15 @@ class TpuFlashAttentionBackend(SDPABackend):
         return TpuFlashAttentionImpl
 
 
-_NON_RING_FLASH_PREFS = frozenset(
-    {
-        "sdpa",
-        "torch",
-        "torch_sdpa",
-        "tpu_sdpa",
-        "cudnn_attn",
-        "flashinfer_attn",
-        "trtllm_attn",
-        "sage_attn",
-        "sage_attn_3",
-        "flash_attn_hub",
-        "flash_attn_3_hub",
-    }
-)
+_NON_TPU_FLASH_BACKEND_PREFS = frozenset({"sdpa", "tpu_sdpa", "torch_sdpa"})
+
+
+def uses_tpu_flash_diffusion_backend(backend_name: str | None) -> bool:
+    """Whether ``backend_name`` selects the TPU Pallas flash attention path."""
+    return (
+        backend_name is None
+        or str(backend_name).lower() not in _NON_TPU_FLASH_BACKEND_PREFS
+    )
 
 
 @functools.cache
@@ -475,17 +468,6 @@ def tpu_ring_flash_attention(
             else ring_size * uly_size
         )
         outer_size = max(1, world_size // (ring_size * uly_size))
-    if _RUNTIME_RING_CFG_STATE is not None and ring_size > 1:
-        validate_ring_cfg_lanes(
-            cfg_groups=_RUNTIME_RING_CFG_STATE.get("cfg_groups"),
-            ring_groups=_RUNTIME_RING_CFG_STATE.get("ring_groups"),
-            cfg_lane_by_rank=_RUNTIME_RING_CFG_STATE.get("cfg_lane_by_rank"),
-            device_ids_by_rank=_RUNTIME_RING_CFG_STATE.get("device_ids_by_rank"),
-            mesh_device_ids=list(range(outer_size * ring_size * uly_size)),
-            outer_size=outer_size,
-            ring_size=ring_size,
-            uly_size=uly_size,
-        )
     fuse = bool(fuse_ulysses and uly_size > 1)
     op = _ring_ulysses_attention_op(outer_size, ring_size, uly_size, fuse)
     q = query.contiguous().unsqueeze(0).unsqueeze(0).unsqueeze(0)
@@ -506,7 +488,7 @@ def can_run_tpu_ring_attention(
 ) -> bool:
     """Whether a RingParallelAttention call fits the TPU Pallas ring kernel."""
     pref = getattr(ring_runner, "attn_backend_pref", None)
-    if pref is not None and str(pref).lower() in _NON_RING_FLASH_PREFS:
+    if not uses_tpu_flash_diffusion_backend(pref):
         return False
     if (
         causal

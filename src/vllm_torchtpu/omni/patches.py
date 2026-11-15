@@ -648,11 +648,74 @@ def _patch_ltx2_split_rope() -> None:
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
 
 
+_DIFFUSION_INIT_DEVICE_WRAPPED = "_tpu_diffusion_init_device_wrapped"
+
+
+def _patch_diffusion_worker_init_device() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni passes OmniDiffusionConfig (or parallel_config)
+    # to a platform worker-init hook before set_device() and
+    # initialize_model_parallel() in DiffusionWorker.init_device().
+    #
+    # Problem: DiffusionWorker.init_device()
+    # (vllm_omni/diffusion/worker/diffusion_worker.py) calls
+    # current_omni_platform.set_device(self.device) before
+    # init_diffusion_worker_vllm_config(vllm_config) and then calls
+    # initialize_model_parallel(...) directly. OmniTpuPlatform needs
+    # self.od_config.parallel_config.ring_degree before set_device() and
+    # initialize_model_parallel() run so it can install device-ID group
+    # ordering when ring_degree > 1. WorkerProc._create_worker calls
+    # get_diffusion_worker_cls() inside each worker process after
+    # DiffusionWorker is defined and before DiffusionWorker.__init__ calls
+    # init_device().
+    # -------------------------------------------------------------------------
+    import functools
+
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    from vllm_torchtpu.omni.platform import OmniTpuPlatform
+
+    if getattr(DiffusionWorker.init_device, _DIFFUSION_INIT_DEVICE_WRAPPED, False):
+        return
+
+    orig_init_device = DiffusionWorker.init_device
+
+    @functools.wraps(orig_init_device)
+    def _tpu_init_device(self: Any) -> None:
+        parallel_config = getattr(
+            getattr(self, "od_config", None), "parallel_config", None
+        )
+        raw_ring_degree = getattr(parallel_config, "ring_degree", 1)
+        OmniTpuPlatform._diffusion_ring_degree = max(1, int(raw_ring_degree or 1))
+        if OmniTpuPlatform._diffusion_ring_degree > 1:
+            _patch_parallel_state_device_order()
+        orig_init_device(self)
+
+    setattr(_tpu_init_device, _DIFFUSION_INIT_DEVICE_WRAPPED, True)
+    DiffusionWorker.init_device = _tpu_init_device
+    logger.info(
+        "Applied TPU patch: record ring_degree before DiffusionWorker.init_device."
+    )
+
+
 _RING_ATTENTION_PATCHED = "_tpu_ring_attention_patched"
 
 
 def _patch_ring_attention() -> None:
     """Route RingParallelAttention and hybrid Ring+Ulysses to TPU Pallas ring."""
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once vLLM-Omni dispatches RingParallelAttention
+    # and hybrid Ring+Ulysses attention through OmniPlatform (or an out-of-tree
+    # ring attention backend hook) instead of hardcoding CUDA/ROCm
+    # FlashAttention, torch.distributed P2P ring sends, and separate Ulysses
+    # all-to-alls.
+    #
+    # Problem: RingParallelAttention.run_attention
+    # (vllm_omni/diffusion/attention/parallel/ring.py) only implements CUDA/ROCm
+    # ring kernels and torch.distributed P2P sends/recvs (which hang on TPU),
+    # and Attention._forward_impl runs Ulysses all-to-alls outside the ring
+    # runner rather than fusing 2D Ring+Ulysses inside one Pallas op.
+    # -------------------------------------------------------------------------
     from vllm_omni.diffusion.attention.layer import Attention
     from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 
@@ -777,7 +840,6 @@ def _patch_ring_attention() -> None:
 
 _PARALLEL_DEVICE_ORDER_PATCHED = "_tpu_parallel_device_order_patched"
 _CACHED_DEVICE_ID_ORDER: tuple[int, list[int], list[int]] | None = None
-_DEVICE_IDS_BY_RANK_OVERRIDE: list[int] | None = None
 _ACTIVE_INIT_MP_DEVICE_ORDER: bool | None = None
 
 
@@ -788,14 +850,6 @@ def _query_local_tpu_device_id() -> int:
 
 def _resolve_device_ids_by_rank(world_size: int) -> tuple[list[int], list[int]] | None:
     global _CACHED_DEVICE_ID_ORDER
-    from vllm_torchtpu.omni.attention import ranks_ordered_by_device_id
-
-    if _DEVICE_IDS_BY_RANK_OVERRIDE is not None:
-        if len(_DEVICE_IDS_BY_RANK_OVERRIDE) != world_size:
-            return None
-        dev_ids = [int(d) for d in _DEVICE_IDS_BY_RANK_OVERRIDE]
-        return dev_ids, ranks_ordered_by_device_id(dev_ids)
-
     if _CACHED_DEVICE_ID_ORDER is not None and _CACHED_DEVICE_ID_ORDER[0] == world_size:
         return _CACHED_DEVICE_ID_ORDER[1], _CACHED_DEVICE_ID_ORDER[2]
 
@@ -825,6 +879,8 @@ def _resolve_device_ids_by_rank(world_size: int) -> tuple[list[int], list[int]] 
             "(ring_degree > 1) lays out the parallel groups by TPU device ID "
             "and cannot run with rank-ordered groups."
         ) from local_exc
+    from vllm_torchtpu.omni.attention import ranks_ordered_by_device_id
+
     dev_ids = [int(x) for x in gathered if x is not None]
     try:
         ranks_by_dev = ranks_ordered_by_device_id(dev_ids)
@@ -864,6 +920,17 @@ def _validate_ascending_c10d_groups(layout: dict[str, Any]) -> None:
 
 def _patch_parallel_state_device_order() -> None:
     """Lay out vLLM-Omni parallel groups by PJRT device ID on TPU."""
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once vLLM-Omni supports device-topology-aware
+    # parallel group assignment or torch_tpu orders single-host worker ranks by
+    # ascending PJRT device ID.
+    #
+    # Problem: vLLM-Omni's RankGenerator and SequenceParallelGroupCoordinator
+    # (vllm_omni/diffusion/distributed/) assign CFG, Ring, and Ulysses groups
+    # by global PyTorch rank 0..N-1, whereas single-host TPU workers bind chips
+    # whose PJRT device IDs are not ordered 0..N-1 by rank, splitting intra-chip
+    # Ulysses pairs or mixing CFG lanes along a device-ordered JAX ring mesh.
+    # -------------------------------------------------------------------------
     from vllm_omni.diffusion.distributed import group_coordinator, parallel_state
 
     if not getattr(
@@ -911,9 +978,7 @@ def _patch_parallel_state_device_order() -> None:
             backend: str | None = None,
         ) -> None:
             global _ACTIVE_INIT_MP_DEVICE_ORDER
-            use_device_order = (ring_degree > 1) or (
-                _DEVICE_IDS_BY_RANK_OVERRIDE is not None
-            )
+            use_device_order = ring_degree > 1
             if not use_device_order:
                 prev_active = _ACTIVE_INIT_MP_DEVICE_ORDER
                 _ACTIVE_INIT_MP_DEVICE_ORDER = False
@@ -944,11 +1009,7 @@ def _patch_parallel_state_device_order() -> None:
                 world_size = (
                     torch.distributed.get_world_size()
                     if torch.distributed.is_initialized()
-                    else (
-                        len(_DEVICE_IDS_BY_RANK_OVERRIDE)
-                        if _DEVICE_IDS_BY_RANK_OVERRIDE is not None
-                        else 1
-                    )
+                    else 1
                 )
                 resolved = _resolve_device_ids_by_rank(world_size)
                 if resolved is not None:
@@ -1147,7 +1208,7 @@ def _patch_parallel_state_device_order() -> None:
             uly_w = int(getattr(self, "ulysses_world_size", 1))
             ring_w = int(getattr(self, "ring_world_size", 1))
             ag_w = int(getattr(self, "allgather_world_size", 1))
-            if ring_w <= 1 and _DEVICE_IDS_BY_RANK_OVERRIDE is None:
+            if ring_w <= 1:
                 return
             if (
                 len(ranks) > 1

@@ -49,6 +49,7 @@ collectives around it.
 
 import functools
 import math
+from collections.abc import Callable
 from typing import Any
 
 import jax
@@ -413,10 +414,16 @@ def _splash_attention_forward(
         column_heads: ``(num_heads, num_kv_heads)`` when q/k/v are
             ``(seq, heads * dim)`` instead: each head is a lane-aligned
             column block, DMA'd in place with no transposes.
+        emit_residuals: when True, skip final normalization and return the
+            unnormalized output with its log2 softmax residuals in f32.
 
     Returns:
-        The normalized output ``(num_heads, head_dim_v, seq_q)`` in
-        ``q.dtype``.
+        When ``emit_residuals`` is False, the normalized output
+        ``(num_heads, head_dim_v, seq_q)`` in ``q.dtype``. When True, a tuple
+        ``(o_unnorm, m, l)`` of ``float32`` arrays with shapes
+        ``(num_heads, head_dim_v, seq_q)``, ``(num_heads, NUM_SUBLANES, seq_q)``,
+        and ``(num_heads, NUM_SUBLANES, seq_q)``, where ``m`` is the log2-scaled
+        row max and ``l`` is the ``exp2(scores_log2 - m)`` row sum.
     """
     if column_heads is None:
         num_q_heads, padded_q_seq_len, head_dim_qk = q.shape
@@ -700,7 +707,17 @@ def residual_flash_attention_bhsd(
     *,
     scale: float | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Device-local unnormalized splash attention returning (o_unnorm, m, l)."""
+    """Device-local unnormalized splash attention over ``(B, H, S, D)`` inputs.
+
+    Scores are scaled by ``scale * log2(e)`` and accumulated in base-2
+    exponentials (``p_unnorm = exp2(scores_log2 - m)``).
+
+    Returns:
+        Tuple ``(o_unnorm, m, l)`` of ``float32`` arrays:
+        - ``o_unnorm``: ``(B, H, S_q, D_v)`` unnormalized attention output.
+        - ``m``: ``(B, H, S_q, 1)`` row-wise max of log2-scaled scores.
+        - ``l``: ``(B, H, S_q, 1)`` row-wise sum of ``exp2(scores_log2 - m)``.
+    """
     _, _, q_orig_len, head_dim = query.shape
     _, _, kv_orig_len, _ = value.shape
     spec = detect_spec()
@@ -792,9 +809,15 @@ def ring_flash_attention_bhsd(
     *,
     ring_axis: str = "ring",
     scale: float | None = None,
-    residual_fn: Any = residual_flash_attention_bhsd,
+    residual_fn: Callable[..., tuple[jax.Array, jax.Array, jax.Array]] = (
+        residual_flash_attention_bhsd
+    ),
 ) -> jax.Array:
-    """Ring attention over (B, H, S_local, D) with ppermute K/V rotation."""
+    """Ring attention over (B, H, S_local, D) with ppermute K/V rotation.
+
+    Tests inject a CPU reference through ``residual_fn`` in place of the TPU
+    Pallas kernel.
+    """
     ring_size = lax.axis_size(ring_axis)
     b, h, s_q, _ = q.shape
     d_v = v.shape[-1]
@@ -807,22 +830,26 @@ def ring_flash_attention_bhsd(
     o_init = jnp.zeros((b, h, s_q, d_v), dtype=jnp.float32)
     lse_init = jnp.full((b, h, s_q, 1), RING_LSE_INIT, dtype=jnp.float32)
 
-    def scan_body(carry, _):
-        o_acc, lse_acc, k_cur, v_cur = carry
+    def compute_and_merge(o_acc, lse_acc, k_cur, v_cur):
         o_un, m_part, l_part = residual_fn(q, k_cur, v_cur, scale=scale)
         o_part, lse_part = partial_to_lse(o_un, m_part, l_part)
-        o_acc, lse_acc = merge_partials(o_acc, lse_acc, o_part, lse_part)
+        return merge_partials(o_acc, lse_acc, o_part, lse_part)
+
+    def scan_body(carry, _):
+        o_acc, lse_acc, k_cur, v_cur = carry
+        o_acc, lse_acc = compute_and_merge(o_acc, lse_acc, k_cur, v_cur)
         k_next = lax.ppermute(k_cur, axis_name=ring_axis, perm=perm)
         v_next = lax.ppermute(v_cur, axis_name=ring_axis, perm=perm)
         return (o_acc, lse_acc, k_next, v_next), None
 
-    (o_final, _, _, _), _ = lax.scan(
+    (o_acc, lse_acc, k_last, v_last), _ = lax.scan(
         scan_body,
         (o_init, lse_init, k, v),
         None,
-        length=ring_size,
+        length=ring_size - 1,
         unroll=True,
     )
+    o_final, _ = compute_and_merge(o_acc, lse_acc, k_last, v_last)
     return o_final.astype(q.dtype)
 
 
@@ -834,9 +861,15 @@ def ring_ulysses_flash_attention_bshd(
     ring_axis: str = "ring",
     uly_axis: str | None = "uly",
     scale: float | None = None,
-    residual_fn: Any = residual_flash_attention_bhsd,
+    residual_fn: Callable[..., tuple[jax.Array, jax.Array, jax.Array]] = (
+        residual_flash_attention_bhsd
+    ),
 ) -> jax.Array:
-    """2D Ring-Ulysses attention over (B, S_local, H, D) inside shard_map."""
+    """2D Ring-Ulysses attention over (B, S_local, H, D) inside shard_map.
+
+    Tests inject a CPU reference through ``residual_fn`` in place of the TPU
+    Pallas kernel.
+    """
     use_uly = uly_axis is not None and lax.axis_size(uly_axis) > 1
     if use_uly:
         assert uly_axis is not None

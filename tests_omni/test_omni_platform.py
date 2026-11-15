@@ -116,6 +116,10 @@ def test_platform_attributes():
         platform.get_diffusion_attn_backend_cls(None, 64)
         == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
     )
+    assert (
+        platform.get_diffusion_attn_backend_cls("FLASH_ATTN_3_HUB", 64)
+        == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
+    )
     for name in ("SDPA", "TPU_SDPA", "torch_sdpa"):
         assert (
             platform.get_diffusion_attn_backend_cls(name, 64)
@@ -1559,7 +1563,15 @@ def test_device_id_rank_layout_c2r2u2_and_c2r4u1(
 
     # Verify patched RankGenerator.get_ranks applies the device-ID permutation.
     omni_patches._patch_parallel_state_device_order()
-    monkeypatch.setattr(omni_patches, "_DEVICE_IDS_BY_RANK_OVERRIDE", device_ids)
+    monkeypatch.setattr(
+        omni_patches,
+        "_resolve_device_ids_by_rank",
+        lambda ws: (
+            (device_ids, ranks_ordered_by_device_id(device_ids))
+            if ws == len(device_ids)
+            else None
+        ),
+    )
     rg = parallel_state.RankGenerator(1, 4, 1, 2, 1, order="tp-sp-pp-cfg-dp")
     assert rg.get_ranks("sp") == [[0, 1, 6, 7], [2, 3, 4, 5]]
     assert rg.get_ranks("cfg") == [[0, 2], [1, 3], [6, 4], [7, 5]]
@@ -1676,6 +1688,20 @@ def test_same_cfg_lane_check_raises():
         )
 
     # 3. tpu_ring_flash_attention enforces the active runtime validation state.
+    import jax.sharding
+    import numpy as np
+    from torch_tpu._internal.pallas.pallas import _PallasDevice
+
+    raw_mesh = jax.sharding.Mesh(
+        np.array(
+            [
+                _PallasDevice(id=dev_id, process_index=r, device_kind="TPU7x")
+                for r, dev_id in enumerate(device_ids)
+            ],
+            dtype=object,
+        ).reshape(2, 2, 2),
+        ("batch", "ring", "uly"),
+    )
     set_ring_cfg_validation_state(
         {
             "cfg_groups": unpatched_cfg,
@@ -1686,7 +1712,13 @@ def test_same_cfg_lane_check_raises():
     )
     try:
         q = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
-        with pytest.raises(RingCfgLaneMismatchError, match="CFG lane"):
+        with (
+            patch(
+                "vllm_torchtpu.omni.attention.pallas.get_pallas_mesh",
+                return_value=raw_mesh,
+            ),
+            pytest.raises(RingCfgLaneMismatchError, match="CFG lane"),
+        ):
             tpu_ring_flash_attention(
                 q, q, q, 0.25, ring_size=2, uly_size=2, outer_size=2, fuse_ulysses=True
             )
@@ -1705,7 +1737,6 @@ def test_resolve_device_ids_by_rank_raises_on_failed_query(
     import vllm_torchtpu.omni.patches as omni_patches
 
     omni_patches._patch_parallel_state_device_order()
-    monkeypatch.setattr(omni_patches, "_DEVICE_IDS_BY_RANK_OVERRIDE", None)
     monkeypatch.setattr(omni_patches, "_CACHED_DEVICE_ID_ORDER", None)
     monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
     fake_world_group = SimpleNamespace(cpu_group="fake_cpu_pg")
@@ -1802,7 +1833,6 @@ def _restore_parallel_state_device_order():
     orig_gather = group_coordinator.GroupCoordinator.gather
     orig_sp_init = group_coordinator.SequenceParallelGroupCoordinator.__init__
     orig_cached = omni_patches._CACHED_DEVICE_ID_ORDER
-    orig_override = omni_patches._DEVICE_IDS_BY_RANK_OVERRIDE
     orig_active = omni_patches._ACTIVE_INIT_MP_DEVICE_ORDER
     orig_cfg_state = get_ring_cfg_validation_state()
     try:
@@ -1816,7 +1846,6 @@ def _restore_parallel_state_device_order():
         group_coordinator.GroupCoordinator.gather = orig_gather
         group_coordinator.SequenceParallelGroupCoordinator.__init__ = orig_sp_init
         omni_patches._CACHED_DEVICE_ID_ORDER = orig_cached
-        omni_patches._DEVICE_IDS_BY_RANK_OVERRIDE = orig_override
         omni_patches._ACTIVE_INIT_MP_DEVICE_ORDER = orig_active
         set_ring_cfg_validation_state(orig_cfg_state)
 
@@ -1949,8 +1978,6 @@ def test_init_device_ring_degree_one_leaves_parallel_state_unpatched(
     parallel_state, group_coordinator = _restore_parallel_state_device_order
     marker = omni_patches._PARALLEL_DEVICE_ORDER_PATCHED
 
-    assert omni_patches._DEVICE_IDS_BY_RANK_OVERRIDE is None
-
     orig_calls: list[int] = []
     diffusion_worker_cls.init_device = lambda self: orig_calls.append(
         OmniTpuPlatform._diffusion_ring_degree
@@ -1962,7 +1989,6 @@ def test_init_device_ring_degree_one_leaves_parallel_state_unpatched(
     )
     diffusion_worker_cls.init_device(fake_worker_ring1)
     assert orig_calls == [1]
-    assert omni_patches._DEVICE_IDS_BY_RANK_OVERRIDE is None
 
     for fn in (
         parallel_state.RankGenerator.get_ranks,
@@ -2026,7 +2052,6 @@ def test_init_device_ring_degree_one_leaves_parallel_state_unpatched(
         [0, 1, 4, 5, 6, 7, 2, 3],
         [0, 1, 6, 7, 2, 3, 4, 5],
     )
-    assert omni_patches._DEVICE_IDS_BY_RANK_OVERRIDE is None
 
     parallel_state.initialize_model_parallel(
         cfg_parallel_size=2, ulysses_degree=4, ring_degree=1
@@ -2043,7 +2068,10 @@ def test_sp_init_ring_degree_two_uses_device_ordered_sp_group(
     _restore_parallel_state_device_order,
 ):
     import vllm_torchtpu.omni.patches as omni_patches
-    from vllm_torchtpu.omni.attention import compute_device_id_group_layout
+    from vllm_torchtpu.omni.attention import (
+        compute_device_id_group_layout,
+        ranks_ordered_by_device_id,
+    )
 
     parallel_state, group_coordinator = _restore_parallel_state_device_order
     device_ids = [0, 1, 4, 5, 6, 7, 2, 3]
@@ -2100,7 +2128,13 @@ def test_sp_init_ring_degree_two_uses_device_ordered_sp_group(
     parallel_state._initialize_model_parallel = _fake_orig_init_mp
     group_coordinator.SequenceParallelGroupCoordinator.__init__ = _fake_orig_sp_init
     omni_patches._patch_parallel_state_device_order()
-    monkeypatch.setattr(omni_patches, "_DEVICE_IDS_BY_RANK_OVERRIDE", device_ids)
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda: len(device_ids))
+    monkeypatch.setattr(
+        omni_patches,
+        "_resolve_device_ids_by_rank",
+        lambda ws: (device_ids, ranks_ordered_by_device_id(device_ids)),
+    )
 
     parallel_state.initialize_model_parallel(
         cfg_parallel_size=2, ring_degree=2, ulysses_degree=2
@@ -2196,15 +2230,22 @@ def test_non_ascending_group_raises_early_and_valid_host_layouts_pass(
     _restore_parallel_state_device_order,
 ):
     import vllm_torchtpu.omni.patches as omni_patches
+    from vllm_torchtpu.omni.attention import ranks_ordered_by_device_id
 
     parallel_state, _ = _restore_parallel_state_device_order
     orig_calls: list[dict[str, object]] = []
     parallel_state._initialize_model_parallel = lambda **kw: orig_calls.append(kw)
     omni_patches._patch_parallel_state_device_order()
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda: 8)
 
     # 1. Non-ascending ulysses group [1, 0] raises before orig_init_mp.
     bad_dev_ids = [1, 0, 4, 5, 6, 7, 2, 3]
-    monkeypatch.setattr(omni_patches, "_DEVICE_IDS_BY_RANK_OVERRIDE", bad_dev_ids)
+    monkeypatch.setattr(
+        omni_patches,
+        "_resolve_device_ids_by_rank",
+        lambda ws: (bad_dev_ids, ranks_ordered_by_device_id(bad_dev_ids)),
+    )
     with pytest.raises(RuntimeError) as exc_info:
         parallel_state.initialize_model_parallel(
             cfg_parallel_size=2, ring_degree=2, ulysses_degree=2
@@ -2228,7 +2269,11 @@ def test_non_ascending_group_raises_early_and_valid_host_layouts_pass(
     assert orig_calls == []
 
     host_dev_ids = [0, 1, 4, 5, 6, 7, 2, 3]
-    monkeypatch.setattr(omni_patches, "_DEVICE_IDS_BY_RANK_OVERRIDE", host_dev_ids)
+    monkeypatch.setattr(
+        omni_patches,
+        "_resolve_device_ids_by_rank",
+        lambda ws: (host_dev_ids, ranks_ordered_by_device_id(host_dev_ids)),
+    )
     with pytest.raises(RuntimeError) as pp_exc:
         parallel_state.initialize_model_parallel(
             cfg_parallel_size=1,
