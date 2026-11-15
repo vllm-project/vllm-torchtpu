@@ -119,7 +119,12 @@ def _wrap(cls, attr: str, name=None) -> None:
 
 def _stack_spans() -> set[str]:
     """Spans that get stack dumps (VLLM_TPU_STARTUP_STACKS_SPANS, comma-separated;
-    default the weight load)."""
+    default the weight load).
+
+    faulthandler reads other threads' state without locks: sampling every 20 s
+    through the compile phase killed a prefill worker mid-lowering
+    (j-969ef035-4526-43b5-8166, VllmWorker-1 died with no exit code), so keep it to
+    short diagnostic runs and prefer the weight load, where it ran safely."""
     return set(
         os.environ.get("VLLM_TPU_STARTUP_STACKS_SPANS", "loader.load_weights").split(",")
     )
