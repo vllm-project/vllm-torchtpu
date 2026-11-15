@@ -260,6 +260,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # with the venv prefix or mount path. get_libtpu_cache_key() already
     # identifies the loaded build without its path.
     "TPU_LIBRARY_PATH",
+    # Standalone ViT torch.compile(backend="tpu") only; never alters LLM
+    # backbone graphs compiled by TpuCompilerAdaptor.
+    "VLLM_TPU_QWEN3_VL_COMPILE_VIT",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (

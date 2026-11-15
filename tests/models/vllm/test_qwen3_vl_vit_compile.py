@@ -46,9 +46,12 @@ class TestQwen3VLVitCompilePatch:
     def test_disabled_by_default_without_env_flag(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from vllm_torchtpu.compilation.tpu_compiler import _TPU_COMPILE_ENV_IGNORED
+
         self._stub_hf_patches(monkeypatch)
         monkeypatch.delenv("VLLM_TPU_QWEN3_VL_COMPILE_VIT", raising=False)
         assert envs.VLLM_TPU_QWEN3_VL_COMPILE_VIT is False
+        assert "VLLM_TPU_QWEN3_VL_COMPILE_VIT" in _TPU_COMPILE_ENV_IGNORED
 
         called = False
 
@@ -65,7 +68,8 @@ class TestQwen3VLVitCompilePatch:
             model="Qwen/Qwen3-VL-4B-Instruct",
             enforce_eager=False,
         )
-        maybe_patch_qwen3_vl(cfg)  # pyrefly: ignore[bad-argument-type]
+        # pyrefly: ignore[bad-argument-type]
+        maybe_patch_qwen3_vl(cfg)
         assert not called
 
     def test_enabled_calls_vit_compile_patch(
@@ -88,7 +92,8 @@ class TestQwen3VLVitCompilePatch:
             model="Qwen/Qwen3-VL-4B-Instruct",
             enforce_eager=False,
         )
-        maybe_patch_qwen3_vl(cfg)  # pyrefly: ignore[bad-argument-type]
+        # pyrefly: ignore[bad-argument-type]
+        maybe_patch_qwen3_vl(cfg)
         assert called
 
     def test_enforce_eager_skips_vit_compile(
@@ -111,7 +116,8 @@ class TestQwen3VLVitCompilePatch:
             model="Qwen/Qwen3-VL-4B-Instruct",
             enforce_eager=True,
         )
-        maybe_patch_qwen3_vl(cfg)  # pyrefly: ignore[bad-argument-type]
+        # pyrefly: ignore[bad-argument-type]
+        maybe_patch_qwen3_vl(cfg)
         assert not called
 
     @pytest.mark.tpu_test
@@ -197,10 +203,12 @@ class TestQwen3VLVitCompilePatch:
                 # 1) Default metadata path with multi-image cu_seqlens.
                 out_compiled = Qwen3_VisionTransformer.forward(vit, x, grid)
                 assert vit in _COMPILED_VIT_FNS
-                # 2) Pre-computed encoder_metadata + tensor grid_thw path.
+                # 2) Pre-computed encoder_metadata (with CPU sequence_lengths)
+                # passed positionally.
                 meta = vit.prepare_encoder_metadata(grid)
+                meta["sequence_lengths"] = torch.tensor([256, 256], dtype=torch.int32)
                 out_precomp = Qwen3_VisionTransformer.forward(
-                    vit, x, torch.tensor(grid), encoder_metadata=meta
+                    vit, x, torch.tensor(grid), meta
                 )
                 # 3) Outer torch.compile(fullgraph=True) skips inner compile.
                 fresh_vit = _DummyViT(tpu)
@@ -221,8 +229,8 @@ class TestQwen3VLVitCompilePatch:
                     cu_seqlens=meta["cu_seqlens"].to(tpu),
                     rotary_pos_emb_cos=meta["rotary_pos_emb_cos"],
                     rotary_pos_emb_sin=meta["rotary_pos_emb_sin"],
-                    max_seqlen=meta["max_seqlen"],
-                    sequence_lengths=None,
+                    max_seqlen=meta["max_seqlen"].to(tpu),
+                    sequence_lengths=meta["sequence_lengths"].to(tpu),
                 )
                 out_ref = torch.cat(
                     [vit.merger(h0), vit.deepstack_merger_list[0](h0)], dim=1

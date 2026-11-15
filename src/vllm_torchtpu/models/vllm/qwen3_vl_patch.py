@@ -458,9 +458,11 @@ def _run_qwen3_vit_blocks_and_merger(
 
 
 _COMPILED_VIT_FNS: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
+_COMPILED_VIT_LOCK = threading.RLock()
 
 
 def _patch_qwen3_vl_vllm_vit_compile() -> None:
+    """Patch Qwen3_VisionTransformer.forward to move cu_seqlens to TPU and compile."""
     # -------------------------------------------------------------------------
     # TODO: Remove once upstream vLLM's Qwen3_VisionTransformer supports
     # @support_torch_compile(is_encoder=True) natively on TPU with bucketed
@@ -493,7 +495,6 @@ def _patch_qwen3_vl_vllm_vit_compile() -> None:
         self: Any,
         x: torch.Tensor,
         grid_thw: torch.Tensor | list[list[int]],
-        *,
         encoder_metadata: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         if self.device.type != "tpu":
@@ -518,6 +519,9 @@ def _patch_qwen3_vl_vllm_vit_compile() -> None:
         cu_seqlens = metadata["cu_seqlens"].to(dev)
         cos = metadata["rotary_pos_emb_cos"].to(dev)
         sin = metadata["rotary_pos_emb_sin"].to(dev)
+        max_seqlen = metadata["max_seqlen"]
+        if isinstance(max_seqlen, torch.Tensor) and max_seqlen.device != dev:
+            max_seqlen = max_seqlen.to(dev)
         seq_lens: torch.Tensor | None = metadata.get("sequence_lengths")
         if seq_lens is not None and seq_lens.device != dev:
             seq_lens = seq_lens.to(dev)
@@ -529,28 +533,31 @@ def _patch_qwen3_vl_vllm_vit_compile() -> None:
                 cu_seqlens,
                 cos,
                 sin,
-                metadata["max_seqlen"],
+                max_seqlen,
                 seq_lens,
             )
 
-        compiled_fn = _COMPILED_VIT_FNS.get(self)
-        if compiled_fn is None:
-            compiled_fn = torch.compile(
-                functools.partial(_run_qwen3_vit_blocks_and_merger, self),
-                backend="tpu",
-                dynamic=False,
-            )
-            _COMPILED_VIT_FNS[self] = compiled_fn
+        with _COMPILED_VIT_LOCK:
+            compiled_fn = _COMPILED_VIT_FNS.get(self)
+            if compiled_fn is None:
+                compiled_fn = torch.compile(
+                    _run_qwen3_vit_blocks_and_merger,
+                    backend="tpu",
+                    dynamic=False,
+                )
+                _COMPILED_VIT_FNS[self] = compiled_fn
 
         return compiled_fn(
+            self,
             hidden_states,
             cu_seqlens,
             cos,
             sin,
-            metadata["max_seqlen"],
+            max_seqlen,
             seq_lens,
         )
 
     patched_forward._tpu_vit_compile_patch = True  # pyrefly: ignore[missing-attribute]
-    Qwen3_VisionTransformer.forward = patched_forward  # type: ignore[method-assign]
+    # pyrefly: ignore[bad-assignment]
+    Qwen3_VisionTransformer.forward = patched_forward
     logger.info("Applied TPU patch: compiled Qwen3_VisionTransformer blocks+merger.")
