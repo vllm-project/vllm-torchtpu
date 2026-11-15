@@ -4849,7 +4849,8 @@ def mla_dcp_shards(
     for name in ("query_up", "key_value_up", "output_gate"):
         start_copy(name)
     dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, rows, skip=_config().dcp_skip, heads=3 * shards,
-                                         sequence_rows=sequence_rows)
+                                         sequence_rows=sequence_rows,
+                                         chunk_rows=_verify_dcp_layout(rows, 3 * shards, sequence_rows).get("chunk_rows"))
     dcp_attention.prime()
     scope = _phase_start("q6_mla_projections")
     if "query_down" in streams:
@@ -6119,6 +6120,17 @@ def _vmem_budget(persistent, regions, *, limit=None, spill_reserve=None):
     return "\n".join(lines), peak
 
 
+def _verify_dcp_layout(rows, heads, sequence_rows):
+    """DCP chunking for attention-DP verifies: one sequence (4 rows) per chunk
+    and 3 ring slots, so a chunk's combine lands while the next two attend.
+    The default is 4-row chunks with 2 slots at 64 group rows (each chunk
+    waits on the previous combine) and 8-row chunks with 3 slots at 16/32/48.
+    Empty: the default layout."""
+    if sequence_rows == 4 and heads == 6 and rows >= 16 and rows % 4 == 0:
+        return {"chunk_rows": 4, "ring": 3}
+    return {}
+
+
 def _mla_scoped_scratch(
     local_weights,
     *,
@@ -6154,6 +6166,7 @@ def _mla_scoped_scratch(
         # reads the span and the buffers from the shape).
         *mla_dcp.scoped_scratch(batch_size, heads=dcp_heads,
                                 cache_dtype=dcp_dtype, page_tokens=dcp_page_tokens, sequence_rows=sequence_rows,
+                                chunk_rows=_verify_dcp_layout(batch_size, dcp_heads, sequence_rows).get("chunk_rows"),
                                 **mla_dcp.page_plan(batch_size, dcp_heads, sequence_rows, dcp_dtype)),
     )
 
@@ -8930,7 +8943,8 @@ def stack(
         ),
         # DCP: buffers group peers' remote copies land in.
         *mla_dcp.persistent_scratch(group_rows, heads=3 * attention_dp,
-                                    cache_dtype=states[2].dtype, sequence_rows=sequence_rows),
+                                    cache_dtype=states[2].dtype, sequence_rows=sequence_rows,
+                                    **_verify_dcp_layout(group_rows, 3 * attention_dp, sequence_rows)),
         *communication_scratch(batch_size, attention_dp)[:-1],
         tpu.VMEM((batch_size, 4096), jnp.bfloat16),
         *projection_staging_scratch(batch_size, attention_dp),
