@@ -15,11 +15,12 @@
 
 vLLM's MoERunner computes the shared expert with its own linears and adds it to
 the routed output before the all-reduce. With ``TPU_MOE_DENSE_FP4_SHARED=1``
-an eligible layer (NVFP4 experts on the EP GMM path, a SwiGLU-OAI shared expert
-on per-channel e4m3 MiniMax-M3 linears) passes the shared expert's tensors to
-the routed op instead: the dense fp4 decode kernel evaluates it in the same
-call, overlapping its weight DMA with the routed experts', and at other token
-counts the op computes it with XLA (``fused_moe_gmm.shared_expert_mlp``). The
+an eligible layer (NVFP4 experts on the GMM path, EP or TP-sliced, a
+SwiGLU-OAI shared expert on per-channel e4m3 MiniMax-M3 linears) passes the
+shared expert's tensors to the routed op instead: the dense fp4 decode kernel
+evaluates it in the same call, overlapping its weight DMA with the routed
+experts', and at other token counts the op computes it with XLA
+(``fused_moe_gmm.shared_expert_mlp``). The
 runner is told it has no shared expert, so the all-reduce of the sum is
 unchanged.
 
@@ -104,7 +105,6 @@ def _admit(runner) -> tuple[torch.Tensor, ...] | None:
         or qm._use_adaptive_fused_moe
         or fused_moe_ep_supported(qm)
         or enable_pipelined_collective_and_compute()
-        or getattr(runner.routed_experts, "_experts_start", None) is None
         or getattr(cfg, "is_sequence_parallel", False)
         or runner.routed_scaling_factor != 1.0
         or runner.routed_input_transform is not None
@@ -128,11 +128,12 @@ def arm_dense_fp4_shared(model: torch.nn.Module, what: str = "model") -> int:
         if shared is None:
             continue
         layer = runner.routed_experts
-        # A traced forward cannot build the op.
+        # A traced forward cannot build the op. TP-sliced experts (no EP) hold
+        # every expert's slice; the op then runs its non-EP routing.
         prebuild_fused_moe_kernel(
             topk=runner.moe_config.experts_per_token,
             activation=runner._quant_method._tpu_activation_str,
-            use_ep=True,
+            use_ep=getattr(layer, "_experts_start", None) is not None,
             with_shared=True,
         )
         for name, tensor in zip(_SHARED_BUFFERS, shared):

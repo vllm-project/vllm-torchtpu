@@ -113,7 +113,8 @@ def test_no_shared_expert_is_refused():
     assert bridge._shared_tensors(_Runner(None)) is None
 
 
-def test_arming_moves_the_shared_expert_into_the_routed_op(monkeypatch):
+@pytest.mark.parametrize("use_ep", [True, False])
+def test_arming_moves_the_shared_expert_into_the_routed_op(monkeypatch, use_ep):
     from vllm_torchtpu.layers.adapter import fused_moe
 
     built = []
@@ -121,6 +122,8 @@ def test_arming_moves_the_shared_expert_into_the_routed_op(monkeypatch):
         fused_moe, "prebuild_fused_moe_kernel", lambda **kw: built.append(kw)
     )
     armed, refused = _Runner(_mlp()), _Runner(_mlp())
+    # EP layers carry their first expert id; TP-sliced (non-EP) layers do not.
+    armed.routed_experts._experts_start = torch.tensor(0) if use_ep else None
     model = nn.ModuleList([armed, refused])
     monkeypatch.setattr(
         bridge, "_admit", lambda r: bridge._shared_tensors(r) if r is armed else None
@@ -131,7 +134,7 @@ def test_arming_moves_the_shared_expert_into_the_routed_op(monkeypatch):
     assert operands is not None and len(operands) == 4
     assert armed._shared_experts is None and armed._forward_entry == "routed"
     assert built == [
-        dict(topk=4, activation="swigluoai", use_ep=True, with_shared=True)
+        dict(topk=4, activation="swigluoai", use_ep=use_ep, with_shared=True)
     ]
     assert refused._forward_entry == "shared"
     assert bridge.shared_operands(refused.routed_experts) is None
