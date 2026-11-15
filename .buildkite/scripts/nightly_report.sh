@@ -31,9 +31,6 @@ meta() {
   buildkite-agent meta-data get "$1" --default "$2"
 }
 
-# The key prefix bootstrap.py stamps on v7x's steps (TPU_V7X.key_prefix).
-V7X_KEY_PREFIX="tpu7x_"
-
 # The keys of file $1's steps a nightly runs: every key but the (PR) steps'
 # `_pr` ones.
 nightly_keys_in() {
@@ -44,10 +41,12 @@ nightly_keys_in() {
 
 # The keys of every CPU and tests-lane step a nightly runs. pipeline_tests.yml
 # names no generation in its keys: bootstrap.py puts each generation's prefix
-# before them, and these are v7x's.
+# before them, and TPU_VERIFIED_KEY_PREFIX is the one of the generation a
+# verified pair needs passed (v7x), which bootstrap.py sets in this step's env.
 nightly_tests_lane_keys() {
   nightly_keys_in ".buildkite/pipeline_cpu.yml"
-  nightly_keys_in ".buildkite/pipeline_tests.yml" | sed "s/^/${V7X_KEY_PREFIX}/"
+  nightly_keys_in ".buildkite/pipeline_tests.yml" \
+    | sed "s/^/${TPU_VERIFIED_KEY_PREFIX}/"
 }
 
 # Every step nightly_tests_lane_keys names passed. Another generation's steps
@@ -73,6 +72,11 @@ tests_lane_passed() {
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   return 0
 fi
+
+# Checked here and not where it is read: tests_lane_passed reads the keys
+# through a process substitution, where a failure would only shorten the list
+# of steps that must have passed.
+: "${TPU_VERIFIED_KEY_PREFIX:?bootstrap.py sets it when it uploads pipeline_verify.yml}"
 
 if [[ "$(meta stop_support_matrix false)" == "true" ]]; then
   echo "--- 🛑 Uploading the models and features failed: no support matrices"

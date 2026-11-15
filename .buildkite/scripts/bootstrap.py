@@ -407,9 +407,6 @@ class TpuGeneration:
         }
 
 
-# pipeline_verify.yml's nightly report waits on v7x's tests-lane steps by key
-# and nightly_report.sh reads their outcomes, so both name v7x's key prefix;
-# test_bootstrap.py holds them to this one.
 TPU_V7X = TpuGeneration(
     name="v7x",
     shape_single="tpu7x-standard-1t/1x1x1",
@@ -435,6 +432,10 @@ TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {
 }
 # The generations those files go up for when CI_TPU_GENERATIONS is unset.
 DEFAULT_TPU_GENERATIONS: tuple[TpuGeneration, ...] = (TPU_V7X,)
+# The generation whose nightly tests-lane steps a verified commit pair needs
+# passed. pipeline_verify.yml's nightly report and nightly_report.sh name those
+# steps by key, and take the key prefix from upload_envs.
+VERIFIED_TPU_GENERATION = TPU_V7X
 # CI_TPU_GENERATIONS=all sends those files up for every generation they list,
 # side by side, on any build. A manual build may instead name one generation,
 # as its steps' labels do (v6e, v7x), to run it alone: auditing v6e then holds
@@ -1155,15 +1156,21 @@ def upload_envs(path: str, ci_tpu_generations: str = "") -> tuple[dict[str, str]
     DEFAULT_TPU_GENERATIONS, with that generation's variables; with
     CI_TPU_GENERATIONS_ALL, once per generation it lists; and with a key of
     TPU_GENERATIONS, for that generation alone; an unknown `ci_tpu_generations`
-    is refused. Any other file goes up once, whatever `ci_tpu_generations` is.
-    When that names one generation the file takes its TPU_KEY_PREFIX, so a
-    step there that waits on per-generation steps (the nightly report, on the
-    tests lane's) names the ones this build has; otherwise it takes nothing,
-    and such a step names v7x's.
+    is refused. Any other file goes up once, whatever `ci_tpu_generations` is,
+    with the two key prefixes a step there needs to name per-generation steps
+    (the nightly report, the tests lane's): TPU_VERIFIED_KEY_PREFIX,
+    VERIFIED_TPU_GENERATION's, for the steps a verified pair needs passed, and
+    TPU_KEY_PREFIX for the steps to wait on, which are the same ones unless
+    `ci_tpu_generations` names one generation and the build has only its.
     """
     single = TPU_GENERATIONS.get(ci_tpu_generations)
     if path not in TPU_GENERATION_FILES:
-        return ({},) if single is None else ({"TPU_KEY_PREFIX": single.key_prefix},)
+        return (
+            {
+                "TPU_KEY_PREFIX": (single or VERIFIED_TPU_GENERATION).key_prefix,
+                "TPU_VERIFIED_KEY_PREFIX": VERIFIED_TPU_GENERATION.key_prefix,
+            },
+        )
     _check_ci_tpu_generations(ci_tpu_generations)
     generations = TPU_GENERATION_FILES[path]
     if single is not None:
