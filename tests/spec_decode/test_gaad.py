@@ -29,6 +29,7 @@ from vllm_torchtpu.spec_decode.gaad import (
     FSMBridge,
     JumpStats,
     topup_running_requests,
+    topup_scheduled_spec_decode_tokens,
     validate_draft_row_invariant,
 )
 
@@ -200,3 +201,38 @@ def test_structured_decoding_manager_skips_grammar_slots():
     )
     assert req_t2 is not None
     assert req_t2[:3].squeeze(-1).tolist() == [False, True, False]
+
+
+def test_topup_scheduled_spec_decode_tokens_updates_num_invalid():
+    grammar = _FakeGrammar('","b":"', {31, 32})
+    tokenizer = _FakeTokenizer({'","b":"': [31, 32]})
+    req = SimpleNamespace(
+        request_id="r1",
+        structured_output_request=SimpleNamespace(grammar=grammar),
+        max_tokens=64,
+        output_token_ids=[1, 2],
+    )
+    sched = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        structured_output_manager=SimpleNamespace(tokenizer=tokenizer),
+        requests={"r1": req},
+    )
+    # Simulate upstream update_draft_token_ids_in_output having invalidated all 3 slots.
+    sched_out = SimpleNamespace(
+        scheduled_spec_decode_tokens={"r1": [-1, -1, -1]},
+        num_invalid_spec_tokens={"r1": 3},
+    )
+    topup_scheduled_spec_decode_tokens(sched, sched_out)
+    assert sched_out.scheduled_spec_decode_tokens["r1"] == [31, 32, -1]
+    assert sched_out.scheduled_spec_decode_flags["r1"] == [
+        DRAFT_FLAG_GRAMMAR,
+        DRAFT_FLAG_GRAMMAR,
+        DRAFT_FLAG_EMPTY,
+    ]
+    assert sched_out.num_invalid_spec_tokens["r1"] == 1
+    # Ensure num_draft_tokens - num_invalid_spec_tokens is non-negative (2 >= 0).
+    assert (
+        len(sched_out.scheduled_spec_decode_tokens["r1"])
+        - sched_out.num_invalid_spec_tokens["r1"]
+        == 2
+    )
