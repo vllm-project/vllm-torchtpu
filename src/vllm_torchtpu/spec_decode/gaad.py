@@ -354,6 +354,7 @@ def topup_scheduled_spec_decode_tokens(scheduler: Any, scheduler_output: Any) ->
     sched_flags = getattr(scheduler_output, "scheduled_spec_decode_flags", None)
     if sched_flags is None:
         sched_flags = {}
+    num_invalid_map = getattr(scheduler_output, "num_invalid_spec_tokens", None)
 
     for req_id, spec_tokens in list(sched_tokens.items()):
         request = requests_map.get(req_id)
@@ -366,20 +367,30 @@ def topup_scheduled_spec_decode_tokens(scheduler: Any, scheduler_output: Any) ->
         if grammar is None:
             continue
 
+        orig_len = len(spec_tokens)
+        if orig_len <= 0:
+            continue
+        # Strip -1 placeholders inserted by upstream validate_tokens padding.
+        raw_model_draft = [int(t) for t in spec_tokens if int(t) >= 0]
         remaining = request.max_tokens - len(request.output_token_ids) - 1
         plan = CompositeDraftPlanner.plan(
             grammar=grammar,
             tokenizer=tokenizer,
-            existing_model_draft=list(spec_tokens),
-            budget=num_spec_tokens,
+            existing_model_draft=raw_model_draft,
+            budget=orig_len,
             max_remaining_tokens=remaining,
             stats=_STATS,
             existing_model_flags=sched_flags.get(req_id),
         )
-        valid_count = num_spec_tokens - plan.num_invalid
-        if valid_count > 0:
-            sched_tokens[req_id] = plan.tokens[:valid_count]
-            sched_flags[req_id] = plan.flags[:valid_count]
+        # Keep orig_len (padded with -1 / EMPTY) so async placeholder counts
+        # and num_invalid_spec_tokens remain consistent.
+        sched_tokens[req_id] = plan.tokens
+        sched_flags[req_id] = plan.flags
+        if num_invalid_map is not None:
+            if plan.num_invalid > 0:
+                num_invalid_map[req_id] = plan.num_invalid
+            else:
+                num_invalid_map.pop(req_id, None)
 
     if sched_flags:
         scheduler_output.scheduled_spec_decode_flags = sched_flags

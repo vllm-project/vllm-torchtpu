@@ -242,9 +242,9 @@ class StructuredDecodingManager:
                     self.target_grammar_bitmask_cpu[row : row + num_drafts] = (
                         torch.from_numpy(bitmask[mask_row : mask_row + num_drafts])
                     )
-                    self.require_structured_out_target_cpu[
-                        row : row + num_drafts
-                    ] = True
+                    self.require_structured_out_target_cpu[row : row + num_drafts] = (
+                        True
+                    )
                 else:
                     for slot_idx in range(num_drafts):
                         flag = req_flags[slot_idx] if slot_idx < len(req_flags) else 1
@@ -252,9 +252,9 @@ class StructuredDecodingManager:
                             self.target_grammar_bitmask_cpu[row + slot_idx] = (
                                 torch.from_numpy(bitmask[mask_row + slot_idx])
                             )
-                            self.require_structured_out_target_cpu[
-                                row + slot_idx
-                            ] = True
+                            self.require_structured_out_target_cpu[row + slot_idx] = (
+                                True
+                            )
             # Bonus row.
             self.grammar_bitmask_cpu[local_index] = torch.from_numpy(
                 bitmask[mask_row + num_drafts]
