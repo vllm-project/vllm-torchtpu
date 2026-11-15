@@ -119,6 +119,9 @@ omni = [
 # https://docs.vllm.ai/en/latest/design/plugin_system/
 torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
 
+# Separate plugin groups: `vllm_omni.platform_plugins` selects the platform when
+# `current_omni_platform` is first resolved; `vllm_omni.general_plugins` runs
+# after imports and before the engine starts its warmup.
 [project.entry-points."vllm_omni.platform_plugins"]
 torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 

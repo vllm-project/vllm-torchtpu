@@ -26,8 +26,12 @@ def register_omni_tpu_platform() -> str | None:
 def register_omni_general_plugins() -> None:
     """Plugin entry point for vllm_omni.general_plugins.
 
-    vLLM-Omni runs its general plugins in every process before it builds a
-    diffusion engine or worker. Returns early unless
+    vLLM-Omni runs its general plugins in every process after imports and
+    before it builds a diffusion engine or worker. Installing the warmup-sync
+    patch from OmniTpuPlatform.__init__ would hit a circular import of
+    DiffusionEngine on a cold StageDiffusionProc start (diffusion_engine.py
+    resolves current_omni_platform before class DiffusionEngine is defined), so
+    it runs from this general-plugin hook instead. Returns early unless
     register_omni_tpu_platform() finds TPU chips (get_num_chips() > 0); safe
     to call more than once.
     """

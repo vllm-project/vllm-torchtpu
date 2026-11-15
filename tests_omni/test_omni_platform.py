@@ -14,7 +14,7 @@
 import os
 import subprocess
 import sys
-import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -110,31 +110,15 @@ def test_general_plugin_patches_warmup_sync_cold_import():
     # A fresh process on a (simulated) TPU host in which vLLM-Omni loads its
     # general plugins, as StageDiffusionProc.run_diffusion_proc does before
     # building the engine, patches DiffusionEngine.run_startup_warmup.
-    code = textwrap.dedent(
-        """
-        import vllm_torchtpu.omni as torchtpu_omni
-
-        torchtpu_omni.get_num_chips = lambda: 8
-        import vllm_omni.diffusion.stage_diffusion_proc
-        from vllm_omni.plugins import load_omni_general_plugins
-
-        load_omni_general_plugins()
-
-        from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
-        from vllm_torchtpu.omni.patches import _WARMUP_SYNC_PATCHED
-
-        assert getattr(
-            DiffusionEngine.run_startup_warmup, _WARMUP_SYNC_PATCHED, False
-        )
-        """
-    )
+    probe_path = Path(__file__).with_name("_cold_import_general_plugin_probe.py")
     result = subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, str(probe_path)],
         capture_output=True,
         text=True,
         timeout=300,
+        check=True,
     )
-    assert result.returncode == 0, result.stderr
+    # load_omni_plugins_by_group logs failures without raising, so rc=0 misses them.
     for error in ("ImportError", "RecursionError", "Failed to load plugin"):
         assert error not in result.stderr, result.stderr
 

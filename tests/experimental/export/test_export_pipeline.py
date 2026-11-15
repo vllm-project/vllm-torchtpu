@@ -689,6 +689,7 @@ def test_metadata_has_no_xla_flags_without_libtpu_init_args(
     assert "env_option_overrides" not in _export_metadata(tmp_path)["compile_options"]
 
 
+# Guard cli.build_arg_parser() fallback in vllm_torchtpu (serve test skips on CPU CI).
 def test_build_arg_parser_uses_vllm_common_cli_args(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
