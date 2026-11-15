@@ -57,7 +57,8 @@ live server: once for performance, and once for each accuracy task.
 Compares the benchmark JSON to `baselines/perf/<chip>/<config>.baseline.json`
 (`<chip>` is `v7x` or `v6e`, read from `TPU_ACCELERATOR_TYPE`), with a 5%
 tolerance. A chip with no baseline for the config reports its numbers without
-the gate. Gated metrics:
+the gate. A run that cannot read its chip stops before the server starts,
+unless it passes `--skip-perf-check`. Gated metrics:
 
 - Median TPOT
 - Total token throughput

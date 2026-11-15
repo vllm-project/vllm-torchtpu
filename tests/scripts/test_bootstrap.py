@@ -2174,26 +2174,56 @@ class TestBootstrapUnits(unittest.TestCase):
                     )
 
         # The verify lane as it goes up when the build does not run one TPU
-        # generation alone: the report waits on v7x's tests-lane steps.
-        verify_doc = _render_doc(".buildkite/pipeline_verify.yml", {})
+        # generation alone: the report waits on v7x's tests-lane steps. The
+        # file names no key prefix of its own; bootstrap gives it both.
+        verify_file = ".buildkite/pipeline_verify.yml"
+        self.assertNotIn(
+            bp.TPU_V7X.key_prefix,
+            (_REPO_ROOT / verify_file).read_text(encoding="utf-8"),
+        )
+        (verify_env,) = bp.upload_envs(verify_file)
+        verify_doc = _render_doc(verify_file, verify_env)
         report_step = next(
             s
             for s in verify_doc["steps"]
             if isinstance(s, dict) and s.get("key") == "nightly_report"
         )
         report_deps = set(report_step["depends_on"]) - {"v6e-group", "v7x-group"}
-        # nightly_report.sh's own scan, run on the repo: it reads the tests
-        # lane's TPU keys behind v7x's key prefix, which is how v7x's upload
-        # names them (test_tests_lane_tpu_generations checks that it does).
+        # nightly_report.sh's own scan, run on the repo with the env the
+        # report step is uploaded with: it reads the tests lane's TPU keys
+        # behind the verified generation's key prefix, which is how v7x's
+        # upload names them (test_tests_lane_tpu_generations checks that it
+        # does). The script defines no prefix of its own either.
         report_sh = _SCRIPTS_DIR / "nightly_report.sh"
+        self.assertNotIn(
+            bp.TPU_V7X.key_prefix, report_sh.read_text(encoding="utf-8")
+        )
+        report_env = {"PATH": os.environ["PATH"], **report_step["env"]}
+        self.assertEqual(
+            report_env["TPU_VERIFIED_KEY_PREFIX"], bp.TPU_V7X.key_prefix
+        )
         scanned = subprocess.run(
             ["bash", "-c", 'source "$1" && nightly_tests_lane_keys', "_", report_sh],
             cwd=_REPO_ROOT,
+            env=report_env,
             check=True,
             capture_output=True,
             text=True,
         )
         self.assertEqual(set(scanned.stdout.split()), report_deps)
+        # Without the prefix the report stops, naming it, before it reads any
+        # outcome: a list of keys cut short would let a pair through.
+        unset = subprocess.run(
+            ["bash", str(report_sh)],
+            cwd=_REPO_ROOT,
+            env={"PATH": os.environ["PATH"]},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(unset.returncode, 0)
+        self.assertIn("TPU_VERIFIED_KEY_PREFIX", unset.stderr)
+        self.assertEqual(unset.stdout, "")
 
     def test_ci_tpu_generations_all_adds_v6e(self) -> None:
         bp = self.bp
@@ -2207,9 +2237,17 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertEqual(
                 bp.upload_envs(path, "all"), tuple(g.upload_env() for g in generations)
             )
+        # with the key prefixes of the steps the nightly report names, v7x's.
+        self.assertIs(bp.VERIFIED_TPU_GENERATION, bp.TPU_V7X)
         for value in ("", "all"):
             self.assertEqual(
-                bp.upload_envs(".buildkite/pipeline_cpu.yml", value), ({},)
+                bp.upload_envs(".buildkite/pipeline_cpu.yml", value),
+                (
+                    {
+                        "TPU_KEY_PREFIX": bp.TPU_V7X.key_prefix,
+                        "TPU_VERIFIED_KEY_PREFIX": bp.TPU_V7X.key_prefix,
+                    },
+                ),
             )
 
         # Unset: v7x alone, and nothing is said.
@@ -2338,7 +2376,12 @@ class TestBootstrapUnits(unittest.TestCase):
         for name, gen in bp.TPU_GENERATIONS.items():
             self.assertEqual(
                 bp.upload_envs(".buildkite/pipeline_cpu.yml", name),
-                ({"TPU_KEY_PREFIX": gen.key_prefix},),
+                (
+                    {
+                        "TPU_KEY_PREFIX": gen.key_prefix,
+                        "TPU_VERIFIED_KEY_PREFIX": bp.TPU_V7X.key_prefix,
+                    },
+                ),
             )
         with self.assertRaises(bp.BootstrapError):
             bp.upload_envs(".buildkite/pipeline_tests.yml", "tpu6e")
@@ -2814,6 +2857,51 @@ class TestBootstrapUnits(unittest.TestCase):
             ],
         )
 
+    def test_run_eval_flow_stops_when_it_cannot_read_the_chip(self) -> None:
+        # run_eval_flow.sh picks the perf baselines by the chip vllm_torchtpu
+        # reads. When that fails, a run that gates on perf stops before it
+        # benchmarks anything and says what to set, where it used to go on
+        # with v7x's baselines.
+        flow = _REPO_ROOT / "scripts/vllm/benchmarking/run_eval_flow.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            calls = tmp_path / "python3.calls"
+            fake_python = bin_dir / "python3"
+            fake_python.write_text(
+                f'#!/usr/bin/env bash\necho called >> "{calls}"\nexit 1\n',
+                encoding="utf-8",
+            )
+            fake_python.chmod(fake_python.stat().st_mode | stat.S_IEXEC)
+            results = tmp_path / "results"
+            # --host: a server that is already up, so the script neither
+            # starts one nor registers its cleanup.
+            stopped = subprocess.run(
+                [
+                    "bash",
+                    str(flow),
+                    "--config",
+                    "qwen3-0.6b-tp1",
+                    "--host",
+                    "127.0.0.1",
+                    "--results-dir",
+                    str(results),
+                ],
+                cwd=_REPO_ROOT,
+                env={"PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}"},
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(stopped.returncode, 1, stopped.stderr)
+            self.assertIn("ERROR: could not read the TPU chip", stopped.stderr)
+            self.assertIn("TPU_ACCELERATOR_TYPE", stopped.stderr)
+            self.assertNotIn("using v7x's perf baselines", stopped.stdout)
+            # The chip lookup was the only thing run: no benchmark, no check.
+            self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), 1)
+            self.assertEqual(list(results.iterdir()), [])
+
     def test_expand_env_interpolates_as_buildkite_does(self) -> None:
         # The fake agent and _render_doc both use it: $$ is a literal $ and
         # is not interpolated, and an unset or empty variable takes its default.
@@ -2906,18 +2994,31 @@ class TestBootstrapUnits(unittest.TestCase):
         # The tests-lane steps the nightly report waits on are CPU or v7x ones.
         # A build that runs one generation alone uploads the verify lane with
         # that generation's TPU_KEY_PREFIX, and then they are CPU ones or its.
-        def report_waits_on(env: dict[str, str]) -> set[str]:
-            verify = _render_doc(".buildkite/pipeline_verify.yml", env)
-            report = next(
-                s for s in verify["steps"] if s.get("key") == "nightly_report"
-            )
-            return {k for k in report["depends_on"] if not k.endswith("-group")}
+        # The steps the report needs passed are v7x's either way.
+        verify_file = ".buildkite/pipeline_verify.yml"
 
-        self.assertLessEqual(report_waits_on({}), {s["key"] for s in cpu + on["v7x"]})
+        def report_step(ci_tpu_generations: str) -> dict[str, Any]:
+            (env,) = bp.upload_envs(verify_file, ci_tpu_generations)
+            verify = _render_doc(verify_file, env)
+            return next(s for s in verify["steps"] if s.get("key") == "nightly_report")
+
+        def report_waits_on(ci_tpu_generations: str) -> set[str]:
+            depends_on = report_step(ci_tpu_generations)["depends_on"]
+            return {k for k in depends_on if not k.endswith("-group")}
+
+        for value in ("", "all"):
+            self.assertLessEqual(
+                report_waits_on(value), {s["key"] for s in cpu + on["v7x"]}, value
+            )
         for gen in bp.TPU_GENERATION_FILES[tpu_file]:
             self.assertLessEqual(
-                report_waits_on({"TPU_KEY_PREFIX": gen.key_prefix}),
+                report_waits_on(gen.name),
                 {s["key"] for s in cpu + on[gen.name]},
+                gen.name,
+            )
+            self.assertEqual(
+                report_step(gen.name)["env"],
+                {"TPU_VERIFIED_KEY_PREFIX": bp.TPU_V7X.key_prefix},
                 gen.name,
             )
 
