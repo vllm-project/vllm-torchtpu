@@ -13,8 +13,11 @@
 # limitations under the License.
 
 import importlib
+import itertools
 import os
 import re
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -686,6 +689,117 @@ class TestTpuCompilerCache:
         compiler._run_backend(None, [])
         compiler._run_backend(None, [])
         assert firsts == [1, 1]
+
+    @staticmethod
+    def _fake_kernel_config(name):
+        """A stand-in for a per-model copy of the streamindex_topk config."""
+        module = types.ModuleType(name)
+        module.counter = itertools.count(1)
+
+        def reserve_scheduling_group_ids(count):
+            first = next(module.counter)
+            for _ in range(count - 1):
+                next(module.counter)
+            return first
+
+        def reset_scheduling_group_ids():
+            module.counter = itertools.count(1)
+
+        module.reserve_scheduling_group_ids = reserve_scheduling_group_ids
+        module.reset_scheduling_group_ids = reset_scheduling_group_ids
+        return module
+
+    def test_run_backend_restarts_model_kernel_scheduling_group_ids(self, monkeypatch):
+        """A per-model kernel copy's counter restarts with every program, like
+        the reference kernel's; modules outside `models.<...>.kernels` are
+        left alone."""
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        copy = self._fake_kernel_config(
+            "vllm_torchtpu.models.vllm.fake_model.kernels.streamindex_topk.config"
+        )
+        not_a_kernel = self._fake_kernel_config(
+            "vllm_torchtpu.models.vllm.fake_model.model"
+        )
+        monkeypatch.setitem(sys.modules, copy.__name__, copy)
+        monkeypatch.setitem(sys.modules, not_a_kernel.__name__, not_a_kernel)
+        # Advance every counter as if earlier programs had been compiled.
+        for module in (config, copy, not_a_kernel):
+            module.reserve_scheduling_group_ids(5)
+
+        firsts = []
+
+        def fake_backend(graph, example_inputs):
+            firsts.append(
+                (
+                    config.reserve_scheduling_group_ids(3),
+                    copy.reserve_scheduling_group_ids(3),
+                )
+            )
+            return lambda *args: args
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
+        compiler = TpuCompilerAdaptor()
+        compiler._run_backend(None, [])
+        compiler._run_backend(None, [])
+        assert firsts == [(1, 1), (1, 1)]
+        assert not_a_kernel.reserve_scheduling_group_ids(1) == 6
+
+    def test_runtime_hash_covers_model_kernel_dirs(self, tmp_path, monkeypatch):
+        """Adding or editing a file in any `models/**/kernels/` directory
+        changes the compile cache key; a model without one is a no-op."""
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        repo_root = tmp_path.resolve()
+        package = repo_root / "vllm_torchtpu"
+        (package / "compilation").mkdir(parents=True)
+        (package / "kernels").mkdir()
+        (package / "kernels" / "reference.py").write_text("REF = 1\n")
+        (package / "models" / "plain_model").mkdir(parents=True)
+        (package / "models" / "plain_model" / "model.py").write_text("M = 1\n")
+        # compute_tpu_compilation_hash finds the source root from __file__.
+        monkeypatch.setattr(
+            tpu_compiler,
+            "__file__",
+            str(package / "compilation" / "tpu_compiler.py"),
+        )
+
+        def hashed_relpaths():
+            return [
+                path.relative_to(repo_root).as_posix()
+                for path in tpu_compiler._iter_runtime_cache_key_files(repo_root)
+            ]
+
+        def cache_key():
+            return tpu_compiler.compute_tpu_compilation_hash(self._config())
+
+        base = cache_key()
+        assert not [p for p in hashed_relpaths() if "/models/" in p]
+
+        nested = package / "models" / "vllm" / "fake_model" / "kernels" / "topk"
+        nested.mkdir(parents=True)
+        (nested / "config.py").write_text("TOP_K = 512\n")
+        added = cache_key()
+        assert added != base
+
+        (nested / "config.py").write_text("TOP_K = 256\n")
+        edited = cache_key()
+        assert edited not in (base, added)
+
+        flat = package / "models" / "flat_model" / "kernels"
+        flat.mkdir(parents=True)
+        (flat / "kernel.py").write_text("K = 1\n")
+        assert cache_key() not in (base, added, edited)
+
+        relpaths = hashed_relpaths()
+        assert relpaths == sorted(relpaths)
+        assert {
+            "vllm_torchtpu/models/flat_model/kernels/kernel.py",
+            "vllm_torchtpu/models/vllm/fake_model/kernels/topk/config.py",
+        } <= set(relpaths)
+        assert "vllm_torchtpu/models/plain_model/model.py" not in relpaths
 
     @staticmethod
     def _peer_compilers(tmp_path, monkeypatch, n=2, peer_replay="1"):
