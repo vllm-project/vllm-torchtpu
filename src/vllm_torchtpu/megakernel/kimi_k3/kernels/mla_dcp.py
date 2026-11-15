@@ -99,7 +99,7 @@ def page_plan(batch: int, heads: int = HEADS_PER_RANK, sequence_rows: int = 1,
     if batch <= 4:
         return {"span": SPAN, "buffers": BUFFERS}
     if sequence_rows == 1:
-        deep = batch == 64 and heads == 6 and cache_dtype == jnp.float8_e4m3fn
+        deep = batch in (32, 64) and heads == 6 and cache_dtype == jnp.float8_e4m3fn
         return {"span": SPAN, "buffers": 3 if chunked(batch) and not deep else BUFFERS}
     span = max(1, SPAN // 2)
     buffers = 4 if batch == 64 or (batch == 32 and heads != HEADS_PER_RANK) else BUFFERS * SPAN // span
