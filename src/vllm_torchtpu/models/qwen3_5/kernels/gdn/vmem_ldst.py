@@ -193,7 +193,11 @@ def load_activation_as_compact(
     v_offset = 2 * k_offset
     num_lanes = pltpu.get_tpu_info().num_lanes
 
-    if cfgs.kq_head_dim % num_lanes == 0 and cfgs.v_head_dim % num_lanes == 0:
+    if (
+        cfgs.step_trims
+        and cfgs.kq_head_dim % num_lanes == 0
+        and cfgs.v_head_dim % num_lanes == 0
+    ):
         # Lane-aligned heads: slice them out of the conv output in registers
         # instead of storing it to VMEM and loading it back per head.
         q_list = [

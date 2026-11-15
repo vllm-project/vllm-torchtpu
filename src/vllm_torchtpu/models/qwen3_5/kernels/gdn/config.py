@@ -37,6 +37,33 @@ SHARED_KKT_SHAPES: frozenset[tuple[int, int, int, int]] = frozenset(
     {(16, 64, 128, 128)}
 )
 
+# Shapes (as above) at which the copy runs the GDN v3 tiler and per-step trims
+# (`wrapper.fused_conv1d_gdn`, `GDNConfig.step_trims`). The tiler sizes the
+# prefill/mixed chunk (128 tokens by default, rounded down to a multiple of 16
+# above 16 and capped at the largest chunk whose VMEM estimate fits) and the
+# decode tile. The chunk sets where the chunked prefill splits a sequence, so a
+# different chunk rounds differently; the decode tile and the trims change the
+# kernel program, which can round differently too. These are the Qwen3.5-397B
+# shapes of the served legs: the PP8 x TP1 prefill (16 kq and 64 value heads of
+# 128), the DP4 x TP2 decode (8 and 32) and the TP8 decode (2 and 8). Every
+# other shape takes main's tiles (the caller's, 64-token chunks and 4-sequence
+# decode tiles by default, or main's picks under TPU_ENABLE_GDN_DYNAMIC_TILING)
+# and main's per-step code.
+TILER_SHAPES: frozenset[tuple[int, int, int, int]] = frozenset(
+    {(16, 64, 128, 128), (8, 32, 128, 128), (2, 8, 128, 128)}
+)
+
+# Shapes (as above) at which a speculative verify window runs the fused 1-dot
+# token recurrence (`GDNConfig.fused_1dot`): one dot gives k S and q S against
+# the undecayed state, and the decay is applied to the products. It
+# reassociates the decay, so its results differ from the two-dot form in the
+# last bits. These are the Qwen3.5-397B DP4 x TP2 decode shape, where it was
+# measured, and its TP1 shape. Every other shape, including the 397B at TP8,
+# keeps the two-dot form, which is main's.
+FUSED_1DOT_SHAPES: frozenset[tuple[int, int, int, int]] = frozenset(
+    {(16, 64, 128, 128), (8, 32, 128, 128)}
+)
+
 
 class AttentionMode(enum.StrEnum):
     # Gated Delta Net: one scalar gate per value head.
@@ -100,6 +127,10 @@ class GDNConfig:
     # Token-recurrent GDN computes k S and q S with one dot against the
     # undecayed state and decays the products (fused_conv1d_gdn fused_1dot).
     fused_1dot: bool = False
+    # The GDN v3 per-step trims (TILER_SHAPES): the conv taps start from the
+    # first product instead of a zero, and lane-aligned heads are sliced out
+    # of the conv output in registers instead of a VMEM store and reload.
+    step_trims: bool = False
 
     @property
     def conv_hbm_offset(self) -> int:
