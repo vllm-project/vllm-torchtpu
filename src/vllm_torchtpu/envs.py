@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     VLLM_TPU_GLM53_MHC_IMPL: str = "pallas"
+    VLLM_TPU_GLM53_MOE_IMPL: str = "fused"
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
@@ -497,6 +498,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_GLM53_MHC_IMPL": lambda: (
         env_with_choices("VLLM_TPU_GLM53_MHC_IMPL", "pallas", ["pallas", "compiled"])()
         or "pallas"
+    ),
+    # GLM-5.3-Flash MoE block: "fused" runs router, routing, routed GMM and
+    # shared expert as one JAX op per layer; "vllm" keeps vLLM's FusedMoE.
+    "VLLM_TPU_GLM53_MOE_IMPL": lambda: (
+        env_with_choices("VLLM_TPU_GLM53_MOE_IMPL", "fused", ["fused", "vllm"])()
+        or "fused"
     ),
     # Store GDN's in_proj_qkvz in the matmul's (k, n) layout, like every other
     # linear, instead of vLLM's [n_out, n_in]. On the per-block FP8 path (gmm_v2)
