@@ -285,7 +285,7 @@ def test_full_compile_uses_tpu_backend(monkeypatch, runner_module):
     runner_module.regionally_compile.assert_not_called()
 
 
-def test_regional_compile_with_real_torch_compile(monkeypatch, runner_module):
+def test_regional_compile_passes_kwargs_to_torch_compile(monkeypatch, runner_module):
     # The kwargs reach torch.compile (mocked) through regionally_compile.
     monkeypatch.setenv(patches.OMNI_COMPILE_ENV, "regional")
     compile_calls = []
@@ -325,6 +325,60 @@ def test_compile_failure_keeps_eager_model(
     assert len(warnings) == 1
     # spmd_safe wrappers are removed again.
     assert all("forward" not in block.__dict__ for block in model.blocks)
+
+
+def test_spmd_safe_midway_failure_restores_partial_state(
+    monkeypatch, runner_module, spmd_util, cache_tag
+):
+    monkeypatch.setenv(patches.OMNI_COMPILE_ENV, "regional")
+    monkeypatch.setenv(patches.OMNI_COMPILE_SPMD_SAFE_ENV, "1")
+
+    class FluxTransformerBlock(_Block):
+        pass
+
+    class FluxSingleTransformerBlock(_Block):
+        pass
+
+    class FluxTransformer2DModel(torch.nn.Module):
+        _repeated_blocks = ["FluxTransformerBlock"]
+
+        def __init__(self):
+            super().__init__()
+            self.transformer_blocks = torch.nn.ModuleList(
+                FluxTransformerBlock() for _ in range(2)
+            )
+            self.single_transformer_blocks = torch.nn.ModuleList(
+                FluxSingleTransformerBlock() for _ in range(1)
+            )
+
+    orig_spmd_safe = spmd_util.spmd_safe.side_effect
+    calls = 0
+
+    def fail_on_second(fn):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("spmd_safe boom")
+        return orig_spmd_safe(fn)
+
+    spmd_util.spmd_safe.side_effect = fail_on_second
+    compiler_config.cache_key_tag = "user-tag"
+    model = FluxTransformer2DModel()
+    pipeline = _pipeline(model)
+    runner = runner_module.DiffusionModelRunner(pipeline)
+    runner.pipeline = pipeline
+    warnings = []
+    monkeypatch.setattr(patches.logger, "warning", lambda *a: warnings.append(a))
+
+    patches.tpu_compile_transformer(runner, "transformer")
+
+    assert len(warnings) == 1
+    runner_module.regionally_compile.assert_not_called()
+    assert "forward" not in model.transformer_blocks[0].__dict__
+    assert "forward" not in model.transformer_blocks[1].__dict__
+    assert model._repeated_blocks == ["FluxTransformerBlock"]
+    assert "_repeated_blocks" not in model.__dict__
+    assert compiler_config.cache_key_tag == "user-tag"
 
 
 def test_missing_transformer_attr_is_skipped(monkeypatch, runner_module):

@@ -142,7 +142,6 @@ def _patch_dit_compile() -> None:
         DiffusionModelRunner._compile_transformer
     )
     orig_load_model = DiffusionModelRunner.load_model
-    DiffusionModelRunner._tpu_orig_load_model = orig_load_model
 
     @functools.wraps(orig_load_model)
     def _load_model(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -186,9 +185,14 @@ def tpu_compile_transformer(runner: Any, attr_name: str) -> None:
         )
     _register_tpu_dynamo_backend()
     _build_dit_ops_eagerly()
+    import torch.compiler.config as compiler_config
+
     # The torch_tpu backend compiles static shapes only (dynamic=False).
     compile_kwargs: dict[str, Any] = {"backend": "tpu", "dynamic": False}
     spmd_regions: list[tuple[torch.nn.Module, str, bool, Any]] = []
+    orig_cache_key_tag = compiler_config.cache_key_tag
+    had_repeated_blocks = "_repeated_blocks" in model.__dict__
+    orig_repeated_blocks = model.__dict__.get("_repeated_blocks")
     try:
         if mode == "full":
             if omni_compile_spmd_safe():
@@ -201,12 +205,17 @@ def tpu_compile_transformer(runner: Any, attr_name: str) -> None:
             compiled_model = model
         else:
             _ensure_extra_repeated_blocks(model)
-            spmd_regions = _wrap_spmd_safe_regions(model)
+            _wrap_spmd_safe_regions(model, spmd_regions)
             compiled_model = regionally_compile(model, **compile_kwargs)
             _feed_offset0_inputs(spmd_regions)
         setattr(runner.pipeline, attr_name, compiled_model)
     except Exception as e:
         _unwrap_regions(spmd_regions)
+        if had_repeated_blocks:
+            cast(Any, model)._repeated_blocks = orig_repeated_blocks
+        else:
+            model.__dict__.pop("_repeated_blocks", None)
+        compiler_config.cache_key_tag = orig_cache_key_tag
         logger.warning(
             "TPU %s torch.compile setup for %s failed: %s. Continuing with the "
             "uncompiled model.",
@@ -267,13 +276,15 @@ def _region_forward_attr(block: torch.nn.Module) -> str:
 
 def _wrap_spmd_safe_regions(
     model: torch.nn.Module,
+    out: list[tuple[torch.nn.Module, str, bool, Any]] | None = None,
 ) -> list[tuple[torch.nn.Module, str, bool, Any]]:
     """Wrap each repeated block's forward in torch_tpu's spmd_safe.
 
     Returns (block, attribute, had instance attribute, original) entries.
     """
+    wrapped = out if out is not None else []
     if not omni_compile_spmd_safe():
-        return []
+        return wrapped
     model_cls = type(model).__name__
     if model_cls not in _SPMD_SAFE_DIT_CLASSES:
         logger.warning_once(
@@ -282,24 +293,24 @@ def _wrap_spmd_safe_regions(
             model_cls,
             sorted(_SPMD_SAFE_DIT_CLASSES),
         )
-        return []
+        return wrapped
     repeated_blocks = set(getattr(model, "_repeated_blocks", None) or ())
     if not repeated_blocks:
-        return []
+        return wrapped
     from torch_tpu._internal.distributed.spmd_util import spmd_safe
 
     # The region annotation is not part of the compile cache key; keep
     # persisted executables of the two region policies apart.
     set_compile_cache_tag(SPMD_SAFE_CACHE_TAG)
-    wrapped = []
     for _, block in model.named_modules():
         if type(block).__name__ not in repeated_blocks:
             continue
         attr = _region_forward_attr(block)
         had_instance_attr = attr in block.__dict__
         orig = getattr(block, attr)
-        _set_region_forward(block, attr, spmd_safe(orig))
+        wrapped_fn = spmd_safe(orig)
         wrapped.append((block, attr, had_instance_attr, orig))
+        _set_region_forward(block, attr, wrapped_fn)
     return wrapped
 
 
@@ -318,7 +329,7 @@ def _set_region_forward(block: torch.nn.Module, attr: str, fn: Any) -> None:
 
 
 def _unwrap_regions(regions: list[tuple[torch.nn.Module, str, bool, Any]]) -> None:
-    for block, attr, had_instance_attr, orig in regions:
+    for block, attr, had_instance_attr, orig in reversed(regions):
         if had_instance_attr:
             _set_region_forward(block, attr, orig)
         else:

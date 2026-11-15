@@ -78,7 +78,7 @@ def _rank_assignment_tag(world_size: int) -> str:
         assignment = list(get_device_assignment())
         if dist.is_initialized():
             rank = str(dist.get_rank())
-    except Exception as e:  # torch_tpu without device_mesh, or no PjRt yet
+    except ImportError as e:  # torch_tpu without device_mesh
         logger.debug("No torch_tpu device assignment for the cache key: %s", e)
     fields = [
         str(world_size),
@@ -188,8 +188,8 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
     @classmethod
     def set_device(cls, device: torch.device | int) -> None:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+        cls._worker_world_size = world_size
         if world_size > 1:
-            cls._worker_world_size = world_size
             chips = os.environ.get("TPU_VISIBLE_CHIPS")
             if chips and [int(c) for c in chips.split(",")] != list(range(world_size)):
                 logger.warning(
@@ -229,7 +229,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         if omni_compile_mode() == "0":
             return
         if world_size is None:
-            world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+            world_size = cls._worker_world_size
         if world_size > 1:
             set_compile_cache_tag(
                 _rank_assignment_tag(world_size), prefix=_RANK_ASSIGNMENT_TAG

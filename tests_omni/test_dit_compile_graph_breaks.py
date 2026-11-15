@@ -394,9 +394,9 @@ def test_op_accessors_build_once(monkeypatch):
 
 
 def test_tiny_flux_tp_single_block_traces_as_one_graph(tiny_wan_block):
-    # Exercises FluxSingleTransformerBlock structure under functional TP
-    # collectives (all_gather_into_tensor + all_reduce) + pair-swap RoPE +
-    # TpuFlashAttentionImpl with fullgraph=True.
+    # Exercises FluxSingleTransformerBlock structure (pair-swap RoPE +
+    # TpuFlashAttentionImpl + MLP, plus funcol.all_reduce when
+    # torch.distributed is initialized) with fullgraph=True.
     import torch.distributed._functional_collectives as funcol
 
     dim = 128
