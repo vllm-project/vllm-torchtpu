@@ -172,6 +172,9 @@ class _OpStatics:
     # TPU_MOE_TP_DECODE_PAD_ROWS: a token count between two kernel row counts
     # runs the kernel on the next one (see _kernel_rows). Same bits per row.
     pad_rows: bool = False
+    # Packed FP4 routed weights (MOE_REQUANTIZE_WEIGHT_DTYPE=fp4, gmm_v2 path):
+    # jnp.float4_e2m1fn, else None (FP8).
+    rhs_quant_dtype: Any = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -345,33 +348,39 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
     shared = _shared_slice(runner)
     if isinstance(shared, str):
         return shared
-    hidden = layer.w13_weight.shape[1]
+    hidden = shared[0].shape[0]
     experts = layer.global_num_experts
     topk = int(cfg.experts_per_token)
-    weights = (
-        layer.e_score_correction_bias,
-        layer.w13_weight,
-        layer.w2_weight,
-        layer.w13_weight_scale_inv,
-        layer.w2_weight_scale_inv,
-        *shared,
-    )
-    rows = tuple(
-        m
-        for m in kernel.ROW_BUCKETS
-        if kernel.can_use_moe_tp_decode(
-            jax.ShapeDtypeStruct((m, hidden), jnp.bfloat16),
-            jax.ShapeDtypeStruct((m, experts), jnp.float32),
-            *(_sds(t) for t in weights),
-            topk=topk,
-            n_ranks=n_ranks,
+    rhs_quant_dtype = getattr(qm, "_rhs_quant_dtype", None)
+    if rhs_quant_dtype is not None:
+        if not (par.use_ep and layer.w13_weight.dtype == torch.uint8):
+            return "packed FP4 routed weights need EP uint8 weights"
+        rows = ()
+    else:
+        weights = (
+            layer.e_score_correction_bias,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            *shared,
         )
-    )
-    if not rows:
-        return (
-            f"the kernel admits no token count (w13 {list(layer.w13_weight.shape)} "
-            f"{layer.w13_weight.dtype}, shared w13 {list(shared[0].shape)})"
+        rows = tuple(
+            m
+            for m in kernel.ROW_BUCKETS
+            if kernel.can_use_moe_tp_decode(
+                jax.ShapeDtypeStruct((m, hidden), jnp.bfloat16),
+                jax.ShapeDtypeStruct((m, experts), jnp.float32),
+                *(_sds(t) for t in weights),
+                topk=topk,
+                n_ranks=n_ranks,
+            )
         )
+        if not rows:
+            return (
+                f"the kernel admits no token count (w13 {list(layer.w13_weight.shape)} "
+                f"{layer.w13_weight.dtype}, shared w13 {list(shared[0].shape)})"
+            )
     statics = _OpStatics(
         topk=topk,
         routed_scale=float(runner.routed_scaling_factor),
@@ -391,6 +400,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         ag_pairs=int(envs.TPU_MOE_TP_DECODE_AG_PAIRS),
         exchange_pieces=int(envs.TPU_MOE_TP_DECODE_EXCHANGE_PIECES),
         pad_rows=bool(envs.TPU_MOE_TP_DECODE_PAD_ROWS),
+        rhs_quant_dtype=rhs_quant_dtype,
     )
     return _Admitted(
         shared=shared,
@@ -512,7 +522,7 @@ def _routed_partial(x, w, ids, w13, w2, s13, s2, sw13, ss13, sw2, ss2, st, e0=No
         use_ep=st.use_ep,
         use_sparse_core=st.use_sparse_core,
         onehot_moe_permute_threshold=st.onehot_threshold,
-        rhs_quant_dtype=None,
+        rhs_quant_dtype=st.rhs_quant_dtype,
         skip_padded_tokens=True,  # admission requires TPU_MOE_SKIP_PADDED_TOKENS
     )
     gate_up = xla_quantized_matmul(x, sw13, ss13)
@@ -561,7 +571,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
         n_valid = n - jnp.sum(is_pad.astype(jnp.int32))
         weights = (w13, w2, s13, s2, sw13, ss13, sw2, ss2)
         m = _kernel_rows(n, statics.pad_rows)
-        if m != n:
+        if statics.rhs_quant_dtype is None and m != n:
             # A decode bucket the kernel has no size for (4 and 8 from
             # TPU_TOKEN_BUCKET_EXTRA, below its smallest size; 48, between
             # sizes, with TPU_MOE_TP_DECODE_PAD_ROWS): run the kernel on `m`
@@ -590,7 +600,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                     ag_pairs=statics.ag_pairs,
                     exchange_pieces=statics.exchange_pieces,
                 )[:n]
-        if kernel.can_use_moe_tp_decode(
+        if statics.rhs_quant_dtype is None and kernel.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
         ):
             return kernel.moe_tp_decode(
