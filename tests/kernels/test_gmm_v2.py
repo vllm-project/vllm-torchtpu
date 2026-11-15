@@ -515,3 +515,21 @@ def test_calculate_tiling_caps_low_token_high_group_tile_m(monkeypatch):
     )
     assert (low_tok.bucket_base, low_tok.tile_m) == (16, 64)
     assert (high_tok.bucket_base, high_tok.tile_m) == (64, 256)
+
+    # Earlier TPU generations keep their existing tile_m defaults unchanged.
+    info_7x = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info_7x)
+    low_tok_7x = calculate_tiling(
+        dims=Dimensions(
+            size_m=256,
+            size_k=2048,
+            size_n=512,
+            size_group=64,
+            size_lhs_group=16,
+            size_lhs_sublane=8,
+        ),
+        lhs_cfgs=lhs_cfg,
+        rhs_cfgs=rhs_cfg,
+        vmem_limit_bytes=info_7x.vmem_capacity_bytes,
+    )
+    assert (low_tok_7x.bucket_base, low_tok_7x.tile_m) == (64, 256)
