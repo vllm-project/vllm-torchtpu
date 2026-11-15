@@ -20,6 +20,8 @@ logger = init_logger(__name__)
 
 _EVERY = envs.VLLM_TPU_HOST_PHASES
 _last: int | None = None
+# Called as hook(name, start_ns, end_ns) for every mark (host_admit_probe).
+_hook = None
 _samples: dict[str, list[int]] = {}
 _steps = 0
 _rank = -1
@@ -28,6 +30,11 @@ _rank = -1
 def set_rank(rank: int) -> None:
     global _rank
     _rank = rank
+
+
+def set_hook(hook) -> None:
+    global _hook
+    _hook = hook
 
 
 def begin_step() -> None:
@@ -55,6 +62,8 @@ def mark(name: str) -> None:
     now = time.perf_counter_ns()
     if _last is not None:
         _samples.setdefault(name, []).append(now - _last)
+        if _hook is not None:
+            _hook(name, _last, now)
     _last = now
 
 

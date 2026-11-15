@@ -281,13 +281,65 @@ class Qwen4ExpAdapter:
             # once its comparisons are done, it runs exactly like `1`).
             self.token_store = batch.token_ids_cpu_tensor
         else:
-            self.token_store = batch.token_ids_cpu_tensor.to(
-                self.runner.device, non_blocking=True
-            )
+            # The upload reads its host memory until the transfer completes,
+            # and the next step's _update_states rewrites token_ids_cpu_tensor
+            # before the runner's input staging fence orders this upload.
+            source = batch.token_ids_cpu_tensor
+            if envs.VLLM_TPU_TOKEN_STORE_CHECK:
+                self._check_token_store_upload()
+            if envs.VLLM_TPU_TOKEN_STORE_UPLOAD_COPY:
+                source = self._token_store_copy(source)
+            self.token_store = source.to(self.runner.device, non_blocking=True)
+            if envs.VLLM_TPU_TOKEN_STORE_CHECK:
+                stats = self._token_store_stats()
+                if stats["taken"] < envs.VLLM_TPU_TOKEN_STORE_CHECK:
+                    stats["taken"] += 1
+                    self._token_store_last = (source.clone(), self.token_store)
         if self.spec_window:
             self._previous_rows, self._current_rows = self._current_rows, {}
             self._recent.reverse()
         return self.token_store
+
+    def _token_store_copy(self, source):
+        """VLLM_TPU_TOKEN_STORE_UPLOAD_COPY: ``source`` copied into one of two
+        host buffers, used in turn. A buffer is rewritten two steps after its
+        upload, after the next step's input staging fence wait has ordered it."""
+        copies = self.__dict__.setdefault("_token_store_copies", [None, None])
+        turn = self.__dict__.get("_token_store_turn", 0)
+        self._token_store_turn = 1 - turn
+        copy = copies[turn]
+        if copy is None or copy.shape != source.shape or copy.dtype != source.dtype:
+            copy = copies[turn] = torch.empty_like(source)
+        copy.copy_(source)
+        return copy
+
+    def _token_store_stats(self):
+        return self.__dict__.setdefault(
+            "_token_store_check", {"taken": 0, "checks": 0, "bad_steps": 0, "bad_entries": 0}
+        )
+
+    def _check_token_store_upload(self):
+        """VLLM_TPU_TOKEN_STORE_CHECK: the previous step's token store, read
+        back from the device, against the host copy taken at its upload."""
+        last = self.__dict__.pop("_token_store_last", None)
+        if last is None:
+            return
+        host, dev = last
+        bad = int((dev.cpu() != host).sum())
+        stats = self._token_store_stats()
+        stats["checks"] += 1
+        stats["bad_steps"] += bad > 0
+        stats["bad_entries"] += bad
+        if (bad and stats["bad_steps"] <= 20) or (
+            stats["checks"] == envs.VLLM_TPU_TOKEN_STORE_CHECK
+        ):
+            logger.info(
+                "TOKEN_STORE_CHECK checks=%d bad_steps=%d bad_entries=%d last_bad=%d",
+                stats["checks"],
+                stats["bad_steps"],
+                stats["bad_entries"],
+                bad,
+            )
 
     def _recent_buffers(self, device):
         """(previous step's record, this step's record)."""

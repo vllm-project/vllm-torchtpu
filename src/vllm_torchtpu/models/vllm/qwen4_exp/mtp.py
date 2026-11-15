@@ -305,6 +305,10 @@ class Qwen4ExpMTP(nn.Module):
     # embedding (draft_needs_own_embedding, set per instance in __init__).
     has_own_embed_tokens = False
     has_own_lm_head = False
+    # compute_logits is exactly lm_head + logits_processor (spec_step_idx is
+    # unused), so the vocabulary-parallel argmax (VLLM_TPU_DRAFT_TOP_TOKENS)
+    # reproduces its argmax.
+    plain_compute_logits = True
     # Draft cache specs a prefill-only producer may hold
     # (Eagle3Proposer._validate_prefill_only_draft_model): the QSA main KV and
     # compressed keys (FullAttentionSpec family) and the raw ring (request state).
@@ -397,8 +401,14 @@ class Qwen4ExpMTP(nn.Module):
             return False
         target = layers[-1].self_attn
         width = target.max_selected_tokens
+        # One row past the budget: the draft slices the carried rows by its
+        # token count, and a bound at the largest bucket can pin that bucket's
+        # trace (compilation/shape_variants.py).
         sink = torch.full(
-            (max_tokens, width), -1, dtype=torch.int32, device=target.rope_cache.device
+            (max_tokens + 1, width),
+            -1,
+            dtype=torch.int32,
+            device=target.rope_cache.device,
         )
         target.register_buffer("_selection_sink", sink, persistent=False)
         for attention in drafts:

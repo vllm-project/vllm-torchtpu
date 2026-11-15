@@ -483,6 +483,28 @@ def relayout_hash_tables(model: torch.nn.Module):
     logger.info("Row-major relayouted %d hash tables", num_changed)
 
 
+def relayout_hc_up_weights(model: torch.nn.Module):
+    """Re-materialize every hyper-connection up weight row-major."""
+    num_changed = 0
+    shapes: set[tuple[int, ...]] = set()
+    for module in model.modules():
+        up = getattr(module, "input_mix_weight_up", None)
+        weight = getattr(up, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+            continue
+        weight.data = _to_row_major(weight.data)
+        shapes.add(tuple(weight.shape))
+        num_changed += 1
+
+    if num_changed:
+        _install_entry_layout_pin()
+    logger.info(
+        "Row-major relayouted %d hyper-connection up weights (shapes %s)",
+        num_changed,
+        sorted(shapes),
+    )
+
+
 def _install_entry_layout_pin() -> None:
     """Make the compiler pin entry layouts for buffers in the registry."""
     global _entry_pin_installed

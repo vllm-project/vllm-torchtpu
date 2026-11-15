@@ -438,8 +438,6 @@ def _random_rejection_sample_impl(
     topk_candidates: int = 0,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
-    total_tokens = draft_token_ids.shape[0]
-    batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
     vocab_size = target_logits.shape[-1]
 
@@ -512,6 +510,38 @@ def _random_rejection_sample_impl(
         recovered_token_ids,
     )
 
+    return assemble_rejection_output(
+        draft_token_ids,
+        accepted,
+        recovered_token_ids,
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )[0]
+
+
+def assemble_rejection_output(
+    draft_token_ids: torch.Tensor,
+    accepted: torch.Tensor,
+    recovered_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Places each request's accepted drafts, the recovered token at its first
+    rejection or the bonus token after a full acceptance.
+
+    `draft_token_ids` is int64, `accepted` the per-slot accept decisions and
+    `recovered_token_ids` the int32 token to emit at a rejected slot. Returns
+    the [batch_size, max_draft_tokens + 1] selected tokens, padded with
+    PLACEHOLDER_TOKEN_ID, and the mask of declared draft slots."""
+    total_tokens = draft_token_ids.shape[0]
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices
     # Only declared draft slots may participate in rejection sampling.
@@ -605,7 +635,7 @@ def _random_rejection_sample_impl(
     )
     selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
-    return selected_tokens[:batch_size]
+    return selected_tokens[:batch_size], valid_slot_mask
 
 
 # The verify-fused program (tpu_runner._verify_fused_impl) traces the

@@ -122,7 +122,9 @@ def ring_receives_posted(stages: int, depth: int, carried: int = 1) -> int:
 
     A stage posts a step's receives when it begins the step. The last stage
     holds no others: it waits for each step's sampled tokens before it
-    takes the next. A stage that sends also holds the receives of at most
+    takes the next (under VLLM_TPU_PP_LAST_ASYNC_OUTPUT it does not, and the
+    run-time limit below bounds it). A stage that sends also holds the
+    receives of at most
     ``depth`` earlier forwards: end_forward waits while that many are
     unsent, and a forward is sent only after it has run on the data it
     received. No stage holds more than the steps the engine keeps in

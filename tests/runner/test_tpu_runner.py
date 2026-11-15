@@ -15,6 +15,7 @@
 import contextlib
 import copy
 import inspect
+import os
 import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -413,6 +414,7 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
         _precompile_timed=lambda _label: contextlib.nullcontext(),
         _warmup_one_spec_request=one,
         _warmup_spec_batch=batch,
+        _shard_head_owner=None,
     )
     with (
         patch.object(tpu_runner.envs, "SPEC_WARMUP", True),
@@ -1504,6 +1506,27 @@ class TestCompactMambaSlotPool:
         assert idx[0] != idx[1]
         # Padded tail points at the null slot (0).
         assert idx[2] == 0 and idx[3] == 0
+
+    @patch.dict(os.environ, {"VLLM_TPU_UNFENCED_UPLOAD_PRIVATE": "1"})
+    def test_unfenced_build_leaves_the_shared_buffer_alone(self):
+        """The drafter's call (input staging fence pending) builds the same
+        indices in a private host tensor; the shared buffer keeps the bytes
+        the step's own upload may still be reading."""
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
+        runner._init_mamba_slot_pool(5)
+        self._set_batch(runner, ["a", "b"])
+        runner._input_staging_fence = None
+        # On CPU the "upload" aliases the shared buffer; keep a copy.
+        first = runner._build_mamba_state_indices(0, 2, 4).clone()
+
+        runner._input_staging_fence = object()
+        runner.mamba_state_indices_cpu.fill_(-3)
+        again = runner._build_mamba_state_indices(0, 2, 4).cpu()
+        assert torch.equal(again, first)
+        assert torch.equal(
+            runner.mamba_state_indices_cpu,
+            torch.full_like(runner.mamba_state_indices_cpu, -3),
+        )
 
     def test_idle_dp_rank_gets_all_null_slots(self):
         """An idle DP rank asks for the coordinated shape with an empty batch.

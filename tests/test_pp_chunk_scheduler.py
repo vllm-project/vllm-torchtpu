@@ -41,6 +41,7 @@ def _scheduler(
     mamba_split=False, cost=None, running=(), waiting=(), step_limit=None
 ) -> TpuPipelineChunkScheduler:
     scheduler = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
+    scheduler._init_warm_first(False, 0.0)
     scheduler._cost = cost
     scheduler._step_limit = step_limit
     scheduler._pp_size = 8

@@ -14,6 +14,7 @@ from vllm.v1.outputs import (
 
 INVALID_TOKEN_ID = -1
 from vllm_torchtpu import envs
+from vllm_torchtpu.runner import gc_at_waits
 
 
 @dataclass
@@ -171,6 +172,8 @@ class AsyncTPUCopyState:
                 self._wait()
 
     def _wait(self) -> None:
+        if gc_at_waits.ENABLED and gc_at_waits.event_pending(self.copy_ready_event):
+            gc_at_waits.collect_due()
         self.copy_ready_event.synchronize()
         self.chunks_tpu = None
         self._spec_logprobs_tpu = None
@@ -212,6 +215,10 @@ class AsyncPreResults:
     # it does not count proposals for the next step. Bootstrap/non-spec: 0 or
     # absent entry (None for an entirely non-spec result).
     num_draft_per_req: dict[int, int] | None = None
+    # Input chunks of this step. `req_id_to_index_copy` positions count the
+    # padded rows of earlier chunks; `num_draft_per_req` keys and the sampled
+    # copy's rows agree with them only for a single chunk.
+    num_chunks: int = 1
 
     def wait_for_copy(self) -> torch.Tensor | None:
         if self.copy_state is None:

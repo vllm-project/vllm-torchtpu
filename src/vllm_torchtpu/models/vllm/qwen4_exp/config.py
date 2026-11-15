@@ -912,6 +912,9 @@ def validate_config(cfg):
         )
     if cfg.speculative_config is not None:
         validate_mtp_config(cfg)
+    validate_gdn_window_factored()
+    if envs.VLLM_TPU_GDN_WINDOW_LOG:
+        validate_gdn_window_log(cfg)
     transfer = cfg.kv_transfer_config
     if transfer is not None and transfer.kv_connector == MULTI_CONNECTOR:
         validate_multi_connector_config(cfg)
@@ -1025,6 +1028,65 @@ def validate_config(cfg):
                 f"including loader allowance; only {available} bytes available. "
                 "Use dp_shared_memory or embedding_across_dp to avoid DP replicas."
             )
+
+
+def validate_gdn_window_factored() -> None:
+    """VLLM_TPU_GDN_WINDOW_FACTORED runs on the GDN window log only: its body
+    reads checkpoint block 0 and the log, and writes them back."""
+    if envs.VLLM_TPU_GDN_WINDOW_FACTORED and not envs.VLLM_TPU_GDN_WINDOW_LOG:
+        raise ValueError(
+            "VLLM_TPU_GDN_WINDOW_FACTORED refused: it runs on the GDN window log "
+            "(VLLM_TPU_GDN_WINDOW_LOG=1)"
+        )
+
+
+def validate_gdn_window_log(cfg) -> None:
+    """VLLM_TPU_GDN_WINDOW_LOG's refusals: it runs on an MTP decode only.
+
+    The window log changes what a GDN checkpoint block holds (checkpoint 0
+    plus the draft operands of positions 1..K, folded on load by the read
+    offset). Of a PD pair only the staged decode runs it; an engine without
+    a PD connector (the offline decode bench) runs it too. The megakernel
+    reads the offset as a checkpoint index and writes one full state per
+    window position, so the two cannot share a pool. DP above 1, PCP above 1
+    and host offload (which moves every group's pages, GDN checkpoints
+    included) are refused: the lifecycle test covers none of them. The
+    geometry (spare rows, dtypes, window) is checked where the kernel's plan
+    is built, against the real pool.
+    """
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.megakernel_runtime import _is_megakernel_requested
+
+    transfer = pd_transfer_config(cfg)
+    reasons = []
+    if num_speculative_tokens(cfg) < 1:
+        reasons.append("it logs MTP draft positions and needs a speculative config")
+    if transfer is not None and (
+        transfer.kv_role != "kv_consumer"
+        or not envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER
+        or cfg.parallel_config.tensor_parallel_size <= 1
+    ):
+        reasons.append(
+            "of a PD pair it runs only on the staged decode (a TP>1 kv_consumer "
+            "with TPU_RAIDEN_POOL_TAGS_PER_LAYER=1)"
+        )
+    if _is_megakernel_requested(SimpleNamespace(vllm_config=cfg)):
+        reasons.append(
+            "the megakernel reads read offsets as checkpoint indices and writes "
+            "full checkpoints"
+        )
+    p = cfg.parallel_config
+    if p.data_parallel_size > 1:
+        reasons.append(f"data parallel size {p.data_parallel_size} > 1")
+    if p.prefill_context_parallel_size > 1:
+        reasons.append(
+            f"prefill context parallel size {p.prefill_context_parallel_size} > 1"
+        )
+    if host_offload_enabled(cfg):
+        reasons.append("host offload moves GDN checkpoint pages")
+    if reasons:
+        raise ValueError("VLLM_TPU_GDN_WINDOW_LOG refused: " + "; ".join(reasons))
 
 
 def validate_host_offload_config(cfg):
