@@ -49,7 +49,18 @@ GAAD_PROPOSER = "vllm_torchtpu.structured_decoding.gaad.GrammarOnlyProposer"
 
 
 class GrammarOnlyProposer:
-    """Names GaaD without a drafter; the TPU runner never instantiates it."""
+    """Names GaaD without a drafter; it proposes nothing.
+
+    vLLM's runner base class builds one from the `custom_class` config; the
+    TPU runner then replaces it with no drafter.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    def propose(self, *args: Any, **kwargs: Any) -> list[list[int]]:
+        del args, kwargs
+        return []
 
 
 def is_standalone(speculative_config: SpeculativeConfig | None) -> bool:
