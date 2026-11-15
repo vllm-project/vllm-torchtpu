@@ -345,6 +345,8 @@ class TestSplitSplashAttention:
         assert len(seen_meta) == 1
         assert seen_meta[0] is not None
         assert seen_meta[0].extra == {"prefix_mask_len": 7}
+        assert seen_meta[0].attn_mask.dtype is torch.bool
+        assert seen_meta[0].attn_mask.shape == (2, 23)
 
         out_orig = attn_cls._tpu_orig_forward(
             attn,
