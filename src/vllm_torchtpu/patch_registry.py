@@ -146,7 +146,7 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch(
-        "vllm_torchtpu.tracing.utils:_patch_vllm_engine_core_tracing_attribution",
+        "vllm_torchtpu.tracing.engine_spans:_patch_vllm_kv_fetch_spans",
         _ENGINE,
     ),
     # Model-specific patches.

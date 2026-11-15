@@ -18,7 +18,7 @@ asynchronous token accounting, decode load-failure handling, and KV cleanup
 remain with Scheduler / AsyncScheduler.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any
@@ -48,6 +48,9 @@ class _PendingResponse:
     stop_reason: int | str | None = None
     kv_transfer_params: dict[str, Any] = field(default_factory=dict)
     outcome: RaidenSendOutcome | None = None
+    # The API server parents the request's span on the terminal output's
+    # trace headers; without them the span lands in a trace of its own.
+    trace_headers: Mapping[str, str] | None = None
 
 
 _ERROR_BY_OUTCOME = {
@@ -95,6 +98,7 @@ class _ProducerCompletion:
                         finish_reason=output.finish_reason,
                         stop_reason=output.stop_reason,
                         kv_transfer_params=transfer_params,
+                        trace_headers=output.trace_headers,
                     )
                     output.finish_reason = None
                     output.stop_reason = None
@@ -148,6 +152,7 @@ class _ProducerCompletion:
                     finish_reason=finish_reason,
                     stop_reason=stop_reason,
                     kv_transfer_params=params,
+                    trace_headers=pending.trace_headers,
                 )
             )
             logger.info(

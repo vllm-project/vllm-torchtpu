@@ -770,6 +770,75 @@ def test_release_free_host_heap_falls_back_to_malloc_trim(monkeypatch):
     assert calls == [0]
 
 
+def test_worker_steps_poll_xla_compile_spans(monkeypatch):
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.vllm_config = SimpleNamespace()
+    worker.rank = 3
+    worker.model_runner = MagicMock()
+    worker.model_runner.execute_model.return_value = "model-out"
+    worker.model_runner.sample_tokens.return_value = "sample-out"
+    emitter = MagicMock()
+    created = []
+    order = []
+    emitter.poll.side_effect = lambda: order.append("poll")
+    worker.model_runner.execute_model.side_effect = lambda s: (
+        order.append("step") or "model-out"
+    )
+
+    def create(config, rank):
+        created.append(rank)
+        order.append("create")
+        return emitter
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker.maybe_create_xla_compile_spans", create
+    )
+
+    assert worker.execute_model("sched") == "model-out"
+    assert worker.sample_tokens("grammar") == "sample-out"
+    assert worker.execute_model("sched") == "model-out"
+
+    # Created once, before the first step runs, so that step's compile counts.
+    assert created == [3]
+    assert order == ["create", "step", "poll", "poll", "step", "poll"]
+
+
+def test_worker_steps_without_tracing_do_not_poll(monkeypatch):
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.vllm_config = SimpleNamespace()
+    worker.rank = 0
+    worker.model_runner = MagicMock()
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker.maybe_create_xla_compile_spans",
+        lambda config, rank: None,
+    )
+
+    worker.execute_model("sched")
+    worker.sample_tokens("grammar")
+
+    assert worker._xla_compile_spans is None
+    assert worker._xla_compile_spans_checked is True
+
+
+def test_idle_dp_step_polls_xla_compile_spans(monkeypatch):
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.vllm_config = SimpleNamespace()
+    worker.rank = 0
+    worker.model_runner = MagicMock()
+    worker.model_runner._dp_coordinated_step.return_value = (None, 0)
+    worker.model_runner.num_tokens_paddings = [16]
+    emitter = MagicMock()
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker.maybe_create_xla_compile_spans",
+        lambda config, rank: emitter,
+    )
+
+    worker.execute_dummy_batch()
+
+    worker.model_runner._dummy_run.assert_called_once()
+    emitter.poll.assert_called_once_with()
+
+
 if __name__ == "__mp_main__":
     # The constructor is the boundary preceding executor and TPU initialization.
     EngineCoreProc.__init__ = _engine_init
