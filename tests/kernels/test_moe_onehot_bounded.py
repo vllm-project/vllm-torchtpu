@@ -70,7 +70,11 @@ def test_admission():
     with _cpu_tpu7_registry():
         assert moe_onehot_bounded.can_use_bounded_onehot(512, 2048, 6144)
         assert moe_onehot_bounded.can_use_bounded_onehot(256, 1024, 6144)
-        # Token counts off the 128 lane width stay on the dense one-hot.
+        # c64's 416-token decode bucket: tokens off the 128 lane width.
+        assert moe_onehot_bounded.can_use_bounded_onehot(416, 1664, 6144)
+        # Below 256 tokens off the lane width (c48's 192), partial sublane
+        # tiles of tokens or 128-slot blocks stay dense.
+        assert not moe_onehot_bounded.can_use_bounded_onehot(192, 768, 6144)
         assert not moe_onehot_bounded.can_use_bounded_onehot(24, 96, 6144)
         # An f32 owner the size of a prefill chunk does not fit VMEM.
         assert not moe_onehot_bounded.can_use_bounded_onehot(4096, 16384, 6144)

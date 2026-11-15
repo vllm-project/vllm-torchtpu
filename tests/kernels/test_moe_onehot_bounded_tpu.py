@@ -60,7 +60,20 @@ def _dense_combine(routed, revert, weights, valid):
     return (onehot * weights[..., None]).sum(axis=1) @ routed
 
 
-@pytest.mark.parametrize("num_tokens,real_tokens", [(256, 192), (384, 296), (512, 448)])
+@pytest.mark.parametrize(
+    "num_tokens,real_tokens",
+    # c48/c64 decode buckets off 128 tokens (192, 224, 320, 416, 448) too.
+    [
+        (256, 192),
+        (384, 296),
+        (512, 448),
+        (192, 184),
+        (224, 216),
+        (320, 288),
+        (416, 400),
+        (448, 424),
+    ],
+)
 def test_matches_dense_one_hot(num_tokens, real_tokens):
     revert, weights, valid = _routing(num_tokens, real_tokens, num_tokens)
     hidden = jax.random.normal(jax.random.PRNGKey(0), (num_tokens, HIDDEN)) * 0.1

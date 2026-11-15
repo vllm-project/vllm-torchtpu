@@ -70,9 +70,12 @@ def _slot_caps(num_slots: int) -> list[int]:
 
 
 def can_use_bounded_onehot(num_tokens: int, num_slots: int, hidden_size: int) -> bool:
-    """Shapes both kernels lay out without padding, within VMEM."""
+    """Shapes both kernels lay out, within VMEM: whole 128-token lanes, or
+    past 256 tokens whole bf16 sublane tiles (Mosaic masks the lane padding:
+    the 320/416-token c48/c64 decode buckets; at c48's 192 the bounded form
+    gained nothing in the twin), and whole 128-slot blocks."""
     return (
-        num_tokens % 128 == 0
+        (num_tokens % 128 == 0 or (num_tokens > 256 and num_tokens % 16 == 0))
         and num_slots % _SLOT_BLOCK == 0
         and _col_chunk(num_tokens, num_slots, hidden_size) is not None
     )
