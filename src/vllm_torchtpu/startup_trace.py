@@ -103,7 +103,7 @@ def _wrap(cls, attr: str, name=None) -> None:
         except Exception:  # noqa: BLE001 - a name must never break startup
             n = f"{cls.__name__}.{attr}"
         _emit("start", n)
-        stacks = n == "loader.load_weights" and _stack_dumps_start()
+        stacks = n in _stack_spans() and _stack_dumps_start()
         try:
             return fn(self, *args, **kwargs)
         finally:
@@ -115,6 +115,14 @@ def _wrap(cls, attr: str, name=None) -> None:
 
     traced._startup_traced = True  # type: ignore[attr-defined]
     setattr(cls, attr, traced)
+
+
+def _stack_spans() -> set[str]:
+    """Spans that get stack dumps (VLLM_TPU_STARTUP_STACKS_SPANS, comma-separated;
+    default the weight load)."""
+    return set(
+        os.environ.get("VLLM_TPU_STARTUP_STACKS_SPANS", "loader.load_weights").split(",")
+    )
 
 
 def _stack_dumps_start() -> bool:
