@@ -1303,6 +1303,195 @@ class TestInt8MoERequantization:
         assert err_lsb.max().item() <= 0.5 + 1e-4
 
 
+def _cpu_jax_op(_name, fn, **_kwargs):
+    """`pallas.jax_op` on CPU: the JAX function on numpy views of the tensors."""
+    import jax
+    import numpy as np
+
+    def to_jax(t):
+        if t.dtype == torch.bfloat16:
+            u16 = t.view(torch.uint16).numpy()
+            return jax.lax.bitcast_convert_type(jnp.asarray(u16), jnp.bfloat16)
+        return jnp.asarray(t.numpy())
+
+    def to_torch(a):
+        if a.dtype == jnp.float4_e2m1fn:
+            pairs = a.reshape(*a.shape[:-1], a.shape[-1] // 2, 2)
+            u8 = np.array(jax.lax.bitcast_convert_type(pairs, jnp.uint8))
+            return torch.from_numpy(u8).view(torch.float4_e2m1fn_x2)
+        return torch.from_numpy(np.array(a))
+
+    class _Op:
+        def __call__(self, *args):
+            out = fn(*(to_jax(a) for a in args))
+            if isinstance(out, tuple):
+                return tuple(to_torch(o) for o in out)
+            return to_torch(out)
+
+    return _Op()
+
+
+class TestFp4MoERequantization:
+    """`MOE_REQUANTIZE_WEIGHT_DTYPE=fp4` through the real loader functions.
+
+    A block-FP8 checkpoint's routed experts become K-major FP4 with one scale
+    per 512 rows of K: packed two to a byte for the GMM path, unpacked
+    `float4_e2m1fn_x2` for the fused EP W4A8 kernel. MTP layers stay FP8
+    unless VLLM_TPU_MOE_REQUANT_MTP is set. CPU-only: the torch_tpu op
+    boundary is replaced by a JAX call on CPU.
+    """
+
+    E, INTER, H, BLOCK = 2, 512, 512, 128
+
+    @pytest.fixture(autouse=True)
+    def _cpu_ops(self, monkeypatch):
+        if not hasattr(torch, "float4_e2m1fn_x2"):
+            pytest.skip("torch.float4_e2m1fn_x2 unavailable")
+        from vllm_torchtpu.layers.adapter import fused_moe
+        from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
+
+        monkeypatch.setattr(fused_moe.pallas, "jax_op", _cpu_jax_op)
+        monkeypatch.setattr(fused_moe, "_quantize_native_fp4_kmajor_ops", {})
+        monkeypatch.setattr(fp8_mod, "fresh_buffer", lambda t: t)
+        monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "fp4")
+        monkeypatch.delenv("MOE_REQUANTIZE_BLOCK_SIZE", raising=False)
+
+    def _layer(self):
+        gen = torch.Generator().manual_seed(0)
+        E, inter, H, B = self.E, self.INTER, self.H, self.BLOCK
+        layer = FakeFusedMoELayer(
+            (torch.randn(E, 2 * inter, H, generator=gen) * 40).to(torch.float8_e4m3fn),
+            (torch.randn(E, H, inter, generator=gen) * 40).to(torch.float8_e4m3fn),
+            torch.rand(E, 2 * inter // B, H // B, generator=gen) + 0.5,
+            torch.rand(E, H // B, inter // B, generator=gen) + 0.5,
+        )
+        layer.moe_config = FakeInt8MoEConfig(inter)
+        return layer
+
+    @staticmethod
+    def _unpack_kmajor(w, scale, packed):
+        """[E, K, N] float32 from the loader's FP4 weight and [E, K/b, 1, N] scale."""
+        import jax
+        import numpy as np
+
+        if packed:  # uint8 [E, K/2, N], the pair of each byte along K
+            fp4 = jax.lax.bitcast_convert_type(
+                jnp.asarray(w.numpy()), jnp.float4_e2m1fn
+            )
+            fp4 = jnp.swapaxes(fp4, -1, -2)  # [E, K/2, 2, N]
+            vals = np.asarray(fp4.astype(jnp.float32)).reshape(
+                w.shape[0], -1, w.shape[2]
+            )
+        else:  # float4_e2m1fn_x2 [E, K, N/2], the pair of each byte along N
+            u8 = jnp.asarray(w.view(torch.uint8).numpy())
+            fp4 = jax.lax.bitcast_convert_type(u8, jnp.float4_e2m1fn)
+            vals = np.asarray(fp4.astype(jnp.float32)).reshape(*w.shape[:2], -1)
+        block = vals.shape[1] // scale.shape[1]
+        return vals * np.repeat(scale[:, :, 0, :].float().numpy(), block, axis=1)
+
+    @pytest.mark.parametrize("fused_ep_w4a8", [False, True])
+    def test_fp8_checkpoint_to_kmajor_fp4(self, monkeypatch, fused_ep_w4a8):
+        import numpy as np
+
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            _process_fp8_moe_weights,
+        )
+        from vllm_torchtpu.layers.core.quantization import dequantize_tensor
+
+        if fused_ep_w4a8:
+            monkeypatch.setenv("USE_MOE_FUSED_EP_KERNEL", "1")
+            monkeypatch.setenv("MOE_FUSED_EP_ENABLE_W4A8", "1")
+        layer = self._layer()
+
+        w13, w13_scale, w2, w2_scale, dtype_name, block_size = _process_fp8_moe_weights(
+            layer, weight_block_size=(self.BLOCK, self.BLOCK), activation="silu"
+        )
+
+        E, inter, H = self.E, self.INTER, self.H
+        assert dtype_name == "fp4" and block_size == 512
+        if fused_ep_w4a8:
+            assert w13.dtype == torch.float4_e2m1fn_x2
+            assert w13.shape == (E, H, inter) and w2.shape == (E, inter, H // 2)
+        else:
+            assert w13.dtype == torch.uint8
+            assert w13.shape == (E, H // 2, 2 * inter) and w2.shape == (
+                E,
+                inter // 2,
+                H,
+            )
+        assert w13_scale.shape == (E, H // 512, 1, 2 * inter)
+        assert w2_scale.shape == (E, inter // 512, 1, H)
+
+        for got_w, got_s, param, scale in (
+            (w13, w13_scale, layer.w13_weight, layer.w13_weight_scale_inv),
+            (w2, w2_scale, layer.w2_weight, layer.w2_weight_scale_inv),
+        ):
+            want = dequantize_tensor(
+                param.data, scale.data, axis=(1, 2), out_dtype=torch.float32
+            )
+            want = want.transpose(1, 2).numpy()  # K-major [E, K, N]
+            got = self._unpack_kmajor(got_w, got_s, packed=not fused_ep_w4a8)
+            rel_err = np.linalg.norm(got - want) / np.linalg.norm(want)
+            assert rel_err < 0.22
+
+    def test_mtp_layers_stay_fp8(self, monkeypatch):
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            _get_moe_quant_config,
+            _mtp_moe_keeps_fp8,
+            _process_fp8_moe_weights,
+        )
+
+        mtp = "mtp.layers.48.mlp.experts"
+        assert _mtp_moe_keeps_fp8(mtp)
+        assert _mtp_moe_keeps_fp8("model.mtp.layers.0.mlp.experts")
+        assert not _mtp_moe_keeps_fp8("model.layers.47.mlp.experts")
+        monkeypatch.setenv("VLLM_TPU_MOE_REQUANT_MTP", "1")
+        assert not _mtp_moe_keeps_fp8(mtp)
+        monkeypatch.delenv("VLLM_TPU_MOE_REQUANT_MTP")
+        # Without FP4 requantization an MTP layer is loaded like the others.
+        monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn")
+        assert not _mtp_moe_keeps_fp8(mtp)
+        monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "fp4")
+
+        assert _get_moe_quant_config("test", force_fp8=False)[1] == (
+            torch.float4_e2m1fn_x2
+        )
+        assert _get_moe_quant_config("test", force_fp8=True) == (
+            "float8_e4m3fn",
+            torch.float8_e4m3fn,
+            None,
+        )
+
+        w13, w13_scale, w2, _, dtype_name, block_size = _process_fp8_moe_weights(
+            self._layer(),
+            weight_block_size=(self.BLOCK, self.BLOCK),
+            activation="silu",
+            force_fp8=True,
+        )
+        assert dtype_name == "float8_e4m3fn" and block_size is None
+        assert w13.dtype == torch.float8_e4m3fn and w2.dtype == torch.float8_e4m3fn
+        assert w13_scale.shape == (self.E, 1, 1, 2 * self.INTER)
+
+    def test_fused_scale_buffers_read_scale_inv(self):
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            register_fused_scale_buffers,
+        )
+
+        layer = torch.nn.Module()
+        layer.w13_weight_scale_inv = torch.nn.Parameter(
+            torch.ones((4, 20, 1, 1280)), requires_grad=False
+        )
+        layer.w2_weight_scale_inv = torch.nn.Parameter(
+            torch.full((4, 5, 1, 2560), 2.0), requires_grad=False
+        )
+        register_fused_scale_buffers(layer)
+        assert layer._tpu_fused_w13_scale.shape == (4, 20, 1280)
+        assert layer._tpu_fused_w2_scale.shape == (4, 5, 2560)
+        assert torch.equal(
+            layer._tpu_fused_w2_scale, layer.w2_weight_scale_inv.squeeze(2)
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

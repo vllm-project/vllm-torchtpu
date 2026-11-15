@@ -152,6 +152,7 @@ if TYPE_CHECKING:
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
+    VLLM_TPU_MOE_REQUANT_MTP: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
@@ -1026,6 +1027,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MOE_FUSED_EP_ENABLE_W4A8 use the kernel's smallest supported block.
     # Selecting MOE_FUSED_EP_KERNEL_IMPL=adaptive also does this automatically.
     # Other MoE paths retain their default, including explicit requantization.
+    # FP4 requantization (MOE_REQUANTIZE_WEIGHT_DTYPE=fp4) defaults to 512 for
+    # FP8 checkpoints; for BF16 weights, 64 under fused EP W4A8, else 128.
     "MOE_REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
     if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
     else None,
@@ -1377,6 +1380,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
     "MOE_FUSED_EP_ENABLE_W4A8": env_bool("MOE_FUSED_EP_ENABLE_W4A8"),
+    # With MOE_REQUANTIZE_WEIGHT_DTYPE=fp4, also requantize the MTP layers'
+    # routed experts. Off by default: MTP MoE layers then stay FP8 with
+    # per-channel scales, which keeps the draft's acceptance, and build no
+    # fused EP op.
+    "VLLM_TPU_MOE_REQUANT_MTP": env_bool("VLLM_TPU_MOE_REQUANT_MTP", default=False),
     # Largest node-wide token count, out of the scheduler's cap, at or above
     # which the fused kernel is armed for the whole deployment. Decided once at
     # weight load, not per step: a per-step choice would need the token count
