@@ -74,6 +74,10 @@ if TYPE_CHECKING:
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MINIMAX_M3_FP8_LINEARS: bool = True
+    TPU_MINIMAX_M3_SP_MODE: str = "off"
+    TPU_MINIMAX_M3_SP_MIN_TOKENS: int = 4096
+    TPU_MINIMAX_M3_SP_FP8_GATHER: bool = False
+    TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER: bool = False
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_GMM_FP8_W8A8: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -713,6 +717,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-channel power-of-two scale (models/minimax_m3/quant.py); 0 restores
     # the exact bf16 dequantization.
     "TPU_MINIMAX_M3_FP8_LINEARS": env_bool("TPU_MINIMAX_M3_FP8_LINEARS", default=True),
+    # MiniMax-M3 sequence parallelism on steps of at least
+    # TPU_MINIMAX_M3_SP_MIN_TOKENS tokens (and a multiple of TP; 0 = never)
+    # (models/minimax_m3/model.py). "attn": MoE layers reduce-scatter the
+    # attention output with the residual, normalize their token shard,
+    # all-gather it as the MoE input, and fold the attention partial into the
+    # MoE all-reduce. "full": the residual stream stays a token shard through
+    # every layer (norms on the shard, all-gather before attention and FFN,
+    # reduce-scatter after). "off": two all-reduces per layer on every step.
+    "TPU_MINIMAX_M3_SP_MODE": env_with_choices(
+        "TPU_MINIMAX_M3_SP_MODE", "off", ["off", "attn", "full"]
+    ),
+    "TPU_MINIMAX_M3_SP_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_SP_MIN_TOKENS", 4096
+    ),
+    # The FFN-input (and, for "full", the attention-input) all-gather sends the
+    # normalized shard as e4m3 with a per-row f32 scale: half the bytes, and a
+    # change to that input's precision.
+    "TPU_MINIMAX_M3_SP_FP8_GATHER": env_bool(
+        "TPU_MINIMAX_M3_SP_FP8_GATHER", default=False
+    ),
+    "TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER": env_bool(
+        "TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER", default=False
+    ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/
     # moe_dense_expert_fp4.py) instead of sort + grouped GEMM + combine.
