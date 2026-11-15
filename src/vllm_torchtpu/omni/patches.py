@@ -422,11 +422,9 @@ def _patch_wan_host_resident_schedule() -> None:
     # runtime inputs, or vLLM-Omni keeps the denoising schedule on the host.
     #
     # With the fresh timestep copy at transformer entry, the first request at a
-    # new step count still pays about 0.6 s per step (480x832x81 on 8 cores:
-    # 26.3 s against 14.9 s warm for 12 steps, 66.4 s against 39.6 s for 40
-    # steps). Each step still reads the schedule view `t` in small device
-    # programs that bake its offset: the expert-boundary compare in the
-    # pipeline loop and the UniPC `index_for_timestep` lookup before every
+    # new step count still recompiles per-step scalar device programs that read
+    # the schedule view `t` and bake its offset: the expert-boundary compare in
+    # the pipeline loop and the UniPC `index_for_timestep` lookup before every
     # update. Keeping `FlowUniPCMultistepScheduler.timesteps` on the host turns
     # both into host work and leaves no device program that depends on the step
     # index; the transformer then receives a host timestep, which the

@@ -680,3 +680,45 @@ class TestWanFreshTimestepPatch:
         assert got_kwargs["encoder_hidden_states"] is ctx, (
             "encoder_hidden_states was not passed through unchanged"
         )
+
+    @pytest.mark.parametrize(
+        "cls",
+        [WanTransformer3DModel, WanVACETransformer3DModel, WanS2VTransformer3DModel],
+        ids=["wan", "vace", "s2v"],
+    )
+    def test_forward_transfers_host_timestep_without_sync(
+        self, monkeypatch: pytest.MonkeyPatch, cls: type
+    ) -> None:
+        """A host-schedule timestep transfers to hidden_states.device without
+        cloning or queueing synchronize_tensors."""
+        from vllm_torchtpu.omni import patches
+
+        calls = []
+        monkeypatch.setattr(
+            cls,
+            "forward",
+            lambda self, hidden_states, timestep, *args, **kwargs: calls.append(
+                (hidden_states, timestep, args, kwargs)
+            ),
+        )
+        synced = []
+        monkeypatch.setattr(
+            "vllm_torchtpu.utils.synchronize_tensors",
+            lambda t, wait=True: synced.append((t, wait)),
+        )
+        patches._wrap_fresh_timestep(cls)
+
+        x_meta = torch.zeros(2, 4, device="meta")
+        host_t = torch.arange(6)[3].expand(2)
+        cls.forward(object(), hidden_states=x_meta, timestep=host_t, return_dict=False)
+        cls.forward(object(), x_meta, host_t, "ctx")
+
+        assert len(calls) == 2
+        assert calls[0][0] is x_meta
+        assert calls[0][1].device.type == "meta" and calls[0][1].shape == (2,)
+        assert calls[0][1]._base is None and calls[0][1].dtype == host_t.dtype
+        assert calls[0][2] == () and calls[0][3] == {"return_dict": False}
+        assert calls[1][0] is x_meta
+        assert calls[1][1].device.type == "meta" and calls[1][1].shape == (2,)
+        assert calls[1][2] == ("ctx",) and calls[1][3] == {}
+        assert synced == []
