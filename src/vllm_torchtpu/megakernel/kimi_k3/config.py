@@ -50,6 +50,8 @@ class KernelConfig:
     decode_no_hlo_calls: bool = True  # no deduplicated HLO calls at B8..B128, DP B2/B4
     shard_routing: bool = False
     kda_staged: bool = False
+    # DP2 plain decode above B16: the kernel writes KDA post-states into their slots.
+    kda_inplace_writes: bool = True
     weight_streams: tuple[tuple[str, tuple], ...] = ()  # (weight, (axis, streams))
     # VMEM and compiler settings.
     vmem_limit_mb: int = 64

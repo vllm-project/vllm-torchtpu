@@ -3711,6 +3711,19 @@ class ChunkedWeightStream:
         return parts[0] if self.chunks == 1 else jnp.concatenate(parts, axis=1)
 
 
+class _ConditionalCopy:
+    """A DMA started and waited only where ``condition`` holds."""
+
+    def __init__(self, copy, condition):
+        self.copy, self.condition = copy, condition
+
+    def start(self):
+        pl.when(self.condition)(self.copy.start)
+
+    def wait(self):
+        pl.when(self.condition)(self.copy.wait)
+
+
 class KdaStateStream:
     """KDA state streamed through three rolling or four private VMEM buffers.
 
@@ -3722,7 +3735,8 @@ class KdaStateStream:
     """
 
     def __init__(self, history_hbm, state_hbm, history_output_hbm, state_output_hbm,
-                 history_buffers, state_buffers, read_semaphores, write_semaphores, *, chunk, chunks, slots=None, sequence_rows=1):
+                 history_buffers, state_buffers, read_semaphores, write_semaphores, *, chunk, chunks, slots=None, sequence_rows=1,
+                 inplace_period=None):
         self.history_hbm, self.state_hbm = history_hbm, state_hbm
         self.history_output_hbm, self.state_output_hbm = history_output_hbm, state_output_hbm
         self.history_buffers, self.state_buffers = history_buffers, state_buffers
@@ -3730,6 +3744,10 @@ class KdaStateStream:
         self.chunk, self.chunks = chunk, chunks
         self.slots = slots
         self.sequence_rows = sequence_rows
+        # In place: each row's post-states go to its own slot of the input banks;
+        # null-slot rows (slot % inplace_period == 0) are not written.
+        self.inplace_period = inplace_period
+        assert inplace_period is None or (slots is not None and sequence_rows == 1)
         self.pending_writes = []
         self.buffer_count = history_buffers.shape[0]
         self.four_buffers = self.buffer_count == 4
@@ -3757,6 +3775,20 @@ class KdaStateStream:
 
     def _writes(self, index):
         rows, slot = pl.ds(index * self.chunk, self.chunk), index % self.buffer_count
+        if self.inplace_period is not None:
+            copies = []
+            for row in range(self.chunk):
+                target = self.slots[index * self.chunk + row]
+                for kind, (buffer, destination) in enumerate((
+                    (self.history_buffers, self.history_hbm),
+                    (self.state_buffers, self.state_hbm),
+                )):
+                    copies.append(_ConditionalCopy(
+                        tpu.make_async_copy(buffer.at[slot, pl.ds(row, 1)],
+                                            destination.at[pl.ds(target, 1)],
+                                            self.write_semaphores.at[slot, kind]),
+                        target % self.inplace_period != 0))
+            return tuple(copies)
         return (
             tpu.make_async_copy(self.history_buffers.at[slot], self.history_output_hbm.at[rows],
                                 self.write_semaphores.at[slot, 0]),
@@ -6237,6 +6269,13 @@ def _moe_scoped_scratch(
 SHARD_ROUTING = _config().shard_routing
 
 
+def kda_inplace_writes(*, batch_size, attention_dp, sequence_rows, slot_reads, state_row):
+    """Whether the stack writes KDA post-states into their bank slots itself
+    (KernelConfig.kda_inplace_writes: DP2 plain decode, streamed states, slot reads)."""
+    return (_config().kda_inplace_writes and slot_reads and attention_dp == 2 and batch_size > 16
+            and sequence_rows == 1 and state_row is None)
+
+
 def stack(
     prefix,
     embedding,
@@ -6515,6 +6554,10 @@ def stack(
             attention_dp == 1 and (select_state_row or not persist_kda_state)
             or attention_dp == 2 and batch_size in (2, 4, 8, 16, 32, 64, 96, 128)):
         raise ValueError("state_slots needs DP1 with state_row or batch > 4, or DP2 at B2..B128")
+    kda_inplace = kda_inplace_writes(batch_size=batch_size, attention_dp=attention_dp,
+                                     sequence_rows=sequence_rows, slot_reads=slot_reads,
+                                     state_row=state_row)
+    kda_inplace_period = states[0].shape[0] // attention_dp if kda_inplace else None
     overlap_kda_state_reads = batch_size in (6, *SCATTER_BATCHES) or attention_dp > 1
     overlap_kda_state_writes = batch_size in (6, *SCATTER_BATCHES) or attention_dp > 1
 
@@ -7779,6 +7822,7 @@ def stack(
                                 chunks=attention_dp * chunks_per_shard,
                                 slots=slots_ref if slot_reads else None,
                                 sequence_rows=sequence_rows,
+                                inplace_period=kda_inplace_period,
                             )
                             shared_state_stream.prime()
                         for shard in range(attention_dp):
@@ -7802,6 +7846,7 @@ def stack(
                                     chunks=chunks_per_shard,
                                     slots=slots_ref.at[rows] if slot_reads else None,
                                     sequence_rows=sequence_rows,
+                                    inplace_period=kda_inplace_period,
                                 )
                                 state_stream.prime()
                             else:
