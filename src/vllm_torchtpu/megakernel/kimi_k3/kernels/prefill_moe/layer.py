@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from ...config import active as _config
 from ..prefill_megakernel import (
     MOE_FAMILIES,
     _moe_sp_shared_rows,
@@ -61,7 +60,7 @@ def routed_experts(
     Resident MXFP4 families use the runtime layer index. Inactive routes sort
     beyond the counted expert prefix; no routing capacity or token dropping
     is imposed. The output contains this rank's reduced token rows, in the
-    ring's dtype (``moe_reduce_dtype``).
+    ring's dtype (FP32).
     """
     tokens, _, half = latent.shape
     input_width = 2 * half
@@ -142,7 +141,7 @@ def routed_experts_prepared(
     options = dict(
         tokens=tokens,
         layer=expert_layer,
-        ring_dtype=jnp.dtype(_config().moe_reduce_dtype),
+        ring_dtype=jnp.dtype(jnp.float32),
     )
     if tokens == 8192:
         return down_valu_compact(
@@ -246,7 +245,7 @@ def make_moe_fused_sp_repacked(
     mesh, *, seq_len, eps=1e-5, collective_id=42, token_ranks=None
 ):
     """Build the TP32 MoE layer for repacked projection weights: the local
-    routed partials, their reduce-scatter ring (``moe_reduce_dtype``), then
+    routed partials, their reduce-scatter ring (FP32), then
     the latent-up and shared-expert tail on each rank's rows."""
     if (
         tuple(mesh.axis_names) != ("k3_sp",)

@@ -7,7 +7,7 @@ import pytest
 
 from vllm_torchtpu.megakernel.kimi_k3 import config
 from vllm_torchtpu.megakernel.kimi_k3.kernels import prefill_megakernel as kernels
-from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_moe import fused, layer
+from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_moe import fused
 from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_moe.moe_down_valu import (
     down_valu_compact,
 )
@@ -18,14 +18,10 @@ pytestmark = pytest.mark.cpu_test
 @pytest.mark.parametrize("window", [512, 1024, 2048, 4096, 6144, 8192])
 @pytest.mark.parametrize("ep", [8, 16, 32])
 @pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("reduce_dtype", ["float32", "bfloat16"])
-def test_factory_preserves_unsupported_shapes(
-    monkeypatch, window, ep, enabled, reduce_dtype
-):
+def test_factory_preserves_unsupported_shapes(monkeypatch, window, ep, enabled):
     cfg = config.KernelConfig(
         prefill_expert_parallel=ep,
         prefill_fused_moe=enabled,
-        moe_reduce_dtype=reduce_dtype,
     )
     monkeypatch.setattr(config, "active", lambda: cfg)
     monkeypatch.setattr(
@@ -38,18 +34,10 @@ def test_factory_preserves_unsupported_shapes(
         "make_indexed_moe_sp_ring",
         lambda mesh, *, seq_len: ("fused", seq_len),
     )
-    monkeypatch.setattr(
-        layer,
-        "make_indexed_moe_sp_ring",
-        lambda mesh, *, seq_len: ("bf16", seq_len),
-    )
     result = kernels.make_indexed_moe_sp_ring(None, seq_len=window)
     expected = "reference"
-    if enabled and ep == 16:
-        if reduce_dtype == "float32" and window in (512, 1024, 2048, 4096, 8192):
-            expected = "fused"
-        elif reduce_dtype == "bfloat16" and window in (4096, 8192):
-            expected = "bf16"
+    if enabled and ep == 16 and window in (512, 1024, 2048, 4096, 8192):
+        expected = "fused"
     assert result == (expected, window)
 
 
@@ -110,13 +98,6 @@ def test_metadata_overflow_is_uniform_and_uncapped(monkeypatch, peak):
             32768 if compact else 0,
         ],
     )
-
-
-def test_direct_fused_factory_rejects_bf16(monkeypatch):
-    cfg = config.KernelConfig(moe_reduce_dtype="bfloat16")
-    monkeypatch.setattr(kernels, "_config", lambda: cfg)
-    with pytest.raises(ValueError, match="FP32"):
-        fused.make_indexed_moe_sp_ring(None, seq_len=4096)
 
 
 @pytest.mark.parametrize("tokens", [512, 1024, 2048, 4096, 8192])
