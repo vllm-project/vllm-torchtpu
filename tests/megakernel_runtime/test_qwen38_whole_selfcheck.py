@@ -36,7 +36,23 @@ def _run(monkeypatch, *, steps, calls_per_step, program=_DEFAULT_PROGRAM, warm_a
     return errors, infos
 
 
+def test_disabled_whole_step_at_self_check_is_fatal(monkeypatch):
+    """VLLM_TPU_MK_ALLOW_FALLBACK unset: a disabled whole-step program raises."""
+    import pytest
+
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_ALLOW_FALLBACK", False)
+    with pytest.raises(drv.MegakernelSetupError, match="SELF-CHECK FAILED"):
+        _run(monkeypatch, steps=drv.WHOLE_SELF_CHECK_STEPS + 50, calls_per_step=0, program=None)
+
+
 def test_no_whole_step_call_after_warmup_is_an_error(monkeypatch):
+    """With the explicit fallback opt-in: logged once, no raise."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_ALLOW_FALLBACK", True)
+    monkeypatch.setattr(drv.logger, "warning", lambda *a, **k: None)
     errors, _ = _run(
         monkeypatch,
         steps=drv.WHOLE_SELF_CHECK_STEPS + 50,

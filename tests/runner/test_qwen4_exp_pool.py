@@ -727,18 +727,17 @@ def test_tail_fold_turns_off_under_main_kv_dcp(monkeypatch, caplog, dcp):
     assert folded == {dcp == "1"}
     blocked = mamba_tail_fold.fold_blocked_by_context_parallel(cfg, int(dcp))
     assert (blocked is None) == (dcp == "1")
-    # The former opt-in is ignored (za6 GSM8K under DCP-2: 0.26 / 0.008).
+    # Opt-in: main-KV DCP folds, with the Mamba specs exactly as without DCP.
     monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_DCP", "1")
-    blocked = mamba_tail_fold.fold_blocked_by_context_parallel(cfg, int(dcp))
-    assert (blocked is None) == (dcp == "1")
+    assert mamba_tail_fold.fold_blocked_by_context_parallel(cfg, int(dcp)) is None
     _, opted = pooled_cache_specs(cfg)
-    folded = {
-        s.num_prefill_checkpoint_blocks > 0
-        for s in opted.values()
-        if isinstance(s, MambaSpec)
-    }
-    assert folded == {dcp == "1"}
-    # vLLM DCP stays off too.
+    monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", "1")
+    _, plain = pooled_cache_specs(cfg)
+    for name, spec in opted.items():
+        if isinstance(spec, MambaSpec):
+            assert spec.num_prefill_checkpoint_blocks == 1
+            assert spec == plain[name], name
+    # vLLM DCP stays off even with the opt-in.
     cfg.parallel_config.decode_context_parallel_size = 2
     assert mamba_tail_fold.fold_blocked_by_context_parallel(cfg, 1)
 

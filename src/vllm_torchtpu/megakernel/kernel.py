@@ -133,6 +133,11 @@ def build(
     extras = extra_inputs(model_spec, ex)
     x_names = [x.name for x in extras]
 
+    # `tiles.hbm_io` needs the output rows == the activation rows (no zero tail to write).
+    assert not tiles.hbm_io or ex.MB == ex.M, (ex.MB, ex.M)
+    io_c = tiles.io_chunk if tiles.io_chunk and ex.MB % tiles.io_chunk == 0 else ex.MB
+    io_chunks = [(r0, io_c) for r0 in range(0, ex.MB, io_c)]
+
     def kernel(*refs):
         pos_ref, hid_ref = refs[:2]
         W = dict(zip(w_names, refs[2 : 2 + n_w]))
@@ -266,7 +271,23 @@ def build(
                 )
             pl.semaphore_wait(barrier, ex.R - 1)
 
-        scr["res"][...] = jnp.where(live, hid_ref[: ex.MB].astype(F32), 0.0)
+        if tiles.hbm_io:  # hidden input in HBM: stage it through `xb` (free until layer 0)
+            hio = pltpu.make_async_copy(
+                hid_ref.at[pl.ds(0, ex.MB)], scr["xb"], scr["hio_sem"]
+            )
+            hio.start()
+            hio.wait()
+            hid_src = scr["xb"]
+        else:
+            hid_src = hid_ref
+        if tiles.io_chunk:
+            for r0, c in io_chunks:
+                rows = lax.broadcasted_iota(I32, (c, 1), 0) + r0
+                scr["res"][r0 : r0 + c] = jnp.where(
+                    rows < ex.B, hid_src[r0 : r0 + c].astype(F32), 0.0
+                )
+        else:
+            scr["res"][...] = jnp.where(live, hid_src[: ex.MB].astype(F32), 0.0)
         scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
         for b in blocks:
             b.init_buffers(ctx)
@@ -281,13 +302,23 @@ def build(
         fn_cp = pltpu.make_async_copy(W["final_norm"], scr["fn"], scr["fn_sem"])
         fn_cp.start()
         fn_cp.wait()
-        out_ref[: ex.MB] = rmsnorm(
-            scr["res"][...],
-            scr["fn"][...],
-            g.eps,
-            zero_centered=bool(g.zero_centered_norm),
-        ).astype(BF16)
-        if ex.MB < ex.M:
+        # hbm_io: the final norm goes to `xb` (free after the blocks' epilogues), then one
+        # DMA to the HBM output.
+        dst = scr["xb"] if tiles.hbm_io else out_ref
+        for r0, c in io_chunks:
+            dst[r0 : r0 + c] = rmsnorm(
+                scr["res"][r0 : r0 + c],
+                scr["fn"][...],
+                g.eps,
+                zero_centered=bool(g.zero_centered_norm),
+            ).astype(BF16)
+        if tiles.hbm_io:
+            hio = pltpu.make_async_copy(
+                scr["xb"], out_ref.at[pl.ds(0, ex.MB)], scr["hio_sem"]
+            )
+            hio.start()
+            hio.wait()
+        elif ex.MB < ex.M:
             out_ref[ex.MB :] = jnp.zeros((ex.M - ex.MB, g.H), BF16)
 
     wsh = weight_shapes(model_spec, ex, p)
@@ -317,7 +348,10 @@ def build(
         for k in st_names
     ]
     in_specs = (
-        [pl.BlockSpec(memory_space=pltpu.SMEM), pl.BlockSpec(memory_space=pltpu.VMEM)]
+        [
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.HBM if tiles.hbm_io else pltpu.VMEM),
+        ]
         + w_specs
         + s_specs
         + [pl.BlockSpec(memory_space=_mem_space(x.memory_space)) for x in extras]
@@ -329,7 +363,7 @@ def build(
         for k in o_names
     ]
     out_specs = [
-        pl.BlockSpec(memory_space=pltpu.VMEM)
+        pl.BlockSpec(memory_space=pltpu.HBM if tiles.hbm_io else pltpu.VMEM)
         if k == "hidden"
         else tuple(
             pl.BlockSpec(memory_space=_mem_space(p.output_decls[k].memory_space))

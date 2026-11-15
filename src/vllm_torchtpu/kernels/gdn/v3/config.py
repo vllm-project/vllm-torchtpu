@@ -140,6 +140,11 @@ class GDNConfig:
     # kernel of the call writes, instead of an XLA zero-initialized buffer.
     # -1 = off.
     zero_out_from: int = -1
+    # VLLM_TPU_GDN_V3_WINDOW_VERIFY: verify-window tiles (BATCHED, window_size
+    # > 1, GDN) run window_tile, one window position and one value head at a
+    # time, instead of inner_kernel. The wrapper sets it only where
+    # window_tile.supported holds for the pool.
+    window_verify: bool = False
 
     # Output rows zeroed per DMA by the in-kernel zero-fill.
     ZERO_OUT_ROWS: ClassVar[int] = 32
@@ -155,6 +160,16 @@ class GDNConfig:
     @property
     def kernel_zero_out(self) -> bool:
         return self.zero_out_from >= 0
+
+    @property
+    def per_head_windows(self) -> bool:
+        """Whether this tile runs window_tile (see `window_verify`)."""
+        return (
+            self.window_verify
+            and self.mode == GDNMode.BATCHED
+            and self.window_size > 1
+            and not self.is_kda
+        )
 
     @property
     def sub_chunk_size(self) -> int:
@@ -261,6 +276,8 @@ class GDNConfig:
             suffix += "_rawba"
         if self.kernel_zero_out:
             suffix += "_zf"
+        if self.per_head_windows:
+            suffix += "_wt"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
@@ -268,6 +285,9 @@ class GDNConfig:
 
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)
+        if not self.window_verify:
+            # Off: the kernel metadata stays what it was before the switch.
+            del cfgs_dict["window_verify"]
         ret = {}
         for path, val in jax.tree_util.tree_leaves_with_path(cfgs_dict):
             key = jax.tree_util.keystr(path, simple=True, separator=".")
@@ -346,9 +366,29 @@ class GDNConfig:
                 pltpu.SemaphoreType.DMA,
             )
 
-        return dict(
+        scratches = dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
             raw_scratch_ref=raw_scratch,
             zero_out_scratch_ref=zero_out_scratch,
         )
+        if self.per_head_windows:
+            # window_tile: FP32 head states, dense conv inputs (the previous
+            # taps, then the window's tokens) and dense conv weights (taps,
+            # then the bias).
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            rows = pl.cdiv(self.dim_size, num_lanes)
+            scratches["window_scratch_refs"] = (
+                pltpu.VMEM(recurrent_shape, jnp.float32),
+                pltpu.VMEM(
+                    (
+                        self.seq_tile_size,
+                        self.chunk_size + self.prev_kernel_size,
+                        rows,
+                        num_lanes,
+                    ),
+                    jnp.float32,
+                ),
+                pltpu.VMEM((self.kernel_size + 1, rows, num_lanes), jnp.float32),
+            )
+        return scratches

@@ -22,8 +22,11 @@ through the whole-step cache writer, after the kernel (the pool is read-only ins
 
 Returns the residual after the layer (the next step's hidden carry, as the stock
 `Qwen4ExpMTP.forward` second output) and the greedy tokens (the stock
-`compute_logits(...).argmax(-1)`). The draft's weights keep their shipped precision:
-the HC mix weights stay BF16 (`hc_fp8=False`), the experts as checkpointed.
+`compute_logits(...).argmax(-1)`, picked on BF16-rounded logits as the stock lm_head
+returns them). The draft's weights keep their checkpoint precision: routed experts are
+the loaded FP8 tensors and scales (aliased, no copy), attention / HC / shared expert /
+router / lm_head the loaded BF16 tensors; `hc_fp8=False` keeps VLLM_TPU_MK_HC_FP8 off
+the draft.
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
 from vllm_torchtpu.megakernel.wholestep.qsa_full import KV_NEW
 from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
-from vllm_torchtpu.megakernel.wholestep.tail import TOP, greedy_tokens
+from vllm_torchtpu.megakernel.wholestep.tail import TOP
 from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
 
 from .qwen38_wholestep_cache import QSALayerCache, wholestep_qsa_writes
@@ -88,6 +91,22 @@ def draft_spec(g: Any, R: int, *, budget: int, max_groups: int, vocab_shard: int
         tail=dict(vocab_shard=vocab_shard),
         hc_fp8=False,
     )
+
+
+def make_draft_greedy(mesh: Any) -> Any:
+    """`tokens [M] int32` (replicated) from the tail's per-rank `(max, index)` pairs
+    `[R*M, 128]` (tp-sharded): `greedy_tokens` inside the mesh, so each rank
+    all-gathers the pairs and takes the first maximal rank (ties to the lower rank).
+    Outside shard_map the rank split of the pairs lowers to a partition id, which the
+    served SPMD compile refuses (exos j-760b499c: "partitionId instruction is not
+    supported for SPMD partitioning")."""
+
+    def per_rank(top):
+        t = jax.lax.all_gather(top, "tp")  # [R, M, 128]
+        best = jnp.argmax(t[:, :, 0], axis=0)
+        return jnp.take_along_axis(t[:, :, 1], best[None], axis=0)[0].astype(jnp.int32)
+
+    return jax.shard_map(per_rank, mesh=mesh, in_specs=P("tp"), out_specs=P(), check_vma=False)
 
 
 def build_draft_call(
@@ -185,6 +204,8 @@ def build_draft_call(
         out_specs=tp, check_vma=False,
     )
 
+    greedy = make_draft_greedy(mesh)
+
     def call(*args):
         hidden = args[0]
         w = [
@@ -202,7 +223,7 @@ def build_draft_call(
         res, kv, kr, ir, top = outs[:5]
         pool = writes(pool, kv, kr, ir, ring, main, comp, positions, starts, context, trig,
                       k_norm, ik_norm, *rank)
-        tokens = greedy_tokens(top, R, M)[:B]
+        tokens = greedy(top)[:B]
         return unpad(res), tokens, pool
 
     in_specs = (
@@ -262,7 +283,7 @@ class MkDraft(nn.Module):
     """The draft layer + final mixer + lm_head + greedy pick as one op per step.
 
     Owns the packed draft operands (one set, shared by the step-0 and loop kinds: the
-    weights do not depend on `T`). `step(...)` mirrors `Qwen4ExpMTP.forward` followed
+    weights do not depend on `T`), each at its checkpoint dtype. `step(...)` mirrors `Qwen4ExpMTP.forward` followed
     by `compute_logits(...).argmax(-1)`.
     """
 
@@ -296,6 +317,9 @@ class MkDraft(nn.Module):
             draft, g, spec, ex, [0], tail=(mtp_model.hyper_connection_mixer, lm, V)
         )
         self.n_w = len(ops)
+        # Largest traced row count per T the kernel is built for (set by the driver from
+        # the whole-step buckets); compile ranges above it trace the stock draft step.
+        object.__setattr__(self, "max_rows", {STEP0_T: 0, LOOP_T: 0})
         for i, t in enumerate(ops):
             self.register_buffer(f"w_{i}", t, persistent=False)
         object.__setattr__(self, "pool", pool)

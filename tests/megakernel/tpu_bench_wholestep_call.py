@@ -50,6 +50,32 @@ from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_call import (
 )
 
 
+def _install_ledger() -> None:
+    """Wrap `kernel.build_scratch`: print the planned VMEM scratch of every kernel built."""
+    import math
+
+    from vllm_torchtpu.megakernel import kernel as _k
+
+    orig = _k.build_scratch
+
+    def wrapped(model_spec, ex, *args, **kw):
+        cp, scratch = orig(model_spec, ex, *args, **kw)
+        rows = sorted(
+            ((math.prod(sh) * jnp.dtype(dt).itemsize, k, sh, jnp.dtype(dt).name)
+             for k, (sh, dt) in cp.vmem_shapes.items()), reverse=True)
+        t = ex.tiles
+        print(f"LEDGER B={ex.B} MB={ex.MB} nbe={t.nbe} nbd={t.nbd} total="
+              f"{cp.vmem_bytes / 2**20:.3f} MiB ({len(rows)} buffers)", flush=True)
+        for b in model_spec.all_blocks():
+            print(f"LEDGER   widths {b.name} {type(b).__name__} {b.shared_widths(model_spec.config, ex)}",
+                  flush=True)
+        for sz, k, sh, dt in rows:
+            print(f"LEDGER   {sz / 2**20:8.3f} {k} {sh} {dt} {cp.phase_map.get(k, '')}", flush=True)
+        return cp, scratch
+
+    _k.build_scratch = wrapped
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--buckets", default="4,8,16")
@@ -81,10 +107,17 @@ def main():
                     "VLLM_TPU_MK_TILES / VLLM_TPU_MK_BUCKET_TUNE configs)")
     ap.add_argument("--trace-only", action="store_true",
                     help="CPU check: interpret Pallas, lower the call once, no run")
+    ap.add_argument("--aot", action="store_true",
+                    help="no TPU: lower + compile for a tpu7x:2x2x1 topology (CPU host with libtpu) "
+                    "and print OK or the compile error (e.g. the scoped VMEM OOM)")
     ap.add_argument("--tail", action="store_true",
                     help="VLLM_TPU_MK_WHOLE_L47: + the last QSA layer as a one-layer kernel")
+    ap.add_argument("--ledger", action="store_true",
+                    help="print each kernel's planned VMEM scratch (name, shape, dtype, MiB, phase)")
     a = ap.parse_args()
     _apply_removals(a.remove)
+    if a.ledger:
+        _install_ledger()
     if a.trace_only:
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
@@ -101,7 +134,13 @@ def main():
         qsa_full_b.UNION_SLOTS = a.slots
     # The served Pallas mesh order (get_pallas_mesh in the server: [0, 1, 4, 5, 6, 7, 2,
     # 3]).
-    by_id = {d.id: d for d in jax.devices()}
+    if a.aot:
+        from jax.experimental import topologies
+
+        devs = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x:2x2x1").devices
+    else:
+        devs = jax.devices()
+    by_id = {d.id: d for d in devs}
     mesh = jax.sharding.Mesh(
         np.array([by_id[i] for i in (0, 1, 4, 5, 6, 7, 2, 3)]), ("tp",)
     )
@@ -179,7 +218,7 @@ def main():
 
         def rnd(shape, dtype):
             nonlocal key
-            if a.trace_only:
+            if a.trace_only or a.aot:
                 return jax.ShapeDtypeStruct(shape, dtype, sharding=tp)
             key, k = jax.random.split(key)
             if jnp.issubdtype(dtype, jnp.floating):
@@ -245,8 +284,12 @@ def main():
         pool = jax.jit(
             lambda nb=NB: jnp.zeros((R * nb * 4, 128, 1, 4, 256), jnp.float8_e4m3fn),
             out_shardings=tp,
-        )() if not a.trace_only else rnd((R * NB * 4, 128, 1, 4, 256), jnp.float8_e4m3fn)
+        )() if not (a.trace_only or a.aot) else rnd((R * NB * 4, 128, 1, 4, 256), jnp.float8_e4m3fn)
         put = lambda x: jax.device_put(jnp.asarray(x), rep)  # noqa: E731
+        if a.aot:
+            put = lambda x: jax.ShapeDtypeStruct(  # noqa: E731
+                np.shape(x), jnp.asarray(x).dtype, sharding=rep
+            )
         args = [hidden, *ws, pool, *map(put, meta), *map(put, tabs), put(positions), put(qsl),
                 put(ctx), put(trig), *map(put, norms)]
         from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
@@ -254,6 +297,23 @@ def main():
         if main_kv_dcp() > 1:  # the QSA layers' dcp_rank buffer: tp rank % 2, one per rank
             args.append(jax.device_put(jnp.arange(R, dtype=jnp.int32) % main_kv_dcp(), tp))
         f = jax.jit(call, donate_argnums=donate)
+        if a.aot:
+            t0 = time.time()
+            try:
+                f.lower(*args).compile()
+                print(f"B={B} L={L} AOT OK ({time.time() - t0:.0f} s)", flush=True)
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                lines = [x for x in msg.splitlines() if "mem" in x.lower() or "oom" in x.lower()]
+                print(f"B={B} L={L} AOT FAIL ({time.time() - t0:.0f} s): "
+                      + " | ".join((lines or msg.splitlines())[:6])[:1500], flush=True)
+                if lines:  # the full allocation list (VMEM accounting)
+                    print("AOT DETAIL\n" + msg[:20000], flush=True)
+                else:
+                    import traceback
+
+                    print("AOT TRACE " + traceback.format_exc()[-3000:].replace("\n", " | "))
+            continue
         if a.trace_only:
             out = jax.eval_shape(f, *args)
             print(f"B={B} L={L} tail={a.tail} traced: {[o.shape for o in out]}", flush=True)

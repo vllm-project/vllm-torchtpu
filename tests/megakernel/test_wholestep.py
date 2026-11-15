@@ -20,6 +20,8 @@ references with `project_reference` + `reference_rows` for the QSA layers.
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -1182,11 +1184,10 @@ def test_last_layer_step_with_per_layer_metadata_matches_reference(T):
         assert dd.mean() < 3e-2 * k * scale, (r, dd.mean() / scale)
 
 
-def test_partial_last_cycle_ends_on_qsa_matches_reference():
-    """`L = 5`, `first="qsa"`: one full cycle (QSA, GDN, GDN, GDN) and a partial cycle
-    of its QSA layer, as layers 3..47 in one kernel (VLLM_TPU_MK_WHOLE_L45)."""
+def _partial_last_cycle_run(tiles):
+    """`L = 5`, `first="qsa"` whole-step call; returns (kernel residual, reference)."""
     R, T, Lt = 2, 4, 5
-    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
+    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=tiles)
     d = wi.random_wholestep_inputs(
         29, G, ex, Lt, budget=BUDGET, n_pages=PAGES, identical_experts=True, first="qsa"
     )
@@ -1216,11 +1217,29 @@ def test_partial_last_cycle_ends_on_qsa_matches_reference():
     res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, : ex.B], np.float32)
     refn = np.asarray(ref, np.float32)
     assert float(np.std(refn - np.asarray(d["inp"].x[: ex.B], np.float32))) > 0.01
+    return res, refn
+
+
+def test_partial_last_cycle_ends_on_qsa_matches_reference():
+    """`L = 5`, `first="qsa"`: one full cycle (QSA, GDN, GDN, GDN) and a partial cycle
+    of its QSA layer, as layers 3..47 in one kernel (VLLM_TPU_MK_WHOLE_L45)."""
+    R, T, Lt = 2, 4, 5
+    res, refn = _partial_last_cycle_run(_TILES)
     _assert_within_budget(res[:, T : 2 * T], refn[T : 2 * T], layers=Lt)
     scale, k = float(np.abs(refn).mean()), np.sqrt(2 * Lt / 8)
     for r in range(R):
         dd = np.abs(res[r, :T] - refn[:T])
         assert dd.mean() < 3e-2 * k * scale, (r, dd.mean() / scale)
+
+
+def test_partial_last_cycle_rel_fetch_bit_identical():
+    """`rel_fetch` (trace-time-decoded dense refills, VLLM_TPU_MK_BUCKET_TUNE b4..b32) with a
+    partial last cycle: its tiles must be refilled too. A `b < L // period` bound dropped
+    them, and the L45 kernel hung on TPU at every rel_fetch bucket (exos j-ffbb37a8,
+    j-a50b71fd). Scheduling only, so the outputs are byte-identical."""
+    base, _ = _partial_last_cycle_run(_TILES)
+    rel, _ = _partial_last_cycle_run(dataclasses.replace(_TILES, rel_fetch=True))
+    np.testing.assert_array_equal(base, rel)
 
 
 @pytest.mark.parametrize("kw", [

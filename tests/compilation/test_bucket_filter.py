@@ -255,6 +255,75 @@ def test_padded_shards_put_1024_and_3072_on_one_sp_trace(tmp_path):
     sv.in_child(partial(_padded_shards_trace_once, str(tmp_path)))
 
 
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class TokenShardIndexer(nn.Module):
+    """VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD's third graph: the
+    replicated backbone plus an all-gather, told apart by two ops."""
+
+    def __init__(self, *, backbone: nn.Module) -> None:
+        super().__init__()
+        object.__setattr__(self, "_backbone", backbone)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return sv.WAVE(sv.WAVE(x * self._backbone.weight))
+
+
+THREE_BUCKETS = [16, 256, 512, 960, 2048, 4096]
+RP_BUCKETS = {256, 512, 960}
+
+
+class ThreeGraphRouter(nn.Module):
+    """Qwen4ExpForCausalLM's routing with the replicated token-shard graph."""
+
+    def __init__(self, config: VllmConfig) -> None:
+        super().__init__()
+        from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
+
+        with set_current_vllm_config(config):
+            self.replicated = Replicated(vllm_config=config)
+            self.sharded = Sharded(vllm_config=config, backbone=self.replicated)
+            self.token_shard = TokenShardIndexer(
+                vllm_config=config, backbone=self.replicated
+            )
+        in_sp = partial(sp.sequence_parallel_eligible, tp_size=TP)
+
+        def in_rp(n):
+            return not in_sp(n) and sp.replicated_token_shard_eligible(n, TP, 16)
+
+        bucket_filter.assign(self.sharded, in_sp)
+        bucket_filter.assign(self.token_shard, in_rp)
+        bucket_filter.assign(self.replicated, lambda n: not in_sp(n) and not in_rp(n))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for module, tag in ((self.sharded, "sharded"), (self.token_shard, "rp")):
+            serves = bucket_filter.assigned(module)
+            if serves(x.shape[0]):
+                with bucket_filter.serving(serves), set_model_tag(tag):
+                    return module(x)
+        with bucket_filter.serving(bucket_filter.assigned(self.replicated)):
+            return self.replicated(x)
+
+
+def _three_graphs_compile_each_bucket_once(cache_root):
+    os.environ["VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD"] = "1"
+    config, backend, router = _prepare(cache_root, ThreeGraphRouter, THREE_BUCKETS)
+    _ladder(router, config, THREE_BUCKETS)
+    compiled = list(backend.compiled)
+    served = _serve_all(router, config, THREE_BUCKETS)
+    assert backend.compiled == compiled, backend.compiled[len(compiled) :]
+    expected = {
+        b: (b, TP if b in SP_BUCKETS else 2 if b in RP_BUCKETS else 1)
+        for b in THREE_BUCKETS
+    }
+    assert served == expected, served
+    assert sorted(compiled) == sorted(expected.values()), compiled
+    assert [n for n, _ in router.named_parameters()] == ["replicated.weight"]
+
+
+def test_replicated_token_shard_graph_takes_its_buckets_once(tmp_path):
+    sv.in_child(partial(_three_graphs_compile_each_bucket_once, str(tmp_path)))
+
+
 def test_unfiltered_outside_a_routed_call():
     assert bucket_filter.serves(16)
     with bucket_filter.serving(lambda n: n > 1000):

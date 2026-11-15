@@ -398,7 +398,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             and self.main_kv_dcp > 1
             and "mtp" not in prefix
         )
-        if self.token_shard or self.decode_token_shard:
+        # VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD: the token-sharded
+        # indexer ops for the replicated backbone's prefill graph too.
+        self.replicated_token_shard = self._replicated_token_shard_mode(
+            tp_size, pooled, prefix
+        )
+        if self.token_shard or self.decode_token_shard or self.replicated_token_shard:
             # The rank as an operand of the token-sharded indexer, so every
             # rank traces the same program.
             self.register_buffer(
@@ -443,6 +448,53 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             max_num_seqs,
         )
         return active
+
+    @staticmethod
+    def _replicated_token_shard_mode(tp_size, pooled, prefix):
+        """Whether to build the token-sharded indexer ops for the replicated
+        prefill graph (``Qwen4ExpBackboneRP``, which also serves the decode
+        buckets of VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD); the MTP draft never
+        takes it."""
+        from vllm_torchtpu.models.vllm.qwen4_exp.sequence_parallel import (
+            decode_req_shard_enabled,
+            replicated_token_shard_enabled,
+        )
+
+        active = bool(
+            tp_size > 1
+            and pooled
+            and "mtp" not in prefix
+            and (replicated_token_shard_enabled() or decode_req_shard_enabled())
+        )
+        if envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD:
+            logger.info_once(
+                "QSA token-sharded indexer for replicated prefill buckets: %s "
+                "(VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD, pooled=%s, "
+                "compressed DCP=%s)",
+                "on" if active else "OFF",
+                pooled,
+                bool(envs.VLLM_TPU_QSA_COMPRESSED_DCP),
+            )
+        return active
+
+    def _attach_union_probe(self, pool) -> None:
+        """VLLM_TPU_QSA_PREFILL_UNION_PROBE (debug, log-only): buffers for ``union_probe``."""
+        from vllm.config import get_current_vllm_config
+
+        from vllm_torchtpu.models.vllm.qwen4_exp import union_probe
+
+        config = get_current_vllm_config()
+        model_config = config.model_config
+        text = getattr(model_config, "hf_text_config", None) or model_config.hf_config
+        layer_types = getattr(text, "layer_types", None) or ()
+        if union_probe.maybe_attach(
+            self,
+            max_tokens=int(config.scheduler_config.max_num_batched_tokens),
+            width=self.max_selected_tokens,
+            device=self.rope_cache.device,
+            layer_types=layer_types,
+        ):
+            union_probe.set_page_size(int(pool.shape[1]))
 
     def get_attn_backend(self):
         return Qwen4ExpPooledQSABackend if self.pooled else Qwen4ExpQSABackend
@@ -514,7 +566,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self._shard_op = None
         self._shard_select_op = None
         self._token_shard_op = None
-        if getattr(self, "token_shard", False):
+        if getattr(self, "token_shard", False) or getattr(
+            self, "replicated_token_shard", False
+        ):
             from vllm.distributed import get_tp_group
 
             from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
@@ -585,7 +639,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 self._rows_op = draft(False, True)
                 if self._shared_ops is not None:
                     self._shared_ops = (draft(True, False), draft(True, True))
-            if getattr(self, "token_shard", False):
+            if getattr(self, "token_shard", False) or getattr(
+                self, "replicated_token_shard", False
+            ):
                 build = build_pooled_qsa_token_shard_dcp_op
                 if compressed:
                     from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
@@ -610,6 +666,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     kv_heads=self.num_kv_heads,
                     **keywords,
                 )
+            if envs.VLLM_TPU_QSA_PREFILL_UNION_PROBE:
+                self._attach_union_probe(pool)
         # With VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP a single-graph module (the
         # MTP draft, traced once for every bucket including prefill chunks)
         # keeps the replicated indexer: it cannot pick per bucket.
@@ -788,6 +846,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         token_shard=False,
         shared=None,
         decode_token_shard=False,
+        write_sink=True,
     ):
         """Attention output and selected tokens.
 
@@ -802,6 +861,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         even when the TP-sharded one is built. ``token_shard`` (static per
         graph, the prefill sequence-parallel backbone): index this rank's
         token shard of the step and all-gather the selections, when built.
+        ``write_sink=False``: leave the MTP draft's shared selection to the
+        caller (``write_selection_sink``), which runs a step in token halves.
         """
         output, selected = self.attend_with_indices(
             hidden,
@@ -812,6 +873,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             token_shard,
             shared,
             decode_token_shard,
+            write_sink,
         )
         output = self.o_proj(output)
         if reduce and self.tp_size > 1:
@@ -832,6 +894,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         token_shard=False,
         shared=None,
         decode_token_shard=False,
+        write_sink=True,
     ):
         """``forward_with_indices`` without the output projection and all-reduce.
 
@@ -930,18 +993,28 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 else {}
             ),
         )
+        if rows is None and getattr(self, "_union_probe_selected", None) is not None:
+            # VLLM_TPU_QSA_PREFILL_UNION_PROBE (debug, log-only): copies only.
+            from vllm_torchtpu.models.vllm.qwen4_exp import union_probe
+
+            union_probe.stash(self, selected, positions)
         if pick_rows:
             keep = (rows >= 0)[:, None]
             picked = rows.clamp_min(0)
             output = torch.where(keep, output[picked], 0)
             selected = torch.where(keep, selected[picked], -1)
+        if write_sink and rows is None:
+            self.write_selection_sink(selected)
+        return output, selected
+
+    def write_selection_sink(self, selected):
+        """The target's selection of a whole step for the MTP draft
+        (bind_shared_selection); nothing without a draft bound."""
         sink = getattr(self, "_selection_sink", None)
-        if sink is not None and rows is None:
-            # The target's selection for the MTP draft (bind_shared_selection).
+        if sink is not None:
             # Both writes go through the donating row update: a slice copy_
             # into the buffer copied all of it every step (~42 us at 8192 rows).
             update_rows_(sink, selected)
-        return output, selected
 
     def select_for_kernel(self, hidden, positions, metadata: QSAMetadata):
         """Cache writes and the indexer only; the attention runs in the Qwen3.8

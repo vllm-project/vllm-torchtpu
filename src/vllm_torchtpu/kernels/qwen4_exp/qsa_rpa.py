@@ -613,19 +613,34 @@ def _prefill_attention(
     kv_head_offset=0,
     dcp=None,
     return_lse=False,
+    ascending=False,
 ):
     """With ``return_lse`` returns ``(out, lse, cache)`` (see
-    ``block_sparse_gqa_attention``)."""
+    ``block_sparse_gqa_attention``). ``ascending``: rows' valid selections
+    are ascending (a speed hint for the block-sparse DCP path)."""
     union_group = envs.VLLM_TPU_QSA_PREFILL_UNION_WALK
     if union_group and (128 % union_group or union_group < 8):
         raise ValueError(
             "VLLM_TPU_QSA_PREFILL_UNION_WALK must be a divisor of 128, at least 8"
         )
+    # VLLM_TPU_QSA_PREFILL_UNION_DCP: the union walk also serves main-KV DCP's
+    # (out, lse) partials (bit-scan walk only; either paired KV slot).
+    union_dcp = bool(
+        union_group
+        and dcp is not None
+        and return_lse
+        and envs.VLLM_TPU_QSA_PREFILL_UNION_DCP
+        and kv_heads == 1
+        and kv_head_offset in (0, 1)
+        and not envs.VLLM_TPU_QSA_PREFILL_UNION_LISTED
+        and not envs.VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES
+        and not envs.VLLM_TPU_QSA_PREFILL_UNION_GATHERED
+        and not envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS
+        and not envs.VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS
+    )
     if (
         union_group
-        and dcp is None
-        and not return_lse
-        and kv_head_offset == 0
+        and (union_dcp or (dcp is None and not return_lse and kv_head_offset == 0))
         and ratio == 4
         and cache.dtype == jnp.float8_e4m3fn
         and cache.shape[1] % 128 == 0
@@ -657,7 +672,11 @@ def _prefill_attention(
             lean=envs.VLLM_TPU_QSA_PREFILL_LEAN,
             listed=envs.VLLM_TPU_QSA_PREFILL_UNION_LISTED or None,
             share_bits=envs.VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS,
-            union_alpha=envs.VLLM_TPU_QSA_PREFILL_UNION_ALPHA,
+            union_alpha=(
+                envs.VLLM_TPU_QSA_PREFILL_UNION_DCP_ALPHA
+                if union_dcp
+                else envs.VLLM_TPU_QSA_PREFILL_UNION_ALPHA
+            ),
             qk16=envs.VLLM_TPU_QSA_PREFILL_UNION_QK16,
             run_tables=envs.VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES,
             lazy_share=envs.VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE,
@@ -667,7 +686,67 @@ def _prefill_attention(
             compact_reqs=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS,
             compact_copy_method=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY,
             sc_bitset=envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET,
+            **(
+                {
+                    "dcp": dcp,
+                    "return_lse": True,
+                    "kv_head_offset": kv_head_offset,
+                    "precheck_stride": envs.VLLM_TPU_QSA_PREFILL_UNION_DCP_PRECHECK,
+                    "precheck_cost": _union_dcp_cost(),
+                }
+                if union_dcp
+                else {}
+            ),
         )
+    return block_sparse_prefill(
+        query,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        starts,
+        kv_heads=kv_heads,
+        ratio=ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_head_offset=kv_head_offset,
+        dcp=dcp,
+        return_lse=return_lse,
+        **({"ascending": True} if ascending and dcp is not None else {}),
+    )
+
+
+def _union_dcp_cost():
+    raw = envs.VLLM_TPU_QSA_PREFILL_UNION_DCP_COST.strip()
+    if not raw or raw.lower() in ("0", "off", "none"):
+        return None
+    cost = tuple(float(x) for x in raw.split(","))
+    if len(cost) != 4:
+        raise ValueError("VLLM_TPU_QSA_PREFILL_UNION_DCP_COST: walk_fixed,walk_per_group,sparse_fixed,sparse_per_page")
+    return cost
+
+
+def block_sparse_prefill(
+    query,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    starts,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+    kv_head_offset=0,
+    dcp=None,
+    return_lse=False,
+    ascending=False,
+):
+    """``_prefill_attention``'s block-sparse call (served tiles, DCP tiles under
+    ``dcp``); also the DCP union walk's fallback."""
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,
     )
@@ -713,6 +792,7 @@ def _prefill_attention(
         **({"query_tile": query_tile} if query_tile else {}),
         **({"dcp": dcp} if dcp is not None else {}),
         **({"return_lse": True} if return_lse else {}),
+        **({"ascending": True} if ascending else {}),
     )
 
 
@@ -870,6 +950,7 @@ def qsa_attention(
     if ascending and dcp is not None:
         # The selection rows are ascending (see virtual_page_metadata).
         decode_fn = functools.partial(decode_fn, ascending=True)
+        prefill_fn = functools.partial(prefill_fn, ascending=True)
     if len(query) <= (len(starts) - 1) * max_query_len:
         output, cache = decode_fn(query, gate, blocks, lengths, table, cache, **options)
         return split(output, lengths, cache) if dcp is not None else (output, cache)

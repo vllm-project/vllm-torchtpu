@@ -55,6 +55,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
+from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
@@ -207,7 +208,10 @@ def gdn_attention_pooled_core_tpu(
     conv_weight_kmajor: bool = False,
     step_metadata: tuple[jax.Array, ...] | None = None,
     prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
-) -> tuple[jax.Array, jax.Array]:
+    packed_metadata: jax.Array | None = None,
+    metadata_only: bool = False,
+    packed_size: int = 0,
+) -> tuple[jax.Array, jax.Array] | jax.Array:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
         b,
@@ -236,6 +240,9 @@ def gdn_attention_pooled_core_tpu(
         conv_weight_kmajor=conv_weight_kmajor,
         step_metadata=step_metadata,
         prefill_ckpt=prefill_ckpt,
+        packed_metadata=packed_metadata,
+        metadata_only=metadata_only,
+        packed_size=packed_size,
     )
 
 
@@ -410,17 +417,59 @@ class GdnStepMetadataCache:
     """
 
     def __init__(self) -> None:
-        self._entries: list[tuple[Any, tuple[torch.Tensor, ...]]] = []
+        self._entries: list[tuple[str, Any, tuple[torch.Tensor, ...]]] = []
 
     def get(
-        self, attn_metadata: Any, build: Callable[[], tuple[torch.Tensor, ...]]
+        self,
+        attn_metadata: Any,
+        build: Callable[[], tuple[torch.Tensor, ...]],
+        kind: str = "step",
     ) -> tuple[torch.Tensor, ...]:
-        for key, value in self._entries:
-            if key is attn_metadata:
+        """``kind`` separates the memos of one group: ``"step"`` for
+        VLLM_TPU_GDN_HOIST_METADATA, ``"kernel"`` for
+        VLLM_TPU_GDN_STEP_KERNEL_METADATA."""
+        for entry_kind, key, value in self._entries:
+            if entry_kind == kind and key is attn_metadata:
                 return value
         value = build()
-        self._entries.append((attn_metadata, value))
+        self._entries.append((kind, attn_metadata, value))
         return value
+
+
+def _half_step(sp_half, attn_metadata, state_indices, distribution, slot_read_offsets):
+    """A GDN group's metadata for one token half of a micro-batched
+    sequence-parallel step: ``(memo key, query_start_loc, seq_lens,
+    distribution, slot_read_offsets)``.
+
+    Requests continued from an earlier half read checkpoint 0, where that half
+    wrote their final state: their entry of the per-block read offsets (indexed
+    by the same state ids as the op's gather) becomes 0.
+    """
+    plan, g = sp_half
+    half = plan.gdn(
+        attn_metadata,
+        attn_metadata.query_start_loc,
+        attn_metadata.seq_lens,
+        distribution,
+        g,
+    )
+    if half.resume_from_carry is not None and slot_read_offsets is not None:
+        ids = state_indices.long()
+        slot_read_offsets = slot_read_offsets.index_put(
+            (ids,),
+            torch.where(
+                half.resume_from_carry,
+                torch.zeros_like(slot_read_offsets[ids]),
+                slot_read_offsets[ids],
+            ),
+        )
+    return (
+        half,
+        half.query_start_loc,
+        half.seq_lens,
+        half.distribution,
+        slot_read_offsets,
+    )
 
 
 @QwenGatedDeltaNetAttention.register_oot
@@ -477,6 +526,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             self._build_pooled_gdn_op(hoisted=True)
             if envs.VLLM_TPU_GDN_HOIST_METADATA and not self._bm_kernel
             else None
+        )
+        # VLLM_TPU_GDN_STEP_KERNEL_METADATA: the step op building the packed
+        # kernel metadata and the layer op consuming it. Plain unified pool
+        # only, as for the hoisted op.
+        step_kmeta = envs.VLLM_TPU_GDN_STEP_KERNEL_METADATA and not self._bm_kernel
+        self.gdn_kernel_metadata_op = (
+            self._build_pooled_gdn_op(kernel_metadata="step") if step_kmeta else None
+        )
+        self.gdn_pooled_kmeta_op = (
+            self._build_pooled_gdn_op(kernel_metadata="layer") if step_kmeta else None
         )
         # Built here, not on first use: registering a custom op while dynamo
         # traces the forward is an error.
@@ -827,9 +886,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         block_major: bool = False,
         hoisted: bool = False,
         prefill_ckpt: bool = False,
+        kernel_metadata: str | None = None,
     ):
         """The pooled GDN op. ``prefill_ckpt``: the variant taking internal
-        prefill checkpoint offsets and blocks (VLLM_TPU_MAMBA_TAIL_FOLD)."""
+        prefill checkpoint offsets and blocks (VLLM_TPU_MAMBA_TAIL_FOLD).
+        ``kernel_metadata`` (VLLM_TPU_GDN_STEP_KERNEL_METADATA): ``"step"``
+        builds the op returning the step's packed kernel metadata;
+        ``"layer"`` the layer op taking it as a last operand."""
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = cast(VllmConfig, vllm_context.vllm_config)
@@ -846,6 +909,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # checkpoint selection (see TPUModelRunner.mamba_slot_read_offsets).
         num_spec_tokens = self.num_spec
         conv_weight_kmajor = envs.VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR
+        # VLLM_TPU_GDN_STEP_KERNEL_METADATA: the step op's output length, from
+        # the scheduler's static limits only (the token dim is dynamic in the
+        # traced forward; no shape of it may reach a Python int).
+        packed_size = 0
+        if kernel_metadata is not None:
+            scheduler = getattr(vllm_config, "scheduler_config", None)
+            max_tokens = getattr(scheduler, "max_num_batched_tokens", None) or 16384
+            max_seqs = getattr(scheduler, "max_num_seqs", None) or 256
+            packed_size = gdn_v3_wrapper.packed_kernel_metadata_size(
+                max_tokens, max_seqs, num_spec_tokens
+            )
 
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
@@ -867,6 +941,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             ckpt_indices,
             step_metadata=None,
             prefill_ckpt=None,
+            packed_metadata=None,
+            metadata_only=False,
         ):
             # Fold the `(num_blocks, rows_per_block, *page)` block-major pool so
             # pool adapters index flat kernel blocks along dim 0; both reshapes
@@ -907,8 +983,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 conv_weight_kmajor=conv_weight_kmajor,
                 step_metadata=step_metadata,
                 prefill_ckpt=prefill_ckpt,
+                packed_metadata=packed_metadata,
+                metadata_only=metadata_only,
+                packed_size=packed_size if metadata_only else 0,
             )
-            if not block_major:
+            if not block_major or metadata_only:
                 return result
             new_pool, output = result
             return new_pool.reshape(recurrent_state.shape), output
@@ -1031,11 +1110,93 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 prefill_ckpt=(ckpt_offsets, ckpt_blocks),
             )
 
+        def wrapped_kmeta_fn(
+            mixed_qkv: jax.Array,
+            b: jax.Array,
+            a: jax.Array,
+            recurrent_state: jax.Array,
+            conv_weight: jax.Array,
+            conv_bias: jax.Array | None,
+            A_log: jax.Array,
+            dt_bias: jax.Array,
+            state_indices: jax.Array,
+            query_start_loc: jax.Array,
+            distribution: jax.Array,
+            seq_lens: jax.Array,
+            slot_read_offsets: jax.Array | None,
+            ckpt_indices: jax.Array | None,
+            packed_metadata: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return run(
+                mixed_qkv,
+                b,
+                a,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                distribution,
+                seq_lens,
+                slot_read_offsets,
+                ckpt_indices,
+                packed_metadata=packed_metadata,
+            )
+
+        def step_kmeta_fn(
+            mixed_qkv: jax.Array,
+            b: jax.Array,
+            a: jax.Array,
+            recurrent_state: jax.Array,
+            conv_weight: jax.Array,
+            conv_bias: jax.Array | None,
+            A_log: jax.Array,
+            dt_bias: jax.Array,
+            state_indices: jax.Array,
+            query_start_loc: jax.Array,
+            distribution: jax.Array,
+            seq_lens: jax.Array,
+            slot_read_offsets: jax.Array | None = None,
+            ckpt_indices: jax.Array | None = None,
+        ) -> jax.Array:
+            # Reads only shapes of the activations and the pool.
+            return run(
+                mixed_qkv,
+                b,
+                a,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                distribution,
+                seq_lens,
+                slot_read_offsets,
+                ckpt_indices,
+                metadata_only=True,
+            )
+
+        def _fake_step_kmeta(mixed_qkv, *args):
+            # Static length: reading the (dynamic) token dim here would
+            # specialize the traced forward on it.
+            return torch.empty(
+                (packed_size,), dtype=torch.int32, device=mixed_qkv.device
+            )
+
         def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)
             out_shape = (num_tokens, local_num_v_heads, d_v)
             out = torch.empty(out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
             return torch.empty_like(recurrent_state), out
+
+        def build_step_kmeta_op(op_name: str):
+            op = pallas.jax_op(op_name, step_kmeta_fn)
+            op.register_fake(_fake_step_kmeta)
+            return op
 
         def build_op(op_name: str):
             # The recurrent state (arg 3) is the attention-shaped pool: the ssm
@@ -1049,13 +1210,22 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 if hoisted
                 else wrapped_ckpt_fn
                 if prefill_ckpt
+                else wrapped_kmeta_fn
+                if kernel_metadata == "layer"
                 else wrapped_fn,
                 donate_argnums=(3,),
             )
             op.register_fake(_fake_gdn)
             return op
 
-        if hoisted:
+        if kernel_metadata is not None:
+            assert not block_major and not prefill_ckpt and not hoisted
+            kind = (
+                "gdn_kernel_metadata"
+                if kernel_metadata == "step"
+                else "gdn_attention_pooled_kmeta"
+            )
+        elif hoisted:
             assert not block_major and not prefill_ckpt
             kind = "gdn_attention_pooled_hoisted"
         else:
@@ -1078,8 +1248,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 num_spec_tokens,
                 conv_weight_kmajor,
             ),
-            build_op,
+            build_step_kmeta_op if kernel_metadata == "step" else build_op,
         )
+
+        if kernel_metadata == "step":
+
+            def kmeta_impl(*inputs: torch.Tensor) -> torch.Tensor:
+                return gdn_jax_op(*inputs)
+
+            return kmeta_impl
 
         def gdn_impl(
             mixed_qkv: torch.Tensor,
@@ -1102,7 +1279,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # read offsets / int32 checkpoint ids, followed by the rolled
             # per-sequence inputs (see gdn_step_metadata). Checkpoint variant:
             # followed by the checkpoint offsets and blocks.
-            assert len(step_metadata) == (5 if hoisted else 2 if prefill_ckpt else 0)
+            assert len(step_metadata) == (
+                5
+                if hoisted
+                else 2
+                if prefill_ckpt
+                else 1
+                if kernel_metadata == "layer"
+                else 0
+            )
             new_rec, outputs = gdn_jax_op(
                 mixed_qkv,
                 b,
@@ -1403,10 +1588,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
         gdn_step_metadata_cache: GdnStepMetadataCache | None = None,
+        sp_half: tuple[Any, int] | None = None,
     ) -> torch.Tensor:
+        """``sp_half=(plan, g)``: ``hidden_states`` is token half ``g`` of a
+        micro-batched sequence-parallel step (``sequence_parallel.MicroBatchPlan``,
+        VLLM_TPU_SP_MICROBATCH_OVERLAP); the core runs it as a step of its own,
+        after the earlier halves wrote their states."""
         num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
         if self._has_active_pooled_pcp_state(kv_cache):
+            if sp_half is not None:
+                raise NotImplementedError("GDN PCP streaming with SP micro-batches")
             assert kv_cache is not None
             attn_metadata = cast(
                 "dict[str, _GdnAttentionMetadata]", get_forward_context().attn_metadata
@@ -1488,10 +1680,31 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         "Speculative decoding with GDN layers requires "
                         "mamba_slot_read_offsets in the attention metadata."
                     )
+                query_start_loc = attn_metadata.query_start_loc
+                seq_lens = attn_metadata.seq_lens
+                step_key: Any = attn_metadata
+                if sp_half is not None:
+                    (
+                        step_key,
+                        query_start_loc,
+                        seq_lens,
+                        request_distribution,
+                        slot_read_offsets,
+                    ) = _half_step(
+                        sp_half,
+                        attn_metadata,
+                        state_indices,
+                        request_distribution,
+                        slot_read_offsets,
+                    )
                 ckpt_indices = mamba_ckpt_of(attn_metadata)
                 step_metadata: tuple[torch.Tensor, ...] = ()
                 pooled_op = self.gdn_pooled_op
                 prefill_ckpt = getattr(attn_metadata, "mamba_prefill_ckpt", None)
+                if prefill_ckpt is not None and sp_half is not None:
+                    raise NotImplementedError(
+                        "VLLM_TPU_MAMBA_TAIL_FOLD with SP micro-batches"
+                    )
                 if prefill_ckpt is not None:
                     assert self.gdn_pooled_ckpt_op is not None, (
                         "mamba_prefill_ckpt without VLLM_TPU_MAMBA_TAIL_FOLD"
@@ -1511,6 +1724,38 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     pooled_op = self.gdn_pooled_ckpt_op
                 elif (
                     gdn_step_metadata_cache is not None
+                    and self.gdn_pooled_kmeta_op is not None
+                    and self.gdn_kernel_metadata_op is not None
+                    and sp_half is None
+                ):
+                    # VLLM_TPU_GDN_STEP_KERNEL_METADATA: the first layer of the
+                    # group builds both segments' kernel metadata; every layer
+                    # passes it to its op.
+                    kmeta_inputs = (
+                        mixed_qkv,
+                        b,
+                        a,
+                        recurrent_state,
+                        self._pooled_conv_weight(),
+                        self.conv1d.bias,
+                        self.A_log,
+                        self.dt_bias,
+                        state_indices,
+                        query_start_loc,
+                        request_distribution,
+                        seq_lens,
+                        slot_read_offsets,
+                        ckpt_indices,
+                    )
+                    kmeta_op = self.gdn_kernel_metadata_op
+                    step_metadata = gdn_step_metadata_cache.get(
+                        step_key,
+                        lambda: (kmeta_op(*kmeta_inputs),),
+                        kind="kernel",
+                    )
+                    pooled_op = self.gdn_pooled_kmeta_op
+                elif (
+                    gdn_step_metadata_cache is not None
                     and self.gdn_pooled_hoisted_op is not None
                     and self.gdn_step_metadata_op is not None
                     and slot_read_offsets is not None
@@ -1521,14 +1766,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     group_inputs = (
                         slot_read_offsets,
                         state_indices,
-                        attn_metadata.query_start_loc,
-                        attn_metadata.seq_lens,
+                        query_start_loc,
+                        seq_lens,
                         request_distribution,
                         ckpt_indices,
                     )
                     slot_read_offsets, ckpt_indices, *rest = (
                         gdn_step_metadata_cache.get(
-                            attn_metadata,
+                            step_key,
                             lambda: tuple(self.gdn_step_metadata_op(*group_inputs)),
                         )
                     )
@@ -1544,9 +1789,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     self.A_log,
                     self.dt_bias,
                     state_indices,
-                    attn_metadata.query_start_loc,
+                    query_start_loc,
                     request_distribution,
-                    attn_metadata.seq_lens,
+                    seq_lens,
                     slot_read_offsets,
                     ckpt_indices,
                     *step_metadata,
@@ -1588,6 +1833,26 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 if mamba_request_distribution is not None:
                     request_distribution = mamba_request_distribution
                 use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
+                query_start_loc = attn_metadata.query_start_loc
+                seq_lens = attn_metadata.seq_lens
+                if sp_half is not None:
+                    if use_pcp_streaming:
+                        raise NotImplementedError(
+                            "GDN PCP prefill with SP micro-batches"
+                        )
+                    (
+                        _,
+                        query_start_loc,
+                        seq_lens,
+                        request_distribution,
+                        slot_read_offsets,
+                    ) = _half_step(
+                        sp_half,
+                        attn_metadata,
+                        state_indices,
+                        request_distribution,
+                        slot_read_offsets,
+                    )
                 if not use_pcp_streaming and self.num_spec > 0:
                     assert slot_read_offsets is not None, (
                         "Speculative decoding with GDN layers requires "
@@ -1607,9 +1872,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         self.A_log,
                         self.dt_bias,
                         state_indices,
-                        attn_metadata.query_start_loc,
+                        query_start_loc,
                         request_distribution,
-                        attn_metadata.seq_lens,
+                        seq_lens,
                         slot_read_offsets,
                     )
                 else:
