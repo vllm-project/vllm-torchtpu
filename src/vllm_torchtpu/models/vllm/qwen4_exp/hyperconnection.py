@@ -249,15 +249,23 @@ class GatedResidual(common_hc.GatedResidual):
 
     @property
     def sp_tile_alignment(self) -> int:
-        """Row multiple keeping active prefill Pallas kernels on one SP trace."""
+        """Row multiple keeping explicit prefill Pallas kernels on one SP trace.
+
+        Auto tiles gate on >= AUTO_MIN_TOKENS (1024) shard rows and are omitted
+        so smaller SP shards stay on ROW_ALIGNMENT without padding.
+        """
         tiles: list[int] = [self.prefill_up_tile, self.prefill_norm_tile]
-        if self._prefill_full_ops:
-            tiles.append(max(self._prefill_full_ops))
-        elif isinstance(self.prefill_full_tile, int) and self.prefill_full_tile:
+        if (
+            isinstance(self.prefill_full_tile, int)
+            and self.prefill_full_tile
+            and self._prefill_full_ops
+        ):
             tiles.append(self.prefill_full_tile)
-        if self._prefill_combine_op is not None:
-            tiles.append(self._combine_token_tile)
-        elif isinstance(self.prefill_combine_tile, int) and self.prefill_combine_tile:
+        if (
+            isinstance(self.prefill_combine_tile, int)
+            and self.prefill_combine_tile
+            and self._prefill_combine_op is not None
+        ):
             tiles.append(self.prefill_combine_tile)
         return math.lcm(1, *(tile for tile in tiles if tile))
 

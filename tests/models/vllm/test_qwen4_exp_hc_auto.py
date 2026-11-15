@@ -682,7 +682,7 @@ def test_tpu_8i_admits_m256_full_mix_and_m128_residual(boundaries, monkeypatch):
     assert tuple(module._prefill_full_ops) == (256, 128)
     assert module._combine_token_tile == 128
     assert module._prefill_combine_op is not None
-    assert module.sp_tile_alignment == 256
+    assert module.sp_tile_alignment == 1
     x, block = route_inputs(4096)
     inj = SimpleNamespace(
         shape=(4096, 4),
