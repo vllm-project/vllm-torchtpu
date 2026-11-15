@@ -21,7 +21,7 @@ A hit can come from more than one tier:
 - **Blocks in different tiers.** Each tier counts the tokens of its own blocks. For example, the first 1024 tokens of a 2048-token hit are in host DRAM and the other 1024 are in storage: `host` and `disk` each grow by 1024.
 - **Two kinds of cached data for the same tokens.** A hybrid model caches attention KV and linear-attention state, and a hit needs both. Such tokens are counted once, under the slowest tier that holds a part of them: `disk` is slower than `p2p`, and `p2p` is slower than `host`. For example, the attention KV of a 2048-token hit is in host DRAM and its linear-attention state is in storage: `disk` grows by 2048, and `host` does not grow.
 
-## `vllm:kv_offload_hit_tokens`
+## `vllm:kv_offload_raiden_hit_tokens`
 
 The connector's own counter of the prompt tokens that the offload tiers supplied. It counts the same hits as the `host`, `p2p`, and `disk` series of `vllm:prompt_tokens_cached_by_source`. Its `backend` label also names what serves the tier:
 
@@ -31,15 +31,15 @@ The connector's own counter of the prompt tokens that the offload tiers supplied
 | `p2p` | `rdma` | The host DRAM pool of another engine. |
 | `disk` | `posix`, the storage type | The storage tier. |
 
-Unlike `vllm:prompt_tokens_cached_by_source`, it has no `device` series and no `external_unspecified` series: it counts only tokens that an offload tier supplied. It is a counter, so a scrape shows it as `vllm:kv_offload_hit_tokens_total`.
+Unlike `vllm:prompt_tokens_cached_by_source`, it has no `device` series and no `external_unspecified` series: it counts only tokens that an offload tier supplied. It is a counter, so a scrape shows it as `vllm:kv_offload_raiden_hit_tokens_total`.
 
 ### Series at startup
 
 The `rate()` and `increase()` functions of Prometheus miss the first increment of a series that did not exist before. So the series of every configured tier are created at 0 at startup, for each engine:
 
 ```text
-vllm:kv_offload_hit_tokens_total{backend="dram",engine="0",model_name="my-model",source="host"} 0.0
-vllm:kv_offload_hit_tokens_total{backend="posix",engine="0",model_name="my-model",source="disk"} 0.0
+vllm:kv_offload_raiden_hit_tokens_total{backend="dram",engine="0",model_name="my-model",source="host"} 0.0
+vllm:kv_offload_raiden_hit_tokens_total{backend="posix",engine="0",model_name="my-model",source="disk"} 0.0
 ```
 
 | Tier | Configured when |

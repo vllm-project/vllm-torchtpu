@@ -84,7 +84,7 @@ SubBlockSourceCounts = tuple[tuple[CacheHitSource, int], ...]
 class RaidenOffloadMetricName(enum.StrEnum):
     """Directional Prometheus metrics emitted by Raiden KV offload."""
 
-    HIT_TOKENS = "vllm:kv_offload_hit_tokens"
+    HIT_TOKENS = "vllm:kv_offload_raiden_hit_tokens"
 
 
 def build_raiden_offload_metric_definitions(
@@ -118,7 +118,7 @@ class RaidenOffloadPromMetrics(OffloadPromMetrics):
     `KVTransferConfig` are mutated.
 
     `configured_tier_labels` holds the `(source, backend)` labels of the tiers
-    the deployment enables. Each engine's `vllm:kv_offload_hit_tokens` series
+    the deployment enables. Each engine's `vllm:kv_offload_raiden_hit_tokens` series
     for these tiers are created at 0 on startup. Prometheus counts a series
     from the first value it scrapes, so `rate()` and `increase()` would miss
     the first hit of a series that only appeared with that hit.
@@ -451,7 +451,7 @@ class RaidenOffloadStatsCollector:
         *,
         preempted: bool = False,
     ) -> None:
-        """Increment `vllm:kv_offload_hit_tokens` for non-preempted admissions.
+        """Increment `vllm:kv_offload_raiden_hit_tokens` for non-preempted admissions.
 
         Matches upstream `Scheduler.schedule()`: re-admissions after preemption
         (`request.num_preemptions > 0`) skip `HIT_TOKENS` so per-request prefix

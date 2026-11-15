@@ -480,7 +480,9 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     disk_load_labels = {**base_labels, "source": "disk", "backend": "posix"}
 
     assert (
-        registry.get_sample_value("vllm:kv_offload_hit_tokens_total", disk_load_labels)
+        registry.get_sample_value(
+            "vllm:kv_offload_raiden_hit_tokens_total", disk_load_labels
+        )
         == 32.0
     )
     # Deprecated CPUOffloadingSpec metric stays at its initial 0.0 value.
@@ -530,7 +532,7 @@ def test_prom_metrics_start_each_configured_tier_hit_series_at_zero(
     for engine in ("0", "1"):
         for source, backend in (("host", "dram"), ("p2p", "rdma"), ("disk", "posix")):
             value = registry.get_sample_value(
-                "vllm:kv_offload_hit_tokens_total",
+                "vllm:kv_offload_raiden_hit_tokens_total",
                 {
                     "model_name": "test-model",
                     "engine": engine,
@@ -595,7 +597,7 @@ def test_tpu_multi_connector_builds_and_observes_raiden_offload_prom_metrics() -
     multi_prom.observe(multi_stats.to_dict(), engine_idx=0)
     assert (
         registry.get_sample_value(
-            "vllm:kv_offload_hit_tokens_total",
+            "vllm:kv_offload_raiden_hit_tokens_total",
             {"model_name": "disagg-model", "source": "disk", "backend": "posix"},
         )
         == 64.0
