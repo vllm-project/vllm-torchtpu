@@ -431,6 +431,9 @@ class TestVllmGatedDeltaNetAttention:
 
         with (
             patch.object(VllmGatedDeltaNetAttention, "_create_conv1d"),
+            # The patched base __init__ sets no prefix; __init__ registers it.
+            patch.object(VllmGatedDeltaNetAttention, "prefix", "layers.0.linear_attn", create=True),
+            patch.object(gdn_attention_op, "_POOLED_GDN_PREFIXES", set()),
             set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
             patch(
                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
@@ -464,6 +467,9 @@ class TestVllmGatedDeltaNetAttention:
 
         with (
             patch.object(VllmGatedDeltaNetAttention, "_create_conv1d"),
+            # The patched base __init__ sets no prefix; __init__ registers it.
+            patch.object(VllmGatedDeltaNetAttention, "prefix", "layers.0.linear_attn", create=True),
+            patch.object(gdn_attention_op, "_POOLED_GDN_PREFIXES", set()),
             set_vllm_model_wrapper_context(
                 mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)
             ),
@@ -586,7 +592,9 @@ class TestVllmGatedDeltaNetAttention:
             gdn_impl = attn._build_pooled_gdn_op()
 
         # Mirrors the operand order at the forward's call site, ending with
-        # slot_read_offsets and the per-checkpoint block indices.
+        # slot_read_offsets, the per-checkpoint block indices, and the stacked
+        # state indices with this layer's row (VLLM_TPU_GDN_LEAN_GLUE; None
+        # with the flag off).
         operands = (
             torch.zeros((2, 64)),  # mixed_qkv
             torch.zeros((2, 64)),  # b
@@ -602,6 +610,8 @@ class TestVllmGatedDeltaNetAttention:
             torch.zeros(2, dtype=torch.int32),  # seq_lens
             torch.zeros(2, dtype=torch.int32),  # slot_read_offsets
             torch.zeros((2, 5), dtype=torch.int32),  # ckpt_indices
+            torch.zeros((3, 2), dtype=torch.int32),  # stacked_state_indices
+            torch.zeros(1, dtype=torch.int32),  # layer_row
         )
         gdn_impl(*operands)
 

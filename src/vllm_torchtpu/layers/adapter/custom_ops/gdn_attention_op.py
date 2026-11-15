@@ -190,6 +190,8 @@ def gdn_attention_pooled_core_tpu(
     seq_lens: jax.Array,
     slot_read_offsets: jax.Array | None = None,
     ckpt_indices: jax.Array | None = None,
+    stacked_state_indices: jax.Array | None = None,
+    layer_row: jax.Array | None = None,
     *,
     mesh: jax.sharding.Mesh,
     n_kq: int,
@@ -202,6 +204,8 @@ def gdn_attention_pooled_core_tpu(
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    window_log: bool = False,
+    window_factored: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -218,6 +222,8 @@ def gdn_attention_pooled_core_tpu(
         seq_lens,
         slot_read_offsets,
         ckpt_indices,
+        stacked_state_indices,
+        layer_row,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -229,6 +235,8 @@ def gdn_attention_pooled_core_tpu(
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
+        window_log=window_log,
+        window_factored=window_factored,
     )
 
 
@@ -366,6 +374,16 @@ def _get_shared_gdn_op(kind: str, key: tuple, build: Callable[[str], Any]) -> An
     return op
 
 
+# Prefixes of every GDN layer built with the pooled op, the rows of the stacks
+# VLLM_TPU_GDN_LEAN_GLUE passes to each layer's kernels.
+_POOLED_GDN_PREFIXES: set[str] = set()
+
+
+def stacked_gdn_prefixes(attn_metadata) -> list[str]:
+    """The pooled GDN layers of this forward, in stack row order."""
+    return sorted(p for p in _POOLED_GDN_PREFIXES if p in attn_metadata)
+
+
 @QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Whether pooled ops consume the merged block-major unified pool, along
@@ -377,6 +395,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # projection set this; VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ then hands the
     # pooled op in_proj_qkvz's output instead of a copied q|k|v slice.
     pooled_qkvz_input: bool = False
+    # Whether this layer's pooled state may run the GDN window log
+    # (VLLM_TPU_GDN_WINDOW_LOG); the model's config validation admits it.
+    window_log_supported: bool = False
     _pooled_pass_qkvz: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
 
@@ -412,6 +433,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
+        _POOLED_GDN_PREFIXES.add(self.prefix)
         self._pooled_pass_qkvz = bool(
             envs.VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ
             and type(self).pooled_qkvz_input
@@ -435,6 +457,40 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         """Binds this layer to its region index within the merged block-major pool."""
         assert self._bm_kernel, "pooled ops were built for per-region pools"
         self._bm_region = (pool_index, layout)
+
+    def _stacked_slot_rows(
+        self, state_indices: torch.Tensor, slot_read_offsets: torch.Tensor | None
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Every pooled GDN layer's state indices of the step, stacked
+        [layers, max_reqs], and this layer's row (VLLM_TPU_GDN_LEAN_GLUE).
+
+        Each layer builds the same stack from the forward context, so the
+        read-offset gather, the PER_SEQ roll and the kernels' SMEM operands
+        are one computation a step (XLA merges the identical ops) and each
+        kernel reads its row. (None, None) when the flag is off, without
+        speculative decoding, or with the block-major pool, whose per-layer
+        id mapping the stack does not apply.
+        """
+        if (
+            not envs.VLLM_TPU_GDN_LEAN_GLUE
+            or slot_read_offsets is None
+            or self._bm_kernel
+        ):
+            return None, None
+        attn_metadata = get_forward_context().attn_metadata
+        prefixes = stacked_gdn_prefixes(attn_metadata)
+        stacked = torch.stack(
+            [attn_metadata[p].mamba_state_indices.to(torch.int32) for p in prefixes]
+        )
+        if stacked.shape[-1] != state_indices.shape[0]:
+            raise RuntimeError(
+                f"GDN layers disagree on the request count: {tuple(stacked.shape)} "
+                f"vs {tuple(state_indices.shape)}"
+            )
+        row = torch.full(
+            (1,), prefixes.index(self.prefix), dtype=torch.int32, device=stacked.device
+        )
+        return stacked, row
 
     def _bm_state_ids(self, ids: torch.Tensor) -> torch.Tensor:
         if not self._bm_kernel:
@@ -781,6 +837,20 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # checkpoint selection (see TPUModelRunner.mamba_slot_read_offsets).
         num_spec_tokens = self.num_spec
         conv_weight_kmajor = envs.VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR
+        # The window log replaces checkpoints 1..K with the draft operands
+        # in checkpoint block 0; every pooled call of the engine runs it.
+        window_log = bool(envs.VLLM_TPU_GDN_WINDOW_LOG)
+        window_factored = bool(envs.VLLM_TPU_GDN_WINDOW_FACTORED)
+        if window_factored and not window_log:
+            raise ValueError(
+                "VLLM_TPU_GDN_WINDOW_FACTORED refused: it needs VLLM_TPU_GDN_WINDOW_LOG"
+            )
+        if window_log and (not type(self).window_log_supported or num_spec_tokens < 1):
+            raise ValueError(
+                f"VLLM_TPU_GDN_WINDOW_LOG refused: {type(self).__name__} with "
+                f"{num_spec_tokens} speculative tokens does not run the GDN "
+                "window log"
+            )
 
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
@@ -800,6 +870,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: jax.Array,
             slot_read_offsets: jax.Array | None = None,
             ckpt_indices: jax.Array | None = None,
+            stacked_state_indices: jax.Array | None = None,
+            layer_row: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array]:
             # Fold the `(num_blocks, rows_per_block, *page)` block-major pool so
             # pool adapters index flat kernel blocks along dim 0; both reshapes
@@ -821,6 +893,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
+                stacked_state_indices,
+                layer_row,
                 mesh=mesh,
                 n_kq=n_kq,
                 n_v=local_num_v_heads,
@@ -838,6 +912,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 conv_state_dtype=conv_state_dtype,
                 num_spec_tokens=num_spec_tokens,
                 conv_weight_kmajor=conv_weight_kmajor,
+                window_log=window_log,
+                window_factored=window_factored,
             )
             if not block_major:
                 return result
@@ -875,6 +951,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 conv_state_dtype,
                 num_spec_tokens,
                 conv_weight_kmajor,
+                window_log,
+                bool(envs.VLLM_TPU_GDN_LEAN_GLUE),
             ),
             build_op,
         )
@@ -894,6 +972,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: torch.Tensor,
             slot_read_offsets: torch.Tensor | None = None,
             ckpt_indices: torch.Tensor | None = None,
+            stacked_state_indices: torch.Tensor | None = None,
+            layer_row: torch.Tensor | None = None,
         ) -> torch.Tensor:
             new_rec, outputs = gdn_jax_op(
                 mixed_qkv,
@@ -910,6 +990,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
+                stacked_state_indices,
+                layer_row,
             )
 
             # Plain donation + copy_ writeback (aliased in-place by XLA).
@@ -1280,6 +1362,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         "mamba_slot_read_offsets in the attention metadata."
                     )
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
+                stacked_state_indices, layer_row = self._stacked_slot_rows(
+                    state_indices, slot_read_offsets
+                )
                 core_attn_out = self.gdn_pooled_op(
                     # The contiguous projection: no q|k|v slice copy at the op
                     # boundary (the op narrows it; see pooled_qkvz_input).
@@ -1297,6 +1382,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     attn_metadata.seq_lens,
                     slot_read_offsets,
                     ckpt_indices,
+                    stacked_state_indices,
+                    layer_row,
                 )
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError("GDN op returned an incompatible output shape.")

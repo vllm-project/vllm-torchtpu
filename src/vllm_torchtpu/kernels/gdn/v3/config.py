@@ -25,6 +25,8 @@ from jax.experimental.pallas import tpu as pltpu
 # Row granule of a 2D bf16 qkv tile (see `GDNConfig.qkv_2d`): one packed bf16
 # sublane tile, so every DMA offset and size is aligned to it.
 QKV_2D_ROW_ALIGN = 16
+# Output rows a zero-fill DMA moves (GDNConfig.zero_fill_rows).
+ZERO_FILL_ROWS = 32
 
 
 class AttentionMode(enum.StrEnum):
@@ -33,6 +35,18 @@ class AttentionMode(enum.StrEnum):
     # Kimi Delta Attention: the gate is per-channel, so it carries
     # `kq_head_dim` values per value head instead of one.
     KDA = enum.auto()
+
+
+class CheckpointMode(enum.StrEnum):
+    # Today's rollback: one full state checkpoint per verify window position,
+    # each in its own source block; a step resumes from checkpoint[read_offset].
+    SELECT = enum.auto()
+    # Checkpoint block 0 holds the state after window position 0, and its
+    # spare rows hold the draft log: the operands (gate, key, update vector
+    # and conv input) of window positions 1..K. A step resumes from
+    # checkpoint 0 with the first read_offset logged updates applied, which
+    # gives the state checkpoint[read_offset] holds in SELECT mode.
+    LOG = enum.auto()
 
 
 class GDNMode(enum.StrEnum):
@@ -96,6 +110,109 @@ class StateSourcePlan:
     conv: StateRegion
     recurrent: StateRegion
     whole_block_dma: bool = False
+    # CheckpointMode.LOG only (the wrapper runs that mode exactly when `log`
+    # is set): the draft log in checkpoint block 0's spare rows. `log` holds
+    # the gates, keys and update vectors of the K draft positions as d_v-lane
+    # f32 rows, `log_conv` their conv inputs in the conv region's view. Row
+    # layout: `log_layout_rows`.
+    log: StateRegion | None = None
+    log_conv: StateRegion | None = None
+
+
+def log_layout_rows(num_log_positions: int, num_kq_heads: int, num_v_heads: int):
+    """Typed-row offsets of the gate, key and update rows in a `log` region.
+
+    Draft position j + 1 (j < num_log_positions) has its gate row at row
+    `j` (lane h: the decay of value head h after exp), key head h at row
+    `keys + j * num_kq_heads + h` and the update vector of value head h at
+    row `updates + j * num_v_heads + h`.
+
+    Returns:
+        (keys, updates, rows_used) typed-row offsets and total.
+    """
+    keys = num_log_positions
+    updates = keys + num_log_positions * num_kq_heads
+    rows_used = updates + num_log_positions * num_v_heads
+    return keys, updates, rows_used
+
+
+def validate_log_plan(
+    plan: StateSourcePlan,
+    *,
+    log_positions: int,
+    num_kq_heads: int,
+    num_v_heads: int,
+    kq_head_dim: int,
+    v_head_dim: int,
+    dim_size: int,
+    block_rows: int,
+    raw_lanes: int,
+    raw_row_bytes: int,
+) -> None:
+    """Checks that a plan's draft log regions match the LOG mode's layout.
+
+    Args:
+        plan: The state-source plan carrying `log` and `log_conv`.
+        log_positions: Draft positions logged (num_speculative_tokens).
+        num_kq_heads, num_v_heads, kq_head_dim, v_head_dim, dim_size: The
+            kernel geometry (dim_size is the conv channel count).
+        block_rows: Rows of one source kernel block.
+        raw_lanes: Minormost dim of the source.
+        raw_row_bytes: Bytes of one source row.
+    """
+    log, log_conv, conv = plan.log, plan.log_conv, plan.conv
+    if log is None or log_conv is None:
+        raise ValueError("LOG mode needs both state_plan.log and state_plan.log_conv")
+    if log_positions < 1:
+        raise ValueError(f"LOG mode needs speculative positions, got {log_positions}")
+    if plan.whole_block_dma:
+        raise NotImplementedError("LOG mode does not support whole-block DMA plans")
+    if kq_head_dim != v_head_dim:
+        raise NotImplementedError(
+            f"LOG rows hold keys and updates alike: d_k={kq_head_dim} != d_v={v_head_dim}"
+        )
+    if num_v_heads > v_head_dim:
+        raise NotImplementedError(
+            f"a gate row holds one lane per value head: {num_v_heads} > {v_head_dim}"
+        )
+    if jnp.dtype(log.view_dtype) != jnp.dtype(jnp.float32):
+        raise ValueError(f"log rows are float32, got {log.view_dtype}")
+    if raw_lanes // log.lane_split != v_head_dim or log.rows_perm is not None:
+        raise ValueError(
+            f"log rows must be {v_head_dim} lanes wide: lanes={raw_lanes}, "
+            f"lane_split={log.lane_split}"
+        )
+    _, _, rows_used = log_layout_rows(log_positions, num_kq_heads, num_v_heads)
+    if log.rows_used != rows_used:
+        raise ValueError(f"log.rows_used={log.rows_used}, expected {rows_used}")
+    if (
+        jnp.dtype(log_conv.view_dtype) != jnp.dtype(conv.view_dtype)
+        or log_conv.lane_split != conv.lane_split
+        or log_conv.rows_perm is not None
+        or conv.rows_perm is not None
+    ):
+        raise ValueError("log_conv must share the conv region's plain view")
+    conv_lanes = raw_lanes // log_conv.lane_split
+    if dim_size % conv_lanes or log_conv.rows_used != (
+        log_positions * dim_size // conv_lanes
+    ):
+        raise ValueError(
+            f"log_conv.rows_used={log_conv.rows_used}, expected "
+            f"{log_positions} * {dim_size} / {conv_lanes}"
+        )
+    for region, lanes in ((log, raw_lanes // log.lane_split), (log_conv, conv_lanes)):
+        typed_bytes = region.rows_used * lanes * jnp.dtype(region.view_dtype).itemsize
+        if region.nblocks != 1 or typed_bytes > region.nrows * raw_row_bytes:
+            raise ValueError(f"log region does not fit its rows: {region}")
+    if log_conv.kb0 != log.kb0 or log_conv.row0 != log.row0 + log.nrows:
+        raise ValueError("log_conv must follow log in the same kernel block")
+    if log_conv.row0 + log_conv.nrows > block_rows:
+        raise ValueError("log regions overrun the kernel block")
+    lo, hi = log.row0, log_conv.row0 + log_conv.nrows
+    for other in (plan.recurrent, conv):
+        for kb in range(other.kb0, other.kb0 + other.nblocks):
+            if kb == log.kb0 and other.row0 < hi and lo < other.row0 + other.nrows:
+                raise ValueError(f"log rows [{lo}, {hi}) overlap {other}")
 
 
 @jax.tree_util.register_dataclass
@@ -127,10 +244,30 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # CheckpointMode.LOG: the state lives in checkpoint block 0 plus the draft
+    # log of `log_positions` (= num_speculative_tokens) positions, in every
+    # kernel mode; see `CheckpointMode` and `StateSourcePlan.log`.
+    checkpoint_mode: CheckpointMode = CheckpointMode.SELECT
+    log_positions: int = 0
+    # LOG mode, BATCHED: the window runs in factored form
+    # (`compute_gdn.factored_gdn`): one product of the window's keys and
+    # queries with the loaded base state, the logged and window updates as
+    # vector work, and one update pass for the state stored to checkpoint 0.
+    # Left out of the kernel metadata while False.
+    factored_window: bool = False
     # Token-dense conv path of a PER_SEQ chunked tile over 2D bf16 rows
     # (VLLM_TPU_GDN_PREFILL_DENSE_CONV); resolved by the wrapper. Left out of
     # the kernel metadata while False, so other kernels' metadata is unchanged.
     dense_conv: bool = False
+    # BATCHED: the kernel itself writes zeros to output rows
+    # [zero_from, batch_size) (zero_from from SMEM), the rows no sequence of
+    # the call owns, instead of reading a zero-filled output buffer. Left out
+    # of the kernel metadata while False.
+    zero_fill_rows: bool = False
+    # b and a stream from one f32 [tokens, 1, aligned_num_v_heads +
+    # aligned_gate_dim] array (b first). Left out of the kernel metadata while
+    # False.
+    ba_packed: bool = False
 
     @property
     def chunk_size(self) -> int:
@@ -238,12 +375,37 @@ class GDNConfig:
         num_lanes = tpu_info.num_lanes
         return pl.cdiv(self.num_v_heads, num_lanes) * num_lanes
 
+    @property
+    def is_window_log(self) -> bool:
+        return self.checkpoint_mode == CheckpointMode.LOG
+
+    @property
+    def writes_window_log(self) -> bool:
+        """Whether the kernel writes the draft log: the BATCHED kernel in LOG
+        mode. Every LOG-mode kernel reads it."""
+        return self.is_window_log and self.mode == GDNMode.BATCHED
+
+    @property
+    def uses_factored_window(self) -> bool:
+        """Whether this kernel runs the factored window body (BATCHED, LOG)."""
+        return self.factored_window and self.writes_window_log
+
+    @property
+    def state_out_positions(self) -> int:
+        """State checkpoints a sequence writes: one per window position, or
+        checkpoint 0 alone in LOG mode (positions 1..K go to the log)."""
+        return 1 if self.is_window_log else self.window_size
+
     def get_kernel_name(self) -> str:
         # Windows of different sizes compile to different kernels; keep them
         # distinguishable in profiles.
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
+        if self.is_window_log:
+            suffix += "_log"
+        if self.uses_factored_window:
+            suffix += "_fact"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
@@ -253,6 +415,17 @@ class GDNConfig:
         cfgs_dict = dataclasses.asdict(self)
         if not cfgs_dict.get("dense_conv"):
             cfgs_dict.pop("dense_conv", None)
+        # Defaults stay out of the metadata, so other kernels' metadata is
+        # unchanged.
+        if not self.is_window_log:
+            cfgs_dict.pop("checkpoint_mode", None)
+            cfgs_dict.pop("log_positions", None)
+        if not self.factored_window:
+            cfgs_dict.pop("factored_window", None)
+        if not self.zero_fill_rows:
+            cfgs_dict.pop("zero_fill_rows", None)
+        if not self.ba_packed:
+            cfgs_dict.pop("ba_packed", None)
         ret = {}
         for path, val in jax.tree_util.tree_leaves_with_path(cfgs_dict):
             key = jax.tree_util.keystr(path, simple=True, separator=".")
@@ -316,4 +489,9 @@ class GDNConfig:
                 (self.seq_tile_size, self.qkv_2d_aligned_chunk, 1, self.dim_size),
                 jnp.float32,
             )
+        if self.zero_fill_rows:
+            scratches["zero_scratch_ref"] = pltpu.VMEM(
+                (ZERO_FILL_ROWS, self.num_v_heads, self.v_head_dim), self.dtypes.act_out
+            )
+            scratches["zero_sem_ref"] = pltpu.SemaphoreType.DMA(())
         return scratches

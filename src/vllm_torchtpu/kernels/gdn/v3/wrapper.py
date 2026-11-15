@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from typing import cast
 
 import jax
@@ -96,6 +97,8 @@ def inner_kernel(
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
+    log_in_slot_refs: tuple[jax.Ref, jax.Ref] | None = None,
+    log_out_slot_refs: tuple[jax.Ref, jax.Ref] | None = None,
 ):
     """Orchestrates computation of Conv1D and GDN for a single tile.
 
@@ -125,6 +128,11 @@ def inner_kernel(
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
             pipeline owns the Pallas program id.
+        log_in_slot_refs: LOG mode: the (log, log_conv) VMEM tiles read from
+            checkpoint block 0; the loaded states apply their first
+            read_offset updates.
+        log_out_slot_refs: LOG mode, BATCHED: the (log, log_conv) VMEM tiles
+            written back to checkpoint block 0 with window positions 1..K.
     """
 
     if p_id is None:
@@ -162,15 +170,29 @@ def inner_kernel(
         )
 
     # Prepare states.
-    real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
-        metadata_ref=metadata_ref,
-        p_id=p_id,
-        conv_state_in_slot_ref=conv_state_in_slot_ref,
-        recurrent_in_slot_ref=recurrent_in_slot_ref,
-        carry_conv_scratch_ref=carry_conv_scratch_ref,
-        carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
-        cfg=cfg,
-    )
+    if cfg.uses_factored_window:
+        assert log_in_slot_refs is not None
+        real_sizes, prev_conv, prev_recurrent, log_rows, log_counts = (
+            vmem_ldst.load_states_factored(
+                metadata_ref=metadata_ref,
+                p_id=p_id,
+                conv_state_in_slot_ref=conv_state_in_slot_ref,
+                recurrent_in_slot_ref=recurrent_in_slot_ref,
+                log_in_slot_refs=log_in_slot_refs,
+                cfg=cfg,
+            )
+        )
+    else:
+        real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
+            metadata_ref=metadata_ref,
+            p_id=p_id,
+            conv_state_in_slot_ref=conv_state_in_slot_ref,
+            recurrent_in_slot_ref=recurrent_in_slot_ref,
+            carry_conv_scratch_ref=carry_conv_scratch_ref,
+            carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
+            cfg=cfg,
+            log_in_slot_refs=log_in_slot_refs,
+        )
 
     # Step 1: Conv1D.
     # NOTE: Conv1D requires performing sliding window where inputs are slided
@@ -178,8 +200,8 @@ def inner_kernel(
     # single register which necessitate costly shuffling for every sliding.
     # Therefore, it is extremely important to leverage compact layout that
     # ensures 1 register only stores data from 1 row.
-    qkv_in_compact = qkv_work_ref[...].astype(jnp.float32)
-    qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
+    qkv_rows = qkv_work_ref[...].astype(jnp.float32)
+    qkv_in_compact = jnp.concat([prev_conv, qkv_rows], axis=1)
 
     # Prepare conv1d weights.
     conv_weight = weights_ref.conv.weight[...].astype(jnp.float32)
@@ -202,7 +224,7 @@ def inner_kernel(
         # through the region's typed view; copy_out pushes the raw bytes
         # of the valid checkpoints back to the source.
         for idx in range(cfg.seq_tile_size):
-            for t in range(cfg.window_size):
+            for t in range(cfg.state_out_positions):
                 args = (
                     conv_state_out_slot_ref.at[idx, t],
                     cfg.state_plan.conv,
@@ -239,7 +261,40 @@ def inner_kernel(
     # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
     # Passing refs into gdn.py breaks strict separation of concerns.
-    if cfg.use_recurrent:
+    if cfg.uses_factored_window:
+        assert log_out_slot_refs is not None
+        q_large, k_large, v_large, b_large, a_large = (
+            vmem_ldst.load_activation_as_large(
+                qkv_vreg=qkv_out_compact,
+                qkv_vmem_ref=qkv_work_ref,
+                b_vmem_ref=b_slot_ref,
+                a_vmem_ref=a_slot_ref,
+                cfgs=cfg,
+            )
+        )
+        out, new_recurrent_state, log_list = compute_gdn.factored_gdn(
+            real_sizes=real_sizes,
+            q_large=q_large,
+            k_large=k_large,
+            v_large=v_large,
+            b_large=b_large,
+            a_large=a_large,
+            base=prev_recurrent,
+            log_rows=log_rows,
+            log_counts=log_counts,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            cfg=cfg,
+        )
+        for idx in range(cfg.seq_tile_size):
+            vmem_ldst.store_window_log_rows(
+                log_out_slot_refs[0].at[idx, 0],
+                log_out_slot_refs[1].at[idx, 0],
+                log_list[idx],
+                qkv_rows[idx, 1:],
+                cfg,
+            )
+    elif cfg.use_recurrent:
         recurrent_fn = (
             compute_kda.recurrent_kda if cfg.is_kda else compute_gdn.recurrent_gdn
         )
@@ -253,7 +308,7 @@ def inner_kernel(
             )
         )
 
-        out, new_recurrent_state = recurrent_fn(
+        out, new_recurrent_state, *window_log = recurrent_fn(
             q_compact=q_compact,
             k_compact=k_compact,
             v_compact=v_compact,
@@ -265,6 +320,19 @@ def inner_kernel(
             cfg=cfg,
             real_sizes=real_sizes,
         )
+        if cfg.writes_window_log:
+            assert log_out_slot_refs is not None and cfg.state_plan is not None
+            (gates, keys, updates) = window_log[0]
+            for idx in range(cfg.seq_tile_size):
+                vmem_ldst.store_window_log(
+                    log_out_slot_refs[0].at[idx, 0],
+                    log_out_slot_refs[1].at[idx, 0],
+                    gates[idx],
+                    keys[idx],
+                    updates[idx],
+                    qkv_rows[idx, 1:],
+                    cfg,
+                )
 
     else:
         chunked_fn = compute_kda.chunked_kda if cfg.is_kda else compute_gdn.chunked_gdn
@@ -299,7 +367,7 @@ def inner_kernel(
         )
     else:
         for idx in range(cfg.seq_tile_size):
-            for t in range(cfg.window_size):
+            for t in range(cfg.state_out_positions):
                 args = (
                     recurrent_out_slot_ref.at[idx, t],
                     cfg.state_plan.recurrent,
@@ -472,6 +540,7 @@ def outer_kernel(
     recurrent_state_ref: jax.Array,
     _: jax.Array,
     weights_ref: memory_ref.WeightRefs,
+    zero_from_ref: jax.Array | None,
     # Outputs.
     out_ref: jax.Array,
     conv_state_out_ref: jax.Array,
@@ -480,6 +549,8 @@ def outer_kernel(
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
     act_scratch_ref: jax.Array | None = None,
+    zero_scratch_ref: jax.Array | None = None,
+    zero_sem_ref: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -513,11 +584,42 @@ def outer_kernel(
 
     num_tiles = metadata_ref.num_tiles[...]
 
+    # LOG mode: the draft log regions of checkpoint block 0 stream in (every
+    # kernel mode) and out (BATCHED) through the same source ref.
+    log_in_allocs: tuple[pltpu.BufferedRef, ...] = ()
+    log_out_allocs: tuple[pltpu.BufferedRef, ...] = ()
+    body = functools.partial(inner_kernel, cfg=cfg)
+    if cfg.is_window_log:
+        log_in_allocs, log_out_allocs = memory_ref.create_log_allocs(
+            metadata_ref,
+            conv_state_ref,
+            cfg,
+            with_outputs=cfg.writes_window_log,
+        )
+        num_log_in, num_log_out = len(log_in_allocs), len(log_out_allocs)
+
+        def body(qkv, b, a, conv_in, recurrent_in, *refs):
+            log_in = refs[:num_log_in]
+            out, conv_out, recurrent_out = refs[num_log_in : num_log_in + 3]
+            log_out = refs[num_log_in + 3 : num_log_in + 3 + num_log_out]
+            scratch_refs = refs[num_log_in + 3 + num_log_out :]
+            inner_kernel(
+                qkv,
+                b,
+                a,
+                conv_in,
+                recurrent_in,
+                out,
+                conv_out,
+                recurrent_out,
+                *scratch_refs,
+                cfg=cfg,
+                log_in_slot_refs=tuple(log_in),
+                log_out_slot_refs=tuple(log_out) if log_out else None,
+            )
+
     pipeline_func = pltpu.emit_pipeline(
-        body=functools.partial(
-            inner_kernel,
-            cfg=cfg,
-        ),
+        body=body,
         grid=(num_tiles,),
         in_specs=(
             qkv_alloc.spec,
@@ -525,11 +627,13 @@ def outer_kernel(
             a_alloc.spec,
             conv_in_alloc.spec,
             recurrent_in_alloc.spec,
+            *(alloc.spec for alloc in log_in_allocs),
         ),
         out_specs=(
             out_alloc.spec,
             conv_out_alloc.spec,
             recurrent_out_alloc.spec,
+            *(alloc.spec for alloc in log_out_allocs),
         ),
     )
 
@@ -549,26 +653,59 @@ def outer_kernel(
             a_alloc,
             conv_in_alloc,
             recurrent_in_alloc,
+            *log_in_allocs,
             out_alloc,
             conv_out_alloc,
             recurrent_out_alloc,
+            *log_out_allocs,
         ),
     )
     def _run(allocations):
         pipeline_func(
             qkv_ref,
             b_ref,
-            a_ref,
+            b_ref if cfg.ba_packed else a_ref,
             conv_state_ref,
             recurrent_state_ref,
+            *(conv_state_ref for _ in log_in_allocs),
             out_ref,
             conv_state_out_ref,
             recurrent_state_out_ref,
+            *(conv_state_out_ref for _ in log_out_allocs),
             scratches=scratches,
             allocations=allocations,
         )
 
+    if not cfg.zero_fill_rows:
+        _run()
+        return
+
+    # Rows [zero_from, batch_size) belong to no sequence of this call (the
+    # PER_SEQ kernel, run next on the same buffer, writes its own rows over
+    # them); they get the zeros a zero-filled output buffer would hold. The
+    # pipeline's copy-outs only touch rows below zero_from.
+    assert zero_from_ref is not None and zero_scratch_ref is not None
+    chunk = zero_scratch_ref.shape[0]
+    zero_from = zero_from_ref[0]
+    num_rows = jnp.maximum(cfg.batch_size - zero_from, 0)
+    zero_scratch_ref[...] = jnp.zeros(zero_scratch_ref.shape, zero_scratch_ref.dtype)
+
+    def zero_copy(k):
+        rows = jnp.minimum(chunk, num_rows - k * chunk)
+        return pltpu.make_async_copy(
+            zero_scratch_ref.at[pl.ds(0, rows)],
+            out_ref.at[pl.ds(zero_from + k * chunk, rows)],
+            zero_sem_ref,
+        )
+
+    num_copies = pl.cdiv(num_rows, chunk)
+    jax.lax.fori_loop(0, num_copies, lambda k, c: (zero_copy(k).start(), c)[1], 0)
     _run()
+    jax.lax.fori_loop(0, num_copies, lambda k, c: (zero_copy(k).wait(), c)[1], 0)
+
+
+# Pieces of `fused_conv1d_gdn(lean_glue=...)`; True takes all of them.
+LEAN_GLUE_PIECES = ("no_ckpt", "zero_fill", "ba_packed")
 
 
 def bf16_qkv_2d_eligible(
@@ -636,6 +773,8 @@ def bf16_qkv_2d_eligible(
         "gate_lower_bound",
         "bf16_qkv_2d",
         "dense_conv",
+        "factored_window",
+        "lean_glue",
     ),
 )
 def fused_conv1d_gdn(
@@ -675,6 +814,9 @@ def fused_conv1d_gdn(
     mixed_tile_size: int = 64,
     bf16_qkv_2d: bool | None = None,
     dense_conv: bool | None = None,
+    factored_window: bool = False,
+    lean_glue: bool | tuple[str, ...] | None = None,
+    slot_rows: metadata.GdnSlotRows | None = None,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -755,6 +897,24 @@ def fused_conv1d_gdn(
             only. Taken only where `bf16_qkv_2d_eligible` holds; otherwise,
             and for a prepared Conv1DInput, qkv is cast to f32 as before.
             None reads VLLM_TPU_GDN_PREFILL_BF16_QKV_2D.
+        factored_window: LOG mode only: the BATCHED kernel runs its verify
+            window in factored form (`compute_gdn.factored_gdn`). The PER_SEQ
+            kernel is unchanged.
+        lean_glue: Same results with less XLA glue around the kernels; True
+            for every piece of LEAN_GLUE_PIECES, or a tuple of them:
+            "no_ckpt": in LOG mode `ckpt_indices` is not passed to the
+            kernels, which address checkpoint 0 only, the state block
+            `state_indices` already names (callers must keep
+            `ckpt_indices[:, 0] == state_indices`, as vLLM's checkpoint layout
+            does). "zero_fill": with `zero_initialize_out` the BATCHED kernel
+            writes zeros to the rows past its sequences instead of reading a
+            zero-filled buffer. "ba_packed" (GDN gate): b and a reach the
+            kernels as one f32 array from one fusion. None reads
+            VLLM_TPU_GDN_LEAN_GLUE.
+        slot_rows: Every GDN layer's state indices and read offsets of the
+            step stacked [layers, num_seqs], and this layer's row; the kernels
+            read their row from the stacks, and `state_indices` /
+            `read_offsets` give only the shape.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -781,12 +941,28 @@ def fused_conv1d_gdn(
     else:
         act_out_dtype = qkv.dtype
     pooled = state_plan is not None
+    # CheckpointMode.LOG runs exactly when the plan carries the draft log.
+    window_log = pooled and state_plan.log is not None
+    if lean_glue is None:
+        lean_glue = envs.VLLM_TPU_GDN_LEAN_GLUE
+    pieces = (
+        frozenset(LEAN_GLUE_PIECES if lean_glue is True else ())
+        if isinstance(lean_glue, bool)
+        else frozenset(lean_glue)
+    )
+    if pieces - set(LEAN_GLUE_PIECES):
+        raise ValueError(f"unknown lean_glue pieces {sorted(pieces - set(LEAN_GLUE_PIECES))}")
+    if "no_ckpt" in pieces and window_log:
+        # LOG mode reads and writes checkpoint 0 only (CheckpointMode.LOG,
+        # state_out_positions == 1), and without the index array the kernels
+        # take checkpoint 0 from state_indices.
+        ckpt_indices = None
     if pooled:
         assert conv_state is None and recurrent_state is None
         assert state_source is not None
         # Checkpoints are individually addressable source blocks; without
         # the index array they would all alias onto the slot's own block.
-        assert num_spec_tokens == 0 or ckpt_indices is not None, (
+        assert num_spec_tokens == 0 or ckpt_indices is not None or window_log, (
             "num_spec_tokens > 0 requires ckpt_indices"
         )
     else:
@@ -795,6 +971,26 @@ def fused_conv1d_gdn(
         conv_out_dtype = conv_state.dtype
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
+    if factored_window and not window_log:
+        raise ValueError("factored_window needs the draft log (state_plan.log)")
+    if window_log:
+        if attention_mode != config.AttentionMode.GDN:
+            raise NotImplementedError("the draft log is GDN only")
+        if dense_conv or (dense_conv is None and envs.VLLM_TPU_GDN_PREFILL_DENSE_CONV):
+            raise NotImplementedError("the draft log does not support dense_conv")
+        config.validate_log_plan(
+            state_plan,
+            log_positions=num_spec_tokens,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=d_k,
+            v_head_dim=d_v,
+            dim_size=qkv_cols or qkv.shape[-1],
+            block_rows=state_source.shape[1],
+            raw_lanes=state_source.shape[-1],
+            raw_row_bytes=math.prod(state_source.shape[2:])
+            * jnp.dtype(state_source.dtype).itemsize,
+        )
 
     # 2D bf16 rows skip the HBM f32 cast; see `bf16_qkv_2d_eligible`.
     if bf16_qkv_2d is None:
@@ -855,11 +1051,21 @@ def fused_conv1d_gdn(
     assert state_indices.shape == (num_seqs,)
     assert distribution.shape == (3,)
     if num_spec_tokens > 0:
-        assert read_offsets is not None, (
+        assert read_offsets is not None or slot_rows is not None, (
             "read_offsets is required when num_spec_tokens > 0"
         )
     if read_offsets is None:
         read_offsets = jnp.zeros((num_seqs,), dtype=jnp.int32)
+    if slot_rows is not None and (
+        slot_rows.state_indices.shape != slot_rows.read_offsets.shape
+        or slot_rows.state_indices.shape[-1] != num_seqs
+        or slot_rows.row.shape != (1,)
+    ):
+        raise ValueError(
+            f"slot_rows: stacks {slot_rows.state_indices.shape} / "
+            f"{slot_rows.read_offsets.shape}, row {slot_rows.row.shape}, "
+            f"for {num_seqs} sequences"
+        )
     assert read_offsets.shape == (num_seqs,)
     read_offsets = read_offsets.astype(jnp.int32)
     if ckpt_indices is not None:
@@ -954,13 +1160,25 @@ def fused_conv1d_gdn(
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
     qkv_padding = ((0, batch_padding_size),) + ((0, 0),) * (qkv.ndim - 1)
     qkv = jnp.pad(qkv, qkv_padding)
-    b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
-    a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
+    ba_packed = "ba_packed" in pieces and not is_kda
+    if ba_packed:
+        # One pad builds both gate inputs, b's lanes then a's (GDN's gate is
+        # as wide as b); the kernels slice them out of it.
+        assert num_v_padding_size == gate_padding_size
+        b = jnp.pad(
+            jnp.stack([b, a], axis=1),
+            ((0, batch_padding_size), (0, 0), (0, num_v_padding_size)),
+        ).reshape(padded_batch_size, -1)
+        a = None
+    else:
+        b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
+        a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
     if not qkv_2d:
         qkv = qkv.reshape(padded_batch_size, 1, -1)
     b = b.reshape(padded_batch_size, 1, -1)
-    a = a.reshape(padded_batch_size, 1, -1)
+    if a is not None:
+        a = a.reshape(padded_batch_size, 1, -1)
 
     # Operand of the BATCHED kernel, which keeps f32 compact rows. Its rows
     # are decode/verify windows of at most `num_spec_tokens + 1` tokens for
@@ -1036,6 +1254,12 @@ def fused_conv1d_gdn(
                 conv_state=(jnp.float32.dtype if pooled else in_conv_state.dtype),
             ),
             state_plan=state_plan,
+            checkpoint_mode=(
+                config.CheckpointMode.LOG if window_log else config.CheckpointMode.SELECT
+            ),
+            log_positions=num_spec_tokens if window_log else 0,
+            factored_window=factored_window and mode == config.GDNMode.BATCHED,
+            ba_packed=ba_packed,
         )
         if (
             dense_conv
@@ -1060,6 +1284,7 @@ def fused_conv1d_gdn(
                 read_offsets=read_offsets,
                 end_seq=distribution[0],
                 ckpt_indices=ckpt_indices,
+                slot_rows=slot_rows,
             )
         else:
             metadata_obj = metadata.compute_per_seq_metadata(
@@ -1071,6 +1296,7 @@ def fused_conv1d_gdn(
                 start_seq=distribution[0],
                 end_seq=distribution[-1],
                 ckpt_indices=ckpt_indices,
+                slot_rows=slot_rows,
             )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
@@ -1080,17 +1306,29 @@ def fused_conv1d_gdn(
         # input in source mode (None contributes no leaves).
         in_out_spec = None
         num_state_inputs = 1 if pooled else 2
-        input_output_aliases = {len(metadata_obj) + 3: 1}
+        # Flat operand index of the first state input: metadata leaves, qkv,
+        # b, then a unless b carries it (ba_packed).
+        first_state = len(metadata_obj) + (2 if a is None else 3)
+        input_output_aliases = {first_state: 1}
         if not pooled:
-            input_output_aliases[len(metadata_obj) + 4] = 2
+            input_output_aliases[first_state + 1] = 2
         out_shape = cfg.get_out_shape()
 
-        if in_act is None and zero_initialize_out:
+        zero_from = None
+        if (
+            "zero_fill" in pieces
+            and in_act is None
+            and zero_initialize_out
+            and mode == config.GDNMode.BATCHED
+        ):
+            cfg = dataclasses.replace(cfg, zero_fill_rows=True)
+            zero_from = query_start_loc[distribution[0]].reshape(1).astype(jnp.int32)
+        elif in_act is None and zero_initialize_out:
             in_act = jnp.zeros_like(out_shape)
         if in_act is not None:
             out_shape = in_act
             in_out_spec = hbm_spec
-            input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
+            input_output_aliases[first_state + num_state_inputs] = 0
 
         vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
@@ -1101,11 +1339,12 @@ def fused_conv1d_gdn(
                 metadata_spec,
                 hbm_spec,
                 hbm_spec,
-                hbm_spec,
+                None if a is None else hbm_spec,
                 hbm_spec,
                 None if pooled else hbm_spec,
                 in_out_spec,
                 weights_spec,
+                None if zero_from is None else smem_spec,
             ),
             out_specs=(hbm_spec, hbm_spec, None if pooled else hbm_spec),
             scratch_shapes=cfg.get_scratch_shape_dict(),
@@ -1125,6 +1364,7 @@ def fused_conv1d_gdn(
             in_recurrent_state,
             in_act,
             weights,
+            zero_from,
         )
 
     if batched_only and prefill_only:

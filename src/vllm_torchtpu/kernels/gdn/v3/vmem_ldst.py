@@ -20,7 +20,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import typed_ldst
-from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
+from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config, memory_ref
 
 
 def load_strided_heads(
@@ -198,6 +198,186 @@ def _load_recurrent_state(
     ).astype(jnp.float32)
 
 
+def load_window_log(
+    log_slot_ref: jax.Ref, log_conv_slot_ref: jax.Ref, cfg: config.GDNConfig
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Loads one slot's draft log (LOG mode) from its raw source tiles.
+
+    Args:
+        log_slot_ref: The slot's `StateSourcePlan.log` tile.
+        log_conv_slot_ref: The slot's `StateSourcePlan.log_conv` tile.
+        cfg: GDN configuration object.
+
+    Returns:
+        gates [K, 1, 1, d_v] (lane h: decay of value head h after exp),
+        keys [K, num_kq_heads, 1, kq_head_dim], updates [K, num_v_heads, 1,
+        v_head_dim] and conv inputs [K, 1, dim_size] f32, for draft
+        positions 1..K.
+    """
+    plan = cfg.state_plan
+    assert plan is not None and plan.log is not None and plan.log_conv is not None
+    num_pos, n_kq, n_v = cfg.log_positions, cfg.num_kq_heads, cfg.num_v_heads
+    keys_row, updates_row, rows_used = config.log_layout_rows(num_pos, n_kq, n_v)
+    rows = load_state_region(log_slot_ref, plan.log, (rows_used, cfg.v_head_dim))
+    gates = rows[:keys_row].reshape(num_pos, 1, 1, cfg.v_head_dim)
+    keys = rows[keys_row:updates_row].reshape(num_pos, n_kq, 1, cfg.kq_head_dim)
+    updates = rows[updates_row:].reshape(num_pos, n_v, 1, cfg.v_head_dim)
+    conv_inputs = load_state_region(
+        log_conv_slot_ref, plan.log_conv, (num_pos, 1, cfg.dim_size)
+    ).astype(jnp.float32)
+    return gates, keys, updates, conv_inputs
+
+
+def store_window_log(
+    log_slot_ref: jax.Ref,
+    log_conv_slot_ref: jax.Ref,
+    gates: jax.Array,
+    keys: jax.Array,
+    updates: jax.Array,
+    conv_inputs: jax.Array,
+    cfg: config.GDNConfig,
+) -> None:
+    """Stores one slot's draft log; the inverse of `load_window_log`."""
+    plan = cfg.state_plan
+    assert plan is not None and plan.log is not None and plan.log_conv is not None
+    d = cfg.v_head_dim
+    rows = jnp.concat(
+        [gates.reshape(-1, d), keys.reshape(-1, d), updates.reshape(-1, d)], axis=0
+    )
+    store_state_region(log_slot_ref, plan.log, rows)
+    store_state_region(log_conv_slot_ref, plan.log_conv, conv_inputs)
+
+
+def fold_window_log(
+    recurrent: jax.Array,  # [num_v_heads, kq_head_dim, v_head_dim]
+    conv: jax.Array,  # [prev_kernel_size, 1, dim_size]
+    gates: jax.Array,
+    keys: jax.Array,
+    updates: jax.Array,
+    conv_inputs: jax.Array,
+    read_offset: jax.Array,
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Applies the first `read_offset` logged draft updates to checkpoint 0.
+
+    Each update is the recurrence's own two statements
+    (`compute_gdn.recurrent_gdn_per_seq`), state * g then + k^T * v_new, on
+    the operands it logged, and the gate and key go through the same
+    lane-to-sublane transposes, so the result is bit for bit the state the
+    window wrote for that position in SELECT mode. The conv state shifts in
+    the same number of logged conv inputs. Positions past `read_offset` are
+    computed and discarded by a select, which keeps the loop static.
+
+    Returns:
+        (recurrent, conv) states after window position `read_offset`.
+    """
+    num_pos = cfg.log_positions
+    # [d_v, K, 1, 1] -> [num_v_heads, K, 1, 1], like the gating in recurrent_gdn.
+    gating = compute_gdn.fused_transpose_broadcast(
+        gates.reshape(1, num_pos, 1, cfg.v_head_dim), src_dim=3, dst_dim=0
+    )[: cfg.num_v_heads]
+    # [K, num_kq_heads, kq_head_dim, 1], like k_compact_t in recurrent_gdn.
+    keys_t = compute_gdn.fused_transpose_broadcast(keys, src_dim=3, dst_dim=2)
+
+    rows = jnp.concat([conv, conv_inputs], axis=0)
+    kprev = cfg.prev_kernel_size
+    new_conv = conv
+    for j in range(num_pos):
+        applied = j < read_offset
+        gating_curr = gating[:, j]
+        k_curr_t = jnp.repeat(keys_t[j], cfg.v_per_kq_head, axis=0)
+        v_new = updates[j]
+        state_updated = recurrent * gating_curr
+        state_new = k_curr_t * v_new
+        recurrent = jnp.where(applied, state_updated + state_new, recurrent)
+        new_conv = jnp.where(applied, rows[j + 1 : j + 1 + kprev], new_conv)
+    return recurrent, new_conv
+
+
+def fold_conv_log(
+    conv: jax.Array,  # [prev_kernel_size, 1, dim_size]
+    conv_inputs: jax.Array,  # [K, 1, dim_size]
+    read_offset: jax.Array,
+    cfg: config.GDNConfig,
+) -> jax.Array:
+    """The conv half of `fold_window_log`: shifts in read_offset logged inputs."""
+    rows = jnp.concat([conv, conv_inputs], axis=0)
+    kprev = cfg.prev_kernel_size
+    new_conv = conv
+    for j in range(cfg.log_positions):
+        new_conv = jnp.where(j < read_offset, rows[j + 1 : j + 1 + kprev], new_conv)
+    return new_conv
+
+
+def load_states_factored(
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    conv_state_in_slot_ref: jax.Ref,
+    recurrent_in_slot_ref: jax.Ref,
+    log_in_slot_refs: tuple[jax.Ref, jax.Ref],
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array, jax.Array, list[jax.Array], list[jax.Array]]:
+    """Loads a BATCHED tile's states for the factored window body.
+
+    The conv state is folded as in `load_and_select_states`; the recurrent
+    state stays checkpoint block 0's (the base), and the log's typed rows
+    and the count of its updates that apply go to `compute_gdn.factored_gdn`.
+    A sequence without an initial state gets zeros and a count of 0.
+
+    Returns:
+        real_sizes [seq_tile_size], conv [seq_tile_size, prev_kernel_size, 1,
+        dim_size], base [seq_tile_size, num_v_heads, kq_head_dim,
+        v_head_dim], and per slot the log rows [rows_used, v_head_dim] and
+        the update count.
+    """
+    assert cfg.uses_factored_window and cfg.state_plan is not None
+    plan = cfg.state_plan
+    _, _, rows_used = config.log_layout_rows(
+        cfg.log_positions, cfg.num_kq_heads, cfg.num_v_heads
+    )
+    log_ref, log_conv_ref = log_in_slot_refs
+    real_sizes, convs, bases, log_rows, counts = [], [], [], [], []
+    for idx in range(cfg.seq_tile_size):
+        s_idx = metadata_ref.p_id_to_s_idx[p_id, idx]
+        has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
+        read_offset = metadata_ref.s_idx_to_read_offset[s_idx]
+        conv_inputs = load_state_region(
+            log_conv_ref.at[idx, 0], plan.log_conv, (cfg.log_positions, 1, cfg.dim_size)
+        ).astype(jnp.float32)
+        conv = fold_conv_log(
+            _load_conv_state(conv_state_in_slot_ref, cfg, idx), conv_inputs, read_offset, cfg
+        )
+        base = _load_recurrent_state(recurrent_in_slot_ref, cfg, idx)
+        real_sizes.append(metadata_ref.p_id_to_r_size[p_id, idx])
+        convs.append(jnp.where(has_initial_state, conv, 0))
+        bases.append(jnp.where(has_initial_state, base, 0))
+        log_rows.append(
+            load_state_region(log_ref.at[idx, 0], plan.log, (rows_used, cfg.v_head_dim))
+        )
+        counts.append(jnp.where(has_initial_state, read_offset, 0))
+    return (
+        jnp.stack(real_sizes, axis=0),
+        jnp.stack(convs, axis=0),
+        jnp.stack(bases, axis=0),
+        log_rows,
+        counts,
+    )
+
+
+def store_window_log_rows(
+    log_slot_ref: jax.Ref,
+    log_conv_slot_ref: jax.Ref,
+    rows: jax.Array,
+    conv_inputs: jax.Array,
+    cfg: config.GDNConfig,
+) -> None:
+    """`store_window_log` for log rows already in the typed row order."""
+    plan = cfg.state_plan
+    assert plan is not None and plan.log is not None and plan.log_conv is not None
+    store_state_region(log_slot_ref, plan.log, rows)
+    store_state_region(log_conv_slot_ref, plan.log_conv, conv_inputs)
+
+
 def load_and_select_states(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
@@ -206,6 +386,7 @@ def load_and_select_states(
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.GDNConfig,
+    log_in_slot_refs: tuple[jax.Ref, jax.Ref] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Load correct states from HBM or prior tile, and masks invalid states.
 
@@ -225,6 +406,9 @@ def load_and_select_states(
             [seq_tile_size, 1, prev_kernel_size, 1, dim_size].
         recurrent_in_slot_ref: Recurrent state read from HBM of shape
             [seq_tile_size, 1, num_v_heads, kq_head_dim, v_head_dim].
+        log_in_slot_refs: LOG mode: the (log, log_conv) tiles of checkpoint
+            block 0, whose first read_offset updates are applied to the
+            loaded states.
         carry_conv_scratch_ref: Optional inter-tile convolution carry of shape
             [seq_tile_size, prev_kernel_size, 1, dim_size].
         carry_recurrent_scratch_ref: Optional inter-tile recurrent state carry of
@@ -243,11 +427,27 @@ def load_and_select_states(
     prev_conv_state_list = []
     prev_recurrent_state_list = []
 
+    assert cfg.is_window_log == (log_in_slot_refs is not None)
+
     for idx in range(cfg.seq_tile_size):
         s_idx = metadata_ref.p_id_to_s_idx[p_id, idx]
         real_sizes = metadata_ref.p_id_to_r_size[p_id, idx]
         is_first_tile = metadata_ref.p_id_is_first_tile[p_id, idx]
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
+
+        def load_states(idx=idx, s_idx=s_idx):
+            conv = _load_conv_state(conv_state_in_slot_ref, cfg, idx)
+            recurrent = _load_recurrent_state(recurrent_in_slot_ref, cfg, idx)
+            if log_in_slot_refs is not None:
+                log_ref, log_conv_ref = log_in_slot_refs
+                recurrent, conv = fold_window_log(
+                    recurrent,
+                    conv,
+                    *load_window_log(log_ref.at[idx, 0], log_conv_ref.at[idx, 0], cfg),
+                    metadata_ref.s_idx_to_read_offset[s_idx],
+                    cfg,
+                )
+            return conv, recurrent
 
         # NOTE: The input VMEM window holds one initial state per sequence at
         # position 0.
@@ -255,14 +455,9 @@ def load_and_select_states(
         # Only the pool decode is worth guarding; a dense slot read is cheap
         # enough that the guard costs more than it saves.
         if carry_conv_scratch_ref is None or cfg.state_plan is None:
-            prev_conv_state = jnp.where(
-                has_initial_state, _load_conv_state(conv_state_in_slot_ref, cfg, idx), 0
-            )
-            prev_recurrent_state = jnp.where(
-                has_initial_state,
-                _load_recurrent_state(recurrent_in_slot_ref, cfg, idx),
-                0,
-            )
+            loaded_conv, loaded_recurrent = load_states()
+            prev_conv_state = jnp.where(has_initial_state, loaded_conv, 0)
+            prev_recurrent_state = jnp.where(has_initial_state, loaded_recurrent, 0)
             if carry_conv_scratch_ref is not None:
                 assert carry_recurrent_scratch_ref is not None
                 prev_conv_state = jnp.where(
@@ -281,15 +476,12 @@ def load_and_select_states(
 
             @pl.when(is_first_tile)
             def _():
+                loaded_conv, loaded_recurrent = load_states()
                 carry_conv_scratch_ref[idx] = jnp.where(
-                    has_initial_state,
-                    _load_conv_state(conv_state_in_slot_ref, cfg, idx),
-                    0,
+                    has_initial_state, loaded_conv, 0
                 )
                 carry_recurrent_scratch_ref[idx] = jnp.where(
-                    has_initial_state,
-                    _load_recurrent_state(recurrent_in_slot_ref, cfg, idx),
-                    0,
+                    has_initial_state, loaded_recurrent, 0
                 )
 
             prev_conv_state = carry_conv_scratch_ref[idx]
