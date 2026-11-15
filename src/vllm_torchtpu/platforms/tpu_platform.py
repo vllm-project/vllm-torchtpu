@@ -41,6 +41,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled,
     update_tpu_block_size_and_slot_config,
 )
+from vllm_torchtpu.structured_decoding import gaad
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -880,13 +881,6 @@ class TpuPlatform(Platform):
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )
-        from vllm_torchtpu.structured_decoding.gaad import (
-            patch_vllm_grammar_jump_decoding,
-            patch_vllm_speculative_config_gaad,
-        )
-
-        patch_vllm_speculative_config_gaad()
-        patch_vllm_grammar_jump_decoding()
         _register_tpu_kv_connectors()
         # Apply before VllmConfig is pickled so EngineCore and all workers see
         # the same setting.
@@ -1132,6 +1126,7 @@ class TpuPlatform(Platform):
         is_attention_free = (
             model_config.is_attention_free if model_config is not None else False
         )
+        gaad.check_config(vllm_config)
         if (
             vllm_config.speculative_config is not None
             and scheduler_config.async_scheduling

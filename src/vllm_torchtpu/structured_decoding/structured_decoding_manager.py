@@ -176,7 +176,6 @@ class StructuredDecodingManager:
         draft_lengths_cpu: np.ndarray | None,
         cur_start_idx: int,
         cur_end_idx: int,
-        scheduled_spec_decode_flags: Mapping[str, Sequence[int]] | None = None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -233,28 +232,10 @@ class StructuredDecodingManager:
                         f"{draft_lengths_cpu[local_index]} drafts."
                     )
                 row = int(target_row_starts[local_index])
-                req_flags = (
-                    scheduled_spec_decode_flags.get(req_id)
-                    if scheduled_spec_decode_flags is not None
-                    else None
+                self.target_grammar_bitmask_cpu[row : row + num_drafts] = (
+                    torch.from_numpy(bitmask[mask_row : mask_row + num_drafts])
                 )
-                if req_flags is None:
-                    self.target_grammar_bitmask_cpu[row : row + num_drafts] = (
-                        torch.from_numpy(bitmask[mask_row : mask_row + num_drafts])
-                    )
-                    self.require_structured_out_target_cpu[row : row + num_drafts] = (
-                        True
-                    )
-                else:
-                    for slot_idx in range(num_drafts):
-                        flag = req_flags[slot_idx] if slot_idx < len(req_flags) else 1
-                        if flag == 1:  # DRAFT_FLAG_MODEL
-                            self.target_grammar_bitmask_cpu[row + slot_idx] = (
-                                torch.from_numpy(bitmask[mask_row + slot_idx])
-                            )
-                            self.require_structured_out_target_cpu[row + slot_idx] = (
-                                True
-                            )
+                self.require_structured_out_target_cpu[row : row + num_drafts] = True
             # Bonus row.
             self.grammar_bitmask_cpu[local_index] = torch.from_numpy(
                 bitmask[mask_row + num_drafts]
@@ -317,7 +298,6 @@ class StructuredDecodingManager:
         draft_lengths_cpu: np.ndarray | None,
         cur_start_idx: int,
         cur_end_idx: int,
-        scheduled_spec_decode_flags: Mapping[str, Sequence[int]] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Applies the grammar bitmask to both bonus and target(if not None).
 
@@ -344,7 +324,6 @@ class StructuredDecodingManager:
                     draft_lengths_cpu,
                     cur_start_idx,
                     cur_end_idx,
-                    scheduled_spec_decode_flags=scheduled_spec_decode_flags,
                 )
             )
         with TraceAnnotation(
