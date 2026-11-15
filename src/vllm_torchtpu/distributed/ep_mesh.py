@@ -40,6 +40,7 @@ from vllm_torchtpu.distributed.mesh_utils import (
     _collect_rank_to_device_id,
     _get_current_global_rank,
     _get_tpu_global_device_id,
+    device_chip_coords,
     get_pipeline_stage,
     get_stage_mesh,
 )
@@ -346,11 +347,13 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
         )
     mesh = Mesh(np.asarray([by_id[d] for d in device_ids]), axis_names=(axis_name,))
     logger.info(
-        "Built EP mesh | axis=%s | size=%d | device_ids=%s | ep_rank_order=%s",
+        "Built EP mesh | axis=%s | size=%d | device_ids=%s | ep_rank_order=%s"
+        " | coords=%s",
         axis_name,
         len(device_ids),
         list(device_ids),
         order,
+        device_chip_coords(mesh.devices.flat),
     )
     _MESH_CACHE[cache_key] = mesh
     return mesh

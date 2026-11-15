@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pytest
 import torch
 
 from vllm_torchtpu.layers.adapter import token_padding
@@ -211,3 +212,39 @@ def test_mask_router_logits_for_padding():
     finally:
         token_padding.set_padding_state(None)
     assert token_padding.mask_router_logits_for_padding(logits) is logits
+
+
+@pytest.mark.parametrize("budget", [256, 512, 2048])
+def test_padding_mask_keeps_the_largest_bucket_dynamic(budget):
+    """A trace at the largest bucket keeps its token count symbolic next to a
+    ``tokens >= budget`` branch of the same step (j-b03d84bd: with a budget of
+    512 the mask slice bounded the count at <= 512, the fused HC gate took
+    ``tokens >= 512``, and the profile run failed with a
+    ConstraintViolationError on the dynamic token dimension)."""
+    state = TokenPaddingState.create(budget, torch.device("cpu"))
+    assert state.local_padding_mask.shape[0] == budget + 1
+    state.update(budget - 3, budget)
+    symints = []
+
+    def backend(gm, example_inputs):
+        symints.extend(
+            node
+            for node in gm.graph.nodes
+            if node.op == "placeholder"
+            and isinstance(node.meta.get("example_value"), torch.SymInt)
+        )
+        return gm
+
+    def step(weights):
+        if weights.shape[0] >= budget:
+            weights = weights + 1
+        is_padding = state.get_local_padding_mask(weights.shape[0])
+        return torch.where(is_padding[:, None], 0.0, weights)
+
+    weights = torch.ones(budget, 2)
+    torch._dynamo.reset()
+    torch._dynamo.mark_dynamic(weights, 0)
+    out = torch.compile(step, backend=backend, fullgraph=True)(weights)
+    torch._dynamo.reset()
+    assert symints
+    assert out[: budget - 3].eq(2.0).all() and out[budget - 3 :].eq(0.0).all()
