@@ -115,3 +115,37 @@ def pool_regions(kv_cache_config) -> int:
     page = max(g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups)
     tensors = kv_cache_config.kv_cache_tensors
     return tensors[0].size // (kv_cache_config.num_blocks * page) if tensors else 0
+
+
+TIER_KINDS = ("main", "keys", "gdn", "ple")
+
+
+def tier_group_kind(spec, layer_names) -> str:
+    """What a cache group holds, for the host tier's size classes.
+
+    ``main`` (QSA main KV), ``keys`` (compressed keys, ``.compressed_k``
+    layers), ``gdn`` (GDN state checkpoints) or ``ple`` (PLE state
+    checkpoints, ``.ple`` layers). ``layer_names`` are the group's layers
+    on every worker.
+    """
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    names = list(layer_names)
+    if not names:
+        raise ValueError(
+            "Qwen4Exp host tier: a cache group with no layers on any worker"
+        )
+    if isinstance(spec, MambaSpec):
+        suffix, kinds = ".ple", ("ple", "gdn")
+    elif isinstance(spec, AttentionSpec):
+        suffix, kinds = ".compressed_k", ("keys", "main")
+    else:
+        raise ValueError(
+            f"Qwen4Exp host tier: no class for a {type(spec).__name__} group"
+        )
+    marked = [name.endswith(suffix) for name in names]
+    if any(marked) and not all(marked):
+        raise ValueError(
+            f"Qwen4Exp host tier: group mixes {suffix} layers with others: {names}"
+        )
+    return kinds[0] if marked[0] else kinds[1]

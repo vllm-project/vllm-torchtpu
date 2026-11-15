@@ -86,6 +86,10 @@ _REQUEST_LEVEL_LOAD_FAILURES = "failed_recving" in getattr(
 
 
 class Qwen4ExpRaidenConnector(TPURaidenConnector):
+    # QWEN4_EXP_PD_DEFER_LOAD_SUBMIT state (set per instance in __init__).
+    _defer_load_submit = False
+    _deferred_load_submit: tuple[tuple, dict] | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -173,6 +177,14 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         )
         self._landed_on_all_ranks: list[str] = []
         self._failed_on_some_rank: list[str] = []
+        # QWEN4_EXP_PD_DEFER_LOAD_SUBMIT (consumer): start_load_kv keeps the
+        # quarantine advance and the staged repack before the forward and
+        # leaves the load submit for submit_deferred_loads, which the runner
+        # calls once the step's forward and sampling are dispatched.
+        self._defer_load_submit = bool(envs.QWEN4_EXP_PD_DEFER_LOAD_SUBMIT) and not (
+            transfer is not None and transfer.is_kv_producer
+        )
+        self._deferred_load_submit: tuple[tuple, dict] | None = None
         # The aborted-while-landing guard (``_guards_landing``): whenever L1
         # names loads, the scheduler names only a load whose request still
         # waits for it (3eeddf339's rule) and drops a name whose request
@@ -266,9 +278,11 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         if not self._sync_repack or self.connector_scheduler is None:
             return
         # vLLM's aggregator reports a receive only once every rank has, and
-        # a failure on any rank in failed_recving beside it. A failed load
-        # recomputes locally: no rank repacks it, and every rank frees the
-        # pages it staged for it in the named step.
+        # a failure on any rank in failed_recving beside it. vLLM ends a
+        # request whose load failed with an error under the deployed
+        # kv_load_failure_policy "fail" (it prefills it locally under
+        # "recompute"); either way no rank repacks it, and every rank frees
+        # the pages it staged for it in the named step.
         finished = set(connector_output.finished_recving or ())
         failed = set(getattr(connector_output, "failed_recving", None) or ())
         guard = self._guards_landing()
@@ -333,6 +347,29 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
                 getattr(meta, "qwen_repack_req_ids", ()),
                 drop=getattr(meta, "qwen_drop_req_ids", ()),
             )
+        if self._defer_load_submit and not kwargs.get("wait_for_completion", False):
+            # The step's loads are not read by its own forward (they land in
+            # staging and are repacked in a later step), so their submit and
+            # its CPU-group collectives can wait for the forward dispatch.
+            self._deferred_load_submit = (args, kwargs)
+            return
+        super().start_load_kv(*args, **kwargs)
+
+    def submit_deferred_loads(self) -> None:
+        """Submits the loads start_load_kv deferred in this step, once.
+
+        The runner calls it after the step's forward and sampling dispatch and
+        again before polling for finished transfers (the poll clears the
+        metadata), so a step without a forward submits at the poll and a
+        submit-time failure still reaches the same step's output. Every rank
+        reaches both call sites in the same order, so the submit's CPU-group
+        collectives stay paired across ranks.
+        """
+        pending = self._deferred_load_submit
+        if pending is None:
+            return
+        self._deferred_load_submit = None
+        args, kwargs = pending
         super().start_load_kv(*args, **kwargs)
 
     @staticmethod
@@ -440,7 +477,8 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         if self.last_failed_recving:
             logger.warning(
                 "Qwen4ExpRaidenWorker rank%d --> KV loads failed for %s; "
-                "they will be recomputed locally",
+                "vLLM fails these requests under kv_load_failure_policy=fail "
+                "(recomputes them under recompute)",
                 self.tp_rank,
                 sorted(self.last_failed_recving),
             )
@@ -603,12 +641,16 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
     def _after_native_registration(self) -> None:
         """Work that needs the native manager to hold the carrier already.
 
-        QWEN4_EXP_PD_SHARED_COMPRESSED: compile the landing gather for the
-        staging carrier's shape (read-only), so no served landing pays the
-        first-call compile. Collective, like the self-test: every TP worker
-        reaches the end of register_runner at the same point."""
+        A staged consumer compiles its repack programs (null chunk, pool null
+        page only), so no served load pays the first-call compile.
+        QWEN4_EXP_PD_SHARED_COMPRESSED: also compile the landing gather for the
+        staging carrier's shape (read-only). Collective, like the self-test:
+        every TP worker reaches the end of register_runner at the same point."""
         staging = getattr(self, "_staging", None)
-        if staging is None or getattr(self, "_qwen_shared", None) is None:
+        if staging is None:
+            return
+        staging.warm_repack()
+        if getattr(self, "_qwen_shared", None) is None:
             return
         seconds = staging.warm_shared()
         if seconds is not None:
@@ -747,6 +789,20 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
     def _stage3_admission_free_map(self):
         staging = getattr(self, "_staging", None)
         return None if staging is None else staging.free
+
+    def _stage3_admission_stats_extra(self) -> str:
+        """Staging pages free and in quarantine at the stats line, the loads
+        holding a reservation and the landed loads waiting for their named
+        repack step. One sum over the free map per stats line."""
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return ""
+        return (
+            f" staging pages={staging.pages} free={int(staging.free.sum())}"
+            f" quarantined={staging.quarantined_pages()}"
+            f" reserved_loads={len(staging.reservations)}"
+            f" pending_repacks={len(self._pending_repacks)}"
+        )
 
     def _stage3_reserve_destination_reduced(self, req_meta, reduced_free) -> bool:
         staging = getattr(self, "_staging", None)

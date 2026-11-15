@@ -139,6 +139,24 @@ def prepare(
     return BatchedAdmission(reduced_free, not_expired, deadlines, collectives)
 
 
+def all_staged(staged: bool, group: Any, one_reduce: bool) -> bool:
+    """Whether every rank of ``group`` staged its submit task for a load.
+
+    ``one_reduce`` (QWEN4_EXP_PD_FAST_ADMIT): a MIN all-reduce of one int32 over
+    ``group.cpu_group``. Otherwise ``all_gather_object`` of the flags, which
+    pickles them and runs two collectives (sizes, then bytes). The same answer:
+    the MIN of 0/1 flags is 1 exactly when every flag is 1."""
+    import torch.distributed as dist
+
+    if one_reduce:
+        flag = torch.tensor([1 if staged else 0], dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group.cpu_group)
+        return bool(flag.item())
+    ready: list[bool | None] = [None] * int(group.world_size)
+    dist.all_gather_object(ready, staged, group=group.cpu_group)
+    return all(ready)
+
+
 def ab_mode(passes: int, ab_passes: int, flag: bool) -> bool:
     """The switch for pass number ``passes`` (1-based, counted identically on every
     rank): ``ab_passes > 0`` alternates off / on every ``ab_passes`` passes, off

@@ -119,6 +119,12 @@ from vllm_torchtpu.offload.block_major_layout import (
 if TYPE_CHECKING:
     import torch
 
+    from vllm_torchtpu.offload.tier_classes import (
+        TierClass,
+        TieredOffloadingManager,
+        TierPlan,
+    )
+
 logger = init_logger(__name__)
 
 # Upper bound (seconds) on a scheduler-side drain of in-flight store/load
@@ -131,12 +137,52 @@ _DRAIN_TIMEOUT_S = envs.VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S
 # be reused, so re-reading them would ship garbage.
 _SAVE_RETRIES = envs.VLLM_TPU_OFFLOAD_SAVE_RETRIES
 
-_DEFAULT_CONTROLLER_PORT = 51515
+# Controller port of the offload store (the first of the host-tier class
+# stores) when the extra config sets none: below Linux's default ephemeral
+# range (32768-60999), so no listener bound to port 0 in the pod (a PD
+# engine's Raiden servers among them) can hold it and take its workers'
+# registrations. The store binds this port and every worker dials it; the
+# Raiden wheel falls back to no default of its own.
+_DEFAULT_CONTROLLER_PORT = 31515
+
+_EPHEMERAL_PORT_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
+
+
+def ephemeral_port_range(path: str = _EPHEMERAL_PORT_RANGE) -> tuple[int, int] | None:
+    """The kernel's ephemeral port range in this network namespace, or None."""
+    try:
+        with open(path) as f:
+            lo, hi = (int(v) for v in f.read().split())
+    except (OSError, ValueError):
+        return None
+    return lo, hi
+
+
+def refuse_ephemeral_ports(ports: Sequence[int]) -> None:
+    """Fails startup when a controller port lies in the ephemeral range, where a
+    listener bound to port 0 can hold it and take its workers' registrations."""
+    ephemeral = ephemeral_port_range()
+    if ephemeral is None:
+        return
+    lo, hi = ephemeral
+    inside = [port for port in ports if lo <= port <= hi]
+    if inside:
+        raise ValueError(
+            f"TPURaidenOffloadingConnector: controller ports {inside} fall in the "
+            f"ephemeral range {lo}-{hi}, where a listener bound to port 0 can hold "
+            "one and take its workers' registrations; set raiden_controller_port "
+            f"below {lo}"
+        )
+
 
 # Host bytes behind one offloaded block, summed over every worker rank, as
 # recorded from the per-worker KV cache configs before the offloading spec is
 # built (see ``_patch_vllm_offload_all_ranks_kv_bytes``). None until recorded.
 _all_ranks_kv_bytes_per_block: int | None = None
+
+# The per-worker KV cache configs that sum went over, in worker order; the
+# host tier's size classes read each worker's group-to-region plan from them.
+_worker_kv_cache_configs: tuple[Any, ...] | None = None
 
 
 def _worker_kv_bytes_per_block(kv_cache_config: Any) -> int:
@@ -169,14 +215,19 @@ def record_all_ranks_kv_bytes_per_block(kv_cache_configs: Sequence[Any]) -> int:
     over the per-worker configs is what one worker's figure times the world
     size cannot give.
     """
-    global _all_ranks_kv_bytes_per_block
+    global _all_ranks_kv_bytes_per_block, _worker_kv_cache_configs
     total = sum(_worker_kv_bytes_per_block(cfg) for cfg in kv_cache_configs)
     _all_ranks_kv_bytes_per_block = total
+    _worker_kv_cache_configs = tuple(kv_cache_configs)
     return total
 
 
 def all_ranks_kv_bytes_per_block() -> int | None:
     return _all_ranks_kv_bytes_per_block
+
+
+def recorded_worker_kv_cache_configs() -> tuple[Any, ...] | None:
+    return _worker_kv_cache_configs
 
 
 def iter_leaf_kv_cache_specs(kv_cache_spec):
@@ -304,6 +355,9 @@ class FinishedJob:
     success: bool
     req_id: str | None = None
     failed_device_block_ids: list[int] = field(default_factory=list)
+    # Stores only: the keys this job saved to the host (keys that were
+    # already resident are pinned in place, not saved).
+    stored_keys: list[OffloadKey] = field(default_factory=list)
 
 
 class RaidenOffloadingManager(OffloadingManager):
@@ -330,6 +384,14 @@ class RaidenOffloadingManager(OffloadingManager):
         # Storage tier behind the host DRAM pool: raiden BackendConfigs from
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
+        # Device rows per scheduler block in the registered views: block b's
+        # data is device row b * device_row_stride. 1 for whole-page rows; a
+        # host-tier class that registers finer rows (the compressed keys'
+        # leading bytes) sets the rows a page holds.
+        device_row_stride: int = 1,
+        # Keep the store time of every key the store holds (host-tier class
+        # telemetry: occupancy, stores, evictions, the oldest entry).
+        track_held: bool = False,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -337,8 +399,14 @@ class RaidenOffloadingManager(OffloadingManager):
         assert kernel_physical_blocks_capacity == (
             offload_logical_blocks_capacity * device_block_size_factor
         )
+        if device_row_stride != 1 and device_block_size_factor != 1:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: finer device rows need one kernel "
+                f"block per scheduler block, got factor {device_block_size_factor}"
+            )
         self._capacity_keys = offload_logical_blocks_capacity
         self._device_block_size_factor = device_block_size_factor
+        self._device_row_stride = device_row_stride
         self._key_namespace = key_namespace
         # Cross-instance sharing: publishing blocks to the global registry
         # requires a peer-reachable store_server_ip.
@@ -467,6 +535,13 @@ class RaidenOffloadingManager(OffloadingManager):
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
 
+        # Held keys by the wall-clock time a store first landed them,
+        # oldest first; updated by successful stores and by the eviction
+        # callback, both under _eviction_lock. None when not tracked.
+        self._held: dict[OffloadKey, float] | None = {} if track_held else None
+        self._held_stored = 0
+        self._held_evicted = 0
+
     # -- sub-hash / block-id expansion ----------------------------------
 
     def _sub_hashes(self, key: OffloadKey) -> list[bytes]:
@@ -484,8 +559,11 @@ class RaidenOffloadingManager(OffloadingManager):
         return out
 
     def _expand_device_blocks(self, device_block_ids: list[int]) -> list[int]:
+        # The only place a scheduler block ID becomes a device row: callers
+        # keep and report the scheduler's IDs.
         f = self._device_block_size_factor
-        return [b * f + i for b in device_block_ids for i in range(f)]
+        stride = self._device_row_stride
+        return [(b * f + i) * stride for b in device_block_ids for i in range(f)]
 
     # -- pin bookkeeping -------------------------------------------------
 
@@ -646,6 +724,24 @@ class RaidenOffloadingManager(OffloadingManager):
             self._remote_slices.update(remote_slices)
         return LookupResult.HIT
 
+    def host_resident_prefix(self, keys: list[OffloadKey]) -> int:
+        """Counts the leading keys whose every sub-block is in the host pool.
+
+        Reads the directory through ``_probe``: no pin is taken and the LRU
+        order stays as it is. The store's lookup halts at the first miss, and
+        an entry that is not on the host (a save in flight, a peer's block, a
+        storage-tier block) also ends the run.
+        """
+        if not keys:
+            return 0
+        host = (self._block_status.HOST, self._block_status.HOST_AND_HBM)
+        resident = 0
+        for _, block in self._probe(self._expand_keys(list(keys))):
+            if block.status not in host:
+                break
+            resident += 1
+        return resident // self._device_block_size_factor
+
     def touch(self, keys, req_context: ReqContext) -> None:
         # A lookup pins what it finds and releasing drops the entry back at
         # the Most Recently Used position, so probe-then-release is the touch:
@@ -750,6 +846,30 @@ class RaidenOffloadingManager(OffloadingManager):
         self._pending_remote_slices.update(remote_slices)
         return RaidenLoadStoreSpec(keys)
 
+    def unwind_prepared_load(self, spec: RaidenLoadStoreSpec) -> None:
+        """Gives back what a successful ``prepare_load`` took for ``spec``.
+
+        For a caller that prepared the load and will not submit it: one
+        release per local sub-hash, the pins that prepare took, and the peer
+        or storage slices it set aside. A pin another request holds on the
+        same entry is a count of its own and stays.
+        """
+        assert spec.pinned
+        local: list[bytes] = []
+        for sub_hash in self._expand_keys(spec.keys):
+            if self._pending_remote_slices.pop(sub_hash, None) is None:
+                local.append(sub_hash)
+        if local:
+            self._store.release(local)
+
+    def held_stats(self) -> tuple[int, int, int, float | None]:
+        """Keys held, keys stored and evicted since startup, and the store time
+        (``time.time()``) of the oldest held key. Needs ``track_held``."""
+        assert self._held is not None
+        with self._eviction_lock:
+            oldest = next(iter(self._held.values()), None)
+            return len(self._held), self._held_stored, self._held_evicted, oldest
+
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
         # The Raiden directory is the sole authority on what is stored: probe
         # it per key, so a key whose entries were displaced from the LRU is
@@ -844,6 +964,8 @@ class RaidenOffloadingManager(OffloadingManager):
                 if parsed is None:
                     continue
                 key, sub_idx = parsed
+                if self._held is not None and self._held.pop(key, None) is not None:
+                    self._held_evicted += 1
                 sub_indices = self._evicted_sub_hashes.setdefault(key, set())
                 if not sub_indices:
                     # Report eviction on the first sub-block loss: the logical
@@ -1142,9 +1264,28 @@ class RaidenOffloadingManager(OffloadingManager):
             self._store.release(held)
         if admission.op == AdmissionOp.STORE:
             self._inflight_store_keys.difference_update(admission.keys)
+            if success and self._held is not None:
+                now = time.time()
+                with self._eviction_lock:
+                    for key in admission.keys:
+                        if key not in self._held:
+                            self._held[key] = now
+                            self._held_stored += 1
+            saved = set(admission.saved_sub_hashes)
             self._finished.append(
                 FinishedJob(
-                    job_id=admission.job_id, op=AdmissionOp.STORE, success=success
+                    job_id=admission.job_id,
+                    op=AdmissionOp.STORE,
+                    success=success,
+                    stored_keys=(
+                        [
+                            key
+                            for key in admission.keys
+                            if all(h in saved for h in self._sub_hashes(key))
+                        ]
+                        if success
+                        else []
+                    ),
                 )
             )
         else:
@@ -1276,7 +1417,9 @@ class RaidenOffloadingManager(OffloadingManager):
         self._finished = []
         return finished
 
-    def drain_jobs(self, job_ids: set[int]) -> list[FinishedJob]:
+    def drain_jobs(
+        self, job_ids: set[int], deadline: float | None = None
+    ) -> list[FinishedJob]:
         """Drain in-flight DMA transfers to safely reclaim HBM blocks before reuse.
 
         Synchronously waits until the specified launched jobs complete (bounded
@@ -1288,6 +1431,9 @@ class RaidenOffloadingManager(OffloadingManager):
         remain live until hardware completion, but the finalizer treats them as
         terminal failures to prevent committing corrupted/torn bytes from reused
         blocks. Poisoned jobs are considered drained on subsequent calls.
+
+        ``deadline`` (a ``time.perf_counter()`` value) replaces the timeout,
+        so several managers can drain against one bound.
         """
         # Suppress retries for draining jobs: source blocks are being reclaimed,
         # so subsequent reads would transfer invalid/overwritten data.
@@ -1295,7 +1441,8 @@ class RaidenOffloadingManager(OffloadingManager):
             admission = self._admissions.get(job_id)
             if admission is not None:
                 admission.retries_left = 0
-        deadline = time.perf_counter() + _DRAIN_TIMEOUT_S
+        if deadline is None:
+            deadline = time.perf_counter() + _DRAIN_TIMEOUT_S
         drained: list[FinishedJob] = []
         while True:
             self._poll_once()
@@ -1614,18 +1761,53 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         # backend, which is right only when the store has no storage tier:
         # with one, every save needs every worker to write its shard.
         backend_configs: Sequence[object] = (),
+        # Register each region as rows of this many bytes instead of whole
+        # pages (a host-tier class that keeps a page's leading bytes only).
+        row_bytes: int | None = None,
+        # Names the registration thread and log lines (a host-tier class).
+        label: str = "",
     ):
         import numpy as np
         import torch
 
         # Set before either branch below starts the registration thread.
         self._backend_configs = list(backend_configs)
+        self._label = label
+        self._row_bytes = row_bytes
 
         (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
             resolve_kernel_geometry(vllm_config, kv_cache_config)
         )
         assert device_block_size % kernel_block_size == 0
         device_block_size_factor = device_block_size // kernel_block_size
+
+        if row_bytes is not None:
+            # Each region as a view of finer rows over its whole storage, at
+            # offset 0: row r is bytes [r * row_bytes, (r + 1) * row_bytes).
+            assert block_major_contract is None and device_block_size_factor == 1
+            assert isinstance(kv_dtype, torch.dtype)
+            itemsize = torch.empty(0, dtype=kv_dtype).element_size()
+            assert row_bytes % itemsize == 0, (row_bytes, itemsize)
+            row_tensors: list[torch.Tensor] = []
+            for kv_cache_tensor in kv_caches.tensors:
+                int8_view = kv_cache_tensor.tensor
+                page = kv_cache_tensor.page_size_bytes
+                assert page % row_bytes == 0, (page, row_bytes)
+                storage_bytes = int8_view.numel() * int8_view.element_size()
+                assert storage_bytes == int8_view.shape[0] * page, (
+                    storage_bytes,
+                    int8_view.shape[0],
+                    page,
+                )
+                row_tensors.append(
+                    torch.empty(0, dtype=kv_dtype, device=int8_view.device)
+                    .set_(int8_view.untyped_storage())
+                    .view(storage_bytes // row_bytes, row_bytes // itemsize)
+                )
+            self._init_registration(
+                row_tensors, host_blocks_to_allocate, controller_address, rank
+            )
+            return
 
         if is_multi_shapes_geometry(per_block_shape):
             # Branch for models whose kv cache consists of multiple tensors
@@ -1743,7 +1925,8 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         self._stop_registration = threading.Event()
         self._register_thread = threading.Thread(
             target=self._register_loop,
-            name=f"raiden-offload-register-rank{rank}",
+            name=f"raiden-offload-register-rank{rank}"
+            + (f"-{self._label}" if self._label else ""),
             daemon=True,
         )
         self._register_thread.start()
@@ -1797,14 +1980,35 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                     )
                     logger.info(
                         "TPURaidenOffloadingConnector: rank %d registered with offload "
-                        "controller at %s (%d host kernel blocks%s)",
+                        "controller at %s (%d host kernel blocks%s%s)",
                         self._rank,
                         self._controller_address,
                         self._host_blocks_to_allocate,
                         ", storage tier on" if self._backend_configs else "",
+                        f", tier class {self._label}" if self._label else "",
                     )
                     return
-                except Exception:
+                except Exception as exc:
+                    if (
+                        self._row_bytes is not None
+                        and "leading (block) dimension" in str(exc)
+                    ):
+                        # The installed Raiden refuses a view of finer rows
+                        # than the base buffer's. Retrying cannot help; the
+                        # class store's registration barrier fails startup.
+                        logger.error(
+                            "TPURaidenOffloadingConnector: rank %d: the installed "
+                            "Raiden refuses the %s class's view of %d-byte rows "
+                            "(%s). VLLM_TPU_OFFLOAD_TIER_KEY_ROWS needs a Raiden "
+                            "build that accepts a leading dimension that is a "
+                            "whole multiple of the base buffer's; startup fails "
+                            "at the class store's registration barrier.",
+                            self._rank,
+                            self._label,
+                            self._row_bytes,
+                            exc,
+                        )
+                        return
                     # A persistent failure escalates via the
                     # scheduler's construction barrier timeout.
                     logger.warning(
@@ -2356,6 +2560,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 config.worker_kv_bytes_per_block * self.world_size
             )
         assert bytes_per_block_all_ranks > 0
+        self.bytes_per_block_all_ranks = bytes_per_block_all_ranks
         self.offload_logical_blocks_capacity = int(
             int(cpu_bytes_to_use) // bytes_per_block_all_ranks
         )
@@ -2422,9 +2627,11 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
         if dp_rank_local is None:
             dp_rank_local = dp_rank
-        self.raiden_controller_port = dp_rank_local + int(
+        self._controller_port_base = int(
             self.extra_config.get("raiden_controller_port", _DEFAULT_CONTROLLER_PORT)
         )
+        self._dp_rank_local = dp_rank_local
+        self.raiden_controller_port = dp_rank_local + self._controller_port_base
         self.raiden_job_name = str(
             self.extra_config.get("raiden_job_name", f"vllm-offload-{config.engine_id}")
         )
@@ -2433,11 +2640,220 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         if dp_rank:
             self.raiden_job_name = f"{self.raiden_job_name}-dp{dp_rank}"
 
-        self._manager: RaidenOffloadingManager | None = None
-        self._worker: RaidenStoreOffloadingWorker | None = None
+        # Host tier in size classes (VLLM_TPU_OFFLOAD_TIER_CLASSES): None when off.
+        self.tier_plan: TierPlan | None = None
+        if envs.VLLM_TPU_OFFLOAD_TIER_CLASSES:
+            self.tier_plan = self._build_tier_plan(
+                config, vllm_config, int(cpu_bytes_to_use)
+            )
+        elif envs.VLLM_TPU_OFFLOAD_TIER_KEY_ROWS or envs.VLLM_TPU_OFFLOAD_TIER_CHECK:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_KEY_ROWS and "
+                "VLLM_TPU_OFFLOAD_TIER_CHECK are modes of the host tier classes and "
+                "need VLLM_TPU_OFFLOAD_TIER_CLASSES=1"
+            )
+
+        self._manager: OffloadingManager | None = None
+        self._worker: OffloadingWorker | None = None
+
+    # -- host tier classes (offload/tier_classes.py) ---------------------------
+
+    def _build_tier_plan(
+        self, config: OffloadingConfig, vllm_config: VllmConfig, budget: int
+    ) -> TierPlan:
+        """The classes from every worker's own plan, refused outside the local
+        DRAM tier and outside the served geometry. A shared-memory host pool
+        is refused before this, with the flag or without."""
+        from vllm_torchtpu.models.vllm.qwen4_exp.offload import (
+            is_qwen4_exp,
+            tier_group_kind,
+        )
+        from vllm_torchtpu.offload.tier_classes import (
+            build_tier_plan,
+            check_served_plan,
+        )
+
+        refused = []
+        if self.global_registry_address:
+            refused.append("a global registry (global_registry_address)")
+        if self.kv_pool_group:
+            refused.append("a peer store group (kv_pool_group)")
+        if self.storage_config is not None:
+            refused.append("a storage tier (raiden_storage_path / RAIDEN_STORAGE_PATH)")
+        if self.block_major_contract is not None:
+            refused.append("the block-major pool (VLLM_TPU_BLOCK_MAJOR_KV)")
+        if not is_qwen4_exp(vllm_config):
+            refused.append(
+                f"model {vllm_config.model_config.architecture!r} (Qwen4Exp only)"
+            )
+        if refused:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_CLASSES serves "
+                "the local host DRAM tier only; refused with " + ", ".join(refused)
+            )
+        worker_configs = recorded_worker_kv_cache_configs()
+        if worker_configs is None:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_CLASSES needs the "
+                "per-worker KV cache configs, which were not recorded before the "
+                "spec was built"
+            )
+        key_row_bytes = None
+        if envs.VLLM_TPU_OFFLOAD_TIER_KEY_ROWS:
+            key_row_bytes = self._compressed_key_live_bytes(vllm_config)
+        plan = build_tier_plan(
+            worker_configs,
+            [group.group_id for group in config.groups],
+            tier_group_kind,
+            budget,
+            envs.VLLM_TPU_OFFLOAD_TIER_CLASS_RATIO,
+            key_row_bytes=key_row_bytes,
+        )
+        check_served_plan(plan)
+        refuse_ephemeral_ports(
+            [
+                self._controller_port_base
+                + self._dp_rank_local * len(plan.classes)
+                + c.index
+                for c in plan.classes
+            ]
+        )
+        logger.info(
+            "TPURaidenOffloadingConnector: host tier classes, budget %d B, ratio "
+            "%.2f (%d token-blocks, %d checkpoints): %s",
+            budget,
+            plan.ratio,
+            plan.token_blocks,
+            plan.checkpoints,
+            plan.describe(),
+        )
+        return plan
+
+    @staticmethod
+    def _compressed_key_live_bytes(vllm_config: VllmConfig) -> int:
+        from vllm_torchtpu.models.vllm.qwen4_exp.pd_manifest import (
+            compressed_live_bytes,
+        )
+        from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import (
+            pooled_cache_specs,
+        )
+
+        layout, _ = pooled_cache_specs(vllm_config)
+        live = compressed_live_bytes(layout)
+        if live is None:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_KEY_ROWS needs "
+                "unpacked, unmerged compressed keys (one layer's keys at the start "
+                "of each page)"
+            )
+        return live
+
+    def tier_controller_port(self, tier_class: TierClass) -> int:
+        """Controller port of a class's store: one block of ports per local DP rank."""
+        assert self.tier_plan is not None
+        return (
+            self._controller_port_base
+            + self._dp_rank_local * len(self.tier_plan.classes)
+            + tier_class.index
+        )
+
+    def build_tier_manager(
+        self,
+        stores: Sequence[Any] | None = None,
+        store_types: Any = None,
+        check: bool | None = None,
+    ) -> TieredOffloadingManager:
+        """One manager per class (stores injected by tests), under one composite."""
+        from vllm_torchtpu.offload.tier_classes import TieredOffloadingManager
+
+        plan = self.tier_plan
+        assert plan is not None
+        factor = self.device_block_size_factor
+        managers = []
+        for tier_class in plan.classes:
+            capacity = plan.capacity(tier_class)
+            managers.append(
+                RaidenOffloadingManager(
+                    kernel_physical_blocks_capacity=capacity * factor,
+                    offload_logical_blocks_capacity=capacity,
+                    device_block_size_factor=factor,
+                    world_size=tier_class.num_workers,
+                    raiden_controller_port=self.tier_controller_port(tier_class),
+                    raiden_job_name=f"{self.raiden_job_name}-{tier_class.name}",
+                    store_server_ip=self.store_server_ip,
+                    key_namespace=self.key_namespace,
+                    device_row_stride=tier_class.rows_per_page,
+                    track_held=True,
+                    store=None if stores is None else stores[tier_class.index],
+                    store_types=store_types,
+                )
+            )
+        if check is None:
+            check = envs.VLLM_TPU_OFFLOAD_TIER_CHECK
+        return TieredOffloadingManager(plan, managers, check=check)
+
+    def _tier_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+        """A class worker for every class this worker has regions for."""
+        from vllm.distributed import parallel_state
+
+        from vllm_torchtpu.offload.tier_classes import (
+            TieredStoreOffloadingWorker,
+            class_kv_caches,
+            worker_group_regions,
+        )
+
+        plan = self.tier_plan
+        assert plan is not None
+        rank = parallel_state.get_world_group().rank_in_group
+        refs = kv_caches.group_data_refs
+        workers: dict[str, RaidenStoreOffloadingWorker] = {}
+        for tier_class in plan.classes:
+            indices = sorted(
+                {ref.tensor_idx for g in tier_class.groups for ref in refs[g]}
+            )
+            own = tuple(
+                sorted(
+                    {
+                        region
+                        for g in tier_class.groups
+                        for region in worker_group_regions(self.kv_cache_config, g)
+                    }
+                )
+            )
+            # register_kv_caches orders the tensors by region index.
+            assert tuple(indices) == own, (tier_class.name, indices, own)
+            if not own:
+                continue
+            assert own in tier_class.worker_regions, (
+                f"host tier class {tier_class.name}: rank {rank} uses regions {own}, "
+                f"which no recorded worker config plans ({tier_class.worker_regions})"
+            )
+            port = self.tier_controller_port(tier_class)
+            workers[tier_class.name] = RaidenStoreOffloadingWorker(
+                class_kv_caches(kv_caches, indices),
+                vllm_config=self.vllm_config,
+                kv_cache_config=self.kv_cache_config,
+                host_blocks_to_allocate=plan.capacity(tier_class)
+                * self.device_block_size_factor,
+                controller_address=f"{self.store_server_ip or '127.0.0.1'}:{port}",
+                rank=rank,
+                row_bytes=(
+                    tier_class.row_bytes if tier_class.rows_per_page > 1 else None
+                ),
+                label=tier_class.name,
+            )
+        logger.info(
+            "TPURaidenOffloadingConnector: rank %d registers host tier classes %s",
+            rank,
+            {name: len(w._device_tensors) for name, w in workers.items()},
+        )
+        return TieredStoreOffloadingWorker(workers)
 
     def get_manager(self) -> OffloadingManager:
+        if self._manager is None and self.tier_plan is not None:
+            self._manager = self.build_tier_manager()
         if self._manager is None:
+            refuse_ephemeral_ports([self.raiden_controller_port])
             secondary_backend_configs: list[object] = []
             storage = self.storage_config
             if storage is not None:
@@ -2489,9 +2905,12 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         return self._manager
 
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+        if self._worker is None and self.tier_plan is not None:
+            self._worker = self._tier_worker(kv_caches)
         if self._worker is None:
             from vllm.distributed import parallel_state
 
+            refuse_ephemeral_ports([self.raiden_controller_port])
             rank = parallel_state.get_world_group().rank_in_group
             # Direct workers to dial the controller on store_server_ip when configured
             # (bind-and-advertise), falling back to loopback (127.0.0.1) for local runs.

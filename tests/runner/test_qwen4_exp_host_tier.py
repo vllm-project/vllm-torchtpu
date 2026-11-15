@@ -690,6 +690,13 @@ def test_victim_policy_stores_evicted_blocks_before_reuse_and_they_hit(monkeypat
         tel = sched.telemetry
         assert tel["victim_stores"] == 1 and tel["victim_store_keys"] == len(evicted)
         assert tel["victim_young"] == 1 and tel["victim_seen"] == len(evicted) + 1
+        # stored keys split by KV cache group: checkpoints counted apart from attention blocks
+        per_group = {k: v for k, v in tel.items() if k.startswith("victim_store_keys_g")}
+        expected_per_group = {}
+        for g, _ in evicted:
+            expected_per_group[f"victim_store_keys_g{g}"] = expected_per_group.get(f"victim_store_keys_g{g}", 0) + 1
+        assert per_group == expected_per_group
+        assert all(f"victim_store_keys_g{g}=" in sched.telemetry_line() for g in mamba)
 
         # turn 2 extends turn 1: a host hit on the stored blocks, up to the checkpoint boundary
         second = _request("r2", first.prompt_token_ids + _tokens(2000, 1))

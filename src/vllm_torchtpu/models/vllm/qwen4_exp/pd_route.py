@@ -225,13 +225,18 @@ def main_src_rows(num_tokens: int, skip_tokens: int, rank: int, pages, g: RouteG
     return _flat(pages, rows, g)
 
 
-def compressed_src_rows(num_tokens: int, skip_tokens: int, pages, g: RouteGeometry):
+def compressed_src_rows(num_tokens: int, skip_tokens: int, pages, g: RouteGeometry, rank=None):
+    """Staging row of every compressed pair from ``skip_tokens`` on, in the order
+    ``pd_staging.compressed_rows_np`` lists them. ``rank`` (a decode TP rank, for
+    compressed keys split under VLLM_TPU_QSA_COMPRESSED_DCP): only the pairs it
+    owns, those of the ``dst_block``-token blocks ``b`` with ``b % dcp == rank %
+    dcp``; every rank still receives every pair."""
     span = 2 * g.ratio
     pairs = math.ceil(math.ceil(num_tokens / g.ratio) / 2)
-    rows = np.arange(skip_tokens // span, pairs, dtype=np.int64) - skip_rows(
-        "compressed", skip_tokens, g
-    )
-    return _flat(pages, rows, g)
+    index = np.arange(skip_tokens // span, pairs, dtype=np.int64)
+    if rank is not None and g.dcp > 1:
+        index = index[(index * span // g.dst_block) % g.dcp == rank % g.dcp]
+    return _flat(pages, index - skip_rows("compressed", skip_tokens, g), g)
 
 
 def prefix_src_rows(pages, g: RouteGeometry):

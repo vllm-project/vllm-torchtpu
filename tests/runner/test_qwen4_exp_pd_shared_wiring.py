@@ -133,7 +133,8 @@ def shared_landing(num_tokens, skip, prod, tables, shared=True):
         fn, staged = repack_fn(r), jnp.asarray(stagings[r])
 
         def run_chunks(chunks, fn=fn, staged=staged, holder=holder):
-            for chunk in chunks:
+            # QWEN4_EXP_PD_FAST_ADMIT plans carry packed chunks.
+            for chunk in map(st.unpacked_chunk, chunks):
                 holder["pool"] = fn(holder["pool"], staged, *(jnp.asarray(v, jnp.int32) for v in chunk))
 
         c._run_chunks = run_chunks
@@ -575,7 +576,8 @@ def test_warm_compiles_every_bucket_for_the_carrier_and_only_reads_it():
 
 def test_warm_runs_after_native_registration_only_with_shared_on():
     """register_runner ends with _after_native_registration (the native manager
-    already holds the carrier); it warms only a shared staged consumer."""
+    already holds the carrier); every staged consumer warms its repack, and
+    only a shared one its landing gather."""
     import inspect
 
     src = inspect.getsource(pc.Qwen4ExpRaidenWorker.register_runner)
@@ -583,12 +585,15 @@ def test_warm_runs_after_native_registration_only_with_shared_on():
     w = object.__new__(pc.Qwen4ExpRaidenWorker)
     w.tp_rank = 0
     warmed = []
-    w._staging = SimpleNamespace(warm_shared=lambda: warmed.append(1) or 0.1)
+    w._staging = SimpleNamespace(
+        warm_shared=lambda: warmed.append("shared") or 0.1,
+        warm_repack=lambda: warmed.append("repack") or 0.1,
+    )
     w._qwen_shared = None
     w._after_native_registration()
-    assert warmed == []
+    assert warmed == ["repack"]
     w._qwen_shared = object()
     w._after_native_registration()
-    assert warmed == [1]
+    assert warmed == ["repack", "repack", "shared"]
     w._staging = None
     w._after_native_registration()  # a producer: nothing to warm

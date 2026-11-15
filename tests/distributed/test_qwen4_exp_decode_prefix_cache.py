@@ -1006,7 +1006,7 @@ def test_draft_kv_warns_when_the_decode_prefix_cache_is_off(monkeypatch):
 @pytest.mark.usefixtures("draft_kv")
 def test_draft_kv_refuses_compressed_dcp(monkeypatch):
     """VLLM_TPU_QSA_COMPRESSED_DCP splits compressed keys over DCP ranks; the
-    staging repack lands them unsplit."""
+    staged landing splits them for a decode-only draft only."""
     import torch
 
     from vllm_torchtpu.models.vllm.qwen4_exp import pd_staging

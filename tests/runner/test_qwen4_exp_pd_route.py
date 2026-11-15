@@ -59,19 +59,19 @@ GEO = rt.RouteGeometry(tp=TP, dcp=DCP, dst_block=DST_BLOCK, src_block=SRC_BLOCK,
 FA_LAYERS, GDN_LAYERS = 2, 2
 
 
-def owners():
+def owners(gdn_layers=GDN_LAYERS):
     names = []
     for i in range(FA_LAYERS):
         names += [f"l{i}.self_attn", f"l{i}.self_attn.compressed_k", f"l{i}.self_attn.raw_ring"]
-    names += [f"g{i}.linear_attn" for i in range(GDN_LAYERS)] + ["p.ple"]
+    names += [f"g{i}.linear_attn" for i in range(gdn_layers)] + ["p.ple"]
     return names
 
 
-def producer_pages(num_tokens, rng):
+def producer_pages(num_tokens, rng, names=None):
     """Per owner, [pages, SRC_BLOCK, 4, 256] uint8 of random bytes."""
     n_tok_pages = -(-num_tokens // SRC_BLOCK)
     out = {}
-    for name in owners():
+    for name in names or owners():
         kind = st.owner_kind(name)
         n = n_tok_pages if kind in ("main", "compressed") else 1
         out[name] = rng.integers(0, 256, (n, SRC_BLOCK, ROWS, LANES), dtype=np.uint8)
@@ -82,21 +82,22 @@ def rank_slice(r):
     return st.RankSlice(tp_size=TP, tp_rank=r, num_kv_heads=KV_HEADS, main_dcp=DCP)
 
 
-def dst_tables(num_tokens, rng):
+def dst_tables(num_tokens, rng, names=None):
     n_main = -(-num_tokens // (DCP * DST_BLOCK))
     n_comp = -(-num_tokens // DST_BLOCK)
     ids = list(rng.permutation(np.arange(1, 400)))
     take = lambda k: [int(ids.pop()) for _ in range(k)]  # noqa: E731
     t = {}
-    for name in owners():
+    for name in names or owners():
         kind = st.owner_kind(name)
         t[name] = take(n_main if kind == "main" else n_comp if kind == "compressed" else 1)
     return t
 
 
-def make_fn(rank, compact):
+def make_fn(rank, compact, gdn=True):
     return st.make_repack(
-        src_block=SRC_BLOCK, dst_block=DST_BLOCK, src_gdn=S_GDN, dst_gdn=D_GDN,
+        src_block=SRC_BLOCK, dst_block=DST_BLOCK,
+        src_gdn=S_GDN if gdn else None, dst_gdn=D_GDN if gdn else None,
         kv_head=rank.kv_head, v_head_start=rank.tp_rank * D_GDN.v_heads,
         channels=st.conv_channels(S_GDN, D_GDN, rank), write=scatter,
         compact_gdn=((GEO.stage_rows, GEO.gdn_rows // GEO.stage_rows) if compact else None),
@@ -188,19 +189,26 @@ def apply_spans(spans, declared, src_pages_bytes, unit, dest_pages, skip_bytes, 
     )
 
 
-def consumer(rank):
+def consumer(rank, names=None, split=False, pairs=None):
     c = object.__new__(st.StagedConsumer)
     c.route, c.rank, c.ratio, c.dst_block = GEO, rank, RATIO, DST_BLOCK
-    names = owners()
+    names = names or owners()
     c._dst_compressed = {n: (n, 0) for n in names if st.owner_kind(n) == "compressed"}
-    c._dst_owner = {n: n for n in names}
+    # QWEN4_EXP_PACK_MAIN_KV: a paired member has no destination group of its own.
+    away = {m for members in (pairs or {}).values() for m in members[1:]}
+    c._dst_owner = {n: n for n in names if n not in away}
+    if pairs:
+        c._main_pairs = pairs
     c._gdn_names = [n for n in names if st.owner_kind(n) == "gdn"]
     c._state_entry = 0
+    if split:  # VLLM_TPU_QSA_COMPRESSED_DCP: compressed keys are DCP-split owners
+        c._dcp_owners = frozenset(c._dst_compressed)
     return c
 
 
-def routed_landing(num_tokens, skip, rank, prod, tables):
-    names = owners()
+def routed_staging(num_tokens, skip, rank, prod, names):
+    """Compact staging after the producer's spans land, its page lists and the
+    staging page count per owner."""
     counts = {n: rt.staging_pages(st.owner_kind(n), num_tokens, len(prod[n]), skip, GEO)
               for n in names}
     staging = np.zeros((sum(counts.values()) + 1, GEO.stage_rows, 1, ROWS, LANES), np.uint8)
@@ -213,7 +221,12 @@ def routed_landing(num_tokens, skip, rank, prod, tables):
         spans = rt.producer_spans(kind, num_tokens, len(prod[name]), GEO)
         apply_spans(spans, sum(n for *_, n, _ in spans), prod[name], rank.tp_rank,
                     pages[name], rt.skip_rows(kind, skip, GEO) * RB, flat)
-    idx = consumer(rank)._routed_indices(pages, tables, num_tokens, skip)
+    return staging, pages, counts
+
+
+def routed_landing(num_tokens, skip, rank, prod, tables, split=False, pairs=None):
+    staging, pages, counts = routed_staging(num_tokens, skip, rank, prod, owners())
+    idx = consumer(rank, split=split, pairs=pairs)._routed_indices(pages, tables, num_tokens, skip)
     pool = np.zeros((400, DST_BLOCK, 1, ROWS, LANES), np.uint8)
     return run(make_fn(rank, True), pool, staging, idx), counts
 
@@ -242,6 +255,105 @@ def test_routed_prefix_aware_landing_is_byte_identical(num_tokens, skip):
         want = broadcast_landing(num_tokens, skip, rank, prod, tables)
         got, _ = routed_landing(num_tokens, skip, rank, prod, tables)
         np.testing.assert_array_equal(got, want, err_msg=f"rank {r}, skip {skip}")
+
+
+@pytest.mark.parametrize("num_tokens,skip", [(2049, 0), (2049, 1792), (321, 0)])
+def test_repack_shape_with_every_gdn_owner_first_lands_identical_pools(
+    num_tokens, skip
+):
+    """36 GDN owners, as Flash has (QWEN4_EXP_PD_REPACK_SHAPE): a first
+    program that carries every GDN owner, later programs from the repack built
+    without GDN state, and a copied-row size apart from main KV land the same
+    pool, byte for byte, as the default 16384,16384,4 chunks."""
+    names = owners(gdn_layers=36)
+    rng = np.random.default_rng(num_tokens + skip + 36)
+    prod = producer_pages(num_tokens, rng, names)
+    tables = dst_tables(num_tokens, rng, names)
+
+    def land(fns, staging, idx, shape, split, null_rows=None):
+        main, copied, gdn = shape
+        chunks = list(st.repack_chunks(
+            *idx, main, gdn, copy_size=copied, split_gdn=split, null_rows=null_rows
+        ))
+        out = jnp.asarray(np.zeros((400, DST_BLOCK, 1, ROWS, LANES), np.uint8))
+        for c in chunks:
+            # As StagedConsumer._run_chunks: a chunk without GDN lists runs
+            # the GDN-free repack, whose GDN arguments are never read.
+            index = (jnp.asarray(0 if v is None else v, jnp.int32) for v in c)
+            out = fns[c[4] is None](out, jnp.asarray(staging), *index)
+        return np.asarray(out), chunks
+
+    for r in range(TP):
+        rank = rank_slice(r)
+        staging, pages, _ = routed_staging(num_tokens, skip, rank, prod, names)
+        idx = consumer(rank, names)._routed_indices(pages, tables, num_tokens, skip)
+        assert len(idx[4]) == 36
+        fns = (make_fn(rank, True), make_fn(rank, True, gdn=False))
+        want, today = land(fns, staging, idx, (16384, 16384, 4), False)
+        assert len(today) == 9 and all(c[4] is not None for c in today)
+        # The served target shape (one program for these loads) and a small one
+        # that cuts each load into several programs.
+        # Spread padding (null_rows): staging page 0 is zero and the pool's
+        # page 0 starts zero, so the whole pool, real rows included, matches.
+        null_rows = (GEO.stage_rows, DST_BLOCK)
+        got, _ = land(fns, staging, idx, (16384, 16384, 4), False, null_rows)
+        np.testing.assert_array_equal(got, want, err_msg=f"rank {r}, spread padding")
+        for shape in ((16384, 8192, 36), (256, 128, 36)):
+            for rows in (None, null_rows):
+                got, chunks = land(fns, staging, idx, shape, True, rows)
+                assert len(chunks[0][4]) == 36 and all(c[4] is None for c in chunks[1:])
+                assert len(chunks) == 1 if shape[0] == 16384 else len(chunks) > 1
+                np.testing.assert_array_equal(
+                    got, want, err_msg=f"rank {r}, shape {shape}, null rows {rows}"
+                )
+        assert want.any()
+
+
+@pytest.mark.parametrize(
+    "shape,split", [((16384, 16384, 4), False), ((16384, 8192, 36), True)]
+)
+def test_warm_repack_runs_null_chunks_of_the_serving_shapes(shape, split):
+    c = consumer(rank_slice(0), owners(gdn_layers=36))
+    c._repack_shape, c._split_gdn = shape, split
+    ran = []
+    c._run_chunks = ran.extend
+    c.warm_repack()
+    main, copied, gdn = shape
+    first = ran[0]
+    assert [len(v) for v in first[:4]] == [main, main, copied, copied]
+    assert first[4].shape == (gdn, GEO.gdn_rows // GEO.stage_rows)
+    assert first[5].shape == (gdn,)
+    assert not any(np.asarray(v).any() for v in first)
+    assert len(ran) == (2 if split else 1)
+    if split:
+        assert ran[1][4] is None and ran[1][5] is None
+        assert all(a is b for a, b in zip(ran[1][:4], first[:4]))
+
+
+def test_spread_padding_uses_distinct_null_page_rows_in_whole_tiles():
+    main_s = np.arange(100, 228, dtype=np.int64)  # 128 real rows: two tiles
+    main_d = np.arange(5000, 5128, dtype=np.int64)
+    (chunk,) = st.repack_chunks(main_s, main_d, main_s[:64], main_d[:64], [7], [9],
+                                size=1024, gdn_pages=1, null_rows=(256, 512))
+    ms, md, cs, cd, gs, gd = chunk
+    np.testing.assert_array_equal(ms[:128], main_s)
+    np.testing.assert_array_equal(md[:128], main_d)
+    np.testing.assert_array_equal(ms[128:], np.arange(1024 - 128) % 256)
+    np.testing.assert_array_equal(md[128:], np.arange(1024 - 128) % 512)
+    pad = md[128:].reshape(-1, st.REPACK_TILE)
+    assert (np.diff(pad, axis=1) == 1).all()  # each padded tile is one contiguous run
+    assert len(set(md[128:640].tolist())) == 512 and md[128:].max() < 512
+    np.testing.assert_array_equal(cd[64:], np.arange(1024 - 64) % 512)
+    assert list(gs) == [7] and list(gd) == [9]
+
+
+def test_repack_shape_env_takes_commas_or_colons():
+    assert st.parse_repack_shape("") == (16384, 16384, 4)
+    assert st.parse_repack_shape("16384:8192:36") == (16384, 8192, 36)
+    assert st.parse_repack_shape(" 8192,8192,36 ") == (8192, 8192, 36)
+    for bad in ("16384,8192", "16384,8100,36", "0,8192,36", "16384,8192,0", "a,b,c"):
+        with pytest.raises(ValueError):
+            st.parse_repack_shape(bad)
 
 
 def test_staging_counts_are_rank_independent_and_compact():
@@ -376,3 +488,263 @@ def test_routed_staging_refuses_a_merged_key_or_pcp_producer(monkeypatch, layout
     with pytest.raises(Exception) as other:
         st.route_geometry_for(None, plain, dst, rank)
     assert "plain TP1 producer" not in str(other.value)
+
+
+# --- VLLM_TPU_QSA_COMPRESSED_DCP: split compressed keys, routed staging ---------
+# The producer and the route are unchanged (every rank receives every pair);
+# each rank lands the pairs of its own DST_BLOCK-token blocks, block k on rank
+# k % DCP, at the same in-page rows of its page for entry k // DCP
+# (pooled_qsa.compressed_pairs with dcp).
+
+
+def split_tables(num_tokens, tables, rng):
+    """``tables`` with each compressed owner's pages replaced by unused ones,
+    one per DCP x DST_BLOCK entry."""
+    used = {p for pages in tables.values() for p in pages}
+    free = [p for p in rng.permutation(np.arange(1, 400)).tolist() if p not in used]
+    entries = -(-num_tokens // (DCP * DST_BLOCK))
+    out = dict(tables)
+    for name in owners():
+        if st.owner_kind(name) == "compressed":
+            out[name] = [int(free.pop()) for _ in range(entries)]
+    return out
+
+
+def split_reference(num_tokens, skip, rank, prod, tables, split):
+    """The slow way: today's unsplit routed landing (compressed keys on their
+    per-block ``tables`` pages), then each block this rank owns copied to its
+    split page, and the unsplit pages cleared (the split landing never
+    writes them)."""
+    unsplit, _ = routed_landing(num_tokens, skip, rank, prod, tables)
+    want = unsplit.copy()
+    rows = DST_BLOCK // (2 * RATIO)
+    pairs = math.ceil(math.ceil(num_tokens / RATIO) / 2)
+    for name in owners():
+        if st.owner_kind(name) != "compressed":
+            continue
+        want[tables[name]] = 0
+        for k in range(skip // DST_BLOCK, -(-num_tokens // DST_BLOCK)):
+            if k % DCP != rank.tp_rank % DCP:
+                continue
+            n = min(rows, pairs - k * rows)
+            want[split[name][k // DCP], :n] = unsplit[tables[name][k], :n]
+    return want
+
+
+SPLIT_CASES = [(n, 0) for n in (1, 127, 128, 129, 255, 256, 321, 1000, 2049)] + [
+    (600, 256), (2049, 512), (2049, 1792), (1000, 768)
+]
+
+
+@pytest.mark.parametrize("num_tokens,skip", SPLIT_CASES)
+def test_routed_split_compressed_landing_is_the_owned_part_of_the_unsplit_one(num_tokens, skip):
+    rng = np.random.default_rng(num_tokens * 7 + skip)
+    prod, tables = producer_pages(num_tokens, rng), dst_tables(num_tokens, rng)
+    split = split_tables(num_tokens, tables, rng)
+    for r in range(TP):
+        rank = rank_slice(r)
+        want = split_reference(num_tokens, skip, rank, prod, tables, split)
+        got, counts = routed_landing(num_tokens, skip, rank, prod, split, split=True)
+        # Page 0 is the null page (an empty plan rewrites its row 0).
+        np.testing.assert_array_equal(got[1:], want[1:], err_msg=f"rank {r}, skip {skip}")
+        # Staging is unchanged: every rank still stages every pair.
+        _, unsplit_counts = routed_landing(num_tokens, skip, rank, prod, tables)
+        assert counts == unsplit_counts
+
+
+@pytest.mark.parametrize("num_tokens,skip", [(2049, 0), (2049, 512), (100, 0)])
+def test_owned_compressed_src_rows_are_the_owned_subset(num_tokens, skip):
+    pages = list(range(50, 50 + rt.staging_pages("compressed", num_tokens, 7, skip, GEO)))
+    every = rt.compressed_src_rows(num_tokens, skip, pages, GEO)
+    t = st.pair_tokens_np(num_tokens, RATIO, skip)
+    for r in range(TP):
+        own = rt.compressed_src_rows(num_tokens, skip, pages, GEO, rank=r)
+        np.testing.assert_array_equal(own, every[(t // DST_BLOCK) % DCP == r % DCP])
+
+
+# --- QWEN4_EXP_PACK_MAIN_KV: paired main KV, routed staging ----------------------
+# The producer and the route are unchanged: every main-KV owner's slice lands in
+# its own compact staging pages. The repack writes both members of a paired owner
+# in one row of the owner's table, member s's head pair at head slots 2s, 2s + 1.
+# The reference is the unpacked routed landing (each member on a table of its
+# own), then each member's pair merged into the owner's rows by the decode's
+# paired writer's rule (pooled_qsa._write_main_cache_paired); the members' own
+# pages stay untouched. Three FA layers: l0 + l1 pair, l2 keeps whole rows.
+
+PACK_PAIRS = {"l0.self_attn": ("l0.self_attn", "l1.self_attn")}
+
+
+def merge_slot(old, new, slot):
+    """``pooled_qsa._write_main_cache_paired`` on rows ``[n, 4, 256]``: FP8
+    head slots of a lane are one 32-bit word, low byte first; slot ``s`` owns
+    bytes 2s and 2s + 1, the keep mask preserves the rest."""
+    pq = pytest.importorskip("vllm_torchtpu.kernels.qwen4_exp.pooled_qsa")
+    moved = np.asarray(pq.main_slot_rows(jnp.asarray(new), slot))
+
+    def words(rows):
+        return np.ascontiguousarray(rows.transpose(0, 2, 1)).view(np.uint32)[..., 0]
+
+    merged = (words(old) & np.uint32(pq._main_slot_keep_mask(slot))) | words(moved)
+    return merged[..., None].view(np.uint8).transpose(0, 2, 1)
+
+
+def owned_rows(num_tokens, skip, rank, table):
+    t = np.arange(skip, num_tokens)
+    t = t[(t // DST_BLOCK) % DCP == rank.tp_rank % DCP]
+    return np.asarray(table, dtype=np.int64)[t // (DCP * DST_BLOCK)] * DST_BLOCK + t % DST_BLOCK
+
+
+def packed_reference(num_tokens, skip, rank, prod, tables, split):
+    unpacked, _ = routed_landing(num_tokens, skip, rank, prod, tables, split=split)
+    ref = unpacked.copy()
+    flat_u = unpacked.reshape(-1, ROWS, LANES)
+    flat = ref.reshape(-1, ROWS, LANES)
+    for owner, members in PACK_PAIRS.items():
+        dst = owned_rows(num_tokens, skip, rank, tables[owner])
+        for slot, member in enumerate(members):
+            src = owned_rows(num_tokens, skip, rank, tables[member])
+            flat[dst] = merge_slot(flat[dst], flat_u[src], slot)
+        for member in members[1:]:
+            ref[tables[member]] = 0  # its own pages: never written when packed
+    return ref
+
+
+PACK_CASES = [(n, 0) for n in (1, 128, 129, 321, 1000, 2049)] + [(600, 256), (2049, 512), (2049, 1792)]
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["unsplit_keys", "f1_split_keys"])
+@pytest.mark.parametrize("num_tokens,skip", PACK_CASES)
+def test_routed_packed_main_landing_is_the_slot_merge_of_the_unpacked_one(
+    monkeypatch, num_tokens, skip, split
+):
+    monkeypatch.setitem(globals(), "FA_LAYERS", 3)
+    rng = np.random.default_rng(num_tokens * 5 + skip + split)
+    prod, tables = producer_pages(num_tokens, rng), dst_tables(num_tokens, rng)
+    if split:
+        tables = split_tables(num_tokens, tables, rng)
+    for r in range(TP):
+        rank = rank_slice(r)
+        want = packed_reference(num_tokens, skip, rank, prod, tables, split)
+        got, counts = routed_landing(num_tokens, skip, rank, prod, tables, split=split,
+                                     pairs=PACK_PAIRS)
+        # Page 0 is the null page (an empty plan rewrites its row 0).
+        np.testing.assert_array_equal(got[1:], want[1:], err_msg=f"rank {r}, skip {skip}")
+        # The odd layer keeps whole rows: slots 2-3 zero.
+        rows = owned_rows(num_tokens, skip, rank, tables["l2.self_attn"])
+        assert not got.reshape(-1, ROWS, LANES)[rows][:, 2:].any()
+        # Staging is unchanged: every producer owner stages as before.
+        _, unpacked_counts = routed_landing(num_tokens, skip, rank, prod, tables, split=split)
+        assert counts == unpacked_counts
+
+
+@pytest.mark.parametrize("num_tokens,skip", [(1000, 0), (2049, 512)])
+def test_routed_packed_main_matches_the_broadcast_packed_landing(monkeypatch, num_tokens, skip):
+    """The broadcast planner (``indices`` without a route) and the routed one
+    plan the same paired rows: equal pools on every rank."""
+    monkeypatch.setitem(globals(), "FA_LAYERS", 3)
+    rng = np.random.default_rng(num_tokens + skip)
+    prod, tables = producer_pages(num_tokens, rng), dst_tables(num_tokens, rng)
+    names = owners()
+    n_pages = sum(len(prod[n]) for n in names) + 1
+    staging = np.zeros((n_pages, SRC_BLOCK, 1, ROWS, LANES), np.uint8)
+    pages, cur = {}, 1
+    for name in names:
+        pages[name] = list(range(cur, cur + len(prod[name])))
+        staging[cur : cur + len(prod[name]), :, 0] = prod[name]
+        cur += len(prod[name])
+    first = skip // SRC_BLOCK
+    staged = {n: (p[first:] if st.owner_kind(n) in ("main", "compressed") else p)
+              for n, p in pages.items()}
+    for r in range(TP):
+        rank = rank_slice(r)
+        b = consumer(rank, pairs=PACK_PAIRS)
+        b.route, b.src_block = None, SRC_BLOCK
+        b._src_owner = {n: i for i, n in enumerate(names)}
+        b.src_groups, b._zero_draft = [None] * len(names), {}
+        groups = [first if st.owner_kind(n) in ("main", "compressed") else 0 for n in names]
+        idx = b.indices(staged, tables, num_tokens, skip, groups)
+        pool = np.zeros((400, DST_BLOCK, 1, ROWS, LANES), np.uint8)
+        want = run(make_fn(rank, False), pool, staging, idx)
+        got, _ = routed_landing(num_tokens, skip, rank, prod, tables, pairs=PACK_PAIRS)
+        np.testing.assert_array_equal(got[1:], want[1:], err_msg=f"rank {r}")
+
+
+def test_spread_padding_pads_both_paired_main_columns_with_distinct_rows():
+    """Paired main-KV sources ([rows, 2], QWEN4_EXP_PACK_MAIN_KV): spread
+    padding gives each column the distinct null-page rows a single column
+    gets, so neither column's gather repeats one row; the shape stays
+    [size, 2] for an empty list too."""
+    main_s = np.stack([np.arange(100, 228), np.arange(900, 1028)], axis=1).astype(np.int64)
+    main_d = np.arange(5000, 5128, dtype=np.int64)
+    (chunk,) = st.repack_chunks(main_s, main_d, [], [], [7], [9], size=1024, gdn_pages=1,
+                                null_rows=(256, 512))
+    ms, md = chunk[0], chunk[1]
+    assert ms.shape == (1024, 2)
+    np.testing.assert_array_equal(ms[:128], main_s)
+    for col in range(2):
+        np.testing.assert_array_equal(ms[128:, col], np.arange(1024 - 128) % 256)
+    np.testing.assert_array_equal(md[128:], np.arange(1024 - 128) % 512)
+    (empty,) = st.repack_chunks(np.zeros((0, 2), np.int64), np.zeros(0, np.int64), [], [],
+                                [7], [9], size=256, gdn_pages=1, null_rows=(256, 512))
+    assert empty[0].shape == (256, 2) and len(set(empty[0][:, 1].tolist())) == 256
+
+
+@pytest.mark.parametrize(
+    "num_tokens,skip", [(2049, 0), (2049, 1792), (321, 0), (9000, 0), (10000, 512)]
+)
+def test_paired_main_lands_the_same_under_every_repack_shape(monkeypatch, num_tokens, skip):
+    """Paired main KV with 36 GDN owners: QWEN4_EXP_PD_REPACK_SHAPE's split-GDN
+    programs and spread padding land the pool the default 16384,16384,4
+    chunks land (that landing is checked against the slot-merge reference
+    above). 8192,8192,36 is the shape the stack runs with packing; the two
+    largest loads give a rank more paired main rows (one pair and one odd
+    owner) than that, without and with a local prefix, so they take two
+    programs of it."""
+    monkeypatch.setitem(globals(), "FA_LAYERS", 3)
+    names = owners(gdn_layers=36)
+    rng = np.random.default_rng(num_tokens + skip + 3)
+    prod = producer_pages(num_tokens, rng, names)
+    tables = dst_tables(num_tokens, rng, names)
+    null_rows = (GEO.stage_rows, DST_BLOCK)
+    for r in (0, 1, 3):
+        rank = rank_slice(r)
+        staging, pages, _ = routed_staging(num_tokens, skip, rank, prod, names)
+        idx = consumer(rank, names, pairs=PACK_PAIRS)._routed_indices(
+            pages, tables, num_tokens, skip
+        )
+        assert idx[0].ndim == 2
+        fns = (make_fn(rank, True), make_fn(rank, True, gdn=False))
+        results = []
+        n_programs = {}
+        for shape, split, rows in (((16384, 16384, 4), False, None),
+                                   ((16384, 16384, 4), False, null_rows),
+                                   ((8192, 8192, 36), True, null_rows),
+                                   ((256, 128, 36), True, null_rows)):
+            main, copied, gdn = shape
+            out = jnp.asarray(np.zeros((400, DST_BLOCK, 1, ROWS, LANES), np.uint8))
+            chunks = list(st.repack_chunks(*idx, main, gdn, copy_size=copied, split_gdn=split,
+                                           null_rows=rows))
+            for c in chunks:
+                assert c[0].shape == (main, 2)
+                index = (jnp.asarray(0 if v is None else v, jnp.int32) for v in c)
+                out = fns[c[4] is None](out, jnp.asarray(staging), *index)
+            results.append(np.asarray(out))
+            n_programs[shape] = len(chunks)
+        if num_tokens >= 9000:
+            assert len(idx[1]) > 8192
+            assert n_programs[(8192, 8192, 36)] == 2  # chunked at the packed stack's shape
+        for got in results[1:]:
+            np.testing.assert_array_equal(got, results[0], err_msg=f"rank {r}")
+        assert results[0].any()
+
+
+def test_warm_repack_runs_the_paired_main_shape(monkeypatch):
+    monkeypatch.setitem(globals(), "FA_LAYERS", 3)
+    c = consumer(rank_slice(0), owners(gdn_layers=36), pairs=PACK_PAIRS)
+    c._repack_shape, c._split_gdn = (16384, 8192, 36), True
+    c._null_rows = (GEO.stage_rows, DST_BLOCK)
+    ran = []
+    c._run_chunks = ran.extend
+    c.warm_repack()
+    assert ran[0][0].shape == (16384, 2) and ran[1][0].shape == (16384, 2)
+    assert len(set(ran[0][0][:, 1].tolist())) == GEO.stage_rows  # spread over page-0 rows

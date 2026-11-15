@@ -16,9 +16,114 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+_ROUTING_POLICIES = ("round_robin", "least_loaded", "sticky")
+
+
+class _LegRouter:
+    """Picks the instance of one leg (prefill or decode) for each request.
+
+    round_robin cycles through the instances. least_loaded takes the one with
+    the fewest requests in flight through this proxy. sticky keeps a
+    conversation (the request's affinity header) on the instance that served
+    its previous turn, which holds that turn's KV: the key's instance is kept
+    while it has fewer than ``max_inflight`` requests in flight (0 is no cap).
+    A key seen for the first time, or one whose instance is at the cap, goes to
+    the least loaded instance and the key moves there; when that one is at the
+    cap too, the key stays where it is. A request without the header goes to
+    the least loaded instance and pins nothing. Least loaded ties go to the
+    instance owning fewer conversations, then to the one sent fewer requests.
+
+    acquire and release run on the event loop only (never in a threadpool), so
+    the counts need no lock.
+    """
+
+    def __init__(
+        self,
+        leg: str,
+        num_instances: int,
+        policy: str,
+        max_inflight: int,
+        log_interval_s: float,
+    ):
+        if policy not in _ROUTING_POLICIES:
+            raise ValueError(
+                f"{leg} routing must be one of {', '.join(_ROUTING_POLICIES)}, "
+                f"got {policy!r}"
+            )
+        self.leg = leg
+        self.policy = policy
+        self.max_inflight = max(0, max_inflight)
+        self.inflight = [0] * num_instances
+        self.dispatched = [0] * num_instances
+        self.owned = [0] * num_instances
+        self.owner: dict[str, int] = {}
+        self.routes = {"sticky": 0, "new": 0, "spill": 0, "full": 0, "nokey": 0}
+        self._cycle = itertools.cycle(range(num_instances))
+        self._log_interval_s = log_interval_s
+        self._next_log = time.monotonic() + log_interval_s
+
+    def _least_loaded(self) -> int:
+        return min(
+            range(len(self.inflight)),
+            key=lambda i: (self.inflight[i], self.owned[i], self.dispatched[i], i),
+        )
+
+    def acquire(self, key: str | None) -> tuple[int, str]:
+        """Returns the instance index and how it was chosen."""
+        if self.policy == "round_robin":
+            idx, route = next(self._cycle), "rr"
+        elif self.policy == "least_loaded":
+            idx, route = self._least_loaded(), "least"
+        elif not key:
+            idx, route = self._least_loaded(), "nokey"
+        else:
+            prev = self.owner.get(key)
+            if prev is not None and (
+                self.max_inflight == 0 or self.inflight[prev] < self.max_inflight
+            ):
+                idx, route = prev, "sticky"
+            else:
+                idx = self._least_loaded()
+                if prev is None:
+                    route = "new"
+                elif self.inflight[idx] >= self.max_inflight:
+                    idx, route = prev, "full"
+                else:
+                    route = "spill"
+                if idx != prev:
+                    if prev is not None:
+                        self.owned[prev] -= 1
+                    self.owned[idx] += 1
+                    self.owner[key] = idx
+        if route in self.routes:
+            self.routes[route] += 1
+        self.inflight[idx] += 1
+        self.dispatched[idx] += 1
+        self._maybe_log()
+        return idx, route
+
+    def release(self, idx: int) -> None:
+        self.inflight[idx] -= 1
+
+    def _maybe_log(self) -> None:
+        if self._log_interval_s <= 0:
+            return
+        now = time.monotonic()
+        if now >= self._next_log:
+            self._next_log = now + self._log_interval_s
+            routes = " ".join(f"{k}={v}" for k, v in self.routes.items())
+            print(
+                f"PERF PROXY routing leg={self.leg} policy={self.policy} "
+                f"max_inflight={self.max_inflight} inflight={self.inflight} "
+                f"dispatched={self.dispatched} owned={self.owned} "
+                f"keys={len(self.owner)} {routes}",
+                flush=True,
+            )
 
 
 class _ProxyLatencyTracker:
@@ -106,6 +211,13 @@ def _env_float(name: str, default: float) -> float:
 _PRE_SEND_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 _MAX_ATTEMPTS = max(1, _env_int("PROXY_MAX_ATTEMPTS", 5))
 _RETRY_BASE_DELAY_S = _env_float("PROXY_RETRY_BASE_DELAY_S", 0.5)
+
+# A prefill reply without kv_transfer_params fails the request instead of going
+# to decode, which would prefill the whole prompt itself inside a token budget
+# sized for decode rows (4 x max_num_seqs) and make no progress on it.
+# PROXY_FORWARD_WITHOUT_KV_PARAMS=1 forwards it anyway, for producers that skip
+# short prompts on purpose (the PCP short-prefix bypass in tpu_connector.py).
+_FORWARD_WITHOUT_KV_PARAMS = _env_int("PROXY_FORWARD_WITHOUT_KV_PARAMS", 0) == 1
 
 
 def _log_unsafe_transport_failure(
@@ -286,13 +398,39 @@ async def lifespan(app: FastAPI):
             }
         )
 
-    # Initialize round-robin iterators
-    app.state.prefill_iterator = itertools.cycle(range(len(app.state.prefill_clients)))
-    app.state.decode_iterator = itertools.cycle(range(len(app.state.decode_clients)))
+    # PROXY_<LEG>_ROUTING picks each leg's instance: round_robin (default),
+    # least_loaded, or sticky by the PROXY_AFFINITY_HEADER request header
+    # (aiperf sends one X-Correlation-ID per conversation), with
+    # PROXY_<LEG>_STICKY_MAX_INFLIGHT as sticky's per-instance cap.
+    log_interval_s = _proxy_latency_interval()
+    app.state.affinity_header = os.getenv("PROXY_AFFINITY_HEADER", "X-Correlation-ID")
+    app.state.prefill_router = _LegRouter(
+        "prefill",
+        len(app.state.prefill_clients),
+        os.getenv("PROXY_PREFILL_ROUTING", "round_robin").strip().lower(),
+        _env_int("PROXY_PREFILL_STICKY_MAX_INFLIGHT", 0),
+        log_interval_s,
+    )
+    app.state.decode_router = _LegRouter(
+        "decode",
+        len(app.state.decode_clients),
+        os.getenv("PROXY_DECODE_ROUTING", "round_robin").strip().lower(),
+        _env_int("PROXY_DECODE_STICKY_MAX_INFLIGHT", 0),
+        log_interval_s,
+    )
 
     print(
         f"Initialized {len(app.state.prefill_clients)} prefill clients "
         f"and {len(app.state.decode_clients)} decode clients."
+    )
+    print(
+        "Routing: "
+        + " ".join(
+            f"{r.leg}={r.policy}(max_inflight={r.max_inflight or 'none'})"
+            for r in (app.state.prefill_router, app.state.decode_router)
+        )
+        + f" affinity_header={app.state.affinity_header}",
+        flush=True,
     )
 
     yield
@@ -351,27 +489,6 @@ def parse_args():
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
 
     return args
-
-
-def get_next_client(app, service_type: str):
-    """
-    Get the next client in round-robin fashion.
-
-    Args:
-        app: The FastAPI app instance
-        service_type: Either 'prefill' or 'decode'
-
-    Returns:
-        The next client to use
-    """
-    if service_type == "prefill":
-        client_idx = next(app.state.prefill_iterator)
-        return app.state.prefill_clients[client_idx]
-    elif service_type == "decode":
-        client_idx = next(app.state.decode_iterator)
-        return app.state.decode_clients[client_idx]
-    else:
-        raise ValueError(f"Unknown service type: {service_type}")
 
 
 async def send_request_to_prefill(
@@ -500,32 +617,47 @@ async def _handle_completions(api: str, request: Request):
         forwarded = {}
         if (dp_rank := request.headers.get("X-data-parallel-rank")) is not None:
             forwarded["X-data-parallel-rank"] = dp_rank
+        # The conversation key and the client's own request id are quoted so
+        # that parsers reading numeric key=value pairs skip them.
+        affinity_key = request.headers.get(request.app.state.affinity_header)
+        client_request_id = request.headers.get("X-Request-ID", "")
         print(
-            f"PERF PROXY req_received req_id={request_id} ts={time.time():.6f}",
+            f"PERF PROXY req_received req_id={request_id} ts={time.time():.6f} "
+            f'conv="{affinity_key or ""}" client_req_id="{client_request_id}"',
             flush=True,
         )
 
-        # Get the next prefill client in round-robin fashion
-        prefill_client_info = get_next_client(request.app, "prefill")
-        render_endpoint = _render_endpoint_for_api(api)
-        if render_endpoint is not None:
-            render_response = await render_completion_prompt(
-                prefill_client_info, render_endpoint, req_data, request_id, forwarded
-            )
-            req_data = _replace_prompt_with_rendered_token_ids(
-                req_data, render_response.json()
-            )
+        prefill_router = request.app.state.prefill_router
+        prefill_idx, prefill_route = prefill_router.acquire(affinity_key)
+        prefill_client_info = request.app.state.prefill_clients[prefill_idx]
+        try:
+            render_endpoint = _render_endpoint_for_api(api)
+            if render_endpoint is not None:
+                render_response = await render_completion_prompt(
+                    prefill_client_info,
+                    render_endpoint,
+                    req_data,
+                    request_id,
+                    forwarded,
+                )
+                req_data = _replace_prompt_with_rendered_token_ids(
+                    req_data, render_response.json()
+                )
 
-        # Send request to prefill service
-        t_prefill_send = time.time()
-        t_prefill_send_perf = time.perf_counter()
-        print(
-            f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
-            flush=True,
-        )
-        response = await send_request_to_prefill(
-            prefill_client_info, api, req_data, request_id, forwarded
-        )
+            # Send request to prefill service
+            t_prefill_send = time.time()
+            t_prefill_send_perf = time.perf_counter()
+            print(
+                f"PERF PROXY prefill_send req_id={request_id} "
+                f"ts={t_prefill_send:.6f} prefill={prefill_idx} "
+                f"route={prefill_route}",
+                flush=True,
+            )
+            response = await send_request_to_prefill(
+                prefill_client_info, api, req_data, request_id, forwarded
+            )
+        finally:
+            prefill_router.release(prefill_idx)
         t_prefill_recv = time.time()
         t_prefill_recv_perf = time.perf_counter()
         prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
@@ -547,41 +679,80 @@ async def _handle_completions(api: str, request: Request):
 
         if kv_transfer_params:
             req_data["kv_transfer_params"] = kv_transfer_params
+        elif not _FORWARD_WITHOUT_KV_PARAMS:
+            message = (
+                "the prefill reply carries no kv_transfer_params; the request "
+                "is not forwarded to decode"
+            )
+            print(
+                f"PROXY missing_kv_transfer_params req_id={request_id} "
+                f'prefill={prefill_idx} conv="{affinity_key or ""}": {message}',
+                flush=True,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": {
+                        "message": message,
+                        "type": "BadGateway",
+                        "code": 502,
+                    }
+                },
+            )
 
-        # Get the next decode client in round-robin fashion
-        decode_client_info = get_next_client(request.app, "decode")
+        decode_router = request.app.state.decode_router
+        decode_idx, decode_route = decode_router.acquire(affinity_key)
+        decode_client_info = request.app.state.decode_clients[decode_idx]
+        released = False
+
+        def release_decode() -> None:
+            # From the stream's finally, and again from the response's
+            # background task, which also covers a stream that never started.
+            nonlocal released
+            if not released:
+                released = True
+                decode_router.release(decode_idx)
+
+        async def release_decode_task() -> None:
+            # Async so that Starlette runs it on the event loop: a sync
+            # background task runs in a threadpool, racing acquire().
+            release_decode()
 
         logger.debug("Using %s %s", prefill_client_info, decode_client_info)
 
         # Stream response from decode service
         async def generate_stream():
-            t_decode_send = time.time()
-            t_decode_send_perf = time.perf_counter()
-            print(
-                f"PERF PROXY decode_send req_id={request_id} "
-                f"ts={t_decode_send:.6f}{kv_uuid_log}",
-                flush=True,
-            )
-            first = True
-            async for chunk in stream_from_decode(
-                decode_client_info, api, req_data, request_id, forwarded
-            ):
-                if first:
-                    t_first = time.time()
-                    t_first_perf = time.perf_counter()
-                    decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
-                    ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
-                    _PROXY_LATENCY.record("decode_first", decode_first_ms)
-                    _PROXY_LATENCY.record("ttft", ttft_ms)
-                    print(
-                        f"PERF PROXY first_chunk req_id={request_id} "
-                        f"ts={t_first:.6f} "
-                        f"dur_from_decode_send_ms={decode_first_ms:.2f} "
-                        f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
-                        flush=True,
-                    )
-                    first = False
-                yield chunk
+            try:
+                t_decode_send = time.time()
+                t_decode_send_perf = time.perf_counter()
+                print(
+                    f"PERF PROXY decode_send req_id={request_id} "
+                    f"ts={t_decode_send:.6f}{kv_uuid_log} decode={decode_idx} "
+                    f"route={decode_route}",
+                    flush=True,
+                )
+                first = True
+                async for chunk in stream_from_decode(
+                    decode_client_info, api, req_data, request_id, forwarded
+                ):
+                    if first:
+                        t_first = time.time()
+                        t_first_perf = time.perf_counter()
+                        decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
+                        ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
+                        _PROXY_LATENCY.record("decode_first", decode_first_ms)
+                        _PROXY_LATENCY.record("ttft", ttft_ms)
+                        print(
+                            f"PERF PROXY first_chunk req_id={request_id} "
+                            f"ts={t_first:.6f} "
+                            f"dur_from_decode_send_ms={decode_first_ms:.2f} "
+                            f"ttft_ms={ttft_ms:.2f}{kv_uuid_log} decode={decode_idx}",
+                            flush=True,
+                        )
+                        first = False
+                    yield chunk
+            finally:
+                release_decode()
 
         # text/event-stream when the caller asked for a stream, which is what
         # the decode instance is actually sending back. Declared as
@@ -592,7 +763,11 @@ async def _handle_completions(api: str, request: Request):
         media_type = (
             "text/event-stream" if req_data.get("stream") else "application/json"
         )
-        return StreamingResponse(generate_stream(), media_type=media_type)
+        return StreamingResponse(
+            generate_stream(),
+            media_type=media_type,
+            background=BackgroundTask(release_decode_task),
+        )
 
     except Exception as e:
         import sys
