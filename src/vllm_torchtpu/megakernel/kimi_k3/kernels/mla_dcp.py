@@ -45,6 +45,7 @@ the first page DMAs early, ``attend`` later).
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import Any
 
@@ -66,6 +67,15 @@ MAX_ROWS = 8  # batch rows of an unchunked call; a larger batch runs in chunks (
 HOST_LANES = 8  # DCP ranks per host (rank = host * 8 + lane)
 
 
+def _select_static(index, values):
+    if isinstance(index, int):
+        return values[index]
+    out = values[-1]
+    for i in range(len(values) - 2, -1, -1):
+        out = jnp.where(index == i, values[i], out)
+    return out
+
+
 def chunk_layout(batch: int, heads: int = HEADS_PER_RANK, *, chunk_rows: int | None = None) -> tuple[int, int]:
     """``(chunk rows, ring slots)`` of a chunked call (``batch > MAX_ROWS``):
     8-row chunks at B16/B32/B48/B64 (amortizing exchanges), else 4 (also
@@ -84,7 +94,7 @@ GROUP = _config().dcp_group
 GLOBAL_PAGES = _config().dcp_tables == "global"
 SPAN = 4  # pages per step
 BUFFERS = 4  # steps in flight
-SMEM_LOOKUP_BATCHES = (16, 32, 48, 64)
+SMEM_LOOKUP_BATCHES = (1, 2, 4, 8, 16, 32, 48, 64)
 
 
 def page_plan(batch: int, heads: int = HEADS_PER_RANK, sequence_rows: int = 1,
@@ -107,7 +117,33 @@ def page_plan(batch: int, heads: int = HEADS_PER_RANK, sequence_rows: int = 1,
     return {"span": span, "buffers": buffers if not chunked(batch, force_chunks) else max(2, buffers * 3 // 4)}
 
 
-MAX_GROUPS = 2  # row groups of a call (see packet_layout)
+MAX_GROUPS = 3
+PACKET_TILE_ROWS = 8
+
+
+def combine_groups(batch: int, heads: int = HEADS_PER_RANK, sequence_rows: int = 1,
+                   chunks: bool = False) -> list[tuple[int, int, int, int]]:
+    slots, groups = packet_layout(batch, heads)
+    if not (
+        chunks
+        and batch in (4, MAX_ROWS)
+        and heads == HEADS_PER_RANK
+        and sequence_rows == 1
+        and groups == 1
+    ):
+        bounds = [batch * g // groups for g in range(groups + 1)]
+        return [(bounds[g], bounds[g + 1], slots * bounds[g], slots * bounds[g + 1])
+                for g in range(groups)]
+    packet = slots * batch
+    out, first_row = [], 0
+    for first_packet in range(0, packet, PACKET_TILE_ROWS):
+        end_packet = min(first_packet + PACKET_TILE_ROWS, packet)
+        end_row = -(-end_packet // slots)
+        out.append((first_row, end_row, first_packet, end_packet))
+        first_row = end_row
+    if len(out) > MAX_GROUPS:
+        raise ValueError(f"{len(out)} combine tiles exceed {MAX_GROUPS} semaphore groups")
+    return out
 
 
 def packet_layout(batch: int, heads: int = HEADS_PER_RANK) -> tuple[int, int]:
@@ -253,7 +289,7 @@ def persistent_scratch(batch, group=GROUP, heads=HEADS_PER_RANK, *,
     # Plain attention DP2 holds six heads for B/2 rows. Speculative attention
     # retains full-precision owner queries for its causal new-token fold.
     plain = sequence_rows == 1 and (
-        (batch in (16, 32, 64) and heads == HEADS_PER_RANK)
+        (batch in (8, 16, 32, 64) and heads == HEADS_PER_RANK)
         or (group == 16 and batch in (16, 32, 48, 64) and heads == 6))
     query_dtype = (jnp.uint8 if cache_dtype == jnp.float8_e4m3fn
                    and (plain or fp8_wire or _grouped_spec(batch, group, heads, sequence_rows))
@@ -288,23 +324,20 @@ PERSISTENT_NAMES = ("dcp gathered queries", "dcp send packets", "dcp received pa
 
 
 def native_pages(batch, heads=HEADS_PER_RANK, sequence_rows=1, cache_dtype=jnp.bfloat16) -> bool:
-    """Whether a call stages pages as ``[span * page_tokens, 640]`` in the
-    MXU's native tile (retiled by the DMA) rather than as the pool's
-    ``[span * 128, packing, 640]`` blocks, whose loads relayout every tile:
-    attention DP2's plain B96 and B128 (48 and 64 group rows of six heads)
-    and FP8 B64 (32; not under the opt-in ``mla_decode_ktile=2048``)."""
+    if (
+        heads == HEADS_PER_RANK
+        and sequence_rows == 1
+        and batch in (1, 2, 4, 8, 16, 32, 64)
+        and cache_dtype == jnp.float8_e4m3fn
+        and _config().mla_decode_ktile == 1024
+    ):
+        return True
     return heads == 6 and sequence_rows == 1 and (
         batch in (48, 64) or batch == 32 and cache_dtype == jnp.float8_e4m3fn
         and _config().mla_decode_ktile == 1024)
 
 
 def staged_folds(batch, heads=HEADS_PER_RANK, sequence_rows=1, cache_dtype=jnp.bfloat16) -> int:
-    """Softmax folds per page step. Attention DP2's FP8 B64 and B96 (32 and
-    48 group rows) stage two: one page wait, row lookup, pool pick and QK per
-    2048 tokens, folded as two 1024-token parts in order (the normalization
-    and FP8 probability boundaries of 1024-token steps, so outputs are
-    unchanged). Their rows end with a static tail
-    (``DcpAttention._staged_tail``), which B128 has no VMEM for."""
     return 2 if (native_pages(batch, heads, sequence_rows, cache_dtype) and batch in (32, 48)
                  and cache_dtype == jnp.float8_e4m3fn and _config().mla_decode_ktile == 1024) else 1
 
@@ -323,7 +356,7 @@ def scoped_scratch(batch, span=SPAN, buffers=BUFFERS, heads=HEADS_PER_RANK, grou
         raise ValueError(
             "mla_decode_ktile=2048 requires DCP16, six heads per rank and "
             "FP8 e4m3fn KV with 512-token pages")
-    if cache_dtype == jnp.float8_e4m3fn and batch in (8, 16, 32, 64):
+    if cache_dtype == jnp.float8_e4m3fn and batch in (1, 2, 4, 8, 16, 32, 64):
         span = 4 if wide and batch == 32 and sequence_rows == 1 else min(span, SPAN * PAGE_TOKENS // page_tokens)
     else:
         span = span * PAGE_TOKENS // page_tokens
@@ -610,19 +643,46 @@ class DcpAttention:
             return pltpu.bitcast(words[:, lanes], self.cache.dtype)
         return packed
 
-    def _attend_range(self, first, end, base):
-        # FP8-query plain decode at B16/B32/B64 (and DP2's 32 local rows), and
-        # staged steps: rows with a partial last step fold its 1 .. span - 1
-        # pages with static tail shapes.
-        if ((self.folds == 1 and (
-                self.sequence_rows != 1 or (self.heads != HEADS_PER_RANK and not (self.group == 16 and self.heads == 6 and self.batch == 32)) or self.batch not in (16, 32, 64) or self.ws.gathered.dtype != jnp.uint8
-                or (self.span != 2 and not (_config().mla_decode_ktile == 2048 and self.span == 4))))
-                or "attend" in self.skip or "pagecompute" in self.skip):
+    def _supports_split_tail_range(self) -> bool:
+        if "attend" in self.skip or "pagecompute" in self.skip:
+            return False
+        if self.folds > 1:
+            return True
+        if self.sequence_rows != 1:
+            return False
+        if (
+            self.batch in (1, 2, 4)
+            and self.heads == HEADS_PER_RANK
+            and self.fp8
+            and self.native
+            and self.span == 2
+        ):
+            return True
+        valid_heads = self.heads == HEADS_PER_RANK or (
+            self.group == 16 and self.heads == 6 and self.batch == 32
+        )
+        valid_span = self.span == 2 or (
+            _config().mla_decode_ktile == 2048 and self.span == 4
+        )
+        return (
+            valid_heads
+            and self.batch in (8, 16, 32, 64)
+            and self.ws.gathered.dtype == jnp.uint8
+            and valid_span
+        )
+
+    def _attend_range(self, first, end, base, rows=None):
+        if not self._supports_split_tail_range():
             return self._attend_pipeline(first, end, base)
-        chunk = chunk_layout(self.batch, self.heads, chunk_rows=self.chunk_rows)[0]
+        chunk = (
+            chunk_layout(self.batch, self.heads, chunk_rows=self.chunk_rows)[0]
+            if chunked(self.batch, self.force_chunked)
+            else self.batch
+        )
+        first_j, end_j = (rows[0] - base, rows[1] - base) if rows is not None else (0, chunk)
 
         def split():
-            @pl.loop(0, chunk)
+            @pl.loop(first_j, end_j)
             def row_loop(j):
                 row = base + j
                 begin = self.ws.lookup_bounds[row]
@@ -653,8 +713,13 @@ class DcpAttention:
             return
         # Branch once per chunk so QK/PV shapes in the page loop stay static.
         remainder = jnp.int32(0)
-        for j in range(chunk):
-            remainder = remainder | (self.ws.lookup_counts[base + j] % self.span)
+        if isinstance(first_j, int) and isinstance(end_j, int):
+            for j in range(first_j, end_j):
+                remainder = remainder | (self.ws.lookup_counts[base + j] % self.span)
+        else:
+            for j in range(chunk):
+                inside = (first_j <= j) & (j < end_j)
+                remainder = remainder | jnp.where(inside, self.ws.lookup_counts[base + j] % self.span, 0)
 
         @pl.when(remainder == 0)
         def whole():
@@ -860,8 +925,11 @@ class DcpAttention:
         ws, rows = self.ws, tokens or self.span * self.page_tokens
         words = (ws.pages.bitcast(jnp.uint32).at[slot] if self.native
                  else ws.pages.bitcast(jnp.uint32).at[slot].reshape(self.span * self.page_rows, LANES))
-        if (self.batch in (16, 32, 48, 64) or self.heads != HEADS_PER_RANK
-                or (self.batch, self.sequence_rows) == (8, 1)):
+        if (
+            self.batch in (16, 32, 48, 64)
+            or self.heads != HEADS_PER_RANK
+            or (self.batch in (1, 2, 4, 8) and self.sequence_rows == 1)
+        ):
             pad_shape = (rows // self.packing, LANES - LATENT)
             pad_lane = jax.lax.broadcasted_iota(jnp.int32, pad_shape, 1)
             tpu.store(words.at[:, pl.ds(LATENT, LANES - LATENT)] if tokens is None
@@ -994,6 +1062,41 @@ class DcpAttention:
         bounds = [self.batch * g // groups for g in range(groups + 1)]
         return [(bounds[g], bounds[g + 1]) for g in range(groups)]
 
+    def _attend_rows(self, first, end):
+        step_first = _select_static(first, self.starts)
+        step_end = step_first if "attend" in self.skip else _select_static(end, self.starts)
+        if self.heads != HEADS_PER_RANK:
+            self._attend_pipeline(step_first, step_end, 0)
+        elif self.batch in (1, 2, 4, 8) and self.sequence_rows == 1:
+            self._attend_range(step_first, step_end, 0, rows=(first, end))
+        else:
+            pl.loop(step_first, step_end)(self._attend_step)
+
+    def _pack_and_send(self, c, send, parity):
+        ws, member, base = self.ws, self.member, self.base
+        c_first, c_end, p_first, p_end = send
+        rows = pl.ds(p_first, p_end - p_first)
+        self._pack_partials(c_first, c_end)
+        for peer in range(0 if "combine" in self.skip else self.group):
+            @pl.when(peer != member)
+            def send_partial(peer=peer):
+                tpu.make_async_remote_copy(
+                    ws.send.at[peer, rows, self._combine_lanes()],
+                    ws.receive.at[parity, member, rows, self._combine_lanes()],
+                    ws.combine_semaphores.at[0, parity, c], ws.combine_semaphores.at[1, parity, c],
+                    device_id=(base + peer, ), device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+        ws.receive[parity, member, rows] = ws.send[member, rows]
+
+    def _attend_and_send_loop(self, group_sends, parity):
+        def group_step(i):
+            self._attend_rows(_select_static(i, [send[0] for _, send in group_sends]),
+                              _select_static(i, [send[1] for _, send in group_sends]))
+            for index, (c, send) in enumerate(group_sends):
+                pl.when(i == index)(functools.partial(self._pack_and_send, c, send, parity))
+
+        pl.loop(0, len(group_sends))(group_step)
+
     def attend(self, queries, new_latents, parity, between: Callable[[], None] | None = None,
                *, keys=None, key_valid=None):
         """``queries`` [B, heads, 640] FP32 absorbed (scale folded in),
@@ -1020,6 +1123,7 @@ class DcpAttention:
         ws, group, member, base, batch = self.ws, self.group, self.member, self.base, self.batch
         heads = group * self.slots
         groups = self.row_groups()
+        sends = combine_groups(batch, self.heads, self.sequence_rows, _config().dcp_combine_chunks)
         ws.own_rows[...] = jnp.zeros(ws.own_rows.shape, jnp.float32)
         ws.new_rows[...] = jnp.zeros(ws.new_rows.shape, jnp.float32)
         for b in range(batch):
@@ -1069,41 +1173,26 @@ class DcpAttention:
                 else:
                     self._store_query(b, jnp.pad(gathered.astype(jnp.float32), padding))
 
-            # 2. Local attention over this rank's pages (the group's steps).
-            # Attention DP's group rows pipeline the fold as chunked calls do.
-            if self.heads != HEADS_PER_RANK:
-                self._attend_pipeline(self.starts[first], self.starts[first] if "attend" in self.skip
-                                      else self.starts[end], 0)
+            group_sends = [(c, send) for c, send in enumerate(sends) if first <= send[0] < send[1] <= end]
+            if len(group_sends) > 1:
+                self._attend_and_send_loop(group_sends, parity)
             else:
-                @pl.loop(self.starts[first], self.starts[first] if "attend" in self.skip else self.starts[end])
-                def attend(step):
-                    self._attend_step(step)
-
-            # 3. Normalize and send each owner its heads' rows.
-            self._pack_partials(first, end)
-            for peer in range(0 if "combine" in self.skip else group):
-                @pl.when(peer != member)
-                def send_partial(peer=peer, g=g):
-                    tpu.make_async_remote_copy(
-                        ws.send.at[peer, rows_of(g), self._combine_lanes()],
-                        ws.receive.at[parity, member, rows_of(g), self._combine_lanes()],
-                        ws.combine_semaphores.at[0, parity, g], ws.combine_semaphores.at[1, parity, g],
-                        device_id=(base + peer, ), device_id_type=pl.DeviceIdType.MESH,
-                    ).start()
-            ws.receive[parity, member, rows_of(g)] = ws.send[member, rows_of(g)]
+                for c, send in group_sends:
+                    self._attend_rows(send[0], send[1])
+                    self._pack_and_send(c, send, parity)
             local_scope.__exit__(None, None, None)
         with self._scope("combine_wait"):
-            for g in range(len(groups)):
-                others = ws.receive.at[parity, pl.ds(0, group - 1), rows_of(g), self._combine_lanes()]
+            for c, (_, _, p_first, p_end) in enumerate(sends):
+                rows = pl.ds(p_first, p_end - p_first)
+                others = ws.receive.at[parity, pl.ds(0, group - 1), rows, self._combine_lanes()]
                 if "combine" not in self.skip:
-                    tpu.make_async_copy(others, others, ws.combine_semaphores.at[0, parity, g]).wait()
-                    tpu.make_async_copy(others, others, ws.combine_semaphores.at[1, parity, g]).wait()
+                    if batch != 8:
+                        tpu.make_async_copy(others, others, ws.combine_semaphores.at[0, parity, c]).wait()
+                    tpu.make_async_copy(others, others, ws.combine_semaphores.at[1, parity, c]).wait()
         merge_scope = self._scope("merge")
         merge_scope.__enter__()
 
         # 4. Log-sum-exp merge of the G partials and the new token.
-        partials = ws.receive[parity].astype(jnp.float32)  # [G, rows, 640]
-        lse = partials[:, :, LATENT:LATENT + 1] + partials[:, :, LATENT + 1:LATENT + 2]
         if keys is not None:
             assert key_valid is not None
             sequences = batch // self.sequence_rows
@@ -1113,7 +1202,13 @@ class DcpAttention:
                                      ws.own_rows[pl.ds(rows * s, rows), :], keys[s], key_valid[s], group,
                                      lse_rows=self.slots if self.lse_in_padding else 0)
                 for s in range(sequences)], axis=0)
+        elif batch == 8 and (self.sequence_rows == 1 or self.cache_verify_rows):
+            merged = _merge_received(
+                ws.receive.at[parity], ws.own_rows[...], ws.new_rows[...], group, unroll=4
+            )
         elif self.sequence_rows == 1 or self.cache_verify_rows:
+            partials = ws.receive[parity].astype(jnp.float32)  # [G, rows, 640]
+            lse = partials[:, :, LATENT:LATENT + 1] + partials[:, :, LATENT + 1:LATENT + 2]
             new_score = jnp.sum(ws.own_rows[...] * ws.new_rows[...], axis=1, keepdims=True)  # [rows, 1]
             top = jnp.maximum(jnp.max(lse, axis=0), new_score)
             weights = jnp.exp(lse - top[None])
@@ -1121,6 +1216,8 @@ class DcpAttention:
             merged = (jnp.sum(weights * partials[:, :, :LATENT], axis=0)
                       + new_weight * ws.new_rows[:, :LATENT]) / (jnp.sum(weights, axis=0) + new_weight)
         else:
+            partials = ws.receive[parity].astype(jnp.float32)  # [G, rows, 640]
+            lse = partials[:, :, LATENT:LATENT + 1] + partials[:, :, LATENT + 1:LATENT + 2]
             # Row b's head slots also attend the new tokens of rows j <= b of
             # its sequence (every rank holds all rows' new latents).
             latents = new_latents  # [B, 640]
@@ -1142,6 +1239,12 @@ class DcpAttention:
                       / (jnp.sum(weights, axis=0) + jnp.sum(new_weights, axis=1, keepdims=True)))
         result = jnp.stack([merged[self.slots * b:self.slots * b + self.heads] for b in range(batch)])
         merge_scope.__exit__(None, None, None)
+        if batch == 8 and "combine" not in self.skip:
+            with self._scope("combine_wait"):
+                for c, (_, _, p_first, p_end) in enumerate(sends):
+                    others = ws.receive.at[parity, pl.ds(0, group - 1), pl.ds(p_first, p_end - p_first),
+                                           self._combine_lanes()]
+                    tpu.make_async_copy(others, others, ws.combine_semaphores.at[0, parity, c]).wait()
         return result
 
 
@@ -1448,9 +1551,8 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
             return
         if self.sequence_rows == 1 or self.cache_verify_rows:
             unroll = (4 if (self.heads == 6 and (batch == 64 or batch == 48 and self.fp8))
-                      or (self.heads == HEADS_PER_RANK and batch == 32 and self.fp8)
+                      or (self.heads == HEADS_PER_RANK and batch in (32, 64) and self.fp8)
                       else 1)
-            # Attention DP2's B128/FP8 B96 and DP1's FP8 B32 merge four peers a step.
             ws.merged[c, :rows, :] = _merge_received(
                 ws.receive.at[ring(c)], ws.own_rows[c, :rows, :], ws.new_rows[c, :rows, :], group,
                 unroll=unroll)

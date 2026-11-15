@@ -104,18 +104,6 @@ def grammar_bitmask_rows(
     return mask if mapped else None
 
 
-_EP8_EXPERT_PLAN = "plan_ep8_real_hotfirst.npz"
-_EP8_REPLICA_PLAN = "replica_plan_ep8_real_plain4.npz"
-
-
-def _plan_or_default(value: str, default: str) -> str:
-    """A plan env value: empty takes ``default``, ``none`` (the replica plan's
-    default) disables it."""
-    if value.lower() == "none":
-        return ""
-    return value or default
-
-
 def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
     """The Kimi-K3 program for the role ``vllm_config`` selects, on TP rank
     ``tp_rank``."""
@@ -141,26 +129,29 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
 
         # Kernel modules read the config at import: install it before the
         # program imports them.
-        prefill_ep = 16 if (not aggregate or envs.K3_AGGREGATE_EP16) else 8
-        expert_plan = envs.K3_PREFILL_EXPERT_PLAN
-        replica_plan = envs.K3_REPLICA_PLAN
-        if aggregate and prefill_ep == 8:
-            # The EP8 aggregate ships its own plans; "none" turns one off.
-            expert_plan = _plan_or_default(expert_plan, _EP8_EXPERT_PLAN)
-            replica_plan = _plan_or_default(
-                replica_plan, "" if envs.K3_HOT_PLAN else _EP8_REPLICA_PLAN
+        prefill_ep, decode_ep, expert_plan, replica_plan = (
+            kernel_config.resolve_expert_parallel_settings(
+                aggregate=aggregate,
+                unified_ep16=envs.K3_UNIFIED_EP16,
+                aggregate_ep16=envs.K3_AGGREGATE_EP16,
+                raw_expert_plan=envs.K3_PREFILL_EXPERT_PLAN,
+                raw_replica_plan=envs.K3_REPLICA_PLAN,
+                raw_hot_plan=envs.K3_HOT_PLAN,
             )
-        else:
-            replica_plan = _plan_or_default(replica_plan, "")
+        )
         kernel_config.install(
             kernel_config.KernelConfig(
                 attention_dp=config.attention_dp,
                 dcp_group=config.decode_context_parallel_size,
-                # The aggregate prefill shares the decode's EP8 experts unless
-                # K3_AGGREGATE_EP16=1 requests banked EP16 experts.
+                decode_expert_parallel=decode_ep,
                 prefill_expert_parallel=prefill_ep,
                 prefill_expert_plan=expert_plan,
                 kd_replica_plan=replica_plan,
+                decode_expert_banks=kernel_config.resolve_decode_expert_banks(
+                    prefill_ep=prefill_ep,
+                    decode_ep=decode_ep,
+                    enabled=envs.K3_DECODE_EXPERT_BANKS,
+                ),
             )
         )
     # The prefill computes the rings of its loader config's draft; the
@@ -382,6 +373,7 @@ class MegakernelModelRunner(TPUModelRunner):
             )
         self._update_states(scheduler_output)
         self._finished_req_ids_pending.update(scheduler_output.finished_req_ids)
+        self._finished_req_ids_pending.update(scheduler_output.preempted_req_ids or ())
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:

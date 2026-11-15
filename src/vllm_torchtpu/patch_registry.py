@@ -78,6 +78,7 @@ PATCHES = (
         refresh="vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",
     ),
     Patch("vllm_torchtpu:_patch_vllm_mamba_split_scheduler_block_size", _ENGINE),
+    Patch("vllm_torchtpu.core.mamba_async_free:patch_mamba_async_align_free", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_megakernel_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_prefill_sjf_queue", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offloading_config_build", _ENGINE),
