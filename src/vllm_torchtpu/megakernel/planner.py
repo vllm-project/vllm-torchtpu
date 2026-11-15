@@ -227,7 +227,7 @@ def plan(
     small_widths: dict[str, int] = {}
     small_slot_owners: dict[str, int] = {}
     shared_widths: dict[str, int] = {
-        "acc": g.H,
+        "acc": 128 if tiles.acc_fit else g.H,
         "ybuf": 128,
         "xb2": 128,
         "mix": 128,

@@ -21,6 +21,8 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+
+from vllm_torchtpu.kernels import sorted_search
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
@@ -1795,7 +1797,7 @@ def streamindex_topk(
     def _fast_path(_):
         token_idx = jnp.arange(q.shape[0])
         seq_idx = jnp.minimum(
-            jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
+            sorted_search.searchsorted(cu_q_lens[1:], token_idx, side="right"),
             seq_lens.shape[0] - 1,
         )
         seq_len = seq_lens[seq_idx]

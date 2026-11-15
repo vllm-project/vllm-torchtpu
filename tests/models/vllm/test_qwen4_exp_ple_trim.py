@@ -80,3 +80,56 @@ def test_merged_embed_all_reduce_matches_the_separate_collectives() -> None:
         assert torch.equal(embed.view(torch.int16), ref_embed.view(torch.int16))
         for got, want in zip(combined, raw_full, strict=True):
             assert got.dtype == want.dtype and torch.equal(got, want)
+
+
+def test_merged_head_embed_reads_only_fields_the_installed_vllm_embedding_has() -> None:
+    """za8d: `_merged_head_embed` read `emb.reduce_results`, which the pinned vLLM's
+    VocabParallelEmbedding does not set, and the AttributeError inside the whole-step
+    trace disabled the megakernel. Every field it reads directly must be set by the
+    installed class (optional ones go through getattr with the pinned default)."""
+    import inspect
+    import re
+
+    from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import model as qwen4_model
+
+    # Plain and annotated assignments (`self.quant_method: QuantizeMethodBase = ...`).
+    # Over the MRO: the served build may register a subclass under this name.
+    have = set()
+    for cls in VocabParallelEmbedding.__mro__:
+        try:
+            src_cls = inspect.getsource(cls)
+        except (OSError, TypeError):
+            continue
+        have |= set(re.findall(r"self\.([a-z_]+)\s*(?::[^=\n]+)?=", src_cls))
+    have |= {n for n, _ in inspect.getmembers(VocabParallelEmbedding)}
+    have.add("weight")  # registered by the quant method's create_weights
+    src = inspect.getsource(qwen4_model.Qwen4ExpBackbone._merged_head_embed)
+    direct = set(re.findall(r"\bemb\.([a-z_]+)", src))
+    optional = set(re.findall(r'getattr\(emb, "([a-z_]+)"', src))
+    assert not (direct - have), (sorted(direct - have), [c.__module__ + "." + c.__qualname__ for c in VocabParallelEmbedding.__mro__])
+    assert optional  # reduce_results / parallel_group / use_fused_embedding
+
+
+def test_merged_head_embed_tolerates_an_embedding_without_reduce_results(monkeypatch) -> None:
+    """The guard treats a missing `reduce_results` as the pinned vLLM's always-reduce
+    and returns before any collective when no PLE layer is in the head groups."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.qwen4_exp import model as qwen4_model
+
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_PLE_TRIM", True)
+    emb = SimpleNamespace(
+        tp_size=8, parallel_group=None, use_fused_embedding=False,
+        weight=torch.zeros(4, 8, dtype=torch.bfloat16),
+    )
+    layer = SimpleNamespace(ple=None)
+    backbone = SimpleNamespace(embed_tokens=emb, layers=[layer, layer, layer])
+    monkeypatch.setattr(qwen4_model, "get_tp_group", lambda: object())
+    ids = torch.zeros(4, dtype=torch.int32)
+    out = qwen4_model.Qwen4ExpBackbone._merged_head_embed(
+        backbone, ids, ids.long(), torch.tensor([0, 4]), None, [[0], [1, 2]]
+    )
+    assert out is None  # no PLE layer: separate collectives, no AttributeError

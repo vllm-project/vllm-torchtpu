@@ -342,7 +342,10 @@ class TwoRing:
             ord_l = b if sp.period == 1 else b * sp.period + lt_
             ords = (ord_b, ord_l)
             row = r - lo if dt is None else dt + (r - lo)
-            cond = jnp.logical_and(b < sp.L // sp.period, "dense" not in self.skip)
+            # Same bound as `fetch`: a partial last cycle (`L % period`, e.g. layers 3..47 in
+            # one kernel, VLLM_TPU_MK_WHOLE_L45) has tiles too. `b < L // period` dropped
+            # them, so their `dtake` waited on a copy never issued (the kernel hung).
+            cond = jnp.logical_and(g < sp.T_TOTAL, "dense" not in self.skip)
             if len(groups) > 1:
                 hit = dt == vs[0]
                 for v in vs[1:]:
