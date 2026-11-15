@@ -293,6 +293,7 @@ def _pallas_rpa_kernel_impl(
         kv_cache = kernel_view(kv_cache)
     packed_pool_shape = None
     if kv_cache.ndim == 4:
+        subspace_rot_dim = key.shape[2] if key.shape[2] < query.shape[2] else None
         if (
             kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
             and query.shape[2] != 64
@@ -305,6 +306,7 @@ def _pallas_rpa_kernel_impl(
                 kv_dtype=kv_cache.dtype,
                 kv_layout=kv_layout,
                 chip_version=get_chip_version(),
+                subspace_k_rot_dim=subspace_rot_dim,
             )
         else:
             native_shape = PallasAttentionBackend.get_kv_cache_shape(
@@ -395,7 +397,7 @@ def _pallas_rpa_kernel_default(
     use_causal_mask: bool = True,
     block_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
+    """Default Pallas RPA kernel entry -- used by `PallasAttentionBackendImpl`.
 
     Full signature (not `*args, **kwargs`) is required so `pallas.jax_op` can
     introspect argument types via `_verify_signature`.
@@ -568,7 +570,7 @@ def _pallas_rpa_kernel_batched(
     block_major: bool = False,
     subpage_split: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
-    """Batched-RPA Pallas kernel entry — used by
+    """Batched-RPA Pallas kernel entry -- used by
     `PallasBatchedRPAAttentionBackendImpl`."""
     return _pallas_rpa_kernel_impl(
         kv_cache,
@@ -643,6 +645,7 @@ class PallasAttentionBackend(AttentionBackend):
         # [L, S, Kx2 / kv_packing, kv_packing, H]
         # where Kx2 = num_kv_heads for hd64 and Kx2 = num_kv_heads * 2 for v3.
         use_hd64 = head_size == 64
+        use_subspace = bool(envs.TPU_SUBSPACE_RPA and head_size == 512)
         # vLLM's OffloadingConnectorWorker.register_kv_caches probes this
         # method without a concrete dtype to discover the num_blocks logical
         # dimension (it only reads test_shape.index(num_blocks); see
@@ -654,10 +657,14 @@ class PallasAttentionBackend(AttentionBackend):
             isinstance(cache_dtype_str, str)
             and cache_dtype_str.lower().strip() == "auto"
         ):
+            if use_subspace:
+                return (num_blocks, block_size, num_kv_heads, 1, 1024)
             num_kv_heads_x2 = num_kv_heads if use_hd64 else num_kv_heads * 2
             return (num_blocks, block_size, num_kv_heads_x2, 1, padded_head_size)
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
         kv_packing = get_dtype_packing(kv_dtype)
+        if use_subspace and kv_packing == 4:
+            return (num_blocks, block_size, num_kv_heads, 4, 256)
 
         num_kv_heads_x2 = num_kv_heads if use_hd64 else num_kv_heads * 2
         num_kv_heads_x2 = cdiv(num_kv_heads_x2, kv_packing) * kv_packing
@@ -839,6 +846,11 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
                 num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
             )
         torch_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
+        use_subspace = (
+            bool(envs.TPU_SUBSPACE_RPA)
+            and head_size == 512
+            and get_dtype_packing(torch_dtype) == 4
+        )
         # Resolve the chip here rather than in the kernel: the scheduler
         # process calls this and owns no chip, so the wrapper must not query a
         # live device.
@@ -852,6 +864,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
                 get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
             ],
             chip_version=get_chip_version(),
+            subspace_k_rot_dim=128 if use_subspace else None,
         )
 
     @staticmethod
@@ -1575,43 +1588,53 @@ class PallasAttentionBackendImpl(AttentionImpl):
             k_len, k_compute_dim = key.shape
 
         assert q_compute_dim == self.head_size * self.num_heads
-        assert k_compute_dim == self.head_size * self.num_kv_heads
-
-        query = query.view(q_len, self.num_heads, self.head_size)
-        key = key.view(k_len, self.num_kv_heads, self.head_size)
-        value = value.view(k_len, self.num_kv_heads, self.head_size)
-        assert key.shape == value.shape
-
-        # A layer whose head_size is narrower than the page it writes into —
-        # a DFlash draft layer sharing the target's unified pool, whose page
-        # geometry comes from whichever attention spec defined the pool (see
-        # `kv_cache_materializer._pool_attention_geometry`). Pad q/k/v out to
-        # the page width so the kernel's slot writes line up, and slice the
-        # result back below. Zeros contribute nothing to the QK dot product,
-        # `self.scale` comes from the real head_size and is passed separately,
-        # and the padded V columns are dropped — so the output is unchanged.
-        #
-        # Only the head dim is reconciled. A layer whose `num_kv_heads`
-        # disagrees with the pool's would write the wrong slots and padding
-        # cannot fix that, so the two must already agree.
-        # SEQ_ALONG_LANE places `page_size` on the last axis and the packed
-        # `head_dim` axes at `[-3, -2]` (indexed from the end so both 5D
-        # layer-major and 6D block-major pools resolve identically).
-        if kv_cache.ndim == 4:
-            pool_head_dim = self.head_size
-        elif self._pool_is_seq_along_lane:
-            pool_head_dim = kv_cache.shape[-3] * kv_cache.shape[-2]
-        else:
-            pool_head_dim = kv_cache.shape[-1]
-        # A layer writing its own native page is never padded, even when the
-        # page is wider than head_size (the head_dim=64 page packs K and V along
-        # its last axis). Only a page defined by another spec is padded.
-        native_page = PallasAttentionBackend.get_kv_cache_shape(
-            1, 1, self.num_kv_heads, self.head_size, kv_cache.dtype
-        )[2:]
-        pad_size = kv_page_head_padding(
-            tuple(kv_cache.shape[-3:]), native_page, pool_head_dim, self.head_size
+        is_subspace_rpa = (
+            bool(envs.TPU_SUBSPACE_RPA)
+            and self.head_size == 512
+            and k_compute_dim == 128 * self.num_kv_heads
         )
+        if is_subspace_rpa:
+            query = query.view(q_len, self.num_heads, self.head_size)
+            key = key.view(k_len, self.num_kv_heads, 128)
+            value = value.view(k_len, self.num_kv_heads, self.head_size)
+            pad_size = 0
+        else:
+            assert k_compute_dim == self.head_size * self.num_kv_heads
+            query = query.view(q_len, self.num_heads, self.head_size)
+            key = key.view(k_len, self.num_kv_heads, self.head_size)
+            value = value.view(k_len, self.num_kv_heads, self.head_size)
+            assert key.shape == value.shape
+
+            # A layer whose head_size is narrower than the page it writes into --
+            # a DFlash draft layer sharing the target's unified pool, whose page
+            # geometry comes from whichever attention spec defined the pool (see
+            # `kv_cache_materializer._pool_attention_geometry`). Pad q/k/v out to
+            # the page width so the kernel's slot writes line up, and slice the
+            # result back below. Zeros contribute nothing to the QK dot product,
+            # `self.scale` comes from the real head_size and is passed separately,
+            # and the padded V columns are dropped -- so the output is unchanged.
+            #
+            # Only the head dim is reconciled. A layer whose `num_kv_heads`
+            # disagrees with the pool's would write the wrong slots and padding
+            # cannot fix that, so the two must already agree.
+            # SEQ_ALONG_LANE places `page_size` on the last axis and the packed
+            # `head_dim` axes at `[-3, -2]` (indexed from the end so both 5D
+            # layer-major and 6D block-major pools resolve identically).
+            if kv_cache.ndim == 4:
+                pool_head_dim = self.head_size
+            elif self._pool_is_seq_along_lane:
+                pool_head_dim = kv_cache.shape[-3] * kv_cache.shape[-2]
+            else:
+                pool_head_dim = kv_cache.shape[-1]
+            # A layer writing its own native page is never padded, even when the
+            # page is wider than head_size (the head_dim=64 page packs K and V along
+            # its last axis). Only a page defined by another spec is padded.
+            native_page = PallasAttentionBackend.get_kv_cache_shape(
+                1, 1, self.num_kv_heads, self.head_size, kv_cache.dtype
+            )[2:]
+            pad_size = kv_page_head_padding(
+                tuple(kv_cache.shape[-3:]), native_page, pool_head_dim, self.head_size
+            )
         if pad_size:
             query = torch.nn.functional.pad(query, (0, pad_size))
             key = torch.nn.functional.pad(key, (0, pad_size))
@@ -1621,11 +1644,26 @@ class PallasAttentionBackendImpl(AttentionImpl):
             v_scale_value = layer._v_scale_float
             if k_scale_value == 0.0 or v_scale_value == 0.0:
                 raise ValueError("k_scale_float and v_scale_float must be non-zero")
-            key, quantized_value = quantize_kv(
-                self.kv_cache_quantized_dtype, key, value, k_scale_value, v_scale_value
-            )
-            assert quantized_value is not None
-            value = quantized_value
+            if is_subspace_rpa and not self._pool_is_seq_along_lane:
+                # HEAD_ALONG_SUBLANE Subspace-RPA stores K_rot in lossless BF16
+                # and quantizes only V_full to FP8!
+                quantized_value, _ = quantize_kv(
+                    self.kv_cache_quantized_dtype,
+                    value,
+                    None,
+                    v_scale_value,
+                )
+                value = quantized_value
+            else:
+                key, quantized_value = quantize_kv(
+                    self.kv_cache_quantized_dtype,
+                    key,
+                    value,
+                    k_scale_value,
+                    v_scale_value,
+                )
+                assert quantized_value is not None
+                value = quantized_value
 
         sink = self.sinks
         ctx = get_vllm_model_wrapper_context()

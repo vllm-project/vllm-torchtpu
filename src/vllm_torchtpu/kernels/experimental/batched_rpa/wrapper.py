@@ -39,9 +39,10 @@ def prepare_inputs(
     v_scale: jax.Array | None = None,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     page_size: int = 128,
+    subspace_k_rot_dim: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     total_q_tokens, actual_num_q_heads, actual_q_head_dim = q.shape
-    _, actual_num_kv_heads, actual_kv_head_dim = k.shape
+    _, actual_num_kv_heads, actual_kv_head_dim = v.shape
     num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
 
     q_packing = utils.get_dtype_packing(q_dtype)
@@ -51,23 +52,6 @@ def prepare_inputs(
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
     aligned_q_head_dim = utils.align_to(actual_q_head_dim, num_lanes)
-
-    # Compute aligned kv head dimension, accounting for per-token scale if
-    # present.
-    if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        if k_scale is not None and v_scale is not None:
-            scale_bits = jax.dtypes.itemsize_bits(k_scale.dtype)
-            kv_bits = jax.dtypes.itemsize_bits(kv_dtype)
-            num_scale_channels = max(1, scale_bits // kv_bits)
-            aligned_kv_head_dim = utils.align_to(
-                actual_kv_head_dim + num_scale_channels, num_sublanes * kv_packing
-            )
-        else:
-            aligned_kv_head_dim = utils.align_to(
-                actual_kv_head_dim, num_sublanes * kv_packing
-            )
-    else:
-        aligned_kv_head_dim = utils.align_to(actual_kv_head_dim, num_lanes)
 
     # queries: (T, H, D) -> (T, H_kv, G, D)
     o_hbm_alias_q_hbm = (
@@ -95,6 +79,70 @@ def prepare_inputs(
         )
         .swapaxes(0, 1)
     )
+
+    if subspace_k_rot_dim is not None:
+        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            aligned_kv_head_dim = utils.align_to(
+                subspace_k_rot_dim + actual_kv_head_dim, num_sublanes * kv_packing
+            )
+            align_tokens = max(num_lanes, page_size)
+            padded_total_tokens = utils.align_to(total_q_tokens, align_tokens)
+            kv_cat = jnp.concatenate([k.astype(kv_dtype), v.astype(kv_dtype)], axis=-1)
+            new_kv_hbm = (
+                jnp.pad(
+                    kv_cat,
+                    (
+                        (0, padded_total_tokens - total_q_tokens),
+                        (0, 0),
+                        (0, aligned_kv_head_dim - kv_cat.shape[-1]),
+                    ),
+                    constant_values=0,
+                )
+                .reshape(
+                    padded_total_tokens,
+                    actual_num_kv_heads,
+                    aligned_kv_head_dim // kv_packing,
+                    kv_packing,
+                )
+                .transpose(1, 2, 3, 0)
+            )
+        else:
+            aligned_kv_head_dim = utils.align_to(
+                pl.cdiv(actual_kv_head_dim + 2 * subspace_k_rot_dim, kv_packing),
+                num_lanes,
+            )
+            v_pad = jnp.pad(
+                v.astype(kv_dtype),
+                ((0, 0), (0, 0), (0, 2 * aligned_kv_head_dim - actual_kv_head_dim)),
+                constant_values=0,
+            )
+            v0 = v_pad[:, :, None, :aligned_kv_head_dim]
+            v1 = v_pad[:, :, None, aligned_kv_head_dim : 2 * aligned_kv_head_dim]
+            k_pad = jnp.pad(
+                k.astype(jnp.bfloat16),
+                ((0, 0), (0, 0), (0, aligned_kv_head_dim - subspace_k_rot_dim)),
+                constant_values=0,
+            )
+            k_bytes = jax.lax.bitcast_convert_type(k_pad, kv_dtype).swapaxes(-1, -2)
+            new_kv_hbm = jnp.concatenate([v0, v1, k_bytes], axis=2)
+        return o_hbm_alias_q_hbm, new_kv_hbm
+
+    # Compute aligned kv head dimension, accounting for per-token scale if
+    # present.
+    if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        if k_scale is not None and v_scale is not None:
+            scale_bits = jax.dtypes.itemsize_bits(k_scale.dtype)
+            kv_bits = jax.dtypes.itemsize_bits(kv_dtype)
+            num_scale_channels = max(1, scale_bits // kv_bits)
+            aligned_kv_head_dim = utils.align_to(
+                actual_kv_head_dim + num_scale_channels, num_sublanes * kv_packing
+            )
+        else:
+            aligned_kv_head_dim = utils.align_to(
+                actual_kv_head_dim, num_sublanes * kv_packing
+            )
+    else:
+        aligned_kv_head_dim = utils.align_to(actual_kv_head_dim, num_lanes)
 
     # Pad keys and values head_dim
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
@@ -182,10 +230,31 @@ def get_kv_cache_shape(
     chip_version: pltpu.ChipVersion = pltpu.ChipVersion.TPU_7X,
     use_per_token_scale: bool = False,
     scale_dtype: jnp.dtype | None = None,
+    subspace_k_rot_dim: int | None = None,
 ):
     chip_info = pltpu.get_tpu_info_for_chip(chip_version, 1)
     num_lanes, num_sublanes = chip_info.num_lanes, chip_info.num_sublanes
     kv_packing = utils.get_dtype_packing(kv_dtype)
+    if subspace_k_rot_dim is not None:
+        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            base_dim = subspace_k_rot_dim + actual_head_dim
+            return (
+                total_num_pages,
+                actual_num_kv_heads,
+                utils.align_to(base_dim, num_sublanes * kv_packing) // kv_packing,
+                kv_packing,
+                page_size,
+            )
+        return (
+            total_num_pages,
+            page_size,
+            actual_num_kv_heads,
+            kv_packing,
+            utils.align_to(
+                pl.cdiv(actual_head_dim + 2 * subspace_k_rot_dim, kv_packing),
+                num_lanes,
+            ),
+        )
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         num_scale_channels = 0
         if use_per_token_scale:
@@ -242,7 +311,15 @@ def calculate_block_sizes(
     )
     aligned_num_q_heads = aligned_num_q_heads_per_kv_head * model_cfgs.num_kv_heads
 
-    if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+    if serve_cfgs.subspace_k_rot_dim is not None:
+        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            aligned_num_kv_heads_x2 = model_cfgs.num_kv_heads
+        else:
+            bkv_stride = model_cfgs.num_kv_heads
+            if utils.has_bank_conflicts(bkv_stride):
+                bkv_stride += 1
+            aligned_num_kv_heads_x2 = bkv_stride * serve_cfgs.packing_kv
+    elif serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         aligned_num_kv_heads_x2 = model_cfgs.num_kv_heads * 2
     else:
         bkv_stride = pl.cdiv(model_cfgs.num_kv_heads * 2, serve_cfgs.packing_kv)
@@ -262,7 +339,21 @@ def calculate_block_sizes(
     num_sublanes = tpu_info.num_sublanes
     packing_kv = serve_cfgs.packing_kv
 
-    if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+    if serve_cfgs.subspace_k_rot_dim is not None:
+        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            aligned_kv_head_dim_val = utils.align_to(
+                serve_cfgs.subspace_k_rot_dim + physical_kv_head_dim,
+                num_sublanes * packing_kv,
+            )
+        else:
+            aligned_kv_head_dim_val = utils.align_to(
+                pl.cdiv(
+                    model_cfgs.head_dim + 2 * serve_cfgs.subspace_k_rot_dim,
+                    packing_kv,
+                ),
+                num_lanes,
+            )
+    elif serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         num_scale_channels = serve_cfgs.scale_channels
         base_dim = physical_kv_head_dim + num_scale_channels
         aligned_kv_head_dim_val = utils.align_to(base_dim, num_sublanes * packing_kv)
@@ -698,6 +789,7 @@ def ragged_paged_attention(
     v_scale_config = v_scale
     k_scale_tensor = dynamic_k_scale
     v_scale_tensor = dynamic_v_scale
+    subspace_k_rot_dim = keys.shape[2] if keys.shape[2] < head_dim else None
 
     serve_cfgs = configs.ServingConfigs(
         num_seqs=max_num_seqs,
@@ -719,6 +811,7 @@ def ragged_paged_attention(
         return_lse=return_lse,
         skip_kv_update=skip_kv_update,
         mask_invalid_v=mask_invalid_v,
+        subspace_k_rot_dim=subspace_k_rot_dim,
     )
 
     if prepared_inputs is None:
@@ -732,6 +825,7 @@ def ragged_paged_attention(
             v_scale_tensor,
             kv_layout=kv_layout,
             page_size=page_size,
+            subspace_k_rot_dim=subspace_k_rot_dim,
         )
     else:
         # Same shapes and dtypes as prepare_inputs would return for this call;
@@ -753,6 +847,7 @@ def ragged_paged_attention(
                 vs,
                 kv_layout=kv_layout,
                 page_size=page_size,
+                subspace_k_rot_dim=subspace_k_rot_dim,
             ),
             queries,
             keys,

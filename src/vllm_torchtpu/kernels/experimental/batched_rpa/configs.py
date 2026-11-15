@@ -174,6 +174,7 @@ class ServingConfigs:
     return_lse: bool = False
     skip_kv_update: bool = False
     mask_invalid_v: bool | None = None
+    subspace_k_rot_dim: int | None = None
 
     def __post_init__(self):
         if self.mask_invalid_v is None:
@@ -342,7 +343,10 @@ class RpaConfigs:
 
     @property
     def bkv_stride(self) -> int:
-        bkv_stride = pl.cdiv(self.model.num_kv_heads * 2, self.serve.packing_kv)
+        if self.serve.subspace_k_rot_dim is not None:
+            bkv_stride = self.model.num_kv_heads
+        else:
+            bkv_stride = pl.cdiv(self.model.num_kv_heads * 2, self.serve.packing_kv)
 
         if utils.has_bank_conflicts(bkv_stride):
             bkv_stride += 1
@@ -371,6 +375,22 @@ class RpaConfigs:
         num_sublanes = pltpu.get_tpu_info().num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
 
+        if self.serve.subspace_k_rot_dim is not None:
+            if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+                total_head_dim = (
+                    self.serve.subspace_k_rot_dim
+                    + self.model.head_dim
+                    + self.serve.scale_channels
+                )
+                return utils.align_to(total_head_dim, num_sublanes * kv_packing)
+            return utils.align_to(
+                pl.cdiv(
+                    self.model.head_dim + 2 * self.serve.subspace_k_rot_dim,
+                    kv_packing,
+                ),
+                num_lanes,
+            )
+
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             total_head_dim = self.model.head_dim
             if self.serve.dtype_kv == jnp.uint8:
@@ -386,6 +406,10 @@ class RpaConfigs:
 
     @property
     def aligned_num_kv_heads_x2(self) -> int:
+        if self.serve.subspace_k_rot_dim is not None:
+            if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+                return self.model.num_kv_heads
+            return self.model.num_kv_heads * self.serve.packing_kv
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.model.num_kv_heads * 2
         packing_kv = self.serve.packing_kv
@@ -398,6 +422,8 @@ class RpaConfigs:
 
     @property
     def kv_hbm_stride(self) -> int:
+        if self.serve.subspace_k_rot_dim is not None:
+            return self.model.num_kv_heads
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.model.num_kv_heads * 2
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
@@ -410,7 +436,7 @@ class RpaConfigs:
     @property
     def kv_bytes_per_token(self) -> int:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            num_elements = self.model.num_kv_heads * 2 * self.aligned_kv_head_dim
+            num_elements = self.kv_hbm_stride * self.aligned_kv_head_dim
         else:
             num_elements = self.aligned_num_kv_heads_x2 * self.aligned_kv_head_dim
         # Calculate byte size using bits to account for subbyte dtypes like fp4.
@@ -483,7 +509,7 @@ class RpaConfigs:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return (
                 self.block.batch_size,
-                self.model.num_kv_heads * 2,
+                self.kv_hbm_stride,
                 self.aligned_kv_head_dim // self.serve.packing_kv,
                 self.serve.packing_kv,
                 self.kv_vmem_lanes,
@@ -559,8 +585,6 @@ class RpaConfigs:
             raise ValueError(
                 f"Expected 3D array for {q.shape=}, {k.shape=}, {v.shape=}"
             )
-        if k.shape != v.shape:
-            raise ValueError(f"Expected {k.shape=} to be equal to {v.shape=}")
         if not (q.shape[0] == k.shape[0] == v.shape[0]):
             raise ValueError(
                 "Expected number of sequences in Q, K, and V to be the same, but got"
@@ -570,13 +594,36 @@ class RpaConfigs:
         if self.serve.dtype_kv == jnp.uint8:
             expected_kv_head_dim = q.shape[2] // 2
 
-        if not (k.shape[2] == v.shape[2] == expected_kv_head_dim):
-            raise ValueError(
-                "Expected number of head dimensions in K and V to be"
-                f" {expected_kv_head_dim} (matching Q shape {q.shape[2]} with"
-                f" packing for {self.serve.dtype_kv}), but got {k.shape[2]=} and"
-                f" {v.shape[2]=}"
-            )
+        if self.serve.subspace_k_rot_dim is not None:
+            if k.shape != (
+                q.shape[0],
+                self.model.num_kv_heads,
+                self.serve.subspace_k_rot_dim,
+            ) or v.shape != (
+                q.shape[0],
+                self.model.num_kv_heads,
+                expected_kv_head_dim,
+            ):
+                exp_k = (
+                    q.shape[0],
+                    self.model.num_kv_heads,
+                    self.serve.subspace_k_rot_dim,
+                )
+                exp_v = (q.shape[0], self.model.num_kv_heads, expected_kv_head_dim)
+                raise ValueError(
+                    f"Subspace-RPA expected k={exp_k} and v={exp_v}, "
+                    f"got {k.shape=}, {v.shape=}"
+                )
+        else:
+            if k.shape != v.shape:
+                raise ValueError(f"Expected {k.shape=} to be equal to {v.shape=}")
+            if not (k.shape[2] == v.shape[2] == expected_kv_head_dim):
+                raise ValueError(
+                    "Expected number of head dimensions in K and V to be"
+                    f" {expected_kv_head_dim} (matching Q shape {q.shape[2]} with"
+                    f" packing for {self.serve.dtype_kv}), but got {k.shape[2]=} and"
+                    f" {v.shape[2]=}"
+                )
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             if self.serve.page_size % 128 != 0:
@@ -586,7 +633,7 @@ class RpaConfigs:
                 )
             expected_kv_cache_shape = (
                 kv_cache.shape[0],
-                self.model.num_kv_heads * 2,
+                self.kv_hbm_stride,
                 self.aligned_kv_head_dim // self.serve.packing_kv,
                 self.serve.packing_kv,
                 self.serve.page_size,
@@ -595,7 +642,7 @@ class RpaConfigs:
             expected_kv_cache_shape = (
                 kv_cache.shape[0],
                 self.serve.page_size,
-                self.aligned_num_kv_heads_x2 // self.serve.packing_kv,
+                self.kv_hbm_stride,
                 self.serve.packing_kv,
                 self.aligned_kv_head_dim,
             )

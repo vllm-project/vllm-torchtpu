@@ -114,6 +114,7 @@ Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `TPU_SUBSPACE_RPA` | `False` | Opt-in. Applies load-time orthogonal channel conjugation, duplicate `W_v` column slicing, `k_norm` non-positional weight absorption, 128-dim RoPE compaction, and decomposed `Subspace-RPA` KV storage (`1,024 B/tok` BF16 `K_rot` + FP8 `V` in `LBNHC`, or `640 B/tok` FP8 in `LBHNC`) on Gemma 4 512-dim `k_eq_v` global attention layers. |
 
 ---
 
