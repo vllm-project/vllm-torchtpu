@@ -312,7 +312,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-    # GLM-5.3-Flash custom-op registration (clamped SwiGLU & MTP norms).
+    # GLM-5.3-Flash custom-op registration (clamped SwiGLU, MTP norms, megakernel).
+    "vllm_torchtpu/models/vllm/glm5_next/megakernel.py",
     "vllm_torchtpu/models/vllm/glm5_next/model.py",
     "vllm_torchtpu/models/vllm/glm5_next/mtp.py",
 )

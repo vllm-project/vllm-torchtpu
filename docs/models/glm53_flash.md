@@ -69,3 +69,31 @@ vllm serve zai-org/GLM-5.3-Flash \
   vision-tower checkpoint weights and serves text inputs only.
 - **Unsupported features**: Dynamic EPLB (`--enable-eplb`) and disaggregated KV
   transfer connectors over the unified KV+KDA pool are rejected at startup.
+
+## Decode megakernel
+
+When `VLLM_TPU_MEGAKERNEL=glm53` (or `additional_config["megakernel"]`) is set
+with `--no-async-scheduling` on a `TP=8` TPU v7x slice (`--kv-cache-dtype fp8`,
+`--mamba-cache-mode align`), `TPUModelRunner` attaches the full-model Pallas
+decode megakernel (`vllm_torchtpu.models.vllm.glm5_next.megakernel`) as its
+`decode_owner`:
+
+```bash
+VLLM_TPU_MEGAKERNEL=glm53 vllm serve zai-org/GLM-5.3-Flash \
+  --tensor-parallel-size 8 \
+  --kv-cache-dtype fp8 \
+  --mamba-cache-mode align \
+  --no-async-scheduling \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
+```
+
+- Runs all 45 decoder layers (and optional `k=3` MTP drafting + verification)
+  inside one `pl.pallas_call` dispatch per decode step with on-chip barrier
+  all-reduce collectives and async weight/KV double-buffering (`numerics="approx"`).
+- Shares routed MoE expert weights in-place with the vLLM prefill model via a
+  stacked `[42, E_local, ...]` expert store (`rhs_group_base`), avoiding HBM
+  duplication.
+- Synchronizes KDA recurrent/conv state and compressed FP8 MLA KV cache between
+  vLLM prefill chunks and megakernel decode slots through the unified block
+  pool. Greedy requests (`temperature=0`, `logprobs <= 64`) are served by the
+  megakernel; non-greedy requests fall back to the stock runner.

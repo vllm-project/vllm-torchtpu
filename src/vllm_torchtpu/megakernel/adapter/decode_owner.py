@@ -171,8 +171,22 @@ def _config_decline(
     spec_toks = (
         int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0) if spec_cfg else 0
     )
-    if spec_toks > 0 and "spec_decode" not in spec.features:
-        return "spec_decode_unsupported"
+    if spec_toks > 0:
+        if "spec_decode" not in spec.features:
+            return "spec_decode_unsupported"
+        if spec.name == "glm53":
+            method = getattr(spec_cfg, "method", None)
+            if (method is not None and method != "mtp") or spec_toks != 3:
+                return "unsupported_spec_config"
+    if spec.name == "glm53":
+        from vllm_torchtpu import envs
+
+        mla_impl = (envs.VLLM_TPU_GLM53_MLA_IMPL or "rpa").strip().lower()
+        if mla_impl != "rpa":
+            return "unsupported_mla_impl"
+        max_req = options.get("max_req")
+        if max_req is not None and int(max_req) not in (8, 16, 32):
+            return "unsupported_max_req"
     kv_cfg = getattr(vllm_config, "kv_transfer_config", None)
     if kv_cfg is not None:
         from .guards import _OFFLOADING_CONNECTORS, kv_connector_names
