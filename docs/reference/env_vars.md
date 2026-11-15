@@ -46,6 +46,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `VLLM_TPU_GLM53_SP_PREFILL` | `True` | Shards the GLM-5.3-Flash token axis across TP during prefill so the hyper-connection sites, sublayer norms and replicated MLA projections run on `T / tp` tokens. |
 | `VLLM_TPU_GLM53_SP_MIN_TOKENS` | `256` | Minimum batch token count for `VLLM_TPU_GLM53_SP_PREFILL` (rounded up to a multiple of `tp_size * 32`). |
+| `VLLM_TPU_MEGAKERNEL` | `""` | Megakernel adapter config: an on/off word, a shorthand template name, a JSON object or `k=v,k=v`; merged per key with `additional_config["megakernel"]`. |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
 

@@ -114,6 +114,17 @@ class SpeculativeDecodingManager:
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
 
+    def peek_draft_token_ids(self) -> list[list[int]] | None:
+        """The synchronous step's host drafts, one list per batch request,
+        without consuming them (None before a propose)."""
+        return self._draft_token_ids
+
+    def set_draft_token_ids(self, draft_token_ids: list[list[int]]) -> None:
+        """Replace the synchronous step's host drafts (one list per batch
+        request, in batch order), e.g. with drafts a decode-owning megakernel
+        proposed for the requests it served."""
+        self._draft_token_ids = draft_token_ids
+
     def stage_draft_token_ids_for_host(
         self,
         drafts: torch.Tensor | list[torch.Tensor],

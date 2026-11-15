@@ -1315,6 +1315,16 @@ class Eagle3Proposer:
                 num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
             )
+            owner = runner.decode_owner
+            if owner is not None:
+                owner.flush_draft_chunk(ci)
+                if (
+                    not return_device
+                    and not is_async
+                    and len(discard_sampled_tokens_req_indices)
+                    >= sum(c.num_reqs for c in chunks)
+                ):
+                    continue
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
@@ -1358,6 +1368,9 @@ class Eagle3Proposer:
                     self._dp_dummy_draft_step(dp_dummy, step)
 
         pad_dp_draft_step(0)
+
+        if not draft_tokens_per_chunk:
+            return [[] for _ in range(sum(c.num_reqs for c in chunks))]
 
         if K > 1:
             # Loop steps: uniform decode shape, one query per request. The
@@ -1667,21 +1680,48 @@ class Eagle3Proposer:
             # num_rejected_np is zeros) and last_token_indices = qsl_end-1 (set
             # above) is the last prompt position -- the correct prefill seed.
             num_rejected_out = num_rejected_np
-            next_token_ids = device_seed[start : start + num_reqs].to(torch.int32)
-            # Partial-prefill (discard) reqs: override seed from host req_state.
             ov_i = [i for i in range(num_reqs) if (start + i) in discard_set]
-            if ov_i:
-                next_token_ids = next_token_ids.clone()
-                ov_v = [
-                    runner.requests[req_ids[i]].get_token_id(
-                        runner.requests[req_ids[i]].num_computed_tokens
-                        + scheduler_output.num_scheduled_tokens[req_ids[i]]
+            if len(ov_i) == num_reqs:
+                next_token_ids_np = np.asarray(
+                    [
+                        runner.requests[req_ids[i]].get_token_id(
+                            runner.requests[req_ids[i]].num_computed_tokens
+                            + scheduler_output.num_scheduled_tokens[req_ids[i]]
+                        )
+                        for i in ov_i
+                    ],
+                    dtype=np.int32,
+                )
+                next_token_ids = chunk.input_ids[:0]
+                device_seed = None
+            else:
+                next_token_ids = device_seed[start : start + num_reqs].to(torch.int32)
+                if ov_i:
+                    next_token_ids = next_token_ids.clone()
+                    ov_v = [
+                        runner.requests[req_ids[i]].get_token_id(
+                            runner.requests[req_ids[i]].num_computed_tokens
+                            + scheduler_output.num_scheduled_tokens[req_ids[i]]
+                        )
+                        for i in ov_i
+                    ]
+                    next_token_ids[
+                        torch.tensor(ov_i, dtype=torch.long, device=runner.device)
+                    ] = torch.tensor(
+                        ov_v, dtype=next_token_ids.dtype, device=runner.device
                     )
-                    for i in ov_i
-                ]
-                next_token_ids[
-                    torch.tensor(ov_i, dtype=torch.long, device=runner.device)
-                ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
+                b_nr = min(self._loop_bucket(num_reqs), int(chunk.input_ids.shape[0]))
+                if b_nr > num_reqs:
+                    pad_np = np.full(b_nr, num_reqs - 1, dtype=np.int64)
+                    pad_np[:num_reqs] = np.arange(num_reqs, dtype=np.int64)
+                    lti_b_np = np.full(b_nr, last_token_indices_np[-1], dtype=np.int64)
+                    lti_b_np[:num_reqs] = last_token_indices_np
+                    last_token_indices = torch.from_numpy(lti_b_np).to(runner.device)
+                    next_token_ids = torch.index_select(
+                        next_token_ids,
+                        0,
+                        torch.from_numpy(pad_np).to(runner.device),
+                    )
         else:
             assert sampled_token_ids is not None
             num_rejected_out = num_rejected_np
@@ -1735,8 +1775,10 @@ class Eagle3Proposer:
             )
             if next_tokens_device is not None:
                 gather_indices = _maybe_pad_dim0(last_token_indices[:p], p)
+            elif last_token_indices.shape[0] == p:
+                gather_indices = last_token_indices
             else:
-                padded_lti_np = np.zeros(p, dtype=np.int64)
+                padded_lti_np = np.full(p, last_token_indices_np[-1], dtype=np.int64)
                 padded_lti_np[:num_reqs] = last_token_indices_np
                 gather_indices = torch.from_numpy(padded_lti_np).to(runner.device)
 

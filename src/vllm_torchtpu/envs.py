@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     VLLM_TPU_GLM53_MLA_IMPL: str = "rpa"
     VLLM_TPU_GLM53_SP_PREFILL: bool = True
     VLLM_TPU_GLM53_SP_MIN_TOKENS: int = 256
+    VLLM_TPU_MEGAKERNEL: str = ""
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
@@ -522,6 +523,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Minimum batch token count for GLM-5.3-Flash sequence-parallel prefill
     # (rounded up to a multiple of tp_size * 32).
     "VLLM_TPU_GLM53_SP_MIN_TOKENS": env_int("VLLM_TPU_GLM53_SP_MIN_TOKENS", 256),
+    # Megakernel adapter config (see megakernel/adapter/config.py): an on/off
+    # word, a shorthand template name, a JSON object or `k=v,k=v`. Merged per
+    # key with `additional_config["megakernel"]`, which wins.
+    "VLLM_TPU_MEGAKERNEL": env_str("VLLM_TPU_MEGAKERNEL", ""),
     # Store GDN's in_proj_qkvz in the matmul's (k, n) layout, like every other
     # linear, instead of vLLM's [n_out, n_in]. On the per-block FP8 path (gmm_v2)
     # the kept layout costs a full weight copy every step. Ignored with prefill

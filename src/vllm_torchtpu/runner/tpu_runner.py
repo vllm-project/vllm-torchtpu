@@ -160,6 +160,8 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
+from vllm_torchtpu.megakernel.adapter import decode_owner
+from vllm_torchtpu.megakernel.adapter.decode_owner import DecodeOwner
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -266,6 +268,9 @@ class ExecuteModelState:
     prompt_logprobs_chunks: list[prompt_logprobs.PromptLogprobsChunk] = field(
         default_factory=list
     )
+    # The first `owned_front` requests are decodes a decode-owning megakernel
+    # serves (`runner.decode_owner`); vLLM's chunks cover the rest.
+    owned_front: int = 0
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -691,6 +696,10 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
+    # A decode-owning megakernel program (megakernel/adapter/decode_owner.py),
+    # set by load_model when the megakernel config selects one.
+    decode_owner: DecodeOwner | None = None
+
     # pyrefly: ignore[bad-override-mutable-attribute]
     drafter: NgramProposer | DFlashProposer | Eagle3Proposer | None
     # pyrefly: ignore[bad-override-mutable-attribute]
@@ -1927,6 +1936,8 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
         if self.pcp_manager is not None:
             self.pcp_manager.set_page_size(mla_kv_page_size(kv_cache_config))
+        if self.decode_owner is not None:
+            self.decode_owner.bind_runner(self)
 
     def _init_prefill_checkpoint_units(self, kv_cache_config: KVCacheConfig) -> None:
         """Initializes the units the worker places prefill checkpoints with.
@@ -2877,17 +2888,22 @@ class TPUModelRunner(GPUModelRunner):
         input_batch._tpu_spec_room_guard = True
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
-        invalidated_req_ids = (
+        invalidated_req_id_set = (
             scheduler_output.finished_req_ids
             | (scheduler_output.preempted_req_ids or set())
             | scheduler_output.scheduled_cached_reqs.resumed_req_ids
         )
+        # Iterate in deterministic sorted order so free-slot stacks stay
+        # identical across spawned TP worker processes with random PYTHONHASHSEED.
+        invalidated_req_ids = sorted(invalidated_req_id_set)
         for req_id in invalidated_req_ids:
             self._mamba_state_pos.pop(req_id, None)
             slot = self._mamba_slot_by_req_id.pop(req_id, None)
             if slot is not None:
                 self._free_mamba_slots.append(slot)
-        self._mamba_offset_seeded.difference_update(invalidated_req_ids)
+        self._mamba_offset_seeded.difference_update(invalidated_req_id_set)
+        if self.decode_owner is not None and invalidated_req_ids:
+            self.decode_owner.release(invalidated_req_ids)
         if self._pre_async_results is not None and invalidated_req_ids:
             # These results belong to freed KV state, including a finished ID
             # resubmitted in this step. Other requests retain their source rows.
@@ -2896,7 +2912,7 @@ class TPUModelRunner(GPUModelRunner):
             self._pre_async_results.request_seq_lens = [
                 record
                 for record in self._pre_async_results.request_seq_lens
-                if record[3] not in invalidated_req_ids
+                if record[3] not in invalidated_req_id_set
             ]
         # Disable vLLM's native GPU async spec-decode num_computed_tokens
         # correction. The TPU runner does its own async rejection correction,
@@ -4042,7 +4058,7 @@ class TPUModelRunner(GPUModelRunner):
         return utils.dp_engines_in_lockstep(self.parallel_config)
 
     def _count_input_chunks(
-        self, scheduler_output: "SchedulerOutput"
+        self, scheduler_output: "SchedulerOutput", start: int = 0
     ) -> tuple[int, int]:
         """Match _prepare_inputs chunking without staging any tensors.
 
@@ -4055,7 +4071,7 @@ class TPUModelRunner(GPUModelRunner):
             return 0, 0
 
         num_reqs = self.input_batch.num_reqs
-        start_index = 0
+        start_index = start
         num_chunks = 0
         max_chunk_reqs = 0
         while start_index < num_reqs:
@@ -4321,9 +4337,23 @@ class TPUModelRunner(GPUModelRunner):
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output
         )
+        owner = self.decode_owner
+        owned_front = 0
+        if owner is not None:
+            owned_front, num_decode_reqs, num_windowed_reqs = (
+                decode_owner.move_owned_to_front(
+                    self.input_batch, owner, num_decode_reqs, num_windowed_reqs
+                )
+            )
+            if owned_front and owned_front == self.input_batch.num_reqs:
+                # Every request is owned: run the step now and return its
+                # output, which saves the engine the sample_tokens round trip.
+                return decode_owner.owned_step_output(self, owner, scheduler_output)
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
-            scheduler_output
+            scheduler_output, owned_front
         )
+        if owner is not None:
+            owner.begin_step(local_num_chunks)
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens,
             local_num_chunks,
@@ -4406,7 +4436,7 @@ class TPUModelRunner(GPUModelRunner):
                     [[0], np.cumsum(is_mm_embed_full.cpu().numpy())]
                 )
 
-        start_index = 0
+        start_index = owned_front
         chunk_index = 0
         logits_list = []
         pooler_output_list = []
@@ -4438,6 +4468,11 @@ class TPUModelRunner(GPUModelRunner):
             begin_kv_save_nan_check(get_kv_transfer_group())
             if has_kv_transfer_group()
             else None
+        )
+        # With a decode owner, a step whose vLLM requests are all partial
+        # prefills needs no logits: no sample of it is kept.
+        skip_logits = owner is not None and decode_owner.chunk_discards_all_samples(
+            self, scheduler_output, owned_front
         )
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:
@@ -4522,6 +4557,14 @@ class TPUModelRunner(GPUModelRunner):
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
             self._record_input_staging_fence()
+            if owner is not None:
+                owner.chunk_tokens(
+                    self,
+                    scheduler_output,
+                    start_index,
+                    num_reqs,
+                    input_ids.shape[0],
+                )
             if self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(
                     input_ids, chunk_mm_inputs
@@ -4607,6 +4650,8 @@ class TPUModelRunner(GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
                 )
+            if owner is not None:
+                owner.flush_chunk()
 
             if nan_check is not None:
                 assert isinstance(hidden_states, (torch.Tensor, IntermediateTensors)), (
@@ -4657,6 +4702,13 @@ class TPUModelRunner(GPUModelRunner):
                         layout_plan,
                     )
                 )
+            elif (
+                skip_logits
+                and spec_decode_metadata is None
+                and not self.num_prompt_logprobs
+            ):
+                hidden_states = self._finalize_hidden_states(hidden_states, layout_plan)
+                logits = torch.empty((0,), device=self.device)
             else:
                 sample_hidden_states = self._maybe_select_logits_hidden_states(
                     hidden_states, layout_plan, logits_indices
@@ -4758,9 +4810,23 @@ class TPUModelRunner(GPUModelRunner):
             top_tokens=top_tokens,
             kv_save_nan_check=nan_check,
             prompt_logprobs_chunks=prompt_logprobs_chunks,
+            owned_front=owned_front,
         )
 
-        if self.is_pooling_model:
+        if self.is_pooling_model or (
+            owner is not None
+            and not self.scheduler_config.async_scheduling
+            and not scheduler_output.has_structured_output_requests
+            and not getattr(scheduler_output, "pending_structured_output_tokens", False)
+            and not any(
+                r and r.startswith("__")
+                for r in self.input_batch.req_ids[: self.input_batch.num_reqs]
+            )
+        ):
+            # With a decode owner, sample in this call when no grammar bitmask
+            # can arrive and no internal (dummy) request expects the separate
+            # sample_tokens call: that round trip would add its latency to
+            # every mixed step.
             return self.sample_tokens(None)
         return None
 
@@ -5429,7 +5495,7 @@ class TPUModelRunner(GPUModelRunner):
             )
             self._update_num_xla_graphs("pooling_step")
         elif is_spec_step:
-            cur_start_idx = 0
+            cur_start_idx = state.owned_front
             all_greedy = self.input_batch.all_greedy
             for logits, num_reqs, md, mamba_indices, boundary_plan in zip(
                 state.logits_list,
@@ -5555,7 +5621,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._update_num_xla_graphs("spec_step")
                 cur_start_idx = cur_end_idx
         else:
-            cur_start_idx = 0
+            cur_start_idx = state.owned_front
             req_ids = cast(
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
@@ -5567,6 +5633,10 @@ class TPUModelRunner(GPUModelRunner):
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
+                if logits.numel() == 0:
+                    # execute_model skipped the logits: no sample is kept.
+                    cur_start_idx = cur_end_idx
+                    continue
                 if grammar_output is not None:
                     logits = self.structured_decoding_manager.mask_logits(
                         logits, grammar_output, cur_start_idx, cur_end_idx
@@ -5723,6 +5793,23 @@ class TPUModelRunner(GPUModelRunner):
         eagle3_drafts = None
         if (
             self._is_async_drafter
+            and not combined_selected_tokens
+            and state.draft_chunks
+            and self.decode_owner is not None
+            and not self._is_dspark_pd_producer
+        ):
+            # Every vLLM request was a partial prefill, so nothing was
+            # sampled, but the draft layers still need this step's prompt.
+            with self._stage_timing.stage("draft_propose"):
+                eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
+                    sampled_token_ids=[],
+                    discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+                    num_rejected_tokens_np=None,
+                    scheduler_output=scheduler_output,
+                    return_device=is_async,
+                )
+        elif (
+            self._is_async_drafter
             and combined_selected_tokens
             and not self._is_dspark_pd_producer
         ):
@@ -5762,6 +5849,13 @@ class TPUModelRunner(GPUModelRunner):
                         # send.
                         flat_seed = handoff_seed_tokens(
                             flat_seed, req_ids, scheduler_output.kv_connector_metadata
+                        )
+                    if state.owned_front:
+                        # The drafter indexes seeds by batch index; the owned
+                        # rows are never drafted by vLLM, so they only shift
+                        # vLLM's rows into place.
+                        flat_seed = torch.cat(
+                            [flat_seed.new_zeros(state.owned_front), flat_seed]
                         )
                     device_seed = flat_seed
                 with self._stage_timing.stage("draft_propose"):
@@ -5946,11 +6040,31 @@ class TPUModelRunner(GPUModelRunner):
             async_output = AsyncTPUModelRunnerOutput(
                 model_runner_output=model_runner_output,
                 copy_state=copy_state,
-                discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+                # The sampled rows cover requests [owned_front, num_reqs).
+                discard_sampled_tokens_req_indices=[
+                    i - state.owned_front for i in discard_sampled_tokens_req_indices
+                ],
             )
 
         if not self.scheduler_config.async_scheduling:
             final_output = async_output.get_output()
+            owner = self.decode_owner
+            if owner is not None:
+                if copy_state is None and not self.is_pooling_model:
+                    final_output.sampled_token_ids = [
+                        [] for _ in range(num_reqs - state.owned_front)
+                    ]
+                # vLLM's state for the owned requests is stale: their tokens
+                # come from one owner step instead.
+                decode_owner.prepend_owned(
+                    self, owner, final_output, state.owned_front, scheduler_output
+                )
+                decode_owner.check_output(
+                    final_output.sampled_token_ids,
+                    req_ids,
+                    discard_sampled_tokens_req_indices,
+                    "mixed",
+                )
             if not self.is_pooling_model:
                 for i, req_state, seq_len, req_id in request_seq_lens:
                     if i in discard_sampled_tokens_req_indices:
@@ -5981,6 +6095,15 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output=scheduler_output,
                 )
 
+            if owner is not None:
+                decode_owner.hand_over(
+                    self,
+                    owner,
+                    scheduler_output,
+                    request_seq_lens,
+                    discard_sampled_tokens_req_indices,
+                    final_output.sampled_token_ids,
+                )
             return final_output
 
         return async_output
@@ -6093,6 +6216,17 @@ class TPUModelRunner(GPUModelRunner):
         # After the drafter: every placed MoE layer, the drafter's too, must
         # have had its router renumbered with its experts.
         expert_placement.check_routers_permuted()
+
+        # After the drafter: a decode owner may share the draft's weights.
+        owner = decode_owner.create(self)
+        if owner is not None:
+            owner.load(
+                self.model,
+                getattr(self.drafter, "draft_model", None)
+                if self._is_async_drafter
+                else None,
+            )
+            self.decode_owner = owner
 
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:
@@ -7482,6 +7616,16 @@ class TPUModelRunner(GPUModelRunner):
             sum(rows),
         )
 
+    @contextmanager
+    def _suspend_decode_owner(self) -> Iterator[None]:
+        """Suspend `self.decode_owner` during synthetic precompile/warmup runs."""
+        saved = self.decode_owner
+        self.decode_owner = None
+        try:
+            yield
+        finally:
+            self.decode_owner = saved
+
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
         self._add_pipeline_chunk_buckets()
@@ -7511,7 +7655,10 @@ class TPUModelRunner(GPUModelRunner):
             assert isinstance(lora_manager, TPUWorkerLoRAManager)
             with self._precompile_timed("LoRA adapter activation"):
                 lora_manager.precompile_activation()
-        with self.maybe_setup_dummy_loras(self.lora_config):
+        with (
+            self._suspend_decode_owner(),
+            self.maybe_setup_dummy_loras(self.lora_config),
+        ):
             with self._precompile_timed("model backbone"):
                 self._precompile_backbone()
 

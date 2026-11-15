@@ -1267,6 +1267,10 @@ class TpuPlatform(Platform):
                     scheduler_config.scheduler_cls,
                 )
 
+        from vllm_torchtpu.megakernel.adapter import decode_owner as mk_decode_owner
+
+        mk_decode_owner.configure_scheduler(vllm_config)
+
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
