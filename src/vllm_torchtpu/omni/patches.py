@@ -694,8 +694,8 @@ def _resolve_qwen_encoder_mask(
 ) -> torch.Tensor | None:
     if mask is None or mask.numel() == 0:
         return None
-    cache: dict[tuple[Any, ...], tuple[torch.Tensor, bool]] | None = getattr(
-        model, "_tpu_encoder_mask_cache", None
+    cache: dict[tuple[Any, ...], tuple[torch.Tensor, bool]] | None = (
+        model._tpu_encoder_mask_cache
     )
     if cache is None:
         cache = {}
@@ -844,7 +844,7 @@ def _patch_qwen_image_mask_once() -> None:
                     hidden_states.device,
                     torch.is_inference_mode_enabled(),
                 )
-                sp_cache = getattr(self, "_tpu_sp_padding_mask_cache", None)
+                sp_cache = self._tpu_sp_padding_mask_cache
                 if sp_cache is None or sp_cache[0] != sp_key:
                     padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
                     hidden_states_mask = torch.ones(
@@ -919,6 +919,8 @@ def _patch_qwen_image_mask_once() -> None:
 
         return qwen_mod.Transformer2DModelOutput(sample=output)
 
+    cls._tpu_encoder_mask_cache = None
+    cls._tpu_sp_padding_mask_cache = None
     setattr(_forward, _QWEN_IMAGE_MASK_ONCE_PATCHED, True)
     cls.forward = _forward
     logger.info("Applied TPU patch: Qwen-Image one-shot mask resolution.")

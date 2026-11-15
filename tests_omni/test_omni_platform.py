@@ -700,8 +700,9 @@ def test_qwen_image_mask_once_inference_mode_cache_safety(monkeypatch, qwen_mask
             assert all(enc_m is want_mask for enc_m, _ in seen_masks)
         assert len(model._tpu_encoder_mask_cache) == _QWEN_ENCODER_MASK_CACHE_MAXSIZE
 
-        # Explicit storage invalidation (resize_(0)) cannot leave a live pointer
-        # matching a stale cache entry.
+        # Explicit storage invalidation (resize_(0)) sets data_ptr to 0, so a
+        # freshly allocated mask cannot match the stale cache entry even if the
+        # allocator reuses the freed address.
         resizable = torch.ones((2, 4), dtype=torch.bool)
         all_calls.clear()
         model.forward(
@@ -711,10 +712,30 @@ def test_qwen_image_mask_once_inference_mode_cache_safety(monkeypatch, qwen_mask
             timestep=t,
         )
         assert len(all_calls) == 1
+        old_ptr = resizable.untyped_storage().data_ptr()
         resizable.untyped_storage().resize_(0)
         cached_tensors = [entry[0] for entry in model._tpu_encoder_mask_cache.values()]
         assert any(t is resizable for t in cached_tensors)
         assert resizable.untyped_storage().data_ptr() == 0
+
+        orig_storage_data_ptr = patches._storage_data_ptr
+        fresh = torch.zeros(2, 4, dtype=torch.bool)
+        monkeypatch.setattr(
+            patches,
+            "_storage_data_ptr",
+            lambda tensor: old_ptr
+            if tensor is fresh
+            else orig_storage_data_ptr(tensor),
+        )
+        seen_masks.clear()
+        model.forward(
+            h,
+            encoder_hidden_states=e,
+            encoder_hidden_states_mask=fresh,
+            timestep=t,
+        )
+        assert len(all_calls) == 2
+        assert all(enc_m is fresh for enc_m, _ in seen_masks)
 
 
 def test_qwen_image_mask_once_sp_padding_skips_all(monkeypatch, qwen_mask_once):
