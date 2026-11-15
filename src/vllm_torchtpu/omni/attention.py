@@ -18,11 +18,10 @@ bf16 attention through a Pallas flash kernel tuned for diffusion
 sequence lengths. Masked, causal, or non-bf16 calls delegate to
 ``TpuSDPAImpl``, which runs PyTorch SDPA by default and, when
 ``VLLM_TPU_OMNI_SPLIT_SPLASH=1``, dispatches eligible prefix-masked
-joint ``[text, image]`` calls to LSE-merged Pallas Split-Splash (and
-unmasked bf16 calls to ``flash_attention_bshd``). On the PyTorch SDPA
-path, ``TpuSDPAImpl`` runs query-broadcast masked calls under
-``sdpa_kernel(SDPBackend.MATH)``, which on torch_tpu selects the
-StableHLO SDPA lowering.
+joint ``[text, image]`` calls to LSE-merged Pallas Split-Splash. On the
+PyTorch SDPA path, ``TpuSDPAImpl`` runs query-broadcast masked calls under
+``sdpa_kernel(SDPBackend.MATH)``, which on torch_tpu selects the StableHLO
+SDPA lowering.
 """
 
 from __future__ import annotations
@@ -41,7 +40,6 @@ from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.diffusion_attention.kernel import flash_attention_bshd
 from vllm_torchtpu.kernels.diffusion_attention.split_splash_attention import (
-    MIN_SPLASH_BLOCK_SIZE,
     is_split_splash_supported,
     split_splash_attention,
 )
@@ -83,8 +81,8 @@ def _prefix_mask_len_for_split_splash(
         or attn_metadata is None
         or query.device.type != "tpu"
         or query.ndim != 4
-        or key.ndim != 4
-        or value.ndim != 4
+        or key.shape != query.shape
+        or value.shape != query.shape
         or query.dtype != torch.bfloat16
         or key.dtype != query.dtype
         or value.dtype != query.dtype
@@ -120,45 +118,6 @@ def _prefix_mask_len_for_split_splash(
     return prefix_len
 
 
-def _can_use_unmasked_flash_in_sdpa(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attn_metadata: AttentionMetadata | None,
-    causal: bool,
-) -> bool:
-    if (
-        not envs.VLLM_TPU_OMNI_SPLIT_SPLASH
-        or causal
-        or query.device.type != "tpu"
-        or query.ndim != 4
-        or key.ndim != 4
-        or value.ndim != 4
-        or query.shape[0] != key.shape[0]
-        or query.shape[0] != value.shape[0]
-        or key.shape[1] != value.shape[1]
-        or key.shape[2] != value.shape[2]
-        or query.dtype != torch.bfloat16
-        or key.dtype != torch.bfloat16
-        or value.dtype != torch.bfloat16
-        or key.shape[2] <= 0
-        or query.shape[2] % key.shape[2] != 0
-        or query.shape[3] != key.shape[3]
-        or query.shape[3] <= 0
-        or query.shape[3] % MIN_SPLASH_BLOCK_SIZE != 0
-        or value.shape[3] <= 0
-        or value.shape[3] % MIN_SPLASH_BLOCK_SIZE != 0
-    ):
-        return False
-    if attn_metadata is None:
-        return True
-    return (
-        attn_metadata.attn_mask is None
-        and attn_metadata.joint_attn_mask is None
-        and attn_metadata.joint_query is None
-    )
-
-
 class TpuSDPAImpl(SDPAImpl):
     """TPU implementation of SDPA (and opt-in Split-Splash) for diffusion models."""
 
@@ -166,7 +125,6 @@ class TpuSDPAImpl(SDPAImpl):
         super().__init__(*args, **kwargs)
         if envs.VLLM_TPU_OMNI_SPLIT_SPLASH and not torch.compiler.is_compiling():
             _get_split_splash_op()
-            _flash_attention_op()
 
     def forward(
         self,
@@ -188,10 +146,6 @@ class TpuSDPAImpl(SDPAImpl):
             return _get_split_splash_op()(
                 query, key, value, attn_metadata.attn_mask, prefix_len, scale
             )
-        if _can_use_unmasked_flash_in_sdpa(
-            query, key, value, attn_metadata, self.causal
-        ):
-            return _flash_attention_op()(query, key, value, scale)
         # ---------------------------------------------------------------------
         # TODO: Remove the math-backend pin, and its canary
         # test_torch_tpu_still_misreads_query_broadcast_attn_mask, once the

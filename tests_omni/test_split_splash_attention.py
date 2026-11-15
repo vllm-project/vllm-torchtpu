@@ -178,33 +178,29 @@ class TestSplitSplashAttention:
                 max_abs=SPLIT_SPLASH_MAX_ABS,
             )
 
-    def test_unmasked_sdpa_routes_to_flash_attention_op(
+    def test_unmasked_sdpa_stays_on_sdpa_impl(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(envs, "VLLM_TPU_OMNI_SPLIT_SPLASH", True)
-        called: list[float] = []
-
-        def _fake_flash(
-            q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
-        ) -> torch.Tensor:
-            called.append(scale)
-            return q.clone()
-
-        monkeypatch.setattr(
-            "vllm_torchtpu.omni.attention._flash_attention_op",
-            lambda: _fake_flash,
-        )
         monkeypatch.setattr(
             "vllm_torchtpu.omni.attention._get_split_splash_op",
             lambda: MagicMock(),
         )
         tpu = torch.device("tpu")
         impl = TpuSDPAImpl(num_heads=4, head_size=128, softmax_scale=0.125)
+        fallback_calls = 0
+
+        def _fake_forward_impl(*args, **kwargs) -> torch.Tensor:
+            nonlocal fallback_calls
+            fallback_calls += 1
+            return args[0].clone()
+
+        monkeypatch.setattr(impl, "_forward_impl", _fake_forward_impl)
         q = torch.randn((1, 4128, 4, 128), dtype=torch.bfloat16, device=tpu)
         with torch.inference_mode():
             out = impl.forward(q, q, q, None)
         assert out.shape == q.shape
-        assert called == [0.125]
+        assert fallback_calls == 1
 
     def test_flash_impl_routes_prefix_masked_to_split_splash_without_warning(
         self, monkeypatch: pytest.MonkeyPatch
@@ -285,6 +281,31 @@ class TestSplitSplashAttention:
             out = sdpa.forward(q, q, q, meta)
         assert out.shape == q.shape
 
+    def test_mismatched_value_shape_falls_back_to_sdpa(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(envs, "VLLM_TPU_OMNI_SPLIT_SPLASH", True)
+        tpu = torch.device("tpu")
+        q = torch.randn((1, 4128, 4, 128), dtype=torch.bfloat16, device=tpu)
+        v = torch.randn((1, 4128, 4, 256), dtype=torch.bfloat16, device=tpu)
+        mask = torch.ones((1, 4128), dtype=torch.bool, device=tpu)
+        meta = AttentionMetadata(attn_mask=mask, extra={"prefix_mask_len": 32})
+        assert _prefix_mask_len_for_split_splash(q, q, v, meta, causal=False) is None
+
+        impl = TpuSDPAImpl(num_heads=4, head_size=128, softmax_scale=128**-0.5)
+        fallback_calls = 0
+
+        def _fake_forward_impl(*args, **kwargs) -> torch.Tensor:
+            nonlocal fallback_calls
+            fallback_calls += 1
+            return args[2].clone()
+
+        monkeypatch.setattr(impl, "_forward_impl", _fake_forward_impl)
+        with torch.inference_mode():
+            out = impl.forward(q, q, v, meta)
+        assert out.shape == v.shape
+        assert fallback_calls == 1
+
     def test_qwen_image_cross_attention_prefix_mask_patch(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -349,3 +370,17 @@ class TestSplitSplashAttention:
         )
         assert seen_meta[0] is not None
         assert seen_meta[0].extra == {}
+
+    def test_qwen_image_prefix_mask_patch_skips_on_signature_drift(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(envs, "VLLM_TPU_OMNI_SPLIT_SPLASH", True)
+        attn_cls = qwen_image_transformer.QwenImageCrossAttention
+
+        def _drifted_forward(self: object, x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        monkeypatch.setattr(attn_cls, "forward", _drifted_forward)
+        _patch_qwen_image_prefix_mask()
+        assert attn_cls.forward is _drifted_forward
+        assert not getattr(attn_cls.forward, _QWEN_IMAGE_PREFIX_MASK_PATCHED, False)

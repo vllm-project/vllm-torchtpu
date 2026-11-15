@@ -1358,8 +1358,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", default=""
     ),
     # vLLM-Omni: enable LSE-merged Split-Splash attention in TpuSDPAImpl for
-    # key-prefix-masked joint [text, image] diffusion sequences (and route
-    # unmasked bf16 TpuSDPAImpl calls to flash_attention_bshd).
+    # key-prefix-masked joint [text, image] diffusion sequences.
     "VLLM_TPU_OMNI_SPLIT_SPLASH": env_bool("VLLM_TPU_OMNI_SPLIT_SPLASH", False),
 }
 
