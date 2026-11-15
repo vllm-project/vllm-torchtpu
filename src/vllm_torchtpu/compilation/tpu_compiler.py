@@ -222,7 +222,8 @@ def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
         # went into the hash (each module's code and a digest per constant),
         # so two ranks' dumps of one range diff to what makes them differ.
         dump_dir = os.path.expandvars(os.environ.get("VLLM_TPU_FINGERPRINT_DUMP", ""))
-        if dump_dir and os.environ.get("LOCAL_RANK", "0") not in ("0", "1"):
+        dump_ranks = os.environ.get("VLLM_TPU_FINGERPRINT_DUMP_RANKS", "0,1").split(",")
+        if dump_dir and os.environ.get("LOCAL_RANK", "0") not in dump_ranks:
             dump_dir = ""
         dump: list[str] = []
         for name, module in graph.named_modules():
