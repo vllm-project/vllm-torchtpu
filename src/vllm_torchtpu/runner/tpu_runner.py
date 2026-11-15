@@ -116,6 +116,7 @@ from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
     expert_placement,
+    moe_skip_policy,
     token_padding,
 )
 from vllm_torchtpu.layers.adapter.attention import (
@@ -1235,6 +1236,9 @@ class TPUModelRunner(GPUModelRunner):
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
+        # Effective BF16 MoeSkip policy, resolved before model loading /
+        # MoE kernel prebuild.
+        self._bf16_moe_skip_policy = moe_skip_policy.Bf16MoeSkipPolicy(enabled=False)
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
 
@@ -6000,6 +6004,10 @@ class TPUModelRunner(GPUModelRunner):
             "Setting TPU quantization config for: %s", self.model_config.quantization
         )
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
+        # Resolve BF16 MoeSkip capability before model loading so
+        # VllmUnquantizedFusedMoEMethod, kernel prebuild, and TokenPaddingState
+        # all share one effective mode.
+        self._bf16_moe_skip_policy = self._resolve_bf16_moe_skip_policy()
 
         # No placed layers or target depth left over from an earlier load.
         expert_placement.reset_model_state()
@@ -6011,6 +6019,7 @@ class TPUModelRunner(GPUModelRunner):
                 mesh=self.mesh, vllm_config=self.vllm_config
             ),
             set_current_vllm_config(self.vllm_config),
+            moe_skip_policy.bf16_policy_scope(self._bf16_moe_skip_policy),
         ):
             load_model = cast(Callable[..., torch.nn.Module], model_loader.load_model)
             model = load_model(
@@ -6020,6 +6029,7 @@ class TPUModelRunner(GPUModelRunner):
         self.model = model
         if self.lora_config is not None:
             self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
+        self._finalize_bf16_moe_skip_policy_for_model()
         self._dp_vocab_logits = dp_vocab_parallel.check_layers_sharded_over_dp(
             self.model
         )
@@ -6129,7 +6139,9 @@ class TPUModelRunner(GPUModelRunner):
                     max_padded_tokens, self.max_num_reqs * self.drafter.block_size
                 )
             self._token_padding_state = token_padding.TokenPaddingState.create(
-                max_padded_tokens, self.device
+                max_padded_tokens,
+                self.device,
+                track_valid_tokens=self._bf16_moe_skip_policy.enabled,
             )
             token_padding.set_padding_state(self._token_padding_state)
 
@@ -7774,6 +7786,95 @@ class TPUModelRunner(GPUModelRunner):
                 self._backbone_dummy_runs(num_tokens)
         if self._pp_handoff is not None:
             self._warmup_handoff_forwards()
+
+    def _resolve_bf16_moe_skip_policy(self) -> moe_skip_policy.Bf16MoeSkipPolicy:
+        """Resolve the BF16 MoeSkip effective mode before model loading.
+
+        Gated here, ahead of ``VllmUnquantizedFusedMoEMethod`` construction,
+        GMM kernel prebuild, and the first backbone trace.
+        """
+        from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+            enable_pipelined_collective_and_compute,
+        )
+        from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+            VllmUnquantizedConfig,
+        )
+
+        is_unquantized = isinstance(
+            self.vllm_config.quant_config, VllmUnquantizedConfig
+        )
+        policy = moe_skip_policy.resolve_bf16_moe_skip_policy(
+            skip_flag=bool(envs.TPU_MOE_SKIP_PADDED_TOKENS),
+            parallel_config=self.parallel_config,
+            pipelined_collective=enable_pipelined_collective_and_compute(),
+            fused_decode_kernel=bool(
+                envs.USE_MOE_TP_DECODE_KERNEL or envs.FUSED_MOE_DECODE_KERNEL
+            ),
+            has_speculative=(
+                self.speculative_config is not None or self.drafter is not None
+            ),
+            has_lora=self.lora_config is not None,
+            is_unquantized_model=is_unquantized,
+        )
+        if policy.fallback_reason is not None and is_unquantized:
+            logger.warning_once(
+                "TPU_MOE_SKIP_PADDED_TOKENS is not applied to the bf16 MoE "
+                "(%s); falling back to the stock path.",
+                policy.fallback_reason,
+            )
+        return policy
+
+    def _finalize_bf16_moe_skip_policy_for_model(self) -> None:
+        """Align the BF16 MoeSkip policy with the loaded model's MoE layers.
+
+        Runs immediately after model loading and before TokenPaddingState
+        allocation or backbone tracing so dense models or models with mixed /
+        non-BF16 MoE layers cleanly fall back to the stock contract without
+        allocating ``local_valid_tokens``.
+        """
+        if not self._bf16_moe_skip_policy.enabled:
+            return
+        from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
+
+        from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+            VllmUnquantizedFusedMoEMethod,
+        )
+
+        moe_modules: list[torch.nn.Module] = [
+            m
+            for m in self.model.modules()
+            if isinstance(getattr(m, "quant_method", None), FusedMoEMethodBase)
+        ]
+        method_types = {type(m.quant_method) for m in moe_modules}
+        reason: str | None = None
+        if not method_types:
+            reason = "model has no MoE layers"
+        elif method_types != {VllmUnquantizedFusedMoEMethod}:
+            names = sorted(t.__name__ for t in method_types)
+            reason = f"MoE methods {names}; only the bf16 method is supported"
+        elif any(
+            not getattr(m.quant_method, "_skip_padded_tokens", False)
+            for m in moe_modules
+        ):
+            reason = "layer-level capability fallback"
+
+        if reason is None:
+            return
+
+        for m in moe_modules:
+            qm = getattr(m, "quant_method", None)
+            if isinstance(qm, VllmUnquantizedFusedMoEMethod):
+                qm.disable_moe_skip(m)
+
+        self._bf16_moe_skip_policy = moe_skip_policy.Bf16MoeSkipPolicy(
+            enabled=False, fallback_reason=reason
+        )
+        if method_types:
+            logger.warning_once(
+                "TPU_MOE_SKIP_PADDED_TOKENS is not applied to the bf16 MoE "
+                "(%s); falling back to the stock path.",
+                reason,
+            )
 
     def _backbone_dummy_runs(self, num_tokens: int) -> None:
         """One warmup forward of the backbone per context bucket."""

@@ -54,7 +54,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.utils import replace_parameter
 
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter import moe_routing, moe_skip_policy, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -252,11 +252,54 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
     CUDA-only router.select_experts() path.
     """
 
+    _skip_padded_tokens: bool = False
+    _padding_rows: str | None = None
+
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
         # Parent sets _is_monolithic=False on TPU and skips wiring
         # apply_monolithic.  Override both after super().__init__().
         self.apply_monolithic = self._select_monolithic()
+        # Adopt the runner's pre-load BF16 MoeSkip policy so prebuild, first
+        # backbone trace, and TokenPaddingState share one effective mode. When
+        # instantiated standalone (outside TPUModelRunner.load_model), resolve
+        # from envs and layer parallel cfg.
+        policy = moe_skip_policy.get_active_bf16_policy()
+        if policy is None:
+            policy = moe_skip_policy.resolve_standalone_bf16_moe_skip_policy(moe)
+            if policy.fallback_reason is not None:
+                logger.warning_once(
+                    "TPU_MOE_SKIP_PADDED_TOKENS is not applied to the bf16 MoE "
+                    "(%s); running the stock path.",
+                    policy.fallback_reason,
+                )
+        elif policy.enabled:
+            layer_reason = moe_skip_policy.bf16_layer_unsupported_reason(moe)
+            if layer_reason is not None:
+                logger.warning_once(
+                    "TPU_MOE_SKIP_PADDED_TOKENS is not applied to the bf16 MoE "
+                    "(%s); running the stock path.",
+                    layer_reason,
+                )
+                policy = moe_skip_policy.Bf16MoeSkipPolicy(
+                    enabled=False, fallback_reason=layer_reason
+                )
+        self._skip_padded_tokens = policy.enabled
+        self._padding_rows = policy.padding_rows
+
+    def disable_moe_skip(self, layer: torch.nn.Module | None = None) -> None:
+        """Fall back to the stock BF16 MoE contract before backbone tracing."""
+        self._skip_padded_tokens = False
+        self._padding_rows = None
+        if layer is not None and self._tpu_activation_str is not None:
+            tpu_layer = cast("TpuRoutedExperts", layer)
+            prebuild_fused_moe_kernel(
+                topk=tpu_layer.moe_config.experts_per_token,
+                activation=self._tpu_activation_str,
+                use_ep=tpu_layer.moe_config.moe_parallel_config.use_ep,
+                skip_padded_tokens=False,
+                padding_rows=None,
+            )
 
     @property
     def is_monolithic(self) -> bool:
@@ -354,6 +397,8 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            skip_padded_tokens=self._skip_padded_tokens,
+            padding_rows=self._padding_rows,
         )
 
     def _forward_monolithic_tpu(
@@ -375,7 +420,26 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
-        kwargs = {
+        # Contract:
+        # - Supported topology (row-count MoeSkip):
+        #     (skip_padded_tokens=True, padding_rows="count", row_info=<count>)
+        # - Flag-off, EP / unsupported fallback:
+        #     (skip_padded_tokens=False, padding_rows=None, row_info omitted)
+        if self._skip_padded_tokens and self._padding_rows == "count":
+            row_info = token_padding.get_local_valid_tokens()
+            if row_info is None:
+                raise RuntimeError(
+                    "BF16 MoeSkip count mode requires TokenPaddingState with "
+                    "track_valid_tokens=True."
+                )
+            skip_padded_tokens = True
+            padding_rows: str | None = "count"
+        else:
+            skip_padded_tokens = False
+            padding_rows = None
+            row_info = None
+
+        kwargs: dict[str, Any] = {
             "hidden_states": x,
             "w1": layer.w13_weight,
             "w2": layer.w2_weight,
@@ -388,7 +452,11 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
+            "skip_padded_tokens": skip_padded_tokens,
+            "padding_rows": padding_rows,
         }
+        if row_info is not None:
+            kwargs["row_info"] = row_info
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 
