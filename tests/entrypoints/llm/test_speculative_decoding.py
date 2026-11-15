@@ -1980,7 +1980,7 @@ class _ServedEngine:
 
 
 class _ServeStartupError(RuntimeError):
-    """`vllm serve` never became healthy; `retryable` marks the TPU init race."""
+    """`vllm serve` never became healthy; `retryable` marks a TPU init race."""
 
     def __init__(self, message: str, retryable: bool):
         super().__init__(message)
@@ -2117,7 +2117,7 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
         except _ServeStartupError as e:
             if not e.retryable or attempt == DP_SERVER_START_ATTEMPTS:
                 raise
-            print(f"vllm serve attempt {attempt} hit the TPU init race:\n{e}")
+            print(f"vllm serve attempt {attempt} hit a TPU init race:\n{e}")
             attempt += 1
     try:
         yield _ServedEngine(base, model_name)
