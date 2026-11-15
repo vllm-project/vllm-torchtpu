@@ -134,6 +134,16 @@ class TPUGlm5NextConfig(Glm5NextModelConfig):
                     "GLM-5.3-Flash unified KV+KDA pool does not yet support "
                     f"disaggregated KV transfer connectors ({non_offload})."
                 )
+        if (
+            getattr(vllm_config, "speculative_config", None) is not None
+            and getattr(vllm_config, "cache_config", None) is not None
+        ):
+            from vllm_torchtpu import gdn_pool_layout
+
+            arch = getattr(model_config, "architecture", "")
+            if not gdn_pool_layout.unified_kv_layout_enabled_for_architecture(arch):
+                vllm_config.cache_config.enable_prefix_caching = False
+                vllm_config.cache_config.mamba_cache_mode = "none"
         index_topk = getattr(text_config, "index_topk", None)
         if index_topk is not None:
             # The sparse attention indexer is not run on TPU: the MLA layers
