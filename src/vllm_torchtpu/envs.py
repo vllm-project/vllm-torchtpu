@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    VLLM_TPU_GLM53_MHC_IMPL: str = "pallas"
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
@@ -489,6 +490,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fingerprint.
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
+    ),
+    # GLM-5.3-Flash mHC (manifold-constrained hyper-connections):
+    # "pallas" runs the Pallas mHC kernels with each post fused into the next
+    # pre; "compiled" runs the torch.compile'd reference ops.
+    "VLLM_TPU_GLM53_MHC_IMPL": lambda: (
+        env_with_choices("VLLM_TPU_GLM53_MHC_IMPL", "pallas", ["pallas", "compiled"])()
+        or "pallas"
     ),
     # Store GDN's in_proj_qkvz in the matmul's (k, n) layout, like every other
     # linear, instead of vLLM's [n_out, n_in]. On the per-block FP8 path (gmm_v2)
