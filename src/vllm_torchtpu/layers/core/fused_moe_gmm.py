@@ -846,8 +846,7 @@ def fused_moe_func(
     num_tokens, hidden_size = hidden_states.shape
 
     dense_fp4 = (
-        use_ep
-        and 0 < num_tokens <= _DENSE_FP4_MAX_TOKENS
+        0 < num_tokens <= _DENSE_FP4_MAX_TOKENS
         and rhs_quant_dtype is None
         and w1_bias is None
         and w2_bias is None
@@ -938,9 +937,10 @@ def fused_moe_func(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
 
-    # Decode under EP: a core holds few routed rows per expert and weight
-    # streaming binds, so the permutation-free kernel skips the routing sort,
-    # permute and combine around the GMM.
+    # Decode: a core holds few routed rows per expert and weight streaming
+    # binds, so the permutation-free kernel skips the routing sort, permute
+    # and combine around the GMM (EP ranks, or TP ranks holding every expert's
+    # slice).
     if dense_fp4:
         logger.info_once("Selected dense-expert fp4 decode MoE")
         return dense_expert_moe_fp4(

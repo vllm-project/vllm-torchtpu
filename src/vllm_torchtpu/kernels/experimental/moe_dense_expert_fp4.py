@@ -16,7 +16,8 @@
 The decode-sized counterpart of moe_dense_expert for fp4 experts with fp32
 [128, 1] block scales. Each nonempty local expert is streamed once, in units of
 `chunk` intermediate columns (its gate, up and down slices), through a ring of
-VMEM buffers; every token is evaluated in its original order and the weighted
+VMEM buffers (a TP-sliced expert narrow enough is one unit, its [gate | up]
+columns one copy); every token is evaluated in its original order and the weighted
 expert outputs accumulate in fp32 VMEM. This replaces the routing sort, the
 one-hot permute, the grouped GEMM and the combine with one call; the routing
 coefficients and the set of nonempty experts are derived in the kernel from the
@@ -158,7 +159,8 @@ def _vmem_bytes(m: int, h: int, chunk: int, i_s: int) -> int:
     """VMEM of one call: the weight ring (VMEM holds fp4 one byte per
     element), its scales, the shared expert's weights, the token-sized scratch
     and the compiler's token-sized temporaries (~16 bytes per element,
-    measured with tpu7x AOT compiles at 16 and 64 rows)."""
+    measured with tpu7x AOT compiles at 16 and 64 rows). Whole-expert units
+    hold gate|up in one ring, so the bytes are the same in both modes."""
     weights = 3 * h * chunk
     scales = (2 * (h // _QUANT_BLOCK) * chunk + (chunk // _QUANT_BLOCK) * h) * 4
     mp = m + (-m % _ROW_ALIGN)
@@ -207,6 +209,8 @@ def _kernel(
     m = x_ref.shape[0]
     mp = acc_ref.shape[0]
     num_chunks = i // chunk
+    # A whole expert per unit (TP-sliced experts): one contiguous w13 copy.
+    whole = chunk == i
 
     if i_s:
         swg_ref, swu_ref, swd_ref, shared_out_ref, shared_sem = shared_scratch
@@ -255,6 +259,13 @@ def _kernel(
         blk = (unit % num_chunks) * (chunk // _QUANT_BLOCK)
         slot = unit % _NUM_BUFFERS
         sem = sem_ref.at[slot]
+        if whole:
+            return [
+                pltpu.make_async_copy(w1_hbm.at[e], wg_ref.at[slot], sem.at[0]),
+                pltpu.make_async_copy(w2_hbm.at[e], wd_ref.at[slot], sem.at[2]),
+                pltpu.make_async_copy(s1_hbm.at[e], sg_ref.at[slot], sem.at[3]),
+                pltpu.make_async_copy(s2_hbm.at[e], sd_ref.at[slot], sem.at[5]),
+            ]
         return [
             pltpu.make_async_copy(
                 w1_hbm.at[e, :, pl.ds(col, chunk)], wg_ref.at[slot], sem.at[0]
@@ -342,6 +353,18 @@ def _kernel(
         for k in range(0, h, _QUANT_BLOCK):
             b = k // _QUANT_BLOCK
             xk = x[:, k : k + _QUANT_BLOCK]
+            if whole:
+                gu = (
+                    jnp.matmul(
+                        xk,
+                        wg_ref[slot, k : k + _QUANT_BLOCK, :].astype(fp8),
+                        preferred_element_type=f32,
+                    )
+                    * sg_ref[slot, b]
+                )
+                gate += gu[:, :chunk]
+                up += gu[:, chunk:]
+                continue
             gate += (
                 jnp.matmul(
                     xk,
@@ -427,15 +450,18 @@ def dense_expert_moe_fp4(
 ):
     """Local routed contribution of fp4 experts, [tokens, hidden] bf16, as
     fused_moe_func's GMM path returns it, plus the shared expert's output
-    when `shared` is given. IDs outside this rank must
-    be -1. Callers check can_use_dense_expert_fp4 first. Non-finite hidden
-    states and weights are zeroed for the routed experts, as the GMM path's
-    one-hot permute (which serves these token counts) does."""
+    when `shared` is given. IDs outside this rank must be -1 (TP-sliced
+    experts: every id is local). Callers check can_use_dense_expert_fp4 first.
+    Non-finite hidden states and weights are zeroed for the routed experts, as
+    the GMM path's one-hot permute does on SparseCore EP steps; elsewhere
+    (TP-MoE, no SparseCore) the GMM path would keep a non-finite token
+    non-finite."""
     m, h = hidden.shape
     experts, i, _ = w2.shape
     i_s = 0 if shared is None else shared.w2.shape[0]
     info = pltpu.get_tpu_info()
     chunk = _chunk(m, h, i, i_s, info.vmem_capacity_bytes)
+    whole = chunk == i
     # Whole f32 sublane tiles of tokens; the kernel pads to _ROW_ALIGN itself.
     pad = -m % 8
     if pad:
@@ -459,6 +485,7 @@ def dense_expert_moe_fp4(
             pltpu.VMEM((mp, h), jnp.bfloat16),
             pltpu.SemaphoreType.DMA((3,)),
         ]
+    gate_cols = 2 * chunk if whole else chunk
     out = pl.pallas_call(
         functools.partial(
             _kernel,
@@ -475,11 +502,21 @@ def dense_expert_moe_fp4(
             in_specs=[vmem, vmem, vmem, *[hbm] * 4, *shared_specs],
             out_specs=vmem,
             scratch_shapes=[
-                pltpu.VMEM((_NUM_BUFFERS, h, chunk), w1.dtype),
-                pltpu.VMEM((_NUM_BUFFERS, h, chunk), w1.dtype),
+                # Whole-expert units keep gate|up in the first ring: no up ring.
+                pltpu.VMEM((_NUM_BUFFERS, h, gate_cols), w1.dtype),
+                pltpu.VMEM(
+                    (1, 128, 128) if whole else (_NUM_BUFFERS, h, chunk), w1.dtype
+                ),
                 pltpu.VMEM((_NUM_BUFFERS, chunk, h), w2.dtype),
-                pltpu.VMEM((_NUM_BUFFERS, h // _QUANT_BLOCK, 1, chunk), jnp.float32),
-                pltpu.VMEM((_NUM_BUFFERS, h // _QUANT_BLOCK, 1, chunk), jnp.float32),
+                pltpu.VMEM(
+                    (_NUM_BUFFERS, h // _QUANT_BLOCK, 1, gate_cols), jnp.float32
+                ),
+                pltpu.VMEM(
+                    (1, 1, 1, 128)
+                    if whole
+                    else (_NUM_BUFFERS, h // _QUANT_BLOCK, 1, chunk),
+                    jnp.float32,
+                ),
                 pltpu.VMEM((_NUM_BUFFERS, chunk // _QUANT_BLOCK, 1, h), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.bfloat16),
                 pltpu.VMEM((mp, experts + (-experts) % lanes), jnp.float32),

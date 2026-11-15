@@ -49,7 +49,7 @@ def _shared(h, i_s, seed):
     )
 
 
-def _moe(x, w1, w2, s1, s2, weights, ids, e, topk, shared=None):
+def _moe(x, w1, w2, s1, s2, weights, ids, e, topk, shared=None, use_ep=True):
     return wrapper.fused_moe_func(
         x,
         w1,
@@ -60,10 +60,10 @@ def _moe(x, w1, w2, s1, s2, weights, ids, e, topk, shared=None):
         None,
         weights,
         ids,
-        jnp.asarray(e, jnp.int32),
+        jnp.asarray(e, jnp.int32) if use_ep else None,
         topk=topk,
         activation="swigluoai",
-        use_ep=True,
+        use_ep=use_ep,
         use_sparse_core=True,
         onehot_moe_permute_threshold=wrapper.resolve_onehot_permute_threshold(),
         skip_padded_tokens=True,
@@ -71,7 +71,8 @@ def _moe(x, w1, w2, s1, s2, weights, ids, e, topk, shared=None):
     )
 
 
-@pytest.mark.parametrize("m,i", [(8, 1024), (13, 512), (16, 384)])
+# i=2048 streams two 1024-column units per expert; the others one whole expert.
+@pytest.mark.parametrize("m,i", [(8, 2048), (8, 1024), (13, 512), (16, 384)])
 def test_dense_fp4_matches_gmm_path(monkeypatch, m, i):
     if jax.default_backend() != "tpu":
         pytest.skip("requires TPU")
@@ -85,6 +86,28 @@ def test_dense_fp4_matches_gmm_path(monkeypatch, m, i):
     jax.clear_caches()
     out = np.asarray(_moe(*args, e, topk), np.float32)
     np.testing.assert_allclose(out, ref, rtol=0, atol=5e-3 * np.abs(ref).max())
+
+
+@pytest.mark.parametrize("with_shared", [False, True])
+def test_dense_fp4_matches_gmm_path_without_ep(monkeypatch, with_shared):
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    h, i, e, topk = 512, 384, 8, 4
+    x, w1, w2, s1, s2, weights, _ = _inputs(8, h, i, e, topk, seed=11)
+    shared = _shared(h, 128, seed=11) if with_shared else None
+    rng = np.random.default_rng(12)
+    # TP-MoE: every expert is local and ids are global.
+    ids = jnp.asarray(
+        np.stack([rng.choice(e, topk, replace=False) for _ in range(8)]), jnp.int32
+    )
+    args = (x, w1, w2, s1, s2, weights, ids, e, topk, shared, False)
+    monkeypatch.setattr(wrapper, "_DENSE_FP4_MAX_TOKENS", 0)
+    jax.clear_caches()
+    ref = np.asarray(_moe(*args), np.float32)
+    monkeypatch.setattr(wrapper, "_DENSE_FP4_MAX_TOKENS", 16)
+    jax.clear_caches()
+    out = np.asarray(_moe(*args), np.float32)
+    np.testing.assert_allclose(out, ref, rtol=0, atol=1e-2 * np.abs(ref).max())
 
 
 def test_dense_fp4_no_local_route_returns_zeros():

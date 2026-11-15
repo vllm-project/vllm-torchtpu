@@ -741,8 +741,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER": env_bool(
         "TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER", default=False
     ),
-    # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
-    # permutation-free dense-expert kernel (kernels/experimental/
+    # MoE steps (EP or TP-MoE) of up to this many tokens with fp4 (NVFP4)
+    # experts run the permutation-free dense-expert kernel (kernels/experimental/
     # moe_dense_expert_fp4.py) instead of sort + grouped GEMM + combine.
     # 0 disables it.
     "TPU_MOE_DENSE_FP4_MAX_TOKENS": env_nonnegative_int(
