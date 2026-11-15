@@ -26,12 +26,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.megablox import gmm_v2 as gmm_v2_module
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     TileSizes,
     apply_act_fn,
     gmm_v2,
     interleave_lane,
     situ_and_mul,
+    validate_inputs,
 )
 
 _GroupConfig = collections.namedtuple(
@@ -462,3 +464,69 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("layer", [0, 2])
+def test_gmm_stacked_rhs_group_base_matches_layer_slice(layer):
+    """`rhs_group_base` reads one layer's groups in place from an
+    [L * E, K, N] stack, bit for bit like the slice."""
+    _require_tpu()
+
+    num_layers, num_groups, batch_size, in_size, out_size = 3, 8, 128, 512, 256
+    key0, key1 = jax.random.split(jax.random.key(0))
+    lhs = jax.random.uniform(key0, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        key1, (num_layers * num_groups, in_size, out_size), jnp.bfloat16, -1, 1
+    )
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=in_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    sl = slice(layer * num_groups, (layer + 1) * num_groups)
+
+    expected = gmm_v2(lhs, rhs_q[sl], group_sizes, rhs_scale=rhs_scale[sl])
+    actual = gmm_v2(
+        lhs,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        rhs_group_base=jnp.array([layer * num_groups], jnp.int32),
+    )
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+@pytest.mark.parametrize("stacked_rhs", [False, True])
+def test_validate_inputs_stacked_rhs_groups(monkeypatch, stacked_rhs):
+    """A stacked rhs processes `len(group_sizes)` groups per call and accepts
+    scales over the whole stack; an unstacked rhs keeps its own group count."""
+    # The sublane size queries the TPU; the group arithmetic does not.
+    monkeypatch.setattr(gmm_v2_module, "_get_lhs_sublane_size", lambda *_: 8)
+    num_layers, num_groups, size_m, size_k, size_n = 3, 4, 16, 256, 128
+    rhs_groups = num_layers * num_groups if stacked_rhs else num_groups
+    dims = validate_inputs(
+        jnp.zeros((size_m, size_k), jnp.bfloat16),
+        jnp.zeros((rhs_groups, size_k, size_n), jnp.bfloat16),
+        jnp.zeros((rhs_groups, 1, 1, size_n), jnp.float32),
+        None,
+        jnp.zeros((num_groups,), jnp.int32),
+        jnp.zeros((1,), jnp.int32),
+        stacked_rhs=stacked_rhs,
+    )
+    assert dims.size_group == num_groups
+    assert dims.size_lhs_group == num_groups
+
+
+def test_validate_inputs_stacked_rhs_rejects_partial_set(monkeypatch):
+    monkeypatch.setattr(gmm_v2_module, "_get_lhs_sublane_size", lambda *_: 8)
+    with pytest.raises(AssertionError):
+        validate_inputs(
+            jnp.zeros((16, 256), jnp.bfloat16),
+            jnp.zeros((10, 256, 128), jnp.bfloat16),
+            None,
+            None,
+            jnp.zeros((4,), jnp.int32),
+            jnp.zeros((1,), jnp.int32),
+            stacked_rhs=True,
+        )
