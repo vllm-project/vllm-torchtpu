@@ -3791,11 +3791,11 @@ def sparse_ragged_paged_attention(
     if mixed_live_widths and (
         topk_cap is None
         or list(mixed_live_widths) != sorted(set(mixed_live_widths))
-        or any(w % 128 or not 0 < w < topk_cap for w in mixed_live_widths)
+        or any(w % GATHER_ATOM_ROWS or not 0 < w < topk_cap for w in mixed_live_widths)
     ):
         raise ValueError(
             f"mixed_live_widths {mixed_live_widths} must be ascending multiples of "
-            f"128 below topk_cap ({topk_cap})"
+            f"{GATHER_ATOM_ROWS} below topk_cap ({topk_cap})"
         )
     if decode_row_widths and (
         topk_cap is None
