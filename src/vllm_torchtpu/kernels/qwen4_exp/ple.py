@@ -6,6 +6,11 @@ import math
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu.kernels.qwen4_exp.history_rows import (
+    gather_history_rows,
+    history_row_kernel_enabled,
+)
+
 
 def compact_rows(table, ids, *, head_dim: int):
     """Gather rows from 128-element storage segments without row padding.
@@ -136,13 +141,21 @@ def short_conv(
     valid = (t < starts[-1]) & (slots[req] >= 0)
     safe_slots = jnp.clip(slots, 0, history.shape[0] - 1)
     state_len = history.shape[1]
+    row_kernel = history_row_kernel_enabled()
+
+    def history_at(slot, pos):
+        # history[slot, pos] for in-range slot and pos, broadcast together.
+        if row_kernel:
+            return gather_history_rows(history, slot * state_len + pos)
+        return history[slot, pos]
+
     accum = jnp.zeros((token_count, channels), jnp.float32)
     for tap in range(weight.shape[-1]):
         distance = state_len - tap * dilation
         position = relative - distance
         # A one-tap convolution has no historical state and only distance 0.
         past = (
-            history[safe_slots[req], jnp.clip(position + state_len, 0, state_len - 1)]
+            history_at(safe_slots[req], jnp.clip(position + state_len, 0, state_len - 1))
             if state_len
             else jnp.zeros_like(x)
         )
@@ -159,9 +172,9 @@ def short_conv(
 
     lengths = starts[1:] - starts[:-1]
     positions = lengths[:, None] - state_len + jnp.arange(state_len)[None, :]
-    past = history[
+    past = history_at(
         safe_slots[:, None], jnp.clip(positions + state_len, 0, state_len - 1)
-    ]
+    )
     past = jnp.where(has_initial_states[:, None, None], past, 0)
     current = x[jnp.clip(starts[:-1, None] + positions, 0, token_count - 1)]
     updated = jnp.where((positions >= 0)[..., None], current, past)

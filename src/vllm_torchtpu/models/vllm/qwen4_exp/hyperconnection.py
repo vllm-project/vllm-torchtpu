@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from vllm.models.qwen4_exp.common import hyperconnection as common_hc
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.qwen4_exp.hc_decode import decode_token_tile
+from vllm_torchtpu.kernels.qwen4_exp.hc_decode import MAX_TOKENS, decode_token_tile
 
 GroupedGemmaRMSNorm = common_hc.GroupedGemmaRMSNorm
 HyperConnectionBase = common_hc.HyperConnectionBase
@@ -135,10 +135,12 @@ class GatedResidual(common_hc.GatedResidual):
             self._decode_mix_op = build_decode_mix_op(
                 self.hc_count, self.hidden_size, eps, inject
             )
-            if inject:
-                # Used by the preceding HC's combine_mix (attn -> mlp).
+            if inject or envs.TPU_QWEN4_HC_DECODE_FOLD:
+                # Used by the preceding HC's combine_mix: attn -> mlp, and
+                # with TPU_QWEN4_HC_DECODE_FOLD mlp -> next attn and mlp ->
+                # the final mixer (no injection gate).
                 self._decode_combine_mix_op = build_decode_combine_mix_op(
-                    self.hc_count, self.hidden_size, eps
+                    self.hc_count, self.hidden_size, eps, inject
                 )
         if prefill_up_tile and hasattr(self, "input_mix_weight_up"):
             # Register before Dynamo traces forward; registration itself uses
@@ -199,10 +201,19 @@ class GatedResidual(common_hc.GatedResidual):
         return weights
 
     def _decode_fused(self, hyper_input) -> bool:
-        """TPU_QWEN4_HC_DECODE_FUSED: one Pallas call for <= 512 BF16 rows."""
+        """TPU_QWEN4_HC_DECODE_FUSED: one Pallas call for < 512 BF16 rows.
+
+        The cap is exclusive and is tested before ``decode_token_tile``, whose
+        own bound is ``<= MAX_TOKENS``: ``combine`` takes the fused prefill
+        path at ``tokens >= 2 * prefill_full_tile`` (512 as served), and a
+        trace at the 512 bucket that also assumed ``tokens <= 512`` would have
+        its token count refined to the constant 512 (see
+        compilation/shape_variants.py on half-open token gates).
+        """
         return (
             self._decode_mix_op is not None
             and hyper_input.dim() == 2
+            and hyper_input.shape[0] < MAX_TOKENS
             and decode_token_tile(hyper_input.shape[0]) is not None
             and hyper_input.dtype == torch.bfloat16
             and all(w.dtype == torch.bfloat16 for w in self._decode_weights())
@@ -346,12 +357,14 @@ class GatedResidual(common_hc.GatedResidual):
         )
         return output.to(hyper_input.dtype)
 
-    def combine_mix(self, block_output, residuals, next_hc):
+    def combine_mix(self, block_output, residuals, next_hc, prefill_fused=True):
         """``next_hc.mix(self.combine(block_output, residuals))``.
 
         After a fused decode mix, this combine runs as the prologue of
         ``next_hc``'s fused mix (one Pallas call; the combined hyper input is
-        written once and returned as the next residual).
+        written once and returned as the next residual). ``prefill_fused``
+        allows the fused prefill combine-mix at whole prefill tiles; without
+        it those sizes run the separate combine and mix.
         """
         hyper_input, gate = residuals
         if (
@@ -362,12 +375,17 @@ class GatedResidual(common_hc.GatedResidual):
             and block_output.dtype == torch.bfloat16
             and next_hc._decode_fused(hyper_input)
         ):
-            mixed, injection, combined = next_hc._decode_combine_mix_op(
+            outs = next_hc._decode_combine_mix_op(
                 hyper_input, block_output, gate, *next_hc._decode_weights()
             )
-            return mixed, (combined, injection)
+            if hasattr(next_hc, "block_inject_weight"):
+                mixed, injection, combined = outs
+                return mixed, (combined, injection)
+            mixed, combined = outs
+            return mixed, (combined, None)
         if (
-            next_hc._prefill_combine_mix_op is not None
+            prefill_fused
+            and next_hc._prefill_combine_mix_op is not None
             and gate is not None
             and gate.shape[-1] == self.hc_count
             and gate.dtype == torch.float32

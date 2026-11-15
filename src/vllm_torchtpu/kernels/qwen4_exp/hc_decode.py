@@ -40,12 +40,35 @@ def decode_token_tile(tokens: int) -> int | None:
     """Token tile for ``tokens`` rows, or None when the kernel does not apply."""
     if tokens < 1 or tokens > MAX_TOKENS:
         return None
-    if tokens <= _SINGLE_TILE_MAX:
+    # Exclusive: 128 rows take the 128-row tile below, the same tile. Called
+    # with the traced token count, this keeps the 128 bucket a lower bound of
+    # the trace (see compilation/shape_variants.py on half-open token gates).
+    if tokens < _SINGLE_TILE_MAX:
         return tokens
     for tile in (128, 64, 32, 16):
         if tokens % tile == 0:
             return tile
     return None
+
+
+def decode_kernel_tile(tokens: int, max_tile: int = 0) -> int | None:
+    """Row tile the kernel runs for a concrete ``tokens``, or None.
+
+    ``max_tile`` 0 takes ``decode_token_tile``. Otherwise ``tokens`` of at
+    least 128 split into the fewest equal tiles of at most ``max_tile`` rows
+    that are a multiple of 16 (192 rows: one tile, 448: two of 224). Every
+    tile streams the layer's low-rank weights through the MXU again, so a
+    64-row tile costs nearly as much as a 128-row one. Accepts every count
+    ``decode_token_tile`` accepts (it falls back to that tile), so the
+    torch-side gate stays ``decode_token_tile``.
+    """
+    tile = decode_token_tile(tokens)
+    if tile is None or not max_tile or tokens < _SINGLE_TILE_MAX:
+        return tile
+    for count in range(-(-tokens // max_tile), tokens // tile):
+        if tokens % count == 0 and (tokens // count) % 16 == 0:
+            return tokens // count
+    return tile
 
 
 def _kernel(
@@ -55,6 +78,7 @@ def _kernel(
     eps: float,
     prologue: bool,
     inject: bool,
+    chunk_tail: bool,
 ):
     refs = list(refs)
     if prologue:
@@ -164,13 +188,17 @@ def _kernel(
             inj_ref[pl.ds(offset, rows), :] = 2.0 * jax.nn.sigmoid(logits / branches)
 
     tile = norm_vm.shape[0]
-    if tile >= 2 * _ROW_CHUNK and tile % _ROW_CHUNK == 0:
-        # Bound the live FP32 row working set like hc_full's 32-row loop.
+    chunks, tail = divmod(tile, _ROW_CHUNK)
+    if chunks >= 2 and (tail == 0 or (chunk_tail and tail % 16 == 0)):
+        # Bound the live FP32 row working set like hc_full's 32-row loop; a
+        # 16-row tail (tiles of 16 * odd rows) runs after the loop.
         def chunk(index, carry):
             normalize_rows(pl.multiple_of(index * _ROW_CHUNK, _ROW_CHUNK), _ROW_CHUNK)
             return carry
 
-        jax.lax.fori_loop(0, tile // _ROW_CHUNK, chunk, jnp.int32(0))
+        jax.lax.fori_loop(0, chunks, chunk, jnp.int32(0))
+        if tail:
+            normalize_rows(chunks * _ROW_CHUNK, tail)
     else:
         normalize_rows(0, tile)
 
@@ -217,6 +245,7 @@ def hc_decode_mix(
     eps: float,
     block=None,
     prev_injection=None,
+    max_tile=0,
     interpret=False,
 ):
     """Fused HC mix for at most ``MAX_TOKENS`` rows.
@@ -224,7 +253,8 @@ def hc_decode_mix(
     ``x`` is the [T, hc*H] hyper input, or with ``block``/``prev_injection``
     the previous HC's residual that is combined first. Returns
     ``(mixed, injection)`` (``injection`` is None without ``inject_weight``),
-    plus the combined hyper input when ``block`` is given.
+    plus the combined hyper input when ``block`` is given. ``max_tile``: see
+    ``decode_kernel_tile`` (TPU_QWEN4_HC_DECODE_TILE_ROWS).
     """
     return _hc_decode_mix(
         x,
@@ -237,11 +267,14 @@ def hc_decode_mix(
         branches=branches,
         hidden=hidden,
         eps=eps,
+        max_tile=max_tile,
         interpret=interpret,
     )
 
 
-@functools.partial(jax.jit, static_argnames=("branches", "hidden", "eps", "interpret"))
+@functools.partial(
+    jax.jit, static_argnames=("branches", "hidden", "eps", "max_tile", "interpret")
+)
 def _hc_decode_mix(
     x,
     weight,
@@ -254,13 +287,14 @@ def _hc_decode_mix(
     branches,
     hidden,
     eps,
+    max_tile,
     interpret,
 ):
     tokens, width = x.shape
     lowrank = down.shape[0]
     prologue = block is not None
     inject = inject_weight is not None
-    tile = decode_token_tile(tokens)
+    tile = decode_kernel_tile(tokens, max_tile)
     if (
         tile is None
         or width != branches * hidden
@@ -318,6 +352,7 @@ def _hc_decode_mix(
             eps=eps,
             prologue=prologue,
             inject=inject,
+            chunk_tail=bool(max_tile),
         ),
         grid=(tokens // tile,),
         in_specs=in_specs,
