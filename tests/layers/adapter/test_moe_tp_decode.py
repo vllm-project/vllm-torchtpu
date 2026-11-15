@@ -769,6 +769,116 @@ def test_ep_split_body_gives_each_core_its_rows_of_the_psum_path(
         np.testing.assert_allclose(got, want, atol=2e-2 * np.abs(want).max())
 
 
+def _unpack_fp4_kmajor(w, scale):
+    """[E, K, N] float32 from packed FP4 weights [E, K/2, N] uint8 (two values
+    of K per byte) and their [E, K/block, 1, N] scales."""
+    import jax
+    import jax.numpy as jnp
+
+    fp4 = jax.lax.bitcast_convert_type(w, jnp.float4_e2m1fn)  # [E, K/2, N, 2]
+    vals = jnp.swapaxes(fp4, -1, -2).astype(jnp.float32)  # [E, K/2, 2, N]
+    vals = vals.reshape(w.shape[0], -1, w.shape[-1])
+    block = vals.shape[1] // scale.shape[1]
+    return vals * jnp.repeat(scale[:, :, 0, :], block, axis=1)
+
+
+def test_ep_split_body_forwards_packed_fp4_routed_weights(monkeypatch):
+    """Packed FP4 routed weights under TPU_PREFILL_SEQ_PARALLEL_EP: the split
+    EP body and the psum path hand fused_moe_func the uint8 weights with
+    rhs_quant_dtype float4_e2m1fn, and each rank's output equals its rows of
+    the psum path's."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental import pallas as pl
+
+    from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
+        fused_moe_prefill_kernel_v2 as v2,
+    )
+    from vllm_torchtpu.layers.core.fused_moe_gmm import (
+        quantize_to_native_fp4_kmajor,
+    )
+
+    pallas_call = pl.pallas_call
+    monkeypatch.setattr(
+        pl,
+        "pallas_call",
+        lambda *a, **k: pallas_call(*a, **{**k, "interpret": pltpu.InterpretParams()}),
+    )
+    seen = []
+
+    def reference_fp4(x, w1, w2, s1, s2, b1, b2, topk_weights, topk_ids, e0, **kw):
+        seen.append((w1.dtype, kw["rhs_quant_dtype"]))
+        w1, w2 = _unpack_fp4_kmajor(w1, s1), _unpack_fp4_kmajor(w2, s2)
+        return _reference_ep_moe(
+            x, w1, w2, None, None, None, None, topk_weights, topk_ids, e0
+        )
+
+    monkeypatch.setattr(moe_tp_decode, "fused_moe_func", reference_fp4)
+    monkeypatch.setattr(
+        moe_tp_decode.kernel, "can_use_moe_tp_decode", lambda *a, **k: False
+    )
+    ranks, hidden, experts, inter, shared, tokens, block = 4, 256, 8, 128, 64, 512, 128
+    local = experts // ranks
+    statics = moe_tp_decode._OpStatics(
+        topk=4,
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        use_ep=True,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+    rng = np.random.default_rng(0)
+
+    def array(shape, dtype, scale=1.0):
+        return jnp.asarray(rng.standard_normal(shape) * scale, dtype)
+
+    w13, s13 = quantize_to_native_fp4_kmajor(
+        array((experts, hidden, 2 * inter), jnp.float32, 0.05), block=block
+    )
+    w2, s2 = quantize_to_native_fp4_kmajor(
+        array((experts, inter, hidden), jnp.float32, 0.05), block=block
+    )
+    x = array((tokens, hidden), jnp.bfloat16)
+    scores = jax.nn.sigmoid(array((tokens, experts), jnp.float32))
+    bias = array((experts,), jnp.float32, 0.1)
+    pad_mask = jnp.arange(tokens) >= tokens - 37
+    per_rank = (
+        w13.reshape(ranks, local, hidden // 2, 2 * inter),
+        w2.reshape(ranks, local, inter // 2, hidden),
+        s13.reshape(ranks, local, hidden // block, 1, 2 * inter),
+        s2.reshape(ranks, local, inter // block, 1, hidden),
+        array((ranks, hidden, 2 * shared), jnp.float8_e4m3fn, 0.3),
+        jnp.asarray(rng.uniform(0.01, 0.02, (ranks, 2 * shared)), jnp.float32),
+        array((ranks, shared, hidden), jnp.float8_e4m3fn, 0.3),
+        jnp.asarray(rng.uniform(0.01, 0.02, (ranks, hidden)), jnp.float32),
+        jnp.arange(ranks, dtype=jnp.int32).reshape(ranks, 1, 1),
+        (jnp.arange(ranks, dtype=jnp.int32) * local).reshape(ranks, 1, 1),
+    )
+
+    def run(body, rows, row_scores):
+        in_axes = (0, 0, None, None) + (0,) * len(per_rank)
+        return jax.jit(jax.vmap(body, in_axes=in_axes, axis_name="ep"))(
+            rows, row_scores, bias, pad_mask, *per_rank
+        )
+
+    every_row = moe_tp_decode._op_body(statics, ranks, "ep")
+    full = run(every_row, jnp.stack([x] * ranks), jnp.stack([scores] * ranks))
+    own = [
+        jnp.stack([v2.own_rows(a, r, ranks) for r in range(ranks)]) for a in (x, scores)
+    ]
+    split = run(moe_tp_decode._ep_split_body(statics, ranks, "ep"), *own)
+
+    assert len(seen) == 2
+    assert all(dt == jnp.uint8 and q == jnp.float4_e2m1fn for dt, q in seen)
+    assert split.shape == (ranks, tokens // ranks, hidden)
+    for r in range(ranks):
+        want = np.asarray(v2.own_rows(full[0], r, ranks), np.float32)
+        got = np.asarray(split[r], np.float32)
+        np.testing.assert_allclose(got, want, atol=2e-2 * np.abs(want).max())
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_token_split_arms_an_expert_parallel_layer_only_when_asked(
     monkeypatch, enabled
@@ -1020,8 +1130,7 @@ def test_rotated_scatter_places_fall_back_to_xla_with_the_reason(
     else:
         assert found is None
         assert logs == [
-            f"TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: {reason}; "
-            "XLA's collectives"
+            f"TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: {reason}; XLA's collectives"
         ]
 
 
@@ -1155,3 +1264,26 @@ def test_a_wrong_peer_table_moves_the_wrong_rows(mesh16, monkeypatch):
     rc = moe_tp_decode.rotated_collectives
     got = run(rc.peer_table(_shuffled_places(1), "all_gather"))
     assert np.abs(got - want).max() > 0.1 * np.abs(want).max()
+
+
+def test_packed_fp4_ep_admitted_only_under_seq_parallel_ep(harness, monkeypatch):
+    import jax.numpy as jnp
+
+    model = harness.model(dict(use_ep=True))
+    runner = model.layers[0]
+    layer = runner.routed_experts
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((E, H // 2, 2 * INTER), dtype=torch.uint8), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((E, INTER // 2, H), dtype=torch.uint8), requires_grad=False
+    )
+    layer.quant_method._rhs_quant_dtype = jnp.float4_e2m1fn
+
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP", False)
+    assert moe_tp_decode.arm(model) == 0
+
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP", True)
+    assert moe_tp_decode.arm(model) == 1
+    assert harness.statics[-1].rhs_quant_dtype == jnp.float4_e2m1fn
+    assert harness.statics[-1].use_ep is True
