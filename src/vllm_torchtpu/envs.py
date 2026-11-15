@@ -138,6 +138,7 @@ if TYPE_CHECKING:
     TPU_STAGE_TIMING_ONLY_WITH_CONSUMER: bool = True
     TPU_WORKER_CPU_PIN: bool = True
     TPU_WORKER_CPU_PIN_SKIP: int = 2
+    TPU_HOST_MEMORY_LOG_S: int = 0
     TPU_AOT_SKIP_GUARD_CHECK: bool = True
     TPU_FOREACH_MUTATION_EPILOGUE: bool = True
     TPU_H2D_REUSE_STEADY: bool = True
@@ -1288,6 +1289,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (worker/cpu_pin.py). Placement only.
     "TPU_WORKER_CPU_PIN": env_bool("TPU_WORKER_CPU_PIN", default=True),
     "TPU_WORKER_CPU_PIN_SKIP": env_int("TPU_WORKER_CPU_PIN_SKIP", 2),
+    # Seconds between host memory reports from one worker per host: the
+    # container's cgroup usage, limit, peak and OOM kills, and the largest
+    # processes (worker/host_memory.py). A host that runs out of memory kills
+    # a worker without an error line; these reports show it coming. 0 is off.
+    "TPU_HOST_MEMORY_LOG_S": env_int("TPU_HOST_MEMORY_LOG_S", 0),
     # After warmup, skip the per-call Dynamo guard check of AOT-compiled model
     # forwards when vLLM compiled them without guards (dynamic_shapes_config
     # .evaluate_guards False). vLLM already does this for an AOT artifact

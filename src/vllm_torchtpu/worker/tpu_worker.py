@@ -38,6 +38,7 @@ from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker import host_memory
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -92,6 +93,10 @@ class TPUWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+        # One worker per host logs the container's memory every
+        # TPU_HOST_MEMORY_LOG_S seconds (off by default): a host OOM during
+        # compile otherwise kills a worker without an error line.
+        host_memory.maybe_start(envs.TPU_HOST_MEMORY_LOG_S)
 
         # Multi-host object-storage serve: ranks on hosts other than the API
         # server's receive a model_config.model rewritten to a local aux-file
