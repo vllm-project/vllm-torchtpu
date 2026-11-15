@@ -44,6 +44,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_DCP_MLA_TOPK_CAP` | `0` | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
 | `TPU_DP_VOCAB_PARALLEL` | `False` | Opt-in. Shards the input embedding and lm_head over every DP x TP rank (the EP group) instead of each DP engine's TP group, cutting their HBM per device by DP x. Needs DP with expert parallelism; ignored, with a warning, under pipeline or context parallelism, speculative decoding, LoRA, pooling or multimodal models, or `TPU_GREEDY_TOP_TOKENS`. |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
+| `VLLM_TPU_GLM53_SP_PREFILL` | `True` | Shards the GLM-5.3-Flash token axis across TP during prefill so the hyper-connection sites, sublayer norms and replicated MLA projections run on `T / tp` tokens. |
+| `VLLM_TPU_GLM53_SP_MIN_TOKENS` | `256` | Minimum batch token count for `VLLM_TPU_GLM53_SP_PREFILL` (rounded up to a multiple of `tp_size * 32`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
 
@@ -94,6 +96,7 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | :--- | :--- | :--- |
 | `VLLM_TPU_BLOCK_MAJOR_KV` | `False` | Selects the block-major KV cache memory layout for Ragged Paged Attention. |
 | `VLLM_TPU_GLM53_MHC_IMPL` | `"pallas"` | GLM-5.3-Flash hyper-connection (mHC) mixing: `"pallas"` runs the Pallas mHC kernels with each post fused into the next pre; `"compiled"` runs the `torch.compile`d reference ops. |
+| `VLLM_TPU_GLM53_MLA_IMPL` | `"rpa"` | GLM-5.3-Flash NoPE MLA layers: `"rpa"` expands the latent with `kv_b_proj` and runs ragged paged attention on per-head K/V; `"absorbed"` caches the latent and runs the absorbed MLA kernel. |
 | `TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL` | `None` | Enables the unified KV cache block pool across hybrid attention layers (e.g., GDN + Full Attention or MLA). Unset: on for the pooled GDN / KDA architectures, off otherwise. Off on a hybrid model selects the per-layer layout: attention KV blocks plus `max_num_reqs + 1` compact mamba slots (or the uniform layout, which pads every block to the mamba page, when a KV connector other than DecodeBench is configured). On the compact layout `--num-gpu-blocks-override` sets the attention block count and the mamba slots stay compact. |
 | `TPU_SKIP_MAMBA_SCHEDULER_BLOCKS` | `True` | On the compact-mamba layout (`TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0`) with prefix caching off, GDN layers take no blocks from the attention pool: the runner keeps their state in its own per-request slots. Applies only to GDN layers without speculative decoding or a KV connector; elsewhere it has no effect. Set `0` to restore vLLM's stock accounting (one block per GDN group per request) for debugging. |
 | `TPU_LATENT_PROJ_INTRA_CHIP_TP` | `False` | Shards MLA latent projections across the 2 TensorCores of a single TPU v7x chip when `TP=1`. |

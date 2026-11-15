@@ -101,6 +101,9 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     VLLM_TPU_GLM53_MHC_IMPL: str = "pallas"
     VLLM_TPU_GLM53_MOE_IMPL: str = "fused"
+    VLLM_TPU_GLM53_MLA_IMPL: str = "rpa"
+    VLLM_TPU_GLM53_SP_PREFILL: bool = True
+    VLLM_TPU_GLM53_SP_MIN_TOKENS: int = 256
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
@@ -505,6 +508,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         env_with_choices("VLLM_TPU_GLM53_MOE_IMPL", "fused", ["fused", "vllm"])()
         or "fused"
     ),
+    # GLM-5.3-Flash NoPE MLA layers: "rpa" expands the latent with kv_b_proj
+    # and runs ragged paged attention on per-head K/V; "absorbed" caches the
+    # latent and runs the absorbed MLA kernel.
+    "VLLM_TPU_GLM53_MLA_IMPL": lambda: (
+        env_with_choices("VLLM_TPU_GLM53_MLA_IMPL", "rpa", ["rpa", "absorbed"])()
+        or "rpa"
+    ),
+    # Shard the GLM-5.3-Flash token axis across TP during prefill, so the mHC
+    # sites, sublayer norms and replicated MLA projections run on T / tp
+    # tokens.
+    "VLLM_TPU_GLM53_SP_PREFILL": env_bool("VLLM_TPU_GLM53_SP_PREFILL", default=True),
+    # Minimum batch token count for GLM-5.3-Flash sequence-parallel prefill
+    # (rounded up to a multiple of tp_size * 32).
+    "VLLM_TPU_GLM53_SP_MIN_TOKENS": env_int("VLLM_TPU_GLM53_SP_MIN_TOKENS", 256),
     # Store GDN's in_proj_qkvz in the matmul's (k, n) layout, like every other
     # linear, instead of vLLM's [n_out, n_in]. On the per-block FP8 path (gmm_v2)
     # the kept layout costs a full weight copy every step. Ignored with prefill
