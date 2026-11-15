@@ -656,27 +656,29 @@ def _patch_ltx2_per_sample_timestep() -> None:
     # TODO: Remove this patch once vLLM-Omni's LTX-2 runtime stops
     # expanding a timestep shared by all tokens to one value per token.
     #
-    # LTXRuntime expands each sample's timestep to one value per video and
-    # audio token (for the sequence-parallel plan, which splits it with the
-    # video tokens). The transformer then embeds the same timestep once per
-    # token, and every block materializes its AdaLN scale/shift/gate tables
-    # per token ((1, 3520, 6, 4096) for the video self-attention and FFN
-    # alone at 704x1280x121 under Ulysses 4) plus relayout copies of them:
-    # ~80 ms of the ~470 ms of device time per step on a v7x core in a
-    # profile (58 ms per step end to end). The transformer also takes
-    # per-sample (1-D) timesteps, which the SP hook leaves unsplit; their
-    # (B, 1, ...) tables broadcast over the tokens. Conditioned requests
-    # still replace the video timestep with their per-token values.
-    #
-    # Opt-in (VLLM_TPU_OMNI_LTX2_PER_SAMPLE_TIMESTEP): the bf16 TPU output
-    # differs from the per-token path, and no on-device bf16 A/B yet shows
-    # the difference is rounding only.
-    #
-    # Wraps upstream LTXRuntime._denoise_timestep_kwargs and only narrows the
-    # timestep tensors it returns. A (B, S) timestep is collapsed to (B,)
-    # only when it is a broadcast view (stride 0 over tokens, as
-    # timestep_kwargs(expand_for_sequence_parallel=True) builds it), so every
-    # token of a sample is known to hold the same value.
+    # Problem: LTXRuntime expands each sample's timestep to one value per
+    #   video and audio token (for the sequence-parallel plan, which splits it
+    #   with the video tokens). The transformer then embeds the same timestep
+    #   once per token, and every block materializes per-token AdaLN
+    #   scale/shift/gate tables ((1, 3520, 6, 4096) for video self-attention
+    #   and FFN alone at 704x1280x121 under Ulysses 4) plus relayout copies.
+    # Fix: wraps upstream LTXRuntime._denoise_timestep_kwargs and narrows
+    #   unconditioned 2-D broadcast (B, S) timestep and audio_timestep views
+    #   to per-sample 1-D (B,) tensors.
+    # Effect: the transformer embeds each sample's timestep once per step, and
+    #   its (B, 1, ...) tables broadcast over the tokens instead of
+    #   materializing and copying per-token AdaLN tables in every block.
+    # Scope:
+    #   - Opt-in (VLLM_TPU_OMNI_LTX2_PER_SAMPLE_TIMESTEP): the bf16 TPU output
+    #     differs from the per-token path, and no on-device bf16 A/B yet shows
+    #     the difference is rounding only.
+    #   - The sequence-parallel split hook leaves 1-D (B,) timesteps unsplit.
+    #   - Conditioned requests (conditioning_mask is not None) keep the
+    #     upstream per-token values.
+    #   - A 2-D (B, S) timestep is collapsed to (B,) only when S == 1 or
+    #     stride(1) == 0 (as timestep_kwargs(expand_for_sequence_parallel=True)
+    #     builds it), so every token of a sample is known to hold the same
+    #     value; non-broadcast 2-D timesteps stay 2-D with a warning_once.
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
 
@@ -712,10 +714,18 @@ def _patch_ltx2_per_sample_timestep() -> None:
             return kwargs
         for name in ("timestep", "audio_timestep"):
             timestep = kwargs[name]
-            if timestep.ndim == 2 and (
-                timestep.shape[1] == 1 or timestep.stride(1) == 0
-            ):
-                kwargs[name] = timestep[:, 0]
+            if timestep.ndim == 2:
+                if timestep.shape[1] == 1 or timestep.stride(1) == 0:
+                    kwargs[name] = timestep[:, 0]
+                else:
+                    logger.warning_once(
+                        "LTX-2 per-sample timestep patch skipped for %s with "
+                        "non-broadcast shape %s (stride %s); keeping 2-D "
+                        "per-token tensor.",
+                        name,
+                        tuple(timestep.shape),
+                        timestep.stride(),
+                    )
         return kwargs
 
     setattr(_per_sample_timestep_kwargs, _PER_SAMPLE_TIMESTEP_PATCHED, True)

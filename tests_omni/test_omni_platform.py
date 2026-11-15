@@ -1108,6 +1108,27 @@ def test_ltx2_per_sample_timestep_patch(monkeypatch):
     assert kwargs["audio_timestep"].shape == (2, 3)
     torch.testing.assert_close(kwargs["timestep"][:, 0], ts)
 
+    # Non-broadcast 2-D timestep with conditioning_mask=None stays 2-D and warns once.
+    warn_spy = MagicMock(wraps=patches.logger.warning_once)
+    monkeypatch.setattr(patches.logger, "warning_once", warn_spy)
+    non_broadcast_video = torch.arange(14, dtype=torch.float32).reshape(2, 7)
+    non_broadcast_runtime = runtime_cls.__new__(runtime_cls)
+    non_broadcast_runtime.guidance_executor = SimpleNamespace(
+        timestep_kwargs=lambda *a, **kw: {
+            "timestep": non_broadcast_video,
+            "audio_timestep": ts.reshape(-1, 1).expand(-1, 3),
+            "sigma": ts,
+        }
+    )
+    nb_kwargs = non_broadcast_runtime._denoise_timestep_kwargs(
+        ts, None, unconditioned, **counts
+    )
+    assert nb_kwargs["timestep"] is non_broadcast_video
+    assert nb_kwargs["audio_timestep"].shape == (2,)
+    assert warn_spy.call_count == 1
+    warn_msg = warn_spy.call_args.args[0] % warn_spy.call_args.args[1:]
+    assert "timestep" in warn_msg and "(2, 7)" in warn_msg
+
     # Re-applying is a no-op and single-sample (B=1) stays 1-D.
     installed = runtime_cls._denoise_timestep_kwargs
     patches._patch_ltx2_per_sample_timestep()
