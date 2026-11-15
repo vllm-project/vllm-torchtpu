@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import torch
 
-from vllm_torchtpu.spec_decode.gaad import (
+from vllm_torchtpu.structured_decoding.gaad import (
     DRAFT_FLAG_EMPTY,
     DRAFT_FLAG_GRAMMAR,
     DRAFT_FLAG_MODEL,
