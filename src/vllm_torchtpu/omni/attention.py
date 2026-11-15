@@ -17,7 +17,7 @@
 bf16 attention through a Pallas flash kernel tuned for diffusion
 sequence lengths. Masked, causal, or non-bf16 calls fall back with a
 one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA). ``TpuSDPAImpl`` runs
-masked calls under ``sdpa_kernel(SDPBackend.MATH)``, which on torch_tpu
+query-broadcast masked calls under ``sdpa_kernel(SDPBackend.MATH)``, which on torch_tpu
 selects the StableHLO SDPA lowering.
 """
 
@@ -58,7 +58,10 @@ class TpuSDPAImpl(SDPAImpl):
         #   (B, 1, 1, K) or (B, H, 1, K) key-padding mask, bool or additive.
         #   The output is wrong even for a mask that keeps every key, and NaN
         #   for some shapes. A mask with a full query dim is read correctly.
-        # Fix: masked calls run under sdpa_kernel(SDPBackend.MATH), which on
+        # Fix: calls whose mask has no query dim or size 1 along it (a 1D
+        #   [K] mask, a 2D [B, K] mask, which becomes [B, 1, 1, K], or a
+        #   mask with shape[-2] == 1) run under
+        #   sdpa_kernel(SDPBackend.MATH), which on
         #   torch_tpu selects the StableHLO SDPA lowering, not ATen math. It
         #   builds the full (B, H, Q, K) score tensor, so it is slower than
         #   the flash kernel on long sequences.
@@ -70,7 +73,8 @@ class TpuSDPAImpl(SDPAImpl):
         #   CFG-parallel 2): blank video and NaN audio. At batch 1 the audio
         #   was finite but wrong.
         # ---------------------------------------------------------------------
-        masked = attn_metadata is not None and attn_metadata.attn_mask is not None
+        mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        masked = mask is not None and (mask.ndim < 3 or mask.shape[-2] == 1)
         with sdpa_kernel(SDPBackend.MATH) if masked else nullcontext():
             return self._forward_impl(
                 query, key, value, attn_metadata, mask_mode="broadcast_k"

@@ -408,13 +408,24 @@ def test_tpu_sdpa_attention_backend():
     assert res_gqa.shape == (1, 16, 8, 16)
 
 
-@pytest.mark.parametrize("mask_kind", ["2d", "b11k", "b11k_additive"])
-def test_tpu_sdpa_masked_calls_use_math_backend(monkeypatch, mask_kind):
+@pytest.mark.parametrize(
+    ("mask_kind", "expect_math"),
+    [
+        ("1d", True),
+        ("2d", True),
+        ("b11k", True),
+        ("b11k_additive", True),
+        ("b1qk", False),
+        ("b1qk_additive", False),
+    ],
+)
+def test_tpu_sdpa_masked_calls_use_math_backend(monkeypatch, mask_kind, expect_math):
     # torch_tpu 0.2.0's default SDPA lowering misreads a mask of size 1 along
-    # the query dim (google-pytorch/torch_tpu#5677), so masked calls must run
-    # under sdpa_kernel(MATH); unmasked calls must not. b11k_additive is a
-    # float mask in the query dtype, for which vLLM-Omni's SDPAImpl does not
-    # select MATH itself.
+    # the query dim (google-pytorch/torch_tpu#5677), so calls with such a
+    # mask (including a 1D [K] mask and a 2D [B, K] mask, which becomes
+    # [B, 1, 1, K]) must run under sdpa_kernel(MATH), while unmasked calls
+    # and full-query-dim masks must not. b11k_additive is a float mask in the
+    # query dtype, for which vLLM-Omni's SDPAImpl does not select MATH itself.
     from vllm_torchtpu.omni import attention as omni_attention
 
     backends = []
@@ -431,8 +442,15 @@ def test_tpu_sdpa_masked_calls_use_math_backend(monkeypatch, mask_kind):
     value = torch.randn(2, 6, 4, 16)
     keep = torch.arange(6) < 5
     keep_2d = keep[None, :].expand(2, -1)
-    mask = keep_2d if mask_kind == "2d" else keep_2d[:, None, None, :]
-    if mask_kind == "b11k_additive":
+    if mask_kind == "1d":
+        mask = keep
+    elif mask_kind == "2d":
+        mask = keep_2d
+    elif mask_kind.startswith("b11k"):
+        mask = keep_2d[:, None, None, :]
+    else:
+        mask = keep_2d[:, None, None, :].expand(-1, -1, query.shape[1], -1)
+    if mask_kind.endswith("_additive"):
         mask = torch.zeros(mask.shape, dtype=query.dtype).masked_fill(~mask, -10000.0)
 
     impl.forward(query, key, value)
@@ -440,7 +458,7 @@ def test_tpu_sdpa_masked_calls_use_math_backend(monkeypatch, mask_kind):
     assert backends == []
 
     out = impl.forward(query, key, value, SimpleNamespace(attn_mask=mask))
-    assert backends == [omni_attention.SDPBackend.MATH]
+    assert backends == ([omni_attention.SDPBackend.MATH] if expect_math else [])
     scores = torch.einsum("bqhd,bkhd->bhqk", query, key) * 0.25
     scores = scores.masked_fill(~keep[None, None, None, :], float("-inf"))
     ref = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(dim=-1), value)
