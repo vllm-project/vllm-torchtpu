@@ -41,7 +41,6 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled,
     update_tpu_block_size_and_slot_config,
 )
-from vllm_torchtpu.structured_decoding import gaad
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -1126,6 +1125,10 @@ class TpuPlatform(Platform):
         is_attention_free = (
             model_config.is_attention_free if model_config is not None else False
         )
+        # Imported here: the structured_decoding package imports vllm.config,
+        # which needs the platform this module defines.
+        from vllm_torchtpu.structured_decoding import gaad
+
         gaad.check_config(vllm_config)
         if (
             vllm_config.speculative_config is not None
