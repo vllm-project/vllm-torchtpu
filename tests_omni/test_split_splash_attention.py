@@ -82,8 +82,11 @@ class TestSplitSplashAttention:
     def test_disabled_by_default_without_env_flag(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from vllm_torchtpu.compilation.tpu_compiler import _TPU_COMPILE_ENV_IGNORED
+
         monkeypatch.delenv("VLLM_TPU_OMNI_SPLIT_SPLASH", raising=False)
         assert envs.VLLM_TPU_OMNI_SPLIT_SPLASH is False
+        assert "VLLM_TPU_OMNI_SPLIT_SPLASH" in _TPU_COMPILE_ENV_IGNORED
 
         attn_cls = qwen_image_transformer.QwenImageCrossAttention
         monkeypatch.setattr(attn_cls, "forward", _UPSTREAM_QWEN_ATTN_FORWARD)
@@ -288,6 +291,7 @@ class TestSplitSplashAttention:
         monkeypatch.setattr(envs, "VLLM_TPU_OMNI_SPLIT_SPLASH", True)
         attn_cls = qwen_image_transformer.QwenImageCrossAttention
         monkeypatch.setattr(attn_cls, "forward", _UPSTREAM_QWEN_ATTN_FORWARD)
+        monkeypatch.setattr(attn_cls, "_tpu_orig_forward", None, raising=False)
         _patch_qwen_image_prefix_mask()
         _patch_qwen_image_prefix_mask()
         assert getattr(attn_cls.forward, _QWEN_IMAGE_PREFIX_MASK_PATCHED, False)

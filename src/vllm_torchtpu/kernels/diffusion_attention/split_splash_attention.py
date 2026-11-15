@@ -100,6 +100,14 @@ def split_splash_attention(
         raise ValueError(
             f"Head dim {d} must be a positive multiple of {MIN_SPLASH_BLOCK_SIZE}."
         )
+    if (
+        query.dtype != jnp.bfloat16
+        or key.dtype != query.dtype
+        or value.dtype != query.dtype
+    ):
+        raise ValueError(
+            f"Expected bfloat16 q/k/v, got {query.dtype}, {key.dtype}, {value.dtype}."
+        )
     if attn_mask.shape != (b, s) or attn_mask.dtype != jnp.bool_:
         raise ValueError(
             f"Expected bool attn_mask of shape ({b}, {s}), got "
@@ -155,10 +163,11 @@ def split_splash_attention(
     exp_txt = jnp.exp(logits - m_txt)
     sum_exp = jnp.sum(exp_txt, axis=-1, keepdims=True)
     lse_txt = (m_txt[..., 0] + jnp.log(sum_exp[..., 0])).astype(jnp.float32)
+    v_txt_f32 = jnp.where(tmask[:, None, :, None], v_txt.astype(jnp.float32), 0.0)
     out_txt_part = jnp.einsum(
         "bhst,bhtd->bhsd",
         exp_txt / sum_exp,
-        v_txt.astype(jnp.float32),
+        v_txt_f32,
     )
 
     lse_max = jnp.maximum(lse_self, lse_txt)
